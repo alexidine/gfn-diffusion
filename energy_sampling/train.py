@@ -1,3 +1,6 @@
+import yaml
+
+from energy_sampling.energies.molecular_crystal import MolecularCrystal
 from plot_utils import *
 import argparse
 import torch
@@ -95,7 +98,16 @@ parser.add_argument('--seed', type=int, default=12345)
 parser.add_argument('--weight_decay', type=float, default=1e-7)
 parser.add_argument('--use_weight_decay', action='store_true', default=False)
 parser.add_argument('--eval', action='store_true', default=False)
-args = parser.parse_args()
+args, remaining = parser.parse_known_args()
+
+if 'config' in remaining[0]:  # load external yaml config file
+    with open(remaining[1], 'r') as f:
+        config_args = yaml.safe_load(f)
+    for key, value in config_args.items():
+        if hasattr(args, key):
+            setattr(args, key, value)
+        else:
+            parser.error(f"Unknown config key: {key}")
 
 set_seed(args.seed)
 if 'SLURM_PROCID' in os.environ:
@@ -130,6 +142,8 @@ def get_energy():
         energy = EasyFunnel(device=device)
     elif args.energy == 'many_well':
         energy = ManyWell(device=device)
+    elif args.energy == 'molecular_crystal':
+        energy = MolecularCrystal(device=device)
     return energy
 
 
@@ -268,7 +282,8 @@ def bwd_train_step(energy, gfn_model, buffer, buffer_ls, exploration_std=None, i
 
 
 def train():
-    name = get_name(args)
+    #name = get_name(args)  # the mkdirs is bugging with long names
+    name = 'test'
     if not os.path.exists(name):
         os.makedirs(name)
 

@@ -1,20 +1,23 @@
 import torch
 
-from mxtaltools.dataset_utils.data_classes import MolCrystalData
+from mxtaltools.dataset_utils.data_classes import MolCrystalData, MolData
 from mxtaltools.dataset_utils.utils import collate_data_list
 
 from .base_set import BaseSet
 
 
 class MolecularCrystal(BaseSet):
-    def __init__(self, device, dim=12, test_molecule='UREA'):
+    def __init__(self, device,
+                 dim: int = 12,
+                 test_molecule: str = 'UREA',
+                 space_group: int = 2):
         super(MolecularCrystal, self).__init__()
         self.device = device
         self.data_ndim = dim
+        self.space_group = space_group
 
         self.test_molecule = test_molecule
         self.initialize_test_molecule(test_molecule)
-
 
     def initialize_test_molecule(self, test_molecule):
         # UREA from molview - default if not specified
@@ -27,93 +30,74 @@ class MolecularCrystal(BaseSet):
             ], dtype=torch.float32, device=self.device)
             self.atom_coords -= self.atom_coords.mean(0)
             self.atom_types = torch.tensor([8, 7, 7, 6], dtype=torch.long, device=self.device)
-            self.mol_mass = 60.06
 
         # NICOTANIMIDE from molview
         elif test_molecule == 'NICOTANIMIDE':
             self.atom_coords = torch.tensor([
                 [-2.3940, 1.1116, -0.0088],
-                [1.7614,   -1.2284,   -0.0034],
-                [-2.4052,   -1.1814,    0.0027],
-                [-0.2969,    0.0397,    0.0024],
-                [0.4261,   1.2273,    0.0039],
-                [0.4117,   -1.1510,   -0.0013],
-                [1.8161,    1.1886,    0.0018],
-                [-1.7494,    0.0472,    0.0045],
-                [2.4302,   -0.0535,   -0.0018]
+                [1.7614, -1.2284, -0.0034],
+                [-2.4052, -1.1814, 0.0027],
+                [-0.2969, 0.0397, 0.0024],
+                [0.4261, 1.2273, 0.0039],
+                [0.4117, -1.1510, -0.0013],
+                [1.8161, 1.1886, 0.0018],
+                [-1.7494, 0.0472, 0.0045],
+                [2.4302, -0.0535, -0.0018]
             ], dtype=torch.float32, device=self.device)
             self.atom_coords -= self.atom_coords.mean(dim=0)
             self.atom_types = torch.tensor([8, 7, 7, 6, 6, 6, 6, 6, 6], dtype=torch.long, device=self.device)
-            self.mol_mass = 122.12
 
-    def prep_crystal_data(self,
-                          sample,
-                          space_group,
-                          cell_lengths,
-                          cell_angles,
-                          aunit_centroid,
-                          aunit_orientation,
-                          aunit_handedness):
-        crystal_list = [
-            MolCrystalData(
-                molecule=sample,
-                sg_ind=space_group,
-                cell_lengths=torch.ones(3),
-                cell_angles=torch.ones(3) * torch.pi / 2,
-                aunit_centroid=torch.ones(3) * 0.5,
-                aunit_orientation=torch.ones(3),
-                aunit_handedness=int(aunit_handedness[ind]),
-                identifier=sample.smiles,
-            )
-            for ind in range(len(samples))
-        ]
-        crystal_batch = collate_data_list(crystal_list)
+        self.mol = MolData(
+            z=self.atom_types,
+            pos=self.atom_coords,
+            x=self.atom_types,
+            skip_mol_analysis=False,
+        )
 
-        return crystal_batch
-
-    # def score_crystal_data(self):
-    #     prep_crystal_data = self.prep_crystal_data(
-    #         molecule=sample,
-    #         sg_ind=space_group,
-    #         cell_lengths=torch.ones(3),
-    #         cell_angles=torch.ones(3) * torch.pi / 2,
-    #         aunit_centroid=torch.ones(3) * 0.5,
-    #         aunit_orientation=torch.ones(3),
-    #         aunit_handedness=int(aunit_handedness[ind]),
-    #         identifier=sample.smiles)
-    #
-    #     pass
-
-    def score_crystal_data(self, x): # x is gfn_outputs
-
-        sample = self.sample(batch_size)
-        crystal_list = [
-            MolCrystalData(
-                molecule=sample,
-                sg_ind=space_group,
-                cell_lengths=torch.ones(3),
-                cell_angles=torch.ones(3) * torch.pi / 2,
-                aunit_centroid=torch.ones(3) * 0.5,
-                aunit_orientation=torch.ones(3),
-                aunit_handedness=int(aunit_handedness[ind]),
-                identifier=sample.smiles,
-            )
-            for ind in range(len(samples))
-        ]
-        crystal_batch = collate_data_list(crystal_list)
-
+    def analyze_crystal_batch(self, x):  # x is gfn_outputs
+        #with torch.no_grad():
+        crystal_batch = self.init_blank_crystal_batch(len(x))
         raw_cell_params = crystal_batch.destandardize_cell_parameters(x)
-        crystal_batch.set_cell_parameters(raw_cell_params)
-        crystal_batch.clean_cell_parameters()
+        crystal_batch.set_cell_parameters(raw_cell_params,
+                                          skip_box_analysis=True)
+        crystal_batch.clean_cell_parameters(mode='soft',
+                                            length_pad=1.5)
+        cluster_batch = crystal_batch.mol2cluster(cutoff=6,
+                                                  supercell_size=10,
+                                                  align_to_standardized_orientation=False)
+        cluster_batch.construct_radial_graph(cutoff=6)
+        crystal_energy = cluster_batch.compute_silu_energy()
 
-        lj_pot, es_pot, scaled_lj_pot = crystal_batch.build_and_analyze()
+        return crystal_energy
 
-        return scaled_lj_pot
+    def energy(self, x, T: float= 10.0):
+        """
+        Energy is not really bounded. Or necessarily well scaled.
+        We do exponential rescaling later with a temperature. For higher temperature,
+        potential is less sharply peaked.
+        :param x:
+        :return:
+        """
+        return -self.analyze_crystal_batch(x)/T
 
-    def energy(self, x):
-        # return score_crystal_data(...)
-        pass
+    def init_blank_crystal_batch(self, batch_size):
+        return collate_data_list([MolCrystalData(
+            molecule=self.mol.clone(),
+            sg_ind=self.space_group,
+            aunit_handedness=torch.ones(1),
+        ) for _ in range(batch_size)]).to(self.device)
 
     def sample(self, batch_size):
-        # return MolData(...)
-        pass
+        """
+        Return random crystal sample
+        note this is NOT weighted by energy
+        """
+        crystal_batch = self.init_blank_crystal_batch(batch_size)
+        crystal_batch.sample_random_crystal_parameters(cleaning_mode='soft')
+        # higher quality crystals but very expensive
+        # crystal_batch.sample_reasonable_random_parameters(
+        #     tolerance=3,
+        #     max_attempts=50
+        # )
+
+        return crystal_batch.standarize_cell_parameters().cpu().detach()
