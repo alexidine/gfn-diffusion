@@ -1,4 +1,5 @@
 import yaml
+from mxtaltools.reporting.online import simple_cell_hist, simple_generated_scatter, log_crystal_samples
 
 from energy_sampling.energies.molecular_crystal import MolecularCrystal
 from plot_utils import *
@@ -61,7 +62,6 @@ parser.add_argument('--ld_schedule', action='store_true', default=False)
 # target acceptance rate
 parser.add_argument('--target_acceptance_rate', type=float, default=0.574)
 
-
 # For replay buffer
 ################################################################
 # high beta give steep priorization in reward prioritized replay sampling
@@ -98,6 +98,11 @@ parser.add_argument('--seed', type=int, default=12345)
 parser.add_argument('--weight_decay', type=float, default=1e-7)
 parser.add_argument('--use_weight_decay', action='store_true', default=False)
 parser.add_argument('--eval', action='store_true', default=False)
+
+# args for molecular crystal energy
+parser.add_argument('--temperature', type=float, default=10)
+
+
 args, remaining = parser.parse_known_args()
 
 if 'config' in remaining[0]:  # load external yaml config file
@@ -114,7 +119,7 @@ if 'SLURM_PROCID' in os.environ:
     args.seed += int(os.environ["SLURM_PROCID"])
 
 eval_data_size = 2000
-final_eval_data_size = 2000
+final_eval_data_size = 200
 plot_data_size = 2000
 final_plot_data_size = 2000
 
@@ -143,7 +148,7 @@ def get_energy():
     elif args.energy == 'many_well':
         energy = ManyWell(device=device)
     elif args.energy == 'molecular_crystal':
-        energy = MolecularCrystal(device=device)
+        energy = MolecularCrystal(device=device, temperature=args.temperature)
     return energy
 
 
@@ -201,34 +206,42 @@ def plot_step(energy, gfn_model, name):
 def eval_step(eval_data, energy, gfn_model, final_eval=False):
     gfn_model.eval()
     metrics = dict()
-    if final_eval:
-        init_state = torch.zeros(final_eval_data_size, energy.data_ndim).to(device)
-        samples, metrics['final_eval/log_Z'], metrics['final_eval/log_Z_lb'], metrics[
-            'final_eval/log_Z_learned'] = log_partition_function(
-            init_state, gfn_model, energy.log_reward)
-    else:
-        init_state = torch.zeros(eval_data_size, energy.data_ndim).to(device)
-        samples, metrics['eval/log_Z'], metrics['eval/log_Z_lb'], metrics[
-            'eval/log_Z_learned'] = log_partition_function(
-            init_state, gfn_model, energy.log_reward)
-    if eval_data is None:
-        log_elbo = None
-        sample_based_metrics = None
-    else:
-        if final_eval:
-            metrics['final_eval/mean_log_likelihood'] = 0. if args.mode_fwd == 'pis' else mean_log_likelihood(eval_data,
-                                                                                                              gfn_model,
-                                                                                                              energy.log_reward)
-        else:
-            metrics['eval/mean_log_likelihood'] = 0. if args.mode_fwd == 'pis' else mean_log_likelihood(eval_data,
-                                                                                                        gfn_model,
-                                                                                                        energy.log_reward)
-        metrics.update(get_sample_metrics(samples, eval_data, final_eval))
+    # if final_eval:
+    init_state = torch.zeros(final_eval_data_size, energy.data_ndim).to(device)
+    samples, metrics['eval/log_Z'], metrics['eval/log_Z_lb'], metrics[
+        'eval/log_Z_learned'], sample_batch = log_partition_function(
+        init_state, gfn_model, energy)
+    metrics['Lattice Features Distribution'] = simple_cell_hist(sample_batch)
+    metrics['Sample Scatter'] = simple_generated_scatter(sample_batch)
+    metrics['eval/packing_coeff'] = sample_batch.packing_coeff.mean().cpu().detach().numpy()
+    metrics['eval/energy'] = sample_batch.silu_pot.mean().cpu().detach().numpy()
+    samples_to_log = log_crystal_samples(sample_batch)
+    [wandb.log({f'crystal_sample_{ind}': samples_to_log[ind]}, commit=False) for ind in range(len(samples_to_log))]
+
+    # else:
+    #     init_state = torch.zeros(eval_data_size, energy.data_ndim).to(device)
+    #     samples, metrics['eval/log_Z'], metrics['eval/log_Z_lb'], metrics[
+    #         'eval/log_Z_learned'] = log_partition_function(
+    #         init_state, gfn_model, energy.log_reward)
+    # if eval_data is None:
+    #     log_elbo = None
+    #     sample_based_metrics = None
+    # else:
+    #     if final_eval:
+    #         metrics['final_eval/mean_log_likelihood'] = 0. if args.mode_fwd == 'pis' else mean_log_likelihood(eval_data,
+    #                                                                                                           gfn_model,
+    #                                                                                                           energy.log_reward)
+    #     else:
+    #         metrics['eval/mean_log_likelihood'] = 0. if args.mode_fwd == 'pis' else mean_log_likelihood(eval_data,
+    #                                                                                                     gfn_model,
+    #                                                                                                     energy.log_reward)
+    #     metrics.update(get_sample_metrics(samples, eval_data, final_eval))
     gfn_model.train()
     return metrics
 
 
-def train_step(energy, gfn_model, gfn_optimizer, it, exploratory, buffer, buffer_ls, exploration_factor, exploration_wd):
+def train_step(energy, gfn_model, gfn_optimizer, it, exploratory, buffer, buffer_ls, exploration_factor,
+               exploration_wd):
     gfn_model.zero_grad()
 
     exploration_std = get_exploration_std(it, exploratory, exploration_factor, exploration_wd)
@@ -236,8 +249,8 @@ def train_step(energy, gfn_model, gfn_optimizer, it, exploratory, buffer, buffer
     if args.both_ways:
         if it % 2 == 0:
             if args.sampling == 'buffer':
-                loss, states, _, _, log_r  = fwd_train_step(energy, gfn_model, exploration_std, return_exp=True)
-                buffer.add(states[:, -1],log_r)
+                loss, states, _, _, log_r = fwd_train_step(energy, gfn_model, exploration_std, return_exp=True)
+                buffer.add(states[:, -1], log_r)
             else:
                 loss = fwd_train_step(energy, gfn_model, exploration_std)
         else:
@@ -271,7 +284,7 @@ def bwd_train_step(energy, gfn_model, buffer, buffer_ls, exploration_std=None, i
                 samples, rewards = buffer.sample()
                 local_search_samples, log_r = langevin_dynamics(samples, energy.log_reward, device, args)
                 buffer_ls.add(local_search_samples, log_r)
-        
+
             samples, rewards = buffer_ls.sample()
         else:
             samples, rewards = buffer.sample()
@@ -304,28 +317,30 @@ def train():
                     pis_architectures=args.pis_architectures, lgv_layers=args.lgv_layers,
                     joint_layers=args.joint_layers, zero_init=args.zero_init, device=device).to(device)
 
-
     gfn_optimizer = get_gfn_optimizer(gfn_model, args.lr_policy, args.lr_flow, args.lr_back, args.learn_pb,
                                       args.conditional_flow_model, args.use_weight_decay, args.weight_decay)
 
     print(gfn_model)
     metrics = dict()
 
-    buffer = ReplayBuffer(args.buffer_size, device, energy.log_reward,args.batch_size, data_ndim=energy.data_ndim, beta=args.beta,
+    buffer = ReplayBuffer(args.buffer_size, device, energy.log_reward, args.batch_size, data_ndim=energy.data_ndim,
+                          beta=args.beta,
                           rank_weight=args.rank_weight, prioritized=args.prioritized)
-    buffer_ls = ReplayBuffer(args.buffer_size, device, energy.log_reward,args.batch_size, data_ndim=energy.data_ndim, beta=args.beta,
-                          rank_weight=args.rank_weight, prioritized=args.prioritized)
+    buffer_ls = ReplayBuffer(args.buffer_size, device, energy.log_reward, args.batch_size, data_ndim=energy.data_ndim,
+                             beta=args.beta,
+                             rank_weight=args.rank_weight, prioritized=args.prioritized)
     gfn_model.train()
     for i in trange(args.epochs + 1):
         metrics['train/loss'] = train_step(energy, gfn_model, gfn_optimizer, i, args.exploratory,
                                            buffer, buffer_ls, args.exploration_factor, args.exploration_wd)
-        if i % 100 == 0:
+
+        if i % 50 == 0 and i > 0:
             metrics.update(eval_step(eval_data, energy, gfn_model, final_eval=False))
             if 'tb-avg' in args.mode_fwd or 'tb-avg' in args.mode_bwd:
                 del metrics['eval/log_Z_learned']
-            images = plot_step(energy, gfn_model, name)
-            metrics.update(images)
-            plt.close('all')
+            # images = plot_step(energy, gfn_model, name)
+            # metrics.update(images)
+            # plt.close('all')
             wandb.log(metrics, step=i)
             if i % 1000 == 0:
                 torch.save(gfn_model.state_dict(), f'{name}model.pt')

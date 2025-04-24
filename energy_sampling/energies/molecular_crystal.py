@@ -10,7 +10,8 @@ class MolecularCrystal(BaseSet):
     def __init__(self, device,
                  dim: int = 12,
                  test_molecule: str = 'UREA',
-                 space_group: int = 2):
+                 space_group: int = 2,
+                 temperature: float = 10):
         super(MolecularCrystal, self).__init__()
         self.device = device
         self.data_ndim = dim
@@ -18,6 +19,7 @@ class MolecularCrystal(BaseSet):
 
         self.test_molecule = test_molecule
         self.initialize_test_molecule(test_molecule)
+        self.temperature = temperature
 
     def initialize_test_molecule(self, test_molecule):
         # UREA from molview - default if not specified
@@ -54,23 +56,29 @@ class MolecularCrystal(BaseSet):
             skip_mol_analysis=False,
         )
 
-    def analyze_crystal_batch(self, x):  # x is gfn_outputs
-        #with torch.no_grad():
+    def analyze_crystal_batch(self, x, return_batch=False):  # x is gfn_outputs
         crystal_batch = self.init_blank_crystal_batch(len(x))
         raw_cell_params = crystal_batch.destandardize_cell_parameters(x)
         crystal_batch.set_cell_parameters(raw_cell_params,
                                           skip_box_analysis=True)
         crystal_batch.clean_cell_parameters(mode='soft',
-                                            length_pad=1.5)
+                                            length_pad=1.5,
+                                            canonicalize_orientations=False,
+                                            constrain_z=True)
         cluster_batch = crystal_batch.mol2cluster(cutoff=6,
                                                   supercell_size=10,
                                                   align_to_standardized_orientation=False)
         cluster_batch.construct_radial_graph(cutoff=6)
-        crystal_energy = cluster_batch.compute_silu_energy()
+        cluster_batch.compute_LJ_energy()
+        crystal_energy = cluster_batch.compute_silu_energy() / cluster_batch.num_atoms
+        cluster_batch.silu_pot = crystal_energy
 
-        return crystal_energy
+        if return_batch:
+            return crystal_energy, cluster_batch
+        else:
+            return crystal_energy
 
-    def energy(self, x, T: float= 10.0):
+    def energy(self, x):
         """
         Energy is not really bounded. Or necessarily well scaled.
         We do exponential rescaling later with a temperature. For higher temperature,
@@ -78,7 +86,7 @@ class MolecularCrystal(BaseSet):
         :param x:
         :return:
         """
-        return -self.analyze_crystal_batch(x)/T
+        return self.analyze_crystal_batch(x)/self.temperature
 
     def init_blank_crystal_batch(self, batch_size):
         return collate_data_list([MolCrystalData(
@@ -100,4 +108,4 @@ class MolecularCrystal(BaseSet):
         #     max_attempts=50
         # )
 
-        return crystal_batch.standarize_cell_parameters().cpu().detach()
+        return crystal_batch.standardize_cell_parameters().cpu().detach()
