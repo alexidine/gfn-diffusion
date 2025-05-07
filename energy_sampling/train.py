@@ -215,7 +215,7 @@ def eval_step(eval_data, energy, gfn_model, final_eval=False):
     metrics['Sample Scatter'] = simple_generated_scatter(sample_batch)
     metrics['eval/packing_coeff'] = sample_batch.packing_coeff.mean().cpu().detach().numpy()
     metrics['eval/energy'] = sample_batch.silu_pot.mean().cpu().detach().numpy()
-    samples_to_log = log_crystal_samples(sample_batch)
+    samples_to_log = log_crystal_samples(sample_batch=sample_batch)
     [wandb.log({f'crystal_sample_{ind}': samples_to_log[ind]}, commit=False) for ind in range(len(samples_to_log))]
 
     # else:

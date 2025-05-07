@@ -64,7 +64,8 @@ class MolecularCrystal(BaseSet):
         crystal_batch.clean_cell_parameters(mode='soft',
                                             length_pad=1.5,
                                             canonicalize_orientations=False,
-                                            constrain_z=True)
+                                            constrain_z=True,
+                                            enforce_niggli=True)
         cluster_batch = crystal_batch.mol2cluster(cutoff=6,
                                                   supercell_size=10,
                                                   align_to_standardized_orientation=False)
