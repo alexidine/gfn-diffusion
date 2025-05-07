@@ -1,7 +1,7 @@
 import yaml
 from mxtaltools.reporting.online import simple_cell_hist, simple_generated_scatter, log_crystal_samples
 
-from energy_sampling.energies.molecular_crystal import MolecularCrystal
+from energies.molecular_crystal import MolecularCrystal
 from plot_utils import *
 import argparse
 import torch
@@ -126,7 +126,7 @@ final_plot_data_size = 2000
 if args.pis_architectures:
     args.zero_init = True
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = args.device #torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 coeff_matrix = cal_subtb_coef_matrix(args.subtb_lambda, args.T).to(device)
 
 if args.both_ways and args.bwd:
@@ -296,7 +296,7 @@ def bwd_train_step(energy, gfn_model, buffer, buffer_ls, exploration_std=None, i
 
 def train():
     #name = get_name(args)  # the mkdirs is bugging with long names
-    name = 'test'
+    name = args.run_name
     if not os.path.exists(name):
         os.makedirs(name)
 
