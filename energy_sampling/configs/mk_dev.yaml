@@ -1,47 +1,45 @@
-lr_policy: 0.001
-lr_flow: 0.1
-lr_back: 0.001
-hidden_dim: 64
-s_emb_dim: 64
-t_emb_dim: 64
-harmonics_dim: 64
-batch_size: 100
-epochs: 25000
-buffer_size: 600000
+lr_policy: 0.001              # learning rate of the policy network
+lr_flow: 0.1                  # learning rate of the flow network
+lr_back: 0.001                # learning rate of the backward pass
+
+hidden_dim: 64                # dimensionality of hidden layer: standard
+s_emb_dim: 64                 # dimensionality of state embedding: standard
+t_emb_dim: 64                 # dimensionality of time embedding: standard
+harmonics_dim: 64             # dimensionality of harmonic embedding: standard
+
+batch_size: 100               # number of samples per training batch: relatively small
+epochs: 25000                 # number of training epochs: relatively large
+buffer_size: 600000           # size of replay buffer: relatively large
+
 T: 100
 subtb_lambda: 2
 t_scale: 1.0
 log_var_range: 4.0
-energy: "molecular_crystal" # "molecular_crystal"  # "many_well"
+energy: "molecular_crystal"   # "molecular_crystal"  # "many_well"
 mode_fwd: "tb"
 mode_bwd: "tb"
 both_ways: false
 
-# For local search
+# local search settings
 ################################################################
 local_search: false
-# How many iterations to run local search
-max_iter_ls: 200
-# How many iterations to burn in before making local search
-burn_in: 100
-# How frequently to make local search
-ls_cycle: 100
-# langevin step size
-ld_step: 0.1
-ld_schedule: true
-target_acceptance_rate: 0.574
+max_iter_ls: 200                # how many iterations to run local search
+burn_in: 100                    # how many iterations to burn in before making local search
+ls_cycle: 100                   # how frequently to make local search
+ld_step: 0.1                    # langevin step size
+ld_schedule: true               # whether to use scheduled langevin step size
+target_acceptance_rate: 0.574   # target acceptance rate for local search
 
-# For replay buffer
+# replay buffer settings
 ################################################################
-# high beta give steep priorization in reward prioritized replay sampling
-beta: 1.0
-# low rank_weighted give steep priorization in rank-based replay sampling
-rank_weight: 0.01
-# three kinds of replay training: random, reward prioritized, rank-based
-prioritized: "rank"
+beta: 1.0             # reward prioritized replay sampling: high beta = steep prioritization
+rank_weight: 0.01     # rank-based replay sampling: low rank_weight = steep prioritization
+prioritized: "rank"   # three kinds of replay training: random, reward prioritized, rank-based
 
+################################################################
 bwd: false
 exploratory: false
+
 sampling: "buffer"
 langevin: false
 langevin_scaling_per_dimension: false
@@ -65,4 +63,5 @@ use_weight_decay: false
 eval: false
 
 # molecular crystal settings
+################################################################
 temperature: 10
