@@ -21,6 +21,9 @@ from tqdm import trange
 import wandb
 
 parser = argparse.ArgumentParser(description='GFN Linear Regression')
+parser.add_argument('--run_name', type=str, default='test')
+parser.add_argument('--device', type=str, default='cpu')
+
 parser.add_argument('--lr_policy', type=float, default=1e-3)
 parser.add_argument('--lr_flow', type=float, default=1e-2)
 parser.add_argument('--lr_back', type=float, default=1e-3)
