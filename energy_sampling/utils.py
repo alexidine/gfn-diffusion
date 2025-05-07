@@ -55,25 +55,25 @@ def fig_to_image(fig):
     )
 
 
-def get_gfn_optimizer(gfn_model, lr_policy, lr_flow, lr_back, back_model=False, conditional_flow_model=False, use_weight_decay=False, weight_decay=1e-7):
-    param_groups = [ {'params': gfn_model.t_model.parameters()},
-                     {'params': gfn_model.s_model.parameters()},
-                     {'params': gfn_model.joint_model.parameters()},
-                     {'params': gfn_model.langevin_scaling_model.parameters()} ]
+def get_gfn_optimizer(gfn_model, lr_policy, lr_flow, lr_back, back_model=False, conditional_flow_model=False,
+                      use_weight_decay=False, weight_decay=1e-7):
+    param_groups = [{'params': gfn_model.t_model.parameters()},
+                    {'params': gfn_model.s_model.parameters()},
+                    {'params': gfn_model.joint_model.parameters()},
+                    {'params': gfn_model.langevin_scaling_model.parameters()}]
     if conditional_flow_model:
-        param_groups += [ {'params': gfn_model.flow_model.parameters(), 'lr': lr_flow} ]
+        param_groups += [{'params': gfn_model.flow_model.parameters(), 'lr': lr_flow}]
     else:
-        param_groups += [ {'params': [gfn_model.flow_model], 'lr': lr_flow} ]
+        param_groups += [{'params': [gfn_model.flow_model], 'lr': lr_flow}]
 
     if back_model:
-        param_groups += [ {'params': gfn_model.back_model.parameters(), 'lr': lr_back} ]
+        param_groups += [{'params': gfn_model.back_model.parameters(), 'lr': lr_back}]
 
     if use_weight_decay:
         gfn_optimizer = torch.optim.Adam(param_groups, lr_policy, weight_decay=weight_decay)
     else:
         gfn_optimizer = torch.optim.Adam(param_groups, lr_policy)
     return gfn_optimizer
-
 
 
 def get_gfn_forward_loss(mode, init_state, gfn_model, log_reward, coeff_matrix, exploration_std=None, return_exp=False):
@@ -86,7 +86,6 @@ def get_gfn_forward_loss(mode, init_state, gfn_model, log_reward, coeff_matrix, 
     elif mode == 'subtb':
         loss = subtb(init_state, gfn_model, log_reward, coeff_matrix, exploration_std)
     return loss
-
 
 
 def get_gfn_backward_loss(mode, samples, gfn_model, log_reward, exploration_std=None):
