@@ -4,12 +4,12 @@ lr_policy: 0.001              # learning rate of the policy network
 lr_flow: 0.1                  # learning rate of the flow network
 lr_back: 0.001                # learning rate of the backward pass
 
-hidden_dim: 256                # dimensionality of hidden layer: standard
-s_emb_dim: 256                 # dimensionality of state embedding: standard
-t_emb_dim: 256                 # dimensionality of time embedding: standard
+hidden_dim: 512                # dimensionality of hidden layer: standard
+s_emb_dim: 512                 # dimensionality of state embedding: standard
+t_emb_dim: 512                 # dimensionality of time embedding: standard
 harmonics_dim: 64             # dimensionality of harmonic embedding: standard
 
-batch_size: 5000               # number of samples per training batch: relatively small
+batch_size: 10000               # number of samples per training batch: relatively small
 epochs: 25000                 # number of training epochs: relatively large
 buffer_size: 600000           # size of replay buffer: relatively large
 
@@ -58,7 +58,7 @@ gfn_clip: 10000.0
 zero_init: true
 pis_architectures: true
 lgv_layers: 8
-joint_layers: 4
+joint_layers: 10
 seed: 12345
 weight_decay: 1e-7
 use_weight_decay: false
@@ -66,4 +66,4 @@ eval: false
 
 # molecular crystal settings
 ################################################################
-temperature: 10
+temperature: 0.1

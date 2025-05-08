@@ -97,53 +97,52 @@ class GFN(nn.Module):
             logvar = torch.tanh(logvar) * self.log_var_range
         return mean, logvar + np.log(self.pf_std_per_traj) * 2.
 
-    def predict_next_state(self, s, t, log_r):
+    def predict_next_state(self, state, time, log_r):
         if self.langevin:
-            s.requires_grad_(True)
+            state.requires_grad_(True)
             with torch.enable_grad():
-                grad_log_r = torch.autograd.grad(log_r(s).sum(), s)[0].detach()
+                grad_log_r = torch.autograd.grad(log_r(state).sum(), state)[0].detach()
                 grad_log_r = torch.nan_to_num(grad_log_r)
                 if self.clipping:
                     grad_log_r = torch.clip(grad_log_r, -self.lgv_clip, self.lgv_clip)
 
-        bsz = s.shape[0]
+        batch_size = state.shape[0]
 
-        t_lgv = t
+        t_lgv = time
 
-        t = self.t_model(t).repeat(bsz, 1)
-        s = self.s_model(s)
-        s_new = self.joint_model(s, t)
-
-        flow = self.flow_model(s, t).squeeze(-1) if self.conditional_flow_model or self.partial_energy else self.flow_model
+        time_encoding = self.t_model(time).repeat(batch_size, 1)
+        state_encoding = self.s_model(state)
+        state_update = self.joint_model(state_encoding, time_encoding)
+        log_flow = self.flow_model(state_encoding, time_encoding).squeeze(-1) if self.conditional_flow_model or self.partial_energy else self.flow_model
 
         if self.langevin:
             if self.pis_architectures:
                 scale = self.langevin_scaling_model(t_lgv)
             else:
-                scale = self.langevin_scaling_model(s, t)
-            s_new[..., :self.dim] += scale * grad_log_r
+                scale = self.langevin_scaling_model(state_encoding, time_encoding)
+            state_update[..., :self.dim] += scale * grad_log_r
 
         if self.clipping:
-            s_new = torch.clip(s_new, -self.gfn_clip, self.gfn_clip)
-        return s_new, flow.squeeze(-1)
+            state_update = torch.clip(state_update, -self.gfn_clip, self.gfn_clip)
+        return state_update, log_flow.squeeze(-1)
 
-    def get_trajectory_fwd(self, s, exploration_std, log_r, pis=False):
-        bsz = s.shape[0]
+    def get_trajectory_fwd(self, state, exploration_std, log_r, pis=False):
+        batch_size = state.shape[0]
 
-        logpf = torch.zeros((bsz, self.trajectory_length), device=self.device)
-        logpb = torch.zeros((bsz, self.trajectory_length), device=self.device)
-        logf = torch.zeros((bsz, self.trajectory_length + 1), device=self.device)
-        states = torch.zeros((bsz, self.trajectory_length + 1, self.dim), device=self.device)
+        logpf = torch.zeros((batch_size, self.trajectory_length), device=self.device)
+        logpb = torch.zeros((batch_size, self.trajectory_length), device=self.device)
+        logf = torch.zeros((batch_size, self.trajectory_length + 1), device=self.device)
+        states = torch.zeros((batch_size, self.trajectory_length + 1, self.dim), device=self.device)
 
         for i in range(self.trajectory_length):
-            pfs, flow = self.predict_next_state(s, i * self.dt, log_r)
+            pfs, log_flow = self.predict_next_state(state, i * self.dt, log_r)
             pf_mean, pflogvars = self.split_params(pfs)
 
-            logf[:, i] = flow
+            logf[:, i] = log_flow
             if self.partial_energy:
                 ref_log_var = np.log(self.t_scale * max(1, i) * self.dt)
-                log_p_ref = -0.5 * (logtwopi + ref_log_var + np.exp(-ref_log_var) * (s ** 2)).sum(1)
-                logf[:, i] += (1 - i * self.dt) * log_p_ref + i * self.dt * log_r(s)
+                log_p_ref = -0.5 * (logtwopi + ref_log_var + np.exp(-ref_log_var) * (state ** 2)).sum(1)
+                logf[:, i] += (1 - i * self.dt) * log_p_ref + i * self.dt * log_r(state)
 
             if exploration_std is None:
                 if pis:
@@ -161,33 +160,34 @@ class GFN(nn.Module):
                     else:
                         pflogvars_sample = torch.logaddexp(pflogvars, add_log_var).detach()
 
-            if pis:
-                s_ = s + self.dt * pf_mean + np.sqrt(self.dt) * (
-                        pflogvars_sample / 2).exp() * torch.randn_like(s, device=self.device)
+            #noise = torch.randn_like(state, device=self.device)
+            if pis:  # equation 2 in the paper
+                next_state = state + self.dt * pf_mean + np.sqrt(self.dt) * (
+                        pflogvars_sample / 2).exp() * torch.randn_like(state, device=self.device)
             else:
-                s_ = s + self.dt * pf_mean.detach() + np.sqrt(self.dt) * (
-                        pflogvars_sample / 2).exp() * torch.randn_like(s, device=self.device)
+                next_state = state + self.dt * pf_mean.detach() + np.sqrt(self.dt) * (
+                        pflogvars_sample / 2).exp() * torch.randn_like(state, device=self.device)
 
-            noise = ((s_ - s) - self.dt * pf_mean) / (np.sqrt(self.dt) * (pflogvars / 2).exp())
+            noise = ((next_state - state) - self.dt * pf_mean) / (np.sqrt(self.dt) * (pflogvars / 2).exp())  # seems unnecessary, as we have the noise above
             logpf[:, i] = -0.5 * (noise ** 2 + logtwopi + np.log(self.dt) + pflogvars).sum(1)
 
             if self.learn_pb:
-                t = self.t_model((i + 1) * self.dt).repeat(bsz, 1)
-                pbs = self.back_model(self.s_model(s_), t)
+                t = self.t_model((i + 1) * self.dt).repeat(batch_size, 1)
+                pbs = self.back_model(self.s_model(next_state), t)
                 dmean, dvar = gaussian_params(pbs)
                 back_mean_correction = 1 + dmean.tanh() * self.pb_scale_range
                 back_var_correction = 1 + dvar.tanh() * self.pb_scale_range
             else:
-                back_mean_correction, back_var_correction = torch.ones_like(s_), torch.ones_like(s_)
+                back_mean_correction, back_var_correction = torch.ones_like(next_state), torch.ones_like(next_state)
 
             if i > 0:
-                back_mean = s_ - self.dt * s_ / ((i + 1) * self.dt) * back_mean_correction
+                back_mean = next_state - self.dt * next_state / ((i + 1) * self.dt) * back_mean_correction
                 back_var = (self.pf_std_per_traj ** 2) * self.dt * i / (i + 1) * back_var_correction
-                noise_backward = (s - back_mean) / back_var.sqrt()
+                noise_backward = (state - back_mean) / back_var.sqrt()
                 logpb[:, i] = -0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1)
 
-            s = s_
-            states[:, i + 1] = s
+            state = next_state
+            states[:, i + 1] = state
 
         return states, logpf, logpb, logf
 

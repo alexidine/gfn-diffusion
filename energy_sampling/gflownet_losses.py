@@ -4,7 +4,7 @@ from torch.distributions import Normal
 
 def fwd_tb(initial_state, gfn, log_reward_fn, exploration_std=None, return_exp = False):
     states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, exploration_std, log_reward_fn)
-    with torch.no_grad():
+    with torch.no_grad():  # get terminal state reward
         log_r = log_reward_fn(states[:, -1]).detach()
 
     loss = 0.5 * ((log_pfs.sum(-1) + log_fs[:, 0] - log_pbs.sum(-1) - log_r) ** 2)

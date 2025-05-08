@@ -74,7 +74,7 @@ class MolecularCrystal(BaseSet):
         cluster_batch.compute_LJ_energy()
         silu_energy = cluster_batch.compute_silu_energy() / cluster_batch.num_atoms
         cluster_batch.silu_pot = silu_energy
-        packing_loss = 10*F.relu(-(cluster_batch.packing_coeff - 0.5))**2  # apply a squared penalty for packing coeffs less than 0.5
+        packing_loss = 100*F.relu(-(cluster_batch.packing_coeff - 0.5))**2  # apply a squared penalty for packing coeffs less than 0.5
         crystal_energy = silu_energy + packing_loss
 
         if return_batch:
