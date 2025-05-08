@@ -9,7 +9,7 @@ s_emb_dim: 256                 # dimensionality of state embedding: standard
 t_emb_dim: 256                 # dimensionality of time embedding: standard
 harmonics_dim: 64             # dimensionality of harmonic embedding: standard
 
-batch_size: 1000               # number of samples per training batch: relatively small
+batch_size: 5000               # number of samples per training batch: relatively small
 epochs: 25000                 # number of training epochs: relatively large
 buffer_size: 600000           # size of replay buffer: relatively large
 

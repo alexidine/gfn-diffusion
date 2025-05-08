@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 from mxtaltools.dataset_utils.data_classes import MolCrystalData, MolData
 from mxtaltools.dataset_utils.utils import collate_data_list
@@ -71,8 +72,10 @@ class MolecularCrystal(BaseSet):
                                                   align_to_standardized_orientation=False)
         cluster_batch.construct_radial_graph(cutoff=6)
         cluster_batch.compute_LJ_energy()
-        crystal_energy = cluster_batch.compute_silu_energy() / cluster_batch.num_atoms
-        cluster_batch.silu_pot = crystal_energy
+        silu_energy = cluster_batch.compute_silu_energy() / cluster_batch.num_atoms
+        cluster_batch.silu_pot = silu_energy
+        packing_loss = 10*F.relu(-(cluster_batch.packing_coeff - 0.5))**2  # apply a squared penalty for packing coeffs less than 0.5
+        crystal_energy = silu_energy + packing_loss
 
         if return_batch:
             return crystal_energy, cluster_batch
@@ -102,7 +105,7 @@ class MolecularCrystal(BaseSet):
         note this is NOT weighted by energy
         """
         crystal_batch = self.init_blank_crystal_batch(batch_size)
-        crystal_batch.sample_random_crystal_parameters(cleaning_mode='soft')
+        crystal_batch.sample_random_reduced_crystal_parameters(cleaning_mode='hard')
         # higher quality crystals but very expensive
         # crystal_batch.sample_reasonable_random_parameters(
         #     tolerance=3,
