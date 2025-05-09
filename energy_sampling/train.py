@@ -106,6 +106,8 @@ parser.add_argument('--eval', action='store_true', default=False)
 
 # args for molecular crystal energy
 parser.add_argument('--temperature', type=float, default=10)
+parser.add_argument('--small_box_penalty', type=float, default=1)
+
 
 
 args, remaining = parser.parse_known_args()
@@ -153,7 +155,7 @@ def get_energy():
     elif args.energy == 'many_well':
         energy = ManyWell(device=device)
     elif args.energy == 'molecular_crystal':
-        energy = MolecularCrystal(device=device, temperature=args.temperature)
+        energy = MolecularCrystal(device=device, temperature=args.temperature, small_box_penalty=args.small_box_penalty)
     return energy
 
 

@@ -12,7 +12,8 @@ class MolecularCrystal(BaseSet):
                  dim: int = 12,
                  test_molecule: str = 'UREA',
                  space_group: int = 2,
-                 temperature: float = 10):
+                 temperature: float = 10,
+                 small_box_penalty: float = 1):
         super(MolecularCrystal, self).__init__()
         self.device = device
         self.data_ndim = dim
@@ -21,6 +22,7 @@ class MolecularCrystal(BaseSet):
         self.test_molecule = test_molecule
         self.initialize_test_molecule(test_molecule)
         self.temperature = temperature
+        self.small_box_penalty = small_box_penalty
 
     def initialize_test_molecule(self, test_molecule):
         # UREA from molview - default if not specified
@@ -74,7 +76,7 @@ class MolecularCrystal(BaseSet):
         cluster_batch.compute_LJ_energy()
         silu_energy = cluster_batch.compute_silu_energy() / cluster_batch.num_atoms
         cluster_batch.silu_pot = silu_energy
-        packing_loss = 100*F.relu(-(cluster_batch.packing_coeff - 0.5))**2  # apply a squared penalty for packing coeffs less than 0.5
+        packing_loss = self.small_box_penalty*F.relu(-(cluster_batch.packing_coeff - 0.5))**2  # apply a squared penalty for packing coeffs less than 0.5
         crystal_energy = silu_energy + packing_loss
 
         if return_batch:
