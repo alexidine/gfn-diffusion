@@ -1,0 +1,72 @@
+run_name: 'dev_test2'
+device: 'cuda'
+lr_policy: 0.001              # learning rate of the policy network
+lr_flow: 0.1                  # learning rate of the flow network
+lr_back: 0.001                # learning rate of the backward pass
+
+# model parameters
+zero_init: true
+pis_architectures: false # false goes to our custom architectures, which are better for training bigger models
+lgv_layers: 4
+joint_layers: 10
+hidden_dim: 512                # dimensionality of hidden layer: standard
+s_emb_dim: 32                 # dimensionality of state embedding: standard
+t_emb_dim: 32                 # dimensionality of time embedding: standard
+harmonics_dim: 64             # dimensionality of harmonic embedding: standard
+dropout: 0
+norm: 'layer'
+
+batch_size: 10000               # number of samples per training batch: relatively small
+epochs: 25000                 # number of training epochs: relatively large
+buffer_size: 600000           # size of replay buffer: relatively large
+
+T: 10
+subtb_lambda: 2
+t_scale: 1.0
+log_var_range: 4.0
+energy: "molecular_crystal"   # "molecular_crystal"  # "many_well"
+mode_fwd: "tb"
+mode_bwd: "tb"
+both_ways: true
+
+# local search settings
+################################################################
+local_search: true
+max_iter_ls: 200                # how many iterations to run local search
+burn_in: 100                    # how many iterations to burn in before making local search
+ls_cycle: 100                   # how frequently to make local search
+ld_step: 0.1                    # langevin step size
+ld_schedule: true               # whether to use scheduled langevin step size
+target_acceptance_rate: 0.574   # target acceptance rate for local search
+
+# replay buffer settings
+################################################################
+beta: 1.0             # reward prioritized replay sampling: high beta = steep prioritization
+rank_weight: 0.01     # rank-based replay sampling: low rank_weight = steep prioritization
+prioritized: "rank"   # three kinds of replay training: random, reward prioritized, rank-based
+
+################################################################
+bwd: false
+exploratory: true
+
+sampling: "buffer"
+langevin: false
+langevin_scaling_per_dimension: false
+conditional_flow_model: false
+learn_pb: true
+pb_scale_range: 0.1
+learned_variance: false
+partial_energy: false
+exploration_factor: 0.35
+exploration_wd: true
+clipping: true
+lgv_clip: 100.0
+gfn_clip: 10000.0
+seed: 12345
+weight_decay: 1e-7
+use_weight_decay: false
+eval: false
+
+# molecular crystal settings
+################################################################
+temperature: 0.1
