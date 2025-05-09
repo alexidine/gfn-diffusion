@@ -30,6 +30,8 @@ parser.add_argument('--lr_back', type=float, default=1e-3)
 parser.add_argument('--hidden_dim', type=int, default=64)
 parser.add_argument('--s_emb_dim', type=int, default=64)
 parser.add_argument('--t_emb_dim', type=int, default=64)
+parser.add_argument('--dropout', type=float, default=0)
+parser.add_argument('--norm', type=str, default=None)
 parser.add_argument('--harmonics_dim', type=int, default=64)
 parser.add_argument('--batch_size', type=int, default=300)
 parser.add_argument('--epochs', type=int, default=25000)
@@ -318,7 +320,8 @@ def train():
                     t_scale=args.t_scale, langevin_scaling_per_dimension=args.langevin_scaling_per_dimension,
                     conditional_flow_model=args.conditional_flow_model, learn_pb=args.learn_pb,
                     pis_architectures=args.pis_architectures, lgv_layers=args.lgv_layers,
-                    joint_layers=args.joint_layers, zero_init=args.zero_init, device=device).to(device)
+                    joint_layers=args.joint_layers, dropout=args.dropout, norm=args.norm,
+                    zero_init=args.zero_init, device=device).to(device)
 
     gfn_optimizer = get_gfn_optimizer(gfn_model, args.lr_policy, args.lr_flow, args.lr_back, args.learn_pb,
                                       args.conditional_flow_model, args.use_weight_decay, args.weight_decay)

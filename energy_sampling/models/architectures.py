@@ -1,8 +1,11 @@
+from typing import Optional
+
 import torch
 import numpy as np
 from einops import rearrange
 from torch import nn
 import math
+from mxtaltools.models.modules.components import scalarMLP
 
 
 class TimeConder(nn.Module):
@@ -88,15 +91,29 @@ class FourierMLP(nn.Module):
 
 
 class TimeEncoding(nn.Module):
-    def __init__(self, harmonics_dim: int, dim: int, hidden_dim: int = 64):
+    def __init__(self, harmonics_dim: int,
+                 dim: int,
+                 hidden_dim: int = 64,
+                 dropout: Optional[float] = 0,
+                 norm: Optional[str] = None,
+                 bias: Optional[bool] = True):
         super(TimeEncoding, self).__init__()
 
         pe = torch.arange(1, harmonics_dim + 1).float().unsqueeze(0) * 2 * math.pi
-        self.t_model = nn.Sequential(
-            nn.Linear(2 * harmonics_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, dim),
-            nn.GELU()
+        # self.t_model = nn.Sequential(
+        #     nn.Linear(2 * harmonics_dim, hidden_dim),
+        #     nn.GELU(),
+        #     nn.Linear(hidden_dim, dim),
+        #     nn.GELU()
+        # )
+        self.t_model = scalarMLP(
+            layers=1,
+            input_dim=2*harmonics_dim,
+            filters=hidden_dim,
+            output_dim=dim,
+            dropout=dropout,
+            norm=norm,
+            bias=bias,
         )
         self.register_buffer('pe', pe)
 
@@ -112,14 +129,29 @@ class TimeEncoding(nn.Module):
 
 
 class StateEncoding(nn.Module):
-    def __init__(self, s_dim: int, hidden_dim: int = 64, s_emb_dim: int = 64):
+    def __init__(self, s_dim: int,
+                 hidden_dim: int = 64,
+                 s_emb_dim: int = 64,
+                 dropout: Optional[float] = 0,
+                 norm: Optional[str] = None,
+                 bias: Optional[bool] = True
+                 ):
         super(StateEncoding, self).__init__()
 
-        self.x_model = nn.Sequential(
-            nn.Linear(s_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, s_emb_dim),
-            nn.GELU()
+        # self.x_model = nn.Sequential(
+        #     nn.Linear(s_dim, hidden_dim),
+        #     nn.GELU(),
+        #     nn.Linear(hidden_dim, s_emb_dim),
+        #     nn.GELU()
+        # )
+        self.x_model = scalarMLP(
+            layers=1,
+            input_dim=s_dim,
+            filters=hidden_dim,
+            output_dim=s_emb_dim,
+            dropout=dropout,
+            norm=norm,
+            bias=bias,
         )
 
     def forward(self, s):
@@ -127,38 +159,64 @@ class StateEncoding(nn.Module):
 
 
 class JointPolicy(nn.Module):
-    def __init__(self, s_dim: int, s_emb_dim: int, t_dim: int, hidden_dim: int = 64, out_dim: int = None,
+    def __init__(self, s_dim: int,
+                 s_emb_dim: int,
+                 t_dim: int,
+                 hidden_dim: int = 64,
+                 layers: int = 4,
+                 out_dim: int = None,
+                 dropout: Optional[float] = 0,
+                 norm: Optional[str] = None,
+                 bias: Optional[bool] = True,
                  zero_init: bool = False):
         super(JointPolicy, self).__init__()
         if out_dim is None:
             out_dim = 2 * s_dim
 
-        self.model = nn.Sequential(
-            nn.Linear(s_emb_dim + t_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, out_dim)
+        self.model = scalarMLP(
+            layers=layers,
+            input_dim=s_emb_dim + t_dim,
+            filters=hidden_dim,
+            output_dim=out_dim,
+            dropout=dropout,
+            norm=norm,
+            bias=bias,
         )
 
         if zero_init:
-            self.model[-1].weight.data.fill_(0.0)
-            self.model[-1].bias.data.fill_(0.0)
+            self.model.output_layer.weight.data.fill_(0.0)
+            #self.model.output_layer.bias.data.fill_(0.0)
 
     def forward(self, s, t):
         return self.model(torch.cat([s, t], dim=-1))
 
 
 class FlowModel(nn.Module):
-    def __init__(self, s_emb_dim: int, t_dim: int, hidden_dim: int = 64, out_dim: int = 1):
+    def __init__(self, s_emb_dim: int,
+                 t_dim: int,
+                 hidden_dim: int = 64,
+                 layers: int = 4,
+                 dropout: Optional[float] = 0,
+                 norm: Optional[str] = None,
+                 bias: Optional[bool] = True,
+                 out_dim: int = 1):
         super(FlowModel, self).__init__()
 
-        self.model = nn.Sequential(
-            nn.Linear(s_emb_dim + t_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, out_dim)
+        # self.model = nn.Sequential(
+        #     nn.Linear(s_emb_dim + t_dim, hidden_dim),
+        #     nn.GELU(),
+        #     nn.Linear(hidden_dim, hidden_dim),
+        #     nn.GELU(),
+        #     nn.Linear(hidden_dim, out_dim)
+        # )
+        self.model = scalarMLP(
+            layers=layers,
+            input_dim=s_emb_dim + t_dim,
+            filters=hidden_dim,
+            output_dim=out_dim,
+            dropout=dropout,
+            norm=norm,
+            bias=bias,
         )
 
     def forward(self, s, t):
@@ -166,20 +224,37 @@ class FlowModel(nn.Module):
 
 
 class LangevinScalingModel(nn.Module):
-    def __init__(self, s_emb_dim: int, t_dim: int, hidden_dim: int = 64, out_dim: int = 1, zero_init: bool = False):
+    def __init__(self, s_emb_dim: int,
+                 t_dim: int,
+                 hidden_dim: int = 64,
+                 layers: int = 3,
+                 out_dim: int = 1,
+                 dropout: Optional[float] = 0,
+                 norm: Optional[str] = None,
+                 bias: Optional[bool] = True,
+                 zero_init: bool = False):
         super(LangevinScalingModel, self).__init__()
 
-        self.model = nn.Sequential(
-            nn.Linear(s_emb_dim + t_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, out_dim)
+        # self.model = nn.Sequential(
+        #     nn.Linear(s_emb_dim + t_dim, hidden_dim),
+        #     nn.GELU(),
+        #     nn.Linear(hidden_dim, hidden_dim),
+        #     nn.GELU(),
+        #     nn.Linear(hidden_dim, out_dim)
+        # )
+        self.model = scalarMLP(
+            layers=layers,
+            input_dim=s_emb_dim + t_dim,
+            filters=hidden_dim,
+            output_dim=out_dim,
+            dropout=dropout,
+            norm=norm,
+            bias=bias,
         )
 
         if zero_init:
-            self.model[-1].weight.data.fill_(0.0)
-            self.model[-1].bias.data.fill_(0.01)
+            self.model.output_layer.weight.data.fill_(0.0)
+            #self.model.output_layer.bias.data.fill_(0.01)
 
     def forward(self, s, t):
         return self.model(torch.cat([s, t], dim=-1))

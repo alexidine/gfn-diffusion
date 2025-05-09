@@ -19,6 +19,7 @@ class GFN(nn.Module):
                  langevin_scaling_per_dimension: bool = True, conditional_flow_model: bool = False,
                  learn_pb: bool = False,
                  pis_architectures: bool = False, lgv_layers: int = 3, joint_layers: int = 2,
+                 dropout: Optional[float] = 0, norm: Optional[str] = None,
                  zero_init: bool = False, device=torch.device('cuda')):
         super(GFN, self).__init__()
         self.dim = dim
@@ -70,24 +71,32 @@ class GFN(nn.Module):
                 self.langevin_scaling_model = LangevinScalingModelPIS(s_emb_dim, t_dim, hidden_dim, 1,
                                                                       lgv_layers, zero_init)
 
-        else:
+        else:  # our custom architectures
 
-            self.t_model = TimeEncoding(harmonics_dim, t_dim, hidden_dim)
-            self.s_model = StateEncoding(dim, hidden_dim, s_emb_dim)
-            self.joint_model = JointPolicy(dim, s_emb_dim, t_dim, hidden_dim, 2 * dim, zero_init)
+            self.t_model = TimeEncoding(harmonics_dim, t_dim, hidden_dim,
+                                        norm=norm, dropout=dropout)
+            self.s_model = StateEncoding(dim, hidden_dim, s_emb_dim,
+                                         norm=norm, dropout=dropout)
+            self.joint_model = JointPolicy(dim, s_emb_dim, t_dim,
+                                           hidden_dim, joint_layers, 2 * dim, zero_init=zero_init,
+                                           norm=norm, dropout=dropout)
             if learn_pb:
-                self.back_model = JointPolicy(dim, s_emb_dim, t_dim, hidden_dim, 2 * dim, zero_init)
+                self.back_model = JointPolicy(dim, s_emb_dim, t_dim, hidden_dim, joint_layers, 2 * dim, zero_init=zero_init,
+                                              norm=norm, dropout=dropout)
             self.pb_scale_range = pb_scale_range
 
             if self.conditional_flow_model:
-                self.flow_model = FlowModel(s_emb_dim, t_dim, hidden_dim, 1)
+                self.flow_model = FlowModel(s_emb_dim, t_dim, hidden_dim, 1,
+                                            norm=norm, dropout=dropout)
             else:
                 self.flow_model = torch.nn.Parameter(torch.tensor(0.).to(self.device))
 
             if self.langevin_scaling_per_dimension:
-                self.langevin_scaling_model = LangevinScalingModel(s_emb_dim, t_dim, hidden_dim, dim, zero_init)
+                self.langevin_scaling_model = LangevinScalingModel(s_emb_dim, t_dim, hidden_dim, lgv_layers, dim, zero_init=zero_init,
+                                                                   norm=norm, dropout=dropout)
             else:
-                self.langevin_scaling_model = LangevinScalingModel(s_emb_dim, t_dim, hidden_dim, 1, zero_init)
+                self.langevin_scaling_model = LangevinScalingModel(s_emb_dim, t_dim, hidden_dim, lgv_layers, 1, zero_init=zero_init,
+                                                                   norm=norm, dropout=dropout)
 
     def split_params(self, tensor):
         mean, logvar = gaussian_params(tensor)
