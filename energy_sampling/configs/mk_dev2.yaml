@@ -16,8 +16,8 @@ harmonics_dim: 64             # dimensionality of harmonic embedding: standard
 dropout: 0
 norm: 'layer'
 
-batch_size: 10000               # number of samples per training batch: relatively small
-epochs: 25000                 # number of training epochs: relatively large
+batch_size: 5000               # number of samples per training batch: relatively small
+epochs: 10000000                 # number of training epochs: relatively large
 buffer_size: 600000           # size of replay buffer: relatively large
 
 T: 10

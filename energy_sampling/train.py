@@ -340,13 +340,18 @@ def train():
                              beta=args.beta,
                              rank_weight=args.rank_weight, prioritized=args.prioritized)
     gfn_model.train()
+    oomed_out = False
     for i in trange(args.epochs + 1):
         try:
             metrics['train/loss'] = train_step(energy, gfn_model, gfn_optimizer, i, args.exploratory,
                                                buffer, buffer_ls, args.exploration_factor, args.exploration_wd)
+            if not oomed_out:
+                args.batch_size = max(args.batch_size + 1, int(args.batch_size * 1.01)) # gradually increment batch size
+
         except (RuntimeError, ValueError) as e:  # if we do hit OOM, slash the batch size
             if "CUDA out of memory" in str(e) or "nonzero is not supported for tensors with more than INT_MAX elements" in str(e):
                 args.batch_size = handle_oom(args.batch_size)
+                oomed_out = True
                 print(f"Reducing batch size to {args.batch_size}")
             else:
                 raise e  # will simply raise error if other or if training on CPU
