@@ -1,3 +1,5 @@
+import gc
+
 import yaml
 from mxtaltools.reporting.online import simple_cell_hist, simple_generated_scatter, log_crystal_samples
 
@@ -339,8 +341,15 @@ def train():
                              rank_weight=args.rank_weight, prioritized=args.prioritized)
     gfn_model.train()
     for i in trange(args.epochs + 1):
-        metrics['train/loss'] = train_step(energy, gfn_model, gfn_optimizer, i, args.exploratory,
-                                           buffer, buffer_ls, args.exploration_factor, args.exploration_wd)
+        try:
+            metrics['train/loss'] = train_step(energy, gfn_model, gfn_optimizer, i, args.exploratory,
+                                               buffer, buffer_ls, args.exploration_factor, args.exploration_wd)
+        except (RuntimeError, ValueError) as e:  # if we do hit OOM, slash the batch size
+            if "CUDA out of memory" in str(e) or "nonzero is not supported for tensors with more than INT_MAX elements" in str(e):
+                args.batch_size = handle_oom(args.batch_size)
+                print(f"Reducing batch size to {args.batch_size}")
+            else:
+                raise e  # will simply raise error if other or if training on CPU
 
         if i % 250 == 0 and i > 0 or i == 0:
             metrics.update(eval_step(eval_data, energy, gfn_model, final_eval=False))
@@ -359,6 +368,11 @@ def train():
         del metrics['eval/log_Z_learned']
     torch.save(gfn_model.state_dict(), f'{name}model_final.pt')
 
+def handle_oom(batch_size):
+    gc.collect()  # TODO not clear to me that these are effective
+    torch.cuda.empty_cache()
+    batch_size = int(batch_size * 0.9)
+    return batch_size
 
 def final_eval(energy, gfn_model):
     final_eval_data = energy.sample(final_eval_data_size)
