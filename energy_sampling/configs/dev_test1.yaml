@@ -66,4 +66,4 @@ eval: false
 
 # molecular crystal settings
 ################################################################
-temperature: 0.1
+temperature: 10
