@@ -27,11 +27,11 @@ log_var_range: 4.0
 energy: "molecular_crystal"   # "molecular_crystal"  # "many_well"
 mode_fwd: "tb"
 mode_bwd: "tb"
-both_ways: false
+both_ways: true
 
 # local search settings
 ################################################################
-local_search: false
+local_search: true
 max_iter_ls: 200                # how many iterations to run local search
 burn_in: 100                    # how many iterations to burn in before making local search
 ls_cycle: 100                   # how frequently to make local search
@@ -53,7 +53,7 @@ sampling: "buffer"
 langevin: false
 langevin_scaling_per_dimension: false
 conditional_flow_model: false
-learn_pb: false
+learn_pb: true
 pb_scale_range: 0.1
 learned_variance: false
 partial_energy: false

@@ -127,10 +127,10 @@ set_seed(args.seed)
 if 'SLURM_PROCID' in os.environ:
     args.seed += int(os.environ["SLURM_PROCID"])
 
-eval_data_size = 2000
-final_eval_data_size = 200
-plot_data_size = 2000
-final_plot_data_size = 2000
+eval_data_size = args.batch_size
+final_eval_data_size = args.batch_size
+plot_data_size = args.batch_size
+final_plot_data_size = args.batch_size
 
 if args.pis_architectures:
     args.zero_init = True
@@ -356,7 +356,7 @@ def train():
             else:
                 raise e  # will simply raise error if other or if training on CPU
 
-        if i % 250 == 0 and i > 0 or i == 0:
+        if (i % 250 == 0 and i > 0) or i == 50:
             metrics.update(eval_step(eval_data, energy, gfn_model, final_eval=False))
             if 'tb-avg' in args.mode_fwd or 'tb-avg' in args.mode_bwd:
                 del metrics['eval/log_Z_learned']
