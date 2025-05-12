@@ -73,5 +73,5 @@ eval: false
 
 # molecular crystal settings
 ################################################################
-temperature: 0.1
-small_box_penalty: 10
+temperature: 1
+small_box_penalty: 1

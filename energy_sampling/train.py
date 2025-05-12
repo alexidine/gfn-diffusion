@@ -372,9 +372,6 @@ def train():
             metrics.update(eval_step(eval_data, energy, gfn_model, final_eval=False))
             if 'tb-avg' in args.mode_fwd or 'tb-avg' in args.mode_bwd:
                 del metrics['eval/log_Z_learned']
-            # images = plot_step(energy, gfn_model, name)
-            # metrics.update(images)
-            # plt.close('all')
             wandb.log(metrics, step=i)
 
         elif i % 10 == 0:
