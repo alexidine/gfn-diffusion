@@ -54,6 +54,7 @@ parser.add_argument('--local_search', action='store_true', default=False)
 
 # How many iterations to run local search
 parser.add_argument('--max_iter_ls', type=int, default=200)
+parser.add_argument('--samples_per_opt', type=int, default=10)
 
 # How many iterations to burn in before making local search
 parser.add_argument('--burn_in', type=int, default=100)
@@ -287,18 +288,29 @@ def bwd_train_step(energy, gfn_model, buffer, buffer_ls, exploration_std=None, i
         samples = gfn_model.sleep_phase_sample(args.batch_size, exploration_std).to(device)
     elif args.sampling == 'energy':
         samples = energy.sample(args.batch_size).to(device)
-    elif args.sampling == 'buffer':
+    elif args.sampling == 'buffer':  # todo cleanup the logic here - for molecular crystal we should really just have one method
         if args.local_search:
             if it % args.ls_cycle < 2:
-                samples, rewards = buffer.sample()
-                local_search_samples, log_r = langevin_dynamics(samples, energy.log_reward, device, args)
+                if args.energy == 'molecular_crystal':
+                    # sample reasonable diffuse crystals
+                    samples = energy.sample(args.batch_size,
+                                            reasonable_only=True,
+                                            target_packing_coeff=0.5)
+                    # optimize them
+                    local_search_samples, log_r = energy.local_opt(samples,
+                                                                   args.max_iter_ls,
+                                                                   args.samples_per_opt,
+                                                                   )
+                else:
+                    samples, rewards = buffer.sample()
+                    local_search_samples, log_r = langevin_dynamics(samples, energy.log_reward, device, args)
                 buffer_ls.add(local_search_samples, log_r)
 
             samples, rewards = buffer_ls.sample()
         else:
             samples, rewards = buffer.sample()
 
-    loss = get_gfn_backward_loss(args.mode_bwd, samples, gfn_model, energy.log_reward,
+    loss = get_gfn_backward_loss(args.mode_bwd, samples.to(device), gfn_model, energy.log_reward,
                                  exploration_std=exploration_std)
     return loss
 
@@ -364,8 +376,12 @@ def train():
             # metrics.update(images)
             # plt.close('all')
             wandb.log(metrics, step=i)
-            if i % 1000 == 0:
-                torch.save(gfn_model.state_dict(), f'{name}model.pt')
+
+        elif i % 10 == 0:
+            wandb.log(metrics, step=i)
+
+        if i % 1000 == 0:
+            torch.save(gfn_model.state_dict(), f'{name}model.pt')
 
     eval_results = final_eval(energy, gfn_model).to(device)
     metrics.update(eval_results)

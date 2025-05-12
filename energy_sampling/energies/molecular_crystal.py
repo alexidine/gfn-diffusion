@@ -1,8 +1,11 @@
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
 
 from mxtaltools.dataset_utils.data_classes import MolCrystalData, MolData
 from mxtaltools.dataset_utils.utils import collate_data_list
+from mxtaltools.crystal_search.standalone_crystal_opt import sample_about_crystal
 
 from .base_set import BaseSet
 
@@ -59,30 +62,82 @@ class MolecularCrystal(BaseSet):
             skip_mol_analysis=False,
         )
 
-    def analyze_crystal_batch(self, x, return_batch=False):  # x is gfn_outputs
+    def instantiate_crystals(self, x):
         crystal_batch = self.init_blank_crystal_batch(len(x))
         raw_cell_params = crystal_batch.destandardize_cell_parameters(x)
         crystal_batch.set_cell_parameters(raw_cell_params,
                                           skip_box_analysis=True)
-        crystal_batch.clean_cell_parameters(mode='soft',
+        # TODO 'soft' will likely train nicer,
+        # but we have the inverse problem when e.g., storing samples in a buffer
+        # this transforms every time we soften it,
+        # so we would have to save an extra 'pre-softened' canonicalized form
+        crystal_batch.clean_cell_parameters(mode='hard',
                                             length_pad=1.5,
                                             canonicalize_orientations=False,
                                             constrain_z=True,
                                             enforce_niggli=True)
+        return crystal_batch
+
+    def analyze_crystal_batch(self, x, return_batch=False):  # x is gfn_outputs
+        crystal_batch = self.instantiate_crystals(x)
         cluster_batch = crystal_batch.mol2cluster(cutoff=6,
                                                   supercell_size=10,
                                                   align_to_standardized_orientation=False)
         cluster_batch.construct_radial_graph(cutoff=6)
         cluster_batch.compute_LJ_energy()
-        silu_energy = cluster_batch.compute_silu_energy() / cluster_batch.num_atoms
-        cluster_batch.silu_pot = silu_energy
-        packing_loss = self.small_box_penalty*F.relu(-(cluster_batch.packing_coeff - 0.5))**2  # apply a squared penalty for packing coeffs less than 0.5
-        crystal_energy = silu_energy + packing_loss
+        silu_energy = cluster_batch.compute_silu_energy()
+        cluster_batch.silu_pot = silu_energy / cluster_batch.num_atoms
+        crystal_energy = self.generator_energy(crystal_batch.packing_coeff,
+                                               silu_energy,
+                                               crystal_batch.num_atoms)
 
         if return_batch:
             return crystal_energy, cluster_batch
         else:
             return crystal_energy
+
+    def generator_energy(self, packing_coeff, silu_energy, num_atoms):
+        # apply a -log penalty below 0.6
+        packing_loss = self.small_box_penalty * F.relu((-torch.log(packing_coeff.clip(min=0.001))) - 0.5)
+        crystal_energy = silu_energy / num_atoms + packing_loss
+
+        return crystal_energy/self.temperature
+
+    def local_opt(self, x,
+                  max_num_steps,
+                  samples_per_opt):
+        """
+        Do a local optimization of the crystal parameters
+        :param x:
+        :return:
+        """
+        crystal_batch = self.instantiate_crystals(x)
+        optimization_record = crystal_batch.optimize_crystal_parameters(
+            mol_orientation=None,
+            enforce_niggli=True,
+            optim_target='silu',
+            cutoff=6,
+            compression_factor=1,
+            max_num_steps=max_num_steps,
+            lr=1e-3,
+        )
+        samples_out = optimization_record[-1]
+        if samples_per_opt > 0:
+            nearby_samples = sample_about_crystal(samples_out,
+                                                  noise_level=0.05,  # empirically gets us an LJ std about 3
+                                                  num_samples=samples_per_opt,
+                                                  cutoff=6,
+                                                  do_silu_pot=True,
+                                                  enforce_niggli=True)
+            for ss in nearby_samples:
+                samples_out.extend(ss)
+
+        samples = torch.cat([elem.standardize_cell_parameters() for elem in samples_out])
+        silu_energies = torch.tensor([elem.silu_pot for elem in samples_out])
+        packing_coeffs = torch.tensor([elem.packing_coeff for elem in samples_out])
+        num_atoms = torch.tensor([elem.num_atoms for elem in samples_out])
+
+        return samples, -self.generator_energy(packing_coeffs, silu_energies, num_atoms)
 
     def energy(self, x):
         """
@@ -92,26 +147,41 @@ class MolecularCrystal(BaseSet):
         :param x:
         :return:
         """
-        return self.analyze_crystal_batch(x)/self.temperature
+        return self.analyze_crystal_batch(x)
 
     def init_blank_crystal_batch(self, batch_size):
         return collate_data_list([MolCrystalData(
             molecule=self.mol.clone(),
             sg_ind=self.space_group,
             aunit_handedness=torch.ones(1),
+            cell_lengths=torch.ones(3, device=self.device),
+            # if we don't put dummies in here, later ops to_data_list fail
+            cell_angles=torch.ones(3, device=self.device),
+            aunit_centroid=torch.ones(3, device=self.device),
+            aunit_orientation=torch.ones(3, device=self.device),
         ) for _ in range(batch_size)]).to(self.device)
 
-    def sample(self, batch_size):
+    def sample(self,
+               batch_size,
+               reasonable_only: bool = False,
+               target_packing_coeff: Optional[float] = None
+               ):
         """
         Return random crystal sample
         note this is NOT weighted by energy
         """
-        crystal_batch = self.init_blank_crystal_batch(batch_size)
-        crystal_batch.sample_random_reduced_crystal_parameters(cleaning_mode='hard')
-        # higher quality crystals but very expensive
-        # crystal_batch.sample_reasonable_random_parameters(
-        #     tolerance=3,
-        #     max_attempts=50
-        # )
+        with torch.no_grad():
+            crystal_batch = self.init_blank_crystal_batch(batch_size)
+            if not reasonable_only:
+                crystal_batch.sample_random_reduced_crystal_parameters(cleaning_mode='hard',
+                                                                       target_packing_coeff=target_packing_coeff)
 
-        return crystal_batch.standardize_cell_parameters().cpu().detach()
+            else: # higher quality crystals, but expensive
+                crystal_batch.sample_reasonable_random_parameters(
+                    tolerance=3,
+                    max_attempts=50,
+                    target_packing_coeff=target_packing_coeff,
+                    sample_niggli=True
+                )
+
+            return crystal_batch.standardize_cell_parameters()

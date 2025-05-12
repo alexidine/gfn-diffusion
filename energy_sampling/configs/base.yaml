@@ -1,4 +1,4 @@
-run_name: 'mk_local_dev'
+run_name: 'base'
 device: 'cuda'
 lr_policy: 0.001              # learning rate of the policy network
 lr_flow: 0.1                  # learning rate of the flow network
@@ -16,7 +16,7 @@ harmonics_dim: 64             # dimensionality of harmonic embedding: standard
 dropout: 0.05
 norm: 'layer'
 
-batch_size: 10               # number of samples per training batch: relatively small
+batch_size: 100               # number of samples per training batch: relatively small
 epochs: 25000                 # number of training epochs: relatively large
 buffer_size: 600000           # size of replay buffer: relatively large
 
@@ -32,7 +32,7 @@ both_ways: true
 # local search settings
 ################################################################
 local_search: true
-max_iter_ls: 20                 # how many iterations to run local search
+max_iter_ls: 200                # how many iterations to run local search
 samples_per_opt: 10             # how many noisy samples to take near each optimized minimum
 burn_in: 100                    # NOT USED IN MXTAL how many iterations to burn in before making local search
 ls_cycle: 100                   # how frequently to make local search
@@ -42,9 +42,6 @@ target_acceptance_rate: 0.574   # NOT USED IN MXTAL target acceptance rate for l
 
 # replay buffer settings
 ################################################################
-# NOTE I HAVE REMOVED BUFFER SAMPLING
-# FROM LS TRAINING FOR MXTALS, FOR NOW
-# ALL LS SAMPLES ARE INSTEAD DRAWN RANDOMLY, WITH SOME CONSTRAINTS
 beta: 1.0             # reward prioritized replay sampling: high beta = steep prioritization
 rank_weight: 0.01     # rank-based replay sampling: low rank_weight = steep prioritization
 prioritized: "rank"   # three kinds of replay training: random, reward prioritized, rank-based
@@ -74,4 +71,4 @@ eval: false
 # molecular crystal settings
 ################################################################
 temperature: 0.1
-small_box_penalty: 10
+small_box_penalty: 100
