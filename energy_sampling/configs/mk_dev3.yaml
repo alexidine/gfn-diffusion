@@ -1,8 +1,8 @@
 run_name: 'dev_test3'
 device: 'cuda'
-lr_policy: 0.001              # learning rate of the policy network
-lr_flow: 0.1                  # learning rate of the flow network
-lr_back: 0.001                # learning rate of the backward pass
+lr_policy: 0.0001              # learning rate of the policy network
+lr_flow: 0.01                  # learning rate of the flow network
+lr_back: 0.0001                # learning rate of the backward pass
 
 # model parameters
 zero_init: true
@@ -16,7 +16,7 @@ harmonics_dim: 64             # dimensionality of harmonic embedding: standard
 dropout: 0
 norm: 'layer'
 
-batch_size: 5000               # number of samples per training batch: relatively small
+batch_size: 500               # number of samples per training batch: relatively small
 epochs: 10000000                 # number of training epochs: relatively large
 buffer_size: 600000           # size of replay buffer: relatively large
 
