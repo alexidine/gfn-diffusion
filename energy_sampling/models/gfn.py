@@ -121,7 +121,7 @@ class GFN(nn.Module):
 
         time_encoding = self.t_model(time).repeat(batch_size, 1)
         state_encoding = self.s_model(state)
-        state_update = self.joint_model(state_encoding, time_encoding)
+        state_update = self.joint_model(state_encoding, time_encoding)  # nx(2d) with d drift and d noise parameters
         log_flow = self.flow_model(state_encoding, time_encoding).squeeze(-1) if self.conditional_flow_model or self.partial_energy else self.flow_model
 
         if self.langevin:
@@ -144,8 +144,8 @@ class GFN(nn.Module):
         states = torch.zeros((batch_size, self.trajectory_length + 1, self.dim), device=self.device)
 
         for i in range(self.trajectory_length):
-            pfs, log_flow = self.predict_next_state(state, i * self.dt, log_r)
-            pf_mean, pflogvars = self.split_params(pfs)
+            state_update, log_flow = self.predict_next_state(state, i * self.dt, log_r)
+            pf_mean, pflogvars = self.split_params(state_update)  # drift and log variance terms
 
             logf[:, i] = log_flow
             if self.partial_energy:

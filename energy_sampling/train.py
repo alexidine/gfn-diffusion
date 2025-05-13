@@ -339,6 +339,8 @@ def train():
                     joint_layers=args.joint_layers, dropout=args.dropout, norm=args.norm,
                     zero_init=args.zero_init, device=device).to(device)
 
+    wandb.watch(gfn_model, log_graph=True, log_freq=100)  # for gradient logging
+
     gfn_optimizer = get_gfn_optimizer(gfn_model, args.lr_policy, args.lr_flow, args.lr_back, args.learn_pb,
                                       args.conditional_flow_model, args.use_weight_decay, args.weight_decay)
 
@@ -358,7 +360,7 @@ def train():
             metrics['train/loss'] = train_step(energy, gfn_model, gfn_optimizer, i, args.exploratory,
                                                buffer, buffer_ls, args.exploration_factor, args.exploration_wd)
             if not oomed_out:
-                args.batch_size = max(args.batch_size + 1, int(args.batch_size * 1.01)) # gradually increment batch size
+                args.batch_size = max(args.batch_size + 1, int(args.batch_size * 1.01))  # gradually increment batch size
 
         except (RuntimeError, ValueError) as e:  # if we do hit OOM, slash the batch size
             if "CUDA out of memory" in str(e) or "nonzero is not supported for tensors with more than INT_MAX elements" in str(e):

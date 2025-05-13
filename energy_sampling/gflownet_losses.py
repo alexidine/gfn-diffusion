@@ -11,7 +11,6 @@ def fwd_tb(initial_state, gfn, log_reward_fn, exploration_std=None, return_exp=F
     if return_exp:
         return loss.mean(), states, log_pfs, log_pbs, log_r
     else:
-
         return loss.mean()
 
 
@@ -35,7 +34,6 @@ def fwd_tb_avg(initial_state, gfn, log_reward_fn, exploration_std=None, return_e
     if return_exp:
         return 0.5 * (loss ** 2).mean(), states, log_pfs, log_pbs, log_r
     else:
-
         return 0.5 * (loss ** 2).mean()
 
 
