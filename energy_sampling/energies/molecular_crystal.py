@@ -1,11 +1,11 @@
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 
 from mxtaltools.dataset_utils.data_classes import MolCrystalData, MolData
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.crystal_search.standalone_crystal_opt import sample_about_crystal
+from mxtaltools.common.utils import softplus_shift
 
 from .base_set import BaseSet
 
@@ -16,7 +16,7 @@ class MolecularCrystal(BaseSet):
                  test_molecule: str = 'UREA',
                  space_group: int = 2,
                  temperature: float = 10,
-                 small_box_penalty: float = 1):
+                 ):
         super(MolecularCrystal, self).__init__()
         self.device = device
         self.data_ndim = dim
@@ -25,7 +25,6 @@ class MolecularCrystal(BaseSet):
         self.test_molecule = test_molecule
         self.initialize_test_molecule(test_molecule)
         self.temperature = temperature
-        self.small_box_penalty = small_box_penalty
 
     def initialize_test_molecule(self, test_molecule):
         # UREA from molview - default if not specified
@@ -64,18 +63,8 @@ class MolecularCrystal(BaseSet):
 
     def instantiate_crystals(self, x):
         crystal_batch = self.init_blank_crystal_batch(len(x))
-        raw_cell_params = crystal_batch.destandardize_cell_parameters(x)
-        crystal_batch.set_cell_parameters(raw_cell_params,
-                                          skip_box_analysis=True)
-        # TODO 'soft' will likely train nicer,
-        # but we have the inverse problem when e.g., storing samples in a buffer
-        # this transforms every time we soften it,
-        # so we would have to save an extra 'pre-softened' canonicalized form
-        crystal_batch.clean_cell_parameters(mode='hard',
-                                            length_pad=1.5,
-                                            canonicalize_orientations=False,
-                                            constrain_z=True,
-                                            enforce_niggli=True)
+        crystal_batch.gen_basis_to_cell_params(x)
+
         return crystal_batch
 
     def analyze_crystal_batch(self, x, return_batch=False):  # x is gfn_outputs
@@ -87,7 +76,7 @@ class MolecularCrystal(BaseSet):
         cluster_batch.compute_LJ_energy()
         silu_energy = cluster_batch.compute_silu_energy()
         cluster_batch.silu_pot = silu_energy / cluster_batch.num_atoms
-        crystal_energy = self.generator_energy(crystal_batch.packing_coeff,
+        crystal_energy = self.generator_energy(crystal_batch,
                                                silu_energy,
                                                crystal_batch.num_atoms)
 
@@ -96,12 +85,13 @@ class MolecularCrystal(BaseSet):
         else:
             return crystal_energy
 
-    def generator_energy(self, packing_coeff, silu_energy, num_atoms):
-        # apply a -log penalty below 0.6
-        packing_loss = self.small_box_penalty * F.relu((-torch.log(packing_coeff.clip(min=0.001))) - 0.5)
-        crystal_energy = silu_energy / num_atoms + packing_loss
+    def generator_energy(self, cluster_batch, silu_energy, num_atoms):
+        aunit_lengths = cluster_batch.scale_lengths_to_aunit()
+        box_loss = softplus_shift(-(aunit_lengths - 3)).sum(1) + softplus_shift(
+            aunit_lengths - (3 * 2 * cluster_batch.radius[:, None])).sum(1)
+        crystal_energy = silu_energy / num_atoms / self.temperature + box_loss
 
-        return crystal_energy/self.temperature
+        return crystal_energy
 
     def local_opt(self, x,
                   max_num_steps,
@@ -132,12 +122,13 @@ class MolecularCrystal(BaseSet):
             for ss in nearby_samples:
                 samples_out.extend(ss)
 
-        samples = torch.cat([elem.standardize_cell_parameters() for elem in samples_out])
+        samples = torch.cat([elem.cell_params_to_gen_basis() for elem in samples_out])
         silu_energies = torch.tensor([elem.silu_pot for elem in samples_out])
         packing_coeffs = torch.tensor([elem.packing_coeff for elem in samples_out])
         num_atoms = torch.tensor([elem.num_atoms for elem in samples_out])
+        energy_out = torch.tensor([-self.generator_energy(sample_batch, silu_energies, num_atoms) for sample_batch in samples_out])
 
-        return samples, -self.generator_energy(packing_coeffs, silu_energies, num_atoms)
+        return samples, energy_out
 
     def energy(self, x):
         """
@@ -173,8 +164,7 @@ class MolecularCrystal(BaseSet):
         with torch.no_grad():
             crystal_batch = self.init_blank_crystal_batch(batch_size)
             if not reasonable_only:
-                crystal_batch.sample_random_reduced_crystal_parameters(cleaning_mode='hard',
-                                                                       target_packing_coeff=target_packing_coeff)
+                crystal_batch.sample_random_reduced_crystal_parameters(target_packing_coeff=target_packing_coeff)
 
             else: # higher quality crystals, but expensive
                 crystal_batch.sample_reasonable_random_parameters(

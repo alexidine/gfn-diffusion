@@ -70,5 +70,4 @@ eval: false
 
 # molecular crystal settings
 ################################################################
-temperature: 0.1
-small_box_penalty: 100
+temperature: 0.1  # scales the intermolecular energy component

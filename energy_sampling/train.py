@@ -1,7 +1,7 @@
 import gc
 
 import yaml
-from mxtaltools.reporting.online import simple_cell_hist, simple_generated_scatter, log_crystal_samples
+from mxtaltools.reporting.online import simple_cell_hist, simple_cell_scatter_fig, log_crystal_samples
 
 from energies.molecular_crystal import MolecularCrystal
 from plot_utils import *
@@ -36,14 +36,17 @@ parser.add_argument('--dropout', type=float, default=0)
 parser.add_argument('--norm', type=str, default=None)
 parser.add_argument('--harmonics_dim', type=int, default=64)
 parser.add_argument('--batch_size', type=int, default=300)
+parser.add_argument('--max_batch_size', type=int, default=300)
+parser.add_argument('--grow_batch_size', type=bool, default=False)
 parser.add_argument('--epochs', type=int, default=25000)
+parser.add_argument('--eval_period', type=int, default=25000)
 parser.add_argument('--buffer_size', type=int, default=300 * 1000 * 2)
 parser.add_argument('--T', type=int, default=100)
 parser.add_argument('--subtb_lambda', type=int, default=2)
 parser.add_argument('--t_scale', type=float, default=5.)
 parser.add_argument('--log_var_range', type=float, default=4.)
-parser.add_argument('--energy', type=str, default='9gmm',
-                    choices=('9gmm', '25gmm', 'hard_funnel', 'easy_funnel', 'many_well'))
+parser.add_argument('--energy', type=str,
+                    default='molecular_crystal')  # this thing is mostly hardcoded for molecular crystals now
 parser.add_argument('--mode_fwd', type=str, default="tb", choices=('tb', 'tb-avg', 'db', 'subtb', "pis"))
 parser.add_argument('--mode_bwd', type=str, default="tb", choices=('tb', 'tb-avg', 'mle'))
 parser.add_argument('--both_ways', action='store_true', default=False)
@@ -108,10 +111,10 @@ parser.add_argument('--use_weight_decay', action='store_true', default=False)
 parser.add_argument('--eval', action='store_true', default=False)
 
 # args for molecular crystal energy
-parser.add_argument('--temperature', type=float, default=10)
-parser.add_argument('--small_box_penalty', type=float, default=1)
-
-
+parser.add_argument('--init_temperature', type=float, default=1)
+parser.add_argument('--min_temperature', type=float, default=1)
+parser.add_argument('--anneal_temperature', type=bool, default=False)
+parser.add_argument('--temperature_annealing_threshold', type=float, default=0)
 
 args, remaining = parser.parse_known_args()
 
@@ -136,7 +139,7 @@ final_plot_data_size = args.batch_size
 if args.pis_architectures:
     args.zero_init = True
 
-device = args.device #torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = args.device  #torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 coeff_matrix = cal_subtb_coef_matrix(args.subtb_lambda, args.T).to(device)
 
 if args.both_ways and args.bwd:
@@ -158,7 +161,7 @@ def get_energy():
     elif args.energy == 'many_well':
         energy = ManyWell(device=device)
     elif args.energy == 'molecular_crystal':
-        energy = MolecularCrystal(device=device, temperature=args.temperature, small_box_penalty=args.small_box_penalty)
+        energy = MolecularCrystal(device=device, temperature=args.init_temperature)
     return energy
 
 
@@ -213,39 +216,20 @@ def plot_step(energy, gfn_model, name):
                 "visualization/kde": wandb.Image(fig_to_image(fig_kde))}
 
 
-def eval_step(eval_data, energy, gfn_model, final_eval=False):
+def eval_step(energy, gfn_model):
     gfn_model.eval()
     metrics = dict()
-    # if final_eval:
     init_state = torch.zeros(final_eval_data_size, energy.data_ndim).to(device)
     samples, metrics['eval/log_Z'], metrics['eval/log_Z_lb'], metrics[
         'eval/log_Z_learned'], sample_batch = log_partition_function(
         init_state, gfn_model, energy)
     metrics['Lattice Features Distribution'] = simple_cell_hist(sample_batch)
-    metrics['Sample Scatter'] = simple_generated_scatter(sample_batch)
+    metrics['Sample Scatter'] = simple_cell_scatter_fig(sample_batch)
     metrics['eval/packing_coeff'] = sample_batch.packing_coeff.mean().cpu().detach().numpy()
     metrics['eval/energy'] = sample_batch.silu_pot.mean().cpu().detach().numpy()
     samples_to_log = log_crystal_samples(sample_batch=sample_batch)
     [wandb.log({f'crystal_sample_{ind}': samples_to_log[ind]}, commit=False) for ind in range(len(samples_to_log))]
 
-    # else:
-    #     init_state = torch.zeros(eval_data_size, energy.data_ndim).to(device)
-    #     samples, metrics['eval/log_Z'], metrics['eval/log_Z_lb'], metrics[
-    #         'eval/log_Z_learned'] = log_partition_function(
-    #         init_state, gfn_model, energy.log_reward)
-    # if eval_data is None:
-    #     log_elbo = None
-    #     sample_based_metrics = None
-    # else:
-    #     if final_eval:
-    #         metrics['final_eval/mean_log_likelihood'] = 0. if args.mode_fwd == 'pis' else mean_log_likelihood(eval_data,
-    #                                                                                                           gfn_model,
-    #                                                                                                           energy.log_reward)
-    #     else:
-    #         metrics['eval/mean_log_likelihood'] = 0. if args.mode_fwd == 'pis' else mean_log_likelihood(eval_data,
-    #                                                                                                     gfn_model,
-    #                                                                                                     energy.log_reward)
-    #     metrics.update(get_sample_metrics(samples, eval_data, final_eval))
     gfn_model.train()
     return metrics
 
@@ -322,7 +306,8 @@ def train():
         os.makedirs(name)
 
     energy = get_energy()
-    eval_data = energy.sample(eval_data_size).to(device)
+    eval_data = None  # we are not using this right now - later maybe we will load from a prebuilt buffer
+    # energy.sample(eval_data_size).to(device)
 
     config = args.__dict__
     config["Experiment"] = "{args.energy}"
@@ -345,7 +330,6 @@ def train():
                                       args.conditional_flow_model, args.use_weight_decay, args.weight_decay)
 
     print(gfn_model)
-    metrics = dict()
 
     buffer = ReplayBuffer(args.buffer_size, device, energy.log_reward, args.batch_size, data_ndim=energy.data_ndim,
                           beta=args.beta,
@@ -353,40 +337,54 @@ def train():
     buffer_ls = ReplayBuffer(args.buffer_size, device, energy.log_reward, args.batch_size, data_ndim=energy.data_ndim,
                              beta=args.beta,
                              rank_weight=args.rank_weight, prioritized=args.prioritized)
+
     gfn_model.train()
+
     oomed_out = False
     for i in trange(args.epochs + 1):
+        metrics = dict()
         try:
             metrics['train/loss'] = train_step(energy, gfn_model, gfn_optimizer, i, args.exploratory,
                                                buffer, buffer_ls, args.exploration_factor, args.exploration_wd)
             if not oomed_out:
-                args.batch_size = max(args.batch_size + 1, int(args.batch_size * 1.01))  # gradually increment batch size
+                if args.batch_size < args.max_batch_size and args.grow_batch_size:
+                    args.batch_size = max(args.batch_size + 1,
+                                          int(args.batch_size * 1.01))  # gradually increment batch size
 
         except (RuntimeError, ValueError) as e:  # if we do hit OOM, slash the batch size
-            if "CUDA out of memory" in str(e) or "nonzero is not supported for tensors with more than INT_MAX elements" in str(e):
+            if "CUDA out of memory" in str(
+                    e) or "nonzero is not supported for tensors with more than INT_MAX elements" in str(e):
                 args.batch_size = handle_oom(args.batch_size)
                 oomed_out = True
                 print(f"Reducing batch size to {args.batch_size}")
             else:
                 raise e  # will simply raise error if other or if training on CPU
 
-        if (i % 250 == 0 and i > 0) or i == 50:
-            metrics.update(eval_step(eval_data, energy, gfn_model, final_eval=False))
+        if (i % args.eval_period == 0 and i > 0) or i == 50:
+            metrics.update(eval_step(energy, gfn_model))
             if 'tb-avg' in args.mode_fwd or 'tb-avg' in args.mode_bwd:
                 del metrics['eval/log_Z_learned']
+            if args.energy == 'molecular_crystal':
+                anneal_energy_temperature(energy, metrics['eval/energy'],
+                                          args.temperature_annealing_threshold,
+                                          args.min_temperature)
+            metrics.update({'Crystal Temperature': energy.temperature})
             wandb.log(metrics, step=i)
 
         elif i % 10 == 0:
             wandb.log(metrics, step=i)
 
-        if i % 1000 == 0:
+        if i % 100 == 0:
             torch.save(gfn_model.state_dict(), f'{name}model.pt')
 
-    eval_results = final_eval(energy, gfn_model).to(device)
-    metrics.update(eval_results)
-    if 'tb-avg' in args.mode_fwd or 'tb-avg' in args.mode_bwd:
-        del metrics['eval/log_Z_learned']
     torch.save(gfn_model.state_dict(), f'{name}model_final.pt')
+
+
+def anneal_energy_temperature(energy_function, sample_energies, threshold, min_temperature):
+    if sample_energies.mean() < threshold:
+        if energy_function.temperature > min_temperature:
+            energy_function.temperature *= 0.9
+
 
 def handle_oom(batch_size):
     gc.collect()  # TODO not clear to me that these are effective
@@ -394,14 +392,7 @@ def handle_oom(batch_size):
     batch_size = int(batch_size * 0.9)
     return batch_size
 
-def final_eval(energy, gfn_model):
-    final_eval_data = energy.sample(final_eval_data_size)
-    results = eval_step(final_eval_data, energy, gfn_model, final_eval=True)
-    return results
 
-
-def eval():
-    pass
 
 
 if __name__ == '__main__':
