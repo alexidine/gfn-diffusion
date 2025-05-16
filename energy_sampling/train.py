@@ -350,6 +350,7 @@ def train():
                 if args.batch_size < args.max_batch_size and args.grow_batch_size:
                     args.batch_size = max(args.batch_size + 1,
                                           int(args.batch_size * 1.01))  # gradually increment batch size
+                    metrics.update({'Batch Size': args.batch_size})
 
         except (RuntimeError, ValueError) as e:  # if we do hit OOM, slash the batch size
             if "CUDA out of memory" in str(
