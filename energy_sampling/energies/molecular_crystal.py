@@ -6,6 +6,7 @@ from mxtaltools.dataset_utils.data_classes import MolCrystalData, MolData
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.crystal_search.standalone_crystal_opt import sample_about_crystal
 from mxtaltools.common.utils import softplus_shift
+import torch.nn.functional as F
 
 from .base_set import BaseSet
 
@@ -87,7 +88,7 @@ class MolecularCrystal(BaseSet):
 
     def generator_energy(self, cluster_batch, silu_energy, num_atoms):
         aunit_lengths = cluster_batch.scale_lengths_to_aunit()
-        box_loss = softplus_shift(-(aunit_lengths - 3)).sum(1) + softplus_shift(
+        box_loss = F.relu(-(aunit_lengths - 3)).sum(1) + F.relu(
             aunit_lengths - (3 * 2 * cluster_batch.radius[:, None])).sum(1)
         crystal_energy = silu_energy / num_atoms / self.temperature + box_loss
 
