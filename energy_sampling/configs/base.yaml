@@ -1,38 +1,43 @@
-run_name: 'base'
+run_name: 'mk_local_dev'
 device: 'cuda'
-lr_policy: 0.001              # learning rate of the policy network
-lr_flow: 0.1                  # learning rate of the flow network
-lr_back: 0.001                # learning rate of the backward pass
+lr_policy: 0.0001              # learning rate of the policy network
+lr_flow: 0.01                  # learning rate of the flow network
+lr_back: 0.0001                # learning rate of the backward pass
 
 # model parameters
 zero_init: true
 pis_architectures: false # false goes to our custom architectures, which are better for training bigger models
 lgv_layers: 4
-joint_layers: 10
-hidden_dim: 512                # dimensionality of hidden layer: standard
+joint_layers: 4
+hidden_dim: 256                # dimensionality of hidden layer: standard
 s_emb_dim: 32                 # dimensionality of state embedding: standard
 t_emb_dim: 32                 # dimensionality of time embedding: standard
 harmonics_dim: 64             # dimensionality of harmonic embedding: standard
-dropout: 0.05
-norm: 'layer'
+dropout: 0
+norm: null
 
-batch_size: 100               # number of samples per training batch: relatively small
-epochs: 25000                 # number of training epochs: relatively large
-buffer_size: 600000           # size of replay buffer: relatively large
+batch_size: 25               # number of samples per training batch: relatively small
+grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
+max_batch_size: 100          # maximum batch size to allow
+epochs: 10000000             # number of training epochs: relatively large
+eval_period: 100             # how often to do evaluation & reporting
+buffer_size: 600000          # size of replay buffer: relatively large
 
-T: 100
+# subtb params
+T: 10
 subtb_lambda: 2
+
 t_scale: 1.0
 log_var_range: 4.0
 energy: "molecular_crystal"   # "molecular_crystal"  # "many_well"
 mode_fwd: "tb"
 mode_bwd: "tb"
-both_ways: true
+both_ways: false
 
 # local search settings
 ################################################################
-local_search: true
-max_iter_ls: 200                # how many iterations to run local search
+local_search: false
+max_iter_ls: 100                 # how many iterations to run local search
 samples_per_opt: 10             # how many noisy samples to take near each optimized minimum
 burn_in: 100                    # NOT USED IN MXTAL how many iterations to burn in before making local search
 ls_cycle: 100                   # how frequently to make local search
@@ -42,6 +47,9 @@ target_acceptance_rate: 0.574   # NOT USED IN MXTAL target acceptance rate for l
 
 # replay buffer settings
 ################################################################
+# NOTE I HAVE REMOVED BUFFER SAMPLING
+# FROM LS TRAINING FOR MXTALS, FOR NOW
+# ALL LS SAMPLES ARE INSTEAD DRAWN RANDOMLY, WITH SOME CONSTRAINTS
 beta: 1.0             # reward prioritized replay sampling: high beta = steep prioritization
 rank_weight: 0.01     # rank-based replay sampling: low rank_weight = steep prioritization
 prioritized: "rank"   # three kinds of replay training: random, reward prioritized, rank-based
@@ -54,12 +62,12 @@ sampling: "buffer"
 langevin: false
 langevin_scaling_per_dimension: false
 conditional_flow_model: false
-learn_pb: true
+learn_pb: false
 pb_scale_range: 0.1
 learned_variance: false
 partial_energy: false
-exploration_factor: 0.35
-exploration_wd: true
+exploration_factor: 0.05
+exploration_wd: false
 clipping: true
 lgv_clip: 100.0
 gfn_clip: 10000.0
@@ -70,4 +78,8 @@ eval: false
 
 # molecular crystal settings
 ################################################################
-temperature: 0.1  # scales the intermolecular energy component
+# scales the energy function
+init_temperature: 100
+min_temperature: 0.01
+anneal_temperature: true  # reduce temperature over time
+temperature_annealing_threshold: 0  # mean energy at which to trigger annealing
