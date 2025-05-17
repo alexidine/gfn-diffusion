@@ -131,11 +131,6 @@ set_seed(args.seed)
 if 'SLURM_PROCID' in os.environ:
     args.seed += int(os.environ["SLURM_PROCID"])
 
-eval_data_size = args.batch_size
-final_eval_data_size = args.batch_size
-plot_data_size = args.batch_size
-final_plot_data_size = args.batch_size
-
 if args.pis_architectures:
     args.zero_init = True
 
@@ -165,61 +160,10 @@ def get_energy():
     return energy
 
 
-def plot_step(energy, gfn_model, name):
-    if args.energy == 'many_well':
-        batch_size = plot_data_size
-        samples = gfn_model.sample(batch_size, energy.log_reward)
-
-        vizualizations = viz_many_well(energy, samples)
-        fig_samples_x13, ax_samples_x13, fig_kde_x13, ax_kde_x13, fig_contour_x13, ax_contour_x13, fig_samples_x23, ax_samples_x23, fig_kde_x23, ax_kde_x23, fig_contour_x23, ax_contour_x23 = vizualizations
-
-        fig_samples_x13.savefig(f'{name}samplesx13.pdf', bbox_inches='tight')
-        fig_samples_x23.savefig(f'{name}samplesx23.pdf', bbox_inches='tight')
-
-        fig_kde_x13.savefig(f'{name}kdex13.pdf', bbox_inches='tight')
-        fig_kde_x23.savefig(f'{name}kdex23.pdf', bbox_inches='tight')
-
-        fig_contour_x13.savefig(f'{name}contourx13.pdf', bbox_inches='tight')
-        fig_contour_x23.savefig(f'{name}contourx23.pdf', bbox_inches='tight')
-
-        return {"visualization/contourx13": wandb.Image(fig_to_image(fig_contour_x13)),
-                "visualization/contourx23": wandb.Image(fig_to_image(fig_contour_x23)),
-                "visualization/kdex13": wandb.Image(fig_to_image(fig_kde_x13)),
-                "visualization/kdex23": wandb.Image(fig_to_image(fig_kde_x23)),
-                "visualization/samplesx13": wandb.Image(fig_to_image(fig_samples_x13)),
-                "visualization/samplesx23": wandb.Image(fig_to_image(fig_samples_x23))}
-
-    elif energy.data_ndim != 2:
-        return {}
-
-    else:
-        batch_size = plot_data_size
-        samples = gfn_model.sample(batch_size, energy.log_reward)
-        gt_samples = energy.sample(batch_size)
-
-        fig_contour, ax_contour = get_figure(bounds=(-13., 13.))
-        fig_kde, ax_kde = get_figure(bounds=(-13., 13.))
-        fig_kde_overlay, ax_kde_overlay = get_figure(bounds=(-13., 13.))
-
-        plot_contours(energy.log_reward, ax=ax_contour, bounds=(-13., 13.), n_contour_levels=150, device=device)
-        plot_kde(gt_samples, ax=ax_kde_overlay, bounds=(-13., 13.))
-        plot_kde(samples, ax=ax_kde, bounds=(-13., 13.))
-        plot_samples(samples, ax=ax_contour, bounds=(-13., 13.))
-        plot_samples(samples, ax=ax_kde_overlay, bounds=(-13., 13.))
-
-        fig_contour.savefig(f'{name}contour.pdf', bbox_inches='tight')
-        fig_kde_overlay.savefig(f'{name}kde_overlay.pdf', bbox_inches='tight')
-        fig_kde.savefig(f'{name}kde.pdf', bbox_inches='tight')
-        # return None
-        return {"visualization/contour": wandb.Image(fig_to_image(fig_contour)),
-                "visualization/kde_overlay": wandb.Image(fig_to_image(fig_kde_overlay)),
-                "visualization/kde": wandb.Image(fig_to_image(fig_kde))}
-
-
-def eval_step(energy, gfn_model):
+def eval_step(energy, gfn_model, batch_size):
     gfn_model.eval()
     metrics = dict()
-    init_state = torch.zeros(final_eval_data_size, energy.data_ndim).to(device)
+    init_state = torch.zeros(batch_size, energy.data_ndim).to(device)
     samples, metrics['eval/log_Z'], metrics['eval/log_Z_lb'], metrics[
         'eval/log_Z_learned'], sample_batch = log_partition_function(
         init_state, gfn_model, energy)
@@ -362,7 +306,7 @@ def train():
                 raise e  # will simply raise error if other or if training on CPU
 
         if (i % args.eval_period == 0 and i > 0) or i == 50:
-            metrics.update(eval_step(energy, gfn_model))
+            metrics.update(eval_step(energy, gfn_model, args.batch_size))
             if 'tb-avg' in args.mode_fwd or 'tb-avg' in args.mode_bwd:
                 del metrics['eval/log_Z_learned']
             if args.energy == 'molecular_crystal':
