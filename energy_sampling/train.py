@@ -296,7 +296,6 @@ def train():
                 if args.batch_size < args.max_batch_size and args.grow_batch_size:
                     args.batch_size = max(args.batch_size + 1,
                                           int(args.batch_size * 1.01))  # gradually increment batch size
-                    metrics.update({'Batch Size': args.batch_size})
 
         except (RuntimeError, ValueError) as e:  # if we do hit OOM, slash the batch size
             if "CUDA out of memory" in str(
@@ -308,6 +307,7 @@ def train():
                 raise e  # will simply raise error if other or if training on CPU
 
         if (i % args.eval_period == 0 and i > 0) or i == 50:
+            metrics.update({'Batch Size': args.batch_size})
             metrics.update(eval_step(energy, gfn_model, eval_batch_size))
             if 'tb-avg' in args.mode_fwd or 'tb-avg' in args.mode_bwd:
                 del metrics['eval/log_Z_learned']
