@@ -111,10 +111,9 @@ parser.add_argument('--use_weight_decay', action='store_true', default=False)
 parser.add_argument('--eval', action='store_true', default=False)
 
 # args for molecular crystal energy
-parser.add_argument('--init_temperature', type=float, default=1)
-parser.add_argument('--min_temperature', type=float, default=1)
-parser.add_argument('--anneal_temperature', type=bool, default=False)
-parser.add_argument('--temperature_annealing_threshold', type=float, default=0)
+parser.add_argument('--energy_temperature', type=float, default=1)
+parser.add_argument('--anneal_energy', type=bool, default=False)
+parser.add_argument('--energy_annealing_threshold', type=float, default=0)
 
 args, remaining = parser.parse_known_args()
 
@@ -143,6 +142,7 @@ if args.both_ways and args.bwd:
 if args.local_search:
     args.both_ways = True
 
+eval_batch_size = min(args.batch_size, 1000)
 
 def get_energy():
     if args.energy == '9gmm':
@@ -156,7 +156,9 @@ def get_energy():
     elif args.energy == 'many_well':
         energy = ManyWell(device=device)
     elif args.energy == 'molecular_crystal':
-        energy = MolecularCrystal(device=device, temperature=args.init_temperature)
+        energy = MolecularCrystal(device=device, temperature=args.energy_temperature)
+    else:
+        assert False, f"{args.energy} is not a valid energy function"
     return energy
 
 
@@ -306,14 +308,16 @@ def train():
                 raise e  # will simply raise error if other or if training on CPU
 
         if (i % args.eval_period == 0 and i > 0) or i == 50:
-            metrics.update(eval_step(energy, gfn_model, args.batch_size))
+            metrics.update(eval_step(energy, gfn_model, eval_batch_size))
             if 'tb-avg' in args.mode_fwd or 'tb-avg' in args.mode_bwd:
                 del metrics['eval/log_Z_learned']
-            if args.energy == 'molecular_crystal':
-                anneal_energy_temperature(energy, metrics['eval/energy'],
-                                          args.temperature_annealing_threshold,
-                                          args.min_temperature)
-            metrics.update({'Crystal Temperature': energy.temperature})
+            if args.energy == 'molecular_crystal' and args.anneal_energy:
+                anneal_energy(energy,
+                              metrics['eval/energy'],
+                              args.energy_annealing_threshold,
+                              10)
+            metrics.update({'Crystal Temperature': energy.temperature,
+                            'Crystal Turnover Potential': energy.turnover_pot})
             wandb.log(metrics, step=i)
 
         elif i % 10 == 0:
@@ -325,10 +329,10 @@ def train():
     torch.save(gfn_model.state_dict(), f'{name}model_final.pt')
 
 
-def anneal_energy_temperature(energy_function, sample_energies, threshold, min_temperature):
+def anneal_energy(energy_function, sample_energies, threshold, max_turnover_pot):
     if sample_energies.mean() < threshold:
-        if energy_function.temperature > min_temperature:
-            energy_function.temperature *= 0.9
+        if energy_function.turnover_pot < max_turnover_pot:
+            energy_function.turnover_pot *= 1.1
 
 
 def handle_oom(batch_size):

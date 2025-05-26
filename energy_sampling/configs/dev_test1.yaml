@@ -1,4 +1,4 @@
-run_name: 'dev_test1'
+run_name: 'dev_test_1'
 device: 'cuda'
 lr_policy: 0.0001              # learning rate of the policy network
 lr_flow: 0.01                  # learning rate of the flow network
@@ -8,17 +8,17 @@ lr_back: 0.0001                # learning rate of the backward pass
 zero_init: true
 pis_architectures: false # false goes to our custom architectures, which are better for training bigger models
 lgv_layers: 4
-joint_layers: 40
-hidden_dim: 512                # dimensionality of hidden layer: standard
+joint_layers: 4
+hidden_dim: 1024                # dimensionality of hidden layer: standard
 s_emb_dim: 32                 # dimensionality of state embedding: standard
 t_emb_dim: 32                 # dimensionality of time embedding: standard
 harmonics_dim: 64             # dimensionality of harmonic embedding: standard
 dropout: 0
-norm: 'layer'
+norm: null
 
 batch_size: 25               # number of samples per training batch: relatively small
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 10000          # maximum batch size to allow
+max_batch_size: 10000        # maximum batch size to allow
 epochs: 10000000             # number of training epochs: relatively large
 eval_period: 100             # how often to do evaluation & reporting
 buffer_size: 600000          # size of replay buffer: relatively large
@@ -66,8 +66,8 @@ learn_pb: true
 pb_scale_range: 0.1
 learned_variance: true
 partial_energy: false
-exploration_factor: 0.2
-exploration_wd: false
+exploration_factor: 0.1
+exploration_wd: true
 clipping: true
 lgv_clip: 100.0
 gfn_clip: 10000.0
@@ -79,7 +79,6 @@ eval: false
 # molecular crystal settings
 ################################################################
 # scales the energy function
-init_temperature: 100
-min_temperature: 0.01
-anneal_temperature: true  # reduce temperature over time
-temperature_annealing_threshold: 0  # mean energy at which to trigger annealing
+anneal_energy: true  # harden intermolecular repulsion over time
+energy_annealing_threshold: 10 # mean sample energy below which to trigger annealing
+energy_temperature: 1  # global fixed temperature for energy function

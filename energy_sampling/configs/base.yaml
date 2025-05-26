@@ -79,7 +79,6 @@ eval: false
 # molecular crystal settings
 ################################################################
 # scales the energy function
-init_temperature: 100
-min_temperature: 0.01
-anneal_temperature: true  # reduce temperature over time
-temperature_annealing_threshold: 0  # mean energy at which to trigger annealing
+anneal_energy: true  # harden intermolecular repulsion over time
+energy_annealing_threshold: 5 # mean sample energy below which to trigger annealing
+energy_temperature: 1  # global fixed temperature for energy function

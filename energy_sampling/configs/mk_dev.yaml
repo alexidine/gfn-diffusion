@@ -9,7 +9,7 @@ zero_init: true
 pis_architectures: false # false goes to our custom architectures, which are better for training bigger models
 lgv_layers: 4
 joint_layers: 4
-hidden_dim: 256                # dimensionality of hidden layer: standard
+hidden_dim: 1024                # dimensionality of hidden layer: standard
 s_emb_dim: 32                 # dimensionality of state embedding: standard
 t_emb_dim: 32                 # dimensionality of time embedding: standard
 harmonics_dim: 64             # dimensionality of harmonic embedding: standard
@@ -32,7 +32,7 @@ log_var_range: 4.0
 energy: "molecular_crystal"   # "molecular_crystal"  # "many_well"
 mode_fwd: "tb"
 mode_bwd: "tb"
-both_ways: false
+both_ways: true
 
 # local search settings
 ################################################################
@@ -62,12 +62,12 @@ sampling: "buffer"
 langevin: false
 langevin_scaling_per_dimension: false
 conditional_flow_model: false
-learn_pb: false
+learn_pb: true
 pb_scale_range: 0.1
-learned_variance: false
+learned_variance: true
 partial_energy: false
-exploration_factor: 0.05
-exploration_wd: false
+exploration_factor: 0.1
+exploration_wd: true
 clipping: true
 lgv_clip: 100.0
 gfn_clip: 10000.0
@@ -79,7 +79,6 @@ eval: false
 # molecular crystal settings
 ################################################################
 # scales the energy function
-init_temperature: 100
-min_temperature: 0.01
-anneal_temperature: true  # reduce temperature over time
-temperature_annealing_threshold: 0  # mean energy at which to trigger annealing
+anneal_energy: true  # harden intermolecular repulsion over time
+energy_annealing_threshold: 10 # mean sample energy below which to trigger annealing
+energy_temperature: 1  # global fixed temperature for energy function

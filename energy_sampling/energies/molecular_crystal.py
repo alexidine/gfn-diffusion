@@ -17,6 +17,7 @@ class MolecularCrystal(BaseSet):
                  test_molecule: str = 'UREA',
                  space_group: int = 2,
                  temperature: float = 10,
+                 turnover_pot: float = 0.01,
                  ):
         super(MolecularCrystal, self).__init__()
         self.device = device
@@ -26,6 +27,7 @@ class MolecularCrystal(BaseSet):
         self.test_molecule = test_molecule
         self.initialize_test_molecule(test_molecule)
         self.temperature = temperature
+        self.turnover_pot = turnover_pot  # energy above which to soften intermolecular repulsion
 
     def initialize_test_molecule(self, test_molecule):
         # UREA from molview - default if not specified
@@ -86,11 +88,17 @@ class MolecularCrystal(BaseSet):
         else:
             return crystal_energy
 
-    def generator_energy(self, cluster_batch, silu_energy, num_atoms):
-        aunit_lengths = cluster_batch.scale_lengths_to_aunit()
-        box_loss = F.relu(-(aunit_lengths - 3)).sum(1) + F.relu(
-            aunit_lengths - (3 * 2 * cluster_batch.radius[:, None])).sum(1)
-        crystal_energy = silu_energy / num_atoms / self.temperature + box_loss
+    def generator_energy(self, cluster_batch, silu_pot, num_atoms):
+        # aunit_lengths = cluster_batch.scale_lengths_to_aunit()
+        # box_loss = F.relu(-(aunit_lengths - 3)).sum(1) + F.relu(
+        #     aunit_lengths - (3 * 2 * cluster_batch.radius[:, None])).sum(1)
+        # crystal_energy = silu_energy / num_atoms / self.temperature + box_loss
+
+        # soften the repulsion
+        crystal_energy = silu_pot.clone()
+        high_bools = crystal_energy > self.turnover_pot
+        crystal_energy[high_bools] = self.turnover_pot + torch.log10(crystal_energy[high_bools] + 1 - self.turnover_pot)
+        crystal_energy = crystal_energy.clip(max=50)
 
         return crystal_energy
 
@@ -127,7 +135,8 @@ class MolecularCrystal(BaseSet):
         silu_energies = torch.tensor([elem.silu_pot for elem in samples_out])
         packing_coeffs = torch.tensor([elem.packing_coeff for elem in samples_out])
         num_atoms = torch.tensor([elem.num_atoms for elem in samples_out])
-        energy_out = torch.tensor([-self.generator_energy(sample_batch, silu_energies, num_atoms) for sample_batch in samples_out])
+        energy_out = torch.tensor(
+            [-self.generator_energy(sample_batch, silu_energies, num_atoms) for sample_batch in samples_out])
 
         return samples, energy_out
 
@@ -167,7 +176,7 @@ class MolecularCrystal(BaseSet):
             if not reasonable_only:
                 crystal_batch.sample_random_reduced_crystal_parameters(target_packing_coeff=target_packing_coeff)
 
-            else: # higher quality crystals, but expensive
+            else:  # higher quality crystals, but expensive
                 crystal_batch.sample_reasonable_random_parameters(
                     tolerance=3,
                     max_attempts=50,
