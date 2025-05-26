@@ -1,4 +1,4 @@
-run_name: 'dev_test_1'
+run_name: 'dev_test_2'
 device: 'cuda'
 lr_policy: 0.0001              # learning rate of the policy network
 lr_flow: 0.01                  # learning rate of the flow network
@@ -9,7 +9,7 @@ zero_init: true
 pis_architectures: false # false goes to our custom architectures, which are better for training bigger models
 lgv_layers: 4
 joint_layers: 4
-hidden_dim: 1024                # dimensionality of hidden layer: standard
+hidden_dim: 256                # dimensionality of hidden layer: standard
 s_emb_dim: 32                 # dimensionality of state embedding: standard
 t_emb_dim: 32                 # dimensionality of time embedding: standard
 harmonics_dim: 64             # dimensionality of harmonic embedding: standard
@@ -80,5 +80,5 @@ eval: false
 ################################################################
 # scales the energy function
 anneal_energy: true  # harden intermolecular repulsion over time
-energy_annealing_threshold: 10 # mean sample energy below which to trigger annealing
+energy_annealing_threshold: 50 # mean sample energy below which to trigger annealing
 energy_temperature: 1  # global fixed temperature for energy function

@@ -84,23 +84,21 @@ class MolecularCrystal(BaseSet):
         cluster_batch.compute_LJ_energy()
         silu_energy = cluster_batch.compute_silu_energy()
         cluster_batch.silu_pot = silu_energy / cluster_batch.num_atoms
-        crystal_energy = self.generator_energy(crystal_batch,
-                                               silu_energy,
-                                               crystal_batch.num_atoms)
+        crystal_energy = self.generator_energy(silu_energy)
 
         if return_batch:
             return crystal_energy, cluster_batch
         else:
             return crystal_energy
 
-    def generator_energy(self, cluster_batch, silu_pot, num_atoms):
+    def generator_energy(self, normed_silu_pot):
         # aunit_lengths = cluster_batch.scale_lengths_to_aunit()
         # box_loss = F.relu(-(aunit_lengths - 3)).sum(1) + F.relu(
         #     aunit_lengths - (3 * 2 * cluster_batch.radius[:, None])).sum(1)
         # crystal_energy = silu_energy / num_atoms / self.temperature + box_loss
 
         # soften the repulsion
-        crystal_energy = silu_pot.clone()
+        crystal_energy = normed_silu_pot.clone()
         high_bools = crystal_energy > self.turnover_pot
         crystal_energy[high_bools] = self.turnover_pot + torch.log10(crystal_energy[high_bools] + 1 - self.turnover_pot)
         crystal_energy = crystal_energy.clip(max=50)
@@ -141,7 +139,7 @@ class MolecularCrystal(BaseSet):
         packing_coeffs = torch.tensor([elem.packing_coeff for elem in samples_out])
         num_atoms = torch.tensor([elem.num_atoms for elem in samples_out])
         energy_out = torch.tensor(
-            [-self.generator_energy(sample_batch, silu_energies, num_atoms) for sample_batch in samples_out])
+            [-self.generator_energy(silu_energies) for sample_batch in samples_out])
 
         return samples, energy_out
 
