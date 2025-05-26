@@ -65,7 +65,12 @@ class MolecularCrystal(BaseSet):
         )
 
     def instantiate_crystals(self, x):
-        crystal_batch = self.init_blank_crystal_batch(len(x))
+        if hasattr(self, 'blank_batch') and len(x) == self.blank_batch.num_graphs:
+            crystal_batch = self.blank_batch.clone()
+        else:
+            crystal_batch = self.init_blank_crystal_batch(len(x))
+            self.blank_batch = crystal_batch.clone()
+
         crystal_batch.gen_basis_to_cell_params(x)
 
         return crystal_batch
@@ -151,16 +156,22 @@ class MolecularCrystal(BaseSet):
         return self.analyze_crystal_batch(x)
 
     def init_blank_crystal_batch(self, batch_size):
-        return collate_data_list([MolCrystalData(
+        # todo when we go to conditional modelling, we'll pass the molecules as MolCrystalData objects
+        # pre-initialized, so we won't have to do this at all.
+        crystal_batch = collate_data_list([MolCrystalData(
             molecule=self.mol.clone(),
             sg_ind=self.space_group,
             aunit_handedness=torch.ones(1),
             cell_lengths=torch.ones(3, device=self.device),
             # if we don't put dummies in here, later ops to_data_list fail
+            # but if we do put dummies in here, it does box analysis one-by-one which is super slow
             cell_angles=torch.ones(3, device=self.device),
             aunit_centroid=torch.ones(3, device=self.device),
             aunit_orientation=torch.ones(3, device=self.device),
+            skip_box_analysis=True,
         ) for _ in range(batch_size)]).to(self.device)
+
+        return crystal_batch
 
     def sample(self,
                batch_size,
