@@ -368,12 +368,15 @@ def handle_oom(batch_size):
 
 def add_dataset_to_buffer(dataset_path, buffer, energy):
     # todo update this with conditional molecular information when the time comes
+    print("Loading prebuilt buffer")
     dataset = collate_data_list(torch.load(dataset_path))
     x = dataset.cell_params_to_gen_basis()
     normed_silu_pot = dataset.silu_pot / dataset.num_atoms
     log_r = energy.generator_energy(
         normed_silu_pot)  # note if we adjust the energy during the run, it will affect these terms
     buffer.add(x, log_r, normed_silu_pot)
+    print(f"Buffer loaded with {len(dataset)} samples")
+
     return buffer
 
 
