@@ -3,6 +3,7 @@ device: 'cuda'
 lr_policy: 0.0001              # learning rate of the policy network
 lr_flow: 0.01                  # learning rate of the flow network
 lr_back: 0.0001                # learning rate of the backward pass
+gradient_norm_clip: 1.0        # gradient norm clip for updating gfn model weights
 
 # model parameters
 zero_init: true
@@ -71,7 +72,7 @@ exploration_factor: 0.1
 exploration_wd: true
 clipping: true
 lgv_clip: 100.0
-gfn_clip: 0.1
+gfn_clip: 10000.0
 seed: 12345
 weight_decay: 1e-7
 use_weight_decay: false

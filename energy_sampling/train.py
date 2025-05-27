@@ -29,6 +29,7 @@ parser.add_argument('--device', type=str, default='cpu')
 parser.add_argument('--lr_policy', type=float, default=1e-3)
 parser.add_argument('--lr_flow', type=float, default=1e-2)
 parser.add_argument('--lr_back', type=float, default=1e-3)
+parser.add_argument('--gradient_norm_clip', type=float, default=10)
 parser.add_argument('--hidden_dim', type=int, default=64)
 parser.add_argument('--s_emb_dim', type=int, default=64)
 parser.add_argument('--t_emb_dim', type=int, default=64)
@@ -204,6 +205,8 @@ def train_step(energy, gfn_model, gfn_optimizer, it, exploratory, buffer, buffer
         loss = fwd_train_step(energy, gfn_model, exploration_std)
 
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(gfn_model.parameters(),
+                                   args.gradient_norm_clip)  # gradient clipping
     gfn_optimizer.step()
     return loss.item()
 
