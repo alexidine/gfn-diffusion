@@ -81,7 +81,13 @@ def collate(data_list):
 
 
 class ReplayBuffer():
-    def __init__(self, buffer_size, device, log_reward, batch_size, data_ndim=2, beta=1.0, rank_weight=1e-2,
+    def __init__(self, buffer_size,
+                 device,
+                 log_reward,
+                 batch_size,
+                 data_ndim=2,
+                 beta=1.0,
+                 rank_weight=1e-2,
                  prioritized=None):
         self.buffer_size = buffer_size
         self.prioritized = prioritized
@@ -89,6 +95,7 @@ class ReplayBuffer():
         self.data_ndim = data_ndim
         self.batch_size = batch_size
         self.reward_dataset = None
+        self.raw_reward_dataset = None
         self.buffer_idx = 0
         self.buffer_full = False
         self.log_reward = log_reward
@@ -96,19 +103,24 @@ class ReplayBuffer():
         self.rank_weight = rank_weight
         self.beta = beta
 
-    def add(self, samples, log_r):
+    def add(self, samples, log_r, raw_reward):
         if self.reward_dataset is None:
             self.reward_dataset = RewardDataset(log_r.detach())
             self.sample_dataset = SampleDataset(samples.detach())
+            self.raw_reward_dataset = RewardDataset(raw_reward.detach())  # store raw values for easier rescaling
             self.sample_dataset.update(samples.detach())
             self.reward_dataset.update(log_r.detach())
+            self.raw_reward_dataset.update(raw_reward.detach())
         else:
             self.sample_dataset.update(samples.detach())
             self.reward_dataset.update(log_r.detach())
+            self.raw_reward_dataset.update(raw_reward.detach())
 
         if self.reward_dataset.__len__() > self.buffer_size:
             self.reward_dataset.deque(self.reward_dataset.__len__() - self.buffer_size)
             self.sample_dataset.deque(self.sample_dataset.__len__() - self.buffer_size)
+            self.raw_reward_dataset.deque(self.raw_reward_dataset.__len__() - self.buffer_size)
+
         if self.prioritized == 'rank':
             self.scores_np = self.reward_dataset.get_tsrs().detach().cpu().view(-1).numpy()
             ranks = np.argsort(np.argsort(-1 * self.scores_np))
@@ -141,6 +153,12 @@ class ReplayBuffer():
                 drop_last=True
             )
         # check if we have any additional samples before updating the buffer and the scorer!
+
+    def __len__(self):
+        if self.reward_dataset is None:
+            return 0
+        else:
+            return len(self.reward_dataset.rewards)
 
     def sample(self):
 

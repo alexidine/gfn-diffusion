@@ -36,14 +36,15 @@ both_ways: true
 
 # local search settings
 ################################################################
-local_search: false
-max_iter_ls: 100                 # how many iterations to run local search
-samples_per_opt: 10             # how many noisy samples to take near each optimized minimum
-burn_in: 100                    # NOT USED IN MXTAL how many iterations to burn in before making local search
-ls_cycle: 100                   # how frequently to make local search
-ld_step: 0.1                    # NOT USED IN MXTAL langevin step size
-ld_schedule: true               # NOT USED IN MXTAL whether to use scheduled langevin step size
-target_acceptance_rate: 0.574   # NOT USED IN MXTAL target acceptance rate for local search
+local_search: true
+dataset_path: 'C:\Users\mikem\PycharmProjects\Python_Codes\MXtalTools\mxtaltools\dataset_utils\construction\misc\optimized_samples_0.pt'
+max_iter_ls: 100                # DEPRECATED # how many iterations to run local search
+samples_per_opt: 10             # DEPRECATED #how many noisy samples to take near each optimized minimum
+burn_in: 100                    # DEPRECATED # NOT USED IN MXTAL how many iterations to burn in before making local search
+ls_cycle: 100                   # DEPRECATED # how frequently to make local search
+ld_step: 0.1                    # DEPRECATED # langevin step size
+ld_schedule: true               # DEPRECATED # whether to use scheduled langevin step size
+target_acceptance_rate: 0.574   # DEPRECATED # target acceptance rate for local search
 
 # replay buffer settings
 ################################################################

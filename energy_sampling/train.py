@@ -2,7 +2,7 @@ import gc
 
 import yaml
 from mxtaltools.reporting.online import simple_cell_hist, simple_cell_scatter_fig, log_crystal_samples
-
+from mxtaltools.dataset_utils.utils import collate_data_list
 from energies.molecular_crystal import MolecularCrystal
 from plot_utils import *
 import argparse
@@ -54,6 +54,7 @@ parser.add_argument('--both_ways', action='store_true', default=False)
 # For local search
 ################################################################
 parser.add_argument('--local_search', action='store_true', default=False)
+parser.add_argument('--dataset_path', type=str, default=None)
 
 # How many iterations to run local search
 parser.add_argument('--max_iter_ls', type=int, default=200)
@@ -144,6 +145,7 @@ if args.local_search:
 
 eval_batch_size = min(args.batch_size, 1000)
 
+
 def get_energy():
     if args.energy == '9gmm':
         energy = NineGaussianMixture(device=device)
@@ -188,7 +190,7 @@ def train_step(energy, gfn_model, gfn_optimizer, it, exploratory, buffer, buffer
 
     if args.both_ways:
         if it % 2 == 0:
-            if args.sampling == 'buffer':
+            if False:  #TODO REIMPLEMENT # args.sampling == 'buffer':
                 loss, states, _, _, log_r = fwd_train_step(energy, gfn_model, exploration_std, return_exp=True)
                 buffer.add(states[:, -1], log_r)
             else:
@@ -218,9 +220,9 @@ def bwd_train_step(energy, gfn_model, buffer, buffer_ls, exploration_std=None, i
         samples = gfn_model.sleep_phase_sample(args.batch_size, exploration_std).to(device)
     elif args.sampling == 'energy':
         samples = energy.sample(args.batch_size).to(device)
-    elif args.sampling == 'buffer':  # todo cleanup the logic here - for molecular crystal we should really just have one method
-        if args.local_search:
-            if it % args.ls_cycle < 2:
+    elif args.sampling == 'buffer':
+        if args.local_search:  # We are just not doing on the fly local search any more, but using a prebuilt dataset
+            if False:  #it % args.ls_cycle < 2:
                 if args.energy == 'molecular_crystal':
                     # sample reasonable diffuse crystals
                     samples = energy.sample(args.batch_size,
@@ -277,13 +279,24 @@ def train():
 
     print(gfn_model)
 
-    buffer = ReplayBuffer(args.buffer_size, device, energy.log_reward, args.batch_size, data_ndim=energy.data_ndim,
+    buffer = ReplayBuffer(args.buffer_size,
+                          device,
+                          energy.log_reward,
+                          args.batch_size,
+                          data_ndim=energy.data_ndim,
                           beta=args.beta,
-                          rank_weight=args.rank_weight, prioritized=args.prioritized)
-    buffer_ls = ReplayBuffer(args.buffer_size, device, energy.log_reward, args.batch_size, data_ndim=energy.data_ndim,
+                          rank_weight=args.rank_weight,
+                          prioritized=args.prioritized)
+    buffer_ls = ReplayBuffer(args.buffer_size,
+                             device,
+                             energy.log_reward,
+                             args.batch_size,
+                             data_ndim=energy.data_ndim,
                              beta=args.beta,
-                             rank_weight=args.rank_weight, prioritized=args.prioritized)
-
+                             rank_weight=args.rank_weight,
+                             prioritized=args.prioritized)
+    if args.local_search:  # preload samples into the buffer
+        buffer_ls = add_dataset_to_buffer(args.dataset_path, buffer_ls, energy)
     gfn_model.train()
 
     oomed_out = False
@@ -312,10 +325,21 @@ def train():
             if 'tb-avg' in args.mode_fwd or 'tb-avg' in args.mode_bwd:
                 del metrics['eval/log_Z_learned']
             if args.energy == 'molecular_crystal' and args.anneal_energy:
+                # todo need here also to adjust the energies stored in the buffer
                 anneal_energy(energy,
                               metrics['eval/energy'],
                               args.energy_annealing_threshold,
                               10)
+                if len(buffer_ls) > 0:
+                    buffer_ls = update_buffer_reward(
+                        buffer_ls,
+                        energy
+                    )
+                if len(buffer) > 0:
+                    buffer = update_buffer_reward(
+                        buffer,
+                        energy
+                    )
             metrics.update({'Crystal Temperature': energy.temperature,
                             'Crystal Turnover Potential': energy.turnover_pot})
             wandb.log(metrics, step=i)
@@ -342,6 +366,23 @@ def handle_oom(batch_size):
     return batch_size
 
 
+def add_dataset_to_buffer(dataset_path, buffer, energy):
+    # todo update this with conditional molecular information when the time comes
+    dataset = collate_data_list(torch.load(dataset_path))
+    x = dataset.cell_params_to_gen_basis()
+    normed_silu_pot = dataset.silu_pot / dataset.num_atoms
+    log_r = energy.generator_energy(
+        normed_silu_pot)  # note if we adjust the energy during the run, it will affect these terms
+    buffer.add(x, log_r, normed_silu_pot)
+    return buffer
+
+
+def update_buffer_reward(buffer,
+                         energy):
+    scaled_energy = energy.generator_energy(buffer.raw_reward_dataset.rewards)
+    buffer.reward_dataset.rewards = scaled_energy
+    buffer.reward_dataset.raw_tsrs = scaled_energy
+    return buffer
 
 
 if __name__ == '__main__':

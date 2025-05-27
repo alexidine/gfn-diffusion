@@ -18,9 +18,9 @@ norm: null
 
 batch_size: 25               # number of samples per training batch: relatively small
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 10000        # maximum batch size to allow
+max_batch_size: 2000         # maximum batch size to allow
 epochs: 10000000             # number of training epochs: relatively large
-eval_period: 100             # how often to do evaluation & reporting
+eval_period: 1000             # how often to do evaluation & reporting
 buffer_size: 600000          # size of replay buffer: relatively large
 
 # subtb params
@@ -36,7 +36,8 @@ both_ways: true
 
 # local search settings
 ################################################################
-local_search: false
+local_search: true
+dataset_path: '/scratch/mk8347/urea_dataset/dataset.pt'
 max_iter_ls: 100                 # how many iterations to run local search
 samples_per_opt: 10             # how many noisy samples to take near each optimized minimum
 burn_in: 100                    # NOT USED IN MXTAL how many iterations to burn in before making local search
