@@ -1,0 +1,85 @@
+run_name: 'dev_test_4'
+device: 'cuda'
+lr_policy: 0.0001              # learning rate of the policy network
+lr_flow: 0.01                  # learning rate of the flow network
+lr_back: 0.0001                # learning rate of the backward pass
+
+# model parameters
+zero_init: true
+pis_architectures: false # false goes to our custom architectures, which are better for training bigger models
+lgv_layers: 4
+joint_layers: 4
+hidden_dim: 1024                # dimensionality of hidden layer: standard
+s_emb_dim: 32                 # dimensionality of state embedding: standard
+t_emb_dim: 32                 # dimensionality of time embedding: standard
+harmonics_dim: 64             # dimensionality of harmonic embedding: standard
+dropout: 0
+norm: layer
+
+batch_size: 25               # number of samples per training batch: relatively small
+grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
+max_batch_size: 2000         # maximum batch size to allow
+epochs: 10000000             # number of training epochs: relatively large
+eval_period: 1000             # how often to do evaluation & reporting
+buffer_size: 600000          # size of replay buffer: relatively large
+
+# subtb params
+T: 10
+subtb_lambda: 2
+
+t_scale: 1.0
+log_var_range: 4.0
+energy: "molecular_crystal"   # "molecular_crystal"  # "many_well"
+mode_fwd: "tb"
+mode_bwd: "tb"
+both_ways: true
+
+# local search settings
+################################################################
+local_search: true
+dataset_path: '/scratch/mk8347/urea_dataset/dataset.pt'
+max_iter_ls: 100                 # how many iterations to run local search
+samples_per_opt: 10             # how many noisy samples to take near each optimized minimum
+burn_in: 100                    # NOT USED IN MXTAL how many iterations to burn in before making local search
+ls_cycle: 100                   # how frequently to make local search
+ld_step: 0.1                    # NOT USED IN MXTAL langevin step size
+ld_schedule: true               # NOT USED IN MXTAL whether to use scheduled langevin step size
+target_acceptance_rate: 0.574   # NOT USED IN MXTAL target acceptance rate for local search
+
+# replay buffer settings
+################################################################
+# NOTE I HAVE REMOVED BUFFER SAMPLING
+# FROM LS TRAINING FOR MXTALS, FOR NOW
+# ALL LS SAMPLES ARE INSTEAD DRAWN RANDOMLY, WITH SOME CONSTRAINTS
+beta: 1.0             # reward prioritized replay sampling: high beta = steep prioritization
+rank_weight: 0.01     # rank-based replay sampling: low rank_weight = steep prioritization
+prioritized: "rank"   # three kinds of replay training: random, reward prioritized, rank-based
+
+################################################################
+bwd: false
+exploratory: true
+
+sampling: "buffer"
+langevin: false
+langevin_scaling_per_dimension: false
+conditional_flow_model: false
+learn_pb: true
+pb_scale_range: 0.1
+learned_variance: true
+partial_energy: false
+exploration_factor: 0.1
+exploration_wd: true
+clipping: true
+lgv_clip: 100.0
+gfn_clip: 10000.0
+seed: 12345
+weight_decay: 1e-7
+use_weight_decay: false
+eval: false
+
+# molecular crystal settings
+################################################################
+# scales the energy function
+anneal_energy: true  # harden intermolecular repulsion over time
+energy_annealing_threshold: 10 # mean sample energy below which to trigger annealing
+energy_temperature: 1  # global fixed temperature for energy function
