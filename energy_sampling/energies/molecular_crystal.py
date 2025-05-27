@@ -71,7 +71,8 @@ class MolecularCrystal(BaseSet):
             crystal_batch = self.init_blank_crystal_batch(len(x))
             self.blank_batch = crystal_batch.clone()
 
-        crystal_batch.gen_basis_to_cell_params(x)
+        crystal_batch.gen_basis_to_cell_params(x,
+                                               clip_min_length=0.5)  # don't allow micro cells
 
         return crystal_batch
 
@@ -79,12 +80,12 @@ class MolecularCrystal(BaseSet):
         crystal_batch = self.instantiate_crystals(x)
         cluster_batch = crystal_batch.mol2cluster(cutoff=6,
                                                   supercell_size=10,
-                                                  align_to_standardized_orientation=False)
+                                                  align_to_standardized_orientation=True)  # todo CONSIDER RELAXING THIS WHEN WE GO TO CONDITIONAL GENERATION
         cluster_batch.construct_radial_graph(cutoff=6)
         cluster_batch.compute_LJ_energy()
         silu_energy = cluster_batch.compute_silu_energy()
         cluster_batch.silu_pot = silu_energy / cluster_batch.num_atoms
-        crystal_energy = self.generator_energy(silu_energy)
+        crystal_energy = self.generator_energy(silu_energy / cluster_batch.num_atoms)
 
         if return_batch:
             return crystal_energy, cluster_batch

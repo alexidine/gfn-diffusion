@@ -372,8 +372,7 @@ def add_dataset_to_buffer(dataset_path, buffer, energy):
     dataset = collate_data_list(torch.load(dataset_path))
     x = dataset.cell_params_to_gen_basis()
     normed_silu_pot = dataset.silu_pot / dataset.num_atoms
-    log_r = energy.generator_energy(
-        normed_silu_pot)  # note if we adjust the energy during the run, it will affect these terms
+    log_r = -energy.generator_energy(normed_silu_pot)  # note if we adjust the energy during the run, it will affect these terms
     buffer.add(x, log_r, normed_silu_pot)
     print(f"Buffer loaded with {len(dataset)} samples")
 
@@ -382,9 +381,9 @@ def add_dataset_to_buffer(dataset_path, buffer, energy):
 
 def update_buffer_reward(buffer,
                          energy):
-    scaled_energy = energy.generator_energy(buffer.raw_reward_dataset.rewards)
-    buffer.reward_dataset.rewards = scaled_energy
-    buffer.reward_dataset.raw_tsrs = scaled_energy
+    rescaled_reward = -energy.generator_energy(buffer.raw_reward_dataset.rewards)
+    buffer.reward_dataset.rewards = rescaled_reward
+    buffer.reward_dataset.raw_tsrs = rescaled_reward
     return buffer
 
 
