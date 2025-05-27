@@ -37,7 +37,7 @@ both_ways: true
 # local search settings
 ################################################################
 local_search: true
-dataset_path: 'C:\Users\mikem\PycharmProjects\Python_Codes\MXtalTools\mxtaltools\dataset_utils\construction\misc\optimized_samples_0.pt'
+dataset_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
 max_iter_ls: 100                # DEPRECATED # how many iterations to run local search
 samples_per_opt: 10             # DEPRECATED #how many noisy samples to take near each optimized minimum
 burn_in: 100                    # DEPRECATED # NOT USED IN MXTAL how many iterations to burn in before making local search
