@@ -1,26 +1,23 @@
-import gc
-
-import yaml
-from mxtaltools.reporting.online import simple_cell_hist, simple_cell_scatter_fig, log_crystal_samples
-from mxtaltools.dataset_utils.utils import collate_data_list
-from energies.molecular_crystal import MolecularCrystal
-from plot_utils import *
 import argparse
-import torch
+import gc
 import os
 
-from utils import set_seed, cal_subtb_coef_matrix, fig_to_image, get_gfn_optimizer, get_gfn_forward_loss, \
-    get_gfn_backward_loss, get_exploration_std, get_name
+import numpy as np
+import wandb
+import yaml
+from mxtaltools.dataset_utils.utils import collate_data_list
+from mxtaltools.reporting.online import simple_cell_hist, simple_cell_scatter_fig, log_crystal_samples
+from time import time
+from tqdm import trange
+
 from buffer import ReplayBuffer
+from energies import *
+from energies.molecular_crystal import MolecularCrystal
+from evaluations import *
 from langevin import langevin_dynamics
 from models import GFN
-from gflownet_losses import *
-from energies import *
-from evaluations import *
-
-import matplotlib.pyplot as plt
-from tqdm import trange
-import wandb
+from utils import set_seed, cal_subtb_coef_matrix, get_gfn_optimizer, get_gfn_forward_loss, \
+    get_gfn_backward_loss, get_exploration_std
 
 parser = argparse.ArgumentParser(description='GFN Linear Regression')
 parser.add_argument('--run_name', type=str, default='test')
@@ -144,8 +141,7 @@ if args.both_ways and args.bwd:
 if args.local_search:
     args.both_ways = True
 
-eval_batch_size = min(args.batch_size, 1000)
-
+times = {}
 
 def get_energy():
     if args.energy == '9gmm':
@@ -175,7 +171,9 @@ def eval_step(energy, gfn_model, batch_size):
     metrics['Lattice Features Distribution'] = simple_cell_hist(sample_batch)
     metrics['Sample Scatter'] = simple_cell_scatter_fig(sample_batch)
     metrics['eval/packing_coeff'] = sample_batch.packing_coeff.mean().cpu().detach().numpy()
-    metrics['eval/energy'] = sample_batch.silu_pot.mean().cpu().detach().numpy()
+    metrics['eval/silu_potential'] = sample_batch.silu_pot.mean().cpu().detach().numpy()
+    metrics['eval/energy'] = sample_batch.gfn_energy.mean().cpu().detach().numpy()
+    metrics['eval/ellipsoid_overlap'] = sample_batch.ellipsoid_overlap.mean().cpu().detach().numpy()
     samples_to_log = log_crystal_samples(sample_batch=sample_batch)
     [wandb.log({f'crystal_sample_{ind}': samples_to_log[ind]}, commit=False) for ind in range(len(samples_to_log))]
 
@@ -251,6 +249,7 @@ def bwd_train_step(energy, gfn_model, buffer, buffer_ls, exploration_std=None, i
 
 
 def train():
+    times['initialization_start'] = time()
     #name = get_name(args)  # the mkdirs is bugging with long names
     name = args.run_name
     if not os.path.exists(name):
@@ -280,7 +279,7 @@ def train():
     gfn_optimizer = get_gfn_optimizer(gfn_model, args.lr_policy, args.lr_flow, args.lr_back, args.learn_pb,
                                       args.conditional_flow_model, args.use_weight_decay, args.weight_decay)
 
-    print(gfn_model)
+    #print(gfn_model)
 
     buffer = ReplayBuffer(args.buffer_size,
                           device,
@@ -302,12 +301,16 @@ def train():
         buffer_ls = add_dataset_to_buffer(args.dataset_path, buffer_ls, energy)
     gfn_model.train()
 
+    times['initialization_end'] = time()
+    loss_record = []
     oomed_out = False
     for i in trange(args.epochs + 1):
         metrics = dict()
+        times['train_step_start'] = time()
         try:
             metrics['train/loss'] = train_step(energy, gfn_model, gfn_optimizer, i, args.exploratory,
                                                buffer, buffer_ls, args.exploration_factor, args.exploration_wd)
+            loss_record.append(metrics['train/loss'])
             if not oomed_out:
                 if args.batch_size < args.max_batch_size and args.grow_batch_size:
                     args.batch_size = max(args.batch_size + 1,
@@ -321,18 +324,20 @@ def train():
                 print(f"Reducing batch size to {args.batch_size}")
             else:
                 raise e  # will simply raise error if other or if training on CPU
+        times['train_step_end'] = time()
 
         if (i % args.eval_period == 0 and i > 0) or i == 50:
+            times['eval_step_start'] = time()
             metrics.update({'Batch Size': args.batch_size})
+            eval_batch_size = min(args.batch_size, 1000)
             metrics.update(eval_step(energy, gfn_model, eval_batch_size))
             if 'tb-avg' in args.mode_fwd or 'tb-avg' in args.mode_bwd:
                 del metrics['eval/log_Z_learned']
             if args.energy == 'molecular_crystal' and args.anneal_energy:
                 # todo need here also to adjust the energies stored in the buffer
                 anneal_energy(energy,
-                              metrics['eval/energy'],
-                              args.energy_annealing_threshold,
-                              10)
+                              loss_record,
+                              )
                 if len(buffer_ls) > 0:
                     buffer_ls = update_buffer_reward(
                         buffer_ls,
@@ -345,9 +350,12 @@ def train():
                     )
             metrics.update({'Crystal Temperature': energy.temperature,
                             'Crystal Turnover Potential': energy.turnover_pot})
+            times['eval_step_end'] = time()
+            metrics.update(log_elapsed_times())
             wandb.log(metrics, step=i)
 
         elif i % 10 == 0:
+            metrics.update(log_elapsed_times())
             wandb.log(metrics, step=i)
 
         if i % 100 == 0:
@@ -355,11 +363,31 @@ def train():
 
     torch.save(gfn_model.state_dict(), f'{name}model_final.pt')
 
+def log_elapsed_times():
+    elapsed_times = {}
+    for key in times.keys():
+        if 'start' in key:
+            start_key = key
+            end_key = start_key.split('_start')[0] + '_end'
+            if end_key in times.keys():
+                elapsed_times[start_key.split('_start')[0] + '_time'] = times[end_key] - times[start_key]
 
-def anneal_energy(energy_function, sample_energies, threshold, max_turnover_pot):
-    if sample_energies.mean() < threshold:
-        if energy_function.turnover_pot < max_turnover_pot:
-            energy_function.turnover_pot *= 1.1
+    return elapsed_times
+
+
+def anneal_energy(energy_function, values, min_temperature: float = 0.01):
+    values = np.array(values)[-100:]
+    # Avoid log(0) or log of very small numbers
+    values = np.clip(values, 1e-12, None)
+    log_values = np.log(values)
+
+    slope, _ = np.polyfit(np.arange(len(log_values)), log_values, 1)
+    curvature, _, _ = np.polyfit(np.arange(len(log_values)), values, 2)
+
+    if slope > -1e-3 and curvature > -1e-1:  # if the loss isn't decaying fast enough / the loss is saturated
+        if energy_function.temperature > min_temperature:
+            energy_function.temperature *= 0.9
+            print("Annealing energy function")
 
 
 def handle_oom(batch_size):
@@ -370,7 +398,7 @@ def handle_oom(batch_size):
 
 
 def add_dataset_to_buffer(dataset_path, buffer, energy):
-    # todo update this with conditional molecular information when the time comes
+    # todo update this with conditional molecular information
     print("Loading prebuilt buffer")
     dataset = collate_data_list(torch.load(dataset_path))
     x = dataset.cell_params_to_gen_basis()

@@ -1,3 +1,4 @@
+import copy
 from typing import Optional
 
 import torch
@@ -16,7 +17,7 @@ class MolecularCrystal(BaseSet):
                  dim: int = 12,
                  test_molecule: str = 'UREA',
                  space_group: int = 2,
-                 temperature: float = 10,
+                 temperature: float = 1,
                  turnover_pot: float = 0.01,
                  ):
         super(MolecularCrystal, self).__init__()
@@ -24,6 +25,7 @@ class MolecularCrystal(BaseSet):
         self.data_ndim = dim
         self.space_group = space_group
 
+        self.ellipsoid_scale = 0.8
         self.test_molecule = test_molecule
         self.initialize_test_molecule(test_molecule)
         self.temperature = temperature
@@ -74,19 +76,39 @@ class MolecularCrystal(BaseSet):
         crystal_batch.gen_basis_to_cell_params(x,
                                                clip_min_length=0.5)  # don't allow micro cells
 
+        crystal_batch.cell_lengths = crystal_batch.cell_lengths + 3
+        crystal_batch.box_analysis()
         return crystal_batch
 
     def analyze_crystal_batch(self, x, return_batch=False):  # x is gfn_outputs
-        crystal_batch = self.instantiate_crystals(x)
+        crystal_batch = self.instantiate_crystals(x)  # todo replace initialization here when we go to conditional gen
         cluster_batch = crystal_batch.mol2cluster(cutoff=6,
                                                   supercell_size=10,
-                                                  align_to_standardized_orientation=True)  # todo CONSIDER RELAXING THIS WHEN WE GO TO CONDITIONAL GENERATION
+                                                  align_to_standardized_orientation=True)
+
+        if not hasattr(self, 'ellipsoid_model'):
+            cluster_batch.load_ellipsoid_model()
+            self.ellipsoid_model = copy.deepcopy(cluster_batch.ellipsoid_model)
+            self.ellipsoid_model = self.ellipsoid_model.to(self.device)
+            self.ellipsoid_model.eval()
         cluster_batch.construct_radial_graph(cutoff=6)
         cluster_batch.compute_LJ_energy()
         silu_energy = cluster_batch.compute_silu_energy()
-        cluster_batch.silu_pot = silu_energy / cluster_batch.num_atoms
-        crystal_energy = self.generator_energy(silu_energy / cluster_batch.num_atoms)
+        # crystal_energy = self.generator_energy(silu_energy / cluster_batch.num_atoms)
 
+        # simplified ellipsoid energy testing
+        molwise_ellipsoid_overlap, v1_pred, v2_pred, v1, v2, norm_factor, normed_ellipsoid_overlap \
+            = cluster_batch.compute_ellipsoidal_overlap(
+            semi_axis_scale=self.ellipsoid_scale,
+            model=self.ellipsoid_model,
+            return_details=True)
+
+        density_energy = F.relu(-(cluster_batch.packing_coeff - 0.9))**2
+        crystal_energy = density_energy + normed_ellipsoid_overlap
+
+        cluster_batch.ellipsoid_overlap = normed_ellipsoid_overlap
+        cluster_batch.silu_pot = silu_energy / cluster_batch.num_atoms
+        cluster_batch.gfn_energy = crystal_energy
         if return_batch:
             return crystal_energy, cluster_batch
         else:
@@ -96,7 +118,7 @@ class MolecularCrystal(BaseSet):
         # aunit_lengths = cluster_batch.scale_lengths_to_aunit()
         # box_loss = F.relu(-(aunit_lengths - 3)).sum(1) + F.relu(
         #     aunit_lengths - (3 * 2 * cluster_batch.radius[:, None])).sum(1)
-        # crystal_energy = silu_energy / num_atoms / self.temperature + box_loss
+        # crystal_energy = silu_energy / num_atoms + box_loss
 
         # soften the repulsion
         crystal_energy = normed_silu_pot.clone()
@@ -152,7 +174,7 @@ class MolecularCrystal(BaseSet):
         :param x:
         :return:
         """
-        return self.analyze_crystal_batch(x)
+        return self.analyze_crystal_batch(x) / self.temperature
 
     def init_blank_crystal_batch(self, batch_size):
         # todo when we go to conditional modelling, we'll pass the molecules as MolCrystalData objects

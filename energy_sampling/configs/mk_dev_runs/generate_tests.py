@@ -30,7 +30,7 @@ config_list = [
         'lr_policy': 0.0001,
         'lr_flow': 0.01,
         'lr_back': 0.0001,
-        'gradient_norm_clip': 1.0,
+        'gradient_norm_clip': 10.0,
         'gfn_clip': 10000.0,
         'clipping': True,
         'weight_decay': 1e-7,
@@ -44,158 +44,25 @@ config_list = [
         'batch_size': 25,
         'grow_batch_size': True,
         'max_batch_size': 1000,
-        'eval_period': 500,
-
-        'local_search': True,
-        'both_ways': True,
-        'learn_pb': True,
-        'exploratory': True,
-        'pb_scale_range': 0.1,
-        'exploration_factor': 0.2,
-        'exploration_wd': True,
-        'learned_variance': True,
-
-        'anneal_energy': True,
-        'energy_annealing_threshold': 10,
-        'energy_temperature': 1.0
-    },  # 0 baseline
-    {
-        'lr_policy': 0.001,
-        'lr_flow': 0.1,
-        'lr_back': 0.001,
-        'gradient_norm_clip': 1.0,
-        'gfn_clip': 10000.0,
-        'clipping': True,
-        'weight_decay': 1e-7,
-        'use_weight_decay': False,
-
-        'joint_layers': 4,
-        'hidden_dim': 256,
-        'dropout': 0,
-        'norm': None,
-
-        'batch_size': 25,
-        'grow_batch_size': True,
-        'max_batch_size': 1000,
-        'eval_period': 500,
-
-        'local_search': True,
-        'both_ways': True,
-        'learn_pb': True,
-        'exploratory': True,
-        'pb_scale_range': 0.1,
-        'exploration_factor': 0.2,
-        'exploration_wd': True,
-        'learned_variance': True,
-
-        'anneal_energy': True,
-        'energy_annealing_threshold': 10,
-        'energy_temperature': 1.0
-    },  # 1 high LR
-    {
-        'lr_policy': 0.0001,
-        'lr_flow': 0.01,
-        'lr_back': 0.0001,
-        'gradient_norm_clip': 1.0,
-        'gfn_clip': 10000.0,
-        'clipping': True,
-        'weight_decay': 1e-7,
-        'use_weight_decay': False,
-
-        'joint_layers': 4,
-        'hidden_dim': 256,
-        'dropout': 0,
-        'norm': None,
-
-        'batch_size': 25,
-        'grow_batch_size': True,
-        'max_batch_size': 1000,
-        'eval_period': 500,
-
-        'local_search': True,
-        'both_ways': True,
-        'learn_pb': True,
-        'exploratory': True,
-        'pb_scale_range': 0.1,
-        'exploration_factor': 0.5,
-        'exploration_wd': True,
-        'learned_variance': True,
-
-        'anneal_energy': True,
-        'energy_annealing_threshold': 10,
-        'energy_temperature': 1.0
-    },  # 2 high exploration factor
-    {
-        'lr_policy': 0.0001,
-        'lr_flow': 0.01,
-        'lr_back': 0.0001,
-        'gradient_norm_clip': 1.0,
-        'gfn_clip': 10000.0,
-        'clipping': True,
-        'weight_decay': 1e-7,
-        'use_weight_decay': False,
-
-        'joint_layers': 4,
-        'hidden_dim': 256,
-        'dropout': 0,
-        'norm': None,
-
-        'batch_size': 25,
-        'grow_batch_size': True,
-        'max_batch_size': 1000,
-        'eval_period': 500,
-
-        'local_search': True,
-        'both_ways': True,
-        'learn_pb': False,
-        'exploratory': True,
-        'pb_scale_range': 0.1,
-        'exploration_factor': 0.2,
-        'exploration_wd': True,
-        'learned_variance': True,
-
-        'anneal_energy': True,
-        'energy_annealing_threshold': 10,
-        'energy_temperature': 1.0
-    },  # 3 not learned pb
-    {
-        'lr_policy': 0.0001,
-        'lr_flow': 0.01,
-        'lr_back': 0.0001,
-        'gradient_norm_clip': 1.0,
-        'gfn_clip': 10000.0,
-        'clipping': True,
-        'weight_decay': 1e-7,
-        'use_weight_decay': False,
-
-        'joint_layers': 4,
-        'hidden_dim': 256,
-        'dropout': 0,
-        'norm': None,
-
-        'batch_size': 25,
-        'grow_batch_size': True,
-        'max_batch_size': 1000,
-        'eval_period': 500,
+        'eval_period': 100,
 
         'local_search': False,
         'both_ways': False,
         'learn_pb': False,
         'exploratory': True,
         'pb_scale_range': 0.1,
-        'exploration_factor': 0.2,
+        'exploration_factor': 0.35,
         'exploration_wd': True,
         'learned_variance': True,
 
         'anneal_energy': True,
-        'energy_annealing_threshold': 10,
         'energy_temperature': 1.0
-    },  # 4 no LS, no bwd
+    },  # 0 baseline
     {
-        'lr_policy': 0.0001,
-        'lr_flow': 0.01,
-        'lr_back': 0.0001,
-        'gradient_norm_clip': 1.0,
+        'lr_policy': 0.001,
+        'lr_flow': 0.1,
+        'lr_back': 0.001,
+        'gradient_norm_clip': 10.0,
         'gfn_clip': 10000.0,
         'clipping': True,
         'weight_decay': 1e-7,
@@ -209,26 +76,25 @@ config_list = [
         'batch_size': 25,
         'grow_batch_size': True,
         'max_batch_size': 1000,
-        'eval_period': 500,
+        'eval_period': 100,
 
         'local_search': False,
-        'both_ways': True,
-        'learn_pb': True,
+        'both_ways': False,
+        'learn_pb': False,
         'exploratory': True,
         'pb_scale_range': 0.1,
-        'exploration_factor': 0.2,
+        'exploration_factor': 0.35,
         'exploration_wd': True,
         'learned_variance': True,
 
         'anneal_energy': True,
-        'energy_annealing_threshold': 10,
         'energy_temperature': 1.0
-    },  # 5 no LS
+    },  # 1 higher lr
     {
         'lr_policy': 0.0001,
         'lr_flow': 0.01,
         'lr_back': 0.0001,
-        'gradient_norm_clip': 1.0,
+        'gradient_norm_clip': 10.0,
         'gfn_clip': 10000.0,
         'clipping': True,
         'weight_decay': 1e-7,
@@ -239,24 +105,87 @@ config_list = [
         'dropout': 0,
         'norm': None,
 
-        'batch_size': 5,
+        'batch_size': 25,
         'grow_batch_size': True,
-        'max_batch_size': 100,
-        'eval_period': 500,
+        'max_batch_size': 500,
+        'eval_period': 100,
 
-        'local_search': True,
-        'both_ways': True,
-        'learn_pb': True,
+        'local_search': False,
+        'both_ways': False,
+        'learn_pb': False,
         'exploratory': True,
         'pb_scale_range': 0.1,
-        'exploration_factor': 0.2,
+        'exploration_factor': 0.35,
         'exploration_wd': True,
         'learned_variance': True,
 
         'anneal_energy': True,
-        'energy_annealing_threshold': 10,
         'energy_temperature': 1.0
-    },  # 6 small batches
+    },  # 2 smaller batch
+    {
+        'lr_policy': 0.0001,
+        'lr_flow': 0.01,
+        'lr_back': 0.0001,
+        'gradient_norm_clip': 10.0,
+        'gfn_clip': 10000.0,
+        'clipping': True,
+        'weight_decay': 1e-7,
+        'use_weight_decay': False,
+
+        'joint_layers': 4,
+        'hidden_dim': 512,
+        'dropout': 0,
+        'norm': None,
+
+        'batch_size': 25,
+        'grow_batch_size': True,
+        'max_batch_size': 1000,
+        'eval_period': 100,
+
+        'local_search': False,
+        'both_ways': False,
+        'learn_pb': False,
+        'exploratory': True,
+        'pb_scale_range': 0.1,
+        'exploration_factor': 0.35,
+        'exploration_wd': True,
+        'learned_variance': True,
+
+        'anneal_energy': True,
+        'energy_temperature': 1.0
+    },  # 3 bigger model
+    {
+        'lr_policy': 0.0001,
+        'lr_flow': 0.01,
+        'lr_back': 0.0001,
+        'gradient_norm_clip': 10.0,
+        'gfn_clip': 10000.0,
+        'clipping': True,
+        'weight_decay': 1e-7,
+        'use_weight_decay': False,
+
+        'joint_layers': 4,
+        'hidden_dim': 256,
+        'dropout': 0,
+        'norm': None,
+
+        'batch_size': 25,
+        'grow_batch_size': True,
+        'max_batch_size': 1000,
+        'eval_period': 100,
+
+        'local_search': False,
+        'both_ways': True,
+        'learn_pb': True,
+        'exploratory': True,
+        'pb_scale_range': 0.1,
+        'exploration_factor': 0.35,
+        'exploration_wd': True,
+        'learned_variance': True,
+
+        'anneal_energy': True,
+        'energy_temperature': 1.0
+    },  # 4 fwd bwd
 ]
 
 
@@ -277,10 +206,6 @@ for ix1 in range(len(config_list)):
 
     run_config = config_list[ix1]
     overwrite_nested_dict(config, run_config)
-
-    # automate tagging
-    run_name = os.path.basename(os.getcwd())
-    config['run_name'] = run_name
 
     with open(str(ind) + '.yaml', 'w') as outfile:
         yaml.dump(config, outfile, default_flow_style=False)
