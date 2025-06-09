@@ -229,8 +229,8 @@ def train():
                     relative_change = total_change / (total_norm + 1e-8)
                     metrics['relative_gradient_change'] = relative_change
                     old_params = [p.clone().detach() for p in gfn_model.parameters()]
-
-                anneal_energy(energy_function, relative_change < 2e-3)
+                # todo add stipulation loss not increasing
+                anneal_energy(energy_function, relative_change < 1e-3)
 
             metrics.update({'Crystal Temperature': energy_function.temperature,
                             'Crystal Turnover Potential': energy_function.turnover_pot})

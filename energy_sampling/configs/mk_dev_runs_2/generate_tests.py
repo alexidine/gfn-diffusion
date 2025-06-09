@@ -27,10 +27,10 @@ base_config = load_yaml('base.yaml')
 
 config_list = [
     {
-        'lr_policy': 0.0005,
+        'lr_policy': 0.0001,
         'lr_flow': 0.01,
-        'lr_back': 0.0005,
-        'gradient_norm_clip': 10.0,
+        'lr_back': 0.0001,
+        'gradient_norm_clip': 1.0,
         'gfn_clip': 10000.0,
         'clipping': True,
         'weight_decay': 1e-7,
@@ -43,7 +43,7 @@ config_list = [
 
         'batch_size': 25,
         'grow_batch_size': True,
-        'max_batch_size': 10000,
+        'max_batch_size': 500,
         'eval_period': 100,
 
         'local_search': False,

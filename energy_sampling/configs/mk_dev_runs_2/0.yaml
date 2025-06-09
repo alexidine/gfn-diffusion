@@ -20,7 +20,7 @@ exploration_factor: 0.5
 exploration_wd: true
 exploratory: true
 gfn_clip: 10000.0
-gradient_norm_clip: 10.0
+gradient_norm_clip: 1.0
 grow_batch_size: true
 harmonics_dim: 64
 hidden_dim: 256
@@ -35,11 +35,11 @@ lgv_clip: 100.0
 lgv_layers: 4
 local_search: false
 log_var_range: 4.0
-lr_back: 0.0005
+lr_back: 0.0001
 lr_flow: 0.01
-lr_policy: 0.0005
+lr_policy: 0.0001
 ls_cycle: 100
-max_batch_size: 10000
+max_batch_size: 500
 max_iter_ls: 100
 mode_bwd: tb
 mode_fwd: tb
