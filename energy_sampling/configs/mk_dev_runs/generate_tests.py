@@ -154,38 +154,6 @@ config_list = [
         'anneal_energy': True,
         'energy_temperature': 1.0
     },  # 3 bigger model
-    {
-        'lr_policy': 0.0001,
-        'lr_flow': 0.01,
-        'lr_back': 0.0001,
-        'gradient_norm_clip': 10.0,
-        'gfn_clip': 10000.0,
-        'clipping': True,
-        'weight_decay': 1e-7,
-        'use_weight_decay': False,
-
-        'joint_layers': 4,
-        'hidden_dim': 256,
-        'dropout': 0,
-        'norm': None,
-
-        'batch_size': 25,
-        'grow_batch_size': True,
-        'max_batch_size': 1000,
-        'eval_period': 100,
-
-        'local_search': False,
-        'both_ways': True,
-        'learn_pb': True,
-        'exploratory': True,
-        'pb_scale_range': 0.1,
-        'exploration_factor': 0.35,
-        'exploration_wd': True,
-        'learned_variance': True,
-
-        'anneal_energy': True,
-        'energy_temperature': 1.0
-    },  # 4 fwd bwd
 ]
 
 

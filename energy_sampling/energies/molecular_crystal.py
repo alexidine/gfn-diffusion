@@ -103,8 +103,9 @@ class MolecularCrystal(BaseSet):
             model=self.ellipsoid_model,
             return_details=True)
 
+        silu_coeff = F.sigmoid(-(torch.tensor(self.temperature, device=self.device) - 0.1)/0.01)
         density_energy = F.relu(-(cluster_batch.packing_coeff - 0.9))**2
-        crystal_energy = density_energy + normed_ellipsoid_overlap
+        crystal_energy = density_energy + normed_ellipsoid_overlap + silu_coeff * silu_energy
 
         cluster_batch.ellipsoid_overlap = normed_ellipsoid_overlap
         cluster_batch.silu_pot = silu_energy / cluster_batch.num_atoms
@@ -128,7 +129,7 @@ class MolecularCrystal(BaseSet):
 
         return crystal_energy
 
-    def local_opt(self, x,
+    def local_opt(self, x,  # todo semi-deprecated
                   max_num_steps,
                   samples_per_opt):
         """
