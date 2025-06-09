@@ -36,10 +36,10 @@ config_list = [
         'weight_decay': 1e-7,
         'use_weight_decay': False,
 
-        'joint_layers': 20,
-        'hidden_dim': 1024,
-        'dropout': 0.25,
-        'norm': 'layer',
+        'joint_layers': 4,
+        'hidden_dim': 256,
+        'dropout': 0,
+        'norm': None,
 
         'batch_size': 25,
         'grow_batch_size': True,
