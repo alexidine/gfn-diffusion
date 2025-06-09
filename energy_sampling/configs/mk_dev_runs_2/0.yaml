@@ -12,7 +12,7 @@ dataset_path: D:/crystal_datasets/urea_gfn_dataset.pt
 device: cuda
 dropout: 0.25
 energy: molecular_crystal
-energy_temperature: 1.0
+energy_temperature: 10.0
 epochs: 10000000
 eval: false
 eval_period: 100

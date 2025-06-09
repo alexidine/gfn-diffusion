@@ -56,7 +56,7 @@ config_list = [
         'learned_variance': True,
 
         'anneal_energy': True,
-        'energy_temperature': 1.0
+        'energy_temperature': 10.0
     },  # 0 baseline
 
 ]
