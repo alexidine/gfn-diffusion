@@ -25,7 +25,7 @@ class MolecularCrystal(BaseSet):
         self.data_ndim = dim
         self.space_group = space_group
 
-        self.ellipsoid_scale = 0.8
+        self.ellipsoid_scale = 1
         self.test_molecule = test_molecule
         self.initialize_test_molecule(test_molecule)
         self.temperature = temperature
@@ -97,15 +97,15 @@ class MolecularCrystal(BaseSet):
         # crystal_energy = self.generator_energy(silu_energy / cluster_batch.num_atoms)
 
         # simplified ellipsoid energy testing
-        molwise_ellipsoid_overlap, v1_pred, v2_pred, v1, v2, norm_factor, normed_ellipsoid_overlap \
+        _, _, _, _, _, _, normed_ellipsoid_overlap \
             = cluster_batch.compute_ellipsoidal_overlap(
             semi_axis_scale=self.ellipsoid_scale,
             model=self.ellipsoid_model,
             return_details=True)
 
-        silu_coeff = F.sigmoid(-(torch.tensor(self.temperature, device=self.device) - 0.1)/0.01)
-        density_energy = F.relu(-(cluster_batch.packing_coeff - 0.9))**2
-        crystal_energy = density_energy + normed_ellipsoid_overlap + silu_coeff * silu_energy
+        silu_coeff = F.sigmoid(-(torch.tensor(self.temperature, device=self.device) - 0.1) / 0.01)
+        density_energy = F.relu(-(cluster_batch.packing_coeff - 0.9)) ** 2
+        crystal_energy = self.soften_LJ_energy(silu_energy)  # density_energy + normed_ellipsoid_overlap + silu_coeff * silu_energy
 
         cluster_batch.ellipsoid_overlap = normed_ellipsoid_overlap
         cluster_batch.silu_pot = silu_energy / cluster_batch.num_atoms
@@ -115,14 +115,24 @@ class MolecularCrystal(BaseSet):
         else:
             return crystal_energy
 
-    def generator_energy(self, normed_silu_pot):
+    def sample_to_reward(self, crystal_list):
+        """
+        For pre-built, pre-scored crystal, generate the approriate reward for this point in training.
+        :param crystal_list:
+        :return:
+        """
+        crystal_batch = collate_data_list(crystal_list)
+        energy = crystal_batch.silu_pot
+        return -energy / self.temperature
+
+    def soften_LJ_energy(self, lj_energy):
         # aunit_lengths = cluster_batch.scale_lengths_to_aunit()
         # box_loss = F.relu(-(aunit_lengths - 3)).sum(1) + F.relu(
         #     aunit_lengths - (3 * 2 * cluster_batch.radius[:, None])).sum(1)
         # crystal_energy = silu_energy / num_atoms + box_loss
 
         # soften the repulsion
-        crystal_energy = normed_silu_pot.clone()
+        crystal_energy = lj_energy.clone()
         high_bools = crystal_energy > self.turnover_pot
         crystal_energy[high_bools] = self.turnover_pot + torch.log10(crystal_energy[high_bools] + 1 - self.turnover_pot)
         crystal_energy = crystal_energy.clip(max=50)
@@ -163,7 +173,7 @@ class MolecularCrystal(BaseSet):
         packing_coeffs = torch.tensor([elem.packing_coeff for elem in samples_out])
         num_atoms = torch.tensor([elem.num_atoms for elem in samples_out])
         energy_out = torch.tensor(
-            [-self.generator_energy(silu_energies) for sample_batch in samples_out])
+            [-self.soften_LJ_energy(silu_energies) for sample_batch in samples_out])
 
         return samples, energy_out
 

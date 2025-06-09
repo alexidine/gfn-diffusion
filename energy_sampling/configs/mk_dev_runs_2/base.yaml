@@ -21,7 +21,7 @@ batch_size: 25               # number of samples per training batch: relatively 
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
 max_batch_size: 1000          # maximum batch size to allow
 epochs: 10000000             # number of training epochs: relatively large
-eval_period: 100             # how often to do evaluation & reporting
+eval_period: 500             # how often to do evaluation & reporting
 buffer_size: 600000          # size of replay buffer: relatively large
 
 # subtb params
@@ -82,4 +82,4 @@ eval: false
 ################################################################
 # scales the energy function
 anneal_energy: true  # harden intermolecular repulsion over time
-energy_temperature: 1  # global fixed temperature for energy function
+energy_temperature: 10  # global fixed temperature for energy function

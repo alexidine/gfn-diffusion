@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+from torch_geometric.data import DataLoader
 
 
 class SampleDataset(torch.utils.data.Dataset):
@@ -169,3 +170,73 @@ class ReplayBuffer():
             sample, reward = next(self.data_iter)
 
         return sample.detach(), reward.detach()
+
+
+class CrystalReplayBuffer():
+    def __init__(self, buffer_size,
+                 device,
+                 energy_function,
+                 batch_size,
+                 beta=1.0,
+                 rank_weight=1e-2,
+                 prioritized=None):
+        self.buffer_size = buffer_size
+        self.prioritized = prioritized
+        self.device = device
+        self.batch_size = batch_size
+        self.dataset = None
+        self.buffer_idx = 0
+        self.buffer_full = False
+        self.energy_function = energy_function
+        self.beta = beta
+        self.rank_weight = rank_weight
+        self.beta = beta
+
+    def add(self, dataset):
+        if self.dataset is None:
+            self.dataset = dataset
+        else:
+            self.dataset.extend(dataset)
+
+        if len(self.dataset) > self.buffer_size:
+            self.dataset = self.dataset[-self.buffer_size:]
+
+        if self.prioritized == 'rank':
+            self.scores_np = self.energy_function.sample_to_reward(self.dataset).detach().cpu().view(-1).numpy()
+            ranks = np.argsort(np.argsort(-1 * self.scores_np))
+            weights = 1.0 / (1e-2 * len(self.scores_np) + ranks)
+            self.dataset = ZipDataset(self.sample_dataset, self.reward_dataset)
+            self.sampler = torch.utils.data.WeightedRandomSampler(
+                weights=weights, num_samples=len(self.scores_np), replacement=True
+            )
+
+            self.loader = DataLoader(
+                self.dataset,
+                batch_size=self.batch_size,
+                sampler=self.sampler,
+                num_workers=0,
+                pin_memory=True,
+                drop_last=False)
+        else:
+            weights = 1.0
+            self.sampler = torch.utils.data.WeightedRandomSampler(
+                weights=weights, num_samples=len(self.scores_np), replacement=True
+            )
+
+            self.loader = DataLoader(
+                self.dataset,
+                batch_size=self.batch_size,
+                sampler=self.sampler,
+                num_workers=0,
+                pin_memory=True,
+                drop_last=False)
+
+    def __len__(self):
+        if self.dataset is None:
+            return 0
+        else:
+            return len(self.dataset)
+
+    def sample(self):
+        sample = next(iter(self.loader))
+        return sample, self.energy_function.sample_to_reward(sample)

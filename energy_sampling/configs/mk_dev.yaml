@@ -19,7 +19,7 @@ norm: null
 
 batch_size: 25               # number of samples per training batch: relatively small
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 1000          # maximum batch size to allow
+max_batch_size: 50           # maximum batch size to allow
 epochs: 10000000             # number of training epochs: relatively large
 eval_period: 100             # how often to do evaluation & reporting
 buffer_size: 600000          # size of replay buffer: relatively large
@@ -37,7 +37,7 @@ both_ways: false
 
 # local search settings
 ################################################################
-local_search: false
+local_search: false             # DEPRECATED we now combine preloaded and sampled elements into a single buffer
 dataset_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
 max_iter_ls: 100                # DEPRECATED # how many iterations to run local search
 samples_per_opt: 10             # DEPRECATED #how many noisy samples to take near each optimized minimum
@@ -57,7 +57,7 @@ rank_weight: 0.01     # rank-based replay sampling: low rank_weight = steep prio
 prioritized: "rank"   # three kinds of replay training: random, reward prioritized, rank-based
 
 ################################################################
-bwd: false
+bwd: false            # backward training only
 exploratory: true
 
 sampling: "buffer"
@@ -82,4 +82,4 @@ eval: false
 ################################################################
 # scales the energy function
 anneal_energy: true  # harden intermolecular repulsion over time
-energy_temperature: 1  # global fixed temperature for energy function
+energy_temperature: 10  # initial global temperature for energy function
