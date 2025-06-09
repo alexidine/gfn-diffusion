@@ -2,20 +2,17 @@ import gc
 import os
 from time import time
 
-import numpy as np
 import torch
 import wandb
-from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.reporting.online import simple_cell_hist, simple_cell_scatter_fig, log_crystal_samples
 from tqdm import trange
 
-from buffer import ReplayBuffer, CrystalReplayBuffer
+from buffer import CrystalReplayBuffer
 from energies.molecular_crystal import MolecularCrystal
-from energy_sampling.plot_utils import get_plotly_fig_size_mb
-from energy_sampling.utils import get_train_args
-from evaluations import log_partition_function, mean_log_likelihood, get_sample_metrics
-from langevin import langevin_dynamics
+from evaluations import log_partition_function
 from models import GFN
+from plot_utils import get_plotly_fig_size_mb
+from utils import get_train_args
 from utils import set_seed, cal_subtb_coef_matrix, get_gfn_optimizer, get_gfn_forward_loss, \
     get_gfn_backward_loss, get_exploration_std
 
