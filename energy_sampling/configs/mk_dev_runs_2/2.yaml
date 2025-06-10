@@ -12,7 +12,7 @@ dataset_path: D:/crystal_datasets/urea_gfn_dataset.pt
 device: cuda
 dropout: 0
 energy: molecular_crystal
-energy_annealing_threshold: 0.01
+energy_annealing_threshold: 0.005
 energy_temperature: 10.0
 epochs: 10000000
 eval: false
@@ -50,7 +50,7 @@ pb_scale_range: 0.1
 pis_architectures: false
 prioritized: rank
 rank_weight: 0.01
-run_name: dev_test_2_0
+run_name: dev_test_2_2
 s_emb_dim: 32
 samples_per_opt: 10
 sampling: buffer

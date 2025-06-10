@@ -15,7 +15,7 @@ from .base_set import BaseSet
 class MolecularCrystal(BaseSet):
     def __init__(self, device,
                  dim: int = 12,
-                 test_molecule: str = 'UREA',
+                 test_molecule: str = 'NICOTINAMIDE',
                  space_group: int = 2,
                  temperature: float = 1,
                  turnover_pot: float = 0.01,
@@ -44,7 +44,7 @@ class MolecularCrystal(BaseSet):
             self.atom_types = torch.tensor([8, 7, 7, 6], dtype=torch.long, device=self.device)
 
         # NICOTANIMIDE from molview
-        elif test_molecule == 'NICOTANIMIDE':
+        elif test_molecule == 'NICOTINAMIDE':
             self.atom_coords = torch.tensor([
                 [-2.3940, 1.1116, -0.0088],
                 [1.7614, -1.2284, -0.0034],

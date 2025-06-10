@@ -1,12 +1,12 @@
 run_name: 'mk_local_dev'
 device: 'cuda'
-lr_policy: 0.0001              # learning rate of the policy network
-lr_flow: 0.01                  # learning rate of the flow network
-lr_back: 0.0001                # learning rate of the backward pass
+lr_policy: 0.0005              # learning rate of the policy network
+lr_flow: 0.02                  # learning rate of the flow network
+lr_back: 0.0005                # learning rate of the backward pass
 gradient_norm_clip: 1.0        # gradient norm clip for updating gfn model weights
 
 # model parameters
-zero_init: true
+zero_init: false
 pis_architectures: false # false goes to our custom architectures, which are better for training bigger models
 lgv_layers: 4
 joint_layers: 4
@@ -19,13 +19,13 @@ norm: null
 
 batch_size: 25               # number of samples per training batch: relatively small
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 100          # maximum batch size to allow
+max_batch_size: 50           # maximum batch size to allow
 epochs: 10000000             # number of training epochs: relatively large
 eval_period: 100             # how often to do evaluation & reporting
 buffer_size: 600000          # size of replay buffer: relatively large
 
 # subtb params
-T: 10
+T: 10  # diffusion trajectory length
 subtb_lambda: 2
 
 t_scale: 1.0
@@ -37,8 +37,8 @@ both_ways: false
 
 # local search settings
 ################################################################
-local_search: false
-dataset_path: null              # path to prebuilt dataset
+local_search: false             # DEPRECATED we now combine preloaded and sampled elements into a single buffer
+dataset_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
 max_iter_ls: 100                # DEPRECATED # how many iterations to run local search
 samples_per_opt: 10             # DEPRECATED #how many noisy samples to take near each optimized minimum
 burn_in: 100                    # DEPRECATED # NOT USED IN MXTAL how many iterations to burn in before making local search
@@ -57,7 +57,7 @@ rank_weight: 0.01     # rank-based replay sampling: low rank_weight = steep prio
 prioritized: "rank"   # three kinds of replay training: random, reward prioritized, rank-based
 
 ################################################################
-bwd: false
+bwd: false            # backward training only
 exploratory: true
 
 sampling: "buffer"
@@ -66,13 +66,13 @@ langevin_scaling_per_dimension: false
 conditional_flow_model: false
 learn_pb: false
 pb_scale_range: 0.1
-learned_variance: false
+learned_variance: true
 partial_energy: false
-exploration_factor: 0.05
-exploration_wd: false
+exploration_factor: 0.35
+exploration_wd: true
 clipping: true
 lgv_clip: 100.0
-gfn_clip: 10000.0
+gfn_clip: 1.0
 seed: 12345
 weight_decay: 1e-7
 use_weight_decay: false
@@ -82,5 +82,5 @@ eval: false
 ################################################################
 # scales the energy function
 anneal_energy: true  # harden intermolecular repulsion over time
-energy_annealing_threshold: 5 # mean sample energy below which to trigger annealing
-energy_temperature: 1  # global fixed temperature for energy function
+annealing_eps: 1.0e-2
+energy_temperature: 10  # initial global temperature for energy function

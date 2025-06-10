@@ -79,7 +79,7 @@ def train_step(energy, gfn_model, gfn_optimizer, it, exploratory, buffer, explor
 
     if args.both_ways:
         if it % 2 == 0:
-            if False:  #TODO REIMPLEMENT # args.sampling == 'buffer':
+            if args.sampling == 'buffer':
                 loss, states, _, _, log_r = fwd_train_step(energy, gfn_model, exploration_std, return_exp=True)
                 buffer.add(states[:, -1], log_r)
             else:
@@ -230,10 +230,9 @@ def train():
                     metrics['relative_gradient_change'] = relative_change
                     old_params = [p.clone().detach() for p in gfn_model.parameters()]
                 # todo add stipulation loss not increasing
-                anneal_energy(energy_function, relative_change < 1e-3)
+                anneal_energy(energy_function, relative_change < args.energy_annealing_threshold)
 
-            metrics.update({'Crystal Temperature': energy_function.temperature,
-                            'Crystal Turnover Potential': energy_function.turnover_pot})
+            metrics.update({'Crystal Temperature': energy_function.temperature})
             times['eval_step_end'] = time()
             metrics.update(log_elapsed_times())
             wandb.log(metrics, step=i)

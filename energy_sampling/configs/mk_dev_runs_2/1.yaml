@@ -36,9 +36,9 @@ lgv_clip: 100.0
 lgv_layers: 4
 local_search: false
 log_var_range: 4.0
-lr_back: 0.0001
+lr_back: 0.0005
 lr_flow: 0.01
-lr_policy: 0.0001
+lr_policy: 0.0005
 ls_cycle: 100
 max_batch_size: 500
 max_iter_ls: 100
@@ -50,7 +50,7 @@ pb_scale_range: 0.1
 pis_architectures: false
 prioritized: rank
 rank_weight: 0.01
-run_name: dev_test_2_0
+run_name: dev_test_2_1
 s_emb_dim: 32
 samples_per_opt: 10
 sampling: buffer

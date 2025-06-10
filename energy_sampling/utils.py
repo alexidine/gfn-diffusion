@@ -239,7 +239,7 @@ def get_train_args():
     # args for molecular crystal energy
     parser.add_argument('--energy_temperature', type=float, default=1)
     parser.add_argument('--anneal_energy', type=bool, default=False)
-    parser.add_argument('--energy_annealing_threshold', type=float, default=0)
+    parser.add_argument('--energy_annealing_threshold', type=float, default=1e-3)
     args, remaining = parser.parse_known_args()
 
     if 'config' in remaining[0]:  # load external yaml config file
