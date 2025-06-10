@@ -1,8 +1,8 @@
-run_name: 'mk_local_dev'
+run_name: 'dev_test_2'
 device: 'cuda'
-lr_policy: 0.0005              # learning rate of the policy network
-lr_flow: 0.02                  # learning rate of the flow network
-lr_back: 0.0005                # learning rate of the backward pass
+lr_policy: 0.0001              # learning rate of the policy network
+lr_flow: 0.01                  # learning rate of the flow network
+lr_back: 0.0001                # learning rate of the backward pass
 gradient_norm_clip: 1.0        # gradient norm clip for updating gfn model weights
 
 # model parameters
@@ -19,10 +19,10 @@ norm: null
 
 batch_size: 25               # number of samples per training batch: relatively small
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 50           # maximum batch size to allow
+max_batch_size: 1000          # maximum batch size to allow
 epochs: 10000000             # number of training epochs: relatively large
 eval_period: 100             # how often to do evaluation & reporting
-figs_period: 100             # how often to log custom figrues
+figs_period: 2000            # how often to log custom figures
 buffer_size: 600000          # size of replay buffer: relatively large
 
 # subtb params
@@ -38,7 +38,7 @@ both_ways: false
 
 # local search settings
 ################################################################
-local_search: false             # DEPRECATED we now combine preloaded and sampled elements into a single buffer
+local_search: false
 dataset_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
 max_iter_ls: 100                # DEPRECATED # how many iterations to run local search
 samples_per_opt: 10             # DEPRECATED #how many noisy samples to take near each optimized minimum
@@ -58,7 +58,7 @@ rank_weight: 0.01     # rank-based replay sampling: low rank_weight = steep prio
 prioritized: "rank"   # three kinds of replay training: random, reward prioritized, rank-based
 
 ################################################################
-bwd: false            # backward training only
+bwd: false
 exploratory: true
 
 sampling: "buffer"
@@ -69,7 +69,7 @@ learn_pb: false
 pb_scale_range: 0.1
 learned_variance: true
 partial_energy: false
-exploration_factor: 0.35
+exploration_factor: 0.5
 exploration_wd: true
 clipping: true
 lgv_clip: 100.0
@@ -83,7 +83,7 @@ eval: false
 ################################################################
 # scales the energy function
 anneal_energy: true  # harden intermolecular repulsion over time
+energy_temperature: 10  # global fixed temperature for energy function
 energy_annealing_threshold: 1.0e-2
-energy_temperature: 10  # initial global temperature for energy function
 convergence_history: 1000
-energy_density_coeff: 0  # how much to weight the density penalty term in the energy functio
+energy_density_coeff: 0  # how much to weight the density penalty term in the energy function

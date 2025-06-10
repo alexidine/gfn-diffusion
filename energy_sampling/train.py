@@ -2,6 +2,7 @@ import gc
 import os
 from time import time
 
+import numpy as np
 import torch
 import wandb
 from mxtaltools.reporting.online import simple_cell_hist, simple_cell_scatter_fig, log_crystal_samples
@@ -37,31 +38,34 @@ if args.local_search:
 times = {}
 
 
-def eval_step(energy, gfn_model, batch_size):
+def eval_step(energy, gfn_model, batch_size, do_figures: bool=True):
     gfn_model.eval()
-    metrics = dict()
+    metrics = {}
     fig_dict = {}
     init_state = torch.zeros(batch_size, energy.data_ndim).to(device)
-    samples, metrics['eval/log_Z'], metrics['eval/log_Z_lb'], metrics[
-        'eval/log_Z_learned'], sample_batch = log_partition_function(
+    samples, log_Z, log_Z_lb, log_Z_learned, sample_batch = log_partition_function(
         init_state, gfn_model, energy)
 
     "Scalar metrics"
+    metrics['eval/log_Z'] = log_Z.cpu().detach().numpy()
+    metrics['eval/log_Z_lb'] = log_Z_lb.cpu().detach().numpy()
+    metrics['eval/log_Z_learned'] = log_Z_learned.cpu().detach().numpy()
     metrics['eval/packing_coeff'] = sample_batch.packing_coeff.mean().cpu().detach().numpy()
     metrics['eval/silu_potential'] = sample_batch.silu_pot.mean().cpu().detach().numpy()
     metrics['eval/energy'] = sample_batch.gfn_energy.mean().cpu().detach().numpy()
     metrics['eval/ellipsoid_overlap'] = sample_batch.ellipsoid_overlap.mean().cpu().detach().numpy()
 
     "Custom Figures"
-    fig_dict['Lattice Features Distribution'] = simple_cell_hist(sample_batch)
-    fig_dict['Sample Scatter'] = simple_cell_scatter_fig(sample_batch)
-    for key in fig_dict.keys():
-        fig = fig_dict[key]
-        if get_plotly_fig_size_mb(fig) > 0.1:  # bigger than .1 MB
-            fig.write_image(key + 'fig.png', width=1024,
-                            height=512)  # save the image rather than the fig, for size reasons
-            fig_dict[key] = wandb.Image(key + 'fig.png')
-    metrics.update(fig_dict)
+    if do_figures:
+        fig_dict['Lattice Features Distribution'] = simple_cell_hist(sample_batch)
+        fig_dict['Sample Scatter'] = simple_cell_scatter_fig(sample_batch)
+        for key in fig_dict.keys():
+            fig = fig_dict[key]
+            if get_plotly_fig_size_mb(fig) > 0.1:  # bigger than .1 MB
+                fig.write_image(key + 'fig.png', width=1024,
+                                height=512)  # save the image rather than the fig, for size reasons
+                fig_dict[key] = wandb.Image(key + 'fig.png')
+        metrics.update(fig_dict)
 
     "Crystal samples"
     samples_to_log = log_crystal_samples(sample_batch=sample_batch)
@@ -96,7 +100,7 @@ def train_step(energy, gfn_model, gfn_optimizer, it, exploratory, buffer, explor
     torch.nn.utils.clip_grad_norm_(gfn_model.parameters(),
                                    args.gradient_norm_clip)  # gradient clipping
     gfn_optimizer.step()
-    return loss.item()
+    return loss.item(), exploration_std(0)
 
 
 def fwd_train_step(energy, gfn_model, exploration_std, return_exp=False):
@@ -146,7 +150,8 @@ def train():
     if not os.path.exists(name):
         os.makedirs(name)
 
-    energy_function = MolecularCrystal(device=device, temperature=args.energy_temperature)
+    energy_function = MolecularCrystal(device=device, temperature=args.energy_temperature,
+                                       density_coeff=args.energy_density_coeff)
 
     config = args.__dict__
     config["Experiment"] = "{args.energy}"
@@ -184,14 +189,23 @@ def train():
 
     times['initialization_end'] = time()
     loss_record = []
+    energy_record = []
+    learned_Z_record = []
     oomed_out = False
     old_params = [p.clone().detach() for p in gfn_model.parameters()]
     for i in trange(args.epochs + 1):
         metrics = dict()
         times['train_step_start'] = time()
         try:
-            metrics['train/loss'] = train_step(energy_function, gfn_model, gfn_optimizer, i, args.exploratory,
-                                               buffer, args.exploration_factor, args.exploration_wd)
+            metrics['train/loss'], metrics['train/expl'] = train_step(energy_function,
+                                               gfn_model,
+                                               gfn_optimizer,
+                                               i,
+                                               args.exploratory,
+                                               buffer,
+                                               args.exploration_factor,
+                                               args.exploration_wd)
+
             loss_record.append(metrics['train/loss'])
             if not oomed_out:
                 if args.batch_size < args.max_batch_size and args.grow_batch_size:
@@ -209,15 +223,22 @@ def train():
         times['train_step_end'] = time()
 
         if (i % args.eval_period == 0 and i > 0) or i == 50:
-
             times['eval_step_start'] = time()
             metrics.update({'Batch Size': args.batch_size})
             eval_batch_size = min(max(args.batch_size, 500), 1000)
-            metrics.update(eval_step(energy_function, gfn_model, eval_batch_size))
-
+            do_figures = i % args.figs_period == 0
+            metrics.update(eval_step(energy_function, gfn_model, eval_batch_size, do_figures))
+            energy_record.append(metrics['eval/energy'])
+            learned_Z_record.append(metrics['eval/log_Z_learned'])
             if 'tb-avg' in args.mode_fwd or 'tb-avg' in args.mode_bwd:
                 del metrics['eval/log_Z_learned']
 
+            metrics.update({'Crystal Temperature': energy_function.temperature})
+            times['eval_step_end'] = time()
+            metrics.update(log_elapsed_times())
+            wandb.log(metrics, step=i)
+
+        if i % 100 == 0 and i > 0:
             if args.energy == 'molecular_crystal' and args.anneal_energy:
                 with torch.no_grad():
                     total_change = 0.0
@@ -229,23 +250,35 @@ def train():
                     relative_change = total_change / (total_norm + 1e-8)
                     metrics['relative_gradient_change'] = relative_change
                     old_params = [p.clone().detach() for p in gfn_model.parameters()]
-                # todo add stipulation loss not increasing
-                anneal_energy(energy_function, relative_change < args.energy_annealing_threshold)
 
-            metrics.update({'Crystal Temperature': energy_function.temperature})
-            times['eval_step_end'] = time()
-            metrics.update(log_elapsed_times())
-            wandb.log(metrics, step=i)
+                convergence_history = args.convergence_history
+                loss_array = np.array(loss_record)[-convergence_history:]
+                energy_array = np.array(energy_record)[-min(10, int(convergence_history/args.eval_period)):]
+                log_Z_array = np.array(learned_Z_record)[-min(10, int(convergence_history / args.eval_period)):]
+
+                loss_slope = relative_slope(loss_array)
+                energy_slope = relative_slope(energy_array)
+                log_Z_slope = relative_slope(log_Z_array)
+
+                annealing_trigger = (relative_change < 1e-4) and \
+                                    (loss_slope.abs() <= args.energy_annealing_threshold) and \
+                                    (energy_slope.abs() <= args.energy_annealing_threshold) and \
+                                    (log_Z_slope.abs() <= args.energy_annealing_threshold)
+
+                anneal_energy(energy_function, annealing_trigger)
+
+            torch.save(gfn_model.state_dict(), f'{name}model.pt')
 
         elif i % 10 == 0:
             metrics.update(log_elapsed_times())
             wandb.log(metrics, step=i)
+    torch.save(gfn_model.state_dict(), f'{name}_model_final.pt')
 
-        if i % 100 == 0:
-            torch.save(gfn_model.state_dict(), f'{name}model.pt')
-
-    torch.save(gfn_model.state_dict(), f'{name}model_final.pt')
-
+def relative_slope(y):
+    if len(y) < 2 or np.ptp(y) == 0:
+        return 0.0  # avoid division by zero or meaningless fit
+    slope, _ = np.polyfit(np.arange(len(y)), y, 1)
+    return abs(slope) / np.std(y)
 
 def log_elapsed_times():
     elapsed_times = {}
@@ -268,7 +301,7 @@ def anneal_energy(energy_function, trigger: bool, min_temperature: float = 0.01)
     # slope, _ = np.polyfit(np.arange(len(log_values)), log_values, 1)
     # curvature, _, _ = np.polyfit(np.arange(len(log_values)), values, 2)
 
-    if trigger: #slope > -1e-3 and curvature > -1e-1:  # if the loss isn't decaying fast enough / the loss is saturated
+    if trigger:  #slope > -1e-3 and curvature > -1e-1:  # if the loss isn't decaying fast enough / the loss is saturated
         if energy_function.temperature > min_temperature:
             energy_function.temperature *= 0.9
             print("Annealing energy function")

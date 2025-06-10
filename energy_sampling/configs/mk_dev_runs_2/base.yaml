@@ -22,6 +22,7 @@ grow_batch_size: true        # whether to dynamically grow the batch size to fil
 max_batch_size: 1000          # maximum batch size to allow
 epochs: 10000000             # number of training epochs: relatively large
 eval_period: 500             # how often to do evaluation & reporting
+figs_period: 2000            # how often to log custom figures
 buffer_size: 600000          # size of replay buffer: relatively large
 
 # subtb params
@@ -83,3 +84,5 @@ eval: false
 # scales the energy function
 anneal_energy: true  # harden intermolecular repulsion over time
 energy_temperature: 10  # global fixed temperature for energy function
+energy_annealing_threshold: 1.0e-2
+convergence_history: 1000

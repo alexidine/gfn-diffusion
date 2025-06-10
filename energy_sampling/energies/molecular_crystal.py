@@ -19,6 +19,7 @@ class MolecularCrystal(BaseSet):
                  space_group: int = 2,
                  temperature: float = 1,
                  turnover_pot: float = 0.01,
+                 density_coeff: float = 0,
                  ):
         super(MolecularCrystal, self).__init__()
         self.device = device
@@ -26,6 +27,7 @@ class MolecularCrystal(BaseSet):
         self.space_group = space_group
 
         self.ellipsoid_scale = 1
+        self.density_coeff = density_coeff
         self.test_molecule = test_molecule
         self.initialize_test_molecule(test_molecule)
         self.temperature = temperature
@@ -104,8 +106,8 @@ class MolecularCrystal(BaseSet):
             return_details=True)
 
         silu_coeff = F.sigmoid(-(torch.tensor(self.temperature, device=self.device) - 0.1) / 0.01)
-        density_energy = F.relu(-(cluster_batch.packing_coeff - 0.9)) ** 2
-        crystal_energy = self.soften_LJ_energy(silu_energy)  # density_energy + normed_ellipsoid_overlap + silu_coeff * silu_energy
+        density_energy = F.relu(-(cluster_batch.packing_coeff - 1)) ** 2
+        crystal_energy = self.soften_LJ_energy(silu_energy) + self.density_coeff * density_energy  # density_energy + normed_ellipsoid_overlap + silu_coeff * silu_energy
 
         cluster_batch.ellipsoid_overlap = normed_ellipsoid_overlap
         cluster_batch.silu_pot = silu_energy / cluster_batch.num_atoms

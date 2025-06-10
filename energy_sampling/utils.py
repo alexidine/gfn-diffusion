@@ -102,7 +102,7 @@ def get_gfn_backward_loss(mode, samples, gfn_model, log_reward, exploration_std=
 
 def get_exploration_std(iter, exploratory, exploration_factor=0.1, exploration_wd=False):
     if exploratory is False:
-        return None
+        return None, None
     if exploration_wd:
         exploration_std = exploration_factor * max(0, 1. - iter / 5000.)
     else:
@@ -178,6 +178,7 @@ def get_train_args():
     parser.add_argument('--grow_batch_size', type=bool, default=False)
     parser.add_argument('--epochs', type=int, default=25000)
     parser.add_argument('--eval_period', type=int, default=25000)
+    parser.add_argument('--figs_period', type=int, default=1000)
     parser.add_argument('--buffer_size', type=int, default=300 * 1000 * 2)
     parser.add_argument('--T', type=int, default=100)
     parser.add_argument('--subtb_lambda', type=int, default=2)
@@ -240,6 +241,9 @@ def get_train_args():
     parser.add_argument('--energy_temperature', type=float, default=1)
     parser.add_argument('--anneal_energy', type=bool, default=False)
     parser.add_argument('--energy_annealing_threshold', type=float, default=1e-3)
+    parser.add_argument('--convergence_history', type=int, default=1000)
+    parser.add_argument('--energy_density_coeff', type=float, default=1e-3)
+
     args, remaining = parser.parse_known_args()
 
     if 'config' in remaining[0]:  # load external yaml config file

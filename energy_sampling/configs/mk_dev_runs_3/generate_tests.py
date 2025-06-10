@@ -58,6 +58,7 @@ config_list = [
         'anneal_energy': True,
         'energy_temperature': 10.0,
         'energy_annealing_threshold': 1e-2,
+        'energy_density_coeff': 0,
     },  # 0 baseline
     {
         'lr_policy': 0.0005,
@@ -91,7 +92,9 @@ config_list = [
         'anneal_energy': True,
         'energy_temperature': 10.0,
         'energy_annealing_threshold': 1e-2,
-    },  # 1 higher lr  # very bad actually - never anneals. I think likely due to large LR making even stochastic weight updates significantly large
+        'energy_density_coeff': 0,
+
+    },  # 1 higher lr
     {
         'lr_policy': 0.0001,
         'lr_flow': 0.01,
@@ -123,9 +126,44 @@ config_list = [
 
         'anneal_energy': True,
         'energy_temperature': 10.0,
-        'energy_annealing_threshold': 5e-3,
-    },  # 2 lower threshold
+        'energy_annealing_threshold': 5e-2,
+        'energy_density_coeff': 0,
 
+    },  # 2 lower threshold
+{
+        'lr_policy': 0.0001,
+        'lr_flow': 0.01,
+        'lr_back': 0.0001,
+        'gradient_norm_clip': 1.0,
+        'gfn_clip': 10000.0,
+        'clipping': True,
+        'weight_decay': 1e-7,
+        'use_weight_decay': False,
+
+        'joint_layers': 4,
+        'hidden_dim': 256,
+        'dropout': 0,
+        'norm': None,
+
+        'batch_size': 25,
+        'grow_batch_size': True,
+        'max_batch_size': 500,
+        'eval_period': 250,
+
+        'local_search': False,
+        'both_ways': False,
+        'learn_pb': False,
+        'exploratory': True,
+        'pb_scale_range': 0.1,
+        'exploration_factor': 0.5,
+        'exploration_wd': True,
+        'learned_variance': True,
+
+        'anneal_energy': True,
+        'energy_temperature': 10.0,
+        'energy_annealing_threshold': 1e-2,
+        'energy_density_coeff': 1,
+},  # 3 added density based penalty
 ]
 
 """
