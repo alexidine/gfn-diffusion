@@ -260,8 +260,7 @@ def train():
                 energy_slope = relative_slope(energy_array)
                 log_Z_slope = relative_slope(log_Z_array)
 
-                annealing_trigger = (relative_change < 1e-4) and \
-                                    (loss_slope.abs() <= args.energy_annealing_threshold) and \
+                annealing_trigger = (loss_slope.abs() <= args.energy_annealing_threshold) and \
                                     (energy_slope.abs() <= args.energy_annealing_threshold) and \
                                     (log_Z_slope.abs() <= args.energy_annealing_threshold)
 
