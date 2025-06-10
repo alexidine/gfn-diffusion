@@ -188,9 +188,7 @@ def train():
     gfn_model.train()
 
     times['initialization_end'] = time()
-    loss_record = []
-    energy_record = []
-    learned_Z_record = []
+    loss_record, energy_record, learned_Z_record = [], [], []
     oomed_out = False
     old_params = [p.clone().detach() for p in gfn_model.parameters()]
     for i in trange(args.epochs + 1):
@@ -223,55 +221,63 @@ def train():
         times['train_step_end'] = time()
 
         if (i % args.eval_period == 0 and i > 0) or i == 50:
-            times['eval_step_start'] = time()
-            metrics.update({'Batch Size': args.batch_size})
-            eval_batch_size = min(max(args.batch_size, 500), 1000)
-            do_figures = i % args.figs_period == 0
-            metrics.update(eval_step(energy_function, gfn_model, eval_batch_size, do_figures))
-            energy_record.append(metrics['eval/energy'])
-            learned_Z_record.append(metrics['eval/log_Z_learned'])
-            if 'tb-avg' in args.mode_fwd or 'tb-avg' in args.mode_bwd:
-                del metrics['eval/log_Z_learned']
-
-            metrics.update({'Crystal Temperature': energy_function.temperature})
-            times['eval_step_end'] = time()
-            metrics.update(log_elapsed_times())
+            metrics = do_evaluation(energy_function, energy_record, gfn_model, i, learned_Z_record, metrics)
             wandb.log(metrics, step=i)
 
         if i % 100 == 0 and i > 0:
-            if args.energy == 'molecular_crystal' and args.anneal_energy:
-                with torch.no_grad():
-                    total_change = 0.0
-                    total_norm = 0.0
-                    for p, old_p in zip(gfn_model.parameters(), old_params):
-                        delta = (p - old_p).norm()
-                        total_change += delta.item()
-                        total_norm += p.norm().item()
-                    relative_change = total_change / (total_norm + 1e-8)
-                    metrics['relative_gradient_change'] = relative_change
-                    old_params = [p.clone().detach() for p in gfn_model.parameters()]
-
-                convergence_history = args.convergence_history
-                loss_array = np.array(loss_record)[-convergence_history:]
-                energy_array = np.array(energy_record)[-min(10, int(convergence_history/args.eval_period)):]
-                log_Z_array = np.array(learned_Z_record)[-min(10, int(convergence_history / args.eval_period)):]
-
-                loss_slope = relative_slope(loss_array)
-                energy_slope = relative_slope(energy_array)
-                log_Z_slope = relative_slope(log_Z_array)
-
-                annealing_trigger = (loss_slope.abs() <= args.energy_annealing_threshold) and \
-                                    (energy_slope.abs() <= args.energy_annealing_threshold) and \
-                                    (log_Z_slope.abs() <= args.energy_annealing_threshold)
-
-                anneal_energy(energy_function, annealing_trigger)
-
             torch.save(gfn_model.state_dict(), f'{name}model.pt')
+
+            if args.energy == 'molecular_crystal' and args.anneal_energy:
+                check_energy_annealing(energy_function, energy_record, gfn_model, learned_Z_record, loss_record,
+                                       metrics, old_params)
 
         elif i % 10 == 0:
             metrics.update(log_elapsed_times())
             wandb.log(metrics, step=i)
+
     torch.save(gfn_model.state_dict(), f'{name}_model_final.pt')
+
+
+def do_evaluation(energy_function, energy_record, gfn_model, i, learned_Z_record, metrics):
+    times['eval_step_start'] = time()
+    metrics.update({'Batch Size': args.batch_size})
+    eval_batch_size = min(max(args.batch_size, 500), 1000)
+    do_figures = i % args.figs_period == 0
+    metrics.update(eval_step(energy_function, gfn_model, eval_batch_size, do_figures))
+    energy_record.append(metrics['eval/energy'])
+    learned_Z_record.append(metrics['eval/log_Z_learned'])
+    if 'tb-avg' in args.mode_fwd or 'tb-avg' in args.mode_bwd:
+        del metrics['eval/log_Z_learned']
+    metrics.update({'Crystal Temperature': energy_function.temperature})
+    times['eval_step_end'] = time()
+    metrics.update(log_elapsed_times())
+    return metrics
+
+
+def check_energy_annealing(energy_function, energy_record, gfn_model, learned_Z_record, loss_record, metrics,
+                           old_params):
+    with torch.no_grad():
+        total_change = 0.0
+        total_norm = 0.0
+        for p, old_p in zip(gfn_model.parameters(), old_params):
+            delta = (p - old_p).norm()
+            total_change += delta.item()
+            total_norm += p.norm().item()
+        relative_change = total_change / (total_norm + 1e-8)
+        metrics['relative_gradient_change'] = relative_change
+        old_params = [p.clone().detach() for p in gfn_model.parameters()]
+    convergence_history = args.convergence_history
+    loss_array = np.array(loss_record)[-convergence_history:]
+    energy_array = np.array(energy_record)[-min(10, int(convergence_history / args.eval_period)):]
+    log_Z_array = np.array(learned_Z_record)[-min(10, int(convergence_history / args.eval_period)):]
+    loss_slope = relative_slope(loss_array)
+    energy_slope = relative_slope(energy_array)
+    log_Z_slope = relative_slope(log_Z_array)
+    annealing_trigger = (np.abs(loss_slope) <= args.energy_annealing_threshold) and \
+                        (np.abs(energy_slope) <= args.energy_annealing_threshold) and \
+                        (np.abs(log_Z_slope) <= args.energy_annealing_threshold)
+    anneal_energy(energy_function, annealing_trigger)
+
 
 def relative_slope(y):
     if len(y) < 2 or np.ptp(y) == 0:
