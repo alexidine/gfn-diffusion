@@ -21,19 +21,8 @@ class BaseSet(abc.ABC, Dataset):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def energy(self, x):
+    def energy(self, x, mol_batch, log_temperature, return_exp: bool=False):
         return
-
-    def unnorm_pdf(self, x):
-        return torch.exp(-self.energy(x))
-
-    # hmt stands for hamiltonian
-    def hmt_energy(self, x):
-        dim = x.shape[-1]
-        x, v = torch.split(x, dim // 2, dim=-1)
-        neg_log_p_x = self.sample_energy_fn(x)
-        neg_log_p_v = nll_unit_gaussian(v)
-        return neg_log_p_x + neg_log_p_v
 
     @property
     def ndim(self):
@@ -43,23 +32,10 @@ class BaseSet(abc.ABC, Dataset):
         del batch_size
         raise NotImplementedError
 
-    def score(self, x):
-        with torch.no_grad():
-            copy_x = x.detach().clone()
-            copy_x.requires_grad = True
-            with torch.enable_grad():
-                self.energy(copy_x).sum().backward()
-                lgv_data = copy_x.grad.data
-            return lgv_data
+    def log_reward(self, x, mol_batch, log_temperature, return_exp: bool = False):
+        if return_exp:
+            energy, sample = self.energy(x, mol_batch, log_temperature, return_exp)
+            return -energy, sample
+        else:
+            return -self.energy(x, mol_batch, log_temperature, return_exp)
 
-    def log_reward(self, x):
-        return -self.energy(x)
-
-    def hmt_score(self, x):
-        with torch.no_grad():
-            copy_x = x.detach().clone()
-            copy_x.requires_grad = True
-            with torch.enable_grad():
-                self.hmt_energy(copy_x).sum().backward()
-                lgv_data = copy_x.grad.data
-            return lgv_data

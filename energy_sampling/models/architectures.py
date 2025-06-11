@@ -100,12 +100,7 @@ class TimeEncoding(nn.Module):
         super(TimeEncoding, self).__init__()
 
         pe = torch.arange(1, harmonics_dim + 1).float().unsqueeze(0) * 2 * math.pi
-        # self.t_model = nn.Sequential(
-        #     nn.Linear(2 * harmonics_dim, hidden_dim),
-        #     nn.GELU(),
-        #     nn.Linear(hidden_dim, dim),
-        #     nn.GELU()
-        # )
+
         self.t_model = scalarMLP(
             layers=1,
             input_dim=2*harmonics_dim,
@@ -131,6 +126,7 @@ class TimeEncoding(nn.Module):
 class StateEncoding(nn.Module):
     def __init__(self, s_dim: int,
                  hidden_dim: int = 64,
+                 conditioning_dim: int = 0,
                  s_emb_dim: int = 64,
                  dropout: Optional[float] = 0,
                  norm: Optional[str] = None,
@@ -138,15 +134,10 @@ class StateEncoding(nn.Module):
                  ):
         super(StateEncoding, self).__init__()
 
-        # self.x_model = nn.Sequential(
-        #     nn.Linear(s_dim, hidden_dim),
-        #     nn.GELU(),
-        #     nn.Linear(hidden_dim, s_emb_dim),
-        #     nn.GELU()
-        # )
+
         self.x_model = scalarMLP(
             layers=1,
-            input_dim=s_dim,
+            input_dim=s_dim + conditioning_dim,
             filters=hidden_dim,
             output_dim=s_emb_dim,
             dropout=dropout,
@@ -154,8 +145,12 @@ class StateEncoding(nn.Module):
             bias=bias,
         )
 
-    def forward(self, s):
-        return self.x_model(s)
+    def forward(self, s, conditioning=None):
+        if conditioning is not None:
+            model_inputs = torch.cat([s, conditioning], dim=-1)
+        else:
+            model_inputs = s
+        return self.x_model(model_inputs)
 
 
 class JointPolicy(nn.Module):
@@ -192,8 +187,7 @@ class JointPolicy(nn.Module):
 
 
 class FlowModel(nn.Module):
-    def __init__(self, s_emb_dim: int,
-                 t_dim: int,
+    def __init__(self, conditioning_dim: int,
                  hidden_dim: int = 64,
                  layers: int = 4,
                  dropout: Optional[float] = 0,
@@ -211,7 +205,7 @@ class FlowModel(nn.Module):
         # )
         self.model = scalarMLP(
             layers=layers,
-            input_dim=s_emb_dim + t_dim,
+            input_dim=conditioning_dim,
             filters=hidden_dim,
             output_dim=out_dim,
             dropout=dropout,
@@ -219,8 +213,8 @@ class FlowModel(nn.Module):
             bias=bias,
         )
 
-    def forward(self, s, t):
-        return self.model(torch.cat([s, t], dim=-1))
+    def forward(self, z):
+        return self.model(z)
 
 
 class LangevinScalingModel(nn.Module):

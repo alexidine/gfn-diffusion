@@ -11,15 +11,15 @@ logtwopi = math.log(2 * math.pi)
 
 
 class GFN(nn.Module):
-    def __init__(self, dim: int, s_emb_dim: int, hidden_dim: int,
+    def __init__(self, dim: int, s_emb_dim: int, hidden_dim: int, conditioning_dim: int,
                  harmonics_dim: int, t_dim: int, log_var_range: float = 4.,
                  t_scale: float = 1., langevin: bool = False, learned_variance: bool = True,
                  trajectory_length: int = 100, partial_energy: bool = False,
                  clipping: bool = False, lgv_clip: float = 1e2, gfn_clip: float = 1e4, pb_scale_range: float = 1.,
                  langevin_scaling_per_dimension: bool = True, conditional_flow_model: bool = False,
-                 learn_pb: bool = False,
-                 pis_architectures: bool = False, lgv_layers: int = 3, joint_layers: int = 2,
+                 learn_pb: bool = False, lgv_layers: int = 3, joint_layers: int = 2,
                  dropout: Optional[float] = 0, norm: Optional[str] = None,
+
                  zero_init: bool = False, device=torch.device('cuda')):
         super(GFN, self).__init__()
         self.dim = dim
@@ -41,7 +41,6 @@ class GFN(nn.Module):
         self.conditional_flow_model = conditional_flow_model
         self.learn_pb = learn_pb
 
-        self.pis_architectures = pis_architectures
         self.lgv_layers = lgv_layers
         self.joint_layers = joint_layers
 
@@ -50,53 +49,30 @@ class GFN(nn.Module):
         self.log_var_range = log_var_range
         self.device = device
 
-        if self.pis_architectures:
+        self.t_model = TimeEncoding(harmonics_dim, t_dim, hidden_dim,
+                                    norm=norm, dropout=dropout)
+        self.s_model = StateEncoding(dim, hidden_dim, conditioning_dim, s_emb_dim,
+                                     norm=norm, dropout=dropout)
+        self.joint_model = JointPolicy(dim, s_emb_dim, t_dim,
+                                       hidden_dim, joint_layers, 2 * dim, zero_init=zero_init,
+                                       norm=norm, dropout=dropout)
+        if learn_pb:
+            self.back_model = JointPolicy(dim, s_emb_dim, t_dim, hidden_dim, joint_layers, 2 * dim, zero_init=zero_init,
+                                          norm=norm, dropout=dropout)
+        self.pb_scale_range = pb_scale_range
 
-            self.t_model = TimeEncodingPIS(harmonics_dim, t_dim, hidden_dim)
-            self.s_model = StateEncodingPIS(dim, hidden_dim, s_emb_dim)
-            self.joint_model = JointPolicyPIS(dim, s_emb_dim, t_dim, hidden_dim, 2 * dim, joint_layers, zero_init)
-            if learn_pb:
-                self.back_model = JointPolicyPIS(dim, s_emb_dim, t_dim, hidden_dim, 2 * dim, joint_layers, zero_init)
-            self.pb_scale_range = pb_scale_range
-
-            if self.conditional_flow_model:
-                self.flow_model = FlowModelPIS(dim, s_emb_dim, t_dim, hidden_dim, 1, joint_layers)
-            else:
-                self.flow_model = torch.nn.Parameter(torch.tensor(0.).to(self.device))
-
-            if self.langevin_scaling_per_dimension:
-                self.langevin_scaling_model = LangevinScalingModelPIS(s_emb_dim, t_dim, hidden_dim, dim,
-                                                                      lgv_layers, zero_init)
-            else:
-                self.langevin_scaling_model = LangevinScalingModelPIS(s_emb_dim, t_dim, hidden_dim, 1,
-                                                                      lgv_layers, zero_init)
-
-        else:  # our custom architectures
-
-            self.t_model = TimeEncoding(harmonics_dim, t_dim, hidden_dim,
+        if self.conditional_flow_model:
+            self.flow_model = FlowModel(conditioning_dim, hidden_dim, 1,
                                         norm=norm, dropout=dropout)
-            self.s_model = StateEncoding(dim, hidden_dim, s_emb_dim,
-                                         norm=norm, dropout=dropout)
-            self.joint_model = JointPolicy(dim, s_emb_dim, t_dim,
-                                           hidden_dim, joint_layers, 2 * dim, zero_init=zero_init,
-                                           norm=norm, dropout=dropout)
-            if learn_pb:
-                self.back_model = JointPolicy(dim, s_emb_dim, t_dim, hidden_dim, joint_layers, 2 * dim, zero_init=zero_init,
-                                              norm=norm, dropout=dropout)
-            self.pb_scale_range = pb_scale_range
+        else:
+            self.flow_model = torch.nn.Parameter(torch.tensor(0.).to(self.device))
 
-            if self.conditional_flow_model:
-                self.flow_model = FlowModel(s_emb_dim, t_dim, hidden_dim, 1,
-                                            norm=norm, dropout=dropout)
-            else:
-                self.flow_model = torch.nn.Parameter(torch.tensor(0.).to(self.device))
-
-            if self.langevin_scaling_per_dimension:
-                self.langevin_scaling_model = LangevinScalingModel(s_emb_dim, t_dim, hidden_dim, lgv_layers, dim, zero_init=zero_init,
-                                                                   norm=norm, dropout=dropout)
-            else:
-                self.langevin_scaling_model = LangevinScalingModel(s_emb_dim, t_dim, hidden_dim, lgv_layers, 1, zero_init=zero_init,
-                                                                   norm=norm, dropout=dropout)
+        if self.langevin_scaling_per_dimension:
+            self.langevin_scaling_model = LangevinScalingModel(s_emb_dim, t_dim, hidden_dim, lgv_layers, dim, zero_init=zero_init,
+                                                               norm=norm, dropout=dropout)
+        else:
+            self.langevin_scaling_model = LangevinScalingModel(s_emb_dim, t_dim, hidden_dim, lgv_layers, 1, zero_init=zero_init,
+                                                               norm=norm, dropout=dropout)
 
     def split_params(self, tensor):
         mean, logvar = gaussian_params(tensor)
@@ -106,36 +82,18 @@ class GFN(nn.Module):
             logvar = torch.tanh(logvar) * self.log_var_range
         return mean, logvar + np.log(self.pf_std_per_traj) * 2.
 
-    def predict_next_state(self, state, time, log_r):
-        if self.langevin:
-            state.requires_grad_(True)
-            with torch.enable_grad():
-                grad_log_r = torch.autograd.grad(log_r(state).sum(), state)[0].detach()
-                grad_log_r = torch.nan_to_num(grad_log_r)
-                if self.clipping:
-                    grad_log_r = torch.clip(grad_log_r, -self.lgv_clip, self.lgv_clip)
-
+    def predict_next_state(self, state, time, condition):
         batch_size = state.shape[0]
-
-        t_lgv = time
-
         time_encoding = self.t_model(time).repeat(batch_size, 1)
-        state_encoding = self.s_model(state)
+        state_encoding = self.s_model(state, condition)
         state_update = self.joint_model(state_encoding, time_encoding)  # nx(2d) with d drift and d noise parameters
-        log_flow = self.flow_model(state_encoding, time_encoding).squeeze(-1) if self.conditional_flow_model or self.partial_energy else self.flow_model
-
-        if self.langevin:
-            if self.pis_architectures:
-                scale = self.langevin_scaling_model(t_lgv)
-            else:
-                scale = self.langevin_scaling_model(state_encoding, time_encoding)
-            state_update[..., :self.dim] += scale * grad_log_r
+        log_flow = self.flow_model(condition).squeeze(-1) if self.conditional_flow_model or self.partial_energy else self.flow_model
 
         if self.clipping:
             state_update = torch.clip(state_update, -self.gfn_clip, self.gfn_clip)
         return state_update, log_flow.squeeze(-1)
 
-    def get_trajectory_fwd(self, state, exploration_std, log_r, pis=False):
+    def get_trajectory_fwd(self, state, exploration_std, log_r, condition):
         batch_size = state.shape[0]
 
         logpf = torch.zeros((batch_size, self.trajectory_length), device=self.device)
@@ -144,45 +102,30 @@ class GFN(nn.Module):
         states = torch.zeros((batch_size, self.trajectory_length + 1, self.dim), device=self.device)
 
         for i in range(self.trajectory_length):
-            state_update, log_flow = self.predict_next_state(state, i * self.dt, log_r)
+            state_update, log_flow = self.predict_next_state(state, i * self.dt, condition)
             pf_mean, pflogvars = self.split_params(state_update)  # drift and log variance terms
 
             logf[:, i] = log_flow
-            if self.partial_energy:
-                ref_log_var = np.log(self.t_scale * max(1, i) * self.dt)
-                log_p_ref = -0.5 * (logtwopi + ref_log_var + np.exp(-ref_log_var) * (state ** 2)).sum(1)
-                logf[:, i] += (1 - i * self.dt) * log_p_ref + i * self.dt * log_r(state)
 
             if exploration_std is None:
-                if pis:
-                    pflogvars_sample = pflogvars
-                else:
-                    pflogvars_sample = pflogvars.detach()
+                pflogvars_sample = pflogvars.detach()
             else:
                 expl = exploration_std(i)
                 if expl <= 0.0:
                     pflogvars_sample = pflogvars.detach()
                 else:
                     add_log_var = torch.full_like(pflogvars, np.log(exploration_std(i) / np.sqrt(self.dt)) * 2)
-                    if pis:
-                        pflogvars_sample = torch.logaddexp(pflogvars, add_log_var)
-                    else:
-                        pflogvars_sample = torch.logaddexp(pflogvars, add_log_var).detach()
+                    pflogvars_sample = torch.logaddexp(pflogvars, add_log_var).detach()
 
-            #noise = torch.randn_like(state, device=self.device)
-            if pis:  # equation 2 in the paper
-                next_state = state + self.dt * pf_mean + np.sqrt(self.dt) * (
-                        pflogvars_sample / 2).exp() * torch.randn_like(state, device=self.device)
-            else:
-                next_state = state + self.dt * pf_mean.detach() + np.sqrt(self.dt) * (
-                        pflogvars_sample / 2).exp() * torch.randn_like(state, device=self.device)
+            next_state = state + self.dt * pf_mean.detach() + np.sqrt(self.dt) * (
+                    pflogvars_sample / 2).exp() * torch.randn_like(state, device=self.device)
 
             noise = ((next_state - state) - self.dt * pf_mean) / (np.sqrt(self.dt) * (pflogvars / 2).exp())  # seems unnecessary, as we have the noise above
             logpf[:, i] = -0.5 * (noise ** 2 + logtwopi + np.log(self.dt) + pflogvars).sum(1)
 
             if self.learn_pb:
                 t = self.t_model((i + 1) * self.dt).repeat(batch_size, 1)
-                pbs = self.back_model(self.s_model(next_state), t)
+                pbs = self.back_model(self.s_model(next_state, condition), t)
                 dmean, dvar = gaussian_params(pbs)
                 back_mean_correction = 1 + dmean.tanh() * self.pb_scale_range
                 back_var_correction = 1 + dvar.tanh() * self.pb_scale_range
@@ -200,20 +143,19 @@ class GFN(nn.Module):
 
         return states, logpf, logpb, logf
 
-    def get_trajectory_bwd(self, s, exploration_std, log_r):
-        bsz = s.shape[0]
-
-        logpf = torch.zeros((bsz, self.trajectory_length), device=self.device)
-        logpb = torch.zeros((bsz, self.trajectory_length), device=self.device)
-        logf = torch.zeros((bsz, self.trajectory_length + 1), device=self.device)
-        states = torch.zeros((bsz, self.trajectory_length + 1, self.dim), device=self.device)
+    def get_trajectory_bwd(self, s, exploration_std, condition):
+        batch_size = s.shape[0]
+        logpf = torch.zeros((batch_size, self.trajectory_length), device=self.device)
+        logpb = torch.zeros((batch_size, self.trajectory_length), device=self.device)
+        logf = torch.zeros((batch_size, self.trajectory_length + 1), device=self.device)
+        states = torch.zeros((batch_size, self.trajectory_length + 1, self.dim), device=self.device)
         states[:, -1] = s
 
         for i in range(self.trajectory_length):
             if i < self.trajectory_length - 1:
                 if self.learn_pb:
-                    t = self.t_model(1. - i * self.dt).repeat(bsz, 1)
-                    pbs = self.back_model(self.s_model(s), t)
+                    t = self.t_model(1. - i * self.dt).repeat(batch_size, 1)
+                    pbs = self.back_model(self.s_model(s, condition), t)
                     dmean, dvar = gaussian_params(pbs)
                     back_mean_correction = 1 + dmean.tanh() * self.pb_scale_range
                     back_var_correction = 1 + dvar.tanh() * self.pb_scale_range
@@ -229,32 +171,24 @@ class GFN(nn.Module):
             else:
                 s_ = torch.zeros_like(s)
 
-            pfs, flow = self.predict_next_state(s_, (1. - (i + 1) * self.dt), log_r)
+            pfs, flow = self.predict_next_state(s_, (1. - (i + 1) * self.dt), condition)
             pf_mean, pflogvars = self.split_params(pfs)
-
             logf[:, self.trajectory_length - i - 1] = flow
-            if self.partial_energy:
-                ref_log_var = np.log(self.t_scale * max(1, self.trajectory_length - i - 1) * self.dt)
-                log_p_ref = -0.5 * (logtwopi + ref_log_var + np.exp(-ref_log_var) * (s ** 2)).sum(1)
-                logf[:, self.trajectory_length - i - 1] += (i + 1) * self.dt * log_p_ref + (
-                        self.trajectory_length - i - 1) * self.dt * log_r(s)
-
             noise = ((s - s_) - self.dt * pf_mean) / (np.sqrt(self.dt) * (pflogvars / 2).exp())
-            logpf[:, self.trajectory_length - i - 1] = -0.5 * (noise ** 2 + logtwopi + np.log(self.dt) + pflogvars).sum(
-                1)
+            logpf[:, self.trajectory_length - i - 1] = -0.5 * (noise ** 2 + logtwopi + np.log(self.dt) + pflogvars).sum(1)
 
             s = s_
             states[:, self.trajectory_length - i - 1] = s
 
         return states, logpf, logpb, logf
 
-    def sample(self, batch_size, log_r):
+    def sample(self, batch_size, log_r, condition=None):
         s = torch.zeros(batch_size, self.dim).to(self.device)
-        return self.get_trajectory_fwd(s, None, log_r)[0][:, -1]
+        return self.get_trajectory_fwd(s, None, log_r, condition)[0][:, -1]
 
-    def sleep_phase_sample(self, batch_size, exploration_std):
+    def sleep_phase_sample(self, batch_size, exploration_std, condition=None):
         s = torch.zeros(batch_size, self.dim).to(self.device)
-        return self.get_trajectory_fwd(s, exploration_std, log_r=None)[0][:, -1]
+        return self.get_trajectory_fwd(s, exploration_std, log_r=None, condition=condition)[0][:, -1]
 
-    def forward(self, s, exploration_std=None, log_r=None):
-        return self.get_trajectory_fwd(s, exploration_std, log_r)
+    def forward(self, s, exploration_std=None, log_r=None, condition=None):
+        return self.get_trajectory_fwd(s, exploration_std, log_r, condition)

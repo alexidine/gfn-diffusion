@@ -4,9 +4,10 @@ from sample_metrics import compute_distribution_distances
 
 
 @torch.no_grad()
-def log_partition_function(initial_state, gfn, energy):
-    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, None, energy.log_reward)
-    energy, sample_batch = energy.analyze_crystal_batch(states[:, -1], return_batch=True)
+def log_partition_function(initial_state, gfn, energy, mol_batch):
+    condition = energy.get_conditioning_tensor(mol_batch)
+    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, None, energy, condition)
+    energy, sample_batch = energy.analyze_crystal_batch(states[:, -1], mol_batch=mol_batch, return_batch=True)
     log_r = -energy
     log_weight = log_r + log_pbs.sum(-1) - log_pfs.sum(-1)
 
@@ -14,7 +15,7 @@ def log_partition_function(initial_state, gfn, energy):
     log_Z_lb = log_weight.mean()
     log_Z_learned = log_fs[:, 0].mean()
 
-    return states[:, -1], log_Z, log_Z_lb, log_Z_learned, sample_batch
+    return states[:, -1], log_Z, log_Z_lb, log_Z_learned, sample_batch, condition
 
 
 @torch.no_grad()

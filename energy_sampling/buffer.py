@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from torch_geometric.data import DataLoader
+from torch_geometric.loader import DataLoader
 
 
 class SampleDataset(torch.utils.data.Dataset):
@@ -202,10 +202,9 @@ class CrystalReplayBuffer():
             self.dataset = self.dataset[-self.buffer_size:]
 
         if self.prioritized == 'rank':
-            self.scores_np = self.energy_function.sample_to_reward(self.dataset).detach().cpu().view(-1).numpy()
+            self.scores_np = self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(len(self.dataset))).detach().cpu().view(-1).numpy()
             ranks = np.argsort(np.argsort(-1 * self.scores_np))
             weights = 1.0 / (1e-2 * len(self.scores_np) + ranks)
-            self.dataset = ZipDataset(self.sample_dataset, self.reward_dataset)
             self.sampler = torch.utils.data.WeightedRandomSampler(
                 weights=weights, num_samples=len(self.scores_np), replacement=True
             )
@@ -218,6 +217,7 @@ class CrystalReplayBuffer():
                 pin_memory=True,
                 drop_last=False)
         else:
+            self.scores_np = self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(len(self.dataset))).detach().cpu().view(-1).numpy()
             weights = 1.0
             self.sampler = torch.utils.data.WeightedRandomSampler(
                 weights=weights, num_samples=len(self.scores_np), replacement=True
@@ -237,6 +237,7 @@ class CrystalReplayBuffer():
         else:
             return len(self.dataset)
 
-    def sample(self):
+    def sample(self, temperature):
         sample = next(iter(self.loader))
-        return sample, self.energy_function.sample_to_reward(sample)
+        reward = self.energy_function.prebuilt_sample_to_reward(sample, temperature)  # recompute reward in case parameters have changed
+        return sample.cell_params_to_gen_basis(), reward, sample  # x, r, condition

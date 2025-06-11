@@ -5,7 +5,12 @@ from time import time
 import numpy as np
 import torch
 import wandb
-from mxtaltools.reporting.online import simple_cell_hist, simple_cell_scatter_fig, log_crystal_samples
+from mxtaltools.reporting.online import simple_cell_hist, simple_cell_scatter_fig, log_crystal_samples, \
+    simple_embedding_fig
+from mxtaltools.dataset_utils.data_classes import MolData
+from mxtaltools.dataset_utils.utils import collate_data_list
+from torch.optim import lr_scheduler
+from torch_geometric.loader import DataLoader
 from tqdm import trange
 
 from buffer import CrystalReplayBuffer
@@ -13,7 +18,7 @@ from energies.molecular_crystal import MolecularCrystal
 from evaluations import log_partition_function
 from models import GFN
 from plot_utils import get_plotly_fig_size_mb
-from utils import get_train_args
+from utils import get_train_args, get_gfn_init_state
 from utils import set_seed, cal_subtb_coef_matrix, get_gfn_optimizer, get_gfn_forward_loss, \
     get_gfn_backward_loss, get_exploration_std
 
@@ -23,10 +28,7 @@ set_seed(args.seed)
 if 'SLURM_PROCID' in os.environ:
     args.seed += int(os.environ["SLURM_PROCID"])
 
-if args.pis_architectures:
-    args.zero_init = True
-
-device = args.device  #torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = args.device
 coeff_matrix = cal_subtb_coef_matrix(args.subtb_lambda, args.T).to(device)
 
 if args.both_ways and args.bwd:
@@ -38,13 +40,14 @@ if args.local_search:
 times = {}
 
 
-def eval_step(energy, gfn_model, batch_size, do_figures: bool=True):
+def eval_step(energy, gfn_model, batch_size, do_figures: bool = True, mol_batch=None):
     gfn_model.eval()
+
     metrics = {}
     fig_dict = {}
-    init_state = torch.zeros(batch_size, energy.data_ndim).to(device)
-    samples, log_Z, log_Z_lb, log_Z_learned, sample_batch = log_partition_function(
-        init_state, gfn_model, energy)
+    init_state = get_gfn_init_state(batch_size, energy.data_ndim, device)
+    samples, log_Z, log_Z_lb, log_Z_learned, sample_batch, condition = log_partition_function(
+        init_state, gfn_model, energy, mol_batch)
 
     "Scalar metrics"
     metrics['eval/log_Z'] = log_Z.cpu().detach().numpy()
@@ -58,7 +61,12 @@ def eval_step(energy, gfn_model, batch_size, do_figures: bool=True):
     "Custom Figures"
     if do_figures:
         fig_dict['Lattice Features Distribution'] = simple_cell_hist(sample_batch)
-        fig_dict['Sample Scatter'] = simple_cell_scatter_fig(sample_batch)
+        fig_dict['Sample Scatter'] = simple_cell_scatter_fig(sample_batch,
+                                                             (condition[:,
+                                                              0].cpu().detach().numpy()) if condition is not None else None,
+                                                             aux_scalar_name='log_temperature' if condition is not None else None)
+        fig_dict['Sample Embedding'] = simple_embedding_fig(sample_batch,
+                                                            sample_batch.gfn_energy.cpu().detach().numpy())  #condition[:, 0].cpu().detach().numpy() if condition is not None else None)
         for key in fig_dict.keys():
             fig = fig_dict[key]
             if get_plotly_fig_size_mb(fig) > 0.1:  # bigger than .1 MB
@@ -76,25 +84,31 @@ def eval_step(energy, gfn_model, batch_size, do_figures: bool=True):
 
 
 def train_step(energy, gfn_model, gfn_optimizer, it, exploratory, buffer, exploration_factor,
-               exploration_wd):
+               exploration_wd, mol_batch, condition, repeats: int = 10):
     gfn_model.zero_grad()
-
-    exploration_std = get_exploration_std(it, exploratory, exploration_factor, exploration_wd)
+    wd_max_steps = 20000
+    exploration_std = get_exploration_std(it, exploratory, wd_max_steps, exploration_factor, exploration_wd)
 
     if args.both_ways:
         if it % 2 == 0:
             if args.sampling == 'buffer':
-                loss, states, _, _, log_r = fwd_train_step(energy, gfn_model, exploration_std, return_exp=True)
-                buffer.add(states[:, -1], log_r)
+                loss, states, _, _, log_r, sample_batch = fwd_train_step(energy, gfn_model, exploration_std, mol_batch,
+                                                                         return_exp=True, repeats=repeats,
+                                                                         condition=condition)
+                buffer.add(sample_batch.cpu().detach().to_data_list())
             else:
-                loss = fwd_train_step(energy, gfn_model, exploration_std)
+                loss = fwd_train_step(energy, gfn_model, exploration_std, mol_batch, repeats=repeats,
+                                      condition=condition)
         else:
-            loss = bwd_train_step(energy, gfn_model, buffer, exploration_std, it=it)
+            loss = bwd_train_step(energy, gfn_model, buffer, exploration_std, it=it, repeats=repeats,
+                                  condition=condition)
 
     elif args.bwd:
-        loss = bwd_train_step(energy, gfn_model, buffer, exploration_std, it=it)
+        loss = bwd_train_step(energy, gfn_model, buffer, exploration_std, it=it, repeats=repeats,
+                              condition=condition)
     else:
-        loss = fwd_train_step(energy, gfn_model, exploration_std)
+        loss = fwd_train_step(energy, gfn_model, exploration_std, mol_batch, repeats=repeats,
+                              condition=condition)
 
     loss.backward()
     torch.nn.utils.clip_grad_norm_(gfn_model.parameters(),
@@ -103,44 +117,29 @@ def train_step(energy, gfn_model, gfn_optimizer, it, exploratory, buffer, explor
     return loss.item(), exploration_std(0)
 
 
-def fwd_train_step(energy, gfn_model, exploration_std, return_exp=False):
-    init_state = torch.zeros(args.batch_size, energy.data_ndim).to(device)
-    loss = get_gfn_forward_loss(args.mode_fwd, init_state, gfn_model, energy.log_reward, coeff_matrix,
-                                exploration_std=exploration_std, return_exp=return_exp)
-    return loss
+def fwd_train_step(energy, gfn_model, exploration_std, mol_batch, return_exp=False, condition=None, repeats: int = 10):
+    init_state = get_gfn_init_state(args.batch_size, energy.data_ndim, device)
+    return get_gfn_forward_loss(args.mode_fwd, init_state, gfn_model, energy.log_reward, coeff_matrix, mol_batch,
+                                exploration_std=exploration_std, return_exp=return_exp, condition=condition,
+                                repeats=repeats)
 
 
-def bwd_train_step(energy, gfn_model, buffer, exploration_std=None, it=0):
-    if args.sampling == 'sleep_phase':
-        samples = gfn_model.sleep_phase_sample(args.batch_size, exploration_std).to(device)
-    elif args.sampling == 'energy':
-        samples = energy.sample(args.batch_size).to(device)
-    elif args.sampling == 'buffer':
-        # if args.local_search:  # We are just not doing on the fly local search any more (slow), but using a prebuilt dataset.
-        #     if it % args.ls_cycle < 2:
-        #         if args.energy == 'molecular_crystal':
-        #             # sample reasonable diffuse crystals
-        #             samples = energy.sample(args.batch_size,
-        #                                     reasonable_only=True,
-        #                                     target_packing_coeff=0.5)
-        #             # optimize them
-        #             local_search_samples, log_r = energy.local_opt(samples,
-        #                                                            args.max_iter_ls,
-        #                                                            args.samples_per_opt,
-        #                                                            )
-        #         else:
-        #             samples, rewards = buffer.sample()
-        #             local_search_samples, log_r = langevin_dynamics(samples, energy.log_reward, device, args)
-        #         buffer_ls.add(local_search_samples, log_r)
-        #
-        #     samples, rewards = buffer_ls.sample()
-        # else:
-        samples, rewards = buffer.sample()
+def bwd_train_step(energy, gfn_model, buffer, exploration_std=None, it=0, condition=None, repeats: int = 10):
+    # if args.sampling == 'sleep_phase':  # todo not updated for current buffering syntax
+    #     samples = gfn_model.sleep_phase_sample(args.batch_size, exploration_std).to(device)
+    # elif args.sampling == 'energy':  # we aren't doing this - built in energy sampler is slow/bad
+    #     samples = energy.sample(args.batch_size).to(device)
+    if args.sampling == 'buffer':
+        if args.temperature_conditioning:
+            temperature = condition[:, 0].cpu().detach()
+        else:
+            temperature = torch.ones(len(condition[:, 0])) * args.energy_static_temperature
+        samples, rewards, crystal_batch = buffer.sample(temperature)
     else:
         assert False, f"sampling method {args.sampling} not implemented"
 
-    loss = get_gfn_backward_loss(args.mode_bwd, samples.to(device), gfn_model, energy.log_reward,
-                                 exploration_std=exploration_std)
+    loss = get_gfn_backward_loss(args.mode_bwd, samples.to(device), gfn_model, rewards.to(device),
+                                 exploration_std=exploration_std, condition=condition, repeats=repeats)
     return loss
 
 
@@ -150,21 +149,26 @@ def train():
     if not os.path.exists(name):
         os.makedirs(name)
 
-    energy_function = MolecularCrystal(device=device, temperature=args.energy_temperature,
+    energy_function = MolecularCrystal(device=device,
+                                       min_temperature=args.energy_min_temperature,
+                                       max_temperature=args.energy_max_temperature,
+                                       temperature_scaling_factor=args.temperature_scaling_factor,
+                                       temperature_conditioning=args.temperature_conditioning,
                                        density_coeff=args.energy_density_coeff)
 
     config = args.__dict__
     config["Experiment"] = "{args.energy}"
     wandb.init(project="GFN Energy", config=config, name=name)
-
-    gfn_model = GFN(energy_function.data_ndim, args.s_emb_dim, args.hidden_dim, args.harmonics_dim, args.t_emb_dim,
+    conditioning_dim = 1 if args.temperature_conditioning else 0
+    gfn_model = GFN(energy_function.data_ndim, args.s_emb_dim, args.hidden_dim, conditioning_dim, args.harmonics_dim,
+                    args.t_emb_dim,
                     trajectory_length=args.T, clipping=args.clipping, lgv_clip=args.lgv_clip, gfn_clip=args.gfn_clip,
                     langevin=args.langevin, learned_variance=args.learned_variance,
                     partial_energy=args.partial_energy, log_var_range=args.log_var_range,
                     pb_scale_range=args.pb_scale_range,
                     t_scale=args.t_scale, langevin_scaling_per_dimension=args.langevin_scaling_per_dimension,
                     conditional_flow_model=args.conditional_flow_model, learn_pb=args.learn_pb,
-                    pis_architectures=args.pis_architectures, lgv_layers=args.lgv_layers,
+                    lgv_layers=args.lgv_layers,
                     joint_layers=args.joint_layers, dropout=args.dropout, norm=args.norm,
                     zero_init=args.zero_init, device=device).to(device)
 
@@ -173,17 +177,10 @@ def train():
     gfn_optimizer = get_gfn_optimizer(gfn_model, args.lr_policy, args.lr_flow, args.lr_back, args.learn_pb,
                                       args.conditional_flow_model, args.use_weight_decay, args.weight_decay)
 
-    buffer = CrystalReplayBuffer(
-        args.buffer_size,
-        device,
-        energy_function,
-        args.batch_size,
-        beta=args.beta,
-        rank_weight=args.rank_weight,
-        prioritized=args.prioritized)
+    if args.scheduler:
+        scheduler = lr_scheduler.MultiplicativeLR(gfn_optimizer, lr_lambda=lambda epoch: args.lr_shrink_lambda)
 
-    if args.learn_pb and args.dataset_path is not None:  # preload samples into the buffer
-        buffer = add_dataset_to_buffer(args.dataset_path, buffer)
+    buffer, mol_loader = init_buffers_datasets(energy_function)
 
     gfn_model.train()
 
@@ -195,41 +192,45 @@ def train():
         metrics = dict()
         times['train_step_start'] = time()
         try:
+            mol_batch = next(iter(mol_loader)).to(device)  # todo add here optional mol adjustments
+            condition = energy_function.get_conditioning_tensor(mol_batch)
             metrics['train/loss'], metrics['train/expl'] = train_step(energy_function,
-                                               gfn_model,
-                                               gfn_optimizer,
-                                               i,
-                                               args.exploratory,
-                                               buffer,
-                                               args.exploration_factor,
-                                               args.exploration_wd)
+                                                                      gfn_model,
+                                                                      gfn_optimizer,
+                                                                      i,
+                                                                      args.exploratory,
+                                                                      buffer,
+                                                                      args.exploration_factor,
+                                                                      args.exploration_wd,
+                                                                      mol_batch,
+                                                                      condition)
+
+            if args.scheduler:
+                scheduler.step()
 
             loss_record.append(metrics['train/loss'])
             if not oomed_out:
-                if args.batch_size < args.max_batch_size and args.grow_batch_size:
-                    args.batch_size = max(args.batch_size + 1,
-                                          int(args.batch_size * 1.01))  # gradually increment batch size
+                buffer, mol_loader = grow_batch_size(buffer, mol_loader)
 
         except (RuntimeError, ValueError) as e:  # if we do hit OOM, slash the batch size
-            if "CUDA out of memory" in str(
-                    e) or "nonzero is not supported for tensors with more than INT_MAX elements" in str(e):
-                args.batch_size = handle_oom(args.batch_size)
-                oomed_out = True
-                print(f"Reducing batch size to {args.batch_size}")
-            else:
-                raise e  # will simply raise error if other or if training on CPU
+            oomed_out, buffer, mol_loader = handle_train_epoch_error(e, oomed_out, buffer, mol_loader)
         times['train_step_end'] = time()
 
         if (i % args.eval_period == 0 and i > 0) or i == 50:
-            metrics = do_evaluation(energy_function, energy_record, gfn_model, i, learned_Z_record, metrics)
+            eval_batch_size = 1000  #min(max(args.batch_size, 500), 1000)
+            eval_rands = np.random.randint(len(mol_loader.dataset), size=eval_batch_size)
+            eval_batch = collate_data_list([mol_loader.dataset[ind] for ind in eval_rands]).to(device)
+            metrics = do_evaluation(eval_batch_size, energy_function, energy_record, gfn_model, i, learned_Z_record,
+                                    metrics, eval_batch)
             wandb.log(metrics, step=i)
 
         if i % 100 == 0 and i > 0:
             torch.save(gfn_model.state_dict(), f'{name}model.pt')
-
+            metrics.update({'lr': gfn_optimizer.param_groups[0]['lr']})
             if args.energy == 'molecular_crystal' and args.anneal_energy:
-                check_energy_annealing(energy_function, energy_record, gfn_model, learned_Z_record, loss_record,
-                                       metrics, old_params)
+                old_params = check_energy_annealing(energy_function, energy_record, gfn_model, learned_Z_record,
+                                                    loss_record,
+                                                    metrics, old_params)
 
         elif i % 10 == 0:
             metrics.update(log_elapsed_times())
@@ -238,17 +239,112 @@ def train():
     torch.save(gfn_model.state_dict(), f'{name}_model_final.pt')
 
 
-def do_evaluation(energy_function, energy_record, gfn_model, i, learned_Z_record, metrics):
+def init_buffers_datasets(energy_function):
+    # load dataset of prebuilt and scored molecular crystals into the buffer
+    buffer = CrystalReplayBuffer(
+        args.buffer_size,
+        device,
+        energy_function,
+        args.batch_size,
+        beta=args.beta,
+        rank_weight=args.rank_weight,
+        prioritized=args.prioritized)
+    if args.learn_pb and args.buffer_path is not None:  # preload samples into the buffer
+        buffer = add_dataset_to_buffer(args.buffer_path, buffer)
+    # load dataset of just molecules
+    # mols_list = torch.load(args.molecules_path)
+    # good_mol = mols_list[17]  # a nice molecule
+    atom_coords = torch.tensor([  # stick with urea for just now
+        [-1.3042, - 0.0008, 0.0001],
+        [0.6903, - 1.1479, 0.0001],
+        [0.6888, 1.1489, 0.0001],
+        [- 0.0749, - 0.0001, - 0.0003],
+    ], dtype=torch.float32, device='cpu')
+    atom_coords -= atom_coords.mean(0)
+    atom_types = torch.tensor([8, 7, 7, 6], dtype=torch.long, device='cpu')
+    good_mol = MolData(
+        z=atom_types,
+        pos=atom_coords,
+        x=atom_types,
+        skip_mol_analysis=False,
+    )
+    mols_list = [good_mol for _ in range(args.max_batch_size)]
+    mol_loader = DataLoader(
+        mols_list,
+        batch_size=args.batch_size,
+        num_workers=0,
+        pin_memory=True,
+        drop_last=True
+    )
+    return buffer, mol_loader
+
+
+def grow_batch_size(buffer, mol_loader):
+    if args.batch_size < args.max_batch_size and args.grow_batch_size:
+        new_batch_size = max(args.batch_size + 1,
+                             int(args.batch_size * 1.01))
+        args.batch_size = new_batch_size  # gradually increment batch size
+
+        if len(buffer) > 0:
+            buffer.loader = DataLoader(
+                buffer.dataset,
+                batch_size=new_batch_size,
+                sampler=buffer.sampler,
+                num_workers=0,
+                pin_memory=True,
+                drop_last=True)
+            buffer.batch_size = new_batch_size
+
+        mol_loader = DataLoader(
+            mol_loader.dataset,
+            batch_size=new_batch_size,
+            num_workers=0,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+    return buffer, mol_loader
+
+
+def handle_train_epoch_error(e, oomed_out, buffer, mol_loader):
+    if "CUDA out of memory" in str(
+            e) or "nonzero is not supported for tensors with more than INT_MAX elements" in str(e):
+        args.batch_size = handle_oom(args.batch_size)
+
+        if len(buffer) > 0:
+            buffer.loader = DataLoader(
+                buffer.dataset,
+                batch_size=args.batch_size,
+                sampler=buffer.sampler,
+                num_workers=0,
+                pin_memory=True,
+                drop_last=True)
+
+        mol_loader = DataLoader(
+            mol_loader.dataset,
+            batch_size=args.batch_size,
+            num_workers=0,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+        oomed_out = True
+        print(f"Reducing batch size to {args.batch_size}")
+    else:
+        raise e  # will simply raise error if other or if training on CPU
+    return oomed_out, buffer, mol_loader
+
+
+def do_evaluation(eval_batch_size, energy_function, energy_record, gfn_model, i, learned_Z_record, metrics, mol_batch):
     times['eval_step_start'] = time()
     metrics.update({'Batch Size': args.batch_size})
-    eval_batch_size = min(max(args.batch_size, 500), 1000)
     do_figures = i % args.figs_period == 0
-    metrics.update(eval_step(energy_function, gfn_model, eval_batch_size, do_figures))
+    metrics.update(eval_step(energy_function, gfn_model, eval_batch_size, do_figures, mol_batch))
     energy_record.append(metrics['eval/energy'])
     learned_Z_record.append(metrics['eval/log_Z_learned'])
     if 'tb-avg' in args.mode_fwd or 'tb-avg' in args.mode_bwd:
         del metrics['eval/log_Z_learned']
-    metrics.update({'Crystal Temperature': energy_function.temperature})
+    #metrics.update({'Crystal Temperature': energy_function.temperature})
     times['eval_step_end'] = time()
     metrics.update(log_elapsed_times())
     return metrics
@@ -277,6 +373,7 @@ def check_energy_annealing(energy_function, energy_record, gfn_model, learned_Z_
                         (np.abs(energy_slope) <= args.energy_annealing_threshold) and \
                         (np.abs(log_Z_slope) <= args.energy_annealing_threshold)
     anneal_energy(energy_function, annealing_trigger)
+    return old_params
 
 
 def relative_slope(y):
@@ -284,6 +381,7 @@ def relative_slope(y):
         return 0.0  # avoid division by zero or meaningless fit
     slope, _ = np.polyfit(np.arange(len(y)), y, 1)
     return abs(slope) / np.std(y)
+
 
 def log_elapsed_times():
     elapsed_times = {}
@@ -307,8 +405,8 @@ def anneal_energy(energy_function, trigger: bool, min_temperature: float = 0.01)
     # curvature, _, _ = np.polyfit(np.arange(len(log_values)), values, 2)
 
     if trigger:  #slope > -1e-3 and curvature > -1e-1:  # if the loss isn't decaying fast enough / the loss is saturated
-        if energy_function.temperature > min_temperature:
-            energy_function.temperature *= 0.9
+        if energy_function.temperature_scaling_factor > 0.01:
+            energy_function.temperature_scaling_factor *= 0.9
             print("Annealing energy function")
 
 
@@ -322,17 +420,39 @@ def handle_oom(batch_size):
 def add_dataset_to_buffer(dataset_path, buffer):
     print("Loading prebuilt buffer")
     dataset = torch.load(dataset_path)
+    # if True:  # add ellipsoid overlaps to each sample here, as they weren't in the original optimization
+    #     from tqdm import tqdm
+    #     batch_size = 500
+    #     loader = DataLoader(
+    #         dataset,
+    #         batch_size=batch_size,
+    #         drop_last=False
+    #     )
+    #     overlaps = []
+    #
+    #     for crystal_batch in tqdm(loader):
+    #         crystal_batch = crystal_batch.to('cuda')
+    #         crystal_batch.box_analysis()
+    #         cluster_batch = crystal_batch.mol2cluster(cutoff=6,
+    #                                                   supercell_size=10,
+    #                                                   align_to_standardized_orientation=True)
+    #
+    #         cluster_batch.construct_radial_graph(cutoff=6)
+    #         # simplified ellipsoid energy testing
+    #         _, _, _, _, _, _, normed_ellipsoid_overlap \
+    #             = cluster_batch.compute_ellipsoidal_overlap(
+    #             semi_axis_scale=1,
+    #             return_details=True)
+    #
+    #         overlaps.extend(normed_ellipsoid_overlap.cpu().detach().numpy())
+    #
+    #     overlaps = torch.tensor(overlaps)
+    #     for ind, elem in enumerate(dataset):
+    #         elem.ellipsoid_overlap = torch.ones(1) * overlaps[ind]
+
     buffer.add(dataset)
     print(f"Buffer loaded with {len(dataset)} samples")
 
-    return buffer
-
-
-def update_buffer_reward(buffer,
-                         energy):
-    rescaled_reward = -energy.soften_LJ_energy(buffer.raw_reward_dataset.rewards)
-    buffer.reward_dataset.rewards = rescaled_reward
-    buffer.reward_dataset.raw_tsrs = rescaled_reward
     return buffer
 
 

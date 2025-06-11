@@ -3,6 +3,7 @@ device: 'cuda'
 lr_policy: 0.0005              # learning rate of the policy network
 lr_flow: 0.02                  # learning rate of the flow network
 lr_back: 0.0005                # learning rate of the backward pass
+scheduler: True
 gradient_norm_clip: 1.0        # gradient norm clip for updating gfn model weights
 
 # model parameters
@@ -39,7 +40,8 @@ both_ways: false
 # local search settings
 ################################################################
 local_search: false             # DEPRECATED we now combine preloaded and sampled elements into a single buffer
-dataset_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
+buffer_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
+molecules_path: 'D:/crystal_datasets/test_qm9_dataset.pt'
 max_iter_ls: 100                # DEPRECATED # how many iterations to run local search
 samples_per_opt: 10             # DEPRECATED #how many noisy samples to take near each optimized minimum
 burn_in: 100                    # DEPRECATED # NOT USED IN MXTAL how many iterations to burn in before making local search

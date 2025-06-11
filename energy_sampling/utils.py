@@ -78,33 +78,44 @@ def get_gfn_optimizer(gfn_model, lr_policy, lr_flow, lr_back, back_model=False, 
     return gfn_optimizer
 
 
-def get_gfn_forward_loss(mode, init_state, gfn_model, log_reward, coeff_matrix, exploration_std=None, return_exp=False):
+def get_gfn_forward_loss(mode, init_state, gfn_model, log_reward, coeff_matrix, mol_batch, exploration_std=None,
+                         return_exp=False, condition=None, repeats=10):
     if mode == 'tb':
-        loss = fwd_tb(init_state, gfn_model, log_reward, exploration_std, return_exp=return_exp)
+        return fwd_tb(init_state, gfn_model, log_reward, mol_batch, exploration_std,
+                      return_exp=return_exp,
+                      condition=condition)
     elif mode == 'tb-avg':
-        loss = fwd_tb_avg(init_state, gfn_model, log_reward, exploration_std, return_exp=return_exp)
+        return fwd_tb_avg(init_state, gfn_model, log_reward, mol_batch, exploration_std, return_exp=return_exp,
+                          condition=condition)
+    elif mode == 'cond-tb-avg':
+        return fwd_tb_avg_cond(init_state, gfn_model, log_reward, mol_batch, exploration_std, return_exp=return_exp,
+                               condition=condition, repeats=repeats)
     elif mode == 'db':
-        loss = db(init_state, gfn_model, log_reward, exploration_std)
+        return db(init_state, gfn_model, log_reward, exploration_std, condition=condition)
     elif mode == 'subtb':
-        loss = subtb(init_state, gfn_model, log_reward, coeff_matrix, exploration_std)
-    return loss
+        return subtb(init_state, gfn_model, log_reward, coeff_matrix, exploration_std, condition=condition)
+    else:
+        assert False
 
 
-def get_gfn_backward_loss(mode, samples, gfn_model, log_reward, exploration_std=None):
+def get_gfn_backward_loss(mode, samples, gfn_model, rewards, exploration_std=None, condition=None, repeats=10):
     if mode == 'tb':
-        loss = bwd_tb(samples, gfn_model, log_reward, exploration_std)
+        return bwd_tb(samples, gfn_model, rewards, exploration_std, condition=condition)
     elif mode == 'tb-avg':
-        loss = bwd_tb_avg(samples, gfn_model, log_reward, exploration_std)
+        return bwd_tb_avg(samples, gfn_model, rewards, exploration_std, condition=condition)
+    elif mode == 'cond-tb-avg':
+        return bwd_tb_avg_cond(samples, gfn_model, rewards, exploration_std, condition=condition, repeats=repeats)
     elif mode == 'mle':
-        loss = bwd_mle(samples, gfn_model, log_reward, exploration_std)
-    return loss
+        return bwd_mle(samples, gfn_model, rewards, exploration_std, condition=condition)
+    else:
+        assert False
 
 
-def get_exploration_std(iter, exploratory, exploration_factor=0.1, exploration_wd=False):
+def get_exploration_std(iter, exploratory, max_steps: int = 5000, exploration_factor=0.1, exploration_wd=False):
     if exploratory is False:
-        return None, None
+        return None
     if exploration_wd:
-        exploration_std = exploration_factor * max(0, 1. - iter / 5000.)
+        exploration_std = exploration_factor * max(0, 1. - iter / max_steps)
     else:
         exploration_std = exploration_factor
     expl = lambda x: exploration_std
@@ -166,6 +177,10 @@ def get_train_args():
     parser.add_argument('--lr_policy', type=float, default=1e-3)
     parser.add_argument('--lr_flow', type=float, default=1e-2)
     parser.add_argument('--lr_back', type=float, default=1e-3)
+    parser.add_argument('--scheduler', action='store_true', default=False)
+    parser.add_argument('--lr_shrink_lambda', type=float, default=0.9999)
+    parser.add_argument('--repeats', type=int, default=10)
+
     parser.add_argument('--gradient_norm_clip', type=float, default=10)
     parser.add_argument('--hidden_dim', type=int, default=64)
     parser.add_argument('--s_emb_dim', type=int, default=64)
@@ -192,7 +207,8 @@ def get_train_args():
     # For local search
     ################################################################
     parser.add_argument('--local_search', action='store_true', default=False)
-    parser.add_argument('--dataset_path', type=str, default=None)
+    parser.add_argument('--buffer_path', type=str, default=None)
+    parser.add_argument('--molecules_path', type=str, default=None)
     # How many iterations to run local search
     parser.add_argument('--max_iter_ls', type=int, default=200)
     parser.add_argument('--samples_per_opt', type=int, default=10)
@@ -238,11 +254,15 @@ def get_train_args():
     parser.add_argument('--use_weight_decay', action='store_true', default=False)
     parser.add_argument('--eval', action='store_true', default=False)
     # args for molecular crystal energy
-    parser.add_argument('--energy_temperature', type=float, default=1)
-    parser.add_argument('--anneal_energy', type=bool, default=False)
+    parser.add_argument('--energy_min_temperature', type=float, default=1)
+    parser.add_argument('--energy_max_temperature', type=float, default=1)
+    parser.add_argument('--energy_static_temperature', type=float, default=1)
+    parser.add_argument('--anneal_energy', action='store_true', default=False)
     parser.add_argument('--energy_annealing_threshold', type=float, default=1e-3)
     parser.add_argument('--convergence_history', type=int, default=1000)
     parser.add_argument('--energy_density_coeff', type=float, default=1e-3)
+    parser.add_argument('--temperature_conditioning', action='store_true', default=False)
+    parser.add_argument('--temperature_scaling_factor', type=float, default=1)
 
     args, remaining = parser.parse_known_args()
 
@@ -256,3 +276,11 @@ def get_train_args():
                 parser.error(f"Unknown config key: {key}")
 
     return args
+
+
+def get_gfn_init_state(batch_size, ndim, device):
+    #return torch.zeros(batch_size, ndim).to(device)  # old init state
+    init_state = torch.zeros(batch_size, ndim).to(device)
+    init_state[:,
+    :3] += 3  # bias length dimensions upwards, which improves early training by avoiding super-dense initial states
+    return init_state

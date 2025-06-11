@@ -5,8 +5,7 @@ import torch
 
 from mxtaltools.dataset_utils.data_classes import MolCrystalData, MolData
 from mxtaltools.dataset_utils.utils import collate_data_list
-from mxtaltools.crystal_search.standalone_crystal_opt import sample_about_crystal
-from mxtaltools.common.utils import softplus_shift
+
 import torch.nn.functional as F
 
 from .base_set import BaseSet
@@ -15,11 +14,13 @@ from .base_set import BaseSet
 class MolecularCrystal(BaseSet):
     def __init__(self, device,
                  dim: int = 12,
-                 test_molecule: str = 'NICOTINAMIDE',
                  space_group: int = 2,
-                 temperature: float = 1,
+                 max_temperature: float = 10,
+                 min_temperature: float = 0.01,
                  turnover_pot: float = 0.01,
                  density_coeff: float = 0,
+                 temperature_scaling_factor: float = 1,
+                 temperature_conditioning: bool = False
                  ):
         super(MolecularCrystal, self).__init__()
         self.device = device
@@ -28,172 +29,113 @@ class MolecularCrystal(BaseSet):
 
         self.ellipsoid_scale = 1
         self.density_coeff = density_coeff
-        self.test_molecule = test_molecule
-        self.initialize_test_molecule(test_molecule)
-        self.temperature = temperature
+        self.max_temperature = max_temperature
+        self.min_temperature = min_temperature
+        self.temperature_scaling_factor = temperature_scaling_factor
+        self.temperature_conditioning = temperature_conditioning
         self.turnover_pot = turnover_pot  # energy above which to soften intermolecular repulsion
 
-    def initialize_test_molecule(self, test_molecule):
-        # UREA from molview - default if not specified
-        if test_molecule == 'UREA':
-            self.atom_coords = torch.tensor([
-                [-1.3042, - 0.0008, 0.0001],
-                [0.6903, - 1.1479, 0.0001],
-                [0.6888, 1.1489, 0.0001],
-                [- 0.0749, - 0.0001, - 0.0003],
-            ], dtype=torch.float32, device=self.device)
-            self.atom_coords -= self.atom_coords.mean(0)
-            self.atom_types = torch.tensor([8, 7, 7, 6], dtype=torch.long, device=self.device)
-
-        # NICOTANIMIDE from molview
-        elif test_molecule == 'NICOTINAMIDE':
-            self.atom_coords = torch.tensor([
-                [-2.3940, 1.1116, -0.0088],
-                [1.7614, -1.2284, -0.0034],
-                [-2.4052, -1.1814, 0.0027],
-                [-0.2969, 0.0397, 0.0024],
-                [0.4261, 1.2273, 0.0039],
-                [0.4117, -1.1510, -0.0013],
-                [1.8161, 1.1886, 0.0018],
-                [-1.7494, 0.0472, 0.0045],
-                [2.4302, -0.0535, -0.0018]
-            ], dtype=torch.float32, device=self.device)
-            self.atom_coords -= self.atom_coords.mean(dim=0)
-            self.atom_types = torch.tensor([8, 7, 7, 6, 6, 6, 6, 6, 6], dtype=torch.long, device=self.device)
-
-        self.mol = MolData(
-            z=self.atom_types,
-            pos=self.atom_coords,
-            x=self.atom_types,
-            skip_mol_analysis=False,
-        )
-
-    def instantiate_crystals(self, x):
-        if hasattr(self, 'blank_batch') and len(x) == self.blank_batch.num_graphs:
-            crystal_batch = self.blank_batch.clone()
-        else:
-            crystal_batch = self.init_blank_crystal_batch(len(x))
-            self.blank_batch = crystal_batch.clone()
-
-        crystal_batch.gen_basis_to_cell_params(x,
-                                               clip_min_length=0.5)  # don't allow micro cells
-
-        crystal_batch.cell_lengths = crystal_batch.cell_lengths + 3
+    def instantiate_crystals(self, x, mol_batch):
+        crystal_batch = self.init_blank_crystal_batch(mol_batch)
+        crystal_batch.gen_basis_to_cell_params(x, clip_min_length=0.5)  # don't allow micro cells
+        #crystal_batch.cell_lengths = crystal_batch.cell_lengths + 3  # TODO add this bias directly to the policy model
         crystal_batch.box_analysis()
         return crystal_batch
 
-    def analyze_crystal_batch(self, x, return_batch=False):  # x is gfn_outputs
-        crystal_batch = self.instantiate_crystals(x)  # todo replace initialization here when we go to conditional gen
+    def analyze_crystal_batch(self, x, mol_batch, return_batch=False):  # x is gfn_outputs
+        crystal_batch = self.instantiate_crystals(x, mol_batch)
         cluster_batch = crystal_batch.mol2cluster(cutoff=6,
                                                   supercell_size=10,
                                                   align_to_standardized_orientation=True)
 
-        if not hasattr(self, 'ellipsoid_model'):
-            cluster_batch.load_ellipsoid_model()
-            self.ellipsoid_model = copy.deepcopy(cluster_batch.ellipsoid_model)
-            self.ellipsoid_model = self.ellipsoid_model.to(self.device)
-            self.ellipsoid_model.eval()
         cluster_batch.construct_radial_graph(cutoff=6)
         cluster_batch.compute_LJ_energy()
-        silu_energy = cluster_batch.compute_silu_energy()
-        # crystal_energy = self.generator_energy(silu_energy / cluster_batch.num_atoms)
+        silu_energy = cluster_batch.compute_silu_energy()  # softened short-range LJ-type energy
 
-        # simplified ellipsoid energy testing
-        _, _, _, _, _, _, normed_ellipsoid_overlap \
-            = cluster_batch.compute_ellipsoidal_overlap(
-            semi_axis_scale=self.ellipsoid_scale,
-            model=self.ellipsoid_model,
-            return_details=True)
+        # if not hasattr(self, 'ellipsoid_model'):
+        #     cluster_batch.load_ellipsoid_model()
+        #     self.ellipsoid_model = copy.deepcopy(cluster_batch.ellipsoid_model)
+        #     self.ellipsoid_model = self.ellipsoid_model.to(self.device)
+        #     self.ellipsoid_model.eval()
+        # # simplified ellipsoid energy testing
+        # _, _, _, _, _, _, normed_ellipsoid_overlap \
+        #     = cluster_batch.compute_ellipsoidal_overlap(
+        #     semi_axis_scale=self.ellipsoid_scale,
+        #     model=self.ellipsoid_model,
+        #     return_details=True)
 
-        silu_coeff = F.sigmoid(-(torch.tensor(self.temperature, device=self.device) - 0.1) / 0.01)
-        density_energy = F.relu(-(cluster_batch.packing_coeff - 1)) ** 2
-        crystal_energy = self.soften_LJ_energy(silu_energy) + self.density_coeff * density_energy  # density_energy + normed_ellipsoid_overlap + silu_coeff * silu_energy
-
-        cluster_batch.ellipsoid_overlap = normed_ellipsoid_overlap
-        cluster_batch.silu_pot = silu_energy / cluster_batch.num_atoms
+        cluster_batch.ellipsoid_overlap = torch.zeros_like(silu_energy) #normed_ellipsoid_overlap.flatten()
+        cluster_batch.silu_pot = silu_energy
+        crystal_energy = self.generator_energy(cluster_batch)
         cluster_batch.gfn_energy = crystal_energy
         if return_batch:
             return crystal_energy, cluster_batch
         else:
             return crystal_energy
 
-    def sample_to_reward(self, crystal_list):
-        """
-        For pre-built, pre-scored crystal, generate the approriate reward for this point in training.
-        :param crystal_list:
-        :return:
-        """
-        crystal_batch = collate_data_list(crystal_list)
-        energy = crystal_batch.silu_pot
-        return -energy / self.temperature
-
-    def soften_LJ_energy(self, lj_energy):
-        # aunit_lengths = cluster_batch.scale_lengths_to_aunit()
-        # box_loss = F.relu(-(aunit_lengths - 3)).sum(1) + F.relu(
-        #     aunit_lengths - (3 * 2 * cluster_batch.radius[:, None])).sum(1)
-        # crystal_energy = silu_energy / num_atoms + box_loss
-
-        # soften the repulsion
-        crystal_energy = lj_energy.clone()
-        high_bools = crystal_energy > self.turnover_pot
-        crystal_energy[high_bools] = self.turnover_pot + torch.log10(crystal_energy[high_bools] + 1 - self.turnover_pot)
-        crystal_energy = crystal_energy.clip(max=50)
+    def generator_energy(self, cluster_batch):
+        density_energy = F.relu(-(cluster_batch.packing_coeff - 1)) ** 2
+        intermolecular_energy = self.soften_LJ_energy(cluster_batch.silu_pot / cluster_batch.num_atoms)
+        #intermolecular_energy = cluster_batch.ellipsoid_overlap
+        crystal_energy = intermolecular_energy + self.density_coeff * density_energy
 
         return crystal_energy
 
-    def local_opt(self, x,  # todo semi-deprecated
-                  max_num_steps,
-                  samples_per_opt):
+    def prebuilt_sample_to_reward(self, crystals, temperature):
         """
-        Do a local optimization of the crystal parameters
-        :param x:
+        For pre-built, pre-scored crystal, generate the approriate reward for this point in training.
+        :param temperature: per-sample torch float tensor containing temperature for each sample to be rewarded
+        :param crystals:
         :return:
         """
-        crystal_batch = self.instantiate_crystals(x)
-        optimization_record = crystal_batch.optimize_crystal_parameters(
-            mol_orientation=None,
-            enforce_niggli=True,
-            optim_target='silu',
-            cutoff=6,
-            compression_factor=1,
-            max_num_steps=max_num_steps,
-            lr=1e-3,
-        )
-        samples_out = optimization_record[-1]
-        if samples_per_opt > 0:
-            nearby_samples = sample_about_crystal(samples_out,
-                                                  noise_level=0.05,  # empirically gets us an LJ std about 3
-                                                  num_samples=samples_per_opt,
-                                                  cutoff=6,
-                                                  do_silu_pot=True,
-                                                  enforce_niggli=True)
-            for ss in nearby_samples:
-                samples_out.extend(ss)
+        if isinstance(crystals, list):
+            crystal_batch = collate_data_list(crystals)
+        else:
+            crystal_batch = crystals
 
-        samples = torch.cat([elem.cell_params_to_gen_basis() for elem in samples_out])
-        silu_energies = torch.tensor([elem.silu_pot for elem in samples_out])
-        packing_coeffs = torch.tensor([elem.packing_coeff for elem in samples_out])
-        num_atoms = torch.tensor([elem.num_atoms for elem in samples_out])
-        energy_out = torch.tensor(
-            [-self.soften_LJ_energy(silu_energies) for sample_batch in samples_out])
+        energy = self.generator_energy(crystal_batch)
 
-        return samples, energy_out
+        if torch.is_tensor(temperature):
+            sample_temperature = temperature
+        elif isinstance(temperature, float) or isinstance(temperature, int):
+            sample_temperature = temperature * torch.ones_like(energy)
+        else:
+            assert False
 
-    def energy(self, x):
+        return -energy / sample_temperature
+
+    def energy(self, x, mol_batch, log_temperature: torch.tensor, return_exp: bool = False):
         """
         Energy is not really bounded. Or necessarily well scaled.
         We do exponential rescaling later with a temperature. For higher temperature,
         potential is less sharply peaked.
+        :param mol_batch:
+        :param temperature:
         :param x:
         :return:
         """
-        return self.analyze_crystal_batch(x) / self.temperature
+        energy, crystal_batch = self.analyze_crystal_batch(x, mol_batch, return_batch=True)
+        temperature = 10 ** log_temperature
+        sample_temperature = temperature
 
-    def init_blank_crystal_batch(self, batch_size):
-        # todo when we go to conditional modelling, we'll pass the molecules as MolCrystalData objects
-        # pre-initialized, so we won't have to do this at all.
+        if return_exp:
+            return energy / sample_temperature, crystal_batch
+        else:
+            return energy / sample_temperature
+
+    def soften_LJ_energy(self, lj_energy):
+        # soften the repulsion
+        softened_energy = lj_energy.clone()
+        high_bools = softened_energy > self.turnover_pot
+        softened_energy[high_bools] = self.turnover_pot + torch.log10(
+            softened_energy[high_bools] + 1 - self.turnover_pot)
+        softened_energy = softened_energy.clip(max=50)
+
+        return softened_energy
+
+    def init_blank_crystal_batch(self, mol_batch):  # todo no possible way this is the most efficient way to do this
         crystal_batch = collate_data_list([MolCrystalData(
-            molecule=self.mol.clone(),
+            molecule=mol_batch[ind].clone(),
             sg_ind=self.space_group,
             aunit_handedness=torch.ones(1),
             cell_lengths=torch.ones(3, device=self.device),
@@ -203,7 +145,13 @@ class MolecularCrystal(BaseSet):
             aunit_centroid=torch.ones(3, device=self.device),
             aunit_orientation=torch.ones(3, device=self.device),
             skip_box_analysis=True,
-        ) for _ in range(batch_size)]).to(self.device)
+            silu_pot=torch.zeros(1, device=self.device),
+            packing_coeff=torch.zeros(1, device=self.device),
+            lj_pot=torch.zeros(1, device=self.device),
+            scaled_lj_pot=torch.zeros(1, device=self.device),
+            es_pot=torch.zeros(1, device=self.device),
+            ellipsoid_overlap=torch.zeros(1, device=self.device)
+        ) for ind in range(len(mol_batch))]).to(self.device)
 
         return crystal_batch
 
@@ -230,3 +178,22 @@ class MolecularCrystal(BaseSet):
                 )
 
             return crystal_batch.standardize_cell_parameters()
+
+    def get_conditioning_tensor(self,
+                                mol_batch,
+                                temperature: torch.tensor = None,
+                                ):
+        """Todo add autoencoder conditioning"""
+        if self.temperature_conditioning:
+            if temperature is None:  # sample randomly in log space
+                rands = torch.rand(mol_batch.num_graphs, device=mol_batch.device, dtype=torch.float32)
+
+                log_min = torch.log10(torch.tensor(self.min_temperature, dtype=torch.float32, device=self.device))
+                log_max = torch.log10(torch.tensor(self.max_temperature, dtype=torch.float32, device=self.device))
+
+                log_temps = log_min + (log_max - log_min) * rands ** self.temperature_scaling_factor
+                return log_temps[:, None]
+            else:
+                return torch.log10(temperature[:, None])
+        else:
+            return None

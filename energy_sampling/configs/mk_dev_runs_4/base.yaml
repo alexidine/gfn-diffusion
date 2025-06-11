@@ -1,8 +1,11 @@
-run_name: 'dev_test_2'
+run_name: 'mk_dev_runs_4'
 device: 'cuda'
 lr_policy: 0.0001              # learning rate of the policy network
 lr_flow: 0.01                  # learning rate of the flow network
 lr_back: 0.0001                # learning rate of the backward pass
+scheduler: True
+lr_shrink_lambda: 0.9995
+repeats: 5                    # for conditional training
 gradient_norm_clip: 1.0        # gradient norm clip for updating gfn model weights
 
 # model parameters
@@ -21,26 +24,29 @@ batch_size: 25               # number of samples per training batch: relatively 
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
 max_batch_size: 1000          # maximum batch size to allow
 epochs: 10000000             # number of training epochs: relatively large
-eval_period: 100             # how often to do evaluation & reporting
-figs_period: 2000            # how often to log custom figures
-buffer_size: 600000          # size of replay buffer: relatively large
+eval_period: 50              # how often to do evaluation & reporting
+figs_period: 250             # how often to log custom figrues
+buffer_size: 500000          # size of replay buffer: relatively large
 
 # subtb params
-T: 10  # diffusion trajectory length
-subtb_lambda: 2
+T: 10                        # diffusion trajectory length
+subtb_lambda: 2              # subtb currently deprecated
 
 t_scale: 1.0
 log_var_range: 4.0
-energy: "molecular_crystal"   # "molecular_crystal"  # "many_well"
+energy: "molecular_crystal"   # "molecular_crystal"
 mode_fwd: "tb"
 mode_bwd: "tb"
-both_ways: false
+both_ways: true
+bwd: false            # backward training only
+learn_pb: true
+
 
 # local search settings
 ################################################################
-local_search: false
-buffer_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
-molecules_path: 'D:/crystal_datasets/test_qm9_dataset.pt'
+local_search: false             # DEPRECATED we now combine preloaded and sampled elements into a single buffer
+buffer_path: '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt'
+molecules_path: '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt'
 max_iter_ls: 100                # DEPRECATED # how many iterations to run local search
 samples_per_opt: 10             # DEPRECATED #how many noisy samples to take near each optimized minimum
 burn_in: 100                    # DEPRECATED # NOT USED IN MXTAL how many iterations to burn in before making local search
@@ -59,18 +65,17 @@ rank_weight: 0.01     # rank-based replay sampling: low rank_weight = steep prio
 prioritized: "rank"   # three kinds of replay training: random, reward prioritized, rank-based
 
 ################################################################
-bwd: false
+
 exploratory: true
 
 sampling: "buffer"
 langevin: false
 langevin_scaling_per_dimension: false
-conditional_flow_model: false
-learn_pb: false
+conditional_flow_model: true  # necessary for temperature conditioning
 pb_scale_range: 0.1
 learned_variance: true
 partial_energy: false
-exploration_factor: 0.5
+exploration_factor: 0.35
 exploration_wd: true
 clipping: true
 lgv_clip: 100.0
@@ -83,8 +88,12 @@ eval: false
 # molecular crystal settings
 ################################################################
 # scales the energy function
-anneal_energy: true  # harden intermolecular repulsion over time
-energy_temperature: 10  # global fixed temperature for energy function
+anneal_energy: false  # harden intermolecular repulsion over time
 energy_annealing_threshold: 1.0e-2
 convergence_history: 1000
-energy_density_coeff: 0  # how much to weight the density penalty term in the energy function
+energy_density_coeff: 1  # how much to weight the density penalty term in the energy function
+temperature_conditioning: true
+energy_min_temperature: 0.1
+energy_max_temperature: 1
+energy_static_temperature: 1
+temperature_scaling_factor: 1  # controls relative frequency of higher vs lower temperatures (higher -> higher)
