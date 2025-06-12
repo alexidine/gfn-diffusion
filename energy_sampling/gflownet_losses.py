@@ -3,9 +3,7 @@ from torch.distributions import Normal
 from mxtaltools.dataset_utils.utils import collate_data_list
 
 
-def fwd_tb(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=None, return_exp=False, condition=None):
-    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, exploration_std, log_reward_fn, condition)
-
+def get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states):
     if condition is not None:
         log_temperature = condition[:, 0]
     else:
@@ -17,41 +15,41 @@ def fwd_tb(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=None, r
             crystal_batch = crystal_batch.detach()
         else:
             log_r = log_reward_fn(states[:, -1], mol_batch, log_temperature, return_exp).detach()
+            crystal_batch = None
+    return crystal_batch, log_r
 
-    loss = 0.5 * ((log_pfs.sum(-1) + log_fs[:, 0] - log_pbs.sum(-1) - log_r) ** 2)
-    assert torch.all(torch.isfinite(loss))
+
+def fwd_tb(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=None, return_exp=False, condition=None):
+    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, exploration_std, log_reward_fn, condition)
+    crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states)
+
+    log_pf = log_pfs.sum(-1)
+    log_pb = log_pbs.sum(-1)
+    log_ratio = log_pf + log_fs[:, 0] - log_pb - log_r
+    log_ratio = log_ratio.clip(min=-10, max=10)  # clip extremely large losses
+    loss = 0.5 * (log_ratio ** 2)
     if return_exp:
         return loss.mean(), states, log_pfs, log_pbs, log_r, crystal_batch
     else:
         return loss.mean()
 
 
-def bwd_tb(initial_state, gfn, log_reward, exploration_std=None, condition=None):
+def bwd_tb(initial_state, gfn, log_r, exploration_std=None, condition=None):
     states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(initial_state, exploration_std, condition)
-
-    log_r = log_reward
-
-    loss = 0.5 * ((log_pfs.sum(-1) + log_fs[:, 0] - log_pbs.sum(-1) - log_r) ** 2)
+    log_ratio = log_pfs.sum(-1) + log_fs[:, 0] - log_pbs.sum(-1) - log_r
+    log_ratio = log_ratio.clip(min=-10, max=10)  # clip extremely large losses
+    loss = 0.5 * (log_ratio ** 2)
 
     return loss.mean()
 
 
 def fwd_tb_avg(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=None, return_exp=False, condition=None):
     states, log_pfs, log_pbs, _ = gfn.get_trajectory_fwd(initial_state, exploration_std, log_reward_fn, condition)
-    if condition is not None:
-        temperature = condition[:, 0]
-    else:
-        temperature = None
-    with torch.no_grad():
-        if return_exp:
-            log_r, crystal_batch = log_reward_fn(states[:, -1], mol_batch, temperature, return_exp)
-            log_r = log_r.detach()
-            crystal_batch = crystal_batch.detach()
-        else:
-            log_r = log_reward_fn(states[:, -1], condition, return_exp).detach()
-
-    log_Z = (log_r + log_pbs.sum(-1) - log_pfs.sum(-1)).mean(dim=0, keepdim=True)
-    loss = log_Z + (log_pfs.sum(-1) - log_r - log_pbs.sum(-1))
+    crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states)
+    log_pf = log_pfs.sum(-1)
+    log_pb = log_pbs.sum(-1)
+    log_Z = (log_r + log_pb - log_pf).mean(dim=0, keepdim=True)
+    loss = log_Z + (log_pf - log_r - log_pb)
     if return_exp:
         return 0.5 * (loss ** 2).mean(), states, log_pfs, log_pbs, log_r, crystal_batch
     else:
@@ -60,33 +58,27 @@ def fwd_tb_avg(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=Non
 
 def bwd_tb_avg(initial_state, gfn, log_r, exploration_std=None, condition=None):
     states, log_pfs, log_pbs, _ = gfn.get_trajectory_bwd(initial_state, exploration_std, condition)
-
-    log_Z = (log_r + log_pbs.sum(-1) - log_pfs.sum(-1)).mean(dim=0, keepdim=True)
-    loss = log_Z + (log_pfs.sum(-1) - log_r - log_pbs.sum(-1))
+    log_pf = log_pfs.sum(-1)
+    log_pb = log_pbs.sum(-1)
+    log_Z = (log_r + log_pb - log_pf).mean(dim=0, keepdim=True)
+    loss = log_Z + (log_pf - log_r - log_pb)
     return 0.5 * (loss ** 2).mean()
 
 
 def fwd_tb_avg_cond(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=None, return_exp=False,
                     condition=None,
                     repeats=10):
+    """equivalent to vargrad"""
     condition = condition.repeat(repeats, 1)
     initial_state = initial_state.repeat(repeats, 1)
     mol_batch = collate_data_list(mol_batch.to_data_list() * repeats)
-    if condition is not None:
-        temperature = condition[:, 0]
-    else:
-        temperature = None
     states, log_pfs, log_pbs, _ = gfn.get_trajectory_fwd(initial_state, exploration_std, log_reward_fn, condition)
-    with torch.no_grad():
-        if return_exp:
-            log_r, crystal_batch = log_reward_fn(states[:, -1], mol_batch, temperature, return_exp)
-            log_r = log_r.detach()
-            crystal_batch = crystal_batch.detach()
-        else:
-            log_r = log_reward_fn(states[:, -1], condition, return_exp).detach()
+    crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states)
 
-    log_Z = (log_r + log_pbs.sum(-1) - log_pfs.sum(-1)).view(repeats, -1).mean(dim=0, keepdim=True)
-    loss = log_Z + (log_pfs.sum(-1) - log_r - log_pbs.sum(-1)).view(repeats, -1)
+    log_pf = log_pfs.sum(-1)
+    log_pb = log_pbs.sum(-1)
+    log_Z = (log_r + log_pb - log_pf).view(repeats, -1).mean(dim=0, keepdim=True)
+    loss = log_Z + (log_pf - log_r - log_pb).view(repeats, -1)
 
     if return_exp:
         return 0.5 * (loss ** 2).mean(), states, log_pfs, log_pbs, log_r, crystal_batch
@@ -100,9 +92,10 @@ def bwd_tb_avg_cond(initial_state, gfn, log_r, exploration_std=None, condition=N
     log_r = log_r.repeat(repeats)
 
     states, log_pfs, log_pbs, _ = gfn.get_trajectory_bwd(initial_state, exploration_std, condition)
-
-    log_Z = (log_r + log_pbs.sum(-1) - log_pfs.sum(-1)).view(repeats, -1).mean(dim=0, keepdim=True)
-    loss = log_Z + (log_pfs.sum(-1) - log_r - log_pbs.sum(-1)).view(repeats, -1)
+    log_pf = log_pfs.sum(-1)
+    log_pb = log_pbs.sum(-1)
+    log_Z = (log_r + log_pb - log_pf).view(repeats, -1).mean(dim=0, keepdim=True)
+    loss = log_Z + (log_pf - log_r - log_pb).view(repeats, -1)
     return 0.5 * (loss ** 2).mean()
 
 

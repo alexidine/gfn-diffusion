@@ -6,20 +6,21 @@ import torch.nn.functional as F
 
 from .architectures import *
 from utils import gaussian_params
+from mxtaltools.models.modules.components import scalarMLP
 
 logtwopi = math.log(2 * math.pi)
 
 
 class GFN(nn.Module):
-    def __init__(self, dim: int, s_emb_dim: int, hidden_dim: int, conditioning_dim: int,
+    def __init__(self, dim: int, s_emb_dim: int, hidden_dim: int, conditions_dim: int,
                  harmonics_dim: int, t_dim: int, log_var_range: float = 4.,
                  t_scale: float = 1., langevin: bool = False, learned_variance: bool = True,
                  trajectory_length: int = 100, partial_energy: bool = False,
+                 conditions_embedding_dim: int = 32,
                  clipping: bool = False, lgv_clip: float = 1e2, gfn_clip: float = 1e4, pb_scale_range: float = 1.,
                  langevin_scaling_per_dimension: bool = True, conditional_flow_model: bool = False,
                  learn_pb: bool = False, lgv_layers: int = 3, joint_layers: int = 2,
                  dropout: Optional[float] = 0, norm: Optional[str] = None,
-
                  zero_init: bool = False, device=torch.device('cuda')):
         super(GFN, self).__init__()
         self.dim = dim
@@ -51,7 +52,7 @@ class GFN(nn.Module):
 
         self.t_model = TimeEncoding(harmonics_dim, t_dim, hidden_dim,
                                     norm=norm, dropout=dropout)
-        self.s_model = StateEncoding(dim, hidden_dim, conditioning_dim, s_emb_dim,
+        self.s_model = StateEncoding(dim, hidden_dim, conditions_embedding_dim, s_emb_dim,
                                      norm=norm, dropout=dropout)
         self.joint_model = JointPolicy(dim, s_emb_dim, t_dim,
                                        hidden_dim, joint_layers, 2 * dim, zero_init=zero_init,
@@ -62,8 +63,10 @@ class GFN(nn.Module):
         self.pb_scale_range = pb_scale_range
 
         if self.conditional_flow_model:
-            self.flow_model = FlowModel(conditioning_dim, hidden_dim, 1,
-                                        norm=norm, dropout=dropout)
+            self.conditions_embedding_model = scalarMLP(input_dim=conditions_dim, norm=None, dropout=0,
+                                                        layers=1, filters=hidden_dim, output_dim=conditions_embedding_dim)
+            self.flow_model = FlowModel(conditions_embedding_dim, hidden_dim, 1,
+                                        norm='layer', dropout=0)
         else:
             self.flow_model = torch.nn.Parameter(torch.tensor(0.).to(self.device))
 
@@ -84,10 +87,16 @@ class GFN(nn.Module):
 
     def predict_next_state(self, state, time, condition):
         batch_size = state.shape[0]
+        if self.conditional_flow_model:
+            condition_embedding = self.conditions_embedding_model(condition)
+            log_flow = self.flow_model(condition_embedding).squeeze(-1)
+        else:
+            condition_embedding = None
+            log_flow = self.flow_model
         time_encoding = self.t_model(time).repeat(batch_size, 1)
-        state_encoding = self.s_model(state, condition)
+        state_encoding = self.s_model(state, condition_embedding)
         state_update = self.joint_model(state_encoding, time_encoding)  # nx(2d) with d drift and d noise parameters
-        log_flow = self.flow_model(condition).squeeze(-1) if self.conditional_flow_model or self.partial_energy else self.flow_model
+
 
         if self.clipping:
             state_update = torch.clip(state_update, -self.gfn_clip, self.gfn_clip)
@@ -125,7 +134,11 @@ class GFN(nn.Module):
 
             if self.learn_pb:
                 t = self.t_model((i + 1) * self.dt).repeat(batch_size, 1)
-                pbs = self.back_model(self.s_model(next_state, condition), t)
+                if self.conditional_flow_model:
+                    condition_embedding = self.conditions_embedding_model(condition)
+                else:
+                    condition_embedding = None
+                pbs = self.back_model(self.s_model(next_state, condition_embedding), t)
                 dmean, dvar = gaussian_params(pbs)
                 back_mean_correction = 1 + dmean.tanh() * self.pb_scale_range
                 back_var_correction = 1 + dvar.tanh() * self.pb_scale_range
@@ -155,7 +168,11 @@ class GFN(nn.Module):
             if i < self.trajectory_length - 1:
                 if self.learn_pb:
                     t = self.t_model(1. - i * self.dt).repeat(batch_size, 1)
-                    pbs = self.back_model(self.s_model(s, condition), t)
+                    if self.conditional_flow_model:
+                        condition_embedding = self.conditions_embedding_model(condition)
+                    else:
+                        condition_embedding = None
+                    pbs = self.back_model(self.s_model(s, condition_embedding), t)
                     dmean, dvar = gaussian_params(pbs)
                     back_mean_correction = 1 + dmean.tanh() * self.pb_scale_range
                     back_var_correction = 1 + dvar.tanh() * self.pb_scale_range

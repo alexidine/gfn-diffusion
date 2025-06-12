@@ -56,6 +56,7 @@ def eval_step(energy, gfn_model, batch_size, do_figures: bool = True, mol_batch=
     metrics['eval/packing_coeff'] = sample_batch.packing_coeff.mean().cpu().detach().numpy()
     metrics['eval/silu_potential'] = sample_batch.silu_pot.mean().cpu().detach().numpy()
     metrics['eval/energy'] = sample_batch.gfn_energy.mean().cpu().detach().numpy()
+    metrics['Crystal Log Temperature'] = condition[:, 0]
     #metrics['eval/ellipsoid_overlap'] = sample_batch.ellipsoid_overlap.mean().cpu().detach().numpy()
 
     "Custom Figures"
@@ -66,7 +67,7 @@ def eval_step(energy, gfn_model, batch_size, do_figures: bool = True, mol_batch=
                                                               0].cpu().detach().numpy()) if condition is not None else None,
                                                              aux_scalar_name='log_temperature' if condition is not None else None)
         fig_dict['Sample Embedding'] = simple_embedding_fig(sample_batch,
-                                                            sample_batch.gfn_energy.cpu().detach().numpy())  #condition[:, 0].cpu().detach().numpy() if condition is not None else None)
+                                                            sample_batch.silu_pot.cpu().detach().numpy())  #condition[:, 0].cpu().detach().numpy() if condition is not None else None)
         for key in fig_dict.keys():
             fig = fig_dict[key]
             if get_plotly_fig_size_mb(fig) > 0.1:  # bigger than .1 MB
@@ -344,7 +345,6 @@ def do_evaluation(eval_batch_size, energy_function, energy_record, gfn_model, i,
     learned_Z_record.append(metrics['eval/log_Z_learned'])
     if 'tb-avg' in args.mode_fwd or 'tb-avg' in args.mode_bwd:
         del metrics['eval/log_Z_learned']
-    #metrics.update({'Crystal Temperature': energy_function.temperature})
     times['eval_step_end'] = time()
     metrics.update(log_elapsed_times())
     return metrics
