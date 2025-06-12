@@ -268,7 +268,7 @@ def init_buffers_datasets(energy_function):
         x=atom_types,
         skip_mol_analysis=False,
     )
-    mols_list = [good_mol for _ in range(args.max_batch_size)]
+    mols_list = [good_mol for _ in range(int(args.max_batch_size * 1.5))]
     mol_loader = DataLoader(
         mols_list,
         batch_size=args.batch_size,
