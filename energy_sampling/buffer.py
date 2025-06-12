@@ -1,6 +1,9 @@
+from typing import Optional
+
 import torch
 import numpy as np
 from torch_geometric.loader import DataLoader
+from mxtaltools.dataset_utils.utils import collate_data_list
 
 
 class SampleDataset(torch.utils.data.Dataset):
@@ -198,11 +201,23 @@ class CrystalReplayBuffer():
         else:
             self.dataset.extend(dataset)
 
-        if len(self.dataset) > self.buffer_size:
+        if len(self.dataset) > self.buffer_size:  # todo consider sorting here by rank / diversity
             self.dataset = self.dataset[-self.buffer_size:]
+            self.scores_np = self.dataset[-self.buffer_size:]
 
-        if self.prioritized == 'rank':
-            self.scores_np = self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(len(self.dataset))).detach().cpu().view(-1).numpy()
+        if not hasattr(self, 'scores_np'):
+            self.scores_np = self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(
+                len(self.dataset))).detach().cpu().view(-1).numpy()
+        else:
+            self.scores_np = np.concatenate([
+                self.scores_np,
+                self.energy_function.prebuilt_sample_to_reward(
+                    dataset,
+                    temperature=torch.ones(len(dataset))).detach().cpu().view(-1).numpy()
+                ]
+            )
+
+        if self.prioritized == 'rank':  # todo add a diversity-type sampler
             ranks = np.argsort(np.argsort(-1 * self.scores_np))
             weights = 1.0 / (1e-2 * len(self.scores_np) + ranks)
             self.sampler = torch.utils.data.WeightedRandomSampler(
@@ -217,7 +232,6 @@ class CrystalReplayBuffer():
                 pin_memory=True,
                 drop_last=False)
         else:
-            self.scores_np = self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(len(self.dataset))).detach().cpu().view(-1).numpy()
             weights = 1.0
             self.sampler = torch.utils.data.WeightedRandomSampler(
                 weights=weights, num_samples=len(self.scores_np), replacement=True
@@ -237,7 +251,28 @@ class CrystalReplayBuffer():
         else:
             return len(self.dataset)
 
-    def sample(self, temperature):
-        sample = next(iter(self.loader))
+    def sample(self,
+               temperature: Optional[torch.tensor] = None,
+               return_conditioning: Optional[bool] = False,
+               override_batch: Optional[int] = None):
+
+        assert return_conditioning or (temperature is not None), "Must provide temperature or generate it here"
+
+        if override_batch is not None and override_batch != self.loader.batch_size:  # manual resampling if we want a custom batch size
+            if override_batch >= len(self.dataset):
+                rand_inds = np.random.randint(len(self.dataset), override_batch)
+            else:
+                rand_inds = np.random.choice(len(self.dataset), override_batch, replace=False)
+
+            sample = collate_data_list([self.loader.dataset[ind] for ind in rand_inds])
+        else:
+            sample = next(iter(self.loader))
+
+        condition = self.energy_function.get_conditioning_tensor(sample)
+        temperature = 10 ** condition[:, 0]  # first dimension is the log temperature
         reward = self.energy_function.prebuilt_sample_to_reward(sample, temperature)  # recompute reward in case parameters have changed
-        return sample.cell_params_to_gen_basis(), reward, sample  # x, r, condition
+
+        if return_conditioning:
+            return sample.cell_params_to_gen_basis(), reward, sample, condition
+        else:
+            return sample.cell_params_to_gen_basis(), reward, sample

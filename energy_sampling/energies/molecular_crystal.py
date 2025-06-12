@@ -188,8 +188,8 @@ class MolecularCrystal(BaseSet):
             if temperature is None:  # sample randomly in log space
                 rands = torch.rand(mol_batch.num_graphs, device=mol_batch.device, dtype=torch.float32)
 
-                log_min = torch.log10(torch.tensor(self.min_temperature, dtype=torch.float32, device=self.device))
-                log_max = torch.log10(torch.tensor(self.max_temperature, dtype=torch.float32, device=self.device))
+                log_min = torch.log10(torch.tensor(self.min_temperature, dtype=torch.float32, device=mol_batch.device))
+                log_max = torch.log10(torch.tensor(self.max_temperature, dtype=torch.float32, device=mol_batch.device))
 
                 log_temps = log_min + (log_max - log_min) * rands ** self.temperature_scaling_factor
                 return log_temps[:, None]

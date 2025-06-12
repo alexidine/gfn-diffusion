@@ -84,32 +84,46 @@ def eval_step(energy, gfn_model, batch_size, do_figures: bool = True, mol_batch=
     return metrics
 
 
-def train_step(energy, gfn_model, gfn_optimizer, it, exploratory, buffer, exploration_factor,
-               exploration_wd, mol_batch, condition, repeats: int = 10):
+def train_step(energy_function, gfn_model, gfn_optimizer, it, exploratory, buffer, mol_loader, exploration_factor,
+               exploration_wd, repeats: int = 10):
     gfn_model.zero_grad()
     wd_max_steps = 20000
     exploration_std = get_exploration_std(it, exploratory, wd_max_steps, exploration_factor, exploration_wd)
 
+    do_forward = False
+    do_backward = False
+    add_to_buffer = False
     if args.both_ways:
-        if it % 2 == 0:
+        if it % args.fwd_train_each == 0:
             if args.sampling == 'buffer':
-                loss, states, _, _, log_r, sample_batch = fwd_train_step(energy, gfn_model, exploration_std, mol_batch,
-                                                                         return_exp=True, repeats=repeats,
-                                                                         condition=condition)
-                buffer.add(sample_batch.cpu().detach().to_data_list())
-            else:
-                loss = fwd_train_step(energy, gfn_model, exploration_std, mol_batch, repeats=repeats,
-                                      condition=condition)
+                add_to_buffer = True
+            do_forward = True
         else:
-            loss = bwd_train_step(energy, gfn_model, buffer, exploration_std, it=it, repeats=repeats,
-                                  condition=condition)
+            do_backward = True
+    elif args.bwd:  # backward ONLY
+        do_backward = True
+    else:  # forward ONLY
+        do_forward = True
 
-    elif args.bwd:
-        loss = bwd_train_step(energy, gfn_model, buffer, exploration_std, it=it, repeats=repeats,
-                              condition=condition)
+    if do_forward:
+        mol_batch = next(iter(mol_loader)).to(device)  # todo add here optional mol adjustments
+        fwd_outputs = fwd_train_step(energy_function,
+                                     gfn_model,
+                                     exploration_std,
+                                     mol_batch,
+                                     return_exp=add_to_buffer,
+                                     repeats=repeats,
+                                     )
+        if add_to_buffer:
+            loss = fwd_outputs[0]
+            buffer.add(fwd_outputs[-1].cpu().detach().to_data_list())
+        else:
+            loss = fwd_outputs
+    elif do_backward:
+        loss = bwd_train_step(gfn_model, buffer, exploration_std,
+                              it=it, repeats=repeats)
     else:
-        loss = fwd_train_step(energy, gfn_model, exploration_std, mol_batch, repeats=repeats,
-                              condition=condition)
+        assert False
 
     loss.backward()
     torch.nn.utils.clip_grad_norm_(gfn_model.parameters(),
@@ -118,29 +132,29 @@ def train_step(energy, gfn_model, gfn_optimizer, it, exploratory, buffer, explor
     return loss.item(), exploration_std(0)
 
 
-def fwd_train_step(energy, gfn_model, exploration_std, mol_batch, return_exp=False, condition=None, repeats: int = 10):
-    init_state = get_gfn_init_state(args.batch_size, energy.data_ndim, device)
-    return get_gfn_forward_loss(args.mode_fwd, init_state, gfn_model, energy.log_reward, coeff_matrix, mol_batch,
+def fwd_train_step(energy_function, gfn_model, exploration_std, mol_batch, return_exp=False, repeats: int = 10):
+    init_state = get_gfn_init_state(args.batch_size, energy_function.data_ndim, device)
+    condition = energy_function.get_conditioning_tensor(mol_batch)
+    return get_gfn_forward_loss(args.mode_fwd, init_state, gfn_model, energy_function.log_reward, coeff_matrix, mol_batch,
                                 exploration_std=exploration_std, return_exp=return_exp, condition=condition,
                                 repeats=repeats)
 
 
-def bwd_train_step(energy, gfn_model, buffer, exploration_std=None, it=0, condition=None, repeats: int = 10):
-    # if args.sampling == 'sleep_phase':  # todo not updated for current buffering syntax
-    #     samples = gfn_model.sleep_phase_sample(args.batch_size, exploration_std).to(device)
-    # elif args.sampling == 'energy':  # we aren't doing this - built in energy sampler is slow/bad
-    #     samples = energy.sample(args.batch_size).to(device)
+def bwd_train_step(gfn_model, buffer, exploration_std=None, it=0, repeats: int = 10):
     if args.sampling == 'buffer':
-        if args.temperature_conditioning:
-            temperature = condition[:, 0].cpu().detach()
-        else:
-            temperature = torch.ones(len(condition[:, 0])) * args.energy_static_temperature
-        samples, rewards, crystal_batch = buffer.sample(temperature)
+        samples, rewards, crystal_batch, condition = buffer.sample(
+            return_conditioning=True,
+            override_batch=int(buffer.batch_size * args.bwd_batch_multiplier))
     else:
         assert False, f"sampling method {args.sampling} not implemented"
 
-    loss = get_gfn_backward_loss(args.mode_bwd, samples.to(device), gfn_model, rewards.to(device),
-                                 exploration_std=exploration_std, condition=condition, repeats=repeats)
+    loss = get_gfn_backward_loss(args.mode_bwd,
+                                 samples.to(device),
+                                 gfn_model,
+                                 rewards.to(device),
+                                 exploration_std=exploration_std,
+                                 condition=condition.to(device),
+                                 repeats=repeats)
     return loss
 
 
@@ -161,19 +175,21 @@ def train():
     config["Experiment"] = "{args.energy}"
     wandb.init(project="GFN Energy", config=config, name=name)
     conditioning_dim = 1 if args.temperature_conditioning else 0
-    gfn_model = GFN(energy_function.data_ndim, args.s_emb_dim, args.hidden_dim, conditioning_dim, args.harmonics_dim,
-                    args.t_emb_dim,
-                    trajectory_length=args.T, clipping=args.clipping, lgv_clip=args.lgv_clip, gfn_clip=args.gfn_clip,
-                    langevin=args.langevin, learned_variance=args.learned_variance,
+    gfn_model = GFN(energy_function.data_ndim, args.s_emb_dim, args.hidden_dim,
+                    conditioning_dim, args.harmonics_dim,
+                    args.t_emb_dim, condition_embedding_dim=args.condition_emb_dim,
+                    trajectory_length=args.T, clipping=args.clipping,
+                    gfn_clip=args.gfn_clip,
+                    learned_variance=args.learned_variance,
                     partial_energy=args.partial_energy, log_var_range=args.log_var_range,
                     pb_scale_range=args.pb_scale_range,
-                    t_scale=args.t_scale, langevin_scaling_per_dimension=args.langevin_scaling_per_dimension,
+                    t_scale=args.t_scale,
                     conditional_flow_model=args.conditional_flow_model, learn_pb=args.learn_pb,
                     lgv_layers=args.lgv_layers,
                     joint_layers=args.joint_layers, dropout=args.dropout, norm=args.norm,
                     zero_init=args.zero_init, device=device).to(device)
 
-    wandb.watch(gfn_model, log_graph=True, log_freq=100)  # for gradient logging
+    wandb.watch(gfn_model, log_graph=True, log_freq=args.figs_period)  # for gradient logging
 
     gfn_optimizer = get_gfn_optimizer(gfn_model, args.lr_policy, args.lr_flow, args.lr_back, args.learn_pb,
                                       args.conditional_flow_model, args.use_weight_decay, args.weight_decay)
@@ -193,18 +209,16 @@ def train():
         metrics = dict()
         times['train_step_start'] = time()
         try:
-            mol_batch = next(iter(mol_loader)).to(device)  # todo add here optional mol adjustments
-            condition = energy_function.get_conditioning_tensor(mol_batch)
             metrics['train/loss'], metrics['train/expl'] = train_step(energy_function,
                                                                       gfn_model,
                                                                       gfn_optimizer,
                                                                       i,
                                                                       args.exploratory,
                                                                       buffer,
+                                                                      mol_loader,
                                                                       args.exploration_factor,
                                                                       args.exploration_wd,
-                                                                      mol_batch,
-                                                                      condition)
+                                                                      )
 
             if args.scheduler:
                 scheduler.step()
@@ -218,11 +232,8 @@ def train():
         times['train_step_end'] = time()
 
         if (i % args.eval_period == 0 and i > 0) or i == 50:
-            eval_batch_size = 1000  #min(max(args.batch_size, 500), 1000)
-            eval_rands = np.random.randint(len(mol_loader.dataset), size=eval_batch_size)
-            eval_batch = collate_data_list([mol_loader.dataset[ind] for ind in eval_rands]).to(device)
-            metrics = do_evaluation(eval_batch_size, energy_function, energy_record, gfn_model, i, learned_Z_record,
-                                    metrics, eval_batch)
+            metrics = do_evaluation(energy_function, energy_record, gfn_model, i, learned_Z_record,
+                                    metrics, mol_loader)
             wandb.log(metrics, step=i)
 
         if i % 100 == 0 and i > 0:
@@ -235,6 +246,7 @@ def train():
 
         elif i % 10 == 0:
             metrics.update(log_elapsed_times())
+            metrics['train/loss'] = np.mean(loss_record[-10:])
             wandb.log(metrics, step=i)
 
     torch.save(gfn_model.state_dict(), f'{name}_model_final.pt')
@@ -336,15 +348,18 @@ def handle_train_epoch_error(e, oomed_out, buffer, mol_loader):
     return oomed_out, buffer, mol_loader
 
 
-def do_evaluation(eval_batch_size, energy_function, energy_record, gfn_model, i, learned_Z_record, metrics, mol_batch):
+def do_evaluation(energy_function, energy_record, gfn_model, i, learned_Z_record, metrics, mol_loader):
     times['eval_step_start'] = time()
+    eval_batch_size = args.eval_batch_size
+    eval_rands = np.random.randint(len(mol_loader.dataset), size=eval_batch_size)
+    mol_batch = collate_data_list([mol_loader.dataset[ind] for ind in eval_rands]).to(device)
     metrics.update({'Batch Size': args.batch_size})
     do_figures = i % args.figs_period == 0
     metrics.update(eval_step(energy_function, gfn_model, eval_batch_size, do_figures, mol_batch))
     energy_record.append(metrics['eval/energy'])
     learned_Z_record.append(metrics['eval/log_Z_learned'])
-    if 'tb-avg' in args.mode_fwd or 'tb-avg' in args.mode_bwd:
-        del metrics['eval/log_Z_learned']
+    # if 'tb-avg' in args.mode_fwd or 'tb-avg' in args.mode_bwd:
+    #     del metrics['eval/log_Z_learned']
     times['eval_step_end'] = time()
     metrics.update(log_elapsed_times())
     return metrics

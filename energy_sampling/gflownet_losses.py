@@ -44,16 +44,16 @@ def bwd_tb(initial_state, gfn, log_r, exploration_std=None, condition=None):
 
 
 def fwd_tb_avg(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=None, return_exp=False, condition=None):
-    states, log_pfs, log_pbs, _ = gfn.get_trajectory_fwd(initial_state, exploration_std, log_reward_fn, condition)
-    crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states)
-    log_pf = log_pfs.sum(-1)
-    log_pb = log_pbs.sum(-1)
-    log_Z = (log_r + log_pb - log_pf).mean(dim=0, keepdim=True)
-    loss = log_Z + (log_pf - log_r - log_pb)
-    if return_exp:
-        return 0.5 * (loss ** 2).mean(), states, log_pfs, log_pbs, log_r, crystal_batch
-    else:
-        return 0.5 * (loss ** 2).mean()
+        states, log_pfs, log_pbs, _ = gfn.get_trajectory_fwd(initial_state, exploration_std, log_reward_fn, condition)
+        crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states)
+        log_pf = log_pfs.sum(-1)
+        log_pb = log_pbs.sum(-1)
+        log_Z = (log_r + log_pb - log_pf).mean(dim=0, keepdim=True)
+        loss = log_Z + (log_pf - log_r - log_pb)
+        if return_exp:
+            return 0.5 * (loss ** 2).mean(), states, log_pfs, log_pbs, log_r, crystal_batch
+        else:
+            return 0.5 * (loss ** 2).mean()
 
 
 def bwd_tb_avg(initial_state, gfn, log_r, exploration_std=None, condition=None):
@@ -68,7 +68,18 @@ def bwd_tb_avg(initial_state, gfn, log_r, exploration_std=None, condition=None):
 def fwd_tb_avg_cond(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=None, return_exp=False,
                     condition=None,
                     repeats=10):
-    """equivalent to vargrad"""
+    """
+    This is the VarGrad forward loss
+    :param initial_state:
+    :param gfn:
+    :param log_reward_fn:
+    :param mol_batch:
+    :param exploration_std:
+    :param return_exp:
+    :param condition:
+    :param repeats:
+    :return:
+    """
     condition = condition.repeat(repeats, 1)
     initial_state = initial_state.repeat(repeats, 1)
     mol_batch = collate_data_list(mol_batch.to_data_list() * repeats)
@@ -77,9 +88,11 @@ def fwd_tb_avg_cond(initial_state, gfn, log_reward_fn, mol_batch, exploration_st
 
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
+    # reshape and take the mean over repeats
     log_Z = (log_r + log_pb - log_pf).view(repeats, -1).mean(dim=0, keepdim=True)
+    # minimize the variance over repeats w.r.t., the norm
     loss = log_Z + (log_pf - log_r - log_pb).view(repeats, -1)
-
+    loss = loss.clip(min=-10, max=10)  # clip extreme outliers for stability
     if return_exp:
         return 0.5 * (loss ** 2).mean(), states, log_pfs, log_pbs, log_r, crystal_batch
     else:
@@ -96,6 +109,7 @@ def bwd_tb_avg_cond(initial_state, gfn, log_r, exploration_std=None, condition=N
     log_pb = log_pbs.sum(-1)
     log_Z = (log_r + log_pb - log_pf).view(repeats, -1).mean(dim=0, keepdim=True)
     loss = log_Z + (log_pf - log_r - log_pb).view(repeats, -1)
+    loss = loss.clip(min=-10, max=10)  # clip extreme outliers for stability
     return 0.5 * (loss ** 2).mean()
 
 

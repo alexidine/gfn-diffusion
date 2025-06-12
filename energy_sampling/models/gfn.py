@@ -14,11 +14,12 @@ logtwopi = math.log(2 * math.pi)
 class GFN(nn.Module):
     def __init__(self, dim: int, s_emb_dim: int, hidden_dim: int, conditions_dim: int,
                  harmonics_dim: int, t_dim: int, log_var_range: float = 4.,
-                 t_scale: float = 1., langevin: bool = False, learned_variance: bool = True,
+                 t_scale: float = 1., learned_variance: bool = True,
                  trajectory_length: int = 100, partial_energy: bool = False,
-                 conditions_embedding_dim: int = 32,
-                 clipping: bool = False, lgv_clip: float = 1e2, gfn_clip: float = 1e4, pb_scale_range: float = 1.,
-                 langevin_scaling_per_dimension: bool = True, conditional_flow_model: bool = False,
+                 condition_embedding_dim: int = 32,
+                 clipping: bool = False,
+                 gfn_clip: float = 1e4, pb_scale_range: float = 1.,
+                 conditional_flow_model: bool = False,
                  learn_pb: bool = False, lgv_layers: int = 3, joint_layers: int = 2,
                  dropout: Optional[float] = 0, norm: Optional[str] = None,
                  zero_init: bool = False, device=torch.device('cuda')):
@@ -29,16 +30,13 @@ class GFN(nn.Module):
         self.s_emb_dim = s_emb_dim
 
         self.trajectory_length = trajectory_length
-        self.langevin = langevin
         self.learned_variance = learned_variance
         self.partial_energy = partial_energy
         self.t_scale = t_scale
 
         self.clipping = clipping
-        self.lgv_clip = lgv_clip
         self.gfn_clip = gfn_clip
 
-        self.langevin_scaling_per_dimension = langevin_scaling_per_dimension
         self.conditional_flow_model = conditional_flow_model
         self.learn_pb = learn_pb
 
@@ -52,7 +50,7 @@ class GFN(nn.Module):
 
         self.t_model = TimeEncoding(harmonics_dim, t_dim, hidden_dim,
                                     norm=norm, dropout=dropout)
-        self.s_model = StateEncoding(dim, hidden_dim, conditions_embedding_dim, s_emb_dim,
+        self.s_model = StateEncoding(dim, hidden_dim, condition_embedding_dim, s_emb_dim,
                                      norm=norm, dropout=dropout)
         self.joint_model = JointPolicy(dim, s_emb_dim, t_dim,
                                        hidden_dim, joint_layers, 2 * dim, zero_init=zero_init,
@@ -64,18 +62,12 @@ class GFN(nn.Module):
 
         if self.conditional_flow_model:
             self.conditions_embedding_model = scalarMLP(input_dim=conditions_dim, norm=None, dropout=0,
-                                                        layers=1, filters=hidden_dim, output_dim=conditions_embedding_dim)
-            self.flow_model = FlowModel(conditions_embedding_dim, hidden_dim, 1,
+                                                        layers=1, filters=hidden_dim,
+                                                        output_dim=condition_embedding_dim)
+            self.flow_model = FlowModel(condition_embedding_dim, hidden_dim, 1,
                                         norm='layer', dropout=0)
         else:
             self.flow_model = torch.nn.Parameter(torch.tensor(0.).to(self.device))
-
-        if self.langevin_scaling_per_dimension:
-            self.langevin_scaling_model = LangevinScalingModel(s_emb_dim, t_dim, hidden_dim, lgv_layers, dim, zero_init=zero_init,
-                                                               norm=norm, dropout=dropout)
-        else:
-            self.langevin_scaling_model = LangevinScalingModel(s_emb_dim, t_dim, hidden_dim, lgv_layers, 1, zero_init=zero_init,
-                                                               norm=norm, dropout=dropout)
 
     def split_params(self, tensor):
         mean, logvar = gaussian_params(tensor)
@@ -96,7 +88,6 @@ class GFN(nn.Module):
         time_encoding = self.t_model(time).repeat(batch_size, 1)
         state_encoding = self.s_model(state, condition_embedding)
         state_update = self.joint_model(state_encoding, time_encoding)  # nx(2d) with d drift and d noise parameters
-
 
         if self.clipping:
             state_update = torch.clip(state_update, -self.gfn_clip, self.gfn_clip)
@@ -129,7 +120,8 @@ class GFN(nn.Module):
             next_state = state + self.dt * pf_mean.detach() + np.sqrt(self.dt) * (
                     pflogvars_sample / 2).exp() * torch.randn_like(state, device=self.device)
 
-            noise = ((next_state - state) - self.dt * pf_mean) / (np.sqrt(self.dt) * (pflogvars / 2).exp())  # seems unnecessary, as we have the noise above
+            noise = ((next_state - state) - self.dt * pf_mean) / (
+                        np.sqrt(self.dt) * (pflogvars / 2).exp())  # seems unnecessary, as we have the noise above
             logpf[:, i] = -0.5 * (noise ** 2 + logtwopi + np.log(self.dt) + pflogvars).sum(1)
 
             if self.learn_pb:
@@ -181,7 +173,7 @@ class GFN(nn.Module):
 
                 mean = s - self.dt * s / (1. - i * self.dt) * back_mean_correction
                 var = ((self.pf_std_per_traj ** 2) * self.dt * (1. - (i + 1) * self.dt)) / (
-                            1 - i * self.dt) * back_var_correction
+                        1 - i * self.dt) * back_var_correction
                 s_ = mean.detach() + var.sqrt().detach() * torch.randn_like(s, device=self.device)
                 noise_backward = (s_ - mean) / var.sqrt()
                 logpb[:, self.trajectory_length - i - 1] = -0.5 * (noise_backward ** 2 + logtwopi + var.log()).sum(1)
@@ -192,7 +184,8 @@ class GFN(nn.Module):
             pf_mean, pflogvars = self.split_params(pfs)
             logf[:, self.trajectory_length - i - 1] = flow
             noise = ((s - s_) - self.dt * pf_mean) / (np.sqrt(self.dt) * (pflogvars / 2).exp())
-            logpf[:, self.trajectory_length - i - 1] = -0.5 * (noise ** 2 + logtwopi + np.log(self.dt) + pflogvars).sum(1)
+            logpf[:, self.trajectory_length - i - 1] = -0.5 * (noise ** 2 + logtwopi + np.log(self.dt) + pflogvars).sum(
+                1)
 
             s = s_
             states[:, self.trajectory_length - i - 1] = s

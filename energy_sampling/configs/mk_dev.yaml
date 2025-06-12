@@ -1,89 +1,76 @@
 run_name: 'mk_local_dev'
+seed: 12345
 device: 'cuda'
 lr_policy: 0.0001              # learning rate of the policy network
 lr_flow: 0.01                  # learning rate of the flow network
 lr_back: 0.0001                # learning rate of the backward pass
+weight_decay: 1e-7
+use_weight_decay: false
 scheduler: True
 lr_shrink_lambda: 0.9995
-repeats: 5                    # for conditional training
 gradient_norm_clip: 1.0        # gradient norm clip for updating gfn model weights
 
 # model parameters
 zero_init: false
-pis_architectures: false # false goes to our custom architectures, which are better for training bigger models
-lgv_layers: 4
-joint_layers: 4
-hidden_dim: 256                # dimensionality of hidden layer: standard
-s_emb_dim: 32                 # dimensionality of state embedding: standard
-t_emb_dim: 32                 # dimensionality of time embedding: standard
-harmonics_dim: 64             # dimensionality of harmonic embedding: standard
-dropout: 0
-norm: null
+
+joint_layers: 4              # number of layers in forward/backward policy models
+hidden_dim: 256              # dimensionality of hidden layer
+s_emb_dim: 32                # dimensionality of state embedding
+t_emb_dim: 32                # dimensionality of time embedding
+harmonics_dim: 64            # dimensionality of harmonic embedding
+condition_emb_dim: 32         # dimensionality of the conditioning embedding
+dropout: 0                   # dropout probability
+norm: null                   # null, "layer", "batch"
 
 batch_size: 25               # number of samples per training batch: relatively small
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
 max_batch_size: 50           # maximum batch size to allow
+eval_batch_size: 500        # batch size for evaluation
 epochs: 10000000             # number of training epochs: relatively large
-eval_period: 50              # how often to do evaluation & reporting
-figs_period: 250             # how often to log custom figrues
+eval_period: 250              # how often to do evaluation & reporting
+figs_period: 500             # how often to log custom figrues
 buffer_size: 500000          # size of replay buffer: relatively large
 
-# subtb params
+# GFlowNet settings
 T: 10                        # diffusion trajectory length
-subtb_lambda: 2              # subtb currently deprecated
-
-t_scale: 1.0
-log_var_range: 4.0
-energy: "molecular_crystal"   # "molecular_crystal"
-mode_fwd: "tb"
-mode_bwd: "tb"
-both_ways: true
-bwd: false            # backward training only
-learn_pb: true
-
+t_scale: 1.0                 # scales learned policy variance
+log_var_range: 4.0           # controls dynamic range of forward policy variance
+pb_scale_range: 0.1          # range of learned backward policy variance
+energy: "molecular_crystal"  # "molecular_crystal"
+mode_fwd: "cond-tb-avg"               # "TB" is trajectory balance, "cond-tb-avg" is conditional VarGrad
+mode_bwd: "cond-tb-avg"      # "TB" is trajectory balance, "cond-tb-avg" is conditional VarGrad
+repeats: 10                  # for conditional VarGrad training
+both_ways: true              # forward and backward training
+bwd_batch_multiplier: 10     # ratio of backward to foward batch size
+fwd_train_each: 5            # how often to do forward training compared to backward
+bwd: false                   # backward training only
+learn_pb: true               # whether to learn a backward policy
+conditional_flow_model: true # PROBABLY WILL NOT RUN IF FALSE, conditional training (currently doing temperature)
+learned_variance: true       # whether to learn policy variance
+partial_energy: false
+clipping: true  # clip the maximumstep size induced by the policy model
+gfn_clip: 10.0  # clip the maximumstep size induced by the policy model
 
 # local search settings
 ################################################################
 local_search: false             # DEPRECATED we now combine preloaded and sampled elements into a single buffer
 buffer_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
 molecules_path: 'D:/crystal_datasets/test_qm9_dataset.pt'
-max_iter_ls: 100                # DEPRECATED # how many iterations to run local search
-samples_per_opt: 10             # DEPRECATED #how many noisy samples to take near each optimized minimum
-burn_in: 100                    # DEPRECATED # NOT USED IN MXTAL how many iterations to burn in before making local search
-ls_cycle: 100                   # DEPRECATED # how frequently to make local search
-ld_step: 0.1                    # DEPRECATED # langevin step size
-ld_schedule: true               # DEPRECATED # whether to use scheduled langevin step size
-target_acceptance_rate: 0.574   # DEPRECATED # target acceptance rate for local search
 
-# replay buffer settings
+# replay buffer / dataset settings
 ################################################################
-# NOTE I HAVE REMOVED BUFFER SAMPLING
-# FROM LS TRAINING FOR MXTALS, FOR NOW
-# ALL LS SAMPLES ARE INSTEAD DRAWN RANDOMLY, WITH SOME CONSTRAINTS
 beta: 1.0             # reward prioritized replay sampling: high beta = steep prioritization
 rank_weight: 0.01     # rank-based replay sampling: low rank_weight = steep prioritization
 prioritized: "rank"   # three kinds of replay training: random, reward prioritized, rank-based
+sampling: "buffer"
 
 ################################################################
 
+# exploration controls
 exploratory: true
-
-sampling: "buffer"
-langevin: false
-langevin_scaling_per_dimension: false
-conditional_flow_model: true  # necessary for temperature conditioning
-pb_scale_range: 0.1
-learned_variance: true
-partial_energy: false
 exploration_factor: 0.35
 exploration_wd: true
-clipping: true
-lgv_clip: 100.0
-gfn_clip: 1.0
-seed: 12345
-weight_decay: 1e-7
-use_weight_decay: false
-eval: false
+
 
 # molecular crystal settings
 ################################################################
@@ -97,3 +84,21 @@ energy_min_temperature: 0.1
 energy_max_temperature: 1
 energy_static_temperature: 1
 temperature_scaling_factor: 1  # controls relative frequency of higher vs lower temperatures (higher -> higher)
+
+
+# deprecated or un-used
+
+max_iter_ls: 100                # DEPRECATED # how many iterations to run local search
+samples_per_opt: 10             # DEPRECATED #how many noisy samples to take near each optimized minimum
+burn_in: 100                    # DEPRECATED # NOT USED IN MXTAL how many iterations to burn in before making local search
+ls_cycle: 100                   # DEPRECATED # how frequently to make local search
+ld_step: 0.1                    # DEPRECATED # langevin step size
+ld_schedule: true               # DEPRECATED # whether to use scheduled langevin step size
+target_acceptance_rate: 0.574   # DEPRECATED # target acceptance rate for local search
+langevin: false
+langevin_scaling_per_dimension: false
+lgv_clip: 100.0
+lgv_layers: 4
+eval: false
+pis_architectures: false # false goes to our custom architectures, which are better for training bigger models
+subtb_lambda: 2              # subtb currently deprecated
