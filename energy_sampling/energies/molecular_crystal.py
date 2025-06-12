@@ -150,7 +150,7 @@ class MolecularCrystal(BaseSet):
             lj_pot=torch.zeros(1, device=self.device),
             scaled_lj_pot=torch.zeros(1, device=self.device),
             es_pot=torch.zeros(1, device=self.device),
-            ellipsoid_overlap=torch.zeros(1, device=self.device)
+            #ellipsoid_overlap=torch.zeros(1, device=self.device)
         ) for ind in range(len(mol_batch))]).to(self.device)
 
         return crystal_batch
