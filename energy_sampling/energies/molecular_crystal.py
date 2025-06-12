@@ -64,7 +64,7 @@ class MolecularCrystal(BaseSet):
         #     model=self.ellipsoid_model,
         #     return_details=True)
 
-        cluster_batch.ellipsoid_overlap = torch.zeros_like(silu_energy) #normed_ellipsoid_overlap.flatten()
+        #cluster_batch.ellipsoid_overlap = torch.zeros_like(silu_energy) #normed_ellipsoid_overlap.flatten()
         cluster_batch.silu_pot = silu_energy
         crystal_energy = self.generator_energy(cluster_batch)
         cluster_batch.gfn_energy = crystal_energy
