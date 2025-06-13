@@ -73,18 +73,6 @@ def bwd_tb_avg(initial_state, gfn, log_r, exploration_std=None, condition=None, 
 def fwd_tb_avg_cond(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=None, return_exp=False,
                     condition=None,
                     repeats=10):
-    """
-    This is the VarGrad forward loss
-    :param initial_state:
-    :param gfn:
-    :param log_reward_fn:
-    :param mol_batch:
-    :param exploration_std:
-    :param return_exp:
-    :param condition:
-    :param repeats:
-    :return:
-    """
     condition = condition.repeat(repeats, 1)
     initial_state = initial_state.repeat(repeats, 1)
     mol_batch = collate_data_list(mol_batch.to_data_list() * repeats)

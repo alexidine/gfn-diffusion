@@ -14,13 +14,13 @@ gradient_norm_clip: 1.0        # gradient norm clip for updating gfn model weigh
 zero_init: false
 
 joint_layers: 4              # number of layers in forward/backward policy models
-hidden_dim: 256              # dimensionality of hidden layer
+hidden_dim: 128              # dimensionality of hidden layer
 s_emb_dim: 32                # dimensionality of state embedding
 t_emb_dim: 32                # dimensionality of time embedding
-harmonics_dim: 64            # dimensionality of harmonic embedding
+harmonics_dim: 32            # dimensionality of harmonic embedding
 condition_emb_dim: 32         # dimensionality of the conditioning embedding
-dropout: 0                   # dropout probability
-norm: null                   # null, "layer", "batch"
+dropout: 0.1                   # dropout probability
+norm: layer                   # null, "layer", "batch"
 
 batch_size: 25               # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
@@ -38,12 +38,12 @@ log_var_range: 4.0           # controls dynamic range of forward policy variance
 pb_scale_range: 0.1          # range of learned backward policy variance
 energy: "molecular_crystal"  # "molecular_crystal"
 mode_fwd: "tb"               # "TB" is trajectory balance, "cond-tb-avg" is conditional VarGrad
-mode_bwd: "tb"      # "TB" is trajectory balance, "cond-tb-avg" is conditional VarGrad
+mode_bwd: "tb"               # "TB" is trajectory balance, "cond-tb-avg" is conditional VarGrad
 repeats: 10                  # for conditional VarGrad training
-both_ways: false              # forward and backward training
-bwd_batch_multiplier: 5     # ratio of backward to foward batch size
+both_ways: true              # forward and backward training
+bwd_batch_multiplier: 5      # ratio of backward to foward batch size (much cheaper to evaluate)
 fwd_train_each: 1            # how often to do forward training compared to backward
-bwd: true                   # backward training only
+bwd: false                   # backward training only
 learn_pb: true               # whether to learn a backward policy
 conditional_flow_model: true # PROBABLY WILL NOT RUN IF FALSE, conditional training (currently doing temperature)
 learned_variance: true       # whether to learn policy variance
@@ -77,7 +77,7 @@ exploration_wd: true
 anneal_energy: false  # harden intermolecular repulsion over time
 energy_annealing_threshold: 1.0e-2
 convergence_history: 1000
-energy_density_coeff: 1  # how much to weight the density penalty term in the energy function
+energy_density_coeff: 10  # how much to weight the density penalty term in the energy function
 temperature_conditioning: true
 energy_min_temperature: 0.1
 energy_max_temperature: 0.10001

@@ -55,6 +55,24 @@ for mode in modes:
             'train_pb': train_pb,
         })
 
+config_list.append(
+{
+            'mode_fwd': 'cond-tb-avg',
+            'mode_bwd': 'cond-tb-avg',
+            'bwd': False,
+            'both_ways': True,
+            'train_pb': False,
+        }
+)
+config_list.append(
+{
+            'mode_fwd': 'tb',
+            'mode_bwd': 'tb',
+            'bwd': False,
+            'both_ways': True,
+            'train_pb': False,
+        }
+)
 # config_list = [
 #     {
 #         'mode_fwd': "cond-tb-avg",
