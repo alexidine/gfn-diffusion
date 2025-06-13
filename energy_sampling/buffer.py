@@ -201,55 +201,54 @@ class CrystalReplayBuffer():
         else:
             self.dataset.extend(dataset)
 
-        if len(self.dataset) > self.buffer_size:  # todo consider sorting here by rank / diversity
-            self.dataset = self.dataset[-self.buffer_size:]
-            self.scores_np = self.dataset[-self.buffer_size:]
-
         if not hasattr(self, 'scores_np'):
             self.scores_np = self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(
                 len(self.dataset))).detach().cpu().view(-1).numpy()
+
         else:
             self.scores_np = np.concatenate([
                 self.scores_np,
                 self.energy_function.prebuilt_sample_to_reward(
                     dataset,
                     temperature=torch.ones(len(dataset))).detach().cpu().view(-1).numpy()
-                ]
-            )
+            ])
+            self.build_sampler()
 
-        if self.prioritized == 'rank':  # todo add a diversity-type sampler
-            ranks = np.argsort(np.argsort(-1 * self.scores_np))
-            weights = 1.0 / (1e-2 * len(self.scores_np) + ranks)
-            self.sampler = torch.utils.data.WeightedRandomSampler(
-                weights=weights, num_samples=len(self.scores_np), replacement=True
-            )
+        if len(self.dataset) > self.buffer_size:
+            if hasattr(self, 'sampler'):
+                inds_to_keep = list(self.sampler)[:self.buffer_size]
+            else:
+                inds_to_keep = np.arange(len(self.dataset) - self.buffer_size, len(self.dataset))
 
-            self.loader = DataLoader(
-                self.dataset,
-                batch_size=self.batch_size,
-                sampler=self.sampler,
-                num_workers=0,
-                pin_memory=True,
-                drop_last=False)
-        else:
-            weights = 1.0
-            self.sampler = torch.utils.data.WeightedRandomSampler(
-                weights=weights, num_samples=len(self.scores_np), replacement=True
-            )
+            self.dataset = [self.dataset[ind] for ind in inds_to_keep]
+            if hasattr(self, 'scores_np'):
+                self.scores_np = np.array([self.scores_np[ind] for ind in inds_to_keep])
+                self.build_sampler()
 
-            self.loader = DataLoader(
-                self.dataset,
-                batch_size=self.batch_size,
-                sampler=self.sampler,
-                num_workers=0,
-                pin_memory=True,
-                drop_last=False)
+        self.loader = DataLoader(
+            self.dataset,
+            batch_size=self.batch_size,
+            sampler=self.sampler,
+            num_workers=0,
+            pin_memory=True,
+            drop_last=False)
 
     def __len__(self):
         if self.dataset is None:
             return 0
         else:
             return len(self.dataset)
+
+    def build_sampler(self):
+        if self.prioritized == 'rank':
+            ranks = np.argsort(np.argsort(-1 * self.scores_np))
+            weights = 1.0 / (1e-2 * len(self.scores_np) + ranks)
+        else:
+            weights = torch.ones(len(self.scores_np))
+
+        self.sampler = torch.utils.data.WeightedRandomSampler(
+            weights=weights, num_samples=len(self.scores_np), replacement=True
+        )
 
     def sample(self,
                temperature: Optional[torch.tensor] = None,
@@ -270,7 +269,8 @@ class CrystalReplayBuffer():
 
         condition = self.energy_function.get_conditioning_tensor(sample)
         temperature = 10 ** condition[:, 0]  # first dimension is the log temperature
-        reward = self.energy_function.prebuilt_sample_to_reward(sample, temperature)  # recompute reward in case parameters have changed
+        reward = self.energy_function.prebuilt_sample_to_reward(sample,
+                                                                temperature)  # recompute reward in case parameters have changed
 
         if return_conditioning:
             return sample.cell_params_to_gen_basis(), reward, sample, condition

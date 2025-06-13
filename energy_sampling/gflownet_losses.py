@@ -26,7 +26,7 @@ def fwd_tb(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=None, r
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
     log_ratio = log_pf + log_fs[:, 0] - log_pb - log_r
-    log_ratio = log_ratio.clip(min=-10, max=10)  # clip extremely large losses
+    #log_ratio = log_ratio.clip(min=-10, max=10)  # clip extremely large losses
     loss = 0.5 * (log_ratio ** 2)
     if return_exp:
         return loss.mean(), states, log_pfs, log_pbs, log_r, crystal_batch
@@ -37,7 +37,7 @@ def fwd_tb(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=None, r
 def bwd_tb(initial_state, gfn, log_r, exploration_std=None, condition=None):
     states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(initial_state, exploration_std, condition)
     log_ratio = log_pfs.sum(-1) + log_fs[:, 0] - log_pbs.sum(-1) - log_r
-    log_ratio = log_ratio.clip(min=-10, max=10)  # clip extremely large losses
+    #log_ratio = log_ratio.clip(min=-10, max=10)  # clip extremely large losses
     loss = 0.5 * (log_ratio ** 2)
 
     return loss.mean()
@@ -92,7 +92,7 @@ def fwd_tb_avg_cond(initial_state, gfn, log_reward_fn, mol_batch, exploration_st
     log_Z = (log_r + log_pb - log_pf).view(repeats, -1).mean(dim=0, keepdim=True)
     # minimize the variance over repeats w.r.t., the norm
     loss = log_Z + (log_pf - log_r - log_pb).view(repeats, -1)
-    loss = loss.clip(min=-10, max=10)  # clip extreme outliers for stability
+    #loss = loss.clip(min=-10, max=10)  # clip extreme outliers for stability
     if return_exp:
         return 0.5 * (loss ** 2).mean(), states, log_pfs, log_pbs, log_r, crystal_batch
     else:
@@ -109,7 +109,7 @@ def bwd_tb_avg_cond(initial_state, gfn, log_r, exploration_std=None, condition=N
     log_pb = log_pbs.sum(-1)
     log_Z = (log_r + log_pb - log_pf).view(repeats, -1).mean(dim=0, keepdim=True)
     loss = log_Z + (log_pf - log_r - log_pb).view(repeats, -1)
-    loss = loss.clip(min=-10, max=10)  # clip extreme outliers for stability
+    #loss = loss.clip(min=-10, max=10)  # clip extreme outliers for stability
     return 0.5 * (loss ** 2).mean()
 
 

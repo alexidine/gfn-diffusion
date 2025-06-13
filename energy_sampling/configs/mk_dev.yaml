@@ -29,7 +29,7 @@ eval_batch_size: 500        # batch size for evaluation
 epochs: 10000000             # number of training epochs: relatively large
 eval_period: 250              # how often to do evaluation & reporting
 figs_period: 500             # how often to log custom figrues
-buffer_size: 500000          # size of replay buffer: relatively large
+buffer_size: 1000          # size of replay buffer: relatively large
 
 # GFlowNet settings
 T: 10                        # diffusion trajectory length
