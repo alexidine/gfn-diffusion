@@ -204,6 +204,7 @@ class CrystalReplayBuffer():
         if not hasattr(self, 'scores_np'):
             self.scores_np = self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(
                 len(self.dataset))).detach().cpu().view(-1).numpy()
+            self.build_sampler()
 
         else:
             self.scores_np = np.concatenate([
