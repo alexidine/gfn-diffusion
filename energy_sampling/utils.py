@@ -101,13 +101,13 @@ def get_gfn_forward_loss(mode, init_state, gfn_model, log_reward, coeff_matrix, 
         assert False
 
 
-def get_gfn_backward_loss(mode, samples, gfn_model, rewards, exploration_std=None, condition=None, repeats=10):
+def get_gfn_backward_loss(mode, samples, gfn_model, rewards, exploration_std=None, condition=None, repeats=10, return_exp = False):
     if mode == 'tb':
-        return bwd_tb(samples, gfn_model, rewards, exploration_std, condition=condition)
+        return bwd_tb(samples, gfn_model, rewards, exploration_std, condition=condition, return_exp=return_exp)
     elif mode == 'tb-avg':
-        return bwd_tb_avg(samples, gfn_model, rewards, exploration_std, condition=condition)
+        return bwd_tb_avg(samples, gfn_model, rewards, exploration_std, condition=condition, return_exp=return_exp)
     elif mode == 'cond-tb-avg':
-        return bwd_tb_avg_cond(samples, gfn_model, rewards, exploration_std, condition=condition, repeats=repeats)
+        return bwd_tb_avg_cond(samples, gfn_model, rewards, exploration_std, condition=condition, repeats=repeats, return_exp=return_exp)
     elif mode == 'mle':
         return bwd_mle(samples, gfn_model, rewards, exploration_std, condition=condition)
     else:

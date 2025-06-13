@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .architectures import *
-from utils import gaussian_params
+from utils import gaussian_params, get_gfn_init_state
 from mxtaltools.models.modules.components import scalarMLP
 
 logtwopi = math.log(2 * math.pi)
@@ -178,7 +178,7 @@ class GFN(nn.Module):
                 noise_backward = (s_ - mean) / var.sqrt()
                 logpb[:, self.trajectory_length - i - 1] = -0.5 * (noise_backward ** 2 + logtwopi + var.log()).sum(1)
             else:
-                s_ = torch.zeros_like(s)
+                s_ = get_gfn_init_state(len(s), s.shape[1], s.device)  # call initial state from function
 
             pfs, flow = self.predict_next_state(s_, (1. - (i + 1) * self.dt), condition)
             pf_mean, pflogvars = self.split_params(pfs)

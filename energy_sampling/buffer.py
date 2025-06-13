@@ -204,8 +204,6 @@ class CrystalReplayBuffer():
         if not hasattr(self, 'scores_np'):
             self.scores_np = self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(
                 len(self.dataset))).detach().cpu().view(-1).numpy()
-            self.build_sampler()
-
         else:
             self.scores_np = np.concatenate([
                 self.scores_np,
@@ -213,7 +211,7 @@ class CrystalReplayBuffer():
                     dataset,
                     temperature=torch.ones(len(dataset))).detach().cpu().view(-1).numpy()
             ])
-            self.build_sampler()
+        self.build_sampler()
 
         if len(self.dataset) > self.buffer_size:
             if hasattr(self, 'sampler'):
@@ -240,10 +238,15 @@ class CrystalReplayBuffer():
         else:
             return len(self.dataset)
 
-    def build_sampler(self):
+    def build_sampler(self):  # todo add pruning / sampling according to diversity. Expensive to repeat though.
         if self.prioritized == 'rank':
             ranks = np.argsort(np.argsort(-1 * self.scores_np))
-            weights = 1.0 / (1e-2 * len(self.scores_np) + ranks)
+            weights = 1.0 / (self.rank_weight * len(self.scores_np) + ranks)
+        elif self.prioritized == 'boltzmann':
+            logits = self.scores_np / 0.1
+            logits = logits - np.max(logits)  # subtract max for stability
+            weights_i = np.exp(logits)
+            weights = weights_i / np.sum(weights_i)
         else:
             weights = torch.ones(len(self.scores_np))
 
@@ -256,7 +259,7 @@ class CrystalReplayBuffer():
                return_conditioning: Optional[bool] = False,
                override_batch: Optional[int] = None):
 
-        assert return_conditioning or (temperature is not None), "Must provide temperature or generate it here"
+        assert return_conditioning or (temperature is not None), "Must provide temperature or generate it here with return_conditioning=True"
 
         if override_batch is not None and override_batch != self.loader.batch_size:  # manual resampling if we want a custom batch size
             if override_batch >= len(self.dataset):

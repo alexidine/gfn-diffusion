@@ -24,11 +24,11 @@ norm: null                   # null, "layer", "batch"
 
 batch_size: 25               # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 50           # maximum batch size to allow
+max_batch_size: 1000           # maximum batch size to allow
 eval_batch_size: 500        # batch size for evaluation
 epochs: 10000000             # number of training epochs: relatively large
 eval_period: 250              # how often to do evaluation & reporting
-figs_period: 500             # how often to log custom figrues
+figs_period: 1000             # how often to log custom figrues
 buffer_size: 100000          # size of replay buffer: relatively large
 
 # GFlowNet settings
@@ -53,8 +53,8 @@ gfn_clip: 10.0  # clip the maximumstep size induced by the policy model
 
 # local search settings
 ################################################################
-buffer_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
-molecules_path: 'D:/crystal_datasets/test_qm9_dataset.pt'
+buffer_path: '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt'
+molecules_path: '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt'
 
 # replay buffer / dataset settings
 ################################################################
