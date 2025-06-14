@@ -58,6 +58,7 @@ def eval_step(energy, gfn_model, batch_size, do_figures: bool = True, mol_batch=
     metrics['eval/silu_potential'] = sample_batch.silu_pot.mean().cpu().detach().numpy()
     metrics['eval/energy'] = sample_batch.gfn_energy.mean().cpu().detach().numpy()
     metrics['Crystal Log Temperature'] = condition[:, 0]
+    metrics['Crystal Mean Log Temperature'] = condition[:, 0].mean()
     metrics['Crystal Min Temperature'] = energy.min_temperature
     metrics['Crystal Max Temperature'] = energy.max_temperature
     metrics['Ellipsoid Scale'] = energy.ellipsoid_scale
@@ -461,7 +462,7 @@ def anneal_energy(energy_function, trigger: bool, min_temperature: float = 0.01)
 
     if trigger:  #slope > -1e-3 and curvature > -1e-1:  # if the loss isn't decaying fast enough / the loss is saturated
         if energy_function.temperature_scaling_factor > 0.01:
-            energy_function.temperature_scaling_factor *= 0.9
+            energy_function.temperature_scaling_factor *= 1.1
             print("Annealing energy function")
 
 

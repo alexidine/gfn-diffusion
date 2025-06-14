@@ -130,6 +130,25 @@ config_list.append(
         # controls relative frequency of higher vs lower temperatures (higher -> higher)
     }
 )
+config_list.append(
+    {
+        'mode_fwd': 'tb',
+        'mode_bwd': 'tb',
+        'bwd': False,
+        'both_ways': False,
+        'train_pb': False,
+        'anneal_energy': True,  # harden intermolecular repulsion over time
+        'energy_annealing_threshold': 1.0e-2,
+        'convergence_history': 1000,
+        'energy_density_coeff': 1,  # how much to weight the density penalty term in the energy function
+        'temperature_conditioning': True,
+        'energy_min_temperature': 0.01,
+        'energy_max_temperature': 10,
+        'energy_static_temperature': 1,
+        'temperature_scaling_factor': 0.1,
+        # controls relative frequency of higher vs lower temperatures (higher -> higher)
+    }
+)
 # config_list = [
 #     {
 #         'mode_fwd': "cond-tb-avg",
