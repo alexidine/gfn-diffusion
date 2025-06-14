@@ -461,8 +461,8 @@ def anneal_energy(energy_function, trigger: bool, min_temperature: float = 0.01)
     # curvature, _, _ = np.polyfit(np.arange(len(log_values)), values, 2)
 
     if trigger:  #slope > -1e-3 and curvature > -1e-1:  # if the loss isn't decaying fast enough / the loss is saturated
-        if energy_function.temperature_scaling_factor > 0.01:
-            energy_function.temperature_scaling_factor *= 1.1
+        if energy_function.temperature_scaling_factor < 2:
+            energy_function.temperature_scaling_factor *= 1.05
             print("Annealing energy function")
 
 
