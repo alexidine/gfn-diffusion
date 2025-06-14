@@ -56,22 +56,60 @@ for mode in modes:
         })
 
 config_list.append(
-{
-            'mode_fwd': 'cond-tb-avg',
-            'mode_bwd': 'cond-tb-avg',
-            'bwd': False,
-            'both_ways': True,
-            'train_pb': False,
-        }
+    {
+        'mode_fwd': 'cond-tb-avg',
+        'mode_bwd': 'cond-tb-avg',
+        'bwd': False,
+        'both_ways': True,
+        'train_pb': False,
+    }
 )
 config_list.append(
-{
-            'mode_fwd': 'tb',
-            'mode_bwd': 'tb',
-            'bwd': False,
-            'both_ways': True,
-            'train_pb': False,
-        }
+    {
+        'mode_fwd': 'tb',
+        'mode_bwd': 'tb',
+        'bwd': False,
+        'both_ways': True,
+        'train_pb': False,
+    }
+)
+config_list.append(
+    {
+        'mode_fwd': 'tb',
+        'mode_bwd': 'tb',
+        'bwd': False,
+        'both_ways': False,
+        'train_pb': False,
+        'anneal_energy': True,  # harden intermolecular repulsion over time
+        'energy_annealing_threshold': 5.0e-2,
+        'convergence_history': 1000,
+        'energy_density_coeff': 5,  # how much to weight the density penalty term in the energy function
+        'temperature_conditioning': True,
+        'energy_min_temperature': 0.01,
+        'energy_max_temperature': 10,
+        'energy_static_temperature': 1,
+        'temperature_scaling_factor': 3,
+        # controls relative frequency of higher vs lower temperatures (higher -> higher)
+    }
+)
+config_list.append(
+    {
+        'mode_fwd': 'cond-tb-avg',
+        'mode_bwd': 'cond-tb-avg',
+        'bwd': False,
+        'both_ways': False,
+        'train_pb': False,
+        'anneal_energy': True,  # harden intermolecular repulsion over time
+        'energy_annealing_threshold': 5.0e-2,
+        'convergence_history': 1000,
+        'energy_density_coeff': 5,  # how much to weight the density penalty term in the energy function
+        'temperature_conditioning': True,
+        'energy_min_temperature': 0.01,
+        'energy_max_temperature': 10,
+        'energy_static_temperature': 1,
+        'temperature_scaling_factor': 3,
+        # controls relative frequency of higher vs lower temperatures (higher -> higher)
+    }
 )
 # config_list = [
 #     {

@@ -219,7 +219,7 @@ def train():
                     joint_layers=args.joint_layers, dropout=args.dropout, norm=args.norm,
                     zero_init=args.zero_init, device=device).to(device)
 
-    wandb.watch(gfn_model, log_graph=True, log_freq=args.figs_period)  # for gradient logging
+    wandb.watch(gfn_model, log_graph=True, log_freq=500)  # for gradient logging
 
     gfn_optimizer = get_gfn_optimizer(gfn_model, args.lr_policy, args.lr_flow, args.lr_back, args.learn_pb,
                                       args.conditional_flow_model, args.use_weight_decay, args.weight_decay)
