@@ -40,11 +40,11 @@ energy: "molecular_crystal"  # "molecular_crystal"
 mode_fwd: "tb"               # "TB" is trajectory balance, "cond-tb-avg" is conditional VarGrad
 mode_bwd: "tb"               # "TB" is trajectory balance, "cond-tb-avg" is conditional VarGrad
 repeats: 10                  # for conditional VarGrad training
-both_ways: true              # forward and backward training
+both_ways: false              # forward and backward training
 bwd_batch_multiplier: 5      # ratio of backward to foward batch size (much cheaper to evaluate)
 fwd_train_each: 1            # how often to do forward training compared to backward
 bwd: false                   # backward training only
-learn_pb: true               # whether to learn a backward policy
+learn_pb: false               # whether to learn a backward policy
 conditional_flow_model: true # PROBABLY WILL NOT RUN IF FALSE, conditional training (currently doing temperature)
 learned_variance: true       # whether to learn policy variance
 partial_energy: false
@@ -79,9 +79,9 @@ energy_annealing_threshold: 1.0e-2
 convergence_history: 1000
 energy_density_coeff: 10  # how much to weight the density penalty term in the energy function
 temperature_conditioning: true
-energy_min_temperature: 0.1
-energy_max_temperature: 0.10001
-energy_static_temperature: 1
+energy_min_temperature: 0.01
+energy_max_temperature: 10
+energy_static_temperature: 0.1
 temperature_scaling_factor: 1  # controls relative frequency of higher vs lower temperatures (higher -> higher)
 
 

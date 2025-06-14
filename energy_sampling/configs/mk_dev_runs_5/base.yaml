@@ -43,7 +43,7 @@ repeats: 10                  # for conditional VarGrad training
 both_ways: false              # forward and backward training
 bwd_batch_multiplier: 5     # ratio of backward to foward batch size
 fwd_train_each: 1            # how often to do forward training compared to backward
-bwd: true                   # backward training only
+bwd: false                   # backward training only
 learn_pb: true               # whether to learn a backward policy
 conditional_flow_model: true # PROBABLY WILL NOT RUN IF FALSE, conditional training (currently doing temperature)
 learned_variance: true       # whether to learn policy variance
@@ -82,7 +82,7 @@ temperature_conditioning: true
 energy_min_temperature: 0.1
 energy_max_temperature: 0.10001
 energy_static_temperature: 1
-temperature_scaling_factor: 1  # controls relative frequency of higher vs lower temperatures (higher -> higher)
+temperature_scaling_factor: 1  # controls relative frequency of higher vs lower temperatures (lower -> higher)
 
 
 # deprecated or un-used

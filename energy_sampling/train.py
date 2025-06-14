@@ -58,6 +58,11 @@ def eval_step(energy, gfn_model, batch_size, do_figures: bool = True, mol_batch=
     metrics['eval/silu_potential'] = sample_batch.silu_pot.mean().cpu().detach().numpy()
     metrics['eval/energy'] = sample_batch.gfn_energy.mean().cpu().detach().numpy()
     metrics['Crystal Log Temperature'] = condition[:, 0]
+    metrics['Crystal Min Temperature'] = energy.min_temperature
+    metrics['Crystal Max Temperature'] = energy.max_temperature
+    metrics['Ellipsoid Scale'] = energy.ellipsoid_scale
+    metrics['Temperature Scaling Factor'] = energy.temperature_scaling_factor
+    metrics['Density Loss Coefficient'] = energy.density_coeff
     #metrics['eval/ellipsoid_overlap'] = sample_batch.ellipsoid_overlap.mean().cpu().detach().numpy()
 
     "Custom Figures"
