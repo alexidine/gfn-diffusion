@@ -272,25 +272,26 @@ def train():
         times['train_step_end'] = time()
 
         if (i % args.eval_period == 0 and i > 0) or i == 50:
+            metrics.update({'lr': gfn_optimizer.param_groups[0]['lr']})
+            torch.save(gfn_model.state_dict(), f'{name}model.pt')
+
             metrics = do_evaluation(energy_function, energy_record, gfn_model, i, learned_Z_record,
                                     metrics, mol_loader)
+
             if prev_rewards_dist is None:
                 prev_rewards_dist = metrics['sample reward distribution']
-            metrics.update({'lr': gfn_optimizer.param_groups[0]['lr']})
+            else:
+                """anneal reward function"""
+                if args.anneal_energy:
+                    anneal_energy_function(energy_function,
+                                           loss_record,
+                                           metrics['sample reward distribution'],
+                                           prev_rewards_dist,
+                                           args.convergence_history,
+                                           args.energy_annealing_threshold)
+                    prev_rewards_dist = metrics['sample reward distribution']
 
             wandb.log(metrics, step=i)
-
-        if i % 100 == 0 and i > 0:
-            torch.save(gfn_model.state_dict(), f'{name}model.pt')
-            if args.energy == 'molecular_crystal' and args.anneal_energy:
-                anneal_energy_function(energy_function,
-                                       loss_record,
-                                       metrics['sample reward distribution'],
-                                       prev_rewards_dist,
-                                       args.convergence_history,
-                                       args.energy_annealing_threshold)
-                prev_rewards_dist = metrics['sample reward distribution']
-
 
         elif i % 10 == 0:
             metrics.update(log_elapsed_times())
