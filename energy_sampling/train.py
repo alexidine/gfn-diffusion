@@ -2,26 +2,24 @@ import gc
 import os
 from time import time
 
-import plotly.graph_objects as go
 import numpy as np
+import plotly.graph_objects as go
 import torch
 import wandb
-from mxtaltools.reporting.online import simple_cell_hist, simple_cell_scatter_fig, log_crystal_samples, \
-    simple_embedding_fig
 from mxtaltools.dataset_utils.data_classes import MolData
 from mxtaltools.dataset_utils.utils import collate_data_list
+from mxtaltools.reporting.online import simple_cell_hist, simple_cell_scatter_fig, log_crystal_samples, \
+    simple_embedding_fig
 from torch.optim import lr_scheduler
 from torch_geometric.loader import DataLoader
 from tqdm import trange
 
 from buffer import CrystalReplayBuffer
 from energies.molecular_crystal import MolecularCrystal
-from utils import anneal_energy_function
 from evaluations import log_partition_function
 from models import GFN
 from plot_utils import get_plotly_fig_size_mb
-from utils import get_train_args, get_gfn_init_state
-from utils import set_seed, cal_subtb_coef_matrix, get_gfn_optimizer, get_gfn_forward_loss, \
+from utils import get_train_args, get_gfn_init_state, anneal_energy_function, set_seed, cal_subtb_coef_matrix, get_gfn_optimizer, get_gfn_forward_loss, \
     get_gfn_backward_loss, get_exploration_std
 
 args = get_train_args()
