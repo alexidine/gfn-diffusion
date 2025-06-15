@@ -52,8 +52,8 @@ lr_shrink_lambda: 0.9995
 ls_cycle: 100
 max_batch_size: 1000
 max_iter_ls: 100
-mode_bwd: cond-tb_avg
-mode_fwd: cond-tb_avg
+mode_bwd: cond-tb-avg
+mode_fwd: cond-tb-avg
 molecules_path: D:/crystal_datasets/test_qm9_dataset.pt
 norm: layer
 partial_energy: false

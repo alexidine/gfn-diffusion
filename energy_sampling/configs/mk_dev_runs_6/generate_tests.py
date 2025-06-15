@@ -33,8 +33,8 @@ config_list = []
 
 config_list.append(
     {
-        'mode_fwd': 'cond-tb_avg',
-        'mode_bwd': 'cond-tb_avg',
+        'mode_fwd': 'cond-tb-avg',
+        'mode_bwd': 'cond-tb-avg',
         'bwd': False,
         'both_ways': False,
         'train_pb': False,
