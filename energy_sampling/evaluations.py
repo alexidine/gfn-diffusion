@@ -15,7 +15,7 @@ def log_partition_function(initial_state, gfn, energy, mol_batch):
     log_Z_lb = log_weight.mean()
     log_Z_learned = log_fs[:, 0].mean()
 
-    return states[:, -1], log_Z, log_Z_lb, log_Z_learned, sample_batch, condition
+    return states[:, -1], log_r, log_Z, log_Z_lb, log_Z_learned, sample_batch, condition
 
 
 @torch.no_grad()

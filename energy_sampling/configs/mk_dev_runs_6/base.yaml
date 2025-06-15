@@ -1,20 +1,20 @@
-run_name: 'mk_local_dev'
+run_name: 'mk_dev_runs_6'
 seed: 12345
 device: 'cuda'
-lr_policy: 0.0001              # learning rate of the policy network
+lr_policy: 0.0005              # learning rate of the policy network
 lr_flow: 0.01                  # learning rate of the flow network
-lr_back: 0.0001                # learning rate of the backward pass
+lr_back: 0.0005                # learning rate of the backward pass
 weight_decay: 1e-7
 use_weight_decay: false
 scheduler: True
 lr_shrink_lambda: 0.9995
-gradient_norm_clip: 1.0        # gradient norm clip for updating gfn model weights
+gradient_norm_clip: 10.0        # gradient norm clip for updating gfn model weights
 
 # model parameters
 zero_init: false
 
 joint_layers: 4              # number of layers in forward/backward policy models
-hidden_dim: 128              # dimensionality of hidden layer
+hidden_dim: 256              # dimensionality of hidden layer
 s_emb_dim: 32                # dimensionality of state embedding
 t_emb_dim: 32                # dimensionality of time embedding
 harmonics_dim: 32            # dimensionality of harmonic embedding
@@ -24,11 +24,11 @@ norm: layer                   # null, "layer", "batch"
 
 batch_size: 25               # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 50           # maximum batch size to allow
-eval_batch_size: 1000        # batch size for evaluation
+max_batch_size: 1000           # maximum batch size to allow
+eval_batch_size: 2000        # batch size for evaluation
 epochs: 10000000             # number of training epochs: relatively large
-eval_period: 50              # how often to do evaluation & reporting
-figs_period: 100             # how often to log custom figrues
+eval_period: 250              # how often to do evaluation & reporting
+figs_period: 500             # how often to log custom figrues
 buffer_size: 100000          # size of replay buffer: relatively large
 
 # GFlowNet settings
@@ -70,12 +70,11 @@ exploratory: true
 exploration_factor: 0.35
 exploration_wd: true
 
-
 # molecular crystal settings
 ################################################################
 # scales the energy function
 anneal_energy: true  # harden intermolecular repulsion over time
-energy_annealing_threshold: 1.0e-1 # 5.0e-2
+energy_annealing_threshold: 5.0e-2 # 5.0e-2
 convergence_history: 100
 energy_density_coeff: 10  # how much to weight the density penalty term in the energy function
 temperature_conditioning: true

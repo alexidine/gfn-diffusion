@@ -1,14 +1,17 @@
-from argparse import Namespace
 import argparse
-import random
-from pathlib import Path
-
-import numpy as np
 import math
+import random
+from argparse import Namespace
+from pathlib import Path
+from scipy.spatial.distance import jensenshannon
+
 import PIL
+import numpy as np
+import torch
 import yaml
 
-from gflownet_losses import *
+from energy_sampling.gflownet_losses import fwd_tb, fwd_tb_avg, fwd_tb_avg_cond, db, subtb, bwd_tb, bwd_tb_avg, \
+    bwd_tb_avg_cond, bwd_mle
 
 
 def set_seed(seed):
@@ -101,13 +104,15 @@ def get_gfn_forward_loss(mode, init_state, gfn_model, log_reward, coeff_matrix, 
         assert False
 
 
-def get_gfn_backward_loss(mode, samples, gfn_model, rewards, exploration_std=None, condition=None, repeats=10, return_exp = False):
+def get_gfn_backward_loss(mode, samples, gfn_model, rewards, exploration_std=None, condition=None, repeats=10,
+                          return_exp=False):
     if mode == 'tb':
         return bwd_tb(samples, gfn_model, rewards, exploration_std, condition=condition, return_exp=return_exp)
     elif mode == 'tb-avg':
         return bwd_tb_avg(samples, gfn_model, rewards, exploration_std, condition=condition, return_exp=return_exp)
     elif mode == 'cond-tb-avg':
-        return bwd_tb_avg_cond(samples, gfn_model, rewards, exploration_std, condition=condition, repeats=repeats, return_exp=return_exp)
+        return bwd_tb_avg_cond(samples, gfn_model, rewards, exploration_std, condition=condition, repeats=repeats,
+                               return_exp=return_exp)
     elif mode == 'mle':
         return bwd_mle(samples, gfn_model, rewards, exploration_std, condition=condition)
     else:
@@ -301,6 +306,7 @@ def load_yaml(path):
 
     return target_dict
 
+
 def dict2namespace(data_dict: dict):
     """
     Recursively converts a dictionary and its internal dictionaries into an
@@ -325,9 +331,101 @@ def dict2namespace(data_dict: dict):
 
     return data_namespace
 
+
 def get_gfn_init_state(batch_size, ndim, device):
     #return torch.zeros(batch_size, ndim).to(device)  # old init state
     init_state = torch.zeros(batch_size, ndim).to(device)
     init_state[:,
     :3] += 3  # bias length dimensions upwards, which improves early training by avoiding super-dense initial states
     return init_state
+
+
+def anneal_energy_function(energy_function,
+                           loss_record,
+                           log_r,
+                           prev_log_r,
+                           convergence_history,
+                           cutoff
+                           ):
+    checks = {}
+
+    """loss slope"""
+    loss_array = loss_record[-convergence_history:]
+    loss_slope, _ = np.polyfit(np.arange(len(loss_array)), loss_array, 1)
+    checks["loss_slope"] = loss_slope
+
+    """js divergence"""
+    checks['js_div'] = js_1d(log_r, prev_log_r)
+
+    """1d EMD"""
+    mu1 = log_r.mean()
+    mu2 = prev_log_r.mean()
+    harmonic_mean = mu1 * mu2 / (mu1 + mu2 + 1e-3)
+    checks['emd'] = wasserstein_1d(log_r, prev_log_r) / harmonic_mean
+
+    # slope cannot be positive
+    # cutoffs must scan
+    trigger = (checks['loss_slope'] <= 0) and \
+              (checks['js_div'] <= cutoff) and \
+              (np.abs(checks['emd']) <= 2 * cutoff)
+
+    if trigger:
+        if energy_function.temperature_scaling_factor < 2:
+            energy_function.temperature_scaling_factor *= 1.05
+            print("Annealing energy function")
+
+
+def relative_slope(y):
+    if len(y) < 2 or np.ptp(y) == 0:
+        return 0.0  # avoid division by zero or meaningless fit
+    slope, _ = np.polyfit(np.arange(len(y)), y, 1)
+    return abs(slope) / np.std(y)
+
+
+def wasserstein_1d(samples_a, samples_b):
+    """
+    Computes the 1D Wasserstein-1 (Earth Mover's) distance between two empirical distributions.
+
+    Parameters
+    ----------
+    samples_a : array-like
+        1D array of samples from the first distribution.
+    samples_b : array-like
+        1D array of samples from the second distribution.
+
+    Returns
+    -------
+    float
+        The Wasserstein-1 distance (mean absolute difference between sorted CDFs).
+    """
+    a_sorted = np.sort(samples_a)
+    b_sorted = np.sort(samples_b)
+
+    # Pad with repeated values if unequal lengths
+    n = max(len(a_sorted), len(b_sorted))
+    if len(a_sorted) != n:
+        a_sorted = np.interp(np.linspace(0, 1, n), np.linspace(0, 1, len(a_sorted)), a_sorted)
+    if len(b_sorted) != n:
+        b_sorted = np.interp(np.linspace(0, 1, n), np.linspace(0, 1, len(b_sorted)), b_sorted)
+
+    return np.mean(np.abs(a_sorted - b_sorted))
+
+
+def js_1d(samples_a, samples_b):
+    # Same bins for both distributions
+    all_vals = np.concatenate([samples_a, samples_b])
+    bins = np.histogram_bin_edges(all_vals, bins='fd')
+
+    p_hist, _ = np.histogram(samples_a, bins=bins, density=True)
+    q_hist, _ = np.histogram(samples_b, bins=bins, density=True)
+
+    # Normalize and clip for numerical stability
+    p_hist = np.clip(p_hist, 1e-10, None)
+    q_hist = np.clip(q_hist, 1e-10, None)
+
+    p_hist /= p_hist.sum()
+    q_hist /= q_hist.sum()
+
+    js_div = jensenshannon(p_hist, q_hist) ** 2
+
+    return js_div
