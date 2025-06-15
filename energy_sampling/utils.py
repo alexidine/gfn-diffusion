@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import yaml
 
-from energy_sampling.gflownet_losses import fwd_tb, fwd_tb_avg, fwd_tb_avg_cond, db, subtb, bwd_tb, bwd_tb_avg, \
+from gflownet_losses import fwd_tb, fwd_tb_avg, fwd_tb_avg_cond, db, subtb, bwd_tb, bwd_tb_avg, \
     bwd_tb_avg_cond, bwd_mle
 
 

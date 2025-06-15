@@ -46,7 +46,7 @@ lgv_layers: 4
 local_search: false
 log_var_range: 4.0
 lr_back: 0.0005
-lr_flow: 0.01
+lr_flow: 0.001
 lr_policy: 0.0005
 lr_shrink_lambda: 0.9995
 ls_cycle: 100
