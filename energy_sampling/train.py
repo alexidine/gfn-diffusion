@@ -16,7 +16,7 @@ from tqdm import trange
 
 from buffer import CrystalReplayBuffer
 from energies.molecular_crystal import MolecularCrystal
-from energy_sampling.utils import anneal_energy_function
+from utils import anneal_energy_function
 from evaluations import log_partition_function
 from models import GFN
 from plot_utils import get_plotly_fig_size_mb
