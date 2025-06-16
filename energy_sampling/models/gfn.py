@@ -67,9 +67,10 @@ class GFN(nn.Module):
                                                         layers=1,
                                                         filters=hidden_dim,
                                                         output_dim=condition_embedding_dim)
-            # self.flow_model = FlowModel(condition_embedding_dim, hidden_dim, 1,
-            #                             norm='layer', dropout=0)
-            self.flow_model = LearnableScalar()
+            self.flow_model = FlowModel(
+                condition_embedding_dim, hidden_dim, 1,
+                                         norm='layer', dropout=0)
+            #self.flow_model = LearnableScalar()
         else:
             self.flow_model = torch.nn.Parameter(torch.tensor(0.).to(self.device))
 
