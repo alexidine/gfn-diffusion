@@ -61,11 +61,15 @@ class GFN(nn.Module):
         self.pb_scale_range = pb_scale_range
 
         if self.conditional_flow_model:
-            self.conditions_embedding_model = scalarMLP(input_dim=conditions_dim, norm=None, dropout=0,
-                                                        layers=1, filters=hidden_dim,
+            self.conditions_embedding_model = scalarMLP(input_dim=conditions_dim,
+                                                        norm=None,
+                                                        dropout=0,
+                                                        layers=1,
+                                                        filters=hidden_dim,
                                                         output_dim=condition_embedding_dim)
-            self.flow_model = FlowModel(condition_embedding_dim, hidden_dim, 1,
-                                        norm='layer', dropout=0)
+            # self.flow_model = FlowModel(condition_embedding_dim, hidden_dim, 1,
+            #                             norm='layer', dropout=0)
+            self.flow_model = LearnableScalar()
         else:
             self.flow_model = torch.nn.Parameter(torch.tensor(0.).to(self.device))
 
@@ -93,18 +97,19 @@ class GFN(nn.Module):
             state_update = torch.clip(state_update, -self.gfn_clip, self.gfn_clip)
         return state_update, log_flow.squeeze(-1)
 
-    def get_trajectory_fwd(self, state, exploration_std, log_r, condition):
-        batch_size = state.shape[0]
+    def get_trajectory_fwd(self, initial_state, exploration_std, log_r, condition):
+        batch_size = initial_state.shape[0]
 
         logpf = torch.zeros((batch_size, self.trajectory_length), device=self.device)
         logpb = torch.zeros((batch_size, self.trajectory_length), device=self.device)
         logf = torch.zeros((batch_size, self.trajectory_length + 1), device=self.device)
         states = torch.zeros((batch_size, self.trajectory_length + 1, self.dim), device=self.device)
+        states[:, 0] = initial_state.detach()  # set correct initial state
 
         for i in range(self.trajectory_length):
-            state_update, log_flow = self.predict_next_state(state, i * self.dt, condition)
-            pf_mean, pflogvars = self.split_params(state_update)  # drift and log variance terms
+            state_update, log_flow = self.predict_next_state(initial_state, i * self.dt, condition)
 
+            pf_mean, pflogvars = self.split_params(state_update)  # drift and log variance terms
             logf[:, i] = log_flow
 
             if exploration_std is None:
@@ -117,12 +122,13 @@ class GFN(nn.Module):
                     add_log_var = torch.full_like(pflogvars, np.log(exploration_std(i) / np.sqrt(self.dt)) * 2)
                     pflogvars_sample = torch.logaddexp(pflogvars, add_log_var).detach()
 
-            next_state = state + self.dt * pf_mean.detach() + np.sqrt(self.dt) * (
-                    pflogvars_sample / 2).exp() * torch.randn_like(state, device=self.device)
+            next_state = (initial_state +
+                          self.dt * pf_mean.detach() +
+                          np.sqrt(self.dt) * (pflogvars_sample / 2).exp() * torch.randn_like(initial_state, device=self.device))
 
-            noise = ((next_state - state) - self.dt * pf_mean) / (
-                        np.sqrt(self.dt) * (pflogvars / 2).exp())  # seems unnecessary, as we have the noise above
-            logpf[:, i] = -0.5 * (noise ** 2 + logtwopi + np.log(self.dt) + pflogvars).sum(1)
+            # need to back the noise out explicitly here to get gradients to pf_mean and pflogvars
+            noise = ((next_state - initial_state) - self.dt * pf_mean) / (np.sqrt(self.dt) * (pflogvars / 2).exp())
+            logpf[:, i] = -0.5 * (noise ** 2 + logtwopi + np.log(self.dt) + pflogvars).sum(1)  # TODO check expression
 
             if self.learn_pb:
                 t = self.t_model((i + 1) * self.dt).repeat(batch_size, 1)
@@ -138,13 +144,18 @@ class GFN(nn.Module):
                 back_mean_correction, back_var_correction = torch.ones_like(next_state), torch.ones_like(next_state)
 
             if i > 0:
-                back_mean = next_state - self.dt * next_state / ((i + 1) * self.dt) * back_mean_correction
+                # back_mean = next_state - self.dt * next_state / ((i + 1) * self.dt) * back_mean_correction
+                # back_var = (self.pf_std_per_traj ** 2) * self.dt * i / (i + 1) * back_var_correction
+
+                # correcting and simplifying - the second term corrects for the nonzero initial state
+                back_mean = (i/(i+1) * next_state + 1/(i+1) * initial_state) * back_mean_correction
                 back_var = (self.pf_std_per_traj ** 2) * self.dt * i / (i + 1) * back_var_correction
-                noise_backward = (state - back_mean) / back_var.sqrt()
+
+                noise_backward = (initial_state - back_mean) / back_var.sqrt()
                 logpb[:, i] = -0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1)
 
-            state = next_state
-            states[:, i + 1] = state
+            initial_state = next_state
+            states[:, i + 1] = initial_state
 
         return states, logpf, logpb, logf
 

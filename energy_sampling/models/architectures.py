@@ -186,6 +186,16 @@ class JointPolicy(nn.Module):
         return self.model(torch.cat([s, t], dim=-1))
 
 
+
+class LearnableScalar(nn.Module):
+    def __init__(self, init_value=0.0, device=None):
+        super().__init__()
+        self.scalar = nn.Parameter(torch.tensor(init_value, device=device))
+
+    def forward(self, *args, **kwargs):
+        return self.scalar
+
+
 class FlowModel(nn.Module):
     def __init__(self, conditioning_dim: int,
                  hidden_dim: int = 64,

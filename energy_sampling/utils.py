@@ -70,7 +70,10 @@ def get_gfn_optimizer(gfn_model, lr_policy, lr_flow, lr_back, back_model=False, 
                     {'params': gfn_model.joint_model.parameters()},
                     ]
     if conditional_flow_model:
-        param_groups += [{'params': gfn_model.flow_model.parameters(), 'lr': lr_flow}]
+        param_groups += [{'params': gfn_model.flow_model.parameters(),
+                          'lr': lr_flow}]
+        param_groups += [{'params': gfn_model.conditions_embedding_model.parameters(),
+                          'lr': lr_policy}]
     else:
         param_groups += [{'params': [gfn_model.flow_model], 'lr': lr_flow}]
 
@@ -370,9 +373,10 @@ def anneal_energy_function(energy_function,
               (np.abs(checks['emd']) <= 2 * cutoff)
 
     if trigger:
-        if energy_function.temperature_scaling_factor < 2:
-            energy_function.temperature_scaling_factor *= 1.05
-            print("Annealing energy function")
+        if energy_function.min_temperature > 0.01: #energy_function.temperature_scaling_factor < 2:
+            energy_function.min_temperature *= 0.95
+            energy_function.max_temperature *= 0.95
+            #energy_function.temperature_scaling_factor *= 1.05
 
 
 def relative_slope(y):

@@ -262,11 +262,7 @@ class CrystalReplayBuffer():
         assert return_conditioning or (temperature is not None), "Must provide temperature or generate it here with return_conditioning=True"
 
         if override_batch is not None and override_batch != self.loader.batch_size:  # manual resampling if we want a custom batch size
-            if override_batch >= len(self.dataset):
-                rand_inds = np.random.randint(len(self.dataset), override_batch)
-            else:
-                rand_inds = np.random.choice(len(self.dataset), override_batch, replace=False)
-
+            rand_inds = np.random.randint(len(self.dataset), size=override_batch)
             sample = collate_data_list([self.loader.dataset[ind] for ind in rand_inds])
         else:
             sample = next(iter(self.loader))

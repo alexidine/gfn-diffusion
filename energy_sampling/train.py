@@ -8,17 +8,14 @@ import torch
 import wandb
 from mxtaltools.dataset_utils.data_classes import MolData
 from mxtaltools.dataset_utils.utils import collate_data_list
-from mxtaltools.reporting.online import simple_cell_hist, simple_cell_scatter_fig, log_crystal_samples, \
-    simple_embedding_fig
 from torch.optim import lr_scheduler
 from torch_geometric.loader import DataLoader
 from tqdm import trange
 
 from buffer import CrystalReplayBuffer
 from energies.molecular_crystal import MolecularCrystal
-from evaluations import log_partition_function
+from evaluations import eval_step
 from models import GFN
-from plot_utils import get_plotly_fig_size_mb
 from utils import get_train_args, get_gfn_init_state, anneal_energy_function, set_seed, cal_subtb_coef_matrix, get_gfn_optimizer, get_gfn_forward_loss, \
     get_gfn_backward_loss, get_exploration_std
 
@@ -40,87 +37,11 @@ if args.local_search:
 times = {}
 
 
-def eval_step(energy, gfn_model, batch_size, do_figures: bool = True, mol_batch=None):
-    gfn_model.eval()
-
-    metrics = {}
-    fig_dict = {}
-    init_state = get_gfn_init_state(batch_size, energy.data_ndim, device)
-    samples, log_r, log_Z, log_Z_lb, log_Z_learned, sample_batch, condition = log_partition_function(
-        init_state, gfn_model, energy, mol_batch)
-
-    "Scalar metrics"
-    metrics['eval/log_Z'] = log_Z.cpu().detach().numpy()
-    metrics['eval/log_Z_lb'] = log_Z_lb.cpu().detach().numpy()
-    metrics['eval/log_Z_learned'] = log_Z_learned.cpu().detach().numpy()
-    metrics['eval/packing_coeff'] = sample_batch.packing_coeff.mean().cpu().detach().numpy()
-    metrics['eval/silu_potential'] = sample_batch.silu_pot.mean().cpu().detach().numpy()
-    metrics['mean sample energy'] = sample_batch.gfn_energy.mean().cpu().detach().numpy()
-    metrics['sample energy distribution'] = sample_batch.gfn_energy.cpu().detach().numpy()
-    metrics['mean sample reward'] = log_r.mean().cpu().detach().numpy()
-    metrics['sample reward distribution'] = log_r.cpu().detach().numpy()
-    metrics['Crystal Log Temperature'] = condition[:, 0]
-    metrics['Crystal Mean Log Temperature'] = condition[:, 0].mean()
-    metrics['Crystal Min Temperature'] = energy.min_temperature
-    metrics['Crystal Max Temperature'] = energy.max_temperature
-    metrics['Ellipsoid Scale'] = energy.ellipsoid_scale
-    metrics['Temperature Scaling Factor'] = energy.temperature_scaling_factor
-    metrics['Density Loss Coefficient'] = energy.density_coeff
-    #metrics['eval/ellipsoid_overlap'] = sample_batch.ellipsoid_overlap.mean().cpu().detach().numpy()
-
-    "Custom Figures"
-    if do_figures:
-        # todo figs to add
-        # pairwise dists to eval sample and dataset
-        # RDF dists of same
-        # clustering / mode counting / basin counting/mapping
-        # known mode coverage
-        # diversity vs T / E
-        if args.conditional_flow_model:  # todo update this with molecule conditioning when the time comes
-            log_temps = torch.linspace(-2, 2, 100).to(args.device)[:, None].flatten()
-            Z_at_T = gfn_model.flow_model(
-                gfn_model.conditions_embedding_model(log_temps[:, None])).cpu().detach().flatten()
-            fig = go.Figure(go.Scatter(x=log_temps.cpu().detach(), y=Z_at_T.cpu().detach(), mode='lines+markers'))
-            fig.update_layout(xaxis_title='Log Temperature', yaxis_title='Log Partition Function')
-            fig_dict['Learned Z vs T'] = fig
-
-            fig = go.Figure()
-            fig.add_histogram2d(x=condition[:, 0].cpu().detach().numpy(),
-                                y=sample_batch.gfn_energy.cpu().detach().numpy(),
-                                showscale=False,
-                                nbinsx=25, nbinsy=50)
-            fig.update_layout(xaxis_title='Log Temperature', yaxis_title='Sample Energy')
-            fig_dict['T vs Energy'] = fig
-
-        fig_dict['Lattice Features Distribution'] = simple_cell_hist(sample_batch)
-        fig_dict['Sample Scatter'] = simple_cell_scatter_fig(sample_batch,
-                                                             (condition[:,
-                                                              0].cpu().detach().numpy()) if condition is not None else None,
-                                                             aux_scalar_name='log_temperature' if condition is not None else None)
-        fig_dict['Sample Embedding'] = simple_embedding_fig(sample_batch,
-                                                            sample_batch.silu_pot.cpu().detach().numpy())  #condition[:, 0].cpu().detach().numpy() if condition is not None else None)
-        for key in fig_dict.keys():
-            fig = fig_dict[key]
-            if get_plotly_fig_size_mb(fig) > 1:  # bigger than 1 MB
-                fig.write_image(key + 'fig.png', width=1024,
-                                height=512)  # save the image rather than the fig, for size reasons
-                fig_dict[key] = wandb.Image(key + 'fig.png')
-        metrics.update(fig_dict)
-
-    "Crystal samples"
-    samples_to_log = log_crystal_samples(sample_batch=sample_batch)
-    [wandb.log({f'crystal_sample_{ind}': samples_to_log[ind]}, commit=False) for ind in range(len(samples_to_log))]
-
-    gfn_model.train()
-    return metrics
-
-
 def train_step(energy_function, gfn_model, gfn_optimizer, it, exploratory, buffer, mol_loader, exploration_factor,
                exploration_wd, repeats: int = 10):
     gfn_model.zero_grad()
-    wd_max_steps = 20000
+    wd_max_steps = args.wd_max_steps
 
-    # todo make this a tensor, variable throughout the batch
     exploration_std = get_exploration_std(it, exploratory, wd_max_steps, exploration_factor, exploration_wd)
 
     do_forward = False
@@ -158,11 +79,11 @@ def train_step(energy_function, gfn_model, gfn_optimizer, it, exploratory, buffe
     else:
         assert False
 
-    loss.backward()  # todo add detailed reporting on flow matching and trajectories
+    loss.backward()  # todo add reporting of flow distributions
     torch.nn.utils.clip_grad_norm_(gfn_model.parameters(),
                                    args.gradient_norm_clip)  # gradient clipping
-    gfn_optimizer.step()
-    return loss.item(), exploration_std(0)
+    gfn_optimizer.step()  # todo add R-value type loss, normed MAE
+    return loss.item(), exploration_std(0) if exploration_std is not None else None
 
 
 def fwd_train_step(energy_function, gfn_model, exploration_std, mol_batch, return_exp=False, repeats: int = 10):
@@ -311,7 +232,7 @@ def init_buffers_datasets(energy_function):
         beta=args.beta,
         rank_weight=args.rank_weight,
         prioritized=args.prioritized)
-    if args.learn_pb and args.buffer_path is not None:  # preload samples into the buffer
+    if (args.learn_pb or args.both_ways or args.bwd) and args.buffer_path is not None:  # preload samples into the buffer
         buffer = add_dataset_to_buffer(args.buffer_path, buffer)
     # load dataset of just molecules
     # mols_list = torch.load(args.molecules_path)
@@ -406,7 +327,14 @@ def do_evaluation(energy_function, energy_record, gfn_model, i, learned_Z_record
     eval_rands = np.random.randint(len(mol_loader.dataset), size=eval_batch_size)
     mol_batch = collate_data_list([mol_loader.dataset[ind] for ind in eval_rands]).to(device)
 
-    metrics.update(eval_step(energy_function, gfn_model, eval_batch_size, do_figures, mol_batch))
+    init_state = get_gfn_init_state(eval_batch_size, energy_function.data_ndim, args.device)
+    metrics.update(
+        eval_step(energy_function,
+                  gfn_model,
+                  init_state,
+                  do_figures,
+                  mol_batch,
+                  args.conditional_flow_model))
 
     energy_record.append(metrics['mean sample energy'])
     learned_Z_record.append(metrics['eval/log_Z_learned'])
