@@ -27,7 +27,7 @@ class MolecularCrystal(BaseSet):
         self.data_ndim = dim
         self.space_group = space_group
 
-        self.ellipsoid_scale = 1
+        self.ellipsoid_scale = 0.8
         self.density_coeff = density_coeff
         self.max_temperature = max_temperature
         self.min_temperature = min_temperature
