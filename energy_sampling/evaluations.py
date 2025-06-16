@@ -81,7 +81,7 @@ def eval_step(energy_function,
     metrics['Density Loss Coefficient'] = energy_function.density_coeff
     if hasattr(sample_batch, 'ellipsoid_overlap'):
         metrics['mean ellipsoid overlap'] = sample_batch.ellipsoid_overlap.mean().cpu().detach().numpy()
-        metrics['ellipsoid overlap'] = sample_batch.log10().ellipsoid_overlap.cpu().detach().numpy()
+        metrics['ellipsoid overlap'] = sample_batch.ellipsoid_overlap.log10().cpu().detach().numpy()
 
     "Custom Figures"
     if do_figures:
