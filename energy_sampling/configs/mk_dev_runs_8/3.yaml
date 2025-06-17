@@ -23,7 +23,7 @@ energy_min_temperature: 0.01
 energy_static_temperature: 1
 epochs: 10000000
 eval: false
-eval_batch_size: 1000
+eval_batch_size: 2000
 eval_period: 250
 exploration_factor: 0.5
 exploration_wd: true
@@ -51,7 +51,7 @@ lr_flow: 0.01
 lr_policy: 0.0001
 lr_shrink_lambda: 0.9995
 ls_cycle: 100
-max_batch_size: 1000
+max_batch_size: 4000
 max_iter_ls: 100
 mode_bwd: tb
 mode_fwd: tb
