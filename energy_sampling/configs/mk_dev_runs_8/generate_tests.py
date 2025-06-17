@@ -41,10 +41,10 @@ config_list.append(
         'convergence_history': 500,
         'energy_density_coeff': 1,  # how much to weight the density penalty term in the energy function
         'temperature_conditioning': True,
-        'energy_min_temperature': 0.99999,
-        'energy_max_temperature': 1.0,
+        'energy_min_temperature': 0.01,
+        'energy_max_temperature': 10,
         'energy_static_temperature': 1,
-        'temperature_scaling_factor': 1,
+        'temperature_scaling_factor': 0.01,
         'joint_layers': 4,
         'hidden_dim': 256,
         'norm': None,
@@ -52,8 +52,9 @@ config_list.append(
         'T': 10,
         'pb_scale_range': 0.1,
         't_scale': 1.0,
-        'exploration_factor': 0.35,
+        'exploration_factor': 0.5,
         'wd_max_steps': 2000,
+        'annealing_max_steps': 10000,
     } #0
 )
 config_list.append(
@@ -68,19 +69,20 @@ config_list.append(
         'convergence_history': 500,
         'energy_density_coeff': 1,  # how much to weight the density penalty term in the energy function
         'temperature_conditioning': True,
-        'energy_min_temperature': 0.99999,
-        'energy_max_temperature': 1.0,
+        'energy_min_temperature': 0.01,
+        'energy_max_temperature': 10,
         'energy_static_temperature': 1,
-        'temperature_scaling_factor': 1,
+        'temperature_scaling_factor': 0.01,
         'joint_layers': 4,
         'hidden_dim': 256,
         'norm': None,
         'dropout': 0,
-        'T': 50,
+        'T': 10,
         'pb_scale_range': 0.1,
         't_scale': 1.0,
-        'exploration_factor': 0.35,
+        'exploration_factor': 0.5,
         'wd_max_steps': 2000,
+        'annealing_max_steps': 5000,
     } #1
 )
 config_list.append(
@@ -95,10 +97,10 @@ config_list.append(
         'convergence_history': 500,
         'energy_density_coeff': 1,  # how much to weight the density penalty term in the energy function
         'temperature_conditioning': True,
-        'energy_min_temperature': 0.99999,
-        'energy_max_temperature': 1.0,
+        'energy_min_temperature': 0.01,
+        'energy_max_temperature': 10,
         'energy_static_temperature': 1,
-        'temperature_scaling_factor': 1,
+        'temperature_scaling_factor': 0.01,
         'joint_layers': 4,
         'hidden_dim': 256,
         'norm': None,
@@ -106,8 +108,9 @@ config_list.append(
         'T': 10,
         'pb_scale_range': 0.1,
         't_scale': 1.0,
-        'exploration_factor': 0.55,
-        'wd_max_steps': 2000,
+        'exploration_factor': 0.5,
+        'wd_max_steps': 10000,
+        'annealing_max_steps': 10000,
     } #2
 )
 config_list.append(
@@ -122,10 +125,10 @@ config_list.append(
         'convergence_history': 500,
         'energy_density_coeff': 1,  # how much to weight the density penalty term in the energy function
         'temperature_conditioning': True,
-        'energy_min_temperature': 0.99999,
-        'energy_max_temperature': 1.0,
+        'energy_min_temperature': 0.01,
+        'energy_max_temperature': 10,
         'energy_static_temperature': 1,
-        'temperature_scaling_factor': 1,
+        'temperature_scaling_factor': 0.01,
         'joint_layers': 4,
         'hidden_dim': 256,
         'norm': None,
@@ -133,8 +136,9 @@ config_list.append(
         'T': 10,
         'pb_scale_range': 0.1,
         't_scale': 1.0,
-        'exploration_factor': 0.35,
-        'wd_max_steps': 5000,
+        'exploration_factor': 0.5,
+        'wd_max_steps': 2000,
+        'annealing_max_steps': 2000,
     } #3
 )
 config_list.append(
@@ -149,19 +153,20 @@ config_list.append(
         'convergence_history': 500,
         'energy_density_coeff': 1,  # how much to weight the density penalty term in the energy function
         'temperature_conditioning': True,
-        'energy_min_temperature': 0.99999,
-        'energy_max_temperature': 1.0,
+        'energy_min_temperature': 0.01,
+        'energy_max_temperature': 10,
         'energy_static_temperature': 1,
-        'temperature_scaling_factor': 1,
+        'temperature_scaling_factor': 0.01,
         'joint_layers': 4,
         'hidden_dim': 256,
         'norm': None,
-        'dropout': .25,
+        'dropout': 0,
         'T': 10,
         'pb_scale_range': 0.1,
         't_scale': 1.0,
-        'exploration_factor': 0.35,
-        'wd_max_steps': 2000,
+        'exploration_factor': 0.5,
+        'wd_max_steps': 5000,
+        'annealing_max_steps': 2000,
     } #4
 )
 config_list.append(
@@ -176,19 +181,20 @@ config_list.append(
         'convergence_history': 500,
         'energy_density_coeff': 1,  # how much to weight the density penalty term in the energy function
         'temperature_conditioning': True,
-        'energy_min_temperature': 0.99999,
-        'energy_max_temperature': 1.0,
+        'energy_min_temperature': 0.01,
+        'energy_max_temperature': 10,
         'energy_static_temperature': 1,
-        'temperature_scaling_factor': 1,
+        'temperature_scaling_factor': 0.01,
         'joint_layers': 4,
         'hidden_dim': 256,
-        'norm': 'layer',
-        'dropout': 0,
+        'norm': None,
+        'dropout': 0.5,
         'T': 10,
         'pb_scale_range': 0.1,
         't_scale': 1.0,
-        'exploration_factor': 0.35,
+        'exploration_factor': 0.5,
         'wd_max_steps': 2000,
+        'annealing_max_steps': 10000,
     } #5
 )
 config_list.append(
@@ -201,21 +207,22 @@ config_list.append(
         'anneal_energy': True,  # harden intermolecular repulsion over time
         'energy_annealing_threshold': 1.0e-2,
         'convergence_history': 500,
-        'energy_density_coeff': 1,  # how much to weight the density penalty term in the energy function
+        'energy_density_coeff': 10,  # how much to weight the density penalty term in the energy function
         'temperature_conditioning': True,
-        'energy_min_temperature': 0.99999,
-        'energy_max_temperature': 1.0,
+        'energy_min_temperature': 0.01,
+        'energy_max_temperature': 10,
         'energy_static_temperature': 1,
-        'temperature_scaling_factor': 1,
+        'temperature_scaling_factor': 0.01,
         'joint_layers': 4,
-        'hidden_dim': 512,
+        'hidden_dim': 256,
         'norm': None,
         'dropout': 0,
         'T': 10,
         'pb_scale_range': 0.1,
-        't_scale': 1.0,
-        'exploration_factor': 0.35,
+        't_scale': 0.5,
+        'exploration_factor': 0.5,
         'wd_max_steps': 2000,
+        'annealing_max_steps': 10000,
     } #6
 )
 config_list.append(
@@ -228,114 +235,29 @@ config_list.append(
         'anneal_energy': True,  # harden intermolecular repulsion over time
         'energy_annealing_threshold': 1.0e-2,
         'convergence_history': 500,
-        'energy_density_coeff': 1,  # how much to weight the density penalty term in the energy function
+        'energy_density_coeff': 0.1,  # how much to weight the density penalty term in the energy function
         'temperature_conditioning': True,
-        'energy_min_temperature': 0.99999,
-        'energy_max_temperature': 1.0,
+        'energy_min_temperature': 0.01,
+        'energy_max_temperature': 10,
         'energy_static_temperature': 1,
-        'temperature_scaling_factor': 1,
-        'joint_layers': 2,
+        'temperature_scaling_factor': 0.01,
+        'joint_layers': 4,
         'hidden_dim': 256,
         'norm': None,
         'dropout': 0,
         'T': 10,
         'pb_scale_range': 0.1,
-        't_scale': 1.0,
-        'exploration_factor': 0.35,
+        't_scale': 0.5,
+        'exploration_factor': 0.5,
         'wd_max_steps': 2000,
+        'annealing_max_steps': 10000,
     } #7
 )
-config_list.append(
-    {
-        'mode_fwd': 'tb',
-        'mode_bwd': 'tb',
-        'bwd': False,
-        'both_ways': False,
-        'train_pb': False,
-        'anneal_energy': True,  # harden intermolecular repulsion over time
-        'energy_annealing_threshold': 1.0e-2,
-        'convergence_history': 500,
-        'energy_density_coeff': 1,  # how much to weight the density penalty term in the energy function
-        'temperature_conditioning': True,
-        'energy_min_temperature': 0.99999,
-        'energy_max_temperature': 1.0,
-        'energy_static_temperature': 1,
-        'temperature_scaling_factor': 1,
-        'joint_layers': 8,
-        'hidden_dim': 256,
-        'norm': None,
-        'dropout': 0,
-        'T': 10,
-        'pb_scale_range': 0.1,
-        't_scale': 1.0,
-        'exploration_factor': 0.35,
-        'wd_max_steps': 2000,
-    } #8
-)
-config_list.append(
-    {
-        'mode_fwd': 'tb',
-        'mode_bwd': 'tb',
-        'bwd': False,
-        'both_ways': False,
-        'train_pb': False,
-        'anneal_energy': True,  # harden intermolecular repulsion over time
-        'energy_annealing_threshold': 5.0e-2,
-        'convergence_history': 500,
-        'energy_density_coeff': 1,  # how much to weight the density penalty term in the energy function
-        'temperature_conditioning': True,
-        'energy_min_temperature': 0.99999,
-        'energy_max_temperature': 1.0,
-        'energy_static_temperature': 1,
-        'temperature_scaling_factor': 1,
-        'joint_layers': 4,
-        'hidden_dim': 256,
-        'norm': None,
-        'dropout': 0,
-        'T': 50,
-        'pb_scale_range': 0.1,
-        't_scale': 1.0,
-        'exploration_factor': 0.35,
-        'wd_max_steps': 2000,
-    } # 9
-)
-config_list.append(
-    {
-        'mode_fwd': 'tb',
-        'mode_bwd': 'tb',
-        'bwd': False,
-        'both_ways': False,
-        'train_pb': False,
-        'anneal_energy': True,  # harden intermolecular repulsion over time
-        'energy_annealing_threshold': 5.0e-2,
-        'convergence_history': 500,
-        'energy_density_coeff': 1,  # how much to weight the density penalty term in the energy function
-        'temperature_conditioning': True,
-        'energy_min_temperature': 0.99999,
-        'energy_max_temperature': 1.0,
-        'energy_static_temperature': 1,
-        'temperature_scaling_factor': 1,
-        'joint_layers': 4,
-        'hidden_dim': 256,
-        'norm': 'layer',
-        'dropout': 0,
-        'T': 10,
-        'pb_scale_range': 0.1,
-        't_scale': 1.0,
-        'exploration_factor': 0.35,
-        'wd_max_steps': 2000,
-    } #5
-)
 
 
-"""
-Notes
 
-- more aggressive temperature scaling
-- figs less often
-- at R value to loss reporting
-- need to use slightly more compute
-"""
+
+
 
 
 def overwrite_nested_dict(d1, d2):

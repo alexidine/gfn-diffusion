@@ -17,7 +17,7 @@ class MolecularCrystal(BaseSet):
                  space_group: int = 2,
                  max_temperature: float = 10,
                  min_temperature: float = 0.01,
-                 turnover_pot: float = 0.01,
+                 turnover_pot: float = 10,
                  density_coeff: float = 0,
                  temperature_scaling_factor: float = 1,
                  temperature_conditioning: bool = False
@@ -27,7 +27,7 @@ class MolecularCrystal(BaseSet):
         self.data_ndim = dim
         self.space_group = space_group
 
-        self.ellipsoid_scale = 0.8
+        self.ellipsoid_scale = 1
         self.density_coeff = density_coeff
         self.max_temperature = max_temperature
         self.min_temperature = min_temperature
@@ -38,7 +38,6 @@ class MolecularCrystal(BaseSet):
     def instantiate_crystals(self, x, mol_batch):
         crystal_batch = self.init_blank_crystal_batch(mol_batch)
         crystal_batch.gen_basis_to_cell_params(x, clip_min_length=0.5)  # don't allow micro cells
-        #crystal_batch.cell_lengths = crystal_batch.cell_lengths + 3  # TODO add this bias directly to the policy model
         crystal_batch.box_analysis()
         return crystal_batch
 
@@ -49,22 +48,23 @@ class MolecularCrystal(BaseSet):
                                                   align_to_standardized_orientation=True)
 
         cluster_batch.construct_radial_graph(cutoff=6)
-        cluster_batch.compute_LJ_energy()
+        #cluster_batch.compute_LJ_energy()
         silu_energy = cluster_batch.compute_silu_energy()  # softened short-range LJ-type energy
 
-        if not hasattr(self, 'ellipsoid_model'):
-            cluster_batch.load_ellipsoid_model()
-            self.ellipsoid_model = copy.deepcopy(cluster_batch.ellipsoid_model)
-            self.ellipsoid_model = self.ellipsoid_model.to(self.device)
-            self.ellipsoid_model.eval()
-        # simplified ellipsoid energy testing
-        _, _, _, _, _, _, normed_ellipsoid_overlap \
-            = cluster_batch.compute_ellipsoidal_overlap(
-            semi_axis_scale=self.ellipsoid_scale,
-            model=self.ellipsoid_model,
-            return_details=True)
+        # if not hasattr(self, 'ellipsoid_model'):
+        #     cluster_batch.load_ellipsoid_model()
+        #     self.ellipsoid_model = copy.deepcopy(cluster_batch.ellipsoid_model)
+        #     self.ellipsoid_model = self.ellipsoid_model.to(self.device)
+        #     self.ellipsoid_model.eval()
+        # # simplified ellipsoid energy testing
+        # _, _, _, _, _, _, normed_ellipsoid_overlap \
+        #     = cluster_batch.compute_ellipsoidal_overlap(
+        #     semi_axis_scale=self.ellipsoid_scale,
+        #     model=self.ellipsoid_model,
+        #     return_details=True)
 
-        cluster_batch.ellipsoid_overlap = normed_ellipsoid_overlap.flatten()
+        # cluster_batch.ellipsoid_overlap = normed_ellipsoid_overlap.flatten()
+        cluster_batch.ellipsoid_overlap = torch.ones_like(silu_energy)
         cluster_batch.silu_pot = silu_energy
         crystal_energy = self.generator_energy(cluster_batch)
         cluster_batch.gfn_energy = crystal_energy
@@ -75,8 +75,8 @@ class MolecularCrystal(BaseSet):
 
     def generator_energy(self, cluster_batch):
         density_energy = F.relu(-(cluster_batch.packing_coeff - 1)) ** 2
-        #intermolecular_energy = self.soften_LJ_energy(cluster_batch.silu_pot / cluster_batch.num_atoms)
-        intermolecular_energy = cluster_batch.ellipsoid_overlap
+        intermolecular_energy = self.soften_LJ_energy(cluster_batch.silu_pot) / cluster_batch.num_atoms
+        #intermolecular_energy = cluster_batch.ellipsoid_overlap
         crystal_energy = intermolecular_energy + self.density_coeff * density_energy
 
         return crystal_energy

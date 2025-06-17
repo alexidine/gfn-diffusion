@@ -370,14 +370,14 @@ def anneal_energy_function(energy_function,
     # cutoffs must scan
     trigger = (checks['loss_slope'] <= 0) and \
               (checks['js_div'] <= cutoff) and \
-              (np.abs(checks['emd']) <= 2 * cutoff)
+              (np.abs(checks['emd']) <= 4 * cutoff)
 
     if trigger:
         # if energy_function.min_temperature > 0.01:
         #     energy_function.min_temperature *= 0.95
         #     energy_function.max_temperature *= 0.95
-        if energy_function.temperature_scaling_factor < 2:
-            energy_function.temperature_scaling_factor *= 1.05
+        if energy_function.temperature_scaling_factor < 10:
+            energy_function.temperature_scaling_factor *= 1.1
 
 
 def relative_slope(y):

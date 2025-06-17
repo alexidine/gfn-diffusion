@@ -156,7 +156,8 @@ def train():
                                       args.conditional_flow_model, args.use_weight_decay, args.weight_decay)
 
     if args.scheduler:
-        scheduler = lr_scheduler.MultiplicativeLR(gfn_optimizer, lr_lambda=lambda epoch: args.lr_shrink_lambda)
+        if gfn_optimizer.param_groups[0]['lr'] > 1e-6:
+            scheduler = lr_scheduler.MultiplicativeLR(gfn_optimizer, lr_lambda=lambda epoch: args.lr_shrink_lambda)
 
     buffer, mol_loader = init_buffers_datasets(energy_function)
 
@@ -204,12 +205,16 @@ def train():
             else:
                 """anneal reward function"""
                 if args.anneal_energy:
-                    anneal_energy_function(energy_function,
-                                           loss_record,
-                                           metrics['sample reward distribution'],
-                                           prev_rewards_dist,
-                                           args.convergence_history,
-                                           args.energy_annealing_threshold)
+                    # anneal_energy_function(energy_function,
+                    #                        loss_record,
+                    #                        metrics['sample reward distribution'],
+                    #                        prev_rewards_dist,
+                    #                        args.convergence_history,
+                    #                        args.energy_annealing_threshold)
+
+                    # go from initial to final scaling value in annealing_max_steps
+                    annealing_lambda = (10/args.temperature_scaling_factor)**(1/(args.annealing_max_steps/ 100))
+                    energy_function.temperature_scaling_factor *= annealing_lambda
                     prev_rewards_dist = metrics['sample reward distribution']
 
             wandb.log(metrics, step=i)
