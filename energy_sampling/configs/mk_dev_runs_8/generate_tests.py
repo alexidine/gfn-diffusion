@@ -253,9 +253,34 @@ config_list.append(
         'annealing_max_steps': 10000,
     } #7
 )
-
-
-
+config_list.append(
+    {
+        'mode_fwd': 'tb',
+        'mode_bwd': 'tb',
+        'bwd': False,
+        'both_ways': False,
+        'train_pb': False,
+        'anneal_energy': True,  # harden intermolecular repulsion over time
+        'energy_annealing_threshold': 1.0e-2,
+        'convergence_history': 500,
+        'energy_density_coeff': 0.1,  # how much to weight the density penalty term in the energy function
+        'temperature_conditioning': True,
+        'energy_min_temperature': 0.01,
+        'energy_max_temperature': 10,
+        'energy_static_temperature': 1,
+        'temperature_scaling_factor': 0.01,
+        'joint_layers': 4,
+        'hidden_dim': 256,
+        'norm': None,
+        'dropout': 0,
+        'T': 10,
+        'pb_scale_range': 0.1,
+        't_scale': 0.5,
+        'exploration_factor': 0.5,
+        'wd_max_steps': 1000,
+        'annealing_max_steps': 1000,
+    } #8
+)
 
 
 

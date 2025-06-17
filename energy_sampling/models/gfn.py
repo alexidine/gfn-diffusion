@@ -82,10 +82,9 @@ class GFN(nn.Module):
             logvar = torch.tanh(logvar) * self.log_var_range
         return mean, logvar + np.log(self.pf_std_per_traj) * 2.
 
-    def predict_next_state(self, state, time, condition):
+    def predict_next_state(self, state, time, condition_embedding):
         batch_size = state.shape[0]
         if self.conditional_flow_model:
-            condition_embedding = self.conditions_embedding_model(condition)
             log_flow = self.flow_model(condition_embedding).squeeze(-1)
         else:
             condition_embedding = None
@@ -106,10 +105,13 @@ class GFN(nn.Module):
         logf = torch.zeros((batch_size, self.trajectory_length + 1), device=self.device)
         states = torch.zeros((batch_size, self.trajectory_length + 1, self.dim), device=self.device)
         states[:, 0] = initial_state.detach()  # set correct initial state
+        if self.conditional_flow_model:
+            condition_embedding = self.conditions_embedding_model(condition)
+        else:
+            condition_embedding = None
 
         for i in range(self.trajectory_length):
-            state_update, log_flow = self.predict_next_state(initial_state, i * self.dt, condition)
-
+            state_update, log_flow = self.predict_next_state(initial_state, i * self.dt, condition_embedding)
             pf_mean, pflogvars = self.split_params(state_update)  # drift and log variance terms
             logf[:, i] = log_flow
 
@@ -129,14 +131,10 @@ class GFN(nn.Module):
 
             # need to back the noise out explicitly here to get gradients to pf_mean and pflogvars
             noise = ((next_state - initial_state) - self.dt * pf_mean) / (np.sqrt(self.dt) * (pflogvars / 2).exp())
-            logpf[:, i] = -0.5 * (noise ** 2 + logtwopi + np.log(self.dt) + pflogvars).sum(1)  # TODO check expression
+            logpf[:, i] = -0.5 * (noise ** 2 + logtwopi + np.log(self.dt) + pflogvars).sum(1)
 
             if self.learn_pb:
                 t = self.t_model((i + 1) * self.dt).repeat(batch_size, 1)
-                if self.conditional_flow_model:
-                    condition_embedding = self.conditions_embedding_model(condition)
-                else:
-                    condition_embedding = None
                 pbs = self.back_model(self.s_model(next_state, condition_embedding), t)
                 dmean, dvar = gaussian_params(pbs)
                 back_mean_correction = 1 + dmean.tanh() * self.pb_scale_range
@@ -167,15 +165,15 @@ class GFN(nn.Module):
         logf = torch.zeros((batch_size, self.trajectory_length + 1), device=self.device)
         states = torch.zeros((batch_size, self.trajectory_length + 1, self.dim), device=self.device)
         states[:, -1] = s
+        if self.conditional_flow_model:
+            condition_embedding = self.conditions_embedding_model(condition)
+        else:
+            condition_embedding = None
 
         for i in range(self.trajectory_length):
             if i < self.trajectory_length - 1:
                 if self.learn_pb:
                     t = self.t_model(1. - i * self.dt).repeat(batch_size, 1)
-                    if self.conditional_flow_model:
-                        condition_embedding = self.conditions_embedding_model(condition)
-                    else:
-                        condition_embedding = None
                     pbs = self.back_model(self.s_model(s, condition_embedding), t)
                     dmean, dvar = gaussian_params(pbs)
                     back_mean_correction = 1 + dmean.tanh() * self.pb_scale_range
@@ -192,7 +190,7 @@ class GFN(nn.Module):
             else:
                 s_ = get_gfn_init_state(len(s), s.shape[1], s.device)  # call initial state from function
 
-            pfs, flow = self.predict_next_state(s_, (1. - (i + 1) * self.dt), condition)
+            pfs, flow = self.predict_next_state(s_, (1. - (i + 1) * self.dt), condition_embedding)
             pf_mean, pflogvars = self.split_params(pfs)
             logf[:, self.trajectory_length - i - 1] = flow
             noise = ((s - s_) - self.dt * pf_mean) / (np.sqrt(self.dt) * (pflogvars / 2).exp())
