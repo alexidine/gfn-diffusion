@@ -2,18 +2,17 @@ import torch
 from mxtaltools.dataset_utils.utils import collate_data_list
 
 
-def get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states):
+def get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states, no_grad: bool = True):
     if condition is not None:
         log_temperature = condition[:, 0]
     else:
         log_temperature = None
-    with torch.no_grad():
+    with torch.set_grad_enabled(not no_grad):
         if return_exp:
             log_r, crystal_batch = log_reward_fn(states[:, -1], mol_batch, log_temperature, return_exp)
-            log_r = log_r.detach()
             crystal_batch = crystal_batch.detach()
         else:
-            log_r = log_reward_fn(states[:, -1], mol_batch, log_temperature, return_exp).detach()
+            log_r = log_reward_fn(states[:, -1], mol_batch, log_temperature, return_exp)
             crystal_batch = None
     return crystal_batch, log_r
 
@@ -32,9 +31,25 @@ def fwd_tb(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=None, r
         return loss.mean()
 
 
-def bwd_tb(initial_state, gfn, log_r, exploration_std=None, condition=None, return_exp: bool = False):
-    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(initial_state, exploration_std, condition)
-    log_ratio = log_pfs.sum(-1) + log_fs[:, 0] - log_pbs.sum(-1) - log_r
+def fwd_greedy(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=None, return_exp=False, condition=None):
+    # connect forward policy model gradients to reward model
+    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, exploration_std, log_reward_fn, condition,
+                                                              keep_step_grads=True)
+    # keep gradients from reward model
+    crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states, no_grad=False)
+
+    loss = -log_r
+    if return_exp:
+        return loss.mean(), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
+    else:
+        return loss.mean()
+
+
+def bwd_tb(terminal_state, gfn, log_r, exploration_std=None, condition=None, return_exp: bool = False):
+    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, exploration_std, condition)
+    log_pf = log_pfs.sum(-1)
+    log_pb = log_pbs.sum(-1)
+    log_ratio = log_pf + log_fs[:, 0] - log_pb - log_r
     loss = 0.5 * (log_ratio ** 2)
 
     if return_exp:
@@ -52,20 +67,20 @@ def fwd_tb_avg(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=Non
     loss = log_Z + (log_pf - log_r - log_pb)
     if return_exp:
         return 0.5 * (
-                    loss ** 2).mean(), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
+                loss ** 2).mean(), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
     else:
         return 0.5 * (loss ** 2).mean()
 
 
-def bwd_tb_avg(initial_state, gfn, log_r, exploration_std=None, condition=None, return_exp=False):
-    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(initial_state, exploration_std, condition)
+def bwd_tb_avg(terminal_state, gfn, log_r, exploration_std=None, condition=None, return_exp=False):
+    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, exploration_std, condition)
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
     log_Z = (log_r + log_pb - log_pf).mean(dim=0, keepdim=True)
     loss = log_Z + (log_pf - log_r - log_pb)
     if return_exp:
         return 0.5 * (
-                    loss ** 2).mean(), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
+                loss ** 2).mean(), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
     else:
         return 0.5 * (loss ** 2).mean()
 
@@ -87,25 +102,25 @@ def fwd_tb_avg_cond(initial_state, gfn, log_reward_fn, mol_batch, exploration_st
     loss = log_Z + (log_pf - log_r - log_pb).view(repeats, -1)
     if return_exp:
         return 0.5 * (
-                    loss ** 2).mean(), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
+                loss ** 2).mean(), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
     else:
         return 0.5 * (loss ** 2).mean()
 
 
-def bwd_tb_avg_cond(initial_state, gfn, log_r, exploration_std=None, condition=None, repeats=10,
+def bwd_tb_avg_cond(terminal_state, gfn, log_r, exploration_std=None, condition=None, repeats=10,
                     return_exp: bool = False):
     condition = condition.repeat(repeats, 1)
-    initial_state = initial_state.repeat(repeats, 1)
+    terminal_state = terminal_state.repeat(repeats, 1)
     log_r = log_r.repeat(repeats)
 
-    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(initial_state, exploration_std, condition)
+    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, exploration_std, condition)
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
     log_Z = (log_r + log_pb - log_pf).view(repeats, -1).mean(dim=0, keepdim=True)
     loss = log_Z + (log_pf - log_r - log_pb).view(repeats, -1)
     if return_exp:
         return 0.5 * (
-                    loss ** 2).mean(), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
+                loss ** 2).mean(), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
     else:
         return 0.5 * (loss ** 2).mean()
 
@@ -136,7 +151,7 @@ def subtb(initial_state, gfn, log_reward_fn, coef_matrix, exploration_std=None, 
     return torch.stack([torch.triu(A2[i] * coef_matrix, diagonal=1).sum() for i in range(A2.shape[0])]).sum()
 
 
-def bwd_mle(samples, gfn, log_reward_fn, exploration_std=None, condition=None):
-    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(samples, exploration_std, log_reward_fn, condition)
+def bwd_mle(terminal_state, gfn, log_reward_fn, exploration_std=None, condition=None):
+    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, exploration_std, log_reward_fn, condition)
     loss = -log_pfs.sum(-1)
     return loss.mean()

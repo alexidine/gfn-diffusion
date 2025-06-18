@@ -17,7 +17,7 @@ class MolecularCrystal(BaseSet):
                  space_group: int = 2,
                  max_temperature: float = 10,
                  min_temperature: float = 0.01,
-                 turnover_pot: float = 10,
+                 turnover_pot: float = 20.0,
                  density_coeff: float = 0,
                  temperature_scaling_factor: float = 1,
                  temperature_conditioning: bool = False
@@ -48,7 +48,7 @@ class MolecularCrystal(BaseSet):
                                                   align_to_standardized_orientation=True)
 
         cluster_batch.construct_radial_graph(cutoff=6)
-        #cluster_batch.compute_LJ_energy()
+        lj_energy, normed_lj_energy = cluster_batch.compute_LJ_energy()
         silu_energy = cluster_batch.compute_silu_energy()  # softened short-range LJ-type energy
 
         # if not hasattr(self, 'ellipsoid_model'):
@@ -64,8 +64,9 @@ class MolecularCrystal(BaseSet):
         #     return_details=True)
 
         # cluster_batch.ellipsoid_overlap = normed_ellipsoid_overlap.flatten()
-        cluster_batch.ellipsoid_overlap = torch.ones_like(silu_energy)
+        #cluster_batch.ellipsoid_overlap = torch.ones_like(silu_energy)
         cluster_batch.silu_pot = silu_energy
+        cluster_batch.lj_pot = lj_energy
         crystal_energy = self.generator_energy(cluster_batch)
         cluster_batch.gfn_energy = crystal_energy
         if return_batch:
@@ -127,7 +128,7 @@ class MolecularCrystal(BaseSet):
         # soften the repulsion
         softened_energy = lj_energy.clone()
         high_bools = softened_energy > self.turnover_pot
-        softened_energy[high_bools] = self.turnover_pot + torch.log10(
+        softened_energy[high_bools] = self.turnover_pot + torch.log(
             softened_energy[high_bools] + 1 - self.turnover_pot)
         softened_energy = softened_energy.clip(max=50)
 
@@ -150,7 +151,7 @@ class MolecularCrystal(BaseSet):
             lj_pot=torch.zeros(1, device=self.device),
             scaled_lj_pot=torch.zeros(1, device=self.device),
             es_pot=torch.zeros(1, device=self.device),
-            ellipsoid_overlap=torch.zeros(1, device=self.device)
+            #ellipsoid_overlap=torch.zeros(1, device=self.device)
         ) for ind in range(len(mol_batch))]).to(self.device)
 
         return crystal_batch

@@ -1,4 +1,4 @@
-run_name: 'mk_local_dev'
+run_name: 'mk_dev_runs_9_1'
 seed: 12345
 device: 'cuda'
 lr_policy: 0.0001              # learning rate of the policy network
@@ -6,8 +6,8 @@ min_lr: 1.0e-6                # ihn
 lr_flow: 0.01                  # learning rate of the flow network
 lr_back: 0.0001                # learning rate of the backward pass
 scheduler: True               # does LR warmup from max/100 -> max -> 1e-6 over the warmup and annealing period
-lr_warmup_time: 250
-lr_anneal_time: 4000
+lr_warmup_time: 500
+lr_anneal_time: 10000
 weight_decay: 1e-7
 use_weight_decay: false
 gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weights
@@ -26,21 +26,21 @@ norm: 'layer'                   # null, "layer", "batch"
 
 batch_size: 25               # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 100           # maximum batch size to allow
-eval_batch_size: 500        # batch size for evaluation
+max_batch_size: 2000           # maximum batch size to allow
+eval_batch_size: 1000        # batch size for evaluation
 epochs: 10000000             # number of training epochs: relatively large
 eval_period: 50              # how often to do evaluation & reporting
 figs_period: 100             # how often to log custom figrues
 buffer_size: 100000          # size of replay buffer: relatively large
 
 # GFlowNet settings
-T: 10                        # diffusion trajectory length
+T: 25                        # diffusion trajectory length
 t_scale: 1.0                 # scales fixed forward policy variance
 log_var_range: 1.0           # controls dynamic range of learned policy variance
 pb_scale_range: 0.1          # range of learned backward policy variance
 energy: "molecular_crystal"  # "molecular_crystal"
-mode_fwd: "tb"               # "TB" is trajectory balance, "cond-tb-avg" is conditional VarGrad, "greedy" is an experimental greedy sampler
-mode_bwd: "tb"               # "TB" is trajectory balance, "cond-tb-avg" is conditional VarGrad
+mode_fwd: "cond-tb-avg"               # "TB" is trajectory balance, "cond-tb-avg" is conditional VarGrad, "greedy" is an experimental greedy sampler
+mode_bwd: "cond-tb-avg"               # "TB" is trajectory balance, "cond-tb-avg" is conditional VarGrad
 repeats: 10                  # for conditional VarGrad training
 both_ways: true              # forward and backward training
 bwd_batch_multiplier: 5      # ratio of backward to foward batch size (much cheaper to evaluate)
@@ -55,8 +55,8 @@ gfn_clip: 1.0  # clip the maximumstep size induced by the policy model
 
 # local search settings
 ################################################################
-buffer_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
-molecules_path: 'D:/crystal_datasets/test_qm9_dataset.pt'
+buffer_path: '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt'
+molecules_path: '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt'
 
 # replay buffer / dataset settings
 ################################################################

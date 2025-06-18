@@ -11,7 +11,7 @@ import torch
 import yaml
 
 from gflownet_losses import fwd_tb, fwd_tb_avg, fwd_tb_avg_cond, db, subtb, bwd_tb, bwd_tb_avg, \
-    bwd_tb_avg_cond, bwd_mle
+    bwd_tb_avg_cond, bwd_mle, fwd_greedy
 
 
 def set_seed(seed):
@@ -91,6 +91,10 @@ def get_gfn_forward_loss(mode, init_state, gfn_model, log_reward, coeff_matrix, 
                          return_exp=False, condition=None, repeats=10):
     if mode == 'tb':
         return fwd_tb(init_state, gfn_model, log_reward, mol_batch, exploration_std,
+                      return_exp=return_exp,
+                      condition=condition)
+    if mode == 'greedy':
+        return fwd_greedy(init_state, gfn_model, log_reward, mol_batch, exploration_std,
                       return_exp=return_exp,
                       condition=condition)
     elif mode == 'tb-avg':
@@ -338,8 +342,8 @@ def dict2namespace(data_dict: dict):
 def get_gfn_init_state(batch_size, ndim, device):
     #return torch.zeros(batch_size, ndim).to(device)  # old init state
     init_state = torch.zeros(batch_size, ndim).to(device)
-    init_state[:,
-    :3] += 3  # bias length dimensions upwards, which improves early training by avoiding super-dense initial states
+    # bias length dimensions upwards, which improves early training by avoiding super-dense initial states
+    init_state[:,:3] += 3
     return init_state
 
 
