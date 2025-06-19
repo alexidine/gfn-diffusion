@@ -1,3 +1,4 @@
+import torch.nn.functional as F
 import torch
 from mxtaltools.dataset_utils.utils import collate_data_list
 
@@ -24,9 +25,26 @@ def fwd_tb(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=None, r
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
     log_ratio = log_pf + log_fs[:, 0] - log_pb - log_r
-    loss = 0.5 * (log_ratio ** 2)
+    #loss = 0.5 * (log_ratio ** 2)
+    loss = F.smooth_l1_loss(log_ratio, torch.zeros_like(log_ratio),
+                            reduction='none')  # a more stable loss, though we lose some theoretical guarantees
     if return_exp:
         return loss.mean(), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
+    else:
+        return loss.mean()
+
+
+def bwd_tb(terminal_state, gfn, log_r, exploration_std=None, condition=None, return_exp: bool = False):
+    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, exploration_std, condition)
+    log_pf = log_pfs.sum(-1)
+    log_pb = log_pbs.sum(-1)
+    log_ratio = log_pf + log_fs[:, 0] - log_pb - log_r
+    #loss = 0.5 * (log_ratio ** 2)
+    loss = F.smooth_l1_loss(log_ratio, torch.zeros_like(log_ratio),
+                            reduction='none') # a more stable loss, though we lose some theoretical guarantees
+
+    if return_exp:
+        return loss.mean(), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
     else:
         return loss.mean()
 
@@ -41,19 +59,6 @@ def fwd_greedy(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=Non
     loss = -log_r
     if return_exp:
         return loss.mean(), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
-    else:
-        return loss.mean()
-
-
-def bwd_tb(terminal_state, gfn, log_r, exploration_std=None, condition=None, return_exp: bool = False):
-    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, exploration_std, condition)
-    log_pf = log_pfs.sum(-1)
-    log_pb = log_pbs.sum(-1)
-    log_ratio = log_pf + log_fs[:, 0] - log_pb - log_r
-    loss = 0.5 * (log_ratio ** 2)
-
-    if return_exp:
-        return loss.mean(), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
     else:
         return loss.mean()
 

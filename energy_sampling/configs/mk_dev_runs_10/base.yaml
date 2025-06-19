@@ -1,4 +1,4 @@
-run_name: 'mk_local_dev'
+run_name: 'mk_dev_runs_10'
 seed: 12345
 device: 'cuda'
 lr_policy: 0.0001              # learning rate of the policy network
@@ -10,7 +10,7 @@ lr_warmup_time: 250
 lr_anneal_time: 4000
 weight_decay: 1e-7
 use_weight_decay: false
-gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weights
+gradient_norm_clip: 1.0        # gradient norm clip for updating gfn model weights
 
 # model parameters
 zero_init: false
@@ -21,17 +21,17 @@ s_emb_dim: 32                # dimensionality of state embedding
 t_emb_dim: 32                # dimensionality of time embedding
 harmonics_dim: 64            # dimensionality of harmonic embedding
 condition_emb_dim: 12         # dimensionality of the conditioning embedding
-dropout: 0.25                   # dropout probability
+dropout: 0                   # dropout probability
 norm: 'layer'                   # null, "layer", "batch"
 
 batch_size: 25               # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 100           # maximum batch size to allow
-eval_batch_size: 500        # batch size for evaluation
+max_batch_size: 500           # maximum batch size to allow
+eval_batch_size: 1000        # batch size for evaluation
 epochs: 10000000             # number of training epochs: relatively large
-eval_period: 100              # how often to do evaluation & reporting
-figs_period: 200             # how often to log custom figrues  # must be multiple of eval_period or it won't fire
-buffer_size: 100000          # size of replay buffer: relatively large
+eval_period: 250              # how often to do evaluation & reporting
+figs_period: 500             # how often to log custom figrues  # must be multiple of eval_period or it won't fire
+buffer_size: 25000          # size of replay buffer: relatively large
 
 # GFlowNet settings
 T: 10                        # diffusion trajectory length
@@ -43,7 +43,7 @@ mode_fwd: "cond-tb-avg"               # "TB" is trajectory balance, "cond-tb-avg
 mode_bwd: "cond-tb-avg"               # "TB" is trajectory balance, "cond-tb-avg" is conditional VarGrad
 repeats: 10                  # for conditional VarGrad training
 both_ways: true              # forward and backward training
-bwd_batch_multiplier: 1      # ratio of backward to foward batch size (much cheaper to evaluate)
+bwd_batch_multiplier: 2      # ratio of backward to foward batch size (much cheaper to evaluate)
 fwd_train_each: 2            # on which multiples of training iter to train the fwd train model instead of bwd
 bwd: false                   # backward training only
 learn_pb: true               # whether to learn a backward policy
@@ -55,8 +55,8 @@ gfn_clip: 1.0  # clip the maximumstep size induced by the policy model
 
 # local search settings
 ################################################################
-buffer_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
-molecules_path: 'D:/crystal_datasets/test_qm9_dataset.pt'
+buffer_path: '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt'
+molecules_path: '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt'
 
 # replay buffer / dataset settings
 ################################################################
@@ -86,7 +86,7 @@ energy_min_temperature: 0.05
 energy_max_temperature: 10
 energy_static_temperature: 1
 temperature_scaling_factor: 0.01  # controls relative frequency of higher vs lower temperatures (higher -> higher)
-annealing_max_steps: 500
+annealing_max_steps: 1000
 
 # deprecated or un-used
 max_iter_ls: 100                # DEPRECATED # how many iterations to run local search

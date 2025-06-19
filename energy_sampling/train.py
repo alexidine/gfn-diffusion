@@ -329,7 +329,8 @@ def handle_train_epoch_error(e, oomed_out, buffer, mol_loader):
             e) or "nonzero is not supported for tensors with more than INT_MAX elements" in str(e):
         args.batch_size = handle_oom(args.batch_size)
 
-        if len(buffer) > 0:
+        if len(buffer) > 0: # cut also the buffer size in case it's getting too big
+            args.buffer_size = max([10000, int(args.buffer_size * 0.9)])
             buffer.loader = DataLoader(
                 buffer.dataset,
                 batch_size=args.batch_size,
@@ -370,7 +371,6 @@ def do_evaluation(energy_function, buffer, energy_record, gfn_model, i, learned_
                   buffer,
                   do_figures,
                   mol_batch,
-                  args.conditional_flow_model,
                   bwd_training=len(buffer) > 0))
 
     energy_record.append(metrics['mean sample energy'])

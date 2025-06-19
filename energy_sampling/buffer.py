@@ -195,11 +195,11 @@ class CrystalReplayBuffer():
         self.rank_weight = rank_weight
         self.beta = beta
 
-    def add(self, dataset):
+    def add(self, data_list):
         if self.dataset is None:
-            self.dataset = dataset
+            self.dataset = data_list
         else:
-            self.dataset.extend(dataset)
+            self.dataset.extend(data_list)
 
         if not hasattr(self, 'scores_np'):
             self.scores_np = self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(
@@ -208,8 +208,8 @@ class CrystalReplayBuffer():
             self.scores_np = np.concatenate([
                 self.scores_np,
                 self.energy_function.prebuilt_sample_to_reward(
-                    dataset,
-                    temperature=torch.ones(len(dataset))).detach().cpu().view(-1).numpy()
+                    data_list,
+                    temperature=torch.ones(len(data_list))).detach().cpu().view(-1).numpy()
             ])
         self.build_sampler()
 
@@ -239,20 +239,24 @@ class CrystalReplayBuffer():
             return len(self.dataset)
 
     def build_sampler(self):  # todo add pruning / sampling according to diversity. Expensive to repeat though.
+        weights = self.get_sampler_weights()
+
+        self.sampler = torch.utils.data.WeightedRandomSampler(
+            weights=weights, num_samples=len(self.scores_np), replacement=False
+        )
+
+    def get_sampler_weights(self):
         if self.prioritized == 'rank':
             ranks = np.argsort(np.argsort(-1 * self.scores_np))
             weights = 1.0 / (self.rank_weight * len(self.scores_np) + ranks)
         elif self.prioritized == 'boltzmann':
-            logits = self.scores_np / 0.1
+            logits = self.scores_np / self.beta
             logits = logits - np.max(logits)  # subtract max for stability
             weights_i = np.exp(logits)
             weights = weights_i / np.sum(weights_i)
         else:
             weights = torch.ones(len(self.scores_np))
-
-        self.sampler = torch.utils.data.WeightedRandomSampler(
-            weights=weights, num_samples=len(self.scores_np), replacement=True
-        )
+        return weights
 
     def sample(self,
                temperature: Optional[torch.tensor] = None,
@@ -262,7 +266,14 @@ class CrystalReplayBuffer():
         assert return_conditioning or (temperature is not None), "Must provide temperature or generate it here with return_conditioning=True"
 
         if override_batch is not None and override_batch != self.loader.batch_size:  # manual resampling if we want a custom batch size
-            rand_inds = np.random.randint(len(self.dataset), size=override_batch)
+            ordered_inds = list(self.sampler)
+            if override_batch > len(ordered_inds):
+                rand_inds = np.random.choice(len(self.dataset),
+                                             size=override_batch,
+                                             replace=True,
+                                             p=self.get_sampler_weights)
+            else:
+                rand_inds = ordered_inds[:override_batch]
             sample = collate_data_list([self.loader.dataset[ind] for ind in rand_inds])
         else:
             sample = next(iter(self.loader))

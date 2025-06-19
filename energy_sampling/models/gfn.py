@@ -179,13 +179,16 @@ class GFN(nn.Module):
         else:
             return states, logpf, logpb, logf
 
-    def get_trajectory_bwd(self, terminal_state, exploration_std, condition):
+    def get_trajectory_bwd(self, terminal_state, exploration_std, condition, return_gauss_params: bool=False):
         initial_state = get_gfn_init_state(len(terminal_state), terminal_state.shape[1], terminal_state.device)
         batch_size = terminal_state.shape[0]
         logpf = torch.zeros((batch_size, self.trajectory_length), device=self.device)
         logpb = torch.zeros((batch_size, self.trajectory_length), device=self.device)
         logf = torch.zeros((batch_size, self.trajectory_length + 1), device=self.device)
         states = torch.zeros((batch_size, self.trajectory_length + 1, self.dim), device=self.device)
+        if return_gauss_params:
+            means = torch.zeros((batch_size, self.trajectory_length), device=self.device)
+            logvars = torch.zeros((batch_size, self.trajectory_length), device=self.device)
         states[:, -1] = terminal_state
         if self.conditional_flow_model:
             condition_embedding = self.conditions_embedding_model(condition)
@@ -213,6 +216,10 @@ class GFN(nn.Module):
                 mean = ((traj_ind - 1) / traj_ind * current_state + (1 / traj_ind) * initial_state) * back_mean_correction  # not sure about this one
                 var = ((traj_ind - 1) / traj_ind * self.dt * self.pf_std_per_traj ** 2) * back_var_correction
 
+                if return_gauss_params:
+                    means[:, i] = mean.mean(dim=1).detach()
+                    logvars[:, i] = var.mean(dim=1).detach()
+
                 prev_state = mean.detach() + var.sqrt().detach() * torch.randn_like(terminal_state, device=self.device)
                 noise_backward = (prev_state - mean) / var.sqrt()
                 logpb[:, self.trajectory_length - i - 1] = -0.5 * (noise_backward ** 2 + logtwopi + var.log()).sum(1)  # note here delta T folded into the var term
@@ -228,7 +235,10 @@ class GFN(nn.Module):
             current_state = prev_state
             states[:, self.trajectory_length - i - 1] = current_state
 
-        return states, logpf, logpb, logf
+        if return_gauss_params:
+            return states, logpf, logpb, logf, means, logvars
+        else:
+            return states, logpf, logpb, logf
 
     def sample(self, batch_size, log_r, condition=None):
         s = torch.zeros(batch_size, self.dim).to(self.device)
