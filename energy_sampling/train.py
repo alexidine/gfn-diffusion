@@ -153,7 +153,7 @@ def train():
     buffer, mol_loader = init_buffers_datasets(energy_function)
 
     times['initialization_end'] = time()
-    loss_record, energy_record, learned_Z_record = [], [], []
+    #loss_record, energy_record, learned_Z_record = [], [], []
     oomed_out = False
     prev_rewards_dist = None
     lr_warmup_finished = False
@@ -180,7 +180,7 @@ def train():
                                                mol_loader,
                                                )
 
-            loss_record.append(metrics['train/loss'])
+            #loss_record.append(metrics['train/loss'])
             if not oomed_out:
                 buffer, mol_loader = grow_batch_size(buffer, mol_loader)
 
@@ -191,9 +191,7 @@ def train():
         if (i % args.eval_period == 0 and i > 0) or i == 50:
             metrics.update({'lr': gfn_optimizer.param_groups[0]['lr']})
             torch.save(gfn_model.state_dict(), f'{name}model.pt')
-
-            metrics = do_evaluation(energy_function, buffer, energy_record, gfn_model, i, learned_Z_record,
-                                    metrics, mol_loader)
+            metrics = do_evaluation(energy_function, buffer, gfn_model, i, metrics, mol_loader)
 
             if prev_rewards_dist is None:
                 prev_rewards_dist = metrics['sample reward distribution']
@@ -226,7 +224,7 @@ def train():
                     scheduler2.step()
 
             metrics.update(log_elapsed_times())
-            metrics['train/loss'] = np.mean(loss_record[-10:])
+            #metrics['train/loss'] = np.mean(loss_record[-10:])
             wandb.log(metrics, step=i)
 
     torch.save(gfn_model.state_dict(), f'{name}_model_final.pt')
@@ -354,7 +352,7 @@ def handle_train_epoch_error(e, oomed_out, buffer, mol_loader):
     return oomed_out, buffer, mol_loader
 
 
-def do_evaluation(energy_function, buffer, energy_record, gfn_model, i, learned_Z_record, metrics, mol_loader):
+def do_evaluation(energy_function, buffer, gfn_model, i, metrics, mol_loader):
     times['eval_step_start'] = time()
 
     do_figures = i % args.figs_period == 0
@@ -373,8 +371,7 @@ def do_evaluation(energy_function, buffer, energy_record, gfn_model, i, learned_
                   mol_batch,
                   bwd_training=len(buffer) > 0))
 
-    energy_record.append(metrics['mean sample energy'])
-    learned_Z_record.append(metrics['eval/log_Z_learned'])
+
 
     metrics.update({'Batch Size': args.batch_size})
     metrics.update(log_elapsed_times())

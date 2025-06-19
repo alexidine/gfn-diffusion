@@ -37,7 +37,7 @@ config_list.append(
         'max_batch_size': 2000,
         't_scale': 1.0
 
-    } # 0, tb small pb
+    }  # 0, tb small pb
 )
 config_list.append(
     {
@@ -47,7 +47,7 @@ config_list.append(
         'max_batch_size': 500,
         't_scale': 1.0
 
-    } # 1, vargrad small pb
+    }  # 1, vargrad small pb
 )
 config_list.append(
     {
@@ -57,7 +57,7 @@ config_list.append(
         'max_batch_size': 2000,
         't_scale': 1.0
 
-    } # 0, tb large pb
+    }  # 2, tb large pb
 )
 config_list.append(
     {
@@ -77,7 +77,7 @@ config_list.append(
         'max_batch_size': 2000,
         't_scale': 2.0
 
-    } # 4, tb large pf and pb
+    }  # 4, tb large pf and pb
 )
 config_list.append(
     {
@@ -89,7 +89,6 @@ config_list.append(
 
     }  # 5, vargrad large pf and pb
 )
-
 
 
 def overwrite_nested_dict(d1, d2):
