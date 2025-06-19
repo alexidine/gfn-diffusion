@@ -101,16 +101,7 @@ def generate_eval_figs(buffer, bwd_training, condition, flow_states, gfn_model, 
     # known mode coverage
     # diversity vs T / E
 
-    if len(buffer) > 0:
-        # take samples according to the sampler weighting, rather than random trash in the buffer
-        buffer_latent_params, buffer_reward, buffer_batch = buffer.sample(temperature=torch.ones(10000),
-                                                                          override_batch=10000)
-        buffer_cell_params = buffer_batch.cell_parameters().cpu().detach().numpy()
-        buffer_latent_params = buffer_batch.cell_params_to_gen_basis().cpu().detach().numpy()
-        buffer_std_params_for_embedding = buffer_batch.standardize_cell_parameters().cpu().detach().numpy()
-        del buffer_batch
-    else:
-        buffer_cell_params, buffer_latent_params, buffer_std_params_for_embedding = None, None, None
+    buffer_cell_params, buffer_latent_params, buffer_std_params_for_embedding = get_buffer_stats(buffer)
 
     fig_dict = {}
     fig_dict['Learned Z vs T'] = Z_vs_T_fig(gfn_model, init_state)
@@ -161,6 +152,19 @@ def generate_eval_figs(buffer, bwd_training, condition, flow_states, gfn_model, 
     return fig_dict
 
 
+def get_buffer_stats(buffer):
+    if len(buffer) > 0:
+        # take samples according to the sampler weighting, rather than random trash in the buffer
+        buffer_latent_params, buffer_reward, buffer_batch = buffer.sample(temperature=torch.ones(10000),
+                                                                          override_batch=10000)
+        buffer_cell_params = buffer_batch.cell_parameters().cpu().detach().numpy()
+        buffer_latent_params = buffer_batch.cell_params_to_gen_basis().cpu().detach().numpy()
+        buffer_std_params_for_embedding = buffer_batch.standardize_cell_parameters().cpu().detach().numpy()
+    else:
+        buffer_cell_params, buffer_latent_params, buffer_std_params_for_embedding = None, None, None
+    return buffer_cell_params, buffer_latent_params, buffer_std_params_for_embedding
+
+
 def mean_var_fig(logvars, means):
     fig = go.Figure()
     fig.add_scatter(y=logvars.mean(0).cpu().detach(), name='Pf LogVar')
@@ -205,9 +209,10 @@ def log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_
         metrics['ellipsoid overlap'] = sample_batch.ellipsoid_overlap.clip(min=1e-3).log10().cpu().detach().numpy()
 
     if buffer is not None:
-        metrics['Buffer Length'] = len(buffer)
-        metrics['Buffer Scores'] = buffer.scores_np[:1000]
-        metrics['Buffer Mean Score'] = np.mean(buffer.scores_np)
+        if len(buffer) > 0:
+            metrics['Buffer Length'] = len(buffer)
+            metrics['Buffer Scores'] = buffer.scores_np[:1000]
+            metrics['Buffer Mean Score'] = np.mean(buffer.scores_np)
 
     return metrics
 

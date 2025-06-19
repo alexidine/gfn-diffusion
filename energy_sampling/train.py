@@ -211,6 +211,10 @@ def train():
                         prev_rewards_dist = metrics['sample reward distribution']
 
             wandb.log(metrics, step=i)
+            del metrics
+            gc.collect()
+            torch.cuda.empty_cache()  # if any tensors are GPU-based
+
 
         elif i % 10 == 0:
             if args.scheduler:
@@ -370,8 +374,6 @@ def do_evaluation(energy_function, buffer, gfn_model, i, metrics, mol_loader):
                   do_figures,
                   mol_batch,
                   bwd_training=len(buffer) > 0))
-
-
 
     metrics.update({'Batch Size': args.batch_size})
     metrics.update(log_elapsed_times())

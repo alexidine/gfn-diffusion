@@ -220,9 +220,8 @@ class CrystalReplayBuffer():
                 inds_to_keep = np.arange(len(self.dataset) - self.buffer_size, len(self.dataset))
 
             self.dataset = [self.dataset[ind] for ind in inds_to_keep]
-            if hasattr(self, 'scores_np'):
-                self.scores_np = np.array([self.scores_np[ind] for ind in inds_to_keep])
-                self.build_sampler()
+            self.scores_np = np.array([self.scores_np[ind] for ind in inds_to_keep])
+            self.build_sampler()
 
         self.loader = DataLoader(
             self.dataset,
