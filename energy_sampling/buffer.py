@@ -1,3 +1,4 @@
+import copy
 import gc
 from typing import Optional
 
@@ -29,9 +30,9 @@ class CrystalReplayBuffer():
     def add(self, data_list):
         with torch.no_grad():
             if self.dataset is None:
-                self.dataset = data_list
+                self.dataset = copy.deepcopy(data_list)
             else:
-                self.dataset.extend(data_list)
+                self.dataset.extend(copy.deepcopy(data_list))
 
             if not hasattr(self, 'scores_np_list'):
                 self.scores_np_list = list(self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(
