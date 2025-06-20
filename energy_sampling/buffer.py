@@ -1,3 +1,4 @@
+import gc
 from typing import Optional
 
 import torch
@@ -196,21 +197,24 @@ class CrystalReplayBuffer():
         self.beta = beta
 
     def add(self, data_list):
+        gc.collect()
         if self.dataset is None:
             self.dataset = data_list
         else:
             self.dataset.extend(data_list)
 
         if not hasattr(self, 'scores_np'):
-            self.scores_np = self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(
-                len(self.dataset))).detach().cpu().view(-1).numpy()
+            with torch.no_grad():
+                self.scores_np = self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(
+                    len(self.dataset))).detach().cpu().view(-1).numpy()
         else:
-            self.scores_np = np.concatenate([
-                self.scores_np,
-                self.energy_function.prebuilt_sample_to_reward(
-                    data_list,
-                    temperature=torch.ones(len(data_list))).detach().cpu().view(-1).numpy()
-            ])
+            with torch.no_grad():
+                self.scores_np = np.concatenate([
+                    self.scores_np,
+                    self.energy_function.prebuilt_sample_to_reward(
+                        data_list,
+                        temperature=torch.ones(len(data_list))).detach().cpu().view(-1).numpy()
+                ])
         self.build_sampler()
 
         if len(self.dataset) > self.buffer_size:
@@ -223,14 +227,6 @@ class CrystalReplayBuffer():
             self.scores_np = np.array([self.scores_np[ind] for ind in inds_to_keep])
             self.build_sampler()
 
-        self.loader = DataLoader(
-            self.dataset,
-            batch_size=self.batch_size,
-            sampler=self.sampler,
-            num_workers=0,
-            pin_memory=True,
-            drop_last=False)
-
     def __len__(self):
         if self.dataset is None:
             return 0
@@ -239,7 +235,6 @@ class CrystalReplayBuffer():
 
     def build_sampler(self):  # todo add pruning / sampling according to diversity. Expensive to repeat though.
         weights = self.get_sampler_weights()
-
         self.sampler = torch.utils.data.WeightedRandomSampler(
             weights=weights, num_samples=len(self.scores_np), replacement=False
         )
@@ -262,25 +257,26 @@ class CrystalReplayBuffer():
                return_conditioning: Optional[bool] = False,
                override_batch: Optional[int] = None):
 
-        assert return_conditioning or (temperature is not None), "Must provide temperature or generate it here with return_conditioning=True"
+        assert return_conditioning or (
+                    temperature is not None), "Must provide temperature or generate it here with return_conditioning=True"
 
-        if override_batch is not None and override_batch != self.loader.batch_size:  # manual resampling if we want a custom batch size
-            ordered_inds = list(self.sampler)
-            if override_batch > len(ordered_inds):
-                rand_inds = np.random.choice(len(self.dataset),
-                                             size=override_batch,
-                                             replace=True,
-                                             p=self.get_sampler_weights)
-            else:
-                rand_inds = ordered_inds[:override_batch]
-            sample = collate_data_list([self.loader.dataset[ind] for ind in rand_inds])
+        if override_batch is not None:
+            batch_size = override_batch
         else:
-            sample = next(iter(self.loader))
+            batch_size = self.batch_size
+
+        # manual dataloader
+        rand_inds = np.random.choice(len(self.dataset),
+                                     size=batch_size,
+                                     replace=True,
+                                     p=self.get_sampler_weights())
+        sample = collate_data_list([self.dataset[ind] for ind in rand_inds])
 
         condition = self.energy_function.get_conditioning_tensor(sample)
         temperature = 10 ** condition[:, 0]  # first dimension is the log temperature
-        reward = self.energy_function.prebuilt_sample_to_reward(sample,
-                                                                temperature)  # recompute reward in case parameters have changed
+        with torch.no_grad():
+            reward = self.energy_function.prebuilt_sample_to_reward(sample,
+                                                                    temperature)  # recompute reward in case parameters have changed
 
         if return_conditioning:
             return sample.cell_params_to_gen_basis(), reward, sample, condition
