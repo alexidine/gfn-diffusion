@@ -213,8 +213,7 @@ def log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_
         if len(buffer) > 0:
             metrics['Buffer Length'] = len(buffer)
             metrics['Buffer Scores'] = np.array(buffer.scores_np_list[:1000])
-            metrics['Buffer Mean Score'] = np.mean(buffer.scores_np)
-
+            metrics['Buffer Mean Score'] = np.mean(buffer.scores_np_list)
     return metrics
 
 
