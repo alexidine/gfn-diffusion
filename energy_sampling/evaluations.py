@@ -108,8 +108,8 @@ def generate_eval_figs(buffer, bwd_training, condition, flow_states, gfn_model, 
     fig_dict['T vs Energy'] = T_vs_E_fig(condition, sample_batch)
     fig_dict['Pf Means and LogVars'] = mean_var_fig(logvars, means)
     fig_dict['Traj Mean Step Sizes'] = mean_flow_step_sizes(flow_states)
-    fig_dict['Pf vs R'] = Pf_vs_R_fig(log_pfs, log_r)
-    fig_dict['Pb vs R'] = Pf_vs_R_fig(log_pbs, log_r)
+    #fig_dict['Pf vs R'] = Pf_vs_R_fig(log_pfs, log_r)
+    #fig_dict['Pb vs R'] = Pf_vs_R_fig(log_pbs, log_r)
     fig_dict['Pf vs Pb'] = Pf_vs_Pb_fig(log_pfs, log_pbs, log_r)
     fig_dict['TB Parity Plot'] = flow_parity_plot(log_r, log_fs[:, 0], log_pbs, log_pfs)
     fig_dict['Lattice Latents Trajectories'] = visualize_latent_trajs(flow_states.cpu().detach().numpy(),
@@ -122,7 +122,7 @@ def generate_eval_figs(buffer, bwd_training, condition, flow_states, gfn_model, 
                                                           0].cpu().detach().numpy()) if condition is not None else None,
                                                          aux_scalar_name='log_temperature' if condition is not None else None)
     fig_dict['Sample Embedding'] = simple_embedding_fig(sample_batch,
-                                                        sample_batch.silu_pot.cpu().detach().numpy(),
+                                                        sample_batch.gfn_energy.cpu().detach().numpy(),
                                                         buffer_std_params_for_embedding,
                                                         )
     if bwd_training:
@@ -135,8 +135,8 @@ def generate_eval_figs(buffer, bwd_training, condition, flow_states, gfn_model, 
         fig_dict['Backward Latents Trajectories'] = visualize_latent_trajs(
             backward_flow_states.cpu().detach().numpy(),
             n_trajs=20, log_r=b_log_r.cpu().detach().numpy())
-        fig_dict['Backward Pf vs R'] = Pf_vs_R_fig(b_log_pfs, b_log_r)
-        fig_dict['Backward Pb vs R'] = Pf_vs_R_fig(b_log_pbs, b_log_r)
+        #fig_dict['Backward Pf vs R'] = Pf_vs_R_fig(b_log_pfs, b_log_r)
+        #fig_dict['Backward Pb vs R'] = Pf_vs_R_fig(b_log_pbs, b_log_r)
         fig_dict['Backward Pf vs Pb'] = Pf_vs_Pb_fig(b_log_pfs, b_log_pbs, b_log_r)
         fig_dict['Backward TB Parity Plot'] = flow_parity_plot(b_log_r.to(b_log_fs.device), b_log_fs[:, 0], b_log_pbs,
                                                                b_log_pfs)
@@ -192,6 +192,7 @@ def log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_
     metrics['eval/log_Z_lb'] = log_Z_lb.cpu().detach().numpy()
     metrics['eval/log_Z_learned'] = log_Z_learned.cpu().detach().numpy()
     metrics['eval/packing_coeff'] = sample_batch.packing_coeff.mean().cpu().detach().numpy()
+    metrics['packing coeff'] = sample_batch.packing_coeff.cpu().detach().numpy()
     metrics['eval/silu_potential'] = sample_batch.silu_pot.mean().cpu().detach().numpy()
     metrics['mean sample energy'] = sample_batch.gfn_energy.mean().cpu().detach().numpy()
     metrics['sample energy distribution'] = sample_batch.gfn_energy.cpu().detach().numpy()
@@ -211,7 +212,7 @@ def log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_
     if buffer is not None:
         if len(buffer) > 0:
             metrics['Buffer Length'] = len(buffer)
-            metrics['Buffer Scores'] = buffer.scores_np[:1000]
+            metrics['Buffer Scores'] = np.array(buffer.scores_np_list[:1000])
             metrics['Buffer Mean Score'] = np.mean(buffer.scores_np)
 
     return metrics
@@ -230,10 +231,12 @@ def Z_vs_T_fig(gfn_model, init_state):
 
 def T_vs_E_fig(condition, sample_batch):
     fig = go.Figure()
-    fig.add_histogram2d(x=condition[:, 0].cpu().detach().numpy(),
-                        y=sample_batch.gfn_energy.cpu().detach().numpy(),
+    x = condition[:, 0].cpu().detach().numpy()
+    y = sample_batch.gfn_energy.cpu().detach().numpy()
+    fig.add_histogram2d(x=x,
+                        y=np.log10(y-y.min()),
                         showscale=False,
-                        nbinsx=25, nbinsy=50)
+                        nbinsx=50, nbinsy=50)
     fig.update_layout(xaxis_title='Log Temperature', yaxis_title='Sample Energy')
     return fig
 
