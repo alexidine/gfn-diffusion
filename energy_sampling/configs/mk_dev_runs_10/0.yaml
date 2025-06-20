@@ -5,7 +5,7 @@ batch_size: 25
 beta: 1.0
 both_ways: true
 buffer_path: /scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt
-buffer_size: 25000
+buffer_size: 10000
 burn_in: 100
 bwd: false
 bwd_batch_multiplier: 2
