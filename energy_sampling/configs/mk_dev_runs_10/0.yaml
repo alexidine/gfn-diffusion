@@ -24,7 +24,7 @@ energy_static_temperature: 1
 epochs: 10000000
 eval: false
 eval_batch_size: 1000
-eval_period: 250
+eval_period: 25
 exploration_factor: 0.35
 exploration_wd: true
 exploratory: true
