@@ -24,7 +24,7 @@ def fwd_tb(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=None, r
 
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
-    log_ratio = log_pf + log_fs[:, 0] - log_pb - log_r
+    log_ratio = (log_pf + log_fs[:, 0] - log_pb - log_r).clip(min=-10, max=10)
     #loss = 0.5 * (log_ratio ** 2)
     loss = F.smooth_l1_loss(log_ratio, torch.zeros_like(log_ratio),
                             reduction='none')  # a more stable loss, though we lose some theoretical guarantees
@@ -38,8 +38,7 @@ def bwd_tb(terminal_state, gfn, log_r, exploration_std=None, condition=None, ret
     states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, exploration_std, condition)
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
-    log_ratio = log_pf + log_fs[:, 0] - log_pb - log_r
-    #loss = 0.5 * (log_ratio ** 2)
+    log_ratio = (log_pf + log_fs[:, 0] - log_pb - log_r).clip(min=-10, max=10)    #loss = 0.5 * (log_ratio ** 2)
     loss = F.smooth_l1_loss(log_ratio, torch.zeros_like(log_ratio),
                             reduction='none')  # a more stable loss, though we lose some theoretical guarantees
 
