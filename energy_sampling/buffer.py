@@ -35,24 +35,24 @@ class CrystalReplayBuffer():
                 self.dataset.extend(copy.deepcopy(data_list))
 
             if not hasattr(self, 'scores_np_list'):
-                self.scores_np_list = list(self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(
-                    len(self))).detach().cpu().view(-1).numpy())
+                self.scores_np_list = list(
+                    self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(
+                        len(self))).detach().cpu().view(-1).numpy())
             else:
-                self.scores_np_list.extend(self.energy_function.prebuilt_sample_to_reward(
-                        data_list,
-                        temperature=torch.ones(len(data_list))).detach().cpu().view(-1).numpy()
-                )
-            self.build_sampler()
+                self.scores_np_list.extend(
+                    list(self.energy_function.prebuilt_sample_to_reward(
+                    data_list,
+                    temperature=torch.ones(len(data_list))).detach().cpu().view(-1).numpy())
+                    )
 
             if len(self) > self.buffer_size:
                 if hasattr(self, 'sampler'):
-                    inds_to_keep = list(self.sampler)[:self.buffer_size]
+                    inds_to_keep = self.get_sample_indices(self.buffer_size)
                 else:
                     inds_to_keep = np.arange(len(self) - self.buffer_size, len(self))
 
                 self.dataset = [self.dataset[ind] for ind in inds_to_keep]
                 self.scores_np_list = [self.scores_np_list[ind] for ind in inds_to_keep]
-                self.build_sampler()
 
         gc.collect()
 
@@ -62,25 +62,26 @@ class CrystalReplayBuffer():
         else:
             return len(self.dataset)
 
-    def build_sampler(self):  # todo add pruning / sampling according to diversity. Expensive to repeat though.
-        weights = self.get_sampler_weights()
-        self.sampler = torch.utils.data.WeightedRandomSampler(
-            weights=weights, num_samples=len(self), replacement=False
-        )
+    def get_sample_indices(self, batch_size):  # todo add pruning / sampling according to diversity. Expensive to repeat though.
+        inds = np.random.choice(len(self),
+                                size=batch_size,
+                                replace=True,
+                                p=self.get_sampler_weights())
+        return inds
 
     def get_sampler_weights(self):
         scores = np.array(self.scores_np_list)
         if self.prioritized == 'rank':
             ranks = np.argsort(np.argsort(-1 * scores))
-            weights = 1.0 / (self.rank_weight * len(scores) + ranks)
+            weights_i = 1.0 / (self.rank_weight * len(scores) + ranks)
         elif self.prioritized == 'boltzmann':
             logits = scores / self.beta
-            logits = logits - np.max(logits)  # subtract max for stability
-            weights_i = np.exp(logits)
-            weights = weights_i / np.sum(weights_i)
-        else:
-            weights = torch.ones(len(scores))
-        return weights
+            logits -= np.max(logits)  # subtract max for stability
+            weights_i = np.nan_to_num(np.exp(logits))
+        else:  # uniform weights
+            weights_i = np.ones(len(scores))
+
+        return weights_i / np.sum(weights_i)  # enforce explicit normalization
 
     def sample(self,
                temperature: Optional[torch.tensor] = None,
@@ -88,7 +89,7 @@ class CrystalReplayBuffer():
                override_batch: Optional[int] = None):
 
         assert return_conditioning or (
-                    temperature is not None), "Must provide temperature or generate it here with return_conditioning=True"
+                temperature is not None), "Must provide temperature or generate it here with return_conditioning=True"
 
         if override_batch is not None:
             batch_size = override_batch
@@ -96,17 +97,14 @@ class CrystalReplayBuffer():
             batch_size = self.batch_size
 
         # manual dataloader
-        rand_inds = np.random.choice(len(self),
-                                     size=batch_size,
-                                     replace=True,
-                                     p=self.get_sampler_weights())
+        rand_inds = self.get_sample_indices(batch_size)
         sample = collate_data_list([self.dataset[ind] for ind in rand_inds])
 
         condition = self.energy_function.get_conditioning_tensor(sample)
         temperature = 10 ** condition[:, 0]  # first dimension is the log temperature
         with torch.no_grad():
-            reward = self.energy_function.prebuilt_sample_to_reward(sample,
-                                                                    temperature)  # recompute reward in case parameters have changed
+            reward = self.energy_function.prebuilt_sample_to_reward(
+                sample, temperature)  # recompute reward in case parameters have changed
 
         if return_conditioning:
             return sample.cell_params_to_gen_basis(), reward, sample, condition

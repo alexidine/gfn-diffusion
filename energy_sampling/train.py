@@ -308,13 +308,6 @@ def grow_batch_size(buffer, mol_loader):
         args.batch_size = new_batch_size  # gradually increment batch size
 
         if len(buffer) > 0:
-            buffer.loader = DataLoader(
-                buffer.dataset,
-                batch_size=new_batch_size,
-                sampler=buffer.sampler,
-                num_workers=0,
-                pin_memory=True,
-                drop_last=True)
             buffer.batch_size = new_batch_size
 
         mol_loader = DataLoader(
