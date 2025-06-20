@@ -197,35 +197,33 @@ class CrystalReplayBuffer():
         self.beta = beta
 
     def add(self, data_list):
-        gc.collect()
-        if self.dataset is None:
-            self.dataset = data_list
-        else:
-            self.dataset.extend(data_list)
+        with torch.no_grad():
+            if self.dataset is None:
+                self.dataset = data_list
+            else:
+                self.dataset.extend(data_list)
 
-        if not hasattr(self, 'scores_np'):
-            with torch.no_grad():
-                self.scores_np = self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(
-                    len(self.dataset))).detach().cpu().view(-1).numpy()
-        else:
-            with torch.no_grad():
-                self.scores_np = np.concatenate([
-                    self.scores_np,
-                    self.energy_function.prebuilt_sample_to_reward(
+            if not hasattr(self, 'scores_np'):
+                self.scores_np_list = list(self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(
+                    len(self))).detach().cpu().view(-1).numpy())
+            else:
+                self.scores_np_list.extend(self.energy_function.prebuilt_sample_to_reward(
                         data_list,
                         temperature=torch.ones(len(data_list))).detach().cpu().view(-1).numpy()
-                ])
-        self.build_sampler()
-
-        if len(self.dataset) > self.buffer_size:
-            if hasattr(self, 'sampler'):
-                inds_to_keep = list(self.sampler)[:self.buffer_size]
-            else:
-                inds_to_keep = np.arange(len(self.dataset) - self.buffer_size, len(self.dataset))
-
-            self.dataset = [self.dataset[ind] for ind in inds_to_keep]
-            self.scores_np = np.array([self.scores_np[ind] for ind in inds_to_keep])
+                )
             self.build_sampler()
+
+            if len(self) > self.buffer_size:
+                if hasattr(self, 'sampler'):
+                    inds_to_keep = list(self.sampler)[:self.buffer_size]
+                else:
+                    inds_to_keep = np.arange(len(self) - self.buffer_size, len(self))
+
+                self.dataset = [self.dataset[ind] for ind in inds_to_keep]
+                self.scores_np_list = [self.scores_np_list[ind] for ind in inds_to_keep]
+                self.build_sampler()
+
+        gc.collect()
 
     def __len__(self):
         if self.dataset is None:
@@ -236,20 +234,21 @@ class CrystalReplayBuffer():
     def build_sampler(self):  # todo add pruning / sampling according to diversity. Expensive to repeat though.
         weights = self.get_sampler_weights()
         self.sampler = torch.utils.data.WeightedRandomSampler(
-            weights=weights, num_samples=len(self.scores_np), replacement=False
+            weights=weights, num_samples=len(self), replacement=False
         )
 
     def get_sampler_weights(self):
+        scores = np.array(self.scores_np_list)
         if self.prioritized == 'rank':
-            ranks = np.argsort(np.argsort(-1 * self.scores_np))
-            weights = 1.0 / (self.rank_weight * len(self.scores_np) + ranks)
+            ranks = np.argsort(np.argsort(-1 * scores))
+            weights = 1.0 / (self.rank_weight * len(scores) + ranks)
         elif self.prioritized == 'boltzmann':
-            logits = self.scores_np / self.beta
+            logits = scores / self.beta
             logits = logits - np.max(logits)  # subtract max for stability
             weights_i = np.exp(logits)
             weights = weights_i / np.sum(weights_i)
         else:
-            weights = torch.ones(len(self.scores_np))
+            weights = torch.ones(len(scores))
         return weights
 
     def sample(self,
@@ -266,7 +265,7 @@ class CrystalReplayBuffer():
             batch_size = self.batch_size
 
         # manual dataloader
-        rand_inds = np.random.choice(len(self.dataset),
+        rand_inds = np.random.choice(len(self),
                                      size=batch_size,
                                      replace=True,
                                      p=self.get_sampler_weights())
