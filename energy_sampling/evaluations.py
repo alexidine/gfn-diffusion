@@ -8,7 +8,6 @@ from matplotlib import cm
 from matplotlib.colors import to_hex
 from mxtaltools.reporting.online import simple_embedding_fig, simple_cell_hist, simple_cell_scatter_fig, \
     log_crystal_samples, simple_latent_hist
-from mxtaltools.dataset_utils.utils import collate_data_list
 from plotly import graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.stats import pearsonr
@@ -21,21 +20,25 @@ from utils import logmeanexp
 @torch.no_grad()
 def log_partition_function(initial_state, gfn, energy_function, mol_batch):
     condition = energy_function.get_conditioning_tensor(mol_batch)
-    states, log_pfs, log_pbs, log_fs, means, logvars = gfn.get_trajectory_fwd(initial_state,
+    (states, log_pfs, log_pbs, log_fs,
+     means_f, logvars_f, means_b, logvars_b) = gfn.get_trajectory_fwd(initial_state,
                                                                               None,
                                                                               energy_function,
                                                                               condition,
                                                                               return_gauss_params=True)
-    log_r, sample_batch = energy_function.log_reward(states[:, -1], mol_batch=mol_batch,
-                                                     log_temperature=condition[:, 0], return_exp=True)
+    log_r, sample_batch = energy_function.log_reward(
+        states[:, -1], mol_batch=mol_batch,
+        log_temperature=condition[:, 0],
+        return_exp=True)
     log_weight = log_r + log_pbs.sum(-1) - log_pfs.sum(-1)
 
     log_Z = logmeanexp(log_weight)
     log_Z_lb = log_weight.mean()
     log_Z_learned = log_fs[:, 0].mean()
 
-    return states, states[:,
-                   -1], log_r, log_Z, log_Z_lb, log_Z_learned, sample_batch, condition, log_pfs, log_pbs, log_fs, means, logvars
+    return (states, states[:,
+                   -1], log_r, log_Z, log_Z_lb, log_Z_learned, sample_batch, condition,
+            log_pfs, log_pbs, log_fs, means_f, logvars_f, means_b, logvars_b)
 
 
 @torch.no_grad()
@@ -66,7 +69,8 @@ def eval_step(energy_function,
     gfn_model.eval()
 
     (flow_states, samples, log_r, log_Z, log_Z_lb,
-     log_Z_learned, sample_batch, condition, log_pfs, log_pbs, log_fs, means, logvars) = log_partition_function(
+     log_Z_learned, sample_batch, condition, log_pfs, log_pbs, log_fs,
+     f_vars_f, f_means_f, f_vars_b, f_means_b) = log_partition_function(
         init_state, gfn_model, energy_function, mol_batch)
 
     metrics = log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_Z_learned, log_r,
@@ -77,7 +81,8 @@ def eval_step(energy_function,
                                       condition, flow_states,
                                       gfn_model, init_state, log_fs,
                                       log_pbs, log_pfs, log_r,
-                                      logvars, means, sample_batch)
+                                      f_vars_f, f_means_f, f_vars_b, f_means_b,
+                                      sample_batch)
         metrics.update(fig_dict)
 
     "Crystal samples"
@@ -93,7 +98,7 @@ def eval_step(energy_function,
 
 
 def generate_eval_figs(buffer, bwd_training, condition, flow_states, gfn_model, init_state, log_fs, log_pbs,
-                       log_pfs, log_r, logvars, means, sample_batch):
+                       log_pfs, log_r, f_vars_f, f_means_f, f_vars_b, f_means_b, sample_batch):
     # todo figs to add
     # pairwise dists to eval sample and dataset
     # RDF dists of same
@@ -106,7 +111,8 @@ def generate_eval_figs(buffer, bwd_training, condition, flow_states, gfn_model, 
     fig_dict = {}
     fig_dict['Learned Z vs T'] = Z_vs_T_fig(gfn_model, init_state)
     fig_dict['T vs Energy'] = T_vs_E_fig(condition, sample_batch)
-    fig_dict['Pf Means and LogVars'] = mean_var_fig(logvars, means)
+    fig_dict['Forward Gauss Params'] = mean_var_fig(f_vars_f, f_means_f,
+                                                    f_vars_b, f_means_b)
     fig_dict['Traj Mean Step Sizes'] = mean_flow_step_sizes(flow_states)
     #fig_dict['Pf vs R'] = Pf_vs_R_fig(log_pfs, log_r)
     #fig_dict['Pb vs R'] = Pf_vs_R_fig(log_pbs, log_r)
@@ -129,7 +135,8 @@ def generate_eval_figs(buffer, bwd_training, condition, flow_states, gfn_model, 
         terminal_state, b_log_r, crystal_batch, condition = buffer.sample(
             return_conditioning=True,
             override_batch=len(init_state))
-        backward_flow_states, b_log_pfs, b_log_pbs, b_log_fs, b_means, b_vars = gfn_model.get_trajectory_bwd(
+        (backward_flow_states, b_log_pfs, b_log_pbs, b_log_fs,
+         b_means_f, b_vars_f, b_means_b, b_vars_b) = gfn_model.get_trajectory_bwd(
             terminal_state.to(gfn_model.device), None,
             condition.to(gfn_model.device), return_gauss_params=True)
         fig_dict['Backward Latents Trajectories'] = visualize_latent_trajs(
@@ -140,7 +147,8 @@ def generate_eval_figs(buffer, bwd_training, condition, flow_states, gfn_model, 
         fig_dict['Backward Pf vs Pb'] = Pf_vs_Pb_fig(b_log_pfs, b_log_pbs, b_log_r)
         fig_dict['Backward TB Parity Plot'] = flow_parity_plot(b_log_r.to(b_log_fs.device), b_log_fs[:, 0], b_log_pbs,
                                                                b_log_pfs)
-        fig_dict['Pb Means and LogVars'] = mean_var_fig(b_vars, b_means)
+        fig_dict['Backward Gauss Params'] = mean_var_fig(b_vars_f, b_means_f,
+                                                        b_vars_b, b_means_b)
 
     for key in fig_dict.keys():
         fig = fig_dict[key]
@@ -165,10 +173,12 @@ def get_buffer_stats(buffer):
     return buffer_cell_params, buffer_latent_params, buffer_std_params_for_embedding
 
 
-def mean_var_fig(logvars, means):
+def mean_var_fig(logvars_f, means_f, logvars_b, means_b):
     fig = go.Figure()
-    fig.add_scatter(y=logvars.mean(0).cpu().detach(), name='Pf LogVar')
-    fig.add_scatter(y=means.abs().mean(0).log10().cpu().detach(), name='Pf Means')
+    fig.add_scatter(y=logvars_f.mean(0).cpu().detach(), name='Pf LogVar')
+    fig.add_scatter(y=means_f.abs().mean(0).log10().cpu().detach(), name='Pf Means')
+    fig.add_scatter(y=logvars_b.mean(0).cpu().detach(), name='Pb LogVar')
+    fig.add_scatter(y=means_b.abs().mean(0).log10().cpu().detach(), name='Pb Means')
     fig.update_layout(xaxis_title='Trajectory Step')
     return fig
 
@@ -212,7 +222,10 @@ def log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_
     if buffer is not None:
         if len(buffer) > 0:
             metrics['Buffer Length'] = len(buffer)
-            metrics['Buffer Scores'] = np.array(buffer.scores_np_list[:1000])
+            metrics['Buffer Quantiles'] = np.array([
+                np.quantile(buffer.scores_np_list, q=p)
+                for p in np.linspace(0, 1, 50)
+            ])
             metrics['Buffer Mean Score'] = np.mean(buffer.scores_np_list)
     return metrics
 
@@ -233,7 +246,7 @@ def T_vs_E_fig(condition, sample_batch):
     x = condition[:, 0].cpu().detach().numpy()
     y = sample_batch.gfn_energy.cpu().detach().numpy()
     fig.add_histogram2d(x=x,
-                        y=np.log10(y-y.min()),
+                        y=np.log10(y-y.min() + 1e-3),
                         showscale=False,
                         nbinsx=50, nbinsy=50)
     fig.update_layout(xaxis_title='Log Temperature', yaxis_title='Sample Energy')

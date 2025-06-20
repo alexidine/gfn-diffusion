@@ -13,6 +13,7 @@ from .base_set import BaseSet
 
 class MolecularCrystal(BaseSet):
     def __init__(self, device,
+                 energy_function: str,
                  dim: int = 12,
                  space_group: int = 2,
                  max_temperature: float = 10,
@@ -26,6 +27,7 @@ class MolecularCrystal(BaseSet):
         self.device = device
         self.data_ndim = dim
         self.space_group = space_group
+        self.energy_function = energy_function
 
         self.ellipsoid_scale = 1
         self.density_coeff = density_coeff
@@ -52,20 +54,22 @@ class MolecularCrystal(BaseSet):
         lj_energy, normed_lj_energy = cluster_batch.compute_LJ_energy()
         silu_energy = cluster_batch.compute_silu_energy()  # softened short-range LJ-type energy
 
-        # if not hasattr(self, 'ellipsoid_model'):
-        #     cluster_batch.load_ellipsoid_model()
-        #     self.ellipsoid_model = copy.deepcopy(cluster_batch.ellipsoid_model)
-        #     self.ellipsoid_model = self.ellipsoid_model.to(self.device)
-        #     self.ellipsoid_model.eval()
-        # # simplified ellipsoid energy testing
-        # _, _, _, _, _, _, normed_ellipsoid_overlap \
-        #     = cluster_batch.compute_ellipsoidal_overlap(
-        #     semi_axis_scale=self.ellipsoid_scale,
-        #     model=self.ellipsoid_model,
-        #     return_details=True)
+        if self.energy_function == 'ellipsoid_overlap':
+            if not hasattr(self, 'ellipsoid_model'):
+                cluster_batch.load_ellipsoid_model()
+                self.ellipsoid_model = copy.deepcopy(cluster_batch.ellipsoid_model)
+                self.ellipsoid_model = self.ellipsoid_model.to(self.device)
+                self.ellipsoid_model.eval()
+            # simplified ellipsoid energy testing
+            _, _, _, _, _, _, normed_ellipsoid_overlap \
+                = cluster_batch.compute_ellipsoidal_overlap(
+                semi_axis_scale=self.ellipsoid_scale,
+                model=self.ellipsoid_model,
+                return_details=True)
 
-        # cluster_batch.ellipsoid_overlap = normed_ellipsoid_overlap.flatten()
-        # cluster_batch.ellipsoid_overlap = torch.ones_like(silu_energy)
+            cluster_batch.ellipsoid_overlap = normed_ellipsoid_overlap.flatten()
+        else:
+            cluster_batch.ellipsoid_overlap = torch.ones_like(silu_energy)
 
         cluster_batch.silu_pot = silu_energy
         cluster_batch.lj_pot = lj_energy
@@ -77,14 +81,23 @@ class MolecularCrystal(BaseSet):
             return crystal_energy
 
     def generator_energy(self, cluster_batch):
-        #density_energy = F.relu(-(cluster_batch.packing_coeff - 1)) ** 2
-        #intermolecular_energy = self.soften_LJ_energy(cluster_batch.silu_pot) / cluster_batch.num_atoms
-        #intermolecular_energy = cluster_batch.ellipsoid_overlap
-        #crystal_energy = intermolecular_energy + self.density_coeff * density_energy
+        if self.energy_function == 'simple_density':
+            crystal_energy = F.mse_loss(cluster_batch.packing_coeff,
+                                        torch.ones_like(cluster_batch.packing_coeff) * 0.7142,
+                                        reduction='none').clip(max=10)
 
-        crystal_energy = F.smooth_l1_loss(cluster_batch.packing_coeff,
-                                          torch.ones_like(cluster_batch.packing_coeff) * 0.7142,
-                                          reduction='none') - 0.1
+        elif self.energy_function == 'ellipsoid_overlap':
+            density_energy = F.relu(-(cluster_batch.packing_coeff - 1)) ** 2
+            intermolecular_energy = cluster_batch.ellipsoid_overlap
+            crystal_energy = intermolecular_energy + self.density_coeff * density_energy
+
+        elif self.energy_function == 'silu_energy':
+            density_energy = F.relu(-(cluster_batch.packing_coeff - 1)) ** 2
+            intermolecular_energy = self.soften_LJ_energy(cluster_batch.silu_pot) / cluster_batch.num_atoms
+            crystal_energy = intermolecular_energy + self.density_coeff * density_energy
+
+        else:
+            assert False, f'{self.energy_function} not implemented'
 
         return crystal_energy
 
@@ -157,7 +170,8 @@ class MolecularCrystal(BaseSet):
             lj_pot=torch.zeros(1, device=self.device),
             scaled_lj_pot=torch.zeros(1, device=self.device),
             es_pot=torch.zeros(1, device=self.device),
-            #ellipsoid_overlap=torch.zeros(1, device=self.device)
+            ellipsoid_overlap=torch.zeros(1,
+                                          device=self.device) if self.energy_function == 'ellipsoid_overlap' else None,
         ) for ind in range(len(mol_batch))]).to(self.device)
 
         return crystal_batch
@@ -190,7 +204,7 @@ class MolecularCrystal(BaseSet):
                                 mol_batch,
                                 temperature: torch.tensor = None,
                                 ):
-        """Todo add autoencoder conditioning"""
+
         if self.temperature_conditioning:
             if temperature is None:  # sample randomly in log space
                 rands = torch.rand(mol_batch.num_graphs, device=mol_batch.device, dtype=torch.float32)

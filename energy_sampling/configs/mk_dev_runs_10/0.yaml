@@ -5,7 +5,7 @@ batch_size: 25
 beta: 1.0
 both_ways: true
 buffer_path: /scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt
-buffer_size: 15000
+buffer_size: 25000
 burn_in: 100
 bwd: false
 bwd_batch_multiplier: 2
@@ -18,13 +18,14 @@ dropout: 0
 energy: molecular_crystal
 energy_annealing_threshold: 0.1
 energy_density_coeff: 0.1
+energy_function: simple_density
 energy_max_temperature: 10
 energy_min_temperature: 0.05
 energy_static_temperature: 1
 epochs: 10000000
 eval: false
 eval_batch_size: 1000
-eval_period: 25
+eval_period: 250
 exploration_factor: 0.35
 exploration_wd: true
 exploratory: true

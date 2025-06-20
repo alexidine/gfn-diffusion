@@ -77,6 +77,9 @@ wd_max_steps: 2000  # number of steps to terminate the added variance
 # molecular crystal settings
 ################################################################
 # scales the energy function
+energy_function: simple_density  # 'simple_density' : make samples with a target packing coefficient,
+  # 'ellipsoid_overlap' : minimize ellipsoid overlaps subject to energy_density_coeff external pressure
+  # 'silu_energy' : minimize a softened LJ-tye energy subject to energy_density_coeff external pressure
 anneal_energy: true  # harden intermolecular repulsion over time
 energy_annealing_threshold: 1.0e-1 # 5.0e-2
 convergence_history: 100

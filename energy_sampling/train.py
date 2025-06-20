@@ -67,7 +67,6 @@ def train_step(energy_function, gfn_model, gfn_optimizer, it, exploration_std, b
                                                                                       )
         if add_to_buffer:
             buffer.add(crystal_batch.cpu().detach().to_data_list())
-            del crystal_batch
 
     elif do_backward:
         loss, states, log_pfs, log_pbs, log_r, log_fs = bwd_train_step(gfn_model,
@@ -125,6 +124,7 @@ def train():
         os.makedirs(name)
 
     energy_function = MolecularCrystal(device=device,
+                                       energy_function=args.energy_function,
                                        min_temperature=args.energy_min_temperature,
                                        max_temperature=args.energy_max_temperature,
                                        temperature_scaling_factor=args.temperature_scaling_factor,
@@ -400,35 +400,37 @@ def handle_oom(batch_size):
 def add_dataset_to_buffer(dataset_path, buffer):
     print("Loading prebuilt buffer")
     dataset = torch.load(dataset_path)
-    # if True:  # add ellipsoid overlaps to each sample here, as they weren't in the original optimization
-    #     from tqdm import tqdm
-    #     batch_size = 500
-    #     loader = DataLoader(
-    #         dataset,
-    #         batch_size=batch_size,
-    #         drop_last=False
-    #     )
-    #     overlaps = []
-    #
-    #     for crystal_batch in tqdm(loader):
-    #         crystal_batch = crystal_batch.to('cuda')
-    #         crystal_batch.box_analysis()
-    #         cluster_batch = crystal_batch.mol2cluster(cutoff=6,
-    #                                                   supercell_size=10,
-    #                                                   align_to_standardized_orientation=True)
-    #
-    #         cluster_batch.construct_radial_graph(cutoff=6)
-    #         # simplified ellipsoid energy testing
-    #         _, _, _, _, _, _, normed_ellipsoid_overlap \
-    #             = cluster_batch.compute_ellipsoidal_overlap(
-    #             semi_axis_scale=1,
-    #             return_details=True)
-    #
-    #         overlaps.extend(normed_ellipsoid_overlap.cpu().detach().numpy())
-    #
-    #     overlaps = torch.tensor(overlaps)
-    #     for ind, elem in enumerate(dataset):
-    #         elem.ellipsoid_overlap = torch.ones(1) * overlaps[ind]
+    if args.energy_function == 'ellipsoid_overlap':  # add ellipsoid overlaps to each sample here, as they weren't in the original optimization
+        print("Adding ellipsoid information to buffer")
+
+        from tqdm import tqdm
+        batch_size = 500
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            drop_last=False
+        )
+        overlaps = []
+
+        for crystal_batch in tqdm(loader):
+            crystal_batch = crystal_batch.to('cuda')
+            crystal_batch.box_analysis()
+            cluster_batch = crystal_batch.mol2cluster(cutoff=6,
+                                                      supercell_size=10,
+                                                      align_to_standardized_orientation=True)
+
+            cluster_batch.construct_radial_graph(cutoff=6)
+            # simplified ellipsoid energy testing
+            _, _, _, _, _, _, normed_ellipsoid_overlap \
+                = cluster_batch.compute_ellipsoidal_overlap(
+                semi_axis_scale=1,
+                return_details=True)
+
+            overlaps.extend(normed_ellipsoid_overlap.cpu().detach().numpy())
+
+        overlaps = torch.tensor(overlaps)
+        for ind, elem in enumerate(dataset):
+            elem.ellipsoid_overlap = torch.ones(1) * overlaps[ind]
 
     buffer.add(dataset)
     print(f"Buffer loaded with {len(dataset)} samples")
