@@ -67,6 +67,8 @@ def train_step(energy_function, gfn_model, gfn_optimizer, it, exploration_std, b
                                                                                       )
         if add_to_buffer:
             buffer.add(crystal_batch.cpu().detach().to_data_list())
+            del crystal_batch
+
     elif do_backward:
         loss, states, log_pfs, log_pbs, log_r, log_fs = bwd_train_step(gfn_model,
                                                                        buffer,

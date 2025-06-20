@@ -48,6 +48,7 @@ class MolecularCrystal(BaseSet):
                                                   align_to_standardized_orientation=True)
 
         cluster_batch.construct_radial_graph(cutoff=6)
+
         lj_energy, normed_lj_energy = cluster_batch.compute_LJ_energy()
         silu_energy = cluster_batch.compute_silu_energy()  # softened short-range LJ-type energy
 
@@ -64,7 +65,8 @@ class MolecularCrystal(BaseSet):
         #     return_details=True)
 
         # cluster_batch.ellipsoid_overlap = normed_ellipsoid_overlap.flatten()
-        #cluster_batch.ellipsoid_overlap = torch.ones_like(silu_energy)
+        # cluster_batch.ellipsoid_overlap = torch.ones_like(silu_energy)
+
         cluster_batch.silu_pot = silu_energy
         cluster_batch.lj_pot = lj_energy
         crystal_energy = self.generator_energy(cluster_batch)
@@ -75,10 +77,14 @@ class MolecularCrystal(BaseSet):
             return crystal_energy
 
     def generator_energy(self, cluster_batch):
-        density_energy = F.relu(-(cluster_batch.packing_coeff - 1)) ** 2
-        intermolecular_energy = self.soften_LJ_energy(cluster_batch.silu_pot) / cluster_batch.num_atoms
+        #density_energy = F.relu(-(cluster_batch.packing_coeff - 1)) ** 2
+        #intermolecular_energy = self.soften_LJ_energy(cluster_batch.silu_pot) / cluster_batch.num_atoms
         #intermolecular_energy = cluster_batch.ellipsoid_overlap
-        crystal_energy = intermolecular_energy + self.density_coeff * density_energy
+        #crystal_energy = intermolecular_energy + self.density_coeff * density_energy
+
+        crystal_energy = F.smooth_l1_loss(cluster_batch.packing_coeff,
+                                          torch.ones_like(cluster_batch.packing_coeff) * 0.7142,
+                                          reduction='none') - 0.1
 
         return crystal_energy
 
