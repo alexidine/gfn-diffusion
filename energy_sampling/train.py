@@ -57,7 +57,7 @@ def train_step(energy_function, gfn_model, gfn_optimizer, it, exploration_std, b
         do_forward = True
 
     if do_forward:
-        mol_batch = next(iter(mol_loader)).to(device)  # todo add here optional mol adjustments
+        mol_batch = next(iter(mol_loader)).to(device)
         loss, states, log_pfs, log_pbs, log_r, log_fs, crystal_batch = fwd_train_step(energy_function,
                                                                                       gfn_model,
                                                                                       exploration_std,
@@ -65,7 +65,7 @@ def train_step(energy_function, gfn_model, gfn_optimizer, it, exploration_std, b
                                                                                       return_exp=True,
                                                                                       repeats=repeats,
                                                                                       )
-        if add_to_buffer:
+        if False: #add_to_buffer:
             buffer.add(crystal_batch.cpu().detach().to_data_list())
     elif do_backward:
         loss, states, log_pfs, log_pbs, log_r, log_fs = bwd_train_step(gfn_model,
