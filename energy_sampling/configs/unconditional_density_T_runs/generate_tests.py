@@ -79,6 +79,34 @@ config_list.append(
         'mode_bwd': 'cond-tb-avg'
     }
 )
+config_list.append(
+    {
+        'energy_min_temperature': 0.01,
+        'energy_max_temperature': 0.01,
+        'mode_fwd': 'tb',
+        'mode_bwd': 'tb',
+        'both_ways': True,
+    }
+)
+config_list.append(
+    {
+        'energy_min_temperature': 0.1,
+        'energy_max_temperature': 0.1,
+        'mode_fwd': 'tb',
+        'mode_bwd': 'tb',
+        'both_ways': True,
+    }
+)
+
+config_list.append(
+    {
+        'energy_min_temperature': 1,
+        'energy_max_temperature': 1,
+        'mode_fwd': 'tb',
+        'mode_bwd': 'tb',
+        'both_ways': True,
+    }
+)
 
 
 
