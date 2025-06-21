@@ -202,7 +202,7 @@ def log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_
     metrics['eval/log_Z_lb'] = log_Z_lb.cpu().detach().numpy()
     metrics['eval/log_Z_learned'] = log_Z_learned.cpu().detach().numpy()
     metrics['eval/packing_coeff'] = sample_batch.packing_coeff.mean().cpu().detach().numpy()
-    metrics['packing coeff'] = sample_batch.packing_coeff.cpu().detach().numpy()
+    metrics['packing coeff'] = sample_batch.packing_coeff.clip(max=2).cpu().detach().numpy()
     metrics['eval/silu_potential'] = sample_batch.silu_pot.mean().cpu().detach().numpy()
     metrics['mean sample energy'] = sample_batch.gfn_energy.mean().cpu().detach().numpy()
     metrics['sample energy distribution'] = sample_batch.gfn_energy.cpu().detach().numpy()

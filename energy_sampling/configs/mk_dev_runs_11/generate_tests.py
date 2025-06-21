@@ -37,7 +37,7 @@ config_list.append(
         'max_batch_size': 2000,
         't_scale': 1.0
 
-    }  # 0, tb small pb
+    }  # 0, tb small pb # very fat distributions, forward tb diverges, training diverges catastrophically
 )
 config_list.append(
     {
@@ -47,7 +47,7 @@ config_list.append(
         'max_batch_size': 500,
         't_scale': 1.0
 
-    }  # 1, vargrad small pb
+    }  # 1, vargrad small pb, crashed early, not so fat distributions?
 )
 config_list.append(
     {
@@ -57,7 +57,7 @@ config_list.append(
         'max_batch_size': 2000,
         't_scale': 1.0
 
-    }  # 2, tb large pb
+    }  # 2, tb large pb, very fat dists, similar to 0
 )
 config_list.append(
     {
@@ -67,7 +67,7 @@ config_list.append(
         'max_batch_size': 500,
         't_scale': 1.0
 
-    }  # 3, vargrad large pb
+    }  # 3, vargrad large pb, crashed early but going OK
 )
 config_list.append(
     {
@@ -77,7 +77,7 @@ config_list.append(
         'max_batch_size': 2000,
         't_scale': 2.0
 
-    }  # 4, tb large pf and pb
+    }  # 4, tb large pf and pb, fat again
 )
 config_list.append(
     {
@@ -87,7 +87,7 @@ config_list.append(
         'max_batch_size': 500,
         't_scale': 2.0
 
-    }  # 5, vargrad large pf and pb
+    }  # 5, vargrad large pf and pb, total insanity
 )
 config_list.append(
     {
@@ -97,7 +97,7 @@ config_list.append(
         'max_batch_size': 2000,
         't_scale': 0.5
 
-    }  # 6, tb small t
+    }  # 6, tb small t, weird disaster again, though good losses
 )
 config_list.append(
     {
@@ -107,7 +107,7 @@ config_list.append(
         'max_batch_size': 500,
         't_scale': 0.5
 
-    }  # 7, vargrad small t
+    }  # 7, vargrad small t, kindof going good but cancelled
 )
 config_list.append(
     {
@@ -118,7 +118,7 @@ config_list.append(
         't_scale': 1.0,
         'T': 50,
 
-    }  # 8, tb more steps
+    }  # 8, tb more steps, wacky var issue
 )
 config_list.append(
     {
@@ -132,6 +132,12 @@ config_list.append(
     }  # 9, vargrad more steps
 )
 
+
+"""
+1) TB was unstable and did weird stuff with very wide variance distributions
+2) vargrad seemed more stable
+3) buffer poisoning looks like a real potential problem
+"""
 
 def overwrite_nested_dict(d1, d2):
     for k, v in d2.items():
