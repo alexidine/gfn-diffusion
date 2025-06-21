@@ -107,6 +107,34 @@ config_list.append(
         'both_ways': True,
     }
 )
+config_list.append(
+    {
+        'energy_min_temperature': 0.01,
+        'energy_max_temperature': 0.01,
+        'mode_fwd': 'tb',
+        'mode_bwd': 'tb',
+        'wd_max_steps': 10000,
+    }
+)
+config_list.append(
+    {
+        'energy_min_temperature': 0.1,
+        'energy_max_temperature': 0.1,
+        'mode_fwd': 'tb',
+        'mode_bwd': 'tb',
+        'wd_max_steps': 10000,
+    }
+)
+
+config_list.append(
+    {
+        'energy_min_temperature': 1,
+        'energy_max_temperature': 1,
+        'mode_fwd': 'tb',
+        'mode_bwd': 'tb',
+        'wd_max_steps': 10000,
+    }
+)
 
 
 
