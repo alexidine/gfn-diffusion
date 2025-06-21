@@ -18,7 +18,7 @@ from evaluations import eval_step
 from models import GFN
 from utils import get_train_args, get_gfn_init_state, anneal_energy_function, set_seed, cal_subtb_coef_matrix, \
     get_gfn_optimizer, get_exploration_std
-from energy_sampling.gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
+from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 
 args = get_train_args()
 
