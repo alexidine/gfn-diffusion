@@ -175,10 +175,10 @@ def get_buffer_stats(buffer):
 
 def mean_var_fig(logvars_f, means_f, logvars_b, means_b):
     fig = go.Figure()
-    fig.add_scatter(y=logvars_f.mean(0).cpu().detach(), name='Pf LogVar')
-    fig.add_scatter(y=means_f.abs().mean(0).log10().cpu().detach(), name='Pf Means')
-    fig.add_scatter(y=logvars_b.mean(0).cpu().detach(), name='Pb LogVar')
-    fig.add_scatter(y=means_b.abs().mean(0).log10().cpu().detach(), name='Pb Means')
+    fig.add_scatter(y=np.nan_to_num(logvars_f.mean(0).cpu().detach().numpy()), name='Pf LogVar')
+    fig.add_scatter(y=np.nan_to_num(means_f.abs().mean(0).cpu().detach().numpy()), name='Pf Mean')
+    fig.add_scatter(y=np.nan_to_num(logvars_b.mean(0).cpu().detach().numpy()), name='Pb LogVar')
+    fig.add_scatter(y=np.nan_to_num(means_b.abs().mean(0).cpu().detach().numpy()), name='Pb Mean')
     fig.update_layout(xaxis_title='Trajectory Step')
     return fig
 

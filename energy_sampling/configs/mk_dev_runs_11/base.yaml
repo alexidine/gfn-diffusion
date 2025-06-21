@@ -1,4 +1,4 @@
-run_name: 'mk_local_dev'
+run_name: 'mk_dev_runs_11'
 seed: 12345
 device: 'cuda'
 lr_policy: 0.0001              # learning rate of the policy network
@@ -29,34 +29,34 @@ grow_batch_size: true        # whether to dynamically grow the batch size to fil
 max_batch_size: 500           # maximum batch size to allow
 eval_batch_size: 1000        # batch size for evaluation
 epochs: 10000000             # number of training epochs: relatively large
-eval_period: 50              # how often to do evaluation & reporting
-figs_period: 50             # how often to log custom figrues  # must be multiple of eval_period or it won't fire
+eval_period: 250              # how often to do evaluation & reporting
+figs_period: 500             # how often to log custom figrues  # must be multiple of eval_period or it won't fire
 buffer_size: 25000          # size of replay buffer: relatively large
 
 # GFlowNet settings
-T: 50                        # diffusion trajectory length
+T: 10                        # diffusion trajectory length
 t_scale: 1.0                 # scales fixed forward policy variance
-log_var_range: 4.0           # controls dynamic range of learned policy variance
-pb_scale_range: 0.1          # range of learned backward policy corrections
+log_var_range: 1.0           # controls dynamic range of learned policy variance
+pb_scale_range: 1.0          # range of learned backward policy corrections
 energy: "molecular_crystal"  # "molecular_crystal"
-mode_fwd: "tb"               # "TB" is trajectory balance, "cond-tb-avg" is conditional VarGrad, "greedy" is an experimental greedy sampler
-mode_bwd: "tb"               # "TB" is trajectory balance, "cond-tb-avg" is conditional VarGrad
+mode_fwd: "cond-tb-avg"               # "TB" is trajectory balance, "cond-tb-avg" is conditional VarGrad, "greedy" is an experimental greedy sampler
+mode_bwd: "cond-tb-avg"               # "TB" is trajectory balance, "cond-tb-avg" is conditional VarGrad
 repeats: 10                  # for conditional VarGrad training
-both_ways: false              # forward and backward training
+both_ways: true              # forward and backward training
 bwd_batch_multiplier: 2      # ratio of backward to foward batch size (much cheaper to evaluate)
 fwd_train_each: 2            # on which multiples of training iter to train the fwd train model instead of bwd
-bwd: true                   # backward training only
-learn_pb: false               # whether to learn a backward policy
+bwd: false                   # backward training only
+learn_pb: true               # whether to learn a backward policy
 conditional_flow_model: true # PROBABLY WILL NOT RUN IF FALSE, conditional training (currently doing temperature)
-learned_variance: false       # whether to learn policy variance
+learned_variance: true       # whether to learn policy variance
 partial_energy: false
 clipping: true  # clip the maximumstep size induced by the policy model
-gfn_clip: 100.0  # clip the maximumstep size induced by the policy model
+gfn_clip: 10.0  # clip the maximumstep size induced by the policy model
 
 # local search settings
 ################################################################
-buffer_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
-molecules_path: 'D:/crystal_datasets/test_qm9_dataset.pt'
+buffer_path: '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt'
+molecules_path: '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt'
 
 # replay buffer / dataset settings
 ################################################################
@@ -85,7 +85,7 @@ energy_annealing_threshold: 1.0e-1 # 5.0e-2
 convergence_history: 100
 energy_density_coeff: 0.1  # how much to weight the density penalty term in the energy function
 temperature_conditioning: true
-energy_min_temperature: 0.01
+energy_min_temperature: 0.05
 energy_max_temperature: 10
 energy_static_temperature: 1
 temperature_scaling_factor: 0.01  # controls relative frequency of higher vs lower temperatures (higher -> higher)

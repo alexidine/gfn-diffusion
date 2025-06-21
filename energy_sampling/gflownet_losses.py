@@ -24,7 +24,7 @@ def fwd_tb(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=None, r
 
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
-    log_ratio = (log_pf + log_fs[:, 0] - log_pb - log_r).clip(min=-10, max=10)
+    log_ratio = (log_pf + log_fs[:, 0] - log_pb - log_r)  #.clip(min=-10, max=10)
     #loss = 0.5 * (log_ratio ** 2)
     loss = F.smooth_l1_loss(log_ratio, torch.zeros_like(log_ratio),
                             reduction='none')  # a more stable loss, though we lose some theoretical guarantees
@@ -38,7 +38,7 @@ def bwd_tb(terminal_state, gfn, log_r, exploration_std=None, condition=None, ret
     states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, exploration_std, condition)
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
-    log_ratio = (log_pf + log_fs[:, 0] - log_pb - log_r).clip(min=-10, max=10)    #loss = 0.5 * (log_ratio ** 2)
+    log_ratio = (log_pf + log_fs[:, 0] - log_pb - log_r)  #.clip(min=-100, max=100)    #loss = 0.5 * (log_ratio ** 2)
     loss = F.smooth_l1_loss(log_ratio, torch.zeros_like(log_ratio),
                             reduction='none')  # a more stable loss, though we lose some theoretical guarantees
 
@@ -48,18 +48,18 @@ def bwd_tb(terminal_state, gfn, log_r, exploration_std=None, condition=None, ret
         return loss.mean()
 
 
-def fwd_greedy(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=None, return_exp=False, condition=None):
-    # connect forward policy model gradients to reward model
-    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, exploration_std, log_reward_fn, condition,
-                                                              keep_step_grads=True)
-    # keep gradients from reward model
-    crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states, no_grad=False)
-
-    loss = -log_r
-    if return_exp:
-        return loss.mean(), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
-    else:
-        return loss.mean()
+# def fwd_greedy(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=None, return_exp=False, condition=None):
+#     # connect forward policy model gradients to reward model
+#     states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, exploration_std, log_reward_fn, condition,
+#                                                               keep_step_grads=True)
+#     # keep gradients from reward model
+#     crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states, no_grad=False)
+#
+#     loss = -log_r
+#     if return_exp:
+#         return loss.mean(), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
+#     else:
+#         return loss.mean()
 
 
 def fwd_tb_avg(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=None, return_exp=False, condition=None):

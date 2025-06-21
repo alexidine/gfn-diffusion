@@ -200,7 +200,7 @@ class GFN(nn.Module):
                 mean = s - self.dt * s / (1. - i * self.dt) * back_mean_correction
                 var = ((self.pf_std_per_traj ** 2) * self.dt * (1. - (i + 1) * self.dt)) / (
                             1 - i * self.dt) * back_var_correction
-                s_ = mean.detach() + var.sqrt().detach() * torch.randn_like(s, device=self.device)
+                s_ = mean.detach() + var.sqrt().detach() * torch.randn_like(s, device=self.device)  #  !! this is wrong?
                 noise_backward = (s_ - mean) / var.sqrt()
                 logpb[:, self.trajectory_length - i - 1] = -0.5 * (noise_backward ** 2 + logtwopi + var.log()).sum(1)
             else:

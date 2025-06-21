@@ -11,7 +11,7 @@ import torch
 import yaml
 
 from gflownet_losses import fwd_tb, fwd_tb_avg, fwd_tb_avg_cond, db, subtb, bwd_tb, bwd_tb_avg, \
-    bwd_tb_avg_cond, bwd_mle, fwd_greedy
+    bwd_tb_avg_cond, bwd_mle
 
 
 def set_seed(seed):
