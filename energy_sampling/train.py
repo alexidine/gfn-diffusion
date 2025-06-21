@@ -17,8 +17,8 @@ from energies.molecular_crystal import MolecularCrystal
 from evaluations import eval_step
 from models import GFN
 from utils import get_train_args, get_gfn_init_state, anneal_energy_function, set_seed, cal_subtb_coef_matrix, \
-    get_gfn_optimizer, get_gfn_forward_loss, \
-    get_gfn_backward_loss, get_exploration_std
+    get_gfn_optimizer, get_exploration_std
+from energy_sampling.gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 
 args = get_train_args()
 
@@ -137,11 +137,11 @@ def train():
     conditioning_dim = 1 if args.temperature_conditioning else 0  # probably will not run without this right now
     gfn_model = GFN(energy_function.data_ndim, args.s_emb_dim, args.hidden_dim,
                     conditioning_dim, args.harmonics_dim,
-                    args.t_emb_dim, condition_embedding_dim=args.condition_emb_dim,
+                    args.t_emb_dim, args.bwd_policy, condition_embedding_dim=args.condition_emb_dim,
                     trajectory_length=args.T, clipping=args.clipping,
                     gfn_clip=args.gfn_clip,
                     learned_variance=args.learned_variance,
-                    partial_energy=args.partial_energy, log_var_range=args.log_var_range,
+                    log_var_range=args.log_var_range,
                     pb_scale_range=args.pb_scale_range,
                     t_scale=args.t_scale,
                     conditional_flow_model=args.conditional_flow_model, learn_pb=args.learn_pb,
@@ -159,7 +159,8 @@ def train():
     oomed_out = False
     prev_rewards_dist = None
     lr_warmup_finished = False
-    annealing_lambda = (1 / args.temperature_scaling_factor) ** (1 / (args.annealing_max_steps / 100))
+    # maxes out at 1, triggering every 10 steps
+    annealing_lambda = (1 / args.temperature_scaling_factor) ** (1 / (args.annealing_max_steps / 10))
 
     gfn_model.train()
     for i in trange(args.epochs + 1):
@@ -195,28 +196,10 @@ def train():
             torch.save(gfn_model.state_dict(), f'{name}model.pt')
             metrics = do_evaluation(energy_function, buffer, gfn_model, i, metrics, mol_loader)
 
-            if prev_rewards_dist is None:
-                prev_rewards_dist = metrics['sample reward distribution']
-            else:
-                """anneal reward function"""
-                if args.anneal_energy:
-                    if energy_function.temperature_scaling_factor < 1:
-                        # anneal_energy_function(energy_function,
-                        #                        loss_record,
-                        #                        metrics['sample reward distribution'],
-                        #                        prev_rewards_dist,
-                        #                        args.convergence_history,
-                        #                        args.energy_annealing_threshold)
-
-                        # go from initial to final scaling value in annealing_max_steps
-                        energy_function.temperature_scaling_factor *= annealing_lambda
-                        prev_rewards_dist = metrics['sample reward distribution']
-
             wandb.log(metrics, step=i)
             del metrics
             gc.collect()
             torch.cuda.empty_cache()  # if any tensors are GPU-based
-
 
         elif i % 10 == 0:
             if args.scheduler:
@@ -229,8 +212,13 @@ def train():
                 elif lr > args.min_lr:
                     scheduler2.step()
 
+            """anneal reward function"""
+            if args.anneal_energy:
+                if energy_function.temperature_scaling_factor < 1:
+                    # go from initial to final scaling value in annealing_max_steps
+                    energy_function.temperature_scaling_factor *= annealing_lambda
+
             metrics.update(log_elapsed_times())
-            #metrics['train/loss'] = np.mean(loss_record[-10:])
             wandb.log(metrics, step=i)
 
     torch.save(gfn_model.state_dict(), f'{name}_model_final.pt')
@@ -326,7 +314,7 @@ def handle_train_epoch_error(e, oomed_out, buffer, mol_loader):
             e) or "nonzero is not supported for tensors with more than INT_MAX elements" in str(e):
         args.batch_size = handle_oom(args.batch_size)
 
-        if len(buffer) > 0: # cut also the buffer size in case it's getting too big
+        if len(buffer) > 0:  # cut also the buffer size in case it's getting too big
             args.buffer_size = max([10000, int(args.buffer_size * 0.9)])
             buffer.loader = DataLoader(
                 buffer.dataset,

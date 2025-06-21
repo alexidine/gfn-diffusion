@@ -103,7 +103,7 @@ class TimeEncoding(nn.Module):
 
         self.t_model = scalarMLP(
             layers=1,
-            input_dim=2*harmonics_dim,
+            input_dim=2 * harmonics_dim,
             filters=hidden_dim,
             output_dim=dim,
             dropout=dropout,
@@ -133,7 +133,6 @@ class StateEncoding(nn.Module):
                  bias: Optional[bool] = True
                  ):
         super(StateEncoding, self).__init__()
-
 
         self.x_model = scalarMLP(
             layers=1,
@@ -172,6 +171,25 @@ class JointPolicy(nn.Module):
             layers=layers,
             input_dim=s_emb_dim + t_dim,
             filters=hidden_dim,
+            output_dim=hidden_dim,
+            dropout=dropout,
+            norm=norm,
+            bias=bias,
+        )
+
+        self.forward_model = scalarMLP(
+            layers=2,
+            input_dim=hidden_dim,
+            filters=hidden_dim,
+            output_dim=out_dim,
+            dropout=dropout,
+            norm=norm,
+            bias=bias,
+        )
+        self.backward_model = scalarMLP(
+            layers=2,
+            input_dim=hidden_dim,
+            filters=hidden_dim,
             output_dim=out_dim,
             dropout=dropout,
             norm=norm,
@@ -180,11 +198,18 @@ class JointPolicy(nn.Module):
 
         if zero_init:
             self.model.output_layer.weight.data.fill_(0.0)
-            #self.model.output_layer.bias.data.fill_(0.0)
+            self.model.output_layer.bias.data.fill_(0.0)
 
     def forward(self, s, t):
         return self.model(torch.cat([s, t], dim=-1))
 
+    def forward_policy(self, s, t):
+        state_embedding = self.model(torch.cat([s, t], dim=-1))
+        return self.forward_model(state_embedding)
+
+    def backward_policy(self, s, t):
+        state_embedding = self.model(torch.cat([s, t], dim=-1))
+        return self.backward_model(state_embedding)
 
 
 class LearnableScalar(nn.Module):

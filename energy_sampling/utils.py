@@ -10,9 +10,6 @@ import numpy as np
 import torch
 import yaml
 
-from gflownet_losses import fwd_tb, fwd_tb_avg, fwd_tb_avg_cond, db, subtb, bwd_tb, bwd_tb_avg, \
-    bwd_tb_avg_cond, bwd_mle
-
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -67,63 +64,24 @@ def get_gfn_optimizer(gfn_model, lr_policy, lr_flow, lr_back, back_model=False, 
                       use_weight_decay=False, weight_decay=1e-7):
     param_groups = [{'params': gfn_model.t_model.parameters()},
                     {'params': gfn_model.s_model.parameters()},
-                    {'params': gfn_model.joint_model.parameters()},
+                    {'params': gfn_model.policy_model.parameters()},
                     ]
     if conditional_flow_model:
-        param_groups += [{'params': gfn_model.flow_model.parameters(),
-                          'lr': lr_flow}]
+        # param_groups += [{'params': gfn_model.policy_model.parameters(),
+        #                   'lr': lr_flow}]
         param_groups += [{'params': gfn_model.conditions_embedding_model.parameters(),
                           'lr': lr_policy}]
     else:
         param_groups += [{'params': [gfn_model.flow_model], 'lr': lr_flow}]
 
-    if back_model:
-        param_groups += [{'params': gfn_model.back_model.parameters(), 'lr': lr_back}]
+    #if back_model:
+    #    param_groups += [{'params': gfn_model.backward_policy.parameters(), 'lr': lr_back}]
 
     if use_weight_decay:
         gfn_optimizer = torch.optim.Adam(param_groups, lr_policy, weight_decay=weight_decay)
     else:
         gfn_optimizer = torch.optim.Adam(param_groups, lr_policy)
     return gfn_optimizer
-
-
-def get_gfn_forward_loss(mode, init_state, gfn_model, log_reward, coeff_matrix, mol_batch, exploration_std=None,
-                         return_exp=False, condition=None, repeats=10):
-    if mode == 'tb':
-        return fwd_tb(init_state, gfn_model, log_reward, mol_batch, exploration_std,
-                      return_exp=return_exp,
-                      condition=condition)
-    if mode == 'greedy':
-        return fwd_greedy(init_state, gfn_model, log_reward, mol_batch, exploration_std,
-                      return_exp=return_exp,
-                      condition=condition)
-    elif mode == 'tb-avg':
-        return fwd_tb_avg(init_state, gfn_model, log_reward, mol_batch, exploration_std, return_exp=return_exp,
-                          condition=condition)
-    elif mode == 'cond-tb-avg':
-        return fwd_tb_avg_cond(init_state, gfn_model, log_reward, mol_batch, exploration_std, return_exp=return_exp,
-                               condition=condition, repeats=repeats)
-    elif mode == 'db':
-        return db(init_state, gfn_model, log_reward, exploration_std, condition=condition)
-    elif mode == 'subtb':
-        return subtb(init_state, gfn_model, log_reward, coeff_matrix, exploration_std, condition=condition)
-    else:
-        assert False
-
-
-def get_gfn_backward_loss(mode, samples, gfn_model, rewards, exploration_std=None, condition=None, repeats=10,
-                          return_exp=False):
-    if mode == 'tb':
-        return bwd_tb(samples, gfn_model, rewards, exploration_std, condition=condition, return_exp=return_exp)
-    elif mode == 'tb-avg':
-        return bwd_tb_avg(samples, gfn_model, rewards, exploration_std, condition=condition, return_exp=return_exp)
-    elif mode == 'cond-tb-avg':
-        return bwd_tb_avg_cond(samples, gfn_model, rewards, exploration_std, condition=condition, repeats=repeats,
-                               return_exp=return_exp)
-    elif mode == 'mle':
-        return bwd_mle(samples, gfn_model, rewards, exploration_std, condition=condition)
-    else:
-        assert False
 
 
 def get_exploration_std(iter, exploratory, max_steps: int = 5000, exploration_factor=0.1, exploration_wd=False):

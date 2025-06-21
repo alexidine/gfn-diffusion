@@ -36,9 +36,11 @@ def log_partition_function(initial_state, gfn, energy_function, mol_batch):
     log_Z_lb = log_weight.mean()
     log_Z_learned = log_fs[:, 0].mean()
 
-    return (states, states[:,
-                   -1], log_r, log_Z, log_Z_lb, log_Z_learned, sample_batch, condition,
-            log_pfs, log_pbs, log_fs, means_f, logvars_f, means_b, logvars_b)
+    return (states, states[:,-1],
+            log_r, log_Z, log_Z_lb, log_Z_learned,
+            sample_batch, condition,
+            log_pfs, log_pbs, log_fs,
+            means_f, logvars_f, means_b, logvars_b)
 
 
 @torch.no_grad()
@@ -65,12 +67,11 @@ def eval_step(energy_function,
               do_figures: bool = True,
               mol_batch=None,
               bwd_training: bool = False, ):
-    # todo clean up this method
     gfn_model.eval()
 
     (flow_states, samples, log_r, log_Z, log_Z_lb,
      log_Z_learned, sample_batch, condition, log_pfs, log_pbs, log_fs,
-     f_vars_f, f_means_f, f_vars_b, f_means_b) = log_partition_function(
+     f_means_f, f_vars_f, f_means_b, f_vars_b) = log_partition_function(
         init_state, gfn_model, energy_function, mol_batch)
 
     metrics = log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_Z_learned, log_r,
@@ -149,6 +150,7 @@ def generate_eval_figs(buffer, bwd_training, condition, flow_states, gfn_model, 
                                                                b_log_pfs)
         fig_dict['Backward Gauss Params'] = mean_var_fig(b_vars_f, b_means_f,
                                                         b_vars_b, b_means_b)
+        initial_state_loss = (init_state - backward_flow_states[:, 0]).norm(dim=1).pow(2)
 
     for key in fig_dict.keys():
         fig = fig_dict[key]
@@ -156,6 +158,9 @@ def generate_eval_figs(buffer, bwd_training, condition, flow_states, gfn_model, 
             fig.write_image(key + 'fig.png', width=720,
                             height=512)  # save the image rather than the fig, for size reasons
             fig_dict[key] = wandb.Image(key + 'fig.png')
+
+    if bwd_training:
+        fig_dict['Backward Initial Matching Loss'] = initial_state_loss.mean().cpu().detach().numpy()
 
     return fig_dict
 
@@ -175,9 +180,9 @@ def get_buffer_stats(buffer):
 
 def mean_var_fig(logvars_f, means_f, logvars_b, means_b):
     fig = go.Figure()
-    fig.add_scatter(y=np.nan_to_num(logvars_f.mean(0).cpu().detach().numpy()), name='Pf LogVar')
+    fig.add_scatter(y=np.nan_to_num(torch.exp(logvars_f).mean(0).cpu().detach().numpy()), name='Pf Var')
     fig.add_scatter(y=np.nan_to_num(means_f.abs().mean(0).cpu().detach().numpy()), name='Pf Mean')
-    fig.add_scatter(y=np.nan_to_num(logvars_b.mean(0).cpu().detach().numpy()), name='Pb LogVar')
+    fig.add_scatter(y=np.nan_to_num(torch.exp(logvars_b).mean(0).cpu().detach().numpy()), name='Pb Var')
     fig.add_scatter(y=np.nan_to_num(means_b.abs().mean(0).cpu().detach().numpy()), name='Pb Mean')
     fig.update_layout(xaxis_title='Trajectory Step')
     return fig
@@ -220,7 +225,7 @@ def log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_
         metrics['ellipsoid overlap'] = sample_batch.ellipsoid_overlap.clip(min=1e-3).log10().cpu().detach().numpy()
 
     if buffer is not None:
-        if len(buffer) > 0:
+        if len(buffer) > 0:  # todo adjust this to be according to the sampling routine
             metrics['Buffer Length'] = len(buffer)
             metrics['Buffer Quantiles'] = np.array([
                 np.quantile(buffer.scores_np_list, q=p)
@@ -335,13 +340,13 @@ def visualize_latent_trajs(states, n_trajs, log_r):
     trajs = states
 
     # Center the normalization around 0
-    vmin = -max(abs(log_r[:n_trajs].min()), abs(log_r[:n_trajs].max()))
-    vmax = -vmin  # symmetric
+    # vmin = -max(abs(log_r[:n_trajs].min()), abs(log_r[:n_trajs].max()))
+    # vmax = -vmin  # symmetric
 
     # Normalize to [0, 1], with 0 mapped to 0.5 in the colormap
-    norm_log_r = (log_r[:n_trajs] - vmin) / (vmax - vmin)
-    cmap = cm.get_cmap('bwr')
-    color_hex = [to_hex(cmap(val)) for val in norm_log_r]
+    # norm_log_r = (log_r[:n_trajs] - vmin) / (vmax - vmin)
+    # cmap = cm.get_cmap('bwr')
+    # color_hex = [to_hex(cmap(val)) for val in norm_log_r]
 
     fig = make_subplots(rows=4, cols=3, subplot_titles=lattice_features)
     for i in range(n_crystal_features):
@@ -356,8 +361,8 @@ def visualize_latent_trajs(states, n_trajs, log_r):
                 mode='lines',
                 marker_line_width=0.5,
                 showlegend=True if i == 0 else False,
-                marker_color=color_hex[j],
-                marker_colorscale='bluered',
+                marker_color=log_r,#color_hex[j],
+                marker_colorscale='viridis',
             ),
                 row=row, col=col
             )

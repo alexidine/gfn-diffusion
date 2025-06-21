@@ -82,9 +82,12 @@ class MolecularCrystal(BaseSet):
 
     def generator_energy(self, cluster_batch):
         if self.energy_function == 'simple_density':
-            crystal_energy = F.mse_loss(cluster_batch.packing_coeff,
+            # harmonic attraction to the target
+            # plus a hard wall at zero
+            crystal_energy = (F.mse_loss(cluster_batch.packing_coeff,
                                         torch.ones_like(cluster_batch.packing_coeff) * 0.7142,
-                                        reduction='none').clip(max=10)
+                                        reduction='none') -
+                              torch.log(cluster_batch.packing_coeff)).clip(max=100)
 
         elif self.energy_function == 'ellipsoid_overlap':
             density_energy = F.relu(-(cluster_batch.packing_coeff - 1)) ** 2
