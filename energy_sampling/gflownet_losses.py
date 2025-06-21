@@ -139,15 +139,15 @@ def bwd_tb_avg_cond(terminal_state, gfn, log_r, exploration_std=None, condition=
     if gfn.bwd_policy == 'gaussian':  # guide the TB loss towards the initial state
         initial_state = get_gfn_init_state(len(terminal_state), terminal_state.shape[1], terminal_state.device)
         initial_state_loss = (initial_state - states[:, 0]).norm(dim=1).pow(2)
-        loss = vg_loss + initial_state_loss
+        loss = vg_loss.mean() + initial_state_loss.mean()
     else:
-        loss = vg_loss
+        loss = vg_loss.mean()
 
     if return_exp:
         return 0.5 * (
-                loss ** 2).mean(), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
+                loss ** 2), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
     else:
-        return 0.5 * (loss ** 2).mean()
+        return 0.5 * (loss ** 2)
 
 
 ### NOTE none of the below are up-to-date
