@@ -39,8 +39,8 @@ t_scale: 1.0                 # scales fixed forward policy variance
 log_var_range: 4.0           # controls dynamic range of learned policy variance
 pb_scale_range: 0.1          # range of learned backward policy corrections, only for 'brownian_bridge'
 energy: "molecular_crystal"  # "molecular_crystal"
-mode_fwd: "tb"               # "TB" is trajectory balance, "cond-tb-avg" is conditional VarGrad, "greedy" is an experimental greedy sampler
-mode_bwd: "tb"               # "TB" is trajectory balance, "cond-tb-avg" is conditional VarGrad
+mode_fwd: "cond-tb-avg"               # "TB" is trajectory balance, "cond-tb-avg" is conditional VarGrad, "greedy" is an experimental greedy sampler
+mode_bwd: "cond-tb-avg"               # "TB" is trajectory balance, "cond-tb-avg" is conditional VarGrad
 repeats: 10                  # for conditional VarGrad training
 both_ways: true              # forward and backward training
 bwd_batch_multiplier: 5      # ratio of backward to foward batch size (much cheaper to evaluate)

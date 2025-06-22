@@ -90,6 +90,101 @@ config_list.append(
         'molecules_path': '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt',
     }
 )
+config_list.append(
+    {
+        'energy_min_temperature': 0.01,
+        'energy_max_temperature': 1,
+        'mode_fwd': 'cond-tb-avg',
+        'mode_bwd': 'cond-tb-avg',
+        'both_ways': False,
+        'max_batch_size': 500,
+        'wd_max_steps': 2000,
+        'annealing_max_steps': 1000,
+        'buffer_path': '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt',
+        'molecules_path': '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt',
+    }
+)
+config_list.append(
+    {
+        'energy_min_temperature': 0.01,
+        'energy_max_temperature': 1,
+        'mode_fwd': 'cond-tb-avg',
+        'mode_bwd': 'cond-tb-avg',
+        'max_batch_size': 1000,
+        'wd_max_steps': 2000,
+        'annealing_max_steps': 1000,
+        'buffer_path': '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt',
+        'molecules_path': '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt',
+    }
+)
+config_list.append(
+    {
+        'energy_min_temperature': 0.01,
+        'energy_max_temperature': 1,
+        'mode_fwd': 'cond-tb-avg',
+        'mode_bwd': 'cond-tb-avg',
+        'max_batch_size': 500,
+        'wd_max_steps': 1000,
+        'annealing_max_steps': 1000,
+        'buffer_path': '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt',
+        'molecules_path': '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt',
+    }
+)
+config_list.append(
+    {
+        'energy_min_temperature': 0.01,
+        'energy_max_temperature': 1,
+        'mode_fwd': 'cond-tb-avg',
+        'mode_bwd': 'cond-tb-avg',
+        'max_batch_size': 500,
+        'wd_max_steps': 2000,
+        'annealing_max_steps': 2000,
+        'buffer_path': '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt',
+        'molecules_path': '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt',
+    }
+)
+config_list.append(
+    {
+        'T': 20,
+        'energy_min_temperature': 0.01,
+        'energy_max_temperature': 1,
+        'mode_fwd': 'cond-tb-avg',
+        'mode_bwd': 'cond-tb-avg',
+        'max_batch_size': 500,
+        'wd_max_steps': 2000,
+        'annealing_max_steps': 1000,
+        'buffer_path': '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt',
+        'molecules_path': '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt',
+    }
+)
+config_list.append(
+    {
+        'energy_min_temperature': 0.01,
+        'energy_max_temperature': 1,
+        'mode_fwd': 'cond-tb-avg',
+        'mode_bwd': 'cond-tb-avg',
+        'repeats': 20,
+        'max_batch_size': 500,
+        'wd_max_steps': 2000,
+        'annealing_max_steps': 1000,
+        'buffer_path': '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt',
+        'molecules_path': '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt',
+    }
+)
+config_list.append(
+    {
+        'energy_min_temperature': 0.01,
+        'energy_max_temperature': 1,
+        'mode_fwd': 'cond-tb-avg',
+        'mode_bwd': 'cond-tb-avg',
+        'repeats': 5,
+        'max_batch_size': 500,
+        'wd_max_steps': 2000,
+        'annealing_max_steps': 1000,
+        'buffer_path': '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt',
+        'molecules_path': '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt',
+    }
+)
 
 """
 1) TB was unstable and did weird stuff with very wide variance distributions
