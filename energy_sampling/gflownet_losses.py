@@ -20,16 +20,33 @@ def get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states, no_
     return crystal_batch, log_r
 
 
+def linear_trajectory_penalty(trajectory_length, initial_state, states, linear_penalty_coeff: float = 0.1):
+    terminal_state = states[:, -1, :]
+    n_steps = trajectory_length
+    steps = torch.linspace(0, 1, n_steps + 1, device=initial_state.device)[None, :, None]
+    linear_interp = initial_state[:, None, :] + steps * (terminal_state - initial_state)[:, None, :]
+    # penalize the MSE against a linear path
+    linear_penalty = (linear_interp - states).norm(dim=2).pow(2).mean(1)
+    return linear_penalty * linear_penalty_coeff
+
+
 def fwd_tb(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=None, return_exp=False, condition=None):
     states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, exploration_std, log_reward_fn, condition)
     crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states)
 
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
-    log_ratio = (log_pf + log_fs[:, 0] - log_pb - log_r)  #.clip(min=-10, max=10)
-    #loss = 0.5 * (log_ratio ** 2)
-    loss = F.smooth_l1_loss(log_ratio, torch.zeros_like(log_ratio),
-                            reduction='none')  # a more stable loss, though we lose some theoretical guarantees
+    log_ratio = (log_pf + log_fs[:, 0] - log_pb - log_r)
+    tb_loss = F.smooth_l1_loss(log_ratio, torch.zeros_like(log_ratio),
+                               reduction='none')  # a more stable loss, though we lose some theoretical guarantees
+
+    if gfn.bwd_policy == 'gaussian':
+        # apply a penalty to regularize the policy towards linear paths
+        linear_penalty = linear_trajectory_penalty(gfn.trajectory_length, initial_state, states)
+
+        loss = tb_loss.mean() + linear_penalty.mean()
+    else:
+        loss = tb_loss.mean()
 
     if return_exp:
         return loss.mean(), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
@@ -43,16 +60,21 @@ def bwd_tb(terminal_state, gfn, log_r, exploration_std=None, condition=None, ret
     log_pb = log_pbs.sum(-1)
     log_ratio = (log_pf + log_fs[:, 0] - log_pb - log_r)  #.clip(min=-100, max=100)    #loss = 0.5 * (log_ratio ** 2)
     tb_loss = F.smooth_l1_loss(log_ratio, torch.zeros_like(log_ratio),
-                            reduction='none')  # a more stable loss, though we lose some theoretical guarantees
+                               reduction='none')  # a more stable loss, though we lose some theoretical guarantees
 
-    if gfn.bwd_policy == 'gaussian':  # guide the TB loss towards the initial state
+    if gfn.bwd_policy == 'gaussian':
+        # guide the TB loss towards the initial state
         initial_state = get_gfn_init_state(len(terminal_state), terminal_state.shape[1], terminal_state.device)
         initial_state_loss = (initial_state - states[:, 0]).norm(dim=1).pow(2)
-        # train tb_loss only when the source already looks good
-        tb_coeff = 2 * F.sigmoid(-initial_state_loss.mean() * 50)  # increase the scalar inside to tighten the fit
-        loss = initial_state_loss + tb_coeff * tb_loss
+
+        # apply a penalty to regularize the policy towards linear paths
+        linear_penalty = linear_trajectory_penalty(gfn.trajectory_length, initial_state, states)
+
+        # only train the flow loss when the trajectory is already well behaved
+        tb_coeff = 2 * F.sigmoid(-initial_state_loss.mean() * 100)  # increase the scalar inside to tighten the fit
+        loss = tb_coeff * tb_loss.mean() + initial_state_loss.mean() + linear_penalty.mean()
     else:
-        loss = tb_loss
+        loss = tb_loss.mean()
 
     if return_exp:
         return loss.mean(), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
@@ -72,6 +94,70 @@ def bwd_tb(terminal_state, gfn, log_r, exploration_std=None, condition=None, ret
 #         return loss.mean(), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
 #     else:
 #         return loss.mean()
+
+
+def fwd_vg(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=None, return_exp=False,
+           condition=None,
+           repeats=10):
+    condition = condition.repeat(repeats, 1)
+    initial_state = initial_state.repeat(repeats, 1)
+    mol_batch = collate_data_list(mol_batch.to_data_list() * repeats)
+    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, exploration_std, log_reward_fn, condition)
+    crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states)
+
+    log_pf = log_pfs.sum(-1)
+    log_pb = log_pbs.sum(-1)
+    # reshape and take the mean over repeats
+    log_Z = (log_r + log_pb - log_pf).view(repeats, -1).mean(dim=0, keepdim=True)
+    # minimize the variance over repeats w.r.t., the norm
+    vg_loss = 0.5 * (log_Z + (log_pf - log_r - log_pb).view(repeats, -1)) ** 2
+
+    if gfn.bwd_policy == 'gaussian':
+        # apply a penalty to regularize the policy towards linear paths
+        linear_penalty = linear_trajectory_penalty(gfn.trajectory_length, initial_state, states)
+        loss = vg_loss.mean() + linear_penalty.mean()
+    else:
+        loss = vg_loss.mean()
+
+    if return_exp:
+        return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
+    else:
+        return loss
+
+
+def bwd_vg(terminal_state, gfn, log_r, exploration_std=None, condition=None, repeats=10,
+           return_exp: bool = False):
+    condition = condition.repeat(repeats, 1)
+    terminal_state = terminal_state.repeat(repeats, 1)
+    log_r = log_r.repeat(repeats)
+
+    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, exploration_std, condition)
+    log_pf = log_pfs.sum(-1)
+    log_pb = log_pbs.sum(-1)
+    log_Z = (log_r + log_pb - log_pf).view(repeats, -1).mean(dim=0, keepdim=True)
+    vg_loss = 0.5 * (log_Z + (log_pf - log_r - log_pb).view(repeats, -1)) ** 2
+
+    if gfn.bwd_policy == 'gaussian':
+        # guide the TB loss towards the initial state
+        initial_state = get_gfn_init_state(len(terminal_state), terminal_state.shape[1], terminal_state.device)
+        initial_state_loss = (initial_state - states[:, 0]).norm(dim=1).pow(2)
+
+        # apply a penalty to regularize the policy towards linear paths
+        linear_penalty = linear_trajectory_penalty(gfn.trajectory_length, initial_state, states)
+
+        # only train the flow loss when the trajectory is already well behaved
+        vg_coeff = 2 * F.sigmoid(-initial_state_loss.mean() * 100)  # increase the scalar inside to tighten the fit
+        loss = vg_coeff * vg_loss.mean() + initial_state_loss.mean() + linear_penalty.mean()
+    else:
+        loss = vg_loss.mean()
+
+    if return_exp:
+        return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
+    else:
+        return loss
+
+
+### NOTE none of the below are up-to-date
 
 
 def fwd_tb_avg(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=None, return_exp=False, condition=None):
@@ -101,56 +187,6 @@ def bwd_tb_avg(terminal_state, gfn, log_r, exploration_std=None, condition=None,
         return 0.5 * (loss ** 2).mean()
 
 
-def fwd_tb_avg_cond(initial_state, gfn, log_reward_fn, mol_batch, exploration_std=None, return_exp=False,
-                    condition=None,
-                    repeats=10):
-    condition = condition.repeat(repeats, 1)
-    initial_state = initial_state.repeat(repeats, 1)
-    mol_batch = collate_data_list(mol_batch.to_data_list() * repeats)
-    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, exploration_std, log_reward_fn, condition)
-    crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states)
-
-    log_pf = log_pfs.sum(-1)
-    log_pb = log_pbs.sum(-1)
-    # reshape and take the mean over repeats
-    log_Z = (log_r + log_pb - log_pf).view(repeats, -1).mean(dim=0, keepdim=True)
-    # minimize the variance over repeats w.r.t., the norm
-    loss = log_Z + (log_pf - log_r - log_pb).view(repeats, -1)
-
-    if return_exp:
-        return 0.5 * (
-                loss ** 2).mean(), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
-    else:
-        return 0.5 * (loss ** 2).mean()
-
-
-def bwd_tb_avg_cond(terminal_state, gfn, log_r, exploration_std=None, condition=None, repeats=10,
-                    return_exp: bool = False):
-    condition = condition.repeat(repeats, 1)
-    terminal_state = terminal_state.repeat(repeats, 1)
-    log_r = log_r.repeat(repeats)
-
-    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, exploration_std, condition)
-    log_pf = log_pfs.sum(-1)
-    log_pb = log_pbs.sum(-1)
-    log_Z = (log_r + log_pb - log_pf).view(repeats, -1).mean(dim=0, keepdim=True)
-    vg_loss = log_Z + (log_pf - log_r - log_pb).view(repeats, -1)
-
-    if gfn.bwd_policy == 'gaussian':  # guide the TB loss towards the initial state
-        initial_state = get_gfn_init_state(len(terminal_state), terminal_state.shape[1], terminal_state.device)
-        initial_state_loss = (initial_state - states[:, 0]).norm(dim=1).pow(2)
-        loss = vg_loss.mean() + initial_state_loss.mean()
-    else:
-        loss = vg_loss.mean()
-
-    if return_exp:
-        return 0.5 * (
-                loss ** 2), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
-    else:
-        return 0.5 * (loss ** 2)
-
-
-### NOTE none of the below are up-to-date
 def db(initial_state, gfn, log_reward_fn, exploration_std=None, condition=None):
     states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, exploration_std, log_reward_fn, condition)
     with torch.no_grad():
@@ -196,8 +232,8 @@ def get_gfn_forward_loss(mode, init_state, gfn_model, log_reward, coeff_matrix, 
         return fwd_tb_avg(init_state, gfn_model, log_reward, mol_batch, exploration_std, return_exp=return_exp,
                           condition=condition)
     elif mode == 'cond-tb-avg':
-        return fwd_tb_avg_cond(init_state, gfn_model, log_reward, mol_batch, exploration_std, return_exp=return_exp,
-                               condition=condition, repeats=repeats)
+        return fwd_vg(init_state, gfn_model, log_reward, mol_batch, exploration_std, return_exp=return_exp,
+                      condition=condition, repeats=repeats)
     elif mode == 'db':
         return db(init_state, gfn_model, log_reward, exploration_std, condition=condition)
     elif mode == 'subtb':
@@ -213,8 +249,8 @@ def get_gfn_backward_loss(mode, samples, gfn_model, rewards, exploration_std=Non
     elif mode == 'tb-avg':
         return bwd_tb_avg(samples, gfn_model, rewards, exploration_std, condition=condition, return_exp=return_exp)
     elif mode == 'cond-tb-avg':
-        return bwd_tb_avg_cond(samples, gfn_model, rewards, exploration_std, condition=condition, repeats=repeats,
-                               return_exp=return_exp)
+        return bwd_vg(samples, gfn_model, rewards, exploration_std, condition=condition, repeats=repeats,
+                      return_exp=return_exp)
     elif mode == 'mle':
         return bwd_mle(samples, gfn_model, rewards, exploration_std, condition=condition)
     else:

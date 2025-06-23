@@ -88,7 +88,8 @@ class GFN(nn.Module):
 
         time_encoding = self.t_model(time).repeat(batch_size, 1)
         state_encoding = self.s_model(state, condition_embedding)
-        state_update = self.policy_model.forward_policy(state_encoding, time_encoding)  # nx(2d) with d drift and d noise parameters
+        state_update = self.policy_model.forward_policy(state_encoding,
+                                                        time_encoding)  # nx(2d) with d drift and d noise parameters
 
         if self.clipping:
             state_update = torch.clip(state_update, -self.gfn_clip, self.gfn_clip)
@@ -101,7 +102,8 @@ class GFN(nn.Module):
         batch_size = state.shape[0]
         time_encoding = self.t_model(time).repeat(batch_size, 1)
         state_encoding = self.s_model(state, condition_embedding)
-        state_update = self.policy_model.backward_policy(state_encoding, time_encoding)  # nx(2d) with d drift and d noise parameters
+        state_update = self.policy_model.backward_policy(state_encoding,
+                                                         time_encoding)  # nx(2d) with d drift and d noise parameters
 
         if self.clipping:
             state_update = torch.clip(state_update, -self.gfn_clip, self.gfn_clip)
@@ -116,7 +118,7 @@ class GFN(nn.Module):
                            log_reward_fn,
                            condition,
                            return_gauss_params: bool = False,
-                           compute_pb: bool=True,
+                           compute_pb: bool = True,
                            ):
 
         batch_size = initial_state.shape[0]
@@ -127,13 +129,21 @@ class GFN(nn.Module):
         states[:, 0] = initial_state.detach()  # set correct initial state
         condition_embedding = self.conditions_embedding_model(condition)
 
+        # get exploration std per-trajectory, and then distribute it randomly across each
+        if exploration_std is not None:
+            per_path_expl_std = torch.rand(len(initial_state), device=initial_state.device) * exploration_std(0)
+            per_step_expl_std = torch.rand_like(states[:, :, 0]) * per_path_expl_std[:, None]
+        else:
+            per_step_expl_std = torch.zeros_like(states[:, :, 0])
+
         for i in range(self.trajectory_length):
             logf[:, i] = self.flow_model(condition_embedding).squeeze(-1).squeeze(-1)
             pf_mean, pf_logvar = self.call_forward_policy(current_state, i * self.dt, condition_embedding)
-
-            # no longer detaching added variance - I don't know why it was the original code and I don't think it makes sense
-            expl_std = self.get_expl_std(exploration_std, i)
             forward_std = (pf_logvar / 2).exp() * np.sqrt(self.dt)
+
+            # expl_std = self.get_expl_std(exploration_std, i)
+            expl_std = per_step_expl_std[:, i, None]
+
             # propagate SDE
             # add manually the exploratory variance, and do not consider it in the Pf calculation
             # we want to know the probability of the move under the policy model, which is not the same
@@ -143,7 +153,7 @@ class GFN(nn.Module):
                           (forward_std + expl_std) * torch.randn_like(current_state, device=self.device))
 
             # get forward probabilities
-            forward_noise = ((next_state - current_state) - self.dt * pf_mean) / forward_std  # extra variance not included here
+            forward_noise = ((next_state - current_state) - self.dt * pf_mean) / forward_std  # extra variance not included here as this is the noise under the policy
             logpf[:, i] = -0.5 * (forward_noise ** 2 + logtwopi + np.log(self.dt) + pf_logvar).sum(1)
 
             if compute_pb:
@@ -262,7 +272,8 @@ class GFN(nn.Module):
                                                               condition_embedding)
                 forward_std = (pf_logvar / 2).exp() * np.sqrt(self.dt)
                 noise = ((current_state - prev_state) - self.dt * pf_mean) / forward_std
-                logpf[:, self.trajectory_length - i - 1] = -0.5 * (noise ** 2 + logtwopi + np.log(self.dt) + pf_logvar).sum(
+                logpf[:, self.trajectory_length - i - 1] = -0.5 * (
+                        noise ** 2 + logtwopi + np.log(self.dt) + pf_logvar).sum(
                     1)
             else:
                 pf_mean, pf_logvar = torch.zeros_like(pb_mean), torch.zeros_like(pb_logvar)

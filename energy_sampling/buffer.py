@@ -14,7 +14,8 @@ class CrystalReplayBuffer():
                  batch_size,
                  beta=1.0,
                  rank_weight=1e-2,
-                 prioritized=None):
+                 prioritized=None,
+                 keep_initial_samples: bool = True):
         self.buffer_size = buffer_size
         self.prioritized = prioritized
         self.device = device
@@ -26,30 +27,43 @@ class CrystalReplayBuffer():
         self.beta = beta
         self.rank_weight = rank_weight
         self.beta = beta
+        self.keep_initial_samples = keep_initial_samples  # never delete originally loaded dataset
+        self.scores_np_list = None
+        self.x = None
+        self.diversity_check_size = 1000
+        self.original_dataset_inds = None
 
-    def add(self, data_list):
+    def add(self, data_list, filter_diversity: bool = True, diversity_cutoff: float = 1.0):
         with torch.no_grad():
             if self.dataset is None:
-                self.dataset = copy.deepcopy(data_list)
-            else:
-                self.dataset.extend(copy.deepcopy(data_list))
-
-            if not hasattr(self, 'scores_np_list'):
+                self.dataset = list(data_list)  # I think this is memory safe and faster #copy.deepcopy(data_list)
+                self.x = collate_data_list(self.dataset).cell_params_to_gen_basis()
                 self.scores_np_list = list(
                     self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(
                         len(self))).detach().cpu().view(-1).numpy())
+                self.original_dataset_inds = list(np.arange(len(self.dataset)))
             else:
+                if filter_diversity:
+                    new_x = collate_data_list(data_list).cell_params_to_gen_basis()
+                    rands = np.random.choice(len(self.dataset), self.diversity_check_size, replace=False)
+                    new_x_dists = torch.cdist(self.x[rands], new_x)
+                    new_x_inds_to_keep = new_x_dists.amin(dim=0) >= diversity_cutoff
+                    data_list = [data_list[ind] for ind in new_x_inds_to_keep]
+
+                self.dataset.extend(list(data_list))
+                self.x = torch.cat([self.x, new_x[new_x_inds_to_keep]], dim=0)
                 self.scores_np_list.extend(
                     list(self.energy_function.prebuilt_sample_to_reward(
-                    data_list,
-                    temperature=torch.ones(len(data_list))).detach().cpu().view(-1).numpy())
-                    )
+                        data_list,
+                        temperature=torch.ones(len(data_list))).detach().cpu().view(-1).numpy())
+                )
 
-            if len(self) > self.buffer_size:
-                if hasattr(self, 'sampler'):
-                    inds_to_keep = self.get_sample_indices(self.buffer_size)
+            if len(self) > self.buffer_size:  # pare down buffer
+                inds_to_keep = self.sample_indices(self.buffer_size, replace=False)
+                if self.keep_initial_samples:
+                    inds_to_keep = list(set(list(inds_to_keep) + self.original_dataset_inds))[:self.buffer_size]
                 else:
-                    inds_to_keep = np.arange(len(self) - self.buffer_size, len(self))
+                    inds_to_keep = list(set(inds_to_keep))
 
                 self.dataset = [self.dataset[ind] for ind in inds_to_keep]
                 self.scores_np_list = [self.scores_np_list[ind] for ind in inds_to_keep]
@@ -62,14 +76,14 @@ class CrystalReplayBuffer():
         else:
             return len(self.dataset)
 
-    def get_sample_indices(self, batch_size):  # todo add pruning / sampling according to diversity. Expensive to repeat though.
+    def sample_indices(self, batch_size, replace: bool):
         inds = np.random.choice(len(self),
                                 size=batch_size,
-                                replace=True,
+                                replace=replace,
                                 p=self.get_sampler_weights())
         return inds
 
-    def get_sampler_weights(self):
+    def get_sampler_weights(self, eps: float=1e-6):
         scores = np.array(self.scores_np_list)
         if self.prioritized == 'rank':
             ranks = np.argsort(np.argsort(-1 * scores))
@@ -77,7 +91,7 @@ class CrystalReplayBuffer():
         elif self.prioritized == 'boltzmann':
             logits = scores / self.beta
             logits -= np.max(logits)  # subtract max for stability
-            weights_i = np.nan_to_num(np.exp(logits))
+            weights_i = np.nan_to_num(np.exp(logits)) + eps  # all samples need nonzero probability
         else:  # uniform weights
             weights_i = np.ones(len(scores))
 
@@ -97,7 +111,11 @@ class CrystalReplayBuffer():
             batch_size = self.batch_size
 
         # manual dataloader
-        rand_inds = self.get_sample_indices(batch_size)
+        if batch_size > len(self):
+            rand_inds = self.sample_indices(batch_size, replace=True)
+        else:
+            rand_inds = self.sample_indices(batch_size, replace=False)
+
         sample = collate_data_list([self.dataset[ind] for ind in rand_inds])
 
         condition = self.energy_function.get_conditioning_tensor(sample)

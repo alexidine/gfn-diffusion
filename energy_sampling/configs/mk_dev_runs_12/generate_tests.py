@@ -40,7 +40,7 @@ config_list.append(
         'buffer_path': '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt',
         'molecules_path': '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt',
     }
-)
+)  #0
 config_list.append(
     {
         'energy_min_temperature': 0.1,
@@ -52,7 +52,7 @@ config_list.append(
         'buffer_path': '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt',
         'molecules_path': '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt',
     }
-)
+)  #1
 config_list.append(
     {
         'energy_min_temperature': 1,
@@ -64,7 +64,7 @@ config_list.append(
         'buffer_path': '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt',
         'molecules_path': '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt',
     }
-)
+)  #2
 config_list.append(
     {
         'energy_min_temperature': 0.01,
@@ -76,7 +76,7 @@ config_list.append(
         'buffer_path': '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt',
         'molecules_path': '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt',
     }
-)
+)  #3
 config_list.append(
     {
         'energy_min_temperature': 0.01,
@@ -89,7 +89,7 @@ config_list.append(
         'buffer_path': '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt',
         'molecules_path': '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt',
     }
-)
+)  #4 - good convergence and temperature dependence
 config_list.append(
     {
         'energy_min_temperature': 0.01,
@@ -103,7 +103,7 @@ config_list.append(
         'buffer_path': '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt',
         'molecules_path': '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt',
     }
-)
+)  #5 - very dense cells and loss peak at LR peak
 config_list.append(
     {
         'energy_min_temperature': 0.01,
@@ -116,7 +116,7 @@ config_list.append(
         'buffer_path': '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt',
         'molecules_path': '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt',
     }
-)
+)  #6 - going rather well, though slower training
 config_list.append(
     {
         'energy_min_temperature': 0.01,
@@ -129,7 +129,7 @@ config_list.append(
         'buffer_path': '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt',
         'molecules_path': '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt',
     }
-)
+)  #7 - good temperature dependence but got stuck in a low reward mode
 config_list.append(
     {
         'energy_min_temperature': 0.01,
@@ -142,7 +142,7 @@ config_list.append(
         'buffer_path': '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt',
         'molecules_path': '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt',
     }
-)
+)  #8 - similar to 4, maybe even higher variances between fwd bwd
 config_list.append(
     {
         'T': 20,
@@ -156,7 +156,7 @@ config_list.append(
         'buffer_path': '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt',
         'molecules_path': '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt',
     }
-)
+)  #9 - temp maybe scaled too fast? got thrown into bad minimum
 config_list.append(
     {
         'energy_min_temperature': 0.01,
@@ -170,7 +170,7 @@ config_list.append(
         'buffer_path': '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt',
         'molecules_path': '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt',
     }
-)
+)  #10 - identical to 4, suspicious
 config_list.append(
     {
         'energy_min_temperature': 0.01,
@@ -184,12 +184,19 @@ config_list.append(
         'buffer_path': '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt',
         'molecules_path': '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt',
     }
-)
+)  #11 - identical to 4, suspicious
 
 """
-1) TB was unstable and did weird stuff with very wide variance distributions
-2) vargrad seemed more stable
-3) buffer poisoning looks like a real potential problem
+1) VarGrad is great but expensive
+2) need to add a VarGrad evaluation parity plot
+ADDRESSED 3) Forward-backward balance doesn't look perfect
+ADDRESSED 4) model not sampling diverse minima, but basically one packing pattern
+ADDRESSED 5) buffer can reinforce mode collapse
+6) inconsistent results between VarGrad options
+7) backward training perhaps is stabilizing
+ADDRESSED 8) forward and backward losses are unbalanced - different scale, leading to high loss variance
+FIXED 9) temperature and expl annealing might be too fast
+FIXED 10) insensitive to number of repeats 
 """
 
 

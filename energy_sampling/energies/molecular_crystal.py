@@ -45,14 +45,18 @@ class MolecularCrystal(BaseSet):
 
     def analyze_crystal_batch(self, x, mol_batch, return_batch=False):  # x is gfn_outputs
         crystal_batch = self.instantiate_crystals(x, mol_batch)
-        cluster_batch = crystal_batch.mol2cluster(cutoff=6,
-                                                  supercell_size=10,
-                                                  align_to_standardized_orientation=True)
+        if self.energy_function == 'simple_density':  # no need to actually build the crystal, this is much faster
+            cluster_batch = crystal_batch
+            lj_energy = torch.zeros(crystal_batch.num_graphs, device=self.device)
+            silu_energy = torch.zeros_like(lj_energy)
+        else:
+            cluster_batch = crystal_batch.mol2cluster(cutoff=6,
+                                                      supercell_size=10,
+                                                      align_to_standardized_orientation=True)
 
-        cluster_batch.construct_radial_graph(cutoff=6)
-
-        lj_energy, normed_lj_energy = cluster_batch.compute_LJ_energy()
-        silu_energy = cluster_batch.compute_silu_energy()  # softened short-range LJ-type energy
+            cluster_batch.construct_radial_graph(cutoff=6)
+            lj_energy, normed_lj_energy = cluster_batch.compute_LJ_energy()
+            silu_energy = cluster_batch.compute_silu_energy()  # softened short-range LJ-type energy
 
         if self.energy_function == 'ellipsoid_overlap':
             if not hasattr(self, 'ellipsoid_model'):
@@ -69,7 +73,7 @@ class MolecularCrystal(BaseSet):
 
             cluster_batch.ellipsoid_overlap = normed_ellipsoid_overlap.flatten()
         else:
-            cluster_batch.ellipsoid_overlap = torch.ones_like(silu_energy)
+            cluster_batch.ellipsoid_overlap = torch.zeros_like(silu_energy)
 
         cluster_batch.silu_pot = silu_energy
         cluster_batch.lj_pot = lj_energy
@@ -87,7 +91,7 @@ class MolecularCrystal(BaseSet):
             crystal_energy = (F.mse_loss(cluster_batch.packing_coeff,
                                         torch.ones_like(cluster_batch.packing_coeff) * 0.7142,
                                         reduction='none') -
-                              torch.log(cluster_batch.packing_coeff)).clip(max=100)
+                              torch.log(cluster_batch.packing_coeff)/100).clip(max=100)
 
         elif self.energy_function == 'ellipsoid_overlap':
             density_energy = F.relu(-(cluster_batch.packing_coeff - 1)) ** 2

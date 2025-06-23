@@ -16,7 +16,7 @@ from buffer import CrystalReplayBuffer
 from energies.molecular_crystal import MolecularCrystal
 from evaluations import eval_step
 from models import GFN
-from utils import get_train_args, get_gfn_init_state, anneal_energy_function, set_seed, cal_subtb_coef_matrix, \
+from utils import get_train_args, get_gfn_init_state, set_seed, cal_subtb_coef_matrix, \
     get_gfn_optimizer, get_exploration_std
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 
@@ -38,8 +38,10 @@ if args.local_search:
 times = {}
 
 
-def train_step(energy_function, gfn_model, gfn_optimizer, it, exploration_std, buffer, mol_loader, repeats: int = 10):
-    gfn_model.zero_grad()
+def train_step(energy_function, gfn_model,
+               fwd_gfn_optimizer,
+               bwd_gfn_optimizer,
+               it, exploration_std, buffer, mol_loader, repeats: int = 10):
 
     do_forward = False
     do_backward = False
@@ -57,6 +59,7 @@ def train_step(energy_function, gfn_model, gfn_optimizer, it, exploration_std, b
         do_forward = True
 
     if do_forward:
+        fwd_gfn_optimizer.zero_grad()
         mol_batch = next(iter(mol_loader)).to(device)
         loss, states, log_pfs, log_pbs, log_r, log_fs, crystal_batch = fwd_train_step(energy_function,
                                                                                       gfn_model,
@@ -69,6 +72,7 @@ def train_step(energy_function, gfn_model, gfn_optimizer, it, exploration_std, b
             buffer.add(crystal_batch.cpu().detach().to_data_list())
 
     elif do_backward:
+        bwd_gfn_optimizer.zero_grad()
         loss, states, log_pfs, log_pbs, log_r, log_fs = bwd_train_step(gfn_model,
                                                                        buffer,
                                                                        exploration_std,
@@ -77,11 +81,14 @@ def train_step(energy_function, gfn_model, gfn_optimizer, it, exploration_std, b
     else:
         assert False
 
-    loss.backward()  # todo add reporting of flow distributions
+    loss.backward()
     torch.nn.utils.clip_grad_norm_(gfn_model.parameters(),
                                    args.gradient_norm_clip)  # gradient clipping
-    gfn_optimizer.step()  # todo add R-value type loss, normed MAE
-    return loss.item()
+    if do_forward:
+        fwd_gfn_optimizer.step()
+    elif do_backward:
+        bwd_gfn_optimizer.step()
+    return loss.item(), "Forward" if do_forward else "Backward"
 
 
 def fwd_train_step(energy_function, gfn_model, exploration_std, mol_batch, return_exp=False, repeats: int = 10):
@@ -151,7 +158,8 @@ def train():
 
     wandb.watch(gfn_model, log_graph=True, log_freq=500)  # for gradient logging
 
-    gfn_optimizer, scheduler1, scheduler2 = init_schedulers_optimizers(gfn_model)
+    forward_optimizer, backward_optimizer, fwd_scheduler1, fwd_scheduler2, bwd_scheduler1, bwd_scheduler2 = init_schedulers_optimizers(
+        gfn_model)
     buffer, mol_loader = init_buffers_datasets(energy_function)
 
     times['initialization_end'] = time()
@@ -160,6 +168,7 @@ def train():
     prev_rewards_dist = None
     lr_warmup_finished = False
     # maxes out at 1, triggering every 10 steps
+    # go from initial to final scaling value in annealing_max_steps
     annealing_lambda = (1 / args.temperature_scaling_factor) ** (1 / (args.annealing_max_steps / 10))
 
     gfn_model.train()
@@ -174,16 +183,17 @@ def train():
 
         times['train_step_start'] = time()
         try:
-            metrics['train/loss'] = train_step(energy_function,
+            train_loss, step_type = train_step(energy_function,
                                                gfn_model,
-                                               gfn_optimizer,
+                                               forward_optimizer,
+                                               backward_optimizer,
                                                i,
                                                exploration_std,
                                                buffer,
                                                mol_loader,
+                                               repeats=args.repeats
                                                )
-
-            #loss_record.append(metrics['train/loss'])
+            metrics[f'{step_type} Loss'] = train_loss
             if not oomed_out:
                 buffer, mol_loader = grow_batch_size(buffer, mol_loader)
 
@@ -192,36 +202,41 @@ def train():
         times['train_step_end'] = time()
 
         if (i % args.eval_period == 0 and i > 0) or i == 50:
-            metrics.update({'lr': gfn_optimizer.param_groups[0]['lr']})
             torch.save(gfn_model.state_dict(), f'{name}model.pt')
             metrics = do_evaluation(energy_function, buffer, gfn_model, i, metrics, mol_loader)
-
             wandb.log(metrics, step=i)
-            del metrics
-            gc.collect()
-            torch.cuda.empty_cache()  # if any tensors are GPU-based
 
         elif i % 10 == 0:
-            if args.scheduler:
-                lr = gfn_optimizer.param_groups[0]['lr']
-                if not lr_warmup_finished:
-                    scheduler1.step()
-                    if lr >= args.lr_policy:
-                        lr_warmup_finished = True
-
-                elif lr > args.min_lr:
-                    scheduler2.step()
-
-            """anneal reward function"""
-            if args.anneal_energy:
-                if energy_function.temperature_scaling_factor < 1:
-                    # go from initial to final scaling value in annealing_max_steps
-                    energy_function.temperature_scaling_factor *= annealing_lambda
-
+            step_lr_schedule(bwd_scheduler1, bwd_scheduler2, forward_optimizer, fwd_scheduler1, fwd_scheduler2,
+                             lr_warmup_finished)
+            anneal_reward(annealing_lambda, energy_function)
+            metrics.update({'lr': forward_optimizer.param_groups[0]['lr']})
             metrics.update(log_elapsed_times())
             wandb.log(metrics, step=i)
 
     torch.save(gfn_model.state_dict(), f'{name}_model_final.pt')
+
+
+def anneal_reward(annealing_lambda, energy_function):
+    """anneal reward function"""
+    if args.anneal_energy:
+        if energy_function.temperature_scaling_factor < 1:
+            energy_function.temperature_scaling_factor *= annealing_lambda
+
+
+def step_lr_schedule(bwd_scheduler1, bwd_scheduler2, forward_optimizer, fwd_scheduler1, fwd_scheduler2,
+                     lr_warmup_finished):
+    if args.scheduler:
+        lr = forward_optimizer.param_groups[0]['lr']
+        if not lr_warmup_finished:
+            fwd_scheduler1.step()
+            bwd_scheduler1.step()
+            if lr >= args.lr_policy:
+                lr_warmup_finished = True
+
+        elif lr > args.min_lr:
+            fwd_scheduler2.step()
+            bwd_scheduler2.step()
 
 
 def init_schedulers_optimizers(gfn_model):
@@ -233,20 +248,32 @@ def init_schedulers_optimizers(gfn_model):
         init_policy_lr = args.lr_policy
         init_flow_lr = args.lr_flow
         init_back_lr = args.lr_back
-    gfn_optimizer = get_gfn_optimizer(gfn_model,
-                                      init_policy_lr,
-                                      init_flow_lr,
-                                      init_back_lr,
-                                      args.learn_pb,
-                                      args.conditional_flow_model, args.use_weight_decay, args.weight_decay)
+    forward_optimizer = get_gfn_optimizer(gfn_model,
+                                          init_policy_lr,
+                                          init_flow_lr,
+                                          init_back_lr,
+                                          args.learn_pb,
+                                          args.conditional_flow_model,
+                                          args.use_weight_decay,
+                                          args.weight_decay)
+    backward_optimizer = get_gfn_optimizer(gfn_model,
+                                           init_policy_lr,
+                                           init_flow_lr,
+                                           init_back_lr,
+                                           args.learn_pb,
+                                           args.conditional_flow_model,
+                                           args.use_weight_decay,
+                                           args.weight_decay)
     if args.scheduler:
         lr_warmup_lambda = (100) ** (1 / (args.lr_warmup_time / 10))  # grow over 2 orders
         lr_annealing_lambda = (args.min_lr / args.lr_policy) ** (1 / (args.lr_anneal_time / 10))
-        scheduler1 = lr_scheduler.MultiplicativeLR(gfn_optimizer, lr_lambda=lambda epoch: lr_warmup_lambda)
-        scheduler2 = lr_scheduler.MultiplicativeLR(gfn_optimizer, lr_lambda=lambda epoch: lr_annealing_lambda)
+        fwd_scheduler1 = lr_scheduler.MultiplicativeLR(forward_optimizer, lr_lambda=lambda epoch: lr_warmup_lambda)
+        fwd_scheduler2 = lr_scheduler.MultiplicativeLR(forward_optimizer, lr_lambda=lambda epoch: lr_annealing_lambda)
+        bwd_scheduler1 = lr_scheduler.MultiplicativeLR(forward_optimizer, lr_lambda=lambda epoch: lr_warmup_lambda)
+        bwd_scheduler2 = lr_scheduler.MultiplicativeLR(forward_optimizer, lr_lambda=lambda epoch: lr_annealing_lambda)
     else:
-        scheduler1, scheduler2 = None, None
-    return gfn_optimizer, scheduler1, scheduler2
+        fwd_scheduler1, fwd_scheduler2, bwd_scheduler1, bwd_scheduler2 = None, None, None, None
+    return forward_optimizer, backward_optimizer, fwd_scheduler1, fwd_scheduler2, bwd_scheduler1, bwd_scheduler2
 
 
 def init_buffers_datasets(energy_function):

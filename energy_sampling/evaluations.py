@@ -4,8 +4,6 @@ import numpy as np
 import plotly.colors as pc
 import torch
 import wandb
-from matplotlib import cm
-from matplotlib.colors import to_hex
 from mxtaltools.reporting.online import simple_embedding_fig, simple_cell_hist, simple_cell_scatter_fig, \
     log_crystal_samples, simple_latent_hist
 from plotly import graph_objects as go
@@ -19,6 +17,7 @@ from utils import logmeanexp
 
 @torch.no_grad()
 def log_partition_function(initial_state, gfn, energy_function, mol_batch):
+    # todo set up option for VarGrad style loss
     condition = energy_function.get_conditioning_tensor(mol_batch)
     (states, log_pfs, log_pbs, log_fs,
      means_f, logvars_f, means_b, logvars_b) = gfn.get_trajectory_fwd(initial_state,
@@ -77,6 +76,8 @@ def eval_step(energy_function,
     metrics = log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_Z_learned, log_r,
                                          sample_batch, buffer)
 
+    buffer.add(sample_batch.cpu().detach().to_data_list())  # add evaluation samples to buffer
+
     if do_figures:
         fig_dict = generate_eval_figs(buffer, bwd_training,
                                       condition, flow_states,
@@ -87,12 +88,13 @@ def eval_step(energy_function,
         metrics.update(fig_dict)
 
     "Crystal samples"
-    samples_to_log, filenames = log_crystal_samples(sample_batch=sample_batch, return_filenames=True)
-    [wandb.log({f'crystal_sample_{ind}': samples_to_log[ind]}, commit=False) for ind in range(len(samples_to_log))]
-    try:
-        [os.remove(file) for file in filenames]  # delete this cif as a temporary file
-    except:
-        pass
+    # skip this for now - not really using it anyway
+    # samples_to_log, filenames = log_crystal_samples(sample_batch=sample_batch, return_filenames=True)
+    # [wandb.log({f'crystal_sample_{ind}': samples_to_log[ind]}, commit=False) for ind in range(len(samples_to_log))]
+    # try:
+    #     [os.remove(file) for file in filenames]  # delete this cif as a temporary file
+    # except:
+    #     pass
 
     gfn_model.train()
     return metrics
