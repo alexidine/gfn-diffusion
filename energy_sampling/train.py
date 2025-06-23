@@ -210,8 +210,10 @@ def train():
             wandb.log(metrics, step=i)
 
         elif i % 10 == 0:
-            step_lr_schedule(bwd_scheduler1, bwd_scheduler2, forward_optimizer, fwd_scheduler1, fwd_scheduler2,
-                             lr_warmup_finished)
+            lr_warmup_finished, lr =step_lr_schedule(bwd_scheduler1, bwd_scheduler2,
+                                                     forward_optimizer,
+                                                     fwd_scheduler1, fwd_scheduler2,
+                                                     lr_warmup_finished)
             anneal_reward(annealing_lambda, energy_function)
             metrics.update({'lr': forward_optimizer.param_groups[0]['lr']})
             metrics.update(log_elapsed_times())
@@ -242,6 +244,9 @@ def step_lr_schedule(bwd_scheduler1, bwd_scheduler2, forward_optimizer, fwd_sche
         elif lr > args.min_lr:
             fwd_scheduler2.step()
             bwd_scheduler2.step()
+        return lr_warmup_finished, lr
+    else:
+        return False, None
 
 
 def init_schedulers_optimizers(gfn_model):

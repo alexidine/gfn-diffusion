@@ -132,7 +132,7 @@ class GFN(nn.Module):
         # get exploration std per-trajectory, and then distribute it randomly across each
         if exploration_std is not None:
             per_path_expl_std = torch.rand(len(initial_state), device=initial_state.device) * exploration_std(0)
-            per_step_expl_std = torch.rand_like(states[:, :, 0]) * per_path_expl_std[:, None]
+            per_step_expl_std = torch.rand_like(states[:, :, 0]) * per_path_expl_std[:, None] * 2
         else:
             per_step_expl_std = torch.zeros_like(states[:, :, 0])
 
