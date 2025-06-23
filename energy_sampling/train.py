@@ -170,7 +170,7 @@ def train():
     # maxes out at 1, triggering every 10 steps
     # go from initial to final scaling value in annealing_max_steps
     annealing_lambda = (1 / args.temperature_scaling_factor) ** (1 / (args.annealing_max_steps / 10))
-
+    fwd_loss, bwd_loss = 0, 0
     gfn_model.train()
     for i in trange(args.epochs + 1):
         metrics = dict()
@@ -193,7 +193,10 @@ def train():
                                                mol_loader,
                                                repeats=args.repeats
                                                )
-            metrics[f'{step_type} Loss'] = train_loss
+            if step_type == 'Forward':
+                fwd_loss = train_loss
+            elif step_type == 'Backward':
+                bwd_loss = train_loss
             if not oomed_out:
                 buffer, mol_loader = grow_batch_size(buffer, mol_loader)
 
@@ -212,6 +215,8 @@ def train():
             anneal_reward(annealing_lambda, energy_function)
             metrics.update({'lr': forward_optimizer.param_groups[0]['lr']})
             metrics.update(log_elapsed_times())
+            metrics['Forward Loss'] = fwd_loss
+            metrics['Backward Loss'] = bwd_loss
             wandb.log(metrics, step=i)
 
     torch.save(gfn_model.state_dict(), f'{name}_model_final.pt')

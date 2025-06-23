@@ -20,7 +20,7 @@ def get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states, no_
     return crystal_batch, log_r
 
 
-def linear_trajectory_penalty(trajectory_length, initial_state, states, linear_penalty_coeff: float = 0.1):
+def linear_trajectory_penalty(trajectory_length, initial_state, states, linear_penalty_coeff: float = 0.0):
     terminal_state = states[:, -1, :]
     n_steps = trajectory_length
     steps = torch.linspace(0, 1, n_steps + 1, device=initial_state.device)[None, :, None]
