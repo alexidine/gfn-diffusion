@@ -69,6 +69,7 @@ class CrystalReplayBuffer():
 
                 self.dataset = [self.dataset[ind] for ind in inds_to_keep]
                 self.scores_np_list = [self.scores_np_list[ind] for ind in inds_to_keep]
+                self.x = self.x[torch.tensor(inds_to_keep,dtype=torch.long)]
 
         gc.collect()
 
