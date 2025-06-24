@@ -27,10 +27,10 @@ norm: 'layer'                   # null, "layer", "batch"
 batch_size: 25               # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
 max_batch_size: 100           # maximum batch size to allow
-eval_batch_size: 500        # batch size for evaluation
-epochs: 52             # number of training epochs: relatively large
-eval_period: 50              # how often to do evaluation & reporting
-figs_period: 50             # how often to log custom figrues  # must be multiple of eval_period or it won't fire
+eval_batch_size: 250        # batch size for evaluation
+epochs: 1000000             # number of training epochs: relatively large
+eval_period: 250              # how often to do evaluation & reporting
+figs_period: 250             # how often to log custom figrues  # must be multiple of eval_period or it won't fire
 buffer_size: 12000          # size of replay buffer: relatively large
 
 # GFlowNet settings
@@ -70,7 +70,7 @@ sampling: "buffer"
 
 # exploration controls
 exploratory: true       # adds variance to optionally learned logvars
-exploration_factor: 1  # initial exploration value
+exploration_factor: 0.1  # initial exploration value
 exploration_wd: True  # decay exploration over time
 wd_max_steps: 1000  # number of steps to terminate the added variance
 
@@ -90,7 +90,7 @@ energy_min_temperature: 0.01
 energy_max_temperature: 1
 energy_static_temperature: 1  # for certain evaluations
 temperature_scaling_factor: 0.01  # controls relative frequency of higher vs lower temperatures (higher -> higher)
-annealing_max_steps: 500  # time for scaling_factor to reach 1 (uniform sampling from min to max)
+annealing_max_steps: 5000  # time for scaling_factor to reach 1 (uniform sampling from min to max)
 
 # deprecated or un-used
 max_iter_ls: 100                # DEPRECATED # how many iterations to run local search

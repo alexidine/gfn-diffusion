@@ -146,8 +146,8 @@ def bwd_vg(terminal_state, gfn, log_r, exploration_std=None, condition=None, rep
         linear_penalty = linear_trajectory_penalty(gfn.trajectory_length, initial_state, states)
 
         # only train the flow loss when the trajectory is already well behaved
-        vg_coeff = 2 * F.sigmoid(-initial_state_loss.mean() * 100)  # increase the scalar inside to tighten the fit
-        loss = vg_coeff * vg_loss.mean() + initial_state_loss.mean() + linear_penalty.mean()
+        vg_coeff = 2 * F.sigmoid(-initial_state_loss.mean() * 10)  # increase the scalar inside to tighten the fit
+        loss = vg_coeff * vg_loss.mean() + initial_state_loss.mean() #+ linear_penalty.mean()
     else:
         loss = vg_loss.mean()
 

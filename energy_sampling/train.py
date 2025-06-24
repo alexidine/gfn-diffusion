@@ -209,8 +209,8 @@ def train():
             metrics = do_evaluation(energy_function, buffer, gfn_model, i, metrics, mol_loader)
             wandb.log(metrics, step=i)
 
-        elif i % 10 == 0:
-            lr_warmup_finished, lr =step_lr_schedule(bwd_scheduler1, bwd_scheduler2,
+        elif i % 10 == 0 and i > 9:
+            lr_warmup_finished, lr = step_lr_schedule(bwd_scheduler1, bwd_scheduler2,
                                                      forward_optimizer,
                                                      fwd_scheduler1, fwd_scheduler2,
                                                      lr_warmup_finished)
@@ -261,16 +261,12 @@ def init_schedulers_optimizers(gfn_model):
     forward_optimizer = get_gfn_optimizer(gfn_model,
                                           init_policy_lr,
                                           init_flow_lr,
-                                          init_back_lr,
-                                          args.learn_pb,
                                           args.conditional_flow_model,
                                           args.use_weight_decay,
                                           args.weight_decay)
     backward_optimizer = get_gfn_optimizer(gfn_model,
-                                           init_policy_lr,
-                                           init_flow_lr,
                                            init_back_lr,
-                                           args.learn_pb,
+                                           init_flow_lr,
                                            args.conditional_flow_model,
                                            args.use_weight_decay,
                                            args.weight_decay)
@@ -279,8 +275,8 @@ def init_schedulers_optimizers(gfn_model):
         lr_annealing_lambda = (args.min_lr / args.lr_policy) ** (1 / (args.lr_anneal_time / 10))
         fwd_scheduler1 = lr_scheduler.MultiplicativeLR(forward_optimizer, lr_lambda=lambda epoch: lr_warmup_lambda)
         fwd_scheduler2 = lr_scheduler.MultiplicativeLR(forward_optimizer, lr_lambda=lambda epoch: lr_annealing_lambda)
-        bwd_scheduler1 = lr_scheduler.MultiplicativeLR(forward_optimizer, lr_lambda=lambda epoch: lr_warmup_lambda)
-        bwd_scheduler2 = lr_scheduler.MultiplicativeLR(forward_optimizer, lr_lambda=lambda epoch: lr_annealing_lambda)
+        bwd_scheduler1 = lr_scheduler.MultiplicativeLR(backward_optimizer, lr_lambda=lambda epoch: lr_warmup_lambda)
+        bwd_scheduler2 = lr_scheduler.MultiplicativeLR(backward_optimizer, lr_lambda=lambda epoch: lr_annealing_lambda)
     else:
         fwd_scheduler1, fwd_scheduler2, bwd_scheduler1, bwd_scheduler2 = None, None, None, None
     return forward_optimizer, backward_optimizer, fwd_scheduler1, fwd_scheduler2, bwd_scheduler1, bwd_scheduler2

@@ -53,7 +53,7 @@ config_list.append(
         'mode_fwd': 'cond-tb-avg',
         'mode_bwd': 'cond-tb-avg',
         'both_ways': True,
-        'max_batch_size': 2000,
+        'max_batch_size': 1000,
         'repeats': 10,
         'wd_max_steps': 5000,
         'annealing_max_steps': 2000,
@@ -77,19 +77,6 @@ config_list.append(
         'molecules_path': '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt',
     }
 )  # 2 - 5 repeats
-"""
-1) VarGrad is great but expensive
-2) need to add a VarGrad evaluation parity plot
-ADDRESSED 3) Forward-backward balance doesn't look perfect
-ADDRESSED 4) model not sampling diverse minima, but basically one packing pattern
-ADDRESSED 5) buffer can reinforce mode collapse
-6) inconsistent results between VarGrad options
-7) backward training perhaps is stabilizing
-ADDRESSED 8) forward and backward losses are unbalanced - different scale, leading to high loss variance
-FIXED 9) temperature and expl annealing might be too fast
-FIXED 10) insensitive to number of repeats 
-"""
-
 
 def overwrite_nested_dict(d1, d2):
     for k, v in d2.items():

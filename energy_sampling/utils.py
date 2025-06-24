@@ -60,22 +60,18 @@ def fig_to_image(fig):
     )
 
 
-def get_gfn_optimizer(gfn_model, lr_policy, lr_flow, lr_back, back_model=False, conditional_flow_model=False,
+def get_gfn_optimizer(gfn_model, lr_policy, lr_flow, conditional_flow_model=False,
                       use_weight_decay=False, weight_decay=1e-7):
     param_groups = [{'params': gfn_model.t_model.parameters()},
                     {'params': gfn_model.s_model.parameters()},
                     {'params': gfn_model.policy_model.parameters()},
                     ]
     if conditional_flow_model:
-        # param_groups += [{'params': gfn_model.policy_model.parameters(),
-        #                   'lr': lr_flow}]
+
         param_groups += [{'params': gfn_model.conditions_embedding_model.parameters(),
                           'lr': lr_policy}]
     else:
         param_groups += [{'params': [gfn_model.flow_model], 'lr': lr_flow}]
-
-    #if back_model:
-    #    param_groups += [{'params': gfn_model.backward_policy.parameters(), 'lr': lr_back}]
 
     if use_weight_decay:
         gfn_optimizer = torch.optim.Adam(param_groups, lr_policy, weight_decay=weight_decay)
