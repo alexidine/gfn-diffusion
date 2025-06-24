@@ -51,14 +51,15 @@ class CrystalReplayBuffer():
                     new_x_inds_to_keep = torch.argwhere(new_x_dists.amin(dim=0) >= diversity_cutoff).flatten()
                     data_list = [data_list[ind] for ind in new_x_inds_to_keep]
 
-                self.dataset.extend(list(data_list))
-                self.x = torch.cat([self.x, new_x[new_x_inds_to_keep]], dim=0)
-                self.scores_np_list.extend(
-                    list(self.energy_function.prebuilt_sample_to_reward(
-                        data_list,
-                        temperature=torch.ones(len(data_list))).detach().cpu().view(-1).numpy())
-                )
-                assert len(self.dataset) == len(self.x) == len(self.scores_np_list)
+                if len(data_list) > 0:
+                    self.dataset.extend(list(data_list))
+                    self.x = torch.cat([self.x, new_x[new_x_inds_to_keep]], dim=0)
+                    self.scores_np_list.extend(
+                        list(self.energy_function.prebuilt_sample_to_reward(
+                            data_list,
+                            temperature=torch.ones(len(data_list))).detach().cpu().view(-1).numpy())
+                    )
+                    assert len(self.dataset) == len(self.x) == len(self.scores_np_list)
 
             if len(self) > self.buffer_size:  # pare down buffer
                 inds_to_keep = self.sample_indices(self.buffer_size, replace=False)
