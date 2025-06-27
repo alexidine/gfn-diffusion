@@ -17,14 +17,13 @@ from utils import logmeanexp
 
 @torch.no_grad()
 def log_partition_function(initial_state, gfn, energy_function, mol_batch):
-    # todo set up option for VarGrad style loss
+    # todo set up option for VarGrad style loss reporting
     condition = energy_function.get_conditioning_tensor(mol_batch)
     (states, log_pfs, log_pbs, log_fs,
      means_f, logvars_f, means_b, logvars_b) = gfn.get_trajectory_fwd(initial_state,
-                                                                              None,
-                                                                              energy_function,
-                                                                              condition,
-                                                                              return_gauss_params=True)
+                                                                      None,
+                                                                      condition,
+                                                                      return_gauss_params=True)
     log_r, sample_batch = energy_function.log_reward(
         states[:, -1], mol_batch=mol_batch,
         log_temperature=condition[:, 0],
@@ -35,7 +34,7 @@ def log_partition_function(initial_state, gfn, energy_function, mol_batch):
     log_Z_lb = log_weight.mean()
     log_Z_learned = log_fs[:, 0].mean()
 
-    return (states, states[:,-1],
+    return (states, states[:, -1],
             log_r, log_Z, log_Z_lb, log_Z_learned,
             sample_batch, condition,
             log_pfs, log_pbs, log_fs,
@@ -76,7 +75,8 @@ def eval_step(energy_function,
     metrics = log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_Z_learned, log_r,
                                          sample_batch, buffer)
 
-    buffer.add(sample_batch.cpu().detach().to_data_list())  # add evaluation samples to buffer
+    if len(buffer) > 0:
+        buffer.add(sample_batch.cpu().detach().to_data_list())  # add evaluation samples to buffer
 
     if do_figures:
         fig_dict = generate_eval_figs(buffer, bwd_training,
@@ -121,6 +121,7 @@ def generate_eval_figs(buffer, bwd_training, condition, flow_states, gfn_model, 
     #fig_dict['Pb vs R'] = Pf_vs_R_fig(log_pbs, log_r)
     fig_dict['Pf vs Pb'] = Pf_vs_Pb_fig(log_pfs, log_pbs, log_r)
     fig_dict['TB Parity Plot'] = flow_parity_plot(log_r, log_fs[:, 0], log_pbs, log_pfs)
+    fig_dict['VG Error'] = vargrad_error(log_r, log_pbs, log_pfs)
     fig_dict['Lattice Latents Trajectories'] = visualize_latent_trajs(flow_states.cpu().detach().numpy(),
                                                                       20,
                                                                       log_r.cpu().detach().numpy())
@@ -140,8 +141,7 @@ def generate_eval_figs(buffer, bwd_training, condition, flow_states, gfn_model, 
             override_batch=len(init_state))
         (backward_flow_states, b_log_pfs, b_log_pbs, b_log_fs,
          b_means_f, b_vars_f, b_means_b, b_vars_b) = gfn_model.get_trajectory_bwd(
-            terminal_state.to(gfn_model.device), None,
-            condition.to(gfn_model.device), return_gauss_params=True)
+            terminal_state.to(gfn_model.device), condition.to(gfn_model.device), return_gauss_params=True)
         fig_dict['Backward Latents Trajectories'] = visualize_latent_trajs(
             backward_flow_states.cpu().detach().numpy(),
             n_trajs=20, log_r=b_log_r.cpu().detach().numpy())
@@ -151,7 +151,7 @@ def generate_eval_figs(buffer, bwd_training, condition, flow_states, gfn_model, 
         fig_dict['Backward TB Parity Plot'] = flow_parity_plot(b_log_r.to(b_log_fs.device), b_log_fs[:, 0], b_log_pbs,
                                                                b_log_pfs)
         fig_dict['Backward Gauss Params'] = mean_var_fig(b_vars_f, b_means_f,
-                                                        b_vars_b, b_means_b)
+                                                         b_vars_b, b_means_b)
         initial_state_loss = (init_state - backward_flow_states[:, 0]).norm(dim=1).pow(2)
 
     for key in fig_dict.keys():
@@ -253,7 +253,7 @@ def T_vs_E_fig(condition, sample_batch):
     x = condition[:, 0].cpu().detach().numpy()
     y = sample_batch.gfn_energy.cpu().detach().numpy()
     fig.add_histogram2d(x=x,
-                        y=np.log10(y-y.min() + 1e-3),
+                        y=np.log10(y - y.min() + 1e-3),
                         showscale=False,
                         nbinsx=50, nbinsy=50)
     fig.update_layout(xaxis_title='Log Temperature', yaxis_title='Sample Energy')
@@ -363,7 +363,7 @@ def visualize_latent_trajs(states, n_trajs, log_r):
                 mode='lines',
                 marker_line_width=0.5,
                 showlegend=True if i == 0 else False,
-                marker_color=log_r,#color_hex[j],
+                marker_color=log_r,  #color_hex[j],
                 marker_colorscale='viridis',
             ),
                 row=row, col=col
@@ -413,6 +413,18 @@ def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs):
         # height=600,
         template='plotly_white'
     )
+
+    return fig
+
+
+def vargrad_error(log_r, log_pbs, log_pfs):
+    # Compute x and y
+    log_ratio = (log_r + log_pbs.sum(-1) - log_pfs.sum(-1)).cpu().detach().numpy()
+    log_z = log_ratio.mean()
+
+    mae = np.abs(log_z - log_ratio).mean()
+    fig = go.Figure(go.Histogram(x=(log_z - log_ratio), nbinsx=100, name=f'MAE={mae:.2f}', showlegend=True))
+    fig.update_layout(xaxis_title='Log Ratio Error', yaxis_title='Count')
 
     return fig
 

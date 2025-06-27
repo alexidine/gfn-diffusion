@@ -46,7 +46,7 @@ class CrystalReplayBuffer():
                 if filter_diversity:
                     new_x = collate_data_list(data_list).cell_params_to_gen_basis()
                     rands = torch.from_numpy(
-                        np.random.choice(len(self.dataset), self.diversity_check_size, replace=False))
+                        np.random.choice(len(self.dataset), self.diversity_check_size, replace=False if len(self.dataset) > self.diversity_check_size else True))
                     new_x_dists = torch.cdist(self.x[rands], new_x)
                     new_x_inds_to_keep = torch.argwhere(new_x_dists.amin(dim=0) >= diversity_cutoff).flatten()
                     data_list = [data_list[ind] for ind in new_x_inds_to_keep]

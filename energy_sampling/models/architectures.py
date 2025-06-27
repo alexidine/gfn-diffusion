@@ -220,6 +220,13 @@ class LearnableScalar(nn.Module):
     def forward(self, *args, **kwargs):
         return self.scalar
 
+class NoneModule(nn.Module):
+    def __init__(self, device=None):
+        super().__init__()
+
+    def forward(self, *args, **kwargs):
+        return None
+
 
 class FlowModel(nn.Module):
     def __init__(self, conditioning_dim: int,

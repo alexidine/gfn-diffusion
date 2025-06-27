@@ -21,6 +21,7 @@ class MolecularCrystal(BaseSet):
                  turnover_pot: float = 20.0,
                  density_coeff: float = 0,
                  temperature_scaling_factor: float = 1,
+                 temperature: float = 1.0,
                  temperature_conditioning: bool = False
                  ):
         super(MolecularCrystal, self).__init__()
@@ -36,6 +37,8 @@ class MolecularCrystal(BaseSet):
         self.temperature_scaling_factor = temperature_scaling_factor
         self.temperature_conditioning = temperature_conditioning
         self.turnover_pot = turnover_pot  # energy above which to soften intermolecular repulsion
+
+        self.temperature = temperature  # for static temperature work
 
     def instantiate_crystals(self, x, mol_batch):
         crystal_batch = self.init_blank_crystal_batch(mol_batch)
@@ -88,10 +91,13 @@ class MolecularCrystal(BaseSet):
         if self.energy_function == 'simple_density':
             # harmonic attraction to the target
             # plus a hard wall at zero
-            crystal_energy = (F.mse_loss(cluster_batch.packing_coeff,
+            density_energy = (F.mse_loss(cluster_batch.packing_coeff,
                                         torch.ones_like(cluster_batch.packing_coeff) * 0.7142,
-                                        reduction='none') -
+                                        reduction='none')*10 -
                               torch.log(cluster_batch.packing_coeff)/100).clip(max=100)
+            pose_params = cluster_batch.cell_parameters()[:, 6:]
+            positional_placeholder_energy = F.mse_loss(pose_params, torch.ones_like(pose_params) * 0.25) * 10
+            crystal_energy = density_energy + positional_placeholder_energy
 
         elif self.energy_function == 'ellipsoid_overlap':
             density_energy = F.relu(-(cluster_batch.packing_coeff - 1)) ** 2
@@ -224,4 +230,4 @@ class MolecularCrystal(BaseSet):
             else:
                 return torch.log10(temperature[:, None])
         else:
-            return None
+            return torch.log10(torch.ones((mol_batch.num_graphs, 1), device=mol_batch.device) * self.temperature)

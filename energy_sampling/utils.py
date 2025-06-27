@@ -65,13 +65,12 @@ def get_gfn_optimizer(gfn_model, lr_policy, lr_flow, conditional_flow_model=Fals
     param_groups = [{'params': gfn_model.t_model.parameters()},
                     {'params': gfn_model.s_model.parameters()},
                     {'params': gfn_model.policy_model.parameters()},
+                    {'params': gfn_model.flow_model.parameters(), 'lr': lr_flow}
                     ]
-    if conditional_flow_model:
 
+    if conditional_flow_model:
         param_groups += [{'params': gfn_model.conditions_embedding_model.parameters(),
                           'lr': lr_policy}]
-    else:
-        param_groups += [{'params': [gfn_model.flow_model], 'lr': lr_flow}]
 
     if use_weight_decay:
         gfn_optimizer = torch.optim.Adam(param_groups, lr_policy, weight_decay=weight_decay)

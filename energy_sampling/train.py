@@ -136,6 +136,7 @@ def train():
                                        max_temperature=args.energy_max_temperature,
                                        temperature_scaling_factor=args.temperature_scaling_factor,
                                        temperature_conditioning=args.temperature_conditioning,
+                                       temperature = args.energy_static_temperature,
                                        density_coeff=args.energy_density_coeff)
 
     config = args.__dict__
@@ -183,6 +184,7 @@ def train():
 
         times['train_step_start'] = time()
         try:
+            torch.autograd.set_detect_anomaly(True)  # for debugging
             train_loss, step_type = train_step(energy_function,
                                                gfn_model,
                                                forward_optimizer,
