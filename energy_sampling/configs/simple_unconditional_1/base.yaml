@@ -56,8 +56,8 @@ gfn_clip: 10.0  # clip the maximumstep size induced by the policy model
 
 # local search settings
 ################################################################
-buffer_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
-molecules_path: 'D:/crystal_datasets/test_qm9_dataset.pt'
+buffer_path: '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt'
+molecules_path: '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt'
 
 # replay buffer / dataset settings
 ################################################################

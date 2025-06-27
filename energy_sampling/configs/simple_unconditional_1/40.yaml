@@ -4,7 +4,7 @@ annealing_max_steps: 5000
 batch_size: 25
 beta: 0.1
 both_ways: false
-buffer_path: D:/crystal_datasets/urea_gfn_dataset.pt
+buffer_path: /scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt
 buffer_size: 20000
 burn_in: 100
 bwd: false
@@ -59,7 +59,7 @@ max_iter_ls: 100
 min_lr: 1.0e-06
 mode_bwd: tb
 mode_fwd: vg
-molecules_path: D:/crystal_datasets/test_qm9_dataset.pt
+molecules_path: /scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt
 norm: null
 partial_energy: false
 pb_scale_range: 0.1
