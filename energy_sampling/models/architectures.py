@@ -152,6 +152,41 @@ class StateEncoding(nn.Module):
         return self.x_model(model_inputs)
 
 
+
+
+class PolicyModel(nn.Module):
+    def __init__(self, s_dim: int,
+                 s_emb_dim: int,
+                 t_dim: int,
+                 hidden_dim: int = 64,
+                 layers: int = 4,
+                 out_dim: int = None,
+                 dropout: Optional[float] = 0,
+                 norm: Optional[str] = None,
+                 bias: Optional[bool] = True,
+                 zero_init: bool = False):
+        super(PolicyModel, self).__init__()
+        if out_dim is None:
+            out_dim = 2 * s_dim
+
+        self.model = scalarMLP(
+            layers=layers,
+            input_dim=s_emb_dim + t_dim,
+            filters=hidden_dim,
+            output_dim=out_dim,
+            dropout=dropout,
+            norm=norm,
+            bias=bias,
+        )
+
+        if zero_init:
+            self.model.output_layer.weight.data.fill_(0.0)
+            #self.model.output_layer.bias.data.fill_(0.0)
+
+    def forward(self, s, t):
+        return self.model(torch.cat([s, t], dim=-1))
+
+
 class JointPolicy(nn.Module):
     def __init__(self, s_dim: int,
                  s_emb_dim: int,

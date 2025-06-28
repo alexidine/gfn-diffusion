@@ -60,11 +60,13 @@ def fig_to_image(fig):
     )
 
 
-def get_gfn_optimizer(gfn_model, lr_policy, lr_flow, conditional_flow_model=False,
+def get_gfn_optimizer(gfn_model, lr_policy, lr_flow,
+                      conditional_flow_model=False,
                       use_weight_decay=False, weight_decay=1e-7):
     param_groups = [{'params': gfn_model.t_model.parameters()},
                     {'params': gfn_model.s_model.parameters()},
-                    {'params': gfn_model.policy_model.parameters()},
+                    {'params': gfn_model.forward_policy.parameters()},
+                    {'params': gfn_model.backward_policy.parameters()},
                     {'params': gfn_model.flow_model.parameters(), 'lr': lr_flow}
                     ]
 

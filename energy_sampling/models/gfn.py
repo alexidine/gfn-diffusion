@@ -71,7 +71,10 @@ class GFN(nn.Module):
                                     norm=norm, dropout=dropout)
         self.s_model = StateEncoding(dim, hidden_dim, condition_embedding_dim, s_emb_dim,
                                      norm=norm, dropout=dropout)
-        self.policy_model = JointPolicy(dim, s_emb_dim, t_dim,
+        self.forward_policy = PolicyModel(dim, s_emb_dim, t_dim,
+                                        hidden_dim, joint_layers, 2 * dim, zero_init=zero_init,
+                                        norm=norm, dropout=dropout)
+        self.backward_policy = PolicyModel(dim, s_emb_dim, t_dim,
                                         hidden_dim, joint_layers, 2 * dim, zero_init=zero_init,
                                         norm=norm, dropout=dropout)
 
@@ -96,7 +99,7 @@ class GFN(nn.Module):
         else:
             time_encoding = self.t_model(time).repeat(batch_size, 1)
         state_encoding = self.s_model(state, condition_embedding)
-        state_update = self.policy_model.forward_policy(state_encoding,
+        state_update = self.forward_policy(state_encoding,
                                                         time_encoding)
 
         if self.clipping:
@@ -110,7 +113,7 @@ class GFN(nn.Module):
         batch_size = state.shape[0]
         time_encoding = self.t_model(time).repeat(batch_size, 1)
         state_encoding = self.s_model(state, condition_embedding)
-        state_update = self.policy_model.backward_policy(state_encoding,
+        state_update = self.backward_policy(state_encoding,
                                                          time_encoding)  # nx(2d) with d drift and d noise parameters
 
         if self.clipping:
@@ -493,7 +496,7 @@ class GFN(nn.Module):
         elif self.bwd_policy == 'gaussian':
             time_encoding = self.t_model(times_for_bwd[:, None])
             state_encoding = self.s_model(states_for_bwd, conditions_for_bwd)
-            state_update = self.policy_model.backward_policy(state_encoding, time_encoding)
+            state_update = self.backward_policy(state_encoding, time_encoding)
 
             if self.clipping:
                 state_update = torch.clip(state_update, -self.gfn_clip, self.gfn_clip)
@@ -539,7 +542,7 @@ class GFN(nn.Module):
         elif self.bwd_policy == 'gaussian':
             time_encoding = self.t_model(current_time)
             state_encoding = self.s_model(current_state, condition_embedding)
-            state_update = self.policy_model.backward_policy(state_encoding, time_encoding)
+            state_update = self.backward_policy(state_encoding, time_encoding)
 
             if self.clipping:
                 state_update = torch.clip(state_update, -self.gfn_clip, self.gfn_clip)
@@ -556,7 +559,7 @@ class GFN(nn.Module):
                 time_encoding = self.t_model(current_time)
 
             state_encoding = self.s_model(current_state, condition_embedding)
-            state_update = self.policy_model.backward_policy(state_encoding, time_encoding)
+            state_update = self.backward_policy(state_encoding, time_encoding)
 
             dmean, dvar = gaussian_params(state_update)
             back_mean_correction = 1 + dmean.tanh() * self.pb_scale_range
