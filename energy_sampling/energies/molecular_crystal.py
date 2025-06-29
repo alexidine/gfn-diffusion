@@ -1,6 +1,7 @@
 import copy
 from typing import Optional
 
+import numpy as np
 import torch
 
 from mxtaltools.dataset_utils.data_classes import MolCrystalData, MolData
@@ -41,14 +42,16 @@ class MolecularCrystal(BaseSet):
         self.temperature = temperature  # for static temperature work
 
     def instantiate_crystals(self, x, mol_batch):
+        eps = 1e-1  # hard clip the model range here
         crystal_batch = self.init_blank_crystal_batch(mol_batch)
-        crystal_batch.gen_basis_to_cell_params(x, clip_min_length=0.5)  # don't allow micro cells
+        crystal_batch.gen_basis_to_cell_params(x.clip(min=-6 + eps, max=6 - eps))
         crystal_batch.box_analysis()
         return crystal_batch
 
     def analyze_crystal_batch(self, x, mol_batch, return_batch=False):  # x is gfn_outputs
         crystal_batch = self.instantiate_crystals(x, mol_batch)
-        if self.energy_function == 'simple_density':  # no need to actually build the crystal, this is much faster
+        if self.energy_function not in ['ellipsoid_overlap',
+                                        'silu_energy']:  # no need to actually build the crystal, this is much faster
             cluster_batch = crystal_batch
             lj_energy = torch.zeros(crystal_batch.num_graphs, device=self.device)
             silu_energy = torch.zeros_like(lj_energy)
@@ -88,16 +91,53 @@ class MolecularCrystal(BaseSet):
             return crystal_energy
 
     def generator_energy(self, cluster_batch):
-        if self.energy_function == 'simple_density':
-            # harmonic attraction to the target
-            # plus a hard wall at zero
-            density_energy = (F.mse_loss(cluster_batch.packing_coeff,
-                                        torch.ones_like(cluster_batch.packing_coeff) * 0.7142,
-                                        reduction='none')*10 -
-                              torch.log(cluster_batch.packing_coeff)/100).clip(max=100)
-            pose_params = cluster_batch.cell_parameters()[:, 6:]
-            positional_placeholder_energy = F.mse_loss(pose_params, torch.ones_like(pose_params) * 0.25) * 10
-            crystal_energy = density_energy + positional_placeholder_energy
+        if self.energy_function == 'latent_harmonic':
+            # a trivial energy function, for testing
+            latents = cluster_batch.cell_params_to_gen_basis()
+            center_of_attraction = -torch.ones((1, 12), device=self.device)
+            crystal_energy = 0.5 * (latents - center_of_attraction).pow(2).sum(dim=1) / self.temperature
+            # analytic Z = (2pi*T)^(d/2)
+        elif self.energy_function == 'crystal_harmonic':
+            # a trivial energy function, for testing
+            cell_params = cluster_batch.cell_parameters()
+            center_of_attraction = torch.tensor([1, 2, 3,
+                                                 1.5, 1.5, 1.5,
+                                                 0.25, 0.5, 0.75,
+                                                 1, 2, 3], device=self.device)[None, :]
+            crystal_energy = 0.5 * (cell_params - center_of_attraction).pow(2).sum(dim=1) / self.temperature
+            # analytic Z = (2pi*T)^(d/2)
+
+        elif self.energy_function == 'latent_multiharmonic':
+            latents = cluster_batch.cell_params_to_gen_basis()
+            if not hasattr(self, 'modes'):
+                self.modes = torch.tensor(generate_modes(10, 12, 4.0, 3.0, half_normal_dim=9), device=self.device)
+
+            diffs = latents[:, None, :] - self.modes[None, :, :]
+            sqdist = (diffs ** 2).sum(dim=-1)  # (B, K)
+            exponent = -0.5 * sqdist / self.temperature  # (B, K)
+            crystal_energy = -torch.logsumexp(exponent, dim=1)  # (B,)
+            """
+            #Partition function
+            
+            D = self.modes.shape[1]
+            det_term = (2 * np.pi * self.temperature) ** (D / 2)
+            weights = torch.ones(self.modes.shape[0], device=self.modes.device) / self.modes.shape[0]
+            Z = det_term * torch.sum(weights).item()
+            log_Z = np.log(Z)
+            """
+
+        elif self.energy_function == 'crystal_multiharmonic':
+            latents = cluster_batch.cell_params_to_gen_basis()
+            if not hasattr(self, 'modes'):
+                latent_modes = torch.tensor(generate_modes(10, 12, 4.0, 3.0, half_normal_dim=9), device=self.device)
+                self.modes = cluster_batch.latent_transform.inverse(latent_modes, cluster_batch.sg_ind[:10],
+                                                                    cluster_batch.radius[:10])
+
+            diffs = latents[:, None, :] - self.modes[None, :, :]
+            sqdist = (diffs ** 2).sum(dim=-1)  # (B, K)
+            exponent = -0.5 * sqdist / self.temperature  # (B, K)
+            crystal_energy = -torch.logsumexp(exponent, dim=1)  # (B,)
+
 
         elif self.energy_function == 'ellipsoid_overlap':
             density_energy = F.relu(-(cluster_batch.packing_coeff - 1)) ** 2
@@ -231,3 +271,24 @@ class MolecularCrystal(BaseSet):
                 return torch.log10(temperature[:, None])
         else:
             return torch.log10(torch.ones((mol_batch.num_graphs, 1), device=mol_batch.device) * self.temperature)
+
+
+def generate_modes(K=20, D=12, rho=4.0, delta=3.0, half_normal_dim=0, seed=42):
+    np.random.seed(seed)
+    mus = []
+
+    def is_well_separated(new_mu, mus, delta):
+        if len(mus) == 0:
+            return True
+        dists = np.linalg.norm(np.array(mus) - new_mu, axis=1)
+        return np.all(dists >= delta)
+
+    while len(mus) < K:
+        mu = np.random.randn(D)
+        mu = rho * mu / np.linalg.norm(mu)
+        if mu[half_normal_dim] > 0:
+            mu[half_normal_dim] = -abs(mu[half_normal_dim])
+        if is_well_separated(mu, mus, delta):
+            mus.append(mu)
+
+    return np.stack(mus)  # shape (K, D)

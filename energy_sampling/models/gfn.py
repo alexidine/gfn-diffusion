@@ -69,14 +69,14 @@ class GFN(nn.Module):
 
         self.t_model = TimeEncoding(harmonics_dim, t_dim, hidden_dim,
                                     norm=norm, dropout=dropout)
-        self.s_model = StateEncoding(dim, hidden_dim, condition_embedding_dim, s_emb_dim,
+        self.s_model = StateEncoding(dim, joint_layers, hidden_dim, condition_embedding_dim, s_emb_dim,
                                      norm=norm, dropout=dropout)
         self.forward_policy = PolicyModel(dim, s_emb_dim, t_dim,
-                                        hidden_dim, joint_layers, 2 * dim, zero_init=zero_init,
-                                        norm=norm, dropout=dropout)
+                                          hidden_dim, joint_layers, 2 * dim, zero_init=zero_init,
+                                          norm=norm, dropout=dropout)
         self.backward_policy = PolicyModel(dim, s_emb_dim, t_dim,
-                                        hidden_dim, joint_layers, 2 * dim, zero_init=zero_init,
-                                        norm=norm, dropout=dropout)
+                                           hidden_dim, joint_layers, 2 * dim, zero_init=zero_init,
+                                           norm=norm, dropout=dropout)
 
         self.pb_scale_range = pb_scale_range
 
@@ -100,7 +100,7 @@ class GFN(nn.Module):
             time_encoding = self.t_model(time).repeat(batch_size, 1)
         state_encoding = self.s_model(state, condition_embedding)
         state_update = self.forward_policy(state_encoding,
-                                                        time_encoding)
+                                           time_encoding)
 
         if self.clipping:
             state_update = torch.clip(state_update, -self.gfn_clip, self.gfn_clip)
@@ -114,7 +114,7 @@ class GFN(nn.Module):
         time_encoding = self.t_model(time).repeat(batch_size, 1)
         state_encoding = self.s_model(state, condition_embedding)
         state_update = self.backward_policy(state_encoding,
-                                                         time_encoding)  # nx(2d) with d drift and d noise parameters
+                                            time_encoding)  # nx(2d) with d drift and d noise parameters
 
         if self.clipping:
             state_update = torch.clip(state_update, -self.gfn_clip, self.gfn_clip)
@@ -123,199 +123,171 @@ class GFN(nn.Module):
 
         return pb_mean, pb_logvars
 
-    #
-    # def old_get_trajectory_fwd(self,
-    #                            initial_state,
-    #                            exploration_std,
-    #                            log_reward_fn,
-    #                            condition,
-    #                            return_gauss_params: bool = False,
-    #                            compute_pb: bool = True,
-    #                            ):
-    #
-    #     batch_size = initial_state.shape[0]
-    #     logf, logpb, logpf, logvars_b, logvars_f, means_b, means_f, states = (
-    #         self.init_traj_tensors(batch_size))
-    #
-    #     current_state = initial_state.clone().detach()
-    #     states[:, 0] = initial_state.detach()  # set correct initial state
-    #     condition_embedding = self.conditions_embedding_model(condition)
-    #
-    #     # get exploration std per-trajectory, and then distribute it randomly across each
-    #     if exploration_std is not None:
-    #         per_path_expl_std = torch.rand(len(initial_state), device=initial_state.device) * exploration_std(0)
-    #         per_step_expl_std = torch.rand_like(states[:, :, 0]) * per_path_expl_std[:, None] * 2
-    #     else:
-    #         per_step_expl_std = torch.zeros_like(states[:, :, 0])
-    #
-    #     for i in range(self.trajectory_length):
-    #         logf[:, i] = self.flow_model(condition_embedding).squeeze(-1).squeeze(-1)
-    #         pf_mean, pf_logvar = self.call_forward_policy(current_state, i * self.dt, condition_embedding)
-    #         forward_std = (pf_logvar / 2).exp() * np.sqrt(self.dt)
-    #
-    #         # expl_std = self.get_expl_std(exploration_std, i)
-    #         expl_std = per_step_expl_std[:, i, None]
-    #
-    #         # propagate SDE
-    #         # add manually the exploratory variance, and do not consider it in the Pf calculation
-    #         # we want to know the probability of the move under the policy model, which is not the same
-    #         # as the path generation policy (which here is just pflogvars + expl)
-    #         next_state = (current_state +
-    #                       self.dt * pf_mean +
-    #                       (forward_std + expl_std) * torch.randn_like(current_state, device=self.device))
-    #
-    #         # get forward probabilities
-    #         forward_noise = ((
-    #                                  next_state - current_state) - self.dt * pf_mean) / forward_std  # extra variance not included here as this is the noise under the policy
-    #         logpf[:, i] = -0.5 * (forward_noise ** 2 + logtwopi + np.log(self.dt) + pf_logvar).sum(1)
-    #
-    #         if compute_pb:
-    #             if self.bwd_policy == 'brownian_bridge':
-    #                 back_mean_correction, back_var_correction = self.get_backward_correction(batch_size,
-    #                                                                                          condition_embedding,
-    #                                                                                          (i + 1) * self.dt,
-    #                                                                                          next_state)
-    #
-    #                 # pb_mean here is the actual mean of the SDE, not the drift (correction)
-    #                 pb_mean = ((i / (i + 1) * next_state + (1 / (i + 1)) * initial_state)) * back_mean_correction
-    #                 pb_var = ((self.pf_std_per_traj ** 2) * (i / (i + 1))) * back_var_correction
-    #                 pb_logvar = pb_var.log()
-    #                 # also, this is the noise of the induced backward step, not the actual one
-    #                 # not clear to me this is right, as we want Pb for the real trajectory
-    #                 # not a trajectory induced by Pb
-    #                 # todo fix this
-    #                 noise_backward = (current_state - next_state) / (pb_var * self.dt).sqrt()
-    #                 logpb[:, i] = -0.5 * (noise_backward ** 2 + logtwopi + np.log(self.dt) + pb_logvar).sum(1)
-    #             elif self.bwd_policy == 'gaussian':
-    #                 pb_mean, pb_logvar = self.call_backwards_gaussian_policy(next_state,
-    #                                                                          (i + 1) * self.dt,
-    #                                                                          condition_embedding
-    #                                                                          )
-    #                 backward_std = (pb_logvar / 2).exp() * np.sqrt(self.dt)
-    #                 backward_noise = ((next_state - current_state) - self.dt * pb_mean) / backward_std
-    #                 logpb[:, i] = -0.5 * (backward_noise ** 2 + logtwopi + np.log(self.dt) + pb_logvar).sum(1)
-    #             else:
-    #                 assert False, 'Unknown bwd_policy'
-    #         else:
-    #             pb_mean, pb_logvar = torch.zeros_like(pf_mean), torch.zeros_like(pf_logvar)
-    #
-    #         if return_gauss_params:
-    #             means_f[:, i] = pf_mean.mean(dim=1).detach()
-    #             logvars_f[:, i] = pf_logvar.mean(dim=1).detach()
-    #             means_b[:, i] = pb_mean.mean(dim=1).detach()
-    #             logvars_b[:, i] = pb_logvar.mean(dim=1).detach()
-    #
-    #         current_state = next_state
-    #         states[:, i + 1] = current_state
-    #
-    #     if return_gauss_params:
-    #         return states, logpf, logpb, logf, means_f, logvars_f, means_b, logvars_b
-    #     else:
-    #         return states, logpf, logpb, logf
-    #
-    # def old_get_trajectory_bwd(self, terminal_state, exploration_std, condition,
-    #                            return_gauss_params: bool = False,
-    #                            compute_pf: bool = True):
-    #     initial_state = get_gfn_init_state(len(terminal_state), terminal_state.shape[1], terminal_state.device)
-    #     batch_size = terminal_state.shape[0]
-    #     logf, logpb, logpf, logvars_b, logvars_f, means_b, means_f, states = (
-    #         self.init_traj_tensors(batch_size))
-    #
-    #     states[:, -1] = terminal_state
-    #     condition_embedding = self.conditions_embedding_model(condition)
-    #
-    #     current_state = terminal_state.clone().detach()  # todo clean up and unify logic between forward and backward trajs
-    #     for i in range(self.trajectory_length):
-    #         traj_ind = self.trajectory_length - i
-    #
-    #         #  no need for separate termination logic - put it in the policies
-    #         #   if True: # roll up the trajectory termination logic here. i < self.trajectory_length - 1:
-    #         if self.bwd_policy == 'brownian_bridge':  # I still think there might be issues here
-    #             # index of the equivalent forward trajectory
-    #             back_mean_correction, back_var_correction = self.get_backward_correction(
-    #                 batch_size,
-    #                 condition_embedding,
-    #                 1 - i * self.dt,
-    #                 current_state
-    #             )
-    #
-    #             # simplified and incorporates connection to nonzero initial state
-    #             pb_mean = ((traj_ind - 1) / traj_ind * current_state + (
-    #                     1 / traj_ind) * initial_state) * back_mean_correction
-    #             pb_var = (((traj_ind - 1) / traj_ind) * self.pf_std_per_traj ** 2) * back_var_correction
-    #             pb_logvar = pb_var.log()
-    #             # current_state omitted here as it's implicit in pb_mean above
-    #             prev_state = (pb_mean +
-    #                           (pb_var * self.dt).sqrt() * torch.randn_like(terminal_state, device=self.device))
-    #             pb_mean = ((traj_ind - 1) / traj_ind * current_state + (
-    #                     1 / traj_ind) * initial_state) * back_mean_correction
-    #             noise_backward = (prev_state - pb_mean) / (pb_var * self.dt).sqrt()
-    #             logpb[:, self.trajectory_length - i - 1] = -0.5 * (
-    #                     noise_backward ** 2 + logtwopi + np.log(self.dt) + pb_logvar).sum(
-    #                 1)
-    #         elif self.bwd_policy == 'gaussian':
-    #
-    #             pb_mean, pb_logvar = self.call_backwards_gaussian_policy(current_state,
-    #                                                                      1 - i * self.dt,
-    #                                                                      condition_embedding
-    #                                                                      )
-    #             backward_std = (pb_logvar / 2).exp() * np.sqrt(self.dt)
-    #             prev_state = (current_state +
-    #                           self.dt * pb_mean +
-    #                           backward_std * torch.randn_like(current_state, device=self.device))
-    #
-    #             backward_noise = ((prev_state - current_state) - self.dt * pb_mean) / backward_std
-    #             logpb[:, i] = -0.5 * (backward_noise ** 2 + logtwopi + np.log(self.dt) + pb_logvar).sum(1)
-    #         else:
-    #             assert False, 'Unknown bwd_policy'
-    #
-    #         # let it propagate
-    #         # else:
-    #         #     prev_state = initial_state  # call initial state from function
-    #         #     # at t=0 brownian bridge variance goes to zero and the SDE adopts the initial state
-    #         #     pb_mean = initial_state
-    #         #     pb_var = torch.zeros_like(pb_mean)
-    #         #     pb_logvar = pb_var.log()
-    #         #     traj_ind = 0
-    #
-    #         if compute_pf:
-    #             logf[:, self.trajectory_length - i - 1] = self.flow_model(condition_embedding).squeeze(-1).squeeze(-1)
-    #             pf_mean, pf_logvar = self.call_forward_policy(prev_state,
-    #                                                           (1. - (i + 1) * self.dt),
-    #                                                           condition_embedding)
-    #             forward_std = (pf_logvar / 2).exp() * np.sqrt(self.dt)
-    #             noise = ((current_state - prev_state) - self.dt * pf_mean) / forward_std
-    #             logpf[:, self.trajectory_length - i - 1] = -0.5 * (
-    #                     noise ** 2 + logtwopi + np.log(self.dt) + pf_logvar).sum(
-    #                 1)
-    #         else:
-    #             pf_mean, pf_logvar = torch.zeros_like(pb_mean), torch.zeros_like(pb_logvar)
-    #
-    #         current_state = prev_state
-    #         states[:, self.trajectory_length - i - 1] = current_state
-    #
-    #         if return_gauss_params:
-    #             means_f[:, traj_ind - 1] = pf_mean.mean(dim=1).detach()
-    #             logvars_f[:, traj_ind - 1] = pf_logvar.mean(dim=1).detach()
-    #             means_b[:, traj_ind - 1] = pb_mean.mean(dim=1).detach()
-    #             logvars_b[:, traj_ind - 1] = pb_logvar.mean(dim=1).detach()
-    #
-    #     if return_gauss_params:
-    #         return states, logpf, logpb, logf, means_f, logvars_f, means_b, logvars_b
-    #     else:
-    #         return states, logpf, logpb, logf
+    def predict_next_state(self, s, t, condition_embedding):
+        t = self.t_model(t)
+        s = self.s_model(s, condition_embedding)
+        s_new = self.forward_policy(s, t)
 
-    def get_trajectory_fwd(self,
-                           initial_state,
-                           exploration_std,
-                           condition,
-                           return_gauss_params: bool = False,
-                           compute_pf: bool = True,
-                           compute_pb: bool = True,
-                           ):
+        if self.clipping:
+            s_new = torch.clip(s_new, -self.gfn_clip, self.gfn_clip)
+        return s_new
+
+    def get_trajectory_fwd(self, initial_state, discretizer, exploration_std, condition,
+                           return_gauss_params: bool = False):
+        batch_size = initial_state.shape[0]
+
+        ts = discretizer(batch_size).to(self.device)
+        trajectory_length = ts.shape[1] - 1
+
+        logf, logpb, logpf, states, means_f, logvars_f, means_b, logvars_b = self.init_traj_tensors(batch_size, trajectory_length)
+
+        states[:, 0] = initial_state.clone().detach()  # set correct initial state
+        current_state = initial_state.clone().detach()
+
+        condition_embedding = self.conditions_embedding_model(condition)
+
+        logf[:, 0] = self.flow_model(condition_embedding).squeeze(-1).squeeze(-1)
+
+        for i in range(trajectory_length):
+            dts = ts[:, i + 1] - ts[:, i]
+
+            state_update = self.predict_next_state(current_state, ts[:, i], condition_embedding)
+            pf_mean, pflogvars = self.split_params(state_update)
+
+            if exploration_std is None:
+                pflogvars_sample = pflogvars.detach()
+            else:
+                expl = exploration_std(
+                    None)  # currently not using this arg -- could use ts here, would need changes to utils get_exploration_std
+                if expl <= 0.0:
+                    pflogvars_sample = pflogvars.detach()
+                else:
+                    add_log_var = torch.full_like(pflogvars, np.log(exploration_std(i)) * 2) / dts.sqrt().unsqueeze(1)
+                    pflogvars_sample = torch.logaddexp(pflogvars, add_log_var).detach()
+
+            s_ = (current_state +
+                  dts.unsqueeze(1) * pf_mean.detach() +
+                  dts.sqrt().unsqueeze(1) * (pflogvars_sample / 2).exp() * torch.randn_like(current_state,
+                                                                                            device=self.device))
+
+            noise = ((s_ - current_state) - dts.unsqueeze(1) * pf_mean) / (
+                    dts.sqrt().unsqueeze(1) * (pflogvars / 2).exp())
+            logpf[:, i] = -0.5 * (noise ** 2 + logtwopi + dts.log().unsqueeze(1) + pflogvars).sum(1)
+
+            if self.learn_pb:
+                t = self.t_model(ts[:, i + 1])
+                pbs = self.backward_policy(self.s_model(s_, condition_embedding), t)
+                dmean, dvar = gaussian_params(pbs)
+                back_mean_correction = 1 + dmean.tanh() * self.pb_scale_range
+                back_var_correction = 1 + dvar.tanh() * self.pb_scale_range
+            else:
+                back_mean_correction, back_var_correction = torch.ones_like(s_), torch.ones_like(s_)
+
+            if i > 0:
+                back_mean = s_ - s_ * (dts / ts[:, i + 1]).unsqueeze(1) * back_mean_correction
+                back_var = (self.pf_std_per_traj ** 2) * (dts * ts[:, i] / ts[:, i + 1]).unsqueeze(
+                    1) * back_var_correction
+                noise_backward = (current_state - back_mean) / back_var.sqrt()
+                logpb[:, i] = -0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1)
+
+            current_state = s_
+            states[:, i + 1] = current_state
+
+            if return_gauss_params:
+                if i > 0:
+                    means_b[:, i, :] = back_mean.detach()
+                    logvars_b[:, i, :] = back_var.log().detach()
+                else:
+                    logvars_b[:, i, :] = -3
+                means_f[:, i, :] = pf_mean.detach()
+                logvars_f[:, i, :] = pflogvars.detach()
+
+        if return_gauss_params:
+            return (states, logpf, logpb, logf,
+                    means_f.detach().mean(-1), logvars_f.detach().mean(-1), means_b.detach().mean(-1),
+                    logvars_b.detach().mean(-1))
+        else:
+            return states, logpf, logpb, logf
+
+    def get_trajectory_bwd(self, terminal_state, discretizer, condition,
+                           return_gauss_params: bool = False):
+        batch_size = terminal_state.shape[0]
+
+        ts = discretizer(batch_size).to(self.device)
+        trajectory_length = ts.shape[1] - 1
+
+        logf, logpb, logpf, states, means_f, logvars_f, means_b, logvars_b = self.init_traj_tensors(batch_size, trajectory_length)
+
+        states[:, -1] = terminal_state.detach().clone()
+        current_state = terminal_state.detach().clone()
+        condition_embedding = self.conditions_embedding_model(condition)
+
+        flow = self.flow_model(condition_embedding).squeeze(-1).squeeze(-1)
+
+        for i in range(trajectory_length):
+            dts = ts[:, trajectory_length - i] - ts[:, trajectory_length - i - 1]
+
+            if i < trajectory_length - 1:
+                if self.learn_pb:
+                    t = self.t_model(ts[:, trajectory_length - i])
+                    pbs = self.backward_policy(self.s_model(current_state), t)
+                    dmean, dvar = gaussian_params(pbs)
+                    back_mean_correction = 1 + dmean.tanh() * self.pb_scale_range
+                    back_var_correction = 1 + dvar.tanh() * self.pb_scale_range
+                else:
+                    back_mean_correction, back_var_correction = torch.ones_like(current_state), torch.ones_like(
+                        current_state)
+
+                mean = current_state - current_state * (dts / ts[:, trajectory_length - i]).unsqueeze(
+                    1) * back_mean_correction
+                var = (self.pf_std_per_traj ** 2) * (
+                        dts * ts[:, trajectory_length - i - 1] / ts[:, trajectory_length - i]).unsqueeze(
+                    1) * back_var_correction
+                s_ = (mean.detach() +
+                      var.sqrt().detach() * torch.randn_like(current_state, device=self.device))
+                noise_backward = (s_ - mean) / var.sqrt()
+                logpb[:, trajectory_length - i - 1] = -0.5 * (noise_backward ** 2 + logtwopi + var.log()).sum(1)
+            else:
+                s_ = torch.zeros_like(current_state)
+
+            pfs = self.predict_next_state(s_, ts[:, trajectory_length - i - 1], condition_embedding)
+            pf_mean, pflogvars = self.split_params(pfs)
+
+            logf[:, trajectory_length - i - 1] = flow
+
+            noise = ((current_state - s_) - dts.unsqueeze(1) * pf_mean) / (
+                        dts.sqrt().unsqueeze(1) * (pflogvars / 2).exp())
+            logpf[:, trajectory_length - i - 1] = -0.5 * (
+                    noise ** 2 + logtwopi + dts.log().unsqueeze(1) + pflogvars).sum(
+                1)
+
+            if return_gauss_params:
+                means_b[:, i, :] = mean.detach()
+                logvars_b[:, i, :] = var.log().detach()
+                means_f[:, i, :] = pf_mean.detach()
+                logvars_f[:, i, :] = pflogvars.detach()
+
+            current_state = s_
+            states[:, trajectory_length - i - 1] = current_state
+
+        if return_gauss_params:
+            return (states, logpf, logpb, logf,
+                    means_f.detach().mean(-1), logvars_f.detach().mean(-1), means_b.detach().mean(-1),
+                    logvars_b.detach().mean(-1))
+        else:
+            return states, logpf, logpb, logf
+
+    def mk_get_trajectory_fwd(self,
+                              initial_state,
+                              exploration_std,
+                              condition,
+                              return_gauss_params: bool = False,
+                              compute_pf: bool = True,
+                              compute_pb: bool = True,
+                              ):
 
         batch_size = initial_state.shape[0]
-        logf, logpb, logpf, states = self.init_traj_tensors(batch_size)
+        logf, logpb, logpf, states, means_f, logvars_f, means_b, logvars_b = self.init_traj_tensors(batch_size)
 
         current_state = initial_state.clone().detach()
         states[:, 0] = initial_state.detach()  # set correct initial state
@@ -355,34 +327,15 @@ class GFN(nn.Module):
         else:
             return states, logpf, logpb, logf
 
-    def compute_traj_pf(self, condition_embedding, logpf, states):
-        logvars_f, means_f = self.get_fwd_params_for_traj(condition_embedding, states)
-        # get forward probabilities in a single parallel step
-        forward_delta_x = states.diff(dim=1)
-        fwd_std_step = (logvars_f / 2).exp() * np.sqrt(self.dt)
-        forward_noise = (forward_delta_x - self.dt * means_f) / fwd_std_step
-        logpf = (-0.5 * (forward_noise ** 2 + logtwopi * np.log(self.dt) + logvars_f)).sum(2)
-        return logpf, logvars_f, means_f
-
-    def compute_traj_pb(self, condition_embedding, initial_state, logpb, states):
-        # call the policy on all the states in the trajectory at once
-        logvars_b, means_b = self.get_bwd_params_for_traj(condition_embedding, initial_state, states)
-        # get backward probabilities in a single parallel step
-        backward_delta_x = -states.diff(dim=1)  # prev_step - current_step
-        bwd_std_step = (logvars_b / 2).exp() * np.sqrt(self.dt)
-        backward_noise = (backward_delta_x - self.dt * means_b) / bwd_std_step
-        logpb = (-0.5 * (backward_noise ** 2 + logtwopi * np.log(self.dt) + logvars_b)).sum(2)
-        return logpb, logvars_b, means_b
-
-    def get_trajectory_bwd(self,
-                           terminal_state,
-                           condition,
-                           return_gauss_params: bool = False,
-                           compute_pf: bool = True,
-                           compute_pb: bool = True):
+    def mk_get_trajectory_bwd(self,
+                              terminal_state,
+                              condition,
+                              return_gauss_params: bool = False,
+                              compute_pf: bool = True,
+                              compute_pb: bool = True):
         initial_state = get_gfn_init_state(len(terminal_state), terminal_state.shape[1], terminal_state.device)
         batch_size = terminal_state.shape[0]
-        logf, logpb, logpf, states = self.init_traj_tensors(batch_size)
+        logf, logpb, logpf, states, means_f, logvars_f, means_b, logvars_b = self.init_traj_tensors(batch_size)
 
         states[:, 0] = initial_state.clone().detach()
         states[:, -1] = terminal_state.clone().detach()
@@ -392,7 +345,7 @@ class GFN(nn.Module):
         logf[:, 0] = self.flow_model(condition_embedding).squeeze(-1).squeeze(-1)
 
         with torch.no_grad():  # pure sampling
-            for i in range(self.trajectory_length - 1): # the final traj step is deterministic
+            for i in range(self.trajectory_length - 1):  # the final traj step is deterministic
                 # equivalent index of current_state in the forward trajectory
                 traj_ind = self.trajectory_length - i
                 pb_logvar, pb_mean = self.get_bwd_params_for_state(
@@ -422,6 +375,25 @@ class GFN(nn.Module):
                     means_b.detach().mean(-1), logvars_b.detach().mean(-1))
         else:
             return states, logpf, logpb, logf
+
+    def compute_traj_pf(self, condition_embedding, logpf, states):
+        logvars_f, means_f = self.get_fwd_params_for_traj(condition_embedding, states)
+        # get forward probabilities in a single parallel step
+        forward_delta_x = states.diff(dim=1)
+        fwd_std_step = (logvars_f / 2).exp() * np.sqrt(self.dt)
+        forward_noise = (forward_delta_x - self.dt * means_f) / fwd_std_step
+        logpf = (-0.5 * (forward_noise ** 2 + logtwopi * np.log(self.dt) + logvars_f)).sum(2)
+        return logpf, logvars_f, means_f
+
+    def compute_traj_pb(self, condition_embedding, initial_state, logpb, states):
+        # call the policy on all the states in the trajectory at once
+        logvars_b, means_b = self.get_bwd_params_for_traj(condition_embedding, initial_state, states)
+        # get backward probabilities in a single parallel step
+        backward_delta_x = -states.diff(dim=1)  # prev_step - current_step
+        bwd_std_step = (logvars_b / 2).exp() * np.sqrt(self.dt)
+        backward_noise = (backward_delta_x - self.dt * means_b) / bwd_std_step
+        logpb = (-0.5 * (backward_noise ** 2 + logtwopi * np.log(self.dt) + logvars_b)).sum(2)
+        return logpb, logvars_b, means_b
 
     def get_fwd_params_for_traj(self, condition_embedding, states):
         # call forward policy on all the states in the trajectory at once
@@ -515,13 +487,14 @@ class GFN(nn.Module):
                                                                             current_time)
 
             # 'local' brownian bridge, where the drift points always towards the initial state
-            local_slope = - (current_state - initial_state)/(current_time + self.dt)
+            local_slope = - (current_state - initial_state) / (current_time + self.dt)
             means_b = local_slope * back_mean_correction
             # sigma^2 * (1- (t - \Delta t))/(1-t) # a constant value that crashes at t=0
             prev_time = current_time - self.dt
             # var_at_t = torch.tensor(self.pf_std_per_traj ** 2 * self.dt * (1 - current_time) / (
             #        1 - (current_time - self.dt)), device=self.device)
-            var_at_t = torch.tensor(self.pf_std_per_traj ** 2 * self.dt * prev_time / (prev_time + self.dt), device=self.device)
+            var_at_t = torch.tensor(self.pf_std_per_traj ** 2 * self.dt * prev_time / (prev_time + self.dt),
+                                    device=self.device)
             logvars_b = (var_at_t.clip(min=1e-2).log() * back_var_correction)  # clip for so edges see nonzero probs
 
         elif self.bwd_policy == 'new_brownian_bridge':
@@ -588,13 +561,17 @@ class GFN(nn.Module):
 
         return expl
 
-    def init_traj_tensors(self, batch_size):
-        logpf = torch.zeros((batch_size, self.trajectory_length), device=self.device)
-        logpb = torch.zeros((batch_size, self.trajectory_length), device=self.device)
-        logf = torch.zeros((batch_size, self.trajectory_length + 1), device=self.device)
-        states = torch.zeros((batch_size, self.trajectory_length + 1, self.dim), device=self.device)
+    def init_traj_tensors(self, batch_size, trajectory_length):
+        logpf = torch.zeros((batch_size, trajectory_length), device=self.device)
+        logpb = torch.zeros((batch_size, trajectory_length), device=self.device)
+        logf = torch.zeros((batch_size, trajectory_length + 1), device=self.device)
+        states = torch.zeros((batch_size, trajectory_length + 1, self.dim), device=self.device)
+        means_f = torch.zeros((batch_size, trajectory_length, self.dim), device=self.device)
+        logvars_f = torch.zeros((batch_size, trajectory_length, self.dim), device=self.device)
+        means_b = torch.zeros((batch_size, trajectory_length, self.dim), device=self.device)
+        logvars_b = torch.zeros((batch_size, trajectory_length, self.dim), device=self.device)
 
-        return logf, logpb, logpf, states
+        return logf, logpb, logpf, states, means_f, logvars_f, means_b, logvars_b
 
     def sample(self, batch_size, log_r, condition=None):
         s = torch.zeros(batch_size, self.dim).to(self.device)

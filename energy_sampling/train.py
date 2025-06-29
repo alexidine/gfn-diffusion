@@ -17,7 +17,8 @@ from energies.molecular_crystal import MolecularCrystal
 from evaluations import eval_step
 from models import GFN
 from utils import get_train_args, get_gfn_init_state, set_seed, cal_subtb_coef_matrix, \
-    get_gfn_optimizer, get_exploration_std
+    get_gfn_optimizer, get_exploration_std, random_discretizer, low_discrepancy_discretizer, \
+    low_discrepancy_discretizer2, shifted_equidistant, uniform_discretizer
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 
 args = get_train_args()
@@ -58,11 +59,14 @@ def train_step(energy_function, gfn_model,
     else:  # forward ONLY
         do_forward = True
 
+    discretizer = get_discretizer(args.discretizer)
+
     if do_forward:
         fwd_gfn_optimizer.zero_grad()
         mol_batch = next(iter(mol_loader)).to(device)
         loss, states, log_pfs, log_pbs, log_r, log_fs, crystal_batch = fwd_train_step(energy_function,
                                                                                       gfn_model,
+                                                                                      discretizer,
                                                                                       exploration_std,
                                                                                       mol_batch,
                                                                                       return_exp=True,
@@ -74,6 +78,7 @@ def train_step(energy_function, gfn_model,
     elif do_backward:
         bwd_gfn_optimizer.zero_grad()
         loss, states, log_pfs, log_pbs, log_r, log_fs = bwd_train_step(gfn_model,
+                                                                       discretizer,
                                                                        buffer,
                                                                        exploration_std,
                                                                        repeats=repeats,
@@ -91,14 +96,37 @@ def train_step(energy_function, gfn_model,
     return loss.item(), "Forward" if do_forward else "Backward"
 
 
-def fwd_train_step(energy_function, gfn_model, exploration_std, mol_batch, return_exp=False, repeats: int = 10):
+def get_discretizer(discretization_type):
+    # discretizer = lambda bsz: uniform_discretizer(bsz, args.T)
+    # discretizer = lambda bsz: uniform_discretizer(bsz, np.random.randint(10,args.T+1))
+    # discretizer = lambda bsz: random_discretizer(bsz, args.T, 10)
+    if args.traj_length_strategy == 'static':
+        traj_length = args.T
+    elif args.traj_length_strategy == 'sampled':
+        traj_length = np.random.randint(low=args.min_traj_length, high=args.max_traj_length + 1)
+    if discretization_type == 'random':
+        discretizer = lambda bsz: random_discretizer(bsz, traj_length, max_ratio=args.discretizer_max_ratio)
+    elif discretization_type == 'low_discrepancy':
+        discretizer = lambda bsz: low_discrepancy_discretizer(bsz, traj_length)
+    elif discretization_type == 'low_discrepancy2':
+        discretizer = lambda bsz: low_discrepancy_discretizer2(bsz, traj_length)
+    elif discretization_type == 'equidistant':
+        discretizer = lambda bsz: shifted_equidistant(bsz, traj_length)
+    elif discretization_type == 'uniform':
+        discretizer = lambda bsz: uniform_discretizer(bsz, traj_length)
+    else:
+        assert False
+    return discretizer
+
+
+def fwd_train_step(energy_function, gfn_model, discretizer, exploration_std, mol_batch, return_exp=False, repeats: int = 10):
     init_state = get_gfn_init_state(args.batch_size, energy_function.data_ndim, device)
     condition = energy_function.get_conditioning_tensor(mol_batch)
     return get_gfn_forward_loss(args.mode_fwd,
                                 init_state,
                                 gfn_model,
                                 energy_function.log_reward,
-                                coeff_matrix,
+                                discretizer,
                                 mol_batch,
                                 exploration_std=exploration_std,
                                 return_exp=return_exp,
@@ -106,7 +134,7 @@ def fwd_train_step(energy_function, gfn_model, exploration_std, mol_batch, retur
                                 repeats=repeats)
 
 
-def bwd_train_step(gfn_model, buffer, exploration_std=None, repeats: int = 10, return_exp=False):
+def bwd_train_step(gfn_model, discretizer, buffer, exploration_std=None, repeats: int = 10, return_exp=False):
     if args.sampling == 'buffer':
         samples, rewards, crystal_batch, condition = buffer.sample(
             return_conditioning=True,
@@ -118,6 +146,7 @@ def bwd_train_step(gfn_model, buffer, exploration_std=None, repeats: int = 10, r
                                  samples.to(device),
                                  gfn_model,
                                  rewards.to(device),
+                                 discretizer,
                                  exploration_std=exploration_std,
                                  condition=condition.to(device),
                                  repeats=repeats,
@@ -170,7 +199,11 @@ def train():
     lr_warmup_finished = False
     # maxes out at 1, triggering every 10 steps
     # go from initial to final scaling value in annealing_max_steps
-    annealing_lambda = (1 / args.temperature_scaling_factor) ** (1 / (args.annealing_max_steps / 10))
+    if args.conditional_flow_model:
+        annealing_lambda = (1 / args.temperature_scaling_factor) ** (1 / (args.annealing_max_steps / 10))
+    else:
+        annealing_lambda = (args.energy_min_temperature / args.energy_static_temperature) ** (1 / (args.annealing_max_steps / 10))
+
     fwd_loss, bwd_loss = 0, 0
     gfn_model.train()
     for i in trange(args.epochs + 1):
@@ -216,7 +249,7 @@ def train():
                                                      forward_optimizer,
                                                      fwd_scheduler1, fwd_scheduler2,
                                                      lr_warmup_finished)
-            anneal_reward(annealing_lambda, energy_function)
+            anneal_reward(annealing_lambda, energy_function, args)
             metrics.update({'lr': forward_optimizer.param_groups[0]['lr']})
             metrics.update(log_elapsed_times())
             metrics['Forward Loss'] = fwd_loss
@@ -226,11 +259,15 @@ def train():
     torch.save(gfn_model.state_dict(), f'{name}_model_final.pt')
 
 
-def anneal_reward(annealing_lambda, energy_function):
+def anneal_reward(annealing_lambda, energy_function, args):
     """anneal reward function"""
     if args.anneal_energy:
-        if energy_function.temperature_scaling_factor < 1:
-            energy_function.temperature_scaling_factor *= annealing_lambda
+        if args.conditional_flow_model:
+            if energy_function.temperature_scaling_factor < 1:
+                energy_function.temperature_scaling_factor *= annealing_lambda
+        else:
+            if energy_function.temperature > args.energy_min_temperature:
+                energy_function.temperature *= annealing_lambda
 
 
 def step_lr_schedule(bwd_scheduler1, bwd_scheduler2, forward_optimizer, fwd_scheduler1, fwd_scheduler2,
@@ -377,6 +414,8 @@ def handle_train_epoch_error(e, oomed_out, buffer, mol_loader):
 def do_evaluation(energy_function, buffer, gfn_model, i, metrics, mol_loader):
     times['eval_step_start'] = time()
 
+    eval_discretizer = lambda bsz: uniform_discretizer(bsz, args.eval_T)
+
     do_figures = i % args.figs_period == 0
     eval_batch_size = args.eval_batch_size
 
@@ -387,6 +426,7 @@ def do_evaluation(energy_function, buffer, gfn_model, i, metrics, mol_loader):
     metrics.update(
         eval_step(energy_function,
                   gfn_model,
+                  eval_discretizer,
                   init_state,
                   buffer,
                   do_figures,

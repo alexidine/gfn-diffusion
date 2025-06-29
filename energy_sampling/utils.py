@@ -295,10 +295,8 @@ def dict2namespace(data_dict: dict):
 
 
 def get_gfn_init_state(batch_size, ndim, device):
-    #return torch.zeros(batch_size, ndim).to(device)  # old init state
     init_state = torch.zeros(batch_size, ndim).to(device)
-    # bias length dimensions upwards, which improves early training by avoiding super-dense initial states
-    init_state[:,:3] += 3
+
     return init_state
 
 
@@ -393,3 +391,55 @@ def js_1d(samples_a, samples_b):
     js_div = jensenshannon(p_hist, q_hist) ** 2
 
     return js_div
+
+
+
+def uniform_discretizer(bsz, trajectory_length):
+    return torch.linspace(0, 1, trajectory_length + 1).repeat(bsz, 1)
+
+
+def random_discretizer(bsz, trajectory_length, max_ratio):
+    x = (torch.rand(bsz, trajectory_length) * (max_ratio - 1) + 1).cumsum(1)
+    x = torch.cat([torch.zeros(bsz, 1), x], 1) / x[:, -1].unsqueeze(1)
+    return x
+
+
+
+def low_discrepancy_discretizer(bsz, traj_length=2):
+    u = torch.rand(1, traj_length-1)
+    u_sorted, _ = torch.sort(u, dim=-1, descending=False)
+    # print(u_sorted)
+    # print(u_sorted.shape)
+    shift_vector = (torch.arange(bsz) / bsz).unsqueeze(1).repeat(1, traj_length - 1)
+    timestep = u + shift_vector
+    timesteps_in_range = timestep % 1.0
+    timesteps_sorted, indices = torch.sort(timesteps_in_range, dim=-1, descending=False)
+    x = torch.cat([torch.zeros(bsz, 1), timesteps_sorted, torch.ones(bsz, 1)], dim=1)
+    return x
+
+    # old code below:
+    # u = torch.rand(1)
+    # shift_vector = torch.arange(bsz)/bsz
+    # timestep = u + shift_vector
+    # timestep_in_range = timestep % 1.0
+    # timestep_in_range = timestep_in_range.unsqueeze(-1)
+    # x = torch.cat([torch.zeros(bsz, 1), timestep_in_range, torch.ones(bsz, 1)], 1)
+    # return x
+
+
+def low_discrepancy_discretizer2(bsz, traj_length=2):
+    s = traj_length - 1
+    u = torch.rand(1, s)
+    shift_vector = torch.arange(bsz) / bsz
+    timestep = u + shift_vector.unsqueeze(-1)
+    timestep_in_range = timestep % 1.0
+    x = (timestep_in_range + torch.arange(s).unsqueeze(0)) / s
+    x = torch.stack([col[torch.randperm(col.size(0))] for col in x.t()]).t()
+    return x
+
+
+def shifted_equidistant(bsz, traj_length, eps=1e-4):
+    bound = 1 / traj_length - eps
+    noise = torch.empty(bsz, 1).uniform_(- bound, bound)
+    steps = (torch.arange(1, traj_length) / traj_length).unsqueeze(0) + noise
+    return torch.cat([torch.zeros(bsz, 1), steps, torch.ones(bsz, 1)], dim=1)

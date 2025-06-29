@@ -16,11 +16,11 @@ from utils import logmeanexp
 
 
 @torch.no_grad()
-def log_partition_function(initial_state, gfn, energy_function, mol_batch):
-    # todo set up option for VarGrad style loss reporting
+def log_partition_function(initial_state, gfn, discretizer, energy_function, mol_batch):
     condition = energy_function.get_conditioning_tensor(mol_batch)
     (states, log_pfs, log_pbs, log_fs,
      means_f, logvars_f, means_b, logvars_b) = gfn.get_trajectory_fwd(initial_state,
+                                                                      discretizer,
                                                                       None,
                                                                       condition,
                                                                       return_gauss_params=True)
@@ -60,6 +60,7 @@ def get_sample_metrics(samples, gt_samples=None, final_eval=False):
 
 def eval_step(energy_function,
               gfn_model,
+              discretizer,
               init_state,
               buffer,
               do_figures: bool = True,
@@ -70,7 +71,7 @@ def eval_step(energy_function,
     (flow_states, samples, log_r, log_Z, log_Z_lb,
      log_Z_learned, sample_batch, condition, log_pfs, log_pbs, log_fs,
      f_means_f, f_vars_f, f_means_b, f_vars_b) = log_partition_function(
-        init_state, gfn_model, energy_function, mol_batch)
+        init_state, gfn_model, discretizer, energy_function, mol_batch)
 
     metrics = log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_Z_learned, log_r,
                                          sample_batch, buffer)
@@ -84,7 +85,7 @@ def eval_step(energy_function,
                                       gfn_model, init_state, log_fs,
                                       log_pbs, log_pfs, log_r,
                                       f_vars_f, f_means_f, f_vars_b, f_means_b,
-                                      sample_batch)
+                                      sample_batch, discretizer)
         metrics.update(fig_dict)
 
     "Crystal samples"
@@ -101,7 +102,7 @@ def eval_step(energy_function,
 
 
 def generate_eval_figs(buffer, bwd_training, condition, flow_states, gfn_model, init_state, log_fs, log_pbs,
-                       log_pfs, log_r, f_vars_f, f_means_f, f_vars_b, f_means_b, sample_batch):
+                       log_pfs, log_r, f_vars_f, f_means_f, f_vars_b, f_means_b, sample_batch, discretizer):
     # todo figs to add
     # pairwise dists to eval sample and dataset
     # RDF dists of same
@@ -135,13 +136,13 @@ def generate_eval_figs(buffer, bwd_training, condition, flow_states, gfn_model, 
                                                         sample_batch.gfn_energy.cpu().detach().numpy(),
                                                         buffer_std_params_for_embedding,
                                                         )
-    if bwd_training:
+    if bwd_training:  # todo split this out in a separate method
         terminal_state, b_log_r, crystal_batch, condition = buffer.sample(
             return_conditioning=True,
             override_batch=len(init_state))
         (backward_flow_states, b_log_pfs, b_log_pbs, b_log_fs,
          b_means_f, b_vars_f, b_means_b, b_vars_b) = gfn_model.get_trajectory_bwd(
-            terminal_state.to(gfn_model.device), condition.to(gfn_model.device), return_gauss_params=True)
+            terminal_state.to(gfn_model.device), discretizer, condition.to(gfn_model.device), return_gauss_params=True)
         fig_dict['Backward Latents Trajectories'] = visualize_latent_trajs(
             backward_flow_states.cpu().detach().numpy(),
             n_trajs=20, log_r=b_log_r.cpu().detach().numpy())
@@ -219,6 +220,7 @@ def log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_
     metrics['Crystal Mean Log Temperature'] = condition[:, 0].mean()
     metrics['Crystal Min Temperature'] = energy_function.min_temperature
     metrics['Crystal Max Temperature'] = energy_function.max_temperature
+    metrics['Crystal Static Temperature'] = energy_function.temperature
     metrics['Ellipsoid Scale'] = energy_function.ellipsoid_scale
     metrics['Temperature Scaling Factor'] = energy_function.temperature_scaling_factor
     metrics['Density Loss Coefficient'] = energy_function.density_coeff

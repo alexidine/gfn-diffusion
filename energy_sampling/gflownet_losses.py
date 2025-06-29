@@ -2,8 +2,6 @@ import torch.nn.functional as F
 import torch
 from mxtaltools.dataset_utils.utils import collate_data_list
 
-from utils import get_gfn_init_state
-
 
 def get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states, no_grad: bool = True):
     if condition is not None:
@@ -20,9 +18,9 @@ def get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states, no_
     return crystal_batch, log_r
 
 
-def fwd_tb(initial_state, gfn, log_reward_fn, mol_batch,
+def fwd_tb(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
            exploration_std=None, return_exp=False, condition=None):
-    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, exploration_std, condition)
+    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, discretizer, exploration_std, condition)
     crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states)
 
     log_pf = log_pfs.sum(-1)
@@ -38,8 +36,8 @@ def fwd_tb(initial_state, gfn, log_reward_fn, mol_batch,
         return loss.mean()
 
 
-def bwd_tb(terminal_state, gfn, log_r, condition=None, return_exp: bool = False):
-    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, condition)
+def bwd_tb(terminal_state, gfn, log_r, discretizer, condition=None, return_exp: bool = False):
+    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, discretizer, condition)
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
     log_ratio = (log_pf + log_fs[:, 0] - log_pb - log_r)
@@ -54,7 +52,8 @@ def bwd_tb(terminal_state, gfn, log_r, condition=None, return_exp: bool = False)
 
 
 def fwd_vg(initial_state, gfn,
-           log_reward_fn,
+           log_r,
+           discretizer,
            mol_batch,
            exploration_std=None,
            return_exp=False,
@@ -65,8 +64,8 @@ def fwd_vg(initial_state, gfn,
         initial_state = initial_state.repeat(repeats, 1)
         mol_batch = collate_data_list(mol_batch.to_data_list() * repeats)
 
-    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, exploration_std, condition)
-    crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states)
+    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, discretizer, exploration_std, condition)
+    crystal_batch, log_r = get_loss_reward(condition, log_r, mol_batch, return_exp, states)
 
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
@@ -93,14 +92,14 @@ def fwd_vg(initial_state, gfn,
         return loss
 
 
-def bwd_vg(terminal_state, gfn, log_r, condition=None, repeats=10,
+def bwd_vg(terminal_state, gfn, log_r, discretizer, condition=None, repeats=10,
            return_exp: bool = False):
     if gfn.conditional_flow_model:  # do repeats if there are conditions, otherwise skip
         condition = condition.repeat(repeats, 1)
         terminal_state = terminal_state.repeat(repeats, 1)
         log_r = log_r.repeat(repeats)
 
-    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, condition)
+    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, discretizer, condition)
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
 
@@ -157,29 +156,29 @@ def bwd_mle(terminal_state, gfn, log_reward_fn, exploration_std=None, condition=
     return loss.mean()
 
 
-def get_gfn_forward_loss(mode, init_state, gfn_model, log_reward, coeff_matrix, mol_batch, exploration_std=None,
+def get_gfn_forward_loss(mode, init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std=None,
                          return_exp=False, condition=None, repeats=10):
     if mode == 'tb':
-        return fwd_tb(init_state, gfn_model, log_reward, mol_batch, exploration_std,
+        return fwd_tb(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
                       return_exp=return_exp,
                       condition=condition)
     elif mode == 'vg':
-        return fwd_vg(init_state, gfn_model, log_reward, mol_batch, exploration_std, return_exp=return_exp,
+        return fwd_vg(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std, return_exp=return_exp,
                       condition=condition, repeats=repeats)
-    elif mode == 'db':
-        return db(init_state, gfn_model, log_reward, exploration_std, condition=condition)
-    elif mode == 'subtb':
-        return subtb(init_state, gfn_model, log_reward, coeff_matrix, exploration_std, condition=condition)
+    # elif mode == 'db':
+    #     return db(init_state, gfn_model, log_reward, exploration_std, condition=condition)
+    # elif mode == 'subtb':
+    #     return subtb(init_state, gfn_model, log_reward, coeff_matrix, exploration_std, condition=condition)
     else:
         assert False
 
 
-def get_gfn_backward_loss(mode, samples, gfn_model, rewards, exploration_std=None, condition=None, repeats=10,
+def get_gfn_backward_loss(mode, samples, gfn_model, rewards, discretizer, exploration_std=None, condition=None, repeats=10,
                           return_exp=False):
     if mode == 'tb':
-        return bwd_tb(samples, gfn_model, rewards, condition=condition, return_exp=return_exp)
+        return bwd_tb(samples, gfn_model, rewards, discretizer, condition=condition, return_exp=return_exp)
     elif mode == 'vg':
-        return bwd_vg(samples, gfn_model, rewards, condition=condition, repeats=repeats,
+        return bwd_vg(samples, gfn_model, rewards, discretizer, condition=condition, repeats=repeats,
                       return_exp=return_exp)
 
     else:

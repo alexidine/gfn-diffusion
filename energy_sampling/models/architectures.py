@@ -112,19 +112,21 @@ class TimeEncoding(nn.Module):
         )
         self.register_buffer('pe', pe)
 
-    def forward(self, t: float = None):
+    def forward(self, t: torch.Tensor = None):
         """
         Arguments:
-            t: float
+            t: torch.Tensor
+            adjusted to work with tensor t
         """
-        t_sin = (t * self.pe).sin()
-        t_cos = (t * self.pe).cos()
+        t_sin = (t[:, None] * self.pe[0]).sin()
+        t_cos = (t[:, None] * self.pe[0]).cos()
         t_emb = torch.cat([t_sin, t_cos], dim=-1)
         return self.t_model(t_emb)
 
 
 class StateEncoding(nn.Module):
     def __init__(self, s_dim: int,
+                 layers: int,
                  hidden_dim: int = 64,
                  conditioning_dim: int = 0,
                  s_emb_dim: int = 64,
@@ -135,7 +137,7 @@ class StateEncoding(nn.Module):
         super(StateEncoding, self).__init__()
 
         self.x_model = scalarMLP(
-            layers=1,
+            layers=layers,
             input_dim=s_dim + conditioning_dim,
             filters=hidden_dim,
             output_dim=s_emb_dim,
