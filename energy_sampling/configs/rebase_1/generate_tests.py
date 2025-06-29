@@ -77,6 +77,68 @@ config_list = [
         'energy_static_temperature': 1,
         'energy_function': 'crystal_multiharmonic',
     },
+    {
+        'anneal_energy': False,
+        'energy_min_temperature': 0.01,
+        'energy_static_temperature': 1,
+        'energy_function': 'latent_harmonic',
+        'max_batch_size': 5000,
+    },
+    {
+        'anneal_energy': False,
+        'energy_min_temperature': 0.01,
+        'energy_static_temperature': 1,
+        'energy_function': 'crystal_harmonic',
+        'max_batch_size': 5000,
+
+    },
+    {
+        'anneal_energy': False,
+        'energy_min_temperature': 0.01,
+        'energy_static_temperature': 1,
+        'energy_function': 'latent_multiharmonic',
+        'max_batch_size': 5000,
+
+    },
+    {
+        'anneal_energy': False,
+        'energy_min_temperature': 0.01,
+        'energy_static_temperature': 1,
+        'energy_function': 'crystal_multiharmonic',
+        'max_batch_size': 5000,
+
+    },
+    {
+        'anneal_energy': False,
+        'energy_min_temperature': 0.01,
+        'energy_static_temperature': 1,
+        'energy_function': 'latent_harmonic',
+        'lr_anneal_time': 5000,
+    },
+    {
+        'anneal_energy': False,
+        'energy_min_temperature': 0.01,
+        'energy_static_temperature': 1,
+        'energy_function': 'crystal_harmonic',
+        'lr_anneal_time': 5000,
+
+    },
+    {
+        'anneal_energy': False,
+        'energy_min_temperature': 0.01,
+        'energy_static_temperature': 1,
+        'energy_function': 'latent_multiharmonic',
+        'lr_anneal_time': 5000,
+
+    },
+    {
+        'anneal_energy': False,
+        'energy_min_temperature': 0.01,
+        'energy_static_temperature': 1,
+        'energy_function': 'crystal_multiharmonic',
+        'lr_anneal_time': 5000,
+
+    },
 ]
 
 def overwrite_nested_dict(d1, d2):
