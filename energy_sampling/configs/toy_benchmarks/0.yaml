@@ -29,11 +29,11 @@ epochs: 1000000
 eval: false
 eval_T: 100
 eval_batch_size: 500
-eval_period: 250
+eval_period: 500
 exploration_factor: 0.2
 exploration_wd: true
 exploratory: false
-figs_period: 250
+figs_period: 500
 fwd_train_each: 2
 gfn_clip: 10.0
 gradient_norm_clip: 1.0
