@@ -42,9 +42,8 @@ class MolecularCrystal(BaseSet):
         self.temperature = temperature  # for static temperature work
 
     def instantiate_crystals(self, x, mol_batch):
-        eps = 1e-1  # hard clip the model range here
         crystal_batch = self.init_blank_crystal_batch(mol_batch)
-        crystal_batch.gen_basis_to_cell_params(x.clip(min=-6 + eps, max=6 - eps))
+        crystal_batch.gen_basis_to_cell_params(x)
         crystal_batch.box_analysis()
         return crystal_batch
 
@@ -96,6 +95,7 @@ class MolecularCrystal(BaseSet):
             latents = cluster_batch.cell_params_to_gen_basis()
             center_of_attraction = -torch.ones((1, 12), device=self.device)
             crystal_energy = 0.5 * (latents - center_of_attraction).pow(2).sum(dim=1) / self.temperature
+            assert torch.isfinite(crystal_energy).all()
             # analytic Z = (2pi*T)^(d/2)
         elif self.energy_function == 'crystal_harmonic':
             # a trivial energy function, for testing
@@ -110,7 +110,9 @@ class MolecularCrystal(BaseSet):
         elif self.energy_function == 'latent_multiharmonic':
             latents = cluster_batch.cell_params_to_gen_basis()
             if not hasattr(self, 'modes'):
-                self.modes = torch.tensor(generate_modes(10, 12, 4.0, 3.0, half_normal_dim=9), device=self.device)
+                self.modes = torch.tensor(generate_modes(10, 12, 4.0, 3.0), device=self.device)
+                self.crystal_modes = cluster_batch.latent_transform(self.modes, cluster_batch.sg_ind[:10],
+                                                                    cluster_batch.radius[:10])
 
             diffs = latents[:, None, :] - self.modes[None, :, :]
             sqdist = (diffs ** 2).sum(dim=-1)  # (B, K)
@@ -129,9 +131,10 @@ class MolecularCrystal(BaseSet):
         elif self.energy_function == 'crystal_multiharmonic':
             latents = cluster_batch.cell_params_to_gen_basis()
             if not hasattr(self, 'modes'):
-                latent_modes = torch.tensor(generate_modes(10, 12, 4.0, 3.0, half_normal_dim=9), device=self.device)
+                latent_modes = torch.tensor(generate_modes(10, 12, 4.0, 3.0), device=self.device)
                 self.modes = cluster_batch.latent_transform.inverse(latent_modes, cluster_batch.sg_ind[:10],
                                                                     cluster_batch.radius[:10])
+                self.crystal_modes = self.modes
 
             diffs = latents[:, None, :] - self.modes[None, :, :]
             sqdist = (diffs ** 2).sum(dim=-1)  # (B, K)
@@ -272,7 +275,7 @@ class MolecularCrystal(BaseSet):
             return torch.log10(torch.ones((mol_batch.num_graphs, 1), device=mol_batch.device) * self.temperature)
 
 
-def generate_modes(K=20, D=12, rho=4.0, delta=3.0, half_normal_dim=0, seed=42):
+def generate_modes(K=20, D=12, rho=4.0, delta=3.0, seed=42):
     np.random.seed(seed)
     mus = []
 
@@ -285,8 +288,6 @@ def generate_modes(K=20, D=12, rho=4.0, delta=3.0, half_normal_dim=0, seed=42):
     while len(mus) < K:
         mu = np.random.randn(D)
         mu = rho * mu / np.linalg.norm(mu)
-        if mu[half_normal_dim] > 0:
-            mu[half_normal_dim] = -abs(mu[half_normal_dim])
         if is_well_separated(mu, mus, delta):
             mus.append(mu)
 

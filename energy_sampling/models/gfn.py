@@ -196,7 +196,7 @@ class GFN(nn.Module):
             if return_gauss_params:
                 if i > 0:
                     means_b[:, i, :] = back_mean.detach()
-                    logvars_b[:, i, :] = back_var.log().detach()
+                    logvars_b[:, i, :] = (back_var / dts[:, None]).log().detach()
                 else:
                     logvars_b[:, i, :] = -3
                 means_f[:, i, :] = pf_mean.detach()

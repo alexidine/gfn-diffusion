@@ -1,0 +1,94 @@
+from pathlib import Path
+import yaml
+from copy import copy
+import os
+
+
+def load_yaml(path):
+    """
+    Safely load yaml file as dict.
+
+    Parameters
+    ----------
+    path : str
+
+    Returns
+    -------
+    dict
+    """
+    yaml_path = Path(path)
+    assert yaml_path.exists()
+    assert yaml_path.suffix in {".yaml", ".yml"}
+    with yaml_path.open("r") as f:
+        target_dict = yaml.safe_load(f)
+
+    return target_dict
+
+
+base_config = load_yaml('base.yaml')
+
+#
+# Latent unimodal hot
+# Latent unimodal cold
+# Latent unimodal conditional T
+# Crystal unimodal hot
+# Crystal unimodal cold
+# Crystal unimodal conditional T
+# Latent Multimodal hot
+# Latent Multimodal cold
+# Latent Multimodal conditional T
+# Crystal Multimodal hot
+# Crystal Multimodal cold
+# Crystal Multimodal conditional T
+
+# conditional and unconditional runs
+config_list = []
+for energy in ['latent_harmonic', 'crystal_harmonic', 'latent_multiharmonic', 'crystal_multiharmonic']:
+    for temps in ['hot', 'cold', 'conditioned']:
+        if temps == 'hot':
+            anneal = False
+            condition = False
+            static_T = 1
+        elif temps == 'cold':
+            anneal = True
+            condition = False
+            static_T = 1
+        elif temps == 'conditioned':
+            anneal = True
+            condition = True
+            static_T = 1
+        else:
+            assert False
+
+        config_list.append(
+            {'energy_function': energy,
+             'energy_static_temperature': static_T,
+             'anneal_energy': anneal,
+             'temperature_conditioning': condition,
+             'conditional_flow_model': condition,
+             }
+        )
+
+
+def overwrite_nested_dict(d1, d2):
+    for k, v in d2.items():
+        if isinstance(v, dict):
+            assert k in d1.keys()
+            d1[k] = overwrite_nested_dict(d1[k], v)
+        else:
+            d1[k] = v
+    return d1
+
+
+ind = 0
+for ix1 in range(len(config_list)):
+    config = copy(base_config)
+    config['run_name'] = config['run_name'] + '_' + str(ind)
+
+    run_config = config_list[ix1]
+    overwrite_nested_dict(config, run_config)
+
+    with open(str(ind) + '.yaml', 'w') as outfile:
+        yaml.dump(config, outfile, default_flow_style=False)
+
+    ind += 1

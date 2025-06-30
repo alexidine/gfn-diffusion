@@ -43,7 +43,6 @@ def train_step(energy_function, gfn_model,
                fwd_gfn_optimizer,
                bwd_gfn_optimizer,
                it, exploration_std, buffer, mol_loader, repeats: int = 10):
-
     do_forward = False
     do_backward = False
     add_to_buffer = False
@@ -119,7 +118,8 @@ def get_discretizer(discretization_type):
     return discretizer
 
 
-def fwd_train_step(energy_function, gfn_model, discretizer, exploration_std, mol_batch, return_exp=False, repeats: int = 10):
+def fwd_train_step(energy_function, gfn_model, discretizer, exploration_std, mol_batch, return_exp=False,
+                   repeats: int = 10):
     init_state = get_gfn_init_state(args.batch_size, energy_function.data_ndim, device)
     condition = energy_function.get_conditioning_tensor(mol_batch)
     return get_gfn_forward_loss(args.mode_fwd,
@@ -165,7 +165,7 @@ def train():
                                        max_temperature=args.energy_max_temperature,
                                        temperature_scaling_factor=args.temperature_scaling_factor,
                                        temperature_conditioning=args.temperature_conditioning,
-                                       temperature = args.energy_static_temperature,
+                                       temperature=args.energy_static_temperature,
                                        density_coeff=args.energy_density_coeff)
 
     config = args.__dict__
@@ -202,7 +202,8 @@ def train():
     if args.conditional_flow_model:
         annealing_lambda = (1 / args.temperature_scaling_factor) ** (1 / (args.annealing_max_steps / 10))
     else:
-        annealing_lambda = (args.energy_min_temperature / args.energy_static_temperature) ** (1 / (args.annealing_max_steps / 10))
+        annealing_lambda = (args.energy_min_temperature / args.energy_static_temperature) ** (
+                    1 / (args.annealing_max_steps / 10))
 
     fwd_loss, bwd_loss = 0, 0
     gfn_model.train()
@@ -217,7 +218,7 @@ def train():
 
         times['train_step_start'] = time()
         try:
-            torch.autograd.set_detect_anomaly(True)  # for debugging
+            #torch.autograd.set_detect_anomaly(True)  # for debugging
             train_loss, step_type = train_step(energy_function,
                                                gfn_model,
                                                forward_optimizer,
@@ -246,9 +247,9 @@ def train():
 
         elif i % 10 == 0 and i > 9:
             lr_warmup_finished, lr = step_lr_schedule(bwd_scheduler1, bwd_scheduler2,
-                                                     forward_optimizer,
-                                                     fwd_scheduler1, fwd_scheduler2,
-                                                     lr_warmup_finished)
+                                                      forward_optimizer,
+                                                      fwd_scheduler1, fwd_scheduler2,
+                                                      lr_warmup_finished)
             anneal_reward(annealing_lambda, energy_function, args)
             metrics.update({'lr': forward_optimizer.param_groups[0]['lr']})
             metrics.update(log_elapsed_times())

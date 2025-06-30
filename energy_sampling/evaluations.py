@@ -80,12 +80,24 @@ def eval_step(energy_function,
         buffer.add(sample_batch.cpu().detach().to_data_list())  # add evaluation samples to buffer
 
     if do_figures:
-        fig_dict = generate_eval_figs(buffer, bwd_training,
-                                      condition, flow_states,
-                                      gfn_model, init_state, log_fs,
-                                      log_pbs, log_pfs, log_r,
-                                      f_vars_f, f_means_f, f_vars_b, f_means_b,
-                                      sample_batch, discretizer)
+        fig_dict = generate_fwd_figs(buffer, energy_function, condition, flow_states,
+                                     gfn_model, init_state, log_fs,
+                                     log_pbs, log_pfs, log_r,
+                                     f_vars_f, f_means_f, f_vars_b, f_means_b,
+                                     sample_batch)
+        if bwd_training:
+            fig_dict = generate_bwd_figs(fig_dict, buffer, gfn_model, init_state, discretizer)
+
+        for key in fig_dict.keys():
+            fig = fig_dict[key]
+            try:
+                if get_plotly_fig_size_mb(fig) > 1:  # bigger than 1 MB
+                    fig.write_image(key + 'fig.png', width=720,
+                                    height=512)  # save the image rather than the fig, for size reasons
+                    fig_dict[key] = wandb.Image(key + 'fig.png')
+            except:
+                pass
+
         metrics.update(fig_dict)
 
     "Crystal samples"
@@ -101,15 +113,9 @@ def eval_step(energy_function,
     return metrics
 
 
-def generate_eval_figs(buffer, bwd_training, condition, flow_states, gfn_model, init_state, log_fs, log_pbs,
-                       log_pfs, log_r, f_vars_f, f_means_f, f_vars_b, f_means_b, sample_batch, discretizer):
-    # todo figs to add
-    # pairwise dists to eval sample and dataset
-    # RDF dists of same
-    # clustering / mode counting / basin counting / mapping
-    # known mode coverage
-    # diversity vs T / E
-
+def generate_fwd_figs(buffer, energy_function,
+                      condition, flow_states, gfn_model, init_state, log_fs, log_pbs,
+                      log_pfs, log_r, f_vars_f, f_means_f, f_vars_b, f_means_b, sample_batch):
     buffer_cell_params, buffer_latent_params, buffer_std_params_for_embedding = get_buffer_stats(buffer)
 
     fig_dict = {}
@@ -118,8 +124,6 @@ def generate_eval_figs(buffer, bwd_training, condition, flow_states, gfn_model, 
     fig_dict['Forward Gauss Params'] = mean_var_fig(f_vars_f, f_means_f,
                                                     f_vars_b, f_means_b)
     fig_dict['Traj Mean Step Sizes'] = mean_flow_step_sizes(flow_states)
-    #fig_dict['Pf vs R'] = Pf_vs_R_fig(log_pfs, log_r)
-    #fig_dict['Pb vs R'] = Pf_vs_R_fig(log_pbs, log_r)
     fig_dict['Pf vs Pb'] = Pf_vs_Pb_fig(log_pfs, log_pbs, log_r)
     fig_dict['TB Parity Plot'] = flow_parity_plot(log_r, log_fs[:, 0], log_pbs, log_pfs)
     fig_dict['VG Error'] = vargrad_error(log_r, log_pbs, log_pfs)
@@ -132,38 +136,43 @@ def generate_eval_figs(buffer, bwd_training, condition, flow_states, gfn_model, 
                                                          (condition[:,
                                                           0].cpu().detach().numpy()) if condition is not None else None,
                                                          aux_scalar_name='log_temperature' if condition is not None else None)
-    fig_dict['Sample Embedding'] = simple_embedding_fig(sample_batch,
-                                                        sample_batch.gfn_energy.cpu().detach().numpy(),
-                                                        buffer_std_params_for_embedding,
+
+    std_cell_params = sample_batch.cell_params_to_gen_basis().cpu().detach()
+    known_modes = energy_function.crystal_modes.detach() if hasattr(energy_function, 'modes') else None
+    if known_modes is not None:
+        known_modes_std = sample_batch.latent_transform.forward(known_modes.to(sample_batch.device),
+                                                                sample_batch.sg_ind[:len(known_modes)],
+                                                                sample_batch.radius[:len(known_modes)]).cpu().detach()
+        dists = torch.cdist(std_cell_params.cpu().detach().float(), known_modes_std.float())
+        nearest_sample = dists.amin(0)
+        cutoff = 1
+        fig_dict['Mode Coverage'] = np.mean(nearest_sample.numpy() < cutoff)
+
+    fig_dict['Sample Embedding'] = simple_embedding_fig(std_cell_params.numpy(),
+                                                        aux_array=sample_batch.gfn_energy.cpu().detach().numpy(),
+                                                        reference_distribution=buffer_std_params_for_embedding,
+                                                        known_minima=known_modes_std.numpy() if known_modes is not None else None
                                                         )
-    if bwd_training:  # todo split this out in a separate method
-        terminal_state, b_log_r, crystal_batch, condition = buffer.sample(
-            return_conditioning=True,
-            override_batch=len(init_state))
-        (backward_flow_states, b_log_pfs, b_log_pbs, b_log_fs,
-         b_means_f, b_vars_f, b_means_b, b_vars_b) = gfn_model.get_trajectory_bwd(
-            terminal_state.to(gfn_model.device), discretizer, condition.to(gfn_model.device), return_gauss_params=True)
-        fig_dict['Backward Latents Trajectories'] = visualize_latent_trajs(
-            backward_flow_states.cpu().detach().numpy(),
-            n_trajs=20, log_r=b_log_r.cpu().detach().numpy())
-        #fig_dict['Backward Pf vs R'] = Pf_vs_R_fig(b_log_pfs, b_log_r)
-        #fig_dict['Backward Pb vs R'] = Pf_vs_R_fig(b_log_pbs, b_log_r)
-        fig_dict['Backward Pf vs Pb'] = Pf_vs_Pb_fig(b_log_pfs, b_log_pbs, b_log_r)
-        fig_dict['Backward TB Parity Plot'] = flow_parity_plot(b_log_r.to(b_log_fs.device), b_log_fs[:, 0], b_log_pbs,
-                                                               b_log_pfs)
-        fig_dict['Backward Gauss Params'] = mean_var_fig(b_vars_f, b_means_f,
-                                                         b_vars_b, b_means_b)
-        initial_state_loss = (init_state - backward_flow_states[:, 0]).norm(dim=1).pow(2)
 
-    for key in fig_dict.keys():
-        fig = fig_dict[key]
-        if get_plotly_fig_size_mb(fig) > 1:  # bigger than 1 MB
-            fig.write_image(key + 'fig.png', width=720,
-                            height=512)  # save the image rather than the fig, for size reasons
-            fig_dict[key] = wandb.Image(key + 'fig.png')
+    return fig_dict
 
-    if bwd_training:
-        fig_dict['Backward Initial Matching Loss'] = initial_state_loss.mean().cpu().detach().numpy()
+
+def generate_bwd_figs(fig_dict, buffer, gfn_model, init_state, discretizer):
+    terminal_state, b_log_r, crystal_batch, condition = buffer.sample(
+        return_conditioning=True,
+        override_batch=len(init_state))
+    (backward_flow_states, b_log_pfs, b_log_pbs, b_log_fs,
+     b_means_f, b_vars_f, b_means_b, b_vars_b) = gfn_model.get_trajectory_bwd(
+        terminal_state.to(gfn_model.device), discretizer, condition.to(gfn_model.device), return_gauss_params=True)
+    fig_dict['Backward Latents Trajectories'] = visualize_latent_trajs(
+        backward_flow_states.cpu().detach().numpy(),
+        n_trajs=20, log_r=b_log_r.cpu().detach().numpy())
+
+    fig_dict['Backward Pf vs Pb'] = Pf_vs_Pb_fig(b_log_pfs, b_log_pbs, b_log_r)
+    fig_dict['Backward TB Parity Plot'] = flow_parity_plot(b_log_r.to(b_log_fs.device), b_log_fs[:, 0], b_log_pbs,
+                                                           b_log_pfs)
+    fig_dict['Backward Gauss Params'] = mean_var_fig(b_vars_f, b_means_f,
+                                                     b_vars_b, b_means_b)
 
     return fig_dict
 
@@ -175,7 +184,7 @@ def get_buffer_stats(buffer):
                                                                           override_batch=10000)
         buffer_cell_params = buffer_batch.cell_parameters().cpu().detach().numpy()
         buffer_latent_params = buffer_batch.cell_params_to_gen_basis().cpu().detach().numpy()
-        buffer_std_params_for_embedding = buffer_batch.standardize_cell_parameters().cpu().detach().numpy()
+        buffer_std_params_for_embedding = buffer_batch.cell_params_to_gen_basis().cpu().detach().numpy()
     else:
         buffer_cell_params, buffer_latent_params, buffer_std_params_for_embedding = None, None, None
     return buffer_cell_params, buffer_latent_params, buffer_std_params_for_embedding
