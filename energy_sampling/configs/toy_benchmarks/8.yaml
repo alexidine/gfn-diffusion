@@ -63,7 +63,7 @@ max_traj_length: 20
 min_lr: 1.0e-06
 min_traj_length: 10
 mode_bwd: tb
-mode_fwd: tb
+mode_fwd: vg
 molecules_path: /scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt
 norm: null
 partial_energy: false
