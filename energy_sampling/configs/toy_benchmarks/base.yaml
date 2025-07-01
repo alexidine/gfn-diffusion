@@ -15,7 +15,7 @@ gradient_norm_clip: 1.0        # gradient norm clip for updating gfn model weigh
 # model parameters
 zero_init: true
 
-joint_layers: 1              # number of layers in forward/backward policy models
+joint_layers: 4              # number of layers in forward/backward policy models
 hidden_dim: 64              # dimensionality of hidden layer
 s_emb_dim: 32                # dimensionality of state embedding
 t_emb_dim: 32                # dimensionality of time embedding
@@ -101,6 +101,7 @@ energy_max_temperature: 1
 energy_static_temperature: 1  # for certain evaluations
 temperature_scaling_factor: 0.01  # controls relative frequency of higher vs lower temperatures (higher -> higher)
 annealing_max_steps: 5000  # time for scaling_factor to reach 1 (uniform sampling from min to max)
+energy_clip: 20
 
 # deprecated or un-used
 max_iter_ls: 100                # DEPRECATED # how many iterations to run local search

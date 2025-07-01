@@ -50,16 +50,31 @@ for energy in ['latent_harmonic', 'crystal_harmonic', 'latent_multiharmonic', 'c
             condition = False
             static_T = 1
             mode_fwd = 'tb'
+            exploratory = False
+            exploration_factor = 0.5
+            exploration_wd = False
+            wd_max_steps = 5000
+            repeats = 5
         elif temps == 'cold':
             anneal = True
             condition = False
             static_T = 1
             mode_fwd = 'tb'
+            exploratory = False
+            exploration_factor = 0.5
+            exploration_wd = False
+            wd_max_steps = 5000
+            repeats = 5
         elif temps == 'conditioned':
             anneal = True
             condition = True
             static_T = 1
             mode_fwd = 'vg'
+            exploratory = True
+            exploration_factor = 0.5
+            exploration_wd = True
+            wd_max_steps = 5000
+            repeats = 5
         else:
             assert False
 
@@ -70,6 +85,11 @@ for energy in ['latent_harmonic', 'crystal_harmonic', 'latent_multiharmonic', 'c
              'temperature_conditioning': condition,
              'conditional_flow_model': condition,
              'mode_fwd': mode_fwd,
+             'exploratory': exploratory,
+             'exploration_factor': exploration_factor,
+             'exploration_wd': exploration_wd,
+             'wd_max_steps': wd_max_steps,
+             'repeats': repeats,
              }
         )
 

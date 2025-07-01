@@ -23,13 +23,15 @@ class MolecularCrystal(BaseSet):
                  density_coeff: float = 0,
                  temperature_scaling_factor: float = 1,
                  temperature: float = 1.0,
-                 temperature_conditioning: bool = False
+                 temperature_conditioning: bool = False,
+                 energy_clip: float=100,
                  ):
         super(MolecularCrystal, self).__init__()
         self.device = device
         self.data_ndim = dim
         self.space_group = space_group
         self.energy_function = energy_function
+        self.energy_clip = energy_clip
 
         self.ellipsoid_scale = 1
         self.density_coeff = density_coeff
@@ -96,18 +98,22 @@ class MolecularCrystal(BaseSet):
         if self.energy_function == 'latent_harmonic':
             # a trivial energy function, for testing
             latents = cluster_batch.cell_params_to_gen_basis()
-            center_of_attraction = -torch.ones((1, 12), device=self.device)
-            crystal_energy = 0.5 * (latents - center_of_attraction).pow(2).sum(dim=1) / self.temperature
-            assert torch.isfinite(crystal_energy).all()
+            if not hasattr(self, 'modes'):
+                self.modes = -torch.ones((1,12), device=self.device)
+                self.crystal_modes = cluster_batch.latent_transform.inverse(self.modes,
+                                                                    cluster_batch.sg_ind[:1],
+                                                                    cluster_batch.radius[:1])
+            crystal_energy = 0.5 * (latents - self.modes[0]).pow(2).sum(dim=1) / self.temperature
             # analytic Z = (2pi*T)^(d/2)
         elif self.energy_function == 'crystal_harmonic':
             # a trivial energy function, for testing
             cell_params = cluster_batch.cell_parameters()
-            center_of_attraction = torch.tensor([1, 2, 3,
-                                                 1.5, 1.5, 1.5,
-                                                 0.25, 0.5, 0.75,
-                                                 1, 2, 3], device=self.device)[None, :]
-            crystal_energy = 0.5 * (cell_params - center_of_attraction).pow(2).sum(dim=1) / self.temperature
+            if not hasattr(self, 'modes'):
+                self.modes = -torch.ones((1,12), device=self.device)
+                self.crystal_modes = cluster_batch.latent_transform.inverse(self.modes,
+                                                                    cluster_batch.sg_ind[:1],
+                                                                    cluster_batch.radius[:1])
+            crystal_energy = 0.5 * (cell_params - self.crystal_modes[0]).pow(2).sum(dim=1) / self.temperature
             # analytic Z = (2pi*T)^(d/2)
 
         elif self.energy_function == 'latent_multiharmonic':
@@ -159,7 +165,7 @@ class MolecularCrystal(BaseSet):
         else:
             assert False, f'{self.energy_function} not implemented'
 
-        return crystal_energy
+        return crystal_energy.clip(min=-self.energy_clip, max=self.energy_clip)
 
     def prebuilt_sample_to_reward(self, crystals, temperature):
         """

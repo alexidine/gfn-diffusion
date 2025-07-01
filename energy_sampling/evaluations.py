@@ -140,9 +140,7 @@ def generate_fwd_figs(buffer, energy_function,
     std_cell_params = sample_batch.cell_params_to_gen_basis().cpu().detach()
     known_modes = energy_function.crystal_modes.detach() if hasattr(energy_function, 'modes') else None
     if known_modes is not None:
-        known_modes_std = sample_batch.latent_transform.forward(known_modes.to(sample_batch.device),
-                                                                sample_batch.sg_ind[:len(known_modes)],
-                                                                sample_batch.radius[:len(known_modes)]).cpu().detach()
+        known_modes_std = energy_function.modes.cpu().detach()
         dists = torch.cdist(std_cell_params.cpu().detach().float(), known_modes_std.float())
         nearest_sample = dists.amin(0)
         cutoff = 1

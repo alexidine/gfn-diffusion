@@ -20,6 +20,7 @@ discretizer_max_ratio: 0.5
 dropout: 0
 energy: molecular_crystal
 energy_annealing_threshold: 0.1
+energy_clip: 20
 energy_density_coeff: 0.1
 energy_function: crystal_multiharmonic
 energy_max_temperature: 1
@@ -30,9 +31,9 @@ eval: false
 eval_T: 100
 eval_batch_size: 500
 eval_period: 500
-exploration_factor: 0.2
+exploration_factor: 0.5
 exploration_wd: true
-exploratory: false
+exploratory: true
 figs_period: 500
 fwd_train_each: 2
 gfn_clip: 10.0
@@ -40,7 +41,7 @@ gradient_norm_clip: 1.0
 grow_batch_size: true
 harmonics_dim: 64
 hidden_dim: 64
-joint_layers: 1
+joint_layers: 4
 langevin: false
 langevin_scaling_per_dimension: false
 ld_schedule: true
@@ -71,7 +72,7 @@ pb_scale_range: 0.1
 pis_architectures: false
 prioritized: boltzmann
 rank_weight: 1.0
-repeats: 10
+repeats: 5
 run_name: toy_benchmarks_11
 s_emb_dim: 32
 samples_per_opt: 10
@@ -86,6 +87,6 @@ temperature_conditioning: true
 temperature_scaling_factor: 0.01
 traj_length_strategy: sampled
 use_weight_decay: false
-wd_max_steps: 1000
+wd_max_steps: 5000
 weight_decay: 1e-7
 zero_init: true

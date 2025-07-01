@@ -166,7 +166,9 @@ def train():
                                        temperature_scaling_factor=args.temperature_scaling_factor,
                                        temperature_conditioning=args.temperature_conditioning,
                                        temperature=args.energy_static_temperature,
-                                       density_coeff=args.energy_density_coeff)
+                                       density_coeff=args.energy_density_coeff,
+                                       energy_clip=args.energy_clip,
+                                       )
 
     config = args.__dict__
     config["Experiment"] = "{args.energy}"
@@ -186,7 +188,7 @@ def train():
                     joint_layers=args.joint_layers, dropout=args.dropout, norm=args.norm,
                     zero_init=args.zero_init, device=device).to(device)
 
-    wandb.watch(gfn_model, log_graph=True, log_freq=500)  # for gradient logging
+    wandb.watch(gfn_model, log_graph=True, log_freq=1000)  # for gradient logging
 
     forward_optimizer, backward_optimizer, fwd_scheduler1, fwd_scheduler2, bwd_scheduler1, bwd_scheduler2 = init_schedulers_optimizers(
         gfn_model)

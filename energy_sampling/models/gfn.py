@@ -157,8 +157,7 @@ class GFN(nn.Module):
             if exploration_std is None:
                 pflogvars_sample = pflogvars.detach()
             else:
-                expl = exploration_std(
-                    None)  # currently not using this arg -- could use ts here, would need changes to utils get_exploration_std
+                expl = exploration_std(None)  # currently not using this arg -- could use ts here, would need changes to utils get_exploration_std
                 if expl <= 0.0:
                     pflogvars_sample = pflogvars.detach()
                 else:
