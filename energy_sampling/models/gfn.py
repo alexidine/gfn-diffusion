@@ -230,7 +230,7 @@ class GFN(nn.Module):
             if i < trajectory_length - 1:
                 if self.learn_pb:
                     t = self.t_model(ts[:, trajectory_length - i])
-                    pbs = self.backward_policy(self.s_model(current_state), t)
+                    pbs = self.backward_policy(self.s_model(current_state, condition_embedding), t)
                     dmean, dvar = gaussian_params(pbs)
                     back_mean_correction = 1 + dmean.tanh() * self.pb_scale_range
                     back_var_correction = 1 + dvar.tanh() * self.pb_scale_range

@@ -30,7 +30,7 @@ eval: false
 eval_T: 100
 eval_batch_size: 500
 eval_period: 500
-exploration_factor: 0.2
+exploration_factor: 0.5
 exploration_wd: true
 exploratory: true
 figs_period: 500
@@ -40,7 +40,7 @@ gradient_norm_clip: 1.0
 grow_batch_size: true
 harmonics_dim: 64
 hidden_dim: 256
-joint_layers: 2
+joint_layers: 4
 langevin: false
 langevin_scaling_per_dimension: false
 ld_schedule: true
@@ -50,7 +50,7 @@ learned_variance: true
 lgv_clip: 100.0
 lgv_layers: 4
 local_search: false
-log_var_range: 2
+log_var_range: 0.5
 lr_anneal_time: 10000
 lr_back: 0.001
 lr_flow: 0.1
@@ -62,7 +62,7 @@ max_iter_ls: 100
 max_traj_length: 20
 min_lr: 1.0e-06
 min_traj_length: 10
-mode_bwd: tb
+mode_bwd: vg
 mode_fwd: vg
 molecules_path: /scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt
 norm: layer
@@ -71,7 +71,7 @@ pb_scale_range: 0.5
 pis_architectures: false
 prioritized: boltzmann
 rank_weight: 1.0
-repeats: 10
+repeats: 5
 run_name: urea_2
 s_emb_dim: 32
 samples_per_opt: 10

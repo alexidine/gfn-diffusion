@@ -60,7 +60,7 @@ class MolecularCrystal(BaseSet):
                                                       align_to_standardized_orientation=True)
 
             cluster_batch.construct_radial_graph(cutoff=6)
-            lj_energy, normed_lj_energy = cluster_batch.compute_LJ_energy()
+            #lj_energy, normed_lj_energy = cluster_batch.compute_LJ_energy()
             silu_energy = cluster_batch.compute_silu_energy()  # softened short-range LJ-type energy
 
         if self.energy_function == 'ellipsoid_overlap':
@@ -81,7 +81,7 @@ class MolecularCrystal(BaseSet):
             cluster_batch.ellipsoid_overlap = torch.zeros_like(silu_energy)
 
         cluster_batch.silu_pot = silu_energy
-        cluster_batch.lj_pot = lj_energy
+        cluster_batch.lj_pot = silu_energy #lj_energy
         crystal_energy = self.generator_energy(cluster_batch)
         cluster_batch.gfn_energy = crystal_energy
         if return_batch:
@@ -90,6 +90,9 @@ class MolecularCrystal(BaseSet):
             return crystal_energy
 
     def generator_energy(self, cluster_batch):
+        if cluster_batch.device != self.device:
+            cluster_batch = cluster_batch.to(self.device)
+
         if self.energy_function == 'latent_harmonic':
             # a trivial energy function, for testing
             latents = cluster_batch.cell_params_to_gen_basis()
@@ -111,7 +114,8 @@ class MolecularCrystal(BaseSet):
             latents = cluster_batch.cell_params_to_gen_basis()
             if not hasattr(self, 'modes'):
                 self.modes = torch.tensor(generate_modes(10, 12, 4.0, 3.0), device=self.device)
-                self.crystal_modes = cluster_batch.latent_transform(self.modes, cluster_batch.sg_ind[:10],
+                self.crystal_modes = cluster_batch.latent_transform.inverse(self.modes,
+                                                                    cluster_batch.sg_ind[:10],
                                                                     cluster_batch.radius[:10])
 
             diffs = latents[:, None, :] - self.modes[None, :, :]
@@ -132,7 +136,8 @@ class MolecularCrystal(BaseSet):
             latents = cluster_batch.cell_params_to_gen_basis()
             if not hasattr(self, 'modes'):
                 latent_modes = torch.tensor(generate_modes(10, 12, 4.0, 3.0), device=self.device)
-                self.modes = cluster_batch.latent_transform.inverse(latent_modes, cluster_batch.sg_ind[:10],
+                self.modes = cluster_batch.latent_transform.inverse(latent_modes,
+                                                                    cluster_batch.sg_ind[:10],
                                                                     cluster_batch.radius[:10])
                 self.crystal_modes = self.modes
 
@@ -171,9 +176,9 @@ class MolecularCrystal(BaseSet):
         energy = self.generator_energy(crystal_batch)
 
         if torch.is_tensor(temperature):
-            sample_temperature = temperature
+            sample_temperature = temperature.to(self.device)
         elif isinstance(temperature, float) or isinstance(temperature, int):
-            sample_temperature = temperature * torch.ones_like(energy)
+            sample_temperature = temperature * torch.ones_like(energy, device=self.device)
         else:
             assert False
 
@@ -209,24 +214,32 @@ class MolecularCrystal(BaseSet):
         return softened_energy
 
     def init_blank_crystal_batch(self, mol_batch):  # todo no possible way this is the most efficient way to do this
+
+        ones3 = torch.ones(3, device=self.device)
+        zeros1 = torch.zeros(1, device=self.device)
+
+        if self.energy_function == 'ellipsoid_overlap':
+            overlap_tensor = torch.zeros(1, device=self.device)
+        else:
+            overlap_tensor = None
+
         crystal_batch = collate_data_list([MolCrystalData(
-            molecule=mol_batch[ind].clone(),
+            molecule=mol_batch[ind].clone(),  # must be cloned
             sg_ind=self.space_group,
             aunit_handedness=torch.ones(1),
             cell_lengths=torch.ones(3, device=self.device),
             # if we don't put dummies in here, later ops to_data_list fail
             # but if we do put dummies in here, it does box analysis one-by-one which is super slow
-            cell_angles=torch.ones(3, device=self.device),
-            aunit_centroid=torch.ones(3, device=self.device),
-            aunit_orientation=torch.ones(3, device=self.device),
+            cell_angles=ones3,
+            aunit_centroid=ones3,
+            aunit_orientation=ones3,
             skip_box_analysis=True,
-            silu_pot=torch.zeros(1, device=self.device),
-            packing_coeff=torch.zeros(1, device=self.device),
-            lj_pot=torch.zeros(1, device=self.device),
-            scaled_lj_pot=torch.zeros(1, device=self.device),
-            es_pot=torch.zeros(1, device=self.device),
-            ellipsoid_overlap=torch.zeros(1,
-                                          device=self.device) if self.energy_function == 'ellipsoid_overlap' else None,
+            silu_pot=zeros1,
+            packing_coeff=zeros1,
+            lj_pot=zeros1,
+            scaled_lj_pot=zeros1,
+            es_pot=zeros1,
+            ellipsoid_overlap=overlap_tensor,
         ) for ind in range(len(mol_batch))]).to(self.device)
 
         return crystal_batch

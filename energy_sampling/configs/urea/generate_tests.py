@@ -66,11 +66,21 @@ for energy in ['ellipsoid_overlap', 'silu_energy']:
                  'temperature_conditioning': condition,
                  'conditional_flow_model': condition,
                  'mode_fwd': mode_fwd,
+                 'mode_bwd': mode_fwd,
                  'both_ways': both_ways,
                  }
             )
 
-
+"""
+0: good energies, very odd high variance behavior. Not enough eploration
+1: worse overlaps, higher density, wacky high variance behavior in fewer dimensions
+2: crashed
+3: same high-variance behavior. Still training.
+4: not enough good modes exploration. Distributions are actually kindof nice, but not sharp enough
+5: variance explosion issue in several dimensions. C dimension is extremely saturated, causing wild density fluctuations
+6: crashed
+7: variance issue
+"""
 def overwrite_nested_dict(d1, d2):
     for k, v in d2.items():
         if isinstance(v, dict):

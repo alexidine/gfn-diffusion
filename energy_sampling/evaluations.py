@@ -148,6 +148,15 @@ def generate_fwd_figs(buffer, energy_function,
         cutoff = 1
         fig_dict['Mode Coverage'] = np.mean(nearest_sample.numpy() < cutoff)
 
+        # Gaussian kernel: soft coverage
+        sigma = 1.0  # can tune this
+        kernel_vals = torch.exp(-0.5 * (dists / sigma) ** 2)  # [num_generated, num_modes]
+
+        # Reduce over generated samples (axis=0) to get "best coverage" per mode
+        coverage_per_mode = kernel_vals.max(dim=0).values  # [num_modes]
+
+        fig_dict['Soft Mode Coverage'] = coverage_per_mode.mean()
+
     fig_dict['Sample Embedding'] = simple_embedding_fig(std_cell_params.numpy(),
                                                         aux_array=sample_batch.gfn_energy.cpu().detach().numpy(),
                                                         reference_distribution=buffer_std_params_for_embedding,

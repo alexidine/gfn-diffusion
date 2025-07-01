@@ -15,7 +15,7 @@ gradient_norm_clip: 1.0        # gradient norm clip for updating gfn model weigh
 # model parameters
 zero_init: true
 
-joint_layers: 2              # number of layers in forward/backward policy models
+joint_layers: 4              # number of layers in forward/backward policy models
 hidden_dim: 256              # dimensionality of hidden layer
 s_emb_dim: 32                # dimensionality of state embedding
 t_emb_dim: 32                # dimensionality of time embedding
@@ -42,12 +42,12 @@ traj_length_strategy: sampled # 'static'  or 'sampled'  will do random between m
 discretizer_max_ratio: 0.5    # maximum ratio between randomly sampled step sizes
 discretizer: 'random'        # 'random' 'low_discrepancy' 'equidistant' 'uniform'
 t_scale: 1.0                 # scales fixed forward policy variance
-log_var_range: 2           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
+log_var_range: 0.5           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
 pb_scale_range: 0.5          # range of learned backward policy corrections, only for 'brownian_bridge'
 energy: "molecular_crystal"  # "molecular_crystal"
 mode_fwd: "tb"               # "tb" is trajectory balance, "vg" is VarGrad
 mode_bwd: "tb"               # "tb" is trajectory balance, "vg" is VarGrad
-repeats: 10                  # for conditional VarGrad training
+repeats: 5                  # for conditional VarGrad training
 both_ways: false             # forward and backward training
 bwd_batch_multiplier: 5      # ratio of backward to foward batch size (much cheaper to evaluate)
 fwd_train_each: 2            # on which multiples of training iter to train the fwd train model instead of bwd
@@ -78,7 +78,7 @@ sampling: "buffer"
 
 # exploration controls
 exploratory: True       # adds variance to optionally learned logvars
-exploration_factor: 0.2  # initial exploration value
+exploration_factor: 0.5  # initial exploration value
 exploration_wd: True  # decay exploration over time
 wd_max_steps: 10000  # number of steps to terminate the added variance
 
