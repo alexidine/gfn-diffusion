@@ -43,35 +43,32 @@ base_config = load_yaml('base.yaml')
 
 # conditional and unconditional runs
 config_list = []
-for energy in ['latent_harmonic', 'crystal_harmonic', 'latent_multiharmonic', 'crystal_multiharmonic']:
-    for temps in ['hot', 'cold', 'conditioned']:
-        if temps == 'hot':
-            anneal = False
-            condition = False
-            static_T = 1
-            mode_fwd = 'tb'
-        elif temps == 'cold':
-            anneal = True
-            condition = False
-            static_T = 1
-            mode_fwd = 'tb'
-        elif temps == 'conditioned':
-            anneal = True
-            condition = True
-            static_T = 1
-            mode_fwd = 'vg'
-        else:
-            assert False
+for energy in ['ellipsoid_overlap', 'silu_energy']:
+    for temps in ['hot', 'conditioned']:
+        for both_ways in [True, False]:
+            if temps == 'hot':
+                anneal = False
+                condition = False
+                static_T = 1
+                mode_fwd = 'tb'
+            elif temps == 'conditioned':
+                anneal = True
+                condition = True
+                static_T = 1
+                mode_fwd = 'vg'
+            else:
+                assert False
 
-        config_list.append(
-            {'energy_function': energy,
-             'energy_static_temperature': static_T,
-             'anneal_energy': anneal,
-             'temperature_conditioning': condition,
-             'conditional_flow_model': condition,
-             'mode_fwd': mode_fwd,
-             }
-        )
+            config_list.append(
+                {'energy_function': energy,
+                 'energy_static_temperature': static_T,
+                 'anneal_energy': anneal,
+                 'temperature_conditioning': condition,
+                 'conditional_flow_model': condition,
+                 'mode_fwd': mode_fwd,
+                 'both_ways': both_ways,
+                 }
+            )
 
 
 def overwrite_nested_dict(d1, d2):

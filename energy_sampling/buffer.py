@@ -106,6 +106,7 @@ class CrystalReplayBuffer():
                return_conditioning: Optional[bool] = False,
                override_batch: Optional[int] = None):
 
+        # todo add option to return the original dataset only
         assert return_conditioning or (
                 temperature is not None), "Must provide temperature or generate it here with return_conditioning=True"
 
