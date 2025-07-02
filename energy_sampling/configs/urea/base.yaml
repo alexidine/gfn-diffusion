@@ -94,7 +94,7 @@ energy_function: crystal_multiharmonic
   # 'ellipsoid_overlap' : minimize ellipsoid overlaps subject to energy_density_coeff external pressure
   # 'silu_energy' : minimize a softened LJ-tye energy subject to energy_density_coeff external pressure
 anneal_energy: true  # scale temperature over time, when conditional it scales the distribution, when not it just decreases from static to min
-energy_density_coeff: 0.1  # how much to weight the density penalty term in the energy function
+energy_density_coeff: 10  # how much to weight the density penalty term in the energy function
 temperature_conditioning: false  # if false, temperatures are set to energy_static_temperature, and there is no annealing
 energy_min_temperature: 0.01
 energy_max_temperature: 1

@@ -15,14 +15,14 @@ gradient_norm_clip: 1.0        # gradient norm clip for updating gfn model weigh
 # model parameters
 zero_init: true
 
-joint_layers: 2              # number of layers in forward/backward policy models
-hidden_dim: 256              # dimensionality of hidden layer
-s_emb_dim: 32                # dimensionality of state embedding
+joint_layers: 4              # number of layers in forward/backward policy models
+hidden_dim: 512              # dimensionality of hidden layer
+s_emb_dim: 512                # dimensionality of state embedding
 t_emb_dim: 32                # dimensionality of time embedding
 harmonics_dim: 64            # dimensionality of harmonic embedding
 condition_emb_dim: 32         # dimensionality of the conditioning embedding
 dropout: 0                   # dropout probability
-norm: null                   # null, "layer", "batch"
+norm: 'layer'                   # null, "layer", "batch"
 
 batch_size: 25               # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
@@ -55,13 +55,13 @@ bwd: false                   # backward training only
 learn_pb: true               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
 conditional_flow_model: false #  conditional training (currently doing temperature)
 learned_variance: true       # whether to learn policy variance
-partial_energy: false
+partial_energy: true
 clipping: true  # clip the maximumstep size induced by the policy model
 gfn_clip: 10.0  # clip the maximumstep size induced by the policy model
 
 # local search settings
 ################################################################
-buffer_path: null #'D:/crystal_datasets/urea_gfn_dataset.pt'
+buffer_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
 molecules_path: 'D:/crystal_datasets/test_qm9_dataset.pt'
 
 #buffer_path: '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt'
@@ -85,7 +85,7 @@ wd_max_steps: 2500  # number of steps to terminate the added variance
 # molecular crystal settings
 ################################################################
 # scales the energy function
-energy_function: crystal_multiharmonic
+energy_function: silu_energy
   # 'latent_harmonic' : unimadal harmonic potential in the latent space
   # 'crystal_harmonic': unimodal harmonic potential in the crystal space
   # 'latent_multiharmonic': multimodal harmonic potential in the latent space
@@ -99,8 +99,8 @@ energy_min_temperature: 0.01
 energy_max_temperature: 1
 energy_static_temperature: 1  # for certain evaluations
 temperature_scaling_factor: 0.01  # controls relative frequency of higher vs lower temperatures (higher -> higher)
-annealing_max_steps: 5000  # time for scaling_factor to reach 1 (uniform sampling from min to max)
-energy_clip: 20
+annealing_max_steps: 2500  # time for scaling_factor to reach 1 (uniform sampling from min to max)
+energy_clip: 100
 
 # deprecated or un-used
 max_iter_ls: 100                # DEPRECATED # how many iterations to run local search

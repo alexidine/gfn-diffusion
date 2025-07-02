@@ -26,7 +26,8 @@ def fwd_tb(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
     log_ratio = (log_pf + log_fs[:, 0] - log_pb - log_r)
-    tb_loss = F.mse_loss(log_ratio, torch.zeros_like(log_ratio), reduction='none')
+    #tb_loss = F.mse_loss(log_ratio, torch.zeros_like(log_ratio), reduction='none')
+    tb_loss = F.smooth_l1_loss(log_ratio, torch.zeros_like(log_ratio), reduction='none')
 
     loss = tb_loss.mean()
 
@@ -41,7 +42,8 @@ def bwd_tb(terminal_state, gfn, log_r, discretizer, condition=None, return_exp: 
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
     log_ratio = (log_pf + log_fs[:, 0] - log_pb - log_r)
-    tb_loss = F.mse_loss(log_ratio, torch.zeros_like(log_ratio), reduction='none')
+    #tb_loss = F.mse_loss(log_ratio, torch.zeros_like(log_ratio), reduction='none')
+    tb_loss = F.smooth_l1_loss(log_ratio, torch.zeros_like(log_ratio), reduction='none')
 
     loss = tb_loss.mean()
 
