@@ -101,6 +101,7 @@ energy_max_temperature: 1
 energy_static_temperature: 1  # for certain evaluations
 temperature_scaling_factor: 0.01  # controls relative frequency of higher vs lower temperatures (higher -> higher)
 annealing_max_steps: 5000  # time for scaling_factor to reach 1 (uniform sampling from min to max)
+energy_clip: 100
 
 # deprecated or un-used
 max_iter_ls: 100                # DEPRECATED # how many iterations to run local search

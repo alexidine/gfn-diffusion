@@ -1,10 +1,10 @@
 run_name: 'mk_local_dev'
 seed: 12345
 device: 'cuda'
-lr_policy: 0.001              # learning rate of the policy network
+lr_policy: 0.0001              # learning rate of the policy network
 min_lr: 1.0e-6                # ihn
-lr_flow: 0.1                  # learning rate of the flow network
-lr_back: 0.001                # learning rate of the backward pass
+lr_flow: 0.01                  # learning rate of the flow network
+lr_back: 0.0001                # learning rate of the backward pass
 scheduler: True               # does LR warmup from max/100 -> max -> 1e-6 over the warmup and annealing period
 lr_warmup_time: 500
 lr_anneal_time: 10000
@@ -15,7 +15,7 @@ gradient_norm_clip: 1.0        # gradient norm clip for updating gfn model weigh
 # model parameters
 zero_init: true
 
-joint_layers: 4              # number of layers in forward/backward policy models
+joint_layers: 2              # number of layers in forward/backward policy models
 hidden_dim: 256              # dimensionality of hidden layer
 s_emb_dim: 32                # dimensionality of state embedding
 t_emb_dim: 32                # dimensionality of time embedding
@@ -47,21 +47,21 @@ pb_scale_range: 0.1          # range of learned backward policy corrections, onl
 energy: "molecular_crystal"  # "molecular_crystal"
 mode_fwd: "tb"               # "tb" is trajectory balance, "vg" is VarGrad
 mode_bwd: "tb"               # "tb" is trajectory balance, "vg" is VarGrad
-repeats: 10                  # for conditional VarGrad training
-both_ways: false             # forward and backward training
+repeats: 5                   # for conditional VarGrad training
+both_ways: true             # forward and backward training
 bwd_batch_multiplier: 5      # ratio of backward to foward batch size (much cheaper to evaluate)
 fwd_train_each: 2            # on which multiples of training iter to train the fwd train model instead of bwd
 bwd: false                   # backward training only
-learn_pb: false               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
+learn_pb: true               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
 conditional_flow_model: false #  conditional training (currently doing temperature)
-learned_variance: false       # whether to learn policy variance
+learned_variance: true       # whether to learn policy variance
 partial_energy: false
 clipping: true  # clip the maximumstep size induced by the policy model
 gfn_clip: 10.0  # clip the maximumstep size induced by the policy model
 
 # local search settings
 ################################################################
-buffer_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
+buffer_path: null #'D:/crystal_datasets/urea_gfn_dataset.pt'
 molecules_path: 'D:/crystal_datasets/test_qm9_dataset.pt'
 
 #buffer_path: '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt'
@@ -78,7 +78,7 @@ sampling: "buffer"
 
 # exploration controls
 exploratory: True       # adds variance to optionally learned logvars
-exploration_factor: 0.5  # initial exploration value
+exploration_factor: 0.3  # initial exploration value
 exploration_wd: True  # decay exploration over time
 wd_max_steps: 2500  # number of steps to terminate the added variance
 

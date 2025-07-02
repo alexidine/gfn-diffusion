@@ -109,7 +109,7 @@ class MolecularCrystal(BaseSet):
             # a trivial energy function, for testing
             cell_params = cluster_batch.cell_parameters()
             if not hasattr(self, 'modes'):
-                self.modes = -torch.ones((1,12), device=self.device)
+                self.modes = -torch.ones((1, 12), device=self.device)
                 self.crystal_modes = cluster_batch.latent_transform.inverse(self.modes,
                                                                     cluster_batch.sg_ind[:1],
                                                                     cluster_batch.radius[:1])
@@ -141,11 +141,10 @@ class MolecularCrystal(BaseSet):
         elif self.energy_function == 'crystal_multiharmonic':
             latents = cluster_batch.cell_params_to_gen_basis()
             if not hasattr(self, 'modes'):
-                latent_modes = torch.tensor(generate_modes(10, 12, 4.0, 3.0), device=self.device)
-                self.modes = cluster_batch.latent_transform.inverse(latent_modes,
+                self.modes = torch.tensor(generate_modes(10, 12, 4.0, 3.0), device=self.device)
+                self.crystal_modes = cluster_batch.latent_transform.inverse(self.modes,
                                                                     cluster_batch.sg_ind[:10],
                                                                     cluster_batch.radius[:10])
-                self.crystal_modes = self.modes
 
             diffs = latents[:, None, :] - self.modes[None, :, :]
             sqdist = (diffs ** 2).sum(dim=-1)  # (B, K)
