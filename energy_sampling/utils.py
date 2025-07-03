@@ -393,7 +393,6 @@ def js_1d(samples_a, samples_b):
     return js_div
 
 
-
 def uniform_discretizer(bsz, trajectory_length):
     return torch.linspace(0, 1, trajectory_length + 1).repeat(bsz, 1)
 
@@ -404,9 +403,8 @@ def random_discretizer(bsz, trajectory_length, max_ratio):
     return x
 
 
-
 def low_discrepancy_discretizer(bsz, traj_length=2):
-    u = torch.rand(1, traj_length-1)
+    u = torch.rand(1, traj_length - 1)
     u_sorted, _ = torch.sort(u, dim=-1, descending=False)
     # print(u_sorted)
     # print(u_sorted.shape)

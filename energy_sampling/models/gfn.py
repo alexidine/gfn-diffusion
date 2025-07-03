@@ -178,7 +178,10 @@ class GFN(nn.Module):
                 pbs = self.backward_policy(self.s_model(s_, condition_embedding), t)
                 dmean, dvar = gaussian_params(pbs)
                 back_mean_correction = 1 + dmean.tanh() * self.pb_scale_range
-                back_var_correction = 1 + dvar.tanh() * self.pb_scale_range
+                if self.learned_variance:
+                    back_var_correction = 1 + dvar.tanh() * self.pb_scale_range
+                else:
+                    back_var_correction = torch.ones_like(s_)
             else:
                 back_mean_correction, back_var_correction = torch.ones_like(s_), torch.ones_like(s_)
 
@@ -197,14 +200,14 @@ class GFN(nn.Module):
                     means_b[:, i, :] = back_mean
                     logvars_b[:, i, :] = (back_var / dts[:, None]).log()
                 else:
-                    logvars_b[:, i, :] = -3
+                    logvars_b[:, i, :] = -3  # placeholder
                 means_f[:, i, :] = pf_mean
                 logvars_f[:, i, :] = pflogvars
 
         if return_gauss_params:
             return (states, logpf, logpb, logf,
-                    means_f.mean(-1), logvars_f.mean(-1), means_b.mean(-1),
-                    logvars_b.mean(-1))
+                    means_f.mean(-1), logvars_f.mean(-1),
+                    means_b.mean(-1), logvars_b.mean(-1))
         else:
             return states, logpf, logpb, logf
 
@@ -232,20 +235,23 @@ class GFN(nn.Module):
                     pbs = self.backward_policy(self.s_model(current_state, condition_embedding), t)
                     dmean, dvar = gaussian_params(pbs)
                     back_mean_correction = 1 + dmean.tanh() * self.pb_scale_range
-                    back_var_correction = 1 + dvar.tanh() * self.pb_scale_range
+                    if self.learned_variance:
+                        back_var_correction = 1 + dvar.tanh() * self.pb_scale_range
+                    else:
+                        back_var_correction = torch.ones_like(current_state)
                 else:
                     back_mean_correction, back_var_correction = torch.ones_like(current_state), torch.ones_like(
                         current_state)
 
-                mean = current_state - current_state * (dts / ts[:, trajectory_length - i]).unsqueeze(
+                back_mean = current_state - current_state * (dts / ts[:, trajectory_length - i]).unsqueeze(
                     1) * back_mean_correction
-                var = (self.pf_std_per_traj ** 2) * (
-                        dts * ts[:, trajectory_length - i - 1] / ts[:, trajectory_length - i]).unsqueeze(
-                    1) * back_var_correction
-                s_ = (mean.detach() +
-                      var.sqrt().detach() * torch.randn_like(current_state, device=self.device))
-                noise_backward = (s_ - mean) / var.sqrt()
-                logpb[:, trajectory_length - i - 1] = -0.5 * (noise_backward ** 2 + logtwopi + var.log()).sum(1)
+                back_var = ((self.pf_std_per_traj ** 2) *
+                       (dts * ts[:, trajectory_length - i - 1] / ts[:, trajectory_length - i]).unsqueeze(
+                    1) * back_var_correction)
+                s_ = (back_mean.detach() +
+                      back_var.sqrt().detach() * torch.randn_like(current_state, device=self.device))
+                noise_backward = (s_ - back_mean) / back_var.sqrt()
+                logpb[:, trajectory_length - i - 1] = -0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1)
             else:
                 s_ = torch.zeros_like(current_state)
 
@@ -261,8 +267,8 @@ class GFN(nn.Module):
                 1)
 
             if return_gauss_params:
-                means_b[:, i, :] = mean
-                logvars_b[:, i, :] = var.log()
+                means_b[:, i, :] = back_mean
+                logvars_b[:, i, :] = (back_var / dts[:, None]).log()
                 means_f[:, i, :] = pf_mean
                 logvars_f[:, i, :] = pflogvars
 
@@ -271,8 +277,8 @@ class GFN(nn.Module):
 
         if return_gauss_params:
             return (states, logpf, logpb, logf,
-                    means_f.mean(-1), logvars_f.mean(-1), means_b.mean(-1),
-                    logvars_b.mean(-1))
+                    means_f.mean(-1), logvars_f.mean(-1),
+                    means_b.mean(-1), logvars_b.mean(-1))
         else:
             return states, logpf, logpb, logf
     #

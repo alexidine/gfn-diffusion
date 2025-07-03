@@ -20,7 +20,7 @@ def get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states, no_
 
 def normed_smoothness_loss(x, eps=1e-5):
     second_diff = torch.diff(x, n=2, dim=-1)
-    curvature = (second_diff**4).mean(dim=-1) # specifically punish very large changes
+    curvature = (second_diff ** 4).mean(dim=-1)  # specifically punish very large changes
     variance = torch.var(x, dim=-1, correction=0)
     return curvature / (variance + eps)
 
@@ -45,25 +45,26 @@ def fwd_combo(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
     log_flow = log_fs[:, 0]
     log_ratio = log_r + log_pb - log_pf
 
+    # trajectory balance loss
+    tb = log_flow - log_ratio
+    tb_loss = F.mse_loss(tb, torch.zeros_like(tb), reduction='none')
+
+    # VarGrad loss
     if gfn.conditional_flow_model:
         # reshape and take the mean over repeats
         # minimize the variance over repeats w.r.t., the norm
         log_Z = log_ratio.view(repeats, -1).mean(dim=0, keepdim=True)
-        log_Z_learned = log_flow.view(repeats, -1).mean(dim=0, keepdim=True)
-        log_Z_mean = (log_Z + log_Z_learned) / 2
-        vg_loss = 0.5 * (log_Z_mean - log_ratio.view(repeats, -1)) ** 2
+        vg_loss = 0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2
     else:
         # take the variance over the full unconditional batch
         log_Z = log_ratio.mean(dim=0, keepdim=True)
-        log_Z_mean = (log_Z + log_flow) / 2
-        vg_loss = 0.5 * (log_Z_mean - log_ratio) ** 2
+        vg_loss = 0.5 * (log_Z - log_ratio) ** 2
 
     # regularize policies for local smoothness with a small penalty
-    smoothness_loss = normed_smoothness_loss(
-        torch.stack([means_f, logvars_f, means_b, logvars_b])
-    )
+    #smoothness_loss = normed_smoothness_loss(torch.stack([means_f, logvars_f, means_b, logvars_b]))
 
-    loss = vg_loss.mean() + smoothness_loss.mean() * 1
+    tb_coeff = 1/(vg_loss.mean() + 1)  # smoothly turn on TB loss when VG is satisfied
+    loss = vg_loss.mean() + tb_coeff * tb_loss.mean()  #+ smoothness_loss.mean() * 1
 
     if return_exp:
         return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
@@ -79,7 +80,7 @@ def bwd_combo(terminal_state, gfn, log_r, discretizer, condition=None, repeats=1
         log_r = log_r.repeat(repeats)
 
     (states, log_pfs, log_pbs, log_fs,
-     means_f, logvars_f, means_b, logvars_b)\
+     means_f, logvars_f, means_b, logvars_b) \
         = gfn.get_trajectory_bwd(terminal_state, discretizer, condition, return_gauss_params=True)
 
     log_pf = log_pfs.sum(-1)
@@ -87,27 +88,26 @@ def bwd_combo(terminal_state, gfn, log_r, discretizer, condition=None, repeats=1
     log_flow = log_fs[:, 0]
     log_ratio = log_r + log_pb - log_pf
 
+    # trajectory balance loss
+    tb = log_flow - log_ratio
+    tb_loss = F.mse_loss(tb, torch.zeros_like(tb), reduction='none')
+
+    # VarGrad loss
     if gfn.conditional_flow_model:
         # reshape and take the mean over repeats
         # minimize the variance over repeats w.r.t., the norm
         log_Z = log_ratio.view(repeats, -1).mean(dim=0, keepdim=True)
-        log_Z_learned = log_flow.view(repeats, -1).mean(dim=0, keepdim=True)
-        log_Z_mean = (log_Z + log_Z_learned) / 2
-        vg_loss = 0.5 * (log_Z_mean - log_ratio.view(repeats, -1)) ** 2
+        vg_loss = 0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2
     else:
         # take the variance over the full unconditional batch
         log_Z = log_ratio.mean(dim=0, keepdim=True)
-        log_Z_mean = (log_Z + log_flow) / 2
-        vg_loss = 0.5 * (log_Z_mean - log_ratio) ** 2
+        vg_loss = 0.5 * (log_Z - log_ratio) ** 2
 
     # regularize policies for local smoothness with a small penalty
-    smoothness_loss = normed_smoothness_loss(
-        torch.stack([means_f, logvars_f, means_b, logvars_b])
-    )
+    # smoothness_loss = normed_smoothness_loss(torch.stack([means_f, logvars_f, means_b, logvars_b]))
 
-    mle_loss = -log_pfs.sum(-1)  # maximize forward probabilities on reverse policy
-
-    loss = vg_loss.mean() + smoothness_loss.mean() * 1 + mle_loss.mean()
+    tb_coeff = 1 / (vg_loss.mean() + 1)  # smoothly turn on TB loss when VG is satisfied
+    loss = vg_loss.mean() + tb_coeff * tb_loss.mean()  # + smoothness_loss.mean() * 1
 
     if return_exp:
         return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
@@ -125,7 +125,7 @@ def fwd_tb(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
     log_flow = log_fs[:, 0]
 
     tb = (log_pf + log_flow - log_pb - log_r)
-    tb_loss = F.smooth_l1_loss(tb, torch.zeros_like(tb), reduction='none')
+    tb_loss = F.mse_loss(tb, torch.zeros_like(tb), reduction='none')
 
     loss = tb_loss.mean()
 
@@ -142,7 +142,7 @@ def bwd_tb(terminal_state, gfn, log_r, discretizer, condition=None, return_exp: 
     log_flow = log_fs[:, 0]
 
     tb = (log_pf + log_flow - log_pb - log_r)
-    tb_loss = F.smooth_l1_loss(tb, torch.zeros_like(tb), reduction='none')
+    tb_loss = F.mse_loss(tb, torch.zeros_like(tb), reduction='none')
 
     loss = tb_loss.mean()
 

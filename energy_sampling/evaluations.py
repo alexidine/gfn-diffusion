@@ -171,6 +171,7 @@ def generate_bwd_figs(fig_dict, buffer, gfn_model, init_state, discretizer):
     (backward_flow_states, b_log_pfs, b_log_pbs, b_log_fs,
      b_means_f, b_vars_f, b_means_b, b_vars_b) = gfn_model.get_trajectory_bwd(
         terminal_state.to(gfn_model.device), discretizer, condition.to(gfn_model.device), return_gauss_params=True)
+
     fig_dict['Backward Latents Trajectories'] = visualize_latent_trajs(
         backward_flow_states.cpu().detach().numpy(),
         n_trajs=20, log_r=b_log_r.cpu().detach().numpy())
