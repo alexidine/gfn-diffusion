@@ -181,6 +181,7 @@ def generate_bwd_figs(fig_dict, buffer, gfn_model, init_state, discretizer):
                                                            b_log_pfs)
     fig_dict['Backward Gauss Params'] = mean_var_fig(b_vars_f, b_means_f,
                                                      b_vars_b, b_means_b)
+    fig_dict['Bwd Traj Mean Step Sizes'] = mean_flow_step_sizes(backward_flow_states)
 
     return fig_dict
 
@@ -403,6 +404,7 @@ def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs):
     lim_high = max_val + margin
     mae = np.mean(np.abs(x - y))
     r_value, _ = pearsonr(x, y)
+    slope, intercept = np.polyfit(x, y, deg=1)
     # Build figure
     fig = go.Figure()
 
@@ -415,6 +417,14 @@ def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs):
         hoverinfo='skip'
     ))
 
+    fig.add_trace(go.Scatter(
+        x=[lim_low, lim_high], y=[slope * lim_low + intercept, slope * lim_high + intercept],
+        mode='lines',
+        line=dict(color='red', dash='dot'),
+        name=f'{slope:.3f}x + {intercept:.3f}',
+        showlegend=True
+    ))
+    
     # Scatter points
     fig.add_trace(go.Scatter(
         x=x, y=y,
