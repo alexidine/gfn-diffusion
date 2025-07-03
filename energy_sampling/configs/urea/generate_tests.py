@@ -111,6 +111,7 @@ config_list.append(
      's_emb_dim': 256,
      'dropout': 0,
      'norm': None,
+     'lr_anneal_time': 20000,
      }  # 8 new baseline config
 )
 
@@ -139,6 +140,7 @@ config_list.append(
      's_emb_dim': 256,
      'dropout': 0,
      'norm': None,
+     'lr_anneal_time': 20000,
      }  # 9 - bigger model
 )
 
@@ -167,6 +169,7 @@ config_list.append(
      's_emb_dim': 256,
      'dropout': 0,
      'norm': None,
+     'lr_anneal_time': 20000,
      }  # 10 - higher density cutoff
 )
 
@@ -195,6 +198,7 @@ config_list.append(
      's_emb_dim': 256,
      'dropout': 0,
      'norm': None,
+     'lr_anneal_time': 20000,
      }  # 11 - higher std variance
 )
 
@@ -223,6 +227,7 @@ config_list.append(
      's_emb_dim': 256,
      'dropout': 0,
      'norm': None,
+     'lr_anneal_time': 20000,
      }  # 12 - more exploration time
 )
 
@@ -251,6 +256,7 @@ config_list.append(
      's_emb_dim': 256,
      'dropout': 0,
      'norm': None,
+     'lr_anneal_time': 20000,
      }  # 13 - more pb range
 )
 
@@ -279,6 +285,7 @@ config_list.append(
      's_emb_dim': 256,
      'dropout': 0,
      'norm': None,
+     'lr_anneal_time': 20000,
      }  # 14 - less pf range
 )
 
@@ -307,6 +314,7 @@ config_list.append(
      's_emb_dim': 256,
      'dropout': 0.5,
      'norm': None,
+     'lr_anneal_time': 20000,
      }  # 15 - lots of dropout
 )
 
@@ -335,6 +343,7 @@ config_list.append(
      's_emb_dim': 256,
      'dropout': 0,
      'norm': 'layer',
+     'lr_anneal_time': 20000,
      }  # 16 - norming
 )
 
@@ -363,6 +372,7 @@ config_list.append(
      's_emb_dim': 256,
      'dropout': 0,
      'norm': None,
+     'lr_anneal_time': 20000,
      }  # 17 fixed Pb
 )
 
@@ -391,6 +401,7 @@ config_list.append(
      's_emb_dim': 256,
      'dropout': 0,
      'norm': None,
+     'lr_anneal_time': 20000,
      }  # 18 fixed variance and pb
 )
 
