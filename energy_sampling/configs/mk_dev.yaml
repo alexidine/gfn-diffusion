@@ -45,8 +45,8 @@ t_scale: 1.0                 # scales fixed forward policy variance
 log_var_range: 1.0           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
 pb_scale_range: 0.1          # range of learned backward policy corrections, only for 'brownian_bridge'
 energy: "molecular_crystal"  # "molecular_crystal"
-mode_fwd: "tb"               # "tb" is trajectory balance, "vg" is VarGrad
-mode_bwd: "tb"               # "tb" is trajectory balance, "vg" is VarGrad
+mode_fwd: "combo"               # "tb" is trajectory balance, "vg" is VarGrad
+mode_bwd: "combo"               # "tb" is trajectory balance, "vg" is VarGrad
 repeats: 5                   # for conditional VarGrad training
 both_ways: true             # forward and backward training
 bwd_batch_multiplier: 5      # ratio of backward to foward batch size (much cheaper to evaluate)
@@ -61,7 +61,7 @@ gfn_clip: 10.0  # clip the maximumstep size induced by the policy model
 
 # local search settings
 ################################################################
-buffer_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
+buffer_path: null #'D:/crystal_datasets/urea_gfn_dataset.pt'
 molecules_path: 'D:/crystal_datasets/test_qm9_dataset.pt'
 
 #buffer_path: '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt'
@@ -85,7 +85,7 @@ wd_max_steps: 2500  # number of steps to terminate the added variance
 # molecular crystal settings
 ################################################################
 # scales the energy function
-energy_function: silu_energy
+energy_function: latent_multiharmonic
   # 'latent_harmonic' : unimadal harmonic potential in the latent space
   # 'crystal_harmonic': unimodal harmonic potential in the crystal space
   # 'latent_multiharmonic': multimodal harmonic potential in the latent space

@@ -18,6 +18,101 @@ def get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states, no_
     return crystal_batch, log_r
 
 
+def normed_smoothness_loss(x, eps=1e-5):
+    second_diff = torch.diff(x, n=2, dim=-1)
+    curvature = (second_diff**4).mean(dim=-1) # specifically punish very large changes
+    variance = torch.var(x, dim=-1, correction=0)
+    return curvature / (variance + eps)
+
+
+def fwd_combo(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
+              exploration_std=None, return_exp=False, condition=None, repeats=10):
+    if gfn.conditional_flow_model:
+        condition = condition.repeat(repeats, 1)
+        initial_state = initial_state.repeat(repeats, 1)
+        mol_batch = collate_data_list(mol_batch.to_data_list() * repeats)
+
+    (states, log_pfs, log_pbs, log_fs,
+     means_f, logvars_f, means_b, logvars_b) = gfn.get_trajectory_fwd(initial_state,
+                                                                      discretizer,
+                                                                      exploration_std,
+                                                                      condition,
+                                                                      return_gauss_params=True)
+    crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states)
+
+    log_pf = log_pfs.sum(-1)
+    log_pb = log_pbs.sum(-1)
+    log_flow = log_fs[:, 0]
+    log_ratio = log_r + log_pb - log_pf
+
+    if gfn.conditional_flow_model:
+        # reshape and take the mean over repeats
+        # minimize the variance over repeats w.r.t., the norm
+        log_Z = log_ratio.view(repeats, -1).mean(dim=0, keepdim=True)
+        log_Z_learned = log_flow.view(repeats, -1).mean(dim=0, keepdim=True)
+        log_Z_mean = (log_Z + log_Z_learned) / 2
+        vg_loss = 0.5 * (log_Z_mean - log_ratio.view(repeats, -1)) ** 2
+    else:
+        # take the variance over the full unconditional batch
+        log_Z = log_ratio.mean(dim=0, keepdim=True)
+        log_Z_mean = (log_Z + log_flow) / 2
+        vg_loss = 0.5 * (log_Z_mean - log_ratio) ** 2
+
+    # regularize policies for local smoothness with a small penalty
+    smoothness_loss = normed_smoothness_loss(
+        torch.stack([means_f, logvars_f, means_b, logvars_b])
+    )
+
+    loss = vg_loss.mean() + smoothness_loss.mean()
+
+    if return_exp:
+        return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
+    else:
+        return loss
+
+
+def bwd_combo(terminal_state, gfn, log_r, discretizer, condition=None, repeats=10,
+              return_exp: bool = False):
+    if gfn.conditional_flow_model:  # do repeats if there are conditions, otherwise skip
+        condition = condition.repeat(repeats, 1)
+        terminal_state = terminal_state.repeat(repeats, 1)
+        log_r = log_r.repeat(repeats)
+
+    (states, log_pfs, log_pbs, log_fs,
+     means_f, logvars_f, means_b, logvars_b)\
+        = gfn.get_trajectory_bwd(terminal_state, discretizer, condition, return_gauss_params=True)
+
+    log_pf = log_pfs.sum(-1)
+    log_pb = log_pbs.sum(-1)
+    log_flow = log_fs[:, 0]
+    log_ratio = log_r + log_pb - log_pf
+
+    if gfn.conditional_flow_model:
+        # reshape and take the mean over repeats
+        # minimize the variance over repeats w.r.t., the norm
+        log_Z = log_ratio.view(repeats, -1).mean(dim=0, keepdim=True)
+        log_Z_learned = log_flow.view(repeats, -1).mean(dim=0, keepdim=True)
+        log_Z_mean = (log_Z + log_Z_learned) / 2
+        vg_loss = 0.5 * (log_Z_mean - log_ratio.view(repeats, -1)) ** 2
+    else:
+        # take the variance over the full unconditional batch
+        log_Z = log_ratio.mean(dim=0, keepdim=True)
+        log_Z_mean = (log_Z + log_flow) / 2
+        vg_loss = 0.5 * (log_Z_mean - log_ratio) ** 2
+
+    # regularize policies for local smoothness with a small penalty
+    smoothness_loss = normed_smoothness_loss(
+        torch.stack([means_f, logvars_f, means_b, logvars_b])
+    )
+
+    loss = vg_loss.mean() + smoothness_loss.mean()
+
+    if return_exp:
+        return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
+    else:
+        return loss
+
+
 def fwd_tb(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
            exploration_std=None, return_exp=False, condition=None):
     states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, discretizer, exploration_std, condition)
@@ -25,9 +120,10 @@ def fwd_tb(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
 
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
-    log_ratio = (log_pf + log_fs[:, 0] - log_pb - log_r)
-    #tb_loss = F.mse_loss(log_ratio, torch.zeros_like(log_ratio), reduction='none')
-    tb_loss = F.smooth_l1_loss(log_ratio, torch.zeros_like(log_ratio), reduction='none')
+    log_flow = log_fs[:, 0]
+
+    tb = (log_pf + log_flow - log_pb - log_r)
+    tb_loss = F.smooth_l1_loss(tb, torch.zeros_like(tb), reduction='none')
 
     loss = tb_loss.mean()
 
@@ -41,9 +137,10 @@ def bwd_tb(terminal_state, gfn, log_r, discretizer, condition=None, return_exp: 
     states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, discretizer, condition)
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
-    log_ratio = (log_pf + log_fs[:, 0] - log_pb - log_r)
-    #tb_loss = F.mse_loss(log_ratio, torch.zeros_like(log_ratio), reduction='none')
-    tb_loss = F.smooth_l1_loss(log_ratio, torch.zeros_like(log_ratio), reduction='none')
+    log_flow = log_fs[:, 0]
+
+    tb = (log_pf + log_flow - log_pb - log_r)
+    tb_loss = F.smooth_l1_loss(tb, torch.zeros_like(tb), reduction='none')
 
     loss = tb_loss.mean()
 
@@ -71,20 +168,17 @@ def fwd_vg(initial_state, gfn,
 
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
+    log_ratio = log_r + log_pb - log_pf
 
     if gfn.conditional_flow_model:
         # reshape and take the mean over repeats
         # minimize the variance over repeats w.r.t., the norm
-        log_ratio = log_r + log_pb - log_pf
         log_Z = log_ratio.view(repeats, -1).mean(dim=0, keepdim=True)
-        vg_loss = 0.5 * (log_Z + (log_pf - log_r - log_pb).view(repeats, -1)) ** 2
-        #vg_loss = F.smooth_l1_loss(log_Z, log_ratio, reduction='none')  # smoother
+        vg_loss = 0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2
     else:
         # take the variance over the full unconditional batch
-        log_ratio = log_r + log_pb - log_pf
         log_Z = log_ratio.mean(dim=0, keepdim=True)
-        vg_loss = 0.5 * (log_Z + (log_pf - log_r - log_pb)) ** 2
-        #vg_loss = F.smooth_l1_loss(log_Z.repeat(len(log_ratio)), log_ratio, reduction='none')  # smoother
+        vg_loss = 0.5 * (log_Z - log_ratio) ** 2
 
     loss = vg_loss.mean()
 
@@ -104,20 +198,17 @@ def bwd_vg(terminal_state, gfn, log_r, discretizer, condition=None, repeats=10,
     states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, discretizer, condition)
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
+    log_ratio = log_r + log_pb - log_pf
 
     if gfn.conditional_flow_model:
         # reshape and take the mean over repeats
         # minimize the variance over repeats w.r.t., the norm
-        log_ratio = log_r + log_pb - log_pf
         log_Z = log_ratio.view(repeats, -1).mean(dim=0, keepdim=True)
-        vg_loss = 0.5 * (log_Z + (log_pf - log_r - log_pb).view(repeats, -1)) ** 2
-        #vg_loss = F.smooth_l1_loss(log_Z, log_ratio, reduction='none')  # smoother
+        vg_loss = 0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2
     else:
         # take the variance over the full unconditional batch
-        log_ratio = log_r + log_pb - log_pf
         log_Z = log_ratio.mean(dim=0, keepdim=True)
-        vg_loss = 0.5 * (log_Z + (log_pf - log_r - log_pb)) ** 2
-        #vg_loss = F.smooth_l1_loss(log_Z.repeat(len(log_ratio)), log_ratio, reduction='none')  # smoother
+        vg_loss = 0.5 * (log_Z - log_ratio) ** 2
 
     loss = vg_loss.mean()
 
@@ -167,6 +258,10 @@ def get_gfn_forward_loss(mode, init_state, gfn_model, log_reward, discretizer, m
     elif mode == 'vg':
         return fwd_vg(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std, return_exp=return_exp,
                       condition=condition, repeats=repeats)
+    elif mode == 'combo':
+        return fwd_combo(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
+                         return_exp=return_exp,
+                         condition=condition, repeats=repeats)
     # elif mode == 'db':
     #     return db(init_state, gfn_model, log_reward, exploration_std, condition=condition)
     # elif mode == 'subtb':
@@ -175,13 +270,17 @@ def get_gfn_forward_loss(mode, init_state, gfn_model, log_reward, discretizer, m
         assert False
 
 
-def get_gfn_backward_loss(mode, samples, gfn_model, rewards, discretizer, exploration_std=None, condition=None, repeats=10,
+def get_gfn_backward_loss(mode, samples, gfn_model, rewards, discretizer, exploration_std=None, condition=None,
+                          repeats=10,
                           return_exp=False):
     if mode == 'tb':
         return bwd_tb(samples, gfn_model, rewards, discretizer, condition=condition, return_exp=return_exp)
     elif mode == 'vg':
         return bwd_vg(samples, gfn_model, rewards, discretizer, condition=condition, repeats=repeats,
                       return_exp=return_exp)
+    elif mode == 'combo':
+        return bwd_combo(samples, gfn_model, rewards, discretizer, condition=condition, repeats=repeats,
+                         return_exp=return_exp)
 
     else:
         assert False

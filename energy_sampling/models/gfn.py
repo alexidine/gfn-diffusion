@@ -194,17 +194,17 @@ class GFN(nn.Module):
 
             if return_gauss_params:
                 if i > 0:
-                    means_b[:, i, :] = back_mean.detach()
-                    logvars_b[:, i, :] = (back_var / dts[:, None]).log().detach()
+                    means_b[:, i, :] = back_mean
+                    logvars_b[:, i, :] = (back_var / dts[:, None]).log()
                 else:
                     logvars_b[:, i, :] = -3
-                means_f[:, i, :] = pf_mean.detach()
-                logvars_f[:, i, :] = pflogvars.detach()
+                means_f[:, i, :] = pf_mean
+                logvars_f[:, i, :] = pflogvars
 
         if return_gauss_params:
             return (states, logpf, logpb, logf,
-                    means_f.detach().mean(-1), logvars_f.detach().mean(-1), means_b.detach().mean(-1),
-                    logvars_b.detach().mean(-1))
+                    means_f.mean(-1), logvars_f.mean(-1), means_b.mean(-1),
+                    logvars_b.mean(-1))
         else:
             return states, logpf, logpb, logf
 
@@ -261,18 +261,18 @@ class GFN(nn.Module):
                 1)
 
             if return_gauss_params:
-                means_b[:, i, :] = mean.detach()
-                logvars_b[:, i, :] = var.log().detach()
-                means_f[:, i, :] = pf_mean.detach()
-                logvars_f[:, i, :] = pflogvars.detach()
+                means_b[:, i, :] = mean
+                logvars_b[:, i, :] = var.log()
+                means_f[:, i, :] = pf_mean
+                logvars_f[:, i, :] = pflogvars
 
             current_state = s_
             states[:, trajectory_length - i - 1] = current_state
 
         if return_gauss_params:
             return (states, logpf, logpb, logf,
-                    means_f.detach().mean(-1), logvars_f.detach().mean(-1), means_b.detach().mean(-1),
-                    logvars_b.detach().mean(-1))
+                    means_f.mean(-1), logvars_f.mean(-1), means_b.mean(-1),
+                    logvars_b.mean(-1))
         else:
             return states, logpf, logpb, logf
     #
