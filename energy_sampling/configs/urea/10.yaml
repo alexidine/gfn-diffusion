@@ -21,7 +21,7 @@ dropout: 0
 energy: molecular_crystal
 energy_annealing_threshold: 0.1
 energy_clip: 100
-energy_density_coeff: 2
+energy_density_coeff: 5
 energy_function: silu_energy
 energy_max_temperature: 1
 energy_min_temperature: 0.01

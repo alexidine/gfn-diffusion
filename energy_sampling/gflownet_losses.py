@@ -63,7 +63,7 @@ def fwd_combo(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
         torch.stack([means_f, logvars_f, means_b, logvars_b])
     )
 
-    loss = vg_loss.mean() + smoothness_loss.mean() * 0.01
+    loss = vg_loss.mean() + smoothness_loss.mean() * 1
 
     if return_exp:
         return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
@@ -105,7 +105,9 @@ def bwd_combo(terminal_state, gfn, log_r, discretizer, condition=None, repeats=1
         torch.stack([means_f, logvars_f, means_b, logvars_b])
     )
 
-    loss = vg_loss.mean() + smoothness_loss.mean() * 0.01
+    mle_loss = -log_pfs.sum(-1)  # maximize forward probabilities on reverse policy
+
+    loss = vg_loss.mean() + smoothness_loss.mean() * 1 + mle_loss.mean()
 
     if return_exp:
         return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
