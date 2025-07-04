@@ -77,14 +77,21 @@ def eval_step(energy_function,
                                          sample_batch, buffer)
 
     if len(buffer) > 0:
-        buffer.add(sample_batch.cpu().detach().to_data_list())  # add evaluation samples to buffer
+        buffer.add(sample_batch.detach().cpu().to_data_list())  # add evaluation samples to buffer
 
     if do_figures:
-        fig_dict = generate_fwd_figs(buffer, energy_function, condition, flow_states,
-                                     gfn_model, init_state, log_fs,
-                                     log_pbs, log_pfs, log_r,
+        fig_dict = generate_fwd_figs(buffer,
+                                     energy_function,
+                                     condition,
+                                     flow_states,
+                                     gfn_model,
+                                     init_state,
+                                     log_fs,
+                                     log_pbs,
+                                     log_pfs,
+                                     log_r,
                                      f_vars_f, f_means_f, f_vars_b, f_means_b,
-                                     sample_batch)
+                                     sample_batch.detach().cpu())
         if bwd_training:
             fig_dict = generate_bwd_figs(fig_dict, buffer, gfn_model, init_state, discretizer)
 
@@ -125,17 +132,17 @@ def generate_fwd_figs(buffer, energy_function,
                                                     f_vars_b, f_means_b)
     fig_dict['Traj Mean Step Sizes'] = mean_flow_step_sizes(flow_states)
     fig_dict['Pf vs Pb'] = Pf_vs_Pb_fig(log_pfs, log_pbs, log_r)
-    fig_dict['TB Parity Plot'] = flow_parity_plot(log_r, log_fs[:, 0], log_pbs, log_pfs)
+    fig_dict['TB Parity Plot'], fig_dict['Forward TB R Value'] = flow_parity_plot(log_r, log_fs[:, 0], log_pbs, log_pfs)
     fig_dict['VG Error'] = vargrad_error(log_r, log_pbs, log_pfs)
     fig_dict['Lattice Latents Trajectories'] = visualize_latent_trajs(flow_states.cpu().detach().numpy(),
                                                                       20,
                                                                       log_r.cpu().detach().numpy())
     fig_dict['Lattice Features Distribution'] = simple_cell_hist(sample_batch, buffer_cell_params)
     fig_dict['Lattice Latents Distribution'] = simple_latent_hist(sample_batch, buffer_latent_params)
-    fig_dict['Sample Scatter'] = simple_cell_scatter_fig(sample_batch,
-                                                         (condition[:,
-                                                          0].cpu().detach().numpy()) if condition is not None else None,
-                                                         aux_scalar_name='log_temperature' if condition is not None else None)
+    fig_dict['Sample Scatter'] = simple_cell_scatter_fig(
+        sample_batch,
+        (condition[:,0].cpu().detach().numpy()) if condition is not None else None,
+        aux_scalar_name='log_temperature' if condition is not None else None)
 
     std_cell_params = sample_batch.cell_params_to_gen_basis().cpu().detach()
     known_modes = energy_function.crystal_modes.detach() if hasattr(energy_function, 'modes') else None
@@ -177,7 +184,7 @@ def generate_bwd_figs(fig_dict, buffer, gfn_model, init_state, discretizer):
         n_trajs=20, log_r=b_log_r.cpu().detach().numpy())
 
     fig_dict['Backward Pf vs Pb'] = Pf_vs_Pb_fig(b_log_pfs, b_log_pbs, b_log_r)
-    fig_dict['Backward TB Parity Plot'] = flow_parity_plot(b_log_r.to(b_log_fs.device), b_log_fs[:, 0], b_log_pbs,
+    fig_dict['Backward TB Parity Plot'], fig_dict['Backward TB R Value'] = flow_parity_plot(b_log_r.to(b_log_fs.device), b_log_fs[:, 0], b_log_pbs,
                                                            b_log_pfs)
     fig_dict['Backward Gauss Params'] = mean_var_fig(b_vars_f, b_means_f,
                                                      b_vars_b, b_means_b)
@@ -443,7 +450,7 @@ def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs):
         template='plotly_white'
     )
 
-    return fig
+    return fig, r_value
 
 
 def vargrad_error(log_r, log_pbs, log_pfs):

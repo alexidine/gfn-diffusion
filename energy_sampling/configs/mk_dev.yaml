@@ -24,13 +24,13 @@ condition_emb_dim: 32         # dimensionality of the conditioning embedding
 dropout: 0.5                   # dropout probability
 norm: null                   # null, "layer", "batch"
 
-batch_size: 500               # number of samples per training batch
+batch_size: 10               # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 500           # maximum batch size to allow
+max_batch_size: 100           # maximum batch size to allow
 eval_batch_size: 250        # batch size for evaluation
 epochs: 1000000             # number of training epochs: relatively large
-eval_period: 250              # how often to do evaluation & reporting
-figs_period: 250             # how often to log custom figrues  # must be multiple of eval_period or it won't fire
+eval_period: 10              # how often to do evaluation & reporting
+figs_period: 10             # how often to log custom figrues  # must be multiple of eval_period or it won't fire
 buffer_size: 2000          # size of replay buffer: relatively large
 
 # GFlowNet settings
@@ -48,7 +48,7 @@ energy: "molecular_crystal"  # "molecular_crystal"
 mode_fwd: "vg"               # "tb" is trajectory balance, "vg" is VarGrad
 mode_bwd: "vg"               # "tb" is trajectory balance, "vg" is VarGrad
 repeats: 5                   # for conditional VarGrad training
-both_ways: true             # forward and backward training
+both_ways: false             # forward and backward training
 bwd_batch_multiplier: 5      # ratio of backward to foward batch size (much cheaper to evaluate)
 fwd_train_each: 2            # on which multiples of training iter to train the fwd train model instead of bwd
 bwd: false                   # backward training only
