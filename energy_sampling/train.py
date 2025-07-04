@@ -72,6 +72,7 @@ def train_step(energy_function, gfn_model,
                                                                                       repeats=repeats,
                                                                                       )
         if add_to_buffer:
+            print("Adding to buffer!")
             buffer.add(crystal_batch.cpu().detach().to_data_list())
 
     elif do_backward:
