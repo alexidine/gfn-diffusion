@@ -38,7 +38,9 @@ class CrystalReplayBuffer():
         with torch.no_grad():
             if self.dataset is None:
                 self.dataset = list(data_list)  # I think this is memory safe and faster #copy.deepcopy(data_list)
-                self.x = collate_data_list(self.dataset).cell_params_to_gen_basis()
+                x_tensor = collate_data_list(self.dataset).cell_params_to_gen_basis()
+                self.x_list = [x_tensor[i] for i in range(x_tensor.shape[0])]
+
                 self.scores_np_list = list(
                     self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(
                         len(self))).detach().cpu().view(-1).numpy())
@@ -49,21 +51,19 @@ class CrystalReplayBuffer():
                     rands = torch.from_numpy(
                         np.random.choice(len(self.dataset), self.diversity_check_size,
                                          replace=False if len(self.dataset) > self.diversity_check_size else True))
-                    new_x_dists = torch.cdist(self.x[rands], new_x)
+                    new_x_dists = torch.cdist(torch.stack([self.x_list[rand] for rand in rands]), new_x)
                     new_x_inds_to_keep = torch.argwhere(new_x_dists.amin(dim=0) >= diversity_cutoff).flatten()
                     data_list = [data_list[ind] for ind in new_x_inds_to_keep]
 
                 if len(data_list) > 0:
                     self.dataset.extend(list(data_list))
-                    self.x = torch.cat([self.x, new_x[new_x_inds_to_keep]], dim=0)
-                    print(f"x size (MB): {self.x.element_size() * self.x.nelement() / 1e6:.2f}")
-
+                    self.x_list.extend([new_x[ind] for ind in new_x_inds_to_keep])
                     self.scores_np_list.extend(
                         list(self.energy_function.prebuilt_sample_to_reward(
                             data_list,
                             temperature=torch.ones(len(data_list))).detach().cpu().view(-1).numpy())
                     )
-                    assert len(self.dataset) == len(self.x) == len(self.scores_np_list)
+                    assert len(self.dataset) == len(self.x_list) == len(self.scores_np_list)
 
             if len(self) > self.buffer_size:  # pare down buffer
                 inds_to_keep = self.sample_indices(self.buffer_size, replace=False)
@@ -74,18 +74,9 @@ class CrystalReplayBuffer():
 
                 self.dataset = [self.dataset[ind] for ind in inds_to_keep]
                 self.scores_np_list = [self.scores_np_list[ind] for ind in inds_to_keep]
+                self.x_list = [self.x_list[ind] for ind in inds_to_keep]
 
-                self.x = self.x[torch.tensor(inds_to_keep, dtype=torch.long)]
-            print(f"x size (MB): {self.x.element_size() * self.x.nelement() / 1e6:.2f}")
-            print(f"Data sample size: {sum(sys.getsizeof(d) for d in data_list)}")
-            total_bytes = 0
-            for i, s in enumerate(self.scores_np_list):
-                if isinstance(s, np.ndarray):
-                    total_bytes += s.nbytes
-                else:
-                    total_bytes += sys.getsizeof(s)
-            print(f"Scores list total size: {total_bytes / 1e6:.2f} MB")
-
+        torch.cuda.empty_cache()
         gc.collect()
 
     def __len__(self):
