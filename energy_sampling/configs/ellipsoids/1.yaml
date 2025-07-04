@@ -3,7 +3,7 @@ anneal_energy: false
 annealing_max_steps: 5000
 batch_size: 1000
 beta: 0.1
-both_ways: false
+both_ways: true
 buffer_path: null
 buffer_size: 15000
 burn_in: 100

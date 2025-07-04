@@ -77,17 +77,25 @@ class MolecularCrystal(BaseSet):
                 semi_axis_scale=self.ellipsoid_scale,
                 model=self.ellipsoid_model,
                 return_details=True)
-
-            cluster_batch.ellipsoid_overlap = normed_ellipsoid_overlap.flatten().detach().contiguous()
+            ellipsoid_overlap = normed_ellipsoid_overlap.flatten().detach().contiguous()
         else:
-            cluster_batch.ellipsoid_overlap = torch.zeros_like(silu_energy)
+            ellipsoid_overlap = torch.zeros_like(silu_energy)
 
         cluster_batch.silu_pot = silu_energy
-        cluster_batch.lj_pot = silu_energy  #lj_energy
+        cluster_batch.lj_pot = silu_energy
+        cluster_batch.ellipsoid_overlap = ellipsoid_overlap
+
         crystal_energy = self.generator_energy(cluster_batch)
+
         cluster_batch.gfn_energy = crystal_energy
+
+        crystal_batch.gfn_energy = crystal_energy.cpu().detach()
+        crystal_batch.silu_pot = silu_energy.cpu().detach()
+        crystal_batch.lj_pot = silu_energy.cpu().detach()
+        crystal_batch.ellipsoid_overlap = ellipsoid_overlap.cpu().detach()
+
         if return_batch:
-            return crystal_energy, clean_batch(cluster_batch)
+            return crystal_energy, clean_batch(crystal_batch)
         else:
             return crystal_energy
 

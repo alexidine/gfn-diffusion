@@ -101,13 +101,13 @@ def eval_step(energy_function,
         metrics.update(fig_dict)
 
     "Crystal samples"
-    # skip this for now - not really using it anyway
-    try:
-        samples_to_log, filenames = log_crystal_samples(sample_batch=sample_batch, return_filenames=True)
-        [wandb.log({f'crystal_sample_{ind}': samples_to_log[ind]}, commit=False) for ind in range(len(samples_to_log))]
-        [os.remove(file) for file in filenames]  # delete this cif as a temporary file
-    except:
-        pass
+    # # skip this for now - not actually passing clusters at the moment so would have to rebuild here
+    # try:
+    #     samples_to_log, filenames = log_crystal_samples(sample_batch=sample_batch, return_filenames=True)
+    #     [wandb.log({f'crystal_sample_{ind}': samples_to_log[ind]}, commit=False) for ind in range(len(samples_to_log))]
+    #     [os.remove(file) for file in filenames]  # delete this cif as a temporary file
+    # except:
+    #     pass
 
     gfn_model.train()
     return metrics
