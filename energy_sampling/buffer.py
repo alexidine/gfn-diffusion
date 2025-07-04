@@ -6,7 +6,7 @@ import torch
 import numpy as np
 from mxtaltools.dataset_utils.utils import collate_data_list
 
-from energy_sampling.utils import report_mem
+from utils import report_mem
 
 
 class CrystalReplayBuffer():
