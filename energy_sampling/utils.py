@@ -1,8 +1,12 @@
 import argparse
+import gc
 import math
+import os
 import random
 from argparse import Namespace
 from pathlib import Path
+
+import psutil
 from scipy.spatial.distance import jensenshannon
 
 import PIL
@@ -441,3 +445,8 @@ def shifted_equidistant(bsz, traj_length, eps=1e-4):
     noise = torch.empty(bsz, 1).uniform_(- bound, bound)
     steps = (torch.arange(1, traj_length) / traj_length).unsqueeze(0) + noise
     return torch.cat([torch.zeros(bsz, 1), steps, torch.ones(bsz, 1)], dim=1)
+
+
+def report_mem(tag=""):
+    gc.collect()
+    print(f"[{tag}] RSS = {psutil.Process(os.getpid()).memory_info().rss / 1e6:.2f} MB")

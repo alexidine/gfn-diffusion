@@ -152,7 +152,7 @@ class MolecularCrystal(BaseSet):
             crystal_energy = -torch.logsumexp(exponent, dim=1)  # (B,)
 
         elif self.energy_function == 'ellipsoid_overlap':
-            density_energy = F.relu(-(cluster_batch.packing_coeff - 0.9)) ** 2
+            density_energy = F.relu(-(cluster_batch.packing_coeff.clone() - 0.9)) ** 2
             intermolecular_energy = cluster_batch.ellipsoid_overlap.clone()
             crystal_energy = intermolecular_energy + self.density_coeff * density_energy
 

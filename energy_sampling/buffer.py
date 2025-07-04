@@ -1,13 +1,12 @@
-import copy
 import gc
-import os
 import sys
 from typing import Optional
 
-import psutil
 import torch
 import numpy as np
 from mxtaltools.dataset_utils.utils import collate_data_list
+
+from energy_sampling.utils import report_mem
 
 
 class CrystalReplayBuffer():
@@ -148,10 +147,6 @@ class CrystalReplayBuffer():
             return sample.cell_params_to_gen_basis(), reward, sample, condition
         else:
             return sample.cell_params_to_gen_basis(), reward, sample
-
-def report_mem(tag=""):
-    gc.collect()
-    print(f"[{tag}] RSS = {psutil.Process(os.getpid()).memory_info().rss / 1e6:.2f} MB")
 
 
 def deep_sizeof(obj, seen=None):
