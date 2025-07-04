@@ -59,13 +59,13 @@ class CrystalReplayBuffer():
                 if len(data_list) > 0:
                     self.dataset.extend(list(data_list))
                     self.x_list.extend([new_x[ind] for ind in new_x_inds_to_keep])
-                    report_mem("before reward")
+                    #report_mem("before reward")
                     self.scores_np_list.extend(
                         list(self.energy_function.prebuilt_sample_to_reward(
                             data_list,
                             temperature=torch.ones(len(data_list))).detach().cpu().view(-1).numpy())
                     )
-                    report_mem("after reward")
+                    #report_mem("after reward")
 
                     assert len(self.dataset) == len(self.x_list) == len(self.scores_np_list)
 
@@ -80,12 +80,8 @@ class CrystalReplayBuffer():
                 self.scores_np_list = [self.scores_np_list[ind] for ind in inds_to_keep]
                 self.x_list = [self.x_list[ind] for ind in inds_to_keep]
 
-            print(f"[Deep size] dataset = {deep_sizeof(self.dataset) / 1e6:.2f} MB, with length {len(self.dataset)}")
-            print(f"[Deep size] x_list = {deep_sizeof(self.x_list) / 1e6:.2f} MB, with length {len(self.x_list)}")
-
-        sys.stdout.flush()
-        torch.cuda.empty_cache()
-        gc.collect()
+            #print(f"[Deep size] dataset = {deep_sizeof(self.dataset) / 1e6:.2f} MB, with length {len(self.dataset)}")
+            #print(f"[Deep size] x_list = {deep_sizeof(self.x_list) / 1e6:.2f} MB, with length {len(self.x_list)}")
 
     def __len__(self):
         if self.dataset is None:

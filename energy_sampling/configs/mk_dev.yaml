@@ -24,14 +24,14 @@ condition_emb_dim: 32         # dimensionality of the conditioning embedding
 dropout: 0.5                   # dropout probability
 norm: null                   # null, "layer", "batch"
 
-batch_size: 25               # number of samples per training batch
+batch_size: 500               # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 100           # maximum batch size to allow
+max_batch_size: 500           # maximum batch size to allow
 eval_batch_size: 250        # batch size for evaluation
 epochs: 1000000             # number of training epochs: relatively large
 eval_period: 250              # how often to do evaluation & reporting
 figs_period: 250             # how often to log custom figrues  # must be multiple of eval_period or it won't fire
-buffer_size: 30000          # size of replay buffer: relatively large
+buffer_size: 2000          # size of replay buffer: relatively large
 
 # GFlowNet settings
 T: 10                        # static training diffusion length
@@ -41,12 +41,12 @@ max_traj_length: 15
 traj_length_strategy: sampled # 'static'  or 'sampled'  will do random between min and max traj lengths
 discretizer_max_ratio: 10    # maximum ratio between randomly sampled step sizes
 discretizer: 'random'        # 'random' 'low_discrepancy' 'equidistant' 'uniform'
-t_scale: 1.0                 # scales fixed forward policy variance
+t_scale: 0.5                 # scales fixed forward policy variance
 log_var_range: 1.0           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
 pb_scale_range: 0.1          # range of learned backward policy corrections, only for 'brownian_bridge'
 energy: "molecular_crystal"  # "molecular_crystal"
-mode_fwd: "combo"               # "tb" is trajectory balance, "vg" is VarGrad
-mode_bwd: "combo"               # "tb" is trajectory balance, "vg" is VarGrad
+mode_fwd: "vg"               # "tb" is trajectory balance, "vg" is VarGrad
+mode_bwd: "vg"               # "tb" is trajectory balance, "vg" is VarGrad
 repeats: 5                   # for conditional VarGrad training
 both_ways: true             # forward and backward training
 bwd_batch_multiplier: 5      # ratio of backward to foward batch size (much cheaper to evaluate)
@@ -78,7 +78,7 @@ sampling: "buffer"
 
 # exploration controls
 exploratory: True       # adds variance to optionally learned logvars
-exploration_factor: 0.3  # initial exploration value
+exploration_factor: 1.0  # initial exploration std value
 exploration_wd: True  # decay exploration over time
 wd_max_steps: 2500  # number of steps to terminate the added variance
 
@@ -93,7 +93,7 @@ energy_function: ellipsoid_overlap
   # 'ellipsoid_overlap' : minimize ellipsoid overlaps subject to energy_density_coeff external pressure
   # 'silu_energy' : minimize a softened LJ-tye energy subject to energy_density_coeff external pressure
 anneal_energy: false  # scale temperature over time, when conditional it scales the distribution, when not it just decreases from static to min
-energy_density_coeff: 10.0  # how much to weight the density penalty term in the energy function
+energy_density_coeff: 2.0  # how much to weight the density penalty term in the energy function
 temperature_conditioning: false  # if false, temperatures are set to energy_static_temperature, and there is no annealing
 energy_min_temperature: 0.01
 energy_max_temperature: 1

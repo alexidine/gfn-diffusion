@@ -104,6 +104,7 @@ def get_discretizer(discretization_type):
         traj_length = args.T
     elif args.traj_length_strategy == 'sampled':
         traj_length = np.random.randint(low=args.min_traj_length, high=args.max_traj_length + 1)
+
     if discretization_type == 'random':
         discretizer = lambda bsz: random_discretizer(bsz, traj_length, max_ratio=args.discretizer_max_ratio)
     elif discretization_type == 'low_discrepancy':
@@ -210,9 +211,9 @@ def train():
 
     fwd_loss, bwd_loss = 0, 0
     gfn_model.train()
-    for i in trange(args.epochs + 1):
+    for step_ind in trange(args.epochs + 1):
         metrics = dict()
-        exploration_std = get_exploration_std(i,
+        exploration_std = get_exploration_std(step_ind,
                                               args.exploratory,
                                               args.wd_max_steps,
                                               args.exploration_factor,
@@ -226,7 +227,7 @@ def train():
                                                gfn_model,
                                                forward_optimizer,
                                                backward_optimizer,
-                                               i,
+                                               step_ind,
                                                exploration_std,
                                                buffer,
                                                mol_loader,
@@ -243,12 +244,12 @@ def train():
             oomed_out, buffer, mol_loader = handle_train_epoch_error(e, oomed_out, buffer, mol_loader)
         times['train_step_end'] = time()
 
-        if (i % args.eval_period == 0 and i > 0) or i == 50:
+        if (step_ind % args.eval_period == 0 and step_ind > 0) or step_ind == 50:
             torch.save(gfn_model.state_dict(), f'{name}model.pt')
-            metrics = do_evaluation(energy_function, buffer, gfn_model, i, metrics, mol_loader)
-            wandb.log(metrics, step=i)
+            metrics = do_evaluation(energy_function, buffer, gfn_model, step_ind, metrics, mol_loader)
+            wandb.log(metrics, step=step_ind)
 
-        elif i % 10 == 0 and i > 9:
+        elif step_ind % 10 == 0 and step_ind > 9:
             lr_warmup_finished, lr = step_lr_schedule(bwd_scheduler1, bwd_scheduler2,
                                                       forward_optimizer,
                                                       fwd_scheduler1, fwd_scheduler2,
@@ -258,7 +259,10 @@ def train():
             metrics.update(log_elapsed_times())
             metrics['Forward Loss'] = fwd_loss
             metrics['Backward Loss'] = bwd_loss
-            wandb.log(metrics, step=i)
+            wandb.log(metrics, step=step_ind)
+
+            torch.cuda.empty_cache()
+            gc.collect()
 
     torch.save(gfn_model.state_dict(), f'{name}_model_final.pt')
 
