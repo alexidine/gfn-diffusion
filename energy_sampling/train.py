@@ -74,6 +74,7 @@ def train_step(energy_function, gfn_model,
         if add_to_buffer:
             print("Adding to buffer!")
             buffer.add(crystal_batch.cpu().detach().to_data_list())
+            del crystal_batch
 
     elif do_backward:
         bwd_gfn_optimizer.zero_grad()

@@ -87,7 +87,7 @@ class MolecularCrystal(BaseSet):
         crystal_energy = self.generator_energy(cluster_batch)
         cluster_batch.gfn_energy = crystal_energy
         if return_batch:
-            return crystal_energy, cluster_batch
+            return crystal_energy, clean_batch(cluster_batch)
         else:
             return crystal_energy
 
@@ -152,10 +152,10 @@ class MolecularCrystal(BaseSet):
             crystal_energy = -torch.logsumexp(exponent, dim=1)  # (B,)
 
         elif self.energy_function == 'ellipsoid_overlap':
-            # intermolecular_energy = cluster_batch.ellipsoid_overlap.detach().clone().contiguous()
-            # density_energy = F.relu(-(cluster_batch.packing_coeff.detach().clone().contiguous() - 0.9)) ** 2
-            # crystal_energy = intermolecular_energy + self.density_coeff * density_energy
-            crystal_energy = torch.rand(cluster_batch.num_graphs, device=self.device)
+            intermolecular_energy = cluster_batch.ellipsoid_overlap.detach().clone().contiguous()
+            density_energy = F.relu(-(cluster_batch.packing_coeff.detach().clone().contiguous() - 0.9)) ** 2
+            crystal_energy = intermolecular_energy + self.density_coeff * density_energy
+            # crystal_energy = torch.rand(cluster_batch.num_graphs, device=self.device)
 
         elif self.energy_function == 'silu_energy':
             density_energy = F.relu(-(cluster_batch.packing_coeff - 0.9)) ** 2
@@ -191,7 +191,9 @@ class MolecularCrystal(BaseSet):
 
         return (-energy / sample_temperature).detach()
 
-    def energy(self, x, mol_batch, log_temperature: torch.tensor, return_exp: bool = False):
+    def energy(self, x, mol_batch,
+               log_temperature: torch.tensor,
+               return_exp: bool = False):
         """
         Energy is not really bounded. Or necessarily well scaled.
         We do exponential rescaling later with a temperature. For higher temperature,
@@ -312,3 +314,28 @@ def generate_modes(K=20, D=12, rho=4.0, delta=3.0, seed=42):
             mus.append(mu)
 
     return np.stack(mus)  # shape (K, D)
+
+
+def clean_batch(batch):
+    # Detach all tensors and move them to CPU in-place
+    keys = set()
+    if hasattr(batch, 'keys'):
+        keys.update(batch.keys())  # standard PyG data attributes
+
+    # Also grab any extra custom tensor attributes (e.g. ellipsoid_overlap)
+    for k in batch.__dict__:
+        val = getattr(batch, k)
+        if torch.is_tensor(val) or (isinstance(val, list) and all(torch.is_tensor(v) for v in val)):
+            keys.add(k)
+
+    for key in keys:
+        try:
+            val = getattr(batch, key)
+            if torch.is_tensor(val):
+                setattr(batch, key, val.detach().cpu())
+            elif isinstance(val, list) and all(torch.is_tensor(v) for v in val):
+                setattr(batch, key, [v.detach().cpu() for v in val])
+        except Exception:
+            continue  # ignore protected or bad attrs
+
+    return batch
