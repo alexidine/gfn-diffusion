@@ -1,11 +1,11 @@
 T: 10
 anneal_energy: false
 annealing_max_steps: 5000
-batch_size: 25
+batch_size: 1000
 beta: 0.1
 both_ways: true
 buffer_path: null
-buffer_size: 25000
+buffer_size: 15000
 burn_in: 100
 bwd: false
 bwd_batch_multiplier: 5
@@ -58,7 +58,7 @@ lr_flow: 0.1
 lr_policy: 0.001
 lr_warmup_time: 500
 ls_cycle: 100
-max_batch_size: 1000
+max_batch_size: 2000
 max_iter_ls: 100
 max_traj_length: 15
 min_lr: 1.0e-06
