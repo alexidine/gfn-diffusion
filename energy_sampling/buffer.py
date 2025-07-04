@@ -36,55 +36,54 @@ class CrystalReplayBuffer():
         self.original_dataset_inds = None
 
     def add(self, data_list, filter_diversity: bool = True, diversity_cutoff: float = 1.0):
-        #with torch.no_grad():
-        if self.dataset is None:
-            self.dataset = list(data_list)  # I think this is memory safe and faster #copy.deepcopy(data_list)
-            x_tensor = collate_data_list(self.dataset).cell_params_to_gen_basis()
-            self.x_list = [x_tensor[i] for i in range(x_tensor.shape[0])]
+        with torch.no_grad():
+            if self.dataset is None:
+                self.dataset = list(data_list)  # I think this is memory safe and faster #copy.deepcopy(data_list)
+                x_tensor = collate_data_list(self.dataset).cell_params_to_gen_basis()
+                self.x_list = [x_tensor[i] for i in range(x_tensor.shape[0])]
 
-            self.scores_np_list = list(
-                self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(
-                    len(self))).detach().cpu().view(-1).numpy())
-            self.original_dataset_inds = list(np.arange(len(self.dataset)))
-        else:
-            if filter_diversity:
-                new_x = collate_data_list(data_list).cell_params_to_gen_basis()
-                rands = torch.from_numpy(
-                    np.random.choice(len(self.dataset), self.diversity_check_size,
-                                     replace=False if len(self.dataset) > self.diversity_check_size else True))
-                new_x_dists = torch.cdist(torch.stack([self.x_list[rand] for rand in rands]), new_x)
-                new_x_inds_to_keep = torch.argwhere(new_x_dists.amin(dim=0) >= diversity_cutoff).flatten()
-                data_list = [data_list[ind] for ind in new_x_inds_to_keep]
-
-            if len(data_list) > 0:
-                self.dataset.extend(list(data_list))
-                self.x_list.extend([new_x[ind] for ind in new_x_inds_to_keep])
-                report_mem("before reward")
-                self.scores_np_list.extend(
-                    list(self.energy_function.prebuilt_sample_to_reward(
-                        data_list,
-                        temperature=torch.ones(len(data_list))).detach().cpu().view(-1).numpy())
-                )
-                report_mem("after reward")
-
-                assert len(self.dataset) == len(self.x_list) == len(self.scores_np_list)
-
-        if len(self) > self.buffer_size:  # pare down buffer
-            inds_to_keep = self.sample_indices(self.buffer_size, replace=False)
-            if self.keep_initial_samples:
-                inds_to_keep = list(set(list(inds_to_keep) + self.original_dataset_inds))[:self.buffer_size]
+                self.scores_np_list = list(
+                    self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(
+                        len(self))).detach().cpu().view(-1).numpy())
+                self.original_dataset_inds = list(np.arange(len(self.dataset)))
             else:
-                inds_to_keep = list(set(inds_to_keep))
+                if filter_diversity:
+                    new_x = collate_data_list(data_list).cell_params_to_gen_basis()
+                    rands = torch.from_numpy(
+                        np.random.choice(len(self.dataset), self.diversity_check_size,
+                                         replace=False if len(self.dataset) > self.diversity_check_size else True))
+                    new_x_dists = torch.cdist(torch.stack([self.x_list[rand] for rand in rands]), new_x)
+                    new_x_inds_to_keep = torch.argwhere(new_x_dists.amin(dim=0) >= diversity_cutoff).flatten()
+                    data_list = [data_list[ind] for ind in new_x_inds_to_keep]
 
-            self.dataset = [self.dataset[ind] for ind in inds_to_keep]
-            self.scores_np_list = [self.scores_np_list[ind] for ind in inds_to_keep]
-            self.x_list = [self.x_list[ind] for ind in inds_to_keep]
+                if len(data_list) > 0:
+                    self.dataset.extend(list(data_list))
+                    self.x_list.extend([new_x[ind] for ind in new_x_inds_to_keep])
+                    report_mem("before reward")
+                    self.scores_np_list.extend(
+                        list(self.energy_function.prebuilt_sample_to_reward(
+                            data_list,
+                            temperature=torch.ones(len(data_list))).detach().cpu().view(-1).numpy())
+                    )
+                    report_mem("after reward")
 
-        print(f"[Deep size] dataset = {deep_sizeof(self.dataset) / 1e6:.2f} MB, with length {len(self.dataset)}")
-        print(f"[Deep size] x_list = {deep_sizeof(self.x_list) / 1e6:.2f} MB, with length {len(self.x_list)}")
+                    assert len(self.dataset) == len(self.x_list) == len(self.scores_np_list)
+
+            if len(self) > self.buffer_size:  # pare down buffer
+                inds_to_keep = self.sample_indices(self.buffer_size, replace=False)
+                if self.keep_initial_samples:
+                    inds_to_keep = list(set(list(inds_to_keep) + self.original_dataset_inds))[:self.buffer_size]
+                else:
+                    inds_to_keep = list(set(inds_to_keep))
+
+                self.dataset = [self.dataset[ind] for ind in inds_to_keep]
+                self.scores_np_list = [self.scores_np_list[ind] for ind in inds_to_keep]
+                self.x_list = [self.x_list[ind] for ind in inds_to_keep]
+
+            print(f"[Deep size] dataset = {deep_sizeof(self.dataset) / 1e6:.2f} MB, with length {len(self.dataset)}")
+            print(f"[Deep size] x_list = {deep_sizeof(self.x_list) / 1e6:.2f} MB, with length {len(self.x_list)}")
 
         sys.stdout.flush()
-
         torch.cuda.empty_cache()
         gc.collect()
 

@@ -58,7 +58,7 @@ config_list.append(
      'norm': None,
      'lr_anneal_time': 20000,
      'max_batch_size': 1000,
-     }  # 0
+     }  # 0 - density loss wins out up to 1. Moderate overlaps. Overall variance explosion.
 )
 config_list.append(
     {'energy_function': 'ellipsoid_overlap',
@@ -91,7 +91,7 @@ config_list.append(
      'norm': None,
      'lr_anneal_time': 20000,
      'max_batch_size': 1000,
-     }  # 1 both ways
+     }  # 1 both ways - looking ok but memory leak crash
 )
 config_list.append(
     {'energy_function': 'ellipsoid_overlap',
@@ -124,7 +124,7 @@ config_list.append(
      'norm': None,
      'lr_anneal_time': 20000,
      'max_batch_size': 1000,
-     }  # 2 with T conditioning
+     }  # 2 with T conditioning - better overlaps. OK Z learning
 )
 config_list.append(
     {'energy_function': 'ellipsoid_overlap',
@@ -157,7 +157,7 @@ config_list.append(
      'norm': None,
      'lr_anneal_time': 20000,
      'max_batch_size': 1000,
-     }  # 3 huge model
+     }  # 3 huge model - wacky explision
 )
 config_list.append(
     {'energy_function': 'ellipsoid_overlap',
@@ -190,11 +190,8 @@ config_list.append(
      'norm': None,
      'lr_anneal_time': 20000,
      'max_batch_size': 1000,
-     }  # 4 more train steps
+     }  # 4 more train steps - identical to 1
 )
-
-
-
 
 
 def overwrite_nested_dict(d1, d2):
