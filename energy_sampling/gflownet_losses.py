@@ -55,16 +55,18 @@ def fwd_combo(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
         # minimize the variance over repeats w.r.t., the norm
         log_Z = log_ratio.view(repeats, -1).mean(dim=0, keepdim=True)
         vg_loss = 0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2
+        #z_matching_loss = F.mse_loss(log_Z, log_flow.view(repeats, -1).mean(dim=0, keepdim=True), reduction='mean')
+
     else:
         # take the variance over the full unconditional batch
         log_Z = log_ratio.mean(dim=0, keepdim=True)
         vg_loss = 0.5 * (log_Z - log_ratio) ** 2
+        #z_matching_loss = F.mse_loss(log_Z.repeat(len(log_flow)), log_flow, reduction='mean')
 
     # regularize policies for local smoothness with a small penalty
     #smoothness_loss = normed_smoothness_loss(torch.stack([means_f, logvars_f, means_b, logvars_b]))
 
-    tb_coeff = 1/(vg_loss.mean() + 1)  # smoothly turn on TB loss when VG is satisfied
-    loss = vg_loss.mean() + tb_coeff * tb_loss.mean()  #+ smoothness_loss.mean() * 1
+    loss = vg_loss.mean() + tb_loss.mean() #+ z_matching_loss  #+ smoothness_loss.mean() * 1
 
     if return_exp:
         return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
@@ -98,16 +100,18 @@ def bwd_combo(terminal_state, gfn, log_r, discretizer, condition=None, repeats=1
         # minimize the variance over repeats w.r.t., the norm
         log_Z = log_ratio.view(repeats, -1).mean(dim=0, keepdim=True)
         vg_loss = 0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2
+        #z_matching_loss = F.mse_loss(log_Z, log_flow.view(repeats, -1).mean(dim=0, keepdim=True), reduction='mean')
+
     else:
         # take the variance over the full unconditional batch
         log_Z = log_ratio.mean(dim=0, keepdim=True)
         vg_loss = 0.5 * (log_Z - log_ratio) ** 2
+        #z_matching_loss = F.mse_loss(log_Z.repeat(len(log_flow)), log_flow, reduction='mean')
 
     # regularize policies for local smoothness with a small penalty
-    # smoothness_loss = normed_smoothness_loss(torch.stack([means_f, logvars_f, means_b, logvars_b]))
+    #smoothness_loss = normed_smoothness_loss(torch.stack([means_f, logvars_f, means_b, logvars_b]))
 
-    tb_coeff = 1 / (vg_loss.mean() + 1)  # smoothly turn on TB loss when VG is satisfied
-    loss = vg_loss.mean() + tb_coeff * tb_loss.mean()  # + smoothness_loss.mean() * 1
+    loss = vg_loss.mean() + tb_loss.mean() #+ z_matching_loss  #+ smoothness_loss.mean() * 1
 
     if return_exp:
         return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()

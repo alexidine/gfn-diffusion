@@ -81,8 +81,9 @@ class CrystalReplayBuffer():
             self.scores_np_list = [self.scores_np_list[ind] for ind in inds_to_keep]
             self.x_list = [self.x_list[ind] for ind in inds_to_keep]
 
-        print(f"[Deep size] dataset = {deep_sizeof(self.dataset) / 1e6:.2f} MB")
-        print(f"[Deep size] x_list = {deep_sizeof(self.x_list) / 1e6:.2f} MB")
+        print(f"[Deep size] dataset = {deep_sizeof(self.dataset) / 1e6:.2f} MB, with length {len(self.dataset)}")
+        print(f"[Deep size] x_list = {deep_sizeof(self.x_list) / 1e6:.2f} MB, with length {len(self.x_list)}")
+
         sys.stdout.flush()
 
         torch.cuda.empty_cache()

@@ -24,7 +24,7 @@ class MolecularCrystal(BaseSet):
                  temperature_scaling_factor: float = 1,
                  temperature: float = 1.0,
                  temperature_conditioning: bool = False,
-                 energy_clip: float=100,
+                 energy_clip: float = 100,
                  ):
         super(MolecularCrystal, self).__init__()
         self.device = device
@@ -83,7 +83,7 @@ class MolecularCrystal(BaseSet):
             cluster_batch.ellipsoid_overlap = torch.zeros_like(silu_energy)
 
         cluster_batch.silu_pot = silu_energy
-        cluster_batch.lj_pot = silu_energy #lj_energy
+        cluster_batch.lj_pot = silu_energy  #lj_energy
         crystal_energy = self.generator_energy(cluster_batch)
         cluster_batch.gfn_energy = crystal_energy
         if return_batch:
@@ -99,10 +99,10 @@ class MolecularCrystal(BaseSet):
             # a trivial energy function, for testing
             latents = cluster_batch.cell_params_to_gen_basis()
             if not hasattr(self, 'modes'):
-                self.modes = -torch.ones((1,12), device=self.device)
+                self.modes = -torch.ones((1, 12), device=self.device)
                 self.crystal_modes = cluster_batch.latent_transform.inverse(self.modes,
-                                                                    cluster_batch.sg_ind[:1],
-                                                                    cluster_batch.radius[:1])
+                                                                            cluster_batch.sg_ind[:1],
+                                                                            cluster_batch.radius[:1])
             crystal_energy = 0.5 * (latents - self.modes[0]).pow(2).sum(dim=1) / self.temperature
             # analytic Z = (2pi*T)^(d/2)
         elif self.energy_function == 'crystal_harmonic':
@@ -111,8 +111,8 @@ class MolecularCrystal(BaseSet):
             if not hasattr(self, 'modes'):
                 self.modes = -torch.ones((1, 12), device=self.device)
                 self.crystal_modes = cluster_batch.latent_transform.inverse(self.modes,
-                                                                    cluster_batch.sg_ind[:1],
-                                                                    cluster_batch.radius[:1])
+                                                                            cluster_batch.sg_ind[:1],
+                                                                            cluster_batch.radius[:1])
             crystal_energy = 0.5 * (cell_params - self.crystal_modes[0]).pow(2).sum(dim=1) / self.temperature
             # analytic Z = (2pi*T)^(d/2)
 
@@ -121,8 +121,8 @@ class MolecularCrystal(BaseSet):
             if not hasattr(self, 'modes'):
                 self.modes = torch.tensor(generate_modes(10, 12, 4.0, 3.0), device=self.device)
                 self.crystal_modes = cluster_batch.latent_transform.inverse(self.modes,
-                                                                    cluster_batch.sg_ind[:10],
-                                                                    cluster_batch.radius[:10])
+                                                                            cluster_batch.sg_ind[:10],
+                                                                            cluster_batch.radius[:10])
 
             diffs = latents[:, None, :] - self.modes[None, :, :]
             sqdist = (diffs ** 2).sum(dim=-1)  # (B, K)
@@ -143,8 +143,8 @@ class MolecularCrystal(BaseSet):
             if not hasattr(self, 'modes'):
                 self.modes = torch.tensor(generate_modes(10, 12, 4.0, 3.0), device=self.device)
                 self.crystal_modes = cluster_batch.latent_transform.inverse(self.modes,
-                                                                    cluster_batch.sg_ind[:10],
-                                                                    cluster_batch.radius[:10])
+                                                                            cluster_batch.sg_ind[:10],
+                                                                            cluster_batch.radius[:10])
 
             diffs = latents[:, None, :] - self.modes[None, :, :]
             sqdist = (diffs ** 2).sum(dim=-1)  # (B, K)
@@ -153,7 +153,7 @@ class MolecularCrystal(BaseSet):
 
         elif self.energy_function == 'ellipsoid_overlap':
             density_energy = F.relu(-(cluster_batch.packing_coeff - 0.9)) ** 2
-            intermolecular_energy = cluster_batch.ellipsoid_overlap
+            intermolecular_energy = cluster_batch.ellipsoid_overlap.clone()
             crystal_energy = intermolecular_energy + self.density_coeff * density_energy
 
         elif self.energy_function == 'silu_energy':
@@ -178,7 +178,8 @@ class MolecularCrystal(BaseSet):
         else:
             crystal_batch = crystals
 
-        energy = self.generator_energy(crystal_batch)
+        with torch.no_grad():
+            energy = self.generator_energy(crystal_batch)
 
         if torch.is_tensor(temperature):
             sample_temperature = temperature.to(self.device)
@@ -187,7 +188,7 @@ class MolecularCrystal(BaseSet):
         else:
             assert False
 
-        return -energy / sample_temperature
+        return (-energy / sample_temperature).detach()
 
     def energy(self, x, mol_batch, log_temperature: torch.tensor, return_exp: bool = False):
         """
