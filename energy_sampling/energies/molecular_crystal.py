@@ -78,7 +78,7 @@ class MolecularCrystal(BaseSet):
                 model=self.ellipsoid_model,
                 return_details=True)
 
-            cluster_batch.ellipsoid_overlap = normed_ellipsoid_overlap.flatten()
+            cluster_batch.ellipsoid_overlap = normed_ellipsoid_overlap.flatten().detach()
         else:
             cluster_batch.ellipsoid_overlap = torch.zeros_like(silu_energy)
 
@@ -152,9 +152,12 @@ class MolecularCrystal(BaseSet):
             crystal_energy = -torch.logsumexp(exponent, dim=1)  # (B,)
 
         elif self.energy_function == 'ellipsoid_overlap':
-            intermolecular_energy = cluster_batch.ellipsoid_overlap.detach().clone().contiguous()
-            density_energy = F.relu(-(cluster_batch.packing_coeff.detach().clone().contiguous() - 0.9)) ** 2
-            crystal_energy = intermolecular_energy + self.density_coeff * density_energy
+            # intermolecular_energy = cluster_batch.ellipsoid_overlap.detach().clone().contiguous()
+            # density_energy = F.relu(-(cluster_batch.packing_coeff.detach().clone().contiguous() - 0.9)) ** 2
+            # crystal_energy = intermolecular_energy + self.density_coeff * density_energy
+            B = cluster_batch.num_atoms.shape[0]
+            # synthetic reward
+            crystal_energy = torch.rand(B, device='cpu')
 
         elif self.energy_function == 'silu_energy':
             density_energy = F.relu(-(cluster_batch.packing_coeff - 0.9)) ** 2
