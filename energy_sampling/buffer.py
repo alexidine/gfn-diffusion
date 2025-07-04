@@ -1,5 +1,6 @@
 import copy
 import gc
+import sys
 from typing import Optional
 
 import torch
@@ -46,7 +47,8 @@ class CrystalReplayBuffer():
                 if filter_diversity:
                     new_x = collate_data_list(data_list).cell_params_to_gen_basis()
                     rands = torch.from_numpy(
-                        np.random.choice(len(self.dataset), self.diversity_check_size, replace=False if len(self.dataset) > self.diversity_check_size else True))
+                        np.random.choice(len(self.dataset), self.diversity_check_size,
+                                         replace=False if len(self.dataset) > self.diversity_check_size else True))
                     new_x_dists = torch.cdist(self.x[rands], new_x)
                     new_x_inds_to_keep = torch.argwhere(new_x_dists.amin(dim=0) >= diversity_cutoff).flatten()
                     data_list = [data_list[ind] for ind in new_x_inds_to_keep]
@@ -54,6 +56,8 @@ class CrystalReplayBuffer():
                 if len(data_list) > 0:
                     self.dataset.extend(list(data_list))
                     self.x = torch.cat([self.x, new_x[new_x_inds_to_keep]], dim=0)
+                    print(f"x size (MB): {self.x.element_size() * self.x.nelement() / 1e6:.2f}")
+
                     self.scores_np_list.extend(
                         list(self.energy_function.prebuilt_sample_to_reward(
                             data_list,
@@ -70,7 +74,17 @@ class CrystalReplayBuffer():
 
                 self.dataset = [self.dataset[ind] for ind in inds_to_keep]
                 self.scores_np_list = [self.scores_np_list[ind] for ind in inds_to_keep]
-                self.x = self.x[torch.tensor(inds_to_keep,dtype=torch.long)]
+
+                self.x = self.x[torch.tensor(inds_to_keep, dtype=torch.long)]
+            print(f"x size (MB): {self.x.element_size() * self.x.nelement() / 1e6:.2f}")
+            print(f"Data sample size: {sum(sys.getsizeof(d) for d in data_list)}")
+            total_bytes = 0
+            for i, s in enumerate(self.scores_np_list):
+                if isinstance(s, np.ndarray):
+                    total_bytes += s.nbytes
+                else:
+                    total_bytes += sys.getsizeof(s)
+            print(f"Scores list total size: {total_bytes / 1e6:.2f} MB")
 
         gc.collect()
 
@@ -87,7 +101,7 @@ class CrystalReplayBuffer():
                                 p=self.get_sampler_weights())
         return inds
 
-    def get_sampler_weights(self, eps: float=1e-6):
+    def get_sampler_weights(self, eps: float = 1e-6):
         scores = np.array(self.scores_np_list)
         if self.prioritized == 'rank':
             ranks = np.argsort(np.argsort(-1 * scores))
