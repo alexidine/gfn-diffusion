@@ -344,14 +344,31 @@ def init_buffers_datasets(energy_function):
     # load dataset of just molecules
     # mols_list = torch.load(args.molecules_path)
     # good_mol = mols_list[17]  # a nice molecule
-    atom_coords = torch.tensor([  # stick with urea for just now
-        [-1.3042, - 0.0008, 0.0001],
-        [0.6903, - 1.1479, 0.0001],
-        [0.6888, 1.1489, 0.0001],
-        [- 0.0749, - 0.0001, - 0.0003],
-    ], dtype=torch.float32, device='cpu')
-    atom_coords -= atom_coords.mean(0)
-    atom_types = torch.tensor([8, 7, 7, 6], dtype=torch.long, device='cpu')
+    if args.molecule == 'urea':
+        atom_coords = torch.tensor([  # stick with urea for just now
+            [-1.3042, - 0.0008, 0.0001],
+            [0.6903, - 1.1479, 0.0001],
+            [0.6888, 1.1489, 0.0001],
+            [- 0.0749, - 0.0001, - 0.0003],
+        ], dtype=torch.float32, device='cpu')
+        atom_coords -= atom_coords.mean(0)
+        atom_types = torch.tensor([8, 7, 7, 6], dtype=torch.long, device='cpu')
+    elif args.molecule == 'nicotinamide':
+        atom_coords = torch.tensor([
+            [-2.3940, 1.1116, -0.0088],
+            [1.7614, -1.2284, -0.0034],
+            [-2.4052, -1.1814, 0.0027],
+            [-0.2969, 0.0397, 0.0024],
+            [0.4261, 1.2273, 0.0039],
+            [0.4117, -1.1510, -0.0013],
+            [1.8161, 1.1886, 0.0018],
+            [-1.7494, 0.0472, 0.0045],
+            [2.4302, -0.0535, -0.0018]
+        ], dtype=torch.float32, device='cpu')
+        atom_coords -= atom_coords.mean(dim=0)
+        atom_types = torch.tensor([8, 7, 7, 6, 6, 6, 6, 6, 6], dtype=torch.long, device='cpu')
+    else:
+        assert False
     good_mol = MolData(
         z=atom_types,
         pos=atom_coords,
