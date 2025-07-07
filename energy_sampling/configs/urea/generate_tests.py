@@ -209,8 +209,8 @@ tags.extend(new_tags)
 
 new_base = \
     {'lr_policy': 0.001,
-     'lr_back': 0.0001,
-     'lr_flow': 0.01,
+     'lr_back': 0.001,
+     'lr_flow': 0.1,
      'lr_anneal_time': 10000,
      'energy_function': 'silu_energy',
      'energy_static_temperature': 1,
@@ -286,7 +286,33 @@ for tag in new_tags:
 
     config_list.append(cc)
 
+"""
+General notes
+-: forward loss crazy noisy. Losses in general quite noisy. Possibly split LR is not good
+-: log Z training lags way behind
 
+21_baseline
+22_tb_greedy
+23_vg_greedy
+24_cond_vg
+25_traj_norm
+26_low_var
+27_big_model
+28_high_var_range
+29_low_var_range
+30_high_pb_range
+31_pre_baseline
+32_pre_tb_greedy
+33_pre_vg_greedy
+34_pre_cond_vg
+35_pre_traj_norm
+36_pre_low_var
+37_pre_big_model
+38_pre_high_var_range
+39_pre_low_var_range
+40_pre_high_pb_range
+
+"""
 
 ind = 0
 for ix1 in range(len(config_list)):

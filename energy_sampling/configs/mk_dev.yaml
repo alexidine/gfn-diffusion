@@ -45,10 +45,10 @@ t_scale: 1.0                 # scales fixed forward policy variance
 log_var_range: 4.0           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
 pb_scale_range: 0.1          # range of learned backward policy corrections, only for 'brownian_bridge'
 energy: "molecular_crystal"  # "molecular_crystal"
-mode_fwd: "greedy"           # "tb" is trajectory balance, "vg" is VarGrad, "greedy" is a local greed + gradients, "tb_greedy", "vg_greedy" are combinations
+mode_fwd: "tb"           # "tb" is trajectory balance, "vg" is VarGrad, "greedy" is a local greed + gradients, "tb_greedy", "vg_greedy" are combinations
 mode_bwd: "tb"               # "tb" is trajectory balance, "vg" is VarGrad
 repeats: 10                   # for conditional VarGrad training
-both_ways: false             # forward and backward training
+both_ways: true             # forward and backward training
 bwd_batch_multiplier: 10      # ratio of backward to foward batch size (much cheaper to evaluate)
 fwd_train_each: 2   # todo change the logic on this so I don't screw it up again       # on which multiples of training iter to train the fwd train model instead of bwd
 bwd: false                   # backward training only

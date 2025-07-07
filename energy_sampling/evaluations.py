@@ -123,17 +123,19 @@ def eval_step(energy_function,
 def generate_fwd_figs(buffer, energy_function,
                       condition, flow_states, gfn_model, init_state, log_fs, log_pbs,
                       log_pfs, log_r, f_vars_f, f_means_f, f_vars_b, f_means_b, sample_batch):
-    buffer_cell_params, buffer_latent_params, buffer_std_params_for_embedding = get_buffer_stats(buffer)
+    buffer_cell_params, buffer_latent_params, buffer_std_params, buffer_reward, buffer_batch = get_buffer_stats(buffer)
 
     fig_dict = {}
-    fig_dict['Learned Z vs T'] = Z_vs_T_fig(gfn_model, init_state)
-    fig_dict['T vs Energy'] = T_vs_E_fig(condition, sample_batch)
+    conditional = len(condition.unique()) != 1
+    if conditional:
+        fig_dict['Learned Z vs T'] = Z_vs_T_fig(gfn_model, init_state)
+        fig_dict['T vs Energy'] = T_vs_E_fig(condition, sample_batch)
     fig_dict['Forward Gauss Params'] = mean_var_fig(f_vars_f, f_means_f,
                                                     f_vars_b, f_means_b)
     fig_dict['Traj Mean Step Sizes'] = mean_flow_step_sizes(flow_states)
     fig_dict['Pf vs Pb'] = Pf_vs_Pb_fig(log_pfs, log_pbs, log_r)
     fig_dict['TB Parity Plot'], fig_dict['Forward TB R Value'] = flow_parity_plot(log_r, log_fs[:, 0], log_pbs, log_pfs)
-    fig_dict['VG Error'] = vargrad_error(log_r, log_pbs, log_pfs)
+    fig_dict['VG Error'] = vargrad_error(log_r, log_pbs, log_pfs)  # todo tune this up for conditional modelling
     fig_dict['Lattice Latents Trajectories'] = visualize_latent_trajs(flow_states.cpu().detach().numpy(),
                                                                       20,
                                                                       log_r.cpu().detach().numpy())
@@ -141,7 +143,7 @@ def generate_fwd_figs(buffer, energy_function,
     fig_dict['Lattice Latents Distribution'] = simple_latent_hist(sample_batch, buffer_latent_params)
     fig_dict['Sample Scatter'] = simple_cell_scatter_fig(
         sample_batch,
-        (condition[:,0].cpu().detach().numpy()) if condition is not None else None,
+        (condition[:, 0].cpu().detach().numpy()) if condition is not None else None,
         aux_scalar_name='log_temperature' if condition is not None else None)
 
     std_cell_params = sample_batch.cell_params_to_gen_basis().cpu().detach()
@@ -164,11 +166,89 @@ def generate_fwd_figs(buffer, energy_function,
 
     fig_dict['Sample Embedding'] = simple_embedding_fig(std_cell_params.numpy(),
                                                         aux_array=sample_batch.gfn_energy.cpu().detach().numpy(),
-                                                        reference_distribution=buffer_std_params_for_embedding,
+                                                        reference_distribution=buffer_std_params,
                                                         known_minima=known_modes_std.numpy() if known_modes is not None else None
                                                         )
 
     return fig_dict
+
+#
+# from scipy.spatial.distance import cdist
+# X = buffer_std_params
+# energies = -buffer_reward.cpu().detach().numpy()
+#
+# """
+# cluster generation
+# """
+# k = 10000
+# min_dist = 5.0
+# energy_cutoff = -3
+#
+# idx_sorted = np.argsort(energies)
+# anchors = []
+# anchor_indices = []
+#
+# for idx in idx_sorted:
+#     candidate = X[idx]
+#     if energies[idx] > energy_cutoff:
+#         break
+#     if len(anchors) == 0:
+#         anchors.append(candidate)
+#         anchor_indices.append(idx)
+#     else:
+#         dists = cdist([candidate], anchors)
+#         if np.min(dists) >= min_dist:
+#             anchors.append(candidate)
+#             anchor_indices.append(idx)
+#     if len(anchors) >= k:
+#         break
+#
+# """
+# cluster assignment
+# """
+# dists = cdist(X, anchors)  # shape (N_samples, N_anchors)
+# cluster_ind = np.argmin(dists, axis=1)
+#
+# import umap
+# reducer = umap.UMAP(n_components=2, n_neighbors=30, min_dist=0.05)
+# reducer.fit(anchors)  # Learn manifold from anchors
+# embedding = reducer.transform(X)  # Project full dataset
+# anchor_embedding = reducer.transform(anchors)
+#
+# color_array = cluster_ind
+# fig = go.Figure()
+#
+# fig.add_trace(go.Scattergl(x=embedding[:, 0],
+#                            y=embedding[:, 1],
+#                            mode='markers',
+#                            opacity=0.85,
+#                            name='Policy Samples',
+#                            showlegend=True,
+#                            marker=dict(
+#                                size=6,
+#                                color=color_array,
+#                                colorscale="portland",
+#                                colorbar=dict(title="Cluster Membership")
+#                            )
+#                            ))
+#
+# fig.add_trace(go.Scattergl(x=anchor_embedding[:, 0],
+#                            y=anchor_embedding[:, 1],
+#                            mode='markers',
+#                            opacity=1,
+#                            name='Known Modes',
+#                            showlegend=True,
+#                            marker=dict(
+#                                size=15,
+#                                color='green',  # Fill color
+#                                line=dict(
+#                                    color='black',  # Outline color
+#                                    width=4  # Outline thickness
+#                                )
+#                            )
+#                            ))
+#
+# fig.show()
 
 
 def generate_bwd_figs(fig_dict, buffer, gfn_model, init_state, discretizer):
@@ -196,14 +276,16 @@ def generate_bwd_figs(fig_dict, buffer, gfn_model, init_state, discretizer):
 def get_buffer_stats(buffer):
     if len(buffer) > 0:
         # take samples according to the sampler weighting, rather than random trash in the buffer
-        buffer_latent_params, buffer_reward, buffer_batch = buffer.sample(temperature=torch.ones(10000),
-                                                                          override_batch=10000)
+        buffer_latent_params, buffer_reward, buffer_batch = buffer.sample(
+            temperature=torch.ones(10000), override_batch=10000)
         buffer_cell_params = buffer_batch.cell_parameters().cpu().detach().numpy()
         buffer_latent_params = buffer_batch.cell_params_to_gen_basis().cpu().detach().numpy()
         buffer_std_params_for_embedding = buffer_batch.cell_params_to_gen_basis().cpu().detach().numpy()
+        reward = buffer_reward.cpu().detach().numpy()
+        batch = batch.cpu().detach()
     else:
-        buffer_cell_params, buffer_latent_params, buffer_std_params_for_embedding = None, None, None
-    return buffer_cell_params, buffer_latent_params, buffer_std_params_for_embedding
+        buffer_cell_params, buffer_latent_params, buffer_std_params_for_embedding, buffer_reward, buffer_stats = None, None, None, None, None
+    return buffer_cell_params, buffer_latent_params, buffer_std_params_for_embedding, reward, batch
 
 
 def mean_var_fig(logvars_f, means_f, logvars_b, means_b):
