@@ -1,0 +1,20 @@
+defaults:
+  base: base.yaml
+
+experiments:
+  - tag: 0_big_model_low_var
+    update:
+      joint_layers: 8
+      hidden_dim: 512
+      s_emb_dim: 512
+      norm: layer
+      dropout: 0.5
+      t_scale: 0.5
+    notes: large model, narrow prior
+
+  - tag: 1_learn_pb_temp_cond
+    update:
+      learn_pb: true
+      conditional_flow_model: true
+      temperature_conditioning: true
+    notes: learning pb under temp conditioning

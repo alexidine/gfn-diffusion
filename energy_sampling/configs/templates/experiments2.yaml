@@ -1,0 +1,33 @@
+defaults:
+  base: base.yaml
+
+grid:
+  direction: [fwd, fwd-bwd, fwd-bwd-preload]
+  model: [baseline, big_model]
+  variance: [default, low_var, high_var]
+
+presets:
+  baseline: {}
+  big_model:
+    joint_layers: 8
+    hidden_dim: 512
+    s_emb_dim: 512
+    norm: layer
+    dropout: 0.5
+  low_var:
+    t_scale: 0.5
+  high_var:
+    t_scale: 1.5
+
+# per-value overrides for specific grid axes
+grid_overrides:
+  direction:
+    fwd:
+      both_ways: false
+      buffer_path: null
+    fwd-bwd:
+      both_ways: true
+      buffer_path: null
+    fwd-bwd-preload:
+      both_ways: true
+      buffer_path: /scratch/urea_gfn_dataset.pt
