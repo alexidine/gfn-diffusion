@@ -197,7 +197,9 @@ def train():
 
     wandb.watch(gfn_model, log_graph=True, log_freq=1000)  # for gradient logging
 
-    forward_optimizer, backward_optimizer, fwd_scheduler1, fwd_scheduler2, bwd_scheduler1, bwd_scheduler2 = init_schedulers_optimizers(
+    (forward_optimizer, backward_optimizer,
+     fwd_scheduler1, fwd_scheduler2,
+     bwd_scheduler1, bwd_scheduler2) = init_schedulers_optimizers(
         gfn_model)
     buffer, mol_loader = init_buffers_datasets(energy_function)
 

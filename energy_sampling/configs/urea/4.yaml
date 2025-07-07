@@ -74,7 +74,7 @@ pis_architectures: false
 prioritized: boltzmann
 rank_weight: 1.0
 repeats: 10
-reweight_T: null
+reweight_T: 1
 run_name: urea_4_fwd_norm_traj
 s_emb_dim: 128
 samples_per_opt: 10

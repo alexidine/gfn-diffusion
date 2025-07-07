@@ -207,12 +207,12 @@ def get_buffer_stats(buffer):
 
 
 def mean_var_fig(logvars_f, means_f, logvars_b, means_b):
-    fig = go.Figure()
-    fig.add_scatter(y=np.nan_to_num(torch.exp(logvars_f).mean(0).cpu().detach().numpy()), name='Pf Var')
-    fig.add_scatter(y=np.nan_to_num(means_f.abs().mean(0).cpu().detach().numpy()), name='Pf Mean')
-    fig.add_scatter(y=np.nan_to_num(torch.exp(logvars_b).mean(0).cpu().detach().numpy()), name='Pb Var')
-    fig.add_scatter(y=np.nan_to_num(means_b.abs().mean(0).cpu().detach().numpy()), name='Pb Mean')
-    fig.update_layout(xaxis_title='Trajectory Step')
+    fig = make_subplots(rows=2,cols=1)
+    fig.add_scatter(y=np.nan_to_num(torch.exp(logvars_f).mean(0).cpu().detach().numpy()), name='Pf Var', row=2, col=1)
+    fig.add_scatter(y=np.nan_to_num(means_f.abs().mean(0).cpu().detach().numpy()), name='Pf Mean', row=1,col=1)
+    fig.add_scatter(y=np.nan_to_num(torch.exp(logvars_b).mean(0).cpu().detach().numpy()), name='Pb Var', row=2,col=1)
+    fig.add_scatter(y=np.nan_to_num(means_b.abs().mean(0).cpu().detach().numpy()), name='Pb Mean',row=1, col=1)
+    fig.update_layout(xaxis2_title='Trajectory Step')
     return fig
 
 

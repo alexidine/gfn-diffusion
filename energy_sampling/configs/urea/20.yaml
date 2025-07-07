@@ -63,7 +63,7 @@ max_iter_ls: 100
 max_traj_length: 15
 min_lr: 1.0e-06
 min_traj_length: 10
-mode_bwd: tb
+mode_bwd: vg
 mode_fwd: vg
 molecule: urea
 molecules_path: /scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt

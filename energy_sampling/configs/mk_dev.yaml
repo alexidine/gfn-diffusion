@@ -1,7 +1,7 @@
 run_name: 'mk_local_dev'
 seed: 12345
 device: 'cuda'
-lr_policy: 0.0001              # learning rate of the policy network
+lr_policy: 0.001              # learning rate of the policy network
 min_lr: 1.0e-6                # ihn
 lr_flow: 0.1                  # learning rate of the flow network
 lr_back: 0.0001                # learning rate of the backward pass
@@ -11,48 +11,48 @@ lr_anneal_time: 10000
 weight_decay: 1e-7
 use_weight_decay: false
 gradient_norm_clip: 1.0        # gradient norm clip for updating gfn model weights
-reweight_T: 100                # smaller values reduce the impact of outlier samples
+reweight_T: 10                # smaller values reduce the impact of outlier samples
 
 # model parameters
 zero_init: true
-joint_layers: 2              # number of layers in forward/backward policy models
-hidden_dim: 64              # dimensionality of hidden layer
-s_emb_dim: 64                # dimensionality of state embedding
+joint_layers: 4              # number of layers in forward/backward policy models
+hidden_dim: 256              # dimensionality of hidden layer
+s_emb_dim: 256                # dimensionality of state embedding
 t_emb_dim: 32                # dimensionality of time embedding
 harmonics_dim: 64            # dimensionality of harmonic embedding
 condition_emb_dim: 32         # dimensionality of the conditioning embedding
 dropout: 0                   # dropout probability
-norm: null                   # null, "layer", "batch"
+norm: 'layer'                   # null, "layer", "batch"
 
 batch_size: 10               # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
 max_batch_size: 100           # maximum batch size to allow
 eval_batch_size: 250        # batch size for evaluation
 epochs: 1000000             # number of training epochs: relatively large
-eval_period: 50              # how often to do evaluation & reporting
+eval_period: 100              # how often to do evaluation & reporting
 figs_period: 100             # how often to log custom figrues  # must be multiple of eval_period or it won't fire
-buffer_size: 2000          # size of replay buffer: relatively large
+buffer_size: 25000          # size of replay buffer: relatively large
 
 # GFlowNet settings
-T: 10                        # static training diffusion length
+T: 5                        # static training diffusion length
 eval_T: 100                  # diffusion trajectory length for inference
-min_traj_length: 10
-max_traj_length: 15
-traj_length_strategy: sampled # 'static'  or 'sampled'  will do random between min and max traj lengths
+min_traj_length: 5
+max_traj_length: 5
+traj_length_strategy: static # 'static'  or 'sampled'  will do random between min and max traj lengths
 discretizer_max_ratio: 10    # maximum ratio between randomly sampled step sizes
 discretizer: 'random'        # 'random' 'low_discrepancy' 'equidistant' 'uniform'
 t_scale: 1.0                 # scales fixed forward policy variance
-log_var_range: 1.0           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
+log_var_range: 4.0           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
 pb_scale_range: 0.1          # range of learned backward policy corrections, only for 'brownian_bridge'
 energy: "molecular_crystal"  # "molecular_crystal"
-mode_fwd: "tb_greedy"           # "tb" is trajectory balance, "vg" is VarGrad, "greedy" is a local greed + gradients, "tb_greedy", "vg_greedy" are combinations
+mode_fwd: "greedy"           # "tb" is trajectory balance, "vg" is VarGrad, "greedy" is a local greed + gradients, "tb_greedy", "vg_greedy" are combinations
 mode_bwd: "tb"               # "tb" is trajectory balance, "vg" is VarGrad
-repeats: 5                   # for conditional VarGrad training
+repeats: 10                   # for conditional VarGrad training
 both_ways: false             # forward and backward training
-bwd_batch_multiplier: 5      # ratio of backward to foward batch size (much cheaper to evaluate)
-fwd_train_each: 2            # on which multiples of training iter to train the fwd train model instead of bwd
+bwd_batch_multiplier: 10      # ratio of backward to foward batch size (much cheaper to evaluate)
+fwd_train_each: 2   # todo change the logic on this so I don't screw it up again       # on which multiples of training iter to train the fwd train model instead of bwd
 bwd: false                   # backward training only
-learn_pb: false               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
+learn_pb: true               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
 conditional_flow_model: false #  conditional training (currently doing temperature)
 learned_variance: true       # whether to learn policy variance
 clipping: true  # clip the maximumstep size induced by the policy model
@@ -93,7 +93,7 @@ energy_function: silu_energy
   # 'ellipsoid_overlap' : minimize ellipsoid overlaps subject to energy_density_coeff external pressure
   # 'silu_energy' : minimize a softened LJ-tye energy subject to energy_density_coeff external pressure
 anneal_energy: false  # scale temperature over time, when conditional it scales the distribution, when not it just decreases from static to min
-energy_density_coeff: 10.0  # how much to weight the density penalty term in the energy function
+energy_density_coeff: 2.0  # how much to weight the density penalty term in the energy function
 temperature_conditioning: false  # if false, temperatures are set to energy_static_temperature, and there is no annealing
 energy_min_temperature: 0.01
 energy_max_temperature: 1

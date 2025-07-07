@@ -83,7 +83,7 @@ scheduler: true
 seed: 12345
 subtb_lambda: 2
 t_emb_dim: 32
-t_scale: 1.0
+t_scale: 0.5
 target_acceptance_rate: 0.574
 temperature_conditioning: false
 temperature_scaling_factor: 0.01

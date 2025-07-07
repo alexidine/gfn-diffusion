@@ -186,7 +186,7 @@ def fwd_tb_greedy(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
     log_pb = log_pbs.sum(-1)
     log_flow = log_fs[:, 0]
 
-    tb = (log_pf + log_flow - log_pb - log_r)
+    tb = (log_pf + log_flow - log_pb - log_r.detach())
     tb_loss = F.mse_loss(tb, torch.zeros_like(tb), reduction='none')
 
     loss = tb_loss + greedy_loss
@@ -213,7 +213,7 @@ def fwd_vg_greedy(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
 
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
-    log_ratio = log_r + log_pb - log_pf
+    log_ratio = log_r.detach() + log_pb - log_pf
 
     if gfn.conditional_flow_model:
         # reshape and take the mean over repeats
@@ -234,6 +234,7 @@ def fwd_vg_greedy(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
         return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
     else:
         return loss
+
 
 def bwd_tb(terminal_state, gfn, log_r, discretizer, condition=None, return_exp: bool = False):
     states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, discretizer, condition)
