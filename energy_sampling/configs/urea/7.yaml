@@ -21,7 +21,7 @@ dropout: 0.5
 energy: molecular_crystal
 energy_annealing_threshold: 0.1
 energy_clip: 20
-energy_density_coeff: 5.0
+energy_density_coeff: 2.0
 energy_function: silu_energy
 energy_max_temperature: 1
 energy_min_temperature: 0.01
@@ -46,8 +46,8 @@ langevin: false
 langevin_scaling_per_dimension: false
 ld_schedule: true
 ld_step: 0.1
-learn_pb: true
-learned_variance: true
+learn_pb: false
+learned_variance: false
 lgv_clip: 100.0
 lgv_layers: 4
 local_search: false
@@ -64,7 +64,7 @@ max_traj_length: 15
 min_lr: 1.0e-06
 min_traj_length: 10
 mode_bwd: tb
-mode_fwd: tb_greedy
+mode_fwd: tb
 molecule: urea
 molecules_path: /scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt
 norm: layer
@@ -75,7 +75,7 @@ prioritized: boltzmann
 rank_weight: 1.0
 repeats: 10
 reweight_T: null
-run_name: urea_7
+run_name: urea_7_fwd-bwd_big_model
 s_emb_dim: 512
 samples_per_opt: 10
 sampling: buffer

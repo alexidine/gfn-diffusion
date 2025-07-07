@@ -62,7 +62,7 @@ base_config.update({'energy_function': 'silu_energy',
                     'mode_bwd': 'tb',
                     'both_ways': False,
                     'buffer_path': None,
-                    'energy_density_coeff': 5.0,
+                    'energy_density_coeff': 2.0,
                     'exploratory': True,
                     'exploration_factor': 0.35,
                     'exploration_wd': True,
@@ -84,6 +84,7 @@ base_config.update({'energy_function': 'silu_energy',
                     'reweight_T': None})
 
 config_list = []
+tags = []
 """
 to-test
 
@@ -96,21 +97,21 @@ to-test
 - greedy alternating
 - temperature conditioning
 """
-
+ind = 0
 for direction in ['fwd', 'fwd-bwd', 'fwd-bwd-preload']:
-    cc = base_config.copy()
-    if direction == 'fwd':
-        cc['both_ways'] = False
-        cc['buffer_path'] = None
-    elif direction == 'fwd-bwd':
-        cc['both_ways'] = True
-        cc['buffer_path'] = None
-    elif direction == 'fwd-bwd-preload':
-        cc['both_ways'] = True
-        cc['buffer_path'] = '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt'
-
     for special in ['big_model', 'learn_pb', 'learn_variance',
                     'low_variance', 'norm_traj', 'greedy', 'temp_cond']:
+        cc = {}
+
+        if direction == 'fwd':
+            cc['both_ways'] = False
+            cc['buffer_path'] = None
+        elif direction == 'fwd-bwd':
+            cc['both_ways'] = True
+            cc['buffer_path'] = None
+        elif direction == 'fwd-bwd-preload':
+            cc['both_ways'] = True
+            cc['buffer_path'] = '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt'
         if special == 'big_model':
             cc['joint_layers'] = 8
             cc['hidden_dim'] = 512
@@ -135,16 +136,44 @@ for direction in ['fwd', 'fwd-bwd', 'fwd-bwd-preload']:
             cc['reweight_T'] = 10
 
         config_list.append(cc)
+        tag = f"{ind}_{direction}_{special}"
+        tags.append(tag)
+        print(tag)
+        ind += 1
+"""
 
 
+0 fwd big_model - too dense, but nice dists. Not sharp at all
+1 fwd learn_pb  - very slightly better
+2 fwd learn_variance - similar
+3 fwd low_variance - similar !! did not have a lower variance, actually
+4 fwd norm_traj - similar
+5 fwd greedy
+6 fwd temp_cond
+7 fwd-bwd big_model
+8 fwd-bwd learn_pb
+9 fwd-bwd learn_variance
+10 fwd-bwd low_variance
+11 fwd-bwd norm_traj
+12 fwd-bwd greedy
+13 fwd-bwd temp_cond
+14 fwd-bwd-preload big_model
+15 fwd-bwd-preload learn_pb
+16 fwd-bwd-preload learn_variance
+17 fwd-bwd-preload low_variance
+18 fwd-bwd-preload norm_traj
+19 fwd-bwd-preload greedy
+20 fwd-bwd-preload temp_cond
+
+"""
 
 
 ind = 0
 for ix1 in range(len(config_list)):
     config = copy(base_config)
+    config['run_name'] = config['run_name'] + '_' + tags[ix1]
 
     run_config = config_list[ix1]
-    run_config['run_name'] = config['run_name'] + '_' + str(ind)
 
     overwrite_nested_dict(config, run_config)
 
