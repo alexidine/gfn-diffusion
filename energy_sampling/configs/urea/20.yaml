@@ -1,5 +1,5 @@
 T: 10
-anneal_energy: false
+anneal_energy: true
 annealing_max_steps: 5000
 batch_size: 25
 beta: 0.1
@@ -12,7 +12,7 @@ bwd_batch_multiplier: 5
 bwd_policy: brownian_bridge
 clipping: true
 condition_emb_dim: 32
-conditional_flow_model: false
+conditional_flow_model: true
 convergence_history: 100
 device: cuda
 discretizer: random
@@ -64,7 +64,7 @@ max_traj_length: 15
 min_lr: 1.0e-06
 min_traj_length: 10
 mode_bwd: tb
-mode_fwd: tb
+mode_fwd: vg
 molecule: urea
 molecules_path: /scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt
 norm: null
@@ -74,7 +74,7 @@ pis_architectures: false
 prioritized: boltzmann
 rank_weight: 1.0
 repeats: 10
-reweight_T: null
+reweight_T: 10
 run_name: urea_20_fwd-bwd-preload_temp_cond
 s_emb_dim: 128
 samples_per_opt: 10
@@ -85,7 +85,7 @@ subtb_lambda: 2
 t_emb_dim: 32
 t_scale: 1.0
 target_acceptance_rate: 0.574
-temperature_conditioning: false
+temperature_conditioning: true
 temperature_scaling_factor: 0.01
 traj_length_strategy: sampled
 use_weight_decay: false

@@ -112,6 +112,7 @@ for direction in ['fwd', 'fwd-bwd', 'fwd-bwd-preload']:
         elif direction == 'fwd-bwd-preload':
             cc['both_ways'] = True
             cc['buffer_path'] = '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt'
+
         if special == 'big_model':
             cc['joint_layers'] = 8
             cc['hidden_dim'] = 512
@@ -128,7 +129,7 @@ for direction in ['fwd', 'fwd-bwd', 'fwd-bwd-preload']:
             cc['reweight_T'] = 1
         elif special == 'greedy':
             cc['mode_fwd'] = 'tb_greedy'
-        elif special == ['temp_cond']:
+        elif special == 'temp_cond':
             cc['mode_fwd'] = 'vg'
             cc['conditional_flow_model'] = True
             cc['anneal_energy'] = True
