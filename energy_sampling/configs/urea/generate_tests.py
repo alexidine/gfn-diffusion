@@ -142,9 +142,10 @@ for direction in ['fwd', 'fwd-bwd', 'fwd-bwd-preload']:
 ind = 0
 for ix1 in range(len(config_list)):
     config = copy(base_config)
-    config['run_name'] = config['run_name'] + '_' + str(ind)
 
     run_config = config_list[ix1]
+    run_config['run_name'] = config['run_name'] + '_' + str(ind)
+
     overwrite_nested_dict(config, run_config)
 
     with open(str(ind) + '.yaml', 'w') as outfile:

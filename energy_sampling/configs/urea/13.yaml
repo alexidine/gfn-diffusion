@@ -75,7 +75,7 @@ prioritized: boltzmann
 rank_weight: 1.0
 repeats: 10
 reweight_T: null
-run_name: urea
+run_name: urea_13
 s_emb_dim: 512
 samples_per_opt: 10
 sampling: buffer
