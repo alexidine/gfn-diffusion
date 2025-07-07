@@ -1,6 +1,7 @@
 import gc
 import os
 from time import time
+from typing import Optional
 
 import numpy as np
 import plotly.graph_objects as go
@@ -70,9 +71,9 @@ def train_step(energy_function, gfn_model,
                                                                                       mol_batch,
                                                                                       return_exp=True,
                                                                                       repeats=repeats,
+                                                                                      reweight_T=args.reweight_T
                                                                                       )
         if add_to_buffer:
-            print("Adding to buffer!")
             buffer.add(crystal_batch.cpu().detach().to_data_list())
 
     elif do_backward:
@@ -82,7 +83,8 @@ def train_step(energy_function, gfn_model,
                                                                        buffer,
                                                                        exploration_std,
                                                                        repeats=repeats,
-                                                                       return_exp=True)
+                                                                       return_exp=True,
+                                                                       reweight_T=args.reweight_T)
     else:
         assert False
 
@@ -121,7 +123,7 @@ def get_discretizer(discretization_type):
 
 
 def fwd_train_step(energy_function, gfn_model, discretizer, exploration_std, mol_batch, return_exp=False,
-                   repeats: int = 10):
+                   repeats: int = 10, reweight_T: Optional[float] = None):
     init_state = get_gfn_init_state(args.batch_size, energy_function.data_ndim, device)
     condition = energy_function.get_conditioning_tensor(mol_batch)
     return get_gfn_forward_loss(args.mode_fwd,
@@ -133,10 +135,12 @@ def fwd_train_step(energy_function, gfn_model, discretizer, exploration_std, mol
                                 exploration_std=exploration_std,
                                 return_exp=return_exp,
                                 condition=condition,
-                                repeats=repeats)
+                                repeats=repeats,
+                                reweight_T=reweight_T)
 
 
-def bwd_train_step(gfn_model, discretizer, buffer, exploration_std=None, repeats: int = 10, return_exp=False):
+def bwd_train_step(gfn_model, discretizer, buffer, exploration_std=None, repeats: int = 10,
+                   return_exp=False, reweight_T: Optional[float] = None):
     if args.sampling == 'buffer':
         samples, rewards, crystal_batch, condition = buffer.sample(
             return_conditioning=True,
@@ -152,7 +156,8 @@ def bwd_train_step(gfn_model, discretizer, buffer, exploration_std=None, repeats
                                  exploration_std=exploration_std,
                                  condition=condition.to(device),
                                  repeats=repeats,
-                                 return_exp=return_exp)
+                                 return_exp=return_exp,
+                                 reweight_T=reweight_T)
 
 
 def train():

@@ -232,7 +232,7 @@ config_list.append(
      'lr_anneal_time': 20000,
      'max_batch_size': 2000,
      'buffer_size': 50000,
-     }  # 5 - new baseline
+     }  # 5 - new baseline - 6 pinned dims, low Z, low density, moderate overlaps
 )
 config_list.append(
     {'energy_function': 'ellipsoid_overlap',
@@ -266,7 +266,7 @@ config_list.append(
      'lr_anneal_time': 20000,
      'max_batch_size': 2000,
      'buffer_size': 50000,
-     }  # 6 - with dropout
+     }  # 6 - with dropout - almost identical, maybe slightly better
 )
 config_list.append(
     {'energy_function': 'ellipsoid_overlap',
@@ -300,7 +300,7 @@ config_list.append(
      'lr_anneal_time': 20000,
      'max_batch_size': 2000,
      'buffer_size': 50000,
-     }  # 7 - lo-hi variance
+     }  # 7 - lo-hi variance - slower & worse convergence, similar otherwise
 )
 config_list.append(
     {'energy_function': 'ellipsoid_overlap',
@@ -334,7 +334,8 @@ config_list.append(
      'lr_anneal_time': 20000,
      'max_batch_size': 2000,
      'buffer_size': 50000,
-     }  # 8 - both ways
+     }  # 8 - both ways - longer & better convergence (stilli mproving. Better energies & densities. Lower LogZ, interestingly.
+ # Worse R. Same 6 pinned dims - they are also pinned in the buffer so they might just be the optima.
 )
 config_list.append(
     {'energy_function': 'ellipsoid_overlap',
@@ -368,7 +369,7 @@ config_list.append(
      'lr_anneal_time': 20000,
      'max_batch_size': 2000,
      'buffer_size': 50000,
-     }  # 9 - pure tb
+     }  # 9 - pure tb - lower loss, identical metrics
 )
 config_list.append(
     {'energy_function': 'ellipsoid_overlap',
@@ -402,7 +403,7 @@ config_list.append(
      'lr_anneal_time': 20000,
      'max_batch_size': 2000,
      'buffer_size': 50000,
-     }  # 10 - pure vg
+     }  # 10 - pure vg - lower loss,identical metrics
 )
 config_list.append(
     {'energy_function': 'ellipsoid_overlap',
@@ -436,7 +437,7 @@ config_list.append(
      'lr_anneal_time': 20000,
      'max_batch_size': 2000,
      'buffer_size': 50000,
-     }  # 11 - learnable pb mean
+     }  # 11 - learnable pb mean - very similar - might be bugged actually
 )
 config_list.append(
     {'energy_function': 'ellipsoid_overlap',
@@ -470,7 +471,7 @@ config_list.append(
      'lr_anneal_time': 20000,
      'max_batch_size': 2000,
      'buffer_size': 50000,
-     }  # 12 - learnable pb mean both ways
+     }  # 12 - learnable pb mean both ways - also may be bugged Pb. Similar to prior both_ways very good
 )
 config_list.append(
     {'energy_function': 'ellipsoid_overlap',
@@ -504,7 +505,7 @@ config_list.append(
      'lr_anneal_time': 20000,
      'max_batch_size': 2000,
      'buffer_size': 50000,
-     }  # 13 - forward very small learnable variance
+     }  # 13 - forward very small learnable variance - almost identical
 )
 config_list.append(
     {'energy_function': 'ellipsoid_overlap',
@@ -538,7 +539,7 @@ config_list.append(
      'lr_anneal_time': 20000,
      'max_batch_size': 2000,
      'buffer_size': 50000,
-     }  # 14 - forward and backward small learnable variance
+     }  # 14 - forward and backward small learnable variance - almost slightly better energy
 )
 config_list.append(
     {'energy_function': 'ellipsoid_overlap',
@@ -572,7 +573,7 @@ config_list.append(
      'lr_anneal_time': 20000,
      'max_batch_size': 2000,
      'buffer_size': 50000,
-     }  # 15 - forward and backward small learnable variance both ways
+     }  # 15 - forward and backward small learnable variance both ways - both_ways still a winner
 )
 
 config_list.append(
@@ -607,7 +608,7 @@ config_list.append(
      'lr_anneal_time': 20000,
      'max_batch_size': 2000,
      'buffer_size': 50000,
-     }  # 16 - small max ratio
+     }  # 16 - small max ratio - almost identical
 )
 config_list.append(
     {'energy_function': 'ellipsoid_overlap',
@@ -641,7 +642,7 @@ config_list.append(
      'lr_anneal_time': 20000,
      'max_batch_size': 2000,
      'buffer_size': 50000,
-     }  # 17 - bit higher density coeff
+     }  # 17 - bit higher density coeff - bit denser, higher overlaps
 )
 config_list.append(
     {'energy_function': 'ellipsoid_overlap',
@@ -675,7 +676,7 @@ config_list.append(
      'lr_anneal_time': 20000,
      'max_batch_size': 2000,
      'buffer_size': 50000,
-     }  # 18 - bit lower density coeff
+     }  # 18 - bit lower density coeff - crashed out very early from wacky numerical
 )
 config_list.append(
     {'energy_function': 'ellipsoid_overlap',
@@ -709,8 +710,19 @@ config_list.append(
      'lr_anneal_time': 20000,
      'max_batch_size': 2000,
      'buffer_size': 50000,
-     }  # 19 - really small model
+     }  # 19 - really small model - bit worse
 )
+
+
+"""
+takeaways
+both_ways is good
+Jury is out on variances
+terminal params are jumpy
+backwards training appears bugged
+vg vs tb doesn't seem to do much here
+learned Z still showing up correctly in VG training is a red flag
+"""
 
 
 def overwrite_nested_dict(d1, d2):

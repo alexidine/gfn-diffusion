@@ -1,10 +1,12 @@
+from typing import Optional
+
 import torch
 import math
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .architectures import *
+from .architectures import FlowModel, NoneModule, LearnableScalar, TimeEncoding, StateEncoding, PolicyModel
 from utils import gaussian_params, get_gfn_init_state
 from mxtaltools.models.modules.components import scalarMLP
 
@@ -133,7 +135,7 @@ class GFN(nn.Module):
         return s_new
 
     def get_trajectory_fwd(self, initial_state, discretizer, exploration_std, condition,
-                           return_gauss_params: bool = False):
+                           return_gauss_params: bool = False, detach_traj: bool = True):
         batch_size = initial_state.shape[0]
 
         ts = discretizer(batch_size).to(self.device)
@@ -155,19 +157,31 @@ class GFN(nn.Module):
             pf_mean, pflogvars = self.split_params(state_update)
 
             if exploration_std is None:
-                pflogvars_sample = pflogvars.detach()
+                if detach_traj:
+                    pflogvars_sample = pflogvars.detach()
+                else:
+                    pflogvars_sample = pflogvars
             else:
                 expl = exploration_std(None)  # currently not using this arg -- could use ts here, would need changes to utils get_exploration_std
                 if expl <= 0.0:
                     pflogvars_sample = pflogvars.detach()
                 else:
                     add_log_var = torch.full_like(pflogvars, np.log(exploration_std(i)) * 2) / dts.sqrt().unsqueeze(1)
-                    pflogvars_sample = torch.logaddexp(pflogvars, add_log_var).detach()
+                    if detach_traj:
+                        pflogvars_sample = torch.logaddexp(pflogvars, add_log_var).detach()
+                    else:
+                        pflogvars_sample = torch.logaddexp(pflogvars, add_log_var)
 
-            s_ = (current_state +
-                  dts.unsqueeze(1) * pf_mean.detach() +
-                  dts.sqrt().unsqueeze(1) * (pflogvars_sample / 2).exp() * torch.randn_like(current_state,
-                                                                                            device=self.device))
+            if detach_traj:
+                s_ = (current_state +
+                      dts.unsqueeze(1) * pf_mean.detach() +
+                      dts.sqrt().unsqueeze(1) * (pflogvars_sample / 2).exp() * torch.randn_like(current_state,
+                                                                                                device=self.device))
+            else:
+                s_ = (current_state +
+                      dts.unsqueeze(1) * pf_mean +
+                      dts.sqrt().unsqueeze(1) * (pflogvars_sample / 2).exp() * torch.randn_like(current_state,
+                                                                                                device=self.device))
 
             noise = ((s_ - current_state) - dts.unsqueeze(1) * pf_mean) / (
                     dts.sqrt().unsqueeze(1) * (pflogvars / 2).exp())
@@ -212,7 +226,7 @@ class GFN(nn.Module):
             return states, logpf, logpb, logf
 
     def get_trajectory_bwd(self, terminal_state, discretizer, condition,
-                           return_gauss_params: bool = False):
+                           return_gauss_params: bool = False, detach_traj: bool = False):
         batch_size = terminal_state.shape[0]
 
         ts = discretizer(batch_size).to(self.device)
@@ -248,9 +262,14 @@ class GFN(nn.Module):
                 back_var = ((self.pf_std_per_traj ** 2) *
                        (dts * ts[:, trajectory_length - i - 1] / ts[:, trajectory_length - i]).unsqueeze(
                     1) * back_var_correction)
-                s_ = (back_mean.detach() +
-                      back_var.sqrt().detach() * torch.randn_like(current_state, device=self.device))
+                if detach_traj:
+                    s_ = (back_mean.detach() +
+                          back_var.sqrt().detach() * torch.randn_like(current_state, device=self.device))
+                else:
+                    s_ = (back_mean +
+                          back_var.sqrt() * torch.randn_like(current_state, device=self.device))
                 noise_backward = (s_ - back_mean) / back_var.sqrt()
+
                 logpb[:, trajectory_length - i - 1] = -0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1)
             else:
                 s_ = torch.zeros_like(current_state)

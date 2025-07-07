@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch.nn.functional as F
 import torch
 from mxtaltools.dataset_utils.utils import collate_data_list
@@ -66,7 +68,7 @@ def fwd_combo(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
     # regularize policies for local smoothness with a small penalty
     #smoothness_loss = normed_smoothness_loss(torch.stack([means_f, logvars_f, means_b, logvars_b]))
 
-    loss = vg_loss.mean() + tb_loss.mean() #+ z_matching_loss  #+ smoothness_loss.mean() * 1
+    loss = vg_loss.mean() + tb_loss.mean()  #+ z_matching_loss  #+ smoothness_loss.mean() * 1
 
     if return_exp:
         return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
@@ -111,7 +113,7 @@ def bwd_combo(terminal_state, gfn, log_r, discretizer, condition=None, repeats=1
     # regularize policies for local smoothness with a small penalty
     #smoothness_loss = normed_smoothness_loss(torch.stack([means_f, logvars_f, means_b, logvars_b]))
 
-    loss = vg_loss.mean() + tb_loss.mean() #+ z_matching_loss  #+ smoothness_loss.mean() * 1
+    loss = vg_loss.mean() + tb_loss.mean()  #+ z_matching_loss  #+ smoothness_loss.mean() * 1
 
     if return_exp:
         return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
@@ -131,13 +133,107 @@ def fwd_tb(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
     tb = (log_pf + log_flow - log_pb - log_r)
     tb_loss = F.mse_loss(tb, torch.zeros_like(tb), reduction='none')
 
-    loss = tb_loss.mean()
+    loss = tb_loss
 
     if return_exp:
-        return loss.mean(), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
+        return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
     else:
-        return loss.mean()
+        return loss
 
+
+def fwd_greedy(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
+               exploration_std=None, return_exp=False, condition=None,
+               traj_midpoint: int = 0,
+               repeats: int = 1, entropy_penalty: float = 1.0,
+               ):
+    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, discretizer,
+                                                              None, condition,
+                                                              detach_traj=False)
+    # optionally only evaluate performance from some mid-trajectory initial state, rather from the global init s0
+    if traj_midpoint > 0:
+        states[:, :traj_midpoint] = states[:, :traj_midpoint].detach()
+
+    # # optionally, evaluate over a minibatch and penalize low entropy
+    # loss = -torch.logsumexp(torch.stack(log_r_list), dim=0)
+    # mean_reward = torch.stack(log_r_list).mean(dim=0)
+    # var_reward = torch.stack(log_r_list).var(dim=0)
+    # loss = -mean_reward + alpha * var_reward
+    crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states, no_grad=False)
+    loss = -log_r
+
+    if return_exp:
+        return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
+    else:
+        return loss
+
+
+def fwd_tb_greedy(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
+                  exploration_std=None, return_exp=False, condition=None,
+                  traj_midpoint: int = 0,
+                  repeats: int = 1, entropy_penalty: float = 1.0,
+                  ):
+    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, discretizer,
+                                                              exploration_std, condition,
+                                                              detach_traj=False)
+    # optionally only evaluate performance from some mid-trajectory initial state, rather from the global init s0
+    if traj_midpoint > 0:
+        states[:, :traj_midpoint] = states[:, :traj_midpoint].detach()
+
+    crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states, no_grad=False)
+    greedy_loss = -log_r
+
+    log_pf = log_pfs.sum(-1)
+    log_pb = log_pbs.sum(-1)
+    log_flow = log_fs[:, 0]
+
+    tb = (log_pf + log_flow - log_pb - log_r)
+    tb_loss = F.mse_loss(tb, torch.zeros_like(tb), reduction='none')
+
+    loss = tb_loss + greedy_loss
+
+    if return_exp:
+        return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
+    else:
+        return loss
+
+
+def fwd_vg_greedy(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
+                  exploration_std=None, return_exp=False, condition=None,
+                  traj_midpoint: int = 0,
+                  repeats: int = 1, entropy_penalty: float = 1.0,
+                  ):
+    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, discretizer,
+                                                              exploration_std, condition,
+                                                              detach_traj=False)
+    # optionally only evaluate performance from some mid-trajectory initial state, rather from the global init s0
+    if traj_midpoint > 0:
+        states[:, :traj_midpoint] = states[:, :traj_midpoint].detach()
+
+    crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states, no_grad=False)
+
+    log_pf = log_pfs.sum(-1)
+    log_pb = log_pbs.sum(-1)
+    log_ratio = log_r + log_pb - log_pf
+
+    if gfn.conditional_flow_model:
+        # reshape and take the mean over repeats
+        # minimize the variance over repeats w.r.t., the norm
+        log_Z = log_ratio.view(repeats, -1).mean(dim=0, keepdim=True)
+        greedy_loss = -log_r.view(repeats, -1).mean(dim=0, keepdim=True)
+
+        vg_loss = 0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2
+    else:
+        # take the variance over the full unconditional batch
+        log_Z = log_ratio.mean(dim=0, keepdim=True)
+        greedy_loss = -log_r
+        vg_loss = 0.5 * (log_Z - log_ratio) ** 2
+
+    loss = vg_loss + greedy_loss
+
+    if return_exp:
+        return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
+    else:
+        return loss
 
 def bwd_tb(terminal_state, gfn, log_r, discretizer, condition=None, return_exp: bool = False):
     states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, discretizer, condition)
@@ -148,12 +244,12 @@ def bwd_tb(terminal_state, gfn, log_r, discretizer, condition=None, return_exp: 
     tb = (log_pf + log_flow - log_pb - log_r)
     tb_loss = F.mse_loss(tb, torch.zeros_like(tb), reduction='none')
 
-    loss = tb_loss.mean()
+    loss = tb_loss
 
     if return_exp:
-        return loss.mean(), states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
+        return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
     else:
-        return loss.mean()
+        return loss
 
 
 def fwd_vg(initial_state, gfn,
@@ -186,7 +282,7 @@ def fwd_vg(initial_state, gfn,
         log_Z = log_ratio.mean(dim=0, keepdim=True)
         vg_loss = 0.5 * (log_Z - log_ratio) ** 2
 
-    loss = vg_loss.mean()
+    loss = vg_loss
 
     if return_exp:
         return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
@@ -216,7 +312,7 @@ def bwd_vg(terminal_state, gfn, log_r, discretizer, condition=None, repeats=10,
         log_Z = log_ratio.mean(dim=0, keepdim=True)
         vg_loss = 0.5 * (log_Z - log_ratio) ** 2
 
-    loss = vg_loss.mean()
+    loss = vg_loss
 
     if return_exp:
         return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
@@ -230,7 +326,7 @@ def db(initial_state, gfn, log_reward_fn, exploration_std=None, condition=None):
         log_fs[:, -1] = log_reward_fn(states[:, -1], condition).detach()
 
     loss = 0.5 * ((log_pfs + log_fs[:, :-1] - log_pbs - log_fs[:, 1:]) ** 2).sum(-1)
-    return loss.mean()
+    return loss
 
 
 def subtb(initial_state, gfn, log_reward_fn, coef_matrix, exploration_std=None, condition=None):
@@ -252,41 +348,71 @@ def subtb(initial_state, gfn, log_reward_fn, coef_matrix, exploration_std=None, 
 def bwd_mle(terminal_state, gfn, log_reward_fn, exploration_std=None, condition=None):
     states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, condition)
     loss = -log_pfs.sum(-1)
-    return loss.mean()
+    return loss
 
 
 def get_gfn_forward_loss(mode, init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std=None,
-                         return_exp=False, condition=None, repeats=10):
+                         return_exp=False, condition=None, repeats=10, reweight_T: Optional[float] = None):
     if mode == 'tb':
-        return fwd_tb(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
-                      return_exp=return_exp,
-                      condition=condition)
+        out = fwd_tb(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
+                     return_exp=return_exp,
+                     condition=condition)
     elif mode == 'vg':
-        return fwd_vg(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std, return_exp=return_exp,
-                      condition=condition, repeats=repeats)
+        out = fwd_vg(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std, return_exp=return_exp,
+                     condition=condition, repeats=repeats)
     elif mode == 'combo':
-        return fwd_combo(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
+        out = fwd_combo(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
+                        return_exp=return_exp,
+                        condition=condition, repeats=repeats)
+    elif mode == 'greedy':
+        out = fwd_greedy(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
                          return_exp=return_exp,
-                         condition=condition, repeats=repeats)
-    # elif mode == 'db':
-    #     return db(init_state, gfn_model, log_reward, exploration_std, condition=condition)
-    # elif mode == 'subtb':
-    #     return subtb(init_state, gfn_model, log_reward, coeff_matrix, exploration_std, condition=condition)
+                         condition=condition)
+    elif mode == 'tb_greedy':
+        out = fwd_tb_greedy(
+            init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
+            return_exp=return_exp,
+            condition=condition
+        )
+    elif mode == 'vg_greedy':
+        out = fwd_vg_greedy(
+            init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
+            return_exp=return_exp,
+            condition=condition
+        )
     else:
         assert False
+
+    losses, *rest = out
+    if reweight_T is not None:  # optionally reweight losses to minimize large outliers
+        weights = torch.softmax(-losses / reweight_T, dim=0) * len(losses)
+    else:
+        weights = torch.ones_like(losses)
+    loss = (weights * losses).mean()
+
+    return (loss, *rest)
 
 
 def get_gfn_backward_loss(mode, samples, gfn_model, rewards, discretizer, exploration_std=None, condition=None,
                           repeats=10,
-                          return_exp=False):
+                          return_exp=False, reweight_T: Optional[float] = None):
     if mode == 'tb':
-        return bwd_tb(samples, gfn_model, rewards, discretizer, condition=condition, return_exp=return_exp)
+        out = bwd_tb(samples, gfn_model, rewards, discretizer, condition=condition, return_exp=return_exp)
     elif mode == 'vg':
-        return bwd_vg(samples, gfn_model, rewards, discretizer, condition=condition, repeats=repeats,
-                      return_exp=return_exp)
+        out = bwd_vg(samples, gfn_model, rewards, discretizer, condition=condition, repeats=repeats,
+                     return_exp=return_exp)
     elif mode == 'combo':
-        return bwd_combo(samples, gfn_model, rewards, discretizer, condition=condition, repeats=repeats,
-                         return_exp=return_exp)
+        out = bwd_combo(samples, gfn_model, rewards, discretizer, condition=condition, repeats=repeats,
+                        return_exp=return_exp)
 
     else:
         assert False
+
+    losses, *rest = out
+    if reweight_T is not None:  # optionally reweight losses to minimize large outliers
+        weights = torch.softmax(-losses / reweight_T, dim=0) * len(losses)
+    else:
+        weights = torch.ones_like(losses)
+    loss = (weights * losses).mean()
+
+    return (loss, *rest)
