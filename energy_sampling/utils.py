@@ -87,7 +87,7 @@ def get_gfn_optimizer(gfn_model, lr_policy, lr_flow,
 
 def get_exploration_std(iter, exploratory, max_steps: int = 5000, exploration_factor=0.1, exploration_wd=False):
     if exploratory is False:
-        return None
+        exploration_factor = 0
     if exploration_wd:
         exploration_std = exploration_factor * max(0, 1. - iter / max_steps)
     else:

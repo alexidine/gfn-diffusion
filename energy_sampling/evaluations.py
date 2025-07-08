@@ -282,9 +282,9 @@ def get_buffer_stats(buffer):
         buffer_latent_params = buffer_batch.cell_params_to_gen_basis().cpu().detach().numpy()
         buffer_std_params_for_embedding = buffer_batch.cell_params_to_gen_basis().cpu().detach().numpy()
         reward = buffer_reward.cpu().detach().numpy()
-        batch = batch.cpu().detach()
+        batch = buffer_batch.cpu().detach()
     else:
-        buffer_cell_params, buffer_latent_params, buffer_std_params_for_embedding, buffer_reward, buffer_stats = None, None, None, None, None
+        buffer_cell_params, buffer_latent_params, buffer_std_params_for_embedding, reward, batch = None, None, None, None, None
     return buffer_cell_params, buffer_latent_params, buffer_std_params_for_embedding, reward, batch
 
 

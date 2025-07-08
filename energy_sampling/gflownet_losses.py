@@ -172,15 +172,21 @@ def fwd_tb_greedy(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
                   traj_midpoint: int = 0,
                   repeats: int = 1, entropy_penalty: float = 1.0,
                   ):
+    skip_greedy = exploration_std(0) != 0
+
     states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, discretizer,
                                                               exploration_std, condition,
-                                                              detach_traj=False)
+                                                              detach_traj=skip_greedy)
     # optionally only evaluate performance from some mid-trajectory initial state, rather from the global init s0
     if traj_midpoint > 0:
         states[:, :traj_midpoint] = states[:, :traj_midpoint].detach()
 
-    crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states, no_grad=False)
-    greedy_loss = -log_r
+    crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states, no_grad=skip_greedy)
+
+    if skip_greedy:
+        greedy_loss = torch.zeros_like(log_r)
+    else:
+        greedy_loss = -log_r
 
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
@@ -202,14 +208,16 @@ def fwd_vg_greedy(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
                   traj_midpoint: int = 0,
                   repeats: int = 1, entropy_penalty: float = 1.0,
                   ):
+    skip_greedy = exploration_std(0) != 0
+
     states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, discretizer,
                                                               exploration_std, condition,
-                                                              detach_traj=False)
+                                                              detach_traj=skip_greedy)
     # optionally only evaluate performance from some mid-trajectory initial state, rather from the global init s0
     if traj_midpoint > 0:
         states[:, :traj_midpoint] = states[:, :traj_midpoint].detach()
 
-    crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states, no_grad=False)
+    crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states, no_grad=skip_greedy)
 
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
@@ -219,13 +227,20 @@ def fwd_vg_greedy(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
         # reshape and take the mean over repeats
         # minimize the variance over repeats w.r.t., the norm
         log_Z = log_ratio.view(repeats, -1).mean(dim=0, keepdim=True)
+        if skip_greedy:
+            greedy_loss = torch.zeros_like(log_Z)
+        else:
+            greedy_loss = -log_r
         greedy_loss = -log_r.view(repeats, -1).mean(dim=0, keepdim=True)
 
         vg_loss = 0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2
     else:
         # take the variance over the full unconditional batch
         log_Z = log_ratio.mean(dim=0, keepdim=True)
-        greedy_loss = -log_r
+        if skip_greedy:
+            greedy_loss = torch.zeros_like(log_r)
+        else:
+            greedy_loss = -log_r
         vg_loss = 0.5 * (log_Z - log_ratio) ** 2
 
     loss = vg_loss + greedy_loss
@@ -346,10 +361,13 @@ def subtb(initial_state, gfn, log_reward_fn, coef_matrix, exploration_std=None, 
     return torch.stack([torch.triu(A2[i] * coef_matrix, diagonal=1).sum() for i in range(A2.shape[0])]).sum()
 
 
-def bwd_mle(terminal_state, gfn, log_reward_fn, exploration_std=None, condition=None):
-    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, condition)
+def bwd_mle(terminal_state, gfn, discretizer, log_r, condition=None, return_exp: bool = False):
+    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, discretizer, condition)
     loss = -log_pfs.sum(-1)
-    return loss
+    if return_exp:
+        return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
+    else:
+        return loss
 
 
 def get_gfn_forward_loss(mode, init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std=None,
@@ -405,6 +423,8 @@ def get_gfn_backward_loss(mode, samples, gfn_model, rewards, discretizer, explor
     elif mode == 'combo':
         out = bwd_combo(samples, gfn_model, rewards, discretizer, condition=condition, repeats=repeats,
                         return_exp=return_exp)
+    elif mode == 'mle':
+        out = bwd_mle(samples, gfn_model, discretizer, rewards, condition=condition, return_exp=return_exp)
 
     else:
         assert False
