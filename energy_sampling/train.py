@@ -1,5 +1,7 @@
 import gc
 import os
+import sys
+import traceback
 from time import time
 from typing import Optional
 
@@ -477,6 +479,10 @@ def log_elapsed_times():
 
 
 def handle_oom(batch_size):
+    traceback.print_exc()
+    # Clear traceback circular references
+    sys.exc_info()
+    # manual GC + cache clear
     gc.collect()
     torch.cuda.empty_cache()
     batch_size = int(batch_size * 0.9)

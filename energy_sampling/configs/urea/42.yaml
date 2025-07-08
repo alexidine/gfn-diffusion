@@ -58,7 +58,7 @@ lr_flow: 0.1
 lr_policy: 0.0001
 lr_warmup_time: 500
 ls_cycle: 100
-max_batch_size: 5000
+max_batch_size: 1000
 max_iter_ls: 100
 max_traj_length: 50
 min_lr: 1.0e-06
@@ -75,7 +75,7 @@ prioritized: boltzmann
 rank_weight: 1.0
 repeats: 5
 reweight_T: null
-run_name: urea_41_pre_mle_overfit_learned_var
+run_name: urea_42_pre_mle_overfit_learned_var
 s_emb_dim: 512
 samples_per_opt: 10
 sampling: buffer

@@ -299,10 +299,10 @@ General notes
 25_traj_norm - very similar
 26_low_var - actually doing better, though still some pinning. Still some low Z
 27_big_model - exploded and died on backwards loss
-28_high_var_range
-29_low_var_range
-30_high_pb_range
-31_pre_baseline
+28_high_var_range - minimal difference
+29_low_var_range - improved, which is weird since learned_variance was off
+30_high_pb_range - no change
+31_pre_baseline - better outputs, worse losses
 32_pre_tb_greedy
 33_pre_vg_greedy
 34_pre_cond_vg
@@ -313,11 +313,35 @@ General notes
 39_pre_low_var_range
 40_pre_high_pb_range
 41_pre_mle_overfit
+
+
+# fixed rerun - bigger batch and learnable variance switched on
+21_baseline - still too fat, Z still too low
+22_tb_greedy - 
+23_vg_greedy - 
+24_cond_vg - 
+25_traj_norm - 
+26_low_var - 
+27_big_model - 
+28_high_var_range - 
+29_low_var_range - 
+30_high_pb_range - 
+31_pre_baseline - 
+32_pre_tb_greedy
+33_pre_vg_greedy
+34_pre_cond_vg
+35_pre_traj_norm
+36_pre_low_var
+37_pre_big_model
+38_pre_high_var_range
+39_pre_low_var_range
+40_pre_high_pb_range
+41_pre_mle_overfit - no learned var
 """
 
 config_list.append(
-    {'lr_policy': 0.001,
-     'lr_back': 0.001,
+    {'lr_policy': 0.0001,
+     'lr_back': 0.0001,
      'lr_flow': 0.1,
      'lr_anneal_time': 10000,
      'energy_function': 'silu_energy',
@@ -325,8 +349,8 @@ config_list.append(
      'anneal_energy': False,
      'temperature_conditioning': False,
      'conditional_flow_model': False,
-     'min_traj_length': 10,
-     'max_traj_length': 30,
+     'min_traj_length': 40,
+     'max_traj_length': 50,
      'discretizer_max_ratio': 10,
      'mode_fwd': 'tb',
      'mode_bwd': 'mle',
@@ -349,12 +373,54 @@ config_list.append(
      's_emb_dim': 512,
      'dropout': 0,
      'norm': 'layer',
-     'max_batch_size': 10000,
+     'max_batch_size': 1000,
+     'buffer_size': 25000,
+     'reweight_T': None,
+     'beta': 0.01}
+)
+
+config_list.append(
+    {'lr_policy': 0.0001,
+     'lr_back': 0.0001,
+     'lr_flow': 0.1,
+     'lr_anneal_time': 10000,
+     'energy_function': 'silu_energy',
+     'energy_static_temperature': 1,
+     'anneal_energy': False,
+     'temperature_conditioning': False,
+     'conditional_flow_model': False,
+     'min_traj_length': 40,
+     'max_traj_length': 50,
+     'discretizer_max_ratio': 10,
+     'mode_fwd': 'tb',
+     'mode_bwd': 'mle',
+     'both_ways': False,
+     'bwd': True,
+     'buffer_path': '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt',
+     'energy_density_coeff': 2.0,
+     'exploratory': False,
+     'exploration_factor': 0.35,
+     'exploration_wd': True,
+     'wd_max_steps': 5000,
+     't_scale': 1.0,
+     'log_var_range': 10.0,
+     'pb_scale_range': 0.5,
+     'learn_pb': False,
+     'learned_variance': True,
+     'repeats': 5,
+     'joint_layers': 8,
+     'hidden_dim': 512,
+     's_emb_dim': 512,
+     'dropout': 0,
+     'norm': 'layer',
+     'max_batch_size': 1000,
      'buffer_size': 25000,
      'reweight_T': None,
      'beta': 0.01}
 )
 tags.append('41_pre_mle_overfit')
+tags.append('42_pre_mle_overfit_learned_var')
+
 
 ind = 0
 for ix1 in range(len(config_list)):
