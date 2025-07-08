@@ -51,7 +51,7 @@ learned_variance: false
 lgv_clip: 100.0
 lgv_layers: 4
 local_search: false
-log_var_range: 4.0
+log_var_range: 10.0
 lr_anneal_time: 10000
 lr_back: 0.001
 lr_flow: 0.1
