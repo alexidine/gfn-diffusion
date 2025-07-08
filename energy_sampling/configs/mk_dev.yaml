@@ -15,9 +15,9 @@ reweight_T: 10                # smaller values reduce the impact of outlier samp
 
 # model parameters
 zero_init: true
-joint_layers: 4              # number of layers in forward/backward policy models
-hidden_dim: 256              # dimensionality of hidden layer
-s_emb_dim: 256                # dimensionality of state embedding
+joint_layers: 8              # number of layers in forward/backward policy models
+hidden_dim: 512              # dimensionality of hidden layer
+s_emb_dim: 512                # dimensionality of state embedding
 t_emb_dim: 32                # dimensionality of time embedding
 harmonics_dim: 64            # dimensionality of harmonic embedding
 condition_emb_dim: 32         # dimensionality of the conditioning embedding
@@ -36,8 +36,8 @@ buffer_size: 25000          # size of replay buffer: relatively large
 # GFlowNet settings
 T: 5                        # static training diffusion length
 eval_T: 100                  # diffusion trajectory length for inference
-min_traj_length: 5
-max_traj_length: 5
+min_traj_length: 10
+max_traj_length: 25
 traj_length_strategy: static # 'static'  or 'sampled'  will do random between min and max traj lengths
 discretizer_max_ratio: 10    # maximum ratio between randomly sampled step sizes
 discretizer: 'random'        # 'random' 'low_discrepancy' 'equidistant' 'uniform'
@@ -46,13 +46,13 @@ log_var_range: 4.0           # controls dynamic range of learned policy variance
 pb_scale_range: 0.1          # range of learned backward policy corrections, only for 'brownian_bridge'
 energy: "molecular_crystal"  # "molecular_crystal"
 mode_fwd: "tb_greedy"           # "tb" is trajectory balance, "vg" is VarGrad, "greedy" is a local greed + gradients, "tb_greedy", "vg_greedy" are combinations
-mode_bwd: "mle"               # "tb" is trajectory balance, "vg" is VarGrad
+mode_bwd: "mle"               # "tb" is trajectory balance, "vg" is VarGrad, 'mle' is trajectory probability maximization
 repeats: 10                   # for conditional VarGrad training
-both_ways: True             # forward and backward training
+both_ways: False             # forward and backward training
 bwd_batch_multiplier: 10      # ratio of backward to foward batch size (much cheaper to evaluate)
 fwd_train_each: 2   # todo change the logic on this so I don't screw it up again       # on which multiples of training iter to train the fwd train model instead of bwd
 bwd: True                   # backward training only
-learn_pb: true               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
+learn_pb: false               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
 conditional_flow_model: false #  conditional training (currently doing temperature)
 learned_variance: true       # whether to learn policy variance
 clipping: true  # clip the maximumstep size induced by the policy model

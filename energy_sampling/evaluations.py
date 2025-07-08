@@ -124,6 +124,9 @@ def generate_fwd_figs(buffer, energy_function,
                       condition, flow_states, gfn_model, init_state, log_fs, log_pbs,
                       log_pfs, log_r, f_vars_f, f_means_f, f_vars_b, f_means_b, sample_batch):
     buffer_cell_params, buffer_latent_params, buffer_std_params, buffer_reward, buffer_batch = get_buffer_stats(buffer)
+    std_cell_params = sample_batch.cell_params_to_gen_basis().cpu().detach()
+
+
 
     fig_dict = {}
     conditional = len(condition.unique()) != 1
@@ -146,7 +149,6 @@ def generate_fwd_figs(buffer, energy_function,
         (condition[:, 0].cpu().detach().numpy()) if condition is not None else None,
         aux_scalar_name='log_temperature' if condition is not None else None)
 
-    std_cell_params = sample_batch.cell_params_to_gen_basis().cpu().detach()
     known_modes = energy_function.crystal_modes.detach() if hasattr(energy_function, 'modes') else None
     if known_modes is not None:
         known_modes_std = energy_function.modes.cpu().detach()
@@ -171,6 +173,11 @@ def generate_fwd_figs(buffer, energy_function,
                                                         )
 
     return fig_dict
+
+def embed_samples(ref_samples, ref_rewards, samples, sample_rewards):
+    aa = 1
+    return None
+
 
 #
 # from scipy.spatial.distance import cdist

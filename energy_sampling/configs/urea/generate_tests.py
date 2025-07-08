@@ -208,8 +208,8 @@ new_tags = [
 tags.extend(new_tags)
 
 new_base = \
-    {'lr_policy': 0.001,
-     'lr_back': 0.001,
+    {'lr_policy': 0.0005,
+     'lr_back': 0.0005,
      'lr_flow': 0.1,
      'lr_anneal_time': 10000,
      'energy_function': 'silu_energy',
@@ -233,14 +233,14 @@ new_base = \
      'log_var_range': 4.0,
      'pb_scale_range': 0.5,
      'learn_pb': False,
-     'learned_variance': False,
+     'learned_variance': True,
      'repeats': 5,
      'joint_layers': 4,
      'hidden_dim': 128,
      's_emb_dim': 128,
      'dropout': 0,
      'norm': 'layer',
-     'max_batch_size': 500,
+     'max_batch_size': 1000,
      'buffer_size': 25000,
      'reweight_T': None,
      'beta': 0.01}
@@ -268,7 +268,7 @@ for tag in new_tags:
     elif 'traj_norm' in tag:
         cc['rweight_T'] = 10
     elif 'low_var' in tag:
-        cc['t_scale'] = 0.5
+        cc['t_scale'] = 0.1
     elif 'big_model' in tag:
         cc['joint_layers'] = 8
         cc['hidden_dim'] = 512
@@ -288,16 +288,17 @@ for tag in new_tags:
 
 """
 General notes
--: forward loss crazy noisy. Losses in general quite noisy. Possibly split LR is not good
--: log Z training lags way behind
+-: distributions too broad
+-: losses still noisy - ** batch size issue? **
+-: all these lacked learned variance - idiot ****
 
-21_baseline
-22_tb_greedy
-23_vg_greedy
-24_cond_vg
-25_traj_norm
-26_low_var
-27_big_model
+21_baseline - maps well the buffer distribution, but it's very high variance. Z lower than var LB. Diffuse or over-dense.
+22_tb_greedy - nearly identical
+23_vg_greedy - more diffuse. Edgy Pf means. Too fat
+24_cond_vg - vicious pinned mode collapse in 10d. Awful
+25_traj_norm - very similar
+26_low_var - actually doing better, though still some pinning. Still some low Z
+27_big_model - exploded and died on backwards loss
 28_high_var_range
 29_low_var_range
 30_high_pb_range
@@ -311,8 +312,49 @@ General notes
 38_pre_high_var_range
 39_pre_low_var_range
 40_pre_high_pb_range
-
+41_pre_mle_overfit
 """
+
+config_list.append(
+    {'lr_policy': 0.001,
+     'lr_back': 0.001,
+     'lr_flow': 0.1,
+     'lr_anneal_time': 10000,
+     'energy_function': 'silu_energy',
+     'energy_static_temperature': 1,
+     'anneal_energy': False,
+     'temperature_conditioning': False,
+     'conditional_flow_model': False,
+     'min_traj_length': 10,
+     'max_traj_length': 30,
+     'discretizer_max_ratio': 10,
+     'mode_fwd': 'tb',
+     'mode_bwd': 'mle',
+     'both_ways': False,
+     'bwd': True,
+     'buffer_path': '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt',
+     'energy_density_coeff': 2.0,
+     'exploratory': False,
+     'exploration_factor': 0.35,
+     'exploration_wd': True,
+     'wd_max_steps': 5000,
+     't_scale': 1.0,
+     'log_var_range': 10.0,
+     'pb_scale_range': 0.5,
+     'learn_pb': False,
+     'learned_variance': False,
+     'repeats': 5,
+     'joint_layers': 8,
+     'hidden_dim': 512,
+     's_emb_dim': 512,
+     'dropout': 0,
+     'norm': 'layer',
+     'max_batch_size': 10000,
+     'buffer_size': 25000,
+     'reweight_T': None,
+     'beta': 0.01}
+)
+tags.append('41_pre_mle_overfit')
 
 ind = 0
 for ix1 in range(len(config_list)):
