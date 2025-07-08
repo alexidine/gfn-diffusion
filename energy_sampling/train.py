@@ -453,7 +453,8 @@ def do_evaluation(energy_function, buffer, gfn_model, i, metrics, mol_loader):
                   buffer,
                   do_figures,
                   mol_batch,
-                  bwd_training=len(buffer) > 0))
+                  bwd_training=len(buffer) > 0,
+                  add_to_buffer=args.both_ways))
 
     metrics.update({'Batch Size': args.batch_size})
     metrics.update(log_elapsed_times())

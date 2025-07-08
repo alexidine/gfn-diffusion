@@ -65,7 +65,8 @@ def eval_step(energy_function,
               buffer,
               do_figures: bool = True,
               mol_batch=None,
-              bwd_training: bool = False, ):
+              bwd_training: bool = False,
+              add_to_buffer: bool = False):
     gfn_model.eval()
 
     (flow_states, samples, log_r, log_Z, log_Z_lb,
@@ -76,7 +77,7 @@ def eval_step(energy_function,
     metrics = log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_Z_learned, log_r,
                                          sample_batch, buffer)
 
-    if len(buffer) > 0:
+    if add_to_buffer:
         buffer.add(sample_batch.detach().cpu().to_data_list())  # add evaluation samples to buffer
 
     if do_figures:
