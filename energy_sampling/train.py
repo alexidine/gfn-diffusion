@@ -418,16 +418,6 @@ def handle_train_epoch_error(e, oomed_out, buffer, mol_loader):
             e) or "nonzero is not supported for tensors with more than INT_MAX elements" in str(e):
         args.batch_size = handle_oom(args.batch_size)
 
-        if len(buffer) > 0:  # cut also the buffer size in case it's getting too big
-            args.buffer_size = max([10000, int(args.buffer_size * 0.9)])
-            buffer.loader = DataLoader(
-                buffer.dataset,
-                batch_size=args.batch_size,
-                sampler=buffer.sampler,
-                num_workers=0,
-                pin_memory=True,
-                drop_last=True)
-
         mol_loader = DataLoader(
             mol_loader.dataset,
             batch_size=args.batch_size,

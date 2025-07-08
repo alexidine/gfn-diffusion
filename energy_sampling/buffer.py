@@ -70,18 +70,23 @@ class CrystalReplayBuffer():
                     assert len(self.dataset) == len(self.x_list) == len(self.scores_np_list)
 
             if len(self) > self.buffer_size:  # pare down buffer
-                inds_to_keep = self.sample_indices(self.buffer_size, replace=False)
-                if self.keep_initial_samples:
-                    inds_to_keep = list(set(list(inds_to_keep) + self.original_dataset_inds))[:self.buffer_size]
-                else:
-                    inds_to_keep = list(set(inds_to_keep))
-
-                self.dataset = [self.dataset[ind] for ind in inds_to_keep]
-                self.scores_np_list = [self.scores_np_list[ind] for ind in inds_to_keep]
-                self.x_list = [self.x_list[ind] for ind in inds_to_keep]
+                self.truncate_buffer()
 
             #print(f"[Deep size] dataset = {deep_sizeof(self.dataset) / 1e6:.2f} MB, with length {len(self.dataset)}")
             #print(f"[Deep size] x_list = {deep_sizeof(self.x_list) / 1e6:.2f} MB, with length {len(self.x_list)}")
+
+    def truncate_buffer(self, override_buffer_size=None):
+        if override_buffer_size is not None:
+            self.buffer_size = override_buffer_size
+
+        inds_to_keep = self.sample_indices(self.buffer_size, replace=False)
+        if self.keep_initial_samples:
+            inds_to_keep = list(set(list(inds_to_keep) + self.original_dataset_inds))[:self.buffer_size]
+        else:
+            inds_to_keep = list(set(inds_to_keep))
+        self.dataset = [self.dataset[ind] for ind in inds_to_keep]
+        self.scores_np_list = [self.scores_np_list[ind] for ind in inds_to_keep]
+        self.x_list = [self.x_list[ind] for ind in inds_to_keep]
 
     def __len__(self):
         if self.dataset is None:
