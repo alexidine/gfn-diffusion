@@ -1,4 +1,6 @@
 from pathlib import Path
+
+import numpy as np
 import yaml
 from copy import copy
 import os
@@ -317,26 +319,30 @@ General notes
 
 # fixed rerun - bigger batch and learnable variance switched on
 21_baseline - still too fat, Z still too low
-22_tb_greedy - 
-23_vg_greedy - 
-24_cond_vg - 
-25_traj_norm - 
-26_low_var - 
-27_big_model - 
-28_high_var_range - 
-29_low_var_range - 
-30_high_pb_range - 
-31_pre_baseline - 
-32_pre_tb_greedy
-33_pre_vg_greedy
-34_pre_cond_vg
-35_pre_traj_norm
-36_pre_low_var
-37_pre_big_model
-38_pre_high_var_range
-39_pre_low_var_range
-40_pre_high_pb_range
+22_tb_greedy - indistinguishable
+23_vg_greedy - very diffuse, even fatter dists
+24_cond_vg - ultra diffuse
+25_traj_norm - indistinguishable
+26_low_var - vastly better. Could honestly be narrower
+27_big_model - actually looking better, though a touch unstable. Also a touch fat. Z also underestimated
+28_high_var_range - too fat dists
+29_low_var_range - better Z estimation. Bit fat. Starting to diverge LOL
+30_high_pb_range - way fat
+31_pre_baseline - higher losses, better rewards (still not very good). Bit fat also.
+32_pre_tb_greedy - indistinguishable
+33_pre_vg_greedy - diffuse
+34_pre_cond_vg - dying
+35_pre_traj_norm - indistinguishable
+36_pre_low_var - not amazing
+37_pre_big_model - bit nicer, only a little instability
+38_pre_high_var_range - no difference
+39_pre_low_var_range - improved
+40_pre_high_pb_range - worse
 41_pre_mle_overfit - no learned var
+42_pre_mle_overfit_var -
+findings:
+-: baseline var too high
+
 """
 
 config_list.append(
@@ -420,6 +426,14 @@ config_list.append(
 )
 tags.append('41_pre_mle_overfit')
 tags.append('42_pre_mle_overfit_learned_var')
+
+init_tag_num = len(tags)
+# baseline variance exploration curve
+for ind, val in enumerate(np.linspace(0.05, 1, 10)):
+    cc = copy(config_list[27])
+    cc['t_scale'] = val
+    config_list.append(cc)
+    tags.append(f'{init_tag_num + ind}_t_scale_{val:.2f}')
 
 
 ind = 0

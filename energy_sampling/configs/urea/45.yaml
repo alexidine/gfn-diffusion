@@ -1,0 +1,110 @@
+T: 10
+anneal_energy: false
+annealing_max_steps: 5000
+batch_size: 25
+beta: 0.01
+both_ways: true
+buffer_path: null
+buffer_size: 25000
+burn_in: 100
+bwd: false
+bwd_batch_multiplier: 5
+bwd_policy: brownian_bridge
+clipping: true
+condition_emb_dim: 32
+conditional_flow_model: false
+convergence_history: 100
+device: cuda
+discretizer: random
+discretizer_max_ratio: 10
+dropout: 0.5
+energy: molecular_crystal
+energy_annealing_threshold: 0.1
+energy_clip: 20
+energy_density_coeff: 2.0
+energy_function: silu_energy
+energy_max_temperature: 1
+energy_min_temperature: 0.01
+energy_static_temperature: 1
+epochs: 1000000
+eval: false
+eval_T: 100
+eval_batch_size: 500
+eval_period: 500
+exploration_factor: 0.35
+exploration_wd: true
+exploratory: true
+figs_period: 500
+fwd_train_each: 2
+gfn_clip: 10.0
+gradient_norm_clip: 1.0
+grow_batch_size: true
+harmonics_dim: 64
+hidden_dim: 512
+joint_layers: 8
+langevin: false
+langevin_scaling_per_dimension: false
+ld_schedule: true
+ld_step: 0.1
+learn_pb: false
+learned_variance: true
+lgv_clip: 100.0
+lgv_layers: 4
+local_search: false
+log_var_range: 4.0
+lr_anneal_time: 10000
+lr_back: 0.0005
+lr_flow: 0.1
+lr_policy: 0.0005
+lr_warmup_time: 500
+ls_cycle: 100
+max_batch_size: 1000
+max_iter_ls: 100
+max_traj_length: 30
+min_lr: 1.0e-06
+min_traj_length: 10
+mode_bwd: tb
+mode_fwd: tb
+molecule: urea
+molecules_path: /scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt
+norm: layer
+partial_energy: false
+pb_scale_range: 0.5
+pis_architectures: false
+prioritized: boltzmann
+rank_weight: 1.0
+repeats: 5
+reweight_T: null
+run_name: urea_45_t_scale_0.26
+s_emb_dim: 512
+samples_per_opt: 10
+sampling: buffer
+scheduler: true
+seed: 12345
+subtb_lambda: 2
+t_emb_dim: 32
+t_scale: !!python/object/apply:numpy.core.multiarray.scalar
+- !!python/object/apply:numpy.dtype
+  args:
+  - f8
+  - false
+  - true
+  state: !!python/tuple
+  - 3
+  - <
+  - null
+  - null
+  - null
+  - -1
+  - -1
+  - 0
+- !!binary |
+  YQu2YAu20D8=
+target_acceptance_rate: 0.574
+temperature_conditioning: false
+temperature_scaling_factor: 0.01
+traj_length_strategy: sampled
+use_weight_decay: false
+wd_max_steps: 5000
+weight_decay: 1e-7
+zero_init: true

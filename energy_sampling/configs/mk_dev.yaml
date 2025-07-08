@@ -15,8 +15,8 @@ reweight_T: 10                # smaller values reduce the impact of outlier samp
 
 # model parameters
 zero_init: true
-joint_layers: 8              # number of layers in forward/backward policy models
-hidden_dim: 512              # dimensionality of hidden layer
+joint_layers: 20              # number of layers in forward/backward policy models
+hidden_dim: 1028              # dimensionality of hidden layer
 s_emb_dim: 512                # dimensionality of state embedding
 t_emb_dim: 32                # dimensionality of time embedding
 harmonics_dim: 64            # dimensionality of harmonic embedding
@@ -24,9 +24,9 @@ condition_emb_dim: 32         # dimensionality of the conditioning embedding
 dropout: 0                   # dropout probability
 norm: 'layer'                   # null, "layer", "batch"
 
-batch_size: 10               # number of samples per training batch
+batch_size: 500               # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 100           # maximum batch size to allow
+max_batch_size: 50000           # maximum batch size to allow
 eval_batch_size: 250        # batch size for evaluation
 epochs: 1000000             # number of training epochs: relatively large
 eval_period: 250              # how often to do evaluation & reporting
