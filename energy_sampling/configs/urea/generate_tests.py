@@ -431,7 +431,7 @@ init_tag_num = len(tags)
 # baseline variance exploration curve
 for ind, val in enumerate(np.linspace(0.05, 1, 10)):
     cc = copy(config_list[27])
-    cc['t_scale'] = val
+    cc['t_scale'] = float(val)
     config_list.append(cc)
     tags.append(f'{init_tag_num + ind}_t_scale_{val:.2f}')
 

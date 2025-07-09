@@ -83,23 +83,7 @@ scheduler: true
 seed: 12345
 subtb_lambda: 2
 t_emb_dim: 32
-t_scale: !!python/object/apply:numpy.core.multiarray.scalar
-- !!python/object/apply:numpy.dtype
-  args:
-  - f8
-  - false
-  - true
-  state: !!python/tuple
-  - 3
-  - <
-  - null
-  - null
-  - null
-  - -1
-  - -1
-  - 0
-- !!binary |
-  AAAAAAAA8D8=
+t_scale: 1.0
 target_acceptance_rate: 0.574
 temperature_conditioning: false
 temperature_scaling_factor: 0.01
