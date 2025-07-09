@@ -436,6 +436,49 @@ for ind, val in enumerate(np.linspace(0.05, 1, 10)):
     tags.append(f'{init_tag_num + ind}_t_scale_{val:.2f}')
 
 
+
+config_list.append(
+    {'lr_policy': 0.0001,
+     'lr_back': 0.0001,
+     'lr_flow': 0.1,
+     'lr_anneal_time': 10000,
+     'energy_function': 'silu_energy',
+     'energy_static_temperature': 1,
+     'anneal_energy': False,
+     'temperature_conditioning': False,
+     'conditional_flow_model': False,
+     'min_traj_length': 40,
+     'max_traj_length': 50,
+     'discretizer_max_ratio': 10,
+     'mode_fwd': 'greedy',
+     'mode_bwd': 'mle',
+     'both_ways': True,
+     'bwd': False,
+     'buffer_path': '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt',
+     'energy_density_coeff': 2.0,
+     'exploratory': False,
+     'exploration_factor': 0.35,
+     'exploration_wd': True,
+     'wd_max_steps': 5000,
+     't_scale': 0.5,
+     'log_var_range': 10.0,
+     'pb_scale_range': 0.5,
+     'learn_pb': False,
+     'learned_variance': True,
+     'repeats': 5,
+     'joint_layers': 8,
+     'hidden_dim': 512,
+     's_emb_dim': 512,
+     'dropout': 0,
+     'norm': 'layer',
+     'max_batch_size': 1000,
+     'buffer_size': 25000,
+     'reweight_T': None,
+     'beta': 0.01}
+)
+
+tags.append('53_mle_greedy')
+
 ind = 0
 for ix1 in range(len(config_list)):
     config = copy(base_config)

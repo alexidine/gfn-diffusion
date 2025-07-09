@@ -1,4 +1,4 @@
-run_name: 'mk_local_dev'
+run_name: 'toy_benchmarks'
 seed: 12345
 device: 'cuda'
 lr_policy: 0.001              # learning rate of the policy network
@@ -11,62 +11,63 @@ lr_anneal_time: 10000
 weight_decay: 1e-7
 use_weight_decay: false
 gradient_norm_clip: 1.0        # gradient norm clip for updating gfn model weights
-reweight_T: null                # 'null' or float: smaller values reduce the impact of outlier samples, warning CAN BE SEVERELY DISTORTIONARY TO THE LOSS
 
 # model parameters
 zero_init: true
+
 joint_layers: 4              # number of layers in forward/backward policy models
-hidden_dim: 256              # dimensionality of hidden layer
-s_emb_dim: 256                # dimensionality of state embedding
+hidden_dim: 64              # dimensionality of hidden layer
+s_emb_dim: 32                # dimensionality of state embedding
 t_emb_dim: 32                # dimensionality of time embedding
 harmonics_dim: 64            # dimensionality of harmonic embedding
-condition_emb_dim: 32         # dimensionality of the conditioning embedding
+condition_emb_dim: 12         # dimensionality of the conditioning embedding
 dropout: 0                   # dropout probability
-norm: 'layer'                   # null, "layer", "batch"
+norm: null                   # null, "layer", "batch"
 
 batch_size: 25               # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 100           # maximum batch size to allow
-eval_batch_size: 250        # batch size for evaluation
+max_batch_size: 500           # maximum batch size to allow
+eval_batch_size: 500        # batch size for evaluation
 epochs: 1000000             # number of training epochs: relatively large
-eval_period: 100              # how often to do evaluation & reporting
-figs_period: 100             # how often to log custom figrues  # must be multiple of eval_period or it won't fire
-buffer_size: 25000          # size of replay buffer: relatively large
+eval_period: 500              # how often to do evaluation & reporting
+figs_period: 500             # how often to log custom figrues  # must be multiple of eval_period or it won't fire
+buffer_size: 25000          # size of replay buffer
 
 # GFlowNet settings
 T: 10                        # static training diffusion length
 eval_T: 100                  # diffusion trajectory length for inference
 min_traj_length: 10
-max_traj_length: 15
+max_traj_length: 20
 traj_length_strategy: sampled # 'static'  or 'sampled'  will do random between min and max traj lengths
-discretizer_max_ratio: 5    # maximum ratio between randomly sampled step sizes
+discretizer_max_ratio: 0.5    # maximum ratio between randomly sampled step sizes
 discretizer: 'random'        # 'random' 'low_discrepancy' 'equidistant' 'uniform'
-t_scale: 0.5                 # scales fixed forward policy variance
-log_var_range: 2.0           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
+t_scale: 1.0                 # scales fixed forward policy variance
+log_var_range: 4           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
 pb_scale_range: 0.1          # range of learned backward policy corrections, only for 'brownian_bridge'
 energy: "molecular_crystal"  # "molecular_crystal"
-mode_fwd: "tb"           # "tb" is trajectory balance, "vg" is VarGrad, "greedy" is a local greed + gradients, "tb_greedy", "vg_greedy" are combinations
-mode_bwd: "tb"               # "tb" is trajectory balance, "vg" is VarGrad, 'mle' is trajectory probability maximization
-repeats: 5                   # for conditional VarGrad training
+mode_fwd: "tb"               # "tb" is trajectory balance, "vg" is VarGrad
+mode_bwd: "tb"               # "tb" is trajectory balance, "vg" is VarGrad
+repeats: 10                  # for conditional VarGrad training
 both_ways: false             # forward and backward training
 bwd_batch_multiplier: 5      # ratio of backward to foward batch size (much cheaper to evaluate)
-fwd_to_bwd_ratio: 1           # whether to do forward (>1) or backward (<1) training more often
-bwd: False                   # backward training only
+fwd_train_each: 2            # on which multiples of training iter to train the fwd train model instead of bwd
+bwd: false                   # backward training only
 learn_pb: false               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
+conditional_flow_model: false #  conditional training (currently doing temperature)
 learned_variance: false       # whether to learn policy variance
+partial_energy: false
 clipping: true  # clip the maximumstep size induced by the policy model
 gfn_clip: 10.0  # clip the maximumstep size induced by the policy model
 
 # local search settings
 ################################################################
-buffer_path: null #'D:/crystal_datasets/urea_gfn_dataset.pt'
-molecules_path: 'D:/crystal_datasets/test_qm9_dataset.pt'
+#buffer_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
+#molecules_path: 'D:/crystal_datasets/test_qm9_dataset.pt'
 
-#buffer_path: '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt'
-#molecules_path: '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt'
+buffer_path: '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt'
+molecules_path: '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt'
 
 # replay buffer / dataset settings
-
 ################################################################
 beta: 0.1             # reward prioritized replay sampling: high beta = steep prioritization
 rank_weight: 1.0     # rank-based replay sampling: low rank_weight = steep prioritization
@@ -76,42 +77,31 @@ sampling: "buffer"
 ################################################################
 
 # exploration controls
-exploratory: True       # adds variance to optionally learned logvars
-exploration_factor: 0.35  # initial exploration std value
+exploratory: False       # adds variance to optionally learned logvars
+exploration_factor: 0.2  # initial exploration value
 exploration_wd: True  # decay exploration over time
-wd_max_steps: 500  # number of steps to terminate the added variance
+wd_max_steps: 1000  # number of steps to terminate the added variance
+
 
 # molecular crystal settings
 ################################################################
 # scales the energy function
-molecule: urea  # 'nicotinamide' or 'urea'
-energy_function: latent_harmonic
+energy_function: crystal_multiharmonic
   # 'latent_harmonic' : unimadal harmonic potential in the latent space
   # 'crystal_harmonic': unimodal harmonic potential in the crystal space
   # 'latent_multiharmonic': multimodal harmonic potential in the latent space
   # 'crystal_multiharmonic': multimodal harmonic potential in the crystal space
   # 'ellipsoid_overlap' : minimize ellipsoid overlaps subject to energy_density_coeff external pressure
   # 'silu_energy' : minimize a softened LJ-tye energy subject to energy_density_coeff external pressure
-anneal_energy: false  # scale temperature over time, when conditional it scales the distribution, when not it just decreases from static to min
-energy_density_coeff: 2.0  # how much to weight the density penalty term in the energy function
+anneal_energy: true  # scale temperature over time, when conditional it scales the distribution, when not it just decreases from static to min
+energy_density_coeff: 0.1  # how much to weight the density penalty term in the energy function
 temperature_conditioning: false  # if false, temperatures are set to energy_static_temperature, and there is no annealing
 energy_min_temperature: 0.01
 energy_max_temperature: 1
-energy_static_temperature: 1  # for certain evaluations or static T training
+energy_static_temperature: 1  # for certain evaluations
 temperature_scaling_factor: 0.01  # controls relative frequency of higher vs lower temperatures (higher -> higher)
-annealing_max_steps: 2500  # time for scaling_factor to reach 1 (uniform sampling from min to max)
-energy_clip: 1000
-
-############
-############
-############
-############
-############
-############
-############
-############
-############
-############
+annealing_max_steps: 5000  # time for scaling_factor to reach 1 (uniform sampling from min to max)
+energy_clip: 20
 
 # deprecated or un-used
 max_iter_ls: 100                # DEPRECATED # how many iterations to run local search
@@ -132,4 +122,3 @@ local_search: false             # DEPRECATED we now combine preloaded and sample
 energy_annealing_threshold: 1.0e-1 # UNUSED
 convergence_history: 100  # UNUSED
 bwd_policy: 'brownian_bridge'       # 'brownian_bridge' or 'gaussian'
-partial_energy: false

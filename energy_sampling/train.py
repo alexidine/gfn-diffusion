@@ -42,15 +42,22 @@ if args.local_search:
 times = {}
 
 
-def train_step(energy_function, gfn_model,
-               fwd_gfn_optimizer,
-               bwd_gfn_optimizer,
-               it, exploration_std, buffer, mol_loader, repeats: int = 10):
+def train_step(energy_function,
+               gfn_model,
+               optimizers,
+               it,
+               exploration_std,
+               buffer, mol_loader, repeats: int = 10):
     do_forward = False
     do_backward = False
     add_to_buffer = False
     if args.both_ways:
-        if it % args.fwd_train_each == 0:
+        if args.fwd_to_bwd_ratio == 1:
+            do_fwd = it % 2 == 0  # always do fwd first
+        else:
+            p_forward = args.fwd_to_bwd_ratio / (args.fwd_to_bwd_ratio + 1)
+            do_fwd = np.random.choice([0, 1], 1, p=[p_forward, 1 - p_forward])
+        if do_fwd:
             if args.sampling == 'buffer':
                 add_to_buffer = True
             do_forward = True
@@ -64,7 +71,7 @@ def train_step(energy_function, gfn_model,
     discretizer = get_discretizer(args.discretizer)
 
     if do_forward:
-        fwd_gfn_optimizer.zero_grad()
+        optimizers['fwd'].zero_grad()
         mol_batch = next(iter(mol_loader)).to(device)
         loss, states, log_pfs, log_pbs, log_r, log_fs, crystal_batch = fwd_train_step(energy_function,
                                                                                       gfn_model,
@@ -79,7 +86,7 @@ def train_step(energy_function, gfn_model,
             buffer.add(crystal_batch.cpu().detach().to_data_list())
 
     elif do_backward:
-        bwd_gfn_optimizer.zero_grad()
+        optimizers['bwd'].zero_grad()
         loss, states, log_pfs, log_pbs, log_r, log_fs = bwd_train_step(gfn_model,
                                                                        discretizer,
                                                                        buffer,
@@ -94,9 +101,12 @@ def train_step(energy_function, gfn_model,
     torch.nn.utils.clip_grad_norm_(gfn_model.parameters(),
                                    args.gradient_norm_clip)  # gradient clipping
     if do_forward:
-        fwd_gfn_optimizer.step()
+        optimizers['fwd'].step()
+        optimizers['flow'].step()
     elif do_backward:
-        bwd_gfn_optimizer.step()
+        optimizers['bwd'].step()
+        optimizers['flow'].step()
+
     return loss.item(), "Forward" if do_forward else "Backward"
 
 
@@ -108,6 +118,8 @@ def get_discretizer(discretization_type):
         traj_length = args.T
     elif args.traj_length_strategy == 'sampled':
         traj_length = np.random.randint(low=args.min_traj_length, high=args.max_traj_length + 1)
+    else:
+        assert False
 
     if discretization_type == 'random':
         discretizer = lambda bsz: random_discretizer(bsz, traj_length, max_ratio=args.discretizer_max_ratio)
@@ -192,16 +204,14 @@ def train():
                     log_var_range=args.log_var_range,
                     pb_scale_range=args.pb_scale_range,
                     t_scale=args.t_scale,
-                    conditional_flow_model=args.conditional_flow_model, learn_pb=args.learn_pb,
+                    conditional_flow_model=args.temperature_conditioning, learn_pb=args.learn_pb,
                     lgv_layers=args.lgv_layers,
                     joint_layers=args.joint_layers, dropout=args.dropout, norm=args.norm,
                     zero_init=args.zero_init, device=device).to(device)
 
     wandb.watch(gfn_model, log_graph=True, log_freq=1000)  # for gradient logging
 
-    (forward_optimizer, backward_optimizer,
-     fwd_scheduler1, fwd_scheduler2,
-     bwd_scheduler1, bwd_scheduler2) = init_schedulers_optimizers(
+    optimizers, schedulers = init_schedulers_optimizers(
         gfn_model)
     buffer, mol_loader = init_buffers_datasets(energy_function)
 
@@ -212,11 +222,11 @@ def train():
     lr_warmup_finished = False
     # maxes out at 1, triggering every 10 steps
     # go from initial to final scaling value in annealing_max_steps
-    if args.conditional_flow_model:
+    if args.temperature_conditioning:
         annealing_lambda = (1 / args.temperature_scaling_factor) ** (1 / (args.annealing_max_steps / 10))
     else:
         annealing_lambda = (args.energy_min_temperature / args.energy_static_temperature) ** (
-                    1 / (args.annealing_max_steps / 10))
+                1 / (args.annealing_max_steps / 10))
 
     fwd_loss, bwd_loss = 0, 0
     gfn_model.train()
@@ -234,8 +244,7 @@ def train():
             #torch.autograd.set_detect_anomaly(True)  # for debugging
             train_loss, step_type = train_step(energy_function,
                                                gfn_model,
-                                               forward_optimizer,
-                                               backward_optimizer,
+                                               optimizers,
                                                step_ind,
                                                exploration_std,
                                                buffer,
@@ -259,12 +268,11 @@ def train():
             wandb.log(metrics, step=step_ind)
 
         elif step_ind % 10 == 0 and step_ind > 9:
-            lr_warmup_finished, lr = step_lr_schedule(bwd_scheduler1, bwd_scheduler2,
-                                                      forward_optimizer,
-                                                      fwd_scheduler1, fwd_scheduler2,
-                                                      lr_warmup_finished)
+            lr_warmup_finished, lr = step_lr_schedule(schedulers, optimizers, lr_warmup_finished)
             anneal_reward(annealing_lambda, energy_function, args)
-            metrics.update({'lr': forward_optimizer.param_groups[0]['lr']})
+            metrics.update({'lr_fwd': optimizers['fwd'].param_groups[0]['lr']})
+            metrics.update({'lr_bwd': optimizers['bwd'].param_groups[0]['lr']})
+            metrics.update({'lr_flow': optimizers['flow'].param_groups[0]['lr']})
             metrics.update(log_elapsed_times())
             metrics['Forward Loss'] = fwd_loss
             metrics['Backward Loss'] = bwd_loss
@@ -279,7 +287,7 @@ def train():
 def anneal_reward(annealing_lambda, energy_function, args):
     """anneal reward function"""
     if args.anneal_energy:
-        if args.conditional_flow_model:
+        if args.temperature_conditioning:
             if energy_function.temperature_scaling_factor < 1:
                 energy_function.temperature_scaling_factor *= annealing_lambda
         else:
@@ -287,19 +295,20 @@ def anneal_reward(annealing_lambda, energy_function, args):
                 energy_function.temperature *= annealing_lambda
 
 
-def step_lr_schedule(bwd_scheduler1, bwd_scheduler2, forward_optimizer, fwd_scheduler1, fwd_scheduler2,
+def step_lr_schedule(schedulers, optimizers,
                      lr_warmup_finished):
     if args.scheduler:
-        lr = forward_optimizer.param_groups[0]['lr']
+        lr = optimizers['fwd'].param_groups[0]['lr']
         if not lr_warmup_finished:
-            fwd_scheduler1.step()
-            bwd_scheduler1.step()
+            schedulers['fwd_1'].step()
+            schedulers['bwd_1'].step()
             if lr >= args.lr_policy:
                 lr_warmup_finished = True
 
         elif lr > args.min_lr:
-            fwd_scheduler2.step()
-            bwd_scheduler2.step()
+            schedulers['fwd_2'].step()
+            schedulers['bwd_2'].step()
+            schedulers['flow'].step()
         return lr_warmup_finished, lr
     else:
         return False, None
@@ -307,35 +316,53 @@ def step_lr_schedule(bwd_scheduler1, bwd_scheduler2, forward_optimizer, fwd_sche
 
 def init_schedulers_optimizers(gfn_model):
     if args.scheduler:
-        init_policy_lr = args.lr_policy / 100
-        init_flow_lr = args.lr_flow / 100
-        init_back_lr = args.lr_back / 100
+        init_fwd_lr = args.lr_policy / 100
+        init_flow_lr = args.lr_flow / 10
+        init_bwd_lr = args.lr_back / 100
     else:
-        init_policy_lr = args.lr_policy
+        init_fwd_lr = args.lr_policy
+        init_bwd_lr = args.lr_back
         init_flow_lr = args.lr_flow
-        init_back_lr = args.lr_back
-    forward_optimizer = get_gfn_optimizer(gfn_model,
-                                          init_policy_lr,
-                                          init_flow_lr,
-                                          args.conditional_flow_model,
-                                          args.use_weight_decay,
-                                          args.weight_decay)
-    backward_optimizer = get_gfn_optimizer(gfn_model,
-                                           init_back_lr,
-                                           init_flow_lr,
-                                           args.conditional_flow_model,
-                                           args.use_weight_decay,
-                                           args.weight_decay)
-    if args.scheduler:
-        lr_warmup_lambda = (100) ** (1 / (args.lr_warmup_time / 10))  # grow over 2 orders
-        lr_annealing_lambda = (args.min_lr / args.lr_policy) ** (1 / (args.lr_anneal_time / 10))
-        fwd_scheduler1 = lr_scheduler.MultiplicativeLR(forward_optimizer, lr_lambda=lambda epoch: lr_warmup_lambda)
-        fwd_scheduler2 = lr_scheduler.MultiplicativeLR(forward_optimizer, lr_lambda=lambda epoch: lr_annealing_lambda)
-        bwd_scheduler1 = lr_scheduler.MultiplicativeLR(backward_optimizer, lr_lambda=lambda epoch: lr_warmup_lambda)
-        bwd_scheduler2 = lr_scheduler.MultiplicativeLR(backward_optimizer, lr_lambda=lambda epoch: lr_annealing_lambda)
+
+    """
+    Initialize Optimizers
+    """
+    policy_params = [{'params': gfn_model.t_model.parameters()},
+                     {'params': gfn_model.s_model.parameters()},
+                     {'params': gfn_model.forward_policy.parameters()},
+                     {'params': gfn_model.backward_policy.parameters()},
+                     ]
+    if args.temperature_conditioning:
+        policy_params += [{'params': gfn_model.conditions_embedding_model.parameters()}]
+
+    flow_params = gfn_model.flow_model.parameters()
+
+    optimizers = {}
+    if args.use_weight_decay:
+        optimizers['fwd'] = torch.optim.Adam(policy_params, init_fwd_lr, weight_decay=args.weight_decay)
+        optimizers['bwd'] = torch.optim.Adam(policy_params, init_bwd_lr, weight_decay=args.weight_decay)
+        optimizers['flow'] = torch.optim.Adam(flow_params, init_flow_lr, weight_decay=args.weight_decay)
     else:
-        fwd_scheduler1, fwd_scheduler2, bwd_scheduler1, bwd_scheduler2 = None, None, None, None
-    return forward_optimizer, backward_optimizer, fwd_scheduler1, fwd_scheduler2, bwd_scheduler1, bwd_scheduler2
+        optimizers['fwd'] = torch.optim.Adam(policy_params, init_fwd_lr)
+        optimizers['bwd'] = torch.optim.Adam(policy_params, init_bwd_lr)
+        optimizers['flow'] = torch.optim.Adam(flow_params, init_flow_lr)
+
+    schedulers = {}
+    if args.scheduler:
+        lr_warmup_lambda = 100 ** (1 / (args.lr_warmup_time / 10))  # grow over 2 orders
+        lr_annealing_lambda = (args.min_lr / args.lr_policy) ** (1 / (args.lr_anneal_time / 10))
+        schedulers['fwd_1'] = lr_scheduler.MultiplicativeLR(optimizers['fwd'], lr_lambda=lambda epoch: lr_warmup_lambda)
+        schedulers['fwd_2'] = lr_scheduler.MultiplicativeLR(optimizers['fwd'],
+                                                            lr_lambda=lambda epoch: lr_annealing_lambda)
+        schedulers['bwd_1'] = lr_scheduler.MultiplicativeLR(optimizers['bwd'], lr_lambda=lambda epoch: lr_warmup_lambda)
+        schedulers['bwd_2'] = lr_scheduler.MultiplicativeLR(optimizers['bwd'],
+                                                            lr_lambda=lambda epoch: lr_annealing_lambda)
+
+        flow_annealing_lambda = ((init_flow_lr/10)/init_flow_lr) ** (1 / (args.lr_anneal_time / 10))
+        schedulers['flow'] = lr_scheduler.MultiplicativeLR(optimizers['flow'],
+                                                            lr_lambda=lambda epoch: flow_annealing_lambda)
+
+    return optimizers, schedulers
 
 
 def init_buffers_datasets(energy_function):

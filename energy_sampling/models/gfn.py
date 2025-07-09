@@ -91,7 +91,7 @@ class GFN(nn.Module):
                 logvar = logvar_i
             else:
                 logvar = torch.tanh(logvar_i) * self.log_var_range
-        return mean, (logvar + np.log(self.pf_std_per_traj) * 2.0).clip(min=-3, max=3)
+        return mean, (logvar + np.log(self.pf_std_per_traj) * 2.0).clip(min=-10, max=10)
 
     def call_forward_policy(self, state, time, condition_embedding):
         batch_size = state.shape[0]
@@ -180,12 +180,9 @@ class GFN(nn.Module):
             states[:, i + 1] = current_state
 
             if return_gauss_params:
-                #if i > 0:
                 means_b[:, i, :] = back_mean - current_state
                 logvars_b[:, i, :] = (back_var / dts[:, None]).log()
-                #else:
-                    #    logvars_b[:, i, :] = -3  # placeholder
-                means_f[:, i, :] = pf_mean
+                means_f[:, i, :] = pf_mean * dts[:, None]
                 logvars_f[:, i, :] = pflogvars
 
         if return_gauss_params:
@@ -248,7 +245,7 @@ class GFN(nn.Module):
             if return_gauss_params:
                 means_b[:, i, :] = back_mean - current_state
                 logvars_b[:, i, :] = (back_var / dts[:, None]).log()
-                means_f[:, i, :] = pf_mean
+                means_f[:, i, :] = pf_mean * dts[:, None]
                 logvars_f[:, i, :] = pflogvars
 
             current_state = prev_state

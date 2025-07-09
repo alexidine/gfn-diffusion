@@ -1,5 +1,6 @@
 from typing import Optional
 
+import numpy as np
 import torch.nn.functional as F
 import torch
 from mxtaltools.dataset_utils.utils import collate_data_list
@@ -370,6 +371,35 @@ def bwd_mle(terminal_state, gfn, discretizer, log_r, condition=None, return_exp:
         return loss
 
 
+def bwd_mle_batch(terminal_state, gfn, discretizer, log_r, condition=None, return_exp: bool = False, repeats: int = 10):
+    """
+    Use importance sampling on the backwards trajectories to weight the forward policy probability loss
+    """
+
+    condition = condition.repeat(repeats, 1)
+    terminal_state = terminal_state.repeat(repeats, 1)
+    log_r = log_r.repeat(repeats)
+
+    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, discretizer, condition)
+
+    log_pb_rep = log_pbs.sum(-1).view(repeats, -1)
+    log_pf_rep = log_pfs.sum(-1).view(repeats, -1)
+
+    # Shape: (repeats, batch_size)
+    log_w = log_pf_rep - log_pb_rep
+
+    # log-sum-exp over repeats (dim 0), then subtract log(repeats)
+    log_p_marginal = torch.logsumexp(log_w, dim=0) - np.log(repeats)
+
+    # Final loss: negative log marginal likelihood for each x_T
+    loss = -log_p_marginal
+
+    if return_exp:
+        return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
+    else:
+        return loss
+
+
 def get_gfn_forward_loss(mode, init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std=None,
                          return_exp=False, condition=None, repeats=10, reweight_T: Optional[float] = None):
     if mode == 'tb':
@@ -404,12 +434,16 @@ def get_gfn_forward_loss(mode, init_state, gfn_model, log_reward, discretizer, m
 
     losses, *rest = out
     if reweight_T is not None:  # optionally reweight losses to minimize large outliers
-        weights = torch.softmax(-losses / reweight_T, dim=0) * len(losses)
-    else:
-        weights = torch.ones_like(losses)
-    loss = (weights * losses).mean()
+        weights = torch.softmax(-losses.detach() / reweight_T, dim=0) * len(losses)
+        weights += 1e-2  # minimum relative contribution
+        weights /= weights.sum()
+        loss = (weights * losses).mean()
 
-    return (loss, *rest)
+    else:
+        loss = losses.mean()
+
+
+    return loss, *rest
 
 
 def get_gfn_backward_loss(mode, samples, gfn_model, rewards, discretizer, exploration_std=None, condition=None,
@@ -425,15 +459,20 @@ def get_gfn_backward_loss(mode, samples, gfn_model, rewards, discretizer, explor
                         return_exp=return_exp)
     elif mode == 'mle':
         out = bwd_mle(samples, gfn_model, discretizer, rewards, condition=condition, return_exp=return_exp)
-
+    elif mode == 'mle_batch':
+        out = bwd_mle_batch(samples, gfn_model, discretizer, rewards, condition=condition, return_exp=return_exp,
+                            repeats=repeats)
     else:
         assert False
 
     losses, *rest = out
     if reweight_T is not None:  # optionally reweight losses to minimize large outliers
-        weights = torch.softmax(-losses / reweight_T, dim=0) * len(losses)
-    else:
-        weights = torch.ones_like(losses)
-    loss = (weights * losses).mean()
+        weights = torch.softmax(-losses.detach() / reweight_T, dim=0) * len(losses)
+        weights += 1e-2  # minimum relative contribution
+        weights /= weights.sum()
+        loss = (weights * losses).mean()
 
-    return (loss, *rest)
+    else:
+        loss = losses.mean()
+
+    return loss, *rest

@@ -8,7 +8,11 @@ from mxtaltools.reporting.online import simple_embedding_fig, simple_cell_hist, 
     log_crystal_samples, simple_latent_hist
 from plotly import graph_objects as go
 from plotly.subplots import make_subplots
+from scipy.spatial import Voronoi
+from scipy.spatial.distance import cdist
 from scipy.stats import pearsonr
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.decomposition import PCA
 
 from plot_utils import get_plotly_fig_size_mb
 from sample_metrics import compute_distribution_distances
@@ -122,18 +126,49 @@ def eval_step(energy_function,
 
 
 def generate_fwd_figs(buffer, energy_function,
-                      condition, flow_states, gfn_model, init_state, log_fs, log_pbs,
-                      log_pfs, log_r, f_vars_f, f_means_f, f_vars_b, f_means_b, sample_batch):
+                      condition, flow_states,
+                      gfn_model, init_state,
+                      log_fs, log_pbs, log_pfs, log_r,
+                      f_vars_f, f_means_f, f_vars_b, f_means_b, sample_batch):
+    fig_dict = {}
+
     buffer_cell_params, buffer_latent_params, buffer_std_params, buffer_reward, buffer_batch = get_buffer_stats(buffer)
     std_cell_params = sample_batch.cell_params_to_gen_basis().cpu().detach()
 
+    known_modes = energy_function.crystal_modes.detach().cpu().numpy() if hasattr(energy_function, 'modes') else None
+    if known_modes is not None:
+        known_modes_std = energy_function.modes.detach().cpu()
+        dists = torch.cdist(std_cell_params.cpu().detach().float(), known_modes_std.float())
+        nearest_sample = dists.amin(0)
+        cutoff = 1
+        fig_dict['Mode Coverage'] = np.mean(nearest_sample.numpy() < cutoff)
 
+        # Gaussian kernel: soft coverage
+        sigma = 1.0  # can tune this
+        kernel_vals = torch.exp(-0.5 * (dists / sigma) ** 2)  # [num_generated, num_modes]
 
-    fig_dict = {}
+        # Reduce over generated samples (axis=0) to get "best coverage" per mode
+        coverage_per_mode = kernel_vals.max(dim=0).values  # [num_modes]
+
+        fig_dict['Soft Mode Coverage'] = coverage_per_mode.mean()
+
+    sample_embedding, anchor_embedding, cluster_ind, anchor_inds = embed_samples(buffer_std_params,
+                                                                                 buffer_reward,
+                                                                                 std_cell_params.cpu().detach().numpy(),
+                                                                                 log_r.cpu().detach().numpy(),
+                                                                                 known_modes)
+    fig_dict['Sample Embedding'] = cluster_fig(sample_embedding, anchor_embedding, cluster_ind)
+
+    # fig_dict['Sample Embedding'] = simple_embedding_fig(std_cell_params.numpy(),
+    #                                                     aux_array=sample_batch.gfn_energy.cpu().detach().numpy(),
+    #                                                     reference_distribution=buffer_std_params,
+    #                                                     known_minima=known_modes_std.numpy() if known_modes is not None else None
+    #                                                     )
+
     conditional = len(condition.unique()) != 1
     if conditional:
-        fig_dict['Learned Z vs T'] = Z_vs_T_fig(gfn_model, init_state)
-        fig_dict['T vs Energy'] = T_vs_E_fig(condition, sample_batch)
+        fig_dict['temp/Learned Z vs T'] = Z_vs_T_fig(gfn_model, init_state)
+        fig_dict['temp/T vs Energy'] = T_vs_E_fig(condition, sample_batch)
     fig_dict['Forward Gauss Params'] = mean_var_fig(f_vars_f, f_means_f,
                                                     f_vars_b, f_means_b)
     fig_dict['Traj Mean Step Sizes'] = mean_flow_step_sizes(flow_states)
@@ -150,34 +185,218 @@ def generate_fwd_figs(buffer, energy_function,
         (condition[:, 0].cpu().detach().numpy()) if condition is not None else None,
         aux_scalar_name='log_temperature' if condition is not None else None)
 
-    known_modes = energy_function.crystal_modes.detach() if hasattr(energy_function, 'modes') else None
-    if known_modes is not None:
-        known_modes_std = energy_function.modes.cpu().detach()
-        dists = torch.cdist(std_cell_params.cpu().detach().float(), known_modes_std.float())
-        nearest_sample = dists.amin(0)
-        cutoff = 1
-        fig_dict['Mode Coverage'] = np.mean(nearest_sample.numpy() < cutoff)
-
-        # Gaussian kernel: soft coverage
-        sigma = 1.0  # can tune this
-        kernel_vals = torch.exp(-0.5 * (dists / sigma) ** 2)  # [num_generated, num_modes]
-
-        # Reduce over generated samples (axis=0) to get "best coverage" per mode
-        coverage_per_mode = kernel_vals.max(dim=0).values  # [num_modes]
-
-        fig_dict['Soft Mode Coverage'] = coverage_per_mode.mean()
-
-    fig_dict['Sample Embedding'] = simple_embedding_fig(std_cell_params.numpy(),
-                                                        aux_array=sample_batch.gfn_energy.cpu().detach().numpy(),
-                                                        reference_distribution=buffer_std_params,
-                                                        known_minima=known_modes_std.numpy() if known_modes is not None else None
-                                                        )
-
     return fig_dict
 
-def embed_samples(ref_samples, ref_rewards, samples, sample_rewards):
-    aa = 1
-    return None
+
+def agglomerative_cluster(ens, samples, energy_cutoff: float = 0.0, min_dist: float = 5):
+    # Can use full dataset or low-energy subset only
+    mask = ens < energy_cutoff
+    X_lowE = samples[mask]
+
+    model = AgglomerativeClustering(
+        n_clusters=None,
+        distance_threshold=min_dist,  # stop when all clusters > threshold apart
+        linkage='ward'
+    )
+    labels = model.fit_predict(X_lowE)
+
+    # Pick 1 lowest-energy point from each cluster as an anchor
+    anchors = []
+    anchor_indices = []
+
+    for lbl in np.unique(labels):
+        members = np.where(labels == lbl)[0]
+        best_idx = members[np.argmin(ens[mask][members])]
+        anchors.append(X_lowE[best_idx])
+        anchor_indices.append(np.where(mask)[0][best_idx])
+    return anchors, anchor_indices
+
+
+def embed_samples(ref_samples, ref_rewards, samples, sample_rewards, known_modes=None, min_dist: float = 20.0, ):
+    """
+    Cluster samples via agglomerative clustering
+    Also, embed them in PC space
+    :param ref_samples:
+    :param ref_rewards:
+    :param samples:
+    :param sample_rewards:
+    :return:
+    """
+
+    if ref_samples is not None:
+        all_samples = np.concatenate([ref_samples, samples])
+        all_energies = -np.concatenate([ref_rewards, sample_rewards])
+    else:
+        all_samples = samples
+        all_energies = -sample_rewards
+
+    if known_modes is not None:
+        all_samples = np.concatenate([known_modes, all_samples])
+        anchors = known_modes
+        anchor_inds = np.arange(len(known_modes))
+    else:  # todo allow these to mix, instead of just replacing
+        en_stats = [np.amin(all_energies), np.amax(all_energies), np.ptp(all_energies)]
+
+        if en_stats[0] < 0:  # if there are any bound states
+            en_cutoff = 0
+        else:  # cluster bottom 20%
+            en_cutoff = np.quantile(all_energies, 0.2) + 1e-2
+
+        anchors, anchor_inds = agglomerative_cluster(all_energies,
+                                                     all_samples,
+                                                     min_dist=min_dist,
+                                                     energy_cutoff=en_cutoff)
+        anchors = np.array(anchors)
+
+    dists = cdist(all_samples, anchors)  # shape (N_samples, N_anchors)
+    cluster_ind = np.argmin(dists, axis=1)
+
+    """PCA is also good"""
+    pca = PCA(n_components=2)
+    sample_embedding = pca.fit_transform(all_samples)
+    anchor_embedding = pca.transform(anchors)
+
+    return sample_embedding, anchor_embedding, cluster_ind, np.array(anchor_inds)
+
+
+def voronoi_finite_polygons_2d(vor, radius=None):
+    """
+    Reconstruct infinite Voronoi regions into finite polygons.
+
+    Code adapted from:
+    https://gist.github.com/pv/8036995
+    """
+    if vor.points.shape[1] != 2:
+        raise ValueError("Requires 2D input")
+
+    new_regions = []
+    new_vertices = vor.vertices.tolist()
+
+    center = vor.points.mean(axis=0)
+    if radius is None:
+        radius = vor.points.ptp().max() * 2  # large enough
+
+    # Map ridge points to ridges
+    all_ridges = {}
+    for (p1, p2), (v1, v2) in zip(vor.ridge_points, vor.ridge_vertices):
+        all_ridges.setdefault(p1, []).append((p2, v1, v2))
+        all_ridges.setdefault(p2, []).append((p1, v1, v2))
+
+    for p1, region_index in enumerate(vor.point_region):
+        region = vor.regions[region_index]
+        if -1 not in region:
+            # Finite region
+            new_regions.append([vor.vertices[i] for i in region])
+            continue
+
+        ridges = all_ridges[p1]
+        new_region = []
+        for p2, v1, v2 in ridges:
+            if v2 < 0:
+                v1, v2 = v2, v1
+            if v1 >= 0 and v2 >= 0:
+                # both vertices are finite
+                new_region.append(vor.vertices[v2].tolist())
+                continue
+
+            # Compute the missing endpoint of an infinite ridge
+            t = vor.points[p2] - vor.points[p1]  # tangent
+            t /= np.linalg.norm(t)
+            n = np.array([-t[1], t[0]])  # normal
+
+            midpoint = vor.points[[p1, p2]].mean(axis=0)
+            direction = np.sign(np.dot(midpoint - center, n)) * n
+            far_point = vor.vertices[v2] + direction * radius
+
+            new_vertices.append(far_point.tolist())
+            new_region.append(vor.vertices[v2].tolist())
+            new_region.append(far_point.tolist())
+
+        # Order region vertices
+        vs = np.array(new_region)
+        c = vs.mean(axis=0)
+        angles = np.arctan2(vs[:, 1] - c[1], vs[:, 0] - c[0])
+        new_region = vs[np.argsort(angles)]
+
+        new_regions.append(new_region)
+
+    return new_regions
+
+
+def cluster_fig(sample_embedding, anchor_embedding, cluster_ind):
+    """
+    Figure for the clusters in PC space + Voronoi assignments
+    :param sample_embedding:
+    :param anchor_embedding:
+    :param cluster_ind:
+    :return:
+    """
+    if len(anchor_embedding) > 1:
+        vor = Voronoi(anchor_embedding)
+        polygons = voronoi_finite_polygons_2d(vor)
+    else:
+        polygons = None
+
+    x_all = np.concatenate([sample_embedding[:, 0], anchor_embedding[:, 0]])
+    y_all = np.concatenate([sample_embedding[:, 1], anchor_embedding[:, 1]])
+
+    colorscale_name = "rainbow"  # or "viridis", "plasma", etc.
+    n_clusters = len(set(cluster_ind))
+    distinct_colors = pc.sample_colorscale(colorscale_name, [i / max(n_clusters - 1, 1) for i in range(n_clusters)])
+    cluster_to_color = {i: distinct_colors[i] for i in range(n_clusters)}
+    mapped_colors = [cluster_to_color[c] for c in cluster_ind]
+
+    fig = go.Figure()
+
+    fig.add_trace(go.Scattergl(x=sample_embedding[:, 0],
+                               y=sample_embedding[:, 1],
+                               mode='markers',
+                               opacity=0.85,
+                               name='Policy Samples',
+                               showlegend=True,
+                               marker=dict(
+                                   size=6,
+                                   color=mapped_colors,
+                                   colorbar=dict(title="Cluster Membership")
+                               )
+                               ))
+
+    fig.add_trace(go.Scattergl(x=anchor_embedding[:, 0],
+                               y=anchor_embedding[:, 1],
+                               mode='markers',
+                               opacity=1,
+                               name='Minima',
+                               showlegend=True,
+                               marker=dict(
+                                   size=15,
+                                   color=[cluster_to_color[ind] for ind in range(len(anchor_embedding))],  # Fill color
+                                   line=dict(
+                                       color='black',  # Outline color
+                                       width=4  # Outline thickness
+                                   )
+                               )
+                               ))
+    if polygons is not None:
+        for ind, poly in enumerate(polygons):
+            cluster_color = cluster_to_color[ind]
+            fig.add_trace(go.Scattergl(
+                x=np.array(poly)[:, 0],
+                y=np.array(poly)[:, 1],
+                mode='lines',
+                line=dict(color=cluster_color, width=1),
+                fill='toself',
+                fillcolor=cluster_color,
+                opacity=0.1,
+                hoverinfo='skip',
+                showlegend=False
+            ))
+
+    fig.update_layout(
+        xaxis_range=[x_all.min() - 1, x_all.max() + 1],
+        yaxis_range=[y_all.min() - 1, y_all.max() + 1]
+    )
+
+    return fig
 
 
 #
@@ -219,7 +438,8 @@ def embed_samples(ref_samples, ref_rewards, samples, sample_rewards):
 #
 # import umap
 # reducer = umap.UMAP(n_components=2, n_neighbors=30, min_dist=0.05)
-# reducer.fit(anchors)  # Learn manifold from anchors
+# reduc
+# er.fit(anchors)  # Learn manifold from anchors
 # embedding = reducer.transform(X)  # Project full dataset
 # anchor_embedding = reducer.transform(anchors)
 #
@@ -272,8 +492,9 @@ def generate_bwd_figs(fig_dict, buffer, gfn_model, init_state, discretizer):
         n_trajs=20, log_r=b_log_r.cpu().detach().numpy())
 
     fig_dict['Backward Pf vs Pb'] = Pf_vs_Pb_fig(b_log_pfs, b_log_pbs, b_log_r)
-    fig_dict['Backward TB Parity Plot'], fig_dict['Backward TB R Value'] = flow_parity_plot(b_log_r.to(b_log_fs.device), b_log_fs[:, 0], b_log_pbs,
-                                                           b_log_pfs)
+    fig_dict['Backward TB Parity Plot'], fig_dict['Backward TB R Value'] = flow_parity_plot(b_log_r.to(b_log_fs.device),
+                                                                                            b_log_fs[:, 0], b_log_pbs,
+                                                                                            b_log_pfs)
     fig_dict['Backward Gauss Params'] = mean_var_fig(b_vars_f, b_means_f,
                                                      b_vars_b, b_means_b)
     fig_dict['Bwd Traj Mean Step Sizes'] = mean_flow_step_sizes(backward_flow_states)
@@ -297,11 +518,11 @@ def get_buffer_stats(buffer):
 
 
 def mean_var_fig(logvars_f, means_f, logvars_b, means_b):
-    fig = make_subplots(rows=2,cols=1)
+    fig = make_subplots(rows=2, cols=1)
     fig.add_scatter(y=np.nan_to_num(torch.exp(logvars_f).mean(0).cpu().detach().numpy()), name='Pf Var', row=2, col=1)
-    fig.add_scatter(y=np.nan_to_num(means_f.abs().mean(0).cpu().detach().numpy()), name='Pf Mean', row=1,col=1)
-    fig.add_scatter(y=np.nan_to_num(torch.exp(logvars_b).mean(0).cpu().detach().numpy()), name='Pb Var', row=2,col=1)
-    fig.add_scatter(y=np.nan_to_num(means_b.abs().mean(0).cpu().detach().numpy()), name='Pb Mean',row=1, col=1)
+    fig.add_scatter(y=np.nan_to_num(means_f.abs().mean(0).cpu().detach().numpy()), name='Pf Mean', row=1, col=1)
+    fig.add_scatter(y=np.nan_to_num(torch.exp(logvars_b).mean(0).cpu().detach().numpy()), name='Pb Var', row=2, col=1)
+    fig.add_scatter(y=np.nan_to_num(means_b.abs().mean(0).cpu().detach().numpy()), name='Pb Mean', row=1, col=1)
     fig.update_layout(xaxis2_title='Trajectory Step')
     return fig
 
@@ -521,7 +742,7 @@ def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs):
         name=f'{slope:.3f}x + {intercept:.3f}',
         showlegend=True
     ))
-    
+
     # Scatter points
     fig.add_trace(go.Scatter(
         x=x, y=y,

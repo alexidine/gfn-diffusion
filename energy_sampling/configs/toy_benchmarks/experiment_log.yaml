@@ -1,0 +1,84 @@
+- index: 0
+  tag: 0_baseline
+  update_keys:
+  - t_scale
+  - log_var_range
+  - learned_variance
+  - lr_flow
+  - lr_policy
+  - energy_function
+  - hidden_dim
+  - s_emb_dim
+  notes: baseline
+- index: 1
+  tag: 1_low_scale
+  update_keys:
+  - t_scale
+  - log_var_range
+  - learned_variance
+  - lr_flow
+  - lr_policy
+  - energy_function
+  - hidden_dim
+  - s_emb_dim
+  notes: null
+- index: 2
+  tag: 2_big_model
+  update_keys:
+  - t_scale
+  - log_var_range
+  - learned_variance
+  - lr_flow
+  - lr_policy
+  - energy_function
+  - hidden_dim
+  - s_emb_dim
+  notes: null
+- index: 3
+  tag: 3_low_flow_lr
+  update_keys:
+  - t_scale
+  - log_var_range
+  - learned_variance
+  - lr_flow
+  - lr_policy
+  - energy_function
+  - hidden_dim
+  - s_emb_dim
+  notes: null
+- index: 4
+  tag: 4_low_policy_lr
+  update_keys:
+  - t_scale
+  - log_var_range
+  - learned_variance
+  - lr_flow
+  - lr_policy
+  - energy_function
+  - hidden_dim
+  - s_emb_dim
+  notes: null
+- index: 5
+  tag: 5_learned_variance
+  update_keys:
+  - t_scale
+  - log_var_range
+  - learned_variance
+  - lr_flow
+  - lr_policy
+  - energy_function
+  - hidden_dim
+  - s_emb_dim
+  notes: null
+- index: 6
+  tag: 6_low_var_learned_var
+  update_keys:
+  - t_scale
+  - log_var_range
+  - learned_variance
+  - lr_flow
+  - lr_policy
+  - energy_function
+  - hidden_dim
+  - s_emb_dim
+  notes: null

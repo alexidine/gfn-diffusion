@@ -1,0 +1,87 @@
+defaults:
+  base: base.yaml
+
+experiments:
+  - tag: 0_baseline
+    update:
+      t_scale: 1.0
+      log_var_range: 2.0
+      learned_variance: false
+      lr_flow: 0.1,
+      lr_policy: 0.001
+      energy_function: latent_harmonic
+      hidden_dim: 64
+      s_emb_dim: 64
+    notes: baseline
+
+  - tag: 1_low_scale
+    update:
+      t_scale: 0.5
+      log_var_range: 2.0
+      learned_variance: false
+      lr_flow: 0.1,
+      lr_policy: 0.001
+      energy_function: latent_harmonic
+      hidden_dim: 64
+      s_emb_dim: 64
+    notes:
+
+  - tag: 2_big_model
+    update:
+      t_scale: 1.0
+      log_var_range: 2.0
+      learned_variance: false
+      lr_flow: 0.1,
+      lr_policy: 0.001
+      energy_function: latent_harmonic
+      hidden_dim: 128
+      s_emb_dim: 128
+    notes:
+
+  - tag: 3_low_flow_lr
+    update:
+      t_scale: 1.0
+      log_var_range: 2.0
+      learned_variance: false
+      lr_flow: 0.01,
+      lr_policy: 0.001
+      energy_function: latent_harmonic
+      hidden_dim: 64
+      s_emb_dim: 64
+    notes:
+
+  - tag: 4_low_policy_lr
+    update:
+      t_scale: 1.0
+      log_var_range: 2.0
+      learned_variance: false
+      lr_flow: 0.1,
+      lr_policy: 0.0001
+      energy_function: latent_harmonic
+      hidden_dim: 64
+      s_emb_dim: 64
+    notes:
+
+  - tag: 5_learned_variance
+    update:
+      t_scale: 1.0
+      log_var_range: 4.0
+      learned_variance: true
+      lr_flow: 0.1,
+      lr_policy: 0.001
+      energy_function: latent_harmonic
+      hidden_dim: 64
+      s_emb_dim: 64
+    notes:
+
+  - tag: 6_low_var_learned_var
+    update:
+      t_scale: 0.5
+      log_var_range: 4.0
+      learned_variance: true
+      lr_flow: 0.1,
+      lr_policy: 0.001
+      energy_function: latent_harmonic
+      hidden_dim: 64
+      s_emb_dim: 64
+    notes:
