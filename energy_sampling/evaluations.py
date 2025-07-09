@@ -156,7 +156,7 @@ def generate_fwd_figs(buffer, energy_function,
                                                                                  buffer_reward,
                                                                                  std_cell_params.cpu().detach().numpy(),
                                                                                  log_r.cpu().detach().numpy(),
-                                                                                 known_modes)
+                                                                                 known_modes_std if known_modes is not None else None)
     fig_dict['Sample Embedding'] = cluster_fig(sample_embedding, anchor_embedding, cluster_ind)
 
     # fig_dict['Sample Embedding'] = simple_embedding_fig(std_cell_params.numpy(),
@@ -357,7 +357,8 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind):
                                marker=dict(
                                    size=6,
                                    color=mapped_colors,
-                                   colorbar=dict(title="Cluster Membership")
+                                   #colorbar=dict(title="Cluster Membership")
+                                   showscale=False,
                                )
                                ))
 
@@ -370,6 +371,7 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind):
                                marker=dict(
                                    size=15,
                                    color=[cluster_to_color[ind] for ind in range(len(anchor_embedding))],  # Fill color
+                                   showscale=False,
                                    line=dict(
                                        color='black',  # Outline color
                                        width=4  # Outline thickness
@@ -388,7 +390,8 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind):
                 fillcolor=cluster_color,
                 opacity=0.1,
                 hoverinfo='skip',
-                showlegend=False
+                showlegend=False,
+                marker_showscale=False,
             ))
 
     fig.update_layout(

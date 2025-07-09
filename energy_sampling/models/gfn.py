@@ -92,38 +92,7 @@ class GFN(nn.Module):
             else:
                 logvar = torch.tanh(logvar_i) * self.log_var_range
         return mean, (logvar + np.log(self.pf_std_per_traj) * 2.0).clip(min=-10, max=10)
-
-    def call_forward_policy(self, state, time, condition_embedding):
-        batch_size = state.shape[0]
-
-        if torch.is_tensor(time):
-            time_encoding = self.t_model(time)
-        else:
-            time_encoding = self.t_model(time).repeat(batch_size, 1)
-        state_encoding = self.s_model(state, condition_embedding)
-        state_update = self.forward_policy(state_encoding,
-                                           time_encoding)
-
-        if self.clipping:
-            state_update = torch.clip(state_update, -self.gfn_clip, self.gfn_clip)
-
-        pf_mean, pf_logvars = self.split_params(state_update)  # drift and log variance terms
-
-        return pf_mean, pf_logvars
-
-    def call_backwards_gaussian_policy(self, state, time, condition_embedding):
-        batch_size = state.shape[0]
-        time_encoding = self.t_model(time).repeat(batch_size, 1)
-        state_encoding = self.s_model(state, condition_embedding)
-        state_update = self.backward_policy(state_encoding,
-                                            time_encoding)  # nx(2d) with d drift and d noise parameters
-
-        if self.clipping:
-            state_update = torch.clip(state_update, -self.gfn_clip, self.gfn_clip)
-
-        pb_mean, pb_logvars = self.split_params(state_update)  # drift and log variance terms
-
-        return pb_mean, pb_logvars
+    #
 
     def predict_next_state(self, s, t, condition_embedding):
         t = self.t_model(t)
@@ -156,9 +125,7 @@ class GFN(nn.Module):
 
             state_update = self.predict_next_state(current_state, ts[:, i], condition_embedding)
             pf_mean, pflogvars = self.split_params(state_update)
-
             pflogvars_sample = self.fwd_get_logvars(detach_traj, dts, exploration_std, i, pflogvars)
-
             next_state = self.fwd_propagate(current_state, detach_traj, dts, pf_mean, pflogvars_sample)
 
             noise = ((next_state - current_state) - dts.unsqueeze(1) * pf_mean) / (
@@ -171,10 +138,10 @@ class GFN(nn.Module):
             if i > 0:  # variance is exactly zero for the first step, so we can't use it
                 back_var = ((self.pf_std_per_traj ** 2) * (dts * ts[:, i] / ts[:, i + 1]).unsqueeze(
                     1) * back_var_correction)
+                noise_backward = (current_state - back_mean) / back_var.sqrt()
+                logpb[:, i] = -0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1)
             else:  # instead set this as a constant the model will have to learn around
                 back_var = torch.ones_like(back_mean) * 1e-1 * dts.unsqueeze(1)
-            noise_backward = (current_state - back_mean) / back_var.sqrt()
-            logpb[:, i] = -0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1)
 
             current_state = next_state
             states[:, i + 1] = current_state
@@ -223,15 +190,13 @@ class GFN(nn.Module):
                                 1) * back_var_correction)
 
                 prev_state = self.bwd_propagate(back_mean, back_var, current_state, detach_traj)
-
+                noise_backward = (prev_state - back_mean) / back_var.sqrt()
+                logpb[:, trajectory_length - i - 1] = -0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1)
             else:
                 # send it identically to the source state (0)
                 prev_state = torch.zeros_like(current_state)
                 back_mean = prev_state  # remember the back_mean in pb is for some reson the actual mean not the drift
                 back_var = torch.ones_like(back_mean) * 1e-1 * dts.unsqueeze(1)
-
-            noise_backward = (prev_state - back_mean) / back_var.sqrt()
-            logpb[:, trajectory_length - i - 1] = -0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1)
 
             pfs = self.predict_next_state(prev_state, ts[:, trajectory_length - i - 1], condition_embedding)
             pf_mean, pflogvars = self.split_params(pfs)
@@ -286,23 +251,20 @@ class GFN(nn.Module):
         return next_state
 
     def fwd_get_logvars(self, detach_traj, dts, exploration_std, i, pflogvars):
-        if exploration_std is None:
-            if detach_traj:
-                pflogvars_sample = pflogvars.detach()
+        if exploration_std is not None:
+            expl = exploration_std(None)
+            if expl > 0:
+                add_log_var = torch.full_like(pflogvars, np.log(exploration_std(i)) * 2) / dts.sqrt().unsqueeze(1)
+                pflogvars_sample = torch.logaddexp(pflogvars, add_log_var).detach()
             else:
                 pflogvars_sample = pflogvars
         else:
-            expl = exploration_std(
-                None)  # currently not using this arg -- could use ts here, would need changes to utils get_exploration_std
-            if expl <= 0.0:
-                pflogvars_sample = pflogvars.detach()
-            else:
-                add_log_var = torch.full_like(pflogvars, np.log(exploration_std(i)) * 2) / dts.sqrt().unsqueeze(1)
-                if detach_traj:
-                    pflogvars_sample = torch.logaddexp(pflogvars, add_log_var).detach()
-                else:
-                    pflogvars_sample = torch.logaddexp(pflogvars, add_log_var)
-        return pflogvars_sample
+            pflogvars_sample = pflogvars
+
+        if detach_traj:
+            return pflogvars_sample.detach()
+        else:
+            return pflogvars_sample
 
     def bwd_propagate(self, back_mean, back_var, current_state, detach_traj):
         if detach_traj:
@@ -605,6 +567,38 @@ class GFN(nn.Module):
     #         back_mean_correction, back_var_correction = torch.ones_like(state), torch.ones_like(state)
     #     return back_mean_correction, back_var_correction
 
+
+    # def call_forward_policy(self, state, time, condition_embedding):
+    #     batch_size = state.shape[0]
+    #
+    #     if torch.is_tensor(time):
+    #         time_encoding = self.t_model(time)
+    #     else:
+    #         time_encoding = self.t_model(time).repeat(batch_size, 1)
+    #     state_encoding = self.s_model(state, condition_embedding)
+    #     state_update = self.forward_policy(state_encoding,
+    #                                        time_encoding)
+    #
+    #     if self.clipping:
+    #         state_update = torch.clip(state_update, -self.gfn_clip, self.gfn_clip)
+    #
+    #     pf_mean, pf_logvars = self.split_params(state_update)  # drift and log variance terms
+    #
+    #     return pf_mean, pf_logvars
+    #
+    # def call_backwards_gaussian_policy(self, state, time, condition_embedding):
+    #     batch_size = state.shape[0]
+    #     time_encoding = self.t_model(time).repeat(batch_size, 1)
+    #     state_encoding = self.s_model(state, condition_embedding)
+    #     state_update = self.backward_policy(state_encoding,
+    #                                         time_encoding)  # nx(2d) with d drift and d noise parameters
+    #
+    #     if self.clipping:
+    #         state_update = torch.clip(state_update, -self.gfn_clip, self.gfn_clip)
+    #
+    #     pb_mean, pb_logvars = self.split_params(state_update)  # drift and log variance terms
+    #
+    #     return pb_mean, pb_logvars
     def get_expl_std(self, exploration_std, i):
         if exploration_std is None:
             expl = 0

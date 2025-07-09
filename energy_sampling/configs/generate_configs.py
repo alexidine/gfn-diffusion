@@ -86,6 +86,9 @@ def generate_grid(spec_path='experiments.yaml', output_dir='configs'):
             if k in grid_overrides and v in grid_overrides[k]:
                 overwrite_nested_dict(config, grid_overrides[k][v])
 
+            elif isinstance(v, (int, float, str, bool)):
+                config[k] = v
+
         with open(outdir / f"{i}.yaml", 'w') as f:
             yaml.dump(config, f, default_flow_style=False)
 
@@ -105,7 +108,7 @@ def generate_grid(spec_path='experiments.yaml', output_dir='configs'):
 
 if __name__ == "__main__":
     # for if the experiments are a list of single runs
-    generate_oneoffs(spec_path='toy_benchmarks/experiments1.yaml', output_dir='toy_benchmarks/')
+    #generate_oneoffs(spec_path='toy_benchmarks/experiments1.yaml', output_dir='toy_benchmarks/')
 
     # for if the experiments are run on a parameter grid
-    #generate_grid(spec_path='templates/experiments2.yaml', output_dir='urea_3')
+    generate_grid(spec_path='nicotinamide/experiments2.yaml', output_dir='nicotinamide/')

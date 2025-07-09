@@ -111,7 +111,7 @@ class MolecularCrystal(BaseSet):
                 self.crystal_modes = cluster_batch.latent_transform.inverse(self.modes,
                                                                             cluster_batch.sg_ind[:1],
                                                                             cluster_batch.radius[:1])
-            crystal_energy = 0.5 * (latents - self.modes[0]).pow(2).sum(dim=1) / self.temperature
+            crystal_energy = 0.5 * (latents - self.modes[0]).pow(2).sum(dim=1)
             # analytic Z = (2pi*T)^(d/2)
         elif self.energy_function == 'crystal_harmonic':
             # a trivial energy function, for testing
@@ -121,7 +121,7 @@ class MolecularCrystal(BaseSet):
                 self.crystal_modes = cluster_batch.latent_transform.inverse(self.modes,
                                                                             cluster_batch.sg_ind[:1],
                                                                             cluster_batch.radius[:1])
-            crystal_energy = 0.5 * (cell_params - self.crystal_modes[0]).pow(2).sum(dim=1) / self.temperature
+            crystal_energy = 0.5 * (cell_params - self.crystal_modes[0]).pow(2).sum(dim=1)
             # analytic Z = (2pi*T)^(d/2)
 
         elif self.energy_function == 'latent_multiharmonic':
@@ -134,7 +134,7 @@ class MolecularCrystal(BaseSet):
 
             diffs = latents[:, None, :] - self.modes[None, :, :]
             sqdist = (diffs ** 2).sum(dim=-1)  # (B, K)
-            exponent = -0.5 * sqdist / self.temperature  # (B, K)
+            exponent = -0.5 * sqdist   # (B, K)
             crystal_energy = -torch.logsumexp(exponent, dim=1)  # (B,)
             """
             #Partition function
@@ -156,7 +156,7 @@ class MolecularCrystal(BaseSet):
 
             diffs = latents[:, None, :] - self.modes[None, :, :]
             sqdist = (diffs ** 2).sum(dim=-1)  # (B, K)
-            exponent = -0.5 * sqdist / self.temperature  # (B, K)
+            exponent = -0.5 * sqdist   # (B, K)
             crystal_energy = -torch.logsumexp(exponent, dim=1)  # (B,)
 
         elif self.energy_function == 'ellipsoid_overlap':

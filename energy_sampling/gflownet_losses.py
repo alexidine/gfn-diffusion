@@ -442,7 +442,6 @@ def get_gfn_forward_loss(mode, init_state, gfn_model, log_reward, discretizer, m
     else:
         loss = losses.mean()
 
-
     return loss, *rest
 
 
