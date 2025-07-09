@@ -1,10 +1,10 @@
 run_name: 'mk_local_dev'
 seed: 12345
 device: 'cuda'
-lr_policy: 0.001              # learning rate of the policy network
+lr_policy: 0.0001              # learning rate of the policy network
 min_lr: 1.0e-6                # ihn
 lr_flow: 0.1                  # learning rate of the flow network
-lr_back: 0.001                # learning rate of the backward pass
+lr_back: 0.0001                # learning rate of the backward pass
 scheduler: True               # does LR warmup from max/100 -> max -> 1e-6 over the warmup and annealing period
 lr_warmup_time: 500
 lr_anneal_time: 10000
@@ -16,8 +16,8 @@ reweight_T: null                # 'null' or float: smaller values reduce the imp
 # model parameters
 zero_init: true
 joint_layers: 4              # number of layers in forward/backward policy models
-hidden_dim: 256              # dimensionality of hidden layer
-s_emb_dim: 256                # dimensionality of state embedding
+hidden_dim: 512              # dimensionality of hidden layer
+s_emb_dim: 512                # dimensionality of state embedding
 t_emb_dim: 32                # dimensionality of time embedding
 harmonics_dim: 64            # dimensionality of harmonic embedding
 condition_emb_dim: 32         # dimensionality of the conditioning embedding
@@ -41,25 +41,25 @@ max_traj_length: 20
 traj_length_strategy: sampled # 'static'  or 'sampled'  will do random between min and max traj lengths
 discretizer_max_ratio: 0.5    # maximum ratio between randomly sampled step sizes
 discretizer: 'random'        # 'random' 'low_discrepancy' 'equidistant' 'uniform'
-t_scale: 0.5                 # scales fixed forward policy variance
-log_var_range: 2.0           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
+t_scale: 0.25                 # scales fixed forward policy variance
+log_var_range: 4.0           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
 pb_scale_range: 0.1          # range of learned backward policy corrections, only for 'brownian_bridge'
 energy: "molecular_crystal"  # "molecular_crystal"
-mode_fwd: "tb"           # "tb" is trajectory balance, "vg" is VarGrad, "greedy" is a local greed + gradients, "tb_greedy", "vg_greedy" are combinations
-mode_bwd: "tb"               # "tb" is trajectory balance, "vg" is VarGrad, 'mle' is trajectory probability maximization
-repeats: 5                   # for conditional VarGrad training
-both_ways: false             # forward and backward training
-bwd_batch_multiplier: 5      # ratio of backward to foward batch size (much cheaper to evaluate)
+mode_fwd: "greedy"           # "tb" is trajectory balance, "vg" is VarGrad, "greedy" is a local greed + gradients, "tb_greedy", "vg_greedy" are combinations
+mode_bwd: "mle_batch"               # "tb" is trajectory balance, "vg" is VarGrad, 'mle' is trajectory probability maximization, 'mle_batch' is a more stable MLE
+repeats: 10                   # for conditional VarGrad training
+both_ways: true             # forward and backward training
+bwd_batch_multiplier: 1      # ratio of backward to foward batch size (much cheaper to evaluate)
 fwd_to_bwd_ratio: 1           # whether to do forward (>1) or backward (<1) training more often
 bwd: False                   # backward training only
 learn_pb: false               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
-learned_variance: false       # whether to learn policy variance
+learned_variance: true       # whether to learn policy variance
 clipping: true  # clip the maximumstep size induced by the policy model
 gfn_clip: 10.0  # clip the maximumstep size induced by the policy model
 
 # local search settings
 ################################################################
-buffer_path: null #'D:/crystal_datasets/urea_gfn_dataset.pt'
+buffer_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
 molecules_path: 'D:/crystal_datasets/test_qm9_dataset.pt'
 
 #buffer_path: '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt'
@@ -76,7 +76,7 @@ sampling: "buffer"
 ################################################################
 
 # exploration controls
-exploratory: True       # adds variance to optionally learned logvars
+exploratory: False       # adds variance to optionally learned logvars
 exploration_factor: 0.5  # initial exploration std value
 exploration_wd: True  # decay exploration over time
 wd_max_steps: 500  # number of steps to terminate the added variance
@@ -85,7 +85,7 @@ wd_max_steps: 500  # number of steps to terminate the added variance
 ################################################################
 # scales the energy function
 molecule: urea  # 'nicotinamide' or 'urea'
-energy_function: latent_multiharmonic
+energy_function: silu_energy
   # 'latent_harmonic' : unimadal harmonic potential in the latent space
   # 'crystal_harmonic': unimodal harmonic potential in the crystal space
   # 'latent_multiharmonic': multimodal harmonic potential in the latent space

@@ -91,7 +91,7 @@ class GFN(nn.Module):
                 logvar = logvar_i
             else:
                 logvar = torch.tanh(logvar_i) * self.log_var_range
-        return mean, (logvar + np.log(self.pf_std_per_traj) * 2.0).clip(min=-10, max=10)
+        return mean, (logvar + np.log(self.pf_std_per_traj) * 2.0).clip(min=-4, max=4)
     #
 
     def predict_next_state(self, s, t, condition_embedding):

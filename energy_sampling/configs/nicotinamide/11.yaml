@@ -21,7 +21,7 @@ energy: molecular_crystal
 energy_annealing_threshold: 0.1
 energy_clip: 1000
 energy_density_coeff: 2.0
-energy_function: latent_harmonic
+energy_function: silu_energy
 energy_max_temperature: 1
 energy_min_temperature: 0.01
 energy_static_temperature: 1
@@ -52,9 +52,9 @@ lgv_layers: 4
 local_search: false
 log_var_range: 1.0
 lr_anneal_time: 20000
-lr_back: 0.001
+lr_back: 0.0005
 lr_flow: 0.1
-lr_policy: 0.001
+lr_policy: 0.0005
 lr_warmup_time: 1000
 ls_cycle: 100
 max_batch_size: 1000
@@ -64,9 +64,9 @@ min_lr: 1.0e-06
 min_traj_length: 10
 mode_bwd: tb
 mode_fwd: tb
-molecule: urea
+molecule: nicotinamide
 molecules_path: /scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt
-norm: null
+norm: layer
 partial_energy: false
 pb_scale_range: 0.1
 pis_architectures: false
