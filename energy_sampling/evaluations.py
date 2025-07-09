@@ -152,12 +152,12 @@ def generate_fwd_figs(buffer, energy_function,
 
         fig_dict['Soft Mode Coverage'] = coverage_per_mode.mean()
 
-    sample_embedding, anchor_embedding, cluster_ind, anchor_inds = embed_samples(buffer_std_params,
+    sample_embedding, anchor_embedding, cluster_ind, anchor_inds, anchor_energies = embed_samples(buffer_std_params,
                                                                                  buffer_reward,
                                                                                  std_cell_params.cpu().detach().numpy(),
                                                                                  log_r.cpu().detach().numpy(),
                                                                                  known_modes_std if known_modes is not None else None)
-    fig_dict['Sample Embedding'] = cluster_fig(sample_embedding, anchor_embedding, cluster_ind)
+    #fig_dict['Sample Embedding'] = cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies)
 
     # fig_dict['Sample Embedding'] = simple_embedding_fig(std_cell_params.numpy(),
     #                                                     aux_array=sample_batch.gfn_energy.cpu().detach().numpy(),
@@ -231,7 +231,6 @@ def embed_samples(ref_samples, ref_rewards, samples, sample_rewards, known_modes
         all_energies = -sample_rewards
 
     if known_modes is not None:
-        all_samples = np.concatenate([known_modes, all_samples])
         anchors = known_modes
         anchor_inds = np.arange(len(known_modes))
     else:  # todo allow these to mix, instead of just replacing
@@ -248,15 +247,15 @@ def embed_samples(ref_samples, ref_rewards, samples, sample_rewards, known_modes
                                                      energy_cutoff=en_cutoff)
         anchors = np.array(anchors)
 
-    dists = cdist(all_samples, anchors)  # shape (N_samples, N_anchors)
+    dists = cdist(samples, anchors)  # shape (N_samples, N_anchors)
     cluster_ind = np.argmin(dists, axis=1)
 
     """PCA is also good"""
     pca = PCA(n_components=2)
-    sample_embedding = pca.fit_transform(all_samples)
+    sample_embedding = pca.fit_transform(samples)
     anchor_embedding = pca.transform(anchors)
 
-    return sample_embedding, anchor_embedding, cluster_ind, np.array(anchor_inds)
+    return sample_embedding, anchor_embedding, cluster_ind, np.array(anchor_inds), all_energies[np.array(anchor_inds)]
 
 
 def voronoi_finite_polygons_2d(vor, radius=None):
@@ -274,7 +273,7 @@ def voronoi_finite_polygons_2d(vor, radius=None):
 
     center = vor.points.mean(axis=0)
     if radius is None:
-        radius = vor.points.ptp().max() * 2  # large enough
+        radius = np.ptp(vor.points)* 2  # large enough
 
     # Map ridge points to ridges
     all_ridges = {}
@@ -323,7 +322,7 @@ def voronoi_finite_polygons_2d(vor, radius=None):
     return new_regions
 
 
-def cluster_fig(sample_embedding, anchor_embedding, cluster_ind):
+def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies):
     """
     Figure for the clusters in PC space + Voronoi assignments
     :param sample_embedding:
@@ -337,6 +336,12 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind):
     else:
         polygons = None
 
+    energies = np.array(anchor_energies)
+    norm_energies = (energies - energies.min()) / (energies.max() - energies.min() + 1e-8)
+
+    colorscale = pc.get_colorscale("Viridis")
+    line_colors = [pc.sample_colorscale(colorscale, [v])[0] for v in norm_energies]
+
     x_all = np.concatenate([sample_embedding[:, 0], anchor_embedding[:, 0]])
     y_all = np.concatenate([sample_embedding[:, 1], anchor_embedding[:, 1]])
 
@@ -344,7 +349,7 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind):
     n_clusters = len(set(cluster_ind))
     distinct_colors = pc.sample_colorscale(colorscale_name, [i / max(n_clusters - 1, 1) for i in range(n_clusters)])
     cluster_to_color = {i: distinct_colors[i] for i in range(n_clusters)}
-    mapped_colors = [cluster_to_color[c] for c in cluster_ind]
+    mapped_colors = [cluster_to_color[c] for c in np.arange(len(cluster_ind))]
 
     fig = go.Figure()
 
@@ -356,7 +361,7 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind):
                                showlegend=True,
                                marker=dict(
                                    size=6,
-                                   color=mapped_colors,
+                                   #color=mapped_colors,
                                    #colorbar=dict(title="Cluster Membership")
                                    showscale=False,
                                )
@@ -371,13 +376,26 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind):
                                marker=dict(
                                    size=15,
                                    color=[cluster_to_color[ind] for ind in range(len(anchor_embedding))],  # Fill color
-                                   showscale=False,
                                    line=dict(
-                                       color='black',  # Outline color
-                                       width=4  # Outline thickness
+                                       color=line_colors,  # <-- variable border color!
+                                       width=4
                                    )
                                )
                                ))
+    fig.add_trace(go.Scattergl(
+        x=[None], y=[None],
+        mode='markers',
+        marker=dict(
+            colorscale=colorscale,
+            cmin=energies.min(),
+            cmax=energies.max(),
+            colorbar=dict(title='Anchor Energy'),
+            color=[energies.min(), energies.max()],  # dummy scalar range
+            showscale=True,
+            size=0.1  # invisible
+        ),
+        showlegend=False
+    ))
     if polygons is not None:
         for ind, poly in enumerate(polygons):
             cluster_color = cluster_to_color[ind]
