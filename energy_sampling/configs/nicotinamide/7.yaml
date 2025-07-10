@@ -67,7 +67,7 @@ log_var_range: 4.0
 lr_anneal_time: 10000
 lr_back: 0.0005
 lr_flow: 0.05
-lr_policy: 0.005
+lr_policy: 0.0005
 lr_warmup_time: 500
 ls_cycle: 100
 max_batch_size: 1000

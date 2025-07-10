@@ -1,7 +1,7 @@
 run_name: 'nicotinamide'
 seed: 12345
 device: 'cuda'
-lr_policy: 0.005              # learning rate of the policy network
+lr_policy: 0.0005              # learning rate of the policy network
 min_lr: 1.0e-6                # ihn
 lr_flow: 0.05                  # learning rate of the flow network
 lr_back: 0.0005                # learning rate of the backward pass
