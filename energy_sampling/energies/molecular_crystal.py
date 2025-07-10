@@ -161,11 +161,11 @@ class MolecularCrystal(BaseSet):
 
         elif self.energy_function == 'ellipsoid_overlap':
             intermolecular_energy = cluster_batch.ellipsoid_overlap
-            density_energy = F.relu(-(cluster_batch.packing_coeff - 0.9)) ** 2
+            density_energy = self.density_penalty(cluster_batch.packing_coeff)
             crystal_energy = intermolecular_energy + self.density_coeff * density_energy
 
         elif self.energy_function == 'silu_energy':
-            density_energy = F.relu(-(cluster_batch.packing_coeff - 0.9)) ** 2
+            density_energy = self.density_penalty(cluster_batch.packing_coeff)
             intermolecular_energy = self.soften_LJ_energy(cluster_batch.silu_pot) / cluster_batch.num_atoms
             crystal_energy = intermolecular_energy + self.density_coeff * density_energy
 
@@ -173,6 +173,14 @@ class MolecularCrystal(BaseSet):
             assert False, f'{self.energy_function} not implemented'
 
         return crystal_energy.clip(min=-self.energy_clip, max=self.energy_clip)
+
+    def density_penalty(self, packing_coeff):
+        """
+        draw crystals into the physically reasonable region
+        :param packing_coeff:
+        :return:
+        """
+        return F.softplus(-(packing_coeff - 0.55)) + F.softplus(packing_coeff-0.9) - 1.2189
 
     def prebuilt_sample_to_reward(self, crystals, temperature):
         """

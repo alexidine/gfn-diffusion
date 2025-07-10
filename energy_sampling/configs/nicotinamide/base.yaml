@@ -52,7 +52,7 @@ both_ways: true             # forward and backward training
 bwd_batch_multiplier: 5      # ratio of backward to foward batch size (much cheaper to evaluate)
 fwd_to_bwd_ratio: 1           # whether to do forward (>1) or backward (<1) training more often
 bwd: False                   # backward training only
-learn_pb: false               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
+learn_pb: true               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
 learned_variance: true       # whether to learn policy variance
 clipping: true  # clip the maximumstep size induced by the policy model
 gfn_clip: 10.0  # clip the maximumstep size induced by the policy model

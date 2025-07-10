@@ -45,7 +45,7 @@ langevin: false
 langevin_scaling_per_dimension: false
 ld_schedule: true
 ld_step: 0.1
-learn_pb: false
+learn_pb: true
 learned_variance: true
 lgv_clip: 100.0
 lgv_layers: 4

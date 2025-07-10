@@ -160,7 +160,7 @@ def fwd_greedy(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
     # var_reward = torch.stack(log_r_list).var(dim=0)
     # loss = -mean_reward + alpha * var_reward
     crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states, no_grad=False)
-    loss = -log_r
+    loss = soft_saturate(-log_r)  # this is just the system energy
 
     if return_exp:
         return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
@@ -173,6 +173,7 @@ def fwd_tb_greedy(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
                   traj_midpoint: int = 0,
                   repeats: int = 1, entropy_penalty: float = 1.0,
                   ):
+    """standard TB loss, but at zero expl, will add a greedy loss term to boost exploitation"""
     skip_greedy = exploration_std(0) != 0
 
     states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, discretizer,
@@ -362,9 +363,21 @@ def subtb(initial_state, gfn, log_reward_fn, coef_matrix, exploration_std=None, 
     return torch.stack([torch.triu(A2[i] * coef_matrix, diagonal=1).sum() for i in range(A2.shape[0])]).sum()
 
 
+def fwd_mle(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
+           exploration_std=None, return_exp=False, condition=None):
+    """maximize the probability of forward-sampled trajectories under the backward model"""
+    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, discretizer, None, condition)
+    crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states)
+    loss = soft_saturate(-log_pbs.sum(-1))
+    if return_exp:
+        return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
+    else:
+        return loss
+
+
 def bwd_mle(terminal_state, gfn, discretizer, log_r, condition=None, return_exp: bool = False):
     states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, discretizer, condition)
-    loss = -log_pfs.sum(-1)
+    loss = soft_saturate(-log_pfs.sum(-1))
     if return_exp:
         return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
     else:
@@ -382,23 +395,25 @@ def bwd_mle_batch(terminal_state, gfn, discretizer, log_r, condition=None, retur
 
     states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, discretizer, condition)
 
-    log_pb_rep = log_pbs.sum(-1).view(repeats, -1)
-    log_pf_rep = log_pfs.sum(-1).view(repeats, -1)
+    log_pb = log_pbs.sum(-1).view(repeats, -1)
+    log_pf = log_pfs.sum(-1).view(repeats, -1)
 
-    # Shape: (repeats, batch_size)
-    log_w = log_pf_rep - log_pb_rep
+    log_weights = log_pf - log_pb
+    log_weights = log_weights - log_weights.max(dim=0, keepdim=True).values  # shape [repeats, B]
 
-    # log-sum-exp over repeats (dim 0), then subtract log(repeats)
-    log_p_marginal = torch.logsumexp(log_w, dim=0) - np.log(repeats)
+    # Softmax weights for marginal likelihood
+    weights = torch.softmax(log_weights, dim=0)  # shape: [repeats, B]
 
-    # Final loss: negative log marginal likelihood for each x_T
-    loss = -log_p_marginal
+    # Use weighted average of log_pf for stability
+    loss = soft_saturate(-torch.sum(weights * log_pf, dim=0))  # shape: [B]
 
     if return_exp:
         return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
     else:
         return loss
 
+def soft_saturate(x, scale: Optional[float] = 1.0):
+    return torch.log(torch.abs(x/scale) + 1)*torch.sign(x)
 
 def get_gfn_forward_loss(mode, init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std=None,
                          return_exp=False, condition=None, repeats=10, reweight_T: Optional[float] = None):
@@ -429,6 +444,11 @@ def get_gfn_forward_loss(mode, init_state, gfn_model, log_reward, discretizer, m
             return_exp=return_exp,
             condition=condition
         )
+
+    elif mode == 'mle':
+        out = fwd_mle(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
+                     return_exp=return_exp,
+                     condition=condition)
     else:
         assert False
 
