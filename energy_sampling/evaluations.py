@@ -62,6 +62,7 @@ def get_sample_metrics(samples, gt_samples=None, final_eval=False):
     return compute_distribution_distances(samples.unsqueeze(1), gt_samples.unsqueeze(1), final_eval)
 
 
+@torch.no_grad()
 def eval_step(energy_function,
               gfn_model,
               discretizer,
@@ -152,12 +153,14 @@ def generate_fwd_figs(buffer, energy_function,
 
         fig_dict['Soft Mode Coverage'] = coverage_per_mode.mean()
 
-    sample_embedding, anchor_embedding, cluster_ind, anchor_inds, anchor_energies = embed_samples(buffer_std_params,
-                                                                                 buffer_reward,
-                                                                                 std_cell_params.cpu().detach().numpy(),
-                                                                                 log_r.cpu().detach().numpy(),
-                                                                                 known_modes_std if known_modes is not None else None)
-    #fig_dict['Sample Embedding'] = cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies)
+    sample_embedding, anchor_embedding, cluster_ind, anchor_inds, anchor_energies = embed_samples(
+        buffer_std_params,
+        buffer_reward,
+        std_cell_params.cpu().detach().numpy(),
+        log_r.cpu().detach().numpy(),
+        known_modes_std if known_modes is not None else None,
+        min_dist=30)
+    fig_dict['Sample Embedding'] = cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies)
 
     # fig_dict['Sample Embedding'] = simple_embedding_fig(std_cell_params.numpy(),
     #                                                     aux_array=sample_batch.gfn_energy.cpu().detach().numpy(),
@@ -346,10 +349,10 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
     y_all = np.concatenate([sample_embedding[:, 1], anchor_embedding[:, 1]])
 
     colorscale_name = "rainbow"  # or "viridis", "plasma", etc.
-    n_clusters = len(set(cluster_ind))
+    n_clusters = len(anchor_embedding)
     distinct_colors = pc.sample_colorscale(colorscale_name, [i / max(n_clusters - 1, 1) for i in range(n_clusters)])
     cluster_to_color = {i: distinct_colors[i] for i in range(n_clusters)}
-    mapped_colors = [cluster_to_color[c] for c in np.arange(len(cluster_ind))]
+    mapped_colors = [cluster_to_color[c] for c in cluster_ind]
 
     fig = go.Figure()
 
@@ -361,8 +364,8 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
                                showlegend=True,
                                marker=dict(
                                    size=6,
-                                   #color=mapped_colors,
-                                   #colorbar=dict(title="Cluster Membership")
+                                   color=mapped_colors,
+                                   colorbar=dict(title="Cluster Membership"),
                                    showscale=False,
                                )
                                ))
@@ -520,6 +523,12 @@ def generate_bwd_figs(fig_dict, buffer, gfn_model, init_state, discretizer):
                                                      b_vars_b, b_means_b)
     fig_dict['Bwd Traj Mean Step Sizes'] = mean_flow_step_sizes(backward_flow_states)
 
+    log_weight = b_log_r + b_log_pbs.sum(-1) - b_log_pfs.sum(-1)
+    log_Z = logmeanexp(log_weight)
+    log_Z_lb = log_weight.mean()
+    fig_dict['Bwd Empirical log Z'] = log_Z.cpu().detach().numpy()
+    fig_dict['Bwd Empirical log Z LB'] = log_Z_lb.cpu().detach().numpy()
+
     return fig_dict
 
 
@@ -563,16 +572,16 @@ def log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_
                                sample_batch, buffer=None):
     """Scalar / distribution metrics"""
     metrics = {}
-    metrics['eval/log_Z'] = log_Z.cpu().detach().numpy()
-    metrics['eval/log_Z_lb'] = log_Z_lb.cpu().detach().numpy()
-    metrics['eval/log_Z_learned'] = log_Z_learned.cpu().detach().numpy()
-    metrics['eval/packing_coeff'] = sample_batch.packing_coeff.mean().cpu().detach().numpy()
-    metrics['packing coeff'] = sample_batch.packing_coeff.clip(max=2).cpu().detach().numpy()
-    metrics['eval/silu_potential'] = sample_batch.silu_pot.mean().cpu().detach().numpy()
-    metrics['mean sample energy'] = sample_batch.gfn_energy.mean().cpu().detach().numpy()
-    metrics['sample energy distribution'] = sample_batch.gfn_energy.cpu().detach().numpy()
-    metrics['mean sample reward'] = log_r.mean().cpu().detach().numpy()
-    metrics['sample reward distribution'] = log_r.cpu().detach().numpy()
+    metrics['Empirical log Z'] = log_Z.cpu().detach().numpy()
+    metrics['Empirical log Z LB'] = log_Z_lb.cpu().detach().numpy()
+    metrics['log Z learned'] = log_Z_learned.cpu().detach().numpy()
+    metrics['Mean Cacking Coeff'] = sample_batch.packing_coeff.mean().cpu().detach().numpy()
+    metrics['Packing Coeff'] = sample_batch.packing_coeff.clip(max=2).cpu().detach().numpy()
+    metrics['Mean Silu Energy'] = sample_batch.silu_pot.mean().cpu().detach().numpy()
+    metrics['Mean Sample Energy'] = sample_batch.gfn_energy.mean().cpu().detach().numpy()
+    metrics['Sample Energy Distribution'] = sample_batch.gfn_energy.cpu().detach().numpy()
+    metrics['Mean Sample Reward'] = log_r.mean().cpu().detach().numpy()
+    metrics['sample Reward Distribution'] = log_r.cpu().detach().numpy()
     metrics['Crystal Log Temperature'] = condition[:, 0]
     metrics['Crystal Mean Log Temperature'] = condition[:, 0].mean()
     metrics['Crystal Min Temperature'] = energy_function.min_temperature

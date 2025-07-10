@@ -74,7 +74,7 @@ prioritized: boltzmann
 rank_weight: 1.0
 repeats: 5
 reweight_T: null
-run_name: 5_t_scale-0.25_log_var_range-0.5
+run_name: 5_t_scale-0.025_log_var_range-0.5
 s_emb_dim: 256
 samples_per_opt: 10
 sampling: buffer
@@ -82,7 +82,7 @@ scheduler: true
 seed: 12345
 subtb_lambda: 2
 t_emb_dim: 32
-t_scale: 0.25
+t_scale: 0.025
 target_acceptance_rate: 0.574
 temperature_conditioning: false
 temperature_scaling_factor: 0.01

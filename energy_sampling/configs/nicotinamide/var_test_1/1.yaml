@@ -50,7 +50,7 @@ learned_variance: true
 lgv_clip: 100.0
 lgv_layers: 4
 local_search: false
-log_var_range: 0.1
+log_var_range: 1.0
 lr_anneal_time: 20000
 lr_back: 0.0005
 lr_flow: 0.1
@@ -74,7 +74,7 @@ prioritized: boltzmann
 rank_weight: 1.0
 repeats: 5
 reweight_T: null
-run_name: 8_t_scale-0.05_log_var_range-0.1
+run_name: 1_t_scale-0.1_log_var_range-1.0
 s_emb_dim: 256
 samples_per_opt: 10
 sampling: buffer
@@ -82,7 +82,7 @@ scheduler: true
 seed: 12345
 subtb_lambda: 2
 t_emb_dim: 32
-t_scale: 0.05
+t_scale: 0.1
 target_acceptance_rate: 0.574
 temperature_conditioning: false
 temperature_scaling_factor: 0.01
