@@ -333,10 +333,10 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
     :param cluster_ind:
     :return:
     """
-    if len(anchor_embedding) > 1:
+    try:
         vor = Voronoi(anchor_embedding)
         polygons = voronoi_finite_polygons_2d(vor)
-    else:
+    except:
         polygons = None
 
     energies = np.array(anchor_energies)
