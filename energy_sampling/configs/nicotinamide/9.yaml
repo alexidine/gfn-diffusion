@@ -1,45 +1,58 @@
 T: 10
 anneal_energy: false
-annealing_max_steps: 2500
+annealing_max_steps: 5000
 batch_size: 25
 beta: 0.1
 both_ways: true
 buffer_path: null
-buffer_size: 25000
+buffer_size: 100000
 burn_in: 100
 bwd: false
-bwd_batch_multiplier: 5
+bwd_batch_multiplier: 1
+bwd_loss_coeffs:
+  mle: 0
+  smoothed: 0
+  tb: 1
+  vg_lb: 0
+  vg_lme: 0
 bwd_policy: brownian_bridge
 clipping: true
 condition_emb_dim: 32
 convergence_history: 100
 device: cuda
 discretizer: random
-discretizer_max_ratio: 5
-dropout: 0
+discretizer_max_ratio: 0.25
+dropout: 0.25
 energy: molecular_crystal
 energy_annealing_threshold: 0.1
 energy_clip: 1000
 energy_density_coeff: 2.0
 energy_function: silu_energy
-energy_max_temperature: 1
-energy_min_temperature: 0.01
+energy_max_temperature: 10
+energy_min_temperature: 0.1
 energy_static_temperature: 1
 epochs: 1000000
 eval: false
 eval_T: 100
 eval_batch_size: 1000
 eval_period: 500
-exploration_factor: 0.35
+exploration_factor: 0.25
 exploration_wd: true
 exploratory: true
 figs_period: 500
+fwd_loss_coeffs:
+  greedy: 0
+  mle: 0
+  smoothed: 0
+  tb: 1
+  vg_lb: 0
+  vg_lme: 0
 fwd_to_bwd_ratio: 1
 gfn_clip: 10.0
 gradient_norm_clip: 1.0
 grow_batch_size: true
 harmonics_dim: 64
-hidden_dim: 256
+hidden_dim: 512
 joint_layers: 4
 langevin: false
 langevin_scaling_per_dimension: false
@@ -50,44 +63,42 @@ learned_variance: true
 lgv_clip: 100.0
 lgv_layers: 4
 local_search: false
-log_var_range: 0.5
-lr_anneal_time: 20000
+log_var_range: 4.0
+lr_anneal_time: 10000
 lr_back: 0.0005
-lr_flow: 0.1
-lr_policy: 0.0005
-lr_warmup_time: 1000
+lr_flow: 0.05
+lr_policy: 0.005
+lr_warmup_time: 500
 ls_cycle: 100
 max_batch_size: 1000
 max_iter_ls: 100
-max_traj_length: 15
+max_traj_length: 20
 min_lr: 1.0e-06
 min_traj_length: 10
-mode_bwd: tb
-mode_fwd: tb
 molecule: nicotinamide
-molecules_path: /scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt
+molecules_path: D:/crystal_datasets/test_qm9_dataset.pt
 norm: layer
 partial_energy: false
-pb_scale_range: 0.1
+pb_scale_range: 0.25
 pis_architectures: false
 prioritized: boltzmann
 rank_weight: 1.0
-repeats: 5
+repeats: 10
 reweight_T: null
-run_name: 9_t_scale-0.05_log_var_range-0.5
-s_emb_dim: 256
+run_name: 9_tb_expl_.25
+s_emb_dim: 512
 samples_per_opt: 10
 sampling: buffer
 scheduler: true
 seed: 12345
 subtb_lambda: 2
 t_emb_dim: 32
-t_scale: 0.05
+t_scale: 0.25
 target_acceptance_rate: 0.574
 temperature_conditioning: false
 temperature_scaling_factor: 0.01
 traj_length_strategy: sampled
 use_weight_decay: false
-wd_max_steps: 5000
+wd_max_steps: 10000
 weight_decay: 1e-7
 zero_init: true

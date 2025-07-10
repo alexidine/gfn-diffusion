@@ -1,0 +1,189 @@
+defaults:
+  base: base.yaml
+
+experiments:
+  - tag: 0_tb
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+      bwd_loss_coeffs:
+        tb: 1
+    notes:
+
+  - tag: 1_tb_smoothing
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+        smoothed: 1
+      bwd_loss_coeffs:
+        tb: 1
+        smoothed: 1
+    notes:
+
+  - tag: 2_tb_vg
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+        vg_lme: 1
+      bwd_loss_coeffs:
+        tb: 1
+        vg_lme: 1
+    notes:
+
+  - tag: 3_tb_mle
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+        mle: 1
+      bwd_loss_coeffs:
+        tb: 1
+        mle: 1
+    notes:
+
+  - tag: 4_tb_greedy
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+        greedy: 1
+      bwd_loss_coeffs:
+        tb: 1
+    notes:
+
+  - tag: 5_vg
+    update:
+      fwd_loss_coeffs:
+        vg_lme: 1
+      bwd_loss_coeffs:
+        vg_lme: 1
+    notes:
+
+  - tag: 6_tb_fwd_mle_bwd
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+      bwd_loss_coeffs:
+        mle: 1
+    notes:
+
+  - tag: 7_tb_vg_greedy
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+        vg_lme: 1
+        greedy: 1
+      bwd_loss_coeffs:
+        tb: 1
+        vg_lme: 1
+    notes:
+
+  - tag: 8_vg_mle
+    update:
+      fwd_loss_coeffs:
+        vg_lme: 1
+        mle: 1
+      bwd_loss_coeffs:
+        vg_lme: 1
+        mle: 1
+    notes:
+
+  - tag: 9_tb_expl_.25
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+      bwd_loss_coeffs:
+        tb: 1
+      exploration_factor: 0.25
+    notes:
+
+  - tag: 10_tb_expl_1
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+      bwd_loss_coeffs:
+        tb: 1
+      exploration_factor: 1
+    notes:
+
+  - tag: 11_tb_expl_perm
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+      bwd_loss_coeffs:
+        tb: 1
+      exploration_wd: false
+    notes:
+
+  - tag: 12_tb_expl_short
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+      bwd_loss_coeffs:
+        tb: 1
+      wd_max_steps: 2500
+    notes:
+
+  - tag: 13_tb_expl_medium
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+      bwd_loss_coeffs:
+        tb: 1
+      wd_max_steps: 5000
+    notes:
+
+  - tag: 14_tb_low_beta
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+      bwd_loss_coeffs:
+        tb: 1
+      beta: 0.01
+    notes:
+
+  - tag: 15_tb_high_beta
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+      bwd_loss_coeffs:
+        tb: 1
+      beta: 1
+    notes:
+
+  - tag: 16_tb_rank_buffer
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+      bwd_loss_coeffs:
+        tb: 1
+      prioritized: 'rank'
+    notes:
+
+  - tag: 17_tb_small_range
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+      bwd_loss_coeffs:
+        tb: 1
+      log_var_range: 1.0
+    notes:
+
+  - tag: 18_tb_large_pb
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+      bwd_loss_coeffs:
+        tb: 1
+      pb_scale_range: 0.5
+    notes:
+
+  - tag: 19_tb_small_pb
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+      bwd_loss_coeffs:
+        tb: 1
+      pb_scale_range: 0.1
+    notes:
+
+
+

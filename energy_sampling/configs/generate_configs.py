@@ -108,7 +108,7 @@ def generate_grid(spec_path='experiments.yaml', output_dir='configs'):
 
 if __name__ == "__main__":
     # for if the experiments are a list of single runs
-    #generate_oneoffs(spec_path='toy_benchmarks/experiments1.yaml', output_dir='toy_benchmarks/')
+    generate_oneoffs(spec_path='nicotinamide/experiments1.yaml', output_dir='nicotinamide/')
 
     # for if the experiments are run on a parameter grid
-    generate_grid(spec_path='nicotinamide/experiments2.yaml', output_dir='nicotinamide/')
+    #generate_grid(spec_path='nicotinamide/experiments2.yaml', output_dir='nicotinamide/')

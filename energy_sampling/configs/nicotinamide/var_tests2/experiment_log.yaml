@@ -1,0 +1,103 @@
+"""
+most started out excellent with mode collapse on a single mode
+at some point, it feaks out and variance starts increasing. It fights to come back, but never narrows again into good modes.
+smaller t_scale with large ranges performed better at first, but also exploded faster
+"""
+
+
+- combo:
+    log_var_range: 0.1
+    t_scale: 0.01
+  index: 0
+  notes: ''
+  tag: 0_t_scale-0.01_log_var_range-0.1
+- combo:
+    log_var_range: 0.5
+    t_scale: 0.01
+  index: 1
+  notes: ''
+  tag: 1_t_scale-0.01_log_var_range-0.5
+- combo:
+    log_var_range: 2.5
+    t_scale: 0.01
+  index: 2
+  notes: ''
+  tag: 2_t_scale-0.01_log_var_range-2.5
+- combo:
+    log_var_range: 10.0
+    t_scale: 0.01
+  index: 3
+  notes: ''
+  tag: 3_t_scale-0.01_log_var_range-10.0
+- combo:
+    log_var_range: 0.1
+    t_scale: 0.025
+  index: 4
+  notes: ''
+  tag: 4_t_scale-0.025_log_var_range-0.1
+- combo:
+    log_var_range: 0.5
+    t_scale: 0.025
+  index: 5
+  notes: ''
+  tag: 5_t_scale-0.025_log_var_range-0.5
+- combo:
+    log_var_range: 2.5
+    t_scale: 0.025
+  index: 6
+  notes: ''
+  tag: 6_t_scale-0.025_log_var_range-2.5
+- combo:
+    log_var_range: 10.0
+    t_scale: 0.025
+  index: 7
+  notes: ''
+  tag: 7_t_scale-0.025_log_var_range-10.0
+- combo:
+    log_var_range: 0.1
+    t_scale: 0.05
+  index: 8
+  notes: ''
+  tag: 8_t_scale-0.05_log_var_range-0.1
+- combo:
+    log_var_range: 0.5
+    t_scale: 0.05
+  index: 9
+  notes: ''
+  tag: 9_t_scale-0.05_log_var_range-0.5
+- combo:
+    log_var_range: 2.5
+    t_scale: 0.05
+  index: 10
+  notes: ''
+  tag: 10_t_scale-0.05_log_var_range-2.5
+- combo:
+    log_var_range: 10.0
+    t_scale: 0.05
+  index: 11
+  notes: ''
+  tag: 11_t_scale-0.05_log_var_range-10.0
+- combo:
+    log_var_range: 0.1
+    t_scale: 0.075
+  index: 12
+  notes: ''
+  tag: 12_t_scale-0.075_log_var_range-0.1
+- combo:
+    log_var_range: 0.5
+    t_scale: 0.075
+  index: 13
+  notes: ''
+  tag: 13_t_scale-0.075_log_var_range-0.5
+- combo:
+    log_var_range: 2.5
+    t_scale: 0.075
+  index: 14
+  notes: ''
+  tag: 14_t_scale-0.075_log_var_range-2.5
+- combo:
+    log_var_range: 10.0
+    t_scale: 0.075
+  index: 15
+  notes: ''
+  tag: 15_t_scale-0.075_log_var_range-10.0

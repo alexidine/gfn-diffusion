@@ -1,13 +1,13 @@
 run_name: 'nicotinamide'
 seed: 12345
 device: 'cuda'
-lr_policy: 0.005              # learning rate of the policy network
+lr_policy: 0.0005              # learning rate of the policy network
 min_lr: 1.0e-6                # ihn
-lr_flow: 0.05                  # learning rate of the flow network
+lr_flow: 0.1                  # learning rate of the flow network
 lr_back: 0.0005                # learning rate of the backward pass
 scheduler: True               # does LR warmup from max/100 -> max -> 1e-6 over the warmup and annealing period
-lr_warmup_time: 500
-lr_anneal_time: 10000
+lr_warmup_time: 1000
+lr_anneal_time: 20000
 weight_decay: 1e-7
 use_weight_decay: false
 gradient_norm_clip: 1.0        # gradient norm clip for updating gfn model weights
@@ -16,12 +16,12 @@ reweight_T: null                # 'null' or float: smaller values reduce the imp
 # model parameters
 zero_init: true
 joint_layers: 4              # number of layers in forward/backward policy models
-hidden_dim: 512              # dimensionality of hidden layer
-s_emb_dim: 512                # dimensionality of state embedding
+hidden_dim: 256              # dimensionality of hidden layer
+s_emb_dim: 256                # dimensionality of state embedding
 t_emb_dim: 32                # dimensionality of time embedding
 harmonics_dim: 64            # dimensionality of harmonic embedding
 condition_emb_dim: 32         # dimensionality of the conditioning embedding
-dropout: 0.25                   # dropout probability
+dropout: 0                   # dropout probability
 norm: layer                   # null, "layer", "batch"
 
 batch_size: 25               # number of samples per training batch
@@ -31,39 +31,25 @@ eval_batch_size: 1000        # batch size for evaluation
 epochs: 1000000             # number of training epochs: relatively large
 eval_period: 500              # how often to do evaluation & reporting
 figs_period: 500             # how often to log custom figrues  # must be multiple of eval_period or it won't fire
-buffer_size: 100000          # size of replay buffer: relatively large
+buffer_size: 25000          # size of replay buffer: relatively large
 
 # GFlowNet settings
-
 T: 10                        # static training diffusion length
 eval_T: 100                  # diffusion trajectory length for inference
 min_traj_length: 10
-max_traj_length: 20
+max_traj_length: 15
 traj_length_strategy: sampled # 'static'  or 'sampled'  will do random between min and max traj lengths
-discretizer_max_ratio: 0.25    # maximum ratio between randomly sampled step sizes
+discretizer_max_ratio: 5    # maximum ratio between randomly sampled step sizes
 discretizer: 'random'        # 'random' 'low_discrepancy' 'equidistant' 'uniform'
-t_scale: 0.25                 # scales fixed forward policy variance
+t_scale: 1.0                 # scales fixed forward policy variance
 log_var_range: 4.0           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
-pb_scale_range: 0.25          # range of learned backward policy corrections, only for 'brownian_bridge'
+pb_scale_range: 0.1          # range of learned backward policy corrections, only for 'brownian_bridge'
 energy: "molecular_crystal"  # "molecular_crystal"
-#mode_fwd: "tb"           # "tb" is trajectory balance, "vg" is VarGrad, "greedy" is a local greed + gradients, "tb_greedy", "vg_greedy" are combinations
-#mode_bwd: "tb"               # "tb" is trajectory balance, "vg" is VarGrad, 'mle' is trajectory probability maximization, 'mle_batch' is a more stable MLE
-fwd_loss_coeffs:
-  tb: 0
-  vg_lb: 0
-  vg_lme: 0  # exclusive with vg_lb
-  greedy: 0
-  mle: 0
-  smoothed: 0
-bwd_loss_coeffs:
-  tb: 0
-  vg_lb: 0
-  vg_lme: 0 # exclusive with vg_lb
-  mle: 0
-  smoothed: 0
-repeats: 10                   # for conditional VarGrad training
+mode_fwd: "tb"           # "tb" is trajectory balance, "vg" is VarGrad, "greedy" is a local greed + gradients, "tb_greedy", "vg_greedy" are combinations
+mode_bwd: "tb"               # "tb" is trajectory balance, "vg" is VarGrad, 'mle' is trajectory probability maximization
+repeats: 5                   # for conditional VarGrad training
 both_ways: true             # forward and backward training
-bwd_batch_multiplier: 1      # ratio of backward to foward batch size (much cheaper to evaluate)
+bwd_batch_multiplier: 5      # ratio of backward to foward batch size (much cheaper to evaluate)
 fwd_to_bwd_ratio: 1           # whether to do forward (>1) or backward (<1) training more often
 bwd: False                   # backward training only
 learn_pb: true               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
@@ -73,11 +59,11 @@ gfn_clip: 10.0  # clip the maximumstep size induced by the policy model
 
 # local search settings
 ################################################################
-buffer_path: null #'D:/crystal_datasets/urea_gfn_dataset.pt'
-molecules_path: 'D:/crystal_datasets/test_qm9_dataset.pt'
+#buffer_path: null #'D:/crystal_datasets/urea_gfn_dataset.pt'
+#molecules_path: 'D:/crystal_datasets/test_qm9_dataset.pt'
 
-#buffer_path: '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt'
-#molecules_path: '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt'
+buffer_path: null # '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt'
+molecules_path: '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt'
 
 # replay buffer / dataset settings
 
@@ -91,9 +77,9 @@ sampling: "buffer"
 
 # exploration controls
 exploratory: True       # adds variance to optionally learned logvars
-exploration_factor: 0.5  # initial exploration std value
+exploration_factor: 0.35  # initial exploration std value
 exploration_wd: True  # decay exploration over time
-wd_max_steps: 10000  # number of steps to terminate the added variance
+wd_max_steps: 5000  # number of steps to terminate the added variance
 
 # molecular crystal settings
 ################################################################
@@ -109,11 +95,11 @@ energy_function: silu_energy
 anneal_energy: false  # scale temperature over time, when conditional it scales the distribution, when not it just decreases from static to min
 energy_density_coeff: 2.0  # how much to weight the density penalty term in the energy function
 temperature_conditioning: false  # if false, temperatures are set to energy_static_temperature, and there is no annealing
-energy_min_temperature: 0.1
-energy_max_temperature: 10
-energy_static_temperature: 1  # for certain evaluations or static T training. Also initial temperature on unconditional temperature annealing
+energy_min_temperature: 0.01
+energy_max_temperature: 1
+energy_static_temperature: 1  # for certain evaluations or static T training
 temperature_scaling_factor: 0.01  # controls relative frequency of higher vs lower temperatures (higher -> higher)
-annealing_max_steps: 5000  # time for scaling_factor to reach 1 (uniform sampling from min to max)
+annealing_max_steps: 2500  # time for scaling_factor to reach 1 (uniform sampling from min to max)
 energy_clip: 1000
 
 ############

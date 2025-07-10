@@ -91,7 +91,7 @@ class GFN(nn.Module):
                 logvar = logvar_i
             else:
                 logvar = torch.tanh(logvar_i) * self.log_var_range
-        return mean, (logvar + np.log(self.pf_std_per_traj) * 2.0).clip(min=-4, max=4)
+        return mean, (logvar + np.log(self.pf_std_per_traj) * 2.0).clip(min=-3, max=3)
     #
 
     def predict_next_state(self, s, t, condition_embedding):
@@ -141,7 +141,7 @@ class GFN(nn.Module):
                 noise_backward = (current_state - back_mean) / back_var.sqrt()
                 logpb[:, i] = -0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1)
             else:  # instead set this as a constant the model will have to learn around
-                back_var = torch.ones_like(back_mean) * 1e-1 * dts.unsqueeze(1)
+                back_var = torch.ones_like(back_mean) * 1e-3 * dts.unsqueeze(1)
 
             current_state = next_state
             states[:, i + 1] = current_state
@@ -196,7 +196,7 @@ class GFN(nn.Module):
                 # send it identically to the source state (0)
                 prev_state = torch.zeros_like(current_state)
                 back_mean = prev_state  # remember the back_mean in pb is for some reson the actual mean not the drift
-                back_var = torch.ones_like(back_mean) * 1e-1 * dts.unsqueeze(1)
+                back_var = torch.ones_like(back_mean) * 1e-3 * dts.unsqueeze(1)
 
             pfs = self.predict_next_state(prev_state, ts[:, trajectory_length - i - 1], condition_embedding)
             pf_mean, pflogvars = self.split_params(pfs)

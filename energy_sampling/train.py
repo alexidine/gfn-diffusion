@@ -140,7 +140,7 @@ def fwd_train_step(energy_function, gfn_model, discretizer, exploration_std, mol
                    repeats: int = 10, reweight_T: Optional[float] = None):
     init_state = get_gfn_init_state(args.batch_size, energy_function.data_ndim, device)
     condition = energy_function.get_conditioning_tensor(mol_batch)
-    return get_gfn_forward_loss(args.mode_fwd,
+    return get_gfn_forward_loss(args.fwd_loss_coeffs,
                                 init_state,
                                 gfn_model,
                                 energy_function.log_reward,
@@ -162,7 +162,7 @@ def bwd_train_step(gfn_model, discretizer, buffer, exploration_std=None, repeats
     else:
         assert False, f"sampling method {args.sampling} not implemented"
 
-    return get_gfn_backward_loss(args.mode_bwd,
+    return get_gfn_backward_loss(args.bwd_loss_coeffs,
                                  samples.to(device),
                                  gfn_model,
                                  rewards.to(device),

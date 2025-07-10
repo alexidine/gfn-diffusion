@@ -29,11 +29,12 @@ grow_batch_size: true        # whether to dynamically grow the batch size to fil
 max_batch_size: 100           # maximum batch size to allow
 eval_batch_size: 250        # batch size for evaluation
 epochs: 1000000             # number of training epochs: relatively large
-eval_period: 100              # how often to do evaluation & reporting
-figs_period: 100             # how often to log custom figrues  # must be multiple of eval_period or it won't fire
-buffer_size: 25000          # size of replay buffer: relatively large
+eval_period: 250              # how often to do evaluation & reporting
+figs_period: 250             # how often to log custom figrues  # must be multiple of eval_period or it won't fire
+buffer_size: 50000          # size of replay buffer: relatively large
 
 # GFlowNet settings
+
 T: 10                        # static training diffusion length
 eval_T: 100                  # diffusion trajectory length for inference
 min_traj_length: 10
@@ -43,23 +44,36 @@ discretizer_max_ratio: 0.5    # maximum ratio between randomly sampled step size
 discretizer: 'random'        # 'random' 'low_discrepancy' 'equidistant' 'uniform'
 t_scale: 0.25                 # scales fixed forward policy variance
 log_var_range: 4.0           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
-pb_scale_range: 0.1          # range of learned backward policy corrections, only for 'brownian_bridge'
+pb_scale_range: 0.5          # range of learned backward policy corrections, only for 'brownian_bridge'
 energy: "molecular_crystal"  # "molecular_crystal"
-mode_fwd: "tb"           # "tb" is trajectory balance, "vg" is VarGrad, "greedy" is a local greed + gradients, "tb_greedy", "vg_greedy" are combinations
-mode_bwd: "tb"               # "tb" is trajectory balance, "vg" is VarGrad, 'mle' is trajectory probability maximization, 'mle_batch' is a more stable MLE
+#mode_fwd: "tb"           # "tb" is trajectory balance, "vg" is VarGrad, "greedy" is a local greed + gradients, "tb_greedy", "vg_greedy" are combinations
+#mode_bwd: "tb"               # "tb" is trajectory balance, "vg" is VarGrad, 'mle' is trajectory probability maximization, 'mle_batch' is a more stable MLE
+fwd_loss_coeffs:
+  tb: 1
+  vg_lb: 0
+  vg_lme: 1  # exclusive with vg_lb
+  greedy: 0
+  mle: 0.1
+  smoothed: 0.1
+bwd_loss_coeffs:
+  tb: 1
+  vg_lb: 0
+  vg_lme: 1 # exclusive with vg_lb
+  mle: 0.1
+  smoothed: 0.1
 repeats: 10                   # for conditional VarGrad training
 both_ways: true             # forward and backward training
 bwd_batch_multiplier: 1      # ratio of backward to foward batch size (much cheaper to evaluate)
 fwd_to_bwd_ratio: 1           # whether to do forward (>1) or backward (<1) training more often
 bwd: False                   # backward training only
-learn_pb: false               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
+learn_pb: true               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
 learned_variance: true       # whether to learn policy variance
 clipping: true  # clip the maximumstep size induced by the policy model
 gfn_clip: 10.0  # clip the maximumstep size induced by the policy model
 
 # local search settings
 ################################################################
-buffer_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
+buffer_path: null #'D:/crystal_datasets/urea_gfn_dataset.pt'
 molecules_path: 'D:/crystal_datasets/test_qm9_dataset.pt'
 
 #buffer_path: '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt'
@@ -68,7 +82,7 @@ molecules_path: 'D:/crystal_datasets/test_qm9_dataset.pt'
 # replay buffer / dataset settings
 
 ################################################################
-beta: 0.1             # reward prioritized replay sampling: high beta = steep prioritization
+beta: 0.01             # reward prioritized replay sampling: high beta = steep prioritization
 rank_weight: 1.0     # rank-based replay sampling: low rank_weight = steep prioritization
 prioritized: "boltzmann"   # three kinds of replay training: random, reward prioritized, rank-based
 sampling: "buffer"
@@ -76,15 +90,15 @@ sampling: "buffer"
 ################################################################
 
 # exploration controls
-exploratory: False       # adds variance to optionally learned logvars
+exploratory: True       # adds variance to optionally learned logvars
 exploration_factor: 0.5  # initial exploration std value
 exploration_wd: True  # decay exploration over time
-wd_max_steps: 500  # number of steps to terminate the added variance
+wd_max_steps: 5000  # number of steps to terminate the added variance
 
 # molecular crystal settings
 ################################################################
 # scales the energy function
-molecule: urea  # 'nicotinamide' or 'urea'
+molecule: nicotinamide  # 'nicotinamide' or 'urea'
 energy_function: silu_energy
   # 'latent_harmonic' : unimadal harmonic potential in the latent space
   # 'crystal_harmonic': unimodal harmonic potential in the crystal space
@@ -95,11 +109,11 @@ energy_function: silu_energy
 anneal_energy: false  # scale temperature over time, when conditional it scales the distribution, when not it just decreases from static to min
 energy_density_coeff: 2.0  # how much to weight the density penalty term in the energy function
 temperature_conditioning: false  # if false, temperatures are set to energy_static_temperature, and there is no annealing
-energy_min_temperature: 0.01
-energy_max_temperature: 1
-energy_static_temperature: 1  # for certain evaluations or static T training
+energy_min_temperature: 0.1
+energy_max_temperature: 10
+energy_static_temperature: 1  # for certain evaluations or static T training. Also initial temperature on unconditional temperature annealing
 temperature_scaling_factor: 0.01  # controls relative frequency of higher vs lower temperatures (higher -> higher)
-annealing_max_steps: 2500  # time for scaling_factor to reach 1 (uniform sampling from min to max)
+annealing_max_steps: 5000  # time for scaling_factor to reach 1 (uniform sampling from min to max)
 energy_clip: 1000
 
 ############

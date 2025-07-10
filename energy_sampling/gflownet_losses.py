@@ -1,3 +1,4 @@
+import math
 from typing import Optional
 
 import numpy as np
@@ -30,6 +31,9 @@ def normed_smoothness_loss(x, eps=1e-5):
 
 def fwd_combo(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
               exploration_std=None, return_exp=False, condition=None, repeats=10):
+    """
+    Loss function that dynamically combines several losses on-the-fly.
+    """
     if gfn.conditional_flow_model:
         condition = condition.repeat(repeats, 1)
         initial_state = initial_state.repeat(repeats, 1)
@@ -54,22 +58,20 @@ def fwd_combo(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
 
     # VarGrad loss
     if gfn.conditional_flow_model:
-        # reshape and take the mean over repeats
-        # minimize the variance over repeats w.r.t., the norm
         log_Z = log_ratio.view(repeats, -1).mean(dim=0, keepdim=True)
         vg_loss = 0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2
-        #z_matching_loss = F.mse_loss(log_Z, log_flow.view(repeats, -1).mean(dim=0, keepdim=True), reduction='mean')
 
     else:
-        # take the variance over the full unconditional batch
         log_Z = log_ratio.mean(dim=0, keepdim=True)
         vg_loss = 0.5 * (log_Z - log_ratio) ** 2
-        #z_matching_loss = F.mse_loss(log_Z.repeat(len(log_flow)), log_flow, reduction='mean')
 
-    # regularize policies for local smoothness with a small penalty
-    #smoothness_loss = normed_smoothness_loss(torch.stack([means_f, logvars_f, means_b, logvars_b]))
+    # greedy loss
+    greedy_loss = soft_saturate(-log_r)  # this is just the system energy
 
-    loss = vg_loss.mean() + tb_loss.mean()  #+ z_matching_loss  #+ smoothness_loss.mean() * 1
+    # backward MLE
+    mle_loss = soft_saturate(-log_pbs.sum(-1))
+
+    loss = vg_loss.mean() + tb_loss.mean() + greedy_loss.mean() + mle_loss.mean()
 
     if return_exp:
         return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
@@ -99,22 +101,18 @@ def bwd_combo(terminal_state, gfn, log_r, discretizer, condition=None, repeats=1
 
     # VarGrad loss
     if gfn.conditional_flow_model:
-        # reshape and take the mean over repeats
-        # minimize the variance over repeats w.r.t., the norm
         log_Z = log_ratio.view(repeats, -1).mean(dim=0, keepdim=True)
         vg_loss = 0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2
-        #z_matching_loss = F.mse_loss(log_Z, log_flow.view(repeats, -1).mean(dim=0, keepdim=True), reduction='mean')
-
     else:
-        # take the variance over the full unconditional batch
         log_Z = log_ratio.mean(dim=0, keepdim=True)
         vg_loss = 0.5 * (log_Z - log_ratio) ** 2
-        #z_matching_loss = F.mse_loss(log_Z.repeat(len(log_flow)), log_flow, reduction='mean')
 
-    # regularize policies for local smoothness with a small penalty
-    #smoothness_loss = normed_smoothness_loss(torch.stack([means_f, logvars_f, means_b, logvars_b]))
+    # forward MLE
+    loss = soft_saturate(-log_pfs.sum(-1))
 
-    loss = vg_loss.mean() + tb_loss.mean()  #+ z_matching_loss  #+ smoothness_loss.mean() * 1
+    # mle loss
+
+    loss = vg_loss.mean() + tb_loss.mean()
 
     if return_exp:
         return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
@@ -364,7 +362,7 @@ def subtb(initial_state, gfn, log_reward_fn, coef_matrix, exploration_std=None, 
 
 
 def fwd_mle(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
-           exploration_std=None, return_exp=False, condition=None):
+            exploration_std=None, return_exp=False, condition=None):
     """maximize the probability of forward-sampled trajectories under the backward model"""
     states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_fwd(initial_state, discretizer, None, condition)
     crystal_batch, log_r = get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states)
@@ -412,11 +410,19 @@ def bwd_mle_batch(terminal_state, gfn, discretizer, log_r, condition=None, retur
     else:
         return loss
 
-def soft_saturate(x, scale: Optional[float] = 1.0):
-    return torch.log(torch.abs(x/scale) + 1)*torch.sign(x)
 
-def get_gfn_forward_loss(mode, init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std=None,
-                         return_exp=False, condition=None, repeats=10, reweight_T: Optional[float] = None):
+def soft_saturate(x, scale: Optional[float] = 1.0):
+    return torch.log(torch.abs(x / scale) + 1) * torch.sign(x)
+
+
+def old_get_gfn_forward_loss(mode,
+                             init_state,
+                             gfn_model,
+                             log_reward,
+                             discretizer,
+                             mol_batch,
+                             exploration_std=None, return_exp=False, condition=None,
+                             repeats=10, reweight_T: Optional[float] = None):
     if mode == 'tb':
         out = fwd_tb(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
                      return_exp=return_exp,
@@ -447,27 +453,127 @@ def get_gfn_forward_loss(mode, init_state, gfn_model, log_reward, discretizer, m
 
     elif mode == 'mle':
         out = fwd_mle(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
-                     return_exp=return_exp,
-                     condition=condition)
+                      return_exp=return_exp,
+                      condition=condition)
     else:
         assert False
-
     losses, *rest = out
+
     if reweight_T is not None:  # optionally reweight losses to minimize large outliers
         weights = torch.softmax(-losses.detach() / reweight_T, dim=0) * len(losses)
         weights += 1e-2  # minimum relative contribution
         weights /= weights.sum()
         loss = (weights * losses).mean()
-
     else:
         loss = losses.mean()
 
     return loss, *rest
 
 
-def get_gfn_backward_loss(mode, samples, gfn_model, rewards, discretizer, exploration_std=None, condition=None,
-                          repeats=10,
-                          return_exp=False, reweight_T: Optional[float] = None):
+def get_gfn_forward_loss(loss_coeffs,
+                         initial_state,
+                         gfn,
+                         log_reward_fn,
+                         discretizer,
+                         mol_batch,
+                         exploration_std=None, return_exp=False, condition=None,
+                         repeats=10, reweight_T: Optional[float] = None):
+    if gfn.conditional_flow_model:
+        condition = condition.repeat(repeats, 1)
+        initial_state = initial_state.repeat(repeats, 1)
+        mol_batch = collate_data_list(mol_batch.to_data_list() * repeats)
+
+    if loss_coeffs.greedy > 0:
+        keep_grads = True
+    else:
+        keep_grads = False
+
+    (states, log_pfs, log_pbs, log_fs,
+     means_f, logvars_f, means_b, logvars_b) = gfn.get_trajectory_fwd(initial_state,
+                                                                      discretizer,
+                                                                      exploration_std,
+                                                                      condition,
+                                                                      detach_traj=not keep_grads,
+                                                                      return_gauss_params=True,
+                                                                      )
+
+    crystal_batch, log_r = get_loss_reward(condition,
+                                           log_reward_fn,
+                                           mol_batch,
+                                           return_exp,
+                                           states,
+                                           no_grad=not keep_grads
+                                           )
+    log_pf = log_pfs.sum(-1)
+    log_pb = log_pbs.sum(-1)
+    log_flow = log_fs[:, 0]
+
+    losses = []
+
+    if loss_coeffs.smoothed > 0:
+        smoothness_loss = normed_smoothness_loss(torch.stack([means_f, logvars_f, means_b, logvars_b])).mean(dim=0)
+        losses.append(smoothness_loss * loss_coeffs.smoothed)
+
+    if loss_coeffs.tb > 0:
+        tb = (log_pf + log_flow - log_pb - log_r.detach())
+        tb_loss = F.mse_loss(tb, torch.zeros_like(tb), reduction='none')
+        losses.append(tb_loss * loss_coeffs.tb)
+
+    if loss_coeffs.vg_lb > 0:
+        assert not (loss_coeffs.vg_lb > 0 and loss_coeffs.vg_lme > 0), \
+            "Cannot use both vg_lb and vg_lme simultaneously"
+        log_ratio = log_r.detach() + log_pb - log_pf
+
+        if gfn.conditional_flow_model:
+            log_Z = log_ratio.view(repeats, -1).mean(dim=0, keepdim=True)
+            vg_loss = 0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2
+        else:
+            log_Z = log_ratio.mean(dim=0, keepdim=True)
+            vg_loss = 0.5 * (log_Z - log_ratio) ** 2
+        losses.append(vg_loss * loss_coeffs.vg_lb)
+
+    elif loss_coeffs.vg_lme > 0:
+        log_ratio = log_r.detach() + log_pb - log_pf
+
+        if gfn.conditional_flow_model:
+            log_Z = torch.logsumexp(log_ratio.view(repeats, -1), dim=0, keepdim=True) - math.log(repeats)
+            vg_loss = 0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2
+        else:
+            log_Z = torch.logsumexp(log_ratio, dim=0, keepdim=True) - math.log(repeats)
+            vg_loss = 0.5 * (log_Z - log_ratio) ** 2
+        losses.append(vg_loss * loss_coeffs.vg_lme)
+
+    if loss_coeffs.mle > 0:
+        mle_loss = soft_saturate(-log_pbs.sum(-1))
+        losses.append(mle_loss * loss_coeffs.mle)
+
+    if loss_coeffs.greedy > 0:
+        greedy_loss = soft_saturate(-log_r)
+        losses.append(greedy_loss * loss_coeffs.greedy)
+
+    combined_losses = torch.stack(losses).mean(dim=0)
+
+    loss = reweight_losses(combined_losses, losses, reweight_T)
+
+    if return_exp:
+        return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
+    else:
+        return loss
+
+
+def reweight_losses(combined_losses, losses, reweight_T):
+    if reweight_T is not None:  # optionally reweight losses to minimize large outliers
+        weights = (torch.softmax(-combined_losses.detach() / reweight_T, dim=0) * len(losses)).clamp(min=1e-4)
+        weights /= weights.sum()
+        loss = (weights * combined_losses).mean()
+    else:
+        loss = combined_losses.mean()
+    return loss
+
+
+def old_get_gfn_backward_loss(mode, samples, gfn_model, rewards, discretizer, exploration_std=None, condition=None,
+                              repeats=10,
+                              return_exp=False, reweight_T: Optional[float] = None):
     if mode == 'tb':
         out = bwd_tb(samples, gfn_model, rewards, discretizer, condition=condition, return_exp=return_exp)
     elif mode == 'vg':
@@ -495,3 +601,71 @@ def get_gfn_backward_loss(mode, samples, gfn_model, rewards, discretizer, explor
         loss = losses.mean()
 
     return loss, *rest
+
+
+def get_gfn_backward_loss(loss_coeffs,
+                          samples,
+                          gfn,
+                          log_r,
+                          discretizer,
+                          exploration_std=None, condition=None,
+                          repeats=10,
+                          return_exp=False, reweight_T: Optional[float] = None):
+    if gfn.conditional_flow_model:
+        condition = condition.repeat(repeats, 1)
+        samples = samples.repeat(repeats, 1)
+
+    (states, log_pfs, log_pbs, log_fs,
+     means_f, logvars_f, means_b, logvars_b) = gfn.get_trajectory_bwd(
+        samples, discretizer, condition, return_gauss_params=True)
+
+    log_pf = log_pfs.sum(-1)
+    log_pb = log_pbs.sum(-1)
+    log_flow = log_fs[:, 0]
+
+    losses = []
+    if loss_coeffs.smoothed > 0:
+        smoothness_loss = normed_smoothness_loss(torch.stack([means_f, logvars_f, means_b, logvars_b])).mean(dim=0)
+        losses.append(smoothness_loss * loss_coeffs.smoothed)
+
+    if loss_coeffs.tb > 0:
+        tb = (log_pf + log_flow - log_pb - log_r)
+        tb_loss = F.mse_loss(tb, torch.zeros_like(tb), reduction='none')
+        losses.append(tb_loss * loss_coeffs.tb)
+
+    if loss_coeffs.vg_lb > 0:
+        assert not (loss_coeffs.vg_lb > 0 and loss_coeffs.vg_lme > 0), \
+            "Cannot use both vg_lb and vg_lme simultaneously"
+        log_ratio = log_r + log_pb - log_pf
+
+        if gfn.conditional_flow_model:
+            log_Z = log_ratio.view(repeats, -1).mean(dim=0, keepdim=True)
+            vg_loss = 0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2
+        else:
+            log_Z = log_ratio.mean(dim=0, keepdim=True)
+            vg_loss = 0.5 * (log_Z - log_ratio) ** 2
+        losses.append(vg_loss * loss_coeffs.vg_lb)
+
+    elif loss_coeffs.vg_lme > 0:
+        log_ratio = log_r + log_pb - log_pf
+
+        if gfn.conditional_flow_model:
+            log_Z = torch.logsumexp(log_ratio.view(repeats, -1), dim=0, keepdim=True) - math.log(repeats)
+            vg_loss = 0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2
+        else:
+            log_Z = torch.logsumexp(log_ratio, dim=0, keepdim=True) - math.log(repeats)
+            vg_loss = 0.5 * (log_Z - log_ratio) ** 2
+        losses.append(vg_loss * loss_coeffs.vg_lme)
+
+    if loss_coeffs.mle > 0:
+        mle_loss = soft_saturate(-log_pfs.sum(-1))
+        losses.append(mle_loss * loss_coeffs.mle)
+
+    combined_losses = torch.stack(losses).mean(dim=0)
+
+    loss = reweight_losses(combined_losses, losses, reweight_T)
+
+    if return_exp:
+        return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
+    else:
+        return loss

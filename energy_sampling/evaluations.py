@@ -114,16 +114,25 @@ def eval_step(energy_function,
         metrics.update(fig_dict)
 
     "Crystal samples"
-    # # skip this for now - not actually passing clusters at the moment so would have to rebuild here
-    # try:
-    #     samples_to_log, filenames = log_crystal_samples(sample_batch=sample_batch, return_filenames=True)
-    #     [wandb.log({f'crystal_sample_{ind}': samples_to_log[ind]}, commit=False) for ind in range(len(samples_to_log))]
-    #     [os.remove(file) for file in filenames]  # delete this cif as a temporary file
-    # except:
-    #     pass
+    try:
+        log_crystals(sample_batch)
+    except:  # sometimes it fails IDK
+        pass
 
     gfn_model.train()
     return metrics
+
+
+def log_crystals(sample_batch):
+    cluster_batch = sample_batch.mol2cluster(cutoff=6,
+                                             supercell_size=10,
+                                             align_to_standardized_orientation=True)
+    cluster_batch.construct_radial_graph(cutoff=6)
+    lj_energy, normed_lj_energy = cluster_batch.compute_LJ_energy()
+    cluster_batch.lj_pot = lj_energy
+    samples_to_log, filenames = log_crystal_samples(sample_batch=cluster_batch, return_filenames=True)
+    [wandb.log({f'crystal_sample_{ind}': samples_to_log[ind]}, commit=False) for ind in range(len(samples_to_log))]
+    [os.remove(file) for file in filenames]  # delete this cif as a temporary file
 
 
 def generate_fwd_figs(buffer, energy_function,
@@ -136,6 +145,7 @@ def generate_fwd_figs(buffer, energy_function,
     buffer_cell_params, buffer_latent_params, buffer_std_params, buffer_reward, buffer_batch = get_buffer_stats(buffer)
     std_cell_params = sample_batch.cell_params_to_gen_basis().cpu().detach()
 
+    # for some toy problems, we save the solution in the energy function
     known_modes = energy_function.crystal_modes.detach().cpu().numpy() if hasattr(energy_function, 'modes') else None
     if known_modes is not None:
         known_modes_std = energy_function.modes.detach().cpu()
@@ -159,7 +169,7 @@ def generate_fwd_figs(buffer, energy_function,
         std_cell_params.cpu().detach().numpy(),
         log_r.cpu().detach().numpy(),
         known_modes_std if known_modes is not None else None,
-        min_dist=30)
+        min_dist=40)
     fig_dict['Sample Embedding'] = cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies)
 
     # fig_dict['Sample Embedding'] = simple_embedding_fig(std_cell_params.numpy(),
@@ -174,6 +184,10 @@ def generate_fwd_figs(buffer, energy_function,
         fig_dict['temp/T vs Energy'] = T_vs_E_fig(condition, sample_batch)
     fig_dict['Forward Gauss Params'] = mean_var_fig(f_vars_f, f_means_f,
                                                     f_vars_b, f_means_b)
+    fig_dict['Mean Fwd F Drift'] = f_means_f.abs().mean()
+    fig_dict['Mean Fwd B Drift'] = f_means_b.abs().mean()
+    fig_dict['Mean Fwd F Var'] = f_vars_f.abs().mean()
+    fig_dict['Mean Fwd B Var'] = f_vars_f.abs().mean()
     fig_dict['Traj Mean Step Sizes'] = mean_flow_step_sizes(flow_states)
     fig_dict['Pf vs Pb'] = Pf_vs_Pb_fig(log_pfs, log_pbs, log_r)
     fig_dict['TB Parity Plot'], fig_dict['Forward TB R Value'] = flow_parity_plot(log_r, log_fs[:, 0], log_pbs, log_pfs)
@@ -199,7 +213,8 @@ def agglomerative_cluster(ens, samples, energy_cutoff: float = 0.0, min_dist: fl
     model = AgglomerativeClustering(
         n_clusters=None,
         distance_threshold=min_dist,  # stop when all clusters > threshold apart
-        linkage='ward'
+        #linkage='ward',
+        linkage='complete',
     )
     labels = model.fit_predict(X_lowE)
 
@@ -521,6 +536,11 @@ def generate_bwd_figs(fig_dict, buffer, gfn_model, init_state, discretizer):
                                                                                             b_log_pfs)
     fig_dict['Backward Gauss Params'] = mean_var_fig(b_vars_f, b_means_f,
                                                      b_vars_b, b_means_b)
+    fig_dict['Mean Bwd F Drift'] = b_means_f.abs().mean()
+    fig_dict['Mean Bwd B Drift'] = b_means_b.abs().mean()
+    fig_dict['Mean Bwd F Var'] = b_vars_f.abs().mean()
+    fig_dict['Mean Bwd B Var'] = b_vars_f.abs().mean()
+
     fig_dict['Bwd Traj Mean Step Sizes'] = mean_flow_step_sizes(backward_flow_states)
 
     log_weight = b_log_r + b_log_pbs.sum(-1) - b_log_pfs.sum(-1)

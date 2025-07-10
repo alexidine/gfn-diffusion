@@ -2,7 +2,7 @@ T: 10
 anneal_energy: false
 annealing_max_steps: 5000
 batch_size: 25
-beta: 0.01
+beta: 0.1
 both_ways: true
 buffer_path: null
 buffer_size: 100000
@@ -63,7 +63,7 @@ learned_variance: true
 lgv_clip: 100.0
 lgv_layers: 4
 local_search: false
-log_var_range: 4.0
+log_var_range: 1.0
 lr_anneal_time: 10000
 lr_back: 0.0005
 lr_flow: 0.05
@@ -85,7 +85,7 @@ prioritized: boltzmann
 rank_weight: 1.0
 repeats: 10
 reweight_T: null
-run_name: 14_tb_low_beta
+run_name: 17_tb_small_range
 s_emb_dim: 512
 samples_per_opt: 10
 sampling: buffer
