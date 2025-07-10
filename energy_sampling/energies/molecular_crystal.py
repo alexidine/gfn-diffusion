@@ -180,7 +180,7 @@ class MolecularCrystal(BaseSet):
         :param packing_coeff:
         :return:
         """
-        return F.softplus(-(packing_coeff - 0.55)) + F.softplus(packing_coeff-0.9) - 1.2189
+        return F.relu(-(torch.log(packing_coeff)-np.log(0.5)))**2 + F.relu(packing_coeff-0.9)**2
 
     def prebuilt_sample_to_reward(self, crystals, temperature):
         """
