@@ -185,5 +185,11 @@ experiments:
       pb_scale_range: 0.1
     notes:
 
-
+  - tag: 20_vg_lb
+    update:
+      fwd_loss_coeffs:
+        vg_lb: 1
+      bwd_loss_coeffs:
+        vg_lb: 1
+    notes:
 
