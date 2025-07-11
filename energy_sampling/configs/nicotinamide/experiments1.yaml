@@ -193,3 +193,110 @@ experiments:
         vg_lb: 1
     notes:
 
+  - tag: 21_tb_special_1
+    update:
+      lr_policy: 0.0001
+      lr_back: 0.0001
+      fwd_loss_coeffs:
+        tb: 1
+        smoothed: 1
+      bwd_loss_coeffs:
+        mle: 1
+        smoothed: 1
+      beta: 1
+    notes:
+
+  - tag: 22_vg_mle_aggressive_expl
+    update:
+      fwd_loss_coeffs:
+        vg_lme: 1
+        mle: 1
+      bwd_loss_coeffs:
+        vg_lme: 1
+        mle: 1
+      beta: 1
+      exploration_factor: 1.0
+    notes:
+
+  - tag: 23_vg_mle_cond
+    update:
+      fwd_loss_coeffs:
+        vg_lme: 1
+        mle: 1
+      bwd_loss_coeffs:
+        vg_lme: 1
+        mle: 1
+      temperature_conditioning: true
+      anneal_energy: true
+      annealing_max_steps: 10000
+    notes:
+
+  - tag: 24_vg_cond
+    update:
+      fwd_loss_coeffs:
+        vg_lme: 1
+      bwd_loss_coeffs:
+        vg_lme: 1
+      temperature_conditioning: true
+      anneal_energy: true
+      annealing_max_steps: 10000
+    notes:
+
+  - tag: 25_vg_lb_cond
+    update:
+      fwd_loss_coeffs:
+        vg_lb: 1
+      bwd_loss_coeffs:
+        vg_lb: 1
+      temperature_conditioning: true
+      anneal_energy: true
+      annealing_max_steps: 10000
+    notes:
+
+  - tag: 26_tb_small
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+      bwd_loss_coeffs:
+        tb: 1
+      hidden_dim: 128
+      s_emb_dim: 128
+    notes:
+
+  - tag: 26_tb_big
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+      bwd_loss_coeffs:
+        tb: 1
+      hidden_dim: 1024
+      s_emb_dim: 1024
+    notes:
+
+  - tag: 27_tb_small_var
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+      bwd_loss_coeffs:
+        tb: 1
+      t_scale: 0.01
+    notes:
+
+  - tag: 28_tb_small_var_big_range
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+      bwd_loss_coeffs:
+        tb: 1
+      t_scale: 0.01
+      log_var_range: 8.0
+    notes:
+
+  - tag: 29_tb_big_range
+    update:
+      fwd_loss_coeffs:
+        tb: 1
+      bwd_loss_coeffs:
+        tb: 1
+      log_var_range: 8.0
+    notes:

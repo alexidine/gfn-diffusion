@@ -187,7 +187,7 @@ def generate_fwd_figs(buffer, energy_function,
     fig_dict['Mean Fwd F Drift'] = f_means_f.abs().mean()
     fig_dict['Mean Fwd B Drift'] = f_means_b.abs().mean()
     fig_dict['Mean Fwd F Var'] = f_vars_f.abs().mean()
-    fig_dict['Mean Fwd B Var'] = f_vars_f.abs().mean()
+    fig_dict['Mean Fwd B Var'] = f_vars_b.abs().mean()
     fig_dict['Traj Mean Step Sizes'] = mean_flow_step_sizes(flow_states)
     fig_dict['Pf vs Pb'] = Pf_vs_Pb_fig(log_pfs, log_pbs, log_r)
     fig_dict['TB Parity Plot'], fig_dict['Forward TB R Value'] = flow_parity_plot(log_r, log_fs[:, 0], log_pbs, log_pfs)
@@ -539,7 +539,7 @@ def generate_bwd_figs(fig_dict, buffer, gfn_model, init_state, discretizer):
     fig_dict['Mean Bwd F Drift'] = b_means_f.abs().mean()
     fig_dict['Mean Bwd B Drift'] = b_means_b.abs().mean()
     fig_dict['Mean Bwd F Var'] = b_vars_f.abs().mean()
-    fig_dict['Mean Bwd B Var'] = b_vars_f.abs().mean()
+    fig_dict['Mean Bwd B Var'] = b_vars_b.abs().mean()
 
     fig_dict['Bwd Traj Mean Step Sizes'] = mean_flow_step_sizes(backward_flow_states)
 

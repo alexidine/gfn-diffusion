@@ -29,8 +29,8 @@ grow_batch_size: true        # whether to dynamically grow the batch size to fil
 max_batch_size: 100           # maximum batch size to allow
 eval_batch_size: 250        # batch size for evaluation
 epochs: 1000000             # number of training epochs: relatively large
-eval_period: 250              # how often to do evaluation & reporting
-figs_period: 250             # how often to log custom figrues  # must be multiple of eval_period or it won't fire
+eval_period: 10              # how often to do evaluation & reporting
+figs_period: 10             # how often to log custom figrues  # must be multiple of eval_period or it won't fire
 buffer_size: 50000          # size of replay buffer: relatively large
 
 # GFlowNet settings

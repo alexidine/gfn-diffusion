@@ -135,3 +135,85 @@
   - fwd_loss_coeffs
   - bwd_loss_coeffs
   notes: null
+- index: 21
+  tag: 21_tb_special_1
+  update_keys:
+  - lr_policy
+  - lr_back
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - beta
+  notes: null
+- index: 22
+  tag: 22_vg_mle_aggressive_expl
+  update_keys:
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - beta
+  - exploration_factor
+  notes: null
+- index: 23
+  tag: 23_vg_mle_cond
+  update_keys:
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - temperature_conditioning
+  - anneal_energy
+  - annealing_max_steps
+  notes: null
+- index: 24
+  tag: 24_vg_cond
+  update_keys:
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - temperature_conditioning
+  - anneal_energy
+  - annealing_max_steps
+  notes: null
+- index: 25
+  tag: 25_vg_lb_cond
+  update_keys:
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - temperature_conditioning
+  - anneal_energy
+  - annealing_max_steps
+  notes: null
+- index: 26
+  tag: 26_tb_small
+  update_keys:
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - hidden_dim
+  - s_emb_dim
+  notes: null
+- index: 27
+  tag: 26_tb_big
+  update_keys:
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - hidden_dim
+  - s_emb_dim
+  notes: null
+- index: 28
+  tag: 27_tb_small_var
+  update_keys:
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - t_scale
+  notes: null
+- index: 29
+  tag: 28_tb_small_var_big_range
+  update_keys:
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - t_scale
+  - log_var_range
+  notes: null
+- index: 30
+  tag: 29_tb_big_range
+  update_keys:
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - log_var_range
+  notes: null
