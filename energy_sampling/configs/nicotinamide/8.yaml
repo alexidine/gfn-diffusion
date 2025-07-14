@@ -10,7 +10,7 @@ burn_in: 100
 bwd: false
 bwd_batch_multiplier: 1
 bwd_loss_coeffs:
-  mle: 0..1
+  mle: 0.1
   smoothed: 0
   tb: 0.0
   vg_lb: 0.0

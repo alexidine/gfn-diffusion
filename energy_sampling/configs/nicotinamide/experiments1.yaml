@@ -284,7 +284,7 @@ experiments:
         tb: 0.0
         vg_lb: 0.0
         vg_lme: 1.0 # exclusive with vg_lb
-        mle: 0..1
+        mle: 0.1
         smoothed: 0
       beta: 1.0
       exploration_factor: 1.0
