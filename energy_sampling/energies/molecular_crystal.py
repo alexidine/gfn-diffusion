@@ -19,12 +19,16 @@ class MolecularCrystal(BaseSet):
                  space_group: int = 2,
                  max_temperature: float = 10,
                  min_temperature: float = 0.01,
-                 turnover_pot: float = 5.0,
+                 lj_turnover_pot: float = 10.0,
                  density_coeff: float = 0,
                  temperature_scaling_factor: float = 1,
                  temperature: float = 1.0,
                  temperature_conditioning: bool = False,
                  energy_clip: float = 100,
+                 ellipsoid_scale: float = 1.0,
+                 core_coeff: float = 1.0,
+                 lj_coeff: float = 1.0,
+                 lj_repulsion: float = 1.0,
                  ):
         super(MolecularCrystal, self).__init__()
         self.device = device
@@ -33,13 +37,16 @@ class MolecularCrystal(BaseSet):
         self.energy_function = energy_function
         self.energy_clip = energy_clip
 
-        self.ellipsoid_scale = 1
+        self.ellipsoid_scale = ellipsoid_scale
         self.density_coeff = density_coeff
         self.max_temperature = max_temperature
         self.min_temperature = min_temperature
         self.temperature_scaling_factor = temperature_scaling_factor
         self.temperature_conditioning = temperature_conditioning
-        self.turnover_pot = turnover_pot  # energy above which to soften intermolecular repulsion
+        self.lj_turnover_pot = lj_turnover_pot  # energy above which to soften intermolecular repulsion
+        self.lj_repulsion = lj_repulsion  #  for values < 1, shifts and softens the silu attraction
+        self.core_coeff = core_coeff
+        self.lj_coeff = lj_coeff
 
         self.temperature = temperature  # for static temperature work
 
@@ -52,7 +59,8 @@ class MolecularCrystal(BaseSet):
     def analyze_crystal_batch(self, x, mol_batch, return_batch=False):  # x is gfn_outputs
         crystal_batch = self.instantiate_crystals(x, mol_batch)
         if self.energy_function not in ['ellipsoid_overlap',
-                                        'silu_energy']:  # no need to actually build the crystal, this is much faster
+                                        'silu_energy',
+                                        'combo']:  # no need to actually build the crystal, this is much faster
             cluster_batch = crystal_batch
             lj_energy = torch.zeros(crystal_batch.num_graphs, device=self.device)
             silu_energy = torch.zeros_like(lj_energy)
@@ -63,9 +71,9 @@ class MolecularCrystal(BaseSet):
 
             cluster_batch.construct_radial_graph(cutoff=6)
             #lj_energy, normed_lj_energy = cluster_batch.compute_LJ_energy()
-            silu_energy = cluster_batch.compute_silu_energy()
+            silu_energy = cluster_batch.compute_silu_energy(repulsion=self.lj_repulsion)
 
-        if self.energy_function == 'ellipsoid_overlap':
+        if self.energy_function in ['ellipsoid_overlap', 'combo']:
             if not hasattr(self, 'ellipsoid_model'):
                 cluster_batch.load_ellipsoid_model()
                 self.ellipsoid_model = copy.deepcopy(cluster_batch.ellipsoid_model)
@@ -77,7 +85,7 @@ class MolecularCrystal(BaseSet):
                 semi_axis_scale=self.ellipsoid_scale,
                 model=self.ellipsoid_model,
                 return_details=True)
-            ellipsoid_overlap = normed_ellipsoid_overlap.flatten()
+            ellipsoid_overlap = normed_ellipsoid_overlap.flatten().detach() # never packprop through this, it's unstable
         else:
             ellipsoid_overlap = torch.zeros_like(silu_energy)
 
@@ -134,7 +142,7 @@ class MolecularCrystal(BaseSet):
 
             diffs = latents[:, None, :] - self.modes[None, :, :]
             sqdist = (diffs ** 2).sum(dim=-1)  # (B, K)
-            exponent = -0.5 * sqdist   # (B, K)
+            exponent = -0.5 * sqdist  # (B, K)
             crystal_energy = -torch.logsumexp(exponent, dim=1)  # (B,)
             """
             #Partition function
@@ -156,18 +164,24 @@ class MolecularCrystal(BaseSet):
 
             diffs = latents[:, None, :] - self.modes[None, :, :]
             sqdist = (diffs ** 2).sum(dim=-1)  # (B, K)
-            exponent = -0.5 * sqdist   # (B, K)
+            exponent = -0.5 * sqdist  # (B, K)
             crystal_energy = -torch.logsumexp(exponent, dim=1)  # (B,)
 
         elif self.energy_function == 'ellipsoid_overlap':
-            intermolecular_energy = cluster_batch.ellipsoid_overlap
             density_energy = self.density_penalty(cluster_batch.packing_coeff)
-            crystal_energy = intermolecular_energy + self.density_coeff * density_energy
+            core_energy = cluster_batch.ellipsoid_overlap ** 2
+            crystal_energy = self.core_coeff * core_energy + self.density_coeff * density_energy
 
         elif self.energy_function == 'silu_energy':
             density_energy = self.density_penalty(cluster_batch.packing_coeff)
-            intermolecular_energy = self.soften_LJ_energy(cluster_batch.silu_pot) / cluster_batch.num_atoms
-            crystal_energy = intermolecular_energy + self.density_coeff * density_energy
+            lj_energy = self.soften_LJ_energy(cluster_batch.silu_pot) / cluster_batch.num_atoms
+            crystal_energy = self.lj_coeff * lj_energy + self.density_coeff * density_energy
+
+        elif self.energy_function == 'combo':
+            density_energy = self.density_penalty(cluster_batch.packing_coeff)
+            lj_energy = self.soften_LJ_energy(cluster_batch.silu_pot) / cluster_batch.num_atoms
+            core_energy = cluster_batch.ellipsoid_overlap ** 2
+            crystal_energy = self.lj_coeff * lj_energy + self.core_coeff * core_energy + self.density_coeff * density_energy
 
         else:
             assert False, f'{self.energy_function} not implemented'
@@ -180,7 +194,7 @@ class MolecularCrystal(BaseSet):
         :param packing_coeff:
         :return:
         """
-        return F.relu(-(torch.log(packing_coeff)-np.log(0.5)))**2 + F.relu(packing_coeff-0.9)**2
+        return F.relu(-(torch.log(packing_coeff) - np.log(0.5))) ** 2 + F.relu(packing_coeff - 0.9) ** 2
 
     def prebuilt_sample_to_reward(self, crystals, temperature):
         """
@@ -230,9 +244,9 @@ class MolecularCrystal(BaseSet):
     def soften_LJ_energy(self, lj_energy):
         # soften the repulsion
         softened_energy = lj_energy.clone()
-        high_bools = softened_energy > self.turnover_pot
-        softened_energy[high_bools] = self.turnover_pot + torch.log(
-            softened_energy[high_bools] + 1 - self.turnover_pot)
+        high_bools = softened_energy > self.lj_turnover_pot
+        softened_energy[high_bools] = self.lj_turnover_pot + torch.log(
+            softened_energy[high_bools] + 1 - self.lj_turnover_pot)
         softened_energy = softened_energy.clip(max=50)
 
         return softened_energy
@@ -242,7 +256,7 @@ class MolecularCrystal(BaseSet):
         ones3 = torch.ones(3, device=self.device)
         zeros1 = torch.zeros(1, device=self.device)
 
-        if self.energy_function == 'ellipsoid_overlap':
+        if self.energy_function in ['ellipsoid_overlap', 'combo']:
             overlap_tensor = torch.zeros(1, device=self.device)
         else:
             overlap_tensor = None

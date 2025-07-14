@@ -1,219 +1,253 @@
 - index: 0
-  tag: 0_tb
+  tag: 0_baseline
   update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
   - fwd_loss_coeffs
   - bwd_loss_coeffs
+  - beta
+  - exploration_factor
+  - wd_max_steps
+  - anneal_temperature
+  - anneal_repulsion
+  - lj_repulsion
+  - ellipsoid_scale
+  - energy_min_temperature
+  - energy_max_temperature
+  - energy_static_temperature
+  - temp_annealing_max_steps
+  - repulsion_annealing_max_steps
   notes: null
 - index: 1
-  tag: 1_tb_smoothing
+  tag: 1_deep
   update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
   - fwd_loss_coeffs
   - bwd_loss_coeffs
+  - beta
+  - exploration_factor
+  - wd_max_steps
+  - anneal_temperature
+  - anneal_repulsion
+  - lj_repulsion
+  - ellipsoid_scale
+  - energy_min_temperature
+  - energy_max_temperature
+  - energy_static_temperature
+  - temp_annealing_max_steps
+  - repulsion_annealing_max_steps
   notes: null
 - index: 2
-  tag: 2_tb_vg
+  tag: 2_wide
   update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
   - fwd_loss_coeffs
   - bwd_loss_coeffs
+  - beta
+  - exploration_factor
+  - wd_max_steps
+  - anneal_temperature
+  - anneal_repulsion
+  - lj_repulsion
+  - ellipsoid_scale
+  - energy_min_temperature
+  - energy_max_temperature
+  - energy_static_temperature
+  - temp_annealing_max_steps
+  - repulsion_annealing_max_steps
   notes: null
 - index: 3
-  tag: 3_tb_mle
+  tag: 3_big_clip
   update_keys:
+  - gradient_norm_clip
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
   - fwd_loss_coeffs
   - bwd_loss_coeffs
+  - beta
+  - exploration_factor
+  - wd_max_steps
+  - anneal_temperature
+  - anneal_repulsion
+  - lj_repulsion
+  - ellipsoid_scale
+  - energy_min_temperature
+  - energy_max_temperature
+  - energy_static_temperature
+  - temp_annealing_max_steps
+  - repulsion_annealing_max_steps
   notes: null
 - index: 4
-  tag: 4_tb_greedy
+  tag: 4_short_expl
   update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
   - fwd_loss_coeffs
   - bwd_loss_coeffs
+  - beta
+  - exploration_factor
+  - wd_max_steps
+  - anneal_temperature
+  - anneal_repulsion
+  - lj_repulsion
+  - ellipsoid_scale
+  - energy_min_temperature
+  - energy_max_temperature
+  - energy_static_temperature
+  - temp_annealing_max_steps
+  - repulsion_annealing_max_steps
   notes: null
 - index: 5
-  tag: 5_vg
+  tag: 5_long_expl
   update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
   - fwd_loss_coeffs
   - bwd_loss_coeffs
+  - beta
+  - exploration_factor
+  - wd_max_steps
+  - anneal_temperature
+  - anneal_repulsion
+  - lj_repulsion
+  - ellipsoid_scale
+  - energy_min_temperature
+  - energy_max_temperature
+  - energy_static_temperature
+  - temp_annealing_max_steps
+  - repulsion_annealing_max_steps
   notes: null
 - index: 6
-  tag: 6_tb_fwd_mle_bwd
+  tag: 6_anneal_T
   update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
   - fwd_loss_coeffs
   - bwd_loss_coeffs
+  - beta
+  - exploration_factor
+  - wd_max_steps
+  - anneal_temperature
+  - anneal_repulsion
+  - lj_repulsion
+  - ellipsoid_scale
+  - energy_min_temperature
+  - energy_max_temperature
+  - energy_static_temperature
+  - temp_annealing_max_steps
+  - repulsion_annealing_max_steps
   notes: null
 - index: 7
-  tag: 7_tb_vg_greedy
+  tag: 7_anneal_repulsion
   update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
   - fwd_loss_coeffs
   - bwd_loss_coeffs
+  - beta
+  - exploration_factor
+  - wd_max_steps
+  - anneal_temperature
+  - anneal_repulsion
+  - lj_repulsion
+  - ellipsoid_scale
+  - energy_min_temperature
+  - energy_max_temperature
+  - energy_static_temperature
+  - temp_annealing_max_steps
+  - repulsion_annealing_max_steps
   notes: null
 - index: 8
-  tag: 8_vg_mle
+  tag: 8_w_mle
   update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
   - fwd_loss_coeffs
   - bwd_loss_coeffs
+  - beta
+  - exploration_factor
+  - wd_max_steps
+  - anneal_temperature
+  - anneal_repulsion
+  - lj_repulsion
+  - ellipsoid_scale
+  - energy_min_temperature
+  - energy_max_temperature
+  - energy_static_temperature
+  - temp_annealing_max_steps
+  - repulsion_annealing_max_steps
   notes: null
 - index: 9
-  tag: 9_tb_expl_.25
+  tag: 9_low_beta
   update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
   - fwd_loss_coeffs
   - bwd_loss_coeffs
+  - beta
   - exploration_factor
+  - wd_max_steps
+  - anneal_temperature
+  - anneal_repulsion
+  - lj_repulsion
+  - ellipsoid_scale
+  - energy_min_temperature
+  - energy_max_temperature
+  - energy_static_temperature
+  - temp_annealing_max_steps
+  - repulsion_annealing_max_steps
   notes: null
 - index: 10
-  tag: 10_tb_expl_1
+  tag: 10_pure_tb
   update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
   - fwd_loss_coeffs
   - bwd_loss_coeffs
+  - beta
   - exploration_factor
+  - wd_max_steps
+  - anneal_temperature
+  - anneal_repulsion
+  - lj_repulsion
+  - ellipsoid_scale
+  - energy_min_temperature
+  - energy_max_temperature
+  - energy_static_temperature
+  - temp_annealing_max_steps
+  - repulsion_annealing_max_steps
   notes: null
 - index: 11
-  tag: 11_tb_expl_perm
+  tag: 11_tb_mle
   update_keys:
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - exploration_wd
-  notes: null
-- index: 12
-  tag: 12_tb_expl_short
-  update_keys:
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - wd_max_steps
-  notes: null
-- index: 13
-  tag: 13_tb_expl_medium
-  update_keys:
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - wd_max_steps
-  notes: null
-- index: 14
-  tag: 14_tb_low_beta
-  update_keys:
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - beta
-  notes: null
-- index: 15
-  tag: 15_tb_high_beta
-  update_keys:
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - beta
-  notes: null
-- index: 16
-  tag: 16_tb_rank_buffer
-  update_keys:
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - prioritized
-  notes: null
-- index: 17
-  tag: 17_tb_small_range
-  update_keys:
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - log_var_range
-  notes: null
-- index: 18
-  tag: 18_tb_large_pb
-  update_keys:
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - pb_scale_range
-  notes: null
-- index: 19
-  tag: 19_tb_small_pb
-  update_keys:
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - pb_scale_range
-  notes: null
-- index: 20
-  tag: 20_vg_lb
-  update_keys:
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  notes: null
-- index: 21
-  tag: 21_tb_special_1
-  update_keys:
-  - lr_policy
-  - lr_back
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - beta
-  notes: null
-- index: 22
-  tag: 22_vg_mle_aggressive_expl
-  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
   - fwd_loss_coeffs
   - bwd_loss_coeffs
   - beta
   - exploration_factor
-  notes: null
-- index: 23
-  tag: 23_vg_mle_cond
-  update_keys:
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - temperature_conditioning
-  - anneal_energy
-  - annealing_max_steps
-  notes: null
-- index: 24
-  tag: 24_vg_cond
-  update_keys:
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - temperature_conditioning
-  - anneal_energy
-  - annealing_max_steps
-  notes: null
-- index: 25
-  tag: 25_vg_lb_cond
-  update_keys:
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - temperature_conditioning
-  - anneal_energy
-  - annealing_max_steps
-  notes: null
-- index: 26
-  tag: 26_tb_small
-  update_keys:
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - hidden_dim
-  - s_emb_dim
-  notes: null
-- index: 27
-  tag: 26_tb_big
-  update_keys:
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - hidden_dim
-  - s_emb_dim
-  notes: null
-- index: 28
-  tag: 27_tb_small_var
-  update_keys:
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - t_scale
-  notes: null
-- index: 29
-  tag: 28_tb_small_var_big_range
-  update_keys:
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - t_scale
-  - log_var_range
-  notes: null
-- index: 30
-  tag: 29_tb_big_range
-  update_keys:
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - log_var_range
+  - wd_max_steps
+  - anneal_temperature
+  - anneal_repulsion
+  - lj_repulsion
+  - ellipsoid_scale
+  - energy_min_temperature
+  - energy_max_temperature
+  - energy_static_temperature
+  - temp_annealing_max_steps
+  - repulsion_annealing_max_steps
   notes: null

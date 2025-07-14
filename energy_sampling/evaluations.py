@@ -1,5 +1,6 @@
 import os
 
+import hdbscan
 import numpy as np
 import plotly.colors as pc
 import torch
@@ -13,6 +14,7 @@ from scipy.spatial.distance import cdist
 from scipy.stats import pearsonr
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.decomposition import PCA
+from umap import UMAP
 
 from plot_utils import get_plotly_fig_size_mb
 from sample_metrics import compute_distribution_distances
@@ -163,20 +165,23 @@ def generate_fwd_figs(buffer, energy_function,
 
         fig_dict['Soft Mode Coverage'] = coverage_per_mode.mean()
 
-    sample_embedding, anchor_embedding, cluster_ind, anchor_inds, anchor_energies = embed_samples(
+    sample_embedding, anchor_embedding, cluster_ind, anchor_energies, all_energies = embed_samples(
         buffer_std_params,
         buffer_reward,
         std_cell_params.cpu().detach().numpy(),
         log_r.cpu().detach().numpy(),
-        known_modes_std if known_modes is not None else None,
-        min_dist=40)
-    fig_dict['Sample Embedding'] = cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies)
+        sample_size=5000
+        )
 
-    # fig_dict['Sample Embedding'] = simple_embedding_fig(std_cell_params.numpy(),
-    #                                                     aux_array=sample_batch.gfn_energy.cpu().detach().numpy(),
-    #                                                     reference_distribution=buffer_std_params,
-    #                                                     known_minima=known_modes_std.numpy() if known_modes is not None else None
-    #                                                     )
+    fig_dict['Sample Embedding'] = cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies, all_energies, color_mode='cluster')
+    fig_dict['Sample Embedding w Energy'] = cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies, all_energies, color_mode='energy')
+
+    # coverage metrics
+    fig_dict['Num Clusters'] = np.sum(cluster_ind > 0)
+    fig_dict['Noise Fraction'] = np.mean(cluster_ind == -1)
+
+    fig = cluster_hist_fig(cluster_ind)
+    fig_dict['Cluster Hist'] = fig
 
     conditional = len(condition.unique()) != 1
     if conditional:
@@ -186,8 +191,8 @@ def generate_fwd_figs(buffer, energy_function,
                                                     f_vars_b, f_means_b)
     fig_dict['Mean Fwd F Drift'] = f_means_f.abs().mean()
     fig_dict['Mean Fwd B Drift'] = f_means_b.abs().mean()
-    fig_dict['Mean Fwd F Var'] = f_vars_f.abs().mean()
-    fig_dict['Mean Fwd B Var'] = f_vars_b.abs().mean()
+    fig_dict['Mean Fwd F Var'] = f_vars_f.mean()
+    fig_dict['Mean Fwd B Var'] = f_vars_b.mean()
     fig_dict['Traj Mean Step Sizes'] = mean_flow_step_sizes(flow_states)
     fig_dict['Pf vs Pb'] = Pf_vs_Pb_fig(log_pfs, log_pbs, log_r)
     fig_dict['TB Parity Plot'], fig_dict['Forward TB R Value'] = flow_parity_plot(log_r, log_fs[:, 0], log_pbs, log_pfs)
@@ -203,6 +208,14 @@ def generate_fwd_figs(buffer, energy_function,
         aux_scalar_name='log_temperature' if condition is not None else None)
 
     return fig_dict
+
+
+def cluster_hist_fig(cluster_ind):
+    uniques, counts = np.unique(cluster_ind, return_counts=True)
+    fig = go.Figure()
+    fig.add_bar(x=uniques, y=counts)
+    fig.update_layout(xaxis_title='Cluster Ind', yaxis_title='Cluster Size')
+    return fig
 
 
 def agglomerative_cluster(ens, samples, energy_cutoff: float = 0.0, min_dist: float = 5):
@@ -230,7 +243,7 @@ def agglomerative_cluster(ens, samples, energy_cutoff: float = 0.0, min_dist: fl
     return anchors, anchor_indices
 
 
-def embed_samples(ref_samples, ref_rewards, samples, sample_rewards, known_modes=None, min_dist: float = 20.0, ):
+def embed_samples(ref_samples, ref_rewards, samples, sample_rewards, sample_size: int, temperature: float = 0.1):
     """
     Cluster samples via agglomerative clustering
     Also, embed them in PC space
@@ -242,38 +255,54 @@ def embed_samples(ref_samples, ref_rewards, samples, sample_rewards, known_modes
     """
 
     if ref_samples is not None:
-        all_samples = np.concatenate([ref_samples, samples])
-        all_energies = -np.concatenate([ref_rewards, sample_rewards])
+        if len(ref_samples) > sample_size:
+            weights = np.exp((ref_rewards-ref_rewards.max()) / temperature) + 1e-2
+            weights /= weights.sum()
+            inds_to_keep = np.random.choice(len(ref_samples), sample_size, replace=False, p=weights)
+
+            ref_samples = ref_samples[inds_to_keep]
+            ref_rewards = ref_rewards[inds_to_keep]
+        samples_to_fit = np.concatenate([ref_samples, samples])
+        energies_to_fit = -np.concatenate([ref_rewards, sample_rewards])
     else:
-        all_samples = samples
-        all_energies = -sample_rewards
+        samples_to_fit = samples
+        energies_to_fit = -sample_rewards
 
-    if known_modes is not None:
-        anchors = known_modes
-        anchor_inds = np.arange(len(known_modes))
-    else:  # todo allow these to mix, instead of just replacing
-        en_stats = [np.amin(all_energies), np.amax(all_energies), np.ptp(all_energies)]
+    # prewhiten data via PCA
+    pca = PCA(n_components=12)
+    pca_embedding = pca.fit_transform(samples_to_fit)
+    clusterer = hdbscan.HDBSCAN(min_cluster_size=5,
+                                min_samples=2,
+                                metric='euclidean',
+                                core_dist_n_jobs=-1)
+    cluster_ind = clusterer.fit_predict(pca_embedding)  # -1 means "noise"
+    sample_cluster_ind = cluster_ind[-len(samples):]
 
-        if en_stats[0] < 0:  # if there are any bound states
-            en_cutoff = 0
-        else:  # cluster bottom 20%
-            en_cutoff = np.quantile(all_energies, 0.2) + 1e-2
+    n_clusters = np.sum(np.unique(cluster_ind) >= 0)
 
-        anchors, anchor_inds = agglomerative_cluster(all_energies,
-                                                     all_samples,
-                                                     min_dist=min_dist,
-                                                     energy_cutoff=en_cutoff)
-        anchors = np.array(anchors)
+    if n_clusters > 0:
+        # extract lowest energy sample
+        cluster_anchor_inds = {}
+        for cluster_id in np.unique(cluster_ind):
+            if cluster_id == -1:
+                continue  # skip noise
+            in_cluster = np.where(cluster_ind == cluster_id)[0]
+            best_ind = in_cluster[np.argmin(energies_to_fit[in_cluster])]
+            cluster_anchor_inds[cluster_id] = best_ind
+        anchor_inds = np.array(list(cluster_anchor_inds.values()))
+    else:
+        anchor_inds = np.array([np.argmin(energies_to_fit)])
+        cluster_ind[anchor_inds] = 0  # make a cluster if there are none naturally
 
-    dists = cdist(samples, anchors)  # shape (N_samples, N_anchors)
-    cluster_ind = np.argmin(dists, axis=1)
+    # dimension reduction
+    sampled_inds = np.random.choice(len(samples_to_fit), size=500, replace=False)
+    samples_to_fit = np.concatenate([samples_to_fit[sampled_inds], samples_to_fit[anchor_inds]])  # ensure anchor inds get into the embedding
+    reducer = UMAP(n_components=2, n_neighbors=10, min_dist=0.05,
+                   metric='euclidean', densmap=False)
+    fit_embedding = reducer.fit_transform(samples_to_fit)
+    sample_embedding = reducer.transform(samples)
 
-    """PCA is also good"""
-    pca = PCA(n_components=2)
-    sample_embedding = pca.fit_transform(samples)
-    anchor_embedding = pca.transform(anchors)
-
-    return sample_embedding, anchor_embedding, cluster_ind, np.array(anchor_inds), all_energies[np.array(anchor_inds)]
+    return sample_embedding, fit_embedding[-len(anchor_inds):], sample_cluster_ind, energies_to_fit[np.array(anchor_inds)], -sample_rewards
 
 
 def voronoi_finite_polygons_2d(vor, radius=None):
@@ -340,7 +369,8 @@ def voronoi_finite_polygons_2d(vor, radius=None):
     return new_regions
 
 
-def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies):
+def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies,
+                sample_energies, color_mode):
     """
     Figure for the clusters in PC space + Voronoi assignments
     :param sample_embedding:
@@ -357,7 +387,7 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
     energies = np.array(anchor_energies)
     norm_energies = (energies - energies.min()) / (energies.max() - energies.min() + 1e-8)
 
-    colorscale = pc.get_colorscale("Viridis")
+    colorscale = pc.get_colorscale("Jet")
     line_colors = [pc.sample_colorscale(colorscale, [v])[0] for v in norm_energies]
 
     x_all = np.concatenate([sample_embedding[:, 0], anchor_embedding[:, 0]])
@@ -367,7 +397,11 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
     n_clusters = len(anchor_embedding)
     distinct_colors = pc.sample_colorscale(colorscale_name, [i / max(n_clusters - 1, 1) for i in range(n_clusters)])
     cluster_to_color = {i: distinct_colors[i] for i in range(n_clusters)}
-    mapped_colors = [cluster_to_color[c] for c in cluster_ind]
+    cluster_to_color.update({-1: 'rgb(0,0,0)'})  # black for noise dimension
+    if color_mode == 'cluster':
+        mapped_colors = [cluster_to_color[c] for c in cluster_ind]
+    elif color_mode == 'energy':
+        mapped_colors = sample_energies
 
     fig = go.Figure()
 
@@ -376,9 +410,10 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
                                mode='markers',
                                opacity=0.85,
                                name='Policy Samples',
-                               showlegend=True,
+                               showlegend=False,
                                marker=dict(
                                    size=6,
+                                   colorscale=colorscale if color_mode == 'energy' else None,
                                    color=mapped_colors,
                                    colorbar=dict(title="Cluster Membership"),
                                    showscale=False,
@@ -390,7 +425,7 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
                                mode='markers',
                                opacity=1,
                                name='Minima',
-                               showlegend=True,
+                               showlegend=False,
                                marker=dict(
                                    size=15,
                                    color=[cluster_to_color[ind] for ind in range(len(anchor_embedding))],  # Fill color
@@ -538,8 +573,8 @@ def generate_bwd_figs(fig_dict, buffer, gfn_model, init_state, discretizer):
                                                      b_vars_b, b_means_b)
     fig_dict['Mean Bwd F Drift'] = b_means_f.abs().mean()
     fig_dict['Mean Bwd B Drift'] = b_means_b.abs().mean()
-    fig_dict['Mean Bwd F Var'] = b_vars_f.abs().mean()
-    fig_dict['Mean Bwd B Var'] = b_vars_b.abs().mean()
+    fig_dict['Mean Bwd F Var'] = b_vars_f.mean()
+    fig_dict['Mean Bwd B Var'] = b_vars_b.mean()
 
     fig_dict['Bwd Traj Mean Step Sizes'] = mean_flow_step_sizes(backward_flow_states)
 
@@ -554,9 +589,10 @@ def generate_bwd_figs(fig_dict, buffer, gfn_model, init_state, discretizer):
 
 def get_buffer_stats(buffer):
     if len(buffer) > 0:
+        samples_to_take = min(10000, len(buffer))
         # take samples according to the sampler weighting, rather than random trash in the buffer
         buffer_latent_params, buffer_reward, buffer_batch = buffer.sample(
-            temperature=torch.ones(10000), override_batch=10000)
+            temperature=torch.ones(samples_to_take), override_batch=samples_to_take)
         buffer_cell_params = buffer_batch.cell_parameters().cpu().detach().numpy()
         buffer_latent_params = buffer_batch.cell_params_to_gen_basis().cpu().detach().numpy()
         buffer_std_params_for_embedding = buffer_batch.cell_params_to_gen_basis().cpu().detach().numpy()
@@ -607,9 +643,34 @@ def log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_
     metrics['Crystal Min Temperature'] = energy_function.min_temperature
     metrics['Crystal Max Temperature'] = energy_function.max_temperature
     metrics['Crystal Static Temperature'] = energy_function.temperature
+    metrics['Crystal Repulsion Factor'] = energy_function.lj_repulsion
     metrics['Ellipsoid Scale'] = energy_function.ellipsoid_scale
     metrics['Temperature Scaling Factor'] = energy_function.temperature_scaling_factor
     metrics['Density Loss Coefficient'] = energy_function.density_coeff
+
+    lattice_features = ['cell_a', 'cell_b', 'cell_c',
+                        'cell_alpha', 'cell_beta', 'cell_gamma',
+                        'aunit_x', 'aunit_y', 'aunit_z',
+                        'orientation_1', 'orientation_2', 'orientation_3']
+    std_params = sample_batch.cell_params_to_gen_basis()
+
+    metrics['Total Var'] = std_params.var(dim=0).sum().item()
+    metrics['Total Mean'] = std_params.mean(dim=0).sum().item()
+
+    eigvals = torch.linalg.svdvals(std_params - std_params.mean(0)) ** 2
+    explained_var_ratio = eigvals / eigvals.sum()
+    d_eff = (explained_var_ratio ** 2).sum() ** -1
+
+    metrics['Effective Dimension'] = d_eff.item()
+    for ind, feat in enumerate(lattice_features):
+        metrics[feat + '_mean'] = std_params[:, ind].mean().item()
+        metrics[feat + '_var'] = std_params[:, ind].var().item()
+        metrics[feat + '_expl_var_rat'] = explained_var_ratio[ind].item()
+
+    cov = torch.cov(std_params.T)  # shape [12, 12]
+    volume_proxy = torch.det(cov).clamp_min(1e-12).sqrt().item()
+    metrics['Gaussian Proxy Hypervolume'] = np.log(volume_proxy)
+
     if hasattr(sample_batch, 'ellipsoid_overlap'):
         metrics['mean ellipsoid overlap'] = sample_batch.ellipsoid_overlap.mean().cpu().detach().numpy()
         metrics['ellipsoid overlap'] = sample_batch.ellipsoid_overlap.clip(min=1e-3).log10().cpu().detach().numpy()
@@ -797,7 +858,7 @@ def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs):
     fig.add_trace(go.Scatter(
         x=x, y=y,
         mode='markers',
-        marker=dict(size=6, opacity=0.7, color=log_r.cpu().detach()),
+        marker=dict(size=6, opacity=0.7, color=log_r.cpu().detach(), colorscale='Jet'),
         name=f'Samples<br>MAE = {mae:.3f}<br>R = {r_value:.3f}'
     ))
 

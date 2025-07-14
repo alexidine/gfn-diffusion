@@ -189,6 +189,11 @@ def train():
                                        temperature=args.energy_static_temperature,
                                        density_coeff=args.energy_density_coeff,
                                        energy_clip=args.energy_clip,
+                                       ellipsoid_scale=args.ellipsoid_scale,
+                                       core_coeff=args.energy_core_coeff,
+                                       lj_coeff=args.energy_lj_coeff,
+                                       lj_turnover_pot=args.lj_turnover_pot,
+                                       lj_repulsion=args.lj_repulsion,
                                        )
 
     config = args.__dict__
@@ -221,12 +226,14 @@ def train():
     prev_rewards_dist = None
     lr_warmup_finished = False
     # maxes out at 1, triggering every 10 steps
-    # go from initial to final scaling value in annealing_max_steps
+    # go from initial to final scaling value in temp_annealing_max_steps
     if args.temperature_conditioning:
-        annealing_lambda = (1 / args.temperature_scaling_factor) ** (1 / (args.annealing_max_steps / 10))
+        temp_annealing_lambda = (1 / args.temperature_scaling_factor) ** (1 / (args.temp_annealing_max_steps / 10))
     else:
-        annealing_lambda = (args.energy_min_temperature / args.energy_static_temperature) ** (
-                1 / (args.annealing_max_steps / 10))
+        temp_annealing_lambda = (args.energy_min_temperature / args.energy_static_temperature) ** (
+                1 / (args.temp_annealing_max_steps / 10))
+
+    repulsion_annealing_lambda = (1 / args.lj_repulsion) ** (1 / (args.repulsion_annealing_max_steps / 10))
 
     fwd_loss, bwd_loss = 0, 0
     gfn_model.train()
@@ -269,7 +276,7 @@ def train():
 
         elif step_ind % 10 == 0 and step_ind > 9:
             lr_warmup_finished, lr = step_lr_schedule(schedulers, optimizers, lr_warmup_finished)
-            anneal_reward(annealing_lambda, energy_function, args)
+            anneal_reward(temp_annealing_lambda, repulsion_annealing_lambda, energy_function, args)
             metrics.update({'lr_fwd': optimizers['fwd'].param_groups[0]['lr']})
             metrics.update({'lr_bwd': optimizers['bwd'].param_groups[0]['lr']})
             metrics.update({'lr_flow': optimizers['flow'].param_groups[0]['lr']})
@@ -284,15 +291,19 @@ def train():
     torch.save(gfn_model.state_dict(), f'{name}_model_final.pt')
 
 
-def anneal_reward(annealing_lambda, energy_function, args):
+def anneal_reward(temp_annealing_lambda, repulsion_annealing_lambda, energy_function, args):
     """anneal reward function"""
-    if args.anneal_energy:
+    if args.anneal_temperature:
         if args.temperature_conditioning:
             if energy_function.temperature_scaling_factor < 1:
-                energy_function.temperature_scaling_factor *= annealing_lambda
+                energy_function.temperature_scaling_factor *= temp_annealing_lambda
         else:
             if energy_function.temperature > args.energy_min_temperature:
-                energy_function.temperature *= annealing_lambda
+                energy_function.temperature *= temp_annealing_lambda
+
+    if args.anneal_repulsion:
+        if energy_function.lj_repulsion < 1:
+            energy_function.lj_repulsion *= repulsion_annealing_lambda
 
 
 def step_lr_schedule(schedulers, optimizers,
@@ -349,7 +360,8 @@ def init_schedulers_optimizers(gfn_model):
 
     schedulers = {}
     if args.scheduler:
-        lr_warmup_lambda = 100 ** (1 / (args.lr_warmup_time / 10))  # grow over 2 orders
+        lr_warmup_lambda = args.lr_warmup_ratio ** (
+                    1 / (args.lr_warmup_time / 10))  # grow over factor of lr_warmup_ratio, each 10 steps
         lr_annealing_lambda = (args.min_lr / args.lr_policy) ** (1 / (args.lr_anneal_time / 10))
         schedulers['fwd_1'] = lr_scheduler.MultiplicativeLR(optimizers['fwd'], lr_lambda=lambda epoch: lr_warmup_lambda)
         schedulers['fwd_2'] = lr_scheduler.MultiplicativeLR(optimizers['fwd'],
@@ -358,9 +370,9 @@ def init_schedulers_optimizers(gfn_model):
         schedulers['bwd_2'] = lr_scheduler.MultiplicativeLR(optimizers['bwd'],
                                                             lr_lambda=lambda epoch: lr_annealing_lambda)
 
-        flow_annealing_lambda = ((init_flow_lr/10)/init_flow_lr) ** (1 / (args.lr_anneal_time / 10))
+        flow_annealing_lambda = ((init_flow_lr / 10) / init_flow_lr) ** (1 / (args.lr_anneal_time / 10))
         schedulers['flow'] = lr_scheduler.MultiplicativeLR(optimizers['flow'],
-                                                            lr_lambda=lambda epoch: flow_annealing_lambda)
+                                                           lr_lambda=lambda epoch: flow_annealing_lambda)
 
     return optimizers, schedulers
 
@@ -519,37 +531,54 @@ def handle_oom(batch_size):
 def add_dataset_to_buffer(dataset_path, buffer):
     print("Loading prebuilt buffer")
     dataset = torch.load(dataset_path)
-    if args.energy_function == 'ellipsoid_overlap':  # add ellipsoid overlaps to each sample here, as they weren't in the original optimization
+    if args.energy_function in ['ellipsoid_overlap',
+                                'silu_energy'
+                                'combo']:  # reparameterize incoming samples
         print("Adding ellipsoid information to buffer")
 
         from tqdm import tqdm
         batch_size = 500
-        loader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            drop_last=False
-        )
-        overlaps = []
+        with torch.no_grad():
 
-        for crystal_batch in tqdm(loader):
-            crystal_batch = crystal_batch.to('cuda')
-            crystal_batch.box_analysis()
-            cluster_batch = crystal_batch.mol2cluster(cutoff=6,
-                                                      supercell_size=10,
-                                                      align_to_standardized_orientation=True)
+            loader = DataLoader(
+                dataset,
+                batch_size=batch_size,
+                drop_last=False
+            )
+            overlaps = []
+            silus = []
+            ljs = []
 
-            cluster_batch.construct_radial_graph(cutoff=6)
-            # simplified ellipsoid energy testing
-            _, _, _, _, _, _, normed_ellipsoid_overlap \
-                = cluster_batch.compute_ellipsoidal_overlap(
-                semi_axis_scale=1,
-                return_details=True)
+            for crystal_batch in tqdm(loader):
+                crystal_batch = crystal_batch.to('cuda')
+                crystal_batch.box_analysis()
+                cluster_batch = crystal_batch.mol2cluster(cutoff=6,
+                                                          supercell_size=10,
+                                                          align_to_standardized_orientation=True)
 
-            overlaps.extend(normed_ellipsoid_overlap.cpu().detach().numpy())
+                cluster_batch.construct_radial_graph(cutoff=6)
 
-        overlaps = torch.tensor(overlaps)
-        for ind, elem in enumerate(dataset):
-            elem.ellipsoid_overlap = torch.ones(1) * overlaps[ind]
+                lj_energy, normed_lj_energy = cluster_batch.compute_LJ_energy()
+                silu_energy = cluster_batch.compute_silu_energy()
+
+                # simplified ellipsoid energy testing
+                _, _, _, _, _, _, normed_ellipsoid_overlap \
+                    = cluster_batch.compute_ellipsoidal_overlap(
+                    semi_axis_scale=args.ellipsoid_scale,
+                    return_details=True)
+
+                overlaps.extend(normed_ellipsoid_overlap.cpu().detach().numpy())
+                silus.extend(silu_energy.cpu().detach().numpy())
+                ljs.extend(lj_energy.cpu().detach().numpy())
+
+            overlaps = torch.tensor(overlaps)
+            silus = torch.tensor(silus)
+            ljs = torch.tensor(ljs)
+            for ind, elem in enumerate(dataset):
+                elem.ellipsoid_overlap = torch.ones(1) * overlaps[ind]
+                elem.silu_pot = torch.ones(1) * silus[ind]
+                elem.lj_pot = torch.ones(1) * ljs[ind]
+
 
     buffer.add(dataset)
     print(f"Buffer loaded with {len(dataset)} samples")
