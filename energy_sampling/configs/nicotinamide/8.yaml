@@ -37,7 +37,7 @@ energy_static_temperature: 1
 epochs: 10000000
 eval: false
 eval_T: 200
-eval_batch_size: 2000
+eval_batch_size: 1000
 eval_period: 250
 exploration_factor: 1.0
 exploration_wd: true
@@ -76,7 +76,7 @@ lr_policy: 0.0001
 lr_warmup_ratio: 100
 lr_warmup_time: 1000
 ls_cycle: 100
-max_batch_size: 2000
+max_batch_size: 500
 max_iter_ls: 100
 max_traj_length: 20
 min_lr: 1.0e-06

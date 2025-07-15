@@ -16,9 +16,9 @@ reweight_T: null                # 'null' or float: smaller values reduce the imp
 
 # model parameters
 zero_init: true
-joint_layers: 4              # number of layers in forward/backward policy models
-hidden_dim: 128              # dimensionality of hidden layer
-s_emb_dim: 128                # dimensionality of state embedding
+joint_layers: 8              # number of layers in forward/backward policy models
+hidden_dim: 1024              # dimensionality of hidden layer
+s_emb_dim: 1024                # dimensionality of state embedding
 t_emb_dim: 32                # dimensionality of time embedding
 harmonics_dim: 64            # dimensionality of harmonic embedding
 condition_emb_dim: 32         # dimensionality of the conditioning embedding
@@ -29,9 +29,9 @@ batch_size: 25               # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
 max_batch_size: 100           # maximum batch size to allow
 eval_batch_size: 500        # batch size for evaluation
-epochs: 10000000             # number of training epochs: relatively large
-eval_period: 10              # how often to do evaluation & reporting
-figs_period: 10             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
+epochs: 200             # number of training epochs: relatively large
+eval_period: 201              # how often to do evaluation & reporting
+figs_period: 201             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
 buffer_size: 50000          # size of replay buffer: relatively large
 
 # GFlowNet settings
@@ -109,7 +109,9 @@ energy_function: combo
   # 'silu_energy' : minimize a softened LJ-tye energy subject to energy_density_coeff external pressure
   # 'combo' : silu + ellipsoid overlap
 anneal_temperature: false  # scale temperature over time, when conditional it scales the distribution, when not it just decreases from static to min
+temp_annealing_max_steps: 5000  # time for scaling_factor to reach 1 (uniform sampling from min to max)
 anneal_repulsion: True
+repulsion_annealing_max_steps: 5000
 energy_density_coeff: 2.0  # how much to weight the density penalty term in the energy function
 energy_lj_coeff: 1.0  # loss coefficient
 energy_core_coeff: 10.0  # loss coefficient
@@ -121,8 +123,6 @@ energy_min_temperature: 0.1
 energy_max_temperature: 10
 energy_static_temperature: 1  # for certain evaluations or static T training. Also initial temperature on unconditional temperature annealing
 temperature_scaling_factor: 0.01  # controls relative frequency of higher vs lower temperatures (higher -> higher)
-temp_annealing_max_steps: 5000  # time for scaling_factor to reach 1 (uniform sampling from min to max)
-repulsion_annealing_max_steps: 5000
 energy_clip: 25
 
 ############
