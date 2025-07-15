@@ -177,7 +177,7 @@ def generate_fwd_figs(buffer, energy_function,
     fig_dict['Sample Embedding w Energy'] = cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies, all_energies, color_mode='energy')
 
     # coverage metrics
-    fig_dict['Num Clusters'] = np.sum(cluster_ind > 0)
+    fig_dict['Num Clusters'] = np.sum(np.unique(cluster_ind) > 0)
     fig_dict['Noise Fraction'] = np.mean(cluster_ind == -1)
 
     fig = cluster_hist_fig(cluster_ind)
@@ -271,8 +271,8 @@ def embed_samples(ref_samples, ref_rewards, samples, sample_rewards, sample_size
     # prewhiten data via PCA
     pca = PCA(n_components=12)
     pca_embedding = pca.fit_transform(samples_to_fit)
-    clusterer = hdbscan.HDBSCAN(min_cluster_size=5,
-                                min_samples=2,
+    clusterer = hdbscan.HDBSCAN(min_cluster_size=20,
+                                min_samples=20,
                                 metric='euclidean',
                                 core_dist_n_jobs=-1)
     cluster_ind = clusterer.fit_predict(pca_embedding)  # -1 means "noise"

@@ -1,5 +1,5 @@
 T: 10
-anneal_repulsion: false
+anneal_repulsion: true
 anneal_temperature: true
 batch_size: 25
 beta: 1.0
@@ -32,17 +32,17 @@ energy_density_coeff: 2.0
 energy_function: combo
 energy_lj_coeff: 1.0
 energy_max_temperature: 10
-energy_min_temperature: 0.01
+energy_min_temperature: 0.1
 energy_static_temperature: 1
 epochs: 10000000
 eval: false
 eval_T: 100
-eval_batch_size: 1000
-eval_period: 100
+eval_batch_size: 2000
+eval_period: 250
 exploration_factor: 1.0
 exploration_wd: true
 exploratory: true
-figs_period: 500
+figs_period: 1000
 fwd_loss_coeffs:
   greedy: 0
   mle: 0.0
@@ -68,7 +68,7 @@ lgv_layers: 4
 lj_repulsion: 0.85
 lj_turnover_pot: 10.0
 local_search: false
-log_var_range: 4
+log_var_range: 8
 lr_anneal_time: 10000
 lr_back: 0.0001
 lr_flow: 0.1
@@ -76,7 +76,7 @@ lr_policy: 0.0001
 lr_warmup_ratio: 100
 lr_warmup_time: 1000
 ls_cycle: 100
-max_batch_size: 500
+max_batch_size: 2000
 max_iter_ls: 100
 max_traj_length: 20
 min_lr: 1.0e-06
@@ -92,7 +92,7 @@ rank_weight: 1.0
 repeats: 10
 repulsion_annealing_max_steps: 10000
 reweight_T: null
-run_name: 6_anneal_T
+run_name: 6_large_var_range
 s_emb_dim: 256
 samples_per_opt: 10
 sampling: buffer

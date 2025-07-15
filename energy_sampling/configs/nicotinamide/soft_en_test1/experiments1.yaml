@@ -25,7 +25,6 @@ experiments:
       joint_layers: 4
       hidden_dim: 256
       s_emb_dim: 256
-      dropout: 0.1
       fwd_loss_coeffs:
         tb: 1.0
         vg_lb: 0.0
@@ -42,11 +41,11 @@ experiments:
       beta: 1.0
       exploration_factor: 1.0
       wd_max_steps: 5000
-      anneal_temperature: true
-      anneal_repulsion: true
+      anneal_temperature: false
+      anneal_repulsion: false
       lj_repulsion: 0.85
       ellipsoid_scale: -0.5
-      energy_min_temperature: 0.1
+      energy_min_temperature: 0.01
       energy_max_temperature: 10
       energy_static_temperature: 1
       temp_annealing_max_steps: 10000
@@ -58,7 +57,6 @@ experiments:
       joint_layers: 8
       hidden_dim: 256
       s_emb_dim: 256
-      dropout: 0.5
       fwd_loss_coeffs:
         tb: 1.0
         vg_lb: 0.0
@@ -75,23 +73,22 @@ experiments:
       beta: 1.0
       exploration_factor: 1.0
       wd_max_steps: 5000
-      anneal_temperature: true
-      anneal_repulsion: true
+      anneal_temperature: false
+      anneal_repulsion: false
       lj_repulsion: 0.85
       ellipsoid_scale: -0.5
-      energy_min_temperature: 0.1
+      energy_min_temperature: 0.01
       energy_max_temperature: 10
       energy_static_temperature: 1
       temp_annealing_max_steps: 10000
       repulsion_annealing_max_steps: 10000
-    notes:
+    notes: low effective dim, lower var. Bette rewards, worse losses
 
   - tag: 2_wide
     update:
       joint_layers: 4
       hidden_dim: 512
       s_emb_dim: 512
-      dropout: 0.5
       fwd_loss_coeffs:
         tb: 1.0
         vg_lb: 0.0
@@ -108,25 +105,55 @@ experiments:
       beta: 1.0
       exploration_factor: 1.0
       wd_max_steps: 5000
-      anneal_temperature: true
-      anneal_repulsion: true
+      anneal_temperature: false
+      anneal_repulsion: false
       lj_repulsion: 0.85
       ellipsoid_scale: -0.5
-      energy_min_temperature: 0.1
+      energy_min_temperature: 0.01
       energy_max_temperature: 10
       energy_static_temperature: 1
       temp_annealing_max_steps: 10000
       repulsion_annealing_max_steps: 10000
-    notes:
+    notes: similar, better var
 
+  - tag: 3_big_clip
+    update:
+      gradient_norm_clip: 1.0
+      joint_layers: 4
+      hidden_dim: 256
+      s_emb_dim: 256
+      fwd_loss_coeffs:
+        tb: 1.0
+        vg_lb: 0.0
+        vg_lme: 0.0  # exclusive with vg_lb
+        greedy: 0
+        mle: 0.0
+        smoothed: 0
+      bwd_loss_coeffs:
+        tb: 0.0
+        vg_lb: 0.0
+        vg_lme: 1.0 # exclusive with vg_lb
+        mle: 0.0
+        smoothed: 0
+      beta: 1.0
+      exploration_factor: 1.0
+      wd_max_steps: 5000
+      anneal_temperature: false
+      anneal_repulsion: false
+      lj_repulsion: 0.85
+      ellipsoid_scale: -0.5
+      energy_min_temperature: 0.01
+      energy_max_temperature: 10
+      energy_static_temperature: 1
+      temp_annealing_max_steps: 10000
+      repulsion_annealing_max_steps: 10000
+    notes: mostly identical
 
-  - tag: 3_small_var
+  - tag: 4_short_expl
     update:
       joint_layers: 4
       hidden_dim: 256
       s_emb_dim: 256
-      dropout: 0.1
-      t_scale: 0.05
       fwd_loss_coeffs:
         tb: 1.0
         vg_lb: 0.0
@@ -142,25 +169,23 @@ experiments:
         smoothed: 0
       beta: 1.0
       exploration_factor: 1.0
-      wd_max_steps: 5000
-      anneal_temperature: true
-      anneal_repulsion: true
+      wd_max_steps: 2500
+      anneal_temperature: false
+      anneal_repulsion: false
       lj_repulsion: 0.85
       ellipsoid_scale: -0.5
-      energy_min_temperature: 0.1
+      energy_min_temperature: 0.01
       energy_max_temperature: 10
       energy_static_temperature: 1
       temp_annealing_max_steps: 10000
       repulsion_annealing_max_steps: 10000
-    notes:
+    notes: loss converges faster, otherwise not obvious
 
-  - tag: 4_large_var
+  - tag: 5_long_expl
     update:
       joint_layers: 4
       hidden_dim: 256
       s_emb_dim: 256
-      dropout: 0.1
-      t_scale: 0.2
       fwd_loss_coeffs:
         tb: 1.0
         vg_lb: 0.0
@@ -176,25 +201,23 @@ experiments:
         smoothed: 0
       beta: 1.0
       exploration_factor: 1.0
-      wd_max_steps: 5000
-      anneal_temperature: true
-      anneal_repulsion: true
+      wd_max_steps: 10000
+      anneal_temperature: false
+      anneal_repulsion: false
       lj_repulsion: 0.85
       ellipsoid_scale: -0.5
-      energy_min_temperature: 0.1
+      energy_min_temperature: 0.01
       energy_max_temperature: 10
       energy_static_temperature: 1
       temp_annealing_max_steps: 10000
       repulsion_annealing_max_steps: 10000
-    notes:
+    notes: loss converges slower. Better var at first
 
-  - tag: 5_small_var_range
+  - tag: 6_anneal_T
     update:
       joint_layers: 4
       hidden_dim: 256
       s_emb_dim: 256
-      dropout: 0.1
-      log_var_range: 2
       fwd_loss_coeffs:
         tb: 1.0
         vg_lb: 0.0
@@ -212,23 +235,21 @@ experiments:
       exploration_factor: 1.0
       wd_max_steps: 5000
       anneal_temperature: true
-      anneal_repulsion: true
+      anneal_repulsion: false
       lj_repulsion: 0.85
       ellipsoid_scale: -0.5
-      energy_min_temperature: 0.1
+      energy_min_temperature: 0.01
       energy_max_temperature: 10
       energy_static_temperature: 1
       temp_annealing_max_steps: 10000
       repulsion_annealing_max_steps: 10000
-    notes:
+    notes: great energies, with partial collapse
 
-  - tag: 6_large_var_range
+  - tag: 7_anneal_repulsion
     update:
       joint_layers: 4
       hidden_dim: 256
       s_emb_dim: 256
-      dropout: 0.1
-      log_var_range: 8
       fwd_loss_coeffs:
         tb: 1.0
         vg_lb: 0.0
@@ -245,58 +266,54 @@ experiments:
       beta: 1.0
       exploration_factor: 1.0
       wd_max_steps: 5000
-      anneal_temperature: true
+      anneal_temperature: false
       anneal_repulsion: true
       lj_repulsion: 0.85
       ellipsoid_scale: -0.5
-      energy_min_temperature: 0.1
+      energy_min_temperature: 0.01
       energy_max_temperature: 10
       energy_static_temperature: 1
       temp_annealing_max_steps: 10000
       repulsion_annealing_max_steps: 10000
-    notes:
+    notes: hard to say. Maybe slightly better
 
-  - tag: 7_large_pb_scale
+  - tag: 8_w_mle
     update:
       joint_layers: 4
       hidden_dim: 256
       s_emb_dim: 256
-      dropout: 0.1
-      pb_scale_range: 0.2
       fwd_loss_coeffs:
         tb: 1.0
         vg_lb: 0.0
         vg_lme: 0.0  # exclusive with vg_lb
         greedy: 0
-        mle: 0.0
+        mle: 0.1
         smoothed: 0
       bwd_loss_coeffs:
         tb: 0.0
         vg_lb: 0.0
         vg_lme: 1.0 # exclusive with vg_lb
-        mle: 0.0
+        mle: 0.1
         smoothed: 0
       beta: 1.0
       exploration_factor: 1.0
       wd_max_steps: 5000
-      anneal_temperature: true
-      anneal_repulsion: true
+      anneal_temperature: false
+      anneal_repulsion: false
       lj_repulsion: 0.85
       ellipsoid_scale: -0.5
-      energy_min_temperature: 0.1
+      energy_min_temperature: 0.01
       energy_max_temperature: 10
       energy_static_temperature: 1
       temp_annealing_max_steps: 10000
       repulsion_annealing_max_steps: 10000
-    notes:
+    notes: better losses actually, maybe from superior mutual overlap
 
-  - tag: 8_extra_eval_T
+  - tag: 9_low_beta
     update:
       joint_layers: 4
       hidden_dim: 256
       s_emb_dim: 256
-      dropout: 0.1
-      eval_T: 200
       fwd_loss_coeffs:
         tb: 1.0
         vg_lb: 0.0
@@ -310,16 +327,80 @@ experiments:
         vg_lme: 1.0 # exclusive with vg_lb
         mle: 0.0
         smoothed: 0
-      beta: 1.0
+      beta: 0.1
       exploration_factor: 1.0
       wd_max_steps: 5000
-      anneal_temperature: true
-      anneal_repulsion: true
+      anneal_temperature: false
+      anneal_repulsion: false
       lj_repulsion: 0.85
       ellipsoid_scale: -0.5
-      energy_min_temperature: 0.1
+      energy_min_temperature: 0.01
       energy_max_temperature: 10
       energy_static_temperature: 1
       temp_annealing_max_steps: 10000
       repulsion_annealing_max_steps: 10000
-    notes:
+    notes: more variance, slightly better samples actually
+
+  - tag: 10_pure_tb
+    update:
+      joint_layers: 4
+      hidden_dim: 256
+      s_emb_dim: 256
+      fwd_loss_coeffs:
+        tb: 1.0
+        vg_lb: 0.0
+        vg_lme: 0.0  # exclusive with vg_lb
+        greedy: 0
+        mle: 0.0
+        smoothed: 0
+      bwd_loss_coeffs:
+        tb: 1.0
+        vg_lb: 0.0
+        vg_lme: 0.0 # exclusive with vg_lb
+        mle: 0.0
+        smoothed: 0
+      beta: 1.0
+      exploration_factor: 1.0
+      wd_max_steps: 5000
+      anneal_temperature: false
+      anneal_repulsion: false
+      lj_repulsion: 0.85
+      ellipsoid_scale: -0.5
+      energy_min_temperature: 0.01
+      energy_max_temperature: 10
+      energy_static_temperature: 1
+      temp_annealing_max_steps: 10000
+      repulsion_annealing_max_steps: 10000
+    notes: better mode seeking, worse exploration
+
+  - tag: 11_tb_mle
+    update:
+      joint_layers: 4
+      hidden_dim: 256
+      s_emb_dim: 256
+      fwd_loss_coeffs:
+        tb: 1.0
+        vg_lb: 0.0
+        vg_lme: 0.0  # exclusive with vg_lb
+        greedy: 0
+        mle: 0.1
+        smoothed: 0
+      bwd_loss_coeffs:
+        tb: 0.0
+        vg_lb: 0.0
+        vg_lme: 1.0 # exclusive with vg_lb
+        mle: 0.1
+        smoothed: 0
+      beta: 1.0
+      exploration_factor: 1.0
+      wd_max_steps: 5000
+      anneal_temperature: false
+      anneal_repulsion: false
+      lj_repulsion: 0.85
+      ellipsoid_scale: -0.5
+      energy_min_temperature: 0.01
+      energy_max_temperature: 10
+      energy_static_temperature: 1
+      temp_annealing_max_steps: 10000
+      repulsion_annealing_max_steps: 10000
+    notes: very similar to 8

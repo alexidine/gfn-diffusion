@@ -4,7 +4,6 @@
   - joint_layers
   - hidden_dim
   - s_emb_dim
-  - dropout
   - fwd_loss_coeffs
   - bwd_loss_coeffs
   - beta
@@ -26,7 +25,6 @@
   - joint_layers
   - hidden_dim
   - s_emb_dim
-  - dropout
   - fwd_loss_coeffs
   - bwd_loss_coeffs
   - beta
@@ -48,7 +46,6 @@
   - joint_layers
   - hidden_dim
   - s_emb_dim
-  - dropout
   - fwd_loss_coeffs
   - bwd_loss_coeffs
   - beta
@@ -65,13 +62,12 @@
   - repulsion_annealing_max_steps
   notes: null
 - index: 3
-  tag: 3_small_var
+  tag: 3_big_clip
   update_keys:
+  - gradient_norm_clip
   - joint_layers
   - hidden_dim
   - s_emb_dim
-  - dropout
-  - t_scale
   - fwd_loss_coeffs
   - bwd_loss_coeffs
   - beta
@@ -88,13 +84,11 @@
   - repulsion_annealing_max_steps
   notes: null
 - index: 4
-  tag: 4_large_var
+  tag: 4_short_expl
   update_keys:
   - joint_layers
   - hidden_dim
   - s_emb_dim
-  - dropout
-  - t_scale
   - fwd_loss_coeffs
   - bwd_loss_coeffs
   - beta
@@ -111,13 +105,11 @@
   - repulsion_annealing_max_steps
   notes: null
 - index: 5
-  tag: 5_small_var_range
+  tag: 5_long_expl
   update_keys:
   - joint_layers
   - hidden_dim
   - s_emb_dim
-  - dropout
-  - log_var_range
   - fwd_loss_coeffs
   - bwd_loss_coeffs
   - beta
@@ -134,13 +126,11 @@
   - repulsion_annealing_max_steps
   notes: null
 - index: 6
-  tag: 6_large_var_range
+  tag: 6_anneal_T
   update_keys:
   - joint_layers
   - hidden_dim
   - s_emb_dim
-  - dropout
-  - log_var_range
   - fwd_loss_coeffs
   - bwd_loss_coeffs
   - beta
@@ -157,13 +147,11 @@
   - repulsion_annealing_max_steps
   notes: null
 - index: 7
-  tag: 7_large_pb_scale
+  tag: 7_anneal_repulsion
   update_keys:
   - joint_layers
   - hidden_dim
   - s_emb_dim
-  - dropout
-  - pb_scale_range
   - fwd_loss_coeffs
   - bwd_loss_coeffs
   - beta
@@ -180,13 +168,74 @@
   - repulsion_annealing_max_steps
   notes: null
 - index: 8
-  tag: 8_extra_eval_T
+  tag: 8_w_mle
   update_keys:
   - joint_layers
   - hidden_dim
   - s_emb_dim
-  - dropout
-  - eval_T
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - beta
+  - exploration_factor
+  - wd_max_steps
+  - anneal_temperature
+  - anneal_repulsion
+  - lj_repulsion
+  - ellipsoid_scale
+  - energy_min_temperature
+  - energy_max_temperature
+  - energy_static_temperature
+  - temp_annealing_max_steps
+  - repulsion_annealing_max_steps
+  notes: null
+- index: 9
+  tag: 9_low_beta
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - beta
+  - exploration_factor
+  - wd_max_steps
+  - anneal_temperature
+  - anneal_repulsion
+  - lj_repulsion
+  - ellipsoid_scale
+  - energy_min_temperature
+  - energy_max_temperature
+  - energy_static_temperature
+  - temp_annealing_max_steps
+  - repulsion_annealing_max_steps
+  notes: null
+- index: 10
+  tag: 10_pure_tb
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - beta
+  - exploration_factor
+  - wd_max_steps
+  - anneal_temperature
+  - anneal_repulsion
+  - lj_repulsion
+  - ellipsoid_scale
+  - energy_min_temperature
+  - energy_max_temperature
+  - energy_static_temperature
+  - temp_annealing_max_steps
+  - repulsion_annealing_max_steps
+  notes: null
+- index: 11
+  tag: 11_tb_mle
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
   - fwd_loss_coeffs
   - bwd_loss_coeffs
   - beta
