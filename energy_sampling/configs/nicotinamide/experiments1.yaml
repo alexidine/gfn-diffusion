@@ -323,3 +323,38 @@ experiments:
       temp_annealing_max_steps: 10000
       repulsion_annealing_max_steps: 10000
     notes:
+
+
+  - tag: 9_noisy_deep
+    update:
+      joint_layers: 8
+      hidden_dim: 256
+      s_emb_dim: 256
+      dropout: 0.5
+      fwd_loss_coeffs:
+        tb: 1.0
+        vg_lb: 0.0
+        vg_lme: 0.0  # exclusive with vg_lb
+        greedy: 0
+        mle: 0.0
+        smoothed: 0
+      bwd_loss_coeffs:
+        tb: 0.0
+        vg_lb: 0.0
+        vg_lme: 1.0 # exclusive with vg_lb
+        mle: 0.0
+        smoothed: 0
+      beta: 1.0
+      exploration_factor: 1.0
+      wd_max_steps: 5000
+      anneal_temperature: true
+      anneal_repulsion: true
+      lj_repulsion: 0.85
+      ellipsoid_scale: -0.5
+      energy_min_temperature: 0.1
+      energy_max_temperature: 10
+      energy_static_temperature: 1
+      temp_annealing_max_steps: 10000
+      repulsion_annealing_max_steps: 10000
+      exploration_factor: 2.0
+    notes:

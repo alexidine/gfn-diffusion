@@ -202,3 +202,25 @@
   - temp_annealing_max_steps
   - repulsion_annealing_max_steps
   notes: null
+- index: 9
+  tag: 9_noisy_deep
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - dropout
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - beta
+  - exploration_factor
+  - wd_max_steps
+  - anneal_temperature
+  - anneal_repulsion
+  - lj_repulsion
+  - ellipsoid_scale
+  - energy_min_temperature
+  - energy_max_temperature
+  - energy_static_temperature
+  - temp_annealing_max_steps
+  - repulsion_annealing_max_steps
+  notes: null

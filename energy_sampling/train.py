@@ -83,7 +83,7 @@ def train_step(energy_function,
                                                                                       reweight_T=args.reweight_T
                                                                                       )
         if add_to_buffer:
-            buffer.add(crystal_batch.cpu().detach().to_data_list())
+            buffer.add(crystal_batch.detach().cpu().to_data_list())
 
     elif do_backward:
         optimizers['bwd'].zero_grad()

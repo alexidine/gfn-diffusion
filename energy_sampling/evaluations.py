@@ -7,6 +7,7 @@ import torch
 import wandb
 from mxtaltools.reporting.online import simple_embedding_fig, simple_cell_hist, simple_cell_scatter_fig, \
     log_crystal_samples, simple_latent_hist
+from mxtaltools.dataset_utils.utils import collate_data_list
 from plotly import graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.spatial import Voronoi
@@ -117,7 +118,9 @@ def eval_step(energy_function,
 
     "Crystal samples"
     try:
-        log_crystals(sample_batch)
+        batch_to_log = collate_data_list(sample_batch.detach().cpu().to_data_list()[:6])
+        batch_to_log.box_analysis()
+        log_crystals(batch_to_log)
     except:  # sometimes it fails IDK
         pass
 
