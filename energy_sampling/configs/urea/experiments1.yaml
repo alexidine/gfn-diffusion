@@ -1,0 +1,47 @@
+defaults:
+  base: base.yaml
+
+
+# scan over model sizes
+
+experiments:
+  - tag: 0_baseline
+    update:
+      joint_layers: 4
+      hidden_dim: 64
+      s_emb_dim: 64
+      dropout: 0
+      norm: null
+
+  - tag: 0_baseline
+    update:
+      joint_layers: 4
+      hidden_dim: 128
+      s_emb_dim: 128
+      dropout: 0
+      norm: null
+
+  - tag: 0_baseline
+    update:
+      joint_layers: 4
+      hidden_dim: 256
+      s_emb_dim: 256
+      dropout: 0
+      norm: null
+
+  - tag: 0_baseline
+    update:
+      joint_layers: 4
+      hidden_dim: 512
+      s_emb_dim: 512
+      dropout: 0
+      norm: null
+
+  - tag: 0_baseline
+    update:
+      joint_layers: 4
+      hidden_dim: 1024
+      s_emb_dim: 1024
+      dropout: 0
+      norm: null
+

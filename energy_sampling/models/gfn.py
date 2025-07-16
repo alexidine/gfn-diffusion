@@ -90,7 +90,7 @@ class GFN(nn.Module):
             if self.log_var_range == -1:
                 logvar = logvar_i
             else:
-                logvar = torch.tanh(logvar_i) * self.log_var_range
+                logvar = torch.tanh(logvar_i/self.log_var_range) * self.log_var_range
         return mean, (logvar + np.log(self.pf_std_per_traj) * 2.0).clip(min=-8, max=8)
     #
 
@@ -228,9 +228,9 @@ class GFN(nn.Module):
             t_emb = self.t_model(ts[:, i + 1])
             pbs = self.backward_policy(self.s_model(next_state, condition_embedding), t_emb)
             dmean, dvar = gaussian_params(pbs)
-            back_mean_correction = 1 + dmean.tanh() * self.pb_scale_range
+            back_mean_correction = 1 + torch.tanh(dmean) * self.pb_scale_range
             if self.learned_variance:
-                back_var_correction = (1 + dvar.tanh() * self.pb_scale_range)
+                back_var_correction = (1 + torch.tanh(dvar) * self.pb_scale_range)
             else:
                 back_var_correction = torch.ones_like(next_state)
         else:

@@ -1,0 +1,45 @@
+- index: 0
+  tag: 0_baseline
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - dropout
+  - norm
+  notes: ''
+- index: 1
+  tag: 0_baseline
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - dropout
+  - norm
+  notes: ''
+- index: 2
+  tag: 0_baseline
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - dropout
+  - norm
+  notes: ''
+- index: 3
+  tag: 0_baseline
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - dropout
+  - norm
+  notes: ''
+- index: 4
+  tag: 0_baseline
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - dropout
+  - norm
+  notes: ''
