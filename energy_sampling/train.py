@@ -532,7 +532,7 @@ def add_dataset_to_buffer(dataset_path, buffer):
     print("Loading prebuilt buffer")
     dataset = torch.load(dataset_path)
     if args.energy_function in ['ellipsoid_overlap',
-                                'silu_energy'
+                                'silu_energy',
                                 'combo']:  # reparameterize incoming samples
         print("Adding ellipsoid information to buffer")
 
@@ -578,7 +578,6 @@ def add_dataset_to_buffer(dataset_path, buffer):
                 elem.ellipsoid_overlap = torch.ones(1) * overlaps[ind]
                 elem.silu_pot = torch.ones(1) * silus[ind]
                 elem.lj_pot = torch.ones(1) * ljs[ind]
-
 
     buffer.add(dataset)
     print(f"Buffer loaded with {len(dataset)} samples")
