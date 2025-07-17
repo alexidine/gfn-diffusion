@@ -92,7 +92,7 @@ rank_weight: 1.0
 repeats: 10
 repulsion_annealing_max_steps: 5000
 reweight_T: null
-run_name: 0_baseline
+run_name: 2_baseline
 s_emb_dim: 256
 samples_per_opt: 10
 sampling: buffer

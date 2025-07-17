@@ -74,7 +74,7 @@ gfn_clip: 10.0  # clip the maximumstep size induced by the policy model
 
 # local search settings
 ################################################################
-buffer_path: null #'D:/crystal_datasets/urea_gfn_dataset.pt'
+buffer_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
 molecules_path: 'D:/crystal_datasets/test_qm9_dataset.pt'
 
 #buffer_path: '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt'
@@ -99,7 +99,7 @@ wd_max_steps: 2000  # number of steps to terminate the added variance
 # molecular crystal settings
 ################################################################
 # scales the energy function
-molecule: nicotinamide  # 'nicotinamide' or 'urea'
+molecule: urea  # 'nicotinamide' or 'urea'
 energy_function: combo
   # 'latent_harmonic' : unimadal harmonic potential in the latent space
   # 'crystal_harmonic': unimodal harmonic potential in the crystal space

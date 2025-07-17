@@ -8,7 +8,7 @@
   - norm
   notes: ''
 - index: 1
-  tag: 0_baseline
+  tag: 1_baseline
   update_keys:
   - joint_layers
   - hidden_dim
@@ -17,7 +17,7 @@
   - norm
   notes: ''
 - index: 2
-  tag: 0_baseline
+  tag: 2_baseline
   update_keys:
   - joint_layers
   - hidden_dim
@@ -26,7 +26,7 @@
   - norm
   notes: ''
 - index: 3
-  tag: 0_baseline
+  tag: 3_baseline
   update_keys:
   - joint_layers
   - hidden_dim
@@ -35,7 +35,7 @@
   - norm
   notes: ''
 - index: 4
-  tag: 0_baseline
+  tag: 4_baseline
   update_keys:
   - joint_layers
   - hidden_dim

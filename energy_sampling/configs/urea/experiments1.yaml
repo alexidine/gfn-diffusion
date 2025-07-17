@@ -13,7 +13,7 @@ experiments:
       dropout: 0
       norm: null
 
-  - tag: 0_baseline
+  - tag: 1_baseline
     update:
       joint_layers: 4
       hidden_dim: 128
@@ -21,7 +21,7 @@ experiments:
       dropout: 0
       norm: null
 
-  - tag: 0_baseline
+  - tag: 2_baseline
     update:
       joint_layers: 4
       hidden_dim: 256
@@ -29,7 +29,7 @@ experiments:
       dropout: 0
       norm: null
 
-  - tag: 0_baseline
+  - tag: 3_baseline
     update:
       joint_layers: 4
       hidden_dim: 512
@@ -37,7 +37,7 @@ experiments:
       dropout: 0
       norm: null
 
-  - tag: 0_baseline
+  - tag: 4_baseline
     update:
       joint_layers: 4
       hidden_dim: 1024
