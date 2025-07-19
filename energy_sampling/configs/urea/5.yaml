@@ -5,7 +5,7 @@ anneal_temperature: false
 batch_size: 25
 beta: 1.0
 both_ways: true
-buffer_path: D:/crystal_datasets/urea_gfn_dataset.pt
+buffer_path: /scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt
 buffer_size: 50000
 burn_in: 100
 bwd: false
@@ -87,7 +87,7 @@ max_traj_length: 15
 min_lr: 1.0e-06
 min_traj_length: 10
 molecule: urea
-molecules_path: D:/crystal_datasets/test_qm9_dataset.pt
+molecules_path: /scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt
 norm: null
 partial_energy: false
 pb_scale_range: 0.2
