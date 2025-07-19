@@ -4,7 +4,7 @@ import torch
 import numpy as np
 from mxtaltools.dataset_utils.utils import collate_data_list
 
-from energy_sampling.utils import compute_sample_overlap
+from utils import compute_sample_overlap
 
 
 class CrystalReplayBuffer:
