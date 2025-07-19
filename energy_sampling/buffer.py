@@ -97,7 +97,7 @@ class CrystalReplayBuffer:
                                 size=batch_size,
                                 replace=replace,
                                 p=self.get_sampler_weights(diversity_coeff=diversity_coeff,
-))
+        ))
         return inds
 
     def get_sampler_weights(self,

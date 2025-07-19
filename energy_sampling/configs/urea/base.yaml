@@ -27,7 +27,7 @@ norm: null                   # null, "layer", "batch"
 
 batch_size: 25               # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 500           # maximum batch size to allow
+max_batch_size: 250           # maximum batch size to allow
 eval_batch_size: 1000        # batch size for evaluation
 epochs: 100000             # number of training epochs: relatively large
 eval_period: 500              # how often to do evaluation & reporting
@@ -117,7 +117,7 @@ anneal_temperature: false  # scale temperature over time, when conditional it sc
 temp_annealing_max_steps: 5000  # time for scaling_factor to reach 1 (uniform sampling from min to max)
 anneal_repulsion: False
 repulsion_annealing_max_steps: 5000
-energy_density_coeff: 2.0  # how much to weight the density penalty term in the energy function
+energy_density_coeff: 10.0  # how much to weight the density penalty term in the energy function
 energy_lj_coeff: 1.0  # loss coefficient
 energy_core_coeff: 10.0  # loss coefficient
 lj_turnover_pot: 10.0  # value above which molecular LJ potential is softcly clipped

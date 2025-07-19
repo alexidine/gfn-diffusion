@@ -505,7 +505,7 @@ def get_gfn_forward_loss(loss_coeffs,
                                            mol_batch,
                                            return_exp,
                                            states,
-                                           no_grad=not keep_grads
+                                           no_grad=loss_coeffs.greedy == 0
                                            )
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
@@ -554,19 +554,23 @@ def get_gfn_forward_loss(loss_coeffs,
         greedy_loss = soft_saturate(-log_r)
         losses.append(greedy_loss * loss_coeffs.greedy)
 
-    if loss_coeffs.var > 0:
+    if loss_coeffs.var > 0:  # exclude c-dimension as density is genuinely uni-modal
+        states_to_compare = torch.cat([states[:, -1, 0:2], states[:, -1, 3:]], dim=-1).clip(min=-6, max=6)
         var_loss = compute_sample_overlap(
-            states[:, -1].clip(min=-6, max=6),  # don't let it escape - it could cheat
-            states[:, -1].clip(min=-6, max=6),  # don't let it escape - it could cheat
+            states_to_compare,  # don't let it escape - it could cheat
+            states_to_compare,  # don't let it escape - it could cheat
             ga=loss_coeffs.var_gamma,
             agg='mean',
         )
         losses.append(var_loss * loss_coeffs.var)
 
-    if loss_coeffs.buffer > 0:
+    if loss_coeffs.buffer > 0: # exclude c-dimension as density is genuinely uni-modal
+        states_to_compare = torch.cat([states[:, -1, 0:2], states[:, -1, 3:]], dim=-1).clip(min=-6, max=6)
+        buffer_states = torch.stack(buffer.x_list).to(gfn.device).clip(min=-6, max=6)
+        buffer_to_compare = torch.cat([buffer_states[:, -1, 0:2], buffer_states[:, -1, 3:]], dim=-1).clip(min=-6, max=6)
         buffer_loss = compute_sample_overlap(
-            torch.stack(buffer.x_list).to(gfn.device).clip(min=-6, max=6),
-            states[:, -1].clip(min=-6, max=6),  # don't let it escape - it could cheat
+            buffer_to_compare,
+            states_to_compare,  # don't let it escape - it could cheat
             ga=loss_coeffs.buffer_gamma,
         )
         losses.append(buffer_loss * loss_coeffs.buffer)

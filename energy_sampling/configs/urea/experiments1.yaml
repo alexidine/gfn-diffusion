@@ -25,7 +25,7 @@ experiments:
         mle: 1.0
         smoothed: 0
 
-  - tag: 1_var_12
+  - tag: 1_var_10
     update:
       fwd_loss_coeffs:
         tb: 1.0
@@ -45,7 +45,7 @@ experiments:
         mle: 1.0
         smoothed: 0
 
-  - tag: 2_baseline
+  - tag: 2_12_joint
     update:
       joint_layers: 12
       fwd_loss_coeffs:
@@ -66,7 +66,7 @@ experiments:
         mle: 1.0
         smoothed: 0
 
-  - tag: 3_baseline
+  - tag: 3_16_joint
     update:
       joint_layers: 16
       fwd_loss_coeffs:
@@ -87,7 +87,7 @@ experiments:
         mle: 1.0
         smoothed: 0
 
-  - tag: 4_baseline
+  - tag: 4_layernorm
     update:
       norm: 'layer'
       fwd_loss_coeffs:
@@ -108,7 +108,7 @@ experiments:
         mle: 1.0
         smoothed: 0
 
-  - tag: 5_baseline
+  - tag: 5_dropout
     update:
       dropout: 0.5
       fwd_loss_coeffs:

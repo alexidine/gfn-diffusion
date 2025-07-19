@@ -73,12 +73,17 @@ def train_step(energy_function,
     else:  # forward ONLY
         do_forward = True
 
+    if len(buffer) == 0:
+        do_forward = True
+        do_backward = False
+
     discretizer = get_discretizer(args.discretizer)
 
     optimizers['flow'].zero_grad()
     if do_forward:
         optimizers['fwd'].zero_grad()
-        mol_batch = next(iter(mol_loader)).to(device)
+        mol_batch = next(iter(mol_loader))
+        mol_batch = mol_batch.to(device, non_blocking=True)
         loss, states, log_pfs, log_pbs, log_r, log_fs, crystal_batch = fwd_train_step(energy_function,
                                                                                       gfn_model,
                                                                                       discretizer,
@@ -93,6 +98,7 @@ def train_step(energy_function,
         forward_iter = int(it * p_forward)
         if add_to_buffer and forward_iter % args.add_to_buffer_each:
             buffer.add(crystal_batch.detach().cpu().to_data_list())
+        del crystal_batch
 
     elif do_backward:
         optimizers['bwd'].zero_grad()
@@ -107,6 +113,7 @@ def train_step(energy_function,
         assert False
 
     loss.backward()
+    clean_loss = loss.item()
     torch.nn.utils.clip_grad_norm_(gfn_model.parameters(),
                                    args.gradient_norm_clip)  # gradient clipping
     if do_forward:
@@ -115,8 +122,9 @@ def train_step(energy_function,
     elif do_backward:
         optimizers['bwd'].step()
         optimizers['flow'].step()
+    del loss, states, log_pfs, log_pbs, log_r, log_fs  # or whatever is large
 
-    return loss.item(), "Forward" if do_forward else "Backward"
+    return clean_loss, "Forward" if do_forward else "Backward"
 
 
 def get_discretizer(discretization_type):
@@ -231,19 +239,21 @@ def train():
     buffer, mol_loader = init_buffers_datasets(energy_function)
 
     times['initialization_end'] = time()
-    #loss_record, energy_record, learned_Z_record = [], [], []
     oomed_out = False
-    prev_rewards_dist = None
     lr_warmup_finished = False
-    # maxes out at 1, triggering every 10 steps
-    # go from initial to final scaling value in temp_annealing_max_steps
-    if args.temperature_conditioning:
-        temp_annealing_lambda = (1 / args.temperature_scaling_factor) ** (1 / (args.temp_annealing_max_steps / 10))
-    else:
-        temp_annealing_lambda = (args.energy_min_temperature / args.energy_static_temperature) ** (
-                1 / (args.temp_annealing_max_steps / 10))
 
-    repulsion_annealing_lambda = (1 / args.lj_repulsion) ** (1 / (args.repulsion_annealing_max_steps / 10))
+    # initialize some annealing factors
+    if args.temperature_conditioning:
+        temp_annealing_lambda = get_annealing_factor(args.temperature_scaling_factor, 1,
+                                                     args.temp_annealing_max_steps, 10)
+
+    else:
+        temp_annealing_lambda = get_annealing_factor(args.energy_max_temperature, args.energy_min_temperature,
+                                                     args.temp_annealing_max_steps, 10)
+
+    repulsion_annealing_lambda = get_annealing_factor(args.lj_repulsion, 1, args.repulsion_annealing_max_steps, 10)
+    var_annealing_factor = get_annealing_factor(1, 0, args.fwd_loss_coeffs.var_end_steps - args.fwd_loss_coeffs.var_start_steps, 10)
+    buffer_annealing_factor = get_annealing_factor(1, 0, args.fwd_loss_coeffs.buffer_end_steps - args.fwd_loss_coeffs.buffer_start_steps, 10)
 
     fwd_loss, bwd_loss = 0, 0
     gfn_model.train()
@@ -288,6 +298,7 @@ def train():
         elif step_ind % 10 == 0 and step_ind > 9:
             lr_warmup_finished, lr = step_lr_schedule(schedulers, optimizers, lr_warmup_finished)
             anneal_reward(temp_annealing_lambda, repulsion_annealing_lambda, energy_function, args)
+            #anneal_loss(step_ind, var_annealing_factor, buffer_annealing_factor)
             metrics.update({'lr_fwd': optimizers['fwd'].param_groups[0]['lr']})
             metrics.update({'lr_bwd': optimizers['bwd'].param_groups[0]['lr']})
             metrics.update({'lr_flow': optimizers['flow'].param_groups[0]['lr']})
@@ -316,6 +327,16 @@ def anneal_reward(temp_annealing_lambda, repulsion_annealing_lambda, energy_func
     if args.anneal_repulsion:
         if energy_function.lj_repulsion < 1:
             energy_function.lj_repulsion *= repulsion_annealing_lambda
+
+
+def anneal_loss(it, var_annealing_factor, buffer_annealing_factor):
+    """anneal reward function"""
+    if it > args.var_end_steps:
+        args.fwd_loss_coeffs.var = 0
+    elif it < args.var_start_steps:
+        args.fwd_loss_coeffs.var = 0
+    elif it > args.var_start_steps:
+        args.fwd_loss_coeffs.var *= var_annealing_factor
 
 
 def step_lr_schedule(schedulers, optimizers,
@@ -372,9 +393,8 @@ def init_schedulers_optimizers(gfn_model):
 
     schedulers = {}
     if args.scheduler:
-        lr_warmup_lambda = args.lr_warmup_ratio ** (
-                1 / (args.lr_warmup_time / 10))  # grow over factor of lr_warmup_ratio, each 10 steps
-        lr_annealing_lambda = (args.min_lr / args.lr_policy) ** (1 / (args.lr_anneal_time / 10))
+        lr_warmup_lambda = get_annealing_factor(1, args.lr_warmup_ratio, args.lr_warmup_time, 10)
+        lr_annealing_lambda = get_annealing_factor(args.lr_policy, args.min_lr, args.lr_anneal_time, 10)
         schedulers['fwd_1'] = lr_scheduler.MultiplicativeLR(optimizers['fwd'], lr_lambda=lambda epoch: lr_warmup_lambda)
         schedulers['fwd_2'] = lr_scheduler.MultiplicativeLR(optimizers['fwd'],
                                                             lr_lambda=lambda epoch: lr_annealing_lambda)
@@ -382,7 +402,7 @@ def init_schedulers_optimizers(gfn_model):
         schedulers['bwd_2'] = lr_scheduler.MultiplicativeLR(optimizers['bwd'],
                                                             lr_lambda=lambda epoch: lr_annealing_lambda)
 
-        flow_annealing_lambda = ((init_flow_lr / 10) / init_flow_lr) ** (1 / (args.lr_anneal_time / 10))
+        flow_annealing_lambda = get_annealing_factor(0.1, 1, args.lr_anneal_time, 10)
         schedulers['flow'] = lr_scheduler.MultiplicativeLR(optimizers['flow'],
                                                            lr_lambda=lambda epoch: flow_annealing_lambda)
 
@@ -469,8 +489,15 @@ def grow_batch_size(buffer, mol_loader):
 
 
 def handle_train_epoch_error(e, oomed_out, buffer, mol_loader):
-    if "CUDA out of memory" in str(
-            e) or "nonzero is not supported for tensors with more than INT_MAX elements" in str(e):
+    print(f"Caught error: {str(e)}")
+    if ("cuda out of memory" in str(e).lower()
+            or "nonzero is not supported for tensors with more than int_max elements" in str(e).lower()):
+        print("OOMED!")
+        """User note
+        When this program OOms out, things get pretty crazy
+        this method of trying to save it almost never works 
+        I'm sorry
+        """
         args.batch_size = handle_oom(args.batch_size)
 
         mol_loader = DataLoader(
@@ -532,13 +559,16 @@ def log_elapsed_times():
 
 
 def handle_oom(batch_size):
-    traceback.print_exc()
+    #traceback.print_exc()
     # Clear traceback circular references
-    sys.exc_info()
+    #sys.exc_info()
     # manual GC + cache clear
     gc.collect()
     torch.cuda.empty_cache()
-    batch_size = int(batch_size * 0.9)
+    batch_size = int(batch_size * 0.5)
+    if batch_size < 1:
+        assert False, "Cascading OOM Failure"
+
     return batch_size
 
 
@@ -597,6 +627,10 @@ def add_dataset_to_buffer(dataset_path, buffer):
     print(f"Buffer loaded with {len(dataset)} samples")
 
     return buffer
+
+
+def get_annealing_factor(start_value, stop_value, total_time, step_iters):
+    return (stop_value / start_value) ** (1 / (total_time / step_iters))
 
 
 if __name__ == '__main__':

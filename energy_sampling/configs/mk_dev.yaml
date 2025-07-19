@@ -57,8 +57,12 @@ fwd_loss_coeffs:
   smoothed: 0
   var: 10.0  # penalize forward policy for crowded samples
   var_gamma: 0.1  # smaller -> longer range repulsion
+  var_start_steps: 500
+  var_end_steps: 1000
   buffer: 0.0  # penalize forward policy for sampling near samples already in the buffer
   buffer_gamma: 1.0  # smaller -> longer range repulsion
+  buffer_start_steps: 500
+  buffer_end_steps: 1000
 bwd_loss_coeffs:
   tb: 1.0
   vg_lb: 0.0
@@ -77,7 +81,7 @@ gfn_clip: 10.0  # clip the maximumstep size induced by the policy model
 
 # local search settings
 ################################################################
-buffer_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
+buffer_path: null #'D:/crystal_datasets/urea_gfn_dataset.pt'
 molecules_path: 'D:/crystal_datasets/test_qm9_dataset.pt'
 
 #buffer_path: '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt'
