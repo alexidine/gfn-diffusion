@@ -10,3 +10,31 @@
   - fwd_loss_coeffs
   - bwd_loss_coeffs
   notes: ''
+- index: 2
+  tag: 2_baseline
+  update_keys:
+  - joint_layers
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 3
+  tag: 3_baseline
+  update_keys:
+  - joint_layers
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 4
+  tag: 4_baseline
+  update_keys:
+  - norm
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 5
+  tag: 5_baseline
+  update_keys:
+  - dropout
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''

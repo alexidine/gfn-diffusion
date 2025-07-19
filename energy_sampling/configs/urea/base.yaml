@@ -27,11 +27,11 @@ norm: null                   # null, "layer", "batch"
 
 batch_size: 25               # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 100           # maximum batch size to allow
-eval_batch_size: 500        # batch size for evaluation
+max_batch_size: 500           # maximum batch size to allow
+eval_batch_size: 1000        # batch size for evaluation
 epochs: 100000             # number of training epochs: relatively large
-eval_period: 100              # how often to do evaluation & reporting
-figs_period: 500             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
+eval_period: 500              # how often to do evaluation & reporting
+figs_period: 1000             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # GFlowNet settings
 

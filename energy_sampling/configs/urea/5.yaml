@@ -23,7 +23,7 @@ convergence_history: 100
 device: cuda
 discretizer: random
 discretizer_max_ratio: 10
-dropout: 0
+dropout: 0.5
 ellipsoid_scale: 0.0
 energy: molecular_crystal
 energy_annealing_threshold: 0.1
@@ -97,7 +97,7 @@ rank_weight: 1.0
 repeats: 10
 repulsion_annealing_max_steps: 5000
 reweight_T: null
-run_name: 0_baseline
+run_name: 5_baseline
 s_emb_dim: 1024
 samples_per_opt: 10
 sampling: buffer

@@ -88,7 +88,7 @@ min_lr: 1.0e-06
 min_traj_length: 10
 molecule: urea
 molecules_path: D:/crystal_datasets/test_qm9_dataset.pt
-norm: null
+norm: layer
 partial_energy: false
 pb_scale_range: 0.2
 pis_architectures: false
@@ -97,7 +97,7 @@ rank_weight: 1.0
 repeats: 10
 repulsion_annealing_max_steps: 5000
 reweight_T: null
-run_name: 0_baseline
+run_name: 4_baseline
 s_emb_dim: 1024
 samples_per_opt: 10
 sampling: buffer

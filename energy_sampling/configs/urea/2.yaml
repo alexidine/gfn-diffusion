@@ -61,7 +61,7 @@ gradient_norm_clip: 0.1
 grow_batch_size: true
 harmonics_dim: 64
 hidden_dim: 1024
-joint_layers: 8
+joint_layers: 12
 langevin: false
 langevin_scaling_per_dimension: false
 ld_schedule: true
@@ -97,7 +97,7 @@ rank_weight: 1.0
 repeats: 10
 repulsion_annealing_max_steps: 5000
 reweight_T: null
-run_name: 0_baseline
+run_name: 2_baseline
 s_emb_dim: 1024
 samples_per_opt: 10
 sampling: buffer
