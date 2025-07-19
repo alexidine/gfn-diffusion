@@ -82,10 +82,10 @@ class MolecularCrystal(BaseSet):
             # simplified ellipsoid energy testing
             _, _, _, _, _, _, normed_ellipsoid_overlap \
                 = cluster_batch.compute_ellipsoidal_overlap(
-                semi_axis_scale=self.ellipsoid_scale,
+                surface_padding=self.ellipsoid_scale,
                 model=self.ellipsoid_model,
                 return_details=True)
-            ellipsoid_overlap = normed_ellipsoid_overlap.flatten().detach() # never packprop through this, it's unstable
+            ellipsoid_overlap = normed_ellipsoid_overlap.flatten().detach()  # never packprop through this, it's unstable
         else:
             ellipsoid_overlap = torch.zeros_like(silu_energy)
 
@@ -169,7 +169,7 @@ class MolecularCrystal(BaseSet):
 
         elif self.energy_function == 'ellipsoid_overlap':
             density_energy = self.density_penalty(cluster_batch.packing_coeff)
-            core_energy = cluster_batch.ellipsoid_overlap ** 2
+            core_energy = self.core_energy_penalty(cluster_batch.ellipsoid_overlap)
             crystal_energy = self.core_coeff * core_energy + self.density_coeff * density_energy
 
         elif self.energy_function == 'silu_energy':
@@ -180,13 +180,17 @@ class MolecularCrystal(BaseSet):
         elif self.energy_function == 'combo':
             density_energy = self.density_penalty(cluster_batch.packing_coeff)
             lj_energy = self.soften_LJ_energy(cluster_batch.silu_pot) / cluster_batch.num_atoms
-            core_energy = cluster_batch.ellipsoid_overlap ** 2
+            core_energy = self.core_energy_penalty(cluster_batch.ellipsoid_overlap)
             crystal_energy = self.lj_coeff * lj_energy + self.core_coeff * core_energy + self.density_coeff * density_energy
 
         else:
             assert False, f'{self.energy_function} not implemented'
 
-        return crystal_energy.clip(min=-self.energy_clip, max=self.energy_clip)
+        return self.soft_clip(crystal_energy,
+                              self.energy_clip)  # softly bound from above  #crystal_energy.clip(min=-self.energy_clip, max=self.energy_clip)
+
+    def core_energy_penalty(self, ellipsoid_overlap):
+        return ellipsoid_overlap ** 2 + ellipsoid_overlap
 
     def density_penalty(self, packing_coeff):
         """
@@ -220,7 +224,9 @@ class MolecularCrystal(BaseSet):
 
         return (-energy / sample_temperature).detach()
 
-    def energy(self, x, mol_batch,
+    def energy(self,
+               x,
+               mol_batch,
                log_temperature: torch.tensor,
                return_exp: bool = False):
         """
@@ -241,15 +247,24 @@ class MolecularCrystal(BaseSet):
         else:
             return energy / sample_temperature
 
-    def soften_LJ_energy(self, lj_energy):
+    def soften_LJ_energy(self, lj_energy, clip: Optional[float] = None):
         # soften the repulsion
         softened_energy = lj_energy.clone()
         high_bools = softened_energy > self.lj_turnover_pot
-        softened_energy[high_bools] = self.lj_turnover_pot + torch.log(
-            softened_energy[high_bools] + 1 - self.lj_turnover_pot)
-        softened_energy = softened_energy.clip(max=50)
+        # softened_energy[high_bools] = self.lj_turnover_pot + torch.log(softened_energy[high_bools] + 1 - self.lj_turnover_pot)
+        delta = softened_energy[high_bools] - self.lj_turnover_pot + 1
+        softened_energy[high_bools] = self.lj_turnover_pot + delta ** 0.9
+        if clip is not None:
+            softened_energy = softened_energy.clip(max=clip)
 
         return softened_energy
+
+    def soft_clip(self, y, clip_value):
+        new_y = y.clone()
+        #delta = new_y[y>clip_value] - clip_value + 1
+        new_y[y > clip_value] = clip_value + torch.log(y[y > clip_value] + 1 - clip_value)
+        #new_y[y>clip_value] = clip_value + delta ** (0.5)
+        return new_y
 
     def init_blank_crystal_batch(self, mol_batch):  # todo no possible way this is the most efficient way to do this
 

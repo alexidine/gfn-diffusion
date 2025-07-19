@@ -7,41 +7,40 @@ defaults:
 experiments:
   - tag: 0_baseline
     update:
-      joint_layers: 4
-      hidden_dim: 64
-      s_emb_dim: 64
-      dropout: 0
-      norm: null
+      fwd_loss_coeffs:
+        tb: 1.0
+        vg_lb: 0.0
+        vg_lme: 0.0  # exclusive with vg_lb
+        greedy: 0
+        mle: 1.0
+        smoothed: 0
+        var: 1.0  # penalize forward policy for crowded samples
+        var_gamma: 0.1  # smaller -> longer range repulsion
+        buffer: 0.0  # penalize forward policy for sampling near samples already in the buffer
+        buffer_gamma: 1.0  # smaller -> longer range repulsion
+      bwd_loss_coeffs:
+        tb: 0.0
+        vg_lb: 0.0
+        vg_lme: 1.0 # exclusive with vg_lb
+        mle: 1.0
+        smoothed: 0
 
-  - tag: 1_baseline
+  - tag: 1_var_12
     update:
-      joint_layers: 4
-      hidden_dim: 128
-      s_emb_dim: 128
-      dropout: 0
-      norm: null
-
-  - tag: 2_baseline
-    update:
-      joint_layers: 4
-      hidden_dim: 256
-      s_emb_dim: 256
-      dropout: 0
-      norm: null
-
-  - tag: 3_baseline
-    update:
-      joint_layers: 4
-      hidden_dim: 512
-      s_emb_dim: 512
-      dropout: 0
-      norm: null
-
-  - tag: 4_baseline
-    update:
-      joint_layers: 4
-      hidden_dim: 1024
-      s_emb_dim: 1024
-      dropout: 0
-      norm: null
-
+      fwd_loss_coeffs:
+        tb: 1.0
+        vg_lb: 0.0
+        vg_lme: 0.0  # exclusive with vg_lb
+        greedy: 0
+        mle: 1.0
+        smoothed: 0
+        var: 10.0  # penalize forward policy for crowded samples
+        var_gamma: 0.1  # smaller -> longer range repulsion
+        buffer: 0.0  # penalize forward policy for sampling near samples already in the buffer
+        buffer_gamma: 1.0  # smaller -> longer range repulsion
+      bwd_loss_coeffs:
+        tb: 0.0
+        vg_lb: 0.0
+        vg_lme: 1.0 # exclusive with vg_lb
+        mle: 1.0
+        smoothed: 0

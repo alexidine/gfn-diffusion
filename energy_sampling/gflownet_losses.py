@@ -6,6 +6,8 @@ import torch.nn.functional as F
 import torch
 from mxtaltools.dataset_utils.utils import collate_data_list
 
+from utils import compute_sample_overlap
+
 
 def get_loss_reward(condition, log_reward_fn, mol_batch, return_exp, states, no_grad: bool = True):
     if condition is not None:
@@ -411,7 +413,7 @@ def bwd_mle_batch(terminal_state, gfn, discretizer, log_r, condition=None, retur
         return loss
 
 
-def soft_saturate(x, scale: Optional[float] = 1.0):
+def soft_saturate(x, scale: Optional[float] = 10.0):
     return torch.log(torch.abs(x / scale) + 1) * torch.sign(x)
 
 
@@ -476,6 +478,7 @@ def get_gfn_forward_loss(loss_coeffs,
                          log_reward_fn,
                          discretizer,
                          mol_batch,
+                         buffer,
                          exploration_std=None, return_exp=False, condition=None,
                          repeats=10, reweight_T: Optional[float] = None):
     if gfn.conditional_flow_model:
@@ -483,7 +486,7 @@ def get_gfn_forward_loss(loss_coeffs,
         initial_state = initial_state.repeat(repeats, 1)
         mol_batch = collate_data_list(mol_batch.to_data_list() * repeats)
 
-    if loss_coeffs.greedy > 0:
+    if loss_coeffs.greedy > 0 or loss_coeffs.var > 0 or loss_coeffs.buffer > 0:  # 0 or loss_coeffs.drift > 0:
         keep_grads = True
     else:
         keep_grads = False
@@ -550,6 +553,23 @@ def get_gfn_forward_loss(loss_coeffs,
     if loss_coeffs.greedy > 0:
         greedy_loss = soft_saturate(-log_r)
         losses.append(greedy_loss * loss_coeffs.greedy)
+
+    if loss_coeffs.var > 0:
+        var_loss = compute_sample_overlap(
+            states[:, -1].clip(min=-6, max=6),  # don't let it escape - it could cheat
+            states[:, -1].clip(min=-6, max=6),  # don't let it escape - it could cheat
+            ga=loss_coeffs.var_gamma,
+            agg='mean',
+        )
+        losses.append(var_loss * loss_coeffs.var)
+
+    if loss_coeffs.buffer > 0:
+        buffer_loss = compute_sample_overlap(
+            torch.stack(buffer.x_list).to(gfn.device).clip(min=-6, max=6),
+            states[:, -1].clip(min=-6, max=6),  # don't let it escape - it could cheat
+            ga=loss_coeffs.buffer_gamma,
+        )
+        losses.append(buffer_loss * loss_coeffs.buffer)
 
     combined_losses = torch.stack(losses).mean(dim=0)
 

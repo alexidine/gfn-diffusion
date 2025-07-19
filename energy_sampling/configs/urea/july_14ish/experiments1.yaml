@@ -1,0 +1,163 @@
+defaults:
+  base: base.yaml
+
+
+# scan over model sizes
+
+experiments:
+  - tag: 0_baseline
+    update:
+      joint_layers: 4
+      hidden_dim: 64
+      s_emb_dim: 64
+      dropout: 0
+      norm: null
+
+  - tag: 1_baseline
+    update:
+      joint_layers: 4
+      hidden_dim: 128
+      s_emb_dim: 128
+      dropout: 0
+      norm: null
+
+  - tag: 2_baseline
+    update:
+      joint_layers: 4
+      hidden_dim: 256
+      s_emb_dim: 256
+      dropout: 0
+      norm: null
+
+  - tag: 3_baseline
+    update:
+      joint_layers: 4
+      hidden_dim: 512
+      s_emb_dim: 512
+      dropout: 0
+      norm: null
+
+  - tag: 4_baseline
+    update:
+      joint_layers: 4
+      hidden_dim: 1024
+      s_emb_dim: 1024
+      dropout: 0
+      norm: null
+
+  - tag: 5_1024_dropout
+    update:
+      joint_layers: 4
+      hidden_dim: 1024
+      s_emb_dim: 1024
+      dropout: 0.5
+      norm: null
+
+  - tag: 6_1024_norm
+    update:
+      joint_layers: 4
+      hidden_dim: 1024
+      s_emb_dim: 1024
+      dropout: 0
+      norm: layer
+
+  - tag: 7_1024_norm_dropout
+    update:
+      joint_layers: 4
+      hidden_dim: 1024
+      s_emb_dim: 1024
+      dropout: 0.5
+      norm: layer
+
+  - tag: 8_1024_deep
+    update:
+      joint_layers: 8
+      hidden_dim: 1024
+      s_emb_dim: 1024
+      dropout: 0
+      norm: null
+
+  - tag: 9_1024_TB
+    update:
+      fwd_loss_coeffs:
+        tb: 1.0
+        vg_lb: 0.0
+        vg_lme: 0.0  # exclusive with vg_lb
+        greedy: 0
+        mle: 0.0
+        smoothed: 0
+      bwd_loss_coeffs:
+        tb: 1.0
+        vg_lb: 0.0
+        vg_lme: 0.0 # exclusive with vg_lb
+        mle: 0.0
+        smoothed: 0
+      joint_layers: 4
+      hidden_dim: 1024
+      s_emb_dim: 1024
+      dropout: 0
+      norm: null
+
+  - tag: 10_1024_TB_MLE
+    update:
+      fwd_loss_coeffs:
+        tb: 1.0
+        vg_lb: 0.0
+        vg_lme: 0.0  # exclusive with vg_lb
+        greedy: 0
+        mle: 0.0
+        smoothed: 0
+      bwd_loss_coeffs:
+        tb: 0.0
+        vg_lb: 0.0
+        vg_lme: 0.0 # exclusive with vg_lb
+        mle: 1.0
+        smoothed: 0
+      joint_layers: 4
+      hidden_dim: 1024
+      s_emb_dim: 1024
+      dropout: 0
+      norm: null
+
+  - tag: 11_1024_TB_VG_MLE
+    update:
+      fwd_loss_coeffs:
+        tb: 1.0
+        vg_lb: 0.0
+        vg_lme: 0.0  # exclusive with vg_lb
+        greedy: 0
+        mle: 0.0
+        smoothed: 0
+      bwd_loss_coeffs:
+        tb: 0.0
+        vg_lb: 0.0
+        vg_lme: 1.0 # exclusive with vg_lb
+        mle: 1.0
+        smoothed: 0
+      joint_layers: 4
+      hidden_dim: 1024
+      s_emb_dim: 1024
+      dropout: 0
+      norm: null
+
+  - tag: 12_1024_TB_TB_MLE
+    update:
+      fwd_loss_coeffs:
+        tb: 1.0
+        vg_lb: 0.0
+        vg_lme: 0.0  # exclusive with vg_lb
+        greedy: 0
+        mle: 0.0
+        smoothed: 0
+      bwd_loss_coeffs:
+        tb: 1.0
+        vg_lb: 0.0
+        vg_lme: 0.0 # exclusive with vg_lb
+        mle: 1.0
+        smoothed: 0
+      joint_layers: 4
+      hidden_dim: 1024
+      s_emb_dim: 1024
+      dropout: 0
+      norm: null
+

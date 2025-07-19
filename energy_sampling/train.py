@@ -47,29 +47,35 @@ def train_step(energy_function,
                optimizers,
                it,
                exploration_std,
-               buffer, mol_loader, repeats: int = 10):
+               buffer,
+               mol_loader,
+               repeats):
     do_forward = False
     do_backward = False
     add_to_buffer = False
     if args.both_ways:
+        p_forward = args.fwd_to_bwd_ratio / (args.fwd_to_bwd_ratio + 1)
         if args.fwd_to_bwd_ratio == 1:
             do_fwd = it % 2 == 0  # always do fwd first
         else:
-            p_forward = args.fwd_to_bwd_ratio / (args.fwd_to_bwd_ratio + 1)
             do_fwd = np.random.choice([0, 1], 1, p=[p_forward, 1 - p_forward])
+
         if do_fwd:
             if args.sampling == 'buffer':
                 add_to_buffer = True
             do_forward = True
         else:
             do_backward = True
+
     elif args.bwd:  # backward ONLY
         do_backward = True
+
     else:  # forward ONLY
         do_forward = True
 
     discretizer = get_discretizer(args.discretizer)
 
+    optimizers['flow'].zero_grad()
     if do_forward:
         optimizers['fwd'].zero_grad()
         mol_batch = next(iter(mol_loader)).to(device)
@@ -78,11 +84,14 @@ def train_step(energy_function,
                                                                                       discretizer,
                                                                                       exploration_std,
                                                                                       mol_batch,
+                                                                                      buffer,
                                                                                       return_exp=True,
                                                                                       repeats=repeats,
                                                                                       reweight_T=args.reweight_T
                                                                                       )
-        if add_to_buffer:
+
+        forward_iter = int(it * p_forward)
+        if add_to_buffer and forward_iter % args.add_to_buffer_each:
             buffer.add(crystal_batch.detach().cpu().to_data_list())
 
     elif do_backward:
@@ -136,7 +145,7 @@ def get_discretizer(discretization_type):
     return discretizer
 
 
-def fwd_train_step(energy_function, gfn_model, discretizer, exploration_std, mol_batch, return_exp=False,
+def fwd_train_step(energy_function, gfn_model, discretizer, exploration_std, mol_batch, buffer, return_exp=False,
                    repeats: int = 10, reweight_T: Optional[float] = None):
     init_state = get_gfn_init_state(args.batch_size, energy_function.data_ndim, device)
     condition = energy_function.get_conditioning_tensor(mol_batch)
@@ -146,6 +155,7 @@ def fwd_train_step(energy_function, gfn_model, discretizer, exploration_std, mol
                                 energy_function.log_reward,
                                 discretizer,
                                 mol_batch,
+                                buffer,
                                 exploration_std=exploration_std,
                                 return_exp=return_exp,
                                 condition=condition,
@@ -267,6 +277,7 @@ def train():
 
         except (RuntimeError, ValueError) as e:  # if we do hit OOM, slash the batch size
             oomed_out, buffer, mol_loader = handle_train_epoch_error(e, oomed_out, buffer, mol_loader)
+
         times['train_step_end'] = time()
 
         if (step_ind % args.eval_period == 0 and step_ind > 0) or step_ind == 50:
@@ -285,6 +296,7 @@ def train():
             metrics['Backward Loss'] = bwd_loss
             wandb.log(metrics, step=step_ind)
 
+        elif step_ind % 100 == 0:
             torch.cuda.empty_cache()
             gc.collect()
 
@@ -361,7 +373,7 @@ def init_schedulers_optimizers(gfn_model):
     schedulers = {}
     if args.scheduler:
         lr_warmup_lambda = args.lr_warmup_ratio ** (
-                    1 / (args.lr_warmup_time / 10))  # grow over factor of lr_warmup_ratio, each 10 steps
+                1 / (args.lr_warmup_time / 10))  # grow over factor of lr_warmup_ratio, each 10 steps
         lr_annealing_lambda = (args.min_lr / args.lr_policy) ** (1 / (args.lr_anneal_time / 10))
         schedulers['fwd_1'] = lr_scheduler.MultiplicativeLR(optimizers['fwd'], lr_lambda=lambda epoch: lr_warmup_lambda)
         schedulers['fwd_2'] = lr_scheduler.MultiplicativeLR(optimizers['fwd'],
@@ -386,7 +398,9 @@ def init_buffers_datasets(energy_function):
         args.batch_size,
         beta=args.beta,
         rank_weight=args.rank_weight,
-        prioritized=args.prioritized)
+        prioritized=args.prioritized,
+        keep_initial_samples=args.buffer_path is not None,
+        gpu_available=args.device == 'cuda')
     if (args.both_ways or args.bwd) and args.buffer_path is not None:  # preload samples into the buffer
         buffer = add_dataset_to_buffer(args.buffer_path, buffer)
     # load dataset of just molecules
@@ -564,7 +578,7 @@ def add_dataset_to_buffer(dataset_path, buffer):
                 # simplified ellipsoid energy testing
                 _, _, _, _, _, _, normed_ellipsoid_overlap \
                     = cluster_batch.compute_ellipsoidal_overlap(
-                    semi_axis_scale=args.ellipsoid_scale,
+                    surface_padding=args.ellipsoid_scale,
                     return_details=True)
 
                 overlaps.extend(normed_ellipsoid_overlap.cpu().detach().numpy())

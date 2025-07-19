@@ -357,3 +357,10 @@ def shifted_equidistant(bsz, traj_length, eps=1e-4):
 def report_mem(tag=""):
     gc.collect()
     print(f"[{tag}] RSS = {psutil.Process(os.getpid()).memory_info().rss / 1e6:.2f} MB")
+
+
+def compute_sample_overlap(ref_x, sample_x, ga: float = 1.0, agg='sum'):
+    if agg=='sum':
+        return torch.exp(-ga * torch.cdist(ref_x, sample_x) ** 2).sum(dim=0)
+    elif agg == 'mean':
+        return torch.exp(-ga * torch.cdist(ref_x, sample_x) ** 2).mean(dim=0)

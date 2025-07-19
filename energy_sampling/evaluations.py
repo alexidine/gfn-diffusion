@@ -1,4 +1,5 @@
 import os
+from typing import Optional
 
 import hdbscan
 import numpy as np
@@ -10,9 +11,12 @@ from mxtaltools.reporting.online import simple_embedding_fig, simple_cell_hist, 
 from mxtaltools.dataset_utils.utils import collate_data_list
 from plotly import graph_objects as go
 from plotly.subplots import make_subplots
-from scipy.spatial import Voronoi
+from scipy.ndimage import gaussian_filter
+from scipy.spatial import Voronoi, KDTree
 from scipy.spatial.distance import cdist
-from scipy.stats import pearsonr
+from scipy.stats import pearsonr, gaussian_kde
+from skimage.feature import peak_local_max
+from skimage.segmentation import watershed
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.decomposition import PCA
 from umap import UMAP
@@ -168,22 +172,26 @@ def generate_fwd_figs(buffer, energy_function,
 
         fig_dict['Soft Mode Coverage'] = coverage_per_mode.mean()
 
-    sample_embedding, anchor_embedding, cluster_ind, anchor_energies, all_energies = embed_samples(
+    (sample_embedding, anchor_embedding, sample_cluster_inds,
+     anchor_energies, all_energies, buffer_cluster_inds,
+     watershed_idx, watershed_range) = embed_samples(
         buffer_std_params,
         buffer_reward,
         std_cell_params.cpu().detach().numpy(),
         log_r.cpu().detach().numpy(),
-        sample_size=5000
-        )
+        max_ref_samples=500
+    )
 
-    fig_dict['Sample Embedding'] = cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies, all_energies, color_mode='cluster')
-    fig_dict['Sample Embedding w Energy'] = cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies, all_energies, color_mode='energy')
+    fig_dict['Sample Embedding'] = cluster_fig(sample_embedding, anchor_embedding, sample_cluster_inds, anchor_energies,
+                                               all_energies, 'cluster', watershed_idx, watershed_range)
+    fig_dict['Sample Embedding w Energy'] = cluster_fig(sample_embedding, anchor_embedding, sample_cluster_inds,
+                                                        anchor_energies, all_energies, 'energy', watershed_idx, watershed_range)
 
     # coverage metrics
-    fig_dict['Num Clusters'] = np.sum(np.unique(cluster_ind) > 0)
-    fig_dict['Noise Fraction'] = np.mean(cluster_ind == -1)
+    fig_dict['Num Sample Clusters'] = np.sum(np.unique(sample_cluster_inds) >= 0)
+    fig_dict['Num Buffer Clusters'] = np.sum(np.unique(buffer_cluster_inds) >= 0)
 
-    fig = cluster_hist_fig(cluster_ind)
+    fig = cluster_hist_fig(sample_cluster_inds)
     fig_dict['Cluster Hist'] = fig
 
     conditional = len(condition.unique()) != 1
@@ -246,7 +254,7 @@ def agglomerative_cluster(ens, samples, energy_cutoff: float = 0.0, min_dist: fl
     return anchors, anchor_indices
 
 
-def embed_samples(ref_samples, ref_rewards, samples, sample_rewards, sample_size: int, temperature: float = 0.1):
+def embed_samples(ref_samples, ref_rewards, samples, sample_rewards, max_ref_samples: int, temperature: float = 0.1):
     """
     Cluster samples via agglomerative clustering
     Also, embed them in PC space
@@ -258,54 +266,136 @@ def embed_samples(ref_samples, ref_rewards, samples, sample_rewards, sample_size
     """
 
     if ref_samples is not None:
-        if len(ref_samples) > sample_size:
-            weights = np.exp((ref_rewards-ref_rewards.max()) / temperature) + 1e-2
-            weights /= weights.sum()
-            inds_to_keep = np.random.choice(len(ref_samples), sample_size, replace=False, p=weights)
+        if len(ref_samples) > max_ref_samples:
+            ref_rewards, ref_samples = subsample_batch(ref_rewards, ref_samples, max_ref_samples, temperature)
 
-            ref_samples = ref_samples[inds_to_keep]
-            ref_rewards = ref_rewards[inds_to_keep]
         samples_to_fit = np.concatenate([ref_samples, samples])
         energies_to_fit = -np.concatenate([ref_rewards, sample_rewards])
     else:
         samples_to_fit = samples
         energies_to_fit = -sample_rewards
 
-    # prewhiten data via PCA
-    pca = PCA(n_components=12)
-    pca_embedding = pca.fit_transform(samples_to_fit)
-    clusterer = hdbscan.HDBSCAN(min_cluster_size=20,
-                                min_samples=20,
-                                metric='euclidean',
-                                core_dist_n_jobs=-1)
-    cluster_ind = clusterer.fit_predict(pca_embedding)  # -1 means "noise"
-    sample_cluster_ind = cluster_ind[-len(samples):]
+    # embed the mixed reference + sampled distribution
+    umap_model = UMAP(n_components=2, n_neighbors=30, min_dist=0.01)
+    sample_embedding = umap_model.fit_transform(samples_to_fit)
 
-    n_clusters = np.sum(np.unique(cluster_ind) >= 0)
+    # fit energy-weighted 2D gaussian kde on the UMAP data
+    beta = 1.0
+    weights = np.exp(-beta * (energies_to_fit - np.min(energies_to_fit)))  # stabilize exponent
+    kde = gaussian_kde(sample_embedding.T, weights=weights, bw_method='scott')
 
-    if n_clusters > 0:
-        # extract lowest energy sample
-        cluster_anchor_inds = {}
-        for cluster_id in np.unique(cluster_ind):
-            if cluster_id == -1:
-                continue  # skip noise
-            in_cluster = np.where(cluster_ind == cluster_id)[0]
-            best_ind = in_cluster[np.argmin(energies_to_fit[in_cluster])]
-            cluster_anchor_inds[cluster_id] = best_ind
-        anchor_inds = np.array(list(cluster_anchor_inds.values()))
-    else:
-        anchor_inds = np.array([np.argmin(energies_to_fit)])
-        cluster_ind[anchor_inds] = 0  # make a cluster if there are none naturally
+    # Evaluate KDE on a 2D grid
+    grid_size = 300
+    x_min, y_min = sample_embedding.min(axis=0)
+    x_max, y_max = sample_embedding.max(axis=0)
+    xx, yy = np.meshgrid(np.linspace(x_min, x_max, grid_size),
+                         np.linspace(y_min, y_max, grid_size))
+    grid_coords = np.vstack([xx.ravel(), yy.ravel()])
+    density = kde(grid_coords).reshape(grid_size, grid_size)
 
-    # dimension reduction
-    sampled_inds = np.random.choice(len(samples_to_fit), size=500, replace=False)
-    samples_to_fit = np.concatenate([samples_to_fit[sampled_inds], samples_to_fit[anchor_inds]])  # ensure anchor inds get into the embedding
-    reducer = UMAP(n_components=2, n_neighbors=10, min_dist=0.05,
-                   metric='euclidean', densmap=False)
-    fit_embedding = reducer.fit_transform(samples_to_fit)
-    sample_embedding = reducer.transform(samples)
+    # Smooth for better watershed behavior
+    density_smooth = gaussian_filter(density, sigma=1)
+    density_inverted = -density_smooth  # so basins are valleys
 
-    return sample_embedding, fit_embedding[-len(anchor_inds):], sample_cluster_ind, energies_to_fit[np.array(anchor_inds)], -sample_rewards
+    # -------------
+    # Step 3: Watershed
+    # -------------
+    min_kde_range = 5  #np.sqrt(grid_size**2 / 500)  # to stuff M evenly spaced clusters
+    peaks = peak_local_max(density_smooth, min_distance=int(min_kde_range), exclude_border=False)
+    markers = np.zeros_like(density_smooth, dtype=int)
+    for i, (x, y) in enumerate(peaks):
+        markers[x, y] = i + 1  # watershed marker labels must be >0
+
+    labels = watershed(density_inverted, markers=markers)
+
+    # -------------
+    # Step 4: Assign samples to regions
+    # -------------
+    # Build tree from grid to map each point to a label
+    grid_points = np.column_stack([xx.ravel(), yy.ravel()])
+    label_flat = labels.ravel()
+    tree = KDTree(grid_points)
+    _, idx = tree.query(sample_embedding, k=1)
+    cluster_assignments = label_flat[idx]
+
+    unique_clusters = np.unique(cluster_assignments)
+    anchor_inds = np.zeros(len(peaks), dtype=np.int32)
+    for ind, clu in enumerate(unique_clusters):
+        good_inds = np.argwhere(cluster_assignments == clu).flatten()
+        ii = np.argmin(energies_to_fit[good_inds]).flatten()
+        anchor_inds[ind] = good_inds[ii]
+    #
+    # # prewhiten data via PCA
+    # pca = PCA(n_components=12)
+    # pca_embedding = pca.fit_transform(samples_to_fit)
+    # clusterer = hdbscan.HDBSCAN(min_cluster_size=20,
+    #                             min_samples=20,
+    #                             metric='euclidean',
+    #                             core_dist_n_jobs=-1)
+    # cluster_ind = clusterer.fit_predict(pca_embedding)  # -1 means "noise"
+    # sample_cluster_ind = cluster_ind[-len(samples):]
+    #
+    # n_clusters = np.sum(np.unique(cluster_ind) >= 0)
+    #
+    # if n_clusters > 0:
+    #     # extract lowest energy sample
+    #     cluster_anchor_inds = {}
+    #     for cluster_id in np.unique(cluster_ind):
+    #         if cluster_id == -1:
+    #             continue  # skip noise
+    #         in_cluster = np.where(cluster_ind == cluster_id)[0]
+    #         best_ind = in_cluster[np.argmin(energies_to_fit[in_cluster])]
+    #         cluster_anchor_inds[cluster_id] = best_ind
+    #     anchor_inds = np.array(list(cluster_anchor_inds.values()))
+    # else:
+    #     anchor_inds = np.array([np.argmin(energies_to_fit)])
+    #     cluster_ind[anchor_inds] = 0  # make a cluster if there are none naturally
+    #
+    # # dimension reduction
+    # sampled_inds = np.random.choice(len(samples_to_fit), size=500, replace=False)
+    # samples_to_fit = np.concatenate([samples_to_fit[sampled_inds], samples_to_fit[anchor_inds]])  # ensure anchor inds get into the embedding
+    # reducer = UMAP(n_components=2, n_neighbors=10, min_dist=0.05,
+    #                metric='euclidean', densmap=False)
+    # fit_embedding = reducer.fit_transform(samples_to_fit)
+    # sample_embedding = reducer.transform(samples)
+
+    return (sample_embedding[-len(samples):],
+            sample_embedding[anchor_inds],
+            cluster_assignments[-len(samples):],
+            energies_to_fit[anchor_inds],
+            -sample_rewards,
+            cluster_assignments[:-len(samples)],
+            labels,
+            (x_min, x_max, y_min, y_max))
+
+
+def subsample_batch(ref_rewards, ref_samples, sample_size, temperature):  # todo replace this with our overlap method
+    dists = cdist(ref_samples, ref_samples) + np.eye(len(ref_samples)) * 100
+    closest_neighbor = np.amin(dists, axis=1)
+    weight_rew = ref_rewards + closest_neighbor ** 2  # reward distinct samples
+    weights = np.exp((weight_rew - weight_rew.max()) / temperature) + 1e-2
+    weights /= weights.sum()
+    inds_to_keep = np.random.choice(len(ref_samples), sample_size, replace=False, p=weights)
+    ref_samples = ref_samples[inds_to_keep]
+    ref_rewards = ref_rewards[inds_to_keep]
+    return ref_rewards, ref_samples
+
+
+"""
+#possible alternative workflow
+
+import numpy as np
+import umap
+from scipy.stats import gaussian_kde
+from scipy.ndimage import gaussian_filter
+from skimage.feature import peak_local_max
+from skimage.morphology import label
+from skimage.segmentation import watershed
+from sklearn.neighbors import KDTree
+import plotly.express as px
+
+
+"""
 
 
 def voronoi_finite_polygons_2d(vor, radius=None):
@@ -323,7 +413,7 @@ def voronoi_finite_polygons_2d(vor, radius=None):
 
     center = vor.points.mean(axis=0)
     if radius is None:
-        radius = np.ptp(vor.points)* 2  # large enough
+        radius = np.ptp(vor.points) * 2  # large enough
 
     # Map ridge points to ridges
     all_ridges = {}
@@ -373,7 +463,7 @@ def voronoi_finite_polygons_2d(vor, radius=None):
 
 
 def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies,
-                sample_energies, color_mode):
+                sample_energies, color_mode, watershed: Optional = None, watershed_range: Optional = None):
     """
     Figure for the clusters in PC space + Voronoi assignments
     :param sample_embedding:
@@ -381,10 +471,13 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
     :param cluster_ind:
     :return:
     """
-    try:
-        vor = Voronoi(anchor_embedding)
-        polygons = voronoi_finite_polygons_2d(vor)
-    except:
+    if watershed is None:
+        try:
+            vor = Voronoi(anchor_embedding)
+            polygons = voronoi_finite_polygons_2d(vor)
+        except:
+            polygons = None
+    else:
         polygons = None
 
     energies = np.array(anchor_energies)
@@ -398,8 +491,9 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
 
     colorscale_name = "rainbow"  # or "viridis", "plasma", etc.
     n_clusters = len(anchor_embedding)
-    distinct_colors = pc.sample_colorscale(colorscale_name, [i / max(n_clusters - 1, 1) for i in range(n_clusters)])
-    cluster_to_color = {i: distinct_colors[i] for i in range(n_clusters)}
+    distinct_colors = pc.sample_colorscale(colorscale_name,
+                                           [i / max((n_clusters + 2) - 1, 1) for i in range(n_clusters + 2)])
+    cluster_to_color = {i: distinct_colors[i] for i in range(n_clusters + 2)}
     cluster_to_color.update({-1: 'rgb(0,0,0)'})  # black for noise dimension
     if color_mode == 'cluster':
         mapped_colors = [cluster_to_color[c] for c in cluster_ind]
@@ -407,6 +501,55 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
         mapped_colors = sample_energies
 
     fig = go.Figure()
+    if polygons is not None:
+        for ind, poly in enumerate(polygons):
+            cluster_color = cluster_to_color[ind]
+            fig.add_trace(go.Scattergl(
+                x=np.array(poly)[:, 0],
+                y=np.array(poly)[:, 1],
+                mode='lines',
+                line=dict(color=cluster_color, width=1),
+                fill='toself',
+                fillcolor=cluster_color,
+                opacity=0.1,
+                hoverinfo='skip',
+                showlegend=False,
+                marker_showscale=False,
+            ))
+
+
+    if watershed is not None:
+        custom_cscale = []
+        for i in range(n_clusters):
+            rel_pos = i / (n_clusters - 1)
+            custom_cscale.append([rel_pos, cluster_to_color[i]])
+
+        x_min, x_max, y_min, y_max = watershed_range
+        x_grid = np.linspace(x_min, x_max, watershed.shape[1])
+        y_grid = np.linspace(y_min, y_max, watershed.shape[0])
+
+        fig.add_trace(go.Heatmap(
+            z=watershed / n_clusters,
+            x=x_grid, y=y_grid,
+            colorscale=custom_cscale,
+            opacity=0.2,
+            showscale=False
+        ))
+
+    fig.add_trace(go.Scattergl(x=anchor_embedding[:, 0],
+                               y=anchor_embedding[:, 1],
+                               mode='markers',
+                               opacity=1,
+                               name='Minima',
+                               showlegend=False,
+                               marker=dict(
+                                   size=15,
+                                   color=line_colors, #[cluster_to_color[ind] for ind in range(len(anchor_embedding))],  # Fill color
+                                   line=dict(
+                                       color='white',  # <-- variable border color!
+                                       width=4
+                                   )
+                               )))
 
     fig.add_trace(go.Scattergl(x=sample_embedding[:, 0],
                                y=sample_embedding[:, 1],
@@ -423,21 +566,6 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
                                )
                                ))
 
-    fig.add_trace(go.Scattergl(x=anchor_embedding[:, 0],
-                               y=anchor_embedding[:, 1],
-                               mode='markers',
-                               opacity=1,
-                               name='Minima',
-                               showlegend=False,
-                               marker=dict(
-                                   size=15,
-                                   color=[cluster_to_color[ind] for ind in range(len(anchor_embedding))],  # Fill color
-                                   line=dict(
-                                       color=line_colors,  # <-- variable border color!
-                                       width=4
-                                   )
-                               )
-                               ))
     fig.add_trace(go.Scattergl(
         x=[None], y=[None],
         mode='markers',
@@ -452,21 +580,6 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
         ),
         showlegend=False
     ))
-    if polygons is not None:
-        for ind, poly in enumerate(polygons):
-            cluster_color = cluster_to_color[ind]
-            fig.add_trace(go.Scattergl(
-                x=np.array(poly)[:, 0],
-                y=np.array(poly)[:, 1],
-                mode='lines',
-                line=dict(color=cluster_color, width=1),
-                fill='toself',
-                fillcolor=cluster_color,
-                opacity=0.1,
-                hoverinfo='skip',
-                showlegend=False,
-                marker_showscale=False,
-            ))
 
     fig.update_layout(
         xaxis_range=[x_all.min() - 1, x_all.max() + 1],
@@ -682,10 +795,10 @@ def log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_
         if len(buffer) > 0:  # todo adjust this to be according to the sampling routine
             metrics['Buffer Length'] = len(buffer)
             metrics['Buffer Quantiles'] = np.array([
-                np.quantile(buffer.scores_np_list, q=p)
+                np.quantile(buffer.rewards_list, q=p)
                 for p in np.linspace(0, 1, 50)
             ])
-            metrics['Buffer Mean Score'] = np.mean(buffer.scores_np_list)
+            metrics['Buffer Mean Score'] = np.mean(buffer.rewards_list)
     return metrics
 
 
