@@ -280,8 +280,9 @@ def embed_samples(ref_samples, ref_rewards, samples, sample_rewards, max_ref_sam
     sample_embedding = umap_model.fit_transform(samples_to_fit)
 
     # fit energy-weighted 2D gaussian kde on the UMAP data
-    beta = 1.0
+    beta = 0.1
     weights = np.exp(-beta * (energies_to_fit - np.min(energies_to_fit)))  # stabilize exponent
+    weights /= weights.sum()
     kde = gaussian_kde(sample_embedding.T, weights=weights, bw_method='scott')
 
     # Evaluate KDE on a 2D grid
@@ -300,7 +301,7 @@ def embed_samples(ref_samples, ref_rewards, samples, sample_rewards, max_ref_sam
     # -------------
     # Step 3: Watershed
     # -------------
-    min_kde_range = 5  #np.sqrt(grid_size**2 / 500)  # to stuff M evenly spaced clusters
+    min_kde_range = 2  #np.sqrt(grid_size**2 / 500)  # to stuff M evenly spaced clusters
     peaks = peak_local_max(density_smooth, min_distance=int(min_kde_range), exclude_border=False)
     markers = np.zeros_like(density_smooth, dtype=int)
     for i, (x, y) in enumerate(peaks):
@@ -521,7 +522,7 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
     if watershed is not None:
         custom_cscale = []
         for i in range(n_clusters):
-            rel_pos = i / (n_clusters - 1)
+            rel_pos = i / n_clusters
             custom_cscale.append([rel_pos, cluster_to_color[i]])
 
         x_min, x_max, y_min, y_max = watershed_range

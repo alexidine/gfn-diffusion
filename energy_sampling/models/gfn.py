@@ -255,7 +255,7 @@ class GFN(nn.Module):
             expl = exploration_std(None)
             if expl > 0:
                 add_log_var = torch.full_like(pflogvars, np.log(exploration_std(i)) * 2) / dts.sqrt().unsqueeze(1)
-                pflogvars_sample = torch.logaddexp(pflogvars, add_log_var).detach()
+                pflogvars_sample = torch.logaddexp(pflogvars, add_log_var)
             else:
                 pflogvars_sample = pflogvars
         else:

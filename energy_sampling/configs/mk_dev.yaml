@@ -17,8 +17,8 @@ reweight_T: null                # 'null' or float: smaller values reduce the imp
 # model parameters
 zero_init: true
 joint_layers: 8              # number of layers in forward/backward policy models
-hidden_dim: 1024              # dimensionality of hidden layer
-s_emb_dim: 1024                # dimensionality of state embedding
+hidden_dim: 512              # dimensionality of hidden layer
+s_emb_dim: 512                # dimensionality of state embedding
 t_emb_dim: 32                # dimensionality of time embedding
 harmonics_dim: 64            # dimensionality of harmonic embedding
 condition_emb_dim: 32         # dimensionality of the conditioning embedding
@@ -31,14 +31,14 @@ max_batch_size: 100           # maximum batch size to allow
 eval_batch_size: 500        # batch size for evaluation
 epochs: 100000             # number of training epochs: relatively large
 eval_period: 100              # how often to do evaluation & reporting
-figs_period: 500             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
+figs_period: 100             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # GFlowNet settings
 
 T: 10                        # static training diffusion length
 eval_T: 100                  # diffusion trajectory length for inference
 min_traj_length: 10
-max_traj_length: 15
+max_traj_length: 20
 traj_length_strategy: sampled # 'static'  or 'sampled'  will do random between min and max traj lengths
 discretizer_max_ratio: 10    # maximum ratio between randomly sampled step sizes
 discretizer: 'random'        # 'random' 'low_discrepancy' 'equidistant' 'uniform'
@@ -52,25 +52,22 @@ fwd_loss_coeffs:
   tb: 1.0
   vg_lb: 0.0
   vg_lme: 0.0  # exclusive with vg_lb
-  greedy: 0
-  mle: 1.0
+  greedy: 0.0
+  mle: 0.0
   smoothed: 0
-  var: 10.0  # penalize forward policy for crowded samples
-  var_gamma: 0.1  # smaller -> longer range repulsion
-  var_start_steps: 500
-  var_end_steps: 1000
+  var: 1.0  # penalize forward policy for crowded samples - this and buffer will anneal on expl timescale
+  var_gamma: 0.05  # smaller -> longer range repulsion
+  var_cutoff: 2.0  # variance below which to penalize
   buffer: 0.0  # penalize forward policy for sampling near samples already in the buffer
   buffer_gamma: 1.0  # smaller -> longer range repulsion
-  buffer_start_steps: 500
-  buffer_end_steps: 1000
 bwd_loss_coeffs:
-  tb: 1.0
+  tb: 0.0
   vg_lb: 0.0
-  vg_lme: 0.0 # exclusive with vg_lb
-  mle: 1.0
+  vg_lme: 1.0 # exclusive with vg_lb
+  mle: 0.0
   smoothed: 0
 repeats: 10                   # for conditional VarGrad training
-both_ways: true             # forward and backward training
+both_ways: false             # forward and backward training
 bwd_batch_multiplier: 1      # ratio of backward to foward batch size (much cheaper to evaluate)
 fwd_to_bwd_ratio: 1           # whether to do forward (>1) or backward (<1) training more often
 bwd: False                   # backward training only
@@ -81,7 +78,7 @@ gfn_clip: 10.0  # clip the maximumstep size induced by the policy model
 
 # local search settings
 ################################################################
-buffer_path: null #'D:/crystal_datasets/urea_gfn_dataset.pt'
+buffer_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
 molecules_path: 'D:/crystal_datasets/test_qm9_dataset.pt'
 
 #buffer_path: '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt'
@@ -100,10 +97,10 @@ buffer_size: 50000          # size of replay buffer: relatively large
 ################################################################
 
 # exploration controls
-exploratory: False       # adds variance to optionally learned logvars
+exploratory: True       # adds variance to optionally learned logvars
 exploration_factor: 1.0  # initial exploration std value
 exploration_wd: True  # decay exploration over time
-wd_max_steps: 2000  # number of steps to terminate the added variance
+wd_max_steps: 5000  # number of steps to terminate the added variance
 
 # molecular crystal settings
 ################################################################
@@ -132,7 +129,7 @@ energy_min_temperature: 0.1
 energy_max_temperature: 10
 energy_static_temperature: 1  # for certain evaluations or static T training. Also initial temperature on unconditional temperature annealing
 temperature_scaling_factor: 0.01  # controls relative frequency of higher vs lower temperatures (higher -> higher)
-energy_clip: 100
+energy_clip: 1000
 
 ############
 ############

@@ -1,7 +1,5 @@
 import gc
 import os
-import sys
-import traceback
 from time import time
 from typing import Optional
 
@@ -72,6 +70,7 @@ def train_step(energy_function,
 
     else:  # forward ONLY
         do_forward = True
+        p_forward = 1
 
     if len(buffer) == 0:
         do_forward = True
@@ -195,8 +194,8 @@ def bwd_train_step(gfn_model, discretizer, buffer, exploration_std=None, repeats
 def train():
     times['initialization_start'] = time()
     name = args.run_name
-    if not os.path.exists(name):
-        os.makedirs(name)
+    # if not os.path.exists(name):
+    #     os.makedirs(name)
 
     energy_function = MolecularCrystal(device=device,
                                        energy_function=args.energy_function,
@@ -252,8 +251,8 @@ def train():
                                                      args.temp_annealing_max_steps, 10)
 
     repulsion_annealing_lambda = get_annealing_factor(args.lj_repulsion, 1, args.repulsion_annealing_max_steps, 10)
-    #var_annealing_factor = get_annealing_factor(1, 0, args.fwd_loss_coeffs.var_end_steps - args.fwd_loss_coeffs.var_start_steps, 10)
-    #buffer_annealing_factor = get_annealing_factor(1, 0, args.fwd_loss_coeffs.buffer_end_steps - args.fwd_loss_coeffs.buffer_start_steps, 10)
+    var_annealing_factor = get_annealing_factor(1, 0.01, args.wd_max_steps, 10)
+    buffer_annealing_factor = get_annealing_factor(1, 0.01, args.wd_max_steps, 10)
 
     fwd_loss, bwd_loss = 0, 0
     gfn_model.train()
@@ -298,7 +297,7 @@ def train():
         elif step_ind % 10 == 0 and step_ind > 9:
             lr_warmup_finished, lr = step_lr_schedule(schedulers, optimizers, lr_warmup_finished)
             anneal_reward(temp_annealing_lambda, repulsion_annealing_lambda, energy_function, args)
-            #anneal_loss(step_ind, var_annealing_factor, buffer_annealing_factor)
+            anneal_loss(step_ind, var_annealing_factor, buffer_annealing_factor)
             metrics.update({'lr_fwd': optimizers['fwd'].param_groups[0]['lr']})
             metrics.update({'lr_bwd': optimizers['bwd'].param_groups[0]['lr']})
             metrics.update({'lr_flow': optimizers['flow'].param_groups[0]['lr']})
@@ -329,14 +328,16 @@ def anneal_reward(temp_annealing_lambda, repulsion_annealing_lambda, energy_func
             energy_function.lj_repulsion *= repulsion_annealing_lambda
 
 
-# def anneal_loss(it, var_annealing_factor, buffer_annealing_factor):
-#     """anneal reward function"""
-#     if it > args.var_end_steps:
-#         args.fwd_loss_coeffs.var = 0
-#     elif it < args.var_start_steps:
-#         args.fwd_loss_coeffs.var = 0
-#     elif it > args.var_start_steps:
-#         args.fwd_loss_coeffs.var *= var_annealing_factor
+def anneal_loss(it, var_annealing_factor, buffer_annealing_factor):
+    """anneal reward function"""
+    if it > args.wd_max_steps:
+        args.fwd_loss_coeffs.var = 0
+    else:
+        args.fwd_loss_coeffs.var *= var_annealing_factor
+    if it > args.wd_max_steps:
+        args.fwd_loss_coeffs.buffer = 0
+    else:
+        args.fwd_loss_coeffs.buffer *= buffer_annealing_factor
 
 
 def step_lr_schedule(schedulers, optimizers,
@@ -630,6 +631,7 @@ def add_dataset_to_buffer(dataset_path, buffer):
 
 
 def get_annealing_factor(start_value, stop_value, total_time, step_iters):
+    assert stop_value > 0, "Setting final value as zero breaks this module"
     return (stop_value / start_value) ** (1 / (total_time / step_iters))
 
 

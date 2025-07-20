@@ -17,11 +17,11 @@ reweight_T: null                # 'null' or float: smaller values reduce the imp
 # model parameters
 zero_init: true
 joint_layers: 8              # number of layers in forward/backward policy models
-hidden_dim: 1024              # dimensionality of hidden layer
-s_emb_dim: 1024                # dimensionality of state embedding
-t_emb_dim: 32                # dimensionality of time embedding
-harmonics_dim: 64            # dimensionality of harmonic embedding
-condition_emb_dim: 32         # dimensionality of the conditioning embedding
+hidden_dim: 512              # dimensionality of hidden layer
+s_emb_dim: 512                # dimensionality of state embedding
+t_emb_dim: 128                # dimensionality of time embedding
+harmonics_dim: 128            # dimensionality of harmonic embedding
+condition_emb_dim: 128         # dimensionality of the conditioning embedding
 dropout: 0                   # dropout probability
 norm: null                   # null, "layer", "batch"
 

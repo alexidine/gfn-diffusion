@@ -69,7 +69,8 @@ class MolecularCrystal(BaseSet):
                                                       supercell_size=10,
                                                       align_to_standardized_orientation=True)
 
-            cluster_batch.construct_radial_graph(cutoff=6)
+            cluster_batch.construct_radial_graph(cutoff=6,
+                                                 max_num_neighbors=500)
             #lj_energy, normed_lj_energy = cluster_batch.compute_LJ_energy()
             silu_energy = cluster_batch.compute_silu_energy(repulsion=self.lj_repulsion)
 
