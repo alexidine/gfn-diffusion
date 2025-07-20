@@ -252,8 +252,8 @@ def train():
                                                      args.temp_annealing_max_steps, 10)
 
     repulsion_annealing_lambda = get_annealing_factor(args.lj_repulsion, 1, args.repulsion_annealing_max_steps, 10)
-    var_annealing_factor = get_annealing_factor(1, 0, args.fwd_loss_coeffs.var_end_steps - args.fwd_loss_coeffs.var_start_steps, 10)
-    buffer_annealing_factor = get_annealing_factor(1, 0, args.fwd_loss_coeffs.buffer_end_steps - args.fwd_loss_coeffs.buffer_start_steps, 10)
+    #var_annealing_factor = get_annealing_factor(1, 0, args.fwd_loss_coeffs.var_end_steps - args.fwd_loss_coeffs.var_start_steps, 10)
+    #buffer_annealing_factor = get_annealing_factor(1, 0, args.fwd_loss_coeffs.buffer_end_steps - args.fwd_loss_coeffs.buffer_start_steps, 10)
 
     fwd_loss, bwd_loss = 0, 0
     gfn_model.train()
@@ -329,14 +329,14 @@ def anneal_reward(temp_annealing_lambda, repulsion_annealing_lambda, energy_func
             energy_function.lj_repulsion *= repulsion_annealing_lambda
 
 
-def anneal_loss(it, var_annealing_factor, buffer_annealing_factor):
-    """anneal reward function"""
-    if it > args.var_end_steps:
-        args.fwd_loss_coeffs.var = 0
-    elif it < args.var_start_steps:
-        args.fwd_loss_coeffs.var = 0
-    elif it > args.var_start_steps:
-        args.fwd_loss_coeffs.var *= var_annealing_factor
+# def anneal_loss(it, var_annealing_factor, buffer_annealing_factor):
+#     """anneal reward function"""
+#     if it > args.var_end_steps:
+#         args.fwd_loss_coeffs.var = 0
+#     elif it < args.var_start_steps:
+#         args.fwd_loss_coeffs.var = 0
+#     elif it > args.var_start_steps:
+#         args.fwd_loss_coeffs.var *= var_annealing_factor
 
 
 def step_lr_schedule(schedulers, optimizers,
