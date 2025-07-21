@@ -26,7 +26,7 @@ from utils import logmeanexp
 
 @torch.no_grad()
 def log_partition_function(initial_state, gfn, discretizer, energy_function, mol_batch):
-    T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(mol_batch)
+    log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(mol_batch)
     mol_batch.sg_ind = sg_inds
     (states, log_pfs, log_pbs, log_fs,
      means_f, logvars_f, means_b, logvars_b) = gfn.get_trajectory_fwd(initial_state,
@@ -36,7 +36,7 @@ def log_partition_function(initial_state, gfn, discretizer, energy_function, mol
                                                                       return_gauss_params=True)
     log_r, sample_batch = energy_function.log_reward(
         states[:, -1], mol_batch=mol_batch,
-        log_temperature=T_tensor,
+        log_temperature=log_T_tensor,
         return_exp=True)
     log_weight = log_r + log_pbs.sum(-1) - log_pfs.sum(-1)
 
@@ -48,7 +48,8 @@ def log_partition_function(initial_state, gfn, discretizer, energy_function, mol
             log_r, log_Z, log_Z_lb, log_Z_learned,
             sample_batch, condition,
             log_pfs, log_pbs, log_fs,
-            means_f, logvars_f, means_b, logvars_b)
+            means_f, logvars_f, means_b, logvars_b,
+            log_T_tensor)
 
 
 @torch.no_grad()
@@ -82,11 +83,12 @@ def eval_step(energy_function,
 
     (flow_states, samples, log_r, log_Z, log_Z_lb,
      log_Z_learned, sample_batch, condition, log_pfs, log_pbs, log_fs,
-     f_means_f, f_vars_f, f_means_b, f_vars_b) = log_partition_function(
+     f_means_f, f_vars_f, f_means_b, f_vars_b,
+     log_T_tensor) = log_partition_function(
         init_state, gfn_model, discretizer, energy_function, mol_batch)
 
     metrics = log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_Z_learned, log_r,
-                                         sample_batch, buffer)
+                                         sample_batch, log_T_tensor, buffer)
 
     if add_to_buffer:
         buffer.add(sample_batch.detach().cpu().to_data_list())  # add evaluation samples to buffer
@@ -709,7 +711,7 @@ def mean_flow_step_sizes(flow_states):
 
 
 def log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_Z_learned, log_r,
-                               sample_batch, buffer=None):
+                               sample_batch, log_T_tensor, buffer=None):
     """Scalar / distribution metrics"""
     metrics = {}
     metrics['Empirical log Z'] = log_Z.cpu().detach().numpy()
@@ -722,7 +724,7 @@ def log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_
     metrics['Sample Energy Distribution'] = sample_batch.gfn_energy.cpu().detach().numpy()
     metrics['Mean Sample Reward'] = log_r.mean().cpu().detach().numpy()
     metrics['sample Reward Distribution'] = log_r.cpu().detach().numpy()
-    metrics['Crystal Log Temperature'] = condition[:, 0]
+    metrics['Crystal Log Temperature'] = log_T_tensor
     metrics['Crystal Mean Log Temperature'] = condition[:, 0].mean()
     metrics['Crystal Min Temperature'] = energy_function.min_temperature
     metrics['Crystal Max Temperature'] = energy_function.max_temperature

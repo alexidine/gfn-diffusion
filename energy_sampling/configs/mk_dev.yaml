@@ -32,8 +32,8 @@ max_batch_size: 50           # maximum batch size to allow
 repeats: 10                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
 eval_batch_size: 500        # batch size for evaluation
 epochs: 100000             # number of training epochs: relatively large
-eval_period: 50              # how often to do evaluation & reporting
-figs_period: 50             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
+eval_period: 100              # how often to do evaluation & reporting
+figs_period: 200             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # GFlowNet settings
 
@@ -57,7 +57,7 @@ fwd_loss_coeffs:
   smoothed: 0
   var: 10.0  # penalize forward policy for crowded samples - this and buffer will anneal on expl timescale
   var_gamma: 0.01  # smaller -> longer range repulsion
-  var_cutoff: 2.0  # variance below which to penalize
+  var_cutoff: 3.0  # variance below which to penalize
   buffer: 0.0  # penalize forward policy for sampling near samples already in the buffer
   buffer_gamma: 1.0  # smaller -> longer range repulsion
 bwd_loss_coeffs:
@@ -109,7 +109,7 @@ wd_max_steps: 5000  # number of steps to terminate the added variance
 molecule: qm9  # 'nicotinamide' or 'urea' or 'qm9' for molecule-conditional training
 molecule_conditioning: True  # MUST be true for molecule='qm9' and false else
 sg_conditioning: True  # whether to conditionally sample across space groups
-space_groups: [2]  # which space groups to sample over
+space_groups: [1,2,8,14,19]  # which space groups to sample over
 energy_function: combo
   # 'latent_harmonic' : unimadal harmonic potential in the latent space
   # 'crystal_harmonic': unimodal harmonic potential in the crystal space

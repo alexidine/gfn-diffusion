@@ -141,8 +141,8 @@ def get_gfn_forward_loss(loss_coeffs,
 
             # Compute variance within each condition
             batch_var = states_reshaped.var(dim=1, keepdim=True)  # (repeats, 1, features)
-            var_loss = (F.relu(-(batch_var - loss_coeffs.var_cutoff)) / loss_coeffs.var_cutoff
-                        ).expand(-1, states_reshaped.shape[1], -1).mean(dim=2)  # (repeats, batch_size_per_condition)
+            var_loss = ((F.relu(-(batch_var - loss_coeffs.var_cutoff)) / loss_coeffs.var_cutoff
+                        )**2).expand(-1, states_reshaped.shape[1], -1).mean(dim=2)  # (repeats, batch_size_per_condition)
 
             # Compute overlap within each condition
             overlap_loss = torch.zeros_like(var_loss)
@@ -159,7 +159,7 @@ def get_gfn_forward_loss(loss_coeffs,
         else:
             states_to_compare = states[:, -1].clip(min=-6, max=6) #states[:, -1, 3:].clip(min=-6, max=6)
             batch_var = states_to_compare.var(dim=0, keepdim=True)
-            var_loss = (F.relu(-(batch_var - loss_coeffs.var_cutoff))/loss_coeffs.var_cutoff).repeat(len(states), 1).mean(dim=1)
+            var_loss = ((F.relu(-(batch_var - loss_coeffs.var_cutoff))/loss_coeffs.var_cutoff)**2).repeat(len(states), 1).mean(dim=1)
             overlap_loss = compute_sample_overlap(
                 states_to_compare,  # don't let it escape - it could cheat
                 states_to_compare,  # don't let it escape - it could cheat
