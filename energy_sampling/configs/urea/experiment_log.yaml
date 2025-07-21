@@ -1,0 +1,77 @@
+- index: 0
+  tag: 0_greedy_var_bmle
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - norm
+  - dropout
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: null
+- index: 1
+  tag: 1_tb_var_bmle
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - norm
+  - dropout
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: null
+- index: 2
+  tag: 2_greedy_sbmle
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - norm
+  - dropout
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: null
+- index: 3
+  tag: 3_greedy_stb_var_svg
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - norm
+  - dropout
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: null
+- index: 4
+  tag: 4_greedy_vg_var_vg
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - norm
+  - dropout
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: null
+- index: 5
+  tag: 5_mix
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - norm
+  - dropout
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: null
+- index: 6
+  tag: 6_greedy_var_big_mle
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - norm
+  - dropout
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: null
