@@ -29,11 +29,14 @@ class MolecularCrystal(BaseSet):
                  core_coeff: float = 1.0,
                  lj_coeff: float = 1.0,
                  lj_repulsion: float = 1.0,
+                 molecule_conditioning: bool = False,
+                 sg_conditioning: bool = False,
+                 space_groups: Optional[list] = [2],
                  ):
+
         super(MolecularCrystal, self).__init__()
         self.device = device
         self.data_ndim = dim
-        self.space_group = space_group
         self.energy_function = energy_function
         self.energy_clip = energy_clip
 
@@ -47,6 +50,9 @@ class MolecularCrystal(BaseSet):
         self.lj_repulsion = lj_repulsion  #  for values < 1, shifts and softens the silu attraction
         self.core_coeff = core_coeff
         self.lj_coeff = lj_coeff
+        self.molecule_conditioning = molecule_conditioning
+        self.sg_conditioning=sg_conditioning
+        self.space_groups = space_groups
 
         self.temperature = temperature  # for static temperature work
 
@@ -67,7 +73,7 @@ class MolecularCrystal(BaseSet):
         else:
             cluster_batch = crystal_batch.mol2cluster(cutoff=6,
                                                       supercell_size=8,
-                                                      align_to_standardized_orientation=True)
+                                                      align_to_standardized_orientation=False if self.molecule_conditioning else True)
 
             cluster_batch.construct_radial_graph(cutoff=6,
                                                  max_num_neighbors=100)
@@ -86,7 +92,7 @@ class MolecularCrystal(BaseSet):
                 surface_padding=self.ellipsoid_scale,
                 model=self.ellipsoid_model,
                 return_details=True)
-            ellipsoid_overlap = normed_ellipsoid_overlap.flatten().detach()  # never packprop through this, it's unstable
+            ellipsoid_overlap = normed_ellipsoid_overlap.flatten().detach()  # don't packprop through this, it's unstable
         else:
             ellipsoid_overlap = torch.zeros_like(silu_energy)
 
@@ -277,9 +283,14 @@ class MolecularCrystal(BaseSet):
         else:
             overlap_tensor = None
 
+        if self.sg_conditioning:
+            sgs = mol_batch.sg_ind
+        else:
+            sgs = [self.space_groups[0] for _ in range(mol_batch.num_graphs)]
+
         crystal_batch = collate_data_list([MolCrystalData(
             molecule=mol_batch[ind].clone(),  # must be cloned
-            sg_ind=self.space_group,
+            sg_ind=sgs[ind],
             aunit_handedness=torch.ones(1),
             cell_lengths=torch.ones(3, device=self.device),
             # if we don't put dummies in here, later ops to_data_list fail
@@ -325,9 +336,14 @@ class MolecularCrystal(BaseSet):
     def get_conditioning_tensor(self,
                                 mol_batch,
                                 temperature: torch.tensor = None,
+                                sg_inds: torch.tensor = None,
                                 ):
 
+        conds = []
         if self.temperature_conditioning:
+            """
+            sample temp range, or a fixed temp, or an override temp
+            """
             if temperature is None:  # sample randomly in log space
                 rands = torch.rand(mol_batch.num_graphs, device=mol_batch.device, dtype=torch.float32)
 
@@ -335,12 +351,28 @@ class MolecularCrystal(BaseSet):
                 log_max = torch.log10(torch.tensor(self.max_temperature, dtype=torch.float32, device=mol_batch.device))
 
                 log_temps = log_min + (log_max - log_min) * rands ** self.temperature_scaling_factor
-                return log_temps[:, None]
+                log_T_tensor = log_temps[:, None]
             else:
-                return torch.log10(temperature[:, None])
-        else:
-            return torch.log10(torch.ones((mol_batch.num_graphs, 1), device=mol_batch.device) * self.temperature)
+                log_T_tensor = torch.log10(temperature[:, None])
 
+            conds.append(log_T_tensor)
+        else:
+            log_T_tensor = torch.log10(torch.ones((mol_batch.num_graphs, 1), device=mol_batch.device) * self.temperature)
+
+        if self.molecule_conditioning:
+            mol_embedding = mol_batch.embedding.flatten(1, 2)
+            conds.append(mol_embedding)
+
+        if sg_inds is not None:
+            sg_embedding = sg_inds[:, None]
+        else:
+            sg_embedding = torch.tensor(np.random.choice(self.space_groups, mol_batch.num_graphs, replace=True)).to(
+                mol_batch.device)[:, None]
+
+        if self.sg_conditioning:
+            conds.append(sg_embedding)
+
+        return log_T_tensor.flatten(), sg_embedding.flatten(), torch.cat(conds, dim=1)
 
 def generate_modes(K=20, D=12, rho=4.0, delta=3.0, seed=42):
     np.random.seed(seed)

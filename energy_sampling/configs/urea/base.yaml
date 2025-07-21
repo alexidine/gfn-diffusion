@@ -102,7 +102,8 @@ wd_max_steps: 5000  # number of steps to terminate the added variance
 # molecular crystal settings
 ################################################################
 # scales the energy function
-molecule: urea  # 'nicotinamide' or 'urea'
+molecule: urea  # 'nicotinamide' or 'urea' or 'qm9' for molecule-conditional training
+molecule_conditioning: True  # MUST be true for molecule='qm9' and false else
 energy_function: combo
   # 'latent_harmonic' : unimadal harmonic potential in the latent space
   # 'crystal_harmonic': unimodal harmonic potential in the crystal space

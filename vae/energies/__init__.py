@@ -1,1 +1,0 @@
-from .vae_energy import VAEEnergy

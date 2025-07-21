@@ -1,14 +1,10 @@
 import os
 from typing import Optional
 
-import hdbscan
 import numpy as np
 import plotly.colors as pc
 import torch
 import wandb
-from mxtaltools.reporting.online import simple_embedding_fig, simple_cell_hist, simple_cell_scatter_fig, \
-    log_crystal_samples, simple_latent_hist
-from mxtaltools.dataset_utils.utils import collate_data_list
 from plotly import graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.ndimage import gaussian_filter
@@ -18,9 +14,11 @@ from scipy.stats import pearsonr, gaussian_kde
 from skimage.feature import peak_local_max
 from skimage.segmentation import watershed
 from sklearn.cluster import AgglomerativeClustering
-from sklearn.decomposition import PCA
 from umap import UMAP
 
+from mxtaltools.dataset_utils.utils import collate_data_list
+from mxtaltools.reporting.online import simple_cell_hist, simple_cell_scatter_fig, \
+    log_crystal_samples, simple_latent_hist
 from plot_utils import get_plotly_fig_size_mb
 from sample_metrics import compute_distribution_distances
 from utils import logmeanexp
@@ -28,7 +26,8 @@ from utils import logmeanexp
 
 @torch.no_grad()
 def log_partition_function(initial_state, gfn, discretizer, energy_function, mol_batch):
-    condition = energy_function.get_conditioning_tensor(mol_batch)
+    T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(mol_batch)
+    mol_batch.sg_ind = sg_inds
     (states, log_pfs, log_pbs, log_fs,
      means_f, logvars_f, means_b, logvars_b) = gfn.get_trajectory_fwd(initial_state,
                                                                       discretizer,
@@ -37,7 +36,7 @@ def log_partition_function(initial_state, gfn, discretizer, energy_function, mol
                                                                       return_gauss_params=True)
     log_r, sample_batch = energy_function.log_reward(
         states[:, -1], mol_batch=mol_batch,
-        log_temperature=condition[:, 0],
+        log_temperature=T_tensor,
         return_exp=True)
     log_weight = log_r + log_pbs.sum(-1) - log_pfs.sum(-1)
 
@@ -172,7 +171,8 @@ def generate_fwd_figs(buffer, energy_function,
 
         fig_dict['Soft Mode Coverage'] = coverage_per_mode.mean()
 
-    (sample_embedding, anchor_embedding, sample_cluster_inds,
+    (sample_embedding, anchor_embedding,
+     anchor_states, sample_cluster_inds,
      anchor_energies, all_energies, buffer_cluster_inds,
      watershed_idx, watershed_range) = embed_samples(
         buffer_std_params,
@@ -194,10 +194,10 @@ def generate_fwd_figs(buffer, energy_function,
     fig = cluster_hist_fig(sample_cluster_inds)
     fig_dict['Cluster Hist'] = fig
 
-    conditional = len(condition.unique()) != 1
-    if conditional:
-        fig_dict['temp/Learned Z vs T'] = Z_vs_T_fig(gfn_model, init_state)
-        fig_dict['temp/T vs Energy'] = T_vs_E_fig(condition, sample_batch)
+    # todo rewrite this for general conditioning
+    # if energy_function.temperature_conditioning:
+    #     fig_dict['temp/Learned Z vs T'] = Z_vs_T_fig(gfn_model, init_state)
+    #     fig_dict['temp/T vs Energy'] = T_vs_E_fig(condition, sample_batch)
     fig_dict['Forward Gauss Params'] = mean_var_fig(f_vars_f, f_means_f,
                                                     f_vars_b, f_means_b)
     fig_dict['Mean Fwd F Drift'] = f_means_f.abs().mean()
@@ -215,8 +215,8 @@ def generate_fwd_figs(buffer, energy_function,
     fig_dict['Lattice Latents Distribution'] = simple_latent_hist(sample_batch, buffer_latent_params)
     fig_dict['Sample Scatter'] = simple_cell_scatter_fig(
         sample_batch,
-        (condition[:, 0].cpu().detach().numpy()) if condition is not None else None,
-        aux_scalar_name='log_temperature' if condition is not None else None)
+        sample_cluster_inds,
+        )
 
     return fig_dict
 
@@ -325,43 +325,10 @@ def embed_samples(ref_samples, ref_rewards, samples, sample_rewards, max_ref_sam
         good_inds = np.argwhere(cluster_assignments == clu).flatten()
         ii = np.argmin(energies_to_fit[good_inds]).flatten()
         anchor_inds[ind] = good_inds[ii]
-    #
-    # # prewhiten data via PCA
-    # pca = PCA(n_components=12)
-    # pca_embedding = pca.fit_transform(samples_to_fit)
-    # clusterer = hdbscan.HDBSCAN(min_cluster_size=20,
-    #                             min_samples=20,
-    #                             metric='euclidean',
-    #                             core_dist_n_jobs=-1)
-    # cluster_ind = clusterer.fit_predict(pca_embedding)  # -1 means "noise"
-    # sample_cluster_ind = cluster_ind[-len(samples):]
-    #
-    # n_clusters = np.sum(np.unique(cluster_ind) >= 0)
-    #
-    # if n_clusters > 0:
-    #     # extract lowest energy sample
-    #     cluster_anchor_inds = {}
-    #     for cluster_id in np.unique(cluster_ind):
-    #         if cluster_id == -1:
-    #             continue  # skip noise
-    #         in_cluster = np.where(cluster_ind == cluster_id)[0]
-    #         best_ind = in_cluster[np.argmin(energies_to_fit[in_cluster])]
-    #         cluster_anchor_inds[cluster_id] = best_ind
-    #     anchor_inds = np.array(list(cluster_anchor_inds.values()))
-    # else:
-    #     anchor_inds = np.array([np.argmin(energies_to_fit)])
-    #     cluster_ind[anchor_inds] = 0  # make a cluster if there are none naturally
-    #
-    # # dimension reduction
-    # sampled_inds = np.random.choice(len(samples_to_fit), size=500, replace=False)
-    # samples_to_fit = np.concatenate([samples_to_fit[sampled_inds], samples_to_fit[anchor_inds]])  # ensure anchor inds get into the embedding
-    # reducer = UMAP(n_components=2, n_neighbors=10, min_dist=0.05,
-    #                metric='euclidean', densmap=False)
-    # fit_embedding = reducer.fit_transform(samples_to_fit)
-    # sample_embedding = reducer.transform(samples)
 
     return (sample_embedding[-len(samples):],
             sample_embedding[anchor_inds],
+            samples_to_fit[anchor_inds],
             cluster_assignments[-len(samples):],
             energies_to_fit[anchor_inds],
             -sample_rewards,

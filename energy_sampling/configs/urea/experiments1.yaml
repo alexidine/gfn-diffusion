@@ -27,7 +27,7 @@ experiments:
         vg_lme: 0.0 # exclusive with vg_lb
         mle: 1.0
         smoothed: 0
-    notes:
+    notes: decent coverage, good clustering, good energies
 
   - tag: 1_tb_var_bmle
     update:
@@ -54,7 +54,7 @@ experiments:
         vg_lme: 0.0 # exclusive with vg_lb
         mle: 1.0
         smoothed: 0
-    notes:
+    notes: pretty decent
 
   - tag: 2_greedy_sbmle
     update:
@@ -81,7 +81,7 @@ experiments:
         vg_lme: 0.0 # exclusive with vg_lb
         mle: 0.1
         smoothed: 0
-    notes:
+    notes: too greedy
 
   - tag: 3_greedy_stb_var_svg
     update:
@@ -108,7 +108,7 @@ experiments:
         vg_lme: 1.0 # exclusive with vg_lb
         mle: 0.0
         smoothed: 0
-    notes:
+    notes: broad (from TB?) but not the full range, like from MLE. Atrocious samples
 
   - tag: 4_greedy_vg_var_vg
     update:
@@ -135,7 +135,7 @@ experiments:
         vg_lme: 1.0 # exclusive with vg_lb
         mle: 0.0
         smoothed: 0
-    notes:
+    notes: decent but narrow from no MLE, and severe mode collapse
 
   - tag: 5_mix
     update:
@@ -162,7 +162,7 @@ experiments:
         vg_lme: 1.0 # exclusive with vg_lb
         mle: 1.0
         smoothed: 0
-    notes:
+    notes: spread in abc killed it very bad samples overall
 
   - tag: 6_greedy_var_big_mle
     update:
@@ -189,4 +189,4 @@ experiments:
         vg_lme: 0.0 # exclusive with vg_lb
         mle: 1.0
         smoothed: 0
-    notes:
+    notes: pretty good coverage, good energies and custering

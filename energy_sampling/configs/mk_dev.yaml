@@ -1,4 +1,5 @@
 run_name: 'mk_local_dev'
+tag: 'dev'
 seed: 12345
 device: 'cuda'
 lr_policy: 0.0001              # learning rate of the policy network
@@ -21,17 +22,18 @@ hidden_dim: 512              # dimensionality of hidden layer
 s_emb_dim: 512                # dimensionality of state embedding
 t_emb_dim: 32                # dimensionality of time embedding
 harmonics_dim: 64            # dimensionality of harmonic embedding
-condition_emb_dim: 32         # dimensionality of the conditioning embedding
+condition_emb_dim: 256         # dimensionality of the conditioning embedding
 dropout: 0.1                   # dropout probability
 norm: layer                   # null, "layer", "batch"
 
-batch_size: 25               # number of samples per training batch
+batch_size: 5               # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 100           # maximum batch size to allow
+max_batch_size: 50           # maximum batch size to allow
+repeats: 10                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
 eval_batch_size: 500        # batch size for evaluation
 epochs: 100000             # number of training epochs: relatively large
-eval_period: 200              # how often to do evaluation & reporting
-figs_period: 200             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
+eval_period: 50              # how often to do evaluation & reporting
+figs_period: 50             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # GFlowNet settings
 
@@ -46,28 +48,25 @@ t_scale: 0.1                 # scales fixed forward policy variance
 log_var_range: 10           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
 pb_scale_range: 0.2          # range of learned backward policy corrections, only for 'brownian_bridge'
 energy: "molecular_crystal"  # "molecular_crystal"
-#mode_fwd: "tb"           # "tb" is trajectory balance, "vg" is VarGrad, "greedy" is a local greed + gradients, "tb_greedy", "vg_greedy" are combinations
-#mode_bwd: "tb"               # "tb" is trajectory balance, "vg" is VarGrad, 'mle' is trajectory probability maximization, 'mle_batch' is a more stable MLE
 fwd_loss_coeffs:
-  tb: 1.0
+  tb: 0.0
   vg_lb: 0.0
   vg_lme: 0.0  # exclusive with vg_lb
   greedy: 1.0
-  mle: 1.0
+  mle: 0.0
   smoothed: 0
-  var: 0.0  # penalize forward policy for crowded samples - this and buffer will anneal on expl timescale
-  var_gamma: 0.05  # smaller -> longer range repulsion
+  var: 10.0  # penalize forward policy for crowded samples - this and buffer will anneal on expl timescale
+  var_gamma: 0.01  # smaller -> longer range repulsion
   var_cutoff: 2.0  # variance below which to penalize
   buffer: 0.0  # penalize forward policy for sampling near samples already in the buffer
   buffer_gamma: 1.0  # smaller -> longer range repulsion
 bwd_loss_coeffs:
-  tb: 1.0
+  tb: 0.0
   vg_lb: 0.0
   vg_lme: 0.0 # exclusive with vg_lb
   mle: 1.0
   smoothed: 0
-repeats: 10                   # for conditional VarGrad training
-both_ways: true             # forward and backward training
+both_ways: False             # forward and backward training
 bwd_batch_multiplier: 1      # ratio of backward to foward batch size (much cheaper to evaluate)
 fwd_to_bwd_ratio: 1           # whether to do forward (>1) or backward (<1) training more often
 bwd: False                   # backward training only
@@ -78,11 +77,13 @@ gfn_clip: 20.0  # clip the maximum step size induced by the policy model
 
 # local search settings
 ################################################################
-buffer_path: 'D:/crystal_datasets/urea_gfn_dataset.pt'
+buffer_path: null #'D:/crystal_datasets/urea_gfn_dataset.pt'
 molecules_path: 'D:/crystal_datasets/test_qm9_dataset.pt'
+autoencoder_path: 'C:/Users/mikem/crystals/CSP_runs/models/cluster/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
 
 #buffer_path: '/scratch/mk8347/csd_runs/datasets/urea_gfn_dataset.pt'
 #molecules_path: '/scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt'
+#autoencodr_path: '/scratch/mk8347/csd_runs/models/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
 
 # replay buffer / dataset settings
 
@@ -105,7 +106,10 @@ wd_max_steps: 5000  # number of steps to terminate the added variance
 # molecular crystal settings
 ################################################################
 # scales the energy function
-molecule: urea  # 'nicotinamide' or 'urea'
+molecule: qm9  # 'nicotinamide' or 'urea' or 'qm9' for molecule-conditional training
+molecule_conditioning: True  # MUST be true for molecule='qm9' and false else
+sg_conditioning: True  # whether to conditionally sample across space groups
+space_groups: [2]  # which space groups to sample over
 energy_function: combo
   # 'latent_harmonic' : unimadal harmonic potential in the latent space
   # 'crystal_harmonic': unimodal harmonic potential in the crystal space
@@ -113,7 +117,7 @@ energy_function: combo
   # 'crystal_multiharmonic': multimodal harmonic potential in the crystal space
   # 'ellipsoid_overlap' : minimize ellipsoid overlaps subject to energy_density_coeff external pressure
   # 'silu_energy' : minimize a softened LJ-tye energy subject to energy_density_coeff external pressure
-  # 'combo' : silu + ellipsoid overlap
+  # 'combo' : silu + ellipsoid overlap + density term
 anneal_temperature: false  # scale temperature over time, when conditional it scales the distribution, when not it just decreases from static to min
 temp_annealing_max_steps: 5000  # time for scaling_factor to reach 1 (uniform sampling from min to max)
 anneal_repulsion: False
