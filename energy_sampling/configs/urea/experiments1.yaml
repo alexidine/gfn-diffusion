@@ -1,125 +1,159 @@
 defaults:
   base: base.yaml
 
-
-# scan over model sizes
-
 experiments:
-  - tag: 0_baseline
+  - tag: 0_greedy_var_bmle
     update:
+      joint_layers: 8
+      hidden_dim: 512
+      s_emb_dim: 512
+      norm: null
+      dropout: 0
       fwd_loss_coeffs:
-        tb: 1.0
+        tb: 0.0
         vg_lb: 0.0
         vg_lme: 0.0  # exclusive with vg_lb
-        greedy: 0
-        mle: 1.0
+        greedy: 1.0
+        mle: 0.0
         smoothed: 0
-        var: 1.0  # penalize forward policy for crowded samples
-        var_gamma: 0.1  # smaller -> longer range repulsion
+        var: 10.0  # penalize forward policy for crowded samples - this and buffer will anneal on expl timescale
+        var_gamma: 0.05  # smaller -> longer range repulsion
+        var_cutoff: 2.0  # variance below which to penalize
         buffer: 0.0  # penalize forward policy for sampling near samples already in the buffer
         buffer_gamma: 1.0  # smaller -> longer range repulsion
       bwd_loss_coeffs:
         tb: 0.0
         vg_lb: 0.0
-        vg_lme: 1.0 # exclusive with vg_lb
+        vg_lme: 0.0 # exclusive with vg_lb
         mle: 1.0
         smoothed: 0
+    notes:
 
-  - tag: 1_var_10
+  - tag: 1_tb_var_bmle
     update:
+      joint_layers: 8
+      hidden_dim: 512
+      s_emb_dim: 512
+      norm: null
+      dropout: 0
       fwd_loss_coeffs:
         tb: 1.0
         vg_lb: 0.0
         vg_lme: 0.0  # exclusive with vg_lb
-        greedy: 0
-        mle: 1.0
+        greedy: 0.0
+        mle: 0.0
         smoothed: 0
-        var: 10.0  # penalize forward policy for crowded samples
-        var_gamma: 0.1  # smaller -> longer range repulsion
+        var: 10.0  # penalize forward policy for crowded samples - this and buffer will anneal on expl timescale
+        var_gamma: 0.05  # smaller -> longer range repulsion
+        var_cutoff: 2.0  # variance below which to penalize
         buffer: 0.0  # penalize forward policy for sampling near samples already in the buffer
         buffer_gamma: 1.0  # smaller -> longer range repulsion
       bwd_loss_coeffs:
         tb: 0.0
         vg_lb: 0.0
-        vg_lme: 1.0 # exclusive with vg_lb
+        vg_lme: 0.0 # exclusive with vg_lb
         mle: 1.0
         smoothed: 0
+    notes:
 
-  - tag: 2_12_joint
+  - tag: 2_greedy_sbmle
     update:
-      joint_layers: 12
+      joint_layers: 8
+      hidden_dim: 512
+      s_emb_dim: 512
+      norm: null
+      dropout: 0
       fwd_loss_coeffs:
-        tb: 1.0
+        tb: 0.0
         vg_lb: 0.0
         vg_lme: 0.0  # exclusive with vg_lb
-        greedy: 0
-        mle: 1.0
+        greedy: 1.0
+        mle: 0.0
         smoothed: 0
-        var: 1.0  # penalize forward policy for crowded samples
-        var_gamma: 0.1  # smaller -> longer range repulsion
+        var: 0.0  # penalize forward policy for crowded samples - this and buffer will anneal on expl timescale
+        var_gamma: 0.05  # smaller -> longer range repulsion
+        var_cutoff: 2.0  # variance below which to penalize
         buffer: 0.0  # penalize forward policy for sampling near samples already in the buffer
         buffer_gamma: 1.0  # smaller -> longer range repulsion
       bwd_loss_coeffs:
         tb: 0.0
         vg_lb: 0.0
-        vg_lme: 1.0 # exclusive with vg_lb
-        mle: 1.0
+        vg_lme: 0.0 # exclusive with vg_lb
+        mle: 0.1
         smoothed: 0
+    notes:
 
-  - tag: 3_16_joint
+  - tag: 3_greedy_stb_var_svg
     update:
-      joint_layers: 16
+      joint_layers: 8
+      hidden_dim: 512
+      s_emb_dim: 512
+      norm: null
+      dropout: 0
       fwd_loss_coeffs:
         tb: 1.0
         vg_lb: 0.0
         vg_lme: 0.0  # exclusive with vg_lb
-        greedy: 0
-        mle: 1.0
+        greedy: 0.1
+        mle: 0.0
         smoothed: 0
-        var: 1.0  # penalize forward policy for crowded samples
-        var_gamma: 0.1  # smaller -> longer range repulsion
+        var: 10.0  # penalize forward policy for crowded samples - this and buffer will anneal on expl timescale
+        var_gamma: 0.05  # smaller -> longer range repulsion
+        var_cutoff: 2.0  # variance below which to penalize
         buffer: 0.0  # penalize forward policy for sampling near samples already in the buffer
         buffer_gamma: 1.0  # smaller -> longer range repulsion
       bwd_loss_coeffs:
         tb: 0.0
         vg_lb: 0.0
         vg_lme: 1.0 # exclusive with vg_lb
-        mle: 1.0
+        mle: 0.0
         smoothed: 0
+    notes:
 
-  - tag: 4_layernorm
+  - tag: 4_greedy_vg_var_vg
     update:
-      norm: 'layer'
+      joint_layers: 8
+      hidden_dim: 512
+      s_emb_dim: 512
+      norm: null
+      dropout: 0
       fwd_loss_coeffs:
-        tb: 1.0
+        tb: 0.0
         vg_lb: 0.0
-        vg_lme: 0.0  # exclusive with vg_lb
-        greedy: 0
-        mle: 1.0
+        vg_lme: 1.0  # exclusive with vg_lb
+        greedy: 1.0
+        mle: 0.0
         smoothed: 0
-        var: 1.0  # penalize forward policy for crowded samples
-        var_gamma: 0.1  # smaller -> longer range repulsion
+        var: 10.0  # penalize forward policy for crowded samples - this and buffer will anneal on expl timescale
+        var_gamma: 0.05  # smaller -> longer range repulsion
+        var_cutoff: 2.0  # variance below which to penalize
         buffer: 0.0  # penalize forward policy for sampling near samples already in the buffer
         buffer_gamma: 1.0  # smaller -> longer range repulsion
       bwd_loss_coeffs:
         tb: 0.0
         vg_lb: 0.0
         vg_lme: 1.0 # exclusive with vg_lb
-        mle: 1.0
+        mle: 0.0
         smoothed: 0
+    notes:
 
-  - tag: 5_dropout
+  - tag: 5_mix
     update:
-      dropout: 0.5
+      joint_layers: 8
+      hidden_dim: 512
+      s_emb_dim: 512
+      norm: null
+      dropout: 0
       fwd_loss_coeffs:
         tb: 1.0
         vg_lb: 0.0
         vg_lme: 0.0  # exclusive with vg_lb
-        greedy: 0
+        greedy: 0.1
         mle: 1.0
         smoothed: 0
-        var: 1.0  # penalize forward policy for crowded samples
-        var_gamma: 0.1  # smaller -> longer range repulsion
+        var: 10.0  # penalize forward policy for crowded samples - this and buffer will anneal on expl timescale
+        var_gamma: 0.05  # smaller -> longer range repulsion
+        var_cutoff: 2.0  # variance below which to penalize
         buffer: 0.0  # penalize forward policy for sampling near samples already in the buffer
         buffer_gamma: 1.0  # smaller -> longer range repulsion
       bwd_loss_coeffs:
@@ -128,3 +162,31 @@ experiments:
         vg_lme: 1.0 # exclusive with vg_lb
         mle: 1.0
         smoothed: 0
+    notes:
+
+  - tag: 6_greedy_var_big_mle
+    update:
+      joint_layers: 8
+      hidden_dim: 512
+      s_emb_dim: 512
+      norm: null
+      dropout: 0
+      fwd_loss_coeffs:
+        tb: 0.0
+        vg_lb: 0.0
+        vg_lme: 0.0  # exclusive with vg_lb
+        greedy: 1.0
+        mle: 1.0
+        smoothed: 0
+        var: 10.0  # penalize forward policy for crowded samples - this and buffer will anneal on expl timescale
+        var_gamma: 0.05  # smaller -> longer range repulsion
+        var_cutoff: 2.0  # variance below which to penalize
+        buffer: 0.0  # penalize forward policy for sampling near samples already in the buffer
+        buffer_gamma: 1.0  # smaller -> longer range repulsion
+      bwd_loss_coeffs:
+        tb: 0.0
+        vg_lb: 0.0
+        vg_lme: 0.0 # exclusive with vg_lb
+        mle: 1.0
+        smoothed: 0
+    notes:

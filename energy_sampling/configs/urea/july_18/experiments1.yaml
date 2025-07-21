@@ -1,0 +1,130 @@
+defaults:
+  base: base.yaml
+
+
+# scan over model sizes
+
+experiments:
+  - tag: 0_baseline
+    update:
+      fwd_loss_coeffs:
+        tb: 1.0
+        vg_lb: 0.0
+        vg_lme: 0.0  # exclusive with vg_lb
+        greedy: 0
+        mle: 1.0
+        smoothed: 0
+        var: 1.0  # penalize forward policy for crowded samples
+        var_gamma: 0.1  # smaller -> longer range repulsion
+        buffer: 0.0  # penalize forward policy for sampling near samples already in the buffer
+        buffer_gamma: 1.0  # smaller -> longer range repulsion
+      bwd_loss_coeffs:
+        tb: 0.0
+        vg_lb: 0.0
+        vg_lme: 1.0 # exclusive with vg_lb
+        mle: 1.0
+        smoothed: 0
+
+  - tag: 1_var_10
+    update:
+      fwd_loss_coeffs:
+        tb: 1.0
+        vg_lb: 0.0
+        vg_lme: 0.0  # exclusive with vg_lb
+        greedy: 0
+        mle: 1.0
+        smoothed: 0
+        var: 10.0  # penalize forward policy for crowded samples
+        var_gamma: 0.1  # smaller -> longer range repulsion
+        buffer: 0.0  # penalize forward policy for sampling near samples already in the buffer
+        buffer_gamma: 1.0  # smaller -> longer range repulsion
+      bwd_loss_coeffs:
+        tb: 0.0
+        vg_lb: 0.0
+        vg_lme: 1.0 # exclusive with vg_lb
+        mle: 1.0
+        smoothed: 0
+
+  - tag: 2_12_joint
+    update:
+      joint_layers: 12
+      fwd_loss_coeffs:
+        tb: 1.0
+        vg_lb: 0.0
+        vg_lme: 0.0  # exclusive with vg_lb
+        greedy: 0
+        mle: 1.0
+        smoothed: 0
+        var: 1.0  # penalize forward policy for crowded samples
+        var_gamma: 0.1  # smaller -> longer range repulsion
+        buffer: 0.0  # penalize forward policy for sampling near samples already in the buffer
+        buffer_gamma: 1.0  # smaller -> longer range repulsion
+      bwd_loss_coeffs:
+        tb: 0.0
+        vg_lb: 0.0
+        vg_lme: 1.0 # exclusive with vg_lb
+        mle: 1.0
+        smoothed: 0
+
+  - tag: 3_16_joint
+    update:
+      joint_layers: 16
+      fwd_loss_coeffs:
+        tb: 1.0
+        vg_lb: 0.0
+        vg_lme: 0.0  # exclusive with vg_lb
+        greedy: 0
+        mle: 1.0
+        smoothed: 0
+        var: 1.0  # penalize forward policy for crowded samples
+        var_gamma: 0.1  # smaller -> longer range repulsion
+        buffer: 0.0  # penalize forward policy for sampling near samples already in the buffer
+        buffer_gamma: 1.0  # smaller -> longer range repulsion
+      bwd_loss_coeffs:
+        tb: 0.0
+        vg_lb: 0.0
+        vg_lme: 1.0 # exclusive with vg_lb
+        mle: 1.0
+        smoothed: 0
+
+  - tag: 4_layernorm
+    update:
+      norm: 'layer'
+      fwd_loss_coeffs:
+        tb: 1.0
+        vg_lb: 0.0
+        vg_lme: 0.0  # exclusive with vg_lb
+        greedy: 0
+        mle: 1.0
+        smoothed: 0
+        var: 1.0  # penalize forward policy for crowded samples
+        var_gamma: 0.1  # smaller -> longer range repulsion
+        buffer: 0.0  # penalize forward policy for sampling near samples already in the buffer
+        buffer_gamma: 1.0  # smaller -> longer range repulsion
+      bwd_loss_coeffs:
+        tb: 0.0
+        vg_lb: 0.0
+        vg_lme: 1.0 # exclusive with vg_lb
+        mle: 1.0
+        smoothed: 0
+
+  - tag: 5_dropout
+    update:
+      dropout: 0.5
+      fwd_loss_coeffs:
+        tb: 1.0
+        vg_lb: 0.0
+        vg_lme: 0.0  # exclusive with vg_lb
+        greedy: 0
+        mle: 1.0
+        smoothed: 0
+        var: 1.0  # penalize forward policy for crowded samples
+        var_gamma: 0.1  # smaller -> longer range repulsion
+        buffer: 0.0  # penalize forward policy for sampling near samples already in the buffer
+        buffer_gamma: 1.0  # smaller -> longer range repulsion
+      bwd_loss_coeffs:
+        tb: 0.0
+        vg_lb: 0.0
+        vg_lme: 1.0 # exclusive with vg_lb
+        mle: 1.0
+        smoothed: 0

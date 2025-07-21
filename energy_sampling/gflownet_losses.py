@@ -1,7 +1,6 @@
 import math
 from typing import Optional
 
-import numpy as np
 import torch.nn.functional as F
 import torch
 from mxtaltools.dataset_utils.utils import collate_data_list
@@ -33,61 +32,6 @@ def normed_smoothness_loss(x, eps=1e-5):
 
 def soft_saturate(x, scale: Optional[float] = 10.0):
     return torch.log(torch.abs(x / scale) + 1) * torch.sign(x)
-
-#
-# def old_get_gfn_forward_loss(mode,
-#                              init_state,
-#                              gfn_model,
-#                              log_reward,
-#                              discretizer,
-#                              mol_batch,
-#                              exploration_std=None, return_exp=False, condition=None,
-#                              repeats=10, reweight_T: Optional[float] = None):
-#     if mode == 'tb':
-#         out = fwd_tb(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
-#                      return_exp=return_exp,
-#                      condition=condition)
-#     elif mode == 'vg':
-#         out = fwd_vg(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std, return_exp=return_exp,
-#                      condition=condition, repeats=repeats)
-#     elif mode == 'combo':
-#         out = fwd_combo(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
-#                         return_exp=return_exp,
-#                         condition=condition, repeats=repeats)
-#     elif mode == 'greedy':
-#         out = fwd_greedy(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
-#                          return_exp=return_exp,
-#                          condition=condition)
-#     elif mode == 'tb_greedy':
-#         out = fwd_tb_greedy(
-#             init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
-#             return_exp=return_exp,
-#             condition=condition
-#         )
-#     elif mode == 'vg_greedy':
-#         out = fwd_vg_greedy(
-#             init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
-#             return_exp=return_exp,
-#             condition=condition
-#         )
-#
-#     elif mode == 'mle':
-#         out = fwd_mle(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
-#                       return_exp=return_exp,
-#                       condition=condition)
-#     else:
-#         assert False
-#     losses, *rest = out
-#
-#     if reweight_T is not None:  # optionally reweight losses to minimize large outliers
-#         weights = torch.softmax(-losses.detach() / reweight_T, dim=0) * len(losses)
-#         weights += 1e-2  # minimum relative contribution
-#         weights /= weights.sum()
-#         loss = (weights * losses).mean()
-#     else:
-#         loss = losses.mean()
-#
-#     return loss, *rest
 
 
 def get_gfn_forward_loss(loss_coeffs,
@@ -696,3 +640,59 @@ def get_gfn_backward_loss(loss_coeffs,
 #     else:
 #         return loss
 #
+
+
+#
+# def old_get_gfn_forward_loss(mode,
+#                              init_state,
+#                              gfn_model,
+#                              log_reward,
+#                              discretizer,
+#                              mol_batch,
+#                              exploration_std=None, return_exp=False, condition=None,
+#                              repeats=10, reweight_T: Optional[float] = None):
+#     if mode == 'tb':
+#         out = fwd_tb(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
+#                      return_exp=return_exp,
+#                      condition=condition)
+#     elif mode == 'vg':
+#         out = fwd_vg(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std, return_exp=return_exp,
+#                      condition=condition, repeats=repeats)
+#     elif mode == 'combo':
+#         out = fwd_combo(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
+#                         return_exp=return_exp,
+#                         condition=condition, repeats=repeats)
+#     elif mode == 'greedy':
+#         out = fwd_greedy(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
+#                          return_exp=return_exp,
+#                          condition=condition)
+#     elif mode == 'tb_greedy':
+#         out = fwd_tb_greedy(
+#             init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
+#             return_exp=return_exp,
+#             condition=condition
+#         )
+#     elif mode == 'vg_greedy':
+#         out = fwd_vg_greedy(
+#             init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
+#             return_exp=return_exp,
+#             condition=condition
+#         )
+#
+#     elif mode == 'mle':
+#         out = fwd_mle(init_state, gfn_model, log_reward, discretizer, mol_batch, exploration_std,
+#                       return_exp=return_exp,
+#                       condition=condition)
+#     else:
+#         assert False
+#     losses, *rest = out
+#
+#     if reweight_T is not None:  # optionally reweight losses to minimize large outliers
+#         weights = torch.softmax(-losses.detach() / reweight_T, dim=0) * len(losses)
+#         weights += 1e-2  # minimum relative contribution
+#         weights /= weights.sum()
+#         loss = (weights * losses).mean()
+#     else:
+#         loss = losses.mean()
+#
+#     return loss, *rest

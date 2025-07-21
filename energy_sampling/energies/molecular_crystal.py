@@ -66,11 +66,11 @@ class MolecularCrystal(BaseSet):
             silu_energy = torch.zeros_like(lj_energy)
         else:
             cluster_batch = crystal_batch.mol2cluster(cutoff=6,
-                                                      supercell_size=10,
+                                                      supercell_size=8,
                                                       align_to_standardized_orientation=True)
 
             cluster_batch.construct_radial_graph(cutoff=6,
-                                                 max_num_neighbors=500)
+                                                 max_num_neighbors=100)
             #lj_energy, normed_lj_energy = cluster_batch.compute_LJ_energy()
             silu_energy = cluster_batch.compute_silu_energy(repulsion=self.lj_repulsion)
 

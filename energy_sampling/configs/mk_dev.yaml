@@ -30,8 +30,8 @@ grow_batch_size: true        # whether to dynamically grow the batch size to fil
 max_batch_size: 100           # maximum batch size to allow
 eval_batch_size: 500        # batch size for evaluation
 epochs: 100000             # number of training epochs: relatively large
-eval_period: 100              # how often to do evaluation & reporting
-figs_period: 100             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
+eval_period: 200              # how often to do evaluation & reporting
+figs_period: 200             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # GFlowNet settings
 
@@ -52,29 +52,29 @@ fwd_loss_coeffs:
   tb: 1.0
   vg_lb: 0.0
   vg_lme: 0.0  # exclusive with vg_lb
-  greedy: 0.0
-  mle: 0.0
+  greedy: 1.0
+  mle: 1.0
   smoothed: 0
-  var: 1.0  # penalize forward policy for crowded samples - this and buffer will anneal on expl timescale
+  var: 0.0  # penalize forward policy for crowded samples - this and buffer will anneal on expl timescale
   var_gamma: 0.05  # smaller -> longer range repulsion
   var_cutoff: 2.0  # variance below which to penalize
   buffer: 0.0  # penalize forward policy for sampling near samples already in the buffer
   buffer_gamma: 1.0  # smaller -> longer range repulsion
 bwd_loss_coeffs:
-  tb: 0.0
+  tb: 1.0
   vg_lb: 0.0
-  vg_lme: 1.0 # exclusive with vg_lb
-  mle: 0.0
+  vg_lme: 0.0 # exclusive with vg_lb
+  mle: 1.0
   smoothed: 0
 repeats: 10                   # for conditional VarGrad training
-both_ways: false             # forward and backward training
+both_ways: true             # forward and backward training
 bwd_batch_multiplier: 1      # ratio of backward to foward batch size (much cheaper to evaluate)
 fwd_to_bwd_ratio: 1           # whether to do forward (>1) or backward (<1) training more often
 bwd: False                   # backward training only
 learn_pb: true               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
 learned_variance: true       # whether to learn policy variance
-clipping: true  # clip the maximumstep size induced by the policy model
-gfn_clip: 10.0  # clip the maximumstep size induced by the policy model
+clipping: true  # clip the maximum step size induced by the policy model
+gfn_clip: 20.0  # clip the maximum step size induced by the policy model
 
 # local search settings
 ################################################################
@@ -97,8 +97,8 @@ buffer_size: 50000          # size of replay buffer: relatively large
 ################################################################
 
 # exploration controls
-exploratory: True       # adds variance to optionally learned logvars
-exploration_factor: 1.0  # initial exploration std value
+exploratory: False       # adds variance to optionally learned logvars
+exploration_factor: 0.5  # initial exploration std value
 exploration_wd: True  # decay exploration over time
 wd_max_steps: 5000  # number of steps to terminate the added variance
 

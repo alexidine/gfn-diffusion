@@ -1,5 +1,7 @@
 import gc
 import os
+import sys
+import traceback
 from time import time
 from typing import Optional
 
@@ -18,7 +20,7 @@ from energies.molecular_crystal import MolecularCrystal
 from evaluations import eval_step
 from models import GFN
 from utils import get_train_args, get_gfn_init_state, set_seed, cal_subtb_coef_matrix, \
-    get_gfn_optimizer, get_exploration_std, random_discretizer, low_discrepancy_discretizer, \
+    get_exploration_std, random_discretizer, low_discrepancy_discretizer, \
     low_discrepancy_discretizer2, shifted_equidistant, uniform_discretizer
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 
@@ -491,7 +493,7 @@ def grow_batch_size(buffer, mol_loader):
 
 def handle_train_epoch_error(e, oomed_out, buffer, mol_loader):
     print(f"Caught error: {str(e)}")
-    if ("cuda out of memory" in str(e).lower()
+    if ("cuda" in str(e).lower()
             or "nonzero is not supported for tensors with more than int_max elements" in str(e).lower()):
         print("OOMED!")
         """User note
@@ -499,7 +501,7 @@ def handle_train_epoch_error(e, oomed_out, buffer, mol_loader):
         this method of trying to save it almost never works 
         I'm sorry
         """
-        args.batch_size = handle_oom(args.batch_size)
+        args.batch_size = handle_oom(args.batch_size, e)
 
         mol_loader = DataLoader(
             mol_loader.dataset,
@@ -559,11 +561,16 @@ def log_elapsed_times():
     return elapsed_times
 
 
-def handle_oom(batch_size):
+def handle_oom(batch_size, e):
     #traceback.print_exc()
     # Clear traceback circular references
     #sys.exc_info()
     # manual GC + cache clear
+    traceback.print_exc()
+    sys.exc_info()  # Break circular references from traceback
+    del e
+
+    # Garbage collection
     gc.collect()
     torch.cuda.empty_cache()
     batch_size = int(batch_size * 0.5)
