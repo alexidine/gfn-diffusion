@@ -97,7 +97,7 @@ pb_scale_range: 0.2
 pis_architectures: false
 prioritized: boltzmann
 rank_weight: 1.0
-repeats: 10
+repeats: 20
 repulsion_annealing_max_steps: 5000
 reweight_T: null
 run_name: 1_0.1_1.0_0.1

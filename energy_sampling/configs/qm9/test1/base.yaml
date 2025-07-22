@@ -29,7 +29,7 @@ norm: null                   # null, "layer", "batch"
 batch_size: 5               # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
 max_batch_size: 100           # maximum batch size to allow
-repeats: 10                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
+repeats: 20                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
 eval_batch_size: 1000        # batch size for evaluation
 epochs: 100000             # number of training epochs: relatively large
 eval_period: 500              # how often to do evaluation & reporting

@@ -73,7 +73,7 @@ class MolecularCrystal(BaseSet):
         else:
             cluster_batch = crystal_batch.mol2cluster(cutoff=6,
                                                       supercell_size=8,
-                                                      align_to_standardized_orientation=False if self.molecule_conditioning else True)
+                                                      align_to_standardized_orientation=True)
 
             cluster_batch.construct_radial_graph(cutoff=6,
                                                  max_num_neighbors=100)

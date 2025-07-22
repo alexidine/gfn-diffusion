@@ -732,7 +732,11 @@ def embed_dataset(dataset):
 
         for crystal_batch in tqdm(loader):
             crystal_batch = crystal_batch.to(args.device)
-            crystal_batch.recenter_molecules()
+            # for now, make all the embeddings exactly standardized,
+            # and we'll generate also in the standardized basis
+            crystal_batch.orient_molecule(mode='standardized',
+                                          target_handedness=torch.ones_like(crystal_batch.radius)
+                                          )
             embeddings.append(encoder.encode(crystal_batch).clone().cpu())
             del crystal_batch
 

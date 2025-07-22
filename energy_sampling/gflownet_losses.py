@@ -135,19 +135,21 @@ def get_gfn_forward_loss(loss_coeffs,
     """Variance loss"""
     if loss_coeffs.var > 0:
         states_to_compare = states[:, -1].clip(min=-6, max=6)  # states[:, -1, 3:].clip(min=-6, max=6)
-
+        dimwise_var_cutoff = torch.ones(12, device=states.device) * loss_coeffs.var_cutoff
+        dimwise_var_cutoff[2] /= 5  # be gentle on the c-dimension
         if gfn.conditional_flow_model:
             states_reshaped = states_to_compare.view(repeats, -1, states_to_compare.shape[-1])
 
             # Compute variance within each condition
-            batch_var = states_reshaped.var(dim=1, keepdim=True)  # (repeats, 1, features)
-            var_loss = ((F.relu(-(batch_var - loss_coeffs.var_cutoff)) / loss_coeffs.var_cutoff
-                        )**2).expand(-1, states_reshaped.shape[1], -1).mean(dim=2)  # (repeats, batch_size_per_condition)
+            batch_var = states_reshaped.var(dim=0)  # (repeats, batch, features)
+            # penalize any variant dimensions below the minimum value
+            var_gap = F.relu(dimwise_var_cutoff[None, :] - batch_var) / dimwise_var_cutoff[None, :]
+            var_loss = ((var_gap**2) * F.softmax(var_gap*10, dim=1)).sum(dim=1, keepdim=True).repeat(1, repeats)
 
             # Compute overlap within each condition
             overlap_loss = torch.zeros_like(var_loss)
-            for i in range(repeats):
-                condition_states = states_reshaped[i]
+            for i in range(len(var_loss)):
+                condition_states = states_reshaped[:, i]
                 overlap_loss[i] = compute_sample_overlap(
                     condition_states,
                     condition_states,
@@ -157,9 +159,10 @@ def get_gfn_forward_loss(loss_coeffs,
 
             total_var_loss = (overlap_loss + var_loss).view(-1)
         else:
-            states_to_compare = states[:, -1].clip(min=-6, max=6) #states[:, -1, 3:].clip(min=-6, max=6)
-            batch_var = states_to_compare.var(dim=0, keepdim=True)
-            var_loss = ((F.relu(-(batch_var - loss_coeffs.var_cutoff))/loss_coeffs.var_cutoff)**2).repeat(len(states), 1).mean(dim=1)
+            batch_var = states_to_compare.var(dim=0)  # (batch, features)
+            var_gap = F.relu(dimwise_var_cutoff - batch_var) / dimwise_var_cutoff
+            var_loss = ((var_gap**2) * F.softmax(var_gap*10, dim=0)).sum(dim=0, keepdim=True).repeat(len(states))
+
             overlap_loss = compute_sample_overlap(
                 states_to_compare,  # don't let it escape - it could cheat
                 states_to_compare,  # don't let it escape - it could cheat
