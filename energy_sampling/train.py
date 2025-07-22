@@ -9,6 +9,7 @@ from tqdm import tqdm
 import numpy as np
 import plotly.graph_objects as go
 import torch
+import torch.nn.functional as F
 import wandb
 from mxtaltools.dataset_utils.data_classes import MolData
 from mxtaltools.dataset_utils.utils import collate_data_list
@@ -305,7 +306,9 @@ def train():
                 buffer, train_mol_loader, test_mol_loader = grow_batch_size(buffer, train_mol_loader, test_mol_loader)
 
         except (RuntimeError, ValueError) as e:  # if we do hit OOM, slash the batch size
-            oomed_out, buffer, train_mol_loader, test_mol_loader = handle_train_epoch_error(e, oomed_out, buffer, train_mol_loader, test_mol_loader)
+            oomed_out, buffer, train_mol_loader, test_mol_loader = handle_train_epoch_error(e, oomed_out, buffer,
+                                                                                            train_mol_loader,
+                                                                                            test_mol_loader)
 
         times['train_step_end'] = time()
 
@@ -316,7 +319,7 @@ def train():
 
         elif step_ind % 10 == 0 and step_ind > 9:
             lr_warmup_finished, lr = step_lr_schedule(schedulers, optimizers, lr_warmup_finished)
-            anneal_reward(temp_annealing_lambda, repulsion_annealing_lambda, energy_function, args)
+            anneal_reward(it, temp_annealing_lambda, repulsion_annealing_lambda, energy_function, args)
             anneal_loss(step_ind, var_annealing_factor, buffer_annealing_factor)
             metrics.update({'lr_fwd': optimizers['fwd'].param_groups[0]['lr']})
             metrics.update({'lr_bwd': optimizers['bwd'].param_groups[0]['lr']})
@@ -344,7 +347,7 @@ def get_conditioning_dim():
     return conditioning_dim
 
 
-def anneal_reward(temp_annealing_lambda, repulsion_annealing_lambda, energy_function, args):
+def anneal_reward(it, temp_annealing_lambda, repulsion_annealing_lambda, energy_function, args):
     """anneal reward function"""
     if args.anneal_temperature:
         if args.temperature_conditioning:
@@ -358,13 +361,23 @@ def anneal_reward(temp_annealing_lambda, repulsion_annealing_lambda, energy_func
         if energy_function.lj_repulsion < 1:
             energy_function.lj_repulsion *= repulsion_annealing_lambda
 
+    if args.core_start_time > 0:
+        energy_function.core_coeff = round(
+            args.energy_core_coeff * F.sigmoid(torch.tensor((it - args.core_start_time) / 50)).item(), 2)
+    if args.lj_start_time > 0:
+        energy_function.lj_coeff = round(
+            args.energy_lj_coeff * F.sigmoid(torch.tensor((it - args.lj_start_time) / 50)).item(), 2)
 
-def anneal_loss(it, var_annealing_factor, buffer_annealing_factor):
+
+def anneal_loss(it,
+                var_annealing_factor,
+                buffer_annealing_factor, ):
     """anneal reward function"""
     if it > args.wd_max_steps:
         args.fwd_loss_coeffs.var = 0
     else:
         args.fwd_loss_coeffs.var *= var_annealing_factor
+
     if it > args.wd_max_steps:
         args.fwd_loss_coeffs.buffer = 0
     else:
@@ -586,7 +599,6 @@ def handle_train_epoch_error(e, oomed_out, buffer, train_mol_loader, test_mol_lo
             pin_memory=True,
             drop_last=True,
         )
-
 
         oomed_out = True
         print(f"Reducing batch size to {args.batch_size}")

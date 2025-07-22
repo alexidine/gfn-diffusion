@@ -32,8 +32,8 @@ max_batch_size: 50           # maximum batch size to allow
 repeats: 10                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
 eval_batch_size: 500        # batch size for evaluation
 epochs: 100000             # number of training epochs: relatively large
-eval_period: 25              # how often to do evaluation & reporting
-figs_period: 25             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
+eval_period: 100              # how often to do evaluation & reporting
+figs_period: 100             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # GFlowNet settings
 
@@ -57,7 +57,7 @@ fwd_loss_coeffs:
   smoothed: 0
   var: 10.0  # penalize forward policy for crowded samples - this and buffer will anneal on expl timescale
   var_gamma: 0.02  # smaller -> longer range repulsion
-  var_cutoff: 2.0  # variance below which to penalize
+  var_cutoff: 1.0  # variance below which to penalize
   buffer: 0.0  # penalize forward policy for sampling near samples already in the buffer
   buffer_gamma: 1.0  # smaller -> longer range repulsion
 bwd_loss_coeffs:
@@ -123,8 +123,10 @@ temp_annealing_max_steps: 5000  # time for scaling_factor to reach 1 (uniform sa
 anneal_repulsion: False
 repulsion_annealing_max_steps: 5000
 energy_density_coeff: 2.0  # how much to weight the density penalty term in the energy function
-energy_lj_coeff: 1.0  # loss coefficient
 energy_core_coeff: 10.0  # loss coefficient
+core_start_time: 500  # after how many steps to turn on the core repulsion energy
+energy_lj_coeff: 1.0  # loss coefficient
+lj_start_time: 1000  # after how many steps to turn on the LJ energy
 lj_turnover_pot: 10.0  # value above which molecular LJ potential is softcly clipped
 lj_repulsion: 0.85  # max 1. for values less than 1 the potential becomes more attractive
 ellipsoid_scale: 0.0  # how big in angstroms to pad around the rough minimum bounding ellipsoid, maybe [-1,1]

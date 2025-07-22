@@ -725,14 +725,11 @@ def log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_
     metrics['Mean Sample Reward'] = log_r.mean().cpu().detach().numpy()
     metrics['sample Reward Distribution'] = log_r.cpu().detach().numpy()
     metrics['Crystal Log Temperature'] = log_T_tensor
-    metrics['Crystal Mean Log Temperature'] = condition[:, 0].mean()
-    metrics['Crystal Min Temperature'] = energy_function.min_temperature
-    metrics['Crystal Max Temperature'] = energy_function.max_temperature
-    metrics['Crystal Static Temperature'] = energy_function.temperature
-    metrics['Crystal Repulsion Factor'] = energy_function.lj_repulsion
-    metrics['Ellipsoid Scale'] = energy_function.ellipsoid_scale
-    metrics['Temperature Scaling Factor'] = energy_function.temperature_scaling_factor
-    metrics['Density Loss Coefficient'] = energy_function.density_coeff
+    metrics['Crystal Mean Log Temperature'] = log_T_tensor.mean()
+    for elem in energy_function.__dict__.keys():
+        thing = energy_function.__dict__[elem]
+        if isinstance(thing, float) or isinstance(thing, int):
+            metrics[elem] = thing
 
     lattice_features = ['cell_a', 'cell_b', 'cell_c',
                         'cell_alpha', 'cell_beta', 'cell_gamma',
@@ -743,15 +740,18 @@ def log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_
     metrics['Total Var'] = std_params.var(dim=0).sum().item()
     metrics['Total Mean'] = std_params.mean(dim=0).sum().item()
 
-    eigvals = torch.linalg.svdvals(std_params - std_params.mean(0)) ** 2
+    U, S, Vh = torch.linalg.svd(std_params - std_params.mean(0), full_matrices=False)
+    eigvals = S**2
     explained_var_ratio = eigvals / eigvals.sum()
+    loadings = Vh.T  # shape: (num_features, num_components)
+    contrib_per_feature = (loadings ** 2) @ explained_var_ratio  # shape: (num_features,)
     d_eff = (explained_var_ratio ** 2).sum() ** -1
 
     metrics['Effective Dimension'] = d_eff.item()
     for ind, feat in enumerate(lattice_features):
         metrics[feat + '_mean'] = std_params[:, ind].mean().item()
         metrics[feat + '_var'] = std_params[:, ind].var().item()
-        metrics[feat + '_expl_var_rat'] = explained_var_ratio[ind].item()
+        metrics[feat + '_expl_var_rat'] = contrib_per_feature[ind].item()
 
     cov = torch.cov(std_params.T)  # shape [12, 12]
     volume_proxy = torch.det(cov).clamp_min(1e-12).sqrt().item()
