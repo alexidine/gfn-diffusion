@@ -359,8 +359,13 @@ def report_mem(tag=""):
     print(f"[{tag}] RSS = {psutil.Process(os.getpid()).memory_info().rss / 1e6:.2f} MB")
 
 
-def compute_sample_overlap(ref_x, sample_x, ga: float = 1.0, agg='sum'):
-    if agg=='sum':
-        return torch.exp(-ga * torch.cdist(ref_x, sample_x) ** 2).sum(dim=0)
+def compute_sample_overlap(ref_x, sample_x=None, ga: float = 1.0, agg='sum'):
+    if sample_x is None:
+        d = torch.cdist(ref_x, ref_x) + torch.eye(len(ref_x), device=ref_x.device) * 100
+    else:
+        d = torch.cdist(ref_x, sample_x)
+
+    if agg == 'sum':
+        return torch.exp(-ga * d ** 2).sum(dim=0)
     elif agg == 'mean':
-        return torch.exp(-ga * torch.cdist(ref_x, sample_x) ** 2).mean(dim=0)
+        return torch.exp(-ga * d ** 2).mean(dim=0)

@@ -46,13 +46,14 @@ def get_gfn_forward_loss(loss_coeffs,
                          repeats=10, reweight_T: Optional[float] = None):
     if gfn.conditional_flow_model and any([
         loss_coeffs.var > 0, loss_coeffs.vg_lb > 0,
-        loss_coeffs.vg_lme > 0, loss_coeffs.buffer > 0
+        loss_coeffs.vg_lme > 0, loss_coeffs.buffer > 0,
+        loss_coeffs.overlap > 0
     ]):
         condition = condition.repeat(repeats, 1)
         initial_state = initial_state.repeat(repeats, 1)
         reassign_sgs = False
         log_T_tensor = log_T_tensor.repeat(repeats)
-        if hasattr(mol_batch,'sg_ind'):
+        if hasattr(mol_batch, 'sg_ind'):
             sg_inds = mol_batch.sg_ind.repeat(repeats)
             reassign_sgs = True
         mol_batch = collate_data_list(mol_batch.to_data_list() * repeats)
@@ -143,39 +144,47 @@ def get_gfn_forward_loss(loss_coeffs,
             # Compute variance within each condition
             batch_var = states_reshaped.var(dim=0)  # (repeats, batch, features)
             # penalize any variant dimensions below the minimum value
-            var_gap = F.relu(dimwise_var_cutoff[None, :] - batch_var) / dimwise_var_cutoff[None, :]
-            var_loss = ((var_gap**2) * F.softmax(var_gap*10, dim=1)).sum(dim=1, keepdim=True).repeat(1, repeats)
+            small_var_loss = F.relu(dimwise_var_cutoff[None, :] - batch_var) / dimwise_var_cutoff[None, :]
+            large_var_loss = F.relu(batch_var - 16)  # penalize very high variances
+            var_gap = small_var_loss + large_var_loss
+            var_loss = ((var_gap ** 2) * F.softmax(var_gap, dim=1)).sum(dim=1, keepdim=True).repeat(1, repeats).view(-1)
+        else:
+            batch_var = states_to_compare.var(dim=0)  # (batch, features)
+            small_var_loss = F.relu(dimwise_var_cutoff - batch_var) / dimwise_var_cutoff
+            large_var_loss = F.relu(batch_var - 16)
+            var_gap = small_var_loss + large_var_loss
+            var_loss = ((var_gap ** 2) * F.softmax(var_gap, dim=0)).sum(dim=0, keepdim=True).repeat(len(states))
+
+        losses.append(var_loss * loss_coeffs.var)
+
+    if loss_coeffs.overlap > 0:
+        states_to_compare = states[:, -1].clip(min=-6, max=6)  # states[:, -1, 3:].clip(min=-6, max=6)
+
+        if gfn.conditional_flow_model:
+            states_reshaped = states_to_compare.view(repeats, -1, states_to_compare.shape[-1])
 
             # Compute overlap within each condition
-            overlap_loss = torch.zeros_like(var_loss)
-            for i in range(len(var_loss)):
+            overlap_loss = torch.zeros((len(states) // repeats, repeats), device=states.device)
+            for i in range(len(overlap_loss)):
                 condition_states = states_reshaped[:, i]
                 overlap_loss[i] = compute_sample_overlap(
-                    condition_states,
                     condition_states,
                     ga=loss_coeffs.var_gamma,
                     agg='mean',
                 )
-
-            total_var_loss = (overlap_loss + var_loss).view(-1)
+            overlap_loss = overlap_loss.view(-1)
         else:
-            batch_var = states_to_compare.var(dim=0)  # (batch, features)
-            var_gap = F.relu(dimwise_var_cutoff - batch_var) / dimwise_var_cutoff
-            var_loss = ((var_gap**2) * F.softmax(var_gap*10, dim=0)).sum(dim=0, keepdim=True).repeat(len(states))
-
             overlap_loss = compute_sample_overlap(
-                states_to_compare,  # don't let it escape - it could cheat
                 states_to_compare,  # don't let it escape - it could cheat
                 ga=loss_coeffs.var_gamma,
                 agg='mean',
             )
-            total_var_loss = overlap_loss + var_loss
-        losses.append(total_var_loss * loss_coeffs.var)
+        losses.append(overlap_loss * loss_coeffs.overlap)
 
     """Buffer distance loss"""
     if loss_coeffs.buffer > 0:
         assert not gfn.conditional_flow_model, "Buffer loss not yet set up for conditional sampling"
-        states_to_compare = states[:, -1].clip(min=-6, max=6) #states[:, -1, 3:].clip(min=-6, max=6)
+        states_to_compare = states[:, -1].clip(min=-6, max=6)  #states[:, -1, 3:].clip(min=-6, max=6)
         buffer_states = torch.stack(buffer.x_list).to(gfn.device)
         buffer_to_compare = buffer_states[:, -1, 3:].clip(min=-6, max=6)
         buffer_loss = compute_sample_overlap(
@@ -275,7 +284,6 @@ def get_gfn_backward_loss(loss_coeffs,
         return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
     else:
         return loss
-
 
 #
 # def fwd_combo(initial_state, gfn, log_reward_fn, discretizer, mol_batch,
@@ -747,4 +755,3 @@ def get_gfn_backward_loss(loss_coeffs,
 #         loss = losses.mean()
 #
 #     return loss, *rest
-

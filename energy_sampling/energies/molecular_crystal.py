@@ -92,7 +92,7 @@ class MolecularCrystal(BaseSet):
                 surface_padding=self.ellipsoid_scale,
                 model=self.ellipsoid_model,
                 return_details=True)
-            ellipsoid_overlap = normed_ellipsoid_overlap.flatten().detach()  # don't packprop through this, it's unstable
+            ellipsoid_overlap = normed_ellipsoid_overlap.flatten()
         else:
             ellipsoid_overlap = torch.zeros_like(silu_energy)
 

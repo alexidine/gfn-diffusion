@@ -106,7 +106,7 @@ class CrystalReplayBuffer:
         scores = np.array(self.rewards_list)
         if diversity_coeff > 0:
             x_tensor = torch.stack(self.x_list).to('cuda' if self.gpu_available else 'cpu')
-            scores -= diversity_coeff * (compute_sample_overlap(x_tensor, x_tensor) - 1).cpu().detach().numpy()  # subtract self contribution
+            scores -= diversity_coeff * (compute_sample_overlap(x_tensor) - 1).cpu().detach().numpy()  # subtract self contribution
 
         if self.prioritized == 'rank':
             ranks = np.argsort(np.argsort(-1 * scores))

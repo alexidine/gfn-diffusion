@@ -1,0 +1,99 @@
+defaults:
+  base: base.yaml
+
+experiments:
+- tag: 0_1.0_1.0_0.01
+  update:
+    fwd_loss_coeffs:
+      greedy: 1.0
+      var: 1.0
+      overlap: 1.0
+      var_gamma: 0.01
+
+- tag: 1_1.0_10.0_0.01
+  update:
+    fwd_loss_coeffs:
+      greedy: 1.0
+      var: 1.0
+      overlap: 10.0
+      var_gamma: 0.01
+
+- tag: 2_10.0_1.0_0.01
+  update:
+    fwd_loss_coeffs:
+      greedy: 1.0
+      var: 10.0
+      overlap: 1.0
+      var_gamma: 0.01
+
+- tag: 3_10.0_10.0_0.01
+  update:
+    fwd_loss_coeffs:
+      greedy: 1.0
+      var: 10.0
+      overlap: 10.0
+      var_gamma: 0.01
+
+- tag: 4_1.0_1.0_0.1
+  update:
+    fwd_loss_coeffs:
+      greedy: 1.0
+      var: 1.0
+      overlap: 1.0
+      var_gamma: 0.1
+
+- tag: 5_1.0_10.0_0.1
+  update:
+    fwd_loss_coeffs:
+      greedy: 1.0
+      var: 1.0
+      overlap: 10.0
+      var_gamma: 0.1
+
+- tag: 6_10.0_1.0_0.1
+  update:
+    fwd_loss_coeffs:
+      greedy: 1.0
+      var: 10.0
+      overlap: 1.0
+      var_gamma: 0.1
+
+- tag: 7_10.0_10.0_0.1
+  update:
+    fwd_loss_coeffs:
+      greedy: 1.0
+      var: 10.0
+      overlap: 10.0
+      var_gamma: 0.1
+
+- tag: 8_5.0_5.0_0.01
+  update:
+    fwd_loss_coeffs:
+      greedy: 1.0
+      var: 5.0
+      overlap: 5.0
+      var_gamma: 0.01
+
+- tag: 9_5.0_5.0_0.1
+  update:
+    fwd_loss_coeffs:
+      greedy: 1.0
+      var: 5.0
+      overlap: 5.0
+      var_gamma: 0.1
+
+- tag: 10_5.0_1.0_0.05
+  update:
+    fwd_loss_coeffs:
+      greedy: 1.0
+      var: 5.0
+      overlap: 1.0
+      var_gamma: 0.05
+
+- tag: 11_1.0_5.0_0.05
+  update:
+    fwd_loss_coeffs:
+      greedy: 1.0
+      var: 1.0
+      overlap: 5.0
+      var_gamma: 0.05

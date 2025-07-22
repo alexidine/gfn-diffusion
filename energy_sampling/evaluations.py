@@ -729,7 +729,7 @@ def log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_
     for elem in energy_function.__dict__.keys():
         thing = energy_function.__dict__[elem]
         if isinstance(thing, float) or isinstance(thing, int):
-            metrics[elem] = thing
+            metrics['energy_func/' + elem] = thing
 
     lattice_features = ['cell_a', 'cell_b', 'cell_c',
                         'cell_alpha', 'cell_beta', 'cell_gamma',

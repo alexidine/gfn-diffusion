@@ -319,7 +319,7 @@ def train():
 
         elif step_ind % 10 == 0 and step_ind > 9:
             lr_warmup_finished, lr = step_lr_schedule(schedulers, optimizers, lr_warmup_finished)
-            anneal_reward(it, temp_annealing_lambda, repulsion_annealing_lambda, energy_function, args)
+            anneal_reward(step_ind, temp_annealing_lambda, repulsion_annealing_lambda, energy_function, args)
             anneal_loss(step_ind, var_annealing_factor, buffer_annealing_factor)
             metrics.update({'lr_fwd': optimizers['fwd'].param_groups[0]['lr']})
             metrics.update({'lr_bwd': optimizers['bwd'].param_groups[0]['lr']})
@@ -333,7 +333,7 @@ def train():
             torch.cuda.empty_cache()
             gc.collect()
 
-    torch.save(gfn_model.state_dict(), f'{name}_model_final.pt')
+    torch.save(gfn_model, f'{name}_model_final.pt')
 
 
 def get_conditioning_dim():
@@ -375,8 +375,10 @@ def anneal_loss(it,
     """anneal reward function"""
     if it > args.wd_max_steps:
         args.fwd_loss_coeffs.var = 0
+        args.fwd_loss_coeffs.overlap = 0
     else:
         args.fwd_loss_coeffs.var *= var_annealing_factor
+        args.fwd_loss_coeffs.overlap *= var_annealing_factor
 
     if it > args.wd_max_steps:
         args.fwd_loss_coeffs.buffer = 0
@@ -526,8 +528,8 @@ def init_buffers_datasets(energy_function):
         assert False
 
     if args.molecule_conditioning:
-        train_mols_list = embed_dataset(train_mols_list)
-        test_mols_list = embed_dataset(test_mols_list)
+        train_mols_list = embed_dataset(train_mols_list, args.autoencoder_path, args.device, encoder=None)
+        test_mols_list = embed_dataset(test_mols_list, args.autoencoder_path, args.device, encoder=None)
 
     train_mol_loader = DataLoader(
         train_mols_list,
@@ -677,7 +679,7 @@ def add_dataset_to_buffer(dataset_path, buffer):
 
     if args.molecule_conditioning:  # embed dataset
         print("Getting preloaded dataset molecule embeddings")
-        dataset = embed_dataset(dataset)
+        dataset = embed_dataset(dataset, args.autoencoder_path, args.device, encoder=None)
 
     buffer.add(dataset)
     print(f"Buffer loaded with {len(dataset)} samples")
@@ -730,7 +732,7 @@ def featurize_dataset(dataset):
     return dataset
 
 
-def embed_dataset(dataset):
+def embed_dataset(dataset, autoencoder_path=None, device=None, encoder=None):
     batch_size = 500
     loader = DataLoader(
         dataset,
@@ -738,7 +740,8 @@ def embed_dataset(dataset):
         drop_last=False
     )
     with torch.no_grad():
-        encoder = load_encoder(args.autoencoder_path).to(args.device).eval()
+        if encoder is None:
+            encoder = load_encoder(autoencoder_path).to(device).eval()
 
         embeddings = []
 
