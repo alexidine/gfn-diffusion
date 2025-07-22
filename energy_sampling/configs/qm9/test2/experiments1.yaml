@@ -1,0 +1,87 @@
+defaults:
+  base: base.yaml
+
+experiments:
+- tag: 0_0.1_1.0_0.01
+  update:
+    fwd_loss_coeffs:
+      greedy: 0.1
+      var: 1.0
+      var_gamma: 0.01
+
+- tag: 1_0.1_1.0_0.1
+  update:
+    fwd_loss_coeffs:
+      greedy: 0.1
+      var: 1.0
+      var_gamma: 0.1
+
+- tag: 2_0.1_10.0_0.01
+  update:
+    fwd_loss_coeffs:
+      greedy: 0.1
+      var: 10.0
+      var_gamma: 0.01
+
+- tag: 3_0.1_10.0_0.1
+  update:
+    fwd_loss_coeffs:
+      greedy: 0.1
+      var: 10.0
+      var_gamma: 0.1
+
+- tag: 4_1.0_1.0_0.01
+  update:
+    fwd_loss_coeffs:
+      greedy: 1.0
+      var: 1.0
+      var_gamma: 0.01
+
+- tag: 5_1.0_1.0_0.1
+  update:
+    fwd_loss_coeffs:
+      greedy: 1.0
+      var: 1.0
+      var_gamma: 0.1
+
+- tag: 6_1.0_10.0_0.01
+  update:
+    fwd_loss_coeffs:
+      greedy: 1.0
+      var: 10.0
+      var_gamma: 0.01
+
+- tag: 7_1.0_10.0_0.1
+  update:
+    fwd_loss_coeffs:
+      greedy: 1.0
+      var: 10.0
+      var_gamma: 0.1
+
+- tag: 8_10.0_1.0_0.01
+  update:
+    fwd_loss_coeffs:
+      greedy: 10.0
+      var: 1.0
+      var_gamma: 0.01
+
+- tag: 9_10.0_1.0_0.1
+  update:
+    fwd_loss_coeffs:
+      greedy: 10.0
+      var: 1.0
+      var_gamma: 0.1
+
+- tag: 10_10.0_10.0_0.01
+  update:
+    fwd_loss_coeffs:
+      greedy: 10.0
+      var: 10.0
+      var_gamma: 0.01
+
+- tag: 11_10.0_10.0_0.1
+  update:
+    fwd_loss_coeffs:
+      greedy: 10.0
+      var: 10.0
+      var_gamma: 0.1

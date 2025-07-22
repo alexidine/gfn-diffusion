@@ -1,0 +1,60 @@
+- index: 0
+  tag: 0_0.1_1.0_0.01
+  update_keys:
+  - fwd_loss_coeffs
+  notes: ''
+- index: 1
+  tag: 1_0.1_1.0_0.1
+  update_keys:
+  - fwd_loss_coeffs
+  notes: ''
+- index: 2
+  tag: 2_0.1_10.0_0.01
+  update_keys:
+  - fwd_loss_coeffs
+  notes: ''
+- index: 3
+  tag: 3_0.1_10.0_0.1
+  update_keys:
+  - fwd_loss_coeffs
+  notes: ''
+- index: 4
+  tag: 4_1.0_1.0_0.01
+  update_keys:
+  - fwd_loss_coeffs
+  notes: ''
+- index: 5
+  tag: 5_1.0_1.0_0.1
+  update_keys:
+  - fwd_loss_coeffs
+  notes: ''
+- index: 6
+  tag: 6_1.0_10.0_0.01
+  update_keys:
+  - fwd_loss_coeffs
+  notes: ''
+- index: 7
+  tag: 7_1.0_10.0_0.1
+  update_keys:
+  - fwd_loss_coeffs
+  notes: ''
+- index: 8
+  tag: 8_10.0_1.0_0.01
+  update_keys:
+  - fwd_loss_coeffs
+  notes: ''
+- index: 9
+  tag: 9_10.0_1.0_0.1
+  update_keys:
+  - fwd_loss_coeffs
+  notes: ''
+- index: 10
+  tag: 10_10.0_10.0_0.01
+  update_keys:
+  - fwd_loss_coeffs
+  notes: ''
+- index: 11
+  tag: 11_10.0_10.0_0.1
+  update_keys:
+  - fwd_loss_coeffs
+  notes: ''
