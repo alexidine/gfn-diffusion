@@ -369,3 +369,9 @@ def compute_sample_overlap(ref_x, sample_x=None, ga: float = 1.0, agg='sum'):
         return torch.exp(-ga * d ** 2).sum(dim=0)
     elif agg == 'mean':
         return torch.exp(-ga * d ** 2).mean(dim=0)
+
+def smoothstep(x, t, delta):
+    if not torch.is_tensor(x):
+        x = torch.tensor([x])
+    x_clipped = torch.clamp((x - t) / delta, 0.0, 1.0)
+    return float(x_clipped**2 * (3 - 2 * x_clipped))  # smoothstep polynomial

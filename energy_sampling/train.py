@@ -2,30 +2,31 @@ import gc
 import os
 import sys
 import traceback
+from copy import deepcopy
 from time import time
 from typing import Optional
-from tqdm import tqdm
 
 import numpy as np
 import plotly.graph_objects as go
 import torch
 import torch.nn.functional as F
 import wandb
-from mxtaltools.dataset_utils.data_classes import MolData
-from mxtaltools.dataset_utils.utils import collate_data_list
 from torch.optim import lr_scheduler
 from torch_geometric.loader import DataLoader
-from tqdm import trange
+from tqdm import tqdm, trange
 
 from buffer import CrystalReplayBuffer
 from energies.molecular_crystal import MolecularCrystal
 from evaluations import eval_step
-from models import GFN
-from mxtaltools.models.utils import load_encoder
-from utils import get_train_args, get_gfn_init_state, set_seed, cal_subtb_coef_matrix, \
-    get_exploration_std, random_discretizer, low_discrepancy_discretizer, \
-    low_discrepancy_discretizer2, shifted_equidistant, uniform_discretizer
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
+from models import GFN
+from mxtaltools.common.training_utils import flatten_wandb_params
+from mxtaltools.dataset_utils.data_classes import MolData
+from mxtaltools.dataset_utils.utils import collate_data_list
+from mxtaltools.models.utils import load_encoder
+from utils import get_train_args, get_gfn_init_state, set_seed, \
+    get_exploration_std, random_discretizer, low_discrepancy_discretizer, \
+    low_discrepancy_discretizer2, shifted_equidistant, uniform_discretizer, smoothstep
 
 args = get_train_args()
 
@@ -34,13 +35,9 @@ if 'SLURM_PROCID' in os.environ:
     args.seed += int(os.environ["SLURM_PROCID"])
 
 device = args.device
-coeff_matrix = cal_subtb_coef_matrix(args.subtb_lambda, args.T).to(device)
 
 if args.both_ways and args.bwd:
     args.bwd = False
-
-if args.local_search:
-    args.both_ways = True
 
 times = {}
 
@@ -226,7 +223,7 @@ def train():
     config = args.__dict__
     config["Experiment"] = "{args.energy}"
     wandb.init(project="GFN Energy",
-               config=config,
+               config=flatten_wandb_params(args),
                name=name,
                tags=[args.tag])
 
@@ -235,7 +232,7 @@ def train():
                     args.hidden_dim,
                     get_conditioning_dim(),
                     args.harmonics_dim,
-                    args.t_emb_dim, args.bwd_policy, condition_embedding_dim=args.condition_emb_dim,
+                    args.t_emb_dim, condition_embedding_dim=args.condition_emb_dim,
                     trajectory_length=args.T, clipping=args.clipping,
                     gfn_clip=args.gfn_clip,
                     learned_variance=args.learned_variance,
@@ -248,7 +245,6 @@ def train():
                         args.sg_conditioning]
                     ),
                     learn_pb=args.learn_pb,
-                    lgv_layers=args.lgv_layers,
                     joint_layers=args.joint_layers, dropout=args.dropout, norm=args.norm,
                     zero_init=args.zero_init, device=device).to(device)
 
@@ -317,10 +313,13 @@ def train():
             metrics = do_evaluation(energy_function, buffer, gfn_model, step_ind, metrics, test_mol_loader)
             wandb.log(metrics, step=step_ind)
 
-        elif step_ind % 10 == 0 and step_ind > 9:
+        elif step_ind % 10 == 0:
             lr_warmup_finished, lr = step_lr_schedule(schedulers, optimizers, lr_warmup_finished)
             anneal_reward(step_ind, temp_annealing_lambda, repulsion_annealing_lambda, energy_function, args)
-            anneal_loss(step_ind, var_annealing_factor, buffer_annealing_factor)
+            anneal_loss(step_ind,
+                        var_annealing_factor,
+                        buffer_annealing_factor,
+                        args)
             metrics.update({'lr_fwd': optimizers['fwd'].param_groups[0]['lr']})
             metrics.update({'lr_bwd': optimizers['bwd'].param_groups[0]['lr']})
             metrics.update({'lr_flow': optimizers['flow'].param_groups[0]['lr']})
@@ -371,7 +370,8 @@ def anneal_reward(it, temp_annealing_lambda, repulsion_annealing_lambda, energy_
 
 def anneal_loss(it,
                 var_annealing_factor,
-                buffer_annealing_factor, ):
+                buffer_annealing_factor,
+                args):
     """anneal reward function"""
     if it > args.wd_max_steps:
         args.fwd_loss_coeffs.var = 0
@@ -384,6 +384,49 @@ def anneal_loss(it,
         args.fwd_loss_coeffs.buffer = 0
     else:
         args.fwd_loss_coeffs.buffer *= buffer_annealing_factor
+
+    if args.do_e3_schedule:
+        if not hasattr(args, 'orig_loss_coeffs'):
+            args.orig_loss_coeffs = [deepcopy(args.fwd_loss_coeffs), deepcopy(args.bwd_loss_coeffs)]
+            args.bwd_loss_coeffs.mle_prior_fraction = 1
+
+        if it < args.e2_time:
+            # exploration: fwd greedy + MLE, bwd prior MLE
+            args.fwd_loss_coeffs.tb = 0
+            args.fwd_loss_coeffs.vg_lb = 0
+            args.fwd_loss_coeffs.vg_lme = 0
+            args.bwd_loss_coeffs.tb = 0
+            args.bwd_loss_coeffs.vg_lb = 0
+            args.bwd_loss_coeffs.vg_lme = 0
+            args.bwd_loss_coeffs.mle_prior_fraction -= (1/args.e2_time)
+
+        if args.e2_time < it < args.e3_time:
+            # equilibration: fwd TB or VarGrad, bwd buffer MLE + TB or VarGrad
+            args.fwd_loss_coeffs.greedy = 0
+            args.bwd_loss_coeffs.mle_prior_fraction = 0
+
+            scaling_factor = smoothstep(it, args.e2_time, 50)
+            args.fwd_loss_coeffs.tb = scaling_factor * args.orig_loss_coeffs[0].tb
+            args.fwd_loss_coeffs.vg_lb = scaling_factor * args.orig_loss_coeffs[0].vg_lb
+            args.fwd_loss_coeffs.vg_lme = scaling_factor * args.orig_loss_coeffs[0].vg_lme
+            args.bwd_loss_coeffs.tb = scaling_factor * args.orig_loss_coeffs[1].tb
+            args.bwd_loss_coeffs.vg_lb = scaling_factor * args.orig_loss_coeffs[1].vg_lb
+            args.bwd_loss_coeffs.vg_lme = scaling_factor * args.orig_loss_coeffs[1].vg_lme
+
+        if it > args.e3_time:
+            # exploitation: terminal greedy
+            args.fwd_loss_coeffs.tb = 0
+            args.fwd_loss_coeffs.vg_lb = 0
+            args.fwd_loss_coeffs.vg_lme = 0
+            args.bwd_loss_coeffs.tb = 0
+            args.bwd_loss_coeffs.vg_lb = 0
+            args.bwd_loss_coeffs.vg_lme = 0
+            args.fwd_loss_coeffs.mle = 0.1
+            args.bwd_loss_coeffs.mle = 0.1
+
+            scaling_factor = smoothstep(it, args.e3_time, 50)
+            args.fwd_loss_coeffs.greedy = scaling_factor * args.orig_loss_coeffs[0].greedy
+            args.fwd_loss_coeffs.detach_after = 1
 
 
 def step_lr_schedule(schedulers, optimizers,
@@ -627,6 +670,7 @@ def do_evaluation(energy_function, buffer, gfn_model, i, metrics, test_mol_loade
                   eval_discretizer,
                   init_state,
                   buffer,
+                  args,
                   do_figures,
                   mol_batch,
                   bwd_training=len(buffer) > 0,

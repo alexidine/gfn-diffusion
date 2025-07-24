@@ -75,6 +75,7 @@ def eval_step(energy_function,
               discretizer,
               init_state,
               buffer,
+              args,
               do_figures: bool = True,
               mol_batch=None,
               bwd_training: bool = False,
@@ -87,8 +88,8 @@ def eval_step(energy_function,
      log_T_tensor) = log_partition_function(
         init_state, gfn_model, discretizer, energy_function, mol_batch)
 
-    metrics = log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_Z_learned, log_r,
-                                         sample_batch, log_T_tensor, buffer)
+    metrics = log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, log_r,
+                                         sample_batch, log_T_tensor, args, buffer)
 
     if add_to_buffer:
         buffer.add(sample_batch.detach().cpu().to_data_list())  # add evaluation samples to buffer
@@ -710,8 +711,8 @@ def mean_flow_step_sizes(flow_states):
     return fig
 
 
-def log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_Z_learned, log_r,
-                               sample_batch, log_T_tensor, buffer=None):
+def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, log_r,
+                               sample_batch, log_T_tensor, args, buffer=None):
     """Scalar / distribution metrics"""
     metrics = {}
     metrics['Empirical log Z'] = log_Z.cpu().detach().numpy()
@@ -731,14 +732,25 @@ def log_eval_scalars_and_dists(condition, energy_function, log_Z, log_Z_lb, log_
         if isinstance(thing, float) or isinstance(thing, int):
             metrics['energy_func/' + elem] = thing
 
+    for elem in args.fwd_loss_coeffs.__dict__.keys():
+        thing = args.fwd_loss_coeffs.__dict__[elem]
+        if isinstance(thing, float) or isinstance(thing, int):
+            metrics['loss_coeffs/' + 'fwd_' + elem] = thing
+
+    for elem in args.bwd_loss_coeffs.__dict__.keys():
+        thing = args.bwd_loss_coeffs.__dict__[elem]
+        if isinstance(thing, float) or isinstance(thing, int):
+            metrics['loss_coeffs/' + 'bwd_' + elem] = thing
+
+
     lattice_features = ['cell_a', 'cell_b', 'cell_c',
                         'cell_alpha', 'cell_beta', 'cell_gamma',
                         'aunit_x', 'aunit_y', 'aunit_z',
                         'orientation_1', 'orientation_2', 'orientation_3']
     std_params = sample_batch.cell_params_to_gen_basis()
 
-    metrics['Total Var'] = std_params.var(dim=0).sum().item()
-    metrics['Total Mean'] = std_params.mean(dim=0).sum().item()
+    metrics['Total Var'] = std_params.var(dim=0).mean().item()
+    metrics['Total Mean'] = std_params.mean(dim=0).mean().item()
 
     U, S, Vh = torch.linalg.svd(std_params - std_params.mean(0), full_matrices=False)
     eigvals = S**2

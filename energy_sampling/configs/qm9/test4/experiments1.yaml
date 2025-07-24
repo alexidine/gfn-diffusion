@@ -1,0 +1,179 @@
+defaults:
+  base: base.yaml
+
+experiments:
+- tag: 0_baseline
+  update:
+    joint_layers: 8
+    dropout: 0
+    norm: null
+    t_scale: 0.1
+    pb_scale_range: 0.2
+    e2_time: 2000
+    e3_time: 5000
+    fwd_loss_coeffs:
+      mle: 1.0
+      greedy: 1.0
+    bwd_loss_coeffs:
+      mle: 10.0
+      pmle_std: 4.0
+
+- tag: 1_fewer-layers
+  update:
+    joint_layers: 4
+    dropout: 0
+    norm: null
+    t_scale: 0.1
+    pb_scale_range: 0.2
+    e2_time: 2000
+    e3_time: 5000
+    fwd_loss_coeffs:
+      mle: 1.0
+      greedy: 1.0
+    bwd_loss_coeffs:
+      mle: 10.0
+      pmle_std: 4.0
+
+- tag: 2_more-layers
+  update:
+    joint_layers: 12
+    dropout: 0
+    norm: null
+    t_scale: 0.1
+    pb_scale_range: 0.2
+    e2_time: 2000
+    e3_time: 5000
+    fwd_loss_coeffs:
+      mle: 1.0
+      greedy: 1.0
+    bwd_loss_coeffs:
+      mle: 10.0
+      pmle_std: 4.0
+
+- tag: 3_with-dropout
+  update:
+    joint_layers: 8
+    dropout: 0.5
+    norm: null
+    t_scale: 0.1
+    pb_scale_range: 0.2
+    e2_time: 2000
+    e3_time: 5000
+    fwd_loss_coeffs:
+      mle: 1.0
+      greedy: 1.0
+    bwd_loss_coeffs:
+      mle: 10.0
+      pmle_std: 4.0
+
+- tag: 4_with-norm
+  update:
+    joint_layers: 8
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    pb_scale_range: 0.2
+    e2_time: 2000
+    e3_time: 5000
+    fwd_loss_coeffs:
+      mle: 1.0
+      greedy: 1.0
+    bwd_loss_coeffs:
+      mle: 10.0
+      pmle_std: 4.0
+
+- tag: 5_tscale-small
+  update:
+    joint_layers: 8
+    dropout: 0
+    norm: null
+    t_scale: 0.02
+    pb_scale_range: 0.2
+    e2_time: 2000
+    e3_time: 5000
+    fwd_loss_coeffs:
+      mle: 1.0
+      greedy: 1.0
+    bwd_loss_coeffs:
+      mle: 10.0
+      pmle_std: 4.0
+
+- tag: 6_pbscale-wide
+  update:
+    joint_layers: 8
+    dropout: 0
+    norm: null
+    t_scale: 0.1
+    pb_scale_range: 0.5
+    e2_time: 2000
+    e3_time: 5000
+    fwd_loss_coeffs:
+      mle: 1.0
+      greedy: 1.0
+    bwd_loss_coeffs:
+      mle: 10.0
+      pmle_std: 4.0
+
+- tag: 7_mle-high
+  update:
+    joint_layers: 8
+    dropout: 0
+    norm: null
+    t_scale: 0.1
+    pb_scale_range: 0.2
+    e2_time: 2000
+    e3_time: 5000
+    fwd_loss_coeffs:
+      mle: 5.0
+      greedy: 1.0
+    bwd_loss_coeffs:
+      mle: 10.0
+      pmle_std: 4.0
+
+- tag: 8_pmle-high
+  update:
+    joint_layers: 8
+    dropout: 0
+    norm: null
+    t_scale: 0.1
+    pb_scale_range: 0.2
+    e2_time: 2000
+    e3_time: 5000
+    fwd_loss_coeffs:
+      mle: 1.0
+      greedy: 1.0
+    bwd_loss_coeffs:
+      mle: 10.0
+      pmle_std: 6.0
+
+- tag: 9_pmle-low
+  update:
+    joint_layers: 8
+    dropout: 0
+    norm: null
+    t_scale: 0.1
+    pb_scale_range: 0.2
+    e2_time: 2000
+    e3_time: 5000
+    fwd_loss_coeffs:
+      mle: 1.0
+      greedy: 1.0
+    bwd_loss_coeffs:
+      mle: 10.0
+      pmle_std: 2.0
+
+- tag: 10_small_bmle
+  update:
+    joint_layers: 8
+    dropout: 0
+    norm: null
+    t_scale: 0.1
+    pb_scale_range: 0.2
+    e2_time: 2000
+    e3_time: 5000
+    fwd_loss_coeffs:
+      mle: 1.0
+      greedy: 1.0
+    bwd_loss_coeffs:
+      mle: 1.0
+      pmle_std: 4.0

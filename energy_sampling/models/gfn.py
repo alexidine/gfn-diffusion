@@ -15,14 +15,14 @@ logtwopi = math.log(2 * math.pi)
 
 class GFN(nn.Module):
     def __init__(self, dim: int, s_emb_dim: int, hidden_dim: int, conditions_dim: int,
-                 harmonics_dim: int, t_dim: int, bwd_policy: str, log_var_range: float = 4.,
+                 harmonics_dim: int, t_dim: int, log_var_range: float = 4.,
                  t_scale: float = 1., learned_variance: bool = True,
                  trajectory_length: int = 100,
                  condition_embedding_dim: int = 32,
                  clipping: bool = False,
                  gfn_clip: float = 1e4, pb_scale_range: float = 1.,
                  conditional_flow_model: bool = False,
-                 learn_pb: bool = False, lgv_layers: int = 3, joint_layers: int = 2,
+                 learn_pb: bool = False, joint_layers: int = 2,
                  dropout: Optional[float] = 0, norm: Optional[str] = None,
                  zero_init: bool = False, device=torch.device('cuda')):
         super(GFN, self).__init__()
@@ -41,9 +41,7 @@ class GFN(nn.Module):
         self.conditional_flow_model = conditional_flow_model
         self.learn_pb = learn_pb
 
-        self.lgv_layers = lgv_layers
         self.joint_layers = joint_layers
-        self.bwd_policy = bwd_policy
 
         self.pf_std_per_traj = np.sqrt(self.t_scale)
         self.dt = 1. / trajectory_length
