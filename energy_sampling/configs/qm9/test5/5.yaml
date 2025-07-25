@@ -12,7 +12,8 @@ buffer_size: 50000
 bwd: false
 bwd_batch_multiplier: 1
 bwd_loss_coeffs:
-  mle: 10.0
+  emp_z: 1.0
+  mle: 1.0
   mle_prior_fraction: 1
   pmle_std: 4
   smoothed: 0
@@ -27,8 +28,8 @@ discretizer: random
 discretizer_max_ratio: 10
 do_e3_schedule: true
 dropout: 0
-e2_time: 2000
-e3_time: 5000
+e2_time: 10000
+e3_time: 20000
 ellipsoid_scale: 0.0
 energy: molecular_crystal
 energy_clip: 1000
@@ -51,7 +52,8 @@ fwd_loss_coeffs:
   buffer: 0.0
   buffer_gamma: 1.0
   detach_after: 0
-  greedy: 1.0
+  emp_z: 1.0
+  greedy: 10.0
   mle: 1.0
   overlap: 0.0
   smoothed: 0
@@ -74,7 +76,7 @@ lj_repulsion: 0.85
 lj_start_time: 200
 lj_turnover_pot: 10.0
 log_var_range: 10
-lr_anneal_time: 10000
+lr_anneal_time: 20000
 lr_back: 0.0001
 lr_flow: 0.1
 lr_policy: 0.0001
@@ -109,7 +111,7 @@ space_groups:
 - 19
 t_emb_dim: 32
 t_scale: 0.05
-tag: qm9_test4
+tag: qm9_test5
 temp_annealing_max_steps: 5000
 temperature_conditioning: false
 temperature_scaling_factor: 0.01
