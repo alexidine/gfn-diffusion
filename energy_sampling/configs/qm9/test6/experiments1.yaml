@@ -1,0 +1,186 @@
+defaults:
+  base: base.yaml
+
+mode: oneoffs  # or 'grid'
+
+experiments:
+- tag: 0_baseline
+  update:
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: null
+    t_scale: 0.1
+    pb_scale_range: 0.5
+    fwd_loss_coeffs:
+      greedy: 1.0
+      mle: 1.0
+    bwd_loss_coeffs:
+      mle: 1.0
+      mle_prior_fraction: 0.5
+
+- tag: 1_big_greedy
+  update:
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: null
+    t_scale: 0.1
+    pb_scale_range: 0.5
+    fwd_loss_coeffs:
+      greedy: 10.0
+      mle: 1.0
+    bwd_loss_coeffs:
+      mle: 1.0
+      mle_prior_fraction: 0.5
+
+- tag: 2_very_big_greedy
+  update:
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: null
+    t_scale: 0.1
+    pb_scale_range: 0.5
+    fwd_loss_coeffs:
+      greedy: 100.0
+      mle: 1.0
+    bwd_loss_coeffs:
+      mle: 1.0
+      mle_prior_fraction: 0.5
+
+- tag: 3_low_fwd_mle
+  update:
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: null
+    t_scale: 0.1
+    pb_scale_range: 0.5
+    fwd_loss_coeffs:
+      greedy: 1.0
+      mle: 0.1
+    bwd_loss_coeffs:
+      mle: 1.0
+      mle_prior_fraction: 0.5
+
+- tag: 4_high_fwd_mle
+  update:
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: null
+    t_scale: 0.1
+    pb_scale_range: 0.5
+    fwd_loss_coeffs:
+      greedy: 1.0
+      mle: 10.0
+    bwd_loss_coeffs:
+      mle: 1.0
+      mle_prior_fraction: 0.5
+
+- tag: 5_low_bwd_mle
+  update:
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: null
+    t_scale: 0.1
+    pb_scale_range: 0.5
+    fwd_loss_coeffs:
+      greedy: 1.0
+      mle: 1.0
+    bwd_loss_coeffs:
+      mle: 0.1
+      mle_prior_fraction: 0.5
+
+- tag: 6_high_bwd_mle
+  update:
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: null
+    t_scale: 0.1
+    pb_scale_range: 0.5
+    fwd_loss_coeffs:
+      greedy: 1.0
+      mle: 1.0
+    bwd_loss_coeffs:
+      mle: 10.0
+      mle_prior_fraction: 0.5
+
+- tag: 7_low_prior_frac
+  update:
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: null
+    t_scale: 0.1
+    pb_scale_range: 0.5
+    fwd_loss_coeffs:
+      greedy: 1.0
+      mle: 1.0
+    bwd_loss_coeffs:
+      mle: 1.0
+      mle_prior_fraction: 0.1
+
+- tag: 8_high_prior_frac
+  update:
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: null
+    t_scale: 0.1
+    pb_scale_range: 0.5
+    fwd_loss_coeffs:
+      greedy: 1.0
+      mle: 1.0
+    bwd_loss_coeffs:
+      mle: 1.0
+      mle_prior_fraction: 0.9
+
+- tag: 9_mk1
+  update:
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: null
+    t_scale: 0.1
+    pb_scale_range: 0.5
+    fwd_loss_coeffs:
+      greedy: 10.0
+      mle: 10.0
+    bwd_loss_coeffs:
+      mle: 0.1
+      mle_prior_fraction: 0.5
+
+- tag: 10_high_pb
+  update:
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: null
+    t_scale: 0.1
+    pb_scale_range: 0.75
+    fwd_loss_coeffs:
+      greedy: 1.0
+      mle: 1.0
+    bwd_loss_coeffs:
+      mle: 1.0
+      mle_prior_fraction: 0.5
+
+- tag: 11_low_t_scale
+  update:
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: null
+    t_scale: 0.05
+    pb_scale_range: 0.5
+    fwd_loss_coeffs:
+      greedy: 1.0
+      mle: 1.0
+    bwd_loss_coeffs:
+      mle: 1.0
+      mle_prior_fraction: 0.5
+

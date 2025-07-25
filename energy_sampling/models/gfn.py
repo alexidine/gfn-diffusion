@@ -94,12 +94,11 @@ class GFN(nn.Module):
     #
 
     def predict_next_state(self, s, t, condition_embedding):
-        t = self.t_model(t)
-        s = self.s_model(s, condition_embedding)
-        s_new = self.forward_policy(s, t)
+        s_new = self.forward_policy(self.s_model(s, condition_embedding), self.t_model(t))
 
         if self.clipping:
             s_new = torch.clip(s_new, -self.gfn_clip, self.gfn_clip)
+
         return s_new
 
     def get_trajectory_fwd(self, initial_state, discretizer, exploration_std, condition,
@@ -112,8 +111,9 @@ class GFN(nn.Module):
         logf, logpb, logpf, states, means_f, logvars_f, means_b, logvars_b = self.init_traj_tensors(batch_size,
                                                                                                     trajectory_length)
 
-        states[:, 0] = initial_state.clone().detach().requires_grad_(not detach_traj)  # set correct initial state
-        current_state = initial_state.clone().detach().requires_grad_(not detach_traj)
+        initial_state.requires_grad_(not detach_traj)
+        current_state = initial_state
+        states[:, 0] = current_state
 
         condition_embedding = self.conditions_embedding_model(condition)
 
@@ -289,7 +289,6 @@ class GFN(nn.Module):
                 current_state)
         return back_mean_correction, back_var_correction
 
-
     def init_traj_tensors(self, batch_size, trajectory_length):
         logpf = torch.zeros((batch_size, trajectory_length), device=self.device)
         logpb = torch.zeros((batch_size, trajectory_length), device=self.device)
@@ -301,14 +300,3 @@ class GFN(nn.Module):
         logvars_b = torch.zeros((batch_size, trajectory_length, self.dim), device=self.device)
 
         return logf, logpb, logpf, states, means_f, logvars_f, means_b, logvars_b
-
-    def sample(self, batch_size, log_r, condition=None):
-        s = torch.zeros(batch_size, self.dim).to(self.device)
-        return self.get_trajectory_fwd(s, None, condition)[0][:, -1]
-
-    def sleep_phase_sample(self, batch_size, exploration_std, condition=None):
-        s = torch.zeros(batch_size, self.dim).to(self.device)
-        return self.get_trajectory_fwd(s, exploration_std, condition=condition)[0][:, -1]
-
-    def forward(self, s, exploration_std=None, log_r=None, condition=None):
-        return self.get_trajectory_fwd(s, exploration_std, condition)

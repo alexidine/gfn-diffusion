@@ -74,7 +74,7 @@ experiments:
     t_scale: 0.1
     pb_scale_range: 0.2
 
-- tag: 8_1024
+- tag: 8_fat_hidden
   update:
     joint_layers: 8
     hidden_dim: 1024

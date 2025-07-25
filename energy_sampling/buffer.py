@@ -38,7 +38,8 @@ class CrystalReplayBuffer:
         self.gpu_available = gpu_available
         self.diversity_coeff = diversity_coeff
 
-    def add(self, data_list, diversity_cutoff: float = 1.0):
+    def add(self, data_list,
+            diversity_cutoff: float = 1.0):
         with torch.no_grad():
             if self.dataset is None:
                 self.init_fresh_dataset(data_list)

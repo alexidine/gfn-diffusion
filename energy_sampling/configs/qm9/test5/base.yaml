@@ -16,7 +16,7 @@ gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weigh
 reweight_T: null                # 'null' or float: smaller values reduce the impact of outlier samples, warning CAN BE SEVERELY DISTORTIONARY TO THE LOSS
 
 # model parameters
-zero_init: true
+zero_init: False
 joint_layers: 8              # number of layers in forward/backward policy models
 hidden_dim: 512              # dimensionality of hidden layer
 s_emb_dim: 512                # dimensionality of state embedding
