@@ -75,12 +75,13 @@ def get_gfn_forward_loss(loss_coeffs,
                                                                       return_gauss_params=True,
                                                                       )
 
-    if loss_coeffs.detach_after > 0 and keep_grads:  # stop grad flow after a certain point
-        n_times = len(discretizer(1)[0])
-        detach_time = int(round(n_times * loss_coeffs.detach_after, 0))
-        if detach_time == n_times:
-            detach_time -= 1
-        states[:, :detach_time] = states[:, :detach_time].detach()
+    # this is pointless, as the whole thing always only looks at the terminal state
+    # if loss_coeffs.detach_after > 0 and keep_grads:  # stop grad flow after a certain point
+    #     n_times = len(discretizer(1)[0])
+    #     detach_time = int(round(n_times * loss_coeffs.detach_after, 0))
+    #     if detach_time == n_times:
+    #         detach_time -= 1
+    #     states[:, :detach_time] = states[:, :detach_time].detach()
 
     crystal_batch, log_r = get_loss_reward(log_T_tensor,
                                            log_reward_fn,
@@ -135,6 +136,13 @@ def get_gfn_forward_loss(loss_coeffs,
             log_Z = torch.logsumexp(log_ratio, dim=0, keepdim=True) - math.log(repeats)
             vg_loss = 0.5 * (log_Z - log_ratio) ** 2
         losses.append(vg_loss * loss_coeffs.vg_lme)
+
+    if loss_coeffs.emp_z > 0:  # train the flow model to match the empirical log Z distribution
+        if gfn.conditional_flow_model:
+            emp_z_loss = (0.5 * (log_Z - log_flow.view(repeats, -1))**2).view(-1)
+        else:
+            emp_z_loss = 0.5 * (log_Z - log_flow)**2
+        losses.append(emp_z_loss * loss_coeffs.emp_z)
 
     """MLE/TPM loss"""
     if loss_coeffs.mle > 0:
@@ -234,9 +242,12 @@ def get_gfn_backward_loss(loss_coeffs,
     if loss_coeffs.mle_prior_fraction > 0:
         # replace buffer samples with a random prior
         prior_samples = (torch.randn_like(samples) * loss_coeffs.pmle_std).clip(min=-6, max=6)
-        num_to_replace = max(1, int(len(samples) * loss_coeffs.mle_prior_fraction))
-        inds_to_replace = np.random.choice(len(samples), num_to_replace, replace=False)
-        samples[inds_to_replace] = prior_samples[inds_to_replace]
+        if loss_coeffs.mle_prior_fraction < 1:
+            num_to_replace = max(1, int(len(samples) * loss_coeffs.mle_prior_fraction))
+            inds_to_replace = np.random.choice(len(samples), num_to_replace, replace=False)
+            samples[inds_to_replace] = prior_samples[inds_to_replace]
+        else:
+            samples = prior_samples
 
     if gfn.conditional_flow_model and any([
         loss_coeffs.vg_lb > 0, loss_coeffs.vg_lme > 0
@@ -286,6 +297,13 @@ def get_gfn_backward_loss(loss_coeffs,
             log_Z = torch.logsumexp(log_ratio, dim=0, keepdim=True) - math.log(repeats)
             vg_loss = 0.5 * (log_Z - log_ratio) ** 2
         losses.append(vg_loss * loss_coeffs.vg_lme)
+
+    if loss_coeffs.emp_z > 0:  # train the flow model to match the empirical log Z distribution
+        if gfn.conditional_flow_model:
+            emp_z_loss = (0.5 * (log_Z - log_flow.view(repeats, -1))**2).view(-1)
+        else:
+            emp_z_loss = 0.5 * (log_Z - log_flow)**2
+        losses.append(emp_z_loss * loss_coeffs.emp_z)
 
     if loss_coeffs.mle > 0:
         mle_loss = soft_saturate(-log_pfs.sum(-1))

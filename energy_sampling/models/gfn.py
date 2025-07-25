@@ -112,8 +112,8 @@ class GFN(nn.Module):
         logf, logpb, logpf, states, means_f, logvars_f, means_b, logvars_b = self.init_traj_tensors(batch_size,
                                                                                                     trajectory_length)
 
-        states[:, 0] = initial_state.clone().detach()  # set correct initial state
-        current_state = initial_state.clone().detach()
+        states[:, 0] = initial_state.clone().detach().requires_grad_(not detach_traj)  # set correct initial state
+        current_state = initial_state.clone().detach().requires_grad_(not detach_traj)
 
         condition_embedding = self.conditions_embedding_model(condition)
 

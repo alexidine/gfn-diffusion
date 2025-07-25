@@ -10,7 +10,7 @@ from plotly.subplots import make_subplots
 from scipy.ndimage import gaussian_filter
 from scipy.spatial import Voronoi, KDTree
 from scipy.spatial.distance import cdist
-from scipy.stats import pearsonr, gaussian_kde
+from scipy.stats import pearsonr, gaussian_kde, linregress
 from skimage.feature import peak_local_max
 from skimage.segmentation import watershed
 from sklearn.cluster import AgglomerativeClustering
@@ -184,11 +184,12 @@ def generate_fwd_figs(buffer, energy_function,
         log_r.cpu().detach().numpy(),
         max_ref_samples=500
     )
-
+    fig_dict['Boltzmann Fit'] = boltzmann_fig(log_r)
     fig_dict['Sample Embedding'] = cluster_fig(sample_embedding, anchor_embedding, sample_cluster_inds, anchor_energies,
                                                all_energies, 'cluster', watershed_idx, watershed_range)
     fig_dict['Sample Embedding w Energy'] = cluster_fig(sample_embedding, anchor_embedding, sample_cluster_inds,
-                                                        anchor_energies, all_energies, 'energy', watershed_idx, watershed_range)
+                                                        anchor_energies, all_energies, 'energy', watershed_idx,
+                                                        watershed_range)
 
     # coverage metrics
     fig_dict['Num Sample Clusters'] = np.sum(np.unique(sample_cluster_inds) >= 0)
@@ -219,9 +220,59 @@ def generate_fwd_figs(buffer, energy_function,
     fig_dict['Sample Scatter'] = simple_cell_scatter_fig(
         sample_batch,
         sample_cluster_inds,
-        )
+    )
 
     return fig_dict
+
+
+def boltzmann_fig(log_r):
+    energies = -log_r
+    # Convert to numpy if it's a PyTorch tensor
+    energies_np = energies.detach().cpu().numpy() if isinstance(energies, torch.Tensor) else energies
+
+    # Histogram (density normalized)
+    hist_y, hist_x = np.histogram(energies_np, bins=50, density=True)
+    bin_centers = 0.5 * (hist_x[1:] + hist_x[:-1])
+
+    # Filter nonzero bins for log fitting
+    nonzero = hist_y > 0
+    log_y = np.log(hist_y[nonzero])
+    x_fit = bin_centers[nonzero]
+
+    # Linear fit to log-probabilities: log(P(E)) = -βE + const
+    slope, intercept, _, _, _ = linregress(x_fit, log_y)
+    beta_est = -slope
+
+    # Reconstruct Boltzmann distribution
+    boltzmann_y = np.exp(-beta_est * bin_centers)
+    boltzmann_y /= np.trapz(boltzmann_y, bin_centers)  # Normalize
+
+    # Plot with Plotly
+    fig = go.Figure()
+
+    fig.add_trace(go.Bar(
+        x=bin_centers,
+        y=hist_y,
+        name='Dist',
+        opacity=0.6
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=bin_centers,
+        y=boltzmann_y,
+        mode='lines',
+        name=f'Fit (β ≈ {beta_est:.2f})'
+    ))
+
+    fig.update_layout(
+        title='Check for Boltzmann Distribution',
+        xaxis_title='Energy',
+        yaxis_title='Probability Density',
+        bargap=0.05,
+        template='plotly_white'
+    )
+
+    return fig
 
 
 def cluster_hist_fig(cluster_ind):
@@ -488,7 +539,6 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
                 marker_showscale=False,
             ))
 
-
     if watershed is not None:
         custom_cscale = []
         for i in range(n_clusters):
@@ -515,7 +565,8 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
                                showlegend=False,
                                marker=dict(
                                    size=15,
-                                   color=line_colors, #[cluster_to_color[ind] for ind in range(len(anchor_embedding))],  # Fill color
+                                   color=line_colors,
+                                   #[cluster_to_color[ind] for ind in range(len(anchor_embedding))],  # Fill color
                                    line=dict(
                                        color='white',  # <-- variable border color!
                                        width=4
@@ -725,8 +776,8 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
     metrics['Sample Energy Distribution'] = sample_batch.gfn_energy.cpu().detach().numpy()
     metrics['Mean Sample Reward'] = log_r.mean().cpu().detach().numpy()
     metrics['sample Reward Distribution'] = log_r.cpu().detach().numpy()
-    metrics['Crystal Log Temperature'] = log_T_tensor
-    metrics['Crystal Mean Log Temperature'] = log_T_tensor.mean()
+    metrics['Crystal Log Temperature'] = log_T_tensor.cpu().detach().numpy()
+    metrics['Crystal Mean Log Temperature'] = log_T_tensor.mean().item()
     for elem in energy_function.__dict__.keys():
         thing = energy_function.__dict__[elem]
         if isinstance(thing, float) or isinstance(thing, int):
@@ -742,18 +793,17 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
         if isinstance(thing, float) or isinstance(thing, int):
             metrics['loss_coeffs/' + 'bwd_' + elem] = thing
 
-
     lattice_features = ['cell_a', 'cell_b', 'cell_c',
                         'cell_alpha', 'cell_beta', 'cell_gamma',
                         'aunit_x', 'aunit_y', 'aunit_z',
                         'orientation_1', 'orientation_2', 'orientation_3']
     std_params = sample_batch.cell_params_to_gen_basis()
 
-    metrics['Total Var'] = std_params.var(dim=0).mean().item()
-    metrics['Total Mean'] = std_params.mean(dim=0).mean().item()
+    metrics['Total Var'] = std_params.var(dim=0).mean().cpu().detach().numpy()
+    metrics['Total Mean'] = std_params.mean(dim=0).mean().cpu().detach().numpy()
 
     U, S, Vh = torch.linalg.svd(std_params - std_params.mean(0), full_matrices=False)
-    eigvals = S**2
+    eigvals = S ** 2
     explained_var_ratio = eigvals / eigvals.sum()
     loadings = Vh.T  # shape: (num_features, num_components)
     contrib_per_feature = (loadings ** 2) @ explained_var_ratio  # shape: (num_features,)
@@ -781,9 +831,20 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
                 for p in np.linspace(0, 1, 50)
             ])
             metrics['Buffer Mean Score'] = np.mean(buffer.rewards_list)
+
+
+
+    metrics = {k: to_loggable(v) for k, v in metrics.items()}
     return metrics
 
-
+def to_loggable(v):
+    if torch.is_tensor(v):
+        v = v.detach().cpu()
+        if v.numel() == 1:
+            return v.item()
+        else:
+            return v.numpy()
+    return v
 def Z_vs_T_fig(gfn_model, init_state):
     log_temps = torch.linspace(-2, 2, 100).to(init_state.device)[:, None].flatten()
     Z_at_T = gfn_model.flow_model(
@@ -839,14 +900,14 @@ def Pf_vs_Pb_fig(pf, pb, log_r):
     r_value, _ = pearsonr(x, y)
 
     fig = go.Figure()
-    fig.add_scatter(x=x,
-                    y=y,
+    fig.add_scatter(x=y,
+                    y=x,
                     marker_color=color,
                     name=f'R = {r_value:.3f}',
                     showlegend=True,
                     mode='markers',
                     )
-    fig.update_layout(xaxis_title='Forward Prob', yaxis_title='Backward Prob')
+    fig.update_layout(yaxis_title='Forward Prob', xaxis_title='Backward Prob')
     return fig
 
 

@@ -388,45 +388,58 @@ def anneal_loss(it,
     if args.do_e3_schedule:
         if not hasattr(args, 'orig_loss_coeffs'):
             args.orig_loss_coeffs = [deepcopy(args.fwd_loss_coeffs), deepcopy(args.bwd_loss_coeffs)]
-            args.bwd_loss_coeffs.mle_prior_fraction = 1
+            args.bwd_loss_coeffs.mle_prior_fraction = 0
 
         if it < args.e2_time:
             # exploration: fwd greedy + MLE, bwd prior MLE
             args.fwd_loss_coeffs.tb = 0
             args.fwd_loss_coeffs.vg_lb = 0
             args.fwd_loss_coeffs.vg_lme = 0
+            args.fwd_loss_coeffs.emp_z = 0
+
             args.bwd_loss_coeffs.tb = 0
             args.bwd_loss_coeffs.vg_lb = 0
             args.bwd_loss_coeffs.vg_lme = 0
-            args.bwd_loss_coeffs.mle_prior_fraction -= (1/args.e2_time)
+            args.bwd_loss_coeffs.emp_z = 0
+
+            args.bwd_loss_coeffs.mle += args.orig_loss_coeffs[1].mle/args.e2_time  # anneal MLE prior anchoring
 
         if args.e2_time < it < args.e3_time:
             # equilibration: fwd TB or VarGrad, bwd buffer MLE + TB or VarGrad
             args.fwd_loss_coeffs.greedy = 0
             args.bwd_loss_coeffs.mle_prior_fraction = 0
+            args.fwd_loss_coeffs.mle = 0.1
+            args.bwd_loss_coeffs.mle = 0.1
 
             scaling_factor = smoothstep(it, args.e2_time, 50)
             args.fwd_loss_coeffs.tb = scaling_factor * args.orig_loss_coeffs[0].tb
             args.fwd_loss_coeffs.vg_lb = scaling_factor * args.orig_loss_coeffs[0].vg_lb
             args.fwd_loss_coeffs.vg_lme = scaling_factor * args.orig_loss_coeffs[0].vg_lme
+            args.fwd_loss_coeffs.emp_z = scaling_factor * args.orig_loss_coeffs[0].emp_z
+
             args.bwd_loss_coeffs.tb = scaling_factor * args.orig_loss_coeffs[1].tb
             args.bwd_loss_coeffs.vg_lb = scaling_factor * args.orig_loss_coeffs[1].vg_lb
             args.bwd_loss_coeffs.vg_lme = scaling_factor * args.orig_loss_coeffs[1].vg_lme
+            args.bwd_loss_coeffs.emp_z = scaling_factor * args.orig_loss_coeffs[1].emp_z
 
         if it > args.e3_time:
-            # exploitation: terminal greedy
-            args.fwd_loss_coeffs.tb = 0
+            # exploitation: terminal TB
+            scaling_factor = smoothstep(it, args.e3_time, 50)
+
+            args.fwd_loss_coeffs.tb = scaling_factor * 1
             args.fwd_loss_coeffs.vg_lb = 0
             args.fwd_loss_coeffs.vg_lme = 0
-            args.bwd_loss_coeffs.tb = 0
+            args.fwd_loss_coeffs.emp_z = 0
+            args.fwd_loss_coeffs.mle = 0
+
+            args.bwd_loss_coeffs.tb = scaling_factor * 1
             args.bwd_loss_coeffs.vg_lb = 0
             args.bwd_loss_coeffs.vg_lme = 0
-            args.fwd_loss_coeffs.mle = 0.1
-            args.bwd_loss_coeffs.mle = 0.1
+            args.bwd_loss_coeffs.emp_z = 0
+            args.bwd_loss_coeffs.mle = 0
 
-            scaling_factor = smoothstep(it, args.e3_time, 50)
-            args.fwd_loss_coeffs.greedy = scaling_factor * args.orig_loss_coeffs[0].greedy
-            args.fwd_loss_coeffs.detach_after = 1
+            # args.fwd_loss_coeffs.greedy = scaling_factor * args.orig_loss_coeffs[0].greedy
+            # args.fwd_loss_coeffs.detach_after = 0.5 # doesn't work anyway
 
 
 def step_lr_schedule(schedulers, optimizers,
@@ -510,7 +523,9 @@ def init_buffers_datasets(energy_function):
         rank_weight=args.rank_weight,
         prioritized=args.prioritized,
         keep_initial_samples=args.buffer_path is not None,
-        gpu_available=args.device == 'cuda')
+        gpu_available=args.device == 'cuda',
+        diversity_coeff=args.buffer_diversity_coeff,
+    )
     if (args.both_ways or args.bwd) and args.buffer_path is not None:  # preload samples into the buffer
         buffer = add_dataset_to_buffer(args.buffer_path, buffer)
     # load dataset of just molecules

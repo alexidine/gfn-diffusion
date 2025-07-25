@@ -1,5 +1,5 @@
-run_name: 'qm9_test4'
-tag: 'qm9_test4'
+run_name: 'qm9_test5'
+tag: 'qm9_test5'
 seed: 12345
 device: 'cuda'
 lr_policy: 0.0001              # learning rate of the policy network
@@ -9,7 +9,7 @@ lr_back: 0.0001                # learning rate of the backward pass
 lr_warmup_ratio: 100           # how much smaller the initial (warmup) LR should be than the max policy value
 scheduler: True               # does LR warmup from lr/lr_warup_ratio -> lr -> min_lr over the warmup and annealing period
 lr_warmup_time: 200
-lr_anneal_time: 10000
+lr_anneal_time: 20000
 weight_decay: 1e-7
 use_weight_decay: false
 gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weights
@@ -30,7 +30,7 @@ batch_size: 5               # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
 max_batch_size: 200           # maximum batch size to allow
 repeats: 5                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
-eval_batch_size: 500        # batch size for evaluation
+eval_batch_size: 1000        # batch size for evaluation
 epochs: 100000             # number of training epochs: relatively large
 eval_period: 500              # how often to do evaluation & reporting
 figs_period: 1000             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
@@ -52,13 +52,14 @@ energy: "molecular_crystal"  # "molecular_crystal"
 # equilibration: fwd TB or VarGrad, bwd buffer MLE + TB or VarGrad
 # exploitation: terminal greedy
 do_e3_schedule: True  # whether to do e3 scheduling, or just what's shown here
-e2_time: 2000
-e3_time: 5000
+e2_time: 10000
+e3_time: 20000
 fwd_loss_coeffs:
   tb: 0.0
   vg_lb: 0.0
   vg_lme: 1.0  # exclusive with vg_lb
-  greedy: 1.0
+  emp_z: 1.0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
+  greedy: 10.0
   detach_after: 0  # only allow gradient flow after this time (0,1)
   mle: 1.0
   smoothed: 0
@@ -72,7 +73,8 @@ bwd_loss_coeffs:
   tb: 0.0
   vg_lb: 0.0
   vg_lme: 1.0 # exclusive with vg_lb
-  mle: 10.0
+  emp_z: 1.0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
+  mle: 1.0
   mle_prior_fraction: 1
   pmle_std: 4  # std deviation of the prior mle distribution
   smoothed: 0
@@ -100,6 +102,7 @@ autoencoder_path: '/scratch/mk8347/csd_runs/models/best_autoencoder_experiments_
 beta: 1.0             # reward prioritized replay sampling: high beta = steep prioritization
 rank_weight: 1.0     # rank-based replay sampling: low rank_weight = steep prioritization
 prioritized: "boltzmann"   # three kinds of replay training: random, reward prioritized (Boltzmann), rank-based
+buffer_diversity_coeff: 10.0  # how highly to weight sample diversity when sampling from the buffer
 sampling: "buffer"
 add_to_buffer_each: 10  # how often to add samples to the buffer during fwd passes in both_ways training
 buffer_size: 50000          # size of replay buffer: relatively large

@@ -1,0 +1,90 @@
+- index: 0
+  tag: 0_baseline
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  notes: ''
+- index: 1
+  tag: 1_4_layers
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  notes: ''
+- index: 2
+  tag: 2_12_layers
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  notes: ''
+- index: 3
+  tag: 3_256_hd
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  notes: ''
+- index: 4
+  tag: 4_layernorm
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  notes: ''
+- index: 5
+  tag: 5_low_t_scale
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  notes: ''
+- index: 6
+  tag: 6_high_pb
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  notes: ''
+- index: 7
+  tag: 7_dropout
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  notes: ''
+- index: 8
+  tag: 81024
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  notes: ''
