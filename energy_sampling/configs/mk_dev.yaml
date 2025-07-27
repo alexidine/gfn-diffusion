@@ -114,10 +114,10 @@ wd_max_steps: 5000  # number of steps to terminate the added variance
 
 # molecular crystal settings
 ################################################################
-molecule: 'nicotinamide'  # 'nicotinamide' or 'urea' or 'qm9' for molecule-conditional training
-molecule_conditioning: False  # MUST be true for molecule='qm9' and false else - conditions the generative prediction on the molecule
-sg_conditioning: False  # whether to conditionally sample across space groups
-space_groups: [2]  # which space groups to sample over
+molecule: 'qm9'  # 'nicotinamide' or 'urea' or 'qm9' for molecule-conditional training
+molecule_conditioning: True  # MUST be true for molecule='qm9' and false else - conditions the generative prediction on the molecule
+sg_conditioning: True  # whether to conditionally sample across space groups
+space_groups: [1, 2]  # which space groups to sample over
 energy_function: combo
   # 'latent_harmonic' : unimadal harmonic potential in the latent space
   # 'crystal_harmonic': unimodal harmonic potential in the crystal space

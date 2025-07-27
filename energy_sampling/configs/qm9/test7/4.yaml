@@ -2,7 +2,7 @@ T: 10
 add_to_buffer_each: 10
 anneal_repulsion: false
 anneal_temperature: true
-autoencoder_path: C:/Users/mikem/crystals/CSP_runs/models/cluster/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05
+autoencoder_path: /scratch/mk8347/csd_runs/models/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05
 batch_size: 5
 beta: 1.0
 both_ways: true
@@ -195,7 +195,7 @@ min_lr: 1.0e-06
 min_traj_length: 10
 molecule: qm9
 molecule_conditioning: true
-molecules_path: D:/crystal_datasets/test_qm9_dataset.pt
+molecules_path: /scratch/mk8347/csd_runs/datasets/test_qm9_dataset.pt
 norm: null
 pb_scale_range: 0.2
 prioritized: boltzmann
