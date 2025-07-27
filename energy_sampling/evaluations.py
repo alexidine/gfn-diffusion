@@ -106,7 +106,8 @@ def eval_step(energy_function,
                                      log_pfs,
                                      log_r,
                                      f_vars_f, f_means_f, f_vars_b, f_means_b,
-                                     sample_batch.detach().cpu())
+                                     sample_batch.detach().cpu(),
+                                     log_T_tensor)
         if bwd_training:
             fig_dict = generate_bwd_figs(fig_dict, buffer, gfn_model, init_state, discretizer)
 
@@ -150,7 +151,8 @@ def generate_fwd_figs(buffer, energy_function,
                       condition, flow_states,
                       gfn_model, init_state,
                       log_fs, log_pbs, log_pfs, log_r,
-                      f_vars_f, f_means_f, f_vars_b, f_means_b, sample_batch):
+                      f_vars_f, f_means_f, f_vars_b, f_means_b, sample_batch,
+                      log_T_tensor):
     fig_dict = {}
 
     buffer_cell_params, buffer_latent_params, buffer_std_params, buffer_reward, buffer_batch = get_buffer_stats(buffer)
@@ -216,10 +218,14 @@ def generate_fwd_figs(buffer, energy_function,
                                                                       20,
                                                                       log_r.cpu().detach().numpy())
     fig_dict['Lattice Features Distribution'] = simple_cell_hist(sample_batch, buffer_cell_params)
-    fig_dict['Lattice Latents Distribution'] = simple_latent_hist(sample_batch, buffer_latent_params)
+    fig_dict['Lattice Latents Distribution'] = simple_latent_hist(sample_batch, flow_states[:, -1, :].cpu().detach().numpy(),
+                                                                  buffer_latent_params)
+    log_T = len(torch.unique(log_T_tensor)) > 1
     fig_dict['Sample Scatter'] = simple_cell_scatter_fig(
         sample_batch,
         sample_cluster_inds,
+        aux_scalar_name='Log Temp' if log_T else None,
+        aux_array=log_T_tensor.cpu().detach().numpy() if log_T else None,
     )
 
     return fig_dict

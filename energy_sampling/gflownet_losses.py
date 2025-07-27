@@ -44,7 +44,9 @@ def get_gfn_forward_loss(loss_coeffs,
                          buffer,
                          log_T_tensor,
                          exploration_std=None, return_exp=False, condition=None,
-                         repeats=10, reweight_T: Optional[float] = None):
+                         repeats=10, reweight_T: Optional[float] = None,
+                         report_losses: bool = False,
+                         ):
     if gfn.conditional_flow_model and any([
         loss_coeffs.var > 0, loss_coeffs.vg_lb > 0,
         loss_coeffs.vg_lme > 0, loss_coeffs.buffer > 0,
@@ -61,6 +63,8 @@ def get_gfn_forward_loss(loss_coeffs,
         if reassign_sgs:
             mol_batch.sg_ind = sg_inds
 
+    loss_dict = {}
+
     if loss_coeffs.greedy > 0 or loss_coeffs.var > 0 or loss_coeffs.buffer > 0:
         keep_grads = True
     else:
@@ -74,14 +78,6 @@ def get_gfn_forward_loss(loss_coeffs,
                                                                       detach_traj=not keep_grads,
                                                                       return_gauss_params=True,
                                                                       )
-
-    # this is pointless, as the whole thing always only looks at the terminal state
-    # if loss_coeffs.detach_after > 0 and keep_grads:  # stop grad flow after a certain point
-    #     n_times = len(discretizer(1)[0])
-    #     detach_time = int(round(n_times * loss_coeffs.detach_after, 0))
-    #     if detach_time == n_times:
-    #         detach_time -= 1
-    #     states[:, :detach_time] = states[:, :detach_time].detach()
 
     crystal_batch, log_r = get_loss_reward(log_T_tensor,
                                            log_reward_fn,
@@ -214,10 +210,35 @@ def get_gfn_forward_loss(loss_coeffs,
 
     loss = reweight_losses(combined_losses, losses, reweight_T)
 
-    if return_exp:
-        return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch
+    if report_losses:
+        loss_dict = {}
+        if loss_coeffs.greedy > 0:
+            loss_dict['greedy'] = greedy_loss.mean().detach()
+        if loss_coeffs.smoothed > 0:
+            loss_dict['smoothed'] = smoothness_loss.mean().detach()
+        if loss_coeffs.tb > 0:
+            loss_dict['tb'] = tb_loss.mean().detach()
+        if loss_coeffs.vg_lb > 0:
+            loss_dict['vg_lb'] = vg_loss.mean().detach()
+        if loss_coeffs.vg_lme > 0:
+            loss_dict['vg_lme'] = vg_loss.mean().detach()
+        if loss_coeffs.emp_z > 0:
+            loss_dict['emp_z'] = emp_z_loss.mean().detach()
+        if loss_coeffs.mle > 0:
+            loss_dict['mle'] = mle_loss.mean().detach()
+        if loss_coeffs.var > 0:
+            loss_dict['var'] = var_loss.mean().detach()
+        if loss_coeffs.overlap > 0:
+            loss_dict['overlap'] = overlap_loss.mean().detach()
+        if loss_coeffs.buffer > 0:
+            loss_dict['buffer'] = buffer_loss.mean().detach()
     else:
-        return loss
+        loss_dict = None
+
+    if return_exp:
+        return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch, loss_dict
+    else:
+        return loss, loss_dict
 
 
 def reweight_losses(combined_losses, losses, reweight_T):
@@ -238,7 +259,9 @@ def get_gfn_backward_loss(loss_coeffs,
                           exploration_std=None,
                           condition=None,
                           repeats=10,
-                          return_exp=False, reweight_T: Optional[float] = None):
+                          return_exp=False,
+                          reweight_T: Optional[float] = None,
+                          report_losses: bool = False):
     if loss_coeffs.mle_prior_fraction > 0:
         # replace buffer samples with a random prior
         prior_samples = (torch.randn_like(samples) * loss_coeffs.pmle_std).clip(min=-6, max=6)
@@ -313,7 +336,24 @@ def get_gfn_backward_loss(loss_coeffs,
 
     loss = reweight_losses(combined_losses, losses, reweight_T)
 
-    if return_exp:
-        return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach()
+    if report_losses:
+        loss_dict = {}
+        if loss_coeffs.smoothed > 0:
+            loss_dict['smoothed'] = smoothness_loss.mean().detach()
+        if loss_coeffs.tb > 0:
+            loss_dict['tb'] = tb_loss.mean().detach()
+        if loss_coeffs.vg_lb > 0:
+            loss_dict['vg_lb'] = vg_loss.mean().detach()
+        if loss_coeffs.vg_lme > 0:
+            loss_dict['vg_lme'] = vg_loss.mean().detach()
+        if loss_coeffs.emp_z > 0:
+            loss_dict['emp_z'] = emp_z_loss.mean().detach()
+        if loss_coeffs.mle > 0:
+            loss_dict['mle'] = mle_loss.mean().detach()
     else:
-        return loss
+        loss_dict = None
+
+    if return_exp:
+        return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), loss_dict
+    else:
+        return loss, loss_dict

@@ -38,7 +38,8 @@ class CrystalReplayBuffer:
         self.gpu_available = gpu_available
         self.diversity_coeff = diversity_coeff
 
-    def add(self, data_list,
+    def add(self,
+            data_list,
             diversity_cutoff: float = 1.0):
         with torch.no_grad():
             if self.dataset is None:
@@ -48,14 +49,19 @@ class CrystalReplayBuffer:
                 new_data_batch = collate_data_list(data_list)
                 new_x_tensor = new_data_batch.cell_params_to_gen_basis().to('cuda' if self.gpu_available else 'cpu')
                 scores = self.energy_function.prebuilt_sample_to_reward(new_data_batch,
-                                                                        temperature=torch.ones(len(new_data_batch)))
-                scores_list = list(scores.cpu().detach().numpy())
+                                                                        temperature=torch.ones(len(new_data_batch))
+                                                                        ).cpu().detach().numpy()
+                scores_list = list(scores)
 
                 ref_x_tensor = torch.stack(self.x_list).to('cuda' if self.gpu_available else 'cpu')
                 min_buffer_dist = torch.cdist(ref_x_tensor, new_x_tensor).amin(0)
                 new_x_tensor = new_x_tensor.cpu()
 
-                new_x_inds_to_keep = torch.argwhere(min_buffer_dist > diversity_cutoff).flatten().tolist()
+                far_enough = (min_buffer_dist >= diversity_cutoff).cpu().detach().numpy()
+                existing_rewards = np.array(self.rewards_list)
+                rewards_cutoff = np.amin(existing_rewards) - np.ptp(existing_rewards) * 0.1
+                good_enough = scores >= rewards_cutoff
+                new_x_inds_to_keep = np.argwhere(far_enough * good_enough).flatten().tolist()
                 data_list_to_add = [data_list[ind] for ind in new_x_inds_to_keep]
 
                 if len(data_list_to_add) > 0:

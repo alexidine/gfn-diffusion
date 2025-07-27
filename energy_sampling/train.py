@@ -20,13 +20,14 @@ from energies.molecular_crystal import MolecularCrystal
 from evaluations import eval_step
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 from models import GFN
+from mxtaltools.common.config_processing import dict2namespace
 from mxtaltools.common.training_utils import flatten_wandb_params
 from mxtaltools.dataset_utils.data_classes import MolData
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.models.utils import load_encoder
 from utils import get_train_args, get_gfn_init_state, set_seed, \
     get_exploration_std, random_discretizer, low_discrepancy_discretizer, \
-    low_discrepancy_discretizer2, shifted_equidistant, uniform_discretizer, smoothstep
+    low_discrepancy_discretizer2, shifted_equidistant, uniform_discretizer, update_loss_schedule
 
 args = get_train_args()
 
@@ -50,6 +51,71 @@ def train_step(energy_function,
                buffer,
                mol_loader,
                repeats):
+    add_to_buffer, do_backward, do_forward, p_forward, report_losses = train_logic(buffer, it)
+
+    discretizer = get_discretizer(args.discretizer)
+
+    optimizers['flow'].zero_grad()
+    if do_forward:
+        optimizers['fwd'].zero_grad()
+        mol_batch = next(iter(mol_loader))
+        mol_batch = mol_batch.to(device, non_blocking=True)
+        loss, states, log_pfs, log_pbs, log_r, log_fs, crystal_batch, loss_dict = fwd_train_step(
+            energy_function,
+            gfn_model,
+            discretizer,
+            exploration_std,
+            mol_batch,
+            buffer,
+            return_exp=True,
+            repeats=repeats,
+            reweight_T=args.reweight_T,
+            report_losses=report_losses
+        )
+
+        forward_iter = int(it * p_forward)
+        if add_to_buffer and forward_iter % args.add_to_buffer_each:
+            buffer.add(crystal_batch.detach().cpu().to_data_list())
+        del crystal_batch
+
+    elif do_backward:
+        optimizers['bwd'].zero_grad()
+        loss, states, log_pfs, log_pbs, log_r, log_fs, loss_dict = bwd_train_step(
+            gfn_model,
+            discretizer,
+            buffer,
+            exploration_std,
+            repeats=repeats,
+            return_exp=True,
+            reweight_T=args.reweight_T,
+            report_losses=report_losses)
+    else:
+        assert False
+
+    loss.backward()
+    clean_loss = loss.item()
+    torch.nn.utils.clip_grad_norm_(gfn_model.parameters(),
+                                   args.gradient_norm_clip)  # gradient clipping
+    if do_forward:
+        optimizers['fwd'].step()
+        optimizers['flow'].step()
+    elif do_backward:
+        optimizers['bwd'].step()
+        optimizers['flow'].step()
+
+    step_type = "Forward" if do_forward else "Backward"
+
+    if report_losses:
+        loss_dict_cpu = {step_type + "_loss/" + key: value.cpu().detach().numpy() for key, value in loss_dict.items()}
+    else:
+        loss_dict_cpu = None
+
+    del loss, states, log_pfs, log_pbs, log_r, log_fs, loss_dict  # or whatever is large
+
+    return clean_loss, step_type, loss_dict_cpu
+
+
+def train_logic(buffer, it):
     do_forward = False
     do_backward = False
     add_to_buffer = False
@@ -73,59 +139,16 @@ def train_step(energy_function,
     else:  # forward ONLY
         do_forward = True
         p_forward = 1
-
     if len(buffer) == 0:
         do_forward = True
         do_backward = False
 
-    discretizer = get_discretizer(args.discretizer)
-
-    optimizers['flow'].zero_grad()
-    if do_forward:
-        optimizers['fwd'].zero_grad()
-        mol_batch = next(iter(mol_loader))
-        mol_batch = mol_batch.to(device, non_blocking=True)
-        loss, states, log_pfs, log_pbs, log_r, log_fs, crystal_batch = fwd_train_step(energy_function,
-                                                                                      gfn_model,
-                                                                                      discretizer,
-                                                                                      exploration_std,
-                                                                                      mol_batch,
-                                                                                      buffer,
-                                                                                      return_exp=True,
-                                                                                      repeats=repeats,
-                                                                                      reweight_T=args.reweight_T
-                                                                                      )
-
-        forward_iter = int(it * p_forward)
-        if add_to_buffer and forward_iter % args.add_to_buffer_each:
-            buffer.add(crystal_batch.detach().cpu().to_data_list())
-        del crystal_batch
-
-    elif do_backward:
-        optimizers['bwd'].zero_grad()
-        loss, states, log_pfs, log_pbs, log_r, log_fs = bwd_train_step(gfn_model,
-                                                                       discretizer,
-                                                                       buffer,
-                                                                       exploration_std,
-                                                                       repeats=repeats,
-                                                                       return_exp=True,
-                                                                       reweight_T=args.reweight_T)
+    if it % 21 == 0:
+        report_losses = True
     else:
-        assert False
+        report_losses = False
 
-    loss.backward()
-    clean_loss = loss.item()
-    torch.nn.utils.clip_grad_norm_(gfn_model.parameters(),
-                                   args.gradient_norm_clip)  # gradient clipping
-    if do_forward:
-        optimizers['fwd'].step()
-        optimizers['flow'].step()
-    elif do_backward:
-        optimizers['bwd'].step()
-        optimizers['flow'].step()
-    del loss, states, log_pfs, log_pbs, log_r, log_fs  # or whatever is large
-
-    return clean_loss, "Forward" if do_forward else "Backward"
+    return add_to_buffer, do_backward, do_forward, p_forward, report_losses
 
 
 def get_discretizer(discretization_type):
@@ -155,7 +178,8 @@ def get_discretizer(discretization_type):
 
 
 def fwd_train_step(energy_function, gfn_model, discretizer, exploration_std, mol_batch, buffer, return_exp=False,
-                   repeats: int = 10, reweight_T: Optional[float] = None):
+                   repeats: int = 10, reweight_T: Optional[float] = None,
+                   report_losses: bool = False):
     init_state = get_gfn_init_state(args.batch_size, energy_function.data_ndim, device)
     log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(mol_batch)
     mol_batch.sg_ind = sg_inds
@@ -171,11 +195,12 @@ def fwd_train_step(energy_function, gfn_model, discretizer, exploration_std, mol
                                 return_exp=return_exp,
                                 condition=condition,
                                 repeats=repeats,
-                                reweight_T=reweight_T)
+                                reweight_T=reweight_T,
+                                report_losses=report_losses)
 
 
 def bwd_train_step(gfn_model, discretizer, buffer, exploration_std=None, repeats: int = 10,
-                   return_exp=False, reweight_T: Optional[float] = None):
+                   return_exp=False, reweight_T: Optional[float] = None, report_losses: bool = False):
     if args.sampling == 'buffer':
         samples, rewards, crystal_batch, condition = buffer.sample(
             return_conditioning=True,
@@ -192,7 +217,8 @@ def bwd_train_step(gfn_model, discretizer, buffer, exploration_std=None, repeats
                                  condition=condition.to(device),
                                  repeats=repeats,
                                  return_exp=return_exp,
-                                 reweight_T=reweight_T)
+                                 reweight_T=reweight_T,
+                                 report_losses=report_losses)
 
 
 def train():
@@ -268,13 +294,16 @@ def train():
                                                      args.temp_annealing_max_steps, 10)
 
     repulsion_annealing_lambda = get_annealing_factor(args.lj_repulsion, 1, args.repulsion_annealing_max_steps, 10)
-    var_annealing_factor = get_annealing_factor(1, 0.01, args.wd_max_steps, 10)
-    buffer_annealing_factor = get_annealing_factor(1, 0.01, args.wd_max_steps, 10)
 
     fwd_loss, bwd_loss = 0, 0
     gfn_model.train()
+    fwd_loss_dict = None
+    bwd_loss_dict = None
+
     for step_ind in trange(args.epochs + 1):
         metrics = dict()
+        if step_ind % 10 == 0:
+            set_loss_coeffs(step_ind, args)
         exploration_std = get_exploration_std(step_ind,
                                               args.exploratory,
                                               args.wd_max_steps,
@@ -285,19 +314,23 @@ def train():
         times['train_step_start'] = time()
         try:
             #torch.autograd.set_detect_anomaly(True)  # for debugging
-            train_loss, step_type = train_step(energy_function,
-                                               gfn_model,
-                                               optimizers,
-                                               step_ind,
-                                               exploration_std,
-                                               buffer,
-                                               train_mol_loader,
-                                               repeats=args.repeats
-                                               )
+            train_loss, step_type, loss_dict = train_step(energy_function,
+                                                          gfn_model,
+                                                          optimizers,
+                                                          step_ind,
+                                                          exploration_std,
+                                                          buffer,
+                                                          train_mol_loader,
+                                                          repeats=args.repeats
+                                                          )
             if step_type == 'Forward':
                 fwd_loss = train_loss
+                if loss_dict is not None:
+                    fwd_loss_dict = loss_dict
             elif step_type == 'Backward':
                 bwd_loss = train_loss
+                if loss_dict is not None:
+                    bwd_loss_dict = loss_dict
             if not oomed_out:
                 buffer, train_mol_loader, test_mol_loader = grow_batch_size(buffer, train_mol_loader, test_mol_loader)
 
@@ -316,16 +349,7 @@ def train():
         elif step_ind % 10 == 0:
             lr_warmup_finished, lr = step_lr_schedule(schedulers, optimizers, lr_warmup_finished)
             anneal_reward(step_ind, temp_annealing_lambda, repulsion_annealing_lambda, energy_function, args)
-            anneal_loss(step_ind,
-                        var_annealing_factor,
-                        buffer_annealing_factor,
-                        args)
-            metrics.update({'lr_fwd': optimizers['fwd'].param_groups[0]['lr']})
-            metrics.update({'lr_bwd': optimizers['bwd'].param_groups[0]['lr']})
-            metrics.update({'lr_flow': optimizers['flow'].param_groups[0]['lr']})
-            metrics.update(log_elapsed_times())
-            metrics['Forward Loss'] = fwd_loss
-            metrics['Backward Loss'] = bwd_loss
+            ten_step_reporting(bwd_loss, bwd_loss_dict, fwd_loss, fwd_loss_dict, metrics, optimizers)
             wandb.log(metrics, step=step_ind)
 
         elif step_ind % 100 == 0:
@@ -333,6 +357,21 @@ def train():
             gc.collect()
 
     torch.save(gfn_model, f'{name}_model_final.pt')
+
+
+def ten_step_reporting(bwd_loss, bwd_loss_dict, fwd_loss, fwd_loss_dict, metrics, optimizers):
+    metrics.update({'lr_fwd': optimizers['fwd'].param_groups[0]['lr']})
+    metrics.update({'lr_bwd': optimizers['bwd'].param_groups[0]['lr']})
+    metrics.update({'lr_flow': optimizers['flow'].param_groups[0]['lr']})
+    metrics.update(log_elapsed_times())
+    metrics['Forward Loss'] = fwd_loss
+    metrics['Backward Loss'] = bwd_loss
+    if fwd_loss_dict is not None:
+        metrics.update(fwd_loss_dict)
+        fwd_loss_dict = None
+    if bwd_loss_dict is not None:
+        metrics.update(bwd_loss_dict)
+        bwd_loss_dict = None
 
 
 def get_conditioning_dim():
@@ -368,78 +407,16 @@ def anneal_reward(it, temp_annealing_lambda, repulsion_annealing_lambda, energy_
             args.energy_lj_coeff * F.sigmoid(torch.tensor((it - args.lj_start_time) / 50)).item(), 2)
 
 
-def anneal_loss(it,
-                var_annealing_factor,
-                buffer_annealing_factor,
-                args):
+def set_loss_coeffs(it, args):
     """anneal reward function"""
-    if it > args.wd_max_steps:
-        args.fwd_loss_coeffs.var = 0
-        args.fwd_loss_coeffs.overlap = 0
-    else:
-        args.fwd_loss_coeffs.var *= var_annealing_factor
-        args.fwd_loss_coeffs.overlap *= var_annealing_factor
+    if it == 0:
+        args.fwd_loss_schedule = deepcopy(args.fwd_loss_coeffs)
+        args.bwd_loss_schedule = deepcopy(args.bwd_loss_coeffs)
+        args.fwd_loss_coeffs = dict2namespace({k: 0.0 for k in args.fwd_loss_schedule.__dict__})
+        args.bwd_loss_coeffs = dict2namespace({k: 0.0 for k in args.bwd_loss_schedule.__dict__})
 
-    if it > args.wd_max_steps:
-        args.fwd_loss_coeffs.buffer = 0
-    else:
-        args.fwd_loss_coeffs.buffer *= buffer_annealing_factor
-
-    if args.do_e3_schedule:
-        if not hasattr(args, 'orig_loss_coeffs'):
-            args.orig_loss_coeffs = [deepcopy(args.fwd_loss_coeffs), deepcopy(args.bwd_loss_coeffs)]
-            args.bwd_loss_coeffs.mle_prior_fraction = 0
-
-        if it < args.e2_time:
-            # exploration: fwd greedy + MLE, bwd prior MLE
-            args.fwd_loss_coeffs.tb = 0
-            args.fwd_loss_coeffs.vg_lb = 0
-            args.fwd_loss_coeffs.vg_lme = 0
-            args.fwd_loss_coeffs.emp_z = 0
-
-            args.bwd_loss_coeffs.tb = 0
-            args.bwd_loss_coeffs.vg_lb = 0
-            args.bwd_loss_coeffs.vg_lme = 0
-            args.bwd_loss_coeffs.emp_z = 0
-
-            args.bwd_loss_coeffs.mle += args.orig_loss_coeffs[1].mle/args.e2_time  # anneal MLE prior anchoring
-
-        if args.e2_time < it < args.e3_time:
-            # equilibration: fwd TB or VarGrad, bwd buffer MLE + TB or VarGrad
-            args.fwd_loss_coeffs.greedy = 0
-            args.bwd_loss_coeffs.mle_prior_fraction = 0
-            args.fwd_loss_coeffs.mle = 0.1
-            args.bwd_loss_coeffs.mle = 0.1
-
-            scaling_factor = smoothstep(it, args.e2_time, 50)
-            args.fwd_loss_coeffs.tb = scaling_factor * args.orig_loss_coeffs[0].tb
-            args.fwd_loss_coeffs.vg_lb = scaling_factor * args.orig_loss_coeffs[0].vg_lb
-            args.fwd_loss_coeffs.vg_lme = scaling_factor * args.orig_loss_coeffs[0].vg_lme
-            args.fwd_loss_coeffs.emp_z = scaling_factor * args.orig_loss_coeffs[0].emp_z
-
-            args.bwd_loss_coeffs.tb = scaling_factor * args.orig_loss_coeffs[1].tb
-            args.bwd_loss_coeffs.vg_lb = scaling_factor * args.orig_loss_coeffs[1].vg_lb
-            args.bwd_loss_coeffs.vg_lme = scaling_factor * args.orig_loss_coeffs[1].vg_lme
-            args.bwd_loss_coeffs.emp_z = scaling_factor * args.orig_loss_coeffs[1].emp_z
-
-        if it > args.e3_time:
-            # exploitation: terminal TB
-            scaling_factor = smoothstep(it, args.e3_time, 50)
-
-            args.fwd_loss_coeffs.tb = scaling_factor * 1
-            args.fwd_loss_coeffs.vg_lb = 0
-            args.fwd_loss_coeffs.vg_lme = 0
-            args.fwd_loss_coeffs.emp_z = 0
-            args.fwd_loss_coeffs.mle = 0
-
-            args.bwd_loss_coeffs.tb = scaling_factor * 1
-            args.bwd_loss_coeffs.vg_lb = 0
-            args.bwd_loss_coeffs.vg_lme = 0
-            args.bwd_loss_coeffs.emp_z = 0
-            args.bwd_loss_coeffs.mle = 0
-
-            # args.fwd_loss_coeffs.greedy = scaling_factor * args.orig_loss_coeffs[0].greedy
-            # args.fwd_loss_coeffs.detach_after = 0.5 # doesn't work anyway
+    update_loss_schedule(it, args.fwd_loss_schedule.__dict__, args.fwd_loss_coeffs.__dict__)
+    update_loss_schedule(it, args.bwd_loss_schedule.__dict__, args.bwd_loss_coeffs.__dict__)
 
 
 def step_lr_schedule(schedulers, optimizers,

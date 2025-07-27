@@ -372,7 +372,7 @@ class MolecularCrystal(BaseSet):
         if self.sg_conditioning:
             conds.append(sg_embedding)
 
-        return log_T_tensor.flatten(), sg_embedding.flatten(), torch.cat(conds, dim=1)
+        return log_T_tensor.flatten(), sg_embedding.flatten(), torch.cat(conds, dim=1) if len(conds) > 0 else torch.zeros_like(log_T_tensor)
 
 def generate_modes(K=20, D=12, rho=4.0, delta=3.0, seed=42):
     np.random.seed(seed)

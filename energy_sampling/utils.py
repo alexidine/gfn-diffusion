@@ -370,8 +370,33 @@ def compute_sample_overlap(ref_x, sample_x=None, ga: float = 1.0, agg='sum'):
     elif agg == 'mean':
         return torch.exp(-ga * d ** 2).mean(dim=0)
 
+
 def smoothstep(x, t, delta):
     if not torch.is_tensor(x):
         x = torch.tensor([x])
     x_clipped = torch.clamp((x - t) / delta, 0.0, 1.0)
-    return float(x_clipped**2 * (3 - 2 * x_clipped))  # smoothstep polynomial
+    return float(x_clipped ** 2 * (3 - 2 * x_clipped))  # smoothstep polynomial
+
+
+def triangle_schedule(it, init, maxval, minval, on, off):
+    if it <= on:
+        # ramp up
+        frac = (it / on) if on > 0 else 1.0
+        return init * (1 - frac) + maxval * frac
+    elif on < it <= off:
+        # ramp down
+        frac = (it - on) / (off - on) if (off - on) > 0 else 1.0
+        return maxval * (1 - frac) + minval * frac
+    else:
+        return minval
+
+
+def update_loss_schedule(it, loss_schedule, active_coeffs):
+    for key, spec in loss_schedule.items():
+        init = spec.init
+        maxval = spec.max
+        minval = spec.min
+        on = spec.on
+        off = spec.off
+
+        active_coeffs[key] = triangle_schedule(it, init, maxval, minval, on, off)
