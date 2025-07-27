@@ -554,8 +554,8 @@ def init_buffers_datasets(energy_function):
         rng = np.random.RandomState(0)
         rands = rng.choice(len(qm9_mols), len(qm9_mols), replace=False)
         bp = int(len(rands) * 0.8)
-        for mol in qm9_mols:
-            mol.deprotonate()  # since we'll be comparing against CSD later, deprotonate here
+        # for mol in qm9_mols:
+        #     mol.deprotonate()  # since we'll be comparing against CSD later, deprotonate here
         train_mols_list = [qm9_mols[ind] for ind in rands[:bp]]
         test_mols_list = [qm9_mols[ind] for ind in rands[bp:]]
 

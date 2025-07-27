@@ -127,7 +127,7 @@ energy_function: combo
   # 'silu_energy' : minimize a softened LJ-tye energy subject to energy_density_coeff external pressure
   # 'combo' : silu + ellipsoid overlap + density term
 anneal_temperature: True  # scale temperature over time, when conditional it scales the distribution, when not it just decreases from static to min
-temp_annealing_max_steps: 1000  # time for scaling_factor to reach 1 (uniform sampling from min to max)
+temp_annealing_max_steps: 2000  # time for scaling_factor to reach 1 (uniform sampling from min to max)
 anneal_repulsion: False
 repulsion_annealing_max_steps: 5000
 energy_density_coeff: 2.0  # how much to weight the density penalty term in the energy function
