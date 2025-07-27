@@ -84,7 +84,7 @@ eval_period: 500
 exploration_factor: 0.1
 exploration_wd: true
 exploratory: true
-figs_period: 2000
+figs_period: 1000
 fwd_loss_coeffs:
   buffer:
     init: 0.0
@@ -189,7 +189,7 @@ lr_flow: 0.1
 lr_policy: 0.0001
 lr_warmup_ratio: 100
 lr_warmup_time: 1000
-max_batch_size: 50
+max_batch_size: 100
 max_traj_length: 20
 min_lr: 1.0e-06
 min_traj_length: 10
