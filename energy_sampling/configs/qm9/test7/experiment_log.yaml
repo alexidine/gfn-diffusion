@@ -70,3 +70,18 @@
   - fwd_loss_coeffs
   - bwd_loss_coeffs
   notes: ''
+- index: 6
+  tag: 6_just_vg_high_lr
+  update_keys:
+  - lr_policy
+  - lr_flow
+  - lr_back
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''

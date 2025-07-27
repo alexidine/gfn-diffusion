@@ -17,7 +17,7 @@ reweight_T: null                # 'null' or float: smaller values reduce the imp
 
 # model parameters
 zero_init: False
-joint_layers: 4              # number of layers in forward/backward policy models
+joint_layers: 8              # number of layers in forward/backward policy models
 hidden_dim: 512              # dimensionality of hidden layer
 s_emb_dim: 512                # dimensionality of state embedding
 t_emb_dim: 32                # dimensionality of time embedding
