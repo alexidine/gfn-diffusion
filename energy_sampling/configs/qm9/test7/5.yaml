@@ -22,7 +22,7 @@ bwd_loss_coeffs:
     init: 1.0
     max: 1.0
     min: 1.0
-    'off': 1.0e9
+    'off': 1000000000.0
     'on': 0
   mle_prior_fraction:
     init: 1.0

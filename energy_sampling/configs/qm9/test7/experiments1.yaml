@@ -77,13 +77,13 @@ experiments:
     t_scale: 0.1
     pb_scale_range: 0.2
     fwd_loss_coeffs:
-      tb: { init: 0.0, max: 1.0, min: 1.0, 'on': 20000,    'off': 1.0e9 }
+      tb: { init: 0.0, max: 1.0, min: 1.0, 'on': 20000,    'off': 1.0E+9 }
       vg_lme: { init: 1.0, max: 1.0, min: 0.0, 'on': 10000,    'off': 20000 }  # exclusive with vg_lb
       emp_z: { init: 1.0, max: 1.0, min: 0.0, 'on': 10000,    'off': 20000 }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
       mle: { init: 1.0, max: 2.0, min: 0.0, 'on': 1000,    'off': 10000 }
 
     bwd_loss_coeffs:
-      tb: { init: 0.0, max: 1.0, min: 1.0, 'on': 20000,    'off': 1.0e9 }
+      tb: { init: 0.0, max: 1.0, min: 1.0, 'on': 20000,    'off': 1.0E+9 }
       vg_lme: { init: 1.0, max: 1.0, min: 0.0, 'on': 10000,    'off': 20000 }  # exclusive with vg_lb
       emp_z: { init: 1.0, max: 1.0, min: 0.0, 'on': 10000,    'off': 20000 }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
       mle: { init: 1.0, max: 2.0, min: 0.0, 'on': 1000,    'off': 10000 }
@@ -132,6 +132,6 @@ experiments:
       tb: { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1 }
       vg_lme: { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1 }  # exclusive with vg_lb
       emp_z: { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1 }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
-      mle: { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1.0e9 }
+      mle: { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1.0E+9 }
       mle_prior_fraction: { init: 1.0,max: 1.0,min: 0.0, 'on': 0,    'off': 20000 }
       pmle_std: { init: 4.0, max: 4.0, min: 4.0, 'on': 0,    'off': 1 }  # std deviation of the prior mle distribution

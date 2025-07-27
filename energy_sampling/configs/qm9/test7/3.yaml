@@ -46,7 +46,7 @@ bwd_loss_coeffs:
     init: 0.0
     max: 1.0
     min: 1.0
-    'off': 1.0e9
+    'off': 1000000000.0
     'on': 20000
   vg_lb:
     init: 0.0
@@ -138,7 +138,7 @@ fwd_loss_coeffs:
     init: 0.0
     max: 1.0
     min: 1.0
-    'off': 1.0e9
+    'off': 1000000000.0
     'on': 20000
   var:
     init: 0.0
