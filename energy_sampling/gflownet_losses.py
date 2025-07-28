@@ -9,6 +9,21 @@ from mxtaltools.dataset_utils.utils import collate_data_list
 from utils import compute_sample_overlap
 
 
+def diagonal_gaussian_log_density(x, mu, sigma):
+    """
+    x     : (batch_size, d)
+    mu    : (d,) or (batch_size, d)
+    sigma : (d,) or (batch_size, d) — standard deviation (not variance!)
+
+    Returns: (batch_size,) log-probability under diagonal Gaussian
+    """
+    var = sigma ** 2
+    log_term = torch.log(2 * math.pi * var)
+    sq_term = ((x - mu) ** 2) / var
+    log_density = -0.5 * (log_term + sq_term)
+    return log_density.sum(dim=1)  # sum over dimensions
+
+
 def get_loss_reward(log_T_tensor, log_reward_fn, mol_batch, return_exp, states, no_grad: bool = True):
     if log_T_tensor is not None:
         log_temperature = log_T_tensor
@@ -96,6 +111,12 @@ def get_gfn_forward_loss(loss_coeffs,
         greedy_loss = soft_saturate(-log_r)
         losses.append(greedy_loss * loss_coeffs.greedy)
 
+    if loss_coeffs.reinforce > 0:
+        log_r_det = log_r.detach()
+        centered_log_r = log_r_det - log_r_det.mean()
+        reinforce_loss = -centered_log_r * log_pf
+        losses.append(reinforce_loss * loss_coeffs.reinforce)
+
     """trajectory smoothing loss"""
     if loss_coeffs.smoothed > 0:
         smoothness_loss = normed_smoothness_loss(torch.stack([means_f, logvars_f, means_b, logvars_b])).mean(dim=0)
@@ -135,9 +156,9 @@ def get_gfn_forward_loss(loss_coeffs,
 
     if loss_coeffs.emp_z > 0:  # train the flow model to match the empirical log Z distribution
         if gfn.conditional_flow_model:
-            emp_z_loss = (0.5 * (log_Z - log_flow.view(repeats, -1))**2).view(-1)
+            emp_z_loss = (0.5 * (log_Z - log_flow.view(repeats, -1)) ** 2).view(-1)
         else:
-            emp_z_loss = 0.5 * (log_Z - log_flow)**2
+            emp_z_loss = 0.5 * (log_Z - log_flow) ** 2
         losses.append(emp_z_loss * loss_coeffs.emp_z)
 
     """MLE/TPM loss"""
@@ -214,6 +235,8 @@ def get_gfn_forward_loss(loss_coeffs,
         loss_dict = {}
         if loss_coeffs.greedy > 0:
             loss_dict['greedy'] = greedy_loss.mean().detach()
+        if loss_coeffs.reinforce > 0:
+            loss_dict['reinforce'] = reinforce_loss.mean().detach()
         if loss_coeffs.smoothed > 0:
             loss_dict['smoothed'] = smoothness_loss.mean().detach()
         if loss_coeffs.tb > 0:
@@ -323,9 +346,9 @@ def get_gfn_backward_loss(loss_coeffs,
 
     if loss_coeffs.emp_z > 0:  # train the flow model to match the empirical log Z distribution
         if gfn.conditional_flow_model:
-            emp_z_loss = (0.5 * (log_Z - log_flow.view(repeats, -1))**2).view(-1)
+            emp_z_loss = (0.5 * (log_Z - log_flow.view(repeats, -1)) ** 2).view(-1)
         else:
-            emp_z_loss = 0.5 * (log_Z - log_flow)**2
+            emp_z_loss = 0.5 * (log_Z - log_flow) ** 2
         losses.append(emp_z_loss * loss_coeffs.emp_z)
 
     if loss_coeffs.mle > 0:

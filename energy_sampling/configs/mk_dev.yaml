@@ -50,13 +50,13 @@ energy: "molecular_crystal"  # "molecular_crystal"
 # ramp: 'linear': tringular profile from init-> max -> min
 # ramp: 'step': smoothstep profile from init -> max over time on - width: on
 fwd_loss_coeffs:
-
   tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
   vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-  vg_lme:           { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1  }  # exclusive with vg_lb
-  emp_z:            { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1  }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
+  vg_lme:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # exclusive with vg_lb
+  emp_z:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
   greedy:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-  mle:              { init: 2.0, max: 2.0, min: 0.0, 'on': 0,    'off': 1000  }
+  reinforce:        { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1    }
+  mle:              { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
   var:              { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
   overlap:          { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
   buffer:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
@@ -69,14 +69,14 @@ fwd_loss_coeffs:
 bwd_loss_coeffs:
   tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
   vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-  vg_lme:           { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1  }  # exclusive with vg_lb
-  emp_z:            { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1    }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
-  mle:              { init: 2.0, max: 2.0, min: 0.0, 'on': 0,    'off': 1000  }
+  vg_lme:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # exclusive with vg_lb
+  emp_z:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
+  mle:              { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
   smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
-  mle_prior_fraction: { init: 1.0,max: 1.0,min: 0.0, 'on': 0,    'off': 1000 }
+  mle_prior_fraction: { init: 1.0,max: 1.0,min: 1.0, 'on': 0,    'off': 1 }
   pmle_std:         { init: 6.0, max: 6.0, min: 6.0, 'on': 0,    'off': 1 }  # std deviation of the prior mle distribution
 
-both_ways: True             # forward and backward training
+both_ways: False             # forward and backward training
 bwd_batch_multiplier: 1      # ratio of backward to foward batch size (much cheaper to evaluate)
 fwd_to_bwd_ratio: 1           # whether to do forward (>1) or backward (<1) training more often
 bwd: False                   # backward training only
@@ -126,7 +126,7 @@ energy_function: combo
   # 'ellipsoid_overlap' : minimize ellipsoid overlaps subject to energy_density_coeff external pressure
   # 'silu_energy' : minimize a softened LJ-tye energy subject to energy_density_coeff external pressure
   # 'combo' : silu + ellipsoid overlap + density term
-anneal_temperature: True  # scale temperature over time, when conditional it scales the distribution, when not it just decreases from static to min
+anneal_temperature: False  # scale temperature over time, when conditional it scales the distribution, when not it just decreases from static to min
 temp_annealing_max_steps: 2000  # time for scaling_factor to reach 1 (uniform sampling from min to max)
 anneal_repulsion: False
 repulsion_annealing_max_steps: 5000
@@ -138,7 +138,7 @@ lj_start_time: 200  # after how many steps to turn on the LJ energy
 lj_turnover_pot: 10.0  # value above which molecular LJ potential is softcly clipped
 lj_repulsion: 0.85  # max 1. for values less than 1 the potential becomes more attractive
 ellipsoid_scale: 0.0  # how big in angstroms to pad around the rough minimum bounding ellipsoid, maybe [-1,1]
-temperature_conditioning: True  # if false, temperatures are set to energy_static_temperature, and there is no annealing
+temperature_conditioning: False  # if false, temperatures are set to energy_static_temperature, and there is no annealing
 energy_min_temperature: 0.1  # for conditional or annealing
 energy_max_temperature: 10   # for conditional only
 energy_static_temperature: 1  # for certain evaluations or static T training. Also initial temperature on unconditional temperature annealing
