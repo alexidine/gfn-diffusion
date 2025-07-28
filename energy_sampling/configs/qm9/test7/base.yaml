@@ -59,6 +59,7 @@ fwd_loss_coeffs:
   overlap:          { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
   buffer:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
   smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+  reinforce:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
 
   detach_after:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # NON FUNCTIONAL
   var_cutoff:       { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
