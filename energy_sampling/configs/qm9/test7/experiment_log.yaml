@@ -164,3 +164,111 @@
   - fwd_loss_coeffs
   - bwd_loss_coeffs
   notes: ''
+- index: 13
+  tag: 13_greedy_0_0
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 14
+  tag: 14_greedy_0.01_0
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 15
+  tag: 15_greedy_0.1_0
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 16
+  tag: 16_greedy_0_0.01
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 17
+  tag: 17_greedy_0_0.1
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 18
+  tag: 18_greedy_0.01_0.01
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 19
+  tag: 19_greedy_0.1_0.01
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 20
+  tag: 20_greedy_0.01_0.1
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 21
+  tag: 21_greedy_0.1_0.1
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
