@@ -319,11 +319,11 @@ experiments:
     t_scale: 0.1
     pb_scale_range: 0.2
     fwd_loss_coeffs:
-      mle: { init: 0.0, max: 0, min: 0.0, 'on': 0,    'off': 1 }
+      mle: { init: 0.001, max: 0, min: 0.0, 'on': 0,    'off': 1 }
       greedy: { init: 1.0, max: 1.0, min: 1.0, 'on': 10000,    'off': 20000}
 
     bwd_loss_coeffs:
-      mle: { init: 0.0, max: 0.0, min: 0.0, 'on': 10000,    'off': 20000}
+      mle: { init: 0.001, max: 0.0, min: 0.0, 'on': 10000,    'off': 20000}
       mle_prior_fraction: { init: 1.0,max: 1.0,min: 1.0, 'on': 0,    'off': 1 }
       pmle_std: { init: 4.0, max: 4.0, min: 4.0, 'on': 0,    'off': 1 }  # std deviation of the prior mle distribution
 
@@ -337,11 +337,11 @@ experiments:
     t_scale: 0.1
     pb_scale_range: 0.2
     fwd_loss_coeffs:
-      mle: { init: 0.0, max: 0.01, min: 0.0, 'on': 0,    'off': 1 }
+      mle: { init: 0.001, max: 0.01, min: 0.0, 'on': 0,    'off': 1 }
       greedy: { init: 1.0, max: 1.0, min: 1.0, 'on': 10000,    'off': 20000}
 
     bwd_loss_coeffs:
-      mle: { init: 0.0, max: 0.0, min: 0.0, 'on': 10000,    'off': 20000}
+      mle: { init: 0.001, max: 0.0, min: 0.001, 'on': 10000,    'off': 20000}
       mle_prior_fraction: { init: 1.0,max: 1.0,min: 1.0, 'on': 0,    'off': 1 }
       pmle_std: { init: 4.0, max: 4.0, min: 4.0, 'on': 0,    'off': 1 }  # std deviation of the prior mle distribution
 
@@ -354,11 +354,11 @@ experiments:
     t_scale: 0.1
     pb_scale_range: 0.2
     fwd_loss_coeffs:
-      mle: { init: 0.0, max: 0.1, min: 0.0, 'on': 0,    'off': 1 }
+      mle: { init: 0.001, max: 0.1, min: 0.0, 'on': 0,    'off': 1 }
       greedy: { init: 1.0, max: 1.0, min: 1.0, 'on': 10000,    'off': 20000}
 
     bwd_loss_coeffs:
-      mle: { init: 0.0, max: 0.0, min: 0.0, 'on': 10000,    'off': 20000}
+      mle: { init: 0.001, max: 0.0, min: 0.001, 'on': 10000,    'off': 20000}
       mle_prior_fraction: { init: 1.0,max: 1.0,min: 1.0, 'on': 0,    'off': 1 }
       pmle_std: { init: 4.0, max: 4.0, min: 4.0, 'on': 0,    'off': 1 }  # std deviation of the prior mle distribution
 
@@ -371,11 +371,11 @@ experiments:
     t_scale: 0.1
     pb_scale_range: 0.2
     fwd_loss_coeffs:
-      mle: { init: 0.0, max: 0, min: 0.0, 'on': 0,    'off': 1 }
+      mle: { init: 0.001, max: 0, min: 0.0, 'on': 0,    'off': 1 }
       greedy: { init: 1.0, max: 1.0, min: 1.0, 'on': 10000,    'off': 20000}
 
     bwd_loss_coeffs:
-      mle: { init: 0.0, max: 0.01, min: 0.0, 'on': 10000,    'off': 20000}
+      mle: { init: 0.001, max: 0.01, min: 0.001, 'on': 10000,    'off': 20000}
       mle_prior_fraction: { init: 1.0,max: 1.0,min: 1.0, 'on': 0,    'off': 1 }
       pmle_std: { init: 4.0, max: 4.0, min: 4.0, 'on': 0,    'off': 1 }  # std deviation of the prior mle distribution
 
@@ -388,11 +388,11 @@ experiments:
     t_scale: 0.1
     pb_scale_range: 0.2
     fwd_loss_coeffs:
-      mle: { init: 0.0, max: 0, min: 0.0, 'on': 0,    'off': 1 }
+      mle: { init: 0.001, max: 0, min: 0.0, 'on': 0,    'off': 1 }
       greedy: { init: 1.0, max: 1.0, min: 1.0, 'on': 10000,    'off': 20000}
 
     bwd_loss_coeffs:
-      mle: { init: 0.0, max: 0.1, min: 0.0, 'on': 10000,    'off': 20000}
+      mle: { init: 0.001, max: 0.1, min: 0.001, 'on': 10000,    'off': 20000}
       mle_prior_fraction: { init: 1.0,max: 1.0,min: 1.0, 'on': 0,    'off': 1 }
       pmle_std: { init: 4.0, max: 4.0, min: 4.0, 'on': 0,    'off': 1 }  # std deviation of the prior mle distribution
 
@@ -405,11 +405,11 @@ experiments:
     t_scale: 0.1
     pb_scale_range: 0.2
     fwd_loss_coeffs:
-      mle: { init: 0.0, max: 0.01, min: 0.0, 'on': 0,    'off': 1 }
+      mle: { init: 0.001, max: 0.01, min: 0.0, 'on': 0,    'off': 1 }
       greedy: { init: 1.0, max: 1.0, min: 1.0, 'on': 10000,    'off': 20000}
 
     bwd_loss_coeffs:
-      mle: { init: 0.0, max: 0.01, min: 0.0, 'on': 10000,    'off': 20000}
+      mle: { init: 0.001, max: 0.01, min: 0.001, 'on': 10000,    'off': 20000}
       mle_prior_fraction: { init: 1.0,max: 1.0,min: 1.0, 'on': 0,    'off': 1 }
       pmle_std: { init: 4.0, max: 4.0, min: 4.0, 'on': 0,    'off': 1 }  # std deviation of the prior mle distribution
 
@@ -422,11 +422,11 @@ experiments:
     t_scale: 0.1
     pb_scale_range: 0.2
     fwd_loss_coeffs:
-      mle: { init: 0.0, max: 0.1, min: 0.0, 'on': 0,    'off': 1 }
+      mle: { init: 0.001, max: 0.1, min: 0.0, 'on': 0,    'off': 1 }
       greedy: { init: 1.0, max: 1.0, min: 1.0, 'on': 10000,    'off': 20000}
 
     bwd_loss_coeffs:
-      mle: { init: 0.0, max: 0.01, min: 0.0, 'on': 10000,    'off': 20000}
+      mle: { init: 0.001, max: 0.01, min: 0.001, 'on': 10000,    'off': 20000}
       mle_prior_fraction: { init: 1.0,max: 1.0,min: 1.0, 'on': 0,    'off': 1 }
       pmle_std: { init: 4.0, max: 4.0, min: 4.0, 'on': 0,    'off': 1 }  # std deviation of the prior mle distribution
 
@@ -439,11 +439,11 @@ experiments:
     t_scale: 0.1
     pb_scale_range: 0.2
     fwd_loss_coeffs:
-      mle: { init: 0.0, max: 0.01, min: 0.0, 'on': 0,    'off': 1 }
+      mle: { init: 0.001, max: 0.01, min: 0.0, 'on': 0,    'off': 1 }
       greedy: { init: 1.0, max: 1.0, min: 1.0, 'on': 10000,    'off': 20000}
 
     bwd_loss_coeffs:
-      mle: { init: 0.0, max: 0.1, min: 0.0, 'on': 10000,    'off': 20000}
+      mle: { init: 0.001, max: 0.1, min: 0.001, 'on': 10000,    'off': 20000}
       mle_prior_fraction: { init: 1.0,max: 1.0,min: 1.0, 'on': 0,    'off': 1 }
       pmle_std: { init: 4.0, max: 4.0, min: 4.0, 'on': 0,    'off': 1 }  # std deviation of the prior mle distribution
 
@@ -457,11 +457,11 @@ experiments:
     t_scale: 0.1
     pb_scale_range: 0.2
     fwd_loss_coeffs:
-      mle: { init: 0.0, max: 0.1, min: 0.0, 'on': 0,    'off': 1 }
+      mle: { init: 0.001, max: 0.1, min: 0.0, 'on': 0,    'off': 1 }
       greedy: { init: 1.0, max: 1.0, min: 1.0, 'on': 10000,    'off': 20000}
 
     bwd_loss_coeffs:
-      mle: { init: 0.0, max: 0.1, min: 0.0, 'on': 10000,    'off': 20000}
+      mle: { init: 0.001, max: 0.1, min: 0.001, 'on': 10000,    'off': 20000}
       mle_prior_fraction: { init: 1.0,max: 1.0,min: 1.0, 'on': 0,    'off': 1 }
       pmle_std: { init: 4.0, max: 4.0, min: 4.0, 'on': 0,    'off': 1 }  # std deviation of the prior mle distribution
 

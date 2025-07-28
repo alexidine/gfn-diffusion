@@ -19,9 +19,9 @@ bwd_loss_coeffs:
     'off': 1
     'on': 0
   mle:
-    init: 0.0
+    init: 0.001
     max: 0.1
-    min: 0.0
+    min: 0.001
     'off': 20000
     'on': 10000
   mle_prior_fraction:
@@ -117,7 +117,7 @@ fwd_loss_coeffs:
     'off': 20000
     'on': 10000
   mle:
-    init: 0.0
+    init: 0.001
     max: 0
     min: 0.0
     'off': 1
