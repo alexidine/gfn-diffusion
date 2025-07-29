@@ -272,3 +272,43 @@
   - fwd_loss_coeffs
   - bwd_loss_coeffs
   notes: ''
+- index: 22
+  tag: 22_vg_mle_tb_RF
+  update_keys:
+  - repeats
+  - beta
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 23
+  tag: 23_just_vg_RF
+  update_keys:
+  - repeats
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 24
+  tag: 23_fvg_bmle_RF
+  update_keys:
+  - repeats
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
