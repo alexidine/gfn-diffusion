@@ -1,14 +1,13 @@
+import math
 from typing import Optional
 
-import torch
-import math
 import numpy as np
+import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from .architectures import FlowModel, NoneModule, LearnableScalar, TimeEncoding, StateEncoding, PolicyModel
-from utils import gaussian_params, get_gfn_init_state
+from energy_sampling.utils import gaussian_params
 from mxtaltools.models.modules.components import scalarMLP
+from .architectures import FlowModel, NoneModule, LearnableScalar, TimeEncoding, StateEncoding, PolicyModel
 
 logtwopi = math.log(2 * math.pi)
 

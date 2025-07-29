@@ -13,6 +13,10 @@ import PIL
 import numpy as np
 import torch
 import yaml
+from torch_geometric.loader import DataLoader
+from tqdm import tqdm
+
+from mxtaltools.models.utils import load_encoder
 
 
 def set_seed(seed):
@@ -400,3 +404,78 @@ def update_loss_schedule(it, loss_schedule, active_coeffs):
         off = spec.off
 
         active_coeffs[key] = triangle_schedule(it, init, maxval, minval, on, off)
+
+
+def featurize_dataset(dataset, device, ellipsoid_scale):
+    batch_size = 500
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        drop_last=False
+    )
+    with torch.no_grad():
+        overlaps = []
+        silus = []
+        ljs = []
+
+        for crystal_batch in tqdm(loader):
+            crystal_batch = crystal_batch.to(device)
+            crystal_batch.box_analysis()
+            cluster_batch = crystal_batch.mol2cluster(cutoff=6,
+                                                      supercell_size=10,
+                                                      align_to_standardized_orientation=True)
+
+            cluster_batch.construct_radial_graph(cutoff=6)
+
+            lj_energy, normed_lj_energy = cluster_batch.compute_LJ_energy()
+            silu_energy = cluster_batch.compute_silu_energy()
+
+            # simplified ellipsoid energy testing
+            _, _, _, _, _, _, normed_ellipsoid_overlap \
+                = cluster_batch.compute_ellipsoidal_overlap(
+                surface_padding=ellipsoid_scale,
+                return_details=True)
+
+            overlaps.extend(normed_ellipsoid_overlap.cpu().detach().numpy())
+            silus.extend(silu_energy.cpu().detach().numpy())
+            ljs.extend(lj_energy.cpu().detach().numpy())
+
+        overlaps = torch.tensor(overlaps)
+        silus = torch.tensor(silus)
+        ljs = torch.tensor(ljs)
+        for ind, elem in enumerate(dataset):
+            elem.ellipsoid_overlap = torch.ones(1) * overlaps[ind]
+            elem.silu_pot = torch.ones(1) * silus[ind]
+            elem.lj_pot = torch.ones(1) * ljs[ind]
+
+    return dataset
+
+
+def embed_dataset(dataset, autoencoder_path=None, device=None, encoder=None):
+    batch_size = 500
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        drop_last=False
+    )
+    with torch.no_grad():
+        if encoder is None:
+            encoder = load_encoder(autoencoder_path).to(device).eval()
+
+        embeddings = []
+
+        for crystal_batch in tqdm(loader):
+            crystal_batch = crystal_batch.to(device)
+            # for now, make all the embeddings exactly standardized,
+            # and we'll generate also in the standardized basis
+            crystal_batch.orient_molecule(mode='standardized',
+                                          target_handedness=torch.ones_like(crystal_batch.radius)
+                                          )
+            embeddings.append(encoder.encode(crystal_batch).clone().cpu())
+            del crystal_batch
+
+        embeddings = torch.cat(embeddings, dim=0)
+        for ind, elem in enumerate(dataset):
+            elem.embedding = embeddings[None, ind]
+
+    return dataset

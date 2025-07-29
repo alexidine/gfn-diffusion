@@ -1,0 +1,206 @@
+import numpy as np
+import torch
+from scipy.spatial.distance import jensenshannon
+from tqdm import tqdm
+
+from energy_sampling.utils import uniform_discretizer, get_gfn_init_state, embed_dataset, logmeanexp
+from mxtaltools.analysis.crystal_rdf import crystal_rdf, compute_rdf_distance
+from mxtaltools.dataset_utils.utils import collate_data_list
+
+
+def sample_from_generator(
+        gfn_model,
+        batch_size,
+        mol_list,
+        space_group,
+        n_steps,
+        samples_per_mol,
+        device,
+        energy_function,
+        encoder=None,
+):
+    """
+    :param gfn_model:
+    :param batch_size:
+    :param mol_list:
+    :param space_group:
+    :param n_steps:
+    :param samples_per_mol:
+    :param device:
+    :param energy_function:
+    :return:
+    """
+
+    """
+    initialize useful things
+    """
+    with torch.no_grad():
+        discretizer = lambda bsz: uniform_discretizer(bsz, n_steps)
+
+        num_batches = len(mol_list) // batch_size
+        if len(mol_list) % batch_size != 0:
+            num_batches += 1
+
+        energy_function.space_groups = [space_group]
+        init_state = get_gfn_init_state(batch_size, energy_function.data_ndim, device)
+
+        params_record = np.zeros((samples_per_mol, len(mol_list), 12))
+        energy_record = np.zeros((samples_per_mol, len(mol_list)))
+        density_record = np.zeros_like(energy_record)
+
+        """embed the dataset"""
+        if hasattr(mol_list[0], 'embedding'):
+            if mol_list[0].embedding is not None:
+                pass
+            else:
+                mol_list = embed_dataset(mol_list, encoder=encoder)
+        else:
+            mol_list = embed_dataset(mol_list, encoder=encoder)
+
+        """sample"""
+        sample_record = []
+        for s_ind in tqdm(range(samples_per_mol)):
+            ssample_record = []
+            for b_ind in range(num_batches):
+                batch_inds = np.arange(b_ind * batch_size, (b_ind + 1) * batch_size)
+                mol_batch = collate_data_list([mol_list[ind] for ind in batch_inds]).to(device)
+                (flow_states, samples, log_r, log_Z, log_Z_lb,
+                 log_Z_learned, sample_batch, condition, log_pfs, log_pbs, log_fs,
+                 f_means_f, f_vars_f, f_means_b, f_vars_b,
+                 log_T_tensor) = log_partition_function(
+                    init_state, gfn_model, discretizer, energy_function, mol_batch)
+
+                params_record[s_ind, batch_inds] = flow_states[:, -1].cpu().detach().numpy()
+                energy_record[s_ind, batch_inds] = sample_batch.silu_pot.cpu().detach().numpy()
+                density_record[s_ind, batch_inds] = sample_batch.packing_coeff.cpu().detach().numpy()
+                ssample_record.append(sample_batch.cpu().detach().to_data_list())
+            sample_record.append(ssample_record)
+
+    return params_record, energy_record, density_record, sample_record
+
+
+@torch.no_grad()
+def log_partition_function(initial_state, gfn, discretizer, energy_function, mol_batch):
+    log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(mol_batch)
+    mol_batch.sg_ind = sg_inds
+    (states, log_pfs, log_pbs, log_fs,
+     means_f, logvars_f, means_b, logvars_b) = gfn.get_trajectory_fwd(initial_state,
+                                                                      discretizer,
+                                                                      None,
+                                                                      condition,
+                                                                      return_gauss_params=True)
+    log_r, sample_batch = energy_function.log_reward(
+        states[:, -1], mol_batch=mol_batch,
+        log_temperature=log_T_tensor,
+        return_exp=True)
+    log_weight = log_r + log_pbs.sum(-1) - log_pfs.sum(-1)
+
+    log_Z = logmeanexp(log_weight)
+    log_Z_lb = log_weight.mean()
+    log_Z_learned = log_fs[:, 0].mean()
+
+    return (states, states[:, -1],
+            log_r, log_Z, log_Z_lb, log_Z_learned,
+            sample_batch, condition,
+            log_pfs, log_pbs, log_fs,
+            means_f, logvars_f, means_b, logvars_b,
+            log_T_tensor)
+
+
+@torch.no_grad()
+def mean_log_likelihood(terminal_state, gfn, log_reward_fn, num_evals=10):
+    bsz = terminal_state.shape[0]
+    terminal_state = terminal_state.unsqueeze(1).repeat(1, num_evals, 1).view(bsz * num_evals, -1)
+    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, None, log_reward_fn)
+    log_weight = (log_pfs.sum(-1) - log_pbs.sum(-1)).view(bsz, num_evals, -1)
+    return logmeanexp(log_weight, dim=1).mean()
+
+
+def crystal_list_rdf(samples, batch_size, device):
+    num_batches = len(samples) // batch_size
+    if len(samples) % batch_size != 0:
+        num_batches += 1
+
+    rdfs = []
+    for b_ind in tqdm(range(num_batches)):
+        batch_inds = np.arange(b_ind * batch_size, (b_ind + 1) * batch_size)
+        mol_batch = collate_data_list([samples[ind] for ind in batch_inds]).to(device)
+        rdf, rr = get_rdfs(mol_batch)
+        rdfs.append(rdf)
+
+    return torch.cat(rdfs), rr
+
+
+def get_rdfs(crystal_batch):
+    with torch.no_grad():
+        _, _, _, cluster_batch = crystal_batch.build_and_analyze(
+            return_cluster=True, cutoff=6)
+        rdf, rr, _ = crystal_rdf(cluster_batch,
+                                 cluster_batch.edges_dict,
+                                 rrange=[0, 6], bins=2000,
+                                 mode='intermolecular',
+                                 elementwise=True,
+                                 raw_density=True,
+                                 cpu_detach=False)
+
+    return rdf.cpu().detach(), rr
+
+
+def sample_csd_rdf_dists(csd_mols, csd_sampling_dict, eval_batch_size, device):
+    sample_rdfs = []
+    for ind in range(len(csd_mols)):
+        identifier = csd_mols[ind].identifier
+        samples = csd_sampling_dict[identifier]['samples'][0]
+        samples = [item for sublist in samples for item in sublist]
+
+        rdf, rr = crystal_list_rdf(samples,
+                                           eval_batch_size,
+                                           device)
+        sample_rdfs.append(rdf)
+
+    sample_rdfs = torch.stack(sample_rdfs)
+
+    csd_rdfs, rr = crystal_list_rdf(csd_mols,
+                                    eval_batch_size,
+                                    device)
+
+    rdf_dists = torch.zeros_like(sample_rdfs[:, :, 0, 0])
+    for ind in range(len(csd_mols)):
+        rdf_dists[ind] = compute_rdf_distance(csd_rdfs[ind].to(device), sample_rdfs[ind].to(device), rr)
+    return rdf_dists, rr
+
+
+def sample_csd_lattice_divs(csd_mols, csd_sampling_dict):
+    identifiers = [elem.identifier for elem in csd_mols]
+    js_divs = []
+    for ind, ident in enumerate(identifiers):
+        box_matrix = csd_mols[ind].T_fc[0].T.cpu().detach().numpy()
+        csd_dists = lattice_distance_spectrum(box_matrix,
+                                              max_radius=50,
+                                              resolution=0.01)
+        samples = csd_sampling_dict[identifiers[ind]]['samples'][0]
+        samples = [item for sublist in samples for item in sublist]
+        hist1, hr = np.histogram(csd_dists, bins=100, range=[0, 50])
+        divs = []
+
+        for j in range(len(samples)):
+            box_matrix = samples[j].T_fc[0].T.cpu().detach().numpy()
+            sample_dists = lattice_distance_spectrum(box_matrix,
+                                                     max_radius=50,
+                                                     resolution=0.01)
+            hist2, hr = np.histogram(sample_dists, bins=100, range=[0, 50])
+            divs.append(jensenshannon(hist1, hist2))
+
+        js_divs.append(divs)
+
+    return js_divs
+
+
+def lattice_distance_spectrum(cell_matrix, max_radius=0.0, resolution=0.01):
+    """Compute sorted inter-point distances for lattice defined by 3x3 cell_matrix"""
+    max_index = int(np.ceil(max_radius / np.min(np.linalg.norm(cell_matrix, axis=1))))
+    shifts = np.mgrid[-max_index:max_index + 1, -max_index:max_index + 1, -max_index:max_index + 1].reshape(3, -1).T
+    distances = np.linalg.norm(shifts @ cell_matrix, axis=1)
+    distances = distances[(distances > 1e-8) & (distances < max_radius)]
+    distances = np.sort(np.round(distances / resolution) * resolution)  # bin by resolution
+    return distances

@@ -7,24 +7,23 @@ from time import time
 from typing import Optional
 
 import numpy as np
-import plotly.graph_objects as go
 import torch
 import torch.nn.functional as F
 import wandb
 from torch.optim import lr_scheduler
 from torch_geometric.loader import DataLoader
-from tqdm import tqdm, trange
+from tqdm import trange
 
-from buffer import CrystalReplayBuffer
 from energies.molecular_crystal import MolecularCrystal
-from evaluations import eval_step
+from energy_sampling.buffer import CrystalReplayBuffer
+from energy_sampling.utils import featurize_dataset, embed_dataset
+from eval.evaluations import eval_step
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 from models import GFN
 from mxtaltools.common.config_processing import dict2namespace
 from mxtaltools.common.training_utils import flatten_wandb_params
 from mxtaltools.dataset_utils.data_classes import MolData
 from mxtaltools.dataset_utils.utils import collate_data_list
-from mxtaltools.models.utils import load_encoder
 from utils import get_train_args, get_gfn_init_state, set_seed, \
     get_exploration_std, random_discretizer, low_discrepancy_discretizer, \
     low_discrepancy_discretizer2, shifted_equidistant, uniform_discretizer, update_loss_schedule
@@ -266,13 +265,15 @@ def train():
                name=name,
                tags=[args.tag])
 
-    gfn_model = GFN(energy_function.data_ndim,
-                    args.s_emb_dim,
-                    args.hidden_dim,
-                    get_conditioning_dim(),
-                    args.harmonics_dim,
-                    args.t_emb_dim, condition_embedding_dim=args.condition_emb_dim,
-                    trajectory_length=args.T, clipping=args.clipping,
+    gfn_model = GFN(dim=energy_function.data_ndim,
+                    s_emb_dim=args.s_emb_dim,
+                    hidden_dim=args.hidden_dim,
+                    conditions_dim=get_conditioning_dim(),
+                    harmonics_dim=args.harmonics_dim,
+                    t_dim=args.t_emb_dim,
+                    condition_embedding_dim=args.condition_emb_dim,
+                    trajectory_length=args.T,
+                    clipping=args.clipping,
                     gfn_clip=args.gfn_clip,
                     learned_variance=args.learned_variance,
                     log_var_range=args.log_var_range,
@@ -284,9 +285,40 @@ def train():
                         args.sg_conditioning]
                     ),
                     learn_pb=args.learn_pb,
-                    joint_layers=args.joint_layers, dropout=args.dropout, norm=args.norm,
-                    zero_init=args.zero_init, device=device).to(device)
-
+                    joint_layers=args.joint_layers,
+                    dropout=args.dropout,
+                    norm=args.norm,
+                    zero_init=args.zero_init,
+                    device=device
+                    ).to(device)
+    gfn_config = dict(
+        dim=energy_function.data_ndim,
+        s_emb_dim=args.s_emb_dim,
+        hidden_dim=args.hidden_dim,
+        conditions_dim=get_conditioning_dim(),
+        harmonics_dim=args.harmonics_dim,
+        t_dim=args.t_emb_dim,
+        condition_embedding_dim=args.condition_emb_dim,
+        trajectory_length=args.T,
+        clipping=args.clipping,
+        gfn_clip=args.gfn_clip,
+        learned_variance=args.learned_variance,
+        log_var_range=args.log_var_range,
+        pb_scale_range=args.pb_scale_range,
+        t_scale=args.t_scale,
+        conditional_flow_model=any([
+            args.temperature_conditioning,
+            args.molecule_conditioning,
+            args.sg_conditioning]
+        ),
+        learn_pb=args.learn_pb,
+        joint_layers=args.joint_layers,
+        dropout=args.dropout,
+        norm=args.norm,
+        zero_init=args.zero_init,
+        device=device
+    )
+    np.save(f'{name}_model_config', gfn_config)
     wandb.watch(gfn_model, log_graph=True, log_freq=1000)  # for gradient logging
 
     optimizers, schedulers = init_schedulers_optimizers(
@@ -355,8 +387,16 @@ def train():
         times['train_step_end'] = time()
 
         if (step_ind % args.eval_period == 0 and step_ind > 0) or step_ind == 50:
-            torch.save(gfn_model.state_dict(), f'{name}model.pt')
-            metrics = do_evaluation(energy_function, buffer, gfn_model, step_ind, metrics, test_mol_loader)
+            torch.save(gfn_model.model_state_dict(), f'{name}_model.pt')
+            metrics = do_evaluation(energy_function, buffer, gfn_model,
+                                    step_ind, metrics, test_mol_loader)
+            if args.molecule_conditioning:
+                train_metrics = do_evaluation(energy_function, buffer, gfn_model,
+                                              step_ind, metrics, train_mol_loader,
+                                              override_do_figures=False)
+                for key in train_metrics.keys():
+                    metrics['train_eval/' + key] = train_metrics[key]
+
             wandb.log(metrics, step=step_ind)
 
         elif step_ind % 10 == 0:
@@ -657,16 +697,19 @@ def handle_train_epoch_error(e, oomed_out, buffer, train_mol_loader, test_mol_lo
     return oomed_out, buffer, train_mol_loader, test_mol_loader
 
 
-def do_evaluation(energy_function, buffer, gfn_model, i, metrics, test_mol_loader):
+def do_evaluation(energy_function, buffer, gfn_model, i, metrics, mol_loader, override_do_figures: Optional[bool] = None):
     times['eval_step_start'] = time()
 
     eval_discretizer = lambda bsz: uniform_discretizer(bsz, args.eval_T)
 
-    do_figures = i % args.figs_period == 0
+    if override_do_figures is not None:
+        do_figures = override_do_figures
+    else:
+        do_figures = i % args.figs_period == 0
     eval_batch_size = args.eval_batch_size
 
-    eval_rands = np.random.randint(len(test_mol_loader.dataset), size=eval_batch_size)
-    mol_batch = collate_data_list([test_mol_loader.dataset[ind] for ind in eval_rands]).to(device)
+    eval_rands = np.random.randint(len(mol_loader.dataset), size=eval_batch_size)
+    mol_batch = collate_data_list([mol_loader.dataset[ind] for ind in eval_rands]).to(device)
 
     init_state = get_gfn_init_state(eval_batch_size, energy_function.data_ndim, args.device)
     metrics.update(
@@ -724,7 +767,7 @@ def add_dataset_to_buffer(dataset_path, buffer):
                                 'silu_energy',
                                 'combo']:  # reparameterize incoming samples
         print("Re-featurizing preloaded buffer samples")
-        dataset = featurize_dataset(dataset)
+        dataset = featurize_dataset(dataset, args.device, args.ellipsoid_scale)
 
     if args.molecule_conditioning:  # embed dataset
         print("Getting preloaded dataset molecule embeddings")
@@ -734,81 +777,6 @@ def add_dataset_to_buffer(dataset_path, buffer):
     print(f"Buffer loaded with {len(dataset)} samples")
 
     return buffer
-
-
-def featurize_dataset(dataset):
-    batch_size = 500
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        drop_last=False
-    )
-    with torch.no_grad():
-        overlaps = []
-        silus = []
-        ljs = []
-
-        for crystal_batch in tqdm(loader):
-            crystal_batch = crystal_batch.to(args.device)
-            crystal_batch.box_analysis()
-            cluster_batch = crystal_batch.mol2cluster(cutoff=6,
-                                                      supercell_size=10,
-                                                      align_to_standardized_orientation=True)
-
-            cluster_batch.construct_radial_graph(cutoff=6)
-
-            lj_energy, normed_lj_energy = cluster_batch.compute_LJ_energy()
-            silu_energy = cluster_batch.compute_silu_energy()
-
-            # simplified ellipsoid energy testing
-            _, _, _, _, _, _, normed_ellipsoid_overlap \
-                = cluster_batch.compute_ellipsoidal_overlap(
-                surface_padding=args.ellipsoid_scale,
-                return_details=True)
-
-            overlaps.extend(normed_ellipsoid_overlap.cpu().detach().numpy())
-            silus.extend(silu_energy.cpu().detach().numpy())
-            ljs.extend(lj_energy.cpu().detach().numpy())
-
-        overlaps = torch.tensor(overlaps)
-        silus = torch.tensor(silus)
-        ljs = torch.tensor(ljs)
-        for ind, elem in enumerate(dataset):
-            elem.ellipsoid_overlap = torch.ones(1) * overlaps[ind]
-            elem.silu_pot = torch.ones(1) * silus[ind]
-            elem.lj_pot = torch.ones(1) * ljs[ind]
-
-    return dataset
-
-
-def embed_dataset(dataset, autoencoder_path=None, device=None, encoder=None):
-    batch_size = 500
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        drop_last=False
-    )
-    with torch.no_grad():
-        if encoder is None:
-            encoder = load_encoder(autoencoder_path).to(device).eval()
-
-        embeddings = []
-
-        for crystal_batch in tqdm(loader):
-            crystal_batch = crystal_batch.to(args.device)
-            # for now, make all the embeddings exactly standardized,
-            # and we'll generate also in the standardized basis
-            crystal_batch.orient_molecule(mode='standardized',
-                                          target_handedness=torch.ones_like(crystal_batch.radius)
-                                          )
-            embeddings.append(encoder.encode(crystal_batch).clone().cpu())
-            del crystal_batch
-
-        embeddings = torch.cat(embeddings, dim=0)
-        for ind, elem in enumerate(dataset):
-            elem.embedding = embeddings[None, ind]
-
-    return dataset
 
 
 def get_annealing_factor(start_value, stop_value, total_time, step_iters):

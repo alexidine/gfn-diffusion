@@ -5,8 +5,7 @@ import numpy as np
 import plotly.colors as pc
 import torch
 import wandb
-from mxtaltools.reporting.figures import simple_cell_hist, simple_cell_scatter_fig, \
-    log_crystal_samples, simple_latent_hist
+from energy_sampling.eval.plot_utils import get_plotly_fig_size_mb
 from plotly import graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.ndimage import gaussian_filter
@@ -18,55 +17,11 @@ from skimage.segmentation import watershed
 from sklearn.cluster import AgglomerativeClustering
 from umap import UMAP
 
+from energy_sampling.eval.utils import log_partition_function
+from energy_sampling.utils import logmeanexp
 from mxtaltools.dataset_utils.utils import collate_data_list
-from plot_utils import get_plotly_fig_size_mb
-from sample_metrics import compute_distribution_distances
-from utils import logmeanexp
-
-
-@torch.no_grad()
-def log_partition_function(initial_state, gfn, discretizer, energy_function, mol_batch):
-    log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(mol_batch)
-    mol_batch.sg_ind = sg_inds
-    (states, log_pfs, log_pbs, log_fs,
-     means_f, logvars_f, means_b, logvars_b) = gfn.get_trajectory_fwd(initial_state,
-                                                                      discretizer,
-                                                                      None,
-                                                                      condition,
-                                                                      return_gauss_params=True)
-    log_r, sample_batch = energy_function.log_reward(
-        states[:, -1], mol_batch=mol_batch,
-        log_temperature=log_T_tensor,
-        return_exp=True)
-    log_weight = log_r + log_pbs.sum(-1) - log_pfs.sum(-1)
-
-    log_Z = logmeanexp(log_weight)
-    log_Z_lb = log_weight.mean()
-    log_Z_learned = log_fs[:, 0].mean()
-
-    return (states, states[:, -1],
-            log_r, log_Z, log_Z_lb, log_Z_learned,
-            sample_batch, condition,
-            log_pfs, log_pbs, log_fs,
-            means_f, logvars_f, means_b, logvars_b,
-            log_T_tensor)
-
-
-@torch.no_grad()
-def mean_log_likelihood(terminal_state, gfn, log_reward_fn, num_evals=10):
-    bsz = terminal_state.shape[0]
-    terminal_state = terminal_state.unsqueeze(1).repeat(1, num_evals, 1).view(bsz * num_evals, -1)
-    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, None, log_reward_fn)
-    log_weight = (log_pfs.sum(-1) - log_pbs.sum(-1)).view(bsz, num_evals, -1)
-    return logmeanexp(log_weight, dim=1).mean()
-
-
-@torch.no_grad()
-def get_sample_metrics(samples, gt_samples=None, final_eval=False):
-    if gt_samples is None:
-        return
-
-    return compute_distribution_distances(samples.unsqueeze(1), gt_samples.unsqueeze(1), final_eval)
+from mxtaltools.reporting.figures import simple_cell_hist, simple_cell_scatter_fig, \
+    log_crystal_samples
 
 
 @torch.no_grad()
