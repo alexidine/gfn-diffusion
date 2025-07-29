@@ -158,8 +158,8 @@ def train_logic(buffer, it):
         args.bwd_loss_coeffs.mle > 0,
         args.bwd_loss_coeffs.smoothed > 0,
     ]):
-        do_backward=False
-        do_forward=True
+        do_backward = False
+        do_forward = True
 
     return add_to_buffer, do_backward, do_forward, p_forward, report_losses
 

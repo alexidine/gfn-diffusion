@@ -118,9 +118,9 @@ class MolecularCrystal(BaseSet):
         if cluster_batch.device != self.device:
             cluster_batch = cluster_batch.to(self.device)
 
+        latents = cluster_batch.cell_params_to_gen_basis()
         if self.energy_function == 'latent_harmonic':
             # a trivial energy function, for testing
-            latents = cluster_batch.cell_params_to_gen_basis()
             if not hasattr(self, 'modes'):
                 self.modes = -torch.ones((1, 12), device=self.device)
                 self.crystal_modes = cluster_batch.latent_transform.inverse(self.modes,
@@ -140,7 +140,6 @@ class MolecularCrystal(BaseSet):
             # analytic Z = (2pi*T)^(d/2)
 
         elif self.energy_function == 'latent_multiharmonic':
-            latents = cluster_batch.cell_params_to_gen_basis()
             if not hasattr(self, 'modes'):
                 self.modes = torch.tensor(generate_modes(10, 12, 4.0, 3.0), device=self.device)
                 self.crystal_modes = cluster_batch.latent_transform.inverse(self.modes,
@@ -162,7 +161,6 @@ class MolecularCrystal(BaseSet):
             """
 
         elif self.energy_function == 'crystal_multiharmonic':
-            latents = cluster_batch.cell_params_to_gen_basis()
             if not hasattr(self, 'modes'):
                 self.modes = torch.tensor(generate_modes(10, 12, 4.0, 3.0), device=self.device)
                 self.crystal_modes = cluster_batch.latent_transform.inverse(self.modes,
@@ -193,7 +191,9 @@ class MolecularCrystal(BaseSet):
         else:
             assert False, f'{self.energy_function} not implemented'
 
-        return self.soft_clip(crystal_energy,
+        bounding_energy = F.relu(latents - 6)**2 + F.relu(-(latents + 6))**2  # discourage exploration beyond clip range
+        total_energy = crystal_energy + bounding_energy
+        return self.soft_clip(total_energy,
                               self.energy_clip)  # softly bound from above  #crystal_energy.clip(min=-self.energy_clip, max=self.energy_clip)
 
     def core_energy_penalty(self, ellipsoid_overlap):
