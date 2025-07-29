@@ -394,7 +394,7 @@ def get_conditioning_dim():
     if args.molecule_conditioning:
         conditioning_dim += 64 * 3
     if args.sg_conditioning:
-        conditioning_dim += 1
+        conditioning_dim += 237
     return conditioning_dim
 
 

@@ -5,6 +5,8 @@ import numpy as np
 import plotly.colors as pc
 import torch
 import wandb
+from mxtaltools.reporting.figures import simple_cell_hist, simple_cell_scatter_fig, \
+    log_crystal_samples, simple_latent_hist
 from plotly import graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.ndimage import gaussian_filter
@@ -17,8 +19,6 @@ from sklearn.cluster import AgglomerativeClustering
 from umap import UMAP
 
 from mxtaltools.dataset_utils.utils import collate_data_list
-from mxtaltools.reporting.online import simple_cell_hist, simple_cell_scatter_fig, \
-    log_crystal_samples, simple_latent_hist
 from plot_utils import get_plotly_fig_size_mb
 from sample_metrics import compute_distribution_distances
 from utils import logmeanexp
@@ -217,9 +217,10 @@ def generate_fwd_figs(buffer, energy_function,
     fig_dict['Lattice Latents Trajectories'] = visualize_latent_trajs(flow_states.cpu().detach().numpy(),
                                                                       20,
                                                                       log_r.cpu().detach().numpy())
-    fig_dict['Lattice Features Distribution'] = simple_cell_hist(sample_batch, buffer_cell_params)
-    fig_dict['Lattice Latents Distribution'] = simple_latent_hist(sample_batch, flow_states[:, -1, :].cpu().detach().numpy(),
-                                                                  buffer_latent_params)
+    fig_dict['Lattice Features Distribution'] = simple_cell_hist(sample_batch, buffer_cell_params,
+                                                                 n_kde_points=200, bw_ratio=10, mode='cell')
+    fig_dict['Lattice Latents Distribution'] = simple_cell_hist(sample_batch, buffer_latent_params,
+                                                                n_kde_points=200, bw_ratio=10, mode='latent')
     log_T = len(torch.unique(log_T_tensor)) > 1
     fig_dict['Sample Scatter'] = simple_cell_scatter_fig(
         sample_batch,
@@ -838,10 +839,9 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
             ])
             metrics['Buffer Mean Score'] = np.mean(buffer.rewards_list)
 
-
-
     metrics = {k: to_loggable(v) for k, v in metrics.items()}
     return metrics
+
 
 def to_loggable(v):
     if torch.is_tensor(v):
@@ -851,6 +851,8 @@ def to_loggable(v):
         else:
             return v.numpy()
     return v
+
+
 def Z_vs_T_fig(gfn_model, init_state):
     log_temps = torch.linspace(-2, 2, 100).to(init_state.device)[:, None].flatten()
     Z_at_T = gfn_model.flow_model(

@@ -70,3 +70,48 @@
   - fwd_loss_coeffs
   - bwd_loss_coeffs
   notes: ''
+- index: 6
+  tag: 6_mle_mle
+  update_keys:
+  - exploratory
+  - lr_warmup_time
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - max_batch_size
+  - t_scale
+  - pb_scale_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 7
+  tag: 7_mle_mle_high_pb
+  update_keys:
+  - exploratory
+  - lr_warmup_time
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - max_batch_size
+  - t_scale
+  - pb_scale_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 8
+  tag: 6_mle_bigmle
+  update_keys:
+  - exploratory
+  - lr_warmup_time
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - max_batch_size
+  - t_scale
+  - pb_scale_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''

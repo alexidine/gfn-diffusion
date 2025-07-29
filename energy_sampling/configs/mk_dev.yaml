@@ -17,7 +17,7 @@ reweight_T: null                # 'null' or float: smaller values reduce the imp
 
 # model parameters
 zero_init: False
-joint_layers: 4              # number of layers in forward/backward policy models
+joint_layers: 8              # number of layers in forward/backward policy models
 hidden_dim: 512              # dimensionality of hidden layer
 s_emb_dim: 512                # dimensionality of state embedding
 t_emb_dim: 32                # dimensionality of time embedding
@@ -33,7 +33,7 @@ repeats: 5                   # for conditional training, multiplies batch size b
 eval_batch_size: 500        # batch size for evaluation
 epochs: 10000000             # number of training epochs: relatively large
 eval_period: 100              # how often to do evaluation & reporting
-figs_period: 100             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
+figs_period: 200             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # GFlowNet settings
 T: 10                        # static training diffusion length
@@ -51,11 +51,11 @@ energy: "molecular_crystal"  # "molecular_crystal"
 fwd_loss_coeffs:
   tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
   vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-  vg_lme:           { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1  }  # exclusive with vg_lb
-  emp_z:            { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1  }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
+  vg_lme:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # exclusive with vg_lb
+  emp_z:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
   greedy:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
   reinforce:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-  mle:              { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+  mle:              { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1  }
   var:              { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
   overlap:          { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
   buffer:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
@@ -70,7 +70,7 @@ bwd_loss_coeffs:
   vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
   vg_lme:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # exclusive with vg_lb
   emp_z:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
-  mle:              { init: 1.0, max: 1.0, min: 0.0, 'on': 1,    'off': 2000  }
+  mle:              { init: 10.0, max: 10.0, min: 0.0, 'on': 1000,    'off': 2000  }
   smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
   mle_prior_fraction: { init: 0.0,max: 0.0,min: 0.0, 'on': 0,    'off': 1 }
   pmle_std:         { init: 4.0, max: 4.0, min: 6.0, 'on': 0,    'off': 1 }  # std deviation of the prior mle distribution
@@ -135,7 +135,7 @@ energy_core_coeff: 10.0  # loss coefficient
 core_start_time: 100  # after how many steps to turn on the core repulsion energy
 energy_lj_coeff: 1.0  # loss coefficient
 lj_start_time: 200  # after how many steps to turn on the LJ energy
-lj_turnover_pot: 10.0  # value above which molecular LJ potential is softcly clipped
+lj_turnover_pot: 10.0  # value above which molecular LJ potential is softly clipped
 lj_repulsion: 0.85  # max 1. for values less than 1 the potential becomes more attractive
 ellipsoid_scale: 0.0  # how big in angstroms to pad around the rough minimum bounding ellipsoid, maybe [-1,1]
 energy_min_temperature: 0.1  # for conditional or annealing

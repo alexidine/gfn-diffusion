@@ -4,6 +4,7 @@ from typing import Optional
 import numpy as np
 import torch
 
+from mxtaltools.constants.space_group_feature_tensor import SG_FEATURE_TENSOR
 from mxtaltools.dataset_utils.data_classes import MolCrystalData, MolData
 from mxtaltools.dataset_utils.utils import collate_data_list
 
@@ -39,6 +40,7 @@ class MolecularCrystal(BaseSet):
         self.data_ndim = dim
         self.energy_function = energy_function
         self.energy_clip = energy_clip
+        self.SG_FEATURE_TENSOR = SG_FEATURE_TENSOR.clone()  # store space group information
 
         self.ellipsoid_scale = ellipsoid_scale
         self.density_coeff = density_coeff
@@ -364,15 +366,16 @@ class MolecularCrystal(BaseSet):
             conds.append(mol_embedding)
 
         if sg_inds is not None:
-            sg_embedding = sg_inds[:, None]
+            sg_to_sample = sg_inds.clone()
         else:
-            sg_embedding = torch.tensor(np.random.choice(self.space_groups, mol_batch.num_graphs, replace=True)).to(
-                mol_batch.device)[:, None]
+            sg_to_sample = torch.tensor(np.random.choice(self.space_groups, mol_batch.num_graphs, replace=True)).to(
+                mol_batch.device)
 
         if self.sg_conditioning:
-            conds.append(sg_embedding)
+            conds.append(self.SG_FEATURE_TENSOR[sg_to_sample])
 
-        return log_T_tensor.flatten(), sg_embedding.flatten(), torch.cat(conds, dim=1) if len(conds) > 0 else torch.zeros_like(log_T_tensor)
+        return (log_T_tensor.flatten(), sg_to_sample,
+                torch.cat(conds, dim=1) if len(conds) > 0 else torch.zeros_like(log_T_tensor))
 
 def generate_modes(K=20, D=12, rho=4.0, delta=3.0, seed=42):
     np.random.seed(seed)

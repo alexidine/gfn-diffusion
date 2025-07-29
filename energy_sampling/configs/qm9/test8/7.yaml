@@ -1,0 +1,230 @@
+T: 10
+add_to_buffer_each: 10
+anneal_repulsion: false
+anneal_temperature: false
+autoencoder_path: /scratch/mk8347/csd_runs/models/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05
+batch_size: 5
+beta: 10.0
+both_ways: true
+buffer_diversity_coeff: 1.0
+buffer_path: /scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt
+buffer_size: 100000
+bwd: false
+bwd_batch_multiplier: 1
+bwd_loss_coeffs:
+  emp_z:
+    init: 0.0
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
+  mle:
+    init: 1.0
+    max: 1.0
+    min: 1.0
+    'off': 1
+    'on': 0
+  mle_prior_fraction:
+    init: 0.0
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
+  pmle_std:
+    init: 0.0
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
+  smoothed:
+    init: 0.0
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
+  tb:
+    init: 0.0
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
+  vg_lb:
+    init: 0.0
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
+  vg_lme:
+    init: 0.0
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
+clipping: true
+condition_emb_dim: 512
+core_start_time: 100
+device: cuda
+discretizer: random
+discretizer_max_ratio: 10
+dropout: 0
+ellipsoid_scale: 0.0
+energy: molecular_crystal
+energy_clip: 1000
+energy_core_coeff: 10.0
+energy_density_coeff: 2.0
+energy_function: combo
+energy_lj_coeff: 1.0
+energy_max_temperature: 10
+energy_min_temperature: 0.1
+energy_static_temperature: 1
+epochs: 10000000
+eval_T: 100
+eval_batch_size: 2000
+eval_period: 1000
+exploration_factor: 0.25
+exploration_wd: true
+exploratory: false
+figs_period: 2000
+fwd_loss_coeffs:
+  buffer:
+    init: 0.0
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
+  buffer_gamma:
+    init: 0.0
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
+  detach_after:
+    init: 0.0
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
+  emp_z:
+    init: 0.0
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
+  greedy:
+    init: 0.0
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
+  mle:
+    init: 0.1
+    max: 0.1
+    min: 0.1
+    'off': 1
+    'on': 0
+  overlap:
+    init: 0.0
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
+  reinforce:
+    init: 0.0
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
+  smoothed:
+    init: 0.0
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
+  tb:
+    init: 0.0
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
+  var:
+    init: 0.0
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
+  var_cutoff:
+    init: 0.0
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
+  var_gamma:
+    init: 0.0
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
+  vg_lb:
+    init: 0.0
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
+  vg_lme:
+    init: 0.0
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
+fwd_to_bwd_ratio: 1
+gfn_clip: 20.0
+gradient_norm_clip: 0.1
+grow_batch_size: true
+harmonics_dim: 64
+hidden_dim: 512
+joint_layers: 8
+learn_pb: true
+learned_variance: true
+lj_repulsion: 0.85
+lj_start_time: 200
+lj_turnover_pot: 10.0
+log_var_range: 10
+lr_anneal_time: 10000
+lr_back: 0.0001
+lr_flow: 0.1
+lr_policy: 0.0001
+lr_warmup_ratio: 100
+lr_warmup_time: 2000
+max_batch_size: 500
+max_traj_length: 20
+min_lr: 1.0e-06
+min_traj_length: 10
+molecule: qm9
+molecule_conditioning: true
+molecules_path: /scratch/mk8347/csd_runs/datasets/csd_free_qm9_dataset.pt
+norm: null
+pb_scale_range: 0.5
+prioritized: boltzmann
+rank_weight: 1.0
+repeats: 5
+repulsion_annealing_max_steps: 5000
+reweight_T: null
+run_name: 7_mle_mle_high_pb
+s_emb_dim: 512
+sampling: buffer
+scheduler: true
+seed: 12345
+sg_conditioning: false
+space_groups:
+- 2
+t_emb_dim: 32
+t_scale: 0.1
+tag: qm9_test8
+temp_annealing_max_steps: 2000
+temperature_conditioning: false
+temperature_scaling_factor: 0.01
+traj_length_strategy: sampled
+use_weight_decay: false
+wd_max_steps: 1000
+weight_decay: 1e-7
+zero_init: false
