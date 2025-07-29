@@ -265,7 +265,7 @@ def get_gfn_forward_loss(loss_coeffs,
 
 
 def reweight_losses(combined_losses, losses, reweight_T):
-    if reweight_T is not None:  # optionally reweight losses to minimize large outliers
+    if reweight_T is not None:  # optionally reweight losses to minimize large outliers.
         weights = (torch.softmax(-combined_losses.detach() / reweight_T, dim=0) * len(losses)).clamp(min=1e-4)
         weights /= weights.sum()
         loss = (weights * combined_losses).mean()

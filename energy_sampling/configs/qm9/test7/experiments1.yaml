@@ -310,8 +310,13 @@ experiments:
       pmle_std: { init: 4.0, max: 4.0, min: 4.0, 'on': 0,    'off': 1 }  # std deviation of the prior mle distribution
 
 
-- tag: 13_greedy_0_0
+# accidentally ran the below with temperature conditioning, so it makes sense it would kindof not work so good
+- tag: 13_greedy_0_0  # greedy loss continuously improved up to 10k before erroring out. wide buffer, somewhat collapsed model. Energies and densities improving
   update:
+    exploratory: False
+    temperature_conditioning: False
+    anneal_temperature: False
+    space_groups: [2]
     joint_layers: 8
     hidden_dim: 512
     dropout: 0
@@ -330,6 +335,10 @@ experiments:
 
 - tag: 14_greedy_0.01_0
   update:
+    exploratory: False
+    temperature_conditioning: False
+    anneal_temperature: False
+    space_groups: [ 2 ]
     joint_layers: 8
     hidden_dim: 512
     dropout: 0
@@ -347,6 +356,10 @@ experiments:
 
 - tag: 15_greedy_0.1_0
   update:
+    exploratory: False
+    temperature_conditioning: False
+    anneal_temperature: False
+    space_groups: [ 2 ]
     joint_layers: 8
     hidden_dim: 512
     dropout: 0
@@ -364,6 +377,10 @@ experiments:
 
 - tag: 16_greedy_0_0.01
   update:
+    exploratory: False
+    temperature_conditioning: False
+    anneal_temperature: False
+    space_groups: [ 2 ]
     joint_layers: 8
     hidden_dim: 512
     dropout: 0
@@ -381,6 +398,10 @@ experiments:
 
 - tag: 17_greedy_0_0.1
   update:
+    exploratory: False
+    temperature_conditioning: False
+    anneal_temperature: False
+    space_groups: [ 2 ]
     joint_layers: 8
     hidden_dim: 512
     dropout: 0
@@ -398,6 +419,10 @@ experiments:
 
 - tag: 18_greedy_0.01_0.01
   update:
+    exploratory: False
+    temperature_conditioning: False
+    anneal_temperature: False
+    space_groups: [ 2 ]
     joint_layers: 8
     hidden_dim: 512
     dropout: 0
@@ -415,6 +440,10 @@ experiments:
 
 - tag: 19_greedy_0.1_0.01
   update:
+    exploratory: False
+    temperature_conditioning: False
+    anneal_temperature: False
+    space_groups: [ 2 ]
     joint_layers: 8
     hidden_dim: 512
     dropout: 0
@@ -432,6 +461,10 @@ experiments:
 
 - tag: 20_greedy_0.01_0.1
   update:
+    exploratory: False
+    temperature_conditioning: False
+    anneal_temperature: False
+    space_groups: [ 2 ]
     joint_layers: 8
     hidden_dim: 512
     dropout: 0
@@ -450,6 +483,10 @@ experiments:
 
 - tag: 21_greedy_0.1_0.1
   update:
+    exploratory: False
+    temperature_conditioning: False
+    anneal_temperature: False
+    space_groups: [ 2 ]
     joint_layers: 8
     hidden_dim: 512
     dropout: 0
@@ -464,7 +501,6 @@ experiments:
       mle: { init: 0.001, max: 0.1, min: 0.001, 'on': 10000,    'off': 20000}
       mle_prior_fraction: { init: 1.0,max: 1.0,min: 1.0, 'on': 0,    'off': 1 }
       pmle_std: { init: 4.0, max: 4.0, min: 4.0, 'on': 0,    'off': 1 }  # std deviation of the prior mle distribution
-
 
 
 - tag: 22_vg_mle_tb_RF

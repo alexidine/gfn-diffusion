@@ -167,6 +167,10 @@
 - index: 13
   tag: 13_greedy_0_0
   update_keys:
+  - exploratory
+  - temperature_conditioning
+  - anneal_temperature
+  - space_groups
   - joint_layers
   - hidden_dim
   - dropout
@@ -179,6 +183,10 @@
 - index: 14
   tag: 14_greedy_0.01_0
   update_keys:
+  - exploratory
+  - temperature_conditioning
+  - anneal_temperature
+  - space_groups
   - joint_layers
   - hidden_dim
   - dropout
@@ -191,6 +199,10 @@
 - index: 15
   tag: 15_greedy_0.1_0
   update_keys:
+  - exploratory
+  - temperature_conditioning
+  - anneal_temperature
+  - space_groups
   - joint_layers
   - hidden_dim
   - dropout
@@ -203,6 +215,10 @@
 - index: 16
   tag: 16_greedy_0_0.01
   update_keys:
+  - exploratory
+  - temperature_conditioning
+  - anneal_temperature
+  - space_groups
   - joint_layers
   - hidden_dim
   - dropout
@@ -215,6 +231,10 @@
 - index: 17
   tag: 17_greedy_0_0.1
   update_keys:
+  - exploratory
+  - temperature_conditioning
+  - anneal_temperature
+  - space_groups
   - joint_layers
   - hidden_dim
   - dropout
@@ -227,6 +247,10 @@
 - index: 18
   tag: 18_greedy_0.01_0.01
   update_keys:
+  - exploratory
+  - temperature_conditioning
+  - anneal_temperature
+  - space_groups
   - joint_layers
   - hidden_dim
   - dropout
@@ -239,6 +263,10 @@
 - index: 19
   tag: 19_greedy_0.1_0.01
   update_keys:
+  - exploratory
+  - temperature_conditioning
+  - anneal_temperature
+  - space_groups
   - joint_layers
   - hidden_dim
   - dropout
@@ -251,6 +279,10 @@
 - index: 20
   tag: 20_greedy_0.01_0.1
   update_keys:
+  - exploratory
+  - temperature_conditioning
+  - anneal_temperature
+  - space_groups
   - joint_layers
   - hidden_dim
   - dropout
@@ -263,6 +295,10 @@
 - index: 21
   tag: 21_greedy_0.1_0.1
   update_keys:
+  - exploratory
+  - temperature_conditioning
+  - anneal_temperature
+  - space_groups
   - joint_layers
   - hidden_dim
   - dropout
