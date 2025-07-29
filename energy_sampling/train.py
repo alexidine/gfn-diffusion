@@ -135,10 +135,12 @@ def train_logic(buffer, it):
 
     elif args.bwd:  # backward ONLY
         do_backward = True
+        p_forward = 0
 
     else:  # forward ONLY
         do_forward = True
         p_forward = 1
+
     if len(buffer) == 0:
         do_forward = True
         do_backward = False
@@ -147,6 +149,17 @@ def train_logic(buffer, it):
         report_losses = True
     else:
         report_losses = False
+
+    if not any([
+        args.bwd_loss_coeffs.tb > 0,
+        args.bwd_loss_coeffs.vg_lb > 0,
+        args.bwd_loss_coeffs.vg_lme > 0,
+        args.bwd_loss_coeffs.emp_z > 0,
+        args.bwd_loss_coeffs.mle > 0,
+        args.bwd_loss_coeffs.smoothed > 0,
+    ]):
+        do_backward=False
+        do_forward=True
 
     return add_to_buffer, do_backward, do_forward, p_forward, report_losses
 
