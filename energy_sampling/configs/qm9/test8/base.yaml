@@ -1,5 +1,5 @@
-run_name: 'mk_local_dev'
-tag: 'dev'
+run_name: 'qm9_test8'
+tag: 'qm9_test8'
 seed: 12345
 device: 'cuda'
 lr_policy: 0.0001              # learning rate of the policy network
@@ -28,12 +28,12 @@ norm: null                   # null, "layer", "batch"
 
 batch_size: 5               # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 50           # maximum batch size to allow
+max_batch_size: 100           # maximum batch size to allow
 repeats: 5                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
-eval_batch_size: 500        # batch size for evaluation
+eval_batch_size: 2000        # batch size for evaluation
 epochs: 10000000             # number of training epochs: relatively large
-eval_period: 100              # how often to do evaluation & reporting
-figs_period: 100             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
+eval_period: 1000              # how often to do evaluation & reporting
+figs_period: 2000             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # GFlowNet settings
 T: 10                        # static training diffusion length
@@ -51,8 +51,8 @@ energy: "molecular_crystal"  # "molecular_crystal"
 fwd_loss_coeffs:
   tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
   vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-  vg_lme:           { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1  }  # exclusive with vg_lb
-  emp_z:            { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1  }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
+  vg_lme:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # exclusive with vg_lb
+  emp_z:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
   greedy:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
   reinforce:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
   mle:              { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
@@ -70,7 +70,7 @@ bwd_loss_coeffs:
   vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
   vg_lme:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # exclusive with vg_lb
   emp_z:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
-  mle:              { init: 1.0, max: 1.0, min: 0.0, 'on': 1,    'off': 2000  }
+  mle:              { init: 0.0, max: 0.0, min: 0.0, 'on': 1,    'off': 2000  }
   smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
   mle_prior_fraction: { init: 0.0,max: 0.0,min: 0.0, 'on': 0,    'off': 1 }
   pmle_std:         { init: 4.0, max: 4.0, min: 6.0, 'on': 0,    'off': 1 }  # std deviation of the prior mle distribution
@@ -86,13 +86,13 @@ gfn_clip: 20.0  # clip the maximum step size induced by the policy model
 
 # dataset settings
 ################################################################
-buffer_path: 'D:/crystal_datasets/test_qm9_sg2_dataset.pt'
-molecules_path: 'D:/crystal_datasets/test_csd_free_qm9_dataset.pt'
-autoencoder_path: 'C:/Users/mikem/crystals/CSP_runs/models/cluster/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
+#buffer_path: 'D:/crystal_datasets/test_qm9_sg2_dataset.pt'
+#molecules_path: 'D:/crystal_datasets/test_csd_free_qm9_dataset.pt'
+#autoencoder_path: 'C:/Users/mikem/crystals/CSP_runs/models/cluster/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
 
-#buffer_path: '/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
-#molecules_path: '/scratch/mk8347/csd_runs/datasets/csd_free_qm9_dataset.pt'
-#autoencoder_path: '/scratch/mk8347/csd_runs/models/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
+buffer_path: '/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+molecules_path: '/scratch/mk8347/csd_runs/datasets/csd_free_qm9_dataset.pt'
+autoencoder_path: '/scratch/mk8347/csd_runs/models/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
 
 # replay buffer settings
 ################################################################
@@ -102,14 +102,14 @@ buffer_diversity_coeff: 1.0  # how highly to weight sample diversity when sampli
 prioritized: "boltzmann"   # three kinds of replay training: random, reward prioritized (Boltzmann), rank-based
 sampling: "buffer"
 add_to_buffer_each: 10  # how often to add samples to the buffer during fwd passes in both_ways training
-buffer_size: 50000          # size of replay buffer: relatively large
+buffer_size: 100000          # size of replay buffer: relatively large
 
 # exploration controls
 ################################################################
 exploratory: True       # adds variance to optionally learned logvars
 exploration_factor: 0.25  # initial exploration std value
 exploration_wd: True  # decay exploration over time
-wd_max_steps: 500  # number of steps to terminate the added variance
+wd_max_steps: 1000  # number of steps to terminate the added variance
 
 # molecular crystal settings
 ################################################################

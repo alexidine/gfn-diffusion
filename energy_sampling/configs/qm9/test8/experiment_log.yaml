@@ -1,0 +1,72 @@
+- index: 0
+  tag: 0_just_vg
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 1
+  tag: 1_vg_mle
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 2
+  tag: 2_vg_fat_mle
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 3
+  tag: 3_vg_mle_tb
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 4
+  tag: 4_vg_long_mle
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 5
+  tag: 5_fvg_bmle
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - pb_scale_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
