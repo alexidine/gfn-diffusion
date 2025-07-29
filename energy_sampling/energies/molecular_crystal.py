@@ -191,7 +191,7 @@ class MolecularCrystal(BaseSet):
         else:
             assert False, f'{self.energy_function} not implemented'
 
-        bounding_energy = F.relu(latents - 6)**2 + F.relu(-(latents + 6))**2  # discourage exploration beyond clip range
+        bounding_energy = (F.relu(latents - 6)**2 + F.relu(-(latents + 6))**2).sum(dim=-1)  # discourage exploration beyond clip range
         total_energy = crystal_energy + bounding_energy
         return self.soft_clip(total_energy,
                               self.energy_clip)  # softly bound from above  #crystal_energy.clip(min=-self.energy_clip, max=self.energy_clip)
