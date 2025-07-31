@@ -417,6 +417,7 @@ def featurize_dataset(dataset, device, ellipsoid_scale):
         overlaps = []
         silus = []
         ljs = []
+        niggli_overlaps = []
 
         for crystal_batch in tqdm(loader):
             crystal_batch = crystal_batch.to(device)
@@ -436,17 +437,25 @@ def featurize_dataset(dataset, device, ellipsoid_scale):
                 surface_padding=ellipsoid_scale,
                 return_details=True)
 
+            niggli_overlap = cluster_batch.compute_niggli_overlap()
+
             overlaps.extend(normed_ellipsoid_overlap.cpu().detach().numpy())
             silus.extend(silu_energy.cpu().detach().numpy())
             ljs.extend(lj_energy.cpu().detach().numpy())
+            niggli_overlaps.extend(niggli_overlap)
 
         overlaps = torch.tensor(overlaps)
         silus = torch.tensor(silus)
         ljs = torch.tensor(ljs)
+        niggli_overlaps = torch.tensor(niggli_overlaps)
         for ind, elem in enumerate(dataset):
             elem.ellipsoid_overlap = torch.ones(1) * overlaps[ind]
             elem.silu_pot = torch.ones(1) * silus[ind]
             elem.lj_pot = torch.ones(1) * ljs[ind]
+            elem.niggli_overlap = torch.ones(1) * niggli_overlaps[ind]
+
+    # exclude negative niggli overlaps
+    dataset = [elem for elem in dataset if elem.niggli_overlap >= 0]
 
     return dataset
 

@@ -322,7 +322,7 @@ def train():
     )
     gfn_model = GFN(**gfn_config).to(device)
 
-    np.save(f'{name}_model_config', gfn_config)
+    np.save(f'checkpoints/{name}_model_config', gfn_config)  # todo add path to saving directories
     wandb.watch(gfn_model, log_graph=True, log_freq=1000)  # for gradient logging
 
     optimizers, schedulers = init_schedulers_optimizers(
@@ -391,7 +391,7 @@ def train():
         times['train_step_end'] = time()
 
         if (step_ind % args.eval_period == 0 and step_ind > 0) or step_ind == 50:
-            torch.save(gfn_model.state_dict(), f'{name}_model.pt')
+            torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model.pt')
             metrics = do_evaluation(energy_function, buffer, gfn_model,
                                     step_ind, metrics, test_mol_loader)
             if args.molecule_conditioning:
@@ -414,7 +414,7 @@ def train():
             torch.cuda.empty_cache()
             gc.collect()
 
-    torch.save(gfn_model, f'{name}_model_final.pt')
+    torch.save(gfn_model, f'checkpoints/{name}_model_final.pt')
 
 
 def ten_step_reporting(bwd_loss, bwd_loss_dict, fwd_loss, fwd_loss_dict, metrics, optimizers):
