@@ -29,6 +29,8 @@ experiments:
       var_cutoff:       { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
       var_gamma:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
       buffer_gamma:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      loss_clip: { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9 }
+
     bwd_loss_coeffs:
       tb:               { init: 0.0, max: 1.0, min: 1.0, 'on': 20000,    'off': 1.0E+9    }
       vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
@@ -38,6 +40,8 @@ experiments:
       smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
       mle_prior_fraction: { init: 1.0,max: 1.0,min: 0.0, 'on': 0,    'off': 15000 }
       pmle_std:         { init: 1.0, max: 6.0, min: 6.0, 'on': 10000,    'off': 1.0E+9 }
+      loss_clip: { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9 }
+
 
 - tag: 1_big_drift
   update:
@@ -66,6 +70,8 @@ experiments:
       var_cutoff:       { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
       var_gamma:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
       buffer_gamma:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      loss_clip: { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9 }
+
     bwd_loss_coeffs:
       tb:               { init: 0.0, max: 1.0, min: 1.0, 'on': 20000,    'off': 1.0E+9    }
       vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
@@ -75,6 +81,8 @@ experiments:
       smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
       mle_prior_fraction: { init: 1.0,max: 1.0,min: 0.0, 'on': 0,    'off': 15000 }
       pmle_std:         { init: 1.0, max: 6.0, min: 6.0, 'on': 10000,    'off': 1.0E+9 }
+      loss_clip: { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9 }
+
 
 - tag: 2_fat_var
   update:
@@ -103,6 +111,8 @@ experiments:
       var_cutoff:       { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
       var_gamma:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
       buffer_gamma:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      loss_clip: { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9 }
+
     bwd_loss_coeffs:
       tb:               { init: 0.0, max: 1.0, min: 1.0, 'on': 20000,    'off': 1.0E+9    }
       vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
@@ -112,6 +122,8 @@ experiments:
       smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
       mle_prior_fraction: { init: 1.0,max: 1.0,min: 0.0, 'on': 0,    'off': 15000 }
       pmle_std:         { init: 1.0, max: 6.0, min: 6.0, 'on': 10000,    'off': 1.0E+9 }
+      loss_clip: { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9 }
+
 
 
 - tag: 3_fat_model
@@ -141,6 +153,8 @@ experiments:
       var_cutoff:       { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
       var_gamma:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
       buffer_gamma:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      loss_clip: { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9 }
+
     bwd_loss_coeffs:
       tb:               { init: 0.0, max: 1.0, min: 1.0, 'on': 20000,    'off': 1.0E+9    }
       vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
@@ -150,3 +164,44 @@ experiments:
       smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
       mle_prior_fraction: { init: 1.0,max: 1.0,min: 0.0, 'on': 0,    'off': 15000 }
       pmle_std:         { init: 1.0, max: 6.0, min: 6.0, 'on': 10000,    'off': 1.0E+9 }
+      loss_clip: { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9 }
+
+
+- tag: 4_gently_greedy
+  update:
+    joint_layers: 16
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    fwd_loss_coeffs:
+      tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 20000,    'off': 1.0E+9    }
+      vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      vg_lme:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 20000  }
+      emp_z:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 20000  }
+      greedy:           { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1    }
+      reinforce:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      mle:              { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
+      var:              { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      overlap:          { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      buffer:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+
+      detach_after:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      var_cutoff:       { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      var_gamma:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      buffer_gamma:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+    bwd_loss_coeffs:
+      tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 20000,    'off': 1.0E+9    }
+      vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      vg_lme:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 20000  }
+      emp_z:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 20000  }
+      mle:              { init: 1.0, max: 5.0, min: 0.0, 'on': 5000,    'off': 20000  }
+      smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      mle_prior_fraction: { init: 1.0,max: 1.0,min: 0.0, 'on': 0,    'off': 15000 }
+      pmle_std:         { init: 1.0, max: 6.0, min: 6.0, 'on': 10000,    'off': 1.0E+9 }
+      loss_clip: { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9 }
+

@@ -50,6 +50,15 @@ def soft_saturate(x, scale: Optional[float] = 10.0):
     return torch.log(torch.abs(x / scale) + 1) * torch.sign(x)
 
 
+def soft_clip(x, cutoff):
+    abs_x = x.abs()
+    sign_x = x.sign()
+    # Match value and slope at cutoff using a shifted log
+    delta = abs_x - cutoff
+    clipped = cutoff + torch.log1p(delta)  # log1p = log(1 + x), safer numerically
+    return torch.where(abs_x <= cutoff, x, sign_x * clipped)
+
+
 def get_gfn_forward_loss(loss_coeffs,
                          initial_state,
                          gfn,
@@ -77,8 +86,6 @@ def get_gfn_forward_loss(loss_coeffs,
         mol_batch = collate_data_list(mol_batch.to_data_list() * repeats)
         if reassign_sgs:
             mol_batch.sg_ind = sg_inds
-
-    loss_dict = {}
 
     if loss_coeffs.greedy > 0 or loss_coeffs.var > 0 or loss_coeffs.buffer > 0:
         keep_grads = True
@@ -122,12 +129,6 @@ def get_gfn_forward_loss(loss_coeffs,
         smoothness_loss = normed_smoothness_loss(torch.stack([means_f, logvars_f, means_b, logvars_b])).mean(dim=0)
         losses.append(smoothness_loss * loss_coeffs.smoothed)
 
-    """TB loss"""
-    if loss_coeffs.tb > 0:
-        tb = (log_pf + log_flow - log_pb - log_r.detach())
-        tb_loss = F.mse_loss(tb, torch.zeros_like(tb), reduction='none')
-        losses.append(tb_loss * loss_coeffs.tb)
-
     """VarGrad - lower bound loss"""
     if loss_coeffs.vg_lb > 0:
         assert not (loss_coeffs.vg_lb > 0 and loss_coeffs.vg_lme > 0), \
@@ -160,6 +161,19 @@ def get_gfn_forward_loss(loss_coeffs,
         else:
             emp_z_loss = 0.5 * (log_Z - log_flow) ** 2
         losses.append(emp_z_loss * loss_coeffs.emp_z)
+
+    """TB loss"""
+    if loss_coeffs.tb > 0:
+        if loss_coeffs.emp_z > 0:  # gate TB against sufficiently good performance on the empirical Z
+            # if the empirical Z is bad enough, the log Z will explode
+            # this will turn on the TB loss when the empirical Z estimate gets sufficiently good
+            emp_z_coeff = 2 * (-emp_z_loss / 100).mean().sigmoid()
+        else:
+            emp_z_coeff = 1
+
+        tb = (log_pf + log_flow - log_pb - log_r.detach())
+        tb_loss = F.mse_loss(tb, torch.zeros_like(tb), reduction='none')
+        losses.append(tb_loss * loss_coeffs.tb * emp_z_coeff)
 
     """MLE/TPM loss"""
     if loss_coeffs.mle > 0:
@@ -227,7 +241,7 @@ def get_gfn_forward_loss(loss_coeffs,
         )
         losses.append(buffer_loss * loss_coeffs.buffer)
 
-    combined_losses = torch.stack(losses).clip(min=-1000, max=1000).mean(dim=0)
+    combined_losses = soft_clip(torch.stack(losses), loss_coeffs.loss_clip).mean(dim=0)
     loss = combined_losses.mean()
 
     if report_losses:
@@ -263,7 +277,6 @@ def get_gfn_forward_loss(loss_coeffs,
         return loss, loss_dict
 
 
-
 def get_gfn_backward_loss(loss_coeffs,
                           samples,
                           gfn,
@@ -274,7 +287,6 @@ def get_gfn_backward_loss(loss_coeffs,
                           return_exp=False,
                           reweight_T: Optional[float] = None,
                           report_losses: bool = False):
-
     if gfn.conditional_flow_model and any([
         loss_coeffs.vg_lb > 0, loss_coeffs.vg_lme > 0
     ]):
@@ -294,11 +306,6 @@ def get_gfn_backward_loss(loss_coeffs,
     if loss_coeffs.smoothed > 0:
         smoothness_loss = normed_smoothness_loss(torch.stack([means_f, logvars_f, means_b, logvars_b])).mean(dim=0)
         losses.append(smoothness_loss * loss_coeffs.smoothed)
-
-    if loss_coeffs.tb > 0:
-        tb = (log_pf + log_flow - log_pb - log_r)
-        tb_loss = F.mse_loss(tb, torch.zeros_like(tb), reduction='none')
-        losses.append(tb_loss * loss_coeffs.tb)
 
     if loss_coeffs.vg_lb > 0:
         assert not (loss_coeffs.vg_lb > 0 and loss_coeffs.vg_lme > 0), \
@@ -331,11 +338,24 @@ def get_gfn_backward_loss(loss_coeffs,
             emp_z_loss = 0.5 * (log_Z - log_flow) ** 2
         losses.append(emp_z_loss * loss_coeffs.emp_z)
 
+    """TB loss"""
+    if loss_coeffs.tb > 0:
+        if loss_coeffs.emp_z > 0:  # gate TB against sufficiently good performance on the empirical Z
+            # if the empirical Z is bad enough, the log Z will explode
+            # this will turn on the TB loss when the empirical Z estimate gets sufficiently good
+            emp_z_coeff = 2 * (-emp_z_loss / 100).mean().sigmoid()
+        else:
+            emp_z_coeff = 1
+
+        tb = (log_pf + log_flow - log_pb - log_r.detach())
+        tb_loss = F.mse_loss(tb, torch.zeros_like(tb), reduction='none')
+        losses.append(tb_loss * loss_coeffs.tb * emp_z_coeff)
+
     if loss_coeffs.mle > 0:
         mle_loss = -log_pf
         losses.append(mle_loss * loss_coeffs.mle)
 
-    combined_losses = torch.stack(losses).clip(min=-1000, max=1000).mean(dim=0)
+    combined_losses = soft_clip(torch.stack(losses), loss_coeffs.loss_clip).mean(dim=0)
     loss = combined_losses.mean()
 
     if report_losses:

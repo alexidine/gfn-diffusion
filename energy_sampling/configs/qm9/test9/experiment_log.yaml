@@ -54,3 +54,17 @@
   - fwd_loss_coeffs
   - bwd_loss_coeffs
   notes: ''
+- index: 4
+  tag: 4_gently_greedy
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''

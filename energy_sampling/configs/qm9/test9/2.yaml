@@ -19,6 +19,12 @@ bwd_loss_coeffs:
     min: 0.0
     'off': 20000
     'on': 0
+  loss_clip:
+    init: 100.0
+    max: 10000.0
+    min: 10000.0
+    'off': 1000000000.0
+    'on': 5000
   mle:
     init: 1.0
     max: 5.0
@@ -117,6 +123,12 @@ fwd_loss_coeffs:
     min: 0.0
     'off': 1
     'on': 0
+  loss_clip:
+    init: 100.0
+    max: 10000.0
+    min: 10000.0
+    'off': 1000000000.0
+    'on': 5000
   mle:
     init: 1.0
     max: 1.0
