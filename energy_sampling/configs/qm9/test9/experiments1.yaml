@@ -2,8 +2,9 @@ defaults:
   base: base.yaml
 
 experiments:
-- tag: 0_base
+- tag: 0_vg_only
   update:
+    max_batch_size: 25
     joint_layers: 16
     hidden_dim: 512
     dropout: 0
@@ -13,13 +14,13 @@ experiments:
     pb_drift_range: 0.2
     pb_var_range: 2
     fwd_loss_coeffs:
-      tb:               { init: 0.0, max: 1.0, min: 1.0, 'on': 20000,    'off': 1.0E+9    }
+      tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 20000,    'off': 1.0E+9    }
       vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-      vg_lme:           { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
-      emp_z:            { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
+      vg_lme:           { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1 }
+      emp_z:            { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1  }
       greedy:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
       reinforce:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-      mle:              { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
+      mle:              { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 20000  }
       var:              { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
       overlap:          { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
       buffer:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
@@ -29,35 +30,35 @@ experiments:
       var_cutoff:       { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
       var_gamma:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
       buffer_gamma:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
-      loss_clip: { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9 }
+      loss_clip:      { init: 1.0E+5, max: 1.0E+5, min: 1.0E+5, 'on': 0,    'off': 1}
 
     bwd_loss_coeffs:
-      tb:               { init: 0.0, max: 1.0, min: 1.0, 'on': 20000,    'off': 1.0E+9    }
+      tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 20000,    'off': 1.0E+9    }
       vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-      vg_lme:           { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
-      emp_z:            { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
-      mle:              { init: 1.0, max: 5.0, min: 0.0, 'on': 5000,    'off': 15000  }
+      vg_lme:           { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 20000  }
+      emp_z:            { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 20000  }
+      mle:              { init: 0.0, max: 0.0, min: 0.0, 'on': 5000,    'off': 15000  }
       smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
       mle_prior_fraction: { init: 1.0,max: 1.0,min: 0.0, 'on': 0,    'off': 15000 }
       pmle_std:         { init: 1.0, max: 6.0, min: 6.0, 'on': 10000,    'off': 1.0E+9 }
-      loss_clip: { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9 }
+      loss_clip:      { init: 1.0E+5, max: 1.0E+5, min: 1.0E+5, 'on': 0,    'off': 1}
 
-
-- tag: 1_big_drift
+- tag: 1_vg_and_mle
   update:
     joint_layers: 16
+    max_batch_size: 25
     hidden_dim: 512
     dropout: 0
     norm: layer
     t_scale: 0.1
     log_var_range: 2
-    pb_drift_range: 0.4
+    pb_drift_range: 0.2
     pb_var_range: 2
     fwd_loss_coeffs:
-      tb:               { init: 0.0, max: 1.0, min: 1.0, 'on': 20000,    'off': 1.0E+9    }
+      tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 20000,    'off': 1.0E+9    }
       vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-      vg_lme:           { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
-      emp_z:            { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
+      vg_lme:           { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1 }
+      emp_z:            { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1  }
       greedy:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
       reinforce:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
       mle:              { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
@@ -70,35 +71,35 @@ experiments:
       var_cutoff:       { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
       var_gamma:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
       buffer_gamma:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
-      loss_clip: { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9 }
+      loss_clip:      { init: 1.0E+5, max: 1.0E+5, min: 1.0E+5, 'on': 0,    'off': 1}
 
     bwd_loss_coeffs:
-      tb:               { init: 0.0, max: 1.0, min: 1.0, 'on': 20000,    'off': 1.0E+9    }
+      tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 20000,    'off': 1.0E+9    }
       vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-      vg_lme:           { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
-      emp_z:            { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
-      mle:              { init: 1.0, max: 5.0, min: 0.0, 'on': 5000,    'off': 15000  }
+      vg_lme:           { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 20000  }
+      emp_z:            { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 20000  }
+      mle:              { init: 1.0, max: 1.0, min: 0.0, 'on': 5000,    'off': 0  }
       smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
-      mle_prior_fraction: { init: 1.0,max: 1.0,min: 0.0, 'on': 0,    'off': 15000 }
+      mle_prior_fraction: { init: 0.0,max: 0.0,min: 0.0, 'on': 0,    'off': 15000 }
       pmle_std:         { init: 1.0, max: 6.0, min: 6.0, 'on': 10000,    'off': 1.0E+9 }
-      loss_clip: { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9 }
+      loss_clip:      { init: 1.0E+5, max: 1.0E+5, min: 1.0E+5, 'on': 0,    'off': 1}
 
-
-- tag: 2_fat_var
+- tag: 2_vg_bmle
   update:
     joint_layers: 16
+    max_batch_size: 25
     hidden_dim: 512
     dropout: 0
     norm: layer
     t_scale: 0.1
-    log_var_range: 4
+    log_var_range: 2
     pb_drift_range: 0.2
-    pb_var_range: 4
+    pb_var_range: 2
     fwd_loss_coeffs:
-      tb:               { init: 0.0, max: 1.0, min: 1.0, 'on': 20000,    'off': 1.0E+9    }
+      tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 20000,    'off': 1.0E+9    }
       vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-      vg_lme:           { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
-      emp_z:            { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
+      vg_lme:           { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1 }
+      emp_z:            { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1  }
       greedy:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
       reinforce:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
       mle:              { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
@@ -111,60 +112,18 @@ experiments:
       var_cutoff:       { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
       var_gamma:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
       buffer_gamma:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
-      loss_clip: { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9 }
+      loss_clip:      { init: 1.0E+5, max: 1.0E+5, min: 1.0E+5, 'on': 0,    'off': 1}
 
     bwd_loss_coeffs:
-      tb:               { init: 0.0, max: 1.0, min: 1.0, 'on': 20000,    'off': 1.0E+9    }
+      tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 20000,    'off': 1.0E+9    }
       vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-      vg_lme:           { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
-      emp_z:            { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
-      mle:              { init: 1.0, max: 5.0, min: 0.0, 'on': 5000,    'off': 15000  }
+      vg_lme:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 20000  }
+      emp_z:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 20000  }
+      mle:              { init: 1.0, max: 1.0, min: 0.001, 'on': 5000,    'off': 15000  }
       smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
-      mle_prior_fraction: { init: 1.0,max: 1.0,min: 0.0, 'on': 0,    'off': 15000 }
+      mle_prior_fraction: { init: 0.0,max: 0.0,min: 0.0, 'on': 0,    'off': 15000 }
       pmle_std:         { init: 1.0, max: 6.0, min: 6.0, 'on': 10000,    'off': 1.0E+9 }
-      loss_clip: { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9 }
-
-
-
-- tag: 3_fat_model
-  update:
-    joint_layers: 8
-    hidden_dim: 1024
-    dropout: 0
-    norm: layer
-    t_scale: 0.1
-    log_var_range: 4
-    pb_drift_range: 0.2
-    pb_var_range: 4
-    fwd_loss_coeffs:
-      tb:               { init: 0.0, max: 1.0, min: 1.0, 'on': 20000,    'off': 1.0E+9    }
-      vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-      vg_lme:           { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
-      emp_z:            { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
-      greedy:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-      reinforce:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-      mle:              { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
-      var:              { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-      overlap:          { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-      buffer:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-      smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-
-      detach_after:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
-      var_cutoff:       { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
-      var_gamma:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
-      buffer_gamma:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
-      loss_clip: { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9 }
-
-    bwd_loss_coeffs:
-      tb:               { init: 0.0, max: 1.0, min: 1.0, 'on': 20000,    'off': 1.0E+9    }
-      vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-      vg_lme:           { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
-      emp_z:            { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
-      mle:              { init: 1.0, max: 5.0, min: 0.0, 'on': 5000,    'off': 15000  }
-      smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
-      mle_prior_fraction: { init: 1.0,max: 1.0,min: 0.0, 'on': 0,    'off': 15000 }
-      pmle_std:         { init: 1.0, max: 6.0, min: 6.0, 'on': 10000,    'off': 1.0E+9 }
-      loss_clip: { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9 }
+      loss_clip:      { init: 1.0E+5, max: 1.0E+5, min: 1.0E+5, 'on': 0,    'off': 1}
 
 
 - tag: 4_gently_greedy
@@ -203,5 +162,206 @@ experiments:
       smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
       mle_prior_fraction: { init: 1.0,max: 1.0,min: 0.0, 'on': 0,    'off': 15000 }
       pmle_std:         { init: 1.0, max: 6.0, min: 6.0, 'on': 10000,    'off': 1.0E+9 }
-      loss_clip: { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9 }
+      loss_clip: { init: 1.0E+9, max: 1.0E+9, min: 1.0E+9, 'on': 5000,    'off': 1.0E+9 }
 
+
+- tag: 5_gently_greedy2
+  update:
+    joint_layers: 16
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    fwd_loss_coeffs:
+      tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 20000,    'off': 1.0E+9    }
+      vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      vg_lme:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 20000  }
+      emp_z:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 20000  }
+      greedy:           { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1    }
+      reinforce:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      mle:              { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
+      var:              { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      overlap:          { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      buffer:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+
+      detach_after:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      var_cutoff:       { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      var_gamma:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      buffer_gamma:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+    bwd_loss_coeffs:
+      tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 20000,    'off': 1.0E+9    }
+      vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      vg_lme:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 20000  }
+      emp_z:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 20000  }
+      mle:              { init: 2.0, max: 10.0, min: 0.0, 'on': 5000,    'off': 20000  }
+      smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      mle_prior_fraction: { init: 1.0,max: 1.0,min: 0.0, 'on': 0,    'off': 15000 }
+      pmle_std:         { init: 1.0, max: 6.0, min: 6.0, 'on': 10000,    'off': 1.0E+9 }
+      loss_clip: { init: 1.0E+9, max: 1.0E+9, min: 1.0E+9, 'on': 5000,    'off': 1.0E+9 }
+
+
+
+- tag: 5_gently_greedy3_all_noise
+  update:
+    joint_layers: 16
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    fwd_loss_coeffs:
+      tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 20000,    'off': 1.0E+9    }
+      vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      vg_lme:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 20000  }
+      emp_z:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 20000  }
+      greedy:           { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1    }
+      reinforce:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      mle:              { init: 1.0, max: 1.0, min: 0.0, 'on': 0,    'off': 20000  }
+      var:              { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      overlap:          { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      buffer:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+
+      detach_after:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      var_cutoff:       { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      var_gamma:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      buffer_gamma:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+    bwd_loss_coeffs:
+      tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 20000,    'off': 1.0E+9    }
+      vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      vg_lme:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 20000  }
+      emp_z:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 20000  }
+      mle:              { init: 2.0, max: 10.0, min: 0.0, 'on': 5000,    'off': 20000  }
+      smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      mle_prior_fraction: { init: 1.0,max: 1.0,min: 1.0, 'on': 0,    'off': 15000 }
+      pmle_std:         { init: 1.0, max: 6.0, min: 6.0, 'on': 10000,    'off': 1.0E+9 }
+      loss_clip: { init: 1.0E+9, max: 1.0E+9, min: 1.0E+9, 'on': 5000,    'off': 1.0E+9 }
+
+
+
+- tag: 6_greedy_RF
+  update:
+    max_batch_size: 200
+    joint_layers: 16
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    fwd_loss_coeffs:
+      tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': .inf    }
+      vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      vg_lme:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # exclusive with vg_lb
+      emp_z:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
+      greedy:           { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1    }
+      reinforce:        { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1    }
+      mle:              { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1  }
+      var:              { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      overlap:          { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      buffer:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+
+      detach_after:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # NON FUNCTIONAL
+      var_cutoff:       { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      var_gamma:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      buffer_gamma:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      loss_clip:        { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9  }
+    bwd_loss_coeffs:
+      tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 1000,    'off': 1000    }
+      vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      vg_lme:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # exclusive with vg_lb
+      emp_z:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
+      mle:              { init: 1.0, max: 1.0, min: 0.1, 'on': 10000,    'off': 20000  }
+      smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      mle_prior_fraction: { init: 1.0,max: 1.0,min: 0.0, 'on': 10000,    'off': 20000 }
+      pmle_std:         { init: 1.0, max: 4.0, min: 4.0, 'on': 10000,    'off': 1.0E+9 }  # std deviation of the prior mle distribution. Best to start small (1) and smoothly grow
+      loss_clip:        { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9  }
+
+- tag: 7_greedy_RF_big_mle
+  update:
+    max_batch_size: 200
+    joint_layers: 16
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    fwd_loss_coeffs:
+      tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': .inf    }
+      vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      vg_lme:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # exclusive with vg_lb
+      emp_z:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
+      greedy:           { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1    }
+      reinforce:        { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1    }
+      mle:              { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1  }
+      var:              { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      overlap:          { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      buffer:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+
+      detach_after:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # NON FUNCTIONAL
+      var_cutoff:       { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      var_gamma:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      buffer_gamma:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      loss_clip:        { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9  }
+    bwd_loss_coeffs:
+      tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 1000,    'off': 1000    }
+      vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      vg_lme:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # exclusive with vg_lb
+      emp_z:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
+      mle:              { init: 1.0, max: 10.0, min: 0.1, 'on': 10000,    'off': 20000  }
+      smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      mle_prior_fraction: { init: 1.0,max: 1.0,min: 0.0, 'on': 10000,    'off': 20000 }
+      pmle_std:         { init: 1.0, max: 4.0, min: 4.0, 'on': 10000,    'off': 1.0E+9 }  # std deviation of the prior mle distribution. Best to start small (1) and smoothly grow
+      loss_clip:        { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9  }
+
+- tag: 8_vg_only_tight_pb
+  update:
+    max_batch_size: 25
+    joint_layers: 16
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 0.5
+    fwd_loss_coeffs:
+      tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 20000,    'off': 1.0E+9    }
+      vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      vg_lme:           { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1 }
+      emp_z:            { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1  }
+      greedy:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      reinforce:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      mle:              { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 20000  }
+      var:              { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      overlap:          { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      buffer:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+
+      detach_after:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      var_cutoff:       { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      var_gamma:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      buffer_gamma:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      loss_clip:      { init: 1.0E+5, max: 1.0E+5, min: 1.0E+5, 'on': 0,    'off': 1}
+
+    bwd_loss_coeffs:
+      tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 20000,    'off': 1.0E+9    }
+      vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+      vg_lme:           { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 20000  }
+      emp_z:            { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 20000  }
+      mle:              { init: 0.0, max: 0.0, min: 0.0, 'on': 5000,    'off': 15000  }
+      smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
+      mle_prior_fraction: { init: 1.0,max: 1.0,min: 0.0, 'on': 0,    'off': 15000 }
+      pmle_std:         { init: 1.0, max: 6.0, min: 6.0, 'on': 10000,    'off': 1.0E+9 }
+      loss_clip:      { init: 1.0E+5, max: 1.0E+5, min: 1.0E+5, 'on': 0,    'off': 1}

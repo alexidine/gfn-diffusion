@@ -6,7 +6,6 @@ import plotly.colors as pc
 import torch
 import torch.nn.functional as F
 import wandb
-from energy_sampling.eval.plot_utils import get_plotly_fig_size_mb
 from plotly import graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.ndimage import gaussian_filter
@@ -18,7 +17,7 @@ from skimage.segmentation import watershed
 from sklearn.cluster import AgglomerativeClustering
 from umap import UMAP
 
-from energy_sampling.eval.utils import log_partition_function
+from energy_sampling.eval.utils import log_partition_function, get_plotly_fig_size_mb
 from energy_sampling.utils import logmeanexp
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.reporting.figures import simple_cell_hist, simple_cell_scatter_fig, \
@@ -737,7 +736,7 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
     metrics['Mean Silu Energy'] = sample_batch.silu_pot.mean().cpu().detach().numpy()
     metrics['Mean Sample Energy'] = sample_batch.gfn_energy.mean().cpu().detach().numpy()
     metrics['Mean Niggli Overlap'] = F.relu(-sample_batch.niggli_overlap).mean().cpu().detach().numpy()
-    metrics['Max Niggli Overlap'] = F.relu(sample_batch.niggli_overlap).amax().cpu().detach().numpy()
+    metrics['Max Niggli Overlap'] = F.relu(-sample_batch.niggli_overlap).amax().cpu().detach().numpy()
     metrics['Sample Energy Distribution'] = sample_batch.gfn_energy.cpu().detach().numpy()
     metrics['Mean Sample Reward'] = log_r.mean().cpu().detach().numpy()
     metrics['sample Reward Distribution'] = log_r.cpu().detach().numpy()

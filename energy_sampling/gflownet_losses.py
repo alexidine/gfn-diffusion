@@ -1,11 +1,10 @@
 import math
 from typing import Optional
 
-import numpy as np
-import torch.nn.functional as F
 import torch
-from mxtaltools.dataset_utils.utils import collate_data_list
+import torch.nn.functional as F
 
+from mxtaltools.dataset_utils.utils import collate_data_list
 from utils import compute_sample_overlap
 
 
@@ -106,7 +105,7 @@ def get_gfn_forward_loss(loss_coeffs,
                                            mol_batch,
                                            return_exp,
                                            states,
-                                           no_grad=loss_coeffs.greedy == 0
+                                           no_grad=(loss_coeffs.greedy == 0)
                                            )
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
@@ -115,7 +114,7 @@ def get_gfn_forward_loss(loss_coeffs,
     losses = []
     """greedy loss"""
     if loss_coeffs.greedy > 0:
-        greedy_loss = soft_saturate(-log_r)
+        greedy_loss = -log_r
         losses.append(greedy_loss * loss_coeffs.greedy)
 
     if loss_coeffs.reinforce > 0:
@@ -131,117 +130,49 @@ def get_gfn_forward_loss(loss_coeffs,
 
     """VarGrad - lower bound loss"""
     if loss_coeffs.vg_lb > 0:
-        assert not (loss_coeffs.vg_lb > 0 and loss_coeffs.vg_lme > 0), \
-            "Cannot use both vg_lb and vg_lme simultaneously"
-        log_ratio = log_r.detach() + log_pb - log_pf
+        log_Z, vg_loss = vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats)
 
-        if gfn.conditional_flow_model:
-            log_Z = log_ratio.view(repeats, -1).mean(dim=0, keepdim=True)
-            vg_loss = (0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2).view(-1)
-        else:
-            log_Z = log_ratio.mean(dim=0, keepdim=True)
-            vg_loss = 0.5 * (log_Z - log_ratio) ** 2
         losses.append(vg_loss * loss_coeffs.vg_lb)
 
         """VarGrad - log mean exp loss"""
     elif loss_coeffs.vg_lme > 0:
-        log_ratio = log_r.detach() + log_pb - log_pf
-
-        if gfn.conditional_flow_model:
-            log_Z = torch.logsumexp(log_ratio.view(repeats, -1), dim=0, keepdim=True) - math.log(repeats)
-            vg_loss = (0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2).view(-1)
-        else:
-            log_Z = torch.logsumexp(log_ratio, dim=0, keepdim=True) - math.log(repeats)
-            vg_loss = 0.5 * (log_Z - log_ratio) ** 2
+        log_Z, vg_loss = vg_lme(gfn, log_pb, log_pf, log_r, repeats)
         losses.append(vg_loss * loss_coeffs.vg_lme)
 
     if loss_coeffs.emp_z > 0:  # train the flow model to match the empirical log Z distribution
-        if gfn.conditional_flow_model:
-            emp_z_loss = (0.5 * (log_Z - log_flow.view(repeats, -1)) ** 2).view(-1)
-        else:
-            emp_z_loss = 0.5 * (log_Z - log_flow) ** 2
+        emp_z_loss = emp_Z(gfn, log_Z, log_flow, repeats)
         losses.append(emp_z_loss * loss_coeffs.emp_z)
 
     """TB loss"""
     if loss_coeffs.tb > 0:
-        if loss_coeffs.emp_z > 0:  # gate TB against sufficiently good performance on the empirical Z
-            # if the empirical Z is bad enough, the log Z will explode
-            # this will turn on the TB loss when the empirical Z estimate gets sufficiently good
-            emp_z_coeff = 2 * (-emp_z_loss / 100).mean().sigmoid()
-        else:
-            emp_z_coeff = 1
-
-        tb = (log_pf + log_flow - log_pb - log_r.detach())
-        tb_loss = F.mse_loss(tb, torch.zeros_like(tb), reduction='none')
+        emp_z_coeff, tb_loss = get_tb_loss(emp_z_loss, log_flow, log_pb, log_pf, log_r, loss_coeffs)
         losses.append(tb_loss * loss_coeffs.tb * emp_z_coeff)
 
     """MLE/TPM loss"""
     if loss_coeffs.mle > 0:
-        mle_loss = -log_pb
+        mle_loss = -power_saturate(log_pb, 0.7)
         losses.append(mle_loss * loss_coeffs.mle)
 
     """Variance loss"""
     if loss_coeffs.var > 0:
-        states_to_compare = states[:, -1].clip(min=-6, max=6)  # states[:, -1, 3:].clip(min=-6, max=6)
-        dimwise_var_cutoff = torch.ones(12, device=states.device) * loss_coeffs.var_cutoff
-        dimwise_var_cutoff[2] /= 5  # be gentle on the c-dimension
-        if gfn.conditional_flow_model:
-            states_reshaped = states_to_compare.view(repeats, -1, states_to_compare.shape[-1])
-
-            # Compute variance within each condition
-            batch_var = states_reshaped.var(dim=0)  # (repeats, batch, features)
-            # penalize any variant dimensions below the minimum value
-            small_var_loss = F.relu(dimwise_var_cutoff[None, :] - batch_var) / dimwise_var_cutoff[None, :]
-            large_var_loss = F.relu(batch_var - 16)  # penalize very high variances
-            var_gap = small_var_loss + large_var_loss
-            var_loss = ((var_gap ** 2) * F.softmax(var_gap, dim=1)).sum(dim=1, keepdim=True).repeat(1, repeats).view(-1)
-        else:
-            batch_var = states_to_compare.var(dim=0)  # (batch, features)
-            small_var_loss = F.relu(dimwise_var_cutoff - batch_var) / dimwise_var_cutoff
-            large_var_loss = F.relu(batch_var - 16)
-            var_gap = small_var_loss + large_var_loss
-            var_loss = ((var_gap ** 2) * F.softmax(var_gap, dim=0)).sum(dim=0, keepdim=True).repeat(len(states))
-
+        var_loss = fwd_var_loss(gfn, loss_coeffs, repeats, states)
         losses.append(var_loss * loss_coeffs.var)
 
+    """self overlap loss"""
     if loss_coeffs.overlap > 0:
-        states_to_compare = states[:, -1].clip(min=-6, max=6)  # states[:, -1, 3:].clip(min=-6, max=6)
-
-        if gfn.conditional_flow_model:
-            states_reshaped = states_to_compare.view(repeats, -1, states_to_compare.shape[-1])
-
-            # Compute overlap within each condition
-            overlap_loss = torch.zeros((len(states) // repeats, repeats), device=states.device)
-            for i in range(len(overlap_loss)):
-                condition_states = states_reshaped[:, i]
-                overlap_loss[i] = compute_sample_overlap(
-                    condition_states,
-                    ga=loss_coeffs.var_gamma,
-                    agg='mean',
-                )
-            overlap_loss = overlap_loss.view(-1)
-        else:
-            overlap_loss = compute_sample_overlap(
-                states_to_compare,  # don't let it escape - it could cheat
-                ga=loss_coeffs.var_gamma,
-                agg='mean',
-            )
+        overlap_loss = fwd_overlap_loss(gfn, loss_coeffs, repeats, states)
         losses.append(overlap_loss * loss_coeffs.overlap)
 
     """Buffer distance loss"""
     if loss_coeffs.buffer > 0:
-        assert not gfn.conditional_flow_model, "Buffer loss not yet set up for conditional sampling"
-        states_to_compare = states[:, -1].clip(min=-6, max=6)  #states[:, -1, 3:].clip(min=-6, max=6)
-        buffer_states = torch.stack(buffer.x_list).to(gfn.device)
-        buffer_to_compare = buffer_states[:, -1, 3:].clip(min=-6, max=6)
-        buffer_loss = compute_sample_overlap(
-            buffer_to_compare,
-            states_to_compare,  # don't let it escape - it could cheat
-            ga=loss_coeffs.buffer_gamma,
-        )
+        buffer_loss = fwd_buffer_loss(buffer, gfn, loss_coeffs, states)
         losses.append(buffer_loss * loss_coeffs.buffer)
 
-    combined_losses = soft_clip(torch.stack(losses), loss_coeffs.loss_clip).mean(dim=0)
+    if loss_coeffs.loss_clip != -1:
+        combined_losses = soft_clip(torch.stack(losses), loss_coeffs.loss_clip).mean(dim=0)
+    else:
+        combined_losses = torch.stack(losses).mean(dim=0)
+
     loss = combined_losses.mean()
 
     if report_losses:
@@ -277,6 +208,117 @@ def get_gfn_forward_loss(loss_coeffs,
         return loss, loss_dict
 
 
+def get_tb_loss(emp_z_loss, log_flow, log_pb, log_pf, log_r, loss_coeffs):
+    if loss_coeffs.emp_z > 0:  # gate TB against sufficiently good performance on the empirical Z
+        # if the empirical Z is bad enough, the log Z will explode
+        # this will turn on the TB loss when the empirical Z estimate gets sufficiently good
+        emp_z_coeff = 2 * (-emp_z_loss / 10).mean().sigmoid()
+    else:
+        emp_z_coeff = 1
+
+    tb = (log_pf + log_flow - log_pb - log_r.detach())
+    # tb_loss = F.mse_loss(tb, torch.zeros_like(tb), reduction='none')
+    tb_loss = F.smooth_l1_loss(tb, torch.zeros_like(tb), reduction='none')
+    return emp_z_coeff, tb_loss
+
+
+def emp_Z(gfn, log_Z, log_flow, repeats):
+    if gfn.conditional_flow_model:
+        emp_z_loss = F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_flow.view(repeats, -1), reduction='none').view(-1)
+    else:
+        emp_z_loss = F.smooth_l1_loss(log_Z.repeat(len(log_flow)), log_flow, reduction='none')
+    return emp_z_loss
+
+
+def vg_lme(gfn, log_pb, log_pf, log_r, repeats):
+    log_ratio = log_r.detach() + log_pb - log_pf
+    if gfn.conditional_flow_model:
+        log_Z = torch.logsumexp(log_ratio.view(repeats, -1), dim=0, keepdim=True) - math.log(repeats)
+        # vg_loss = (0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2).view(-1)
+        vg_loss = F.smooth_l1_loss(log_Z.repeat(repeats,1), log_ratio.view(repeats, -1), reduction='none').view(-1)
+    else:
+        log_Z = torch.logsumexp(log_ratio, dim=0, keepdim=True) - math.log(repeats)
+        # vg_loss = 0.5 * (log_Z - log_ratio) ** 2
+        vg_loss = F.smooth_l1_loss(log_Z.repeat(len(log_ratio)), log_ratio, reduction='none')
+    return log_Z, vg_loss
+
+
+def vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats):
+    assert not (loss_coeffs.vg_lb > 0 and loss_coeffs.vg_lme > 0), \
+        "Cannot use both vg_lb and vg_lme simultaneously"
+    log_ratio = log_r.detach() + log_pb - log_pf
+    if gfn.conditional_flow_model:
+        log_Z = log_ratio.view(repeats, -1).mean(dim=0, keepdim=True)
+        # vg_loss = (0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2).view(-1)
+        vg_loss = F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_ratio.view(repeats, -1), reduction='none').view(-1)
+
+    else:
+        log_Z = log_ratio.mean(dim=0, keepdim=True)
+        # vg_loss = 0.5 * (log_Z - log_ratio) ** 2
+        vg_loss = F.smooth_l1_loss(log_Z.repeat(len(log_ratio)), log_ratio, reduction='none')
+    return log_Z, vg_loss
+
+
+def fwd_buffer_loss(buffer, gfn, loss_coeffs, states):
+    assert not gfn.conditional_flow_model, "Buffer loss not yet set up for conditional sampling"
+    states_to_compare = states[:, -1].clip(min=-6, max=6)  # states[:, -1, 3:].clip(min=-6, max=6)
+    buffer_states = torch.stack(buffer.x_list).to(gfn.device)
+    buffer_to_compare = buffer_states[:, -1, 3:].clip(min=-6, max=6)
+    buffer_loss = compute_sample_overlap(
+        buffer_to_compare,
+        states_to_compare,  # don't let it escape - it could cheat
+        ga=loss_coeffs.buffer_gamma,
+    )
+    return buffer_loss
+
+
+def fwd_var_loss(gfn, loss_coeffs, repeats, states):
+    states_to_compare = states[:, -1].clip(min=-6, max=6)  # states[:, -1, 3:].clip(min=-6, max=6)
+    dimwise_var_cutoff = torch.ones(12, device=states.device) * loss_coeffs.var_cutoff
+    dimwise_var_cutoff[2] /= 5  # be gentle on the c-dimension
+    if gfn.conditional_flow_model:
+        states_reshaped = states_to_compare.view(repeats, -1, states_to_compare.shape[-1])
+
+        # Compute variance within each condition
+        batch_var = states_reshaped.var(dim=0)  # (repeats, batch, features)
+        # penalize any variant dimensions below the minimum value
+        small_var_loss = F.relu(dimwise_var_cutoff[None, :] - batch_var) / dimwise_var_cutoff[None, :]
+        large_var_loss = F.relu(batch_var - 16)  # penalize very high variances
+        var_gap = small_var_loss + large_var_loss
+        var_loss = ((var_gap ** 2) * F.softmax(var_gap, dim=1)).sum(dim=1, keepdim=True).repeat(1, repeats).view(-1)
+    else:
+        batch_var = states_to_compare.var(dim=0)  # (batch, features)
+        small_var_loss = F.relu(dimwise_var_cutoff - batch_var) / dimwise_var_cutoff
+        large_var_loss = F.relu(batch_var - 16)
+        var_gap = small_var_loss + large_var_loss
+        var_loss = ((var_gap ** 2) * F.softmax(var_gap, dim=0)).sum(dim=0, keepdim=True).repeat(len(states))
+    return var_loss
+
+
+def fwd_overlap_loss(gfn, loss_coeffs, repeats, states):
+    states_to_compare = states[:, -1].clip(min=-6, max=6)  # states[:, -1, 3:].clip(min=-6, max=6)
+    if gfn.conditional_flow_model:
+        states_reshaped = states_to_compare.view(repeats, -1, states_to_compare.shape[-1])
+
+        # Compute overlap within each condition
+        overlap_loss = torch.zeros((len(states) // repeats, repeats), device=states.device)
+        for i in range(len(overlap_loss)):
+            condition_states = states_reshaped[:, i]
+            overlap_loss[i] = compute_sample_overlap(
+                condition_states,
+                ga=loss_coeffs.var_gamma,
+                agg='mean',
+            )
+        overlap_loss = overlap_loss.view(-1)
+    else:
+        overlap_loss = compute_sample_overlap(
+            states_to_compare,  # don't let it escape - it could cheat
+            ga=loss_coeffs.var_gamma,
+            agg='mean',
+        )
+    return overlap_loss
+
+
 def get_gfn_backward_loss(loss_coeffs,
                           samples,
                           gfn,
@@ -307,55 +349,34 @@ def get_gfn_backward_loss(loss_coeffs,
         smoothness_loss = normed_smoothness_loss(torch.stack([means_f, logvars_f, means_b, logvars_b])).mean(dim=0)
         losses.append(smoothness_loss * loss_coeffs.smoothed)
 
+    """VarGrad - lower bound loss"""
     if loss_coeffs.vg_lb > 0:
-        assert not (loss_coeffs.vg_lb > 0 and loss_coeffs.vg_lme > 0), \
-            "Cannot use both vg_lb and vg_lme simultaneously"
-        log_ratio = log_r + log_pb - log_pf
+        log_Z, vg_loss = vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats)
 
-        if gfn.conditional_flow_model:
-            log_Z = log_ratio.view(repeats, -1).mean(dim=0, keepdim=True)
-            vg_loss = (0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2).view(-1)
-        else:
-            log_Z = log_ratio.mean(dim=0, keepdim=True)
-            vg_loss = 0.5 * (log_Z - log_ratio) ** 2
         losses.append(vg_loss * loss_coeffs.vg_lb)
 
+        """VarGrad - log mean exp loss"""
     elif loss_coeffs.vg_lme > 0:
-        log_ratio = log_r + log_pb - log_pf
-
-        if gfn.conditional_flow_model:
-            log_Z = torch.logsumexp(log_ratio.view(repeats, -1), dim=0, keepdim=True) - math.log(repeats)
-            vg_loss = (0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2).view(-1)
-        else:
-            log_Z = torch.logsumexp(log_ratio, dim=0, keepdim=True) - math.log(repeats)
-            vg_loss = 0.5 * (log_Z - log_ratio) ** 2
+        log_Z, vg_loss = vg_lme(gfn, log_pb, log_pf, log_r, repeats)
         losses.append(vg_loss * loss_coeffs.vg_lme)
 
     if loss_coeffs.emp_z > 0:  # train the flow model to match the empirical log Z distribution
-        if gfn.conditional_flow_model:
-            emp_z_loss = (0.5 * (log_Z - log_flow.view(repeats, -1)) ** 2).view(-1)
-        else:
-            emp_z_loss = 0.5 * (log_Z - log_flow) ** 2
+        emp_z_loss = emp_Z(gfn, log_Z, log_flow, repeats)
         losses.append(emp_z_loss * loss_coeffs.emp_z)
 
     """TB loss"""
     if loss_coeffs.tb > 0:
-        if loss_coeffs.emp_z > 0:  # gate TB against sufficiently good performance on the empirical Z
-            # if the empirical Z is bad enough, the log Z will explode
-            # this will turn on the TB loss when the empirical Z estimate gets sufficiently good
-            emp_z_coeff = 2 * (-emp_z_loss / 100).mean().sigmoid()
-        else:
-            emp_z_coeff = 1
-
-        tb = (log_pf + log_flow - log_pb - log_r.detach())
-        tb_loss = F.mse_loss(tb, torch.zeros_like(tb), reduction='none')
+        emp_z_coeff, tb_loss = get_tb_loss(emp_z_loss, log_flow, log_pb, log_pf, log_r, loss_coeffs)
         losses.append(tb_loss * loss_coeffs.tb * emp_z_coeff)
 
     if loss_coeffs.mle > 0:
-        mle_loss = -log_pf
+        mle_loss = -power_saturate(log_pf, 0.7)
         losses.append(mle_loss * loss_coeffs.mle)
 
-    combined_losses = soft_clip(torch.stack(losses), loss_coeffs.loss_clip).mean(dim=0)
+    if loss_coeffs.loss_clip != -1:
+        combined_losses = soft_clip(torch.stack(losses), loss_coeffs.loss_clip).mean(dim=0)
+    else:
+        combined_losses = torch.stack(losses).mean(dim=0)
     loss = combined_losses.mean()
 
     if report_losses:
@@ -379,3 +400,7 @@ def get_gfn_backward_loss(loss_coeffs,
         return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), loss_dict
     else:
         return loss, loss_dict
+
+
+def power_saturate(x, power):
+    return torch.sign(x) * (torch.abs(x) ** power)

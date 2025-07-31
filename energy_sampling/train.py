@@ -608,7 +608,7 @@ def init_buffers_datasets(energy_function):
         test_mols_list = [good_mol for _ in range(int(args.max_batch_size * 1.5))]
 
     elif args.molecule == 'qm9':
-        qm9_mols = torch.load(args.molecules_path)
+        qm9_mols = torch.load(args.molecules_path, weights_only=False)
         rng = np.random.RandomState(0)
         rands = rng.choice(len(qm9_mols), len(qm9_mols), replace=False)
         bp = int(len(rands) * 0.8)
@@ -766,7 +766,7 @@ def handle_oom(batch_size, e):
 
 def add_dataset_to_buffer(dataset_path, buffer):
     print("Loading prebuilt buffer")
-    dataset = torch.load(dataset_path)
+    dataset = torch.load(dataset_path, weights_only=False)
 
     if args.energy_function in ['ellipsoid_overlap',
                                 'silu_energy',

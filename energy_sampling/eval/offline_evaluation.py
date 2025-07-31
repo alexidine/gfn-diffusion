@@ -7,7 +7,9 @@ Detailed / expensive evaluations for the GFN generator
 """
 import os
 
+import numpy as np
 import torch
+from tqdm import tqdm
 
 from energy_sampling.energies.molecular_crystal import MolecularCrystal
 from energy_sampling.eval.offline_figs import create_energy_distribution_plot, create_density_distribution_plot, \
@@ -17,7 +19,7 @@ from energy_sampling.models import GFN
 from energy_sampling.utils import load_yaml, dict2namespace
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.models.utils import load_encoder
-import numpy as np
+from scipy.spatial.distance import cdist
 
 """load relevant data"""
 eval_config = 'eval.yaml'
@@ -63,6 +65,8 @@ energy_function = MolecularCrystal(device=args.device,
                                    molecule_conditioning=args.molecule_conditioning,
                                    sg_conditioning=args.sg_conditioning,
                                    space_groups=args.space_groups,
+                                   bounding_coeff=args.bounding_coeff,
+                                   niggli_coeff=args.niggli_coeff,
                                    )
 
 """
@@ -70,7 +74,7 @@ for each space group, for the eval set, sample and record energies, cell paramet
 """
 if not os.path.exists('sg_results.npy') or override_resample:
 
-    eval_mols = torch.load(eval_molecules_path)[:args.eval_mols_to_sample]
+    eval_mols = torch.load(eval_molecules_path, weights_only=False)[:args.eval_mols_to_sample]
     sg_sampling_dict = {sg: {} for sg in args.sgs_to_sample}
 
     for sg in args.sgs_to_sample:
@@ -94,14 +98,14 @@ if not os.path.exists('sg_results.npy') or override_resample:
 for each csd molecule, sample and record energies, cell parameters in the target SG
 """
 if not os.path.exists('csd_results.npy') or override_resample:
-    csd_mols = torch.load(csd_crystals_path)
+    csd_mols = torch.load(csd_crystals_path, weights_only=False)
     csd_mols = [mol for mol in csd_mols if int(mol.sg_ind) == 2]  # todo relax in future
     csd_mols = csd_mols[:args.csd_mols_to_sample]
 
     identifiers = [mol.identifier for mol in csd_mols]
     csd_sampling_dict = {ident: {} for ident in identifiers}
 
-    for ind in range(len(csd_mols)):
+    for ind in tqdm(range(len(csd_mols))):
         id = identifiers[ind]
         mol = csd_mols[ind]
         sg = mol.sg_ind
@@ -156,9 +160,8 @@ if args.show_figs:
 """Hit rate vs synthetic"""
 
 """Hit rate vs CSD"""
-
 # analyze & preprocess CSD samples
-csd_mols = torch.load(csd_crystals_path)
+csd_mols = torch.load(csd_crystals_path, weights_only=False)
 csd_mols = [mol for mol in csd_mols if int(mol.sg_ind) == 2]  # todo relax in future
 csd_mols = csd_mols[:args.csd_mols_to_sample]
 identifiers = [elem.identifier for elem in csd_mols]
@@ -172,24 +175,72 @@ ref_energies = csd_clusters.compute_silu_energy()
 csd_sampling_dict = np.load('csd_results.npy', allow_pickle=True).item()
 
 # get rdf dists
-rdf_dists, rr = sample_csd_rdf_dists(csd_mols, csd_sampling_dict,
-                                     args.eval_batch_size, args.device)
+print('getting RDFs')
+if not os.path.exists('csd_rdfs.npy'):
+    rdf_dists, rr = sample_csd_rdf_dists(csd_mols,
+                                         csd_sampling_dict,
+                                         args.eval_batch_size,
+                                         args.device)
+    np.save('csd_rdfs', rdf_dists.cpu().detach().numpy())
+else:
+    rdf_dists = np.load('csd_rdfs.npy',allow_pickle=True)
 
 # funnel figs
-funnel_figs = []
+if args.show_figs:
+    funnel_figs = []
+    for ind in range(len(csd_mols)):
+        samples = csd_sampling_dict[identifiers[ind]]
+        funnel_figs.append(crystal_sample_funnel_plot(
+            packing_coeff=samples['densities'].flatten(),
+            energies=samples['energies'].flatten(),
+            dists=torch.tensor(rdf_dists)[ind],
+            ref_energies=torch.tensor([ref_energies[ind]]),
+            ref_packing_coeff=csd_clusters[ind].packing_coeff
+        ))
+    [f.show() for f in funnel_figs]
+
+# Divergence between lattice distance sets
+js_divs = np.array(sample_csd_lattice_divs(csd_mols, csd_sampling_dict))
+
+dmats = []
 for ind in range(len(csd_mols)):
     samples = csd_sampling_dict[identifiers[ind]]
-    funnel_figs.append(crystal_sample_funnel_plot(
-        packing_coeff=samples['densities'].flatten(),
-        energies=samples['energies'].flatten(),
-        dists=rdf_dists[ind],
-        ref_energies=torch.tensor([ref_energies[ind]]),
-        ref_packing_coeff=csd_clusters[ind].packing_coeff
-    ))
-[f.show() for f in funnel_figs]
+    dens = samples['densities'].flatten()
+    ens =samples['energies'].flatten()
+    std_den = (dens - np.mean(dens))/np.std(dens)
+    std_en = (ens - np.mean(ens))/np.std(ens)
 
-# Divergence between lattice distanc sets
-js_divs = sample_csd_lattice_divs(csd_mols, csd_sampling_dict)
+    ref_en = np.array(float(ref_energies[ind]))[None]
+    ref_den = np.array(float(csd_clusters[ind].packing_coeff))[None]
+    std_ref_en = (ref_en - np.mean(ens))/np.std(ens)
+    std_ref_den = (ref_den - np.mean(dens))/np.std(dens)
+
+    scat_dists = cdist(np.stack([std_den, std_en]).T, np.stack([std_ref_den, std_ref_en]).T)
+
+    js_dists = js_divs[ind]
+    import plotly.graph_objects as go
+
+    dmats = []
+    for ind in range(len(csd_mols)):
+        samples = csd_sampling_dict[identifiers[ind]]
+        dens = samples['densities'].flatten()
+        ens = samples['energies'].flatten()
+        std_den = (dens - np.mean(dens)) / np.std(dens)
+        std_en = (ens - np.mean(ens)) / np.std(ens)
+
+        ref_en = np.array(float(ref_energies[ind]))[None]
+        ref_den = np.array(float(csd_clusters[ind].packing_coeff))[None]
+        std_ref_en = (ref_en - np.mean(ens)) / np.std(ens)
+        std_ref_den = (ref_den - np.mean(dens)) / np.std(dens)
+
+        scat_dists = cdist(np.stack([std_den, std_en]).T, np.stack([std_ref_den, std_ref_en]).T)
+
+        js_dists = js_divs[ind]
+        import plotly.graph_objects as go
+
+        go.Figure(
+            go.Scatter(x=scat_dists.flatten(), y=js_dists, mode='markers', marker_color=np.log10(rdf_dists[ind]))).show(
+            renderer='browser', marker_colorscale='viridis')
 
 aa = 1
 

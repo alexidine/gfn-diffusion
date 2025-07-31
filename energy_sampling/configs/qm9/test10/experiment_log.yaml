@@ -2,6 +2,7 @@
   tag: 0_vg_only
   update_keys:
   - max_batch_size
+  - repeats
   - joint_layers
   - hidden_dim
   - dropout
@@ -14,10 +15,11 @@
   - bwd_loss_coeffs
   notes: ''
 - index: 1
-  tag: 1_vg_and_mle
+  tag: 1_mle_to_noise1
   update_keys:
-  - joint_layers
   - max_batch_size
+  - repeats
+  - joint_layers
   - hidden_dim
   - dropout
   - norm
@@ -29,10 +31,11 @@
   - bwd_loss_coeffs
   notes: ''
 - index: 2
-  tag: 2_vg_bmle
+  tag: 2_mle_to_noise2
   update_keys:
-  - joint_layers
   - max_batch_size
+  - repeats
+  - joint_layers
   - hidden_dim
   - dropout
   - norm
@@ -44,8 +47,10 @@
   - bwd_loss_coeffs
   notes: ''
 - index: 3
-  tag: 4_gently_greedy
+  tag: 3_mle_to_noise3
   update_keys:
+  - max_batch_size
+  - repeats
   - joint_layers
   - hidden_dim
   - dropout
@@ -58,8 +63,10 @@
   - bwd_loss_coeffs
   notes: ''
 - index: 4
-  tag: 5_gently_greedy2
+  tag: 4_mle_to_noise4
   update_keys:
+  - max_batch_size
+  - repeats
   - joint_layers
   - hidden_dim
   - dropout
@@ -72,8 +79,10 @@
   - bwd_loss_coeffs
   notes: ''
 - index: 5
-  tag: 5_gently_greedy3_all_noise
+  tag: 5_mle_to_data1
   update_keys:
+  - max_batch_size
+  - repeats
   - joint_layers
   - hidden_dim
   - dropout
@@ -86,9 +95,10 @@
   - bwd_loss_coeffs
   notes: ''
 - index: 6
-  tag: 6_greedy_RF
+  tag: 6_mle_to_data2
   update_keys:
   - max_batch_size
+  - repeats
   - joint_layers
   - hidden_dim
   - dropout
@@ -101,9 +111,10 @@
   - bwd_loss_coeffs
   notes: ''
 - index: 7
-  tag: 7_greedy_RF_big_mle
+  tag: 7_mle_to_data3
   update_keys:
   - max_batch_size
+  - repeats
   - joint_layers
   - hidden_dim
   - dropout
@@ -116,9 +127,90 @@
   - bwd_loss_coeffs
   notes: ''
 - index: 8
-  tag: 8_vg_only_tight_pb
+  tag: 8_mle_to_data4
   update_keys:
   - max_batch_size
+  - repeats
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 9
+  tag: 9_mle_noise_to_data1
+  update_keys:
+  - max_batch_size
+  - repeats
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 10
+  tag: 10_mle_noise_to_data2
+  update_keys:
+  - max_batch_size
+  - repeats
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 11
+  tag: 11_mle_noise_to_data3
+  update_keys:
+  - max_batch_size
+  - repeats
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 12
+  tag: 12_mle_noise_to_data4
+  update_keys:
+  - max_batch_size
+  - repeats
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 13
+  tag: 13_greedy_test
+  update_keys:
+  - max_batch_size
+  - repeats
   - joint_layers
   - hidden_dim
   - dropout

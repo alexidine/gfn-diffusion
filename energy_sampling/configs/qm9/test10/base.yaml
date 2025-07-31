@@ -1,5 +1,5 @@
-run_name: 'qm9_test9'
-tag: 'qm9_test9'
+run_name: 'qm9_test10'
+tag: 'qm9_test10'
 seed: 12345
 device: 'cuda'
 lr_policy: 0.0001              # learning rate of the policy network
@@ -12,14 +12,14 @@ lr_warmup_time: 1000
 lr_anneal_time: 40000
 weight_decay: 1e-7
 use_weight_decay: false
-gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weights
+gradient_norm_clip: 1.0        # gradient norm clip for updating gfn model weights
 
 # model parameters
 zero_init: False
-joint_layers: 16              # number of layers in forward/backward policy models
+joint_layers: 8              # number of layers in forward/backward policy models
 hidden_dim: 512              # dimensionality of hidden layer
 s_emb_dim: 512               # dimensionality of state embedding
-condition_emb_dim: 5412         # dimensionality of the conditioning embedding
+condition_emb_dim: 512         # dimensionality of the conditioning embedding
 t_emb_dim: 32                # dimensionality of time embedding
 harmonics_dim: 64            # dimensionality of harmonic embedding
 dropout: 0                   # dropout probability

@@ -99,7 +99,7 @@ def create_cell_params_variance_plot(sg_sampling_dict):
             name=f'SG {sg}',
             marker_color=colors[i % len(colors)],
             showlegend=False,
-            text=np.round(vars, 2),
+            text=[f"{v:.2e}" for v in vars],
             textposition='auto',
             opacity=0.7,
         ))
@@ -109,7 +109,7 @@ def create_cell_params_variance_plot(sg_sampling_dict):
             y=vertical_step + np.amax(vars) * 0.25,
             text=f"SG {sg}",
             showarrow=False,
-            font=dict(size=14),
+            font=dict(size=28),
             align='right',
         )
         vertical_step += np.amax(vars)
@@ -124,8 +124,6 @@ def create_cell_params_variance_plot(sg_sampling_dict):
         yaxis=dict(showticklabels=False, showgrid=False, zeroline=False),
     )
 
-    fig.show()
-
     return fig
 
 
@@ -134,8 +132,6 @@ def crystal_sample_funnel_plot(packing_coeff,
                                dists,
                                ref_packing_coeff,
                                ref_energies):
-
-
     fig = go.Figure()
     fontsize = 26
     fig.add_scatter(x=packing_coeff, y=energies,
@@ -164,8 +160,6 @@ def crystal_sample_funnel_plot(packing_coeff,
             colorscale='bluered',
             colorbar=dict(
                 title='log RDF EMD',
-                titlefont_size=18,
-                tickfont_size=18,
                 x=1  # shift it to the right so it doesn't overlap
             )
         )
@@ -186,7 +180,8 @@ def crystal_sample_funnel_plot(packing_coeff,
             xanchor="center",
             x=0.5
         ),
-        margin=dict(t=100)  # Increase top margin to make space
+        margin=dict(t=100),  # Increase top margin to make space
+        yaxis_range=[min(energies.min(), ref_energies.min()) - 1, 0]  # show only bound states
     )
 
     return fig
