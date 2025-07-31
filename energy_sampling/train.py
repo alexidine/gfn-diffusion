@@ -15,8 +15,8 @@ from torch_geometric.loader import DataLoader
 from tqdm import trange
 
 from energies.molecular_crystal import MolecularCrystal
-from energy_sampling.buffer import CrystalReplayBuffer
-from energy_sampling.utils import featurize_dataset, embed_dataset
+from buffer import CrystalReplayBuffer
+from utils import featurize_dataset, embed_dataset
 from eval.evaluations import eval_step
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 from models import GFN
