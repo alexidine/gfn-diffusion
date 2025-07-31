@@ -186,9 +186,7 @@ for ind in range(len(csd_mols)):
         ref_energies=torch.tensor([ref_energies[ind]]),
         ref_packing_coeff=csd_clusters[ind].packing_coeff
     ))
-
-
-#[f.show() for f in funnel_figs]
+[f.show() for f in funnel_figs]
 
 # Divergence between lattice distanc sets
 js_divs = sample_csd_lattice_divs(csd_mols, csd_sampling_dict)

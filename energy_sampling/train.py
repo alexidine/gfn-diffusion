@@ -68,7 +68,6 @@ def train_step(energy_function,
             buffer,
             return_exp=True,
             repeats=repeats,
-            reweight_T=args.reweight_T,
             report_losses=report_losses
         )
 
@@ -83,10 +82,9 @@ def train_step(energy_function,
             gfn_model,
             discretizer,
             buffer,
-            exploration_std,
+            energy_function,
             repeats=repeats,
             return_exp=True,
-            reweight_T=args.reweight_T,
             report_losses=report_losses)
     else:
         assert False
@@ -190,7 +188,7 @@ def get_discretizer(discretization_type):
 
 
 def fwd_train_step(energy_function, gfn_model, discretizer, exploration_std, mol_batch, buffer, return_exp=False,
-                   repeats: int = 10, reweight_T: Optional[float] = None,
+                   repeats: int = 10,
                    report_losses: bool = False):
     init_state = get_gfn_init_state(args.batch_size, energy_function.data_ndim, device)
     log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(mol_batch)
@@ -207,12 +205,11 @@ def fwd_train_step(energy_function, gfn_model, discretizer, exploration_std, mol
                                 return_exp=return_exp,
                                 condition=condition,
                                 repeats=repeats,
-                                reweight_T=reweight_T,
                                 report_losses=report_losses)
 
 
-def bwd_train_step(gfn_model, discretizer, buffer, exploration_std=None, repeats: int = 10,
-                   return_exp=False, reweight_T: Optional[float] = None, report_losses: bool = False):
+def bwd_train_step(gfn_model, discretizer, buffer, energy_function, repeats: int = 10,
+                   return_exp=False, report_losses: bool = False):
     if args.sampling == 'buffer':
         samples, rewards, crystal_batch, condition = buffer.sample(
             return_conditioning=True,
@@ -220,17 +217,45 @@ def bwd_train_step(gfn_model, discretizer, buffer, exploration_std=None, repeats
     else:
         assert False, f"sampling method {args.sampling} not implemented"
 
+    condition, rewards, samples = substitute_prior(condition, crystal_batch, energy_function, rewards, samples)
+
     return get_gfn_backward_loss(args.bwd_loss_coeffs,
                                  samples.to(device),
                                  gfn_model,
                                  rewards.to(device),
                                  discretizer,
-                                 exploration_std=exploration_std,
                                  condition=condition.to(device),
                                  repeats=repeats,
                                  return_exp=return_exp,
-                                 reweight_T=reweight_T,
                                  report_losses=report_losses)
+
+
+def substitute_prior(condition, crystal_batch, energy_function, rewards, samples):
+    loss_coeffs = args.bwd_loss_coeffs
+    if loss_coeffs.mle_prior_fraction > 0:
+        # replace buffer samples with a random prior
+        prior_samples = (torch.randn_like(samples) * loss_coeffs.pmle_std).clip(min=-6, max=6)
+        if loss_coeffs.mle_prior_fraction < 1:
+            num_to_replace = max(1, int(len(samples) * loss_coeffs.mle_prior_fraction))
+            inds_to_replace = np.random.choice(len(samples), num_to_replace, replace=False)
+            samples[inds_to_replace] = prior_samples[inds_to_replace]
+        else:
+            samples = prior_samples
+
+        # have to update the rewards if we are using any loss functions that take them
+        if any([
+            loss_coeffs.tb > 0,
+            loss_coeffs.vg_lb > 0,
+            loss_coeffs.vg_lme > 0,
+        ]):
+            log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(crystal_batch)
+            if log_T_tensor is not None:
+                log_temperature = log_T_tensor
+            else:
+                log_temperature = None
+            with torch.no_grad():
+                rewards = energy_function.log_reward(samples, crystal_batch, log_temperature, False)
+    return condition, rewards, samples
 
 
 def train():
@@ -256,6 +281,8 @@ def train():
                                        molecule_conditioning=args.molecule_conditioning,
                                        sg_conditioning=args.sg_conditioning,
                                        space_groups=args.space_groups,
+                                       bounding_coeff=args.bounding_coeff,
+                                       niggli_coeff=args.niggli_coeff,
                                        )
 
     config = args.__dict__
@@ -265,32 +292,6 @@ def train():
                name=name,
                tags=[args.tag])
 
-    gfn_model = GFN(dim=energy_function.data_ndim,
-                    s_emb_dim=args.s_emb_dim,
-                    hidden_dim=args.hidden_dim,
-                    conditions_dim=get_conditioning_dim(),
-                    harmonics_dim=args.harmonics_dim,
-                    t_dim=args.t_emb_dim,
-                    condition_embedding_dim=args.condition_emb_dim,
-                    trajectory_length=args.T,
-                    clipping=args.clipping,
-                    gfn_clip=args.gfn_clip,
-                    learned_variance=args.learned_variance,
-                    log_var_range=args.log_var_range,
-                    pb_scale_range=args.pb_scale_range,
-                    t_scale=args.t_scale,
-                    conditional_flow_model=any([
-                        args.temperature_conditioning,
-                        args.molecule_conditioning,
-                        args.sg_conditioning]
-                    ),
-                    learn_pb=args.learn_pb,
-                    joint_layers=args.joint_layers,
-                    dropout=args.dropout,
-                    norm=args.norm,
-                    zero_init=args.zero_init,
-                    device=device
-                    ).to(device)
     gfn_config = dict(
         dim=energy_function.data_ndim,
         s_emb_dim=args.s_emb_dim,
@@ -304,7 +305,8 @@ def train():
         gfn_clip=args.gfn_clip,
         learned_variance=args.learned_variance,
         log_var_range=args.log_var_range,
-        pb_scale_range=args.pb_scale_range,
+        pb_drift_range=args.pb_drift_range,
+        pb_var_range=args.pb_var_range,
         t_scale=args.t_scale,
         conditional_flow_model=any([
             args.temperature_conditioning,
@@ -318,6 +320,8 @@ def train():
         zero_init=args.zero_init,
         device=device
     )
+    gfn_model = GFN(**gfn_config).to(device)
+
     np.save(f'{name}_model_config', gfn_config)
     wandb.watch(gfn_model, log_graph=True, log_freq=1000)  # for gradient logging
 
@@ -387,14 +391,15 @@ def train():
         times['train_step_end'] = time()
 
         if (step_ind % args.eval_period == 0 and step_ind > 0) or step_ind == 50:
-            torch.save(gfn_model.model_state_dict(), f'{name}_model.pt')
+            torch.save(gfn_model.state_dict(), f'{name}_model.pt')
             metrics = do_evaluation(energy_function, buffer, gfn_model,
                                     step_ind, metrics, test_mol_loader)
             if args.molecule_conditioning:
                 train_metrics = do_evaluation(energy_function, buffer, gfn_model,
                                               step_ind, metrics, train_mol_loader,
                                               override_do_figures=False)
-                for key in train_metrics.keys():
+                kk = list(train_metrics.keys())
+                for key in kk:
                     metrics['train_eval/' + key] = train_metrics[key]
 
             wandb.log(metrics, step=step_ind)

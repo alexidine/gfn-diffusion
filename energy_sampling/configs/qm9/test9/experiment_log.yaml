@@ -1,0 +1,56 @@
+- index: 0
+  tag: 0_base
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 1
+  tag: 1_big_drift
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 2
+  tag: 2_fat_var
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''
+- index: 3
+  tag: 3_fat_model
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  notes: ''

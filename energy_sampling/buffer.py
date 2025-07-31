@@ -2,6 +2,8 @@ from typing import Optional
 
 import torch
 import numpy as np
+
+from mxtaltools.crystal_building.crystal_latent_transforms import compute_niggli_overlap
 from mxtaltools.dataset_utils.utils import collate_data_list
 
 from utils import compute_sample_overlap
@@ -47,27 +49,39 @@ class CrystalReplayBuffer:
 
             else:
                 new_data_batch = collate_data_list(data_list)
-                new_x_tensor = new_data_batch.cell_params_to_gen_basis().to('cuda' if self.gpu_available else 'cpu')
-                scores = self.energy_function.prebuilt_sample_to_reward(new_data_batch,
-                                                                        temperature=torch.ones(len(new_data_batch))
-                                                                        ).cpu().detach().numpy()
-                scores_list = list(scores)
 
-                ref_x_tensor = torch.stack(self.x_list).to('cuda' if self.gpu_available else 'cpu')
-                min_buffer_dist = torch.cdist(ref_x_tensor, new_x_tensor).amin(0)
-                new_x_tensor = new_x_tensor.cpu()
+                # do not take samples with bad overlaps
+                # these could be 'flipped' to their valid cell form and added, but I don't have the transform
+                # for the molecule positions, only for the cell (angle = pi-angle)
+                a, b, c = new_data_batch.cell_lengths.split(1, dim=1)
+                al, be, ga = new_data_batch.cell_angles.split(1, dim=1)
+                _, _, _, _, _, _, overlap = compute_niggli_overlap(a, b, c, al, be, ga)
+                bad_inds = torch.argwhere(overlap.flatten() < 0).flatten().tolist()
+                data_list = [elem for ind, elem in enumerate(data_list) if ind not in bad_inds]
+                if len(data_list) > 0:
+                    new_data_batch = collate_data_list(data_list)
 
-                far_enough = (min_buffer_dist >= diversity_cutoff).cpu().detach().numpy()
-                existing_rewards = np.array(self.rewards_list)
-                rewards_cutoff = np.amin(existing_rewards) - np.ptp(existing_rewards) * 0.1
-                good_enough = scores >= rewards_cutoff
-                new_x_inds_to_keep = np.argwhere(far_enough * good_enough).flatten().tolist()
-                data_list_to_add = [data_list[ind] for ind in new_x_inds_to_keep]
+                    new_x_tensor = new_data_batch.cell_params_to_gen_basis().to('cuda' if self.gpu_available else 'cpu')
+                    scores = self.energy_function.prebuilt_sample_to_reward(new_data_batch,
+                                                                            temperature=torch.ones(len(new_data_batch))
+                                                                            ).cpu().detach().numpy()
+                    scores_list = list(scores)
 
-                if len(data_list_to_add) > 0:
-                    self.dataset.extend(list(data_list_to_add))
-                    self.x_list.extend([new_x_tensor[ind] for ind in new_x_inds_to_keep])
-                    self.rewards_list.extend([scores_list[ind] for ind in new_x_inds_to_keep])
+                    ref_x_tensor = torch.stack(self.x_list).to('cuda' if self.gpu_available else 'cpu')
+                    min_buffer_dist = torch.cdist(ref_x_tensor, new_x_tensor).amin(0)
+                    new_x_tensor = new_x_tensor.cpu()
+
+                    far_enough = (min_buffer_dist >= diversity_cutoff).cpu().detach().numpy()
+                    existing_rewards = np.array(self.rewards_list)
+                    rewards_cutoff = np.amin(existing_rewards) - np.ptp(existing_rewards) * 0.1
+                    good_enough = scores >= rewards_cutoff
+                    new_x_inds_to_keep = np.argwhere(far_enough * good_enough).flatten().tolist()
+                    data_list_to_add = [data_list[ind] for ind in new_x_inds_to_keep]
+
+                    if len(data_list_to_add) > 0:
+                        self.dataset.extend(list(data_list_to_add))
+                        self.x_list.extend([new_x_tensor[ind] for ind in new_x_inds_to_keep])
+                        self.rewards_list.extend([scores_list[ind] for ind in new_x_inds_to_keep])
 
             if len(self) > self.buffer_size:  # pare down buffer
                 self.truncate_buffer()

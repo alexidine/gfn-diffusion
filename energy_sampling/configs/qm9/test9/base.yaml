@@ -1,11 +1,11 @@
-run_name: 'mk_local_dev'
-tag: 'dev'
+run_name: 'qm9_test9'
+tag: 'qm9_test9'
 seed: 12345
 device: 'cuda'
-lr_policy: 0.0001              # learning rate of the policy network
-min_lr: 1.0e-6                # ihn
+lr_policy: 0.0005              # learning rate of the policy network
+min_lr: 1.0e-5                # ihn
 lr_flow: 0.1                  # learning rate of the flow network
-lr_back: 0.0001                # learning rate of the backward pass
+lr_back: 0.0005                # learning rate of the backward pass
 lr_warmup_ratio: 100           # how much smaller the initial (warmup) LR should be than the max policy value
 scheduler: True               # does LR warmup from lr/lr_warup_ratio -> lr -> min_lr over the warmup and annealing period
 lr_warmup_time: 1000
@@ -16,23 +16,23 @@ gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weigh
 
 # model parameters
 zero_init: False
-joint_layers: 2              # number of layers in forward/backward policy models
-hidden_dim: 128              # dimensionality of hidden layer
-s_emb_dim: 128               # dimensionality of state embedding
-condition_emb_dim: 128         # dimensionality of the conditioning embedding
+joint_layers: 16              # number of layers in forward/backward policy models
+hidden_dim: 512              # dimensionality of hidden layer
+s_emb_dim: 512               # dimensionality of state embedding
+condition_emb_dim: 5412         # dimensionality of the conditioning embedding
 t_emb_dim: 32                # dimensionality of time embedding
 harmonics_dim: 64            # dimensionality of harmonic embedding
 dropout: 0                   # dropout probability
-norm: null                   # null, "layer", "batch"
+norm: layer                   # null, "layer", "batch"
 
 batch_size: 5               # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
 max_batch_size: 50           # maximum batch size to allow
 repeats: 5                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
-eval_batch_size: 500        # batch size for evaluation
+eval_batch_size: 1000        # batch size for evaluation
 epochs: 10000000             # number of training epochs: relatively large
-eval_period: 200              # how often to do evaluation & reporting
-figs_period: 200             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
+eval_period: 1000              # how often to do evaluation & reporting
+figs_period: 1000             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # GFlowNet settings
 T: 10                        # static training diffusion length
@@ -49,7 +49,7 @@ pb_var_range: 2             # range of learned backward policy variance
 energy: "molecular_crystal"  # "molecular_crystal"
 # ramp: 'linear': tringular profile from init-> max -> min
 fwd_loss_coeffs:
-  tb:               { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1    }
+  tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
   vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
   vg_lme:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # exclusive with vg_lb
   emp_z:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
@@ -66,7 +66,7 @@ fwd_loss_coeffs:
   var_gamma:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
   buffer_gamma:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
 bwd_loss_coeffs:
-  tb:               { init: 0.01, max: 1.0, min: 1.0, 'on': 1000,    'off': 1000    }
+  tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
   vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
   vg_lme:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # exclusive with vg_lb
   emp_z:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
@@ -86,34 +86,34 @@ gfn_clip: 20.0  # clip the maximum step size induced by the policy model
 
 # dataset settings
 ################################################################
-buffer_path: null #'D:/crystal_datasets/test_qm9_sg2_dataset.pt'
-molecules_path: 'D:/crystal_datasets/test_csd_free_qm9_dataset.pt'
-autoencoder_path: 'C:/Users/mikem/crystals/CSP_runs/models/cluster/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
+#buffer_path: null #'D:/crystal_datasets/test_qm9_sg2_dataset.pt'
+#molecules_path: 'D:/crystal_datasets/test_csd_free_qm9_dataset.pt'
+#autoencoder_path: 'C:/Users/mikem/crystals/CSP_runs/models/cluster/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
 
-#buffer_path: '/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
-#molecules_path: '/scratch/mk8347/csd_runs/datasets/csd_free_qm9_dataset.pt'
-#autoencoder_path: '/scratch/mk8347/csd_runs/models/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
+buffer_path: '/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+molecules_path: '/scratch/mk8347/csd_runs/datasets/csd_free_qm9_dataset.pt'
+autoencoder_path: '/scratch/mk8347/csd_runs/models/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
 
 # replay buffer settings
 ################################################################
 beta: 10.0             # reward prioritized replay sampling: high beta = steep prioritization
 rank_weight: 1.0     # rank-based replay sampling: low rank_weight = steep prioritization
-buffer_diversity_coeff: 1.0  # how highly to weight sample diversity when sampling from the buffer
+buffer_diversity_coeff: 0.1  # how highly to weight sample diversity when sampling from the buffer
 prioritized: "boltzmann"   # three kinds of replay training: random, reward prioritized (Boltzmann), rank-based
 sampling: "buffer"
 add_to_buffer_each: 10  # how often to add samples to the buffer during fwd passes in both_ways training
-buffer_size: 50000          # size of replay buffer: relatively large
+buffer_size: 200000          # size of replay buffer: relatively large
 
 # exploration controls
 ################################################################
 exploratory: True       # adds variance to optionally learned logvars
-exploration_factor: 0.25  # initial exploration std value
+exploration_factor: 0.05  # initial exploration std value
 exploration_wd: True  # decay exploration over time
-wd_max_steps: 1000  # number of steps to terminate the added variance
+wd_max_steps: 5000  # number of steps to terminate the added variance
 
 # molecular crystal settings
 ################################################################
-molecule: 'urea'  # 'nicotinamide' or 'urea' or 'qm9' for molecule-conditional training
+molecule: 'qm9'  # 'nicotinamide' or 'urea' or 'qm9' for molecule-conditional training
 temperature_conditioning: False  # if false, temperatures are set to energy_static_temperature, and there is no annealing
 molecule_conditioning: True  # MUST be true for molecule='qm9' and false else - conditions the generative prediction on the molecule
 sg_conditioning: False  # whether to conditionally sample across space groups
@@ -132,7 +132,7 @@ anneal_repulsion: False
 repulsion_annealing_max_steps: 5000
 energy_density_coeff: 2.0  # how much to weight the density penalty term in the energy function
 energy_core_coeff: 10.0  # loss coefficient
-bounding_coeff: 1.0
+bounding_coeff: 10.0
 niggli_coeff: 10.0
 core_start_time: 100  # after how many steps to turn on the core repulsion energy
 energy_lj_coeff: 1.0  # loss coefficient

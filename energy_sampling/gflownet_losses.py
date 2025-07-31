@@ -163,7 +163,7 @@ def get_gfn_forward_loss(loss_coeffs,
 
     """MLE/TPM loss"""
     if loss_coeffs.mle > 0:
-        mle_loss = soft_saturate(-log_pbs.sum(-1))
+        mle_loss = -log_pb
         losses.append(mle_loss * loss_coeffs.mle)
 
     """Variance loss"""
@@ -227,9 +227,8 @@ def get_gfn_forward_loss(loss_coeffs,
         )
         losses.append(buffer_loss * loss_coeffs.buffer)
 
-    combined_losses = torch.stack(losses).mean(dim=0)
-
-    loss = reweight_losses(combined_losses, losses, reweight_T)
+    combined_losses = torch.stack(losses).clip(min=-1000, max=1000).mean(dim=0)
+    loss = combined_losses.mean()
 
     if report_losses:
         loss_dict = {}
@@ -264,36 +263,17 @@ def get_gfn_forward_loss(loss_coeffs,
         return loss, loss_dict
 
 
-def reweight_losses(combined_losses, losses, reweight_T):
-    if reweight_T is not None:  # optionally reweight losses to minimize large outliers.
-        weights = (torch.softmax(-combined_losses.detach() / reweight_T, dim=0) * len(losses)).clamp(min=1e-4)
-        weights /= weights.sum()
-        loss = (weights * combined_losses).mean()
-    else:
-        loss = combined_losses.mean()
-    return loss
-
 
 def get_gfn_backward_loss(loss_coeffs,
                           samples,
                           gfn,
                           log_r,
                           discretizer,
-                          exploration_std=None,
                           condition=None,
                           repeats=10,
                           return_exp=False,
                           reweight_T: Optional[float] = None,
                           report_losses: bool = False):
-    if loss_coeffs.mle_prior_fraction > 0:
-        # replace buffer samples with a random prior
-        prior_samples = (torch.randn_like(samples) * loss_coeffs.pmle_std).clip(min=-6, max=6)
-        if loss_coeffs.mle_prior_fraction < 1:
-            num_to_replace = max(1, int(len(samples) * loss_coeffs.mle_prior_fraction))
-            inds_to_replace = np.random.choice(len(samples), num_to_replace, replace=False)
-            samples[inds_to_replace] = prior_samples[inds_to_replace]
-        else:
-            samples = prior_samples
 
     if gfn.conditional_flow_model and any([
         loss_coeffs.vg_lb > 0, loss_coeffs.vg_lme > 0
@@ -352,12 +332,11 @@ def get_gfn_backward_loss(loss_coeffs,
         losses.append(emp_z_loss * loss_coeffs.emp_z)
 
     if loss_coeffs.mle > 0:
-        mle_loss = soft_saturate(-log_pfs.sum(-1))
+        mle_loss = -log_pf
         losses.append(mle_loss * loss_coeffs.mle)
 
-    combined_losses = torch.stack(losses).mean(dim=0)
-
-    loss = reweight_losses(combined_losses, losses, reweight_T)
+    combined_losses = torch.stack(losses).clip(min=-1000, max=1000).mean(dim=0)
+    loss = combined_losses.mean()
 
     if report_losses:
         loss_dict = {}

@@ -19,7 +19,8 @@ class GFN(nn.Module):
                  trajectory_length: int = 100,
                  condition_embedding_dim: int = 32,
                  clipping: bool = False,
-                 gfn_clip: float = 1e4, pb_scale_range: float = 1.,
+                 gfn_clip: float = 1e4, pb_drift_range: float = 0.1,
+                 pb_var_range: float = 0.1,
                  conditional_flow_model: bool = False,
                  learn_pb: bool = False, joint_layers: int = 2,
                  dropout: Optional[float] = 0, norm: Optional[str] = None,
@@ -77,7 +78,8 @@ class GFN(nn.Module):
                                            hidden_dim, joint_layers, 2 * dim, zero_init=zero_init,
                                            norm=norm, dropout=dropout)
 
-        self.pb_scale_range = pb_scale_range
+        self.pb_drift_range = pb_drift_range
+        self.pb_var_range = pb_var_range
 
     def split_params(self, tensor):
         mean, logvar_i = gaussian_params(tensor)
@@ -89,8 +91,6 @@ class GFN(nn.Module):
             else:
                 logvar = torch.tanh(logvar_i / self.log_var_range) * self.log_var_range
         return mean, (logvar + np.log(self.pf_std_per_traj) * 2.0).clip(min=-8, max=8)
-
-    #
 
     def predict_next_state(self, s, t, condition_embedding):
         s_new = self.forward_policy(self.s_model(s, condition_embedding), self.t_model(t))
@@ -134,8 +134,10 @@ class GFN(nn.Module):
                                                                                      ts)
             back_mean = (next_state - next_state * (dts / ts[:, i + 1]).unsqueeze(1) * back_mean_correction)
             if i > 0:  # variance is exactly zero for the first step, so we can't use it
-                back_var = ((self.pf_std_per_traj ** 2) * (dts * ts[:, i] / ts[:, i + 1]).unsqueeze(
-                    1) * back_var_correction)
+                # back_var = ((self.pf_std_per_traj ** 2) * (dts * ts[:, i] / ts[:, i + 1]).unsqueeze(
+                #     1) * back_var_correction)
+                var = (back_var_correction + np.log(self.pf_std_per_traj) * 2.0).clip(min=-8, max=8).exp()
+                back_var = var * (dts * ts[:, i] / ts[:, i + 1]).unsqueeze(1)
                 noise_backward = (current_state - back_mean) / back_var.sqrt()
                 logpb[:, i] = -0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1)
             else:  # instead set this as a constant the model will have to learn around
@@ -183,10 +185,11 @@ class GFN(nn.Module):
 
                 back_mean = (current_state -
                              current_state * (dts / ts[:, trajectory_length - i]).unsqueeze(1) * back_mean_correction)
-                back_var = ((self.pf_std_per_traj ** 2) *
-                            (dts * ts[:, trajectory_length - i - 1] / ts[:, trajectory_length - i]).unsqueeze(
-                                1) * back_var_correction)
-
+                # back_var = ((self.pf_std_per_traj ** 2) *
+                #             (dts * ts[:, trajectory_length - i - 1] / ts[:, trajectory_length - i]).unsqueeze(
+                #                 1) * back_var_correction)
+                var = (back_var_correction + np.log(self.pf_std_per_traj) * 2.0).clip(min=-8, max=8).exp()
+                back_var = var * (dts * ts[:, trajectory_length - i - 1] / ts[:, trajectory_length - i]).unsqueeze(1)
                 prev_state = self.bwd_propagate(back_mean, back_var, current_state, detach_traj)
                 noise_backward = (prev_state - back_mean) / back_var.sqrt()
                 logpb[:, trajectory_length - i - 1] = -0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1)
@@ -226,14 +229,18 @@ class GFN(nn.Module):
             t_emb = self.t_model(ts[:, i + 1])
             pbs = self.backward_policy(self.s_model(next_state, condition_embedding), t_emb)
             dmean, dvar = gaussian_params(pbs)
-            back_mean_correction = 1 + torch.tanh(dmean) * self.pb_scale_range
+            back_mean_correction = 1 + torch.tanh(dmean / self.pb_drift_range) * self.pb_drift_range
+
             if self.learned_variance:
-                back_var_correction = (1 + torch.tanh(dvar) * self.pb_scale_range)
+                back_additive_logvar = torch.tanh(dvar / self.pb_var_range) * self.pb_var_range
+
+                #back_var_correction = (1 + torch.tanh(dvar/self.pb_scale_range) * self.pb_scale_range)
             else:
-                back_var_correction = torch.ones_like(next_state)
+                back_additive_logvar = torch.zeros_like(dvar)
+
         else:
-            back_mean_correction, back_var_correction = torch.ones_like(next_state), torch.ones_like(next_state)
-        return back_mean_correction, back_var_correction
+            back_mean_correction, back_additive_logvar = torch.ones_like(next_state), torch.zeros_like(next_state)
+        return back_mean_correction, back_additive_logvar
 
     def fwd_propagate(self, current_state, detach_traj, dts, pf_mean, pflogvars_sample):
         if detach_traj:
@@ -278,15 +285,18 @@ class GFN(nn.Module):
             t = self.t_model(ts[:, trajectory_length - i])
             pbs = self.backward_policy(self.s_model(current_state, condition_embedding), t)
             dmean, dvar = gaussian_params(pbs)
-            back_mean_correction = 1 + dmean.tanh() * self.pb_scale_range
+            back_mean_correction = 1 + dmean.tanh() * self.pb_drift_range
+
             if self.learned_variance:
-                back_var_correction = 1 + dvar.tanh() * self.pb_scale_range
+                back_additive_logvar = torch.tanh(dvar / self.pb_var_range) * self.pb_var_range
+
+                # back_var_correction = (1 + torch.tanh(dvar/self.pb_scale_range) * self.pb_scale_range)
             else:
-                back_var_correction = torch.ones_like(current_state)
+                back_additive_logvar = torch.zeros_like(dvar)
+
         else:
-            back_mean_correction, back_var_correction = torch.ones_like(current_state), torch.ones_like(
-                current_state)
-        return back_mean_correction, back_var_correction
+            back_mean_correction, back_additive_logvar = torch.ones_like(current_state), torch.zeros_like(current_state)
+        return back_mean_correction, back_additive_logvar
 
     def init_traj_tensors(self, batch_size, trajectory_length):
         logpf = torch.zeros((batch_size, trajectory_length), device=self.device)
