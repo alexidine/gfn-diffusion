@@ -17,30 +17,30 @@ bwd_loss_coeffs:
     init: 0.0
     max: 0.0
     min: 0.0
-    'off': 20000
+    'off': 1
     'on': 0
   loss_clip:
-    init: 1000000000.0
-    max: 1000000000.0
-    min: 1000000000.0
+    init: 100.0
+    max: 10000.0
+    min: 10000.0
     'off': 1000000000.0
     'on': 5000
   mle:
     init: 1.0
-    max: 5.0
-    min: 0.0
+    max: 1.0
+    min: 0.1
     'off': 20000
-    'on': 5000
+    'on': 10000
   mle_prior_fraction:
     init: 1.0
     max: 1.0
     min: 0.0
-    'off': 15000
-    'on': 0
+    'off': 20000
+    'on': 10000
   pmle_std:
     init: 1.0
-    max: 6.0
-    min: 6.0
+    max: 4.0
+    min: 4.0
     'off': 1000000000.0
     'on': 10000
   smoothed:
@@ -53,8 +53,8 @@ bwd_loss_coeffs:
     init: 0.0
     max: 0.0
     min: 0.0
-    'off': 1000000000.0
-    'on': 20000
+    'off': 1000
+    'on': 1000
   vg_lb:
     init: 0.0
     max: 0.0
@@ -65,7 +65,7 @@ bwd_loss_coeffs:
     init: 0.0
     max: 0.0
     min: 0.0
-    'off': 20000
+    'off': 1
     'on': 0
 clipping: true
 condition_emb_dim: 5412
@@ -115,7 +115,7 @@ fwd_loss_coeffs:
     init: 0.0
     max: 0.0
     min: 0.0
-    'off': 20000
+    'off': 1
     'on': 0
   greedy:
     init: 1.0
@@ -132,8 +132,8 @@ fwd_loss_coeffs:
   mle:
     init: 1.0
     max: 1.0
-    min: 0.0
-    'off': 20000
+    min: 1.0
+    'off': 1
     'on': 0
   overlap:
     init: 0.0
@@ -142,9 +142,9 @@ fwd_loss_coeffs:
     'off': 1
     'on': 0
   reinforce:
-    init: 0.0
-    max: 0.0
-    min: 0.0
+    init: 1.0
+    max: 1.0
+    min: 1.0
     'off': 1
     'on': 0
   smoothed:
@@ -157,8 +157,8 @@ fwd_loss_coeffs:
     init: 0.0
     max: 0.0
     min: 0.0
-    'off': 1000000000.0
-    'on': 20000
+    'off': .inf
+    'on': 0
   var:
     init: 0.0
     max: 0.0
@@ -187,7 +187,7 @@ fwd_loss_coeffs:
     init: 0.0
     max: 0.0
     min: 0.0
-    'off': 20000
+    'off': 1
     'on': 0
 fwd_to_bwd_ratio: 1
 gfn_clip: 20.0
@@ -208,7 +208,7 @@ lr_flow: 0.1
 lr_policy: 0.0001
 lr_warmup_ratio: 100
 lr_warmup_time: 1000
-max_batch_size: 50
+max_batch_size: 200
 max_traj_length: 20
 min_lr: 1.0e-05
 min_traj_length: 10
@@ -223,7 +223,7 @@ prioritized: boltzmann
 rank_weight: 1.0
 repeats: 20
 repulsion_annealing_max_steps: 5000
-run_name: 4_gently_greedy
+run_name: 6_greedy_RF
 s_emb_dim: 512
 sampling: buffer
 scheduler: true

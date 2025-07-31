@@ -221,7 +221,7 @@ pb_drift_range: 0.2
 pb_var_range: 2
 prioritized: boltzmann
 rank_weight: 1.0
-repeats: 5
+repeats: 20
 repulsion_annealing_max_steps: 5000
 run_name: 5_gently_greedy2
 s_emb_dim: 512
