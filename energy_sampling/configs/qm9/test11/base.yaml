@@ -1,9 +1,9 @@
-run_name: 'qm9_test10'
-tag: 'qm9_test10'
+run_name: 'qm9_test11'
+tag: 'qm9_test11'
 seed: 12345
 device: 'cuda'
 lr_policy: 0.0001              # learning rate of the policy network
-min_lr: 1.0e-5                # ihn
+min_lr: 1.0e-6                # ihn
 lr_flow: 0.1                  # learning rate of the flow network
 lr_back: 0.0001                # learning rate of the backward pass
 lr_warmup_ratio: 100           # how much smaller the initial (warmup) LR should be than the max policy value
@@ -12,7 +12,7 @@ lr_warmup_time: 1000
 lr_anneal_time: 40000
 weight_decay: 1e-7
 use_weight_decay: false
-gradient_norm_clip: 1.0        # gradient norm clip for updating gfn model weights
+gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weights
 
 # model parameters
 zero_init: False
@@ -28,11 +28,11 @@ norm: layer                   # null, "layer", "batch"
 batch_size: 5               # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
 max_batch_size: 50           # maximum batch size to allow
-repeats: 20                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
-eval_batch_size: 1000        # batch size for evaluation
-epochs: 10000000             # number of training epochs: relatively large
+repeats: 5                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
+eval_batch_size: 2000        # batch size for evaluation
+epochs: 100000000             # number of training epochs: relatively large
 eval_period: 1000              # how often to do evaluation & reporting
-figs_period: 1000             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
+figs_period: 2000             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # GFlowNet settings
 T: 10                        # static training diffusion length
@@ -41,43 +41,42 @@ min_traj_length: 10
 max_traj_length: 20
 traj_length_strategy: sampled # 'static'  or 'sampled'  will do random between min and max traj lengths
 discretizer_max_ratio: 10    # maximum ratio between randomly sampled step sizes
-discretizer: 'random'        # 'random' 'low_discrepancy' 'equidistantf' 'uniform'
+discretizer: 'random'        # 'random' 'low_discrepancy' 'equidistant' 'uniform'
 t_scale: 0.1                 # scales fixed forward policy variance
 log_var_range: 2           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
 pb_drift_range: 0.2          # range of learned backward drift corrections, only for 'brownian_bridge'
-pb_var_range: 2             # range of learned backward policy variance
+pb_var_range: 1             # range of learned backward policy variance
 energy: "molecular_crystal"  # "molecular_crystal"
-# ramp: 'linear': tringular profile from init-> max -> min
+# set a a constant or
+# as a set of line segments [[step, value], [step, value], ...]
 fwd_loss_coeffs:
-  tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-  vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-  vg_lme:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # exclusive with vg_lb
-  emp_z:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
-  greedy:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-  reinforce:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-  mle:              { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
-  var:              { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-  overlap:          { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-  buffer:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-  smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+  tb:               0
+  vg_lb:            0
+  vg_lme:           0  # exclusive with vg_lb
+  emp_z:            0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
+  greedy:           0
+  reinforce:        0
+  mle:              0
+  var:              0
+  overlap:          0
+  buffer:           0
+  smoothed:         0
 
-  detach_after:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # NON FUNCTIONAL
-  var_cutoff:       { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
-  var_gamma:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
-  buffer_gamma:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
-  loss_clip:        { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9 }
-
+  detach_after:     0  # NON FUNCTIONAL
+  var_cutoff:       0
+  var_gamma:        0
+  buffer_gamma:     0
+  loss_clip:        1.0E+9
 bwd_loss_coeffs:
-  tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-  vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-  vg_lme:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # exclusive with vg_lb
-  emp_z:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
-  mle:              { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
-  smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
-  mle_prior_fraction: { init: 1.0,max: 1.0,min: 1.0, 'on': 0,    'off': 1 }
-  pmle_std:         { init: 1.0, max: 4.0, min: 4.0, 'on': 2000,    'off': 1.0E+9 }  # std deviation of the prior mle distribution. Best to start small (1) and smoothly grow
-  loss_clip:        { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9 }
-
+  tb:               0
+  vg_lb:            0
+  vg_lme:           0  # exclusive with vg_lb
+  emp_z:            0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
+  mle:              0
+  smoothed:         0
+  mle_prior_fraction: 0
+  pmle_std:         1 # std deviation of the prior mle distribution. Best to start small (1) and smoothly grow
+  loss_clip:        1.0E+9
 
 both_ways: True             # forward and backward training
 bwd_batch_multiplier: 1      # ratio of backward to foward batch size (much cheaper to evaluate)
@@ -90,7 +89,7 @@ gfn_clip: 20.0  # clip the maximum step size induced by the policy model
 
 # dataset settings
 ################################################################
-#buffer_path: null #'D:/crystal_datasets/test_qm9_sg2_dataset.pt'
+#buffer_path: 'D:/crystal_datasets/test_qm9_sg2_dataset.pt'
 #molecules_path: 'D:/crystal_datasets/test_csd_free_qm9_dataset.pt'
 #autoencoder_path: 'C:/Users/mikem/crystals/CSP_runs/models/cluster/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
 
@@ -102,26 +101,26 @@ autoencoder_path: '/scratch/mk8347/csd_runs/models/best_autoencoder_experiments_
 ################################################################
 beta: 10.0             # reward prioritized replay sampling: high beta = steep prioritization
 rank_weight: 1.0     # rank-based replay sampling: low rank_weight = steep prioritization
-buffer_diversity_coeff: 0.1  # how highly to weight sample diversity when sampling from the buffer
+buffer_diversity_coeff: 1.0  # how highly to weight sample diversity when sampling from the buffer
 prioritized: "boltzmann"   # three kinds of replay training: random, reward prioritized (Boltzmann), rank-based
 sampling: "buffer"
 add_to_buffer_each: 10  # how often to add samples to the buffer during fwd passes in both_ways training
-buffer_size: 200000          # size of replay buffer: relatively large
+buffer_size: 100000          # size of replay buffer: relatively large
 
 # exploration controls
 ################################################################
 exploratory: True       # adds variance to optionally learned logvars
-exploration_factor: 0.05  # initial exploration std value
+exploration_factor: 0.25  # initial exploration std value
 exploration_wd: True  # decay exploration over time
-wd_max_steps: 5000  # number of steps to terminate the added variance
+wd_max_steps: 1000  # number of steps to terminate the added variance
 
 # molecular crystal settings
 ################################################################
 molecule: 'qm9'  # 'nicotinamide' or 'urea' or 'qm9' for molecule-conditional training
 temperature_conditioning: False  # if false, temperatures are set to energy_static_temperature, and there is no annealing
 molecule_conditioning: True  # MUST be true for molecule='qm9' and false else - conditions the generative prediction on the molecule
-sg_conditioning: False  # whether to conditionally sample across space groups
-space_groups: [2]  # which space groups to sample over
+sg_conditioning: True  # whether to conditionally sample across space groups
+space_groups: [1, 2]  # which space groups to sample over
 energy_function: combo
   # 'latent_harmonic' : unimadal harmonic potential in the latent space
   # 'crystal_harmonic': unimodal harmonic potential in the crystal space
@@ -136,7 +135,7 @@ anneal_repulsion: False
 repulsion_annealing_max_steps: 5000
 energy_density_coeff: 2.0  # how much to weight the density penalty term in the energy function
 energy_core_coeff: 10.0  # loss coefficient
-bounding_coeff: 10.0
+bounding_coeff: 1.0
 niggli_coeff: 10.0
 core_start_time: 100  # after how many steps to turn on the core repulsion energy
 energy_lj_coeff: 1.0  # loss coefficient

@@ -16,6 +16,7 @@ from tqdm import trange
 
 from energies.molecular_crystal import MolecularCrystal
 from buffer import CrystalReplayBuffer
+from mxtaltools.crystal_building.crystal_latent_transforms import enforce_niggli_plane
 from utils import featurize_dataset, embed_dataset
 from eval.evaluations import eval_step
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
@@ -234,7 +235,20 @@ def substitute_prior(condition, crystal_batch, energy_function, rewards, samples
     loss_coeffs = args.bwd_loss_coeffs
     if loss_coeffs.mle_prior_fraction > 0:
         # replace buffer samples with a random prior
-        prior_samples = (torch.randn_like(samples) * loss_coeffs.pmle_std).clip(min=-6, max=6)
+        rands = torch.randn((crystal_batch.num_graphs, 12), device=crystal_batch.device)
+
+        # enforce the random prior is in the positive niggli plane
+        temp_params = crystal_batch.latent_transform.inverse(rands,
+                                                             crystal_batch.sg_ind,
+                                                             crystal_batch.radius)
+        cell_lengths = temp_params[:, :3]
+        cell_angles = temp_params[:, 3:6]
+        cell_angles = enforce_niggli_plane(cell_lengths, cell_angles, mode='mirror')
+        temp_params[:, 3:6] = cell_angles
+
+        prior_samples = crystal_batch.latent_transform.forward(temp_params, crystal_batch.sg_ind, crystal_batch.radius).clip(
+            min=-6, max=6)
+
         if loss_coeffs.mle_prior_fraction < 1:
             num_to_replace = max(1, int(len(samples) * loss_coeffs.mle_prior_fraction))
             inds_to_replace = np.random.choice(len(samples), num_to_replace, replace=False)
@@ -394,13 +408,13 @@ def train():
             torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model.pt')
             metrics = do_evaluation(energy_function, buffer, gfn_model,
                                     step_ind, metrics, test_mol_loader)
-            if args.molecule_conditioning:
-                train_metrics = do_evaluation(energy_function, buffer, gfn_model,
-                                              step_ind, metrics, train_mol_loader,
-                                              override_do_figures=False)
-                kk = list(train_metrics.keys())
-                for key in kk:
-                    metrics['train_eval/' + key] = train_metrics[key]
+            # if args.molecule_conditioning:
+            #     train_metrics = do_evaluation(energy_function, buffer, gfn_model,
+            #                                   step_ind, metrics, train_mol_loader,
+            #                                   override_do_figures=False)
+            #     kk = list(train_metrics.keys())
+            #     for key in kk:
+            #         metrics['train_eval/' + key] = train_metrics[key]
 
             wandb.log(metrics, step=step_ind)
 
@@ -468,14 +482,97 @@ def anneal_reward(it, temp_annealing_lambda, repulsion_annealing_lambda, energy_
 def set_loss_coeffs(it, args):
     """anneal reward function"""
     if it == 0:
-        args.fwd_loss_schedule = deepcopy(args.fwd_loss_coeffs)
-        args.bwd_loss_schedule = deepcopy(args.bwd_loss_coeffs)
-        args.fwd_loss_coeffs = dict2namespace({k: 0.0 for k in args.fwd_loss_schedule.__dict__})
-        args.bwd_loss_coeffs = dict2namespace({k: 0.0 for k in args.bwd_loss_schedule.__dict__})
+        args.fwd_loss_schedule = parse_loss_schedules(args.fwd_loss_coeffs)
+        args.bwd_loss_schedule = parse_loss_schedules(args.bwd_loss_coeffs)
 
-    update_loss_schedule(it, args.fwd_loss_schedule.__dict__, args.fwd_loss_coeffs.__dict__)
-    update_loss_schedule(it, args.bwd_loss_schedule.__dict__, args.bwd_loss_coeffs.__dict__)
+        args.fwd_loss_coeffs = dict2namespace({k: 0.0 for k in args.fwd_loss_schedule})
+        args.bwd_loss_coeffs = dict2namespace({k: 0.0 for k in args.bwd_loss_schedule})
 
+    update_loss_schedule(it, args.fwd_loss_schedule, args.fwd_loss_coeffs.__dict__)
+    update_loss_schedule(it, args.bwd_loss_schedule, args.bwd_loss_coeffs.__dict__)
+
+
+def parse_loss_schedules(loss_coeffs_config):
+    """
+    Parse loss coefficient configuration into standardized format.
+
+    Input formats:
+    - Single value: coeff_name: 1.5 -> constant schedule
+    - List of [step, value] pairs: coeff_name: [[0, 0.0], [1000, 2.0]]
+
+    Returns dict of {coeff_name: [(step, value), ...]}
+    """
+    schedules = {}
+
+    # Handle both dict and namespace objects
+    if hasattr(loss_coeffs_config, '__dict__'):
+        config_dict = loss_coeffs_config.__dict__
+    else:
+        config_dict = loss_coeffs_config
+
+    for key, value in config_dict.items():
+        if isinstance(value, (int, float)):
+            # Single constant value
+            schedules[key] = [(0, float(value))]
+        elif isinstance(value, list) and len(value) > 0:
+            # List of [step, value] pairs
+            if all(isinstance(item, (list, tuple)) and len(item) == 2 for item in value):
+                # Validate and sort by step
+                schedule = [(int(step), float(val)) for step, val in value]
+                schedule.sort(key=lambda x: x[0])  # Sort by step
+
+                # Validate steps are non-negative and ascending
+                for i, (step, val) in enumerate(schedule):
+                    if step < 0:
+                        raise ValueError(f"Step {step} for {key} must be non-negative")
+                    if i > 0 and step < schedule[i - 1][0]:
+                        raise ValueError(f"Steps for {key} must be in ascending order")
+
+                schedules[key] = schedule
+            else:
+                raise ValueError(f"Invalid schedule format for {key}: {value}")
+        else:
+            raise ValueError(f"Invalid schedule format for {key}: {value}")
+
+    return schedules
+
+def evaluate_schedule(step, schedule):
+    """
+    Evaluate a piecewise linear schedule at given step.
+
+    Args:
+        step: Current training step
+        schedule: List of (step, value) tuples, sorted by step
+
+    Returns:
+        Interpolated value at the given step
+    """
+    if len(schedule) == 1:
+        # Constant schedule
+        return schedule[0][1]
+
+    # Find the appropriate segment
+    for i in range(len(schedule) - 1):
+        step1, val1 = schedule[i]
+        step2, val2 = schedule[i + 1]
+
+        if step <= step1:
+            return val1
+        elif step1 < step <= step2:
+            # Linear interpolation between points
+            if step1 == step2:  # Avoid division by zero
+                return val2
+
+            alpha = (step - step1) / (step2 - step1)
+            return val1 + alpha * (val2 - val1)
+
+    # Past the last point, return final value
+    return schedule[-1][1]
+
+def update_loss_schedule(it, loss_schedules, active_coeffs):
+    """Update active coefficients based on current iteration and schedules"""
+    for key, schedule in loss_schedules.items():
+        active_coeffs[key] = evaluate_schedule(it, schedule)
 
 def step_lr_schedule(schedulers, optimizers,
                      lr_warmup_finished):

@@ -25,7 +25,7 @@ harmonics_dim: 64            # dimensionality of harmonic embedding
 dropout: 0                   # dropout probability
 norm: null                   # null, "layer", "batch"
 
-batch_size: 5               # number of samples per training batch
+batch_size: 50               # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
 max_batch_size: 50           # maximum batch size to allow
 repeats: 5                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
@@ -47,35 +47,36 @@ log_var_range: 2           # controls dynamic range of learned policy variance, 
 pb_drift_range: 0.2          # range of learned backward drift corrections, only for 'brownian_bridge'
 pb_var_range: 2             # range of learned backward policy variance
 energy: "molecular_crystal"  # "molecular_crystal"
-# ramp: 'linear': tringular profile from init-> max -> min
+# set a a constant or
+# as a set of line segments [[step, value], [step, value], ...]
 fwd_loss_coeffs:
-  tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': .inf    }
-  vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-  vg_lme:           { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1  }  # exclusive with vg_lb
-  emp_z:            { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1  }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
-  greedy:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-  reinforce:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-  mle:              { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
-  var:              { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-  overlap:          { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-  buffer:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-  smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
+  tb:               0
+  vg_lb:            0
+  vg_lme:           1  # exclusive with vg_lb
+  emp_z:            1  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
+  greedy:           0
+  reinforce:        0
+  mle:              0
+  var:              0
+  overlap:          0
+  buffer:           0
+  smoothed:         0
 
-  detach_after:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }  # NON FUNCTIONAL
-  var_cutoff:       { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
-  var_gamma:        { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
-  buffer_gamma:     { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
-  loss_clip:        { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9  }
+  detach_after:     0  # NON FUNCTIONAL
+  var_cutoff:       0
+  var_gamma:        0
+  buffer_gamma:     0
+  loss_clip:        1.0E+9
 bwd_loss_coeffs:
-  tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 1000,    'off': 1000    }
-  vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-  vg_lme:           { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1  }  # exclusive with vg_lb
-  emp_z:            { init: 1.0, max: 1.0, min: 1.0, 'on': 0,    'off': 1    }  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
-  mle:              { init: 0.0, max: 0.0, min: 0.0, 'on': 1000,    'off': 2000  }
-  smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1  }
-  mle_prior_fraction: { init: 1.0,max: 1.0,min: 0.0, 'on': 1000,    'off': 2000 }
-  pmle_std:         { init: 1.0, max: 4.0, min: 4.0, 'on': 1000,    'off': 1.0E+9 }  # std deviation of the prior mle distribution. Best to start small (1) and smoothly grow
-  loss_clip:        { init: 100.0, max: 10000.0, min: 10000.0, 'on': 5000,    'off': 1.0E+9  }
+  tb:               0
+  vg_lb:            0
+  vg_lme:           0  # exclusive with vg_lb
+  emp_z:            0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
+  mle:              [[0, 0.01], [100, 1], [1000, 0]]
+  smoothed:         0
+  mle_prior_fraction: [[0, 1], [1000, 0]]
+  pmle_std:         1 # std deviation of the prior mle distribution. Best to start small (1) and smoothly grow
+  loss_clip:        1.0E+9
 
 both_ways: True             # forward and backward training
 bwd_batch_multiplier: 1      # ratio of backward to foward batch size (much cheaper to evaluate)
@@ -115,9 +116,9 @@ wd_max_steps: 1000  # number of steps to terminate the added variance
 
 # molecular crystal settings
 ################################################################
-molecule: 'qm9'  # 'nicotinamide' or 'urea' or 'qm9' for molecule-conditional training
+molecule: 'urea'  # 'nicotinamide' or 'urea' or 'qm9' for molecule-conditional training
 temperature_conditioning: False  # if false, temperatures are set to energy_static_temperature, and there is no annealing
-molecule_conditioning: True  # MUST be true for molecule='qm9' and false else - conditions the generative prediction on the molecule
+molecule_conditioning: False  # MUST be true for molecule='qm9' and false else - conditions the generative prediction on the molecule
 sg_conditioning: False  # whether to conditionally sample across space groups
 space_groups: [2]  # which space groups to sample over
 energy_function: combo

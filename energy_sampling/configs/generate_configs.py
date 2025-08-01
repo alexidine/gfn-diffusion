@@ -97,7 +97,7 @@ def generate_grid(spec_path='experiments.yaml', output_dir='configs'):
             "tag": tag,
             "combo": dict(zip(keys, combo)),
             "notes": ""
-        })
+        })  
 
     log_path = outdir / 'experiment_log.yaml'
     with open(log_path, 'w') as f:
@@ -108,7 +108,7 @@ def generate_grid(spec_path='experiments.yaml', output_dir='configs'):
 
 if __name__ == "__main__":
     # for if the experiments are a list of single runs
-    generate_oneoffs(spec_path='qm9/test10/experiments1.yaml', output_dir='qm9/test10/')
+    generate_oneoffs(spec_path='qm9/test11/experiments1.yaml', output_dir='qm9/test11/')
 
     # for if the experiments are run on a parameter grid
     #generate_grid(spec_path='nicotinamide/experiments2.yaml', output_dir='nicotinamide/')

@@ -114,13 +114,16 @@ def get_gfn_forward_loss(loss_coeffs,
     losses = []
     """greedy loss"""
     if loss_coeffs.greedy > 0:
-        greedy_loss = -log_r
+        greedy_loss = -power_saturate(log_r, 0.7)
         losses.append(greedy_loss * loss_coeffs.greedy)
 
-    if loss_coeffs.reinforce > 0:
+    if loss_coeffs.reinforce > 0:  # todo maybe do repeats over conditioning here for the weight
         log_r_det = log_r.detach()
         centered_log_r = log_r_det - log_r_det.mean()
-        reinforce_loss = -centered_log_r * log_pf
+        weight = F.softmax(centered_log_r/10, dim=0) + 1e-2 / len(log_r)
+        weight /= weight.sum()
+        weight *= len(weight)
+        reinforce_loss = -power_saturate(weight * log_pf, 0.7)
         losses.append(reinforce_loss * loss_coeffs.reinforce)
 
     """trajectory smoothing loss"""

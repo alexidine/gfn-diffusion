@@ -554,8 +554,8 @@ experiments:
 - tag: 13_greedy_test
   update:
     max_batch_size: 100
-    repeats: 10
     joint_layers: 8
+    repeats: 10
     hidden_dim: 512
     dropout: 0
     norm: layer
@@ -584,9 +584,9 @@ experiments:
 
     bwd_loss_coeffs:
       tb:               { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-      vg_lb:            { init: 0.0, max: 1.0, min: 1.0, 'on': 10000,    'off': 1.0E+9    }
+      vg_lb:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
       vg_lme:           { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
-      emp_z:            { init: 0.0, max: 1.0, min: 1.0, 'on': 10000,    'off': 1.0E+9    }
+      emp_z:            { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
       mle:              { init: 1.0, max: 1.0, min: 0.0, 'on': 20000,    'off': 30000    }
       smoothed:         { init: 0.0, max: 0.0, min: 0.0, 'on': 0,    'off': 1    }
       mle_prior_fraction: { init: 1.0,max: 1.0,min: 0.0, 'on': 20000,    'off': 25000    }
