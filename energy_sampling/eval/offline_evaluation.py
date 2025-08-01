@@ -153,9 +153,9 @@ if args.show_figs:
     fig3 = create_cell_params_variance_plot(sg_sampling_dict)
 
     # Display the figures
-    fig1.show()
-    fig2.show()
-    fig3.show()
+    fig1.show(renderer='browser')
+    fig2.show(renderer='browser')
+    fig3.show(renderer='browser')
 
 """Hit rate vs synthetic"""
 

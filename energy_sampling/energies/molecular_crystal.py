@@ -17,7 +17,6 @@ class MolecularCrystal(BaseSet):
     def __init__(self, device,
                  energy_function: str,
                  dim: int = 12,
-                 space_group: int = 2,
                  max_temperature: float = 10,
                  min_temperature: float = 0.01,
                  lj_turnover_pot: float = 10.0,
@@ -77,8 +76,9 @@ class MolecularCrystal(BaseSet):
             lj_energy = torch.zeros(crystal_batch.num_graphs, device=self.device)
             silu_energy = torch.zeros_like(lj_energy)
         else:
+            # for crystals at realistic densities, supercell_size=2 is sufficient. Very dense crystals will not be accurate, but they get punished later by the density energy term
             cluster_batch = crystal_batch.mol2cluster(cutoff=6,
-                                                      supercell_size=8,
+                                                      supercell_size=2,
                                                       align_to_standardized_orientation=True)
 
             cluster_batch.construct_radial_graph(cutoff=6,
