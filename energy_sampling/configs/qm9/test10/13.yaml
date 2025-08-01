@@ -15,10 +15,10 @@ bwd_batch_multiplier: 1
 bwd_loss_coeffs:
   emp_z:
     init: 0.0
-    max: 1.0
-    min: 1.0
-    'off': 1000000000.0
-    'on': 10000
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
   loss_clip:
     init: -1.0
     max: -1.0
@@ -57,10 +57,10 @@ bwd_loss_coeffs:
     'on': 0
   vg_lb:
     init: 0.0
-    max: 1.0
-    min: 1.0
-    'off': 1000000000.0
-    'on': 10000
+    max: 0.0
+    min: 0.0
+    'off': 1
+    'on': 0
   vg_lme:
     init: 0.0
     max: 0.0
