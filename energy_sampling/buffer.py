@@ -132,11 +132,11 @@ class CrystalReplayBuffer:
             x_tensor = torch.stack(self.x_list).to('cuda' if self.gpu_available else 'cpu')
             if len(x_tensor) > 5000:
                 subsample_inds = np.random.choice(len(self), 5000, replace=False)
-                scores -= diversity_coeff * ((compute_sample_overlap(x_tensor[subsample_inds].half(),
-                                                                     x_tensor.half(),
+                scores -= diversity_coeff * ((compute_sample_overlap(x_tensor[subsample_inds].float(),
+                                                                     x_tensor.float(),
                                                                      agg='sum')).cpu().detach().numpy() - 1)  # subtract self contribution
             else:
-                scores -= diversity_coeff * ((compute_sample_overlap(x_tensor.half(),
+                scores -= diversity_coeff * ((compute_sample_overlap(x_tensor.float(),
                                                                      agg='sum')).cpu().detach().numpy() - 1)  # subtract self contribution
 
         if self.prioritized == 'rank':
