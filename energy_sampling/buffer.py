@@ -121,7 +121,7 @@ class CrystalReplayBuffer:
                                 size=batch_size,
                                 replace=replace,
                                 p=self.get_sampler_weights(diversity_coeff=diversity_coeff,
-        ))
+                                                           ))
         return inds
 
     def get_sampler_weights(self,
@@ -130,11 +130,14 @@ class CrystalReplayBuffer:
         scores = np.array(self.rewards_list)
         if diversity_coeff > 0:
             x_tensor = torch.stack(self.x_list).to('cuda' if self.gpu_available else 'cpu')
-            if len(x_tensor) > 10000:
-                subsample_inds = np.random.choice(len(self), 10000, replace=False)
-                scores -= diversity_coeff * (compute_sample_overlap(x_tensor[subsample_inds], x_tensor, agg='sum') - 1).cpu().detach().numpy()  # subtract self contribution
+            if len(x_tensor) > 5000:
+                subsample_inds = np.random.choice(len(self), 5000, replace=False)
+                scores -= diversity_coeff * ((compute_sample_overlap(x_tensor[subsample_inds].half(),
+                                                                     x_tensor.half(),
+                                                                     agg='sum')).cpu().detach().numpy() - 1)  # subtract self contribution
             else:
-                scores -= diversity_coeff * (compute_sample_overlap(x_tensor, agg='sum') - 1).cpu().detach().numpy()  # subtract self contribution
+                scores -= diversity_coeff * ((compute_sample_overlap(x_tensor.half(),
+                                                                     agg='sum')).cpu().detach().numpy() - 1)  # subtract self contribution
 
         if self.prioritized == 'rank':
             ranks = np.argsort(np.argsort(-1 * scores))
@@ -148,6 +151,7 @@ class CrystalReplayBuffer:
 
         return weights_i / np.sum(weights_i)  # enforce explicit normalization
 
+    @torch.no_grad()
     def sample(self,
                temperature: Optional[torch.tensor] = None,
                return_conditioning: Optional[bool] = False,
@@ -169,7 +173,8 @@ class CrystalReplayBuffer:
             if batch_size > len(self):
                 rand_inds = np.arange(len(self))
                 missing_len = batch_size - len(self)
-                rand_inds = np.concatenate([rand_inds, self.sample_indices(missing_len, replace=True, diversity_coeff=self.diversity_coeff)])
+                rand_inds = np.concatenate(
+                    [rand_inds, self.sample_indices(missing_len, replace=True, diversity_coeff=self.diversity_coeff)])
             else:
                 rand_inds = self.sample_indices(batch_size, replace=False, diversity_coeff=self.diversity_coeff)
 
@@ -186,5 +191,3 @@ class CrystalReplayBuffer:
             return sample.cell_params_to_gen_basis(), reward, sample, condition
         else:
             return sample.cell_params_to_gen_basis(), reward, sample
-
-
