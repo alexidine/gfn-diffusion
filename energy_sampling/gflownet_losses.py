@@ -120,7 +120,7 @@ def get_gfn_forward_loss(loss_coeffs,
     if loss_coeffs.reinforce > 0:  # todo maybe do repeats over conditioning here for the weight
         log_r_det = log_r.detach()
         centered_log_r = log_r_det - log_r_det.mean()
-        weight = F.softmax(centered_log_r/10, dim=0) + 1e-2 / len(log_r)
+        weight = F.softmax(centered_log_r / 10, dim=0) + 1e-2 / len(log_r)
         weight /= weight.sum()
         weight *= len(weight)
         reinforce_loss = -power_saturate(weight * log_pf, 0.7)
@@ -145,6 +145,8 @@ def get_gfn_forward_loss(loss_coeffs,
     if loss_coeffs.emp_z > 0:  # train the flow model to match the empirical log Z distribution
         emp_z_loss = emp_Z(gfn, log_Z, log_flow, repeats)
         losses.append(emp_z_loss * loss_coeffs.emp_z)
+    else:
+        emp_z_loss = None
 
     """TB loss"""
     if loss_coeffs.tb > 0:
@@ -238,7 +240,7 @@ def vg_lme(gfn, log_pb, log_pf, log_r, repeats):
     if gfn.conditional_flow_model:
         log_Z = torch.logsumexp(log_ratio.view(repeats, -1), dim=0, keepdim=True) - math.log(repeats)
         # vg_loss = (0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2).view(-1)
-        vg_loss = F.smooth_l1_loss(log_Z.repeat(repeats,1), log_ratio.view(repeats, -1), reduction='none').view(-1)
+        vg_loss = F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_ratio.view(repeats, -1), reduction='none').view(-1)
     else:
         log_Z = torch.logsumexp(log_ratio, dim=0, keepdim=True) - math.log(repeats)
         # vg_loss = 0.5 * (log_Z - log_ratio) ** 2
@@ -366,6 +368,8 @@ def get_gfn_backward_loss(loss_coeffs,
     if loss_coeffs.emp_z > 0:  # train the flow model to match the empirical log Z distribution
         emp_z_loss = emp_Z(gfn, log_Z, log_flow, repeats)
         losses.append(emp_z_loss * loss_coeffs.emp_z)
+    else:
+        emp_z_loss = None
 
     """TB loss"""
     if loss_coeffs.tb > 0:
