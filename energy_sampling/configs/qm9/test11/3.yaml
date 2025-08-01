@@ -127,9 +127,8 @@ s_emb_dim: 512
 sampling: buffer
 scheduler: true
 seed: 12345
-sg_conditioning: true
+sg_conditioning: false
 space_groups:
-- 1
 - 2
 t_emb_dim: 32
 t_scale: 0.1
