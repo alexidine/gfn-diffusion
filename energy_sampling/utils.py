@@ -7,15 +7,16 @@ from argparse import Namespace
 from pathlib import Path
 
 import psutil
-from scipy.spatial.distance import jensenshannon
 
 import PIL
 import numpy as np
 import torch
 import yaml
+from torch.nn import functional as F
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
+from mxtaltools.common.config_processing import dict2namespace
 from mxtaltools.models.utils import load_encoder
 
 
@@ -150,109 +151,8 @@ def get_name(args):
 
 def get_train_args():
     parser = argparse.ArgumentParser(description='GFN Linear Regression')
-    # parser.add_argument('--run_name', type=str, default='test')
-    # parser.add_argument('--device', type=str, default='cpu')
-    # parser.add_argument('--lr_policy', type=float, default=1e-3)
-    # parser.add_argument('--lr_flow', type=float, default=1e-2)
-    # parser.add_argument('--lr_back', type=float, default=1e-3)
-    # parser.add_argument('--scheduler', action='store_true', default=False)
-    # parser.add_argument('--lr_shrink_lambda', type=float, default=0.9999)
-    # parser.add_argument('--repeats', type=int, default=10)
-    #
-    # parser.add_argument('--gradient_norm_clip', type=float, default=10)
-    # parser.add_argument('--hidden_dim', type=int, default=64)
-    # parser.add_argument('--s_emb_dim', type=int, default=64)
-    # parser.add_argument('--t_emb_dim', type=int, default=64)
-    # parser.add_argument('--dropout', type=float, default=0)
-    # parser.add_argument('--norm', type=str, default=None)
-    # parser.add_argument('--harmonics_dim', type=int, default=64)
-    # parser.add_argument('--batch_size', type=int, default=300)
-    # parser.add_argument('--max_batch_size', type=int, default=300)
-    # parser.add_argument('--grow_batch_size', type=bool, default=False)
-    # parser.add_argument('--epochs', type=int, default=25000)
-    # parser.add_argument('--eval_period', type=int, default=25000)
-    # parser.add_argument('--figs_period', type=int, default=1000)
-    # parser.add_argument('--buffer_size', type=int, default=300 * 1000 * 2)
-    # parser.add_argument('--T', type=int, default=100)
-    # parser.add_argument('--subtb_lambda', type=int, default=2)
-    # parser.add_argument('--t_scale', type=float, default=5.)
-    # parser.add_argument('--log_var_range', type=float, default=4.)
-    # parser.add_argument('--energy', type=str,
-    #                     default='molecular_crystal')  # this thing is mostly hardcoded for molecular crystals now
-    # parser.add_argument('--mode_fwd', type=str, default="tb", choices=('tb', 'tb-avg', 'db', 'subtb', "pis"))
-    # parser.add_argument('--mode_bwd', type=str, default="tb", choices=('tb', 'tb-avg', 'mle'))
-    # parser.add_argument('--both_ways', action='store_true', default=False)
-    # # For local search
-    # ################################################################
-    # parser.add_argument('--local_search', action='store_true', default=False)
-    # parser.add_argument('--buffer_path', type=str, default=None)
-    # parser.add_argument('--molecules_path', type=str, default=None)
-    # # How many iterations to run local search
-    # parser.add_argument('--max_iter_ls', type=int, default=200)
-    # parser.add_argument('--samples_per_opt', type=int, default=10)
-    # # How many iterations to burn in before making local search
-    # parser.add_argument('--burn_in', type=int, default=100)
-    # # How frequently to make local search
-    # parser.add_argument('--ls_cycle', type=int, default=100)
-    # # langevin step size
-    # parser.add_argument('--ld_step', type=float, default=0.001)
-    # parser.add_argument('--ld_schedule', action='store_true', default=False)
-    # # target acceptance rate
-    # parser.add_argument('--target_acceptance_rate', type=float, default=0.574)
-    # # For replay buffer
-    # ################################################################
-    # # high beta give steep priorization in reward prioritized replay sampling
-    # parser.add_argument('--beta', type=float, default=1.)
-    # # low rank_weighted give steep priorization in rank-based replay sampling
-    # parser.add_argument('--rank_weight', type=float, default=1e-2)
-    # # three kinds of replay training: random, reward prioritized, rank-based
-    # parser.add_argument('--prioritized', type=str, default="rank", choices=('none', 'reward', 'rank'))
-    # ################################################################
-    # parser.add_argument('--bwd', action='store_true', default=False)
-    # parser.add_argument('--exploratory', action='store_true', default=False)
-    # parser.add_argument('--sampling', type=str, default="buffer", choices=('sleep_phase', 'energy', 'buffer'))
-    # parser.add_argument('--langevin', action='store_true', default=False)
-    # parser.add_argument('--langevin_scaling_per_dimension', action='store_true', default=False)
-    # parser.add_argument('--conditional_flow_model', action='store_true', default=False)
-    # parser.add_argument('--learn_pb', action='store_true', default=False)
-    # parser.add_argument('--pb_scale_range', type=float, default=0.1)
-    # parser.add_argument('--learned_variance', action='store_true', default=False)
-    # parser.add_argument('--partial_energy', action='store_true', default=False)
-    # parser.add_argument('--exploration_factor', type=float, default=0.1)
-    # parser.add_argument('--exploration_wd', action='store_true', default=False)
-    # parser.add_argument('--clipping', action='store_true', default=False)
-    # parser.add_argument('--lgv_clip', type=float, default=1e2)
-    # parser.add_argument('--gfn_clip', type=float, default=1e4)
-    # parser.add_argument('--zero_init', action='store_true', default=False)
-    # parser.add_argument('--pis_architectures', action='store_true', default=False)
-    # parser.add_argument('--lgv_layers', type=int, default=3)
-    # parser.add_argument('--joint_layers', type=int, default=2)
-    # parser.add_argument('--seed', type=int, default=12345)
-    # parser.add_argument('--weight_decay', type=float, default=1e-7)
-    # parser.add_argument('--use_weight_decay', action='store_true', default=False)
-    # parser.add_argument('--eval', action='store_true', default=False)
-    # # args for molecular crystal energy
-    # parser.add_argument('--energy_min_temperature', type=float, default=1)
-    # parser.add_argument('--energy_max_temperature', type=float, default=1)
-    # parser.add_argument('--energy_static_temperature', type=float, default=1)
-    # parser.add_argument('--anneal_energy', action='store_true', default=False)
-    # parser.add_argument('--energy_annealing_threshold', type=float, default=1e-3)
-    # parser.add_argument('--convergence_history', type=int, default=1000)
-    # parser.add_argument('--energy_density_coeff', type=float, default=1e-3)
-    # parser.add_argument('--temperature_conditioning', action='store_true', default=False)
-    # parser.add_argument('--temperature_scaling_factor', type=float, default=1)
-    #
     args, remaining = parser.parse_known_args()
-    #
-    # if 'config' in remaining[0]:  # load external yaml config file
-    #     with open(remaining[1], 'r') as f:
-    #         config_args = yaml.safe_load(f)
-    #     for key, value in config_args.items():
-    #         if hasattr(args, key):
-    #             setattr(args, key, value)
-    #         else:
-    #             parser.error(f"Unknown config key: {key}")
-    #
+
     return dict2namespace(load_yaml(remaining[1]))
 
 
@@ -395,17 +295,6 @@ def triangle_schedule(it, init, maxval, minval, on, off):
         return minval
 
 
-def update_loss_schedule(it, loss_schedule, active_coeffs):
-    for key, spec in loss_schedule.items():
-        init = spec.init
-        maxval = spec.max
-        minval = spec.min
-        on = spec.on
-        off = spec.off
-
-        active_coeffs[key] = triangle_schedule(it, init, maxval, minval, on, off)
-
-
 def featurize_dataset(dataset, device, ellipsoid_scale):
     batch_size = 500
     loader = DataLoader(
@@ -488,3 +377,134 @@ def embed_dataset(dataset, autoencoder_path=None, device=None, encoder=None):
             elem.embedding = embeddings[None, ind]
 
     return dataset
+
+
+def get_conditioning_dim(args):
+    conditioning_dim = 0
+    if args.temperature_conditioning:
+        conditioning_dim += 1
+    if args.molecule_conditioning:
+        conditioning_dim += 64 * 3
+    if args.sg_conditioning:
+        conditioning_dim += 237
+    return conditioning_dim
+
+
+def anneal_reward(it, temp_annealing_lambda, repulsion_annealing_lambda, energy_function, args):
+    """anneal reward function"""
+    if args.anneal_temperature:
+        if args.temperature_conditioning:
+            if energy_function.temperature_scaling_factor < 1:
+                energy_function.temperature_scaling_factor *= temp_annealing_lambda
+        else:
+            if energy_function.temperature > args.energy_min_temperature:
+                energy_function.temperature *= temp_annealing_lambda
+
+    if args.anneal_repulsion:
+        if energy_function.lj_repulsion < 1:
+            energy_function.lj_repulsion *= repulsion_annealing_lambda
+
+    if args.core_start_time > 0:
+        energy_function.core_coeff = round(
+            args.energy_core_coeff * F.sigmoid(torch.tensor((it - args.core_start_time) / 50)).item(), 2)
+    if args.lj_start_time > 0:
+        energy_function.lj_coeff = round(
+            args.energy_lj_coeff * F.sigmoid(torch.tensor((it - args.lj_start_time) / 50)).item(), 2)
+
+
+def set_loss_coeffs(it, args):
+    """anneal reward function"""
+    if it == 0:
+        args.fwd_loss_schedule = parse_loss_schedules(args.fwd_loss_coeffs)
+        args.bwd_loss_schedule = parse_loss_schedules(args.bwd_loss_coeffs)
+
+        args.fwd_loss_coeffs = dict2namespace({k: 0.0 for k in args.fwd_loss_schedule})
+        args.bwd_loss_coeffs = dict2namespace({k: 0.0 for k in args.bwd_loss_schedule})
+
+    update_loss_schedule(it, args.fwd_loss_schedule, args.fwd_loss_coeffs.__dict__)
+    update_loss_schedule(it, args.bwd_loss_schedule, args.bwd_loss_coeffs.__dict__)
+
+
+def parse_loss_schedules(loss_coeffs_config):
+    """
+    Parse loss coefficient configuration into standardized format.
+
+    Input formats:
+    - Single value: coeff_name: 1.5 -> constant schedule
+    - List of [step, value] pairs: coeff_name: [[0, 0.0], [1000, 2.0]]
+
+    Returns dict of {coeff_name: [(step, value), ...]}
+    """
+    schedules = {}
+
+    # Handle both dict and namespace objects
+    if hasattr(loss_coeffs_config, '__dict__'):
+        config_dict = loss_coeffs_config.__dict__
+    else:
+        config_dict = loss_coeffs_config
+
+    for key, value in config_dict.items():
+        if isinstance(value, (int, float)):
+            # Single constant value
+            schedules[key] = [(0, float(value))]
+        elif isinstance(value, list) and len(value) > 0:
+            # List of [step, value] pairs
+            if all(isinstance(item, (list, tuple)) and len(item) == 2 for item in value):
+                # Validate and sort by step
+                schedule = [(int(step), float(val)) for step, val in value]
+                schedule.sort(key=lambda x: x[0])  # Sort by step
+
+                # Validate steps are non-negative and ascending
+                for i, (step, val) in enumerate(schedule):
+                    if step < 0:
+                        raise ValueError(f"Step {step} for {key} must be non-negative")
+                    if i > 0 and step < schedule[i - 1][0]:
+                        raise ValueError(f"Steps for {key} must be in ascending order")
+
+                schedules[key] = schedule
+            else:
+                raise ValueError(f"Invalid schedule format for {key}: {value}")
+        else:
+            raise ValueError(f"Invalid schedule format for {key}: {value}")
+
+    return schedules
+
+
+def evaluate_schedule(step, schedule):
+    """
+    Evaluate a piecewise linear schedule at given step.
+
+    Args:
+        step: Current training step
+        schedule: List of (step, value) tuples, sorted by step
+
+    Returns:
+        Interpolated value at the given step
+    """
+    if len(schedule) == 1:
+        # Constant schedule
+        return schedule[0][1]
+
+    # Find the appropriate segment
+    for i in range(len(schedule) - 1):
+        step1, val1 = schedule[i]
+        step2, val2 = schedule[i + 1]
+
+        if step <= step1:
+            return val1
+        elif step1 < step <= step2:
+            # Linear interpolation between points
+            if step1 == step2:  # Avoid division by zero
+                return val2
+
+            alpha = (step - step1) / (step2 - step1)
+            return val1 + alpha * (val2 - val1)
+
+    # Past the last point, return final value
+    return schedule[-1][1]
+
+
+def update_loss_schedule(it, loss_schedules, active_coeffs):
+    """Update active coefficients based on current iteration and schedules"""
+    for key, schedule in loss_schedules.items():
+        active_coeffs[key] = evaluate_schedule(it, schedule)

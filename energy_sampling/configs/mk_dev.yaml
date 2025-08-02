@@ -9,7 +9,7 @@ lr_back: 0.0001                # learning rate of the backward pass
 lr_warmup_ratio: 100           # how much smaller the initial (warmup) LR should be than the max policy value
 scheduler: True               # does LR warmup from lr/lr_warup_ratio -> lr -> min_lr over the warmup and annealing period
 lr_warmup_time: 1000
-lr_anneal_time: 40000
+lr_anneal_time: 10000
 weight_decay: 1e-7
 use_weight_decay: false
 gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weights
@@ -50,14 +50,14 @@ energy: "molecular_crystal"  # "molecular_crystal"
 # set a a constant or
 # as a set of line segments [[step, value], [step, value], ...]
 fwd_loss_coeffs:
-  tb:               0
+  tb:               1
   vg_lb:            0
   vg_lme:           1  # exclusive with vg_lb
   emp_z:            1  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
-  greedy:           0
-  reinforce:        0
+  greedy:           1
+  reinforce:        1
   mle:              0
-  var:              0
+  var:              1
   overlap:          0
   buffer:           0
   smoothed:         0
@@ -68,13 +68,13 @@ fwd_loss_coeffs:
   buffer_gamma:     0
   loss_clip:        1.0E+9
 bwd_loss_coeffs:
-  tb:               0
+  tb:               1
   vg_lb:            0
-  vg_lme:           0  # exclusive with vg_lb
-  emp_z:            0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
-  mle:              [[0, 0.01], [100, 1], [1000, 0]]
+  vg_lme:           1  # exclusive with vg_lb
+  emp_z:            1  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
+  mle:              1
   smoothed:         0
-  mle_prior_fraction: [[0, 1], [1000, 0]]
+  mle_prior_fraction: 1
   pmle_std:         1 # std deviation of the prior mle distribution. Best to start small (1) and smoothly grow
   loss_clip:        1.0E+9
 
@@ -105,7 +105,7 @@ buffer_diversity_coeff: 1.0  # how highly to weight sample diversity when sampli
 prioritized: "boltzmann"   # three kinds of replay training: random, reward prioritized (Boltzmann), rank-based
 sampling: "buffer"
 add_to_buffer_each: 10  # how often to add samples to the buffer during fwd passes in both_ways training
-buffer_size: 50000          # size of replay buffer: relatively large
+buffer_size: 100000          # size of replay buffer: relatively large
 
 # exploration controls
 ################################################################
@@ -116,9 +116,9 @@ wd_max_steps: 1000  # number of steps to terminate the added variance
 
 # molecular crystal settings
 ################################################################
-molecule: 'urea'  # 'nicotinamide' or 'urea' or 'qm9' for molecule-conditional training
+molecule: 'qm9'  # 'nicotinamide' or 'urea' or 'qm9' for molecule-conditional training
 temperature_conditioning: False  # if false, temperatures are set to energy_static_temperature, and there is no annealing
-molecule_conditioning: False  # MUST be true for molecule='qm9' and false else - conditions the generative prediction on the molecule
+molecule_conditioning: True  # MUST be true for molecule='qm9' and false else - conditions the generative prediction on the molecule
 sg_conditioning: False  # whether to conditionally sample across space groups
 space_groups: [2]  # which space groups to sample over
 energy_function: combo

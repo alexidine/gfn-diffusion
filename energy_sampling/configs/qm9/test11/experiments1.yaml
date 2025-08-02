@@ -618,3 +618,233 @@ experiments:
     exploration_factor: 0.25
     exploration_wd: True
     wd_max_steps: 10000
+
+- tag: 18_greedy_1k
+  update:
+    lr_warmup_time: 1000
+    lr_anneal_time: 40000
+    max_batch_size: 200
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 1
+    fwd_loss_coeffs:
+      tb: 0
+      vg_lb: 0
+      vg_lme: 0
+      emp_z: 0
+      greedy: 1
+      reinforce: 0
+      mle: 0
+    bwd_loss_coeffs:
+      tb: 0
+      vg_lb: 0
+      vg_lme: 0
+      emp_z: 0
+      mle: 0
+      mle_prior_fraction: 0
+      pmle_std: 1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    exploratory: False
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    both_ways: False
+
+
+- tag: 19_greedy_2k
+  update:
+    lr_warmup_time: 2000
+    lr_anneal_time: 40000
+    max_batch_size: 200
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 1
+    fwd_loss_coeffs:
+      tb: 0
+      vg_lb: 0
+      vg_lme: 0
+      emp_z: 0
+      greedy: 1
+      reinforce: 0
+      mle: 0
+    bwd_loss_coeffs:
+      tb: 0
+      vg_lb: 0
+      vg_lme: 0
+      emp_z: 0
+      mle: 0
+      mle_prior_fraction: 0
+      pmle_std: 1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    exploratory: False
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    both_ways: False
+
+
+- tag: 20_greedy_4k
+  update:
+    lr_warmup_time: 4000
+    lr_anneal_time: 40000
+    max_batch_size: 200
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 1
+    fwd_loss_coeffs:
+      tb: 0
+      vg_lb: 0
+      vg_lme: 0
+      emp_z: 0
+      greedy: 1
+      reinforce: 0
+      mle: 0
+    bwd_loss_coeffs:
+      tb: 0
+      vg_lb: 0
+      vg_lme: 0
+      emp_z: 0
+      mle: 0
+      mle_prior_fraction: 0
+      pmle_std: 1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    exploratory: False
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    both_ways: False
+
+
+- tag: 21_greedy_8k
+  update:
+    lr_warmup_time: 8000
+    lr_anneal_time: 40000
+    max_batch_size: 200
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 1
+    fwd_loss_coeffs:
+      tb: 0
+      vg_lb: 0
+      vg_lme: 0
+      emp_z: 0
+      greedy: 1
+      reinforce: 0
+      mle: 0
+    bwd_loss_coeffs:
+      tb: 0
+      vg_lb: 0
+      vg_lme: 0
+      emp_z: 0
+      mle: 0
+      mle_prior_fraction: 0
+      pmle_std: 1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    exploratory: False
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    both_ways: False
+
+
+- tag: 22_greedy_1k_f10
+  update:
+    lr_warmup_time: 1000
+    lr_anneal_time: 40000
+    lr_warmup_ratio: 10
+    max_batch_size: 200
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 1
+    fwd_loss_coeffs:
+      tb: 0
+      vg_lb: 0
+      vg_lme: 0
+      emp_z: 0
+      greedy: 1
+      reinforce: 0
+      mle: 0
+    bwd_loss_coeffs:
+      tb: 0
+      vg_lb: 0
+      vg_lme: 0
+      emp_z: 0
+      mle: 0
+      mle_prior_fraction: 0
+      pmle_std: 1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    exploratory: False
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    both_ways: False
+
+
+- tag: 23_greedy_1k_lowmax
+  update:
+    lr_warmup_time: 1000
+    lr_anneal_time: 40000
+    lr_policy: 0.00005
+    lr_back: 0.00005
+    max_batch_size: 200
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 1
+    fwd_loss_coeffs:
+      tb: 0
+      vg_lb: 0
+      vg_lme: 0
+      emp_z: 0
+      greedy: 1
+      reinforce: 0
+      mle: 0
+    bwd_loss_coeffs:
+      tb: 0
+      vg_lb: 0
+      vg_lme: 0
+      emp_z: 0
+      mle: 0
+      mle_prior_fraction: 0
+      pmle_std: 1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    exploratory: False
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    both_ways: False

@@ -2,32 +2,30 @@ import gc
 import os
 import sys
 import traceback
-from copy import deepcopy
 from time import time
 from typing import Optional
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import wandb
 from torch.optim import lr_scheduler
 from torch_geometric.loader import DataLoader
 from tqdm import trange
 
-from energies.molecular_crystal import MolecularCrystal
 from buffer import CrystalReplayBuffer
-from mxtaltools.crystal_building.crystal_latent_transforms import enforce_niggli_plane
-from utils import featurize_dataset, embed_dataset
+from energies.molecular_crystal import MolecularCrystal
 from eval.evaluations import eval_step
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 from models import GFN
-from mxtaltools.common.config_processing import dict2namespace
+from mxtaltools.common.geometry_utils import batch_cell_vol_torch
 from mxtaltools.common.training_utils import flatten_wandb_params
+from mxtaltools.crystal_building.crystal_latent_transforms import enforce_niggli_plane
 from mxtaltools.dataset_utils.data_classes import MolData
 from mxtaltools.dataset_utils.utils import collate_data_list
 from utils import get_train_args, get_gfn_init_state, set_seed, \
     get_exploration_std, random_discretizer, low_discrepancy_discretizer, \
-    low_discrepancy_discretizer2, shifted_equidistant, uniform_discretizer, update_loss_schedule
+    low_discrepancy_discretizer2, shifted_equidistant, uniform_discretizer, \
+    featurize_dataset, embed_dataset, get_conditioning_dim, anneal_reward, set_loss_coeffs
 
 args = get_train_args()
 
@@ -233,7 +231,7 @@ def bwd_train_step(gfn_model, discretizer, buffer, energy_function, repeats: int
 
 def substitute_prior(condition, crystal_batch, energy_function, rewards, samples):
     loss_coeffs = args.bwd_loss_coeffs
-    if loss_coeffs.mle_prior_fraction > 0:
+    if loss_coeffs.mle_prior_fraction > 0:  # todo change variable name to 'buffer_noise_fraction'
         # replace buffer samples with a random prior
         rands = torch.randn((crystal_batch.num_graphs, 12), device=crystal_batch.device)
 
@@ -243,11 +241,22 @@ def substitute_prior(condition, crystal_batch, energy_function, rewards, samples
                                                              crystal_batch.radius)
         cell_lengths = temp_params[:, :3]
         cell_angles = temp_params[:, 3:6]
+
+        # rescale cell lengths for a good packing coeff
+        target_packing_coeff = (torch.randn(crystal_batch.num_graphs, device=crystal_batch.device) * 0.075 + 0.65).clip(min=0.55, max=0.95)
+        vol1 = batch_cell_vol_torch(cell_lengths, cell_angles)
+        cp1 = crystal_batch.mol_volume * crystal_batch.sym_mult / vol1
+        correction_ratio = (cp1 / target_packing_coeff) ** (1 / 3)
+        cell_lengths *= correction_ratio[:, None]
+
+        # enforce positive side of niggli plane
         cell_angles = enforce_niggli_plane(cell_lengths, cell_angles, mode='mirror')
         temp_params[:, 3:6] = cell_angles
 
-        prior_samples = crystal_batch.latent_transform.forward(temp_params, crystal_batch.sg_ind, crystal_batch.radius).clip(
-            min=-6, max=6)
+        prior_samples = crystal_batch.latent_transform.forward(temp_params,
+                                                               crystal_batch.sg_ind,
+                                                               crystal_batch.radius
+                                                               ).clip(min=-6, max=6)
 
         if loss_coeffs.mle_prior_fraction < 1:
             num_to_replace = max(1, int(len(samples) * loss_coeffs.mle_prior_fraction))
@@ -310,7 +319,7 @@ def train():
         dim=energy_function.data_ndim,
         s_emb_dim=args.s_emb_dim,
         hidden_dim=args.hidden_dim,
-        conditions_dim=get_conditioning_dim(),
+        conditions_dim=get_conditioning_dim(args),
         harmonics_dim=args.harmonics_dim,
         t_dim=args.t_emb_dim,
         condition_embedding_dim=args.condition_emb_dim,
@@ -446,147 +455,17 @@ def ten_step_reporting(bwd_loss, bwd_loss_dict, fwd_loss, fwd_loss_dict, metrics
         bwd_loss_dict = None
 
 
-def get_conditioning_dim():
-    conditioning_dim = 0
-    if args.temperature_conditioning:
-        conditioning_dim += 1
-    if args.molecule_conditioning:
-        conditioning_dim += 64 * 3
-    if args.sg_conditioning:
-        conditioning_dim += 237
-    return conditioning_dim
-
-
-def anneal_reward(it, temp_annealing_lambda, repulsion_annealing_lambda, energy_function, args):
-    """anneal reward function"""
-    if args.anneal_temperature:
-        if args.temperature_conditioning:
-            if energy_function.temperature_scaling_factor < 1:
-                energy_function.temperature_scaling_factor *= temp_annealing_lambda
-        else:
-            if energy_function.temperature > args.energy_min_temperature:
-                energy_function.temperature *= temp_annealing_lambda
-
-    if args.anneal_repulsion:
-        if energy_function.lj_repulsion < 1:
-            energy_function.lj_repulsion *= repulsion_annealing_lambda
-
-    if args.core_start_time > 0:
-        energy_function.core_coeff = round(
-            args.energy_core_coeff * F.sigmoid(torch.tensor((it - args.core_start_time) / 50)).item(), 2)
-    if args.lj_start_time > 0:
-        energy_function.lj_coeff = round(
-            args.energy_lj_coeff * F.sigmoid(torch.tensor((it - args.lj_start_time) / 50)).item(), 2)
-
-
-def set_loss_coeffs(it, args):
-    """anneal reward function"""
-    if it == 0:
-        args.fwd_loss_schedule = parse_loss_schedules(args.fwd_loss_coeffs)
-        args.bwd_loss_schedule = parse_loss_schedules(args.bwd_loss_coeffs)
-
-        args.fwd_loss_coeffs = dict2namespace({k: 0.0 for k in args.fwd_loss_schedule})
-        args.bwd_loss_coeffs = dict2namespace({k: 0.0 for k in args.bwd_loss_schedule})
-
-    update_loss_schedule(it, args.fwd_loss_schedule, args.fwd_loss_coeffs.__dict__)
-    update_loss_schedule(it, args.bwd_loss_schedule, args.bwd_loss_coeffs.__dict__)
-
-
-def parse_loss_schedules(loss_coeffs_config):
-    """
-    Parse loss coefficient configuration into standardized format.
-
-    Input formats:
-    - Single value: coeff_name: 1.5 -> constant schedule
-    - List of [step, value] pairs: coeff_name: [[0, 0.0], [1000, 2.0]]
-
-    Returns dict of {coeff_name: [(step, value), ...]}
-    """
-    schedules = {}
-
-    # Handle both dict and namespace objects
-    if hasattr(loss_coeffs_config, '__dict__'):
-        config_dict = loss_coeffs_config.__dict__
-    else:
-        config_dict = loss_coeffs_config
-
-    for key, value in config_dict.items():
-        if isinstance(value, (int, float)):
-            # Single constant value
-            schedules[key] = [(0, float(value))]
-        elif isinstance(value, list) and len(value) > 0:
-            # List of [step, value] pairs
-            if all(isinstance(item, (list, tuple)) and len(item) == 2 for item in value):
-                # Validate and sort by step
-                schedule = [(int(step), float(val)) for step, val in value]
-                schedule.sort(key=lambda x: x[0])  # Sort by step
-
-                # Validate steps are non-negative and ascending
-                for i, (step, val) in enumerate(schedule):
-                    if step < 0:
-                        raise ValueError(f"Step {step} for {key} must be non-negative")
-                    if i > 0 and step < schedule[i - 1][0]:
-                        raise ValueError(f"Steps for {key} must be in ascending order")
-
-                schedules[key] = schedule
-            else:
-                raise ValueError(f"Invalid schedule format for {key}: {value}")
-        else:
-            raise ValueError(f"Invalid schedule format for {key}: {value}")
-
-    return schedules
-
-def evaluate_schedule(step, schedule):
-    """
-    Evaluate a piecewise linear schedule at given step.
-
-    Args:
-        step: Current training step
-        schedule: List of (step, value) tuples, sorted by step
-
-    Returns:
-        Interpolated value at the given step
-    """
-    if len(schedule) == 1:
-        # Constant schedule
-        return schedule[0][1]
-
-    # Find the appropriate segment
-    for i in range(len(schedule) - 1):
-        step1, val1 = schedule[i]
-        step2, val2 = schedule[i + 1]
-
-        if step <= step1:
-            return val1
-        elif step1 < step <= step2:
-            # Linear interpolation between points
-            if step1 == step2:  # Avoid division by zero
-                return val2
-
-            alpha = (step - step1) / (step2 - step1)
-            return val1 + alpha * (val2 - val1)
-
-    # Past the last point, return final value
-    return schedule[-1][1]
-
-def update_loss_schedule(it, loss_schedules, active_coeffs):
-    """Update active coefficients based on current iteration and schedules"""
-    for key, schedule in loss_schedules.items():
-        active_coeffs[key] = evaluate_schedule(it, schedule)
-
 def step_lr_schedule(schedulers, optimizers,
                      lr_warmup_finished):
     if args.scheduler:
         lr = optimizers['fwd'].param_groups[0]['lr']
         if not lr_warmup_finished:
-            schedulers['fwd_1'].step()
-            schedulers['bwd_1'].step()
+            schedulers['policy_1'].step()
             if lr >= args.lr_policy:
                 lr_warmup_finished = True
 
         elif lr > args.min_lr:
-            schedulers['fwd_2'].step()
-            schedulers['bwd_2'].step()
+            schedulers['policy_2'].step()
             schedulers['flow'].step()
         return lr_warmup_finished, lr
     else:
@@ -595,9 +474,9 @@ def step_lr_schedule(schedulers, optimizers,
 
 def init_schedulers_optimizers(gfn_model):
     if args.scheduler:
-        init_fwd_lr = args.lr_policy / 100
-        init_flow_lr = args.lr_flow / 10
-        init_bwd_lr = args.lr_back / 100
+        init_fwd_lr = args.lr_policy / args.lr_warmup_ratio
+        init_flow_lr = args.lr_flow / args.lr_warmup_ratio
+        init_bwd_lr = args.lr_back / args.lr_warmup_ratio
     else:
         init_fwd_lr = args.lr_policy
         init_bwd_lr = args.lr_back
@@ -629,17 +508,16 @@ def init_schedulers_optimizers(gfn_model):
     schedulers = {}
     if args.scheduler:
         lr_warmup_lambda = get_annealing_factor(1, args.lr_warmup_ratio, args.lr_warmup_time, 10)
-        lr_annealing_lambda = get_annealing_factor(args.lr_policy, args.min_lr, args.lr_anneal_time, 10)
-        schedulers['fwd_1'] = lr_scheduler.MultiplicativeLR(optimizers['fwd'], lr_lambda=lambda epoch: lr_warmup_lambda)
-        schedulers['fwd_2'] = lr_scheduler.MultiplicativeLR(optimizers['fwd'],
-                                                            lr_lambda=lambda epoch: lr_annealing_lambda)
-        schedulers['bwd_1'] = lr_scheduler.MultiplicativeLR(optimizers['bwd'], lr_lambda=lambda epoch: lr_warmup_lambda)
-        schedulers['bwd_2'] = lr_scheduler.MultiplicativeLR(optimizers['bwd'],
-                                                            lr_lambda=lambda epoch: lr_annealing_lambda)
 
-        flow_annealing_lambda = get_annealing_factor(0.1, 1, args.lr_anneal_time, 10)
-        schedulers['flow'] = lr_scheduler.MultiplicativeLR(optimizers['flow'],
-                                                           lr_lambda=lambda epoch: flow_annealing_lambda)
+        lr_annealing_lambda = get_annealing_factor(args.lr_policy, args.min_lr, args.lr_anneal_time, 10)
+        schedulers['policy_1'] = lr_scheduler.MultiplicativeLR(
+            optimizers['fwd'], lr_lambda=lambda epoch: lr_warmup_lambda)
+        schedulers['policy_2'] = lr_scheduler.MultiplicativeLR(
+            optimizers['fwd'], lr_lambda=lambda epoch: lr_annealing_lambda)
+
+        flow_annealing_lambda = get_annealing_factor(1, args.lr_warmup_ratio, args.lr_anneal_time, 10)
+        schedulers['flow'] = lr_scheduler.MultiplicativeLR(
+            optimizers['flow'], lr_lambda=lambda epoch: flow_annealing_lambda)
 
     return optimizers, schedulers
 
@@ -799,7 +677,8 @@ def handle_train_epoch_error(e, oomed_out, buffer, train_mol_loader, test_mol_lo
     return oomed_out, buffer, train_mol_loader, test_mol_loader
 
 
-def do_evaluation(energy_function, buffer, gfn_model, i, metrics, mol_loader, override_do_figures: Optional[bool] = None):
+def do_evaluation(energy_function, buffer, gfn_model, i, metrics, mol_loader,
+                  override_do_figures: Optional[bool] = None):
     times['eval_step_start'] = time()
 
     eval_discretizer = lambda bsz: uniform_discretizer(bsz, args.eval_T)

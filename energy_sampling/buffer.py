@@ -57,7 +57,13 @@ class CrystalReplayBuffer:
                 al, be, ga = new_data_batch.cell_angles.split(1, dim=1)
                 _, _, _, _, _, _, overlap = compute_niggli_overlap(a, b, c, al, be, ga)
                 bad_inds = torch.argwhere(overlap.flatten() < 0).flatten().tolist()
+
+                # also, hard filter samples which are above or below our density cutoffs
+                bad_inds.extend(torch.argwhere(0.55 < new_data_batch.packing_coeff).flatten().tolist())
+                bad_inds.extend(torch.argwhere(new_data_batch.packing_coeff > 0.95).flatten().tolist())
+                bad_inds = list(set(bad_inds))
                 data_list = [elem for ind, elem in enumerate(data_list) if ind not in bad_inds]
+
                 if len(data_list) > 0:
                     new_data_batch = collate_data_list(data_list)
 
@@ -134,9 +140,11 @@ class CrystalReplayBuffer:
                 subsample_inds = np.random.choice(len(self), 5000, replace=False)
                 scores -= diversity_coeff * ((compute_sample_overlap(x_tensor[subsample_inds].float(),
                                                                      x_tensor.float(),
+                                                                     ga=0.1,
                                                                      agg='sum')).cpu().detach().numpy() - 1)  # subtract self contribution
             else:
                 scores -= diversity_coeff * ((compute_sample_overlap(x_tensor.float(),
+                                                                     ga=0.1,
                                                                      agg='sum')).cpu().detach().numpy() - 1)  # subtract self contribution
 
         if self.prioritized == 'rank':
