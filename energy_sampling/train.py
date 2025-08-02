@@ -243,7 +243,8 @@ def substitute_prior(condition, crystal_batch, energy_function, rewards, samples
         cell_angles = temp_params[:, 3:6]
 
         # rescale cell lengths for a good packing coeff
-        target_packing_coeff = (torch.randn(crystal_batch.num_graphs, device=crystal_batch.device) * 0.075 + 0.65).clip(min=0.55, max=0.95)
+        target_packing_coeff = (torch.randn(crystal_batch.num_graphs, device=crystal_batch.device) * 0.075 + 0.65).clip(
+            min=0.55, max=0.95)
         vol1 = batch_cell_vol_torch(cell_lengths, cell_angles)
         cp1 = crystal_batch.mol_volume * crystal_batch.sym_mult / vol1
         correction_ratio = (cp1 / target_packing_coeff) ** (1 / 3)
@@ -532,7 +533,7 @@ def init_buffers_datasets(energy_function):
         beta=args.beta,
         rank_weight=args.rank_weight,
         prioritized=args.prioritized,
-        keep_initial_samples=args.buffer_path is not None,
+        keep_initial_samples=False,  # args.buffer_path is not None,
         gpu_available=args.device == 'cuda',
         diversity_coeff=args.buffer_diversity_coeff,
     )
