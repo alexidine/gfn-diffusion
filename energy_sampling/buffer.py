@@ -188,7 +188,8 @@ class CrystalReplayBuffer:
 
         sample = collate_data_list([self.dataset[ind] for ind in rand_inds])
 
-        T_tensor, sg_inds, condition = self.energy_function.get_conditioning_tensor(sample)
+        T_tensor, sg_inds, condition = self.energy_function.get_conditioning_tensor(sample,
+                                                                                    sg_inds=sample.sg_ind)
         sample.sg_ind = sg_inds
         temperature = 10 ** T_tensor  # first dimension is the log temperature
         with torch.no_grad():

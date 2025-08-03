@@ -13,6 +13,38 @@ import torch.nn.functional as F
 from .base_set import BaseSet
 
 
+def density_penalty(packing_coeff):
+    """
+    draw crystals into the physically reasonable region
+    :param packing_coeff:
+    :return:
+    """
+    return F.relu(-(torch.log(packing_coeff) - np.log(0.55))) ** 2 + F.relu(packing_coeff - 0.95) ** 2
+
+
+def compute_niggli_overlap(cell_parameters):
+    """
+    Compute the overlap g4 + g5 + g6, which must be >=0 for valid niggli cells
+    :param cell_parameters:
+    :return:
+    """
+
+    a, b, c, al, be, ga = cell_parameters[:, :6].split(1, dim=1)
+    ab = a * b
+    ac = a * c
+    bc = b * c
+
+    al_cos = torch.cos(al)
+    be_cos = torch.cos(be)
+    ga_cos = torch.cos(ga)
+
+    return (ab * ga_cos + ac * be_cos + bc * al_cos).flatten()
+
+
+def core_energy_penalty(ellipsoid_overlap):
+    return ellipsoid_overlap ** 2 + ellipsoid_overlap
+
+
 class MolecularCrystal(BaseSet):
     def __init__(self, device,
                  energy_function: str,
@@ -56,7 +88,7 @@ class MolecularCrystal(BaseSet):
         self.bounding_coeff = bounding_coeff
         self.niggli_coeff = niggli_coeff
         self.molecule_conditioning = molecule_conditioning
-        self.sg_conditioning=sg_conditioning
+        self.sg_conditioning = sg_conditioning
         self.space_groups = space_groups
 
         self.temperature = temperature  # for static temperature work
@@ -105,9 +137,9 @@ class MolecularCrystal(BaseSet):
         cluster_batch.silu_pot = silu_energy
         cluster_batch.lj_pot = silu_energy
         cluster_batch.ellipsoid_overlap = ellipsoid_overlap
-        cluster_batch.niggli_overlap = self.compute_niggli_overlap(cluster_batch.cell_parameters())
+        cluster_batch.niggli_overlap = compute_niggli_overlap(cluster_batch.cell_parameters())
 
-        crystal_energy = self.generator_energy(cluster_batch)
+        crystal_energy, ens_dict = self.generator_energy(cluster_batch)
 
         cluster_batch.gfn_energy = crystal_energy
 
@@ -116,35 +148,35 @@ class MolecularCrystal(BaseSet):
         crystal_batch.lj_pot = silu_energy.cpu().detach()
         crystal_batch.ellipsoid_overlap = ellipsoid_overlap.cpu().detach()
         crystal_batch.niggli_overlap = cluster_batch.ellipsoid_overlap.cpu().detach()
+        for key in ens_dict.keys():
+            setattr(crystal_batch, key, ens_dict[key].cpu().detach())
 
         if return_batch:
             return crystal_energy, clean_batch(crystal_batch)
         else:
             return crystal_energy
 
-    def compute_niggli_overlap(self, cell_parameters):
-        """
-        Compute the overlap g4 + g5 + g6, which must be >=0 for valid niggli cells
-        :param cell_parameters:
-        :return:
-        """
-
-        a, b, c, al, be, ga = cell_parameters[:, :6].split(1, dim=1)
-        ab = a * b
-        ac = a * c
-        bc = b * c
-
-        al_cos = torch.cos(al)
-        be_cos = torch.cos(be)
-        ga_cos = torch.cos(ga)
-
-        return (ab * ga_cos + ac * be_cos + bc * al_cos).flatten()
-
     def generator_energy(self, cluster_batch):
+        ens_dict = {}
         if cluster_batch.device != self.device:
             cluster_batch = cluster_batch.to(self.device)
 
         latents = cluster_batch.cell_params_to_gen_basis()
+        bounding_energy = (F.relu(latents - 6) ** 2 + F.relu(-(latents + 6)) ** 2).sum(dim=-1)  # discourage exploration beyond clip range
+
+        if self.energy_function in ['ellipsoid_overlap', 'silu_energy', 'combo']:
+            density_energy = density_penalty(cluster_batch.packing_coeff)
+            lj_energy = self.soften_LJ_energy(cluster_batch.silu_pot) / cluster_batch.num_atoms
+            core_energy = core_energy_penalty(cluster_batch.ellipsoid_overlap)
+            niggli_energy = F.relu(-cluster_batch.niggli_overlap) ** 2  # punish negative overlaps
+            ens_dict['niggli_energy'] = niggli_energy
+            ens_dict['core_energy'] = core_energy
+            ens_dict['lj_energy'] = lj_energy
+            ens_dict['density_energy'] = density_energy
+            ens_dict['bounding_energy'] = bounding_energy
+        else:
+            niggli_energy = torch.zeros_like(bounding_energy)
+
         if self.energy_function == 'latent_harmonic':
             # a trivial energy function, for testing
             if not hasattr(self, 'modes'):
@@ -199,44 +231,22 @@ class MolecularCrystal(BaseSet):
             crystal_energy = -torch.logsumexp(exponent, dim=1)  # (B,)
 
         elif self.energy_function == 'ellipsoid_overlap':
-            density_energy = self.density_penalty(cluster_batch.packing_coeff)
-            core_energy = self.core_energy_penalty(cluster_batch.ellipsoid_overlap)
+
             crystal_energy = self.core_coeff * core_energy + self.density_coeff * density_energy
 
         elif self.energy_function == 'silu_energy':
-            density_energy = self.density_penalty(cluster_batch.packing_coeff)
-            lj_energy = self.soften_LJ_energy(cluster_batch.silu_pot) / cluster_batch.num_atoms
+
             crystal_energy = self.lj_coeff * lj_energy + self.density_coeff * density_energy
 
         elif self.energy_function == 'combo':
-            density_energy = self.density_penalty(cluster_batch.packing_coeff)
-            lj_energy = self.soften_LJ_energy(cluster_batch.silu_pot) / cluster_batch.num_atoms
-            core_energy = self.core_energy_penalty(cluster_batch.ellipsoid_overlap)
+
             crystal_energy = self.lj_coeff * lj_energy + self.core_coeff * core_energy + self.density_coeff * density_energy
 
         else:
             assert False, f'{self.energy_function} not implemented'
 
-        if self.energy_function in ['ellipsoid_overlap', 'silu_energy', 'combo']:
-            niggli_energy = F.relu(-cluster_batch.niggli_overlap)**2  # punish negative overlaps
-        else:
-            niggli_energy = torch.zeros_like(crystal_energy)
-
-        bounding_energy = (F.relu(latents - 6)**2 + F.relu(-(latents + 6))**2).sum(dim=-1)  # discourage exploration beyond clip range
-        total_energy = crystal_energy + bounding_energy * self.bounding_coeff + niggli_energy* self.niggli_coeff
-        return self.soft_clip(total_energy,
-                              self.energy_clip)  # softly bound from above  #crystal_energy.clip(min=-self.energy_clip, max=self.energy_clip)
-
-    def core_energy_penalty(self, ellipsoid_overlap):
-        return ellipsoid_overlap ** 2 + ellipsoid_overlap
-
-    def density_penalty(self, packing_coeff):
-        """
-        draw crystals into the physically reasonable region
-        :param packing_coeff:
-        :return:
-        """
-        return F.relu(-(torch.log(packing_coeff) - np.log(0.55))) ** 2 + F.relu(packing_coeff - 0.95) ** 2
+        total_energy = crystal_energy + bounding_energy * self.bounding_coeff + niggli_energy * self.niggli_coeff
+        return self.soft_clip(total_energy, self.energy_clip), ens_dict  # softly bound from above  #crystal_energy.clip(min=-self.energy_clip, max=self.energy_clip)
 
     def prebuilt_sample_to_reward(self, crystals, temperature):
         """
@@ -251,7 +261,7 @@ class MolecularCrystal(BaseSet):
             crystal_batch = crystals
 
         with torch.no_grad():
-            energy = self.generator_energy(crystal_batch)
+            energy, _ = self.generator_energy(crystal_batch)
 
         if torch.is_tensor(temperature):
             sample_temperature = temperature.to(self.device)
@@ -337,6 +347,11 @@ class MolecularCrystal(BaseSet):
             es_pot=zeros1,
             niggli_overlap=zeros1,
             ellipsoid_overlap=overlap_tensor,
+            density_energy=zeros1,
+            niggli_energy=zeros1,
+            core_energy=zeros1,
+            lj_energy=zeros1,
+            bounding_energy=zeros1,
         ) for ind in range(len(mol_batch))]).to(self.device)
 
         return crystal_batch
@@ -389,7 +404,8 @@ class MolecularCrystal(BaseSet):
 
             conds.append(log_T_tensor)
         else:
-            log_T_tensor = torch.log10(torch.ones((mol_batch.num_graphs, 1), device=mol_batch.device) * self.temperature)
+            log_T_tensor = torch.log10(
+                torch.ones((mol_batch.num_graphs, 1), device=mol_batch.device) * self.temperature)
 
         if self.molecule_conditioning:
             mol_embedding = mol_batch.embedding.flatten(1, 2)
@@ -402,10 +418,13 @@ class MolecularCrystal(BaseSet):
                 mol_batch.device)
 
         if self.sg_conditioning:
-            conds.append(self.SG_FEATURE_TENSOR[sg_to_sample])
+            conds.append(torch.stack([self.SG_FEATURE_TENSOR[sg]
+                 for sg in sg_to_sample]).to(mol_batch.device)
+                         )
 
         return (log_T_tensor.flatten(), sg_to_sample,
                 torch.cat(conds, dim=1) if len(conds) > 0 else torch.zeros_like(log_T_tensor))
+
 
 def generate_modes(K=20, D=12, rho=4.0, delta=3.0, seed=42):
     np.random.seed(seed)

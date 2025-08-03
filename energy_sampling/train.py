@@ -272,7 +272,8 @@ def substitute_prior(condition, crystal_batch, energy_function, rewards, samples
             loss_coeffs.vg_lb > 0,
             loss_coeffs.vg_lme > 0,
         ]):
-            log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(crystal_batch)
+            log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(crystal_batch,
+                                                                                       sg_inds=crystal_batch.sg_ind)
             if log_T_tensor is not None:
                 log_temperature = log_T_tensor
             else:
@@ -416,15 +417,15 @@ def train():
 
         if (step_ind % args.eval_period == 0 and step_ind > 0) or step_ind == 50:
             torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model.pt')
-            metrics = do_evaluation(energy_function, buffer, gfn_model,
-                                    step_ind, metrics, test_mol_loader)
-            # if args.molecule_conditioning:
-            #     train_metrics = do_evaluation(energy_function, buffer, gfn_model,
-            #                                   step_ind, metrics, train_mol_loader,
-            #                                   override_do_figures=False)
-            #     kk = list(train_metrics.keys())
-            #     for key in kk:
-            #         metrics['train_eval/' + key] = train_metrics[key]
+            metrics.update(do_evaluation(energy_function, buffer, gfn_model,
+                                    step_ind, test_mol_loader))
+            if args.molecule_conditioning:
+                train_metrics = do_evaluation(energy_function, buffer, gfn_model,
+                                              step_ind, train_mol_loader,
+                                              override_do_figures=False)
+                kk = list(train_metrics.keys())
+                for key in kk:
+                    metrics['train_eval/' + key] = train_metrics[key]
 
             wandb.log(metrics, step=step_ind)
 
@@ -678,7 +679,7 @@ def handle_train_epoch_error(e, oomed_out, buffer, train_mol_loader, test_mol_lo
     return oomed_out, buffer, train_mol_loader, test_mol_loader
 
 
-def do_evaluation(energy_function, buffer, gfn_model, i, metrics, mol_loader,
+def do_evaluation(energy_function, buffer, gfn_model, i, mol_loader,
                   override_do_figures: Optional[bool] = None):
     times['eval_step_start'] = time()
 
@@ -694,7 +695,9 @@ def do_evaluation(energy_function, buffer, gfn_model, i, metrics, mol_loader,
     mol_batch = collate_data_list([mol_loader.dataset[ind] for ind in eval_rands]).to(device)
 
     init_state = get_gfn_init_state(eval_batch_size, energy_function.data_ndim, args.device)
-    metrics.update(
+
+    eval_metrics = {}
+    eval_metrics.update(
         eval_step(energy_function,
                   gfn_model,
                   eval_discretizer,
@@ -706,12 +709,12 @@ def do_evaluation(energy_function, buffer, gfn_model, i, metrics, mol_loader,
                   bwd_training=len(buffer) > 0,
                   add_to_buffer=args.both_ways))
 
-    metrics.update({'Batch Size': args.batch_size})
-    metrics.update(log_elapsed_times())
+    eval_metrics.update({'Batch Size': args.batch_size})
+    eval_metrics.update(log_elapsed_times())
 
     times['eval_step_end'] = time()
 
-    return metrics
+    return eval_metrics
 
 
 def log_elapsed_times():
@@ -749,7 +752,8 @@ def add_dataset_to_buffer(dataset_path, buffer):
                                 'silu_energy',
                                 'combo']:  # reparameterize incoming samples
         print("Re-featurizing preloaded buffer samples")
-        dataset = featurize_dataset(dataset, args.device, args.ellipsoid_scale)
+        dataset = featurize_dataset(dataset, args.device,
+                                    args.ellipsoid_scale, args.lj_repulsion)
 
     if args.molecule_conditioning:  # embed dataset
         print("Getting preloaded dataset molecule embeddings")

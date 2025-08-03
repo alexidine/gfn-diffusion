@@ -37,5 +37,5 @@ class BaseSet(abc.ABC, Dataset):
             energy, sample = self.energy(x, mol_batch, log_temperature, return_exp)
             return -energy, sample
         else:
-            return -self.energy(x, mol_batch, log_temperature, return_exp)
+            return - self.energy(x, mol_batch, log_temperature, return_exp)
 

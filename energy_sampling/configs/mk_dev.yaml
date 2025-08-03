@@ -31,7 +31,7 @@ max_batch_size: 50           # maximum batch size to allow
 repeats: 5                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
 eval_batch_size: 500        # batch size for evaluation
 epochs: 100000000             # number of training epochs: relatively large
-eval_period: 200              # how often to do evaluation & reporting
+eval_period: 50              # how often to do evaluation & reporting
 figs_period: 200             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # GFlowNet settings
@@ -52,12 +52,12 @@ energy: "molecular_crystal"  # "molecular_crystal"
 fwd_loss_coeffs:
   tb:               1
   vg_lb:            0
-  vg_lme:           1  # exclusive with vg_lb
-  emp_z:            1  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
-  greedy:           1
-  reinforce:        1
+  vg_lme:           0  # exclusive with vg_lb
+  emp_z:            0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
+  greedy:           0
+  reinforce:        0
   mle:              0
-  var:              1
+  var:              0
   overlap:          0
   buffer:           0
   smoothed:         0
@@ -70,9 +70,9 @@ fwd_loss_coeffs:
 bwd_loss_coeffs:
   tb:               1
   vg_lb:            0
-  vg_lme:           1  # exclusive with vg_lb
-  emp_z:            1  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
-  mle:              1
+  vg_lme:           0  # exclusive with vg_lb
+  emp_z:            0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
+  mle:              0
   smoothed:         0
   mle_prior_fraction: 1
   pmle_std:         1 # std deviation of the prior mle distribution. Best to start small (1) and smoothly grow
@@ -137,9 +137,9 @@ energy_density_coeff: 2.0  # how much to weight the density penalty term in the 
 energy_core_coeff: 10.0  # loss coefficient
 bounding_coeff: 1.0
 niggli_coeff: 10.0
-core_start_time: 100  # after how many steps to turn on the core repulsion energy
+core_start_time: 0  # after how many steps to turn on the core repulsion energy
 energy_lj_coeff: 1.0  # loss coefficient
-lj_start_time: 200  # after how many steps to turn on the LJ energy
+lj_start_time: 0  # after how many steps to turn on the LJ energy
 lj_turnover_pot: 10.0  # value above which molecular LJ potential is softly clipped
 lj_repulsion: 0.85  # max 1. for values less than 1 the potential becomes more attractive
 ellipsoid_scale: 0.0  # how big in angstroms to pad around the rough minimum bounding ellipsoid, maybe [-1,1]

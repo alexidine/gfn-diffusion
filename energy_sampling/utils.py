@@ -295,7 +295,7 @@ def triangle_schedule(it, init, maxval, minval, on, off):
         return minval
 
 
-def featurize_dataset(dataset, device, ellipsoid_scale):
+def featurize_dataset(dataset, device, ellipsoid_scale, lj_repulsion):
     batch_size = 500
     loader = DataLoader(
         dataset,
@@ -318,7 +318,9 @@ def featurize_dataset(dataset, device, ellipsoid_scale):
             cluster_batch.construct_radial_graph(cutoff=6)
 
             lj_energy, normed_lj_energy = cluster_batch.compute_LJ_energy()
-            silu_energy = cluster_batch.compute_silu_energy()
+            silu_energy = cluster_batch.compute_silu_energy(
+                repulsion=lj_repulsion,
+            )
 
             # simplified ellipsoid energy testing
             _, _, _, _, _, _, normed_ellipsoid_overlap \

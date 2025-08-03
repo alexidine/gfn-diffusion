@@ -3,15 +3,16 @@ from typing import Optional
 
 import numpy as np
 import plotly.colors as pc
+import plotly.graph_objects as go
 import torch
 import torch.nn.functional as F
 import wandb
-from plotly import graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.ndimage import gaussian_filter
 from scipy.spatial import Voronoi, KDTree
 from scipy.spatial.distance import cdist
-from scipy.stats import pearsonr, gaussian_kde, linregress
+from scipy.stats import linregress, gaussian_kde
+from scipy.stats import pearsonr
 from skimage.feature import peak_local_max
 from skimage.segmentation import watershed
 from sklearn.cluster import AgglomerativeClustering
@@ -188,51 +189,97 @@ def generate_fwd_figs(buffer, energy_function,
 
 
 def boltzmann_fig(log_r):
-    energies = -log_r
-    # Convert to numpy if it's a PyTorch tensor
+    # === Input energies ===
     energies_np = energies.detach().cpu().numpy() if isinstance(energies, torch.Tensor) else energies
 
-    # Histogram (density normalized)
+    # === Histogram ===
     hist_y, hist_x = np.histogram(energies_np, bins=50, density=True)
     bin_centers = 0.5 * (hist_x[1:] + hist_x[:-1])
-
-    # Filter nonzero bins for log fitting
     nonzero = hist_y > 0
-    log_y = np.log(hist_y[nonzero])
-    x_fit = bin_centers[nonzero]
 
-    # Linear fit to log-probabilities: log(P(E)) = -βE + const
+    # === KDE ===
+    kde = gaussian_kde(energies_np, bw_method=0.3)
+    x_kde = np.linspace(energies_np.min(), energies_np.max(), 500)
+    y_kde = kde(x_kde)
+
+    # === Trim fit to low-energy region ===
+    quantile_cutoff = 0.7
+    energy_cutoff = np.quantile(energies_np, quantile_cutoff)
+    low_energy_mask = bin_centers <= energy_cutoff
+    fit_mask = nonzero & low_energy_mask
+
+    x_fit = bin_centers[fit_mask]
+    log_y = np.log(hist_y[fit_mask])
+
+    # === Linear fit to log P(E) ≈ -βE + const
     slope, intercept, _, _, _ = linregress(x_fit, log_y)
     beta_est = -slope
 
-    # Reconstruct Boltzmann distribution
-    boltzmann_y = np.exp(-beta_est * bin_centers)
-    boltzmann_y /= np.trapz(boltzmann_y, bin_centers)  # Normalize
+    # === Boltzmann fit in linear space
+    boltzmann_y = np.exp(-beta_est * x_kde)
+    boltzmann_y /= np.trapz(boltzmann_y, x_kde)
+    log_fit = slope * bin_centers + intercept
 
-    # Plot with Plotly
-    fig = go.Figure()
+    # === Create subplots
+    fig = make_subplots(rows=1, cols=2, subplot_titles=('Probability Density', 'Log-Probability vs Energy'))
 
+    # --- Left plot: Linear space
     fig.add_trace(go.Bar(
-        x=bin_centers,
-        y=hist_y,
-        name='Dist',
-        opacity=0.6
-    ))
+        x=bin_centers, y=hist_y,
+        name='Histogram', opacity=0.5, showlegend=True
+    ), row=1, col=1)
 
     fig.add_trace(go.Scatter(
-        x=bin_centers,
-        y=boltzmann_y,
-        mode='lines',
-        name=f'Fit (β ≈ {beta_est:.2f})'
-    ))
+        x=x_kde, y=y_kde,
+        mode='lines', name='KDE', line=dict(width=2)
+    ), row=1, col=1)
 
+    fig.add_trace(go.Scatter(
+        x=x_kde, y=boltzmann_y,
+        mode='lines', name=f'Boltzmann Fit (β ≈ {beta_est:.2f})',
+        line=dict(dash='dot')
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=[energy_cutoff, energy_cutoff],
+        y=[0, max(y_kde.max(), hist_y.max())],
+        mode='lines', name='Fit Cutoff',
+        line=dict(color='gray', dash='dash')
+    ), row=1, col=1)
+
+    # --- Right plot: Log-space
+    fig.add_trace(go.Scatter(
+        x=bin_centers[nonzero], y=np.log(hist_y[nonzero]),
+        mode='markers+lines', name='log Histogram',
+        marker=dict(size=5), line=dict(width=2)
+    ), row=1, col=2)
+
+    fig.add_trace(go.Scatter(
+        x=bin_centers, y=log_fit,
+        mode='lines', name=f'Linear Fit (β ≈ {beta_est:.2f})',
+        line=dict(dash='dot', width=2)
+    ), row=1, col=2)
+
+    fig.add_trace(go.Scatter(
+        x=[energy_cutoff, energy_cutoff],
+        y=[min(log_y.min(), log_fit.min()), log_y.max()],
+        mode='lines', name='Fit Cutoff',
+        line=dict(color='gray', dash='dash')
+    ), row=1, col=2)
+
+    # === Layout
     fig.update_layout(
-        title='Check for Boltzmann Distribution',
-        xaxis_title='Energy',
-        yaxis_title='Probability Density',
-        bargap=0.05,
+        title_text='Boltzmann Distribution Check (Linear & Log View)',
+        #height=500,
+        #width=1000,
         template='plotly_white'
     )
+
+    fig.update_xaxes(title_text='Energy', row=1, col=1)
+    fig.update_yaxes(title_text='P(E)', row=1, col=1)
+
+    fig.update_xaxes(title_text='Energy', row=1, col=2)
+    fig.update_yaxes(title_text='log P(E)', row=1, col=2)
 
     return fig
 
@@ -728,20 +775,33 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
                                sample_batch, log_T_tensor, args, buffer=None):
     """Scalar / distribution metrics"""
     metrics = {}
-    metrics['Empirical log Z'] = log_Z.cpu().detach().numpy()
-    metrics['Empirical log Z LB'] = log_Z_lb.cpu().detach().numpy()
-    metrics['log Z learned'] = log_Z_learned.cpu().detach().numpy()
-    metrics['Mean Cacking Coeff'] = sample_batch.packing_coeff.mean().cpu().detach().numpy()
+    # energies
+    for key in sample_batch.keys():
+        if 'energy' in key or 'pot' in key:
+            val = sample_batch[key].mean().cpu().detach().item()
+            metrics['Mean ' + key] = val
+
+    # physical properties
+    metrics['Mean Packing Coeff'] = sample_batch.packing_coeff.mean().cpu().detach().item()
     metrics['Packing Coeff'] = sample_batch.packing_coeff.clip(max=2).cpu().detach().numpy()
-    metrics['Mean Silu Energy'] = sample_batch.silu_pot.mean().cpu().detach().numpy()
-    metrics['Mean Sample Energy'] = sample_batch.gfn_energy.mean().cpu().detach().numpy()
-    metrics['Mean Niggli Overlap'] = F.relu(-sample_batch.niggli_overlap).mean().cpu().detach().numpy()
-    metrics['Max Niggli Overlap'] = F.relu(-sample_batch.niggli_overlap).amax().cpu().detach().numpy()
-    metrics['Sample Energy Distribution'] = sample_batch.gfn_energy.cpu().detach().numpy()
-    metrics['Mean Sample Reward'] = log_r.mean().cpu().detach().numpy()
-    metrics['sample Reward Distribution'] = log_r.cpu().detach().numpy()
+    metrics['Niggli Overlap'] = sample_batch.niggli_overlap.cpu().detach().numpy()
+    metrics['Mean ellipsoid_overlap'] = sample_batch['ellipsoid_overlap'].mean().cpu().detach().item()
+
+    # conditions
     metrics['Crystal Log Temperature'] = log_T_tensor.cpu().detach().numpy()
     metrics['Crystal Mean Log Temperature'] = log_T_tensor.mean().item()
+
+    # training metrics
+    metrics['Mean Sample Energy'] = sample_batch.gfn_energy.mean().cpu().detach().item()
+    metrics['Sample Energy'] = sample_batch.gfn_energy.clip(max=50).cpu().detach().numpy()
+
+    metrics['Mean Sample Reward'] = log_r.mean().cpu().detach().item()
+    metrics['Sample Reward'] = log_r.clip(min=-50).cpu().detach().numpy()
+
+    metrics['Empirical log Z'] = log_Z.cpu().detach().item()
+    metrics['Empirical log Z LB'] = log_Z_lb.cpu().detach().item()
+    metrics['log Z learned'] = log_Z_learned.cpu().detach().item()
+
     for elem in energy_function.__dict__.keys():
         thing = energy_function.__dict__[elem]
         if isinstance(thing, float) or isinstance(thing, int):
