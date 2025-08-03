@@ -120,7 +120,7 @@ space_groups:
 - 2
 t_emb_dim: 32
 t_scale: 0.1
-tag: qm9_test12
+tag: qm9_test13
 temp_annealing_max_steps: 20000
 temperature_conditioning: true
 temperature_scaling_factor: 0.01
