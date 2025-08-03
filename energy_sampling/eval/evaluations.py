@@ -189,6 +189,7 @@ def generate_fwd_figs(buffer, energy_function,
 
 
 def boltzmann_fig(log_r):
+    energies = -log_r
     # === Input energies ===
     energies_np = energies.detach().cpu().numpy() if isinstance(energies, torch.Tensor) else energies
 
