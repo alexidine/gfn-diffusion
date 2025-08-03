@@ -83,7 +83,7 @@ lr_flow: 0.1
 lr_policy: 0.0001
 lr_warmup_ratio: 100
 lr_warmup_time: 2000
-max_batch_size: 1000
+max_batch_size: 500
 max_traj_length: 20
 min_lr: 1.0e-06
 min_traj_length: 10
