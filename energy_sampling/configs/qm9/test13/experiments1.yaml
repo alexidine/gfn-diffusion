@@ -1,0 +1,480 @@
+defaults:
+  base: base.yaml
+
+experiments:
+- tag: 0_baseline
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    gradient_norm_clip: 0.1
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 1
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+      reinforce: 0
+      mle: 0
+    bwd_loss_coeffs:
+      tb: 1
+      mle: 0
+      mle_prior_fraction: 0
+      pmle_std: 0
+    buffer_path: '/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    exploratory: False
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+
+- tag: 1_low_lr
+  update:
+    lr_policy: 0.00001
+    lr_back: 0.00001
+    gradient_norm_clip: 0.1
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 1
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+      reinforce: 0
+      mle: 0
+    bwd_loss_coeffs:
+      tb: 1
+      mle: 0
+      mle_prior_fraction: 0
+      pmle_std: 0
+    buffer_path: '/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    exploratory: False
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+
+- tag: 2_small_model
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    gradient_norm_clip: 0.1
+    max_batch_size: 1000
+    repeats: 5
+    joint_layers: 4
+    hidden_dim: 256
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 1
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+      reinforce: 0
+      mle: 0
+    bwd_loss_coeffs:
+      tb: 1
+      mle: 0
+      mle_prior_fraction: 0
+      pmle_std: 0
+    buffer_path: '/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    exploratory: False
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+
+- tag: 3_small_bwd
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    gradient_norm_clip: 0.1
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 1
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+      reinforce: 0
+      mle: 0
+    bwd_loss_coeffs:
+      tb: 0.1
+      mle: 0
+      mle_prior_fraction: 0
+      pmle_std: 0
+    buffer_path: '/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    exploratory: False
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+
+- tag: 4_vars_1_1
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    gradient_norm_clip: 0.1
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 1
+    pb_drift_range: 0.2
+    pb_var_range: 1
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+      reinforce: 0
+      mle: 0
+    bwd_loss_coeffs:
+      tb: 1
+      mle: 0
+      mle_prior_fraction: 0
+      pmle_std: 0
+    buffer_path: '/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    exploratory: False
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+
+- tag: 5_vars_2_2
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    gradient_norm_clip: 0.1
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+      reinforce: 0
+      mle: 0
+    bwd_loss_coeffs:
+      tb: 1
+      mle: 0
+      mle_prior_fraction: 0
+      pmle_std: 0
+    buffer_path: '/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    exploratory: False
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+
+
+- tag: 6_vars_4_4
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    gradient_norm_clip: 0.1
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 4
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+      reinforce: 0
+      mle: 0
+    bwd_loss_coeffs:
+      tb: 1
+      mle: 0
+      mle_prior_fraction: 0
+      pmle_std: 0
+    buffer_path: '/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    exploratory: False
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+
+- tag: 7_vars_4_4_big_drift
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    gradient_norm_clip: 0.1
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 4
+    pb_drift_range: 0.9
+    pb_var_range: 4
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+      reinforce: 0
+      mle: 0
+    bwd_loss_coeffs:
+      tb: 1
+      mle: 0
+      mle_prior_fraction: 0
+      pmle_std: 0
+    buffer_path: '/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    exploratory: False
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+
+- tag: 8_low_t_scale
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    gradient_norm_clip: 0.1
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.01
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 1
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+      reinforce: 0
+      mle: 0
+    bwd_loss_coeffs:
+      tb: 1
+      mle: 0
+      mle_prior_fraction: 0
+      pmle_std: 0
+    buffer_path: '/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    exploratory: False
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+
+- tag: 9_greed
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    gradient_norm_clip: 0.1
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 1
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0.1
+      reinforce: 0
+      mle: 0
+    bwd_loss_coeffs:
+      tb: 1
+      mle: 0
+      mle_prior_fraction: 0
+      pmle_std: 0
+    buffer_path: '/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    exploratory: False
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+
+
+- tag: 10_greed_low_t_scale
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    gradient_norm_clip: 0.1
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.01
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 1
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0.1
+      reinforce: 0
+      mle: 0
+    bwd_loss_coeffs:
+      tb: 1
+      mle: 0
+      mle_prior_fraction: 0
+      pmle_std: 0
+    buffer_path: '/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    exploratory: False
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+
+- tag: 11_cooling
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    gradient_norm_clip: 0.1
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 1
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+      reinforce: 0
+      mle: 0
+    bwd_loss_coeffs:
+      tb: 1
+      mle: 0
+      mle_prior_fraction: 0
+      pmle_std: 0
+    buffer_path: '/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    exploratory: False
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    temp_annealing_max_steps: 40000
+    anneal_temperature: True
+    energy_min_temperature: 0.01
+
+- tag: 12_conditional_cooling
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    gradient_norm_clip: 0.1
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 1
+    fwd_loss_coeffs:
+      tb: [[0, 0], [10000, 0], [20000, 1]]
+      vg_lme: 1
+      emp_z: 1
+      greedy: 0
+      reinforce: 0
+      mle: 0
+    bwd_loss_coeffs:
+      tb: [[0, 0], [10000, 0], [20000, 1]]
+      vg_lme: 1
+      emp_z: 1
+      mle: 0
+      mle_prior_fraction: 0
+      pmle_std: 0
+    buffer_path: '/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    exploratory: False
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    anneal_temperature: True
+    temp_annealing_max_steps: 20000
+    temperature_conditioning: True
+
+- tag: 19_tb_mle_mle
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    gradient_norm_clip: 0.1
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 2
+    pb_drift_range: 0.2
+    pb_var_range: 1
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+      reinforce: 0
+      mle: 0.1
+    bwd_loss_coeffs:
+      tb: 1
+      mle: [[0, 0], [10000, 5], [20000, 0]]
+      mle_prior_fraction: 0
+      pmle_std: 0
+    buffer_path: '/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    exploratory: False
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+
+- tag: 14_just_big_drift
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    gradient_norm_clip: 0.1
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 2
+    pb_drift_range: 0.9
+    pb_var_range: 1
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+      reinforce: 0
+      mle: 0
+    bwd_loss_coeffs:
+      tb: 1
+      mle: 0
+      mle_prior_fraction: 0
+      pmle_std: 0
+    buffer_path: '/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    exploratory: False
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
