@@ -1,5 +1,5 @@
-run_name: 'qm9_test13'
-tag: 'qm9_test13'
+run_name: 'qm9_test14'
+tag: 'qm9_test14'
 seed: 12345
 device: 'cuda'
 lr_policy: 0.0001              # learning rate of the policy network
@@ -85,7 +85,7 @@ bwd: False                   # backward training only
 learn_pb: true               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
 learned_variance: true       # whether to learn policy variance
 clipping: true  # clip the maximum step size induced by the policy model
-gfn_clip: 20.0  # clip the maximum step size induced by the policy model
+gfn_clip: 200.0  # clip the maximum step size induced by the policy model
 
 # dataset settings
 ################################################################
@@ -105,7 +105,7 @@ buffer_diversity_coeff: 1.0  # how highly to weight sample diversity when sampli
 prioritized: "boltzmann"   # three kinds of replay training: random, reward prioritized (Boltzmann), rank-based
 sampling: "buffer"
 add_to_buffer_each: 10  # how often to add samples to the buffer during fwd passes in both_ways training
-buffer_size: 100000          # size of replay buffer: relatively large
+buffer_size: 200000          # size of replay buffer: relatively large
 
 # exploration controls
 ################################################################
@@ -137,15 +137,15 @@ energy_density_coeff: 10.0  # how much to weight the density penalty term in the
 energy_core_coeff: 10.0  # loss coefficient
 bounding_coeff: 1.0
 niggli_coeff: 10.0
-core_start_time: 100  # after how many steps to turn on the core repulsion energy
+core_start_time: 0  # after how many steps to turn on the core repulsion energy
 energy_lj_coeff: 1.0  # loss coefficient
-lj_start_time: 200  # after how many steps to turn on the LJ energy
+lj_start_time: 0  # after how many steps to turn on the LJ energy
 lj_turnover_pot: 10.0  # value above which molecular LJ potential is softly clipped
 lj_repulsion: 0.85  # max 1. for values less than 1 the potential becomes more attractive
-ellipsoid_scale: -0.5  # how big in angstroms to pad around the rough minimum bounding ellipsoid, maybe [-1,1]
+ellipsoid_scale: 0.0  # how big in angstroms to pad around the rough minimum bounding ellipsoid, maybe [-1,1]
 energy_min_temperature: 0.1  # for conditional or annealing
 energy_max_temperature: 10   # for conditional only
 energy_static_temperature: 1  # for certain evaluations or static T training. Also initial temperature on unconditional temperature annealing
 temperature_scaling_factor: 0.01  # controls relative frequency of higher vs lower temperatures in conditional training (higher -> higher)
-energy_clip: 1000  # where to start softly clipping energy values from above
+energy_clip: 100  # where to start softly clipping energy values from above - WE HAVE TUNED THE LOSS FOR THIS TO BE SET AT 100!!!
 

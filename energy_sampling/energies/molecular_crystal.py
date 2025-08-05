@@ -3,13 +3,11 @@ from typing import Optional
 
 import numpy as np
 import torch
-
-from mxtaltools.constants.space_group_feature_tensor import SG_FEATURE_TENSOR
-from mxtaltools.dataset_utils.data_classes import MolCrystalData, MolData
-from mxtaltools.dataset_utils.utils import collate_data_list
-
 import torch.nn.functional as F
 
+from mxtaltools.constants.space_group_feature_tensor import SG_FEATURE_TENSOR
+from mxtaltools.dataset_utils.data_classes import MolCrystalData
+from mxtaltools.dataset_utils.utils import collate_data_list
 from .base_set import BaseSet
 
 
@@ -45,6 +43,26 @@ def core_energy_penalty(ellipsoid_overlap):
     return ellipsoid_overlap ** 2 + ellipsoid_overlap
 
 
+def soften_high(energy, turnover_pot, coeff, clip: Optional[float] = None):
+    # soften the repulsion
+    softened_energy = energy.clone()
+    high_bools = softened_energy > turnover_pot
+    delta = softened_energy[high_bools] - turnover_pot
+    softened_energy[high_bools] = turnover_pot + delta ** coeff
+    if clip is not None:
+        softened_energy = softened_energy.clip(max=clip)
+
+    return softened_energy
+
+
+def soft_clip(y, clip_value):
+    new_y = y.clone()
+    #delta = new_y[y>clip_value] - clip_value + 1
+    new_y[y > clip_value] = clip_value + torch.log(y[y > clip_value] + 1 - clip_value)
+    #new_y[y>clip_value] = clip_value + delta ** (0.5)
+    return new_y
+
+
 class MolecularCrystal(BaseSet):
     def __init__(self, device,
                  energy_function: str,
@@ -57,7 +75,7 @@ class MolecularCrystal(BaseSet):
                  temperature: float = 1.0,
                  temperature_conditioning: bool = False,
                  energy_clip: float = 100,
-                 ellipsoid_scale: float = 1.0,
+                 ellipsoid_scale: float = 0.0,
                  core_coeff: float = 1.0,
                  lj_coeff: float = 1.0,
                  lj_repulsion: float = 1.0,
@@ -166,7 +184,7 @@ class MolecularCrystal(BaseSet):
 
         if self.energy_function in ['ellipsoid_overlap', 'silu_energy', 'combo']:
             density_energy = density_penalty(cluster_batch.packing_coeff)
-            lj_energy = self.soften_LJ_energy(cluster_batch.silu_pot) / cluster_batch.num_atoms
+            lj_energy = soften_high(cluster_batch.silu_pot, self.lj_turnover_pot, coeff = 0.9) / cluster_batch.num_atoms
             core_energy = core_energy_penalty(cluster_batch.ellipsoid_overlap)
             niggli_energy = F.relu(-cluster_batch.niggli_overlap) ** 2  # punish negative overlaps
             ens_dict['niggli_energy'] = niggli_energy
@@ -246,7 +264,10 @@ class MolecularCrystal(BaseSet):
             assert False, f'{self.energy_function} not implemented'
 
         total_energy = crystal_energy + bounding_energy * self.bounding_coeff + niggli_energy * self.niggli_coeff
-        return self.soft_clip(total_energy, self.energy_clip), ens_dict  # softly bound from above  #crystal_energy.clip(min=-self.energy_clip, max=self.energy_clip)
+        #return total_energy, ens_dict
+        return (soft_clip(soften_high(total_energy, self.energy_clip/2, coeff=0.7), self.energy_clip),
+                ens_dict)  # softly bound from above  #crystal_energy.clip(min=-self.energy_clip, max=self.energy_clip)
+        #return soft_clip(total_energy, 0).clip(max=self.energy_clip), ens_dict  # softly bound from above  #crystal_energy.clip(min=-self.energy_clip, max=self.energy_clip)
 
     def prebuilt_sample_to_reward(self, crystals, temperature):
         """
@@ -294,25 +315,6 @@ class MolecularCrystal(BaseSet):
             return energy / sample_temperature, crystal_batch
         else:
             return energy / sample_temperature
-
-    def soften_LJ_energy(self, lj_energy, clip: Optional[float] = None):
-        # soften the repulsion
-        softened_energy = lj_energy.clone()
-        high_bools = softened_energy > self.lj_turnover_pot
-        # softened_energy[high_bools] = self.lj_turnover_pot + torch.log(softened_energy[high_bools] + 1 - self.lj_turnover_pot)
-        delta = softened_energy[high_bools] - self.lj_turnover_pot + 1
-        softened_energy[high_bools] = self.lj_turnover_pot + delta ** 0.9
-        if clip is not None:
-            softened_energy = softened_energy.clip(max=clip)
-
-        return softened_energy
-
-    def soft_clip(self, y, clip_value):
-        new_y = y.clone()
-        #delta = new_y[y>clip_value] - clip_value + 1
-        new_y[y > clip_value] = clip_value + torch.log(y[y > clip_value] + 1 - clip_value)
-        #new_y[y>clip_value] = clip_value + delta ** (0.5)
-        return new_y
 
     def init_blank_crystal_batch(self, mol_batch):  # todo no possible way this is the most efficient way to do this
 
@@ -468,3 +470,4 @@ def clean_batch(batch):
             continue  # ignore protected or bad attrs
 
     return batch
+

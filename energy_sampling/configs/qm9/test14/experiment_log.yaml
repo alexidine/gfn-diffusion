@@ -21,9 +21,10 @@
   - exploration_factor
   - exploration_wd
   - wd_max_steps
+  - energy_static_temperature
   notes: ''
 - index: 1
-  tag: 1_low_lr
+  tag: 1_tb_vg
   update_keys:
   - lr_policy
   - lr_back
@@ -45,9 +46,10 @@
   - exploration_factor
   - exploration_wd
   - wd_max_steps
+  - energy_static_temperature
   notes: ''
 - index: 2
-  tag: 2_small_model
+  tag: 2_tb_vg_lme
   update_keys:
   - lr_policy
   - lr_back
@@ -69,9 +71,10 @@
   - exploration_factor
   - exploration_wd
   - wd_max_steps
+  - energy_static_temperature
   notes: ''
 - index: 3
-  tag: 3_small_bwd
+  tag: 3_hot_tb
   update_keys:
   - lr_policy
   - lr_back
@@ -93,9 +96,10 @@
   - exploration_factor
   - exploration_wd
   - wd_max_steps
+  - energy_static_temperature
   notes: ''
 - index: 4
-  tag: 4_vars_1_1
+  tag: 4_cold_tb
   update_keys:
   - lr_policy
   - lr_back
@@ -117,9 +121,10 @@
   - exploration_factor
   - exploration_wd
   - wd_max_steps
+  - energy_static_temperature
   notes: ''
 - index: 5
-  tag: 5_vars_2_2
+  tag: 5_cooling
   update_keys:
   - lr_policy
   - lr_back
@@ -141,9 +146,13 @@
   - exploration_factor
   - exploration_wd
   - wd_max_steps
+  - energy_static_temperature
+  - energy_min_temperature
+  - energy_max_temperature
+  - anneal_temperature
   notes: ''
 - index: 6
-  tag: 6_vars_4_4
+  tag: 6_conditional_T
   update_keys:
   - lr_policy
   - lr_back
@@ -165,159 +174,14 @@
   - exploration_factor
   - exploration_wd
   - wd_max_steps
-  notes: ''
-- index: 7
-  tag: 7_vars_4_4_big_drift
-  update_keys:
-  - lr_policy
-  - lr_back
-  - gradient_norm_clip
-  - max_batch_size
-  - repeats
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - t_scale
-  - log_var_range
-  - pb_drift_range
-  - pb_var_range
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - buffer_path
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  notes: ''
-- index: 8
-  tag: 8_low_t_scale
-  update_keys:
-  - lr_policy
-  - lr_back
-  - gradient_norm_clip
-  - max_batch_size
-  - repeats
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - t_scale
-  - log_var_range
-  - pb_drift_range
-  - pb_var_range
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - buffer_path
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  notes: ''
-- index: 9
-  tag: 9_greed
-  update_keys:
-  - lr_policy
-  - lr_back
-  - gradient_norm_clip
-  - max_batch_size
-  - repeats
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - t_scale
-  - log_var_range
-  - pb_drift_range
-  - pb_var_range
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - buffer_path
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  notes: ''
-- index: 10
-  tag: 10_greed_low_t_scale
-  update_keys:
-  - lr_policy
-  - lr_back
-  - gradient_norm_clip
-  - max_batch_size
-  - repeats
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - t_scale
-  - log_var_range
-  - pb_drift_range
-  - pb_var_range
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - buffer_path
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  notes: ''
-- index: 11
-  tag: 11_cooling
-  update_keys:
-  - lr_policy
-  - lr_back
-  - gradient_norm_clip
-  - max_batch_size
-  - repeats
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - t_scale
-  - log_var_range
-  - pb_drift_range
-  - pb_var_range
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - buffer_path
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  - temp_annealing_max_steps
-  - anneal_temperature
+  - energy_static_temperature
   - energy_min_temperature
-  notes: ''
-- index: 12
-  tag: 12_conditional_cooling
-  update_keys:
-  - lr_policy
-  - lr_back
-  - gradient_norm_clip
-  - max_batch_size
-  - repeats
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - t_scale
-  - log_var_range
-  - pb_drift_range
-  - pb_var_range
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - buffer_path
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
+  - energy_max_temperature
   - anneal_temperature
-  - temp_annealing_max_steps
   - temperature_conditioning
   notes: ''
-- index: 13
-  tag: 19_tb_mle_mle
+- index: 7
+  tag: 7_high_var_stiff
   update_keys:
   - lr_policy
   - lr_back
@@ -339,9 +203,161 @@
   - exploration_factor
   - exploration_wd
   - wd_max_steps
+  - energy_static_temperature
+  notes: ''
+- index: 8
+  tag: 8_mid_var_stiff
+  update_keys:
+  - lr_policy
+  - lr_back
+  - gradient_norm_clip
+  - max_batch_size
+  - repeats
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - buffer_path
+  - exploratory
+  - exploration_factor
+  - exploration_wd
+  - wd_max_steps
+  - energy_static_temperature
+  notes: ''
+- index: 9
+  tag: 9_low_var_stiff
+  update_keys:
+  - lr_policy
+  - lr_back
+  - gradient_norm_clip
+  - max_batch_size
+  - repeats
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - buffer_path
+  - exploratory
+  - exploration_factor
+  - exploration_wd
+  - wd_max_steps
+  - energy_static_temperature
+  notes: ''
+- index: 10
+  tag: 10_high_var_flex
+  update_keys:
+  - lr_policy
+  - lr_back
+  - gradient_norm_clip
+  - max_batch_size
+  - repeats
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - buffer_path
+  - exploratory
+  - exploration_factor
+  - exploration_wd
+  - wd_max_steps
+  - energy_static_temperature
+  notes: ''
+- index: 11
+  tag: 11_mid_var_flex
+  update_keys:
+  - lr_policy
+  - lr_back
+  - gradient_norm_clip
+  - max_batch_size
+  - repeats
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - buffer_path
+  - exploratory
+  - exploration_factor
+  - exploration_wd
+  - wd_max_steps
+  - energy_static_temperature
+  notes: ''
+- index: 12
+  tag: 12_low_var_flex
+  update_keys:
+  - lr_policy
+  - lr_back
+  - gradient_norm_clip
+  - max_batch_size
+  - repeats
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - buffer_path
+  - exploratory
+  - exploration_factor
+  - exploration_wd
+  - wd_max_steps
+  - energy_static_temperature
+  notes: ''
+- index: 13
+  tag: 13_no_pb
+  update_keys:
+  - lr_policy
+  - lr_back
+  - gradient_norm_clip
+  - max_batch_size
+  - repeats
+  - joint_layers
+  - hidden_dim
+  - dropout
+  - norm
+  - t_scale
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - buffer_path
+  - exploratory
+  - exploration_factor
+  - exploration_wd
+  - wd_max_steps
+  - energy_static_temperature
+  - learn_pb
   notes: ''
 - index: 14
-  tag: 14_just_big_drift
+  tag: 14_fwd_only
   update_keys:
   - lr_policy
   - lr_back
@@ -363,9 +379,11 @@
   - exploration_factor
   - exploration_wd
   - wd_max_steps
+  - energy_static_temperature
+  - both_ways
   notes: ''
 - index: 15
-  tag: 15_very_low_t_scale
+  tag: 15_baseline_no_preload
   update_keys:
   - lr_policy
   - lr_back
@@ -387,9 +405,10 @@
   - exploration_factor
   - exploration_wd
   - wd_max_steps
+  - energy_static_temperature
   notes: ''
 - index: 16
-  tag: 16_very_low_t_scale_2_2
+  tag: 16_focus_preload
   update_keys:
   - lr_policy
   - lr_back
@@ -411,15 +430,14 @@
   - exploration_factor
   - exploration_wd
   - wd_max_steps
+  - energy_static_temperature
   notes: ''
 - index: 17
-  tag: 17_more_train_steps
+  tag: 17_greedy_late
   update_keys:
   - lr_policy
   - lr_back
   - gradient_norm_clip
-  - min_traj_length
-  - max_traj_length
   - max_batch_size
   - repeats
   - joint_layers
@@ -437,16 +455,14 @@
   - exploration_factor
   - exploration_wd
   - wd_max_steps
+  - energy_static_temperature
   notes: ''
 - index: 18
-  tag: 18_more_eval_steps
+  tag: 18_small_dropout
   update_keys:
   - lr_policy
   - lr_back
   - gradient_norm_clip
-  - min_traj_length
-  - max_traj_length
-  - eval_T
   - max_batch_size
   - repeats
   - joint_layers
@@ -464,9 +480,10 @@
   - exploration_factor
   - exploration_wd
   - wd_max_steps
+  - energy_static_temperature
   notes: ''
 - index: 19
-  tag: 19_deeper_model
+  tag: 19_big_dropout
   update_keys:
   - lr_policy
   - lr_back
@@ -488,59 +505,10 @@
   - exploration_factor
   - exploration_wd
   - wd_max_steps
+  - energy_static_temperature
   notes: ''
 - index: 20
-  tag: 20_no_learned_var
-  update_keys:
-  - lr_policy
-  - lr_back
-  - gradient_norm_clip
-  - max_batch_size
-  - repeats
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - t_scale
-  - log_var_range
-  - pb_drift_range
-  - pb_var_range
-  - learned_variance
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - buffer_path
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  notes: ''
-- index: 21
-  tag: 21_no_learned_var_small_t_scale
-  update_keys:
-  - lr_policy
-  - lr_back
-  - gradient_norm_clip
-  - max_batch_size
-  - repeats
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - t_scale
-  - log_var_range
-  - pb_drift_range
-  - pb_var_range
-  - learned_variance
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - buffer_path
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  notes: ''
-- index: 22
-  tag: 22_fat_model
+  tag: 20_deep
   update_keys:
   - lr_policy
   - lr_back
@@ -562,148 +530,5 @@
   - exploration_factor
   - exploration_wd
   - wd_max_steps
-  notes: ''
-- index: 23
-  tag: 23_deeper_model_dropout
-  update_keys:
-  - lr_policy
-  - lr_back
-  - gradient_norm_clip
-  - max_batch_size
-  - repeats
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - t_scale
-  - log_var_range
-  - pb_drift_range
-  - pb_var_range
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - buffer_path
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  notes: ''
-- index: 24
-  tag: 24_deeper_model_mle
-  update_keys:
-  - lr_policy
-  - lr_back
-  - gradient_norm_clip
-  - max_batch_size
-  - repeats
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - t_scale
-  - log_var_range
-  - pb_drift_range
-  - pb_var_range
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - buffer_path
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  notes: ''
-- index: 25
-  tag: 24_deeper_model_pmle
-  update_keys:
-  - lr_policy
-  - lr_back
-  - gradient_norm_clip
-  - max_batch_size
-  - repeats
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - t_scale
-  - log_var_range
-  - pb_drift_range
-  - pb_var_range
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - buffer_path
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  notes: ''
-- index: 26
-  tag: 25_deeper_model_bmle
-  update_keys:
-  - lr_policy
-  - lr_back
-  - gradient_norm_clip
-  - max_batch_size
-  - repeats
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - t_scale
-  - log_var_range
-  - pb_drift_range
-  - pb_var_range
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - buffer_path
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  notes: ''
-- index: 27
-  tag: 26_deeper_model_highvar
-  update_keys:
-  - lr_policy
-  - lr_back
-  - gradient_norm_clip
-  - max_batch_size
-  - repeats
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - t_scale
-  - log_var_range
-  - pb_drift_range
-  - pb_var_range
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - buffer_path
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  notes: ''
-- index: 28
-  tag: 27_deeper_model_low_t_scale
-  update_keys:
-  - lr_policy
-  - lr_back
-  - gradient_norm_clip
-  - max_batch_size
-  - repeats
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - t_scale
-  - log_var_range
-  - pb_drift_range
-  - pb_var_range
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - buffer_path
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
+  - energy_static_temperature
   notes: ''

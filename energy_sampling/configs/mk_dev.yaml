@@ -85,7 +85,7 @@ bwd: False                   # backward training only
 learn_pb: true               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
 learned_variance: true       # whether to learn policy variance
 clipping: true  # clip the maximum step size induced by the policy model
-gfn_clip: 20.0  # clip the maximum step size induced by the policy model
+gfn_clip: 200.0  # clip the maximum step size induced by the policy model
 
 # dataset settings
 ################################################################
@@ -133,7 +133,7 @@ anneal_temperature: False  # scale temperature over time, when conditional it sc
 temp_annealing_max_steps: 2000  # time for scaling_factor to reach 1 (uniform sampling from min to max)
 anneal_repulsion: False
 repulsion_annealing_max_steps: 5000
-energy_density_coeff: 2.0  # how much to weight the density penalty term in the energy function
+energy_density_coeff: 10.0  # how much to weight the density penalty term in the energy function
 energy_core_coeff: 10.0  # loss coefficient
 bounding_coeff: 1.0
 niggli_coeff: 10.0
@@ -147,5 +147,5 @@ energy_min_temperature: 0.1  # for conditional or annealing
 energy_max_temperature: 10   # for conditional only
 energy_static_temperature: 1  # for certain evaluations or static T training. Also initial temperature on unconditional temperature annealing
 temperature_scaling_factor: 0.01  # controls relative frequency of higher vs lower temperatures in conditional training (higher -> higher)
-energy_clip: 1000  # where to start softly clipping energy values from above
+energy_clip: 100  # where to start softly clipping energy values from above - WE HAVE TUNED THE LOSS FOR THIS TO BE SET AT 100!!!
 

@@ -59,7 +59,7 @@ class GFN(nn.Module):
                                                         )
             self.flow_model = FlowModel(condition_embedding_dim,
                                         hidden_dim,
-                                        2,
+                                        joint_layers,
                                         norm=norm,
                                         dropout=dropout,
                                         )

@@ -5,7 +5,6 @@ import numpy as np
 import plotly.colors as pc
 import plotly.graph_objects as go
 import torch
-import torch.nn.functional as F
 import wandb
 from plotly.subplots import make_subplots
 from scipy.ndimage import gaussian_filter
@@ -15,7 +14,6 @@ from scipy.stats import linregress, gaussian_kde
 from scipy.stats import pearsonr
 from skimage.feature import peak_local_max
 from skimage.segmentation import watershed
-from sklearn.cluster import AgglomerativeClustering
 from umap import UMAP
 
 from energy_sampling.eval.utils import log_partition_function, get_plotly_fig_size_mb
@@ -311,30 +309,6 @@ def cluster_hist_fig(cluster_ind):
     return fig
 
 
-def agglomerative_cluster(ens, samples, energy_cutoff: float = 0.0, min_dist: float = 5):
-    # Can use full dataset or low-energy subset only
-    mask = ens < energy_cutoff
-    X_lowE = samples[mask]
-
-    model = AgglomerativeClustering(
-        n_clusters=None,
-        distance_threshold=min_dist,  # stop when all clusters > threshold apart
-        #linkage='ward',
-        linkage='complete',
-    )
-    labels = model.fit_predict(X_lowE)
-
-    # Pick 1 lowest-energy point from each cluster as an anchor
-    anchors = []
-    anchor_indices = []
-
-    for lbl in np.unique(labels):
-        members = np.where(labels == lbl)[0]
-        best_idx = members[np.argmin(ens[mask][members])]
-        anchors.append(X_lowE[best_idx])
-        anchor_indices.append(np.where(mask)[0][best_idx])
-    return anchors, anchor_indices
-
 
 def embed_samples(ref_samples, ref_rewards, samples, sample_rewards, max_ref_samples: int, temperature: float = 0.1):
     """
@@ -362,10 +336,10 @@ def embed_samples(ref_samples, ref_rewards, samples, sample_rewards, max_ref_sam
     sample_embedding = umap_model.fit_transform(samples_to_fit)
 
     # fit energy-weighted 2D gaussian kde on the UMAP data
-    beta = 0.1
+    beta = 0.001
     weights = np.exp(-beta * (energies_to_fit - np.min(energies_to_fit)))  # stabilize exponent
     weights /= weights.sum()
-    kde = gaussian_kde(sample_embedding.T, weights=weights, bw_method='scott')
+    kde = gaussian_kde(sample_embedding.T, weights=weights, bw_method=0.1)
 
     # Evaluate KDE on a 2D grid
     grid_size = 300
