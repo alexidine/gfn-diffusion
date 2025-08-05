@@ -176,10 +176,22 @@ def generate_fwd_figs(buffer, energy_function,
     fig_dict['Lattice Latents Trajectories'] = visualize_latent_trajs(flow_states.cpu().detach().numpy(),
                                                                       20,
                                                                       log_r.cpu().detach().numpy())
-    fig_dict['Lattice Features Distribution'] = simple_cell_hist(sample_batch, buffer_cell_params,
+    fig_dict['Lattice Features Distribution'], cell_klds = simple_cell_hist(sample_batch, buffer_cell_params,
                                                                  n_kde_points=200, bw_ratio=10, mode='cell')
-    fig_dict['Lattice Latents Distribution'] = simple_cell_hist(sample_batch, buffer_latent_params,
+    fig_dict['Lattice Latents Distribution'], latent_klds = simple_cell_hist(sample_batch, buffer_latent_params,
                                                                 n_kde_points=200, bw_ratio=10, mode='latent')
+
+    lattice_features = ['cell_a', 'cell_b', 'cell_c',
+                        'cell_alpha', 'cell_beta', 'cell_gamma',
+                        'aunit_x', 'aunit_y', 'aunit_z',
+                        'orientation_1', 'orientation_2', 'orientation_3']
+
+    for ind, feat in enumerate(lattice_features):
+        fig_dict[f'{feat} Cell KLD'] = cell_klds[ind]
+        fig_dict[f'{feat} Latent KLD'] = latent_klds[ind]
+    fig_dict['Mean Cell KLD'] = np.mean(cell_klds)
+    fig_dict['Mean Latent KLD'] = np.mean(latent_klds)
+
     log_T = len(torch.unique(log_T_tensor)) > 1
     fig_dict['Sample Scatter'] = simple_cell_scatter_fig(
         sample_batch,

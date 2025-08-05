@@ -124,6 +124,12 @@ if not os.path.exists('csd_results.npy') or override_resample:
             encoder
         )
     np.save('csd_results', csd_sampling_dict)
+    print('getting RDFs')
+    csd_rdf_dists, rr = sample_csd_rdf_dists(csd_mols,
+                                             csd_sampling_dict,
+                                             args.eval_batch_size,
+                                             args.device)
+    np.save('csd_rdfs', csd_rdf_dists.cpu().detach().numpy())
 
 """
 Reporting
@@ -173,17 +179,7 @@ ref_energies = csd_clusters.compute_silu_energy()
 
 # load samples
 csd_sampling_dict = np.load('csd_results.npy', allow_pickle=True).item()
-
-# get rdf dists
-print('getting RDFs')
-if not os.path.exists('csd_rdfs.npy'):
-    rdf_dists, rr = sample_csd_rdf_dists(csd_mols,
-                                         csd_sampling_dict,
-                                         args.eval_batch_size,
-                                         args.device)
-    np.save('csd_rdfs', rdf_dists.cpu().detach().numpy())
-else:
-    rdf_dists = np.load('csd_rdfs.npy',allow_pickle=True)
+csd_rdf_dists = np.load('csd_rdfs.npy', allow_pickle=True)
 
 # funnel figs
 if args.show_figs:
@@ -193,11 +189,11 @@ if args.show_figs:
         funnel_figs.append(crystal_sample_funnel_plot(
             packing_coeff=samples['densities'].flatten(),
             energies=samples['energies'].flatten(),
-            dists=torch.tensor(rdf_dists)[ind],
+            dists=torch.tensor(csd_rdf_dists)[ind],
             ref_energies=torch.tensor([ref_energies[ind]]),
             ref_packing_coeff=csd_clusters[ind].packing_coeff
         ))
-    [f.show() for f in funnel_figs]
+    [f.show(renderer='browser') for f in funnel_figs]
 
 # Divergence between lattice distance sets
 js_divs = np.array(sample_csd_lattice_divs(csd_mols, csd_sampling_dict))
@@ -239,7 +235,7 @@ for ind in range(len(csd_mols)):
         import plotly.graph_objects as go
 
         go.Figure(
-            go.Scatter(x=scat_dists.flatten(), y=js_dists, mode='markers', marker_color=np.log10(rdf_dists[ind]))).show(
+            go.Scatter(x=scat_dists.flatten(), y=js_dists, mode='markers', marker_color=np.log10(csd_rdf_dists[ind]))).show(
             renderer='browser', marker_colorscale='viridis')
 
 aa = 1

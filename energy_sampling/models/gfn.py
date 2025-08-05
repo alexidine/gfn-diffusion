@@ -47,6 +47,7 @@ class GFN(nn.Module):
         self.dt = 1. / trajectory_length
         self.log_var_range = log_var_range
         self.device = device
+        self.var_clip = 16
 
         if self.conditional_flow_model:
             self.conditions_embedding_model = scalarMLP(input_dim=conditions_dim,
@@ -90,7 +91,7 @@ class GFN(nn.Module):
                 logvar = logvar_i
             else:
                 logvar = torch.tanh(logvar_i / self.log_var_range) * self.log_var_range
-        return mean, (logvar + np.log(self.pf_std_per_traj) * 2.0).clip(min=-8, max=8)
+        return mean, (logvar + np.log(self.pf_std_per_traj) * 2.0).clip(min=-self.var_clip, max=self.var_clip)
 
     def predict_next_state(self, s, t, condition_embedding):
         s_new = self.forward_policy(self.s_model(s, condition_embedding), self.t_model(t))
@@ -136,7 +137,7 @@ class GFN(nn.Module):
             if i > 0:  # variance is exactly zero for the first step, so we can't use it
                 # back_var = ((self.pf_std_per_traj ** 2) * (dts * ts[:, i] / ts[:, i + 1]).unsqueeze(
                 #     1) * back_var_correction)
-                var = (back_var_correction + np.log(self.pf_std_per_traj) * 2.0).clip(min=-8, max=8).exp()
+                var = (back_var_correction + np.log(self.pf_std_per_traj) * 2.0).clip(min=-self.var_clip, max=self.var_clip).exp()
                 back_var = var * (dts * ts[:, i] / ts[:, i + 1]).unsqueeze(1)
                 noise_backward = (current_state - back_mean) / back_var.sqrt()
                 logpb[:, i] = -0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1)
@@ -188,7 +189,7 @@ class GFN(nn.Module):
                 # back_var = ((self.pf_std_per_traj ** 2) *
                 #             (dts * ts[:, trajectory_length - i - 1] / ts[:, trajectory_length - i]).unsqueeze(
                 #                 1) * back_var_correction)
-                var = (back_var_correction + np.log(self.pf_std_per_traj) * 2.0).clip(min=-8, max=8).exp()
+                var = (back_var_correction + np.log(self.pf_std_per_traj) * 2.0).clip(min=-self.var_clip, max=self.var_clip).exp()
                 back_var = var * (dts * ts[:, trajectory_length - i - 1] / ts[:, trajectory_length - i]).unsqueeze(1)
                 prev_state = self.bwd_propagate(back_mean, back_var, current_state, detach_traj)
                 noise_backward = (prev_state - back_mean) / back_var.sqrt()

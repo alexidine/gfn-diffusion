@@ -162,7 +162,8 @@ def crystal_sample_funnel_plot(packing_coeff,
                 title='log RDF EMD',
                 x=1  # shift it to the right so it doesn't overlap
             )
-        )
+        ),
+        xaxis_range=[0.5, 1],
     )
     fig.update_layout(legend_orientation='h')
     fig.update_layout(plot_bgcolor='rgba(0,0,0,0)')
