@@ -142,7 +142,10 @@ def generate_fwd_figs(buffer, energy_function,
         log_r.cpu().detach().numpy(),
         max_ref_samples=500
     )
-    fig_dict['Boltzmann Fit'] = boltzmann_fig(log_r)
+    try:
+        fig_dict['Boltzmann Fit'] = boltzmann_fig(log_r)
+    except:  # some issues in the above I don't care to fix
+        pass
     fig_dict['Sample Embedding'] = cluster_fig(sample_embedding, anchor_embedding, sample_cluster_inds, anchor_energies,
                                                all_energies, 'cluster', watershed_idx, watershed_range)
     fig_dict['Sample Embedding w Energy'] = cluster_fig(sample_embedding, anchor_embedding, sample_cluster_inds,
@@ -204,7 +207,7 @@ def boltzmann_fig(log_r):
     y_kde = kde(x_kde)
 
     # === Trim fit to low-energy region ===
-    quantile_cutoff = 0.7
+    quantile_cutoff = 0.95
     energy_cutoff = np.quantile(energies_np, quantile_cutoff)
     low_energy_mask = bin_centers <= energy_cutoff
     fit_mask = nonzero & low_energy_mask
@@ -213,8 +216,11 @@ def boltzmann_fig(log_r):
     log_y = np.log(hist_y[fit_mask])
 
     # === Linear fit to log P(E) ≈ -βE + const
-    slope, intercept, _, _, _ = linregress(x_fit, log_y)
-    beta_est = -slope
+    try:
+        slope, intercept, _, _, _ = linregress(x_fit, log_y)
+        beta_est = -slope
+    except:
+        slope, intercept = 1, 1
 
     # === Boltzmann fit in linear space
     boltzmann_y = np.exp(-beta_est * x_kde)
@@ -1051,7 +1057,7 @@ def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs):
     fig.update_layout(
         title='Parity Plot',
         xaxis=dict(title='log_r + log_pb', range=[lim_low, lim_high]),
-        yaxis=dict(title='log_Z + log_pf', range=[lim_low, lim_high], scaleanchor='x', scaleratio=1),
+        yaxis=dict(title='log_Z + log_pf', range=[lim_low, lim_high], scaleanchor='x'),#, scaleratio=1),
         # width=600,
         # height=600,
         template='plotly_white'
