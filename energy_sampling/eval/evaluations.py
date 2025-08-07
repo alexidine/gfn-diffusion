@@ -20,7 +20,7 @@ from energy_sampling.eval.utils import log_partition_function, get_plotly_fig_si
 from energy_sampling.utils import logmeanexp
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.reporting.figures import simple_cell_hist, simple_cell_scatter_fig, \
-    log_crystal_samples
+    log_crystal_samples, conditional_simple_cell_hist
 
 
 @torch.no_grad()
@@ -84,6 +84,56 @@ def eval_step(energy_function,
         log_crystals(batch_to_log)
     except:  # sometimes it fails IDK
         pass
+
+    gfn_model.train()
+    return metrics
+
+
+@torch.no_grad()
+def conditional_eval_step(energy_function,
+                          gfn_model,
+                          discretizer,
+                          init_state,
+                          mol_batch,
+                          mols_to_sample: int = 10
+                          ):
+    gfn_model.eval()
+    # pick some molecules
+    mols_to_sample_list = mol_batch.to_data_list()[:mols_to_sample]
+    # ensure a clean batch
+    samples_per_mol = len(init_state) // mols_to_sample
+    init_state = init_state[:samples_per_mol * mols_to_sample]
+    # instantiate batch to sample
+    mol_batch = collate_data_list(mols_to_sample_list * samples_per_mol)
+    cond_inds = torch.tensor([_ for _ in range(mols_to_sample)] * (samples_per_mol), dtype=torch.long)
+
+    (flow_states, samples, log_r, log_Z, log_Z_lb,
+     log_Z_learned, sample_batch, condition, log_pfs, log_pbs, log_fs,
+     f_means_f, f_vars_f, f_means_b, f_vars_b,
+     log_T_tensor) = log_partition_function(
+        init_state, gfn_model, discretizer, energy_function, mol_batch)
+
+    metrics = {}
+    fig_dict = conditional_fwd_figs(
+        log_fs,
+        log_pbs,
+        log_pfs,
+        log_r,
+        sample_batch.detach().cpu(),
+        cond_inds,
+        log_T_tensor)
+
+    for key in fig_dict.keys():
+        fig = fig_dict[key]
+        try:
+            if get_plotly_fig_size_mb(fig) > 1:  # bigger than 1 MB
+                fig.write_image(key + 'fig.png', width=720,
+                                height=512)  # save the image rather than the fig, for size reasons
+                fig_dict[key] = wandb.Image(key + 'fig.png')
+        except:
+            pass
+
+    metrics.update(fig_dict)
 
     gfn_model.train()
     return metrics
@@ -175,9 +225,10 @@ def generate_fwd_figs(buffer, energy_function,
                                                                       20,
                                                                       log_r.cpu().detach().numpy())
     fig_dict['Lattice Features Distribution'], cell_klds = simple_cell_hist(sample_batch, buffer_cell_params,
-                                                                 n_kde_points=200, bw_ratio=10, mode='cell')
+                                                                            n_kde_points=200, bw_ratio=10, mode='cell')
     fig_dict['Lattice Latents Distribution'], latent_klds = simple_cell_hist(sample_batch, buffer_latent_params,
-                                                                n_kde_points=200, bw_ratio=10, mode='latent')
+                                                                             n_kde_points=200, bw_ratio=10,
+                                                                             mode='latent')
 
     lattice_features = ['cell_a', 'cell_b', 'cell_c',
                         'cell_alpha', 'cell_beta', 'cell_gamma',
@@ -196,6 +247,32 @@ def generate_fwd_figs(buffer, energy_function,
         sample_cluster_inds,
         aux_scalar_name='Log Temp' if log_T else None,
         aux_array=log_T_tensor.cpu().detach().numpy() if log_T else None,
+    )
+
+    return fig_dict
+
+
+def conditional_fwd_figs(log_fs, log_pbs, log_pfs, log_r,
+                         sample_batch, cond_inds,
+                         log_T_tensor):
+    fig_dict = {}
+    fig_dict['Conditional TB Parity Plot'], _ = conditional_flow_parity_plot(log_r, log_fs[:, 0], log_pbs, log_pfs, cond_inds)
+    fig_dict['Conditional VG Error'] = conditional_vargrad_error(log_r, log_pbs,
+                                                                 log_pfs, cond_inds)
+
+    fig_dict['Conditional Lattice Features Distribution'] = conditional_simple_cell_hist(sample_batch,
+                                                                                         cond_inds,
+                                                                                         n_kde_points=200, bw_ratio=10,
+                                                                                         mode='cell')
+    fig_dict['Conditional Lattice Latents Distribution'] = conditional_simple_cell_hist(sample_batch,
+                                                                                        cond_inds,
+                                                                                        n_kde_points=200, bw_ratio=10,
+                                                                                        mode='latent')
+
+    fig_dict['Conditional Sample Scatter'] = simple_cell_scatter_fig(
+        sample_batch,
+        aux_scalar_name='Molecule',
+        aux_array=cond_inds.cpu().detach().numpy(),
     )
 
     return fig_dict
@@ -307,7 +384,6 @@ def cluster_hist_fig(cluster_ind):
     fig.add_bar(x=uniques, y=counts)
     fig.update_layout(xaxis_title='Cluster Ind', yaxis_title='Cluster Size')
     return fig
-
 
 
 def embed_samples(ref_samples, ref_rewards, samples, sample_rewards, max_ref_samples: int, temperature: float = 0.1):
@@ -1043,7 +1119,64 @@ def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs):
     fig.update_layout(
         title='Parity Plot',
         xaxis=dict(title='log_r + log_pb', range=[lim_low, lim_high]),
-        yaxis=dict(title='log_Z + log_pf', range=[lim_low, lim_high], scaleanchor='x'),#, scaleratio=1),
+        yaxis=dict(title='log_Z + log_pf', range=[lim_low, lim_high], scaleanchor='x'),  #, scaleratio=1),
+        # width=600,
+        # height=600,
+        template='plotly_white'
+    )
+
+    return fig, r_value
+
+
+def conditional_flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs, cond_inds):
+    # Compute x and y
+    x = (log_r + log_pbs.sum(-1)).cpu().detach().numpy()
+    y = (log_Z_learned + log_pfs.sum(-1)).cpu().detach().numpy()
+
+    # Get symmetric limits
+    min_val = min(x.min(), y.min())
+    max_val = max(x.max(), y.max())
+    margin = 0.05 * (max_val - min_val)
+    lim_low = min_val - margin
+    lim_high = max_val + margin
+    mae = np.mean(np.abs(x - y))
+    r_value, _ = pearsonr(x, y)
+    slope, intercept = np.polyfit(x, y, deg=1)
+    # Build figure
+    fig = go.Figure()
+
+    # Identity line
+    fig.add_trace(go.Scatter(
+        x=[lim_low, lim_high], y=[lim_low, lim_high],
+        mode='lines',
+        line=dict(color='gray', dash='dash'),
+        showlegend=False,
+        hoverinfo='skip'
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=[lim_low, lim_high], y=[slope * lim_low + intercept, slope * lim_high + intercept],
+        mode='lines',
+        line=dict(color='red', dash='dot'),
+        name=f'{slope:.3f}x + {intercept:.3f}',
+        showlegend=True
+    ))
+    n_elems = len(torch.unique(cond_inds))
+    for ind in range(n_elems):
+        bools = cond_inds == ind
+        # Scatter points
+        fig.add_trace(go.Scatter(
+            x=x[bools], y=y[bools],
+            mode='markers',
+            marker=dict(size=6, opacity=0.7, color=ind, colorscale='Rainbow'),
+            #name=f'Samples<br>MAE = {mae:.3f}<br>R = {r_value:.3f}'
+        ))
+
+    # Layout adjustments
+    fig.update_layout(
+        title='Parity Plot',
+        xaxis=dict(title='log_r + log_pb', range=[lim_low, lim_high]),
+        yaxis=dict(title='log_Z + log_pf', range=[lim_low, lim_high], scaleanchor='x'),  #, scaleratio=1),
         # width=600,
         # height=600,
         template='plotly_white'
@@ -1059,6 +1192,23 @@ def vargrad_error(log_r, log_pbs, log_pfs):
 
     mae = np.abs(log_z - log_ratio).mean()
     fig = go.Figure(go.Histogram(x=(log_z - log_ratio), nbinsx=100, name=f'MAE={mae:.2f}', showlegend=True))
+    fig.update_layout(xaxis_title='Log Ratio Error', yaxis_title='Count')
+
+    return fig
+
+
+def conditional_vargrad_error(log_r, log_pbs, log_pfs, cond_inds):
+    # Compute x and y
+    n_elems = len(torch.unique(cond_inds))
+    fig = go.Figure()
+    for ind in range(n_elems):
+        bools = cond_inds == ind
+        log_ratio = (log_r[bools] + log_pbs[bools].sum(-1) - log_pfs[bools].sum(-1)).cpu().detach().numpy()
+        log_z = log_ratio.mean()
+
+        fig.add_trace(go.Violin(
+            x=(log_z - log_ratio), side='positive', orientation='h', width=4,
+                showlegend=False, opacity=0.5))
     fig.update_layout(xaxis_title='Log Ratio Error', yaxis_title='Count')
 
     return fig

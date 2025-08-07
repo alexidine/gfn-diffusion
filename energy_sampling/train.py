@@ -14,7 +14,7 @@ from tqdm import trange
 
 from buffer import CrystalReplayBuffer
 from energies.molecular_crystal import MolecularCrystal
-from eval.evaluations import eval_step
+from eval.evaluations import eval_step, conditional_eval_step
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 from models import GFN
 from mxtaltools.common.geometry_utils import batch_cell_vol_torch
@@ -417,15 +417,22 @@ def train():
 
         if (step_ind % args.eval_period == 0 and step_ind > 0) or step_ind == 50:
             torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model.pt')
-            metrics.update(do_evaluation(energy_function, buffer, gfn_model,
-                                    step_ind, test_mol_loader))
             if args.molecule_conditioning:
-                train_metrics = do_evaluation(energy_function, buffer, gfn_model,
-                                              step_ind, train_mol_loader,
-                                              override_do_figures=False)
-                kk = list(train_metrics.keys())
-                for key in kk:
-                    metrics['train_eval/' + key] = train_metrics[key]
+                # so far not useful
+                # train_metrics = do_evaluation(energy_function, buffer, gfn_model,
+                #                               step_ind, train_mol_loader,
+                #                               override_do_figures=False)
+                # kk = list(train_metrics.keys())
+                # for key in kk:
+                #     metrics['train_eval/' + key] = train_metrics[key]
+                if step_ind % args.figs_period == 0:  # make conditional sampling figures
+                    conditional_metrics = do_conditional_evaluation(energy_function, gfn_model,
+                                                                    test_mol_loader,
+                                                                    )
+                    metrics.update(conditional_metrics)
+
+            metrics.update(do_evaluation(energy_function, buffer, gfn_model,
+                                         step_ind, test_mol_loader))
 
             wandb.log(metrics, step=step_ind)
 
@@ -713,6 +720,31 @@ def do_evaluation(energy_function, buffer, gfn_model, i, mol_loader,
     eval_metrics.update(log_elapsed_times())
 
     times['eval_step_end'] = time()
+
+    return eval_metrics
+
+
+def do_conditional_evaluation(energy_function, gfn_model, mol_loader,
+                              ):  # todo these functions could be cleaned up / consolidated
+    times['eval_step_start'] = time()
+    eval_discretizer = lambda bsz: uniform_discretizer(bsz, args.eval_T)
+
+    eval_batch_size = args.eval_batch_size
+
+    eval_rands = np.random.randint(len(mol_loader.dataset), size=eval_batch_size)
+    mol_batch = collate_data_list([mol_loader.dataset[ind] for ind in eval_rands]).to(device)
+
+    init_state = get_gfn_init_state(eval_batch_size, energy_function.data_ndim, args.device)
+
+    eval_metrics = {}
+    eval_metrics.update(
+        conditional_eval_step(energy_function,
+                              gfn_model,
+                              eval_discretizer,
+                              init_state,
+                              mol_batch,
+                              mols_to_sample=5
+                              ))
 
     return eval_metrics
 
