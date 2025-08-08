@@ -229,17 +229,19 @@ def generate_fwd_figs(buffer, energy_function,
     fig_dict['Lattice Latents Distribution'], latent_klds = simple_cell_hist(sample_batch, buffer_latent_params,
                                                                              n_kde_points=200, bw_ratio=10,
                                                                              mode='latent')
+    fig_dict['Pf vs Reward Distribution'], fig_dict['Pf Reward R Value'] = Pf_vs_R_fig(log_pfs, log_r)
 
     lattice_features = ['cell_a', 'cell_b', 'cell_c',
                         'cell_alpha', 'cell_beta', 'cell_gamma',
                         'aunit_x', 'aunit_y', 'aunit_z',
                         'orientation_1', 'orientation_2', 'orientation_3']
 
-    for ind, feat in enumerate(lattice_features):
-        fig_dict[f'{feat} Cell KLD'] = cell_klds[ind]
-        fig_dict[f'{feat} Latent KLD'] = latent_klds[ind]
-    fig_dict['Mean Cell KLD'] = np.mean(cell_klds)
-    fig_dict['Mean Latent KLD'] = np.mean(latent_klds)
+    if len(cell_klds) == len(lattice_features):
+        for ind, feat in enumerate(lattice_features):
+            fig_dict[f'{feat} Cell KLD'] = cell_klds[ind]
+            fig_dict[f'{feat} Latent KLD'] = latent_klds[ind]
+        fig_dict['Mean Cell KLD'] = np.mean(cell_klds)
+        fig_dict['Mean Latent KLD'] = np.mean(latent_klds)
 
     log_T = len(torch.unique(log_T_tensor)) > 1
     fig_dict['Sample Scatter'] = simple_cell_scatter_fig(
@@ -854,6 +856,7 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
     metrics['Mean Packing Coeff'] = sample_batch.packing_coeff.mean().cpu().detach().item()
     metrics['Packing Coeff'] = sample_batch.packing_coeff.clip(max=2).cpu().detach().numpy()
     metrics['Niggli Overlap'] = sample_batch.niggli_overlap.cpu().detach().numpy()
+    metrics['Niggli Invalid Fraction'] = np.mean(sample_batch.niggli_overlap.cpu().detach().numpy() < 0)
     metrics['Mean ellipsoid_overlap'] = sample_batch['ellipsoid_overlap'].mean().cpu().detach().item()
 
     # conditions
@@ -975,7 +978,7 @@ def Pf_vs_R_fig(pf, log_r):
                     mode='markers',
                     )
     fig.update_layout(xaxis_title='Trajectory Probability', yaxis_title='Terminal Reward')
-    return fig
+    return fig, r_value
 
 
 def Pf_vs_Pb_fig(pf, pb, log_r):

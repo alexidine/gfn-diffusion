@@ -165,7 +165,7 @@ class MolecularCrystal(BaseSet):
         crystal_batch.silu_pot = silu_energy.cpu().detach()
         crystal_batch.lj_pot = silu_energy.cpu().detach()
         crystal_batch.ellipsoid_overlap = ellipsoid_overlap.cpu().detach()
-        crystal_batch.niggli_overlap = cluster_batch.ellipsoid_overlap.cpu().detach()
+        crystal_batch.niggli_overlap = cluster_batch.niggli_overlap.cpu().detach()
         for key in ens_dict.keys():
             setattr(crystal_batch, key, ens_dict[key].cpu().detach())
 

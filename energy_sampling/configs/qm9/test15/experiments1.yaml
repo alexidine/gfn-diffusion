@@ -1,0 +1,538 @@
+defaults:
+  base: base.yaml
+
+
+# to-do with these runs - we are trying to see if we can convince Pf to correlate with log R
+# fwd-only training
+# no buffer training
+# model size, norm, dropout
+# policy variance
+# greedy
+
+# format #_losses_learnvar_modelsize_flexibility_baseline
+# 0_ftb_noPb_var_med_low_med
+# 1_ftb_noPb_var_nonorm_low_med
+# 2_ftb_noPb_var_deep_low_med
+# 3_ftb_noPb_var_shallow_low_med
+# 4_ftb_noPb_novar_med_zero_med
+# 5_ftb_noPb_var_dropout_low_med
+# 6_ftb_noPb_var_med_high_med
+# 7_ftb_noPb_var_med_low_low
+# 8_ftb_noPb_var_med_low_high
+# 9_ftb_Pb_var_med_low_med
+# 10_ftb_noPb_novar_med_zero_low
+# 11_tb_noPb_var_med_low_med
+# 12_tb_Pb_var_med_low_med
+# 13_ftbg_noPb_var_med_low_med
+# 14_ftbg_noPb_var_med_med_med
+# 15_ftbg_noPb_novar_med_zero_med
+# 16_tbg_noPb_var_med_low_med
+# 17_ftbg_noPb_var_dropout_low_med
+
+
+experiments:
+- tag: 0_ftb_noPb_var_med_low_med
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.05
+    log_var_range: 1
+    pb_var_range: 1
+    pb_drift_range: 0.2
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+    bwd_loss_coeffs:
+      tb: 1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    both_ways: False
+    learn_pb: False
+    learned_variance: True
+    exploratory: True
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    energy_static_temperature: 1
+
+- tag: 1_ftb_noPb_var_nonorm_low_med
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: null
+    t_scale: 0.05
+    log_var_range: 1
+    pb_var_range: 1
+    pb_drift_range: 0.2
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+    bwd_loss_coeffs:
+      tb: 1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    both_ways: False
+    learn_pb: False
+    learned_variance: True
+    exploratory: True
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    energy_static_temperature: 1
+- tag: 2_ftb_noPb_var_deep_low_med
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 16
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.05
+    log_var_range: 1
+    pb_var_range: 1
+    pb_drift_range: 0.2
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+    bwd_loss_coeffs:
+      tb: 1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    both_ways: False
+    learn_pb: False
+    learned_variance: True
+    exploratory: True
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    energy_static_temperature: 1
+- tag: 3_ftb_noPb_var_shallow_low_med
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 4
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.05
+    log_var_range: 1
+    pb_var_range: 1
+    pb_drift_range: 0.2
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+    bwd_loss_coeffs:
+      tb: 1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    both_ways: False
+    learn_pb: False
+    learned_variance: True
+    exploratory: True
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    energy_static_temperature: 1
+- tag: 4_ftb_noPb_novar_med_zero_med
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.05
+    log_var_range: 1
+    pb_var_range: 1
+    pb_drift_range: 0.2
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+    bwd_loss_coeffs:
+      tb: 1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    both_ways: False
+    learn_pb: False
+    learned_variance: False
+    exploratory: True
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    energy_static_temperature: 1
+- tag: 5_ftb_noPb_var_dropout_low_med
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0.5
+    norm: layer
+    t_scale: 0.05
+    log_var_range: 1
+    pb_var_range: 1
+    pb_drift_range: 0.2
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+    bwd_loss_coeffs:
+      tb: 1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    both_ways: False
+    learn_pb: False
+    learned_variance: True
+    exploratory: True
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    energy_static_temperature: 1
+- tag: 6_ftb_noPb_var_med_high_med
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.05
+    log_var_range: 6
+    pb_var_range: 6
+    pb_drift_range: 0.2
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+    bwd_loss_coeffs:
+      tb: 1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    both_ways: False
+    learn_pb: False
+    learned_variance: True
+    exploratory: True
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    energy_static_temperature: 1
+- tag: 7_ftb_noPb_var_med_low_low
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.01
+    log_var_range: 1
+    pb_var_range: 1
+    pb_drift_range: 0.2
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+    bwd_loss_coeffs:
+      tb: 1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    both_ways: False
+    learn_pb: False
+    learned_variance: True
+    exploratory: True
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    energy_static_temperature: 1
+- tag: 8_ftb_noPb_var_med_low_high
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.1
+    log_var_range: 1
+    pb_var_range: 1
+    pb_drift_range: 0.2
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+    bwd_loss_coeffs:
+      tb: 1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    both_ways: False
+    learn_pb: False
+    learned_variance: True
+    exploratory: True
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    energy_static_temperature: 1
+- tag: 9_ftb_Pb_var_med_low_med
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.05
+    log_var_range: 1
+    pb_var_range: 1
+    pb_drift_range: 0.2
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+    bwd_loss_coeffs:
+      tb: 1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    both_ways: False
+    learn_pb: True
+    learned_variance: True
+    exploratory: True
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    energy_static_temperature: 1
+- tag: 10_ftb_noPb_novar_med_zero_low
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.01
+    log_var_range: 1
+    pb_var_range: 1
+    pb_drift_range: 0.2
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+    bwd_loss_coeffs:
+      tb: 1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    both_ways: False
+    learn_pb: False
+    learned_variance: False
+    exploratory: True
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    energy_static_temperature: 1
+- tag: 11_tb_noPb_var_med_low_med
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.05
+    log_var_range: 1
+    pb_var_range: 1
+    pb_drift_range: 0.2
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+    bwd_loss_coeffs:
+      tb: 0.1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    both_ways: True
+    learn_pb: False
+    learned_variance: True
+    exploratory: True
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    energy_static_temperature: 1
+- tag: 12_tb_Pb_var_med_low_med
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.05
+    log_var_range: 1
+    pb_var_range: 1
+    pb_drift_range: 0.2
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 0
+    bwd_loss_coeffs:
+      tb: 0.1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    both_ways: True
+    learn_pb: True
+    learned_variance: True
+    exploratory: True
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    energy_static_temperature: 1
+- tag: 13_ftbg_noPb_var_med_low_med
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.05
+    log_var_range: 1
+    pb_var_range: 1
+    pb_drift_range: 0.2
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 1
+    bwd_loss_coeffs:
+      tb: 1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    both_ways: False
+    learn_pb: False
+    learned_variance: True
+    exploratory: True
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    energy_static_temperature: 1
+- tag: 14_ftbg_noPb_var_med_med_med
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.05
+    log_var_range: 3
+    pb_var_range: 3
+    pb_drift_range: 0.2
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 1
+    bwd_loss_coeffs:
+      tb: 1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    both_ways: False
+    learn_pb: False
+    learned_variance: True
+    exploratory: True
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    energy_static_temperature: 1
+- tag: 15_ftbg_noPb_novar_med_zero_med
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.05
+    log_var_range: 1
+    pb_var_range: 1
+    pb_drift_range: 0.2
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 1
+    bwd_loss_coeffs:
+      tb: 1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    both_ways: False
+    learn_pb: False
+    learned_variance: False
+    exploratory: True
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    energy_static_temperature: 1
+- tag: 16_tbg_noPb_var_med_low_med
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0
+    norm: layer
+    t_scale: 0.05
+    log_var_range: 1
+    pb_var_range: 1
+    pb_drift_range: 0.2
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 1
+    bwd_loss_coeffs:
+      tb: 0.1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    both_ways: True
+    learn_pb: False
+    learned_variance: True
+    exploratory: True
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    energy_static_temperature: 1
+- tag: 17_ftbg_noPb_var_dropout_low_med
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.0001
+    max_batch_size: 250
+    repeats: 5
+    joint_layers: 8
+    hidden_dim: 512
+    dropout: 0.5
+    norm: layer
+    t_scale: 0.05
+    log_var_range: 1
+    pb_var_range: 1
+    pb_drift_range: 0.2
+    fwd_loss_coeffs:
+      tb: 1
+      greedy: 1
+    bwd_loss_coeffs:
+      tb: 1
+    buffer_path: null #'/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+    both_ways: False
+    learn_pb: False
+    learned_variance: True
+    exploratory: True
+    exploration_factor: 0.25
+    exploration_wd: True
+    wd_max_steps: 10000
+    energy_static_temperature: 1

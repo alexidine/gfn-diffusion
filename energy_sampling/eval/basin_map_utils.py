@@ -6,11 +6,11 @@ from umap import UMAP
 from matplotlib import cm
 
 
-def agg_cluster(points):
+def agg_cluster(points, linkage='ward', threshold: float = 10.0):
     # clustering
     cluster_model = AgglomerativeClustering(n_clusters=None,
-                                            linkage='ward',
-                                            distance_threshold=10.0)
+                                            linkage=linkage,
+                                            distance_threshold=threshold)
     cluster_labels = cluster_model.fit_predict(points)
     return cluster_labels
 
