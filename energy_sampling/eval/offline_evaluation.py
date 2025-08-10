@@ -197,46 +197,28 @@ if args.show_figs:
 
 # Divergence between lattice distance sets
 js_divs = np.array(sample_csd_lattice_divs(csd_mols, csd_sampling_dict))
-
-dmats = []
-for ind in range(len(csd_mols)):
-    samples = csd_sampling_dict[identifiers[ind]]
-    dens = samples['densities'].flatten()
-    ens =samples['energies'].flatten()
-    std_den = (dens - np.mean(dens))/np.std(dens)
-    std_en = (ens - np.mean(ens))/np.std(ens)
-
-    ref_en = np.array(float(ref_energies[ind]))[None]
-    ref_den = np.array(float(csd_clusters[ind].packing_coeff))[None]
-    std_ref_en = (ref_en - np.mean(ens))/np.std(ens)
-    std_ref_den = (ref_den - np.mean(dens))/np.std(dens)
-
-    scat_dists = cdist(np.stack([std_den, std_en]).T, np.stack([std_ref_den, std_ref_en]).T)
-
-    js_dists = js_divs[ind]
-    import plotly.graph_objects as go
-
-    dmats = []
-    for ind in range(len(csd_mols)):
-        samples = csd_sampling_dict[identifiers[ind]]
-        dens = samples['densities'].flatten()
-        ens = samples['energies'].flatten()
-        std_den = (dens - np.mean(dens)) / np.std(dens)
-        std_en = (ens - np.mean(ens)) / np.std(ens)
-
-        ref_en = np.array(float(ref_energies[ind]))[None]
-        ref_den = np.array(float(csd_clusters[ind].packing_coeff))[None]
-        std_ref_en = (ref_en - np.mean(ens)) / np.std(ens)
-        std_ref_den = (ref_den - np.mean(dens)) / np.std(dens)
-
-        scat_dists = cdist(np.stack([std_den, std_en]).T, np.stack([std_ref_den, std_ref_en]).T)
-
-        js_dists = js_divs[ind]
-        import plotly.graph_objects as go
-
-        go.Figure(
-            go.Scatter(x=scat_dists.flatten(), y=js_dists, mode='markers', marker_color=np.log10(csd_rdf_dists[ind]))).show(
-            renderer='browser', marker_colorscale='viridis')
+#
+# dmats = []
+# for ind in range(len(csd_mols)):
+#     samples = csd_sampling_dict[identifiers[ind]]
+#     dens = samples['densities'].flatten()
+#     ens = samples['energies'].flatten()
+#     std_den = (dens - np.mean(dens)) / np.std(dens)
+#     std_en = (ens - np.mean(ens)) / np.std(ens)
+#
+#     ref_en = np.array(float(ref_energies[ind]))[None]
+#     ref_den = np.array(float(csd_clusters[ind].packing_coeff))[None]
+#     std_ref_en = (ref_en - np.mean(ens)) / np.std(ens)
+#     std_ref_den = (ref_den - np.mean(dens)) / np.std(dens)
+#
+#     scat_dists = cdist(np.stack([std_den, std_en]).T, np.stack([std_ref_den, std_ref_en]).T)
+#
+#     js_dists = js_divs[ind]
+#     import plotly.graph_objects as go
+#
+#     go.Figure(
+#         go.Scatter(x=scat_dists.flatten(), y=js_dists, mode='markers', marker_color=np.log10(csd_rdf_dists[ind]))).show(
+#         renderer='browser', marker_colorscale='viridis')
 
 aa = 1
 

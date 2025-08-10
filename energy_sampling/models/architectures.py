@@ -154,8 +154,6 @@ class StateEncoding(nn.Module):
         return self.x_model(model_inputs)
 
 
-
-
 class PolicyModel(nn.Module):
     def __init__(self, s_dim: int,
                  s_emb_dim: int,
@@ -256,6 +254,7 @@ class LearnableScalar(nn.Module):
 
     def forward(self, *args, **kwargs):
         return self.scalar
+
 
 class NoneModule(nn.Module):
     def __init__(self, device=None):

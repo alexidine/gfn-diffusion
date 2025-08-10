@@ -244,9 +244,9 @@ def generate_fwd_figs(buffer, energy_function,
         fig_dict['Mean Latent KLD'] = np.mean(latent_klds)
 
     log_T = len(torch.unique(log_T_tensor)) > 1
-    fig_dict['Sample Scatter'] = simple_cell_scatter_fig(
+    fig_dict['Sample Scatter'] = simple_cell_scatter_fig(  # todo maybe change colour to cluster id
         sample_batch,
-        sample_cluster_inds,
+        #sample_cluster_inds,
         aux_scalar_name='Log Temp' if log_T else None,
         aux_array=log_T_tensor.cpu().detach().numpy() if log_T else None,
     )
@@ -410,14 +410,16 @@ def embed_samples(ref_samples, ref_rewards, samples, sample_rewards, max_ref_sam
         energies_to_fit = -sample_rewards
 
     # embed the mixed reference + sampled distribution
-    umap_model = UMAP(n_components=2, n_neighbors=30, min_dist=0.01)
+    # todo cluster replace by agglomerative, but keep viz in umap
+    # todo write a beautiful clustering module
+    umap_model = UMAP(n_components=2, n_neighbors=30, min_dist=0.1)
     sample_embedding = umap_model.fit_transform(samples_to_fit)
 
     # fit energy-weighted 2D gaussian kde on the UMAP data
     beta = 0.001
     weights = np.exp(-beta * (energies_to_fit - np.min(energies_to_fit)))  # stabilize exponent
     weights /= weights.sum()
-    kde = gaussian_kde(sample_embedding.T, weights=weights, bw_method=0.1)
+    kde = gaussian_kde(sample_embedding.T, weights=weights, bw_method='scott')
 
     # Evaluate KDE on a 2D grid
     grid_size = 300

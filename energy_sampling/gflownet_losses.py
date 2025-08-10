@@ -67,7 +67,7 @@ def get_gfn_forward_loss(loss_coeffs,
                          buffer,
                          log_T_tensor,
                          exploration_std=None, return_exp=False, condition=None,
-                         repeats=10, reweight_T: Optional[float] = None,
+                         repeats=10,
                          report_losses: bool = False,
                          ):
     if gfn.conditional_flow_model and any([
@@ -332,7 +332,6 @@ def get_gfn_backward_loss(loss_coeffs,
                           condition=None,
                           repeats=10,
                           return_exp=False,
-                          reweight_T: Optional[float] = None,
                           report_losses: bool = False):
     if gfn.conditional_flow_model and any([
         loss_coeffs.vg_lb > 0, loss_coeffs.vg_lme > 0

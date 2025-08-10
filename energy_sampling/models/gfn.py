@@ -73,10 +73,12 @@ class GFN(nn.Module):
         self.s_model = StateEncoding(dim, joint_layers, hidden_dim, condition_embedding_dim, s_emb_dim,
                                      norm=norm, dropout=dropout)
         self.forward_policy = PolicyModel(dim, s_emb_dim, t_dim,
-                                          hidden_dim, joint_layers, 2 * dim, zero_init=zero_init,
+                                          hidden_dim, joint_layers, 2 * dim,
+                                          zero_init=zero_init,
                                           norm=norm, dropout=dropout)
         self.backward_policy = PolicyModel(dim, s_emb_dim, t_dim,
-                                           hidden_dim, joint_layers, 2 * dim, zero_init=zero_init,
+                                           hidden_dim, joint_layers, 2 * dim,
+                                           zero_init=zero_init,
                                            norm=norm, dropout=dropout)
 
         self.pb_drift_range = pb_drift_range

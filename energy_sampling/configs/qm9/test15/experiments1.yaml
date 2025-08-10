@@ -10,25 +10,32 @@ defaults:
 # greedy
 
 # format #_losses_learnvar_modelsize_flexibility_baseline
-# 0_ftb_noPb_var_med_low_med
-# 1_ftb_noPb_var_nonorm_low_med
-# 2_ftb_noPb_var_deep_low_med
-# 3_ftb_noPb_var_shallow_low_med
-# 4_ftb_noPb_novar_med_zero_med
-# 5_ftb_noPb_var_dropout_low_med
-# 6_ftb_noPb_var_med_high_med
-# 7_ftb_noPb_var_med_low_low
-# 8_ftb_noPb_var_med_low_high
-# 9_ftb_Pb_var_med_low_med
-# 10_ftb_noPb_novar_med_zero_low
-# 11_tb_noPb_var_med_low_med
-# 12_tb_Pb_var_med_low_med
-# 13_ftbg_noPb_var_med_low_med
-# 14_ftbg_noPb_var_med_med_med
-# 15_ftbg_noPb_novar_med_zero_med
-# 16_tbg_noPb_var_med_low_med
-# 17_ftbg_noPb_var_dropout_low_med
+# ftb: forward TB only
+# noPb: backward policy not learned
+# novar: No learned variance
+# ftbg: ftb + greedy loss
+# base model is 8x512 conditioner, state model, forward, and backward policy models, with 0 dropout and layer norm
+# 0_ftb_noPb_var_med_low_med - broadly good density and energy. More collapsed early and then searching more (broader sampling distribution) over time. Mean sample energy also increases over time. As this happens, we can see in the Trajectory balance parity plot the diagonal artifact we've seen so many times, with high-energy samples diagonally offset up and to the left, and the R-value getting worse as well. Overall I guess sharp early and then searching more late.
+# 1_ftb_noPb_var_nonorm_low_med - got stuck at ultra dense range and died
+# 2_ftb_noPb_var_deep_low_med - similar general behaviour but it stays much more collapsed and we don't see the energy increasing over time, rather decreasing. and TB parity stays strong. 4 dimensions are hard pinned to their allowed extrema. Curiously bounding energy is zero - might be bugged.
+# 3_ftb_noPb_var_shallow_low_med - worse samples, but also less severe TB parity violations. Otherwise similar.
+# 4_ftb_noPb_novar_med_zero_med - stuck in ultra dense and died
+# 5_ftb_noPb_var_dropout_low_med - more mode collapsed, energies don't increase, better TB parity, somehow higher TB loss though
+# 6_ftb_noPb_var_med_high_med - somehow, worse in every way? Wider variance
+# 7_ftb_noPb_var_med_low_low - dense explosion
+# 8_ftb_noPb_var_med_low_high - better losses, energies, sample variance, AND TB parity. Huh. Kindof beautiful actually
+# 9_ftb_Pb_var_med_low_med - better loss, var stops growing, better energy and TB parity
+# 10_ftb_noPb_novar_med_zero_low - high density explosion
+# 11_tb_noPb_var_med_low_med - (no preloaded buffer) worse samples, higher losses, excellent backward TB parity but terrible forward. Buffer still improving over time. Even with 1.0 fwd tb and 0.1 bwd tb, the bwd seems to dominate. I'm not sure why that would be the case, maybe repeated exposure to the same samples? The KLD with the buffer gets quite small so it's more or less training against the buffer distribution, I guess.
+# 12_tb_Pb_var_med_low_med - similar to 11
+# 13_ftbg_noPb_var_med_low_med - higher densities, slightly higher energies. Limited variance growth (mmore mode collapsed in general. High drift and low var (expected)
+# 14_ftbg_noPb_var_med_med_med - similar to 13, slightly worse maybe
+# 15_ftbg_noPb_novar_med_zero_med - slightly better than 13
+# 16_tbg_noPb_var_med_low_med - bit unstable. Kindof like baseline, but worse energies, better TB parity. Chaotic.
+# 17_ftbg_noPb_var_dropout_low_med - quite different. Energies consistently going down. Very low variance / highly collapsed. Best energies by far.
 
+
+# at no point does Pf highly correlate with R LMAO. Sometimes they correlate a bit and that seems to be good on average
 
 experiments:
 - tag: 0_ftb_noPb_var_med_low_med

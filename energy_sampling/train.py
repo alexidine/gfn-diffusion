@@ -51,7 +51,8 @@ def train_step(energy_function,
                repeats):
     add_to_buffer, do_backward, do_forward, p_forward, report_losses = train_logic(buffer, it)
 
-    discretizer = get_discretizer(args.discretizer)
+    discretizer = get_discretizer(args.traj_length_strategy,
+                                  args.discretizer)
 
     optimizers['flow'].zero_grad()
     if do_forward:
@@ -120,7 +121,7 @@ def train_logic(buffer, it):
         if args.fwd_to_bwd_ratio == 1:
             do_fwd = it % 2 == 0  # always do fwd first
         else:
-            do_fwd = np.random.choice([0, 1], 1, p=[p_forward, 1 - p_forward])
+            do_fwd = np.random.choice([0, 1], 1, p=[1-p_forward, p_forward])
 
         if do_fwd:
             if args.sampling == 'buffer':
@@ -160,13 +161,13 @@ def train_logic(buffer, it):
     return add_to_buffer, do_backward, do_forward, p_forward, report_losses
 
 
-def get_discretizer(discretization_type):
+def get_discretizer(traj_length_strategy, discretization_type):
     # discretizer = lambda bsz: uniform_discretizer(bsz, args.T)
     # discretizer = lambda bsz: uniform_discretizer(bsz, np.random.randint(10,args.T+1))
     # discretizer = lambda bsz: random_discretizer(bsz, args.T, 10)
-    if args.traj_length_strategy == 'static':
+    if traj_length_strategy == 'static':
         traj_length = args.T
-    elif args.traj_length_strategy == 'sampled':
+    elif traj_length_strategy == 'sampled':
         traj_length = np.random.randint(low=args.min_traj_length, high=args.max_traj_length + 1)
     else:
         assert False
@@ -425,7 +426,7 @@ def train():
                 # kk = list(train_metrics.keys())
                 # for key in kk:
                 #     metrics['train_eval/' + key] = train_metrics[key]
-                if step_ind % args.figs_period == 0:  # make conditional sampling figures
+                if step_ind % args.conditional_eval_period == 0:  # make conditional sampling figures
                     conditional_metrics = do_conditional_evaluation(energy_function, gfn_model,
                                                                     test_mol_loader,
                                                                     )

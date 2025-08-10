@@ -157,7 +157,7 @@ class MolecularCrystal(BaseSet):
         cluster_batch.ellipsoid_overlap = ellipsoid_overlap
         cluster_batch.niggli_overlap = compute_niggli_overlap(cluster_batch.cell_parameters())
 
-        crystal_energy, ens_dict = self.generator_energy(cluster_batch)
+        crystal_energy, ens_dict = self.generator_energy(cluster_batch, raw_latents=x)
 
         cluster_batch.gfn_energy = crystal_energy
 
@@ -174,13 +174,16 @@ class MolecularCrystal(BaseSet):
         else:
             return crystal_energy
 
-    def generator_energy(self, cluster_batch):
+    def generator_energy(self, cluster_batch, raw_latents=None):
         ens_dict = {}
         if cluster_batch.device != self.device:
             cluster_batch = cluster_batch.to(self.device)
 
         latents = cluster_batch.cell_params_to_gen_basis()
-        bounding_energy = (F.relu(latents - 6) ** 2 + F.relu(-(latents + 6)) ** 2).sum(dim=-1)  # discourage exploration beyond clip range
+        if raw_latents is not None:
+            bounding_energy = (F.relu(raw_latents - 6) ** 2 + F.relu(-(raw_latents + 6)) ** 2).sum(dim=-1)  # discourage exploration beyond clip range
+        else:
+            bounding_energy = torch.zeros_like(latents[:, 0])
 
         if self.energy_function in ['ellipsoid_overlap', 'silu_energy', 'combo']:
             density_energy = density_penalty(cluster_batch.packing_coeff)
