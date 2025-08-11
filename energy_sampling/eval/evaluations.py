@@ -229,7 +229,8 @@ def generate_fwd_figs(buffer, energy_function,
     fig_dict['Lattice Latents Distribution'], latent_klds = simple_cell_hist(sample_batch, buffer_latent_params,
                                                                              n_kde_points=200, bw_ratio=10,
                                                                              mode='latent')
-    fig_dict['Pf vs Reward Distribution'], fig_dict['Pf Reward R Value'] = Pf_vs_R_fig(log_pfs, log_r)
+    #fig_dict['Pf vs Reward Distribution'], fig_dict['Pf Reward R Value'] = Pf_vs_R_fig(log_pfs, log_r)
+    fig_dict['Pf Parity'], fig_dict['Pf Parity R Value'] = Pf_alignment_fig(log_pfs, log_pbs, log_r, log_fs)
 
     lattice_features = ['cell_a', 'cell_b', 'cell_c',
                         'cell_alpha', 'cell_beta', 'cell_gamma',
@@ -258,7 +259,8 @@ def conditional_fwd_figs(log_fs, log_pbs, log_pfs, log_r,
                          sample_batch, cond_inds,
                          log_T_tensor):
     fig_dict = {}
-    fig_dict['Conditional TB Parity Plot'], _ = conditional_flow_parity_plot(log_r, log_fs[:, 0], log_pbs, log_pfs, cond_inds)
+    fig_dict['Conditional TB Parity Plot'], _ = conditional_flow_parity_plot(log_r, log_fs[:, 0], log_pbs, log_pfs,
+                                                                             cond_inds)
     fig_dict['Conditional VG Error'] = conditional_vargrad_error(log_r, log_pbs,
                                                                  log_pfs, cond_inds)
 
@@ -983,6 +985,24 @@ def Pf_vs_R_fig(pf, log_r):
     return fig, r_value
 
 
+def Pf_alignment_fig(log_pfs, log_pbs, log_r, log_fs):
+    x = log_pfs.sum(-1).cpu().detach().numpy()
+    y = (log_r + log_pbs.sum(-1) - log_fs[:, 0]).cpu().detach().numpy()
+    r_value, _ = pearsonr(x, y)
+
+    fig = go.Figure()
+    fig.add_scatter(x=x,
+                    y=y,
+                    name=f'R = {r_value:.3f}',
+                    showlegend=True,
+                    marker_color=log_r.cpu().detach().numpy(),
+                    marker_colorscale='Jet',
+                    mode='markers',
+                    )
+    fig.update_layout(xaxis_title='Pf(t)', yaxis_title='Pb*R/Z')
+    return fig, r_value
+
+
 def Pf_vs_Pb_fig(pf, pb, log_r):
     if torch.is_tensor(pf):
         x = pf.sum(-1).cpu().detach().numpy()
@@ -1002,6 +1022,7 @@ def Pf_vs_Pb_fig(pf, pb, log_r):
     fig.add_scatter(x=y,
                     y=x,
                     marker_color=color,
+                    marker_colorscale='Jet',
                     name=f'R = {r_value:.3f}',
                     showlegend=True,
                     mode='markers',
@@ -1071,7 +1092,7 @@ def visualize_latent_trajs(states, n_trajs, log_r):
                 marker_line_width=0.5,
                 showlegend=True if i == 0 else False,
                 marker_color=log_r,  #color_hex[j],
-                marker_colorscale='viridis',
+                marker_colorscale='Jet',
             ),
                 row=row, col=col
             )
@@ -1213,7 +1234,7 @@ def conditional_vargrad_error(log_r, log_pbs, log_pfs, cond_inds):
 
         fig.add_trace(go.Violin(
             x=(log_z - log_ratio), side='positive', orientation='h', width=4,
-                showlegend=False, opacity=0.5))
+            showlegend=False, opacity=0.5))
     fig.update_layout(xaxis_title='Log Ratio Error', yaxis_title='Count')
 
     return fig

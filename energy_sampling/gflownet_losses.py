@@ -339,6 +339,9 @@ def get_gfn_backward_loss(loss_coeffs,
         condition = condition.repeat(repeats, 1)
         samples = samples.repeat(repeats, 1)
         log_r = log_r.repeat(repeats)
+        conditional_repeats = True
+    else:
+        conditional_repeats = False
 
     (states, log_pfs, log_pbs, log_fs,
      means_f, logvars_f, means_b, logvars_b) = gfn.get_trajectory_bwd(
@@ -376,7 +379,14 @@ def get_gfn_backward_loss(loss_coeffs,
         losses.append(tb_loss * loss_coeffs.tb * emp_z_coeff)
 
     if loss_coeffs.mle > 0:
-        mle_loss = -power_saturate(log_pf, 0.7)
+        mle_loss = terminal_mle(
+            log_pf, log_pb,
+            repeats,
+            conditional_repeats,
+            estimator='exact' if conditional_repeats else 'bound',
+            dreg=True
+        )
+        #mle_loss = -power_saturate(log_pf, 0.7)
         losses.append(mle_loss * loss_coeffs.mle)
 
     if loss_coeffs.loss_clip != -1:
@@ -406,6 +416,60 @@ def get_gfn_backward_loss(loss_coeffs,
         return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), loss_dict
     else:
         return loss, loss_dict
+
+
+def terminal_mle(
+        log_pf, log_pb,
+        reps: int | None,
+        do_repeats: bool = False,
+        estimator: str = "bound",  # "bound" (Jensen, eq. 28) or "exact" (IWAE, eq. 27)
+        dreg: bool = True,  # use detached responsibilities for "exact"
+):
+    """
+    Returns:
+        loss: scalar tensor
+        stats: dict with diagnostics
+    """
+    if not do_repeats:
+        repeats = 1
+    else:
+        repeats = 1 * reps
+
+    # reshape into [B, K] where B = number of distinct terminals (before repeating)
+    if log_pf.numel() % repeats != 0:
+        raise ValueError(f"log_pf size {log_pf.numel()} not divisible by repeats={repeats}")
+
+    B = log_pf.numel() // repeats
+    log_pf = log_pf.view(B, repeats)
+    log_pb = log_pb.view(B, repeats)
+
+    logw = log_pf - log_pb  # [B, K]  ; log importance weights for each path
+
+    if estimator == "bound":
+        # Eq. (28): E_{τ~Pb}[ log Pf(τ) - log Pb(τ|x) ]  (sample mean over paths)
+        # No importance weights needed; just average over the K samples.
+        loss = -logw.mean(dim=1)  # [B]
+
+        return loss
+
+    elif estimator == "exact":
+        assert do_repeats, "Exact MLE estimator requires minibatch repeats > 1"
+        # Eq. (27): log E_{τ~Pb}[ exp(logw) ] ≈ logsumexp(logw, dim=1) - log K
+        if dreg:
+            # DReG-style gradient: responsibilities detached to tame variance
+            with torch.no_grad():
+                alpha = torch.softmax(logw, dim=1)  # [B, K]
+            # Equivalent gradient to IWAE objective under DReG; stable
+            loss = -((alpha * logw).sum(dim=1))  # [B]
+        else:
+            # Plain IWAE objective (can be higher variance)
+            lse = torch.logsumexp(logw, dim=1)  # [B]
+            loss = -(lse - math.log(repeats))
+
+        return loss
+
+    else:
+        raise ValueError("estimator must be 'bound' or 'exact'")
 
 
 def power_saturate(x, power):
