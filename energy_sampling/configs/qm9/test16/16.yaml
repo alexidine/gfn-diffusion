@@ -84,7 +84,7 @@ lr_flow: 0.1
 lr_policy: 0.0001
 lr_warmup_ratio: 100
 lr_warmup_time: 2000
-max_batch_size: 250
+max_batch_size: 50
 max_traj_length: 40
 min_lr: 1.0e-06
 min_traj_length: 10
@@ -97,7 +97,7 @@ pb_drift_range: 0.2
 pb_var_range: 1
 prioritized: boltzmann
 rank_weight: 1.0
-repeats: 5
+repeats: 10
 repulsion_annealing_max_steps: 5000
 run_name: 17_512x8_random2_mlemle_Pb
 s_emb_dim: 512
