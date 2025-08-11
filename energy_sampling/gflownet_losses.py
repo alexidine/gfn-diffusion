@@ -466,7 +466,7 @@ def terminal_mle(
             lse = torch.logsumexp(logw, dim=1)  # [B]
             loss = -(lse - math.log(repeats))
 
-        return loss
+        return loss.repeat(repeats)
 
     else:
         raise ValueError("estimator must be 'bound' or 'exact'")
