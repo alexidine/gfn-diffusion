@@ -420,12 +420,12 @@ def train():
             torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model.pt')
             if args.molecule_conditioning:
                 # so far not useful
-                # train_metrics = do_evaluation(energy_function, buffer, gfn_model,
-                #                               step_ind, train_mol_loader,
-                #                               override_do_figures=False)
-                # kk = list(train_metrics.keys())
-                # for key in kk:
-                #     metrics['train_eval/' + key] = train_metrics[key]
+                train_metrics = do_evaluation(energy_function, buffer, gfn_model,
+                                              step_ind, train_mol_loader,
+                                              override_do_figures=False)
+                kk = list(train_metrics.keys())
+                for key in kk:
+                    metrics['train_eval/' + key] = train_metrics[key]
                 if step_ind % args.conditional_eval_period == 0:  # make conditional sampling figures
                     conditional_metrics = do_conditional_evaluation(energy_function, gfn_model,
                                                                     test_mol_loader,
