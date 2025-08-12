@@ -79,7 +79,7 @@ class CrystalReplayBuffer:
 
                     far_enough = (min_buffer_dist >= diversity_cutoff).cpu().detach().numpy()
                     existing_rewards = np.array(self.rewards_list)
-                    rewards_cutoff = np.amin(existing_rewards) # - np.ptp(existing_rewards) * 0.1
+                    rewards_cutoff = np.quantile(existing_rewards, 0.2)
                     good_enough = scores >= rewards_cutoff
                     new_x_inds_to_keep = np.argwhere(far_enough * good_enough).flatten().tolist()
                     data_list_to_add = [data_list[ind] for ind in new_x_inds_to_keep]

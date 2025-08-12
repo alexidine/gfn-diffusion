@@ -420,7 +420,7 @@ def get_gfn_backward_loss(loss_coeffs,
 
 def terminal_mle(
         log_pf, log_pb,
-        reps: int | None,
+        reps: int = None,
         do_repeats: bool = False,
         estimator: str = "bound",  # "bound" (Jensen, eq. 28) or "exact" (IWAE, eq. 27)
         dreg: bool = True,  # use detached responsibilities for "exact"
