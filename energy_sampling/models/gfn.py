@@ -133,8 +133,8 @@ class GFN(nn.Module):
                     dts.sqrt().unsqueeze(1) * (pflogvars / 2).exp())
             logpf[:, i] = -0.5 * (noise ** 2 + logtwopi + dts.log().unsqueeze(1) + pflogvars).sum(1)
 
-            back_mean_correction, back_var_correction = self.fwd_get_back_correction(condition_embedding, i, next_state,
-                                                                                     ts)
+            back_mean_correction, back_var_correction = self.fwd_get_back_correction(
+                condition_embedding, i, next_state, ts)
             back_mean = (next_state - next_state * (dts / ts[:, i + 1]).unsqueeze(1) * back_mean_correction)
             if i > 0:  # variance is exactly zero for the first step, so we can't use it
                 # back_var = ((self.pf_std_per_traj ** 2) * (dts * ts[:, i] / ts[:, i + 1]).unsqueeze(
@@ -183,8 +183,9 @@ class GFN(nn.Module):
             dts = ts[:, trajectory_length - i] - ts[:, trajectory_length - i - 1]
 
             if i < trajectory_length - 1:
-                back_mean_correction, back_var_correction = self.bwd_get_correction(condition_embedding, current_state,
-                                                                                    i, trajectory_length, ts)
+                back_mean_correction, back_var_correction\
+                    = self.bwd_get_correction(
+                    condition_embedding, current_state, i, trajectory_length, ts)
 
                 back_mean = (current_state -
                              current_state * (dts / ts[:, trajectory_length - i]).unsqueeze(1) * back_mean_correction)

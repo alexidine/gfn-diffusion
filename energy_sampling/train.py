@@ -25,7 +25,7 @@ from mxtaltools.dataset_utils.utils import collate_data_list
 from utils import get_train_args, get_gfn_init_state, set_seed, \
     get_exploration_std, random_discretizer, low_discrepancy_discretizer, \
     low_discrepancy_discretizer2, shifted_equidistant, uniform_discretizer, \
-    featurize_dataset, embed_dataset, get_conditioning_dim, anneal_reward, set_loss_coeffs
+    featurize_dataset, embed_dataset, get_conditioning_dim, anneal_reward, set_loss_coeffs, sample_crystal_prior
 
 args = get_train_args()
 
@@ -121,7 +121,7 @@ def train_logic(buffer, it):
         if args.fwd_to_bwd_ratio == 1:
             do_fwd = it % 2 == 0  # always do fwd first
         else:
-            do_fwd = np.random.choice([0, 1], 1, p=[1-p_forward, p_forward])
+            do_fwd = np.random.choice([0, 1], 1, p=[1 - p_forward, p_forward])
 
         if do_fwd:
             if args.sampling == 'buffer':
@@ -212,7 +212,6 @@ def bwd_train_step(gfn_model, discretizer, buffer, energy_function, repeats: int
                    return_exp=False, report_losses: bool = False):
     if args.sampling == 'buffer':
         samples, rewards, crystal_batch, condition = buffer.sample(
-            return_conditioning=True,
             override_batch=int(buffer.batch_size * args.bwd_batch_multiplier))
     else:
         assert False, f"sampling method {args.sampling} not implemented"
@@ -234,31 +233,7 @@ def substitute_prior(condition, crystal_batch, energy_function, rewards, samples
     loss_coeffs = args.bwd_loss_coeffs
     if loss_coeffs.mle_prior_fraction > 0:  # todo change variable name to 'buffer_noise_fraction'
         # replace buffer samples with a random prior
-        rands = torch.randn((crystal_batch.num_graphs, 12), device=crystal_batch.device)
-
-        # enforce the random prior is in the positive niggli plane
-        temp_params = crystal_batch.latent_transform.inverse(rands,
-                                                             crystal_batch.sg_ind,
-                                                             crystal_batch.radius)
-        cell_lengths = temp_params[:, :3]
-        cell_angles = temp_params[:, 3:6]
-
-        # rescale cell lengths for a good packing coeff
-        target_packing_coeff = (torch.randn(crystal_batch.num_graphs, device=crystal_batch.device) * 0.075 + 0.65).clip(
-            min=0.55, max=0.95)
-        vol1 = batch_cell_vol_torch(cell_lengths, cell_angles)
-        cp1 = crystal_batch.mol_volume * crystal_batch.sym_mult / vol1
-        correction_ratio = (cp1 / target_packing_coeff) ** (1 / 3)
-        cell_lengths *= correction_ratio[:, None]
-
-        # enforce positive side of niggli plane
-        cell_angles = enforce_niggli_plane(cell_lengths, cell_angles, mode='mirror')
-        temp_params[:, 3:6] = cell_angles
-
-        prior_samples = crystal_batch.latent_transform.forward(temp_params,
-                                                               crystal_batch.sg_ind,
-                                                               crystal_batch.radius
-                                                               ).clip(min=-6, max=6)
+        prior_samples = sample_crystal_prior(crystal_batch, args.bwd_loss_coeffs.pmle_std)
 
         if loss_coeffs.mle_prior_fraction < 1:
             num_to_replace = max(1, int(len(samples) * loss_coeffs.mle_prior_fraction))
@@ -606,8 +581,10 @@ def init_buffers_datasets(energy_function):
         assert False
 
     if args.molecule_conditioning:
-        train_mols_list = embed_dataset(train_mols_list, args.autoencoder_path, args.device, encoder=None)
-        test_mols_list = embed_dataset(test_mols_list, args.autoencoder_path, args.device, encoder=None)
+        train_mols_list = embed_dataset(train_mols_list, args.autoencoder_path, args.device, encoder=None,
+                                        embedding_type=args.mol_embedding_type)
+        test_mols_list = embed_dataset(test_mols_list, args.autoencoder_path, args.device, encoder=None,
+                                       embedding_type=args.mol_embedding_type)
 
     train_mol_loader = DataLoader(
         train_mols_list,
@@ -801,6 +778,8 @@ def add_dataset_to_buffer(dataset_path, buffer):
 def get_annealing_factor(start_value, stop_value, total_time, step_iters):
     assert stop_value > 0, "Setting final value as zero breaks this module"
     return (stop_value / start_value) ** (1 / (total_time / step_iters))
+
+
 
 
 if __name__ == '__main__':

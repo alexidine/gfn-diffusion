@@ -17,7 +17,7 @@ from skimage.segmentation import watershed
 from umap import UMAP
 
 from energy_sampling.eval.utils import log_partition_function, get_plotly_fig_size_mb
-from energy_sampling.utils import logmeanexp
+from energy_sampling.utils import logmeanexp, sample_crystal_prior
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.reporting.figures import simple_cell_hist, simple_cell_scatter_fig, \
     log_crystal_samples, conditional_simple_cell_hist
@@ -162,6 +162,91 @@ def generate_fwd_figs(buffer, energy_function,
     buffer_cell_params, buffer_latent_params, buffer_std_params, buffer_reward, buffer_batch = get_buffer_stats(buffer)
     std_cell_params = sample_batch.cell_params_to_gen_basis().cpu().detach()
 
+    known_mode_coverage(energy_function, fig_dict, std_cell_params)
+
+    # rewrite this - it's way too slow
+    # (sample_embedding, anchor_embedding,
+    #  anchor_states, sample_cluster_inds,
+    #  anchor_energies, all_energies, buffer_cluster_inds,
+    #  watershed_idx, watershed_range) = embed_samples(
+    #     buffer_std_params,
+    #     buffer_reward,
+    #     std_cell_params.cpu().detach().numpy(),
+    #     log_r.cpu().detach().numpy(),
+    #     max_ref_samples=500
+    # )
+    # fig_dict['Sample Embedding'] = cluster_fig(sample_embedding, anchor_embedding, sample_cluster_inds, anchor_energies,
+    #                                            all_energies, 'cluster', watershed_idx, watershed_range)
+    # fig_dict['Sample Embedding w Energy'] = cluster_fig(sample_embedding, anchor_embedding, sample_cluster_inds,
+    #                                                     anchor_energies, all_energies, 'energy', watershed_idx,
+    #                                                     watershed_range)
+    # # coverage metrics
+    # fig_dict['Num Sample Clusters'] = np.sum(np.unique(sample_cluster_inds) >= 0)
+    # fig_dict['Num Buffer Clusters'] = np.sum(np.unique(buffer_cluster_inds) >= 0)
+    #
+    # fig = cluster_hist_fig(sample_cluster_inds)
+    # fig_dict['Cluster Hist'] = fig
+
+    try:
+        fig_dict['Boltzmann Fit'] = boltzmann_fig(log_r)
+    except:  # some issues in the above I don't care to fix
+        pass
+
+    # todo rewrite this for general conditioning
+    # if energy_function.temperature_conditioning:
+    #     fig_dict['temp/Learned Z vs T'] = Z_vs_T_fig(gfn_model, init_state)
+    #     fig_dict['temp/T vs Energy'] = T_vs_E_fig(condition, sample_batch)
+    traj_param_logging(f_means_b, f_means_f, f_vars_b, f_vars_f, fig_dict, flow_states, log_pbs, log_pfs, log_r)
+    fig_dict['TB Parity Plot'], fig_dict['Forward TB R Value'] = flow_parity_plot(log_r, log_fs[:, 0], log_pbs, log_pfs)
+    fig_dict['VG Error'] = vargrad_error(log_r, log_pbs, log_pfs)  # todo tune this up for conditional modelling
+    fig_dict['Lattice Latents Trajectories'] = visualize_latent_trajs(flow_states.cpu().detach().numpy(),
+                                                                      20,
+                                                                      log_r.cpu().detach().numpy())
+    fig_dict['Lattice Features Distribution'], cell_klds = simple_cell_hist(sample_batch, buffer_cell_params,
+                                                                            n_kde_points=200, bw_ratio=10, mode='cell')
+    fig_dict['Lattice Latents Distribution'], latent_klds = simple_cell_hist(sample_batch, buffer_latent_params,
+                                                                             n_kde_points=200, bw_ratio=10,
+                                                                             mode='latent')
+    fig_dict['Pf Parity'], fig_dict['Pf Parity R Value'] = Pf_alignment_fig(log_pfs, log_pbs, log_r, log_fs)
+
+    log_buffer_kld(cell_klds, fig_dict, latent_klds)
+
+    log_T = len(torch.unique(log_T_tensor)) > 1
+    fig_dict['Sample Scatter'] = simple_cell_scatter_fig(  # todo maybe change colour to cluster id
+        sample_batch,
+        #sample_cluster_inds,
+        aux_scalar_name='Log Temp' if log_T else None,
+        aux_array=log_T_tensor.cpu().detach().numpy() if log_T else None,
+    )
+
+    return fig_dict
+
+
+def traj_param_logging(f_means_b, f_means_f, f_vars_b, f_vars_f, fig_dict, flow_states, log_pbs, log_pfs, log_r):
+    fig_dict['Forward Gauss Params'] = mean_var_fig(f_vars_f, f_means_f,
+                                                    f_vars_b, f_means_b)
+    fig_dict['Mean Fwd F Drift'] = f_means_f.abs().mean()
+    fig_dict['Mean Fwd B Drift'] = f_means_b.abs().mean()
+    fig_dict['Mean Fwd F Var'] = f_vars_f.mean()
+    fig_dict['Mean Fwd B Var'] = f_vars_b.mean()
+    fig_dict['Traj Mean Step Sizes'] = mean_flow_step_sizes(flow_states)
+    fig_dict['Pf vs Pb'] = Pf_vs_Pb_fig(log_pfs, log_pbs, log_r)
+
+
+def log_buffer_kld(cell_klds, fig_dict, latent_klds):
+    lattice_features = ['cell_a', 'cell_b', 'cell_c',
+                        'cell_alpha', 'cell_beta', 'cell_gamma',
+                        'aunit_x', 'aunit_y', 'aunit_z',
+                        'orientation_1', 'orientation_2', 'orientation_3']
+    if len(cell_klds) == len(lattice_features):
+        for ind, feat in enumerate(lattice_features):
+            fig_dict[f'{feat} Cell KLD'] = cell_klds[ind]
+            fig_dict[f'{feat} Latent KLD'] = latent_klds[ind]
+        fig_dict['Mean Cell KLD'] = np.mean(cell_klds)
+        fig_dict['Mean Latent KLD'] = np.mean(latent_klds)
+
+
+def known_mode_coverage(energy_function, fig_dict, std_cell_params):
     # for some toy problems, we save the solution in the energy function
     known_modes = energy_function.crystal_modes.detach().cpu().numpy() if hasattr(energy_function, 'modes') else None
     if known_modes is not None:
@@ -179,80 +264,6 @@ def generate_fwd_figs(buffer, energy_function,
         coverage_per_mode = kernel_vals.max(dim=0).values  # [num_modes]
 
         fig_dict['Soft Mode Coverage'] = coverage_per_mode.mean()
-
-    (sample_embedding, anchor_embedding,
-     anchor_states, sample_cluster_inds,
-     anchor_energies, all_energies, buffer_cluster_inds,
-     watershed_idx, watershed_range) = embed_samples(
-        buffer_std_params,
-        buffer_reward,
-        std_cell_params.cpu().detach().numpy(),
-        log_r.cpu().detach().numpy(),
-        max_ref_samples=500
-    )
-    try:
-        fig_dict['Boltzmann Fit'] = boltzmann_fig(log_r)
-    except:  # some issues in the above I don't care to fix
-        pass
-    fig_dict['Sample Embedding'] = cluster_fig(sample_embedding, anchor_embedding, sample_cluster_inds, anchor_energies,
-                                               all_energies, 'cluster', watershed_idx, watershed_range)
-    fig_dict['Sample Embedding w Energy'] = cluster_fig(sample_embedding, anchor_embedding, sample_cluster_inds,
-                                                        anchor_energies, all_energies, 'energy', watershed_idx,
-                                                        watershed_range)
-
-    # coverage metrics
-    fig_dict['Num Sample Clusters'] = np.sum(np.unique(sample_cluster_inds) >= 0)
-    fig_dict['Num Buffer Clusters'] = np.sum(np.unique(buffer_cluster_inds) >= 0)
-
-    fig = cluster_hist_fig(sample_cluster_inds)
-    fig_dict['Cluster Hist'] = fig
-
-    # todo rewrite this for general conditioning
-    # if energy_function.temperature_conditioning:
-    #     fig_dict['temp/Learned Z vs T'] = Z_vs_T_fig(gfn_model, init_state)
-    #     fig_dict['temp/T vs Energy'] = T_vs_E_fig(condition, sample_batch)
-    fig_dict['Forward Gauss Params'] = mean_var_fig(f_vars_f, f_means_f,
-                                                    f_vars_b, f_means_b)
-    fig_dict['Mean Fwd F Drift'] = f_means_f.abs().mean()
-    fig_dict['Mean Fwd B Drift'] = f_means_b.abs().mean()
-    fig_dict['Mean Fwd F Var'] = f_vars_f.mean()
-    fig_dict['Mean Fwd B Var'] = f_vars_b.mean()
-    fig_dict['Traj Mean Step Sizes'] = mean_flow_step_sizes(flow_states)
-    fig_dict['Pf vs Pb'] = Pf_vs_Pb_fig(log_pfs, log_pbs, log_r)
-    fig_dict['TB Parity Plot'], fig_dict['Forward TB R Value'] = flow_parity_plot(log_r, log_fs[:, 0], log_pbs, log_pfs)
-    fig_dict['VG Error'] = vargrad_error(log_r, log_pbs, log_pfs)  # todo tune this up for conditional modelling
-    fig_dict['Lattice Latents Trajectories'] = visualize_latent_trajs(flow_states.cpu().detach().numpy(),
-                                                                      20,
-                                                                      log_r.cpu().detach().numpy())
-    fig_dict['Lattice Features Distribution'], cell_klds = simple_cell_hist(sample_batch, buffer_cell_params,
-                                                                            n_kde_points=200, bw_ratio=10, mode='cell')
-    fig_dict['Lattice Latents Distribution'], latent_klds = simple_cell_hist(sample_batch, buffer_latent_params,
-                                                                             n_kde_points=200, bw_ratio=10,
-                                                                             mode='latent')
-    #fig_dict['Pf vs Reward Distribution'], fig_dict['Pf Reward R Value'] = Pf_vs_R_fig(log_pfs, log_r)
-    fig_dict['Pf Parity'], fig_dict['Pf Parity R Value'] = Pf_alignment_fig(log_pfs, log_pbs, log_r, log_fs)
-
-    lattice_features = ['cell_a', 'cell_b', 'cell_c',
-                        'cell_alpha', 'cell_beta', 'cell_gamma',
-                        'aunit_x', 'aunit_y', 'aunit_z',
-                        'orientation_1', 'orientation_2', 'orientation_3']
-
-    if len(cell_klds) == len(lattice_features):
-        for ind, feat in enumerate(lattice_features):
-            fig_dict[f'{feat} Cell KLD'] = cell_klds[ind]
-            fig_dict[f'{feat} Latent KLD'] = latent_klds[ind]
-        fig_dict['Mean Cell KLD'] = np.mean(cell_klds)
-        fig_dict['Mean Latent KLD'] = np.mean(latent_klds)
-
-    log_T = len(torch.unique(log_T_tensor)) > 1
-    fig_dict['Sample Scatter'] = simple_cell_scatter_fig(  # todo maybe change colour to cluster id
-        sample_batch,
-        #sample_cluster_inds,
-        aux_scalar_name='Log Temp' if log_T else None,
-        aux_array=log_T_tensor.cpu().detach().numpy() if log_T else None,
-    )
-
-    return fig_dict
 
 
 def conditional_fwd_figs(log_fs, log_pbs, log_pfs, log_r,
@@ -777,8 +788,8 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
 
 def generate_bwd_figs(fig_dict, buffer, gfn_model, init_state, discretizer):
     terminal_state, b_log_r, crystal_batch, condition = buffer.sample(
-        return_conditioning=True,
-        override_batch=len(init_state))
+        override_batch=len(init_state),
+    override_sampler=None)
     (backward_flow_states, b_log_pfs, b_log_pbs, b_log_fs,
      b_means_f, b_vars_f, b_means_b, b_vars_b) = gfn_model.get_trajectory_bwd(
         terminal_state.to(gfn_model.device), discretizer, condition.to(gfn_model.device), return_gauss_params=True)
@@ -813,8 +824,8 @@ def get_buffer_stats(buffer):
     if len(buffer) > 0:
         samples_to_take = min(10000, len(buffer))
         # take samples according to the sampler weighting, rather than random trash in the buffer
-        buffer_latent_params, buffer_reward, buffer_batch = buffer.sample(
-            temperature=torch.ones(samples_to_take), override_batch=samples_to_take)
+        buffer_latent_params, buffer_reward, buffer_batch, condition = buffer.sample(
+            override_batch=samples_to_take, override_sampler=None)
         buffer_cell_params = buffer_batch.cell_parameters().cpu().detach().numpy()
         buffer_latent_params = buffer_batch.cell_params_to_gen_basis().cpu().detach().numpy()
         buffer_std_params_for_embedding = buffer_batch.cell_params_to_gen_basis().cpu().detach().numpy()
@@ -932,7 +943,24 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
             ])
             metrics['Buffer Mean Score'] = np.mean(buffer.rewards_list)
 
+    if buffer is not None:
+        prior_sample, _, _, _ = buffer.sample(override_batch=len(std_params), override_sampler=None)
+    else:
+        prior_sample = sample_crystal_prior(sample_batch, args.bwd_loss_coeffs.pmle_std)
+
+    prior_coverage = get_dimwise_coverage(std_params, prior_sample.to('cpu'),
+                                          n_bins=24, cmin=1, tau=100)
+    lattice_features = ['cell_a', 'cell_b', 'cell_c',
+                        'cell_alpha', 'cell_beta', 'cell_gamma',
+                        'aunit_x', 'aunit_y', 'aunit_z',
+                        'orientation_1', 'orientation_2', 'orientation_3']
+    for ind, thing in enumerate(lattice_features):
+        metrics[f'{thing} coverage'] = prior_coverage[ind].item()
+
+    metrics['Minium 1d coverage'] = torch.amin(prior_coverage).item()
+
     metrics = {k: to_loggable(v) for k, v in metrics.items()}
+
     return metrics
 
 
@@ -1287,3 +1315,34 @@ fig.update_layout(
 fig.show()
 
 '''
+
+
+def get_dimwise_coverage(test_samples, ref_samples, n_bins=24, tau=10, cmin=1):
+    device = test_samples.device
+    N, D = test_samples.shape
+    q = torch.linspace(0, 1, n_bins + 1, device=device)
+    edges = torch.empty(D, n_bins + 1, device=device)
+    for j in range(D):
+        edges[j] = torch.quantile(ref_samples[:, j], q)
+
+    interior = edges[:, 1:-1]  # [D, B-1]
+    per_dim_cov = torch.empty(D, device=device)
+    expected = N / n_bins
+    thresh = max(cmin, expected / tau)
+
+    for j in range(D):
+        idx = torch.bucketize(test_samples[:, j], interior[j], right=False)
+        # idx in [0, B-1]
+        counts = torch.bincount(idx, minlength=n_bins)
+        covered = (counts >= thresh).float().mean()  # fraction of bins covered
+        per_dim_cov[j] = covered
+
+    ref_cov = torch.empty(D, device=device)
+    for j in range(D):
+        idx = torch.bucketize(ref_samples[:, j], interior[j], right=False)
+        # idx in [0, B-1]
+        counts = torch.bincount(idx, minlength=n_bins)
+        covered = (counts >= thresh).float().mean()  # fraction of bins covered
+        ref_cov[j] = covered
+
+    return (per_dim_cov / ref_cov.clip(min=0.01)).clip(min=0, max=1)

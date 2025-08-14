@@ -17,6 +17,8 @@ from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
 from mxtaltools.common.config_processing import dict2namespace
+from mxtaltools.common.geometry_utils import batch_molecule_principal_axes_torch, batch_cell_vol_torch
+from mxtaltools.crystal_building.crystal_latent_transforms import enforce_niggli_plane
 from mxtaltools.models.utils import load_encoder
 
 
@@ -351,7 +353,7 @@ def featurize_dataset(dataset, device, ellipsoid_scale, lj_repulsion):
     return dataset
 
 
-def embed_dataset(dataset, autoencoder_path=None, device=None, encoder=None):
+def embed_dataset(dataset, autoencoder_path=None, device=None, encoder=None, embedding_type='autoencoder'):
     batch_size = 500
     loader = DataLoader(
         dataset,
@@ -359,7 +361,7 @@ def embed_dataset(dataset, autoencoder_path=None, device=None, encoder=None):
         drop_last=False
     )
     with torch.no_grad():
-        if encoder is None:
+        if encoder is None and embedding_type == 'autoencoder':
             encoder = load_encoder(autoencoder_path).to(device).eval()
 
         embeddings = []
@@ -371,7 +373,17 @@ def embed_dataset(dataset, autoencoder_path=None, device=None, encoder=None):
             crystal_batch.orient_molecule(mode='standardized',
                                           target_handedness=torch.ones_like(crystal_batch.radius)
                                           )
-            embeddings.append(encoder.encode(crystal_batch).clone().cpu())
+            if embedding_type == 'autoencoder':
+                embeddings.append(encoder.encode(crystal_batch).clone().cpu())
+            elif embedding_type == 'principal_axes':
+                v_embedding_i, s_embedding_i, _ = batch_molecule_principal_axes_torch(
+                    crystal_batch.pos,
+                    crystal_batch.batch,
+                    crystal_batch.num_graphs,
+                    crystal_batch.num_atoms,
+                )
+                embeddings.append(v_embedding_i * s_embedding_i[:, :, None].clone().cpu())
+
             del crystal_batch
 
         embeddings = torch.cat(embeddings, dim=0)
@@ -386,7 +398,12 @@ def get_conditioning_dim(args):
     if args.temperature_conditioning:
         conditioning_dim += 1
     if args.molecule_conditioning:
-        conditioning_dim += 64 * 3
+        if args.mol_embedding_type == 'autoencodoer':
+            conditioning_dim += 64 * 3
+        elif args.mol_embedding_type == 'principal_axes':
+            conditioning_dim += 9
+        else:
+            assert False
     if args.sg_conditioning:
         conditioning_dim += 237
     return conditioning_dim
@@ -510,3 +527,35 @@ def update_loss_schedule(it, loss_schedules, active_coeffs):
     """Update active coefficients based on current iteration and schedules"""
     for key, schedule in loss_schedules.items():
         active_coeffs[key] = evaluate_schedule(it, schedule)
+
+
+def sample_crystal_prior(crystal_batch, std):
+    rands = torch.randn((crystal_batch.num_graphs, 12), device=crystal_batch.device) * std
+
+    # enforce the random prior is in the positive niggli plane
+    if not hasattr(crystal_batch, 'latent_transform'):
+        crystal_batch.init_latent_transform()
+    temp_params = crystal_batch.latent_transform.inverse(rands,
+                                                         crystal_batch.sg_ind,
+                                                         crystal_batch.radius)
+    cell_lengths = temp_params[:, :3]
+    cell_angles = temp_params[:, 3:6]
+
+    # rescale cell lengths for a good packing coeff
+    target_packing_coeff = (torch.randn(crystal_batch.num_graphs, device=crystal_batch.device) * 0.075 + 0.65).clip(
+        min=0.55, max=0.95)
+    vol1 = batch_cell_vol_torch(cell_lengths, cell_angles)
+    cp1 = crystal_batch.mol_volume * crystal_batch.sym_mult / vol1
+    correction_ratio = (cp1 / target_packing_coeff) ** (1 / 3)
+    cell_lengths *= correction_ratio[:, None]
+
+    # enforce positive side of niggli plane
+    cell_angles = enforce_niggli_plane(cell_lengths, cell_angles, mode='mirror')
+    temp_params[:, 3:6] = cell_angles
+
+    prior_samples = crystal_batch.latent_transform.forward(temp_params,
+                                                           crystal_batch.sg_ind,
+                                                           crystal_batch.radius
+                                                           ).clip(min=-6, max=6)
+
+    return prior_samples

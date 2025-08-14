@@ -471,6 +471,6 @@ def clean_batch(batch):
                 setattr(batch, key, [v.detach().cpu() for v in val])
         except Exception:
             continue  # ignore protected or bad attrs
-
+    del batch.asym_unit_dict, batch.latent_transform
     return batch
 

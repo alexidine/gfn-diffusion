@@ -122,17 +122,27 @@ class CrystalReplayBuffer:
         else:
             return len(self.dataset)
 
-    def sample_indices(self, batch_size, replace: bool, diversity_coeff: float):
+    def sample_indices(self, batch_size,
+                       replace: bool,
+                       diversity_coeff: float,
+                       override_method: Optional[str] = None):
         inds = np.random.choice(len(self),
                                 size=batch_size,
                                 replace=replace,
                                 p=self.get_sampler_weights(diversity_coeff=diversity_coeff,
+                                                           override_method=override_method,
                                                            ))
         return inds
 
     def get_sampler_weights(self,
                             diversity_coeff,
-                            eps: float = 1e-6):
+                            eps: float = 1e-6,
+                            override_method: Optional[str] = None):
+        if override_method is not None:
+            method = override_method
+        else:
+            method = self.prioritized
+
         scores = np.array(self.rewards_list)
         if diversity_coeff > 0:
             x_tensor = torch.stack(self.x_list).to('cuda' if self.gpu_available else 'cpu')
@@ -147,10 +157,10 @@ class CrystalReplayBuffer:
                                                                      ga=0.1,
                                                                      agg='sum')).cpu().detach().numpy() - 1)  # subtract self contribution
 
-        if self.prioritized == 'rank':
+        if method == 'rank':
             ranks = np.argsort(np.argsort(-1 * scores))
             weights_i = 1.0 / (self.rank_weight * len(scores) + ranks)
-        elif self.prioritized == 'boltzmann':
+        elif method == 'boltzmann':
             logits = scores / self.beta
             logits -= np.max(logits)  # subtract max for stability
             weights_i = np.nan_to_num(np.exp(logits)) + eps  # all samples need nonzero probability
@@ -161,13 +171,10 @@ class CrystalReplayBuffer:
 
     @torch.no_grad()
     def sample(self,
-               temperature: Optional[torch.tensor] = None,
-               return_conditioning: Optional[bool] = False,
                override_batch: Optional[int] = None,
-               return_preload: Optional[bool] = False):
-
-        assert return_conditioning or (
-                temperature is not None), "Must provide temperature or generate it here with return_conditioning=True"
+               return_preload: Optional[bool] = False,
+               override_sampler: Optional[str] = None
+               ):
 
         if override_batch is not None:
             batch_size = override_batch
@@ -182,9 +189,9 @@ class CrystalReplayBuffer:
                 rand_inds = np.arange(len(self))
                 missing_len = batch_size - len(self)
                 rand_inds = np.concatenate(
-                    [rand_inds, self.sample_indices(missing_len, replace=True, diversity_coeff=self.diversity_coeff)])
+                    [rand_inds, self.sample_indices(missing_len, replace=True, diversity_coeff=self.diversity_coeff, override_method=override_sampler)])
             else:
-                rand_inds = self.sample_indices(batch_size, replace=False, diversity_coeff=self.diversity_coeff)
+                rand_inds = self.sample_indices(batch_size, replace=False, diversity_coeff=self.diversity_coeff, override_method=override_sampler)
 
         sample = collate_data_list([self.dataset[ind] for ind in rand_inds])
 
@@ -196,7 +203,5 @@ class CrystalReplayBuffer:
             reward = self.energy_function.prebuilt_sample_to_reward(
                 sample, temperature)  # recompute reward in case parameters have changed
 
-        if return_conditioning:
-            return sample.cell_params_to_gen_basis(), reward, sample, condition
-        else:
-            return sample.cell_params_to_gen_basis(), reward, sample
+        return sample.cell_params_to_gen_basis(), reward, sample, condition
+
