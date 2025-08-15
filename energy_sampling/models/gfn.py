@@ -110,7 +110,7 @@ class GFN(nn.Module):
         ts = discretizer(batch_size).to(self.device)
         trajectory_length = ts.shape[1] - 1
 
-        logf, logpb, logpf, states, means_f, logvars_f, means_b, logvars_b = self.init_traj_tensors(batch_size,
+        logpb, logpf, states, means_f, logvars_f, means_b, logvars_b = self.init_traj_tensors(batch_size,
                                                                                                     trajectory_length)
 
         initial_state.requires_grad_(not detach_traj)
@@ -119,7 +119,7 @@ class GFN(nn.Module):
 
         condition_embedding = self.conditions_embedding_model(condition)
 
-        logf[:, 0] = self.flow_model(condition_embedding).squeeze(-1).squeeze(-1)
+        logf = self.flow_model(condition_embedding).flatten()
 
         for i in range(trajectory_length):
             dts = ts[:, i + 1] - ts[:, i]
@@ -131,8 +131,8 @@ class GFN(nn.Module):
 
             noise = ((next_state - current_state) - dts.unsqueeze(1) * pf_mean) / (
                     dts.sqrt().unsqueeze(1) * (pflogvars / 2).exp())
-            logpf[:, i] = -0.5 * (noise ** 2 + logtwopi + dts.log().unsqueeze(1) + pflogvars).sum(1)
-
+            #logpf[:, i] = -0.5 * (noise ** 2 + logtwopi + dts.log().unsqueeze(1) + pflogvars).sum(1)
+            logpf.append(-0.5 * (noise ** 2 + logtwopi + dts.log().unsqueeze(1) + pflogvars).sum(1))
             back_mean_correction, back_var_correction = self.fwd_get_back_correction(
                 condition_embedding, i, next_state, ts)
             back_mean = (next_state - next_state * (dts / ts[:, i + 1]).unsqueeze(1) * back_mean_correction)
@@ -142,7 +142,8 @@ class GFN(nn.Module):
                 var = (back_var_correction + np.log(self.pf_std_per_traj) * 2.0).clip(min=-self.var_clip, max=self.var_clip).exp()
                 back_var = var * (dts * ts[:, i] / ts[:, i + 1]).unsqueeze(1)
                 noise_backward = (current_state - back_mean) / back_var.sqrt()
-                logpb[:, i] = -0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1)
+                #logpb[:, i] = -0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1)
+                logpb.append(-0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1))
             else:  # instead set this as a constant the model will have to learn around
                 back_var = torch.ones_like(back_mean) * 1e-3 * dts.unsqueeze(1)
 
@@ -150,17 +151,19 @@ class GFN(nn.Module):
             states[:, i + 1] = current_state
 
             if return_gauss_params:
-                means_b[:, i, :] = back_mean - current_state
-                logvars_b[:, i, :] = (back_var / dts[:, None]).log()
-                means_f[:, i, :] = pf_mean * dts[:, None]
-                logvars_f[:, i, :] = pflogvars
+                means_b[:, i, :] = (back_mean - current_state).detach()
+                logvars_b[:, i, :] = (back_var / dts[:, None]).log().detach()
+                means_f[:, i, :] = (pf_mean * dts[:, None]).detach()
+                logvars_f[:, i, :] = pflogvars.detach()
 
+        logpfs = torch.stack(logpf).T
+        logpbs = torch.stack(logpb).T
         if return_gauss_params:
-            return (states, logpf, logpb, logf,
+            return (states, logpfs, logpbs, logf,
                     means_f.mean(-1), logvars_f.mean(-1),
                     means_b.mean(-1), logvars_b.mean(-1))
         else:
-            return states, logpf, logpb, logf
+            return states, logpfs, logpbs, logf
 
     def get_trajectory_bwd(self, terminal_state, discretizer, condition,
                            return_gauss_params: bool = False, detach_traj: bool = False):
@@ -169,15 +172,15 @@ class GFN(nn.Module):
         ts = discretizer(batch_size).to(self.device)
         trajectory_length = ts.shape[1] - 1
 
-        logf, logpb, logpf, states, means_f, logvars_f, means_b, logvars_b = self.init_traj_tensors(batch_size,
+        logpb, logpf, states, means_f, logvars_f, means_b, logvars_b = self.init_traj_tensors(batch_size,
                                                                                                     trajectory_length)
 
-        states[:, -1] = terminal_state.detach().clone()
-        current_state = terminal_state.detach().clone()
+        states[:, -1] = terminal_state.detach()
+        current_state = terminal_state.detach()
         condition_embedding = self.conditions_embedding_model(condition)
 
-        flow = self.flow_model(condition_embedding).squeeze(-1).squeeze(-1)
-        logf[:, 0] = flow
+        logf = self.flow_model(condition_embedding).flatten()
+        log_var_base = 2.0 * math.log(float(self.pf_std_per_traj))
 
         for i in range(trajectory_length):
             dts = ts[:, trajectory_length - i] - ts[:, trajectory_length - i - 1]
@@ -192,11 +195,12 @@ class GFN(nn.Module):
                 # back_var = ((self.pf_std_per_traj ** 2) *
                 #             (dts * ts[:, trajectory_length - i - 1] / ts[:, trajectory_length - i]).unsqueeze(
                 #                 1) * back_var_correction)
-                var = (back_var_correction + np.log(self.pf_std_per_traj) * 2.0).clip(min=-self.var_clip, max=self.var_clip).exp()
+                var = (back_var_correction + log_var_base).clip(min=-self.var_clip, max=self.var_clip).exp()
                 back_var = var * (dts * ts[:, trajectory_length - i - 1] / ts[:, trajectory_length - i]).unsqueeze(1)
                 prev_state = self.bwd_propagate(back_mean, back_var, current_state, detach_traj)
                 noise_backward = (prev_state - back_mean) / back_var.sqrt()
-                logpb[:, trajectory_length - i - 1] = -0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1)
+                #logpb[:, trajectory_length - i - 1] = -0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1)
+                logpb.append(-0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1))
             else:
                 # send it identically to the source state (0)
                 prev_state = torch.zeros_like(current_state)
@@ -208,25 +212,30 @@ class GFN(nn.Module):
 
             noise = ((current_state - prev_state) - dts.unsqueeze(1) * pf_mean) / (
                     dts.sqrt().unsqueeze(1) * (pflogvars / 2).exp())
-            logpf[:, trajectory_length - i - 1] = -0.5 * (
+            # logpf[:, trajectory_length - i - 1] = -0.5 * (
+            #         noise ** 2 + logtwopi + dts.log().unsqueeze(1) + pflogvars).sum(
+            #     1)
+            logpf.append(-0.5 * (
                     noise ** 2 + logtwopi + dts.log().unsqueeze(1) + pflogvars).sum(
-                1)
+                1))
 
             if return_gauss_params:
-                means_b[:, i, :] = back_mean - current_state
-                logvars_b[:, i, :] = (back_var / dts[:, None]).log()
-                means_f[:, i, :] = pf_mean * dts[:, None]
-                logvars_f[:, i, :] = pflogvars
+                means_b[:, i, :] = (back_mean - current_state).detach()
+                logvars_b[:, i, :] = (back_var / dts[:, None]).log().detach()
+                means_f[:, i, :] = (pf_mean * dts[:, None]).detach()
+                logvars_f[:, i, :] = pflogvars.detach()
 
             current_state = prev_state
-            states[:, trajectory_length - i - 1] = current_state
+            states[:, trajectory_length - i - 1] = current_state.detach()
 
+        logpfs = torch.stack(logpf).T
+        logpbs = torch.stack(logpb).T
         if return_gauss_params:
-            return (states, logpf, logpb, logf,
+            return (states, logpfs, logpbs, logf,
                     means_f.mean(-1), logvars_f.mean(-1),
                     means_b.mean(-1), logvars_b.mean(-1))
         else:
-            return states, logpf, logpb, logf
+            return states, logpfs, logpbs, logf
 
     def fwd_get_back_correction(self, condition_embedding, i, next_state, ts):
         if self.learn_pb:
@@ -303,13 +312,13 @@ class GFN(nn.Module):
         return back_mean_correction, back_additive_logvar
 
     def init_traj_tensors(self, batch_size, trajectory_length):
-        logpf = torch.zeros((batch_size, trajectory_length), device=self.device)
-        logpb = torch.zeros((batch_size, trajectory_length), device=self.device)
-        logf = torch.zeros((batch_size, trajectory_length + 1), device=self.device)
+        logpf = []#torch.zeros((batch_size, trajectory_length), device=self.device)
+        logpb = []#torch.zeros((batch_size, trajectory_length), device=self.device)
+        #logf = torch.zeros((batch_size, trajectory_length + 1), device=self.device)
         states = torch.zeros((batch_size, trajectory_length + 1, self.dim), device=self.device)
         means_f = torch.zeros((batch_size, trajectory_length, self.dim), device=self.device)
         logvars_f = torch.zeros((batch_size, trajectory_length, self.dim), device=self.device)
         means_b = torch.zeros((batch_size, trajectory_length, self.dim), device=self.device)
         logvars_b = torch.zeros((batch_size, trajectory_length, self.dim), device=self.device)
 
-        return logf, logpb, logpf, states, means_f, logvars_f, means_b, logvars_b
+        return logpb, logpf, states, means_f, logvars_f, means_b, logvars_b

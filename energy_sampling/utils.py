@@ -297,6 +297,7 @@ def triangle_schedule(it, init, maxval, minval, on, off):
         return minval
 
 
+@torch.inference_mode()
 def featurize_dataset(dataset, device, ellipsoid_scale, lj_repulsion):
     batch_size = 500
     loader = DataLoader(
@@ -332,10 +333,10 @@ def featurize_dataset(dataset, device, ellipsoid_scale, lj_repulsion):
 
             niggli_overlap = cluster_batch.compute_niggli_overlap()
 
-            overlaps.extend(normed_ellipsoid_overlap.cpu().detach().numpy())
-            silus.extend(silu_energy.cpu().detach().numpy())
-            ljs.extend(lj_energy.cpu().detach().numpy())
-            niggli_overlaps.extend(niggli_overlap)
+            overlaps.extend(normed_ellipsoid_overlap.cpu().detach())
+            silus.extend(silu_energy.cpu().detach())
+            ljs.extend(lj_energy.cpu().detach())
+            niggli_overlaps.extend(niggli_overlap.cpu().detach())
 
         overlaps = torch.tensor(overlaps)
         silus = torch.tensor(silus)
@@ -349,10 +350,11 @@ def featurize_dataset(dataset, device, ellipsoid_scale, lj_repulsion):
 
     # exclude negative niggli overlaps
     dataset = [elem for elem in dataset if elem.niggli_overlap >= 0]
+    [elem.box_analysis() for elem in dataset]
 
     return dataset
 
-
+@torch.inference_mode()
 def embed_dataset(dataset, autoencoder_path=None, device=None, encoder=None, embedding_type='autoencoder'):
     batch_size = 500
     loader = DataLoader(
@@ -382,7 +384,7 @@ def embed_dataset(dataset, autoencoder_path=None, device=None, encoder=None, emb
                     crystal_batch.num_graphs,
                     crystal_batch.num_atoms,
                 )
-                embeddings.append(v_embedding_i * s_embedding_i[:, :, None].clone().cpu())
+                embeddings.append((v_embedding_i * s_embedding_i[:, :, None]).cpu())
 
             del crystal_batch
 

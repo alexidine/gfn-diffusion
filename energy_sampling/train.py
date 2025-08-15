@@ -1,7 +1,7 @@
 import gc
 import os
-import sys
-import traceback
+# os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
+#     "max_split_size_mb:128,garbage_collection_threshold:0.8,expandable_segments:True")
 from time import time
 from typing import Optional
 
@@ -17,15 +17,16 @@ from energies.molecular_crystal import MolecularCrystal
 from eval.evaluations import eval_step, conditional_eval_step
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 from models import GFN
-from mxtaltools.common.geometry_utils import batch_cell_vol_torch
 from mxtaltools.common.training_utils import flatten_wandb_params
-from mxtaltools.crystal_building.crystal_latent_transforms import enforce_niggli_plane
 from mxtaltools.dataset_utils.data_classes import MolData
 from mxtaltools.dataset_utils.utils import collate_data_list
 from utils import get_train_args, get_gfn_init_state, set_seed, \
     get_exploration_std, random_discretizer, low_discrepancy_discretizer, \
     low_discrepancy_discretizer2, shifted_equidistant, uniform_discretizer, \
-    featurize_dataset, embed_dataset, get_conditioning_dim, anneal_reward, set_loss_coeffs, sample_crystal_prior
+    featurize_dataset, embed_dataset, get_conditioning_dim, set_loss_coeffs, sample_crystal_prior, anneal_reward
+
+torch.cuda.set_per_process_memory_fraction(0.9, device=0)
+torch.cuda.init()  # create context with the cap already in place
 
 args = get_train_args()
 
@@ -47,19 +48,19 @@ def train_step(energy_function,
                it,
                exploration_std,
                buffer,
-               mol_loader,
+               mol_iterator,
                repeats):
     add_to_buffer, do_backward, do_forward, p_forward, report_losses = train_logic(buffer, it)
 
     discretizer = get_discretizer(args.traj_length_strategy,
                                   args.discretizer)
 
-    optimizers['flow'].zero_grad()
+    optimizers['flow'].zero_grad(set_to_none=True)
     if do_forward:
-        optimizers['fwd'].zero_grad()
-        mol_batch = next(iter(mol_loader))
-        mol_batch = mol_batch.to(device, non_blocking=True)
-        loss, states, log_pfs, log_pbs, log_r, log_fs, crystal_batch, loss_dict = fwd_train_step(
+        optimizers['fwd'].zero_grad(set_to_none=True)
+        mol_batch = next(mol_iterator)
+        #mol_batch = mol_batch.to(device, non_blocking=True)
+        loss, crystal_batch, loss_dict = fwd_train_step(
             energy_function,
             gfn_model,
             discretizer,
@@ -72,13 +73,13 @@ def train_step(energy_function,
         )
 
         forward_iter = int(it * p_forward)
-        if add_to_buffer and forward_iter % args.add_to_buffer_each:
+        if add_to_buffer and forward_iter % args.add_to_buffer_each == 0:
             buffer.add(crystal_batch.detach().cpu().to_data_list())
         del crystal_batch
 
     elif do_backward:
-        optimizers['bwd'].zero_grad()
-        loss, states, log_pfs, log_pbs, log_r, log_fs, loss_dict = bwd_train_step(
+        optimizers['bwd'].zero_grad(set_to_none=True)
+        loss, loss_dict = bwd_train_step(
             gfn_model,
             discretizer,
             buffer,
@@ -107,7 +108,7 @@ def train_step(energy_function,
     else:
         loss_dict_cpu = None
 
-    del loss, states, log_pfs, log_pbs, log_r, log_fs, loss_dict  # or whatever is large
+    del loss, loss_dict  # or whatever is large
 
     return clean_loss, step_type, loss_dict_cpu
 
@@ -153,7 +154,6 @@ def train_logic(buffer, it):
         args.bwd_loss_coeffs.vg_lme > 0,
         args.bwd_loss_coeffs.emp_z > 0,
         args.bwd_loss_coeffs.mle > 0,
-        args.bwd_loss_coeffs.smoothed > 0,
     ]):
         do_backward = False
         do_forward = True
@@ -212,7 +212,7 @@ def bwd_train_step(gfn_model, discretizer, buffer, energy_function, repeats: int
                    return_exp=False, report_losses: bool = False):
     if args.sampling == 'buffer':
         samples, rewards, crystal_batch, condition = buffer.sample(
-            override_batch=int(buffer.batch_size * args.bwd_batch_multiplier))
+            override_batch=int(args.batch_size * args.bwd_batch_multiplier))
     else:
         assert False, f"sampling method {args.sampling} not implemented"
 
@@ -225,7 +225,6 @@ def bwd_train_step(gfn_model, discretizer, buffer, energy_function, repeats: int
                                  discretizer,
                                  condition=condition.to(device),
                                  repeats=repeats,
-                                 return_exp=return_exp,
                                  report_losses=report_losses)
 
 
@@ -262,77 +261,21 @@ def substitute_prior(condition, crystal_batch, energy_function, rewards, samples
 def train():
     times['initialization_start'] = time()
     name = args.run_name
-    # if not os.path.exists(name):
-    #     os.makedirs(name)
-
-    energy_function = MolecularCrystal(device=device,
-                                       energy_function=args.energy_function,
-                                       min_temperature=args.energy_min_temperature,
-                                       max_temperature=args.energy_max_temperature,
-                                       temperature_scaling_factor=args.temperature_scaling_factor,
-                                       temperature_conditioning=args.temperature_conditioning,
-                                       temperature=args.energy_static_temperature,
-                                       density_coeff=args.energy_density_coeff,
-                                       energy_clip=args.energy_clip,
-                                       ellipsoid_scale=args.ellipsoid_scale,
-                                       core_coeff=args.energy_core_coeff,
-                                       lj_coeff=args.energy_lj_coeff,
-                                       lj_turnover_pot=args.lj_turnover_pot,
-                                       lj_repulsion=args.lj_repulsion,
-                                       molecule_conditioning=args.molecule_conditioning,
-                                       sg_conditioning=args.sg_conditioning,
-                                       space_groups=args.space_groups,
-                                       bounding_coeff=args.bounding_coeff,
-                                       niggli_coeff=args.niggli_coeff,
-                                       )
-
     config = args.__dict__
     config["Experiment"] = "{args.energy}"
-    wandb.init(project="GFN Energy",
-               config=flatten_wandb_params(args),
-               name=name,
-               tags=[args.tag])
 
-    gfn_config = dict(
-        dim=energy_function.data_ndim,
-        s_emb_dim=args.s_emb_dim,
-        hidden_dim=args.hidden_dim,
-        conditions_dim=get_conditioning_dim(args),
-        harmonics_dim=args.harmonics_dim,
-        t_dim=args.t_emb_dim,
-        condition_embedding_dim=args.condition_emb_dim,
-        trajectory_length=args.T,
-        clipping=args.clipping,
-        gfn_clip=args.gfn_clip,
-        learned_variance=args.learned_variance,
-        log_var_range=args.log_var_range,
-        pb_drift_range=args.pb_drift_range,
-        pb_var_range=args.pb_var_range,
-        t_scale=args.t_scale,
-        conditional_flow_model=any([
-            args.temperature_conditioning,
-            args.molecule_conditioning,
-            args.sg_conditioning]
-        ),
-        learn_pb=args.learn_pb,
-        joint_layers=args.joint_layers,
-        dropout=args.dropout,
-        norm=args.norm,
-        zero_init=args.zero_init,
-        device=device
-    )
-    gfn_model = GFN(**gfn_config).to(device)
+    # Reward init
+    energy_function = init_energy_function(args)
 
+    # Model Init
+    gfn_model, gfn_config = init_gfn_model(args, energy_function)
     np.save(f'checkpoints/{name}_model_config', gfn_config)  # todo add path to saving directories
-    wandb.watch(gfn_model, log_graph=True, log_freq=1000)  # for gradient logging
 
-    optimizers, schedulers = init_schedulers_optimizers(
-        gfn_model)
-    buffer, train_mol_loader, test_mol_loader = init_buffers_datasets(energy_function)
+    # opt init
+    optimizers, schedulers = init_schedulers_optimizers(args, gfn_model)
 
-    times['initialization_end'] = time()
-    oomed_out = False
-    lr_warmup_finished = False
+    # buffer & loaders init
+    buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator = init_buffers_datasets(args, energy_function)
 
     # initialize some annealing factors
     if args.temperature_conditioning:
@@ -345,84 +288,87 @@ def train():
 
     repulsion_annealing_lambda = get_annealing_factor(args.lj_repulsion, 1, args.repulsion_annealing_max_steps, 10)
 
-    fwd_loss, bwd_loss = 0, 0
-    gfn_model.train()
     fwd_loss_dict = None
     bwd_loss_dict = None
+    oomed_out = False
+    lr_warmup_finished = False
+    fwd_loss, bwd_loss = 0, 0
 
-    for step_ind in trange(args.epochs + 1):
-        metrics = dict()
-        if step_ind % 10 == 0:
-            set_loss_coeffs(step_ind, args)
-        exploration_std = get_exploration_std(step_ind,
-                                              args.exploratory,
-                                              args.wd_max_steps,
-                                              args.exploration_factor,
-                                              args.exploration_wd)
-        metrics['train/expl'] = exploration_std(0) if exploration_std is not None else 0
+    times['initialization_end'] = time()
 
-        times['train_step_start'] = time()
-        try:
-            #torch.autograd.set_detect_anomaly(True)  # for debugging
-            train_loss, step_type, loss_dict = train_step(energy_function,
-                                                          gfn_model,
-                                                          optimizers,
-                                                          step_ind,
-                                                          exploration_std,
-                                                          buffer,
-                                                          train_mol_loader,
-                                                          repeats=args.repeats
-                                                          )
-            if step_type == 'Forward':
-                fwd_loss = train_loss
-                if loss_dict is not None:
-                    fwd_loss_dict = loss_dict
-            elif step_type == 'Backward':
-                bwd_loss = train_loss
-                if loss_dict is not None:
-                    bwd_loss_dict = loss_dict
-            if not oomed_out:
-                buffer, train_mol_loader, test_mol_loader = grow_batch_size(buffer, train_mol_loader, test_mol_loader)
+    with wandb.init(project="GFN Energy",
+               config=flatten_wandb_params(args),
+               name=name,
+               tags=[args.tag]):
 
-        except (RuntimeError, ValueError) as e:  # if we do hit OOM, slash the batch size
-            oomed_out, buffer, train_mol_loader, test_mol_loader = handle_train_epoch_error(e, oomed_out, buffer,
-                                                                                            train_mol_loader,
-                                                                                            test_mol_loader)
+        wandb.watch(gfn_model,
+                    log_graph=False,
+                    log_freq=1000,
+                    log='gradients')  # for gradient logging
 
-        times['train_step_end'] = time()
+        gfn_model.train()
 
-        if (step_ind % args.eval_period == 0 and step_ind > 0) or step_ind == 50:
-            torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model.pt')
-            if args.molecule_conditioning:
-                # so far not useful
-                train_metrics = do_evaluation(energy_function, buffer, gfn_model,
-                                              step_ind, train_mol_loader,
-                                              override_do_figures=False)
-                kk = list(train_metrics.keys())
-                for key in kk:
-                    metrics['train_eval/' + key] = train_metrics[key]
-                if step_ind % args.conditional_eval_period == 0:  # make conditional sampling figures
-                    conditional_metrics = do_conditional_evaluation(energy_function, gfn_model,
-                                                                    test_mol_loader,
-                                                                    )
-                    metrics.update(conditional_metrics)
+        for step_ind in trange(args.epochs + 1):
+            metrics = dict()
+            if step_ind % 10 == 0:
+                set_loss_coeffs(step_ind, args)
 
-            metrics.update(do_evaluation(energy_function, buffer, gfn_model,
-                                         step_ind, test_mol_loader))
+            exploration_std = get_exploration_std(step_ind,
+                                                  args.exploratory,
+                                                  args.wd_max_steps,
+                                                  args.exploration_factor,
+                                                  args.exploration_wd)
 
-            wandb.log(metrics, step=step_ind)
 
-        elif step_ind % 10 == 0:
-            lr_warmup_finished, lr = step_lr_schedule(schedulers, optimizers, lr_warmup_finished)
-            anneal_reward(step_ind, temp_annealing_lambda, repulsion_annealing_lambda, energy_function, args)
-            ten_step_reporting(bwd_loss, bwd_loss_dict, fwd_loss, fwd_loss_dict, metrics, optimizers)
-            wandb.log(metrics, step=step_ind)
+            times['train_step_start'] = time()
+            try:
+                #torch.autograd.set_detect_anomaly(True)  # for debugging
+                train_loss, step_type, loss_dict = train_step(energy_function,
+                                                              gfn_model,
+                                                              optimizers,
+                                                              step_ind,
+                                                              exploration_std,
+                                                              buffer,
+                                                              train_iterator,
+                                                              repeats=args.repeats
+                                                              )
+                if step_type == 'Forward':
+                    fwd_loss = train_loss
+                    if loss_dict is not None:
+                        fwd_loss_dict = loss_dict
+                elif step_type == 'Backward':
+                    bwd_loss = train_loss
+                    if loss_dict is not None:
+                        bwd_loss_dict = loss_dict
 
-        elif step_ind % 100 == 0:
-            torch.cuda.empty_cache()
-            gc.collect()
+                if not oomed_out and (args.batch_size < args.max_batch_size and args.grow_batch_size):
+                    buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator = increment_batch_size(buffer, train_mol_loader,
+                                                                                test_mol_loader,
+                                                                                args.batch_growth_increment)
 
-    torch.save(gfn_model, f'checkpoints/{name}_model_final.pt')
+            except (RuntimeError, ValueError) as e:  # if we do hit OOM, slash the batch size
+                oomed_out, buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator = handle_train_epoch_error(e, oomed_out, buffer,
+                                                                                                train_mol_loader,
+                                                                                                test_mol_loader,
+                                                                                                optimizers)
+            times['train_step_end'] = time()
+
+            # evaluation work
+            if (step_ind % args.eval_period == 0 and step_ind > 0) or step_ind == 50:
+                eval_work(args, gfn_model, step_ind, name,
+                          buffer, train_mol_loader,test_mol_loader,
+                          energy_function, metrics)
+
+            # train monitoring
+            elif step_ind % 10 == 0:
+                metrics['train/expl'] = exploration_std(0) if exploration_std is not None else 0
+                lr_warmup_finished, lr = step_lr_schedule(schedulers, optimizers, lr_warmup_finished)
+                anneal_reward(step_ind, temp_annealing_lambda, repulsion_annealing_lambda, energy_function, args)
+                ten_step_reporting(bwd_loss, bwd_loss_dict, fwd_loss, fwd_loss_dict, metrics, optimizers)
+                wandb.log(metrics, step=step_ind)
+
+
+        torch.save(gfn_model, f'checkpoints/{name}_model_final.pt')
 
 
 def ten_step_reporting(bwd_loss, bwd_loss_dict, fwd_loss, fwd_loss_dict, metrics, optimizers):
@@ -457,7 +403,7 @@ def step_lr_schedule(schedulers, optimizers,
         return False, None
 
 
-def init_schedulers_optimizers(gfn_model):
+def init_schedulers_optimizers(args, gfn_model):
     if args.scheduler:
         init_fwd_lr = args.lr_policy / args.lr_warmup_ratio
         init_flow_lr = args.lr_flow / args.lr_warmup_ratio
@@ -507,18 +453,17 @@ def init_schedulers_optimizers(gfn_model):
     return optimizers, schedulers
 
 
-def init_buffers_datasets(energy_function):
+def init_buffers_datasets(args, energy_function):
     # load dataset of prebuilt and scored molecular crystals into the buffer
     buffer = CrystalReplayBuffer(
         args.buffer_size,
-        device,
+        'cpu',
         energy_function,
         args.batch_size,
         beta=args.beta,
         rank_weight=args.rank_weight,
         prioritized=args.prioritized,
         keep_initial_samples=False,  # args.buffer_path is not None,
-        gpu_available=args.device == 'cuda',
         diversity_coeff=args.buffer_diversity_coeff,
     )
     if (args.both_ways or args.bwd) and args.buffer_path is not None:  # preload samples into the buffer
@@ -600,47 +545,68 @@ def init_buffers_datasets(energy_function):
         pin_memory=True,
         drop_last=True
     )
-    return buffer, train_mol_loader, test_mol_loader
+    train_iterator = iter_forever(train_mol_loader)
+    test_iterator = iter_forever(test_mol_loader)
+
+    return buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator
 
 
-def grow_batch_size(buffer, train_mol_loader, test_mol_loader):
-    if args.batch_size < args.max_batch_size and args.grow_batch_size:
-        new_batch_size = max(args.batch_size + 1,
-                             int(args.batch_size * 1.01))
-        args.batch_size = new_batch_size  # gradually increment batch size
+def increment_batch_size(buffer, train_mol_loader, test_mol_loader, batch_growth_increment):
 
-        if len(buffer) > 0:
-            buffer.batch_size = new_batch_size
+    new_batch_size = max(args.batch_size + 1,
+                         int(args.batch_size * batch_growth_increment))
+    args.batch_size = new_batch_size  # gradually increment batch size
 
-        train_mol_loader = DataLoader(
-            train_mol_loader.dataset,
-            batch_size=new_batch_size,
-            num_workers=0,
-            pin_memory=True,
-            drop_last=True,
-        )
-        test_mol_loader = DataLoader(
-            test_mol_loader.dataset,
-            batch_size=new_batch_size,
-            num_workers=0,
-            pin_memory=True,
-            drop_last=True,
-        )
+    if len(buffer) > 0:
+        buffer.batch_size = new_batch_size
 
-    return buffer, train_mol_loader, test_mol_loader
+    train_mol_loader = DataLoader(
+        train_mol_loader.dataset,
+        batch_size=new_batch_size,
+        num_workers=0,
+        pin_memory=True,
+        drop_last=True,
+    )
+    test_mol_loader = DataLoader(
+        test_mol_loader.dataset,
+        batch_size=new_batch_size,
+        num_workers=0,
+        pin_memory=True,
+        drop_last=True,
+    )
+    train_iterator = iter_forever(train_mol_loader)
+    test_iterator = iter_forever(test_mol_loader)
 
+    return buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator
 
-def handle_train_epoch_error(e, oomed_out, buffer, train_mol_loader, test_mol_loader):
+def iter_forever(loader):
+    while True:
+        for batch in loader:
+            yield batch
+
+def handle_train_epoch_error(e, oomed_out, buffer, train_mol_loader, test_mol_loader, optimizers):
     print(f"Caught error: {str(e)}")
-    if (("cuda" in str(e).lower() and "memory" in str(e).lower())
-            or "nonzero is not supported for tensors with more than int_max elements" in str(e).lower()):
+    if is_cuda_oom(e):
         print("OOMED!")
-        """User note
-        When this program OOms out, things get pretty crazy
-        this method of trying to save it almost never works 
-        I'm sorry
-        """
-        args.batch_size = handle_oom(args.batch_size, e)
+
+        for opt in optimizers.values():
+            opt.zero_grad(set_to_none=True)
+
+        # break reference cycles
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+
+        args.batch_size = max(1, int(args.batch_size * 0.95))
+        if args.batch_size <= 1:
+            raise RuntimeError("Cascading OOM Failure")
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
         train_mol_loader = DataLoader(
             train_mol_loader.dataset,
@@ -656,12 +622,26 @@ def handle_train_epoch_error(e, oomed_out, buffer, train_mol_loader, test_mol_lo
             pin_memory=True,
             drop_last=True,
         )
+        train_iterator = iter_forever(train_mol_loader)
+        test_iterator = iter_forever(test_mol_loader)
 
         oomed_out = True
         print(f"Reducing batch size to {args.batch_size}")
     else:
         raise e  # will simply raise error if other or if training on CPU
-    return oomed_out, buffer, train_mol_loader, test_mol_loader
+    return oomed_out, buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator
+
+def is_cuda_oom(e: Exception) -> bool:
+    if isinstance(e, torch.cuda.OutOfMemoryError):
+        return True
+    s = str(e).lower()
+    return (
+        ("cuda" in s and "memory" in s)
+        or ("cublas" in s and "alloc" in s)
+        or ("cusolver" in s and "alloc" in s)
+        or ("out of memory" in s)
+        or ("nonzero is not supported for tensors with more than int_max elements" in s)
+    )
 
 
 def do_evaluation(energy_function, buffer, gfn_model, i, mol_loader,
@@ -674,7 +654,7 @@ def do_evaluation(energy_function, buffer, gfn_model, i, mol_loader,
         do_figures = override_do_figures
     else:
         do_figures = i % args.figs_period == 0
-    eval_batch_size = args.eval_batch_size
+    eval_batch_size = max(args.batch_size, args.eval_batch_size)
 
     eval_rands = np.random.randint(len(mol_loader.dataset), size=eval_batch_size)
     mol_batch = collate_data_list([mol_loader.dataset[ind] for ind in eval_rands]).to(device)
@@ -739,19 +719,41 @@ def log_elapsed_times():
     return elapsed_times
 
 
-def handle_oom(batch_size, e):
-    traceback.print_exc()
-    sys.exc_info()  # Break circular references from traceback
-    del e
+# def handle_oom(batch_size, e, optimizers_dict):
+#     traceback.print_exc()
+#     sys.exc_info()  # Break circular references from traceback
+#     for opt in optimizers_dict.values():  # if you track them, else do per-optimizer
+#         for group in opt.param_groups:
+#             for p in group['params']:
+#                 if p.grad is not None:
+#                     p.grad = None
+#     del e
+#
+#     torch.cuda.synchronize()
+#
+#     # Garbage collection
+#     gc.collect()
+#     torch.cuda.empty_cache()
+#     batch_size = int(batch_size * 0.5)
+#     if batch_size < 1:
+#         assert False, "Cascading OOM Failure"
+#
+#     return batch_size
 
-    # Garbage collection
-    gc.collect()
-    torch.cuda.empty_cache()
-    batch_size = int(batch_size * 0.5)
-    if batch_size < 1:
-        assert False, "Cascading OOM Failure"
 
-    return batch_size
+
+class SkipBatch(RuntimeError):
+    def __init__(self, msg, new_bs):
+        super().__init__(msg)
+        self.new_bs = new_bs
+
+def robust_zero_grad(optimizers_dict):
+    # Use set_to_none=True for instant free
+    for opt in optimizers_dict.values():
+        for group in opt.param_groups:
+            for p in group['params']:
+                if p.grad is not None:
+                    p.grad = None
 
 
 def add_dataset_to_buffer(dataset_path, buffer):
@@ -780,6 +782,102 @@ def get_annealing_factor(start_value, stop_value, total_time, step_iters):
     return (stop_value / start_value) ** (1 / (total_time / step_iters))
 
 
+def init_gfn_model(args, energy_function):
+    gfn_config = dict(
+        dim=energy_function.data_ndim,
+        s_emb_dim=args.s_emb_dim,
+        hidden_dim=args.hidden_dim,
+        conditions_dim=get_conditioning_dim(args),
+        harmonics_dim=args.harmonics_dim,
+        t_dim=args.t_emb_dim,
+        condition_embedding_dim=args.condition_emb_dim,
+        trajectory_length=args.T,
+        clipping=args.clipping,
+        gfn_clip=args.gfn_clip,
+        learned_variance=args.learned_variance,
+        log_var_range=args.log_var_range,
+        pb_drift_range=args.pb_drift_range,
+        pb_var_range=args.pb_var_range,
+        t_scale=args.t_scale,
+        conditional_flow_model=any([
+            args.temperature_conditioning,
+            args.molecule_conditioning,
+            args.sg_conditioning]
+        ),
+        learn_pb=args.learn_pb,
+        joint_layers=args.joint_layers,
+        dropout=args.dropout,
+        norm=args.norm,
+        zero_init=args.zero_init,
+        device=device
+    )
+    gfn_model = GFN(**gfn_config).to(device)
+
+    return gfn_model, gfn_config
+
+def init_energy_function(args):
+    energy_config = {
+        'device': device,
+        'energy_function': args.energy_function,
+        'min_temperature': args.energy_min_temperature,
+        'max_temperature': args.energy_max_temperature,
+        'temperature_scaling_factor': args.temperature_scaling_factor,
+        'temperature_conditioning': args.temperature_conditioning,
+        'temperature': args.energy_static_temperature,
+        'density_coeff': args.energy_density_coeff,
+        'energy_clip': args.energy_clip,
+        'ellipsoid_scale': args.ellipsoid_scale,
+        'core_coeff': args.energy_core_coeff,
+        'lj_coeff': args.energy_lj_coeff,
+        'lj_turnover_pot': args.lj_turnover_pot,
+        'lj_repulsion': args.lj_repulsion,
+        'molecule_conditioning': args.molecule_conditioning,
+        'sg_conditioning': args.sg_conditioning,
+        'space_groups': args.space_groups,
+        'bounding_coeff': args.bounding_coeff,
+        'niggli_coeff': args.niggli_coeff,
+    }
+    energy_function = MolecularCrystal(**energy_config
+                                       )
+    return energy_function
+
+def eval_work(args,
+              gfn_model,
+              step_ind,
+              name,
+              buffer,
+              train_mol_loader,
+              test_mol_loader,
+              energy_function,
+              metrics):
+    torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model.pt')
+    if args.molecule_conditioning:
+        # # so far not useful
+        # train_metrics = do_evaluation(energy_function, buffer, gfn_model,
+        #                               step_ind, train_mol_loader,
+        #                               override_do_figures=False)
+        # kk = list(train_metrics.keys())
+        # for key in kk:
+        #     metrics['train_eval/' + key] = train_metrics[key]
+        if step_ind % args.conditional_eval_period == 0:  # make conditional sampling figures
+            conditional_metrics = do_conditional_evaluation(energy_function, gfn_model,
+                                                            test_mol_loader,
+                                                            )
+            metrics.update(conditional_metrics)
+
+    metrics.update(do_evaluation(energy_function, buffer, gfn_model,
+                                 step_ind, test_mol_loader))
+
+    if args.prior_coverage_cutoff is not None:
+        low_cut = max(0, args.prior_coverage_cutoff * 0.95)
+        high_cut = min(1, args.prior_coverage_cutoff * 1.05)
+        if metrics['Minium 1d coverage'] < high_cut:
+            args.fwd_to_bwd_ratio *= 0.9  # train forward less often
+        elif metrics['Minium 1d coverage'] < low_cut:
+            args.fwd_to_bwd_ratio *= 1.1
+
+    metrics['Fwd to Bwd Ratio'] = args.fwd_to_bwd_ratio
+    wandb.log(metrics, step=step_ind)
 
 
 if __name__ == '__main__':

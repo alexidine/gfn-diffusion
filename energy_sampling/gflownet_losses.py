@@ -24,17 +24,26 @@ def diagonal_gaussian_log_density(x, mu, sigma):
 
 
 def get_loss_reward(log_T_tensor, log_reward_fn, mol_batch, return_exp, states, no_grad: bool = True):
-    if log_T_tensor is not None:
-        log_temperature = log_T_tensor
+    log_temperature = log_T_tensor if log_T_tensor is not None else None
+
+    x_T = states[:, -1]
+    if no_grad:
+        x_T = x_T.detach()
+        ctx = torch.inference_mode()
     else:
-        log_temperature = None
-    with torch.set_grad_enabled(not no_grad):
+        ctx = torch.enable_grad()
+
+    with ctx:
         if return_exp:
-            log_r, crystal_batch = log_reward_fn(states[:, -1], mol_batch, log_temperature, return_exp)
-            crystal_batch = crystal_batch.detach()
+            log_r, crystal_batch = log_reward_fn(x_T, mol_batch, log_temperature, return_exp)
+            crystal_batch = crystal_batch.detach().to('cpu')
         else:
             log_r = log_reward_fn(states[:, -1], mol_batch, log_temperature, return_exp)
             crystal_batch = None
+
+    if no_grad:
+        log_r = log_r.detach()
+
     return crystal_batch, log_r
 
 
@@ -91,13 +100,14 @@ def get_gfn_forward_loss(loss_coeffs,
     else:
         keep_grads = False
 
-    (states, log_pfs, log_pbs, log_fs,
-     means_f, logvars_f, means_b, logvars_b) = gfn.get_trajectory_fwd(initial_state,
+    condition = condition.to(gfn.device)
+    log_T_tensor = log_T_tensor.to(gfn.device)
+    (states, log_pfs, log_pbs, log_flow) = gfn.get_trajectory_fwd(initial_state,
                                                                       discretizer,
                                                                       exploration_std,
                                                                       condition,
                                                                       detach_traj=not keep_grads,
-                                                                      return_gauss_params=True,
+                                                                      return_gauss_params=False,
                                                                       )
 
     crystal_batch, log_r = get_loss_reward(log_T_tensor,
@@ -109,7 +119,6 @@ def get_gfn_forward_loss(loss_coeffs,
                                            )
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
-    log_flow = log_fs[:, 0]
 
     losses = []
     """greedy loss"""
@@ -125,11 +134,6 @@ def get_gfn_forward_loss(loss_coeffs,
         weight *= len(weight)
         reinforce_loss = -power_saturate(weight * log_pf, 0.7)
         losses.append(reinforce_loss * loss_coeffs.reinforce)
-
-    """trajectory smoothing loss"""
-    if loss_coeffs.smoothed > 0:
-        smoothness_loss = normed_smoothness_loss(torch.stack([means_f, logvars_f, means_b, logvars_b])).mean(dim=0)
-        losses.append(smoothness_loss * loss_coeffs.smoothed)
 
     """VarGrad - lower bound loss"""
     if loss_coeffs.vg_lb > 0:
@@ -186,8 +190,6 @@ def get_gfn_forward_loss(loss_coeffs,
             loss_dict['greedy'] = greedy_loss.mean().detach()
         if loss_coeffs.reinforce > 0:
             loss_dict['reinforce'] = reinforce_loss.mean().detach()
-        if loss_coeffs.smoothed > 0:
-            loss_dict['smoothed'] = smoothness_loss.mean().detach()
         if loss_coeffs.tb > 0:
             loss_dict['tb'] = tb_loss.mean().detach()
         if loss_coeffs.vg_lb > 0:
@@ -208,9 +210,150 @@ def get_gfn_forward_loss(loss_coeffs,
         loss_dict = None
 
     if return_exp:
-        return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), crystal_batch, loss_dict
+        return loss, crystal_batch.cpu().detach(), loss_dict
     else:
         return loss, loss_dict
+
+
+
+def get_gfn_backward_loss(loss_coeffs,
+                          samples,
+                          gfn,
+                          log_r,
+                          discretizer,
+                          condition=None,
+                          repeats=10,
+                          report_losses: bool = False):
+    if gfn.conditional_flow_model and any([
+        loss_coeffs.vg_lb > 0, loss_coeffs.vg_lme > 0
+    ]):
+        condition = condition.repeat(repeats, 1)
+        samples = samples.repeat(repeats, 1)
+        log_r = log_r.repeat(repeats)
+        conditional_repeats = True
+    else:
+        conditional_repeats = False
+
+    condition = condition.to(gfn.device)
+    states, log_pfs, log_pbs, log_flow = gfn.get_trajectory_bwd(
+        samples, discretizer, condition, return_gauss_params=False)
+
+    log_pf = log_pfs.sum(-1)
+    log_pb = log_pbs.sum(-1)
+
+    losses = []
+    """VarGrad - lower bound loss"""
+    if loss_coeffs.vg_lb > 0:
+        log_Z, vg_loss = vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats)
+
+        losses.append(vg_loss * loss_coeffs.vg_lb)
+
+        """VarGrad - log mean exp loss"""
+    elif loss_coeffs.vg_lme > 0:
+        log_Z, vg_loss = vg_lme(gfn, log_pb, log_pf, log_r, repeats)
+        losses.append(vg_loss * loss_coeffs.vg_lme)
+
+    if loss_coeffs.emp_z > 0:  # train the flow model to match the empirical log Z distribution
+        emp_z_loss = emp_Z(gfn, log_Z, log_flow, repeats)
+        losses.append(emp_z_loss * loss_coeffs.emp_z)
+    else:
+        emp_z_loss = None
+
+    """TB loss"""
+    if loss_coeffs.tb > 0:
+        emp_z_coeff, tb_loss = get_tb_loss(emp_z_loss, log_flow, log_pb, log_pf, log_r, loss_coeffs)
+        losses.append(tb_loss * loss_coeffs.tb * emp_z_coeff)
+
+    if loss_coeffs.mle > 0:
+        mle_loss = terminal_mle(
+            log_pf, log_pb,
+            repeats,
+            conditional_repeats,
+            estimator='exact' if conditional_repeats else 'bound',
+            dreg=True
+        )
+        losses.append(mle_loss * loss_coeffs.mle)
+
+    if loss_coeffs.loss_clip != -1:
+        combined_losses = soft_clip(torch.stack(losses), loss_coeffs.loss_clip).mean(dim=0)
+    else:
+        combined_losses = torch.stack(losses).mean(dim=0)
+    loss = combined_losses.mean()
+
+    if report_losses:
+        loss_dict = {}
+        if loss_coeffs.tb > 0:
+            loss_dict['tb'] = tb_loss.mean().detach()
+        if loss_coeffs.vg_lb > 0:
+            loss_dict['vg_lb'] = vg_loss.mean().detach()
+        if loss_coeffs.vg_lme > 0:
+            loss_dict['vg_lme'] = vg_loss.mean().detach()
+        if loss_coeffs.emp_z > 0:
+            loss_dict['emp_z'] = emp_z_loss.mean().detach()
+        if loss_coeffs.mle > 0:
+            loss_dict['mle'] = mle_loss.mean().detach()
+    else:
+        loss_dict = None
+
+    return loss, loss_dict
+
+
+def terminal_mle(
+        log_pf, log_pb,
+        reps: int = None,
+        do_repeats: bool = False,
+        estimator: str = "bound",  # "bound" (Jensen, eq. 28) or "exact" (IWAE, eq. 27)
+        dreg: bool = True,  # use detached responsibilities for "exact"
+):
+    """
+    Returns:
+        loss: scalar tensor
+        stats: dict with diagnostics
+    """
+    if not do_repeats:
+        repeats = 1
+    else:
+        repeats = 1 * reps
+
+    # reshape into [B, K] where B = number of distinct terminals (before repeating)
+    if log_pf.numel() % repeats != 0:
+        raise ValueError(f"log_pf size {log_pf.numel()} not divisible by repeats={repeats}")
+
+    B = log_pf.numel() // repeats
+    log_pf = log_pf.view(B, repeats)
+    log_pb = log_pb.view(B, repeats)
+
+    logw = log_pf - log_pb  # [B, K]  ; log importance weights for each path
+
+    if estimator == "bound":
+        # Eq. (28): E_{τ~Pb}[ log Pf(τ) - log Pb(τ|x) ]  (sample mean over paths)
+        # No importance weights needed; just average over the K samples.
+        loss = -logw.mean(dim=1)  # [B]
+
+        return loss
+
+    elif estimator == "exact":
+        assert do_repeats, "Exact MLE estimator requires minibatch repeats > 1"
+        # Eq. (27): log E_{τ~Pb}[ exp(logw) ] ≈ logsumexp(logw, dim=1) - log K
+        if dreg:
+            # DReG-style gradient: responsibilities detached to tame variance
+            with torch.no_grad():
+                alpha = torch.softmax(logw, dim=1)  # [B, K]
+            # Equivalent gradient to IWAE objective under DReG; stable
+            loss = -((alpha * logw).sum(dim=1))  # [B]
+        else:
+            # Plain IWAE objective (can be higher variance)
+            lse = torch.logsumexp(logw, dim=1)  # [B]
+            loss = -(lse - math.log(repeats))
+
+        return loss.repeat(repeats)
+
+    else:
+        raise ValueError("estimator must be 'bound' or 'exact'")
+
+
+def power_saturate(x, power):
+    return torch.sign(x) * (torch.abs(x) ** power)
 
 
 def get_tb_loss(emp_z_loss, log_flow, log_pb, log_pf, log_r, loss_coeffs):
@@ -322,155 +465,3 @@ def fwd_overlap_loss(gfn, loss_coeffs, repeats, states):
             agg='mean',
         )
     return overlap_loss
-
-
-def get_gfn_backward_loss(loss_coeffs,
-                          samples,
-                          gfn,
-                          log_r,
-                          discretizer,
-                          condition=None,
-                          repeats=10,
-                          return_exp=False,
-                          report_losses: bool = False):
-    if gfn.conditional_flow_model and any([
-        loss_coeffs.vg_lb > 0, loss_coeffs.vg_lme > 0
-    ]):
-        condition = condition.repeat(repeats, 1)
-        samples = samples.repeat(repeats, 1)
-        log_r = log_r.repeat(repeats)
-        conditional_repeats = True
-    else:
-        conditional_repeats = False
-
-    (states, log_pfs, log_pbs, log_fs,
-     means_f, logvars_f, means_b, logvars_b) = gfn.get_trajectory_bwd(
-        samples, discretizer, condition, return_gauss_params=True)
-
-    log_pf = log_pfs.sum(-1)
-    log_pb = log_pbs.sum(-1)
-    log_flow = log_fs[:, 0]
-
-    losses = []
-    if loss_coeffs.smoothed > 0:
-        smoothness_loss = normed_smoothness_loss(torch.stack([means_f, logvars_f, means_b, logvars_b])).mean(dim=0)
-        losses.append(smoothness_loss * loss_coeffs.smoothed)
-
-    """VarGrad - lower bound loss"""
-    if loss_coeffs.vg_lb > 0:
-        log_Z, vg_loss = vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats)
-
-        losses.append(vg_loss * loss_coeffs.vg_lb)
-
-        """VarGrad - log mean exp loss"""
-    elif loss_coeffs.vg_lme > 0:
-        log_Z, vg_loss = vg_lme(gfn, log_pb, log_pf, log_r, repeats)
-        losses.append(vg_loss * loss_coeffs.vg_lme)
-
-    if loss_coeffs.emp_z > 0:  # train the flow model to match the empirical log Z distribution
-        emp_z_loss = emp_Z(gfn, log_Z, log_flow, repeats)
-        losses.append(emp_z_loss * loss_coeffs.emp_z)
-    else:
-        emp_z_loss = None
-
-    """TB loss"""
-    if loss_coeffs.tb > 0:
-        emp_z_coeff, tb_loss = get_tb_loss(emp_z_loss, log_flow, log_pb, log_pf, log_r, loss_coeffs)
-        losses.append(tb_loss * loss_coeffs.tb * emp_z_coeff)
-
-    if loss_coeffs.mle > 0:
-        mle_loss = terminal_mle(
-            log_pf, log_pb,
-            repeats,
-            conditional_repeats,
-            estimator='exact' if conditional_repeats else 'bound',
-            dreg=True
-        )
-        #mle_loss = -power_saturate(log_pf, 0.7)
-        losses.append(mle_loss * loss_coeffs.mle)
-
-    if loss_coeffs.loss_clip != -1:
-        combined_losses = soft_clip(torch.stack(losses), loss_coeffs.loss_clip).mean(dim=0)
-    else:
-        combined_losses = torch.stack(losses).mean(dim=0)
-    loss = combined_losses.mean()
-
-    if report_losses:
-        loss_dict = {}
-        if loss_coeffs.smoothed > 0:
-            loss_dict['smoothed'] = smoothness_loss.mean().detach()
-        if loss_coeffs.tb > 0:
-            loss_dict['tb'] = tb_loss.mean().detach()
-        if loss_coeffs.vg_lb > 0:
-            loss_dict['vg_lb'] = vg_loss.mean().detach()
-        if loss_coeffs.vg_lme > 0:
-            loss_dict['vg_lme'] = vg_loss.mean().detach()
-        if loss_coeffs.emp_z > 0:
-            loss_dict['emp_z'] = emp_z_loss.mean().detach()
-        if loss_coeffs.mle > 0:
-            loss_dict['mle'] = mle_loss.mean().detach()
-    else:
-        loss_dict = None
-
-    if return_exp:
-        return loss, states.detach(), log_pfs.detach(), log_pbs.detach(), log_r.detach(), log_fs.detach(), loss_dict
-    else:
-        return loss, loss_dict
-
-
-def terminal_mle(
-        log_pf, log_pb,
-        reps: int = None,
-        do_repeats: bool = False,
-        estimator: str = "bound",  # "bound" (Jensen, eq. 28) or "exact" (IWAE, eq. 27)
-        dreg: bool = True,  # use detached responsibilities for "exact"
-):
-    """
-    Returns:
-        loss: scalar tensor
-        stats: dict with diagnostics
-    """
-    if not do_repeats:
-        repeats = 1
-    else:
-        repeats = 1 * reps
-
-    # reshape into [B, K] where B = number of distinct terminals (before repeating)
-    if log_pf.numel() % repeats != 0:
-        raise ValueError(f"log_pf size {log_pf.numel()} not divisible by repeats={repeats}")
-
-    B = log_pf.numel() // repeats
-    log_pf = log_pf.view(B, repeats)
-    log_pb = log_pb.view(B, repeats)
-
-    logw = log_pf - log_pb  # [B, K]  ; log importance weights for each path
-
-    if estimator == "bound":
-        # Eq. (28): E_{τ~Pb}[ log Pf(τ) - log Pb(τ|x) ]  (sample mean over paths)
-        # No importance weights needed; just average over the K samples.
-        loss = -logw.mean(dim=1)  # [B]
-
-        return loss
-
-    elif estimator == "exact":
-        assert do_repeats, "Exact MLE estimator requires minibatch repeats > 1"
-        # Eq. (27): log E_{τ~Pb}[ exp(logw) ] ≈ logsumexp(logw, dim=1) - log K
-        if dreg:
-            # DReG-style gradient: responsibilities detached to tame variance
-            with torch.no_grad():
-                alpha = torch.softmax(logw, dim=1)  # [B, K]
-            # Equivalent gradient to IWAE objective under DReG; stable
-            loss = -((alpha * logw).sum(dim=1))  # [B]
-        else:
-            # Plain IWAE objective (can be higher variance)
-            lse = torch.logsumexp(logw, dim=1)  # [B]
-            loss = -(lse - math.log(repeats))
-
-        return loss.repeat(repeats)
-
-    else:
-        raise ValueError("estimator must be 'bound' or 'exact'")
-
-
-def power_saturate(x, power):
-    return torch.sign(x) * (torch.abs(x) ** power)

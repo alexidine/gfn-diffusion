@@ -18,7 +18,6 @@ class CrystalReplayBuffer:
                  rank_weight=1e-2,
                  prioritized=None,
                  keep_initial_samples: bool = False,
-                 gpu_available: bool = False,
                  diversity_coeff: float = 0.0,
                  ):
         self.buffer_size = buffer_size
@@ -37,7 +36,6 @@ class CrystalReplayBuffer:
         self.x = None
         self.diversity_check_size = 1000
         self.original_dataset_inds = None
-        self.gpu_available = gpu_available
         self.diversity_coeff = diversity_coeff
 
     def add(self,
@@ -67,13 +65,13 @@ class CrystalReplayBuffer:
                 if len(data_list) > 0:
                     new_data_batch = collate_data_list(data_list)
 
-                    new_x_tensor = new_data_batch.cell_params_to_gen_basis().to('cuda' if self.gpu_available else 'cpu')
+                    new_x_tensor = new_data_batch.cell_params_to_gen_basis().to(self.device)
                     scores = self.energy_function.prebuilt_sample_to_reward(new_data_batch,
                                                                             temperature=torch.ones(len(new_data_batch))
                                                                             ).cpu().detach().numpy()
                     scores_list = list(scores)
 
-                    ref_x_tensor = torch.stack(self.x_list).to('cuda' if self.gpu_available else 'cpu')
+                    ref_x_tensor = torch.stack(self.x_list).to(self.device)
                     min_buffer_dist = torch.cdist(ref_x_tensor, new_x_tensor).amin(0)
                     new_x_tensor = new_x_tensor.cpu()
 
@@ -134,6 +132,7 @@ class CrystalReplayBuffer:
                                                            ))
         return inds
 
+    @torch.inference_mode()
     def get_sampler_weights(self,
                             diversity_coeff,
                             eps: float = 1e-6,
@@ -145,16 +144,16 @@ class CrystalReplayBuffer:
 
         scores = np.array(self.rewards_list)
         if diversity_coeff > 0:
-            x_tensor = torch.stack(self.x_list).to('cuda' if self.gpu_available else 'cpu')
-            if len(x_tensor) > 5000:
-                subsample_inds = np.random.choice(len(self), 5000, replace=False)
+            x_tensor = torch.stack(self.x_list).to(self.device)
+            if len(x_tensor) > 1000:
+                subsample_inds = np.random.choice(len(self), 1000, replace=False)
                 scores -= diversity_coeff * ((compute_sample_overlap(x_tensor[subsample_inds].float(),
                                                                      x_tensor.float(),
-                                                                     ga=0.1,
+                                                                     ga=0.01,
                                                                      agg='sum')).cpu().detach().numpy() - 1)  # subtract self contribution
             else:
                 scores -= diversity_coeff * ((compute_sample_overlap(x_tensor.float(),
-                                                                     ga=0.1,
+                                                                     ga=0.01,
                                                                      agg='sum')).cpu().detach().numpy() - 1)  # subtract self contribution
 
         if method == 'rank':
@@ -169,7 +168,7 @@ class CrystalReplayBuffer:
 
         return weights_i / np.sum(weights_i)  # enforce explicit normalization
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def sample(self,
                override_batch: Optional[int] = None,
                return_preload: Optional[bool] = False,
@@ -199,9 +198,8 @@ class CrystalReplayBuffer:
                                                                                     sg_inds=sample.sg_ind)
         sample.sg_ind = sg_inds
         temperature = 10 ** T_tensor  # first dimension is the log temperature
-        with torch.no_grad():
-            reward = self.energy_function.prebuilt_sample_to_reward(
-                sample, temperature)  # recompute reward in case parameters have changed
+        reward = self.energy_function.prebuilt_sample_to_reward(
+            sample, temperature)  # recompute reward in case parameters have changed
 
         return sample.cell_params_to_gen_basis(), reward, sample, condition
 

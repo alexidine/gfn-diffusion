@@ -68,7 +68,7 @@ def sample_from_generator(
                 batch_inds = np.arange(b_ind * batch_size, (b_ind + 1) * batch_size)
                 mol_batch = collate_data_list([mol_list[ind] for ind in batch_inds]).to(device)
                 (flow_states, samples, log_r, log_Z, log_Z_lb,
-                 log_Z_learned, sample_batch, condition, log_pfs, log_pbs, log_fs,
+                 log_Z_learned, sample_batch, condition, log_pfs, log_pbs, log_flow,
                  f_means_f, f_vars_f, f_means_b, f_vars_b,
                  log_T_tensor) = log_partition_function(
                     init_state, gfn_model, discretizer, energy_function, mol_batch)
@@ -85,8 +85,9 @@ def sample_from_generator(
 @torch.no_grad()
 def log_partition_function(initial_state, gfn, discretizer, energy_function, mol_batch):
     log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(mol_batch)
+    condition = condition.to(gfn.device)
     mol_batch.sg_ind = sg_inds
-    (states, log_pfs, log_pbs, log_fs,
+    (states, log_pfs, log_pbs, log_flow,
      means_f, logvars_f, means_b, logvars_b) = gfn.get_trajectory_fwd(initial_state,
                                                                       discretizer,
                                                                       None,
@@ -100,12 +101,12 @@ def log_partition_function(initial_state, gfn, discretizer, energy_function, mol
 
     log_Z = logmeanexp(log_weight)
     log_Z_lb = log_weight.mean()
-    log_Z_learned = log_fs[:, 0].mean()
+    log_Z_learned = log_flow.mean()
 
     return (states, states[:, -1],
             log_r, log_Z, log_Z_lb, log_Z_learned,
             sample_batch, condition,
-            log_pfs, log_pbs, log_fs,
+            log_pfs, log_pbs, log_flow,
             means_f, logvars_f, means_b, logvars_b,
             log_T_tensor)
 

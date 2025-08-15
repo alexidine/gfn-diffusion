@@ -37,7 +37,7 @@ def eval_step(energy_function,
     gfn_model.eval()
 
     (flow_states, samples, log_r, log_Z, log_Z_lb,
-     log_Z_learned, sample_batch, condition, log_pfs, log_pbs, log_fs,
+     log_Z_learned, sample_batch, condition, log_pfs, log_pbs, log_flow,
      f_means_f, f_vars_f, f_means_b, f_vars_b,
      log_T_tensor) = log_partition_function(
         init_state, gfn_model, discretizer, energy_function, mol_batch)
@@ -55,7 +55,7 @@ def eval_step(energy_function,
                                      flow_states,
                                      gfn_model,
                                      init_state,
-                                     log_fs,
+                                     log_flow,
                                      log_pbs,
                                      log_pfs,
                                      log_r,
@@ -108,14 +108,14 @@ def conditional_eval_step(energy_function,
     cond_inds = torch.tensor([_ for _ in range(mols_to_sample)] * (samples_per_mol), dtype=torch.long)
 
     (flow_states, samples, log_r, log_Z, log_Z_lb,
-     log_Z_learned, sample_batch, condition, log_pfs, log_pbs, log_fs,
+     log_Z_learned, sample_batch, condition, log_pfs, log_pbs, log_flow,
      f_means_f, f_vars_f, f_means_b, f_vars_b,
      log_T_tensor) = log_partition_function(
         init_state, gfn_model, discretizer, energy_function, mol_batch)
 
     metrics = {}
     fig_dict = conditional_fwd_figs(
-        log_fs,
+        log_flow,
         log_pbs,
         log_pfs,
         log_r,
@@ -154,7 +154,7 @@ def log_crystals(sample_batch):
 def generate_fwd_figs(buffer, energy_function,
                       condition, flow_states,
                       gfn_model, init_state,
-                      log_fs, log_pbs, log_pfs, log_r,
+                      log_flow, log_pbs, log_pfs, log_r,
                       f_vars_f, f_means_f, f_vars_b, f_means_b, sample_batch,
                       log_T_tensor):
     fig_dict = {}
@@ -197,7 +197,7 @@ def generate_fwd_figs(buffer, energy_function,
     #     fig_dict['temp/Learned Z vs T'] = Z_vs_T_fig(gfn_model, init_state)
     #     fig_dict['temp/T vs Energy'] = T_vs_E_fig(condition, sample_batch)
     traj_param_logging(f_means_b, f_means_f, f_vars_b, f_vars_f, fig_dict, flow_states, log_pbs, log_pfs, log_r)
-    fig_dict['TB Parity Plot'], fig_dict['Forward TB R Value'] = flow_parity_plot(log_r, log_fs[:, 0], log_pbs, log_pfs)
+    fig_dict['TB Parity Plot'], fig_dict['Forward TB R Value'] = flow_parity_plot(log_r, log_flow, log_pbs, log_pfs)
     fig_dict['VG Error'] = vargrad_error(log_r, log_pbs, log_pfs)  # todo tune this up for conditional modelling
     fig_dict['Lattice Latents Trajectories'] = visualize_latent_trajs(flow_states.cpu().detach().numpy(),
                                                                       20,
@@ -207,7 +207,7 @@ def generate_fwd_figs(buffer, energy_function,
     fig_dict['Lattice Latents Distribution'], latent_klds = simple_cell_hist(sample_batch, buffer_latent_params,
                                                                              n_kde_points=200, bw_ratio=10,
                                                                              mode='latent')
-    fig_dict['Pf Parity'], fig_dict['Pf Parity R Value'] = Pf_alignment_fig(log_pfs, log_pbs, log_r, log_fs)
+    fig_dict['Pf Parity'], fig_dict['Pf Parity R Value'] = Pf_alignment_fig(log_pfs, log_pbs, log_r, log_flow)
 
     log_buffer_kld(cell_klds, fig_dict, latent_klds)
 
@@ -266,11 +266,11 @@ def known_mode_coverage(energy_function, fig_dict, std_cell_params):
         fig_dict['Soft Mode Coverage'] = coverage_per_mode.mean()
 
 
-def conditional_fwd_figs(log_fs, log_pbs, log_pfs, log_r,
+def conditional_fwd_figs(log_flow, log_pbs, log_pfs, log_r,
                          sample_batch, cond_inds,
                          log_T_tensor):
     fig_dict = {}
-    fig_dict['Conditional TB Parity Plot'], _ = conditional_flow_parity_plot(log_r, log_fs[:, 0], log_pbs, log_pfs,
+    fig_dict['Conditional TB Parity Plot'], _ = conditional_flow_parity_plot(log_r, log_flow, log_pbs, log_pfs,
                                                                              cond_inds)
     fig_dict['Conditional VG Error'] = conditional_vargrad_error(log_r, log_pbs,
                                                                  log_pfs, cond_inds)
@@ -790,7 +790,7 @@ def generate_bwd_figs(fig_dict, buffer, gfn_model, init_state, discretizer):
     terminal_state, b_log_r, crystal_batch, condition = buffer.sample(
         override_batch=len(init_state),
     override_sampler=None)
-    (backward_flow_states, b_log_pfs, b_log_pbs, b_log_fs,
+    (backward_flow_states, b_log_pfs, b_log_pbs, b_log_flow,
      b_means_f, b_vars_f, b_means_b, b_vars_b) = gfn_model.get_trajectory_bwd(
         terminal_state.to(gfn_model.device), discretizer, condition.to(gfn_model.device), return_gauss_params=True)
 
@@ -799,8 +799,8 @@ def generate_bwd_figs(fig_dict, buffer, gfn_model, init_state, discretizer):
         n_trajs=20, log_r=b_log_r.cpu().detach().numpy())
 
     fig_dict['Backward Pf vs Pb'] = Pf_vs_Pb_fig(b_log_pfs, b_log_pbs, b_log_r)
-    fig_dict['Backward TB Parity Plot'], fig_dict['Backward TB R Value'] = flow_parity_plot(b_log_r.to(b_log_fs.device),
-                                                                                            b_log_fs[:, 0], b_log_pbs,
+    fig_dict['Backward TB Parity Plot'], fig_dict['Backward TB R Value'] = flow_parity_plot(b_log_r.to(b_log_flow.device),
+                                                                                            b_log_flow, b_log_pbs,
                                                                                             b_log_pfs)
     fig_dict['Backward Gauss Params'] = mean_var_fig(b_vars_f, b_means_f,
                                                      b_vars_b, b_means_b)
@@ -811,7 +811,7 @@ def generate_bwd_figs(fig_dict, buffer, gfn_model, init_state, discretizer):
 
     fig_dict['Bwd Traj Mean Step Sizes'] = mean_flow_step_sizes(backward_flow_states)
 
-    log_weight = b_log_r + b_log_pbs.sum(-1) - b_log_pfs.sum(-1)
+    log_weight = b_log_r + b_log_pbs.sum(-1).cpu() - b_log_pfs.sum(-1).cpu()
     log_Z = logmeanexp(log_weight)
     log_Z_lb = log_weight.mean()
     fig_dict['Bwd Empirical log Z'] = log_Z.cpu().detach().numpy()
@@ -1013,9 +1013,9 @@ def Pf_vs_R_fig(pf, log_r):
     return fig, r_value
 
 
-def Pf_alignment_fig(log_pfs, log_pbs, log_r, log_fs):
+def Pf_alignment_fig(log_pfs, log_pbs, log_r, log_flow):
     x = log_pfs.sum(-1).cpu().detach().numpy()
-    y = (log_r + log_pbs.sum(-1) - log_fs[:, 0]).cpu().detach().numpy()
+    y = (log_r + log_pbs.sum(-1) - log_flow).cpu().detach().numpy()
     r_value, _ = pearsonr(x, y)
 
     fig = go.Figure()

@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from mxtaltools.constants.space_group_feature_tensor import SG_FEATURE_TENSOR
+from mxtaltools.constants.space_group_info import SYM_OPS
 from mxtaltools.dataset_utils.data_classes import MolCrystalData
 from mxtaltools.dataset_utils.utils import collate_data_list
 from .base_set import BaseSet
@@ -176,8 +177,6 @@ class MolecularCrystal(BaseSet):
 
     def generator_energy(self, cluster_batch, raw_latents=None):
         ens_dict = {}
-        if cluster_batch.device != self.device:
-            cluster_batch = cluster_batch.to(self.device)
 
         latents = cluster_batch.cell_params_to_gen_basis()
         if raw_latents is not None:
@@ -272,6 +271,7 @@ class MolecularCrystal(BaseSet):
                 ens_dict)  # softly bound from above  #crystal_energy.clip(min=-self.energy_clip, max=self.energy_clip)
         #return soft_clip(total_energy, 0).clip(max=self.energy_clip), ens_dict  # softly bound from above  #crystal_energy.clip(min=-self.energy_clip, max=self.energy_clip)
 
+    @torch.inference_mode()
     def prebuilt_sample_to_reward(self, crystals, temperature):
         """
         For pre-built, pre-scored crystal, generate the approriate reward for this point in training.
@@ -284,17 +284,16 @@ class MolecularCrystal(BaseSet):
         else:
             crystal_batch = crystals
 
-        with torch.no_grad():
-            energy, _ = self.generator_energy(crystal_batch)
+        energy, _ = self.generator_energy(crystal_batch)
 
         if torch.is_tensor(temperature):
-            sample_temperature = temperature.to(self.device)
+            sample_temperature = temperature.to(crystal_batch.device)
         elif isinstance(temperature, float) or isinstance(temperature, int):
-            sample_temperature = temperature * torch.ones_like(energy, device=self.device)
+            sample_temperature = temperature * torch.ones_like(energy, device=crystal_batch.device)
         else:
             assert False
 
-        return (-energy / sample_temperature).detach()
+        return -energy / sample_temperature
 
     def energy(self,
                x,
@@ -320,12 +319,12 @@ class MolecularCrystal(BaseSet):
             return energy / sample_temperature
 
     def init_blank_crystal_batch(self, mol_batch):  # todo no possible way this is the most efficient way to do this
-
-        ones3 = torch.ones(3, device=self.device)
-        zeros1 = torch.zeros(1, device=self.device)
-
+        ones3 = torch.ones(3, device='cpu')
+        zeros1 = torch.zeros(1, device='cpu')
+        eye3 = torch.eye(3, device='cpu')[None, :]
+        ones1 = torch.ones(1, device='cpu')
         if self.energy_function in ['ellipsoid_overlap', 'combo']:
-            overlap_tensor = torch.zeros(1, device=self.device)
+            overlap_tensor = torch.zeros(1, device='cpu')
         else:
             overlap_tensor = None
 
@@ -334,19 +333,18 @@ class MolecularCrystal(BaseSet):
         else:
             sgs = [self.space_groups[0] for _ in range(mol_batch.num_graphs)]
 
-        crystal_batch = collate_data_list([MolCrystalData(
-            molecule=mol_batch[ind].clone(),  # must be cloned
-            sg_ind=sgs[ind],
-            aunit_handedness=torch.ones(1),
-            cell_lengths=torch.ones(3, device=self.device),
-            # if we don't put dummies in here, later ops to_data_list fail
-            # but if we do put dummies in here, it does box analysis one-by-one which is super slow
+        sg_cache = {}
+        for sg in set(sgs):
+            sg_cache[sg] = np.stack(SYM_OPS[int(sg)])
+
+        base_xtal = MolCrystalData(
+            skip_box_analysis=True,
+            aunit_handedness=ones1,
+            cell_lengths=ones3,
             cell_angles=ones3,
             aunit_centroid=ones3,
             aunit_orientation=ones3,
-            skip_box_analysis=True,
             silu_pot=zeros1,
-            packing_coeff=zeros1,
             lj_pot=zeros1,
             scaled_lj_pot=zeros1,
             es_pot=zeros1,
@@ -357,7 +355,23 @@ class MolecularCrystal(BaseSet):
             core_energy=zeros1,
             lj_energy=zeros1,
             bounding_energy=zeros1,
-        ) for ind in range(len(mol_batch))]).to(self.device)
+            T_fc =eye3,
+            T_cf = eye3,
+            cell_volume = zeros1,
+            packing_coeff = zeros1,
+            density = zeros1,
+        )
+        crystal_list = []
+        for ind in range(mol_batch.num_graphs):
+            crystal = base_xtal.clone()
+            crystal.set_mol_attrs(mol_batch[ind].clone())
+            crystal.set_sg_attrs(is_well_defined=True,
+                                 nonstandard_symmetry=False,
+                                 sg_ind=sgs[ind],
+                                 symmetry_operators=sg_cache[sgs[ind]])
+            crystal_list.append(crystal)
+
+        crystal_batch = collate_data_list(crystal_list).to(self.device)
 
         return crystal_batch
 

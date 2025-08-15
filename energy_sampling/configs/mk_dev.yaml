@@ -16,21 +16,22 @@ gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weigh
 
 # model parameters
 zero_init: False
-joint_layers: 4              # number of layers in forward/backward policy models
-hidden_dim: 256              # dimensionality of hidden layer
-s_emb_dim: 256               # dimensionality of state embedding
-condition_emb_dim: 256         # dimensionality of the conditioning embedding
+joint_layers: 8              # number of layers in forward/backward policy models
+hidden_dim: 512              # dimensionality of hidden layer
+s_emb_dim: 512               # dimensionality of state embedding
+condition_emb_dim: 512         # dimensionality of the conditioning embedding
 t_emb_dim: 32                # dimensionality of time embedding
 harmonics_dim: 64            # dimensionality of harmonic embedding
 dropout: 0.1                   # dropout probability
 norm: layer                   # null, "layer", "batch"
 
-batch_size: 5               # number of samples per training batch
+batch_size: 5              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 50           # maximum batch size to allow
-repeats: 10                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
-eval_batch_size: 500        # batch size for evaluation
-epochs: 40000             # number of training epochs: relatively large
+max_batch_size: 2000           # maximum batch size to allow
+batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
+repeats: 5                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
+eval_batch_size: 1000        # batch size for evaluation
+epochs: 1000000             # number of training epochs: relatively large
 eval_period: 100              # how often to do evaluation & reporting
 conditional_eval_period: 10000 # how often to do conditional evaluation with figs # must be multiple of eval period
 figs_period: 100             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
@@ -61,7 +62,6 @@ fwd_loss_coeffs:
   var:              0
   overlap:          0
   buffer:           0
-  smoothed:         0
 
   detach_after:     0  # NON FUNCTIONAL
   var_cutoff:       0
@@ -69,16 +69,16 @@ fwd_loss_coeffs:
   buffer_gamma:     0
   loss_clip:        1.0E+9
 bwd_loss_coeffs:
-  tb:               0 #[[0, 1], [1000, 1], [2000, 0]]
+  tb:               0.0 #[[0, 1], [1000, 1], [2000, 0]]
   vg_lb:            0
-  vg_lme:           0  # exclusive with vg_lb
+  vg_lme:           1.0  # exclusive with vg_lb
   emp_z:            0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
-  mle:              1  # will do weighted MLE if VG is running, otherwise trajectory-wise
-  smoothed:         0
+  mle:              1.0  # will do weighted MLE if VG is running, otherwise trajectory-wise
   mle_prior_fraction: 0
   pmle_std:         1 # std deviation of the prior mle distribution. Best to start small (1) and smoothly grow
   loss_clip:        1.0E+9
 
+prior_coverage_cutoff: 0.75  # or None  # value of minimum 1D coverage below which we penalize forward training in favour of backward
 both_ways: True             # forward and backward training
 bwd_batch_multiplier: 1      # ratio of backward to foward batch size (much cheaper to evaluate)
 fwd_to_bwd_ratio: 1           # whether to do forward (>1) or backward (<1) training more often
@@ -92,7 +92,7 @@ gfn_clip: 200.0  # clip the maximum step size induced by the policy model
 ################################################################
 buffer_path: 'D:/crystal_datasets/nic_sg2_dataset.pt'#'D:/crystal_datasets/test_qm9_sg2_dataset.pt' #'D:/crystal_datasets/urea_gfn_dataset.pt' #
 molecules_path: 'D:/crystal_datasets/test_csd_free_qm9_dataset.pt'
-autoencoder_path: 'C:/Users/mikem/crystals/CSP_runs/models/cluster/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
+autoencoder_path: 'D:/crystal_datasets/model_checkpoints/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
 
 #buffer_path: '/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
 #molecules_path: '/scratch/mk8347/csd_runs/datasets/csd_free_qm9_dataset.pt'
@@ -120,11 +120,11 @@ wd_max_steps: 10000  # number of steps to terminate the added variance
 molecule: 'nicotinamide'  # 'nicotinamide' or 'urea' or 'qm9' for molecule-conditional training
 temperature_conditioning: False  # if false, temperatures are set to energy_static_temperature, and there is no annealing
 molecule_conditioning: False  # MUST be true for molecule='qm9' and false else - conditions the generative prediction on the molecule
-mol_embedding_type: 'principal_axes'  # pricipal_axes or autoencoder
+mol_embedding_type: 'autoencoder'  # pricipal_axes or autoencoder
 sg_conditioning: False  # whether to conditionally sample across space groups
 space_groups: [2]  # which space groups to sample over
 energy_function: combo
-  # 'latent_harmonic' : unimadal harmonic potential in the latent space
+  # 'latent_harmonic' : unimodal harmonic potential in the latent space
   # 'crystal_harmonic': unimodal harmonic potential in the crystal space
   # 'latent_multiharmonic': multimodal harmonic potential in the latent space
   # 'crystal_multiharmonic': multimodal harmonic potential in the crystal space
@@ -133,7 +133,7 @@ energy_function: combo
   # 'combo' : silu + ellipsoid overlap + density term
 anneal_temperature: False  # scale temperature over time, when conditional it scales the distribution, when not it just decreases from static to min
 temp_annealing_max_steps: 2000  # time for scaling_factor to reach 1 (uniform sampling from min to max)
-anneal_repulsion: False
+anneal_repulsion: True
 repulsion_annealing_max_steps: 5000
 energy_density_coeff: 10.0  # how much to weight the density penalty term in the energy function
 energy_core_coeff: 10.0  # loss coefficient
