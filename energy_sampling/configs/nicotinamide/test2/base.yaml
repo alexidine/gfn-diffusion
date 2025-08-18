@@ -100,7 +100,7 @@ autoencoder_path: '/scratch/mk8347/csd_runs/models/best_autoencoder_experiments_
 
 # replay buffer settings
 ################################################################
-beta: 10.0             # reward prioritized replay sampling: high beta = steep prioritization
+beta: 0.1             # reward prioritized replay sampling: high beta = steep prioritization
 rank_weight: 1.0     # rank-based replay sampling: low rank_weight = steep prioritization
 buffer_diversity_coeff: 1.0  # how highly to weight sample diversity when sampling from the buffer
 prioritized: "boltzmann"   # three kinds of replay training: random, reward prioritized (Boltzmann), rank-based

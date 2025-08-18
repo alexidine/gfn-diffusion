@@ -132,7 +132,7 @@
   - anneal_repulsion_cutoff
   notes: ''
 - index: 11
-  tag: 11_beta_0.1
+  tag: 11_beta_10
   update_keys:
   - fwd_loss_coeffs
   - bwd_loss_coeffs

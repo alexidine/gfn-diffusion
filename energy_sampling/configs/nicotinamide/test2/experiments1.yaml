@@ -22,7 +22,7 @@ experiments:
     prior_coverage_cutoff: 0.75
     learn_pb: false
     learned_variance: false
-    beta: 10.0
+    beta: 0.1
     buffer_diversity_coeff: 1.0
     anneal_repulsion_cutoff: 0.5
 
@@ -42,7 +42,7 @@ experiments:
     prior_coverage_cutoff: 0.75
     learn_pb: false
     learned_variance: false
-    beta: 10.0
+    beta: 0.1
     buffer_diversity_coeff: 1.0
     anneal_repulsion_cutoff: 0.5
 
@@ -62,7 +62,7 @@ experiments:
     prior_coverage_cutoff: 0.75
     learn_pb: false
     learned_variance: false
-    beta: 10.0
+    beta: 0.1
     buffer_diversity_coeff: 1.0
     anneal_repulsion_cutoff: 0.5
 
@@ -82,7 +82,7 @@ experiments:
     prior_coverage_cutoff: 0.75
     learn_pb: false
     learned_variance: false
-    beta: 10.0
+    beta: 0.1
     buffer_diversity_coeff: 1.0
     anneal_repulsion_cutoff: 0.5
 
@@ -102,7 +102,7 @@ experiments:
     prior_coverage_cutoff: 0.75
     learn_pb: false
     learned_variance: false
-    beta: 10.0
+    beta: 0.1
     buffer_diversity_coeff: 1.0
     anneal_repulsion_cutoff: 0.5
 
@@ -122,7 +122,7 @@ experiments:
     prior_coverage_cutoff: 0.75
     learn_pb: false
     learned_variance: false
-    beta: 10.0
+    beta: 0.1
     buffer_diversity_coeff: 1.0
     anneal_repulsion_cutoff: 0.5
 
@@ -142,7 +142,7 @@ experiments:
     prior_coverage_cutoff: 0.65
     learn_pb: false
     learned_variance: false
-    beta: 10.0
+    beta: 0.1
     buffer_diversity_coeff: 1.0
     anneal_repulsion_cutoff: 0.5
 
@@ -162,7 +162,7 @@ experiments:
     prior_coverage_cutoff: 0.75
     learn_pb: true
     learned_variance: false
-    beta: 10.0
+    beta: 0.1
     buffer_diversity_coeff: 1.0
     anneal_repulsion_cutoff: 0.5
 
@@ -182,7 +182,7 @@ experiments:
     prior_coverage_cutoff: 0.75
     learn_pb: false
     learned_variance: true
-    beta: 10.0
+    beta: 0.1
     buffer_diversity_coeff: 1.0
     anneal_repulsion_cutoff: 0.5
 
@@ -202,7 +202,7 @@ experiments:
     prior_coverage_cutoff: 0.75
     learn_pb: true
     learned_variance: true
-    beta: 10.0
+    beta: 0.1
     buffer_diversity_coeff: 1.0
     anneal_repulsion_cutoff: 0.5
 
@@ -223,11 +223,11 @@ experiments:
     prior_coverage_cutoff: 0.75
     learn_pb: false
     learned_variance: false
-    beta: 10.0
+    beta: 0.1
     buffer_diversity_coeff: 1.0
     anneal_repulsion_cutoff: 0.5
 
-- tag: 11_beta_0.1
+- tag: 11_beta_10
   update:
     fwd_loss_coeffs:
       tb: 0.1
@@ -243,7 +243,7 @@ experiments:
     prior_coverage_cutoff: 0.75
     learn_pb: false
     learned_variance: false
-    beta: 0.1
+    beta: 10.0
     buffer_diversity_coeff: 1.0
     anneal_repulsion_cutoff: 0.5
 
