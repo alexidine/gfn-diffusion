@@ -1,0 +1,249 @@
+defaults:
+  base: base.yaml
+
+# single-molecule search
+# testing the depth/breadth tradeoff
+
+
+experiments:
+- tag: 0_baseline
+  update:
+    fwd_loss_coeffs:
+      tb: 0.1
+      vg_lme: 0
+      emp_z: 0
+      greedy: 1.0
+      reinforce: 0
+    bwd_loss_coeffs:
+      tb: 0.0
+      vg_lme: 0.1
+      emp_z: 0
+      mle: 1.0
+    prior_coverage_cutoff: 0.75
+    learn_pb: false
+    learned_variance: false
+    beta: 10.0
+    buffer_diversity_coeff: 1.0
+    anneal_repulsion_cutoff: 0.5
+
+- tag: 1_sub_RF
+  update:
+    fwd_loss_coeffs:
+      tb: 0.1
+      vg_lme: 0
+      emp_z: 0
+      greedy: 0.0
+      reinforce: 1.0
+    bwd_loss_coeffs:
+      tb: 0.0
+      vg_lme: 0.1
+      emp_z: 0
+      mle: 1.0
+    prior_coverage_cutoff: 0.75
+    learn_pb: false
+    learned_variance: false
+    beta: 10.0
+    buffer_diversity_coeff: 1.0
+    anneal_repulsion_cutoff: 0.5
+
+- tag: 2_plus_RF
+  update:
+    fwd_loss_coeffs:
+      tb: 0.1
+      vg_lme: 0
+      emp_z: 0
+      greedy: 1.0
+      reinforce: 1.0
+    bwd_loss_coeffs:
+      tb: 0.0
+      vg_lme: 0.1
+      emp_z: 0
+      mle: 1.0
+    prior_coverage_cutoff: 0.75
+    learn_pb: false
+    learned_variance: false
+    beta: 10.0
+    buffer_diversity_coeff: 1.0
+    anneal_repulsion_cutoff: 0.5
+
+- tag: 3_fTB only
+  update:
+    fwd_loss_coeffs:
+      tb: 1.0
+      vg_lme: 0
+      emp_z: 0
+      greedy: 0.0
+      reinforce: 0
+    bwd_loss_coeffs:
+      tb: 0.0
+      vg_lme: 0.1
+      emp_z: 0
+      mle: 1.0
+    prior_coverage_cutoff: 0.75
+    learn_pb: false
+    learned_variance: false
+    beta: 10.0
+    buffer_diversity_coeff: 1.0
+    anneal_repulsion_cutoff: 0.5
+
+- tag: 4_bVG_only
+  update:
+    fwd_loss_coeffs:
+      tb: 0.1
+      vg_lme: 0
+      emp_z: 0
+      greedy: 1.0
+      reinforce: 0
+    bwd_loss_coeffs:
+      tb: 0.0
+      vg_lme: 1.0
+      emp_z: 0
+      mle: 0.0
+    prior_coverage_cutoff: 0.75
+    learn_pb: false
+    learned_variance: false
+    beta: 10.0
+    buffer_diversity_coeff: 1.0
+    anneal_repulsion_cutoff: 0.5
+
+- tag: 5_sub_bTB
+  update:
+    fwd_loss_coeffs:
+      tb: 0.1
+      vg_lme: 0
+      emp_z: 0
+      greedy: 1.0
+      reinforce: 0
+    bwd_loss_coeffs:
+      tb: 0.1
+      vg_lme: 0.0
+      emp_z: 0
+      mle: 1.0
+    prior_coverage_cutoff: 0.75
+    learn_pb: false
+    learned_variance: false
+    beta: 10.0
+    buffer_diversity_coeff: 1.0
+    anneal_repulsion_cutoff: 0.5
+
+- tag: 6_cover_65
+  update:
+    fwd_loss_coeffs:
+      tb: 0.1
+      vg_lme: 0
+      emp_z: 0
+      greedy: 1.0
+      reinforce: 0
+    bwd_loss_coeffs:
+      tb: 0.0
+      vg_lme: 0.1
+      emp_z: 0
+      mle: 1.0
+    prior_coverage_cutoff: 0.65
+    learn_pb: false
+    learned_variance: false
+    beta: 10.0
+    buffer_diversity_coeff: 1.0
+    anneal_repulsion_cutoff: 0.5
+
+- tag: 7_learn_pb
+  update:
+    fwd_loss_coeffs:
+      tb: 0.1
+      vg_lme: 0
+      emp_z: 0
+      greedy: 1.0
+      reinforce: 0
+    bwd_loss_coeffs:
+      tb: 0.0
+      vg_lme: 0.1
+      emp_z: 0
+      mle: 1.0
+    prior_coverage_cutoff: 0.75
+    learn_pb: true
+    learned_variance: false
+    beta: 10.0
+    buffer_diversity_coeff: 1.0
+    anneal_repulsion_cutoff: 0.5
+
+- tag: 8_learn_var
+  update:
+    fwd_loss_coeffs:
+      tb: 0.1
+      vg_lme: 0
+      emp_z: 0
+      greedy: 1.0
+      reinforce: 0
+    bwd_loss_coeffs:
+      tb: 0.0
+      vg_lme: 0.1
+      emp_z: 0
+      mle: 1.0
+    prior_coverage_cutoff: 0.75
+    learn_pb: false
+    learned_variance: true
+    beta: 10.0
+    buffer_diversity_coeff: 1.0
+    anneal_repulsion_cutoff: 0.5
+
+- tag: 9_learn_both
+  update:
+    fwd_loss_coeffs:
+      tb: 0.1
+      vg_lme: 0
+      emp_z: 0
+      greedy: 1.0
+      reinforce: 0
+    bwd_loss_coeffs:
+      tb: 0.0
+      vg_lme: 0.1
+      emp_z: 0
+      mle: 1.0
+    prior_coverage_cutoff: 0.75
+    learn_pb: true
+    learned_variance: true
+    beta: 10.0
+    buffer_diversity_coeff: 1.0
+    anneal_repulsion_cutoff: 0.5
+
+- tag: 10_low_disc_discretizer
+  update:
+    discretizer: low_discrepancy
+    fwd_loss_coeffs:
+      tb: 0.1
+      vg_lme: 0
+      emp_z: 0
+      greedy: 1.0
+      reinforce: 0
+    bwd_loss_coeffs:
+      tb: 0.0
+      vg_lme: 0.1
+      emp_z: 0
+      mle: 1.0
+    prior_coverage_cutoff: 0.75
+    learn_pb: false
+    learned_variance: false
+    beta: 10.0
+    buffer_diversity_coeff: 1.0
+    anneal_repulsion_cutoff: 0.5
+
+- tag: 11_beta_0.1
+  update:
+    fwd_loss_coeffs:
+      tb: 0.1
+      vg_lme: 0
+      emp_z: 0
+      greedy: 1.0
+      reinforce: 0
+    bwd_loss_coeffs:
+      tb: 0.0
+      vg_lme: 0.1
+      emp_z: 0
+      mle: 1.0
+    prior_coverage_cutoff: 0.75
+    learn_pb: false
+    learned_variance: false
+    beta: 0.1
+    buffer_diversity_coeff: 1.0
+    anneal_repulsion_cutoff: 0.5
+

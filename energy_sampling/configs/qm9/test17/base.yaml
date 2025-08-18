@@ -1,5 +1,5 @@
-run_name: 'mk_local_dev'
-tag: 'dev'
+run_name: 'test17'
+tag: 'test17'
 seed: 12345
 device: 'cuda'
 lr_policy: 0.001              # learning rate of the policy network
@@ -34,7 +34,7 @@ eval_batch_size: 1000        # batch size for evaluation
 epochs: 1000000             # number of training epochs: relatively large
 eval_period: 500              # how often to do evaluation & reporting
 conditional_eval_period: 10000 # how often to do conditional evaluation with figs # must be multiple of eval period
-figs_period: 500             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+figs_period: 500             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # GFlowNet settings
 T: 10                        # static training diffusion length
@@ -89,7 +89,7 @@ gfn_clip: 200.0  # clip the maximum step size induced by the policy model
 
 # dataset settings
 ################################################################
-buffer_path: 'D:/crystal_datasets/nic_sg2_dataset.pt'  #D:/crystal_datasets/test_qm9_sg2_dataset.pt'#'D:/crystal_datasets/nic_sg2_dataset.pt' #'D:/crystal_datasets/urea_gfn_dataset.pt' #
+buffer_path: 'D:/crystal_datasets/test_qm9_sg2_dataset.pt'#'D:/crystal_datasets/nic_sg2_dataset.pt' #'D:/crystal_datasets/urea_gfn_dataset.pt' #
 molecules_path: 'D:/crystal_datasets/test_csd_free_qm9_dataset.pt'
 autoencoder_path: 'D:/crystal_datasets/model_checkpoints/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
 
@@ -116,9 +116,9 @@ wd_max_steps: 10000  # number of steps to terminate the added variance
 
 # molecular crystal settings
 ################################################################
-molecule: 'nicotinamide'  # 'nicotinamide' or 'urea' or 'qm9' for molecule-conditional training
+molecule: 'qm9'  # 'nicotinamide' or 'urea' or 'qm9' for molecule-conditional training
 temperature_conditioning: False  # if false, temperatures are set to energy_static_temperature, and there is no annealing
-molecule_conditioning: False  # MUST be true for molecule='qm9' and false else - conditions the generative prediction on the molecule
+molecule_conditioning: True  # MUST be true for molecule='qm9' and false else - conditions the generative prediction on the molecule
 mol_embedding_type: 'autoencoder'  # pricipal_axes or autoencoder
 sg_conditioning: False  # whether to conditionally sample across space groups
 space_groups: [2]  # which space groups to sample over

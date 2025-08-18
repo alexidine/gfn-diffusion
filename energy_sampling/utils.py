@@ -298,55 +298,54 @@ def triangle_schedule(it, init, maxval, minval, on, off):
 
 
 @torch.inference_mode()
-def featurize_dataset(dataset, device, ellipsoid_scale, lj_repulsion):
-    batch_size = 500
+def featurize_dataset(dataset, device, ellipsoid_scale, lj_repulsion, batch_size: int = 500):
+
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         drop_last=False
     )
-    with torch.no_grad():
-        overlaps = []
-        silus = []
-        ljs = []
-        niggli_overlaps = []
+    overlaps = []
+    silus = []
+    ljs = []
+    niggli_overlaps = []
 
-        for crystal_batch in tqdm(loader):
-            crystal_batch = crystal_batch.to(device)
-            crystal_batch.box_analysis()
-            cluster_batch = crystal_batch.mol2cluster(cutoff=6,
-                                                      supercell_size=10,
-                                                      align_to_standardized_orientation=True)
+    for crystal_batch in tqdm(loader):
+        crystal_batch = crystal_batch.to(device)
+        crystal_batch.box_analysis()
+        cluster_batch = crystal_batch.mol2cluster(cutoff=6,
+                                                  supercell_size=10,
+                                                  align_to_standardized_orientation=True)
 
-            cluster_batch.construct_radial_graph(cutoff=6)
+        cluster_batch.construct_radial_graph(cutoff=6)
 
-            lj_energy, normed_lj_energy = cluster_batch.compute_LJ_energy()
-            silu_energy = cluster_batch.compute_silu_energy(
-                repulsion=lj_repulsion,
-            )
+        lj_energy, normed_lj_energy = cluster_batch.compute_LJ_energy()
+        silu_energy = cluster_batch.compute_silu_energy(
+            repulsion=lj_repulsion,
+        )
 
-            # simplified ellipsoid energy testing
-            _, _, _, _, _, _, normed_ellipsoid_overlap \
-                = cluster_batch.compute_ellipsoidal_overlap(
-                surface_padding=ellipsoid_scale,
-                return_details=True)
+        # simplified ellipsoid energy testing
+        _, _, _, _, _, _, normed_ellipsoid_overlap \
+            = cluster_batch.compute_ellipsoidal_overlap(
+            surface_padding=ellipsoid_scale,
+            return_details=True)
 
-            niggli_overlap = cluster_batch.compute_niggli_overlap()
+        niggli_overlap = cluster_batch.compute_niggli_overlap()
 
-            overlaps.extend(normed_ellipsoid_overlap.cpu().detach())
-            silus.extend(silu_energy.cpu().detach())
-            ljs.extend(lj_energy.cpu().detach())
-            niggli_overlaps.extend(niggli_overlap.cpu().detach())
+        overlaps.extend(normed_ellipsoid_overlap.cpu().detach())
+        silus.extend(silu_energy.cpu().detach())
+        ljs.extend(lj_energy.cpu().detach())
+        niggli_overlaps.extend(niggli_overlap.cpu().detach())
 
-        overlaps = torch.tensor(overlaps)
-        silus = torch.tensor(silus)
-        ljs = torch.tensor(ljs)
-        niggli_overlaps = torch.tensor(niggli_overlaps)
-        for ind, elem in enumerate(dataset):
-            elem.ellipsoid_overlap = torch.ones(1) * overlaps[ind]
-            elem.silu_pot = torch.ones(1) * silus[ind]
-            elem.lj_pot = torch.ones(1) * ljs[ind]
-            elem.niggli_overlap = torch.ones(1) * niggli_overlaps[ind]
+    overlaps = torch.tensor(overlaps)
+    silus = torch.tensor(silus)
+    ljs = torch.tensor(ljs)
+    niggli_overlaps = torch.tensor(niggli_overlaps)
+    for ind, elem in enumerate(dataset):
+        elem.ellipsoid_overlap = torch.ones(1) * overlaps[ind]
+        elem.silu_pot = torch.ones(1) * silus[ind]
+        elem.lj_pot = torch.ones(1) * ljs[ind]
+        elem.niggli_overlap = torch.ones(1) * niggli_overlaps[ind]
 
     # exclude negative niggli overlaps
     dataset = [elem for elem in dataset if elem.niggli_overlap >= 0]
@@ -400,7 +399,7 @@ def get_conditioning_dim(args):
     if args.temperature_conditioning:
         conditioning_dim += 1
     if args.molecule_conditioning:
-        if args.mol_embedding_type == 'autoencodoer':
+        if args.mol_embedding_type == 'autoencoder':
             conditioning_dim += 64 * 3
         elif args.mol_embedding_type == 'principal_axes':
             conditioning_dim += 9
@@ -411,7 +410,7 @@ def get_conditioning_dim(args):
     return conditioning_dim
 
 
-def anneal_reward(it, temp_annealing_lambda, repulsion_annealing_lambda, energy_function, args):
+def anneal_reward(it, temp_annealing_lambda, energy_function, args):
     """anneal reward function"""
     if args.anneal_temperature:
         if args.temperature_conditioning:
@@ -420,10 +419,6 @@ def anneal_reward(it, temp_annealing_lambda, repulsion_annealing_lambda, energy_
         else:
             if energy_function.temperature > args.energy_min_temperature:
                 energy_function.temperature *= temp_annealing_lambda
-
-    if args.anneal_repulsion:
-        if energy_function.lj_repulsion < 1:
-            energy_function.lj_repulsion *= repulsion_annealing_lambda
 
     if args.core_start_time > 0:
         energy_function.core_coeff = round(

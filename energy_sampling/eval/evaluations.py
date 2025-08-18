@@ -935,7 +935,7 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
         metrics['ellipsoid overlap'] = sample_batch.ellipsoid_overlap.clip(min=1e-3).log10().cpu().detach().numpy()
 
     if buffer is not None:
-        if len(buffer) > 0:  # todo adjust this to be according to the sampling routine
+        if len(buffer) > 0:
             metrics['Buffer Length'] = len(buffer)
             metrics['Buffer Quantiles'] = np.array([
                 np.quantile(buffer.rewards_list, q=p)
@@ -948,6 +948,7 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
     else:
         prior_sample = sample_crystal_prior(sample_batch, args.bwd_loss_coeffs.pmle_std)
 
+    # todo do this separately for each space group
     prior_coverage = get_dimwise_coverage(std_params, prior_sample.to('cpu'),
                                           n_bins=24, cmin=1, tau=100)
     lattice_features = ['cell_a', 'cell_b', 'cell_c',
@@ -959,6 +960,9 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
 
     metrics['Minium 1d coverage'] = torch.amin(prior_coverage).item()
 
+    # get fraction of samples which are 'reasonable', meaning density > 0.55 and bound states
+    sample_is_good = (sample_batch.silu_pot < 0) * (sample_batch.packing_coeff > 0.55)
+    metrics["Reasonable Sample Fraction"] = sample_is_good.float().mean().item()
     metrics = {k: to_loggable(v) for k, v in metrics.items()}
 
     return metrics

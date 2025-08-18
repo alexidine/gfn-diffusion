@@ -285,9 +285,6 @@ def train():
     else:
         temp_annealing_lambda = get_annealing_factor(args.energy_max_temperature, args.energy_min_temperature,
                                                      args.temp_annealing_max_steps, 10)
-
-    repulsion_annealing_lambda = get_annealing_factor(args.lj_repulsion, 1, args.repulsion_annealing_max_steps, 10)
-
     fwd_loss_dict = None
     bwd_loss_dict = None
     oomed_out = False
@@ -363,7 +360,7 @@ def train():
             elif step_ind % 10 == 0:
                 metrics['train/expl'] = exploration_std(0) if exploration_std is not None else 0
                 lr_warmup_finished, lr = step_lr_schedule(schedulers, optimizers, lr_warmup_finished)
-                anneal_reward(step_ind, temp_annealing_lambda, repulsion_annealing_lambda, energy_function, args)
+                anneal_reward(step_ind, temp_annealing_lambda, energy_function, args)
                 ten_step_reporting(bwd_loss, bwd_loss_dict, fwd_loss, fwd_loss_dict, metrics, optimizers)
                 wandb.log(metrics, step=step_ind)
 
@@ -870,11 +867,24 @@ def eval_work(args,
 
     if args.prior_coverage_cutoff is not None:
         low_cut = max(0, args.prior_coverage_cutoff * 0.95)
-        high_cut = min(1, args.prior_coverage_cutoff * 1.05)
+        high_cut = min(1, args.prior_coverage_cutoff * 1.0)
         if metrics['Minium 1d coverage'] < high_cut:
             args.fwd_to_bwd_ratio *= 0.9  # train forward less often
         elif metrics['Minium 1d coverage'] < low_cut:
             args.fwd_to_bwd_ratio *= 1.1
+
+    if args.anneal_repulsion:
+        if metrics['Reasonable Sample Fraction'] >= args.anneal_repulsion_cutoff:
+            if args.lj_repulsion < 1:
+                args.lj_repulsion = min(1, args.lj_repulsion * 1.1)
+                energy_function.lj_repulsion = args.lj_repulsion
+                buffer.recompute_silu_pot(
+                    batch_size=min(500, args.batch_size),
+                    lj_repulsion=args.lj_repulsion,
+                    device=args.device
+                )
+
+    metrics['LJ Repulsion'] = args.lj_repulsion
 
     metrics['Fwd to Bwd Ratio'] = args.fwd_to_bwd_ratio
     wandb.log(metrics, step=step_ind)

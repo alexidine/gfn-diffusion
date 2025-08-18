@@ -2,6 +2,7 @@ from typing import Optional
 
 import torch
 import numpy as np
+from torch_geometric.loader import DataLoader
 
 from mxtaltools.crystal_building.crystal_latent_transforms import compute_niggli_overlap
 from mxtaltools.dataset_utils.utils import collate_data_list
@@ -203,3 +204,35 @@ class CrystalReplayBuffer:
 
         return sample.cell_params_to_gen_basis(), reward, sample, condition
 
+    @torch.inference_mode()
+    def recompute_silu_pot(self, batch_size, lj_repulsion, device):
+        """when updating the silu repulsive term,
+        we have to rebuild and re-analyze the full dataset"""
+        loader = DataLoader(
+            self.dataset,
+            batch_size=batch_size,
+            drop_last=False
+        )
+        silus = []
+
+        for crystal_batch in loader:
+            crystal_batch = crystal_batch.to(device)
+            crystal_batch.box_analysis()
+            cluster_batch = crystal_batch.mol2cluster(cutoff=6,
+                                                      supercell_size=10,
+                                                      align_to_standardized_orientation=True)
+
+            cluster_batch.construct_radial_graph(cutoff=6)
+
+            _, _ = cluster_batch.compute_LJ_energy()
+            silu_energy = cluster_batch.compute_silu_energy(
+                repulsion=lj_repulsion,
+            )
+            silus.extend(silu_energy.cpu())
+
+        silus = torch.tensor(silus)
+        for ind, elem in enumerate(self.dataset):
+            elem.silu_pot = torch.ones(1) * silus[ind]
+
+        scores = self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(len(self)))
+        self.rewards_list = list(scores.flatten().cpu().detach().numpy())
