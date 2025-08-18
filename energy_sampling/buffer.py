@@ -161,7 +161,7 @@ class CrystalReplayBuffer:
             ranks = np.argsort(np.argsort(-1 * scores))
             weights_i = 1.0 / (self.rank_weight * len(scores) + ranks)
         elif method == 'boltzmann':
-            logits = scores / self.beta
+            logits = self.beta * scores
             logits -= np.max(logits)  # subtract max for stability
             weights_i = np.nan_to_num(np.exp(logits)) + eps  # all samples need nonzero probability
         else:  # uniform weights

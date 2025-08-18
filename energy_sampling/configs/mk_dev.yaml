@@ -78,6 +78,7 @@ bwd_loss_coeffs:
   loss_clip:        1.0E+9
 
 prior_coverage_cutoff: 0.65  # or None  # value of minimum 1D coverage below which we penalize forward training in favour of backward
+prior_coverage_ratio: 0.01  # [0, 1] fraction of uniform bin coverage that will satisfy the coverage metric
 both_ways: True             # forward and backward training
 bwd_batch_multiplier: 1      # ratio of backward to foward batch size (much cheaper to evaluate)
 fwd_to_bwd_ratio: 1           # whether to do forward (>1) or backward (<1) training more often
