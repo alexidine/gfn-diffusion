@@ -230,6 +230,9 @@ def low_discrepancy_discretizer(bsz, traj_length=2):
     timesteps_in_range = timestep % 1.0
     timesteps_sorted, indices = torch.sort(timesteps_in_range, dim=-1, descending=False)
     x = torch.cat([torch.zeros(bsz, 1), timesteps_sorted, torch.ones(bsz, 1)], dim=1)
+    # dt = x.diff(dim=1)
+    # too_small = dt < 5e-3
+
     return x
 
     # old code below:
