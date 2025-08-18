@@ -1,488 +1,145 @@
 - index: 0
-  tag: 0_512x8_random_tbtb_noPb
+  tag: 0_baseline
   update_keys:
-  - lr_policy
-  - lr_back
-  - max_batch_size
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - t_scale
-  - log_var_range
-  - pb_var_range
-  - pb_drift_range
   - fwd_loss_coeffs
   - bwd_loss_coeffs
-  - buffer_path
-  - both_ways
+  - prior_coverage_cutoff
   - learn_pb
   - learned_variance
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  - energy_static_temperature
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
   notes: ''
 - index: 1
-  tag: 1_512x8_random_tbtb_Pb
+  tag: 1_sub_RF
   update_keys:
-  - lr_policy
-  - lr_back
-  - max_batch_size
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - t_scale
-  - log_var_range
-  - pb_var_range
-  - pb_drift_range
   - fwd_loss_coeffs
   - bwd_loss_coeffs
-  - buffer_path
-  - both_ways
+  - prior_coverage_cutoff
   - learn_pb
   - learned_variance
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  - energy_static_temperature
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
   notes: ''
 - index: 2
-  tag: 2_512x8_random_tbtbmle_noPb
+  tag: 2_plus_RF
   update_keys:
-  - lr_policy
-  - lr_back
-  - max_batch_size
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - t_scale
-  - log_var_range
-  - pb_var_range
-  - pb_drift_range
   - fwd_loss_coeffs
   - bwd_loss_coeffs
-  - buffer_path
-  - both_ways
+  - prior_coverage_cutoff
   - learn_pb
   - learned_variance
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  - energy_static_temperature
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
   notes: ''
 - index: 3
-  tag: 3_1024x8_random_tbtb_noPb
+  tag: 3_fTB only
   update_keys:
-  - lr_policy
-  - lr_back
-  - max_batch_size
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - t_scale
-  - log_var_range
-  - pb_var_range
-  - pb_drift_range
   - fwd_loss_coeffs
   - bwd_loss_coeffs
-  - buffer_path
-  - both_ways
+  - prior_coverage_cutoff
   - learn_pb
   - learned_variance
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  - energy_static_temperature
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
   notes: ''
 - index: 4
-  tag: 4_512x16_random_tbtb_noPb
+  tag: 4_bVG_only
   update_keys:
-  - lr_policy
-  - lr_back
-  - max_batch_size
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - t_scale
-  - log_var_range
-  - pb_var_range
-  - pb_drift_range
   - fwd_loss_coeffs
   - bwd_loss_coeffs
-  - buffer_path
-  - both_ways
+  - prior_coverage_cutoff
   - learn_pb
   - learned_variance
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  - energy_static_temperature
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
   notes: ''
 - index: 5
-  tag: 5_512x8_random_tbgtb_noPb
+  tag: 5_sub_bTB
   update_keys:
-  - lr_policy
-  - lr_back
-  - max_batch_size
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - t_scale
-  - log_var_range
-  - pb_var_range
-  - pb_drift_range
   - fwd_loss_coeffs
   - bwd_loss_coeffs
-  - buffer_path
-  - both_ways
+  - prior_coverage_cutoff
   - learn_pb
   - learned_variance
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  - energy_static_temperature
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
   notes: ''
 - index: 6
-  tag: 6_512x8_random_tbtbBmle_noPb
+  tag: 6_cover_65
   update_keys:
-  - lr_policy
-  - lr_back
-  - max_batch_size
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - t_scale
-  - log_var_range
-  - pb_var_range
-  - pb_drift_range
   - fwd_loss_coeffs
   - bwd_loss_coeffs
-  - buffer_path
-  - both_ways
+  - prior_coverage_cutoff
   - learn_pb
   - learned_variance
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  - energy_static_temperature
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
   notes: ''
 - index: 7
-  tag: 7_512x8_lowd_tbtb_noPb
+  tag: 7_learn_pb
   update_keys:
-  - lr_policy
-  - lr_back
-  - max_batch_size
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - discretizer
-  - t_scale
-  - log_var_range
-  - pb_var_range
-  - pb_drift_range
   - fwd_loss_coeffs
   - bwd_loss_coeffs
-  - buffer_path
-  - both_ways
+  - prior_coverage_cutoff
   - learn_pb
   - learned_variance
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  - energy_static_temperature
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
   notes: ''
 - index: 8
-  tag: 8_512x8_uni_tbtb_noPb
+  tag: 8_learn_var
   update_keys:
-  - lr_policy
-  - lr_back
-  - max_batch_size
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - discretizer
-  - t_scale
-  - log_var_range
-  - pb_var_range
-  - pb_drift_range
   - fwd_loss_coeffs
   - bwd_loss_coeffs
-  - buffer_path
-  - both_ways
+  - prior_coverage_cutoff
   - learn_pb
   - learned_variance
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  - energy_static_temperature
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
   notes: ''
 - index: 9
-  tag: 9_1024x16_random_tbtb_noPb
+  tag: 9_learn_both
   update_keys:
-  - lr_policy
-  - lr_back
-  - max_batch_size
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - t_scale
-  - log_var_range
-  - pb_var_range
-  - pb_drift_range
   - fwd_loss_coeffs
   - bwd_loss_coeffs
-  - buffer_path
-  - both_ways
+  - prior_coverage_cutoff
   - learn_pb
   - learned_variance
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  - energy_static_temperature
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
   notes: ''
 - index: 10
-  tag: 10_512x8_random2_tbtb_noPb
+  tag: 10_low_disc_discretizer
   update_keys:
-  - lr_policy
-  - lr_back
-  - max_batch_size
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
   - discretizer
-  - discretizer_max_ratio
-  - t_scale
-  - log_var_range
-  - pb_var_range
-  - pb_drift_range
   - fwd_loss_coeffs
   - bwd_loss_coeffs
-  - buffer_path
-  - both_ways
+  - prior_coverage_cutoff
   - learn_pb
   - learned_variance
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  - energy_static_temperature
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
   notes: ''
 - index: 11
-  tag: 11_512x8_random100_tbtb_noPb
+  tag: 11_beta_0.1
   update_keys:
-  - lr_policy
-  - lr_back
-  - max_batch_size
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - discretizer
-  - discretizer_max_ratio
-  - t_scale
-  - log_var_range
-  - pb_var_range
-  - pb_drift_range
   - fwd_loss_coeffs
   - bwd_loss_coeffs
-  - buffer_path
-  - both_ways
+  - prior_coverage_cutoff
   - learn_pb
   - learned_variance
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  - energy_static_temperature
-  notes: ''
-- index: 12
-  tag: 12_512x8_random5_tbtb_noPb
-  update_keys:
-  - lr_policy
-  - lr_back
-  - max_batch_size
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - discretizer
-  - discretizer_max_ratio
-  - t_scale
-  - log_var_range
-  - pb_var_range
-  - pb_drift_range
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - buffer_path
-  - both_ways
-  - learn_pb
-  - learned_variance
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  - energy_static_temperature
-  notes: ''
-- index: 13
-  tag: 13_512x8_low_discrepancy_tbtb_noPb
-  update_keys:
-  - lr_policy
-  - lr_back
-  - max_batch_size
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - discretizer
-  - discretizer_max_ratio
-  - t_scale
-  - log_var_range
-  - pb_var_range
-  - pb_drift_range
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - buffer_path
-  - both_ways
-  - learn_pb
-  - learned_variance
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  - energy_static_temperature
-  notes: ''
-- index: 14
-  tag: 14_512x8_low_discrepancy2_tbtb_noPb
-  update_keys:
-  - lr_policy
-  - lr_back
-  - max_batch_size
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - discretizer
-  - discretizer_max_ratio
-  - t_scale
-  - log_var_range
-  - pb_var_range
-  - pb_drift_range
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - buffer_path
-  - both_ways
-  - learn_pb
-  - learned_variance
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  - energy_static_temperature
-  notes: ''
-- index: 15
-  tag: 16_512x8_equidistant_tbtb_noPb
-  update_keys:
-  - lr_policy
-  - lr_back
-  - max_batch_size
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - discretizer
-  - discretizer_max_ratio
-  - t_scale
-  - log_var_range
-  - pb_var_range
-  - pb_drift_range
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - buffer_path
-  - both_ways
-  - learn_pb
-  - learned_variance
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  - energy_static_temperature
-  notes: ''
-- index: 16
-  tag: 17_512x8_random2_mlemle_Pb
-  update_keys:
-  - lr_policy
-  - lr_back
-  - max_batch_size
-  - repeats
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - discretizer
-  - discretizer_max_ratio
-  - t_scale
-  - log_var_range
-  - pb_var_range
-  - pb_drift_range
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - buffer_path
-  - both_ways
-  - learn_pb
-  - learned_variance
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  - energy_static_temperature
-  notes: ''
-- index: 17
-  tag: 18_256x32_random2_mlemle_Pb
-  update_keys:
-  - lr_policy
-  - lr_back
-  - max_batch_size
-  - repeats
-  - joint_layers
-  - hidden_dim
-  - dropout
-  - norm
-  - discretizer
-  - discretizer_max_ratio
-  - t_scale
-  - log_var_range
-  - pb_var_range
-  - pb_drift_range
-  - fwd_loss_coeffs
-  - bwd_loss_coeffs
-  - buffer_path
-  - both_ways
-  - learn_pb
-  - learned_variance
-  - exploratory
-  - exploration_factor
-  - exploration_wd
-  - wd_max_steps
-  - energy_static_temperature
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
   notes: ''
