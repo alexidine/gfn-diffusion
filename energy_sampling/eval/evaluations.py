@@ -950,7 +950,7 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
 
     # todo do this separately for each space group
     prior_coverage = get_dimwise_coverage(std_params, prior_sample.to('cpu'),
-                                          n_bins=24, cmin=1, tau=1/args.prior.coverage_ratio)
+                                          n_bins=24, cmin=1, tau=1/args.prior_coverage_ratio)
     lattice_features = ['cell_a', 'cell_b', 'cell_c',
                         'cell_alpha', 'cell_beta', 'cell_gamma',
                         'aunit_x', 'aunit_y', 'aunit_z',
