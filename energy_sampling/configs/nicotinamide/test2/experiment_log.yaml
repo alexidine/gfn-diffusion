@@ -1,0 +1,145 @@
+- index: 0
+  tag: 0_baseline
+  update_keys:
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - prior_coverage_cutoff
+  - learn_pb
+  - learned_variance
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
+  notes: ''
+- index: 1
+  tag: 1_sub_RF
+  update_keys:
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - prior_coverage_cutoff
+  - learn_pb
+  - learned_variance
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
+  notes: ''
+- index: 2
+  tag: 2_plus_RF
+  update_keys:
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - prior_coverage_cutoff
+  - learn_pb
+  - learned_variance
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
+  notes: ''
+- index: 3
+  tag: 3_fTB only
+  update_keys:
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - prior_coverage_cutoff
+  - learn_pb
+  - learned_variance
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
+  notes: ''
+- index: 4
+  tag: 4_bVG_only
+  update_keys:
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - prior_coverage_cutoff
+  - learn_pb
+  - learned_variance
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
+  notes: ''
+- index: 5
+  tag: 5_sub_bTB
+  update_keys:
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - prior_coverage_cutoff
+  - learn_pb
+  - learned_variance
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
+  notes: ''
+- index: 6
+  tag: 6_cover_65
+  update_keys:
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - prior_coverage_cutoff
+  - learn_pb
+  - learned_variance
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
+  notes: ''
+- index: 7
+  tag: 7_learn_pb
+  update_keys:
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - prior_coverage_cutoff
+  - learn_pb
+  - learned_variance
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
+  notes: ''
+- index: 8
+  tag: 8_learn_var
+  update_keys:
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - prior_coverage_cutoff
+  - learn_pb
+  - learned_variance
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
+  notes: ''
+- index: 9
+  tag: 9_learn_both
+  update_keys:
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - prior_coverage_cutoff
+  - learn_pb
+  - learned_variance
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
+  notes: ''
+- index: 10
+  tag: 10_low_disc_discretizer
+  update_keys:
+  - discretizer
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - prior_coverage_cutoff
+  - learn_pb
+  - learned_variance
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
+  notes: ''
+- index: 11
+  tag: 11_beta_0.1
+  update_keys:
+  - fwd_loss_coeffs
+  - bwd_loss_coeffs
+  - prior_coverage_cutoff
+  - learn_pb
+  - learned_variance
+  - beta
+  - buffer_diversity_coeff
+  - anneal_repulsion_cutoff
+  notes: ''

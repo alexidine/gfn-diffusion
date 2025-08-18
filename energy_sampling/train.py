@@ -869,14 +869,14 @@ def eval_work(args,
         low_cut = max(0, args.prior_coverage_cutoff * 0.95)
         high_cut = min(1, args.prior_coverage_cutoff * 1.0)
         if metrics['Minium 1d coverage'] < high_cut:
-            args.fwd_to_bwd_ratio *= 0.9  # train forward less often
+            args.fwd_to_bwd_ratio *= 0.75  # train forward less often
         elif metrics['Minium 1d coverage'] < low_cut:
-            args.fwd_to_bwd_ratio *= 1.1
+            args.fwd_to_bwd_ratio *= 1.25
 
     if args.anneal_repulsion:
         if metrics['Reasonable Sample Fraction'] >= args.anneal_repulsion_cutoff:
             if args.lj_repulsion < 1:
-                args.lj_repulsion = min(1, args.lj_repulsion * 1.1)
+                args.lj_repulsion = min(1, args.lj_repulsion * 1.05)
                 energy_function.lj_repulsion = args.lj_repulsion
                 buffer.recompute_silu_pot(
                     batch_size=min(500, args.batch_size),
