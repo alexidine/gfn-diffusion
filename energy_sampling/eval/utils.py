@@ -6,12 +6,15 @@ import torch
 from scipy.spatial.distance import jensenshannon
 from tqdm import tqdm
 
-from energy_sampling.utils import uniform_discretizer, get_gfn_init_state, embed_dataset, logmeanexp
+from energy_sampling.energies.molecular_crystal import mol_to_blank_crystal_list
+from energy_sampling.utils import uniform_discretizer, get_gfn_init_state, embed_dataset, logmeanexp, \
+    sample_crystal_prior
 from mxtaltools.analysis.crystal_rdf import crystal_rdf, compute_rdf_distance
 from mxtaltools.dataset_utils.utils import collate_data_list
 
 
-def sample_from_generator(
+def sample_crystals(
+        generator: str,  # 'generator' or 'random'
         gfn_model,
         batch_size,
         mol_list,
@@ -21,6 +24,8 @@ def sample_from_generator(
         device,
         energy_function,
         encoder=None,
+        optim_kwargs=None,
+        do_opt: bool = False
 ):
     """
     :param gfn_model:
@@ -37,6 +42,20 @@ def sample_from_generator(
     """
     initialize useful things
     """
+    if optim_kwargs is None:
+        optim_kwargs = dict(
+            optim_target='silu',
+            show_tqdm=True,
+            lr=1e-4,
+            convergence_eps=1e-3,
+            compression_factor=0.1,
+            max_num_steps=300,
+            do_box_restriction=True,
+            enforce_niggli=True,
+            cutoff=6,
+            optimizer_func=torch.optim.Rprop,
+        )
+
     with torch.no_grad():
         discretizer = lambda bsz: uniform_discretizer(bsz, n_steps)
 
@@ -50,36 +69,81 @@ def sample_from_generator(
         params_record = np.zeros((samples_per_mol, len(mol_list), 12))
         energy_record = np.zeros((samples_per_mol, len(mol_list)))
         density_record = np.zeros_like(energy_record)
+        sample_record = []
+        if do_opt:
+            opt_params_record = np.zeros((samples_per_mol, len(mol_list), 12))
+            opt_energy_record = np.zeros((samples_per_mol, len(mol_list)))
+            opt_density_record = np.zeros_like(energy_record)
+            opt_sample_record = []
 
-        """embed the dataset"""
-        if hasattr(mol_list[0], 'embedding'):
-            if mol_list[0].embedding is not None:
-                pass
+        if generator == 'generator':
+            """embed the dataset"""
+            if hasattr(mol_list[0], 'embedding'):
+                if mol_list[0].embedding is not None:
+                    pass
+                else:
+                    mol_list = embed_dataset(mol_list, encoder=encoder)
             else:
                 mol_list = embed_dataset(mol_list, encoder=encoder)
-        else:
-            mol_list = embed_dataset(mol_list, encoder=encoder)
 
         """sample"""
-        sample_record = []
+
         for s_ind in tqdm(range(samples_per_mol)):
             ssample_record = []
+            if do_opt:
+                opt_ssample_record = []
+
             for b_ind in range(num_batches):
                 batch_inds = np.arange(b_ind * batch_size, (b_ind + 1) * batch_size)
                 mol_batch = collate_data_list([mol_list[ind] for ind in batch_inds]).to(device)
-                (flow_states, samples, log_r, log_Z, log_Z_lb,
-                 log_Z_learned, sample_batch, condition, log_pfs, log_pbs, log_flow,
-                 f_means_f, f_vars_f, f_means_b, f_vars_b,
-                 log_T_tensor) = log_partition_function(
-                    init_state, gfn_model, discretizer, energy_function, mol_batch)
 
-                params_record[s_ind, batch_inds] = flow_states[:, -1].cpu().detach().numpy()
-                energy_record[s_ind, batch_inds] = sample_batch.silu_pot.cpu().detach().numpy()
+                if generator == 'generator':
+                    (_, samples, log_r, _, _,
+                     _, sample_batch, _, _, _, _,
+                     _, _, _, _,
+                     log_T_tensor) = log_partition_function(
+                        init_state, gfn_model, discretizer, energy_function, mol_batch)
+
+                elif generator == 'random':
+                    crystal_batch = collate_data_list(mol_to_blank_crystal_list(mol_batch, [space_group for _ in range(mol_batch.num_graphs)]))
+                    samples = sample_crystal_prior(crystal_batch, 1)
+                    log_T_tensor = torch.ones(crystal_batch.num_graphs, device=device) * energy_function.temperature
+                    log_r, sample_batch = energy_function.log_reward(
+                        samples, mol_batch=mol_batch,
+                        log_temperature=log_T_tensor,
+                        return_exp=True)
+
+                params_record[s_ind, batch_inds] = samples.cpu().detach().numpy()
+                energy_record[s_ind, batch_inds] = sample_batch.lj_pot.cpu().detach().numpy()
                 density_record[s_ind, batch_inds] = sample_batch.packing_coeff.cpu().detach().numpy()
                 ssample_record.append(sample_batch.cpu().detach().to_data_list())
-            sample_record.append(ssample_record)
 
-    return params_record, energy_record, density_record, sample_record
+                if do_opt:
+                    opt_batch = sample_batch.clone()
+                    opt_batch = opt_batch.to(device)
+                    opt_traj = opt_batch.optimize_crystal_parameters(**optim_kwargs)
+                    opt_batch = opt_batch.cpu()
+
+                    finished_batch = collate_data_list(opt_traj[-1])
+
+                    opt_params_record[s_ind, batch_inds] = finished_batch.cell_params_to_gen_basis().cpu().detach().numpy()
+                    opt_energy_record[s_ind, batch_inds] = finished_batch.lj_pot.cpu().detach().numpy()
+                    opt_density_record[s_ind, batch_inds] = finished_batch.packing_coeff.cpu().detach().numpy()
+                    opt_ssample_record.append(opt_traj[-1])
+
+            sample_record.append(ssample_record)
+            if do_opt:
+                opt_sample_record.append(opt_ssample_record)
+
+    if do_opt:
+        return params_record, energy_record, density_record, sample_record, \
+            opt_params_record, opt_energy_record, opt_density_record, opt_sample_record
+
+
+    else:
+        return params_record, energy_record, density_record, sample_record
+
+
 
 
 @torch.no_grad()
@@ -149,7 +213,7 @@ def get_rdfs(crystal_batch):
 
     return rdf.cpu().detach(), rr
 
-
+@torch.no_grad()
 def sample_csd_rdf_dists(csd_mols, csd_sampling_dict, eval_batch_size, device):
     sample_rdfs = []
     for ind in tqdm(range(len(csd_mols))):

@@ -260,7 +260,7 @@ def substitute_prior(condition, crystal_batch, energy_function, rewards, samples
 
 def train():
     times['initialization_start'] = time()
-    name = args.run_name
+    name = args.tag +  '_' + args.run_name
     config = args.__dict__
     config["Experiment"] = "{args.energy}"
 
@@ -389,12 +389,13 @@ def step_lr_schedule(schedulers, optimizers,
         lr = optimizers['fwd'].param_groups[0]['lr']
         if not lr_warmup_finished:
             schedulers['policy_1'].step()
+            schedulers['flow'].step()
+
             if lr >= args.lr_policy:
                 lr_warmup_finished = True
 
         elif lr > args.min_lr:
             schedulers['policy_2'].step()
-            schedulers['flow'].step()
         return lr_warmup_finished, lr
     else:
         return False, None
@@ -868,10 +869,11 @@ def eval_work(args,
     if args.prior_coverage_cutoff is not None:
         low_cut = max(0, args.prior_coverage_cutoff * 0.95)
         high_cut = min(1, args.prior_coverage_cutoff * 1.0)
-        if metrics['Minium 1d coverage'] < high_cut:
-            args.fwd_to_bwd_ratio *= 0.75  # train forward less often
+        if metrics['Minium 1d coverage'] > high_cut:
+            args.fwd_to_bwd_ratio *= 1.25  # train forward more often
         elif metrics['Minium 1d coverage'] < low_cut:
-            args.fwd_to_bwd_ratio *= 1.25
+            if args.fwd_to_bwd_ratio > 0.01:
+                args.fwd_to_bwd_ratio *= 0.75
 
     if args.anneal_repulsion:
         if metrics['Reasonable Sample Fraction'] >= args.anneal_repulsion_cutoff:

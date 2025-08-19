@@ -3,26 +3,40 @@ import torch
 from plotly import graph_objects as go, express as px
 
 
-def create_energy_distribution_plot(sg_sampling_dict):
+def create_energy_distribution_plot(sg_gen_sampling_dict,
+                                    sg_rand_sampling_dict):
     """Figure 1: Distribution of energies as stacked violin plots"""
+
     fig = go.Figure()
 
-    space_groups = sorted(sg_sampling_dict.keys())
+    space_groups = sorted(sg_gen_sampling_dict.keys())
+    names = ['Gen', 'Gen + Opt', 'Rand', 'Rand + Opt']
 
     for i, sg in enumerate(space_groups):
-        energies = sg_sampling_dict[sg]['energies'].flatten()
+        gen_energies = sg_gen_sampling_dict[sg]['energies'].flatten()
+        opt_gen_energies = sg_gen_sampling_dict[sg]['opt_energies'].flatten()
+        rand_energies = sg_rand_sampling_dict[sg]['energies'].flatten()
+        opt_rand_energies = sg_rand_sampling_dict[sg]['opt_energies'].flatten()
 
-        fig.add_trace(go.Violin(
-            #y=[f'SG={sg}'],  # y-axis position (space group number)
-            x=energies,  # x-axis values (energy distribution)
-            name=f'SG {sg}',
-            orientation='h',  # horizontal orientation
-            side='positive',
-            width=0.8,
-            points=False,
-            meanline_visible=True,
-            line_color=px.colors.qualitative.Set1[i % len(px.colors.qualitative.Set1)]
-        ))
+        for j, en in enumerate([gen_energies,
+                                opt_gen_energies,
+                                rand_energies,
+                                opt_rand_energies]):
+            fig.add_trace(go.Violin(
+                #y=[f'SG={sg}'],  # y-axis position (space group number)
+                x=en.clip(max=100),  # x-axis values (energy distribution)
+                #name=f'SG {sg}',
+                orientation='h',  # horizontal orientation
+                side='positive',
+                name=names[j],
+                legendgroup=names[j],
+                showlegend=i == 0,
+                width=0.8,
+                bandwidth = np.ptp(gen_energies) / 400,
+                points=False,
+                meanline_visible=True,
+                line_color=px.colors.qualitative.Set1[j % len(px.colors.qualitative.Set1)]
+            ))
 
     fig.update_layout(
         title='Energy Distributions by Space Group',
@@ -33,32 +47,44 @@ def create_energy_distribution_plot(sg_sampling_dict):
             tickvals=space_groups,
             ticktext=[f'SG {sg}' for sg in space_groups]
         ),
-        showlegend=False,
     )
 
     return fig
 
 
-def create_density_distribution_plot(sg_sampling_dict):
+def create_density_distribution_plot(sg_gen_sampling_dict,
+                                     sg_rand_sampling_dict):
     """Figure 2: Distribution of densities as stacked violin plots"""
+
     fig = go.Figure()
 
-    space_groups = sorted(sg_sampling_dict.keys())
-
+    space_groups = sorted(sg_gen_sampling_dict.keys())
+    names = ['Gen', 'Gen + Opt', 'Rand', 'Rand + Opt']
     for i, sg in enumerate(space_groups):
-        densities = sg_sampling_dict[sg]['densities'].flatten()
+        gen_densities = sg_gen_sampling_dict[sg]['densities'].flatten()
+        opt_gen_densities = sg_gen_sampling_dict[sg]['opt_densities'].flatten().clip(max=gen_densities.max())
+        rand_densities = sg_rand_sampling_dict[sg]['densities'].flatten().clip(max=gen_densities.max())
+        opt_rand_densities = sg_rand_sampling_dict[sg]['opt_densities'].flatten().clip(max=gen_densities.max())
 
-        fig.add_trace(go.Violin(
-            #y=[sg] * len(densities),  # y-axis position (space group number)
-            x=densities,  # x-axis values (density distribution)
-            name=f'SG {sg}',
-            orientation='h',  # horizontal orientation
-            side='positive',
-            width=0.8,
-            points=False,
-            meanline_visible=True,
-            line_color=px.colors.qualitative.Set1[i % len(px.colors.qualitative.Set1)]
-        ))
+        for j, den in enumerate([gen_densities,
+                                opt_gen_densities,
+                                rand_densities,
+                                opt_rand_densities]):
+            fig.add_trace(go.Violin(
+                y=[i + j / 10 for _ in range(len(den))],  # y-axis position (space group number)
+                x=den.clip(max=2),  # x-axis values (energy distribution)
+                # name=f'SG {sg}',
+                orientation='h',  # horizontal orientation
+                side='positive',
+                name=names[j],
+                legendgroup=names[j],
+                showlegend=i == 0,
+                width=0.8,
+                bandwidth=np.ptp(gen_densities) / 100,
+                points=False,
+                meanline_visible=True,
+                line_color=px.colors.qualitative.Set1[j % len(px.colors.qualitative.Set1)]
+            ))
 
     fig.update_layout(
         title='Density Distributions by Space Group',
@@ -69,7 +95,6 @@ def create_density_distribution_plot(sg_sampling_dict):
             tickvals=space_groups,
             ticktext=[f'SG {sg}' for sg in space_groups]
         ),
-        showlegend=False,
     )
 
     return fig

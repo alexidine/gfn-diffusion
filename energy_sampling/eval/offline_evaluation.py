@@ -14,7 +14,8 @@ from tqdm import tqdm
 from energy_sampling.energies.molecular_crystal import MolecularCrystal
 from energy_sampling.eval.offline_figs import create_energy_distribution_plot, create_density_distribution_plot, \
     create_cell_params_variance_plot, crystal_sample_funnel_plot
-from energy_sampling.eval.utils import sample_from_generator, sample_csd_rdf_dists, sample_csd_lattice_divs
+from energy_sampling.eval.utils import sample_csd_rdf_dists, sample_csd_lattice_divs, \
+    sample_crystals
 from energy_sampling.models import GFN
 from energy_sampling.utils import load_yaml, dict2namespace
 from mxtaltools.dataset_utils.utils import collate_data_list
@@ -37,6 +38,8 @@ if not os.path.exists('eval_results'):
     os.mkdir('eval_results')
 # load stuff here
 gfn_model_config = np.load(generator_config_path, allow_pickle=True).item()
+gfn_model_config['conditional_flow_model'] = True
+gfn_model_config['conditions_dim'] = 64 * 3
 gfn_model_state_dict = torch.load(generator_path, weights_only=True)
 gfn_model = GFN(**gfn_model_config)
 gfn_model.load_state_dict(gfn_model_state_dict)
@@ -72,16 +75,22 @@ energy_function = MolecularCrystal(device=args.device,
 """
 for each space group, for the eval set, sample and record energies, cell parameters
 """
-if not os.path.exists('sg_results.npy') or override_resample:
+if not os.path.exists('sg_gen_results.npy') or override_resample:
 
     eval_mols = torch.load(eval_molecules_path, weights_only=False)[:args.eval_mols_to_sample]
-    sg_sampling_dict = {sg: {} for sg in args.sgs_to_sample}
+    sg_gen_sampling_dict = {sg: {} for sg in args.sgs_to_sample}
 
     for sg in args.sgs_to_sample:
-        (sg_sampling_dict[sg]['cell_params'],
-         sg_sampling_dict[sg]['energies'],
-         sg_sampling_dict[sg]['densities'],
-         sg_sampling_dict[sg]['samples']) = sample_from_generator(
+        (sg_gen_sampling_dict[sg]['cell_params'],
+         sg_gen_sampling_dict[sg]['energies'],
+         sg_gen_sampling_dict[sg]['densities'],
+         sg_gen_sampling_dict[sg]['samples'],
+         sg_gen_sampling_dict[sg]['opt_cell_params'],
+         sg_gen_sampling_dict[sg]['opt_energies'],
+         sg_gen_sampling_dict[sg]['opt_densities'],
+         sg_gen_sampling_dict[sg]['opt_samples']
+         ) = sample_crystals(
+            'generator',
             gfn_model,
             args.eval_batch_size,
             eval_mols,
@@ -90,29 +99,64 @@ if not os.path.exists('sg_results.npy') or override_resample:
             args.eval_samples_per_mol,
             args.device,
             energy_function,
-            encoder
+            encoder,
+            do_opt=True,
         )
-    np.save('sg_results', sg_sampling_dict)
+    np.save('sg_gen_results', sg_gen_sampling_dict)
+
+if not os.path.exists('sg_rand_results.npy') or override_resample:
+    eval_mols = torch.load(eval_molecules_path, weights_only=False)[:args.eval_mols_to_sample]
+    sg_rand_sampling_dict = {sg: {} for sg in args.sgs_to_sample}
+
+    for sg in args.sgs_to_sample:
+        (sg_rand_sampling_dict[sg]['cell_params'],
+         sg_rand_sampling_dict[sg]['energies'],
+         sg_rand_sampling_dict[sg]['densities'],
+         sg_rand_sampling_dict[sg]['samples'],
+         sg_rand_sampling_dict[sg]['opt_cell_params'],
+         sg_rand_sampling_dict[sg]['opt_energies'],
+         sg_rand_sampling_dict[sg]['opt_densities'],
+         sg_rand_sampling_dict[sg]['opt_samples']
+         ) = sample_crystals(
+            'random',
+            gfn_model,
+            args.eval_batch_size,
+            eval_mols,
+            sg,
+            args.eval_T,
+            args.eval_samples_per_mol,
+            args.device,
+            energy_function,
+            encoder,
+            do_opt=True,
+        )
+    np.save('sg_rand_results', sg_rand_sampling_dict)
 
 """
 for each csd molecule, sample and record energies, cell parameters in the target SG
 """
-if not os.path.exists('csd_results.npy') or override_resample:
+if not os.path.exists('csd_opt_results.npy') or override_resample:
     csd_mols = torch.load(csd_crystals_path, weights_only=False)
     csd_mols = [mol for mol in csd_mols if int(mol.sg_ind) == 2]  # todo relax in future
     csd_mols = csd_mols[:args.csd_mols_to_sample]
 
     identifiers = [mol.identifier for mol in csd_mols]
-    csd_sampling_dict = {ident: {} for ident in identifiers}
+    csd_opt_sampling_dict = {ident: {} for ident in identifiers}
 
     for ind in tqdm(range(len(csd_mols))):
         id = identifiers[ind]
         mol = csd_mols[ind]
         sg = mol.sg_ind
-        (csd_sampling_dict[id]['cell_params'],
-         csd_sampling_dict[id]['energies'],
-         csd_sampling_dict[id]['densities'],
-         csd_sampling_dict[id]['samples']) = sample_from_generator(
+        (csd_opt_sampling_dict[id]['cell_params'],
+         csd_opt_sampling_dict[id]['energies'],
+         csd_opt_sampling_dict[id]['densities'],
+         csd_opt_sampling_dict[id]['samples'],
+         csd_opt_sampling_dict[id]['opt_cell_params'],
+         csd_opt_sampling_dict[id]['opt_energies'],
+         csd_opt_sampling_dict[id]['opt_densities'],
+         csd_opt_sampling_dict[id]['opt_samples']
+         ) = sample_crystals(
+            'generator',
             gfn_model,
             args.eval_batch_size,
             [mol for _ in range(args.eval_batch_size)],
@@ -121,15 +165,50 @@ if not os.path.exists('csd_results.npy') or override_resample:
             int(max(1, args.csd_samples_per_mol / args.eval_batch_size)),
             args.device,
             energy_function,
-            encoder
+            encoder,
+            do_opt=True,
         )
-    np.save('csd_results', csd_sampling_dict)
+    np.save('csd_opt_results', csd_opt_sampling_dict)
+
+    csd_rand_sampling_dict = {ident: {} for ident in identifiers}
+
+    for ind in tqdm(range(len(csd_mols))):
+        id = identifiers[ind]
+        mol = csd_mols[ind]
+        sg = mol.sg_ind
+        (csd_rand_sampling_dict[id]['cell_params'],
+         csd_rand_sampling_dict[id]['energies'],
+         csd_rand_sampling_dict[id]['densities'],
+         csd_rand_sampling_dict[id]['samples'],
+         csd_rand_sampling_dict[id]['opt_cell_params'],
+         csd_rand_sampling_dict[id]['opt_energies'],
+         csd_rand_sampling_dict[id]['opt_densities'],
+         csd_rand_sampling_dict[id]['opt_samples']
+         ) = sample_crystals(
+            'random',
+            gfn_model,
+            args.eval_batch_size,
+            [mol for _ in range(args.eval_batch_size)],
+            sg,
+            args.eval_T,
+            int(max(1, args.csd_samples_per_mol / args.eval_batch_size)),
+            args.device,
+            energy_function,
+            encoder,
+            do_opt=True,
+        )
+    np.save('csd_rand_results', csd_rand_sampling_dict)
     print('getting RDFs')
     csd_rdf_dists, rr = sample_csd_rdf_dists(csd_mols,
-                                             csd_sampling_dict,
-                                             args.eval_batch_size,
+                                             csd_opt_sampling_dict,
+                                             args.rdfs_batch_size,
                                              args.device)
-    np.save('csd_rdfs', csd_rdf_dists.cpu().detach().numpy())
+    np.save('csd_opt_rdfs', csd_rdf_dists.cpu().detach().numpy())
+    csd_rdf_dists, rr = sample_csd_rdf_dists(csd_mols,
+                                             csd_rand_sampling_dict,
+                                             args.rdfs_batch_size,
+                                             args.device)
+    np.save('csd_rand_rdfs', csd_rdf_dists.cpu().detach().numpy())
 
 """
 Reporting
@@ -151,17 +230,89 @@ Reporting
 
 """SG and molecule properties distributions"""
 if args.show_figs:
-    sg_sampling_dict = np.load('sg_results.npy', allow_pickle=True).item()
+    sg_gen_sampling_dict = np.load('sg_gen_results.npy', allow_pickle=True).item()
+    sg_rand_sampling_dict = np.load('sg_rand_results.npy', allow_pickle=True).item()
 
     # Create the three figures
-    fig1 = create_energy_distribution_plot(sg_sampling_dict)
-    fig2 = create_density_distribution_plot(sg_sampling_dict)
-    fig3 = create_cell_params_variance_plot(sg_sampling_dict)
+    fig1 = create_energy_distribution_plot(sg_gen_sampling_dict, sg_rand_sampling_dict)
+    fig2 = create_density_distribution_plot(sg_gen_sampling_dict, sg_rand_sampling_dict)
+    fig3 = create_cell_params_variance_plot(sg_gen_sampling_dict)
 
     # Display the figures
     fig1.show(renderer='browser')
     fig2.show(renderer='browser')
     fig3.show(renderer='browser')
+
+    from plotly.subplots import make_subplots
+    import plotly.graph_objects as go
+    import plotly.express as px
+
+    space_groups = sorted(sg_gen_sampling_dict.keys())
+    for sg in space_groups:
+        gen_dict = sg_gen_sampling_dict[sg]
+        rand_dict = sg_rand_sampling_dict[sg]
+        fig = go.Figure()
+
+        fig.add_scatter(x=gen_dict['opt_densities'].flatten(), y=gen_dict['opt_energies'].flatten(),
+                        marker_color='blue', marker_size=1,
+                        showlegend=False, mode='markers')
+
+        fig.add_scatter(x=rand_dict['opt_densities'].flatten(), y=rand_dict['opt_energies'].flatten(),
+                        marker_color='red', marker_size=1,
+                        showlegend=False, mode='markers')
+    fig.update_xaxes(range=[0.55, 0.95])
+    fig.update_yaxes(range=[-500, 0])
+    fig.show(renderer='browser')
+
+    from plotly.subplots import make_subplots
+    import plotly.graph_objects as go
+    import plotly.express as px
+
+    space_groups = sorted(sg_gen_sampling_dict.keys())
+    for sg in space_groups:
+        gen_dict = sg_gen_sampling_dict[sg]
+        rand_dict = sg_rand_sampling_dict[sg]
+        fig = make_subplots(rows=2, cols=2, subplot_titles=['Gen', 'Gen + Opt', 'Rand', 'Rand + Opt'])
+
+        fig.add_scatter(x=gen_dict['densities'].flatten(), y=gen_dict['energies'].flatten(), row=1, col=1,
+                        showlegend=False, mode='markers')
+        fig.add_scatter(x=gen_dict['opt_densities'].flatten(), y=gen_dict['opt_energies'].flatten(), row=1, col=2,
+                        showlegend=False, mode='markers')
+        fig.add_scatter(x=rand_dict['densities'].flatten(), y=rand_dict['energies'].flatten(), row=2, col=1,
+                        showlegend=False, mode='markers')
+        fig.add_scatter(x=rand_dict['opt_densities'].flatten(), y=rand_dict['opt_energies'].flatten(), row=2, col=2,
+                        showlegend=False, mode='markers')
+    fig.update_xaxes(range=[0, 1])
+    fig.update_yaxes(range=[-500, 500])
+    fig.show(renderer='browser')
+
+    lattice_features = ['cell_a', 'cell_b', 'cell_c',
+                        'cell_alpha', 'cell_beta', 'cell_gamma',
+                        'aunit_x', 'aunit_y', 'aunit_z',
+                        'orientation_1', 'orientation_2', 'orientation_2']
+    # 1d Histograms
+    colors = ['red', 'blue']
+    fig = make_subplots(rows=4, cols=3, subplot_titles=lattice_features)
+    for sind, samples in enumerate([gen_dict['opt_cell_params'], rand_dict['opt_cell_params']]):
+        samples = np.concatenate(samples)
+
+        for i in range(12):
+            row = i // 3 + 1
+            col = i % 3 + 1
+            fig.add_trace(go.Violin(
+                x=samples[:, i], y=[0 for _ in range(len(samples))], side='positive', orientation='h', width=4,
+                name='rand' if sind == 1 else 'gen',
+                legendgroup='rand' if sind == 1 else 'gen',
+                showlegend=True if i == 0 else False,
+                meanline_visible=True, bandwidth=float(np.ptp(samples[:, i]) / 100), points=False,
+                line_color=colors[sind],
+            ),
+                row=row, col=col
+            )
+
+    fig.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', violinmode='overlay')
+    fig.update_traces(opacity=0.5)
+    fig.show(renderer='browser')
 
 """Hit rate vs synthetic"""
 
@@ -175,28 +326,49 @@ csd_batch = collate_data_list(csd_mols)
 csd_batch.box_analysis()
 csd_clusters = csd_batch.mol2cluster(cutoff=6)
 csd_clusters.construct_radial_graph(cutoff=6)
-ref_energies = csd_clusters.compute_silu_energy()
+ref_energies, _ = csd_clusters.compute_LJ_energy()
+ref_densities = csd_clusters.packing_coeff
+
+optim_kwargs = dict(
+    optim_target='silu',
+    show_tqdm=True,
+    lr=1e-4,
+    convergence_eps=1e-3,
+    compression_factor=0.1,
+    max_num_steps=300,
+    do_box_restriction=True,
+    enforce_niggli=True,
+    cutoff=6,
+    optimizer_func=torch.optim.Rprop,
+)
+csd_opt_traj = csd_batch.optimize_crystal_parameters(**optim_kwargs)
+csd_opt_batch = collate_data_list(csd_opt_traj[-1])
+opt_ref_energies = csd_opt_batch.lj_pot
+opt_ref_densities = csd_opt_batch.packing_coeff
 
 # load samples
-csd_sampling_dict = np.load('csd_results.npy', allow_pickle=True).item()
-csd_rdf_dists = np.load('csd_rdfs.npy', allow_pickle=True)
+csd_opt_sampling_dict = np.load('csd_opt_results.npy', allow_pickle=True).item()
+csd_opt_rdf_dists = np.load('csd_opt_rdfs.npy', allow_pickle=True)
+csd_rand_sampling_dict = np.load('csd_rand_results.npy', allow_pickle=True).item()
+csd_rand_rdf_dists = np.load('csd_rand_rdfs.npy', allow_pickle=True)
+
 
 # funnel figs
 if args.show_figs:
     funnel_figs = []
     for ind in range(len(csd_mols)):
-        samples = csd_sampling_dict[identifiers[ind]]
+        samples = csd_opt_sampling_dict[identifiers[ind]]
         funnel_figs.append(crystal_sample_funnel_plot(
-            packing_coeff=samples['densities'].flatten(),
-            energies=samples['energies'].flatten(),
+            packing_coeff=samples['opt_densities'].flatten(),
+            energies=samples['opt_energies'].flatten(),
             dists=torch.tensor(csd_rdf_dists)[ind],
-            ref_energies=torch.tensor([ref_energies[ind]]),
-            ref_packing_coeff=csd_clusters[ind].packing_coeff
+            ref_energies=opt_ref_energies[ind, None],
+            ref_packing_coeff=opt_ref_densities[ind, None]
         ))
     [f.show(renderer='browser') for f in funnel_figs]
 
 # Divergence between lattice distance sets
-js_divs = np.array(sample_csd_lattice_divs(csd_mols, csd_sampling_dict))
+js_divs = np.array(sample_csd_lattice_divs(csd_mols, csd_opt_sampling_dict))
 #
 # dmats = []
 # for ind in range(len(csd_mols)):

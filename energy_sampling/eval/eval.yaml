@@ -5,22 +5,23 @@ device: 'cuda'
 
 # Paths
 ################################################################
-autoencoder_path: 'C:/Users/mikem/crystals/CSP_runs/models/cluster/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
+autoencoder_path: 'D:/crystal_datasets/model_checkpoints/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
 eval_molecules_path: 'D:/crystal_datasets/test_csd_free_qm9_dataset.pt'
 #generator_path: 'D:\crystal_datasets\4_vars_1_1_model.pt' #'../mk_local_dev_model.pt'
-generator_path: 'C:\Users\mikem\PycharmProjects\Python_Codes\mxt_gfn\gfn-diffusion\energy_sampling\checkpoints\greedy_model.pt'
+generator_path: 'D:\crystal_datasets\5_sub_bTB_model.pt'
 opt_crystals_path: 'D:\crystal_datasets\test_qm9_sg2_dataset.pt'
 csd_crystals_path: 'D:\crystal_datasets\qm9_like_csd_crystals.pt'
 
 # Evaluation options
 ################################################################
 sgs_to_sample: [2]
-override_resample: True
-eval_batch_size: 100
-eval_mols_to_sample: 200  # ideally a multiple of batch size
-eval_samples_per_mol: 5
-csd_mols_to_sample: 10
-csd_samples_per_mol: 500  # ideally a multiple of batch size
+override_resample: False
+eval_batch_size: 200
+rdfs_batch_size: 100
+eval_mols_to_sample: 1000  # ideally a multiple of batch size
+eval_samples_per_mol: 1
+csd_mols_to_sample: 5
+csd_samples_per_mol: 200  # ideally a multiple of batch size
 eval_T: 100
 
 show_figs: True
@@ -46,7 +47,7 @@ bounding_coeff: 1.0
 niggli_coeff: 10.0
 energy_lj_coeff: 1.0  # loss coefficient
 lj_turnover_pot: 10.0  # value above which molecular LJ potential is softly clipped
-lj_repulsion: 0.85  # max 1. for values less than 1 the potential becomes more attractive
+lj_repulsion: 1.0  # max 1. for values less than 1 the potential becomes more attractive
 ellipsoid_scale: 0.0  # how big in angstroms to pad around the rough minimum bounding ellipsoid, maybe [-1,1]
 energy_min_temperature: 0.1  # for conditional or annealing
 energy_max_temperature: 10   # for conditional only

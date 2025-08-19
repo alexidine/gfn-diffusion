@@ -64,6 +64,52 @@ def soft_clip(y, clip_value):
     return new_y
 
 
+def mol_to_blank_crystal_list(mol_batch, sgs):
+    ones3 = torch.ones(3, device='cpu')
+    zeros1 = torch.zeros(1, device='cpu')
+    eye3 = torch.eye(3, device='cpu')[None, :]
+    ones1 = torch.ones(1, device='cpu')
+
+    sg_cache = {}
+    for sg in set(sgs):
+        sg_cache[sg] = np.stack(SYM_OPS[int(sg)])
+
+    base_xtal = MolCrystalData(
+        skip_box_analysis=True,
+        aunit_handedness=ones1,
+        cell_lengths=ones3,
+        cell_angles=ones3,
+        aunit_centroid=ones3,
+        aunit_orientation=ones3,
+        silu_pot=zeros1,
+        lj_pot=zeros1,
+        scaled_lj_pot=zeros1,
+        es_pot=zeros1,
+        niggli_overlap=zeros1,
+        ellipsoid_overlap=zeros1,
+        density_energy=zeros1,
+        niggli_energy=zeros1,
+        core_energy=zeros1,
+        lj_energy=zeros1,
+        bounding_energy=zeros1,
+        T_fc=eye3,
+        T_cf=eye3,
+        cell_volume=zeros1,
+        packing_coeff=zeros1,
+        density=zeros1,
+    )
+    crystal_list = []
+    for ind in range(mol_batch.num_graphs):
+        crystal = base_xtal.clone()
+        crystal.set_mol_attrs(mol_batch[ind].clone())
+        crystal.set_sg_attrs(is_well_defined=True,
+                             nonstandard_symmetry=False,
+                             sg_ind=sgs[ind],
+                             symmetry_operators=sg_cache[sgs[ind]])
+        crystal_list.append(crystal)
+    return crystal_list
+
+
 class MolecularCrystal(BaseSet):
     def __init__(self, device,
                  energy_function: str,
@@ -134,7 +180,7 @@ class MolecularCrystal(BaseSet):
 
             cluster_batch.construct_radial_graph(cutoff=6,
                                                  max_num_neighbors=100)
-            #lj_energy, normed_lj_energy = cluster_batch.compute_LJ_energy()
+            lj_energy, normed_lj_energy = cluster_batch.compute_LJ_energy()
             silu_energy = cluster_batch.compute_silu_energy(repulsion=self.lj_repulsion)
 
         if self.energy_function in ['ellipsoid_overlap', 'combo']:
@@ -154,7 +200,7 @@ class MolecularCrystal(BaseSet):
             ellipsoid_overlap = torch.zeros_like(silu_energy)
 
         cluster_batch.silu_pot = silu_energy
-        cluster_batch.lj_pot = silu_energy
+        cluster_batch.lj_pot = lj_energy
         cluster_batch.ellipsoid_overlap = ellipsoid_overlap
         cluster_batch.niggli_overlap = compute_niggli_overlap(cluster_batch.cell_parameters())
 
@@ -319,57 +365,12 @@ class MolecularCrystal(BaseSet):
             return energy / sample_temperature
 
     def init_blank_crystal_batch(self, mol_batch):  # todo no possible way this is the most efficient way to do this
-        ones3 = torch.ones(3, device='cpu')
-        zeros1 = torch.zeros(1, device='cpu')
-        eye3 = torch.eye(3, device='cpu')[None, :]
-        ones1 = torch.ones(1, device='cpu')
-        if self.energy_function in ['ellipsoid_overlap', 'combo']:
-            overlap_tensor = torch.zeros(1, device='cpu')
-        else:
-            overlap_tensor = None
-
         if self.sg_conditioning:
             sgs = mol_batch.sg_ind
         else:
             sgs = [self.space_groups[0] for _ in range(mol_batch.num_graphs)]
 
-        sg_cache = {}
-        for sg in set(sgs):
-            sg_cache[sg] = np.stack(SYM_OPS[int(sg)])
-
-        base_xtal = MolCrystalData(
-            skip_box_analysis=True,
-            aunit_handedness=ones1,
-            cell_lengths=ones3,
-            cell_angles=ones3,
-            aunit_centroid=ones3,
-            aunit_orientation=ones3,
-            silu_pot=zeros1,
-            lj_pot=zeros1,
-            scaled_lj_pot=zeros1,
-            es_pot=zeros1,
-            niggli_overlap=zeros1,
-            ellipsoid_overlap=overlap_tensor,
-            density_energy=zeros1,
-            niggli_energy=zeros1,
-            core_energy=zeros1,
-            lj_energy=zeros1,
-            bounding_energy=zeros1,
-            T_fc =eye3,
-            T_cf = eye3,
-            cell_volume = zeros1,
-            packing_coeff = zeros1,
-            density = zeros1,
-        )
-        crystal_list = []
-        for ind in range(mol_batch.num_graphs):
-            crystal = base_xtal.clone()
-            crystal.set_mol_attrs(mol_batch[ind].clone())
-            crystal.set_sg_attrs(is_well_defined=True,
-                                 nonstandard_symmetry=False,
-                                 sg_ind=sgs[ind],
-                                 symmetry_operators=sg_cache[sgs[ind]])
-            crystal_list.append(crystal)
+        crystal_list = mol_to_blank_crystal_list( mol_batch, sgs)
 
         crystal_batch = collate_data_list(crystal_list).to(self.device)
 

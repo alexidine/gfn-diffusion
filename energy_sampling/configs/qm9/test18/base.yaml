@@ -1,0 +1,153 @@
+run_name: 'test18'
+tag: 'test18'
+seed: 12345
+device: 'cuda'
+lr_policy: 0.001              # learning rate of the policy network
+min_lr: 1.0e-5                # ihn
+lr_flow: 0.1                  # learning rate of the flow network
+lr_back: 0.001                # learning rate of the backward pass
+lr_warmup_ratio: 100           # how much smaller the initial (warmup) LR should be than the max policy value
+scheduler: True               # does LR warmup from lr/lr_warup_ratio -> lr -> min_lr over the warmup and annealing period
+lr_warmup_time: 2000
+lr_anneal_time: 40000
+weight_decay: 1e-7
+use_weight_decay: false
+gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weights
+
+# model parameters
+zero_init: False
+joint_layers: 4              # number of layers in forward/backward policy models
+hidden_dim: 512              # dimensionality of hidden layer
+s_emb_dim: 512               # dimensionality of state embedding
+condition_emb_dim: 512         # dimensionality of the conditioning embedding
+t_emb_dim: 32                # dimensionality of time embedding
+harmonics_dim: 64            # dimensionality of harmonic embedding
+dropout: 0.1                   # dropout probability
+norm: layer                   # null, "layer", "batch"
+
+batch_size: 5              # number of samples per training batch
+grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
+max_batch_size: 2000           # maximum batch size to allow
+batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
+repeats: 5                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
+eval_batch_size: 2000        # batch size for evaluation
+epochs: 1000000             # number of training epochs: relatively large
+eval_period: 1000              # how often to do evaluation & reporting
+conditional_eval_period: 10000 # how often to do conditional evaluation with figs # must be multiple of eval period
+figs_period: 2000             # how often to log custom figrues EXPENSIVE # must be multiple of eval_period or it won't fire
+
+# GFlowNet settings
+T: 10                        # static training diffusion length
+eval_T: 100                  # diffusion trajectory length for inference
+min_traj_length: 20
+max_traj_length: 30
+traj_length_strategy: sampled # 'static'  or 'sampled'  will do random between min and max traj lengths
+discretizer_max_ratio: 15    # maximum ratio between randomly sampled step sizes
+discretizer: 'random'        # 'random' 'low_discrepancy' 'equidistant' 'uniform'
+t_scale: 0.1                 # scales fixed forward policy variance
+log_var_range: 1           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
+pb_drift_range: 0.2          # range of learned backward drift corrections, only for 'brownian_bridge'
+pb_var_range: 1             # range of learned backward policy variance
+energy: "molecular_crystal"  # "molecular_crystal"
+# set a constant or
+# as a set of line segments [[step, value], [step, value], ...]
+fwd_loss_coeffs:
+  tb:               0.1
+  vg_lb:            0
+  vg_lme:           0  # exclusive with vg_lb
+  emp_z:            0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
+  greedy:           1.0
+  reinforce:        0
+  mle:              0
+  var:              0
+  overlap:          0
+  buffer:           0
+
+  var_cutoff:       0
+  var_gamma:        0
+  buffer_gamma:     0
+  loss_clip:        1.0E+9
+bwd_loss_coeffs:
+  tb:               0.0 #[[0, 1], [1000, 1], [2000, 0]]
+  vg_lb:            0
+  vg_lme:           0.1  # exclusive with vg_lb
+  emp_z:            0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
+  mle:              1.0  # will do weighted MLE if VG is running, otherwise trajectory-wise
+  mle_prior_fraction: 0
+  pmle_std:         1 # std deviation of the prior mle distribution. Best to start small (1) and smoothly grow
+  loss_clip:        1.0E+9
+
+prior_coverage_cutoff: 0.75  # or None  # value of minimum 1D coverage below which we penalize forward training in favour of backward
+prior_coverage_ratio: 0.05  # [0, 1] fraction of uniform bin coverage that will satisfy the coverage metric
+both_ways: True             # forward and backward training
+bwd_batch_multiplier: 1      # ratio of backward to foward batch size (much cheaper to evaluate)
+fwd_to_bwd_ratio: 1           # whether to do forward (>1) or backward (<1) training more often
+bwd: False                   # backward training only
+learn_pb: False               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
+learned_variance: False       # whether to learn policy variance
+clipping: true  # clip the maximum step size induced by the policy model
+gfn_clip: 200.0  # clip the maximum step size induced by the policy model
+
+# dataset settings
+################################################################
+#buffer_path: 'D:/crystal_datasets/test_qm9_sg2_dataset.pt'#'D:/crystal_datasets/nic_sg2_dataset.pt' #'D:/crystal_datasets/urea_gfn_dataset.pt' #
+#molecules_path: 'D:/crystal_datasets/test_csd_free_qm9_dataset.pt'
+#autoencoder_path: 'D:/crystal_datasets/model_checkpoints/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
+
+buffer_path: '/scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt'
+molecules_path: '/scratch/mk8347/csd_runs/datasets/csd_free_qm9_dataset.pt'
+autoencoder_path: '/scratch/mk8347/csd_runs/models/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
+
+# replay buffer settings
+################################################################
+beta: 0.1             # reward prioritized replay sampling: high beta = steep prioritization
+rank_weight: 1.0     # rank-based replay sampling: low rank_weight = steep prioritization
+buffer_diversity_coeff: 1.0  # how highly to weight sample diversity when sampling from the buffer
+prioritized: "boltzmann"   # three kinds of replay training: random, reward prioritized (Boltzmann), rank-based
+sampling: "buffer"
+add_to_buffer_each: 10  # how often to add samples to the buffer during fwd passes in both_ways training
+buffer_size: 100000          # size of replay buffer
+
+# exploration controls
+################################################################
+exploratory: False       # adds variance to optionally learned logvars
+exploration_factor: 0.25  # initial exploration std value
+exploration_wd: True  # decay exploration over time
+wd_max_steps: 10000  # number of steps to terminate the added variance
+
+# molecular crystal settings
+################################################################
+molecule: 'qm9'  # 'nicotinamide' or 'urea' or 'qm9' for molecule-conditional training
+temperature_conditioning: False  # if false, temperatures are set to energy_static_temperature, and there is no annealing
+molecule_conditioning: True  # MUST be true for molecule='qm9' and false else - conditions the generative prediction on the molecule
+mol_embedding_type: 'autoencoder'  # principal_axes or autoencoder
+sg_conditioning: False  # whether to conditionally sample across space groups
+space_groups: [2]  # which space groups to sample over
+energy_function: combo
+  # 'latent_harmonic' : unimodal harmonic potential in the latent space
+  # 'crystal_harmonic': unimodal harmonic potential in the crystal space
+  # 'latent_multiharmonic': multimodal harmonic potential in the latent space
+  # 'crystal_multiharmonic': multimodal harmonic potential in the crystal space
+  # 'ellipsoid_overlap' : minimize ellipsoid overlaps subject to energy_density_coeff external pressure
+  # 'silu_energy' : minimize a softened LJ-tye energy subject to energy_density_coeff external pressure
+  # 'combo' : silu + ellipsoid overlap + density term
+anneal_temperature: False  # scale temperature over time, when conditional it scales the distribution, when not it just decreases from static to min
+temp_annealing_max_steps: 2000  # time for scaling_factor to reach 1 (uniform sampling from min to max)
+anneal_repulsion: True
+anneal_repulsion_cutoff: 0.5  # fraction of samples which have to be 'reasonably good' before we trigger a difficulty increase
+energy_density_coeff: 10.0  # how much to weight the density penalty term in the energy function
+energy_core_coeff: 10.0  # loss coefficient
+bounding_coeff: 1.0
+niggli_coeff: 10.0
+core_start_time: 0  # after how many steps to turn on the core repulsion energy
+energy_lj_coeff: 1.0  # loss coefficient
+lj_start_time: 0  # after how many steps to turn on the LJ energy
+lj_turnover_pot: 10.0  # value above which molecular LJ potential is softly clipped
+lj_repulsion: 0.5  # max 1. for values less than 1 the potential becomes more attractive
+ellipsoid_scale: -0.5  # how big in angstroms to pad around the rough minimum bounding ellipsoid, maybe [-1,1]
+energy_min_temperature: 0.1  # for conditional or annealing
+energy_max_temperature: 10   # for conditional only
+energy_static_temperature: 1  # for certain evaluations or static T training. Also initial temperature on unconditional temperature annealing
+temperature_scaling_factor: 0.01  # controls relative frequency of higher vs lower temperatures in conditional training (higher -> higher)
+energy_clip: 100  # where to start softly clipping energy values from above - WE HAVE TUNED THE LOSS FOR THIS TO BE SET AT 100!!!
+
