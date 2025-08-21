@@ -559,3 +559,23 @@ def sample_crystal_prior(crystal_batch, std):
                                                            ).clip(min=-6, max=6)
 
     return prior_samples
+
+@torch.no_grad()
+def update_ema(model, ema_model, decay=0.9999):
+    """
+    Update ema_model parameters towards model parameters.
+
+    Args:
+        model:      nn.Module, the training model
+        ema_model:  nn.Module, the EMA copy
+        decay:      float, EMA decay (close to 1.0 gives long memory)
+    """
+    if decay is not None:
+        if decay > 0:
+            msd = model.state_dict()
+            emsd = ema_model.state_dict()
+            for k in msd.keys():
+                if msd[k].dtype.is_floating_point:
+                    emsd[k].mul_(decay).add_(msd[k], alpha=1 - decay)
+                else:
+                    emsd[k] = msd[k]  # copy over non-float buffers (e.g. ints, bools)

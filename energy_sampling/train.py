@@ -11,10 +11,11 @@ import wandb
 from torch.optim import lr_scheduler
 from torch_geometric.loader import DataLoader
 from tqdm import trange
+from copy import deepcopy
 
 from buffer import CrystalReplayBuffer
 from energies.molecular_crystal import MolecularCrystal
-from eval.evaluations import eval_step, conditional_eval_step
+from eval.evaluations import eval_step, conditional_eval_step, get_dimwise_coverage
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 from models import GFN
 from mxtaltools.common.training_utils import flatten_wandb_params
@@ -23,7 +24,8 @@ from mxtaltools.dataset_utils.utils import collate_data_list
 from utils import get_train_args, get_gfn_init_state, set_seed, \
     get_exploration_std, random_discretizer, low_discrepancy_discretizer, \
     low_discrepancy_discretizer2, shifted_equidistant, uniform_discretizer, \
-    featurize_dataset, embed_dataset, get_conditioning_dim, set_loss_coeffs, sample_crystal_prior, anneal_reward
+    featurize_dataset, embed_dataset, get_conditioning_dim, set_loss_coeffs, sample_crystal_prior, anneal_reward, \
+    update_ema
 
 torch.cuda.set_per_process_memory_fraction(0.9, device=0)
 torch.cuda.init()  # create context with the cap already in place
@@ -59,7 +61,6 @@ def train_step(energy_function,
     if do_forward:
         optimizers['fwd'].zero_grad(set_to_none=True)
         mol_batch = next(mol_iterator)
-        #mol_batch = mol_batch.to(device, non_blocking=True)
         loss, crystal_batch, loss_dict = fwd_train_step(
             energy_function,
             gfn_model,
@@ -73,6 +74,7 @@ def train_step(energy_function,
         )
 
         forward_iter = int(it * p_forward)
+        buffer.update_running_stats(crystal_batch)
         if add_to_buffer and forward_iter % args.add_to_buffer_each == 0:
             buffer.add(crystal_batch.detach().cpu().to_data_list())
         del crystal_batch
@@ -187,7 +189,8 @@ def get_discretizer(traj_length_strategy, discretization_type):
     return discretizer
 
 
-def fwd_train_step(energy_function, gfn_model, discretizer, exploration_std, mol_batch, buffer, return_exp=False,
+def fwd_train_step(energy_function, gfn_model, discretizer,
+                   exploration_std, mol_batch, buffer, return_exp=False,
                    repeats: int = 10,
                    report_losses: bool = False):
     init_state = get_gfn_init_state(args.batch_size, energy_function.data_ndim, device)
@@ -269,6 +272,7 @@ def train():
 
     # Model Init
     gfn_model, gfn_config = init_gfn_model(args, energy_function)
+    ema_model = deepcopy(gfn_model)
     np.save(f'checkpoints/{name}_model_config', gfn_config)  # todo add path to saving directories
 
     # opt init
@@ -329,6 +333,7 @@ def train():
                                                               train_iterator,
                                                               repeats=args.repeats
                                                               )
+                update_ema(gfn_model, ema_model, decay=args.ema_decay)
                 if step_type == 'Forward':
                     fwd_loss = train_loss
                     if loss_dict is not None:
@@ -352,12 +357,16 @@ def train():
 
             # evaluation work
             if (step_ind % args.eval_period == 0 and step_ind > 0) or step_ind == 50:
-                eval_work(args, gfn_model, step_ind, name,
+                eval_work(args, ema_model, step_ind, name,
                           buffer, train_mol_loader,test_mol_loader,
                           energy_function, metrics)
 
+            # dynamical tracking
+            if step_ind % 100 == 0:
+                dynamic_quality_management(buffer, energy_function, metrics)
+
             # train monitoring
-            elif step_ind % 10 == 0:
+            if step_ind % 10 == 0:
                 metrics['train/expl'] = exploration_std(0) if exploration_std is not None else 0
                 lr_warmup_finished, lr = step_lr_schedule(schedulers, optimizers, lr_warmup_finished)
                 anneal_reward(step_ind, temp_annealing_lambda, energy_function, args)
@@ -365,7 +374,53 @@ def train():
                 wandb.log(metrics, step=step_ind)
 
 
-        torch.save(gfn_model, f'checkpoints/{name}_model_final.pt')
+        torch.save(ema_model, f'checkpoints/{name}_model_final.pt')
+
+
+def dynamic_quality_management(buffer, energy_function, metrics):
+    rolling_sample = np.concatenate(buffer.sample_record)
+    if buffer is not None:
+        if len(buffer) > 0:
+            prior_sample, _, _, _ = buffer.sample(override_batch=min(100000, len(rolling_sample)), override_sampler=None)
+        else:
+            prior_sample = torch.randn(len(rolling_sample), 12) * 2
+    else:
+        prior_sample = torch.randn(len(rolling_sample), 12) * 2
+
+    prior_coverage = get_dimwise_coverage(torch.tensor(rolling_sample),
+                                          prior_sample,
+                                          n_bins=24, cmin=1, tau=1 / args.prior_coverage_ratio)
+    minimum_1d_coverage = torch.amin(prior_coverage).item()
+    metrics['Rolling Minimum 1D Coverage'] = minimum_1d_coverage
+
+    if args.prior_coverage_cutoff is not None and args.both_ways:
+        low_cut = max(0, args.prior_coverage_cutoff * 0.95)
+        high_cut = min(1, args.prior_coverage_cutoff * 1.0)
+        if minimum_1d_coverage > high_cut:
+            args.fwd_to_bwd_ratio *= 1.05  # train forward more often
+        elif minimum_1d_coverage < low_cut:
+            if args.fwd_to_bwd_ratio > 0.01:
+                args.fwd_to_bwd_ratio *= 0.95
+
+    energies = np.concatenate(buffer.energy_record)
+    densities = np.concatenate(buffer.packing_record)
+    sample_is_good = (energies < 0) * (densities > 0.55)
+    metrics['Rolling Reasonable Sample Fraction'] = sample_is_good.mean()
+
+    if args.anneal_repulsion:
+        if sample_is_good.mean() >= args.anneal_repulsion_cutoff:
+            if args.lj_repulsion < 1:
+                args.lj_repulsion = min(1, args.lj_repulsion * 1.05)
+                energy_function.lj_repulsion = args.lj_repulsion
+                if buffer is not None:
+                    if len(buffer) > 0:
+                        buffer.recompute_silu_pot(
+                            batch_size=min(500, args.batch_size),
+                            lj_repulsion=args.lj_repulsion,
+                            device=args.device
+                        )
+    metrics['LJ Repulsion'] = args.lj_repulsion
+    metrics['Fwd to Bwd Ratio'] = args.fwd_to_bwd_ratio
 
 
 def ten_step_reporting(bwd_loss, bwd_loss_dict, fwd_loss, fwd_loss_dict, metrics, optimizers):
@@ -458,6 +513,7 @@ def init_buffers_datasets(args, energy_function):
         'cpu',
         energy_function,
         args.batch_size,
+        args.running_stats_iters,
         beta=args.beta,
         rank_weight=args.rank_weight,
         prioritized=args.prioritized,
@@ -866,29 +922,6 @@ def eval_work(args,
     metrics.update(do_evaluation(energy_function, buffer, gfn_model,
                                  step_ind, test_mol_loader))
 
-    if args.prior_coverage_cutoff is not None:
-        low_cut = max(0, args.prior_coverage_cutoff * 0.95)
-        high_cut = min(1, args.prior_coverage_cutoff * 1.0)
-        if metrics['Minium 1d coverage'] > high_cut:
-            args.fwd_to_bwd_ratio *= 1.25  # train forward more often
-        elif metrics['Minium 1d coverage'] < low_cut:
-            if args.fwd_to_bwd_ratio > 0.01:
-                args.fwd_to_bwd_ratio *= 0.75
-
-    if args.anneal_repulsion:
-        if metrics['Reasonable Sample Fraction'] >= args.anneal_repulsion_cutoff:
-            if args.lj_repulsion < 1:
-                args.lj_repulsion = min(1, args.lj_repulsion * 1.05)
-                energy_function.lj_repulsion = args.lj_repulsion
-                buffer.recompute_silu_pot(
-                    batch_size=min(500, args.batch_size),
-                    lj_repulsion=args.lj_repulsion,
-                    device=args.device
-                )
-
-    metrics['LJ Repulsion'] = args.lj_repulsion
-
-    metrics['Fwd to Bwd Ratio'] = args.fwd_to_bwd_ratio
     wandb.log(metrics, step=step_ind)
 
 

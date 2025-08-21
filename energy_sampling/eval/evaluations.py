@@ -202,11 +202,17 @@ def generate_fwd_figs(buffer, energy_function,
     fig_dict['Lattice Latents Trajectories'] = visualize_latent_trajs(flow_states.cpu().detach().numpy(),
                                                                       20,
                                                                       log_r.cpu().detach().numpy())
-    fig_dict['Lattice Features Distribution'], cell_klds = simple_cell_hist(sample_batch, buffer_cell_params,
-                                                                            n_kde_points=200, bw_ratio=10, mode='cell')
-    fig_dict['Lattice Latents Distribution'], latent_klds = simple_cell_hist(sample_batch, buffer_latent_params,
+    rolling_sample = np.concatenate(buffer.sample_record)
+
+    fig_dict['Rolling Lattice Latents Distribution'], latent_klds = (
+        simple_cell_hist(buffer_latent_params, n_kde_points=200, bw_ratio=10, mode='latent', samples=rolling_sample))
+    fig_dict['Lattice Features Distribution'], cell_klds = (
+        simple_cell_hist(sample_batch, buffer_cell_params,
+                                                                            n_kde_points=200, bw_ratio=10, mode='cell'))
+    fig_dict['Lattice Latents Distribution'], latent_klds = (
+        simple_cell_hist(sample_batch, buffer_latent_params,
                                                                              n_kde_points=200, bw_ratio=10,
-                                                                             mode='latent')
+                                                                             mode='latent'))
     fig_dict['Pf Parity'], fig_dict['Pf Parity R Value'] = Pf_alignment_fig(log_pfs, log_pbs, log_r, log_flow)
 
     log_buffer_kld(cell_klds, fig_dict, latent_klds)
@@ -889,6 +895,7 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
     metrics['Empirical log Z LB'] = log_Z_lb.cpu().detach().item()
     metrics['log Z learned'] = log_Z_learned.cpu().detach().item()
 
+    # training coefficients
     for elem in energy_function.__dict__.keys():
         thing = energy_function.__dict__[elem]
         if isinstance(thing, float) or isinstance(thing, int):
@@ -904,6 +911,7 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
         if isinstance(thing, float) or isinstance(thing, int):
             metrics['loss_coeffs/' + 'bwd_' + elem] = thing
 
+    # distributional analysis
     lattice_features = ['cell_a', 'cell_b', 'cell_c',
                         'cell_alpha', 'cell_beta', 'cell_gamma',
                         'aunit_x', 'aunit_y', 'aunit_z',
@@ -919,8 +927,8 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
     loadings = Vh.T  # shape: (num_features, num_components)
     contrib_per_feature = (loadings ** 2) @ explained_var_ratio  # shape: (num_features,)
     d_eff = (explained_var_ratio ** 2).sum() ** -1
-
     metrics['Effective Dimension'] = d_eff.item()
+
     for ind, feat in enumerate(lattice_features):
         metrics[feat + '_mean'] = std_params[:, ind].mean().item()
         metrics[feat + '_var'] = std_params[:, ind].var().item()
@@ -943,10 +951,7 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
             ])
             metrics['Buffer Mean Score'] = np.mean(buffer.rewards_list)
 
-    if buffer is not None:
-        prior_sample, _, _, _ = buffer.sample(override_batch=len(std_params), override_sampler=None)
-    else:
-        prior_sample = sample_crystal_prior(sample_batch, args.bwd_loss_coeffs.pmle_std)
+    prior_sample = sample_backward_prior(args, buffer, sample_batch, len(std_params))
 
     # todo do this separately for each space group
     prior_coverage = get_dimwise_coverage(std_params, prior_sample.to('cpu'),
@@ -958,14 +963,26 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
     for ind, thing in enumerate(lattice_features):
         metrics[f'{thing} coverage'] = prior_coverage[ind].item()
 
-    metrics['Minium 1d coverage'] = torch.amin(prior_coverage).item()
+    metrics['Minimum 1d coverage'] = torch.amin(prior_coverage).item()
 
-    # get fraction of samples which are 'reasonable', meaning density > 0.55 and bound states
+    # get fraction of samples which are 'reasonable' at this energy,
+    # meaning density > 0.55 and bound states
     sample_is_good = (sample_batch.silu_pot < 0) * (sample_batch.packing_coeff > 0.55)
     metrics["Reasonable Sample Fraction"] = sample_is_good.float().mean().item()
     metrics = {k: to_loggable(v) for k, v in metrics.items()}
 
     return metrics
+
+
+def sample_backward_prior(args, buffer, sample_batch, num_samples):
+    if buffer is not None:
+        if len(buffer) > 0:
+            prior_sample, _, _, _ = buffer.sample(override_batch=num_samples, override_sampler=None)
+        else:
+            prior_sample = sample_crystal_prior(sample_batch, args.bwd_loss_coeffs.pmle_std)
+    else:
+        prior_sample = sample_crystal_prior(sample_batch, args.bwd_loss_coeffs.pmle_std)
+    return prior_sample
 
 
 def to_loggable(v):

@@ -171,6 +171,7 @@ class MolecularCrystal(BaseSet):
                                         'combo']:  # no need to actually build the crystal, this is much faster
             cluster_batch = crystal_batch
             lj_energy = torch.zeros(crystal_batch.num_graphs, device=self.device)
+            normed_lj_energy = torch.zeros_like(lj_energy)
             silu_energy = torch.zeros_like(lj_energy)
         else:
             # for crystals at realistic densities, supercell_size=2 is sufficient. Very dense crystals will not be accurate, but they get punished later by the density energy term
@@ -201,6 +202,7 @@ class MolecularCrystal(BaseSet):
 
         cluster_batch.silu_pot = silu_energy
         cluster_batch.lj_pot = lj_energy
+        cluster_batch.scaled_lj_pot = normed_lj_energy
         cluster_batch.ellipsoid_overlap = ellipsoid_overlap
         cluster_batch.niggli_overlap = compute_niggli_overlap(cluster_batch.cell_parameters())
 
@@ -210,7 +212,8 @@ class MolecularCrystal(BaseSet):
 
         crystal_batch.gfn_energy = crystal_energy.cpu().detach()
         crystal_batch.silu_pot = silu_energy.cpu().detach()
-        crystal_batch.lj_pot = silu_energy.cpu().detach()
+        crystal_batch.lj_pot = lj_energy.cpu().detach()
+        crystal_batch.scaled_lj_pot = normed_lj_energy
         crystal_batch.ellipsoid_overlap = ellipsoid_overlap.cpu().detach()
         crystal_batch.niggli_overlap = cluster_batch.niggli_overlap.cpu().detach()
         for key in ens_dict.keys():

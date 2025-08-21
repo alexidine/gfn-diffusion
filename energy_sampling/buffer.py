@@ -1,3 +1,4 @@
+from collections import deque
 from typing import Optional
 
 import torch
@@ -15,6 +16,7 @@ class CrystalReplayBuffer:
                  device,
                  energy_function,
                  batch_size,
+                 running_stats_iters: int,
                  beta=1.0,
                  rank_weight=1e-2,
                  prioritized=None,
@@ -38,6 +40,8 @@ class CrystalReplayBuffer:
         self.diversity_check_size = 1000
         self.original_dataset_inds = None
         self.diversity_coeff = diversity_coeff
+        self.running_stats_iters = running_stats_iters
+        self.init_running_stats()
 
     def add(self,
             data_list,
@@ -60,6 +64,10 @@ class CrystalReplayBuffer:
                 # also, hard filter samples which are above or below our density cutoffs
                 bad_inds.extend(torch.argwhere(0.55 < new_data_batch.packing_coeff).flatten().tolist())
                 bad_inds.extend(torch.argwhere(new_data_batch.packing_coeff > 0.95).flatten().tolist())
+
+                # also strictly reject unbound states
+                bad_inds.extend(torch.argwhere(new_data_batch.lj_pot > 0))
+
                 bad_inds = list(set(bad_inds))
                 data_list = [elem for ind, elem in enumerate(data_list) if ind not in bad_inds]
 
@@ -236,3 +244,17 @@ class CrystalReplayBuffer:
 
         scores = self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(len(self)))
         self.rewards_list = list(scores.flatten().cpu().detach().numpy())
+
+    def init_running_stats(self):
+        self.sample_record = deque(maxlen=self.running_stats_iters)
+        self.packing_record = deque(maxlen=self.running_stats_iters)
+        self.energy_record = deque(maxlen=self.running_stats_iters)
+
+    def update_running_stats(self,
+                             crystal_batch):
+        self.sample_record.append(
+            crystal_batch.cell_params_to_gen_basis().detach().cpu().numpy()
+        )
+        self.packing_record.append(crystal_batch.packing_coeff.detach().cpu().numpy())
+        self.energy_record.append(crystal_batch.silu_pot.detach().cpu().numpy())
+

@@ -361,7 +361,7 @@ if args.show_figs:
         funnel_figs.append(crystal_sample_funnel_plot(
             packing_coeff=samples['opt_densities'].flatten(),
             energies=samples['opt_energies'].flatten(),
-            dists=torch.tensor(csd_rdf_dists)[ind],
+            dists=torch.tensor(csd_opt_rdf_dists)[ind],
             ref_energies=opt_ref_energies[ind, None],
             ref_packing_coeff=opt_ref_densities[ind, None]
         ))
