@@ -32,7 +32,7 @@ discretizer: random
 discretizer_max_ratio: 15
 dropout: 0.0
 ellipsoid_scale: -0.5
-ema_decay: 0.995
+ema_decay: 0.99
 energy: molecular_crystal
 energy_clip: 100
 energy_core_coeff: 10.0
@@ -79,9 +79,9 @@ lj_start_time: 0
 lj_turnover_pot: 10.0
 log_var_range: 1
 lr_anneal_time: 40000
-lr_back: 0.001
+lr_back: 0.0001
 lr_flow: 0.1
-lr_policy: 0.001
+lr_policy: 0.0001
 lr_warmup_ratio: 100
 lr_warmup_time: 2000
 max_batch_size: 1000
@@ -102,7 +102,7 @@ prioritized: boltzmann
 rank_weight: 1.0
 repeats: 5
 run_name: 3_with_back_TB
-running_stats_iters: 100
+running_stats_iters: 10
 s_emb_dim: 1024
 sampling: buffer
 scheduler: true

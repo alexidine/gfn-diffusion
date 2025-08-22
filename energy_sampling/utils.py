@@ -579,3 +579,9 @@ def update_ema(model, ema_model, decay=0.9999):
                     emsd[k].mul_(decay).add_(msd[k], alpha=1 - decay)
                 else:
                     emsd[k] = msd[k]  # copy over non-float buffers (e.g. ints, bools)
+    else:
+        msd = model.state_dict()
+        emsd = ema_model.state_dict()
+        for k in msd.keys():  # simply overwrite state dict to EMA model
+            emsd[k] = msd[k]
+

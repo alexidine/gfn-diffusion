@@ -2,10 +2,10 @@ run_name: 'test19'
 tag: 'test19'
 seed: 12345
 device: 'cuda'
-lr_policy: 0.001              # learning rate of the policy network
+lr_policy: 0.0001              # learning rate of the policy network
 min_lr: 1.0e-5                # ihn
 lr_flow: 0.1                  # learning rate of the flow network
-lr_back: 0.001                # learning rate of the backward pass
+lr_back: 0.0001                # learning rate of the backward pass
 lr_warmup_ratio: 100           # how much smaller the initial (warmup) LR should be than the max policy value
 scheduler: True               # does LR warmup from lr/lr_warup_ratio -> lr -> min_lr over the warmup and annealing period
 lr_warmup_time: 2000
@@ -13,8 +13,8 @@ lr_anneal_time: 40000
 weight_decay: 1e-7
 use_weight_decay: false
 gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weights
-ema_decay: 0.995  # set to 0 for no ema
-running_stats_iters: 100 # how many train iterations to average for running stats checks
+ema_decay: 0.99  # set to 0 for no ema
+running_stats_iters: 10 # how many train iterations to average for running stats checks
 
 # model parameters
 zero_init: False

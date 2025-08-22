@@ -74,8 +74,8 @@ def train_step(energy_function,
         )
 
         forward_iter = int(it * p_forward)
-        buffer.update_running_stats(crystal_batch)
         if add_to_buffer and forward_iter % args.add_to_buffer_each == 0:
+            buffer.update_running_stats(crystal_batch)
             buffer.add(crystal_batch.detach().cpu().to_data_list())
         del crystal_batch
 
@@ -333,7 +333,10 @@ def train():
                                                               train_iterator,
                                                               repeats=args.repeats
                                                               )
-                update_ema(gfn_model, ema_model, decay=args.ema_decay)
+                if args.ema_decay is not None:
+                    update_ema(gfn_model, ema_model, decay=args.ema_decay)
+                else:
+                    ema_model = gfn_model
                 if step_type == 'Forward':
                     fwd_loss = train_loss
                     if loss_dict is not None:
@@ -919,7 +922,8 @@ def eval_work(args,
                                                             )
             metrics.update(conditional_metrics)
 
-    metrics.update(do_evaluation(energy_function, buffer, gfn_model,
+    metrics.update(do_evaluation(energy_function, buffer,
+                                 gfn_model,
                                  step_ind, test_mol_loader))
 
     wandb.log(metrics, step=step_ind)

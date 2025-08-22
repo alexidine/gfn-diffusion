@@ -121,34 +121,3 @@ experiments:
     beta: 1.0
     buffer_diversity_coeff: 1.0
     anneal_repulsion_cutoff: 0.5
-
-- tag: 4_.5PMLE
-  update:
-    joint_layers: 8
-    hidden_dim: 1024
-    s_emb_dim: 1024
-    condition_emb_dim: 1024
-    t_emb_dim: 256
-    dropout: 0.0
-    norm: null
-    max_batch_size: 1000
-    fwd_loss_coeffs:
-      tb: 0.1
-      vg_lme: 0
-      emp_z: 0
-      greedy: 1.0
-      reinforce: 0
-    bwd_loss_coeffs:
-      tb: 0.0
-      vg_lme: 0.1
-      emp_z: 0
-      mle: 1.0
-      pmle_std: 2
-      mle_prior_fraction: 0.5
-    prior_coverage_cutoff: 0.75
-    prior_coverage_ratio: 0.1
-    learn_pb: false
-    learned_variance: false
-    beta: 1.0
-    buffer_diversity_coeff: 1.0
-    anneal_repulsion_cutoff: 0.5
