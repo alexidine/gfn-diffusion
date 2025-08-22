@@ -65,7 +65,7 @@ fwd_loss_coeffs:
   var_gamma: 0
   vg_lb: 0
   vg_lme: 0
-fwd_to_bwd_ratio: 1
+fwd_to_bwd_ratio: 0.01
 gfn_clip: 200.0
 gradient_norm_clip: 0.1
 grow_batch_size: true

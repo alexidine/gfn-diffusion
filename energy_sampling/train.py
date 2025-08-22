@@ -121,7 +121,9 @@ def train_logic(buffer, it):
     add_to_buffer = False
     if args.both_ways:
         p_forward = args.fwd_to_bwd_ratio / (args.fwd_to_bwd_ratio + 1)
-        if args.fwd_to_bwd_ratio == 1:
+        if it == 0:
+            do_fwd = True
+        elif args.fwd_to_bwd_ratio == 1:
             do_fwd = it % 2 == 0  # always do fwd first
         else:
             do_fwd = np.random.choice([0, 1], 1, p=[1 - p_forward, p_forward])
