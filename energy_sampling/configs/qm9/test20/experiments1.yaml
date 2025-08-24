@@ -70,3 +70,68 @@ experiments:
     dropout: 0.0
     norm: null
     max_batch_size: 1000
+
+- tag: 5_baseline
+  update:
+    lr_policy: 0.001
+    lr_back: 0.0001
+    joint_layers: 8
+    hidden_dim: 256
+    s_emb_dim: 256
+    condition_emb_dim: 256
+    t_emb_dim: 256
+    dropout: 0.0
+    norm: null
+    max_batch_size: 1000
+
+- tag: 6_-3_-3
+  update:
+    lr_policy: 0.001
+    lr_back: 0.001
+    joint_layers: 8
+    hidden_dim: 256
+    s_emb_dim: 256
+    condition_emb_dim: 256
+    t_emb_dim: 256
+    dropout: 0.0
+    norm: null
+    max_batch_size: 1000
+
+- tag: 7_-4_-3
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.001
+    joint_layers: 8
+    hidden_dim: 256
+    s_emb_dim: 256
+    condition_emb_dim: 256
+    t_emb_dim: 256
+    dropout: 0.0
+    norm: null
+    max_batch_size: 1000
+
+- tag: 8_512_dim
+  update:
+    lr_policy: 0.001
+    lr_back: 0.0001
+    joint_layers: 8
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 256
+    dropout: 0.0
+    norm: null
+    max_batch_size: 1000
+
+- tag: 9_16_layers
+  update:
+    lr_policy: 0.001
+    lr_back: 0.0001
+    joint_layers: 16
+    hidden_dim: 256
+    s_emb_dim: 256
+    condition_emb_dim: 256
+    t_emb_dim: 256
+    dropout: 0.0
+    norm: null
+    max_batch_size: 1000

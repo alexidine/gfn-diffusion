@@ -1,0 +1,122 @@
+T: 10
+add_to_buffer_each: 10
+anneal_repulsion: true
+anneal_repulsion_cutoff: 0.5
+anneal_temperature: false
+autoencoder_path: /scratch/mk8347/csd_runs/models/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05
+batch_growth_increment: 1.01
+batch_size: 5
+beta: 1.0
+both_ways: true
+bounding_coeff: 1.0
+buffer_diversity_coeff: 1.0
+buffer_path: /scratch/mk8347/csd_runs/datasets/qm9_sg2_dataset.pt
+buffer_size: 100000
+bwd: false
+bwd_batch_multiplier: 1
+bwd_loss_coeffs:
+  emp_z: 0
+  loss_clip: 1000000000.0
+  mle: 1.0
+  mle_prior_fraction: 0
+  pmle_std: 1
+  tb: 0.0
+  vg_lb: 0
+  vg_lme: 0.1
+clipping: true
+condition_emb_dim: 256
+conditional_eval_period: 10000
+core_start_time: 0
+device: cuda
+discretizer: random
+discretizer_max_ratio: 15
+dropout: 0.0
+ellipsoid_scale: -0.5
+ema_decay: 0.995
+energy: molecular_crystal
+energy_clip: 100
+energy_core_coeff: 10.0
+energy_density_coeff: 10.0
+energy_function: combo
+energy_lj_coeff: 1.0
+energy_max_temperature: 10
+energy_min_temperature: 0.1
+energy_static_temperature: 1
+epochs: 1000000
+eval_T: 50
+eval_batch_size: 1000
+eval_period: 1000
+exploration_factor: 0.25
+exploration_wd: true
+exploratory: false
+figs_period: 10000
+fwd_loss_coeffs:
+  buffer: 0
+  buffer_gamma: 0
+  emp_z: 0
+  greedy: 1.0
+  loss_clip: 1000000000.0
+  mle: 0
+  overlap: 0
+  reinforce: 0.1
+  tb: 0.1
+  var: 0
+  var_cutoff: 0
+  var_gamma: 0
+  vg_lb: 0
+  vg_lme: 0
+fwd_to_bwd_ratio: 0.1
+gfn_clip: 200.0
+gradient_norm_clip: 0.1
+grow_batch_size: true
+harmonics_dim: 64
+hidden_dim: 256
+joint_layers: 8
+learn_pb: true
+learned_variance: true
+lj_repulsion: 0.5
+lj_start_time: 0
+lj_turnover_pot: 10.0
+log_var_range: 2
+lr_anneal_time: 100000
+lr_back: 0.0001
+lr_flow: 0.1
+lr_policy: 0.001
+lr_warmup_ratio: 100
+lr_warmup_time: 10000
+max_batch_size: 1000
+max_traj_length: 15
+min_lr: 1.0e-05
+min_traj_length: 10
+mol_embedding_type: autoencoder
+molecule: qm9
+molecule_conditioning: true
+molecules_path: /scratch/mk8347/csd_runs/datasets/csd_free_qm9_dataset.pt
+niggli_coeff: 10.0
+norm: null
+pb_drift_range: 0.2
+pb_var_range: 2
+prior_coverage_cutoff: 0.8
+prior_coverage_ratio: 0.1
+prioritized: null
+rank_weight: 1.0
+repeats: 5
+run_name: 5_baseline
+s_emb_dim: 256
+sampling: buffer
+scheduler: true
+seed: 12345
+sg_conditioning: false
+space_groups:
+- 2
+t_emb_dim: 256
+t_scale: 0.1
+tag: test20
+temp_annealing_max_steps: 2000
+temperature_conditioning: false
+temperature_scaling_factor: 0.01
+traj_length_strategy: sampled
+use_weight_decay: false
+wd_max_steps: 10000
+weight_decay: 1e-7
+zero_init: false

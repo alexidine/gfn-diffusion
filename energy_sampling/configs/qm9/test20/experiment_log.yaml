@@ -68,3 +68,73 @@
   - norm
   - max_batch_size
   notes: ''
+- index: 5
+  tag: 5_baseline
+  update_keys:
+  - lr_policy
+  - lr_back
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  - t_emb_dim
+  - dropout
+  - norm
+  - max_batch_size
+  notes: ''
+- index: 6
+  tag: 6_-3_-3
+  update_keys:
+  - lr_policy
+  - lr_back
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  - t_emb_dim
+  - dropout
+  - norm
+  - max_batch_size
+  notes: ''
+- index: 7
+  tag: 7_-4_-3
+  update_keys:
+  - lr_policy
+  - lr_back
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  - t_emb_dim
+  - dropout
+  - norm
+  - max_batch_size
+  notes: ''
+- index: 8
+  tag: 8_512_dim
+  update_keys:
+  - lr_policy
+  - lr_back
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  - t_emb_dim
+  - dropout
+  - norm
+  - max_batch_size
+  notes: ''
+- index: 9
+  tag: 9_16_layers
+  update_keys:
+  - lr_policy
+  - lr_back
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  - t_emb_dim
+  - dropout
+  - norm
+  - max_batch_size
+  notes: ''
