@@ -1,0 +1,72 @@
+defaults:
+  base: base.yaml
+
+# single-molecule search
+# testing the depth/breadth tradeoff
+
+
+experiments:
+- tag: 0_baseline
+  update:
+    lr_policy: 0.001
+    lr_back: 0.0001
+    joint_layers: 2
+    hidden_dim: 256
+    s_emb_dim: 256
+    condition_emb_dim: 256
+    t_emb_dim: 256
+    dropout: 0.0
+    norm: null
+    max_batch_size: 1000
+
+- tag: 1_-3_-3
+  update:
+    lr_policy: 0.001
+    lr_back: 0.001
+    joint_layers: 2
+    hidden_dim: 256
+    s_emb_dim: 256
+    condition_emb_dim: 256
+    t_emb_dim: 256
+    dropout: 0.0
+    norm: null
+    max_batch_size: 1000
+
+- tag: 2_-4_-3
+  update:
+    lr_policy: 0.0001
+    lr_back: 0.001
+    joint_layers: 2
+    hidden_dim: 256
+    s_emb_dim: 256
+    condition_emb_dim: 256
+    t_emb_dim: 256
+    dropout: 0.0
+    norm: null
+    max_batch_size: 1000
+
+- tag: 3_512_dim
+  update:
+    lr_policy: 0.001
+    lr_back: 0.0001
+    joint_layers: 2
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 256
+    dropout: 0.0
+    norm: null
+    max_batch_size: 1000
+
+- tag: 4_4_layers
+  update:
+    lr_policy: 0.001
+    lr_back: 0.0001
+    joint_layers: 4
+    hidden_dim: 256
+    s_emb_dim: 256
+    condition_emb_dim: 256
+    t_emb_dim: 256
+    dropout: 0.0
+    norm: null
+    max_batch_size: 1000

@@ -2,26 +2,25 @@ run_name: 'mk_local_dev'
 tag: 'dev'
 seed: 12345
 device: 'cuda'
-lr_policy: 0.0001              # learning rate of the policy network
-min_lr: 1.0e-6                # ihn
+lr_policy: 0.001              # learning rate of the policy network
+min_lr: 1.0e-5                # ihn
 lr_flow: 0.1                  # learning rate of the flow network
-lr_back: 0.0001                # learning rate of the backward pass
+lr_back: 0.001                # learning rate of the backward pass
 lr_warmup_ratio: 100           # how much smaller the initial (warmup) LR should be than the max policy value
 scheduler: True               # does LR warmup from lr/lr_warup_ratio -> lr -> min_lr over the warmup and annealing period
 lr_warmup_time: 500
-lr_anneal_time: 40000
+lr_anneal_time: 100000
 weight_decay: 1e-7
 use_weight_decay: false
 gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weights
-ema_decay: null #0.999  # set to null for no ema
-running_stats_iters: 10 # how many train iterations to average for running stats checks
+ema_decay: 0.995 #0.999  # set to null for no ema
 
 # model parameters
 zero_init: False
 joint_layers: 4              # number of layers in forward/backward policy models
-hidden_dim: 256              # dimensionality of hidden layer
-s_emb_dim: 256               # dimensionality of state embedding
-condition_emb_dim: 256         # dimensionality of the conditioning embedding
+hidden_dim: 512             # dimensionality of hidden layer
+s_emb_dim: 512               # dimensionality of state embedding
+condition_emb_dim: 512         # dimensionality of the conditioning embedding
 t_emb_dim: 32                # dimensionality of time embedding
 harmonics_dim: 64            # dimensionality of harmonic embedding
 dropout: 0                    # dropout probability
@@ -29,27 +28,27 @@ norm: null                   # null, "layer", "batch"
 
 batch_size: 5              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 500           # maximum batch size to allow
+max_batch_size: 1000           # maximum batch size to allow
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
 repeats: 5                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
 eval_batch_size: 1000        # batch size for evaluation
 epochs: 1000000             # number of training epochs: relatively large
-eval_period: 100              # how often to do evaluation & reporting
+eval_period: 1000              # how often to do evaluation & reporting
 conditional_eval_period: 10000 # how often to do conditional evaluation with figs # must be multiple of eval period
-figs_period: 100             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+figs_period: 10000             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # GFlowNet settings
 T: 10                        # static training diffusion length
-eval_T: 100                  # diffusion trajectory length for inference
-min_traj_length: 20
-max_traj_length: 30
+eval_T: 50                  # diffusion trajectory length for inference
+min_traj_length: 10
+max_traj_length: 15
 traj_length_strategy: sampled # 'static'  or 'sampled'  will do random between min and max traj lengths
 discretizer_max_ratio: 15    # maximum ratio between randomly sampled step sizes - needs to be >25 for 15 steps, or 10 for 30 steps to get good coverage at extrema
 discretizer: 'random'        # 'random' 'low_discrepancy' 'equidistant' 'uniform'
 t_scale: 0.1                 # scales fixed forward policy variance
-log_var_range: 1           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
+log_var_range: 2           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
 pb_drift_range: 0.2          # range of learned backward drift corrections, only for 'brownian_bridge'
-pb_var_range: 1             # range of learned backward policy variance
+pb_var_range: 2             # range of learned backward policy variance
 energy: "molecular_crystal"  # "molecular_crystal"
 # set a constant or
 # as a set of line segments [[step, value], [step, value], ...]
@@ -58,9 +57,9 @@ fwd_loss_coeffs:
   vg_lb:            0
   vg_lme:           0  # exclusive with vg_lb
   emp_z:            0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
-  greedy:           0
-  reinforce:        1.0
-  mle:              0
+  greedy:           1.0
+  reinforce:        0.1
+  mle:              0.1
   var:              0
   overlap:          0
   buffer:           0
@@ -79,11 +78,11 @@ bwd_loss_coeffs:
   pmle_std:         1 # std deviation of the prior mle distribution. Best to start small (1) and smoothly grow
   loss_clip:        1.0E+9
 
-prior_coverage_cutoff: 0.75 #0.75  # or None  # value of minimum 1D coverage below which we penalize forward training in favour of backward
+prior_coverage_cutoff: 0.8  # or None  # value of minimum 1D coverage below which we penalize forward training in favour of backward
 prior_coverage_ratio: 0.1  # [0, 1] fraction of uniform bin coverage that will satisfy the coverage metric
 both_ways: True             # forward and backward training
 bwd_batch_multiplier: 1      # ratio of backward to foward batch size (much cheaper to evaluate)
-fwd_to_bwd_ratio: 1           # whether to do forward (>1) or backward (<1) training more often
+fwd_to_bwd_ratio: 0.1           # whether to do forward (>1) or backward (<1) training more often
 bwd: False                   # backward training only
 learn_pb: True               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
 learned_variance: True       # whether to learn policy variance
@@ -105,7 +104,7 @@ autoencoder_path: 'D:/crystal_datasets/model_checkpoints/best_autoencoder_experi
 beta: 1.0             # reward prioritized replay sampling: high beta = steep prioritization
 rank_weight: 1.0     # rank-based replay sampling: low rank_weight = steep prioritization
 buffer_diversity_coeff: 1.0  # how highly to weight sample diversity when sampling from the buffer
-prioritized: "boltzmann"   # three kinds of replay training: random, reward prioritized (Boltzmann), rank-based
+prioritized: null #"boltzmann"   # three kinds of replay training: random, reward prioritized (Boltzmann), rank-based
 sampling: "buffer"
 add_to_buffer_each: 10  # how often to add samples to the buffer during fwd passes in both_ways training
 buffer_size: 100000          # size of replay buffer
@@ -119,9 +118,9 @@ wd_max_steps: 10000  # number of steps to terminate the added variance
 
 # molecular crystal settings
 ################################################################
-molecule: 'qm9'  # 'nicotinamide' or 'urea' or 'qm9' for molecule-conditional training
+molecule: 'nicotinamide'  # 'nicotinamide' or 'urea' or 'qm9' for molecule-conditional training
 temperature_conditioning: False  # if false, temperatures are set to energy_static_temperature, and there is no annealing
-molecule_conditioning: True  # MUST be true for molecule='qm9' and false else - conditions the generative prediction on the molecule
+molecule_conditioning: False  # MUST be true for molecule='qm9' and false else - conditions the generative prediction on the molecule
 mol_embedding_type: 'autoencoder'  # pricipal_axes or autoencoder
 sg_conditioning: False  # whether to conditionally sample across space groups
 space_groups: [2]  # which space groups to sample over

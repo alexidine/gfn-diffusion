@@ -202,10 +202,7 @@ def generate_fwd_figs(buffer, energy_function,
     fig_dict['Lattice Latents Trajectories'] = visualize_latent_trajs(flow_states.cpu().detach().numpy(),
                                                                       20,
                                                                       log_r.cpu().detach().numpy())
-    rolling_sample = np.concatenate(buffer.sample_record)
 
-    fig_dict['Rolling Lattice Latents Distribution'], latent_klds = (
-        simple_cell_hist(buffer_latent_params, n_kde_points=200, bw_ratio=10, mode='latent', samples=rolling_sample))
     fig_dict['Lattice Features Distribution'], cell_klds = (
         simple_cell_hist(sample_batch, buffer_cell_params,
                                                                             n_kde_points=200, bw_ratio=10, mode='cell'))

@@ -75,7 +75,6 @@ def train_step(energy_function,
 
         forward_iter = int(it * p_forward)
         if add_to_buffer and forward_iter % args.add_to_buffer_each == 0:
-            buffer.update_running_stats(crystal_batch)
             buffer.add(crystal_batch.detach().cpu().to_data_list())
         del crystal_batch
 
@@ -366,10 +365,6 @@ def train():
                           buffer, train_mol_loader,test_mol_loader,
                           energy_function, metrics)
 
-            # dynamical tracking
-            if step_ind % 100 == 0:
-                dynamic_quality_management(buffer, energy_function, metrics)
-
             # train monitoring
             if step_ind % 10 == 0:
                 metrics['train/expl'] = exploration_std(0) if exploration_std is not None else 0
@@ -382,50 +377,6 @@ def train():
         torch.save(ema_model, f'checkpoints/{name}_model_final.pt')
 
 
-def dynamic_quality_management(buffer, energy_function, metrics):
-    rolling_sample = np.concatenate(buffer.sample_record)
-    if buffer is not None:
-        if len(buffer) > 0:
-            prior_sample, _, _, _ = buffer.sample(override_batch=min(100000, len(rolling_sample)), override_sampler=None)
-        else:
-            prior_sample = torch.randn(len(rolling_sample), 12) * 2
-    else:
-        prior_sample = torch.randn(len(rolling_sample), 12) * 2
-
-    prior_coverage = get_dimwise_coverage(torch.tensor(rolling_sample),
-                                          prior_sample,
-                                          n_bins=24, cmin=1, tau=1 / args.prior_coverage_ratio)
-    minimum_1d_coverage = torch.amin(prior_coverage).item()
-    metrics['Rolling Minimum 1D Coverage'] = minimum_1d_coverage
-
-    if args.prior_coverage_cutoff is not None and args.both_ways:
-        low_cut = max(0, args.prior_coverage_cutoff * 0.95)
-        high_cut = min(1, args.prior_coverage_cutoff * 1.0)
-        if minimum_1d_coverage > high_cut:
-            args.fwd_to_bwd_ratio *= 1.05  # train forward more often
-        elif minimum_1d_coverage < low_cut:
-            if args.fwd_to_bwd_ratio > 0.01:
-                args.fwd_to_bwd_ratio *= 0.95
-
-    energies = np.concatenate(buffer.energy_record)
-    densities = np.concatenate(buffer.packing_record)
-    sample_is_good = (energies < 0) * (densities > 0.55)
-    metrics['Rolling Reasonable Sample Fraction'] = sample_is_good.mean()
-
-    if args.anneal_repulsion:
-        if sample_is_good.mean() >= args.anneal_repulsion_cutoff:
-            if args.lj_repulsion < 1:
-                args.lj_repulsion = min(1, args.lj_repulsion * 1.05)
-                energy_function.lj_repulsion = args.lj_repulsion
-                if buffer is not None:
-                    if len(buffer) > 0:
-                        buffer.recompute_silu_pot(
-                            batch_size=min(500, args.batch_size),
-                            lj_repulsion=args.lj_repulsion,
-                            device=args.device
-                        )
-    metrics['LJ Repulsion'] = args.lj_repulsion
-    metrics['Fwd to Bwd Ratio'] = args.fwd_to_bwd_ratio
 
 
 def ten_step_reporting(bwd_loss, bwd_loss_dict, fwd_loss, fwd_loss_dict, metrics, optimizers):
@@ -518,7 +469,6 @@ def init_buffers_datasets(args, energy_function):
         'cpu',
         energy_function,
         args.batch_size,
-        args.running_stats_iters,
         beta=args.beta,
         rank_weight=args.rank_weight,
         prioritized=args.prioritized,
@@ -928,8 +878,41 @@ def eval_work(args,
                                  gfn_model,
                                  step_ind, test_mol_loader))
 
+    dynamic_quality_management(metrics, buffer, energy_function)
+
     wandb.log(metrics, step=step_ind)
 
+
+def dynamic_quality_management(metrics, buffer, energy_function):
+    minimum_1d_coverage = metrics['Minimum 1d coverage']
+
+    diversity_check = True
+    if args.prior_coverage_cutoff is not None and args.both_ways:
+        low_cut = max(0, args.prior_coverage_cutoff * 0.95)
+        high_cut = min(1, args.prior_coverage_cutoff * 1.0)
+        if minimum_1d_coverage > high_cut:
+            args.fwd_to_bwd_ratio *= 1.1  # train forward more often
+        elif minimum_1d_coverage < low_cut:
+            if args.fwd_to_bwd_ratio > 0.01:
+                args.fwd_to_bwd_ratio *= 0.9
+            diversity_check = False
+
+    reasonable_frac = metrics['Reasonable Sample Fraction']
+
+    if args.anneal_repulsion:
+        if (reasonable_frac >= args.anneal_repulsion_cutoff) and diversity_check:
+            if args.lj_repulsion < 1:
+                args.lj_repulsion = min(1, args.lj_repulsion * 1.05)
+                energy_function.lj_repulsion = args.lj_repulsion
+                if buffer is not None:
+                    if len(buffer) > 0:
+                        buffer.recompute_silu_pot(
+                            batch_size=min(500, args.batch_size),
+                            lj_repulsion=args.lj_repulsion,
+                            device=args.device
+                        )
+    metrics['LJ Repulsion'] = args.lj_repulsion
+    metrics['Fwd to Bwd Ratio'] = args.fwd_to_bwd_ratio
 
 if __name__ == '__main__':
     train()
