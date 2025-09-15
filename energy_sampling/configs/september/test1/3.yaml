@@ -78,12 +78,12 @@ lj_repulsion: 0.5
 lj_start_time: 0
 lj_turnover_pot: 10.0
 log_var_range: 2
-lr_anneal_time: 40000
+lr_anneal_time: 200000
 lr_back: 0.001
 lr_flow: 0.1
 lr_policy: 0.001
 lr_warmup_ratio: 100
-lr_warmup_time: 500
+lr_warmup_time: 2000
 max_batch_size: 10000
 max_traj_length: 15
 min_lr: 1.0e-05
