@@ -29,7 +29,7 @@ def get_loss_reward(log_T_tensor, log_reward_fn, mol_batch, return_exp, states, 
     x_T = states[:, -1]
     if no_grad:
         x_T = x_T.detach()
-        ctx = torch.inference_mode()
+        ctx = torch.no_grad()
     else:
         ctx = torch.enable_grad()
 
@@ -63,7 +63,7 @@ def soft_clip(x, cutoff):
     sign_x = x.sign()
     # Match value and slope at cutoff using a shifted log
     delta = abs_x - cutoff
-    clipped = cutoff + torch.log1p(delta)  # log1p = log(1 + x), safer numerically
+    clipped = cutoff + torch.log1p(delta.clip(min=1e-3))  # log1p = log(1 + x), safer numerically
     return torch.where(abs_x <= cutoff, x, sign_x * clipped)
 
 
@@ -182,6 +182,7 @@ def get_gfn_forward_loss(loss_coeffs,
     else:
         combined_losses = torch.stack(losses).mean(dim=0)
 
+    assert combined_losses.isfinite().all()
     loss = combined_losses.mean()
 
     if report_losses:

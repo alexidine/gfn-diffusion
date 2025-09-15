@@ -1,14 +1,15 @@
-from collections import deque
+import os
 from typing import Optional
 
 import torch
 import numpy as np
-from torch_geometric.loader import DataLoader
+from torch.utils.data import Sampler
+from torch_geometric.loader import DataLoader, DynamicBatchSampler
 
 from mxtaltools.crystal_building.crystal_latent_transforms import compute_niggli_overlap
 from mxtaltools.dataset_utils.utils import collate_data_list
 
-from utils import compute_sample_overlap
+from utils import compute_sample_overlap, iter_forever
 
 
 class CrystalReplayBuffer:
@@ -47,8 +48,10 @@ class CrystalReplayBuffer:
         with torch.no_grad():
             if self.dataset is None:
                 self.init_fresh_dataset(data_list)
+                self.init_loader()
 
             else:
+                assert False, "NOTE: loader not currently set up for on-the-fly dataset addition!"
                 new_data_batch = collate_data_list(data_list)
 
                 # do not take samples with bad overlaps
@@ -81,6 +84,7 @@ class CrystalReplayBuffer:
                     ref_x_tensor = torch.stack(self.x_list).to(self.device)
                     min_buffer_dist = torch.cdist(ref_x_tensor, new_x_tensor).amin(0)
                     new_x_tensor = new_x_tensor.cpu()
+                    sg_list = new_data_batch.sg_ind.cpu()
 
                     far_enough = (min_buffer_dist >= diversity_cutoff).cpu().detach().numpy()
                     existing_rewards = np.array(self.rewards_list)
@@ -93,6 +97,7 @@ class CrystalReplayBuffer:
                         self.dataset.extend(list(data_list_to_add))
                         self.x_list.extend([new_x_tensor[ind] for ind in new_x_inds_to_keep])
                         self.rewards_list.extend([scores_list[ind] for ind in new_x_inds_to_keep])
+                        self.sg_list.extend([sg_list[ind] for ind in new_x_inds_to_keep])
 
             if len(self) > self.buffer_size:  # pare down buffer
                 self.truncate_buffer()
@@ -107,6 +112,7 @@ class CrystalReplayBuffer:
         self.x_list = [x_tensor[i] for i in range(x_tensor.shape[0])]
         self.rewards_list = list(scores.flatten().cpu().detach().numpy())
         self.original_dataset_inds = list(np.arange(len(self.dataset)))
+        self.sg_list = list(dataset_batch.sg_ind.cpu())
 
     def truncate_buffer(self, override_buffer_size=None):
         if override_buffer_size is not None:
@@ -120,6 +126,7 @@ class CrystalReplayBuffer:
         self.dataset = [self.dataset[ind] for ind in inds_to_keep]
         self.rewards_list = [self.rewards_list[ind] for ind in inds_to_keep]
         self.x_list = [self.x_list[ind] for ind in inds_to_keep]
+        self.sg_list = [self.sg_list[ind] for ind in inds_to_keep]
 
     def __len__(self):
         if self.dataset is None:
@@ -139,7 +146,7 @@ class CrystalReplayBuffer:
                                                            ))
         return inds
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def get_sampler_weights(self,
                             diversity_coeff,
                             eps: float = 1e-6,
@@ -149,19 +156,20 @@ class CrystalReplayBuffer:
         else:
             method = self.prioritized
 
-        scores = np.array(self.rewards_list)
-        if diversity_coeff > 0:
-            x_tensor = torch.stack(self.x_list).to(self.device)
-            if len(x_tensor) > 1000:
-                subsample_inds = np.random.choice(len(self), 1000, replace=False)
-                scores -= diversity_coeff * ((compute_sample_overlap(x_tensor[subsample_inds].float(),
-                                                                     x_tensor.float(),
-                                                                     ga=0.01,
-                                                                     agg='sum')).cpu().detach().numpy() - 1)  # subtract self contribution
-            else:
-                scores -= diversity_coeff * ((compute_sample_overlap(x_tensor.float(),
-                                                                     ga=0.01,
-                                                                     agg='sum')).cpu().detach().numpy() - 1)  # subtract self contribution
+        if method is not None:
+            scores = np.array(self.rewards_list)
+            if diversity_coeff > 0:
+                x_tensor = torch.stack(self.x_list).to(self.device)
+                if len(x_tensor) > 1000:
+                    subsample_inds = np.random.choice(len(self), 1000, replace=False)
+                    scores -= diversity_coeff * ((compute_sample_overlap(x_tensor[subsample_inds].float(),
+                                                                         x_tensor.float(),
+                                                                         ga=0.01,
+                                                                         agg='sum')).cpu().detach().numpy() - 1)  # subtract self contribution
+                else:
+                    scores -= diversity_coeff * ((compute_sample_overlap(x_tensor.float(),
+                                                                         ga=0.01,
+                                                                         agg='sum')).cpu().detach().numpy() - 1)  # subtract self contribution
 
         if method == 'rank':
             ranks = np.argsort(np.argsort(-1 * scores))
@@ -171,46 +179,62 @@ class CrystalReplayBuffer:
             logits -= np.max(logits)  # subtract max for stability
             weights_i = np.nan_to_num(np.exp(logits)) + eps  # all samples need nonzero probability
         else:  # uniform weights
-            weights_i = np.ones(len(scores))
+            weights_i = np.ones(len(self.x_list))
 
         return weights_i / np.sum(weights_i)  # enforce explicit normalization
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def sample(self,
                override_batch: Optional[int] = None,
                return_preload: Optional[bool] = False,
-               override_sampler: Optional[str] = None
+               override_sampler: Optional[str] = None,
                ):
 
         if override_batch is not None:
-            batch_size = override_batch
-        else:
-            batch_size = self.batch_size
+            self.batch_size = override_batch
 
         # manual dataloader
         if return_preload:
             rand_inds = self.original_dataset_inds
         else:
-            if batch_size > len(self):
+            if self.batch_size > len(self):
                 rand_inds = np.arange(len(self))
-                missing_len = batch_size - len(self)
+                missing_len = self.batch_size - len(self)
                 rand_inds = np.concatenate(
                     [rand_inds, self.sample_indices(missing_len, replace=True, diversity_coeff=self.diversity_coeff, override_method=override_sampler)])
             else:
-                rand_inds = self.sample_indices(batch_size, replace=False, diversity_coeff=self.diversity_coeff, override_method=override_sampler)
+                rand_inds = self.sample_indices(self.batch_size, replace=False, diversity_coeff=self.diversity_coeff, override_method=override_sampler)
 
-        sample = collate_data_list([self.dataset[ind] for ind in rand_inds])
+        sample_batch = collate_data_list([self.dataset[ind] for ind in rand_inds])
 
-        T_tensor, sg_inds, condition = self.energy_function.get_conditioning_tensor(sample,
-                                                                                    sg_inds=sample.sg_ind)
-        sample.sg_ind = sg_inds
+        T_tensor, sg_inds, condition = self.energy_function.get_conditioning_tensor(sample_batch,
+                                                                                    sg_inds=sample_batch.sg_ind)
+        sample_batch.sg_ind = sg_inds
         temperature = 10 ** T_tensor  # first dimension is the log temperature
         reward = self.energy_function.prebuilt_sample_to_reward(
-            sample, temperature)  # recompute reward in case parameters have changed
+            sample_batch, temperature)  # recompute reward in case parameters have changed
 
-        return sample.cell_params_to_gen_basis(), reward, sample, condition
+        return sample_batch.cell_params_to_gen_basis(), reward, sample_batch, condition
 
-    @torch.inference_mode()
+    def init_loader(self):
+        self.loader = DataLoader(
+            self.dataset,
+            batch_size=self.batch_size,
+            collate_fn=collate_fn,
+            shuffle=True,
+            num_workers=0,#os.cpu_count() - 2,  # use all but two available CPUs
+            persistent_workers=False, #True,
+            drop_last=True,
+            pin_memory=True,
+            #prefetch_factor=4,
+        )
+        self._loader_iter = iter_forever(self.loader)
+
+    def adjust_batch_size(self, new_batch_size: int):
+        self.loader.batch_sampler.batch_size = new_batch_size
+        self._loader_iter = iter_forever(self.loader)
+
+    @torch.no_grad()
     def recompute_silu_pot(self, batch_size, lj_repulsion, device):
         """when updating the silu repulsive term,
         we have to rebuild and re-analyze the full dataset"""
@@ -243,3 +267,32 @@ class CrystalReplayBuffer:
         scores = self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(len(self)))
         self.rewards_list = list(scores.flatten().cpu().detach().numpy())
 
+
+    def sample_mol_unconditional_prior(self, sg_inds, noise: Optional[float] = None):
+        """
+        sample from the buffer, unconditional on molecules, conditional on space groups
+        then optionally noise
+        :param sg_inds:
+        :return:
+        """
+        samples = torch.zeros((len(sg_inds), 12), dtype=torch.float32)
+        sgs_to_sample = torch.unique(sg_inds).tolist()
+        sg_buffer = torch.tensor(self.sg_list)
+        x_tensor = torch.stack(self.x_list).to(self.device)
+
+        for sg in sgs_to_sample:
+            sample_mask = sg_inds == sg
+            mask = (sg_buffer == sg)
+            relevant = x_tensor[mask]
+
+            n = sample_mask.sum()
+            rand_idx = torch.randint(0, relevant.size(0), (n,), device=self.device)
+            samples[sample_mask] = relevant[rand_idx]
+
+        if noise is not None:
+            samples += torch.randn_like(samples) * noise
+
+        return samples.clip(min=-6, max=6)
+
+def collate_fn(data_list):
+    return collate_data_list(data_list, exclude_unit_cell=True)

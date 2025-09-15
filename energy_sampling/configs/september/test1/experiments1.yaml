@@ -1,0 +1,52 @@
+defaults:
+  base: base.yaml
+
+
+experiments:
+- tag: 0_qm9_baseline
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+
+- tag: 1_nic_baseline
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    molecule: 'nicotinamide'
+    molecule_conditioning: null
+    buffer_path: '/scratch/mk8347/csd_runs/datasets/nic_sg2_dataset.pt'
+
+- tag: 2_qm9_smallbatch
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    max_batch_size: 10000
+
+- tag: 3_nic_smallbatch
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    max_batch_size: 10000
+    molecule: 'nicotinamide'
+    molecule_conditioning: null
+    buffer_path: '/scratch/mk8347/csd_runs/datasets/nic_sg2_dataset.pt'

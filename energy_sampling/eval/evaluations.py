@@ -17,7 +17,7 @@ from skimage.segmentation import watershed
 from umap import UMAP
 
 from energy_sampling.eval.utils import log_partition_function, get_plotly_fig_size_mb
-from energy_sampling.utils import logmeanexp, sample_crystal_prior
+from energy_sampling.utils import logmeanexp, sample_crystal_prior, manual_batch_to_data_list
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.reporting.figures import simple_cell_hist, simple_cell_scatter_fig, \
     log_crystal_samples, conditional_simple_cell_hist
@@ -45,8 +45,8 @@ def eval_step(energy_function,
     metrics = log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, log_r,
                                          sample_batch, log_T_tensor, args, buffer)
 
-    if add_to_buffer:
-        buffer.add(sample_batch.detach().cpu().to_data_list())  # add evaluation samples to buffer
+    # if add_to_buffer:
+    #     buffer.add(manual_batch_to_data_list(sample_batch.detach().cpu()))  # add evaluation samples to buffer
 
     if do_figures:
         fig_dict = generate_fwd_figs(buffer,
@@ -791,8 +791,7 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
 
 def generate_bwd_figs(fig_dict, buffer, gfn_model, init_state, discretizer):
     terminal_state, b_log_r, crystal_batch, condition = buffer.sample(
-        override_batch=len(init_state),
-    override_sampler=None)
+        override_batch=len(init_state))
     (backward_flow_states, b_log_pfs, b_log_pbs, b_log_flow,
      b_means_f, b_vars_f, b_means_b, b_vars_b) = gfn_model.get_trajectory_bwd(
         terminal_state.to(gfn_model.device), discretizer, condition.to(gfn_model.device), return_gauss_params=True)
@@ -828,7 +827,7 @@ def get_buffer_stats(buffer):
         samples_to_take = min(10000, len(buffer))
         # take samples according to the sampler weighting, rather than random trash in the buffer
         buffer_latent_params, buffer_reward, buffer_batch, condition = buffer.sample(
-            override_batch=samples_to_take, override_sampler=None)
+            override_batch=samples_to_take)
         buffer_cell_params = buffer_batch.cell_parameters().cpu().detach().numpy()
         buffer_latent_params = buffer_batch.cell_params_to_gen_basis().cpu().detach().numpy()
         buffer_std_params_for_embedding = buffer_batch.cell_params_to_gen_basis().cpu().detach().numpy()
@@ -974,7 +973,7 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
 def sample_backward_prior(args, buffer, sample_batch, num_samples):
     if buffer is not None:
         if len(buffer) > 0:
-            prior_sample, _, _, _ = buffer.sample(override_batch=num_samples, override_sampler=None)
+            prior_sample, _, _, _ = buffer.sample(override_batch=num_samples)
         else:
             prior_sample = sample_crystal_prior(sample_batch, args.bwd_loss_coeffs.pmle_std)
     else:
@@ -1349,7 +1348,7 @@ def get_dimwise_coverage(test_samples, ref_samples, n_bins=24, tau=10, cmin=1):
     thresh = max(cmin, expected / tau)
 
     for j in range(D):
-        idx = torch.bucketize(test_samples[:, j], interior[j], right=False)
+        idx = torch.bucketize(test_samples[:, j].contiguous(), interior[j], right=False)
         # idx in [0, B-1]
         counts = torch.bincount(idx, minlength=n_bins)
         covered = (counts >= thresh).float().mean()  # fraction of bins covered

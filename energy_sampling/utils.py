@@ -19,6 +19,7 @@ from tqdm import tqdm
 from mxtaltools.common.config_processing import dict2namespace
 from mxtaltools.common.geometry_utils import batch_molecule_principal_axes_torch, batch_cell_vol_torch
 from mxtaltools.crystal_building.crystal_latent_transforms import enforce_niggli_plane
+from mxtaltools.dataset_utils.data_classes import MolCrystalData
 from mxtaltools.models.utils import load_encoder
 
 
@@ -300,7 +301,7 @@ def triangle_schedule(it, init, maxval, minval, on, off):
         return minval
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def featurize_dataset(dataset, device, ellipsoid_scale, lj_repulsion, batch_size: int = 500):
 
     loader = DataLoader(
@@ -356,7 +357,7 @@ def featurize_dataset(dataset, device, ellipsoid_scale, lj_repulsion, batch_size
 
     return dataset
 
-@torch.inference_mode()
+@torch.no_grad()
 def embed_dataset(dataset, autoencoder_path=None, device=None, encoder=None, embedding_type='autoencoder'):
     batch_size = 500
     loader = DataLoader(
@@ -364,35 +365,34 @@ def embed_dataset(dataset, autoencoder_path=None, device=None, encoder=None, emb
         batch_size=batch_size,
         drop_last=False
     )
-    with torch.no_grad():
-        if encoder is None and embedding_type == 'autoencoder':
-            encoder = load_encoder(autoencoder_path).to(device).eval()
+    if encoder is None and embedding_type == 'autoencoder':
+        encoder = load_encoder(autoencoder_path).to(device).eval()
 
-        embeddings = []
+    embeddings = []
 
-        for crystal_batch in tqdm(loader):
-            crystal_batch = crystal_batch.to(device)
-            # for now, make all the embeddings exactly standardized,
-            # and we'll generate also in the standardized basis
-            crystal_batch.orient_molecule(mode='standardized',
-                                          target_handedness=torch.ones_like(crystal_batch.radius)
-                                          )
-            if embedding_type == 'autoencoder':
-                embeddings.append(encoder.encode(crystal_batch).clone().cpu())
-            elif embedding_type == 'principal_axes':
-                v_embedding_i, s_embedding_i, _ = batch_molecule_principal_axes_torch(
-                    crystal_batch.pos,
-                    crystal_batch.batch,
-                    crystal_batch.num_graphs,
-                    crystal_batch.num_atoms,
-                )
-                embeddings.append((v_embedding_i * s_embedding_i[:, :, None]).cpu())
+    for crystal_batch in tqdm(loader):
+        crystal_batch = crystal_batch.to(device)
+        # for now, make all the embeddings exactly standardized,
+        # and we'll generate also in the standardized basis
+        crystal_batch.orient_molecule(mode='standardized',
+                                      target_handedness=torch.ones_like(crystal_batch.radius)
+                                      )
+        if embedding_type == 'autoencoder':
+            embeddings.append(encoder.encode(crystal_batch).clone().cpu())
+        elif embedding_type == 'principal_axes':
+            v_embedding_i, s_embedding_i, _ = batch_molecule_principal_axes_torch(
+                crystal_batch.pos,
+                crystal_batch.batch,
+                crystal_batch.num_graphs,
+                crystal_batch.num_atoms,
+            )
+            embeddings.append((v_embedding_i * s_embedding_i[:, :, None]).cpu())
 
-            del crystal_batch
+        del crystal_batch
 
-        embeddings = torch.cat(embeddings, dim=0)
-        for ind, elem in enumerate(dataset):
-            elem.embedding = embeddings[None, ind]
+    embeddings = torch.cat(embeddings, dim=0)
+    for ind, elem in enumerate(dataset):
+        elem.embedding = embeddings[None, ind]
 
     return dataset
 
@@ -585,3 +585,47 @@ def update_ema(model, ema_model, decay=0.9999):
         for k in msd.keys():  # simply overwrite state dict to EMA model
             emsd[k] = msd[k]
 
+
+def manual_batch_to_data_list(batch):
+    ptr = batch.ptr
+    num_graphs = batch.num_graphs
+
+    # Pre-split all tensor attributes into lists of [num_graphs] length
+    attr_splits = {}
+    for key in batch.keys():
+        if key not in ['batch','ptr', 'edges_dict',
+                    'niggli_energy',
+                    'core_energy',
+                    'density_energy',
+                    'lj_energy',
+                    'bounding_energy',
+                       'asym_unit_dict',
+                       'latent_transform',]:
+            value = batch[key]
+            if torch.is_tensor(value) and value.size(0) == ptr[-1]:
+                # node-level attributes
+                attr_splits[key] = torch.split(value, torch.diff(ptr).tolist())
+            elif torch.is_tensor(value) and value.size(0) == num_graphs:
+                # graph-level attributes
+                attr_splits[key] = value.unsqueeze(1)
+            elif len(value) == num_graphs:
+                # graph-level, list attrubutes
+                attr_splits[key] = value
+
+    data_list = []
+    for ind in range(num_graphs):
+        data = MolCrystalData()
+
+        # here assign attributes to object
+        for key, splits in attr_splits.items():
+            setattr(data, key, splits[ind])
+
+        data_list.append(data)
+
+    return data_list
+
+
+def iter_forever(loader):
+    while True:
+        for batch in loader:
+            yield batch

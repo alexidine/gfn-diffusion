@@ -1,5 +1,7 @@
 import gc
 import os
+# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+# os.environ["TORCH_USE_CUDA_DSA"] = "1"
 # os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
 #     "max_split_size_mb:128,garbage_collection_threshold:0.8,expandable_segments:True")
 from time import time
@@ -15,7 +17,8 @@ from copy import deepcopy
 
 from buffer import CrystalReplayBuffer
 from energies.molecular_crystal import MolecularCrystal
-from eval.evaluations import eval_step, conditional_eval_step, get_dimwise_coverage
+from energy_sampling.utils import manual_batch_to_data_list, iter_forever
+from eval.evaluations import eval_step, conditional_eval_step
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 from models import GFN
 from mxtaltools.common.training_utils import flatten_wandb_params
@@ -24,7 +27,7 @@ from mxtaltools.dataset_utils.utils import collate_data_list
 from utils import get_train_args, get_gfn_init_state, set_seed, \
     get_exploration_std, random_discretizer, low_discrepancy_discretizer, \
     low_discrepancy_discretizer2, shifted_equidistant, uniform_discretizer, \
-    featurize_dataset, embed_dataset, get_conditioning_dim, set_loss_coeffs, sample_crystal_prior, anneal_reward, \
+    featurize_dataset, embed_dataset, get_conditioning_dim, set_loss_coeffs, anneal_reward, \
     update_ema
 
 torch.cuda.set_per_process_memory_fraction(0.9, device=0)
@@ -54,8 +57,7 @@ def train_step(energy_function,
                repeats):
     add_to_buffer, do_backward, do_forward, p_forward, report_losses = train_logic(buffer, it)
 
-    discretizer = get_discretizer(args.traj_length_strategy,
-                                  args.discretizer)
+    discretizer = get_discretizer(args.traj_length_strategy, args.discretizer)
 
     optimizers['flow'].zero_grad(set_to_none=True)
     if do_forward:
@@ -74,19 +76,23 @@ def train_step(energy_function,
         )
 
         forward_iter = int(it * p_forward)
-        if add_to_buffer and forward_iter % args.add_to_buffer_each == 0:
-            buffer.add(crystal_batch.detach().cpu().to_data_list())
+        # if add_to_buffer and forward_iter % args.add_to_buffer_each == 0:
+        #     # standard to_data_list won't work with our custom batching in the energy function
+        #     data_list = manual_batch_to_data_list(crystal_batch.detach().cpu())
+        #     buffer.add(data_list)
+
         del crystal_batch
 
     elif do_backward:
         optimizers['bwd'].zero_grad(set_to_none=True)
+        mol_batch = next(mol_iterator)
         loss, loss_dict = bwd_train_step(
             gfn_model,
             discretizer,
+            mol_batch,
             buffer,
             energy_function,
             repeats=repeats,
-            return_exp=True,
             report_losses=report_losses)
     else:
         assert False
@@ -212,15 +218,16 @@ def fwd_train_step(energy_function, gfn_model, discretizer,
                                 report_losses=report_losses)
 
 
-def bwd_train_step(gfn_model, discretizer, buffer, energy_function, repeats: int = 10,
-                   return_exp=False, report_losses: bool = False):
+def bwd_train_step(gfn_model, discretizer, mol_batch,
+                   buffer, energy_function, repeats: int = 10,
+                   report_losses: bool = False):
     if args.sampling == 'buffer':
         samples, rewards, crystal_batch, condition = buffer.sample(
             override_batch=int(args.batch_size * args.bwd_batch_multiplier))
     else:
         assert False, f"sampling method {args.sampling} not implemented"
 
-    condition, rewards, samples = substitute_prior(condition, crystal_batch, energy_function, rewards, samples)
+    condition, rewards, samples = substitute_prior(condition, crystal_batch, energy_function, rewards, samples, buffer)
 
     return get_gfn_backward_loss(args.bwd_loss_coeffs,
                                  samples.to(device),
@@ -232,12 +239,12 @@ def bwd_train_step(gfn_model, discretizer, buffer, energy_function, repeats: int
                                  report_losses=report_losses)
 
 
-def substitute_prior(condition, crystal_batch, energy_function, rewards, samples):
+def substitute_prior(condition, crystal_batch, energy_function, rewards, samples, buffer):
     loss_coeffs = args.bwd_loss_coeffs
-    if loss_coeffs.mle_prior_fraction > 0:  # todo change variable name to 'buffer_noise_fraction'
+    if loss_coeffs.mle_prior_fraction > 0:
         # replace buffer samples with a random prior
-        prior_samples = sample_crystal_prior(crystal_batch, args.bwd_loss_coeffs.pmle_std)
-
+        #prior_samples = sample_crystal_prior(crystal_batch, args.bwd_loss_coeffs.pmle_std)
+        prior_samples = buffer.sample_mol_unconditional_prior(crystal_batch.sg_ind, loss_coeffs.pmle_std)
         if loss_coeffs.mle_prior_fraction < 1:
             num_to_replace = max(1, int(len(samples) * loss_coeffs.mle_prior_fraction))
             inds_to_replace = np.random.choice(len(samples), num_to_replace, replace=False)
@@ -245,7 +252,8 @@ def substitute_prior(condition, crystal_batch, energy_function, rewards, samples
         else:
             samples = prior_samples
 
-        # have to update the rewards if we are using any loss functions that take them
+        # have to update the rewards if we are using any loss functions that require them
+        # otherwise, if we're not using the reward, just pass the raw sample
         if any([
             loss_coeffs.tb > 0,
             loss_coeffs.vg_lb > 0,
@@ -310,6 +318,18 @@ def train():
 
         gfn_model.train()
 
+        # torch.autograd.set_detect_anomaly(True)  # for debugging
+        #
+        # def grad_check_hook(grad, name):
+        #     if not torch.isfinite(grad).all():
+        #         raise RuntimeError(f"NaN/Inf gradient in {name}")
+        #     return grad
+        #
+        # for name, p in gfn_model.named_parameters():
+        #     if p.requires_grad:
+        #         p.register_hook(lambda g, n=name: grad_check_hook(g, n))
+        #
+
         for step_ind in trange(args.epochs + 1):
             metrics = dict()
             if step_ind % 10 == 0:
@@ -324,7 +344,6 @@ def train():
 
             times['train_step_start'] = time()
             try:
-                #torch.autograd.set_detect_anomaly(True)  # for debugging
                 train_loss, step_type, loss_dict = train_step(energy_function,
                                                               gfn_model,
                                                               optimizers,
@@ -588,10 +607,6 @@ def increment_batch_size(buffer, train_mol_loader, test_mol_loader, batch_growth
 
     return buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator
 
-def iter_forever(loader):
-    while True:
-        for batch in loader:
-            yield batch
 
 def handle_train_epoch_error(e, oomed_out, buffer, train_mol_loader, test_mol_loader, optimizers):
     print(f"Caught error: {str(e)}")
@@ -861,14 +876,15 @@ def eval_work(args,
               metrics):
     torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model.pt')
     if args.molecule_conditioning:
-        # # so far not useful
-        # train_metrics = do_evaluation(energy_function, buffer, gfn_model,
-        #                               step_ind, train_mol_loader,
-        #                               override_do_figures=False)
-        # kk = list(train_metrics.keys())
-        # for key in kk:
-        #     metrics['train_eval/' + key] = train_metrics[key]
+
         if step_ind % args.conditional_eval_period == 0:  # make conditional sampling figures
+            # # so far not useful
+            train_metrics = do_evaluation(energy_function, buffer, gfn_model,
+                                          step_ind, train_mol_loader,
+                                          override_do_figures=False)
+            kk = list(train_metrics.keys())
+            for key in kk:
+                metrics['train_eval/' + key] = train_metrics[key]
             conditional_metrics = do_conditional_evaluation(energy_function, gfn_model,
                                                             test_mol_loader,
                                                             )

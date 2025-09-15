@@ -158,6 +158,8 @@ class MolecularCrystal(BaseSet):
 
         self.temperature = temperature  # for static temperature work
 
+        self.batch = collate_data_list([MolCrystalData()])
+
     def instantiate_crystals(self, x, mol_batch):
         crystal_batch = self.init_blank_crystal_batch(mol_batch)
         crystal_batch.gen_basis_to_cell_params(x)
@@ -320,7 +322,7 @@ class MolecularCrystal(BaseSet):
                 ens_dict)  # softly bound from above  #crystal_energy.clip(min=-self.energy_clip, max=self.energy_clip)
         #return soft_clip(total_energy, 0).clip(max=self.energy_clip), ens_dict  # softly bound from above  #crystal_energy.clip(min=-self.energy_clip, max=self.energy_clip)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def prebuilt_sample_to_reward(self, crystals, temperature):
         """
         For pre-built, pre-scored crystal, generate the approriate reward for this point in training.
@@ -372,10 +374,61 @@ class MolecularCrystal(BaseSet):
             sgs = mol_batch.sg_ind
         else:
             sgs = [self.space_groups[0] for _ in range(mol_batch.num_graphs)]
+        #
+        # crystal_list = mol_to_blank_crystal_list(mol_batch, sgs)
+        #
+        # crystal_batch = collate_data_list(crystal_list).to(self.device)
 
-        crystal_list = mol_to_blank_crystal_list( mol_batch, sgs)
+        crystal_batch = self.batch.clone()
+        ones3 = torch.ones((mol_batch.num_graphs, 3), device='cpu')
+        zeros1 = torch.zeros((mol_batch.num_graphs), device='cpu')
+        eye3 = torch.eye(3, device='cpu').repeat(mol_batch.num_graphs, 1, 1)
+        ones1 = torch.ones((mol_batch.num_graphs), device='cpu')
 
-        crystal_batch = collate_data_list(crystal_list).to(self.device)
+        blank_batch_properties = {
+            '_num_graphs': mol_batch.num_graphs,
+            'aunit_handedness' : ones1,
+        'cell_lengths' : ones3,
+        'cell_angles' : ones3,
+        'aunit_centroid' : ones3,
+        'aunit_orientation' : ones3,
+        'silu_pot' : zeros1,
+        'lj_pot' : zeros1,
+        'scaled_lj_pot' : zeros1,
+        'es_pot' : zeros1,
+        'niggli_overlap' : zeros1,
+        'ellipsoid_overlap' : zeros1,
+        #'density_energy' : zeros1,
+        #'niggli_energy' : zeros1,
+        #'core_energy' : zeros1,
+        #'lj_energy' : zeros1,
+        #'bounding_energy' : zeros1,
+        'T_fc' : eye3,
+        'T_cf' : eye3,
+        'cell_volume' : zeros1,
+        'packing_coeff' : zeros1,
+        'density' : zeros1
+        }
+        crystal_batch.set_mol_attrs(mol_batch.clone())
+        for key in blank_batch_properties:
+            if key.startswith("_"):
+                setattr(crystal_batch, key, blank_batch_properties[key])
+            else:
+                crystal_batch[key] = blank_batch_properties[key]
+        sg_cache = {}
+        for sg in set(sgs):
+            sg_cache[sg] = np.stack(SYM_OPS[int(sg)])
+
+        crystal_batch.sg_ind = torch.tensor(sgs, dtype=torch.long)
+        sym_ops = []
+        sym_mult = torch.zeros_like(zeros1).long()
+        for ind, sg in enumerate(sgs):
+            sym_ops.append(sg_cache[sg])
+            sym_mult[ind] = len(sym_ops[-1])
+        crystal_batch.symmetry_operators = sym_ops
+        crystal_batch.sym_mult = sym_mult
+
+        crystal_batch = crystal_batch.to(self.device)
 
         return crystal_batch
 
