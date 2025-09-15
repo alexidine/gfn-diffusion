@@ -103,12 +103,12 @@ def get_gfn_forward_loss(loss_coeffs,
     condition = condition.to(gfn.device)
     log_T_tensor = log_T_tensor.to(gfn.device)
     (states, log_pfs, log_pbs, log_flow) = gfn.get_trajectory_fwd(initial_state,
-                                                                      discretizer,
-                                                                      exploration_std,
-                                                                      condition,
-                                                                      detach_traj=not keep_grads,
-                                                                      return_gauss_params=False,
-                                                                      )
+                                                                  discretizer,
+                                                                  exploration_std,
+                                                                  condition,
+                                                                  detach_traj=not keep_grads,
+                                                                  return_gauss_params=False,
+                                                                  )
 
     crystal_batch, log_r = get_loss_reward(log_T_tensor,
                                            log_reward_fn,
@@ -214,7 +214,6 @@ def get_gfn_forward_loss(loss_coeffs,
         return loss, crystal_batch.cpu().detach(), loss_dict
     else:
         return loss, loss_dict
-
 
 
 def get_gfn_backward_loss(loss_coeffs,

@@ -1356,7 +1356,7 @@ def get_dimwise_coverage(test_samples, ref_samples, n_bins=24, tau=10, cmin=1):
 
     ref_cov = torch.empty(D, device=device)
     for j in range(D):
-        idx = torch.bucketize(ref_samples[:, j], interior[j], right=False)
+        idx = torch.bucketize(ref_samples[:, j].contiguous(), interior[j], right=False)
         # idx in [0, B-1]
         counts = torch.bincount(idx, minlength=n_bins)
         covered = (counts >= thresh).float().mean()  # fraction of bins covered

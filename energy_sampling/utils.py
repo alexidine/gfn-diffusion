@@ -2,7 +2,9 @@ import argparse
 import gc
 import math
 import os
+import queue
 import random
+import threading
 from argparse import Namespace
 from pathlib import Path
 
@@ -629,3 +631,63 @@ def iter_forever(loader):
     while True:
         for batch in loader:
             yield batch
+
+
+
+class ThreadedDataLoader:
+    def __init__(self, dataset, batch_size=1, max_prefetch=2, collate_fn=None, pin_memory=True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.max_prefetch = max_prefetch
+        self.collate_fn = collate_fn or (lambda x: x)
+        self.queue = queue.Queue(max_prefetch)
+        #self.queue = queue.SimpleQueue()
+
+        self.stop_event = threading.Event()
+        self.pin_memory = pin_memory
+        self.skip_next = False
+
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def _worker(self):
+        n = len(self.dataset)
+        while not self.stop_event.is_set():
+            # sample with replacement
+            idxs = torch.randint(n, (self.batch_size,), device='cpu')
+            batch = [self.dataset[i] for i in idxs]
+            batch = self.collate_fn(batch)
+            if self.pin_memory:
+                batch = batch.pin_memory()
+            self.queue.put(batch)
+
+    def __iter__(self):
+        return self
+
+    def shutdown(self):
+        self.stop_event.set()
+        if self.thread.is_alive():
+            self.thread.join()
+
+    def __next__(self):
+        while True:
+            batch = self.queue.get()
+            if self.skip_next:
+                # discard this one batch no matter what
+                self.skip_next = False
+                continue
+            return batch
+
+    def set_batch_size(self, new_size):
+        """Update batch size and flush queue to avoid stale batches."""
+        self.batch_size = int(new_size)
+        self._flush_queue()
+        self.skip_next = True   # force burn one
+
+    def _flush_queue(self):
+        """Remove all pending items in the prefetch queue."""
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break

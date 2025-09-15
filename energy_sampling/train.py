@@ -1,5 +1,6 @@
 import gc
 import os
+from copy import deepcopy
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 # os.environ["TORCH_USE_CUDA_DSA"] = "1"
 # os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
@@ -13,11 +14,10 @@ import wandb
 from torch.optim import lr_scheduler
 from torch_geometric.loader import DataLoader
 from tqdm import trange
-from copy import deepcopy
 
 from buffer import CrystalReplayBuffer
 from energies.molecular_crystal import MolecularCrystal
-from energy_sampling.utils import manual_batch_to_data_list, iter_forever
+from energy_sampling.utils import iter_forever
 from eval.evaluations import eval_step, conditional_eval_step
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 from models import GFN
@@ -75,7 +75,7 @@ def train_step(energy_function,
             report_losses=report_losses
         )
 
-        forward_iter = int(it * p_forward)
+        # forward_iter = int(it * p_forward)
         # if add_to_buffer and forward_iter % args.add_to_buffer_each == 0:
         #     # standard to_data_list won't work with our custom batching in the energy function
         #     data_list = manual_batch_to_data_list(crystal_batch.detach().cpu())
@@ -85,11 +85,9 @@ def train_step(energy_function,
 
     elif do_backward:
         optimizers['bwd'].zero_grad(set_to_none=True)
-        mol_batch = next(mol_iterator)
         loss, loss_dict = bwd_train_step(
             gfn_model,
             discretizer,
-            mol_batch,
             buffer,
             energy_function,
             repeats=repeats,
@@ -218,7 +216,7 @@ def fwd_train_step(energy_function, gfn_model, discretizer,
                                 report_losses=report_losses)
 
 
-def bwd_train_step(gfn_model, discretizer, mol_batch,
+def bwd_train_step(gfn_model, discretizer,
                    buffer, energy_function, repeats: int = 10,
                    report_losses: bool = False):
     if args.sampling == 'buffer':
@@ -654,6 +652,8 @@ def handle_train_epoch_error(e, oomed_out, buffer, train_mol_loader, test_mol_lo
     else:
         raise e  # will simply raise error if other or if training on CPU
     return oomed_out, buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator
+
+
 
 def is_cuda_oom(e: Exception) -> bool:
     if isinstance(e, torch.cuda.OutOfMemoryError):

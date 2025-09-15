@@ -26,13 +26,13 @@ harmonics_dim: 64            # dimensionality of harmonic embedding
 dropout: 0                    # dropout probability
 norm: null                   # null, "layer", "batch"
 
-batch_size: 5000              # number of samples per training batch
+batch_size: 4000              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
 max_batch_size: 5000           # maximum batch size to allow
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
 repeats: 5                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
 eval_batch_size: 1000        # batch size for evaluation
-epochs: 1000000000             # number of training epochs
+epochs: 250             # number of training epochs
 eval_period: 500              # how often to do evaluation & reporting
 conditional_eval_period: 5000 # how often to do conditional evaluation with figs # must be multiple of eval period
 figs_period: 1000             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire

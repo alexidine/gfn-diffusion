@@ -50,3 +50,119 @@ experiments:
     molecule: 'nicotinamide'
     molecule_conditioning: null
     buffer_path: '/scratch/mk8347/csd_runs/datasets/nic_sg2_dataset.pt'
+
+
+- tag: 4_qm9_fast_ema
+  update:
+    ema_decay: 0.95
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    max_batch_size: 10000
+
+
+- tag: 5_qm9_1kbatch
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    max_batch_size: 1000
+
+
+- tag: 6_qm9_longtraj
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    max_batch_size: 10000
+    min_traj_length: 20
+    max_traj_length: 30
+
+
+- tag: 7_qm9_norm
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: layer
+    max_batch_size: 10000
+
+
+- tag: 8_qm9_deep
+  update:
+    joint_layers: 8
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    max_batch_size: 10000
+
+
+- tag: 9_qm9_wide
+  update:
+    joint_layers: 4
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    max_batch_size: 10000
+
+
+- tag: 10_qm9_expl
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    max_batch_size: 10000
+    exploratory: True
+    exploration_factor: 0.1
+    exploration_wd: False
+
+
+- tag: 11_qm9_nopb
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    max_batch_size: 10000
+    learn_pb: False
+
+
+- tag: 12_qm9_highvar
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    max_batch_size: 10000
+    t_scale: 0.5
