@@ -1,0 +1,144 @@
+defaults:
+  base: base.yaml
+
+
+experiments:
+- tag: 0_baseline
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    prior_coverage_cutoff: 0.75
+    prior_coverage_ratio: 0.05
+
+- tag: 1_high_cov_rat
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    prior_coverage_cutoff: 0.75
+    prior_coverage_ratio: 0.1
+
+- tag: 2_high_cov_cutoff
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    prior_coverage_cutoff: 0.9
+    prior_coverage_ratio: 0.05
+
+- tag: 3_small_model
+  update:
+    joint_layers: 2
+    hidden_dim: 256
+    s_emb_dim: 256
+    condition_emb_dim: 256
+    dropout: 0.0
+    norm: null
+    prior_coverage_cutoff: 0.75
+    prior_coverage_ratio: 0.05
+
+- tag: 4_dropout
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    dropout: 0.25
+    norm: null
+    prior_coverage_cutoff: 0.75
+    prior_coverage_ratio: 0.05
+
+- tag: 5_big_normed
+  update:
+    joint_layers: 8
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
+    dropout: 0.5
+    norm: layer
+    prior_coverage_cutoff: 0.75
+    prior_coverage_ratio: 0.05
+
+- tag: 6_5kbatch
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    prior_coverage_cutoff: 0.75
+    prior_coverage_ratio: 0.05
+    max_batch_size: 5000
+
+- tag: 7_6layer
+  update:
+    joint_layers: 6
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    prior_coverage_cutoff: 0.75
+    prior_coverage_ratio: 0.05
+
+- tag: 8_high_varrange
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    prior_coverage_cutoff: 0.75
+    prior_coverage_ratio: 0.05
+    log_var_range: 4
+
+- tag: 9_flexible_pb
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    prior_coverage_cutoff: 0.75
+    prior_coverage_ratio: 0.05
+    pb_drift_range: 0.4
+    pb_var_range: 4
+
+- tag: 10_small_base_var
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    prior_coverage_cutoff: 0.75
+    prior_coverage_ratio: 0.05
+    t_scale: 0.025
+
+- tag: 11_reinforce
+  update:
+    fwd_loss_coeffs:
+      reinforce: 1.0
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    prior_coverage_cutoff: 0.75
+    prior_coverage_ratio: 0.05
+
