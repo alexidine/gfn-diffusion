@@ -30,7 +30,7 @@ from utils import get_train_args, get_gfn_init_state, set_seed, \
     featurize_dataset, embed_dataset, get_conditioning_dim, set_loss_coeffs, anneal_reward, \
     update_ema
 
-torch.cuda.set_per_process_memory_fraction(0.9, device=0)
+#torch.cuda.set_per_process_memory_fraction(0.9, device=0)
 torch.cuda.init()  # create context with the cap already in place
 
 args = get_train_args()
