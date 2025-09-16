@@ -901,16 +901,15 @@ def eval_work(args,
 
 def dynamic_quality_management(metrics, buffer, energy_function):
     minimum_1d_coverage = metrics['Minimum 1d coverage']
-
+    # adjust by a factor of 'multiple' for each 'delta_factor' of miss
+    multiple = 2
+    delta_factor = 0.05
     diversity_check = True
     if args.prior_coverage_cutoff is not None and args.both_ways:
-        low_cut = max(0, args.prior_coverage_cutoff * 0.95)
-        high_cut = min(1, args.prior_coverage_cutoff * 1.0)
-        if minimum_1d_coverage > high_cut:
-            args.fwd_to_bwd_ratio *= 1.1  # train forward more often
-        elif minimum_1d_coverage < low_cut:
-            if args.fwd_to_bwd_ratio > 0.01:
-                args.fwd_to_bwd_ratio *= 0.9
+        miss = minimum_1d_coverage - args.prior_coverage_cutoff
+        adjustment_factor = multiple ** (miss / delta_factor)
+        args.fwd_to_bwd_ratio *= adjustment_factor
+        if minimum_1d_coverage < args.prior_coverage_cutoff:
             diversity_check = False
 
     reasonable_frac = metrics['Reasonable Sample Fraction']
