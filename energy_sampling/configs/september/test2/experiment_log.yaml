@@ -148,3 +148,89 @@
   - prior_coverage_cutoff
   - prior_coverage_ratio
   notes: ''
+- index: 12
+  tag: 12_vargrad
+  update_keys:
+  - fwd_loss_coeffs
+  - repeats
+  - max_batch_size
+  - bwd_batch_multiplier
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  - dropout
+  - norm
+  - prior_coverage_cutoff
+  - prior_coverage_ratio
+  notes: ''
+- index: 13
+  tag: 13_low_lr
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  - dropout
+  - norm
+  - prior_coverage_cutoff
+  - prior_coverage_ratio
+  - lr_policy
+  - lr_back
+  notes: ''
+- index: 14
+  tag: 14_low_Z_lr
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  - dropout
+  - norm
+  - prior_coverage_cutoff
+  - prior_coverage_ratio
+  - lr_flow
+  notes: ''
+- index: 15
+  tag: 15_vargrad_bigmodel
+  update_keys:
+  - fwd_loss_coeffs
+  - repeats
+  - max_batch_size
+  - bwd_batch_multiplier
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  - dropout
+  - norm
+  - prior_coverage_cutoff
+  - prior_coverage_ratio
+  notes: ''
+- index: 16
+  tag: 16_low_lr_bigmodel
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  - dropout
+  - norm
+  - prior_coverage_cutoff
+  - prior_coverage_ratio
+  - lr_policy
+  - lr_back
+  notes: ''
+- index: 17
+  tag: 17_low_Z_lr_bigmodel
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  - dropout
+  - norm
+  - prior_coverage_cutoff
+  - prior_coverage_ratio
+  - lr_flow
+  notes: ''

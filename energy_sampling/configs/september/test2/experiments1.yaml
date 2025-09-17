@@ -142,3 +142,87 @@ experiments:
     prior_coverage_cutoff: 0.75
     prior_coverage_ratio: 0.05
 
+- tag: 12_vargrad
+  update:
+    fwd_loss_coeffs:
+      tb: 0.0
+      vg_lb: 1.0
+    repeats: 5
+    max_batch_size: 2000
+    bwd_batch_multiplier: 5
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    prior_coverage_cutoff: 0.75
+    prior_coverage_ratio: 0.05
+
+- tag: 13_low_lr
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    prior_coverage_cutoff: 0.75
+    prior_coverage_ratio: 0.05
+    lr_policy: 0.0001
+    lr_back: 0.0001
+
+- tag: 14_low_Z_lr
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    prior_coverage_cutoff: 0.75
+    prior_coverage_ratio: 0.05
+    lr_flow: 0.01
+
+- tag: 15_vargrad_bigmodel
+  update:
+    fwd_loss_coeffs:
+      tb: 0.0
+      vg_lb: 1.0
+    repeats: 5
+    max_batch_size: 2000
+    bwd_batch_multiplier: 5
+    joint_layers: 8
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
+    dropout: 0.5
+    norm: layer
+    prior_coverage_cutoff: 0.75
+    prior_coverage_ratio: 0.05
+
+- tag: 16_low_lr_bigmodel
+  update:
+    joint_layers: 8
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
+    dropout: 0.5
+    norm: layer
+    prior_coverage_cutoff: 0.75
+    prior_coverage_ratio: 0.05
+    lr_policy: 0.0001
+    lr_back: 0.0001
+
+- tag: 17_low_Z_lr_bigmodel
+  update:
+    joint_layers: 8
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
+    dropout: 0.5
+    norm: layer
+    prior_coverage_cutoff: 0.75
+    prior_coverage_ratio: 0.05
+    lr_flow: 0.01
+
