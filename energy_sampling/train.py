@@ -906,11 +906,12 @@ def dynamic_quality_management(metrics, buffer, energy_function):
     delta_factor = 0.05
     diversity_check = True
     if args.prior_coverage_cutoff is not None and args.both_ways:
-        miss = minimum_1d_coverage - args.prior_coverage_cutoff
-        adjustment_factor = multiple ** (miss / delta_factor)
-        args.fwd_to_bwd_ratio *= adjustment_factor
-        if minimum_1d_coverage < args.prior_coverage_cutoff:
-            diversity_check = False
+        if args.fwd_to_bwd_ratio < 1000 and args.fwd_to_bwd_ratio > 0.001: # don't let it get too crazy
+            miss = minimum_1d_coverage - args.prior_coverage_cutoff
+            adjustment_factor = multiple ** (miss / delta_factor)
+            args.fwd_to_bwd_ratio *= adjustment_factor
+            if minimum_1d_coverage < args.prior_coverage_cutoff:
+                diversity_check = False
 
     reasonable_frac = metrics['Reasonable Sample Fraction']
 
