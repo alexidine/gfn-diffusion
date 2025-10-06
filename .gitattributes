@@ -1,0 +1,2 @@
+tests/datasets/* filter=lfs diff=lfs merge=lfs -text
+tests/datasets/misc_data_for_new_csd.npy filter=lfs diff=lfs merge=lfs -text
