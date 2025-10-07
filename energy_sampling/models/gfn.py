@@ -111,7 +111,7 @@ class GFN(nn.Module):
         trajectory_length = ts.shape[1] - 1
 
         logpb, logpf, states, means_f, logvars_f, means_b, logvars_b = self.init_traj_tensors(batch_size,
-                                                                                                    trajectory_length)
+                                                                                              trajectory_length)
 
         initial_state.requires_grad_(not detach_traj)
         current_state = initial_state
@@ -131,7 +131,7 @@ class GFN(nn.Module):
 
             noise = ((next_state - current_state) - dts.unsqueeze(1) * pf_mean) / (
                     dts.sqrt().unsqueeze(1) * (pflogvars / 2).exp())
-            #logpf[:, i] = -0.5 * (noise ** 2 + logtwopi + dts.log().unsqueeze(1) + pflogvars).sum(1)
+            # logpf[:, i] = -0.5 * (noise ** 2 + logtwopi + dts.log().unsqueeze(1) + pflogvars).sum(1)
             logpf.append(-0.5 * (noise ** 2 + logtwopi + dts.log().unsqueeze(1) + pflogvars).sum(1))
             back_mean_correction, back_var_correction = self.fwd_get_back_correction(
                 condition_embedding, i, next_state, ts)
@@ -139,10 +139,11 @@ class GFN(nn.Module):
             if i > 0:  # variance is exactly zero for the first step, so we can't use it
                 # back_var = ((self.pf_std_per_traj ** 2) * (dts * ts[:, i] / ts[:, i + 1]).unsqueeze(
                 #     1) * back_var_correction)
-                var = (back_var_correction + np.log(self.pf_std_per_traj) * 2.0).clip(min=-self.var_clip, max=self.var_clip).exp()
+                var = (back_var_correction + np.log(self.pf_std_per_traj) * 2.0).clip(min=-self.var_clip,
+                                                                                      max=self.var_clip).exp()
                 back_var = var * (dts * ts[:, i] / ts[:, i + 1]).unsqueeze(1)
                 noise_backward = (current_state - back_mean) / back_var.sqrt()
-                #logpb[:, i] = -0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1)
+                # logpb[:, i] = -0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1)
                 logpb.append(-0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1))
             else:  # instead set this as a constant the model will have to learn around
                 back_var = torch.ones_like(back_mean) * 1e-3 * dts.unsqueeze(1)
@@ -173,7 +174,7 @@ class GFN(nn.Module):
         trajectory_length = ts.shape[1] - 1
 
         logpb, logpf, states, means_f, logvars_f, means_b, logvars_b = self.init_traj_tensors(batch_size,
-                                                                                                    trajectory_length)
+                                                                                              trajectory_length)
 
         states[:, -1] = terminal_state.detach()
         current_state = terminal_state.detach()
@@ -186,7 +187,7 @@ class GFN(nn.Module):
             dts = ts[:, trajectory_length - i] - ts[:, trajectory_length - i - 1]
 
             if i < trajectory_length - 1:
-                back_mean_correction, back_var_correction\
+                back_mean_correction, back_var_correction \
                     = self.bwd_get_correction(
                     condition_embedding, current_state, i, trajectory_length, ts)
 
@@ -199,7 +200,7 @@ class GFN(nn.Module):
                 back_var = var * (dts * ts[:, trajectory_length - i - 1] / ts[:, trajectory_length - i]).unsqueeze(1)
                 prev_state = self.bwd_propagate(back_mean, back_var, current_state, detach_traj)
                 noise_backward = (prev_state - back_mean) / back_var.sqrt()
-                #logpb[:, trajectory_length - i - 1] = -0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1)
+                # logpb[:, trajectory_length - i - 1] = -0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1)
                 logpb.append(-0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1))
             else:
                 # send it identically to the source state (0)
@@ -247,7 +248,7 @@ class GFN(nn.Module):
             if self.learned_variance:
                 back_additive_logvar = torch.tanh(dvar / self.pb_var_range) * self.pb_var_range
 
-                #back_var_correction = (1 + torch.tanh(dvar/self.pb_scale_range) * self.pb_scale_range)
+                # back_var_correction = (1 + torch.tanh(dvar/self.pb_scale_range) * self.pb_scale_range)
             else:
                 back_additive_logvar = torch.zeros_like(dvar)
 
@@ -312,9 +313,9 @@ class GFN(nn.Module):
         return back_mean_correction, back_additive_logvar
 
     def init_traj_tensors(self, batch_size, trajectory_length):
-        logpf = []#torch.zeros((batch_size, trajectory_length), device=self.device)
-        logpb = []#torch.zeros((batch_size, trajectory_length), device=self.device)
-        #logf = torch.zeros((batch_size, trajectory_length + 1), device=self.device)
+        logpf = []  # torch.zeros((batch_size, trajectory_length), device=self.device)
+        logpb = []  # torch.zeros((batch_size, trajectory_length), device=self.device)
+        # logf = torch.zeros((batch_size, trajectory_length + 1), device=self.device)
         states = torch.zeros((batch_size, trajectory_length + 1, self.dim), device=self.device)
         means_f = torch.zeros((batch_size, trajectory_length, self.dim), device=self.device)
         logvars_f = torch.zeros((batch_size, trajectory_length, self.dim), device=self.device)

@@ -1,14 +1,12 @@
-import os
 from typing import Optional
 
-import torch
 import numpy as np
-from torch.utils.data import Sampler
-from torch_geometric.loader import DataLoader, DynamicBatchSampler
+import torch
+from scipy.spatial.transform import Rotation
+from torch_geometric.loader import DataLoader
 
 from mxtaltools.crystal_building.crystal_latent_transforms import compute_niggli_overlap
 from mxtaltools.dataset_utils.utils import collate_data_list
-
 from utils import compute_sample_overlap, iter_forever
 
 
@@ -40,7 +38,6 @@ class CrystalReplayBuffer:
         self.diversity_check_size = 1000
         self.original_dataset_inds = None
         self.diversity_coeff = diversity_coeff
-
 
     def add(self,
             data_list,
@@ -75,7 +72,7 @@ class CrystalReplayBuffer:
                 if len(data_list) > 0:
                     new_data_batch = collate_data_list(data_list)
 
-                    new_x_tensor = new_data_batch.cell_params_to_gen_basis().to(self.device)
+                    new_x_tensor = new_data_batch.latent_params().to(self.device)
                     scores = self.energy_function.prebuilt_sample_to_reward(new_data_batch,
                                                                             temperature=torch.ones(len(new_data_batch))
                                                                             ).cpu().detach().numpy()
@@ -107,7 +104,7 @@ class CrystalReplayBuffer:
     def init_fresh_dataset(self, data_list):
         self.dataset = list(data_list)  # I think this is memory safe and faster #copy.deepcopy(data_list)
         dataset_batch = collate_data_list(self.dataset)
-        x_tensor = dataset_batch.cell_params_to_gen_basis()
+        x_tensor = dataset_batch.latent_params()
         scores = self.energy_function.prebuilt_sample_to_reward(dataset_batch, temperature=torch.ones(len(self)))
         self.x_list = [x_tensor[i] for i in range(x_tensor.shape[0])]
         self.rewards_list = list(scores.flatten().cpu().detach().numpy())
@@ -188,6 +185,7 @@ class CrystalReplayBuffer:
                override_batch: Optional[int] = None,
                return_preload: Optional[bool] = False,
                override_sampler: Optional[str] = None,
+               randomize_orientations: Optional[bool] = False,
                ):
 
         if override_batch is not None:
@@ -201,20 +199,48 @@ class CrystalReplayBuffer:
                 rand_inds = np.arange(len(self))
                 missing_len = self.batch_size - len(self)
                 rand_inds = np.concatenate(
-                    [rand_inds, self.sample_indices(missing_len, replace=True, diversity_coeff=self.diversity_coeff, override_method=override_sampler)])
+                    [rand_inds, self.sample_indices(missing_len, replace=True, diversity_coeff=self.diversity_coeff,
+                                                    override_method=override_sampler)])
             else:
-                rand_inds = self.sample_indices(self.batch_size, replace=False, diversity_coeff=self.diversity_coeff, override_method=override_sampler)
+                rand_inds = self.sample_indices(self.batch_size, replace=False, diversity_coeff=self.diversity_coeff,
+                                                override_method=override_sampler)
 
         sample_batch = collate_data_list([self.dataset[ind] for ind in rand_inds])
 
-        T_tensor, sg_inds, condition = self.energy_function.get_conditioning_tensor(sample_batch,
-                                                                                    sg_inds=sample_batch.sg_ind)
+        if randomize_orientations:
+            # this is a form of sample augmentation, where we rotate the molecule and its applied orientation
+            # in order to construct the identical crystal, but with a distinct conditioning vector & sample
+            # also rotate the embedding vector which is passed to conditioning
+            random_rotations = torch.tensor(
+                Rotation.random(num=sample_batch.num_graphs).as_matrix(),
+                device=sample_batch.device, dtype=torch.float32)
+            sample_batch.orient_molecule(mode='std')
+            sample_batch.orient_molecule(mode='random',  # important that the rotation is applied *from* the standard
+                                         include_inversion=False,
+                                         correct_orientation=True,
+                                         override_random_rotations=random_rotations)
+            sample_batch.embedding = sample_batch.rotate_embedding(random_rotations)
+            """
+            sample_batch.orient_molecule(mode='std')
+            sample_batch.orient_molecule(mode='random',  # important that the rotation is applied *from* the standard
+                                         include_inversion=False,
+                                         correct_orientation=True,
+                                         override_random_rotations=random_rotations)
+            aa = sample_batch.analyze(['lj'], std_orientation=False, cutoff=10)
+            print(((aa['lj']-sample_batch.lj_pot).abs()/sample_batch.lj_pot.abs()).mean())
+            # test to make sure this is working
+            # important that we standardize before applying the orientation adjustment!!!
+            """
+
+        T_tensor, sg_inds, condition, z_primes = self.energy_function.get_conditioning_tensor(sample_batch,
+                                                                                              sg_inds=sample_batch.sg_ind)
         sample_batch.sg_ind = sg_inds
+        sample_batch.z_prime = z_primes
         temperature = 10 ** T_tensor  # first dimension is the log temperature
         reward = self.energy_function.prebuilt_sample_to_reward(
             sample_batch, temperature)  # recompute reward in case parameters have changed
 
-        return sample_batch.cell_params_to_gen_basis(), reward, sample_batch, condition
+        return sample_batch.latent_params(), reward, sample_batch, condition
 
     def init_loader(self):
         self.loader = DataLoader(
@@ -222,11 +248,11 @@ class CrystalReplayBuffer:
             batch_size=self.batch_size,
             collate_fn=collate_fn,
             shuffle=True,
-            num_workers=0,#os.cpu_count() - 2,  # use all but two available CPUs
-            persistent_workers=False, #True,
+            num_workers=0,  # os.cpu_count() - 2,  # use all but two available CPUs
+            persistent_workers=False,  # True,
             drop_last=True,
             pin_memory=True,
-            #prefetch_factor=4,
+            # prefetch_factor=4,
         )
         self._loader_iter = iter_forever(self.loader)
 
@@ -250,11 +276,11 @@ class CrystalReplayBuffer:
             crystal_batch.box_analysis()
             cluster_batch = crystal_batch.mol2cluster(cutoff=6,
                                                       supercell_size=10,
-                                                      align_to_standardized_orientation=True)
+                                                      std_orientation=True)
 
             cluster_batch.construct_radial_graph(cutoff=6)
 
-            _, _ = cluster_batch.compute_LJ_energy()
+            _ = cluster_batch.compute_LJ_energy()
             silu_energy = cluster_batch.compute_silu_energy(
                 repulsion=lj_repulsion,
             )
@@ -266,7 +292,6 @@ class CrystalReplayBuffer:
 
         scores = self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(len(self)))
         self.rewards_list = list(scores.flatten().cpu().detach().numpy())
-
 
     def sample_mol_unconditional_prior(self, sg_inds, noise: Optional[float] = None):
         """
@@ -293,6 +318,7 @@ class CrystalReplayBuffer:
             samples += torch.randn_like(samples) * noise
 
         return samples.clip(min=-6, max=6)
+
 
 def collate_fn(data_list):
     return collate_data_list(data_list, exclude_unit_cell=True)

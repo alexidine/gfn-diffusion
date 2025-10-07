@@ -105,7 +105,7 @@ def sample_crystals(
                         init_state, gfn_model, discretizer, energy_function, mol_batch)
 
                 elif generator == 'random':
-                    crystal_batch = collate_data_list(mol_to_blank_crystal_list(mol_batch, [space_group for _ in range(mol_batch.num_graphs)]))
+                    crystal_batch = collate_data_list(mol_to_blank_crystal_list(mol_batch, [space_group for _ in range(mol_batch.num_graphs)],))
                     samples = sample_crystal_prior(crystal_batch, 1)
                     log_T_tensor = torch.ones(crystal_batch.num_graphs, device=device) * energy_function.temperature
                     log_r, sample_batch = energy_function.log_reward(
@@ -126,7 +126,7 @@ def sample_crystals(
 
                     finished_batch = collate_data_list(opt_traj[-1])
 
-                    opt_params_record[s_ind, batch_inds] = finished_batch.cell_params_to_gen_basis().cpu().detach().numpy()
+                    opt_params_record[s_ind, batch_inds] = finished_batch.latent_params().cpu().detach().numpy()
                     opt_energy_record[s_ind, batch_inds] = finished_batch.lj_pot.cpu().detach().numpy()
                     opt_density_record[s_ind, batch_inds] = finished_batch.packing_coeff.cpu().detach().numpy()
                     opt_ssample_record.append(opt_traj[-1])
@@ -148,9 +148,13 @@ def sample_crystals(
 
 @torch.no_grad()
 def log_partition_function(initial_state, gfn, discretizer, energy_function, mol_batch):
-    log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(mol_batch)
+    log_T_tensor, sg_inds, condition, z_primes = energy_function.get_conditioning_tensor(mol_batch)
+
     condition = condition.to(gfn.device)
+
     mol_batch.sg_ind = sg_inds
+    mol_batch.z_prime = z_primes
+
     (states, log_pfs, log_pbs, log_flow,
      means_f, logvars_f, means_b, logvars_b) = gfn.get_trajectory_fwd(initial_state,
                                                                       discretizer,
@@ -201,8 +205,8 @@ def crystal_list_rdf(samples, batch_size, device):
 
 def get_rdfs(crystal_batch):
     with torch.no_grad():
-        _, _, _, cluster_batch = crystal_batch.build_and_analyze(
-            return_cluster=True, cutoff=6)
+        cluster_batch = crystal_batch.mol2cluster(cutoff=6)
+        cluster_batch.construct_radial_graph(cutoff=6)
         rdf, rr, _ = crystal_rdf(cluster_batch,
                                  cluster_batch.edges_dict,
                                  rrange=[0, 6], bins=2000,

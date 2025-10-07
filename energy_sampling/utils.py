@@ -8,10 +8,9 @@ import threading
 from argparse import Namespace
 from pathlib import Path
 
-import psutil
-
 import PIL
 import numpy as np
+import psutil
 import torch
 import yaml
 from torch.nn import functional as F
@@ -104,55 +103,6 @@ def get_exploration_std(iter, exploratory, max_steps: int = 5000, exploration_fa
         exploration_std = exploration_factor
     expl = lambda x: exploration_std
     return expl
-
-
-def get_name(args):
-    name = ''
-    if args.langevin:
-        name = f'langevin_'
-        if args.langevin_scaling_per_dimension:
-            name = f'langevin_scaling_per_dimension_'
-    if args.exploratory and (args.exploration_factor is not None):
-        if args.exploration_wd:
-            name = f'exploration_wd_{args.exploration_factor}_{name}_'
-        else:
-            name = f'exploration_{args.exploration_factor}_{name}_'
-
-    if args.learn_pb:
-        name = f'{name}learn_pb_scale_range_{args.pb_scale_range}_'
-
-    if args.clipping:
-        name = f'{name}clipping_lgv_{args.lgv_clip}_gfn_{args.gfn_clip}_'
-
-    if args.mode_fwd == 'subtb':
-        mode_fwd = f'subtb_subtb_lambda_{args.subtb_lambda}'
-        if args.partial_energy:
-            mode_fwd = f'{mode_fwd}_{args.partial_energy}'
-    else:
-        mode_fwd = args.mode_fwd
-
-    if args.both_ways:
-        ways = f'fwd_bwd/fwd_{mode_fwd}_bwd_{args.mode_bwd}'
-    elif args.bwd:
-        ways = f'bwd/bwd_{args.mode_bwd}'
-    else:
-        ways = f'fwd/fwd_{mode_fwd}'
-
-    if args.local_search:
-        local_search = f'local_search_iter_{args.max_iter_ls}_burn_{args.burn_in}_cycle_{args.ls_cycle}_step_{args.ld_step}_beta_{args.beta}_rankw_{args.rank_weight}_prioritized_{args.prioritized}'
-        ways = f'{ways}/{local_search}'
-
-    if args.pis_architectures:
-        results = 'results_pis_architectures'
-    else:
-        results = 'results'
-
-    name = f'{results}/{args.energy}/{name}gfn/{ways}/T_{args.T}/tscale_{args.t_scale}/lvr_{args.log_var_range}/'
-
-    name = f'{name}/seed_{args.seed}/'
-
-    return name
-
 
 def get_train_args():
     parser = argparse.ArgumentParser(description='GFN Linear Regression')
@@ -305,7 +255,6 @@ def triangle_schedule(it, init, maxval, minval, on, off):
 
 @torch.no_grad()
 def featurize_dataset(dataset, device, ellipsoid_scale, lj_repulsion, batch_size: int = 500):
-
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -321,11 +270,11 @@ def featurize_dataset(dataset, device, ellipsoid_scale, lj_repulsion, batch_size
         crystal_batch.box_analysis()
         cluster_batch = crystal_batch.mol2cluster(cutoff=6,
                                                   supercell_size=10,
-                                                  align_to_standardized_orientation=True)
+                                                  std_orientation=True)
 
         cluster_batch.construct_radial_graph(cutoff=6)
 
-        lj_energy, normed_lj_energy = cluster_batch.compute_LJ_energy()
+        lj_energy = cluster_batch.compute_LJ_energy()
         silu_energy = cluster_batch.compute_silu_energy(
             repulsion=lj_repulsion,
         )
@@ -354,13 +303,15 @@ def featurize_dataset(dataset, device, ellipsoid_scale, lj_repulsion, batch_size
         elem.niggli_overlap = torch.ones(1) * niggli_overlaps[ind]
 
     # exclude negative niggli overlaps
-    dataset = [elem for elem in dataset if elem.niggli_overlap >= 0]
+    dataset = [elem for elem in dataset if elem.niggli_overlap > 0]
     [elem.box_analysis() for elem in dataset]
 
     return dataset
 
+
 @torch.no_grad()
-def embed_dataset(dataset, autoencoder_path=None, device=None, encoder=None, embedding_type='autoencoder'):
+def embed_dataset(dataset, autoencoder_path=None, device=None, encoder=None, embedding_type='autoencoder',
+                  ):
     batch_size = 500
     loader = DataLoader(
         dataset,
@@ -377,7 +328,7 @@ def embed_dataset(dataset, autoencoder_path=None, device=None, encoder=None, emb
         # for now, make all the embeddings exactly standardized,
         # and we'll generate also in the standardized basis
         crystal_batch.orient_molecule(mode='standardized',
-                                      target_handedness=torch.ones_like(crystal_batch.radius)
+                                      target_handedness=torch.ones_like(crystal_batch.radius)[:, None],
                                       )
         if embedding_type == 'autoencoder':
             embeddings.append(encoder.encode(crystal_batch).clone().cpu())
@@ -397,53 +348,6 @@ def embed_dataset(dataset, autoencoder_path=None, device=None, encoder=None, emb
         elem.embedding = embeddings[None, ind]
 
     return dataset
-
-
-def get_conditioning_dim(args):
-    conditioning_dim = 0
-    if args.temperature_conditioning:
-        conditioning_dim += 1
-    if args.molecule_conditioning:
-        if args.mol_embedding_type == 'autoencoder':
-            conditioning_dim += 64 * 3
-        elif args.mol_embedding_type == 'principal_axes':
-            conditioning_dim += 9
-        else:
-            assert False
-    if args.sg_conditioning:
-        conditioning_dim += 237
-    return conditioning_dim
-
-
-def anneal_reward(it, temp_annealing_lambda, energy_function, args):
-    """anneal reward function"""
-    if args.anneal_temperature:
-        if args.temperature_conditioning:
-            if energy_function.temperature_scaling_factor < 1:
-                energy_function.temperature_scaling_factor *= temp_annealing_lambda
-        else:
-            if energy_function.temperature > args.energy_min_temperature:
-                energy_function.temperature *= temp_annealing_lambda
-
-    if args.core_start_time > 0:
-        energy_function.core_coeff = round(
-            args.energy_core_coeff * F.sigmoid(torch.tensor((it - args.core_start_time) / 50)).item(), 2)
-    if args.lj_start_time > 0:
-        energy_function.lj_coeff = round(
-            args.energy_lj_coeff * F.sigmoid(torch.tensor((it - args.lj_start_time) / 50)).item(), 2)
-
-
-def set_loss_coeffs(it, args):
-    """anneal reward function"""
-    if it == 0:
-        args.fwd_loss_schedule = parse_loss_schedules(args.fwd_loss_coeffs)
-        args.bwd_loss_schedule = parse_loss_schedules(args.bwd_loss_coeffs)
-
-        args.fwd_loss_coeffs = dict2namespace({k: 0.0 for k in args.fwd_loss_schedule})
-        args.bwd_loss_coeffs = dict2namespace({k: 0.0 for k in args.bwd_loss_schedule})
-
-    update_loss_schedule(it, args.fwd_loss_schedule, args.fwd_loss_coeffs.__dict__)
-    update_loss_schedule(it, args.bwd_loss_schedule, args.bwd_loss_coeffs.__dict__)
 
 
 def parse_loss_schedules(loss_coeffs_config):
@@ -562,6 +466,7 @@ def sample_crystal_prior(crystal_batch, std):
 
     return prior_samples
 
+
 @torch.no_grad()
 def update_ema(model, ema_model, decay=0.9999):
     """
@@ -595,14 +500,14 @@ def manual_batch_to_data_list(batch):
     # Pre-split all tensor attributes into lists of [num_graphs] length
     attr_splits = {}
     for key in batch.keys():
-        if key not in ['batch','ptr', 'edges_dict',
-                    'niggli_energy',
-                    'core_energy',
-                    'density_energy',
-                    'lj_energy',
-                    'bounding_energy',
+        if key not in ['batch', 'ptr', 'edges_dict',
+                       'niggli_energy',
+                       'core_energy',
+                       'density_energy',
+                       'lj_energy',
+                       'bounding_energy',
                        'asym_unit_dict',
-                       'latent_transform',]:
+                       'latent_transform', ]:
             value = batch[key]
             if torch.is_tensor(value) and value.size(0) == ptr[-1]:
                 # node-level attributes
@@ -633,7 +538,6 @@ def iter_forever(loader):
             yield batch
 
 
-
 class ThreadedDataLoader:
     def __init__(self, dataset, batch_size=1, max_prefetch=2, collate_fn=None, pin_memory=True):
         self.dataset = dataset
@@ -641,7 +545,7 @@ class ThreadedDataLoader:
         self.max_prefetch = max_prefetch
         self.collate_fn = collate_fn or (lambda x: x)
         self.queue = queue.Queue(max_prefetch)
-        #self.queue = queue.SimpleQueue()
+        # self.queue = queue.SimpleQueue()
 
         self.stop_event = threading.Event()
         self.pin_memory = pin_memory
@@ -682,7 +586,7 @@ class ThreadedDataLoader:
         """Update batch size and flush queue to avoid stale batches."""
         self.batch_size = int(new_size)
         self._flush_queue()
-        self.skip_next = True   # force burn one
+        self.skip_next = True  # force burn one
 
     def _flush_queue(self):
         """Remove all pending items in the prefetch queue."""
@@ -691,3 +595,52 @@ class ThreadedDataLoader:
                 self.queue.get_nowait()
             except queue.Empty:
                 break
+
+
+
+
+def is_cuda_oom(e: Exception) -> bool:
+    if isinstance(e, torch.cuda.OutOfMemoryError):
+        return True
+    s = str(e).lower()
+    return (
+            ("cuda" in s and "memory" in s)
+            or ("cublas" in s and "alloc" in s)
+            or ("cusolver" in s and "alloc" in s)
+            or ("out of memory" in s)
+            or ("nonzero is not supported for tensors with more than int_max elements" in s)
+    )
+
+
+def get_annealing_factor(start_value, stop_value, total_time, step_iters):
+    assert stop_value > 0, "Setting final value as zero breaks this module"
+    return (stop_value / start_value) ** (1 / (total_time / step_iters))
+
+
+def substitute_prior(loss_coeffs, condition, crystal_batch, energy_function, rewards, samples, buffer):
+    # replace buffer samples with a random prior
+    # prior_samples = sample_crystal_prior(crystal_batch, args.bwd_loss_coeffs.pmle_std)
+    prior_samples = buffer.sample_mol_unconditional_prior(crystal_batch.sg_ind, loss_coeffs.pmle_std)
+    if loss_coeffs.mle_prior_fraction < 1:
+        num_to_replace = max(1, int(len(samples) * loss_coeffs.mle_prior_fraction))
+        inds_to_replace = np.random.choice(len(samples), num_to_replace, replace=False)
+        samples[inds_to_replace] = prior_samples[inds_to_replace]
+    else:
+        samples = prior_samples
+
+    # have to update the rewards if we are using any loss functions that require them
+    # otherwise, if we're not using the reward, just pass the raw sample
+    if any([
+        loss_coeffs.tb > 0,
+        loss_coeffs.vg_lb > 0,
+        loss_coeffs.vg_lme > 0,
+    ]):
+        log_T_tensor, sg_inds, condition, z_primes = energy_function.get_conditioning_tensor(crystal_batch,
+                                                                                             sg_inds=crystal_batch.sg_ind)
+        if log_T_tensor is not None:
+            log_temperature = log_T_tensor
+        else:
+            log_temperature = None
+        with torch.no_grad():
+            rewards = energy_function.log_reward(samples, crystal_batch, log_temperature, False)
+    return condition, rewards, samples

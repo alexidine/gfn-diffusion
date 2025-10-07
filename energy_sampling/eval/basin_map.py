@@ -80,7 +80,7 @@ def cluster_samples(samples_to_fit, energies_to_fit, beta: float = 0.001, bw=0.1
 energies = batch.lj_pot
 
 sample_embedding, cluster_assignments, labels, anchor_inds, watershed_range = \
-    cluster_samples(batch.cell_params_to_gen_basis(), energies, beta=1.0, bw=0.1)
+    cluster_samples(batch.latent_params(), energies, beta=1.0, bw=0.1)
 
 f3 = cluster_fig(sample_embedding, sample_embedding[anchor_inds],
                  cluster_assignments, energies[anchor_inds],

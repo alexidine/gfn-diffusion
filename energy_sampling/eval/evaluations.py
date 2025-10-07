@@ -44,6 +44,7 @@ def eval_step(energy_function,
 
     metrics = log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, log_r,
                                          sample_batch, log_T_tensor, args, buffer)
+    sample_batch.plot_batch_cell_params(show=False)
 
     # if add_to_buffer:
     #     buffer.add(manual_batch_to_data_list(sample_batch.detach().cpu()))  # add evaluation samples to buffer
@@ -142,9 +143,9 @@ def conditional_eval_step(energy_function,
 def log_crystals(sample_batch):
     cluster_batch = sample_batch.mol2cluster(cutoff=6,
                                              supercell_size=10,
-                                             align_to_standardized_orientation=True)
+                                             std_orientation=True)
     cluster_batch.construct_radial_graph(cutoff=6)
-    lj_energy, normed_lj_energy = cluster_batch.compute_LJ_energy()
+    lj_energy = cluster_batch.compute_LJ_energy()
     cluster_batch.lj_pot = lj_energy
     samples_to_log, filenames = log_crystal_samples(sample_batch=cluster_batch, return_filenames=True)
     [wandb.log({f'crystal_sample_{ind}': samples_to_log[ind]}, commit=False) for ind in range(len(samples_to_log))]
@@ -160,7 +161,7 @@ def generate_fwd_figs(buffer, energy_function,
     fig_dict = {}
 
     buffer_cell_params, buffer_latent_params, buffer_std_params, buffer_reward, buffer_batch = get_buffer_stats(buffer)
-    std_cell_params = sample_batch.cell_params_to_gen_basis().cpu().detach()
+    std_cell_params = sample_batch.latent_params().cpu().detach()
 
     known_mode_coverage(energy_function, fig_dict, std_cell_params)
 
@@ -828,9 +829,9 @@ def get_buffer_stats(buffer):
         # take samples according to the sampler weighting, rather than random trash in the buffer
         buffer_latent_params, buffer_reward, buffer_batch, condition = buffer.sample(
             override_batch=samples_to_take)
-        buffer_cell_params = buffer_batch.cell_parameters().cpu().detach().numpy()
-        buffer_latent_params = buffer_batch.cell_params_to_gen_basis().cpu().detach().numpy()
-        buffer_std_params_for_embedding = buffer_batch.cell_params_to_gen_basis().cpu().detach().numpy()
+        buffer_cell_params = buffer_batch.zp1_cell_parameters().cpu().detach().numpy()
+        buffer_latent_params = buffer_batch.latent_params().cpu().detach().numpy()
+        buffer_std_params_for_embedding = buffer_batch.latent_params().cpu().detach().numpy()
         reward = buffer_reward.cpu().detach().numpy()
         batch = buffer_batch.cpu().detach()
     else:
@@ -912,7 +913,7 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
                         'cell_alpha', 'cell_beta', 'cell_gamma',
                         'aunit_x', 'aunit_y', 'aunit_z',
                         'orientation_1', 'orientation_2', 'orientation_3']
-    std_params = sample_batch.cell_params_to_gen_basis()
+    std_params = sample_batch.latent_params()
 
     metrics['Total Var'] = std_params.var(dim=0).mean().cpu().detach().numpy()
     metrics['Total Mean'] = std_params.mean(dim=0).mean().cpu().detach().numpy()

@@ -167,4 +167,55 @@ experiments:
     max_batch_size: 10000
     t_scale: 0.5
 
+- tag: 13_nic_RF
+  update:
+    fwd_loss_coeffs:
+      tb: 0.0
+      reinforce: 1.0
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    max_batch_size: 10000
+    molecule: 'nicotinamide'
+    molecule_conditioning: null
+    buffer_path: '/scratch/mk8347/csd_runs/datasets/nic_sg2_dataset.pt'
 
+- tag: 14_nic_greedy
+  update:
+    fwd_loss_coeffs:
+      tb: 0.0
+      greedy: 1.0
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    max_batch_size: 10000
+    molecule: 'nicotinamide'
+    molecule_conditioning: null
+    buffer_path: '/scratch/mk8347/csd_runs/datasets/nic_sg2_dataset.pt'
+
+- tag: 15_nic_TB_highcut
+  update:
+    fwd_loss_coeffs:
+      tb: 0.0
+      reinforce: 1.0
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    max_batch_size: 10000
+    molecule: 'nicotinamide'
+    molecule_conditioning: null
+    buffer_path: '/scratch/mk8347/csd_runs/datasets/nic_sg2_dataset.pt'
+    prior_coverage_cutoff: 0.85
+    prior_coverage_ratio: 0.2

@@ -70,6 +70,7 @@ energy_function = MolecularCrystal(device=args.device,
                                    space_groups=args.space_groups,
                                    bounding_coeff=args.bounding_coeff,
                                    niggli_coeff=args.niggli_coeff,
+                                   # todo add z prime info
                                    )
 
 """
@@ -326,7 +327,7 @@ csd_batch = collate_data_list(csd_mols)
 csd_batch.box_analysis()
 csd_clusters = csd_batch.mol2cluster(cutoff=6)
 csd_clusters.construct_radial_graph(cutoff=6)
-ref_energies, _ = csd_clusters.compute_LJ_energy()
+ref_energies = csd_clusters.compute_LJ_energy()
 ref_densities = csd_clusters.packing_coeff
 
 optim_kwargs = dict(
