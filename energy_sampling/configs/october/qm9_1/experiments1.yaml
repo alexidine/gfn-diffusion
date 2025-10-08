@@ -62,3 +62,44 @@ experiments:
     t_emb_dim: 1024
     dropout: 0.5
     norm: null
+
+- tag: 6_baseline_highlr
+  update:
+    lr_policy: 0.001
+    lr_back: 0.001
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+
+
+- tag: 7_baseline_smallbatch
+  update:
+    lr_policy: 0.001
+    lr_back: 0.001
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    max_batch_size: 2000
+
+
+- tag: 8_baseline_bigbatch
+  update:
+    lr_policy: 0.001
+    lr_back: 0.001
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    max_batch_size: 10000
+
