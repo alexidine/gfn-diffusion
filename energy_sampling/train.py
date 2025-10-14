@@ -573,13 +573,15 @@ class Modeller:
                                    buffer, train_mol_loader, test_mol_loader,
                                    energy_function, metrics)
 
-                    if loss_record[-1] == torch.amin(torch.tensor(loss_record)):  # if this is the best model yet
-                        torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train.pt')
-                        torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval.pt')
+
 
                 # train monitoring
                 if step_ind % 10 == 0:
                     loss_record.append(fwd_loss + bwd_loss)
+                    if loss_record[-1] == torch.amin(torch.tensor(loss_record)):  # if this is the best model yet
+                        torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train.pt')
+                        torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval.pt')
+
                     metrics['train/expl'] = exploration_std(0) if exploration_std is not None else 0
                     lr = self.step_lr_schedule(schedulers, optimizers)
                     self.anneal_reward(step_ind, temp_annealing_lambda, energy_function)
@@ -617,6 +619,10 @@ class Modeller:
 
             if hit_threshold or increasing_loss:
                 print("Losses increasing! Reloading best checkpoint and slashing LR.")
+                if hit_threshold:
+                    print("Hit loss threshold!")
+                if increasing_loss:
+                    print(f"Losses increasing over prior {grace_time} steps!")
 
                 gfn_model.load_state_dict(torch.load(f'checkpoints/{name}_model_train.pt'))
                 ema_model.load_state_dict(torch.load(f'checkpoints/{name}_model_eval.pt'))
@@ -626,7 +632,7 @@ class Modeller:
                 for opt in optimizers.values():
                     for g in opt.param_groups:
                         if g['lr'] > self.args.min_lr:
-                            g['lr'] *= 0.3
+                            g['lr'] *= 0.75
 
                 self.lr_warmup_finished = True
 

@@ -2,10 +2,10 @@ run_name: 'mk_local_dev'
 tag: 'dev'
 seed: 12345
 device: 'cuda'
-lr_policy: 0.001              # learning rate of the policy network
+lr_policy: 0.01              # learning rate of the policy network
 min_lr: 1.0e-6                # ihn
 lr_flow: 1.0                  # learning rate of the flow network
-lr_back: 0.001                # learning rate of the backward pass
+lr_back: 0.01                # learning rate of the backward pass
 lr_warmup_ratio: 100           # how much smaller the initial (warmup) LR should be than the max policy value
 scheduler: True               # does LR warmup from lr/lr_warup_ratio -> lr -> min_lr over the warmup and annealing period
 lr_warmup_time: 500
@@ -26,9 +26,9 @@ harmonics_dim: 64            # dimensionality of harmonic embedding
 dropout: 0                    # dropout probability
 norm: layer                   # null, "layer", "batch"
 
-batch_size: 1000              # number of samples per training batch
+batch_size: 100              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 5000           # maximum batch size to allow
+max_batch_size: 200           # maximum batch size to allow
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
 repeats: 5                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
 eval_batch_size: 5000        # batch size for evaluation

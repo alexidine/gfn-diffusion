@@ -13,7 +13,7 @@ lr_anneal_time: 40000
 weight_decay: 1e-7
 use_weight_decay: false
 gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weights
-ema_decay: 0.995 #0.999  # set to null for no ema
+ema_decay: 0.99 #0.999  # set to null for no ema
 
 # model parameters
 zero_init: False
