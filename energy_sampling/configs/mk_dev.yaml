@@ -40,13 +40,13 @@ figs_period: 500             # how often to log custom figures EXPENSIVE # must 
 # GFlowNet settings
 T: 15                        # static training diffusion length
 eval_T: 50                  # diffusion trajectory length for inference
-min_traj_length: 10
-max_traj_length: 20
+min_traj_length: 20
+max_traj_length: 40
 traj_length_strategy: sampled # 'static'  or 'sampled'  will do random between min and max traj lengths
 discretizer_max_ratio: 15    # maximum ratio between randomly sampled step sizes - needs to be >25 for 15 steps, or 10 for 30 steps to get good coverage at extrema
 discretizer: 'random'        # 'random' 'low_discrepancy' 'equidistant' 'uniform'
 t_scale: 0.1                 # scales fixed forward policy variance
-log_var_range: 2           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
+log_var_range: 8           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
 pb_drift_range: 0.2          # range of learned backward drift corrections, only for 'brownian_bridge'
 pb_var_range: 2             # range of learned backward policy variance
 energy: "molecular_crystal"  # "molecular_crystal"

@@ -31,3 +31,77 @@
   - dropout
   - norm
   notes: ''
+- index: 3
+  tag: 3_big_fwd_var
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  - t_emb_dim
+  - dropout
+  - norm
+  - log_var_range
+  notes: ''
+- index: 4
+  tag: 4_big_back_var
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  - t_emb_dim
+  - dropout
+  - norm
+  - pb_var_range
+  - pb_drift_range
+  notes: ''
+- index: 5
+  tag: 5_big_flex
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  - t_emb_dim
+  - dropout
+  - norm
+  - log_var_range
+  - pb_var_range
+  - pb_drift_range
+  notes: ''
+- index: 6
+  tag: 6_small_model
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  - t_emb_dim
+  - dropout
+  - norm
+  notes: ''
+- index: 7
+  tag: 7_low_clip
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  - t_emb_dim
+  - dropout
+  - norm
+  - energy_clip
+  notes: ''
+- index: 8
+  tag: 8_v_low_clip
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  - t_emb_dim
+  - dropout
+  - norm
+  - energy_clip
+  notes: ''

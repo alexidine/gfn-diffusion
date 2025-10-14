@@ -32,3 +32,71 @@ experiments:
     t_emb_dim: 512
     dropout: 0.0
     norm: null
+
+- tag: 3_big_fwd_var
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    log_var_range: 8
+
+- tag: 4_big_back_var
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    pb_var_range: 8
+    pb_drift_range: 0.5
+
+- tag: 5_big_flex
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    log_var_range: 8
+    pb_var_range: 8
+    pb_drift_range: 0.5
+
+- tag: 6_small_model
+  update:
+    joint_layers: 4
+    hidden_dim: 256
+    s_emb_dim: 256
+    condition_emb_dim: 256
+    t_emb_dim: 256
+    dropout: 0.0
+    norm: null
+
+- tag: 7_low_clip
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    energy_clip: 50
+
+- tag: 8_v_low_clip
+  update:
+    joint_layers: 4
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+    t_emb_dim: 512
+    dropout: 0.0
+    norm: null
+    energy_clip: 20

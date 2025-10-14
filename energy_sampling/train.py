@@ -977,7 +977,7 @@ class Modeller:
         multiple = 2
         delta_factor = 2
         min_rat = 1 / 5
-        max_rat = 1000
+        max_rat = 100
         eps = 1e-6
         fwd_res = np.log(1 - metrics['Forward TB R Value'] + eps)  # metrics['TB Residual']
         bwd_res = np.log(1 - metrics['Backward TB R Value'] + eps)  # metrics['Bwd TB Residual']
