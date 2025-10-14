@@ -101,11 +101,12 @@ def sample_crystals(
                     (_, samples, log_r, _, _,
                      _, sample_batch, _, _, _, _,
                      _, _, _, _,
-                     log_T_tensor) = log_partition_function(
+                     log_T_tensor) = sample_eval_fwd_trajs(
                         init_state, gfn_model, discretizer, energy_function, mol_batch)
 
                 elif generator == 'random':
-                    crystal_batch = collate_data_list(mol_to_blank_crystal_list(mol_batch, [space_group for _ in range(mol_batch.num_graphs)],))
+                    crystal_batch = collate_data_list(
+                        mol_to_blank_crystal_list(mol_batch, [space_group for _ in range(mol_batch.num_graphs)], ))
                     samples = sample_crystal_prior(crystal_batch, 1)
                     log_T_tensor = torch.ones(crystal_batch.num_graphs, device=device) * energy_function.temperature
                     log_r, sample_batch = energy_function.log_reward(
@@ -144,10 +145,8 @@ def sample_crystals(
         return params_record, energy_record, density_record, sample_record
 
 
-
-
 @torch.no_grad()
-def log_partition_function(initial_state, gfn, discretizer, energy_function, mol_batch):
+def sample_eval_fwd_trajs(initial_state, gfn, discretizer, energy_function, mol_batch):
     log_T_tensor, sg_inds, condition, z_primes = energy_function.get_conditioning_tensor(mol_batch)
 
     condition = condition.to(gfn.device)
@@ -156,11 +155,15 @@ def log_partition_function(initial_state, gfn, discretizer, energy_function, mol
     mol_batch.z_prime = z_primes
 
     (states, log_pfs, log_pbs, log_flow,
-     means_f, logvars_f, means_b, logvars_b) = gfn.get_trajectory_fwd(initial_state,
-                                                                      discretizer,
-                                                                      None,
-                                                                      condition,
-                                                                      return_gauss_params=True)
+     means_f, logvars_f, means_b, logvars_b) = gfn.get_traj_fwd(initial_state,
+                                                                discretizer,
+                                                                None,
+                                                                condition,
+                                                                return_gauss_params=True)
+    gauss_params = {'means_f': means_f,
+                    'logvars_f': logvars_f,
+                    'means_b': means_b,
+                    'logvars_b': logvars_b}
     log_r, sample_batch = energy_function.log_reward(
         states[:, -1], mol_batch=mol_batch,
         log_temperature=log_T_tensor,
@@ -175,15 +178,14 @@ def log_partition_function(initial_state, gfn, discretizer, energy_function, mol
             log_r, log_Z, log_Z_lb, log_Z_learned,
             sample_batch, condition,
             log_pfs, log_pbs, log_flow,
-            means_f, logvars_f, means_b, logvars_b,
-            log_T_tensor)
+            gauss_params, log_T_tensor)
 
 
 @torch.no_grad()
 def mean_log_likelihood(terminal_state, gfn, log_reward_fn, num_evals=10):
     bsz = terminal_state.shape[0]
     terminal_state = terminal_state.unsqueeze(1).repeat(1, num_evals, 1).view(bsz * num_evals, -1)
-    states, log_pfs, log_pbs, log_fs = gfn.get_trajectory_bwd(terminal_state, None, log_reward_fn)
+    states, log_pfs, log_pbs, log_fs = gfn.get_traj_bwd(terminal_state, None, log_reward_fn)
     log_weight = (log_pfs.sum(-1) - log_pbs.sum(-1)).view(bsz, num_evals, -1)
     return logmeanexp(log_weight, dim=1).mean()
 
@@ -216,6 +218,7 @@ def get_rdfs(crystal_batch):
                                  cpu_detach=False)
 
     return rdf.cpu().detach(), rr
+
 
 @torch.no_grad()
 def sample_csd_rdf_dists(csd_mols, csd_sampling_dict, eval_batch_size, device):

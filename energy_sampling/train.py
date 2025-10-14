@@ -13,12 +13,14 @@ import torch
 import torch.nn.functional as F
 import wandb
 from scipy.spatial.transform import Rotation
+from sympy.codegen.ast import continue_
 from torch.optim import lr_scheduler
 from torch_geometric.loader import DataLoader
 from tqdm import trange
 
 from energies.molecular_crystal import MolecularCrystal
 from energy_sampling.buffer import CrystalReplayBuffer
+from energy_sampling.eval.evaluations import bwd_figs
 from energy_sampling.utils import iter_forever, \
     is_cuda_oom, get_annealing_factor, \
     substitute_prior, parse_loss_schedules, dict2namespace, update_loss_schedule, \
@@ -38,7 +40,7 @@ from utils import get_train_args, get_gfn_init_state, set_seed, \
 class Modeller:
     def __init__(self):
         self.times = {}
-        # torch.cuda.set_per_process_memory_fraction(0.9, device=0)
+        torch.cuda.set_per_process_memory_fraction(0.9, device=0)
         torch.cuda.init()  # create context with the cap already in place
 
         args = get_train_args()
@@ -418,7 +420,7 @@ class Modeller:
         return buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator
 
     def init_nicotinamide(self, buffer):
-        if len(buffer.dataset) > 0:  # ensure same conformer as dataset, where possible
+        if len(buffer) > 0:  # ensure same conformer as dataset, where possible
             atom_coords = buffer.dataset[0].pos
             atom_types = buffer.dataset[0].z
         else:
@@ -783,7 +785,22 @@ class Modeller:
 
         eval_rands = np.random.randint(len(mol_loader.dataset), size=eval_batch_size)
         mol_batch = collate_data_list([mol_loader.dataset[ind] for ind in eval_rands]).to(self.device)
+        if not self.args.molecule_conditioning: # always std orientation if we're not conditioning
+            mol_batch.orient_molecule(mode='standard')
+        else:  # if we are conditioning, randomly rotate and make sure we catch the embedding
+            random_rotations = torch.tensor(
+                Rotation.random(num=mol_batch.num_graphs).as_matrix(),
+                device=mol_batch.device, dtype=torch.float32)
+            mol_batch.orient_molecule(mode='standard')
+            mol_batch.orient_molecule(mode='random',
+                                      include_inversion=False,
+                                      correct_orientation=True,
+                                      random_rotations=random_rotations
+                                      )
 
+            mol_batch.embedding = mol_batch.rotate_embedding(random_rotations)
+
+        # if we are conditioning, we take it as it comes
         init_state = get_gfn_init_state(eval_batch_size, energy_function.data_ndim, self.device)
 
         eval_metrics = {}
@@ -879,42 +896,49 @@ class Modeller:
                                                                      )
                 metrics.update(conditional_metrics)
 
-        metrics.update(self.do_evaluation(energy_function, buffer,
+        metrics.update(self.do_evaluation(energy_function,
+                                          buffer,
                                           gfn_model,
-                                          step_ind, test_mol_loader))
+                                          step_ind,
+                                          test_mol_loader))
 
-        self.dynamic_quality_management(metrics, buffer, energy_function)
+        self.dynamic_quality_management(metrics)
 
         wandb.log(metrics, step=step_ind)
 
-    def dynamic_quality_management(self, metrics, buffer, energy_function):
-        minimum_1d_coverage = metrics['Minimum 1d coverage']
+    def dynamic_quality_management(self, metrics):
+        #minimum_1d_coverage = metrics['Minimum 1d coverage']
         # adjust by a factor of 'multiple' for each 'delta_factor' of miss
-        multiple = 2
-        delta_factor = 0.05
-        diversity_check = True
-        if self.args.prior_coverage_cutoff is not None and self.args.both_ways:
+        multiple = 10
+        delta_factor = 5
+        fwd_res = metrics['TB Residual']
+        bwd_res = metrics['Bwd TB Residual']
+        miss = np.log10(fwd_res) - np.log10(bwd_res) # want to push towards zero
+        if self.args.prior_mean_loss_cutoff is not None and self.args.both_ways:
+            # check the TB losses on forward and backward training
             if 1000 > self.args.fwd_to_bwd_ratio > 0.001:  # don't let it get too crazy
-                miss = minimum_1d_coverage - self.args.prior_coverage_cutoff
-                adjustment_factor = multiple ** (miss / delta_factor)
+                # if miss > self.args.prior_mean_loss_cutoff:
+                gated_miss = np.clip(miss, a_max=delta_factor, a_min=-delta_factor)
+                # when fwd res is large, increase fwd_to_bwd_ratio, and vice-versa
+                adjustment_factor = multiple ** (gated_miss / delta_factor)
                 self.args.fwd_to_bwd_ratio *= adjustment_factor
-                if minimum_1d_coverage < self.args.prior_coverage_cutoff:
-                    diversity_check = False
 
-        reasonable_frac = metrics['Reasonable Sample Fraction']
-
+        metrics['Fwd-Bwd Residual Ratio'] = miss
         if self.args.anneal_repulsion:
-            if (reasonable_frac >= self.args.anneal_repulsion_cutoff) and diversity_check:
-                if self.args.lj_repulsion < 1:
-                    self.args.lj_repulsion = min(1, self.args.lj_repulsion * 1.05)
-                    energy_function.lj_repulsion = self.args.lj_repulsion
-                    if buffer is not None:
-                        if len(buffer) > 0:
-                            buffer.recompute_silu_pot(
-                                batch_size=min(500, self.args.batch_size),
-                                lj_repulsion=self.args.lj_repulsion,
-                                device=self.device
-                            )
+            print("We're not doing repulsive annealing anymore!")
+
+            # reasonable_frac = metrics['Reasonable Sample Fraction']
+            # if (reasonable_frac >= self.args.anneal_repulsion_cutoff) and diversity_check:
+            #     if self.args.lj_repulsion < 1:
+            #         self.args.lj_repulsion = min(1, self.args.lj_repulsion * 1.05)
+            #         energy_function.lj_repulsion = self.args.lj_repulsion
+            #         if buffer is not None:
+            #             if len(buffer) > 0:
+            #                 buffer.recompute_silu_pot(
+            #                     batch_size=min(500, self.args.batch_size),
+            #                     lj_repulsion=self.args.lj_repulsion,
+            #                     device=self.device
+            #                 )
         metrics['LJ Repulsion'] = self.args.lj_repulsion
         metrics['Fwd to Bwd Ratio'] = self.args.fwd_to_bwd_ratio
 

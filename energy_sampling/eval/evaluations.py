@@ -16,8 +16,9 @@ from skimage.feature import peak_local_max
 from skimage.segmentation import watershed
 from umap import UMAP
 
-from energy_sampling.eval.utils import log_partition_function, get_plotly_fig_size_mb
+from energy_sampling.eval.utils import sample_eval_fwd_trajs, get_plotly_fig_size_mb
 from energy_sampling.utils import logmeanexp, sample_crystal_prior, manual_batch_to_data_list
+from mxtaltools.common.utils import get_point_density
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.reporting.figures import simple_cell_hist, simple_cell_scatter_fig, \
     log_crystal_samples, conditional_simple_cell_hist
@@ -38,56 +39,59 @@ def eval_step(energy_function,
 
     (flow_states, samples, log_r, log_Z, log_Z_lb,
      log_Z_learned, sample_batch, condition, log_pfs, log_pbs, log_flow,
-     f_means_f, f_vars_f, f_means_b, f_vars_b,
-     log_T_tensor) = log_partition_function(
+     gauss_params_f,
+     log_T_tensor) = sample_eval_fwd_trajs(
         init_state, gfn_model, discretizer, energy_function, mol_batch)
 
-    metrics = log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, log_r,
-                                         sample_batch, log_T_tensor, args, buffer)
-    sample_batch.plot_batch_cell_params(show=False)
-
-    # if add_to_buffer:
-    #     buffer.add(manual_batch_to_data_list(sample_batch.detach().cpu()))  # add evaluation samples to buffer
+    metrics = log_metrics(energy_function, log_Z, log_Z_lb, log_Z_learned, log_r, log_flow,
+                          sample_batch, log_T_tensor, log_pfs, log_pbs, args, buffer)
 
     if do_figures:
-        fig_dict = generate_fwd_figs(buffer,
-                                     energy_function,
-                                     condition,
-                                     flow_states,
-                                     gfn_model,
-                                     init_state,
-                                     log_flow,
-                                     log_pbs,
-                                     log_pfs,
-                                     log_r,
-                                     f_vars_f, f_means_f, f_vars_b, f_means_b,
-                                     sample_batch.detach().cpu(),
-                                     log_T_tensor)
-        if bwd_training:
-            fig_dict = generate_bwd_figs(fig_dict, buffer, gfn_model, init_state, discretizer)
+        # always sample from forward policy
+        fig_dict = fwd_figs(buffer,
+                            flow_states,
+                            log_flow,
+                            log_pbs,
+                            log_pfs,
+                            log_r,
+                            gauss_params_f,
+                            sample_batch.detach().cpu(),
+                            )
+    else:
+        fig_dict = {}
 
-        for key in fig_dict.keys():
-            fig = fig_dict[key]
-            try:
-                if get_plotly_fig_size_mb(fig) > 1:  # bigger than 1 MB
-                    fig.write_image(key + 'fig.png', width=720,
-                                    height=512)  # save the image rather than the fig, for size reasons
-                    fig_dict[key] = wandb.Image(key + 'fig.png')
-            except:
-                pass
+    if bwd_training:
+        metrics, fig_dict = bwd_figs(metrics, fig_dict, buffer, gfn_model, init_state, discretizer, do_figs=do_figures)
 
+    if do_figures:
+        adjust_fig_filesize(fig_dict)
         metrics.update(fig_dict)
 
-    "Crystal samples"
-    try:
-        batch_to_log = collate_data_list(sample_batch.detach().cpu().to_data_list()[:6])
-        batch_to_log.box_analysis()
-        log_crystals(batch_to_log)
-    except:  # sometimes it fails IDK
-        pass
+        "Crystal samples"
+        # TODO this always fails for our current accelerated batching technique
+        # need to write a manual decollater
+        # try:
+        #     batch_to_log = sample_batch.detach().cpu().batch_to_list()[:6]
+        #     batch_to_log.box_analysis()
+        #     log_crystals(batch_to_log)
+        # except:  # sometimes it fails IDK
+        #     print("Crystal Logging Failed!")
+        #     pass
 
     gfn_model.train()
     return metrics
+
+
+def adjust_fig_filesize(fig_dict):
+    for key in fig_dict.keys():
+        fig = fig_dict[key]
+        try:
+            if get_plotly_fig_size_mb(fig) > 1:  # bigger than 1 MB
+                fig.write_image(key + 'fig.png', width=720,
+                                height=512)  # save the image rather than the fig, for size reasons
+                fig_dict[key] = wandb.Image(key + 'fig.png')
+        except:
+            pass
 
 
 @torch.no_grad()
@@ -111,7 +115,7 @@ def conditional_eval_step(energy_function,
     (flow_states, samples, log_r, log_Z, log_Z_lb,
      log_Z_learned, sample_batch, condition, log_pfs, log_pbs, log_flow,
      f_means_f, f_vars_f, f_means_b, f_vars_b,
-     log_T_tensor) = log_partition_function(
+     log_T_tensor) = sample_eval_fwd_trajs(
         init_state, gfn_model, discretizer, energy_function, mol_batch)
 
     metrics = {}
@@ -124,16 +128,7 @@ def conditional_eval_step(energy_function,
         cond_inds,
         log_T_tensor)
 
-    for key in fig_dict.keys():
-        fig = fig_dict[key]
-        try:
-            if get_plotly_fig_size_mb(fig) > 1:  # bigger than 1 MB
-                fig.write_image(key + 'fig.png', width=720,
-                                height=512)  # save the image rather than the fig, for size reasons
-                fig_dict[key] = wandb.Image(key + 'fig.png')
-        except:
-            pass
-
+    adjust_fig_filesize(fig_dict)
     metrics.update(fig_dict)
 
     gfn_model.train()
@@ -152,81 +147,60 @@ def log_crystals(sample_batch):
     [os.remove(file) for file in filenames]  # delete this cif as a temporary file
 
 
-def generate_fwd_figs(buffer, energy_function,
-                      condition, flow_states,
-                      gfn_model, init_state,
-                      log_flow, log_pbs, log_pfs, log_r,
-                      f_vars_f, f_means_f, f_vars_b, f_means_b, sample_batch,
-                      log_T_tensor):
+def fwd_figs(buffer, flow_states,
+             log_flow, log_pbs, log_pfs, log_r,
+             gauss_params_f,
+             sample_batch,
+             ):
     fig_dict = {}
 
-    buffer_cell_params, buffer_latent_params, buffer_std_params, buffer_reward, buffer_batch = get_buffer_stats(buffer)
-    std_cell_params = sample_batch.latent_params().cpu().detach()
-
-    known_mode_coverage(energy_function, fig_dict, std_cell_params)
-
-    # rewrite this - it's way too slow
-    # (sample_embedding, anchor_embedding,
-    #  anchor_states, sample_cluster_inds,
-    #  anchor_energies, all_energies, buffer_cluster_inds,
-    #  watershed_idx, watershed_range) = embed_samples(
-    #     buffer_std_params,
-    #     buffer_reward,
-    #     std_cell_params.cpu().detach().numpy(),
-    #     log_r.cpu().detach().numpy(),
-    #     max_ref_samples=500
-    # )
-    # fig_dict['Sample Embedding'] = cluster_fig(sample_embedding, anchor_embedding, sample_cluster_inds, anchor_energies,
-    #                                            all_energies, 'cluster', watershed_idx, watershed_range)
-    # fig_dict['Sample Embedding w Energy'] = cluster_fig(sample_embedding, anchor_embedding, sample_cluster_inds,
-    #                                                     anchor_energies, all_energies, 'energy', watershed_idx,
-    #                                                     watershed_range)
-    # # coverage metrics
-    # fig_dict['Num Sample Clusters'] = np.sum(np.unique(sample_cluster_inds) >= 0)
-    # fig_dict['Num Buffer Clusters'] = np.sum(np.unique(buffer_cluster_inds) >= 0)
-    #
-    # fig = cluster_hist_fig(sample_cluster_inds)
-    # fig_dict['Cluster Hist'] = fig
+    (buffer_cell_params, buffer_latent_params,
+     buffer_std_params, buffer_reward,
+     buffer_batch, buffer_sg_inds) = get_buffer_stats(buffer)
 
     try:
         fig_dict['Boltzmann Fit'] = boltzmann_fig(log_r)
     except:  # some issues in the above I don't care to fix
         pass
 
-    # todo rewrite this for general conditioning
-    # if energy_function.temperature_conditioning:
-    #     fig_dict['temp/Learned Z vs T'] = Z_vs_T_fig(gfn_model, init_state)
-    #     fig_dict['temp/T vs Energy'] = T_vs_E_fig(condition, sample_batch)
-    traj_param_logging(f_means_b, f_means_f, f_vars_b, f_vars_f, fig_dict, flow_states, log_pbs, log_pfs, log_r)
+    log_fwd_traj_params(gauss_params_f, fig_dict, flow_states, log_pbs, log_pfs, log_r)
     fig_dict['TB Parity Plot'], fig_dict['Forward TB R Value'] = flow_parity_plot(log_r, log_flow, log_pbs, log_pfs)
-    fig_dict['VG Error'] = vargrad_error(log_r, log_pbs, log_pfs)  # todo tune this up for conditional modelling
+    fig_dict['VG Error'] = vargrad_error(log_r, log_pbs, log_pfs)
+    fig_dict['TB Residual vs R'] = xy_scatter_plot(
+        log_r,
+        torch.abs(log_r - log_flow - log_pfs.sum(-1) + log_pbs.sum(-1)),
+        'Reward',
+        'TB Residual',
+
+    )
     fig_dict['Lattice Latents Trajectories'] = visualize_latent_trajs(flow_states.cpu().detach().numpy(),
                                                                       20,
                                                                       log_r.cpu().detach().numpy())
 
     fig_dict['Lattice Features Distribution'], cell_klds = (
         simple_cell_hist(sample_batch, buffer_cell_params,
-                                                                            n_kde_points=200, bw_ratio=10, mode='cell'))
+                         n_kde_points=200, bw_ratio=10, mode='cell'))
     fig_dict['Lattice Latents Distribution'], latent_klds = (
         simple_cell_hist(sample_batch, buffer_latent_params,
-                                                                             n_kde_points=200, bw_ratio=10,
-                                                                             mode='latent'))
-    fig_dict['Pf Parity'], fig_dict['Pf Parity R Value'] = Pf_alignment_fig(log_pfs, log_pbs, log_r, log_flow)
+                         n_kde_points=200, bw_ratio=10,
+                         mode='latent'))
+    _, fig_dict['Pf Parity R Value'] = pf_parity_plot(log_pfs, log_pbs, log_r, log_flow)
 
     log_buffer_kld(cell_klds, fig_dict, latent_klds)
 
-    log_T = len(torch.unique(log_T_tensor)) > 1
-    fig_dict['Sample Scatter'] = simple_cell_scatter_fig(  # todo maybe change colour to cluster id
+    fig_dict['Sample Scatter'] = simple_cell_scatter_fig(
         sample_batch,
-        #sample_cluster_inds,
-        aux_scalar_name='Log Temp' if log_T else None,
-        aux_array=log_T_tensor.cpu().detach().numpy() if log_T else None,
     )
 
     return fig_dict
 
 
-def traj_param_logging(f_means_b, f_means_f, f_vars_b, f_vars_f, fig_dict, flow_states, log_pbs, log_pfs, log_r):
+def log_fwd_traj_params(gauss_params_f, fig_dict, flow_states, log_pbs, log_pfs, log_r):
+    f_vars_f = gauss_params_f['logvars_f']
+    f_means_f = gauss_params_f['means_f']
+    f_vars_b = gauss_params_f['logvars_b']
+    f_means_b = gauss_params_f['means_b']
+
     fig_dict['Forward Gauss Params'] = mean_var_fig(f_vars_f, f_means_f,
                                                     f_vars_b, f_means_b)
     fig_dict['Mean Fwd F Drift'] = f_means_f.abs().mean()
@@ -234,7 +208,17 @@ def traj_param_logging(f_means_b, f_means_f, f_vars_b, f_vars_f, fig_dict, flow_
     fig_dict['Mean Fwd F Var'] = f_vars_f.mean()
     fig_dict['Mean Fwd B Var'] = f_vars_b.mean()
     fig_dict['Traj Mean Step Sizes'] = mean_flow_step_sizes(flow_states)
-    fig_dict['Pf vs Pb'] = Pf_vs_Pb_fig(log_pfs, log_pbs, log_r)
+    # fig_dict['Pf vs Pb'] = Pf_vs_Pb_fig(log_pfs, log_pbs, log_r)
+
+
+def mean_var_fig(logvars_f, means_f, logvars_b, means_b):
+    fig = make_subplots(rows=2, cols=1)
+    fig.add_scatter(y=np.nan_to_num(torch.exp(logvars_f).mean(0).cpu().detach().numpy()), name='Pf Var', row=2, col=1)
+    fig.add_scatter(y=np.nan_to_num(means_f.abs().mean(0).cpu().detach().numpy()), name='Pf Mean', row=1, col=1)
+    fig.add_scatter(y=np.nan_to_num(torch.exp(logvars_b).mean(0).cpu().detach().numpy()), name='Pb Var', row=2, col=1)
+    fig.add_scatter(y=np.nan_to_num(means_b.abs().mean(0).cpu().detach().numpy()), name='Pb Mean', row=1, col=1)
+    fig.update_layout(xaxis2_title='Trajectory Step')
+    return fig
 
 
 def log_buffer_kld(cell_klds, fig_dict, latent_klds):
@@ -383,8 +367,8 @@ def boltzmann_fig(log_r):
     # === Layout
     fig.update_layout(
         title_text='Boltzmann Distribution Check (Linear & Log View)',
-        #height=500,
-        #width=1000,
+        # height=500,
+        # width=1000,
         template='plotly_white'
     )
 
@@ -454,7 +438,7 @@ def embed_samples(ref_samples, ref_rewards, samples, sample_rewards, max_ref_sam
     # -------------
     # Step 3: Watershed
     # -------------
-    min_kde_range = 2  #np.sqrt(grid_size**2 / 500)  # to stuff M evenly spaced clusters
+    min_kde_range = 2  # np.sqrt(grid_size**2 / 500)  # to stuff M evenly spaced clusters
     peaks = peak_local_max(density_smooth, min_distance=int(min_kde_range), exclude_border=False)
     markers = np.zeros_like(density_smooth, dtype=int)
     for i, (x, y) in enumerate(peaks):
@@ -665,7 +649,7 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
                                marker=dict(
                                    size=15,
                                    color=line_colors,
-                                   #[cluster_to_color[ind] for ind in range(len(anchor_embedding))],  # Fill color
+                                   # [cluster_to_color[ind] for ind in range(len(anchor_embedding))],  # Fill color
                                    line=dict(
                                        color='white',  # <-- variable border color!
                                        width=4
@@ -710,117 +694,53 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
     return fig
 
 
-#
-# from scipy.spatial.distance import cdist
-# X = buffer_std_params
-# energies = -buffer_reward.cpu().detach().numpy()
-#
-# """
-# cluster generation
-# """
-# k = 10000
-# min_dist = 5.0
-# energy_cutoff = -3
-#
-# idx_sorted = np.argsort(energies)
-# anchors = []
-# anchor_indices = []
-#
-# for idx in idx_sorted:
-#     candidate = X[idx]
-#     if energies[idx] > energy_cutoff:
-#         break
-#     if len(anchors) == 0:
-#         anchors.append(candidate)
-#         anchor_indices.append(idx)
-#     else:
-#         dists = cdist([candidate], anchors)
-#         if np.min(dists) >= min_dist:
-#             anchors.append(candidate)
-#             anchor_indices.append(idx)
-#     if len(anchors) >= k:
-#         break
-#
-# """
-# cluster assignment
-# """
-# dists = cdist(X, anchors)  # shape (N_samples, N_anchors)
-# cluster_ind = np.argmin(dists, axis=1)
-#
-# import umap
-# reducer = umap.UMAP(n_components=2, n_neighbors=30, min_dist=0.05)
-# reduc
-# er.fit(anchors)  # Learn manifold from anchors
-# embedding = reducer.transform(X)  # Project full dataset
-# anchor_embedding = reducer.transform(anchors)
-#
-# color_array = cluster_ind
-# fig = go.Figure()
-#
-# fig.add_trace(go.Scattergl(x=embedding[:, 0],
-#                            y=embedding[:, 1],
-#                            mode='markers',
-#                            opacity=0.85,
-#                            name='Policy Samples',
-#                            showlegend=True,
-#                            marker=dict(
-#                                size=6,
-#                                color=color_array,
-#                                colorscale="portland",
-#                                colorbar=dict(title="Cluster Membership")
-#                            )
-#                            ))
-#
-# fig.add_trace(go.Scattergl(x=anchor_embedding[:, 0],
-#                            y=anchor_embedding[:, 1],
-#                            mode='markers',
-#                            opacity=1,
-#                            name='Known Modes',
-#                            showlegend=True,
-#                            marker=dict(
-#                                size=15,
-#                                color='green',  # Fill color
-#                                line=dict(
-#                                    color='black',  # Outline color
-#                                    width=4  # Outline thickness
-#                                )
-#                            )
-#                            ))
-#
-# fig.show()
-
-
-def generate_bwd_figs(fig_dict, buffer, gfn_model, init_state, discretizer):
+def bwd_figs(metrics, fig_dict, buffer, gfn_model, init_state, discretizer, do_figs: Optional[bool] = False):
     terminal_state, b_log_r, crystal_batch, condition = buffer.sample(
         override_batch=len(init_state))
     (backward_flow_states, b_log_pfs, b_log_pbs, b_log_flow,
-     b_means_f, b_vars_f, b_means_b, b_vars_b) = gfn_model.get_trajectory_bwd(
+     b_means_f, b_vars_f, b_means_b, b_vars_b) = gfn_model.get_traj_bwd(
         terminal_state.to(gfn_model.device), discretizer, condition.to(gfn_model.device), return_gauss_params=True)
 
-    fig_dict['Backward Latents Trajectories'] = visualize_latent_trajs(
-        backward_flow_states.cpu().detach().numpy(),
-        n_trajs=20, log_r=b_log_r.cpu().detach().numpy())
-
-    fig_dict['Backward Pf vs Pb'] = Pf_vs_Pb_fig(b_log_pfs, b_log_pbs, b_log_r)
-    fig_dict['Backward TB Parity Plot'], fig_dict['Backward TB R Value'] = flow_parity_plot(b_log_r.to(b_log_flow.device),
-                                                                                            b_log_flow, b_log_pbs,
-                                                                                            b_log_pfs)
-    fig_dict['Backward Gauss Params'] = mean_var_fig(b_vars_f, b_means_f,
-                                                     b_vars_b, b_means_b)
-    fig_dict['Mean Bwd F Drift'] = b_means_f.abs().mean()
-    fig_dict['Mean Bwd B Drift'] = b_means_b.abs().mean()
-    fig_dict['Mean Bwd F Var'] = b_vars_f.mean()
+    metrics['Mean Bwd F Drift'] = b_means_f.abs().mean()
+    metrics['Mean Bwd B Drift'] = b_means_b.abs().mean()
+    metrics['Mean Bwd F Var'] = b_vars_f.mean()
     fig_dict['Mean Bwd B Var'] = b_vars_b.mean()
 
-    fig_dict['Bwd Traj Mean Step Sizes'] = mean_flow_step_sizes(backward_flow_states)
 
     log_weight = b_log_r + b_log_pbs.sum(-1).cpu() - b_log_pfs.sum(-1).cpu()
-    log_Z = logmeanexp(log_weight)
+    log_Z_empirical = logmeanexp(log_weight)
     log_Z_lb = log_weight.mean()
-    fig_dict['Bwd Empirical log Z'] = log_Z.cpu().detach().numpy()
-    fig_dict['Bwd Empirical log Z LB'] = log_Z_lb.cpu().detach().numpy()
+    log_Z_learned = b_log_flow.mean()
+    metrics['Bwd Empirical log Z'] = log_Z_empirical.cpu().detach().numpy()
+    metrics['Bwd Empirical log Z LB'] = log_Z_lb.cpu().detach().numpy()
 
-    return fig_dict
+    log_pf = b_log_pfs.sum(-1)
+    log_pb = b_log_pbs.sum(-1)
+    tb_residual = torch.abs(log_pf.cpu() + b_log_flow.cpu() - log_pb.cpu() - b_log_r.cpu())
+    metrics['Bwd TB Residual'] = tb_residual.mean().item()
+    metrics['Bwd Log Z Residual'] = (log_Z_empirical - log_Z_learned).item()
+
+    if do_figs:
+        fig_dict['Backward Latents Trajectories'] = visualize_latent_trajs(
+            backward_flow_states.cpu().detach().numpy(),
+            n_trajs=20, log_r=b_log_r.cpu().detach().numpy())
+
+        # fig_dict['Backward Pf vs Pb'] = Pf_vs_Pb_fig(b_log_pfs, b_log_pbs, b_log_r)
+        fig_dict['Backward TB Parity Plot'], fig_dict['Backward TB R Value'] = flow_parity_plot(
+            b_log_r.to(b_log_flow.device),
+            b_log_flow, b_log_pbs,
+            b_log_pfs)
+        fig_dict['Bwd TB Residual vs R'] = xy_scatter_plot(
+            b_log_r,
+            torch.abs(b_log_r.cpu() - b_log_flow.cpu() - b_log_pfs.sum(-1).cpu() + b_log_pbs.sum(-1).cpu()),
+            xaxis_title='Reward',
+            yaxis_title='TB Residual',
+        )
+        fig_dict['Backward Gauss Params'] = mean_var_fig(b_vars_f, b_means_f,
+                                                         b_vars_b, b_means_b)
+        fig_dict['Bwd Traj Mean Step Sizes'] = mean_flow_step_sizes(backward_flow_states)
+
+    return metrics, fig_dict
 
 
 def get_buffer_stats(buffer):
@@ -834,19 +754,10 @@ def get_buffer_stats(buffer):
         buffer_std_params_for_embedding = buffer_batch.latent_params().cpu().detach().numpy()
         reward = buffer_reward.cpu().detach().numpy()
         batch = buffer_batch.cpu().detach()
+        sg_inds = buffer_batch.sg_ind.cpu().detach().numpy()
     else:
-        buffer_cell_params, buffer_latent_params, buffer_std_params_for_embedding, reward, batch = None, None, None, None, None
-    return buffer_cell_params, buffer_latent_params, buffer_std_params_for_embedding, reward, batch
-
-
-def mean_var_fig(logvars_f, means_f, logvars_b, means_b):
-    fig = make_subplots(rows=2, cols=1)
-    fig.add_scatter(y=np.nan_to_num(torch.exp(logvars_f).mean(0).cpu().detach().numpy()), name='Pf Var', row=2, col=1)
-    fig.add_scatter(y=np.nan_to_num(means_f.abs().mean(0).cpu().detach().numpy()), name='Pf Mean', row=1, col=1)
-    fig.add_scatter(y=np.nan_to_num(torch.exp(logvars_b).mean(0).cpu().detach().numpy()), name='Pb Var', row=2, col=1)
-    fig.add_scatter(y=np.nan_to_num(means_b.abs().mean(0).cpu().detach().numpy()), name='Pb Mean', row=1, col=1)
-    fig.update_layout(xaxis2_title='Trajectory Step')
-    return fig
+        buffer_cell_params, buffer_latent_params, buffer_std_params_for_embedding, reward, batch, sg_inds = None, None, None, None, None, None
+    return buffer_cell_params, buffer_latent_params, buffer_std_params_for_embedding, reward, batch, sg_inds
 
 
 def mean_flow_step_sizes(flow_states):
@@ -860,8 +771,8 @@ def mean_flow_step_sizes(flow_states):
     return fig
 
 
-def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, log_r,
-                               sample_batch, log_T_tensor, args, buffer=None):
+def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r, log_flow,
+                sample_batch, log_T_tensor, log_pfs, log_pbs, args, buffer=None):
     """Scalar / distribution metrics"""
     metrics = {}
     # energies
@@ -875,11 +786,10 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
     metrics['Packing Coeff'] = sample_batch.packing_coeff.clip(max=2).cpu().detach().numpy()
     metrics['Niggli Overlap'] = sample_batch.niggli_overlap.cpu().detach().numpy()
     metrics['Niggli Invalid Fraction'] = np.mean(sample_batch.niggli_overlap.cpu().detach().numpy() < 0)
-    metrics['Mean ellipsoid_overlap'] = sample_batch['ellipsoid_overlap'].mean().cpu().detach().item()
 
     # conditions
-    metrics['Crystal Log Temperature'] = log_T_tensor.cpu().detach().numpy()
     metrics['Crystal Mean Log Temperature'] = log_T_tensor.mean().item()
+    metrics['Crystal Log Temperature'] = log_T_tensor.cpu().detach().numpy()
 
     # training metrics
     metrics['Mean Sample Energy'] = sample_batch.gfn_energy.mean().cpu().detach().item()
@@ -888,7 +798,7 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
     metrics['Mean Sample Reward'] = log_r.mean().cpu().detach().item()
     metrics['Sample Reward'] = log_r.clip(min=-50).cpu().detach().numpy()
 
-    metrics['Empirical log Z'] = log_Z.cpu().detach().item()
+    metrics['Empirical log Z'] = log_Z_empirical.cpu().detach().item()
     metrics['Empirical log Z LB'] = log_Z_lb.cpu().detach().item()
     metrics['log Z learned'] = log_Z_learned.cpu().detach().item()
 
@@ -931,10 +841,6 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
         metrics[feat + '_var'] = std_params[:, ind].var().item()
         metrics[feat + '_expl_var_rat'] = contrib_per_feature[ind].item()
 
-    cov = torch.cov(std_params.T)  # shape [12, 12]
-    volume_proxy = torch.det(cov).clamp_min(1e-12).sqrt().item()
-    metrics['Gaussian Proxy Hypervolume'] = np.log(volume_proxy)
-
     if hasattr(sample_batch, 'ellipsoid_overlap'):
         metrics['mean ellipsoid overlap'] = sample_batch.ellipsoid_overlap.mean().cpu().detach().numpy()
         metrics['ellipsoid overlap'] = sample_batch.ellipsoid_overlap.clip(min=1e-3).log10().cpu().detach().numpy()
@@ -950,9 +856,9 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
 
     prior_sample = sample_backward_prior(args, buffer, sample_batch, len(std_params))
 
-    # todo do this separately for each space group
+    # this isn't SG conditioned, but that's OK because we're not really using it anymore anyway
     prior_coverage = get_dimwise_coverage(std_params, prior_sample.to('cpu'),
-                                          n_bins=24, cmin=1, tau=1/args.prior_coverage_ratio)
+                                          n_bins=24, cmin=1, tau=1 / args.prior_coverage_ratio)
     lattice_features = ['cell_a', 'cell_b', 'cell_c',
                         'cell_alpha', 'cell_beta', 'cell_gamma',
                         'aunit_x', 'aunit_y', 'aunit_z',
@@ -962,9 +868,16 @@ def log_eval_scalars_and_dists(energy_function, log_Z, log_Z_lb, log_Z_learned, 
 
     metrics['Minimum 1d coverage'] = torch.amin(prior_coverage).item()
 
+    # unconditional flow metrics
+    log_pf = log_pfs.sum(-1)
+    log_pb = log_pbs.sum(-1)
+    tb_residual = torch.abs(log_pf + log_flow - log_pb - log_r)
+    metrics['TB Residual'] = tb_residual.mean().item()
+    metrics['Log Z Residual'] = (log_Z_empirical - log_Z_learned).item()
+
     # get fraction of samples which are 'reasonable' at this energy,
     # meaning density > 0.55 and bound states
-    sample_is_good = (sample_batch.silu_pot < 0) * (sample_batch.packing_coeff > 0.55)
+    sample_is_good = (sample_batch.lj_pot < 0) * (sample_batch.packing_coeff > 0.55)
     metrics["Reasonable Sample Fraction"] = sample_is_good.float().mean().item()
     metrics = {k: to_loggable(v) for k, v in metrics.items()}
 
@@ -992,46 +905,7 @@ def to_loggable(v):
     return v
 
 
-def Z_vs_T_fig(gfn_model, init_state):
-    log_temps = torch.linspace(-2, 2, 100).to(init_state.device)[:, None].flatten()
-    Z_at_T = gfn_model.flow_model(
-        gfn_model.conditions_embedding_model(log_temps[:, None])).cpu().detach().flatten()
-    fig = go.Figure(go.Scatter(x=log_temps.cpu().detach(),
-                               y=Z_at_T.cpu().detach(),
-                               mode='lines'))
-    fig.update_layout(xaxis_title='Log Temperature', yaxis_title='Log Partition Function')
-    return fig
-
-
-def T_vs_E_fig(condition, sample_batch):
-    fig = go.Figure()
-    x = condition[:, 0].cpu().detach().numpy()
-    y = sample_batch.gfn_energy.cpu().detach().numpy()
-    fig.add_histogram2d(x=x,
-                        y=np.log10(y - y.min() + 1e-3),
-                        showscale=False,
-                        nbinsx=50, nbinsy=50)
-    fig.update_layout(xaxis_title='Log Temperature', yaxis_title='Sample Energy')
-    return fig
-
-
-def Pf_vs_R_fig(pf, log_r):
-    x = pf.sum(-1).cpu().detach().numpy()
-    y = log_r.cpu().detach().numpy()
-    r_value, _ = pearsonr(x, y)
-
-    fig = go.Figure()
-    fig.add_scatter(x=x,
-                    y=y,
-                    name=f'R = {r_value:.3f}',
-                    showlegend=True,
-                    mode='markers',
-                    )
-    fig.update_layout(xaxis_title='Trajectory Probability', yaxis_title='Terminal Reward')
-    return fig, r_value
-
-
-def Pf_alignment_fig(log_pfs, log_pbs, log_r, log_flow):
+def pf_parity_plot(log_pfs, log_pbs, log_r, log_flow):
     x = log_pfs.sum(-1).cpu().detach().numpy()
     y = (log_r + log_pbs.sum(-1) - log_flow).cpu().detach().numpy()
     r_value, _ = pearsonr(x, y)
@@ -1049,31 +923,37 @@ def Pf_alignment_fig(log_pfs, log_pbs, log_r, log_flow):
     return fig, r_value
 
 
-def Pf_vs_Pb_fig(pf, pb, log_r):
-    if torch.is_tensor(pf):
-        x = pf.sum(-1).cpu().detach().numpy()
-        y = pb.sum(-1).cpu().detach().numpy()
-    else:
-        x = pf.sum(-1)
-        y = pb.sum(-1)
+def xy_scatter_plot(
+        x: torch.Tensor,
+        y: torch.Tensor,
+        xaxis_title: str,
+        yaxis_title: str,
+        c: Optional[torch.Tensor] = None,
 
-    if torch.is_tensor(log_r):
-        color = log_r.cpu().detach().numpy()
-    else:
-        color = log_r
+):
+    try:
+        r_value, _ = pearsonr(x, y)
+    except:
+        r_value = 0
 
-    r_value, _ = pearsonr(x, y)
+    if c is None:
+        xy = np.vstack([x.cpu().detach().numpy(), y.cpu().detach().numpy()])
+        try:
+            c = get_point_density(xy, bins=25)
+        except:
+            c = np.ones(len(xy))
 
-    fig = go.Figure()
-    fig.add_scatter(x=y,
-                    y=x,
-                    marker_color=color,
+        fig = go.Figure()
+    fig.add_scatter(x=x.cpu().detach().numpy(),
+                    y=y.cpu().detach().numpy(),
+                    marker_color=c,
                     marker_colorscale='Jet',
                     name=f'R = {r_value:.3f}',
                     showlegend=True,
                     mode='markers',
                     )
-    fig.update_layout(yaxis_title='Forward Prob', xaxis_title='Backward Prob')
+    fig.update_layout(yaxis_title=yaxis_title,
+                      xaxis_title=xaxis_title)
     return fig
 
 
@@ -1137,7 +1017,7 @@ def visualize_latent_trajs(states, n_trajs, log_r):
                 mode='lines',
                 marker_line_width=0.5,
                 showlegend=True if i == 0 else False,
-                marker_color=log_r,  #color_hex[j],
+                marker_color=log_r,  # color_hex[j],
                 marker_colorscale='Jet',
             ),
                 row=row, col=col
@@ -1191,7 +1071,7 @@ def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs):
     fig.update_layout(
         title='Parity Plot',
         xaxis=dict(title='log_r + log_pb', range=[lim_low, lim_high]),
-        yaxis=dict(title='log_Z + log_pf', range=[lim_low, lim_high], scaleanchor='x'),  #, scaleratio=1),
+        yaxis=dict(title='log_Z + log_pf', range=[lim_low, lim_high], scaleanchor='x'),  # , scaleratio=1),
         # width=600,
         # height=600,
         template='plotly_white'
@@ -1241,14 +1121,14 @@ def conditional_flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs, cond_in
             x=x[bools], y=y[bools],
             mode='markers',
             marker=dict(size=6, opacity=0.7, color=ind, colorscale='Rainbow'),
-            #name=f'Samples<br>MAE = {mae:.3f}<br>R = {r_value:.3f}'
+            # name=f'Samples<br>MAE = {mae:.3f}<br>R = {r_value:.3f}'
         ))
 
     # Layout adjustments
     fig.update_layout(
         title='Parity Plot',
         xaxis=dict(title='log_r + log_pb', range=[lim_low, lim_high]),
-        yaxis=dict(title='log_Z + log_pf', range=[lim_low, lim_high], scaleanchor='x'),  #, scaleratio=1),
+        yaxis=dict(title='log_Z + log_pf', range=[lim_low, lim_high], scaleanchor='x'),  # , scaleratio=1),
         # width=600,
         # height=600,
         template='plotly_white'

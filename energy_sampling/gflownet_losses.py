@@ -102,13 +102,13 @@ def get_gfn_forward_loss(loss_coeffs,
 
     condition = condition.to(gfn.device)
     log_T_tensor = log_T_tensor.to(gfn.device)
-    (states, log_pfs, log_pbs, log_flow) = gfn.get_trajectory_fwd(initial_state,
-                                                                  discretizer,
-                                                                  exploration_std,
-                                                                  condition,
-                                                                  detach_traj=not keep_grads,
-                                                                  return_gauss_params=False,
-                                                                  )
+    (states, log_pfs, log_pbs, log_flow) = gfn.get_traj_fwd(initial_state,
+                                                            discretizer,
+                                                            exploration_std,
+                                                            condition,
+                                                            detach_traj=not keep_grads,
+                                                            return_gauss_params=False,
+                                                            )
 
     crystal_batch, log_r = get_loss_reward(log_T_tensor,
                                            log_reward_fn,
@@ -154,8 +154,8 @@ def get_gfn_forward_loss(loss_coeffs,
 
     """TB loss"""
     if loss_coeffs.tb > 0:
-        emp_z_coeff, tb_loss = get_tb_loss(emp_z_loss, log_flow, log_pb, log_pf, log_r, loss_coeffs)
-        losses.append(tb_loss * loss_coeffs.tb * emp_z_coeff)
+        tb_loss = get_tb_loss(log_flow, log_pb, log_pf, log_r)
+        losses.append(tb_loss * loss_coeffs.tb)
 
     """MLE/TPM loss"""
     if loss_coeffs.mle > 0:
@@ -235,7 +235,7 @@ def get_gfn_backward_loss(loss_coeffs,
         conditional_repeats = False
 
     condition = condition.to(gfn.device)
-    states, log_pfs, log_pbs, log_flow = gfn.get_trajectory_bwd(
+    states, log_pfs, log_pbs, log_flow = gfn.get_traj_bwd(
         samples, discretizer, condition, return_gauss_params=False)
 
     log_pf = log_pfs.sum(-1)
@@ -261,8 +261,8 @@ def get_gfn_backward_loss(loss_coeffs,
 
     """TB loss"""
     if loss_coeffs.tb > 0:
-        emp_z_coeff, tb_loss = get_tb_loss(emp_z_loss, log_flow, log_pb, log_pf, log_r, loss_coeffs)
-        losses.append(tb_loss * loss_coeffs.tb * emp_z_coeff)
+        tb_loss = get_tb_loss(log_flow, log_pb, log_pf, log_r, detach_z = True)
+        losses.append(tb_loss * loss_coeffs.tb)
 
     if loss_coeffs.mle > 0:
         mle_loss = terminal_mle(
@@ -356,18 +356,14 @@ def power_saturate(x, power):
     return torch.sign(x) * (torch.abs(x) ** power)
 
 
-def get_tb_loss(emp_z_loss, log_flow, log_pb, log_pf, log_r, loss_coeffs):
-    if loss_coeffs.emp_z > 0:  # gate TB against sufficiently good performance on the empirical Z
-        # if the empirical Z is bad enough, the log Z will explode
-        # this will turn on the TB loss when the empirical Z estimate gets sufficiently good
-        emp_z_coeff = 2 * (-emp_z_loss / 10).mean().sigmoid()
+def get_tb_loss(log_flow, log_pb, log_pf, log_r, detach_z=False):
+    if detach_z:
+        tb = (log_pf + log_flow.detach() - log_pb - log_r.detach())
     else:
-        emp_z_coeff = 1
-
-    tb = (log_pf + log_flow - log_pb - log_r.detach())
+        tb = (log_pf + log_flow - log_pb - log_r.detach())
     # tb_loss = F.mse_loss(tb, torch.zeros_like(tb), reduction='none')
     tb_loss = F.smooth_l1_loss(tb, torch.zeros_like(tb), reduction='none')
-    return emp_z_coeff, tb_loss
+    return tb_loss
 
 
 def emp_Z(gfn, log_Z, log_flow, repeats):

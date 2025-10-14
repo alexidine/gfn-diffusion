@@ -163,8 +163,7 @@ class MolecularCrystal(BaseSet):
 
         self.temperature = temperature  # for static temperature work
 
-        self.batch = collate_data_list([MolCrystalData()])
-        self.batch.max_z_prime = max_z_prime
+        self.batch = collate_data_list([MolCrystalData(max_z_prime=max_z_prime)], max_z_prime=max_z_prime)
 
         self.sg_cache = {}
         for sg in range(1, 230):
@@ -197,7 +196,7 @@ class MolecularCrystal(BaseSet):
             normed_lj_energy = log_rescale_positive(lj_energy)
             silu_energy = cluster_batch.compute_silu_energy(repulsion=self.lj_repulsion)
 
-        if self.energy_function in ['ellipsoid_overlap', 'combo']:
+        if self.energy_function in ['ellipsoid_overlap']:
             if not hasattr(self, 'ellipsoid_model'):
                 cluster_batch.load_ellipsoid_model()
                 self.ellipsoid_model = copy.deepcopy(cluster_batch.ellipsoid_model)
@@ -391,11 +390,11 @@ class MolecularCrystal(BaseSet):
         ones3 = torch.ones((mol_batch.num_graphs, 3), device='cpu')
         zeros1 = torch.zeros((mol_batch.num_graphs), device='cpu')
         eye3 = torch.eye(3, device='cpu').repeat(mol_batch.num_graphs, 1, 1)
-        ones1 = torch.ones((mol_batch.num_graphs), device='cpu')
-
+        ones1 = torch.ones(mol_batch.num_graphs, device='cpu')
+        trues1 = torch.zeros(mol_batch.num_graphs, dtype=torch.bool, device='cpu').fill_(True)
         blank_batch_properties = {
             '_num_graphs': mol_batch.num_graphs,
-            'aunit_handedness': ones1[None, ...],
+            'aunit_handedness': ones1[:, None],
             'cell_lengths': ones3,
             'cell_angles': ones3,
             'aunit_centroid': ones3,
@@ -412,6 +411,7 @@ class MolecularCrystal(BaseSet):
             'packing_coeff': zeros1,
             'density': zeros1,
             'z_prime': ones1,
+            'is_well_defined': trues1,
         }
         crystal_batch.set_mol_attrs(mol_batch.clone())
         for key in blank_batch_properties:

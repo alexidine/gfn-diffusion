@@ -1,0 +1,33 @@
+- index: 0
+  tag: 0_baseline
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  - t_emb_dim
+  - dropout
+  - norm
+  notes: ''
+- index: 1
+  tag: 1_wide
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  - t_emb_dim
+  - dropout
+  - norm
+  notes: ''
+- index: 2
+  tag: 2_deep
+  update_keys:
+  - joint_layers
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  - t_emb_dim
+  - dropout
+  - norm
+  notes: ''
