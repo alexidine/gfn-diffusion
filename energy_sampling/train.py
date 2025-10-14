@@ -13,14 +13,12 @@ import torch
 import torch.nn.functional as F
 import wandb
 from scipy.spatial.transform import Rotation
-from sympy.codegen.ast import continue_
 from torch.optim import lr_scheduler
 from torch_geometric.loader import DataLoader
 from tqdm import trange
 
 from energies.molecular_crystal import MolecularCrystal
 from energy_sampling.buffer import CrystalReplayBuffer
-from energy_sampling.eval.evaluations import bwd_figs
 from energy_sampling.utils import iter_forever, \
     is_cuda_oom, get_annealing_factor, \
     substitute_prior, parse_loss_schedules, dict2namespace, update_loss_schedule, \
@@ -56,6 +54,8 @@ class Modeller:
         config["Experiment"] = "{args.energy}"
         self.args = args
         self.device = self.args.device
+        self.increasing_loss_cooldown = 0
+        self.lr_warmup_finished = False
 
     def train_logic(self, buffer, it):
         do_forward = False
@@ -169,20 +169,19 @@ class Modeller:
 
         return buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator
 
-    def step_lr_schedule(self, schedulers, optimizers,
-                         lr_warmup_finished):
+    def step_lr_schedule(self, schedulers, optimizers):
         if self.args.scheduler:
             lr = optimizers['fwd'].param_groups[0]['lr']
-            if not lr_warmup_finished:
+            if not self.lr_warmup_finished:
                 schedulers['policy_1'].step()
                 schedulers['flow'].step()
 
                 if lr >= self.args.lr_policy:
-                    lr_warmup_finished = True
+                    self.lr_warmup_finished = True
 
             elif lr > self.args.min_lr:
                 schedulers['policy_2'].step()
-            return lr_warmup_finished, lr
+            return lr
         else:
             return False, None
 
@@ -498,8 +497,8 @@ class Modeller:
         fwd_loss_dict = None
         bwd_loss_dict = None
         oomed_out = False
-        lr_warmup_finished = False
         fwd_loss, bwd_loss = 0, 0
+        loss_record = []
 
         self.times['initialization_end'] = time()
 
@@ -514,18 +513,7 @@ class Modeller:
                         log='gradients')  # for gradient logging
 
             gfn_model.train()
-
-            # torch.autograd.set_detect_anomaly(True)  # for debugging
-            #
-            # def grad_check_hook(grad, name):
-            #     if not torch.isfinite(grad).all():
-            #         raise RuntimeError(f"NaN/Inf gradient in {name}")
-            #     return grad
-            #
-            # for name, p in gfn_model.named_parameters():
-            #     if p.requires_grad:
-            #         p.register_hook(lambda g, n=name: grad_check_hook(g, n))
-            #
+            self.set_detect_anomaly(gfn_model, do_anomaly_detection=False)
 
             for step_ind in trange(self.args.epochs + 1):
                 metrics = dict()
@@ -553,6 +541,7 @@ class Modeller:
                         update_ema(gfn_model, ema_model, decay=self.args.ema_decay)
                     else:
                         ema_model = gfn_model
+
                     if step_type == 'Forward':
                         fwd_loss = train_loss
                         if loss_dict is not None:
@@ -580,19 +569,88 @@ class Modeller:
 
                 # evaluation work
                 if (step_ind % self.args.eval_period == 0 and step_ind > 0) or step_ind == 50:
-                    self.eval_work(ema_model, step_ind, name,
+                    self.eval_work(ema_model, step_ind,
                                    buffer, train_mol_loader, test_mol_loader,
                                    energy_function, metrics)
 
+                    if loss_record[-1] == torch.amin(torch.tensor(loss_record)):  # if this is the best model yet
+                        torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train.pt')
+                        torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval.pt')
+
                 # train monitoring
                 if step_ind % 10 == 0:
+                    loss_record.append(fwd_loss + bwd_loss)
                     metrics['train/expl'] = exploration_std(0) if exploration_std is not None else 0
-                    lr_warmup_finished, lr = self.step_lr_schedule(schedulers, optimizers, lr_warmup_finished)
+                    lr = self.step_lr_schedule(schedulers, optimizers)
                     self.anneal_reward(step_ind, temp_annealing_lambda, energy_function)
                     self.ten_step_reporting(bwd_loss, bwd_loss_dict, fwd_loss, fwd_loss_dict, metrics, optimizers)
+                    loss_record = self.check_loss_explosion(name, loss_record, gfn_model, ema_model, optimizers)
                     wandb.log(metrics, step=step_ind)
 
             torch.save(ema_model, f'checkpoints/{name}_model_final.pt')
+
+    def check_loss_explosion(self,
+                             name: str,
+                             loss_record: list,
+                             gfn_model,
+                             ema_model,
+                             optimizers,
+                             explosion_buffer: float = 10,
+                             grace_time: int = 10):
+        """
+        If losses are exploding, reload best prior checkpoint and slash the learning rate
+
+        """
+        if len(loss_record) >= (grace_time * 2):
+            self.increasing_loss_cooldown -= 1
+
+            losses = torch.tensor(loss_record)
+            current_loss = losses[-1]
+            best_loss = torch.amin(losses)
+
+            scale = torch.quantile(torch.abs(losses[:-grace_time] - best_loss), 0.95) + 1e-4
+            threshold = best_loss + scale * explosion_buffer
+            diffs = torch.diff(losses, dim=0)
+
+            hit_threshold = current_loss > threshold
+            increasing_loss = torch.all(diffs[-grace_time:] > 0) and self.increasing_loss_cooldown <= 0
+
+            if hit_threshold or increasing_loss:
+                print("Losses increasing! Reloading best checkpoint and slashing LR.")
+
+                gfn_model.load_state_dict(torch.load(f'checkpoints/{name}_model_train.pt'))
+                ema_model.load_state_dict(torch.load(f'checkpoints/{name}_model_eval.pt'))
+                gfn_model.train()
+                ema_model.eval()
+
+                for opt in optimizers.values():
+                    for g in opt.param_groups:
+                        if g['lr'] > self.args.min_lr:
+                            g['lr'] *= 0.3
+
+                self.lr_warmup_finished = True
+
+                if increasing_loss:
+                    self.increasing_loss_cooldown = grace_time
+
+                if hit_threshold:
+                    to_keep = torch.argwhere(losses <= threshold).flatten().tolist()
+                    loss_record = [rec for ind, rec in enumerate(loss_record) if ind in to_keep]
+
+        return loss_record
+
+    def set_detect_anomaly(self, gfn_model, do_anomaly_detection: bool):
+        if do_anomaly_detection:
+            torch.autograd.set_detect_anomaly(True)  # for debugging
+
+            def grad_check_hook(grad, name):
+                if not torch.isfinite(grad).all():
+                    raise RuntimeError(f"NaN/Inf gradient in {name}")
+                return grad
+
+            for p_name, p in gfn_model.named_parameters():
+                if p.requires_grad:
+                    p.register_hook(lambda g, n=p_name: grad_check_hook(g, n))
 
     def train_step(self,
                    energy_function,
@@ -623,6 +681,8 @@ class Modeller:
                                           correct_orientation=True,
                                           override_random_rotations=random_rotations)
                 mol_batch.embedding = mol_batch.rotate_embedding(random_rotations)
+            else:
+                mol_batch.orient_molecule(mode='std')
 
             loss, crystal_batch, loss_dict = self.fwd_train_step(
                 energy_function,
@@ -785,9 +845,10 @@ class Modeller:
 
         eval_rands = np.random.randint(len(mol_loader.dataset), size=eval_batch_size)
         mol_batch = collate_data_list([mol_loader.dataset[ind] for ind in eval_rands]).to(self.device)
-        if not self.args.molecule_conditioning: # always std orientation if we're not conditioning
+        if not self.args.molecule_conditioning:  # always std orientation if we're not conditioning
             mol_batch.orient_molecule(mode='standard')
         else:  # if we are conditioning, randomly rotate and make sure we catch the embedding
+            # todo functionalize this
             random_rotations = torch.tensor(
                 Rotation.random(num=mol_batch.num_graphs).as_matrix(),
                 device=mol_batch.device, dtype=torch.float32)
@@ -814,7 +875,7 @@ class Modeller:
                       do_figures,
                       mol_batch,
                       bwd_training=len(buffer) > 0,
-                      add_to_buffer=self.args.both_ways))
+                      ))
 
         eval_metrics.update({'Batch Size': self.args.batch_size})
         eval_metrics.update(self.log_elapsed_times())
@@ -874,13 +935,11 @@ class Modeller:
     def eval_work(self,
                   gfn_model,
                   step_ind,
-                  name,
                   buffer,
                   train_mol_loader,
                   test_mol_loader,
                   energy_function,
                   metrics):
-        torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model.pt')
         if self.args.molecule_conditioning or self.args.sg_conditioning:
 
             if step_ind % self.args.conditional_eval_period == 0:  # make conditional sampling figures
@@ -907,23 +966,30 @@ class Modeller:
         wandb.log(metrics, step=step_ind)
 
     def dynamic_quality_management(self, metrics):
-        #minimum_1d_coverage = metrics['Minimum 1d coverage']
+        # minimum_1d_coverage = metrics['Minimum 1d coverage']
         # adjust by a factor of 'multiple' for each 'delta_factor' of miss
-        multiple = 10
-        delta_factor = 5
-        fwd_res = metrics['TB Residual']
-        bwd_res = metrics['Bwd TB Residual']
-        miss = np.log10(fwd_res) - np.log10(bwd_res) # want to push towards zero
+        multiple = 2
+        delta_factor = 2
+        min_rat = 1 / 5
+        max_rat = 1000
+        eps = 1e-6
+        fwd_res = np.log(1 - metrics['Forward TB R Value'] + eps)  # metrics['TB Residual']
+        bwd_res = np.log(1 - metrics['Backward TB R Value'] + eps)  # metrics['Bwd TB Residual']
+        # check the TB losses on forward and backward training
+        miss = fwd_res - bwd_res  # want to push this ratio towards zero
+        # for positive miss, do more forward training
+        # for negative miss, do more backward training
         if self.args.prior_mean_loss_cutoff is not None and self.args.both_ways:
-            # check the TB losses on forward and backward training
-            if 1000 > self.args.fwd_to_bwd_ratio > 0.001:  # don't let it get too crazy
+            # must keep a significant amount of forward training at all times, as this is actually the relevant balancing mechanism
+            if max_rat >= self.args.fwd_to_bwd_ratio >= min_rat:
                 # if miss > self.args.prior_mean_loss_cutoff:
                 gated_miss = np.clip(miss, a_max=delta_factor, a_min=-delta_factor)
                 # when fwd res is large, increase fwd_to_bwd_ratio, and vice-versa
                 adjustment_factor = multiple ** (gated_miss / delta_factor)
                 self.args.fwd_to_bwd_ratio *= adjustment_factor
+                self.args.fwd_to_bwd_ratio = np.clip(self.args.fwd_to_bwd_ratio, a_min=min_rat, a_max=max_rat)
 
-        metrics['Fwd-Bwd Residual Ratio'] = miss
+        metrics['Fwd-Bwd R Value Ratio'] = miss
         if self.args.anneal_repulsion:
             print("We're not doing repulsive annealing anymore!")
 

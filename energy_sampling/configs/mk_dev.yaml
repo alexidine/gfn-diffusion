@@ -3,7 +3,7 @@ tag: 'dev'
 seed: 12345
 device: 'cuda'
 lr_policy: 0.001              # learning rate of the policy network
-min_lr: 1.0e-5                # ihn
+min_lr: 1.0e-6                # ihn
 lr_flow: 1.0                  # learning rate of the flow network
 lr_back: 0.001                # learning rate of the backward pass
 lr_warmup_ratio: 100           # how much smaller the initial (warmup) LR should be than the max policy value
@@ -13,7 +13,7 @@ lr_anneal_time: 40000
 weight_decay: 1e-7
 use_weight_decay: false
 gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weights
-ema_decay: 0.995 #0.999  # set to null for no ema
+ema_decay: 0.99  # set to null for no ema
 
 # model parameters
 zero_init: False
@@ -31,17 +31,17 @@ grow_batch_size: true        # whether to dynamically grow the batch size to fil
 max_batch_size: 5000           # maximum batch size to allow
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
 repeats: 5                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
-eval_batch_size: 1000        # batch size for evaluation
+eval_batch_size: 5000        # batch size for evaluation
 epochs: 1000000             # number of training epochs
 eval_period: 100              # how often to do evaluation & reporting
 conditional_eval_period: 500 # how often to do conditional evaluation with figs # must be multiple of eval period
 figs_period: 500             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # GFlowNet settings
-T: 10                        # static training diffusion length
+T: 15                        # static training diffusion length
 eval_T: 50                  # diffusion trajectory length for inference
 min_traj_length: 10
-max_traj_length: 15
+max_traj_length: 20
 traj_length_strategy: sampled # 'static'  or 'sampled'  will do random between min and max traj lengths
 discretizer_max_ratio: 15    # maximum ratio between randomly sampled step sizes - needs to be >25 for 15 steps, or 10 for 30 steps to get good coverage at extrema
 discretizer: 'random'        # 'random' 'low_discrepancy' 'equidistant' 'uniform'
@@ -69,11 +69,11 @@ fwd_loss_coeffs:
   buffer_gamma:     0
   loss_clip:        1.0E+9
 bwd_loss_coeffs:
-  tb:               1.0 #[[0, 1], [1000, 1], [2000, 0]]
-  vg_lb:            0.0
+  tb:               1.0
+  vg_lb:            0
   vg_lme:           0  # exclusive with vg_lb
   emp_z:            0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
-  mle:              0.0  # will do weighted MLE if VG is running, otherwise trajectory-wise
+  mle:              0 #[[0, 1.0], [1000, 1.0], [2000, 0.0]]  # will do weighted MLE if VG is running, otherwise trajectory-wise
   mle_prior_fraction: 0.0  # what fraction of samples to replace with SG-wise unconditional prior
   pmle_std:         0.01 # std deviation of the prior mle distribution. Best to start small (1) and smoothly grow
   loss_clip:        1.0E+9
@@ -82,7 +82,7 @@ prior_mean_loss_cutoff: 2  # or None  # value of minimum 1D coverage below which
 prior_coverage_ratio: 0.05  # [0, 1] fraction of uniform bin coverage that will satisfy the coverage metric
 both_ways: true             # forward and backward training
 bwd_batch_multiplier: 1      # ratio of backward to foward batch size (much cheaper to evaluate)
-fwd_to_bwd_ratio: 0.25           # whether to do forward (>1) or backward (<1) training more often
+fwd_to_bwd_ratio: 1.0           # whether to do forward (>1) or backward (<1) training more often
 bwd: false                   # backward training only
 learn_pb: True               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
 learned_variance: True       # whether to learn policy variance

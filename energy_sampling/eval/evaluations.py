@@ -5,6 +5,7 @@ import numpy as np
 import plotly.colors as pc
 import plotly.graph_objects as go
 import torch
+import torch.nn.functional as F
 import wandb
 from plotly.subplots import make_subplots
 from scipy.ndimage import gaussian_filter
@@ -17,7 +18,7 @@ from skimage.segmentation import watershed
 from umap import UMAP
 
 from energy_sampling.eval.utils import sample_eval_fwd_trajs, get_plotly_fig_size_mb
-from energy_sampling.utils import logmeanexp, sample_crystal_prior, manual_batch_to_data_list
+from energy_sampling.utils import logmeanexp, sample_crystal_prior
 from mxtaltools.common.utils import get_point_density
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.reporting.figures import simple_cell_hist, simple_cell_scatter_fig, \
@@ -34,7 +35,7 @@ def eval_step(energy_function,
               do_figures: bool = True,
               mol_batch=None,
               bwd_training: bool = False,
-              add_to_buffer: bool = False):
+              ):
     gfn_model.eval()
 
     (flow_states, samples, log_r, log_Z, log_Z_lb,
@@ -164,7 +165,7 @@ def fwd_figs(buffer, flow_states,
         pass
 
     log_fwd_traj_params(gauss_params_f, fig_dict, flow_states, log_pbs, log_pfs, log_r)
-    fig_dict['TB Parity Plot'], fig_dict['Forward TB R Value'] = flow_parity_plot(log_r, log_flow, log_pbs, log_pfs)
+    fig_dict['TB Parity Plot'], _ = flow_parity_plot(log_r, log_flow, log_pbs, log_pfs)
     fig_dict['VG Error'] = vargrad_error(log_r, log_pbs, log_pfs)
     fig_dict['TB Residual vs R'] = xy_scatter_plot(
         log_r,
@@ -706,6 +707,9 @@ def bwd_figs(metrics, fig_dict, buffer, gfn_model, init_state, discretizer, do_f
     metrics['Mean Bwd F Var'] = b_vars_f.mean()
     fig_dict['Mean Bwd B Var'] = b_vars_b.mean()
 
+    tb_x = b_log_flow.cpu() + b_log_pfs.sum(-1).cpu()
+    tb_y = b_log_r.cpu() + b_log_pbs.sum(-1).cpu()
+    metrics['Backward TB R Value'] = torch.corrcoef(torch.stack([tb_x, tb_y]))[0, 1].item()
 
     log_weight = b_log_r + b_log_pbs.sum(-1).cpu() - b_log_pfs.sum(-1).cpu()
     log_Z_empirical = logmeanexp(log_weight)
@@ -716,7 +720,8 @@ def bwd_figs(metrics, fig_dict, buffer, gfn_model, init_state, discretizer, do_f
 
     log_pf = b_log_pfs.sum(-1)
     log_pb = b_log_pbs.sum(-1)
-    tb_residual = torch.abs(log_pf.cpu() + b_log_flow.cpu() - log_pb.cpu() - b_log_r.cpu())
+    log_ratio = log_pf.cpu() + b_log_flow.cpu() - log_pb.cpu() - b_log_r.cpu()
+    tb_residual = F.smooth_l1_loss(log_ratio, torch.ones_like(log_ratio), reduction='none')
     metrics['Bwd TB Residual'] = tb_residual.mean().item()
     metrics['Bwd Log Z Residual'] = (log_Z_empirical - log_Z_learned).item()
 
@@ -726,7 +731,7 @@ def bwd_figs(metrics, fig_dict, buffer, gfn_model, init_state, discretizer, do_f
             n_trajs=20, log_r=b_log_r.cpu().detach().numpy())
 
         # fig_dict['Backward Pf vs Pb'] = Pf_vs_Pb_fig(b_log_pfs, b_log_pbs, b_log_r)
-        fig_dict['Backward TB Parity Plot'], fig_dict['Backward TB R Value'] = flow_parity_plot(
+        fig_dict['Backward TB Parity Plot'], _ = flow_parity_plot(
             b_log_r.to(b_log_flow.device),
             b_log_flow, b_log_pbs,
             b_log_pfs)
@@ -802,6 +807,10 @@ def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r
     metrics['Empirical log Z LB'] = log_Z_lb.cpu().detach().item()
     metrics['log Z learned'] = log_Z_learned.cpu().detach().item()
 
+    tb_x = log_flow.cpu() + log_pfs.sum(-1).cpu()
+    tb_y = log_r.cpu() + log_pbs.sum(-1).cpu()
+    metrics['Forward TB R Value'] = torch.corrcoef(torch.stack([tb_x, tb_y]))[0, 1].item()
+
     # training coefficients
     for elem in energy_function.__dict__.keys():
         thing = energy_function.__dict__[elem]
@@ -871,7 +880,8 @@ def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r
     # unconditional flow metrics
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
-    tb_residual = torch.abs(log_pf + log_flow - log_pb - log_r)
+    log_ratio = log_pf.cpu() + log_flow.cpu() - log_pb.cpu() - log_r.cpu()
+    tb_residual = F.smooth_l1_loss(log_ratio, torch.ones_like(log_ratio), reduction='none')
     metrics['TB Residual'] = tb_residual.mean().item()
     metrics['Log Z Residual'] = (log_Z_empirical - log_Z_learned).item()
 

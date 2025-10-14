@@ -115,10 +115,8 @@ class GFN(nn.Module):
     def get_traj_fwd(self, initial_state, discretizer, exploration_std, condition,
                      return_gauss_params: bool = False, detach_traj: bool = True):
         batch_size = initial_state.shape[0]
-
         ts = discretizer(batch_size).to(self.device)
         trajectory_length = ts.shape[1] - 1
-
         logpb, logpf, states, means_f, logvars_f, means_b, logvars_b = self.init_traj_tensors(batch_size,
                                                                                               trajectory_length)
 
@@ -186,7 +184,6 @@ class GFN(nn.Module):
     def get_traj_bwd(self, terminal_state, discretizer, condition,
                      return_gauss_params: bool = False, detach_traj: bool = False):
         batch_size = terminal_state.shape[0]
-
         ts = discretizer(batch_size).to(self.device)
         trajectory_length = ts.shape[1] - 1
 
