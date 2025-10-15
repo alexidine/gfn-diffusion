@@ -709,7 +709,9 @@ def bwd_figs(metrics, fig_dict, buffer, gfn_model, init_state, discretizer, do_f
 
     tb_x = b_log_flow.cpu() + b_log_pfs.sum(-1).cpu()
     tb_y = b_log_r.cpu() + b_log_pbs.sum(-1).cpu()
-    metrics['Backward TB R Value'] = torch.corrcoef(torch.stack([tb_x, tb_y]))[0, 1].item()
+    high_cut, low_cut = torch.quantile(b_log_r, 0.9), torch.quantile(b_log_r, 0.1)
+    good_inds = ((high_cut >= b_log_r) * (b_log_r >= low_cut)).cpu()
+    metrics['Backward TB R Value'] = torch.corrcoef(torch.stack([tb_x[good_inds], tb_y[good_inds]]))[0, 1].item()
 
     log_weight = b_log_r + b_log_pbs.sum(-1).cpu() - b_log_pfs.sum(-1).cpu()
     log_Z_empirical = logmeanexp(log_weight)
@@ -809,7 +811,9 @@ def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r
 
     tb_x = log_flow.cpu() + log_pfs.sum(-1).cpu()
     tb_y = log_r.cpu() + log_pbs.sum(-1).cpu()
-    metrics['Forward TB R Value'] = torch.corrcoef(torch.stack([tb_x, tb_y]))[0, 1].item()
+    high_cut, low_cut = torch.quantile(log_r, 0.9), torch.quantile(log_r, 0.1)
+    good_inds = ((high_cut >= log_r) * (log_r >= low_cut)).cpu()
+    metrics['Forward TB R Value'] = torch.corrcoef(torch.stack([tb_x[good_inds], tb_y[good_inds]]))[0, 1].item()
 
     # training coefficients
     for elem in energy_function.__dict__.keys():

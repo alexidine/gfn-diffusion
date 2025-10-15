@@ -24,13 +24,13 @@ bwd_loss_coeffs:
   vg_lb: 0
   vg_lme: 0
 clipping: true
-condition_emb_dim: 1024
+condition_emb_dim: 512
 conditional_eval_period: 2000
 core_start_time: 0
 device: cuda
 discretizer: random
 discretizer_max_ratio: 15
-dropout: 0.5
+dropout: 0.0
 ellipsoid_scale: -0.5
 ema_decay: 0.995
 energy: molecular_crystal
@@ -70,8 +70,8 @@ gfn_clip: 200.0
 gradient_norm_clip: 0.1
 grow_batch_size: true
 harmonics_dim: 64
-hidden_dim: 1024
-joint_layers: 8
+hidden_dim: 512
+joint_layers: 4
 learn_pb: true
 learned_variance: true
 lj_repulsion: 0.5
@@ -101,8 +101,8 @@ prior_coverage_ratio: 0.05
 prioritized: null
 rank_weight: 1.0
 repeats: 5
-run_name: 5_bignorm
-s_emb_dim: 1024
+run_name: 0_baseline
+s_emb_dim: 512
 sampling: buffer
 scheduler: true
 seed: 12345
@@ -115,7 +115,7 @@ space_groups:
 - 15
 - 19
 - 33
-t_emb_dim: 1024
+t_emb_dim: 512
 t_scale: 0.1
 tag: qm9_1
 temp_annealing_max_steps: 2000
