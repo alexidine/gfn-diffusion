@@ -111,7 +111,7 @@ space_groups:
 - 2
 t_emb_dim: 512
 t_scale: 0.1
-tag: nic_1
+tag: nic_2
 temp_annealing_max_steps: 2000
 temperature_conditioning: false
 temperature_scaling_factor: 0.01

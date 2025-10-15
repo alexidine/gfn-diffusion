@@ -5,7 +5,7 @@ anneal_repulsion_cutoff: 0.5
 anneal_temperature: false
 autoencoder_path: /scratch/mk8347/csd_runs/models/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05
 batch_growth_increment: 1.01
-batch_size: 1000
+batch_size: 100
 beta: 1.0
 both_ways: true
 bounding_coeff: 1.0
@@ -71,7 +71,7 @@ gradient_norm_clip: 0.1
 grow_batch_size: true
 harmonics_dim: 64
 hidden_dim: 512
-joint_layers: 4
+joint_layers: 8
 learn_pb: true
 learned_variance: true
 lj_repulsion: 1.0
@@ -84,7 +84,7 @@ lr_flow: 1.0
 lr_policy: 0.001
 lr_warmup_ratio: 100
 lr_warmup_time: 500
-max_batch_size: 5000
+max_batch_size: 1000
 max_traj_length: 15
 min_lr: 1.0e-05
 min_traj_length: 10
@@ -95,13 +95,13 @@ molecules_path: /scratch/mk8347/csd_runs/datasets/nicotinamide.pt
 niggli_coeff: 10.0
 norm: null
 pb_drift_range: 0.2
-pb_var_range: 2
+pb_var_range: 4
 prior_coverage_ratio: 0.05
 prior_mean_loss_cutoff: 2
 prioritized: null
 rank_weight: 1.0
 repeats: 5
-run_name: 3_big_fwd_var
+run_name: 3_smallbatch
 s_emb_dim: 512
 sampling: buffer
 scheduler: true
@@ -111,7 +111,7 @@ space_groups:
 - 2
 t_emb_dim: 512
 t_scale: 0.1
-tag: nic_1
+tag: nic_2
 temp_annealing_max_steps: 2000
 temperature_conditioning: false
 temperature_scaling_factor: 0.01
