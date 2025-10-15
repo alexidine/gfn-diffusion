@@ -115,8 +115,7 @@ def conditional_eval_step(energy_function,
 
     (flow_states, samples, log_r, log_Z, log_Z_lb,
      log_Z_learned, sample_batch, condition, log_pfs, log_pbs, log_flow,
-     f_means_f, f_vars_f, f_means_b, f_vars_b,
-     log_T_tensor) = sample_eval_fwd_trajs(
+     gauss_params,log_T_tensor) = sample_eval_fwd_trajs(
         init_state, gfn_model, discretizer, energy_function, mol_batch)
 
     metrics = {}
