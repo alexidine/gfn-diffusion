@@ -862,7 +862,7 @@ class Modeller:
             mol_batch.orient_molecule(mode='random',
                                       include_inversion=False,
                                       correct_orientation=True,
-                                      random_rotations=random_rotations
+                                      override_random_rotations=random_rotations
                                       )
 
             mol_batch.embedding = mol_batch.rotate_embedding(random_rotations)
