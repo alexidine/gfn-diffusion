@@ -4,6 +4,7 @@ anneal_repulsion: false
 anneal_repulsion_cutoff: 0.5
 anneal_temperature: false
 autoencoder_path: /scratch/mk8347/csd_runs/models/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05
+automatic_fwd_bwd_balance: false
 batch_growth_increment: 1.01
 batch_size: 1000
 beta: 1.0
@@ -101,6 +102,7 @@ prior_coverage_ratio: 0.05
 prioritized: null
 rank_weight: 1.0
 repeats: 5
+rotation_mode: wrapped
 run_name: 1_flexible
 s_emb_dim: 512
 sampling: buffer

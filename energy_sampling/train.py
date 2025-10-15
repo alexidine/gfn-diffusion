@@ -297,7 +297,9 @@ class Modeller:
             dropout=self.args.dropout,
             norm=self.args.norm,
             zero_init=self.args.zero_init,
-            device=self.device
+            device=self.device,
+            rot_mode=self.args.rotation_mode,
+            max_z_prime=max(self.args.z_primes),
         )
         gfn_model = GFN(**gfn_config).to(self.device)
 
@@ -773,7 +775,8 @@ class Modeller:
         if self.args.sampling == 'buffer':
             samples, rewards, crystal_batch, condition = buffer.sample(
                 override_batch=int(self.args.batch_size * self.args.bwd_batch_multiplier),
-                randomize_orientations=True if self.args.molecule_conditioning else False)
+                randomize_orientations=True if self.args.molecule_conditioning else False,
+            override_rot_mode=self.args.rotation_mode)
         else:
             assert False, f"sampling method {self.args.sampling} not implemented"
 
@@ -985,7 +988,7 @@ class Modeller:
         miss = fwd_res - bwd_res  # want to push this ratio towards zero
         # for positive miss, do more forward training
         # for negative miss, do more backward training
-        if self.args.both_ways:
+        if self.args.both_ways and self.args.automatic_fwd_bwd_balance:
             # must keep a significant amount of forward training at all times, as this is actually the relevant balancing mechanism
             if max_rat >= self.args.fwd_to_bwd_ratio >= min_rat:
                 # if miss > self.args.prior_mean_loss_cutoff:

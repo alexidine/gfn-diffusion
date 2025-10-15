@@ -24,7 +24,10 @@ class GFN(nn.Module):
                  conditional_flow_model: bool = False,
                  learn_pb: bool = False, joint_layers: int = 2,
                  dropout: Optional[float] = 0, norm: Optional[str] = None,
-                 zero_init: bool = False, device=torch.device('cuda')):
+                 zero_init: bool = False, device=torch.device('cuda'),
+                 rot_mode: str = 'wrapped',
+                 max_z_prime: int = 1,
+                 ):
         super(GFN, self).__init__()
         self.dim = dim
         self.harmonics_dim = harmonics_dim
@@ -48,12 +51,25 @@ class GFN(nn.Module):
         self.log_var_range = log_var_range
         self.var_clip = 16
         self.device = device
+        self.max_z_prime = max_z_prime
+        self.rot_mode = rot_mode
 
-        # self.ANG_MASK = torch.tensor([False] * 9 + [True] * 3) # can put this in config
-        self.ang_mask = torch.tensor([False, False, False,
-                                      False, False, False,
-                                      False, False, False,
-                                      False, False, False])
+        if rot_mode == 'wrapped':
+            angs = [False] * 6
+            for zp in range(self.max_z_prime):
+                angs.extend([False, False, False,
+                             False, True, True])
+                # phi and r dimensions arein rotational basis
+            self.ang_mask = torch.tensor(angs, device=device)
+        elif rot_mode == 'linear':
+            self.ang_mask = torch.tensor([False, False, False,
+                                          False, False, False,
+                                          False, False, False,
+                                          False, False, False],
+                                         device=device)
+        else:
+            assert False, "Must choose a valid rotational mode"
+
         self.ang_dim = (self.ang_mask == True).sum().item()
         self.lin_dim = self.dim - self.ang_dim
         self.expanded_dim = self.lin_dim + self.ang_dim * 2
@@ -167,10 +183,9 @@ class GFN(nn.Module):
             states[:, i + 1] = current_state
 
             if return_gauss_params:
-                means_b[:, i, :] = back_drift.detach()
-                logvars_b[:, i, :] = (back_var / dts[:, None]).log().detach()
-                means_f[:, i, :] = (fwd_drift).detach()
-                logvars_f[:, i, :] = pflogvars.detach()
+                self.log_gauss_params(back_drift, back_var, dts, fwd_drift, i,
+                                      logvars_b, logvars_f, means_b, means_f,
+                                      pflogvars)
 
         logpfs = torch.stack(logpf).T
         logpbs = torch.stack(logpb).T
@@ -180,6 +195,12 @@ class GFN(nn.Module):
                     means_b.mean(-1), logvars_b.mean(-1))
         else:
             return states, logpfs, logpbs, logf
+
+    def log_gauss_params(self, back_drift, back_var, dts, fwd_drift, i, logvars_b, logvars_f, means_b, means_f, pflogvars):
+        means_b[:, i, :] = back_drift.detach()
+        logvars_b[:, i, :] = (back_var / dts[:, None]).log().detach()
+        means_f[:, i, :] = fwd_drift.detach()
+        logvars_f[:, i, :] = pflogvars.detach()
 
     def get_traj_bwd(self, terminal_state, discretizer, condition,
                      return_gauss_params: bool = False, detach_traj: bool = False):
@@ -247,10 +268,8 @@ class GFN(nn.Module):
             logpf.append(self.gauss_logprob(current_state - prev_state, fwd_drift, fwd_var))
 
             if return_gauss_params:
-                means_b[:, i, :] = back_drift.detach()
-                logvars_b[:, i, :] = (back_var / dts[:, None]).log().detach()
-                means_f[:, i, :] = (fwd_drift).detach()
-                logvars_f[:, i, :] = pflogvars.detach()
+                self.log_gauss_params(back_drift, back_var, dts, fwd_drift, i, logvars_b, logvars_f, means_b, means_f,
+                                      pflogvars)
 
             current_state = prev_state
             if self.ang_dim > 0:
@@ -353,14 +372,14 @@ class GFN(nn.Module):
 
     def wrap_to_pi(self, x):
         # (-pi, pi]
-        return (x + math.pi) % (2 * math.pi) - math.pi
+        return (x + torch.pi) % (2 * torch.pi) - torch.pi
 
     def expand_state_for_policy(self, state):
-        lin = state[..., ~self.ang_mask]  # [B, 9]
-        ang = state[..., self.ang_mask]  # [B, 3]
-        sin, cos = torch.sin(ang), torch.cos(ang)  # [B, 3] each
+        lin = state[..., ~self.ang_mask]  # [B, 10]
+        ang = state[..., self.ang_mask]  # [B, 2]
+        sin, cos = torch.sin(ang), torch.cos(ang)  # [B, 2] each
         orient = torch.stack([sin, cos], dim=-1).reshape(state.size(0), self.ang_dim * 2) # [B, 6]
-        return torch.cat([lin, orient], dim=-1)  # [B, 15]
+        return torch.cat([lin, orient], dim=-1)  # [B, 6 + 8*zp]
 
     def gauss_logprob(self, delta_x, drift, var):
         noise = (delta_x - drift) / var.sqrt()

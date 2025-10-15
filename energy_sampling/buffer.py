@@ -186,6 +186,7 @@ class CrystalReplayBuffer:
                return_preload: Optional[bool] = False,
                override_sampler: Optional[str] = None,
                randomize_orientations: Optional[bool] = False,
+               override_rot_mode: Optional[str] = None,
                ):
 
         if override_batch is not None:
@@ -240,7 +241,10 @@ class CrystalReplayBuffer:
         reward = self.energy_function.prebuilt_sample_to_reward(
             sample_batch, temperature)  # recompute reward in case parameters have changed
 
-        return sample_batch.latent_params(), reward, sample_batch, condition
+        if hasattr(sample_batch,'latent_transform'):
+            del sample_batch.latent_transform
+        latents = sample_batch.latent_params(override_mode=override_rot_mode)
+        return latents, reward, sample_batch, condition
 
     def init_loader(self):
         self.loader = DataLoader(

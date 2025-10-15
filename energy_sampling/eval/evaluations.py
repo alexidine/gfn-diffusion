@@ -179,10 +179,10 @@ def fwd_figs(buffer, flow_states,
 
     fig_dict['Lattice Features Distribution'], cell_klds = (
         simple_cell_hist(sample_batch, buffer_cell_params,
-                         n_kde_points=200, bw_ratio=10, mode='cell'))
+                         n_kde_points=200, bw_ratio=20, mode='cell'))
     fig_dict['Lattice Latents Distribution'], latent_klds = (
         simple_cell_hist(sample_batch, buffer_latent_params,
-                         n_kde_points=200, bw_ratio=10,
+                         n_kde_points=200, bw_ratio=20,
                          mode='latent'))
     _, fig_dict['Pf Parity R Value'] = pf_parity_plot(log_pfs, log_pbs, log_r, log_flow)
 
@@ -696,7 +696,8 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
 
 def bwd_figs(metrics, fig_dict, buffer, gfn_model, init_state, discretizer, do_figs: Optional[bool] = False):
     terminal_state, b_log_r, crystal_batch, condition = buffer.sample(
-        override_batch=len(init_state))
+        override_batch=len(init_state),
+    override_rot_mode=gfn_model.rot_mode)
     (backward_flow_states, b_log_pfs, b_log_pbs, b_log_flow,
      b_means_f, b_vars_f, b_means_b, b_vars_b) = gfn_model.get_traj_bwd(
         terminal_state.to(gfn_model.device), discretizer, condition.to(gfn_model.device), return_gauss_params=True)
@@ -753,10 +754,11 @@ def get_buffer_stats(buffer):
     if len(buffer) > 0:
         samples_to_take = min(10000, len(buffer))
         # take samples according to the sampler weighting, rather than random trash in the buffer
-        buffer_latent_params, buffer_reward, buffer_batch, condition = buffer.sample(
+        _, buffer_reward, buffer_batch, condition = buffer.sample(
             override_batch=samples_to_take)
         buffer_cell_params = buffer_batch.zp1_cell_parameters().cpu().detach().numpy()
-        buffer_latent_params = buffer_batch.latent_params().cpu().detach().numpy()
+        del buffer_batch.latent_transform
+        buffer_latent_params = buffer_batch.latent_params(override_mode='wrapped').cpu().detach().numpy()
         buffer_std_params_for_embedding = buffer_batch.latent_params().cpu().detach().numpy()
         reward = buffer_reward.cpu().detach().numpy()
         batch = buffer_batch.cpu().detach()
@@ -900,7 +902,8 @@ def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r
 def sample_backward_prior(args, buffer, sample_batch, num_samples):
     if buffer is not None:
         if len(buffer) > 0:
-            prior_sample, _, _, _ = buffer.sample(override_batch=num_samples)
+            prior_sample, _, _, _ = buffer.sample(override_batch=num_samples,
+                                                  override_rot_mode=args.rotation_mode)
         else:
             prior_sample = sample_crystal_prior(sample_batch, args.bwd_loss_coeffs.pmle_std)
     else:
@@ -1035,6 +1038,11 @@ def visualize_latent_trajs(states, n_trajs, log_r):
             ),
                 row=row, col=col
             )
+    custom_ranges = {i: [-6.5, 6.5] for i in range(len(lattice_features))}
+    for i in range(len(lattice_features)):
+        row = i // 3 + 1
+        col = i % 3 + 1
+        fig.update_xaxes(range=custom_ranges[i], row=row, col=col)
     return fig
 
 

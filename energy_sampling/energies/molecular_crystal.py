@@ -134,6 +134,7 @@ class MolecularCrystal(BaseSet):
                  niggli_coeff: float = 1.0,
                  max_z_prime: int = 1,
                  z_primes: Tuple[int] = (1,),
+                 rot_mode: str = 'wrapped',
                  ):
 
         super(MolecularCrystal, self).__init__()
@@ -160,10 +161,12 @@ class MolecularCrystal(BaseSet):
         self.space_groups = space_groups
         self.max_z_prime = max_z_prime
         self.z_primes = z_primes
+        self.rot_mode = rot_mode
 
         self.temperature = temperature  # for static temperature work
 
         self.batch = collate_data_list([MolCrystalData(max_z_prime=max_z_prime)], max_z_prime=max_z_prime)
+        self.batch.rot_mode = self.rot_mode
 
         self.sg_cache = {}
         for sg in range(1, 230):

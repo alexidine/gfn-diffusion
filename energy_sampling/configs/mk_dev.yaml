@@ -28,16 +28,17 @@ norm: layer                   # null, "layer", "batch"
 
 batch_size: 100              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 200           # maximum batch size to allow
+max_batch_size: 500           # maximum batch size to allow
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
 repeats: 5                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
 eval_batch_size: 5000        # batch size for evaluation
 epochs: 1000000             # number of training epochs
 eval_period: 100              # how often to do evaluation & reporting
-conditional_eval_period: 500 # how often to do conditional evaluation with figs # must be multiple of eval period
-figs_period: 500             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+conditional_eval_period: 100 # how often to do conditional evaluation with figs # must be multiple of eval period
+figs_period: 100             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # GFlowNet settings
+rotation_mode: 'wrapped' # wrapped or linear <- treatment of angular DoF
 T: 15                        # static training diffusion length
 eval_T: 50                  # diffusion trajectory length for inference
 min_traj_length: 20
@@ -69,21 +70,22 @@ fwd_loss_coeffs:
   buffer_gamma:     0
   loss_clip:        1.0E+9
 bwd_loss_coeffs:
-  tb:               1.0
+  tb:               0.01
   vg_lb:            0
   vg_lme:           0  # exclusive with vg_lb
   emp_z:            0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
-  mle:              0 #[[0, 1.0], [1000, 1.0], [2000, 0.0]]  # will do weighted MLE if VG is running, otherwise trajectory-wise
+  mle:              1.0 #[[0, 1.0], [1000, 1.0], [2000, 0.0]]  # will do weighted MLE if VG is running, otherwise trajectory-wise
   mle_prior_fraction: 0.0  # what fraction of samples to replace with SG-wise unconditional prior
   pmle_std:         0.01 # std deviation of the prior mle distribution. Best to start small (1) and smoothly grow
   loss_clip:        1.0E+9
 
+automatic_fwd_bwd_balance: False
 prior_mean_loss_cutoff: 2  # or None  # value of minimum 1D coverage below which we penalize forward training in favour of backward
 prior_coverage_ratio: 0.05  # [0, 1] fraction of uniform bin coverage that will satisfy the coverage metric
-both_ways: true             # forward and backward training
+both_ways: false             # forward and backward training
 bwd_batch_multiplier: 1      # ratio of backward to foward batch size (much cheaper to evaluate)
-fwd_to_bwd_ratio: 1.0           # whether to do forward (>1) or backward (<1) training more often
-bwd: false                   # backward training only
+fwd_to_bwd_ratio: 1           # whether to do forward (>1) or backward (<1) training more often
+bwd: true                   # backward training only
 learn_pb: True               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
 learned_variance: True       # whether to learn policy variance
 clipping: true  # clip the maximum step size induced by the policy model

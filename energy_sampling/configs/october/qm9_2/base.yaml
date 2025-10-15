@@ -38,6 +38,7 @@ conditional_eval_period: 2000 # how often to do conditional evaluation with figs
 figs_period: 2000             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # GFlowNet settings
+rotation_mode: 'wrapped' # wrapped or linear <- treatment of angular DoF
 T: 10                        # static training diffusion length
 eval_T: 50                  # diffusion trajectory length for inference
 min_traj_length: 20
@@ -78,6 +79,7 @@ bwd_loss_coeffs:
   pmle_std:         0.01 # std deviation of the prior mle distribution. Best to start small (1) and smoothly grow
   loss_clip:        1.0E+9
 
+automatic_fwd_bwd_balance: False
 prior_coverage_cutoff: 0.75  # or None  # value of minimum 1D coverage below which we penalize forward training in favour of backward
 prior_coverage_ratio: 0.05  # [0, 1] fraction of uniform bin coverage that will satisfy the coverage metric
 both_ways: False             # forward and backward training
