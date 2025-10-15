@@ -985,7 +985,7 @@ class Modeller:
         miss = fwd_res - bwd_res  # want to push this ratio towards zero
         # for positive miss, do more forward training
         # for negative miss, do more backward training
-        if self.args.prior_mean_loss_cutoff is not None and self.args.both_ways:
+        if self.args.both_ways:
             # must keep a significant amount of forward training at all times, as this is actually the relevant balancing mechanism
             if max_rat >= self.args.fwd_to_bwd_ratio >= min_rat:
                 # if miss > self.args.prior_mean_loss_cutoff:
