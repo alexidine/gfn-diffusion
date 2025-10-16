@@ -369,9 +369,11 @@ class Modeller:
             keep_initial_samples=False,  # self.args.buffer_path is not None,
             diversity_coeff=self.args.buffer_diversity_coeff,
         )
-        if (
-                self.args.both_ways or self.args.bwd) and self.args.buffer_path is not None:  # preload samples into the buffer
-            buffer = self.add_dataset_to_buffer(self.args.buffer_path, buffer, self.args.space_groups)
+        if ((self.args.both_ways or self.args.bwd) and
+                self.args.buffer_path is not None):  # preload samples into the buffer
+            buffer = self.add_dataset_to_buffer(self.args.buffer_path, buffer,
+                                                filter_unbound=True,
+                                                space_groups=self.args.space_groups)
 
         if self.args.molecule == 'urea':
             good_mol = self.init_urea(buffer)
