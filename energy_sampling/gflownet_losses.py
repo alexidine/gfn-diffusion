@@ -261,7 +261,7 @@ def get_gfn_backward_loss(loss_coeffs,
 
     """TB loss"""
     if loss_coeffs.tb > 0:
-        tb_loss = get_tb_loss(log_flow, log_pb, log_pf, log_r, detach_z = False)
+        tb_loss = get_tb_loss(log_flow, log_pb, log_pf, log_r, detach_z = True if loss_coeffs.bwd_tb_z == 1 else False)
         losses.append(tb_loss * loss_coeffs.tb)
 
     if loss_coeffs.mle > 0:

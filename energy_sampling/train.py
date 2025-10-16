@@ -37,6 +37,7 @@ from utils import get_train_args, get_gfn_init_state, set_seed, \
 
 class Modeller:
     def __init__(self):
+        self.hit_init_kld = False
         self.times = {}
         torch.cuda.set_per_process_memory_fraction(0.9, device=0)
         torch.cuda.init()  # create context with the cap already in place
@@ -917,7 +918,8 @@ class Modeller:
 
         return eval_metrics
 
-    def add_dataset_to_buffer(self, dataset_path, buffer, space_groups=None):
+    def add_dataset_to_buffer(self, dataset_path, buffer, filter_unbound=True,
+                              space_groups=None):
         print("Loading prebuilt buffer")
         dataset = torch.load(dataset_path, weights_only=False)
 
@@ -931,6 +933,10 @@ class Modeller:
             print("Re-featurizing preloaded buffer samples")
             dataset = featurize_dataset(dataset, self.device,
                                         self.args.ellipsoid_scale, self.args.lj_repulsion)
+
+        if filter_unbound: # filter non-bound states
+            dataset = [elem for elem in dataset if elem.lj_pot < 0]
+            dataset = [elem for elem in dataset if elem.silu_pot < 0]
 
         if self.args.molecule_conditioning:  # embed dataset
             print("Getting preloaded dataset molecule embeddings")
@@ -975,46 +981,26 @@ class Modeller:
         wandb.log(metrics, step=step_ind)
 
     def dynamic_quality_management(self, metrics):
-        # minimum_1d_coverage = metrics['Minimum 1d coverage']
         # adjust by a factor of 'multiple' for each 'delta_factor' of miss
-        multiple = 2
-        delta_factor = 2
-        min_rat = 1 / 5
+        min_rat = 1/100
         max_rat = 100
-        eps = 1e-6
-        fwd_res = np.log(1 - metrics['Forward TB R Value'] + eps)  # metrics['TB Residual']
-        bwd_res = np.log(1 - metrics['Backward TB R Value'] + eps)  # metrics['Bwd TB Residual']
-        # check the TB losses on forward and backward training
-        miss = fwd_res - bwd_res  # want to push this ratio towards zero
-        # for positive miss, do more forward training
-        # for negative miss, do more backward training
-        if self.args.both_ways and self.args.automatic_fwd_bwd_balance:
-            # must keep a significant amount of forward training at all times, as this is actually the relevant balancing mechanism
-            if max_rat >= self.args.fwd_to_bwd_ratio >= min_rat:
-                # if miss > self.args.prior_mean_loss_cutoff:
-                gated_miss = np.clip(miss, a_max=delta_factor, a_min=-delta_factor)
-                # when fwd res is large, increase fwd_to_bwd_ratio, and vice-versa
-                adjustment_factor = multiple ** (gated_miss / delta_factor)
-                self.args.fwd_to_bwd_ratio *= adjustment_factor
+        metric = metrics['Max Latent KLD']
+        if self.args.kld_threshold is not None and self.args.both_ways:
+            # check if we have hit our initial KLD target
+            if not self.hit_init_kld:
+                if metric <= self.args.init_kld_threshold:
+                    print("Hit initial KLD threshold. Moving to forward training & refinement.")
+                    self.hit_init_kld = True
+                    self.args.bwd_loss_coeffs.bwd_tb_z = 0.0
+                    self.args.bwd_loss_coeffs.tb = 0.0
+                    self.args.fwd_to_bwd_ratio = 0.1
+                    self.increasing_loss_cooldown = 100  # give it time to adjust to new loss landscape
+            else: # if we have hit it, dynamically adjust fwd_to_bwd_ratio to keep it under the threshold
+                err = (metric - self.args.kld_threshold) / self.args.kld_threshold
+                # target the given kld threshold and optimize towards it
+                self.args.fwd_to_bwd_ratio *= np.exp(-0.1 * err)
                 self.args.fwd_to_bwd_ratio = np.clip(self.args.fwd_to_bwd_ratio, a_min=min_rat, a_max=max_rat)
 
-        metrics['Fwd-Bwd R Value Ratio'] = miss
-        if self.args.anneal_repulsion:
-            print("We're not doing repulsive annealing anymore!")
-
-            # reasonable_frac = metrics['Reasonable Sample Fraction']
-            # if (reasonable_frac >= self.args.anneal_repulsion_cutoff) and diversity_check:
-            #     if self.args.lj_repulsion < 1:
-            #         self.args.lj_repulsion = min(1, self.args.lj_repulsion * 1.05)
-            #         energy_function.lj_repulsion = self.args.lj_repulsion
-            #         if buffer is not None:
-            #             if len(buffer) > 0:
-            #                 buffer.recompute_silu_pot(
-            #                     batch_size=min(500, self.args.batch_size),
-            #                     lj_repulsion=self.args.lj_repulsion,
-            #                     device=self.device
-            #                 )
-        metrics['LJ Repulsion'] = self.args.lj_repulsion
         metrics['Fwd to Bwd Ratio'] = self.args.fwd_to_bwd_ratio
 
 

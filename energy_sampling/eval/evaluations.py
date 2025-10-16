@@ -11,7 +11,7 @@ from plotly.subplots import make_subplots
 from scipy.ndimage import gaussian_filter
 from scipy.spatial import Voronoi, KDTree
 from scipy.spatial.distance import cdist
-from scipy.stats import linregress, gaussian_kde
+from scipy.stats import linregress, gaussian_kde, entropy
 from scipy.stats import pearsonr
 from skimage.feature import peak_local_max
 from skimage.segmentation import watershed
@@ -23,6 +23,7 @@ from mxtaltools.common.utils import get_point_density
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.reporting.figures import simple_cell_hist, simple_cell_scatter_fig, \
     log_crystal_samples, conditional_simple_cell_hist
+from mxtaltools.reporting.utils import lightweight_one_sided_violin
 
 
 @torch.no_grad()
@@ -177,16 +178,15 @@ def fwd_figs(buffer, flow_states,
                                                                       20,
                                                                       log_r.cpu().detach().numpy())
 
-    fig_dict['Lattice Features Distribution'], cell_klds = (
+    fig_dict['Lattice Features Distribution'] = (
         simple_cell_hist(sample_batch, buffer_cell_params,
                          n_kde_points=200, bw_ratio=20, mode='cell'))
-    fig_dict['Lattice Latents Distribution'], latent_klds = (
+    fig_dict['Lattice Latents Distribution'] = (
         simple_cell_hist(sample_batch, buffer_latent_params,
                          n_kde_points=200, bw_ratio=20,
                          mode='latent'))
     _, fig_dict['Pf Parity R Value'] = pf_parity_plot(log_pfs, log_pbs, log_r, log_flow)
 
-    log_buffer_kld(cell_klds, fig_dict, latent_klds)
 
     fig_dict['Sample Scatter'] = simple_cell_scatter_fig(
         sample_batch,
@@ -221,17 +221,19 @@ def mean_var_fig(logvars_f, means_f, logvars_b, means_b):
     return fig
 
 
-def log_buffer_kld(cell_klds, fig_dict, latent_klds):
+def log_buffer_kld(cell_klds, metrics, latent_klds):
     lattice_features = ['cell_a', 'cell_b', 'cell_c',
                         'cell_alpha', 'cell_beta', 'cell_gamma',
                         'aunit_x', 'aunit_y', 'aunit_z',
                         'orientation_1', 'orientation_2', 'orientation_3']
     if len(cell_klds) == len(lattice_features):
         for ind, feat in enumerate(lattice_features):
-            fig_dict[f'{feat} Cell KLD'] = cell_klds[ind]
-            fig_dict[f'{feat} Latent KLD'] = latent_klds[ind]
-        fig_dict['Mean Cell KLD'] = np.mean(cell_klds)
-        fig_dict['Mean Latent KLD'] = np.mean(latent_klds)
+            metrics[f'{feat} Cell KLD'] = cell_klds[ind]
+            metrics[f'{feat} Latent KLD'] = latent_klds[ind]
+        metrics['Mean Cell KLD'] = np.mean(cell_klds)
+        metrics['Mean Latent KLD'] = np.mean(latent_klds)
+        metrics['Max Cell KLD'] = np.max(cell_klds)
+        metrics['Max Latent KLD'] = np.max(latent_klds)
 
 
 def known_mode_coverage(energy_function, fig_dict, std_cell_params):
@@ -868,6 +870,22 @@ def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r
             ])
             metrics['Buffer Mean Score'] = np.mean(buffer.rewards_list)
 
+        (buffer_cell_params, buffer_latent_params,
+         buffer_std_params, buffer_reward,
+         buffer_batch, buffer_sg_inds) = get_buffer_stats(buffer)
+
+        cell_params = sample_batch.zp1_cell_parameters().cpu().detach().numpy()
+        del sample_batch.latent_transform
+        latent_params = sample_batch.latent_params(override_mode='wrapped').cpu().detach().numpy()
+
+        cell_klds = np.zeros(cell_params.shape[1])
+        latent_klds = np.zeros(latent_params.shape[1])
+        for ind in range(len(cell_klds)):
+            cell_klds[ind] = compute_1d_kld(cell_params[:, ind], buffer_cell_params[:, ind])
+            latent_klds[ind] = compute_1d_kld(latent_params[:, ind], buffer_latent_params[:, ind])
+
+        log_buffer_kld(cell_klds, metrics, latent_klds)
+
     prior_sample = sample_backward_prior(args, buffer, sample_batch, len(std_params))
 
     # this isn't SG conditioned, but that's OK because we're not really using it anymore anyway
@@ -897,6 +915,54 @@ def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r
     metrics = {k: to_loggable(v) for k, v in metrics.items()}
 
     return metrics
+
+
+def compute_1d_kld(p_data: np.ndarray,
+                   q_data: np.ndarray,
+                   n_kde_points=200,
+                   bw_ratio = 0.1,
+                   epsilon: float = 1e-4):
+    """
+    :param p_data: reference distribution
+    :param q_data: sample distribution
+    :param n_bins:
+    :param eps:
+    :return:
+    """
+    data_range = [min(np.amin(p_data), np.amin(q_data)), max(np.amax(p_data), np.amax(q_data))]
+    x_samp, y_samp = lightweight_one_sided_violin(
+        q_data, n_kde_points,
+        bandwidth_factor=bw_ratio,
+        data_min=data_range[0],
+        data_max=data_range[1],
+    )
+    x_ref, y_ref = lightweight_one_sided_violin(
+        p_data, n_kde_points,
+        bandwidth_factor=bw_ratio,
+        data_min=data_range[0],
+        data_max=data_range[1],
+    )
+
+    x_common = x_samp
+
+    # Remove the arbitrary "width" scaling for probability normalization
+    y_ref = np.maximum(y_ref, epsilon)
+    y_q   = np.maximum(y_samp, epsilon)
+    P = y_ref / np.trapz(y_ref, x_common)
+    Q = y_q / np.trapz(y_q, x_common)
+
+    kl = np.trapz(P * np.log((P + epsilon) / (Q + epsilon)), x_common)
+    return kl
+    """
+    #visually examine
+    
+    import plotly.graph_objects as go
+    fig = go.Figure()
+    fig.add_scatter(x=x_samp, y=y_samp)
+    fig.add_scatter(x=x_ref,y=y_ref)
+    fig.show()
+   
+    """
 
 
 def sample_backward_prior(args, buffer, sample_batch, num_samples):
