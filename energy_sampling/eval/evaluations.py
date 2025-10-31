@@ -102,11 +102,14 @@ def conditional_eval_step(energy_function,
                           discretizer,
                           init_state,
                           mol_batch,
-                          mols_to_sample: int = 10
+                          mols_to_sample: int = 10,
+                          sample_sgs = None
+
                           ):
     gfn_model.eval()
     # pick some molecules
-    mols_to_sample_list = mol_batch.to_data_list()[:mols_to_sample]
+    rands = np.random.choice(mol_batch.num_graphs, mols_to_sample, replace=False)
+    mols_to_sample_list = [elem for i, elem in enumerate(mol_batch.to_data_list()) if i in rands]
     # ensure a clean batch
     samples_per_mol = len(init_state) // mols_to_sample
     init_state = init_state[:samples_per_mol * mols_to_sample]
@@ -114,10 +117,22 @@ def conditional_eval_step(energy_function,
     mol_batch = collate_data_list(mols_to_sample_list * samples_per_mol)
     cond_inds = torch.tensor([_ for _ in range(mols_to_sample)] * (samples_per_mol), dtype=torch.long)
 
+    if sample_sgs is not None:
+        sg_inds = torch.tensor(
+            np.random.choice(sample_sgs, mols_to_sample),
+            dtype=torch.long,
+            device=mol_batch.device
+        )
+        sg_inds = sg_inds.repeat(samples_per_mol)
+    else:
+        sg_inds = None
+
     (flow_states, samples, log_r, log_Z, log_Z_lb,
      log_Z_learned, sample_batch, condition, log_pfs, log_pbs, log_flow,
-     gauss_params,log_T_tensor) = sample_eval_fwd_trajs(
-        init_state, gfn_model, discretizer, energy_function, mol_batch)
+     gauss_params, log_T_tensor) = sample_eval_fwd_trajs(
+        init_state, gfn_model, discretizer, energy_function, mol_batch,
+        sg_inds=sg_inds,
+    )
 
     metrics = {}
     fig_dict = conditional_fwd_figs(
@@ -127,7 +142,8 @@ def conditional_eval_step(energy_function,
         log_r,
         sample_batch.detach().cpu(),
         cond_inds,
-        log_T_tensor)
+        log_T_tensor,
+    )
 
     adjust_fig_filesize(fig_dict)
     metrics.update(fig_dict)
@@ -160,7 +176,7 @@ def fwd_figs(buffer, flow_states,
      buffer_batch, buffer_sg_inds) = get_buffer_stats(buffer)
 
     try:
-        fig_dict['Boltzmann Fit'] = boltzmann_fig(log_r)
+        fig_dict['Boltzmann Fit'], fig_dict['Boltzmann Temp Estimate'] = boltzmann_fig(log_r)
     except:  # some issues in the above I don't care to fix
         pass
 
@@ -178,19 +194,14 @@ def fwd_figs(buffer, flow_states,
                                                                       20,
                                                                       log_r.cpu().detach().numpy())
 
-    fig_dict['Lattice Features Distribution'] = (
-        simple_cell_hist(sample_batch, buffer_cell_params,
-                         n_kde_points=200, bw_ratio=20, mode='cell'))
-    fig_dict['Lattice Latents Distribution'] = (
-        simple_cell_hist(sample_batch, buffer_latent_params,
-                         n_kde_points=200, bw_ratio=20,
-                         mode='latent'))
+    fig_dict['Lattice Features Distribution'] = sample_batch.plot_batch_cell_params(
+        space='real', ref_dist=buffer_cell_params, quantiles=[0.1], show=False, return_fig=True)
+    fig_dict['Lattice Latents Distribution'] = sample_batch.plot_batch_cell_params(
+        space='latent', ref_dist=buffer_latent_params, quantiles=[0.1], show=False, return_fig=True)
+
     _, fig_dict['Pf Parity R Value'] = pf_parity_plot(log_pfs, log_pbs, log_r, log_flow)
 
-
-    fig_dict['Sample Scatter'] = simple_cell_scatter_fig(
-        sample_batch,
-    )
+    fig_dict['Sample Scatter'] = sample_batch.plot_batch_density_funnel(show=False, return_fig=True)
 
     return fig_dict
 
@@ -265,20 +276,15 @@ def conditional_fwd_figs(log_flow, log_pbs, log_pfs, log_r,
     fig_dict['Conditional VG Error'] = conditional_vargrad_error(log_r, log_pbs,
                                                                  log_pfs, cond_inds)
 
-    fig_dict['Conditional Lattice Features Distribution'] = conditional_simple_cell_hist(sample_batch,
-                                                                                         cond_inds,
-                                                                                         n_kde_points=200, bw_ratio=10,
-                                                                                         mode='cell')
-    fig_dict['Conditional Lattice Latents Distribution'] = conditional_simple_cell_hist(sample_batch,
-                                                                                        cond_inds,
-                                                                                        n_kde_points=200, bw_ratio=10,
-                                                                                        mode='latent')
-
-    fig_dict['Conditional Sample Scatter'] = simple_cell_scatter_fig(
-        sample_batch,
-        aux_scalar_name='Molecule',
-        aux_array=cond_inds.cpu().detach().numpy(),
+    # todo re-add molwise conditioning / flagging with cond_inds
+    fig_dict['Conditional Lattice Features Distribution'] = sample_batch.plot_batch_cell_params(
+        split_by_sg=True, split_by_zp=True, space='real', show=False, return_fig=True
     )
+    fig_dict['Conditional Lattice Latents Distribution'] = sample_batch.plot_batch_cell_params(
+        split_by_sg=True, split_by_zp=True, space='latent', show=False, return_fig=True
+    )
+    fig_dict['Conditional Sample Scatter'] = sample_batch.plot_batch_density_funnel(
+        split_by_sg=True,show=False, return_fig=True)
 
     return fig_dict
 
@@ -299,7 +305,7 @@ def boltzmann_fig(log_r):
     y_kde = kde(x_kde)
 
     # === Trim fit to low-energy region ===
-    quantile_cutoff = 0.95
+    quantile_cutoff = 0.99
     energy_cutoff = np.quantile(energies_np, quantile_cutoff)
     low_energy_mask = bin_centers <= energy_cutoff
     fit_mask = nonzero & low_energy_mask
@@ -368,7 +374,6 @@ def boltzmann_fig(log_r):
 
     # === Layout
     fig.update_layout(
-        title_text='Boltzmann Distribution Check (Linear & Log View)',
         # height=500,
         # width=1000,
         template='plotly_white'
@@ -380,7 +385,7 @@ def boltzmann_fig(log_r):
     fig.update_xaxes(title_text='Energy', row=1, col=2)
     fig.update_yaxes(title_text='log P(E)', row=1, col=2)
 
-    return fig
+    return fig, 1 / beta_est
 
 
 def cluster_hist_fig(cluster_ind):
@@ -699,7 +704,7 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
 def bwd_figs(metrics, fig_dict, buffer, gfn_model, init_state, discretizer, do_figs: Optional[bool] = False):
     terminal_state, b_log_r, crystal_batch, condition = buffer.sample(
         override_batch=len(init_state),
-    override_rot_mode=gfn_model.rot_mode)
+        )
     (backward_flow_states, b_log_pfs, b_log_pbs, b_log_flow,
      b_means_f, b_vars_f, b_means_b, b_vars_b) = gfn_model.get_traj_bwd(
         terminal_state.to(gfn_model.device), discretizer, condition.to(gfn_model.device), return_gauss_params=True)
@@ -757,10 +762,12 @@ def get_buffer_stats(buffer):
         samples_to_take = min(10000, len(buffer))
         # take samples according to the sampler weighting, rather than random trash in the buffer
         _, buffer_reward, buffer_batch, condition = buffer.sample(
-            override_batch=samples_to_take)
-        buffer_cell_params = buffer_batch.zp1_cell_parameters().cpu().detach().numpy()
+            override_batch=samples_to_take,
+            # standardize_orientations=True
+        )
+        buffer_cell_params = buffer_batch.full_cell_parameters().cpu().detach().numpy()
         del buffer_batch.latent_transform
-        buffer_latent_params = buffer_batch.latent_params(override_mode='wrapped').cpu().detach().numpy()
+        buffer_latent_params = buffer_batch.latent_params().cpu().detach().numpy()
         buffer_std_params_for_embedding = buffer_batch.latent_params().cpu().detach().numpy()
         reward = buffer_reward.cpu().detach().numpy()
         batch = buffer_batch.cpu().detach()
@@ -862,6 +869,9 @@ def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r
         metrics['ellipsoid overlap'] = sample_batch.ellipsoid_overlap.clip(min=1e-3).log10().cpu().detach().numpy()
 
     if buffer is not None:
+        """
+        Buffer / prior metrics
+        """
         if len(buffer) > 0:
             metrics['Buffer Length'] = len(buffer)
             metrics['Buffer Quantiles'] = np.array([
@@ -870,21 +880,21 @@ def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r
             ])
             metrics['Buffer Mean Score'] = np.mean(buffer.rewards_list)
 
-        (buffer_cell_params, buffer_latent_params,
-         buffer_std_params, buffer_reward,
-         buffer_batch, buffer_sg_inds) = get_buffer_stats(buffer)
+            (buffer_cell_params, buffer_latent_params,
+             buffer_std_params, buffer_reward,
+             buffer_batch, buffer_sg_inds) = get_buffer_stats(buffer)
 
-        cell_params = sample_batch.zp1_cell_parameters().cpu().detach().numpy()
-        del sample_batch.latent_transform
-        latent_params = sample_batch.latent_params(override_mode='wrapped').cpu().detach().numpy()
+            cell_params = sample_batch.zp1_cell_parameters().cpu().detach().numpy()
+            del sample_batch.latent_transform
+            latent_params = sample_batch.latent_params().cpu().detach().numpy()
 
-        cell_klds = np.zeros(cell_params.shape[1])
-        latent_klds = np.zeros(latent_params.shape[1])
-        for ind in range(len(cell_klds)):
-            cell_klds[ind] = compute_1d_kld(cell_params[:, ind], buffer_cell_params[:, ind])
-            latent_klds[ind] = compute_1d_kld(latent_params[:, ind], buffer_latent_params[:, ind])
+            cell_klds = np.zeros(cell_params.shape[1])
+            latent_klds = np.zeros(latent_params.shape[1])
+            for ind in range(len(cell_klds)):
+                cell_klds[ind] = compute_1d_kld(cell_params[:, ind], buffer_cell_params[:, ind])
+                latent_klds[ind] = compute_1d_kld(latent_params[:, ind], buffer_latent_params[:, ind])
 
-        log_buffer_kld(cell_klds, metrics, latent_klds)
+            log_buffer_kld(cell_klds, metrics, latent_klds)
 
     prior_sample = sample_backward_prior(args, buffer, sample_batch, len(std_params))
 
@@ -920,7 +930,7 @@ def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r
 def compute_1d_kld(p_data: np.ndarray,
                    q_data: np.ndarray,
                    n_kde_points=200,
-                   bw_ratio = 0.1,
+                   bw_ratio=0.1,
                    epsilon: float = 1e-4):
     """
     :param p_data: reference distribution
@@ -947,9 +957,9 @@ def compute_1d_kld(p_data: np.ndarray,
 
     # Remove the arbitrary "width" scaling for probability normalization
     y_ref = np.maximum(y_ref, epsilon)
-    y_q   = np.maximum(y_samp, epsilon)
-    P = y_ref / np.trapz(y_ref, x_common)
-    Q = y_q / np.trapz(y_q, x_common)
+    y_q = np.maximum(y_samp, epsilon)
+    P = y_ref / (np.trapz(y_ref, x_common) + epsilon)
+    Q = y_q / (np.trapz(y_q, x_common) + epsilon)
 
     kl = np.trapz(P * np.log((P + epsilon) / (Q + epsilon)), x_common)
     return kl
@@ -969,7 +979,7 @@ def sample_backward_prior(args, buffer, sample_batch, num_samples):
     if buffer is not None:
         if len(buffer) > 0:
             prior_sample, _, _, _ = buffer.sample(override_batch=num_samples,
-                                                  override_rot_mode=args.rotation_mode)
+                                                  )
         else:
             prior_sample = sample_crystal_prior(sample_batch, args.bwd_loss_coeffs.pmle_std)
     else:
@@ -1104,7 +1114,7 @@ def visualize_latent_trajs(states, n_trajs, log_r):
             ),
                 row=row, col=col
             )
-    custom_ranges = {i: [-6.5, 6.5] for i in range(len(lattice_features))}
+    custom_ranges = {i: [-1.1, 1.1] for i in range(len(lattice_features))}
     for i in range(len(lattice_features)):
         row = i // 3 + 1
         col = i % 3 + 1

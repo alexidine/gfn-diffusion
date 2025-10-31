@@ -64,57 +64,56 @@ def soft_clip(y, clip_value):
     # new_y[y>clip_value] = clip_value + delta ** (0.5)
     return new_y
 
-
-def mol_to_blank_crystal_list(mol_batch, sgs):
-    ones3 = torch.ones(3, device='cpu')
-    zeros1 = torch.zeros(1, device='cpu')
-    eye3 = torch.eye(3, device='cpu')[None, :]
-    ones1 = torch.ones(1, device='cpu')
-
-    sg_cache = {}
-    for sg in set(sgs):
-        sg_cache[sg] = np.stack(SYM_OPS[int(sg)])
-
-    base_xtal = MolCrystalData(
-        skip_box_analysis=True,
-        aunit_handedness=ones1,
-        cell_lengths=ones3,
-        cell_angles=ones3,
-        aunit_centroid=ones3,
-        aunit_orientation=ones3,
-        silu_pot=zeros1,
-        lj_pot=zeros1,
-        scaled_lj_pot=zeros1,
-        es_pot=zeros1,
-        niggli_overlap=zeros1,
-        ellipsoid_overlap=zeros1,
-        density_energy=zeros1,
-        niggli_energy=zeros1,
-        core_energy=zeros1,
-        lj_energy=zeros1,
-        bounding_energy=zeros1,
-        T_fc=eye3,
-        T_cf=eye3,
-        cell_volume=zeros1,
-        packing_coeff=zeros1,
-        density=zeros1,
-    )
-    crystal_list = []
-    for ind in range(mol_batch.num_graphs):
-        crystal = base_xtal.clone()
-        crystal.set_mol_attrs(mol_batch[ind].clone())
-        crystal.set_symmetry_attrs(is_well_defined=True,
-                                   nonstandard_symmetry=False,
-                                   sg_ind=sgs[ind],
-                                   symmetry_operators=sg_cache[sgs[ind]])
-        crystal_list.append(crystal)
-    return crystal_list
+#
+# def mol_to_blank_crystal_list(mol_batch, sgs):
+#     ones3 = torch.ones(3, device='cpu')
+#     zeros1 = torch.zeros(1, device='cpu')
+#     eye3 = torch.eye(3, device='cpu')[None, :]
+#     ones1 = torch.ones(1, device='cpu')
+#
+#     sg_cache = {}
+#     for sg in set(sgs):
+#         sg_cache[sg] = np.stack(SYM_OPS[int(sg)])
+#
+#     base_xtal = MolCrystalData(
+#         skip_box_analysis=True,
+#         aunit_handedness=ones1,
+#         cell_lengths=ones3,
+#         cell_angles=ones3,
+#         aunit_centroid=ones3,
+#         aunit_orientation=ones3,
+#         silu_pot=zeros1,
+#         lj_pot=zeros1,
+#         scaled_lj_pot=zeros1,
+#         es_pot=zeros1,
+#         niggli_overlap=zeros1,
+#         ellipsoid_overlap=zeros1,
+#         density_energy=zeros1,
+#         niggli_energy=zeros1,
+#         core_energy=zeros1,
+#         lj_energy=zeros1,
+#         bounding_energy=zeros1,
+#         T_fc=eye3,
+#         T_cf=eye3,
+#         cell_volume=zeros1,
+#         packing_coeff=zeros1,
+#         density=zeros1,
+#     )
+#     crystal_list = []
+#     for ind in range(mol_batch.num_graphs):
+#         crystal = base_xtal.clone()
+#         crystal.set_mol_attrs(mol_batch[ind].clone())
+#         crystal.set_symmetry_attrs(is_well_defined=True,
+#                                    nonstandard_symmetry=False,
+#                                    sg_ind=sgs[ind],
+#                                    symmetry_operators=sg_cache[sgs[ind]])
+#         crystal_list.append(crystal)
+#     return crystal_list
 
 
 class MolecularCrystal(BaseSet):
     def __init__(self, device,
                  energy_function: str,
-                 dim: int = 12,
                  max_temperature: float = 10,
                  min_temperature: float = 0.01,
                  lj_turnover_pot: float = 10.0,
@@ -129,17 +128,17 @@ class MolecularCrystal(BaseSet):
                  lj_repulsion: float = 1.0,
                  molecule_conditioning: bool = False,
                  sg_conditioning: bool = False,
+                 zp_conditioning: bool = False,
                  space_groups: Optional[list] = [2],
                  bounding_coeff: float = 1.0,
                  niggli_coeff: float = 1.0,
                  max_z_prime: int = 1,
                  z_primes: Tuple[int] = (1,),
-                 rot_mode: str = 'wrapped',
                  ):
 
         super(MolecularCrystal, self).__init__()
         self.device = device
-        self.data_ndim = dim
+        self.data_ndim = 6 + 6 * max_z_prime
         self.energy_function = energy_function
         self.energy_clip = energy_clip
         self.SG_FEATURE_TENSOR = SG_FEATURE_TENSOR.clone()  # store space group information
@@ -161,12 +160,11 @@ class MolecularCrystal(BaseSet):
         self.space_groups = space_groups
         self.max_z_prime = max_z_prime
         self.z_primes = z_primes
-        self.rot_mode = rot_mode
+        self.zp_conditioning = zp_conditioning
 
         self.temperature = temperature  # for static temperature work
 
         self.batch = collate_data_list([MolCrystalData(max_z_prime=max_z_prime)], max_z_prime=max_z_prime)
-        self.batch.rot_mode = self.rot_mode
 
         self.sg_cache = {}
         for sg in range(1, 230):
@@ -192,7 +190,6 @@ class MolecularCrystal(BaseSet):
             cluster_batch = crystal_batch.mol2cluster(cutoff=6,
                                                       supercell_size=2,
                                                       std_orientation=False)  # take the input molecule as given
-
             cluster_batch.construct_radial_graph(cutoff=6,
                                                  max_num_neighbors=100)
             lj_energy = cluster_batch.compute_LJ_energy()
@@ -217,7 +214,7 @@ class MolecularCrystal(BaseSet):
 
         cluster_batch.silu_pot = silu_energy
         cluster_batch.lj_pot = lj_energy
-        cluster_batch.scaled_lj_pot = normed_lj_energy
+        cluster_batch.scaled_lj_pot = normed_lj_energy / cluster_batch.num_atoms
         cluster_batch.ellipsoid_overlap = ellipsoid_overlap
         cluster_batch.niggli_overlap = compute_niggli_overlap(cluster_batch.zp1_cell_parameters())
 
@@ -244,18 +241,29 @@ class MolecularCrystal(BaseSet):
 
         latents = cluster_batch.latent_params()
         if raw_latents is not None:
-            bounding_energy = (F.relu(raw_latents - 6) ** 2 + F.relu(-(raw_latents + 6)) ** 2).sum(
-                dim=-1)  # discourage exploration beyond clip range
+            bounding_energy = (F.relu(raw_latents - 1) ** 2 + F.relu(-(raw_latents + 1)) ** 2).sum(dim=-1)  # discourage exploration beyond clip range
         else:
             bounding_energy = torch.zeros_like(latents[:, 0])
+
+        if self.max_z_prime > 1:
+            # penalize the model for placing asymmetric units out of the canonical order (closest -> furthest from origin)
+            per_aunit_centroids = cluster_batch.aunit_centroid.reshape(cluster_batch.num_graphs, cluster_batch.max_z_prime, 3)
+            idx = torch.arange(cluster_batch.max_z_prime, device=cluster_batch.device)[None, ...]
+            mask = (idx >= (cluster_batch.z_prime[..., None]))[..., None].expand(-1, -1, 3)
+            per_aunit_centroids[mask] = 1  # this will put lower Z' options always at the end
+            origin_dists = per_aunit_centroids.norm(dim=2)
+
+            overlaps = -origin_dists.diff(dim=1)
+            zp_ordering_energy = F.relu(overlaps).mean(dim=-1) ** 2
+            bounding_energy = bounding_energy + zp_ordering_energy
 
         if self.energy_function in ['ellipsoid_overlap', 'silu_energy', 'combo']:
             density_energy = density_penalty(cluster_batch.packing_coeff)
             lj_energy = soften_high(cluster_batch.silu_pot, self.lj_turnover_pot, coeff=0.9) / cluster_batch.num_atoms
-            core_energy = core_energy_penalty(cluster_batch.ellipsoid_overlap)
+            #core_energy = core_energy_penalty(cluster_batch.ellipsoid_overlap)
             niggli_energy = F.relu(-cluster_batch.niggli_overlap) ** 2  # punish negative overlaps
             ens_dict['niggli_energy'] = niggli_energy
-            ens_dict['core_energy'] = core_energy
+            #ens_dict['core_energy'] = core_energy
             ens_dict['lj_energy'] = lj_energy
             ens_dict['density_energy'] = density_energy
             ens_dict['bounding_energy'] = bounding_energy
@@ -265,7 +273,7 @@ class MolecularCrystal(BaseSet):
         if self.energy_function == 'latent_harmonic':
             # a trivial energy function, for testing
             if not hasattr(self, 'modes'):
-                self.modes = -torch.ones((1, 12), device=self.device)
+                self.modes = -torch.ones((1, self.dim), device=self.device)
                 self.crystal_modes = cluster_batch.latent_transform.inverse(self.modes,
                                                                             cluster_batch.sg_ind[:1],
                                                                             cluster_batch.radius[:1])
@@ -275,7 +283,7 @@ class MolecularCrystal(BaseSet):
             # a trivial energy function, for testing
             cell_params = cluster_batch.zp1_cell_parameters()
             if not hasattr(self, 'modes'):
-                self.modes = -torch.ones((1, 12), device=self.device)
+                self.modes = -torch.ones((1, self.dim), device=self.device)
                 self.crystal_modes = cluster_batch.latent_transform.inverse(self.modes,
                                                                             cluster_batch.sg_ind[:1],
                                                                             cluster_batch.radius[:1])
@@ -284,7 +292,7 @@ class MolecularCrystal(BaseSet):
 
         elif self.energy_function == 'latent_multiharmonic':
             if not hasattr(self, 'modes'):
-                self.modes = torch.tensor(generate_modes(10, 12, 4.0, 3.0), device=self.device)
+                self.modes = torch.tensor(generate_modes(10, self.dim, 4.0, 3.0), device=self.device)
                 self.crystal_modes = cluster_batch.latent_transform.inverse(self.modes,
                                                                             cluster_batch.sg_ind[:10],
                                                                             cluster_batch.radius[:10])
@@ -305,7 +313,7 @@ class MolecularCrystal(BaseSet):
 
         elif self.energy_function == 'crystal_multiharmonic':
             if not hasattr(self, 'modes'):
-                self.modes = torch.tensor(generate_modes(10, 12, 4.0, 3.0), device=self.device)
+                self.modes = torch.tensor(generate_modes(10, self.dim, 4.0, 3.0), device=self.device)
                 self.crystal_modes = cluster_batch.latent_transform.inverse(self.modes,
                                                                             cluster_batch.sg_ind[:10],
                                                                             cluster_batch.radius[:10])
@@ -315,9 +323,9 @@ class MolecularCrystal(BaseSet):
             exponent = -0.5 * sqdist  # (B, K)
             crystal_energy = -torch.logsumexp(exponent, dim=1)  # (B,)
 
-        elif self.energy_function == 'ellipsoid_overlap':
-
-            crystal_energy = self.core_coeff * core_energy + self.density_coeff * density_energy
+        # elif self.energy_function == 'ellipsoid_overlap':
+        #
+        #     crystal_energy = self.core_coeff * core_energy + self.density_coeff * density_energy
 
         elif self.energy_function == 'silu_energy':
 
@@ -325,7 +333,7 @@ class MolecularCrystal(BaseSet):
 
         elif self.energy_function == 'combo':
 
-            crystal_energy = self.lj_coeff * lj_energy + self.core_coeff * core_energy + self.density_coeff * density_energy
+            crystal_energy = self.lj_coeff * lj_energy + self.density_coeff * density_energy
 
         else:
             assert False, f'{self.energy_function} not implemented'
@@ -395,13 +403,16 @@ class MolecularCrystal(BaseSet):
         eye3 = torch.eye(3, device='cpu').repeat(mol_batch.num_graphs, 1, 1)
         ones1 = torch.ones(mol_batch.num_graphs, device='cpu')
         trues1 = torch.zeros(mol_batch.num_graphs, dtype=torch.bool, device='cpu').fill_(True)
+        zones3 = torch.ones((mol_batch.num_graphs, 3*self.max_z_prime), device='cpu')
+        zones1 =  torch.ones((mol_batch.num_graphs, self.max_z_prime), device='cpu')
         blank_batch_properties = {
             '_num_graphs': mol_batch.num_graphs,
-            'aunit_handedness': ones1[:, None],
+            'aunit_handedness': zones1,
+            'nonstandard_symmetry': ~trues1,
             'cell_lengths': ones3,
             'cell_angles': ones3,
-            'aunit_centroid': ones3,
-            'aunit_orientation': ones3,
+            'aunit_centroid': zones3,
+            'aunit_orientation': zones3,
             'silu_pot': zeros1,
             'lj_pot': zeros1,
             'scaled_lj_pot': zeros1,
@@ -471,7 +482,7 @@ class MolecularCrystal(BaseSet):
                                 z_primes: torch.tensor = None,
                                 ):
 
-        conds = []
+        conds = []  # feedback of zp information is broken
         if self.temperature_conditioning:
             """
             sample temp range, or a fixed temp, or an override temp
@@ -502,23 +513,26 @@ class MolecularCrystal(BaseSet):
             sg_to_sample = torch.tensor(np.random.choice(self.space_groups, mol_batch.num_graphs, replace=True)).to(
                 mol_batch.device)
 
-        if z_primes is not None:
-            zp_to_sample = z_primes.clone()
-        else:
-            zp_to_sample = torch.tensor(np.random.choice(self.z_primes, mol_batch.num_graphs, replace=True)).to(
-                mol_batch.device)
+        # if z_primes is not None:
+        #     zp_to_sample = z_primes.clone()
+        # else:  # can't sample z prime here because of issues in the formatting of the cyrstaldata
+        #
+        #     # zp_to_sample = torch.tensor(np.random.choice(self.z_primes, mol_batch.num_graphs, replace=True)).to(
+        #     #     mol_batch.device)
 
         if self.sg_conditioning:
             conds.append(torch.stack([self.SG_FEATURE_TENSOR[sg]
                                       for sg in sg_to_sample]).to(mol_batch.device)
                          )
 
+        if self.zp_conditioning:
+            conds.append(z_primes.clone()[:, None].float())
+
         # todo add z prime information to conditioning tensor
 
         return (log_T_tensor.flatten(),
                 sg_to_sample,
                 torch.cat(conds, dim=1) if len(conds) > 0 else torch.zeros_like(log_T_tensor),
-                zp_to_sample
                 )
 
 

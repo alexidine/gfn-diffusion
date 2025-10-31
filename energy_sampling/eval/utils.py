@@ -2,11 +2,11 @@ import json
 import sys
 
 import numpy as np
+import plotly
 import torch
 from scipy.spatial.distance import jensenshannon
 from tqdm import tqdm
 
-from energy_sampling.energies.molecular_crystal import mol_to_blank_crystal_list
 from energy_sampling.utils import uniform_discretizer, get_gfn_init_state, embed_dataset, logmeanexp, \
     sample_crystal_prior
 from mxtaltools.analysis.crystal_rdf import crystal_rdf, compute_rdf_distance
@@ -103,16 +103,16 @@ def sample_crystals(
                      _, _, _, _,
                      log_T_tensor) = sample_eval_fwd_trajs(
                         init_state, gfn_model, discretizer, energy_function, mol_batch)
-
-                elif generator == 'random':
-                    crystal_batch = collate_data_list(
-                        mol_to_blank_crystal_list(mol_batch, [space_group for _ in range(mol_batch.num_graphs)], ))
-                    samples = sample_crystal_prior(crystal_batch, 1)
-                    log_T_tensor = torch.ones(crystal_batch.num_graphs, device=device) * energy_function.temperature
-                    log_r, sample_batch = energy_function.log_reward(
-                        samples, mol_batch=mol_batch,
-                        log_temperature=log_T_tensor,
-                        return_exp=True)
+                # # DEPRECATED
+                # elif generator == 'random':
+                #     crystal_batch = collate_data_list(
+                #         mol_to_blank_crystal_list(mol_batch, [space_group for _ in range(mol_batch.num_graphs)], ))
+                #     samples = sample_crystal_prior(crystal_batch, 1)
+                #     log_T_tensor = torch.ones(crystal_batch.num_graphs, device=device) * energy_function.temperature
+                #     log_r, sample_batch = energy_function.log_reward(
+                #         samples, mol_batch=mol_batch,
+                #         log_temperature=log_T_tensor,
+                #         return_exp=True)
 
                 params_record[s_ind, batch_inds] = samples.cpu().detach().numpy()
                 energy_record[s_ind, batch_inds] = sample_batch.lj_pot.cpu().detach().numpy()
@@ -146,13 +146,14 @@ def sample_crystals(
 
 
 @torch.no_grad()
-def sample_eval_fwd_trajs(initial_state, gfn, discretizer, energy_function, mol_batch):
-    log_T_tensor, sg_inds, condition, z_primes = energy_function.get_conditioning_tensor(mol_batch)
+def sample_eval_fwd_trajs(initial_state, gfn, discretizer, energy_function, mol_batch,
+                          sg_inds=None):
+    log_T_tensor, sg_inds, condition = (
+        energy_function.get_conditioning_tensor(mol_batch, sg_inds=sg_inds, z_primes=mol_batch.z_prime))
 
     condition = condition.to(gfn.device)
 
     mol_batch.sg_ind = sg_inds
-    mol_batch.z_prime = z_primes
 
     (states, log_pfs, log_pbs, log_flow,
      means_f, logvars_f, means_b, logvars_b) = gfn.get_traj_fwd(initial_state,

@@ -21,6 +21,7 @@ from mxtaltools.common.config_processing import dict2namespace
 from mxtaltools.common.geometry_utils import batch_molecule_principal_axes_torch, batch_cell_vol_torch
 from mxtaltools.crystal_building.crystal_latent_transforms import enforce_niggli_plane
 from mxtaltools.dataset_utils.data_classes import MolCrystalData
+from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.models.utils import load_encoder
 
 
@@ -254,50 +255,49 @@ def triangle_schedule(it, init, maxval, minval, on, off):
 
 
 @torch.no_grad()
-def featurize_dataset(dataset, device, ellipsoid_scale, lj_repulsion, batch_size: int = 500):
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        drop_last=False
-    )
-    overlaps = []
+def featurize_dataset(dataset, device, ellipsoid_scale, lj_repulsion, batch_size: int = 500,
+                      max_z_prime: int = 1):
+
+    num_batches = len(dataset) // batch_size + (1 if len(dataset) % batch_size > 0 else 0)
+    #overlaps = []
     silus = []
     ljs = []
     niggli_overlaps = []
 
-    for crystal_batch in tqdm(loader):
+    for b_ind in range(num_batches):  # todo update this analysis
+        crystal_batch = collate_data_list(dataset[b_ind * batch_size:(b_ind + 1) * batch_size], max_z_prime=max_z_prime)
         crystal_batch = crystal_batch.to(device)
         crystal_batch.box_analysis()
-        cluster_batch = crystal_batch.mol2cluster(cutoff=6,
+        cluster_batch = crystal_batch.mol2cluster(cutoff=10,
                                                   supercell_size=10,
                                                   std_orientation=True)
 
-        cluster_batch.construct_radial_graph(cutoff=6)
+        cluster_batch.construct_radial_graph(cutoff=10)
 
         lj_energy = cluster_batch.compute_LJ_energy()
         silu_energy = cluster_batch.compute_silu_energy(
             repulsion=lj_repulsion,
         )
-
-        # simplified ellipsoid energy testing
-        _, _, _, _, _, _, normed_ellipsoid_overlap \
-            = cluster_batch.compute_ellipsoidal_overlap(
-            surface_padding=ellipsoid_scale,
-            return_details=True)
+        #
+        # # simplified ellipsoid energy testing
+        # _, _, _, _, _, _, normed_ellipsoid_overlap \
+        #     = cluster_batch.compute_ellipsoidal_overlap(
+        #     surface_padding=ellipsoid_scale,
+        #     return_details=True)
 
         niggli_overlap = cluster_batch.compute_niggli_overlap()
 
-        overlaps.extend(normed_ellipsoid_overlap.cpu().detach())
+        #overlaps.extend(normed_ellipsoid_overlap.cpu().detach())
         silus.extend(silu_energy.cpu().detach())
         ljs.extend(lj_energy.cpu().detach())
         niggli_overlaps.extend(niggli_overlap.cpu().detach())
 
-    overlaps = torch.tensor(overlaps)
+    #overlaps = torch.tensor(overlaps)
     silus = torch.tensor(silus)
     ljs = torch.tensor(ljs)
     niggli_overlaps = torch.tensor(niggli_overlaps)
     for ind, elem in enumerate(dataset):
-        elem.ellipsoid_overlap = torch.ones(1) * overlaps[ind]
+        #elem.ellipsoid_overlap = torch.ones(1) * overlaps[ind]
         elem.silu_pot = torch.ones(1) * silus[ind]
         elem.lj_pot = torch.ones(1) * ljs[ind]
         elem.niggli_overlap = torch.ones(1) * niggli_overlaps[ind]
@@ -436,6 +436,7 @@ def update_loss_schedule(it, loss_schedules, active_coeffs):
 
 
 def sample_crystal_prior(crystal_batch, std):
+    assert False, "This method needs to be rewritten as the latent prior is no longer std normal"
     rands = torch.randn((crystal_batch.num_graphs, 12), device=crystal_batch.device) * std
 
     # enforce the random prior is in the positive niggli plane
@@ -635,8 +636,8 @@ def substitute_prior(loss_coeffs, condition, crystal_batch, energy_function, rew
         loss_coeffs.vg_lb > 0,
         loss_coeffs.vg_lme > 0,
     ]):
-        log_T_tensor, sg_inds, condition, z_primes = energy_function.get_conditioning_tensor(crystal_batch,
-                                                                                             sg_inds=crystal_batch.sg_ind)
+        log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(crystal_batch,
+                                                                                             sg_inds=crystal_batch.sg_ind, z_primes=crystal_batch.z_prime)
         if log_T_tensor is not None:
             log_temperature = log_T_tensor
         else:

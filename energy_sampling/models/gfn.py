@@ -25,7 +25,6 @@ class GFN(nn.Module):
                  learn_pb: bool = False, joint_layers: int = 2,
                  dropout: Optional[float] = 0, norm: Optional[str] = None,
                  zero_init: bool = False, device=torch.device('cuda'),
-                 rot_mode: str = 'wrapped',
                  max_z_prime: int = 1,
                  ):
         super(GFN, self).__init__()
@@ -39,7 +38,7 @@ class GFN(nn.Module):
         self.t_scale = t_scale
 
         self.clipping = clipping
-        self.gfn_clip = gfn_clip
+        self.gfn_clip = gfn_clip  # clipping maximum step size
 
         self.conditional_flow_model = conditional_flow_model
         self.learn_pb = learn_pb
@@ -52,23 +51,14 @@ class GFN(nn.Module):
         self.var_clip = 16
         self.device = device
         self.max_z_prime = max_z_prime
-        self.rot_mode = rot_mode
 
-        if rot_mode == 'wrapped':
-            angs = [False] * 6
-            for zp in range(self.max_z_prime):
-                angs.extend([False, False, False,
-                             False, True, True])
-                # phi and r dimensions arein rotational basis
-            self.ang_mask = torch.tensor(angs, device=device)
-        elif rot_mode == 'linear':
-            self.ang_mask = torch.tensor([False, False, False,
-                                          False, False, False,
-                                          False, False, False,
-                                          False, False, False],
-                                         device=device)
-        else:
-            assert False, "Must choose a valid rotational mode"
+        angs = [False] * 6
+        for zp in range(self.max_z_prime):
+            angs.extend([False, False, False])
+        for zp in range(self.max_z_prime):
+            angs.extend([False, True, True])
+            # phi and r dimensions arein rotational basis
+        self.ang_mask = torch.tensor(angs, device=device)
 
         self.ang_dim = (self.ang_mask == True).sum().item()
         self.lin_dim = self.dim - self.ang_dim
@@ -82,6 +72,17 @@ class GFN(nn.Module):
                                                         filters=hidden_dim,
                                                         output_dim=condition_embedding_dim,
                                                         )
+            """  # will return nice o(3) invariant embeddings from vector inputs
+            self.conditions_embedding_model = vectorMLP(input_dim=scalar_conditions_dim,
+                                                        vector_input_dim = vector_conditions_dim,
+                                                        norm=norm,
+                                                        dropout=dropout,
+                                                        layers=joint_layers,
+                                                        filters=hidden_dim,
+                                                        output_dim=condition_embedding_dim,
+                                                        vector_output_dim=0
+                                                        )
+            """
             self.flow_model = FlowModel(condition_embedding_dim,
                                         hidden_dim,
                                         joint_layers,
@@ -179,7 +180,7 @@ class GFN(nn.Module):
             current_state = next_state
             # only wrap after logprob calculations
             if self.ang_dim > 0:
-                current_state[:, self.ang_mask] = self.wrap_to_pi(current_state[:, self.ang_mask])
+                current_state[:, self.ang_mask] = self.wrap_to_pi(current_state[:, self.ang_mask] * torch.pi) / torch.pi  # latent space is on [-1, 1]
             states[:, i + 1] = current_state
 
             if return_gauss_params:
@@ -208,8 +209,8 @@ class GFN(nn.Module):
         ts = discretizer(batch_size).to(self.device)
         trajectory_length = ts.shape[1] - 1
 
-        logpb, logpf, states, means_f, logvars_f, means_b, logvars_b = self.init_traj_tensors(batch_size,
-                                                                                              trajectory_length)
+        logpb, logpf, states, means_f, logvars_f, means_b, logvars_b = (
+            self.init_traj_tensors(batch_size, trajectory_length))
 
         states[:, -1] = terminal_state.detach()
         current_state = terminal_state.detach()
@@ -273,7 +274,7 @@ class GFN(nn.Module):
 
             current_state = prev_state
             if self.ang_dim > 0:
-                current_state[:, self.ang_mask] = self.wrap_to_pi(current_state[:, self.ang_mask])
+                current_state[:, self.ang_mask] = self.wrap_to_pi(current_state[:, self.ang_mask] * torch.pi) / torch.pi  # latent space is on [-1, 1]
             states[:, trajectory_length - i - 1] = current_state.detach()
 
         logpfs = torch.stack(logpf).T
@@ -360,8 +361,8 @@ class GFN(nn.Module):
         return back_mean_correction, back_additive_logvar
 
     def init_traj_tensors(self, batch_size, trajectory_length):
-        logpf = []  # torch.zeros((batch_size, trajectory_length), device=self.device)
-        logpb = []  # torch.zeros((batch_size, trajectory_length), device=self.device)
+        logpf = []
+        logpb = []
         states = torch.zeros((batch_size, trajectory_length + 1, self.dim), device=self.device)
         means_f = torch.zeros((batch_size, trajectory_length, self.dim), device=self.device)
         logvars_f = torch.zeros((batch_size, trajectory_length, self.dim), device=self.device)
@@ -376,7 +377,7 @@ class GFN(nn.Module):
 
     def expand_state_for_policy(self, state):
         lin = state[..., ~self.ang_mask]  # [B, 10]
-        ang = state[..., self.ang_mask]  # [B, 2]
+        ang = state[..., self.ang_mask] * torch.pi  # [B, 2]  # latent space is natively defined on [-1, 1]
         sin, cos = torch.sin(ang), torch.cos(ang)  # [B, 2] each
         orient = torch.stack([sin, cos], dim=-1).reshape(state.size(0), self.ang_dim * 2) # [B, 6]
         return torch.cat([lin, orient], dim=-1)  # [B, 6 + 8*zp]

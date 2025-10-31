@@ -10,7 +10,6 @@ from typing import Optional
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import wandb
 from scipy.spatial.transform import Rotation
 from torch.optim import lr_scheduler
@@ -21,7 +20,7 @@ from energies.molecular_crystal import MolecularCrystal
 from energy_sampling.buffer import CrystalReplayBuffer
 from energy_sampling.utils import iter_forever, \
     is_cuda_oom, get_annealing_factor, \
-    substitute_prior, parse_loss_schedules, dict2namespace, update_loss_schedule, \
+    parse_loss_schedules, dict2namespace, update_loss_schedule, \
     random_discretizer, low_discrepancy_discretizer, low_discrepancy_discretizer2, shifted_equidistant
 from eval.evaluations import eval_step, conditional_eval_step
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
@@ -210,13 +209,6 @@ class Modeller:
                 if energy_function.temperature > self.args.energy_min_temperature:
                     energy_function.temperature *= temp_annealing_lambda
 
-        if self.args.core_start_time > 0:
-            energy_function.core_coeff = round(
-                self.args.energy_core_coeff * F.sigmoid(torch.tensor((it - self.args.core_start_time) / 50)).item(), 2)
-        if self.args.lj_start_time > 0:
-            energy_function.lj_coeff = round(
-                self.args.energy_lj_coeff * F.sigmoid(torch.tensor((it - self.args.lj_start_time) / 50)).item(), 2)
-
     def set_loss_coeffs(self, it):
         """anneal reward function"""
         if it == 0:
@@ -242,6 +234,8 @@ class Modeller:
                 assert False
         if self.args.sg_conditioning:
             conditioning_dim += 237
+        if self.args.zp_conditioning:
+            conditioning_dim += 1
         return conditioning_dim
 
     def init_energy_function(self):
@@ -267,44 +261,58 @@ class Modeller:
             'niggli_coeff': self.args.niggli_coeff,
             'z_primes': self.args.z_primes,
             'max_z_prime': max(self.args.z_primes),
+            'zp_conditioning': self.args.zp_conditioning,
         }
         energy_function = MolecularCrystal(**energy_config)
         return energy_function
 
     def init_gfn_model(self, energy_function):
-        gfn_config = dict(
-            dim=energy_function.data_ndim,
-            s_emb_dim=self.args.s_emb_dim,
-            hidden_dim=self.args.hidden_dim,
-            conditions_dim=self.get_conditioning_dim(),
-            harmonics_dim=self.args.harmonics_dim,
-            t_dim=self.args.t_emb_dim,
-            condition_embedding_dim=self.args.condition_emb_dim,
-            trajectory_length=self.args.T,
-            clipping=self.args.clipping,
-            gfn_clip=self.args.gfn_clip,
-            learned_variance=self.args.learned_variance,
-            log_var_range=self.args.log_var_range,
-            pb_drift_range=self.args.pb_drift_range,
-            pb_var_range=self.args.pb_var_range,
-            t_scale=self.args.t_scale,
-            conditional_flow_model=any([
-                self.args.temperature_conditioning,
-                self.args.molecule_conditioning,
-                self.args.sg_conditioning]
-            ),
-            learn_pb=self.args.learn_pb,
-            joint_layers=self.args.joint_layers,
-            dropout=self.args.dropout,
-            norm=self.args.norm,
-            zero_init=self.args.zero_init,
-            device=self.device,
-            rot_mode=self.args.rotation_mode,
-            max_z_prime=max(self.args.z_primes),
-        )
-        gfn_model = GFN(**gfn_config).to(self.device)
+        if self.args.checkpoint_path is not None:
+            print(f"Loading model from checkpoint {self.args.checkpoint_path}")
+            eval_path = self.args.checkpoint_path.replace('train', 'eval')
+            config_path = self.args.checkpoint_path.replace('train', 'config').replace('.pt', '.npy')
 
-        return gfn_model, gfn_config
+            gfn_config = np.load(config_path, allow_pickle=True).item()
+            gfn_model = GFN(**gfn_config).to(self.device)
+            gfn_model.load_state_dict(torch.load(self.args.checkpoint_path))
+            ema_model = deepcopy(gfn_model)
+            ema_model.load_state_dict(torch.load(eval_path))
+        else:
+            gfn_config = dict(
+                dim=energy_function.data_ndim,
+                s_emb_dim=self.args.s_emb_dim,
+                hidden_dim=self.args.hidden_dim,
+                conditions_dim=self.get_conditioning_dim(),
+                harmonics_dim=self.args.harmonics_dim,
+                t_dim=self.args.t_emb_dim,
+                condition_embedding_dim=self.args.condition_emb_dim,
+                trajectory_length=self.args.T,
+                clipping=self.args.clipping,
+                gfn_clip=self.args.gfn_clip,
+                learned_variance=self.args.learned_variance,
+                log_var_range=self.args.log_var_range,
+                pb_drift_range=self.args.pb_drift_range,
+                pb_var_range=self.args.pb_var_range,
+                t_scale=self.args.t_scale,
+                conditional_flow_model=any([
+                    self.args.temperature_conditioning,
+                    self.args.molecule_conditioning,
+                    self.args.sg_conditioning,
+                    self.args.zp_conditioning,
+                ]
+                ),
+                learn_pb=self.args.learn_pb,
+                joint_layers=self.args.joint_layers,
+                dropout=self.args.dropout,
+                norm=self.args.norm,
+                zero_init=self.args.zero_init,
+                device=self.device,
+                max_z_prime=max(self.args.z_primes),
+            )
+            gfn_model = GFN(**gfn_config).to(self.device)
+            ema_model = deepcopy(gfn_model)
+
+        return gfn_model, gfn_config, ema_model
 
     def init_schedulers_optimizers(self, gfn_model):
         if self.args.scheduler:
@@ -368,24 +376,42 @@ class Modeller:
             prioritized=self.args.prioritized,
             keep_initial_samples=False,  # self.args.buffer_path is not None,
             diversity_coeff=self.args.buffer_diversity_coeff,
+            max_z_prime=energy_function.max_z_prime,
         )
         if ((self.args.both_ways or self.args.bwd) and
                 self.args.buffer_path is not None):  # preload samples into the buffer
             buffer = self.add_dataset_to_buffer(self.args.buffer_path, buffer,
-                                                filter_unbound=True,
-                                                space_groups=self.args.space_groups)
+                                                filter_unbound=True)
 
-        if self.args.molecule == 'urea':
-            good_mol = self.init_urea(buffer)
-            train_mols_list = [good_mol.clone() for _ in range(int(self.args.max_batch_size * 1.5))]
-            test_mols_list = [good_mol.clone() for _ in range(int(self.args.max_batch_size * 1.5))]
+        if len(buffer) > 0 and (self.args.molecule != 'qm9'):
+            mols_list = self.init_mol_from_buffer(buffer, energy_function.max_z_prime)
+            train_mols_list = []
+            test_mols_list = []
+            while len(train_mols_list) < int(self.args.max_batch_size * 1.5):
+                for mol in mols_list:
+                    train_mols_list.append(mol.clone())
+            while len(test_mols_list) < int(self.args.max_batch_size * 1.5):
+                for mol in mols_list:
+                    test_mols_list.append(mol.clone())
 
-        elif self.args.molecule == 'nicotinamide':
-            good_mol = self.init_nicotinamide(buffer)
-            train_mols_list = [good_mol.clone() for _ in range(int(self.args.max_batch_size * 1.5))]
-            test_mols_list = [good_mol.clone() for _ in range(int(self.args.max_batch_size * 1.5))]
+        # elif self.args.molecule == 'urea':
+        #     good_mol = self.init_urea(buffer)
+        #     train_mols_list = [good_mol.clone() for _ in range(int(self.args.max_batch_size * 1.5))]
+        #     test_mols_list = [good_mol.clone() for _ in range(int(self.args.max_batch_size * 1.5))]
+        #
+        # elif self.args.molecule == 'nicotinamide':
+        #     good_mol = self.init_nicotinamide(buffer)
+        #     train_mols_list = [good_mol.clone() for _ in range(int(self.args.max_batch_size * 1.5))]
+        #     test_mols_list = [good_mol.clone() for _ in range(int(self.args.max_batch_size * 1.5))]
+        #
+        # elif self.args.molecule == 'acridine':
+        #     good_mol = self.init_acridine(buffer)
+        #     train_mols_list = [good_mol.clone() for _ in range(int(self.args.max_batch_size * 1.5))]
+        #     test_mols_list = [good_mol.clone() for _ in range(int(self.args.max_batch_size * 1.5))]
 
         elif self.args.molecule == 'qm9':
+            if energy_function.max_z_prime > 1:
+                assert False, "Z'>1 mol loading not yet implemented for qm9"
             qm9_mols = torch.load(self.args.molecules_path, weights_only=False)
             rng = np.random.RandomState(0)
             rands = rng.choice(len(qm9_mols), len(qm9_mols), replace=False)
@@ -394,9 +420,8 @@ class Modeller:
             #     mol.deprotonate()  # since we'll be comparing against CSD later, deprotonate here
             train_mols_list = [qm9_mols[ind] for ind in rands[:bp]]
             test_mols_list = [qm9_mols[ind] for ind in rands[bp:]]
-
         else:
-            assert False
+            assert False, "Due to changes in Z'>1 modelling, must now initialize from a buffer"
 
         if self.args.molecule_conditioning:
             train_mols_list = embed_dataset(train_mols_list, self.args.autoencoder_path, self.device, encoder=None,
@@ -423,6 +448,27 @@ class Modeller:
 
         return buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator
 
+    def init_mol_from_buffer(self, buffer, max_z_prime):
+        # this structure assumes the MXT format, where for Z'>1 samples, the mols are stacked in the same spot, in the same order
+        sample = buffer.dataset[0]
+        atoms_per_mol = sample.num_atoms // sample.z_prime
+        atom_types = sample.z[:atoms_per_mol]
+        atom_coords = sample.pos[:atoms_per_mol]
+        atom_coords -= atom_coords.mean(dim=0)
+        mols = []
+        for zp in range(1, max_z_prime+1):
+            mols.append(MolData(
+                z=atom_types.repeat(zp),
+                pos=atom_coords.repeat(zp,1),
+                x=atom_types.repeat(zp),
+                do_mol_analysis=False,
+                radius=sample.radius,
+                mass=sample.mass,
+                mol_volume=sample.mol_volume,
+                z_prime=zp,
+            ))
+        return mols
+
     def init_nicotinamide(self, buffer):
         if len(buffer) > 0:  # ensure same conformer as dataset, where possible
             atom_coords = buffer.dataset[0].pos
@@ -440,6 +486,24 @@ class Modeller:
                 [2.4302, -0.0535, -0.0018]
             ], dtype=torch.float32, device='cpu')
             atom_types = torch.tensor([8, 7, 7, 6, 6, 6, 6, 6, 6], dtype=torch.long, device='cpu')
+        atom_coords -= atom_coords.mean(dim=0)
+        good_mol = MolData(
+            z=atom_types,
+            pos=atom_coords,
+            x=atom_types,
+            do_mol_analysis=True,
+        )
+        return good_mol
+
+    def init_acridine(self, buffer):
+        if len(buffer) > 0:  # ensure same conformer as dataset, where possible
+            if buffer.dataset[0].z_prime > 1:
+                assert False, "not implemented!"
+
+            atom_coords = buffer.dataset[0].pos
+            atom_types = buffer.dataset[0].z
+        else:
+            assert False, "Must load acridine from buffer!"
         atom_coords -= atom_coords.mean(dim=0)
         good_mol = MolData(
             z=atom_types,
@@ -477,8 +541,7 @@ class Modeller:
         energy_function = self.init_energy_function()
 
         # Model Init
-        gfn_model, gfn_config = self.init_gfn_model(energy_function)
-        ema_model = deepcopy(gfn_model)
+        gfn_model, gfn_config, ema_model = self.init_gfn_model(energy_function)
         name = self.args.tag + '_' + self.args.run_name
         np.save(f'checkpoints/{name}_model_config', gfn_config)  # todo add path to saving directories
 
@@ -577,8 +640,7 @@ class Modeller:
                     self.eval_work(ema_model, step_ind,
                                    buffer, train_mol_loader, test_mol_loader,
                                    energy_function, metrics)
-
-
+                    self.manage_prior_anchor(metrics, gfn_model, ema_model, name)
 
                 # train monitoring
                 if step_ind % 10 == 0:
@@ -634,7 +696,7 @@ class Modeller:
                 gfn_model.train()
                 ema_model.eval()
 
-                for opt in optimizers.values():
+                for opt in optimizers.values():  # MK consider also loading optimizer state here
                     for g in opt.param_groups:
                         if g['lr'] > self.args.min_lr:
                             g['lr'] *= 0.75
@@ -682,16 +744,7 @@ class Modeller:
             mol_batch = next(mol_iterator)
             if self.args.molecule_conditioning:
                 # if doing molecule conditioning, augment over mol orientations, adjusting properly the embedding
-                random_rotations = torch.tensor(
-                    Rotation.random(num=mol_batch.num_graphs).as_matrix(),
-                    device=mol_batch.device, dtype=torch.float32)
-                mol_batch.orient_molecule(mode='std')
-                mol_batch.orient_molecule(mode='random',
-                                          # important that the rotation is applied *from* the standard
-                                          include_inversion=False,
-                                          correct_orientation=True,
-                                          override_random_rotations=random_rotations)
-                mol_batch.embedding = mol_batch.rotate_embedding(random_rotations)
+                self.scramble_mol_and_embedding(mol_batch)
             else:
                 mol_batch.orient_molecule(mode='std')
 
@@ -707,7 +760,7 @@ class Modeller:
                 report_losses=report_losses
             )
 
-            # forward_iter = int(it * p_forward)
+            # forward_iter = int(it * p_forward)  # TODO add back exceptionally good or exceptionally expensive samples
             # if add_to_buffer and forward_iter % self.args.add_to_buffer_each == 0:
             #     # standard to_data_list won't work with our custom batching in the energy function
             #     data_list = manual_batch_to_data_list(crystal_batch.detach().cpu())
@@ -755,9 +808,8 @@ class Modeller:
                        repeats: int = 10,
                        report_losses: bool = False):
         init_state = get_gfn_init_state(self.args.batch_size, energy_function.data_ndim, self.device)
-        log_T_tensor, sg_inds, condition, z_primes = energy_function.get_conditioning_tensor(mol_batch)
+        log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(mol_batch, z_primes=mol_batch.z_prime)
         mol_batch.sg_ind = sg_inds
-        mol_batch.z_prime = z_primes
         return get_gfn_forward_loss(self.args.fwd_loss_coeffs,
                                     init_state,
                                     gfn_model,
@@ -779,13 +831,13 @@ class Modeller:
             samples, rewards, crystal_batch, condition = buffer.sample(
                 override_batch=int(self.args.batch_size * self.args.bwd_batch_multiplier),
                 randomize_orientations=True if self.args.molecule_conditioning else False,
-            override_rot_mode=self.args.rotation_mode)
+            )
         else:
             assert False, f"sampling method {self.args.sampling} not implemented"
 
-        if self.args.bwd_loss_coeffs.mle_prior_fraction > 0:
-            condition, rewards, samples = substitute_prior(
-                self.args.bwd_loss_coeffs, condition, crystal_batch, energy_function, rewards, samples, buffer)
+        # if self.args.bwd_loss_coeffs.mle_prior_fraction > 0:
+        #     condition, rewards, samples = substitute_prior(
+        #         self.args.bwd_loss_coeffs, condition, crystal_batch, energy_function, rewards, samples, buffer)
 
         return get_gfn_backward_loss(self.args.bwd_loss_coeffs,
                                      samples.to(self.device),
@@ -853,7 +905,7 @@ class Modeller:
             do_figures = override_do_figures
         else:
             do_figures = i % self.args.figs_period == 0
-        eval_batch_size = max(self.args.batch_size, self.args.eval_batch_size)
+        eval_batch_size = self.args.eval_batch_size
 
         eval_rands = np.random.randint(len(mol_loader.dataset), size=eval_batch_size)
         mol_batch = collate_data_list([mol_loader.dataset[ind] for ind in eval_rands]).to(self.device)
@@ -861,17 +913,7 @@ class Modeller:
             mol_batch.orient_molecule(mode='standard')
         else:  # if we are conditioning, randomly rotate and make sure we catch the embedding
             # todo functionalize this
-            random_rotations = torch.tensor(
-                Rotation.random(num=mol_batch.num_graphs).as_matrix(),
-                device=mol_batch.device, dtype=torch.float32)
-            mol_batch.orient_molecule(mode='standard')
-            mol_batch.orient_molecule(mode='random',
-                                      include_inversion=False,
-                                      correct_orientation=True,
-                                      override_random_rotations=random_rotations
-                                      )
-
-            mol_batch.embedding = mol_batch.rotate_embedding(random_rotations)
+            self.scramble_mol_and_embedding(mol_batch)
 
         # if we are conditioning, we take it as it comes
         init_state = get_gfn_init_state(eval_batch_size, energy_function.data_ndim, self.device)
@@ -906,6 +948,9 @@ class Modeller:
         eval_rands = np.random.randint(len(mol_loader.dataset), size=eval_batch_size)
         mol_batch = collate_data_list([mol_loader.dataset[ind] for ind in eval_rands]).to(self.device)
 
+        if self.args.molecule_conditioning:
+            self.scramble_mol_and_embedding(mol_batch)
+
         init_state = get_gfn_init_state(eval_batch_size, energy_function.data_ndim, self.device)
 
         eval_metrics = {}
@@ -915,36 +960,81 @@ class Modeller:
                                   eval_discretizer,
                                   init_state,
                                   mol_batch,
-                                  mols_to_sample=5
+                                  mols_to_sample=5,
+                                  sample_sgs=self.args.space_groups if self.args.sg_conditioning else None,
                                   ))
 
         return eval_metrics
 
-    def add_dataset_to_buffer(self, dataset_path, buffer, filter_unbound=True,
-                              space_groups=None):
+    def scramble_mol_and_embedding(self, mol_batch):
+        random_rotations = torch.tensor(
+            Rotation.random(num=mol_batch.num_graphs).as_matrix(),
+            device=mol_batch.device, dtype=torch.float32)
+        mol_batch.orient_molecule(mode='std')
+        mol_batch.orient_molecule(mode='random',
+                                  # important that the rotation is applied *from* the standard
+                                  include_inversion=False,
+                                  correct_orientation=True,
+                                  override_random_rotations=random_rotations)
+        mol_batch.embedding = mol_batch.rotate_embedding(random_rotations)
+
+    def add_dataset_to_buffer(self, dataset_path, buffer,
+                              filter_unbound=True,
+                              ):
         print("Loading prebuilt buffer")
         dataset = torch.load(dataset_path, weights_only=False)
+        max_z_prime = max([int(elem.z_prime) for elem in dataset])
+        assert max_z_prime == max(self.args.z_primes), "Preloaded data max z prime must match model"
 
-        if space_groups is not None:
-            # filter unwanted space groups
-            dataset = [elem for elem in dataset if elem.sg_ind in space_groups]
+        # filter unwanted SG
+        dataset = [elem for elem in dataset if elem.sg_ind in self.args.space_groups]
+
+        # filter unwanted Z'
+        dataset = [elem for elem in dataset if elem.z_prime in self.args.z_primes]
+
+        # canonicalize rotvecs (upper half-plane)
+        batch = collate_data_list(dataset, max_z_prime=max_z_prime)
+        batch.canonicalize_orientation()
+        orientations = batch.aunit_orientation
+        for ind, elem in enumerate(dataset):
+            elem.aunit_orientation = orientations[ind][None, ...]
+
+        # canonicalize aunit parameterizations
+        batch = collate_data_list(dataset, max_z_prime=max_z_prime)
+        batch.canonicalize_zp_aunits()
+        aunits = batch.aunit_centroid
+        for ind, elem in enumerate(dataset):
+            elem.aunit_centroid = aunits[ind][None, ...]
+
+        # filter invalid latents
+        batch = collate_data_list(dataset, max_z_prime=max_z_prime)
+        latents = batch.latent_params()
+        good_inds = torch.argwhere(torch.all(latents.abs() <= 1, dim=1))  # valid latent space
+        dataset = [dataset[ind] for ind in good_inds]
+
+        if self.args.energy_function == 'ellipsoid_overlap':
+            assert False, "Ellipsoid overlap not updated for Z'>1"
 
         if self.args.energy_function in ['ellipsoid_overlap',
                                          'silu_energy',
                                          'combo']:  # reparameterize incoming samples
             print("Re-featurizing preloaded buffer samples")
-            dataset = featurize_dataset(dataset, self.device,
-                                        self.args.ellipsoid_scale, self.args.lj_repulsion)
+            dataset = featurize_dataset(dataset,
+                                        self.device,
+                                        self.args.ellipsoid_scale,
+                                        self.args.lj_repulsion,
+                                        max_z_prime=max_z_prime)
 
-        if filter_unbound: # filter non-bound states
+        if filter_unbound:  # filter non-bound states
             dataset = [elem for elem in dataset if elem.lj_pot < 0]
             dataset = [elem for elem in dataset if elem.silu_pot < 0]
 
         if self.args.molecule_conditioning:  # embed dataset
+            assert max(self.args.z_primes) == 1, "Molecule conditioning not yet supported for Z'>1"
             print("Getting preloaded dataset molecule embeddings")
             dataset = embed_dataset(dataset, self.args.autoencoder_path, self.device, encoder=None)
 
-        buffer.add(dataset)
+        buffer.add(dataset, max_z_prime)
         print(f"Buffer loaded with {len(dataset)} samples")
 
         return buffer
@@ -957,16 +1047,17 @@ class Modeller:
                   test_mol_loader,
                   energy_function,
                   metrics):
-        if self.args.molecule_conditioning or self.args.sg_conditioning:
+        if self.args.molecule_conditioning or self.args.sg_conditioning or self.args.zp_conditioning:
 
             if step_ind % self.args.conditional_eval_period == 0:  # make conditional sampling figures
                 # # so far not useful
-                train_metrics = self.do_evaluation(energy_function, buffer, gfn_model,
-                                                   step_ind, train_mol_loader,
-                                                   override_do_figures=False)
-                kk = list(train_metrics.keys())
-                for key in kk:
-                    metrics['train_eval/' + key] = train_metrics[key]
+                # train_metrics = self.do_evaluation(energy_function, buffer, gfn_model,
+                #                                    step_ind, train_mol_loader,
+                #                                    override_do_figures=False)
+                # kk = list(train_metrics.keys())
+                # for key in kk:
+                #     metrics['train_eval/' + key] = train_metrics[key]
+
                 conditional_metrics = self.do_conditional_evaluation(energy_function, gfn_model,
                                                                      test_mol_loader,
                                                                      )
@@ -978,32 +1069,35 @@ class Modeller:
                                           step_ind,
                                           test_mol_loader))
 
-        self.dynamic_quality_management(metrics)
-
         wandb.log(metrics, step=step_ind)
 
-    def dynamic_quality_management(self, metrics):
-        # adjust by a factor of 'multiple' for each 'delta_factor' of miss
-        min_rat = 1/100
-        max_rat = 100
-        metric = metrics['Max Latent KLD']
-        if self.args.kld_threshold is not None and self.args.both_ways:
+    def manage_prior_anchor(self, metrics, gfn_model, ema_model, name):
+        if self.args.kld_threshold is not None and self.args.both_ways:  # todo update this to work with conditioning
+            # adjust by a factor of 'multiple' for each 'delta_factor' of miss
+            min_rat = 1 / 100
+            max_rat = 100
+            metric = metrics['Max Latent KLD']
             # check if we have hit our initial KLD target
             if not self.hit_init_kld:
                 if metric <= self.args.init_kld_threshold:
-                    print("Hit initial KLD threshold. Moving to forward training & refinement.")
                     self.hit_init_kld = True
                     self.args.bwd_loss_coeffs.bwd_tb_z = 0.0
                     self.args.bwd_loss_coeffs.tb = 0.0
                     self.args.fwd_to_bwd_ratio = 0.1
                     self.increasing_loss_cooldown = 100  # give it time to adjust to new loss landscape
-            else: # if we have hit it, dynamically adjust fwd_to_bwd_ratio to keep it under the threshold
+
+                    torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train_hit_prior.pt')
+                    torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval_hit_prior.pt')
+                    print("Hit initial KLD threshold. Moving to forward training & refinement.")
+
+
+            else:  # if we have hit it, dynamically adjust fwd_to_bwd_ratio to keep it under the threshold
                 err = (metric - self.args.kld_threshold) / self.args.kld_threshold
                 # target the given kld threshold and optimize towards it
                 self.args.fwd_to_bwd_ratio *= np.exp(-0.1 * err)
                 self.args.fwd_to_bwd_ratio = np.clip(self.args.fwd_to_bwd_ratio, a_min=min_rat, a_max=max_rat)
 
-        metrics['Fwd to Bwd Ratio'] = self.args.fwd_to_bwd_ratio
+            metrics['Fwd to Bwd Ratio'] = self.args.fwd_to_bwd_ratio
 
 
 if __name__ == '__main__':

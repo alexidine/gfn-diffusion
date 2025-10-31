@@ -20,6 +20,7 @@ class CrystalReplayBuffer:
                  prioritized=None,
                  keep_initial_samples: bool = False,
                  diversity_coeff: float = 0.0,
+                 max_z_prime: int = 1
                  ):
         self.buffer_size = buffer_size
         self.prioritized = prioritized
@@ -38,13 +39,14 @@ class CrystalReplayBuffer:
         self.diversity_check_size = 1000
         self.original_dataset_inds = None
         self.diversity_coeff = diversity_coeff
+        self.max_z_prime = max_z_prime
 
     def add(self,
             data_list,
-            diversity_cutoff: float = 1.0):
+            max_z_prime: int = 1):
         with torch.no_grad():
             if self.dataset is None:
-                self.init_fresh_dataset(data_list)
+                self.init_fresh_dataset(data_list, max_z_prime)
                 self.init_loader()
 
             else:
@@ -101,9 +103,9 @@ class CrystalReplayBuffer:
 
             assert len(self.dataset) == len(self.x_list) == len(self.rewards_list)
 
-    def init_fresh_dataset(self, data_list):
+    def init_fresh_dataset(self, data_list, max_z_prime):
         self.dataset = list(data_list)  # I think this is memory safe and faster #copy.deepcopy(data_list)
-        dataset_batch = collate_data_list(self.dataset)
+        dataset_batch = collate_data_list(self.dataset, max_z_prime=max_z_prime)
         x_tensor = dataset_batch.latent_params()
         scores = self.energy_function.prebuilt_sample_to_reward(dataset_batch, temperature=torch.ones(len(self)))
         self.x_list = [x_tensor[i] for i in range(x_tensor.shape[0])]
@@ -186,7 +188,7 @@ class CrystalReplayBuffer:
                return_preload: Optional[bool] = False,
                override_sampler: Optional[str] = None,
                randomize_orientations: Optional[bool] = False,
-               override_rot_mode: Optional[str] = None,
+               standardize_orientations: Optional[bool] = False,
                ):
 
         if override_batch is not None:
@@ -206,7 +208,8 @@ class CrystalReplayBuffer:
                 rand_inds = self.sample_indices(self.batch_size, replace=False, diversity_coeff=self.diversity_coeff,
                                                 override_method=override_sampler)
 
-        sample_batch = collate_data_list([self.dataset[ind] for ind in rand_inds])
+        sample_batch = collate_data_list([self.dataset[ind] for ind in rand_inds],
+                                         max_z_prime=self.max_z_prime)
 
         if randomize_orientations:
             # this is a form of sample augmentation, where we rotate the molecule and its applied orientation
@@ -221,29 +224,23 @@ class CrystalReplayBuffer:
                                          correct_orientation=True,
                                          override_random_rotations=random_rotations)
             sample_batch.embedding = sample_batch.rotate_embedding(random_rotations)
-            """
-            sample_batch.orient_molecule(mode='std')
-            sample_batch.orient_molecule(mode='random',  # important that the rotation is applied *from* the standard
-                                         include_inversion=False,
-                                         correct_orientation=True,
-                                         override_random_rotations=random_rotations)
-            aa = sample_batch.analyze(['lj'], std_orientation=False, cutoff=10)
-            print(((aa['lj']-sample_batch.lj_pot).abs()/sample_batch.lj_pot.abs()).mean())
-            # test to make sure this is working
-            # important that we standardize before applying the orientation adjustment!!!
-            """
 
-        T_tensor, sg_inds, condition, z_primes = self.energy_function.get_conditioning_tensor(sample_batch,
-                                                                                              sg_inds=sample_batch.sg_ind)
+        # if standardize_orientations:
+        #     assert not randomize_orientations
+        #     sample_batch.orient_molecule(mode='std',
+        #                                  correct_orientation=True)
+
+        T_tensor, sg_inds, condition = self.energy_function.get_conditioning_tensor(sample_batch,
+                                                                                              sg_inds=sample_batch.sg_ind, z_primes=sample_batch.z_prime)
         sample_batch.sg_ind = sg_inds
-        sample_batch.z_prime = z_primes
         temperature = 10 ** T_tensor  # first dimension is the log temperature
         reward = self.energy_function.prebuilt_sample_to_reward(
             sample_batch, temperature)  # recompute reward in case parameters have changed
 
         if hasattr(sample_batch,'latent_transform'):
             del sample_batch.latent_transform
-        latents = sample_batch.latent_params(override_mode=override_rot_mode)
+
+        latents = sample_batch.latent_params()
         return latents, reward, sample_batch, condition
 
     def init_loader(self):
@@ -304,24 +301,26 @@ class CrystalReplayBuffer:
         :param sg_inds:
         :return:
         """
-        samples = torch.zeros((len(sg_inds), 12), dtype=torch.float32)
-        sgs_to_sample = torch.unique(sg_inds).tolist()
-        sg_buffer = torch.tensor(self.sg_list)
-        x_tensor = torch.stack(self.x_list).to(self.device)
-
-        for sg in sgs_to_sample:
-            sample_mask = sg_inds == sg
-            mask = (sg_buffer == sg)
-            relevant = x_tensor[mask]
-
-            n = sample_mask.sum()
-            rand_idx = torch.randint(0, relevant.size(0), (n,), device=self.device)
-            samples[sample_mask] = relevant[rand_idx]
-
-        if noise is not None:
-            samples += torch.randn_like(samples) * noise
-
-        return samples.clip(min=-6, max=6)
+        assert False, ("Unconditional prior sampling needs to be rewritten, as "
+                       "the latent space is no longer strictly std normal")
+        # samples = torch.zeros((len(sg_inds), 12), dtype=torch.float32)
+        # sgs_to_sample = torch.unique(sg_inds).tolist()
+        # sg_buffer = torch.tensor(self.sg_list)
+        # x_tensor = torch.stack(self.x_list).to(self.device)
+        #
+        # for sg in sgs_to_sample:
+        #     sample_mask = sg_inds == sg
+        #     mask = (sg_buffer == sg)
+        #     relevant = x_tensor[mask]
+        #
+        #     n = sample_mask.sum()
+        #     rand_idx = torch.randint(0, relevant.size(0), (n,), device=self.device)
+        #     samples[sample_mask] = relevant[rand_idx]
+        #
+        # if noise is not None:
+        #     samples += torch.randn_like(samples) * noise
+        #
+        # return samples.clip(min=-6, max=6)
 
 
 def collate_fn(data_list):
