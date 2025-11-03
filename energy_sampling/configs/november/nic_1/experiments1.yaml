@@ -1,0 +1,110 @@
+defaults:
+  base: base.yaml
+
+
+experiments:
+- tag: 0
+  update:
+    T: 50
+    eval_T: 50
+    energy_clip: 10
+    energy_static_temperature: 1.0
+
+- tag: 1
+  update:
+    T: 15
+    eval_T: 15
+    energy_clip: 10
+    energy_static_temperature: 1.0
+
+- tag: 2
+  update:
+    T: 100
+    eval_T: 100
+    energy_clip: 10
+    energy_static_temperature: 1.0
+
+- tag: 3
+  update:
+    T: 50
+    eval_T: 50
+    energy_clip: 100
+    energy_static_temperature: 1.0
+
+- tag: 4
+  update:
+    T: 15
+    eval_T: 15
+    energy_clip: 100
+    energy_static_temperature: 1.0
+
+- tag: 5
+  update:
+    T: 100
+    eval_T: 100
+    energy_clip: 100
+    energy_static_temperature: 1.0
+
+
+- tag: 6
+  update:
+    T: 50
+    eval_T: 50
+    energy_clip: 10
+    energy_static_temperature: 0.1
+- tag: 7
+  update:
+    T: 15
+    eval_T: 15
+    energy_clip: 10
+    energy_static_temperature: 0.1
+- tag: 8
+  update:
+    T: 100
+    eval_T: 100
+    energy_clip: 10
+    energy_static_temperature: 0.1
+- tag: 9
+  update:
+    T: 50
+    eval_T: 50
+    energy_clip: 100
+    energy_static_temperature: 0.1
+- tag: 10
+  update:
+    T: 15
+    eval_T: 15
+    energy_clip: 100
+    energy_static_temperature: 0.1
+- tag: 11
+  update:
+    T: 100
+    eval_T: 100
+    energy_clip: 100
+    energy_static_temperature: 0.1
+
+- tag: 12
+  update:
+    T: 50
+    eval_T: 50
+    energy_clip: 10
+    energy_static_temperature: 1.0
+    learn_pb: false
+
+- tag: 13
+  update:
+    T: 50
+    eval_T: 50
+    energy_clip: 10
+    energy_static_temperature: 1.0
+    learn_pb: false
+    learned_variance: false
+
+- tag: 12
+  update:
+    T: 50
+    eval_T: 50
+    energy_clip: 10
+    energy_static_temperature: 1.0
+    learn_pb: true
+    pb_var_range: 4

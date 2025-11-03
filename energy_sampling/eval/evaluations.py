@@ -733,6 +733,7 @@ def bwd_figs(metrics, fig_dict, buffer, gfn_model, init_state, discretizer, do_f
     tb_residual = F.smooth_l1_loss(log_ratio, torch.ones_like(log_ratio), reduction='none')
     metrics['Bwd TB Residual'] = tb_residual.mean().item()
     metrics['Bwd Log Z Residual'] = (log_Z_empirical - log_Z_learned).item()
+    metrics['Bwd Log Z LB Residual'] = (log_Z_lb - log_Z_learned).item()
 
     if do_figs:
         fig_dict['Backward Latents Trajectories'] = visualize_latent_trajs(
@@ -917,6 +918,7 @@ def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r
     tb_residual = F.smooth_l1_loss(log_ratio, torch.ones_like(log_ratio), reduction='none')
     metrics['TB Residual'] = tb_residual.mean().item()
     metrics['Log Z Residual'] = (log_Z_empirical - log_Z_learned).item()
+    metrics['Log Z LB Residual'] = (log_Z_lb - log_Z_learned).item()
 
     # get fraction of samples which are 'reasonable' at this energy,
     # meaning density > 0.55 and bound states

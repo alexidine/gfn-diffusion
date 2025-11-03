@@ -286,7 +286,6 @@ class Modeller:
                 harmonics_dim=self.args.harmonics_dim,
                 t_dim=self.args.t_emb_dim,
                 condition_embedding_dim=self.args.condition_emb_dim,
-                trajectory_length=self.args.T,
                 clipping=self.args.clipping,
                 gfn_clip=self.args.gfn_clip,
                 learned_variance=self.args.learned_variance,
@@ -585,8 +584,8 @@ class Modeller:
 
             for step_ind in trange(self.args.epochs + 1):
                 metrics = dict()
-                if step_ind % 10 == 0:
-                    self.set_loss_coeffs(step_ind)
+                # if step_ind % 10 == 0: # not currently used
+                #     self.set_loss_coeffs(step_ind)
 
                 exploration_std = get_exploration_std(step_ind,
                                                       self.args.exploratory,
@@ -1072,27 +1071,46 @@ class Modeller:
         wandb.log(metrics, step=step_ind)
 
     def manage_prior_anchor(self, metrics, gfn_model, ema_model, name):
-        if self.args.kld_threshold is not None and self.args.both_ways:  # todo update this to work with conditioning
+        if self.args.btb_threshold is not None and self.args.both_ways:  # todo update this to work with conditioning
             # adjust by a factor of 'multiple' for each 'delta_factor' of miss
             min_rat = 1 / 100
             max_rat = 100
-            metric = metrics['Max Latent KLD']
             # check if we have hit our initial KLD target
             if not self.hit_init_kld:
+                metric = metrics['Max Latent KLD']
                 if metric <= self.args.init_kld_threshold:
                     self.hit_init_kld = True
-                    self.args.bwd_loss_coeffs.bwd_tb_z = 0.0
-                    self.args.bwd_loss_coeffs.tb = 0.0
-                    self.args.fwd_to_bwd_ratio = 0.1
+                    self.args.bwd_loss_coeffs.bwd_tb_z = 1.0
+                    self.args.bwd_loss_coeffs.tb = 1.0
+                    self.args.bwd_loss_coeffs.mle = 0.0
                     self.increasing_loss_cooldown = 100  # give it time to adjust to new loss landscape
 
-                    torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train_hit_prior.pt')
-                    torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval_hit_prior.pt')
-                    print("Hit initial KLD threshold. Moving to forward training & refinement.")
+                    torch.save(gfn_model.state_dict(), f'checkpoints/{name}_train_hit_prior.pt')
+                    torch.save(ema_model.state_dict(), f'checkpoints/{name}_eval_hit_prior.pt')
+                    print("Hit initial KLD threshold. Moving to backward thermalization.")
 
+                    self.iters_to_thermalize = self.args.bwd_thermalization_time
+                    self.phase = 2
 
-            else:  # if we have hit it, dynamically adjust fwd_to_bwd_ratio to keep it under the threshold
-                err = (metric - self.args.kld_threshold) / self.args.kld_threshold
+            elif self.iters_to_thermalize > 0:
+                self.iters_to_thermalize -= self.args.eval_period
+
+                if self.iters_to_thermalize <= 0:
+                    torch.save(gfn_model.state_dict(), f'checkpoints/{name}_train_thermalized.pt')
+                    torch.save(ema_model.state_dict(), f'checkpoints/{name}_eval_thermalized.pt')
+                    print("Thermalization complete. Moving to forward training & refinement.")
+
+                    self.args.fwd_to_bwd_ratio = 0.1
+                    self.args.bwd_loss_coeffs.bwd_tb_z = 0.0 # turn off backwards log Z thermalization
+                    self.increasing_loss_cooldown = 100
+                    self.phase = 3
+                    self.bwd_anchor = float(metrics['Bwd TB Residual'])
+
+            elif self.phase == 3:
+                # if we have hit it, dynamically adjust fwd_to_bwd_ratio to keep it under the threshold based on the minimum original value
+                metric = metrics['Bwd TB Residual']
+
+                err = (metric - self.bwd_anchor * self.args.btb_threshold) / (self.bwd_anchor * self.args.btb_threshold)
                 # target the given kld threshold and optimize towards it
                 self.args.fwd_to_bwd_ratio *= np.exp(-0.1 * err)
                 self.args.fwd_to_bwd_ratio = np.clip(self.args.fwd_to_bwd_ratio, a_min=min_rat, a_max=max_rat)

@@ -372,15 +372,15 @@ def get_tb_loss(log_flow, log_pb, log_pf, log_r, detach_z=False, z_only=False):
         tb = (log_pf + log_flow - log_pb - log_r.detach())
 
     # tb_loss = F.mse_loss(tb, torch.zeros_like(tb), reduction='none')
-    tb_loss = F.smooth_l1_loss(tb, torch.zeros_like(tb), reduction='none')
+    tb_loss = F.smooth_l1_loss(tb, torch.zeros_like(tb), reduction='none', beta=10)
     return tb_loss
 
 
 def emp_Z(gfn, log_Z, log_flow, repeats):
     if gfn.conditional_flow_model:
-        emp_z_loss = F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_flow.view(repeats, -1), reduction='none').view(-1)
+        emp_z_loss = F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_flow.view(repeats, -1), reduction='none', beta=10).view(-1)
     else:
-        emp_z_loss = F.smooth_l1_loss(log_Z.repeat(len(log_flow)), log_flow, reduction='none')
+        emp_z_loss = F.smooth_l1_loss(log_Z.repeat(len(log_flow)), log_flow, reduction='none', beta=10)
     return emp_z_loss
 
 
@@ -389,11 +389,11 @@ def vg_lme(gfn, log_pb, log_pf, log_r, repeats):
     if gfn.conditional_flow_model:
         log_Z = torch.logsumexp(log_ratio.view(repeats, -1), dim=0, keepdim=True) - math.log(repeats)
         # vg_loss = (0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2).view(-1)
-        vg_loss = F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_ratio.view(repeats, -1), reduction='none').view(-1)
+        vg_loss = F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_ratio.view(repeats, -1), reduction='none', beta=10).view(-1)
     else:
         log_Z = torch.logsumexp(log_ratio, dim=0, keepdim=True) - math.log(repeats)
         # vg_loss = 0.5 * (log_Z - log_ratio) ** 2
-        vg_loss = F.smooth_l1_loss(log_Z.repeat(len(log_ratio)), log_ratio, reduction='none')
+        vg_loss = F.smooth_l1_loss(log_Z.repeat(len(log_ratio)), log_ratio, reduction='none', beta=10)
     return log_Z, vg_loss
 
 
@@ -404,12 +404,12 @@ def vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats):
     if gfn.conditional_flow_model:
         log_Z = log_ratio.view(repeats, -1).mean(dim=0, keepdim=True)
         # vg_loss = (0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2).view(-1)
-        vg_loss = F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_ratio.view(repeats, -1), reduction='none').view(-1)
+        vg_loss = F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_ratio.view(repeats, -1), reduction='none', beta=10).view(-1)
 
     else:
         log_Z = log_ratio.mean(dim=0, keepdim=True)
         # vg_loss = 0.5 * (log_Z - log_ratio) ** 2
-        vg_loss = F.smooth_l1_loss(log_Z.repeat(len(log_ratio)), log_ratio, reduction='none')
+        vg_loss = F.smooth_l1_loss(log_Z.repeat(len(log_ratio)), log_ratio, reduction='none', beta=10)
     return log_Z, vg_loss
 
 #

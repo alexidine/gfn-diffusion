@@ -16,7 +16,6 @@ class GFN(nn.Module):
     def __init__(self, dim: int, s_emb_dim: int, hidden_dim: int, conditions_dim: int,
                  harmonics_dim: int, t_dim: int, log_var_range: float = 4.,
                  t_scale: float = 1., learned_variance: bool = True,
-                 trajectory_length: int = 100,
                  condition_embedding_dim: int = 32,
                  clipping: bool = False,
                  gfn_clip: float = 1e4, pb_drift_range: float = 0.1,
@@ -33,7 +32,6 @@ class GFN(nn.Module):
         self.t_dim = t_dim
         self.s_emb_dim = s_emb_dim
 
-        self.trajectory_length = trajectory_length
         self.learned_variance = learned_variance
         self.t_scale = t_scale
 
@@ -46,7 +44,6 @@ class GFN(nn.Module):
         self.joint_layers = joint_layers
 
         self.pf_std_per_traj = np.sqrt(self.t_scale)
-        self.dt = 1. / trajectory_length
         self.log_var_range = log_var_range
         self.var_clip = 16
         self.device = device
