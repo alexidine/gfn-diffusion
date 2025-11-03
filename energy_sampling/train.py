@@ -541,7 +541,7 @@ class Modeller:
 
         # Model Init
         gfn_model, gfn_config, ema_model = self.init_gfn_model(energy_function)
-        name = self.args.tag + '_' + self.args.run_name
+        name = str(self.args.tag) + '_' + str(self.args.run_name)
         np.save(f'checkpoints/{name}_model_config', gfn_config)  # todo add path to saving directories
 
         # opt init
@@ -584,7 +584,7 @@ class Modeller:
 
             for step_ind in trange(self.args.epochs + 1):
                 metrics = dict()
-                # if step_ind % 10 == 0: # not currently used
+                # if step_ind % 10 == 0:
                 #     self.set_loss_coeffs(step_ind)
 
                 exploration_std = get_exploration_std(step_ind,
