@@ -584,8 +584,8 @@ class Modeller:
 
             for step_ind in trange(self.args.epochs + 1):
                 metrics = dict()
-                # if step_ind % 10 == 0:
-                #     self.set_loss_coeffs(step_ind)
+                if step_ind % 10 == 0:
+                    self.set_loss_coeffs(step_ind)
 
                 exploration_std = get_exploration_std(step_ind,
                                                       self.args.exploratory,
@@ -639,7 +639,7 @@ class Modeller:
                     self.eval_work(ema_model, step_ind,
                                    buffer, train_mol_loader, test_mol_loader,
                                    energy_function, metrics)
-                    self.manage_prior_anchor(metrics, gfn_model, ema_model, name)
+                    self.manage_prior_anchor(step_ind, metrics, gfn_model, ema_model, name)
 
                 # train monitoring
                 if step_ind % 10 == 0:
@@ -1070,7 +1070,7 @@ class Modeller:
 
         wandb.log(metrics, step=step_ind)
 
-    def manage_prior_anchor(self, metrics, gfn_model, ema_model, name):
+    def manage_prior_anchor(self, step_ind, metrics, gfn_model, ema_model, name):
         if self.args.btb_threshold is not None and self.args.both_ways:  # todo update this to work with conditioning
             # adjust by a factor of 'multiple' for each 'delta_factor' of miss
             min_rat = 1 / 100
@@ -1081,8 +1081,12 @@ class Modeller:
                 if metric <= self.args.init_kld_threshold:
                     self.hit_init_kld = True
                     self.args.bwd_loss_coeffs.bwd_tb_z = 1.0
-                    self.args.bwd_loss_coeffs.tb = 1.0
-                    self.args.bwd_loss_coeffs.mle = 0.0
+
+                    # self.args.bwd_loss_coeffs.tb = 1.0
+                    # self.args.bwd_loss_coeffs.mle = 0.0
+                    self.args.bwd_loss_schedule['tb'] = [(0, 1.0), (step_ind, 0.0), (step_ind + self.args.bwd_thermalization_time//2, 1.0)]
+                    self.args.bwd_loss_schedule['mle'] = [(0, 1.0), (step_ind, 1.0), (step_ind + self.args.bwd_thermalization_time // 2, 0.0)]
+                    self.args.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 1.0)]
                     self.increasing_loss_cooldown = 100  # give it time to adjust to new loss landscape
 
                     torch.save(gfn_model.state_dict(), f'checkpoints/{name}_train_hit_prior.pt')
@@ -1101,7 +1105,9 @@ class Modeller:
                     print("Thermalization complete. Moving to forward training & refinement.")
 
                     self.args.fwd_to_bwd_ratio = 0.1
-                    self.args.bwd_loss_coeffs.bwd_tb_z = 0.0 # turn off backwards log Z thermalization
+                    self.args.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 0.0)]
+
+                    #self.args.bwd_loss_coeffs.bwd_tb_z = 0.0 # turn off backwards log Z thermalization
                     self.increasing_loss_cooldown = 100
                     self.phase = 3
                     self.bwd_anchor = float(metrics['Bwd TB Residual'])

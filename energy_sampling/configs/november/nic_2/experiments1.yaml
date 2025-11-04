@@ -100,7 +100,7 @@ experiments:
     learn_pb: false
     learned_variance: false
 
-- tag: 12
+- tag: 14
   update:
     T: 50
     eval_T: 50

@@ -152,13 +152,14 @@ class GFN(nn.Module):
             pflogvars_sample = self.fwd_get_logvars(detach_traj, dts, exploration_std, i, pflogvars)
             next_state = self.fwd_propagate(current_state, detach_traj, dts, pf_mean, pflogvars_sample)
 
-            #noise = ((next_state - current_state) - dts.unsqueeze(1) * pf_mean) / (
+            # noise = ((next_state - current_state) - dts.unsqueeze(1) * pf_mean) / (
             #        dts.sqrt().unsqueeze(1) * (pflogvars / 2).exp())
 
             # compute forward logprobs
             fwd_drift = dts.unsqueeze(1) * pf_mean
             fwd_var = dts.unsqueeze(1) * pflogvars.exp()
-            logpf.append(self.gauss_logprob(next_state-current_state, fwd_drift, fwd_var))#-0.5 * (noise ** 2 + logtwopi + dts.log().unsqueeze(1) + pflogvars).sum(1))
+            logpf.append(self.gauss_logprob(next_state - current_state, fwd_drift,
+                                            fwd_var))  # -0.5 * (noise ** 2 + logtwopi + dts.log().unsqueeze(1) + pflogvars).sum(1))
 
             # compute backward logprobs
             expanded_next_state = self.expand_state_for_policy(next_state)
@@ -169,7 +170,7 @@ class GFN(nn.Module):
                 var = (back_var_correction + np.log(self.pf_std_per_traj) * 2.0).clip(min=-self.var_clip,
                                                                                       max=self.var_clip).exp()
                 back_var = var * (dts * ts[:, i] / ts[:, i + 1]).unsqueeze(1)
-                logpb.append(self.gauss_logprob(current_state-next_state, back_drift, back_var))
+                logpb.append(self.gauss_logprob(current_state - next_state, back_drift, back_var))
 
             else:  # instead set this as a constant the model will have to learn around
                 back_var = torch.ones_like(back_drift) * 1e-3 * dts.unsqueeze(1)
@@ -177,7 +178,8 @@ class GFN(nn.Module):
             current_state = next_state
             # only wrap after logprob calculations
             if self.ang_dim > 0:
-                current_state[:, self.ang_mask] = self.wrap_to_pi(current_state[:, self.ang_mask] * torch.pi) / torch.pi  # latent space is on [-1, 1]
+                current_state[:, self.ang_mask] = self.wrap_to_pi(
+                    current_state[:, self.ang_mask] * torch.pi) / torch.pi  # latent space is on [-1, 1]
             states[:, i + 1] = current_state
 
             if return_gauss_params:
@@ -194,7 +196,8 @@ class GFN(nn.Module):
         else:
             return states, logpfs, logpbs, logf
 
-    def log_gauss_params(self, back_drift, back_var, dts, fwd_drift, i, logvars_b, logvars_f, means_b, means_f, pflogvars):
+    def log_gauss_params(self, back_drift, back_var, dts, fwd_drift, i, logvars_b, logvars_f, means_b, means_f,
+                         pflogvars):
         means_b[:, i, :] = back_drift.detach()
         logvars_b[:, i, :] = (back_var / dts[:, None]).log().detach()
         means_f[:, i, :] = fwd_drift.detach()
@@ -238,14 +241,14 @@ class GFN(nn.Module):
                 prev_state = self.bwd_propagate(back_mean, back_var, current_state, detach_traj)
 
                 # log Pb calculation
-                #noise_backward = (prev_state - back_mean) / back_var.sqrt()
-                #logpb.append(-0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1))
+                # noise_backward = (prev_state - back_mean) / back_var.sqrt()
+                # logpb.append(-0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1))
                 logpb.append(self.gauss_logprob(prev_state - current_state, back_drift, back_var))
             else:
                 # send it identically to the source state (0)
                 prev_state = torch.zeros_like(current_state)
-                back_drift= -current_state
-                #back_mean = prev_state  # remember the back_mean in pb is for some reason the actual mean not the drift
+                back_drift = -current_state
+                # back_mean = prev_state  # remember the back_mean in pb is for some reason the actual mean not the drift
                 back_var = torch.ones_like(back_drift) * 1e-3 * dts.unsqueeze(1)
 
             """log pf calculation"""
@@ -271,7 +274,8 @@ class GFN(nn.Module):
 
             current_state = prev_state
             if self.ang_dim > 0:
-                current_state[:, self.ang_mask] = self.wrap_to_pi(current_state[:, self.ang_mask] * torch.pi) / torch.pi  # latent space is on [-1, 1]
+                current_state[:, self.ang_mask] = self.wrap_to_pi(
+                    current_state[:, self.ang_mask] * torch.pi) / torch.pi  # latent space is on [-1, 1]
             states[:, trajectory_length - i - 1] = current_state.detach()
 
         logpfs = torch.stack(logpf).T
@@ -283,10 +287,10 @@ class GFN(nn.Module):
         else:
             return states, logpfs, logpbs, logf
 
-    def fwd_get_back_correction(self, condition_embedding, i, next_state, ts):
+    def fwd_get_back_correction(self, condition_embedding, i, expanded_next_state, ts):
         if self.learn_pb:
             t_emb = self.t_model(ts[:, i + 1])
-            pbs = self.backward_policy(self.s_model(next_state, condition_embedding), t_emb)
+            pbs = self.backward_policy(self.s_model(expanded_next_state, condition_embedding), t_emb)
             dmean, dvar = gaussian_params(pbs)
             back_mean_correction = 1 + torch.tanh(dmean / self.pb_drift_range) * self.pb_drift_range
 
@@ -298,7 +302,11 @@ class GFN(nn.Module):
                 back_additive_logvar = torch.zeros_like(dvar)
 
         else:
-            back_mean_correction, back_additive_logvar = torch.ones_like(next_state), torch.zeros_like(next_state)
+            back_mean_correction, back_additive_logvar = (torch.ones((len(expanded_next_state), self.dim),
+                                                                     dtype=torch.float32, device=self.device),
+                                                          torch.zeros((len(expanded_next_state), self.dim),
+                                                                      dtype=torch.float32, device=self.device)
+                                                          )
         return back_mean_correction, back_additive_logvar
 
     def fwd_propagate(self, current_state, detach_traj, dts, pf_mean, pflogvars_sample):
@@ -339,10 +347,10 @@ class GFN(nn.Module):
                   back_var.sqrt() * torch.randn_like(current_state, device=self.device))
         return s_
 
-    def bwd_get_correction(self, condition_embedding, current_state, i, trajectory_length, ts):
+    def bwd_get_correction(self, condition_embedding, expanded_current_state, i, trajectory_length, ts):
         if self.learn_pb:
             t = self.t_model(ts[:, trajectory_length - i])
-            pbs = self.backward_policy(self.s_model(current_state, condition_embedding), t)
+            pbs = self.backward_policy(self.s_model(expanded_current_state, condition_embedding), t)
             dmean, dvar = gaussian_params(pbs)
             back_mean_correction = 1 + dmean.tanh() * self.pb_drift_range
 
@@ -354,7 +362,12 @@ class GFN(nn.Module):
                 back_additive_logvar = torch.zeros_like(dvar)
 
         else:
-            back_mean_correction, back_additive_logvar = torch.ones_like(current_state), torch.zeros_like(current_state)
+            # back_mean_correction, back_additive_logvar = torch.ones_like(current_state), torch.zeros_like(current_state)
+            back_mean_correction, back_additive_logvar = (torch.ones((len(expanded_current_state), self.dim),
+                                                                     dtype=torch.float32, device=self.device),
+                                                          torch.zeros((len(expanded_current_state), self.dim),
+                                                                      dtype=torch.float32, device=self.device)
+                                                          )
         return back_mean_correction, back_additive_logvar
 
     def init_traj_tensors(self, batch_size, trajectory_length):
@@ -376,11 +389,11 @@ class GFN(nn.Module):
         lin = state[..., ~self.ang_mask]  # [B, 10]
         ang = state[..., self.ang_mask] * torch.pi  # [B, 2]  # latent space is natively defined on [-1, 1]
         sin, cos = torch.sin(ang), torch.cos(ang)  # [B, 2] each
-        orient = torch.stack([sin, cos], dim=-1).reshape(state.size(0), self.ang_dim * 2) # [B, 6]
+        orient = torch.stack([sin, cos], dim=-1).reshape(state.size(0), self.ang_dim * 2)  # [B, 6]
         return torch.cat([lin, orient], dim=-1)  # [B, 6 + 8*zp]
 
     def gauss_logprob(self, delta_x, drift, var):
         noise = (delta_x - drift) / var.sqrt()
-        #noise_raw[:, self.ang_mask] = self.wrap_to_pi(noise_raw[:, self.ang_mask])
+        # noise_raw[:, self.ang_mask] = self.wrap_to_pi(noise_raw[:, self.ang_mask])
 
         return -0.5 * (noise ** 2 + logtwopi + var.log()).sum(1)
