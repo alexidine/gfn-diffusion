@@ -1,5 +1,5 @@
-run_name: 'mk_local_dev'
-tag: 'dev'
+run_name: 'nov_nic_3'
+tag: 'nov_nic_3'
 seed: 12345
 device: 'cuda'
 lr_policy: 0.0005              # learning rate of the policy network
@@ -27,15 +27,15 @@ harmonics_dim: 64            # dimensionality of harmonic embedding
 dropout: 0                    # dropout probability
 norm: layer                   # null, "layer" - DON'T PUT 'batch'
 
-batch_size: 100              # number of samples per training batch
+batch_size: 500              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 10000           # maximum batch size to allow
+max_batch_size: 2000           # maximum batch size to allow
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
 eval_batch_size: 5000        # batch size for evaluation
 epochs: 1000000             # number of training epochs
 eval_period: 100              # how often to do evaluation & reporting
-conditional_eval_period: 100 # how often to do conditional evaluation with figs # must be multiple of eval period
-figs_period: 100             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+conditional_eval_period: 1000 # how often to do conditional evaluation with figs # must be multiple of eval period
+figs_period: 1000             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # GFlowNet settings
 T: 15                        # static training diffusion length
@@ -70,23 +70,23 @@ fwd_loss_coeffs:
   loss_clip:        1.0E+9
 bwd_loss_coeffs:
   tb:               1.0  # will be altered by bwd_tb_z - must be nonzero for log Z backwards-trained warm start
-  bwd_tb_z:         1.0  # 2 if we should only train the Z component in tb, 1 if we should train log Z on backward TB, 0 if not. bwd tb must be >0
+  bwd_tb_z:         2.0  # 2 if we should only train the Z component in tb, 1 if we should train log Z on backward TB, 0 if not. bwd tb must be >0
   vg_lb:            0
   vg_lme:           0  # exclusive with vg_lb
   emp_z:            0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
-  mle:              0.0  #[[0, 1.0], [1000, 1.0], [2000, 0.0]]  # will do weighted MLE if VG is running, otherwise trajectory-wise
+  mle:              1.0  #[[0, 1.0], [1000, 1.0], [2000, 0.0]]  # will do weighted MLE if VG is running, otherwise trajectory-wise
   mle_prior_fraction: 0.0  # DEPRECATED must be rewritten what fraction of samples to replace with SG-wise unconditional prior
   pmle_std:         0.01 # std deviation of the prior mle distribution. Best to start small (1) and smoothly grow
   loss_clip:        1.0E+9
 
-btb_threshold: 1.5 # set this null to skip fwd-bwd balancing
-bwd_thermalization_time: 50  # time to transition from MLE to bTB training
-init_kld_threshold: 1
-prior_coverage_ratio: 0.05  # [0, 1] fraction of uniform bin coverage that will satisfy the coverage metric
+btb_threshold: 1.5
+bwd_thermalization_time: 5000
+init_kld_threshold: 0.01
+prior_coverage_ratio: 0.05  # mostly unused [0, 1] fraction of uniform bin coverage that will satisfy the coverage metric
 both_ways: true             # forward and backward training
 repeats: 2                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
 bwd_batch_multiplier: 1      # ratio of backward to foward batch size (much cheaper to evaluate)
-fwd_to_bwd_ratio: 0.00001          # whether to do forward (>1) or backward (<1) training more often
+fwd_to_bwd_ratio: 0.000001           # whether to do forward (>1) or backward (<1) training more often
 bwd: false                   # backward training only
 learn_pb: true               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
 learned_variance: True       # whether to learn policy variance
@@ -96,18 +96,9 @@ energy_clip: 10  # where to start softly clipping energy values from above - han
 
 # dataset settings
 ################################################################
-#buffer_path: 'D:/crystal_datasets/opt_outputs/acridine_sg_14_zp_1_2.pt'
-buffer_path: 'D:/crystal_datasets/opt_outputs/nicotinamide_sg_1_2.pt' #'D:/crystal_datasets/urea_gfn_dataset.pt' #
-#buffer_path: 'D:/crystal_datasets/test_qm9_crystals_test.pt' #'D:/crystal_datasets/nic_sg2_dataset.pt' #'D:/crystal_datasets/urea_gfn_dataset.pt' #
-#molecules_path: 'D:/crystal_datasets/train_qm9.pt'
-#molecules_path: 'D:/crystal_datasets/acridine.pt'
-molecules_path: 'D:/crystal_datasets/nicotinamide.pt'
-autoencoder_path: 'D:/crystal_datasets/model_checkpoints/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
-
-#buffer_path: '/scratch/mk8347/csd_runs/datasets/nicotinamide_sg_1_2.pt'
-#molecules_path: '/scratch/mk8347/csd_runs/datasets/nicotinamide.pt'
-#autoencoder_path: '/scratch/mk8347/csd_runs/models/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
-
+buffer_path: '/scratch/mk8347/csd_runs/datasets/nicotinamide_sg_1_2.pt'
+molecules_path: '/scratch/mk8347/csd_runs/datasets/nicotinamide.pt'
+autoencoder_path: '/scratch/mk8347/csd_runs/models/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
 
 # replay buffer settings
 # NOTE THESE SETTINGS CURRENTLY UNUSED - BUFFER IS SET TO PRELOADED PRIOR ONLY WITH RANDOM SAMPLING

@@ -19,7 +19,8 @@ def density_penalty(packing_coeff):
     :param packing_coeff:
     :return:
     """
-    return F.relu(-(torch.log(packing_coeff) - np.log(0.55))) ** 2 + F.relu(packing_coeff - 0.95) ** 2
+    cp = packing_coeff.clip(min=0.1, max=2)  # clip here for safety - this loss term can explode
+    return F.relu(-(torch.log(cp) - np.log(0.55))) ** 2 + F.relu(cp - 0.95) ** 2
 
 
 def compute_niggli_overlap(cell_parameters):
@@ -63,52 +64,6 @@ def soft_clip(y, clip_value):
     new_y[y > clip_value] = clip_value + torch.log(y[y > clip_value] + 1 - clip_value)
     # new_y[y>clip_value] = clip_value + delta ** (0.5)
     return new_y
-
-#
-# def mol_to_blank_crystal_list(mol_batch, sgs):
-#     ones3 = torch.ones(3, device='cpu')
-#     zeros1 = torch.zeros(1, device='cpu')
-#     eye3 = torch.eye(3, device='cpu')[None, :]
-#     ones1 = torch.ones(1, device='cpu')
-#
-#     sg_cache = {}
-#     for sg in set(sgs):
-#         sg_cache[sg] = np.stack(SYM_OPS[int(sg)])
-#
-#     base_xtal = MolCrystalData(
-#         skip_box_analysis=True,
-#         aunit_handedness=ones1,
-#         cell_lengths=ones3,
-#         cell_angles=ones3,
-#         aunit_centroid=ones3,
-#         aunit_orientation=ones3,
-#         silu_pot=zeros1,
-#         lj_pot=zeros1,
-#         scaled_lj_pot=zeros1,
-#         es_pot=zeros1,
-#         niggli_overlap=zeros1,
-#         ellipsoid_overlap=zeros1,
-#         density_energy=zeros1,
-#         niggli_energy=zeros1,
-#         core_energy=zeros1,
-#         lj_energy=zeros1,
-#         bounding_energy=zeros1,
-#         T_fc=eye3,
-#         T_cf=eye3,
-#         cell_volume=zeros1,
-#         packing_coeff=zeros1,
-#         density=zeros1,
-#     )
-#     crystal_list = []
-#     for ind in range(mol_batch.num_graphs):
-#         crystal = base_xtal.clone()
-#         crystal.set_mol_attrs(mol_batch[ind].clone())
-#         crystal.set_symmetry_attrs(is_well_defined=True,
-#                                    nonstandard_symmetry=False,
-#                                    sg_ind=sgs[ind],
-#                                    symmetry_operators=sg_cache[sgs[ind]])
-#         crystal_list.append(crystal)
-#     return crystal_list
 
 
 class MolecularCrystal(BaseSet):
@@ -343,7 +298,6 @@ class MolecularCrystal(BaseSet):
         # return total_energy, ens_dict
         return (soft_clip(soften_high(total_energy, self.energy_clip / 2, coeff=0.7), self.energy_clip),
                 ens_dict)  # softly bound from above  #crystal_energy.clip(min=-self.energy_clip, max=self.energy_clip)
-        # return soft_clip(total_energy, 0).clip(max=self.energy_clip), ens_dict  # softly bound from above  #crystal_energy.clip(min=-self.energy_clip, max=self.energy_clip)
 
     @torch.no_grad()
     def prebuilt_sample_to_reward(self, crystals, temperature):

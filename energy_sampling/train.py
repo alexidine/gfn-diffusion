@@ -1,5 +1,6 @@
 import gc
 import os
+from collections import defaultdict
 from copy import deepcopy
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 # os.environ["TORCH_USE_CUDA_DSA"] = "1"
@@ -695,7 +696,8 @@ class Modeller:
                 gfn_model.train()
                 ema_model.eval()
 
-                for opt in optimizers.values():  # MK consider also loading optimizer state here
+                for opt in optimizers.values():
+                    opt.state = defaultdict(dict)  # wipe also the momentum buffers
                     for g in opt.param_groups:
                         if g['lr'] > self.args.min_lr:
                             g['lr'] *= 0.75
@@ -1093,24 +1095,28 @@ class Modeller:
                     torch.save(ema_model.state_dict(), f'checkpoints/{name}_eval_hit_prior.pt')
                     print("Hit initial KLD threshold. Moving to backward thermalization.")
 
-                    self.iters_to_thermalize = self.args.bwd_thermalization_time
                     self.phase = 2
+                    self.bwd_tb_record = []
 
-            elif self.iters_to_thermalize > 0:
-                self.iters_to_thermalize -= self.args.eval_period
+            elif self.phase == 2:
+                self.bwd_tb_record.append(metrics['Bwd TB Residual'])
+                n_eval_steps = (1000//self.args.eval_period)
+                if len(self.bwd_tb_record) >= n_eval_steps:  # check convergence over X steps
+                    recent = np.array(self.bwd_tb_record[-n_eval_steps:])
+                    mean_recent = recent.mean()
+                    std_recent = recent.std()
+                    if std_recent / (mean_recent + 1e-9) < 0.05:
+                        torch.save(gfn_model.state_dict(), f'checkpoints/{name}_train_thermalized.pt')
+                        torch.save(ema_model.state_dict(), f'checkpoints/{name}_eval_thermalized.pt')
+                        print("Thermalization complete. Moving to forward training & refinement.")
 
-                if self.iters_to_thermalize <= 0:
-                    torch.save(gfn_model.state_dict(), f'checkpoints/{name}_train_thermalized.pt')
-                    torch.save(ema_model.state_dict(), f'checkpoints/{name}_eval_thermalized.pt')
-                    print("Thermalization complete. Moving to forward training & refinement.")
+                        self.args.fwd_to_bwd_ratio = 0.1
+                        self.args.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 0.0)]
 
-                    self.args.fwd_to_bwd_ratio = 0.1
-                    self.args.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 0.0)]
-
-                    #self.args.bwd_loss_coeffs.bwd_tb_z = 0.0 # turn off backwards log Z thermalization
-                    self.increasing_loss_cooldown = 100
-                    self.phase = 3
-                    self.bwd_anchor = float(metrics['Bwd TB Residual'])
+                        #self.args.bwd_loss_coeffs.bwd_tb_z = 0.0 # turn off backwards log Z thermalization
+                        self.increasing_loss_cooldown = 100
+                        self.phase = 3
+                        self.bwd_anchor = float(np.median(recent))
 
             elif self.phase == 3:
                 # if we have hit it, dynamically adjust fwd_to_bwd_ratio to keep it under the threshold based on the minimum original value
