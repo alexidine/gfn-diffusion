@@ -143,7 +143,7 @@ class MolecularCrystal(BaseSet):
         else:
             # for crystals at realistic densities, supercell_size=2 is sufficient. Very dense crystals will not be accurate, but they get punished later by the density energy term
             cluster_batch = crystal_batch.mol2cluster(cutoff=6,
-                                                      supercell_size=2,
+                                                      supercell_size=4,
                                                       std_orientation=False)  # take the input molecule as given
             cluster_batch.construct_radial_graph(cutoff=6,
                                                  max_num_neighbors=100)
@@ -170,7 +170,7 @@ class MolecularCrystal(BaseSet):
         # todo this could definitely be cleaned up
         cluster_batch.silu_pot = silu_energy
         cluster_batch.lj_pot = lj_energy
-        cluster_batch.scaled_lj_pot = normed_lj_energy / cluster_batch.num_atoms
+        cluster_batch.scaled_lj_pot = normed_lj_energy
         cluster_batch.ellipsoid_overlap = ellipsoid_overlap
         cluster_batch.niggli_overlap = compute_niggli_overlap(cluster_batch.zp1_cell_parameters())
 
@@ -179,9 +179,9 @@ class MolecularCrystal(BaseSet):
         cluster_batch.gfn_energy = crystal_energy
 
         crystal_batch.gfn_energy = crystal_energy.cpu().detach()
-        crystal_batch.silu_pot = (silu_energy / cluster_batch.num_atoms).cpu().detach()
-        crystal_batch.lj_pot = (lj_energy / cluster_batch.num_atoms).cpu().detach()
-        crystal_batch.scaled_lj_pot = (normed_lj_energy / cluster_batch.num_atoms).cpu().detach()
+        crystal_batch.silu_pot = silu_energy.cpu().detach()
+        crystal_batch.lj_pot = lj_energy.cpu().detach()
+        crystal_batch.scaled_lj_pot = normed_lj_energy.cpu().detach()
         crystal_batch.ellipsoid_overlap = ellipsoid_overlap.cpu().detach()
         crystal_batch.niggli_overlap = cluster_batch.niggli_overlap.cpu().detach()
         for key in ens_dict.keys():

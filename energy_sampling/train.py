@@ -646,8 +646,8 @@ class Modeller:
                 if step_ind % 10 == 0:
                     loss_record.append(fwd_loss + bwd_loss)
                     if loss_record[-1] == torch.amin(torch.tensor(loss_record)):  # if this is the best model yet
-                        torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train.pt')
-                        torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval.pt')
+                        torch.save(gfn_model.state_dict(), f'checkpoints/best_{name}_model_train.pt')
+                        torch.save(ema_model.state_dict(), f'checkpoints/best_{name}_model_eval.pt')
 
                     metrics['train/expl'] = exploration_std(0) if exploration_std is not None else 0
                     lr = self.step_lr_schedule(schedulers, optimizers)
@@ -655,6 +655,10 @@ class Modeller:
                     self.ten_step_reporting(bwd_loss, bwd_loss_dict, fwd_loss, fwd_loss_dict, metrics, optimizers)
                     loss_record = self.check_loss_explosion(name, loss_record, gfn_model, ema_model, optimizers)
                     wandb.log(metrics, step=step_ind)
+
+                if step_ind % 1000 == 0: # save running model
+                    torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train.pt')
+                    torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval.pt')
 
             torch.save(ema_model, f'checkpoints/{name}_model_final.pt')
 
@@ -1087,7 +1091,7 @@ class Modeller:
                     # self.args.bwd_loss_coeffs.tb = 1.0
                     # self.args.bwd_loss_coeffs.mle = 0.0
                     self.args.bwd_loss_schedule['tb'] = [(0, 1.0), (step_ind, 0.0), (step_ind + self.args.bwd_thermalization_time//2, 1.0)]
-                    self.args.bwd_loss_schedule['mle'] = [(0, 1.0), (step_ind, 1.0), (step_ind + self.args.bwd_thermalization_time // 2, 0.0)]
+                    self.args.bwd_loss_schedule['mle'] = [(0, 1.0), (step_ind, 1), (step_ind + self.args.bwd_thermalization_time // 2, 0.0)]
                     self.args.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 1.0)]
                     self.increasing_loss_cooldown = 100  # give it time to adjust to new loss landscape
 
@@ -1111,7 +1115,9 @@ class Modeller:
                         print("Thermalization complete. Moving to forward training & refinement.")
 
                         self.args.fwd_to_bwd_ratio = 0.1
-                        self.args.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 0.0)]
+                        self.args.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 0)]
+                        self.args.fwd_loss_schedule['tb'] = [(0, 1.0), (step_ind, 0.0),
+                                                             (step_ind + self.args.bwd_thermalization_time // 2, 1.0)]
 
                         #self.args.bwd_loss_coeffs.bwd_tb_z = 0.0 # turn off backwards log Z thermalization
                         self.increasing_loss_cooldown = 100

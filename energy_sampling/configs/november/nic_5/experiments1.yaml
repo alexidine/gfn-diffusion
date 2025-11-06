@@ -1,0 +1,113 @@
+defaults:
+  base: base.yaml
+
+
+# check variance, pb, temperature, energy clip, batch size, lr
+experiments:
+- tag: 0
+  update:
+    T: 50
+    eval_T: 50
+    energy_clip: 100
+    energy_static_temperature: 1.0
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    learn_pb: true
+    learned_variance: true
+
+- tag: 1
+  update:
+    T: 50
+    eval_T: 50
+    energy_clip: 100
+    energy_static_temperature: 1.0
+    max_batch_size: 2000
+    log_var_range: 6
+    pb_drift_range: 0.3
+    pb_var_range: 4
+    learn_pb: true
+    learned_variance: true
+
+- tag: 2
+  update:
+    T: 50
+    eval_T: 50
+    energy_clip: 100
+    energy_static_temperature: 0.75
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    learn_pb: true
+    learned_variance: true
+
+- tag: 3
+  update:
+    T: 50
+    eval_T: 50
+    energy_clip: 100
+    energy_static_temperature: 0.5
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    learn_pb: true
+    learned_variance: true
+
+- tag: 4
+  update:
+    T: 50
+    eval_T: 50
+    energy_clip: 100
+    energy_static_temperature: 0.1
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    learn_pb: true
+    learned_variance: true
+
+- tag: 5
+  update:
+    T: 50
+    eval_T: 50
+    energy_clip: 100
+    energy_static_temperature: 0.1
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    learn_pb: true
+    learned_variance: true
+    weight_decay: 0.001
+    use_weight_decay: true
+
+- tag: 6
+  update:
+    T: 50
+    eval_T: 50
+    energy_clip: 100
+    energy_static_temperature: 01
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    learn_pb: true
+    learned_variance: true
+    gradient_norm_clip: 0.05
+
+- tag: 7
+  update:
+    T: 50
+    eval_T: 50
+    energy_clip: 100
+    energy_static_temperature: 1.0
+    max_batch_size: 10000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    learn_pb: true
+    learned_variance: true
+

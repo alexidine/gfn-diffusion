@@ -812,8 +812,9 @@ def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r
     # training metrics
     metrics['Mean Sample Energy'] = sample_batch.gfn_energy.mean().cpu().detach().item()
     metrics['Sample Energy'] = sample_batch.gfn_energy.clip(max=50).cpu().detach().numpy()
+    metrics['Scaled LJ'] = sample_batch.scaled_lj_pot.cpu().detach().numpy()
 
-    metrics['Mean Sample Reward'] = log_r.mean().cpu().detach().item()
+    metrics['Mean Sample Reward'] = log_r.mean().cpu().detach().item()  # todo this should probably be denormed by the temperature
     metrics['Sample Reward'] = log_r.clip(min=-50).cpu().detach().numpy()
 
     metrics['Empirical log Z'] = log_Z_empirical.cpu().detach().item()
