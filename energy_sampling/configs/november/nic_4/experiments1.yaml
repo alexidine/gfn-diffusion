@@ -17,7 +17,7 @@ experiments:
     learn_pb: true
     learned_variance: true
 
-- tag: 1
+- tag: 1 # slightly slower to train, perhaps
   update:
     T: 50
     eval_T: 50
@@ -30,7 +30,7 @@ experiments:
     learn_pb: true
     learned_variance: true
 
-- tag: 2
+- tag: 2  # failed MLE task
   update:
     T: 50
     eval_T: 50
@@ -43,7 +43,7 @@ experiments:
     learn_pb: true
     learned_variance: false
 
-- tag: 3
+- tag: 3  # variance explosion
   update:
     T: 50
     eval_T: 50
@@ -56,7 +56,7 @@ experiments:
     learn_pb: false
     learned_variance: true
 
-- tag: 4
+- tag: 4  # slightly worse training
   update:
     T: 50
     eval_T: 50
@@ -69,7 +69,7 @@ experiments:
     learn_pb: true
     learned_variance: true
 
-- tag: 5
+- tag: 5 # tighter convergence, much larger distribution shift. Led into variance explosion failure mode
   update:
     T: 50
     eval_T: 50
@@ -82,7 +82,7 @@ experiments:
     learn_pb: true
     learned_variance: true
 
-- tag: 6
+- tag: 6  #tighter convergence, larger distribution shift, worse energies but no explosion
   update:
     T: 50
     eval_T: 50
@@ -95,7 +95,7 @@ experiments:
     learn_pb: true
     learned_variance: true
 
-- tag: 7
+- tag: 7  # rather good, starting to concentrate at lower and lower energies. no explosions. Weak backward anchor. Ema model would probably be nice
   update:
     T: 50
     eval_T: 50
@@ -108,7 +108,7 @@ experiments:
     learn_pb: true
     learned_variance: true
 
-- tag: 8
+- tag: 8  # very different behavior actually. seems like lower effective temperature
   update:
     T: 50
     eval_T: 50

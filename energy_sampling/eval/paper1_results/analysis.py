@@ -5,6 +5,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import torch
 from tqdm import tqdm
+from umap import UMAP
 
 from energy_sampling.eval.paper1_results.utils import cluster_dendro_fig, marginal_cluster_1d, coupling_ratio, \
     correlate_mask, top_joint_correlates, latent_dendro_fig, plot_marginals
@@ -36,7 +37,7 @@ def get_highp_correlations(marginal_labels, n_samples, n_dims, cutoff: float = 2
     return corr_df
 
 
-def compute_dim_weights(corr_df, use_pjoint=True):
+def compute_dim_weights(corr_df, use_pjoint=True, ratio_thresh=2.0, order_min=2):
     """
     Compute per-dimension weights from high-probability correlations.
 
@@ -306,24 +307,25 @@ if __name__ == '__main__':
     samples = analyze_samples(sample_latents, molecule * len(sample_latents), max_z_prime, device, batch_size)
     sample_batch = collate_data_list(samples, max_z_prime=max_z_prime)
 
+
     """Analyses"""
     "Standard visualizations"
     sample_batch.plot_batch_staircase(space='real')
     sample_batch.plot_batch_cell_params(space='real', ref_dist=data_batch.full_cell_parameters())
     sample_batch.plot_batch_density_funnel()
 
-    "Latent Space Analysis"
-    latent_dendro_fig(sample_latents[sample_batch.lj_pot < 0].cpu().detach().numpy(),
-                      sample_batch.lj_pot[sample_batch.lj_pot < 0].cpu().detach().numpy())
-
     "1D Marginal Clusters"
     marginal_labels = marginal_cluster_1d(sample_latents.cpu().detach().numpy())
     n_samples, n_dims = marginal_labels.shape
     clusters_per_dim = np.amax(marginal_labels, axis=0) + 1
 
+    "Latent Space Dendrogram"
+    latent_dendro_fig(sample_latents[sample_batch.lj_pot < 0].cpu().detach().numpy(),
+                      sample_batch.lj_pot[sample_batch.lj_pot < 0].cpu().detach().numpy())
+
     "High coupling n-dimensional correlation clusters for any n"
     corr_df = get_highp_correlations(marginal_labels, n_samples, n_dims, 2, 4)
-    dim_weights = compute_dim_weights(corr_df)
+    dim_weights = compute_dim_weights(corr_df, ratio_thresh=2.0, order_min=2)
     # masks = [
     #     correlate_mask(marginal_labels, row.dims, row.clusters)
     #     for _, row in corr_df[corr_df.order == 2].iterrows()
@@ -358,5 +360,20 @@ if __name__ == '__main__':
 
     "Hierarchical joint probabilities"
     # df = hierarchical_joint_df(marginal_labels, max_order=3, cutoff=0.005)
+
+    "Dimension Reduction"
+    umap_model = UMAP(n_components=2, n_neighbors=100, min_dist=0.01)
+    sample_embedding = umap_model.fit_transform(sample_latents)
+    # masks = [correlate_mask(marginal_labels, top_df.loc[ind, "dims"], top_df.loc[ind, "clusters"]) for ind in
+    #          range(20)]
+    masks = [
+        correlate_mask(marginal_labels, row.dims, row.clusters)
+        for _, row in corr_df[corr_df.order == 4].iloc[:20].iterrows()
+    ]
+    fig = go.Figure()
+    fig.add_scatter(x=sample_embedding[:, 0], y=sample_embedding[:, 1], mode='markers', opacity=0.25, showlegend=False)
+    for ind, m in enumerate(masks):
+        fig.add_scatter(x=sample_embedding[m, 0], y=sample_embedding[m, 1], mode='markers', opacity=1.0, showlegend=False, marker_color=ind)
+    fig.show()
 
     end = 1

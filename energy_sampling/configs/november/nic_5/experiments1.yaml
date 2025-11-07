@@ -1,10 +1,12 @@
 defaults:
   base: base.yaml
 
+# we should maybe boost bounding energy ***
+# backward anchor - it's in log space, so maybe it should be rescaled?
 
 # check variance, pb, temperature, energy clip, batch size, lr
 experiments:
-- tag: 0
+- tag: 0  # starting to hit bounds and explode, I think
   update:
     T: 50
     eval_T: 50
@@ -17,7 +19,7 @@ experiments:
     learn_pb: true
     learned_variance: true
 
-- tag: 1
+- tag: 1  # well behaved. Less sharpening actually. Log Z going down
   update:
     T: 50
     eval_T: 50
@@ -30,7 +32,7 @@ experiments:
     learn_pb: true
     learned_variance: true
 
-- tag: 2
+- tag: 2  # sensible result
   update:
     T: 50
     eval_T: 50
@@ -69,7 +71,7 @@ experiments:
     learn_pb: true
     learned_variance: true
 
-- tag: 5
+- tag: 5  # crashed
   update:
     T: 50
     eval_T: 50
@@ -89,7 +91,7 @@ experiments:
     T: 50
     eval_T: 50
     energy_clip: 100
-    energy_static_temperature: 01
+    energy_static_temperature: 01 # oops
     max_batch_size: 2000
     log_var_range: 4
     pb_drift_range: 0.2
@@ -98,7 +100,7 @@ experiments:
     learned_variance: true
     gradient_norm_clip: 0.05
 
-- tag: 7
+- tag: 7  # ok, legitimately more stable, though worse losses. better energies. Actually nice overall
   update:
     T: 50
     eval_T: 50

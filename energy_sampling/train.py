@@ -250,11 +250,8 @@ class Modeller:
             'temperature': self.args.energy_static_temperature,
             'density_coeff': self.args.energy_density_coeff,
             'energy_clip': self.args.energy_clip,
-            'ellipsoid_scale': self.args.ellipsoid_scale,
-            'core_coeff': self.args.energy_core_coeff,
             'lj_coeff': self.args.energy_lj_coeff,
             'lj_turnover_pot': self.args.lj_turnover_pot,
-            'lj_repulsion': self.args.lj_repulsion,
             'molecule_conditioning': self.args.molecule_conditioning,
             'sg_conditioning': self.args.sg_conditioning,
             'space_groups': self.args.space_groups,
@@ -1017,20 +1014,14 @@ class Modeller:
         good_inds = torch.argwhere(torch.all(latents.abs() <= 1, dim=1))  # valid latent space
         dataset = [dataset[ind] for ind in good_inds]
 
-        if self.args.energy_function == 'ellipsoid_overlap':
-            assert False, "Ellipsoid overlap not updated for Z'>1"
-
-        if self.args.energy_function in ['ellipsoid_overlap',
-                                         'silu_energy',
-                                         'combo']:  # reparameterize incoming samples
+        if self.args.energy_function in ['silu', 'lj']:  # reparameterize incoming samples
             print("Re-featurizing preloaded buffer samples")
             dataset = featurize_dataset(dataset,
                                         self.device,
-                                        self.args.ellipsoid_scale,
-                                        self.args.lj_repulsion,
+                                        self.args.energy_function,
                                         max_z_prime=max_z_prime)
 
-        if filter_unbound:  # filter non-bound states
+        if filter_unbound:  # filter unbound states
             dataset = [elem for elem in dataset if elem.lj_pot < 0]
             dataset = [elem for elem in dataset if elem.silu_pot < 0]
 
@@ -1074,6 +1065,12 @@ class Modeller:
                                           step_ind,
                                           test_mol_loader))
 
+        for key in metrics.keys():  # cleanup nans
+            if isinstance(metrics[key], np.ndarray):
+                metrics[key] = np.nan_to_num(metrics[key])
+            elif torch.is_tensor(metrics[key]):
+                metrics[key] = torch.nan_to_num(metrics[key])
+
         wandb.log(metrics, step=step_ind)
 
     def manage_prior_anchor(self, step_ind, metrics, gfn_model, ema_model, name):
@@ -1094,6 +1091,7 @@ class Modeller:
                     self.args.bwd_loss_schedule['mle'] = [(0, 1.0), (step_ind, 1), (step_ind + self.args.bwd_thermalization_time // 2, 0.0)]
                     self.args.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 1.0)]
                     self.increasing_loss_cooldown = 100  # give it time to adjust to new loss landscape
+                    self.bwd_thermalization_stop_time = step_ind + self.args.bwd_thermalization_time
 
                     torch.save(gfn_model.state_dict(), f'checkpoints/{name}_train_hit_prior.pt')
                     torch.save(ema_model.state_dict(), f'checkpoints/{name}_eval_hit_prior.pt')
@@ -1101,15 +1099,23 @@ class Modeller:
 
                     self.phase = 2
                     self.bwd_tb_record = []
+                    self.logz_record = []
 
             elif self.phase == 2:
                 self.bwd_tb_record.append(metrics['Bwd TB Residual'])
+                self.logz_record.append(metrics['log Z learned'])
+
                 n_eval_steps = (1000//self.args.eval_period)
                 if len(self.bwd_tb_record) >= n_eval_steps:  # check convergence over X steps
-                    recent = np.array(self.bwd_tb_record[-n_eval_steps:])
-                    mean_recent = recent.mean()
-                    std_recent = recent.std()
-                    if std_recent / (mean_recent + 1e-9) < 0.05:
+                    recent_tb = np.array(self.bwd_tb_record[-n_eval_steps:])
+                    recent_z = np.array(self.logz_record[-n_eval_steps:])
+
+                    mean_tb, std_tb = recent_tb.mean(), recent_tb.std()
+                    mean_z, std_z = recent_z.mean(), recent_z.std()
+
+                    tb_stable = (std_tb / (mean_tb + 1e-9)) < self.args.thermalization_conv_eps
+                    z_stable = (std_z / (abs(mean_z) + 1e-9)) < self.args.theramlization_conv_eps # tune threshold as needed
+                    if tb_stable and z_stable and (step_ind >= self.bwd_thermalization_stop_time):
                         torch.save(gfn_model.state_dict(), f'checkpoints/{name}_train_thermalized.pt')
                         torch.save(ema_model.state_dict(), f'checkpoints/{name}_eval_thermalized.pt')
                         print("Thermalization complete. Moving to forward training & refinement.")
@@ -1122,11 +1128,11 @@ class Modeller:
                         #self.args.bwd_loss_coeffs.bwd_tb_z = 0.0 # turn off backwards log Z thermalization
                         self.increasing_loss_cooldown = 100
                         self.phase = 3
-                        self.bwd_anchor = float(np.median(recent))
+                        self.bwd_anchor = np.sqrt(float(np.median(recent_tb)))
 
             elif self.phase == 3:
                 # if we have hit it, dynamically adjust fwd_to_bwd_ratio to keep it under the threshold based on the minimum original value
-                metric = metrics['Bwd TB Residual']
+                metric = np.sqrt(metrics['Bwd TB Residual'])
 
                 err = (metric - self.bwd_anchor * self.args.btb_threshold) / (self.bwd_anchor * self.args.btb_threshold)
                 # target the given kld threshold and optimize towards it

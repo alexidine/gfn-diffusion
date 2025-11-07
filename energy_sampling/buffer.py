@@ -261,38 +261,6 @@ class CrystalReplayBuffer:
         self.loader.batch_sampler.batch_size = new_batch_size
         self._loader_iter = iter_forever(self.loader)
 
-    @torch.no_grad()
-    def recompute_silu_pot(self, batch_size, lj_repulsion, device):
-        """when updating the silu repulsive term,
-        we have to rebuild and re-analyze the full dataset"""
-        loader = DataLoader(
-            self.dataset,
-            batch_size=batch_size,
-            drop_last=False
-        )
-        silus = []
-
-        for crystal_batch in loader:
-            crystal_batch = crystal_batch.to(device)
-            crystal_batch.box_analysis()
-            cluster_batch = crystal_batch.mol2cluster(cutoff=6,
-                                                      supercell_size=10,
-                                                      std_orientation=True)
-
-            cluster_batch.construct_radial_graph(cutoff=6)
-
-            _ = cluster_batch.compute_LJ_energy()
-            silu_energy = cluster_batch.compute_silu_energy(
-                repulsion=lj_repulsion,
-            )
-            silus.extend(silu_energy.cpu())
-
-        silus = torch.tensor(silus)
-        for ind, elem in enumerate(self.dataset):
-            elem.silu_pot = torch.ones(1) * silus[ind]
-
-        scores = self.energy_function.prebuilt_sample_to_reward(self.dataset, temperature=torch.ones(len(self)))
-        self.rewards_list = list(scores.flatten().cpu().detach().numpy())
 
     def sample_mol_unconditional_prior(self, sg_inds, noise: Optional[float] = None):
         """

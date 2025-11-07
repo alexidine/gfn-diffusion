@@ -255,55 +255,43 @@ def triangle_schedule(it, init, maxval, minval, on, off):
 
 
 @torch.no_grad()
-def featurize_dataset(dataset, device, ellipsoid_scale, lj_repulsion, batch_size: int = 500,
+def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 500,
                       max_z_prime: int = 1):
 
     num_batches = len(dataset) // batch_size + (1 if len(dataset) % batch_size > 0 else 0)
-    #overlaps = []
     silus = []
     ljs = []
     niggli_overlaps = []
+    if energy_function == 'lj':
+        cutoff = 10
+    elif energy_function == 'silu':
+        cutoff = 6
+    else:
+        assert False
 
-    for b_ind in range(num_batches):  # todo update this analysis
+    for b_ind in range(num_batches):
         crystal_batch = collate_data_list(dataset[b_ind * batch_size:(b_ind + 1) * batch_size], max_z_prime=max_z_prime)
         crystal_batch = crystal_batch.to(device)
         crystal_batch.box_analysis()
-        cluster_batch = crystal_batch.mol2cluster(cutoff=10,
-                                                  supercell_size=10,
-                                                  std_orientation=True)
+        out = crystal_batch.analyze(['lj','silu','niggli'],
+                                    cutoff=cutoff,
+                                    supercell_size=5,
+                                    std_orientation=True)
 
-        cluster_batch.construct_radial_graph(cutoff=10)
+        silus.extend(out['silu'].cpu().detach())
+        ljs.extend(out['lj'].cpu().detach())
+        niggli_overlaps.extend(out['niggli'].cpu().detach())
 
-        lj_energy = cluster_batch.compute_LJ_energy()
-        silu_energy = cluster_batch.compute_silu_energy(
-            repulsion=lj_repulsion,
-        )
-        #
-        # # simplified ellipsoid energy testing
-        # _, _, _, _, _, _, normed_ellipsoid_overlap \
-        #     = cluster_batch.compute_ellipsoidal_overlap(
-        #     surface_padding=ellipsoid_scale,
-        #     return_details=True)
-
-        niggli_overlap = cluster_batch.compute_niggli_overlap()
-
-        #overlaps.extend(normed_ellipsoid_overlap.cpu().detach())
-        silus.extend(silu_energy.cpu().detach())
-        ljs.extend(lj_energy.cpu().detach())
-        niggli_overlaps.extend(niggli_overlap.cpu().detach())
-
-    #overlaps = torch.tensor(overlaps)
     silus = torch.tensor(silus)
     ljs = torch.tensor(ljs)
     niggli_overlaps = torch.tensor(niggli_overlaps)
     for ind, elem in enumerate(dataset):
-        #elem.ellipsoid_overlap = torch.ones(1) * overlaps[ind]
         elem.silu_pot = torch.ones(1) * silus[ind]
         elem.lj_pot = torch.ones(1) * ljs[ind]
         elem.niggli_overlap = torch.ones(1) * niggli_overlaps[ind]
 
     # exclude negative niggli overlaps
-    dataset = [elem for elem in dataset if elem.niggli_overlap > 0]
+    dataset = [elem for elem in dataset if elem.niggli_overlap >= 0]
     [elem.box_analysis() for elem in dataset]
 
     return dataset
