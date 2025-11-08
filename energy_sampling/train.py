@@ -1105,7 +1105,7 @@ class Modeller:
                 self.bwd_tb_record.append(metrics['Bwd TB Residual'])
                 self.logz_record.append(metrics['log Z learned'])
 
-                n_eval_steps = (1000//self.args.eval_period)
+                n_eval_steps = (self.args.bwd_thermalization_time//self.args.eval_period)
                 if len(self.bwd_tb_record) >= n_eval_steps:  # check convergence over X steps
                     recent_tb = np.array(self.bwd_tb_record[-n_eval_steps:])
                     recent_z = np.array(self.logz_record[-n_eval_steps:])
@@ -1114,7 +1114,7 @@ class Modeller:
                     mean_z, std_z = recent_z.mean(), recent_z.std()
 
                     tb_stable = (std_tb / (mean_tb + 1e-9)) < self.args.thermalization_conv_eps
-                    z_stable = (std_z / (abs(mean_z) + 1e-9)) < self.args.thermalization_conf # tune threshold as needed
+                    z_stable = (std_z / (abs(mean_z) + 1e-9)) < self.args.thermalization_conv_eps # tune threshold as needed
                     if tb_stable and z_stable and (step_ind >= self.bwd_thermalization_stop_time):
                         torch.save(gfn_model.state_dict(), f'checkpoints/{name}_train_thermalized.pt')
                         torch.save(ema_model.state_dict(), f'checkpoints/{name}_eval_thermalized.pt')

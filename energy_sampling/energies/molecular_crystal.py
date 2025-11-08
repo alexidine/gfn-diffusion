@@ -127,6 +127,11 @@ class MolecularCrystal(BaseSet):
 
         crystal_batch.add_graph_attr(crystal_energy, 'gfn_energy')
 
+        if torch.any(torch.isinf(crystal_energy)) or torch.any(torch.isnan(crystal_energy)):
+            aa = 1
+            crystal_energy[torch.isinf(crystal_energy)] = 0 # just patch it for now
+            crystal_energy[torch.isnan(crystal_energy)] = 0
+
         for key in ens_dict.keys():
             setattr(crystal_batch, key, ens_dict[key].cpu().detach())
 
