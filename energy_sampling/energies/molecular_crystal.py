@@ -128,7 +128,6 @@ class MolecularCrystal(BaseSet):
         crystal_batch.add_graph_attr(crystal_energy, 'gfn_energy')
 
         if torch.any(torch.isinf(crystal_energy)) or torch.any(torch.isnan(crystal_energy)):
-            aa = 1
             crystal_energy[torch.isinf(crystal_energy)] = 0 # just patch it for now
             crystal_energy[torch.isnan(crystal_energy)] = 0
 
@@ -318,7 +317,6 @@ class MolecularCrystal(BaseSet):
         zones3 = torch.ones((mol_batch.num_graphs, 3*self.max_z_prime), device='cpu')
         zones1 =  torch.ones((mol_batch.num_graphs, self.max_z_prime), device='cpu')
         blank_batch_properties = {
-            '_num_graphs': mol_batch.num_graphs,
             'aunit_handedness': zones1,
             'nonstandard_symmetry': ~trues1,
             'cell_lengths': ones3,
@@ -339,24 +337,16 @@ class MolecularCrystal(BaseSet):
             'is_well_defined': trues1,
         }
         crystal_batch.set_mol_attrs(mol_batch.clone())
-        for key in blank_batch_properties:
-            if key.startswith("_"):
-                setattr(crystal_batch, key, blank_batch_properties[key])
-            else:
-                crystal_batch[key] = blank_batch_properties[key]
+        setattr(crystal_batch, '_num_graphs', mol_batch.num_graphs)
 
-        if not torch.is_tensor(sgs):
-            crystal_batch.sg_ind = torch.tensor(sgs, dtype=torch.long)
-        else:
-            crystal_batch.sg_ind = sgs.long()
-        sym_ops = []
-        sym_mult = torch.zeros_like(zeros1).long()
-        for ind, sg in enumerate(sgs):
-            sym_ops.append(self.sg_cache[int(sg)])
-            sym_mult[ind] = len(sym_ops[-1])
-        crystal_batch.symmetry_operators = sym_ops
-        crystal_batch.sym_mult = sym_mult
-        crystal_batch.z_prime = mol_batch.z_prime
+        slice_dict = torch.arange(0, crystal_batch.num_graphs + 1, 1, device='cpu')
+        inc_dict = torch.zeros(crystal_batch.num_graphs, dtype=torch.long, device='cpu')
+        for key in blank_batch_properties:
+            crystal_batch.add_graph_attr(blank_batch_properties[key], key, slice_dict, inc_dict)
+            #crystal_batch[key] = blank_batch_properties[key]
+
+        crystal_batch.reset_sg_info(sgs)
+        crystal_batch.add_graph_attr(mol_batch.z_prime, 'z_prime', slice_dict, inc_dict)
 
         crystal_batch = crystal_batch.to(self.device)
 

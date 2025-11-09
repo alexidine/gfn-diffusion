@@ -206,12 +206,12 @@ def get_gfn_forward_loss(loss_coeffs,
             loss_dict['emp_z'] = emp_z_loss.mean().detach()
         if loss_coeffs.mle > 0:
             loss_dict['mle'] = mle_loss.mean().detach()
-        if loss_coeffs.var > 0:
-            loss_dict['var'] = var_loss.mean().detach()
-        if loss_coeffs.overlap > 0:
-            loss_dict['overlap'] = overlap_loss.mean().detach()
-        if loss_coeffs.buffer > 0:
-            loss_dict['buffer'] = buffer_loss.mean().detach()
+        # if loss_coeffs.var > 0:
+        #     loss_dict['var'] = var_loss.mean().detach()
+        # if loss_coeffs.overlap > 0:
+        #     loss_dict['overlap'] = overlap_loss.mean().detach()
+        # if loss_coeffs.buffer > 0:
+        #     loss_dict['buffer'] = buffer_loss.mean().detach()
     else:
         loss_dict = None
 

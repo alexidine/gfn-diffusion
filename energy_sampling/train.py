@@ -1107,7 +1107,7 @@ class Modeller:
                 self.bwd_tb_record.append(metrics['Bwd TB Residual'])
                 self.logz_record.append(metrics['log Z learned'])
 
-                n_eval_steps = (1000//self.args.eval_period)
+                n_eval_steps = min(10, (self.args.bwd_thermalization_time//self.args.eval_period))
                 if len(self.bwd_tb_record) >= n_eval_steps:  # check convergence over X steps
                     recent_tb = np.array(self.bwd_tb_record[-n_eval_steps:])
                     recent_z = np.array(self.logz_record[-n_eval_steps:])

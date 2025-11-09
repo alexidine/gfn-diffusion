@@ -230,9 +230,10 @@ class CrystalReplayBuffer:
         #     sample_batch.orient_molecule(mode='std',
         #                                  correct_orientation=True)
 
-        T_tensor, sg_inds, condition = self.energy_function.get_conditioning_tensor(sample_batch,
-                                                                                              sg_inds=sample_batch.sg_ind, z_primes=sample_batch.z_prime)
-        sample_batch.sg_ind = sg_inds
+        T_tensor, sg_inds, condition = self.energy_function.get_conditioning_tensor(
+            sample_batch, sg_inds=sample_batch.sg_ind, z_primes=sample_batch.z_prime)
+
+        sample_batch.reset_sg_info(sg_inds)
         temperature = 10 ** T_tensor  # first dimension is the log temperature
         reward = self.energy_function.prebuilt_sample_to_reward(
             sample_batch, temperature)  # recompute reward in case parameters have changed

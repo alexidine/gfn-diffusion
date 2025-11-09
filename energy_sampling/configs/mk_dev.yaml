@@ -6,7 +6,7 @@ lr_policy: 0.0005              # learning rate of the policy network
 min_lr: 1.0e-6                # ihn
 lr_flow: 1.0                  # learning rate of the flow network
 lr_back: 0.0005                # learning rate of the backward pass
-lr_warmup_ratio: 100           # how much smaller the initial (warmup) LR should be than the max policy value
+lr_warmup_ratio: 10           # how much smaller the initial (warmup) LR should be than the max policy value
 scheduler: True               # does LR warmup from lr/lr_warup_ratio -> lr -> min_lr over the warmup and annealing period
 lr_warmup_time: 1000
 lr_anneal_time: 200000
@@ -31,9 +31,9 @@ batch_size: 100              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
 max_batch_size: 10000           # maximum batch size to allow
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
-eval_batch_size: 5000        # batch size for evaluation
+eval_batch_size: 1000        # batch size for evaluation
 epochs: 1000000             # number of training epochs
-eval_period: 100              # how often to do evaluation & reporting
+eval_period: 50              # how often to do evaluation & reporting
 conditional_eval_period: 100 # how often to do conditional evaluation with figs # must be multiple of eval period
 figs_period: 100             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 
@@ -79,15 +79,15 @@ bwd_loss_coeffs:
   pmle_std:         0.01 # std deviation of the prior mle distribution. Best to start small (1) and smoothly grow
   loss_clip:        1.0E+9
 
-btb_threshold: 1.25 #1.5 # set this null to skip fwd-bwd balancing
-bwd_thermalization_time: 1000  # time to transition from MLE to bTB training
-thermalization_conv_eps: 0.1
-init_kld_threshold: 0.25
+btb_threshold: 1.0 #1.25 #1.25 #1.5 # set this null to skip fwd-bwd balancing
+bwd_thermalization_time: 100  # time to transition from MLE to bTB training
+thermalization_conv_eps: 1.0
+init_kld_threshold: 1.0
 prior_coverage_ratio: 0.05  # [0, 1] fraction of uniform bin coverage that will satisfy the coverage metric
 both_ways: true             # forward and backward training
 repeats: 2                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
 bwd_batch_multiplier: 1      # ratio of backward to foward batch size (much cheaper to evaluate)
-fwd_to_bwd_ratio: 0.000001          # whether to do forward (>1) or backward (<1) training more often
+fwd_to_bwd_ratio: 0.00001          # whether to do forward (>1) or backward (<1) training more often
 bwd: false                   # backward training only
 learn_pb: true               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
 learned_variance: True       # whether to learn policy variance

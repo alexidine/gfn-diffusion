@@ -1,5 +1,8 @@
+from collections import Counter
+
 import numpy as np
 import pandas as pd
+import torch
 from _plotly_utils.colors import qualitative
 from matplotlib import cm, colors
 from plotly import graph_objects as go
@@ -7,6 +10,10 @@ from plotly.subplots import make_subplots
 from scipy.cluster.hierarchy import linkage, to_tree, leaves_list
 from scipy.spatial.distance import pdist
 from sklearn.cluster import estimate_bandwidth, MeanShift
+from tqdm import tqdm
+
+from energy_sampling.utils import uniform_discretizer, get_gfn_init_state
+from mxtaltools.dataset_utils.utils import collate_data_list
 
 
 def cluster_1d(X):
@@ -366,3 +373,268 @@ def hierarchical_joint_df(labels, max_order=4, cutoff=0.01, descriptors_fn=None)
         for _, row in df.iterrows()
     ]
     return df.sort_values(["order", "p"], ascending=[True, False]).reset_index(drop=True)
+
+
+def get_highp_correlations(marginal_labels, n_samples, n_dims, clusters_per_dim, cutoff: float = 2.0, max_depth: int = 4):
+    p1 = [
+        np.bincount(marginal_labels[:, i], minlength=clusters_per_dim[i]) / n_samples
+        for i in range(n_dims)
+    ]
+    mask_cache = {
+        (i, c): (marginal_labels[:, i] == c)
+        for i in range(n_dims)
+        for c in range(clusters_per_dim[i])
+    }
+    idx_cache = {key: np.flatnonzero(mask) for key, mask in mask_cache.items()}
+
+    trees = []
+    for i in range(marginal_labels.shape[1]):
+        for c_i in range(clusters_per_dim[i]):
+            tree = expand_tree_fast(i, c_i, p1, idx_cache, n_samples, cutoff=cutoff, max_depth=max_depth)
+            trees.append(tree)
+
+    corr_df = collect_correlations(trees)
+    return corr_df
+
+
+def compute_dim_weights(corr_df, use_pjoint=True, ratio_thresh=2.0, order_min=2):
+    """
+    Compute per-dimension weights from high-probability correlations.
+
+    Parameters
+    ----------
+    corr_df : pd.DataFrame
+        DataFrame with columns ['dims', 'clusters', 'ratio', 'p_joint'].
+    ratio_thresh : float
+        Minimum ratio to consider a correlation 'high'.
+    order_min : int
+        Minimum order (ignore 1-body terms).
+    use_pjoint : bool
+        Whether to weight by p_joint * ratio (default) or ratio alone.
+
+    Returns
+    -------
+    pd.Series : normalized dimension weights (sum = 1)
+    """
+    df = corr_df.query("order >= @order_min and ratio > @ratio_thresh")
+
+    weights = Counter()
+    for _, row in df.iterrows():
+        w = row.ratio * (row.p_joint if use_pjoint else 1.0)
+        for d in row.dims:
+            weights[d] += w
+
+    # normalize
+    total = sum(weights.values())
+    for k in weights:
+        weights[k] /= total + 1e-12
+
+    return pd.Series(weights).sort_index()
+
+
+def collect_correlations(trees):
+    """
+    Flatten a list of correlation trees and dedupe them into a readable DataFrame.
+    """
+    found = {}
+
+    def dfs(node, root):
+        key = frozenset(node["indices"])
+        order = len(node["indices"])
+        p_joint = node["p_joint"]
+        ratio = node["ratio"]
+
+        # insert or update
+        if key not in found or ratio > found[key]["ratio"]:
+            found[key] = {
+                "dims": [i for i, _ in sorted(node["indices"])],
+                "clusters": [c for _, c in sorted(node["indices"])],
+                "order": order,
+                "p_joint": p_joint,
+                "ratio": ratio,
+                "root_dim": root[0],
+                "root_cluster": root[1],
+            }
+
+        for ch in node["children"]:
+            dfs(ch, root)
+
+    # traverse all trees
+    for t in trees:
+        root = t["indices"][0]
+        dfs(t, root)
+
+    # convert to DataFrame
+    df = pd.DataFrame(list(found.values()))
+    df.sort_values(["order", "ratio"], ascending=[True, False], inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+
+def expand_tree_fast(root_dim, root_cluster, p1, idx_cache, N,
+                     cutoff=5.0, max_depth=None):
+    """
+    Build the full n-body correlation tree starting from a single 1-body cluster.
+
+    Parameters
+    ----------
+    root_dim : int
+        Dimension index of the root cluster.
+    root_cluster : int
+        Cluster index within that dimension.
+    p1 : list of np.ndarray
+        Precomputed 1D marginal probabilities per dimension.
+    idx_cache : dict[(int,int)] -> np.ndarray
+        Cached indices (sample positions) for each (dimension, cluster) pair.
+    N : int
+        Total number of samples.
+    cutoff : float
+        Coupling ratio threshold for retaining a branch.
+    max_depth : int or None
+        Optional limit on how deep to expand.
+
+    Returns
+    -------
+    dict : correlation tree node
+    """
+    root_idx = idx_cache[(root_dim, root_cluster)]
+    p_root = len(root_idx) / N
+
+    node = {
+        "indices": [(root_dim, root_cluster)],
+        "p_joint": p_root,
+        "ratio": 1.0,
+        "children": []
+    }
+
+    def recurse(indices, idx_set, prod_base, depth):
+        if max_depth and depth >= max_depth:
+            return []
+
+        used_dims = [i for i, _ in indices]
+        children = []
+
+        for j in range(len(p1)):
+            if j in used_dims:
+                continue
+
+            for c_j in range(len(p1[j])):
+                # intersection of index sets
+                new_idx = np.intersect1d(idx_set, idx_cache[(j, c_j)], assume_unique=True)
+                if new_idx.size == 0:
+                    continue
+
+                p_joint = new_idx.size / N
+                ratio = p_joint / (prod_base * p1[j][c_j] + 1e-12)
+
+                if ratio > cutoff:
+                    child = {
+                        "indices": indices + [(j, c_j)],
+                        "p_joint": p_joint,
+                        "ratio": ratio,
+                        "children": []
+                    }
+                    # recursively expand
+                    child["children"] = recurse(
+                        child["indices"], new_idx, prod_base * p1[j][c_j], depth + 1
+                    )
+                    children.append(child)
+
+        return children
+
+    node["children"] = recurse(
+        [(root_dim, root_cluster)], root_idx, p1[root_dim][root_cluster], 1
+    )
+    return node
+
+
+def estimate_logp_with_convergence(
+        gfn_model, terminal_states, batch_size,
+        n_steps, tol=1e-3, window=5, max_repeats=200
+):
+    flows = []
+    logp_history = []
+
+    repeat = 0
+    while True:
+        repeat += 1
+        # --- one backward trajectory sample ---
+        discretizer = lambda bsz: uniform_discretizer(bsz, n_steps)
+        condition = torch.zeros((batch_size, 1), device=gfn_model.device)
+
+        with torch.no_grad():
+            states, log_pfs, log_pbs, log_flow = gfn_model.get_traj_bwd(
+                terminal_states.clone().to(gfn_model.device),
+                discretizer, condition, return_gauss_params=False
+            )
+            delta = (log_pfs.sum(-1) - log_pbs.sum(-1)).cpu().detach()
+            flows.append(delta)
+
+        # --- recompute running log p_F(x) ---
+        deltas = torch.stack(flows, dim=1)  # [n_states, n_repeats]
+        logp_est = torch.logsumexp(deltas, dim=1) - np.log(len(flows))
+        logp_history.append(logp_est)
+
+        # --- convergence check every iteration after window ---
+        if len(logp_history) > window:
+            recent = torch.stack(logp_history[-window:], dim=0)
+            diffs = (recent[-1] - recent[0]).abs().mean().item()
+            if diffs < tol or len(flows) >= max_repeats:
+                print(f"Converged after {len(flows)} repeats (Δ={diffs:.3e})")
+                break
+
+    return logp_est, torch.stack(logp_history, dim=0)
+
+
+def get_sample_batch(batch_size, max_z_prime, device, n_steps, gfn_model):
+    init_state = get_gfn_init_state(batch_size, 6 + 6 * max_z_prime, device)
+    discretizer = lambda bsz: uniform_discretizer(bsz, n_steps)
+
+    condition = torch.zeros((batch_size, 1))  # unconditional sampling
+    with torch.no_grad():
+        (states, log_pfs, log_pbs, log_flow) = gfn_model.get_traj_fwd(init_state,
+                                                                      discretizer,
+                                                                      None,
+                                                                      condition,
+                                                                      return_gauss_params=False)
+    return states[:, -1, :]
+
+
+def sample_from_gfn(num_samples, max_z_prime, device, n_steps, batch_size, gfn_model):
+    samples = []
+    counter = 0
+    with tqdm(total=num_samples) as pbar:
+        while (len(samples) * batch_size) < num_samples:
+            states = get_sample_batch(batch_size, max_z_prime, device, n_steps, gfn_model)
+
+            samples.append(states.cpu().detach())
+
+            counter += batch_size
+            pbar.update(batch_size)
+
+    samples = torch.cat(samples)
+    return samples
+
+
+def analyze_samples(x, mol_list, max_z_prime, device, batch_size):
+    num_batches = len(mol_list) // batch_size + (1 if len(mol_list) % batch_size else 0)
+    num_samples = len(mol_list)
+    samples = []
+    counter = 0
+    with tqdm(total=num_samples) as pbar:
+        with torch.no_grad():
+            for b_ind in range(num_batches):
+                inds = torch.arange(b_ind * batch_size, (b_ind + 1) * batch_size)
+                batch = collate_data_list([mol_list[ind] for ind in inds], max_z_prime=max_z_prime)
+                batch.reset_sg_info(2)
+                batch.latent_to_cell_params(x[inds])
+                batch = batch.to(device)
+                outs = batch.analyze(['lj', 'silu'], cutoff=10, std_orientation=True)
+                batch.add_graph_attr(outs['lj'], 'lj_pot')
+                batch.add_graph_attr(outs['silu'], 'silu_pot')
+                batch.to('cpu')
+                samples.extend(batch.batch_to_list())
+                counter += batch_size
+                pbar.update(batch_size)
+
+    return samples
