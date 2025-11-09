@@ -837,6 +837,8 @@ class Modeller:
         else:
             assert False, f"sampling method {self.args.sampling} not implemented"
 
+        # todo an option, similar to what we did with the pmle, to noise the samples and recompute r, would be nice
+
         # if self.args.bwd_loss_coeffs.mle_prior_fraction > 0:
         #     condition, rewards, samples = substitute_prior(
         #         self.args.bwd_loss_coeffs, condition, crystal_batch, energy_function, rewards, samples, buffer)
@@ -1090,7 +1092,7 @@ class Modeller:
                     self.args.bwd_loss_schedule['tb'] = [(0, 1.0), (step_ind, 0.0), (step_ind + self.args.bwd_thermalization_time//2, 1.0)]
                     self.args.bwd_loss_schedule['mle'] = [(0, 1.0), (step_ind, 1), (step_ind + self.args.bwd_thermalization_time // 2, 0.0)]
                     self.args.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 1.0)]
-                    self.increasing_loss_cooldown = 100  # give it time to adjust to new loss landscape
+                    self.increasing_loss_cooldown = self.args.bwd_thermalization_time  # give it time to adjust to new loss landscape
                     self.bwd_thermalization_stop_time = step_ind + self.args.bwd_thermalization_time
 
                     torch.save(gfn_model.state_dict(), f'checkpoints/{name}_train_hit_prior.pt')
@@ -1105,7 +1107,7 @@ class Modeller:
                 self.bwd_tb_record.append(metrics['Bwd TB Residual'])
                 self.logz_record.append(metrics['log Z learned'])
 
-                n_eval_steps = (self.args.bwd_thermalization_time//self.args.eval_period)
+                n_eval_steps = (1000//self.args.eval_period)
                 if len(self.bwd_tb_record) >= n_eval_steps:  # check convergence over X steps
                     recent_tb = np.array(self.bwd_tb_record[-n_eval_steps:])
                     recent_z = np.array(self.logz_record[-n_eval_steps:])
@@ -1126,7 +1128,7 @@ class Modeller:
                                                              (step_ind + self.args.bwd_thermalization_time // 2, 1.0)]
 
                         #self.args.bwd_loss_coeffs.bwd_tb_z = 0.0 # turn off backwards log Z thermalization
-                        self.increasing_loss_cooldown = 100
+                        self.increasing_loss_cooldown = self.args.bwd_thermalization_time
                         self.phase = 3
                         self.bwd_anchor = np.sqrt(float(np.median(recent_tb)))
 
