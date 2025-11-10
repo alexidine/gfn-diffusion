@@ -60,3 +60,72 @@
   - energy_function
   - thermalization_conv_eps
   notes: ''
+- index: 6
+  tag: 6
+  update_keys:
+  - energy_static_temperature
+  - max_batch_size
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - energy_function
+  notes: ''
+- index: 7
+  tag: 7
+  update_keys:
+  - energy_static_temperature
+  - max_batch_size
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - energy_function
+  notes: ''
+- index: 8
+  tag: 8
+  update_keys:
+  - energy_static_temperature
+  - max_batch_size
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - energy_function
+  - lr_policy
+  - lr_back
+  notes: ''
+- index: 9
+  tag: 9
+  update_keys:
+  - energy_static_temperature
+  - max_batch_size
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - energy_function
+  - lr_flow
+  notes: ''
+- index: 10
+  tag: 10
+  update_keys:
+  - energy_static_temperature
+  - max_batch_size
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - energy_function
+  - lr_policy
+  - lr_back
+  - lr_flow
+  notes: ''
+- index: 11
+  tag: 11
+  update_keys:
+  - energy_static_temperature
+  - max_batch_size
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - energy_function
+  - lr_policy
+  - lr_back
+  - lr_flow
+  notes: ''

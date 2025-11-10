@@ -12,7 +12,7 @@ from mxtaltools.dataset_utils.utils import collate_data_list
 
 if __name__ == '__main__':
     device = 'cuda'
-    num_samples = 50000
+    num_samples = 20000
     batch_size = 500
     n_steps = 50  # critical to get this right!
 

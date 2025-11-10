@@ -58,3 +58,66 @@ experiments:
     pb_var_range: 2
     energy_function: lj
     thermalization_conv_eps: 0.01
+
+- tag: 6
+  update:
+    energy_static_temperature: 0.5
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: lj
+
+- tag: 7
+  update:
+    energy_static_temperature: 0.25
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: lj
+
+- tag: 8
+  update:
+    energy_static_temperature: 0.25
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: lj
+    lr_policy: 0.001
+    lr_back: 0.001
+
+- tag: 9
+  update:
+    energy_static_temperature: 0.25
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: lj
+    lr_flow: 10.0
+
+- tag: 10
+  update:
+    energy_static_temperature: 0.25
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: lj
+    lr_policy: 0.001
+    lr_back: 0.001
+    lr_flow: 10.0
+
+- tag: 11
+  update:
+    energy_static_temperature: 0.25
+    max_batch_size: 2000
+    log_var_range: 6
+    pb_drift_range: 0.4
+    pb_var_range: 4
+    energy_function: lj
+    lr_policy: 0.001
+    lr_back: 0.001
+    lr_flow: 10.0
