@@ -57,11 +57,12 @@ class Modeller:
         self.device = self.args.device
         self.increasing_loss_cooldown = 0
         self.lr_warmup_finished = False
+        self.phase = None
+        self.grow_buffer = False
 
     def train_logic(self, buffer, it):
         do_forward = False
         do_backward = False
-        add_to_buffer = False
         if self.args.both_ways:
             p_forward = self.args.fwd_to_bwd_ratio / (self.args.fwd_to_bwd_ratio + 1)
             if it == 0:
@@ -72,8 +73,6 @@ class Modeller:
                 do_fwd = np.random.choice([0, 1], 1, p=[1 - p_forward, p_forward])
 
             if do_fwd:
-                if self.args.sampling == 'buffer':
-                    add_to_buffer = True
                 do_forward = True
             else:
                 do_backward = True
@@ -105,7 +104,7 @@ class Modeller:
             do_backward = False
             do_forward = True
 
-        return add_to_buffer, do_backward, do_forward, p_forward, report_losses
+        return do_backward, do_forward, p_forward, report_losses
 
     def log_elapsed_times(self):
         elapsed_times = {}
@@ -371,9 +370,9 @@ class Modeller:
             beta=self.args.beta,
             rank_weight=self.args.rank_weight,
             prioritized=self.args.prioritized,
-            keep_initial_samples=False,  # self.args.buffer_path is not None,
-            diversity_coeff=self.args.buffer_diversity_coeff,
+            keep_initial_samples=self.args.buffer_path is not None,
             max_z_prime=energy_function.max_z_prime,
+            buffer_dist_cutoff=self.args.buffer_dist_cutoff,
         )
         if ((self.args.both_ways or self.args.bwd) and
                 self.args.buffer_path is not None):  # preload samples into the buffer
@@ -736,7 +735,7 @@ class Modeller:
                    buffer,
                    mol_iterator,
                    repeats):
-        add_to_buffer, do_backward, do_forward, p_forward, report_losses = self.train_logic(buffer, it)
+        do_backward, do_forward, p_forward, report_losses = self.train_logic(buffer, it)
 
         discretizer = self.get_discretizer()
 
@@ -761,12 +760,6 @@ class Modeller:
                 repeats=repeats,
                 report_losses=report_losses
             )
-
-            # forward_iter = int(it * p_forward)  # TODO add back exceptionally good or exceptionally expensive samples
-            # if add_to_buffer and forward_iter % self.args.add_to_buffer_each == 0:
-            #     # standard to_data_list won't work with our custom batching in the energy function
-            #     data_list = manual_batch_to_data_list(crystal_batch.detach().cpu())
-            #     buffer.add(data_list)
 
             del crystal_batch
 
@@ -933,6 +926,7 @@ class Modeller:
                       do_figures,
                       mol_batch,
                       bwd_training=len(buffer) > 0,
+                      save_batch=self.grow_buffer,
                       ))
 
         eval_metrics.update({'Batch Size': self.args.batch_size})
@@ -1082,6 +1076,7 @@ class Modeller:
             max_rat = 100
             # check if we have hit our initial KLD target
             if not self.hit_init_kld:
+                self.phase = 1
                 metric = metrics['Max Latent KLD']
                 if metric <= self.args.init_kld_threshold:
                     self.hit_init_kld = True
@@ -1104,20 +1099,19 @@ class Modeller:
                     self.logz_record = []
 
             elif self.phase == 2:
-                self.bwd_tb_record.append(metrics['Bwd TB Residual'])
-                self.logz_record.append(metrics['log Z learned'])
+                self.bwd_tb_record.append(metrics['Bwd Normed TB Residual'])
+                self.logz_record.append(metrics['Bwd Normed Log Z LB Residual'])
 
                 n_eval_steps = min(10, (self.args.bwd_thermalization_time//self.args.eval_period))
                 if len(self.bwd_tb_record) >= n_eval_steps:  # check convergence over X steps
                     recent_tb = np.array(self.bwd_tb_record[-n_eval_steps:])
                     recent_z = np.array(self.logz_record[-n_eval_steps:])
+                    mean_tb = recent_tb.mean()
 
-                    mean_tb, std_tb = recent_tb.mean(), recent_tb.std()
-                    mean_z, std_z = recent_z.mean(), recent_z.std()
+                    tb_stable = mean_tb < self.args.thermalization_conv_eps
+                    z_converged = recent_z.mean() < self.args.thermalization_conv_eps
 
-                    tb_stable = (std_tb / (mean_tb + 1e-9)) < self.args.thermalization_conv_eps
-                    z_stable = (std_z / (abs(mean_z) + 1e-9)) < self.args.thermalization_conv_eps # tune threshold as needed
-                    if tb_stable and z_stable and (step_ind >= self.bwd_thermalization_stop_time):
+                    if tb_stable and z_converged and (step_ind >= self.bwd_thermalization_stop_time):
                         torch.save(gfn_model.state_dict(), f'checkpoints/{name}_train_thermalized.pt')
                         torch.save(ema_model.state_dict(), f'checkpoints/{name}_eval_thermalized.pt')
                         print("Thermalization complete. Moving to forward training & refinement.")
@@ -1130,17 +1124,19 @@ class Modeller:
                         #self.args.bwd_loss_coeffs.bwd_tb_z = 0.0 # turn off backwards log Z thermalization
                         self.increasing_loss_cooldown = self.args.bwd_thermalization_time
                         self.phase = 3
-                        self.bwd_anchor = np.sqrt(float(np.median(recent_tb)))
+                        self.grow_buffer = True
+                        self.bwd_anchor = float(np.median(recent_tb))
 
             elif self.phase == 3:
                 # if we have hit it, dynamically adjust fwd_to_bwd_ratio to keep it under the threshold based on the minimum original value
-                metric = np.sqrt(metrics['Bwd TB Residual'])
+                metric = max(0.01, metrics['Bwd Normed TB Residual'])  # don't let it be unrealistically small
 
                 err = (metric - self.bwd_anchor * self.args.btb_threshold) / (self.bwd_anchor * self.args.btb_threshold)
                 # target the given kld threshold and optimize towards it
                 self.args.fwd_to_bwd_ratio *= np.exp(-0.1 * err)
                 self.args.fwd_to_bwd_ratio = np.clip(self.args.fwd_to_bwd_ratio, a_min=min_rat, a_max=max_rat)
 
+            metrics['Training Phase'] = self.phase
             metrics['Fwd to Bwd Ratio'] = self.args.fwd_to_bwd_ratio
 
 

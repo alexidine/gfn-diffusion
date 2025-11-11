@@ -1,9 +1,11 @@
 from typing import Optional
 
+import hdbscan
 import numpy as np
 import torch
 from scipy.spatial.transform import Rotation
 from torch_geometric.loader import DataLoader
+from torch_scatter import scatter
 
 from mxtaltools.crystal_building.crystal_latent_transforms import compute_niggli_overlap
 from mxtaltools.dataset_utils.utils import collate_data_list
@@ -20,7 +22,8 @@ class CrystalReplayBuffer:
                  prioritized=None,
                  keep_initial_samples: bool = False,
                  diversity_coeff: float = 0.0,
-                 max_z_prime: int = 1
+                 max_z_prime: int = 1,
+                 buffer_dist_cutoff: float = 0.25,
                  ):
         self.buffer_size = buffer_size
         self.prioritized = prioritized
@@ -40,9 +43,11 @@ class CrystalReplayBuffer:
         self.original_dataset_inds = None
         self.diversity_coeff = diversity_coeff
         self.max_z_prime = max_z_prime
+        self.buffer_dist_cutoff = buffer_dist_cutoff
 
     def add(self,
-            data_list,
+            data_list=None,
+            data_batch=None,
             max_z_prime: int = 1):
         with torch.no_grad():
             if self.dataset is None:
@@ -50,53 +55,29 @@ class CrystalReplayBuffer:
                 self.init_loader()
 
             else:
-                assert False, "NOTE: loader not currently set up for on-the-fly dataset addition!"
-                new_data_batch = collate_data_list(data_list)
+                # rough filtration
+                if data_list is None and data_batch is not None:
+                    data_list = data_batch.batch_to_list()
+                elif data_list is not None and data_batch is None:
+                    data_batch = collate_data_list(data_list, max_z_prime=self.max_z_prime)
 
-                # do not take samples with bad overlaps
-                # these could be 'flipped' to their valid cell form and added, but I don't have the transform
-                # for the molecule positions, only for the cell (angle = pi-angle)
-                a, b, c = new_data_batch.cell_lengths.split(1, dim=1)
-                al, be, ga = new_data_batch.cell_angles.split(1, dim=1)
-                _, _, _, _, _, _, overlap = compute_niggli_overlap(a, b, c, al, be, ga)
-                bad_inds = torch.argwhere(overlap.flatten() < 0).flatten().tolist()
+                scores = self.energy_function.prebuilt_sample_to_reward(data_batch, temperature=torch.ones(data_batch.num_graphs))
+                score_cut = np.quantile(self.rewards_list, 0.05)
 
-                # also, hard filter samples which are above or below our density cutoffs
-                bad_inds.extend(torch.argwhere(0.55 < new_data_batch.packing_coeff).flatten().tolist())
-                bad_inds.extend(torch.argwhere(new_data_batch.packing_coeff > 0.95).flatten().tolist())
+                good_inds = [ind for ind in range(len(data_list)) if
+                            ((data_list[ind].lj_pot < 0) and (data_list[ind].niggli_overlap >= 0) and (scores[ind] > score_cut))
+                            ]
 
-                # also strictly reject unbound states
-                bad_inds.extend(torch.argwhere(new_data_batch.lj_pot > 0))
+                if True: #len(good_inds) > 0:
+                    data_to_add = [data_list[ind] for ind in good_inds]
 
-                bad_inds = list(set(bad_inds))
-                data_list = [elem for ind, elem in enumerate(data_list) if ind not in bad_inds]
-
-                if len(data_list) > 0:
-                    new_data_batch = collate_data_list(data_list)
-
-                    new_x_tensor = new_data_batch.latent_params().to(self.device)
-                    scores = self.energy_function.prebuilt_sample_to_reward(new_data_batch,
-                                                                            temperature=torch.ones(len(new_data_batch))
-                                                                            ).cpu().detach().numpy()
-                    scores_list = list(scores)
-
-                    ref_x_tensor = torch.stack(self.x_list).to(self.device)
-                    min_buffer_dist = torch.cdist(ref_x_tensor, new_x_tensor).amin(0)
-                    new_x_tensor = new_x_tensor.cpu()
-                    sg_list = new_data_batch.sg_ind.cpu()
-
-                    far_enough = (min_buffer_dist >= diversity_cutoff).cpu().detach().numpy()
-                    existing_rewards = np.array(self.rewards_list)
-                    rewards_cutoff = np.quantile(existing_rewards, 0.2)
-                    good_enough = scores >= rewards_cutoff
-                    new_x_inds_to_keep = np.argwhere(far_enough * good_enough).flatten().tolist()
-                    data_list_to_add = [data_list[ind] for ind in new_x_inds_to_keep]
-
-                    if len(data_list_to_add) > 0:
-                        self.dataset.extend(list(data_list_to_add))
-                        self.x_list.extend([new_x_tensor[ind] for ind in new_x_inds_to_keep])
-                        self.rewards_list.extend([scores_list[ind] for ind in new_x_inds_to_keep])
-                        self.sg_list.extend([sg_list[ind] for ind in new_x_inds_to_keep])
+                    self.dataset.extend(data_to_add)
+                    dataset_batch = collate_data_list(self.dataset, max_z_prime=max_z_prime)
+                    x_tensor = dataset_batch.latent_params()
+                    good_scores = scores[torch.tensor(good_inds, dtype=torch.long)]
+                    self.x_list = [x_tensor[i] for i in range(x_tensor.shape[0])]
+                    self.rewards_list.extend(good_scores.flatten().cpu().detach().numpy())
+                    self.sg_list = list(dataset_batch.sg_ind.cpu())
 
             if len(self) > self.buffer_size:  # pare down buffer
                 self.truncate_buffer()
@@ -105,6 +86,10 @@ class CrystalReplayBuffer:
 
     def init_fresh_dataset(self, data_list, max_z_prime):
         self.dataset = list(data_list)  # I think this is memory safe and faster #copy.deepcopy(data_list)
+        for elem in self.dataset:
+            del elem.fingerprint, elem.smiles, elem.mol_ind, elem.identifier, (
+                elem.aunit_batch), elem.skip_box_analysis, elem.cocrystal, elem.symmetry_operators
+
         dataset_batch = collate_data_list(self.dataset, max_z_prime=max_z_prime)
         x_tensor = dataset_batch.latent_params()
         scores = self.energy_function.prebuilt_sample_to_reward(dataset_batch, temperature=torch.ones(len(self)))
@@ -113,15 +98,65 @@ class CrystalReplayBuffer:
         self.original_dataset_inds = list(np.arange(len(self.dataset)))
         self.sg_list = list(dataset_batch.sg_ind.cpu())
 
-    def truncate_buffer(self, override_buffer_size=None):
-        if override_buffer_size is not None:
-            self.buffer_size = override_buffer_size
-
-        inds_to_keep = self.sample_indices(self.buffer_size, replace=False, diversity_coeff=self.diversity_coeff)
-        if self.keep_initial_samples:
-            inds_to_keep = list(set(list(inds_to_keep) + self.original_dataset_inds))[:self.buffer_size]
+    def truncate_buffer(self):
+        """
+        1 - keep initial states
+        2 - bottom-up energy greedy selection
+        3 - clustering
+        :return:
+        """
+        d_cut = self.buffer_dist_cutoff
+        if self.original_dataset_inds is not None:
+            e_cut = np.median(np.nan_to_num(np.array(self.rewards_list)[self.original_dataset_inds]))
         else:
-            inds_to_keep = list(set(inds_to_keep))
+            e_cut = np.median(np.nan_to_num(np.array(self.rewards_list)))
+
+        e_tensor = -torch.nan_to_num(torch.tensor(self.rewards_list, device=self.device))
+        x_tensor = torch.stack(self.x_list).to(self.device)
+        sort_inds = torch.argsort(e_tensor)
+        sorted_x_tensor = x_tensor[sort_inds]
+        sorted_e_tensor = e_tensor[sort_inds]
+        distmat = torch.cdist(sorted_x_tensor, sorted_x_tensor)
+        mask = sorted_e_tensor < e_cut
+
+        keep = torch.zeros(len(x_tensor), dtype=bool, device=self.device)
+        for ind in range(len(self)):
+            if not mask[ind]:
+                continue
+
+            too_close = (distmat[ind, keep] < d_cut).any()
+            if not too_close:
+                keep[ind] = True
+
+        """cluster near-degenerate states and extract minima"""
+        clusterer = hdbscan.HDBSCAN(min_cluster_size=2, min_samples=1, cluster_selection_epsilon=0.1)
+        labels = clusterer.fit_predict(x_tensor.cpu().numpy())
+        labels_t = torch.tensor(labels, device=x_tensor.device)
+        num_labels = len(np.unique(labels))
+        basin_minima = scatter(torch.arange(len(labels_t), device=labels_t.device), labels_t, reduce='min', dim_size=num_labels, dim=0)
+
+        assigned_minima_inds = torch.cat([
+            sort_inds[basin_minima[1:]],  # all clustered minima
+            sort_inds[torch.argwhere(labels_t == -1).flatten()]  # plus noise points
+        ])
+        inds_to_keep = assigned_minima_inds
+
+        if self.keep_initial_samples:
+            orig_dataset_ind_tensor = torch.tensor(self.original_dataset_inds, device=self.device, dtype=torch.long)
+            combined = torch.unique(torch.cat([torch.tensor(inds_to_keep),
+                                               orig_dataset_ind_tensor]))
+            # Protect originals by giving them artificially low energy ranks
+            energies = e_tensor[combined].clone()
+            mask_orig = torch.isin(combined, orig_dataset_ind_tensor)
+            energies[mask_orig] -= 1e6  # will always be kept
+            sorted_combined = combined[torch.argsort(energies)]
+            inds_to_keep = sorted_combined[:self.buffer_size]
+        else:
+            # Sort by (modified) energy and truncate
+            if len(inds_to_keep) > self.buffer_size:
+                sorted_by_e = inds_to_keep[torch.argsort(e_tensor[inds_to_keep])]
+                inds_to_keep = sorted_by_e[:self.buffer_size]
+
         self.dataset = [self.dataset[ind] for ind in inds_to_keep]
         self.rewards_list = [self.rewards_list[ind] for ind in inds_to_keep]
         self.x_list = [self.x_list[ind] for ind in inds_to_keep]

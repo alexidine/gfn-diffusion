@@ -326,7 +326,6 @@ class MolecularCrystal(BaseSet):
             'silu_pot': zeros1,
             'lj_pot': zeros1,
             'scaled_lj_pot': zeros1,
-            'es_pot': zeros1,
             'niggli_overlap': zeros1,
             'T_fc': eye3,
             'T_cf': eye3,
@@ -336,14 +335,13 @@ class MolecularCrystal(BaseSet):
             'z_prime': ones1,
             'is_well_defined': trues1,
         }
-        crystal_batch.set_mol_attrs(mol_batch.clone())
         setattr(crystal_batch, '_num_graphs', mol_batch.num_graphs)
-
+        setattr(crystal_batch, 'device', mol_batch.device)
+        crystal_batch.set_mol_attrs(mol_batch.clone())
         slice_dict = torch.arange(0, crystal_batch.num_graphs + 1, 1, device='cpu')
         inc_dict = torch.zeros(crystal_batch.num_graphs, dtype=torch.long, device='cpu')
         for key in blank_batch_properties:
             crystal_batch.add_graph_attr(blank_batch_properties[key], key, slice_dict, inc_dict)
-            #crystal_batch[key] = blank_batch_properties[key]
 
         crystal_batch.reset_sg_info(sgs)
         crystal_batch.add_graph_attr(mol_batch.z_prime, 'z_prime', slice_dict, inc_dict)

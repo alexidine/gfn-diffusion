@@ -19,6 +19,7 @@ from tqdm import tqdm
 
 from mxtaltools.common.config_processing import dict2namespace
 from mxtaltools.common.geometry_utils import batch_molecule_principal_axes_torch, batch_cell_vol_torch
+from mxtaltools.common.utils import log_rescale_positive
 from mxtaltools.crystal_building.crystal_latent_transforms import enforce_niggli_plane
 from mxtaltools.dataset_utils.data_classes import MolCrystalData
 from mxtaltools.dataset_utils.utils import collate_data_list
@@ -289,6 +290,7 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
         elem.silu_pot = torch.ones(1) * silus[ind]
         elem.lj_pot = torch.ones(1) * ljs[ind]
         elem.niggli_overlap = torch.ones(1) * niggli_overlaps[ind]
+        elem.scaled_lj_pot = torch.ones(1) * log_rescale_positive(ljs[ind])
 
     # exclude negative niggli overlaps
     dataset = [elem for elem in dataset if elem.niggli_overlap >= 0]

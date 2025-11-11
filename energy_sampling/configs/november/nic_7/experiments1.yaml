@@ -1,0 +1,32 @@
+defaults:
+  base: base.yaml
+
+
+experiments:
+- tag: 0
+  update:
+    energy_static_temperature: 0.05
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: silu
+
+- tag: 1
+  update:
+    energy_static_temperature: 0.1
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: silu
+
+- tag: 2
+  update:
+    energy_static_temperature: 0.5
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: silu
+

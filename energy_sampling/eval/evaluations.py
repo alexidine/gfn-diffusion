@@ -36,6 +36,7 @@ def eval_step(energy_function,
               do_figures: bool = True,
               mol_batch=None,
               bwd_training: bool = False,
+              save_batch: bool = False,
               ):
     gfn_model.eval()
 
@@ -44,6 +45,9 @@ def eval_step(energy_function,
      gauss_params_f,
      log_T_tensor) = sample_eval_fwd_trajs(
         init_state, gfn_model, discretizer, energy_function, mol_batch)
+
+    if True: #save_batch:
+        buffer.add(data_batch=sample_batch.detach().cpu())
 
     metrics = log_metrics(energy_function, log_Z, log_Z_lb, log_Z_learned, log_r, log_flow,
                           sample_batch, log_T_tensor, log_pfs, log_pbs, args, buffer)
@@ -729,11 +733,16 @@ def bwd_figs(metrics, fig_dict, buffer, gfn_model, init_state, discretizer, do_f
 
     log_pf = b_log_pfs.sum(-1)
     log_pb = b_log_pbs.sum(-1)
-    log_ratio = log_pf.cpu() + b_log_flow.cpu() - log_pb.cpu() - b_log_r.cpu()
+    log_ratio = (-log_pf.cpu() - b_log_flow.cpu() + log_pb.cpu() + b_log_r.cpu())
+    normed_log_ratio = log_ratio / (b_log_r.cpu() - b_log_flow.cpu()).abs()
     tb_residual = F.smooth_l1_loss(log_ratio, torch.ones_like(log_ratio), reduction='none', beta=10)
+    normed_tb_residual = normed_log_ratio.mean()
     metrics['Bwd TB Residual'] = tb_residual.mean().item()
+    metrics['Bwd Normed TB Residual'] = normed_tb_residual.mean().item()
     metrics['Bwd Log Z Residual'] = (log_Z_empirical - log_Z_learned).item()
+    metrics['Bwd Normed Log Z Residual'] = ((log_Z_empirical - log_Z_learned).abs()/log_Z_lb.abs()).item()
     metrics['Bwd Log Z LB Residual'] = (log_Z_lb - log_Z_learned).item()
+    metrics['Bwd Normed Log Z LB Residual'] = ((log_Z_lb - log_Z_learned).abs()/log_Z_lb.abs()).item()
 
     if do_figs:
         fig_dict['Backward Latents Trajectories'] = visualize_latent_trajs(
@@ -880,7 +889,7 @@ def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r
                 np.quantile(buffer.rewards_list, q=p)
                 for p in np.linspace(0, 1, 50)
             ])
-            metrics['Buffer Mean Score'] = np.mean(buffer.rewards_list)
+            metrics['Buffer Mean Score'] = np.mean(np.nan_to_num(buffer.rewards_list))
 
             (buffer_cell_params, buffer_latent_params,
              buffer_std_params, buffer_reward,
@@ -915,11 +924,16 @@ def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r
     # unconditional flow metrics
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
-    log_ratio = log_pf.cpu() + log_flow.cpu() - log_pb.cpu() - log_r.cpu()
+    log_ratio = (-log_pf.cpu() - log_flow.cpu() + log_pb.cpu() + log_r.cpu()) / (log_r.cpu() - log_flow.cpu())
+    normed_log_ratio = log_ratio / (log_r.cpu() - log_flow.cpu()).abs()
     tb_residual = F.smooth_l1_loss(log_ratio, torch.ones_like(log_ratio), reduction='none', beta=10)
+    normed_tb_residual = normed_log_ratio.mean()
     metrics['TB Residual'] = tb_residual.mean().item()
+    metrics['Normed TB Residual'] = normed_tb_residual.mean().item()
     metrics['Log Z Residual'] = (log_Z_empirical - log_Z_learned).item()
+    metrics['Normed Log Z Residual'] =  ((log_Z_empirical - log_Z_learned).abs()/log_Z_empirical.abs()).item()
     metrics['Log Z LB Residual'] = (log_Z_lb - log_Z_learned).item()
+    metrics['Normed Log Z LB Residual'] = ((log_Z_lb - log_Z_learned).abs()/log_Z_lb.abs()).item()
 
     # get fraction of samples which are 'reasonable' at this energy,
     # meaning density > 0.55 and bound states
