@@ -652,7 +652,7 @@ class Modeller:
                     loss_record = self.check_loss_explosion(name, loss_record, gfn_model, ema_model, optimizers)
                     wandb.log(metrics, step=step_ind)
 
-                if step_ind % 1000 == 0: # save running model
+                if step_ind % 250 == 0: # save running model
                     torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train.pt')
                     torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval.pt')
 

@@ -2,10 +2,10 @@ run_name: 'nov_nic_7'
 tag: 'nov_nic_7'
 seed: 12345
 device: 'cuda'
-lr_policy: 0.001              # learning rate of the policy network
+lr_policy: 0.0005              # learning rate of the policy network
 min_lr: 1.0e-6                # ihn
-lr_flow: 10.0                  # learning rate of the flow network
-lr_back: 0.001                # learning rate of the backward pass
+lr_flow: 1.0                  # learning rate of the flow network
+lr_back: 0.0005                # learning rate of the backward pass
 lr_warmup_ratio: 10           # how much smaller the initial (warmup) LR should be than the max policy value
 scheduler: True               # does LR warmup from lr/lr_warup_ratio -> lr -> min_lr over the warmup and annealing period
 lr_warmup_time: 1000
@@ -87,7 +87,7 @@ init_kld_threshold: 0.025
 prior_coverage_ratio: 0.05  # [0, 1] fraction of uniform bin coverage that will satisfy the coverage metric
 both_ways: true             # forward and backward training
 repeats: 2                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
-bwd_batch_multiplier: 2      # ratio of backward to foward batch size (much cheaper to evaluate)
+bwd_batch_multiplier: 1      # ratio of backward to foward batch size (much cheaper to evaluate)
 fwd_to_bwd_ratio: 0.00001          # whether to do forward (>1) or backward (<1) training more often
 bwd: false                   # backward training only
 learn_pb: true               # whether to learn a correction to the backward policy in 'brownian_bridge' mode

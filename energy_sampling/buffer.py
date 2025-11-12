@@ -107,9 +107,9 @@ class CrystalReplayBuffer:
         """
         d_cut = self.buffer_dist_cutoff
         if self.original_dataset_inds is not None:
-            e_cut = np.median(np.nan_to_num(np.array(self.rewards_list)[self.original_dataset_inds]))
+            e_cut = np.quantile(np.nan_to_num(np.array(self.rewards_list)[self.original_dataset_inds]), 0.25)
         else:
-            e_cut = np.median(np.nan_to_num(np.array(self.rewards_list)))
+            e_cut = np.quantile(np.nan_to_num(np.array(self.rewards_list)), 0.25)
 
         e_tensor = -torch.nan_to_num(torch.tensor(self.rewards_list, device=self.device))
         x_tensor = torch.stack(self.x_list).to(self.device)

@@ -46,7 +46,7 @@ def eval_step(energy_function,
      log_T_tensor) = sample_eval_fwd_trajs(
         init_state, gfn_model, discretizer, energy_function, mol_batch)
 
-    if True: #save_batch:
+    if save_batch:
         buffer.add(data_batch=sample_batch.detach().cpu())
 
     metrics = log_metrics(energy_function, log_Z, log_Z_lb, log_Z_learned, log_r, log_flow,
@@ -734,7 +734,7 @@ def bwd_figs(metrics, fig_dict, buffer, gfn_model, init_state, discretizer, do_f
     log_pf = b_log_pfs.sum(-1)
     log_pb = b_log_pbs.sum(-1)
     log_ratio = (-log_pf.cpu() - b_log_flow.cpu() + log_pb.cpu() + b_log_r.cpu())
-    normed_log_ratio = log_ratio / (b_log_r.cpu() - b_log_flow.cpu()).abs()
+    normed_log_ratio = log_ratio.abs() / (b_log_r.cpu() - b_log_flow.cpu()).abs()
     tb_residual = F.smooth_l1_loss(log_ratio, torch.ones_like(log_ratio), reduction='none', beta=10)
     normed_tb_residual = normed_log_ratio.mean()
     metrics['Bwd TB Residual'] = tb_residual.mean().item()

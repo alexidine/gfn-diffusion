@@ -11,7 +11,7 @@ buffer_dist_cutoff: 0.25
 buffer_path: /scratch/mk8347/csd_runs/datasets/nicotinamide_sg_1_2.pt
 buffer_size: 50000
 bwd: false
-bwd_batch_multiplier: 2
+bwd_batch_multiplier: 1
 bwd_loss_coeffs:
   bwd_tb_z: 2.0
   emp_z: 0
@@ -77,9 +77,9 @@ learned_variance: true
 lj_turnover_pot: 10.0
 log_var_range: 4
 lr_anneal_time: 200000
-lr_back: 0.001
-lr_flow: 10.0
-lr_policy: 0.001
+lr_back: 0.0005
+lr_flow: 1.0
+lr_policy: 0.0005
 lr_warmup_ratio: 10
 lr_warmup_time: 1000
 max_batch_size: 2000
