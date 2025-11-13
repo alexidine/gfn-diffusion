@@ -106,6 +106,7 @@ def get_exploration_std(iter, exploratory, max_steps: int = 5000, exploration_fa
     expl = lambda x: exploration_std
     return expl
 
+
 def get_train_args():
     parser = argparse.ArgumentParser(description='GFN Linear Regression')
     args, remaining = parser.parse_known_args()
@@ -258,12 +259,12 @@ def triangle_schedule(it, init, maxval, minval, on, off):
 @torch.no_grad()
 def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 500,
                       max_z_prime: int = 1):
-
     num_batches = len(dataset) // batch_size + (1 if len(dataset) % batch_size > 0 else 0)
     silus = []
     ljs = []
+    qljs = []
     niggli_overlaps = []
-    if energy_function == 'lj':
+    if energy_function in ['lj', 'qlj']:
         cutoff = 10
     elif energy_function == 'silu':
         cutoff = 6
@@ -274,21 +275,24 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
         crystal_batch = collate_data_list(dataset[b_ind * batch_size:(b_ind + 1) * batch_size], max_z_prime=max_z_prime)
         crystal_batch = crystal_batch.to(device)
         crystal_batch.box_analysis()
-        out = crystal_batch.analyze(['lj','silu','niggli'],
+        out = crystal_batch.analyze(['lj', 'qlj', 'silu', 'niggli'],
                                     cutoff=cutoff,
                                     supercell_size=5,
                                     std_orientation=True)
 
         silus.extend(out['silu'].cpu().detach())
         ljs.extend(out['lj'].cpu().detach())
+        qljs.extend(out['qlj'].cpu().detach())
         niggli_overlaps.extend(out['niggli'].cpu().detach())
 
     silus = torch.tensor(silus)
     ljs = torch.tensor(ljs)
+    qljs = torch.tensor(qljs)
     niggli_overlaps = torch.tensor(niggli_overlaps)
     for ind, elem in enumerate(dataset):
         elem.silu_pot = torch.ones(1) * silus[ind]
         elem.lj_pot = torch.ones(1) * ljs[ind]
+        elem.qlj_pot = torch.ones(1) * qljs[ind]
         elem.niggli_overlap = torch.ones(1) * niggli_overlaps[ind]
         elem.scaled_lj_pot = torch.ones(1) * log_rescale_positive(ljs[ind])
 
@@ -588,8 +592,6 @@ class ThreadedDataLoader:
                 break
 
 
-
-
 def is_cuda_oom(e: Exception) -> bool:
     if isinstance(e, torch.cuda.OutOfMemoryError):
         return True
@@ -627,7 +629,8 @@ def substitute_prior(loss_coeffs, condition, crystal_batch, energy_function, rew
         loss_coeffs.vg_lme > 0,
     ]):
         log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(crystal_batch,
-                                                                                             sg_inds=crystal_batch.sg_ind, z_primes=crystal_batch.z_prime)
+                                                                                   sg_inds=crystal_batch.sg_ind,
+                                                                                   z_primes=crystal_batch.z_prime)
         if log_T_tensor is not None:
             log_temperature = log_T_tensor
         else:

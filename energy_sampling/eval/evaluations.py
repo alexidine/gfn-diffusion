@@ -713,14 +713,14 @@ def bwd_figs(metrics, fig_dict, buffer, gfn_model, init_state, discretizer, do_f
      b_means_f, b_vars_f, b_means_b, b_vars_b) = gfn_model.get_traj_bwd(
         terminal_state.to(gfn_model.device), discretizer, condition.to(gfn_model.device), return_gauss_params=True)
 
-    metrics['Mean Bwd F Drift'] = b_means_f.abs().mean()
-    metrics['Mean Bwd B Drift'] = b_means_b.abs().mean()
-    metrics['Mean Bwd F Var'] = b_vars_f.mean()
-    fig_dict['Mean Bwd B Var'] = b_vars_b.mean()
+    metrics['Mean Bwd F Drift'] = b_means_f.abs().mean().item()
+    metrics['Mean Bwd B Drift'] = b_means_b.abs().mean().item()
+    metrics['Mean Bwd F Var'] = b_vars_f.mean().item()
+    metrics['Mean Bwd B Var'] = b_vars_b.mean().item()
 
     tb_x = b_log_flow.cpu() + b_log_pfs.sum(-1).cpu()
     tb_y = b_log_r.cpu() + b_log_pbs.sum(-1).cpu()
-    high_cut, low_cut = torch.quantile(b_log_r, 0.9), torch.quantile(b_log_r, 0.1)
+    high_cut, low_cut = torch.quantile(b_log_r, 0.99), torch.quantile(b_log_r, 0.01)
     good_inds = ((high_cut >= b_log_r) * (b_log_r >= low_cut)).cpu()
     metrics['Backward TB R Value'] = torch.corrcoef(torch.stack([tb_x[good_inds], tb_y[good_inds]]))[0, 1].item()
 
@@ -728,13 +728,15 @@ def bwd_figs(metrics, fig_dict, buffer, gfn_model, init_state, discretizer, do_f
     log_Z_empirical = logmeanexp(log_weight)
     log_Z_lb = log_weight.mean()
     log_Z_learned = b_log_flow.mean()
-    metrics['Bwd Empirical log Z'] = log_Z_empirical.cpu().detach().numpy()
-    metrics['Bwd Empirical log Z LB'] = log_Z_lb.cpu().detach().numpy()
+    metrics['Bwd Empirical log Z'] = log_Z_empirical.cpu().detach().item()
+    metrics['Bwd Empirical log Z LB'] = log_Z_lb.cpu().detach().item()
 
     log_pf = b_log_pfs.sum(-1)
     log_pb = b_log_pbs.sum(-1)
     log_ratio = (-log_pf.cpu() - b_log_flow.cpu() + log_pb.cpu() + b_log_r.cpu())
-    normed_log_ratio = log_ratio.abs() / (b_log_r.cpu() - b_log_flow.cpu()).abs()
+    X_side = log_pb.cpu() - log_pf.cpu()
+    Y_side = b_log_r.cpu() - b_log_flow.cpu()
+    normed_log_ratio = (X_side - Y_side).abs() / Y_side.abs()
     tb_residual = F.smooth_l1_loss(log_ratio, torch.ones_like(log_ratio), reduction='none', beta=10)
     normed_tb_residual = normed_log_ratio.mean()
     metrics['Bwd TB Residual'] = tb_residual.mean().item()
@@ -832,7 +834,7 @@ def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r
 
     tb_x = log_flow.cpu() + log_pfs.sum(-1).cpu()
     tb_y = log_r.cpu() + log_pbs.sum(-1).cpu()
-    high_cut, low_cut = torch.quantile(log_r, 0.9), torch.quantile(log_r, 0.1)
+    high_cut, low_cut = torch.quantile(log_r, 0.99), torch.quantile(log_r, 0.01)
     good_inds = ((high_cut >= log_r) * (log_r >= low_cut)).cpu()
     metrics['Forward TB R Value'] = torch.corrcoef(torch.stack([tb_x[good_inds], tb_y[good_inds]]))[0, 1].item()
 
@@ -925,7 +927,9 @@ def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
     log_ratio = (-log_pf.cpu() - log_flow.cpu() + log_pb.cpu() + log_r.cpu()) / (log_r.cpu() - log_flow.cpu())
-    normed_log_ratio = log_ratio / (log_r.cpu() - log_flow.cpu()).abs()
+    X_side = log_pb.cpu() - log_pf.cpu()
+    Y_side = log_r.cpu() - log_flow.cpu()
+    normed_log_ratio = (X_side - Y_side).abs() / Y_side.abs()
     tb_residual = F.smooth_l1_loss(log_ratio, torch.ones_like(log_ratio), reduction='none', beta=10)
     normed_tb_residual = normed_log_ratio.mean()
     metrics['TB Residual'] = tb_residual.mean().item()

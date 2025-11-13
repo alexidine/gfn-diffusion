@@ -94,3 +94,36 @@
   - energy_function
   - thermalization_conv_eps
   notes: ''
+- index: 9
+  tag: 9
+  update_keys:
+  - energy_static_temperature
+  - max_batch_size
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - energy_function
+  - thermalization_conv_eps
+  notes: ''
+- index: 10
+  tag: 10
+  update_keys:
+  - energy_static_temperature
+  - max_batch_size
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - energy_function
+  - thermalization_conv_eps
+  notes: ''
+- index: 11
+  tag: 11
+  update_keys:
+  - energy_static_temperature
+  - max_batch_size
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - energy_function
+  - thermalization_conv_eps
+  notes: ''

@@ -452,10 +452,10 @@ class Modeller:
         atom_coords = sample.pos[:atoms_per_mol]
         atom_coords -= atom_coords.mean(dim=0)
         mols = []
-        for zp in range(1, max_z_prime+1):
+        for zp in range(1, max_z_prime + 1):
             mols.append(MolData(
                 z=atom_types.repeat(zp),
-                pos=atom_coords.repeat(zp,1),
+                pos=atom_coords.repeat(zp, 1),
                 x=atom_types.repeat(zp),
                 do_mol_analysis=False,
                 radius=sample.radius,
@@ -636,7 +636,8 @@ class Modeller:
                     self.eval_work(ema_model, step_ind,
                                    buffer, train_mol_loader, test_mol_loader,
                                    energy_function, metrics)
-                    self.manage_prior_anchor(step_ind, metrics, gfn_model, ema_model, name)
+                    if self.args.anchor_fwd_bwd and self.args.both_ways:
+                        self.manage_prior_anchor(step_ind, metrics, gfn_model, ema_model, name)
 
                 # train monitoring
                 if step_ind % 10 == 0:
@@ -652,7 +653,7 @@ class Modeller:
                     loss_record = self.check_loss_explosion(name, loss_record, gfn_model, ema_model, optimizers)
                     wandb.log(metrics, step=step_ind)
 
-                if step_ind % 250 == 0: # save running model
+                if step_ind % 250 == 0:  # save running model
                     torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train.pt')
                     torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval.pt')
 
@@ -803,7 +804,8 @@ class Modeller:
                        repeats: int = 10,
                        report_losses: bool = False):
         init_state = get_gfn_init_state(self.args.batch_size, energy_function.data_ndim, self.device)
-        log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(mol_batch, z_primes=mol_batch.z_prime)
+        log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(mol_batch,
+                                                                                   z_primes=mol_batch.z_prime)
         mol_batch.sg_ind = sg_inds
         return get_gfn_forward_loss(self.args.fwd_loss_coeffs,
                                     init_state,
@@ -1010,7 +1012,7 @@ class Modeller:
         good_inds = torch.argwhere(torch.all(latents.abs() <= 1, dim=1))  # valid latent space
         dataset = [dataset[ind] for ind in good_inds]
 
-        if self.args.energy_function in ['silu', 'lj']:  # reparameterize incoming samples
+        if self.args.energy_function in ['silu', 'lj', 'qlj']:  # reparameterize incoming samples
             print("Re-featurizing preloaded buffer samples")
             dataset = featurize_dataset(dataset,
                                         self.device,
@@ -1070,74 +1072,81 @@ class Modeller:
         wandb.log(metrics, step=step_ind)
 
     def manage_prior_anchor(self, step_ind, metrics, gfn_model, ema_model, name):
-        if self.args.btb_threshold is not None and self.args.both_ways:  # todo update this to work with conditioning
-            # adjust by a factor of 'multiple' for each 'delta_factor' of miss
-            min_rat = 1 / 100
-            max_rat = 100
-            # check if we have hit our initial KLD target
-            if not self.hit_init_kld:
-                self.phase = 1
-                metric = metrics['Max Latent KLD']
-                if metric <= self.args.init_kld_threshold:
-                    self.hit_init_kld = True
-                    self.args.bwd_loss_coeffs.bwd_tb_z = 1.0
+        min_rat = 1 / 10
+        max_rat = 10
+        if not self.hit_init_kld:
+            self.phase = 1
+            metric = metrics['Max Latent KLD']
+            "check threshold"
+            if metric <= self.args.init_kld_threshold:
+                print("Hit initial KLD threshold. Moving to backward thermalization.")
+                self.hit_init_kld = True
 
-                    # self.args.bwd_loss_coeffs.tb = 1.0
-                    # self.args.bwd_loss_coeffs.mle = 0.0
-                    self.args.bwd_loss_schedule['tb'] = [(0, 1.0), (step_ind, 0.0), (step_ind + self.args.bwd_thermalization_time//2, 1.0)]
-                    self.args.bwd_loss_schedule['mle'] = [(0, 1.0), (step_ind, 1), (step_ind + self.args.bwd_thermalization_time // 2, 0.0)]
-                    self.args.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 1.0)]
-                    self.increasing_loss_cooldown = self.args.bwd_thermalization_time  # give it time to adjust to new loss landscape
-                    self.bwd_thermalization_stop_time = step_ind + self.args.bwd_thermalization_time
+                "adjust loss coefficients"
+                self.args.bwd_loss_coeffs.bwd_tb_z = 1.0
+                self.args.bwd_loss_schedule['tb'] = [(0, 1.0), (step_ind, 0.0),
+                                                     (step_ind + self.args.bwd_thermalization_time // 2, 1.0)]
+                self.args.bwd_loss_schedule['mle'] = [(0, 1.0), (step_ind, 1),
+                                                      (step_ind + self.args.bwd_thermalization_time // 2, 0.0)]
+                self.args.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 1.0)]
 
-                    torch.save(gfn_model.state_dict(), f'checkpoints/{name}_train_hit_prior.pt')
-                    torch.save(ema_model.state_dict(), f'checkpoints/{name}_eval_hit_prior.pt')
-                    print("Hit initial KLD threshold. Moving to backward thermalization.")
+                "set cooldowns"
+                self.increasing_loss_cooldown = self.args.bwd_thermalization_time  # give it time to adjust to new loss landscape
+                self.bwd_thermalization_stop_time = step_ind + self.args.bwd_thermalization_time
 
-                    self.phase = 2
-                    self.bwd_tb_record = []
-                    self.logz_record = []
+                "save checkpoint"
+                torch.save(gfn_model.state_dict(), f'checkpoints/{name}_train_hit_prior.pt')
+                torch.save(ema_model.state_dict(), f'checkpoints/{name}_eval_hit_prior.pt')
 
-            elif self.phase == 2:
-                self.bwd_tb_record.append(metrics['Bwd Normed TB Residual'])
-                self.logz_record.append(metrics['Bwd Normed Log Z LB Residual'])
+                self.phase = 2
+                self.bwd_tb_record = []
+                self.logz_record = []
+                self.n_eval_steps = min(10, (self.args.bwd_thermalization_time // self.args.eval_period))
 
-                n_eval_steps = min(10, (self.args.bwd_thermalization_time//self.args.eval_period))
-                if len(self.bwd_tb_record) >= n_eval_steps:  # check convergence over X steps
-                    recent_tb = np.array(self.bwd_tb_record[-n_eval_steps:])
-                    recent_z = np.array(self.logz_record[-n_eval_steps:])
-                    mean_tb = recent_tb.mean()
+        elif self.phase == 2:
+            "record convergence metrics"
+            self.bwd_tb_record.append(metrics['Bwd Normed TB Residual'])
+            self.logz_record.append(metrics['Bwd Normed Log Z LB Residual'])
 
-                    tb_stable = mean_tb < self.args.thermalization_conv_eps
-                    z_converged = recent_z.mean() < self.args.thermalization_conv_eps
+            if len(self.bwd_tb_record) >= self.n_eval_steps:  # check convergence over X steps
+                "check convergence"
+                recent_tb = np.array(self.bwd_tb_record[-self.n_eval_steps:])
+                recent_z = np.array(self.logz_record[-self.n_eval_steps:])
+                tb_stable = recent_tb.mean() < self.args.thermalization_conv_eps
+                z_converged = recent_z.mean() < self.args.thermalization_conv_eps
 
-                    if tb_stable and z_converged and (step_ind >= self.bwd_thermalization_stop_time):
-                        torch.save(gfn_model.state_dict(), f'checkpoints/{name}_train_thermalized.pt')
-                        torch.save(ema_model.state_dict(), f'checkpoints/{name}_eval_thermalized.pt')
-                        print("Thermalization complete. Moving to forward training & refinement.")
+                if tb_stable and z_converged and (step_ind >= self.bwd_thermalization_stop_time):
+                    print("Thermalization complete. Moving to forward training & refinement.")
+                    self.phase = 3
 
-                        self.args.fwd_to_bwd_ratio = 0.1
-                        self.args.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 0)]
-                        self.args.fwd_loss_schedule['tb'] = [(0, 1.0), (step_ind, 0.0),
-                                                             (step_ind + self.args.bwd_thermalization_time // 2, 1.0)]
+                    "save checkpoint"
+                    torch.save(gfn_model.state_dict(), f'checkpoints/{name}_train_thermalized.pt')
+                    torch.save(ema_model.state_dict(), f'checkpoints/{name}_eval_thermalized.pt')
 
-                        #self.args.bwd_loss_coeffs.bwd_tb_z = 0.0 # turn off backwards log Z thermalization
-                        self.increasing_loss_cooldown = self.args.bwd_thermalization_time
-                        self.phase = 3
-                        self.grow_buffer = True
-                        self.bwd_anchor = float(np.median(recent_tb))
+                    "adjust loss and balancing coefficients"
+                    self.args.fwd_to_bwd_ratio = min_rat
+                    self.args.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 0)]
+                    self.args.fwd_loss_schedule['tb'] = [(0, 1.0), (step_ind, 0.0),
+                                                         (step_ind + self.args.bwd_thermalization_time // 2, 1.0)]
 
-            elif self.phase == 3:
-                # if we have hit it, dynamically adjust fwd_to_bwd_ratio to keep it under the threshold based on the minimum original value
-                metric = max(0.01, metrics['Bwd Normed TB Residual'])  # don't let it be unrealistically small
+                    "set cooldown"
+                    self.increasing_loss_cooldown = self.args.bwd_thermalization_time
+                    self.grow_buffer = True
 
-                err = (metric - self.bwd_anchor * self.args.btb_threshold) / (self.bwd_anchor * self.args.btb_threshold)
-                # target the given kld threshold and optimize towards it
-                self.args.fwd_to_bwd_ratio *= np.exp(-0.1 * err)
-                self.args.fwd_to_bwd_ratio = np.clip(self.args.fwd_to_bwd_ratio, a_min=min_rat, a_max=max_rat)
+        elif self.phase == 3:
+            "get metrics"
+            # if we have hit it, dynamically adjust fwd_to_bwd_ratio to keep it under the threshold based on the minimum original value
+            metric = metrics['Bwd Normed TB Residual']
+            bwd_anchor = self.args.thermalization_conv_eps * self.args.btb_threshold
 
-            metrics['Training Phase'] = self.phase
-            metrics['Fwd to Bwd Ratio'] = self.args.fwd_to_bwd_ratio
+            "dynamic adjustment"
+            err = (metric - bwd_anchor) / bwd_anchor
+            # target the given kld threshold and optimize towards it
+            self.args.fwd_to_bwd_ratio *= np.exp(-0.1 * err)
+            self.args.fwd_to_bwd_ratio = np.clip(self.args.fwd_to_bwd_ratio, a_min=min_rat, a_max=max_rat)
+
+        metrics['Training Phase'] = self.phase
+        metrics['Fwd to Bwd Ratio'] = self.args.fwd_to_bwd_ratio
 
 
 if __name__ == '__main__':

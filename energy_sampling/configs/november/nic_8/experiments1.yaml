@@ -1,0 +1,82 @@
+defaults:
+  base: base.yaml
+
+
+experiments:
+- tag: 0
+  update:
+    energy_static_temperature: 1.0
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: qlj
+    btb_threshold: 1.5
+    bwd_thermalization_time: 1000
+    thermalization_conv_eps: 0.1
+    init_kld_threshold: 0.05
+
+- tag: 1
+  update:
+    energy_static_temperature: 1.0
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: qlj
+    btb_threshold: 1.5
+    bwd_thermalization_time: 1000
+    thermalization_conv_eps: 0.2
+    init_kld_threshold: 0.05
+
+- tag: 2
+  update:
+    energy_static_temperature: 1.0
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: qlj
+    btb_threshold: 1.5
+    bwd_thermalization_time: 1000
+    thermalization_conv_eps: 0.3
+    init_kld_threshold: 0.05
+
+- tag: 3
+  update:
+    energy_static_temperature: 1.0
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: qlj
+    btb_threshold: 1.5
+    bwd_thermalization_time: 1000
+    thermalization_conv_eps: 0.1
+    init_kld_threshold: 0.1
+
+- tag: 4
+  update:
+    energy_static_temperature: 1.0
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: qlj
+    btb_threshold: 2.0
+    bwd_thermalization_time: 1000
+    thermalization_conv_eps: 0.1
+    init_kld_threshold: 0.05
+
+- tag: 5
+  update:
+    energy_static_temperature: 1.0
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: qlj
+    btb_threshold: 1.5
+    bwd_thermalization_time: 2000
+    thermalization_conv_eps: 0.1
+    init_kld_threshold: 0.05

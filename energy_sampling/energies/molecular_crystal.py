@@ -97,29 +97,32 @@ class MolecularCrystal(BaseSet):
     def analyze_crystal_batch(self, x, mol_batch, return_batch=False):  # x is gfn_outputs
         crystal_batch = self.instantiate_crystals(x, mol_batch)
 
-        if self.energy_function not in ['lj', 'silu']:
+        if self.energy_function not in ['lj', 'qlj', 'silu']:
             lj_energy = torch.zeros(crystal_batch.num_graphs, device=self.device)
+            qlj_energy = torch.zeros_like(lj_energy)
             normed_lj_energy = torch.zeros_like(lj_energy)
             silu_energy = torch.zeros_like(lj_energy)
             niggli_overlap = torch.zeros_like(lj_energy)
         else:
-            if self.energy_function == 'lj':
+            if self.energy_function in ['lj', 'qlj']:
                 cutoff = 10
             elif self.energy_function == 'silu':
                 cutoff = 6
             else:
                 assert False
-            out = crystal_batch.analyze(['lj', 'silu', 'niggli'],
+            out = crystal_batch.analyze(['lj', 'qlj', 'silu', 'niggli'],
                                         cutoff=cutoff,
                                         supercell_size=5,
                                         std_orientation=False)
             lj_energy = out['lj']
+            qlj_energy = out['qlj']
             normed_lj_energy = log_rescale_positive(lj_energy, 0)
             silu_energy = out['silu']
             niggli_overlap = out['niggli']
 
         crystal_batch.add_graph_attr(silu_energy, 'silu_pot')
         crystal_batch.add_graph_attr(lj_energy, 'lj_pot')
+        crystal_batch.add_graph_attr(qlj_energy, 'qlj_pot')
         crystal_batch.add_graph_attr(niggli_overlap, 'niggli_overlap')
         crystal_batch.add_graph_attr(normed_lj_energy, 'scaled_lj_pot')
 
@@ -128,7 +131,7 @@ class MolecularCrystal(BaseSet):
         crystal_batch.add_graph_attr(crystal_energy, 'gfn_energy')
 
         if torch.any(torch.isinf(crystal_energy)) or torch.any(torch.isnan(crystal_energy)):
-            crystal_energy[torch.isinf(crystal_energy)] = 0 # just patch it for now
+            crystal_energy[torch.isinf(crystal_energy)] = 0  # just patch it for now
             crystal_energy[torch.isnan(crystal_energy)] = 0
 
         for key in ens_dict.keys():
@@ -144,13 +147,15 @@ class MolecularCrystal(BaseSet):
 
         latents = crystal_batch.latent_params()
         if raw_latents is not None:
-            bounding_energy = (F.relu(raw_latents - 1) ** 2 + F.relu(-(raw_latents + 1)) ** 2).sum(dim=-1)  # discourage exploration beyond clip range
+            bounding_energy = (F.relu(raw_latents - 1) ** 2 + F.relu(-(raw_latents + 1)) ** 2).sum(
+                dim=-1)  # discourage exploration beyond clip range
         else:
             bounding_energy = torch.zeros_like(latents[:, 0])
 
         if self.max_z_prime > 1:
             # penalize the model for placing asymmetric units out of the canonical order (closest -> furthest from origin)
-            per_aunit_centroids = crystal_batch.aunit_centroid.reshape(crystal_batch.num_graphs, crystal_batch.max_z_prime, 3)
+            per_aunit_centroids = crystal_batch.aunit_centroid.reshape(crystal_batch.num_graphs,
+                                                                       crystal_batch.max_z_prime, 3)
             idx = torch.arange(crystal_batch.max_z_prime, device=crystal_batch.device)[None, ...]
             mask = (idx >= (crystal_batch.z_prime[..., None]))[..., None].expand(-1, -1, 3)
             per_aunit_centroids[mask] = 1  # this will put lower Z' options always at the end
@@ -160,12 +165,16 @@ class MolecularCrystal(BaseSet):
             zp_ordering_energy = F.relu(overlaps).mean(dim=-1) ** 2
             bounding_energy = bounding_energy + zp_ordering_energy
 
-        if self.energy_function in ['lj', 'silu']:
+        if self.energy_function in ['lj', 'qlj', 'silu']:
             density_energy = density_penalty(crystal_batch.packing_coeff)
             if self.energy_function == 'lj':
                 lj_energy = log_rescale_positive(crystal_batch.lj_pot, self.lj_turnover_pot) / crystal_batch.num_atoms
+            elif self.energy_function == 'qlj':
+                lj_energy = soften_high(crystal_batch.qlj_pot, self.lj_turnover_pot,
+                                        coeff=0.25) / crystal_batch.num_atoms
             elif self.energy_function == 'silu':
-                lj_energy = soften_high(crystal_batch.silu_pot, self.lj_turnover_pot, coeff=0.25) / crystal_batch.num_atoms
+                lj_energy = soften_high(crystal_batch.silu_pot, self.lj_turnover_pot,
+                                        coeff=0.25) / crystal_batch.num_atoms
             else:
                 assert False
             niggli_energy = F.relu(-crystal_batch.niggli_overlap) ** 2  # punish negative overlaps
@@ -189,14 +198,14 @@ class MolecularCrystal(BaseSet):
         elif self.energy_function == 'crystal_multiharmonic':
             crystal_energy = self.crystal_multiharmonic_en(crystal_batch, latents)
 
-        elif self.energy_function == 'silu' or self.energy_function == 'lj':
+        elif self.energy_function in ['lj', 'qlj', 'silu']:
             crystal_energy = self.lj_coeff * lj_energy + self.density_coeff * density_energy
 
         else:
             assert False, f'{self.energy_function} not implemented'
 
         total_energy = crystal_energy + bounding_energy * self.bounding_coeff + niggli_energy * self.niggli_coeff
-        #return soft_clip(soften_high(total_energy, self.energy_clip / 2, coeff=0.7), self.energy_clip), ens_dict
+        # return soft_clip(soften_high(total_energy, self.energy_clip / 2, coeff=0.7), self.energy_clip), ens_dict
         return log_rescale_positive(total_energy, self.energy_clip), ens_dict
 
     def crystal_multiharmonic_en(self, crystal_batch, latents):
@@ -314,8 +323,8 @@ class MolecularCrystal(BaseSet):
         eye3 = torch.eye(3, device='cpu').repeat(mol_batch.num_graphs, 1, 1)
         ones1 = torch.ones(mol_batch.num_graphs, device='cpu')
         trues1 = torch.zeros(mol_batch.num_graphs, dtype=torch.bool, device='cpu').fill_(True)
-        zones3 = torch.ones((mol_batch.num_graphs, 3*self.max_z_prime), device='cpu')
-        zones1 =  torch.ones((mol_batch.num_graphs, self.max_z_prime), device='cpu')
+        zones3 = torch.ones((mol_batch.num_graphs, 3 * self.max_z_prime), device='cpu')
+        zones1 = torch.ones((mol_batch.num_graphs, self.max_z_prime), device='cpu')
         blank_batch_properties = {
             'aunit_handedness': zones1,
             'nonstandard_symmetry': ~trues1,
@@ -325,6 +334,7 @@ class MolecularCrystal(BaseSet):
             'aunit_orientation': zones3,
             'silu_pot': zeros1,
             'lj_pot': zeros1,
+            'qlj_pot': zeros1,
             'scaled_lj_pot': zeros1,
             'niggli_overlap': zeros1,
             'T_fc': eye3,

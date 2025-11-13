@@ -96,5 +96,41 @@ experiments:
     thermalization_conv_eps: 0.1
 
 
+- tag: 9
+  update:
+    energy_static_temperature: 0.05
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: silu
+    thermalization_conv_eps: 1.0
+
+
+- tag: 10
+  update:
+    energy_static_temperature: 0.1
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: silu
+    thermalization_conv_eps: 1.0
+
+
+- tag: 11
+  update:
+    energy_static_temperature: 0.5
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: silu
+    thermalization_conv_eps: 1.0
+
+
+
+
+
 
 
