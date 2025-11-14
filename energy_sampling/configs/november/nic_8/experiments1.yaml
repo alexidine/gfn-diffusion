@@ -15,6 +15,7 @@ experiments:
     bwd_thermalization_time: 1000
     thermalization_conv_eps: 0.1
     init_kld_threshold: 0.05
+    checkpoint_path: '/scratch/mk8347/diffusion/energy_sampling/checkpoints/nov_nic_8_0_train_hit_prior.pt'
 
 - tag: 1
   update:
@@ -28,6 +29,8 @@ experiments:
     bwd_thermalization_time: 1000
     thermalization_conv_eps: 0.2
     init_kld_threshold: 0.05
+    checkpoint_path: '/scratch/mk8347/diffusion/energy_sampling/checkpoints/nov_nic_8_1_train_hit_prior.pt'
+
 
 - tag: 2
   update:
@@ -41,6 +44,8 @@ experiments:
     bwd_thermalization_time: 1000
     thermalization_conv_eps: 0.3
     init_kld_threshold: 0.05
+    checkpoint_path: '/scratch/mk8347/diffusion/energy_sampling/checkpoints/nov_nic_8_2_train_hit_prior.pt'
+
 
 - tag: 3
   update:
@@ -54,6 +59,8 @@ experiments:
     bwd_thermalization_time: 1000
     thermalization_conv_eps: 0.1
     init_kld_threshold: 0.1
+    checkpoint_path: '/scratch/mk8347/diffusion/energy_sampling/checkpoints/nov_nic_8_3_train_hit_prior.pt'
+
 
 - tag: 4
   update:
@@ -67,6 +74,8 @@ experiments:
     bwd_thermalization_time: 1000
     thermalization_conv_eps: 0.1
     init_kld_threshold: 0.05
+    checkpoint_path: '/scratch/mk8347/diffusion/energy_sampling/checkpoints/nov_nic_8_4_train_hit_prior.pt'
+
 
 - tag: 5
   update:
@@ -80,3 +89,4 @@ experiments:
     bwd_thermalization_time: 2000
     thermalization_conv_eps: 0.1
     init_kld_threshold: 0.05
+    checkpoint_path: '/scratch/mk8347/diffusion/energy_sampling/checkpoints/nov_nic_8_5_train_hit_prior.pt'

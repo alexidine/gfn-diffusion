@@ -2,10 +2,10 @@ run_name: 'mk_local_dev'
 tag: 'dev'
 seed: 12345
 device: 'cuda'
-lr_policy: 0.0005              # learning rate of the policy network
+lr_policy: 5.0e-4              # learning rate of the policy network
 min_lr: 1.0e-6                # ihn
-lr_flow: 1.0                  # learning rate of the flow network
-lr_back: 0.0005                # learning rate of the backward pass
+lr_flow: 1.0e-0                  # learning rate of the flow network
+lr_back: 5.0e-4                # learning rate of the backward pass
 lr_warmup_ratio: 10           # how much smaller the initial (warmup) LR should be than the max policy value
 scheduler: True               # does LR warmup from lr/lr_warup_ratio -> lr -> min_lr over the warmup and annealing period
 lr_warmup_time: 500
@@ -16,7 +16,7 @@ gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weigh
 ema_decay: null #0.99  # set to null for no ema
 
 # model parameters
-checkpoint_path: null
+checkpoint_path: 'D:\crystal_datasets\nov_nic_8_0_model_train.pt'
 zero_init: False
 joint_layers: 4              # number of layers in forward/backward policy models
 hidden_dim: 1024             # dimensionality of hidden layer
@@ -69,12 +69,12 @@ fwd_loss_coeffs:
   buffer_gamma:     0
   loss_clip:        1.0E+9
 bwd_loss_coeffs:
-  tb:               1.0  # will be altered by bwd_tb_z - must be nonzero for log Z backwards-trained warm start
-  bwd_tb_z:         2.0  # 2 if we should only train the Z component in tb, 1 if we should train log Z on backward TB, 0 if not. bwd tb must be >0
+  tb:               1.0 #1.0  # will be altered by bwd_tb_z - must be nonzero for log Z backwards-trained warm start
+  bwd_tb_z:         1.0 #2.0  # 2 if we should only train the Z component in tb, 1 if we should train log Z on backward TB, 0 if not. bwd tb must be >0
   vg_lb:            0
   vg_lme:           0  # exclusive with vg_lb
   emp_z:            0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
-  mle:              1.0  #[[0, 1.0], [1000, 1.0], [2000, 0.0]]  # will do weighted MLE if VG is running, otherwise trajectory-wise
+  mle:              0.0 # 1.0  # will do weighted MLE if VG is running with repeats, otherwise trajectory-wise
   mle_prior_fraction: 0.0  # DEPRECATED must be rewritten what fraction of samples to replace with SG-wise unconditional prior
   pmle_std:         0.01 # std deviation of the prior mle distribution. Best to start small (1) and smoothly grow
   loss_clip:        1.0E+9
@@ -83,14 +83,14 @@ btb_threshold: 1.5 # fractional leeway on the thermalization conv_eps for fwd-bw
 bwd_thermalization_time: 100  # time to transition from MLE to bTB training
 thermalization_conv_eps: 1.0
 init_kld_threshold: 1.0
-anchor_fwd_bwd: true
+anchor_fwd_bwd: false
 
 prior_coverage_ratio: 0.05  # [0, 1] fraction of uniform bin coverage that will satisfy the coverage metric
-both_ways: true             # forward and backward training
+both_ways: false             # forward and backward training
 repeats: 2                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
 bwd_batch_multiplier: 1      # ratio of backward to foward batch size (much cheaper to evaluate)
-fwd_to_bwd_ratio: 0.00001          # whether to do forward (>1) or backward (<1) training more often
-bwd: false                   # backward training only
+fwd_to_bwd_ratio: 1          # whether to do forward (>1) or backward (<1) training more often
+bwd: trie                   # backward training only
 learn_pb: true               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
 learned_variance: True       # whether to learn policy variance
 clipping: true  # clip the maximum step size induced by the policy model

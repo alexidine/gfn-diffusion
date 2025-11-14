@@ -11,6 +11,7 @@
   - bwd_thermalization_time
   - thermalization_conv_eps
   - init_kld_threshold
+  - checkpoint_path
   notes: ''
 - index: 1
   tag: 1
@@ -25,6 +26,7 @@
   - bwd_thermalization_time
   - thermalization_conv_eps
   - init_kld_threshold
+  - checkpoint_path
   notes: ''
 - index: 2
   tag: 2
@@ -39,6 +41,7 @@
   - bwd_thermalization_time
   - thermalization_conv_eps
   - init_kld_threshold
+  - checkpoint_path
   notes: ''
 - index: 3
   tag: 3
@@ -53,6 +56,7 @@
   - bwd_thermalization_time
   - thermalization_conv_eps
   - init_kld_threshold
+  - checkpoint_path
   notes: ''
 - index: 4
   tag: 4
@@ -67,6 +71,7 @@
   - bwd_thermalization_time
   - thermalization_conv_eps
   - init_kld_threshold
+  - checkpoint_path
   notes: ''
 - index: 5
   tag: 5
@@ -81,4 +86,5 @@
   - bwd_thermalization_time
   - thermalization_conv_eps
   - init_kld_threshold
+  - checkpoint_path
   notes: ''

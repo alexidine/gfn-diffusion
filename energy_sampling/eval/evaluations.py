@@ -706,10 +706,10 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
 
 
 def bwd_figs(metrics, fig_dict, buffer, gfn_model, init_state, discretizer, do_figs: Optional[bool] = False):
-    terminal_state, b_log_r, crystal_batch, condition = buffer.sample(
+    terminal_state, log_r, crystal_batch, condition = buffer.sample(
         override_batch=len(init_state),
         )
-    (backward_flow_states, b_log_pfs, b_log_pbs, b_log_flow,
+    (backward_flow_states, b_log_pfs, b_log_pbs, log_z,
      b_means_f, b_vars_f, b_means_b, b_vars_b) = gfn_model.get_traj_bwd(
         terminal_state.to(gfn_model.device), discretizer, condition.to(gfn_model.device), return_gauss_params=True)
 
@@ -718,29 +718,31 @@ def bwd_figs(metrics, fig_dict, buffer, gfn_model, init_state, discretizer, do_f
     metrics['Mean Bwd F Var'] = b_vars_f.mean().item()
     metrics['Mean Bwd B Var'] = b_vars_b.mean().item()
 
-    tb_x = b_log_flow.cpu() + b_log_pfs.sum(-1).cpu()
-    tb_y = b_log_r.cpu() + b_log_pbs.sum(-1).cpu()
-    high_cut, low_cut = torch.quantile(b_log_r, 0.99), torch.quantile(b_log_r, 0.01)
-    good_inds = ((high_cut >= b_log_r) * (b_log_r >= low_cut)).cpu()
+    tb_x = log_z.cpu() + b_log_pfs.sum(-1).cpu()
+    tb_y = log_r.cpu() + b_log_pbs.sum(-1).cpu()
+    high_cut, low_cut = torch.quantile(log_r, 0.99), torch.quantile(log_r, 0.01)
+    good_inds = ((high_cut >= log_r) * (log_r >= low_cut)).cpu()
     metrics['Backward TB R Value'] = torch.corrcoef(torch.stack([tb_x[good_inds], tb_y[good_inds]]))[0, 1].item()
 
-    log_weight = b_log_r + b_log_pbs.sum(-1).cpu() - b_log_pfs.sum(-1).cpu()
+    log_weight = log_r + b_log_pbs.sum(-1).cpu() - b_log_pfs.sum(-1).cpu()
     log_Z_empirical = logmeanexp(log_weight)
     log_Z_lb = log_weight.mean()
-    log_Z_learned = b_log_flow.mean()
+    log_Z_learned = log_z.mean()
     metrics['Bwd Empirical log Z'] = log_Z_empirical.cpu().detach().item()
     metrics['Bwd Empirical log Z LB'] = log_Z_lb.cpu().detach().item()
 
     log_pf = b_log_pfs.sum(-1)
     log_pb = b_log_pbs.sum(-1)
-    log_ratio = (-log_pf.cpu() - b_log_flow.cpu() + log_pb.cpu() + b_log_r.cpu())
-    X_side = log_pb.cpu() - log_pf.cpu()
-    Y_side = b_log_r.cpu() - b_log_flow.cpu()
-    normed_log_ratio = (X_side - Y_side).abs() / Y_side.abs()
+
+    log_ratio = (-log_pf.cpu() - log_z.cpu() + log_pb.cpu() + log_r.cpu())
     tb_residual = F.smooth_l1_loss(log_ratio, torch.ones_like(log_ratio), reduction='none', beta=10)
-    normed_tb_residual = normed_log_ratio.mean()
     metrics['Bwd TB Residual'] = tb_residual.mean().item()
+
+    X_side = log_pf.cpu() - log_pb.cpu()
+    Y_side = log_r.cpu() - log_z.cpu()
+    normed_tb_residual = (X_side - Y_side).abs() / Y_side.abs()
     metrics['Bwd Normed TB Residual'] = normed_tb_residual.mean().item()
+
     metrics['Bwd Log Z Residual'] = (log_Z_empirical - log_Z_learned).item()
     metrics['Bwd Normed Log Z Residual'] = ((log_Z_empirical - log_Z_learned).abs()/log_Z_lb.abs()).item()
     metrics['Bwd Log Z LB Residual'] = (log_Z_lb - log_Z_learned).item()
@@ -749,16 +751,16 @@ def bwd_figs(metrics, fig_dict, buffer, gfn_model, init_state, discretizer, do_f
     if do_figs:
         fig_dict['Backward Latents Trajectories'] = visualize_latent_trajs(
             backward_flow_states.cpu().detach().numpy(),
-            n_trajs=20, log_r=b_log_r.cpu().detach().numpy())
+            n_trajs=20, log_r=log_r.cpu().detach().numpy())
 
         # fig_dict['Backward Pf vs Pb'] = Pf_vs_Pb_fig(b_log_pfs, b_log_pbs, b_log_r)
         fig_dict['Backward TB Parity Plot'], _ = flow_parity_plot(
-            b_log_r.to(b_log_flow.device),
-            b_log_flow, b_log_pbs,
+            log_r.to(log_z.device),
+            log_z, b_log_pbs,
             b_log_pfs)
         fig_dict['Bwd TB Residual vs R'] = xy_scatter_plot(
-            b_log_r,
-            torch.abs(b_log_r.cpu() - b_log_flow.cpu() - b_log_pfs.sum(-1).cpu() + b_log_pbs.sum(-1).cpu()),
+            log_r,
+            torch.abs(log_r.cpu() - log_z.cpu() - b_log_pfs.sum(-1).cpu() + b_log_pbs.sum(-1).cpu()),
             xaxis_title='Reward',
             yaxis_title='TB Residual',
         )
@@ -800,7 +802,7 @@ def mean_flow_step_sizes(flow_states):
     return fig
 
 
-def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r, log_flow,
+def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r, log_z,
                 sample_batch, log_T_tensor, log_pfs, log_pbs, args, buffer=None):
     """Scalar / distribution metrics"""
     metrics = {}
@@ -832,7 +834,7 @@ def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r
     metrics['Empirical log Z LB'] = log_Z_lb.cpu().detach().item()
     metrics['log Z learned'] = log_Z_learned.cpu().detach().item()
 
-    tb_x = log_flow.cpu() + log_pfs.sum(-1).cpu()
+    tb_x = log_z.cpu() + log_pfs.sum(-1).cpu()
     tb_y = log_r.cpu() + log_pbs.sum(-1).cpu()
     high_cut, low_cut = torch.quantile(log_r, 0.99), torch.quantile(log_r, 0.01)
     good_inds = ((high_cut >= log_r) * (log_r >= low_cut)).cpu()
@@ -926,14 +928,16 @@ def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r
     # unconditional flow metrics
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
-    log_ratio = (-log_pf.cpu() - log_flow.cpu() + log_pb.cpu() + log_r.cpu()) / (log_r.cpu() - log_flow.cpu())
-    X_side = log_pb.cpu() - log_pf.cpu()
-    Y_side = log_r.cpu() - log_flow.cpu()
-    normed_log_ratio = (X_side - Y_side).abs() / Y_side.abs()
+
+    log_ratio = -log_pf.cpu() - log_z.cpu() + log_pb.cpu() + log_r.cpu()
     tb_residual = F.smooth_l1_loss(log_ratio, torch.ones_like(log_ratio), reduction='none', beta=10)
-    normed_tb_residual = normed_log_ratio.mean()
     metrics['TB Residual'] = tb_residual.mean().item()
-    metrics['Normed TB Residual'] = normed_tb_residual.mean().item()
+
+    X_side = log_pf.cpu() - log_pb.cpu()
+    Y_side = log_r.cpu() - log_z.cpu()
+    normed_log_ratio = (X_side - Y_side).abs() / Y_side.abs()
+    metrics['Normed TB Residual'] = normed_log_ratio.mean().item()
+
     metrics['Log Z Residual'] = (log_Z_empirical - log_Z_learned).item()
     metrics['Normed Log Z Residual'] =  ((log_Z_empirical - log_Z_learned).abs()/log_Z_empirical.abs()).item()
     metrics['Log Z LB Residual'] = (log_Z_lb - log_Z_learned).item()

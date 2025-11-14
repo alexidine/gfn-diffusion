@@ -24,7 +24,7 @@ bwd_loss_coeffs:
   vg_lb: 0
   vg_lme: 0
 bwd_thermalization_time: 1000
-checkpoint_path: null
+checkpoint_path: /scratch/mk8347/diffusion/energy_sampling/checkpoints/nov_nic_8_1_train_hit_prior.pt
 clipping: true
 condition_emb_dim: 1024
 conditional_eval_period: 1000
