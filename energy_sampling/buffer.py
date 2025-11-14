@@ -130,7 +130,9 @@ class CrystalReplayBuffer:
                 keep[ind] = True
 
         """cluster near-degenerate states and extract minima"""
-        clusterer = hdbscan.HDBSCAN(min_cluster_size=2, min_samples=1, cluster_selection_epsilon=0.1)
+        clusterer = hdbscan.HDBSCAN(min_cluster_size=2, min_samples=1, cluster_selection_epsilon=0.1,
+                                    core_dist_n_jobs=1, algorithm='best'# exclude multiprocessing to make it cuda-safe
+                                    )
         labels = clusterer.fit_predict(x_tensor.cpu().numpy())
         labels_t = torch.tensor(labels, device=x_tensor.device)
         num_labels = len(np.unique(labels))
