@@ -1095,8 +1095,8 @@ class Modeller:
                 self.bwd_thermalization_stop_time = step_ind + self.args.bwd_thermalization_time
 
                 "save checkpoint"
-                torch.save(gfn_model.state_dict(), f'checkpoints/{name}_train_hit_prior.pt')
-                torch.save(ema_model.state_dict(), f'checkpoints/{name}_eval_hit_prior.pt')
+                torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train_hit_prior.pt')
+                torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval_hit_prior.pt')
 
                 self.phase = 2
                 self.bwd_tb_record = []
@@ -1120,8 +1120,8 @@ class Modeller:
                     self.phase = 3
 
                     "save checkpoint"
-                    torch.save(gfn_model.state_dict(), f'checkpoints/{name}_train_thermalized.pt')
-                    torch.save(ema_model.state_dict(), f'checkpoints/{name}_eval_thermalized.pt')
+                    torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train_thermalized.pt')
+                    torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval_thermalized.pt')
 
                     "adjust loss and balancing coefficients"
                     self.args.fwd_to_bwd_ratio = min_rat
