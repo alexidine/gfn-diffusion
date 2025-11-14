@@ -3,6 +3,7 @@ from typing import Optional
 import hdbscan
 import numpy as np
 import torch
+from poetry.console.commands import self
 from scipy.spatial.transform import Rotation
 from torch_geometric.loader import DataLoader
 from torch_scatter import scatter
@@ -52,37 +53,43 @@ class CrystalReplayBuffer:
         with torch.no_grad():
             if self.dataset is None:
                 self.init_fresh_dataset(data_list, max_z_prime)
-                self.init_loader()
 
             else:
-                # rough filtration
-                if data_list is None and data_batch is not None:
-                    data_list = data_batch.batch_to_list()
-                elif data_list is not None and data_batch is None:
-                    data_batch = collate_data_list(data_list, max_z_prime=self.max_z_prime)
-
-                scores = self.energy_function.prebuilt_sample_to_reward(data_batch, temperature=torch.ones(data_batch.num_graphs))
-                score_cut = np.quantile(self.rewards_list, 0.05)
-
-                good_inds = [ind for ind in range(len(data_list)) if
-                            ((data_list[ind].lj_pot < 0) and (data_list[ind].niggli_overlap >= 0) and (scores[ind] > score_cut))
-                            ]
-
-                if True: #len(good_inds) > 0:
-                    data_to_add = [data_list[ind] for ind in good_inds]
-
-                    self.dataset.extend(data_to_add)
-                    dataset_batch = collate_data_list(self.dataset, max_z_prime=max_z_prime)
-                    x_tensor = dataset_batch.latent_params()
-                    good_scores = scores[torch.tensor(good_inds, dtype=torch.long)]
-                    self.x_list = [x_tensor[i] for i in range(x_tensor.shape[0])]
-                    self.rewards_list.extend(good_scores.flatten().cpu().detach().numpy())
-                    self.sg_list = list(dataset_batch.sg_ind.cpu())
+                self.add_samples_to_dataset(data_batch, data_list, max_z_prime)
 
             if len(self) > self.buffer_size:  # pare down buffer
                 self.truncate_buffer()
 
             assert len(self.dataset) == len(self.x_list) == len(self.rewards_list)
+
+            self.init_loader()
+
+    def add_samples_to_dataset(self, data_batch, data_list, max_z_prime):
+        # batch samples
+        if data_list is None and data_batch is not None:
+            data_list = data_batch.batch_to_list()
+        elif data_list is not None and data_batch is None:
+            data_batch = collate_data_list(data_list, max_z_prime=self.max_z_prime)
+        # get rewards
+        scores = self.energy_function.prebuilt_sample_to_reward(data_batch,
+                                                                temperature=torch.ones(data_batch.num_graphs))
+        # enforce reasonable standards for consideration in the buffer
+        score_cut = np.quantile(self.rewards_list, 0.5)
+        good_inds = [ind for ind in range(len(data_list)) if
+                     ((data_list[ind].lj_pot < 0) and (data_list[ind].niggli_overlap >= 0) and (
+                                 scores[ind] > score_cut))
+                     ]
+        # add anything reasonable
+        if len(good_inds) > 0:
+            data_to_add = [data_list[ind] for ind in good_inds]
+
+            self.dataset.extend(data_to_add)
+            dataset_batch = collate_data_list(self.dataset, max_z_prime=max_z_prime)
+            x_tensor = dataset_batch.latent_params()
+            good_scores = scores[torch.tensor(good_inds, dtype=torch.long)]
+            self.x_list = [x_tensor[i] for i in range(x_tensor.shape[0])]
+            self.rewards_list.extend(good_scores.flatten().cpu().detach().numpy())
+            self.sg_list = list(dataset_batch.sg_ind.cpu())
 
     def init_fresh_dataset(self, data_list, max_z_prime):
         self.dataset = list(data_list)  # I think this is memory safe and faster #copy.deepcopy(data_list)
@@ -105,44 +112,19 @@ class CrystalReplayBuffer:
         3 - clustering
         :return:
         """
-        d_cut = self.buffer_dist_cutoff
-        e_tensor = -torch.nan_to_num(torch.tensor(self.rewards_list, device=self.device))
+        # get descriptors
+        device = self.device
+        x_tensor = torch.stack(self.x_list).to(device)
+        e_tensor = -torch.nan_to_num(torch.tensor(self.rewards_list, device=device))
 
+        # define cutoffs
+        d_cut = self.buffer_dist_cutoff
         if self.original_dataset_inds is not None:
             e_cut = np.quantile(e_tensor[self.original_dataset_inds], 0.25)
         else:
-            e_cut = -np.quantile(e_tensor, 0.25)
+            e_cut = np.quantile(e_tensor, 0.25)
 
-        x_tensor = torch.stack(self.x_list).to(self.device)
-        sort_inds = torch.argsort(e_tensor)
-        sorted_x_tensor = x_tensor[sort_inds]
-        sorted_e_tensor = e_tensor[sort_inds]
-        distmat = torch.cdist(sorted_x_tensor, sorted_x_tensor)
-        mask = sorted_e_tensor < e_cut
-
-        keep = torch.zeros(len(x_tensor), dtype=bool, device=self.device)
-        for ind in range(len(self)):
-            if not mask[ind]:
-                continue
-
-            too_close = (distmat[ind, keep] < d_cut).any()
-            if not too_close:
-                keep[ind] = True
-
-        """cluster near-degenerate states and extract minima"""
-        clusterer = hdbscan.HDBSCAN(min_cluster_size=2, min_samples=1, cluster_selection_epsilon=0.1,
-                                    core_dist_n_jobs=1, algorithm='best'# exclude multiprocessing to make it cuda-safe
-                                    )
-        labels = clusterer.fit_predict(x_tensor.cpu().numpy())
-        labels_t = torch.tensor(labels, device=x_tensor.device)
-        num_labels = len(np.unique(labels))
-        basin_minima = scatter(torch.arange(len(labels_t), device=labels_t.device), labels_t, reduce='min', dim_size=num_labels, dim=0)
-
-        assigned_minima_inds = torch.cat([
-            sort_inds[basin_minima[1:]],  # all clustered minima
-            sort_inds[torch.argwhere(labels_t == -1).flatten()]  # plus noise points
-        ])
-        inds_to_keep = assigned_minima_inds
+        inds_to_keep = self.bottom_up_cluster(x_tensor, e_tensor, d_cut, e_cut)
 
         if self.keep_initial_samples:
             orig_dataset_ind_tensor = torch.tensor(self.original_dataset_inds, device=self.device, dtype=torch.long)
@@ -160,6 +142,20 @@ class CrystalReplayBuffer:
                 sorted_by_e = inds_to_keep[torch.argsort(e_tensor[inds_to_keep])]
                 inds_to_keep = sorted_by_e[:self.buffer_size]
 
+        inds_to_keep = inds_to_keep.tolist()  # for convenience
+
+        # Fill with random samples if needed
+        n_keep = len(inds_to_keep)
+        if n_keep < self.buffer_size:
+            # Candidates = all indices not already kept
+            all_inds = set(range(len(self.x_list)))
+            remaining = list(all_inds - set(inds_to_keep))
+
+            n_fill = self.buffer_size - n_keep
+            if n_fill > 0 and len(remaining) > 0:
+                fill_inds = np.random.choice(remaining, size=min(n_fill, len(remaining)), replace=False)
+                inds_to_keep.extend(fill_inds.tolist())
+
         self.dataset = [self.dataset[ind] for ind in inds_to_keep]
         self.rewards_list = [self.rewards_list[ind] for ind in inds_to_keep]
         self.x_list = [self.x_list[ind] for ind in inds_to_keep]
@@ -170,6 +166,45 @@ class CrystalReplayBuffer:
             return 0
         else:
             return len(self.dataset)
+
+    def bottom_up_cluster(self, xx, e, d_cut, e_cut):
+        # Sort by energy ascending
+        sort_inds = torch.argsort(e)
+        xx_sorted = xx[sort_inds]
+        e_sorted = e[sort_inds]
+
+        mask = e_sorted < e_cut
+
+        # Compute full distance matrix once (O(n^2) but fast on GPU)
+        dmat = torch.cdist(xx_sorted, xx_sorted)
+
+        keep = torch.zeros(len(xx_sorted), dtype=bool, device=xx.device)
+        for i in range(len(xx_sorted)):
+            if not mask[i]:
+                break
+            # check if this point is farther than d_cut from all previously kept points
+            too_close = (dmat[i, keep] < d_cut).any()
+            if not too_close:
+                keep[i] = True
+
+        keep_inds = sort_inds[keep]
+
+        clusterer = hdbscan.HDBSCAN(min_cluster_size=2, min_samples=1, cluster_selection_epsilon=0.1)
+        labels = clusterer.fit_predict(xx[keep_inds].cpu().numpy())
+        minima_inds = []
+        for lbl in torch.unique(torch.tensor(labels), sorted=True):
+            mask = labels == lbl.item()
+            if mask.sum() == 0: continue
+            idx = torch.argmin(e[keep_inds][mask])
+            minima_inds.append(keep_inds[mask][idx])
+
+        noisy_inds = keep_inds[labels==-1]
+
+        inds_to_keep = torch.cat([
+            torch.tensor(minima_inds[1:]), noisy_inds
+        ])
+
+        return inds_to_keep
 
     def sample_indices(self, batch_size,
                        replace: bool,
@@ -247,7 +282,7 @@ class CrystalReplayBuffer:
                                                 override_method=override_sampler)
 
         sample_batch = collate_data_list([self.dataset[ind] for ind in rand_inds],
-                                         max_z_prime=self.max_z_prime)
+                                         max_z_prime=self.max_z_prime, exclude_keys=['symmetry_operators'])
 
         if randomize_orientations:
             # this is a form of sample augmentation, where we rotate the molecule and its applied orientation

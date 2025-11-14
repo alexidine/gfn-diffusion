@@ -22,7 +22,7 @@ from energy_sampling.buffer import CrystalReplayBuffer
 from energy_sampling.utils import iter_forever, \
     is_cuda_oom, get_annealing_factor, \
     parse_loss_schedules, dict2namespace, update_loss_schedule, \
-    random_discretizer, low_discrepancy_discretizer, low_discrepancy_discretizer2, shifted_equidistant
+    random_discretizer, low_discrepancy_discretizer, low_discrepancy_discretizer2, shifted_equidistant, substitute_prior
 from eval.evaluations import eval_step, conditional_eval_step
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 from models import GFN
@@ -58,7 +58,9 @@ class Modeller:
         self.increasing_loss_cooldown = 0
         self.lr_warmup_finished = False
         self.phase = None
-        self.grow_buffer = False
+        self.grow_buffer = self.args.grow_buffer
+        if self.args.anchor_fwd_bwd:
+            self.args.fwd_to_bwd_ratio = 1.0E-6
 
     def train_logic(self, buffer, it):
         do_forward = False
@@ -832,11 +834,10 @@ class Modeller:
         else:
             assert False, f"sampling method {self.args.sampling} not implemented"
 
-        # todo an option, similar to what we did with the pmle, to noise the samples and recompute r, would be nice
-
-        # if self.args.bwd_loss_coeffs.mle_prior_fraction > 0:
-        #     condition, rewards, samples = substitute_prior(
-        #         self.args.bwd_loss_coeffs, condition, crystal_batch, energy_function, rewards, samples, buffer)
+        if self.args.bwd_loss_coeffs.noised_fraction > 0:
+            condition, rewards, samples = substitute_prior(
+                self.args.bwd_loss_coeffs, condition, crystal_batch,
+                energy_function, rewards, samples, buffer)
 
         return get_gfn_backward_loss(self.args.bwd_loss_coeffs,
                                      samples.to(self.device),
@@ -1089,6 +1090,8 @@ class Modeller:
                 self.args.bwd_loss_schedule['mle'] = [(0, 1.0), (step_ind, 1),
                                                       (step_ind + self.args.bwd_thermalization_time // 2, 0.0)]
                 self.args.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 1.0)]
+                self.args.bwd_loss_schedule['noised_fraction'] = [(0, 1.0), (step_ind, self.args.anchor_noise_fraction)]
+                self.args.bwd_loss_schedule['noise_level'] = [(0, 1.0), (step_ind, self.args.anchor_noise_level)]
 
                 "set cooldowns"
                 self.increasing_loss_cooldown = self.args.bwd_thermalization_time  # give it time to adjust to new loss landscape

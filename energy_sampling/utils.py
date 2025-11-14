@@ -611,18 +611,19 @@ def get_annealing_factor(start_value, stop_value, total_time, step_iters):
 
 
 def substitute_prior(loss_coeffs, condition, crystal_batch, energy_function, rewards, samples, buffer):
-    # replace buffer samples with a random prior
-    # prior_samples = sample_crystal_prior(crystal_batch, args.bwd_loss_coeffs.pmle_std)
-    prior_samples = buffer.sample_mol_unconditional_prior(crystal_batch.sg_ind, loss_coeffs.pmle_std)
-    if loss_coeffs.mle_prior_fraction < 1:
-        num_to_replace = max(1, int(len(samples) * loss_coeffs.mle_prior_fraction))
+    # noise buffer samples
+    noised_samples = (samples + torch.randn_like(samples) * loss_coeffs.noise_level).clip(min=-1, max=1)
+    new_samples = samples.clone()
+    if loss_coeffs.noised_fraction < 1:
+        num_to_replace = max(1, int(len(samples) * loss_coeffs.noised_fraction))
         inds_to_replace = np.random.choice(len(samples), num_to_replace, replace=False)
-        samples[inds_to_replace] = prior_samples[inds_to_replace]
+        new_samples[inds_to_replace] = noised_samples[inds_to_replace]
     else:
-        samples = prior_samples
+        new_samples = noised_samples
 
     # have to update the rewards if we are using any loss functions that require them
     # otherwise, if we're not using the reward, just pass the raw sample
+    # recondition and rescore
     if any([
         loss_coeffs.tb > 0,
         loss_coeffs.vg_lb > 0,
@@ -636,5 +637,10 @@ def substitute_prior(loss_coeffs, condition, crystal_batch, energy_function, rew
         else:
             log_temperature = None
         with torch.no_grad():
-            rewards = energy_function.log_reward(samples, crystal_batch, log_temperature, False)
-    return condition, rewards, samples
+            # todo update this when the time comes for conditional rotation business
+            crystal_batch.orient_molecule(mode='std')
+            new_rewards = energy_function.log_reward(new_samples.to(energy_function.device),
+                                                     crystal_batch.to(energy_function.device),
+                                                     log_temperature.to(energy_function.device),
+                                                     False)
+    return condition, new_rewards, new_samples
