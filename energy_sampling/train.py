@@ -267,7 +267,7 @@ class Modeller:
         if self.args.checkpoint_path is not None:
             print(f"Loading model from checkpoint {self.args.checkpoint_path}")
             eval_path = self.args.checkpoint_path.replace('train', 'eval')
-            config_path = self.args.checkpoint_path.replace('train', 'config').replace('.pt', '.npy')
+            config_path = self.args.checkpoint_path.replace('train', 'config').replace('.pt', '.npy').replace('_hit_prior','').replace('_thermalized','')
 
             gfn_config = np.load(config_path, allow_pickle=True).item()
             gfn_model = GFN(**gfn_config).to(self.device)
