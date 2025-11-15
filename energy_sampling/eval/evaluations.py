@@ -743,6 +743,11 @@ def bwd_figs(metrics, fig_dict, buffer, gfn_model, init_state, discretizer, do_f
     normed_tb_residual = (X_side - Y_side).abs() / Y_side.abs()
     metrics['Bwd Normed TB Residual'] = normed_tb_residual.mean().item()
 
+    '''
+    xy_scatter_plot(log_pf - log_pb, log_r.cpu() - log_z.cpu(), 'x', 'y').show()
+    xy_scatter_plot(log_pf.cpu() + log_r.cpu(), log_pb + log_z, 'x', 'y').show()
+    '''
+
     metrics['Bwd Log Z Residual'] = (log_Z_empirical - log_Z_learned).item()
     metrics['Bwd Normed Log Z Residual'] = ((log_Z_empirical - log_Z_learned).abs()/log_Z_lb.abs()).item()
     metrics['Bwd Log Z LB Residual'] = (log_Z_lb - log_Z_learned).item()
@@ -777,6 +782,7 @@ def get_buffer_stats(buffer):
         # take samples according to the sampler weighting, rather than random trash in the buffer
         _, buffer_reward, buffer_batch, condition = buffer.sample(
             override_batch=samples_to_take,
+            return_preload=True,
             # standardize_orientations=True
         )
         buffer_cell_params = buffer_batch.full_cell_parameters().cpu().detach().numpy()
@@ -1021,6 +1027,27 @@ def to_loggable(v):
             return v.numpy()
     return v
 
+def parity_plot(x_in, y_in):
+    if torch.is_tensor(x_in):
+        x = x_in.cpu().detach().numpy()
+    else:
+        x = x_in
+    if torch.is_tensor(y_in):
+        y = y_in.cpu().detach().numpy()
+    else:
+        y = y_in
+
+    r_value, _ = pearsonr(x, y)
+
+    fig = go.Figure()
+    fig.add_scatter(x=x,
+                    y=y,
+                    name=f'R = {r_value:.3f}',
+                    showlegend=True,
+                    marker_colorscale='Jet',
+                    mode='markers',
+                    )
+    return fig
 
 def pf_parity_plot(log_pfs, log_pbs, log_r, log_flow):
     x = log_pfs.sum(-1).cpu().detach().numpy()
