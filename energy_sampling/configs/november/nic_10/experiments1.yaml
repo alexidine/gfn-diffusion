@@ -1,0 +1,8 @@
+defaults:
+  base: base.yaml
+
+
+experiments:
+- tag: 0
+  update:
+    energy_static_temperature: 2.5

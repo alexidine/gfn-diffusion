@@ -1,0 +1,5 @@
+- index: 0
+  tag: 0
+  update_keys:
+  - energy_static_temperature
+  notes: ''
