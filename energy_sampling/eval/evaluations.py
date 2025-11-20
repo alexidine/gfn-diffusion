@@ -326,7 +326,7 @@ def boltzmann_fig(log_r):
 
     # === Boltzmann fit in linear space
     boltzmann_y = np.exp(-beta_est * x_kde)
-    boltzmann_y /= np.trapz(boltzmann_y, x_kde)
+    boltzmann_y /= (np.trapz(boltzmann_y, x_kde) + 1e-6)
     log_fit = slope * bin_centers + intercept
 
     # === Create subplots

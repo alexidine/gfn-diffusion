@@ -100,3 +100,105 @@
   - anchor_noise_level
   - checkpoint_path
   notes: ''
+- index: 6
+  tag: 6
+  update_keys:
+  - energy_static_temperature
+  - max_batch_size
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - energy_function
+  - btb_threshold
+  - bwd_thermalization_time
+  - thermalization_conv_eps
+  - init_kld_threshold
+  - anchor_noise_fraction
+  - anchor_noise_level
+  - checkpoint_path
+  notes: ''
+- index: 7
+  tag: 7
+  update_keys:
+  - energy_static_temperature
+  - max_batch_size
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - energy_function
+  - btb_threshold
+  - bwd_thermalization_time
+  - thermalization_conv_eps
+  - init_kld_threshold
+  - anchor_noise_fraction
+  - anchor_noise_level
+  - checkpoint_path
+  notes: ''
+- index: 8
+  tag: 8
+  update_keys:
+  - energy_static_temperature
+  - max_batch_size
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - energy_function
+  - btb_threshold
+  - bwd_thermalization_time
+  - thermalization_conv_eps
+  - init_kld_threshold
+  - anchor_noise_fraction
+  - anchor_noise_level
+  - checkpoint_path
+  notes: ''
+- index: 9
+  tag: 9
+  update_keys:
+  - energy_static_temperature
+  - max_batch_size
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - energy_function
+  - btb_threshold
+  - bwd_thermalization_time
+  - thermalization_conv_eps
+  - init_kld_threshold
+  - anchor_noise_fraction
+  - anchor_noise_level
+  - checkpoint_path
+  notes: ''
+- index: 10
+  tag: 10
+  update_keys:
+  - energy_static_temperature
+  - max_batch_size
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - energy_function
+  - btb_threshold
+  - bwd_thermalization_time
+  - thermalization_conv_eps
+  - init_kld_threshold
+  - anchor_noise_fraction
+  - anchor_noise_level
+  - checkpoint_path
+  notes: ''
+- index: 11
+  tag: 11
+  update_keys:
+  - energy_static_temperature
+  - max_batch_size
+  - log_var_range
+  - pb_drift_range
+  - pb_var_range
+  - energy_function
+  - btb_threshold
+  - bwd_thermalization_time
+  - thermalization_conv_eps
+  - init_kld_threshold
+  - anchor_noise_fraction
+  - anchor_noise_level
+  - checkpoint_path
+  notes: ''

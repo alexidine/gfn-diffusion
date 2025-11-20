@@ -5,19 +5,19 @@ from umap import UMAP
 
 from energy_sampling.eval.paper1_results.utils import cluster_dendro_fig, marginal_cluster_1d, coupling_ratio, \
     correlate_mask, top_joint_correlates, latent_dendro_fig, plot_marginals, get_highp_correlations, \
-    compute_dim_weights, estimate_logp_with_convergence, sample_from_gfn, analyze_samples
+    compute_dim_weights, estimate_logp_with_convergence, sample_from_gfn, analyze_samples, cluster_hdbscan_to_df
 from energy_sampling.models import GFN
 from mxtaltools.common.utils import log_rescale_positive
 from mxtaltools.dataset_utils.utils import collate_data_list
 
 if __name__ == '__main__':
     device = 'cuda'
-    num_samples = 20000
+    num_samples = 2000
     batch_size = 500
     n_steps = 50  # critical to get this right!
 
-    model_path = r"D:\crystal_datasets\nov_nic_6_0_model_eval.pt"
-    config_path = r"D:\crystal_datasets\nov_nic_6_0_model_config.npy"
+    model_path = r"D:\crystal_datasets\nov_nic_9_2_model_eval.pt"
+    config_path = r"D:\crystal_datasets\nov_nic_9_2_model_config.npy"
     molecule_path = r'D:/crystal_datasets/nicotinamide.pt'
     dataset_path = r'D:/crystal_datasets/opt_outputs/nicotinamide_sg_1_2.pt'
 
@@ -36,7 +36,6 @@ if __name__ == '__main__':
     sample_latents = sample_from_gfn(num_samples, max_z_prime, device, n_steps, batch_size, gfn_model)
     samples = analyze_samples(sample_latents, molecule * len(sample_latents), max_z_prime, device, batch_size)
     sample_batch = collate_data_list(samples, max_z_prime=max_z_prime)
-
 
     """Analyses"""
     "Standard visualizations"
@@ -61,7 +60,8 @@ if __name__ == '__main__':
         correlate_mask(marginal_labels, row.dims, row.clusters)
         for _, row in corr_df[corr_df.order == 2].iterrows()
     ]
-    sample_batch.plot_batch_cell_params(space='latent', aux_dists=[sample_batch.latent_params()[m] for m in masks[:10]])
+    sample_batch.plot_batch_cell_params(space='latent',
+                                        aux_dists=[sample_batch.latent_params()[m] for m in masks[:10] if sum(m) > 1])
 
     "High coupling n-dimensional correlation clusters for n=n_dims"
     plot_marginals(sample_latents, labels=marginal_labels, clusters_per_dim=clusters_per_dim)
@@ -92,22 +92,6 @@ if __name__ == '__main__':
     "Hierarchical joint probabilities"
     # df = hierarchical_joint_df(marginal_labels, max_order=3, cutoff=0.005)
 
-    "Dimension Reduction"
-    umap_model = UMAP(n_components=2, n_neighbors=100, min_dist=0.01)
-    sample_embedding = umap_model.fit_transform(sample_latents[low_en_bools])
-    masks = [correlate_mask(marginal_labels, top_df.loc[ind, "dims"], top_df.loc[ind, "clusters"])[low_en_bools] for ind
-             in
-             range(20)]
-    # masks = [
-    #     correlate_mask(marginal_labels, row.dims, row.clusters)[low_en_bools]
-    #     for _, row in corr_df[corr_df.order == 2].iloc[:20].iterrows()
-    # ]
-    fig = go.Figure()
-    fig.add_scatter(x=sample_embedding[:, 0], y=sample_embedding[:, 1], mode='markers', opacity=0.25, showlegend=False)
-    for ind, m in enumerate(masks):
-        fig.add_scatter(x=sample_embedding[m, 0], y=sample_embedding[m, 1], mode='markers', opacity=1.0, showlegend=False, marker_color=ind)
-    fig.show()
-
     "Top Cluster Analysis"
     masks = [correlate_mask(marginal_labels, top_df.loc[ind, "dims"], top_df.loc[ind, "clusters"]) for ind
              in
@@ -115,59 +99,30 @@ if __name__ == '__main__':
     sample_batch.plot_batch_cell_params(space='latent', aux_dists=[sample_batch.latent_params()[m] for m in masks[:10]])
     top_df.p / top_df.p.sum()
 
-    import torch
-    import numpy as np
-    import pandas as pd
-    import hdbscan
-
-
-    def cluster_hdbscan_to_df(X: torch.Tensor,
-                              lj_pot: torch.Tensor,
-                              min_cluster_size: int = 10):
-        """
-        Run HDBSCAN on samples X [n, d] and summarize results in a DataFrame.
-
-        Parameters
-        ----------
-        X : torch.Tensor [n, d]
-            Sample coordinates.
-        lj_pot : torch.Tensor [n]
-            Per-sample energies.
-        min_cluster_size : int
-            Minimum cluster size for HDBSCAN.
-
-        Returns
-        -------
-        pd.DataFrame with columns ['cluster_id', 'n', 'p', 'mean_en'].
-        """
-
-        # --- run clustering on CPU numpy array ---
-        clusterer = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size)
-        labels = clusterer.fit_predict(X.cpu().numpy())
-
-        # cluster probabilities (membership strengths)
-
-        # --- collect cluster masks and statistics ---
-        df_records = []
-        unique_labels = np.unique(labels)
-        for cid in unique_labels:
-            mask = labels == cid
-            n_points = int(mask.sum())
-            p_mean = n_points / len(X)
-
-            if cid == -1:  # noise cluster
-                mean_en = float(torch.tensor(log_rescale_positive(lj_pot[mask])).mean().cpu())
-            else:
-                mean_en = float(log_rescale_positive(lj_pot[mask]).mean().cpu())
-
-            df_records.append(dict(cluster_id=cid, n=n_points, p=p_mean, mean_en=mean_en))
-
-        top_df = pd.DataFrame(df_records, columns=['cluster_id', 'n', 'p', 'mean_en'])
-        return top_df, labels
-
-
     clust_df, clust_labels = cluster_hdbscan_to_df(sample_batch.latent_params(), sample_batch.lj_pot)
 
-
     clust_df = clust_df.sort_values('p', ascending=False)
+
+    "Dimension Reduction"
+    umap_model = UMAP(n_components=2, n_neighbors=100, min_dist=0.01)
+    sample_embedding = umap_model.fit_transform(sample_latents)#[low_en_bools])
+    # masks = [correlate_mask(marginal_labels, top_df.loc[ind, "dims"], top_df.loc[ind, "clusters"])[low_en_bools] for ind
+    #          in
+    #          range(20)]
+    # masks = [correlate_mask(marginal_labels, top_df.loc[ind, "dims"], top_df.loc[ind, "clusters"]) for ind
+    #          in
+    #          range(20)]
+    # masks = [
+    #     correlate_mask(marginal_labels, row.dims, row.clusters)[low_en_bools]
+    #     for _, row in corr_df[corr_df.order == 2].iloc[:20].iterrows()
+    # ]
+    masks = [clust_labels == ind for ind in np.unique(clust_labels)]
+    fig = go.Figure()
+    fig.add_scatter(x=sample_embedding[:, 0], y=sample_embedding[:, 1], mode='markers', opacity=0.25, showlegend=False)
+    maskes = [clust_labels == ind for ind in np.unique(clust_labels)]
+    for ind, m in enumerate(masks):
+        fig.add_scatter(x=sample_embedding[m, 0], y=sample_embedding[m, 1], mode='markers', opacity=1.0,
+                        showlegend=False, marker_color=ind)
+    fig.show()
+
     end = 1

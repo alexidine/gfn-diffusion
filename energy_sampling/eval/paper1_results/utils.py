@@ -1,5 +1,6 @@
 from collections import Counter
 
+import hdbscan
 import numpy as np
 import pandas as pd
 import torch
@@ -13,6 +14,7 @@ from sklearn.cluster import estimate_bandwidth, MeanShift
 from tqdm import tqdm
 
 from energy_sampling.utils import uniform_discretizer, get_gfn_init_state
+from mxtaltools.common.utils import log_rescale_positive
 from mxtaltools.dataset_utils.utils import collate_data_list
 
 
@@ -26,7 +28,7 @@ def cluster_1d(X):
 
 def plot_marginals(latents, labels, clusters_per_dim):
     fig = make_subplots(rows=4, cols=3)
-    colors = qualitative.Dark24
+    colors = qualitative.Dark24  # todo these heights are still messed up
     for ind in range(12):
         row = ind // 3 + 1
         col = ind % 3 + 1
@@ -638,3 +640,48 @@ def analyze_samples(x, mol_list, max_z_prime, device, batch_size):
                 pbar.update(batch_size)
 
     return samples
+
+
+def cluster_hdbscan_to_df(X: torch.Tensor,
+                          lj_pot: torch.Tensor,
+                          min_cluster_size: int = 10):
+    """
+    Run HDBSCAN on samples X [n, d] and summarize results in a DataFrame.
+
+    Parameters
+    ----------
+    X : torch.Tensor [n, d]
+        Sample coordinates.
+    lj_pot : torch.Tensor [n]
+        Per-sample energies.
+    min_cluster_size : int
+        Minimum cluster size for HDBSCAN.
+
+    Returns
+    -------
+    pd.DataFrame with columns ['cluster_id', 'n', 'p', 'mean_en'].
+    """
+
+    # --- run clustering on CPU numpy array ---
+    clusterer = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size)
+    labels = clusterer.fit_predict(X.cpu().numpy())
+
+    # cluster probabilities (membership strengths)
+
+    # --- collect cluster masks and statistics ---
+    df_records = []
+    unique_labels = np.unique(labels)
+    for cid in unique_labels:
+        mask = labels == cid
+        n_points = int(mask.sum())
+        p_mean = n_points / len(X)
+
+        if cid == -1:  # noise cluster
+            mean_en = float(torch.tensor(log_rescale_positive(lj_pot[mask])).mean().cpu())
+        else:
+            mean_en = float(log_rescale_positive(lj_pot[mask]).mean().cpu())
+
+        df_records.append(dict(cluster_id=cid, n=n_points, p=p_mean, mean_en=mean_en))
+
+    top_df = pd.DataFrame(df_records, columns=['cluster_id', 'n', 'p', 'mean_en'])
+    return top_df, labels

@@ -98,3 +98,99 @@ experiments:
     anchor_noise_fraction: 0.5
     anchor_noise_level: 0.1
     checkpoint_path: '/scratch/mk8347/diffusion/energy_sampling/checkpoints/nov_nic_8_0_model_train_hit_prior.pt'
+
+- tag: 6
+  update:
+    energy_static_temperature: 0.2
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: qlj
+    btb_threshold: 1.5
+    bwd_thermalization_time: 500
+    thermalization_conv_eps: 0.5
+    init_kld_threshold: 0.1
+    anchor_noise_fraction: 0.2
+    anchor_noise_level: 0.025
+    checkpoint_path: '/scratch/mk8347/diffusion/energy_sampling/checkpoints/nov_nic_8_0_model_train_hit_prior.pt'
+
+- tag: 7
+  update:
+    energy_static_temperature: 0.3
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: qlj
+    btb_threshold: 1.5
+    bwd_thermalization_time: 500
+    thermalization_conv_eps: 0.5
+    init_kld_threshold: 0.1
+    anchor_noise_fraction: 0.2
+    anchor_noise_level: 0.025
+    checkpoint_path: '/scratch/mk8347/diffusion/energy_sampling/checkpoints/nov_nic_8_0_model_train_hit_prior.pt'
+
+- tag: 8
+  update:
+    energy_static_temperature: 0.4
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: qlj
+    btb_threshold: 1.5
+    bwd_thermalization_time: 500
+    thermalization_conv_eps: 0.5
+    init_kld_threshold: 0.1
+    anchor_noise_fraction: 0.2
+    anchor_noise_level: 0.025
+    checkpoint_path: '/scratch/mk8347/diffusion/energy_sampling/checkpoints/nov_nic_8_0_model_train_hit_prior.pt'
+
+- tag: 9
+  update:
+    energy_static_temperature: 0.5
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: qlj
+    btb_threshold: 1.5
+    bwd_thermalization_time: 500
+    thermalization_conv_eps: 0.5
+    init_kld_threshold: 0.1
+    anchor_noise_fraction: 0.2
+    anchor_noise_level: 0.025
+    checkpoint_path: '/scratch/mk8347/diffusion/energy_sampling/checkpoints/nov_nic_8_0_model_train_hit_prior.pt'
+
+- tag: 10
+  update:
+    energy_static_temperature: 0.75
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: qlj
+    btb_threshold: 1.5
+    bwd_thermalization_time: 500
+    thermalization_conv_eps: 0.5
+    init_kld_threshold: 0.1
+    anchor_noise_fraction: 0.2
+    anchor_noise_level: 0.025
+    checkpoint_path: '/scratch/mk8347/diffusion/energy_sampling/checkpoints/nov_nic_8_0_model_train_hit_prior.pt'
+
+- tag: 11
+  update:
+    energy_static_temperature: 1.0
+    max_batch_size: 2000
+    log_var_range: 4
+    pb_drift_range: 0.2
+    pb_var_range: 2
+    energy_function: qlj
+    btb_threshold: 1.5
+    bwd_thermalization_time: 500
+    thermalization_conv_eps: 0.5
+    init_kld_threshold: 0.1
+    anchor_noise_fraction: 0.2
+    anchor_noise_level: 0.025
+    checkpoint_path: '/scratch/mk8347/diffusion/energy_sampling/checkpoints/nov_nic_8_0_model_train_hit_prior.pt'

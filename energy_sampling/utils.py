@@ -6,7 +6,9 @@ import queue
 import random
 import threading
 from argparse import Namespace
+from asyncio import sleep
 from pathlib import Path
+from typing import Optional
 
 import PIL
 import numpy as np
@@ -23,6 +25,7 @@ from mxtaltools.common.utils import log_rescale_positive
 from mxtaltools.crystal_building.crystal_latent_transforms import enforce_niggli_plane
 from mxtaltools.dataset_utils.data_classes import MolCrystalData
 from mxtaltools.dataset_utils.utils import collate_data_list
+from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 from mxtaltools.models.utils import load_encoder
 
 
@@ -258,36 +261,69 @@ def triangle_schedule(it, init, maxval, minval, on, off):
 
 @torch.no_grad()
 def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 500,
-                      max_z_prime: int = 1):
-    num_batches = len(dataset) // batch_size + (1 if len(dataset) % batch_size > 0 else 0)
+                      max_z_prime: int = 1, uma_path: Optional[str] = None,):
+
     silus = []
     ljs = []
     qljs = []
     niggli_overlaps = []
-    if energy_function in ['lj', 'qlj']:
-        cutoff = 10
-    elif energy_function == 'silu':
-        cutoff = 6
-    else:
-        assert False
+    gas_umas = []
+    cry_umas = []
+    cutoff = 10
 
-    for b_ind in range(num_batches):
-        crystal_batch = collate_data_list(dataset[b_ind * batch_size:(b_ind + 1) * batch_size], max_z_prime=max_z_prime)
-        crystal_batch = crystal_batch.to(device)
-        crystal_batch.box_analysis()
-        out = crystal_batch.analyze(['lj', 'qlj', 'silu', 'niggli'],
-                                    cutoff=cutoff,
-                                    supercell_size=5,
-                                    std_orientation=True)
+    if energy_function == 'uma':
+        uma_predictor = init_uma_crystal_predictor(uma_path, device=device)
 
-        silus.extend(out['silu'].cpu().detach())
-        ljs.extend(out['lj'].cpu().detach())
-        qljs.extend(out['qlj'].cpu().detach())
-        niggli_overlaps.extend(out['niggli'].cpu().detach())
+
+    cursor = 0
+    pbar = tqdm(total=len(dataset), unit="reparameterized samples")
+
+    while cursor < len(dataset):
+        try:
+            crystal_batch = collate_data_list(
+                [dataset[ind] for ind in range(cursor, min(len(dataset), cursor + batch_size))])
+            crystal_batch = crystal_batch#.to(device)
+
+            if energy_function == 'uma':
+                cry_umas.extend(crystal_batch.compute_crystal_uma(
+                    predictor=uma_predictor, std_orientation=True).cpu().detach() * 96.485)  # output in kJ/mol (of unit cells)
+                gas_umas.extend(crystal_batch.compute_lattice_gas_phase_uma(
+                    predictor=uma_predictor, std_orientation=True).cpu().detach() * 96.485)
+            else:
+                cry_umas.extend(torch.ones(crystal_batch.num_graphs, dtype=torch.float32, device='cpu'))
+                gas_umas.extend(torch.ones(crystal_batch.num_graphs, dtype=torch.float32, device='cpu'))
+
+            crystal_batch.box_analysis()
+            out = crystal_batch.analyze(['lj', 'qlj', 'silu', 'niggli'],
+                                        cutoff=cutoff,
+                                        supercell_size=5,
+                                        std_orientation=True)
+
+            silus.extend(out['silu'].cpu().detach())
+            ljs.extend(out['lj'].cpu().detach())
+            qljs.extend(out['qlj'].cpu().detach())
+            niggli_overlaps.extend(out['niggli'].cpu().detach())
+
+            cursor += batch_size
+            pbar.update(min(batch_size, len(dataset) - cursor))  # safe final update
+            batch_size += 1
+
+        except (RuntimeError, ValueError) as e:
+            if is_cuda_oom(e):
+                batch_size = max(int(batch_size * 0.6), 1)
+                print(f"OOM error: dropping batch size to {batch_size}")
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                sleep(0.1)
+            else:
+                raise e
 
     silus = torch.tensor(silus)
     ljs = torch.tensor(ljs)
     qljs = torch.tensor(qljs)
+    gas_umas = torch.tensor(gas_umas)
+    cry_umas = torch.tensor(cry_umas)
     niggli_overlaps = torch.tensor(niggli_overlaps)
     for ind, elem in enumerate(dataset):
         elem.silu_pot = torch.ones(1) * silus[ind]
@@ -295,6 +331,8 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
         elem.qlj_pot = torch.ones(1) * qljs[ind]
         elem.niggli_overlap = torch.ones(1) * niggli_overlaps[ind]
         elem.scaled_lj_pot = torch.ones(1) * log_rescale_positive(ljs[ind])
+        elem.uma_gas_pot = torch.ones(1) * gas_umas[ind]
+        elem.uma_pot = torch.ones(1) * cry_umas[ind]
 
     # exclude negative niggli overlaps
     dataset = [elem for elem in dataset if elem.niggli_overlap >= 0]
@@ -325,6 +363,8 @@ def embed_dataset(dataset, autoencoder_path=None, device=None, encoder=None, emb
                                       target_handedness=torch.ones_like(crystal_batch.radius)[:, None],
                                       )
         if embedding_type == 'autoencoder':
+            # NOTE - autoencoder trained on global centroids, but recenter molecules in orient_molecule works on heavy atoms now
+            crystal_batch.recenter_molecules(center_on_heavy_atoms=False)
             embeddings.append(encoder.encode(crystal_batch).clone().cpu())
         elif embedding_type == 'principal_axes':
             v_embedding_i, s_embedding_i, _ = batch_molecule_principal_axes_torch(
@@ -332,6 +372,8 @@ def embed_dataset(dataset, autoencoder_path=None, device=None, encoder=None, emb
                 crystal_batch.batch,
                 crystal_batch.num_graphs,
                 crystal_batch.num_atoms,
+                heavy_atoms_only=True,
+                atom_types=crystal_batch.z
             )
             embeddings.append((v_embedding_i * s_embedding_i[:, :, None]).cpu())
 
@@ -532,64 +574,6 @@ def iter_forever(loader):
         for batch in loader:
             yield batch
 
-
-class ThreadedDataLoader:
-    def __init__(self, dataset, batch_size=1, max_prefetch=2, collate_fn=None, pin_memory=True):
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.max_prefetch = max_prefetch
-        self.collate_fn = collate_fn or (lambda x: x)
-        self.queue = queue.Queue(max_prefetch)
-        # self.queue = queue.SimpleQueue()
-
-        self.stop_event = threading.Event()
-        self.pin_memory = pin_memory
-        self.skip_next = False
-
-        self.thread = threading.Thread(target=self._worker, daemon=True)
-        self.thread.start()
-
-    def _worker(self):
-        n = len(self.dataset)
-        while not self.stop_event.is_set():
-            # sample with replacement
-            idxs = torch.randint(n, (self.batch_size,), device='cpu')
-            batch = [self.dataset[i] for i in idxs]
-            batch = self.collate_fn(batch)
-            if self.pin_memory:
-                batch = batch.pin_memory()
-            self.queue.put(batch)
-
-    def __iter__(self):
-        return self
-
-    def shutdown(self):
-        self.stop_event.set()
-        if self.thread.is_alive():
-            self.thread.join()
-
-    def __next__(self):
-        while True:
-            batch = self.queue.get()
-            if self.skip_next:
-                # discard this one batch no matter what
-                self.skip_next = False
-                continue
-            return batch
-
-    def set_batch_size(self, new_size):
-        """Update batch size and flush queue to avoid stale batches."""
-        self.batch_size = int(new_size)
-        self._flush_queue()
-        self.skip_next = True  # force burn one
-
-    def _flush_queue(self):
-        """Remove all pending items in the prefetch queue."""
-        while not self.queue.empty():
-            try:
-                self.queue.get_nowait()
-            except queue.Empty:
-                break
 
 
 def is_cuda_oom(e: Exception) -> bool:

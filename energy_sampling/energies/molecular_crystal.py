@@ -10,6 +10,7 @@ from mxtaltools.constants.space_group_feature_tensor import SG_FEATURE_TENSOR
 from mxtaltools.constants.space_group_info import SYM_OPS
 from mxtaltools.dataset_utils.data_classes import MolCrystalData
 from mxtaltools.dataset_utils.utils import collate_data_list
+from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 from .base_set import BaseSet
 
 
@@ -40,12 +41,10 @@ class MolecularCrystal(BaseSet):
                  energy_function: str,
                  max_temperature: float = 10,
                  min_temperature: float = 0.01,
-                 lj_turnover_pot: float = 10.0,
                  density_coeff: float = 0,
                  temperature_scaling_factor: float = 1,
                  temperature: float = 1.0,
                  temperature_conditioning: bool = False,
-                 energy_clip: float = 100,
                  lj_coeff: float = 1.0,
                  molecule_conditioning: bool = False,
                  sg_conditioning: bool = False,
@@ -55,13 +54,14 @@ class MolecularCrystal(BaseSet):
                  niggli_coeff: float = 1.0,
                  max_z_prime: int = 1,
                  z_primes: Tuple[int] = (1,),
+                 uma_path: Optional[str] = None,
+                 reward_range: float = None,
                  ):
 
         super(MolecularCrystal, self).__init__()
         self.device = device
         self.data_ndim = 6 + 6 * max_z_prime
         self.energy_function = energy_function
-        self.energy_clip = energy_clip
         self.SG_FEATURE_TENSOR = SG_FEATURE_TENSOR.clone()  # store space group information
 
         self.density_coeff = density_coeff
@@ -69,7 +69,6 @@ class MolecularCrystal(BaseSet):
         self.min_temperature = min_temperature
         self.temperature_scaling_factor = temperature_scaling_factor
         self.temperature_conditioning = temperature_conditioning
-        self.lj_turnover_pot = lj_turnover_pot  # energy above which to soften intermolecular repulsion
         self.lj_coeff = lj_coeff
         self.bounding_coeff = bounding_coeff
         self.niggli_coeff = niggli_coeff
@@ -79,14 +78,30 @@ class MolecularCrystal(BaseSet):
         self.max_z_prime = max_z_prime
         self.z_primes = z_primes
         self.zp_conditioning = zp_conditioning
+        self.reward_range = reward_range
+        if self.energy_function == 'uma':
+            self.uma_predictor = init_uma_crystal_predictor(uma_path, device=self.device)
 
         self.temperature = temperature  # for static temperature work
+        self.energy_clip = 0
 
         self.batch = collate_data_list([MolCrystalData(max_z_prime=max_z_prime)], max_z_prime=max_z_prime)
 
         self.sg_cache = {}
         for sg in range(1, 230):
             self.sg_cache[sg] = np.stack(SYM_OPS[int(sg)])
+
+    def set_reward_clip(self, dataset_rewards):
+        """
+        We want to restrain the range of allowable rewards, by log-clipping the log reward below a certain threshold.
+        NOTE this would have to be re-done dynamically if the conditioning evolves
+        :param dataset_rewards:
+        :return:
+        """
+        max_reward = max(dataset_rewards)
+        reward_range = self.reward_range
+        min_allowed_reward = max_reward - reward_range
+        self.energy_clip = - min_allowed_reward * self.temperature  # convert the minimum allowed reward to a clip on the energy
 
     def instantiate_crystals(self, x, mol_batch):
         crystal_batch = self.init_blank_crystal_batch(mol_batch)
@@ -97,19 +112,16 @@ class MolecularCrystal(BaseSet):
     def analyze_crystal_batch(self, x, mol_batch, return_batch=False):  # x is gfn_outputs
         crystal_batch = self.instantiate_crystals(x, mol_batch)
 
-        if self.energy_function not in ['lj', 'qlj', 'silu']:
+        if self.energy_function not in ['lj', 'qlj', 'silu','uma']:
             lj_energy = torch.zeros(crystal_batch.num_graphs, device=self.device)
             qlj_energy = torch.zeros_like(lj_energy)
             normed_lj_energy = torch.zeros_like(lj_energy)
             silu_energy = torch.zeros_like(lj_energy)
             niggli_overlap = torch.zeros_like(lj_energy)
+            uma_energy = torch.zeros_like(lj_energy)
         else:
-            if self.energy_function in ['lj', 'qlj']:
-                cutoff = 10
-            elif self.energy_function == 'silu':
-                cutoff = 6
-            else:
-                assert False
+            cutoff = 10
+
             out = crystal_batch.analyze(['lj', 'qlj', 'silu', 'niggli'],
                                         cutoff=cutoff,
                                         supercell_size=5,
@@ -119,12 +131,18 @@ class MolecularCrystal(BaseSet):
             normed_lj_energy = log_rescale_positive(lj_energy, 0)
             silu_energy = out['silu']
             niggli_overlap = out['niggli']
+            if self.energy_function == 'uma':
+                uma_energy = crystal_batch.compute_crystal_uma(
+                    predictor=self.uma_predictor, std_orientation=False) * 96.485  # output in kJ/mol (of unit cells)
+            else:
+                uma_energy = torch.zeros_like(lj_energy)
 
         crystal_batch.add_graph_attr(silu_energy, 'silu_pot')
         crystal_batch.add_graph_attr(lj_energy, 'lj_pot')
         crystal_batch.add_graph_attr(qlj_energy, 'qlj_pot')
         crystal_batch.add_graph_attr(niggli_overlap, 'niggli_overlap')
         crystal_batch.add_graph_attr(normed_lj_energy, 'scaled_lj_pot')
+        crystal_batch.add_graph_attr(uma_energy, 'uma_pot')
 
         crystal_energy, ens_dict = self.generator_energy(crystal_batch, raw_latents=x)
 
@@ -153,34 +171,27 @@ class MolecularCrystal(BaseSet):
             bounding_energy = torch.zeros_like(latents[:, 0])
 
         if self.max_z_prime > 1:
-            # penalize the model for placing asymmetric units out of the canonical order (closest -> furthest from origin)
-            per_aunit_centroids = crystal_batch.aunit_centroid.reshape(crystal_batch.num_graphs,
-                                                                       crystal_batch.max_z_prime, 3)
-            idx = torch.arange(crystal_batch.max_z_prime, device=crystal_batch.device)[None, ...]
-            mask = (idx >= (crystal_batch.z_prime[..., None]))[..., None].expand(-1, -1, 3)
-            per_aunit_centroids[mask] = 1  # this will put lower Z' options always at the end
-            origin_dists = per_aunit_centroids.norm(dim=2)
+            bounding_energy = self.compute_zp_order_penalty(bounding_energy, crystal_batch)
 
-            overlaps = -origin_dists.diff(dim=1)
-            zp_ordering_energy = F.relu(overlaps).mean(dim=-1) ** 2
-            bounding_energy = bounding_energy + zp_ordering_energy
-
-        if self.energy_function in ['lj', 'qlj', 'silu']:
+        if self.energy_function in ['lj', 'qlj', 'silu','uma']:
             density_energy = density_penalty(crystal_batch.packing_coeff)
             if self.energy_function == 'lj':
-                lj_energy = log_rescale_positive(crystal_batch.lj_pot, self.lj_turnover_pot) / crystal_batch.num_atoms
+                mol_energy = crystal_batch.lj_pot / crystal_batch.num_atoms
             elif self.energy_function == 'qlj':
-                lj_energy = soften_high(crystal_batch.qlj_pot, self.lj_turnover_pot,
-                                        coeff=0.25) / crystal_batch.num_atoms
+                mol_energy = crystal_batch.qlj_pot / crystal_batch.num_atoms
             elif self.energy_function == 'silu':
-                lj_energy = soften_high(crystal_batch.silu_pot, self.lj_turnover_pot,
-                                        coeff=0.25) / crystal_batch.num_atoms
+                mol_energy = crystal_batch.silu_pot / crystal_batch.num_atoms
+            elif self.energy_function == 'uma':
+                gas_pot = -38303.8359  # temporary hardcode - nicotinamide unit cell gas energy under uma esen-s
+                #mol_energy = (crystal_batch.uma_pot / crystal_batch.sym_mult - crystal_batch.uma_gas_pot/crystal_batch.sym_mult) / crystal_batch.num_atoms  # gas pots are messed up
+                mol_energy = (crystal_batch.uma_pot / crystal_batch.sym_mult - gas_pot/crystal_batch.sym_mult[0]) / crystal_batch.num_atoms  # TODO REPLACE THIS LINE EVENTUALLY
             else:
                 assert False
+
             niggli_energy = F.relu(-crystal_batch.niggli_overlap) ** 2  # punish negative overlaps
 
             ens_dict['niggli_energy'] = niggli_energy
-            ens_dict['lj_energy'] = lj_energy
+            ens_dict['mol_energy'] = mol_energy
             ens_dict['density_energy'] = density_energy
             ens_dict['bounding_energy'] = bounding_energy
         else:
@@ -198,15 +209,27 @@ class MolecularCrystal(BaseSet):
         elif self.energy_function == 'crystal_multiharmonic':
             crystal_energy = self.crystal_multiharmonic_en(crystal_batch, latents)
 
-        elif self.energy_function in ['lj', 'qlj', 'silu']:
-            crystal_energy = self.lj_coeff * lj_energy + self.density_coeff * density_energy
+        elif self.energy_function in ['lj', 'qlj', 'silu', 'uma']:
+            crystal_energy = self.lj_coeff * mol_energy + self.density_coeff * density_energy
 
         else:
             assert False, f'{self.energy_function} not implemented'
 
         total_energy = crystal_energy + bounding_energy * self.bounding_coeff + niggli_energy * self.niggli_coeff
-        # return soft_clip(soften_high(total_energy, self.energy_clip / 2, coeff=0.7), self.energy_clip), ens_dict
         return log_rescale_positive(total_energy, self.energy_clip), ens_dict
+
+    def compute_zp_order_penalty(self, bounding_energy, crystal_batch):
+        # penalize the model for placing asymmetric units out of the canonical order (closest -> furthest from origin)
+        per_aunit_centroids = crystal_batch.aunit_centroid.reshape(crystal_batch.num_graphs,
+                                                                   crystal_batch.max_z_prime, 3)
+        idx = torch.arange(crystal_batch.max_z_prime, device=crystal_batch.device)[None, ...]
+        mask = (idx >= (crystal_batch.z_prime[..., None]))[..., None].expand(-1, -1, 3)
+        per_aunit_centroids[mask] = 1  # this will put lower Z' options always at the end
+        origin_dists = per_aunit_centroids.norm(dim=2)
+        overlaps = -origin_dists.diff(dim=1)
+        zp_ordering_energy = F.relu(overlaps).mean(dim=-1) ** 2
+        bounding_energy = bounding_energy + zp_ordering_energy
+        return bounding_energy
 
     def crystal_multiharmonic_en(self, crystal_batch, latents):
         if not hasattr(self, 'modes'):
@@ -344,6 +367,7 @@ class MolecularCrystal(BaseSet):
             'density': zeros1,
             'z_prime': ones1,
             'is_well_defined': trues1,
+            'uma_lattice_pot': zeros1,
         }
         setattr(crystal_batch, '_num_graphs', mol_batch.num_graphs)
         setattr(crystal_batch, 'device', mol_batch.device)

@@ -46,23 +46,22 @@ class CrystalReplayBuffer:
         self.max_z_prime = max_z_prime
         self.buffer_dist_cutoff = buffer_dist_cutoff
 
+    @torch.no_grad()
     def add(self,
             data_list=None,
             data_batch=None,
             max_z_prime: int = 1):
-        with torch.no_grad():
-            if self.dataset is None:
-                self.init_fresh_dataset(data_list, max_z_prime)
+        if self.dataset is None:
+            self.init_fresh_dataset(data_list, max_z_prime)
+        else:
+            self.add_samples_to_dataset(data_batch, data_list, max_z_prime)
 
-            else:
-                self.add_samples_to_dataset(data_batch, data_list, max_z_prime)
+        if len(self) > self.buffer_size:  # pare down buffer
+            self.truncate_buffer()
 
-            if len(self) > self.buffer_size:  # pare down buffer
-                self.truncate_buffer()
+        assert len(self.dataset) == len(self.x_list) == len(self.rewards_list)
 
-            assert len(self.dataset) == len(self.x_list) == len(self.rewards_list)
-
-            self.init_loader()
+        self.init_loader()
 
     def add_samples_to_dataset(self, data_batch, data_list, max_z_prime):
         # batch samples
@@ -93,15 +92,18 @@ class CrystalReplayBuffer:
 
     def init_fresh_dataset(self, data_list, max_z_prime):
         self.dataset = list(data_list)  # I think this is memory safe and faster #copy.deepcopy(data_list)
-        for elem in self.dataset:
+        for elem in self.dataset:  # have to do this now because collation is a mess
             del elem.fingerprint, elem.smiles, elem.mol_ind, elem.identifier, (
                 elem.aunit_batch), elem.skip_box_analysis, elem.cocrystal, elem.symmetry_operators
 
         dataset_batch = collate_data_list(self.dataset, max_z_prime=max_z_prime)
         x_tensor = dataset_batch.latent_params()
-        scores = self.energy_function.prebuilt_sample_to_reward(dataset_batch, temperature=torch.ones(len(self)))
+        rewards = self.energy_function.prebuilt_sample_to_reward(dataset_batch, temperature=torch.ones(len(self)))
+        if self.energy_function.reward_range is not None:
+            self.energy_function.set_reward_clip(rewards)
+
         self.x_list = [x_tensor[i] for i in range(x_tensor.shape[0])]
-        self.rewards_list = list(scores.flatten().cpu().detach().numpy())
+        self.rewards_list = list(rewards.flatten().cpu().detach().numpy())
         self.original_dataset_inds = list(np.arange(len(self.dataset)))
         self.sg_list = list(dataset_batch.sg_ind.cpu())
 
