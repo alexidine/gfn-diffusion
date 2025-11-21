@@ -182,9 +182,9 @@ class MolecularCrystal(BaseSet):
             elif self.energy_function == 'silu':
                 mol_energy = crystal_batch.silu_pot / crystal_batch.num_atoms
             elif self.energy_function == 'uma':
-                gas_pot = -38303.8359  # temporary hardcode - nicotinamide unit cell gas energy under uma esen-s
-                #mol_energy = (crystal_batch.uma_pot / crystal_batch.sym_mult - crystal_batch.uma_gas_pot/crystal_batch.sym_mult) / crystal_batch.num_atoms  # gas pots are messed up
-                mol_energy = (crystal_batch.uma_pot / crystal_batch.sym_mult - gas_pot/crystal_batch.sym_mult[0]) / crystal_batch.num_atoms  # TODO REPLACE THIS LINE EVENTUALLY
+                #gas_pot =  crystal_batch.uma_gas_pot
+                gas_pot = -9587.2559
+                mol_energy = (crystal_batch.uma_pot / crystal_batch.sym_mult - gas_pot) / crystal_batch.num_atoms  # todo un-hardcode this when we fix it in the training set
             else:
                 assert False
 
@@ -367,7 +367,6 @@ class MolecularCrystal(BaseSet):
             'density': zeros1,
             'z_prime': ones1,
             'is_well_defined': trues1,
-            'uma_lattice_pot': zeros1,
         }
         setattr(crystal_batch, '_num_graphs', mol_batch.num_graphs)
         setattr(crystal_batch, 'device', mol_batch.device)

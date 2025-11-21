@@ -45,16 +45,23 @@ class CrystalReplayBuffer:
         self.diversity_coeff = diversity_coeff
         self.max_z_prime = max_z_prime
         self.buffer_dist_cutoff = buffer_dist_cutoff
+        self.staging_buffer = []
+
+    @torch.no_grad()
+    def add_to_staging(self, data_list=None, data_batch=None):
+        if data_list is None and data_batch is not None:
+            data_list = data_batch.batch_to_list()
+
+        self.staging_buffer.extend(data_list)
 
     @torch.no_grad()
     def add(self,
             data_list=None,
-            data_batch=None,
             max_z_prime: int = 1):
         if self.dataset is None:
             self.init_fresh_dataset(data_list, max_z_prime)
         else:
-            self.add_samples_to_dataset(data_batch, data_list, max_z_prime)
+            self.add_samples_to_dataset(data_list, max_z_prime)
 
         if len(self) > self.buffer_size:  # pare down buffer
             self.truncate_buffer()
@@ -63,25 +70,24 @@ class CrystalReplayBuffer:
 
         self.init_loader()
 
-    def add_samples_to_dataset(self, data_batch, data_list, max_z_prime):
+    def add_samples_to_dataset(self, data_list, max_z_prime):
         # batch samples
-        if data_list is None and data_batch is not None:
-            data_list = data_batch.batch_to_list()
-        elif data_list is not None and data_batch is None:
-            data_batch = collate_data_list(data_list, max_z_prime=self.max_z_prime)
+        if len(self.staging_buffer) > 0:  # include staged samples
+            data_list.extend(self.staging_buffer)
+            self.staging_buffer = []
+
+        data_batch = collate_data_list(data_list, max_z_prime=self.max_z_prime)
+
         # get rewards
         scores = self.energy_function.prebuilt_sample_to_reward(data_batch,
                                                                 temperature=torch.ones(data_batch.num_graphs))
         # enforce reasonable standards for consideration in the buffer
         score_cut = np.quantile(self.rewards_list, 0.5)
         good_inds = [ind for ind in range(len(data_list)) if
-                     ((data_list[ind].lj_pot < 0) and (data_list[ind].niggli_overlap >= 0) and (
-                                 scores[ind] > score_cut))
-                     ]
+                     (data_list[ind].niggli_overlap >= 0) and (scores[ind] > score_cut)]
         # add anything reasonable
         if len(good_inds) > 0:
             data_to_add = [data_list[ind] for ind in good_inds]
-
             self.dataset.extend(data_to_add)
             dataset_batch = collate_data_list(self.dataset, max_z_prime=max_z_prime)
             x_tensor = dataset_batch.latent_params()

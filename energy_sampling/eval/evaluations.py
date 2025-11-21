@@ -47,7 +47,7 @@ def eval_step(energy_function,
         init_state, gfn_model, discretizer, energy_function, mol_batch)
 
     if save_batch:
-        buffer.add(data_batch=sample_batch.detach().cpu())
+        buffer.add(data_list=sample_batch.detach().cpu().batch_to_list())
 
     metrics = log_metrics(energy_function, log_Z, log_Z_lb, log_Z_learned, log_r, log_flow,
                           sample_batch, log_T_tensor, log_pfs, log_pbs, args, buffer)

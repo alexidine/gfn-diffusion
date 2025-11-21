@@ -405,21 +405,6 @@ class Modeller:
                 for mol in mols_list:
                     test_mols_list.append(mol.clone())
 
-        # elif self.args.molecule == 'urea':
-        #     good_mol = self.init_urea(buffer)
-        #     train_mols_list = [good_mol.clone() for _ in range(int(self.args.max_batch_size * 1.5))]
-        #     test_mols_list = [good_mol.clone() for _ in range(int(self.args.max_batch_size * 1.5))]
-        #
-        # elif self.args.molecule == 'nicotinamide':
-        #     good_mol = self.init_nicotinamide(buffer)
-        #     train_mols_list = [good_mol.clone() for _ in range(int(self.args.max_batch_size * 1.5))]
-        #     test_mols_list = [good_mol.clone() for _ in range(int(self.args.max_batch_size * 1.5))]
-        #
-        # elif self.args.molecule == 'acridine':
-        #     good_mol = self.init_acridine(buffer)
-        #     train_mols_list = [good_mol.clone() for _ in range(int(self.args.max_batch_size * 1.5))]
-        #     test_mols_list = [good_mol.clone() for _ in range(int(self.args.max_batch_size * 1.5))]
-
         elif self.args.molecule == 'qm9':
             if energy_function.max_z_prime > 1:
                 assert False, "Z'>1 mol loading not yet implemented for qm9"
@@ -439,6 +424,13 @@ class Modeller:
                                             embedding_type=self.args.mol_embedding_type)
             test_mols_list = embed_dataset(test_mols_list, self.args.autoencoder_path, self.device, encoder=None,
                                            embedding_type=self.args.mol_embedding_type)
+
+        if hasattr(buffer.dataset[0], 'uma_gas_pot'):  # TODO REWRITE ALL THIS
+            pot = buffer.dataset[0].uma_gas_pot
+            for elem in train_mols_list:
+                elem.uma_gas_pot = pot
+            for elem in test_mols_list:
+                elem.uma_gas_pot = pot
 
         train_mol_loader = DataLoader(
             train_mols_list,
@@ -811,12 +803,12 @@ class Modeller:
                 discretizer,
                 exploration_std,
                 mol_batch,
-                buffer,
                 return_exp=True,
                 repeats=repeats,
                 report_losses=report_losses
             )
-
+            if energy_function.energy_function == 'uma':  # save expensive stuff
+                buffer.add_to_staging(data_batch=crystal_batch)
             del crystal_batch
 
         elif do_backward:
@@ -853,7 +845,7 @@ class Modeller:
         return clean_loss, loss_dict_cpu
 
     def fwd_train_step(self, energy_function, gfn_model, discretizer,
-                       exploration_std, mol_batch, buffer, return_exp=False,
+                       exploration_std, mol_batch, return_exp=False,
                        repeats: int = 10,
                        report_losses: bool = False):
         init_state = get_gfn_init_state(self.forward_batch_size, energy_function.data_ndim, self.device)
@@ -866,7 +858,6 @@ class Modeller:
                                     energy_function.log_reward,
                                     discretizer,
                                     mol_batch,
-                                    buffer,
                                     log_T_tensor,
                                     exploration_std=exploration_std,
                                     return_exp=return_exp,
@@ -1042,6 +1033,8 @@ class Modeller:
                               ):
         print("Loading prebuilt buffer")
         dataset = torch.load(dataset_path, weights_only=False)
+        if 'nic_14_zp1.pt' in dataset_path:
+            dataset = [elem for elem in dataset if elem.identifier == 'NICOAM']  # TODO delete - some confusion in this dataset around conformations
         max_z_prime = max([int(elem.z_prime) for elem in dataset])
         assert max_z_prime == max(self.args.z_primes), "Preloaded data max z prime must match model"
 
@@ -1085,8 +1078,8 @@ class Modeller:
         keep_inds = torch.arange(len(latents), device=latents.device)[keep]
         dataset = [dataset[ind] for ind in keep_inds]
 
-        # todo remove!!
-        dataset = dataset[:100]
+        # # todo remove!!
+        # dataset = dataset[:100]
 
         if self.args.energy_function in ['silu', 'lj', 'qlj', 'uma']:  # reparameterize incoming samples
             print("Re-featurizing preloaded buffer samples")

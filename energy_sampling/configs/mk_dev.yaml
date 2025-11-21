@@ -2,10 +2,10 @@ run_name: 'mk_local_dev'
 tag: 'dev'
 seed: 12345
 device: 'cuda'
-lr_policy: 5.0e-7              # learning rate of the policy network
+lr_policy: 5.0e-4              # learning rate of the policy network
 min_lr: 1.0e-6                # ihn
-lr_flow: 1.0e-7                  # learning rate of the flow network
-lr_back: 5.0e-7                # learning rate of the backward pass
+lr_flow: 1.0e-0                  # learning rate of the flow network
+lr_back: 5.0e-4                # learning rate of the backward pass
 lr_warmup_ratio: 10           # how much smaller the initial (warmup) LR should be than the max policy value
 scheduler: True               # does LR warmup from lr/lr_warup_ratio -> lr -> min_lr over the warmup and annealing period
 lr_warmup_time: 500
@@ -102,7 +102,7 @@ reward_range: 20 # range of reward values allowed, null to go unrestricted
 
 # dataset settings
 ################################################################
-uma_path: 'C:\Users\mikem\Downloads\esen_s.pt'
+uma_path: 'D:\crystal_datasets\esen_s.pt'
 #buffer_path: 'D:/crystal_datasets/opt_outputs/acridine_sg_14_zp_1_2.pt'
 buffer_path: 'D:/crystal_datasets/opt_outputs/nic_14_zp1.pt' #'D:/crystal_datasets/urea_gfn_dataset.pt' #
 #buffer_path: 'D:/crystal_datasets/test_qm9_crystals_test.pt' #'D:/crystal_datasets/nic_sg2_dataset.pt' #'D:/crystal_datasets/urea_gfn_dataset.pt' #
