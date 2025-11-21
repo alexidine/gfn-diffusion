@@ -870,7 +870,7 @@ class Modeller:
                        report_losses: bool = False):
         if self.args.sampling == 'buffer':
             samples, rewards, crystal_batch, condition = buffer.sample(
-                override_batch=int(self.backward_batch_size * self.args.bwd_batch_multiplier),
+                override_batch=int(self.backward_batch_size),
                 randomize_orientations=True if self.args.molecule_conditioning else False,
             )
         else:
@@ -1079,7 +1079,7 @@ class Modeller:
         dataset = [dataset[ind] for ind in keep_inds]
 
         # # todo remove!!
-        # dataset = dataset[:100]
+        #dataset = dataset[:100]
 
         if self.args.energy_function in ['silu', 'lj', 'qlj', 'uma']:  # reparameterize incoming samples
             print("Re-featurizing preloaded buffer samples")

@@ -1,4 +1,5 @@
 import copy
+import gc
 from typing import Optional, Tuple
 
 import numpy as np
@@ -132,8 +133,14 @@ class MolecularCrystal(BaseSet):
             silu_energy = out['silu']
             niggli_overlap = out['niggli']
             if self.energy_function == 'uma':
-                uma_energy = crystal_batch.compute_crystal_uma(
-                    predictor=self.uma_predictor, std_orientation=False) * 96.485  # output in kJ/mol (of unit cells)
+                # clear memory
+                del out
+                torch.cuda.empty_cache()
+                gc.collect()
+
+                with torch.no_grad():
+                    uma_energy = crystal_batch.compute_crystal_uma(
+                        predictor=self.uma_predictor, std_orientation=False) * 96.485  # output in kJ/mol (of unit cells)
             else:
                 uma_energy = torch.zeros_like(lj_energy)
 
@@ -176,15 +183,15 @@ class MolecularCrystal(BaseSet):
         if self.energy_function in ['lj', 'qlj', 'silu','uma']:
             density_energy = density_penalty(crystal_batch.packing_coeff)
             if self.energy_function == 'lj':
-                mol_energy = crystal_batch.lj_pot / crystal_batch.num_atoms
+                mol_energy = crystal_batch.lj_pot# / crystal_batch.num_atoms
             elif self.energy_function == 'qlj':
-                mol_energy = crystal_batch.qlj_pot / crystal_batch.num_atoms
+                mol_energy = crystal_batch.qlj_pot# / crystal_batch.num_atoms
             elif self.energy_function == 'silu':
-                mol_energy = crystal_batch.silu_pot / crystal_batch.num_atoms
+                mol_energy = crystal_batch.silu_pot#/ crystal_batch.num_atoms
             elif self.energy_function == 'uma':
                 #gas_pot =  crystal_batch.uma_gas_pot
                 gas_pot = -9587.2559
-                mol_energy = (crystal_batch.uma_pot / crystal_batch.sym_mult - gas_pot) / crystal_batch.num_atoms  # todo un-hardcode this when we fix it in the training set
+                mol_energy = (crystal_batch.uma_pot / crystal_batch.sym_mult - gas_pot)  # the raw lattice energdy # / crystal_batch.num_atoms  # todo un-hardcode this when we fix it in the training set
             else:
                 assert False
 
