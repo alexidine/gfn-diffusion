@@ -28,7 +28,7 @@ bwd_thermalization_time: 200
 checkpoint_path: /scratch/mk8347/csd_runs/datasets/nic12_model_train_hit_prior.pt
 clipping: true
 condition_emb_dim: 1024
-conditional_eval_period: 100
+conditional_eval_period: 1000
 device: cuda
 discretizer: uniform
 discretizer_max_ratio: 15
@@ -44,11 +44,11 @@ energy_static_temperature: 10
 epochs: 1000000
 eval_T: 50
 eval_batch_size: 1000
-eval_period: 100
+eval_period: 200
 exploration_factor: 0.25
 exploration_wd: true
 exploratory: false
-figs_period: 100
+figs_period: 1000
 fwd_loss_coeffs:
   buffer: 0
   buffer_gamma: 0
@@ -110,7 +110,7 @@ space_groups:
 - 2
 t_emb_dim: 64
 t_scale: 0.1
-tag: nic_11
+tag: nic_12
 temp_annealing_max_steps: 2000
 temperature_conditioning: false
 temperature_scaling_factor: 0.01
