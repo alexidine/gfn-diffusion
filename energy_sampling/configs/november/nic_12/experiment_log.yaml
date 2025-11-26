@@ -62,3 +62,47 @@
   - btb_threshold
   - reward_range
   notes: ''
+- index: 8
+  tag: 8
+  update_keys:
+  - energy_static_temperature
+  - thermalization_conv_eps
+  - eval_period
+  - bwd_thermalization_time
+  - energy_density_coeff
+  - btb_threshold
+  - reward_range
+  notes: ''
+- index: 9
+  tag: 9
+  update_keys:
+  - energy_static_temperature
+  - thermalization_conv_eps
+  - eval_period
+  - bwd_thermalization_time
+  - energy_density_coeff
+  - btb_threshold
+  - reward_range
+  notes: ''
+- index: 10
+  tag: 10
+  update_keys:
+  - energy_static_temperature
+  - thermalization_conv_eps
+  - eval_period
+  - bwd_thermalization_time
+  - energy_density_coeff
+  - btb_threshold
+  - reward_range
+  notes: ''
+- index: 11
+  tag: 11
+  update_keys:
+  - energy_static_temperature
+  - thermalization_conv_eps
+  - eval_period
+  - bwd_thermalization_time
+  - energy_density_coeff
+  - btb_threshold
+  - reward_range
+  notes: ''

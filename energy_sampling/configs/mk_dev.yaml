@@ -34,9 +34,9 @@ batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAS
 eval_batch_size: 500        # batch size for evaluation (adaptive)
 eval_num_samples: 1000       # minimum number of samples for evaluation
 epochs: 1000000             # number of training epochs
-eval_period: 1000              # how often to do evaluation & reporting
-conditional_eval_period: 1000 # DEPRECATED # how often to do conditional evaluation with figs # must be multiple of eval period
-figs_period: 1000             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+eval_period: 100              # how often to do evaluation & reporting
+conditional_eval_period: 100 # DEPRECATED # how often to do conditional evaluation with figs # must be multiple of eval period
+figs_period: 100             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # GFlowNet settings
 T: 50                        # static training diffusion length
@@ -85,7 +85,7 @@ anchor_fwd_bwd: true  # whether to do this at all
 btb_threshold: 1.0 # fractional leeway on the thermalization conv_eps for fwd-bwd balancing
 bwd_thermalization_time: 500  # time to transition from MLE to bTB training
 thermalization_conv_eps: 0.5
-init_kld_threshold: 0.05
+init_kld_threshold: 0.1
 anchor_noise_fraction: 0.0
 anchor_noise_level: 0.0
 
@@ -125,7 +125,7 @@ buffer_dist_cutoff: 0.25
 prioritized: null #"boltzmann"   # three kinds of replay training: random, reward prioritized (Boltzmann), rank-based
 sampling: "buffer"  # no alternative for right now
 buffer_size: 100000          # size of replay buffer
-grow_buffer: true  # can be toggled on or off in certain training modes
+grow_buffer: falsead  # can be toggled on or off in certain training modes
 
 # exploration controls
 ################################################################
