@@ -78,16 +78,16 @@ if __name__ == '__main__':
     cluster_dendro_fig(top_df[top_df.mean_en < -150])
 
     "Estimate state sampling probability"
-    sort_inds = torch.argsort(sample_batch.lj_pot)[:batch_size]
-    terminal_states = sample_latents[sort_inds, :]
-    logp_est, _ = estimate_logp_with_convergence(
-        gfn_model, terminal_states, batch_size, n_steps=n_steps, max_repeats=500, tol=1e-2, window=10
-    )
-
-    boltzmann_logprobs = -(sample_batch.lj_pot / sample_batch.num_atoms)[
-        sort_inds] - gfn_model.flow_model().item()  # unconditional boltzmann factor
-
-    go.Figure(go.Scatter(x=logp_est.cpu().detach(), y=boltzmann_logprobs.cpu().detach(), mode='markers')).show()
+    # sort_inds = torch.argsort(sample_batch.lj_pot)[:batch_size]
+    # terminal_states = sample_latents[sort_inds, :]
+    # logp_est, _ = estimate_logp_with_convergence(
+    #     gfn_model, terminal_states, batch_size, n_steps=n_steps, max_repeats=500, tol=1e-2, window=10
+    # )
+    #
+    # boltzmann_logprobs = -(sample_batch.lj_pot / sample_batch.num_atoms)[
+    #     sort_inds] - gfn_model.flow_model().item()  # unconditional boltzmann factor
+    #
+    # go.Figure(go.Scatter(x=logp_est.cpu().detach(), y=boltzmann_logprobs.cpu().detach(), mode='markers')).show()
 
     "Hierarchical joint probabilities"
     # df = hierarchical_joint_df(marginal_labels, max_order=3, cutoff=0.005)

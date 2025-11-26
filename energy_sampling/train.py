@@ -640,7 +640,8 @@ class Modeller:
                         e, oomed_out, buffer,
                         train_mol_loader,
                         test_mol_loader,
-                        optimizers, step_type
+                        optimizers, step_type,
+                        train_iterator, test_iterator
                     )
                 self.times['train_step_end'] = time()
 
@@ -890,7 +891,7 @@ class Modeller:
                                      repeats=repeats,
                                      report_losses=report_losses)
 
-    def handle_train_epoch_error(self, e, oomed_out, buffer, train_mol_loader, test_mol_loader, optimizers, step_type):
+    def handle_train_epoch_error(self, e, oomed_out, buffer, train_mol_loader, test_mol_loader, optimizers, step_type, train_iterator, test_iterator):
         print(f"Caught error: {str(e)}")
         if is_cuda_oom(e):
             print("OOMED!")
