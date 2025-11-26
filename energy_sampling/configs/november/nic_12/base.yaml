@@ -115,7 +115,7 @@ buffer_dist_cutoff: 0.25
 prioritized: null #"boltzmann"   # three kinds of replay training: random, reward prioritized (Boltzmann), rank-based
 sampling: "buffer"  # no alternative for right now
 buffer_size: 100000          # size of replay buffer
-grow_buffer: true  # can be toggled on or off in certain training modes
+grow_buffer: false  # can be toggled on or off in certain training modes
 
 # exploration controls
 ################################################################

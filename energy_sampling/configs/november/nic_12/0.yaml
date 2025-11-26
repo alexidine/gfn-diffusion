@@ -68,7 +68,7 @@ fwd_to_bwd_ratio: 1
 gfn_clip: 200.0
 gradient_norm_clip: 0.1
 grow_batch_size: true
-grow_buffer: true
+grow_buffer: false
 harmonics_dim: 64
 hidden_dim: 1024
 init_kld_threshold: 10.0
