@@ -24,7 +24,7 @@ bwd_loss_coeffs:
   tb: 1.0
   vg_lb: 0
   vg_lme: 0
-bwd_thermalization_time: 200
+bwd_thermalization_time: 500
 checkpoint_path: /scratch/mk8347/csd_runs/datasets/nic12_model_train_hit_prior.pt
 clipping: true
 condition_emb_dim: 1024
@@ -44,7 +44,8 @@ energy_static_temperature: 10
 epochs: 1000000
 eval_T: 50
 eval_batch_size: 1000
-eval_period: 200
+eval_num_samples: 1000
+eval_period: 1000
 exploration_factor: 0.25
 exploration_wd: true
 exploratory: false
@@ -71,7 +72,7 @@ grow_batch_size: true
 grow_buffer: false
 harmonics_dim: 64
 hidden_dim: 1024
-init_kld_threshold: 10.0
+init_kld_threshold: 0.05
 joint_layers: 4
 learn_pb: true
 learned_variance: true

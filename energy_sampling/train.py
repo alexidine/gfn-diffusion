@@ -19,11 +19,12 @@ from tqdm import trange
 
 from energies.molecular_crystal import MolecularCrystal
 from energy_sampling.buffer import CrystalReplayBuffer
+from energy_sampling.eval.utils import sample_eval_fwd_trajs
 from energy_sampling.utils import iter_forever, \
     is_cuda_oom, get_annealing_factor, \
     parse_loss_schedules, dict2namespace, update_loss_schedule, \
     random_discretizer, low_discrepancy_discretizer, low_discrepancy_discretizer2, shifted_equidistant, substitute_prior
-from eval.evaluations import eval_step, conditional_eval_step
+from eval.evaluations import conditional_eval_step, adjust_fig_filesize, log_metrics, fwd_figs, bwd_figs
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 from models import GFN
 from mxtaltools.common.training_utils import flatten_wandb_params
@@ -92,7 +93,6 @@ class Modeller:
         if len(buffer) == 0:
             do_forward = True
             do_backward = False
-
 
         if not any([
             self.args.bwd_loss_coeffs.tb > 0,
@@ -647,29 +647,9 @@ class Modeller:
 
                 # evaluation work
                 if (step_ind % self.args.eval_period == 0 and step_ind > 0) or step_ind == 50:
-                    finished = False
-                    while not finished:
-                        try:
-                            self.eval_work(ema_model, step_ind,
-                                           buffer, train_mol_loader, test_mol_loader,
-                                           energy_function, metrics)
-                            finished = True
-                        except (RuntimeError, ValueError) as e:
-                            print(f"Caught error: {str(e)}")
-                            if is_cuda_oom(e):
-                                self.args.eval_batch_size = max(1, int(self.args.eval_batch_size * 0.95))
-                                if self.args.eval_batch_size <= 1:
-                                    raise RuntimeError("Cascading OOM Failure")
-                                print(f"Reducing eval batch size to {self.args.eval_batch_size}")
-                                gc.collect()
-                                if torch.cuda.is_available():
-                                    torch.cuda.empty_cache()
-                                    try:
-                                        torch.cuda.ipc_collect()
-                                    except Exception:
-                                        pass
-                            else:
-                                raise e
+                    self.evaluation(ema_model, step_ind,
+                                    buffer, train_mol_loader, test_mol_loader,
+                                    energy_function, metrics)
 
                     if self.args.anchor_fwd_bwd and self.args.both_ways:
                         self.manage_prior_anchor(step_ind, metrics, gfn_model, ema_model, name)
@@ -773,11 +753,11 @@ class Modeller:
                    mol_iterator,
                    repeats):
         if step_type == "Forward":
-            do_forward=True
-            do_backward=False
-        elif step_type=="Backward":
-            do_forward=False
-            do_backward=True
+            do_forward = True
+            do_backward = False
+        elif step_type == "Backward":
+            do_forward = False
+            do_backward = True
         else:
             assert False
 
@@ -891,7 +871,8 @@ class Modeller:
                                      repeats=repeats,
                                      report_losses=report_losses)
 
-    def handle_train_epoch_error(self, e, oomed_out, buffer, train_mol_loader, test_mol_loader, optimizers, step_type, train_iterator, test_iterator):
+    def handle_train_epoch_error(self, e, oomed_out, buffer, train_mol_loader, test_mol_loader, optimizers, step_type,
+                                 train_iterator, test_iterator):
         print(f"Caught error: {str(e)}")
         if is_cuda_oom(e):
             print("OOMED!")
@@ -946,46 +927,6 @@ class Modeller:
 
     def do_evaluation(self, energy_function, buffer, gfn_model, i, mol_loader,
                       override_do_figures: Optional[bool] = None):
-        self.times['eval_step_start'] = time()
-
-        eval_discretizer = lambda bsz: uniform_discretizer(bsz, self.args.eval_T)
-
-        if override_do_figures is not None:
-            do_figures = override_do_figures
-        else:
-            do_figures = i % self.args.figs_period == 0
-        eval_batch_size = self.args.eval_batch_size
-
-        eval_rands = np.random.randint(len(mol_loader.dataset), size=eval_batch_size)
-        mol_batch = collate_data_list([mol_loader.dataset[ind] for ind in eval_rands]).to(self.device)
-        if not self.args.molecule_conditioning:  # always std orientation if we're not conditioning
-            mol_batch.orient_molecule(mode='standard')
-        else:  # if we are conditioning, randomly rotate and make sure we catch the embedding
-            # todo functionalize this
-            self.scramble_mol_and_embedding(mol_batch)
-
-        # if we are conditioning, we take it as it comes
-        init_state = get_gfn_init_state(eval_batch_size, energy_function.data_ndim, self.device)
-
-        eval_metrics = {}
-        eval_metrics.update(
-            eval_step(energy_function,
-                      gfn_model,
-                      eval_discretizer,
-                      init_state,
-                      buffer,
-                      self.args,
-                      do_figures,
-                      mol_batch,
-                      bwd_training=len(buffer) > 0,
-                      save_batch=self.grow_buffer,
-                      ))
-
-        eval_metrics.update({'Forward Batch Size': self.forward_batch_size})
-        eval_metrics.update({'Backward Batch Size': self.backward_batch_size})
-        eval_metrics.update(self.log_elapsed_times())
-
-        self.times['eval_step_end'] = time()
 
         return eval_metrics
 
@@ -1035,7 +976,8 @@ class Modeller:
         print("Loading prebuilt buffer")
         dataset = torch.load(dataset_path, weights_only=False)
         if 'nic_14_zp1.pt' in dataset_path:
-            dataset = [elem for elem in dataset if elem.identifier == 'NICOAM']  # TODO delete - some confusion in this dataset around conformations
+            dataset = [elem for elem in dataset if
+                       elem.identifier == 'NICOAM']  # TODO delete - some confusion in this dataset around conformations
         max_z_prime = max([int(elem.z_prime) for elem in dataset])
         assert max_z_prime == max(self.args.z_primes), "Preloaded data max z prime must match model"
 
@@ -1080,7 +1022,8 @@ class Modeller:
         dataset = [dataset[ind] for ind in keep_inds]
 
         # # todo remove!!
-        #dataset = dataset[:100]
+        if 'D:' in self.args.buffer_path: # if we're on local, this takes forever
+            dataset = dataset[:500]
 
         if self.args.energy_function in ['silu', 'lj', 'qlj', 'uma']:  # reparameterize incoming samples
             print("Re-featurizing preloaded buffer samples")
@@ -1104,43 +1047,157 @@ class Modeller:
 
         return buffer
 
-    def eval_work(self,
-                  gfn_model,
-                  step_ind,
-                  buffer,
-                  train_mol_loader,
-                  test_mol_loader,
-                  energy_function,
-                  metrics):
-        if self.args.molecule_conditioning or self.args.sg_conditioning or self.args.zp_conditioning:
+    def evaluation(self,
+                   gfn_model,
+                   step_ind,
+                   buffer,
+                   train_mol_loader,
+                   test_mol_loader,
+                   energy_function,
+                   metrics):
 
-            if step_ind % self.args.conditional_eval_period == 0:  # make conditional sampling figures
-                # # so far not useful
-                # train_metrics = self.do_evaluation(energy_function, buffer, gfn_model,
-                #                                    step_ind, train_mol_loader,
-                #                                    override_do_figures=False)
-                # kk = list(train_metrics.keys())
-                # for key in kk:
-                #     metrics['train_eval/' + key] = train_metrics[key]
+        self.times['eval_step_start'] = time()
+        '''setup'''
+        eval_discretizer = lambda bsz: uniform_discretizer(bsz, self.args.eval_T)
 
-                conditional_metrics = self.do_conditional_evaluation(energy_function, gfn_model,
-                                                                     test_mol_loader,
-                                                                     )
-                metrics.update(conditional_metrics)
+        do_figs = step_ind % self.args.figs_period == 0
 
-        metrics.update(self.do_evaluation(energy_function,
-                                          buffer,
-                                          gfn_model,
-                                          step_ind,
-                                          test_mol_loader))
+        '''fwd sampling'''
+        flow_states_list = []
+        eval_samples = []
+        log_Z_list = []
+        log_Z_lb_list = []
+        log_Z_learned_list = []
+        log_r_list = []
+        log_flow_list = []
+        log_T_list = []
+        log_pfs_list = []
+        log_pbs_list = []
+        gauss_params_f_list = []
+        while len(eval_samples) < self.args.eval_num_samples:
+            try:
+                eval_rands = np.random.randint(len(test_mol_loader.dataset), size=self.args.eval_batch_size)
+                mol_batch = collate_data_list([test_mol_loader.dataset[ind] for ind in eval_rands]).to(self.device)
 
-        for key in metrics.keys():  # cleanup nans
+                if not self.args.molecule_conditioning:  # always std orientation if we're not conditioning
+                    mol_batch.orient_molecule(mode='standard')
+                else:  # if we are conditioning, randomly rotate and make sure we catch the embedding
+                    self.scramble_mol_and_embedding(mol_batch)
+
+                init_state = get_gfn_init_state(self.args.eval_batch_size,
+                                                energy_function.data_ndim,
+                                                self.device)
+
+                gfn_model.eval()
+                (flow_states, samples, log_r, log_Z, log_Z_lb,
+                 log_Z_learned, sample_batch, condition, log_pfs, log_pbs, log_flow,
+                 gauss_params_f,
+                 log_T_tensor) = sample_eval_fwd_trajs(
+                    init_state, gfn_model, eval_discretizer, energy_function, mol_batch)
+                flow_states_list.append(flow_states)
+                log_Z_list.append(log_Z)
+                log_Z_lb_list.append(log_Z_lb)
+                log_Z_learned_list.append(log_Z_learned)
+                log_r_list.append(log_r)
+                log_flow_list.append(log_flow)
+                log_T_list.append(log_T_tensor)
+                log_pfs_list.append(log_pfs)
+                log_pbs_list.append(log_pbs)
+                gauss_params_f_list.append(gauss_params_f)
+                eval_samples.extend(sample_batch.batch_to_list())
+
+                if self.grow_buffer:
+                    buffer.add(data_list=sample_batch.detach().cpu().batch_to_list())
+
+            except (RuntimeError, ValueError) as e:
+                print(f"Caught error: {str(e)}")
+                if is_cuda_oom(e):
+                    self.args.eval_batch_size = max(1, int(self.args.eval_batch_size * 0.75))
+                    if self.args.eval_batch_size <= 1:
+                        raise RuntimeError("Cascading OOM Failure")
+                    print(f"Reducing eval batch size to {self.args.eval_batch_size}")
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        try:
+                            torch.cuda.ipc_collect()
+                        except Exception:
+                            pass
+                else:
+                    raise e
+        flow_states = torch.cat(flow_states_list)
+        log_Z = torch.stack(log_Z_list).mean()
+        log_Z_lb = torch.stack(log_Z_lb_list).mean()
+        log_Z_learned = torch.stack(log_Z_learned_list).mean()
+        log_r = torch.cat(log_r_list)
+        log_T_tensor = torch.cat(log_T_list)
+        log_pfs = torch.cat(log_pfs_list)
+        log_pbs = torch.cat(log_pbs_list)
+        gauss_params_f = {}
+        for key in gauss_params_f_list[0].keys():
+            gauss_params_f[key] = torch.cat([d[key] for d in gauss_params_f_list])
+        sample_batch = collate_data_list(eval_samples, skip_default_exclusion=True)
+
+        '''fwd analysis'''
+        metrics.update(log_metrics(energy_function, log_Z, log_Z_lb, log_Z_learned, log_r,
+                                   sample_batch, log_T_tensor, log_pfs, log_pbs, self.args, buffer))
+
+        if do_figs:
+            # always sample from forward policy
+            fig_dict = fwd_figs(buffer,
+                                flow_states,
+                                log_Z_learned,
+                                log_pbs,
+                                log_pfs,
+                                log_r,
+                                gauss_params_f,
+                                sample_batch.detach().cpu(),
+                                )
+        else:
+            fig_dict = {}
+
+        '''bwd sampling and analysis are combined'''
+        if self.args.both_ways or self.args.bwd:
+            init_state = get_gfn_init_state(self.args.eval_num_samples,
+                                            energy_function.data_ndim,
+                                            self.device)
+            bwd_metrics, bwd_fig_dict = bwd_figs(
+                buffer, gfn_model,
+                init_state, eval_discretizer,
+                do_figs=do_figs)
+            metrics.update(bwd_metrics)
+            fig_dict.update(bwd_fig_dict)
+
+        '''logging and wrap up'''
+        if do_figs:
+            adjust_fig_filesize(fig_dict)
+            metrics.update(fig_dict)
+
+        gfn_model.train()
+
+        metrics.update({'Forward Batch Size': self.forward_batch_size})
+        metrics.update({'Backward Batch Size': self.backward_batch_size})
+        metrics.update({'Eval Batch Size': self.args.eval_batch_size})
+        metrics.update(self.log_elapsed_times())
+
+        self.times['eval_step_end'] = time()
+
+        for key in metrics.keys():  # cleanup before logging
             if isinstance(metrics[key], np.ndarray):
                 metrics[key] = np.nan_to_num(metrics[key])
             elif torch.is_tensor(metrics[key]):
                 metrics[key] = torch.nan_to_num(metrics[key])
 
         wandb.log(metrics, step=step_ind)
+
+        '''conditional sampling should be rewritten anyway '''  # TODO
+        # if self.args.molecule_conditioning or self.args.sg_conditioning or self.args.zp_conditioning:
+        #
+        #     if step_ind % self.args.conditional_eval_period == 0:  # make conditional sampling figures
+        #         conditional_metrics = self.do_conditional_evaluation(energy_function, gfn_model,
+        #                                                              test_mol_loader,
+        #                                                              )
+        #         metrics.update(conditional_metrics)
 
     def manage_prior_anchor(self, step_ind, metrics, gfn_model, ema_model, name):
         min_rat = 1 / 10
@@ -1215,7 +1272,8 @@ class Modeller:
             "dynamic adjustment"
             err = (metric - bwd_anchor) / bwd_anchor
             # target the given kld threshold and optimize towards it
-            self.args.fwd_to_bwd_ratio *= np.exp(-0.1 * err)
+            coeff = 0.2  # larger coeff means it moves more aggressively
+            self.args.fwd_to_bwd_ratio *= np.exp(-coeff * err)
             self.args.fwd_to_bwd_ratio = np.clip(self.args.fwd_to_bwd_ratio, a_min=min_rat, a_max=max_rat)
 
         metrics['Training Phase'] = self.phase

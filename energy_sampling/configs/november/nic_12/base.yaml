@@ -31,10 +31,11 @@ batch_size: 10              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
 max_batch_size: 2000           # maximum batch size to allow
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
-eval_batch_size: 1000        # batch size for evaluation
+eval_batch_size: 1000        # batch size for evaluation (adaptive)
+eval_num_samples: 1000       # minimum number of samples for evaluation
 epochs: 1000000             # number of training epochs
-eval_period: 200              # how often to do evaluation & reporting
-conditional_eval_period: 1000 # how often to do conditional evaluation with figs # must be multiple of eval period
+eval_period: 1000              # how often to do evaluation & reporting
+conditional_eval_period: 1000 # DEPRECATED # how often to do conditional evaluation with figs # must be multiple of eval period
 figs_period: 1000             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # GFlowNet settings
@@ -82,7 +83,7 @@ bwd_loss_coeffs:
 # for controlling 3-phase convergence protocol
 anchor_fwd_bwd: true  # whether to do this at all
 btb_threshold: 1.0 # fractional leeway on the thermalization conv_eps for fwd-bwd balancing
-bwd_thermalization_time: 200  # time to transition from MLE to bTB training
+bwd_thermalization_time: 500  # time to transition from MLE to bTB training
 thermalization_conv_eps: 0.5
 init_kld_threshold: 0.05
 anchor_noise_fraction: 0.0

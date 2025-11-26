@@ -3,7 +3,6 @@
   update_keys:
   - energy_static_temperature
   - thermalization_conv_eps
-  - init_kld_threshold
   - btb_threshold
   - reward_range
   notes: ''
@@ -12,7 +11,6 @@
   update_keys:
   - energy_static_temperature
   - thermalization_conv_eps
-  - init_kld_threshold
   - btb_threshold
   - reward_range
   notes: ''
@@ -21,7 +19,6 @@
   update_keys:
   - energy_static_temperature
   - thermalization_conv_eps
-  - init_kld_threshold
   - btb_threshold
   - reward_range
   notes: ''
@@ -30,7 +27,6 @@
   update_keys:
   - energy_static_temperature
   - thermalization_conv_eps
-  - init_kld_threshold
   - btb_threshold
   - reward_range
   notes: ''
@@ -39,7 +35,6 @@
   update_keys:
   - energy_static_temperature
   - thermalization_conv_eps
-  - init_kld_threshold
   - btb_threshold
   - reward_range
   notes: ''
@@ -48,7 +43,6 @@
   update_keys:
   - energy_static_temperature
   - thermalization_conv_eps
-  - init_kld_threshold
   - btb_threshold
   - reward_range
   notes: ''
@@ -57,7 +51,6 @@
   update_keys:
   - energy_static_temperature
   - thermalization_conv_eps
-  - init_kld_threshold
   - btb_threshold
   - reward_range
   notes: ''
@@ -66,7 +59,6 @@
   update_keys:
   - energy_static_temperature
   - thermalization_conv_eps
-  - init_kld_threshold
   - btb_threshold
   - reward_range
   notes: ''

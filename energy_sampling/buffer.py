@@ -79,12 +79,15 @@ class CrystalReplayBuffer:
         data_batch = collate_data_list(data_list, max_z_prime=self.max_z_prime)
 
         # get rewards
-        scores = self.energy_function.prebuilt_sample_to_reward(data_batch,
-                                                                temperature=torch.ones(data_batch.num_graphs))
+        scores = self.energy_function.prebuilt_sample_to_reward(
+            data_batch,
+            temperature=torch.ones(data_batch.num_graphs) * self.energy_function.temperature)
         # enforce reasonable standards for consideration in the buffer
         score_cut = np.quantile(self.rewards_list, 0.5)
+        packing_coeffs = data_batch.packing_coeff.cpu().detach().numpy()
         good_inds = [ind for ind in range(len(data_list)) if
-                     (data_list[ind].niggli_overlap >= 0) and (scores[ind] > score_cut)]
+                     (data_list[ind].niggli_overlap >= 0) and (scores[ind] > score_cut) and (
+                             packing_coeffs[ind] > 0.55) and (packing_coeffs[ind] < 0.95)]
         # add anything reasonable
         if len(good_inds) > 0:
             data_to_add = [data_list[ind] for ind in good_inds]
@@ -104,9 +107,17 @@ class CrystalReplayBuffer:
 
         dataset_batch = collate_data_list(self.dataset, max_z_prime=max_z_prime)
         x_tensor = dataset_batch.latent_params()
-        rewards = self.energy_function.prebuilt_sample_to_reward(dataset_batch, temperature=torch.ones(len(self)))
+        rewards = self.energy_function.prebuilt_sample_to_reward(
+            dataset_batch,
+            temperature=torch.ones(len(self)) * self.energy_function.temperature)
+
         if self.energy_function.reward_range is not None:
+            # reward scaling is temperature dependent
             self.energy_function.set_reward_clip(rewards)
+            # recompute with new clip
+            rewards = self.energy_function.prebuilt_sample_to_reward(
+                dataset_batch,
+                temperature=torch.ones(len(self)) * self.energy_function.temperature)
 
         self.x_list = [x_tensor[i] for i in range(x_tensor.shape[0])]
         self.rewards_list = list(rewards.flatten().cpu().detach().numpy())
@@ -206,7 +217,7 @@ class CrystalReplayBuffer:
             idx = torch.argmin(e[keep_inds][mask])
             minima_inds.append(keep_inds[mask][idx])
 
-        noisy_inds = keep_inds[labels==-1]
+        noisy_inds = keep_inds[labels == -1]
 
         inds_to_keep = torch.cat([
             torch.tensor(minima_inds[1:]), noisy_inds
@@ -319,7 +330,7 @@ class CrystalReplayBuffer:
         reward = self.energy_function.prebuilt_sample_to_reward(
             sample_batch, temperature)  # recompute reward in case parameters have changed
 
-        if hasattr(sample_batch,'latent_transform'):
+        if hasattr(sample_batch, 'latent_transform'):
             del sample_batch.latent_transform
 
         latents = sample_batch.latent_params()
@@ -342,7 +353,6 @@ class CrystalReplayBuffer:
     def adjust_batch_size(self, new_batch_size: int):
         self.loader.batch_sampler.batch_size = new_batch_size
         self._loader_iter = iter_forever(self.loader)
-
 
     def sample_mol_unconditional_prior(self, sg_inds, noise: Optional[float] = None):
         """

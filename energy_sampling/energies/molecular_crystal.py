@@ -84,7 +84,7 @@ class MolecularCrystal(BaseSet):
             self.uma_predictor = init_uma_crystal_predictor(uma_path, device=self.device)
 
         self.temperature = temperature  # for static temperature work
-        self.energy_clip = 0
+        self.energy_clip = None
 
         self.batch = collate_data_list([MolCrystalData(max_z_prime=max_z_prime)], max_z_prime=max_z_prime)
 
@@ -113,7 +113,7 @@ class MolecularCrystal(BaseSet):
     def analyze_crystal_batch(self, x, mol_batch, return_batch=False):  # x is gfn_outputs
         crystal_batch = self.instantiate_crystals(x, mol_batch)
 
-        if self.energy_function not in ['lj', 'qlj', 'silu','uma']:
+        if self.energy_function not in ['lj', 'qlj', 'silu', 'uma']:
             lj_energy = torch.zeros(crystal_batch.num_graphs, device=self.device)
             qlj_energy = torch.zeros_like(lj_energy)
             normed_lj_energy = torch.zeros_like(lj_energy)
@@ -140,7 +140,8 @@ class MolecularCrystal(BaseSet):
 
                 with torch.no_grad():
                     uma_energy = crystal_batch.compute_crystal_uma(
-                        predictor=self.uma_predictor, std_orientation=False) * 96.485  # output in kJ/mol (of unit cells)
+                        predictor=self.uma_predictor,
+                        std_orientation=False) * 96.485  # output in kJ/mol (of unit cells)
             else:
                 uma_energy = torch.zeros_like(lj_energy)
 
@@ -180,18 +181,19 @@ class MolecularCrystal(BaseSet):
         if self.max_z_prime > 1:
             bounding_energy = self.compute_zp_order_penalty(bounding_energy, crystal_batch)
 
-        if self.energy_function in ['lj', 'qlj', 'silu','uma']:
+        if self.energy_function in ['lj', 'qlj', 'silu', 'uma']:
             density_energy = density_penalty(crystal_batch.packing_coeff)
             if self.energy_function == 'lj':
-                mol_energy = crystal_batch.lj_pot# / crystal_batch.num_atoms
+                mol_energy = crystal_batch.lj_pot  # / crystal_batch.num_atoms
             elif self.energy_function == 'qlj':
-                mol_energy = crystal_batch.qlj_pot# / crystal_batch.num_atoms
+                mol_energy = crystal_batch.qlj_pot  # / crystal_batch.num_atoms
             elif self.energy_function == 'silu':
-                mol_energy = crystal_batch.silu_pot#/ crystal_batch.num_atoms
+                mol_energy = crystal_batch.silu_pot  # / crystal_batch.num_atoms
             elif self.energy_function == 'uma':
-                #gas_pot =  crystal_batch.uma_gas_pot
+                # gas_pot =  crystal_batch.uma_gas_pot
                 gas_pot = -9587.2559
-                mol_energy = (crystal_batch.uma_pot / crystal_batch.sym_mult - gas_pot)  # the raw lattice energdy # / crystal_batch.num_atoms  # todo un-hardcode this when we fix it in the training set
+                mol_energy = (
+                            crystal_batch.uma_pot / crystal_batch.sym_mult - gas_pot)  # the raw lattice energdy # / crystal_batch.num_atoms  # todo un-hardcode this when we fix it in the training set
             else:
                 assert False
 
@@ -223,7 +225,10 @@ class MolecularCrystal(BaseSet):
             assert False, f'{self.energy_function} not implemented'
 
         total_energy = crystal_energy + bounding_energy * self.bounding_coeff + niggli_energy * self.niggli_coeff
-        return log_rescale_positive(total_energy, self.energy_clip), ens_dict
+        if self.energy_clip is not None:
+            return log_rescale_positive(total_energy, self.energy_clip), ens_dict
+        else:
+            return total_energy, ens_dict
 
     def compute_zp_order_penalty(self, bounding_energy, crystal_batch):
         # penalize the model for placing asymmetric units out of the canonical order (closest -> furthest from origin)

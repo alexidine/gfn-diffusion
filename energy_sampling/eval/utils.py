@@ -161,10 +161,10 @@ def sample_eval_fwd_trajs(initial_state, gfn, discretizer, energy_function, mol_
                                                                 None,
                                                                 condition,
                                                                 return_gauss_params=True)
-    gauss_params = {'means_f': means_f,
-                    'logvars_f': logvars_f,
-                    'means_b': means_b,
-                    'logvars_b': logvars_b}
+    gauss_params = {'means_f': means_f.cpu().detach(),
+                    'logvars_f': logvars_f.cpu().detach(),
+                    'means_b': means_b.cpu().detach(),
+                    'logvars_b': logvars_b.cpu().detach()}
     log_r, sample_batch = energy_function.log_reward(
         states[:, -1], mol_batch=mol_batch,
         log_temperature=log_T_tensor,
@@ -175,12 +175,14 @@ def sample_eval_fwd_trajs(initial_state, gfn, discretizer, energy_function, mol_
     log_Z_lb = log_weight.mean()
     log_Z_learned = log_flow.mean()
 
-    return (states, states[:, -1],
+    outputs = (states, states[:, -1],
             log_r, log_Z, log_Z_lb, log_Z_learned,
             sample_batch, condition,
             log_pfs, log_pbs, log_flow,
             gauss_params, log_T_tensor)
-
+    outputs = (o if isinstance(o, dict) else o.cpu().detach()
+               for o in outputs)
+    return outputs
 
 @torch.no_grad()
 def mean_log_likelihood(terminal_state, gfn, log_reward_fn, num_evals=10):

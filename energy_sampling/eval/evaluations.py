@@ -11,7 +11,7 @@ from plotly.subplots import make_subplots
 from scipy.ndimage import gaussian_filter
 from scipy.spatial import Voronoi, KDTree
 from scipy.spatial.distance import cdist
-from scipy.stats import linregress, gaussian_kde, entropy
+from scipy.stats import linregress, gaussian_kde
 from scipy.stats import pearsonr
 from skimage.feature import peak_local_max
 from skimage.segmentation import watershed
@@ -21,71 +21,8 @@ from energy_sampling.eval.utils import sample_eval_fwd_trajs, get_plotly_fig_siz
 from energy_sampling.utils import logmeanexp, sample_crystal_prior
 from mxtaltools.common.utils import get_point_density
 from mxtaltools.dataset_utils.utils import collate_data_list
-from mxtaltools.reporting.figures import simple_cell_hist, simple_cell_scatter_fig, \
-    log_crystal_samples, conditional_simple_cell_hist
+from mxtaltools.reporting.figures import log_crystal_samples
 from mxtaltools.reporting.utils import lightweight_one_sided_violin
-
-
-@torch.no_grad()
-def eval_step(energy_function,
-              gfn_model,
-              discretizer,
-              init_state,
-              buffer,
-              args,
-              do_figures: bool = True,
-              mol_batch=None,
-              bwd_training: bool = False,
-              save_batch: bool = False,
-              ):
-    gfn_model.eval()
-
-    (flow_states, samples, log_r, log_Z, log_Z_lb,
-     log_Z_learned, sample_batch, condition, log_pfs, log_pbs, log_flow,
-     gauss_params_f,
-     log_T_tensor) = sample_eval_fwd_trajs(
-        init_state, gfn_model, discretizer, energy_function, mol_batch)
-
-    if save_batch:
-        buffer.add(data_list=sample_batch.detach().cpu().batch_to_list())
-
-    metrics = log_metrics(energy_function, log_Z, log_Z_lb, log_Z_learned, log_r, log_flow,
-                          sample_batch, log_T_tensor, log_pfs, log_pbs, args, buffer)
-
-    if do_figures:
-        # always sample from forward policy
-        fig_dict = fwd_figs(buffer,
-                            flow_states,
-                            log_flow,
-                            log_pbs,
-                            log_pfs,
-                            log_r,
-                            gauss_params_f,
-                            sample_batch.detach().cpu(),
-                            )
-    else:
-        fig_dict = {}
-
-    if bwd_training:
-        metrics, fig_dict = bwd_figs(metrics, fig_dict, buffer, gfn_model, init_state, discretizer, do_figs=do_figures)
-
-    if do_figures:
-        adjust_fig_filesize(fig_dict)
-        metrics.update(fig_dict)
-
-        "Crystal samples"
-        # TODO this always fails for our current accelerated batching technique
-        # need to write a manual decollater
-        # try:
-        #     batch_to_log = sample_batch.detach().cpu().batch_to_list()[:6]
-        #     batch_to_log.box_analysis()
-        #     log_crystals(batch_to_log)
-        # except:  # sometimes it fails IDK
-        #     print("Crystal Logging Failed!")
-        #     pass
-
-    gfn_model.train()
-    return metrics
 
 
 def adjust_fig_filesize(fig_dict):
@@ -107,7 +44,7 @@ def conditional_eval_step(energy_function,
                           init_state,
                           mol_batch,
                           mols_to_sample: int = 10,
-                          sample_sgs = None
+                          sample_sgs=None
 
                           ):
     gfn_model.eval()
@@ -288,7 +225,7 @@ def conditional_fwd_figs(log_flow, log_pbs, log_pfs, log_r,
         split_by_sg=True, split_by_zp=True, space='latent', show=False, return_fig=True
     )
     fig_dict['Conditional Sample Scatter'] = sample_batch.plot_batch_density_funnel(
-        split_by_sg=True,show=False, return_fig=True)
+        split_by_sg=True, show=False, return_fig=True)
 
     return fig_dict
 
@@ -705,14 +642,15 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
     return fig
 
 
-def bwd_figs(metrics, fig_dict, buffer, gfn_model, init_state, discretizer, do_figs: Optional[bool] = False):
+def bwd_figs(buffer, gfn_model, init_state, discretizer, do_figs: Optional[bool] = False):
     terminal_state, log_r, crystal_batch, condition = buffer.sample(
         override_batch=len(init_state),
-        )
+    )
     (backward_flow_states, b_log_pfs, b_log_pbs, log_z,
      b_means_f, b_vars_f, b_means_b, b_vars_b) = gfn_model.get_traj_bwd(
         terminal_state.to(gfn_model.device), discretizer, condition.to(gfn_model.device), return_gauss_params=True)
-
+    metrics = {}
+    fig_dict = {}
     metrics['Mean Bwd F Drift'] = b_means_f.abs().mean().item()
     metrics['Mean Bwd B Drift'] = b_means_b.abs().mean().item()
     metrics['Mean Bwd F Var'] = b_vars_f.mean().item()
@@ -749,9 +687,9 @@ def bwd_figs(metrics, fig_dict, buffer, gfn_model, init_state, discretizer, do_f
     '''
 
     metrics['Bwd Log Z Residual'] = (log_Z_empirical - log_Z_learned).item()
-    metrics['Bwd Normed Log Z Residual'] = ((log_Z_empirical - log_Z_learned).abs()/log_Z_lb.abs()).item()
+    metrics['Bwd Normed Log Z Residual'] = ((log_Z_empirical - log_Z_learned).abs() / log_Z_lb.abs()).item()
     metrics['Bwd Log Z LB Residual'] = (log_Z_lb - log_Z_learned).item()
-    metrics['Bwd Normed Log Z LB Residual'] = ((log_Z_lb - log_Z_learned).abs()/log_Z_lb.abs()).item()
+    metrics['Bwd Normed Log Z LB Residual'] = ((log_Z_lb - log_Z_learned).abs() / log_Z_lb.abs()).item()
 
     if do_figs:
         fig_dict['Backward Latents Trajectories'] = visualize_latent_trajs(
@@ -808,8 +746,13 @@ def mean_flow_step_sizes(flow_states):
     return fig
 
 
-def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r, log_z,
-                sample_batch, log_T_tensor, log_pfs, log_pbs, args, buffer=None):
+def log_metrics(energy_function,
+                log_Z_empirical,
+                log_Z_lb,
+                log_Z_learned,
+                log_r,
+                sample_batch, log_T_tensor,
+                log_pfs, log_pbs, args, buffer=None):
     """Scalar / distribution metrics"""
     metrics = {}
     # energies
@@ -833,14 +776,15 @@ def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r
     metrics['Sample Energy'] = sample_batch.gfn_energy.clip(max=50).cpu().detach().numpy()
     metrics['Scaled LJ'] = sample_batch.scaled_lj_pot.cpu().detach().numpy()
 
-    metrics['Mean Sample Reward'] = log_r.mean().cpu().detach().item()  # todo this should probably be denormed by the temperature
+    metrics[
+        'Mean Sample Reward'] = log_r.mean().cpu().detach().item()  # todo this should probably be denormed by the temperature
     metrics['Sample Reward'] = log_r.clip(min=-50).cpu().detach().numpy()
 
     metrics['Empirical log Z'] = log_Z_empirical.cpu().detach().item()
     metrics['Empirical log Z LB'] = log_Z_lb.cpu().detach().item()
     metrics['log Z learned'] = log_Z_learned.cpu().detach().item()
 
-    tb_x = log_z.cpu() + log_pfs.sum(-1).cpu()
+    tb_x = log_Z_learned.cpu() + log_pfs.sum(-1).cpu()
     tb_y = log_r.cpu() + log_pbs.sum(-1).cpu()
     high_cut, low_cut = torch.quantile(log_r, 0.99), torch.quantile(log_r, 0.01)
     good_inds = ((high_cut >= log_r) * (log_r >= low_cut)).cpu()
@@ -935,19 +879,19 @@ def log_metrics(energy_function, log_Z_empirical, log_Z_lb, log_Z_learned, log_r
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
 
-    log_ratio = -log_pf.cpu() - log_z.cpu() + log_pb.cpu() + log_r.cpu()
+    log_ratio = -log_pf.cpu() - log_Z_learned.cpu() + log_pb.cpu() + log_r.cpu()
     tb_residual = F.smooth_l1_loss(log_ratio, torch.ones_like(log_ratio), reduction='none', beta=10)
     metrics['TB Residual'] = tb_residual.mean().item()
 
     X_side = log_pf.cpu() - log_pb.cpu()
-    Y_side = log_r.cpu() - log_z.cpu()
+    Y_side = log_r.cpu() - log_Z_learned.cpu()
     normed_log_ratio = (X_side - Y_side).abs() / Y_side.abs()
     metrics['Normed TB Residual'] = normed_log_ratio.mean().item()
 
     metrics['Log Z Residual'] = (log_Z_empirical - log_Z_learned).item()
-    metrics['Normed Log Z Residual'] =  ((log_Z_empirical - log_Z_learned).abs()/log_Z_empirical.abs()).item()
+    metrics['Normed Log Z Residual'] = ((log_Z_empirical - log_Z_learned).abs() / log_Z_empirical.abs()).item()
     metrics['Log Z LB Residual'] = (log_Z_lb - log_Z_learned).item()
-    metrics['Normed Log Z LB Residual'] = ((log_Z_lb - log_Z_learned).abs()/log_Z_lb.abs()).item()
+    metrics['Normed Log Z LB Residual'] = ((log_Z_lb - log_Z_learned).abs() / log_Z_lb.abs()).item()
 
     # get fraction of samples which are 'reasonable' at this energy,
     # meaning density > 0.55 and bound states
@@ -1027,6 +971,7 @@ def to_loggable(v):
             return v.numpy()
     return v
 
+
 def parity_plot(x_in, y_in):
     if torch.is_tensor(x_in):
         x = x_in.cpu().detach().numpy()
@@ -1048,6 +993,7 @@ def parity_plot(x_in, y_in):
                     mode='markers',
                     )
     return fig
+
 
 def pf_parity_plot(log_pfs, log_pbs, log_r, log_flow):
     x = log_pfs.sum(-1).cpu().detach().numpy()
