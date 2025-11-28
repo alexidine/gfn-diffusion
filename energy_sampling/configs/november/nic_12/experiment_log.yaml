@@ -106,3 +106,29 @@
   - btb_threshold
   - reward_range
   notes: ''
+- index: 12
+  tag: 1_restart
+  update_keys:
+  - eval_period
+  - energy_static_temperature
+  - thermalization_conv_eps
+  - checkpoint_path
+  - buffer_size
+  - starting_phase
+  - btb_threshold
+  - reward_range
+  - bwd_thermalization_time
+  notes: ''
+- index: 13
+  tag: 4_restart
+  update_keys:
+  - eval_period
+  - energy_static_temperature
+  - thermalization_conv_eps
+  - checkpoint_path
+  - buffer_size
+  - btb_threshold
+  - reward_range
+  - starting_phase
+  - bwd_thermalization_time
+  notes: ''

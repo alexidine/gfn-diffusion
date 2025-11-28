@@ -64,6 +64,7 @@ class Modeller:
             self.args.fwd_to_bwd_ratio = 1.0E-6
         self.forward_batch_size = self.args.batch_size
         self.backward_batch_size = self.args.batch_size
+        self.phase = 1
 
     def train_logic(self, buffer, it):
         do_forward = False
@@ -151,8 +152,8 @@ class Modeller:
     def increment_batch_size(self, buffer, train_mol_loader, test_mol_loader, batch_growth_increment, step_type,
                              train_iterator, test_iterator):
         if step_type == "Forward":
-            if self.forward_batch_size < self.args.max_batch_size:
-                new_batch_size = min(self.args.max_batch_size, max(self.forward_batch_size + 1,
+            if self.forward_batch_size < self.args.max_fwd_batch_size:
+                new_batch_size = min(self.args.max_fwd_batch_size, max(self.forward_batch_size + 1,
                                                                    int(self.forward_batch_size * batch_growth_increment)))
                 self.forward_batch_size = new_batch_size  # gradually increment batch size
 
@@ -176,8 +177,8 @@ class Modeller:
                 train_iterator = iter_forever(train_mol_loader)
                 test_iterator = iter_forever(test_mol_loader)
         elif step_type == "Backward":
-            if self.backward_batch_size < self.args.max_batch_size:
-                new_batch_size = min(self.args.max_batch_size, max(self.backward_batch_size + 1,
+            if self.backward_batch_size < self.args.max_bwd_batch_size:
+                new_batch_size = min(self.args.max_bwd_batch_size, max(self.backward_batch_size + 1,
                                                                    int(self.backward_batch_size * batch_growth_increment)))
                 self.backward_batch_size = new_batch_size  # gradually increment batch size
 
@@ -398,10 +399,10 @@ class Modeller:
             mols_list = self.init_mol_from_buffer(buffer, energy_function.max_z_prime)
             train_mols_list = []
             test_mols_list = []
-            while len(train_mols_list) < int(self.args.max_batch_size * 1.5):
+            while len(train_mols_list) < int(self.args.max_fwd_batch_size * 1.5):
                 for mol in mols_list:
                     train_mols_list.append(mol.clone())
-            while len(test_mols_list) < int(self.args.max_batch_size * 1.5):
+            while len(test_mols_list) < int(self.args.max_fwd_batch_size * 1.5):
                 for mol in mols_list:
                     test_mols_list.append(mol.clone())
 
@@ -1202,8 +1203,11 @@ class Modeller:
     def manage_prior_anchor(self, step_ind, metrics, gfn_model, ema_model, name):
         min_rat = 1 / 10
         max_rat = 10
-        if not self.hit_init_kld:
-            self.phase = 1
+        self.bwd_tb_record = []
+        self.logz_record = []
+        self.n_eval_steps = min(10, (self.args.bwd_thermalization_time // self.args.eval_period))
+
+        if self.phase == 1:
             metric = metrics['Max Latent KLD']
             "check threshold"
             if metric <= self.args.init_kld_threshold:
@@ -1229,9 +1233,6 @@ class Modeller:
                 torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval_hit_prior.pt')
 
                 self.phase = 2
-                self.bwd_tb_record = []
-                self.logz_record = []
-                self.n_eval_steps = min(10, (self.args.bwd_thermalization_time // self.args.eval_period))
 
         elif self.phase == 2:
             "record convergence metrics"

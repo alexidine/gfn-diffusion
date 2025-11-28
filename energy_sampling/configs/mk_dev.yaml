@@ -29,7 +29,8 @@ norm: layer                   # null, "layer" - DON'T PUT 'batch'
 
 batch_size: 10              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 2000           # maximum batch size to allow
+max_fwd_batch_size: 100
+max_bwd_batch_size: 10000
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
 eval_batch_size: 500        # batch size for evaluation (adaptive)
 eval_num_samples: 1000       # minimum number of samples for evaluation
@@ -82,10 +83,10 @@ bwd_loss_coeffs:
 
 # for controlling 3-phase convergence protocol
 anchor_fwd_bwd: true  # whether to do this at all
-btb_threshold: 1.0 # fractional leeway on the thermalization conv_eps for fwd-bwd balancing
-bwd_thermalization_time: 500  # time to transition from MLE to bTB training
-thermalization_conv_eps: 0.5
-init_kld_threshold: 0.1
+btb_threshold: 10.0 # fractional leeway on the thermalization conv_eps for fwd-bwd balancing
+bwd_thermalization_time: 50  # time to transition from MLE to bTB training
+thermalization_conv_eps: 10.0
+init_kld_threshold: 10.0
 anchor_noise_fraction: 0.0
 anchor_noise_level: 0.0
 
