@@ -25,7 +25,7 @@ bwd_loss_coeffs:
   vg_lb: 0
   vg_lme: 0
 bwd_thermalization_time: 100
-checkpoint_path: /scratch/mk8347/projects/gfn_mxt/gfn-diffusion/energy_sampling/checkpoints/nic_12_1_train.pt
+checkpoint_path: /scratch/mk8347/projects/gfn_mxt/gfn-diffusion/energy_sampling/checkpoints/nic_12_1_model_train.pt
 clipping: true
 condition_emb_dim: 1024
 conditional_eval_period: 1000
