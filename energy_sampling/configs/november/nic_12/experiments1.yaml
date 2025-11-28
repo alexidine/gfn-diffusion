@@ -118,6 +118,8 @@ experiments:
     btb_threshold: 1.0
     reward_range: 40
     bwd_thermalization_time: 100
+    max_fwd_batch_size: 200
+    max_bwd_batch_size: 2000
 
 - tag: 4_restart
   update:
@@ -130,3 +132,5 @@ experiments:
     reward_range: 20
     starting_phase: 3
     bwd_thermalization_time: 100
+    max_fwd_batch_size: 200
+    max_bwd_batch_size: 2000

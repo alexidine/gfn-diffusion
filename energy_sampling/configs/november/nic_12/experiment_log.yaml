@@ -118,6 +118,8 @@
   - btb_threshold
   - reward_range
   - bwd_thermalization_time
+  - max_fwd_batch_size
+  - max_bwd_batch_size
   notes: ''
 - index: 13
   tag: 4_restart
@@ -131,4 +133,6 @@
   - reward_range
   - starting_phase
   - bwd_thermalization_time
+  - max_fwd_batch_size
+  - max_bwd_batch_size
   notes: ''
