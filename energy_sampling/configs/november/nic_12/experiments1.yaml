@@ -112,7 +112,7 @@ experiments:
     eval_period: 500
     energy_static_temperature: 2.5
     thermalization_conv_eps: 0.5
-    checkpoint_path: /scratch/mk8347/projects/gfn_mxt/gfn-diffusion/energy_sampling/checkpoints/nic_12_1_train.pt
+    checkpoint_path: /scratch/mk8347/projects/gfn_mxt/gfn-diffusion/energy_sampling/checkpoints/nic_12_1_model_train.pt
     buffer_size: 50000
     starting_phase: 3
     btb_threshold: 1.0
@@ -126,7 +126,7 @@ experiments:
     eval_period: 500
     energy_static_temperature: 10
     thermalization_conv_eps: 0.5
-    checkpoint_path: /scratch/mk8347/projects/gfn_mxt/gfn-diffusion/energy_sampling/checkpoints/nic_12_4_train.pt
+    checkpoint_path: /scratch/mk8347/projects/gfn_mxt/gfn-diffusion/energy_sampling/checkpoints/nic_12_4_model_train.pt
     buffer_size: 50000
     btb_threshold: 1.0
     reward_range: 20
@@ -134,3 +134,4 @@ experiments:
     bwd_thermalization_time: 100
     max_fwd_batch_size: 200
     max_bwd_batch_size: 2000
+

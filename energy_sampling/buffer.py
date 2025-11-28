@@ -77,11 +77,13 @@ class CrystalReplayBuffer:
             self.staging_buffer = []
 
         data_batch = collate_data_list(data_list, max_z_prime=self.max_z_prime)
-
-        # get rewards
+        new_latents = data_batch.latent_params()
+        new_sgs = data_batch.sg_ind
+        # get new samples rewards
         scores = self.energy_function.prebuilt_sample_to_reward(
             data_batch,
             temperature=torch.ones(data_batch.num_graphs) * self.energy_function.temperature)
+
         # enforce reasonable standards for consideration in the buffer
         score_cut = np.quantile(self.rewards_list, 0.5)
         packing_coeffs = data_batch.packing_coeff.cpu().detach().numpy()
@@ -92,12 +94,10 @@ class CrystalReplayBuffer:
         if len(good_inds) > 0:
             data_to_add = [data_list[ind] for ind in good_inds]
             self.dataset.extend(data_to_add)
-            dataset_batch = collate_data_list(self.dataset, max_z_prime=max_z_prime)
-            x_tensor = dataset_batch.latent_params()
             good_scores = scores[torch.tensor(good_inds, dtype=torch.long)]
-            self.x_list = [x_tensor[i] for i in range(x_tensor.shape[0])]
+            self.x_list.extend([new_latents[i] for i in good_inds])
             self.rewards_list.extend(good_scores.flatten().cpu().detach().numpy())
-            self.sg_list = list(dataset_batch.sg_ind.cpu())
+            self.sg_list.extend([new_sgs[i] for i in good_inds])
 
     def init_fresh_dataset(self, data_list, max_z_prime):
         self.dataset = list(data_list)  # I think this is memory safe and faster #copy.deepcopy(data_list)
@@ -194,7 +194,7 @@ class CrystalReplayBuffer:
 
         mask = e_sorted < e_cut
 
-        # Compute full distance matrix once (O(n^2) but fast on GPU)
+        # TODO replace this with something that scales. Brutally bad for large buffers.
         dmat = torch.cdist(xx_sorted, xx_sorted)
 
         keep = torch.zeros(len(xx_sorted), dtype=bool, device=xx.device)

@@ -274,6 +274,7 @@ class Modeller:
             'zp_conditioning': self.args.zp_conditioning,
             'uma_path': self.args.uma_path,
             'reward_range': self.args.reward_range,
+            'lj_rescale': self.args.lj_rescale,
         }
         energy_function = MolecularCrystal(**energy_config)
         return energy_function
@@ -657,11 +658,15 @@ class Modeller:
 
                 # train monitoring
                 if step_ind % 10 == 0:
-                    loss_record.append(fwd_loss + bwd_loss)
-                    if loss_record[-1] == torch.amin(torch.tensor(loss_record)):  # if this is the best model yet
-                        torch.save(gfn_model.state_dict(), f'checkpoints/best_{name}_model_train.pt')
-                        torch.save(ema_model.state_dict(), f'checkpoints/best_{name}_model_eval.pt')
+                    if bwd_loss_dict is not None:  # dynamic quality management
+                        metric = bwd_loss_dict['Backward_loss/normed_tb']
+                        if self.phase == 2: # catch backwards convergence IMMEDIATELY
+                            if  metric < self.args.thermalization_conv_eps:
+                                self.phase2to3(ema_model, gfn_model, 1000, name, step_ind)
+                        if metric < self.args.bwd_overfit_threshold:
+                            self.reload_running_model(ema_model, gfn_model, name)
 
+                    loss_record.append(fwd_loss + bwd_loss)
                     metrics['train/expl'] = exploration_std(0) if exploration_std is not None else 0
                     lr = self.step_lr_schedule(schedulers, optimizers)
                     self.anneal_reward(step_ind, temp_annealing_lambda, energy_function)
@@ -669,11 +674,17 @@ class Modeller:
                     loss_record = self.check_loss_explosion(name, loss_record, gfn_model, ema_model, optimizers)
                     wandb.log(metrics, step=step_ind)
 
-                if step_ind % 250 == 0:  # save running model
+                if step_ind % 50 == 0:  # save running model
                     torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train.pt')
                     torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval.pt')
 
             torch.save(ema_model, f'checkpoints/{name}_model_final.pt')
+
+    def reload_running_model(self, ema_model, gfn_model, name):
+        gfn_model.load_state_dict(torch.load(f'checkpoints/{name}_model_train.pt'))
+        ema_model.load_state_dict(torch.load(f'checkpoints/{name}_model_eval.pt'))
+        gfn_model.train()
+        ema_model.eval()
 
     def check_loss_explosion(self,
                              name: str,
@@ -698,8 +709,8 @@ class Modeller:
             threshold = best_loss + scale * explosion_buffer
             diffs = torch.diff(losses, dim=0)
 
-            hit_threshold = current_loss > threshold
-            increasing_loss = torch.all(diffs[-grace_time:] > 0) and self.increasing_loss_cooldown <= 0
+            hit_threshold = current_loss > threshold  # loss exploding
+            increasing_loss = (torch.mean((diffs[-grace_time:] > 0).float()) > 0.8) and self.increasing_loss_cooldown <= 0  # loss slowly increasing
 
             if hit_threshold or increasing_loss:
                 print("Losses increasing! Reloading best checkpoint and slashing LR.")
@@ -708,10 +719,7 @@ class Modeller:
                 if increasing_loss:
                     print(f"Losses increasing over prior {grace_time} steps!")
 
-                gfn_model.load_state_dict(torch.load(f'checkpoints/{name}_model_train.pt'))
-                ema_model.load_state_dict(torch.load(f'checkpoints/{name}_model_eval.pt'))
-                gfn_model.train()
-                ema_model.eval()
+                self.reload_running_model(ema_model, gfn_model, name)
 
                 for opt in optimizers.values():
                     opt.state = defaultdict(dict)  # wipe also the momentum buffers
@@ -1023,10 +1031,10 @@ class Modeller:
         dataset = [dataset[ind] for ind in keep_inds]
 
         # # todo remove!!
-        if 'D:' in self.args.buffer_path: # if we're on local, this takes forever
+        if 'D:' in self.args.buffer_path and self.args.energy_function == 'uma': # if we're on local, this takes forever
             dataset = dataset[:500]
 
-        if self.args.energy_function in ['silu', 'lj', 'qlj', 'uma']:  # reparameterize incoming samples
+        if self.args.energy_function in ['silu', 'lj', 'qlj', 'elj','uma']:  # reparameterize incoming samples
             print("Re-featurizing preloaded buffer samples")
             dataset = featurize_dataset(dataset,
                                         self.device,
@@ -1036,7 +1044,6 @@ class Modeller:
 
         if filter_unbound:  # filter unbound states
             dataset = [elem for elem in dataset if elem.lj_pot < 0]
-            dataset = [elem for elem in dataset if elem.silu_pot < 0]
 
         if self.args.molecule_conditioning:  # embed dataset
             assert max(self.args.z_primes) == 1, "Molecule conditioning not yet supported for Z'>1"
@@ -1201,84 +1208,89 @@ class Modeller:
         #         metrics.update(conditional_metrics)
 
     def manage_prior_anchor(self, step_ind, metrics, gfn_model, ema_model, name):
-        min_rat = 1 / 10
-        max_rat = 10
+        min_rat = 1 / 100
+        max_rat = 1000
         self.bwd_tb_record = []
         self.logz_record = []
-        self.n_eval_steps = min(10, (self.args.bwd_thermalization_time // self.args.eval_period))
+        self.n_eval_steps = int(max(1, 10 // self.args.eval_period))  # the trailing thermalization time is 500
 
         if self.phase == 1:
             metric = metrics['Max Latent KLD']
             "check threshold"
             if metric <= self.args.init_kld_threshold:
-                print("Hit initial KLD threshold. Moving to backward thermalization.")
-                self.hit_init_kld = True
+                self.phase1to2(ema_model, gfn_model, name, step_ind)
 
-                "adjust loss coefficients"
-                self.args.bwd_loss_coeffs.bwd_tb_z = 1.0
-                self.args.bwd_loss_schedule['tb'] = [(0, 1.0), (step_ind, 0.0),
-                                                     (step_ind + self.args.bwd_thermalization_time // 2, 1.0)]
-                self.args.bwd_loss_schedule['mle'] = [(0, 1.0), (step_ind, 1),
-                                                      (step_ind + self.args.bwd_thermalization_time // 2, 0.0)]
-                self.args.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 1.0)]
-                self.args.bwd_loss_schedule['noised_fraction'] = [(0, 1.0), (step_ind, self.args.anchor_noise_fraction)]
-                self.args.bwd_loss_schedule['noise_level'] = [(0, 1.0), (step_ind, self.args.anchor_noise_level)]
-
-                "set cooldowns"
-                self.increasing_loss_cooldown = self.args.bwd_thermalization_time  # give it time to adjust to new loss landscape
-                self.bwd_thermalization_stop_time = step_ind + self.args.bwd_thermalization_time
-
-                "save checkpoint"
-                torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train_hit_prior.pt')
-                torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval_hit_prior.pt')
-
-                self.phase = 2
-
-        elif self.phase == 2:
+        if self.phase == 2:
             "record convergence metrics"
             self.bwd_tb_record.append(metrics['Bwd Normed TB Residual'])
             self.logz_record.append(metrics['Bwd Normed Log Z LB Residual'])
+            # bwd_overfit_flag = (metrics['Backward TB R Value'] > 0.99) or (metrics['Bwd Normed TB Residual'] < self.args.bwd_overfit_threshold)
 
-            if len(self.bwd_tb_record) >= self.n_eval_steps:  # check convergence over X steps
-                "check convergence"
-                recent_tb = np.array(self.bwd_tb_record[-self.n_eval_steps:])
-                recent_z = np.array(self.logz_record[-self.n_eval_steps:])
-                tb_stable = recent_tb.mean() < self.args.thermalization_conv_eps
-                z_converged = recent_z.mean() < self.args.thermalization_conv_eps
+            # if (len(self.bwd_tb_record) >= self.n_eval_steps) or bwd_overfit_flag:  # check convergence over X steps
+            #     "check convergence"
+            #     recent_tb = np.array(self.bwd_tb_record[-self.n_eval_steps:])
+            #     recent_z = np.array(self.logz_record[-self.n_eval_steps:])
+            #     tb_stable = recent_tb.mean() < self.args.thermalization_conv_eps
+            #     z_converged = recent_z.mean() < self.args.thermalization_conv_eps
+            #
+            #     if (tb_stable and z_converged) or bwd_overfit_flag:
+            #         self.phase2to3(ema_model, gfn_model, min_rat, name, step_ind)
 
-                if tb_stable and z_converged and (step_ind >= self.bwd_thermalization_stop_time):
-                    print("Thermalization complete. Moving to forward training & refinement.")
-                    self.phase = 3
-
-                    "save checkpoint"
-                    torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train_thermalized.pt')
-                    torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval_thermalized.pt')
-
-                    "adjust loss and balancing coefficients"
-                    self.args.fwd_to_bwd_ratio = min_rat
-                    self.args.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 0)]
-                    self.args.fwd_loss_schedule['tb'] = [(0, 1.0), (step_ind, 0.0),
-                                                         (step_ind + self.args.bwd_thermalization_time // 2, 1.0)]
-
-                    "set cooldown"
-                    self.increasing_loss_cooldown = self.args.bwd_thermalization_time
-                    self.grow_buffer = True
-
-        elif self.phase == 3:
+        if self.phase == 3:
             "get metrics"
             # if we have hit it, dynamically adjust fwd_to_bwd_ratio to keep it under the threshold based on the minimum original value
-            metric = metrics['Bwd Normed TB Residual']
-            bwd_anchor = self.args.thermalization_conv_eps * self.args.btb_threshold
+            err_fwd = metrics['Normed TB Residual']
+            err_bwd = metrics['Bwd Normed TB Residual']
+            bwd_ceiling = self.args.thermalization_conv_eps * self.args.btb_threshold  # bwd metric must not exceed this value
+            bwd_overfit_flag = (err_bwd < self.args.bwd_overfit_threshold) and (err_fwd > self.args.bwd_overfit_threshold * 3)
 
-            "dynamic adjustment"
-            err = (metric - bwd_anchor) / bwd_anchor
-            # target the given kld threshold and optimize towards it
-            coeff = 0.2  # larger coeff means it moves more aggressively
-            self.args.fwd_to_bwd_ratio *= np.exp(-coeff * err)
-            self.args.fwd_to_bwd_ratio = np.clip(self.args.fwd_to_bwd_ratio, a_min=min_rat, a_max=max_rat)
+            if err_bwd < bwd_ceiling:  # dynamically balance forward and backward
+                coeff = 0.2
+                imbalance = err_fwd - err_bwd
+                self.args.fwd_to_bwd_ratio *= np.exp(coeff * imbalance)
+                self.args.fwd_to_bwd_ratio = np.clip(self.args.fwd_to_bwd_ratio, a_min=min_rat, a_max=max_rat)
+
+            if err_bwd > bwd_ceiling:  # re-emphasize backward if we are losing it
+                self.args.fwd_to_bwd_ratio /= 2
+                self.args.fwd_to_bwd_ratio = np.clip(self.args.fwd_to_bwd_ratio, a_min=min_rat, a_max=max_rat)
 
         metrics['Training Phase'] = self.phase
         metrics['Fwd to Bwd Ratio'] = self.args.fwd_to_bwd_ratio
+
+    def phase1to2(self, ema_model, gfn_model, name, step_ind):
+        print("Hit initial KLD threshold. Moving to backward thermalization.")
+        self.hit_init_kld = True
+        "adjust loss coefficients"
+        self.args.bwd_loss_coeffs.bwd_tb_z = 1.0
+        self.args.bwd_loss_schedule['tb'] = [(0, 1.0), (step_ind, 0.0),
+                                             (step_ind + self.args.phase_change_time, 1.0)]
+        self.args.bwd_loss_schedule['mle'] = [(0, 1.0), (step_ind, 1),
+                                              (step_ind + self.args.phase_change_time, 0.0)]
+        self.args.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 1.0)]
+        self.args.bwd_loss_schedule['noised_fraction'] = [(0, 1.0), (step_ind, self.args.anchor_noise_fraction)]
+        self.args.bwd_loss_schedule['noise_level'] = [(0, 1.0), (step_ind, self.args.anchor_noise_level)]
+        "set cooldowns"
+        self.increasing_loss_cooldown = self.args.phase_change_time  # give it time to adjust to new loss landscape
+        "save checkpoint"
+        torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train_hit_prior.pt')
+        torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval_hit_prior.pt')
+        self.phase = 2
+
+
+    def phase2to3(self, ema_model, gfn_model, init_rat, name, step_ind):
+        print("Thermalization complete. Moving to forward training & refinement.")
+        self.phase = 3
+        "save checkpoint"
+        torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train_thermalized.pt')
+        torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval_thermalized.pt')
+        "adjust loss and balancing coefficients"
+        self.args.fwd_to_bwd_ratio = init_rat
+        self.args.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 0)]
+        self.args.fwd_loss_schedule['tb'] = [(0, 1.0), (step_ind, 0.0),
+                                             (step_ind + self.args.phase_change_time // 2, 1.0)]
+        "set cooldown"
+        self.increasing_loss_cooldown = self.args.phase_change_time
+        self.grow_buffer = True
 
 
 if __name__ == '__main__':

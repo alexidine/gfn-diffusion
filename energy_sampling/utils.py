@@ -261,11 +261,11 @@ def triangle_schedule(it, init, maxval, minval, on, off):
 
 @torch.no_grad()
 def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 500,
-                      max_z_prime: int = 1, uma_path: Optional[str] = None,):
-
+                      max_z_prime: int = 1, uma_path: Optional[str] = None, ):
     silus = []
     ljs = []
     qljs = []
+    eljs = []
     niggli_overlaps = []
     gas_umas = []
     cry_umas = []
@@ -274,7 +274,6 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
     if energy_function == 'uma':
         uma_predictor = init_uma_crystal_predictor(uma_path, device=device)
 
-
     cursor = 0
     pbar = tqdm(total=len(dataset), unit="reparameterized samples")
 
@@ -282,11 +281,12 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
         try:
             crystal_batch = collate_data_list(
                 [dataset[ind] for ind in range(cursor, min(len(dataset), cursor + batch_size))])
-            crystal_batch = crystal_batch#.to(device)
+            crystal_batch = crystal_batch  # .to(device)
 
             if energy_function == 'uma':
                 cry_umas.extend(crystal_batch.compute_crystal_uma(
-                    predictor=uma_predictor, std_orientation=True).cpu().detach() * 96.485)  # output in kJ/mol (of unit cells)
+                    predictor=uma_predictor,
+                    std_orientation=True).cpu().detach() * 96.485)  # output in kJ/mol (of unit cells)
                 gas_umas.extend(crystal_batch.compute_lattice_gas_phase_uma(
                     predictor=uma_predictor, std_orientation=True).cpu().detach() * 96.485)
             else:
@@ -294,7 +294,7 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
                 gas_umas.extend(torch.ones(crystal_batch.num_graphs, dtype=torch.float32, device='cpu'))
 
             crystal_batch.box_analysis()
-            out = crystal_batch.analyze(['lj', 'qlj', 'silu', 'niggli'],
+            out = crystal_batch.analyze(['lj', 'qlj', 'elj','silu', 'niggli'],
                                         cutoff=cutoff,
                                         supercell_size=5,
                                         std_orientation=True)
@@ -302,6 +302,7 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
             silus.extend(out['silu'].cpu().detach())
             ljs.extend(out['lj'].cpu().detach())
             qljs.extend(out['qlj'].cpu().detach())
+            eljs.extend(out['elj'].cpu().detach())
             niggli_overlaps.extend(out['niggli'].cpu().detach())
 
             cursor += batch_size
@@ -322,6 +323,7 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
     silus = torch.tensor(silus)
     ljs = torch.tensor(ljs)
     qljs = torch.tensor(qljs)
+    eljs = torch.tensor(eljs)
     gas_umas = torch.tensor(gas_umas)
     cry_umas = torch.tensor(cry_umas)
     niggli_overlaps = torch.tensor(niggli_overlaps)
@@ -329,6 +331,7 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
         elem.silu_pot = torch.ones(1) * silus[ind]
         elem.lj_pot = torch.ones(1) * ljs[ind]
         elem.qlj_pot = torch.ones(1) * qljs[ind]
+        elem.elj_pot = torch.ones(1) * eljs[ind]
         elem.niggli_overlap = torch.ones(1) * niggli_overlaps[ind]
         elem.scaled_lj_pot = torch.ones(1) * log_rescale_positive(ljs[ind])
         elem.uma_gas_pot = torch.ones(1) * gas_umas[ind]
@@ -573,7 +576,6 @@ def iter_forever(loader):
     while True:
         for batch in loader:
             yield batch
-
 
 
 def is_cuda_oom(e: Exception) -> bool:

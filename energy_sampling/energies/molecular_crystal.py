@@ -57,6 +57,7 @@ class MolecularCrystal(BaseSet):
                  z_primes: Tuple[int] = (1,),
                  uma_path: Optional[str] = None,
                  reward_range: float = None,
+                 lj_rescale: list = None,
                  ):
 
         super(MolecularCrystal, self).__init__()
@@ -80,6 +81,7 @@ class MolecularCrystal(BaseSet):
         self.z_primes = z_primes
         self.zp_conditioning = zp_conditioning
         self.reward_range = reward_range
+        self.lj_rescale = lj_rescale
         if self.energy_function == 'uma':
             self.uma_predictor = init_uma_crystal_predictor(uma_path, device=self.device)
 
@@ -112,9 +114,10 @@ class MolecularCrystal(BaseSet):
     def analyze_crystal_batch(self, x, mol_batch, return_batch=False):  # x is gfn_outputs
         crystal_batch = self.instantiate_crystals(x, mol_batch)
 
-        if self.energy_function not in ['lj', 'qlj', 'silu', 'uma']:
+        if self.energy_function not in ['lj', 'qlj','elj', 'silu', 'uma']:  # todo simplify all these energies
             lj_energy = torch.zeros(crystal_batch.num_graphs, device=self.device)
             qlj_energy = torch.zeros_like(lj_energy)
+            elj_energy = torch.zeros_like(lj_energy)
             normed_lj_energy = torch.zeros_like(lj_energy)
             silu_energy = torch.zeros_like(lj_energy)
             niggli_overlap = torch.zeros_like(lj_energy)
@@ -122,12 +125,13 @@ class MolecularCrystal(BaseSet):
         else:
             cutoff = 10
 
-            out = crystal_batch.analyze(['lj', 'qlj', 'silu', 'niggli'],
+            out = crystal_batch.analyze(['lj', 'qlj', 'elj','silu', 'niggli'],
                                         cutoff=cutoff,
                                         supercell_size=5,
                                         std_orientation=False)
             lj_energy = out['lj']
             qlj_energy = out['qlj']
+            elj_energy = out['elj']
             normed_lj_energy = log_rescale_positive(lj_energy, 0)
             silu_energy = out['silu']
             niggli_overlap = out['niggli']
@@ -144,9 +148,11 @@ class MolecularCrystal(BaseSet):
             else:
                 uma_energy = torch.zeros_like(lj_energy)
 
+        # todo this is getting silly
         crystal_batch.add_graph_attr(silu_energy, 'silu_pot')
         crystal_batch.add_graph_attr(lj_energy, 'lj_pot')
         crystal_batch.add_graph_attr(qlj_energy, 'qlj_pot')
+        crystal_batch.add_graph_attr(elj_energy, 'elj_pot')
         crystal_batch.add_graph_attr(niggli_overlap, 'niggli_overlap')
         crystal_batch.add_graph_attr(normed_lj_energy, 'scaled_lj_pot')
         crystal_batch.add_graph_attr(uma_energy, 'uma_pot')
@@ -180,12 +186,14 @@ class MolecularCrystal(BaseSet):
         if self.max_z_prime > 1:
             bounding_energy = self.compute_zp_order_penalty(bounding_energy, crystal_batch)
 
-        if self.energy_function in ['lj', 'qlj', 'silu', 'uma']:
+        if self.energy_function in ['lj', 'qlj', 'elj','silu', 'uma']:
             density_energy = density_penalty(crystal_batch.packing_coeff)
             if self.energy_function == 'lj':
                 mol_energy = crystal_batch.lj_pot  # / crystal_batch.num_atoms
             elif self.energy_function == 'qlj':
                 mol_energy = crystal_batch.qlj_pot  # / crystal_batch.num_atoms
+            elif self.energy_function == 'elj':
+                mol_energy = crystal_batch.elj_pot
             elif self.energy_function == 'silu':
                 mol_energy = crystal_batch.silu_pot  # / crystal_batch.num_atoms
             elif self.energy_function == 'uma':
@@ -195,6 +203,11 @@ class MolecularCrystal(BaseSet):
                             crystal_batch.uma_pot / crystal_batch.sym_mult - gas_pot)  # the raw lattice energdy # / crystal_batch.num_atoms  # todo un-hardcode this when we fix it in the training set
             else:
                 assert False
+
+            if self.energy_function in ['lj','qlj','elj'] and self.lj_rescale is not None:
+                # rescale functions with LJ-type minima to uma statistics
+                lj_mean, lj_std, uma_mean, uma_std = self.lj_rescale
+                mol_energy = (mol_energy - lj_mean)/lj_std * uma_std + uma_mean
 
             niggli_energy = F.relu(-crystal_batch.niggli_overlap) ** 2  # punish negative overlaps
 
@@ -217,7 +230,7 @@ class MolecularCrystal(BaseSet):
         elif self.energy_function == 'crystal_multiharmonic':
             crystal_energy = self.crystal_multiharmonic_en(crystal_batch, latents)
 
-        elif self.energy_function in ['lj', 'qlj', 'silu', 'uma']:
+        elif self.energy_function in ['lj', 'qlj','elj', 'silu', 'uma']:
             crystal_energy = self.lj_coeff * mol_energy + self.density_coeff * density_energy
 
         else:
@@ -369,6 +382,7 @@ class MolecularCrystal(BaseSet):
             'silu_pot': zeros1,
             'lj_pot': zeros1,
             'qlj_pot': zeros1,
+            'elj_pot': zeros1,
             'scaled_lj_pot': zeros1,
             'niggli_overlap': zeros1,
             'T_fc': eye3,

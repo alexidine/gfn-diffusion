@@ -1,0 +1,120 @@
+defaults:
+  base: base.yaml
+
+#		○ Room & high T
+#		○ max rewards ranges, maybe 20, 40, 100
+#		○ UMA & eLJ
+#		x○ 256, 512, 1024 dim models
+
+experiments:
+- tag: 0
+  update:
+    energy_static_temperature: 2.5
+    thermalization_conv_eps: 1.0
+    btb_threshold: 2.0
+    bwd_overfit_threshold: 0.2
+    init_kld_threshold: 0.05
+    phase_change_time: 100
+    reward_range: 40
+    energy_function: uma
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
+
+- tag: 1
+  update:
+    energy_static_temperature: 2.5
+    thermalization_conv_eps: 1.0
+    btb_threshold: 2.0
+    bwd_overfit_threshold: 0.2
+    init_kld_threshold: 0.05
+    phase_change_time: 100
+    reward_range: 40
+    energy_function: uma
+    hidden_dim: 512
+    s_emb_dim: 512
+    condition_emb_dim: 512
+
+- tag: 2
+  update:
+    energy_static_temperature: 2.5
+    thermalization_conv_eps: 1.0
+    btb_threshold: 2.0
+    bwd_overfit_threshold: 0.2
+    init_kld_threshold: 0.05
+    phase_change_time: 100
+    reward_range: 40
+    energy_function: uma
+    hidden_dim: 256
+    s_emb_dim: 256
+    condition_emb_dim: 256
+
+- tag: 3
+  update:
+    energy_static_temperature: 10.0
+    thermalization_conv_eps: 1.0
+    btb_threshold: 2.0
+    bwd_overfit_threshold: 0.2
+    init_kld_threshold: 0.05
+    phase_change_time: 100
+    reward_range: 40
+    energy_function: uma
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
+
+- tag: 4
+  update:
+    energy_static_temperature: 2.5
+    thermalization_conv_eps: 1.0
+    btb_threshold: 2.0
+    bwd_overfit_threshold: 0.2
+    init_kld_threshold: 0.05
+    phase_change_time: 100
+    reward_range: 40
+    energy_function: elj
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
+
+- tag: 5
+  update:
+    energy_static_temperature: 10.0
+    thermalization_conv_eps: 1.0
+    btb_threshold: 2.0
+    bwd_overfit_threshold: 0.2
+    init_kld_threshold: 0.05
+    phase_change_time: 100
+    reward_range: 40
+    energy_function: elj
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
+
+- tag: 6
+  update:
+    energy_static_temperature: 2.5
+    thermalization_conv_eps: 1.0
+    btb_threshold: 2.0
+    bwd_overfit_threshold: 0.2
+    init_kld_threshold: 0.05
+    phase_change_time: 100
+    reward_range: 20
+    energy_function: uma
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
+
+- tag: 7
+  update:
+    energy_static_temperature: 2.5
+    thermalization_conv_eps: 1.0
+    btb_threshold: 2.0
+    bwd_overfit_threshold: 0.2
+    init_kld_threshold: 0.05
+    phase_change_time: 100
+    reward_range: 100
+    energy_function: uma
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
