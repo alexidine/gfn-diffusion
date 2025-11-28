@@ -106,3 +106,21 @@ experiments:
     energy_density_coeff: 100.0
     btb_threshold: 1.5
     reward_range: 100
+
+- tag: 1_restart
+  update:
+    energy_static_temperature: 2.5
+    thermalization_conv_eps: 0.5
+    checkpoint_path: /scratch/mk8347/projects/gfn_mxt/gfn-diffusion/energy_sampling/checkpoints/nic_12_1_train.pt
+    buffer_size: 50000
+    btb_threshold: 1.0
+    reward_range: 40
+
+- tag: 4_restart
+  update:
+    energy_static_temperature: 10
+    thermalization_conv_eps: 0.5
+    checkpoint_path: /scratch/mk8347/projects/gfn_mxt/gfn-diffusion/energy_sampling/checkpoints/nic_12_4_train.pt
+    buffer_size: 50000
+    btb_threshold: 1.0
+    reward_range: 20

@@ -129,7 +129,6 @@ def fwd_figs(buffer, flow_states,
         torch.abs(log_r - log_flow - log_pfs.sum(-1) + log_pbs.sum(-1)),
         'Reward',
         'TB Residual',
-
     )
     fig_dict['Lattice Latents Trajectories'] = visualize_latent_trajs(flow_states.cpu().detach().numpy(),
                                                                       20,

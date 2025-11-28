@@ -107,7 +107,6 @@ class MolecularCrystal(BaseSet):
     def instantiate_crystals(self, x, mol_batch):
         crystal_batch = self.init_blank_crystal_batch(mol_batch)
         crystal_batch.latent_to_cell_params(x)
-        crystal_batch.box_analysis()
         return crystal_batch
 
     def analyze_crystal_batch(self, x, mol_batch, return_batch=False):  # x is gfn_outputs
