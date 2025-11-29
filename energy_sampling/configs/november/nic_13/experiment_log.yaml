@@ -118,3 +118,63 @@
   - s_emb_dim
   - condition_emb_dim
   notes: ''
+- index: 8
+  tag: 8
+  update_keys:
+  - energy_static_temperature
+  - thermalization_conv_eps
+  - btb_threshold
+  - bwd_overfit_threshold
+  - init_kld_threshold
+  - phase_change_time
+  - reward_range
+  - energy_function
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  notes: ''
+- index: 9
+  tag: 9
+  update_keys:
+  - energy_static_temperature
+  - thermalization_conv_eps
+  - btb_threshold
+  - bwd_overfit_threshold
+  - init_kld_threshold
+  - phase_change_time
+  - reward_range
+  - energy_function
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  notes: ''
+- index: 10
+  tag: 10
+  update_keys:
+  - energy_static_temperature
+  - thermalization_conv_eps
+  - btb_threshold
+  - bwd_overfit_threshold
+  - init_kld_threshold
+  - phase_change_time
+  - reward_range
+  - energy_function
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  notes: ''
+- index: 11
+  tag: 11
+  update_keys:
+  - energy_static_temperature
+  - thermalization_conv_eps
+  - btb_threshold
+  - bwd_overfit_threshold
+  - init_kld_threshold
+  - phase_change_time
+  - reward_range
+  - energy_function
+  - hidden_dim
+  - s_emb_dim
+  - condition_emb_dim
+  notes: ''

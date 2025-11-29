@@ -118,3 +118,60 @@ experiments:
     hidden_dim: 1024
     s_emb_dim: 1024
     condition_emb_dim: 1024
+
+- tag: 8
+  update:
+    energy_static_temperature: 2.5
+    thermalization_conv_eps: 0.75
+    btb_threshold: 2.0
+    bwd_overfit_threshold: 0.2
+    init_kld_threshold: 0.05
+    phase_change_time: 100
+    reward_range: 100
+    energy_function: uma
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
+
+- tag: 9
+  update:
+    energy_static_temperature: 2.5
+    thermalization_conv_eps: 1.0
+    btb_threshold: 1.5
+    bwd_overfit_threshold: 0.2
+    init_kld_threshold: 0.05
+    phase_change_time: 100
+    reward_range: 100
+    energy_function: uma
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
+
+
+- tag: 10
+  update:
+    energy_static_temperature: 2.5
+    thermalization_conv_eps: 0.75
+    btb_threshold: 2.0
+    bwd_overfit_threshold: 0.2
+    init_kld_threshold: 0.05
+    phase_change_time: 100
+    reward_range: 100
+    energy_function: elj
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
+
+- tag: 11
+  update:
+    energy_static_temperature: 2.5
+    thermalization_conv_eps: 1.0
+    btb_threshold: 1.5
+    bwd_overfit_threshold: 0.2
+    init_kld_threshold: 0.05
+    phase_change_time: 100
+    reward_range: 100
+    energy_function: elj
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
