@@ -2,10 +2,10 @@ run_name: 'mk_local_dev'
 tag: 'dev'
 seed: 12345
 device: 'cuda'
-lr_policy: 1.0e-4              # learning rate of the policy network
+lr_policy: 5.0e-4              # learning rate of the policy network
 min_lr: 1.0e-6                # ihn
 lr_flow: 10.0e-0                  # learning rate of the flow network
-lr_back: 1.0e-4                # learning rate of the backward pass
+lr_back: 5.0e-4                # learning rate of the backward pass
 lr_warmup_ratio: 10           # how much smaller the initial (warmup) LR should be than the max policy value
 scheduler: True               # does LR warmup from lr/lr_warup_ratio -> lr -> min_lr over the warmup and annealing period
 lr_warmup_time: 500
@@ -86,8 +86,7 @@ bwd_loss_coeffs:
 anchor_fwd_bwd: true  # whether to do this at all
 btb_threshold: 2.0 # ratio of thermalization_conv_eps at which we activate emergency bwd training
 phase_change_time: 100  # time to adjust loss coefficients between phases
-thermalization_conv_eps: 1.0
-bwd_overfit_threshold: 0.5
+thermalization_conv_eps: 0.5
 init_kld_threshold: 0.1
 anchor_noise_fraction: 0.0
 anchor_noise_level: 0.0
@@ -128,7 +127,7 @@ buffer_dist_cutoff: 0.25
 prioritized: null #"boltzmann"   # three kinds of replay training: random, reward prioritized (Boltzmann), rank-based
 sampling: "buffer"  # no alternative for right now
 buffer_size: 20000          # size of replay buffer
-grow_buffer: false  # can be toggled on or off in certain training modes
+grow_buffer: true  # can be toggled on or off in certain training modes
 
 # exploration controls
 ################################################################

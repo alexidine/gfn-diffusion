@@ -65,6 +65,7 @@ class Modeller:
         self.forward_batch_size = self.args.batch_size
         self.backward_batch_size = self.args.batch_size
         self.phase = 1
+        self.fwd_tb_norm = 10
 
     def train_logic(self, buffer, it):
         do_forward = False
@@ -154,7 +155,7 @@ class Modeller:
         if step_type == "Forward":
             if self.forward_batch_size < self.args.max_fwd_batch_size:
                 new_batch_size = min(self.args.max_fwd_batch_size, max(self.forward_batch_size + 1,
-                                                                   int(self.forward_batch_size * batch_growth_increment)))
+                                                                       int(self.forward_batch_size * batch_growth_increment)))
                 self.forward_batch_size = new_batch_size  # gradually increment batch size
 
                 if len(buffer) > 0:
@@ -179,7 +180,7 @@ class Modeller:
         elif step_type == "Backward":
             if self.backward_batch_size < self.args.max_bwd_batch_size:
                 new_batch_size = min(self.args.max_bwd_batch_size, max(self.backward_batch_size + 1,
-                                                                   int(self.backward_batch_size * batch_growth_increment)))
+                                                                       int(self.backward_batch_size * batch_growth_increment)))
                 self.backward_batch_size = new_batch_size  # gradually increment batch size
 
         return buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator
@@ -572,13 +573,14 @@ class Modeller:
         oomed_out = False
         fwd_loss, bwd_loss = 0, 0
         loss_record = []
+        loss_dict_record = []
 
         self.times['initialization_end'] = time()
 
-        with wandb.init(project="GFN Energy",
-                        config=flatten_wandb_params(self.args),
-                        name=name,
-                        tags=[self.args.tag]):
+        with (wandb.init(project="GFN Energy",
+                         config=flatten_wandb_params(self.args),
+                         name=name,
+                         tags=[self.args.tag])):
 
             wandb.watch(gfn_model,
                         log_graph=False,
@@ -611,7 +613,9 @@ class Modeller:
                         exploration_std,
                         buffer,
                         train_iterator,
-                        repeats=self.args.repeats
+                        repeats=self.args.repeats,
+                        ema_model=ema_model,
+                        name=name
                     )
                     if self.args.ema_decay is not None:
                         update_ema(gfn_model, ema_model, decay=self.args.ema_decay)
@@ -628,7 +632,8 @@ class Modeller:
                             bwd_loss_dict = loss_dict
 
                     if not oomed_out and self.args.grow_batch_size:
-                        buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator = self.increment_batch_size(
+                        (buffer, train_mol_loader, test_mol_loader,
+                         train_iterator, test_iterator) = self.increment_batch_size(
                             buffer, train_mol_loader,
                             test_mol_loader,
                             self.args.batch_growth_increment,
@@ -658,15 +663,9 @@ class Modeller:
 
                 # train monitoring
                 if step_ind % 10 == 0:
-                    if bwd_loss_dict is not None:  # dynamic quality management
-                        metric = bwd_loss_dict['Backward_loss/normed_tb']
-                        if self.phase == 2: # catch backwards convergence IMMEDIATELY
-                            if  metric < self.args.thermalization_conv_eps:
-                                self.phase2to3(ema_model, gfn_model, 1000, name, step_ind)
-                        if metric < self.args.bwd_overfit_threshold:
-                            self.reload_running_model(ema_model, gfn_model, name)
-
                     loss_record.append(fwd_loss + bwd_loss)
+                    beta = 0.9
+                    self.fwd_tb_norm = float(self.fwd_tb_norm * beta + (1-beta) * fwd_loss_dict['Forward_loss/normed_tb'])
                     metrics['train/expl'] = exploration_std(0) if exploration_std is not None else 0
                     lr = self.step_lr_schedule(schedulers, optimizers)
                     self.anneal_reward(step_ind, temp_annealing_lambda, energy_function)
@@ -710,7 +709,8 @@ class Modeller:
             diffs = torch.diff(losses, dim=0)
 
             hit_threshold = current_loss > threshold  # loss exploding
-            increasing_loss = (torch.mean((diffs[-grace_time:] > 0).float()) > 0.8) and self.increasing_loss_cooldown <= 0  # loss slowly increasing
+            increasing_loss = (torch.mean((diffs[
+                                               -grace_time:] > 0).float()) > 0.8) and self.increasing_loss_cooldown <= 0  # loss slowly increasing
 
             if hit_threshold or increasing_loss:
                 print("Losses increasing! Reloading best checkpoint and slashing LR.")
@@ -760,7 +760,9 @@ class Modeller:
                    exploration_std,
                    buffer,
                    mol_iterator,
-                   repeats):
+                   repeats,
+                   ema_model,
+                   name):
         if step_type == "Forward":
             do_forward = True
             do_backward = False
@@ -770,10 +772,10 @@ class Modeller:
         else:
             assert False
 
-        if it % 21 == 0:
+        if True: #it % 21 == 0:
             report_losses = True
-        else:
-            report_losses = False
+        #else:
+        #    report_losses = False
 
         discretizer = self.get_discretizer()
 
@@ -813,16 +815,23 @@ class Modeller:
         else:
             assert False
 
-        loss.backward()
         clean_loss = loss.item()
-        torch.nn.utils.clip_grad_norm_(gfn_model.parameters(),
-                                       self.args.gradient_norm_clip)  # gradient clipping
-        if do_forward:
-            optimizers['fwd'].step()
-            optimizers['flow'].step()
-        elif do_backward:
-            optimizers['bwd'].step()
-            optimizers['flow'].step()
+
+        if self.phase >= 2 and do_backward:
+            metric = loss_dict['normed_tb']
+            if metric < self.args.thermalization_conv_eps and self.phase == 2:
+                self.phase2to3(ema_model, gfn_model, 1, name, it)
+
+            # block backwards grads if loss is too good
+            threshold = self.args.thermalization_conv_eps #min(self.args.thermalization_conv_eps * self.args.btb_threshold, self.fwd_tb_norm*0.75)
+            if metric < threshold:
+                self.args.fwd_to_bwd_ratio *= 1.05  # push it away
+                pass  # do not step the bwd loss if we are below the desired threshold
+            else:
+                self.step_loss(do_backward, do_forward, gfn_model, loss, optimizers)
+
+        else:
+            self.step_loss(do_backward, do_forward, gfn_model, loss, optimizers)
 
         if report_losses:
             loss_dict_cpu = {step_type + "_loss/" + key: value.cpu().detach().numpy() for key, value in
@@ -833,6 +842,17 @@ class Modeller:
         del loss, loss_dict  # or whatever is large
 
         return clean_loss, loss_dict_cpu
+
+    def step_loss(self, do_backward, do_forward, gfn_model, loss, optimizers):
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(gfn_model.parameters(),
+                                       self.args.gradient_norm_clip)  # gradient clipping
+        if do_forward:
+            optimizers['fwd'].step()
+            optimizers['flow'].step()
+        elif do_backward:
+            optimizers['bwd'].step()
+            optimizers['flow'].step()
 
     def fwd_train_step(self, energy_function, gfn_model, discretizer,
                        exploration_std, mol_batch, return_exp=False,
@@ -1017,24 +1037,24 @@ class Modeller:
         dataset = [dataset[ind] for ind in good_inds]
 
         # filter near-identical samples
-        d_cut = 0.01
-        latents = collate_data_list(dataset).latent_params()
-        dmat = torch.cdist(latents, latents)
-        keep = torch.zeros(len(latents), dtype=bool, device=latents.device)
-
-        for i in range(len(latents)):
-            # check if this point is far from all previously kept points
-            if not (dmat[i, keep] < d_cut).any():
-                keep[i] = True
-
-        keep_inds = torch.arange(len(latents), device=latents.device)[keep]
-        dataset = [dataset[ind] for ind in keep_inds]
+        # d_cut = 0.01
+        # latents = collate_data_list(dataset).latent_params()
+        # dmat = torch.cdist(latents, latents)
+        # keep = torch.zeros(len(latents), dtype=bool, device=latents.device)
+        #
+        # for i in range(len(latents)):
+        #     # check if this point is far from all previously kept points
+        #     if not (dmat[i, keep] < d_cut).any():
+        #         keep[i] = True
+        #
+        # keep_inds = torch.arange(len(latents), device=latents.device)[keep]
+        # dataset = [dataset[ind] for ind in keep_inds]
 
         # # todo remove!!
-        if 'D:' in self.args.buffer_path and self.args.energy_function == 'uma': # if we're on local, this takes forever
+        if 'D:' in self.args.buffer_path and self.args.energy_function == 'uma':  # if we're on local, this takes forever
             dataset = dataset[:500]
 
-        if self.args.energy_function in ['silu', 'lj', 'qlj', 'elj','uma']:  # reparameterize incoming samples
+        if self.args.energy_function in ['silu', 'lj', 'qlj', 'elj', 'uma']:  # reparameterize incoming samples
             print("Re-featurizing preloaded buffer samples")
             dataset = featurize_dataset(dataset,
                                         self.device,
@@ -1237,22 +1257,23 @@ class Modeller:
             #         self.phase2to3(ema_model, gfn_model, min_rat, name, step_ind)
 
         if self.phase == 3:
-            "get metrics"
-            # if we have hit it, dynamically adjust fwd_to_bwd_ratio to keep it under the threshold based on the minimum original value
             err_fwd = metrics['Normed TB Residual']
             err_bwd = metrics['Bwd Normed TB Residual']
-            bwd_ceiling = self.args.thermalization_conv_eps * self.args.btb_threshold  # bwd metric must not exceed this value
-            bwd_overfit_flag = (err_bwd < self.args.bwd_overfit_threshold) and (err_fwd > self.args.bwd_overfit_threshold * 3)
+            bwd_ceiling = self.args.thermalization_conv_eps * self.args.btb_threshold
+            ratio = self.args.fwd_to_bwd_ratio
 
-            if err_bwd < bwd_ceiling:  # dynamically balance forward and backward
-                coeff = 0.2
-                imbalance = err_fwd - err_bwd
-                self.args.fwd_to_bwd_ratio *= np.exp(coeff * imbalance)
-                self.args.fwd_to_bwd_ratio = np.clip(self.args.fwd_to_bwd_ratio, a_min=min_rat, a_max=max_rat)
+            # --- 1. Backward constraint: if violated, immediately suppress forward ---
+            if err_bwd > bwd_ceiling:
+                # Violating constraint → reduce forward contribution
+                ratio *= 0.5
 
-            if err_bwd > bwd_ceiling:  # re-emphasize backward if we are losing it
-                self.args.fwd_to_bwd_ratio /= 2
-                self.args.fwd_to_bwd_ratio = np.clip(self.args.fwd_to_bwd_ratio, a_min=min_rat, a_max=max_rat)
+            # --- 2. If backward is safe, we are free to minimize err_fwd ---
+            else:
+                coeff = 0.1
+                ratio *= min(2, np.exp(coeff * err_fwd))
+
+            # Clip and store
+            self.args.fwd_to_bwd_ratio = np.clip(ratio, a_min=min_rat, a_max=max_rat)
 
         metrics['Training Phase'] = self.phase
         metrics['Fwd to Bwd Ratio'] = self.args.fwd_to_bwd_ratio
@@ -1275,7 +1296,6 @@ class Modeller:
         torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train_hit_prior.pt')
         torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval_hit_prior.pt')
         self.phase = 2
-
 
     def phase2to3(self, ema_model, gfn_model, init_rat, name, step_ind):
         print("Thermalization complete. Moving to forward training & refinement.")

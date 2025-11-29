@@ -199,6 +199,10 @@ def get_gfn_forward_loss(loss_coeffs,
             loss_dict['reinforce'] = reinforce_loss.mean().detach()
         if loss_coeffs.tb > 0:
             loss_dict['tb'] = tb_loss.mean().detach()
+            X_side = log_pf - log_pb
+            Y_side = log_r - log_flow
+            normed_tb_residual = (X_side - Y_side).abs() / Y_side.abs()
+            loss_dict['normed_tb'] = normed_tb_residual.mean().detach()
         if loss_coeffs.vg_lb > 0:
             loss_dict['vg_lb'] = vg_loss.mean().detach()
         if loss_coeffs.vg_lme > 0:
