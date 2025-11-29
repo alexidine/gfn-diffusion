@@ -12,7 +12,7 @@ bounding_coeff: 10.0
 btb_threshold: 1.5
 buffer_dist_cutoff: 0.25
 buffer_path: /scratch/mk8347/csd_runs/datasets/nic_2_zp1.pt
-buffer_size: 25000
+buffer_size: 40000
 bwd: false
 bwd_loss_coeffs:
   bwd_tb_z: 2.0
