@@ -77,7 +77,7 @@ def cluster_samples(samples_to_fit, energies_to_fit, beta: float = 0.001, bw=0.1
     return sample_embedding, cluster_assignments, labels, anchor_inds, (x_min, x_max, y_min, y_max)
 
 
-energies = batch.lj_pot
+energies = batch.lj
 
 sample_embedding, cluster_assignments, labels, anchor_inds, watershed_range = \
     cluster_samples(batch.latent_params(), energies, beta=1.0, bw=0.1)

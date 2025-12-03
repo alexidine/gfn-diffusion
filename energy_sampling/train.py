@@ -65,7 +65,10 @@ class Modeller:
         self.forward_batch_size = self.args.batch_size
         self.backward_batch_size = self.args.batch_size
         self.phase = 1
-        self.fwd_tb_norm = 10
+        self.fwd_tb_norm = None
+        self.bwd_tb_norm = None
+        self.last_fwd_it = 0
+        self.last_bwd_it = 0
 
     def train_logic(self, buffer, it):
         do_forward = False
@@ -205,6 +208,9 @@ class Modeller:
         metrics.update({'lr_fwd': optimizers['fwd'].param_groups[0]['lr']})
         metrics.update({'lr_bwd': optimizers['bwd'].param_groups[0]['lr']})
         metrics.update({'lr_flow': optimizers['flow'].param_groups[0]['lr']})
+        metrics['Fwd to Bwd Ratio'] = self.args.fwd_to_bwd_ratio
+        metrics['Rolling fTB Norm'] = self.fwd_tb_norm
+        metrics['Rolling bTB Norm'] = self.bwd_tb_norm
         metrics.update(self.log_elapsed_times())
         metrics['Forward Loss'] = fwd_loss
         metrics['Backward Loss'] = bwd_loss
@@ -573,7 +579,6 @@ class Modeller:
         oomed_out = False
         fwd_loss, bwd_loss = 0, 0
         loss_record = []
-        loss_dict_record = []
 
         self.times['initialization_end'] = time()
 
@@ -664,8 +669,6 @@ class Modeller:
                 # train monitoring
                 if step_ind % 10 == 0:
                     loss_record.append(fwd_loss + bwd_loss)
-                    beta = 0.9
-                    self.fwd_tb_norm = float(self.fwd_tb_norm * beta + (1-beta) * fwd_loss_dict['Forward_loss/normed_tb'])
                     metrics['train/expl'] = exploration_std(0) if exploration_std is not None else 0
                     lr = self.step_lr_schedule(schedulers, optimizers)
                     self.anneal_reward(step_ind, temp_annealing_lambda, energy_function)
@@ -772,11 +775,6 @@ class Modeller:
         else:
             assert False
 
-        if True: #it % 21 == 0:
-            report_losses = True
-        #else:
-        #    report_losses = False
-
         discretizer = self.get_discretizer()
 
         optimizers['flow'].zero_grad(set_to_none=True)
@@ -797,9 +795,10 @@ class Modeller:
                 mol_batch,
                 return_exp=True,
                 repeats=repeats,
-                report_losses=report_losses
+                report_losses=True
             )
-            if energy_function.energy_function == 'uma':  # save expensive stuff
+            if self.grow_buffer: #energy_function.energy_function == 'uma':  # save expensive stuff
+                del crystal_batch.symmetry_operators, crystal_batch.gfn_energy
                 buffer.add_to_staging(data_batch=crystal_batch)
             del crystal_batch
 
@@ -811,37 +810,80 @@ class Modeller:
                 buffer,
                 energy_function,
                 repeats=repeats,
-                report_losses=report_losses)
+                report_losses=True)
         else:
             assert False
 
         clean_loss = loss.item()
+        T = 25  # effective target update time
+        if do_forward and loss_dict is not None:
+            if self.fwd_tb_norm is None:
+                self.fwd_tb_norm = float(loss_dict['normed_tb'])
+            else:
+                dt = it - self.last_fwd_it
+                beta_fwd = np.exp(-dt / T)
+                self.fwd_tb_norm = float(
+                    self.fwd_tb_norm * beta_fwd + (1 - beta_fwd) * loss_dict['normed_tb'])
+            self.last_fwd_it = it
 
-        if self.phase >= 2 and do_backward:
-            metric = loss_dict['normed_tb']
-            if metric < self.args.thermalization_conv_eps and self.phase == 2:
+        if do_backward and loss_dict is not None:
+            if self.bwd_tb_norm is None:
+                self.bwd_tb_norm = float(loss_dict['normed_tb'])
+            else:
+                dt = it - self.last_bwd_it
+                beta_bwd = np.exp(-dt / T)
+                self.bwd_tb_norm = float(
+                    self.bwd_tb_norm * beta_bwd + (1 - beta_bwd) * np.nan_to_num(loss_dict['normed_tb'].cpu().detach(), posinf=self.bwd_tb_norm))
+            self.last_bwd_it = it
+
+        skip_step = False
+        if self.phase == 2:
+            if self.bwd_tb_norm <= self.args.thermalization_conv_eps:  # hit stage 2 convergence criteria
                 self.phase2to3(ema_model, gfn_model, 1, name, it)
 
-            # block backwards grads if loss is too good
-            threshold = self.args.thermalization_conv_eps #min(self.args.thermalization_conv_eps * self.args.btb_threshold, self.fwd_tb_norm*0.75)
-            if metric < threshold:
-                self.args.fwd_to_bwd_ratio *= 1.05  # push it away
-                pass  # do not step the bwd loss if we are below the desired threshold
-            else:
-                self.step_loss(do_backward, do_forward, gfn_model, loss, optimizers)
+        if self.phase == 3:
+            skip_step = self.update_controller(it, do_backward, skip_step)
 
-        else:
+        if not skip_step:
             self.step_loss(do_backward, do_forward, gfn_model, loss, optimizers)
 
-        if report_losses:
-            loss_dict_cpu = {step_type + "_loss/" + key: value.cpu().detach().numpy() for key, value in
-                             loss_dict.items()}
-        else:
-            loss_dict_cpu = None
+        loss_dict_cpu = {step_type + "_loss/" + key: value.cpu().detach().numpy() for key, value in
+                         loss_dict.items()}
 
         del loss, loss_dict  # or whatever is large
 
         return clean_loss, loss_dict_cpu
+
+    def update_controller(self, it, do_backward, skip_step):
+        update_this_step = it % 20 == 0
+        bwd_ceil = min(self.args.thermalization_conv_eps * self.args.btb_threshold,
+                       self.fwd_tb_norm * self.args.btb_threshold)
+        bwd_floor = min(self.args.thermalization_conv_eps, self.fwd_tb_norm)
+        bwd_target = (bwd_ceil + bwd_floor) / 2
+        metric = self.bwd_tb_norm
+        coeff = 0.2
+        err = (metric - bwd_target) / bwd_target  # if metric is large
+
+        if metric > bwd_ceil:
+            if update_this_step:
+                self.args.fwd_to_bwd_ratio /= max(1.2, np.exp(coeff * err))
+                #print(f"Firing ceil {metric:.2f}:{bwd_target:.2f}")
+        elif metric < bwd_floor:
+            if update_this_step:
+                # this won't ameliorate below a good threshold - so just set it
+                self.args.fwd_to_bwd_ratio = max(1.5, self.args.fwd_to_bwd_ratio)
+                self.args.fwd_to_bwd_ratio *= 1.2
+                #print(f"Firing floor {metric:.2f}:{bwd_target:.2f}")
+            if do_backward:
+                skip_step = True  # we're already doing too good
+        elif update_this_step:
+            self.args.fwd_to_bwd_ratio *= np.exp(-coeff * err)  # this is very negative -> pushes towards bwd, which is good
+
+        self.args.fwd_to_bwd_ratio = np.clip(
+            self.args.fwd_to_bwd_ratio, 0.1, 10)  # need even enough ratios to get reasonable updates to the metrics
+
+
+        return skip_step
 
     def step_loss(self, do_backward, do_forward, gfn_model, loss, optimizers):
         loss.backward()
@@ -887,9 +929,11 @@ class Modeller:
             assert False, f"sampling method {self.args.sampling} not implemented"
 
         if self.args.bwd_loss_coeffs.noised_fraction > 0:
-            condition, rewards, samples = substitute_prior(
+            condition, rewards, samples, crystal_batch = substitute_prior(
                 self.args.bwd_loss_coeffs, condition, crystal_batch,
                 energy_function, rewards, samples, buffer)
+            if self.grow_buffer:
+                buffer.add_to_staging(data_batch=crystal_batch.cpu().detach())
 
         return get_gfn_backward_loss(self.args.bwd_loss_coeffs,
                                      samples.to(self.device),
@@ -954,10 +998,6 @@ class Modeller:
             raise e  # will simply raise error if other or if training on CPU
         return oomed_out, buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator
 
-    def do_evaluation(self, energy_function, buffer, gfn_model, i, mol_loader,
-                      override_do_figures: Optional[bool] = None):
-
-        return eval_metrics
 
     def do_conditional_evaluation(self, energy_function, gfn_model, mol_loader,
                                   ):  # todo these functions could be cleaned up / consolidated
@@ -999,11 +1039,16 @@ class Modeller:
                                   override_random_rotations=random_rotations)
         mol_batch.embedding = mol_batch.rotate_embedding(random_rotations)
 
-    def add_dataset_to_buffer(self, dataset_path, buffer,
+    def add_dataset_to_buffer(self,
+                              dataset_path, buffer,
                               filter_unbound=True,
                               ):
         print("Loading prebuilt buffer")
         dataset = torch.load(dataset_path, weights_only=False)
+        for elem in dataset:
+            elem.lj = elem.lj_pot  # todo remove this later
+            del elem.lj_pot
+
         if 'nic_14_zp1.pt' in dataset_path:
             dataset = [elem for elem in dataset if
                        elem.identifier == 'NICOAM']  # TODO delete - some confusion in this dataset around conformations
@@ -1037,33 +1082,38 @@ class Modeller:
         dataset = [dataset[ind] for ind in good_inds]
 
         # filter near-identical samples
-        # d_cut = 0.01
-        # latents = collate_data_list(dataset).latent_params()
-        # dmat = torch.cdist(latents, latents)
-        # keep = torch.zeros(len(latents), dtype=bool, device=latents.device)
-        #
-        # for i in range(len(latents)):
-        #     # check if this point is far from all previously kept points
-        #     if not (dmat[i, keep] < d_cut).any():
-        #         keep[i] = True
-        #
-        # keep_inds = torch.arange(len(latents), device=latents.device)[keep]
-        # dataset = [dataset[ind] for ind in keep_inds]
+        d_cut = 0.01
+        latents = collate_data_list(dataset).latent_params()
+        dmat = torch.cdist(latents, latents)
+        keep = torch.zeros(len(latents), dtype=bool, device=latents.device)
 
-        # # todo remove!!
+        for i in range(len(latents)):
+            # check if this point is far from all previously kept points
+            if not (dmat[i, keep] < d_cut).any():
+                keep[i] = True
+
+        keep_inds = torch.arange(len(latents), device=latents.device)[keep]
+        dataset = [dataset[ind] for ind in keep_inds]
+
+        # todo remove this eventually
         if 'D:' in self.args.buffer_path and self.args.energy_function == 'uma':  # if we're on local, this takes forever
             dataset = dataset[:500]
 
-        if self.args.energy_function in ['silu', 'lj', 'qlj', 'elj', 'uma']:  # reparameterize incoming samples
-            print("Re-featurizing preloaded buffer samples")
-            dataset = featurize_dataset(dataset,
-                                        self.device,
-                                        self.args.energy_function,
-                                        max_z_prime=max_z_prime,
-                                        uma_path=self.args.uma_path)
+        print("Re-featurizing preloaded buffer samples")
+        dataset = featurize_dataset(dataset,
+                                    self.device,
+                                    self.args.energy_function,
+                                    max_z_prime=max_z_prime,
+                                    uma_path=self.args.uma_path)
 
-        if filter_unbound:  # filter unbound states
-            dataset = [elem for elem in dataset if elem.lj_pot < 0]
+        # always filter awful crystals
+        dataset = [elem for elem in dataset if elem.niggli_overlap >= 0]
+        dataset = [elem for elem in dataset if elem.packing_coeff >= 0.55]
+        dataset = [elem for elem in dataset if elem.packing_coeff <= 0.95]
+
+        if filter_unbound:  # filter unbound states under this potential
+            en_func = self.args.energy_function
+            dataset = [elem for elem in dataset if elem[en_func] < 0]
 
         if self.args.molecule_conditioning:  # embed dataset
             assert max(self.args.z_primes) == 1, "Molecule conditioning not yet supported for Z'>1"
@@ -1091,6 +1141,89 @@ class Modeller:
         do_figs = step_ind % self.args.figs_period == 0
 
         '''fwd sampling'''
+        self.times['eval_sampling_start'] = time()
+        (flow_states, gauss_params_f, log_T_tensor, log_Z,
+         log_Z_lb, log_Z_learned, log_pbs, log_pfs, log_r, sample_batch) = self.eval_sampling(
+            buffer, energy_function, eval_discretizer, gfn_model, test_mol_loader)
+        self.times['eval_sampling_end'] = time()
+
+        self.times['eval_buffering_start'] = time()
+        buffer.incorporate_staging_buffer()
+
+        self.times['eval_buffering_end'] = time()
+
+        self.times['eval_log_metrics_start'] = time()
+        '''fwd analysis'''
+        metrics.update(log_metrics(energy_function, log_Z, log_Z_lb, log_Z_learned, log_r,
+                                   sample_batch, log_T_tensor, log_pfs, log_pbs, self.args, buffer))
+
+        self.times['eval_log_metrics_end'] = time()
+        self.times['eval_figs_start'] = time()
+        if do_figs:
+            # always sample from forward policy
+            fig_dict = fwd_figs(buffer,
+                                flow_states,
+                                log_Z_learned,
+                                log_pbs,
+                                log_pfs,
+                                log_r,
+                                gauss_params_f,
+                                sample_batch.detach().cpu(),
+                                )
+        else:
+            fig_dict = {}
+        self.times['eval_figs_end'] = time()
+
+        '''bwd sampling and analysis are combined'''
+        if self.args.both_ways or self.args.bwd:
+            init_state = get_gfn_init_state(self.args.eval_num_samples,
+                                            energy_function.data_ndim,
+                                            self.device)
+
+            self.times['eval_bwd_figs_start'] = time()
+            bwd_metrics, bwd_fig_dict = bwd_figs(
+                buffer, gfn_model,
+                init_state, eval_discretizer,
+                do_figs=do_figs)
+            self.times['eval_bwd_figs_end'] = time()
+            metrics.update(bwd_metrics)
+            fig_dict.update(bwd_fig_dict)
+
+        '''logging and wrap up'''
+        self.times['eval_wrapup_start'] = time()
+
+        if do_figs:
+            adjust_fig_filesize(fig_dict)
+            metrics.update(fig_dict)
+
+        gfn_model.train()
+
+        metrics.update({'Forward Batch Size': self.forward_batch_size})
+        metrics.update({'Backward Batch Size': self.backward_batch_size})
+        metrics.update({'Eval Batch Size': self.args.eval_batch_size})
+        metrics.update(self.log_elapsed_times())
+        self.times['eval_wrapup_end'] = time()
+
+        self.times['eval_step_end'] = time()
+
+        for key in metrics.keys():  # cleanup before logging
+            if isinstance(metrics[key], np.ndarray):
+                metrics[key] = np.nan_to_num(metrics[key])
+            elif torch.is_tensor(metrics[key]):
+                metrics[key] = torch.nan_to_num(metrics[key])
+
+        wandb.log(metrics, step=step_ind)
+
+        '''conditional sampling should be rewritten anyway '''  # TODO
+        # if self.args.molecule_conditioning or self.args.sg_conditioning or self.args.zp_conditioning:
+        #
+        #     if step_ind % self.args.conditional_eval_period == 0:  # make conditional sampling figures
+        #         conditional_metrics = self.do_conditional_evaluation(energy_function, gfn_model,
+        #                                                              test_mol_loader,
+        #                                                              )
+        #         metrics.update(conditional_metrics)
+
+    def eval_sampling(self, buffer, energy_function, eval_discretizer, gfn_model, test_mol_loader):
         flow_states_list = []
         eval_samples = []
         log_Z_list = []
@@ -1135,7 +1268,7 @@ class Modeller:
                 eval_samples.extend(sample_batch.batch_to_list())
 
                 if self.grow_buffer:
-                    buffer.add(data_list=sample_batch.detach().cpu().batch_to_list())
+                    buffer.add_to_staging(data_batch=sample_batch.cpu().detach())
 
             except (RuntimeError, ValueError) as e:
                 print(f"Caught error: {str(e)}")
@@ -1165,67 +1298,7 @@ class Modeller:
         for key in gauss_params_f_list[0].keys():
             gauss_params_f[key] = torch.cat([d[key] for d in gauss_params_f_list])
         sample_batch = collate_data_list(eval_samples, skip_default_exclusion=True)
-
-        '''fwd analysis'''
-        metrics.update(log_metrics(energy_function, log_Z, log_Z_lb, log_Z_learned, log_r,
-                                   sample_batch, log_T_tensor, log_pfs, log_pbs, self.args, buffer))
-
-        if do_figs:
-            # always sample from forward policy
-            fig_dict = fwd_figs(buffer,
-                                flow_states,
-                                log_Z_learned,
-                                log_pbs,
-                                log_pfs,
-                                log_r,
-                                gauss_params_f,
-                                sample_batch.detach().cpu(),
-                                )
-        else:
-            fig_dict = {}
-
-        '''bwd sampling and analysis are combined'''
-        if self.args.both_ways or self.args.bwd:
-            init_state = get_gfn_init_state(self.args.eval_num_samples,
-                                            energy_function.data_ndim,
-                                            self.device)
-            bwd_metrics, bwd_fig_dict = bwd_figs(
-                buffer, gfn_model,
-                init_state, eval_discretizer,
-                do_figs=do_figs)
-            metrics.update(bwd_metrics)
-            fig_dict.update(bwd_fig_dict)
-
-        '''logging and wrap up'''
-        if do_figs:
-            adjust_fig_filesize(fig_dict)
-            metrics.update(fig_dict)
-
-        gfn_model.train()
-
-        metrics.update({'Forward Batch Size': self.forward_batch_size})
-        metrics.update({'Backward Batch Size': self.backward_batch_size})
-        metrics.update({'Eval Batch Size': self.args.eval_batch_size})
-        metrics.update(self.log_elapsed_times())
-
-        self.times['eval_step_end'] = time()
-
-        for key in metrics.keys():  # cleanup before logging
-            if isinstance(metrics[key], np.ndarray):
-                metrics[key] = np.nan_to_num(metrics[key])
-            elif torch.is_tensor(metrics[key]):
-                metrics[key] = torch.nan_to_num(metrics[key])
-
-        wandb.log(metrics, step=step_ind)
-
-        '''conditional sampling should be rewritten anyway '''  # TODO
-        # if self.args.molecule_conditioning or self.args.sg_conditioning or self.args.zp_conditioning:
-        #
-        #     if step_ind % self.args.conditional_eval_period == 0:  # make conditional sampling figures
-        #         conditional_metrics = self.do_conditional_evaluation(energy_function, gfn_model,
-        #                                                              test_mol_loader,
-        #                                                              )
-        #         metrics.update(conditional_metrics)
+        return flow_states, gauss_params_f, log_T_tensor, log_Z, log_Z_lb, log_Z_learned, log_pbs, log_pfs, log_r, sample_batch
 
     def manage_prior_anchor(self, step_ind, metrics, gfn_model, ema_model, name):
         min_rat = 1 / 100
@@ -1238,67 +1311,60 @@ class Modeller:
             metric = metrics['Max Latent KLD']
             "check threshold"
             if metric <= self.args.init_kld_threshold:
-                self.phase1to2(ema_model, gfn_model, name, step_ind)
+                self.phase1to2(metrics, ema_model, gfn_model, name, step_ind)
 
         if self.phase == 2:
-            "record convergence metrics"
-            self.bwd_tb_record.append(metrics['Bwd Normed TB Residual'])
-            self.logz_record.append(metrics['Bwd Normed Log Z LB Residual'])
-            # bwd_overfit_flag = (metrics['Backward TB R Value'] > 0.99) or (metrics['Bwd Normed TB Residual'] < self.args.bwd_overfit_threshold)
-
-            # if (len(self.bwd_tb_record) >= self.n_eval_steps) or bwd_overfit_flag:  # check convergence over X steps
-            #     "check convergence"
-            #     recent_tb = np.array(self.bwd_tb_record[-self.n_eval_steps:])
-            #     recent_z = np.array(self.logz_record[-self.n_eval_steps:])
-            #     tb_stable = recent_tb.mean() < self.args.thermalization_conv_eps
-            #     z_converged = recent_z.mean() < self.args.thermalization_conv_eps
-            #
-            #     if (tb_stable and z_converged) or bwd_overfit_flag:
-            #         self.phase2to3(ema_model, gfn_model, min_rat, name, step_ind)
+            pass  # this function is too infrequent for efficient control. We moved the functionality to the train step
 
         if self.phase == 3:
-            err_fwd = metrics['Normed TB Residual']
-            err_bwd = metrics['Bwd Normed TB Residual']
-            bwd_ceiling = self.args.thermalization_conv_eps * self.args.btb_threshold
-            ratio = self.args.fwd_to_bwd_ratio
-
-            # --- 1. Backward constraint: if violated, immediately suppress forward ---
-            if err_bwd > bwd_ceiling:
-                # Violating constraint → reduce forward contribution
-                ratio *= 0.5
-
-            # --- 2. If backward is safe, we are free to minimize err_fwd ---
-            else:
-                coeff = 0.1
-                ratio *= min(2, np.exp(coeff * err_fwd))
-
-            # Clip and store
-            self.args.fwd_to_bwd_ratio = np.clip(ratio, a_min=min_rat, a_max=max_rat)
+            pass  # this function is too infrequent for efficient control. We moved the functionality to the train step
+            # err_fwd = metrics['Normed TB Residual']
+            # err_bwd = metrics['Bwd Normed TB Residual']
+            # bwd_ceiling = self.args.thermalization_conv_eps * self.args.btb_threshold
+            # ratio = self.args.fwd_to_bwd_ratio
+            #
+            # # --- 1. Backward constraint: if violated, immediately suppress forward ---
+            # if err_bwd > bwd_ceiling:
+            #     # Violating constraint → reduce forward contribution
+            #     ratio *= 0.5
+            #
+            # # --- 2. If backward is safe, we are free to minimize err_fwd ---
+            # else:
+            #     coeff = 0.1
+            #     ratio *= min(2, np.exp(coeff * err_fwd))
+            #
+            # # Clip and store
+            # self.args.fwd_to_bwd_ratio = np.clip(ratio, a_min=min_rat, a_max=max_rat)
 
         metrics['Training Phase'] = self.phase
         metrics['Fwd to Bwd Ratio'] = self.args.fwd_to_bwd_ratio
 
-    def phase1to2(self, ema_model, gfn_model, name, step_ind):
-        print("Hit initial KLD threshold. Moving to backward thermalization.")
+    def phase1to2(self, metrics, ema_model, gfn_model, name, step_ind):
+        #print("Hit initial KLD threshold. Moving to backward thermalization.")
         self.hit_init_kld = True
         "adjust loss coefficients"
         self.args.bwd_loss_coeffs.bwd_tb_z = 1.0
-        self.args.bwd_loss_schedule['tb'] = [(0, 1.0), (step_ind, 0.0),
+        self.args.bwd_loss_schedule['tb'] = [(0, 1.0), (step_ind, 0.1),
                                              (step_ind + self.args.phase_change_time, 1.0)]
         self.args.bwd_loss_schedule['mle'] = [(0, 1.0), (step_ind, 1),
                                               (step_ind + self.args.phase_change_time, 0.0)]
         self.args.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 1.0)]
-        self.args.bwd_loss_schedule['noised_fraction'] = [(0, 1.0), (step_ind, self.args.anchor_noise_fraction)]
-        self.args.bwd_loss_schedule['noise_level'] = [(0, 1.0), (step_ind, self.args.anchor_noise_level)]
+        self.args.bwd_loss_schedule['noised_fraction'] = [(0, 0.0), (step_ind, self.args.anchor_noise_fraction)]
+        self.args.bwd_loss_schedule['noise_level'] = [(0, 0.0), (step_ind, self.args.anchor_noise_level)]
         "set cooldowns"
         self.increasing_loss_cooldown = self.args.phase_change_time  # give it time to adjust to new loss landscape
+        "align log Z to buffer (it will converge to this value)"
+        # z = metrics['Bwd Empirical log Z LB']# todo come back to thinking about this
+        # with torch.no_grad():
+        #     ema_model.flow_model.weight.data = z
+        #     gfn_model.flow_model.weight.data = z
         "save checkpoint"
         torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train_hit_prior.pt')
         torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval_hit_prior.pt')
         self.phase = 2
 
     def phase2to3(self, ema_model, gfn_model, init_rat, name, step_ind):
-        print("Thermalization complete. Moving to forward training & refinement.")
+        #print("Thermalization complete. Moving to forward training & refinement.")
         self.phase = 3
         "save checkpoint"
         torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train_thermalized.pt')

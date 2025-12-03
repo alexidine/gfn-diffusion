@@ -341,7 +341,7 @@ optim_kwargs = dict(
 )
 csd_opt_traj = csd_batch.optimize_crystal_parameters(**optim_kwargs)
 csd_opt_batch = collate_data_list(csd_opt_traj[-1])
-opt_ref_energies = csd_opt_batch.lj_pot
+opt_ref_energies = csd_opt_batch.lj
 opt_ref_densities = csd_opt_batch.packing_coeff
 
 # load samples

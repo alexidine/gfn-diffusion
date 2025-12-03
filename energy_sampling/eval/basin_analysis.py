@@ -25,7 +25,7 @@ if not os.path.exists('mol0_trajectories'):
         for i in range(len(opt_traj)):
             b = collate_data_list(opt_traj[i])
             traj.append(b.latent_params())
-            ens.append(b.lj_pot)
+            ens.append(b.lj)
 
         trajectories.append(traj)
         energies.append(ens)

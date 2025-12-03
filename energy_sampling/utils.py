@@ -262,14 +262,13 @@ def triangle_schedule(it, init, maxval, minval, on, off):
 @torch.no_grad()
 def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 500,
                       max_z_prime: int = 1, uma_path: Optional[str] = None, ):
-    silus = []
-    ljs = []
-    qljs = []
-    eljs = []
-    niggli_overlaps = []
-    gas_umas = []
-    cry_umas = []
+
+    outputs = []
+
     cutoff = 10
+    computes = ['lj', 'niggli_overlap']
+    if energy_function != 'lj' and energy_function != 'uma':
+        computes.append(energy_function)
 
     if energy_function == 'uma':
         uma_predictor = init_uma_crystal_predictor(uma_path, device=device)
@@ -283,28 +282,24 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
                 [dataset[ind] for ind in range(cursor, min(len(dataset), cursor + batch_size))])
             crystal_batch = crystal_batch  # .to(device)
 
-            if energy_function == 'uma':
-                cry_umas.extend(crystal_batch.compute_crystal_uma(
-                    predictor=uma_predictor,
-                    std_orientation=True).cpu().detach() * 96.485)  # output in kJ/mol (of unit cells)
-                gas_umas.extend(crystal_batch.compute_lattice_gas_phase_uma(
-                    predictor=uma_predictor, std_orientation=True).cpu().detach() * 96.485)
-            else:
-                cry_umas.extend(torch.ones(crystal_batch.num_graphs, dtype=torch.float32, device='cpu'))
-                gas_umas.extend(torch.ones(crystal_batch.num_graphs, dtype=torch.float32, device='cpu'))
 
             crystal_batch.box_analysis()
-            out = crystal_batch.analyze(['lj', 'qlj', 'elj','silu', 'niggli'],
-                                        cutoff=cutoff,
-                                        supercell_size=5,
-                                        std_orientation=True)
+            out = crystal_batch.analyze(computes,
+                                  cutoff=cutoff,
+                                  supercell_size=5,
+                                  std_orientation=True,
+                                  )
+            if energy_function == 'uma':
+                cry_en = crystal_batch.compute_crystal_uma(
+                    predictor=uma_predictor,
+                    std_orientation=True).cpu().detach() * 96.485  # output in kJ/mol (of unit cells)
+                gas_en = crystal_batch.compute_lattice_gas_phase_uma(
+                    predictor=uma_predictor, std_orientation=True).cpu().detach() * 96.485
+                out.update({'uma_gas_pot': gas_en,
+                            'uma_pot': cry_en,
+                            'uma': cry_en/crystal_batch.sym_mult - gas_en})  # lattice energy
 
-            silus.extend(out['silu'].cpu().detach())
-            ljs.extend(out['lj'].cpu().detach())
-            qljs.extend(out['qlj'].cpu().detach())
-            eljs.extend(out['elj'].cpu().detach())
-            niggli_overlaps.extend(out['niggli'].cpu().detach())
-
+            outputs.append(out)
             cursor += batch_size
             pbar.update(min(batch_size, len(dataset) - cursor))  # safe final update
             batch_size += 1
@@ -320,25 +315,22 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
             else:
                 raise e
 
-    silus = torch.tensor(silus)
-    ljs = torch.tensor(ljs)
-    qljs = torch.tensor(qljs)
-    eljs = torch.tensor(eljs)
-    gas_umas = torch.tensor(gas_umas)
-    cry_umas = torch.tensor(cry_umas)
-    niggli_overlaps = torch.tensor(niggli_overlaps)
-    for ind, elem in enumerate(dataset):
-        elem.silu_pot = torch.ones(1) * silus[ind]
-        elem.lj_pot = torch.ones(1) * ljs[ind]
-        elem.qlj_pot = torch.ones(1) * qljs[ind]
-        elem.elj_pot = torch.ones(1) * eljs[ind]
-        elem.niggli_overlap = torch.ones(1) * niggli_overlaps[ind]
-        elem.scaled_lj_pot = torch.ones(1) * log_rescale_positive(ljs[ind])
-        elem.uma_gas_pot = torch.ones(1) * gas_umas[ind]
-        elem.uma_pot = torch.ones(1) * cry_umas[ind]
+    keys = outputs[0].keys()
 
-    # exclude negative niggli overlaps
-    dataset = [elem for elem in dataset if elem.niggli_overlap >= 0]
+    full = {
+        key: torch.cat([batch[key] for batch in outputs], dim=0)
+        for key in keys
+    }
+
+    for key, tensor in full.items():
+        for i, elem in enumerate(dataset):
+            setattr(elem, key, tensor[None, i])
+
+    if 'lj' in full:
+        scaled = log_rescale_positive(full['lj'])
+        for i, elem in enumerate(dataset):
+            setattr(elem, 'scaled_lj', scaled[None, i])
+
     [elem.box_analysis() for elem in dataset]
 
     return dataset
@@ -597,8 +589,11 @@ def get_annealing_factor(start_value, stop_value, total_time, step_iters):
 
 
 def substitute_prior(loss_coeffs, condition, crystal_batch, energy_function, rewards, samples, buffer):
-    # noise buffer samples
-    noised_samples = (samples + torch.randn_like(samples) * loss_coeffs.noise_level).clip(min=-1, max=1)
+    # noise buffer samples with gaussian magnitude steps
+    rand_dir = torch.randn_like(samples)
+    rand_dir = rand_dir / rand_dir.norm(dim=-1, keepdim=True)
+    rand_magnitude = torch.randn(len(samples), device=samples.device).abs() * loss_coeffs.noise_level
+    noised_samples = (samples + rand_dir * rand_magnitude[:, None]).clip(min=-1, max=1)
     new_samples = samples.clone()
     if loss_coeffs.noised_fraction < 1:
         num_to_replace = max(1, int(len(samples) * loss_coeffs.noised_fraction))
@@ -629,4 +624,5 @@ def substitute_prior(loss_coeffs, condition, crystal_batch, energy_function, rew
                                                      crystal_batch.to(energy_function.device),
                                                      log_temperature.to(energy_function.device),
                                                      False)
-    return condition, new_rewards, new_samples
+
+    return condition, new_rewards, new_samples, crystal_batch

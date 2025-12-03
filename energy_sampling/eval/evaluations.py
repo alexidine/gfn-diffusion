@@ -99,7 +99,7 @@ def log_crystals(sample_batch):
                                              std_orientation=True)
     cluster_batch.construct_radial_graph(cutoff=6)
     lj_energy = cluster_batch.compute_LJ_energy()
-    cluster_batch.lj_pot = lj_energy
+    cluster_batch.lj = lj_energy
     samples_to_log, filenames = log_crystal_samples(sample_batch=cluster_batch, return_filenames=True)
     [wandb.log({f'crystal_sample_{ind}': samples_to_log[ind]}, commit=False) for ind in range(len(samples_to_log))]
     [os.remove(file) for file in filenames]  # delete this cif as a temporary file
@@ -133,15 +133,17 @@ def fwd_figs(buffer, flow_states,
     fig_dict['Lattice Latents Trajectories'] = visualize_latent_trajs(flow_states.cpu().detach().numpy(),
                                                                       20,
                                                                       log_r.cpu().detach().numpy())
-
+    sample_energy = sample_batch[buffer.energy_function.energy_function]
     fig_dict['Lattice Features Distribution'] = sample_batch.plot_batch_cell_params(
-        space='real', ref_dist=buffer_cell_params, quantiles=[0.1], show=False, return_fig=True)
+        space='real', ref_dist=buffer_cell_params, quantiles=[0.1], show=False, return_fig=True,
+        override_energy=sample_energy)
     fig_dict['Lattice Latents Distribution'] = sample_batch.plot_batch_cell_params(
-        space='latent', ref_dist=buffer_latent_params, quantiles=[0.1], show=False, return_fig=True)
+        space='latent', ref_dist=buffer_latent_params, quantiles=[0.1], show=False, return_fig=True,
+        override_energy=sample_energy)
 
     _, fig_dict['Pf Parity R Value'] = pf_parity_plot(log_pfs, log_pbs, log_r, log_flow)
-
-    fig_dict['Sample Scatter'] = sample_batch.plot_batch_density_funnel(show=False, return_fig=True)
+    fig_dict['Sample Scatter'] = sample_batch.plot_batch_density_funnel(show=False, return_fig=True,
+                                                                        override_energy=sample_energy)
 
     return fig_dict
 
@@ -773,7 +775,7 @@ def log_metrics(energy_function,
     # training metrics
     metrics['Mean Sample Energy'] = sample_batch.gfn_energy.mean().cpu().detach().item()
     metrics['Sample Energy'] = sample_batch.gfn_energy.clip(max=50).cpu().detach().numpy()
-    metrics['Scaled LJ'] = sample_batch.scaled_lj_pot.cpu().detach().numpy()
+    metrics['Scaled LJ'] = sample_batch.scaled_lj.cpu().detach().numpy()
 
     metrics[
         'Mean Sample Reward'] = log_r.mean().cpu().detach().item()  # todo this should probably be denormed by the temperature
@@ -893,8 +895,9 @@ def log_metrics(energy_function,
     metrics['Normed Log Z LB Residual'] = ((log_Z_lb - log_Z_learned).abs() / log_Z_lb.abs()).item()
 
     # get fraction of samples which are 'reasonable' at this energy,
-    # meaning density > 0.55 and bound states
-    sample_is_good = (sample_batch.lj_pot < 0) * (sample_batch.packing_coeff > 0.55)
+    en_func = energy_function.energy_function
+    sample_is_good = (sample_batch[en_func] < 0) * (sample_batch.packing_coeff > 0.55) * (
+                sample_batch.packing_coeff < 0.95)
     metrics["Reasonable Sample Fraction"] = sample_is_good.float().mean().item()
     metrics = {k: to_loggable(v) for k, v in metrics.items()}
 

@@ -16,6 +16,7 @@ from tqdm import tqdm
 from energy_sampling.utils import uniform_discretizer, get_gfn_init_state
 from mxtaltools.common.utils import log_rescale_positive
 from mxtaltools.dataset_utils.utils import collate_data_list
+from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 
 
 def cluster_1d(X):
@@ -618,11 +619,12 @@ def sample_from_gfn(num_samples, max_z_prime, device, n_steps, batch_size, gfn_m
     return samples
 
 
-def analyze_samples(x, mol_list, max_z_prime, device, batch_size):
+def analyze_samples(x, mol_list, max_z_prime, device, batch_size, do_uma: bool=False, predictor=None):
     num_batches = len(mol_list) // batch_size + (1 if len(mol_list) % batch_size else 0)
     num_samples = len(mol_list)
     samples = []
     counter = 0
+
     with tqdm(total=num_samples) as pbar:
         with torch.no_grad():
             for b_ind in range(num_batches):
@@ -631,11 +633,20 @@ def analyze_samples(x, mol_list, max_z_prime, device, batch_size):
                 batch.reset_sg_info(2)
                 batch.latent_to_cell_params(x[inds])
                 batch = batch.to(device)
-                outs = batch.analyze(['lj', 'silu'], cutoff=10, std_orientation=True)
-                batch.add_graph_attr(outs['lj'], 'lj_pot')
-                batch.add_graph_attr(outs['silu'], 'silu_pot')
+                outs = batch.analyze(['lj','qlj','elj','silu'], cutoff=10, std_orientation=True)
+                if do_uma:
+                    gas_en = batch.compute_lattice_gas_phase_uma(predictor, std_orientation=True).cpu().detach() * 96.485
+                    cry_en = batch.compute_crystal_uma(predictor=predictor, std_orientation=True).cpu().detach() * 96.485
+                    batch.add_graph_attr(gas_en, 'uma_gas_pot')
+                    batch.add_graph_attr(cry_en, 'uma_pot')
+
+                batch.add_graph_attr(outs['lj'], 'lj')
+                batch.add_graph_attr(outs['elj'], 'elj')
+                batch.add_graph_attr(outs['qlj'], 'qlj')
+                batch.add_graph_attr(outs['silu'], 'silu')
                 batch.to('cpu')
                 samples.extend(batch.batch_to_list())
+                del batch
                 counter += batch_size
                 pbar.update(batch_size)
 

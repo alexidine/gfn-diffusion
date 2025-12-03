@@ -8,6 +8,7 @@ from scipy.spatial.transform import Rotation
 from torch_geometric.loader import DataLoader
 from torch_scatter import scatter
 
+from mxtaltools.common.utils import is_cuda_oom
 from mxtaltools.crystal_building.crystal_latent_transforms import compute_niggli_overlap
 from mxtaltools.dataset_utils.utils import collate_data_list
 from utils import compute_sample_overlap, iter_forever
@@ -49,10 +50,11 @@ class CrystalReplayBuffer:
 
     @torch.no_grad()
     def add_to_staging(self, data_list=None, data_batch=None):
-        if data_list is None and data_batch is not None:
-            data_list = data_batch.batch_to_list()
+        if len(self.staging_buffer) < len(self):  # don't stage a crazy number of samples - downstream cost becomes too high
+            if data_list is None and data_batch is not None:
+                data_list = data_batch.batch_to_list()
 
-        self.staging_buffer.extend(data_list)
+            self.staging_buffer.extend(data_list)
 
     @torch.no_grad()
     def add(self,
@@ -68,13 +70,25 @@ class CrystalReplayBuffer:
 
         assert len(self.dataset) == len(self.x_list) == len(self.rewards_list)
 
-        self.init_loader()
+        # self.init_loader()  # never used
 
-    def add_samples_to_dataset(self, data_list, max_z_prime):
+    def incorporate_staging_buffer(self):
+        self.add_samples_to_dataset(self.staging_buffer, 1, skip_staging=True)
+        self.staging_buffer = []
+
+        if len(self) > self.buffer_size:  # pare down buffer
+            self.truncate_buffer()
+
+        assert len(self.dataset) == len(self.x_list) == len(self.rewards_list)
+
+        # self.init_loader()  # never used
+
+    def add_samples_to_dataset(self, data_list, max_z_prime, skip_staging: bool = False):
         # batch samples
-        if len(self.staging_buffer) > 0:  # include staged samples
-            data_list.extend(self.staging_buffer)
-            self.staging_buffer = []
+        if not skip_staging:
+            if len(self.staging_buffer) > 0:  # include staged samples
+                data_list.extend(self.staging_buffer)
+                self.staging_buffer = []
 
         data_batch = collate_data_list(data_list, max_z_prime=self.max_z_prime)
         new_latents = data_batch.latent_params()
@@ -85,7 +99,8 @@ class CrystalReplayBuffer:
             temperature=torch.ones(data_batch.num_graphs) * self.energy_function.temperature)
 
         # enforce reasonable standards for consideration in the buffer
-        score_cut = np.quantile(self.rewards_list, 0.5)
+        # score_cut = np.quantile(self.rewards_list, 0.5)
+        score_cut = max(self.reward_clip, np.amin(self.rewards_list))  # the lowest reward in our dynamical range
         packing_coeffs = data_batch.packing_coeff.cpu().detach().numpy()
         good_inds = [ind for ind in range(len(data_list)) if
                      (data_list[ind].niggli_overlap >= 0) and (scores[ind] > score_cut) and (
@@ -114,6 +129,7 @@ class CrystalReplayBuffer:
         if self.energy_function.reward_range is not None:
             # reward scaling is temperature dependent
             self.energy_function.set_reward_clip(rewards)
+            self.reward_clip = -self.energy_function.energy_clip / self.energy_function.temperature
             # recompute with new clip
             rewards = self.energy_function.prebuilt_sample_to_reward(
                 dataset_batch,
@@ -134,27 +150,30 @@ class CrystalReplayBuffer:
         # get descriptors
         device = self.device
         x_tensor = torch.stack(self.x_list).to(device)
-        e_tensor = -torch.nan_to_num(torch.tensor(self.rewards_list, device=device))
+        e_tensor = -torch.nan_to_num(torch.tensor(self.rewards_list, device=device)) * self.energy_function.temperature
 
         # define cutoffs
         d_cut = self.buffer_dist_cutoff
-        if self.original_dataset_inds is not None:
-            e_cut = np.quantile(e_tensor[self.original_dataset_inds], 0.25)
-        else:
-            e_cut = np.quantile(e_tensor, 0.25)
+        e_cut = self.energy_function.energy_clip
 
-        inds_to_keep = self.bottom_up_cluster(x_tensor, e_tensor, d_cut, e_cut)
+        if self.keep_initial_samples:
+            max_new_samples = self.buffer_size - len(self.original_dataset_inds)
+        else:
+            max_new_samples = self.buffer_size
+
+        inds_to_keep = self.bottom_up_cluster(x_tensor, e_tensor, d_cut, e_cut, max_new_samples)
 
         if self.keep_initial_samples:
             orig_dataset_ind_tensor = torch.tensor(self.original_dataset_inds, device=self.device, dtype=torch.long)
-            combined = torch.unique(torch.cat([torch.tensor(inds_to_keep),
+            keep_inds_tensor = torch.as_tensor(inds_to_keep)
+            combined = torch.unique(torch.cat([keep_inds_tensor,
                                                orig_dataset_ind_tensor]))
             # Protect originals by giving them artificially low energy ranks
             energies = e_tensor[combined].clone()
             mask_orig = torch.isin(combined, orig_dataset_ind_tensor)
             energies[mask_orig] -= 1e6  # will always be kept
             sorted_combined = combined[torch.argsort(energies)]
-            inds_to_keep = sorted_combined[:self.buffer_size]
+            inds_to_keep = sorted_combined[:max(len(self.original_dataset_inds), self.buffer_size)]
         else:
             # Sort by (modified) energy and truncate
             if len(inds_to_keep) > self.buffer_size:
@@ -186,7 +205,8 @@ class CrystalReplayBuffer:
         else:
             return len(self.dataset)
 
-    def bottom_up_cluster(self, xx, e, d_cut, e_cut):
+    @torch.no_grad()
+    def bottom_up_cluster(self, xx, e, d_cut, e_cut, max_new_samples:int):
         # Sort by energy ascending
         sort_inds = torch.argsort(e)
         xx_sorted = xx[sort_inds]
@@ -194,36 +214,31 @@ class CrystalReplayBuffer:
 
         mask = e_sorted < e_cut
 
-        # TODO replace this with something that scales. Brutally bad for large buffers.
-        dmat = torch.cdist(xx_sorted, xx_sorted)
-
+        # faster algorithm for this
+        xx_sorted_cuda = xx_sorted.cuda()
+        blocked = torch.zeros(len(xx_sorted), dtype=torch.bool, device=xx.device)
         keep = torch.zeros(len(xx_sorted), dtype=bool, device=xx.device)
+        d_cut_squared = d_cut * d_cut
         for i in range(len(xx_sorted)):
             if not mask[i]:
                 break
-            # check if this point is farther than d_cut from all previously kept points
-            too_close = (dmat[i, keep] < d_cut).any()
-            if not too_close:
-                keep[i] = True
+
+            if blocked[i]:
+                continue
+
+            keep[i] = True
+            if torch.sum(keep) == max_new_samples:
+                break
+
+            drow = ((xx_sorted_cuda - xx_sorted_cuda[i, None, :]) ** 2).sum(-1).cpu()  # faster, skips sqrt
+            nearby = drow < d_cut_squared
+            blocked |= nearby
 
         keep_inds = sort_inds[keep]
+        del xx_sorted_cuda
 
-        clusterer = hdbscan.HDBSCAN(min_cluster_size=2, min_samples=1, cluster_selection_epsilon=0.1)
-        labels = clusterer.fit_predict(xx[keep_inds].cpu().numpy())
-        minima_inds = []
-        for lbl in torch.unique(torch.tensor(labels), sorted=True):
-            mask = labels == lbl.item()
-            if mask.sum() == 0: continue
-            idx = torch.argmin(e[keep_inds][mask])
-            minima_inds.append(keep_inds[mask][idx])
 
-        noisy_inds = keep_inds[labels == -1]
-
-        inds_to_keep = torch.cat([
-            torch.tensor(minima_inds[1:]), noisy_inds
-        ])
-
-        return inds_to_keep
+        return keep_inds
 
     def sample_indices(self, batch_size,
                        replace: bool,

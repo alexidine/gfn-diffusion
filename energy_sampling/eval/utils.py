@@ -115,7 +115,7 @@ def sample_crystals(
                 #         return_exp=True)
 
                 params_record[s_ind, batch_inds] = samples.cpu().detach().numpy()
-                energy_record[s_ind, batch_inds] = sample_batch.lj_pot.cpu().detach().numpy()
+                energy_record[s_ind, batch_inds] = sample_batch.lj.cpu().detach().numpy()
                 density_record[s_ind, batch_inds] = sample_batch.packing_coeff.cpu().detach().numpy()
                 ssample_record.append(sample_batch.cpu().detach().to_data_list())
 
@@ -128,7 +128,7 @@ def sample_crystals(
                     finished_batch = collate_data_list(opt_traj[-1])
 
                     opt_params_record[s_ind, batch_inds] = finished_batch.latent_params().cpu().detach().numpy()
-                    opt_energy_record[s_ind, batch_inds] = finished_batch.lj_pot.cpu().detach().numpy()
+                    opt_energy_record[s_ind, batch_inds] = finished_batch.lj.cpu().detach().numpy()
                     opt_density_record[s_ind, batch_inds] = finished_batch.packing_coeff.cpu().detach().numpy()
                     opt_ssample_record.append(opt_traj[-1])
 

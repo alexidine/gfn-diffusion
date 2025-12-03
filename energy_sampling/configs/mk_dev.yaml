@@ -16,6 +16,7 @@ gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weigh
 ema_decay: 0.95 #0.99  # set to null for no ema
 
 # model parameters
+#checkpoint_path: C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints\nic_good_elj_model_train.pt #D:\crystal_datasets\nic12_model_train_hit_prior.pt # if you put the train model, it will automatically load the relevant config and eval model
 checkpoint_path: D:\crystal_datasets\nic12_model_train_hit_prior.pt # if you put the train model, it will automatically load the relevant config and eval model
 zero_init: False
 joint_layers: 4              # number of layers in forward/backward policy models
@@ -29,16 +30,15 @@ norm: layer                   # null, "layer" - DON'T PUT 'batch'
 
 batch_size: 10              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_fwd_batch_size: 100
-max_bwd_batch_size: 10000
-max_batch_size: 2000           # maximum batch size to allow
+max_fwd_batch_size: 1000
+max_bwd_batch_size: 1000
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
 eval_batch_size: 500        # batch size for evaluation (adaptive)
 eval_num_samples: 1000       # minimum number of samples for evaluation
 epochs: 1000000             # number of training epochs
-eval_period: 50              # how often to do evaluation & reporting
-conditional_eval_period: 200 # DEPRECATED # how often to do conditional evaluation with figs # must be multiple of eval period
-figs_period: 200             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+eval_period: 250              # how often to do evaluation & reporting
+figs_period: 500             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+conditional_eval_period: 1000 # DEPRECATED # how often to do conditional evaluation with figs # must be multiple of eval period
 
 # GFlowNet settings
 T: 50                        # static training diffusion length
@@ -72,8 +72,8 @@ fwd_loss_coeffs:
   buffer_gamma: 0
   loss_clip: 1.0E+9
 bwd_loss_coeffs:
-  tb: 1.0 #1.0  # will be altered by bwd_tb_z - must be nonzero for log Z backwards-trained warm start
-  bwd_tb_z: 2.0 #2.0  # 2 if we should only train the Z component in tb, 1 if we should train log Z on backward TB, 0 if not. bwd tb must be >0
+  tb: 0.0 #1.0  # will be altered by bwd_tb_z - must be nonzero for log Z backwards-trained warm start
+  bwd_tb_z: 0.0 #2.0  # 2 if we should only train the Z component in tb, 1 if we should train log Z on backward TB, 0 if not. bwd tb must be >0
   vg_lb: 0
   vg_lme: 0  # exclusive with vg_lb
   emp_z: 0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
@@ -85,11 +85,11 @@ bwd_loss_coeffs:
 # for controlling 3-phase convergence protocol
 anchor_fwd_bwd: true  # whether to do this at all
 btb_threshold: 2.0 # ratio of thermalization_conv_eps at which we activate emergency bwd training
-phase_change_time: 100  # time to adjust loss coefficients between phases
+phase_change_time: 200  # time to adjust loss coefficients between phases
 thermalization_conv_eps: 0.5
-init_kld_threshold: 0.1
-anchor_noise_fraction: 0.0
-anchor_noise_level: 0.0
+init_kld_threshold: 0.5
+anchor_noise_fraction: 1.0
+anchor_noise_level: 0.05 # much higher than this is a total disaster
 
 prior_coverage_ratio: 0.05  # [0, 1] fraction of uniform bin coverage that will satisfy the coverage metric
 both_ways: true             # forward and backward training
@@ -106,7 +106,7 @@ reward_range: 40 # range of reward values allowed, null to go unrestricted
 ################################################################
 uma_path: 'D:\crystal_datasets\esen_s.pt'
 #buffer_path: 'D:/crystal_datasets/opt_outputs/acridine_sg_14_zp_1_2.pt'
-buffer_path: 'D:/crystal_datasets/opt_outputs/nic_2_zp1.pt' #'D:/crystal_datasets/urea_gfn_dataset.pt' #
+buffer_path: 'D:/crystal_datasets/opt_outputs/new_nic_2_zp1.pt' #'D:/crystal_datasets/urea_gfn_dataset.pt' #
 #buffer_path: 'D:/crystal_datasets/test_qm9_crystals_test.pt' #'D:/crystal_datasets/nic_sg2_dataset.pt' #'D:/crystal_datasets/urea_gfn_dataset.pt' #
 #molecules_path: 'D:/crystal_datasets/train_qm9.pt'
 #molecules_path: 'D:/crystal_datasets/acridine.pt'
@@ -123,7 +123,7 @@ autoencoder_path: 'D:/crystal_datasets/model_checkpoints/best_autoencoder_experi
 ################################################################
 beta: 1.0             # reward prioritized replay sampling: high beta = steep prioritization
 rank_weight: 1.0     # rank-based replay sampling: low rank_weight = steep prioritization
-buffer_dist_cutoff: 0.25
+buffer_dist_cutoff: 0.5  # 0.5 a bit loose, 0.75 a bit tight
 prioritized: null #"boltzmann"   # three kinds of replay training: random, reward prioritized (Boltzmann), rank-based
 sampling: "buffer"  # no alternative for right now
 buffer_size: 20000          # size of replay buffer
@@ -168,6 +168,6 @@ lj_turnover_pot: 10.0  # value above which molecular LJ potential is softly clip
 energy_min_temperature: 0.1  # for conditional or annealing
 energy_max_temperature: 10   # for conditional only
 # note for physical potentials i.e., UMA - kT at room temperature is ~2.5
-energy_static_temperature: 2.5 # for certain evaluations or static T training. Also initial temperature on unconditional temperature annealing
+energy_static_temperature: 2.5 # 2.5 is kT by the way for certain evaluations or static T training. Also initial temperature on unconditional temperature annealing
 temperature_scaling_factor: 0.01  # controls relative frequency of higher vs lower temperatures in conditional training (higher -> higher)
 
