@@ -1,0 +1,143 @@
+defaults:
+  base: base.yaml
+
+#		○ Room & high T
+#		○ max rewards ranges, maybe 20, 40, 100
+#		○ UMA & eLJ
+#		x○ 256, 512, 1024 dim models
+
+experiments:
+- tag: 0
+  update:
+    energy_static_temperature: 2.5
+    thermalization_conv_eps: 0.5
+    btb_threshold: 2.0
+    init_kld_threshold: 0.05
+    phase_change_time: 200
+    reward_range: 40
+    energy_function: elj
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
+    anchor_noise_level: 0.05
+    anchor_noise_fraction: 1.0
+
+- tag: 1
+  update:
+    energy_static_temperature: 0.5
+    thermalization_conv_eps: 0.5
+    btb_threshold: 2.0
+    init_kld_threshold: 0.05
+    phase_change_time: 200
+    reward_range: 40
+    energy_function: elj
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
+    anchor_noise_level: 0.05
+    anchor_noise_fraction: 1.0
+
+- tag: 2
+  update:
+    energy_static_temperature: 10.0
+    thermalization_conv_eps: 0.5
+    btb_threshold: 2.0
+    init_kld_threshold: 0.05
+    phase_change_time: 200
+    reward_range: 40
+    energy_function: elj
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
+    anchor_noise_level: 0.05
+    anchor_noise_fraction: 1.0
+
+- tag: 3
+  update:
+    energy_static_temperature: 2.5
+    thermalization_conv_eps: 0.25
+    btb_threshold: 2.0
+    init_kld_threshold: 0.05
+    phase_change_time: 200
+    reward_range: 40
+    energy_function: elj
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
+    anchor_noise_level: 0.05
+    anchor_noise_fraction: 1.0
+
+- tag: 4
+  update:
+    energy_static_temperature: 2.5
+    thermalization_conv_eps: 0.75
+    btb_threshold: 2.0
+    init_kld_threshold: 0.05
+    phase_change_time: 200
+    reward_range: 40
+    energy_function: elj
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
+    anchor_noise_level: 0.05
+    anchor_noise_fraction: 1.0
+
+- tag: 5
+  update:
+    energy_static_temperature: 2.5
+    thermalization_conv_eps: 0.5
+    btb_threshold: 3.0
+    init_kld_threshold: 0.05
+    phase_change_time: 200
+    reward_range: 40
+    energy_function: elj
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
+    anchor_noise_level: 0.05
+    anchor_noise_fraction: 1.0
+
+- tag: 6
+  update:
+    energy_static_temperature: 2.5
+    thermalization_conv_eps: 0.5
+    btb_threshold: 2.0
+    init_kld_threshold: 0.05
+    phase_change_time: 200
+    reward_range: 20
+    energy_function: elj
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
+    anchor_noise_level: 0.05
+    anchor_noise_fraction: 1.0
+
+- tag: 7
+  update:
+    energy_static_temperature: 2.5
+    thermalization_conv_eps: 0.5
+    btb_threshold: 2.0
+    init_kld_threshold: 0.05
+    phase_change_time: 200
+    reward_range: 80
+    energy_function: elj
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
+    anchor_noise_level: 0.05
+    anchor_noise_fraction: 1.0
+
+- tag: 8
+  update:
+    energy_static_temperature: 2.5
+    thermalization_conv_eps: 0.5
+    btb_threshold: 2.0
+    init_kld_threshold: 0.025
+    phase_change_time: 200
+    reward_range: 40
+    energy_function: elj
+    hidden_dim: 1024
+    s_emb_dim: 1024
+    condition_emb_dim: 1024
+    anchor_noise_level: 0.05
+    anchor_noise_fraction: 1.0

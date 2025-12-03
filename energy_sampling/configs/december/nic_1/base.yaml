@@ -4,12 +4,12 @@ seed: 12345
 device: 'cuda'
 lr_policy: 5.0e-4              # learning rate of the policy network
 min_lr: 1.0e-6                # ihn
-lr_flow: 1.0e-0                  # learning rate of the flow network
+lr_flow: 10.0e-0                  # learning rate of the flow network
 lr_back: 5.0e-4                # learning rate of the backward pass
 lr_warmup_ratio: 10           # how much smaller the initial (warmup) LR should be than the max policy value
 scheduler: True               # does LR warmup from lr/lr_warup_ratio -> lr -> min_lr over the warmup and annealing period
 lr_warmup_time: 500
-lr_anneal_time: 200000
+lr_anneal_time: 100000
 weight_decay: 1.0E-4
 use_weight_decay: false
 gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weights
@@ -29,16 +29,15 @@ norm: layer                   # null, "layer" - DON'T PUT 'batch'
 
 batch_size: 10              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_fwd_batch_size: 200
+max_fwd_batch_size: 2000
 max_bwd_batch_size: 2000
-max_batch_size: 2000           # maximum batch size to allow
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
-eval_batch_size: 1000        # batch size for evaluation (adaptive)
-eval_num_samples: 1000       # minimum number of samples for evaluation
+eval_batch_size: 500        # batch size for evaluation (adaptive)
+eval_num_samples: 2000       # minimum number of samples for evaluation
 epochs: 1000000             # number of training epochs
-eval_period: 250              # how often to do evaluation & reporting
-conditional_eval_period: 1000 # DEPRECATED # how often to do conditional evaluation with figs # must be multiple of eval period
+eval_period: 500              # how often to do evaluation & reporting
 figs_period: 1000             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+conditional_eval_period: 1000 # DEPRECATED # how often to do conditional evaluation with figs # must be multiple of eval period
 
 # GFlowNet settings
 T: 50                        # static training diffusion length
@@ -72,8 +71,8 @@ fwd_loss_coeffs:
   buffer_gamma: 0
   loss_clip: 1.0E+9
 bwd_loss_coeffs:
-  tb: 1.0 #1.0  # will be altered by bwd_tb_z - must be nonzero for log Z backwards-trained warm start
-  bwd_tb_z: 2.0 #2.0  # 2 if we should only train the Z component in tb, 1 if we should train log Z on backward TB, 0 if not. bwd tb must be >0
+  tb: 0.0 #1.0  # will be altered by bwd_tb_z - must be nonzero for log Z backwards-trained warm start
+  bwd_tb_z: 0.0 #2.0  # 2 if we should only train the Z component in tb, 1 if we should train log Z on backward TB, 0 if not. bwd tb must be >0
   vg_lb: 0
   vg_lme: 0  # exclusive with vg_lb
   emp_z: 0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
@@ -84,13 +83,12 @@ bwd_loss_coeffs:
 
 # for controlling 3-phase convergence protocol
 anchor_fwd_bwd: true  # whether to do this at all
-btb_threshold: 1.5 # fractional leeway on the thermalization conv_eps for fwd-bwd balancing
-phase_change_time: 100  # time to adjust loss coefficients between phases
-thermalization_conv_eps: 1.0
-bwd_overfit_threshold: 0.4
+btb_threshold: 2.0 # ratio of thermalization_conv_eps at which we activate emergency bwd training
+phase_change_time: 200  # time to adjust loss coefficients between phases
+thermalization_conv_eps: 0.5
 init_kld_threshold: 0.05
-anchor_noise_fraction: 0.0
-anchor_noise_level: 0.0
+anchor_noise_fraction: 1.0
+anchor_noise_level: 0.05 # much higher than this is a total disaster
 
 prior_coverage_ratio: 0.05  # [0, 1] fraction of uniform bin coverage that will satisfy the coverage metric
 both_ways: true             # forward and backward training
@@ -106,7 +104,7 @@ reward_range: 40 # range of reward values allowed, null to go unrestricted
 # dataset settings
 ################################################################
 uma_path: '/scratch/mk8347/models/uma/esen_s.pt'
-buffer_path: '/scratch/mk8347/csd_runs/datasets/nic_2_zp1.pt'
+buffer_path: '/scratch/mk8347/csd_runs/datasets/new_nic_2_zp1.pt'
 molecules_path: '/scratch/mk8347/csd_runs/datasets/nicoam0.pkl'
 autoencoder_path: '/scratch/mk8347/csd_runs/models/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
 
@@ -115,11 +113,11 @@ autoencoder_path: '/scratch/mk8347/csd_runs/models/best_autoencoder_experiments_
 ################################################################
 beta: 1.0             # reward prioritized replay sampling: high beta = steep prioritization
 rank_weight: 1.0     # rank-based replay sampling: low rank_weight = steep prioritization
-buffer_dist_cutoff: 0.25
+buffer_dist_cutoff: 0.5  # 0.5 a bit loose, 0.75 a bit tight
 prioritized: null #"boltzmann"   # three kinds of replay training: random, reward prioritized (Boltzmann), rank-based
 sampling: "buffer"  # no alternative for right now
-buffer_size: 40000          # size of replay buffer
-grow_buffer: false  # can be toggled on or off in certain training modes
+buffer_size: 20000          # size of replay buffer
+grow_buffer: true  # can be toggled on or off in certain training modes
 
 # exploration controls
 ################################################################
@@ -139,7 +137,7 @@ space_groups: [ 2 ]  # which space groups to sample over
 zp_conditioning: false # whether to condition over z prime values
 z_primes: [ 1 ]
 lj_rescale: [-293, 99, -31, 41]  # mean and std by which to rescale LJ to align with uma
-energy_function: 'uma'
+energy_function: 'elj'
   # 'latent_harmonic' : unimodal harmonic potential in the latent space
   # 'crystal_harmonic': unimodal harmonic potential in the crystal space
   # 'latent_multiharmonic': multimodal harmonic potential in the latent space
@@ -160,6 +158,6 @@ lj_turnover_pot: 10.0  # value above which molecular LJ potential is softly clip
 energy_min_temperature: 0.1  # for conditional or annealing
 energy_max_temperature: 10   # for conditional only
 # note for physical potentials i.e., UMA - kT at room temperature is ~2.5
-energy_static_temperature: 2.5 # for certain evaluations or static T training. Also initial temperature on unconditional temperature annealing
+energy_static_temperature: 2.5 # 2.5 is kT by the way for certain evaluations or static T training. Also initial temperature on unconditional temperature annealing
 temperature_scaling_factor: 0.01  # controls relative frequency of higher vs lower temperatures in conditional training (higher -> higher)
 
