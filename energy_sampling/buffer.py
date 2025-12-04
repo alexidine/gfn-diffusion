@@ -207,17 +207,21 @@ class CrystalReplayBuffer:
 
     @torch.no_grad()
     def bottom_up_cluster(self, xx, e, d_cut, e_cut, max_new_samples:int):
-        # Sort by energy ascending
-        sort_inds = torch.argsort(e)
-        xx_sorted = xx[sort_inds]
-        e_sorted = e[sort_inds]
 
+        if torch.cuda.is_available():
+            device = 'cuda'
+        else:
+            device = self.device
+
+        # Sort by energy ascending
+        sort_inds = torch.argsort(e.to(device))
+        xx_sorted = xx.to(device)[sort_inds]
+        e_sorted = e.to(device)[sort_inds]
         mask = e_sorted < e_cut
 
-        # faster algorithm for this
-        xx_sorted_cuda = xx_sorted.cuda()
-        blocked = torch.zeros(len(xx_sorted), dtype=torch.bool, device=xx.device)
-        keep = torch.zeros(len(xx_sorted), dtype=bool, device=xx.device)
+        xx_sorted_cuda = xx_sorted.to(device)
+        blocked = torch.zeros(len(xx_sorted), dtype=torch.bool, device=device)
+        keep = torch.zeros(len(xx_sorted), dtype=bool, device=device)
         d_cut_squared = d_cut * d_cut
         for i in range(len(xx_sorted)):
             if not mask[i]:
@@ -230,15 +234,13 @@ class CrystalReplayBuffer:
             if torch.sum(keep) == max_new_samples:
                 break
 
-            drow = ((xx_sorted_cuda - xx_sorted_cuda[i, None, :]) ** 2).sum(-1).cpu()  # faster, skips sqrt
+            drow = ((xx_sorted_cuda - xx_sorted_cuda[i, None, :]) ** 2).sum(-1)  # faster, skips sqrt
             nearby = drow < d_cut_squared
             blocked |= nearby
 
         keep_inds = sort_inds[keep]
-        del xx_sorted_cuda
 
-
-        return keep_inds
+        return keep_inds.cpu()
 
     def sample_indices(self, batch_size,
                        replace: bool,

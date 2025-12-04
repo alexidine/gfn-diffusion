@@ -108,7 +108,7 @@ class MolecularCrystal(BaseSet):
         max_reward = max(dataset_rewards)
         reward_range = self.reward_range
         min_allowed_reward = max_reward - reward_range
-        self.energy_clip = - min_allowed_reward * self.temperature  # convert the minimum allowed reward to a clip on the energy
+        self.energy_clip = float(- min_allowed_reward * self.temperature)  # convert the minimum allowed reward to a clip on the energy
 
     def instantiate_crystals(self, x, mol_batch):
         crystal_batch = self.init_blank_crystal_batch(mol_batch)
