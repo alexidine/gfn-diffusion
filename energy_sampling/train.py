@@ -839,7 +839,7 @@ class Modeller:
         skip_step = False
         if self.phase == 2:
             if self.bwd_tb_norm <= self.args.thermalization_conv_eps:  # hit stage 2 convergence criteria
-                self.phase2to3(ema_model, gfn_model, 1, name, it)
+                self.phase2to3(ema_model, gfn_model, 0.1, name, it)
 
         if self.phase == 3:
             skip_step = self.update_controller(it, do_backward, skip_step)
@@ -861,18 +861,18 @@ class Modeller:
         bwd_floor = min(self.args.thermalization_conv_eps, self.fwd_tb_norm)
         bwd_target = (bwd_ceil + bwd_floor) / 2
         metric = self.bwd_tb_norm
-        coeff = 0.2
+        coeff = 0.1
         err = (metric - bwd_target) / bwd_target  # if metric is large
 
         if metric > bwd_ceil:
             if update_this_step:
-                self.args.fwd_to_bwd_ratio /= max(1.2, np.exp(coeff * err))
+                self.args.fwd_to_bwd_ratio /= max(1.05, np.exp(coeff * err))
                 #print(f"Firing ceil {metric:.2f}:{bwd_target:.2f}")
         elif metric < bwd_floor:
             if update_this_step:
                 # this won't ameliorate below a good threshold - so just set it
-                self.args.fwd_to_bwd_ratio = max(1.5, self.args.fwd_to_bwd_ratio)
-                self.args.fwd_to_bwd_ratio *= 1.2
+                self.args.fwd_to_bwd_ratio = max(0.5, self.args.fwd_to_bwd_ratio)
+                self.args.fwd_to_bwd_ratio *= 1.1
                 #print(f"Firing floor {metric:.2f}:{bwd_target:.2f}")
             if do_backward:
                 skip_step = True  # we're already doing too good
