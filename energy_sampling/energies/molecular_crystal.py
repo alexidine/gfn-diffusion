@@ -134,7 +134,8 @@ class MolecularCrystal(BaseSet):
                 uma_energy = crystal_batch.compute_crystal_uma(
                     predictor=self.uma_predictor,
                     std_orientation=False) * 96.485  # output in kJ/mol (of unit cells)
-                out.update({'uma_pot': uma_energy})
+                out.update({'uma_pot': uma_energy,
+                            'uma': uma_energy/crystal_batch.sym_mult - crystal_batch.uma_gas_pot})
 
         for key in out.keys():
             crystal_batch.add_graph_attr(out[key], key)
@@ -180,10 +181,7 @@ class MolecularCrystal(BaseSet):
             elif self.energy_function == 'silu':
                 mol_energy = crystal_batch.silu  # / crystal_batch.num_atoms
             elif self.energy_function == 'uma':
-                # gas_pot =  crystal_batch.uma_gas_pot
-                gas_pot = -9587.2559
-                mol_energy = (
-                        crystal_batch.uma_pot / crystal_batch.sym_mult - gas_pot)  # the raw lattice energy # / crystal_batch.num_atoms  # todo un-hardcode this when we fix it in the training set
+                mol_energy = crystal_batch.uma
             else:
                 assert False
 

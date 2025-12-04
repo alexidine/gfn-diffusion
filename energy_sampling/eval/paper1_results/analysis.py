@@ -14,8 +14,8 @@ torch.cuda.set_per_process_memory_fraction(0.9, device=0)
 
 if __name__ == '__main__':
     device = 'cuda'
-    num_samples = 1000
-    batch_size = 250
+    num_samples = 10000
+    batch_size = 1000
     energy_function = 'elj'  # 'elj', 'lj'
     n_steps = 50  # critical to get this right!
 
@@ -32,8 +32,13 @@ if __name__ == '__main__':
     # molecule_path = r'D:\crystal_datasets\protonated_nicoam\nicoam0.pkl'
     # dataset_path = r'D:/crystal_datasets/opt_outputs/nic_2_zp1.pt'
 
-    model_path = r"C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints\nic_good_elj_model_train.pt"
-    config_path = r"C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints\nic_good_elj_model_config.npy"
+    # model_path = r"C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints\nic_good_elj_model_train.pt"
+    # config_path = r"C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints\nic_good_elj_model_config.npy"
+    # molecule_path = r'D:\crystal_datasets\protonated_nicoam\nicoam0.pkl'
+    # dataset_path = r'D:/crystal_datasets/opt_outputs/nic_2_zp1.pt'
+    #
+    model_path = r"D:\crystal_datasets\nic_1_0_model_eval.pt"
+    config_path = r"D:\crystal_datasets\nic_1_0_model_config.npy"
     molecule_path = r'D:\crystal_datasets\protonated_nicoam\nicoam0.pkl'
     dataset_path = r'D:/crystal_datasets/opt_outputs/nic_2_zp1.pt'
 
@@ -124,6 +129,8 @@ if __name__ == '__main__':
                         showlegend=False, marker_color=ind)
     fig.show()
 
+    m_sort = np.argsort([sum(m) for m in masks])
+    sort_masks = [masks[ind] for ind in m_sort[::-1]]
     sample_batch.plot_batch_cell_params(space='real',
                                         aux_dists=[sample_batch.full_cell_parameters()[m] for m in masks[:10] if
                                                    sum(m) > 1])

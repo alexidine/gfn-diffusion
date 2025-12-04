@@ -144,6 +144,7 @@ if __name__ == '__main__':
             mirror=True,
             row=1, col=1  # target the main scatter subplot
         )
+        fig.show()
 
 
     def staircase():
@@ -218,7 +219,7 @@ if __name__ == '__main__':
         )
         fig.update_xaxes(showgrid=False, zeroline=False, ticks='outside', tickwidth=1, nticks=4, tickfont_size=16)
         fig.update_yaxes(showgrid=False, zeroline=False, ticks='outside', tickwidth=1, nticks=4, tickfont_size=16)
-
+        fig.show()
 
     def cell_params():
 
@@ -293,6 +294,7 @@ if __name__ == '__main__':
         fig.update_layout(font_size=20)
         fig.update_annotations(font_size=20)
         fig.update_traces(opacity=0.5)
+        fig.show()
 
     def crystals_vis():
 

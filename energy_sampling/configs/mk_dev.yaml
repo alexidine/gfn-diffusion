@@ -36,8 +36,8 @@ batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAS
 eval_batch_size: 500        # batch size for evaluation (adaptive)
 eval_num_samples: 1000       # minimum number of samples for evaluation
 epochs: 1000000             # number of training epochs
-eval_period: 250              # how often to do evaluation & reporting
-figs_period: 500             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+eval_period: 25              # how often to do evaluation & reporting
+figs_period: 25             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 conditional_eval_period: 1000 # DEPRECATED # how often to do conditional evaluation with figs # must be multiple of eval period
 
 # GFlowNet settings
@@ -86,7 +86,7 @@ bwd_loss_coeffs:
 anchor_fwd_bwd: true  # whether to do this at all
 btb_threshold: 2.0 # ratio of thermalization_conv_eps at which we activate emergency bwd training
 phase_change_time: 200  # time to adjust loss coefficients between phases
-thermalization_conv_eps: 10.0 #0.5
+thermalization_conv_eps: 10.0
 init_kld_threshold: 0.5
 anchor_noise_fraction: 1.0
 anchor_noise_level: 0.05 # much higher than this is a total disaster
@@ -147,7 +147,7 @@ space_groups: [ 2 ]  # which space groups to sample over
 zp_conditioning: false # whether to condition over z prime values
 z_primes: [ 1 ]
 lj_rescale: [-293, 99, -31, 41]  # mean and std by which to rescale LJ to align with uma
-energy_function: 'elj'
+energy_function: 'uma'
   # 'latent_harmonic' : unimodal harmonic potential in the latent space
   # 'crystal_harmonic': unimodal harmonic potential in the crystal space
   # 'latent_multiharmonic': multimodal harmonic potential in the latent space
