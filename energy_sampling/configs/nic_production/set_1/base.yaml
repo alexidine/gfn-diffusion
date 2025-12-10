@@ -118,6 +118,7 @@ prioritized: null #"boltzmann"   # three kinds of replay training: random, rewar
 sampling: "buffer"  # no alternative for right now
 buffer_size: 20000          # size of replay buffer
 grow_buffer: false  # can be toggled on or off in certain training modes
+noised_buffer_length: 200000
 
 # exploration controls
 ################################################################

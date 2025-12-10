@@ -96,6 +96,7 @@ mol_embedding_type: autoencoder
 molecule: nicotinamide
 molecule_conditioning: false
 molecules_path: /scratch/mk8347/csd_runs/datasets/nicotinamide/protonated_nicotinamide.pt
+noised_buffer_length: 200000
 norm: layer
 pb_drift_range: 0.2
 pb_var_range: 2
