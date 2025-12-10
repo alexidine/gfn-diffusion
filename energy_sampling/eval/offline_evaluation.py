@@ -66,7 +66,7 @@ energy_function = MolecularCrystal(device=args.device,
                                    sg_conditioning=args.sg_conditioning,
                                    space_groups=args.space_groups,
                                    bounding_coeff=args.bounding_coeff,
-                                   niggli_coeff=args.niggli_coeff,
+                                   reduction_coeff=args.reduction_coeff,
                                    # todo add z prime info
                                    )
 

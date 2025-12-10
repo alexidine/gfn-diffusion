@@ -765,8 +765,8 @@ def log_metrics(energy_function,
     # physical properties
     metrics['Mean Packing Coeff'] = sample_batch.packing_coeff.mean().cpu().detach().item()
     metrics['Packing Coeff'] = sample_batch.packing_coeff.clip(max=2).cpu().detach().numpy()
-    metrics['Niggli Overlap'] = sample_batch.niggli_overlap.cpu().detach().numpy()
-    metrics['Niggli Invalid Fraction'] = np.mean(sample_batch.niggli_overlap.cpu().detach().numpy() < 0)
+    metrics['Reduction Energy'] = sample_batch.reduction_en.cpu().detach().numpy()
+    metrics['Reduced Valid Fraction'] = np.mean(sample_batch.reduction_en.cpu().detach().numpy() < 1e-3)
 
     # conditions
     metrics['Crystal Mean Log Temperature'] = log_T_tensor.mean().item()
@@ -844,6 +844,8 @@ def log_metrics(energy_function,
                 np.quantile(buffer.rewards_list, q=p)
                 for p in np.linspace(0, 1, 50)
             ])
+            metrics['Buffer Noised Length'] = buffer.noised_size
+            metrics['Buffer Noised Mean Reward'] = torch.mean(buffer.noised_rewards)
             metrics['Buffer Mean Score'] = np.mean(np.nan_to_num(buffer.rewards_list))
 
             (buffer_cell_params, buffer_latent_params,

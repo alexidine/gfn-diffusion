@@ -52,7 +52,7 @@ class MolecularCrystal(BaseSet):
                  zp_conditioning: bool = False,
                  space_groups: Optional[list] = [2],
                  bounding_coeff: float = 1.0,
-                 niggli_coeff: float = 1.0,
+                 reduction_coeff: float = 1.0,
                  max_z_prime: int = 1,
                  z_primes: Tuple[int] = (1,),
                  uma_path: Optional[str] = None,
@@ -73,7 +73,7 @@ class MolecularCrystal(BaseSet):
         self.temperature_conditioning = temperature_conditioning
         self.lj_coeff = lj_coeff
         self.bounding_coeff = bounding_coeff
-        self.niggli_coeff = niggli_coeff
+        self.reduction_coeff = reduction_coeff
         self.molecule_conditioning = molecule_conditioning
         self.sg_conditioning = sg_conditioning
         self.space_groups = space_groups
@@ -94,7 +94,7 @@ class MolecularCrystal(BaseSet):
         for sg in range(1, 230):
             self.sg_cache[sg] = np.stack(SYM_OPS[int(sg)])
 
-        self.computes = ['lj', 'niggli_overlap']
+        self.computes = ['lj', 'reduction_en']
         if self.energy_function != 'lj' and self.energy_function != 'uma':
             self.computes.append(self.energy_function)
 
@@ -108,7 +108,8 @@ class MolecularCrystal(BaseSet):
         max_reward = max(dataset_rewards)
         reward_range = self.reward_range
         min_allowed_reward = max_reward - reward_range
-        self.energy_clip = float(- min_allowed_reward * self.temperature)  # convert the minimum allowed reward to a clip on the energy
+        self.energy_clip = float(
+            - min_allowed_reward * self.temperature)  # convert the minimum allowed reward to a clip on the energy
 
     def instantiate_crystals(self, x, mol_batch):
         crystal_batch = self.init_blank_crystal_batch(mol_batch)
@@ -125,7 +126,6 @@ class MolecularCrystal(BaseSet):
                                         supercell_size=5,
                                         std_orientation=False)
 
-
             if self.energy_function == 'uma':
                 # clear memory
                 torch.cuda.empty_cache()
@@ -135,7 +135,8 @@ class MolecularCrystal(BaseSet):
                     predictor=self.uma_predictor,
                     std_orientation=False) * 96.485  # output in kJ/mol (of unit cells)
                 out.update({'uma_pot': uma_energy,
-                            'uma': uma_energy/crystal_batch.sym_mult - crystal_batch.uma_gas_pot})
+                            'uma': uma_energy / (
+                                        crystal_batch.sym_mult * crystal_batch.z_prime) - crystal_batch.uma_gas_pot})
 
         for key in out.keys():
             crystal_batch.add_graph_attr(out[key], key)
@@ -173,13 +174,13 @@ class MolecularCrystal(BaseSet):
         if self.energy_function in ['lj', 'qlj', 'elj', 'silu', 'uma']:
             density_energy = density_penalty(crystal_batch.packing_coeff)
             if self.energy_function == 'lj':
-                mol_energy = crystal_batch.lj  # / crystal_batch.num_atoms
+                mol_energy = crystal_batch.lj / crystal_batch.z_prime
             elif self.energy_function == 'qlj':
-                mol_energy = crystal_batch.qlj  # / crystal_batch.num_atoms
+                mol_energy = crystal_batch.qlj / crystal_batch.z_prime
             elif self.energy_function == 'elj':
-                mol_energy = crystal_batch.elj
+                mol_energy = crystal_batch.elj / crystal_batch.z_prime
             elif self.energy_function == 'silu':
-                mol_energy = crystal_batch.silu  # / crystal_batch.num_atoms
+                mol_energy = crystal_batch.silu / crystal_batch.z_prime
             elif self.energy_function == 'uma':
                 mol_energy = crystal_batch.uma
             else:
@@ -190,14 +191,14 @@ class MolecularCrystal(BaseSet):
                 lj_mean, lj_std, uma_mean, uma_std = self.lj_rescale
                 mol_energy = (mol_energy - lj_mean) / lj_std * uma_std + uma_mean
 
-            niggli_energy = F.relu(-crystal_batch.niggli_overlap) ** 2  # punish negative overlaps
+            reduction_energy = F.relu(crystal_batch.reduction_en)  # punish positive energies
 
-            ens_dict['niggli_energy'] = niggli_energy
+            ens_dict['reduction_energy'] = reduction_energy
             ens_dict['mol_energy'] = mol_energy
             ens_dict['density_energy'] = density_energy
             ens_dict['bounding_energy'] = bounding_energy
         else:
-            niggli_energy = torch.zeros_like(bounding_energy)
+            reduction_energy = torch.zeros_like(bounding_energy)
 
         if self.energy_function == 'latent_harmonic':
             crystal_energy = self.latent_harmonic_en(crystal_batch, latents)
@@ -219,13 +220,13 @@ class MolecularCrystal(BaseSet):
         if self.energy_clip is not None:
 
             total_energy = log_rescale_positive(crystal_energy,
-                                                self.energy_clip) + bounding_energy * self.bounding_coeff + niggli_energy * self.niggli_coeff
+                                                self.energy_clip) + bounding_energy * self.bounding_coeff + reduction_energy * self.reduction_coeff
             return (log_rescale_positive(total_energy, self.energy_clip + 0.1 * np.abs(self.energy_clip)),
                     # to prevent total saturation by the energy function, add a buffer over the clip
                     ens_dict)
         else:
 
-            total_energy = crystal_energy + bounding_energy * self.bounding_coeff + niggli_energy * self.niggli_coeff
+            total_energy = crystal_energy + bounding_energy * self.bounding_coeff + reduction_energy * self.reduction_coeff
             return total_energy, ens_dict
 
     def compute_zp_order_penalty(self, bounding_energy, crystal_batch):
@@ -367,7 +368,7 @@ class MolecularCrystal(BaseSet):
             'aunit_orientation': zones3,
             'lj': zeros1,
             'scaled_lj': zeros1,
-            'niggli_overlap': zeros1,
+            'reduction_en': zeros1,
             'T_fc': eye3,
             'T_cf': eye3,
             'cell_volume': zeros1,
@@ -400,20 +401,21 @@ class MolecularCrystal(BaseSet):
         Return random crystal sample
         note this is NOT weighted by energy
         """
-        with torch.no_grad():
-            crystal_batch = self.init_blank_crystal_batch(batch_size)
-            if not reasonable_only:
-                crystal_batch.sample_random_reduced_crystal_parameters(target_packing_coeff=target_packing_coeff)
-
-            else:  # higher quality crystals, but expensive
-                crystal_batch.sample_reasonable_random_parameters(
-                    tolerance=3,
-                    max_attempts=50,
-                    target_packing_coeff=target_packing_coeff,
-                    sample_niggli=True
-                )
-
-            return crystal_batch.zp1_std_cell_parameters()
+        assert False, "not implemented"
+        # with torch.no_grad():
+        #     crystal_batch = self.init_blank_crystal_batch(batch_size)
+        #     if not reasonable_only:
+        #         crystal_batch.sample_random_reduced_crystal_parameters(target_packing_coeff=target_packing_coeff)
+        #
+        #     else:  # higher quality crystals, but expensive
+        #         crystal_batch.sample_reasonable_random_parameters(
+        #             tolerance=3,
+        #             max_attempts=50,
+        #             target_packing_coeff=target_packing_coeff,
+        #             sample_niggli=True
+        #         )
+        #
+        #     return crystal_batch.zp1_std_cell_parameters()
 
     def get_conditioning_tensor(self,
                                 mol_batch,

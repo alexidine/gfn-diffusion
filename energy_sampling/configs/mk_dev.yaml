@@ -17,7 +17,7 @@ ema_decay: 0.95 #0.99  # set to null for no ema
 
 # model parameters
 #checkpoint_path: C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints\nic_good_elj_model_train.pt #D:\crystal_datasets\nic12_model_train_hit_prior.pt # if you put the train model, it will automatically load the relevant config and eval model
-checkpoint_path: D:\crystal_datasets\nic12_model_train_hit_prior.pt # if you put the train model, it will automatically load the relevant config and eval model
+checkpoint_path: null #D:\crystal_datasets\nic12_model_train_hit_prior.pt # if you put the train model, it will automatically load the relevant config and eval model
 zero_init: False
 joint_layers: 4              # number of layers in forward/backward policy models
 hidden_dim: 1024             # dimensionality of hidden layer
@@ -30,14 +30,14 @@ norm: layer                   # null, "layer" - DON'T PUT 'batch'
 
 batch_size: 10              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_fwd_batch_size: 1000
+max_fwd_batch_size: 250
 max_bwd_batch_size: 1000
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
 eval_batch_size: 500        # batch size for evaluation (adaptive)
 eval_num_samples: 1000       # minimum number of samples for evaluation
 epochs: 1000000             # number of training epochs
-eval_period: 25              # how often to do evaluation & reporting
-figs_period: 25             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+eval_period: 100              # how often to do evaluation & reporting
+figs_period: 200             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 conditional_eval_period: 1000 # DEPRECATED # how often to do conditional evaluation with figs # must be multiple of eval period
 
 # GFlowNet settings
@@ -86,8 +86,8 @@ bwd_loss_coeffs:
 anchor_fwd_bwd: true  # whether to do this at all
 btb_threshold: 2.0 # ratio of thermalization_conv_eps at which we activate emergency bwd training
 phase_change_time: 200  # time to adjust loss coefficients between phases
-thermalization_conv_eps: 10.0
-init_kld_threshold: 0.5
+thermalization_conv_eps: 0.5
+init_kld_threshold: 0.075
 anchor_noise_fraction: 1.0
 anchor_noise_level: 0.05 # much higher than this is a total disaster
 
@@ -100,18 +100,18 @@ learn_pb: true               # whether to learn a correction to the backward pol
 learned_variance: True       # whether to learn policy variance
 clipping: true  # clip the maximum step size induced by the policy model
 gfn_clip: 200.0  # clip the maximum step size induced by the policy model
-reward_range: 40 # range of reward values allowed, null to go unrestricted
+reward_range: 80 # range of reward values allowed, null to go unrestricted
 
 # dataset settings
 ################################################################
 uma_path: 'D:\crystal_datasets\esen_s.pt'
 #buffer_path: 'D:/crystal_datasets/opt_outputs/acridine_sg_14_zp_1_2.pt'
-buffer_path: 'D:/crystal_datasets/opt_outputs/new_nic_2_zp1.pt' #'D:/crystal_datasets/urea_gfn_dataset.pt' #
+buffer_path: 'D:\crystal_datasets\opt_outputs\reduced_nic_sg2_zp2.pt' #'D:/crystal_datasets/urea_gfn_dataset.pt' #
 #buffer_path: 'D:/crystal_datasets/test_qm9_crystals_test.pt' #'D:/crystal_datasets/nic_sg2_dataset.pt' #'D:/crystal_datasets/urea_gfn_dataset.pt' #
 #molecules_path: 'D:/crystal_datasets/train_qm9.pt'
 #molecules_path: 'D:/crystal_datasets/acridine.pt'
-molecules_path: 'D:/crystal_datasets/protonated_nicotinamide.pt'
-autoencoder_path: 'D:/crystal_datasets/model_checkpoints/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
+molecules_path: 'D:/crystal_datasets/nicoam/protonated_nicotinamide.pt'
+autoencoder_path: null #'D:/crystal_datasets/model_checkpoints/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
 
 #buffer_path: '/scratch/mk8347/csd_runs/datasets/nicotinamide_sg_1_2.pt'
 #molecules_path: '/scratch/mk8347/csd_runs/datasets/nicotinamide.pt'
@@ -127,7 +127,8 @@ buffer_dist_cutoff: 0.5  # 0.5 a bit loose, 0.75 a bit tight
 prioritized: null #"boltzmann"   # three kinds of replay training: random, reward prioritized (Boltzmann), rank-based
 sampling: "buffer"  # no alternative for right now
 buffer_size: 20000          # size of replay buffer
-grow_buffer: true  # can be toggled on or off in certain training modes
+grow_buffer: false  # can be toggled on or off in certain training modes
+noised_buffer_length: 200000
 
 # exploration controls
 ################################################################
@@ -145,9 +146,9 @@ mol_embedding_type: 'autoencoder'  # principal_axes or autoencoder
 sg_conditioning: False  # whether to conditionally sample across space groups
 space_groups: [ 2 ]  # which space groups to sample over
 zp_conditioning: false # whether to condition over z prime values
-z_primes: [ 1 ]
+z_primes: [ 2 ]
 lj_rescale: [-293, 99, -31, 41]  # mean and std by which to rescale LJ to align with uma
-energy_function: 'uma'
+energy_function: 'elj'
   # 'latent_harmonic' : unimodal harmonic potential in the latent space
   # 'crystal_harmonic': unimodal harmonic potential in the crystal space
   # 'latent_multiharmonic': multimodal harmonic potential in the latent space
@@ -162,9 +163,8 @@ anneal_temperature: False  # scale temperature over time, when conditional it sc
 temp_annealing_max_steps: 2000  # time for scaling_factor to reach 1 (uniform sampling from min to max)
 energy_density_coeff: 10.0  # how much to weight the density penalty term in the energy function
 bounding_coeff: 10.0
-niggli_coeff: 10.0
+reduction_coeff: 10.0
 energy_lj_coeff: 1.0  # loss coefficient
-lj_turnover_pot: 10.0  # value above which molecular LJ potential is softly clipped
 energy_min_temperature: 0.1  # for conditional or annealing
 energy_max_temperature: 10   # for conditional only
 # note for physical potentials i.e., UMA - kT at room temperature is ~2.5

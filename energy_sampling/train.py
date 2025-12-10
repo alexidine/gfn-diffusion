@@ -69,6 +69,7 @@ class Modeller:
         self.bwd_tb_norm = None
         self.last_fwd_it = 0
         self.last_bwd_it = 0
+        self.step_ind = 0
 
     def train_logic(self, buffer, it):
         do_forward = False
@@ -275,7 +276,7 @@ class Modeller:
             'sg_conditioning': self.args.sg_conditioning,
             'space_groups': self.args.space_groups,
             'bounding_coeff': self.args.bounding_coeff,
-            'niggli_coeff': self.args.niggli_coeff,
+            'reduction_coeff': self.args.reduction_coeff,
             'z_primes': self.args.z_primes,
             'max_z_prime': max(self.args.z_primes),
             'zp_conditioning': self.args.zp_conditioning,
@@ -292,7 +293,9 @@ class Modeller:
             eval_path = self.args.checkpoint_path.replace('train', 'eval')
             config_path = self.args.checkpoint_path.replace('train', 'config').replace('.pt', '.npy').replace(
                 '_hit_prior', '').replace('_thermalized', '')
+            state_path = self.args.checkpoing_path.replace('_hit_prior', '').replace('_thermalized', '').replace('model_train','modeller_state')
 
+            self.load_modeller_state(state_path)
             gfn_config = np.load(config_path, allow_pickle=True).item()
             gfn_model = GFN(**gfn_config).to(self.device)
             gfn_model.load_state_dict(torch.load(self.args.checkpoint_path))
@@ -397,6 +400,7 @@ class Modeller:
             keep_initial_samples=self.args.buffer_path is not None,
             max_z_prime=energy_function.max_z_prime,
             buffer_dist_cutoff=self.args.buffer_dist_cutoff,
+            noised_buffer_length=self.args.noised_buffer_length,
         )
         if ((self.args.both_ways or self.args.bwd) and
                 self.args.buffer_path is not None):  # preload samples into the buffer
@@ -404,7 +408,7 @@ class Modeller:
                                                 filter_unbound=True)
 
         if len(buffer) > 0 and (self.args.molecule != 'qm9'):
-            mols_list = self.init_mol_from_buffer(buffer, energy_function.max_z_prime)
+            mols_list = self.init_mol_from_buffer(buffer, self.args.z_primes)
             train_mols_list = []
             test_mols_list = []
             while len(train_mols_list) < int(self.args.max_fwd_batch_size * 1.5):
@@ -460,7 +464,7 @@ class Modeller:
 
         return buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator
 
-    def init_mol_from_buffer(self, buffer, max_z_prime):
+    def init_mol_from_buffer(self, buffer, z_primes):
         # this structure assumes the MXT format, where for Z'>1 samples, the mols are stacked in the same spot, in the same order
         sample = buffer.dataset[0]
         atoms_per_mol = sample.num_atoms // sample.z_prime
@@ -468,7 +472,7 @@ class Modeller:
         atom_coords = sample.pos[:atoms_per_mol]
         atom_coords -= atom_coords.mean(dim=0)
         mols = []
-        for zp in range(1, max_z_prime + 1):
+        for zp in z_primes:
             mols.append(MolData(
                 z=atom_types.repeat(zp),
                 pos=atom_coords.repeat(zp, 1),
@@ -595,8 +599,9 @@ class Modeller:
             gfn_model.train()
             self.set_detect_anomaly(gfn_model, do_anomaly_detection=False)
 
-            for step_ind in trange(self.args.epochs + 1):
+            for step_ind in trange(self.step_ind, self.args.epochs + 1):
                 metrics = dict()
+                self.step_ind = step_ind
                 if step_ind % 10 == 0:
                     self.set_loss_coeffs(step_ind)
 
@@ -679,6 +684,7 @@ class Modeller:
                 if step_ind % 50 == 0:  # save running model
                     torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train.pt')
                     torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval.pt')
+                    self.save_modeller_state(name)
 
             torch.save(ema_model, f'checkpoints/{name}_model_final.pt')
 
@@ -759,7 +765,7 @@ class Modeller:
                    energy_function,
                    gfn_model,
                    optimizers,
-                   it,
+                   step_ind,
                    exploration_std,
                    buffer,
                    mol_iterator,
@@ -805,6 +811,7 @@ class Modeller:
         elif do_backward:
             optimizers['bwd'].zero_grad(set_to_none=True)
             loss, loss_dict = self.bwd_train_step(
+                step_ind,
                 gfn_model,
                 discretizer,
                 buffer,
@@ -820,29 +827,29 @@ class Modeller:
             if self.fwd_tb_norm is None:
                 self.fwd_tb_norm = float(loss_dict['normed_tb'])
             else:
-                dt = it - self.last_fwd_it
+                dt = step_ind - self.last_fwd_it
                 beta_fwd = np.exp(-dt / T)
                 self.fwd_tb_norm = float(
                     self.fwd_tb_norm * beta_fwd + (1 - beta_fwd) * loss_dict['normed_tb'])
-            self.last_fwd_it = it
+            self.last_fwd_it = step_ind
 
         if do_backward and loss_dict is not None:
             if self.bwd_tb_norm is None:
                 self.bwd_tb_norm = float(loss_dict['normed_tb'])
             else:
-                dt = it - self.last_bwd_it
+                dt = step_ind - self.last_bwd_it
                 beta_bwd = np.exp(-dt / T)
                 self.bwd_tb_norm = float(
                     self.bwd_tb_norm * beta_bwd + (1 - beta_bwd) * np.nan_to_num(loss_dict['normed_tb'].cpu().detach(), posinf=self.bwd_tb_norm))
-            self.last_bwd_it = it
+            self.last_bwd_it = step_ind
 
         skip_step = False
         if self.phase == 2:
             if self.bwd_tb_norm <= self.args.thermalization_conv_eps:  # hit stage 2 convergence criteria
-                self.phase2to3(ema_model, gfn_model, 0.1, name, it)
+                self.phase2to3(ema_model, gfn_model, 0.1, name, step_ind)
 
         if self.phase == 3:
-            skip_step = self.update_controller(it, do_backward, skip_step)
+            skip_step = self.update_controller(step_ind, do_backward, skip_step)
 
         if not skip_step:
             self.step_loss(do_backward, do_forward, gfn_model, loss, optimizers)
@@ -917,7 +924,7 @@ class Modeller:
                                     repeats=repeats,
                                     report_losses=report_losses)
 
-    def bwd_train_step(self, gfn_model, discretizer,
+    def bwd_train_step(self, step_ind, gfn_model, discretizer,
                        buffer, energy_function, repeats: int = 10,
                        report_losses: bool = False):
         if self.args.sampling == 'buffer':
@@ -929,11 +936,15 @@ class Modeller:
             assert False, f"sampling method {self.args.sampling} not implemented"
 
         if self.args.bwd_loss_coeffs.noised_fraction > 0:
-            condition, rewards, samples, crystal_batch = substitute_prior(
-                self.args.bwd_loss_coeffs, condition, crystal_batch,
-                energy_function, rewards, samples, buffer)
-            if self.grow_buffer:
-                buffer.add_to_staging(data_batch=crystal_batch.cpu().detach())
+            if buffer.noised_size <= 10*self.backward_batch_size or (step_ind % 10 == 0):  # draw noised samples
+                condition, rewards, samples, crystal_batch = substitute_prior(
+                    self.args.bwd_loss_coeffs, condition, crystal_batch,
+                    energy_function, rewards, samples, buffer)
+                if self.grow_buffer:
+                    buffer.add_to_staging(data_batch=crystal_batch.cpu().detach())
+                    buffer.add_to_noised(rewards, samples)
+            else:
+                rewards, samples = buffer.sample_from_noised(int(self.backward_batch_size))
 
         return get_gfn_backward_loss(self.args.bwd_loss_coeffs,
                                      samples.to(self.device),
@@ -1045,13 +1056,7 @@ class Modeller:
                               ):
         print("Loading prebuilt buffer")
         dataset = torch.load(dataset_path, weights_only=False)
-        for elem in dataset:
-            elem.lj = elem.lj_pot  # todo remove this later
-            del elem.lj_pot
 
-        if 'nic_14_zp1.pt' in dataset_path:
-            dataset = [elem for elem in dataset if
-                       elem.identifier == 'NICOAM']  # TODO delete - some confusion in this dataset around conformations
         max_z_prime = max([int(elem.z_prime) for elem in dataset])
         assert max_z_prime == max(self.args.z_primes), "Preloaded data max z prime must match model"
 
@@ -1107,7 +1112,7 @@ class Modeller:
                                     uma_path=self.args.uma_path)
 
         # always filter awful crystals
-        dataset = [elem for elem in dataset if elem.niggli_overlap >= 0]
+        dataset = [elem for elem in dataset if elem.reduction_en <= 1e-3]
         dataset = [elem for elem in dataset if elem.packing_coeff >= 0.55]
         dataset = [elem for elem in dataset if elem.packing_coeff <= 0.95]
 
@@ -1120,7 +1125,7 @@ class Modeller:
             print("Getting preloaded dataset molecule embeddings")
             dataset = embed_dataset(dataset, self.args.autoencoder_path, self.device, encoder=None)
 
-        buffer.add(dataset, max_z_prime)
+        buffer.add(dataset)
         print(f"Buffer loaded with {len(dataset)} samples")
 
         return buffer
@@ -1148,7 +1153,8 @@ class Modeller:
         self.times['eval_sampling_end'] = time()
 
         self.times['eval_buffering_start'] = time()
-        buffer.incorporate_staging_buffer()
+        if len(buffer.staging_buffer) > 0:
+            buffer.incorporate_staging_buffer()
 
         self.times['eval_buffering_end'] = time()
 
@@ -1301,11 +1307,6 @@ class Modeller:
         return flow_states, gauss_params_f, log_T_tensor, log_Z, log_Z_lb, log_Z_learned, log_pbs, log_pfs, log_r, sample_batch
 
     def manage_prior_anchor(self, step_ind, metrics, gfn_model, ema_model, name):
-        min_rat = 1 / 100
-        max_rat = 1000
-        self.bwd_tb_record = []
-        self.logz_record = []
-        self.n_eval_steps = int(max(1, 10 // self.args.eval_period))  # the trailing thermalization time is 500
 
         if self.phase == 1:
             metric = metrics['Max Latent KLD']
@@ -1362,6 +1363,7 @@ class Modeller:
         torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train_hit_prior.pt')
         torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval_hit_prior.pt')
         self.phase = 2
+        self.grow_buffer = True
 
     def phase2to3(self, ema_model, gfn_model, init_rat, name, step_ind):
         #print("Thermalization complete. Moving to forward training & refinement.")
@@ -1377,6 +1379,43 @@ class Modeller:
         "set cooldown"
         self.increasing_loss_cooldown = self.args.phase_change_time
         self.grow_buffer = True
+
+    def save_modeller_state(self, name):
+        state = dict(
+            phase=self.phase,
+            fwd_tb_norm=self.fwd_tb_norm,
+            bwd_tb_norm=self.bwd_tb_norm,
+            step_ind=self.step_ind,
+            last_fwd_it=self.last_fwd_it,
+            last_bwd_it=self.last_bwd_it,
+            fwd_to_bwd_ratio=self.args.fwd_to_bwd_ratio,
+            increasing_loss_cooldown=self.increasing_loss_cooldown,
+            lr_warmup_finished=self.lr_warmup_finished,
+            hit_init_kld=self.hit_init_kld,
+            forward_batch_size=self.forward_batch_size,
+            backward_batch_size=self.backward_batch_size,
+        )
+        torch.save(state, f'checkpoints/{name}_modeller_state.pt')
+
+    def load_modeller_state(self, path):
+        if not os.path.exists(path):
+            print("No modeller state found; starting fresh.")
+            return
+
+        state = torch.load(path)
+
+        self.phase = state['phase']
+        self.step_ind = state['step_ind']
+        self.fwd_tb_norm = state['fwd_tb_norm']
+        self.bwd_tb_norm = state['bwd_tb_norm']
+        self.last_fwd_it = state['last_fwd_it']
+        self.last_bwd_it = state['last_bwd_it']
+        self.args.fwd_to_bwd_ratio = state['fwd_to_bwd_ratio']
+        self.increasing_loss_cooldown = state['increasing_loss_cooldown']
+        self.lr_warmup_finished = state['lr_warmup_finished']
+        self.hit_init_kld = state['hit_init_kld']
+        self.forward_batch_size = state['forward_batch_size']
+        self.backward_batch_size = state['backward_batch_size']
 
 
 if __name__ == '__main__':

@@ -1,15 +1,10 @@
 from typing import Optional
 
-import hdbscan
 import numpy as np
 import torch
-from poetry.console.commands import self
 from scipy.spatial.transform import Rotation
 from torch_geometric.loader import DataLoader
-from torch_scatter import scatter
 
-from mxtaltools.common.utils import is_cuda_oom
-from mxtaltools.crystal_building.crystal_latent_transforms import compute_niggli_overlap
 from mxtaltools.dataset_utils.utils import collate_data_list
 from utils import compute_sample_overlap, iter_forever
 
@@ -26,6 +21,7 @@ class CrystalReplayBuffer:
                  diversity_coeff: float = 0.0,
                  max_z_prime: int = 1,
                  buffer_dist_cutoff: float = 0.25,
+                 noised_buffer_length: int = 100000,
                  ):
         self.buffer_size = buffer_size
         self.prioritized = prioritized
@@ -47,10 +43,16 @@ class CrystalReplayBuffer:
         self.max_z_prime = max_z_prime
         self.buffer_dist_cutoff = buffer_dist_cutoff
         self.staging_buffer = []
+        self.noised_buffer_length = noised_buffer_length
+        self.noised_rewards = torch.zeros(self.noised_buffer_length, dtype=torch.float32, device='cpu')
+        self.noised_samples = torch.zeros((self.noised_buffer_length, 6+6*max_z_prime), dtype=torch.float32, device='cpu')
+        self.noised_ptr = 0
+        self.noised_size = 0
 
     @torch.no_grad()
     def add_to_staging(self, data_list=None, data_batch=None):
-        if len(self.staging_buffer) < len(self):  # don't stage a crazy number of samples - downstream cost becomes too high
+        if len(self.staging_buffer) < len(
+                self):  # don't stage a crazy number of samples - downstream cost becomes too high
             if data_list is None and data_batch is not None:
                 data_list = data_batch.batch_to_list()
 
@@ -58,12 +60,11 @@ class CrystalReplayBuffer:
 
     @torch.no_grad()
     def add(self,
-            data_list=None,
-            max_z_prime: int = 1):
+            data_list=None):
         if self.dataset is None:
-            self.init_fresh_dataset(data_list, max_z_prime)
+            self.init_fresh_dataset(data_list)
         else:
-            self.add_samples_to_dataset(data_list, max_z_prime)
+            self.add_samples_to_dataset(data_list)
 
         if len(self) > self.buffer_size:  # pare down buffer
             self.truncate_buffer()
@@ -73,17 +74,18 @@ class CrystalReplayBuffer:
         # self.init_loader()  # never used
 
     def incorporate_staging_buffer(self):
-        self.add_samples_to_dataset(self.staging_buffer, 1, skip_staging=True)
-        self.staging_buffer = []
+        if len(self.staging_buffer) > 0:  # will fail if staging buffer is empty
+            self.add_samples_to_dataset(self.staging_buffer, skip_staging=True)
+            self.staging_buffer = []
 
-        if len(self) > self.buffer_size:  # pare down buffer
-            self.truncate_buffer()
+            if len(self) > self.buffer_size:  # pare down buffer
+                self.truncate_buffer()
 
-        assert len(self.dataset) == len(self.x_list) == len(self.rewards_list)
+            assert len(self.dataset) == len(self.x_list) == len(self.rewards_list)
 
         # self.init_loader()  # never used
 
-    def add_samples_to_dataset(self, data_list, max_z_prime, skip_staging: bool = False):
+    def add_samples_to_dataset(self, data_list, skip_staging: bool = False):
         # batch samples
         if not skip_staging:
             if len(self.staging_buffer) > 0:  # include staged samples
@@ -103,7 +105,7 @@ class CrystalReplayBuffer:
         score_cut = max(self.reward_clip, np.amin(self.rewards_list))  # the lowest reward in our dynamical range
         packing_coeffs = data_batch.packing_coeff.cpu().detach().numpy()
         good_inds = [ind for ind in range(len(data_list)) if
-                     (data_list[ind].niggli_overlap >= 0) and (scores[ind] > score_cut) and (
+                     (data_list[ind].reduction_en >= 1e-3) and (scores[ind] > score_cut) and (
                              packing_coeffs[ind] > 0.55) and (packing_coeffs[ind] < 0.95)]
         # add anything reasonable
         if len(good_inds) > 0:
@@ -114,13 +116,13 @@ class CrystalReplayBuffer:
             self.rewards_list.extend(good_scores.flatten().cpu().detach().numpy())
             self.sg_list.extend([new_sgs[i] for i in good_inds])
 
-    def init_fresh_dataset(self, data_list, max_z_prime):
+    def init_fresh_dataset(self, data_list):
         self.dataset = list(data_list)  # I think this is memory safe and faster #copy.deepcopy(data_list)
         for elem in self.dataset:  # have to do this now because collation is a mess
             del elem.fingerprint, elem.smiles, elem.mol_ind, elem.identifier, (
                 elem.aunit_batch), elem.skip_box_analysis, elem.cocrystal, elem.symmetry_operators
 
-        dataset_batch = collate_data_list(self.dataset, max_z_prime=max_z_prime)
+        dataset_batch = collate_data_list(self.dataset, max_z_prime=self.max_z_prime)
         x_tensor = dataset_batch.latent_params()
         rewards = self.energy_function.prebuilt_sample_to_reward(
             dataset_batch,
@@ -206,7 +208,7 @@ class CrystalReplayBuffer:
             return len(self.dataset)
 
     @torch.no_grad()
-    def bottom_up_cluster(self, xx, e, d_cut, e_cut, max_new_samples:int):
+    def bottom_up_cluster(self, xx, e, d_cut, e_cut, max_new_samples: int):
 
         if torch.cuda.is_available():
             device = 'cuda'
@@ -398,6 +400,45 @@ class CrystalReplayBuffer:
         #     samples += torch.randn_like(samples) * noise
         #
         # return samples.clip(min=-6, max=6)
+
+    def add_to_noised(self, rewards, samples):
+        rewards = rewards.detach().to(self.device)
+        samples = samples.detach().to(self.device)
+
+        B = rewards.shape[0]
+        ptr = self.noised_ptr
+        max_size = self.noised_buffer_length
+
+        end = ptr + B
+
+        # Case 1: no wraparound
+        if end <= max_size:
+            self.noised_rewards[ptr:end] = rewards
+            self.noised_samples[ptr:end] = samples
+        else:
+            # Case 2: wraparound
+            first = max_size - ptr
+            self.noised_rewards[ptr:] = rewards[:first]
+            self.noised_samples[ptr:] = samples[:first]
+
+            second = end % max_size
+            self.noised_rewards[:second] = rewards[first:]
+            self.noised_samples[:second] = samples[first:]
+
+        # Update pointer & size
+        self.noised_ptr = end % max_size
+        self.noised_size = min(self.noised_size + B, max_size)
+
+    def sample_from_noised(self, num_samples):
+        if self.noised_size == 0:
+            raise RuntimeError("No noised samples available in buffer.")
+
+        idx = torch.randint(self.noised_size, (num_samples,), device=self.device)
+
+        rewards = self.noised_rewards[idx]
+        samples = self.noised_samples[idx]
+
+        return rewards, samples
 
 
 def collate_fn(data_list):

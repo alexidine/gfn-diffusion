@@ -2,9 +2,7 @@ import argparse
 import gc
 import math
 import os
-import queue
 import random
-import threading
 from argparse import Namespace
 from asyncio import sleep
 from pathlib import Path
@@ -15,14 +13,13 @@ import numpy as np
 import psutil
 import torch
 import yaml
-from torch.nn import functional as F
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
 from mxtaltools.common.config_processing import dict2namespace
-from mxtaltools.common.geometry_utils import batch_molecule_principal_axes_torch, batch_cell_vol_torch
+from mxtaltools.common.geometry_utils import batch_molecule_principal_axes_torch
 from mxtaltools.common.utils import log_rescale_positive
-from mxtaltools.crystal_building.crystal_latent_transforms import enforce_niggli_plane
+# from mxtaltools.crystal_building.crystal_latent_transforms import enforce_niggli_plane
 from mxtaltools.dataset_utils.data_classes import MolCrystalData
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
@@ -262,11 +259,10 @@ def triangle_schedule(it, init, maxval, minval, on, off):
 @torch.no_grad()
 def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 500,
                       max_z_prime: int = 1, uma_path: Optional[str] = None, ):
-
     outputs = []
 
     cutoff = 10
-    computes = ['lj', 'niggli_overlap']
+    computes = ['lj', 'reduction_en']
     if energy_function != 'lj' and energy_function != 'uma':
         computes.append(energy_function)
 
@@ -282,13 +278,12 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
                 [dataset[ind] for ind in range(cursor, min(len(dataset), cursor + batch_size))])
             crystal_batch = crystal_batch  # .to(device)
 
-
             crystal_batch.box_analysis()
             out = crystal_batch.analyze(computes,
-                                  cutoff=cutoff,
-                                  supercell_size=5,
-                                  std_orientation=True,
-                                  )
+                                        cutoff=cutoff,
+                                        supercell_size=5,
+                                        std_orientation=True,
+                                        )
             if energy_function == 'uma':
                 cry_en = crystal_batch.compute_crystal_uma(
                     predictor=uma_predictor,
@@ -297,7 +292,7 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
                     predictor=uma_predictor, std_orientation=True).cpu().detach() * 96.485
                 out.update({'uma_gas_pot': gas_en,
                             'uma_pot': cry_en,
-                            'uma': cry_en/crystal_batch.sym_mult - gas_en})  # lattice energy
+                            'uma': cry_en / crystal_batch.sym_mult - gas_en})  # lattice energy
 
             outputs.append(out)
             cursor += batch_size
@@ -468,35 +463,35 @@ def update_loss_schedule(it, loss_schedules, active_coeffs):
 
 def sample_crystal_prior(crystal_batch, std):
     assert False, "This method needs to be rewritten as the latent prior is no longer std normal"
-    rands = torch.randn((crystal_batch.num_graphs, 12), device=crystal_batch.device) * std
-
-    # enforce the random prior is in the positive niggli plane
-    if not hasattr(crystal_batch, 'latent_transform'):
-        crystal_batch.init_latent_transform()
-    temp_params = crystal_batch.latent_transform.inverse(rands,
-                                                         crystal_batch.sg_ind,
-                                                         crystal_batch.radius)
-    cell_lengths = temp_params[:, :3]
-    cell_angles = temp_params[:, 3:6]
-
-    # rescale cell lengths for a good packing coeff
-    target_packing_coeff = (torch.randn(crystal_batch.num_graphs, device=crystal_batch.device) * 0.075 + 0.65).clip(
-        min=0.55, max=0.95)
-    vol1 = batch_cell_vol_torch(cell_lengths, cell_angles)
-    cp1 = crystal_batch.mol_volume * crystal_batch.sym_mult / vol1
-    correction_ratio = (cp1 / target_packing_coeff) ** (1 / 3)
-    cell_lengths *= correction_ratio[:, None]
-
-    # enforce positive side of niggli plane
-    cell_angles = enforce_niggli_plane(cell_lengths, cell_angles, mode='mirror')
-    temp_params[:, 3:6] = cell_angles
-
-    prior_samples = crystal_batch.latent_transform.forward(temp_params,
-                                                           crystal_batch.sg_ind,
-                                                           crystal_batch.radius
-                                                           ).clip(min=-6, max=6)
-
-    return prior_samples
+    # rands = torch.randn((crystal_batch.num_graphs, 12), device=crystal_batch.device) * std
+    #
+    # # enforce the random prior is in the positive niggli plane
+    # if not hasattr(crystal_batch, 'latent_transform'):
+    #     crystal_batch.init_latent_transform()
+    # temp_params = crystal_batch.latent_transform.inverse(rands,
+    #                                                      crystal_batch.sg_ind,
+    #                                                      crystal_batch.radius)
+    # cell_lengths = temp_params[:, :3]
+    # cell_angles = temp_params[:, 3:6]
+    #
+    # # rescale cell lengths for a good packing coeff
+    # target_packing_coeff = (torch.randn(crystal_batch.num_graphs, device=crystal_batch.device) * 0.075 + 0.65).clip(
+    #     min=0.55, max=0.95)
+    # vol1 = batch_cell_vol_torch(cell_lengths, cell_angles)
+    # cp1 = crystal_batch.mol_volume * crystal_batch.sym_mult / vol1
+    # correction_ratio = (cp1 / target_packing_coeff) ** (1 / 3)
+    # cell_lengths *= correction_ratio[:, None]
+    #
+    # # enforce positive side of niggli plane
+    # cell_angles = enforce_niggli_plane(cell_lengths, cell_angles, mode='mirror')
+    # temp_params[:, 3:6] = cell_angles
+    #
+    # prior_samples = crystal_batch.latent_transform.forward(temp_params,
+    #                                                        crystal_batch.sg_ind,
+    #                                                        crystal_batch.radius
+    #                                                        ).clip(min=-6, max=6)
+    #
+    # return prior_samples
 
 
 @torch.no_grad()
@@ -534,6 +529,7 @@ def manual_batch_to_data_list(batch):
     for key in batch.keys():
         if key not in ['batch', 'ptr', 'edges_dict',
                        'niggli_energy',
+                       'reduction_en',
                        'core_energy',
                        'density_energy',
                        'lj_energy',

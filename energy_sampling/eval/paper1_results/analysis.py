@@ -74,19 +74,19 @@ if __name__ == '__main__':
     else:
         sample_energy = sample_batch.lj
 
-    # sort_inds = torch.argsort(sample_energy)[:batch_size]
-    # terminal_states = sample_latents[sort_inds, :]
-    terminal_states = sample_latents[:batch_size, :]
-    logp_est, _ = estimate_logp_with_convergence(
-        gfn_model, terminal_states, batch_size, n_steps=n_steps, max_repeats=500, tol=1e-2, window=10
-    )
-
-    boltzmann_logprobs = -sample_energy[
-        :batch_size] / 2.5 - gfn_model.flow_model().item()  # unconditional boltzmann factor
-    x = logp_est.cpu().detach()
-    y = boltzmann_logprobs.cpu().detach()
-    linreg = linregress(x, y)
-    go.Figure(go.Scatter(x=x, y=y, mode='markers')).show()
+    # # sort_inds = torch.argsort(sample_energy)[:batch_size]
+    # # terminal_states = sample_latents[sort_inds, :]
+    # terminal_states = sample_latents[:batch_size, :]
+    # logp_est, _ = estimate_logp_with_convergence(
+    #     gfn_model, terminal_states, batch_size, n_steps=n_steps, max_repeats=500, tol=1e-2, window=10
+    # )
+    #
+    # boltzmann_logprobs = -sample_energy[
+    #     :batch_size] / 2.5 - gfn_model.flow_model().item()  # unconditional boltzmann factor
+    # x = logp_est.cpu().detach()
+    # y = boltzmann_logprobs.cpu().detach()
+    # linreg = linregress(x, y)
+    # go.Figure(go.Scatter(x=x, y=y, mode='markers')).show()
 
     "Dimension Reduction"
     real_params = sample_batch.full_cell_parameters()
