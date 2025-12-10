@@ -22,18 +22,21 @@ def overwrite_nested_dict(d1, d2):
 
 
 if __name__ == "__main__":
-    base_path = 'acridine.yaml'
+    base_path = 'base.yaml'
     base, spec_dir = load_yaml(base_path)
 
     ind = 0
     for sg in [ 2,4,9,14, 15, 19, 33, 61 ]:
         for zp in [ 1, 2 ]:
             config = deepcopy(base)
-            config['sgs_to_search'] = [sg]
-            config['zp_to_search'] = [zp]
-            config['run_name'] = f'acridine_sg{sg}_zp{zp}'
+            config['space_groups'] = [sg]
+            config['z_primes'] = [zp]
+            config['run_name'] = f'nic_sg{sg}_zp{zp}'
+            config['tag'] = f'nic_sg{sg}_zp{zp}'
+            config['molecules_path'] = '/scratch/mk8347/csd_runs/datasets/nicotinamide/protonated_nicotinamide.pt'
+            config['buffer_path'] = f'/scratch/mk8347/csd_runs/datasets/nicotinamide/nic_sg{sg}_zp{zp}.pt'
 
-            config_path = f'acridine_{ind}.yaml'
+            config_path = f'{ind}.yaml'
             with open(config_path, 'w') as f:
                 yaml.dump(config, f, default_flow_style=False)
 
