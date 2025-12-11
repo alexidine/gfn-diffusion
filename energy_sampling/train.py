@@ -1057,6 +1057,7 @@ class Modeller:
         print("Loading prebuilt buffer")
         dataset = torch.load(dataset_path, weights_only=False)
 
+        # todo exclude outside latents and warn if there are a shitload of them
         max_z_prime = max([int(elem.z_prime) for elem in dataset])
         assert max_z_prime == max(self.args.z_primes), "Preloaded data max z prime must match model"
 
