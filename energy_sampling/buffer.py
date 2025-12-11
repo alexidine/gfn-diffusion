@@ -105,7 +105,7 @@ class CrystalReplayBuffer:
         score_cut = max(self.reward_clip, np.amin(self.rewards_list))  # the lowest reward in our dynamical range
         packing_coeffs = data_batch.packing_coeff.cpu().detach().numpy()
         good_inds = [ind for ind in range(len(data_list)) if
-                     (data_list[ind].reduction_en >= 1e-3) and (scores[ind] > score_cut) and (
+                     (data_list[ind].reduction_en <= 1e-3) and (scores[ind] > score_cut) and (
                              packing_coeffs[ind] > 0.55) and (packing_coeffs[ind] < 0.95)]
         # add anything reasonable
         if len(good_inds) > 0:
@@ -348,9 +348,6 @@ class CrystalReplayBuffer:
         temperature = 10 ** T_tensor  # first dimension is the log temperature
         reward = self.energy_function.prebuilt_sample_to_reward(
             sample_batch, temperature)  # recompute reward in case parameters have changed
-
-        if hasattr(sample_batch, 'latent_transform'):
-            del sample_batch.latent_transform
 
         latents = sample_batch.latent_params()
         return latents, reward, sample_batch, condition

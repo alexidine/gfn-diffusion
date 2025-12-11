@@ -725,7 +725,6 @@ def get_buffer_stats(buffer):
             # standardize_orientations=True
         )
         buffer_cell_params = buffer_batch.full_cell_parameters().cpu().detach().numpy()
-        del buffer_batch.latent_transform
         buffer_latent_params = buffer_batch.latent_params().cpu().detach().numpy()
         buffer_std_params_for_embedding = buffer_batch.latent_params().cpu().detach().numpy()
         reward = buffer_reward.cpu().detach().numpy()
@@ -853,7 +852,6 @@ def log_metrics(energy_function,
              buffer_batch, buffer_sg_inds) = get_buffer_stats(buffer)
 
             cell_params = sample_batch.zp1_cell_parameters().cpu().detach().numpy()
-            del sample_batch.latent_transform
             latent_params = sample_batch.latent_params().cpu().detach().numpy()
 
             cell_klds = np.zeros(cell_params.shape[1])
