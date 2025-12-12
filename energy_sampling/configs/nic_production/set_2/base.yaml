@@ -1,23 +1,22 @@
-run_name: 'mk_dev'
-tag: 'dev'
+run_name: 'nic_prod_1'
+tag: 'nic_prod_1'
 seed: 12345
 device: 'cuda'
 lr_policy: 5.0e-4              # learning rate of the policy network
 min_lr: 1.0e-6                # ihn
-lr_flow: 10.0e-0                  # learning rate of the flow network
+lr_flow: 1.0e-0                  # learning rate of the flow network
 lr_back: 5.0e-4                # learning rate of the backward pass
 lr_warmup_ratio: 10           # how much smaller the initial (warmup) LR should be than the max policy value
 scheduler: True               # does LR warmup from lr/lr_warup_ratio -> lr -> min_lr over the warmup and annealing period
 lr_warmup_time: 500
-lr_anneal_time: 200000
+lr_anneal_time: 100000
 weight_decay: 1.0E-4
 use_weight_decay: false
 gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weights
 ema_decay: 0.95 #0.99  # set to null for no ema
 
 # model parameters
-#checkpoint_path: C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints\nic_good_elj_model_train.pt #D:\crystal_datasets\nic12_model_train_hit_prior.pt # if you put the train model, it will automatically load the relevant config and eval model
-checkpoint_path: null #D:\crystal_datasets\nic12_model_train_hit_prior.pt # if you put the train model, it will automatically load the relevant config and eval model
+checkpoint_path: null #/scratch/mk8347/csd_runs/datasets/nic12_model_train_hit_prior.pt # if you put the train model, it will automatically load the relevant config and eval model
 zero_init: False
 joint_layers: 4              # number of layers in forward/backward policy models
 hidden_dim: 1024             # dimensionality of hidden layer
@@ -30,14 +29,14 @@ norm: layer                   # null, "layer" - DON'T PUT 'batch'
 
 batch_size: 10              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_fwd_batch_size: 125
-max_bwd_batch_size: 500
+max_fwd_batch_size: 250
+max_bwd_batch_size: 2500
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
 eval_batch_size: 500        # batch size for evaluation (adaptive)
-eval_num_samples: 1000       # minimum number of samples for evaluation
+eval_num_samples: 2000       # minimum number of samples for evaluation
 epochs: 1000000             # number of training epochs
-eval_period: 100              # how often to do evaluation & reporting
-figs_period: 200             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+eval_period: 500              # how often to do evaluation & reporting
+figs_period: 1000             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 conditional_eval_period: 1000 # DEPRECATED # how often to do conditional evaluation with figs # must be multiple of eval period
 
 # GFlowNet settings
@@ -84,11 +83,11 @@ bwd_loss_coeffs:
 
 # for controlling 3-phase convergence protocol
 anchor_fwd_bwd: true  # whether to do this at all
-btb_threshold: 2.0 # ratio of thermalization_conv_eps at which we activate emergency bwd training
+btb_threshold: 1.5 # ratio of thermalization_conv_eps at which we activate emergency bwd training
 phase_change_time: 200  # time to adjust loss coefficients between phases
-thermalization_conv_eps: 0.75
-init_kld_threshold: 0.075
-anchor_noise_fraction: 0.8
+thermalization_conv_eps: 0.5
+init_kld_threshold: 0.05
+anchor_noise_fraction: 0.9
 anchor_noise_level: 0.05 # much higher than this is a total disaster
 
 prior_coverage_ratio: 0.05  # [0, 1] fraction of uniform bin coverage that will satisfy the coverage metric
@@ -104,19 +103,10 @@ reward_range: 80 # range of reward values allowed, null to go unrestricted
 
 # dataset settings
 ################################################################
-uma_path: 'D:\crystal_datasets\esen_s.pt'
-#buffer_path: 'D:/crystal_datasets/opt_outputs/acridine_sg_14_zp_1_2.pt'
-buffer_path: 'D:\crystal_datasets\nicoam\nic_sg19_zp1.pt' #'D:/crystal_datasets/urea_gfn_dataset.pt' #
-#buffer_path: 'D:/crystal_datasets/test_qm9_crystals_test.pt' #'D:/crystal_datasets/nic_sg2_dataset.pt' #'D:/crystal_datasets/urea_gfn_dataset.pt' #
-#molecules_path: 'D:/crystal_datasets/train_qm9.pt'
-#molecules_path: 'D:/crystal_datasets/acridine.pt'
-molecules_path: 'D:/crystal_datasets/nicoam/protonated_nicotinamide.pt'
-autoencoder_path: null #'D:/crystal_datasets/model_checkpoints/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
-
-#buffer_path: '/scratch/mk8347/csd_runs/datasets/nicotinamide_sg_1_2.pt'
-#molecules_path: '/scratch/mk8347/csd_runs/datasets/nicotinamide.pt'
-#autoencoder_path: '/scratch/mk8347/csd_runs/models/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
-
+uma_path: '/scratch/mk8347/models/uma/esen_s.pt'
+buffer_path: '/scratch/mk8347/csd_runs/datasets/new_nic_2_zp1.pt'
+molecules_path: '/scratch/mk8347/csd_runs/datasets/nicoam0.pkl'
+autoencoder_path: null # '/scratch/mk8347/csd_runs/models/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
 
 # replay buffer settings
 # NOTE THESE SETTINGS CURRENTLY UNUSED - BUFFER IS SET TO PRELOADED PRIOR ONLY WITH RANDOM SAMPLING
@@ -144,7 +134,7 @@ temperature_conditioning: False  # if false, temperatures are set to energy_stat
 molecule_conditioning: False  # MUST be true for molecule='qm9' and false else - conditions the generative prediction on the molecule
 mol_embedding_type: 'autoencoder'  # principal_axes or autoencoder
 sg_conditioning: False  # whether to conditionally sample across space groups
-space_groups: [ 19 ]  # which space groups to sample over
+space_groups: [ 2 ]  # which space groups to sample over
 zp_conditioning: false # whether to condition over z prime values
 z_primes: [ 1 ]
 lj_rescale: [-293, 99, -31, 41]  # mean and std by which to rescale LJ to align with uma
@@ -168,6 +158,6 @@ energy_lj_coeff: 1.0  # loss coefficient
 energy_min_temperature: 0.1  # for conditional or annealing
 energy_max_temperature: 10   # for conditional only
 # note for physical potentials i.e., UMA - kT at room temperature is ~2.5
-energy_static_temperature: 5.0 # 2.5 is kT by the way for certain evaluations or static T training. Also initial temperature on unconditional temperature annealing
+energy_static_temperature: 2.5 # 2.5 is kT by the way for certain evaluations or static T training. Also initial temperature on unconditional temperature annealing
 temperature_scaling_factor: 0.01  # controls relative frequency of higher vs lower temperatures in conditional training (higher -> higher)
 
