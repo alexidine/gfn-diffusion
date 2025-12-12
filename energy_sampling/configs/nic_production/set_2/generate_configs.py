@@ -31,8 +31,8 @@ if __name__ == "__main__":
             config = deepcopy(base)
             config['space_groups'] = [sg]
             config['z_primes'] = [zp]
-            config['run_name'] = f'nic_sg{sg}_zp{zp}'
-            config['tag'] = f'nic_sg{sg}_zp{zp}'
+            config['run_name'] = f'nic2_sg{sg}_zp{zp}'
+            config['tag'] = f'nic2_sg{sg}_zp{zp}'
             config['molecules_path'] = '/scratch/mk8347/csd_runs/datasets/nicotinamide/protonated_nicotinamide.pt'
             config['buffer_path'] = f'/scratch/mk8347/csd_runs/datasets/nicotinamide/nic_sg{sg}_zp{zp}.pt'
 

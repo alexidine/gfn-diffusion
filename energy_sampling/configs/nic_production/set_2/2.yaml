@@ -107,7 +107,7 @@ rank_weight: 1.0
 reduction_coeff: 10.0
 repeats: 2
 reward_range: 80
-run_name: nic_sg14_zp1
+run_name: nic2_sg14_zp1
 s_emb_dim: 1024
 sampling: buffer
 scheduler: true
@@ -117,7 +117,7 @@ space_groups:
 - 14
 t_emb_dim: 64
 t_scale: 0.1
-tag: nic_sg14_zp1
+tag: nic2_sg14_zp1
 temp_annealing_max_steps: 2000
 temperature_conditioning: false
 temperature_scaling_factor: 0.01
