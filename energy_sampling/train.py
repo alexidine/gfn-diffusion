@@ -70,6 +70,7 @@ class Modeller:
         self.last_fwd_it = 0
         self.last_bwd_it = 0
         self.step_ind = 0
+        self.run_name = str(self.args.tag) + '_' + str(self.args.run_name)
 
     def train_logic(self, buffer, it):
         do_forward = False
@@ -235,14 +236,14 @@ class Modeller:
     def set_loss_coeffs(self, it):
         """anneal reward function"""
         if it == 0:
-            self.args.fwd_loss_schedule = parse_loss_schedules(self.args.fwd_loss_coeffs)
-            self.args.bwd_loss_schedule = parse_loss_schedules(self.args.bwd_loss_coeffs)
+            self.fwd_loss_schedule = parse_loss_schedules(self.args.fwd_loss_coeffs)
+            self.bwd_loss_schedule = parse_loss_schedules(self.args.bwd_loss_coeffs)
 
-            self.args.fwd_loss_coeffs = dict2namespace({k: 0.0 for k in self.args.fwd_loss_schedule})
-            self.args.bwd_loss_coeffs = dict2namespace({k: 0.0 for k in self.args.bwd_loss_schedule})
+            self.args.fwd_loss_coeffs = dict2namespace({k: 0.0 for k in self.fwd_loss_schedule})
+            self.args.bwd_loss_coeffs = dict2namespace({k: 0.0 for k in self.bwd_loss_schedule})
 
-        update_loss_schedule(it, self.args.fwd_loss_schedule, self.args.fwd_loss_coeffs.__dict__)
-        update_loss_schedule(it, self.args.bwd_loss_schedule, self.args.bwd_loss_coeffs.__dict__)
+        update_loss_schedule(it, self.fwd_loss_schedule, self.args.fwd_loss_coeffs.__dict__)
+        update_loss_schedule(it, self.bwd_loss_schedule, self.args.bwd_loss_coeffs.__dict__)
 
     def get_conditioning_dim(self):
         conditioning_dim = 0
@@ -288,17 +289,29 @@ class Modeller:
         return energy_function
 
     def init_gfn_model(self, energy_function):
+        reload = False
         if self.args.checkpoint_path is not None:
-            print(f"Loading model from checkpoint {self.args.checkpoint_path}")
-            eval_path = self.args.checkpoint_path.replace('train', 'eval')
-            config_path = self.args.checkpoint_path.replace('train', 'config').replace('.pt', '.npy').replace(
-                '_hit_prior', '').replace('_thermalized', '')
-            state_path = self.args.checkpoing_path.replace('_hit_prior', '').replace('_thermalized', '').replace('model_train','modeller_state')
+            reload = True
+            reload_path = self.args.checkpoint_path
+            print(f"Loading model from checkpoint {reload_path}")
 
+        elif os.path.exists(f'checkpoints/{self.run_name}_model_train.pt'):
+            reload_path = f'checkpoints/{self.run_name}_model_train.pt'
+            if 'dev' not in reload_path:
+                print("Reloading automatically from this prior checkpoint with same run name")
+                reload = True
+                reload_path = f'checkpoints/{self.run_name}_model_train.pt'
+
+        if reload:
+            eval_path = reload_path.replace('train', 'eval')
+            config_path = reload_path.replace('train', 'config').replace('.pt', '.npy').replace(
+                '_hit_prior', '').replace('_thermalized', '')
+            state_path = reload_path.replace('_hit_prior', '').replace('_thermalized', '').replace('model_train','modeller_state')
             self.load_modeller_state(state_path)
+
             gfn_config = np.load(config_path, allow_pickle=True).item()
             gfn_model = GFN(**gfn_config).to(self.device)
-            gfn_model.load_state_dict(torch.load(self.args.checkpoint_path))
+            gfn_model.load_state_dict(torch.load(reload_path))
             ema_model = deepcopy(gfn_model)
             ema_model.load_state_dict(torch.load(eval_path))
         else:
@@ -558,8 +571,7 @@ class Modeller:
 
         # Model Init
         gfn_model, gfn_config, ema_model = self.init_gfn_model(energy_function)
-        name = str(self.args.tag) + '_' + str(self.args.run_name)
-        np.save(f'checkpoints/{name}_model_config', gfn_config)  # todo add path to saving directories
+        np.save(f'checkpoints/{self.run_name}_model_config', gfn_config)  # todo add path to saving directories
 
         # opt init
         optimizers, schedulers = self.init_schedulers_optimizers(gfn_model)
@@ -588,7 +600,7 @@ class Modeller:
 
         with (wandb.init(project="GFN Energy",
                          config=flatten_wandb_params(self.args),
-                         name=name,
+                         name=self.run_name,
                          tags=[self.args.tag])):
 
             wandb.watch(gfn_model,
@@ -625,7 +637,6 @@ class Modeller:
                         train_iterator,
                         repeats=self.args.repeats,
                         ema_model=ema_model,
-                        name=name
                     )
                     if self.args.ema_decay is not None:
                         update_ema(gfn_model, ema_model, decay=self.args.ema_decay)
@@ -669,7 +680,7 @@ class Modeller:
                                     energy_function, metrics)
 
                     if self.args.anchor_fwd_bwd and self.args.both_ways:
-                        self.manage_prior_anchor(step_ind, metrics, gfn_model, ema_model, name)
+                        self.manage_prior_anchor(step_ind, metrics, gfn_model, ema_model)
 
                 # train monitoring
                 if step_ind % 10 == 0:
@@ -678,24 +689,23 @@ class Modeller:
                     lr = self.step_lr_schedule(schedulers, optimizers)
                     self.anneal_reward(step_ind, temp_annealing_lambda, energy_function)
                     self.ten_step_reporting(bwd_loss, bwd_loss_dict, fwd_loss, fwd_loss_dict, metrics, optimizers)
-                    loss_record = self.check_loss_explosion(name, loss_record, gfn_model, ema_model, optimizers)
+                    loss_record = self.check_loss_explosion(loss_record, gfn_model, ema_model, optimizers)
                     wandb.log(metrics, step=step_ind)
 
                 if step_ind % 50 == 0:  # save running model
-                    torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train.pt')
-                    torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval.pt')
-                    self.save_modeller_state(name)
+                    torch.save(gfn_model.state_dict(), f'checkpoints/{self.run_name}_model_train.pt')
+                    torch.save(ema_model.state_dict(), f'checkpoints/{self.run_name}_model_eval.pt')
+                    self.save_modeller_state()
 
-            torch.save(ema_model, f'checkpoints/{name}_model_final.pt')
+            torch.save(ema_model, f'checkpoints/{self.run_name}_model_final.pt')
 
-    def reload_running_model(self, ema_model, gfn_model, name):
-        gfn_model.load_state_dict(torch.load(f'checkpoints/{name}_model_train.pt'))
-        ema_model.load_state_dict(torch.load(f'checkpoints/{name}_model_eval.pt'))
+    def reload_running_model(self, ema_model, gfn_model):
+        gfn_model.load_state_dict(torch.load(f'checkpoints/{self.run_name}_model_train.pt'))
+        ema_model.load_state_dict(torch.load(f'checkpoints/{self.run_name}_model_eval.pt'))
         gfn_model.train()
         ema_model.eval()
 
     def check_loss_explosion(self,
-                             name: str,
                              loss_record: list,
                              gfn_model,
                              ema_model,
@@ -728,7 +738,7 @@ class Modeller:
                 if increasing_loss:
                     print(f"Losses increasing over prior {grace_time} steps!")
 
-                self.reload_running_model(ema_model, gfn_model, name)
+                self.reload_running_model(ema_model, gfn_model)
 
                 for opt in optimizers.values():
                     opt.state = defaultdict(dict)  # wipe also the momentum buffers
@@ -771,7 +781,7 @@ class Modeller:
                    mol_iterator,
                    repeats,
                    ema_model,
-                   name):
+                   ):
         if step_type == "Forward":
             do_forward = True
             do_backward = False
@@ -846,7 +856,7 @@ class Modeller:
         skip_step = False
         if self.phase == 2:
             if self.bwd_tb_norm <= self.args.thermalization_conv_eps:  # hit stage 2 convergence criteria
-                self.phase2to3(ema_model, gfn_model, 0.1, name, step_ind)
+                self.phase2to3(ema_model, gfn_model, 0.1, step_ind)
 
         if self.phase == 3:
             skip_step = self.update_controller(step_ind, do_backward, skip_step)
@@ -863,10 +873,19 @@ class Modeller:
 
     def update_controller(self, it, do_backward, skip_step):
         update_this_step = it % 20 == 0
-        bwd_ceil = min(self.args.thermalization_conv_eps * self.args.btb_threshold,
-                       self.fwd_tb_norm * self.args.btb_threshold)
-        bwd_floor = min(self.args.thermalization_conv_eps, self.fwd_tb_norm)
-        bwd_target = (bwd_ceil + bwd_floor) / 2
+        static_ceil = self.args.thermalization_conv_eps * self.args.btb_threshold
+        static_floor = self.args.thermalization_conv_eps
+        static_target = (static_ceil + static_floor) / 2
+
+        if self.fwd_tb_norm > static_target:
+            bwd_target = static_target
+            bwd_ceil = static_ceil
+            bwd_floor = static_floor
+        else:
+            bwd_target = self.fwd_tb_norm
+            bwd_ceil = bwd_target * self.args.btb_threshold
+            bwd_floor = bwd_target * 0.75
+
         metric = self.bwd_tb_norm
         coeff = 0.1
         err = (metric - bwd_target) / bwd_target  # if metric is large
@@ -1307,52 +1326,29 @@ class Modeller:
         sample_batch = collate_data_list(eval_samples, skip_default_exclusion=True)
         return flow_states, gauss_params_f, log_T_tensor, log_Z, log_Z_lb, log_Z_learned, log_pbs, log_pfs, log_r, sample_batch
 
-    def manage_prior_anchor(self, step_ind, metrics, gfn_model, ema_model, name):
+    def manage_prior_anchor(self, step_ind, metrics, gfn_model, ema_model):
 
         if self.phase == 1:
             metric = metrics['Max Latent KLD']
             "check threshold"
             if metric <= self.args.init_kld_threshold:
-                self.phase1to2(metrics, ema_model, gfn_model, name, step_ind)
-
-        if self.phase == 2:
-            pass  # this function is too infrequent for efficient control. We moved the functionality to the train step
-
-        if self.phase == 3:
-            pass  # this function is too infrequent for efficient control. We moved the functionality to the train step
-            # err_fwd = metrics['Normed TB Residual']
-            # err_bwd = metrics['Bwd Normed TB Residual']
-            # bwd_ceiling = self.args.thermalization_conv_eps * self.args.btb_threshold
-            # ratio = self.args.fwd_to_bwd_ratio
-            #
-            # # --- 1. Backward constraint: if violated, immediately suppress forward ---
-            # if err_bwd > bwd_ceiling:
-            #     # Violating constraint → reduce forward contribution
-            #     ratio *= 0.5
-            #
-            # # --- 2. If backward is safe, we are free to minimize err_fwd ---
-            # else:
-            #     coeff = 0.1
-            #     ratio *= min(2, np.exp(coeff * err_fwd))
-            #
-            # # Clip and store
-            # self.args.fwd_to_bwd_ratio = np.clip(ratio, a_min=min_rat, a_max=max_rat)
+                self.phase1to2(ema_model, gfn_model, step_ind)
 
         metrics['Training Phase'] = self.phase
         metrics['Fwd to Bwd Ratio'] = self.args.fwd_to_bwd_ratio
 
-    def phase1to2(self, metrics, ema_model, gfn_model, name, step_ind):
+    def phase1to2(self, ema_model, gfn_model, step_ind):
         #print("Hit initial KLD threshold. Moving to backward thermalization.")
         self.hit_init_kld = True
         "adjust loss coefficients"
         self.args.bwd_loss_coeffs.bwd_tb_z = 1.0
-        self.args.bwd_loss_schedule['tb'] = [(0, 1.0), (step_ind, 0.1),
+        self.bwd_loss_schedule['tb'] = [(0, 1.0), (step_ind, 0.1),
                                              (step_ind + self.args.phase_change_time, 1.0)]
-        self.args.bwd_loss_schedule['mle'] = [(0, 1.0), (step_ind, 1),
+        self.bwd_loss_schedule['mle'] = [(0, 1.0), (step_ind, 1),
                                               (step_ind + self.args.phase_change_time, 0.0)]
-        self.args.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 1.0)]
-        self.args.bwd_loss_schedule['noised_fraction'] = [(0, 0.0), (step_ind, self.args.anchor_noise_fraction)]
-        self.args.bwd_loss_schedule['noise_level'] = [(0, 0.0), (step_ind, self.args.anchor_noise_level)]
+        self.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 1.0)]
+        self.bwd_loss_schedule['noised_fraction'] = [(0, 0.0), (step_ind, self.args.anchor_noise_fraction)]
+        self.bwd_loss_schedule['noise_level'] = [(0, 0.0), (step_ind, self.args.anchor_noise_level)]
         "set cooldowns"
         self.increasing_loss_cooldown = self.args.phase_change_time  # give it time to adjust to new loss landscape
         "align log Z to buffer (it will converge to this value)"
@@ -1361,27 +1357,27 @@ class Modeller:
         #     ema_model.flow_model.weight.data = z
         #     gfn_model.flow_model.weight.data = z
         "save checkpoint"
-        torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train_hit_prior.pt')
-        torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval_hit_prior.pt')
+        torch.save(gfn_model.state_dict(), f'checkpoints/{self.run_name}_model_train_hit_prior.pt')
+        torch.save(ema_model.state_dict(), f'checkpoints/{self.run_name}_model_eval_hit_prior.pt')
         self.phase = 2
         self.grow_buffer = True
 
-    def phase2to3(self, ema_model, gfn_model, init_rat, name, step_ind):
+    def phase2to3(self, ema_model, gfn_model, init_rat, step_ind):
         #print("Thermalization complete. Moving to forward training & refinement.")
         self.phase = 3
         "save checkpoint"
-        torch.save(gfn_model.state_dict(), f'checkpoints/{name}_model_train_thermalized.pt')
-        torch.save(ema_model.state_dict(), f'checkpoints/{name}_model_eval_thermalized.pt')
+        torch.save(gfn_model.state_dict(), f'checkpoints/{self.run_name}_model_train_thermalized.pt')
+        torch.save(ema_model.state_dict(), f'checkpoints/{self.run_name}_model_eval_thermalized.pt')
         "adjust loss and balancing coefficients"
         self.args.fwd_to_bwd_ratio = init_rat
-        self.args.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 0)]
-        self.args.fwd_loss_schedule['tb'] = [(0, 1.0), (step_ind, 0.0),
+        self.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 0)]
+        self.fwd_loss_schedule['tb'] = [(0, 1.0), (step_ind, 0.0),
                                              (step_ind + self.args.phase_change_time // 2, 1.0)]
         "set cooldown"
         self.increasing_loss_cooldown = self.args.phase_change_time
         self.grow_buffer = True
 
-    def save_modeller_state(self, name):
+    def save_modeller_state(self):
         state = dict(
             phase=self.phase,
             fwd_tb_norm=self.fwd_tb_norm,
@@ -1389,21 +1385,24 @@ class Modeller:
             step_ind=self.step_ind,
             last_fwd_it=self.last_fwd_it,
             last_bwd_it=self.last_bwd_it,
+            fwd_loss_schedule=self.fwd_loss_schedule,
+            bwd_loss_schedule=self.bwd_loss_schedule,
             fwd_to_bwd_ratio=self.args.fwd_to_bwd_ratio,
             increasing_loss_cooldown=self.increasing_loss_cooldown,
             lr_warmup_finished=self.lr_warmup_finished,
             hit_init_kld=self.hit_init_kld,
             forward_batch_size=self.forward_batch_size,
             backward_batch_size=self.backward_batch_size,
+            grow_buffer = self.grow_buffer,
         )
-        torch.save(state, f'checkpoints/{name}_modeller_state.pt')
+        torch.save(state, f'checkpoints/{self.run_name}_modeller_state.pt')
 
     def load_modeller_state(self, path):
         if not os.path.exists(path):
             print("No modeller state found; starting fresh.")
             return
 
-        state = torch.load(path)
+        state = torch.load(path, weights_only=False)
 
         self.phase = state['phase']
         self.step_ind = state['step_ind']
@@ -1411,12 +1410,15 @@ class Modeller:
         self.bwd_tb_norm = state['bwd_tb_norm']
         self.last_fwd_it = state['last_fwd_it']
         self.last_bwd_it = state['last_bwd_it']
+        self.fwd_loss_schedule = state['fwd_loss_schedule']
+        self.bwd_loss_schedule = state['bwd_loss_schedule']
         self.args.fwd_to_bwd_ratio = state['fwd_to_bwd_ratio']
         self.increasing_loss_cooldown = state['increasing_loss_cooldown']
         self.lr_warmup_finished = state['lr_warmup_finished']
         self.hit_init_kld = state['hit_init_kld']
         self.forward_batch_size = state['forward_batch_size']
         self.backward_batch_size = state['backward_batch_size']
+        self.grow_buffer = state['grow_buffer']
 
 
 if __name__ == '__main__':

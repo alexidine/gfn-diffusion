@@ -679,7 +679,7 @@ def bwd_figs(buffer, gfn_model, init_state, discretizer, do_figs: Optional[bool]
 
     X_side = log_pf.cpu() - log_pb.cpu()
     Y_side = log_r.cpu() - log_z.cpu()
-    normed_tb_residual = (X_side - Y_side).abs() / Y_side.abs()
+    normed_tb_residual = (X_side - Y_side).abs() / torch.maximum(torch.ones_like(Y_side),Y_side.abs())
     metrics['Bwd Normed TB Residual'] = normed_tb_residual.mean().item()
 
     '''
@@ -884,9 +884,10 @@ def log_metrics(energy_function,
     tb_residual = F.smooth_l1_loss(log_ratio, torch.ones_like(log_ratio), reduction='none', beta=10)
     metrics['TB Residual'] = tb_residual.mean().item()
 
+    # todo functionalize this
     X_side = log_pf.cpu() - log_pb.cpu()
     Y_side = log_r.cpu() - log_Z_learned.cpu()
-    normed_log_ratio = (X_side - Y_side).abs() / Y_side.abs()
+    normed_log_ratio = (X_side - Y_side).abs() / torch.maximum(torch.ones_like(Y_side), Y_side.abs())
     metrics['Normed TB Residual'] = normed_log_ratio.mean().item()
 
     metrics['Log Z Residual'] = (log_Z_empirical - log_Z_learned).item()

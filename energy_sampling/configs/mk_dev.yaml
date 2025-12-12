@@ -1,4 +1,4 @@
-run_name: 'mk_local_dev'
+run_name: 'mk_dev'
 tag: 'dev'
 seed: 12345
 device: 'cuda'
@@ -86,9 +86,9 @@ bwd_loss_coeffs:
 anchor_fwd_bwd: true  # whether to do this at all
 btb_threshold: 2.0 # ratio of thermalization_conv_eps at which we activate emergency bwd training
 phase_change_time: 200  # time to adjust loss coefficients between phases
-thermalization_conv_eps: 0.5
-init_kld_threshold: 0.075
-anchor_noise_fraction: 1.0
+thermalization_conv_eps: 1.0
+init_kld_threshold: 1.0
+anchor_noise_fraction: 0.8
 anchor_noise_level: 0.05 # much higher than this is a total disaster
 
 prior_coverage_ratio: 0.05  # [0, 1] fraction of uniform bin coverage that will satisfy the coverage metric
@@ -128,7 +128,7 @@ prioritized: null #"boltzmann"   # three kinds of replay training: random, rewar
 sampling: "buffer"  # no alternative for right now
 buffer_size: 20000          # size of replay buffer
 grow_buffer: false  # can be toggled on or off in certain training modes
-noised_buffer_length: 200000
+noised_buffer_length: 50000
 
 # exploration controls
 ################################################################
