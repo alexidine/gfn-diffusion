@@ -107,7 +107,7 @@ rank_weight: 1.0
 reduction_coeff: 10.0
 repeats: 2
 reward_range: 80
-run_name: sg14_zp1
+run_name: sg14_zp1_7
 s_emb_dim: 1024
 sampling: buffer
 scheduler: true

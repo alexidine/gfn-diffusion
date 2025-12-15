@@ -43,7 +43,7 @@ if __name__ == "__main__":
             config.update({
                 'space_groups': [14],
                 'z_primes': [1],
-                'run_name': 'sg14_zp1',
+                'run_name': f'sg14_zp1_{ind}',
                 'tag': 'nic3',
                 'molecules_path': '/scratch/mk8347/csd_runs/datasets/nicotinamide/protonated_nicotinamide.pt',
                 'buffer_path': '/scratch/mk8347/csd_runs/datasets/nicotinamide/nic_sg14_zp1.pt',
