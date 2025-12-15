@@ -159,6 +159,7 @@ class Modeller:
     def increment_batch_size(self, buffer, train_mol_loader, test_mol_loader, batch_growth_increment, step_type,
                              train_iterator, test_iterator):
         if step_type == "Forward":
+            print("7")
             if self.forward_batch_size < self.args.max_fwd_batch_size:
                 new_batch_size = min(self.args.max_fwd_batch_size, max(self.forward_batch_size + 1,
                                                                        int(self.forward_batch_size * batch_growth_increment)))
@@ -613,20 +614,22 @@ class Modeller:
             self.set_detect_anomaly(gfn_model, do_anomaly_detection=False)
 
             for step_ind in trange(self.step_ind, self.args.epochs + 1):
+                print("1")
                 metrics = dict()
                 self.step_ind = step_ind
                 if step_ind % 10 == 0:
                     self.set_loss_coeffs(step_ind)
-
+                print("2")
                 exploration_std = get_exploration_std(step_ind,
                                                       self.args.exploratory,
                                                       self.args.wd_max_steps,
                                                       self.args.exploration_factor,
                                                       self.args.exploration_wd)
-
+                print("3")
                 self.times['train_step_start'] = time()
                 try:
                     step_type = self.train_logic(buffer, step_ind)
+                    print("4")
                     train_loss, loss_dict = self.train_step(
                         step_type,
                         energy_function,
@@ -639,11 +642,12 @@ class Modeller:
                         repeats=self.args.repeats,
                         ema_model=ema_model,
                     )
+                    print("5")
                     if self.args.ema_decay is not None:
                         update_ema(gfn_model, ema_model, decay=self.args.ema_decay)
                     else:
                         ema_model = gfn_model
-
+                    print("6")
                     if step_type == 'Forward':
                         fwd_loss = train_loss
                         if loss_dict is not None:
