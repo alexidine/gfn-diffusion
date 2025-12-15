@@ -619,7 +619,7 @@ def sample_from_gfn(num_samples, max_z_prime, device, n_steps, batch_size, gfn_m
     return samples
 
 
-def analyze_samples(x, mol_list, max_z_prime, device, batch_size, do_uma: bool=False, predictor=None):
+def analyze_samples(x, mol_list, max_z_prime, device, batch_size, sg_ind, zp, do_uma: bool=False, predictor=None):
     num_batches = len(mol_list) // batch_size + (1 if len(mol_list) % batch_size else 0)
     num_samples = len(mol_list)
     samples = []
@@ -629,8 +629,10 @@ def analyze_samples(x, mol_list, max_z_prime, device, batch_size, do_uma: bool=F
         with torch.no_grad():
             for b_ind in range(num_batches):
                 inds = torch.arange(b_ind * batch_size, (b_ind + 1) * batch_size)
+                for elem in mol_list:
+                    elem.z_prime = zp
                 batch = collate_data_list([mol_list[ind] for ind in inds], max_z_prime=max_z_prime)
-                batch.reset_sg_info(2)
+                batch.reset_sg_info(sg_ind)
                 batch.latent_to_cell_params(x[inds])
                 batch = batch.to(device)
                 outs = batch.analyze(['lj','qlj','elj','silu'], cutoff=10, std_orientation=True)

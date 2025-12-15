@@ -65,8 +65,9 @@ class Modeller:
         self.forward_batch_size = self.args.batch_size
         self.backward_batch_size = self.args.batch_size
         self.phase = 1
-        self.fwd_tb_norm = None
-        self.bwd_tb_norm = None
+        self.fwd_tb_norm = 10000
+        self.bwd_tb_norm = 10000
+        self.best_tb_norm = 10000
         self.last_fwd_it = 0
         self.last_bwd_it = 0
         self.step_ind = 0
@@ -692,6 +693,11 @@ class Modeller:
                     loss_record = self.check_loss_explosion(loss_record, gfn_model, ema_model, optimizers)
                     wandb.log(metrics, step=step_ind)
 
+                    if (self.fwd_tb_norm + self.bwd_tb_norm) < self.best_tb_norm:
+                        self.best_tb_norm = self.fwd_tb_norm + self.bwd_tb_norm
+                        torch.save(gfn_model.state_dict(), f'checkpoints/best_{self.run_name}_model_train.pt')
+                        torch.save(ema_model.state_dict(), f'checkpoints/best_{self.run_name}_model_eval.pt')
+
                 if step_ind % 50 == 0:  # save running model
                     torch.save(gfn_model.state_dict(), f'checkpoints/{self.run_name}_model_train.pt')
                     torch.save(ema_model.state_dict(), f'checkpoints/{self.run_name}_model_eval.pt')
@@ -832,26 +838,7 @@ class Modeller:
             assert False
 
         clean_loss = loss.item()
-        T = 25  # effective target update time
-        if do_forward and loss_dict is not None:
-            if self.fwd_tb_norm is None:
-                self.fwd_tb_norm = float(loss_dict['normed_tb'])
-            else:
-                dt = step_ind - self.last_fwd_it
-                beta_fwd = np.exp(-dt / T)
-                self.fwd_tb_norm = float(
-                    self.fwd_tb_norm * beta_fwd + (1 - beta_fwd) * loss_dict['normed_tb'])
-            self.last_fwd_it = step_ind
-
-        if do_backward and loss_dict is not None:
-            if self.bwd_tb_norm is None:
-                self.bwd_tb_norm = float(loss_dict['normed_tb'])
-            else:
-                dt = step_ind - self.last_bwd_it
-                beta_bwd = np.exp(-dt / T)
-                self.bwd_tb_norm = float(
-                    self.bwd_tb_norm * beta_bwd + (1 - beta_bwd) * np.nan_to_num(loss_dict['normed_tb'].cpu().detach(), posinf=self.bwd_tb_norm))
-            self.last_bwd_it = step_ind
+        self.update_rolling_tb(do_backward, do_forward, loss_dict, step_ind)
 
         skip_step = False
         if self.phase == 2:
@@ -870,6 +857,28 @@ class Modeller:
         del loss, loss_dict  # or whatever is large
 
         return clean_loss, loss_dict_cpu
+
+    def update_rolling_tb(self, do_backward, do_forward, loss_dict, step_ind):
+        T = 25  # effective target update time
+        if do_forward and loss_dict is not None:
+            if self.fwd_tb_norm == 10000:
+                self.fwd_tb_norm = float(loss_dict['normed_tb'])
+            else:
+                dt = step_ind - self.last_fwd_it
+                beta_fwd = np.exp(-dt / T)
+                self.fwd_tb_norm = float(
+                    self.fwd_tb_norm * beta_fwd + (1 - beta_fwd) * loss_dict['normed_tb'])
+            self.last_fwd_it = step_ind
+        if do_backward and loss_dict is not None:
+            if self.bwd_tb_norm == 10000:
+                self.bwd_tb_norm = float(loss_dict['normed_tb'])
+            else:
+                dt = step_ind - self.last_bwd_it
+                beta_bwd = np.exp(-dt / T)
+                self.bwd_tb_norm = float(
+                    self.bwd_tb_norm * beta_bwd + (1 - beta_bwd) * np.nan_to_num(loss_dict['normed_tb'].cpu().detach(),
+                                                                                 posinf=self.bwd_tb_norm))
+            self.last_bwd_it = step_ind
 
     def update_controller(self, it, do_backward, skip_step):
         update_this_step = it % 20 == 0
@@ -1122,13 +1131,12 @@ class Modeller:
 
         # todo remove this eventually
         if 'D:' in self.args.buffer_path and self.args.energy_function == 'uma':  # if we're on local, this takes forever
-            dataset = dataset[:500]
+            pass #dataset = dataset[:500]
 
         print("Re-featurizing preloaded buffer samples")
         dataset = featurize_dataset(dataset,
                                     self.device,
                                     self.args.energy_function,
-                                    max_z_prime=max_z_prime,
                                     uma_path=self.args.uma_path)
 
         # always filter awful crystals
@@ -1370,7 +1378,7 @@ class Modeller:
         torch.save(ema_model.state_dict(), f'checkpoints/{self.run_name}_model_eval_thermalized.pt')
         "adjust loss and balancing coefficients"
         self.args.fwd_to_bwd_ratio = init_rat
-        self.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 0)]
+        self.bwd_loss_schedule['bwd_tb_z'] = [(0, 1.0), (step_ind, 0)]
         self.fwd_loss_schedule['tb'] = [(0, 1.0), (step_ind, 0.0),
                                              (step_ind + self.args.phase_change_time // 2, 1.0)]
         "set cooldown"
@@ -1394,6 +1402,7 @@ class Modeller:
             forward_batch_size=self.forward_batch_size,
             backward_batch_size=self.backward_batch_size,
             grow_buffer = self.grow_buffer,
+            best_tb_norm = self.best_tb_norm,
         )
         torch.save(state, f'checkpoints/{self.run_name}_modeller_state.pt')
 
@@ -1419,6 +1428,7 @@ class Modeller:
         self.forward_batch_size = state['forward_batch_size']
         self.backward_batch_size = state['backward_batch_size']
         self.grow_buffer = state['grow_buffer']
+        self.best_tb_norm = state['best_tb_norm']
 
 
 if __name__ == '__main__':

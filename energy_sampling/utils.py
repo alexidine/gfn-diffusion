@@ -258,7 +258,7 @@ def triangle_schedule(it, init, maxval, minval, on, off):
 
 @torch.no_grad()
 def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 500,
-                      max_z_prime: int = 1, uma_path: Optional[str] = None, ):
+                      uma_path: Optional[str] = None, ):
     outputs = []
 
     cutoff = 10
@@ -292,7 +292,7 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
                     predictor=uma_predictor, std_orientation=True).cpu().detach() * 96.485
                 out.update({'uma_gas_pot': gas_en,
                             'uma_pot': cry_en,
-                            'uma': cry_en / crystal_batch.sym_mult - gas_en})  # lattice energy
+                            'uma': cry_en / (crystal_batch.sym_mult * crystal_batch.z_prime) - gas_en})  # lattice energy
 
             outputs.append(out)
             cursor += batch_size

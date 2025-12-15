@@ -18,29 +18,13 @@ if __name__ == '__main__':
     batch_size = 1000
     energy_function = 'elj'  # 'elj', 'lj'
     n_steps = 50  # critical to get this right!
+    sg_ind = 14
+    zp = 1  # todo fix zp>1 pre-processing
 
-    # decent cold uma model
-    #
-    # model_path = r"D:\crystal_datasets\nic_12_1_restart_model_train.pt"
-    # config_path = r"D:\crystal_datasets\nic_12_1_restart_model_config.npy"
-    # molecule_path = r'D:\crystal_datasets\protonated_nicoam\nicoam0.pkl'
-    # dataset_path = r'D:/crystal_datasets/opt_outputs/nic_2_zp1.pt'
-
-    #
-    # model_path = r"D:\crystal_datasets\nic_13_10_model_train.pt"
-    # config_path = r"D:\crystal_datasets\nic_13_10_model_config.npy"
-    # molecule_path = r'D:\crystal_datasets\protonated_nicoam\nicoam0.pkl'
-    # dataset_path = r'D:/crystal_datasets/opt_outputs/nic_2_zp1.pt'
-
-    # model_path = r"C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints\nic_good_elj_model_train.pt"
-    # config_path = r"C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints\nic_good_elj_model_config.npy"
-    # molecule_path = r'D:\crystal_datasets\protonated_nicoam\nicoam0.pkl'
-    # dataset_path = r'D:/crystal_datasets/opt_outputs/nic_2_zp1.pt'
-    #
-    model_path = r"D:\crystal_datasets\nic_1_0_model_eval.pt"
-    config_path = r"D:\crystal_datasets\nic_1_0_model_config.npy"
-    molecule_path = r'D:\crystal_datasets\protonated_nicoam\nicoam0.pkl'
-    dataset_path = r'D:/crystal_datasets/opt_outputs/nic_2_zp1.pt'
+    model_path = rf"D:\crystal_datasets\nic2_sg{sg_ind}_zp{zp}_nic2_sg{sg_ind}_zp{zp}_model_eval.pt"
+    config_path = rf"D:\crystal_datasets\nic2_sg{sg_ind}_zp{zp}_nic2_sg{sg_ind}_zp{zp}_model_config.npy"
+    molecule_path = r"D:\crystal_datasets\nicoam\protonated_nicotinamide.pt"
+    dataset_path = rf"D:\crystal_datasets\nicoam\nic_sg{sg_ind}_zp{zp}.pt"
 
     gfn_model = GFN(**np.load(config_path, allow_pickle=True).item())
     gfn_model.load_state_dict(torch.load(model_path, weights_only=True))
@@ -49,7 +33,6 @@ if __name__ == '__main__':
 
     molecule = torch.load(molecule_path, weights_only=False)
     dataset = torch.load(dataset_path, weights_only=False)
-    dataset = [elem for elem in dataset if elem.sg_ind == 2]
     max_z_prime = max([int(elem.max_z_prime) for elem in dataset])
     data_batch = collate_data_list(dataset, max_z_prime=max_z_prime)
     data_latents = data_batch.latent_params()
@@ -61,7 +44,7 @@ if __name__ == '__main__':
     else:
         predictor = None
 
-    samples = analyze_samples(sample_latents, molecule * len(sample_latents), max_z_prime, device, batch_size,
+    samples = analyze_samples(sample_latents, molecule * len(sample_latents), max_z_prime, device, batch_size, sg_ind, zp,
                               do_uma=energy_function == 'uma', predictor=predictor)
     sample_batch = collate_data_list(samples, max_z_prime=max_z_prime)
 
@@ -90,7 +73,7 @@ if __name__ == '__main__':
 
     "Dimension Reduction"
     real_params = sample_batch.full_cell_parameters()
-    whitened_cell_params = (real_params - real_params.mean(0)) / real_params.std(0)
+    whitened_cell_params = (real_params - real_params.mean(0)) / torch.maximum(real_params.std(0), torch.ones_like(real_params.std(0)))
     umap_model = UMAP(n_components=6, n_neighbors=10, min_dist=0.001)
     sample_embedding = umap_model.fit_transform(whitened_cell_params)  # [low_en_bools])
 
