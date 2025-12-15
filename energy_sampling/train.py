@@ -599,20 +599,22 @@ class Modeller:
         loss_record = []
 
         self.times['initialization_end'] = time()
+        print("-1")
 
         with (wandb.init(project="GFN Energy",
                          config=flatten_wandb_params(self.args),
                          name=self.run_name,
                          tags=[self.args.tag])):
-
+            print("-0.5")
             wandb.watch(gfn_model,
                         log_graph=False,
                         log_freq=1000,
                         log='gradients')  # for gradient logging
+            print("-0.25")
 
             gfn_model.train()
             self.set_detect_anomaly(gfn_model, do_anomaly_detection=False)
-
+            print("0")
             for step_ind in trange(self.step_ind, self.args.epochs + 1):
                 print("1")
                 metrics = dict()
