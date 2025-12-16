@@ -2,7 +2,7 @@ import gc
 import os
 from collections import defaultdict
 from copy import deepcopy
-# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 # os.environ["TORCH_USE_CUDA_DSA"] = "1"
 # os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
 #     "max_split_size_mb:128,garbage_collection_threshold:0.8,expandable_segments:True")
@@ -215,6 +215,7 @@ class Modeller:
         metrics['Fwd to Bwd Ratio'] = self.args.fwd_to_bwd_ratio
         metrics['Rolling fTB Norm'] = self.fwd_tb_norm
         metrics['Rolling bTB Norm'] = self.bwd_tb_norm
+        metrics['Best TB Norm'] = self.best_tb_norm
         metrics.update(self.log_elapsed_times())
         metrics['Forward Loss'] = fwd_loss
         metrics['Backward Loss'] = bwd_loss
