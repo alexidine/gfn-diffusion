@@ -21,8 +21,8 @@ if __name__ == '__main__':
     sg_ind = 14
     zp = 1  # todo fix zp>1 pre-processing
 
-    model_path = rf"D:\crystal_datasets\nic2_sg{sg_ind}_zp{zp}_nic2_sg{sg_ind}_zp{zp}_model_eval.pt"
-    config_path = rf"D:\crystal_datasets\nic2_sg{sg_ind}_zp{zp}_nic2_sg{sg_ind}_zp{zp}_model_config.npy"
+    model_path = rf"D:\crystal_datasets\nic3_sg{sg_ind}_zp{zp}_2_model_eval.pt"
+    config_path = rf"D:\crystal_datasets\nic3_sg{sg_ind}_zp{zp}_2_model_config.npy"
     molecule_path = r"D:\crystal_datasets\nicoam\protonated_nicotinamide.pt"
     dataset_path = rf"D:\crystal_datasets\nicoam\nic_sg{sg_ind}_zp{zp}.pt"
 
@@ -115,7 +115,7 @@ if __name__ == '__main__':
     m_sort = np.argsort([sum(m) for m in masks])
     sort_masks = [masks[ind] for ind in m_sort[::-1]]
     sample_batch.plot_batch_cell_params(space='real',
-                                        aux_dists=[sample_batch.full_cell_parameters()[m] for m in masks[:10] if
+                                        aux_dists=[sample_batch.full_cell_parameters()[m] for m in sort_masks[:10] if
                                                    sum(m) > 1])
 
     "Standard visualizations"
@@ -128,7 +128,34 @@ if __name__ == '__main__':
 
 '''
 # other analyses
-    
+
+ 
+# GM business
+
+from sklearn.mixture import GaussianMixture
+X = sample_latents.clone().cpu().detach().numpy()[sample_energy < sample_energy.quantile(0.25)]
+E = sample_energy.clone().cpu().detach().numpy()[sample_energy < sample_energy.quantile(0.25)]
+K = 30   # deliberately too many
+gmm = GaussianMixture(
+    n_components=K,
+    covariance_type="full",
+    n_init=5,
+    reg_covar=1e-6,
+    random_state=0,
+)
+gmm.fit(X)
+resp = gmm.predict_proba(X)     # (N, K)
+Nk = resp.sum(axis=0)           # soft population per component
+sample_batch.plot_batch_cell_params(space='latent', ref_dist=torch.tensor(gmm.means_))
+E_k = (resp * E[:, None]).sum(axis=0) / Nk
+go.Figure(go.Scatter(x=Nk, y=E_k, mode='markers')).show()
+O = resp.T @ resp / len(X)
+go.Figure(go.Heatmap(z=O)).show()
+
+eff_components = (resp > 0.1).sum(axis=1)
+go.Figure(go.Histogram(x=eff_components, nbinsx=50)).show()
+
+
     
     "1D Marginal Clusters"
     cell_params = sample_batch.full_cell_parameters()
