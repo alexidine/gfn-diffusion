@@ -16,7 +16,7 @@ if __name__ == '__main__':
     device = 'cuda'
     num_samples = 10000
     batch_size = 1000
-    energy_function = 'elj'  # 'elj', 'lj'
+    energy_function = 'elj'  # 'elj', 'lj' 'uma
     n_steps = 50  # critical to get this right!
     sg_ind = 14
     zp = 1  # todo fix zp>1 pre-processing
@@ -50,7 +50,7 @@ if __name__ == '__main__':
 
     """Analyses"""
     if energy_function == 'uma':
-        sample_energy = sample_batch.uma_pot / sample_batch.sym_mult - sample_batch.uma_gas_pot
+        sample_energy = sample_batch.uma_pot / (sample_batch.sym_mult * sample_batch.z_prime) - sample_batch.uma_gas_pot
     elif energy_function == 'elj':
         sample_energy = sample_batch.elj
         sample_energy = ((sample_energy - -293) / 99) * 41 + -31

@@ -1,5 +1,5 @@
-run_name: 'nic_prod_1'
-tag: 'nic_prod_1'
+run_name: '0'
+tag: 'acr3'
 seed: 12345
 device: 'cuda'
 lr_policy: 5.0e-4              # learning rate of the policy network
@@ -29,7 +29,7 @@ norm: layer                   # null, "layer" - DON'T PUT 'batch'
 
 batch_size: 10              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_fwd_batch_size: 250
+max_fwd_batch_size: 100
 max_bwd_batch_size: 2500
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
 eval_batch_size: 500        # batch size for evaluation (adaptive)
@@ -47,7 +47,7 @@ max_traj_length: 50
 traj_length_strategy: static # 'static'  or 'sampled'  will do random between min and max traj lengths
 discretizer_max_ratio: 15    # maximum ratio between randomly sampled step sizes - needs to be >25 for 15 steps, or 10 for 30 steps to get good coverage at extrema
 discretizer: uniform #'random'        # 'random' 'low_discrepancy' 'equidistant' 'uniform'
-t_scale: 0.1                 # scales fixed forward policy variance
+t_scale: 0.05                 # scales fixed forward policy variance
 log_var_range: 4           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
 pb_drift_range: 0.2          # range of learned backward drift corrections, only for 'brownian_bridge'
 pb_var_range: 2             # range of learned backward policy variance
@@ -83,7 +83,7 @@ bwd_loss_coeffs:
 
 # for controlling 3-phase convergence protocol
 anchor_fwd_bwd: true  # whether to do this at all
-btb_threshold: 2.0 # ratio of thermalization_conv_eps at which we activate emergency bwd training
+btb_threshold: 1.75 # ratio of thermalization_conv_eps at which we activate emergency bwd training
 phase_change_time: 200  # time to adjust loss coefficients between phases
 thermalization_conv_eps: 0.5
 init_kld_threshold: 0.05
@@ -118,7 +118,7 @@ prioritized: null #"boltzmann"   # three kinds of replay training: random, rewar
 sampling: "buffer"  # no alternative for right now
 buffer_size: 20000          # size of replay buffer
 grow_buffer: false  # can be toggled on or off in certain training modes
-noised_buffer_length: 200000
+noised_buffer_length: 100000
 
 # exploration controls
 ################################################################
@@ -129,7 +129,7 @@ wd_max_steps: 10000  # number of steps to terminate the added variance
 
 # molecular crystal settings
 ################################################################
-molecule: 'nicotinamide'  # 'nicotinamide' or 'acridine' or 'qm9' for molecule-conditional training
+molecule: 'acridine'  # 'nicotinamide' or 'acridine' or 'qm9' for molecule-conditional training
 temperature_conditioning: False  # if false, temperatures are set to energy_static_temperature, and there is no annealing
 molecule_conditioning: False  # MUST be true for molecule='qm9' and false else - conditions the generative prediction on the molecule
 mol_embedding_type: 'autoencoder'  # principal_axes or autoencoder
@@ -137,13 +137,13 @@ sg_conditioning: False  # whether to conditionally sample across space groups
 space_groups: [ 2 ]  # which space groups to sample over
 zp_conditioning: false # whether to condition over z prime values
 z_primes: [ 1 ]
-lj_rescale: [-293, 99, -31, 41]  # mean and std by which to rescale LJ to align with uma
-energy_function: 'elj'
-  # 'latent_harmonic' : unimodal harmonic potential in the latent space
-  # 'crystal_harmonic': unimodal harmonic potential in the crystal space
-  # 'latent_multiharmonic': multimodal harmonic potential in the latent space
-  # 'crystal_multiharmonic': multimodal harmonic potential in the crystal space
-  # 'ellipsoid_overlap' : minimize ellipsoid overlaps subject to energy_density_coeff external pressure
+lj_rescale: [ -293, 99, -31, 41 ]  # mean and std by which to rescale LJ to align with uma
+energy_function: 'uma'
+# 'latent_harmonic' : unimodal harmonic potential in the latent space
+# 'crystal_harmonic': unimodal harmonic potential in the crystal space
+# 'latent_multiharmonic': multimodal harmonic potential in the latent space
+# 'crystal_multiharmonic': multimodal harmonic potential in the crystal space
+# 'ellipsoid_overlap' : minimize ellipsoid overlaps subject to energy_density_coeff external pressure
 # 'silu' : silu + bounding terms
 # 'lj' : lj + bounding terms
 # 'qlj' : lj with quadratic repulsion
