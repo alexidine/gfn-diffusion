@@ -33,7 +33,7 @@ if __name__ == "__main__":
             config['z_primes'] = [zp]
             config['run_name'] = f'sg{sg}_zp{zp}'
             config['tag'] = f'acr3'
-            config['molecules_path'] = '/scratch/mk8347/csd_runs/datasets/acridine/acridine.pkl'
+            config['molecules_path'] = '/scratch/mk8347/csd_runs/datasets/acridine/acridine_conformer.pt'
             config['buffer_path'] = f'/scratch/mk8347/csd_runs/datasets/acridine/acridine_sg{sg}_zp{zp}.pt'
 
             config_path = f'{ind}.yaml'

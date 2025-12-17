@@ -95,7 +95,7 @@ min_traj_length: 50
 mol_embedding_type: autoencoder
 molecule: acridine
 molecule_conditioning: false
-molecules_path: /scratch/mk8347/csd_runs/datasets/acridine/acridine.pkl
+molecules_path: /scratch/mk8347/csd_runs/datasets/acridine/acridine_conformer.pt
 noised_buffer_length: 100000
 norm: layer
 pb_drift_range: 0.2

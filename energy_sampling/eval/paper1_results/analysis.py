@@ -57,19 +57,45 @@ if __name__ == '__main__':
     else:
         sample_energy = sample_batch.lj
 
-    # # sort_inds = torch.argsort(sample_energy)[:batch_size]
-    # # terminal_states = sample_latents[sort_inds, :]
-    # terminal_states = sample_latents[:batch_size, :]
-    # logp_est, _ = estimate_logp_with_convergence(
-    #     gfn_model, terminal_states, batch_size, n_steps=n_steps, max_repeats=500, tol=1e-2, window=10
-    # )
-    #
-    # boltzmann_logprobs = -sample_energy[
-    #     :batch_size] / 2.5 - gfn_model.flow_model().item()  # unconditional boltzmann factor
-    # x = logp_est.cpu().detach()
-    # y = boltzmann_logprobs.cpu().detach()
-    # linreg = linregress(x, y)
-    # go.Figure(go.Scatter(x=x, y=y, mode='markers')).show()
+
+    'Explicit Density Estimation'
+    # sort_inds = torch.argsort(sample_energy)[:batch_size]
+    # terminal_states = sample_latents[sort_inds, :]
+    terminal_states = sample_latents[:batch_size, :]
+    logp_est, _ = estimate_logp_with_convergence(
+        gfn_model, terminal_states, batch_size, n_steps=n_steps, max_repeats=50, tol=1e-2, window=10
+    )
+
+    boltzmann_logprobs = -sample_energy[
+        :batch_size] / 2.5 - gfn_model.flow_model().item()  # unconditional boltzmann factor
+    x = logp_est.cpu().detach()
+    y = boltzmann_logprobs.cpu().detach()
+    linreg = linregress(x, y)
+    go.Figure(go.Scatter(x=x, y=y, mode='markers')).show()
+    go.Figure(go.Scatter(x=x, y=sample_energy[:batch_size], mode='markers')).show()
+
+    "Free energy marginals"
+    # b/max(a,c) marginal
+    len_rat = sample_batch.cell_lengths[:, 1] / torch.amax(sample_batch.cell_lengths[:, 0:3:2], dim=1)
+    go.Figure(go.Histogram(x=len_rat, nbinsx=100)).show()
+    # density marginal
+    go.Figure(go.Histogram(x=sample_batch.packing_coeff)).show()
+    # the 6 aunit marginals are then pretty interesting
+
+
+    "Low T clusters"
+    e_cut = torch.quantile(sample_energy, 0.1)
+    low_en_samples_inds = torch.argwhere(sample_energy < e_cut).flatten()
+    low_en_samples = sample_latents[low_en_samples_inds]
+    clust_df, clust_labels = cluster_hdbscan_to_df(torch.Tensor(low_en_samples), sample_energy[low_en_samples_inds])
+    ll = torch.ones(len(sample_latents), device=sample_latents.device, dtype=torch.long)
+    ll -= 2
+    ll[low_en_samples_inds] = torch.tensor(clust_labels, dtype=torch.long)
+    masks = [ll == ind for ind in np.unique(ll)]
+    sample_batch.plot_batch_cell_params(space='real',
+                                        aux_dists=[sample_batch.full_cell_parameters()[m] for m in masks[:10] if
+                                                   sum(m) > 1])
+
 
     "Dimension Reduction"
     real_params = sample_batch.full_cell_parameters()

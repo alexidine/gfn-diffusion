@@ -189,7 +189,9 @@ class MolecularCrystal(BaseSet):
             if self.energy_function in ['lj', 'qlj', 'elj'] and self.lj_rescale is not None:
                 # rescale functions with LJ-type minima to uma statistics
                 lj_mean, lj_std, uma_mean, uma_std = self.lj_rescale
-                mol_energy = (mol_energy - lj_mean) / lj_std * uma_std + uma_mean
+                atomwise_energy = mol_energy/(crystal_batch.num_atoms / crystal_batch.z_prime)
+                atomwise_fixed = (atomwise_energy - lj_mean) / lj_std * uma_std + uma_mean
+                mol_energy = atomwise_fixed * (crystal_batch.num_atoms / crystal_batch.z_prime)
 
             reduction_energy = F.relu(crystal_batch.reduction_en)  # punish positive energies
 
