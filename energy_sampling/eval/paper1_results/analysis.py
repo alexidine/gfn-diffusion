@@ -2,6 +2,8 @@ import numpy as np
 import plotly.graph_objects as go
 import torch
 from scipy.stats import linregress
+from sklearn.neighbors import NearestNeighbors
+from tqdm import tqdm
 from umap import UMAP
 
 from energy_sampling.eval.paper1_results.utils import sample_from_gfn, analyze_samples, cluster_hdbscan_to_df, \
@@ -12,9 +14,38 @@ from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 
 torch.cuda.set_per_process_memory_fraction(0.9, device=0)
 
+def knn_blockwise(x, k, block_size=1024):
+    """
+    x: (N, D) tensor on GPU
+    returns knn indices: (N, k)
+    """
+    N = x.shape[0]
+    device = x.device
+
+    knn_inds = torch.empty((N, k), dtype=torch.long, device=device)
+    knn_dists = torch.empty((N, k), dtype=x.dtype, device=device)
+
+    for i in range(0, N, block_size):
+        i_end = min(i + block_size, N)
+        xb = x[i:i_end]                       # (B, D)
+
+        # distances to ALL points, but only for this block
+        d = torch.cdist(xb, x)                # (B, N)
+
+        # remove self matches
+        row_idx = torch.arange(i, i_end, device=device)
+        d[torch.arange(i_end - i, device=device), row_idx] = float("inf")
+
+        vals, inds = d.topk(k, largest=False)
+        knn_inds[i:i_end] = inds
+        knn_dists[i:i_end] = vals
+
+    return knn_inds, knn_dists
+
+
 if __name__ == '__main__':
     device = 'cuda'
-    num_samples = 10000
+    num_samples = 100000
     batch_size = 1000
     energy_function = 'elj'  # 'elj', 'lj' 'uma
     n_steps = 50  # critical to get this right!
@@ -82,6 +113,80 @@ if __name__ == '__main__':
     go.Figure(go.Histogram(x=sample_batch.packing_coeff)).show()
     # the 6 aunit marginals are then pretty interesting
 
+    "steepest descent graph clustering"
+
+
+    def graph_descent(i, knn, energies):
+        while True:
+            neigh = knn[i]
+            j = neigh[torch.argmin(energies[neigh])]
+            if energies[j] < energies[i]:
+                i = j
+            else:
+                return i
+
+
+    energies = sample_energy
+
+    'MC method'
+    N = len(energies)
+    S = 500  # steps per walker
+    beta_mc = 1 / 2.5
+    cval = 1.0
+
+    k = int(sample_latents.shape[1] * cval * np.log(len(sample_latents)))
+    nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm="auto").fit(sample_latents.cpu().numpy())
+    dists, inds = nbrs.kneighbors(sample_latents.cpu().numpy())
+
+    knn = torch.tensor(inds[:, 1:], device=sample_latents.device)
+    k = knn.shape[1]
+
+    # walkers
+    current = torch.arange(N, device=energies.device)
+    best = current.clone()
+    best_energy = energies[current]
+
+    for _ in range(S):
+        # pick random neighbor for each walker
+        rand_idx = torch.randint(k, (N,), device=energies.device)
+        proposal = knn[current, rand_idx]
+
+        dE = energies[proposal] - energies[current]
+
+        accept = (dE < 0) | (torch.rand(N, device=energies.device) < torch.exp(-beta_mc * dE))
+        current = torch.where(accept, proposal, current)
+
+        # update best seen
+        better = energies[current] < best_energy
+        best = torch.where(better, current, best)
+        best_energy = torch.where(better, energies[current], best_energy)
+
+    go.Figure(go.Histogram(x=best, nbinsx=len(best.unique()))).show()
+    masks = np.array([best == ind for ind in np.unique(best)])
+    mask_sorts = np.argsort([sum(m) for m in masks])[::-1]
+    sample_batch.plot_batch_cell_params(space='real',
+                                        aux_dists=[sample_batch.full_cell_parameters()[m] for m in masks[mask_sorts[:10]] if
+                                                   sum(m) > 1])
+
+    'steepest descent method'
+    cval = 1
+    k = int(sample_latents.shape[1]*cval*np.log(len(sample_latents)))
+    nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm="auto").fit(sample_latents.cpu().numpy())
+    dists, inds = nbrs.kneighbors(sample_latents.cpu().numpy())
+
+    minima = torch.empty(len(energies), dtype=torch.long)
+
+    for i in tqdm(range(len(energies))):
+        minima[i] = graph_descent(i, knn, energies)
+
+    clabel = minima
+    masks = [clabel == ind for ind in np.unique(clabel)]
+    sample_batch.plot_batch_cell_params(space='real',
+                                        aux_dists=[sample_batch.full_cell_parameters()[m] for m in masks[:10] if
+                                                   sum(m) > 1])
+    go.Figure(go.Histogram(x=minima, nbinsx=len(torch.unique(minima)))).show()
+
+
 
     "Low T clusters"
     e_cut = torch.quantile(sample_energy, 0.1)
@@ -121,7 +226,7 @@ if __name__ == '__main__':
 
             # Is there a neighbor that is:
             # 1) energetically close to i
-            # 2) energetically not higher than anchor + delta_E
+            # 2) energetically lower than anchor + delta_E
             reachable = (
                     (low_energy[neigh_inds] <= Ei + delta_E) &
                     (low_energy[neigh_inds] <= low_energy[a_ind] + delta_E)
