@@ -300,7 +300,7 @@ class Modeller:
 
         elif os.path.exists(f'checkpoints/{self.run_name}_model_train.pt'):
             reload_path = f'checkpoints/{self.run_name}_model_train.pt'
-            if 'dev' not in reload_path:
+            if ('dev' not in reload_path) and not self.args.force_restart:
                 print("Reloading automatically from this prior checkpoint with same run name")
                 reload = True
                 reload_path = f'checkpoints/{self.run_name}_model_train.pt'

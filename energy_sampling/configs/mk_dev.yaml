@@ -106,6 +106,7 @@ reward_range: 80 # range of reward values allowed, null to go unrestricted
 
 # dataset settings
 ################################################################
+force_restart: true
 uma_path: 'D:\crystal_datasets\esen_s.pt'
 buffer_path: 'D:\crystal_datasets\acridine\acridine_sg2_zp1.pt' #'D:/crystal_datasets/urea_gfn_dataset.pt' #
 #molecules_path: 'D:/crystal_datasets/train_qm9.pt'

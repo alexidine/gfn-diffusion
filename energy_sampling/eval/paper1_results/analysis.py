@@ -87,15 +87,87 @@ if __name__ == '__main__':
     e_cut = torch.quantile(sample_energy, 0.1)
     low_en_samples_inds = torch.argwhere(sample_energy < e_cut).flatten()
     low_en_samples = sample_latents[low_en_samples_inds]
-    clust_df, clust_labels = cluster_hdbscan_to_df(torch.Tensor(low_en_samples), sample_energy[low_en_samples_inds])
-    ll = torch.ones(len(sample_latents), device=sample_latents.device, dtype=torch.long)
-    ll -= 2
-    ll[low_en_samples_inds] = torch.tensor(clust_labels, dtype=torch.long)
-    masks = [ll == ind for ind in np.unique(ll)]
+
+    low_latents = low_en_samples
+    low_energy = sample_energy[low_en_samples_inds]
+    order = torch.argsort(low_energy)
+    low_latents = low_latents[order]
+    low_energy = low_energy[order]
+    k = 10
+
+    dmat = torch.cdist(low_latents, low_latents)
+    knn = dmat.topk(k + 1, largest=False).indices[:, 1:]
+
+    kT = 2.5
+    beta = 1/kT
+    delta_E = 2.0 * kT  # or ~2–3 kT in energy units
+
+    anchor_inds = []  # indices *into low_latents*
+
+    for i in range(len(low_latents)):
+        Ei = low_energy[i]
+
+        # First point is always an anchor
+        if len(anchor_inds) == 0:
+            anchor_inds.append(i)
+            continue
+
+        is_new_anchor = True
+
+        # Check against all existing anchors
+        for a_ind in anchor_inds:
+            # Look at neighbors of candidate i
+            neigh_inds = knn[i]
+
+            # Is there a neighbor that is:
+            # 1) energetically close to i
+            # 2) energetically not higher than anchor + delta_E
+            reachable = (
+                    (low_energy[neigh_inds] <= Ei + delta_E) &
+                    (low_energy[neigh_inds] <= low_energy[a_ind] + delta_E)
+            ).any()
+
+            if reachable:
+                is_new_anchor = False
+                break
+
+        if is_new_anchor:
+            anchor_inds.append(i)
+    sigmas = []
+    for a_ind in anchor_inds:
+        # local energy window
+        mask = low_energy < low_energy[a_ind] + delta_E
+        d = torch.norm(low_latents[mask] - low_latents[a_ind], dim=1)
+        sigmas.append(torch.median(d))
+    sigmas = torch.stack(sigmas)
+
+    weights = []
+
+    for j, a_ind in enumerate(anchor_inds):
+        a_lat = low_latents[a_ind]
+        a_E = low_energy[a_ind]
+
+        d = torch.norm(sample_latents - a_lat, dim=1)
+
+        geom = torch.exp(-(d ** 2) / (2 * sigmas[j] ** 2))
+
+        # soft energy gate
+        energy_gate = torch.exp(
+            -torch.clamp(sample_energy - a_E, min=0.0) / delta_E
+        )
+
+        w = geom * energy_gate
+        weights.append(w)
+
+    weights = torch.stack(weights)  # shape (n_anchors, n_samples)
+    weights = weights / (weights.sum(dim=0, keepdim=True) + 1e-8)
+    clabel = weights.argmax(dim=0)
+    Z = torch.sum(torch.exp(-beta * sample_energy) * weights, dim=1)
+    F = -kT * torch.log(Z)
+    masks = [clabel == ind for ind in np.unique(clabel)]
     sample_batch.plot_batch_cell_params(space='real',
                                         aux_dists=[sample_batch.full_cell_parameters()[m] for m in masks[:10] if
                                                    sum(m) > 1])
-
 
     "Dimension Reduction"
     real_params = sample_batch.full_cell_parameters()

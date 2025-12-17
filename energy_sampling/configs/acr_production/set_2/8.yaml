@@ -49,6 +49,7 @@ exploration_factor: 0.25
 exploration_wd: true
 exploratory: false
 figs_period: 1000
+force_restart: true
 fwd_loss_coeffs:
   buffer: 0
   buffer_gamma: 0
@@ -117,7 +118,7 @@ space_groups:
 - 1
 t_emb_dim: 64
 t_scale: 0.05
-tag: acr3
+tag: acr4
 temp_annealing_max_steps: 2000
 temperature_conditioning: false
 temperature_scaling_factor: 0.01

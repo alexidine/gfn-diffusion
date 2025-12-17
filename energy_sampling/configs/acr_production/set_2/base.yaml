@@ -103,6 +103,7 @@ reward_range: 80 # range of reward values allowed, null to go unrestricted
 
 # dataset settings
 ################################################################
+force_restart: true
 uma_path: '/scratch/mk8347/models/uma/esen_s.pt'
 buffer_path: '/scratch/mk8347/csd_runs/datasets/new_nic_2_zp1.pt'
 molecules_path: '/scratch/mk8347/csd_runs/datasets/nicoam0.pkl'
