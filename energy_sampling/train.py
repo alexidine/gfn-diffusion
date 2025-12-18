@@ -40,7 +40,7 @@ class Modeller:
     def __init__(self):
         self.hit_init_kld = False
         self.times = {}
-        torch.cuda.set_per_process_memory_fraction(0.9, device=0)
+        torch.cuda.set_per_process_memory_fraction(0.95, device=0)
         torch.cuda.init()  # create context with the cap already in place
 
         args = get_train_args()
