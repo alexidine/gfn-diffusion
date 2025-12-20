@@ -54,7 +54,7 @@ class CrystalReplayBuffer:
         if len(self.staging_buffer) < len(
                 self):  # don't stage a crazy number of samples - downstream cost becomes too high
             if data_list is None and data_batch is not None:
-                data_list = data_batch.batch_to_list()
+                data_list = data_batch.cpu().detach().batch_to_list()
 
             self.staging_buffer.extend(data_list)
 

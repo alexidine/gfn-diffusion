@@ -1,16 +1,19 @@
+import re
 from collections import Counter
 
 import hdbscan
 import numpy as np
 import pandas as pd
+import plotly.colors as pc
 import torch
-from _plotly_utils.colors import qualitative
+from _plotly_utils.colors import qualitative, color_parser, hex_to_rgb
 from matplotlib import cm, colors
 from plotly import graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.cluster.hierarchy import linkage, to_tree, leaves_list
 from scipy.spatial.distance import pdist
 from sklearn.cluster import estimate_bandwidth, MeanShift
+from sklearn.neighbors import NearestNeighbors
 from tqdm import tqdm
 
 from energy_sampling.utils import uniform_discretizer, get_gfn_init_state
@@ -26,6 +29,7 @@ def cluster_1d(X):
     labels = ms.fit_predict(X_)
     n_clusters = len(np.unique(labels))
     return n_clusters, labels
+
 
 def plot_marginals(latents, labels, clusters_per_dim):
     fig = make_subplots(rows=4, cols=3)
@@ -378,7 +382,8 @@ def hierarchical_joint_df(labels, max_order=4, cutoff=0.01, descriptors_fn=None)
     return df.sort_values(["order", "p"], ascending=[True, False]).reset_index(drop=True)
 
 
-def get_highp_correlations(marginal_labels, n_samples, n_dims, clusters_per_dim, cutoff: float = 2.0, max_depth: int = 4):
+def get_highp_correlations(marginal_labels, n_samples, n_dims, clusters_per_dim, cutoff: float = 2.0,
+                           max_depth: int = 4):
     p1 = [
         np.bincount(marginal_labels[:, i], minlength=clusters_per_dim[i]) / n_samples
         for i in range(n_dims)
@@ -552,7 +557,7 @@ def expand_tree_fast(root_dim, root_cluster, p1, idx_cache, N,
 
 
 def estimate_logp_with_convergence(
-        gfn_model, terminal_states, batch_size,
+        gfn_model, terminal_states,
         n_steps, tol=1e-3, window=5, max_repeats=200
 ):
     flows = []
@@ -563,7 +568,7 @@ def estimate_logp_with_convergence(
         repeat += 1
         # --- one backward trajectory sample ---
         discretizer = lambda bsz: uniform_discretizer(bsz, n_steps)
-        condition = torch.zeros((batch_size, 1), device=gfn_model.device)
+        condition = torch.zeros((len(terminal_states), 1), device=gfn_model.device)
 
         with torch.no_grad():
             states, log_pfs, log_pbs, log_flow = gfn_model.get_traj_bwd(
@@ -619,7 +624,7 @@ def sample_from_gfn(num_samples, max_z_prime, device, n_steps, batch_size, gfn_m
     return samples
 
 
-def analyze_samples(x, mol_list, max_z_prime, device, batch_size, sg_ind, zp, do_uma: bool=False, predictor=None):
+def analyze_samples(x, mol_list, max_z_prime, device, batch_size, sg_ind, zp, do_uma: bool = False, predictor=None):
     num_batches = len(mol_list) // batch_size + (1 if len(mol_list) % batch_size else 0)
     num_samples = len(mol_list)
     samples = []
@@ -635,17 +640,20 @@ def analyze_samples(x, mol_list, max_z_prime, device, batch_size, sg_ind, zp, do
                 batch.reset_sg_info(sg_ind)
                 batch.latent_to_cell_params(x[inds])
                 batch = batch.to(device)
-                outs = batch.analyze(['lj','qlj','elj','silu'], cutoff=10, std_orientation=True)
+                outs = batch.analyze(['lj', 'qlj', 'elj', 'silu', 'rdf'], cutoff=10, std_orientation=True)
                 if do_uma:
-                    gas_en = batch.compute_lattice_gas_phase_uma(predictor, std_orientation=True).cpu().detach() * 96.485
-                    cry_en = batch.compute_crystal_uma(predictor=predictor, std_orientation=True).cpu().detach() * 96.485
+                    gas_en = batch.compute_lattice_gas_phase_uma(predictor,
+                                                                 std_orientation=True).cpu().detach() * 96.485
+                    cry_en = batch.compute_crystal_uma(predictor=predictor,
+                                                       std_orientation=True).cpu().detach() * 96.485
                     batch.add_graph_attr(gas_en, 'uma_gas_pot')
                     batch.add_graph_attr(cry_en, 'uma_pot')
 
-                batch.add_graph_attr(outs['lj'], 'lj')
-                batch.add_graph_attr(outs['elj'], 'elj')
-                batch.add_graph_attr(outs['qlj'], 'qlj')
-                batch.add_graph_attr(outs['silu'], 'silu')
+                for key, value in outs.items():
+                    if key != 'rdf':
+                        batch.add_graph_attr(value, key)
+                    else:
+                        batch.add_graph_attr(value[0], key)
                 batch.to('cpu')
                 samples.extend(batch.batch_to_list())
                 del batch
@@ -698,3 +706,276 @@ def cluster_hdbscan_to_df(X: torch.Tensor,
 
     top_df = pd.DataFrame(df_records, columns=['cluster_id', 'n', 'p', 'mean_en'])
     return top_df, labels
+
+
+def graph_MC(energies, traj_len, kT, cval, samples=None, dmat=None):
+    N = len(energies)
+    beta_mc = 1 / kT
+    k = int(samples.shape[1] * cval * np.log(len(samples)))
+
+    if dmat is not None and samples is None:
+        knn = dmat.topk(k + 1, largest=False).indices[:, 1:]
+    elif samples is not None:
+        nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm="auto").fit(samples.cpu().numpy())
+        dists, inds = nbrs.kneighbors(samples.cpu().numpy())
+        knn = torch.tensor(inds[:, 1:], device=samples.device)
+
+    k = knn.shape[1]
+
+    # walkers
+    current = torch.arange(N, device=energies.device)
+    best = current.clone()
+    best_energy = energies[current]
+
+    for _ in range(traj_len):
+        # pick random neighbor for each walker
+        rand_idx = torch.randint(k, (N,), device=energies.device)
+        proposal = knn[current, rand_idx]
+
+        dE = energies[proposal] - energies[current]
+
+        accept = (dE < 0) | (torch.rand(N, device=energies.device) < torch.exp(-beta_mc * dE))
+        current = torch.where(accept, proposal, current)
+
+        # update best seen
+        better = energies[current] < best_energy
+        best = torch.where(better, current, best)
+        best_energy = torch.where(better, energies[current], best_energy)
+
+    return best
+
+
+def first_hit_graph_MC(energies, basin_inds, traj_len, kT, cval, samples=None, dmat=None):
+    N = len(energies)
+    beta_mc = 1 / kT
+    k = int(samples.shape[1] * cval * np.log(len(samples)))
+
+    if dmat is not None and samples is None:
+        knn = dmat.topk(k + 1, largest=False).indices[:, 1:]
+    elif samples is not None:
+        nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm="auto").fit(samples.cpu().numpy())
+        dists, inds = nbrs.kneighbors(samples.cpu().numpy())
+        knn = torch.tensor(inds[:, 1:], device=samples.device)
+
+    k = knn.shape[1]
+
+    state_is_basin = torch.zeros(len(energies), dtype=bool)
+    state_is_basin.fill_(False)
+    state_is_basin[basin_inds] = True
+
+    # walkers
+    current = torch.arange(N, device=energies.device)
+    active = torch.ones(len(energies), dtype=bool)
+
+    for _ in range(traj_len):
+        if active.any() == False:
+            break
+        # pick random neighbor for each walker
+        rand_idx = torch.randint(k, (N,), device=energies.device)
+        proposal = knn[current, rand_idx]
+
+        dE = energies[proposal] - energies[current]
+
+        accept = (dE < 0) | (torch.rand(N, device=energies.device) < torch.exp(-beta_mc * dE))
+        current = torch.where(accept & active, proposal, current)
+
+        # update best seen
+        new_hit = state_is_basin[current] & active
+        active[new_hit] = False
+
+    first_basin_hit = current
+    first_basin_hit[active] = -1
+
+    return first_basin_hit
+
+
+def steepest_descent(samples, energies, cval):
+    k = int(samples.shape[1] * cval * np.log(len(samples)))
+    nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm="auto").fit(samples.cpu().numpy())
+    dists, inds = nbrs.kneighbors(samples.cpu().numpy())
+    knn = torch.tensor(inds[:, 1:], device=samples.device)
+
+    minima = torch.empty(len(energies), dtype=torch.long)
+
+    for i in tqdm(range(len(energies))):
+        minima[i] = graph_descent(i, knn, energies)
+
+    return minima
+
+
+def graph_descent(i, knn, energies):
+    while True:
+        neigh = knn[i]
+        j = neigh[torch.argmin(energies[neigh])]
+        if energies[j] < energies[i]:
+            i = j
+        else:
+            return i
+
+
+def basin_average(observable, basin_weights):
+    w = basin_weights
+    num = (w * observable.unsqueeze(1)).sum(0)
+    den = w.sum(0).clamp(min=1e-12)
+    return num / den
+
+
+def get_committor_weights(clabel, basin_inds, num_committor_steps: int, sample_energy, num_samples, num_basins,
+                          sample_latents, cval: float, mc_kT: float):
+    basin_id = torch.full_like(clabel, -1)
+    basin_id[basin_inds] = torch.arange(len(basin_inds), device=clabel.device)
+    committed_record = torch.zeros((num_committor_steps, num_samples), dtype=torch.long)
+    for ind in tqdm(range(num_committor_steps)):
+        hits = first_hit_graph_MC(
+            sample_energy,
+            basin_inds,
+            traj_len=5000,
+            kT=mc_kT,
+            cval=cval,
+            samples=sample_latents)
+        committed_record[ind] = torch.where(
+            hits >= 0,
+            basin_id[hits],
+            -1
+        )
+    basin_weights = torch.zeros(num_samples, num_basins)
+
+    flat = committed_record.view(-1)
+    mask = flat >= 0
+
+    basin_weights.index_add_(
+        0,
+        torch.arange(num_samples).repeat(num_committor_steps)[mask],
+        torch.nn.functional.one_hot(flat[mask], num_basins).float()
+    )
+
+    basin_weights /= num_committor_steps
+    return basin_weights
+
+
+def get_gfn_samples(num_samples, max_z_prime, device, n_steps, batch_size, gfn_model, energy_function, molecule, sg_ind,
+                    zp):
+    sample_latents = sample_from_gfn(num_samples, max_z_prime, device, n_steps, batch_size, gfn_model)
+    if energy_function == 'uma':
+        pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
+        predictor = init_uma_crystal_predictor(pred_path, device=device)
+    else:
+        predictor = None
+    samples = analyze_samples(sample_latents, molecule * num_samples, max_z_prime, device, batch_size, sg_ind,
+                              zp,
+                              do_uma=energy_function == 'uma', predictor=predictor)
+    sample_batch = collate_data_list(samples, max_z_prime=max_z_prime)
+
+    if energy_function == 'uma':
+        sample_energy = sample_batch.uma_pot / (sample_batch.sym_mult * sample_batch.z_prime) - sample_batch.uma_gas_pot
+    elif energy_function == 'elj':
+        lj_mean, lj_std, uma_mean, uma_std = [-20.6, 5.7, -3.4, 1.5]
+        atomwise_energy = sample_batch.elj / (sample_batch.num_atoms / sample_batch.z_prime)
+        atomwise_fixed = (atomwise_energy - lj_mean) / lj_std * uma_std + uma_mean
+        sample_energy = atomwise_fixed * (sample_batch.num_atoms / sample_batch.z_prime)
+    else:
+        sample_energy = sample_batch.lj
+
+    return sample_batch, sample_latents, sample_energy, sample_batch.packing_coeff, samples
+
+
+def get_cluster_weights(sample_latents, sample_energy, num_samples, num_committor_steps, cval: float = 1,
+                        mc_kT: float = 2.5):
+    "Soft clustering by committor analysis"
+    clabel = steepest_descent(sample_latents, sample_energy, cval=cval)
+    basin_inds = torch.unique(clabel)
+    num_basins = len(basin_inds)
+    basin_weights = get_committor_weights(clabel, basin_inds, num_committor_steps, sample_energy, num_samples,
+                                          num_basins, sample_latents, cval=cval, mc_kT=mc_kT)
+    hard_assignment = torch.argmax(basin_weights, dim=1)
+    hard_assignment_prob = torch.amax(basin_weights, dim=1)
+    return basin_weights, hard_assignment, hard_assignment_prob, basin_inds
+
+    # masks = np.array([hard_assignment == ind for ind in np.unique(hard_assignment)])
+    # mask_sorts = np.argsort([sum(m) for m in masks])[::-1]
+    # sorted_masks = masks[mask_sorts]
+    # go.Figure(go.Histogram(x=basin_weights.amax(1), nbinsx=100)).show()
+    # go.Figure(go.Histogram(x=hard_assignment, nbinsx=len(hard_assignment.unique()))).show()
+    # sample_batch.plot_batch_cell_params(space='real',
+    #                                     aux_dists=[sample_batch.full_cell_parameters()[m] for m in
+    #                                                masks[mask_sorts[:10]] if
+    #                                                sum(m) > 1])
+
+
+def cluster_thermo_analysis(basin_weights, sample_energy, kT, cp, basin_inds, top_cluster_inds):
+    min_ens = sample_energy[basin_inds][top_cluster_inds]
+
+    # Basin partition weights
+    Zb = basin_weights.sum(dim=0).clamp(min=1e-12)  # (B,)
+
+    # Relative free energies
+    Fb = -kT * torch.log(Zb / Zb.sum())  # (B,)
+    basin_probs = Zb / Zb.sum()
+
+    # Mean energies per basin
+    mean_E = (basin_weights * sample_energy[:, None]).sum(dim=0) / Zb
+
+    # Mean densities per basin
+    mean_rho = (basin_weights * cp[:, None]).sum(dim=0) / Zb
+
+    # Effective entropies (relative)
+    Sb = (mean_E - Fb) / kT
+    return min_ens, Zb, Fb, basin_probs, mean_rho, Sb, mean_E
+
+
+
+def to_rgba(color, alpha=0.7):
+    # already rgba → just replace alpha
+    if color.startswith("rgba"):
+        return re.sub(
+            r'rgba\(([^,]+),([^,]+),([^,]+),[^)]+\)',
+            rf'rgba(\1,\2,\3,{alpha})',
+            color
+        )
+
+    # rgb(...)
+    if color.startswith("rgb"):
+        nums = re.findall(r'\d+', color)
+        r, g, b = nums[:3]
+        return f"rgba({r},{g},{b},{alpha})"
+
+    # must be a hex
+    r, g, b = hex_to_rgb(color)
+    return f"rgba({r},{g},{b},{alpha})"
+
+def get_color_set(n, alpha=0.7):
+    if n <= len(qualitative.Plotly):
+        colors = qualitative.Plotly[:n]
+    elif n <= len(qualitative.Dark24):
+        colors = qualitative.Dark24[:n]
+    else:
+        colors = pc.n_colors(
+            'rgb(0,0,255)',
+            'rgb(255,0,0)',
+            n,
+            colortype='rgb'
+        )
+
+    return [to_rgba(c, alpha) for c in colors]
+
+
+def get_gfn_logprobs(batch_size, sample_latents, gfn_model, n_steps, max_repeats: int = 50, tol:float=1e-2):
+    num_batches = len(sample_latents) // batch_size + (1 if len(sample_latents) % batch_size else 0)
+    num_samples = len(sample_latents)
+    counter = 0
+    logps = torch.zeros(len(sample_latents), dtype=torch.float32)
+
+    with tqdm(total=num_samples) as pbar:
+        with torch.no_grad():
+            for b_ind in range(num_batches):
+                inds = torch.arange(b_ind * batch_size, (b_ind + 1) * batch_size)
+                terminal_states = sample_latents[inds, :]
+                logp_est, _ = estimate_logp_with_convergence(
+                    gfn_model, terminal_states, n_steps=n_steps, max_repeats=max_repeats, tol=tol, window=10
+                )
+                logps[inds] = logp_est
+                counter += batch_size
+                pbar.update(batch_size)
+
+    return logps
+

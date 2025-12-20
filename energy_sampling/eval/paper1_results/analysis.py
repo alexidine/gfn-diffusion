@@ -2,337 +2,119 @@ import numpy as np
 import plotly.graph_objects as go
 import torch
 from scipy.stats import linregress
-from sklearn.neighbors import NearestNeighbors
 from tqdm import tqdm
-from umap import UMAP
 
-from energy_sampling.eval.paper1_results.utils import sample_from_gfn, analyze_samples, cluster_hdbscan_to_df, \
-    estimate_logp_with_convergence
+from energy_sampling.eval.paper1_results.figures import general_figs, cluster_comparison_fig, dim_reduction_fig, \
+    boltzmann_fig, make_thermo_table
+from energy_sampling.eval.paper1_results.utils import estimate_logp_with_convergence, get_gfn_samples, \
+    get_cluster_weights, cluster_thermo_analysis, get_color_set, get_gfn_logprobs
 from energy_sampling.models import GFN
 from mxtaltools.dataset_utils.utils import collate_data_list
-from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 
 torch.cuda.set_per_process_memory_fraction(0.9, device=0)
 
-def knn_blockwise(x, k, block_size=1024):
-    """
-    x: (N, D) tensor on GPU
-    returns knn indices: (N, k)
-    """
-    N = x.shape[0]
-    device = x.device
-
-    knn_inds = torch.empty((N, k), dtype=torch.long, device=device)
-    knn_dists = torch.empty((N, k), dtype=x.dtype, device=device)
-
-    for i in range(0, N, block_size):
-        i_end = min(i + block_size, N)
-        xb = x[i:i_end]                       # (B, D)
-
-        # distances to ALL points, but only for this block
-        d = torch.cdist(xb, x)                # (B, N)
-
-        # remove self matches
-        row_idx = torch.arange(i, i_end, device=device)
-        d[torch.arange(i_end - i, device=device), row_idx] = float("inf")
-
-        vals, inds = d.topk(k, largest=False)
-        knn_inds[i:i_end] = inds
-        knn_dists[i:i_end] = vals
-
-    return knn_inds, knn_dists
-
-
 if __name__ == '__main__':
+    "Configs & args"
     device = 'cuda'
-    num_samples = 100000
+    num_samples = 20000
     batch_size = 1000
     energy_function = 'elj'  # 'elj', 'lj' 'uma
     n_steps = 50  # critical to get this right!
     sg_ind = 14
     zp = 1  # todo fix zp>1 pre-processing
+    show_figs = True
+    save_figs = True
+    num_committor_steps = 100
+    cval = 1
+    mc_kT = 2.5
+    kT = 2.5
+    clusters_to_analyze = 8
+    max_repeats=50
+    tol = 1e-2
+
+    do_general_vis = True
+    do_clustering = True
+    do_dimension_reduction = True
+    do_explicit_probs = True
 
     model_path = rf"D:\crystal_datasets\nic3_sg{sg_ind}_zp{zp}_2_model_eval.pt"
     config_path = rf"D:\crystal_datasets\nic3_sg{sg_ind}_zp{zp}_2_model_config.npy"
     molecule_path = r"D:\crystal_datasets\nicoam\protonated_nicotinamide.pt"
     dataset_path = rf"D:\crystal_datasets\nicoam\nic_sg{sg_ind}_zp{zp}.pt"
 
+    "Load GFN"
     gfn_model = GFN(**np.load(config_path, allow_pickle=True).item())
     gfn_model.load_state_dict(torch.load(model_path, weights_only=True))
     gfn_model.to(device)
     gfn_model.eval()
 
+    "Load Relevant Dataset"
     molecule = torch.load(molecule_path, weights_only=False)
     dataset = torch.load(dataset_path, weights_only=False)
     max_z_prime = max([int(elem.max_z_prime) for elem in dataset])
     data_batch = collate_data_list(dataset, max_z_prime=max_z_prime)
     data_latents = data_batch.latent_params()
 
-    sample_latents = sample_from_gfn(num_samples, max_z_prime, device, n_steps, batch_size, gfn_model)
-    if energy_function == 'uma':
-        pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
-        predictor = init_uma_crystal_predictor(pred_path, device=device)
-    else:
-        predictor = None
-
-    samples = analyze_samples(sample_latents, molecule * len(sample_latents), max_z_prime, device, batch_size, sg_ind, zp,
-                              do_uma=energy_function == 'uma', predictor=predictor)
-    sample_batch = collate_data_list(samples, max_z_prime=max_z_prime)
-
-    """Analyses"""
-    if energy_function == 'uma':
-        sample_energy = sample_batch.uma_pot / (sample_batch.sym_mult * sample_batch.z_prime) - sample_batch.uma_gas_pot
-    elif energy_function == 'elj':
-        sample_energy = sample_batch.elj
-        sample_energy = ((sample_energy - -293) / 99) * 41 + -31
-    else:
-        sample_energy = sample_batch.lj
-
-
-    'Explicit Density Estimation'
-    # sort_inds = torch.argsort(sample_energy)[:batch_size]
-    # terminal_states = sample_latents[sort_inds, :]
-    terminal_states = sample_latents[:batch_size, :]
-    logp_est, _ = estimate_logp_with_convergence(
-        gfn_model, terminal_states, batch_size, n_steps=n_steps, max_repeats=50, tol=1e-2, window=10
+    "Sample from GFN & process samples"
+    sample_batch, sample_latents, sample_energy, sample_cp, samples = get_gfn_samples(
+        num_samples, max_z_prime,
+        device, n_steps, batch_size, gfn_model,
+        energy_function, molecule, sg_ind, zp
     )
 
-    boltzmann_logprobs = -sample_energy[
-        :batch_size] / 2.5 - gfn_model.flow_model().item()  # unconditional boltzmann factor
-    x = logp_est.cpu().detach()
-    y = boltzmann_logprobs.cpu().detach()
-    linreg = linregress(x, y)
-    go.Figure(go.Scatter(x=x, y=y, mode='markers')).show()
-    go.Figure(go.Scatter(x=x, y=sample_energy[:batch_size], mode='markers')).show()
+    """
+    Make Figures
+    """
+    fig_dict = {}
+    if do_general_vis:  # Standard visualizations
+        fig_dict = general_figs(fig_dict, sample_batch, sample_energy, data_batch)
 
-    "Free energy marginals"
-    # b/max(a,c) marginal
-    len_rat = sample_batch.cell_lengths[:, 1] / torch.amax(sample_batch.cell_lengths[:, 0:3:2], dim=1)
-    go.Figure(go.Histogram(x=len_rat, nbinsx=100)).show()
-    # density marginal
-    go.Figure(go.Histogram(x=sample_batch.packing_coeff)).show()
-    # the 6 aunit marginals are then pretty interesting
-
-    "steepest descent graph clustering"
-
-
-    def graph_descent(i, knn, energies):
-        while True:
-            neigh = knn[i]
-            j = neigh[torch.argmin(energies[neigh])]
-            if energies[j] < energies[i]:
-                i = j
-            else:
-                return i
-
-
-    energies = sample_energy
-
-    'MC method'
-    N = len(energies)
-    S = 500  # steps per walker
-    beta_mc = 1 / 2.5
-    cval = 1.0
-
-    k = int(sample_latents.shape[1] * cval * np.log(len(sample_latents)))
-    nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm="auto").fit(sample_latents.cpu().numpy())
-    dists, inds = nbrs.kneighbors(sample_latents.cpu().numpy())
-
-    knn = torch.tensor(inds[:, 1:], device=sample_latents.device)
-    k = knn.shape[1]
-
-    # walkers
-    current = torch.arange(N, device=energies.device)
-    best = current.clone()
-    best_energy = energies[current]
-
-    for _ in range(S):
-        # pick random neighbor for each walker
-        rand_idx = torch.randint(k, (N,), device=energies.device)
-        proposal = knn[current, rand_idx]
-
-        dE = energies[proposal] - energies[current]
-
-        accept = (dE < 0) | (torch.rand(N, device=energies.device) < torch.exp(-beta_mc * dE))
-        current = torch.where(accept, proposal, current)
-
-        # update best seen
-        better = energies[current] < best_energy
-        best = torch.where(better, current, best)
-        best_energy = torch.where(better, energies[current], best_energy)
-
-    go.Figure(go.Histogram(x=best, nbinsx=len(best.unique()))).show()
-    masks = np.array([best == ind for ind in np.unique(best)])
-    mask_sorts = np.argsort([sum(m) for m in masks])[::-1]
-    sample_batch.plot_batch_cell_params(space='real',
-                                        aux_dists=[sample_batch.full_cell_parameters()[m] for m in masks[mask_sorts[:10]] if
-                                                   sum(m) > 1])
-
-    'steepest descent method'
-    cval = 1
-    k = int(sample_latents.shape[1]*cval*np.log(len(sample_latents)))
-    nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm="auto").fit(sample_latents.cpu().numpy())
-    dists, inds = nbrs.kneighbors(sample_latents.cpu().numpy())
-
-    minima = torch.empty(len(energies), dtype=torch.long)
-
-    for i in tqdm(range(len(energies))):
-        minima[i] = graph_descent(i, knn, energies)
-
-    clabel = minima
-    masks = [clabel == ind for ind in np.unique(clabel)]
-    sample_batch.plot_batch_cell_params(space='real',
-                                        aux_dists=[sample_batch.full_cell_parameters()[m] for m in masks[:10] if
-                                                   sum(m) > 1])
-    go.Figure(go.Histogram(x=minima, nbinsx=len(torch.unique(minima)))).show()
-
-
-
-    "Low T clusters"
-    e_cut = torch.quantile(sample_energy, 0.1)
-    low_en_samples_inds = torch.argwhere(sample_energy < e_cut).flatten()
-    low_en_samples = sample_latents[low_en_samples_inds]
-
-    low_latents = low_en_samples
-    low_energy = sample_energy[low_en_samples_inds]
-    order = torch.argsort(low_energy)
-    low_latents = low_latents[order]
-    low_energy = low_energy[order]
-    k = 10
-
-    dmat = torch.cdist(low_latents, low_latents)
-    knn = dmat.topk(k + 1, largest=False).indices[:, 1:]
-
-    kT = 2.5
-    beta = 1/kT
-    delta_E = 2.0 * kT  # or ~2–3 kT in energy units
-
-    anchor_inds = []  # indices *into low_latents*
-
-    for i in range(len(low_latents)):
-        Ei = low_energy[i]
-
-        # First point is always an anchor
-        if len(anchor_inds) == 0:
-            anchor_inds.append(i)
-            continue
-
-        is_new_anchor = True
-
-        # Check against all existing anchors
-        for a_ind in anchor_inds:
-            # Look at neighbors of candidate i
-            neigh_inds = knn[i]
-
-            # Is there a neighbor that is:
-            # 1) energetically close to i
-            # 2) energetically lower than anchor + delta_E
-            reachable = (
-                    (low_energy[neigh_inds] <= Ei + delta_E) &
-                    (low_energy[neigh_inds] <= low_energy[a_ind] + delta_E)
-            ).any()
-
-            if reachable:
-                is_new_anchor = False
-                break
-
-        if is_new_anchor:
-            anchor_inds.append(i)
-    sigmas = []
-    for a_ind in anchor_inds:
-        # local energy window
-        mask = low_energy < low_energy[a_ind] + delta_E
-        d = torch.norm(low_latents[mask] - low_latents[a_ind], dim=1)
-        sigmas.append(torch.median(d))
-    sigmas = torch.stack(sigmas)
-
-    weights = []
-
-    for j, a_ind in enumerate(anchor_inds):
-        a_lat = low_latents[a_ind]
-        a_E = low_energy[a_ind]
-
-        d = torch.norm(sample_latents - a_lat, dim=1)
-
-        geom = torch.exp(-(d ** 2) / (2 * sigmas[j] ** 2))
-
-        # soft energy gate
-        energy_gate = torch.exp(
-            -torch.clamp(sample_energy - a_E, min=0.0) / delta_E
+    if do_clustering:  # Clustering & thermodynamic analysis
+        basin_weights, hard_assignment, hard_assignment_prob, basin_inds = get_cluster_weights(
+            sample_latents, sample_energy, num_samples, num_committor_steps, cval, mc_kT
         )
+        top_cluster_inds = torch.argsort(basin_weights.sum(0), descending=True).flatten()
+        min_ens, Zb, Fb, basin_probs, mean_rho, Sb, mean_E = cluster_thermo_analysis(basin_weights, sample_energy, kT,
+                                                                             sample_cp, basin_inds, top_cluster_inds)
 
-        w = geom * energy_gate
-        weights.append(w)
+        cluster_color = get_color_set(clusters_to_analyze, alpha=0.7)
+        fig_dict['clusters'] = cluster_comparison_fig(top_cluster_inds,
+                                                      sample_cp, sample_energy, hard_assignment,
+                                                      sample_batch, clusters_to_analyze, sample_latents,
+                                                      cluster_color,
+                                                      )
+        fig_dict['Thermo Table'] = make_thermo_table(Zb, basin_probs, Fb, mean_E, min_ens, Sb, mean_rho,hard_assignment, clusters_to_analyze)
 
-    weights = torch.stack(weights)  # shape (n_anchors, n_samples)
-    weights = weights / (weights.sum(dim=0, keepdim=True) + 1e-8)
-    clabel = weights.argmax(dim=0)
-    Z = torch.sum(torch.exp(-beta * sample_energy) * weights, dim=1)
-    F = -kT * torch.log(Z)
-    masks = [clabel == ind for ind in np.unique(clabel)]
-    sample_batch.plot_batch_cell_params(space='real',
-                                        aux_dists=[sample_batch.full_cell_parameters()[m] for m in masks[:10] if
-                                                   sum(m) > 1])
+    if do_dimension_reduction:
+        assert do_clustering, "Need clusters for dim reduction fig"
+        fig_dict['Dim Reduction'] = dim_reduction_fig(sample_batch, hard_assignment, clusters_to_analyze, cluster_color,
+                                                      basin_inds)
 
-    "Dimension Reduction"
-    real_params = sample_batch.full_cell_parameters()
-    whitened_cell_params = (real_params - real_params.mean(0)) / torch.maximum(real_params.std(0), torch.ones_like(real_params.std(0)))
-    umap_model = UMAP(n_components=6, n_neighbors=10, min_dist=0.001)
-    sample_embedding = umap_model.fit_transform(whitened_cell_params)  # [low_en_bools])
+    if do_explicit_probs:
+        'Explicit Density Estimation'
+        logp_est = get_gfn_logprobs(batch_size, sample_latents, gfn_model, n_steps, max_repeats, tol)
+        fig_dict['boltzmann'] = boltzmann_fig(sample_energy, kT, gfn_model, logp_est)
 
-    "Clustering in umap dims"
-    clust_df, clust_labels = cluster_hdbscan_to_df(torch.Tensor(sample_embedding), sample_energy)
-    clust_df = clust_df.sort_values('p', ascending=False)
-    masks = [clust_labels == ind for ind in np.unique(clust_labels)]
 
-    if energy_function == 'uma':
-        # p21/c nicotinamide
-        nic = torch.load(r"D:\crystal_datasets\protonated_nicoam\protonated_nonstandard_nicotinamide.pkl",
-                         weights_only=False)
-        nb = collate_data_list(nic)
-        ref_out = nb.analyze(['elj'])
-        elj_en = ref_out['elj'] / nb.num_atoms
+    if show_figs:
+        for fig in fig_dict.values():
+            fig.show()
 
-        import plotly.graph_objects as go
-
-        gas_en = nb.compute_lattice_gas_phase_uma(predictor, std_orientation=True).cpu().detach() * 96.485
-        cry_en = nb.compute_crystal_uma(predictor=predictor, std_orientation=True).cpu().detach() * 96.485
-        uma_en = cry_en / nb.sym_mult - gas_en
-
-        fig = go.Figure(
-            go.Scatter(x=sample_batch.packing_coeff, y=sample_energy, mode='markers'))
-        fig.add_scatter(x=nb.packing_coeff, y=uma_en, mode='markers', marker_size=20)
-        fig.show()
-
-    "Umap visualization"
-    umap_model = UMAP(n_components=2, n_neighbors=10, min_dist=0.001)
-    sample_embedding = umap_model.fit_transform(whitened_cell_params)  # [low_en_bools])
-
-    fig = go.Figure()
-    fig.add_scatter(x=sample_embedding[:, 0], y=sample_embedding[:, 1], mode='markers', opacity=0.25, showlegend=False)
-    for ind, m in enumerate(masks):
-        fig.add_scatter(x=sample_embedding[m, 0], y=sample_embedding[m, 1], mode='markers', opacity=1.0,
-                        showlegend=False, marker_color=ind)
-    fig.show()
-
-    m_sort = np.argsort([sum(m) for m in masks])
-    sort_masks = [masks[ind] for ind in m_sort[::-1]]
-    sample_batch.plot_batch_cell_params(space='real',
-                                        aux_dists=[sample_batch.full_cell_parameters()[m] for m in sort_masks[:10] if
-                                                   sum(m) > 1])
-
-    "Standard visualizations"
-    sample_batch.plot_batch_staircase(space='real')
-    sample_batch.plot_batch_cell_params(space='real', ref_dist=data_batch.full_cell_parameters(), quantiles=[0.1],
-                                        override_energy=sample_energy)
-    sample_batch.plot_batch_density_funnel(override_energy=sample_energy)  # , color_flag=clust_labels)
-
-    end = 1
+    if save_figs:
+        for key, fig in fig_dict.items():
+            fig.write_image(rf"C:\Users\mikem\OneDrive\NYU\CSD\papers\generator\{key.replace(' ','_')}.png", width=1920, height=1080)
 
 '''
 # other analyses
 
- 
+
+    # 'best samples analysis'
+    # best_batch = collate_data_list([samples[ind] for ind in top_cluster_inds[num_clusters]])
+    # bin_edges = torch.linspace(0, 6, sample_batch.rdf.shape[-1], )
+    # dmat = compute_rdf_distmat(sample_batch.rdf[top_cluster_inds[:num_clusters]], bin_edges, chunk_size=10000)
+    # go.Figure(go.Heatmap(z=dmat)).show()
+
+
 # GM business
 
 from sklearn.mixture import GaussianMixture
@@ -436,5 +218,44 @@ go.Figure(go.Histogram(x=eff_components, nbinsx=50)).show()
              range(20)]
     sample_batch.plot_batch_cell_params(space='latent', aux_dists=[sample_batch.latent_params()[m] for m in masks[:10]])
     top_df.p / top_df.p.sum()
+
+    # 'RDF space MC'
+    # rdf_device = 'cuda'
+    # bin_edges = torch.linspace(0, 6, sample_batch.rdf.shape[-1], device=rdf_device)
+    # dmat = compute_rdf_distmat(sample_batch.rdf.to(rdf_device), bin_edges, chunk_size=10000).cpu()
+    # best, best_energy = graph_MC(sample_energy,
+    #                              traj_len=500,
+    #                              kT=2.5,
+    #                              cval=1.0,
+    #                              dmat=dmat)
+    # 
+    # if show_plots:
+    #     go.Figure(go.Histogram(x=best, nbinsx=len(best.unique()))).show()
+    #     masks = np.array([best == ind for ind in np.unique(best)])
+    #     mask_sorts = np.argsort([sum(m) for m in masks])[::-1]
+    #     sample_batch.plot_batch_cell_params(space='real',
+    #                                         aux_dists=[sample_batch.full_cell_parameters()[m] for m in
+    #                                                    masks[mask_sorts[:10]] if
+    #                                                    sum(m) > 1])
+    
+    if energy_function == 'uma':
+        # p21/c nicotinamide
+        nic = torch.load(r"D:\crystal_datasets\protonated_nicoam\protonated_nonstandard_nicotinamide.pkl",
+                         weights_only=False)
+        nb = collate_data_list(nic)
+        ref_out = nb.analyze(['elj'])
+        elj_en = ref_out['elj'] / nb.num_atoms
+
+        import plotly.graph_objects as go
+
+        gas_en = nb.compute_lattice_gas_phase_uma(predictor, std_orientation=True).cpu().detach() * 96.485
+        cry_en = nb.compute_crystal_uma(predictor=predictor, std_orientation=True).cpu().detach() * 96.485
+        uma_en = cry_en / nb.sym_mult - gas_en
+
+        fig = go.Figure(
+            go.Scatter(x=sample_batch.packing_coeff, y=sample_energy, mode='markers'))
+        fig.add_scatter(x=nb.packing_coeff, y=uma_en, mode='markers', marker_size=20)
+        fig.show()
+
 
 '''

@@ -184,113 +184,113 @@ def sample_eval_fwd_trajs(initial_state, gfn, discretizer, energy_function, mol_
                for o in outputs)
     return outputs
 
-@torch.no_grad()
-def mean_log_likelihood(terminal_state, gfn, log_reward_fn, num_evals=10):
-    bsz = terminal_state.shape[0]
-    terminal_state = terminal_state.unsqueeze(1).repeat(1, num_evals, 1).view(bsz * num_evals, -1)
-    states, log_pfs, log_pbs, log_fs = gfn.get_traj_bwd(terminal_state, None, log_reward_fn)
-    log_weight = (log_pfs.sum(-1) - log_pbs.sum(-1)).view(bsz, num_evals, -1)
-    return logmeanexp(log_weight, dim=1).mean()
+# @torch.no_grad()
+# def mean_log_likelihood(terminal_state, gfn, log_reward_fn, num_evals=10):
+#     bsz = terminal_state.shape[0]
+#     terminal_state = terminal_state.unsqueeze(1).repeat(1, num_evals, 1).view(bsz * num_evals, -1)
+#     states, log_pfs, log_pbs, log_fs = gfn.get_traj_bwd(terminal_state, None, log_reward_fn)
+#     log_weight = (log_pfs.sum(-1) - log_pbs.sum(-1)).view(bsz, num_evals, -1)
+#     return logmeanexp(log_weight, dim=1).mean()
+
+#
+# def crystal_list_rdf(samples, batch_size, device):
+#     num_batches = len(samples) // batch_size
+#     if len(samples) % batch_size != 0:
+#         num_batches += 1
+#
+#     rdfs = []
+#     for b_ind in range(num_batches):
+#         batch_inds = np.arange(b_ind * batch_size, min(len(samples), (b_ind + 1) * batch_size))
+#         mol_batch = collate_data_list([samples[ind] for ind in batch_inds]).to(device)
+#         rdf, rr = get_rdfs(mol_batch)
+#         rdfs.append(rdf)
+#
+#     return torch.cat(rdfs), rr
+#
+#
+# def get_rdfs(crystal_batch):
+#     with torch.no_grad():
+#         cluster_batch = crystal_batch.mol2cluster(cutoff=6)
+#         cluster_batch.construct_radial_graph(cutoff=6)
+#         rdf, rr, _ = crystal_rdf(cluster_batch,
+#                                  cluster_batch.edges_dict,
+#                                  rrange=[0, 6], bins=2000,
+#                                  mode='intermolecular',
+#                                  elementwise=True,
+#                                  raw_density=True,
+#                                  cpu_detach=False)
+#
+#     return rdf.cpu().detach(), rr
+
+#
+# @torch.no_grad()
+# def sample_csd_rdf_dists(csd_mols, csd_sampling_dict, eval_batch_size, device):
+#     sample_rdfs = []
+#     for ind in tqdm(range(len(csd_mols))):
+#         identifier = csd_mols[ind].identifier
+#         for ind2 in range(len(csd_sampling_dict[identifier]['samples'])):
+#             samples = csd_sampling_dict[identifier]['samples'][ind2]
+#             samples = [item for sublist in samples for item in sublist]
+#
+#             rdf, rr = crystal_list_rdf(samples, eval_batch_size, device)
+#             sample_rdfs.append(rdf)
+#
+#     per_csd_rdfs = []
+#     ii = 0
+#     for ind in range(len(csd_mols)):
+#         ss_rdf = []
+#         for ind2 in range(len(csd_sampling_dict[identifier]['samples'])):
+#             ss_rdf.append(sample_rdfs[ii])
+#             ii += 1
+#         per_csd_rdfs.append(torch.cat(ss_rdf))
+#
+#     sample_rdfs = torch.stack(per_csd_rdfs)
+#     csd_rdfs, rr = crystal_list_rdf(csd_mols,
+#                                     eval_batch_size,
+#                                     device)
+#
+#     rdf_dists = torch.zeros_like(sample_rdfs[:, :, 0, 0])
+#     for ind in range(len(csd_mols)):
+#         rdf_dists[ind] = compute_rdf_distance(csd_rdfs[ind].to(device), sample_rdfs[ind].to(device), rr)
+#     return rdf_dists, rr
+
+#
+# def sample_csd_lattice_divs(csd_mols, csd_sampling_dict):
+#     identifiers = [elem.identifier for elem in csd_mols]
+#     js_divs = []
+#     for ind, ident in enumerate(identifiers):
+#         box_matrix = csd_mols[ind].T_fc[0].T.cpu().detach().numpy()
+#         csd_dists = lattice_distance_spectrum(box_matrix,
+#                                               max_radius=50,
+#                                               resolution=0.01)
+#         samples = []
+#         for elem in csd_sampling_dict[identifiers[ind]]['samples']:
+#             samples.extend(elem)
+#         samples = [item for sublist in samples for item in sublist]
+#         hist1, hr = np.histogram(csd_dists, bins=100, range=[0, 50])
+#         divs = []
+#
+#         for j in range(len(samples)):
+#             box_matrix = samples[j].T_fc[0].T.cpu().detach().numpy()
+#             sample_dists = lattice_distance_spectrum(box_matrix,
+#                                                      max_radius=50,
+#                                                      resolution=0.01)
+#             hist2, hr = np.histogram(sample_dists, bins=100, range=[0, 50])
+#             divs.append(jensenshannon(hist1, hist2))
+#
+#         js_divs.append(divs)
+#
+#     return js_divs
 
 
-def crystal_list_rdf(samples, batch_size, device):
-    num_batches = len(samples) // batch_size
-    if len(samples) % batch_size != 0:
-        num_batches += 1
-
-    rdfs = []
-    for b_ind in range(num_batches):
-        batch_inds = np.arange(b_ind * batch_size, min(len(samples), (b_ind + 1) * batch_size))
-        mol_batch = collate_data_list([samples[ind] for ind in batch_inds]).to(device)
-        rdf, rr = get_rdfs(mol_batch)
-        rdfs.append(rdf)
-
-    return torch.cat(rdfs), rr
-
-
-def get_rdfs(crystal_batch):
-    with torch.no_grad():
-        cluster_batch = crystal_batch.mol2cluster(cutoff=6)
-        cluster_batch.construct_radial_graph(cutoff=6)
-        rdf, rr, _ = crystal_rdf(cluster_batch,
-                                 cluster_batch.edges_dict,
-                                 rrange=[0, 6], bins=2000,
-                                 mode='intermolecular',
-                                 elementwise=True,
-                                 raw_density=True,
-                                 cpu_detach=False)
-
-    return rdf.cpu().detach(), rr
-
-
-@torch.no_grad()
-def sample_csd_rdf_dists(csd_mols, csd_sampling_dict, eval_batch_size, device):
-    sample_rdfs = []
-    for ind in tqdm(range(len(csd_mols))):
-        identifier = csd_mols[ind].identifier
-        for ind2 in range(len(csd_sampling_dict[identifier]['samples'])):
-            samples = csd_sampling_dict[identifier]['samples'][ind2]
-            samples = [item for sublist in samples for item in sublist]
-
-            rdf, rr = crystal_list_rdf(samples, eval_batch_size, device)
-            sample_rdfs.append(rdf)
-
-    per_csd_rdfs = []
-    ii = 0
-    for ind in range(len(csd_mols)):
-        ss_rdf = []
-        for ind2 in range(len(csd_sampling_dict[identifier]['samples'])):
-            ss_rdf.append(sample_rdfs[ii])
-            ii += 1
-        per_csd_rdfs.append(torch.cat(ss_rdf))
-
-    sample_rdfs = torch.stack(per_csd_rdfs)
-    csd_rdfs, rr = crystal_list_rdf(csd_mols,
-                                    eval_batch_size,
-                                    device)
-
-    rdf_dists = torch.zeros_like(sample_rdfs[:, :, 0, 0])
-    for ind in range(len(csd_mols)):
-        rdf_dists[ind] = compute_rdf_distance(csd_rdfs[ind].to(device), sample_rdfs[ind].to(device), rr)
-    return rdf_dists, rr
-
-
-def sample_csd_lattice_divs(csd_mols, csd_sampling_dict):
-    identifiers = [elem.identifier for elem in csd_mols]
-    js_divs = []
-    for ind, ident in enumerate(identifiers):
-        box_matrix = csd_mols[ind].T_fc[0].T.cpu().detach().numpy()
-        csd_dists = lattice_distance_spectrum(box_matrix,
-                                              max_radius=50,
-                                              resolution=0.01)
-        samples = []
-        for elem in csd_sampling_dict[identifiers[ind]]['samples']:
-            samples.extend(elem)
-        samples = [item for sublist in samples for item in sublist]
-        hist1, hr = np.histogram(csd_dists, bins=100, range=[0, 50])
-        divs = []
-
-        for j in range(len(samples)):
-            box_matrix = samples[j].T_fc[0].T.cpu().detach().numpy()
-            sample_dists = lattice_distance_spectrum(box_matrix,
-                                                     max_radius=50,
-                                                     resolution=0.01)
-            hist2, hr = np.histogram(sample_dists, bins=100, range=[0, 50])
-            divs.append(jensenshannon(hist1, hist2))
-
-        js_divs.append(divs)
-
-    return js_divs
-
-
-def lattice_distance_spectrum(cell_matrix, max_radius=0.0, resolution=0.01):
-    """Compute sorted inter-point distances for lattice defined by 3x3 cell_matrix"""
-    max_index = int(np.ceil(max_radius / np.min(np.linalg.norm(cell_matrix, axis=1))))
-    shifts = np.mgrid[-max_index:max_index + 1, -max_index:max_index + 1, -max_index:max_index + 1].reshape(3, -1).T
-    distances = np.linalg.norm(shifts @ cell_matrix, axis=1)
-    distances = distances[(distances > 1e-8) & (distances < max_radius)]
-    distances = np.sort(np.round(distances / resolution) * resolution)  # bin by resolution
-    return distances
+# def lattice_distance_spectrum(cell_matrix, max_radius=0.0, resolution=0.01):
+#     """Compute sorted inter-point distances for lattice defined by 3x3 cell_matrix"""
+#     max_index = int(np.ceil(max_radius / np.min(np.linalg.norm(cell_matrix, axis=1))))
+#     shifts = np.mgrid[-max_index:max_index + 1, -max_index:max_index + 1, -max_index:max_index + 1].reshape(3, -1).T
+#     distances = np.linalg.norm(shifts @ cell_matrix, axis=1)
+#     distances = distances[(distances > 1e-8) & (distances < max_radius)]
+#     distances = np.sort(np.round(distances / resolution) * resolution)  # bin by resolution
+#     return distances
 
 
 def get_plotly_fig_size_mb(fig) -> float:
