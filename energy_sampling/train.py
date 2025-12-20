@@ -40,7 +40,7 @@ class Modeller:
     def __init__(self):
         self.hit_init_kld = False
         self.times = {}
-        torch.cuda.set_per_process_memory_fraction(0.95, device=0)
+        torch.cuda.set_per_process_memory_fraction(0.9, device=0)
         torch.cuda.init()  # create context with the cap already in place
 
         args = get_train_args()
@@ -828,7 +828,7 @@ class Modeller:
             )
             if self.grow_buffer: #energy_function.energy_function == 'uma':  # save expensive stuff
                 del crystal_batch.symmetry_operators, crystal_batch.gfn_energy
-                buffer.add_to_staging(data_batch=crystal_batch)
+                buffer.add_to_staging(data_batch=crystal_batch.cpu().detach())
             del crystal_batch
 
         elif do_backward:
@@ -861,7 +861,9 @@ class Modeller:
         loss_dict_cpu = {step_type + "_loss/" + key: value.cpu().detach().numpy() for key, value in
                          loss_dict.items()}
 
-        del loss, loss_dict  # or whatever is large
+        loss = None
+        loss_dict = None
+        torch.cuda.synchronize()
 
         return clean_loss, loss_dict_cpu
 
@@ -962,24 +964,25 @@ class Modeller:
     def bwd_train_step(self, step_ind, gfn_model, discretizer,
                        buffer, energy_function, repeats: int = 10,
                        report_losses: bool = False):
-        if self.args.sampling == 'buffer':
-            samples, rewards, crystal_batch, condition = buffer.sample(
-                override_batch=int(self.backward_batch_size),
-                randomize_orientations=True if self.args.molecule_conditioning else False,
-            )
-        else:
-            assert False, f"sampling method {self.args.sampling} not implemented"
-
-        if self.args.bwd_loss_coeffs.noised_fraction > 0:
-            if buffer.noised_size <= 10*self.backward_batch_size or (step_ind % 10 == 0):  # draw noised samples
-                condition, rewards, samples, crystal_batch = substitute_prior(
-                    self.args.bwd_loss_coeffs, condition, crystal_batch,
-                    energy_function, rewards, samples, buffer)
-                if self.grow_buffer:
-                    buffer.add_to_staging(data_batch=crystal_batch.cpu().detach())
-                    buffer.add_to_noised(rewards, samples)
+        with torch.no_grad():
+            if self.args.sampling == 'buffer':
+                samples, rewards, crystal_batch, condition = buffer.sample(
+                    override_batch=int(self.backward_batch_size),
+                    randomize_orientations=True if self.args.molecule_conditioning else False,
+                )
             else:
-                rewards, samples = buffer.sample_from_noised(int(self.backward_batch_size))
+                assert False, f"sampling method {self.args.sampling} not implemented"
+
+            if self.args.bwd_loss_coeffs.noised_fraction > 0:
+                if buffer.noised_size <= 10*self.backward_batch_size or (step_ind % 10 == 0):  # draw noised samples
+                    condition, rewards, samples, crystal_batch = substitute_prior(
+                        self.args.bwd_loss_coeffs, condition, crystal_batch,
+                        energy_function, rewards, samples, buffer)
+                    if self.grow_buffer:
+                        buffer.add_to_staging(data_batch=crystal_batch.cpu().detach())
+                        buffer.add_to_noised(rewards, samples)
+                else:
+                    rewards, samples = buffer.sample_from_noised(int(self.backward_batch_size))
 
         return get_gfn_backward_loss(self.args.bwd_loss_coeffs,
                                      samples.to(self.device),

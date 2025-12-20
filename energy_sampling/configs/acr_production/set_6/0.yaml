@@ -49,6 +49,7 @@ exploration_factor: 0.25
 exploration_wd: true
 exploratory: nFalse
 figs_period: 1000
+force_restart: true
 fwd_loss_coeffs:
   buffer: 0
   buffer_gamma: 0
@@ -87,8 +88,8 @@ lr_flow: 1.0
 lr_policy: 0.0001
 lr_warmup_ratio: 10
 lr_warmup_time: 500
-max_bwd_batch_size: 2500
-max_fwd_batch_size: 250
+max_bwd_batch_size: 500
+max_fwd_batch_size: 500
 max_traj_length: 50
 min_lr: 1.0e-06
 min_traj_length: 50

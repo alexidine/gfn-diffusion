@@ -49,6 +49,7 @@ exploration_factor: 0.25
 exploration_wd: true
 exploratory: nFalse
 figs_period: 1000
+force_restart: true
 fwd_loss_coeffs:
   buffer: 0
   buffer_gamma: 0
