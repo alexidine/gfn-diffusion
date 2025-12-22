@@ -35,7 +35,7 @@ dropout: 0
 ema_decay: 0.95
 energy: molecular_crystal
 energy_density_coeff: 10.0
-energy_function: lj
+energy_function: elj
 energy_lj_coeff: 1.0
 energy_max_temperature: 10
 energy_min_temperature: 0.1
@@ -108,7 +108,7 @@ rank_weight: 1.0
 reduction_coeff: 10.0
 repeats: 2
 reward_range: 200
-run_name: sg2_zp1
+run_name: sg2_zp1_3
 s_emb_dim: 512
 sampling: buffer
 scheduler: true
@@ -118,7 +118,7 @@ space_groups:
 - 2
 t_emb_dim: 64
 t_scale: 0.05
-tag: acr_lj_3
+tag: acr_lj
 temp_annealing_max_steps: 2000
 temperature_conditioning: false
 temperature_scaling_factor: 0.01
