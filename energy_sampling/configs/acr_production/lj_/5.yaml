@@ -42,7 +42,7 @@ energy_min_temperature: 0.1
 energy_static_temperature: 2.5
 epochs: 1000000
 eval_T: 100
-eval_batch_size: 500
+eval_batch_size: 1000
 eval_num_samples: 2000
 eval_period: 500
 exploration_factor: 0.25
@@ -88,8 +88,8 @@ lr_flow: 1.0
 lr_policy: 0.0005
 lr_warmup_ratio: 10
 lr_warmup_time: 500
-max_bwd_batch_size: 500
-max_fwd_batch_size: 500
+max_bwd_batch_size: 1000
+max_fwd_batch_size: 1000
 max_traj_length: 100
 min_lr: 1.0e-06
 min_traj_length: 100
