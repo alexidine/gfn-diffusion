@@ -1,17 +1,117 @@
+import os
+
 import numpy as np
-import plotly.graph_objects as go
 import torch
-from scipy.stats import linregress
-from tqdm import tqdm
 
 from energy_sampling.eval.paper1_results.figures import general_figs, cluster_comparison_fig, dim_reduction_fig, \
     boltzmann_fig, make_thermo_table
-from energy_sampling.eval.paper1_results.utils import estimate_logp_with_convergence, get_gfn_samples, \
+from energy_sampling.eval.paper1_results.utils import get_gfn_samples, \
     get_cluster_weights, cluster_thermo_analysis, get_color_set, get_gfn_logprobs
 from energy_sampling.models import GFN
 from mxtaltools.dataset_utils.utils import collate_data_list
 
 torch.cuda.set_per_process_memory_fraction(0.9, device=0)
+
+
+def save_outputs():
+    results = {
+        "version": 1,
+
+        # --- identity / invariants ---
+        "meta": {
+            "num_samples": num_samples,
+            "max_z_prime": max_z_prime,
+            "sg_ind": sg_ind,
+            "zp": zp,
+            "mc_kT": mc_kT,
+            "cval": cval,
+            "n_steps": n_steps,
+        },
+
+        # --- GFN sampling outputs ---
+        "samples": {
+            "batch": sample_batch,  # heavy, but sometimes useful
+            "latents": sample_latents,  # (N, D)
+            "energy": sample_energy,  # (N,)
+            "cp": sample_cp,  # (N,)
+            "raw": samples,  # whatever get_gfn_samples returns
+        },
+
+        # --- committor / clustering ---
+        "committor": {
+            "basin_weights": basin_weights,  # (N, B)
+            "hard_assignment": hard_assignment,  # (N,)
+            "hard_assignment_prob": hard_assignment_prob,  # (N,)
+            "basin_inds": basin_inds,  # (B,)
+            "top_cluster_inds": top_cluster_inds,  # (B,)
+            "num_committor_steps": num_committor_steps,
+        },
+
+        # --- density / probabilities ---
+        "density": {
+            "logp_est": logp_est,  # (N,)
+            "learned_log_Z": learned_log_Z,  # scalar
+            "logp_settings": {
+                "batch_size": batch_size,
+                "max_repeats": max_repeats,
+                "tol": tol,
+            }
+        },
+    }
+    torch.save(results, results_path)
+
+
+def load_results():
+    R = torch.load(results_path,weights_only=False)
+    # ---- samples ----
+    sample_batch = R["samples"].get("batch", None)
+    sample_latents = R["samples"]["latents"]
+    sample_energy = R["samples"]["energy"]
+    sample_cp = R["samples"]["cp"]
+    samples = R["samples"].get("raw", None)
+    # ---- committor ----
+    basin_weights = R["committor"]["basin_weights"]
+    hard_assignment = R["committor"]["hard_assignment"]
+    hard_assignment_prob = R["committor"]["hard_assignment_prob"]
+    basin_inds = R["committor"]["basin_inds"]
+    top_cluster_inds = R["committor"]["top_cluster_inds"]
+    # ---- density ----
+    logp_est = R["density"]["logp_est"]
+    learned_log_Z = R["density"]["learned_log_Z"]
+    return sample_batch, sample_latents, sample_energy, sample_cp, samples, basin_weights, hard_assignment, hard_assignment_prob, basin_inds, top_cluster_inds, logp_est, learned_log_Z
+
+
+def sample_and_analyze():
+    gfn_model = GFN(**np.load(config_path, allow_pickle=True).item())
+    gfn_model.load_state_dict(torch.load(model_path, weights_only=True))
+    gfn_model.to(device)
+    gfn_model.eval()
+    "Sample from GFN & process samples"
+    sample_batch, sample_latents, sample_energy, sample_cp, samples = get_gfn_samples(
+        num_samples, max_z_prime,
+        device, n_steps, batch_size, gfn_model,
+        energy_function, molecule, sg_ind, zp
+    )
+    "Do committor analysis"
+    basin_weights, hard_assignment, hard_assignment_prob, basin_inds = get_cluster_weights(
+        sample_latents, sample_energy, num_samples, num_committor_steps, cval, mc_kT
+    )
+    top_cluster_inds = torch.argsort(basin_weights.sum(0), descending=True).flatten()
+    'Explicit Density Estimation'
+    logp_est = get_gfn_logprobs(batch_size, sample_latents, gfn_model, n_steps, max_repeats, tol)
+    learned_log_Z = gfn_model.flow_model().item()
+    if save_results:
+        if os.path.exists(results_path):
+            if overwrite_results:
+                save_outputs()
+            else:
+                pass
+        else:
+            save_outputs()
+
+    return sample_batch, sample_latents, sample_energy, sample_cp, samples, basin_weights, hard_assignment, hard_assignment_prob, basin_inds, top_cluster_inds, logp_est, learned_log_Z
+
+
 
 if __name__ == '__main__':
     "Configs & args"
@@ -29,9 +129,12 @@ if __name__ == '__main__':
     mc_kT = 2.5
     kT = 2.5
     clusters_to_analyze = 8
-    max_repeats=50
+    max_repeats = 50
     tol = 1e-2
 
+    reload_results = True
+    save_results = True
+    overwrite_results = True
     do_general_vis = True
     do_clustering = True
     do_dimension_reduction = True
@@ -42,11 +145,7 @@ if __name__ == '__main__':
     molecule_path = r"D:\crystal_datasets\nicoam\protonated_nicotinamide.pt"
     dataset_path = rf"D:\crystal_datasets\nicoam\nic_sg{sg_ind}_zp{zp}.pt"
 
-    "Load GFN"
-    gfn_model = GFN(**np.load(config_path, allow_pickle=True).item())
-    gfn_model.load_state_dict(torch.load(model_path, weights_only=True))
-    gfn_model.to(device)
-    gfn_model.eval()
+    results_path = rf"D:\crystal_datasets\gfn_results\nic_sg{sg_ind}_zp{zp}.pt"
 
     "Load Relevant Dataset"
     molecule = torch.load(molecule_path, weights_only=False)
@@ -55,54 +154,95 @@ if __name__ == '__main__':
     data_batch = collate_data_list(dataset, max_z_prime=max_z_prime)
     data_latents = data_batch.latent_params()
 
-    "Sample from GFN & process samples"
-    sample_batch, sample_latents, sample_energy, sample_cp, samples = get_gfn_samples(
-        num_samples, max_z_prime,
-        device, n_steps, batch_size, gfn_model,
-        energy_function, molecule, sg_ind, zp
-    )
+    if reload_results:
+        (sample_batch, sample_latents, sample_energy, sample_cp, samples,
+         basin_weights, hard_assignment, hard_assignment_prob, basin_inds,
+         top_cluster_inds, logp_est, learned_log_Z) = load_results()
+    else:
+        "Load GFN"
+        (sample_batch, sample_latents, sample_energy, sample_cp, samples,
+         basin_weights, hard_assignment, hard_assignment_prob,
+         basin_inds, top_cluster_inds, logp_est, learned_log_Z) = sample_and_analyze()
 
     """
     Make Figures
     """
+    cluster_color = get_color_set(clusters_to_analyze, alpha=0.7)
+
     fig_dict = {}
     if do_general_vis:  # Standard visualizations
         fig_dict = general_figs(fig_dict, sample_batch, sample_energy, data_batch)
 
     if do_clustering:  # Clustering & thermodynamic analysis
-        basin_weights, hard_assignment, hard_assignment_prob, basin_inds = get_cluster_weights(
-            sample_latents, sample_energy, num_samples, num_committor_steps, cval, mc_kT
-        )
-        top_cluster_inds = torch.argsort(basin_weights.sum(0), descending=True).flatten()
         min_ens, Zb, Fb, basin_probs, mean_rho, Sb, mean_E = cluster_thermo_analysis(basin_weights, sample_energy, kT,
-                                                                             sample_cp, basin_inds, top_cluster_inds)
+                                                                                     sample_cp, basin_inds,
+                                                                                     top_cluster_inds)
 
-        cluster_color = get_color_set(clusters_to_analyze, alpha=0.7)
         fig_dict['clusters'] = cluster_comparison_fig(top_cluster_inds,
                                                       sample_cp, sample_energy, hard_assignment,
                                                       sample_batch, clusters_to_analyze, sample_latents,
                                                       cluster_color,
                                                       )
-        fig_dict['Thermo Table'] = make_thermo_table(Zb, basin_probs, Fb, mean_E, min_ens, Sb, mean_rho,hard_assignment, clusters_to_analyze)
+        fig_dict['Thermo Table'] = make_thermo_table(Zb, basin_probs, Fb, mean_E, min_ens, Sb, mean_rho,
+                                                     hard_assignment, clusters_to_analyze)
 
     if do_dimension_reduction:
         assert do_clustering, "Need clusters for dim reduction fig"
-        fig_dict['Dim Reduction'] = dim_reduction_fig(sample_batch, hard_assignment, clusters_to_analyze, cluster_color,
+        fig_dict['Dim Reduction'] = dim_reduction_fig(sample_batch, hard_assignment,
+                                                      clusters_to_analyze,
+                                                      cluster_color,
                                                       basin_inds)
 
     if do_explicit_probs:
-        'Explicit Density Estimation'
-        logp_est = get_gfn_logprobs(batch_size, sample_latents, gfn_model, n_steps, max_repeats, tol)
-        fig_dict['boltzmann'] = boltzmann_fig(sample_energy, kT, gfn_model, logp_est)
-
+        fig_dict['boltzmann'] = boltzmann_fig(sample_energy, kT, learned_log_Z, logp_est)
 
     if show_figs:
-        for fig in fig_dict.values():
+        for key, fig in fig_dict.items():
+            if key == 'boltzmann':
+                fig.update_layout(
+                    width=900,
+                    height=900
+                )
+            elif key == 'staircase_fig':
+                fig.update_layout(
+                    width=1500,
+                    height=1000,
+                    font_size=24
+                )
+            elif key == 'std_marginals_fig':
+                fig.update_layout(
+                    width=1920,
+                    height=800,
+                    font_size = 24
+                )
+            elif key == 'density_funnel_fig':
+                fig.update_layout(
+                    width=1200,
+                    height=1000,
+                    font_size = 24
+                )
+            elif key == 'clusters':
+                fig.update_layout(
+                    width=1920,
+                    height=1080,
+                )
+            elif key == 'Thermo Table':
+                fig.update_layout(
+                    width=800,
+                    height=400
+                )
+            elif key == 'Dim Reduction':
+                fig.update_layout(
+                    width=800,
+                    height=800
+                )
+
             fig.show()
 
     if save_figs:
         for key, fig in fig_dict.items():
-            fig.write_image(rf"C:\Users\mikem\OneDrive\NYU\CSD\papers\generator\{key.replace(' ','_')}.png", width=1920, height=1080)
+            fig.write_image(rf"C:\Users\mikem\OneDrive\NYU\CSD\papers\generator\{key.replace(' ', '_')}.png",
+                            width=1920, height=1080)
 
 '''
 # other analyses
