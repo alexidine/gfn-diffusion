@@ -26,7 +26,7 @@ if __name__ == "__main__":
     base, spec_dir = load_yaml(base_path)
 
     ind = 0
-    for zp in [1]:
+    for zp in [1, 2]:
         for sg in [14, 61]:
             for en in ['uma']:
                 for rew in [100]:
@@ -35,10 +35,12 @@ if __name__ == "__main__":
                         config['space_groups'] = [sg]
                         config['z_primes'] = [zp]
                         config['run_name'] = f'sg{sg}_zp{zp}_{ind}'
-                        config['tag'] = f'xuld_lj'
+                        config['tag'] = f'xul2'
                         config['energy_function'] = en
                         config['energy_static_temperature'] = temp
                         config['reward_range'] = rew
+                        config['max_fwd_batch_size'] = 400
+                        config['max_bwd_batch_size'] = 400
                         config['molecules_path'] = '/scratch/mk8347/csd_runs/datasets/xuldud/xuldud.pt'
                         config['buffer_path'] = f'/scratch/mk8347/csd_runs/datasets/xuldud/xuldud_sg{sg}_zp{zp}.pt'
 

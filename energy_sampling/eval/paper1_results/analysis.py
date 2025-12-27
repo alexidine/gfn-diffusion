@@ -6,14 +6,17 @@ import torch
 from energy_sampling.eval.paper1_results.figures import general_figs, cluster_comparison_fig, dim_reduction_fig, \
     boltzmann_fig, make_thermo_table
 from energy_sampling.eval.paper1_results.utils import get_gfn_samples, \
-    get_cluster_weights, cluster_thermo_analysis, get_color_set, get_gfn_logprobs
+    get_cluster_weights, cluster_thermo_analysis, get_color_set, get_gfn_logprobs, get_cluster_basins_labels, \
+    steepest_descent, steepest_descent_parallel, get_cluster_weights2
 from energy_sampling.models import GFN
+from examples.crystal_search_reporting import batch_compack
+from mxtaltools.common.geometry_utils import crystal_parameter_distmat
 from mxtaltools.dataset_utils.utils import collate_data_list
 
 torch.cuda.set_per_process_memory_fraction(0.9, device=0)
 
 
-def save_outputs():
+def save_outputs(sample_batch, sample_latents, sample_energy, sample_cp, samples, basin_weights, hard_assignment, hard_assignment_prob, basin_inds, top_cluster_inds, logp_est, learned_log_Z):
     results = {
         "version": 1,
 
@@ -62,10 +65,10 @@ def save_outputs():
 
 
 def load_results():
-    R = torch.load(results_path,weights_only=False)
+    R = torch.load(results_path, weights_only=False)
     # ---- samples ----
     sample_batch = R["samples"].get("batch", None)
-    sample_latents = R["samples"]["latents"]
+    sample_latents = R["samples"]["latents"].clip(max=1, min=-1)
     sample_energy = R["samples"]["energy"]
     sample_cp = R["samples"]["cp"]
     samples = R["samples"].get("raw", None)
@@ -92,10 +95,10 @@ def sample_and_analyze():
         device, n_steps, batch_size, gfn_model,
         energy_function, molecule, sg_ind, zp
     )
-    "Do committor analysis"
-    basin_weights, hard_assignment, hard_assignment_prob, basin_inds = get_cluster_weights(
-        sample_latents, sample_energy, num_samples, num_committor_steps, cval, mc_kT
-    )
+
+    basin_weights, hard_assignment, hard_assignment_prob, basin_inds = get_cluster_weights2(
+        sample_latents, sample_energy, num_committor_steps, mc_kT)
+
     top_cluster_inds = torch.argsort(basin_weights.sum(0), descending=True).flatten()
     'Explicit Density Estimation'
     logp_est = get_gfn_logprobs(batch_size, sample_latents, gfn_model, n_steps, max_repeats, tol)
@@ -103,18 +106,20 @@ def sample_and_analyze():
     if save_results:
         if os.path.exists(results_path):
             if overwrite_results:
-                save_outputs()
+                save_outputs(sample_batch, sample_latents, sample_energy, sample_cp, samples, basin_weights, hard_assignment, hard_assignment_prob, basin_inds, top_cluster_inds, logp_est, learned_log_Z)
             else:
                 pass
         else:
-            save_outputs()
+            save_outputs(sample_batch, sample_latents, sample_energy, sample_cp, samples, basin_weights, hard_assignment, hard_assignment_prob, basin_inds, top_cluster_inds, logp_est, learned_log_Z)
 
     return sample_batch, sample_latents, sample_energy, sample_cp, samples, basin_weights, hard_assignment, hard_assignment_prob, basin_inds, top_cluster_inds, logp_est, learned_log_Z
 
 
-
 if __name__ == '__main__':
     "Configs & args"
+    '''
+    # test nicotinamide config
+    run_name = 'nic_test'
     device = 'cuda'
     num_samples = 20000
     batch_size = 1000
@@ -122,30 +127,52 @@ if __name__ == '__main__':
     n_steps = 50  # critical to get this right!
     sg_ind = 14
     zp = 1  # todo fix zp>1 pre-processing
-    show_figs = True
-    save_figs = True
+    show_figs = False
     num_committor_steps = 100
     cval = 1
+    mc_cval = 0.5
     mc_kT = 2.5
     kT = 2.5
     clusters_to_analyze = 8
     max_repeats = 50
     tol = 1e-2
-
+    model_path = rf"D:\crystal_datasets\nic3_sg{sg_ind}_zp{zp}_2_model_eval.pt"
+    config_path = rf"D:\crystal_datasets\nic3_sg{sg_ind}_zp{zp}_2_model_config.npy"
+    molecule_path = r"D:\crystal_datasets\nicoam\protonated_nicotinamide.pt"
+    dataset_path = rf"D:\crystal_datasets\nicoam\nic_sg{sg_ind}_zp{zp}.pt"
+    results_path = rf"D:\crystal_datasets\gfn_results\{run_name}_sg{sg_ind}_zp{zp}.pt"
+    '''
+    # acridine lj config
+    run_name = 'acr_lj'
+    device = 'cuda'
+    num_samples = 10000
+    batch_size = 1000
+    energy_function = 'elj'  # 'elj', 'lj' 'uma
+    n_steps = 100  # critical to get this right!
+    sg_ind = 2
+    zp = 1  # todo fix zp>1 pre-processing
+    num_committor_steps = 100
+    cval = 3
+    mc_cval = 0.5
+    mc_kT = 2.5
+    kT = 2.5
+    clusters_to_analyze = 10
+    max_repeats = 50
+    tol = 1e-2
+    model_path = rf"D:\crystal_datasets\acridine\best_acr_lj_sg{sg_ind}_zp{zp}_2_model_eval.pt"
+    config_path = rf"D:\crystal_datasets\acridine\acr_lj_sg{sg_ind}_zp{zp}_2_model_config.npy"
+    molecule_path = r"D:\crystal_datasets\acridine\acridine_conformer.pt"
+    dataset_path = rf"D:\crystal_datasets\acridine\acridine_sg{sg_ind}_zp{zp}.pt"
+    results_path = rf"D:\crystal_datasets\gfn_results\{run_name}_sg{sg_ind}_zp{zp}.pt"
     reload_results = True
+    show_figs = True
+    write_figs = False
     save_results = True
     overwrite_results = True
     do_general_vis = True
     do_clustering = True
     do_dimension_reduction = True
     do_explicit_probs = True
-
-    model_path = rf"D:\crystal_datasets\nic3_sg{sg_ind}_zp{zp}_2_model_eval.pt"
-    config_path = rf"D:\crystal_datasets\nic3_sg{sg_ind}_zp{zp}_2_model_config.npy"
-    molecule_path = r"D:\crystal_datasets\nicoam\protonated_nicotinamide.pt"
-    dataset_path = rf"D:\crystal_datasets\nicoam\nic_sg{sg_ind}_zp{zp}.pt"
-
-    results_path = rf"D:\crystal_datasets\gfn_results\nic_sg{sg_ind}_zp{zp}.pt"
 
     "Load Relevant Dataset"
     molecule = torch.load(molecule_path, weights_only=False)
@@ -154,19 +181,20 @@ if __name__ == '__main__':
     data_batch = collate_data_list(dataset, max_z_prime=max_z_prime)
     data_latents = data_batch.latent_params()
 
-    if reload_results:
+    if reload_results and os.path.exists(results_path):
         (sample_batch, sample_latents, sample_energy, sample_cp, samples,
-         basin_weights, hard_assignment, hard_assignment_prob, basin_inds,
+         basin_weights, cluster_labels, cluster_prob, basin_inds,
          top_cluster_inds, logp_est, learned_log_Z) = load_results()
     else:
         "Load GFN"
         (sample_batch, sample_latents, sample_energy, sample_cp, samples,
-         basin_weights, hard_assignment, hard_assignment_prob,
+         basin_weights, cluster_labels, cluster_prob,
          basin_inds, top_cluster_inds, logp_est, learned_log_Z) = sample_and_analyze()
 
     """
     Make Figures
     """
+    clusters_to_analyze = min(len(top_cluster_inds), clusters_to_analyze)
     cluster_color = get_color_set(clusters_to_analyze, alpha=0.7)
 
     fig_dict = {}
@@ -179,16 +207,16 @@ if __name__ == '__main__':
                                                                                      top_cluster_inds)
 
         fig_dict['clusters'] = cluster_comparison_fig(top_cluster_inds,
-                                                      sample_cp, sample_energy, hard_assignment,
+                                                      sample_cp, sample_energy, cluster_labels,
                                                       sample_batch, clusters_to_analyze, sample_latents,
                                                       cluster_color,
                                                       )
         fig_dict['Thermo Table'] = make_thermo_table(Zb, basin_probs, Fb, mean_E, min_ens, Sb, mean_rho,
-                                                     hard_assignment, clusters_to_analyze)
+                                                     cluster_labels, clusters_to_analyze)
 
     if do_dimension_reduction:
         assert do_clustering, "Need clusters for dim reduction fig"
-        fig_dict['Dim Reduction'] = dim_reduction_fig(sample_batch, hard_assignment,
+        fig_dict['Dim Reduction'] = dim_reduction_fig(sample_batch, cluster_labels,
                                                       clusters_to_analyze,
                                                       cluster_color,
                                                       basin_inds)
@@ -199,61 +227,99 @@ if __name__ == '__main__':
     if show_figs:
         for key, fig in fig_dict.items():
             if key == 'boltzmann':
+                width = 900
+                height = 900
                 fig.update_layout(
-                    width=900,
-                    height=900
+                    width=width,
+                    height=height
                 )
+
+
             elif key == 'staircase_fig':
+                width = 2000
+                height = 1300
                 fig.update_layout(
-                    width=1500,
-                    height=1000,
+                    width=width,
+                    height=height,
                     font_size=24
                 )
+
             elif key == 'std_marginals_fig':
+                width = 1920
+                height = 1080
                 fig.update_layout(
-                    width=1920,
-                    height=800,
-                    font_size = 24
+                    width=width,
+                    height=height,
+                    font_size=20
                 )
+
             elif key == 'density_funnel_fig':
+                width = 1200
+                height = 1000
                 fig.update_layout(
-                    width=1200,
-                    height=1000,
-                    font_size = 24
+                    width=width,
+                    height=height,
+                    font_size=24
                 )
+
             elif key == 'clusters':
+                width = 1400
+                height = 1000
                 fig.update_layout(
-                    width=1920,
-                    height=1080,
+                    width=width,
+                    height=height,
                 )
+
             elif key == 'Thermo Table':
+                width = 800
+                height = 400
                 fig.update_layout(
-                    width=800,
-                    height=400
+                    width=width,
+                    height=height
                 )
+
             elif key == 'Dim Reduction':
+                width = 1000
+                height = 800
                 fig.update_layout(
-                    width=800,
-                    height=800
+                    width=width,
+                    height=height
                 )
 
             fig.show()
 
-    if save_figs:
-        for key, fig in fig_dict.items():
-            fig.write_image(rf"C:\Users\mikem\OneDrive\NYU\CSD\papers\generator\{key.replace(' ', '_')}.png",
-                            width=1920, height=1080)
+        if write_figs:
+            for key in fig_dict.keys():
+                fig_dict[key].write_image(rf"C:\Users\mikem\OneDrive\NYU\CSD\papers\generator\{run_name}_{key.replace(' ', '_')}.png", scale=2)
+
+        aa = 1
+
+    'best samples analysis'  # todo replace with probability maximum
+    best_samples = [samples[ind] for ind in top_cluster_inds[:clusters_to_analyze]]
+    best_batch = collate_data_list(best_samples)
+
+    from mxtaltools.analysis.crystal_rdf import compute_rdf_distmat
+    import plotly.graph_objects as go
+
+    bin_edges = torch.linspace(0, 6, sample_batch.rdf.shape[-1], )
+    dmat = compute_rdf_distmat(sample_batch.rdf[top_cluster_inds[:clusters_to_analyze]], bin_edges,
+                               chunk_size=10000)
+    go.Figure(go.Heatmap(z=dmat)).show()
+
+    matchess, rmsdss = [], []
+    for ind in range(best_batch.num_graphs):
+        matches, rmsds = batch_compack([ind for ind in range(best_batch.num_graphs)],
+                                       best_samples,
+                                       collate_data_list([best_samples[ind]]).mol2cluster(cutoff=6))
+        matchess.append(matches)
+        rmsdss.append(rmsds)
+
+    clusters = best_batch.mol2cluster(cutoff=6)
+    clusters.visualize(mode='unit cell')
+
 
 '''
 # other analyses
-
-
-    # 'best samples analysis'
-    # best_batch = collate_data_list([samples[ind] for ind in top_cluster_inds[num_clusters]])
-    # bin_edges = torch.linspace(0, 6, sample_batch.rdf.shape[-1], )
-    # dmat = compute_rdf_distmat(sample_batch.rdf[top_cluster_inds[:num_clusters]], bin_edges, chunk_size=10000)
-    # go.Figure(go.Heatmap(z=dmat)).show()
-
 
 # GM business
 

@@ -88,8 +88,8 @@ lr_flow: 1.0
 lr_policy: 0.0005
 lr_warmup_ratio: 10
 lr_warmup_time: 500
-max_bwd_batch_size: 1000
-max_fwd_batch_size: 1000
+max_bwd_batch_size: 400
+max_fwd_batch_size: 400
 max_traj_length: 100
 min_lr: 1.0e-06
 min_traj_length: 100
@@ -118,7 +118,7 @@ space_groups:
 - 61
 t_emb_dim: 64
 t_scale: 0.05
-tag: xuld_lj
+tag: xul2
 temp_annealing_max_steps: 2000
 temperature_conditioning: false
 temperature_scaling_factor: 0.01

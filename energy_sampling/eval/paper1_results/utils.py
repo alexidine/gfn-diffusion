@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import plotly.colors as pc
 import torch
-from _plotly_utils.colors import qualitative, color_parser, hex_to_rgb
+from _plotly_utils.colors import qualitative, hex_to_rgb
 from matplotlib import cm, colors
 from plotly import graph_objects as go
 from plotly.subplots import make_subplots
@@ -15,8 +15,11 @@ from scipy.spatial.distance import pdist
 from sklearn.cluster import estimate_bandwidth, MeanShift
 from sklearn.neighbors import NearestNeighbors
 from tqdm import tqdm
+from umap import UMAP
 
 from energy_sampling.utils import uniform_discretizer, get_gfn_init_state
+from mxtaltools.analysis.crystal_rdf import compute_rdf_distmat
+from mxtaltools.common.geometry_utils import crystal_parameter_distmat
 from mxtaltools.common.utils import log_rescale_positive
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
@@ -621,7 +624,7 @@ def sample_from_gfn(num_samples, max_z_prime, device, n_steps, batch_size, gfn_m
             pbar.update(batch_size)
 
     samples = torch.cat(samples)
-    return samples
+    return samples.clip(max=1, min=-1)
 
 
 def analyze_samples(x, mol_list, max_z_prime, device, batch_size, sg_ind, zp, do_uma: bool = False, predictor=None):
@@ -745,17 +748,11 @@ def graph_MC(energies, traj_len, kT, cval, samples=None, dmat=None):
     return best
 
 
-def first_hit_graph_MC(energies, basin_inds, traj_len, kT, cval, samples=None, dmat=None):
+def first_hit_graph_MC(energies, basin_inds, traj_len, kT, cval, samples, dmat):
     N = len(energies)
     beta_mc = 1 / kT
     k = int(samples.shape[1] * cval * np.log(len(samples)))
-
-    if dmat is not None and samples is None:
-        knn = dmat.topk(k + 1, largest=False).indices[:, 1:]
-    elif samples is not None:
-        nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm="auto").fit(samples.cpu().numpy())
-        dists, inds = nbrs.kneighbors(samples.cpu().numpy())
-        knn = torch.tensor(inds[:, 1:], device=samples.device)
+    knn = dmat.topk(k + 1, largest=False).indices[:, 1:]
 
     k = knn.shape[1]
 
@@ -789,15 +786,11 @@ def first_hit_graph_MC(energies, basin_inds, traj_len, kT, cval, samples=None, d
     return first_basin_hit
 
 
-def steepest_descent(samples, energies, cval):
+def steepest_descent(samples, energies, cval, dmat):
     k = int(samples.shape[1] * cval * np.log(len(samples)))
-    nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm="auto").fit(samples.cpu().numpy())
-    dists, inds = nbrs.kneighbors(samples.cpu().numpy())
-    knn = torch.tensor(inds[:, 1:], device=samples.device)
-
+    knn = dmat.topk(min(len(dmat), k + 1), largest=False).indices[:, 1:]
     minima = torch.empty(len(energies), dtype=torch.long)
-
-    for i in tqdm(range(len(energies))):
+    for i in range(len(energies)):
         minima[i] = graph_descent(i, knn, energies)
 
     return minima
@@ -813,6 +806,60 @@ def graph_descent(i, knn, energies):
             return i
 
 
+def steepest_descent_parallel(knn, energies):
+    N = energies.shape[0]
+    current = torch.arange(N, device=energies.device)
+    active = torch.ones(N, dtype=torch.bool, device=energies.device)
+
+    while active.any():
+        neigh = knn[current]  # (N, k)
+        neigh_E = energies[neigh]  # (N, k)
+        best_idx = neigh_E.argmin(dim=1)  # (N,)
+        j = neigh[torch.arange(N), best_idx]  # (N,)
+
+        better = energies[j] < energies[current]
+        move = active & better
+
+        current = torch.where(move, j, current)
+        active = move
+
+    return current
+
+
+def adaptive_steepest_descent_parallel(dmat, energies, cval_init, dim):
+    N = energies.shape[0]
+    current = torch.arange(N, device=energies.device)
+    active = torch.ones(N, dtype=torch.bool, device=energies.device)
+
+    minima_record = []
+
+    cval = cval_init
+    while len(current.unique()) > 1:
+        k = int(dim * cval * np.log(len(energies)))
+        knn = dmat.topk(min(len(dmat), k + 1), largest=False).indices[:, 1:]
+
+        while active.any():
+            neigh = knn[current]  # (N, k)
+            neigh_E = energies[neigh]  # (N, k)
+            best_idx = neigh_E.argmin(dim=1)  # (N,)
+            j = neigh[torch.arange(N), best_idx]  # (N,)
+
+            better = energies[j] < energies[current]
+            move = active & better
+
+            if not move.any():
+                break
+
+            current = torch.where(move, j, current)
+            active = move
+
+        minima_record.append(current)
+        active = torch.ones(N, dtype=torch.bool, device=energies.device)
+        cval *= 1.1
+
+    return current
+
+
 def basin_average(observable, basin_weights):
     w = basin_weights
     num = (w * observable.unsqueeze(1)).sum(0)
@@ -825,6 +872,7 @@ def get_committor_weights(clabel, basin_inds, num_committor_steps: int, sample_e
     basin_id = torch.full_like(clabel, -1)
     basin_id[basin_inds] = torch.arange(len(basin_inds), device=clabel.device)
     committed_record = torch.zeros((num_committor_steps, num_samples), dtype=torch.long)
+    dmat = crystal_parameter_distmat(sample_latents)
     for ind in tqdm(range(num_committor_steps)):
         hits = first_hit_graph_MC(
             sample_energy,
@@ -832,7 +880,8 @@ def get_committor_weights(clabel, basin_inds, num_committor_steps: int, sample_e
             traj_len=5000,
             kT=mc_kT,
             cval=cval,
-            samples=sample_latents)
+            samples=sample_latents,
+            dmat=dmat)
         committed_record[ind] = torch.where(
             hits >= 0,
             basin_id[hits],
@@ -861,7 +910,12 @@ def get_gfn_samples(num_samples, max_z_prime, device, n_steps, batch_size, gfn_m
         predictor = init_uma_crystal_predictor(pred_path, device=device)
     else:
         predictor = None
-    samples = analyze_samples(sample_latents, molecule * num_samples, max_z_prime, device, batch_size, sg_ind,
+
+    if isinstance(molecule, list):
+        mol_list = molecule
+    else:
+        mol_list = [molecule]
+    samples = analyze_samples(sample_latents, mol_list * num_samples, max_z_prime, device, batch_size, sg_ind,
                               zp,
                               do_uma=energy_function == 'uma', predictor=predictor)
     sample_batch = collate_data_list(samples, max_z_prime=max_z_prime)
@@ -879,18 +933,22 @@ def get_gfn_samples(num_samples, max_z_prime, device, n_steps, batch_size, gfn_m
     return sample_batch, sample_latents, sample_energy, sample_batch.packing_coeff, samples
 
 
-def get_cluster_weights(sample_latents, sample_energy, num_samples, num_committor_steps, cval: float = 1,
+def get_cluster_weights(sample_latents, sample_energy, num_committor_steps,
+                        cval: float = 1,
+                        mc_cval: float = 0.5,
                         mc_kT: float = 2.5):
     "Soft clustering by committor analysis"
+    num_samples = len(sample_latents)
     clabel = steepest_descent(sample_latents, sample_energy, cval=cval)
     basin_inds = torch.unique(clabel)
     num_basins = len(basin_inds)
     basin_weights = get_committor_weights(clabel, basin_inds, num_committor_steps, sample_energy, num_samples,
-                                          num_basins, sample_latents, cval=cval, mc_kT=mc_kT)
+                                          num_basins, sample_latents, cval=mc_cval, mc_kT=mc_kT)
     hard_assignment = torch.argmax(basin_weights, dim=1)
     hard_assignment_prob = torch.amax(basin_weights, dim=1)
     return basin_weights, hard_assignment, hard_assignment_prob, basin_inds
 
+    # import plotly.graph_objects as go
     # masks = np.array([hard_assignment == ind for ind in np.unique(hard_assignment)])
     # mask_sorts = np.argsort([sum(m) for m in masks])[::-1]
     # sorted_masks = masks[mask_sorts]
@@ -923,7 +981,6 @@ def cluster_thermo_analysis(basin_weights, sample_energy, kT, cp, basin_inds, to
     return min_ens, Zb, Fb, basin_probs, mean_rho, Sb, mean_E
 
 
-
 def to_rgba(color, alpha=0.7):
     # already rgba → just replace alpha
     if color.startswith("rgba"):
@@ -943,6 +1000,7 @@ def to_rgba(color, alpha=0.7):
     r, g, b = hex_to_rgb(color)
     return f"rgba({r},{g},{b},{alpha})"
 
+
 def get_color_set(n, alpha=0.7):
     if n <= len(qualitative.Plotly):
         colors = qualitative.Plotly[:n]
@@ -959,7 +1017,7 @@ def get_color_set(n, alpha=0.7):
     return [to_rgba(c, alpha) for c in colors]
 
 
-def get_gfn_logprobs(batch_size, sample_latents, gfn_model, n_steps, max_repeats: int = 50, tol:float=1e-2):
+def get_gfn_logprobs(batch_size, sample_latents, gfn_model, n_steps, max_repeats: int = 50, tol: float = 1e-2):
     num_batches = len(sample_latents) // batch_size + (1 if len(sample_latents) % batch_size else 0)
     num_samples = len(sample_latents)
     counter = 0
@@ -978,4 +1036,201 @@ def get_gfn_logprobs(batch_size, sample_latents, gfn_model, n_steps, max_repeats
                 pbar.update(batch_size)
 
     return logps
+
+
+def get_cluster_basins_labels(samples, energy):
+    dmat = crystal_parameter_distmat(samples).fill_diagonal_(0).detach().numpy().astype(np.float64)
+
+    umap_model = UMAP(n_components=6, n_neighbors=10, min_dist=0.01, metric='precomputed')
+    sample_embedding = umap_model.fit_transform(dmat)
+    clusterer = hdbscan.HDBSCAN(
+        metric='euclidean',  # use your distance matrix
+        min_cluster_size=50,
+        cluster_selection_method='eom',  # or 'leaf'
+        min_samples=10,
+        # prediction_data=True,
+    )
+    labels = clusterer.fit_predict(torch.cdist(torch.tensor(sample_embedding), torch.tensor(sample_embedding)))
+    num_clusters = len(np.unique(labels[labels != -1]))
+    labels[labels == -1] = np.random.randint(low=0, high=num_clusters, size=(labels == -1).sum())
+    # soft = hdbscan.all_points_membership_vectors(clusterer)
+    soft = torch.nn.functional.one_hot(torch.as_tensor(labels), num_classes=len(np.unique(labels)))
+
+    rep_sample_inds = torch.zeros(num_clusters, dtype=torch.long)
+    for c_ind in range(num_clusters):
+        members_bools = (torch.as_tensor(labels) == c_ind) & (torch.as_tensor(clusterer.probabilities_) > 0.9)
+        members_ens = energy[members_bools]
+        members = samples[members_bools]
+        interior_dists = torch.as_tensor(dmat)[members_bools][:, members_bools]
+
+        sigma = interior_dists.median()
+        dist_weight = torch.exp(-(interior_dists / sigma) ** 2).median(dim=1).values
+
+        beta = 1.0 / members_ens.std().clamp(min=1e-6)
+        e_weight = torch.softmax(-beta * (members_ens - members_ens.min()), dim=0)
+        rep_sample_inds[c_ind] = torch.argmax(dist_weight * e_weight).item()
+
+    return soft, labels, clusterer.probabilities_, rep_sample_inds
+
+
+def get_cluster_weights2(sample_latents, sample_energy, num_committor_steps,
+                         mc_kT: float = 2.5):
+    "Soft clustering by committor analysis"
+    with torch.no_grad():
+        energies = sample_energy.cuda()
+        dmat = crystal_parameter_distmat(sample_latents).fill_diagonal_(0)
+        dmat = dmat.cuda()
+
+        traj_record = []
+        cval_init = 0.1
+        dim = 12
+        N = energies.shape[0]
+
+        k0 = int(dim * cval_init * np.log(N))
+        knn0 = dmat.topk(min(N, k0 + 1), largest=False).indices[:, 1:]
+
+        neigh_E = energies[knn0]  # (N, k)
+        E0 = energies[:, None]  # (N, 1)
+        dE = neigh_E - E0  # (N, k)
+        weights = (-dE / mc_kT).softmax(dim=1)
+
+        for c_step in tqdm(range(num_committor_steps)):
+            """need a preliminary MC step"""
+            choice = torch.multinomial(weights, num_samples=1).squeeze(1)
+            # select nearby point to init traj
+            j = knn0[torch.arange(N, device=energies.device), choice]
+            current = j
+
+            active = torch.ones(N, dtype=torch.bool, device=energies.device)
+
+            minima_record = []
+            cval_record = []
+            cval = cval_init
+
+            while len(current.unique()) > 1:
+                k = int(dim * cval * np.log(len(energies)))
+                knn = dmat.topk(min(len(dmat), k + 1), largest=False).indices[:, 1:]
+
+                while active.any():
+                    neigh = knn[current]  # (N, k)
+                    neigh_E = energies[neigh]  # (N, k)
+                    best_idx = neigh_E.argmin(dim=1)  # (N,)
+                    j = neigh[torch.arange(N), best_idx]  # (N,)
+
+                    better = energies[j] < energies[current]
+                    move = active & better
+
+                    current = torch.where(move, j, current)
+                    active = move
+
+                minima_record.append(current.clone().cpu().detach())
+                active = torch.ones(N, dtype=torch.bool, device=energies.device)
+                cval *= 1.1
+                cval_record.append(cval)
+
+            traj_record.append(minima_record)
+
+    k_ind = 50
+    final_assignments = torch.stack(
+        [traj[k_ind] for traj in traj_record],  # (num_committor_steps, N)
+        dim=0
+    )  # CPU tensor is fine
+    basin_inds = torch.unique(final_assignments)
+    num_basins = len(basin_inds)
+    basin_to_id = {int(b.item()): i for i, b in enumerate(basin_inds)}
+
+    basin_ids = torch.empty_like(final_assignments)
+
+    for b, bid in basin_to_id.items():
+        basin_ids[final_assignments == b] = bid
+    C, N = basin_ids.shape
+    B = num_basins
+
+    # counts[i, b] = number of committor runs where sample i ended in basin b
+    counts = torch.zeros((N, B), dtype=torch.int32)
+
+    for b in range(B):
+        counts[:, b] = (basin_ids == b).sum(dim=0)
+
+    basin_weights = counts / C
+    hard_assignment = torch.argmax(basin_weights, dim=1)
+    hard_assignment_prob = torch.amax(basin_weights, dim=1)
+
+    return basin_weights, hard_assignment, hard_assignment_prob, basin_inds
+
+    # import plotly.graph_objects as go
+    # masks = np.array([hard_assignment == ind for ind in np.unique(hard_assignment)])
+    # mask_sorts = np.argsort([sum(m) for m in masks])[::-1]
+    # sorted_masks = masks[mask_sorts]
+
+    # sample_batch.plot_batch_cell_params(space='real',
+    #                                     aux_dists=[sample_batch.full_cell_parameters()[m] for m in
+    #                                                masks[mask_sorts[:10]] if
+    #                                                sum(m) > 1])
+
+    # go.Figure(go.Histogram(x=basin_weights.amax(1), nbinsx=100)).show()
+    # go.Figure(go.Histogram(x=hard_assignment, nbinsx=len(hard_assignment.unique()))).show()
+
+
+def bottom_up_cluster(xx, e, d_cut, e_cut, max_new_samples: int, device):
+    # Sort by energy ascending
+    sort_inds = torch.argsort(e.to(device))
+    xx_sorted = xx.to(device)[sort_inds]
+    e_sorted = e.to(device)[sort_inds]
+    mask = e_sorted < e_cut
+
+    xx_sorted_cuda = xx_sorted.to(device)
+    blocked = torch.zeros(len(xx_sorted), dtype=torch.bool, device=device)
+    keep = torch.zeros(len(xx_sorted), dtype=bool, device=device)
+    d_cut_squared = d_cut * d_cut
+    for i in range(len(xx_sorted)):
+        if not mask[i]:
+            break
+
+        if blocked[i]:
+            continue
+
+        keep[i] = True
+        if torch.sum(keep) == max_new_samples:
+            break
+
+        drow = ((xx_sorted_cuda - xx_sorted_cuda[i, None, :]) ** 2).sum(-1)  # faster, skips sqrt
+        nearby = drow < d_cut_squared
+        blocked |= nearby
+
+    keep_inds = sort_inds[keep]
+
+    return keep_inds.cpu()
+
+
+def simple_dedupe(samples, d_cut, rdf_cut):
+    "Cluster / dedupe"
+    batch = collate_data_list(samples)
+    latents = batch.latent_params()
+    energy = batch.uma_pot / (batch.sym_mult * batch.z_prime) - batch.uma_gas_pot
+
+    quant = torch.quantile(energy, 0.1)
+    candidates = bottom_up_cluster(latents, energy, d_cut, quant, 1000000,
+                                   device=latents.device)
+
+    candidate_samples = [samples[ind] for ind in candidates]
+    candidate_batch = collate_data_list(candidate_samples)
+    candidate_energy = candidate_batch.uma_pot / (
+            candidate_batch.sym_mult * candidate_batch.z_prime) - candidate_batch.uma_gas_pot
+    out = candidate_batch.analyze(['rdf'])
+    rdf_dists = compute_rdf_distmat(out['rdf'][0], out['rdf'][1]).fill_diagonal_(100)
+
+    uniques = []
+    for ind in range(candidate_batch.num_graphs):
+        drow = rdf_dists[ind]
+        if torch.any(drow < rdf_cut):
+            match_inds = torch.argwhere(drow < rdf_cut).flatten()
+            if torch.any(candidate_energy[match_inds] < candidate_energy[ind]):
+                pass
+            else:
+                uniques.append(ind)
+        else:
+            uniques.append(ind)
+
+    return [candidate_samples[ind] for ind in uniques]
 

@@ -12,11 +12,11 @@ from mxtaltools.reporting.utils import lightweight_one_sided_violin
 def make_thermo_table(Zb, basin_probs, Fb, mean_E, min_ens, Sb, mean_rho, hard_assignment, num_clusters: int):
     top_inds = torch.argsort(Zb, descending=True)[:num_clusters]
 
-    a, b, = hard_assignment.unique(return_counts=True)
+    a, b, = np.unique(hard_assignment.cpu().numpy(), return_counts=True)
     hard_p = b / b.sum()
     basin_ids = [f"{i + 1}" for i in range(num_clusters)]
     p_vals = basin_probs[top_inds].cpu().numpy()
-    cluster_members = hard_p[top_inds].cpu().numpy()
+    cluster_members = hard_p[top_inds]
     ref_state = Fb[top_inds].argmin()
     F_vals = (Fb[top_inds] - Fb[top_inds][ref_state]).cpu().numpy()
     Emean_vals = mean_E[top_inds].cpu().numpy()
@@ -58,7 +58,7 @@ def make_thermo_table(Zb, basin_probs, Fb, mean_E, min_ens, Sb, mean_rho, hard_a
 
     fig.update_layout(
         font_size=16,
-        #title="Thermodynamic Properties of Dominant Basins",
+        # title="Thermodynamic Properties of Dominant Basins",
         margin=dict(l=10, r=10, t=40, b=10),
     )
     return fig
@@ -71,8 +71,8 @@ def add_violin(fig, samples, name, color, row, col, ranges, n_kde, bw_factor):
                                                   data_min=ranges[0],
                                                   data_max=ranges[1])
     fig.add_scatter(
-        x=x_samp,
-        y=y_samp,
+        x=x_samp.cpu().detach().numpy() if torch.is_tensor(x_samp) else x_samp,
+        y=y_samp.cpu().detach().numpy() if torch.is_tensor(y_samp) else y_samp,
         mode='lines',
         fill='toself',  # 'tonexty' if i == 0 else 'tonexty',  # Fill to next y (which is 0)
         fillcolor=color,
@@ -87,11 +87,16 @@ def general_figs(fig_dict, sample_batch, sample_energy, data_batch):
     fig_dict['staircase_fig'] = sample_batch.plot_batch_staircase(space='real', return_fig=True, show=False)
     fig_dict['std_marginals_fig'] = sample_batch.plot_batch_cell_params(space='real',
                                                                         ref_dist=data_batch.full_cell_parameters(),
-                                                                        quantiles=[0.1],
+                                                                        #quantiles=[0.1],
                                                                         override_energy=sample_energy, return_fig=True,
                                                                         show=False)
-    fig_dict['density_funnel_fig'] = sample_batch.plot_batch_density_funnel(override_energy=sample_energy,
-                                                                            return_fig=True, show=False)
+
+
+    fig_dict['density_funnel_fig'] = sample_batch.plot_batch_density_funnel(
+        override_energy=sample_energy * sample_batch.num_atoms,
+        return_fig=True, show=False,
+        max_y_quantile=0.9,
+        overwrite_yaxis_title=r"Energy (kJ/mol)")
     return fig_dict
 
 
@@ -114,15 +119,15 @@ def cluster_comparison_fig(top_cluster_inds,
     titles[6] = 'r'
 
     fig = make_subplots(rows=num_clusters, cols=n_cols, subplot_titles=titles)
-    for ind in range(num_clusters):
+    for ind in range(min(num_clusters, len(top_cluster_inds))):
         row = ind + 1
         # weights = basin_weights[:, top_cluster_inds[ind]]
         cluster_bools = hard_assignment == top_cluster_inds[ind]
         if not cluster_bools.sum() > 1:
             continue
         fig.add_trace(go.Histogram2dContour(
-            x=sample_cp,
-            y=sample_energy.clip(max=0),
+            x=sample_cp.numpy(),
+            y=sample_energy.clip(max=0).numpy(),
             ncontours=12,
             showscale=False,  # colorbar and (i == D - 1 and j == 0),
             contours=dict(coloring='none', showlines=True, start=0.0001, end=0.1, size=0.04),
@@ -132,9 +137,9 @@ def cluster_comparison_fig(top_cluster_inds,
             histnorm='probability',
             showlegend=False,
         ), row=row, col=1)
-        x = sample_batch.packing_coeff[cluster_bools]
-        y = sample_energy[cluster_bools]
-        xy = np.vstack([x.cpu().detach().numpy(), y.cpu().detach().numpy()])
+        x = sample_batch.packing_coeff[cluster_bools].numpy()
+        y = sample_energy[cluster_bools].numpy()
+        xy = np.vstack([x, y])
         try:
             c = get_point_density(xy, bins=50)
         except:
@@ -225,18 +230,22 @@ def cluster_comparison_fig(top_cluster_inds,
 
     fig.update_layout(font_size=16)
     fig.update_layout(width=1920, height=1080)
+
     return fig
 
 
 def dim_reduction_fig(sample_batch, hard_assignment, clusters_to_analyze, cluster_color, basin_inds):
-    real_params = sample_batch.latent_params()
-    whitened_cell_params = (real_params - real_params.mean(0)) / torch.maximum(real_params.std(0),
-                                                                               torch.ones_like(real_params.std(0)))
+
     "Umap visualization"
-    umap_model = UMAP(n_components=2, n_neighbors=10, min_dist=0.01)
-    sample_embedding = umap_model.fit_transform(whitened_cell_params)  # [low_en_bools])
+    dmat = sample_batch.latent_distmat()
+    umap_model = UMAP(n_components=2, n_neighbors=10, min_dist=0.01, metric='precomputed')
+    sample_embedding = umap_model.fit_transform(dmat)
 
     fig = go.Figure()
+    fig.add_scatter(x=sample_embedding[:, 0],
+                    y=sample_embedding[:, 1],
+                    mode='markers', opacity=0.75,
+                    showlegend=False, marker_color='grey')
     masks = np.array([hard_assignment == ind for ind in np.unique(hard_assignment)])
     mask_sorts = np.argsort([sum(m) for m in masks])[::-1]
 
@@ -246,11 +255,14 @@ def dim_reduction_fig(sample_batch, hard_assignment, clusters_to_analyze, cluste
         fig.add_scatter(x=sample_embedding[m, 0],
                         y=sample_embedding[m, 1],
                         mode='markers', opacity=0.75,
+                        name=f"Cluster {ind + 1}",
+                        legendgroup=f"Cluster {ind + 1}",
                         showlegend=False, marker_color=cluster_color[ind])
         fig.add_scatter(x=[sample_embedding[basin_inds[c_ind], 0]],
                         y=[sample_embedding[basin_inds[c_ind], 1]],
                         mode='markers', opacity=1.0,
                         name=f"Cluster {ind + 1}",
+                        legendgroup=f"Cluster {ind + 1}",
                         showlegend=True, marker_color=cluster_color[ind],
                         marker_size=16, marker_line_color='black',
                         marker_line_width=6)
@@ -275,25 +287,18 @@ def dim_reduction_fig(sample_batch, hard_assignment, clusters_to_analyze, cluste
     )
     fig.update_layout(xaxis_title='CV1', yaxis_title='CV2')
     fig.update_layout(font_size=24)
+
     return fig
 
 
 def boltzmann_fig(sample_energy, kT, learned_log_Z, logp_est):
-
     boltzmann_logprobs = -sample_energy / kT - learned_log_Z  # unconditional boltzmann factor
     y = logp_est.cpu().detach()
     x = boltzmann_logprobs.cpu().detach()
-    y = y[(x > x.quantile(0.05))]
-    x = x[(x > x.quantile(0.05))]
-    linreg = linregress(x, y)
 
-    # domain
     xmin = min(x.min(), y.min())
     xmax = max(x.max(), y.max())
-    xx = np.linspace(xmin, xmax, 200)
-
-    # regression line
-    yy = linreg.slope * xx + linreg.intercept
+    xmin = 0
 
     fig = go.Figure()
 
@@ -302,6 +307,7 @@ def boltzmann_fig(sample_energy, kT, learned_log_Z, logp_est):
         c = get_point_density(xy, bins=50)
     except:
         c = np.ones(len(xy))
+
     # scatter
     fig.add_scatter(
         x=x,
@@ -313,30 +319,42 @@ def boltzmann_fig(sample_energy, kT, learned_log_Z, logp_est):
             color='rgba(31,119,180,0.6)',
             line=dict(width=0)
         ),
+        opacity=0.65,
         name='data',
         showlegend=False,
     )
 
-    # regression
-    fig.add_scatter(
-        x=xx,
-        y=yy,
-        mode='lines',
-        line=dict(color='black', width=2),
-        name='fit',
-        showlegend=False,
-    )
+    # regression line
+    linregs = []
+    for quantile in [0, 0.01, 0.05]:
+        xmin = torch.quantile(x, quantile)
+        linreg = linregress(x[x > xmin], y[x > xmin])
+        xx = np.linspace(xmin, xmax, 200)
+        yy = linreg.slope * xx + linreg.intercept
+        # regression
+        fig.add_scatter(
+            x=xx,
+            y=yy,
+            mode='lines',
+            line=dict(color='black', width=4),
+            name='fit',
+            showlegend=False,
+        )
+        linregs.append(linreg)
 
     # y = x reference
     fig.add_scatter(
         x=xx,
         y=xx,
         mode='lines',
-        line=dict(color='gray', width=1, dash='dash'),
+        line=dict(color='gray', width=5, dash='dash'),
         name='y = x',
         showlegend=False,
     )
 
+    slopes = [f'{linreg.slope:.2f}' for linreg in linregs]
+    intercepts = [f'{linreg.intercept:.2f}' for linreg in linregs]
+    rs = [f'{linreg.rvalue:.2f}' for linreg in linregs]
     # annotation
     fig.add_annotation(
         x=0.02,
@@ -346,9 +364,9 @@ def boltzmann_fig(sample_energy, kT, learned_log_Z, logp_est):
         showarrow=False,
         align='left',
         text=(
-            f"slope = {linreg.slope:.3f}<br>"
-            f"intercept = {linreg.intercept:.3f}<br>"
-            f"R = {linreg.rvalue:.3f}<br>"
+            f"slope = {slopes}<br>"
+            f"intercept = {intercepts}<br>"
+            f"R = {rs}<br>"
             # f"p = {linreg.pvalue:.2e}"
         ),
         font=dict(size=20)
@@ -357,8 +375,11 @@ def boltzmann_fig(sample_energy, kT, learned_log_Z, logp_est):
     # layout
     fig.update_layout(
         template='simple_white',
-        xaxis=dict(scaleanchor='y'),
-        legend=dict(orientation='h', y=1.05, x=0.5, xanchor='center'),
+        xaxis=dict(showline=False, zeroline=True, zerolinecolor='black', zerolinewidth=2,
+                   range=[torch.quantile(x, 0.025), torch.amax(x)]),  # scaleanchor='y',
+        yaxis=dict(showline=False, zeroline=True, zerolinecolor='black', zerolinewidth=2,
+                   range=[torch.quantile(x, 0.025), torch.amax(x)]),
+        legend=dict(orientation='h', y=1.05, x=0.5),  # , xanchor='center'),
         margin=dict(l=60, r=20, t=40, b=50)
     )
     fig.update_layout(xaxis_title='Log Boltzmann Weight',

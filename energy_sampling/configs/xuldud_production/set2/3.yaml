@@ -11,7 +11,7 @@ both_ways: true
 bounding_coeff: 10.0
 btb_threshold: 1.5
 buffer_dist_cutoff: 0.5
-buffer_path: /scratch/mk8347/csd_runs/datasets/xuldud/xuldud_sg61_zp1.pt
+buffer_path: /scratch/mk8347/csd_runs/datasets/xuldud/xuldud_sg61_zp2.pt
 buffer_size: 20000
 bwd: false
 bwd_loss_coeffs:
@@ -88,8 +88,8 @@ lr_flow: 1.0
 lr_policy: 0.0005
 lr_warmup_ratio: 10
 lr_warmup_time: 500
-max_bwd_batch_size: 1000
-max_fwd_batch_size: 1000
+max_bwd_batch_size: 400
+max_fwd_batch_size: 400
 max_traj_length: 100
 min_lr: 1.0e-06
 min_traj_length: 100
@@ -108,7 +108,7 @@ rank_weight: 1.0
 reduction_coeff: 10.0
 repeats: 2
 reward_range: 100
-run_name: sg61_zp1_1
+run_name: sg61_zp2_3
 s_emb_dim: 512
 sampling: buffer
 scheduler: true
@@ -118,7 +118,7 @@ space_groups:
 - 61
 t_emb_dim: 64
 t_scale: 0.05
-tag: xuld_lj
+tag: xul2
 temp_annealing_max_steps: 2000
 temperature_conditioning: false
 temperature_scaling_factor: 0.01
@@ -129,6 +129,6 @@ use_weight_decay: false
 wd_max_steps: 10000
 weight_decay: 0.0001
 z_primes:
-- 1
+- 2
 zero_init: false
 zp_conditioning: false

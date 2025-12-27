@@ -11,7 +11,7 @@ both_ways: true
 bounding_coeff: 10.0
 btb_threshold: 1.5
 buffer_dist_cutoff: 0.5
-buffer_path: /scratch/mk8347/csd_runs/datasets/xuldud/xuldud_sg61_zp1.pt
+buffer_path: /scratch/mk8347/csd_runs/datasets/acridine/acridine_sg61_zp1.pt
 buffer_size: 20000
 bwd: false
 bwd_loss_coeffs:
@@ -42,12 +42,12 @@ energy_min_temperature: 0.1
 energy_static_temperature: 2.5
 epochs: 1000000
 eval_T: 100
-eval_batch_size: 1000
+eval_batch_size: 500
 eval_num_samples: 2000
 eval_period: 500
 exploration_factor: 0.25
 exploration_wd: true
-exploratory: false
+exploratory: nFalse
 figs_period: 1000
 force_restart: true
 fwd_loss_coeffs:
@@ -88,15 +88,15 @@ lr_flow: 1.0
 lr_policy: 0.0005
 lr_warmup_ratio: 10
 lr_warmup_time: 500
-max_bwd_batch_size: 1000
-max_fwd_batch_size: 1000
+max_bwd_batch_size: 150
+max_fwd_batch_size: 500
 max_traj_length: 100
 min_lr: 1.0e-06
 min_traj_length: 100
 mol_embedding_type: autoencoder
 molecule: acridine
 molecule_conditioning: false
-molecules_path: /scratch/mk8347/csd_runs/datasets/xuldud/xuldud.pt
+molecules_path: /scratch/mk8347/csd_runs/datasets/acridine/acridine_conformer.pt
 noised_buffer_length: 200000
 norm: layer
 pb_drift_range: 0.2
@@ -107,8 +107,8 @@ prioritized: null
 rank_weight: 1.0
 reduction_coeff: 10.0
 repeats: 2
-reward_range: 100
-run_name: sg61_zp1_1
+reward_range: 80
+run_name: sg61_zp1
 s_emb_dim: 512
 sampling: buffer
 scheduler: true
@@ -118,7 +118,7 @@ space_groups:
 - 61
 t_emb_dim: 64
 t_scale: 0.05
-tag: xuld_lj
+tag: acr7_rerun_
 temp_annealing_max_steps: 2000
 temperature_conditioning: false
 temperature_scaling_factor: 0.01

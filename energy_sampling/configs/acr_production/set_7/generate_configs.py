@@ -41,3 +41,22 @@ if __name__ == "__main__":
                 yaml.dump(config, f, default_flow_style=False)
 
             ind += 1
+
+    # fix / reruns
+    for zp in [1]:
+        for sg in [15, 60, 61, 62, 146]:
+            config = deepcopy(base)
+            config['space_groups'] = [sg]
+            config['z_primes'] = [zp]
+            config['run_name'] = f'sg{sg}_zp{zp}'
+            config['tag'] = f'acr7_rerun_'
+            config['max_fwd_batch_size'] = 500
+            config['max_bwd_batch_size'] = 150
+            config['molecules_path'] = '/scratch/mk8347/csd_runs/datasets/acridine/acridine_conformer.pt'
+            config['buffer_path'] = f'/scratch/mk8347/csd_runs/datasets/acridine/acridine_sg{sg}_zp{zp}.pt'
+
+            config_path = f'{ind}.yaml'
+            with open(config_path, 'w') as f:
+                yaml.dump(config, f, default_flow_style=False)
+
+            ind += 1

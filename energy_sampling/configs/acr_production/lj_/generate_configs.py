@@ -28,14 +28,14 @@ if __name__ == "__main__":
     ind = 0
     for zp in [1]:
         for sg in [2]:
-            for en in ['lj']:
+            for en in ['elj']:
                 for rew in [100, 200]:
                     for temp in [0.625, 1.25, 2.5]:
                         config = deepcopy(base)
                         config['space_groups'] = [sg]
                         config['z_primes'] = [zp]
-                        config['run_name'] = f'sg{sg}_zp{zp}'
-                        config['tag'] = f'acr_lj_1'
+                        config['run_name'] = f'sg{sg}_zp{zp}_{ind}'
+                        config['tag'] = f'acr_lj'
                         config['energy_function'] = en
                         config['energy_static_temperature'] = temp
                         config['reward_range'] = rew
