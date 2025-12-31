@@ -14,6 +14,7 @@ from scipy.cluster.hierarchy import linkage, to_tree, leaves_list
 from scipy.spatial.distance import pdist
 from sklearn.cluster import estimate_bandwidth, MeanShift
 from sklearn.neighbors import NearestNeighbors
+from torch_scatter import scatter
 from tqdm import tqdm
 from umap import UMAP
 
@@ -930,34 +931,35 @@ def get_gfn_samples(num_samples, max_z_prime, device, n_steps, batch_size, gfn_m
     else:
         sample_energy = sample_batch.lj
 
-    return sample_batch, sample_latents, sample_energy, sample_batch.packing_coeff, samples
+    return sample_batch, sample_latents, sample_energy.float(), sample_batch.packing_coeff, samples
 
 
-def get_cluster_weights(sample_latents, sample_energy, num_committor_steps,
-                        cval: float = 1,
-                        mc_cval: float = 0.5,
-                        mc_kT: float = 2.5):
-    "Soft clustering by committor analysis"
-    num_samples = len(sample_latents)
-    clabel = steepest_descent(sample_latents, sample_energy, cval=cval)
-    basin_inds = torch.unique(clabel)
-    num_basins = len(basin_inds)
-    basin_weights = get_committor_weights(clabel, basin_inds, num_committor_steps, sample_energy, num_samples,
-                                          num_basins, sample_latents, cval=mc_cval, mc_kT=mc_kT)
-    hard_assignment = torch.argmax(basin_weights, dim=1)
-    hard_assignment_prob = torch.amax(basin_weights, dim=1)
-    return basin_weights, hard_assignment, hard_assignment_prob, basin_inds
+#
+# def get_cluster_weights(sample_latents, sample_energy, num_committor_steps,
+#                         cval: float = 1,
+#                         mc_cval: float = 0.5,
+#                         mc_kT: float = 2.5):
+#     "Soft clustering by committor analysis"
+#     num_samples = len(sample_latents)
+#     clabel = steepest_descent(sample_latents, sample_energy, cval=cval)
+#     basin_inds = torch.unique(clabel)
+#     num_basins = len(basin_inds)
+#     basin_weights = get_committor_weights(clabel, basin_inds, num_committor_steps, sample_energy, num_samples,
+#                                           num_basins, sample_latents, cval=mc_cval, mc_kT=mc_kT)
+#     hard_assignment = torch.argmax(basin_weights, dim=1)
+#     hard_assignment_prob = torch.amax(basin_weights, dim=1)
+#     return basin_weights, hard_assignment, hard_assignment_prob, basin_inds
 
-    # import plotly.graph_objects as go
-    # masks = np.array([hard_assignment == ind for ind in np.unique(hard_assignment)])
-    # mask_sorts = np.argsort([sum(m) for m in masks])[::-1]
-    # sorted_masks = masks[mask_sorts]
-    # go.Figure(go.Histogram(x=basin_weights.amax(1), nbinsx=100)).show()
-    # go.Figure(go.Histogram(x=hard_assignment, nbinsx=len(hard_assignment.unique()))).show()
-    # sample_batch.plot_batch_cell_params(space='real',
-    #                                     aux_dists=[sample_batch.full_cell_parameters()[m] for m in
-    #                                                masks[mask_sorts[:10]] if
-    #                                                sum(m) > 1])
+# import plotly.graph_objects as go
+# masks = np.array([hard_assignment == ind for ind in np.unique(hard_assignment)])
+# mask_sorts = np.argsort([sum(m) for m in masks])[::-1]
+# sorted_masks = masks[mask_sorts]
+# go.Figure(go.Histogram(x=basin_weights.amax(1), nbinsx=100)).show()
+# go.Figure(go.Histogram(x=hard_assignment, nbinsx=len(hard_assignment.unique()))).show()
+# sample_batch.plot_batch_cell_params(space='real',
+#                                     aux_dists=[sample_batch.full_cell_parameters()[m] for m in
+#                                                masks[mask_sorts[:10]] if
+#                                                sum(m) > 1])
 
 
 def cluster_thermo_analysis(basin_weights, sample_energy, kT, cp, basin_inds, top_cluster_inds):
@@ -1234,3 +1236,173 @@ def simple_dedupe(samples, d_cut, rdf_cut):
 
     return [candidate_samples[ind] for ind in uniques]
 
+
+def basin_min_energy(basin_id, energy):
+    nb = basin_id.max().item() + 1
+    Emin = torch.full((nb,), float('inf'), device=energy.device)
+    Emin.scatter_reduce_(0, basin_id, energy.float(), reduce="amin")
+    return Emin
+
+
+def basin_barriers(basin_id, energy, knn):
+    N, k = knn.shape
+    i = torch.arange(N, device=energy.device)[:, None].expand(N, k)
+    j = knn
+
+    bi = basin_id[i]
+    bj = basin_id[j]
+
+    mask = bi != bj
+    bi = bi[mask]
+    bj = bj[mask]
+
+    barrier = torch.maximum(energy[i][mask], energy[j][mask])
+
+    # canonical basin pair ordering
+    pair = torch.stack([
+        torch.minimum(bi, bj),
+        torch.maximum(bi, bj)
+    ], dim=1)
+
+    return pair, barrier
+
+
+def reduce_min_barrier(pairs, barriers, num_basins):
+    key = pairs[:, 0] * num_basins + pairs[:, 1]
+    uniq, inv = torch.unique(key, return_inverse=True)
+
+    min_barrier = torch.full((len(uniq),), float('inf'), device=barriers.device)
+    min_barrier.scatter_reduce_(0, inv, barriers, reduce="amin")
+
+    bi = uniq // num_basins
+    bj = uniq % num_basins
+    return bi, bj, min_barrier
+
+
+def merge_edges_kT(bi, bj, barrier_ij, Emin, kT):
+    delta = barrier_ij - torch.minimum(Emin[bi], Emin[bj])  # uphill merge rule
+    #delta = barrier_ij - torch.maximum(Emin[bi], Emin[bj])
+    mask = delta < kT
+    return bi[mask], bj[mask]
+
+
+class UnionFind:
+    def __init__(self, n):
+        self.parent = list(range(n))
+
+    def find(self, x):
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, x, y):
+        rx, ry = self.find(x), self.find(y)
+        if rx != ry:
+            self.parent[ry] = rx
+
+
+def merge_basins(num_basins, bi, bj):
+    uf = UnionFind(num_basins)
+    for i, j in zip(bi.tolist(), bj.tolist()):
+        uf.union(i, j)
+
+    rep = torch.tensor([uf.find(i) for i in range(num_basins)])
+    _, new_labels = torch.unique(rep, return_inverse=True)
+    return new_labels
+
+
+def basin_min_energy_and_index(assignments, energy):
+    """
+    Returns:
+        Emin  : (B,) minimum energy per basin
+        idx   : (B,) index of sample achieving Emin
+    """
+    B = assignments.max().item() + 1
+
+    # initialize
+    Emin = torch.full((B,), float('inf'), device=energy.device)
+    Emin.scatter_reduce_(0, assignments, energy, reduce="amin")
+
+    # find indices (argmin per basin)
+    idx = torch.full((B,), -1, dtype=torch.long, device=energy.device)
+    for b in range(B):
+        mask = assignments == b
+        if mask.any():
+            idx[b] = torch.argmin(energy[mask])
+            idx[b] = torch.where(mask)[0][idx[b]]
+
+    return Emin, idx
+
+
+def kinetic_clustering(sample_latents, sample_energy, cval, kT):
+    dmat = crystal_parameter_distmat(sample_latents)
+
+    init_basins = steepest_descent(
+        sample_latents,
+        sample_energy,
+        cval=cval,
+        dmat=dmat
+    ).long()
+
+    init_basins_unique, init_basins_contiguous = torch.unique(init_basins, return_inverse=True)
+    num_basins = len(init_basins_unique)  # Actual count
+
+    N = dmat.shape[0]
+    k = int(sample_latents.shape[1] * cval * np.log(N))
+    knn = dmat.topk(min(dmat.shape[1], k + 1), largest=False).indices[:, 1:]
+
+    Emin = basin_min_energy(init_basins_contiguous, sample_energy)
+    pairs, barriers = basin_barriers(init_basins_contiguous, sample_energy, knn)
+    bi, bj, barrier_ij = reduce_min_barrier(pairs, barriers, num_basins)
+
+    merge_i, merge_j = merge_edges_kT(bi, bj, barrier_ij, Emin, kT)
+    merged_basin_labels = merge_basins(num_basins, merge_i, merge_j)
+
+    cluster_ind = merged_basin_labels[init_basins_contiguous]
+    num_clusters = len(cluster_ind.unique())
+
+    cluster_rep_inds = torch.empty(num_clusters, dtype=torch.long, device=cluster_ind.device)
+    for k in range(num_clusters):
+        mask = cluster_ind == k
+        inds = torch.where(mask)[0]
+        cluster_rep_inds[k] = inds[sample_energy[inds].argmin()]
+
+    "estimate local fluctuations via distance weighted neighbors"
+    k_sigma = 20  # smaller than p_k
+    r_k = dmat.topk(k_sigma + 1, largest=False).values[:, -1]
+    sigma = torch.median(r_k)
+
+    p_k = min(100, len(dmat) - 1)
+    p_knn = dmat.topk(p_k, largest=False).indices
+    neighbor_clusters = cluster_ind[p_knn]
+    dists = dmat[torch.arange(len(dmat))[:, None], p_knn]
+    dist_weights = torch.exp(-dists / sigma)  # (N, p_k)
+
+    basin_weights = scatter(
+        dist_weights,
+        neighbor_clusters,
+        dim=1,
+        dim_size=num_clusters,
+        reduce='sum'
+    )
+    basin_weights /= basin_weights.sum(dim=1, keepdim=True)
+    hard_cluster_probs = torch.amax(basin_weights, dim=1)
+
+    return basin_weights, cluster_ind, hard_cluster_probs, cluster_rep_inds
+
+
+'''
+
+    import plotly.graph_objects as go
+    masks = np.array([cluster_ind == ind for ind in np.unique(cluster_ind)])
+    mask_sorts = np.argsort([sum(m) for m in masks])[::-1]
+    sorted_masks = masks[mask_sorts]
+    go.Figure(go.Histogram(x=basin_weights.amax(1), nbinsx=100)).show()
+    go.Figure(go.Histogram(x=cluster_ind, nbinsx=len(cluster_ind.unique()))).show()
+    sample_batch.plot_batch_cell_params(space='real',
+                                        aux_dists=[sample_batch.full_cell_parameters()[m] for m in
+                                                   masks[mask_sorts[:10]] if
+                                                   sum(m) > 1])
+
+'''

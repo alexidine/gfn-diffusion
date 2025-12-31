@@ -11,7 +11,7 @@ both_ways: true
 bounding_coeff: 10.0
 btb_threshold: 1.5
 buffer_dist_cutoff: 0.5
-buffer_path: /scratch/mk8347/csd_runs/datasets/acridine/acridine_sg62_zp2.pt
+buffer_path: /scratch/mk8347/csd_runs/datasets/acridine/acridine_sg15_zp1.pt
 buffer_size: 20000
 bwd: false
 bwd_loss_coeffs:
@@ -88,7 +88,7 @@ lr_flow: 1.0
 lr_policy: 0.0005
 lr_warmup_ratio: 10
 lr_warmup_time: 500
-max_bwd_batch_size: 500
+max_bwd_batch_size: 150
 max_fwd_batch_size: 500
 max_traj_length: 100
 min_lr: 1.0e-06
@@ -108,17 +108,17 @@ rank_weight: 1.0
 reduction_coeff: 10.0
 repeats: 2
 reward_range: 80
-run_name: sg62_zp2
+run_name: sg15_zp1
 s_emb_dim: 512
 sampling: buffer
 scheduler: true
 seed: 12345
 sg_conditioning: false
 space_groups:
-- 62
+- 15
 t_emb_dim: 64
 t_scale: 0.05
-tag: acr7
+tag: acr7_rerun_
 temp_annealing_max_steps: 2000
 temperature_conditioning: false
 temperature_scaling_factor: 0.01
@@ -129,6 +129,6 @@ use_weight_decay: false
 wd_max_steps: 10000
 weight_decay: 0.0001
 z_primes:
-- 2
+- 1
 zero_init: false
 zp_conditioning: false

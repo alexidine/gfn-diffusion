@@ -11,7 +11,7 @@ both_ways: true
 bounding_coeff: 10.0
 btb_threshold: 1.5
 buffer_dist_cutoff: 0.5
-buffer_path: /scratch/mk8347/csd_runs/datasets/acridine/acridine_sg33_zp1.pt
+buffer_path: /scratch/mk8347/csd_runs/datasets/acridine/acridine_sg60_zp1.pt
 buffer_size: 20000
 bwd: false
 bwd_loss_coeffs:
@@ -108,14 +108,14 @@ rank_weight: 1.0
 reduction_coeff: 10.0
 repeats: 2
 reward_range: 80
-run_name: sg33_zp1
+run_name: sg60_zp1
 s_emb_dim: 512
 sampling: buffer
 scheduler: true
 seed: 12345
 sg_conditioning: false
 space_groups:
-- 33
+- 60
 t_emb_dim: 64
 t_scale: 0.05
 tag: acr7

@@ -120,47 +120,25 @@ def sample_and_analyze():
 
 if __name__ == '__main__':
     "Configs & args"
-    '''
-    # test nicotinamide config
-    run_name = 'nic_test'
-    device = 'cuda'
-    num_samples = 20000
-    batch_size = 1000
-    energy_function = 'elj'  # 'elj', 'lj' 'uma
-    n_steps = 50  # critical to get this right!
-    sg_ind = 14
-    zp = 1  # todo fix zp>1 pre-processing
-    show_figs = False
-    cval = 1
-    kT = 2.5
-    clusters_to_analyze = 8
-    max_repeats = 50
-    tol = 1e-2
-    model_path = rf"D:\crystal_datasets\nic3_sg{sg_ind}_zp{zp}_2_model_eval.pt"
-    config_path = rf"D:\crystal_datasets\nic3_sg{sg_ind}_zp{zp}_2_model_config.npy"
-    molecule_path = r"D:\crystal_datasets\nicoam\protonated_nicotinamide.pt"
-    dataset_path = rf"D:\crystal_datasets\nicoam\nic_sg{sg_ind}_zp{zp}.pt"
-    results_path = rf"D:\crystal_datasets\gfn_results\{run_name}_sg{sg_ind}_zp{zp}.pt"
-    '''
-    # acridine lj config
-    run_name = 'acr_lj'
+    # xuldud uma config
+    run_name = 'xul_14'
     device = 'cuda'
     num_samples = 10000
-    batch_size = 1000
-    energy_function = 'elj'  # 'elj', 'lj' 'uma
+    batch_size = 50
+    energy_function = 'uma'  # 'elj', 'lj' 'uma
     n_steps = 100  # critical to get this right!
-    sg_ind = 2
+    sg_ind = 14
     zp = 1  # todo fix zp>1 pre-processing
-    cval = 0.1
-    kT = 2.5
+    cval = 0.5
+    kT = 1.0
     clust_kT = 7.5
     clusters_to_analyze = 10
     max_repeats = 50
     tol = 1e-2
-    model_path = rf"D:\crystal_datasets\acridine\best_acr_lj_sg{sg_ind}_zp{zp}_2_model_eval.pt"
-    config_path = rf"D:\crystal_datasets\acridine\acr_lj_sg{sg_ind}_zp{zp}_2_model_config.npy"
-    molecule_path = r"D:\crystal_datasets\acridine\acridine_conformer.pt"
-    dataset_path = rf"D:\crystal_datasets\acridine\acridine_sg{sg_ind}_zp{zp}.pt"
+    model_path = rf"D:\crystal_datasets\xuldud\best_xul2_sg{sg_ind}_zp{zp}_0_model_eval.pt"
+    config_path = rf"D:\crystal_datasets\xuldud\xul2_sg{sg_ind}_zp{zp}_0_model_config.npy"
+    molecule_path = r"D:\crystal_datasets\xuldud\xuldud.pt"
+    dataset_path = rf"D:\crystal_datasets\xuldud\xuldud_sg{sg_ind}_zp{zp}.pt"
     results_path = rf"D:\crystal_datasets\gfn_results\{run_name}_sg{sg_ind}_zp{zp}.pt"
     reload_results = True
     show_figs = True
@@ -173,6 +151,7 @@ if __name__ == '__main__':
     do_explicit_probs = True
 
     "Load Relevant Dataset"
+    exp_crystals = torch.load(r"D:\crystal_datasets\xuldud\xul_csd.pkl", weights_only=False)
     molecule = torch.load(molecule_path, weights_only=False)
     dataset = torch.load(dataset_path, weights_only=False)
     max_z_prime = max([int(elem.max_z_prime) for elem in dataset])
@@ -208,6 +187,28 @@ if __name__ == '__main__':
 
     clusters_to_analyze = min(len(top_cluster_inds), clusters_to_analyze)
     cluster_color = get_color_set(clusters_to_analyze, alpha=0.7)
+
+    '''
+    # exp comparisons
+    
+    from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
+    pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
+    predictor = init_uma_crystal_predictor(pred_path, device=device)
+    ebatch = collate_data_list(exp_crystals)
+    gas_en = ebatch.compute_lattice_gas_phase_uma(predictor,
+                                                 std_orientation=True).cpu().detach() * 96.485
+    cry_en = ebatch.compute_crystal_uma(predictor=predictor,
+                                       std_orientation=True).cpu().detach() * 96.485
+    exp_uma = sample_batch.uma_pot / (sample_batch.sym_mult * sample_batch.z_prime) - sample_batch.uma_gas_pot
+    
+    fig = go.Figure(go.Scatter(x=sample_batch.packing_coeff, y=sample_energy, mode='markers'))
+    fig.add_scatter(x=ebatch.packing_coeff, y=exp_uma, mode='markers', marker_size=20)
+    fig.update_layout(yaxis_range=[-np.inf, 0])
+    fig.show()
+    sample_batch.plot_batch_cell_params(space='real',ref_dist=ebatch.full_cell_parameters(), show=True)
+    
+    '''
+
 
     fig_dict = {}
     if do_general_vis:  # Standard visualizations

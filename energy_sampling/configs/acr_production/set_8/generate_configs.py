@@ -26,7 +26,7 @@ if __name__ == "__main__":
     base, spec_dir = load_yaml(base_path)
 
     ind = 0
-    for zp in [1, 2]:
+    for zp in [2]:
         for sg in [2, 4, 9, 14, 15, 19, 33, 61, 1, 5, 7, 12, 13, 18, 29, 60, 62, 146]:
             config = deepcopy(base)
             if zp == 2:
@@ -45,21 +45,3 @@ if __name__ == "__main__":
 
             ind += 1
 
-    # fix / reruns
-    for zp in [1]:
-        for sg in [15, 60, 61, 62, 146]:
-            config = deepcopy(base)
-            config['space_groups'] = [sg]
-            config['z_primes'] = [zp]
-            config['run_name'] = f'sg{sg}_zp{zp}'
-            config['tag'] = f'acr7_rerun_'
-            config['max_fwd_batch_size'] = 500
-            config['max_bwd_batch_size'] = 150
-            config['molecules_path'] = '/scratch/mk8347/csd_runs/datasets/acridine/acridine_conformer.pt'
-            config['buffer_path'] = f'/scratch/mk8347/csd_runs/datasets/acridine/acridine_sg{sg}_zp{zp}.pt'
-
-            config_path = f'{ind}.yaml'
-            with open(config_path, 'w') as f:
-                yaml.dump(config, f, default_flow_style=False)
-
-            ind += 1

@@ -35,7 +35,7 @@ if __name__ == '__main__':
     # acridine lj config
     run_name = 'acr_search'
     device = 'cuda'
-    num_samples = 10000
+    num_samples = 1000
     batch_size = 10
     energy_function = 'uma'  # 'elj', 'lj' 'uma
     n_steps = 100  # critical to get this right!
@@ -49,7 +49,7 @@ if __name__ == '__main__':
     molecule_path = r"D:\crystal_datasets\acridine\acridine_conformer.pt"
     results_path = rf"D:\crystal_datasets\gfn_results\{run_name}.pt"
     samples_path = rf"D:\crystal_datasets\gfn_results\{run_name}"
-    reload_results = True
+    reload_results = False
 
     os.chdir(model_path)
     models = glob.glob(f'{model_prefix}*eval.pt')
@@ -63,7 +63,7 @@ if __name__ == '__main__':
     else:# os.path.exists(results_path):
         all_samples = []
         for m_path in models:
-            sg_ind = int(m_path.split('_')[2].split('sg')[-1])
+            sg_ind = int(m_path.replace('rerun__','').split('_')[2].split('sg')[-1])
             config_path = m_path.replace('best_', '').replace('model_eval.pt', 'model_config.npy')
             samples = sample_and_analyze(m_path, config_path, molecule, max_z_prime, batch_size, sg_ind, zp,
                                          energy_function, device, num_samples)
@@ -97,7 +97,7 @@ if __name__ == '__main__':
     from mxtaltools.constants.space_group_info import SPACE_GROUPS
     from mxtaltools.common.utils import get_point_density
 
-    fig = make_subplots(rows=3, cols=6, subplot_titles=[ii + '_' + SPACE_GROUPS[int(ii)] for ii in sorted_sgs])
+    fig = make_subplots(rows=3, cols=6, subplot_titles=[str(ii) + '_' + SPACE_GROUPS[int(ii)] for ii in sorted_sgs])
 
     all_ens = []
     all_cps = []
