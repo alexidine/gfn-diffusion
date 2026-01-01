@@ -276,7 +276,7 @@ if __name__ == '__main__':
 
         elif key == 'clusters':
             width = 1800
-            height = 1050
+            height = 1200
             fig.update_layout(
                 width=width,
                 height=height,

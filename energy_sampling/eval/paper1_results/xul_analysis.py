@@ -121,22 +121,22 @@ def sample_and_analyze():
 if __name__ == '__main__':
     "Configs & args"
     # xuldud uma config
-    run_name = 'xul_14'
     device = 'cuda'
     num_samples = 10000
     batch_size = 50
     energy_function = 'uma'  # 'elj', 'lj' 'uma
     n_steps = 100  # critical to get this right!
-    sg_ind = 14
+    sg_ind = 61
+    run_name = f'xul_{sg_ind}'
     zp = 1  # todo fix zp>1 pre-processing
     cval = 0.5
-    kT = 1.0
-    clust_kT = 7.5
+    kT = 2.5
+    clust_kT = 2.5
     clusters_to_analyze = 10
     max_repeats = 50
     tol = 1e-2
-    model_path = rf"D:\crystal_datasets\xuldud\best_xul2_sg{sg_ind}_zp{zp}_0_model_eval.pt"
-    config_path = rf"D:\crystal_datasets\xuldud\xul2_sg{sg_ind}_zp{zp}_0_model_config.npy"
+    model_path = rf"D:\crystal_datasets\xuldud\xul2_sg{sg_ind}_zp{zp}_1_model_eval.pt"
+    config_path = rf"D:\crystal_datasets\xuldud\xul2_sg{sg_ind}_zp{zp}_1_model_config.npy"
     molecule_path = r"D:\crystal_datasets\xuldud\xuldud.pt"
     dataset_path = rf"D:\crystal_datasets\xuldud\xuldud_sg{sg_ind}_zp{zp}.pt"
     results_path = rf"D:\crystal_datasets\gfn_results\{run_name}_sg{sg_ind}_zp{zp}.pt"
@@ -176,6 +176,8 @@ if __name__ == '__main__':
     top_cluster_inds = torch.argsort(basin_weights.sum(0), descending=True).flatten()
     confident_cluster_labels = cluster_labels.clone()
     confident_cluster_labels[cluster_prob < 0.9] = -1
+    clusters_to_analyze = min(len(top_cluster_inds), clusters_to_analyze)
+    cluster_color = get_color_set(clusters_to_analyze, alpha=0.7)
 
     masks = np.array([cluster_labels == ind for ind in np.unique(cluster_labels)])
     mask_sorts = np.argsort([sum(m) for m in masks])[::-1]
@@ -185,8 +187,6 @@ if __name__ == '__main__':
                                                    masks[mask_sorts[:10]] if
                                                    sum(m) > 1])
 
-    clusters_to_analyze = min(len(top_cluster_inds), clusters_to_analyze)
-    cluster_color = get_color_set(clusters_to_analyze, alpha=0.7)
 
     '''
     # exp comparisons
@@ -214,7 +214,7 @@ if __name__ == '__main__':
     if do_general_vis:  # Standard visualizations
         fig_dict = general_figs(fig_dict, sample_batch, sample_energy, data_batch)
 
-    if do_clustering:  # Clustering & thermodynamic analysis
+    if do_clustering and clusters_to_analyze > 1:  # Clustering & thermodynamic analysis
         min_ens, Zb, Fb, basin_probs, mean_rho, Sb, mean_E = cluster_thermo_analysis(basin_weights, sample_energy, kT,
                                                                                      sample_cp, basin_inds,
                                                                                      top_cluster_inds)
@@ -277,7 +277,7 @@ if __name__ == '__main__':
 
         elif key == 'clusters':
             width = 1800
-            height = 1050
+            height = 1200
             fig.update_layout(
                 width=width,
                 height=height,
@@ -303,6 +303,7 @@ if __name__ == '__main__':
 
         if show_figs:
             fig.show()
+
         if write_figs:
             fig.write_image(
                 rf"C:\Users\mikem\OneDrive\NYU\CSD\papers\generator\{run_name}_{key.replace(' ', '_')}.png",

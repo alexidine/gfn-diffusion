@@ -341,7 +341,6 @@ def boltzmann_fig(sample_energy, kT, learned_log_Z, logp_est):
     x = boltzmann_logprobs.cpu().detach()
 
     xmax = max(x.max(), y.max())
-    xmin = 0
 
     fig = go.Figure()
 
@@ -434,9 +433,9 @@ def boltzmann_fig(sample_energy, kT, learned_log_Z, logp_est):
     # layout
     fig.update_layout(
         template='simple_white',
-        xaxis=dict(showline=False, zeroline=True, zerolinecolor='black', zerolinewidth=2,
+        xaxis=dict(showline=True, zeroline=True, zerolinecolor='grey', zerolinewidth=0.5,
                    range=[torch.quantile(x, 0.025), torch.amax(x)]),  # scaleanchor='y',
-        yaxis=dict(showline=False, zeroline=True, zerolinecolor='black', zerolinewidth=2,
+        yaxis=dict(showline=True, zeroline=True, zerolinecolor='grey', zerolinewidth=0.5,
                    range=[torch.quantile(x, 0.025), torch.amax(x)]),
         legend=dict(orientation='h', y=1.05, x=0.5),  # , xanchor='center'),
         margin=dict(l=60, r=20, t=40, b=50)

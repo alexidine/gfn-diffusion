@@ -1281,7 +1281,7 @@ def reduce_min_barrier(pairs, barriers, num_basins):
 
 def merge_edges_kT(bi, bj, barrier_ij, Emin, kT):
     delta = barrier_ij - torch.minimum(Emin[bi], Emin[bj])  # uphill merge rule
-    #delta = barrier_ij - torch.maximum(Emin[bi], Emin[bj])
+    #delta = barrier_ij - torch.maximum(Emin[bi], Emin[bj])  # downhill merge rule
     mask = delta < kT
     return bi[mask], bj[mask]
 
@@ -1349,7 +1349,7 @@ def kinetic_clustering(sample_latents, sample_energy, cval, kT):
     num_basins = len(init_basins_unique)  # Actual count
 
     N = dmat.shape[0]
-    k = int(sample_latents.shape[1] * cval * np.log(N))
+    k = 5 #sample_latents.shape[1]
     knn = dmat.topk(min(dmat.shape[1], k + 1), largest=False).indices[:, 1:]
 
     Emin = basin_min_energy(init_basins_contiguous, sample_energy)
