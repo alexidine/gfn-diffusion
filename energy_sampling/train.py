@@ -980,9 +980,10 @@ class Modeller:
             if self.args.bwd_loss_coeffs.noised_fraction > 0:
                 if buffer.noised_size == 0:  # initialize buffer
                     print("Initializing noised buffer")
-                    reward_range = 10
+                    reward_range = 5
                     reward_record, sample_record = noise_buffer(0.5, 1,
                                                                 buffer, energy_function, reward_range,
+                                                                noise_step = 0.025,
                                                                 sample_inds=None)
 
                     reward_record = torch.tensor(reward_record)
@@ -1246,18 +1247,19 @@ class Modeller:
                 eps = 0.05
                 beta = 1.0
 
-                score = alpha * stdz(log_r) + (1 - alpha) * stdz(-normed_btb_residual)
+                score = alpha * stdz(rewards) + (1 - alpha) * stdz(-normed_btb_residual)
                 weight = F.softmax(beta * score, dim=0)
 
                 weight = (1 - eps) * weight + eps / len(weight)
                 weight = weight.clamp(min=0)
                 weight = weight/weight.sum()
 
-                sample_inds = torch.multinomial(weight, num_samples=1000, replacement=True)
+                sample_inds = torch.multinomial(weight, num_samples=1000, replacement=True)[:self.args.eval_batch_size] # subsample for speed
 
-                reward_range = 10
+                reward_range = 5
                 reward_record, sample_record = noise_buffer(0.5, 1,
                                                             buffer, energy_function, reward_range,
+                                                            noise_step=0.025,
                                                             sample_inds=sample_inds)
 
                 reward_record = torch.tensor(reward_record)

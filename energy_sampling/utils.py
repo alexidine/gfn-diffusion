@@ -623,6 +623,7 @@ def substitute_prior(noised_fraction, noise_level, crystal_batch, energy_functio
     return condition, new_rewards, new_samples, crystal_batch
 
 def noise_buffer(max_noise_level, noised_fraction, buffer, energy_function, reward_range,
+                 noise_step,
                  sample_inds: Optional[torch.Tensor] = None):
     # sample full buffer
     samples, rewards, crystal_batch, condition = buffer.sample(
@@ -636,7 +637,7 @@ def noise_buffer(max_noise_level, noised_fraction, buffer, energy_function, rewa
     reward_record = []
     noise_level = 0
     while True:
-        noise_level += 0.01
+        noise_level += noise_step
         if noise_level > 0:
             condition, noised_rewards, noised_samples, crystal_batch = substitute_prior(
                 noised_fraction, noise_level, crystal_batch.clone(),
