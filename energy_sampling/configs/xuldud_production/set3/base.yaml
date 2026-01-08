@@ -29,8 +29,8 @@ norm: layer                   # null, "layer" - DON'T PUT 'batch'
 
 batch_size: 10              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_fwd_batch_size: 500
-max_bwd_batch_size: 500
+max_fwd_batch_size: 2000
+max_bwd_batch_size: 2000
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
 eval_batch_size: 1000        # batch size for evaluation (adaptive)
 eval_num_samples: 2000       # minimum number of samples for evaluation
