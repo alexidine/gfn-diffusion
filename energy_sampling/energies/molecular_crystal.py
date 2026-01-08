@@ -375,7 +375,7 @@ class MolecularCrystal(BaseSet):
                     samples.extend(outs[1].cpu().detach().batch_to_list())
 
                 cursor += len(inds)
-                self.batch_size += 1
+                self.batch_size *= 1.01
 
             except (RuntimeError, ValueError) as e:
                 if is_cuda_oom(e):

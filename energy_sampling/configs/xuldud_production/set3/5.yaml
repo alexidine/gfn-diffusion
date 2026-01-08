@@ -84,9 +84,9 @@ lj_rescale:
 - 1.5
 log_var_range: 6
 lr_anneal_time: 100000
-lr_back: 5.0e-05
-lr_flow: 1.0
-lr_policy: 5.0e-05
+lr_back: 0.0005
+lr_flow: 10.0
+lr_policy: 0.0005
 lr_warmup_ratio: 25
 lr_warmup_time: 1000
 max_bwd_batch_size: 500

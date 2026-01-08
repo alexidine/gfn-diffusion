@@ -986,7 +986,7 @@ class Modeller:
                                                                 sample_inds=None)
 
                     reward_record = torch.tensor(reward_record)
-                    good_inds = torch.argwhere(reward_record >= buffer.reward_clip)
+                    good_inds = torch.argwhere(reward_record >= buffer.reward_clip).flatten()
 
                     buffer.add_to_noised(reward_record[good_inds],
                                          torch.stack(sample_record)[good_inds])
@@ -1261,7 +1261,7 @@ class Modeller:
                                                             sample_inds=sample_inds)
 
                 reward_record = torch.tensor(reward_record)
-                good_inds = torch.argwhere(reward_record >= buffer.reward_clip)
+                good_inds = torch.argwhere(reward_record >= buffer.reward_clip).flatten()
 
                 buffer.add_to_noised(reward_record[good_inds],
                                      torch.stack(sample_record)[good_inds])

@@ -86,8 +86,8 @@ bwd_loss_coeffs:
 anchor_fwd_bwd: true #true  # whether to do this at all
 btb_threshold: 1.5 # ratio of thermalization_conv_eps at which we activate emergency bwd training
 phase_change_time: 2000  # time to adjust loss coefficients between phases
-thermalization_conv_eps: 0.5
-init_kld_threshold: 0.05
+thermalization_conv_eps: 1.0
+init_kld_threshold: 0.5
 anchor_noise_fraction: 1.0
 anchor_noise_level: 0.5  # noise level for bwd samples (unused)
 

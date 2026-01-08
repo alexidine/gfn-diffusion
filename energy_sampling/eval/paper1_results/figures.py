@@ -111,7 +111,7 @@ def make_thermo_table(Zb, basin_probs, Fb, mean_E, min_ens, Sb, mean_rho, hard_a
 
 
 def add_violin(fig, samples, name, color, row, col, ranges, n_kde, bw_factor):
-    x_samp, y_samp = lightweight_one_sided_violin(samples + torch.randn_like(samples) * 1e-3,
+    x_samp, y_samp = lightweight_one_sided_violin(samples,
                                                   n_kde,
                                                   bandwidth_factor=bw_factor,
                                                   data_min=ranges[0],
