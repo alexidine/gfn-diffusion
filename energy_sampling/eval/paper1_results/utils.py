@@ -1,6 +1,7 @@
 import re
 from collections import Counter
 
+import torch.nn.functional as F
 import hdbscan
 import numpy as np
 import pandas as pd
@@ -18,6 +19,7 @@ from torch_scatter import scatter
 from tqdm import tqdm
 from umap import UMAP
 
+from energy_sampling.energies.molecular_crystal import density_penalty
 from energy_sampling.utils import uniform_discretizer, get_gfn_init_state
 from mxtaltools.analysis.crystal_rdf import compute_rdf_distmat
 from mxtaltools.common.geometry_utils import crystal_parameter_distmat
@@ -609,23 +611,29 @@ def get_sample_batch(batch_size, max_z_prime, device, n_steps, gfn_model):
                                                                       None,
                                                                       condition,
                                                                       return_gauss_params=False)
-    return states[:, -1, :]
+    return states[:, -1, :], log_pfs.sum(-1), log_pbs.sum(-1)
 
 
 def sample_from_gfn(num_samples, max_z_prime, device, n_steps, batch_size, gfn_model):
     samples = []
+    pfs = []
+    pbs = []
     counter = 0
     with tqdm(total=num_samples) as pbar:
         while (len(samples) * batch_size) < num_samples:
-            states = get_sample_batch(batch_size, max_z_prime, device, n_steps, gfn_model)
+            states, log_pfs, log_pbs = get_sample_batch(batch_size, max_z_prime, device, n_steps, gfn_model)
 
             samples.append(states.cpu().detach())
+            pfs.append(log_pfs.cpu().detach())
+            pbs.append(log_pbs.cpu().detach())
 
             counter += batch_size
             pbar.update(batch_size)
 
     samples = torch.cat(samples)
-    return samples.clip(max=1, min=-1)
+    pfs = torch.cat(pfs)
+    pbs = torch.cat(pbs)
+    return samples.clip(max=1, min=-1), pfs, pbs
 
 
 def analyze_samples(x, mol_list, max_z_prime, device, batch_size, sg_ind, zp, do_uma: bool = False, predictor=None):
@@ -637,7 +645,7 @@ def analyze_samples(x, mol_list, max_z_prime, device, batch_size, sg_ind, zp, do
     with tqdm(total=num_samples) as pbar:
         with torch.no_grad():
             for b_ind in range(num_batches):
-                inds = torch.arange(b_ind * batch_size, (b_ind + 1) * batch_size)
+                inds = torch.arange(b_ind * batch_size, min((b_ind + 1) * batch_size, num_samples))
                 for elem in mol_list:
                     elem.z_prime = zp
                 batch = collate_data_list([mol_list[ind] for ind in inds], max_z_prime=max_z_prime)
@@ -903,9 +911,11 @@ def get_committor_weights(clabel, basin_inds, num_committor_steps: int, sample_e
     return basin_weights
 
 
+@torch.no_grad()
 def get_gfn_samples(num_samples, max_z_prime, device, n_steps, batch_size, gfn_model, energy_function, molecule, sg_ind,
                     zp):
-    sample_latents = sample_from_gfn(num_samples, max_z_prime, device, n_steps, batch_size, gfn_model)
+    sample_latents, pfs, pbs = sample_from_gfn(num_samples, max_z_prime, device, n_steps, 1000, gfn_model)
+
     if energy_function == 'uma':
         pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
         predictor = init_uma_crystal_predictor(pred_path, device=device)
@@ -931,7 +941,7 @@ def get_gfn_samples(num_samples, max_z_prime, device, n_steps, batch_size, gfn_m
     else:
         sample_energy = sample_batch.lj
 
-    return sample_batch, sample_latents, sample_energy.float(), sample_batch.packing_coeff, samples
+    return sample_batch, sample_latents, sample_energy.float(), sample_batch.packing_coeff, samples, pfs, pbs
 
 
 #
@@ -962,8 +972,8 @@ def get_gfn_samples(num_samples, max_z_prime, device, n_steps, batch_size, gfn_m
 #                                                sum(m) > 1])
 
 
-def cluster_thermo_analysis(basin_weights, sample_energy, kT, cp, basin_inds, top_cluster_inds):
-    min_ens = sample_energy[basin_inds][top_cluster_inds]
+def cluster_thermo_analysis(basin_weights, sample_energy, kT, cp, cluster_labels, top_cluster_inds):
+    min_ens = torch.tensor([sample_energy[cluster_labels == lab].amin() for lab in cluster_labels.unique()])[top_cluster_inds]
 
     # Basin partition weights
     Zb = basin_weights.sum(dim=0).clamp(min=1e-12)  # (B,)
@@ -1040,39 +1050,68 @@ def get_gfn_logprobs(batch_size, sample_latents, gfn_model, n_steps, max_repeats
     return logps
 
 
-def get_cluster_basins_labels(samples, energy):
-    dmat = crystal_parameter_distmat(samples).fill_diagonal_(0).detach().numpy().astype(np.float64)
+def umap_hdbscan_clustering(dmat, sample_energy, n_components, n_neighbors, min_dist, min_cluster_size, min_samples, kT):
 
-    umap_model = UMAP(n_components=6, n_neighbors=10, min_dist=0.01, metric='precomputed')
-    sample_embedding = umap_model.fit_transform(dmat)
+    umap_model = UMAP(n_components=n_components,
+                      n_neighbors=n_neighbors,
+                      min_dist=min_dist,
+                      metric='precomputed')
+    sample_embedding = umap_model.fit_transform(dmat.numpy().astype(np.float64))
+
     clusterer = hdbscan.HDBSCAN(
         metric='euclidean',  # use your distance matrix
-        min_cluster_size=50,
+        min_cluster_size=min_cluster_size,
         cluster_selection_method='eom',  # or 'leaf'
-        min_samples=10,
+        min_samples=min_samples,
         # prediction_data=True,
     )
-    labels = clusterer.fit_predict(torch.cdist(torch.tensor(sample_embedding), torch.tensor(sample_embedding)))
-    num_clusters = len(np.unique(labels[labels != -1]))
-    labels[labels == -1] = np.random.randint(low=0, high=num_clusters, size=(labels == -1).sum())
-    # soft = hdbscan.all_points_membership_vectors(clusterer)
-    soft = torch.nn.functional.one_hot(torch.as_tensor(labels), num_classes=len(np.unique(labels)))
+    cluster_labels = clusterer.fit_predict(sample_embedding)
+    num_clusters = len(np.unique(cluster_labels[cluster_labels != -1]))
+    cluster_labels[cluster_labels == -1] = np.random.randint(low=0, high=num_clusters, size=(cluster_labels == -1).sum())
+    cluster_labels = torch.tensor(cluster_labels, dtype=torch.long)
 
-    rep_sample_inds = torch.zeros(num_clusters, dtype=torch.long)
-    for c_ind in range(num_clusters):
-        members_bools = (torch.as_tensor(labels) == c_ind) & (torch.as_tensor(clusterer.probabilities_) > 0.9)
-        members_ens = energy[members_bools]
-        members = samples[members_bools]
-        interior_dists = torch.as_tensor(dmat)[members_bools][:, members_bools]
+    "get soft assignments"
+    k_sigma = 20  # smaller than p_k
+    r_k = dmat.topk(k_sigma + 1, largest=False).values[:, -1]
+    sigma = torch.median(r_k)
 
-        sigma = interior_dists.median()
-        dist_weight = torch.exp(-(interior_dists / sigma) ** 2).median(dim=1).values
+    p_k = min(100, len(dmat) - 1)
+    p_knn = dmat.topk(p_k, largest=False).indices
+    neighbor_clusters = cluster_labels[p_knn]
+    dists = dmat[torch.arange(len(dmat))[:, None], p_knn]
+    dist_weights = torch.exp(-dists / sigma)  # (N, p_k)
 
-        beta = 1.0 / members_ens.std().clamp(min=1e-6)
-        e_weight = torch.softmax(-beta * (members_ens - members_ens.min()), dim=0)
-        rep_sample_inds[c_ind] = torch.argmax(dist_weight * e_weight).item()
+    basin_weights = scatter(
+        dist_weights,
+        neighbor_clusters,
+        dim=1,
+        dim_size=num_clusters,
+        reduce='sum'
+    )
+    basin_weights /= basin_weights.sum(dim=1, keepdim=True)
+    cluster_prob = torch.amax(basin_weights, dim=1)
 
-    return soft, labels, clusterer.probabilities_, rep_sample_inds
+    num_clusters = len(cluster_labels.unique())
+
+    cluster_rep_inds = torch.empty(num_clusters, dtype=torch.long, device=cluster_labels.device)
+
+    for k in range(num_clusters):
+        mask = (cluster_labels == k)# & (cluster_prob > 0.95)
+        inds = torch.where(mask)[0]
+
+        # pairwise distances within basin
+        D = dmat[inds][:, inds]
+
+        # Boltzmann weights (numerically stable)
+        E = sample_energy[inds]
+        w = torch.exp(-(E - E.min()) / kT)
+        w = w / w.sum()
+
+        # energy-weighted medoid
+        score = (D * w[None, :]).sum(dim=1)
+        cluster_rep_inds[k] = inds[score.argmin()]
+
+    return basin_weights, cluster_labels, cluster_prob, cluster_rep_inds
 
 
 def get_cluster_weights2(sample_latents, sample_energy, num_committor_steps,
@@ -1406,3 +1445,80 @@ def kinetic_clustering(sample_latents, sample_energy, cval, kT):
                                                    sum(m) > 1])
 
 '''
+
+
+def compute_zp_order_penalty(bounding_energy, crystal_batch):
+    # penalize the model for placing asymmetric units out of the canonical order (closest -> furthest from origin)
+    per_aunit_centroids = crystal_batch.aunit_centroid.reshape(crystal_batch.num_graphs,
+                                                               crystal_batch.max_z_prime, 3)
+    idx = torch.arange(crystal_batch.max_z_prime, device=crystal_batch.device)[None, ...]
+    mask = (idx >= (crystal_batch.z_prime[..., None]))[..., None].expand(-1, -1, 3)
+    per_aunit_centroids[mask] = 1  # this will put lower Z' options always at the end
+    origin_dists = per_aunit_centroids.norm(dim=2)
+    overlaps = -origin_dists.diff(dim=1)
+    zp_ordering_energy = F.relu(overlaps).mean(dim=-1) ** 2
+    bounding_energy = bounding_energy + zp_ordering_energy
+    return bounding_energy
+
+
+def generator_reward(crystal_batch, raw_latents, max_z_prime,
+                     energy_function, temperature,
+                     energy_clip, lj_coeff = 1, bounding_coeff = 10, reduction_coeff = 10, density_coeff = 10):
+    ens_dict = {}
+
+    latents = crystal_batch.latent_params()
+    if raw_latents is not None:
+        bounding_energy = (F.relu(raw_latents - 1) ** 2 + F.relu(-(raw_latents + 1)) ** 2).sum(
+            dim=-1)  # discourage exploration beyond clip range
+    else:
+        bounding_energy = torch.zeros_like(latents[:, 0])
+
+    if max_z_prime > 1:
+        bounding_energy = compute_zp_order_penalty(bounding_energy, crystal_batch)
+
+    if energy_function in ['lj', 'qlj', 'elj', 'silu', 'uma']:
+        density_energy = density_penalty(crystal_batch.packing_coeff)
+        if energy_function == 'lj':
+            mol_energy = crystal_batch.lj / crystal_batch.z_prime
+        elif energy_function == 'qlj':
+            mol_energy = crystal_batch.qlj / crystal_batch.z_prime
+        elif energy_function == 'elj':
+            mol_energy = crystal_batch.elj / crystal_batch.z_prime
+        elif energy_function == 'silu':
+            mol_energy = crystal_batch.silu / crystal_batch.z_prime
+        elif energy_function == 'uma':
+            mol_energy = crystal_batch.uma
+        else:
+            assert False
+
+        lj_rescale = [-20.6, 5.7, -3.4, 1.5]  # mean and std by which to rescale LJ to align with uma
+        if energy_function in ['lj', 'qlj', 'elj'] and lj_rescale is not None:
+            # rescale functions with LJ-type minima to uma statistics
+            lj_mean, lj_std, uma_mean, uma_std = lj_rescale
+            atomwise_energy = mol_energy/(crystal_batch.num_atoms / crystal_batch.z_prime)
+            atomwise_fixed = (atomwise_energy - lj_mean) / lj_std * uma_std + uma_mean
+            mol_energy = atomwise_fixed * (crystal_batch.num_atoms / crystal_batch.z_prime)
+
+        reduction_en = crystal_batch.compute(['reduction_en'])['reduction_en']
+        reduction_energy = F.relu(reduction_en)  # punish positive energies
+
+        ens_dict['reduction_energy'] = reduction_energy
+        ens_dict['mol_energy'] = mol_energy
+        ens_dict['density_energy'] = density_energy
+        ens_dict['bounding_energy'] = bounding_energy
+    else:
+        reduction_energy = torch.zeros_like(bounding_energy)
+
+
+    crystal_energy = lj_coeff * mol_energy + density_coeff * density_energy
+
+    if energy_clip is not None:
+        total_energy = (log_rescale_positive(crystal_energy,
+                                            energy_clip) +
+                        bounding_energy * bounding_coeff +
+                        reduction_energy * reduction_coeff)
+        total_energy = log_rescale_positive(total_energy, energy_clip + 0.1 * np.abs(energy_clip))
+    else:
+        total_energy = crystal_energy + bounding_energy * bounding_coeff + reduction_energy * reduction_coeff
+
+    return -total_energy / temperature

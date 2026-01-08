@@ -643,13 +643,11 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
     return fig
 
 
-def bwd_figs(buffer, gfn_model, init_state, discretizer, do_figs: Optional[bool] = False):
-    terminal_state, log_r, crystal_batch, condition = buffer.sample(
-        override_batch=len(init_state),
-    )
-    (backward_flow_states, b_log_pfs, b_log_pbs, log_z,
-     b_means_f, b_vars_f, b_means_b, b_vars_b) = gfn_model.get_traj_bwd(
-        terminal_state.to(gfn_model.device), discretizer, condition.to(gfn_model.device), return_gauss_params=True)
+@torch.no_grad()
+def bwd_evaluation(buffer, gfn_model, init_state, discretizer, do_figs: Optional[bool] = False):
+    log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, log_r = analyze_buffer(
+        buffer, discretizer, gfn_model, init_state)
+
     metrics = {}
     fig_dict = {}
     metrics['Mean Bwd F Drift'] = b_means_f.abs().mean().item()
@@ -679,7 +677,7 @@ def bwd_figs(buffer, gfn_model, init_state, discretizer, do_figs: Optional[bool]
 
     X_side = log_pf.cpu() - log_pb.cpu()
     Y_side = log_r.cpu() - log_z.cpu()
-    normed_tb_residual = (X_side - Y_side).abs() / torch.maximum(torch.ones_like(Y_side),Y_side.abs())
+    normed_tb_residual = (X_side - Y_side).abs() / torch.maximum(torch.ones_like(Y_side), Y_side.abs())
     metrics['Bwd Normed TB Residual'] = normed_tb_residual.mean().item()
 
     '''
@@ -693,26 +691,97 @@ def bwd_figs(buffer, gfn_model, init_state, discretizer, do_figs: Optional[bool]
     metrics['Bwd Normed Log Z LB Residual'] = ((log_Z_lb - log_Z_learned).abs() / log_Z_lb.abs()).item()
 
     if do_figs:
-        fig_dict['Backward Latents Trajectories'] = visualize_latent_trajs(
-            backward_flow_states.cpu().detach().numpy(),
-            n_trajs=20, log_r=log_r.cpu().detach().numpy())
+        fig_dict = bwd_figs(b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, fig_dict, log_r,
+                 log_z)
 
-        # fig_dict['Backward Pf vs Pb'] = Pf_vs_Pb_fig(b_log_pfs, b_log_pbs, b_log_r)
-        fig_dict['Backward TB Parity Plot'], _ = flow_parity_plot(
-            log_r.to(log_z.device),
-            log_z, b_log_pbs,
-            b_log_pfs)
-        fig_dict['Bwd TB Residual vs R'] = xy_scatter_plot(
-            log_r,
-            torch.abs(log_r.cpu() - log_z.cpu() - b_log_pfs.sum(-1).cpu() + b_log_pbs.sum(-1).cpu()),
-            xaxis_title='Reward',
-            yaxis_title='TB Residual',
+    return metrics, fig_dict, log_r, tb_residual, normed_tb_residual
+
+
+def bwd_figs(b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, fig_dict, log_r,
+             log_z):
+    fig_dict['Backward Latents Trajectories'] = visualize_latent_trajs(
+        backward_flow_states.cpu().detach().numpy(),
+        n_trajs=20, log_r=log_r.cpu().detach().numpy())
+    # fig_dict['Backward Pf vs Pb'] = Pf_vs_Pb_fig(b_log_pfs, b_log_pbs, b_log_r)
+    fig_dict['Backward TB Parity Plot'], _ = flow_parity_plot(
+        log_r.to(log_z.device),
+        log_z, b_log_pbs,
+        b_log_pfs)
+    fig_dict['Bwd TB Residual vs R'] = xy_scatter_plot(
+        log_r,
+        torch.abs(log_r.cpu() - log_z.cpu() - b_log_pfs.sum(-1).cpu() + b_log_pbs.sum(-1).cpu()),
+        xaxis_title='Reward',
+        yaxis_title='TB Residual',
+    )
+    fig_dict['Backward Gauss Params'] = mean_var_fig(b_vars_f, b_means_f,
+                                                     b_vars_b, b_means_b)
+    fig_dict['Bwd Traj Mean Step Sizes'] = mean_flow_step_sizes(backward_flow_states)
+    return fig_dict
+
+
+def analyze_buffer(buffer, discretizer, gfn_model, init_state):
+    sample_inds = torch.arange(len(buffer))
+    num_samples = len(sample_inds)
+    batch_size = len(init_state)
+    num_batches = num_samples // batch_size + int((num_samples % batch_size) != 0)
+    acc = dict(
+        backward_flow_states=[],
+        b_log_pfs=[],
+        b_log_pbs=[],
+        b_means_f=[],
+        b_vars_f=[],
+        b_means_b=[],
+        b_vars_b=[],
+        log_r=[],
+        log_z=[],
+    )
+    for b_ind in range(num_batches):
+        start = b_ind * batch_size
+        end = min((b_ind + 1) * batch_size, num_samples)
+        if start >= end:
+            break
+
+        inds = sample_inds[start:end]
+
+        terminal_state, log_r, crystal_batch, condition = buffer.sample(
+            override_batch=len(init_state),
+            override_sample_inds=inds
         )
-        fig_dict['Backward Gauss Params'] = mean_var_fig(b_vars_f, b_means_f,
-                                                         b_vars_b, b_means_b)
-        fig_dict['Bwd Traj Mean Step Sizes'] = mean_flow_step_sizes(backward_flow_states)
 
-    return metrics, fig_dict
+        terminal_state = terminal_state.to(gfn_model.device)
+        condition = condition.to(gfn_model.device)
+        log_r = log_r.to(gfn_model.device)
+
+        # ---- backward trajectory ----
+        (backward_flow_states, b_log_pfs, b_log_pbs, log_z,
+         b_means_f, b_vars_f, b_means_b, b_vars_b) = gfn_model.get_traj_bwd(
+            terminal_state,
+            discretizer,
+            condition,
+            return_gauss_params=True
+        )
+
+        # ---- append (detach later, not now) ----
+        acc['backward_flow_states'].append(backward_flow_states.cpu())
+        acc['b_log_pfs'].append(b_log_pfs.cpu())
+        acc['b_log_pbs'].append(b_log_pbs.cpu())
+        acc['b_means_f'].append(b_means_f.cpu())
+        acc['b_vars_f'].append(b_vars_f.cpu())
+        acc['b_means_b'].append(b_means_b.cpu())
+        acc['b_vars_b'].append(b_vars_b.cpu())
+        acc['log_r'].append(log_r.cpu())
+        acc['log_z'].append(log_z.cpu())
+    backward_flow_states = torch.cat(acc['backward_flow_states'], dim=0)
+    b_log_pfs = torch.cat(acc['b_log_pfs'], dim=0)
+    b_log_pbs = torch.cat(acc['b_log_pbs'], dim=0)
+    b_means_f = torch.cat(acc['b_means_f'], dim=0)
+    b_vars_f = torch.cat(acc['b_vars_f'], dim=0)
+    b_means_b = torch.cat(acc['b_means_b'], dim=0)
+    b_vars_b = torch.cat(acc['b_vars_b'], dim=0)
+    log_r = torch.cat(acc['log_r'], dim=0)
+    # log_z may be scalar-per-batch or per-sample
+    log_z = torch.stack(acc['log_z']).mean()
+    return log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, log_r
 
 
 def get_buffer_stats(buffer):
@@ -898,7 +967,7 @@ def log_metrics(energy_function,
     # get fraction of samples which are 'reasonable' at this energy,
     en_func = energy_function.energy_function
     sample_is_good = (sample_batch[en_func] < 0) * (sample_batch.packing_coeff > 0.55) * (
-                sample_batch.packing_coeff < 0.95)
+            sample_batch.packing_coeff < 0.95)
     metrics["Reasonable Sample Fraction"] = sample_is_good.float().mean().item()
     metrics = {k: to_loggable(v) for k, v in metrics.items()}
 

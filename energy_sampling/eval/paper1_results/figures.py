@@ -5,13 +5,14 @@ import torch
 from scipy.stats import linregress
 from umap import UMAP
 
-from mxtaltools.common.utils import get_point_density
+from mxtaltools.common.utils import get_point_density_knn
 from mxtaltools.reporting.utils import lightweight_one_sided_violin
 import numpy as np
 import plotly.colors as pc
 
 
-def make_thermo_table(Zb, basin_probs, Fb, mean_E, min_ens, Sb, mean_rho, hard_assignment, num_clusters: int):
+def make_thermo_table(Zb, basin_probs, Fb, mean_E, min_ens, Sb, mean_rho, hard_assignment, num_clusters: int,
+                      units: str):
     top_inds = torch.argsort(Zb, descending=True)[:num_clusters]
 
     a, b, = np.unique(hard_assignment.cpu().numpy(), return_counts=True)
@@ -27,13 +28,13 @@ def make_thermo_table(Zb, basin_probs, Fb, mean_E, min_ens, Sb, mean_rho, hard_a
     rho_vals = mean_rho[top_inds].cpu().numpy()
 
     table_columns = {
-        "Basin": basin_ids,
+        "Cluster": basin_ids,
         r"$p$": [f"{x:.3f}" for x in p_vals],
         r"$p_{\mathrm{hard}}$": [f"{x:.3f}" for x in cluster_members],
-        r"$\Delta F\ (\mathrm{kJ/mol})$": [f"{x:.2f}" for x in F_vals],
-        r"$\langle E \rangle\ (\mathrm{kJ/mol})$": [f"{x:.2f}" for x in Emean_vals],
-        r"$E_{\min}\ (\mathrm{kJ/mol})$": [f"{x:.2f}" for x in Emin_vals],
-        r"$\Delta S_{\mathrm{eff}}\ (\mathrm{kJ/mol})$": [f"{x:.2f}" for x in S_vals],
+        rf"$\Delta F\ (\mathrm{{{units}}})$": [f"{x:.2f}" for x in F_vals],
+        rf"$\langle E \rangle\ (\mathrm{{{units}}})$": [f"{x:.2f}" for x in Emean_vals],
+        rf"$E_{{\min}}\ (\mathrm{{{units}}})$": [f"{x:.2f}" for x in Emin_vals],
+        rf"$\Delta S_{{\mathrm{{eff}}}}\ (\mathrm{{{units}}})$": [f"{x:.2f}" for x in S_vals],
         r"$c_p$": [f"{x:.3f}" for x in rho_vals],
     }
 
@@ -128,7 +129,7 @@ def add_violin(fig, samples, name, color, row, col, ranges, n_kde, bw_factor):
         row=row, col=col)
 
 
-def general_figs(fig_dict, sample_batch, sample_energy, data_batch):
+def general_figs(fig_dict, sample_batch, sample_energy, data_batch, units):
     fig = sample_batch.plot_batch_staircase(space='real', return_fig=True, show=False)
     fig.update_xaxes(tickfont=dict(size=15))
     fig.update_yaxes(tickfont=dict(size=15))
@@ -141,13 +142,15 @@ def general_figs(fig_dict, sample_batch, sample_energy, data_batch):
                                                                         # quantiles=[0.1],
                                                                         override_energy=sample_energy, return_fig=True,
                                                                         show=False)
+    fig_dict['std_marginals_fig'].update_traces(name="Prior Dataset",
+                                                selector=dict(name="Reference"))
     fig_dict['std_marginals_fig'].update_annotations(font_size=20)
 
     fig_dict['density_funnel_fig'] = sample_batch.plot_batch_density_funnel(
         override_energy=sample_energy * sample_batch.num_atoms,
         return_fig=True, show=False,
         max_y_quantile=0.99,
-        overwrite_yaxis_title=r"Lattice Energy (kJ/mol)")
+        overwrite_yaxis_title=rf"Lattice Energy ({units})")
     return fig_dict
 
 
@@ -170,7 +173,8 @@ def cluster_comparison_fig(top_cluster_inds,
     titles[6] = 'Phi'
     titles[7] = 'r'
 
-    fig = make_subplots(rows=num_clusters, cols=n_cols, subplot_titles=titles, horizontal_spacing=0.02, vertical_spacing=0.02)
+    fig = make_subplots(rows=num_clusters, cols=n_cols, subplot_titles=titles, horizontal_spacing=0.02,
+                        vertical_spacing=0.02)
     for ind in range(min(num_clusters, len(top_cluster_inds))):
         row = ind + 1
         # weights = basin_weights[:, top_cluster_inds[ind]]
@@ -193,7 +197,7 @@ def cluster_comparison_fig(top_cluster_inds,
         y = sample_energy[cluster_bools].numpy()
         xy = np.vstack([x, y])
         try:
-            c = get_point_density(xy, bins=50)
+            c = get_point_density_knn(xy)
         except:
             c = np.ones(len(xy))
         fig.add_trace(go.Scatter(
@@ -214,17 +218,11 @@ def cluster_comparison_fig(top_cluster_inds,
                    bw_factor=0.05,
                    ranges=[0, len_rat.amax()])
 
-        for cind in range(3):
+        for cind in range(6):
             add_violin(fig, sample_latents[:, 6 + cind], name='', color='grey', row=row,
                        col=3 + cind, n_kde=200, bw_factor=0.1, ranges=[-1, 1])
             add_violin(fig, sample_latents[:, 6 + cind][cluster_bools], name='', color=cluster_color[ind], row=row,
                        col=3 + cind, n_kde=200, bw_factor=0.1, ranges=[-1, 1])
-
-        for cind in range(3):
-            add_violin(fig, sample_latents[:, 8 + cind], name='', color='grey', row=row,
-                       col=6 + cind, n_kde=200, bw_factor=0.1, ranges=[-1, 1])
-            add_violin(fig, sample_latents[:, 8 + cind][cluster_bools], name='', color=cluster_color[ind], row=row,
-                       col=6 + cind, n_kde=200, bw_factor=0.1, ranges=[-1, 1])
 
     x_range = [0.55, 0.95]
     y_range = [torch.amin(sample_energy), min(0, torch.quantile(sample_energy, 0.95))]
@@ -235,7 +233,7 @@ def cluster_comparison_fig(top_cluster_inds,
     fig.update_layout(
         paper_bgcolor="white",
         plot_bgcolor="white",
-        margin=dict(l=40, r=20, t=20, b=40),
+        margin=dict(l=40, r=20, t=60, b=40),
     )
 
     # Dark axis styling
@@ -276,16 +274,16 @@ def cluster_comparison_fig(top_cluster_inds,
 
 
 def dim_reduction_fig(dmat, hard_assignment, clusters_to_analyze, cluster_color, basin_inds,
-                      n_neighbors=10, min_dist = 0.01):
+                      n_neighbors=10, min_dist=0.05):
     "Umap visualization"
     umap_model = UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=min_dist, metric='precomputed')
-    sample_embedding = umap_model.fit_transform(dmat)
+    sample_embedding = umap_model.fit_transform(dmat.numpy().astype(np.float64))
 
     fig = go.Figure()
     fig.add_scatter(x=sample_embedding[:, 0],
                     y=sample_embedding[:, 1],
                     mode='markers', opacity=0.75,
-                    marker_size=6,
+                    marker_size=4,
                     showlegend=False, marker_color='grey')
     masks = np.array([hard_assignment == ind for ind in np.unique(hard_assignment)])
     mask_sorts = np.argsort([sum(m) for m in masks])[::-1]
@@ -296,10 +294,13 @@ def dim_reduction_fig(dmat, hard_assignment, clusters_to_analyze, cluster_color,
         fig.add_scatter(x=sample_embedding[m, 0],
                         y=sample_embedding[m, 1],
                         mode='markers', opacity=0.75,
-                        marker_size=8,
+                        marker_size=4,
                         name=f"Cluster {ind + 1}",
                         legendgroup=f"Cluster {ind + 1}",
-                        showlegend=False, marker_color=cluster_color[ind])
+                        showlegend=False, marker_color=cluster_color[ind],
+                        # marker_line_color='grey',
+                        # marker_line_width=0.5,
+                        )
         fig.add_scatter(x=[sample_embedding[basin_inds[c_ind], 0]],
                         y=[sample_embedding[basin_inds[c_ind], 1]],
                         mode='markers', opacity=1.0,
@@ -318,6 +319,7 @@ def dim_reduction_fig(dmat, hard_assignment, clusters_to_analyze, cluster_color,
     fig.update_yaxes(tickfont=dict(color="rgba(0,0,0,0)", size=1))
     fig.update_layout(font=dict(size=16))
     fig.update_layout(plot_bgcolor='rgb(255,255,255)')
+
     fig.update_layout(
         legend=dict(
             orientation="h",
@@ -334,8 +336,6 @@ def dim_reduction_fig(dmat, hard_assignment, clusters_to_analyze, cluster_color,
 
 
 def boltzmann_fig(sample_energy, kT, learned_log_Z, logp_est):
-
-
     boltzmann_logprobs = -sample_energy / kT - learned_log_Z  # unconditional boltzmann factor
     y = logp_est.cpu().detach()
     x = boltzmann_logprobs.cpu().detach()
@@ -346,7 +346,7 @@ def boltzmann_fig(sample_energy, kT, learned_log_Z, logp_est):
 
     xy = np.vstack([x.cpu().detach().numpy(), y.cpu().detach().numpy()])
     try:
-        c = get_point_density(xy, bins=50)
+        c = get_point_density_knn(xy)
     except:
         c = np.ones(len(xy))
 
@@ -379,7 +379,7 @@ def boltzmann_fig(sample_energy, kT, learned_log_Z, logp_est):
         rs.append(linreg.rvalue)
 
     xx = np.linspace(torch.quantile(x, 0.025), xmax, 300)
-    med_q = -1 # len(quantiles) // 2
+    med_q = -1  # len(quantiles) // 2
     yy_med = slopes[med_q] * xx + intercepts[med_q]
 
     # y = x reference
@@ -423,9 +423,9 @@ def boltzmann_fig(sample_energy, kT, learned_log_Z, logp_est):
         align='left',
         text=(
             "Upper 90th Pctl. Regression<br>"
-            f"Slope = {slopes[med_q]:.3f}<br>"
-            f"Intercept = {intercepts[med_q]:.3f}<br>"
-            f"R = {rs[med_q]:.3f}<br>"
+            f"Slope = {slopes[med_q]:.3g}<br>"
+            f"Intercept = {intercepts[med_q]:.3g}<br>"
+            f"R = {rs[med_q]:.3g}<br>"
         ),
         font=dict(size=20)
     )
@@ -530,3 +530,117 @@ def rugged_pes_fig():
     )
 
     fig.show()
+
+
+def parity_fig(
+        x_raw,
+        y_raw,
+        x_label='Target (Pf + R)',
+        y_label='Model (Pb + Z)',
+):
+    """
+    Pure parity plot with a single global regression.
+    """
+
+    # tensors → cpu
+    x = x_raw.detach().cpu().float()
+    y = y_raw.detach().cpu().float()
+
+    # limits
+    xmin = y.min()  # min(x.min(), y.min())
+    xmax = max(x.max(), y.max())
+    pad = 0.02 * (xmax - xmin)
+    xmin -= pad
+    xmax += pad
+
+    # density coloring
+    xy = np.vstack([x.numpy(), y.numpy()])
+    try:
+        c = get_point_density_knn(xy)
+    except Exception:
+        c = np.ones(len(x))
+
+    # regression
+    linreg = linregress(x.numpy(), y.numpy())
+    slope, intercept, r = linreg.slope, linreg.intercept, linreg.rvalue
+
+    xx = np.linspace(xmin, xmax, 300)
+    yy = slope * xx + intercept
+
+    fig = go.Figure()
+
+    # scatter
+    fig.add_scatter(
+        x=x,
+        y=y,
+        mode='markers',
+        marker=dict(
+            size=6,
+            color=c,
+            colorscale='Viridis',
+            opacity=0.55,
+            line=dict(width=0),
+        ),
+        showlegend=False,
+    )
+
+    # y = x reference
+    fig.add_scatter(
+        x=xx,
+        y=xx,
+        mode='lines',
+        line=dict(color='gray', width=3, dash='dash'),
+        showlegend=False,
+    )
+
+    # regression line
+    fig.add_scatter(
+        x=xx,
+        y=yy,
+        mode='lines',
+        line=dict(color='black', width=4),
+        showlegend=False,
+    )
+
+    # annotation
+    fig.add_annotation(
+        x=0.02,
+        y=0.98,
+        xref='paper',
+        yref='paper',
+        showarrow=False,
+        align='left',
+        text=(
+            f"Slope = {slope:.2g}<br>"
+            f"Intercept = {intercept:.3g}<br>"
+            f"R = {r:.2g}"
+        ),
+        font=dict(size=20)
+    )
+
+    # layout
+    fig.update_layout(
+        template='simple_white',
+        xaxis=dict(
+            title=x_label,
+            range=[xmin, xmax],
+            showline=True,
+            zeroline=True,
+            zerolinecolor='grey',
+            zerolinewidth=0.5,
+        ),
+        yaxis=dict(
+            title=y_label,
+            range=[xmin, xmax],
+            showline=True,
+            zeroline=True,
+            zerolinecolor='grey',
+            zerolinewidth=0.5,
+            scaleanchor='x',
+            scaleratio=1,
+        ),
+        margin=dict(l=70, r=20, t=40, b=60),
+        font_size=24,
+    )
+
+    return fig

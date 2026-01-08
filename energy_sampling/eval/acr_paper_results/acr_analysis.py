@@ -21,7 +21,7 @@ def sample_and_analyze(model_path, config_path, molecule, max_z_prime, batch_siz
     gfn_model.eval()
 
     "Sample from GFN & process samples"
-    sample_batch, sample_latents, sample_energy, sample_cp, samples = get_gfn_samples(
+    sample_batch, sample_latents, sample_energy, sample_cp, samples, pfs, pbs = get_gfn_samples(
         num_samples, max_z_prime,
         device, n_steps, batch_size, gfn_model,
         energy_function, molecule, sg_ind, zp

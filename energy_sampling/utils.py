@@ -292,7 +292,8 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
                     predictor=uma_predictor, std_orientation=True).cpu().detach() * 96.485
                 out.update({'uma_gas_pot': gas_en,
                             'uma_pot': cry_en,
-                            'uma': cry_en / (crystal_batch.sym_mult * crystal_batch.z_prime) - gas_en})  # lattice energy
+                            'uma': cry_en / (
+                                    crystal_batch.sym_mult * crystal_batch.z_prime) - gas_en})  # lattice energy
 
             outputs.append(out)
             cursor += batch_size
@@ -584,41 +585,79 @@ def get_annealing_factor(start_value, stop_value, total_time, step_iters):
     return (stop_value / start_value) ** (1 / (total_time / step_iters))
 
 
-def substitute_prior(loss_coeffs, condition, crystal_batch, energy_function, rewards, samples, buffer):
+@torch.no_grad()
+def substitute_prior(noised_fraction, noise_level, crystal_batch, energy_function, rewards, samples, buffer):
     # noise buffer samples with gaussian magnitude steps
     rand_dir = torch.randn_like(samples)
     rand_dir = rand_dir / rand_dir.norm(dim=-1, keepdim=True)
-    rand_magnitude = torch.randn(len(samples), device=samples.device).abs() * loss_coeffs.noise_level
+    rand_magnitude = torch.randn(len(samples), device=samples.device).abs() * noise_level
+
     noised_samples = (samples + rand_dir * rand_magnitude[:, None]).clip(min=-1, max=1)
-    new_samples = samples.clone()
-    if loss_coeffs.noised_fraction < 1:
-        num_to_replace = max(1, int(len(samples) * loss_coeffs.noised_fraction))
+
+    if noised_fraction < 1:
+        new_samples = samples.clone()
+        num_to_replace = max(1, int(len(samples) * noised_fraction))
         inds_to_replace = np.random.choice(len(samples), num_to_replace, replace=False)
         new_samples[inds_to_replace] = noised_samples[inds_to_replace]
     else:
         new_samples = noised_samples
 
     # have to update the rewards if we are using any loss functions that require them
-    # otherwise, if we're not using the reward, just pass the raw sample
-    # recondition and rescore
-    if any([
-        loss_coeffs.tb > 0,
-        loss_coeffs.vg_lb > 0,
-        loss_coeffs.vg_lme > 0,
-    ]):
-        log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(crystal_batch,
-                                                                                   sg_inds=crystal_batch.sg_ind,
-                                                                                   z_primes=crystal_batch.z_prime)
-        if log_T_tensor is not None:
-            log_temperature = log_T_tensor
-        else:
-            log_temperature = None
-        with torch.no_grad():
-            # todo update this when the time comes for conditional rotation business
-            crystal_batch.orient_molecule(mode='std')
-            new_rewards = energy_function.log_reward(new_samples.to(energy_function.device),
-                                                     crystal_batch.to(energy_function.device),
-                                                     log_temperature.to(energy_function.device),
-                                                     False)
+    log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(
+        crystal_batch,
+        sg_inds=crystal_batch.sg_ind,
+        z_primes=crystal_batch.z_prime)
+
+    if log_T_tensor is not None:
+        log_temperature = log_T_tensor
+    else:
+        log_temperature = None
+
+    with torch.no_grad():
+        crystal_batch.orient_molecule(mode='std')
+        new_rewards = energy_function.log_reward(new_samples.to(energy_function.device),
+                                                 crystal_batch.to(energy_function.device),
+                                                 log_temperature.to(energy_function.device),
+                                                 False).to(samples.device)
 
     return condition, new_rewards, new_samples, crystal_batch
+
+def noise_buffer(max_noise_level, noised_fraction, buffer, energy_function, reward_range,
+                 sample_inds: Optional[torch.Tensor] = None):
+    # sample full buffer
+    samples, rewards, crystal_batch, condition = buffer.sample(
+        override_batch=len(buffer),
+        randomize_orientations=False,
+        override_sampler=None,
+        override_sample_inds=sample_inds,
+    )
+
+    sample_record = []
+    reward_record = []
+    noise_level = 0
+    while True:
+        noise_level += 0.01
+        if noise_level > 0:
+            condition, noised_rewards, noised_samples, crystal_batch = substitute_prior(
+                noised_fraction, noise_level, crystal_batch.clone(),
+                energy_function, rewards, samples, buffer)
+        else:
+            noised_rewards = rewards.clone()
+            noised_samples = samples.clone()
+
+        reward_record.extend(noised_rewards.detach().cpu())
+        sample_record.extend(noised_samples)
+        rewards_within_range = noised_rewards >= (rewards - reward_range)
+
+        if rewards_within_range.float().mean() < 0.5:
+            break
+        if noise_level >= max_noise_level:
+            break
+
+    return reward_record, sample_record
+
+
+def stdz(x):
+    return (x - x.mean()) / x.std()
+
+

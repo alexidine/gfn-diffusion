@@ -45,7 +45,8 @@ class CrystalReplayBuffer:
         self.staging_buffer = []
         self.noised_buffer_length = noised_buffer_length
         self.noised_rewards = torch.zeros(self.noised_buffer_length, dtype=torch.float32, device='cpu')
-        self.noised_samples = torch.zeros((self.noised_buffer_length, 6+6*max_z_prime), dtype=torch.float32, device='cpu')
+        self.noised_samples = torch.zeros((self.noised_buffer_length, 6 + 6 * max_z_prime), dtype=torch.float32,
+                                          device='cpu')
         self.noised_ptr = 0
         self.noised_size = 0
 
@@ -71,8 +72,6 @@ class CrystalReplayBuffer:
 
         assert len(self.dataset) == len(self.x_list) == len(self.rewards_list)
 
-        # self.init_loader()  # never used
-
     def incorporate_staging_buffer(self):
         if len(self.staging_buffer) > 0:  # will fail if staging buffer is empty
             self.add_samples_to_dataset(self.staging_buffer, skip_staging=True)
@@ -82,9 +81,6 @@ class CrystalReplayBuffer:
                 self.truncate_buffer()
 
             assert len(self.dataset) == len(self.x_list) == len(self.rewards_list)
-
-        # self.init_loader()  # never used
-
     def add_samples_to_dataset(self, data_list, skip_staging: bool = False):
         # batch samples
         if not skip_staging:
@@ -259,7 +255,7 @@ class CrystalReplayBuffer:
     @torch.no_grad()
     def get_sampler_weights(self,
                             diversity_coeff,
-                            eps: float = 1e-6,
+                            eps: float = 1e-3,
                             override_method: Optional[str] = None):
         if override_method is not None:
             method = override_method
@@ -267,28 +263,37 @@ class CrystalReplayBuffer:
             method = self.prioritized
 
         if method is not None:
-            scores = np.array(self.rewards_list)
-            if diversity_coeff > 0:
-                x_tensor = torch.stack(self.x_list).to(self.device)
-                if len(x_tensor) > 1000:
-                    subsample_inds = np.random.choice(len(self), 1000, replace=False)
-                    scores -= diversity_coeff * ((compute_sample_overlap(x_tensor[subsample_inds].float(),
-                                                                         x_tensor.float(),
-                                                                         ga=0.01,
-                                                                         agg='sum')).cpu().detach().numpy() - 1)  # subtract self contribution
-                else:
-                    scores -= diversity_coeff * ((compute_sample_overlap(x_tensor.float(),
-                                                                         ga=0.01,
-                                                                         agg='sum')).cpu().detach().numpy() - 1)  # subtract self contribution
+            if method in ['rank', 'boltzmann']:
+                scores = np.array(self.rewards_list)
+                if diversity_coeff > 0:
+                    x_tensor = torch.stack(self.x_list).to(self.device)
+                    if len(x_tensor) > 1000:
+                        subsample_inds = np.random.choice(len(self), 1000, replace=False)
+                        scores -= diversity_coeff * ((compute_sample_overlap(x_tensor[subsample_inds].float(),
+                                                                             x_tensor.float(),
+                                                                             ga=0.01,
+                                                                             agg='sum')).cpu().detach().numpy() - 1)  # subtract self contribution
+                    else:
+                        scores -= diversity_coeff * ((compute_sample_overlap(x_tensor.float(),
+                                                                             ga=0.01,
+                                                                             agg='sum')).cpu().detach().numpy() - 1)  # subtract self contribution
 
-        if method == 'rank':
-            ranks = np.argsort(np.argsort(-1 * scores))
-            weights_i = 1.0 / (self.rank_weight * len(scores) + ranks)
-        elif method == 'boltzmann':
-            logits = self.beta * scores
-            logits -= np.max(logits)  # subtract max for stability
-            weights_i = np.nan_to_num(np.exp(logits)) + eps  # all samples need nonzero probability
-        else:  # uniform weights
+                if method == 'rank':
+                    ranks = np.argsort(np.argsort(-1 * scores))
+                    weights_i = 1.0 / (self.rank_weight * len(scores) + ranks)
+                elif method == 'boltzmann':
+                    logits = self.beta * scores
+                    logits -= np.max(logits)  # subtract max for stability
+                    weights_i = np.nan_to_num(np.exp(logits)) + eps  # all samples need nonzero probability
+            elif method in ['loss']:
+                scores = np.array(self.rewards_list)
+                logits = self.beta * scores
+                logits -= np.max(logits)  # subtract max for stability
+                energy_weight = np.nan_to_num(np.exp(logits)) + eps
+                losses = np.array(self.losses_list)
+                loss_weight = (eps + losses) ** 1
+                weights_i = energy_weight * loss_weight
+        else:
             weights_i = np.ones(len(self.x_list))
 
         return weights_i / np.sum(weights_i)  # enforce explicit normalization
@@ -299,7 +304,8 @@ class CrystalReplayBuffer:
                return_preload: Optional[bool] = False,
                override_sampler: Optional[str] = None,
                randomize_orientations: Optional[bool] = False,
-               standardize_orientations: Optional[bool] = False,
+               return_sample_inds: Optional[bool] = False,
+               override_sample_inds: Optional[torch.Tensor] = None,
                ):
 
         if override_batch is not None:
@@ -308,6 +314,8 @@ class CrystalReplayBuffer:
         # manual dataloader
         if return_preload:
             rand_inds = self.original_dataset_inds
+        elif override_sampler is not None:
+            rand_inds = override_sample_inds
         else:
             if self.batch_size > len(self):
                 rand_inds = np.arange(len(self))
@@ -320,21 +328,24 @@ class CrystalReplayBuffer:
                                                 override_method=override_sampler)
 
         sample_batch = collate_data_list([self.dataset[ind] for ind in rand_inds],
-                                         max_z_prime=self.max_z_prime, exclude_keys=['symmetry_operators'])
+                                         max_z_prime=self.max_z_prime,
+                                         exclude_keys=['symmetry_operators']
+                                         )
 
         if randomize_orientations:
-            # this is a form of sample augmentation, where we rotate the molecule and its applied orientation
-            # in order to construct the identical crystal, but with a distinct conditioning vector & sample
-            # also rotate the embedding vector which is passed to conditioning
-            random_rotations = torch.tensor(
-                Rotation.random(num=sample_batch.num_graphs).as_matrix(),
-                device=sample_batch.device, dtype=torch.float32)
-            sample_batch.orient_molecule(mode='std')
-            sample_batch.orient_molecule(mode='random',  # important that the rotation is applied *from* the standard
-                                         include_inversion=False,
-                                         correct_orientation=True,
-                                         override_random_rotations=random_rotations)
-            sample_batch.embedding = sample_batch.rotate_embedding(random_rotations)
+            assert False, "Orientation work currently deprecated"
+            # # this is a form of sample augmentation, where we rotate the molecule and its applied orientation
+            # # in order to construct the identical crystal, but with a distinct conditioning vector & sample
+            # # also rotate the embedding vector which is passed to conditioning
+            # random_rotations = torch.tensor(
+            #     Rotation.random(num=sample_batch.num_graphs).as_matrix(),
+            #     device=sample_batch.device, dtype=torch.float32)
+            # sample_batch.orient_molecule(mode='std')
+            # sample_batch.orient_molecule(mode='random',  # important that the rotation is applied *from* the standard
+            #                              include_inversion=False,
+            #                              correct_orientation=True,
+            #                              override_random_rotations=random_rotations)
+            # sample_batch.embedding = sample_batch.rotate_embedding(random_rotations)
 
         # if standardize_orientations:
         #     assert not randomize_orientations
@@ -350,7 +361,11 @@ class CrystalReplayBuffer:
             sample_batch, temperature)  # recompute reward in case parameters have changed
 
         latents = sample_batch.latent_params()
-        return latents, reward, sample_batch, condition
+
+        if return_sample_inds:
+            return latents, reward, sample_batch, condition, rand_inds
+        else:
+            return latents, reward, sample_batch, condition
 
     def init_loader(self):
         self.loader = DataLoader(

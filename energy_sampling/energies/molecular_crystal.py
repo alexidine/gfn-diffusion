@@ -1,12 +1,13 @@
 import copy
 import gc
+from time import sleep
 from typing import Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from mxtaltools.common.utils import log_rescale_positive
+from mxtaltools.common.utils import log_rescale_positive, is_cuda_oom
 from mxtaltools.constants.space_group_feature_tensor import SG_FEATURE_TENSOR
 from mxtaltools.constants.space_group_info import SYM_OPS
 from mxtaltools.dataset_utils.data_classes import MolCrystalData
@@ -87,6 +88,7 @@ class MolecularCrystal(BaseSet):
 
         self.temperature = temperature  # for static temperature work
         self.energy_clip = None
+        self.reward_clip = None
 
         self.batch = collate_data_list([MolCrystalData(max_z_prime=max_z_prime)], max_z_prime=max_z_prime)
 
@@ -108,8 +110,8 @@ class MolecularCrystal(BaseSet):
         max_reward = max(dataset_rewards)
         reward_range = self.reward_range
         min_allowed_reward = max_reward - reward_range
-        self.energy_clip = float(
-            - min_allowed_reward * self.temperature)  # convert the minimum allowed reward to a clip on the energy
+        self.energy_clip = float(- min_allowed_reward * self.temperature)  # convert the minimum allowed reward to a clip on the energy
+        self.reward_clip = min_allowed_reward
 
     def instantiate_crystals(self, x, mol_batch):
         crystal_batch = self.init_blank_crystal_batch(mol_batch)
@@ -128,6 +130,7 @@ class MolecularCrystal(BaseSet):
 
             if self.energy_function == 'uma':
                 # clear memory
+                assert torch.sum(torch.isnan(crystal_batch.pos)) == 0
                 torch.cuda.empty_cache()
                 gc.collect()
 
@@ -136,7 +139,7 @@ class MolecularCrystal(BaseSet):
                     std_orientation=False) * 96.485  # output in kJ/mol (of unit cells)
                 out.update({'uma_pot': uma_energy,
                             'uma': uma_energy / (
-                                        crystal_batch.sym_mult * crystal_batch.z_prime) - crystal_batch.uma_gas_pot})
+                                    crystal_batch.sym_mult * crystal_batch.z_prime) - crystal_batch.uma_gas_pot})
 
         for key in out.keys():
             crystal_batch.add_graph_attr(out[key], key)
@@ -189,7 +192,7 @@ class MolecularCrystal(BaseSet):
             if self.energy_function in ['lj', 'qlj', 'elj'] and self.lj_rescale is not None:
                 # rescale functions with LJ-type minima to uma statistics
                 lj_mean, lj_std, uma_mean, uma_std = self.lj_rescale
-                atomwise_energy = mol_energy/(crystal_batch.num_atoms / crystal_batch.z_prime)
+                atomwise_energy = mol_energy / (crystal_batch.num_atoms / crystal_batch.z_prime)
                 atomwise_fixed = (atomwise_energy - lj_mean) / lj_std * uma_std + uma_mean
                 mol_energy = atomwise_fixed * (crystal_batch.num_atoms / crystal_batch.z_prime)
 
@@ -338,7 +341,8 @@ class MolecularCrystal(BaseSet):
         :param x:
         :return:
         """
-        energy, crystal_batch = self.analyze_crystal_batch(x, mol_batch, return_batch=True)
+
+        energy, crystal_batch = self.batched_analyze_crystal_batch(x, mol_batch, return_batch=True)
         temperature = 10 ** log_temperature
         sample_temperature = temperature
 
@@ -346,6 +350,53 @@ class MolecularCrystal(BaseSet):
             return energy / sample_temperature, crystal_batch
         else:
             return energy / sample_temperature
+
+    def batched_analyze_crystal_batch(self, x, mol_batch, return_batch=False):
+        if not hasattr(self, 'batch_size'):
+            self.batch_size = len(x)
+        cursor = 0
+        n_samples = len(x)
+        energies = torch.zeros(len(x), dtype=torch.float32, device='cpu')
+        samples = []
+        if 'Crystal' in mol_batch.__class__.__name__:
+            data_list = mol_batch.batch_to_list()
+        else:
+            data_list = mol_batch.to_data_list()
+
+        while cursor < n_samples:
+            try:
+                inds = np.arange(cursor, min(n_samples, cursor + self.batch_size))
+                mol_batch_i = collate_data_list([data_list[ind] for ind in inds])
+
+                outs = self.analyze_crystal_batch(x[inds], mol_batch_i, return_batch=return_batch)
+
+                energies[inds] = outs[0].cpu().detach()
+                if return_batch:
+                    samples.extend(outs[1].cpu().detach().batch_to_list())
+
+                cursor += len(inds)
+                self.batch_size += 1
+
+            except (RuntimeError, ValueError) as e:
+                if is_cuda_oom(e):
+                    self.batch_size = max(int(self.batch_size * 0.8), 1)
+                    print(f"OOM in energy evaluation: dropping batch size to {self.batch_size}")
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    sleep(0.1)
+                else:
+                    raise e
+
+        del outs
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+        if return_batch:
+            return energies.to(x.device), collate_data_list(samples, skip_default_exclusion=True)
+        else:
+            return energies.to(x.device)
 
     def init_blank_crystal_batch(self, mol_batch):  # todo no possible way this is the most efficient way to do this
         if self.sg_conditioning:

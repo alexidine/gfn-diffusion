@@ -2,13 +2,12 @@ import gc
 import os
 from collections import defaultdict
 from copy import deepcopy
-#os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 # os.environ["TORCH_USE_CUDA_DSA"] = "1"
 # os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
 #     "max_split_size_mb:128,garbage_collection_threshold:0.8,expandable_segments:True")
 from time import time
-from typing import Optional
-
+import torch.nn.functional as F
 import numpy as np
 import torch
 import wandb
@@ -23,10 +22,12 @@ from energy_sampling.eval.utils import sample_eval_fwd_trajs
 from energy_sampling.utils import iter_forever, \
     is_cuda_oom, get_annealing_factor, \
     parse_loss_schedules, dict2namespace, update_loss_schedule, \
-    random_discretizer, low_discrepancy_discretizer, low_discrepancy_discretizer2, shifted_equidistant, substitute_prior
-from eval.evaluations import conditional_eval_step, adjust_fig_filesize, log_metrics, fwd_figs, bwd_figs
+    random_discretizer, low_discrepancy_discretizer, low_discrepancy_discretizer2, shifted_equidistant, \
+    noise_buffer, stdz
+from eval.evaluations import adjust_fig_filesize, log_metrics, fwd_figs, bwd_evaluation
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 from models import GFN
+from mxtaltools.common.geometry_utils import crystal_parameter_distmat
 from mxtaltools.common.training_utils import flatten_wandb_params
 from mxtaltools.dataset_utils.data_classes import MolData
 from mxtaltools.dataset_utils.utils import collate_data_list
@@ -159,7 +160,7 @@ class Modeller:
     def increment_batch_size(self, buffer, train_mol_loader, test_mol_loader, batch_growth_increment, step_type,
                              train_iterator, test_iterator):
         if step_type == "Forward":
-            #print("7")
+            # print("7")
             if self.forward_batch_size < self.args.max_fwd_batch_size:
                 new_batch_size = min(self.args.max_fwd_batch_size, max(self.forward_batch_size + 1,
                                                                        int(self.forward_batch_size * batch_growth_increment)))
@@ -309,7 +310,8 @@ class Modeller:
             eval_path = reload_path.replace('train', 'eval')
             config_path = reload_path.replace('train', 'config').replace('.pt', '.npy').replace(
                 '_hit_prior', '').replace('_thermalized', '')
-            state_path = reload_path.replace('_hit_prior', '').replace('_thermalized', '').replace('model_train','modeller_state')
+            state_path = reload_path.replace('_hit_prior', '').replace('_thermalized', '').replace('model_train',
+                                                                                                   'modeller_state')
             self.load_modeller_state(state_path)
 
             gfn_config = np.load(config_path, allow_pickle=True).item()
@@ -600,39 +602,39 @@ class Modeller:
         loss_record = []
 
         self.times['initialization_end'] = time()
-        #print("-1")
+        # print("-1")
 
         with (wandb.init(project="GFN Energy",
                          config=flatten_wandb_params(self.args),
                          name=self.run_name,
                          tags=[self.args.tag])):
-            #print("-0.5")
+            # print("-0.5")
             wandb.watch(gfn_model,
                         log_graph=False,
                         log_freq=1000,
                         log='gradients')  # for gradient logging
-            #print("-0.25")
+            # print("-0.25")
 
             gfn_model.train()
             self.set_detect_anomaly(gfn_model, do_anomaly_detection=False)
-            #print("0")
+            # print("0")
             for step_ind in trange(self.step_ind, self.args.epochs + 1):
-                #print("1")
+                # print("1")
                 metrics = dict()
                 self.step_ind = step_ind
                 if step_ind % 10 == 0:
                     self.set_loss_coeffs(step_ind)
-                #print("2")
+                # print("2")
                 exploration_std = get_exploration_std(step_ind,
                                                       self.args.exploratory,
                                                       self.args.wd_max_steps,
                                                       self.args.exploration_factor,
                                                       self.args.exploration_wd)
-                #print("3")
+                # print("3")
                 self.times['train_step_start'] = time()
                 try:
                     step_type = self.train_logic(buffer, step_ind)
-                    #print("4")
+                    # print("4")
                     train_loss, loss_dict = self.train_step(
                         step_type,
                         energy_function,
@@ -645,12 +647,12 @@ class Modeller:
                         repeats=self.args.repeats,
                         ema_model=ema_model,
                     )
-                    #print("5")
+                    # print("5")
                     if self.args.ema_decay is not None:
                         update_ema(gfn_model, ema_model, decay=self.args.ema_decay)
                     else:
                         ema_model = gfn_model
-                    #print("6")
+                    # print("6")
                     if step_type == 'Forward':
                         fwd_loss = train_loss
                         if loss_dict is not None:
@@ -826,7 +828,7 @@ class Modeller:
                 repeats=repeats,
                 report_losses=True
             )
-            if self.grow_buffer: #energy_function.energy_function == 'uma':  # save expensive stuff
+            if self.grow_buffer:  # energy_function.energy_function == 'uma':  # save expensive stuff
                 del crystal_batch.symmetry_operators, crystal_batch.gfn_energy
                 buffer.add_to_staging(data_batch=crystal_batch.cpu().detach())
             del crystal_batch
@@ -911,21 +913,21 @@ class Modeller:
         if metric > bwd_ceil:
             if update_this_step:
                 self.args.fwd_to_bwd_ratio /= max(1.05, np.exp(coeff * err))
-                #print(f"Firing ceil {metric:.2f}:{bwd_target:.2f}")
+                # print(f"Firing ceil {metric:.2f}:{bwd_target:.2f}")
         elif metric < bwd_floor:
             if update_this_step:
                 # this won't ameliorate below a good threshold - so just set it
                 self.args.fwd_to_bwd_ratio = max(0.5, self.args.fwd_to_bwd_ratio)
                 self.args.fwd_to_bwd_ratio *= 1.1
-                #print(f"Firing floor {metric:.2f}:{bwd_target:.2f}")
+                # print(f"Firing floor {metric:.2f}:{bwd_target:.2f}")
             if do_backward:
                 skip_step = True  # we're already doing too good
         elif update_this_step:
-            self.args.fwd_to_bwd_ratio *= np.exp(-coeff * err)  # this is very negative -> pushes towards bwd, which is good
+            self.args.fwd_to_bwd_ratio *= np.exp(
+                -coeff * err)  # this is very negative -> pushes towards bwd, which is good
 
         self.args.fwd_to_bwd_ratio = np.clip(
             self.args.fwd_to_bwd_ratio, 0.1, 10)  # need even enough ratios to get reasonable updates to the metrics
-
 
         return skip_step
 
@@ -969,18 +971,25 @@ class Modeller:
                 samples, rewards, crystal_batch, condition = buffer.sample(
                     override_batch=int(self.backward_batch_size),
                     randomize_orientations=True if self.args.molecule_conditioning else False,
+                    override_sampler=None,
+                    return_sample_inds=False,
                 )
             else:
                 assert False, f"sampling method {self.args.sampling} not implemented"
 
             if self.args.bwd_loss_coeffs.noised_fraction > 0:
-                if buffer.noised_size <= 10*self.backward_batch_size or (step_ind % 10 == 0):  # draw noised samples
-                    condition, rewards, samples, crystal_batch = substitute_prior(
-                        self.args.bwd_loss_coeffs, condition, crystal_batch,
-                        energy_function, rewards, samples, buffer)
-                    if self.grow_buffer:
-                        buffer.add_to_staging(data_batch=crystal_batch.cpu().detach())
-                        buffer.add_to_noised(rewards, samples)
+                if buffer.noised_size == 0:  # initialize buffer
+                    print("Initializing noised buffer")
+                    reward_range = 10
+                    reward_record, sample_record = noise_buffer(0.5, 1,
+                                                                buffer, energy_function, reward_range,
+                                                                sample_inds=None)
+
+                    reward_record = torch.tensor(reward_record)
+                    good_inds = torch.argwhere(reward_record >= buffer.reward_clip)
+
+                    buffer.add_to_noised(reward_record[good_inds],
+                                         torch.stack(sample_record)[good_inds])
                 else:
                     rewards, samples = buffer.sample_from_noised(int(self.backward_batch_size))
 
@@ -1047,34 +1056,34 @@ class Modeller:
             raise e  # will simply raise error if other or if training on CPU
         return oomed_out, buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator
 
-
-    def do_conditional_evaluation(self, energy_function, gfn_model, mol_loader,
-                                  ):  # todo these functions could be cleaned up / consolidated
-        self.times['eval_step_start'] = time()
-        eval_discretizer = lambda bsz: uniform_discretizer(bsz, self.args.eval_T)
-
-        eval_batch_size = self.args.eval_batch_size
-
-        eval_rands = np.random.randint(len(mol_loader.dataset), size=eval_batch_size)
-        mol_batch = collate_data_list([mol_loader.dataset[ind] for ind in eval_rands]).to(self.device)
-
-        if self.args.molecule_conditioning:
-            self.scramble_mol_and_embedding(mol_batch)
-
-        init_state = get_gfn_init_state(eval_batch_size, energy_function.data_ndim, self.device)
-
-        eval_metrics = {}
-        eval_metrics.update(
-            conditional_eval_step(energy_function,
-                                  gfn_model,
-                                  eval_discretizer,
-                                  init_state,
-                                  mol_batch,
-                                  mols_to_sample=5,
-                                  sample_sgs=self.args.space_groups if self.args.sg_conditioning else None,
-                                  ))
-
-        return eval_metrics
+    #
+    # def do_conditional_evaluation(self, energy_function, gfn_model, mol_loader,
+    #                               ):  # todo these functions could be cleaned up / consolidated
+    #     self.times['eval_step_start'] = time()
+    #     eval_discretizer = lambda bsz: uniform_discretizer(bsz, self.args.eval_T)
+    #
+    #     eval_batch_size = self.args.eval_batch_size
+    #
+    #     eval_rands = np.random.randint(len(mol_loader.dataset), size=eval_batch_size)
+    #     mol_batch = collate_data_list([mol_loader.dataset[ind] for ind in eval_rands]).to(self.device)
+    #
+    #     if self.args.molecule_conditioning:
+    #         self.scramble_mol_and_embedding(mol_batch)
+    #
+    #     init_state = get_gfn_init_state(eval_batch_size, energy_function.data_ndim, self.device)
+    #
+    #     eval_metrics = {}
+    #     eval_metrics.update(
+    #         conditional_eval_step(energy_function,
+    #                               gfn_model,
+    #                               eval_discretizer,
+    #                               init_state,
+    #                               mol_batch,
+    #                               mols_to_sample=5,
+    #                               sample_sgs=self.args.space_groups if self.args.sg_conditioning else None,
+    #                               ))
+    #
+    #     return eval_metrics
 
     def scramble_mol_and_embedding(self, mol_batch):
         random_rotations = torch.tensor(
@@ -1126,9 +1135,9 @@ class Modeller:
         dataset = [dataset[ind] for ind in good_inds]
 
         # filter near-identical samples
-        d_cut = 0.01
+        d_cut = 0.0001
         latents = collate_data_list(dataset).latent_params()
-        dmat = torch.cdist(latents, latents)
+        dmat = crystal_parameter_distmat(latents)
         keep = torch.zeros(len(latents), dtype=bool, device=latents.device)
 
         for i in range(len(latents)):
@@ -1193,14 +1202,12 @@ class Modeller:
         self.times['eval_buffering_start'] = time()
         if len(buffer.staging_buffer) > 0:
             buffer.incorporate_staging_buffer()
-
         self.times['eval_buffering_end'] = time()
 
         self.times['eval_log_metrics_start'] = time()
         '''fwd analysis'''
         metrics.update(log_metrics(energy_function, log_Z, log_Z_lb, log_Z_learned, log_r,
                                    sample_batch, log_T_tensor, log_pfs, log_pbs, self.args, buffer))
-
         self.times['eval_log_metrics_end'] = time()
         self.times['eval_figs_start'] = time()
         if do_figs:
@@ -1225,13 +1232,39 @@ class Modeller:
                                             self.device)
 
             self.times['eval_bwd_figs_start'] = time()
-            bwd_metrics, bwd_fig_dict = bwd_figs(
+            bwd_metrics, bwd_fig_dict, rewards, btb_residual, normed_btb_residual = bwd_evaluation(
                 buffer, gfn_model,
                 init_state, eval_discretizer,
                 do_figs=do_figs)
             self.times['eval_bwd_figs_end'] = time()
             metrics.update(bwd_metrics)
             fig_dict.update(bwd_fig_dict)
+
+            if buffer.noised_size > 0:
+                # also refresh the buffer
+                alpha = 0.5
+                eps = 0.05
+                beta = 1.0
+
+                score = alpha * stdz(log_r) + (1 - alpha) * stdz(-normed_btb_residual)
+                weight = F.softmax(beta * score, dim=0)
+
+                weight = (1 - eps) * weight + eps / len(weight)
+                weight = weight.clamp(min=0)
+                weight = weight/weight.sum()
+
+                sample_inds = torch.multinomial(weight, num_samples=1000, replacement=True)
+
+                reward_range = 10
+                reward_record, sample_record = noise_buffer(0.5, 1,
+                                                            buffer, energy_function, reward_range,
+                                                            sample_inds=sample_inds)
+
+                reward_record = torch.tensor(reward_record)
+                good_inds = torch.argwhere(reward_record >= buffer.reward_clip)
+
+                buffer.add_to_noised(reward_record[good_inds],
+                                     torch.stack(sample_record)[good_inds])
 
         '''logging and wrap up'''
         self.times['eval_wrapup_start'] = time()
@@ -1356,14 +1389,14 @@ class Modeller:
         metrics['Fwd to Bwd Ratio'] = self.args.fwd_to_bwd_ratio
 
     def phase1to2(self, ema_model, gfn_model, step_ind):
-        #print("Hit initial KLD threshold. Moving to backward thermalization.")
+        # print("Hit initial KLD threshold. Moving to backward thermalization.")
         self.hit_init_kld = True
         "adjust loss coefficients"
         self.args.bwd_loss_coeffs.bwd_tb_z = 1.0
         self.bwd_loss_schedule['tb'] = [(0, 1.0), (step_ind, 0.1),
-                                             (step_ind + self.args.phase_change_time, 1.0)]
+                                        (step_ind + self.args.phase_change_time, 1.0)]
         self.bwd_loss_schedule['mle'] = [(0, 1.0), (step_ind, 1),
-                                              (step_ind + self.args.phase_change_time, 0.0)]
+                                         (step_ind + self.args.phase_change_time, 0.0)]
         self.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (step_ind, 1.0)]
         self.bwd_loss_schedule['noised_fraction'] = [(0, 0.0), (step_ind, self.args.anchor_noise_fraction)]
         self.bwd_loss_schedule['noise_level'] = [(0, 0.0), (step_ind, self.args.anchor_noise_level)]
@@ -1381,7 +1414,7 @@ class Modeller:
         self.grow_buffer = True
 
     def phase2to3(self, ema_model, gfn_model, init_rat, step_ind):
-        #print("Thermalization complete. Moving to forward training & refinement.")
+        # print("Thermalization complete. Moving to forward training & refinement.")
         self.phase = 3
         "save checkpoint"
         torch.save(gfn_model.state_dict(), f'checkpoints/{self.run_name}_model_train_thermalized.pt')
@@ -1390,7 +1423,7 @@ class Modeller:
         self.args.fwd_to_bwd_ratio = init_rat
         self.bwd_loss_schedule['bwd_tb_z'] = [(0, 1.0), (step_ind, 0)]
         self.fwd_loss_schedule['tb'] = [(0, 1.0), (step_ind, 0.0),
-                                             (step_ind + self.args.phase_change_time // 2, 1.0)]
+                                        (step_ind + self.args.phase_change_time // 2, 1.0)]
         "set cooldown"
         self.increasing_loss_cooldown = self.args.phase_change_time
         self.grow_buffer = True
@@ -1411,8 +1444,8 @@ class Modeller:
             hit_init_kld=self.hit_init_kld,
             forward_batch_size=self.forward_batch_size,
             backward_batch_size=self.backward_batch_size,
-            grow_buffer = self.grow_buffer,
-            best_tb_norm = self.best_tb_norm,
+            grow_buffer=self.grow_buffer,
+            best_tb_norm=self.best_tb_norm,
         )
         torch.save(state, f'checkpoints/{self.run_name}_modeller_state.pt')
 

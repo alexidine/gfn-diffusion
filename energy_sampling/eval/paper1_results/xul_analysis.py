@@ -7,18 +7,18 @@ from energy_sampling.eval.paper1_results.figures import general_figs, cluster_co
     boltzmann_fig, make_thermo_table
 from energy_sampling.eval.paper1_results.utils import get_gfn_samples, \
     cluster_thermo_analysis, get_color_set, get_gfn_logprobs, \
-    kinetic_clustering
+    kinetic_clustering, umap_hdbscan_clustering
 from energy_sampling.models import GFN
 from examples.crystal_search_reporting import batch_compack
 from mxtaltools.analysis.crystal_rdf import compute_rdf_distmat
+from mxtaltools.common.geometry_utils import crystal_parameter_distmat
 from mxtaltools.dataset_utils.utils import collate_data_list
 import plotly.graph_objects as go
 
 torch.cuda.set_per_process_memory_fraction(0.9, device=0)
 
 
-def save_outputs(sample_batch, sample_latents, sample_energy, sample_cp, samples, basin_weights, hard_assignment,
-                 hard_assignment_prob, basin_inds, top_cluster_inds, logp_est, learned_log_Z):
+def save_outputs(sample_batch, sample_energy, sample_cp, samples, logp_est, learned_log_Z):
     results = {
         "version": 1,
 
@@ -35,19 +35,9 @@ def save_outputs(sample_batch, sample_latents, sample_energy, sample_cp, samples
         # --- GFN sampling outputs ---
         "samples": {
             "batch": sample_batch,  # heavy, but sometimes useful
-            "latents": sample_latents,  # (N, D)
             "energy": sample_energy,  # (N,)
             "cp": sample_cp,  # (N,)
             "raw": samples,  # whatever get_gfn_samples returns
-        },
-
-        # --- committor / clustering ---
-        "committor": {
-            "basin_weights": basin_weights,  # (N, B)
-            "hard_assignment": hard_assignment,  # (N,)
-            "hard_assignment_prob": hard_assignment_prob,  # (N,)
-            "basin_inds": basin_inds,  # (B,)
-            "top_cluster_inds": top_cluster_inds,  # (B,)
         },
 
         # --- density / probabilities ---
@@ -68,20 +58,13 @@ def load_results():
     R = torch.load(results_path, weights_only=False)
     # ---- samples ----
     sample_batch = R["samples"].get("batch", None)
-    sample_latents = R["samples"]["latents"].clip(max=1, min=-1)
     sample_energy = R["samples"]["energy"]
     sample_cp = R["samples"]["cp"]
     samples = R["samples"].get("raw", None)
-    # ---- committor ----
-    basin_weights = R["committor"]["basin_weights"]
-    hard_assignment = R["committor"]["hard_assignment"]
-    hard_assignment_prob = R["committor"]["hard_assignment_prob"]
-    basin_inds = R["committor"]["basin_inds"]
-    top_cluster_inds = R["committor"]["top_cluster_inds"]
     # ---- density ----
     logp_est = R["density"]["logp_est"]
     learned_log_Z = R["density"]["learned_log_Z"]
-    return sample_batch, sample_latents, sample_energy, sample_cp, samples, basin_weights, hard_assignment, hard_assignment_prob, basin_inds, top_cluster_inds, logp_est, learned_log_Z
+    return sample_batch, sample_energy, sample_cp, samples, logp_est, learned_log_Z
 
 
 def sample_and_analyze():
@@ -90,14 +73,11 @@ def sample_and_analyze():
     gfn_model.to(device)
     gfn_model.eval()
     "Sample from GFN & process samples"
-    sample_batch, sample_latents, sample_energy, sample_cp, samples = get_gfn_samples(
+    sample_batch, sample_latents, sample_energy, sample_cp, samples, pfs, pbs = get_gfn_samples(
         num_samples, max_z_prime,
         device, n_steps, batch_size, gfn_model,
         energy_function, molecule, sg_ind, zp
     )
-
-    basin_weights, hard_assignment, hard_assignment_prob, basin_inds = kinetic_clustering(
-        sample_latents, sample_energy, cval, clust_kT)
 
     top_cluster_inds = torch.argsort(basin_weights.sum(0), descending=True).flatten()
     'Explicit Density Estimation'
@@ -106,16 +86,14 @@ def sample_and_analyze():
     if save_results:
         if os.path.exists(results_path):
             if overwrite_results:
-                save_outputs(sample_batch, sample_latents, sample_energy, sample_cp, samples, basin_weights,
-                             hard_assignment, hard_assignment_prob, basin_inds, top_cluster_inds, logp_est,
-                             learned_log_Z)
+                save_outputs(sample_batch, sample_energy, sample_cp, samples,
+                             logp_est, learned_log_Z)
             else:
                 pass
         else:
-            save_outputs(sample_batch, sample_latents, sample_energy, sample_cp, samples, basin_weights,
-                         hard_assignment, hard_assignment_prob, basin_inds, top_cluster_inds, logp_est, learned_log_Z)
+            save_outputs(sample_batch, sample_energy, sample_cp, samples,logp_est, learned_log_Z)
 
-    return sample_batch, sample_latents, sample_energy, sample_cp, samples, basin_weights, hard_assignment, hard_assignment_prob, basin_inds, top_cluster_inds, logp_est, learned_log_Z
+    return sample_batch, sample_energy, sample_cp, samples, logp_est, learned_log_Z
 
 
 if __name__ == '__main__':
@@ -142,7 +120,7 @@ if __name__ == '__main__':
     results_path = rf"D:\crystal_datasets\gfn_results\{run_name}_sg{sg_ind}_zp{zp}.pt"
     reload_results = True
     show_figs = True
-    write_figs = False
+    write_figs = True
     save_results = True
     overwrite_results = True
     do_general_vis = True
@@ -159,25 +137,26 @@ if __name__ == '__main__':
     data_latents = data_batch.latent_params()
 
     if reload_results and os.path.exists(results_path):
-        (sample_batch, sample_latents, sample_energy, sample_cp, samples,
-         basin_weights, cluster_labels, cluster_prob, basin_inds,
-         top_cluster_inds, logp_est, learned_log_Z) = load_results()
+        (sample_batch, sample_energy, sample_cp, samples,
+         logp_est, learned_log_Z) = load_results()
     else:
         "Load GFN"
-        (sample_batch, sample_latents, sample_energy, sample_cp, samples,
-         basin_weights, cluster_labels, cluster_prob,
-         basin_inds, top_cluster_inds, logp_est, learned_log_Z) = sample_and_analyze()
+        (sample_batch, sample_energy, sample_cp, samples,
+         logp_est, learned_log_Z) = sample_and_analyze()
 
     """
     Make Figures
     """
-    basin_weights, cluster_labels, cluster_prob, basin_inds = kinetic_clustering(
-        sample_latents, sample_energy, cval, clust_kT)
+    sample_latents = sample_batch.latent_params()
+
+    "redo clustering"
+    dmat = crystal_parameter_distmat(sample_latents).fill_diagonal_(0).detach()
+    basin_weights, cluster_labels, cluster_prob, basin_inds = umap_hdbscan_clustering(
+        dmat, sample_energy)
+
     top_cluster_inds = torch.argsort(basin_weights.sum(0), descending=True).flatten()
     confident_cluster_labels = cluster_labels.clone()
     confident_cluster_labels[cluster_prob < 0.9] = -1
-    clusters_to_analyze = min(len(top_cluster_inds), clusters_to_analyze)
-    cluster_color = get_color_set(clusters_to_analyze, alpha=0.7)
 
     masks = np.array([cluster_labels == ind for ind in np.unique(cluster_labels)])
     mask_sorts = np.argsort([sum(m) for m in masks])[::-1]
@@ -187,24 +166,28 @@ if __name__ == '__main__':
                                                    masks[mask_sorts[:10]] if
                                                    sum(m) > 1])
 
+    clusters_to_analyze = min(len(top_cluster_inds), clusters_to_analyze)
+    cluster_color = get_color_set(clusters_to_analyze, alpha=0.7)
+
 
     '''
     # exp comparisons
-    
     from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
+    
     pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
     predictor = init_uma_crystal_predictor(pred_path, device=device)
     ebatch = collate_data_list(exp_crystals)
     gas_en = ebatch.compute_lattice_gas_phase_uma(predictor,
-                                                 std_orientation=True).cpu().detach() * 96.485
+                                                  std_orientation=True).cpu().detach() * 96.485
     cry_en = ebatch.compute_crystal_uma(predictor=predictor,
-                                       std_orientation=True).cpu().detach() * 96.485
-    exp_uma = sample_batch.uma_pot / (sample_batch.sym_mult * sample_batch.z_prime) - sample_batch.uma_gas_pot
+                                        std_orientation=True).cpu().detach() * 96.485
+    exp_uma = cry_en / (ebatch.sym_mult * ebatch.z_prime) - gas_en
     
     fig = go.Figure(go.Scatter(x=sample_batch.packing_coeff, y=sample_energy, mode='markers'))
     fig.add_scatter(x=ebatch.packing_coeff, y=exp_uma, mode='markers', marker_size=20)
     fig.update_layout(yaxis_range=[-np.inf, 0])
     fig.show()
+
     sample_batch.plot_batch_cell_params(space='real',ref_dist=ebatch.full_cell_parameters(), show=True)
     
     '''
@@ -229,7 +212,7 @@ if __name__ == '__main__':
 
     if do_dimension_reduction:
         assert do_clustering, "Need clusters for dim reduction fig"
-        fig_dict['Dim Reduction'] = dim_reduction_fig(sample_batch.latent_distmat(),
+        fig_dict['Dim Reduction'] = dim_reduction_fig(dmat,
                                                       cluster_labels,
                                                       clusters_to_analyze,
                                                       cluster_color,
@@ -277,7 +260,7 @@ if __name__ == '__main__':
 
         elif key == 'clusters':
             width = 1800
-            height = 1200
+            height = 1000
             fig.update_layout(
                 width=width,
                 height=height,
@@ -303,7 +286,6 @@ if __name__ == '__main__':
 
         if show_figs:
             fig.show()
-
         if write_figs:
             fig.write_image(
                 rf"C:\Users\mikem\OneDrive\NYU\CSD\papers\generator\{run_name}_{key.replace(' ', '_')}.png",
@@ -311,9 +293,8 @@ if __name__ == '__main__':
                 width=width,
                 scale=2)
 
-        aa = 1
 
-    'best samples analysis'  # todo replace with probability maximum
+    'best samples analysis'
     best_samples = [samples[ind] for ind in top_cluster_inds[:clusters_to_analyze]]
     best_batch = collate_data_list(best_samples)
 
