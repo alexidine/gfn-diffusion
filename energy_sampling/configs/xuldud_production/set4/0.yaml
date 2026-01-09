@@ -123,7 +123,7 @@ tag: xul4
 temp_annealing_max_steps: 2000
 temperature_conditioning: false
 temperature_scaling_factor: 0.01
-thermalization_conv_eps: 0.5
+thermalization_conv_eps: 0.2
 traj_length_strategy: static
 uma_path: /scratch/mk8347/models/uma/esen_s.pt
 use_weight_decay: false

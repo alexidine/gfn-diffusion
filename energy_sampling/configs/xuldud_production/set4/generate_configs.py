@@ -48,6 +48,7 @@ if __name__ == "__main__":
             config['energy_function'] = en
             config['energy_static_temperature'] = temp
             config['reward_range'] = rew
+            config['thermalization_conv_eps'] = eps
             config['molecules_path'] = '/scratch/mk8347/csd_runs/datasets/xuldud/xuldud.pt'
             config['buffer_path'] = f'/scratch/mk8347/csd_runs/datasets/xuldud/xuldud_sg{sg}_zp{zp}.pt'
 
