@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from mxtaltools.common.geometry_utils import lat2sph_rotvec
 from mxtaltools.common.utils import log_rescale_positive, is_cuda_oom
 from mxtaltools.constants.space_group_feature_tensor import SG_FEATURE_TENSOR
 from mxtaltools.constants.space_group_info import SYM_OPS
@@ -110,7 +111,8 @@ class MolecularCrystal(BaseSet):
         max_reward = max(dataset_rewards)
         reward_range = self.reward_range
         min_allowed_reward = max_reward - reward_range
-        self.energy_clip = float(- min_allowed_reward * self.temperature)  # convert the minimum allowed reward to a clip on the energy
+        self.energy_clip = float(
+            - min_allowed_reward * self.temperature)  # convert the minimum allowed reward to a clip on the energy
         self.reward_clip = min_allowed_reward
 
     def instantiate_crystals(self, x, mol_batch):
@@ -118,7 +120,7 @@ class MolecularCrystal(BaseSet):
         crystal_batch.latent_to_cell_params(x)
         return crystal_batch
 
-    def analyze_crystal_batch(self, x, mol_batch, return_batch=False):  # x is gfn_outputs
+    def analyze_crystal_batch(self, x, mol_batch,temperature, return_batch=False):  # x is gfn_outputs
         crystal_batch = self.instantiate_crystals(x, mol_batch)
 
         cutoff = 10
@@ -137,15 +139,15 @@ class MolecularCrystal(BaseSet):
                 uma_energy = crystal_batch.compute_crystal_uma(
                     predictor=self.uma_predictor,
                     std_orientation=False) * 96.485  # output in kJ/mol (of unit cells)
-                out.update({'uma_pot': uma_energy,
-                            'uma': uma_energy / (
-                                    crystal_batch.sym_mult * crystal_batch.z_prime) - crystal_batch.uma_gas_pot})
+                out.update({'uma_pot': uma_energy.float(),
+                            'uma': (uma_energy / (
+                                    crystal_batch.sym_mult * crystal_batch.z_prime) - crystal_batch.uma_gas_pot).float()})
 
         for key in out.keys():
             crystal_batch.add_graph_attr(out[key], key)
         crystal_batch.add_graph_attr(log_rescale_positive(out['lj']), 'scaled_lj')
 
-        crystal_energy, ens_dict = self.generator_energy(crystal_batch, raw_latents=x)
+        crystal_energy, ens_dict = self.generator_energy(crystal_batch, temperature, raw_latents=x)
 
         crystal_batch.add_graph_attr(crystal_energy, 'gfn_energy')
 
@@ -161,7 +163,7 @@ class MolecularCrystal(BaseSet):
         else:
             return crystal_energy
 
-    def generator_energy(self, crystal_batch, raw_latents=None):
+    def generator_energy(self, crystal_batch, temperature, raw_latents=None):
         ens_dict = {}
 
         latents = crystal_batch.latent_params()
@@ -222,16 +224,32 @@ class MolecularCrystal(BaseSet):
 
         else:
             assert False, f'{self.energy_function} not implemented'
+
+        latent_rotvecs = crystal_batch.latent_params()[:, -3*crystal_batch.max_z_prime:]
+        sph_rotvec = lat2sph_rotvec(latent_rotvecs, crystal_batch.max_z_prime)
+        sph = sph_rotvec.view(crystal_batch.num_graphs, crystal_batch.max_z_prime, 3)
+        phi = sph[..., 0]  # polar angle
+        r = sph[..., 2]  # rotation magnitude
+        eps = 1e-8
+        jacobian_weight = (
+                torch.sin(r / 2).clamp_min(eps) ** 2
+                * torch.sin(phi).clamp_min(eps)
+        )
+        jacobian_energy = - temperature * torch.log(jacobian_weight.sum(dim=-1))  # sum, because each dim gets its own correction
+
         if self.energy_clip is not None:
 
-            total_energy = log_rescale_positive(crystal_energy,
-                                                self.energy_clip) + bounding_energy * self.bounding_coeff + reduction_energy * self.reduction_coeff
-            return (log_rescale_positive(total_energy, self.energy_clip + 0.1 * np.abs(self.energy_clip)),
+            total_energy = (log_rescale_positive(crystal_energy, self.energy_clip) +
+                            bounding_energy * self.bounding_coeff +
+                            reduction_energy * self.reduction_coeff)
+            return (log_rescale_positive(total_energy, self.energy_clip + 0.1 * np.abs(self.energy_clip)) + jacobian_energy,
                     # to prevent total saturation by the energy function, add a buffer over the clip
                     ens_dict)
         else:
-
-            total_energy = crystal_energy + bounding_energy * self.bounding_coeff + reduction_energy * self.reduction_coeff
+            total_energy = (crystal_energy +
+                            bounding_energy * self.bounding_coeff +
+                            reduction_energy * self.reduction_coeff +
+                            jacobian_energy)
             return total_energy, ens_dict
 
     def compute_zp_order_penalty(self, bounding_energy, crystal_batch):
@@ -316,7 +334,7 @@ class MolecularCrystal(BaseSet):
         else:
             crystal_batch = crystals
 
-        energy, _ = self.generator_energy(crystal_batch)
+        energy, _ = self.generator_energy(crystal_batch, temperature)
 
         if torch.is_tensor(temperature):
             sample_temperature = temperature.to(crystal_batch.device)
@@ -341,17 +359,16 @@ class MolecularCrystal(BaseSet):
         :param x:
         :return:
         """
-
-        energy, crystal_batch = self.batched_analyze_crystal_batch(x, mol_batch, return_batch=True)
         temperature = 10 ** log_temperature
-        sample_temperature = temperature
+        energy, crystal_batch = self.batched_analyze_crystal_batch(x, mol_batch, temperature, return_batch=True)
+
 
         if return_exp:
-            return energy / sample_temperature, crystal_batch
+            return energy / temperature, crystal_batch
         else:
-            return energy / sample_temperature
+            return energy / temperature
 
-    def batched_analyze_crystal_batch(self, x, mol_batch, return_batch=False):
+    def batched_analyze_crystal_batch(self, x, mol_batch, temperature, return_batch=False):
         if not hasattr(self, 'batch_size'):
             self.batch_size = 1000 if self.energy_function != 'uma' else 50
         cursor = 0
@@ -368,19 +385,20 @@ class MolecularCrystal(BaseSet):
                 inds = np.arange(cursor, min(n_samples, cursor + self.batch_size))
                 mol_batch_i = collate_data_list([data_list[ind] for ind in inds])
 
-                outs = self.analyze_crystal_batch(x[inds], mol_batch_i, return_batch=return_batch)
+                outs = self.analyze_crystal_batch(x[inds], mol_batch_i, temperature[inds], return_batch=return_batch)
 
                 energies[inds] = outs[0].cpu().detach()
                 if return_batch:
                     samples.extend(outs[1].cpu().detach().batch_to_list())
 
                 cursor += len(inds)
-                self.batch_size += max(int(self.batch_size * 0.01), 1)
+                if self.batch_size <= 10000:
+                    self.batch_size += max(int(self.batch_size * 0.01), 1)
 
             except (RuntimeError, ValueError) as e:
                 if is_cuda_oom(e):
                     self.batch_size = max(int(self.batch_size * 0.8), 1)
-                    print(f"OOM in energy evaluation: dropping batch size to {self.batch_size}")
+                    #print(f"OOM in energy evaluation: dropping batch size to {self.batch_size}")
                     gc.collect()
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()

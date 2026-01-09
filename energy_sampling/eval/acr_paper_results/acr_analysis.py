@@ -49,7 +49,7 @@ if __name__ == '__main__':
     molecule_path = r"D:\crystal_datasets\acridine\acridine_conformer.pt"
     results_path = rf"D:\crystal_datasets\gfn_results\{run_name}.pt"
     samples_path = rf"D:\crystal_datasets\gfn_results\{run_name}"
-    reload_results = False
+    reload_results = True
 
     os.chdir(model_path)
     models = glob.glob(f'{model_prefix}*eval.pt')

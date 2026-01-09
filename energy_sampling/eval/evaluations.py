@@ -644,9 +644,10 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
 
 
 @torch.no_grad()
-def bwd_evaluation(buffer, gfn_model, init_state, discretizer, do_figs: Optional[bool] = False):
+def bwd_evaluation(buffer, gfn_model, discretizer, batch_size, do_figs: Optional[bool] = False):
+
     log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, log_r = analyze_buffer(
-        buffer, discretizer, gfn_model, init_state)
+        buffer, discretizer, gfn_model, batch_size)
 
     metrics = {}
     fig_dict = {}
@@ -691,8 +692,11 @@ def bwd_evaluation(buffer, gfn_model, init_state, discretizer, do_figs: Optional
     metrics['Bwd Normed Log Z LB Residual'] = ((log_Z_lb - log_Z_learned).abs() / log_Z_lb.abs()).item()
 
     if do_figs:
-        fig_dict = bwd_figs(b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, fig_dict, log_r,
-                 log_z)
+        fig_dict = bwd_figs(b_log_pbs, b_log_pfs,
+                            b_means_b, b_means_f, b_vars_b, b_vars_f,
+                            backward_flow_states,
+                            fig_dict,
+                            log_r, log_z)
 
     return metrics, fig_dict, log_r, tb_residual, normed_tb_residual
 
@@ -719,10 +723,9 @@ def bwd_figs(b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, bac
     return fig_dict
 
 
-def analyze_buffer(buffer, discretizer, gfn_model, init_state):
+def analyze_buffer(buffer, discretizer, gfn_model, batch_size):
     sample_inds = torch.arange(len(buffer))
     num_samples = len(sample_inds)
-    batch_size = len(init_state)
     num_batches = num_samples // batch_size + int((num_samples % batch_size) != 0)
     acc = dict(
         backward_flow_states=[],
@@ -744,7 +747,7 @@ def analyze_buffer(buffer, discretizer, gfn_model, init_state):
         inds = sample_inds[start:end]
 
         terminal_state, log_r, crystal_batch, condition = buffer.sample(
-            override_batch=len(init_state),
+            override_batch=batch_size,
             override_sample_inds=inds
         )
 
@@ -913,7 +916,7 @@ def log_metrics(energy_function,
                 for p in np.linspace(0, 1, 50)
             ])
             metrics['Buffer Noised Length'] = buffer.noised_size
-            metrics['Buffer Noised Mean Reward'] = torch.mean(buffer.noised_rewards)
+            metrics['Buffer Noised Mean Reward'] = torch.mean(buffer.noised_rewards[:buffer.noised_size])
             metrics['Buffer Mean Score'] = np.mean(np.nan_to_num(buffer.rewards_list))
 
             (buffer_cell_params, buffer_latent_params,

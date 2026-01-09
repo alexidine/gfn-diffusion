@@ -157,7 +157,10 @@ class Modeller:
             assert False
         return discretizer
 
-    def increment_batch_size(self, buffer, train_mol_loader, test_mol_loader, batch_growth_increment, step_type,
+    def increment_batch_size(self, buffer,
+                             train_mol_loader, test_mol_loader,
+                             batch_growth_increment,
+                             step_type,
                              train_iterator, test_iterator):
         if step_type == "Forward":
             # print("7")
@@ -662,7 +665,7 @@ class Modeller:
                         if loss_dict is not None:
                             bwd_loss_dict = loss_dict
 
-                    if not oomed_out and self.args.grow_batch_size:
+                    if (not oomed_out or (step_ind % 100 == 0)) and self.args.grow_batch_size:
                         (buffer, train_mol_loader, test_mol_loader,
                          train_iterator, test_iterator) = self.increment_batch_size(
                             buffer, train_mol_loader,
@@ -983,7 +986,7 @@ class Modeller:
                     reward_range = 5
                     reward_record, sample_record = noise_buffer(0.5, 1,
                                                                 buffer, energy_function, reward_range,
-                                                                noise_step = 0.025,
+                                                                noise_step=0.025,
                                                                 sample_inds=None)
 
                     reward_record = torch.tensor(reward_record)
@@ -1105,7 +1108,6 @@ class Modeller:
         print("Loading prebuilt buffer")
         dataset = torch.load(dataset_path, weights_only=False)
 
-        # todo exclude outside latents and warn if there are a shitload of them
         max_z_prime = max([int(elem.z_prime) for elem in dataset])
         assert max_z_prime == max(self.args.z_primes), "Preloaded data max z prime must match model"
 
@@ -1149,6 +1151,9 @@ class Modeller:
         keep_inds = torch.arange(len(latents), device=latents.device)[keep]
         dataset = [dataset[ind] for ind in keep_inds]
 
+        dataset = [elem for elem in dataset if elem.packing_coeff >= 0.55]
+        dataset = [elem for elem in dataset if elem.packing_coeff <= 0.95]
+
         # todo remove this eventually
         if 'D:' in self.args.buffer_path and self.args.energy_function == 'uma':  # if we're on local, this takes forever
             dataset = dataset[:500]
@@ -1161,8 +1166,6 @@ class Modeller:
 
         # always filter awful crystals
         dataset = [elem for elem in dataset if elem.reduction_en <= 1e-3]
-        dataset = [elem for elem in dataset if elem.packing_coeff >= 0.55]
-        dataset = [elem for elem in dataset if elem.packing_coeff <= 0.95]
 
         if filter_unbound:  # filter unbound states under this potential
             en_func = self.args.energy_function
@@ -1228,45 +1231,18 @@ class Modeller:
 
         '''bwd sampling and analysis are combined'''
         if self.args.both_ways or self.args.bwd:
-            init_state = get_gfn_init_state(self.args.eval_num_samples,
-                                            energy_function.data_ndim,
-                                            self.device)
 
             self.times['eval_bwd_figs_start'] = time()
             bwd_metrics, bwd_fig_dict, rewards, btb_residual, normed_btb_residual = bwd_evaluation(
-                buffer, gfn_model,
-                init_state, eval_discretizer,
+                buffer, gfn_model, eval_discretizer, self.backward_batch_size,
                 do_figs=do_figs)
             self.times['eval_bwd_figs_end'] = time()
+
             metrics.update(bwd_metrics)
             fig_dict.update(bwd_fig_dict)
 
             if buffer.noised_size > 0:
-                # also refresh the buffer
-                alpha = 0.5
-                eps = 0.05
-                beta = 1.0
-
-                score = alpha * stdz(rewards) + (1 - alpha) * stdz(-normed_btb_residual)
-                weight = F.softmax(beta * score, dim=0)
-
-                weight = (1 - eps) * weight + eps / len(weight)
-                weight = weight.clamp(min=0)
-                weight = weight/weight.sum()
-
-                sample_inds = torch.multinomial(weight, num_samples=1000, replacement=True)[:self.args.eval_batch_size] # subsample for speed
-
-                reward_range = 5
-                reward_record, sample_record = noise_buffer(0.5, 1,
-                                                            buffer, energy_function, reward_range,
-                                                            noise_step=0.025,
-                                                            sample_inds=sample_inds)
-
-                reward_record = torch.tensor(reward_record)
-                good_inds = torch.argwhere(reward_record >= buffer.reward_clip).flatten()
-
-                buffer.add_to_noised(reward_record[good_inds],
-                                     torch.stack(sample_record)[good_inds])
+                self.grow_noised_buffer(buffer, energy_function, normed_btb_residual, rewards)
 
         '''logging and wrap up'''
         self.times['eval_wrapup_start'] = time()
@@ -1301,6 +1277,29 @@ class Modeller:
         #                                                              test_mol_loader,
         #                                                              )
         #         metrics.update(conditional_metrics)
+
+    def grow_noised_buffer(self, buffer, energy_function, normed_btb_residual, rewards):
+        self.times['eval_bwd_noising_start'] = time()
+        # also refresh the buffer
+        alpha = 0.5
+        eps = 0.05
+        beta = 1.0
+        score = alpha * stdz(rewards) + (1 - alpha) * stdz(-normed_btb_residual)
+        weight = F.softmax(beta * score, dim=0)
+        weight = (1 - eps) * weight + eps / len(weight)
+        weight = weight.clamp(min=0)
+        weight = weight / weight.sum()
+        sample_inds = torch.multinomial(weight, num_samples=1000, replacement=True)[:self.args.eval_batch_size]  # subsample for speed
+        reward_range = 5
+        reward_record, sample_record = noise_buffer(0.5, 1,
+                                                    buffer, energy_function, reward_range,
+                                                    noise_step=0.05,
+                                                    sample_inds=sample_inds)
+        reward_record = torch.tensor(reward_record)
+        good_inds = torch.argwhere(reward_record >= buffer.reward_clip).flatten()
+        buffer.add_to_noised(reward_record[good_inds],
+                             torch.stack(sample_record)[good_inds])
+        self.times['eval_bwd_noising_end'] = time()
 
     def eval_sampling(self, buffer, energy_function, eval_discretizer, gfn_model, test_mol_loader):
         flow_states_list = []

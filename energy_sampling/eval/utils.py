@@ -165,10 +165,12 @@ def sample_eval_fwd_trajs(initial_state, gfn, discretizer, energy_function, mol_
                     'logvars_f': logvars_f.cpu().detach(),
                     'means_b': means_b.cpu().detach(),
                     'logvars_b': logvars_b.cpu().detach()}
+
     log_r, sample_batch = energy_function.log_reward(
         states[:, -1], mol_batch=mol_batch,
         log_temperature=log_T_tensor,
         return_exp=True)
+
     log_weight = log_r + log_pbs.sum(-1) - log_pfs.sum(-1)
 
     log_Z = logmeanexp(log_weight)
