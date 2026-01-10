@@ -63,8 +63,7 @@ class Modeller:
         self.grow_buffer = self.args.grow_buffer
         if self.args.anchor_fwd_bwd:
             self.args.fwd_to_bwd_ratio = 1.0E-6
-        self.forward_batch_size = self.args.batch_size
-        self.backward_batch_size = self.args.batch_size
+        self.batch_size = self.args.batch_size
         self.phase = 1
         self.fwd_tb_norm = 10000
         self.bwd_tb_norm = 10000
@@ -162,37 +161,31 @@ class Modeller:
                              batch_growth_increment,
                              step_type,
                              train_iterator, test_iterator):
-        if step_type == "Forward":
-            # print("7")
-            if self.forward_batch_size < self.args.max_fwd_batch_size:
-                new_batch_size = min(self.args.max_fwd_batch_size, max(self.forward_batch_size + 1,
-                                                                       int(self.forward_batch_size * batch_growth_increment)))
-                self.forward_batch_size = new_batch_size  # gradually increment batch size
+        # print("7")
+        if self.batch_size < self.args.max_batch_size:
+            new_batch_size = min(self.args.max_batch_size, max(self.batch_size + 1,
+                                                               int(self.batch_size * batch_growth_increment)))
+            self.batch_size = new_batch_size  # gradually increment batch size
 
-                if len(buffer) > 0:
-                    buffer.batch_size = new_batch_size
+            if len(buffer) > 0:
+                buffer.batch_size = new_batch_size
 
-                train_mol_loader = DataLoader(
-                    train_mol_loader.dataset,
-                    batch_size=new_batch_size,
-                    num_workers=0,
-                    pin_memory=True,
-                    drop_last=True,
-                )
-                test_mol_loader = DataLoader(
-                    test_mol_loader.dataset,
-                    batch_size=new_batch_size,
-                    num_workers=0,
-                    pin_memory=True,
-                    drop_last=True,
-                )
-                train_iterator = iter_forever(train_mol_loader)
-                test_iterator = iter_forever(test_mol_loader)
-        elif step_type == "Backward":
-            if self.backward_batch_size < self.args.max_bwd_batch_size:
-                new_batch_size = min(self.args.max_bwd_batch_size, max(self.backward_batch_size + 1,
-                                                                       int(self.backward_batch_size * batch_growth_increment)))
-                self.backward_batch_size = new_batch_size  # gradually increment batch size
+            train_mol_loader = DataLoader(
+                train_mol_loader.dataset,
+                batch_size=new_batch_size,
+                num_workers=0,
+                pin_memory=True,
+                drop_last=True,
+            )
+            test_mol_loader = DataLoader(
+                test_mol_loader.dataset,
+                batch_size=new_batch_size,
+                num_workers=0,
+                pin_memory=True,
+                drop_last=True,
+            )
+            train_iterator = iter_forever(train_mol_loader)
+            test_iterator = iter_forever(test_mol_loader)
 
         return buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator
 
@@ -414,7 +407,7 @@ class Modeller:
             self.args.buffer_size,
             'cpu',
             energy_function,
-            self.backward_batch_size,
+            self.batch_size,
             beta=self.args.beta,
             rank_weight=self.args.rank_weight,
             prioritized=self.args.prioritized,
@@ -432,14 +425,15 @@ class Modeller:
             mols_list = self.init_mol_from_buffer(buffer, self.args.z_primes)
             train_mols_list = []
             test_mols_list = []
-            while len(train_mols_list) < int(self.args.max_fwd_batch_size * 1.5):
+            while len(train_mols_list) < int(self.args.max_batch_size * 1.5):
                 for mol in mols_list:
                     train_mols_list.append(mol.clone())
-            while len(test_mols_list) < int(self.args.max_fwd_batch_size * 1.5):
+            while len(test_mols_list) < int(self.args.max_batch_size * 1.5):
                 for mol in mols_list:
                     test_mols_list.append(mol.clone())
 
         elif self.args.molecule == 'qm9':
+            assert False, "QM9 conditional modelling currently deprecated"
             if energy_function.max_z_prime > 1:
                 assert False, "Z'>1 mol loading not yet implemented for qm9"
             qm9_mols = torch.load(self.args.molecules_path, weights_only=False)
@@ -468,14 +462,14 @@ class Modeller:
 
         train_mol_loader = DataLoader(
             train_mols_list,
-            batch_size=self.forward_batch_size,
+            batch_size=self.batch_size,
             num_workers=0,
             pin_memory=True,
             drop_last=True
         )
         test_mol_loader = DataLoader(
             test_mols_list,
-            batch_size=self.forward_batch_size,
+            batch_size=self.batch_size,
             num_workers=0,
             pin_memory=True,
             drop_last=True
@@ -949,7 +943,7 @@ class Modeller:
                        exploration_std, mol_batch, return_exp=False,
                        repeats: int = 10,
                        report_losses: bool = False):
-        init_state = get_gfn_init_state(self.forward_batch_size, energy_function.data_ndim, self.device)
+        init_state = get_gfn_init_state(self.batch_size, energy_function.data_ndim, self.device)
         log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(mol_batch,
                                                                                    z_primes=mol_batch.z_prime)
         mol_batch.sg_ind = sg_inds
@@ -972,7 +966,7 @@ class Modeller:
         with torch.no_grad():
             if self.args.sampling == 'buffer':
                 samples, rewards, crystal_batch, condition = buffer.sample(
-                    override_batch=int(self.backward_batch_size),
+                    override_batch=int(self.batch_size),
                     randomize_orientations=True if self.args.molecule_conditioning else False,
                     override_sampler=None,
                     return_sample_inds=False,
@@ -995,7 +989,7 @@ class Modeller:
                     buffer.add_to_noised(reward_record[good_inds],
                                          torch.stack(sample_record)[good_inds])
                 else:
-                    rewards, samples = buffer.sample_from_noised(int(self.backward_batch_size))
+                    rewards, samples = buffer.sample_from_noised(int(self.batch_size))
 
         return get_gfn_backward_loss(self.args.bwd_loss_coeffs,
                                      samples.to(self.device),
@@ -1024,33 +1018,29 @@ class Modeller:
                 except Exception:
                     pass
 
-            if step_type == 'Forward':
-                self.forward_batch_size = max(1, int(self.forward_batch_size * 0.95))
-                if self.forward_batch_size <= 1:
-                    raise RuntimeError("Cascading OOM Failure")
-                train_mol_loader = DataLoader(
-                    train_mol_loader.dataset,
-                    batch_size=self.forward_batch_size,
-                    num_workers=0,
-                    pin_memory=True,
-                    drop_last=True,
-                )
-                test_mol_loader = DataLoader(
-                    test_mol_loader.dataset,
-                    batch_size=self.forward_batch_size,
-                    num_workers=0,
-                    pin_memory=True,
-                    drop_last=True,
-                )
-                train_iterator = iter_forever(train_mol_loader)
-                test_iterator = iter_forever(test_mol_loader)
-                print(f"Reducing forward batch size to {self.forward_batch_size}")
+            self.batch_size = max(1, int(self.batch_size * 0.95))
+            if self.batch_size <= 1:
+                raise RuntimeError("Cascading OOM Failure")
+            train_mol_loader = DataLoader(
+                train_mol_loader.dataset,
+                batch_size=self.batch_size,
+                num_workers=0,
+                pin_memory=True,
+                drop_last=True,
+            )
+            test_mol_loader = DataLoader(
+                test_mol_loader.dataset,
+                batch_size=self.batch_size,
+                num_workers=0,
+                pin_memory=True,
+                drop_last=True,
+            )
+            train_iterator = iter_forever(train_mol_loader)
+            test_iterator = iter_forever(test_mol_loader)
 
-            elif step_type == 'Backward':
-                self.backward_batch_size = max(1, int(self.backward_batch_size * 0.95))
-                if self.backward_batch_size <= 1:
-                    raise RuntimeError("Cascading OOM Failure")
-                print(f"Reducing backward batch size to {self.backward_batch_size}")
+            if self.batch_size <= 1:
+                raise RuntimeError("Cascading OOM Failure")
+            print(f"Reducing batch size to {self.batch_size}")
 
             gc.collect()
             torch.cuda.empty_cache()
@@ -1059,35 +1049,6 @@ class Modeller:
         else:
             raise e  # will simply raise error if other or if training on CPU
         return oomed_out, buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator
-
-    #
-    # def do_conditional_evaluation(self, energy_function, gfn_model, mol_loader,
-    #                               ):  # todo these functions could be cleaned up / consolidated
-    #     self.times['eval_step_start'] = time()
-    #     eval_discretizer = lambda bsz: uniform_discretizer(bsz, self.args.eval_T)
-    #
-    #     eval_batch_size = self.args.eval_batch_size
-    #
-    #     eval_rands = np.random.randint(len(mol_loader.dataset), size=eval_batch_size)
-    #     mol_batch = collate_data_list([mol_loader.dataset[ind] for ind in eval_rands]).to(self.device)
-    #
-    #     if self.args.molecule_conditioning:
-    #         self.scramble_mol_and_embedding(mol_batch)
-    #
-    #     init_state = get_gfn_init_state(eval_batch_size, energy_function.data_ndim, self.device)
-    #
-    #     eval_metrics = {}
-    #     eval_metrics.update(
-    #         conditional_eval_step(energy_function,
-    #                               gfn_model,
-    #                               eval_discretizer,
-    #                               init_state,
-    #                               mol_batch,
-    #                               mols_to_sample=5,
-    #                               sample_sgs=self.args.space_groups if self.args.sg_conditioning else None,
-    #                               ))
-    #
-    #     return eval_metrics
 
     def scramble_mol_and_embedding(self, mol_batch):
         random_rotations = torch.tensor(
@@ -1234,7 +1195,7 @@ class Modeller:
 
             self.times['eval_bwd_figs_start'] = time()
             bwd_metrics, bwd_fig_dict, rewards, btb_residual, normed_btb_residual = bwd_evaluation(
-                buffer, gfn_model, eval_discretizer, self.backward_batch_size,
+                buffer, gfn_model, eval_discretizer, self.batch_size,
                 do_figs=do_figs)
             self.times['eval_bwd_figs_end'] = time()
 
@@ -1253,8 +1214,7 @@ class Modeller:
 
         gfn_model.train()
 
-        metrics.update({'Forward Batch Size': self.forward_batch_size})
-        metrics.update({'Backward Batch Size': self.backward_batch_size})
+        metrics.update({'Batch Size': self.batch_size})
         metrics.update({'Eval Batch Size': self.args.eval_batch_size})
         metrics.update(self.log_elapsed_times())
         self.times['eval_wrapup_end'] = time()
@@ -1289,7 +1249,8 @@ class Modeller:
         weight = (1 - eps) * weight + eps / len(weight)
         weight = weight.clamp(min=0)
         weight = weight / weight.sum()
-        sample_inds = torch.multinomial(weight, num_samples=1000, replacement=True)[:self.args.eval_batch_size]  # subsample for speed
+        sample_inds = torch.multinomial(weight, num_samples=1000, replacement=True)[
+            :self.args.eval_batch_size]  # subsample for speed
         reward_range = 5
         reward_record, sample_record = noise_buffer(0.5, 1,
                                                     buffer, energy_function, reward_range,
@@ -1443,8 +1404,7 @@ class Modeller:
             increasing_loss_cooldown=self.increasing_loss_cooldown,
             lr_warmup_finished=self.lr_warmup_finished,
             hit_init_kld=self.hit_init_kld,
-            forward_batch_size=self.forward_batch_size,
-            backward_batch_size=self.backward_batch_size,
+            batch_size=self.batch_size,
             grow_buffer=self.grow_buffer,
             best_tb_norm=self.best_tb_norm,
         )
@@ -1469,8 +1429,7 @@ class Modeller:
         self.increasing_loss_cooldown = state['increasing_loss_cooldown']
         self.lr_warmup_finished = state['lr_warmup_finished']
         self.hit_init_kld = state['hit_init_kld']
-        self.forward_batch_size = state['forward_batch_size']
-        self.backward_batch_size = state['backward_batch_size']
+        self.batch_size = state['batch_size']
         self.grow_buffer = state['grow_buffer']
         self.best_tb_norm = state['best_tb_norm']
 

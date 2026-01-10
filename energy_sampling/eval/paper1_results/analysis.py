@@ -167,7 +167,7 @@ if __name__ == '__main__':
         device = 'cuda'
         num_samples = 10000
         batch_size = 25
-        energy_function = 'uma'  # 'elj', 'lj' 'uma
+        energy_function = 'elj'  # 'elj', 'lj' 'uma
         n_steps = 100  # critical to get this right!
         sg_ind = 61
         run_name = f'xul_{sg_ind}'
@@ -175,21 +175,19 @@ if __name__ == '__main__':
         kT = 2.5
         clusters_to_analyze = 10
         units = 'kJ/mol'
-        model_path = rf"D:\crystal_datasets\xuldud\xul2_sg{sg_ind}_zp{zp}_1_model_eval.pt"
-        config_path = rf"D:\crystal_datasets\xuldud\xul2_sg{sg_ind}_zp{zp}_1_model_config.npy"
+        model_path = rf"D:\crystal_datasets\xuldud\best_xul4_sg{sg_ind}_zp{zp}_0_model_eval.pt"
+        config_path = rf"D:\crystal_datasets\xuldud\xul4_sg{sg_ind}_zp{zp}_0_model_config.npy"
         molecule_path = r"D:\crystal_datasets\xuldud\xuldud.pt"
         dataset_path = rf"D:\crystal_datasets\xuldud\xuldud_sg{sg_ind}_zp{zp}.pt"
         results_dir = rf"D:\crystal_datasets\gfn_results"
         results_path = os.path.join(results_dir, rf"{run_name}_sg{sg_ind}_zp{zp}.pt")
-
         exp_sample_path = r"D:\crystal_datasets\xuldud\xul_csd.pkl"
 
-    reload_results = True
+    reload_results = False
     show_figs = True
     write_figs = True
     save_results = True
     overwrite_results = True
-    do_explicit_probs = True
 
     "Load Relevant Dataset"
     molecule = torch.load(molecule_path, weights_only=False)
@@ -223,7 +221,7 @@ if __name__ == '__main__':
     )
 
     "analyze experimental samples"
-    if exp_sample_path is not None:
+    if False: #exp_sample_path is not None:
         "analyze dataset"
         dbatch = collate_data_list(dataset)
         dsamples = analyze_samples(
@@ -261,7 +259,6 @@ if __name__ == '__main__':
         ebatch = collate_data_list(exp_crystals)
 
         "get tb loss on experimental states"
-
         gfn_model = GFN(**np.load(config_path, allow_pickle=True).item())
         gfn_model.load_state_dict(torch.load(model_path, weights_only=True))
         gfn_model.to(device)
