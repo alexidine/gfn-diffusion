@@ -44,7 +44,7 @@ if __name__ == "__main__":
         config['space_groups'] = [sg]
         config['z_primes'] = [zp]
         config['run_name'] = f'sg{sg}_zp{zp}_{ind}'
-        config['tag'] = f'xul4'
+        config['tag'] = f'xul5'
         config['energy_function'] = en
         config['energy_static_temperature'] = temp
         config['reward_range'] = rew
