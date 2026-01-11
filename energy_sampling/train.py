@@ -848,7 +848,7 @@ class Modeller:
 
         skip_step = False
         if self.phase == 2:
-            if self.bwd_tb_norm <= self.args.thermalization_conv_eps:  # hit stage 2 convergence criteria
+            if True: #skip phase 2 directly #self.bwd_tb_norm <= self.args.thermalization_conv_eps:  # hit stage 2 convergence criteria
                 self.phase2to3(ema_model, gfn_model, 0.1, step_ind)
 
         if self.phase == 3:
