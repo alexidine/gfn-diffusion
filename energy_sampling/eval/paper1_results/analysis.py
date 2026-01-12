@@ -1,27 +1,21 @@
-from energy_sampling.utils import uniform_discretizer
 import os
 
 import numpy as np
 import plotly.graph_objects as go
 import torch
-from ase.constraints import UnitCellFilter
-from ase.optimize import LBFGS, FIRE
 from ase.spacegroup import Spacegroup
-from fairchem.core import FAIRChemCalculator
-from fairchem.core.datasets.atomic_data import atomicdata_list_to_batch, AtomicData
 
 from energy_sampling.eval.paper1_results.figures import general_figs, cluster_comparison_fig, dim_reduction_fig, \
     make_thermo_table, parity_fig
 from energy_sampling.eval.paper1_results.utils import get_gfn_samples, \
-    cluster_thermo_analysis, get_color_set, umap_hdbscan_clustering, generator_reward, analyze_samples
+    cluster_thermo_analysis, get_color_set, umap_hdbscan_clustering, generator_reward
 from energy_sampling.models import GFN
+from energy_sampling.utils import uniform_discretizer
 from examples.crystal_search_reporting import batch_compack
 from mxtaltools.analysis.crystal_rdf import compute_rdf_distmat
 from mxtaltools.common.ase_interface import ase_mol_from_crystaldata
 from mxtaltools.common.geometry_utils import crystal_parameter_distmat
 from mxtaltools.dataset_utils.utils import collate_data_list
-from mxtaltools.mlip_interfaces.uma_utils import batch_to_ase_ucell_list, safe_predict_uma
-from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 
 torch.cuda.set_per_process_memory_fraction(0.9, device=0)
 
@@ -165,18 +159,18 @@ if __name__ == '__main__':
 
     elif run == 'xuldud':
         device = 'cuda'
-        num_samples = 10000
-        batch_size = 25
+        num_samples = 50000
+        batch_size = 2000
         energy_function = 'elj'  # 'elj', 'lj' 'uma
         n_steps = 100  # critical to get this right!
         sg_ind = 61
         run_name = f'xul_{sg_ind}'
         zp = 1
         kT = 2.5
-        clusters_to_analyze = 10
+        clusters_to_analyze = 20
         units = 'kJ/mol'
-        model_path = rf"D:\crystal_datasets\xuldud\best_xul4_sg{sg_ind}_zp{zp}_0_model_eval.pt"
-        config_path = rf"D:\crystal_datasets\xuldud\xul4_sg{sg_ind}_zp{zp}_0_model_config.npy"
+        model_path = rf"D:\crystal_datasets\xuldud\xul4_sg{sg_ind}_zp{zp}_1_model_eval.pt"
+        config_path = rf"D:\crystal_datasets\xuldud\xul4_sg{sg_ind}_zp{zp}_1_model_config.npy"
         molecule_path = r"D:\crystal_datasets\xuldud\xuldud.pt"
         dataset_path = rf"D:\crystal_datasets\xuldud\xuldud_sg{sg_ind}_zp{zp}.pt"
         results_dir = rf"D:\crystal_datasets\gfn_results"
@@ -221,7 +215,7 @@ if __name__ == '__main__':
     )
 
     "analyze experimental samples"
-    if False: #exp_sample_path is not None:
+    if False:  # exp_sample_path is not None:
         "analyze dataset"
         dbatch = collate_data_list(dataset)
         dsamples = analyze_samples(
@@ -233,7 +227,7 @@ if __name__ == '__main__':
             sg_ind,
             zp,
             do_uma=False,
-            #predictor=predictor
+            # predictor=predictor
         )
         exp_crystals = torch.load(exp_sample_path, weights_only=False)
         exp_crystals = [cry for cry in exp_crystals if cry.sg_ind == sg_ind]
@@ -247,7 +241,7 @@ if __name__ == '__main__':
             sg_ind,
             zp,
             do_uma=False,
-            #predictor=predictor
+            # predictor=predictor
         )
 
         pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
@@ -276,7 +270,7 @@ if __name__ == '__main__':
         gas_en = ebatch.compute_lattice_gas_phase_uma(predictor,
                                                       std_orientation=True).cpu().detach() * 96.485
         cry_en = ebatch.compute_crystal_uma(predictor=predictor,
-                                           std_orientation=True).cpu().detach() * 96.485
+                                            std_orientation=True).cpu().detach() * 96.485
         exp_uma = cry_en / (ebatch.sym_mult * ebatch.z_prime) - gas_en
         ebatch.uma_gas_pot = gas_en
         ebatch.uma_pot = cry_en
@@ -316,13 +310,13 @@ if __name__ == '__main__':
         uma_batch = atomicdata_list_to_batch([AtomicData.from_ase(atoms, task_name='omc') for atoms in alist])
 
         out, crashed = safe_predict_uma(predictor, uma_batch)
-        cry_en=out['energy'].cpu().detach() * 96.485
+        cry_en = out['energy'].cpu().detach() * 96.485
         # convert back to our batch data type
 
         gas_en = ebatch.compute_lattice_gas_phase_uma(predictor,
                                                       std_orientation=True).cpu().detach() * 96.485
         cry_en = ebatch.compute_crystal_uma(predictor=predictor,
-                                           std_orientation=True).cpu().detach() * 96.485
+                                            std_orientation=True).cpu().detach() * 96.485
         exp_uma = cry_en / (ebatch.sym_mult * ebatch.z_prime) - gas_en
 
         fig = go.Figure(go.Scatter(x=sample_batch.packing_coeff, y=sample_energy, mode='markers'))
@@ -330,7 +324,8 @@ if __name__ == '__main__':
         fig.update_layout(yaxis_range=[-np.inf, 0])
         fig.show()
 
-        sample_batch.plot_batch_cell_params(space='real', ref_dist=ebatch.full_cell_parameters().repeat(2,1), show=True)
+        sample_batch.plot_batch_cell_params(space='real', ref_dist=ebatch.full_cell_parameters().repeat(2, 1),
+                                            show=True)
 
     "Clustering"
     dmat = crystal_parameter_distmat(sample_latents).fill_diagonal_(0).detach()
