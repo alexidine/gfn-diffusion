@@ -260,7 +260,6 @@ def triangle_schedule(it, init, maxval, minval, on, off):
 def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 500,
                       uma_path: Optional[str] = None, ):
     outputs = []
-
     cutoff = 10
     computes = ['lj', 'reduction_en']
     if energy_function != 'lj' and energy_function != 'uma':
@@ -284,6 +283,7 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
                                         supercell_size=5,
                                         std_orientation=True,
                                         )
+            out = {key: val.cpu().detach() for key,val in out.items()}
             if energy_function == 'uma':
                 cry_en = crystal_batch.compute_crystal_uma(
                     predictor=uma_predictor,
@@ -293,7 +293,7 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
                 out.update({'uma_gas_pot': gas_en,
                             'uma_pot': cry_en,
                             'uma': cry_en / (
-                                    crystal_batch.sym_mult * crystal_batch.z_prime) - gas_en})  # lattice energy
+                                    crystal_batch.sym_mult.cpu().detach() * crystal_batch.z_prime.cpu().detach()) - gas_en})  # lattice energy
 
             outputs.append(out)
             cursor += batch_size
@@ -622,6 +622,7 @@ def substitute_prior(noised_fraction, noise_level, crystal_batch, energy_functio
 
     return condition, new_rewards, new_samples, crystal_batch
 
+
 def noise_buffer(max_noise_level, noised_fraction, buffer, energy_function, reward_range,
                  noise_step,
                  sample_inds: Optional[torch.Tensor] = None):
@@ -660,5 +661,3 @@ def noise_buffer(max_noise_level, noised_fraction, buffer, energy_function, rewa
 
 def stdz(x):
     return (x - x.mean()) / x.std()
-
-

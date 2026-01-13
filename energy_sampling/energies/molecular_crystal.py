@@ -85,6 +85,7 @@ class MolecularCrystal(BaseSet):
         self.reward_range = reward_range
         self.lj_rescale = lj_rescale
         if self.energy_function == 'uma':
+            self.uma_path = uma_path
             self.uma_predictor = init_uma_crystal_predictor(uma_path, device=self.device)
 
         self.temperature = temperature  # for static temperature work
@@ -370,7 +371,7 @@ class MolecularCrystal(BaseSet):
 
     def batched_analyze_crystal_batch(self, x, mol_batch, temperature, return_batch=False):
         if not hasattr(self, 'batch_size'):
-            self.batch_size = 1000 if self.energy_function != 'uma' else 50
+            self.batch_size = 1000
         cursor = 0
         n_samples = len(x)
         energies = torch.zeros(len(x), dtype=torch.float32, device='cpu')
@@ -379,7 +380,7 @@ class MolecularCrystal(BaseSet):
             data_list = mol_batch.batch_to_list()
         else:
             data_list = mol_batch.to_data_list()
-
+        already_oomed = False
         while cursor < n_samples:
             try:
                 inds = np.arange(cursor, min(n_samples, cursor + self.batch_size))
@@ -392,16 +393,22 @@ class MolecularCrystal(BaseSet):
                     samples.extend(outs[1].cpu().detach().batch_to_list())
 
                 cursor += len(inds)
-                if self.batch_size <= 10000:
+                if (self.batch_size <= 10000) and (self.batch_size < n_samples) and not already_oomed:
                     self.batch_size += max(int(self.batch_size * 0.01), 1)
 
             except (RuntimeError, ValueError) as e:
                 if is_cuda_oom(e):
-                    self.batch_size = max(int(self.batch_size * 0.8), 1)
-                    #print(f"OOM in energy evaluation: dropping batch size to {self.batch_size}")
+                    if self.batch_size == 1:
+                        assert False, "Cascading OOM failure in molecule energy evaluation"
+                    self.batch_size = max(int(self.batch_size * 0.65), 1)
+                    print(f"OOM in energy evaluation: dropping batch size to {self.batch_size}")
                     gc.collect()
+                    #del self.uma_predictor, mol_batch_i
                     torch.cuda.empty_cache()
+                    #torch.cuda.reset_peak_memory_stats()
                     torch.cuda.synchronize()
+                    #self.uma_predictor = init_uma_crystal_predictor(self.uma_path, device=self.device)
+                    already_oomed = True
                     sleep(0.1)
                 else:
                     raise e

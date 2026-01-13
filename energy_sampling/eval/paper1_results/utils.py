@@ -1,5 +1,7 @@
+import gc
 import re
 from collections import Counter
+from time import sleep
 
 import torch.nn.functional as F
 import hdbscan
@@ -20,7 +22,7 @@ from tqdm import tqdm
 from umap import UMAP
 
 from energy_sampling.energies.molecular_crystal import density_penalty
-from energy_sampling.utils import uniform_discretizer, get_gfn_init_state
+from energy_sampling.utils import uniform_discretizer, get_gfn_init_state, is_cuda_oom
 from mxtaltools.analysis.crystal_rdf import compute_rdf_distmat
 from mxtaltools.common.geometry_utils import crystal_parameter_distmat
 from mxtaltools.common.utils import log_rescale_positive
@@ -1522,3 +1524,101 @@ def generator_reward(crystal_batch, raw_latents, max_z_prime,
         total_energy = crystal_energy + bounding_energy * bounding_coeff + reduction_energy * reduction_coeff
 
     return -total_energy / temperature
+
+@torch.no_grad()
+def make_kinetic_graph(base_sample, sample_batch, kT, n_points=10):
+    ""
+
+    'make latent space knn'
+    latents = sample_batch.latent_params()
+    latent_dmat = sample_batch.latent_distmat()
+    lat_k = 5
+    lat_knn = latent_dmat.topk(lat_k + 1, largest=False).indices[:, 1:]
+
+    'get all edges to be interpolated'
+    N, k = lat_knn.shape
+
+    src = torch.arange(N, device=lat_knn.device).repeat_interleave(k)
+    dst = lat_knn.reshape(-1)
+
+    edge_index = torch.stack([src, dst], dim=0)  # (2, N*k)
+
+    'iterate over edges'
+    num_trajs = edge_index.shape[1]
+    batch_size = 1000
+
+    ens = torch.zeros(num_trajs, n_points, device='cpu', dtype=torch.float32)
+    finished = False
+    cursor = 0
+    pbar = tqdm(total=num_trajs, unit="samples")
+    while not finished:
+        try:
+            batch_inds = torch.arange(cursor, min(cursor + batch_size, num_trajs))
+            src_lat = latents[edge_index[0, batch_inds]]
+            tgt_lat = latents[edge_index[1, batch_inds]]
+            paths = torch.linspace(0, 1, n_points)
+            paths = src_lat[None] + paths[:, None, None] * (tgt_lat - src_lat)
+            #paths = paths[1:-1,...]  # exclude endpoints
+            paths = paths.clip(min=-1, max=1)
+            x = paths.reshape(-1, paths.shape[2]).to('cuda')
+
+            sample = base_sample.clone()
+            traj_batch = collate_data_list([sample for _ in range(len(x))]).to('cuda')
+            traj_batch.latent_to_cell_params(x)
+            en = traj_batch.analyze(['elj'])['elj'].cpu()
+            ens[batch_inds, :] = en.reshape(paths.shape[:2]).T
+
+            pbar.update(min(batch_size, num_trajs - cursor))  # safe final update
+
+            cursor += batch_size
+            if cursor >= num_trajs:
+                finished = True
+            else:
+                batch_size = int(batch_size * 1.01) # keep pushing the batch size between sets
+                #print(f"Boosting batch size to {batch_size}")
+
+        except (RuntimeError, ValueError) as e:
+            if is_cuda_oom(e):
+                batch_size = max(int(batch_size * 0.9), 1)
+                print(f"OOM error: dropping batch size to {batch_size}")
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                sleep(0.1)
+
+            else:
+                raise e
+
+    E_src = ens[:,0]#.elj[edge_index[0,:]]
+    E_dst = ens[:,-1]#sample_batch.elj[edge_index[1,:]]
+    gamma = 3.0  # try 3, 5, 10
+    kT = 2.5
+    Ecut = gamma * kT
+    barrier = ens.amax(dim=1) - torch.minimum(E_src, E_dst)
+
+    keep = barrier <= Ecut
+    edges = edge_index[:, keep]
+
+    import scipy.sparse as sp
+    from scipy.sparse.csgraph import connected_components
+
+    N = latents.shape[0]
+    A = sp.coo_matrix(
+        (np.ones(edges.shape[1]),
+         (edges[0].cpu(), edges[1].cpu())),
+        shape=(N, N)
+    )
+    A = A + A.T
+
+    cluster_labels = connected_components(A, directed=False)[1]
+
+    masks = np.array([cluster_labels == ind for ind in np.unique(cluster_labels)])
+    mask_sorts = np.argsort([sum(m) for m in masks])[::-1]
+    sorted_masks = masks[mask_sorts]
+    sample_batch.plot_batch_cell_params(space='real',
+                                        aux_dists=[sample_batch.full_cell_parameters()[m] for m in
+                                                   masks[mask_sorts[:10]] if
+                                                   sum(m) > 1])
+    [print(sum(m)) for m in sorted_masks[:20]]
+    degree_gamma = A.sum(axis=1)
+    go.Figure(go.Histogram(x=np.array(degree_gamma).flatten())).show()

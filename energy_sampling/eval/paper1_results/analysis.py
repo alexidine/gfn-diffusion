@@ -8,7 +8,7 @@ from ase.spacegroup import Spacegroup
 from energy_sampling.eval.paper1_results.figures import general_figs, cluster_comparison_fig, dim_reduction_fig, \
     make_thermo_table, parity_fig
 from energy_sampling.eval.paper1_results.utils import get_gfn_samples, \
-    cluster_thermo_analysis, get_color_set, umap_hdbscan_clustering, generator_reward
+    cluster_thermo_analysis, get_color_set, umap_hdbscan_clustering, generator_reward, make_kinetic_graph
 from energy_sampling.models import GFN
 from energy_sampling.utils import uniform_discretizer
 from examples.crystal_search_reporting import batch_compack
@@ -159,7 +159,7 @@ if __name__ == '__main__':
 
     elif run == 'xuldud':
         device = 'cuda'
-        num_samples = 50000
+        num_samples = 10000
         batch_size = 2000
         energy_function = 'elj'  # 'elj', 'lj' 'uma
         n_steps = 100  # critical to get this right!
@@ -177,9 +177,9 @@ if __name__ == '__main__':
         results_path = os.path.join(results_dir, rf"{run_name}_sg{sg_ind}_zp{zp}.pt")
         exp_sample_path = r"D:\crystal_datasets\xuldud\xul_csd.pkl"
 
-    reload_results = False
+    reload_results = True
     show_figs = True
-    write_figs = True
+    write_figs = False
     save_results = True
     overwrite_results = True
 
@@ -201,6 +201,9 @@ if __name__ == '__main__':
     sample_energy = results_dict['sample_energy']
     sample_cp = results_dict['sample_cp']
     sample_latents = sample_batch.latent_params()  # results_dict['sample_latents']  # these are sometimes wrong for xul
+
+    kinetic_graph = make_kinetic_graph(samples[0], sample_batch, kT)
+
     if energy_function == 'uma':
         sample_batch.uma = sample_batch.uma_pot / (
                 sample_batch.sym_mult * sample_batch.z_prime) - sample_batch.uma_gas_pot

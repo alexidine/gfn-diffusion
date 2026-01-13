@@ -974,7 +974,7 @@ class Modeller:
             else:
                 assert False, f"sampling method {self.args.sampling} not implemented"
 
-            if self.args.bwd_loss_coeffs.noised_fraction > 0:
+            if True: #self.args.bwd_loss_coeffs.noised_fraction > 0:
                 if buffer.noised_size == 0:  # initialize buffer
                     print("Initializing noised buffer")
                     reward_range = 5
@@ -988,9 +988,11 @@ class Modeller:
 
                     buffer.add_to_noised(reward_record[good_inds],
                                          torch.stack(sample_record)[good_inds])
+                    print(len(buffer))
+                    #assert False, "We did it guys"
+
                 else:
                     rewards, samples = buffer.sample_from_noised(int(self.batch_size))
-
         return get_gfn_backward_loss(self.args.bwd_loss_coeffs,
                                      samples.to(self.device),
                                      gfn_model,
@@ -1115,22 +1117,22 @@ class Modeller:
         dataset = [elem for elem in dataset if elem.packing_coeff >= 0.55]
         dataset = [elem for elem in dataset if elem.packing_coeff <= 0.95]
 
-        # todo remove this eventually
+        # todo remove this eventually, hopefully
         if 'D:' in self.args.buffer_path and self.args.energy_function == 'uma':  # if we're on local, this takes forever
-            dataset = dataset[:500]
+            dataset = dataset[:25]
 
         print("Re-featurizing preloaded buffer samples")
         dataset = featurize_dataset(dataset,
                                     self.device,
                                     self.args.energy_function,
-                                    uma_path=self.args.uma_path)
+                                    uma_path=self.args.uma_path,
+                                    batch_size=500)
 
         # always filter awful crystals
         dataset = [elem for elem in dataset if elem.reduction_en <= 1e-3]
 
         if filter_unbound:  # filter unbound states under this potential
-            en_func = self.args.energy_function
-            dataset = [elem for elem in dataset if elem[en_func] < 0]
+            dataset = [elem for elem in dataset if elem[self.args.energy_function] < 0]
 
         if self.args.molecule_conditioning:  # embed dataset
             assert max(self.args.z_primes) == 1, "Molecule conditioning not yet supported for Z'>1"
@@ -1249,8 +1251,7 @@ class Modeller:
         weight = (1 - eps) * weight + eps / len(weight)
         weight = weight.clamp(min=0)
         weight = weight / weight.sum()
-        sample_inds = torch.multinomial(weight, num_samples=1000, replacement=True)[
-            :self.args.eval_batch_size]  # subsample for speed
+        sample_inds = torch.multinomial(weight, num_samples=energy_function.batch_size, replacement=True)  # subsample for speed - a single batch no more
         reward_range = 5
         reward_record, sample_record = noise_buffer(0.5, 1,
                                                     buffer, energy_function, reward_range,

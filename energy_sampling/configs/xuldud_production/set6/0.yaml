@@ -5,7 +5,7 @@ anchor_noise_level: 0.05
 anneal_temperature: false
 autoencoder_path: null
 batch_growth_increment: 1.01
-batch_size: 10
+batch_size: 50
 beta: 1.0
 both_ways: true
 bounding_coeff: 10.0
