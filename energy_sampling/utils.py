@@ -656,6 +656,9 @@ def noise_buffer(max_noise_level, noised_fraction, buffer, energy_function, rewa
         if noise_level >= max_noise_level:
             break
 
+    print(f"final noise level {noise_level}")
+    print(f"tot num samples {len(reward_record)}")
+    print(f"batch size {crystal_batch.num_graphs}")
     return reward_record, sample_record
 
 
