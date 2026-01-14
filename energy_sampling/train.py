@@ -1251,7 +1251,7 @@ class Modeller:
         weight = (1 - eps) * weight + eps / len(weight)
         weight = weight.clamp(min=0)
         weight = weight / weight.sum()
-        sample_inds = torch.multinomial(weight, num_samples=energy_function.batch_size, replacement=True)  # subsample for speed - a single batch no more
+        sample_inds = torch.multinomial(weight, num_samples=energy_function.batch_size, replacement=False)  # subsample for speed - a single batch no more
         reward_range = 5
         reward_record, sample_record = noise_buffer(0.5, 1,
                                                     buffer, energy_function, reward_range,

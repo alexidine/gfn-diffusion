@@ -314,7 +314,7 @@ class CrystalReplayBuffer:
         # manual dataloader
         if return_preload:
             rand_inds = self.original_dataset_inds
-        elif override_sampler is not None:
+        elif override_sample_inds is not None:
             rand_inds = override_sample_inds
         else:
             if self.batch_size > len(self):
