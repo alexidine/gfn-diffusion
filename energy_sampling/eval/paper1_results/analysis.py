@@ -202,7 +202,7 @@ if __name__ == '__main__':
     sample_cp = results_dict['sample_cp']
     sample_latents = sample_batch.latent_params()  # results_dict['sample_latents']  # these are sometimes wrong for xul
 
-    kinetic_graph = make_kinetic_graph(samples[0], sample_batch, kT)
+    #kinetic_graph = make_kinetic_graph(samples[0], sample_batch, kT)
 
     if energy_function == 'uma':
         sample_batch.uma = sample_batch.uma_pot / (
@@ -217,121 +217,31 @@ if __name__ == '__main__':
         energy_clip=None
     )
 
-    "analyze experimental samples"
-    if False:  # exp_sample_path is not None:
-        "analyze dataset"
-        dbatch = collate_data_list(dataset)
-        dsamples = analyze_samples(
-            dbatch.latent_params(),
-            [molecule] * dbatch.num_graphs,
-            max_z_prime,
-            device,
-            1000,
-            sg_ind,
-            zp,
-            do_uma=False,
-            # predictor=predictor
-        )
-        exp_crystals = torch.load(exp_sample_path, weights_only=False)
-        exp_crystals = [cry for cry in exp_crystals if cry.sg_ind == sg_ind]
-        ebatch = collate_data_list(exp_crystals)
-        esamples = analyze_samples(
-            ebatch.latent_params(),
-            [molecule] * ebatch.num_graphs,
-            max_z_prime,
-            device,
-            1000,
-            sg_ind,
-            zp,
-            do_uma=False,
-            # predictor=predictor
-        )
-
-        pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
-        predictor = init_uma_crystal_predictor(pred_path, device=device)
-        calc = FAIRChemCalculator(predictor, task_name="omc")
-
-        exp_crystals = torch.load(exp_sample_path, weights_only=False)
-        exp_crystals = [cry for cry in exp_crystals if cry.sg_ind == sg_ind]
-        ebatch = collate_data_list(exp_crystals)
-
-        "get tb loss on experimental states"
-        gfn_model = GFN(**np.load(config_path, allow_pickle=True).item())
-        gfn_model.load_state_dict(torch.load(model_path, weights_only=True))
-        gfn_model.to(device)
-        gfn_model.eval()
-
-        bwd_repeats = 250
-        terminal_states = ebatch.latent_params().repeat(bwd_repeats, 1)
-        discretizer = lambda bsz: uniform_discretizer(bsz, n_steps)
-        condition = torch.zeros((len(terminal_states), 1), device=gfn_model.device)
-
-        states, log_pfs, log_pbs, log_flow = gfn_model.get_traj_bwd(
-            terminal_states.clone().to(gfn_model.device),
-            discretizer, condition, return_gauss_params=False
-        )
-        gas_en = ebatch.compute_lattice_gas_phase_uma(predictor,
-                                                      std_orientation=True).cpu().detach() * 96.485
-        cry_en = ebatch.compute_crystal_uma(predictor=predictor,
-                                            std_orientation=True).cpu().detach() * 96.485
-        exp_uma = cry_en / (ebatch.sym_mult * ebatch.z_prime) - gas_en
-        ebatch.uma_gas_pot = gas_en
-        ebatch.uma_pot = cry_en
-        ebatch.uma = exp_uma
-
-        exp_rewards = generator_reward(
-            ebatch,
-            None,
-            max_z_prime,
-            energy_function=energy_function,
-            temperature=kT,
-            energy_clip=None
-        ).repeat(bwd_repeats)
-
-        parity_fig(
-            y_raw=log_pfs.sum(-1).cpu().detach() + gfn_model.flow_model().item(),
-            x_raw=log_pbs.sum(-1).cpu().detach() + exp_rewards.cpu().detach(),
-            y_label=r'$log(P_f(\tau)) + log(R(x_T))$',
-            x_label=r'$log(P_b(\tau|x_T)) + log(Z_\theta)$',
-        ).show()
-
-        alist = batch_to_ase_ucell_list(ebatch, std_orientation=True, pbc=True)
-
-        for atoms in alist:
-            atoms.calc = calc
-
-            # Stage 1: fast, robust descent
-            opt = LBFGS(UnitCellFilter(atoms, mask=[1, 1, 1, 0, 0, 0]), memory=50, maxstep=0.2)
-            opt.run(fmax=0.1, steps=100)
-
-            # Stage 2: clean convergence
-            opt = FIRE(UnitCellFilter(atoms, mask=[1, 1, 1, 0, 0, 0]))
-            opt.run(fmax=0.03, steps=200)
-
-        # get terminal energy
-
-        uma_batch = atomicdata_list_to_batch([AtomicData.from_ase(atoms, task_name='omc') for atoms in alist])
-
-        out, crashed = safe_predict_uma(predictor, uma_batch)
-        cry_en = out['energy'].cpu().detach() * 96.485
-        # convert back to our batch data type
-
-        gas_en = ebatch.compute_lattice_gas_phase_uma(predictor,
-                                                      std_orientation=True).cpu().detach() * 96.485
-        cry_en = ebatch.compute_crystal_uma(predictor=predictor,
-                                            std_orientation=True).cpu().detach() * 96.485
-        exp_uma = cry_en / (ebatch.sym_mult * ebatch.z_prime) - gas_en
-
-        fig = go.Figure(go.Scatter(x=sample_batch.packing_coeff, y=sample_energy, mode='markers'))
-        fig.add_scatter(x=ebatch.packing_coeff, y=exp_uma, mode='markers', marker_size=20)
-        fig.update_layout(yaxis_range=[-np.inf, 0])
-        fig.show()
-
-        sample_batch.plot_batch_cell_params(space='real', ref_dist=ebatch.full_cell_parameters().repeat(2, 1),
-                                            show=True)
 
     "Clustering"
     dmat = crystal_parameter_distmat(sample_latents).fill_diagonal_(0).detach()
+
+    '''
+    sample_batch.pose_aunit(std_orientation=True)
+    sample_batch.build_unit_cell()
+    upos = sample_batch.unit_cell_pos.reshape(sample_batch.num_graphs,
+                                              sample_batch.sym_mult[0] * sample_batch.num_atoms[0], 3)
+    d2 = torch.zeros_like(dmat)
+    for ind in range(sample_batch.num_graphs):
+        d2[ind] = (upos[ind, None, ...] - upos).norm(dim=-1).mean(-1)
+    fig = go.Figure(go.Histogram2dContour(
+                x=dmat[:100].flatten().numpy(),
+                y=d2[:100].flatten().numpy(),
+                ncontours=12,
+                showscale=False,  # colorbar and (i == D - 1 and j == 0),
+                #contours=dict(coloring='none', showlines=True, start=0.0001, end=0.1, size=0.04),
+                #line=dict(smoothing=1.0, color='grey', width=2),
+                nbinsx=50,
+                nbinsy=50,
+                histnorm='probability',
+                showlegend=False))
+    fig.show()
+    '''
     basin_weights, cluster_labels, cluster_prob, basin_inds = umap_hdbscan_clustering(
         dmat, sample_energy,
         n_components=6,
@@ -416,3 +326,116 @@ if __name__ == '__main__':
     matched = np.stack(matchess)
     rmsds = np.stack(rmsdss)
     go.Figure(go.Scatter(x=(rmsds / matched).flatten(), y=dmat.flatten(), mode='markers')).show()
+
+"analyze experimental samples"
+if False:  # exp_sample_path is not None:
+    "analyze dataset"
+    dbatch = collate_data_list(dataset)
+    dsamples = analyze_samples(
+        dbatch.latent_params(),
+        [molecule] * dbatch.num_graphs,
+        max_z_prime,
+        device,
+        1000,
+        sg_ind,
+        zp,
+        do_uma=False,
+        # predictor=predictor
+    )
+    exp_crystals = torch.load(exp_sample_path, weights_only=False)
+    exp_crystals = [cry for cry in exp_crystals if cry.sg_ind == sg_ind]
+    ebatch = collate_data_list(exp_crystals)
+    esamples = analyze_samples(
+        ebatch.latent_params(),
+        [molecule] * ebatch.num_graphs,
+        max_z_prime,
+        device,
+        1000,
+        sg_ind,
+        zp,
+        do_uma=False,
+        # predictor=predictor
+    )
+
+    pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
+    predictor = init_uma_crystal_predictor(pred_path, device=device)
+    calc = FAIRChemCalculator(predictor, task_name="omc")
+
+    exp_crystals = torch.load(exp_sample_path, weights_only=False)
+    exp_crystals = [cry for cry in exp_crystals if cry.sg_ind == sg_ind]
+    ebatch = collate_data_list(exp_crystals)
+
+    "get tb loss on experimental states"
+    gfn_model = GFN(**np.load(config_path, allow_pickle=True).item())
+    gfn_model.load_state_dict(torch.load(model_path, weights_only=True))
+    gfn_model.to(device)
+    gfn_model.eval()
+
+    bwd_repeats = 250
+    terminal_states = ebatch.latent_params().repeat(bwd_repeats, 1)
+    discretizer = lambda bsz: uniform_discretizer(bsz, n_steps)
+    condition = torch.zeros((len(terminal_states), 1), device=gfn_model.device)
+
+    states, log_pfs, log_pbs, log_flow = gfn_model.get_traj_bwd(
+        terminal_states.clone().to(gfn_model.device),
+        discretizer, condition, return_gauss_params=False
+    )
+    gas_en = ebatch.compute_lattice_gas_phase_uma(predictor,
+                                                  std_orientation=True).cpu().detach() * 96.485
+    cry_en = ebatch.compute_crystal_uma(predictor=predictor,
+                                        std_orientation=True).cpu().detach() * 96.485
+    exp_uma = cry_en / (ebatch.sym_mult * ebatch.z_prime) - gas_en
+    ebatch.uma_gas_pot = gas_en
+    ebatch.uma_pot = cry_en
+    ebatch.uma = exp_uma
+
+    exp_rewards = generator_reward(
+        ebatch,
+        None,
+        max_z_prime,
+        energy_function=energy_function,
+        temperature=kT,
+        energy_clip=None
+    ).repeat(bwd_repeats)
+
+    parity_fig(
+        y_raw=log_pfs.sum(-1).cpu().detach() + gfn_model.flow_model().item(),
+        x_raw=log_pbs.sum(-1).cpu().detach() + exp_rewards.cpu().detach(),
+        y_label=r'$log(P_f(\tau)) + log(R(x_T))$',
+        x_label=r'$log(P_b(\tau|x_T)) + log(Z_\theta)$',
+    ).show()
+
+    alist = batch_to_ase_ucell_list(ebatch, std_orientation=True, pbc=True)
+
+    for atoms in alist:
+        atoms.calc = calc
+
+        # Stage 1: fast, robust descent
+        opt = LBFGS(UnitCellFilter(atoms, mask=[1, 1, 1, 0, 0, 0]), memory=50, maxstep=0.2)
+        opt.run(fmax=0.1, steps=100)
+
+        # Stage 2: clean convergence
+        opt = FIRE(UnitCellFilter(atoms, mask=[1, 1, 1, 0, 0, 0]))
+        opt.run(fmax=0.03, steps=200)
+
+    # get terminal energy
+
+    uma_batch = atomicdata_list_to_batch([AtomicData.from_ase(atoms, task_name='omc') for atoms in alist])
+
+    out, crashed = safe_predict_uma(predictor, uma_batch)
+    cry_en = out['energy'].cpu().detach() * 96.485
+    # convert back to our batch data type
+
+    gas_en = ebatch.compute_lattice_gas_phase_uma(predictor,
+                                                  std_orientation=True).cpu().detach() * 96.485
+    cry_en = ebatch.compute_crystal_uma(predictor=predictor,
+                                        std_orientation=True).cpu().detach() * 96.485
+    exp_uma = cry_en / (ebatch.sym_mult * ebatch.z_prime) - gas_en
+
+    fig = go.Figure(go.Scatter(x=sample_batch.packing_coeff, y=sample_energy, mode='markers'))
+    fig.add_scatter(x=ebatch.packing_coeff, y=exp_uma, mode='markers', marker_size=20)
+    fig.update_layout(yaxis_range=[-np.inf, 0])
+    fig.show()
+
+    sample_batch.plot_batch_cell_params(space='real', ref_dist=ebatch.full_cell_parameters().repeat(2, 1),
+                                        show=True)
