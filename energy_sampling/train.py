@@ -974,7 +974,7 @@ class Modeller:
             else:
                 assert False, f"sampling method {self.args.sampling} not implemented"
 
-            if True: #self.args.bwd_loss_coeffs.noised_fraction > 0:
+            if self.args.bwd_loss_coeffs.noised_fraction > 0:
                 if buffer.noised_size == 0:  # initialize buffer
                     print("Initializing noised buffer")
                     reward_range = 5
