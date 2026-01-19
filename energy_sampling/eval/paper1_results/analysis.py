@@ -1,21 +1,17 @@
 import os
 
 import numpy as np
-import plotly.graph_objects as go
 import torch
-from ase.spacegroup import Spacegroup
+from plotly.subplots import make_subplots
+from umap import UMAP
 
-from energy_sampling.eval.paper1_results.figures import general_figs, cluster_comparison_fig, dim_reduction_fig, \
-    make_thermo_table, parity_fig
+from energy_sampling.eval.paper1_results.figures import general_figs, parity_fig, sample_summary_table
 from energy_sampling.eval.paper1_results.utils import get_gfn_samples, \
-    cluster_thermo_analysis, get_color_set, umap_hdbscan_clustering, generator_reward, make_kinetic_graph
+    generator_reward, get_rmsdmat, local_analysis, analyze_samples
 from energy_sampling.models import GFN
 from energy_sampling.utils import uniform_discretizer
-from examples.crystal_search_reporting import batch_compack
-from mxtaltools.analysis.crystal_rdf import compute_rdf_distmat
-from mxtaltools.common.ase_interface import ase_mol_from_crystaldata
-from mxtaltools.common.geometry_utils import crystal_parameter_distmat
 from mxtaltools.dataset_utils.utils import collate_data_list
+from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 
 torch.cuda.set_per_process_memory_fraction(0.9, device=0)
 
@@ -132,7 +128,7 @@ def view_and_save_figs(fig_dict):
 
 if __name__ == '__main__':
     # acridine lj config
-    run = 'xuldud'
+    run = 'xuldud_61_uma'
 
     if run == 'acridine':
         run_name = 'acr_lj'
@@ -157,9 +153,9 @@ if __name__ == '__main__':
         exp_sample_path = None
 
 
-    elif run == 'xuldud':
+    elif run == 'xuldud_61_lj':
         device = 'cuda'
-        num_samples = 10000
+        num_samples = 20000
         batch_size = 2000
         energy_function = 'elj'  # 'elj', 'lj' 'uma
         n_steps = 100  # critical to get this right!
@@ -177,6 +173,27 @@ if __name__ == '__main__':
         results_path = os.path.join(results_dir, rf"{run_name}_sg{sg_ind}_zp{zp}.pt")
         exp_sample_path = r"D:\crystal_datasets\xuldud\xul_csd.pkl"
 
+    elif run == 'xuldud_61_uma':
+        device = 'cuda'
+        num_samples = 10000
+        batch_size = 100
+        energy_function = 'uma'  # 'elj', 'lj' 'uma
+        n_steps = 100  # critical to get this right!
+        sg_ind = 61
+        run_name = run
+        zp = 1
+        kT = 2.5
+        clusters_to_analyze = 20
+        units = 'kJ/mol'
+        model_path = rf"D:\crystal_datasets\xuldud\xul6_sg{sg_ind}_zp{zp}_3_model_eval.pt"
+        config_path = rf"D:\crystal_datasets\xuldud\xul6_sg{sg_ind}_zp{zp}_3_model_config.npy"
+        molecule_path = r"D:\crystal_datasets\xuldud\xuldud.pt"
+        dataset_path = rf"D:\crystal_datasets\xuldud\xuldud_sg{sg_ind}_zp{zp}.pt"
+        results_dir = rf"D:\crystal_datasets\gfn_results"
+        results_path = os.path.join(results_dir, rf"{run_name}_sg{sg_ind}_zp{zp}.pt")
+        exp_sample_path = r"D:\crystal_datasets\xuldud\xul_csd.pkl"
+
+    k_vals = [50, 100, 200]  # , 50, 100]
     reload_results = True
     show_figs = True
     write_figs = False
@@ -196,14 +213,39 @@ if __name__ == '__main__':
     else:
         results_dict = sample_and_analyze()
 
-    sample_batch = results_dict['sample_batch']
-    samples = results_dict['samples']
-    sample_energy = results_dict['sample_energy']
-    sample_cp = results_dict['sample_cp']
+    exp_crystals = torch.load(exp_sample_path, weights_only=False)
+    exp_crystals = [cry for cry in exp_crystals if cry.sg_ind == sg_ind]
+    ebatch = collate_data_list(exp_crystals)
+    pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
+    predictor = init_uma_crystal_predictor(pred_path, device=device)
+    esamples = analyze_samples(
+        ebatch.latent_params(),
+        [molecule] * ebatch.num_graphs,
+        max_z_prime,
+        device,
+        1000,
+        sg_ind,
+        zp,
+        do_uma=True,
+        predictor=predictor
+    )
+
+    samples = results_dict['samples'] + esamples
+    sample_batch = collate_data_list(samples) #results_dict['sample_batch']
+    if energy_function == 'uma':
+        sample_energy = sample_batch.uma_pot / (sample_batch.sym_mult * sample_batch.z_prime) - sample_batch.uma_gas_pot
+    elif energy_function == 'elj':
+        lj_mean, lj_std, uma_mean, uma_std = [-20.6, 5.7, -3.4, 1.5]
+        atomwise_energy = sample_batch.elj / (sample_batch.num_atoms / sample_batch.z_prime)
+        atomwise_fixed = (atomwise_energy - lj_mean) / lj_std * uma_std + uma_mean
+        sample_energy = atomwise_fixed * (sample_batch.num_atoms / sample_batch.z_prime)
+    else:
+        sample_energy = sample_batch.lj
+    #sample_energy = results_dict['sample_energy']
+    #sample_cp = results_dict['sample_cp']
+    sample_cp = sample_batch.packing_coeff
     sample_latents = sample_batch.latent_params()  # results_dict['sample_latents']  # these are sometimes wrong for xul
-
-    #kinetic_graph = make_kinetic_graph(samples[0], sample_batch, kT)
-
+    # collate_data_list([samples[ind] for ind in torch.argsort(rmsdmat[-1])[:10]]).mol2cluster().visualize(mode='unit cell')
     if energy_function == 'uma':
         sample_batch.uma = sample_batch.uma_pot / (
                 sample_batch.sym_mult * sample_batch.z_prime) - sample_batch.uma_gas_pot
@@ -217,81 +259,77 @@ if __name__ == '__main__':
         energy_clip=None
     )
 
+    """distance calculations"""
+    rmsdmat = get_rmsdmat(sample_batch.clone())
+    # lat_dmat = crystal_parameter_distmat(sample_latents).fill_diagonal_(0).detach()
 
-    "Clustering"
-    dmat = crystal_parameter_distmat(sample_latents).fill_diagonal_(0).detach()
+    sample_metrics = local_analysis(k_vals, sample_batch, sample_energy, rmsdmat)
+    """linear edge interpolations"""
+    # edges_dir, ens_dir = get_directed_kinetic_edges(sample_inds,
+    #                                                 samples,
+    #                                                 sample_batch,
+    #                                                 results_dir,
+    #                                                 run_name,
+    #                                                 rmsdmat,
+    #                                                 kT, d_cut=2, lat_k=50)
 
-    '''
-    sample_batch.pose_aunit(std_orientation=True)
-    sample_batch.build_unit_cell()
-    upos = sample_batch.unit_cell_pos.reshape(sample_batch.num_graphs,
-                                              sample_batch.sym_mult[0] * sample_batch.num_atoms[0], 3)
-    d2 = torch.zeros_like(dmat)
-    for ind in range(sample_batch.num_graphs):
-        d2[ind] = (upos[ind, None, ...] - upos).norm(dim=-1).mean(-1)
-    fig = go.Figure(go.Histogram2dContour(
-                x=dmat[:100].flatten().numpy(),
-                y=d2[:100].flatten().numpy(),
-                ncontours=12,
-                showscale=False,  # colorbar and (i == D - 1 and j == 0),
-                #contours=dict(coloring='none', showlines=True, start=0.0001, end=0.1, size=0.04),
-                #line=dict(smoothing=1.0, color='grey', width=2),
-                nbinsx=50,
-                nbinsy=50,
-                histnorm='probability',
-                showlegend=False))
-    fig.show()
-    '''
-    basin_weights, cluster_labels, cluster_prob, basin_inds = umap_hdbscan_clustering(
-        dmat, sample_energy,
-        n_components=6,
-        n_neighbors=10,
-        min_dist=0.01,
-        min_cluster_size=50,
-        min_samples=10,
-        kT=kT,
-    )
-    top_cluster_inds = torch.argsort(basin_weights.sum(0), descending=True).flatten()
+    """visual and local thermo analysis"""
+    umap_model = UMAP(n_components=2, n_neighbors=50, min_dist=0.01, metric='precomputed')
+    sample_embedding = umap_model.fit_transform(rmsdmat.numpy().astype(np.float64))
 
-    """
-    Make Figures
-    """
-    masks = np.array([cluster_labels == ind for ind in np.unique(cluster_labels)])
-    mask_sorts = np.argsort([sum(m) for m in masks])[::-1]
-    sorted_masks = masks[mask_sorts]
-    sample_batch.plot_batch_cell_params(space='real',
-                                        aux_dists=[sample_batch.full_cell_parameters()[m] for m in
-                                                   masks[mask_sorts[:10]] if
-                                                   sum(m) > 1])
-
-    significant_weight_clusters = sum(basin_weights.sum(0) > (basin_weights.sum(0)[0] * 0.1))
-    clusters_to_analyze = min(len(top_cluster_inds), min(clusters_to_analyze, significant_weight_clusters))
-    cluster_color = get_color_set(clusters_to_analyze, alpha=0.7)
+    candidates_to_eval = np.argwhere(sample_metrics[200]['is_local_en_minimum']).flatten()[:27]
+    #candidates_to_eval = np.argwhere(sample_metrics[200]['is_local_rho_maximum']).flatten()[:27]
+    candidates_to_eval = np.unique(np.concatenate([candidates_to_eval, [sample_batch.num_graphs - 1]])) # add experimental state
 
     fig_dict = {}
+
+    for k in k_vals:
+        thermos = np.stack(list(sample_metrics[k].values()))
+        x = sample_embedding[:, 0]
+        y = sample_embedding[:, 1]
+        n_thermos = thermos.shape[0]
+        fig = make_subplots(rows=n_thermos//4 + int(n_thermos % 4 > 0), cols=4, subplot_titles=list(sample_metrics[200].keys()), vertical_spacing=0.05, horizontal_spacing=0.05)
+        for ind in range(len(thermos)):
+            c = thermos[ind]
+            fig.add_scatter(x=x, y=y, marker_color=c, mode='markers',
+                            opacity=0.7, marker_size=4, showlegend=False,
+                            marker_colorscale='icefire',
+                            row=ind // 4 + 1, col=ind % 4 + 1)
+        fig_dict[f'umap_{k}'] = fig
+
+        # todo nice column names
+        # todo nice column
+        fig = sample_summary_table(sample_metrics, [k], candidates_to_eval)
+        # #, good_keys = [
+        #     'basin_min_en',
+        #     'basin_std_en',
+        #     'log_rho',
+        #     'grad_mag',
+        #     'd_eff',
+        #     'softness',
+        # ])
+        fig_dict[f'table_{k}'] = fig
+
+    import plotly.graph_objects as go
+
+    labels = list(sample_metrics[k].keys())
+    corr = np.corrcoef(thermos / (1e-3 + np.std(thermos, axis=1)[:, None]))
+    np.fill_diagonal(corr, 0)
+    go.Figure(go.Heatmap(z=corr, x=labels, y=labels)).show()
+
     fig_dict = general_figs(fig_dict, sample_batch, sample_energy, data_batch, units=units)
+    # todo qualitative UMAP fig over PCs of these metrics. Typically density dominates PC1 and anisotropy (log_cond) PC2. gauss_entropy active in both
 
-    min_ens, Zb, Fb, basin_probs, mean_rho, Sb, mean_E = cluster_thermo_analysis(basin_weights, sample_energy, kT,
-                                                                                 sample_cp, cluster_labels,
-                                                                                 top_cluster_inds)
+    # todo per-sample reporting
+    # energy, local density, d_eff, log_cond, grad_mag, escape barrier (kinetic), over a few representative samples
 
-    fig_dict['clusters'] = cluster_comparison_fig(top_cluster_inds,
-                                                  sample_cp, sample_energy, cluster_labels,
-                                                  sample_batch, 8, sample_latents,
-                                                  cluster_color,
-                                                  )
-    fig_dict['Thermo Table'] = make_thermo_table(Zb, basin_probs, Fb, mean_E, min_ens, Sb, mean_rho,
-                                                 cluster_labels, clusters_to_analyze,
-                                                 units=units)
 
-    fig_dict['Dim Reduction'] = dim_reduction_fig(dmat,
-                                                  cluster_labels,
-                                                  clusters_to_analyze,
-                                                  cluster_color,
-                                                  basin_inds)
+    for fig in fig_dict.values():
+        fig.show()
+
     fig_dict['tb'] = parity_fig(
         y_raw=results_dict['log_pfs'] + results_dict['learned_log_z'],
-        x_raw=results_dict['log_pbs'] + rewards,
+        x_raw=results_dict['log_pbs'] + rewards[len(results_dict['log_pbs'])],
         y_label=r'$log(P_f(\tau)) + log(R(x_T))$',
         x_label=r'$log(P_b(\tau|x_T)) + log(Z_\theta)$',
     )
@@ -299,33 +337,33 @@ if __name__ == '__main__':
     view_and_save_figs(fig_dict)
 
     'best samples analysis'
-    best_samples = [samples[ind] for ind in top_cluster_inds[:clusters_to_analyze]]
-    best_batch = collate_data_list(best_samples)
-    clusters = best_batch.mol2cluster(cutoff=6)
-
-    for ii, ind in enumerate(top_cluster_inds[:clusters_to_analyze]):
-        mol = ase_mol_from_crystaldata(clusters, index=ii, mode='unit cell')
-        mol.info['spacegroup'] = Spacegroup(sg_ind, setting=1)
-        mol.write(os.path.join(results_dir, f'{run_name}_{ii}.cif'))
-
-    bin_edges = torch.linspace(0, 6, sample_batch.rdf.shape[-1], )
-    dmat = compute_rdf_distmat(sample_batch.rdf[top_cluster_inds[:clusters_to_analyze]], bin_edges,
-                               chunk_size=10000)
-    go.Figure(go.Heatmap(z=dmat)).show()
-
-    clusters.visualize(mode='unit cell')
-
-    matchess, rmsdss = [], []
-    for ind in range(best_batch.num_graphs):
-        matches, rmsds = batch_compack([ind for ind in range(best_batch.num_graphs)],
-                                       best_samples,
-                                       collate_data_list([best_samples[ind]]).mol2cluster(cutoff=6))
-        matchess.append(matches)
-        rmsdss.append(rmsds)
-
-    matched = np.stack(matchess)
-    rmsds = np.stack(rmsdss)
-    go.Figure(go.Scatter(x=(rmsds / matched).flatten(), y=dmat.flatten(), mode='markers')).show()
+    # best_samples = [samples[ind] for ind in top_cluster_inds[:clusters_to_analyze]]
+    # best_batch = collate_data_list(best_samples)
+    # clusters = best_batch.mol2cluster(cutoff=6)
+    #
+    # for ii, ind in enumerate(top_cluster_inds[:clusters_to_analyze]):
+    #     mol = ase_mol_from_crystaldata(clusters, index=ii, mode='unit cell')
+    #     mol.info['spacegroup'] = Spacegroup(sg_ind, setting=1)
+    #     mol.write(os.path.join(results_dir, f'{run_name}_{ii}.cif'))
+    #
+    # bin_edges = torch.linspace(0, 6, sample_batch.rdf.shape[-1], )
+    # dmat = compute_rdf_distmat(sample_batch.rdf[top_cluster_inds[:clusters_to_analyze]], bin_edges,
+    #                            chunk_size=10000)
+    # go.Figure(go.Heatmap(z=dmat)).show()
+    #
+    # clusters.visualize(mode='unit cell')
+    #
+    # matchess, rmsdss = [], []
+    # for ind in range(best_batch.num_graphs):
+    #     matches, rmsds = batch_compack([ind for ind in range(best_batch.num_graphs)],
+    #                                    best_samples,
+    #                                    collate_data_list([best_samples[ind]]).mol2cluster(cutoff=6))
+    #     matchess.append(matches)
+    #     rmsdss.append(rmsds)
+    #
+    # matched = np.stack(matchess)
+    # rmsds = np.stack(rmsdss)
+    # go.Figure(go.Scatter(x=(rmsds / matched).flatten(), y=dmat.flatten(), mode='markers')).show()
 
 "analyze experimental samples"
 if False:  # exp_sample_path is not None:
@@ -439,3 +477,71 @@ if False:  # exp_sample_path is not None:
 
     sample_batch.plot_batch_cell_params(space='real', ref_dist=ebatch.full_cell_parameters().repeat(2, 1),
                                         show=True)
+
+    '''
+    # compare RMSD to latent dist
+    sample_batch.pose_aunit(std_orientation=True)
+    sample_batch.build_unit_cell()
+    upos = sample_batch.unit_cell_pos.reshape(sample_batch.num_graphs,
+                                              sample_batch.sym_mult[0] * sample_batch.num_atoms[0], 3)
+    d2 = torch.zeros_like(dmat)
+    for ind in range(sample_batch.num_graphs):
+        d2[ind] = (upos[ind, None, ...] - upos).norm(dim=-1).mean(-1)
+    fig = go.Figure(go.Histogram2dContour(
+                x=dmat[:100].flatten().numpy(),
+                y=d2[:100].flatten().numpy(),
+                ncontours=12,
+                showscale=False,  # colorbar and (i == D - 1 and j == 0),
+                #contours=dict(coloring='none', showlines=True, start=0.0001, end=0.1, size=0.04),
+                #line=dict(smoothing=1.0, color='grey', width=2),
+                nbinsx=50,
+                nbinsy=50,
+                histnorm='probability',
+                showlegend=False))
+    fig.show()
+    '''
+
+    #     basin_weights, cluster_labels, cluster_prob, basin_inds = umap_hdbscan_clustering(
+    #         dmat, sample_energy,
+    #         n_components=6,
+    #         n_neighbors=10,
+    #         min_dist=0.01,
+    #         min_cluster_size=50,
+    #         min_samples=10,
+    #         kT=kT,
+    #     )
+    #     top_cluster_inds = torch.argsort(basin_weights.sum(0), descending=True).flatten()
+    #
+    #     """
+    #     Make Figures
+    #     """
+    #     masks = np.array([cluster_labels == ind for ind in np.unique(cluster_labels)])
+    #     mask_sorts = np.argsort([sum(m) for m in masks])[::-1]
+    #     sorted_masks = masks[mask_sorts]
+    #     sample_batch.plot_batch_cell_params(space='real',
+    #                                         aux_dists=[sample_batch.full_cell_parameters()[m] for m in
+    #                                                    masks[mask_sorts[:10]] if
+    #                                                    sum(m) > 1])
+    #
+    #     significant_weight_clusters = sum(basin_weights.sum(0) > (basin_weights.sum(0)[0] * 0.1))
+    #     clusters_to_analyze = min(len(top_cluster_inds), min(clusters_to_analyze, significant_weight_clusters))
+    #     cluster_color = get_color_set(clusters_to_analyze, alpha=0.7)
+    #
+    # min_ens, Zb, Fb, basin_probs, mean_rho, Sb, mean_E = cluster_thermo_analysis(basin_weights, sample_energy, kT,
+    #                                                                              sample_cp, cluster_labels,
+    #                                                                              top_cluster_inds)
+    #
+    # fig_dict['clusters'] = cluster_comparison_fig(top_cluster_inds,
+    #                                               sample_cp, sample_energy, cluster_labels,
+    #                                               sample_batch, 8, sample_latents,
+    #                                               cluster_color,
+    #                                               )
+    # fig_dict['Thermo Table'] = make_thermo_table(Zb, basin_probs, Fb, mean_E, min_ens, Sb, mean_rho,
+    #                                              cluster_labels, clusters_to_analyze,
+    #                                              units=units)
+    #
+    # fig_dict['Dim Reduction'] = dim_reduction_fig(dmat,
+    #                                               cluster_labels,
+    #                                               clusters_to_analyze,
+    #                                               cluster_color,
+    #                                               basin_inds)

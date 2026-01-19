@@ -662,5 +662,5 @@ def noise_buffer(max_noise_level, noised_fraction, buffer, energy_function, rewa
     return reward_record, sample_record
 
 
-def stdz(x):
-    return (x - x.mean()) / x.std()
+def stdz(x, eps:float=1e-6):
+    return (x - x.mean()) / (x.std()+eps)

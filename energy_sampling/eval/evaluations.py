@@ -644,10 +644,10 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
 
 
 @torch.no_grad()
-def bwd_evaluation(buffer, gfn_model, discretizer, batch_size, do_figs: Optional[bool] = False):
+def bwd_evaluation(buffer, gfn_model, discretizer, batch_size, eval_num_samples, do_figs: Optional[bool] = False):
 
     log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, log_r = analyze_buffer(
-        buffer, discretizer, gfn_model, batch_size)
+        buffer, discretizer, gfn_model, batch_size, eval_num_samples)
 
     metrics = {}
     fig_dict = {}
@@ -723,9 +723,8 @@ def bwd_figs(b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, bac
     return fig_dict
 
 
-def analyze_buffer(buffer, discretizer, gfn_model, batch_size):
-    sample_inds = torch.arange(len(buffer))
-    num_samples = len(sample_inds)
+def analyze_buffer(buffer, discretizer, gfn_model, batch_size, num_samples):
+    #sample_inds = torch.arange(len(buffer))
     num_batches = num_samples // batch_size + int((num_samples % batch_size) != 0)
     acc = dict(
         backward_flow_states=[],
@@ -739,16 +738,16 @@ def analyze_buffer(buffer, discretizer, gfn_model, batch_size):
         log_z=[],
     )
     for b_ind in range(num_batches):
-        start = b_ind * batch_size
-        end = min((b_ind + 1) * batch_size, num_samples)
-        if start >= end:
-            break
-
-        inds = sample_inds[start:end]
+        # start = b_ind * batch_size
+        # end = min((b_ind + 1) * batch_size, num_samples)
+        # if start >= end:
+        #     break
+        #
+        # inds = sample_inds[start:end]
 
         terminal_state, log_r, crystal_batch, condition = buffer.sample(
             override_batch=batch_size,
-            override_sample_inds=inds
+            #override_sample_inds=inds
         )
 
         terminal_state = terminal_state.to(gfn_model.device)

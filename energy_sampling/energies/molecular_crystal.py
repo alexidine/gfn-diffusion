@@ -381,7 +381,7 @@ class MolecularCrystal(BaseSet):
         else:
             data_list = mol_batch.to_data_list()
         already_oomed = False
-        while cursor < n_samples:
+        while cursor < n_samples: # todo get a single unified interface for all the places we do this
             try:
                 inds = np.arange(cursor, min(n_samples, cursor + self.batch_size))
                 mol_batch_i = collate_data_list([data_list[ind] for ind in inds])

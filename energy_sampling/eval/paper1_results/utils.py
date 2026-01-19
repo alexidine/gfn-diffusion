@@ -1,19 +1,25 @@
 import gc
+import os
 import re
 from collections import Counter
+from collections import deque
 from time import sleep
+from typing import Optional
 
-import torch.nn.functional as F
 import hdbscan
 import numpy as np
 import pandas as pd
 import plotly.colors as pc
+import scipy.sparse as sp
 import torch
+import torch.nn.functional as F
 from _plotly_utils.colors import qualitative, hex_to_rgb
 from matplotlib import cm, colors
 from plotly import graph_objects as go
 from plotly.subplots import make_subplots
+from pynndescent.distances import spearmanr
 from scipy.cluster.hierarchy import linkage, to_tree, leaves_list
+from scipy.sparse.csgraph import connected_components
 from scipy.spatial.distance import pdist
 from sklearn.cluster import estimate_bandwidth, MeanShift
 from sklearn.neighbors import NearestNeighbors
@@ -28,6 +34,13 @@ from mxtaltools.common.geometry_utils import crystal_parameter_distmat
 from mxtaltools.common.utils import log_rescale_positive
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
+
+METRIC_REGISTRY = {}
+
+# 2. Define the decorator
+def register_metric(func):
+    METRIC_REGISTRY[func.__name__] = func
+    return func
 
 
 def cluster_1d(X):
@@ -639,40 +652,59 @@ def sample_from_gfn(num_samples, max_z_prime, device, n_steps, batch_size, gfn_m
 
 
 def analyze_samples(x, mol_list, max_z_prime, device, batch_size, sg_ind, zp, do_uma: bool = False, predictor=None):
-    num_batches = len(mol_list) // batch_size + (1 if len(mol_list) % batch_size else 0)
     num_samples = len(mol_list)
     samples = []
-    counter = 0
-
+    cursor = 0
+    already_oomed = False
     with tqdm(total=num_samples) as pbar:
         with torch.no_grad():
-            for b_ind in range(num_batches):
-                inds = torch.arange(b_ind * batch_size, min((b_ind + 1) * batch_size, num_samples))
-                for elem in mol_list:
-                    elem.z_prime = zp
-                batch = collate_data_list([mol_list[ind] for ind in inds], max_z_prime=max_z_prime)
-                batch.reset_sg_info(sg_ind)
-                batch.latent_to_cell_params(x[inds])
-                batch = batch.to(device)
-                outs = batch.analyze(['lj', 'qlj', 'elj', 'silu', 'rdf'], cutoff=10, std_orientation=True)
-                if do_uma:
-                    gas_en = batch.compute_lattice_gas_phase_uma(predictor,
-                                                                 std_orientation=True).cpu().detach() * 96.485
-                    cry_en = batch.compute_crystal_uma(predictor=predictor,
-                                                       std_orientation=True).cpu().detach() * 96.485
-                    batch.add_graph_attr(gas_en, 'uma_gas_pot')
-                    batch.add_graph_attr(cry_en, 'uma_pot')
+            try:
+                while cursor < num_samples:
+                    inds = np.arange(cursor, min(num_samples, cursor + batch_size))
+                    for elem in mol_list:
+                        elem.z_prime = zp
+                    batch = collate_data_list([mol_list[ind] for ind in inds], max_z_prime=max_z_prime)
+                    batch.reset_sg_info(sg_ind)
+                    batch.latent_to_cell_params(x[inds])
+                    batch = batch.to(device)
+                    outs = batch.analyze(['lj', 'qlj', 'elj', 'silu', 'rdf'], cutoff=10, std_orientation=True)
+                    if do_uma:
+                        gas_en = batch.compute_lattice_gas_phase_uma(predictor,
+                                                                     std_orientation=True).cpu().detach() * 96.485
+                        cry_en = batch.compute_crystal_uma(predictor=predictor,
+                                                           std_orientation=True).cpu().detach() * 96.485
+                        batch.add_graph_attr(gas_en, 'uma_gas_pot')
+                        batch.add_graph_attr(cry_en, 'uma_pot')
 
-                for key, value in outs.items():
-                    if key != 'rdf':
-                        batch.add_graph_attr(value, key)
-                    else:
-                        batch.add_graph_attr(value[0], key)
-                batch.to('cpu')
-                samples.extend(batch.batch_to_list())
-                del batch
-                counter += batch_size
-                pbar.update(batch_size)
+                    for key, value in outs.items():
+                        if key != 'rdf':
+                            batch.add_graph_attr(value, key)
+                        else:
+                            batch.add_graph_attr(value[0], key)
+
+                    batch.to('cpu')
+                    samples.extend(batch.batch_to_list())
+                    del batch
+                    cursor += batch_size
+                    if (batch_size <= 10000) and (batch_size < num_samples) and not already_oomed:
+                        batch_size += max(int(batch_size * 0.01), 1)
+                    pbar.update(batch_size)
+            except (RuntimeError, ValueError) as e:
+                if is_cuda_oom(e):
+                    if batch_size == 1:
+                        assert False, "Cascading OOM failure in molecule energy evaluation"
+                    batch_size = max(int(batch_size * 0.65), 1)
+                    print(f"OOM in energy evaluation: dropping batch size to {batch_size}")
+                    gc.collect()
+                    # del self.uma_predictor, mol_batch_i
+                    torch.cuda.empty_cache()
+                    # torch.cuda.reset_peak_memory_stats()
+                    torch.cuda.synchronize()
+                    # self.uma_predictor = init_uma_crystal_predictor(self.uma_path, device=self.device)
+                    already_oomed = True
+                    sleep(0.1)
+                else:
+                    raise e
 
     return samples
 
@@ -975,7 +1007,8 @@ def get_gfn_samples(num_samples, max_z_prime, device, n_steps, batch_size, gfn_m
 
 
 def cluster_thermo_analysis(basin_weights, sample_energy, kT, cp, cluster_labels, top_cluster_inds):
-    min_ens = torch.tensor([sample_energy[cluster_labels == lab].amin() for lab in cluster_labels.unique()])[top_cluster_inds]
+    min_ens = torch.tensor([sample_energy[cluster_labels == lab].amin() for lab in cluster_labels.unique()])[
+        top_cluster_inds]
 
     # Basin partition weights
     Zb = basin_weights.sum(dim=0).clamp(min=1e-12)  # (B,)
@@ -1052,8 +1085,8 @@ def get_gfn_logprobs(batch_size, sample_latents, gfn_model, n_steps, max_repeats
     return logps
 
 
-def umap_hdbscan_clustering(dmat, sample_energy, n_components, n_neighbors, min_dist, min_cluster_size, min_samples, kT):
-
+def umap_hdbscan_clustering(dmat, sample_energy, n_components, n_neighbors, min_dist, min_cluster_size, min_samples,
+                            kT):
     umap_model = UMAP(n_components=n_components,
                       n_neighbors=n_neighbors,
                       min_dist=min_dist,
@@ -1069,7 +1102,8 @@ def umap_hdbscan_clustering(dmat, sample_energy, n_components, n_neighbors, min_
     )
     cluster_labels = clusterer.fit_predict(sample_embedding)
     num_clusters = len(np.unique(cluster_labels[cluster_labels != -1]))
-    cluster_labels[cluster_labels == -1] = np.random.randint(low=0, high=num_clusters, size=(cluster_labels == -1).sum())
+    cluster_labels[cluster_labels == -1] = np.random.randint(low=0, high=num_clusters,
+                                                             size=(cluster_labels == -1).sum())
     cluster_labels = torch.tensor(cluster_labels, dtype=torch.long)
 
     "get soft assignments"
@@ -1098,7 +1132,7 @@ def umap_hdbscan_clustering(dmat, sample_energy, n_components, n_neighbors, min_
     cluster_rep_inds = torch.empty(num_clusters, dtype=torch.long, device=cluster_labels.device)
 
     for k in range(num_clusters):
-        mask = (cluster_labels == k)# & (cluster_prob > 0.95)
+        mask = (cluster_labels == k)  # & (cluster_prob > 0.95)
         inds = torch.where(mask)[0]
 
         # pairwise distances within basin
@@ -1322,7 +1356,7 @@ def reduce_min_barrier(pairs, barriers, num_basins):
 
 def merge_edges_kT(bi, bj, barrier_ij, Emin, kT):
     delta = barrier_ij - torch.minimum(Emin[bi], Emin[bj])  # uphill merge rule
-    #delta = barrier_ij - torch.maximum(Emin[bi], Emin[bj])  # downhill merge rule
+    # delta = barrier_ij - torch.maximum(Emin[bi], Emin[bj])  # downhill merge rule
     mask = delta < kT
     return bi[mask], bj[mask]
 
@@ -1390,7 +1424,7 @@ def kinetic_clustering(sample_latents, sample_energy, cval, kT):
     num_basins = len(init_basins_unique)  # Actual count
 
     N = dmat.shape[0]
-    k = 5 #sample_latents.shape[1]
+    k = 5  # sample_latents.shape[1]
     knn = dmat.topk(min(dmat.shape[1], k + 1), largest=False).indices[:, 1:]
 
     Emin = basin_min_energy(init_basins_contiguous, sample_energy)
@@ -1465,7 +1499,7 @@ def compute_zp_order_penalty(bounding_energy, crystal_batch):
 
 def generator_reward(crystal_batch, raw_latents, max_z_prime,
                      energy_function, temperature,
-                     energy_clip, lj_coeff = 1, bounding_coeff = 10, reduction_coeff = 10, density_coeff = 10):
+                     energy_clip, lj_coeff=1, bounding_coeff=10, reduction_coeff=10, density_coeff=10):
     ens_dict = {}
 
     latents = crystal_batch.latent_params()
@@ -1497,7 +1531,7 @@ def generator_reward(crystal_batch, raw_latents, max_z_prime,
         if energy_function in ['lj', 'qlj', 'elj'] and lj_rescale is not None:
             # rescale functions with LJ-type minima to uma statistics
             lj_mean, lj_std, uma_mean, uma_std = lj_rescale
-            atomwise_energy = mol_energy/(crystal_batch.num_atoms / crystal_batch.z_prime)
+            atomwise_energy = mol_energy / (crystal_batch.num_atoms / crystal_batch.z_prime)
             atomwise_fixed = (atomwise_energy - lj_mean) / lj_std * uma_std + uma_mean
             mol_energy = atomwise_fixed * (crystal_batch.num_atoms / crystal_batch.z_prime)
 
@@ -1511,12 +1545,11 @@ def generator_reward(crystal_batch, raw_latents, max_z_prime,
     else:
         reduction_energy = torch.zeros_like(bounding_energy)
 
-
     crystal_energy = lj_coeff * mol_energy + density_coeff * density_energy
 
     if energy_clip is not None:
         total_energy = (log_rescale_positive(crystal_energy,
-                                            energy_clip) +
+                                             energy_clip) +
                         bounding_energy * bounding_coeff +
                         reduction_energy * reduction_coeff)
         total_energy = log_rescale_positive(total_energy, energy_clip + 0.1 * np.abs(energy_clip))
@@ -1525,84 +1558,20 @@ def generator_reward(crystal_batch, raw_latents, max_z_prime,
 
     return -total_energy / temperature
 
+
 @torch.no_grad()
-def make_kinetic_graph(base_sample, sample_batch, kT, n_points=10):
+def make_kinetic_graph(base_sample, sample_batch, n_points=10):
     ""
-
-    'make latent space knn'
-    latents = sample_batch.latent_params()
-    latent_dmat = sample_batch.latent_distmat()
-    lat_k = 5
-    lat_knn = latent_dmat.topk(lat_k + 1, largest=False).indices[:, 1:]
-
-    'get all edges to be interpolated'
-    N, k = lat_knn.shape
-
-    src = torch.arange(N, device=lat_knn.device).repeat_interleave(k)
-    dst = lat_knn.reshape(-1)
-
-    edge_index = torch.stack([src, dst], dim=0)  # (2, N*k)
-
-    'iterate over edges'
-    num_trajs = edge_index.shape[1]
-    batch_size = 1000
-
-    ens = torch.zeros(num_trajs, n_points, device='cpu', dtype=torch.float32)
-    finished = False
-    cursor = 0
-    pbar = tqdm(total=num_trajs, unit="samples")
-    while not finished:
-        try:
-            batch_inds = torch.arange(cursor, min(cursor + batch_size, num_trajs))
-            src_lat = latents[edge_index[0, batch_inds]]
-            tgt_lat = latents[edge_index[1, batch_inds]]
-            paths = torch.linspace(0, 1, n_points)
-            paths = src_lat[None] + paths[:, None, None] * (tgt_lat - src_lat)
-            #paths = paths[1:-1,...]  # exclude endpoints
-            paths = paths.clip(min=-1, max=1)
-            x = paths.reshape(-1, paths.shape[2]).to('cuda')
-
-            sample = base_sample.clone()
-            traj_batch = collate_data_list([sample for _ in range(len(x))]).to('cuda')
-            traj_batch.latent_to_cell_params(x)
-            en = traj_batch.analyze(['elj'])['elj'].cpu()
-            ens[batch_inds, :] = en.reshape(paths.shape[:2]).T
-
-            pbar.update(min(batch_size, num_trajs - cursor))  # safe final update
-
-            cursor += batch_size
-            if cursor >= num_trajs:
-                finished = True
-            else:
-                batch_size = int(batch_size * 1.01) # keep pushing the batch size between sets
-                #print(f"Boosting batch size to {batch_size}")
-
-        except (RuntimeError, ValueError) as e:
-            if is_cuda_oom(e):
-                batch_size = max(int(batch_size * 0.9), 1)
-                print(f"OOM error: dropping batch size to {batch_size}")
-                gc.collect()
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-                sleep(0.1)
-
-            else:
-                raise e
-
-    E_src = ens[:,0]#.elj[edge_index[0,:]]
-    E_dst = ens[:,-1]#sample_batch.elj[edge_index[1,:]]
+    edge_index, ens = kinetic_knn_interpolation(base_sample, n_points, sample_batch)
+    E_src = ens[:, 0]  # .elj[edge_index[0,:]]
+    E_dst = ens[:, -1]  # sample_batch.elj[edge_index[1,:]]
     gamma = 3.0  # try 3, 5, 10
     kT = 2.5
     Ecut = gamma * kT
     barrier = ens.amax(dim=1) - torch.minimum(E_src, E_dst)
-
     keep = barrier <= Ecut
     edges = edge_index[:, keep]
-
-    import scipy.sparse as sp
-    from scipy.sparse.csgraph import connected_components
-
-    N = latents.shape[0]
+    N = sample_batch.num_graphs.shape[0]
     A = sp.coo_matrix(
         (np.ones(edges.shape[1]),
          (edges[0].cpu(), edges[1].cpu())),
@@ -1622,3 +1591,322 @@ def make_kinetic_graph(base_sample, sample_batch, kT, n_points=10):
     [print(sum(m)) for m in sorted_masks[:20]]
     degree_gamma = A.sum(axis=1)
     go.Figure(go.Histogram(x=np.array(degree_gamma).flatten())).show()
+
+
+def kinetic_knn_interpolation(base_sample, n_points, lat_k, sample_batch, dmat, d_cut: float,
+                              valid_sources: Optional[torch.Tensor] = None):
+    'make latent space knn'
+    latents = sample_batch.latent_params()
+    lat_knn = dmat.topk(lat_k + 1, largest=False).indices[:, 1:]
+    'get all edges to be interpolated'
+    N, k = lat_knn.shape
+    src = torch.arange(N, device=lat_knn.device).repeat_interleave(k)
+    dst = lat_knn.reshape(-1)
+    edge_index = torch.stack([src, dst], dim=0)  # (2, N*k)
+    "prune long edges"
+    dist = dmat[edge_index[0], edge_index[1]]
+    edge_index = edge_index[:, dist < d_cut]
+
+    "prune to valid sources"
+    if valid_sources is not None:
+        keep_edges = torch.isin(edge_index[0], valid_sources)
+        edge_index = edge_index[:, keep_edges]
+
+    'iterate over edges'
+    num_trajs = edge_index.shape[1]
+    batch_size = 500
+    ens = torch.zeros(num_trajs, n_points, device='cpu', dtype=torch.float32)
+    finished = False
+    cursor = 0
+    pbar = tqdm(total=num_trajs, unit="samples")
+    while not finished:
+        try:
+            batch_inds = torch.arange(cursor, min(cursor + batch_size, num_trajs))
+            src_lat = latents[edge_index[0, batch_inds]]
+            tgt_lat = latents[edge_index[1, batch_inds]]
+            paths = torch.linspace(0, 1, n_points)
+            paths = src_lat[None] + paths[:, None, None] * (tgt_lat - src_lat)
+            # paths = paths[1:-1,...]  # exclude endpoints
+            paths = paths.clip(min=-1, max=1)
+            x = paths.reshape(-1, paths.shape[2]).to('cuda')
+
+            sample = base_sample.clone()
+            traj_batch = collate_data_list([sample for _ in range(len(x))]).to('cuda')
+            traj_batch.latent_to_cell_params(x)
+            en = traj_batch.analyze(['elj'], cutoff=10)['elj'].cpu()
+            ens[batch_inds, :] = en.reshape(paths.shape[:2]).T
+
+            pbar.update(min(batch_size, num_trajs - cursor))  # safe final update
+
+            cursor += batch_size
+            if cursor >= num_trajs:
+                finished = True
+            else:
+                batch_size = int(batch_size * 1.01)  # keep pushing the batch size between sets
+                # print(f"Boosting batch size to {batch_size}")
+
+        except (RuntimeError, ValueError) as e:
+            if is_cuda_oom(e):
+                batch_size = max(int(batch_size * 0.9), 1)
+                print(f"OOM error: dropping batch size to {batch_size}")
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                sleep(0.1)
+
+            else:
+                raise e
+
+    return edge_index, ens
+
+
+def get_rmsdmat(sample_batch, radius: float = 5):
+    sample_batch.pose_aunit(std_orientation=True)
+    sample_batch.build_unit_cell()
+    upos = sample_batch.unit_cell_pos.reshape(sample_batch.num_graphs,
+                                              sample_batch.sym_mult[0] * sample_batch.num_atoms[0], 3)
+    #
+    # num_graphs = sample_batch.num_graphs
+    # device = upos.device
+    # if num_graphs > 10000:
+    #     all_indices = []
+    #     all_values = []
+    #     for ind in range(num_graphs):
+    #         # Calculate one full row of distances: (1, num_graphs)
+    #         # Using .norm and .mean to get the RMSD-like average distance
+    #         row_dist = (upos[ind, None, ...] - upos).norm(dim=-1).mean(-1)
+    #
+    #         # Apply hard cutoff
+    #         mask = row_dist <= radius
+    #
+    #         # Get the indices where the condition is true
+    #         # .nonzero() returns the indices of the neighbors
+    #         neighbor_idxs = torch.nonzero(mask).flatten()
+    #         vals = row_dist[neighbor_idxs]
+    #
+    #         # Store
+    #         rows = torch.full_all((len(vals),), ind, dtype=torch.long, device=upos.device)
+    #         all_indices.append(torch.stack([rows, neighbor_idxs], dim=0))
+    #         all_values.append(vals)
+    #
+    #     indices = torch.cat(all_indices, dim=1)
+    #     values = torch.cat(all_values)
+    #
+    #     # Create the sparse COO tensor
+    #     sparse_rmsd = torch.sparse_coo_tensor(
+    #         indices, values, size=(num_graphs, num_graphs)
+    #     ).coalesce()
+    # else:
+
+    rmsdmat = torch.zeros(sample_batch.num_graphs, sample_batch.num_graphs)
+    for ind in range(sample_batch.num_graphs):
+        rmsdmat[ind] = (upos[ind, None, ...] - upos).norm(dim=-1).mean(-1)
+
+    return rmsdmat
+
+
+def get_directed_kinetic_edges(sample_inds, samples, sample_batch, results_dir, run_name, rmsdmat, kT, d_cut: float = 2,
+                               lat_k: int = 50):
+    nn_dist = rmsdmat.fill_diagonal_(100).amin(0).median()
+    if True:  # not os.path.exists(results_dir + f'/{run_name}_kinetics.pt'):
+        edges, ens = kinetic_knn_interpolation(samples[0], 10, lat_k, sample_batch, rmsdmat, d_cut,
+                                               valid_sources=torch.as_tensor(sample_inds))
+    else:
+        edges, ens = torch.load(results_dir + f'/{run_name}_kinetics.pt')
+    '''   # a cheaper way
+    converged = False
+    max_iter = 50
+    iter = 0
+    sources = torch.as_tensor(sample_inds)
+    edges_list = []
+    ens_list = []
+    visited = torch.zeros(sample_batch.num_graphs, dtype=torch.bool, device=sources.device)
+    while not converged and iter < max_iter:
+        visited[sources] = True
+        edges, ens = kinetic_knn_interpolation(samples[0], 10, lat_k, sample_batch, rmsdmat, d_cut, valid_sources=sources)
+        edges_list.extend(edges.T)
+        ens_list.extend(ens)
+
+        # check for reachable neighbors
+        dir_barrier = ens.amax(dim=1) - ens[:, 0]
+        valid = torch.argwhere(dir_barrier < kT).flatten().unique()
+        # stop if there are no more valid hops
+        if len(valid) == 0:
+            converged = True
+
+        # barriers successfully hopped are the new source nodes
+        sources = edges[1, valid]
+        sources = sources[~visited[sources]]
+        if len(sources) == 0:
+            converged = True
+
+        iter += 1
+    '''
+    # dist = rmsdmat[edges[0], edges[1]]
+
+    "2A kNN edges, and linearly interpolated energy profiles"
+    E_src = ens[:, 0]
+    # E_dst = ens[:, 1]
+
+    # directed barrier
+    barrier_dir = ens.max(dim=1).values - E_src
+    # dist = (rmsdmat[edges[0]] - rmsdmat[edges[1]]).norm(dim=1)
+    Ecut = kT
+    keep = barrier_dir <= Ecut
+    edges_dir = edges[:, keep]  # directed edges i -> j
+    # dist_dir = dist[keep]
+    ens_dir = ens[keep]
+
+    return edges_dir, ens_dir
+
+@register_metric
+def anisotropy(w, **kwargs):
+    return np.log(w[-1] / w[0]) if len(w) >= 2 else 0
+
+@register_metric
+def d_eff(w, k, **kwargs):
+    if len(w) < 2:
+        return 0
+    p = w / w.sum()
+    return np.exp(-np.sum(p * np.log(p))) / k
+
+@register_metric
+def gap(w, **kwargs):
+    return w[-1] / w[-2] if len(w) >= 2 else 0
+
+@register_metric
+def softness(w, **kwargs):
+    return np.log(w[-1]) if len(w) >= 2 else 0
+
+@register_metric
+def gauss_entropy(w, **kwargs):
+    return 0.5 * np.sum(np.log(w)) if len(w) >= 2 else 0
+
+@register_metric
+def local_dim(w, k, **kwargs):
+    return len(w) / k if len(w) >= 2 else 0
+
+@register_metric
+def grad_mag(w, log_rho_local, log_rho_i, **kwargs):
+    return (log_rho_local - log_rho_i).mean() if len(w) >= 2 else 0
+
+@register_metric
+def basin_radius(w, dists, **kwargs):
+    return np.amax(dists, axis=-1)
+
+@register_metric
+def basin_std(w, dists, **kwargs):
+    return np.std(dists, axis=-1)
+
+@register_metric
+def n_neighbors(w, dists, **kwargs):
+    return dists.shape[-1]
+
+@register_metric
+def basin_mean_en(w, sample_energy_local, **kwargs):
+    return np.mean(sample_energy_local, axis=-1)
+
+@register_metric
+def basin_min_en(w, sample_energy, sample_energy_local, **kwargs):
+    return min(np.amin(sample_energy_local, axis=-1), sample_energy)
+
+@register_metric
+def basin_std_en(w, sample_energy_local, **kwargs):
+    return np.std(sample_energy_local, axis=-1)
+
+@register_metric
+def is_local_en_minimum(w, sample_energy, sample_energy_local, **kwargs):
+    return np.all(sample_energy <= sample_energy_local)
+
+@register_metric
+def log_rho(w, log_rho_i, **kwargs):
+    return log_rho_i
+
+@register_metric
+def basin_max_rho( w, log_rho_local, log_rho_i, **kwargs):
+    return max(np.amax(log_rho_local), log_rho_i)
+
+@register_metric
+def basin_mean_rho(w, log_rho_local, **kwargs):
+    return np.mean(log_rho_local)
+
+@register_metric
+def is_local_rho_maximum(w, log_rho_local, log_rho_i, **kwargs):
+    return np.all(log_rho_local <= log_rho_i)
+
+@register_metric
+def energy_smoothness(dists, sample_energy_local, **kwargs):
+    # Correlation between distance from center and energy of neighbors
+    # We use the absolute difference to see if energy 'drifts' predictably
+    corr = spearmanr(dists, sample_energy_local)
+    return corr
+
+def local_analysis(k_values, sample_batch, sample_energy, dmat):
+    N = sample_batch.num_graphs
+    d2 = (dmat ** 2).numpy()
+    sample_latents = sample_batch.latent_params()
+    D = sample_latents.shape[1]
+
+    all_results = {}
+    for k in k_values:
+        nn = NearestNeighbors(
+            n_neighbors=k,
+            metric='precomputed'
+        )
+        nn.fit(dmat)
+        dists, inds = nn.kneighbors(dmat)
+
+        metrics = k_nn_analysis(D, METRIC_REGISTRY, np.arange(N), d2, dists, inds, k, sample_energy)
+
+        all_results[k] = metrics
+
+    return all_results
+
+
+def k_nn_analysis(D, METRICS, indices_to_compute, d2, dists, inds, k, sample_energy):
+    N = len(indices_to_compute)
+    metrics = {key: np.zeros(N) for key in METRICS}
+
+    if isinstance(k, list):
+        rk = [max(d) for d in dists]
+        log_rho = np.log(k) - D * np.log(rk)
+
+    elif isinstance(k, int):
+        rk = dists[:, k - 1]
+        # Local density estimate
+        H = np.eye(k) - np.ones((k, k)) / k
+        log_rho = np.log(k) - D * np.log(rk)
+
+    for i in indices_to_compute:
+        if isinstance(k, list):
+            kk = k[i]
+            H = np.eye(kk) - np.ones((kk, kk)) / kk
+        elif isinstance(k, int):
+            kk = k
+
+        inds_i = inds[i]
+        D2_local = d2[np.ix_(inds_i, inds_i)]
+
+        # centered Gram matrix (intrinsic covariance)
+        K = -0.5 * H @ D2_local @ H / (kk - 1)
+
+        w = np.linalg.eigvalsh(K)
+        w = w / (rk[i] ** 2)
+        w = w[w > 1e-10]
+
+        # Prepare context for all metrics
+        context = {
+            'w': w,
+            'log_rho_local': log_rho[inds_i],
+            'log_rho_i': log_rho[i],
+            'dists': dists[i, :k],  # distances to neighbors
+            'sample_energy_local': np.array(sample_energy[inds_i]),
+            'sample_energy': np.array(sample_energy[i]),
+            'k': k,
+        }
+
+        # Compute all metrics
+        for name, func in METRICS.items():
+            metrics[name][i] = func(**context)
+
+    return metrics

@@ -190,14 +190,14 @@ def get_gfn_forward_loss(loss_coeffs,
     assert combined_losses.isfinite().all()
     loss = combined_losses.mean()
 
+    X_side = log_pf - log_pb
+    Y_side = log_r - log_flow
+    normed_tb_residual = (X_side - Y_side).abs() / torch.maximum(torch.ones_like(Y_side), Y_side.abs())
+    normed_tb_residual = torch.nan_to_num(normed_tb_residual.detach())
+
     if report_losses:
         loss_dict = {}
-        X_side = log_pf - log_pb
-        Y_side = log_r - log_flow
-        normed_tb_residual = (X_side - Y_side).abs() / torch.maximum(torch.ones_like(Y_side),Y_side.abs())
-        normed_tb_residual = torch.nan_to_num(normed_tb_residual.detach())
-        normed_tb_residual = normed_tb_residual.clip(max=normed_tb_residual.quantile(0.95)) # exclude extreme outliers
-        loss_dict['normed_tb'] = normed_tb_residual.mean()
+        loss_dict['normed_tb'] = normed_tb_residual.clip(max=normed_tb_residual.quantile(0.95)).mean()
         if loss_coeffs.greedy > 0:
             loss_dict['greedy'] = greedy_loss.mean().detach()
         if loss_coeffs.reinforce > 0:
@@ -222,9 +222,10 @@ def get_gfn_forward_loss(loss_coeffs,
         loss_dict = None
 
     if return_exp:
-        return loss, crystal_batch.cpu().detach(), loss_dict
+        return loss, crystal_batch.cpu().detach(), loss_dict, log_r, normed_tb_residual
     else:
-        return loss, loss_dict
+        return loss, loss_dict, log_r, normed_tb_residual
+
 
 
 def get_gfn_backward_loss(loss_coeffs,
@@ -293,14 +294,15 @@ def get_gfn_backward_loss(loss_coeffs,
         combined_losses = torch.stack(losses).mean(dim=0)
     loss = combined_losses.mean()
 
+    'normed tb reporting'
+    X_side = log_pf - log_pb
+    Y_side = log_r - log_flow
+    normed_tb_residual = (X_side - Y_side).abs() / torch.maximum(torch.ones_like(Y_side), Y_side.abs())
+    normed_tb_residual = torch.nan_to_num(normed_tb_residual.detach())
+
     if report_losses:
         loss_dict = {}
-        X_side = log_pf - log_pb
-        Y_side = log_r - log_flow
-        normed_tb_residual = (X_side - Y_side).abs() / torch.maximum(torch.ones_like(Y_side), Y_side.abs())
-        normed_tb_residual = torch.nan_to_num(normed_tb_residual.detach())
-        normed_tb_residual = normed_tb_residual.clip(max=normed_tb_residual.quantile(0.95)) # exclude extreme outliers
-        loss_dict['normed_tb'] =  normed_tb_residual.mean()
+        loss_dict['normed_tb'] =  normed_tb_residual.clip(max=normed_tb_residual.quantile(0.95)).mean() # exclude outliers
         if loss_coeffs.tb > 0:
             loss_dict['tb'] = tb_loss.mean().detach()
         if loss_coeffs.vg_lb > 0:
@@ -314,7 +316,7 @@ def get_gfn_backward_loss(loss_coeffs,
     else:
         loss_dict = None
 
-    return loss, loss_dict
+    return loss, loss_dict, normed_tb_residual.detach()
 
 
 def terminal_mle(

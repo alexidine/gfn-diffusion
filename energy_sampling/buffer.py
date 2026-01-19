@@ -2,11 +2,11 @@ from typing import Optional
 
 import numpy as np
 import torch
-from scipy.spatial.transform import Rotation
+import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
 
 from mxtaltools.dataset_utils.utils import collate_data_list
-from utils import compute_sample_overlap, iter_forever
+from utils import compute_sample_overlap, iter_forever, stdz
 
 
 class CrystalReplayBuffer:
@@ -47,8 +47,11 @@ class CrystalReplayBuffer:
         self.noised_rewards = torch.zeros(self.noised_buffer_length, dtype=torch.float32, device='cpu')
         self.noised_samples = torch.zeros((self.noised_buffer_length, 6 + 6 * max_z_prime), dtype=torch.float32,
                                           device='cpu')
+        self.noised_losses = torch.zeros(self.noised_buffer_length, dtype=torch.float32, device='cpu')
+
         self.noised_ptr = 0
         self.noised_size = 0
+        self.protected_size = 0
 
     @torch.no_grad()
     def add_to_staging(self, data_list=None, data_batch=None):
@@ -81,6 +84,7 @@ class CrystalReplayBuffer:
                 self.truncate_buffer()
 
             assert len(self.dataset) == len(self.x_list) == len(self.rewards_list)
+
     def add_samples_to_dataset(self, data_list, skip_staging: bool = False):
         # batch samples
         if not skip_staging:
@@ -285,14 +289,7 @@ class CrystalReplayBuffer:
                     logits = self.beta * scores
                     logits -= np.max(logits)  # subtract max for stability
                     weights_i = np.nan_to_num(np.exp(logits)) + eps  # all samples need nonzero probability
-            elif method in ['loss']:
-                scores = np.array(self.rewards_list)
-                logits = self.beta * scores
-                logits -= np.max(logits)  # subtract max for stability
-                energy_weight = np.nan_to_num(np.exp(logits)) + eps
-                losses = np.array(self.losses_list)
-                loss_weight = (eps + losses) ** 1
-                weights_i = energy_weight * loss_weight
+
         else:
             weights_i = np.ones(len(self.x_list))
 
@@ -413,44 +410,100 @@ class CrystalReplayBuffer:
         #
         # return samples.clip(min=-6, max=6)
 
-    def add_to_noised(self, rewards, samples):
+    def add_to_noised(self, rewards, samples, losses, protect: bool = False):
         rewards = rewards.detach().to(self.device)
         samples = samples.detach().to(self.device)
+        losses = losses.detach().to(self.device)
+        if protect:
+            if self.protected_size != 0 or self.noised_size != 0:
+                assert False, "noised buffer protection only works once, and for first inputs"
+            self.protected_size = len(rewards)
 
         B = rewards.shape[0]
         ptr = self.noised_ptr
         max_size = self.noised_buffer_length
+        K = self.protected_size
 
         end = ptr + B
 
-        # Case 1: no wraparound
-        if end <= max_size:
-            self.noised_rewards[ptr:end] = rewards
-            self.noised_samples[ptr:end] = samples
+        # Case 0: buffer not yet filled to protected region
+        if self.noised_size < K:
+            # how many slots still free in protected region
+            free = K - self.noised_size
+            take = min(B, free)
+
+            self.noised_rewards[self.noised_size:self.noised_size + take] = rewards[:take]
+            self.noised_samples[self.noised_size:self.noised_size + take] = samples[:take]
+            self.noised_losses[self.noised_size:self.noised_size + take] = losses[:take]
+
+            self.noised_size += take
+
+            # nothing more to do
+            if take == B:
+                return
+
+            # spill remainder into FIFO region
+            rewards = rewards[take:]
+            samples = samples[take:]
+            losses = losses[take:]
+            B = rewards.shape[0]
+
+        # Case 1: FIFO region logic
+        ptr = self.noised_ptr
+        fifo_cap = max_size - K
+        rel_ptr = ptr - K
+        rel_end = rel_ptr + B
+
+        if rel_end <= fifo_cap:
+            # no wrap
+            self.noised_rewards[ptr:ptr + B] = rewards
+            self.noised_samples[ptr:ptr + B] = samples
+            self.noised_losses[ptr:ptr + B] = losses
         else:
-            # Case 2: wraparound
-            first = max_size - ptr
+            # wraparound
+            first = fifo_cap - rel_ptr
+
             self.noised_rewards[ptr:] = rewards[:first]
             self.noised_samples[ptr:] = samples[:first]
+            self.noised_losses[ptr:] = losses[:first]
 
-            second = end % max_size
-            self.noised_rewards[:second] = rewards[first:]
-            self.noised_samples[:second] = samples[first:]
+            second = rel_end % fifo_cap
+            start = K
+            self.noised_rewards[start:start + second] = rewards[first:]
+            self.noised_samples[start:start + second] = samples[first:]
+            self.noised_losses[start:start + second] = losses[first:]
 
-        # Update pointer & size
-        self.noised_ptr = end % max_size
+        # update pointer & size
+        self.noised_ptr = K + (rel_end % fifo_cap)
         self.noised_size = min(self.noised_size + B, max_size)
 
-    def sample_from_noised(self, num_samples):
+    @torch.no_grad()
+    def update_noised_losses(self, losses, inds, beta: float = 0.95):
+        old = self.noised_losses[inds]
+        self.noised_losses[inds] = beta * old + (1.0 - beta) * losses.cpu()
+
+    def sample_from_noised(self, num_samples, beta: float = 1.0, alpha=0.05):
         if self.noised_size == 0:
             raise RuntimeError("No noised samples available in buffer.")
 
-        idx = torch.randint(self.noised_size, (num_samples,), device=self.device)
+        losses = self.noised_losses[:self.noised_size]
+        rewards = self.noised_rewards[:self.noised_size]
+
+        score = stdz(rewards) + stdz(-losses)  # higher is better
+        weight = F.softmax(beta * score, dim=0)
+        weight = (1 - alpha) * weight + alpha / len(weight)
+        probs = weight / weight.sum()
+
+        if num_samples <= self.noised_size:
+            idx = torch.multinomial(probs, num_samples, replacement=False)
+        else:
+            idx = torch.multinomial(probs, num_samples, replacement=True)
+
 
         rewards = self.noised_rewards[idx]
         samples = self.noised_samples[idx]
 
-        return rewards, samples
+        return rewards, samples, idx
 
 
 def collate_fn(data_list):

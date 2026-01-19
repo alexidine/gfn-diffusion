@@ -1,3 +1,5 @@
+from typing import Optional
+
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -273,7 +275,45 @@ def cluster_comparison_fig(top_cluster_inds,
     return fig
 
 
-def dim_reduction_fig(dmat, hard_assignment, clusters_to_analyze, cluster_color, basin_inds,
+
+def dim_reduction_fig(sample_embedding,marker_color, colorscale: Optional[str] = 'viridis'):
+    "Umap visualization"
+    fig = go.Figure()
+    fig.add_scatter(x=sample_embedding[:, 0],
+                    y=sample_embedding[:, 1],
+                    mode='markers', opacity=0.75,
+                    marker_size=4,
+                    showlegend=False,
+                    show_colorbar=True,
+                    marker_color=marker_color,
+                    marker_colorscale=colorscale)
+
+    fig.update_yaxes(linecolor='black', mirror=True,
+                     showgrid=True, zeroline=True)
+    fig.update_xaxes(linecolor='black', mirror=True,
+                     showgrid=True, zeroline=True)
+
+    fig.update_xaxes(tickfont=dict(color="rgba(0,0,0,0)", size=1))
+    fig.update_yaxes(tickfont=dict(color="rgba(0,0,0,0)", size=1))
+    fig.update_layout(font=dict(size=16))
+    fig.update_layout(plot_bgcolor='rgb(255,255,255)')
+
+    fig.update_layout(
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="center",
+            x=0.5,
+        )
+    )
+    fig.update_layout(xaxis_title='CV1', yaxis_title='CV2')
+    fig.update_layout(font_size=24)
+
+    return fig
+
+
+def dim_reduction_fig_old(dmat, hard_assignment, clusters_to_analyze, cluster_color, basin_inds,
                       n_neighbors=10, min_dist=0.05):
     "Umap visualization"
     umap_model = UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=min_dist, metric='precomputed')
@@ -641,6 +681,88 @@ def parity_fig(
         ),
         margin=dict(l=70, r=20, t=40, b=60),
         font_size=24,
+    )
+
+    return fig
+
+
+def sample_summary_table(sample_metrics, k_vals, sample_inds, good_keys: Optional[list] = None):
+
+
+    if good_keys is not None:
+        metric_keys = good_keys
+    else:
+        metric_keys = list(sample_metrics[k_vals[0]].keys())
+        metric_keys = [key for key in metric_keys if key not in ['is_local_en_minimum']]
+
+    table_columns = {"Sample #": [ind for ind in range(len(sample_inds))]}
+    # table_columns.update({
+    #     f'{key}_k={k}': [f"{sample_metrics[k][key][ind]:.3g}" for ind in sample_inds]
+    #     for key in metric_keys for k in k_vals
+    # })
+    table_columns.update({
+        f'{key}': [f"{sample_metrics[k][key][ind]:.3g}" for ind in sample_inds]
+        for key in metric_keys for k in k_vals
+    })
+
+    def column_colors(
+            vals,
+            colorscale="RdBu",
+            vmin=None,
+            vmax=None,
+            alpha=0.35,
+    ):
+        vals = np.asarray(vals, dtype=float)
+        if vmin is None: vmin = vals.min()
+        if vmax is None: vmax = vals.max()
+
+        denom = max(vmax - vmin, 1e-12)
+        # Normalize values between 0 and 1
+        t = (vals - vmin) / denom
+
+        # Sample the actual colorscale at point t
+        actual_colors = pc.sample_colorscale(colorscale, t)
+
+        # Optional: Apply alpha blending if you want them washed out
+        return [
+            pc.find_intermediate_color(
+                "rgb(255,255,255)",
+                c,
+                alpha,  # Constant blend to make colors pastel
+                colortype="rgb",
+            )
+            for c in actual_colors
+        ]
+
+    fill_colors = [
+        column_colors(vals, "RdBu", alpha=0.35) for vals in table_columns.values()
+    ]
+    fill_colors[0] = ['rgb(255,255,255)' for _ in range(len(fill_colors[0]))]
+    fig = go.Figure(
+        data=[
+            go.Table(
+                header=dict(
+                    values=list(table_columns.keys()),
+                    align="center",
+                    font=dict(size=14, color="white"),
+                    fill_color="rgb(50,50,50)",
+                    height=32,
+                ),
+                cells=dict(
+                    values=list(table_columns.values()),
+                    align="center",
+                    font=dict(size=13),
+                    fill_color=fill_colors,  # "rgb(245,245,245)",
+                    height=28,
+                ),
+            )
+        ]
+    )
+
+    fig.update_layout(
+        font_size=16,
+        # title="Thermodynamic Properties of Dominant Basins",
+        margin=dict(l=10, r=10, t=40, b=10),
     )
 
     return fig

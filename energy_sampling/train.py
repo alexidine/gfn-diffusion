@@ -421,6 +421,23 @@ class Modeller:
             buffer = self.add_dataset_to_buffer(self.args.buffer_path, buffer,
                                                 filter_unbound=True)
 
+            print("Initializing noised buffer")
+            reward_range = 5
+            reward_record, sample_record = noise_buffer(0.5, 1,
+                                                        buffer, energy_function, reward_range,
+                                                        noise_step=0.01,
+                                                        sample_inds=None)
+
+            reward_record = torch.tensor(reward_record)
+            good_inds = torch.argwhere(reward_record >= buffer.reward_clip).flatten()
+
+            buffer.add_to_noised(reward_record[good_inds],
+                                 torch.stack(sample_record)[good_inds],
+                                 losses=torch.zeros_like(reward_record[good_inds]),
+                                 protect=True)
+            print(len(buffer))
+            # assert False, "We did it guys"
+
         if len(buffer) > 0 and (self.args.molecule != 'qm9'):
             mols_list = self.init_mol_from_buffer(buffer, self.args.z_primes)
             train_mols_list = []
@@ -815,7 +832,7 @@ class Modeller:
             else:
                 mol_batch.orient_molecule(mode='std')
 
-            loss, crystal_batch, loss_dict = self.fwd_train_step(
+            loss, crystal_batch, loss_dict, rewards, ftb_loss = self.fwd_train_step(
                 energy_function,
                 gfn_model,
                 discretizer,
@@ -826,8 +843,12 @@ class Modeller:
                 report_losses=True
             )
             if self.grow_buffer:  # energy_function.energy_function == 'uma':  # save expensive stuff
-                del crystal_batch.symmetry_operators, crystal_batch.gfn_energy
-                buffer.add_to_staging(data_batch=crystal_batch.cpu().detach())
+                buffer.add_to_noised(rewards=rewards,
+                                     samples=crystal_batch.latent_params(),
+                                     losses = ftb_loss,
+                                     )
+                #del crystal_batch.symmetry_operators, crystal_batch.gfn_energy
+                #buffer.add_to_staging(data_batch=crystal_batch.cpu().detach())
             del crystal_batch
 
         elif do_backward:
@@ -975,25 +996,21 @@ class Modeller:
                 assert False, f"sampling method {self.args.sampling} not implemented"
 
             if self.args.bwd_loss_coeffs.noised_fraction > 0:
-                if buffer.noised_size == 0:  # initialize buffer
-                    print("Initializing noised buffer")
-                    reward_range = 5
-                    reward_record, sample_record = noise_buffer(0.5, 1,
-                                                                buffer, energy_function, reward_range,
-                                                                noise_step=0.025,
-                                                                sample_inds=None)
+                if self.args.bwd_loss_coeffs.noised_fraction == 1:
+                    rewards, samples, b_inds = buffer.sample_from_noised(int(self.batch_size))
+                else: # todo test this
+                    noisy_rewards, noisy_samples, b_inds = buffer.sample_from_noised(int(self.batch_size))
+                    replace_inds = np.random.choice(len(samples), max(1, int(self.args.bwd_loss_coeffs.noised_fraction * len(samples))), replace=False)
+                    mask = np.zeros(len(samples),dtype=bool)
+                    mask[replace_inds] = True
+                    for ind in range(len(samples)):
+                        if mask[ind]:
+                            samples[ind] = noisy_samples[ind]
+                            rewards[ind] = noisy_rewards[ind]
 
-                    reward_record = torch.tensor(reward_record)
-                    good_inds = torch.argwhere(reward_record >= buffer.reward_clip).flatten()
+                    b_inds = b_inds[mask]
 
-                    buffer.add_to_noised(reward_record[good_inds],
-                                         torch.stack(sample_record)[good_inds])
-                    print(len(buffer))
-                    #assert False, "We did it guys"
-
-                else:
-                    rewards, samples = buffer.sample_from_noised(int(self.batch_size))
-        return get_gfn_backward_loss(self.args.bwd_loss_coeffs,
+        loss, loss_dict, btb_losses =  get_gfn_backward_loss(self.args.bwd_loss_coeffs,
                                      samples.to(self.device),
                                      gfn_model,
                                      rewards.to(self.device),
@@ -1001,6 +1018,11 @@ class Modeller:
                                      condition=condition.to(self.device),
                                      repeats=repeats,
                                      report_losses=report_losses)
+
+        if self.args.bwd_loss_coeffs.noised_fraction > 0:
+            buffer.update_noised_losses(btb_losses, b_inds)
+
+        return loss, loss_dict
 
     def handle_train_epoch_error(self, e, oomed_out, buffer, train_mol_loader, test_mol_loader, optimizers, step_type,
                                  train_iterator, test_iterator):
@@ -1166,10 +1188,10 @@ class Modeller:
             buffer, energy_function, eval_discretizer, gfn_model, test_mol_loader)
         self.times['eval_sampling_end'] = time()
 
-        self.times['eval_buffering_start'] = time()
-        if len(buffer.staging_buffer) > 0:
-            buffer.incorporate_staging_buffer()
-        self.times['eval_buffering_end'] = time()
+        # self.times['eval_buffering_start'] = time()
+        # if len(buffer.staging_buffer) > 0:
+        #     buffer.incorporate_staging_buffer()
+        # self.times['eval_buffering_end'] = time()
 
         self.times['eval_log_metrics_start'] = time()
         '''fwd analysis'''
@@ -1197,15 +1219,15 @@ class Modeller:
 
             self.times['eval_bwd_figs_start'] = time()
             bwd_metrics, bwd_fig_dict, rewards, btb_residual, normed_btb_residual = bwd_evaluation(
-                buffer, gfn_model, eval_discretizer, self.batch_size,
+                buffer, gfn_model, eval_discretizer, self.batch_size, self.args.eval_num_samples,
                 do_figs=do_figs)
             self.times['eval_bwd_figs_end'] = time()
 
             metrics.update(bwd_metrics)
             fig_dict.update(bwd_fig_dict)
 
-            if buffer.noised_size > 0:
-                self.grow_noised_buffer(buffer, energy_function, normed_btb_residual, rewards)
+            # if buffer.noised_size > 0:
+            #     self.grow_noised_buffer(buffer, energy_function, normed_btb_residual, rewards)
 
         '''logging and wrap up'''
         self.times['eval_wrapup_start'] = time()
@@ -1308,7 +1330,10 @@ class Modeller:
                 eval_samples.extend(sample_batch.batch_to_list())
 
                 if self.grow_buffer:
-                    buffer.add_to_staging(data_batch=sample_batch.cpu().detach())
+                    buffer.add_to_noised(rewards=log_r,
+                                         samples=samples,
+                                         losses=torch.zeros_like(log_r))
+                    #buffer.add_to_staging(data_batch=sample_batch.cpu().detach())
 
             except (RuntimeError, ValueError) as e:
                 print(f"Caught error: {str(e)}")
