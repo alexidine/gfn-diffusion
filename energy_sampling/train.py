@@ -1261,29 +1261,29 @@ class Modeller:
         #                                                              test_mol_loader,
         #                                                              )
         #         metrics.update(conditional_metrics)
-
-    def grow_noised_buffer(self, buffer, energy_function, normed_btb_residual, rewards):
-        self.times['eval_bwd_noising_start'] = time()
-        # also refresh the buffer
-        alpha = 0.5
-        eps = 0.05
-        beta = 1.0
-        score = alpha * stdz(rewards) + (1 - alpha) * stdz(-normed_btb_residual)
-        weight = F.softmax(beta * score, dim=0)
-        weight = (1 - eps) * weight + eps / len(weight)
-        weight = weight.clamp(min=0)
-        weight = weight / weight.sum()
-        sample_inds = torch.multinomial(weight, num_samples=energy_function.batch_size, replacement=False)  # subsample for speed - a single batch no more
-        reward_range = 5
-        reward_record, sample_record = noise_buffer(0.5, 1,
-                                                    buffer, energy_function, reward_range,
-                                                    noise_step=0.05,
-                                                    sample_inds=sample_inds)
-        reward_record = torch.tensor(reward_record)
-        good_inds = torch.argwhere(reward_record >= buffer.reward_clip).flatten()
-        buffer.add_to_noised(reward_record[good_inds],
-                             torch.stack(sample_record)[good_inds])
-        self.times['eval_bwd_noising_end'] = time()
+    #
+    # def grow_noised_buffer(self, buffer, energy_function, normed_btb_residual, rewards):
+    #     self.times['eval_bwd_noising_start'] = time()
+    #     # also refresh the buffer
+    #     alpha = 0.5
+    #     eps = 0.05
+    #     beta = 1.0
+    #     score = alpha * stdz(rewards) + (1 - alpha) * stdz(-normed_btb_residual)
+    #     weight = F.softmax(beta * score, dim=0)
+    #     weight = (1 - eps) * weight + eps / len(weight)
+    #     weight = weight.clamp(min=0)
+    #     weight = weight / weight.sum()
+    #     sample_inds = torch.multinomial(weight, num_samples=energy_function.batch_size, replacement=False)  # subsample for speed - a single batch no more
+    #     reward_range = 5
+    #     reward_record, sample_record = noise_buffer(0.5, 1,
+    #                                                 buffer, energy_function, reward_range,
+    #                                                 noise_step=0.05,
+    #                                                 sample_inds=sample_inds)
+    #     reward_record = torch.tensor(reward_record)
+    #     good_inds = torch.argwhere(reward_record >= buffer.reward_clip).flatten()
+    #     buffer.add_to_noised(reward_record[good_inds],
+    #                          torch.stack(sample_record)[good_inds])
+    #     self.times['eval_bwd_noising_end'] = time()
 
     def eval_sampling(self, buffer, energy_function, eval_discretizer, gfn_model, test_mol_loader):
         flow_states_list = []

@@ -482,11 +482,11 @@ class CrystalReplayBuffer:
         old = self.noised_losses[inds]
         self.noised_losses[inds] = beta * old + (1.0 - beta) * losses.cpu()
 
-    def sample_from_noised(self, num_samples, beta: float = 1.0, alpha=0.05):
+    def sample_from_noised(self, num_samples, beta: float = 2.0, alpha=0.01):
         if self.noised_size == 0:
             raise RuntimeError("No noised samples available in buffer.")
 
-        losses = self.noised_losses[:self.noised_size]
+        losses = 5 * self.noised_losses[:self.noised_size]
         rewards = self.noised_rewards[:self.noised_size]
 
         score = stdz(rewards) + stdz(-losses)  # higher is better
