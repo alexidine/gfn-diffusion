@@ -842,11 +842,11 @@ class Modeller:
                 repeats=repeats,
                 report_losses=True
             )
-            if self.grow_buffer:  # energy_function.energy_function == 'uma':  # save expensive stuff
-                buffer.add_to_noised(rewards=rewards,
-                                     samples=crystal_batch.latent_params(),
-                                     losses = ftb_loss,
-                                     )
+            # if self.grow_buffer:  # energy_function.energy_function == 'uma':  # save expensive stuff
+            #     buffer.add_to_noised(rewards=rewards,
+            #                          samples=crystal_batch.latent_params(),
+            #                          losses = ftb_loss,
+            #                          )
                 #del crystal_batch.symmetry_operators, crystal_batch.gfn_energy
                 #buffer.add_to_staging(data_batch=crystal_batch.cpu().detach())
             del crystal_batch
