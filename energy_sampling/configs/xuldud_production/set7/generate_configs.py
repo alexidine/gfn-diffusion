@@ -84,3 +84,27 @@ if __name__ == "__main__":
         yaml.dump(config, f, default_flow_style=False)
 
     ind += 1
+    en = 'elj'
+    eps = 0.2
+    config = deepcopy(base)
+    config['max_batch_size'] = 500
+    config['norm'] = norm
+    config['hidden_dim'] = hidden
+    config['layers'] = layers
+    config['s_emb_dim'] = hidden
+    config['space_groups'] = [sg]
+    config['z_primes'] = [zp]
+    config['run_name'] = f'sg{sg}_zp{zp}_{ind}'
+    config['tag'] = f'xul7'
+    config['energy_function'] = en
+    config['energy_static_temperature'] = temp
+    config['reward_range'] = rew
+    config['thermalization_conv_eps'] = eps
+    config['molecules_path'] = '/scratch/mk8347/csd_runs/datasets/xuldud/xuldud.pt'
+    config['buffer_path'] = f'/scratch/mk8347/csd_runs/datasets/xuldud/xuldud_sg{sg}_zp{zp}.pt'
+
+    config_path = f'{ind}.yaml'
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False)
+
+    ind += 1
