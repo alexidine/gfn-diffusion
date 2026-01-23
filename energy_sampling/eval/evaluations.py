@@ -909,30 +909,7 @@ def log_metrics(energy_function,
         """
         Buffer / prior metrics
         """
-        if len(buffer) > 0:
-            metrics['Buffer Length'] = len(buffer)
-            metrics['Buffer Quantiles'] = np.array([
-                np.quantile(buffer.rewards_list, q=p)
-                for p in np.linspace(0, 1, 50)
-            ])
-            metrics['Buffer Noised Length'] = buffer.noised_size
-            metrics['Buffer Noised Mean Reward'] = torch.mean(buffer.noised_rewards[:buffer.noised_size])
-            metrics['Buffer Mean Score'] = np.mean(np.nan_to_num(buffer.rewards_list))
-
-            (buffer_cell_params, buffer_latent_params,
-             buffer_std_params, buffer_reward,
-             buffer_batch, buffer_sg_inds) = get_buffer_stats(buffer)
-
-            cell_params = sample_batch.zp1_cell_parameters().cpu().detach().numpy()
-            latent_params = sample_batch.latent_params().cpu().detach().numpy()
-
-            cell_klds = np.zeros(cell_params.shape[1])
-            latent_klds = np.zeros(latent_params.shape[1])
-            for ind in range(len(cell_klds)):
-                cell_klds[ind] = compute_1d_kld(cell_params[:, ind], buffer_cell_params[:, ind])
-                latent_klds[ind] = compute_1d_kld(latent_params[:, ind], buffer_latent_params[:, ind])
-
-            log_buffer_kld(cell_klds, metrics, latent_klds)
+        buffer_logging(buffer, metrics, sample_batch)
 
     prior_sample = sample_backward_prior(args, buffer, sample_batch, len(std_params))
 
@@ -975,6 +952,51 @@ def log_metrics(energy_function,
     metrics = {k: to_loggable(v) for k, v in metrics.items()}
 
     return metrics
+
+
+def buffer_logging(buffer, metrics, sample_batch):
+    if len(buffer) > 0:
+        metrics['Buffer Length'] = len(buffer)
+        metrics['Buffer Quantiles'] = np.array([
+            np.quantile(buffer.rewards_list, q=p)
+            for p in np.linspace(0, 1, 50)
+        ])
+        metrics['Buffer Mean Score'] = np.mean(np.nan_to_num(buffer.rewards_list))
+
+        buffer_kld(buffer, metrics, sample_batch)
+    if len(buffer.noised_rewards) > 0:
+        metrics['Noised Buffer Length'] = len(buffer.noised_rewards)
+        metrics['Noised Buffer Quantiles'] = np.array([
+            np.quantile(buffer.noised_rewards, q=p)
+            for p in np.linspace(0, 1, 50)
+        ])
+        metrics['Noised Buffer Mean Score'] = np.mean(np.nan_to_num(buffer.noised_rewards))
+
+        metrics['Noised Buffer Loss Quantiles'] = np.array([
+            np.quantile(buffer.noised_losses, q=p)
+            for p in np.linspace(0, 1, 50)
+        ])
+        metrics['Noised Buffer Mean Loss'] = np.mean(np.nan_to_num(buffer.noised_losses))
+
+        metrics['Noised Buffer Step Quantiles'] = np.array([
+            np.quantile(buffer.noised_select_counts, q=p)
+            for p in np.linspace(0, 1, 50)
+        ])
+        metrics['Noised Buffer Mean Step'] = np.mean(np.nan_to_num(buffer.noised_select_counts))
+
+
+def buffer_kld(buffer, metrics, sample_batch):
+    (buffer_cell_params, buffer_latent_params,
+     buffer_std_params, buffer_reward,
+     buffer_batch, buffer_sg_inds) = get_buffer_stats(buffer)
+    cell_params = sample_batch.zp1_cell_parameters().cpu().detach().numpy()
+    latent_params = sample_batch.latent_params().cpu().detach().numpy()
+    cell_klds = np.zeros(cell_params.shape[1])
+    latent_klds = np.zeros(latent_params.shape[1])
+    for ind in range(len(cell_klds)):
+        cell_klds[ind] = compute_1d_kld(cell_params[:, ind], buffer_cell_params[:, ind])
+        latent_klds[ind] = compute_1d_kld(latent_params[:, ind], buffer_latent_params[:, ind])
+    log_buffer_kld(cell_klds, metrics, latent_klds)
 
 
 def compute_1d_kld(p_data: np.ndarray,

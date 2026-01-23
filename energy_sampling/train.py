@@ -2,12 +2,13 @@ import gc
 import os
 from collections import defaultdict
 from copy import deepcopy
+from math import ceil
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 # os.environ["TORCH_USE_CUDA_DSA"] = "1"
 # os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
 #     "max_split_size_mb:128,garbage_collection_threshold:0.8,expandable_segments:True")
 from time import time
-import torch.nn.functional as F
+
 import numpy as np
 import torch
 import wandb
@@ -23,7 +24,7 @@ from energy_sampling.utils import iter_forever, \
     is_cuda_oom, get_annealing_factor, \
     parse_loss_schedules, dict2namespace, update_loss_schedule, \
     random_discretizer, low_discrepancy_discretizer, low_discrepancy_discretizer2, shifted_equidistant, \
-    noise_buffer, stdz
+    calibrate_prior_noise, noise_buffer, stdz
 from eval.evaluations import adjust_fig_filesize, log_metrics, fwd_figs, bwd_evaluation
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 from models import GFN
@@ -415,6 +416,7 @@ class Modeller:
             max_z_prime=energy_function.max_z_prime,
             buffer_dist_cutoff=self.args.buffer_dist_cutoff,
             noised_buffer_length=self.args.noised_buffer_length,
+            noised_max_steps=self.args.noised_max_steps,
         )
         if ((self.args.both_ways or self.args.bwd) and
                 self.args.buffer_path is not None):  # preload samples into the buffer
@@ -422,19 +424,29 @@ class Modeller:
                                                 filter_unbound=True)
 
             print("Initializing noised buffer")
-            reward_range = 5
-            reward_record, sample_record = noise_buffer(0.5, 1,
-                                                        buffer, energy_function, reward_range,
-                                                        noise_step=0.01,
-                                                        sample_inds=None)
+            rewards, samples, self.log_noise_range = calibrate_prior_noise(
+                buffer, energy_function, log_min=-3, log_max=-0.5, low_cut=0.05, high_cut=10.0,
+            )
+            num_noised_samples = max(
+                int(1000 * self.args.eval_period / self.args.noised_max_steps),
+                1000,  # len(buffer)
+            )
+            rewards2, samples2 = noise_buffer(self.log_noise_range,
+                                              buffer, energy_function,
+                                              sample_inds=np.random.randint(
+                                                  len(buffer),
+                                                  size=num_noised_samples,
+                                              ))
+            reward_record = torch.cat([rewards, rewards2])
+            sample_record = torch.cat([samples, samples2], dim=0)
 
             reward_record = torch.tensor(reward_record)
             good_inds = torch.argwhere(reward_record >= buffer.reward_clip).flatten()
 
             buffer.add_to_noised(reward_record[good_inds],
-                                 torch.stack(sample_record)[good_inds],
+                                 sample_record[good_inds],
                                  losses=torch.zeros_like(reward_record[good_inds]),
-                                 protect=True)
+                                 )
             print(len(buffer))
             # assert False, "We did it guys"
 
@@ -826,11 +838,11 @@ class Modeller:
         if do_forward:
             optimizers['fwd'].zero_grad(set_to_none=True)
             mol_batch = next(mol_iterator)
-            if self.args.molecule_conditioning:
-                # if doing molecule conditioning, augment over mol orientations, adjusting properly the embedding
-                self.scramble_mol_and_embedding(mol_batch)
-            else:
-                mol_batch.orient_molecule(mode='std')
+            # if self.args.molecule_conditioning:
+            #     # if doing molecule conditioning, augment over mol orientations, adjusting properly the embedding
+            #     self.scramble_mol_and_embedding(mol_batch)
+            # else:
+            mol_batch.orient_molecule(mode='std')
 
             loss, crystal_batch, loss_dict, rewards, ftb_loss = self.fwd_train_step(
                 energy_function,
@@ -842,13 +854,9 @@ class Modeller:
                 repeats=repeats,
                 report_losses=True
             )
-            # if self.grow_buffer:  # energy_function.energy_function == 'uma':  # save expensive stuff
-            #     buffer.add_to_noised(rewards=rewards,
-            #                          samples=crystal_batch.latent_params(),
-            #                          losses = ftb_loss,
-            #                          )
-                #del crystal_batch.symmetry_operators, crystal_batch.gfn_energy
-                #buffer.add_to_staging(data_batch=crystal_batch.cpu().detach())
+            if self.grow_buffer:
+                del crystal_batch.symmetry_operators, crystal_batch.gfn_energy
+                buffer.add_to_staging(data_batch=crystal_batch.cpu().detach())
             del crystal_batch
 
         elif do_backward:
@@ -869,7 +877,7 @@ class Modeller:
 
         skip_step = False
         if self.phase == 2:
-            if True: #skip phase 2 directly #self.bwd_tb_norm <= self.args.thermalization_conv_eps:  # hit stage 2 convergence criteria
+            if True:  # skip phase 2 directly #self.bwd_tb_norm <= self.args.thermalization_conv_eps:  # hit stage 2 convergence criteria
                 self.phase2to3(ema_model, gfn_model, 0.1, step_ind)
 
         if self.phase == 3:
@@ -998,10 +1006,12 @@ class Modeller:
             if self.args.bwd_loss_coeffs.noised_fraction > 0:
                 if self.args.bwd_loss_coeffs.noised_fraction == 1:
                     rewards, samples, b_inds = buffer.sample_from_noised(int(self.batch_size))
-                else: # todo test this
+                else:  # todo test this
                     noisy_rewards, noisy_samples, b_inds = buffer.sample_from_noised(int(self.batch_size))
-                    replace_inds = np.random.choice(len(samples), max(1, int(self.args.bwd_loss_coeffs.noised_fraction * len(samples))), replace=False)
-                    mask = np.zeros(len(samples),dtype=bool)
+                    replace_inds = np.random.choice(len(samples), max(1,
+                                                                      int(self.args.bwd_loss_coeffs.noised_fraction * len(
+                                                                          samples))), replace=False)
+                    mask = np.zeros(len(samples), dtype=bool)
                     mask[replace_inds] = True
                     for ind in range(len(samples)):
                         if mask[ind]:
@@ -1010,14 +1020,14 @@ class Modeller:
 
                     b_inds = b_inds[mask]
 
-        loss, loss_dict, btb_losses =  get_gfn_backward_loss(self.args.bwd_loss_coeffs,
-                                     samples.to(self.device),
-                                     gfn_model,
-                                     rewards.to(self.device),
-                                     discretizer,
-                                     condition=condition.to(self.device),
-                                     repeats=repeats,
-                                     report_losses=report_losses)
+        loss, loss_dict, btb_losses = get_gfn_backward_loss(self.args.bwd_loss_coeffs,
+                                                            samples.to(self.device),
+                                                            gfn_model,
+                                                            rewards.to(self.device),
+                                                            discretizer,
+                                                            condition=condition.to(self.device),
+                                                            repeats=repeats,
+                                                            report_losses=report_losses)
 
         if self.args.bwd_loss_coeffs.noised_fraction > 0:
             buffer.update_noised_losses(btb_losses, b_inds)
@@ -1188,10 +1198,10 @@ class Modeller:
             buffer, energy_function, eval_discretizer, gfn_model, test_mol_loader)
         self.times['eval_sampling_end'] = time()
 
-        # self.times['eval_buffering_start'] = time()
-        # if len(buffer.staging_buffer) > 0:
-        #     buffer.incorporate_staging_buffer()
-        # self.times['eval_buffering_end'] = time()
+        self.times['buffer_integration_start'] = time()
+        if len(buffer.staging_buffer) > 0:
+            buffer.incorporate_staging_buffer()
+        self.times['buffer_integration_end'] = time()
 
         self.times['eval_log_metrics_start'] = time()
         '''fwd analysis'''
@@ -1216,7 +1226,6 @@ class Modeller:
 
         '''bwd sampling and analysis are combined'''
         if self.args.both_ways or self.args.bwd:
-
             self.times['eval_bwd_figs_start'] = time()
             bwd_metrics, bwd_fig_dict, rewards, btb_residual, normed_btb_residual = bwd_evaluation(
                 buffer, gfn_model, eval_discretizer, self.batch_size, self.args.eval_num_samples,
@@ -1226,8 +1235,8 @@ class Modeller:
             metrics.update(bwd_metrics)
             fig_dict.update(bwd_fig_dict)
 
-            # if buffer.noised_size > 0:
-            #     self.grow_noised_buffer(buffer, energy_function, normed_btb_residual, rewards)
+            if len(buffer.noised_rewards) > 0:
+                self.grow_noised_buffer(buffer, energy_function, normed_btb_residual, rewards)
 
         '''logging and wrap up'''
         self.times['eval_wrapup_start'] = time()
@@ -1261,29 +1270,44 @@ class Modeller:
         #                                                              test_mol_loader,
         #                                                              )
         #         metrics.update(conditional_metrics)
-    #
-    # def grow_noised_buffer(self, buffer, energy_function, normed_btb_residual, rewards):
-    #     self.times['eval_bwd_noising_start'] = time()
-    #     # also refresh the buffer
-    #     alpha = 0.5
-    #     eps = 0.05
-    #     beta = 1.0
-    #     score = alpha * stdz(rewards) + (1 - alpha) * stdz(-normed_btb_residual)
-    #     weight = F.softmax(beta * score, dim=0)
-    #     weight = (1 - eps) * weight + eps / len(weight)
-    #     weight = weight.clamp(min=0)
-    #     weight = weight / weight.sum()
-    #     sample_inds = torch.multinomial(weight, num_samples=energy_function.batch_size, replacement=False)  # subsample for speed - a single batch no more
-    #     reward_range = 5
-    #     reward_record, sample_record = noise_buffer(0.5, 1,
-    #                                                 buffer, energy_function, reward_range,
-    #                                                 noise_step=0.05,
-    #                                                 sample_inds=sample_inds)
-    #     reward_record = torch.tensor(reward_record)
-    #     good_inds = torch.argwhere(reward_record >= buffer.reward_clip).flatten()
-    #     buffer.add_to_noised(reward_record[good_inds],
-    #                          torch.stack(sample_record)[good_inds])
-    #     self.times['eval_bwd_noising_end'] = time()
+
+    def grow_noised_buffer(self, buffer, energy_function, normed_btb_residual, rewards):
+        self.times['eval_bwd_noising_start'] = time()
+
+        # select samples to be noised
+        # take the top-k in loss + reward for 75%
+        # then 25% random
+        ranked_mix = 0.75
+        random_mix = 0.25
+
+        noised_losses = np.array(buffer.noised_losses)
+        noised_train_steps = np.array(buffer.noised_select_counts)
+
+        samples_to_be_replaced = ((noised_losses <= noised_losses.mean())
+                                  * (noised_losses > 0)
+                                  * (noised_train_steps >= self.args.noised_max_steps))
+        num_to_replace = sum(samples_to_be_replaced)
+        if num_to_replace >= 4:
+            ranked_to_replace = ceil(num_to_replace * ranked_mix)
+            random_to_replace = num_to_replace - ranked_to_replace
+
+            # we want high losses, and high rewards
+            weight = torch.tanh(stdz(normed_btb_residual)) + torch.tanh(stdz(rewards))
+            ranked_inds = np.argsort(-weight).flatten()[:ranked_to_replace]
+            random_inds = np.random.randint(0, len(buffer), random_to_replace)
+            sample_inds = np.concatenate([ranked_inds, random_inds])
+
+            new_rewards, samples = noise_buffer(self.log_noise_range,
+                                                buffer, energy_function,
+                                                sample_inds=sample_inds)
+
+            # good_inds = torch.argwhere(rewards >= buffer.reward_clip).flatten()
+            buffer.purge_noised_by_index(np.argwhere(samples_to_be_replaced).flatten())
+            buffer.add_to_noised(new_rewards,  # [good_inds],
+                                 samples,  # [good_inds],
+                                 losses=torch.zeros_like(new_rewards))  # [good_inds]))
+
+        self.times['eval_bwd_noising_end'] = time()
 
     def eval_sampling(self, buffer, energy_function, eval_discretizer, gfn_model, test_mol_loader):
         flow_states_list = []
@@ -1330,10 +1354,7 @@ class Modeller:
                 eval_samples.extend(sample_batch.batch_to_list())
 
                 if self.grow_buffer:
-                    buffer.add_to_noised(rewards=log_r,
-                                         samples=samples,
-                                         losses=torch.zeros_like(log_r))
-                    #buffer.add_to_staging(data_batch=sample_batch.cpu().detach())
+                    buffer.add_to_staging(data_batch=sample_batch.cpu().detach())
 
             except (RuntimeError, ValueError) as e:
                 print(f"Caught error: {str(e)}")

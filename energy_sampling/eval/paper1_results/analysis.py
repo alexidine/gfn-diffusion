@@ -129,28 +129,29 @@ def view_and_save_figs(fig_dict):
 if __name__ == '__main__':
     # acridine lj config
     run = 'xuldud_61_uma'
+    # run = 'xuldud_61_elj'
+    # run = 'acridine_14_uma'
 
-    if run == 'acridine':
+    if run == 'acridine_14_uma':
         run_name = 'acr_lj'
         device = 'cuda'
         num_samples = 10000
         batch_size = 1000
-        energy_function = 'elj'  # 'elj', 'lj' 'uma
+        energy_function = 'uma'  # 'elj', 'lj' 'uma
         n_steps = 100  # critical to get this right!
-        sg_ind = 2
+        sg_ind = 14
         zp = 1
         kT = 2.5
-        clusters_to_analyze = 12
-        units = 'LJ en /mol'
+        units = 'kJ/mol'
 
-        model_path = rf"D:\crystal_datasets\acridine\best_acr_lj_sg{sg_ind}_zp{zp}_2_model_eval.pt"
-        config_path = rf"D:\crystal_datasets\acridine\acr_lj_sg{sg_ind}_zp{zp}_2_model_config.npy"
+        model_path = rf"D:\crystal_datasets\acridine\acr10_sg{sg_ind}_zp{zp}_model_eval.pt"
+        config_path = rf"D:\crystal_datasets\acridine\acr10_sg{sg_ind}_zp{zp}_model_config.npy"
         molecule_path = r"D:\crystal_datasets\acridine\acridine_conformer.pt"
         dataset_path = rf"D:\crystal_datasets\acridine\acridine_sg{sg_ind}_zp{zp}.pt"
         results_dir = rf"D:\crystal_datasets\gfn_results"
         results_path = os.path.join(results_dir, rf"{run_name}_sg{sg_ind}_zp{zp}.pt")
 
-        exp_sample_path = None
+        exp_sample_path = r"D:\crystal_datasets\acridine\prot_acrdin_crystals.pt"
 
 
     elif run == 'xuldud_61_lj':
@@ -213,25 +214,31 @@ if __name__ == '__main__':
     else:
         results_dict = sample_and_analyze()
 
-    exp_crystals = torch.load(exp_sample_path, weights_only=False)
-    exp_crystals = [cry for cry in exp_crystals if cry.sg_ind == sg_ind]
-    ebatch = collate_data_list(exp_crystals)
-    pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
-    predictor = init_uma_crystal_predictor(pred_path, device=device)
-    esamples = analyze_samples(
-        ebatch.latent_params(),
-        [molecule] * ebatch.num_graphs,
-        max_z_prime,
-        device,
-        1000,
-        sg_ind,
-        zp,
-        do_uma=True,
-        predictor=predictor
-    )
+    "analyze experimental samples"
+    if exp_sample_path is not None:
+        exp_crystals = torch.load(exp_sample_path, weights_only=False)
+        exp_crystals = [cry for cry in exp_crystals if (cry.sg_ind == sg_ind) and (cry.z_prime == zp)]
+        ebatch = collate_data_list(exp_crystals, max_z_prime = zp)
+        pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
+        predictor = init_uma_crystal_predictor(pred_path, device=device)
+        esamples = analyze_samples(
+            None, #ebatch.latent_params(),
+            [molecule] * ebatch.num_graphs,
+            max_z_prime,
+            device,
+            1000,
+            sg_ind,
+            zp,
+            do_uma=True,
+            predictor=predictor,
+            overwrite_latents=False,
+        )
 
-    samples = results_dict['samples'] + esamples
-    sample_batch = collate_data_list(samples) #results_dict['sample_batch']
+    "recompute energies"
+    samples = results_dict['samples']
+    if exp_sample_path is not None:
+        samples = samples + esamples
+    sample_batch = collate_data_list(samples)  # results_dict['sample_batch']
     if energy_function == 'uma':
         sample_energy = sample_batch.uma_pot / (sample_batch.sym_mult * sample_batch.z_prime) - sample_batch.uma_gas_pot
     elif energy_function == 'elj':
@@ -241,8 +248,9 @@ if __name__ == '__main__':
         sample_energy = atomwise_fixed * (sample_batch.num_atoms / sample_batch.z_prime)
     else:
         sample_energy = sample_batch.lj
-    #sample_energy = results_dict['sample_energy']
-    #sample_cp = results_dict['sample_cp']
+
+    # sample_energy = results_dict['sample_energy']
+    # sample_cp = results_dict['sample_cp']
     sample_cp = sample_batch.packing_coeff
     sample_latents = sample_batch.latent_params()  # results_dict['sample_latents']  # these are sometimes wrong for xul
     # collate_data_list([samples[ind] for ind in torch.argsort(rmsdmat[-1])[:10]]).mol2cluster().visualize(mode='unit cell')
@@ -264,31 +272,46 @@ if __name__ == '__main__':
     # lat_dmat = crystal_parameter_distmat(sample_latents).fill_diagonal_(0).detach()
 
     sample_metrics = local_analysis(k_vals, sample_batch, sample_energy, rmsdmat)
-    """linear edge interpolations"""
-    # edges_dir, ens_dir = get_directed_kinetic_edges(sample_inds,
-    #                                                 samples,
-    #                                                 sample_batch,
-    #                                                 results_dir,
-    #                                                 run_name,
-    #                                                 rmsdmat,
-    #                                                 kT, d_cut=2, lat_k=50)
 
     """visual and local thermo analysis"""
     umap_model = UMAP(n_components=2, n_neighbors=50, min_dist=0.01, metric='precomputed')
     sample_embedding = umap_model.fit_transform(rmsdmat.numpy().astype(np.float64))
 
-    candidates_to_eval = np.argwhere(sample_metrics[200]['is_local_en_minimum']).flatten()[:27]
-    #candidates_to_eval = np.argwhere(sample_metrics[200]['is_local_rho_maximum']).flatten()[:27]
-    candidates_to_eval = np.unique(np.concatenate([candidates_to_eval, [sample_batch.num_graphs - 1]])) # add experimental state
+    candidates_to_eval = np.argwhere(sample_metrics[200]['is_local_en_minimum']).flatten()
+    candi2 = np.argwhere(sample_metrics[200]['is_local_rho_maximum']).flatten()
+    candidates_to_eval = np.unique(
+        np.concatenate([candidates_to_eval, [sample_batch.num_graphs - (ebatch.num_graphs + 1)], candi2]))  # add experimental state
+
+    candidates_to_eval = candidates_to_eval[np.argsort(sample_energy[candidates_to_eval])]
 
     fig_dict = {}
+
+    for k in k_vals:
+        # todo nice column names
+        # todo nice column groups
+        fig = sample_summary_table(sample_metrics, [k], candidates_to_eval,
+                                   good_keys=[
+                                       'basin_min_en',
+                                       'basin_std_en',
+                                       'log_rho',
+                                       'basin_max_rho',
+                                       'grad_mag',
+                                       'd_eff',
+                                       'softness',
+                                       'is_local_en_minimum',
+                                       'is_local_rho_maximum',
+                                   ])
+        fig_dict[f'table_{k}'] = fig
+
 
     for k in k_vals:
         thermos = np.stack(list(sample_metrics[k].values()))
         x = sample_embedding[:, 0]
         y = sample_embedding[:, 1]
         n_thermos = thermos.shape[0]
-        fig = make_subplots(rows=n_thermos//4 + int(n_thermos % 4 > 0), cols=4, subplot_titles=list(sample_metrics[200].keys()), vertical_spacing=0.05, horizontal_spacing=0.05)
+        fig = make_subplots(rows=n_thermos // 4 + int(n_thermos % 4 > 0), cols=4,
+                            subplot_titles=list(sample_metrics[200].keys()), vertical_spacing=0.05,
+                            horizontal_spacing=0.05)
         for ind in range(len(thermos)):
             c = thermos[ind]
             fig.add_scatter(x=x, y=y, marker_color=c, mode='markers',
@@ -297,18 +320,15 @@ if __name__ == '__main__':
                             row=ind // 4 + 1, col=ind % 4 + 1)
         fig_dict[f'umap_{k}'] = fig
 
-        # todo nice column names
-        # todo nice column
-        fig = sample_summary_table(sample_metrics, [k], candidates_to_eval)
-        # #, good_keys = [
-        #     'basin_min_en',
-        #     'basin_std_en',
-        #     'log_rho',
-        #     'grad_mag',
-        #     'd_eff',
-        #     'softness',
-        # ])
-        fig_dict[f'table_{k}'] = fig
+
+    for fig in fig_dict.values():
+        fig.show()
+
+    # todo qualitative UMAP fig over PCs of these metrics. Typically density dominates PC1 and anisotropy (log_cond) PC2. gauss_entropy active in both
+
+    # todo per-sample reporting
+    # energy, local density, d_eff, log_cond, grad_mag, escape barrier (kinetic), over a few representative samples
+
 
     import plotly.graph_objects as go
 
@@ -317,15 +337,8 @@ if __name__ == '__main__':
     np.fill_diagonal(corr, 0)
     go.Figure(go.Heatmap(z=corr, x=labels, y=labels)).show()
 
+
     fig_dict = general_figs(fig_dict, sample_batch, sample_energy, data_batch, units=units)
-    # todo qualitative UMAP fig over PCs of these metrics. Typically density dominates PC1 and anisotropy (log_cond) PC2. gauss_entropy active in both
-
-    # todo per-sample reporting
-    # energy, local density, d_eff, log_cond, grad_mag, escape barrier (kinetic), over a few representative samples
-
-
-    for fig in fig_dict.values():
-        fig.show()
 
     fig_dict['tb'] = parity_fig(
         y_raw=results_dict['log_pfs'] + results_dict['learned_log_z'],
@@ -475,7 +488,9 @@ if False:  # exp_sample_path is not None:
     fig.update_layout(yaxis_range=[-np.inf, 0])
     fig.show()
 
-    sample_batch.plot_batch_cell_params(space='real', ref_dist=ebatch.full_cell_parameters().repeat(2, 1),
+    nn = ebatch.full_cell_parameters().repeat(200, 1)
+    nn += torch.randn_like(nn) * 0.05
+    sample_batch.plot_batch_cell_params(space='real', ref_dist=nn,
                                         show=True)
 
     '''

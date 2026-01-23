@@ -651,21 +651,22 @@ def sample_from_gfn(num_samples, max_z_prime, device, n_steps, batch_size, gfn_m
     return samples.clip(max=1, min=-1), pfs, pbs
 
 
-def analyze_samples(x, mol_list, max_z_prime, device, batch_size, sg_ind, zp, do_uma: bool = False, predictor=None):
+def analyze_samples(x, mol_list, max_z_prime, device, batch_size, sg_ind, zp, do_uma: bool = False, predictor=None, overwrite_latents: bool = True):
     num_samples = len(mol_list)
     samples = []
     cursor = 0
     already_oomed = False
     with tqdm(total=num_samples) as pbar:
         with torch.no_grad():
-            try:
-                while cursor < num_samples:
+            while cursor < num_samples:
+                try:
                     inds = np.arange(cursor, min(num_samples, cursor + batch_size))
                     for elem in mol_list:
                         elem.z_prime = zp
                     batch = collate_data_list([mol_list[ind] for ind in inds], max_z_prime=max_z_prime)
-                    batch.reset_sg_info(sg_ind)
-                    batch.latent_to_cell_params(x[inds])
+                    if overwrite_latents:
+                        batch.reset_sg_info(sg_ind)
+                        batch.latent_to_cell_params(x[inds])
                     batch = batch.to(device)
                     outs = batch.analyze(['lj', 'qlj', 'elj', 'silu', 'rdf'], cutoff=10, std_orientation=True)
                     if do_uma:
@@ -689,22 +690,22 @@ def analyze_samples(x, mol_list, max_z_prime, device, batch_size, sg_ind, zp, do
                     if (batch_size <= 10000) and (batch_size < num_samples) and not already_oomed:
                         batch_size += max(int(batch_size * 0.01), 1)
                     pbar.update(batch_size)
-            except (RuntimeError, ValueError) as e:
-                if is_cuda_oom(e):
-                    if batch_size == 1:
-                        assert False, "Cascading OOM failure in molecule energy evaluation"
-                    batch_size = max(int(batch_size * 0.65), 1)
-                    print(f"OOM in energy evaluation: dropping batch size to {batch_size}")
-                    gc.collect()
-                    # del self.uma_predictor, mol_batch_i
-                    torch.cuda.empty_cache()
-                    # torch.cuda.reset_peak_memory_stats()
-                    torch.cuda.synchronize()
-                    # self.uma_predictor = init_uma_crystal_predictor(self.uma_path, device=self.device)
-                    already_oomed = True
-                    sleep(0.1)
-                else:
-                    raise e
+                except (RuntimeError, ValueError) as e:
+                    if is_cuda_oom(e):
+                        if batch_size == 1:
+                            assert False, "Cascading OOM failure in molecule energy evaluation"
+                        batch_size = max(int(batch_size * 0.65), 1)
+                        print(f"OOM in energy evaluation: dropping batch size to {batch_size}")
+                        gc.collect()
+                        # del self.uma_predictor, mol_batch_i
+                        torch.cuda.empty_cache()
+                        # torch.cuda.reset_peak_memory_stats()
+                        torch.cuda.synchronize()
+                        # self.uma_predictor = init_uma_crystal_predictor(self.uma_path, device=self.device)
+                        already_oomed = True
+                        sleep(0.1)
+                    else:
+                        raise e
 
     return samples
 

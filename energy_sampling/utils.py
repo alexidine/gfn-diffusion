@@ -283,7 +283,7 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
                                         supercell_size=5,
                                         std_orientation=True,
                                         )
-            out = {key: val.cpu().detach() for key,val in out.items()}
+            out = {key: val.cpu().detach() for key, val in out.items()}
             if energy_function == 'uma':
                 cry_en = crystal_batch.compute_crystal_uma(
                     predictor=uma_predictor,
@@ -586,12 +586,15 @@ def get_annealing_factor(start_value, stop_value, total_time, step_iters):
 
 
 @torch.no_grad()
-def substitute_prior(noised_fraction, noise_level, crystal_batch, energy_function, rewards, samples, buffer):
+def substitute_prior(noised_fraction, log_noise_range,
+                     crystal_batch, energy_function,
+                     samples, ):
     # noise buffer samples with gaussian magnitude steps
     rand_dir = torch.randn_like(samples)
     rand_dir = rand_dir / rand_dir.norm(dim=-1, keepdim=True)
-    rand_magnitude = torch.randn(len(samples), device=samples.device).abs() * noise_level
-
+    # rand_magnitude = torch.randn(len(samples), device=samples.device).abs() * noise_level
+    u = torch.rand(len(samples))
+    rand_magnitude = 10 ** (log_noise_range[0] + (log_noise_range[1] - log_noise_range[0]) * u)
     noised_samples = (samples + rand_dir * rand_magnitude[:, None]).clip(min=-1, max=1)
 
     if noised_fraction < 1:
@@ -620,13 +623,104 @@ def substitute_prior(noised_fraction, noise_level, crystal_batch, energy_functio
                                                  log_temperature.to(energy_function.device),
                                                  False).to(samples.device)
 
-    return condition, new_rewards, new_samples, crystal_batch
+    return new_rewards, new_samples
 
 
-def noise_buffer(max_noise_level, noised_fraction, buffer, energy_function, reward_range,
-                 noise_step,
-                 sample_inds: Optional[torch.Tensor] = None):
-    # sample full buffer
+@torch.no_grad()
+def calibrate_prior_noise(buffer, energy_function,
+                          log_min=-3, log_max=-0.5,
+                          low_cut=0.05, high_cut=10.0  # rewards are in units of kT already
+                          ):
+    samples, rewards, crystal_batch, condition = buffer.sample(
+        override_batch=len(buffer),
+        randomize_orientations=False,
+        override_sampler=None,
+        override_sample_inds=np.arange(len(buffer)),
+    )
+    # noise buffer samples with gaussian magnitude steps
+    rand_dir = torch.randn_like(samples)
+    rand_dir = rand_dir / rand_dir.norm(dim=-1, keepdim=True)
+    rand_magnitude = torch.logspace(log_min, log_max, len(samples))
+
+    noised_samples = (samples + rand_dir * rand_magnitude[:, None]).clip(min=-1, max=1)
+    new_samples = noised_samples
+
+    # have to update the rewards if we are using any loss functions that require them
+    log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(
+        crystal_batch,
+        sg_inds=crystal_batch.sg_ind,
+        z_primes=crystal_batch.z_prime)
+
+    if log_T_tensor is not None:
+        log_temperature = log_T_tensor
+    else:
+        log_temperature = None
+
+    with torch.no_grad():
+        crystal_batch.orient_molecule(mode='std')
+        new_rewards = energy_function.log_reward(new_samples.to(energy_function.device),
+                                                 crystal_batch.to(energy_function.device),
+                                                 log_temperature.to(energy_function.device),
+                                                 False).to(samples.device)
+
+    'calibration'
+    x = torch.nan_to_num(rand_magnitude.log10())
+    y = torch.nan_to_num((rewards - new_rewards).abs().log10())
+    m, b = np.polyfit(x, y, 1)
+    # bins = np.linspace(x.min(), x.max(), 40)
+    # medians = np.array([y[(bins[ind] <= x) * (x < bins[ind + 1])].median() for ind in range(len(bins) - 1)])
+
+    x_min = (np.log10(low_cut) - b) / m
+    x_max = (np.log10(high_cut) - b) / m
+
+    del crystal_batch
+
+    return new_rewards.detach().clone(), new_samples.detach().clone(), [x_min, x_max]
+
+
+#
+# def noise_buffer_ramped(max_noise_level, noised_fraction, buffer, energy_function, reward_range,
+#                         noise_step,
+#                         sample_inds: Optional[torch.Tensor] = None):
+#     # sample full buffer
+#     samples, rewards, crystal_batch, condition = buffer.sample(
+#         override_batch=len(buffer),
+#         randomize_orientations=False,
+#         override_sampler=None,
+#         override_sample_inds=sample_inds,
+#     )
+#
+#     sample_record = []
+#     reward_record = []
+#     noise_level = 0
+#     while True:
+#         noise_level += noise_step
+#         if noise_level > 0:
+#             condition, noised_rewards, noised_samples, crystal_batch = substitute_prior(
+#                 noised_fraction, noise_level, crystal_batch.clone(),
+#                 energy_function, rewards, samples, buffer)
+#         else:
+#             noised_rewards = rewards.clone()
+#             noised_samples = samples.clone()
+#
+#         reward_record.extend(noised_rewards.detach().cpu())
+#         sample_record.extend(noised_samples)
+#         rewards_within_range = noised_rewards >= (rewards - reward_range)
+#
+#         if rewards_within_range.float().mean() < 0.5:
+#             break
+#         if noise_level >= max_noise_level:
+#             break
+#
+#     print(f"final noise level {noise_level}")
+#     print(f"tot num samples {len(reward_record)}")
+#     print(f"batch size {crystal_batch.num_graphs}")
+#     return reward_record, sample_record, noise_level
+
+
+def noise_buffer(log_noise_range, buffer, energy_function,
+                 sample_inds: Optional = None):
+    noised_fraction = 1
     samples, rewards, crystal_batch, condition = buffer.sample(
         override_batch=len(buffer),
         randomize_orientations=False,
@@ -634,33 +728,87 @@ def noise_buffer(max_noise_level, noised_fraction, buffer, energy_function, rewa
         override_sample_inds=sample_inds,
     )
 
-    sample_record = []
-    reward_record = []
-    noise_level = 0
-    while True:
-        noise_level += noise_step
-        if noise_level > 0:
-            condition, noised_rewards, noised_samples, crystal_batch = substitute_prior(
-                noised_fraction, noise_level, crystal_batch.clone(),
-                energy_function, rewards, samples, buffer)
-        else:
-            noised_rewards = rewards.clone()
-            noised_samples = samples.clone()
+    noised_rewards, noised_samples = substitute_prior(
+        noised_fraction, log_noise_range, crystal_batch.clone(),
+        energy_function, samples)
 
-        reward_record.extend(noised_rewards.detach().cpu())
-        sample_record.extend(noised_samples)
-        rewards_within_range = noised_rewards >= (rewards - reward_range)
+    del crystal_batch
 
-        if rewards_within_range.float().mean() < 0.5:
-            break
-        if noise_level >= max_noise_level:
-            break
-
-    print(f"final noise level {noise_level}")
-    print(f"tot num samples {len(reward_record)}")
-    print(f"batch size {crystal_batch.num_graphs}")
-    return reward_record, sample_record
+    return noised_rewards.detach().clone(), noised_samples.detach().clone()
 
 
-def stdz(x, eps:float=1e-6):
-    return (x - x.mean()) / (x.std()+eps)
+def stdz(x, eps: float = 1e-6):
+    return (x - x.mean()) / (x.std() + eps)
+
+
+@torch.no_grad()
+def batched_crystal_analysis(samples, device, computes: list[str] = ['lj'],
+                             do_uma: bool = False, init_batch_size: int = 500,
+                             uma_path: Optional[str] = None, cutoff: float = 10,
+                             max_batch_size: int = 10000, grow_batch_size: bool = True):
+    def analyze_batch(samples, cursor, batch_size, sample_outputs, uma_predictor=None):
+        crystal_batch = collate_data_list(
+            [samples[ind] for ind in range(cursor, min(len(samples), cursor + batch_size))])
+        crystal_batch = crystal_batch.to(device)
+        crystal_batch.box_analysis()
+        out = crystal_batch.analyze(computes,
+                                    cutoff=cutoff,
+                                    supercell_size=5,
+                                    std_orientation=True,
+                                    assign_outputs=True,
+                                    )
+
+        out = {key: val.cpu().detach() for key, val in out.items()}
+        if do_uma == 'uma':
+            cry_en = crystal_batch.compute_crystal_uma(
+                predictor=uma_predictor,
+                std_orientation=True).cpu().detach() * 96.485  # output in kJ/mol (of unit cells)
+            gas_en = crystal_batch.compute_lattice_gas_phase_uma(
+                predictor=uma_predictor, std_orientation=True).cpu().detach() * 96.485
+            out.update({'uma_gas_pot': gas_en,
+                        'uma_pot': cry_en,
+                        'uma': cry_en / (
+                                crystal_batch.sym_mult.cpu().detach() * crystal_batch.z_prime.cpu().detach()) - gas_en})  # lattice energy
+            for key in ['uma_gas_pot', 'uma_pot', 'uma']:
+                crystal_batch.add_graph_attr(out[key], key)
+
+        sample_outputs.extend(crystal_batch.cpu().detach().batch_to_list())
+        return sample_outputs
+
+    if do_uma:
+        assert uma_path is not None
+        uma_predictor = init_uma_crystal_predictor(uma_path, device=device)
+    else:
+        uma_predictor = None
+
+    num_samples = len(samples)
+    batch_size = int(1 * init_batch_size)
+    cursor = 0
+    already_oomed = False
+    pbar = tqdm(total=len(samples), unit="reparameterized samples")
+    sample_outputs = []
+    with tqdm(total=len(samples)) as pbar:
+        while cursor < len(samples):
+            try:
+                sample_outputs = analyze_batch(samples, cursor, batch_size, sample_outputs, uma_predictor=uma_predictor)
+                cursor += batch_size
+                if ((batch_size <= max_batch_size) and (
+                        batch_size < num_samples) and not already_oomed) and grow_batch_size:
+                    batch_size += max(int(batch_size * 0.01), 1)
+                pbar.update(min(batch_size, len(samples) - cursor))  # safe final update
+
+            except (RuntimeError, ValueError) as e:
+                if is_cuda_oom(e):
+                    if batch_size == 1 and already_oomed:
+                        assert False, "Cascading OOM failure in molecule energy evaluation"
+                    batch_size = max(int(init_batch_size * 0.6), 1)
+                    print(f"OOM error: dropping batch size to {init_batch_size}")
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    already_oomed = True
+                    sleep(0.1)
+                else:
+                    raise e
+
+    return sample_outputs

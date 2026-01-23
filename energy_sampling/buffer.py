@@ -22,6 +22,7 @@ class CrystalReplayBuffer:
                  max_z_prime: int = 1,
                  buffer_dist_cutoff: float = 0.25,
                  noised_buffer_length: int = 100000,
+                 noised_max_steps: int = 50,
                  ):
         self.buffer_size = buffer_size
         self.prioritized = prioritized
@@ -44,14 +45,11 @@ class CrystalReplayBuffer:
         self.buffer_dist_cutoff = buffer_dist_cutoff
         self.staging_buffer = []
         self.noised_buffer_length = noised_buffer_length
-        self.noised_rewards = torch.zeros(self.noised_buffer_length, dtype=torch.float32, device='cpu')
-        self.noised_samples = torch.zeros((self.noised_buffer_length, 6 + 6 * max_z_prime), dtype=torch.float32,
-                                          device='cpu')
-        self.noised_losses = torch.zeros(self.noised_buffer_length, dtype=torch.float32, device='cpu')
-
-        self.noised_ptr = 0
-        self.noised_size = 0
-        self.protected_size = 0
+        self.noised_rewards = []  # torch.zeros(self.noised_buffer_length, dtype=torch.float32, device='cpu')
+        self.noised_samples = []  # torch.zeros((self.noised_buffer_length, 6 + 6 * max_z_prime), dtype=torch.float32, device='cpu')
+        self.noised_losses = []  # torch.zeros(self.noised_buffer_length, dtype=torch.float32, device='cpu')
+        self.noised_select_counts = []
+        self.noised_max_steps = noised_max_steps
 
     @torch.no_grad()
     def add_to_staging(self, data_list=None, data_batch=None):
@@ -364,7 +362,7 @@ class CrystalReplayBuffer:
         else:
             return latents, reward, sample_batch, condition
 
-    def init_loader(self):
+    def init_loader(self):  # todo this is almost never used, currently
         self.loader = DataLoader(
             self.dataset,
             batch_size=self.batch_size,
@@ -378,132 +376,80 @@ class CrystalReplayBuffer:
         )
         self._loader_iter = iter_forever(self.loader)
 
-    def adjust_batch_size(self, new_batch_size: int):
+    def adjust_batch_size(self, new_batch_size: int):  # todo almost never used
         self.loader.batch_sampler.batch_size = new_batch_size
         self._loader_iter = iter_forever(self.loader)
 
-    def sample_mol_unconditional_prior(self, sg_inds, noise: Optional[float] = None):
-        """
-        sample from the buffer, unconditional on molecules, conditional on space groups
-        then optionally noise
-        :param sg_inds:
-        :return:
-        """
-        assert False, ("Unconditional prior sampling needs to be rewritten, as "
-                       "the latent space is no longer strictly std normal")
-        # samples = torch.zeros((len(sg_inds), 12), dtype=torch.float32)
-        # sgs_to_sample = torch.unique(sg_inds).tolist()
-        # sg_buffer = torch.tensor(self.sg_list)
-        # x_tensor = torch.stack(self.x_list).to(self.device)
-        #
-        # for sg in sgs_to_sample:
-        #     sample_mask = sg_inds == sg
-        #     mask = (sg_buffer == sg)
-        #     relevant = x_tensor[mask]
-        #
-        #     n = sample_mask.sum()
-        #     rand_idx = torch.randint(0, relevant.size(0), (n,), device=self.device)
-        #     samples[sample_mask] = relevant[rand_idx]
-        #
-        # if noise is not None:
-        #     samples += torch.randn_like(samples) * noise
-        #
-        # return samples.clip(min=-6, max=6)
-
-    def add_to_noised(self, rewards, samples, losses, protect: bool = False):
+    def add_to_noised(self, rewards, samples, losses):
         rewards = rewards.detach().to(self.device)
         samples = samples.detach().to(self.device)
         losses = losses.detach().to(self.device)
-        if protect:
-            if self.protected_size != 0 or self.noised_size != 0:
-                assert False, "noised buffer protection only works once, and for first inputs"
-            self.protected_size = len(rewards)
-
         B = rewards.shape[0]
-        ptr = self.noised_ptr
-        max_size = self.noised_buffer_length
-        K = self.protected_size
 
-        end = ptr + B
+        for i in range(B):
+            # If buffer is full, remove oldest entry (FIFO)
+            if len(self.noised_rewards) >= self.noised_buffer_length:
+                self.noised_rewards.pop(0)
+                self.noised_samples.pop(0)
+                self.noised_losses.pop(0)
+                self.noised_select_counts.pop(0)
 
-        # Case 0: buffer not yet filled to protected region
-        if self.noised_size < K:
-            # how many slots still free in protected region
-            free = K - self.noised_size
-            take = min(B, free)
-
-            self.noised_rewards[self.noised_size:self.noised_size + take] = rewards[:take]
-            self.noised_samples[self.noised_size:self.noised_size + take] = samples[:take]
-            self.noised_losses[self.noised_size:self.noised_size + take] = losses[:take]
-
-            self.noised_size += take
-
-            # nothing more to do
-            if take == B:
-                return
-
-            # spill remainder into FIFO region
-            rewards = rewards[take:]
-            samples = samples[take:]
-            losses = losses[take:]
-            B = rewards.shape[0]
-
-        # Case 1: FIFO region logic
-        ptr = self.noised_ptr
-        fifo_cap = max_size - K
-        rel_ptr = ptr - K
-        rel_end = rel_ptr + B
-
-        if rel_end <= fifo_cap:
-            # no wrap
-            self.noised_rewards[ptr:ptr + B] = rewards
-            self.noised_samples[ptr:ptr + B] = samples
-            self.noised_losses[ptr:ptr + B] = losses
-        else:
-            # wraparound
-            first = fifo_cap - rel_ptr
-
-            self.noised_rewards[ptr:] = rewards[:first]
-            self.noised_samples[ptr:] = samples[:first]
-            self.noised_losses[ptr:] = losses[:first]
-
-            second = rel_end % fifo_cap
-            start = K
-            self.noised_rewards[start:start + second] = rewards[first:]
-            self.noised_samples[start:start + second] = samples[first:]
-            self.noised_losses[start:start + second] = losses[first:]
-
-        # update pointer & size
-        self.noised_ptr = K + (rel_end % fifo_cap)
-        self.noised_size = min(self.noised_size + B, max_size)
+            self.noised_rewards.append(rewards[i])
+            self.noised_samples.append(samples[i])
+            self.noised_losses.append(losses[i])
+            self.noised_select_counts.append(0)
 
     @torch.no_grad()
-    def update_noised_losses(self, losses, inds, beta: float = 0.95):
-        old = self.noised_losses[inds]
-        self.noised_losses[inds] = beta * old + (1.0 - beta) * losses.cpu()
+    def update_noised_losses(self, losses, indices, beta: float = 0.9):
+        """Update losses for specific indices with EMA."""
+        losses = losses.detach().cpu()
+        for i, idx in enumerate(indices):
+            old_loss = self.noised_losses[idx]
+            if old_loss == 0:
+                self.noised_losses[idx] = losses[i]
+            else:
+                self.noised_losses[idx] = beta * old_loss + (1.0 - beta) * losses[i]
 
-    def sample_from_noised(self, num_samples, beta: float = 2.0, alpha=0.01):
-        if self.noised_size == 0:
-            raise RuntimeError("No noised samples available in buffer.")
+    def sample_from_noised(self, num_samples):
+        buffer_size = len(self.noised_rewards)
 
-        losses = 5 * self.noised_losses[:self.noised_size]
-        rewards = self.noised_rewards[:self.noised_size]
-
-        score = stdz(rewards) + stdz(-losses)  # higher is better
-        weight = F.softmax(beta * score, dim=0)
-        weight = (1 - alpha) * weight + alpha / len(weight)
-        probs = weight / weight.sum()
-
-        if num_samples <= self.noised_size:
-            idx = torch.multinomial(probs, num_samples, replacement=False)
+        if num_samples <= buffer_size:
+            indices = np.random.choice(range(buffer_size), num_samples, replace=False)
         else:
-            idx = torch.multinomial(probs, num_samples, replacement=True)
+            indices = np.random.choice(range(buffer_size), num_samples, replace=True)
+
+        rewards = torch.stack([self.noised_rewards[i] for i in indices])
+        samples = torch.stack([self.noised_samples[i] for i in indices])
+
+        # Increment selection counts
+        for idx in indices:
+            self.noised_select_counts[idx] += 1
+
+        return rewards, samples, indices
 
 
-        rewards = self.noised_rewards[idx]
-        samples = self.noised_samples[idx]
+    def purge_noised_buffer(self):
+        steps_cutoff = self.noised_max_steps
+        loss_cutoff = np.mean(self.noised_losses)
 
-        return rewards, samples, idx
+        losses = np.array(self.noised_losses)
+        steps = np.array(self.noised_select_counts)
+
+        purge_list = np.argwhere(
+            (losses < loss_cutoff) * (steps > steps_cutoff)
+        ).flatten()
+
+        self.purge_noised_by_index(purge_list)
+
+    def purge_noised_by_index(self, indices_to_remove):
+        """Remove samples by their current indices. Indices should be sorted in descending order."""
+        # Sort in descending order to avoid index shifting issues
+        for idx in sorted(indices_to_remove, reverse=True):
+            if 0 <= idx < len(self.noised_rewards):
+                self.noised_rewards.pop(idx)
+                self.noised_samples.pop(idx)
+                self.noised_losses.pop(idx)
+                self.noised_select_counts.pop(idx)
 
 
 def collate_fn(data_list):

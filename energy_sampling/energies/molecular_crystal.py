@@ -401,7 +401,7 @@ class MolecularCrystal(BaseSet):
                     if self.batch_size == 1:
                         assert False, "Cascading OOM failure in molecule energy evaluation"
                     self.batch_size = max(int(self.batch_size * 0.65), 1)
-                    print(f"OOM in energy evaluation: dropping batch size to {self.batch_size}")
+                    #print(f"OOM in energy evaluation: dropping batch size to {self.batch_size}")
                     gc.collect()
                     #del self.uma_predictor, mol_batch_i
                     torch.cuda.empty_cache()
