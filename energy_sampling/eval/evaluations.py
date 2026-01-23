@@ -973,7 +973,7 @@ def buffer_logging(buffer, metrics, sample_batch):
         metrics['Noised Buffer Mean Score'] = np.mean(np.nan_to_num(buffer.noised_rewards))
 
         metrics['Noised Buffer Loss Quantiles'] = np.array([
-            np.quantile(buffer.noised_losses, q=p)
+            np.quantile(np.nan_to_num(np.log(buffer.noised_losses)), q=p)
             for p in np.linspace(0, 1, 50)
         ])
         metrics['Noised Buffer Mean Loss'] = np.mean(np.nan_to_num(buffer.noised_losses))

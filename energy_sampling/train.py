@@ -427,10 +427,7 @@ class Modeller:
             rewards, samples, self.log_noise_range = calibrate_prior_noise(
                 buffer, energy_function, log_min=-3, log_max=-0.5, low_cut=0.05, high_cut=10.0,
             )
-            num_noised_samples = max(
-                int(1000 * self.args.eval_period / self.args.noised_max_steps),
-                1000,  # len(buffer)
-            )
+            num_noised_samples = max(self.args.noised_buffer_length - len(rewards), 1000)
             rewards2, samples2 = noise_buffer(self.log_noise_range,
                                               buffer, energy_function,
                                               sample_inds=np.random.randint(
