@@ -1,0 +1,134 @@
+T: 100
+anchor_fwd_bwd: true
+anchor_noise_fraction: 1.0
+anchor_noise_level: 0.05
+anneal_temperature: false
+autoencoder_path: null
+batch_growth_increment: 1.01
+batch_size: 50
+beta: 1.0
+both_ways: true
+bounding_coeff: 10.0
+btb_threshold: 1.5
+buffer_dist_cutoff: 0.5
+buffer_path: /scratch/mk8347/csd_runs/datasets/acridine/acridine_sg18_zp1.pt
+buffer_size: 100000
+bwd: false
+bwd_loss_coeffs:
+  bwd_tb_z: 2.0
+  emp_z: 0
+  loss_clip: 1000000000.0
+  mle: 1.0
+  noise_level: 0.0
+  noised_fraction: 0.0
+  tb: 1.0
+  vg_lb: 0
+  vg_lme: 0
+checkpoint_path: null
+clipping: true
+condition_emb_dim: 1024
+conditional_eval_period: 1000
+device: cuda
+discretizer: uniform
+discretizer_max_ratio: 15
+dropout: 0
+ema_decay: 0.95
+energy: molecular_crystal
+energy_density_coeff: 10.0
+energy_function: uma
+energy_lj_coeff: 1.0
+energy_max_temperature: 10
+energy_min_temperature: 0.1
+energy_static_temperature: 2.5
+epochs: 1000000
+eval_T: 100
+eval_batch_size: 1000
+eval_num_samples: 1000
+eval_period: 500
+exploration_factor: 0.25
+exploration_wd: true
+exploratory: false
+figs_period: 1000
+force_restart: true
+fwd_loss_coeffs:
+  buffer: 0
+  buffer_gamma: 0
+  emp_z: 0
+  greedy: 0
+  loss_clip: 1000000000.0
+  mle: 0
+  overlap: 0
+  reinforce: 0
+  tb: 1.0
+  var: 0
+  var_cutoff: 0
+  var_gamma: 0
+  vg_lb: 0.0
+  vg_lme: 0
+fwd_to_bwd_ratio: 1
+gfn_clip: 200.0
+gradient_norm_clip: 0.1
+grow_batch_size: true
+grow_buffer: false
+harmonics_dim: 64
+hidden_dim: 1024
+init_kld_threshold: 0.05
+joint_layers: 4
+learn_pb: true
+learned_variance: true
+lj_rescale:
+- -20.6
+- 5.7
+- -3.4
+- 1.5
+log_var_range: 6
+lr_anneal_time: 100000
+lr_back: 0.0005
+lr_flow: 10.0
+lr_policy: 0.0005
+lr_warmup_ratio: 25
+lr_warmup_time: 1000
+max_batch_size: 1000
+max_traj_length: 100
+min_lr: 1.0e-06
+min_traj_length: 100
+mol_embedding_type: autoencoder
+molecule: acridine
+molecule_conditioning: false
+molecules_path: /scratch/mk8347/csd_runs/datasets/acridine/acridine_conformer.pt
+noised_buffer_length: 10000
+noised_max_steps: 25
+norm: layer
+pb_drift_range: 0.2
+pb_var_range: 1
+phase_change_time: 2000
+prior_coverage_ratio: 0.05
+prioritized: null
+rank_weight: 1.0
+reduction_coeff: 10.0
+repeats: 2
+reward_range: 100
+run_name: sg18_zp1
+s_emb_dim: 1024
+sampling: buffer
+scheduler: true
+seed: 12345
+sg_conditioning: false
+space_groups:
+- 18
+t_emb_dim: 64
+t_scale: 0.05
+tag: acr11
+temp_annealing_max_steps: 2000
+temperature_conditioning: false
+temperature_scaling_factor: 0.01
+thermalization_conv_eps: 0.2
+traj_length_strategy: static
+uma_path: /scratch/mk8347/models/uma/esen_s.pt
+use_weight_decay: false
+wd_max_steps: 10000
+weight_decay: 0.0001
+z_primes:
+- 1
+zero_init: false
+zp_conditioning: false
