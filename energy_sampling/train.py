@@ -875,7 +875,7 @@ class Modeller:
         skip_step = False
         if self.phase == 2:
             if True:  # skip phase 2 directly #self.bwd_tb_norm <= self.args.thermalization_conv_eps:  # hit stage 2 convergence criteria
-                self.phase2to3(ema_model, gfn_model, 0.1, step_ind)
+                self.phase2to3(ema_model, gfn_model, self.args.min_fwd_bwd_ratio, step_ind)
 
         if self.phase == 3:
             skip_step = self.update_controller(step_ind, do_backward, skip_step)
@@ -950,7 +950,7 @@ class Modeller:
                 -coeff * err)  # this is very negative -> pushes towards bwd, which is good
 
         self.args.fwd_to_bwd_ratio = np.clip(
-            self.args.fwd_to_bwd_ratio, 0.1, 10)  # need even enough ratios to get reasonable updates to the metrics
+            self.args.fwd_to_bwd_ratio, self.args.min_fwd_bwd_ratio, self.args.max_fwd_bwd_ratio)  # need even enough ratios to get reasonable updates to the metrics
 
         return skip_step
 
