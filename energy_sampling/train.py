@@ -1202,14 +1202,7 @@ class Modeller:
 
         log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, b_log_r = analyze_buffer(
             buffer, eval_discretizer, gfn_model, self.batch_size)
-
-        if len(buffer) > buffer.buffer_size:
-            log_importance_weight = (b_log_r - log_z) - (b_log_pfs.sum(dim=-1) - b_log_pbs.sum(dim=-1))
-            buffer.truncate_buffer(log_importance_weight)
-
-        self.times['buffer_integration_start'] = time()
-
-        self.times['buffer_integration_end'] = time()
+        log_importance_weight = ((b_log_r - log_z) - (b_log_pfs.sum(dim=-1) - b_log_pbs.sum(dim=-1))).cpu()
 
         self.times['eval_log_metrics_start'] = time()
         '''fwd analysis'''
@@ -1235,7 +1228,7 @@ class Modeller:
         '''bwd sampling and analysis are combined'''
         if self.args.both_ways or self.args.bwd:
             self.times['eval_bwd_figs_start'] = time()
-            bwd_metrics, bwd_fig_dict, rewards, btb_residual, normed_btb_residual, log_importance_weight = bwd_evaluation(
+            bwd_metrics, bwd_fig_dict, rewards, btb_residual, normed_btb_residual = bwd_evaluation(
                 log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, b_log_r,
                 do_figs=do_figs)
             self.times['eval_bwd_figs_end'] = time()
@@ -1245,6 +1238,9 @@ class Modeller:
 
             if len(buffer.noised_rewards) > 0:
                 self.grow_noised_buffer(buffer, energy_function, log_importance_weight, rewards)
+
+        if len(buffer) > buffer.buffer_size:
+            buffer.truncate_buffer(log_importance_weight)
 
         '''logging and wrap up'''
         self.times['eval_wrapup_start'] = time()
@@ -1285,16 +1281,19 @@ class Modeller:
         noised_losses = np.array(buffer.noised_losses)
         noised_train_steps = np.array(buffer.noised_select_counts)
 
-        samples_to_be_replaced = ((noised_losses <= np.percentile(noised_losses, 0.25))
-                                  * (noised_losses > 0)
-                                  * (noised_train_steps >= self.args.noised_max_steps)) or (noised_train_steps >= self.args.noised_max_steps * 2)
+        loss_cut = min(1, np.quantile(noised_losses, 0.25))
+        good_loss = (noised_losses <= loss_cut) & (noised_losses > 0)
+        old_enough = (noised_train_steps >= self.args.noised_max_steps)
+        too_old =  (noised_train_steps >= self.args.noised_max_steps * 2)
+        samples_to_be_replaced = (good_loss & old_enough) | too_old
 
         num_to_replace = sum(samples_to_be_replaced)
         if num_to_replace >= 4:
             log_importance_weight = log_importance_weight.clip(max=log_importance_weight.quantile(0.99))
-            importance_weight = (alpha * log_importance_weight).exp()
+            importance_weight = (alpha * log_importance_weight).exp() + 1e-6
             importance_weight = (1 - eps) * importance_weight
             importance_weight += eps / len(importance_weight)
+            importance_weight = importance_weight.numpy().astype(np.float64)
             importance_weight /= importance_weight.sum()
             sample_inds = np.random.choice(len(buffer), num_to_replace, p=importance_weight, replace=True)
 

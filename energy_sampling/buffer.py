@@ -141,24 +141,8 @@ class CrystalReplayBuffer:
         3 - clustering
         :return:
         """
-        # get descriptors
-        device = self.device
-        #x_tensor = torch.stack(self.x_list).to(device)
-        #e_tensor = -torch.nan_to_num(torch.tensor(self.rewards_list, device=device)) * self.energy_function.temperature
-        #assert len(importance_weight) == len(e_tensor)
-        #
-        # # define cutoffs
-        # d_cut = self.buffer_dist_cutoff
-        # e_cut = self.energy_function.energy_clip
-        #
-        if self.keep_initial_samples:
-            max_new_samples = self.buffer_size - len(self.original_dataset_inds)
-        else:
-            max_new_samples = self.buffer_size
 
-        # inds_to_keep = self.bottom_up_cluster(x_tensor, e_tensor, d_cut, e_cut, max_new_samples)
-
-        inds_to_keep = torch.argsort(importance_weight, descending=True)[:max_new_samples]
+        inds_to_keep = torch.argsort(importance_weight, descending=True)
 
         if self.keep_initial_samples:
             orig_dataset_ind_tensor = torch.tensor(self.original_dataset_inds, device=self.device, dtype=torch.long)

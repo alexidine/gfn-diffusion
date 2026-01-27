@@ -35,8 +35,8 @@ batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAS
 eval_batch_size: 1000        # batch size for evaluation (adaptive)
 eval_num_samples: 1000       # minimum number of samples for evaluation
 epochs: 1000000             # number of training epochs
-eval_period: 250              # how often to do evaluation & reporting
-figs_period: 250             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+eval_period: 50              # how often to do evaluation & reporting
+figs_period: 50             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 conditional_eval_period: 1000 # DEPRECATED # how often to do conditional evaluation with figs # must be multiple of eval period
 
 # GFlowNet settings
@@ -126,10 +126,10 @@ rank_weight: 1.0     # rank-based replay sampling: low rank_weight = steep prior
 buffer_dist_cutoff: 0.5  # 0.5 a bit loose, 0.75 a bit tight
 prioritized: null #"boltzmann"   # three kinds of replay training: random, reward prioritized (Boltzmann), rank-based
 sampling: "buffer"  # no alternative for right now
-buffer_size: 5000          # size of replay buffer
+buffer_size: 4000          # size of replay buffer
 grow_buffer: false  # can be toggled on or off in certain training modes
-noised_buffer_length: 10000
-noised_max_steps: 50
+noised_buffer_length: 4000
+noised_max_steps: 5
 
 # exploration controls
 ################################################################

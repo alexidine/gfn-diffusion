@@ -678,7 +678,7 @@ def bwd_evaluation(log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, 
     Y_side = b_log_r.cpu() - log_z.cpu()
     normed_tb_residual = (X_side - Y_side).abs() / torch.maximum(torch.ones_like(Y_side), Y_side.abs())
     metrics['Bwd Normed TB Residual'] = normed_tb_residual.mean().item()
-    importance_weight = (Y_side - X_side).cpu()
+    #importance_weight = (Y_side - X_side).cpu()
     '''
     xy_scatter_plot(log_pf - log_pb, log_r.cpu() - log_z.cpu(), 'x', 'y').show()
     xy_scatter_plot(log_pf.cpu() + log_r.cpu(), log_pb + log_z, 'x', 'y').show()
@@ -696,7 +696,7 @@ def bwd_evaluation(log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, 
                             fig_dict,
                             b_log_r, log_z)
 
-    return metrics, fig_dict, b_log_r, tb_residual, normed_tb_residual, importance_weight
+    return metrics, fig_dict, b_log_r, tb_residual, normed_tb_residual
 
 
 def bwd_figs(b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, fig_dict, log_r,
