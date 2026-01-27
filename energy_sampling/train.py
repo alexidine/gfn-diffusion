@@ -1287,8 +1287,7 @@ class Modeller:
 
         samples_to_be_replaced = ((noised_losses <= np.percentile(noised_losses, 0.25))
                                   * (noised_losses > 0)
-                                  * (noised_train_steps >= self.args.noised_max_steps))
-        samples_to_be_replaced = torch.logical_or(samples_to_be_replaced, noised_train_steps >= self.args.noised_max_steps * 2)
+                                  * (noised_train_steps >= self.args.noised_max_steps)) or (noised_train_steps >= self.args.noised_max_steps * 2)
 
         num_to_replace = sum(samples_to_be_replaced)
         if num_to_replace >= 4:
