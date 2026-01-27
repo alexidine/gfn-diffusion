@@ -644,10 +644,8 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
 
 
 @torch.no_grad()
-def bwd_evaluation(buffer, gfn_model, discretizer, batch_size, eval_num_samples, do_figs: Optional[bool] = False):
-
-    log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, log_r = analyze_buffer(
-        buffer, discretizer, gfn_model, batch_size)
+def bwd_evaluation(log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, b_log_r,
+                   do_figs: Optional[bool] = False):
 
     metrics = {}
     fig_dict = {}
@@ -657,12 +655,12 @@ def bwd_evaluation(buffer, gfn_model, discretizer, batch_size, eval_num_samples,
     metrics['Mean Bwd B Var'] = b_vars_b.mean().item()
 
     tb_x = log_z.cpu() + b_log_pfs.sum(-1).cpu()
-    tb_y = log_r.cpu() + b_log_pbs.sum(-1).cpu()
-    high_cut, low_cut = torch.quantile(log_r, 0.99), torch.quantile(log_r, 0.01)
-    good_inds = ((high_cut >= log_r) * (log_r >= low_cut)).cpu()
+    tb_y = b_log_r.cpu() + b_log_pbs.sum(-1).cpu()
+    high_cut, low_cut = torch.quantile(b_log_r, 0.99), torch.quantile(b_log_r, 0.01)
+    good_inds = ((high_cut >= b_log_r) * (b_log_r >= low_cut)).cpu()
     metrics['Backward TB R Value'] = torch.corrcoef(torch.stack([tb_x[good_inds], tb_y[good_inds]]))[0, 1].item()
 
-    log_weight = log_r + b_log_pbs.sum(-1).cpu() - b_log_pfs.sum(-1).cpu()
+    log_weight = b_log_r + b_log_pbs.sum(-1).cpu() - b_log_pfs.sum(-1).cpu()
     log_Z_empirical = logmeanexp(log_weight)
     log_Z_lb = log_weight.mean()
     log_Z_learned = log_z.mean()
@@ -672,15 +670,15 @@ def bwd_evaluation(buffer, gfn_model, discretizer, batch_size, eval_num_samples,
     log_pf = b_log_pfs.sum(-1)
     log_pb = b_log_pbs.sum(-1)
 
-    log_ratio = (-log_pf.cpu() - log_z.cpu() + log_pb.cpu() + log_r.cpu())
+    log_ratio = (-log_pf.cpu() - log_z.cpu() + log_pb.cpu() + b_log_r.cpu())
     tb_residual = F.smooth_l1_loss(log_ratio, torch.ones_like(log_ratio), reduction='none', beta=10)
     metrics['Bwd TB Residual'] = tb_residual.mean().item()
 
     X_side = log_pf.cpu() - log_pb.cpu()
-    Y_side = log_r.cpu() - log_z.cpu()
+    Y_side = b_log_r.cpu() - log_z.cpu()
     normed_tb_residual = (X_side - Y_side).abs() / torch.maximum(torch.ones_like(Y_side), Y_side.abs())
     metrics['Bwd Normed TB Residual'] = normed_tb_residual.mean().item()
-
+    importance_weight = (Y_side - X_side).cpu()
     '''
     xy_scatter_plot(log_pf - log_pb, log_r.cpu() - log_z.cpu(), 'x', 'y').show()
     xy_scatter_plot(log_pf.cpu() + log_r.cpu(), log_pb + log_z, 'x', 'y').show()
@@ -696,9 +694,9 @@ def bwd_evaluation(buffer, gfn_model, discretizer, batch_size, eval_num_samples,
                             b_means_b, b_means_f, b_vars_b, b_vars_f,
                             backward_flow_states,
                             fig_dict,
-                            log_r, log_z)
+                            b_log_r, log_z)
 
-    return metrics, fig_dict, log_r, tb_residual, normed_tb_residual
+    return metrics, fig_dict, b_log_r, tb_residual, normed_tb_residual, importance_weight
 
 
 def bwd_figs(b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, fig_dict, log_r,
@@ -723,6 +721,7 @@ def bwd_figs(b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, bac
     return fig_dict
 
 
+@torch.no_grad()
 def analyze_buffer(buffer, discretizer, gfn_model, batch_size):
     sample_inds = torch.arange(len(buffer))
     num_samples = len(sample_inds)
@@ -973,13 +972,13 @@ def buffer_logging(buffer, metrics, sample_batch):
         metrics['Noised Buffer Mean Score'] = np.mean(np.nan_to_num(buffer.noised_rewards))
 
         metrics['Noised Buffer Loss Quantiles'] = np.array([
-            np.quantile(buffer.noised_losses, q=p)
+            np.quantile(np.clip(buffer.noised_losses, max=10), q=p)
             for p in np.linspace(0, 1, 50)
         ])
         metrics['Noised Buffer Mean Loss'] = np.mean(np.nan_to_num(buffer.noised_losses))
 
         metrics['Noised Buffer Step Quantiles'] = np.array([
-            np.quantile(buffer.noised_select_counts, q=p)
+            np.quantile(np.clip(buffer.noised_select_counts, max=100), q=p)
             for p in np.linspace(0, 1, 50)
         ])
         metrics['Noised Buffer Mean Step'] = np.mean(np.nan_to_num(buffer.noised_select_counts))

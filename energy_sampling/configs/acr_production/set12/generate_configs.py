@@ -43,8 +43,8 @@ if __name__ == "__main__":
                     config = deepcopy(base)
                     config['space_groups'] = [sg]
                     config['z_primes'] = [zp]
-                    config['run_name'] = f'sg{sg}_zp{zp}'
-                    config['tag'] = f'acr11'
+                    config['run_name'] = f'sg{sg}_zp{zp}_{ind}'
+                    config['tag'] = f'acr12'
                     config['noised_buffer_length'] = nbs
                     config['buffer_size'] = bs
                     config['noised_max_steps'] = mx

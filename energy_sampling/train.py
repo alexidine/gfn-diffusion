@@ -25,7 +25,7 @@ from energy_sampling.utils import iter_forever, \
     parse_loss_schedules, dict2namespace, update_loss_schedule, \
     random_discretizer, low_discrepancy_discretizer, low_discrepancy_discretizer2, shifted_equidistant, \
     calibrate_prior_noise, noise_buffer, stdz
-from eval.evaluations import adjust_fig_filesize, log_metrics, fwd_figs, bwd_evaluation
+from eval.evaluations import adjust_fig_filesize, log_metrics, fwd_figs, bwd_evaluation, analyze_buffer
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 from models import GFN
 from mxtaltools.common.geometry_utils import crystal_parameter_distmat
@@ -841,7 +841,7 @@ class Modeller:
             # else:
             mol_batch.orient_molecule(mode='std')
 
-            loss, crystal_batch, loss_dict, rewards, ftb_loss = self.fwd_train_step(
+            loss, crystal_batch, loss_dict, rewards, log_importance_weight = self.fwd_train_step(
                 energy_function,
                 gfn_model,
                 discretizer,
@@ -851,9 +851,11 @@ class Modeller:
                 repeats=repeats,
                 report_losses=True
             )
-            if self.grow_buffer:
+            add_tau = min(1, int(self.args.fwd_to_bwd_ratio/ 0.1))
+            if self.grow_buffer and (step_ind % add_tau == 0):
                 del crystal_batch.symmetry_operators, crystal_batch.gfn_energy
-                buffer.add_to_staging(data_batch=crystal_batch.cpu().detach())
+                buffer.add_to_staging(data_batch=crystal_batch.cpu().detach(),
+                                      importance_weight=log_importance_weight.cpu().detach())
             del crystal_batch
 
         elif do_backward:
@@ -886,8 +888,8 @@ class Modeller:
         loss_dict_cpu = {step_type + "_loss/" + key: value.cpu().detach().numpy() for key, value in
                          loss_dict.items()}
 
-        loss = None
-        loss_dict = None
+        # loss = None
+        # loss_dict = None
         torch.cuda.synchronize()
 
         return clean_loss, loss_dict_cpu
@@ -1130,11 +1132,11 @@ class Modeller:
         dataset = [dataset[ind] for ind in good_inds]
 
         # filter near-identical samples
-        d_cut = 0.0001
+        d_cut = 0.01
         latents = collate_data_list(dataset).latent_params()
         dmat = crystal_parameter_distmat(latents)
-        keep = torch.zeros(len(latents), dtype=bool, device=latents.device)
 
+        keep = torch.zeros(len(latents), dtype=bool, device=latents.device)
         for i in range(len(latents)):
             # check if this point is far from all previously kept points
             if not (dmat[i, keep] < d_cut).any():
@@ -1195,9 +1197,18 @@ class Modeller:
             buffer, energy_function, eval_discretizer, gfn_model, test_mol_loader)
         self.times['eval_sampling_end'] = time()
 
-        self.times['buffer_integration_start'] = time()
         if len(buffer.staging_buffer) > 0:
             buffer.incorporate_staging_buffer()
+
+        log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, b_log_r = analyze_buffer(
+            buffer, eval_discretizer, gfn_model, self.batch_size)
+
+        if len(buffer) > buffer.buffer_size:
+            log_importance_weight = (b_log_r - log_z) - (b_log_pfs.sum(dim=-1) - b_log_pbs.sum(dim=-1))
+            buffer.truncate_buffer(log_importance_weight)
+
+        self.times['buffer_integration_start'] = time()
+
         self.times['buffer_integration_end'] = time()
 
         self.times['eval_log_metrics_start'] = time()
@@ -1224,8 +1235,8 @@ class Modeller:
         '''bwd sampling and analysis are combined'''
         if self.args.both_ways or self.args.bwd:
             self.times['eval_bwd_figs_start'] = time()
-            bwd_metrics, bwd_fig_dict, rewards, btb_residual, normed_btb_residual = bwd_evaluation(
-                buffer, gfn_model, eval_discretizer, self.batch_size, self.args.eval_num_samples,
+            bwd_metrics, bwd_fig_dict, rewards, btb_residual, normed_btb_residual, log_importance_weight = bwd_evaluation(
+                log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, b_log_r,
                 do_figs=do_figs)
             self.times['eval_bwd_figs_end'] = time()
 
@@ -1233,7 +1244,7 @@ class Modeller:
             fig_dict.update(bwd_fig_dict)
 
             if len(buffer.noised_rewards) > 0:
-                self.grow_noised_buffer(buffer, energy_function, normed_btb_residual, rewards)
+                self.grow_noised_buffer(buffer, energy_function, log_importance_weight, rewards)
 
         '''logging and wrap up'''
         self.times['eval_wrapup_start'] = time()
@@ -1268,31 +1279,25 @@ class Modeller:
         #                                                              )
         #         metrics.update(conditional_metrics)
 
-    def grow_noised_buffer(self, buffer, energy_function, normed_btb_residual, rewards):
+    def grow_noised_buffer(self, buffer, energy_function, log_importance_weight, rewards, alpha: float = 1.0, eps: float = 1.0e-2):
         self.times['eval_bwd_noising_start'] = time()
-
-        # select samples to be noised
-        # take the top-k in loss + reward for 75%
-        # then 25% random
-        ranked_mix = 0.75
-        random_mix = 0.25
 
         noised_losses = np.array(buffer.noised_losses)
         noised_train_steps = np.array(buffer.noised_select_counts)
 
-        samples_to_be_replaced = ((noised_losses <= noised_losses.mean())
+        samples_to_be_replaced = ((noised_losses <= np.percentile(noised_losses, 0.25))
                                   * (noised_losses > 0)
                                   * (noised_train_steps >= self.args.noised_max_steps))
+        samples_to_be_replaced = torch.logical_or(samples_to_be_replaced, noised_train_steps >= self.args.noised_max_steps * 2)
+
         num_to_replace = sum(samples_to_be_replaced)
         if num_to_replace >= 4:
-            ranked_to_replace = ceil(num_to_replace * ranked_mix)
-            random_to_replace = num_to_replace - ranked_to_replace
-
-            # we want high losses, and high rewards
-            weight = torch.tanh(stdz(normed_btb_residual)) + torch.tanh(stdz(rewards))
-            ranked_inds = np.argsort(-weight).flatten()[:ranked_to_replace]
-            random_inds = np.random.randint(0, len(buffer), random_to_replace)
-            sample_inds = np.concatenate([ranked_inds, random_inds])
+            log_importance_weight = log_importance_weight.clip(max=log_importance_weight.quantile(0.99))
+            importance_weight = (alpha * log_importance_weight).exp()
+            importance_weight = (1 - eps) * importance_weight
+            importance_weight += eps / len(importance_weight)
+            importance_weight /= importance_weight.sum()
+            sample_inds = np.random.choice(len(buffer), num_to_replace, p=importance_weight, replace=True)
 
             new_rewards, samples = noise_buffer(self.log_noise_range,
                                                 buffer, energy_function,
@@ -1351,7 +1356,9 @@ class Modeller:
                 eval_samples.extend(sample_batch.batch_to_list())
 
                 if self.grow_buffer:
-                    buffer.add_to_staging(data_batch=sample_batch.cpu().detach())
+                    log_importance_weight = ((log_r - log_Z_learned) - (log_pfs.sum(-1) - log_pbs.sum(-1))).cpu().detach()
+                    buffer.add_to_staging(importance_weight=log_importance_weight,
+                                          data_batch=sample_batch.cpu().detach())
 
             except (RuntimeError, ValueError) as e:
                 print(f"Caught error: {str(e)}")

@@ -194,6 +194,7 @@ def get_gfn_forward_loss(loss_coeffs,
     Y_side = log_r - log_flow
     normed_tb_residual = (X_side - Y_side).abs() / torch.maximum(torch.ones_like(Y_side), Y_side.abs())
     normed_tb_residual = torch.nan_to_num(normed_tb_residual.detach())
+    log_importance_weight = (Y_side - X_side).detach()
 
     if report_losses:
         loss_dict = {}
@@ -222,9 +223,9 @@ def get_gfn_forward_loss(loss_coeffs,
         loss_dict = None
 
     if return_exp:
-        return loss, crystal_batch.cpu().detach(), loss_dict, log_r, normed_tb_residual
+        return loss, crystal_batch.cpu().detach(), loss_dict, log_r, log_importance_weight
     else:
-        return loss, loss_dict, log_r, normed_tb_residual
+        return loss, loss_dict, log_r, log_importance_weight
 
 
 

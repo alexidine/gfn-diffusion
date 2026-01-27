@@ -15,6 +15,65 @@ from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 
 torch.cuda.set_per_process_memory_fraction(0.9, device=0)
 
+def dataset_tb_analysis():
+    molecule = torch.load(molecule_path, weights_only=False)
+    dataset = torch.load(dataset_path, weights_only=False)
+    max_z_prime = max([int(elem.max_z_prime) for elem in dataset])
+    data_batch = collate_data_list(dataset, max_z_prime=max_z_prime)
+    data_latents = data_batch.latent_params()
+
+    gfn_model = GFN(**np.load(config_path, allow_pickle=True).item())
+    gfn_model.load_state_dict(torch.load(model_path, weights_only=True))
+    gfn_model.to(device)
+    gfn_model.eval()
+
+    bsz = 10000
+    terminal_states = data_latents
+    discretizer = lambda bsz: uniform_discretizer(bsz, n_steps)
+    condition = torch.zeros((len(terminal_states), 1), device=gfn_model.device)
+
+    with torch.no_grad():
+        states, log_pfs, log_pbs, log_flow = gfn_model.get_traj_bwd(
+            terminal_states.clone().to(gfn_model.device),
+            discretizer, condition, return_gauss_params=False
+        )
+        pbs = log_pbs.sum(-1).cpu().detach()
+        pfs = log_pfs.sum(-1).cpu().detach()
+
+    pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
+    predictor = init_uma_crystal_predictor(pred_path, device=device)
+    dataset = analyze_samples(
+        None, #data_batch.latent_params(),
+        dataset,
+        max_z_prime,
+        device,
+        1000,
+        sg_ind,
+        zp,
+        do_uma=True,
+        predictor=predictor,
+        overwrite_latents=False,
+    )
+
+    denergy = data_batch.uma_pot / (data_batch.sym_mult * data_batch.z_prime) - data_batch.uma_gas_pot
+    data_batch = collate_data_list(dataset)
+    data_batch.uma = denergy
+    rewards = generator_reward(
+        data_batch,
+        None,
+        max_z_prime,
+        energy_function=energy_function,
+        temperature=kT,
+        energy_clip=None
+    )
+    parity_fig(
+        y_raw=pfs + gfn_model.flow_model().item(),
+        x_raw=pbs + rewards,
+        y_label=r'$log(P_f(\tau)) + log(R(x_T))$',
+        x_label=r'$log(P_b(\tau|x_T)) + log(Z_\theta)$',
+    ).show()
+    data_batch.plot_batch_density_funnel(override_energy=denergy)
+
 
 def sample_and_analyze():
     gfn_model = GFN(**np.load(config_path, allow_pickle=True).item())
@@ -128,14 +187,14 @@ def view_and_save_figs(fig_dict):
 
 if __name__ == '__main__':
     # acridine lj config
-    run = 'xuldud_61_uma'
+    # run = 'xuldud_61_uma'
     # run = 'xuldud_61_elj'
-    # run = 'acridine_14_uma'
+    run = 'acridine_14_uma'
 
     if run == 'acridine_14_uma':
         run_name = 'acr_lj'
         device = 'cuda'
-        num_samples = 10000
+        num_samples = 1000
         batch_size = 1000
         energy_function = 'uma'  # 'elj', 'lj' 'uma
         n_steps = 100  # critical to get this right!
@@ -144,8 +203,8 @@ if __name__ == '__main__':
         kT = 2.5
         units = 'kJ/mol'
 
-        model_path = rf"D:\crystal_datasets\acridine\acr10_sg{sg_ind}_zp{zp}_model_eval.pt"
-        config_path = rf"D:\crystal_datasets\acridine\acr10_sg{sg_ind}_zp{zp}_model_config.npy"
+        model_path = rf"D:\crystal_datasets\acridine\acr11_sg{sg_ind}_zp{zp}_model_eval.pt"
+        config_path = rf"D:\crystal_datasets\acridine\acr11_sg{sg_ind}_zp{zp}_model_config.npy"
         molecule_path = r"D:\crystal_datasets\acridine\acridine_conformer.pt"
         dataset_path = rf"D:\crystal_datasets\acridine\acridine_sg{sg_ind}_zp{zp}.pt"
         results_dir = rf"D:\crystal_datasets\gfn_results"
@@ -195,11 +254,11 @@ if __name__ == '__main__':
         exp_sample_path = r"D:\crystal_datasets\xuldud\xul_csd.pkl"
 
     k_vals = [50, 100, 200]  # , 50, 100]
-    reload_results = True
+    reload_results = False
     show_figs = True
     write_figs = False
     save_results = True
-    overwrite_results = True
+    overwrite_results = False
 
     "Load Relevant Dataset"
     molecule = torch.load(molecule_path, weights_only=False)

@@ -52,13 +52,13 @@ class CrystalReplayBuffer:
         self.noised_max_steps = noised_max_steps
 
     @torch.no_grad()
-    def add_to_staging(self, data_list=None, data_batch=None):
+    def add_to_staging(self, importance_weight, data_list=None, data_batch=None):
         if len(self.staging_buffer) < len(
                 self):  # don't stage a crazy number of samples - downstream cost becomes too high
             if data_list is None and data_batch is not None:
                 data_list = data_batch.cpu().detach().batch_to_list()
 
-            self.staging_buffer.extend(data_list)
+            self.staging_buffer.extend([elem for ind, elem in enumerate(data_list) if importance_weight[ind] > 0]) # keep any plausibly underweighted states
 
     @torch.no_grad()
     def add(self,
@@ -68,19 +68,14 @@ class CrystalReplayBuffer:
         else:
             self.add_samples_to_dataset(data_list)
 
-        if len(self) > self.buffer_size:  # pare down buffer
-            self.truncate_buffer()
+        # if len(self) > self.buffer_size:  # pare down buffer
+        #     self.truncate_buffer()
 
         assert len(self.dataset) == len(self.x_list) == len(self.rewards_list)
 
     def incorporate_staging_buffer(self):
         if len(self.staging_buffer) > 0:  # will fail if staging buffer is empty
-            self.add_samples_to_dataset(self.staging_buffer, skip_staging=True)
-            self.staging_buffer = []
-
-            if len(self) > self.buffer_size:  # pare down buffer
-                self.truncate_buffer()
-
+            self.add_samples_to_dataset(self.staging_buffer, skip_staging=False)
             assert len(self.dataset) == len(self.x_list) == len(self.rewards_list)
 
     def add_samples_to_dataset(self, data_list, skip_staging: bool = False):
@@ -94,22 +89,21 @@ class CrystalReplayBuffer:
         new_latents = data_batch.latent_params()
         new_sgs = data_batch.sg_ind
         # get new samples rewards
-        scores = self.energy_function.prebuilt_sample_to_reward(
+        rewards = self.energy_function.prebuilt_sample_to_reward(
             data_batch,
             temperature=torch.ones(data_batch.num_graphs) * self.energy_function.temperature)
 
-        # enforce reasonable standards for consideration in the buffer
-        # score_cut = np.quantile(self.rewards_list, 0.5)
+        # enforce VERY LOOSE standards for consideration in the buffer
         score_cut = max(self.reward_clip, np.amin(self.rewards_list))  # the lowest reward in our dynamical range
         packing_coeffs = data_batch.packing_coeff.cpu().detach().numpy()
         good_inds = [ind for ind in range(len(data_list)) if
-                     (data_list[ind].reduction_en <= 1e-3) and (scores[ind] > score_cut) and (
+                     (data_list[ind].reduction_en <= 1e-3) and (rewards[ind] > score_cut) and (
                              packing_coeffs[ind] > 0.55) and (packing_coeffs[ind] < 0.95)]
         # add anything reasonable
         if len(good_inds) > 0:
             data_to_add = [data_list[ind] for ind in good_inds]
             self.dataset.extend(data_to_add)
-            good_scores = scores[torch.tensor(good_inds, dtype=torch.long)]
+            good_scores = rewards[torch.tensor(good_inds, dtype=torch.long)]
             self.x_list.extend([new_latents[i] for i in good_inds])
             self.rewards_list.extend(good_scores.flatten().cpu().detach().numpy())
             self.sg_list.extend([new_sgs[i] for i in good_inds])
@@ -140,7 +134,7 @@ class CrystalReplayBuffer:
         self.original_dataset_inds = list(np.arange(len(self.dataset)))
         self.sg_list = list(dataset_batch.sg_ind.cpu())
 
-    def truncate_buffer(self):
+    def truncate_buffer(self, importance_weight):
         """
         1 - keep initial states
         2 - bottom-up energy greedy selection
@@ -149,51 +143,28 @@ class CrystalReplayBuffer:
         """
         # get descriptors
         device = self.device
-        x_tensor = torch.stack(self.x_list).to(device)
-        e_tensor = -torch.nan_to_num(torch.tensor(self.rewards_list, device=device)) * self.energy_function.temperature
-
-        # define cutoffs
-        d_cut = self.buffer_dist_cutoff
-        e_cut = self.energy_function.energy_clip
-
+        #x_tensor = torch.stack(self.x_list).to(device)
+        #e_tensor = -torch.nan_to_num(torch.tensor(self.rewards_list, device=device)) * self.energy_function.temperature
+        #assert len(importance_weight) == len(e_tensor)
+        #
+        # # define cutoffs
+        # d_cut = self.buffer_dist_cutoff
+        # e_cut = self.energy_function.energy_clip
+        #
         if self.keep_initial_samples:
             max_new_samples = self.buffer_size - len(self.original_dataset_inds)
         else:
             max_new_samples = self.buffer_size
 
-        inds_to_keep = self.bottom_up_cluster(x_tensor, e_tensor, d_cut, e_cut, max_new_samples)
+        # inds_to_keep = self.bottom_up_cluster(x_tensor, e_tensor, d_cut, e_cut, max_new_samples)
+
+        inds_to_keep = torch.argsort(importance_weight, descending=True)[:max_new_samples]
 
         if self.keep_initial_samples:
             orig_dataset_ind_tensor = torch.tensor(self.original_dataset_inds, device=self.device, dtype=torch.long)
-            keep_inds_tensor = torch.as_tensor(inds_to_keep)
-            combined = torch.unique(torch.cat([keep_inds_tensor,
-                                               orig_dataset_ind_tensor]))
-            # Protect originals by giving them artificially low energy ranks
-            energies = e_tensor[combined].clone()
-            mask_orig = torch.isin(combined, orig_dataset_ind_tensor)
-            energies[mask_orig] -= 1e6  # will always be kept
-            sorted_combined = combined[torch.argsort(energies)]
-            inds_to_keep = sorted_combined[:max(len(self.original_dataset_inds), self.buffer_size)]
-        else:
-            # Sort by (modified) energy and truncate
-            if len(inds_to_keep) > self.buffer_size:
-                sorted_by_e = inds_to_keep[torch.argsort(e_tensor[inds_to_keep])]
-                inds_to_keep = sorted_by_e[:self.buffer_size]
+            combined = torch.unique(torch.cat([orig_dataset_ind_tensor, inds_to_keep]))[:self.buffer_size]
 
-        inds_to_keep = inds_to_keep.tolist()  # for convenience
-
-        # Fill with random samples if needed
-        n_keep = len(inds_to_keep)
-        if n_keep < self.buffer_size:
-            # Candidates = all indices not already kept
-            all_inds = set(range(len(self.x_list)))
-            remaining = list(all_inds - set(inds_to_keep))
-
-            n_fill = self.buffer_size - n_keep
-            if n_fill > 0 and len(remaining) > 0:
-                fill_inds = np.random.choice(remaining, size=min(n_fill, len(remaining)), replace=False)
-                inds_to_keep.extend(fill_inds.tolist())
-
+        inds_to_keep = combined.tolist()  # for convenience
         self.dataset = [self.dataset[ind] for ind in inds_to_keep]
         self.rewards_list = [self.rewards_list[ind] for ind in inds_to_keep]
         self.x_list = [self.x_list[ind] for ind in inds_to_keep]
