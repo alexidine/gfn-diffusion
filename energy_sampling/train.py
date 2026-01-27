@@ -851,8 +851,8 @@ class Modeller:
                 repeats=repeats,
                 report_losses=True
             )
-            add_tau = min(1, int(self.args.fwd_to_bwd_ratio/ 0.1))
-            if self.grow_buffer and (step_ind % add_tau == 0):
+            p_add = max(0.1, min(1.0, (1/10) / self.args.fwd_to_bwd_ratio))
+            if self.grow_buffer and np.random.rand() < p_add:
                 del crystal_batch.symmetry_operators, crystal_batch.gfn_energy
                 buffer.add_to_staging(data_batch=crystal_batch.cpu().detach(),
                                       importance_weight=log_importance_weight.cpu().detach())
