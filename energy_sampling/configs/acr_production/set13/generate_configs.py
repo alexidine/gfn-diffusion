@@ -94,3 +94,64 @@ if __name__ == "__main__":
 
                         ind += 1
 
+    temp = 1.25
+
+    for zp in [1]:
+        for sg in [14]:
+            for mx in [25, 50]:
+                for nbs in [10000, 20000]:
+                    for bs in [10000, 20000]:
+                        config = deepcopy(base)
+                        config['space_groups'] = [sg]
+                        config['z_primes'] = [zp]
+                        config['run_name'] = f'sg{sg}_zp{zp}_{ind}'
+                        config['tag'] = f'acr13'
+                        config['noised_buffer_length'] = nbs
+                        config['buffer_size'] = bs
+                        config['noised_max_steps'] = mx
+                        config['max_batch_size'] = 1000
+                        config['space_groups'] = [sg]
+                        config['z_primes'] = [zp]
+                        config['energy_function'] = en
+                        config['energy_static_temperature'] = temp
+                        config['thermalization_conv_eps'] = eps
+
+                        config['molecules_path'] = '/scratch/mk8347/csd_runs/datasets/acridine/acridine_conformer.pt'
+                        config['buffer_path'] = f'/scratch/mk8347/csd_runs/datasets/acridine/acridine_sg{sg}_zp{zp}.pt'
+
+                        config_path = f'{ind}.yaml'
+                        with open(config_path, 'w') as f:
+                            yaml.dump(config, f, default_flow_style=False)
+
+                        ind += 1
+
+    temp = 5
+    en = 'elj'
+    for zp in [1]:
+        for sg in [14]:
+            for mx in [25, 50]:
+                for nbs in [10000, 20000]:
+                    for bs in [10000, 20000]:
+                        config = deepcopy(base)
+                        config['space_groups'] = [sg]
+                        config['z_primes'] = [zp]
+                        config['run_name'] = f'sg{sg}_zp{zp}_{ind}'
+                        config['tag'] = f'acr13'
+                        config['noised_buffer_length'] = nbs
+                        config['buffer_size'] = bs
+                        config['noised_max_steps'] = mx
+                        config['max_batch_size'] = 1000
+                        config['space_groups'] = [sg]
+                        config['z_primes'] = [zp]
+                        config['energy_function'] = en
+                        config['energy_static_temperature'] = temp
+                        config['thermalization_conv_eps'] = eps
+
+                        config['molecules_path'] = '/scratch/mk8347/csd_runs/datasets/acridine/acridine_conformer.pt'
+                        config['buffer_path'] = f'/scratch/mk8347/csd_runs/datasets/acridine/acridine_sg{sg}_zp{zp}.pt'
+
+                        config_path = f'{ind}.yaml'
+                        with open(config_path, 'w') as f:
+                            yaml.dump(config, f, default_flow_style=False)
+
+                        ind += 1

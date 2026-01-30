@@ -37,6 +37,43 @@ def adjust_fig_filesize(fig_dict):
             pass
 
 
+def add_color_switcher(fig, color_fields, *, colorscales=None, clip=(1, 99), trace_index=2):
+    # trace_index = index of the scatter you want to recolor
+    # (0 = identity line, 1 = fit line, 2 = scatter)
+
+    cmins = {k: np.percentile(v, clip[0]) for k, v in color_fields.items()}
+    cmaxs = {k: np.percentile(v, clip[1]) for k, v in color_fields.items()}
+
+    buttons = []
+    for name, z in color_fields.items():
+        buttons.append(dict(
+            label=name,
+            method="restyle",
+            args=[
+                {
+                    "marker.color": [z.tolist()],
+                    "marker.cmin": cmins[name],
+                    "marker.cmax": cmaxs[name],
+                    "marker.colorscale": (colorscales or {}).get(name, "Viridis"),
+                    "marker.colorbar.title": name,
+                },
+                [trace_index],  # IMPORTANT
+            ],
+        ))
+
+    fig.update_layout(
+        updatemenus=[dict(
+            buttons=buttons,
+            direction="down",
+            x=1.05,
+            y=1.0,
+            showactive=True,
+        )],
+        margin=dict(r=120),
+    )
+    return fig
+
+
 @torch.no_grad()
 def conditional_eval_step(energy_function,
                           gfn_model,
@@ -122,7 +159,8 @@ def fwd_figs(buffer, flow_states,
         pass
 
     log_fwd_traj_params(gauss_params_f, fig_dict, flow_states, log_pbs, log_pfs, log_r)
-    fig_dict['TB Parity Plot'], _ = flow_parity_plot(log_r, log_flow, log_pbs, log_pfs)
+    # append density, reward, log importance weight, TB loss
+    fig_dict['TB Parity Plot'], _ = flow_parity_plot(log_r, log_flow, log_pbs, log_pfs, sample_batch.packing_coeff)
     fig_dict['VG Error'] = vargrad_error(log_r, log_pbs, log_pfs)
     fig_dict['TB Residual vs R'] = xy_scatter_plot(
         log_r,
@@ -645,8 +683,8 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
 
 @torch.no_grad()
 def bwd_evaluation(log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, b_log_r,
+                   b_packing_coeff,
                    do_figs: Optional[bool] = False):
-
     metrics = {}
     fig_dict = {}
     metrics['Mean Bwd F Drift'] = b_means_f.abs().mean().item()
@@ -678,7 +716,7 @@ def bwd_evaluation(log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, 
     Y_side = b_log_r.cpu() - log_z.cpu()
     normed_tb_residual = (X_side - Y_side).abs() / torch.maximum(torch.ones_like(Y_side), Y_side.abs())
     metrics['Bwd Normed TB Residual'] = normed_tb_residual.mean().item()
-    #importance_weight = (Y_side - X_side).cpu()
+    # importance_weight = (Y_side - X_side).cpu()
     '''
     xy_scatter_plot(log_pf - log_pb, log_r.cpu() - log_z.cpu(), 'x', 'y').show()
     xy_scatter_plot(log_pf.cpu() + log_r.cpu(), log_pb + log_z, 'x', 'y').show()
@@ -694,13 +732,15 @@ def bwd_evaluation(log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, 
                             b_means_b, b_means_f, b_vars_b, b_vars_f,
                             backward_flow_states,
                             fig_dict,
-                            b_log_r, log_z)
+                            b_log_r, log_z,
+                            b_packing_coeff,
+                            )
 
     return metrics, fig_dict, b_log_r, tb_residual, normed_tb_residual
 
 
 def bwd_figs(b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, fig_dict, log_r,
-             log_z):
+             log_z, b_packing_coeff):
     fig_dict['Backward Latents Trajectories'] = visualize_latent_trajs(
         backward_flow_states.cpu().detach().numpy(),
         n_trajs=20, log_r=log_r.cpu().detach().numpy())
@@ -708,7 +748,8 @@ def bwd_figs(b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, bac
     fig_dict['Backward TB Parity Plot'], _ = flow_parity_plot(
         log_r.to(log_z.device),
         log_z, b_log_pbs,
-        b_log_pfs)
+        b_log_pfs,
+        b_packing_coeff)
     fig_dict['Bwd TB Residual vs R'] = xy_scatter_plot(
         log_r,
         torch.abs(log_r.cpu() - log_z.cpu() - b_log_pfs.sum(-1).cpu() + b_log_pbs.sum(-1).cpu()),
@@ -736,6 +777,7 @@ def analyze_buffer(buffer, discretizer, gfn_model, batch_size):
         b_vars_b=[],
         log_r=[],
         log_z=[],
+        b_packing_coeff=[],
     )
     for b_ind in range(num_batches):
         start = b_ind * batch_size
@@ -773,6 +815,7 @@ def analyze_buffer(buffer, discretizer, gfn_model, batch_size):
         acc['b_vars_b'].append(b_vars_b.cpu())
         acc['log_r'].append(log_r.cpu())
         acc['log_z'].append(log_z.cpu())
+        acc['b_packing_coeff'].append(crystal_batch.packing_coeff.cpu())
     backward_flow_states = torch.cat(acc['backward_flow_states'], dim=0)
     b_log_pfs = torch.cat(acc['b_log_pfs'], dim=0)
     b_log_pbs = torch.cat(acc['b_log_pbs'], dim=0)
@@ -781,9 +824,10 @@ def analyze_buffer(buffer, discretizer, gfn_model, batch_size):
     b_means_b = torch.cat(acc['b_means_b'], dim=0)
     b_vars_b = torch.cat(acc['b_vars_b'], dim=0)
     log_r = torch.cat(acc['log_r'], dim=0)
+    b_packing_coeff = torch.cat(acc['b_packing_coeff'], dim=0)
     # log_z may be scalar-per-batch or per-sample
     log_z = torch.stack(acc['log_z']).mean()
-    return log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, log_r
+    return log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, log_r, b_packing_coeff
 
 
 def get_buffer_stats(buffer):
@@ -1216,10 +1260,11 @@ def visualize_latent_trajs(states, n_trajs, log_r):
     return fig
 
 
-def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs):
+def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs, packing_coeff):
     # Compute x and y
     x = (log_r + log_pbs.sum(-1)).cpu().detach().numpy()
     y = (log_Z_learned + log_pfs.sum(-1)).cpu().detach().numpy()
+    log_importance_weight = ((log_r - log_Z_learned) - (log_pfs.sum(-1) - log_pbs.sum(-1))).cpu().detach().numpy()
 
     # Get symmetric limits
     min_val = min(x.min(), y.min())
@@ -1254,7 +1299,9 @@ def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs):
     fig.add_trace(go.Scatter(
         x=x, y=y,
         mode='markers',
-        marker=dict(size=6, opacity=0.7, color=log_r.cpu().detach(), colorscale='Jet'),
+        marker=dict(size=6, opacity=0.7,
+                    # color=log_r.cpu().detach(), colorscale='Jet'
+                    ),
         name=f'Samples<br>MAE = {mae:.3f}<br>R = {r_value:.3f}'
     ))
 
@@ -1267,6 +1314,12 @@ def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs):
         # height=600,
         template='plotly_white'
     )
+    color_fields = {
+        "Reward": log_r,
+        "Density": packing_coeff.clip(max=2),
+        "Importance Weight": log_importance_weight,
+    }
+    fig = add_color_switcher(fig, color_fields)
 
     return fig, r_value
 

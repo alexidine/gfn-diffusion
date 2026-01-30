@@ -1200,7 +1200,7 @@ class Modeller:
         if len(buffer.staging_buffer) > 0:
             buffer.incorporate_staging_buffer()
 
-        log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, b_log_r = analyze_buffer(
+        log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, b_log_r, b_packing_coeff = analyze_buffer(
             buffer, eval_discretizer, gfn_model, self.batch_size)
         log_importance_weight = ((b_log_r - log_z) - (b_log_pfs.sum(dim=-1) - b_log_pbs.sum(dim=-1))).cpu()
 
@@ -1230,6 +1230,7 @@ class Modeller:
             self.times['eval_bwd_figs_start'] = time()
             bwd_metrics, bwd_fig_dict, rewards, btb_residual, normed_btb_residual = bwd_evaluation(
                 log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, b_log_r,
+                b_packing_coeff,
                 do_figs=do_figs)
             self.times['eval_bwd_figs_end'] = time()
 

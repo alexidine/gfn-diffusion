@@ -18,6 +18,8 @@ torch.cuda.set_per_process_memory_fraction(0.9, device=0)
 def dataset_tb_analysis():
     molecule = torch.load(molecule_path, weights_only=False)
     dataset = torch.load(dataset_path, weights_only=False)
+    #dataset = [elem for elem in dataset if elem.packing_coeff >= 0.55]
+    #dataset = [elem for elem in dataset if elem.packing_coeff <= 0.95]
     max_z_prime = max([int(elem.max_z_prime) for elem in dataset])
     data_batch = collate_data_list(dataset, max_z_prime=max_z_prime)
     data_latents = data_batch.latent_params()
@@ -50,14 +52,18 @@ def dataset_tb_analysis():
         1000,
         sg_ind,
         zp,
-        do_uma=True,
+        do_uma=False,
         predictor=predictor,
         overwrite_latents=False,
     )
 
-    denergy = data_batch.uma_pot / (data_batch.sym_mult * data_batch.z_prime) - data_batch.uma_gas_pot
     data_batch = collate_data_list(dataset)
-    data_batch.uma = denergy
+    lj_mean, lj_std, uma_mean, uma_std = [-20.6, 5.7, -3.4, 1.5]
+    atomwise_energy = data_batch.elj / (data_batch.num_atoms / data_batch.z_prime)
+    atomwise_fixed = (atomwise_energy - lj_mean) / lj_std * uma_std + uma_mean
+    denergy = atomwise_fixed * (data_batch.num_atoms / data_batch.z_prime)
+    # denergy = data_batch.uma_pot / (data_batch.sym_mult * data_batch.z_prime) - data_batch.uma_gas_pot
+    # data_batch.uma = denergy
     rewards = generator_reward(
         data_batch,
         None,
@@ -74,6 +80,51 @@ def dataset_tb_analysis():
     ).show()
     data_batch.plot_batch_density_funnel(override_energy=denergy)
 
+    import plotly.graph_objects as go
+    alpha = 1.0
+    eps = 1.0e-2
+    z = gfn_model.flow_model().item()
+    log_importance_weight = (rewards - z) - (pfs - pbs)
+    log_importance_weight = log_importance_weight.clip(max=log_importance_weight.quantile(0.99))
+    importance_weight = (alpha * log_importance_weight).exp() + 1e-6
+    importance_weight = (1 - eps) * importance_weight
+    importance_weight += eps / len(importance_weight)
+    importance_weight = importance_weight.numpy().astype(np.float64)
+    importance_weight /= importance_weight.sum()
+    go.Figure(go.Scatter(y=pfs + z, x=pbs + rewards, mode='markers', marker_color=np.log10(importance_weight),
+                         marker_colorscale='viridis', opacity=0.5)).show()
+    go.Figure(
+        go.Scatter(x=data_batch.packing_coeff, y=denergy, marker_color=np.log10(importance_weight), mode='markers',
+                   opacity=0.5)).show()
+
+    from examples.crystal_search_reporting import batch_compack
+    from mxtaltools.analysis.crystal_rdf import compute_rdf_distance
+    exp_crystals = torch.load(exp_sample_path, weights_only=False)
+    exp_crystals = [cry for cry in exp_crystals if (cry.sg_ind == sg_ind) and (cry.z_prime == zp)]
+    exp_crystals = [exp_crystals[0]]
+    ebatch = collate_data_list(exp_crystals, max_z_prime=zp)
+    pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
+    predictor = init_uma_crystal_predictor(pred_path, device=device)
+    esamples = analyze_samples(
+        None,  # ebatch.latent_params(),
+        [molecule] * ebatch.num_graphs,
+        max_z_prime,
+        device,
+        1000,
+        sg_ind,
+        zp,
+        do_uma=True,
+        predictor=predictor,
+        overwrite_latents=False,
+    )
+
+    n_bins = esamples[0].rdf.shape[-1]
+    dd = compute_rdf_distance(esamples[0].rdf, data_batch.rdf, torch.linspace(0, 6, n_bins))
+    matches, rmsds = batch_compack([int(ind) for ind in torch.argsort(dd)[:10].flatten()],
+                                   dataset,
+                                   ebatch.mol2cluster(cutoff=6))
+
+    aa = 1
 
 def sample_and_analyze():
     gfn_model = GFN(**np.load(config_path, allow_pickle=True).item())
@@ -189,10 +240,11 @@ if __name__ == '__main__':
     # acridine lj config
     # run = 'xuldud_61_uma'
     # run = 'xuldud_61_elj'
-    run = 'acridine_14_uma'
+    #run = 'acridine_14_uma'
+    run = 'acridine_14_elj'
 
     if run == 'acridine_14_uma':
-        run_name = 'acr_lj'
+        run_name = 'acr_uma'
         device = 'cuda'
         num_samples = 1000
         batch_size = 1000
@@ -211,6 +263,28 @@ if __name__ == '__main__':
         results_path = os.path.join(results_dir, rf"{run_name}_sg{sg_ind}_zp{zp}.pt")
 
         exp_sample_path = r"D:\crystal_datasets\acridine\prot_acrdin_crystals.pt"
+
+    elif run == 'acridine_14_elj':
+        run_name = 'acr_lj'
+        device = 'cuda'
+        num_samples = 1000
+        batch_size = 1000
+        energy_function = 'elj'  # 'elj', 'lj' 'uma
+        n_steps = 100  # critical to get this right!
+        sg_ind = 14
+        zp = 1
+        kT = 2.5
+        units = 'kJ/mol'
+
+        model_path = rf"D:\crystal_datasets\acridine\acr13_sg{sg_ind}_zp{zp}_8_model_eval.pt"
+        config_path = rf"D:\crystal_datasets\acridine\acr13_sg{sg_ind}_zp{zp}_8_model_config.npy"
+        molecule_path = r"D:\crystal_datasets\acridine\acridine_conformer.pt"
+        dataset_path = rf"D:\crystal_datasets\acridine\acridine_sg{sg_ind}_zp{zp}.pt"
+        results_dir = rf"D:\crystal_datasets\gfn_results"
+        results_path = os.path.join(results_dir, rf"{run_name}_sg{sg_ind}_zp{zp}.pt")
+
+        exp_sample_path = r"D:\crystal_datasets\acridine\prot_acrdin_crystals.pt"
+
 
 
     elif run == 'xuldud_61_lj':
@@ -267,6 +341,7 @@ if __name__ == '__main__':
     data_batch = collate_data_list(dataset, max_z_prime=max_z_prime)
     data_latents = data_batch.latent_params()
 
+    dataset_tb_analysis()
     "load presampled results"
     if reload_results and os.path.exists(results_path):
         results_dict = torch.load(results_path, weights_only=False)
