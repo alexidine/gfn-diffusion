@@ -95,7 +95,7 @@ if __name__ == "__main__":
                         ind += 1
 
     temp = 1.25
-
+    en = 'uma'
     for zp in [1]:
         for sg in [14]:
             for mx in [25, 50]:

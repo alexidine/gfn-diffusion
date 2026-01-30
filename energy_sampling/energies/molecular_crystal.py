@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from energy_sampling.energies.base_set import BaseSet
 from mxtaltools.common.geometry_utils import lat2sph_rotvec
 from mxtaltools.common.utils import log_rescale_positive, is_cuda_oom
 from mxtaltools.constants.space_group_feature_tensor import SG_FEATURE_TENSOR
@@ -14,7 +15,6 @@ from mxtaltools.constants.space_group_info import SYM_OPS
 from mxtaltools.dataset_utils.data_classes import MolCrystalData
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
-from .base_set import BaseSet
 
 
 def density_penalty(packing_coeff):
