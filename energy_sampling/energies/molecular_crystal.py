@@ -232,11 +232,13 @@ class MolecularCrystal(BaseSet):
         phi = sph[..., 0]  # polar angle
         r = sph[..., 2]  # rotation magnitude
         eps = 1e-8
-        jacobian_weight = (
+        rot_jacob_weight = (  # this comes from composing the transforms of spherical -> cartesian ball and then to uniform rotation
                 torch.sin(r / 2).clamp_min(eps) ** 2
                 * torch.sin(phi).clamp_min(eps)
         )
-        jacobian_energy = - temperature * torch.log(jacobian_weight.sum(dim=-1))  # sum, because each dim gets its own correction
+        frac_jacob_weight = - crystal_batch.z_prime * temperature * torch.log(  # this comes from the cartesian -> fractional transform, with a factor for each independent object transformed
+            crystal_batch.cell_volume / crystal_batch.sym_mult)
+        jacobian_energy = - temperature * torch.log(rot_jacob_weight).sum(dim=-1) + frac_jacob_weight # sum, because each dim gets its own correction
 
         if self.energy_clip is not None:
 
