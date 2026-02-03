@@ -300,7 +300,8 @@ class Modeller:
             reload = True
             reload_path = f'checkpoints/{self.run_name}_model_train.pt'
 
-        elif os.path.exists(f'checkpoints/{self.run_name}_model_train_hit_prior.pt') and self.args.continue_from_hit_prior:
+        elif os.path.exists(
+                f'checkpoints/{self.run_name}_model_train_hit_prior.pt') and self.args.continue_from_hit_prior:
             print("Reloading from checkpoint converged on prior")
             reload = True
             reload_path = f'checkpoints/{self.run_name}_model_train_hit_prior.pt'
@@ -441,6 +442,7 @@ class Modeller:
                             'turnover_log_sigma': self.turnover_log_sigma, },
                            opt_buffer_path)
             else:
+                print("Reloading previously constructed MC opt buffer")
                 opt_buffer_dict = torch.load(opt_buffer_path, weights_only=False)
                 local_reward_max = opt_buffer_dict['local_reward_max']
                 local_opt_sample = opt_buffer_dict['local_opt_sample']
@@ -894,11 +896,9 @@ class Modeller:
         elif do_backward:
             optimizers['bwd'].zero_grad(set_to_none=True)
             loss, loss_dict = self.bwd_train_step(
-                step_ind,
                 gfn_model,
                 discretizer,
                 buffer,
-                energy_function,
                 repeats=repeats,
                 report_losses=True)
         else:
@@ -1022,8 +1022,8 @@ class Modeller:
                                     repeats=repeats,
                                     report_losses=report_losses)
 
-    def bwd_train_step(self, step_ind, gfn_model, discretizer,
-                       buffer, energy_function, repeats: int = 10,
+    def bwd_train_step(self, gfn_model, discretizer,
+                       buffer, repeats: int = 10,
                        report_losses: bool = False):
         with torch.no_grad():
             if self.args.sampling == 'buffer':
@@ -1329,13 +1329,22 @@ class Modeller:
 
         num_to_replace = sum(samples_to_be_replaced)
         if num_to_replace >= 4:
+            log_importance_weight = torch.nan_to_num(log_importance_weight,
+                                                     nan=-6,posinf=-6,neginf=-6)
             log_importance_weight = log_importance_weight.clip(max=log_importance_weight.quantile(0.99))
+
             importance_weight = (alpha * log_importance_weight).exp() + 1e-6
             importance_weight = (1 - eps) * importance_weight
             importance_weight += eps / len(importance_weight)
             importance_weight = importance_weight.numpy().astype(np.float64)
             importance_weight /= importance_weight.sum()
-            sample_inds = np.random.choice(len(buffer), num_to_replace, p=importance_weight, replace=True)
+            try:
+                sample_inds = np.random.choice(len(buffer), num_to_replace, p=importance_weight, replace=True)
+            except ValueError:
+                print("Value error in importance weights")
+                print(importance_weight)
+                print(log_importance_weight)
+                sample_inds = np.random.choice(len(buffer), num_to_replace, replace=True)
 
             new_rewards, samples = noise_buffer(self.log_noise_range,
                                                 buffer, energy_function,
