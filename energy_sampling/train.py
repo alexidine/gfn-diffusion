@@ -2,7 +2,6 @@ import gc
 import os
 from collections import defaultdict
 from copy import deepcopy
-from math import ceil
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 # os.environ["TORCH_USE_CUDA_DSA"] = "1"
 # os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
@@ -24,7 +23,7 @@ from energy_sampling.utils import iter_forever, \
     is_cuda_oom, get_annealing_factor, \
     parse_loss_schedules, dict2namespace, update_loss_schedule, \
     random_discretizer, low_discrepancy_discretizer, low_discrepancy_discretizer2, shifted_equidistant, \
-    calibrate_prior_noise, noise_buffer, stdz
+    calibrate_prior_noise, noise_buffer, mc_relax_buffer
 from eval.evaluations import adjust_fig_filesize, log_metrics, fwd_figs, bwd_evaluation, analyze_buffer
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 from models import GFN
@@ -296,12 +295,15 @@ class Modeller:
             reload_path = self.args.checkpoint_path
             print(f"Loading model from checkpoint {reload_path}")
 
-        elif os.path.exists(f'checkpoints/{self.run_name}_model_train.pt'):
+        elif os.path.exists(f'checkpoints/{self.run_name}_model_train.pt') and self.args.continue_from_checkpoint:
+            print("Reloading automatically from this prior checkpoint with same run name")
+            reload = True
             reload_path = f'checkpoints/{self.run_name}_model_train.pt'
-            if ('dev' not in reload_path) and not self.args.force_restart:
-                print("Reloading automatically from this prior checkpoint with same run name")
-                reload = True
-                reload_path = f'checkpoints/{self.run_name}_model_train.pt'
+
+        elif os.path.exists(f'checkpoints/{self.run_name}_model_train_hit_prior.pt') and self.args.continue_from_hit_prior:
+            print("Reloading from checkpoint converged on prior")
+            reload = True
+            reload_path = f'checkpoints/{self.run_name}_model_train_hit_prior.pt'
 
         if reload:
             eval_path = reload_path.replace('train', 'eval')
@@ -417,29 +419,39 @@ class Modeller:
             buffer_dist_cutoff=self.args.buffer_dist_cutoff,
             noised_buffer_length=self.args.noised_buffer_length,
             noised_max_steps=self.args.noised_max_steps,
+            kT_range=self.args.kT_range
         )
         if ((self.args.both_ways or self.args.bwd) and
                 self.args.buffer_path is not None):  # preload samples into the buffer
             buffer = self.add_dataset_to_buffer(self.args.buffer_path, buffer,
-                                                filter_unbound=True)
+                                                filter_unbound=False)
 
             print("Initializing noised buffer")
-            rewards, samples, self.log_noise_range = calibrate_prior_noise(
-                buffer, energy_function, log_min=-3, log_max=-0.5, low_cut=0.05, high_cut=10.0,
-            )
-            num_noised_samples = max(self.args.noised_buffer_length - len(rewards), 1000)
-            rewards2, samples2 = noise_buffer(self.log_noise_range,
-                                              buffer, energy_function,
-                                              sample_inds=np.random.randint(
-                                                  len(buffer),
-                                                  size=num_noised_samples,
-                                              ))
-            reward_record = torch.cat([rewards, rewards2])
-            sample_record = torch.cat([samples, samples2], dim=0)
+            opt_buffer_path = self.args.buffer_path.replace('.pt',
+                                                            f'_{self.args.energy_function}_kTrange_{self.args.kT_range}_relaxed.pt')
+            if not os.path.exists(opt_buffer_path):
+                local_opt_sample, local_reward_max, reward_record, sample_record = self.relax_noise_buffer(buffer,
+                                                                                                           energy_function)
 
-            reward_record = torch.tensor(reward_record)
+                torch.save({'local_reward_max': local_reward_max,
+                            'local_opt_sample': local_opt_sample,
+                            'reward_record': reward_record,
+                            'sample_record': sample_record,
+                            'log_noise_range': self.log_noise_range,
+                            'turnover_log_sigma': self.turnover_log_sigma, },
+                           opt_buffer_path)
+            else:
+                opt_buffer_dict = torch.load(opt_buffer_path, weights_only=False)
+                local_reward_max = opt_buffer_dict['local_reward_max']
+                local_opt_sample = opt_buffer_dict['local_opt_sample']
+                reward_record = opt_buffer_dict['reward_record']
+                sample_record = opt_buffer_dict['sample_record']
+                self.log_noise_range = opt_buffer_dict['log_noise_range']
+                self.turnover_log_sigma = opt_buffer_dict['turnover_log_sigma']
+
+                buffer.replace_initial_with_local_optima(local_opt_sample, local_reward_max)
+
             good_inds = torch.argwhere(reward_record >= buffer.reward_clip).flatten()
-
             buffer.add_to_noised(reward_record[good_inds],
                                  sample_record[good_inds],
                                  losses=torch.zeros_like(reward_record[good_inds]),
@@ -474,6 +486,7 @@ class Modeller:
             assert False, "Due to changes in Z'>1 modelling, must now initialize from a buffer"
 
         if self.args.molecule_conditioning:
+            assert False, "conditioning currently deprecated"
             train_mols_list = embed_dataset(train_mols_list, self.args.autoencoder_path, self.device, encoder=None,
                                             embedding_type=self.args.mol_embedding_type)
             test_mols_list = embed_dataset(test_mols_list, self.args.autoencoder_path, self.device, encoder=None,
@@ -504,6 +517,26 @@ class Modeller:
         test_iterator = iter_forever(test_mol_loader)
 
         return buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator
+
+    def relax_noise_buffer(self, buffer, energy_function):
+        rewards, samples, self.log_noise_range, self.turnover_log_sigma = calibrate_prior_noise(
+            buffer, energy_function, log_min=-3, log_max=-0.5, low_cut=0.05, high_cut=self.args.kT_range,
+        )
+        local_opt_sample, local_reward_max, mc_samples, mc_rewards = mc_relax_buffer(
+            buffer, energy_function, self.turnover_log_sigma,
+            max_steps=50, conv_eps=1e-2, conv_hist=10)
+        buffer.replace_initial_with_local_optima(local_opt_sample, local_reward_max)
+        num_noised_samples = max(self.args.noised_buffer_length - len(rewards) - len(mc_rewards), 10)
+        rewards2, samples2 = noise_buffer(self.log_noise_range,
+                                          buffer, energy_function,
+                                          sample_inds=np.random.randint(
+                                              len(buffer),
+                                              size=num_noised_samples,
+                                          ))
+        reward_record = torch.cat([rewards, rewards2, mc_rewards])
+        sample_record = torch.cat([samples, samples2, mc_samples], dim=0)
+        reward_record = torch.tensor(reward_record)
+        return local_opt_sample, local_reward_max, reward_record, sample_record
 
     def init_mol_from_buffer(self, buffer, z_primes):
         # this structure assumes the MXT format, where for Z'>1 samples, the mols are stacked in the same spot, in the same order
@@ -851,11 +884,11 @@ class Modeller:
                 repeats=repeats,
                 report_losses=True
             )
-            p_add = max(0.1, min(1.0, (1/10) / self.args.fwd_to_bwd_ratio))
-            if self.grow_buffer and np.random.rand() < p_add:
-                del crystal_batch.symmetry_operators, crystal_batch.gfn_energy
-                buffer.add_to_staging(data_batch=crystal_batch.cpu().detach(),
-                                      importance_weight=log_importance_weight.cpu().detach())
+            # p_add = max(0.1, min(1.0, (1 / 10) / self.args.fwd_to_bwd_ratio))
+            # if self.grow_buffer and np.random.rand() < p_add:
+            #     del crystal_batch.symmetry_operators, crystal_batch.gfn_energy
+            #     buffer.add_to_staging(data_batch=crystal_batch.cpu().detach(),
+            #                           importance_weight=log_importance_weight.cpu().detach())
             del crystal_batch
 
         elif do_backward:
@@ -876,7 +909,7 @@ class Modeller:
 
         skip_step = False
         if self.phase == 2:
-            if True:  # skip phase 2 directly #self.bwd_tb_norm <= self.args.thermalization_conv_eps:  # hit stage 2 convergence criteria
+            if self.bwd_tb_norm <= self.args.thermalization_conv_eps:  # hit stage 2 convergence criteria
                 self.phase2to3(ema_model, gfn_model, self.args.min_fwd_bwd_ratio, step_ind)
 
         if self.phase == 3:
@@ -952,7 +985,8 @@ class Modeller:
                 -coeff * err)  # this is very negative -> pushes towards bwd, which is good
 
         self.args.fwd_to_bwd_ratio = np.clip(
-            self.args.fwd_to_bwd_ratio, self.args.min_fwd_bwd_ratio, self.args.max_fwd_bwd_ratio)  # need even enough ratios to get reasonable updates to the metrics
+            self.args.fwd_to_bwd_ratio, self.args.min_fwd_bwd_ratio,
+            self.args.max_fwd_bwd_ratio)  # need even enough ratios to get reasonable updates to the metrics
 
         return skip_step
 
@@ -1131,22 +1165,25 @@ class Modeller:
         good_inds = torch.argwhere(torch.all(latents.abs() <= 1, dim=1))  # valid latent space
         dataset = [dataset[ind] for ind in good_inds]
 
+        # filter reasonable densities
+        dataset = [elem for elem in dataset if elem.packing_coeff >= 0.55]
+        dataset = [elem for elem in dataset if elem.packing_coeff <= 0.95]
+
         # filter near-identical samples
-        d_cut = 0.01
+        d_cut = 0.05  # should be relatively sparse or the local density bias becomes large
         latents = collate_data_list(dataset).latent_params()
         dmat = crystal_parameter_distmat(latents)
 
         keep = torch.zeros(len(latents), dtype=bool, device=latents.device)
-        for i in range(len(latents)):
+        ens = torch.tensor([elem.lj for elem in dataset])
+        sort_inds = torch.argsort(ens, descending=False)
+        for i in sort_inds:
             # check if this point is far from all previously kept points
             if not (dmat[i, keep] < d_cut).any():
                 keep[i] = True
 
-        keep_inds = torch.arange(len(latents), device=latents.device)[keep]
-        dataset = [dataset[ind] for ind in keep_inds]
-
-        dataset = [elem for elem in dataset if elem.packing_coeff >= 0.55]
-        dataset = [elem for elem in dataset if elem.packing_coeff <= 0.95]
+        keep_inds = torch.nonzero(keep, as_tuple=False).squeeze(-1)
+        dataset = [dataset[i] for i in keep_inds]
 
         # todo remove this eventually, hopefully
         if 'D:' in self.args.buffer_path and self.args.energy_function == 'uma':  # if we're on local, this takes forever
@@ -1165,10 +1202,11 @@ class Modeller:
         if filter_unbound:  # filter unbound states under this potential
             dataset = [elem for elem in dataset if elem[self.args.energy_function] < 0]
 
-        if self.args.molecule_conditioning:  # embed dataset
-            assert max(self.args.z_primes) == 1, "Molecule conditioning not yet supported for Z'>1"
-            print("Getting preloaded dataset molecule embeddings")
-            dataset = embed_dataset(dataset, self.args.autoencoder_path, self.device, encoder=None)
+        #  # todo rewrite
+        # if self.args.molecule_conditioning:  # embed dataset
+        #     assert max(self.args.z_primes) == 1, "Molecule conditioning not yet supported for Z'>1"
+        #     print("Getting preloaded dataset molecule embeddings")
+        #     dataset = embed_dataset(dataset, self.args.autoencoder_path, self.device, encoder=None)
 
         buffer.add(dataset)
         print(f"Buffer loaded with {len(dataset)} samples")
@@ -1197,8 +1235,8 @@ class Modeller:
             buffer, energy_function, eval_discretizer, gfn_model, test_mol_loader)
         self.times['eval_sampling_end'] = time()
 
-        if len(buffer.staging_buffer) > 0:
-            buffer.incorporate_staging_buffer()
+        # if len(buffer.staging_buffer) > 0:
+        #     buffer.incorporate_staging_buffer()
 
         log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, b_log_r, b_packing_coeff = analyze_buffer(
             buffer, eval_discretizer, gfn_model, self.batch_size)
@@ -1240,8 +1278,8 @@ class Modeller:
             if len(buffer.noised_rewards) > 0:
                 self.grow_noised_buffer(buffer, energy_function, log_importance_weight, rewards)
 
-        if len(buffer) > buffer.buffer_size:
-            buffer.truncate_buffer(log_importance_weight)
+        # if len(buffer) > buffer.buffer_size:
+        #     buffer.truncate_buffer(log_importance_weight)
 
         '''logging and wrap up'''
         self.times['eval_wrapup_start'] = time()
@@ -1276,7 +1314,8 @@ class Modeller:
         #                                                              )
         #         metrics.update(conditional_metrics)
 
-    def grow_noised_buffer(self, buffer, energy_function, log_importance_weight, rewards, alpha: float = 1.0, eps: float = 1.0e-2):
+    def grow_noised_buffer(self, buffer, energy_function, log_importance_weight, rewards, alpha: float = 1.0,
+                           eps: float = 1.0e-2):
         self.times['eval_bwd_noising_start'] = time()
 
         noised_losses = np.array(buffer.noised_losses)
@@ -1285,7 +1324,7 @@ class Modeller:
         loss_cut = min(1, np.quantile(noised_losses, 0.25))
         good_loss = (noised_losses <= loss_cut) & (noised_losses > 0)
         old_enough = (noised_train_steps >= self.args.noised_max_steps)
-        too_old =  (noised_train_steps >= self.args.noised_max_steps * 2)
+        too_old = (noised_train_steps >= self.args.noised_max_steps * 2)
         samples_to_be_replaced = (good_loss & old_enough) | too_old
 
         num_to_replace = sum(samples_to_be_replaced)
@@ -1353,11 +1392,12 @@ class Modeller:
                 log_pbs_list.append(log_pbs)
                 gauss_params_f_list.append(gauss_params_f)
                 eval_samples.extend(sample_batch.batch_to_list())
-
-                if self.grow_buffer:
-                    log_importance_weight = ((log_r - log_Z_learned) - (log_pfs.sum(-1) - log_pbs.sum(-1))).cpu().detach()
-                    buffer.add_to_staging(importance_weight=log_importance_weight,
-                                          data_batch=sample_batch.cpu().detach())
+                #
+                # if self.grow_buffer:
+                #     log_importance_weight = (
+                #             (log_r - log_Z_learned) - (log_pfs.sum(-1) - log_pbs.sum(-1))).cpu().detach()
+                #     buffer.add_to_staging(importance_weight=log_importance_weight,
+                #                           data_batch=sample_batch.cpu().detach())
 
             except (RuntimeError, ValueError) as e:
                 print(f"Caught error: {str(e)}")

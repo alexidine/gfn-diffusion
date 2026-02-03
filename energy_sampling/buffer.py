@@ -23,6 +23,7 @@ class CrystalReplayBuffer:
                  buffer_dist_cutoff: float = 0.25,
                  noised_buffer_length: int = 100000,
                  noised_max_steps: int = 50,
+                 kT_range: float = 6.0,
                  ):
         self.buffer_size = buffer_size
         self.prioritized = prioritized
@@ -38,6 +39,7 @@ class CrystalReplayBuffer:
         self.keep_initial_samples = keep_initial_samples  # never delete originally loaded dataset
         self.rewards_list = None
         self.x = None
+        self.kT_range = kT_range
         self.diversity_check_size = 1000
         self.original_dataset_inds = None
         self.diversity_coeff = diversity_coeff
@@ -93,12 +95,18 @@ class CrystalReplayBuffer:
             data_batch,
             temperature=torch.ones(data_batch.num_graphs) * self.energy_function.temperature)
 
-        # enforce VERY LOOSE standards for consideration in the buffer
-        score_cut = max(self.reward_clip, np.amin(self.rewards_list))  # the lowest reward in our dynamical range
+        # enforce standards for consideration in the buffer
+        score_cut = np.amax(self.rewards_list) - 2  # don't keep things more than 2*kT worse than the best sample
+        # the lowest reward in our dynamical range
         packing_coeffs = data_batch.packing_coeff.cpu().detach().numpy()
         good_inds = [ind for ind in range(len(data_list)) if
                      (data_list[ind].reduction_en <= 1e-3) and (rewards[ind] > score_cut) and (
                              packing_coeffs[ind] > 0.55) and (packing_coeffs[ind] < 0.95)]
+
+        data_list = [data_batch[ind] for ind in good_inds]
+        data_batch = collate_data_list(data_list, max_z_prime=self.max_z_prime)
+
+
         # add anything reasonable
         if len(good_inds) > 0:
             data_to_add = [data_list[ind] for ind in good_inds]
@@ -141,6 +149,13 @@ class CrystalReplayBuffer:
         3 - clustering
         :return:
         """
+        new_inds = self.find_new_permanent_candidates(
+            dist_cutoff=0.05,
+            energy_window=1.0
+        )
+
+        for ind in new_inds:
+            self.original_dataset_inds.append(ind)
 
         inds_to_keep = torch.argsort(importance_weight, descending=True)
 
@@ -154,11 +169,65 @@ class CrystalReplayBuffer:
         self.x_list = [self.x_list[ind] for ind in inds_to_keep]
         self.sg_list = [self.sg_list[ind] for ind in inds_to_keep]
 
+    def find_new_permanent_candidates(self, dist_cutoff=0.05, energy_window=1.0):
+        """
+        Identify high-reward, geometrically distinct samples to promote
+        to the permanent buffer.
+
+        Returns
+        -------
+        List[int]
+            Indices of samples suitable for promotion.
+        """
+
+        rewards = np.array(self.rewards_list)
+        best_reward = np.amax(rewards)
+
+        # candidates: within 1 kT of best, but NOT already original
+        candidate_inds = [
+            i for i in range(len(rewards))
+            if (i not in self.original_dataset_inds)
+               and (rewards[i] >= best_reward - energy_window)
+        ]
+
+        if len(candidate_inds) == 0:
+            return []
+
+        # Latents
+        x_all = torch.stack(self.x_list).to(self.device)
+        x_candidates = x_all[candidate_inds]
+
+        # Reference set: existing protected samples
+        ref_inds = self.original_dataset_inds
+        if len(ref_inds) == 0:
+            # If nothing is protected yet, accept all candidates
+            return candidate_inds
+
+        x_ref = x_all[ref_inds]
+
+        # Compute pairwise distances (candidate → protected)
+        # shape: [N_candidates, N_ref]
+        dists = torch.cdist(x_candidates, x_ref)
+
+        # Minimum distance to protected set
+        min_dists = dists.min(dim=1).values
+
+        # Accept only sufficiently distinct samples
+        accepted = [
+            candidate_inds[i]
+            for i in range(len(candidate_inds))
+            if min_dists[i].item() > dist_cutoff
+        ]
+
+        return accepted
+
     def __len__(self):
         if self.dataset is None:
             return 0
         else:
             return len(self.dataset)
+
+
 
     @torch.no_grad()
     def bottom_up_cluster(self, xx, e, d_cut, e_cut, max_new_samples: int):
@@ -405,6 +474,33 @@ class CrystalReplayBuffer:
                 self.noised_samples.pop(idx)
                 self.noised_losses.pop(idx)
                 self.noised_select_counts.pop(idx)
+
+    @torch.no_grad()
+    def replace_initial_with_local_optima(self,
+                                          opt_latents: torch.Tensor,
+                                          opt_rewards: torch.Tensor
+                                          ):
+        """
+        Replace protected initial samples with their local optima
+        when clearly better and geometrically equivalent.
+        """
+
+        assert self.original_dataset_inds is not None
+        assert len(self.original_dataset_inds) == len(opt_latents)
+
+        for k, buf_idx in enumerate(self.original_dataset_inds):
+            x_new = opt_latents[k]
+            r_new = opt_rewards[k]
+
+            # Replace latent + reward
+            self.x_list[buf_idx] = x_new.detach().cpu()
+            self.rewards_list[buf_idx] = float(r_new)
+
+            # Optional: update dataset object itself if needed
+            self.dataset[buf_idx].latent_to_cell_params(x_new[None, :])
+            for elem in self.dataset:
+                del elem.asym_unit_dict
+
 
 
 def collate_fn(data_list):

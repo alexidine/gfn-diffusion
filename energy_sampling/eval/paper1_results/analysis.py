@@ -10,6 +10,8 @@ from energy_sampling.eval.paper1_results.utils import get_gfn_samples, \
     generator_reward, get_rmsdmat, local_analysis, analyze_samples
 from energy_sampling.models import GFN
 from energy_sampling.utils import uniform_discretizer
+from mxtaltools.analysis.crystal_rdf import compute_rdf_distmat
+from mxtaltools.common.geometry_utils import crystal_parameter_distmat
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 
@@ -52,7 +54,7 @@ def dataset_tb_analysis():
         1000,
         sg_ind,
         zp,
-        do_uma=False,
+        do_uma=True,
         predictor=predictor,
         overwrite_latents=False,
     )
@@ -62,8 +64,8 @@ def dataset_tb_analysis():
     atomwise_energy = data_batch.elj / (data_batch.num_atoms / data_batch.z_prime)
     atomwise_fixed = (atomwise_energy - lj_mean) / lj_std * uma_std + uma_mean
     denergy = atomwise_fixed * (data_batch.num_atoms / data_batch.z_prime)
-    # denergy = data_batch.uma_pot / (data_batch.sym_mult * data_batch.z_prime) - data_batch.uma_gas_pot
-    # data_batch.uma = denergy
+    denergy = data_batch.uma_pot / (data_batch.sym_mult * data_batch.z_prime) - data_batch.uma_gas_pot
+    data_batch.uma = denergy
     rewards = generator_reward(
         data_batch,
         None,
@@ -113,16 +115,16 @@ def dataset_tb_analysis():
         1000,
         sg_ind,
         zp,
-        do_uma=True,
+        do_uma=energy_function == 'uma',
         predictor=predictor,
         overwrite_latents=False,
     )
 
-    n_bins = esamples[0].rdf.shape[-1]
-    dd = compute_rdf_distance(esamples[0].rdf, data_batch.rdf, torch.linspace(0, 6, n_bins))
-    matches, rmsds = batch_compack([int(ind) for ind in torch.argsort(dd)[:10].flatten()],
-                                   dataset,
-                                   ebatch.mol2cluster(cutoff=6))
+    # n_bins = esamples[0].rdf.shape[-1]
+    # dd = compute_rdf_distance(esamples[0].rdf, data_batch.rdf, torch.linspace(0, 6, n_bins))
+    # matches, rmsds = batch_compack([int(ind) for ind in torch.argsort(dd)[:10].flatten()],
+    #                                dataset,
+    #                                ebatch.mol2cluster(cutoff=6))
 
     aa = 1
 
@@ -267,17 +269,17 @@ if __name__ == '__main__':
     elif run == 'acridine_14_elj':
         run_name = 'acr_lj'
         device = 'cuda'
-        num_samples = 1000
+        num_samples = 10000
         batch_size = 1000
         energy_function = 'elj'  # 'elj', 'lj' 'uma
         n_steps = 100  # critical to get this right!
         sg_ind = 14
         zp = 1
-        kT = 2.5
+        kT = 5.0
         units = 'kJ/mol'
 
-        model_path = rf"D:\crystal_datasets\acridine\acr13_sg{sg_ind}_zp{zp}_8_model_eval.pt"
-        config_path = rf"D:\crystal_datasets\acridine\acr13_sg{sg_ind}_zp{zp}_8_model_config.npy"
+        model_path = rf"D:\crystal_datasets\acridine\acr13_sg{sg_ind}_zp{zp}_31_model_eval.pt"
+        config_path = rf"D:\crystal_datasets\acridine\acr13_sg{sg_ind}_zp{zp}_31_model_config.npy"
         molecule_path = r"D:\crystal_datasets\acridine\acridine_conformer.pt"
         dataset_path = rf"D:\crystal_datasets\acridine\acridine_sg{sg_ind}_zp{zp}.pt"
         results_dir = rf"D:\crystal_datasets\gfn_results"
@@ -341,7 +343,7 @@ if __name__ == '__main__':
     data_batch = collate_data_list(dataset, max_z_prime=max_z_prime)
     data_latents = data_batch.latent_params()
 
-    dataset_tb_analysis()
+    #dataset_tb_analysis()
     "load presampled results"
     if reload_results and os.path.exists(results_path):
         results_dict = torch.load(results_path, weights_only=False)
@@ -352,6 +354,7 @@ if __name__ == '__main__':
     if exp_sample_path is not None:
         exp_crystals = torch.load(exp_sample_path, weights_only=False)
         exp_crystals = [cry for cry in exp_crystals if (cry.sg_ind == sg_ind) and (cry.z_prime == zp)]
+        exp_crystals = [exp_crystals[0]]
         ebatch = collate_data_list(exp_crystals, max_z_prime = zp)
         pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
         predictor = init_uma_crystal_predictor(pred_path, device=device)
@@ -403,8 +406,9 @@ if __name__ == '__main__':
 
     """distance calculations"""
     rmsdmat = get_rmsdmat(sample_batch.clone())
-    # lat_dmat = crystal_parameter_distmat(sample_latents).fill_diagonal_(0).detach()
-
+    lat_dmat = crystal_parameter_distmat(sample_latents).fill_diagonal_(0).detach()
+    bin_edges = torch.linspace(0, 6, sample_batch.rdf.shape[-1], )
+    rdf_dmat = compute_rdf_distmat(sample_batch.rdf, bin_edges, chunk_size=10000)
     sample_metrics = local_analysis(k_vals, sample_batch, sample_energy, rmsdmat)
 
     """visual and local thermo analysis"""

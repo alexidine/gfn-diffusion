@@ -13,6 +13,8 @@ import numpy as np
 import psutil
 import torch
 import yaml
+from scipy.stats import median_abs_deviation
+from sklearn.neighbors import KernelDensity
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
@@ -627,6 +629,79 @@ def substitute_prior(noised_fraction, log_noise_range,
 
 
 @torch.no_grad()
+def mc_relax_buffer(buffer, energy_function, turnover_log_sigma: float,
+                    max_steps: int = 500, conv_eps=1e-2, conv_hist=10):
+    noised_fraction = 1.0
+    log_noise_range = [turnover_log_sigma - 1, turnover_log_sigma]
+
+    samples, rewards, crystal_batch, condition = buffer.sample(
+        override_batch=len(buffer),
+        randomize_orientations=False,
+        override_sampler=None,
+        override_sample_inds=np.arange(len(buffer)),
+    )
+    sample_record = torch.zeros((max_steps, samples.shape[0], samples.shape[1]))
+    reward_record = torch.zeros((max_steps, len(samples)))
+    state_reward_record = torch.zeros((max_steps, len(samples)))
+
+    state_rewards = rewards.clone()
+    state_samples = samples.clone()
+    for step_ind in tqdm(range(max_steps)):
+        noised_rewards, noised_samples = substitute_prior(
+            noised_fraction, log_noise_range, crystal_batch.clone(),
+            energy_function, state_samples)
+
+        sample_record[step_ind] = noised_samples
+        reward_record[step_ind] = noised_rewards
+
+        rep_inds = noised_rewards >= state_rewards
+        state_samples[rep_inds] = noised_samples[rep_inds]
+        state_rewards[rep_inds] = noised_rewards[rep_inds]
+
+        state_reward_record[step_ind] = state_rewards
+
+        if step_ind > conv_hist:
+            window = state_reward_record[step_ind - conv_hist:step_ind]
+            delta = window[-1] - window[0]
+            converged = (delta.abs() < conv_eps).all()
+            if converged:
+                break
+
+    deduped_samples, deduped_rewards = dedupe_mc_outputs(sample_record[:step_ind],
+                                                         reward_record[:step_ind],
+                                                         d_cut=10 ** turnover_log_sigma
+                                                         )
+
+    return state_samples, state_rewards, deduped_samples, deduped_rewards
+
+
+def dedupe_mc_outputs(sample_record, reward_record, d_cut: float):
+    T, N, D = sample_record.shape
+
+    kept_samples = []
+    kept_rewards = []
+
+    for i in range(N):
+        traj = sample_record[:, i, :]  # [T, D]
+        rewards = reward_record[:, i]  # [T]
+
+        dmat = torch.cdist(traj, traj)  # [T, T]
+
+        keep = torch.ones(T, dtype=torch.bool, device=traj.device)
+
+        for t in range(T):
+            if not keep[t]:
+                continue
+            # suppress all *future* points within d_cut
+            close = (dmat[t, t + 1:] < d_cut)
+            keep[t + 1:][close] = False
+
+        kept_samples.append(traj[keep])
+        kept_rewards.append(rewards[keep])
+
+    return torch.cat(kept_samples), torch.cat(kept_rewards)
+
+@torch.no_grad()
 def calibrate_prior_noise(buffer, energy_function,
                           log_min=-3, log_max=-0.5,
                           low_cut=0.05, high_cut=10.0  # rewards are in units of kT already
@@ -673,9 +748,53 @@ def calibrate_prior_noise(buffer, energy_function,
     x_min = (np.log10(low_cut) - b) / m
     x_max = (np.log10(high_cut) - b) / m
 
+    eps = 1e-6
+    delta = (rewards - new_rewards) / (rewards.abs() + eps)
+    delta = delta.cpu().numpy()
+
+    x = rand_magnitude.log10().cpu().numpy()
+
+    m = np.median(delta)
+    s = median_abs_deviation(delta) + eps
+    c = 5.0
+
+    delta_h = np.where(
+        np.abs(delta - m) <= c * s,
+        delta,
+        m + c * s * np.sign(delta - m)
+    )
+
+    # evaluation grid (independent of N)
+    x_grid = np.linspace(x.min(), x.max(), 300)
+
+    bandwidth = 0.15  # in log10(σ) units; this is the only tuning knob
+
+    # kde = KernelDensity(kernel="gaussian", bandwidth=bandwidth)
+
+    # weighted regression via Nadaraya–Watson
+    y_smooth = np.zeros_like(x_grid)
+
+    for i, xi in enumerate(x_grid):
+        w = np.exp(-0.5 * ((x - xi) / bandwidth) ** 2)
+        y_smooth[i] = np.sum(w * delta_h) / np.sum(w)
+    dy = np.gradient(y_smooth, x_grid)
+    d2y = np.gradient(dy, x_grid)
+
+    turnover_idx = np.argmax(d2y)
+    turnover_log_sigma = x_grid[turnover_idx]
+    turnover_sigma = 10 ** turnover_log_sigma
+    # fig = go.Figure()
+    # fig.add_trace(go.Scatter(x=x_grid, y=y_smooth,
+    #                          mode="lines", name="robust mean"))
+    # fig.add_trace(go.Scatter(x=[turnover_log_sigma],
+    #                          y=[y_smooth[turnover_idx]],
+    #                          marker_color="red", marker_size=10,
+    #                          name="turnover"))
+    # fig.show()
+
     del crystal_batch
 
-    return new_rewards.detach().clone(), new_samples.detach().clone(), [x_min, x_max]
+    return new_rewards.detach().clone(), new_samples.detach().clone(), [x_min, x_max], turnover_log_sigma
 
 
 #
