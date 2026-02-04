@@ -162,7 +162,7 @@ class MolecularCrystal(BaseSet):
         if return_batch:
             return crystal_energy, clean_batch(crystal_batch.cpu().detach())
         else:
-            return crystal_energy
+            return crystal_energy, None
 
     def generator_energy(self, crystal_batch, temperature, raw_latents=None):
         ens_dict = {}
@@ -363,12 +363,11 @@ class MolecularCrystal(BaseSet):
         :return:
         """
         temperature = 10 ** log_temperature
-        energy, crystal_batch = self.batched_analyze_crystal_batch(x, mol_batch, temperature, return_batch=True)
-
-
         if return_exp:
+            energy, crystal_batch = self.batched_analyze_crystal_batch(x, mol_batch, temperature, return_batch=return_exp)
             return energy / temperature, crystal_batch
         else:
+            energy = self.batched_analyze_crystal_batch(x, mol_batch, temperature, return_batch=return_exp)
             return energy / temperature
 
     def batched_analyze_crystal_batch(self, x, mol_batch, temperature, return_batch=False):
@@ -399,7 +398,7 @@ class MolecularCrystal(BaseSet):
 
                 cursor += len(inds)
                 if (self.batch_size <= 100000) and (self.batch_size < n_samples) and not already_oomed:
-                    self.batch_size += max(int(self.batch_size * 0.1), 1)
+                    self.batch_size += max(int(self.batch_size * 0.01), 1)
 
             except (RuntimeError, ValueError) as e:
                 if is_cuda_oom(e):

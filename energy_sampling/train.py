@@ -431,8 +431,8 @@ class Modeller:
             opt_buffer_path = self.args.buffer_path.replace('.pt',
                                                             f'_{self.args.energy_function}_kTrange_{self.args.kT_range}_relaxed.pt')
             if not os.path.exists(opt_buffer_path):
-                local_opt_sample, local_reward_max, reward_record, sample_record = self.relax_noise_buffer(buffer,
-                                                                                                           energy_function)
+                local_opt_sample, local_reward_max, reward_record, sample_record = self.relax_noise_buffer(
+                    buffer, energy_function, max_steps = 500)
 
                 torch.save({'local_reward_max': local_reward_max,
                             'local_opt_sample': local_opt_sample,
@@ -459,7 +459,6 @@ class Modeller:
                                  losses=torch.zeros_like(reward_record[good_inds]),
                                  )
             print(len(buffer))
-            # assert False, "We did it guys"
 
         if len(buffer) > 0 and (self.args.molecule != 'qm9'):
             mols_list = self.init_mol_from_buffer(buffer, self.args.z_primes)
@@ -520,13 +519,13 @@ class Modeller:
 
         return buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator
 
-    def relax_noise_buffer(self, buffer, energy_function):
+    def relax_noise_buffer(self, buffer, energy_function, max_steps: int = 500):
         rewards, samples, self.log_noise_range, self.turnover_log_sigma = calibrate_prior_noise(
             buffer, energy_function, log_min=-3, log_max=-0.5, low_cut=0.05, high_cut=self.args.kT_range,
         )
         local_opt_sample, local_reward_max, mc_samples, mc_rewards = mc_relax_buffer(
             buffer, energy_function, self.turnover_log_sigma,
-            max_steps=500, conv_eps=1e-2, conv_hist=10)
+            max_steps=max_steps, conv_eps=1e-2, conv_hist=10)
         buffer.replace_initial_with_local_optima(local_opt_sample, local_reward_max)
         num_noised_samples = max(self.args.noised_buffer_length - len(rewards) - len(mc_rewards), 10)
         rewards2, samples2 = noise_buffer(self.log_noise_range,
@@ -627,45 +626,44 @@ class Modeller:
         return good_mol
 
     def train(self):
-        self.times['initialization_start'] = time()
-
-        # Reward init
-        energy_function = self.init_energy_function()
-
-        # Model Init
-        gfn_model, gfn_config, ema_model = self.init_gfn_model(energy_function)
-        np.save(f'checkpoints/{self.run_name}_model_config', gfn_config)  # todo add path to saving directories
-
-        # opt init
-        optimizers, schedulers = self.init_schedulers_optimizers(gfn_model)
-
-        # buffer & loaders init
-        (buffer, train_mol_loader, test_mol_loader,
-         train_iterator, test_iterator) = self.init_buffers_datasets(energy_function)
-
-        # initialize some annealing factors
-        if self.args.temperature_conditioning:
-            temp_annealing_lambda = get_annealing_factor(self.args.temperature_scaling_factor, 1,
-                                                         self.args.temp_annealing_max_steps, 10)
-
-        else:
-            temp_annealing_lambda = get_annealing_factor(self.args.energy_max_temperature,
-                                                         self.args.energy_min_temperature,
-                                                         self.args.temp_annealing_max_steps, 10)
-
-        fwd_loss_dict = None
-        bwd_loss_dict = None
-        oomed_out = False
-        fwd_loss, bwd_loss = 0, 0
-        loss_record = []
-
-        self.times['initialization_end'] = time()
-        # print("-1")
-
         with (wandb.init(project="GFN Energy",
                          config=flatten_wandb_params(self.args),
                          name=self.run_name,
                          tags=[self.args.tag])):
+            self.times['initialization_start'] = time()
+
+            # Reward init
+            energy_function = self.init_energy_function()
+
+            # Model Init
+            gfn_model, gfn_config, ema_model = self.init_gfn_model(energy_function)
+            np.save(f'checkpoints/{self.run_name}_model_config', gfn_config)  # todo add path to saving directories
+
+            # opt init
+            optimizers, schedulers = self.init_schedulers_optimizers(gfn_model)
+
+            # buffer & loaders init
+            (buffer, train_mol_loader, test_mol_loader,
+             train_iterator, test_iterator) = self.init_buffers_datasets(energy_function)
+
+            # initialize some annealing factors
+            if self.args.temperature_conditioning:
+                temp_annealing_lambda = get_annealing_factor(self.args.temperature_scaling_factor, 1,
+                                                             self.args.temp_annealing_max_steps, 10)
+
+            else:
+                temp_annealing_lambda = get_annealing_factor(self.args.energy_max_temperature,
+                                                             self.args.energy_min_temperature,
+                                                             self.args.temp_annealing_max_steps, 10)
+
+            fwd_loss_dict = None
+            bwd_loss_dict = None
+            oomed_out = False
+            fwd_loss, bwd_loss = 0, 0
+            loss_record = []
+
+            self.times['initialization_end'] = time()
+        # print("-1")
             # print("-0.5")
             wandb.watch(gfn_model,
                         log_graph=False,

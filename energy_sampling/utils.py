@@ -701,6 +701,7 @@ def dedupe_mc_outputs(sample_record, reward_record, d_cut: float):
 
     return torch.cat(kept_samples), torch.cat(kept_rewards)
 
+
 @torch.no_grad()
 def calibrate_prior_noise(buffer, energy_function,
                           log_min=-3, log_max=-0.5,

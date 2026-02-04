@@ -142,7 +142,7 @@ wd_max_steps: 10000  # number of steps to terminate the added variance
 
 # molecular crystal settings
 ################################################################
-molecule: 'acridine'  # 'nicotinamide' or 'acridine' or 'qm9' for molecule-conditional training
+molecule: 'xuldud'  # 'nicotinamide' or 'acridine' or 'qm9' for molecule-conditional training
 temperature_conditioning: False  # if false, temperatures are set to energy_static_temperature, and there is no annealing
 molecule_conditioning: False  # MUST be true for molecule='qm9' and false else - conditions the generative prediction on the molecule
 mol_embedding_type: 'autoencoder'  # principal_axes or autoencoderd
