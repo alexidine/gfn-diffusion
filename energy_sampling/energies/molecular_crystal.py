@@ -373,7 +373,10 @@ class MolecularCrystal(BaseSet):
 
     def batched_analyze_crystal_batch(self, x, mol_batch, temperature, return_batch=False):
         if not hasattr(self, 'batch_size'):
-            self.batch_size = 1000
+            if self.energy_function == 'uma':
+                self.batch_size = 1000
+            else:
+                self.batch_size = 10000
         cursor = 0
         n_samples = len(x)
         energies = torch.zeros(len(x), dtype=torch.float32, device='cpu')
@@ -395,8 +398,8 @@ class MolecularCrystal(BaseSet):
                     samples.extend(outs[1].cpu().detach().batch_to_list())
 
                 cursor += len(inds)
-                if (self.batch_size <= 10000) and (self.batch_size < n_samples) and not already_oomed:
-                    self.batch_size += max(int(self.batch_size * 0.01), 1)
+                if (self.batch_size <= 100000) and (self.batch_size < n_samples) and not already_oomed:
+                    self.batch_size += max(int(self.batch_size * 0.1), 1)
 
             except (RuntimeError, ValueError) as e:
                 if is_cuda_oom(e):

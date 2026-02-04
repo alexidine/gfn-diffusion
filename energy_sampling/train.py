@@ -1187,7 +1187,7 @@ class Modeller:
 
         # todo remove this eventually, hopefully
         if 'D:' in self.args.buffer_path and self.args.energy_function == 'uma':  # if we're on local, this takes forever
-            dataset = dataset[:25]
+            dataset = dataset[:250]
 
         print("Re-featurizing preloaded buffer samples")
         dataset = featurize_dataset(dataset,
