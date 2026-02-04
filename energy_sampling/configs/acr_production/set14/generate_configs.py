@@ -26,14 +26,14 @@ if __name__ == "__main__":
     base, spec_dir = load_yaml(base_path)
 
     ind = 0
-    sg = 61
+    sg = 14
     zp = 1
     temp = 2.5
     en = 'elj'
     eps = 0.2
     mx = 25
     nbs = 10000
-    bs = 10000
+    bs = 100000
 
     ind = 0
     for mx in [10, 20]:

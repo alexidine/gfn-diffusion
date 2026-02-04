@@ -526,7 +526,7 @@ class Modeller:
         )
         local_opt_sample, local_reward_max, mc_samples, mc_rewards = mc_relax_buffer(
             buffer, energy_function, self.turnover_log_sigma,
-            max_steps=50, conv_eps=1e-2, conv_hist=10)
+            max_steps=500, conv_eps=1e-2, conv_hist=10)
         buffer.replace_initial_with_local_optima(local_opt_sample, local_reward_max)
         num_noised_samples = max(self.args.noised_buffer_length - len(rewards) - len(mc_rewards), 10)
         rewards2, samples2 = noise_buffer(self.log_noise_range,
