@@ -683,7 +683,7 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
 
 @torch.no_grad()
 def bwd_evaluation(log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, b_log_r,
-                   b_packing_coeff,
+                   b_packing_coeff, log_importance_weight,
                    do_figs: Optional[bool] = False):
     metrics = {}
     fig_dict = {}
@@ -734,13 +734,14 @@ def bwd_evaluation(log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, 
                             fig_dict,
                             b_log_r, log_z,
                             b_packing_coeff,
+                            log_importance_weight,
                             )
 
     return metrics, fig_dict, b_log_r, tb_residual, normed_tb_residual
 
 
 def bwd_figs(b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, fig_dict, log_r,
-             log_z, b_packing_coeff):
+             log_z, b_packing_coeff, log_importance_weight):
     fig_dict['Backward Latents Trajectories'] = visualize_latent_trajs(
         backward_flow_states.cpu().detach().numpy(),
         n_trajs=20, log_r=log_r.cpu().detach().numpy())
@@ -759,6 +760,13 @@ def bwd_figs(b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, bac
     fig_dict['Backward Gauss Params'] = mean_var_fig(b_vars_f, b_means_f,
                                                      b_vars_b, b_means_b)
     fig_dict['Bwd Traj Mean Step Sizes'] = mean_flow_step_sizes(backward_flow_states)
+    fig_dict['Importance Weight vs R'] = xy_scatter_plot(
+        log_r,
+        log_importance_weight,
+        c=b_log_pfs.sum(-1) - b_log_pbs.sum(-1),
+        xaxis_title='Reward',
+        yaxis_title='Log Importance Weight',
+    )
     return fig_dict
 
 
@@ -997,36 +1005,68 @@ def log_metrics(energy_function,
     return metrics
 
 
+def _safe_array(x):
+    """
+    Convert list / tensor / array-like to a clean NumPy array once.
+    """
+    if hasattr(x, "detach"):  # torch tensor
+        x = x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def _log_stats(metrics, prefix, values, *,
+               clip_max=None,
+               n_quantiles=50):
+    """
+    Compute length, quantiles, and mean in one place.
+    """
+    arr = _safe_array(values)
+    if arr.size == 0:
+        return
+
+    if clip_max is not None:
+        arr = np.clip(arr, None, clip_max)
+
+    arr = np.nan_to_num(arr)
+
+    qs = np.linspace(0, 1, n_quantiles)
+
+    metrics[f'{prefix} Length'] = arr.size
+    metrics[f'{prefix} Quantiles'] = np.quantile(arr, qs)
+    metrics[f'{prefix} Mean'] = arr.mean()
+
+
 def buffer_logging(buffer, metrics, sample_batch):
+    # ---- main buffer ----
     if len(buffer) > 0:
-        metrics['Buffer Length'] = len(buffer)
-        metrics['Buffer Quantiles'] = np.array([
-            np.quantile(buffer.rewards_list, q=p)
-            for p in np.linspace(0, 1, 50)
-        ])
-        metrics['Buffer Mean Score'] = np.mean(np.nan_to_num(buffer.rewards_list))
-
+        _log_stats(
+            metrics,
+            'Buffer',
+            buffer.rewards_list,
+        )
         buffer_kld(buffer, metrics, sample_batch)
+
+    # ---- noised buffer ----
     if len(buffer.noised_rewards) > 0:
-        metrics['Noised Buffer Length'] = len(buffer.noised_rewards)
-        metrics['Noised Buffer Quantiles'] = np.array([
-            np.quantile(buffer.noised_rewards, q=p)
-            for p in np.linspace(0, 1, 50)
-        ])
-        metrics['Noised Buffer Mean Score'] = np.mean(np.nan_to_num(buffer.noised_rewards))
+        _log_stats(
+            metrics,
+            'Noised Buffer',
+            buffer.noised_rewards,
+        )
 
-        metrics['Noised Buffer Loss Quantiles'] = np.array([
-            np.quantile(np.clip(buffer.noised_losses, max=10), q=p)
-            for p in np.linspace(0, 1, 50)
-        ])
-        metrics['Noised Buffer Mean Loss'] = np.mean(np.nan_to_num(buffer.noised_losses))
+        _log_stats(
+            metrics,
+            'Noised Buffer Loss',
+            buffer.noised_losses,
+            clip_max=10,
+        )
 
-        metrics['Noised Buffer Step Quantiles'] = np.array([
-            np.quantile(np.clip(buffer.noised_select_counts, max=100), q=p)
-            for p in np.linspace(0, 1, 50)
-        ])
-        metrics['Noised Buffer Mean Step'] = np.mean(np.nan_to_num(buffer.noised_select_counts))
-
+        _log_stats(
+            metrics,
+            'Noised Buffer Step',
+            buffer.noised_select_counts,
+            clip_max=100,
+        )
 
 def buffer_kld(buffer, metrics, sample_batch):
     (buffer_cell_params, buffer_latent_params,
@@ -1173,7 +1213,7 @@ def xy_scatter_plot(
         except:
             c = np.ones(len(xy))
 
-        fig = go.Figure()
+    fig = go.Figure()
     fig.add_scatter(x=x.cpu().detach().numpy(),
                     y=y.cpu().detach().numpy(),
                     marker_color=c,

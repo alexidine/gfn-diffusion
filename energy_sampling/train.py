@@ -23,11 +23,10 @@ from energy_sampling.utils import iter_forever, \
     is_cuda_oom, get_annealing_factor, \
     parse_loss_schedules, dict2namespace, update_loss_schedule, \
     random_discretizer, low_discrepancy_discretizer, low_discrepancy_discretizer2, shifted_equidistant, \
-    calibrate_prior_noise, noise_buffer, mc_relax_buffer
+    calibrate_prior_noise, noise_buffer, mc_relax_buffer, thin_large_dmat_block
 from eval.evaluations import adjust_fig_filesize, log_metrics, fwd_figs, bwd_evaluation, analyze_buffer
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 from models import GFN
-from mxtaltools.common.geometry_utils import crystal_parameter_distmat
 from mxtaltools.common.training_utils import flatten_wandb_params
 from mxtaltools.dataset_utils.data_classes import MolData
 from mxtaltools.dataset_utils.utils import collate_data_list
@@ -68,6 +67,8 @@ class Modeller:
         self.fwd_tb_norm = 10000
         self.bwd_tb_norm = 10000
         self.best_tb_norm = 10000
+        self.fwd_Z_lb = 10000
+        self.bwd_Z_lb = 10000
         self.last_fwd_it = 0
         self.last_bwd_it = 0
         self.step_ind = 0
@@ -432,7 +433,7 @@ class Modeller:
                                                             f'_{self.args.energy_function}_kTrange_{self.args.kT_range}_relaxed.pt')
             if not os.path.exists(opt_buffer_path):
                 local_opt_sample, local_reward_max, reward_record, sample_record = self.relax_noise_buffer(
-                    buffer, energy_function, max_steps = 500)
+                    buffer, energy_function, max_steps=500)
 
                 torch.save({'local_reward_max': local_reward_max,
                             'local_opt_sample': local_opt_sample,
@@ -451,12 +452,15 @@ class Modeller:
                 self.log_noise_range = opt_buffer_dict['log_noise_range']
                 self.turnover_log_sigma = opt_buffer_dict['turnover_log_sigma']
 
-                buffer.replace_initial_with_local_optima(local_opt_sample, local_reward_max)
+                buffer.replace_initial_with_local_optima(local_opt_sample[:len(buffer.original_dataset_inds)],
+                                                         local_reward_max[
+                                                             :len(buffer.original_dataset_inds)])  # TODO DELETE
 
             good_inds = torch.argwhere(reward_record >= buffer.reward_clip).flatten()
             buffer.add_to_noised(reward_record[good_inds],
                                  sample_record[good_inds],
                                  losses=torch.zeros_like(reward_record[good_inds]),
+                                 override_size=True,
                                  )
             print(len(buffer))
 
@@ -663,7 +667,7 @@ class Modeller:
             loss_record = []
 
             self.times['initialization_end'] = time()
-        # print("-1")
+            # print("-1")
             # print("-0.5")
             wandb.watch(gfn_model,
                         log_graph=False,
@@ -927,25 +931,67 @@ class Modeller:
 
     def update_rolling_tb(self, do_backward, do_forward, loss_dict, step_ind):
         T = 25  # effective target update time
-        if do_forward and loss_dict is not None:
-            if self.fwd_tb_norm == 10000:
-                self.fwd_tb_norm = float(loss_dict['normed_tb'])
-            else:
-                dt = step_ind - self.last_fwd_it
-                beta_fwd = np.exp(-dt / T)
-                self.fwd_tb_norm = float(
-                    self.fwd_tb_norm * beta_fwd + (1 - beta_fwd) * loss_dict['normed_tb'])
+        if do_forward:
+            self.fwd_tb_norm = self._update_rolling(
+                self.fwd_tb_norm,
+                loss_dict['normed_tb'],
+                self.last_fwd_it,
+                step_ind,
+                T,
+                sanitize=True,
+            )
+            self.fwd_Z_lb = self._update_rolling(
+                self.fwd_Z_lb,
+                loss_dict['log_Z_lb'],
+                self.last_fwd_it,
+                step_ind,
+                T,
+                sanitize=True,
+            )
             self.last_fwd_it = step_ind
-        if do_backward and loss_dict is not None:
-            if self.bwd_tb_norm == 10000:
-                self.bwd_tb_norm = float(loss_dict['normed_tb'])
-            else:
-                dt = step_ind - self.last_bwd_it
-                beta_bwd = np.exp(-dt / T)
-                self.bwd_tb_norm = float(
-                    self.bwd_tb_norm * beta_bwd + (1 - beta_bwd) * np.nan_to_num(loss_dict['normed_tb'].cpu().detach(),
-                                                                                 posinf=self.bwd_tb_norm))
+
+        if do_backward:
+            self.bwd_tb_norm = self._update_rolling(
+                self.bwd_tb_norm,
+                loss_dict['normed_tb'].cpu().detach(),
+                self.last_bwd_it,
+                step_ind,
+                T,
+                sanitize=True,
+            )
+            self.bwd_Z_lb = self._update_rolling(
+                self.bwd_Z_lb,
+                loss_dict['log_Z_lb'],
+                self.last_bwd_it,
+                step_ind,
+                T,
+                sanitize=True,
+            )
             self.last_bwd_it = step_ind
+
+    def _update_rolling(
+            self,
+            value,
+            new_value,
+            last_it,
+            step_ind,
+            T,
+            *,
+            sanitize=False,
+    ):
+        if value == 10000:
+            value = float(new_value)
+        else:
+            dt = step_ind - last_it
+            beta = np.exp(-dt / T)
+            if sanitize:
+                new_value = np.nan_to_num(
+                    float(new_value),
+                    posinf=value,
+                    neginf=value,
+                )
+            value = value * beta + (1 - beta) * float(new_value)
+        return value
 
     def update_controller(self, it, do_backward, skip_step):
         update_this_step = it % 20 == 0
@@ -963,6 +1009,19 @@ class Modeller:
             bwd_floor = bwd_target * 0.75
 
         metric = self.bwd_tb_norm
+
+        # if the buffer samples are miscalibrated against log Z
+        # the normed TB values can be anomalous
+        # in other words, normed TB is only meaningful when the log Z mismatch is small
+        log_Z_mismatch = abs(self.fwd_Z_lb - self.bwd_Z_lb) / self.args.energy_static_temperature
+
+        z_cap = 10.0
+        z_thresh = 5.0
+
+        if log_Z_mismatch > z_thresh:
+            z_factor = min(z_cap, log_Z_mismatch / z_thresh)
+            metric *= z_factor
+
         coeff = 0.1
         err = (metric - bwd_target) / bwd_target  # if metric is large
 
@@ -1132,7 +1191,7 @@ class Modeller:
                               filter_unbound=True,
                               ):
         print("Loading prebuilt buffer")
-        dataset = torch.load(dataset_path, weights_only=False)
+        dataset = torch.load(dataset_path, weights_only=False)  # [:1000]  # TODO DELETE
 
         max_z_prime = max([int(elem.z_prime) for elem in dataset])
         assert max_z_prime == max(self.args.z_primes), "Preloaded data max z prime must match model"
@@ -1170,16 +1229,9 @@ class Modeller:
         # filter near-identical samples
         d_cut = 0.05  # should be relatively sparse or the local density bias becomes large
         latents = collate_data_list(dataset).latent_params()
-        dmat = crystal_parameter_distmat(latents)
-
-        keep = torch.zeros(len(latents), dtype=bool, device=latents.device)
-        ens = torch.tensor([elem.lj for elem in dataset])
-        sort_inds = torch.argsort(ens, descending=False)
-        for i in sort_inds:
-            # check if this point is far from all previously kept points
-            if not (dmat[i, keep] < d_cut).any():
-                keep[i] = True
-
+        keep = thin_large_dmat_block(latents.to(self.args.device),
+                                     torch.tensor([elem.lj for elem in dataset], device=self.args.device),
+                                     d_cut).cpu()
         keep_inds = torch.nonzero(keep, as_tuple=False).squeeze(-1)
         dataset = [dataset[i] for i in keep_inds]
 
@@ -1266,7 +1318,7 @@ class Modeller:
             self.times['eval_bwd_figs_start'] = time()
             bwd_metrics, bwd_fig_dict, rewards, btb_residual, normed_btb_residual = bwd_evaluation(
                 log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, b_log_r,
-                b_packing_coeff,
+                b_packing_coeff, log_importance_weight,
                 do_figs=do_figs)
             self.times['eval_bwd_figs_end'] = time()
 
@@ -1326,16 +1378,20 @@ class Modeller:
         samples_to_be_replaced = (good_loss & old_enough) | too_old
 
         num_to_replace = sum(samples_to_be_replaced)
+        print("Log noise range check", self.log_noise_range)
         if num_to_replace >= 4:
             log_importance_weight = torch.nan_to_num(log_importance_weight,
-                                                     nan=-6,posinf=-6,neginf=-6)
+                                                     nan=-6, posinf=-6, neginf=-6)
             log_importance_weight = log_importance_weight.clip(max=log_importance_weight.quantile(0.99))
 
             importance_weight = (alpha * log_importance_weight).exp() + 1e-6
+            good_reward = rewards > (rewards.quantile(0.75))  # limit importance sampling to high reward samples
+            importance_weight[~good_reward] = 1e-6
             importance_weight = (1 - eps) * importance_weight
             importance_weight += eps / len(importance_weight)
             importance_weight = importance_weight.numpy().astype(np.float64)
             importance_weight /= importance_weight.sum()
+
             try:
                 sample_inds = np.random.choice(len(buffer), num_to_replace, p=importance_weight, replace=True)
             except ValueError:
@@ -1345,7 +1401,8 @@ class Modeller:
                 sample_inds = np.random.choice(len(buffer), num_to_replace, replace=True)
 
             new_rewards, samples = noise_buffer(self.log_noise_range,
-                                                buffer, energy_function,
+                                                buffer,
+                                                energy_function,
                                                 sample_inds=sample_inds)
 
             # good_inds = torch.argwhere(rewards >= buffer.reward_clip).flatten()
@@ -1492,6 +1549,8 @@ class Modeller:
             phase=self.phase,
             fwd_tb_norm=self.fwd_tb_norm,
             bwd_tb_norm=self.bwd_tb_norm,
+            fwd_Z_lb=self.fwd_Z_lb,
+            bwd_Z_lb=self.bwd_Z_lb,
             step_ind=self.step_ind,
             last_fwd_it=self.last_fwd_it,
             last_bwd_it=self.last_bwd_it,
@@ -1518,6 +1577,8 @@ class Modeller:
         self.step_ind = state['step_ind']
         self.fwd_tb_norm = state['fwd_tb_norm']
         self.bwd_tb_norm = state['bwd_tb_norm']
+        # self.fwd_Z_lb = state['fwd_Z_lb']
+        # self.bwd_Z_lb = state['bwd_Z_lb']
         self.last_fwd_it = state['last_fwd_it']
         self.last_bwd_it = state['last_bwd_it']
         self.fwd_loss_schedule = state['fwd_loss_schedule']

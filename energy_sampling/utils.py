@@ -14,12 +14,12 @@ import psutil
 import torch
 import yaml
 from scipy.stats import median_abs_deviation
-from sklearn.neighbors import KernelDensity
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
 from mxtaltools.common.config_processing import dict2namespace
 from mxtaltools.common.geometry_utils import batch_molecule_principal_axes_torch
+from mxtaltools.common.geometry_utils import crystal_parameter_distance
 from mxtaltools.common.utils import log_rescale_positive
 # from mxtaltools.crystal_building.crystal_latent_transforms import enforce_niggli_plane
 from mxtaltools.dataset_utils.data_classes import MolCrystalData
@@ -932,3 +932,77 @@ def batched_crystal_analysis(samples, device, computes: list[str] = ['lj'],
                     raise e
 
     return sample_outputs
+
+
+def thin_large_dmat(latents, d_cut, energy, B: int = 100000):
+    # todo replace this with a very beautiful method
+    sort_inds = torch.argsort(energy, descending=False)
+    N = len(latents)
+    keep = torch.zeros(N, dtype=torch.bool, device=latents.device)
+
+    for i in tqdm(sort_inds):
+        kept_inds = torch.nonzero(keep, as_tuple=False).squeeze(-1)
+        if len(kept_inds) > 0:
+            # chunked distance check
+            found = False
+            for j in range(0, len(kept_inds), B):
+                chunk = kept_inds[j:j + B]
+                if (crystal_parameter_distance(latents[None, i], latents[chunk]) < d_cut).any():
+                    found = True
+                    break
+            if found:
+                continue
+        keep[i] = True
+
+    return keep
+
+
+def thin_large_dmat_block(latents, energy, d_cut, target_entries=5_000_000):
+    # Fixed argsort: simplest signature to avoid TypeError
+    sort_inds = torch.argsort(energy)
+    latents = latents[sort_inds]
+    N, K = latents.shape
+    keep_mask = torch.zeros(N, dtype=torch.bool, device=latents.device)
+    kept_indices = []
+    i = 0
+    pbar = tqdm(total=N)
+    while i < N:
+        num_kept = len(kept_indices)
+        # Adaptive block size
+        if num_kept > 0:
+            B = max(1, min(2048, target_entries // num_kept))
+        else:
+            B = 1024
+        end = min(i + B, N)
+        block_latents = latents[i:end]
+        b_size = block_latents.shape[0]
+        # 1. Batch Check: Block vs. All Previously Kept
+        if num_kept > 0:
+            kept_latents = latents[kept_indices]
+            # Expansion logic for [n, k] distance function
+            lat1_exp = block_latents[:, None, :].expand(b_size, num_kept, K).reshape(-1, K)
+            lat2_exp = kept_latents[None, :, :].expand(b_size, num_kept, K).reshape(-1, K)
+            d_to_past = crystal_parameter_distance(lat1_exp, lat2_exp).view(b_size, num_kept)
+            is_far_from_past = ~(d_to_past < d_cut).any(dim=1)
+        else:
+            is_far_from_past = torch.ones(b_size, dtype=torch.bool, device=latents.device)
+        # 2. Sequential Check within the block
+        candidate_sub_indices = is_far_from_past.nonzero(as_tuple=True)[0]
+        for idx in candidate_sub_indices:
+            curr_idx = i + idx.item()
+            curr_latent = latents[curr_idx:curr_idx + 1]  # [1, K]
+            # Re-check against latents added from THIS SAME BLOCK
+            newly_added_indices = [j for j in kept_indices if j >= i]
+            if newly_added_indices:
+                recent_tensor = latents[newly_added_indices]  # [R, K]
+                # Your distance function accepts [1, K] and [R, K]
+                if (crystal_parameter_distance(curr_latent, recent_tensor) < d_cut).any():
+                    continue
+            kept_indices.append(curr_idx)
+            keep_mask[curr_idx] = True
+        pbar.update(end - i)
+        i = end
+    pbar.close()
+    final_keep = torch.zeros(N, dtype=torch.bool, device=latents.device)
+    final_keep[sort_inds] = keep_mask
+    return final_keep

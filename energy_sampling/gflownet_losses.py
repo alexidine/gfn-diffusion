@@ -196,8 +196,12 @@ def get_gfn_forward_loss(loss_coeffs,
     normed_tb_residual = torch.nan_to_num(normed_tb_residual.detach())
     log_importance_weight = (Y_side - X_side).detach()
 
+    log_weight = log_r + log_pb - log_pf
+    log_Z_lb = log_weight.mean()
+
     if report_losses:
         loss_dict = {}
+        loss_dict['log_Z_lb'] = log_Z_lb
         loss_dict['normed_tb'] = normed_tb_residual.clip(max=normed_tb_residual.quantile(0.95)).mean()
         if loss_coeffs.greedy > 0:
             loss_dict['greedy'] = greedy_loss.mean().detach()
@@ -301,8 +305,12 @@ def get_gfn_backward_loss(loss_coeffs,
     normed_tb_residual = (X_side - Y_side).abs() / torch.maximum(torch.ones_like(Y_side), Y_side.abs())
     normed_tb_residual = torch.nan_to_num(normed_tb_residual.detach())
 
+    log_weight = log_r + log_pb - log_pf
+    log_Z_lb = log_weight.mean()
+
     if report_losses:
         loss_dict = {}
+        loss_dict['log_Z_lb'] = log_Z_lb
         loss_dict['normed_tb'] =  normed_tb_residual.clip(max=normed_tb_residual.quantile(0.95)).mean() # exclude outliers
         if loss_coeffs.tb > 0:
             loss_dict['tb'] = tb_loss.mean().detach()

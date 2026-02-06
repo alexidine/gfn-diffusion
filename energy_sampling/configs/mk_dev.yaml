@@ -17,7 +17,7 @@ ema_decay: 0.95 #0.99  # set to null for no ema
 
 # model parameters
 #checkpoint_path: C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints\nic_good_elj_model_train.pt #D:\crystal_datasets\nic12_model_train_hit_prior.pt # if you put the train model, it will automatically load the relevant config and eval model
-checkpoint_path: null #D:\crystal_datasets\nic12_model_train_hit_prior.pt # if you put the train model, it will automatically load the relevant config and eval model
+checkpoint_path: D:\crystal_datasets\acridine\acr14_sg14_zp1_0_model_train.pt # if you put the train model, it will automatically load the relevant config and eval model
 zero_init: False
 joint_layers: 4              # number of layers in forward/backward policy models
 hidden_dim: 1024             # dimensionality of hidden layer
@@ -108,9 +108,9 @@ reward_range: 80 # range of reward values allowed, null to go unrestricted
 continue_from_checkpoint: false
 continue_from_hit_prior: false
 uma_path: 'D:\crystal_datasets\esen_s.pt'
-buffer_path: 'D:\crystal_datasets\xuldud\xuldud_sg61_zp1.pt' #'D:/crystal_datasets/urea_gfn_dataset.pt' #
+buffer_path: 'D:\crystal_datasets\acridine\acridine_sg14_zp1.pt' #'D:/crystal_datasets/urea_gfn_dataset.pt' #
 #molecules_path: 'D:/crystal_datasets/train_qm9.pt'
-molecules_path: 'D:/crystal_datasets/xuldud\xuldud.pt'
+molecules_path: 'D:/crystal_datasets/acridine\acridine_conformer.pt'
 #molecules_path: 'D:/crystal_datasets/nicoam/protonated_nicotinamide.pt'
 autoencoder_path: null #'D:/crystal_datasets/model_checkpoints/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
 #
@@ -133,6 +133,7 @@ grow_buffer: false  # can be toggled on or off in certain training modes
 noised_buffer_length: 20000
 noised_max_steps: 25
 
+
 # exploration controls
 ################################################################
 exploratory: False       # adds variance to optionally learned logvars
@@ -147,7 +148,7 @@ temperature_conditioning: False  # if false, temperatures are set to energy_stat
 molecule_conditioning: False  # MUST be true for molecule='qm9' and false else - conditions the generative prediction on the molecule
 mol_embedding_type: 'autoencoder'  # principal_axes or autoencoderd
 sg_conditioning: False  # whether to conditionally sample across space groups
-space_groups: [ 61 ]  # which space groups to sample over
+space_groups: [ 14 ]  # which space groups to sample over
 zp_conditioning: false # whether to condition over z prime values
 z_primes: [ 1 ]
 lj_rescale: [-20.6, 5.7, -3.4, 1.5]  # mean and std by which to rescale LJ to align with uma

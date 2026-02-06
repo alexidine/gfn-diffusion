@@ -404,7 +404,7 @@ class CrystalReplayBuffer:
         self.loader.batch_sampler.batch_size = new_batch_size
         self._loader_iter = iter_forever(self.loader)
 
-    def add_to_noised(self, rewards, samples, losses):
+    def add_to_noised(self, rewards, samples, losses, override_size: bool = False):
         rewards = rewards.detach().to(self.device)
         samples = samples.detach().to(self.device)
         losses = losses.detach().to(self.device)
@@ -412,11 +412,12 @@ class CrystalReplayBuffer:
 
         for i in range(B):
             # If buffer is full, remove oldest entry (FIFO)
-            if len(self.noised_rewards) >= self.noised_buffer_length:
-                self.noised_rewards.pop(0)
-                self.noised_samples.pop(0)
-                self.noised_losses.pop(0)
-                self.noised_select_counts.pop(0)
+            if not override_size:
+                if len(self.noised_rewards) >= self.noised_buffer_length:
+                    self.noised_rewards.pop(0)
+                    self.noised_samples.pop(0)
+                    self.noised_losses.pop(0)
+                    self.noised_select_counts.pop(0)
 
             self.noised_rewards.append(rewards[i])
             self.noised_samples.append(samples[i])
@@ -496,10 +497,9 @@ class CrystalReplayBuffer:
             self.x_list[buf_idx] = x_new.detach().cpu()
             self.rewards_list[buf_idx] = float(r_new)
 
-            # Optional: update dataset object itself if needed
             self.dataset[buf_idx].latent_to_cell_params(x_new[None, :])
-            for elem in self.dataset:
-                del elem.asym_unit_dict
+        for elem in self.dataset:
+            del elem.asym_unit_dict
 
 
 
