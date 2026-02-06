@@ -19,7 +19,7 @@ from umap import UMAP
 
 from energy_sampling.eval.utils import sample_eval_fwd_trajs, get_plotly_fig_size_mb
 from energy_sampling.utils import logmeanexp, sample_crystal_prior
-from mxtaltools.common.utils import get_point_density
+from mxtaltools.common.utils import get_point_density, log_rescale_positive
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.reporting.figures import log_crystal_samples
 from mxtaltools.reporting.utils import lightweight_one_sided_violin
@@ -897,7 +897,7 @@ def log_metrics(energy_function,
     # training metrics
     metrics['Mean Sample Energy'] = sample_batch.gfn_energy.mean().cpu().detach().item()
     metrics['Sample Energy'] = sample_batch.gfn_energy.clip(max=50).cpu().detach().numpy()
-    metrics['Scaled LJ'] = sample_batch.scaled_lj.cpu().detach().numpy()
+    metrics['Scaled LJ'] = log_rescale_positive(sample_batch.lj).cpu().detach().numpy()
 
     metrics[
         'Mean Sample Reward'] = log_r.mean().cpu().detach().item()  # todo this should probably be denormed by the temperature
@@ -1196,9 +1196,10 @@ def pf_parity_plot(log_pfs, log_pbs, log_r, log_flow):
 def xy_scatter_plot(
         x: torch.Tensor,
         y: torch.Tensor,
-        xaxis_title: str,
-        yaxis_title: str,
+        xaxis_title: str = '',
+        yaxis_title: str = '',
         c: Optional[torch.Tensor] = None,
+        c_bins: int = 25,
 
 ):
     try:
@@ -1209,7 +1210,7 @@ def xy_scatter_plot(
     if c is None:
         xy = np.vstack([x.cpu().detach().numpy(), y.cpu().detach().numpy()])
         try:
-            c = get_point_density(xy, bins=25)
+            c = get_point_density(xy, bins=c_bins)
         except:
             c = np.ones(len(xy))
 

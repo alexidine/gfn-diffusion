@@ -261,43 +261,34 @@ def triangle_schedule(it, init, maxval, minval, on, off):
 @torch.no_grad()
 def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 500,
                       uma_path: Optional[str] = None, ):
-    outputs = []
     cutoff = 10
     computes = ['lj', 'reduction_en']
-    if energy_function != 'lj' and energy_function != 'uma':
+    if energy_function != 'lj':
         computes.append(energy_function)
 
     if energy_function == 'uma':
         uma_predictor = init_uma_crystal_predictor(uma_path, device=device)
+    else:
+        uma_predictor = None
 
     cursor = 0
     pbar = tqdm(total=len(dataset), unit="reparameterized samples")
-
+    feat_dataset = []
     while cursor < len(dataset):
         try:
             crystal_batch = collate_data_list(
                 [dataset[ind] for ind in range(cursor, min(len(dataset), cursor + batch_size))])
-            crystal_batch = crystal_batch  # .to(device)
+            crystal_batch = crystal_batch.to(device)
 
-            crystal_batch.box_analysis()
-            out = crystal_batch.analyze(computes,
-                                        cutoff=cutoff,
-                                        supercell_size=5,
-                                        std_orientation=True,
-                                        )
-            out = {key: val.cpu().detach() for key, val in out.items()}
-            if energy_function == 'uma':
-                cry_en = crystal_batch.compute_crystal_uma(
-                    predictor=uma_predictor,
-                    std_orientation=True).cpu().detach() * 96.485  # output in kJ/mol (of unit cells)
-                gas_en = crystal_batch.compute_lattice_gas_phase_uma(
-                    predictor=uma_predictor, std_orientation=True).cpu().detach() * 96.485
-                out.update({'uma_gas_pot': gas_en,
-                            'uma_pot': cry_en,
-                            'uma': cry_en / (
-                                    crystal_batch.sym_mult.cpu().detach() * crystal_batch.z_prime.cpu().detach()) - gas_en})  # lattice energy
-
-            outputs.append(out)
+            crystal_batch.latent_to_cell_params(crystal_batch.latent_params())
+            crystal_batch.analyze(computes,
+                                  cutoff=cutoff,
+                                  supercell_size=10,
+                                  std_orientation=True,
+                                  assign_outputs=True,
+                                  predictor=uma_predictor
+                                  )
+            feat_dataset.extend(crystal_batch.cpu().detach().batch_to_list())
             cursor += batch_size
             pbar.update(min(batch_size, len(dataset) - cursor))  # safe final update
             batch_size += 1
@@ -313,25 +304,7 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
             else:
                 raise e
 
-    keys = outputs[0].keys()
-
-    full = {
-        key: torch.cat([batch[key] for batch in outputs], dim=0)
-        for key in keys
-    }
-
-    for key, tensor in full.items():
-        for i, elem in enumerate(dataset):
-            setattr(elem, key, tensor[None, i])
-
-    if 'lj' in full:
-        scaled = log_rescale_positive(full['lj'])
-        for i, elem in enumerate(dataset):
-            setattr(elem, 'scaled_lj', scaled[None, i])
-
-    [elem.box_analysis() for elem in dataset]
-
-    return dataset
+    return feat_dataset
 
 
 @torch.no_grad()

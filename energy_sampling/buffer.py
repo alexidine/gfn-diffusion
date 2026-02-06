@@ -63,15 +63,9 @@ class CrystalReplayBuffer:
             self.staging_buffer.extend([elem for ind, elem in enumerate(data_list) if importance_weight[ind] > 0]) # keep any plausibly underweighted states
 
     @torch.no_grad()
-    def add(self,
-            data_list=None):
-        if self.dataset is None:
-            self.init_fresh_dataset(data_list)
-        else:
-            self.add_samples_to_dataset(data_list)
-
-        # if len(self) > self.buffer_size:  # pare down buffer
-        #     self.truncate_buffer()
+    def add_init(self,
+                 data_list):
+        self.init_fresh_dataset(data_list)
 
         assert len(self.dataset) == len(self.x_list) == len(self.rewards_list)
 
@@ -82,6 +76,7 @@ class CrystalReplayBuffer:
 
     def add_samples_to_dataset(self, data_list, skip_staging: bool = False):
         # batch samples
+        assert False, "This needs to be rewritten / checked for index issues" # todo
         if not skip_staging:
             if len(self.staging_buffer) > 0:  # include staged samples
                 data_list.extend(self.staging_buffer)

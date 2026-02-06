@@ -87,6 +87,8 @@ class MolecularCrystal(BaseSet):
         if self.energy_function == 'uma':
             self.uma_path = uma_path
             self.uma_predictor = init_uma_crystal_predictor(uma_path, device=self.device)
+        else:
+            self.uma_predictor = None
 
         self.temperature = temperature  # for static temperature work
         self.energy_clip = None
@@ -99,7 +101,7 @@ class MolecularCrystal(BaseSet):
             self.sg_cache[sg] = np.stack(SYM_OPS[int(sg)])
 
         self.computes = ['lj', 'reduction_en']
-        if self.energy_function != 'lj' and self.energy_function != 'uma':
+        if self.energy_function != 'lj':
             self.computes.append(self.energy_function)
 
     def set_reward_clip(self, dataset_rewards):
@@ -129,20 +131,8 @@ class MolecularCrystal(BaseSet):
             out = crystal_batch.analyze(self.computes,
                                         cutoff=cutoff,
                                         supercell_size=5,
-                                        std_orientation=False)
-
-            if self.energy_function == 'uma':
-                # clear memory
-                assert torch.sum(torch.isnan(crystal_batch.pos)) == 0
-                torch.cuda.empty_cache()
-                gc.collect()
-
-                uma_energy = crystal_batch.compute_crystal_uma(
-                    predictor=self.uma_predictor,
-                    std_orientation=False) * 96.485  # output in kJ/mol (of unit cells)
-                out.update({'uma_pot': uma_energy.float(),
-                            'uma': (uma_energy / (
-                                    crystal_batch.sym_mult * crystal_batch.z_prime) - crystal_batch.uma_gas_pot).float()})
+                                        std_orientation=False,
+                                        predictor=self.uma_predictor,)
 
         for key in out.keys():
             crystal_batch.add_graph_attr(out[key], key)

@@ -433,7 +433,7 @@ class Modeller:
                                                             f'_{self.args.energy_function}_kTrange_{self.args.kT_range}_relaxed.pt')
             if not os.path.exists(opt_buffer_path):
                 local_opt_sample, local_reward_max, reward_record, sample_record = self.relax_noise_buffer(
-                    buffer, energy_function, max_steps=500)
+                    buffer, energy_function, max_steps=50)
 
                 torch.save({'local_reward_max': local_reward_max,
                             'local_opt_sample': local_opt_sample,
@@ -454,7 +454,7 @@ class Modeller:
 
                 buffer.replace_initial_with_local_optima(local_opt_sample[:len(buffer.original_dataset_inds)],
                                                          local_reward_max[
-                                                             :len(buffer.original_dataset_inds)])  # TODO DELETE
+                                                             :len(buffer.original_dataset_inds)])
 
             good_inds = torch.argwhere(reward_record >= buffer.reward_clip).flatten()
             buffer.add_to_noised(reward_record[good_inds],
@@ -1015,12 +1015,12 @@ class Modeller:
         # in other words, normed TB is only meaningful when the log Z mismatch is small
         log_Z_mismatch = abs(self.fwd_Z_lb - self.bwd_Z_lb) / self.args.energy_static_temperature
 
-        z_cap = 10.0
-        z_thresh = 5.0
+        z_cap = 5.0
+        z_thresh = 1.0
 
         if log_Z_mismatch > z_thresh:
             z_factor = min(z_cap, log_Z_mismatch / z_thresh)
-            metric *= z_factor
+            metric += z_factor  # the standard metric can get anomalously small, additive noise may not work
 
         coeff = 0.1
         err = (metric - bwd_target) / bwd_target  # if metric is large
@@ -1042,8 +1042,7 @@ class Modeller:
                 -coeff * err)  # this is very negative -> pushes towards bwd, which is good
 
         self.args.fwd_to_bwd_ratio = np.clip(
-            self.args.fwd_to_bwd_ratio, self.args.min_fwd_bwd_ratio,
-            self.args.max_fwd_bwd_ratio)  # need even enough ratios to get reasonable updates to the metrics
+            self.args.fwd_to_bwd_ratio, self.args.min_fwd_bwd_ratio, self.args.max_fwd_bwd_ratio)  # need even enough ratios to get reasonable updates to the metrics
 
         return skip_step
 
@@ -1191,7 +1190,7 @@ class Modeller:
                               filter_unbound=True,
                               ):
         print("Loading prebuilt buffer")
-        dataset = torch.load(dataset_path, weights_only=False)  # [:1000]  # TODO DELETE
+        dataset = torch.load(dataset_path, weights_only=False)
 
         max_z_prime = max([int(elem.z_prime) for elem in dataset])
         assert max_z_prime == max(self.args.z_primes), "Preloaded data max z prime must match model"
@@ -1258,7 +1257,7 @@ class Modeller:
         #     print("Getting preloaded dataset molecule embeddings")
         #     dataset = embed_dataset(dataset, self.args.autoencoder_path, self.device, encoder=None)
 
-        buffer.add(dataset)
+        buffer.add_init(dataset)
         print(f"Buffer loaded with {len(dataset)} samples")
 
         return buffer
@@ -1378,13 +1377,13 @@ class Modeller:
         samples_to_be_replaced = (good_loss & old_enough) | too_old
 
         num_to_replace = sum(samples_to_be_replaced)
-        print("Log noise range check", self.log_noise_range)
+        #print("Log noise range check", self.log_noise_range)
         if num_to_replace >= 4:
-            log_importance_weight = torch.nan_to_num(log_importance_weight,
-                                                     nan=-6, posinf=-6, neginf=-6)
-            log_importance_weight = log_importance_weight.clip(max=log_importance_weight.quantile(0.99))
+            log_importance_weight_i = torch.nan_to_num(log_importance_weight,
+                                                       nan=-6, posinf=-6, neginf=-6)
+            log_importance_weight_i = log_importance_weight_i.clip(max=log_importance_weight_i.quantile(0.99))
 
-            importance_weight = (alpha * log_importance_weight).exp() + 1e-6
+            importance_weight = (alpha * log_importance_weight_i).exp() + 1e-6
             good_reward = rewards > (rewards.quantile(0.75))  # limit importance sampling to high reward samples
             importance_weight[~good_reward] = 1e-6
             importance_weight = (1 - eps) * importance_weight
@@ -1397,7 +1396,7 @@ class Modeller:
             except ValueError:
                 print("Value error in importance weights")
                 print(importance_weight)
-                print(log_importance_weight)
+                print(log_importance_weight_i)
                 sample_inds = np.random.choice(len(buffer), num_to_replace, replace=True)
 
             new_rewards, samples = noise_buffer(self.log_noise_range,
@@ -1577,8 +1576,8 @@ class Modeller:
         self.step_ind = state['step_ind']
         self.fwd_tb_norm = state['fwd_tb_norm']
         self.bwd_tb_norm = state['bwd_tb_norm']
-        # self.fwd_Z_lb = state['fwd_Z_lb']
-        # self.bwd_Z_lb = state['bwd_Z_lb']
+        self.fwd_Z_lb = state['fwd_Z_lb']
+        self.bwd_Z_lb = state['bwd_Z_lb']
         self.last_fwd_it = state['last_fwd_it']
         self.last_bwd_it = state['last_bwd_it']
         self.fwd_loss_schedule = state['fwd_loss_schedule']
