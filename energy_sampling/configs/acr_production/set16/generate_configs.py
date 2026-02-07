@@ -39,7 +39,7 @@ if __name__ == "__main__":
             config['space_groups'] = [sg]
             config['z_primes'] = [zp]
             config['run_name'] = f'sg{sg}_zp{zp}_{ind}'
-            config['tag'] = f'acr14'
+            config['tag'] = f'acr16'
             config['noised_buffer_length'] = nbs
             config['noised_max_steps'] = mx
             config['space_groups'] = [sg]

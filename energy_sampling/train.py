@@ -915,7 +915,7 @@ class Modeller:
                 self.phase2to3(ema_model, gfn_model, self.args.min_fwd_bwd_ratio, step_ind)
 
         if self.phase == 3:
-            skip_step = self.update_controller(step_ind, do_backward, skip_step)
+            skip_step = self.update_controller(step_ind, do_backward, skip_step, gfn_model.flow_model().item())
 
         if not skip_step:
             self.step_loss(do_backward, do_forward, gfn_model, loss, optimizers)
@@ -993,7 +993,7 @@ class Modeller:
             value = value * beta + (1 - beta) * float(new_value)
         return value
 
-    def update_controller(self, it, do_backward, skip_step):
+    def update_controller(self, it, do_backward, skip_step, learned_log_Z):
         update_this_step = it % 20 == 0
         static_ceil = self.args.thermalization_conv_eps * self.args.btb_threshold
         static_floor = self.args.thermalization_conv_eps
@@ -1013,7 +1013,7 @@ class Modeller:
         # if the buffer samples are miscalibrated against log Z
         # the normed TB values can be anomalous
         # in other words, normed TB is only meaningful when the log Z mismatch is small
-        log_Z_mismatch = abs(self.fwd_Z_lb - self.bwd_Z_lb) / self.args.energy_static_temperature
+        log_Z_mismatch = abs(learned_log_Z - self.bwd_Z_lb) / self.args.energy_static_temperature
 
         z_cap = 5.0
         z_thresh = 1.0
@@ -1377,6 +1377,10 @@ class Modeller:
         samples_to_be_replaced = (good_loss & old_enough) | too_old
 
         num_to_replace = sum(samples_to_be_replaced)
+        # if it's already full, let it shrink gracefully, while keeping some fresh samples
+        if buffer.noised_buffer_length < (len(noised_losses) - num_to_replace):
+            num_to_replace = max(1, num_to_replace // 2)
+
         #print("Log noise range check", self.log_noise_range)
         if num_to_replace >= 4:
             log_importance_weight_i = torch.nan_to_num(log_importance_weight,
@@ -1402,13 +1406,14 @@ class Modeller:
             new_rewards, samples = noise_buffer(self.log_noise_range,
                                                 buffer,
                                                 energy_function,
-                                                sample_inds=sample_inds)
+                                                sample_inds=sample_inds,)
 
             # good_inds = torch.argwhere(rewards >= buffer.reward_clip).flatten()
             buffer.purge_noised_by_index(np.argwhere(samples_to_be_replaced).flatten())
             buffer.add_to_noised(new_rewards,  # [good_inds],
                                  samples,  # [good_inds],
-                                 losses=torch.zeros_like(new_rewards))  # [good_inds]))
+                                 losses=torch.zeros_like(new_rewards),
+                                 override_size=True)  # [good_inds]))
 
         self.times['eval_bwd_noising_end'] = time()
 
@@ -1576,8 +1581,8 @@ class Modeller:
         self.step_ind = state['step_ind']
         self.fwd_tb_norm = state['fwd_tb_norm']
         self.bwd_tb_norm = state['bwd_tb_norm']
-        self.fwd_Z_lb = state['fwd_Z_lb']
-        self.bwd_Z_lb = state['bwd_Z_lb']
+        #self.fwd_Z_lb = state['fwd_Z_lb']
+        #self.bwd_Z_lb = state['bwd_Z_lb']
         self.last_fwd_it = state['last_fwd_it']
         self.last_bwd_it = state['last_bwd_it']
         self.fwd_loss_schedule = state['fwd_loss_schedule']
