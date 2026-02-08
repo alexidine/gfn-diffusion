@@ -437,8 +437,9 @@ class Modeller:
         )
         if ((self.args.both_ways or self.args.bwd) and
                 self.args.buffer_path is not None):  # preload samples into the buffer
-            buffer = self.add_dataset_to_buffer(self.args.buffer_path, buffer,
-                                                filter_unbound=False)
+            buffer = self.add_dataset_to_buffer(self.args.buffer_path,
+                                                buffer,
+                                                filter_unbound=True)
 
             print("Initializing noised buffer")
             opt_buffer_path = self.args.buffer_path.replace('.pt',
