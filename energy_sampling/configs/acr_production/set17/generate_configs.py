@@ -59,3 +59,28 @@ if __name__ == "__main__":
 
             ind += 1
 
+    for s_err in [0.05, 0.5]:
+        for i_err in [1, 10]:
+            config = deepcopy(base)
+            config['lr_flow'] = 10.0
+            config['space_groups'] = [sg]
+            config['z_primes'] = [zp]
+            config['run_name'] = f'sg{sg}_zp{zp}_{ind}'
+            config['tag'] = f'acr17'
+            config['noised_buffer_length'] = nbs
+            config['noised_max_steps'] = mx
+            config['space_groups'] = [sg]
+            config['z_primes'] = [zp]
+            config['energy_function'] = en
+            config['energy_static_temperature'] = temp
+            config['thermalization_slope_err'] = s_err
+            config['thermalization_intercept_err'] = i_err
+
+            config['molecules_path'] = '/scratch/mk8347/data/crystal_datasets/acridine/acridine_conformer.pt'
+            config['buffer_path'] = f'/scratch/mk8347/data/crystal_datasets/acridine/acridine_sg{sg}_zp{zp}.pt'
+
+            config_path = f'{ind}.yaml'
+            with open(config_path, 'w') as f:
+                yaml.dump(config, f, default_flow_style=False)
+
+            ind += 1

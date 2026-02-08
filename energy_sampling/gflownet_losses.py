@@ -326,7 +326,6 @@ def get_gfn_backward_loss(loss_coeffs,
     intercept_err = abs(b) / np.std(tb_y)
     scatter_err = np.std(tb_x - tb_y)
 
-
     if report_losses:
         loss_dict = {}
         loss_dict['log_Z_lb'] = log_Z_lb
