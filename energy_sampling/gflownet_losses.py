@@ -1,6 +1,7 @@
 import math
 from typing import Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -196,6 +197,13 @@ def get_gfn_forward_loss(loss_coeffs,
     normed_tb_residual = torch.nan_to_num(normed_tb_residual.detach())
     log_importance_weight = (Y_side - X_side).detach()
 
+    tb_y = (log_flow + log_pf).cpu().detach().numpy()
+    tb_x = (log_r + log_pb).cpu().detach().numpy()
+    m, b = np.polyfit(tb_x, tb_y, 1)
+    slope_err = abs(m - 1)
+    intercept_err = abs(b) / np.std(tb_y)
+    scatter_err = np.std(tb_x - tb_y)
+
     log_weight = log_r + log_pb - log_pf
     log_Z_lb = log_weight.mean()
 
@@ -203,6 +211,9 @@ def get_gfn_forward_loss(loss_coeffs,
         loss_dict = {}
         loss_dict['log_Z_lb'] = log_Z_lb
         loss_dict['normed_tb'] = normed_tb_residual.clip(max=normed_tb_residual.quantile(0.95)).mean()
+        loss_dict['scatter_err'] = scatter_err
+        loss_dict['slope_err'] = slope_err
+        loss_dict['intercept_err'] = intercept_err
         if loss_coeffs.greedy > 0:
             loss_dict['greedy'] = greedy_loss.mean().detach()
         if loss_coeffs.reinforce > 0:
@@ -277,10 +288,10 @@ def get_gfn_backward_loss(loss_coeffs,
         emp_z_loss = None
 
     """TB loss"""
+    tb_loss = get_tb_loss(log_flow, log_pb, log_pf, log_r,
+                          detach_z = True if loss_coeffs.bwd_tb_z == 0 else False,
+                          z_only=True if loss_coeffs.bwd_tb_z == 2 else False)
     if loss_coeffs.tb > 0:
-        tb_loss = get_tb_loss(log_flow, log_pb, log_pf, log_r,
-                              detach_z = True if loss_coeffs.bwd_tb_z == 0 else False,
-                              z_only=True if loss_coeffs.bwd_tb_z == 2 else False)
         losses.append(tb_loss * loss_coeffs.tb)
 
     if loss_coeffs.mle > 0:
@@ -308,10 +319,21 @@ def get_gfn_backward_loss(loss_coeffs,
     log_weight = log_r + log_pb - log_pf
     log_Z_lb = log_weight.mean()
 
+    tb_y = (log_flow + log_pf).cpu().detach().numpy()
+    tb_x = (log_r + log_pb).cpu().detach().numpy()
+    m, b = np.polyfit(tb_x, tb_y, 1)
+    slope_err = abs(m - 1)
+    intercept_err = abs(b) / np.std(tb_y)
+    scatter_err = np.std(tb_x - tb_y)
+
+
     if report_losses:
         loss_dict = {}
         loss_dict['log_Z_lb'] = log_Z_lb
         loss_dict['normed_tb'] =  normed_tb_residual.clip(max=normed_tb_residual.quantile(0.95)).mean() # exclude outliers
+        loss_dict['scatter_err'] = scatter_err
+        loss_dict['slope_err'] = slope_err
+        loss_dict['intercept_err'] = intercept_err
         if loss_coeffs.tb > 0:
             loss_dict['tb'] = tb_loss.mean().detach()
         if loss_coeffs.vg_lb > 0:
@@ -325,7 +347,7 @@ def get_gfn_backward_loss(loss_coeffs,
     else:
         loss_dict = None
 
-    return loss, loss_dict, normed_tb_residual.detach()
+    return loss, loss_dict, tb_loss.detach()
 
 
 def terminal_mle(

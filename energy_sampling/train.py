@@ -69,6 +69,12 @@ class Modeller:
         self.best_tb_norm = 10000
         self.fwd_Z_lb = 10000
         self.bwd_Z_lb = 10000
+        self.fwd_slope_err = 10000
+        self.bwd_slope_err = 10000
+        self.fwd_intercept_err = 10000
+        self.bwd_intercept_err = 10000
+        self.fwd_scatter_err = 10000
+        self.bwd_scatter_err = 10000
         self.last_fwd_it = 0
         self.last_bwd_it = 0
         self.step_ind = 0
@@ -213,6 +219,12 @@ class Modeller:
         metrics['Fwd to Bwd Ratio'] = self.args.fwd_to_bwd_ratio
         metrics['Rolling fTB Norm'] = self.fwd_tb_norm
         metrics['Rolling bTB Norm'] = self.bwd_tb_norm
+        metrics['fwd_scatter_err'] = self.fwd_scatter_err
+        metrics['fwd_intercept_err'] = self.fwd_intercept_err
+        metrics['fwd_slope_err'] = self.fwd_slope_err
+        metrics['bwd_scatter_err'] = self.bwd_scatter_err
+        metrics['bwd_intercept_err'] = self.bwd_intercept_err
+        metrics['bwd_slope_err'] = self.bwd_slope_err
         metrics['Best TB Norm'] = self.best_tb_norm
         metrics.update(self.log_elapsed_times())
         metrics['Forward Loss'] = fwd_loss
@@ -915,12 +927,13 @@ class Modeller:
                 self.phase2to3(ema_model, gfn_model, self.args.min_fwd_bwd_ratio, step_ind)
 
         if self.phase == 3:
-            skip_step = self.update_controller(step_ind, do_backward, skip_step, gfn_model.flow_model().item())
+            skip_step = self.update_controller(step_ind, do_backward, skip_step)
 
         if not skip_step:
             self.step_loss(do_backward, do_forward, gfn_model, loss, optimizers)
 
-        loss_dict_cpu = {step_type + "_loss/" + key: value.cpu().detach().numpy() for key, value in
+        loss_dict_cpu = {step_type + "_loss/" + key: (value.cpu().detach().numpy() if torch.is_tensor(value) else value)
+                         for key, value in
                          loss_dict.items()}
 
         # loss = None
@@ -948,6 +961,30 @@ class Modeller:
                 T,
                 sanitize=True,
             )
+            self.fwd_intercept_err = self._update_rolling(
+                self.fwd_intercept_err,
+                loss_dict['intercept_err'],
+                self.last_fwd_it,
+                step_ind,
+                T,
+                sanitize=True,
+            )
+            self.fwd_slope_err = self._update_rolling(
+                self.fwd_slope_err,
+                loss_dict['slope_err'],
+                self.last_fwd_it,
+                step_ind,
+                T,
+                sanitize=True,
+            )
+            self.fwd_scatter_err = self._update_rolling(
+                self.fwd_scatter_err,
+                loss_dict['scatter_err'],
+                self.last_fwd_it,
+                step_ind,
+                T,
+                sanitize=True,
+            )
             self.last_fwd_it = step_ind
 
         if do_backward:
@@ -962,6 +999,30 @@ class Modeller:
             self.bwd_Z_lb = self._update_rolling(
                 self.bwd_Z_lb,
                 loss_dict['log_Z_lb'],
+                self.last_bwd_it,
+                step_ind,
+                T,
+                sanitize=True,
+            )
+            self.bwd_intercept_err = self._update_rolling(
+                self.bwd_intercept_err,
+                loss_dict['intercept_err'],
+                self.last_bwd_it,
+                step_ind,
+                T,
+                sanitize=True,
+            )
+            self.bwd_slope_err = self._update_rolling(
+                self.bwd_slope_err,
+                loss_dict['slope_err'],
+                self.last_bwd_it,
+                step_ind,
+                T,
+                sanitize=True,
+            )
+            self.bwd_scatter_err = self._update_rolling(
+                self.bwd_scatter_err,
+                loss_dict['scatter_err'],
                 self.last_bwd_it,
                 step_ind,
                 T,
@@ -993,56 +1054,41 @@ class Modeller:
             value = value * beta + (1 - beta) * float(new_value)
         return value
 
-    def update_controller(self, it, do_backward, skip_step, learned_log_Z):
+    def update_controller(self, it, do_backward, skip_step, eps=1e-3):
         update_this_step = it % 20 == 0
-        static_ceil = self.args.thermalization_conv_eps * self.args.btb_threshold
-        static_floor = self.args.thermalization_conv_eps
-        static_target = (static_ceil + static_floor) / 2
+        slope_ceil = self.args.thermalization_slope_err
+        intercept_ceil = self.args.thermalization_intercept_err
 
-        if self.fwd_tb_norm > static_target:
-            bwd_target = static_target
-            bwd_ceil = static_ceil
-            bwd_floor = static_floor
-        else:
-            bwd_target = self.fwd_tb_norm
-            bwd_ceil = bwd_target * self.args.btb_threshold
-            bwd_floor = bwd_target * 0.75
+        slope_err = self.bwd_slope_err
+        intercept_err = self.bwd_intercept_err
 
-        metric = self.bwd_tb_norm
+        # forward errors (should be smoothed upstream)
+        fwd_slope_err = self.fwd_slope_err
+        fwd_intercept_err = self.fwd_intercept_err
 
-        # if the buffer samples are miscalibrated against log Z
-        # the normed TB values can be anomalous
-        # in other words, normed TB is only meaningful when the log Z mismatch is small
-        log_Z_mismatch = abs(learned_log_Z - self.bwd_Z_lb) / self.args.energy_static_temperature
+        # backward must be at least as good as forward
+        slope_ceil = min(slope_ceil, fwd_slope_err)
+        intercept_ceil = min(intercept_ceil, fwd_intercept_err)
 
-        z_cap = 5.0
-        z_thresh = 1.0
+        if update_this_step:
+            metric = max(
+                slope_err / max(slope_ceil, eps),
+                intercept_err / max(intercept_ceil, eps)
+            )
 
-        if log_Z_mismatch > z_thresh:
-            z_factor = min(z_cap, log_Z_mismatch / z_thresh)
-            metric += z_factor  # the standard metric can get anomalously small, additive noise may not work
-
-        coeff = 0.1
-        err = (metric - bwd_target) / bwd_target  # if metric is large
-
-        if metric > bwd_ceil:
-            if update_this_step:
-                self.args.fwd_to_bwd_ratio /= max(1.05, np.exp(coeff * err))
-                # print(f"Firing ceil {metric:.2f}:{bwd_target:.2f}")
-        elif metric < bwd_floor:
-            if update_this_step:
-                # this won't ameliorate below a good threshold - so just set it
-                self.args.fwd_to_bwd_ratio = max(0.5, self.args.fwd_to_bwd_ratio)
-                self.args.fwd_to_bwd_ratio *= 1.1
-                # print(f"Firing floor {metric:.2f}:{bwd_target:.2f}")
-            if do_backward:
-                skip_step = True  # we're already doing too good
-        elif update_this_step:
-            self.args.fwd_to_bwd_ratio *= np.exp(
-                -coeff * err)  # this is very negative -> pushes towards bwd, which is good
+            if metric > 1.2:
+                # buffer unsafe → backward dominance
+                self.args.fwd_to_bwd_ratio *= 0.5
+                if not do_backward:
+                    skip_step = True  # don't do backprop on forward if we're out of range
+            elif metric < 0.8:
+                # buffer safe → allow forward normalization
+                self.args.fwd_to_bwd_ratio *= 1.05
+            # else - safe region
 
         self.args.fwd_to_bwd_ratio = np.clip(
-            self.args.fwd_to_bwd_ratio, self.args.min_fwd_bwd_ratio, self.args.max_fwd_bwd_ratio)  # need even enough ratios to get reasonable updates to the metrics
+            self.args.fwd_to_bwd_ratio, self.args.min_fwd_bwd_ratio,
+            self.args.max_fwd_bwd_ratio)  # need even enough ratios to get reasonable updates to the metrics
 
         return skip_step
 
@@ -1364,7 +1410,7 @@ class Modeller:
         #         metrics.update(conditional_metrics)
 
     def grow_noised_buffer(self, buffer, energy_function, log_importance_weight, rewards, alpha: float = 1.0,
-                           eps: float = 1.0e-2):
+                           eps: float = 1.0e-2, rand_frac: float = 0.5):
         self.times['eval_bwd_noising_start'] = time()
 
         noised_losses = np.array(buffer.noised_losses)
@@ -1381,32 +1427,35 @@ class Modeller:
         if buffer.noised_buffer_length < (len(noised_losses) - num_to_replace):
             num_to_replace = max(1, num_to_replace // 2)
 
-        #print("Log noise range check", self.log_noise_range)
+        # print("Log noise range check", self.log_noise_range)
         if num_to_replace >= 4:
+            n_rands = max(1, int(num_to_replace * rand_frac))
+            rand_inds = np.random.choice(len(buffer), n_rands, replace=True)
             log_importance_weight_i = torch.nan_to_num(log_importance_weight,
-                                                       nan=-6, posinf=-6, neginf=-6)
-            log_importance_weight_i = log_importance_weight_i.clip(max=log_importance_weight_i.quantile(0.99))
+                                                       nan=-20, posinf=-20, neginf=-20)
+            log_importance_weight_i = (alpha * log_importance_weight_i).clip(
+                min=-20,
+                max=min(80, log_importance_weight_i.quantile(0.99)))
 
-            importance_weight = (alpha * log_importance_weight_i).exp() + 1e-6
+            importance_weight = (log_importance_weight_i).exp()
             good_reward = rewards > (rewards.quantile(0.75))  # limit importance sampling to high reward samples
-            importance_weight[~good_reward] = 1e-6
-            importance_weight = (1 - eps) * importance_weight
-            importance_weight += eps / len(importance_weight)
+            importance_weight[~good_reward] = 1e-20
             importance_weight = importance_weight.numpy().astype(np.float64)
             importance_weight /= importance_weight.sum()
 
             try:
-                sample_inds = np.random.choice(len(buffer), num_to_replace, p=importance_weight, replace=True)
+                sample_inds = np.random.choice(len(buffer), num_to_replace - n_rands, p=importance_weight, replace=True)
             except ValueError:
                 print("Value error in importance weights")
                 print(importance_weight)
                 print(log_importance_weight_i)
-                sample_inds = np.random.choice(len(buffer), num_to_replace, replace=True)
+                sample_inds = np.random.choice(len(buffer), num_to_replace - n_rands, replace=True)
 
+            sample_inds = np.concatenate([sample_inds, rand_inds])
             new_rewards, samples = noise_buffer(self.log_noise_range,
                                                 buffer,
                                                 energy_function,
-                                                sample_inds=sample_inds,)
+                                                sample_inds=sample_inds, )
 
             # good_inds = torch.argwhere(rewards >= buffer.reward_clip).flatten()
             buffer.purge_noised_by_index(np.argwhere(samples_to_be_replaced).flatten())
@@ -1555,6 +1604,12 @@ class Modeller:
             bwd_tb_norm=self.bwd_tb_norm,
             fwd_Z_lb=self.fwd_Z_lb,
             bwd_Z_lb=self.bwd_Z_lb,
+            fwd_intercept_err=self.fwd_intercept_err,
+            bwd_intercept_err=self.bwd_intercept_err,
+            fwd_slope_err=self.fwd_slope_err,
+            bwd_slope_err=self.bwd_slope_err,
+            fwd_scatter_err=self.fwd_scatter_err,
+            bwd_scatter_err=self.bwd_scatter_err,
             step_ind=self.step_ind,
             last_fwd_it=self.last_fwd_it,
             last_bwd_it=self.last_bwd_it,
@@ -1581,8 +1636,14 @@ class Modeller:
         self.step_ind = state['step_ind']
         self.fwd_tb_norm = state['fwd_tb_norm']
         self.bwd_tb_norm = state['bwd_tb_norm']
-        #self.fwd_Z_lb = state['fwd_Z_lb']
-        #self.bwd_Z_lb = state['bwd_Z_lb']
+        self.fwd_Z_lb = state['fwd_Z_lb']
+        self.bwd_Z_lb = state['bwd_Z_lb']
+        self.fwd_scatter_err = state['fwd_scatter_err']
+        self.fwd_intercept_err = state['fwd_intercept_err']
+        self.fwd_slope_err = state['fwd_slope_err']
+        self.bwd_scatter_err = state['bwd_scatter_err']
+        self.bwd_intercept_err = state['bwd_intercept_err']
+        self.bwd_slope_err = state['bwd_slope_err']
         self.last_fwd_it = state['last_fwd_it']
         self.last_bwd_it = state['last_bwd_it']
         self.fwd_loss_schedule = state['fwd_loss_schedule']
