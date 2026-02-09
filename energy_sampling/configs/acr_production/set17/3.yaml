@@ -86,7 +86,7 @@ lj_rescale:
 log_var_range: 6
 lr_anneal_time: 100000
 lr_back: 0.0005
-lr_flow: 0.1
+lr_flow: 1.0
 lr_policy: 5.0e-05
 lr_warmup_ratio: 25
 lr_warmup_time: 1000

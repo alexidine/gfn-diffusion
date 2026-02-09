@@ -202,12 +202,15 @@ class Modeller:
             if not self.lr_warmup_finished:
                 schedulers['policy_1'].step()
                 schedulers['flow'].step()
+                schedulers['policy_1b'].step()
 
                 if lr >= self.args.lr_policy:
                     self.lr_warmup_finished = True
 
             elif lr > self.args.min_lr:
                 schedulers['policy_2'].step()
+                schedulers['policy_2b'].step()
+
             return lr
         else:
             return False, None
@@ -381,24 +384,29 @@ class Modeller:
         """
         Initialize Optimizers
         """
-        policy_params = [{'params': gfn_model.t_model.parameters()},
-                         {'params': gfn_model.s_model.parameters()},
-                         {'params': gfn_model.forward_policy.parameters()},
-                         {'params': gfn_model.backward_policy.parameters()},
-                         ]
-        if self.args.temperature_conditioning:
-            policy_params += [{'params': gfn_model.conditions_embedding_model.parameters()}]
+
+        def get_policy_params(gfn_model):
+            return [{'params': gfn_model.t_model.parameters()},
+                    {'params': gfn_model.s_model.parameters()},
+                    {'params': gfn_model.forward_policy.parameters()},
+                    {'params': gfn_model.backward_policy.parameters()},
+                    ]
+
+        # if self.args.temperature_conditioning:
+        #     policy_params += [{'params': gfn_model.conditions_embedding_model.parameters()}]
 
         flow_params = gfn_model.flow_model.parameters()
 
         optimizers = {}
         if self.args.use_weight_decay:
-            optimizers['fwd'] = torch.optim.Adam(policy_params, init_fwd_lr, weight_decay=self.args.weight_decay)
-            optimizers['bwd'] = torch.optim.Adam(policy_params, init_bwd_lr, weight_decay=self.args.weight_decay)
+            optimizers['fwd'] = torch.optim.Adam(get_policy_params(gfn_model), init_fwd_lr,
+                                                 weight_decay=self.args.weight_decay)
+            optimizers['bwd'] = torch.optim.Adam(get_policy_params(gfn_model), init_bwd_lr,
+                                                 weight_decay=self.args.weight_decay)
             optimizers['flow'] = torch.optim.Adam(flow_params, init_flow_lr, weight_decay=self.args.weight_decay)
         else:
-            optimizers['fwd'] = torch.optim.Adam(policy_params, init_fwd_lr)
-            optimizers['bwd'] = torch.optim.Adam(policy_params, init_bwd_lr)
+            optimizers['fwd'] = torch.optim.Adam(get_policy_params(gfn_model), init_fwd_lr)
+            optimizers['bwd'] = torch.optim.Adam(get_policy_params(gfn_model), init_bwd_lr)
             optimizers['flow'] = torch.optim.Adam(flow_params, init_flow_lr)
 
         schedulers = {}
@@ -411,6 +419,10 @@ class Modeller:
                 optimizers['fwd'], lr_lambda=lambda epoch: lr_warmup_lambda)
             schedulers['policy_2'] = lr_scheduler.MultiplicativeLR(
                 optimizers['fwd'], lr_lambda=lambda epoch: lr_annealing_lambda)
+            schedulers['policy_1b'] = lr_scheduler.MultiplicativeLR(
+                optimizers['bwd'], lr_lambda=lambda epoch: lr_warmup_lambda)
+            schedulers['policy_2b'] = lr_scheduler.MultiplicativeLR(
+                optimizers['bwd'], lr_lambda=lambda epoch: lr_annealing_lambda)
 
             flow_annealing_lambda = get_annealing_factor(1, self.args.lr_warmup_ratio, self.args.lr_anneal_time, 10)
             schedulers['flow'] = lr_scheduler.MultiplicativeLR(
@@ -832,7 +844,7 @@ class Modeller:
                     opt.state = defaultdict(dict)  # wipe also the momentum buffers
                     for g in opt.param_groups:
                         if g['lr'] > self.args.min_lr:
-                            g['lr'] *= 0.75
+                            g['lr'] *= 0.85
 
                 self.lr_warmup_finished = True
 
@@ -1631,7 +1643,7 @@ class Modeller:
             print("No modeller state found; starting fresh.")
             return
 
-        state = torch.load(path, weights_only=False)
+        state = torch.load(path, weights_only=False)  # todo wrap all these up in a nice dict
 
         self.phase = state['phase']
         self.step_ind = state['step_ind']

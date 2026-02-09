@@ -2,7 +2,7 @@ run_name: 'mk_dev'
 tag: 'dev'
 seed: 12345
 device: 'cuda'
-lr_policy: 5.0e-4              # learning rate of the policy network
+lr_policy: 5.0e-5              # learning rate of the policy network
 min_lr: 1.0e-6                # ihn
 lr_flow: 0.1e-0                  # learning rate of the flow network
 lr_back: 5.0e-4                # learning rate of the backward pass
@@ -35,8 +35,8 @@ batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAS
 eval_batch_size: 1000        # batch size for evaluation (adaptive)
 eval_num_samples: 1000       # minimum number of samples for evaluation
 epochs: 1000000             # number of training epochs
-eval_period: 250              # how often to do evaluation & reporting
-figs_period: 250             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+eval_period: 25              # how often to do evaluation & reporting
+figs_period: 25             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 conditional_eval_period: 1000 # DEPRECATED # how often to do conditional evaluation with figs # must be multiple of eval period
 
 # GFlowNet settings

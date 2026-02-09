@@ -4,7 +4,7 @@ seed: 12345
 device: 'cuda'
 lr_policy: 5.0e-5              # learning rate of the policy network
 min_lr: 1.0e-6                # ihn
-lr_flow: 0.1e-0                  # learning rate of the flow network
+lr_flow: 1.0                  # learning rate of the flow network
 lr_back: 5.0e-4                # learning rate of the backward pass
 lr_warmup_ratio: 25           # how much smaller the initial (warmup) LR should be than the max policy value
 scheduler: True               # does LR warmup from lr/lr_warup_ratio -> lr -> min_lr over the warmup and annealing period
