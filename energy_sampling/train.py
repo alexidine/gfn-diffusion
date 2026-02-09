@@ -1244,6 +1244,7 @@ class Modeller:
                                   override_random_rotations=random_rotations)
         mol_batch.embedding = mol_batch.rotate_embedding(random_rotations)
 
+
     def add_dataset_to_buffer(self,
                               dataset_path, buffer,
                               filter_unbound=True,
