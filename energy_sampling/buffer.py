@@ -9,6 +9,16 @@ from mxtaltools.dataset_utils.utils import collate_data_list
 from utils import compute_sample_overlap, iter_forever, stdz
 
 
+def robust_range(x, k=8):
+    med = np.median(x)
+    mad = np.median(np.abs(x - med))
+    sigma_robust = 1.4826 * mad  # consistent with Gaussian σ
+
+    lower = med - k * sigma_robust
+    upper = med + k * sigma_robust
+    return lower, upper
+
+
 class CrystalReplayBuffer:
     def __init__(self, buffer_size,
                  device,
@@ -117,6 +127,15 @@ class CrystalReplayBuffer:
             del elem.fingerprint, elem.smiles, elem.mol_ind, elem.identifier, (
                 elem.aunit_batch), elem.skip_box_analysis, elem.cocrystal, elem.symmetry_operators
 
+        dataset_batch = collate_data_list(self.dataset, max_z_prime=self.max_z_prime)
+        x_tensor = dataset_batch.latent_params()
+        rewards = self.energy_function.prebuilt_sample_to_reward(
+            dataset_batch,
+            temperature=torch.ones(len(self)) * self.energy_function.temperature)
+
+        l, u = robust_range(x=rewards, k=4)
+        good_inds = rewards > l
+        self.dataset = [self.dataset[ind] for ind in torch.argwhere(good_inds).flatten()]
         dataset_batch = collate_data_list(self.dataset, max_z_prime=self.max_z_prime)
         x_tensor = dataset_batch.latent_params()
         rewards = self.energy_function.prebuilt_sample_to_reward(

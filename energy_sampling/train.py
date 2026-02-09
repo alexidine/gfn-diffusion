@@ -458,7 +458,7 @@ class Modeller:
                                                             f'_{self.args.energy_function}_kTrange_{self.args.kT_range}_relaxed.pt')
             if not os.path.exists(opt_buffer_path):
                 local_opt_sample, local_reward_max, reward_record, sample_record = self.relax_noise_buffer(
-                    buffer, energy_function, max_steps=50)
+                    buffer, energy_function, max_steps=500)
 
                 torch.save({'local_reward_max': local_reward_max,
                             'local_opt_sample': local_opt_sample,
@@ -1305,6 +1305,10 @@ class Modeller:
                                     batch_size=500)
 
         # always filter awful crystals
+        # re-filter this, as sometimes reparameterization happens inside the feat function
+        dataset = [elem for elem in dataset if elem.packing_coeff >= 0.55]
+        dataset = [elem for elem in dataset if elem.packing_coeff <= 0.95]
+
         dataset = [elem for elem in dataset if elem.reduction_en <= 1e-3]
 
         if filter_unbound:  # filter unbound states under this potential

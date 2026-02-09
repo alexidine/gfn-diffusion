@@ -274,6 +274,7 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
     cursor = 0
     pbar = tqdm(total=len(dataset), unit="reparameterized samples")
     feat_dataset = []
+    params = torch.zeros((len(dataset), dataset[0].full_cell_parameters().shape[-1]), dtype=torch.float32)
     while cursor < len(dataset):
         try:
             crystal_batch = collate_data_list(
@@ -281,6 +282,7 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
             crystal_batch = crystal_batch.to(device)
 
             crystal_batch.latent_to_cell_params(crystal_batch.latent_params())
+            params[cursor:min(len(dataset), cursor+batch_size)]=crystal_batch.full_cell_parameters()  # record canonicalized cell params
             crystal_batch.analyze(computes,
                                   cutoff=cutoff,
                                   supercell_size=10,
@@ -303,6 +305,9 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
                 sleep(0.1)
             else:
                 raise e
+
+    for ind, elem in enumerate(feat_dataset):
+        elem.set_cell_parameters(params[None, ind])
 
     return feat_dataset
 
