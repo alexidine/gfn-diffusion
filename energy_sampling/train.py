@@ -2,10 +2,13 @@ import gc
 import os
 from collections import defaultdict
 from copy import deepcopy
+
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 # os.environ["TORCH_USE_CUDA_DSA"] = "1"
 # os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
 #     "max_split_size_mb:128,garbage_collection_threshold:0.8,expandable_segments:True")
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 from time import time
 
 import numpy as np
@@ -35,6 +38,10 @@ from utils import get_train_args, get_gfn_init_state, set_seed, \
     featurize_dataset, embed_dataset, \
     update_ema
 
+def atomic_save(state_dict, path):
+    tmp_path = path + ".tmp"
+    torch.save(state_dict, tmp_path)
+    os.replace(tmp_path, path)
 
 class Modeller:
     def __init__(self):
@@ -747,7 +754,7 @@ class Modeller:
                         if loss_dict is not None:
                             bwd_loss_dict = loss_dict
 
-                    if (not oomed_out or (step_ind % 100 == 0)) and self.args.grow_batch_size:
+                    if (not oomed_out or (step_ind % 500 == 0)) and self.args.grow_batch_size:
                         (buffer, train_mol_loader, test_mol_loader,
                          train_iterator, test_iterator) = self.increment_batch_size(
                             buffer, train_mol_loader,
@@ -789,21 +796,24 @@ class Modeller:
 
                     if (self.fwd_tb_norm + self.bwd_tb_norm) < self.best_tb_norm:
                         self.best_tb_norm = self.fwd_tb_norm + self.bwd_tb_norm
-                        torch.save(gfn_model.state_dict(), f'checkpoints/best_{self.run_name}_model_train.pt')
-                        torch.save(ema_model.state_dict(), f'checkpoints/best_{self.run_name}_model_eval.pt')
+                        atomic_save(gfn_model.state_dict(), f'checkpoints/best_{self.run_name}_model_train.pt')
+                        atomic_save(ema_model.state_dict(), f'checkpoints/best_{self.run_name}_model_eval.pt')
 
                 if step_ind % 50 == 0:  # save running model
-                    torch.save(gfn_model.state_dict(), f'checkpoints/{self.run_name}_model_train.pt')
+                    atomic_save(gfn_model.state_dict(), f'checkpoints/{self.run_name}_model_train.pt')
                     torch.save(ema_model.state_dict(), f'checkpoints/{self.run_name}_model_eval.pt')
                     self.save_modeller_state()
 
-            torch.save(ema_model, f'checkpoints/{self.run_name}_model_final.pt')
+            atomic_save(ema_model, f'checkpoints/{self.run_name}_model_final.pt')
 
     def reload_running_model(self, ema_model, gfn_model):
-        gfn_model.load_state_dict(torch.load(f'checkpoints/{self.run_name}_model_train.pt'))
-        ema_model.load_state_dict(torch.load(f'checkpoints/{self.run_name}_model_eval.pt'))
-        gfn_model.train()
-        ema_model.eval()
+        try:
+            gfn_model.load_state_dict(torch.load(f'checkpoints/{self.run_name}_model_train.pt'))
+            ema_model.load_state_dict(torch.load(f'checkpoints/{self.run_name}_model_eval.pt'))
+            gfn_model.train()
+            ema_model.eval()
+        except Exception as e:
+            print(f"Checkpoint load failed ({e}); skipping reload.")
 
     def check_loss_explosion(self,
                              loss_record: list,
@@ -1054,7 +1064,7 @@ class Modeller:
             sanitize=False,
     ):
         if value == 10000:
-            value = float(new_value)
+            value = float(new_value.item() if torch.is_tensor(new_value) else new_value)
         else:
             dt = step_ind - last_it
             beta = np.exp(-dt / T)
@@ -1243,7 +1253,6 @@ class Modeller:
                                   correct_orientation=True,
                                   override_random_rotations=random_rotations)
         mol_batch.embedding = mol_batch.rotate_embedding(random_rotations)
-
 
     def add_dataset_to_buffer(self,
                               dataset_path, buffer,
@@ -1595,8 +1604,8 @@ class Modeller:
         #     ema_model.flow_model.weight.data = z
         #     gfn_model.flow_model.weight.data = z
         "save checkpoint"
-        torch.save(gfn_model.state_dict(), f'checkpoints/{self.run_name}_model_train_hit_prior.pt')
-        torch.save(ema_model.state_dict(), f'checkpoints/{self.run_name}_model_eval_hit_prior.pt')
+        atomic_save(gfn_model.state_dict(), f'checkpoints/{self.run_name}_model_train_hit_prior.pt')
+        atomic_save(ema_model.state_dict(), f'checkpoints/{self.run_name}_model_eval_hit_prior.pt')
         self.phase = 2
         self.grow_buffer = True
 
@@ -1604,8 +1613,8 @@ class Modeller:
         # print("Thermalization complete. Moving to forward training & refinement.")
         self.phase = 3
         "save checkpoint"
-        torch.save(gfn_model.state_dict(), f'checkpoints/{self.run_name}_model_train_thermalized.pt')
-        torch.save(ema_model.state_dict(), f'checkpoints/{self.run_name}_model_eval_thermalized.pt')
+        atomic_save(gfn_model.state_dict(), f'checkpoints/{self.run_name}_model_train_thermalized.pt')
+        atomic_save(ema_model.state_dict(), f'checkpoints/{self.run_name}_model_eval_thermalized.pt')
         "adjust loss and balancing coefficients"
         self.args.fwd_to_bwd_ratio = init_rat
         self.bwd_loss_schedule['bwd_tb_z'] = [(0, 1.0), (step_ind, 0)]
@@ -1641,7 +1650,7 @@ class Modeller:
             grow_buffer=self.grow_buffer,
             best_tb_norm=self.best_tb_norm,
         )
-        torch.save(state, f'checkpoints/{self.run_name}_modeller_state.pt')
+        atomic_save(state, f'checkpoints/{self.run_name}_modeller_state.pt')
 
     def load_modeller_state(self, path):
         if not os.path.exists(path):
