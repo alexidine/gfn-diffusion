@@ -41,7 +41,16 @@ from utils import get_train_args, get_gfn_init_state, set_seed, \
 def atomic_save(state_dict, path):
     tmp_path = path + ".tmp"
     torch.save(state_dict, tmp_path)
-    os.replace(tmp_path, path)
+    # force metadata + data flush
+    with open(tmp_path, "rb") as f:
+        os.fsync(f.fileno())
+
+    if not os.path.exists(tmp_path):
+        print("TMP MISSING:", tmp_path)
+        print("CWD:", os.getcwd())
+        print("DIR CONTENTS:", os.listdir(os.path.dirname(tmp_path)))
+    else:
+        os.replace(tmp_path, path)
 
 class Modeller:
     def __init__(self):
