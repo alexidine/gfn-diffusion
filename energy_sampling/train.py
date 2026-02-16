@@ -38,19 +38,15 @@ from utils import get_train_args, get_gfn_init_state, set_seed, \
     featurize_dataset, embed_dataset, \
     update_ema
 
-def atomic_save(state_dict, path):
-    tmp_path = path + ".tmp"
-    torch.save(state_dict, tmp_path)
-    # force metadata + data flush
-    with open(tmp_path, "rb") as f:
-        os.fsync(f.fileno())
 
-    if not os.path.exists(tmp_path):
-        print("TMP MISSING:", tmp_path)
-        print("CWD:", os.getcwd())
-        print("DIR CONTENTS:", os.listdir(os.path.dirname(tmp_path)))
-    else:
+def atomic_save(state_dict, path):
+    try:
+        tmp_path = path + ".tmp"
+        torch.save(state_dict, tmp_path)
         os.replace(tmp_path, path)
+    except Exception as e:
+        print("Save failed to", path)
+
 
 class Modeller:
     def __init__(self):
@@ -186,8 +182,8 @@ class Modeller:
                              train_iterator, test_iterator):
         # print("7")
         if self.batch_size < self.args.max_batch_size:
-            new_batch_size = min(self.args.max_batch_size, max(self.batch_size + 1,
-                                                               int(self.batch_size * batch_growth_increment)))
+            new_batch_size = min(self.args.max_batch_size,
+                                 max(self.batch_size + 1, int(self.batch_size * batch_growth_increment)))
             self.batch_size = new_batch_size  # gradually increment batch size
 
             if len(buffer) > 0:
@@ -472,9 +468,9 @@ class Modeller:
             print("Initializing noised buffer")
             opt_buffer_path = self.args.buffer_path.replace('.pt',
                                                             f'_{self.args.energy_function}_kTrange_{self.args.kT_range}_relaxed.pt')
-            if not os.path.exists(opt_buffer_path):
+            if True:  # os.path.exists(opt_buffer_path):
                 local_opt_sample, local_reward_max, reward_record, sample_record = self.relax_noise_buffer(
-                    buffer, energy_function, max_steps=500)
+                    buffer, energy_function, max_steps=10)
 
                 torch.save({'local_reward_max': local_reward_max,
                             'local_opt_sample': local_opt_sample,
@@ -1268,7 +1264,7 @@ class Modeller:
                               filter_unbound=True,
                               ):
         print("Loading prebuilt buffer")
-        dataset = torch.load(dataset_path, weights_only=False)
+        dataset = torch.load(dataset_path, weights_only=False)[:10000]
 
         max_z_prime = max([int(elem.z_prime) for elem in dataset])
         assert max_z_prime == max(self.args.z_primes), "Preloaded data max z prime must match model"
@@ -1474,7 +1470,7 @@ class Modeller:
                 max=min(80, log_importance_weight_i.quantile(0.99)))
 
             importance_weight = (log_importance_weight_i).exp()
-            good_reward = rewards > (rewards.quantile(0.75))  # limit importance sampling to high reward samples
+            good_reward = rewards > (rewards.quantile(0.25))  # limit importance sampling to high reward samples
             importance_weight[~good_reward] = 1e-20
             importance_weight = importance_weight.numpy().astype(np.float64)
             importance_weight /= importance_weight.sum()

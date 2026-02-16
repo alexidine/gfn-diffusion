@@ -124,6 +124,7 @@ def get_gfn_forward_loss(loss_coeffs,
                                            )
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
+    #del log_pfs, log_pbs
 
     losses = []
     """greedy loss"""
