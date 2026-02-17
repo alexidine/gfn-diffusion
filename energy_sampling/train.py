@@ -468,9 +468,9 @@ class Modeller:
             print("Initializing noised buffer")
             opt_buffer_path = self.args.buffer_path.replace('.pt',
                                                             f'_{self.args.energy_function}_kTrange_{self.args.kT_range}_relaxed.pt')
-            if True:  # os.path.exists(opt_buffer_path):
+            if not os.path.exists(opt_buffer_path):
                 local_opt_sample, local_reward_max, reward_record, sample_record = self.relax_noise_buffer(
-                    buffer, energy_function, max_steps=10)
+                    buffer, energy_function, max_steps=500)
 
                 torch.save({'local_reward_max': local_reward_max,
                             'local_opt_sample': local_opt_sample,
@@ -1264,7 +1264,7 @@ class Modeller:
                               filter_unbound=True,
                               ):
         print("Loading prebuilt buffer")
-        dataset = torch.load(dataset_path, weights_only=False)[:10000]
+        dataset = torch.load(dataset_path, weights_only=False)
 
         max_z_prime = max([int(elem.z_prime) for elem in dataset])
         assert max_z_prime == max(self.args.z_primes), "Preloaded data max z prime must match model"
