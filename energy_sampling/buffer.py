@@ -70,7 +70,8 @@ class CrystalReplayBuffer:
             if data_list is None and data_batch is not None:
                 data_list = data_batch.cpu().detach().batch_to_list()
 
-            self.staging_buffer.extend([elem for ind, elem in enumerate(data_list) if importance_weight[ind] > 0]) # keep any plausibly underweighted states
+            self.staging_buffer.extend([elem for ind, elem in enumerate(data_list) if
+                                        importance_weight[ind] > 0])  # keep any plausibly underweighted states
 
     @torch.no_grad()
     def add_init(self,
@@ -86,7 +87,7 @@ class CrystalReplayBuffer:
 
     def add_samples_to_dataset(self, data_list, skip_staging: bool = False):
         # batch samples
-        assert False, "This needs to be rewritten / checked for index issues" # todo
+        assert False, "This needs to be rewritten / checked for index issues"  # todo
         if not skip_staging:
             if len(self.staging_buffer) > 0:  # include staged samples
                 data_list.extend(self.staging_buffer)
@@ -110,7 +111,6 @@ class CrystalReplayBuffer:
 
         data_list = [data_batch[ind] for ind in good_inds]
         data_batch = collate_data_list(data_list, max_z_prime=self.max_z_prime)
-
 
         # add anything reasonable
         if len(good_inds) > 0:
@@ -240,8 +240,6 @@ class CrystalReplayBuffer:
             return 0
         else:
             return len(self.dataset)
-
-
 
     @torch.no_grad()
     def bottom_up_cluster(self, xx, e, d_cut, e_cut, max_new_samples: int):
@@ -466,7 +464,6 @@ class CrystalReplayBuffer:
 
         return rewards, samples, indices
 
-
     def purge_noised_buffer(self):
         steps_cutoff = self.noised_max_steps
         loss_cutoff = np.mean(self.noised_losses)
@@ -514,7 +511,6 @@ class CrystalReplayBuffer:
             self.dataset[buf_idx].latent_to_cell_params(x_new[None, :])
         for elem in self.dataset:
             del elem.asym_unit_dict
-
 
 
 def collate_fn(data_list):
