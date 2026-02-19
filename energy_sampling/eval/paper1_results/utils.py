@@ -37,6 +37,7 @@ from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 
 METRIC_REGISTRY = {}
 
+
 # 2. Define the decorator
 def register_metric(func):
     METRIC_REGISTRY[func.__name__] = func
@@ -651,11 +652,15 @@ def sample_from_gfn(num_samples, max_z_prime, device, n_steps, batch_size, gfn_m
     return samples.clip(max=1, min=-1), pfs, pbs
 
 
-def analyze_samples(x, mol_list, max_z_prime, device, batch_size, sg_ind, zp, do_uma: bool = False, predictor=None, overwrite_latents: bool = True):
+def analyze_samples(x, mol_list, max_z_prime, device, batch_size, sg_ind, zp, do_uma: bool = False, predictor=None,
+                    overwrite_latents: bool = True):
     num_samples = len(mol_list)
     samples = []
     cursor = 0
     already_oomed = False
+    computes = ['lj', 'qlj', 'elj', 'silu', 'rdf', 'reduction_en']
+    if do_uma:
+        computes.append(['uma'])
     with tqdm(total=num_samples) as pbar:
         with torch.no_grad():
             while cursor < num_samples:
@@ -668,20 +673,8 @@ def analyze_samples(x, mol_list, max_z_prime, device, batch_size, sg_ind, zp, do
                         batch.reset_sg_info(sg_ind)
                         batch.latent_to_cell_params(x[inds])
                     batch = batch.to(device)
-                    outs = batch.analyze(['lj', 'qlj', 'elj', 'silu', 'rdf'], cutoff=10, std_orientation=True)
-                    if do_uma:
-                        gas_en = batch.compute_lattice_gas_phase_uma(predictor,
-                                                                     std_orientation=True).cpu().detach() * 96.485
-                        cry_en = batch.compute_crystal_uma(predictor=predictor,
-                                                           std_orientation=True).cpu().detach() * 96.485
-                        batch.add_graph_attr(gas_en, 'uma_gas_pot')
-                        batch.add_graph_attr(cry_en, 'uma_pot')
-
-                    for key, value in outs.items():
-                        if key != 'rdf':
-                            batch.add_graph_attr(value, key)
-                        else:
-                            batch.add_graph_attr(value[0], key)
+                    outs = batch.analyze(computes, cutoff=10, std_orientation=True, assign_outputs=True,
+                                         predictor=predictor)
 
                     batch.to('cpu')
                     samples.extend(batch.batch_to_list())
@@ -1594,7 +1587,12 @@ def make_kinetic_graph(base_sample, sample_batch, n_points=10):
     go.Figure(go.Histogram(x=np.array(degree_gamma).flatten())).show()
 
 
-def kinetic_knn_interpolation(base_sample, n_points, lat_k, sample_batch, dmat, d_cut: float,
+def kinetic_knn_interpolation(base_sample,
+                              n_points,
+                              lat_k,
+                              sample_batch,
+                              dmat,
+                              d_cut: float,
                               valid_sources: Optional[torch.Tensor] = None):
     'make latent space knn'
     latents = sample_batch.latent_params()
@@ -1621,42 +1619,46 @@ def kinetic_knn_interpolation(base_sample, n_points, lat_k, sample_batch, dmat, 
     cursor = 0
     pbar = tqdm(total=num_trajs, unit="samples")
     while not finished:
-        try:
-            batch_inds = torch.arange(cursor, min(cursor + batch_size, num_trajs))
-            src_lat = latents[edge_index[0, batch_inds]]
-            tgt_lat = latents[edge_index[1, batch_inds]]
-            paths = torch.linspace(0, 1, n_points)
-            paths = src_lat[None] + paths[:, None, None] * (tgt_lat - src_lat)
-            # paths = paths[1:-1,...]  # exclude endpoints
-            paths = paths.clip(min=-1, max=1)
-            x = paths.reshape(-1, paths.shape[2]).to('cuda')
+        with torch.no_grad():
+            try:
+                batch_inds = torch.arange(cursor, min(cursor + batch_size, num_trajs))
+                src_lat = latents[edge_index[0, batch_inds]]
+                tgt_lat = latents[edge_index[1, batch_inds]]
+                paths = torch.linspace(0, 1, n_points)
+                paths = src_lat[None] + paths[:, None, None] * (tgt_lat - src_lat)
+                # paths = paths[1:-1,...]  # exclude endpoints
+                paths = paths.clip(min=-1, max=1)
+                x = paths.reshape(-1, paths.shape[2]).to('cuda')
 
-            sample = base_sample.clone()
-            traj_batch = collate_data_list([sample for _ in range(len(x))]).to('cuda')
-            traj_batch.latent_to_cell_params(x)
-            en = traj_batch.analyze(['elj'], cutoff=10)['elj'].cpu()
-            ens[batch_inds, :] = en.reshape(paths.shape[:2]).T
+                sample = base_sample.clone()
+                traj_batch = collate_data_list([sample for _ in range(len(x))]).to('cuda')
+                traj_batch.latent_to_cell_params(x)
+                out = traj_batch.analyze(['elj'], cutoff=10)
+                en = out['elj'].cpu().detach()
+                ens[batch_inds, :] = en.reshape(paths.shape[:2]).T
 
-            pbar.update(min(batch_size, num_trajs - cursor))  # safe final update
+                pbar.update(min(batch_size, num_trajs - cursor))  # safe final update
 
-            cursor += batch_size
-            if cursor >= num_trajs:
-                finished = True
-            else:
-                batch_size = int(batch_size * 1.01)  # keep pushing the batch size between sets
-                # print(f"Boosting batch size to {batch_size}")
-
-        except (RuntimeError, ValueError) as e:
-            if is_cuda_oom(e):
-                batch_size = max(int(batch_size * 0.9), 1)
-                print(f"OOM error: dropping batch size to {batch_size}")
-                gc.collect()
+                cursor += batch_size
+                del x, traj_batch, out, paths
                 torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-                sleep(0.1)
+                if cursor >= num_trajs:
+                    finished = True
+                else:
+                    batch_size = int(batch_size * 1.01)  # keep pushing the batch size between sets
+                    # print(f"Boosting batch size to {batch_size}")
 
-            else:
-                raise e
+            except (RuntimeError, ValueError) as e:
+                if is_cuda_oom(e):
+                    batch_size = max(int(batch_size * 0.9), 1)
+                    print(f"OOM error: dropping batch size to {batch_size}")
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    sleep(0.1)
+
+                else:
+                    raise e
 
     return edge_index, ens
 
@@ -1760,9 +1762,11 @@ def get_directed_kinetic_edges(sample_inds, samples, sample_batch, results_dir, 
 
     return edges_dir, ens_dir
 
+
 @register_metric
 def anisotropy(w, **kwargs):
     return np.log(w[-1] / w[0]) if len(w) >= 2 else 0
+
 
 @register_metric
 def d_eff(w, k, **kwargs):
@@ -1771,69 +1775,86 @@ def d_eff(w, k, **kwargs):
     p = w / w.sum()
     return np.exp(-np.sum(p * np.log(p))) / k
 
+
 @register_metric
 def gap(w, **kwargs):
     return w[-1] / w[-2] if len(w) >= 2 else 0
+
 
 @register_metric
 def softness(w, **kwargs):
     return np.log(w[-1]) if len(w) >= 2 else 0
 
+
 @register_metric
 def gauss_entropy(w, **kwargs):
     return 0.5 * np.sum(np.log(w)) if len(w) >= 2 else 0
+
 
 @register_metric
 def local_dim(w, k, **kwargs):
     return len(w) / k if len(w) >= 2 else 0
 
+
 @register_metric
 def grad_mag(w, log_rho_local, log_rho_i, **kwargs):
     return (log_rho_local - log_rho_i).mean() if len(w) >= 2 else 0
+
 
 @register_metric
 def basin_radius(w, dists, **kwargs):
     return np.amax(dists, axis=-1)
 
+
 @register_metric
 def basin_std(w, dists, **kwargs):
     return np.std(dists, axis=-1)
+
 
 @register_metric
 def n_neighbors(w, dists, **kwargs):
     return dists.shape[-1]
 
+
 @register_metric
 def basin_mean_en(w, sample_energy_local, **kwargs):
     return np.mean(sample_energy_local, axis=-1)
+
 
 @register_metric
 def basin_min_en(w, sample_energy, sample_energy_local, **kwargs):
     return min(np.amin(sample_energy_local, axis=-1), sample_energy)
 
+
 @register_metric
 def basin_std_en(w, sample_energy_local, **kwargs):
     return np.std(sample_energy_local, axis=-1)
+
 
 @register_metric
 def is_local_en_minimum(w, sample_energy, sample_energy_local, **kwargs):
     return np.all(sample_energy <= sample_energy_local)
 
+
 @register_metric
 def log_rho(w, log_rho_i, **kwargs):
     return log_rho_i
 
+
 @register_metric
-def basin_max_rho( w, log_rho_local, log_rho_i, **kwargs):
+def basin_max_rho(w, log_rho_local, log_rho_i, **kwargs):
     return max(np.amax(log_rho_local), log_rho_i)
+
 
 @register_metric
 def basin_mean_rho(w, log_rho_local, **kwargs):
     return np.mean(log_rho_local)
 
+
 @register_metric
 def is_local_rho_maximum(w, log_rho_local, log_rho_i, **kwargs):
     return np.all(log_rho_local <= log_rho_i)
+
 
 @register_metric
 def energy_smoothness(dists, sample_energy_local, **kwargs):
@@ -1841,6 +1862,7 @@ def energy_smoothness(dists, sample_energy_local, **kwargs):
     # We use the absolute difference to see if energy 'drifts' predictably
     corr = spearmanr(dists, sample_energy_local)
     return corr
+
 
 def local_analysis(k_values, sample_batch, sample_energy, dmat):
     N = sample_batch.num_graphs
@@ -1911,3 +1933,87 @@ def k_nn_analysis(D, METRICS, indices_to_compute, d2, dists, inds, k, sample_ene
             metrics[name][i] = func(**context)
 
     return metrics
+
+
+def load_experimental_structure(exp_sample_path, sg_ind, zp, device, max_z_prime, molecule, energy_function):
+    exp_crystals = torch.load(exp_sample_path, weights_only=False)
+    exp_crystals = [cry for cry in exp_crystals if (cry.sg_ind == sg_ind) and (cry.z_prime == zp)]
+    exp_crystals = [exp_crystals[0]]
+    ebatch = collate_data_list(exp_crystals, max_z_prime=zp)
+    pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
+    predictor = init_uma_crystal_predictor(pred_path, device=device)
+    esamples = analyze_samples(
+        None,  # ebatch.latent_params(),
+        [molecule] * ebatch.num_graphs,
+        max_z_prime,
+        device,
+        1000,
+        sg_ind,
+        zp,
+        do_uma=energy_function == 'uma',
+        predictor=predictor,
+        overwrite_latents=False,
+    )
+    return esamples
+
+
+import torch
+
+def local_metric_tensor_from_custom_distance(
+    x0,            # (D,)
+    X,             # (N, D)
+    custom_dists,  # (N,) distances from x0
+    k,
+    reg=1e-6
+):
+    """
+    Estimate local metric tensor G such that:
+        (x - x0)^T G (x - x0) ≈ d_custom(x, x0)^2
+
+    Returns:
+        G        : (D, D) symmetric positive-definite metric tensor
+        Sigma    : inverse metric (local covariance-like)
+        eigvals  : eigenvalues of Sigma
+        eigvecs  : eigenvectors of Sigma
+    """
+
+    D = x0.shape[0]
+
+    # Select k nearest neighbors
+    knn_inds = torch.topk(custom_dists, k+1, largest=False).indices[1:]
+    Xk = X[knn_inds]
+    dk = custom_dists[knn_inds]
+
+    # Center at x0
+    DX = Xk - x0  # (k, D)
+
+    # Build regression system
+    # Each equation: vec(outer(DX_i, DX_i)) · vec(G) = d_i^2
+    A = []
+    b = []
+
+    for i in range(k):
+        dx = DX[i]
+        outer = torch.ger(dx, dx)  # (D, D)
+        A.append(outer.reshape(-1))
+        b.append(dk[i] ** 2)
+
+    A = torch.stack(A)           # (k, D*D)
+    b = torch.stack(b)           # (k,)
+
+    # Solve least squares for vec(G)
+    G_vec, *_ = torch.linalg.lstsq(A, b.unsqueeze(-1))
+    G = G_vec.reshape(D, D)
+
+    # Symmetrize
+    G = 0.5 * (G + G.T)
+
+    # Regularize for stability
+    G = G + reg * torch.eye(D, device=G.device)
+
+    # Invert to get covariance-like object
+    Sigma = torch.linalg.inv(G)
+
+    eigvals, eigvecs = torch.linalg.eigh(Sigma)
+
+    return G, Sigma, eigvals, eigvecs

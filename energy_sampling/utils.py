@@ -282,7 +282,8 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
             crystal_batch = crystal_batch.to(device)
 
             crystal_batch.latent_to_cell_params(crystal_batch.latent_params())
-            params[cursor:min(len(dataset), cursor+batch_size)]=crystal_batch.full_cell_parameters()  # record canonicalized cell params
+            params[cursor:min(len(dataset),
+                              cursor + batch_size)] = crystal_batch.full_cell_parameters()  # record canonicalized cell params
             crystal_batch.analyze(computes,
                                   cutoff=cutoff,
                                   supercell_size=10,

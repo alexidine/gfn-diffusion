@@ -3,13 +3,12 @@ import sys
 
 import numpy as np
 import plotly
+import plotly.graph_objects as go
 import torch
-from scipy.spatial.distance import jensenshannon
+from plotly.subplots import make_subplots
 from tqdm import tqdm
 
-from energy_sampling.utils import uniform_discretizer, get_gfn_init_state, embed_dataset, logmeanexp, \
-    sample_crystal_prior
-from mxtaltools.analysis.crystal_rdf import crystal_rdf, compute_rdf_distance
+from energy_sampling.utils import uniform_discretizer, get_gfn_init_state, embed_dataset, logmeanexp
 from mxtaltools.dataset_utils.utils import collate_data_list
 
 
@@ -178,13 +177,14 @@ def sample_eval_fwd_trajs(initial_state, gfn, discretizer, energy_function, mol_
     log_Z_learned = log_flow.mean()
 
     outputs = (states, states[:, -1],
-            log_r, log_Z, log_Z_lb, log_Z_learned,
-            sample_batch, condition,
-            log_pfs, log_pbs, log_flow,
-            gauss_params, log_T_tensor)
+               log_r, log_Z, log_Z_lb, log_Z_learned,
+               sample_batch, condition,
+               log_pfs, log_pbs, log_flow,
+               gauss_params, log_T_tensor)
     outputs = (o if isinstance(o, dict) else o.cpu().detach()
                for o in outputs)
     return outputs
+
 
 # @torch.no_grad()
 # def mean_log_likelihood(terminal_state, gfn, log_reward_fn, num_evals=10):
@@ -299,3 +299,63 @@ def get_plotly_fig_size_mb(fig) -> float:
     # Convert Plotly figure to JSON string
     fig_json = json.dumps(fig, cls=plotly.utils.PlotlyJSONEncoder)
     return sys.getsizeof(fig_json) / (1024 * 1024)
+
+
+def big_staircse_comparison(dbatch, ebatch):
+    gen_samples = dbatch.latent_params()
+    elats = ebatch.latent_params()
+    if torch.is_tensor(gen_samples):
+        gen_samples = gen_samples.detach().cpu().numpy()
+    N, D = gen_samples.shape
+
+    # Create D×D subplots (upper triangle empty)
+    fig = make_subplots(
+        rows=D, cols=D,
+        horizontal_spacing=0.01, vertical_spacing=0.01,
+        shared_xaxes=True, shared_yaxes=True,
+    )
+
+    # Loop over lower triangle
+    for i in range(D):
+        for j in range(D):
+            if j >= i:
+                continue  # keep lower triangle only
+
+            x = gen_samples[:, j]
+            y = gen_samples[:, i]
+
+            trace = go.Histogram2dContour(
+                x=x, y=y,
+                ncontours=100,
+                colorscale='icefire',
+                showscale=False,
+                contours=dict(coloring='fill', showlines=False, start=0, end=None, size=None),
+                line=dict(smoothing=0.85, width=0),
+                nbinsx=100,
+                nbinsy=100,
+            )
+            fig.add_trace(trace, row=i + 1, col=j + 1)
+
+            trace = go.Scatter(x=elats[:, j], y=elats[:, i], mode='markers',
+                               marker_color='yellow', marker_line_width=4, opacity=0.5,
+                               marker_line_color='black', marker_size=14, showlegend=False)
+            fig.add_trace(trace, row=i + 1, col=j + 1)
+
+    fig.update_layout(
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        margin=dict(l=20, r=20, t=20, b=20),
+        # height=1000,
+        # width=1000,
+        showlegend=False,
+    )
+    fig.update_layout(
+        font=dict(family="Helvetica", size=12),
+        paper_bgcolor='white',
+        plot_bgcolor='white',
+        margin=dict(l=30, r=30, t=20, b=30),
+    )
+    fig.update_xaxes(showgrid=False, zeroline=False, ticks='outside', tickwidth=1)  # , range=[-1,1])
+    fig.update_yaxes(showgrid=False, zeroline=False, ticks='outside', tickwidth=1)  # , range=[-1,1])
+    fig.update_layout(height=2400, width=3000)
+    return fig

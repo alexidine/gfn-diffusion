@@ -2,37 +2,83 @@ import os
 
 import numpy as np
 import torch
+from ase.spacegroup import Spacegroup
 from plotly.subplots import make_subplots
 from umap import UMAP
 
 from energy_sampling.eval.paper1_results.figures import general_figs, parity_fig, sample_summary_table
 from energy_sampling.eval.paper1_results.utils import get_gfn_samples, \
-    generator_reward, get_rmsdmat, local_analysis, analyze_samples
+    generator_reward, get_rmsdmat, local_analysis, analyze_samples, load_experimental_structure
 from energy_sampling.models import GFN
-from energy_sampling.utils import uniform_discretizer
+from energy_sampling.utils import uniform_discretizer, thin_large_dmat_block, featurize_dataset
+from examples.crystal_search_reporting import batch_compack
+from mxtaltools.analysis.crystal_rdf import compute_rdf_distance
 from mxtaltools.analysis.crystal_rdf import compute_rdf_distmat
+from mxtaltools.common.ase_interface import ase_mol_from_crystaldata
 from mxtaltools.common.geometry_utils import crystal_parameter_distmat
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 
 torch.cuda.set_per_process_memory_fraction(0.9, device=0)
 
+
 def dataset_tb_analysis():
     molecule = torch.load(molecule_path, weights_only=False)
     dataset = torch.load(dataset_path, weights_only=False)
-    #dataset = [elem for elem in dataset if elem.packing_coeff >= 0.55]
-    #dataset = [elem for elem in dataset if elem.packing_coeff <= 0.95]
     max_z_prime = max([int(elem.max_z_prime) for elem in dataset])
-    data_batch = collate_data_list(dataset, max_z_prime=max_z_prime)
-    data_latents = data_batch.latent_params()
+
+    # canonicalize rotvecs (upper half-plane)
+    batch = collate_data_list(dataset, max_z_prime=max_z_prime)
+    batch.canonicalize_orientation()
+    orientations = batch.aunit_orientation
+    for ind, elem in enumerate(dataset):
+        elem.aunit_orientation = orientations[ind][None, ...]
+
+    # canonicalize aunit parameterizations
+    batch = collate_data_list(dataset, max_z_prime=max_z_prime)
+    batch.canonicalize_zp_aunits()
+    aunits = batch.aunit_centroid
+    for ind, elem in enumerate(dataset):
+        elem.aunit_centroid = aunits[ind][None, ...]
+
+    # filter invalid latents
+    batch = collate_data_list(dataset, max_z_prime=max_z_prime)
+    latents = batch.latent_params()
+    good_inds = torch.argwhere(torch.all(latents.abs() <= 1, dim=1))  # valid latent space
+    dataset = [dataset[ind] for ind in good_inds]
+
+    # filter reasonable densities
+    dataset = [elem for elem in dataset if elem.packing_coeff >= 0.55]
+    dataset = [elem for elem in dataset if elem.packing_coeff <= 0.95]
+
+    # filter near-identical samples
+    d_cut = 0.05  # should be relatively sparse or the local density bias becomes large
+    latents = collate_data_list(dataset).latent_params()
+    keep = thin_large_dmat_block(latents.to(device),
+                                 torch.tensor([elem.lj for elem in dataset], device=device),
+                                 d_cut).cpu()
+    keep_inds = torch.nonzero(keep, as_tuple=False).squeeze(-1)
+    dataset = [dataset[i] for i in keep_inds]
 
     gfn_model = GFN(**np.load(config_path, allow_pickle=True).item())
     gfn_model.load_state_dict(torch.load(model_path, weights_only=True))
     gfn_model.to(device)
     gfn_model.eval()
 
-    bsz = 10000
-    terminal_states = data_latents
+    pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
+    dataset = featurize_dataset(dataset,
+                                device,
+                                energy_function,
+                                uma_path=pred_path,
+                                batch_size=10000)
+
+    dataset = [elem for elem in dataset if elem.packing_coeff >= 0.55]
+    dataset = [elem for elem in dataset if elem.packing_coeff <= 0.95]
+    dataset = [elem for elem in dataset if elem.reduction_en <= 1e-3]
+
+    data_batch = collate_data_list(dataset)
+
+    terminal_states = data_batch.latent_params()
     discretizer = lambda bsz: uniform_discretizer(bsz, n_steps)
     condition = torch.zeros((len(terminal_states), 1), device=gfn_model.device)
 
@@ -43,29 +89,16 @@ def dataset_tb_analysis():
         )
         pbs = log_pbs.sum(-1).cpu().detach()
         pfs = log_pfs.sum(-1).cpu().detach()
+        del log_pbs, log_pfs
 
-    pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
-    predictor = init_uma_crystal_predictor(pred_path, device=device)
-    dataset = analyze_samples(
-        None, #data_batch.latent_params(),
-        dataset,
-        max_z_prime,
-        device,
-        1000,
-        sg_ind,
-        zp,
-        do_uma=True,
-        predictor=predictor,
-        overwrite_latents=False,
-    )
-
-    data_batch = collate_data_list(dataset)
-    lj_mean, lj_std, uma_mean, uma_std = [-20.6, 5.7, -3.4, 1.5]
-    atomwise_energy = data_batch.elj / (data_batch.num_atoms / data_batch.z_prime)
-    atomwise_fixed = (atomwise_energy - lj_mean) / lj_std * uma_std + uma_mean
-    denergy = atomwise_fixed * (data_batch.num_atoms / data_batch.z_prime)
-    denergy = data_batch.uma_pot / (data_batch.sym_mult * data_batch.z_prime) - data_batch.uma_gas_pot
-    data_batch.uma = denergy
+    if energy_function == 'uma':
+        denergy = data_batch.uma_pot / (data_batch.sym_mult * data_batch.z_prime) - data_batch.uma_gas_pot
+        data_batch.uma = denergy
+    else:
+        lj_mean, lj_std, uma_mean, uma_std = [-20.6, 5.7, -3.4, 1.5]
+        atomwise_energy = data_batch.elj / (data_batch.num_atoms / data_batch.z_prime)
+        atomwise_fixed = (atomwise_energy - lj_mean) / lj_std * uma_std + uma_mean
+        denergy = atomwise_fixed * (data_batch.num_atoms / data_batch.z_prime)
     rewards = generator_reward(
         data_batch,
         None,
@@ -99,8 +132,6 @@ def dataset_tb_analysis():
         go.Scatter(x=data_batch.packing_coeff, y=denergy, marker_color=np.log10(importance_weight), mode='markers',
                    opacity=0.5)).show()
 
-    from examples.crystal_search_reporting import batch_compack
-    from mxtaltools.analysis.crystal_rdf import compute_rdf_distance
     exp_crystals = torch.load(exp_sample_path, weights_only=False)
     exp_crystals = [cry for cry in exp_crystals if (cry.sg_ind == sg_ind) and (cry.z_prime == zp)]
     exp_crystals = [exp_crystals[0]]
@@ -120,13 +151,25 @@ def dataset_tb_analysis():
         overwrite_latents=False,
     )
 
-    # n_bins = esamples[0].rdf.shape[-1]
-    # dd = compute_rdf_distance(esamples[0].rdf, data_batch.rdf, torch.linspace(0, 6, n_bins))
-    # matches, rmsds = batch_compack([int(ind) for ind in torch.argsort(dd)[:10].flatten()],
-    #                                dataset,
-    #                                ebatch.mol2cluster(cutoff=6))
+    n_bins = esamples[0].rdf.shape[-1]
+    dd = compute_rdf_distance(esamples[0].rdf, data_batch.rdf, torch.linspace(0, 6, n_bins))
+    good_inds = torch.argsort(dd)[:10]
+    best_samples = [dataset[ind] for ind in good_inds]
+    best_batch = collate_data_list(best_samples)
+    clusters = best_batch.mol2cluster(cutoff=6)
+
+    for ii in range(len(best_samples)):
+        mol = ase_mol_from_crystaldata(clusters, index=ii, mode='unit cell')
+        mol.info['spacegroup'] = Spacegroup(sg_ind, setting=1)
+        mol.write(os.path.join(results_dir,
+                               rf'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\eval\paper1_results\{run_name}_{ii}.cif'))
+
+    matches, rmsds = batch_compack(best_samples,
+                                   dataset,
+                                   ebatch.mol2cluster(cutoff=6))
 
     aa = 1
+
 
 def sample_and_analyze():
     gfn_model = GFN(**np.load(config_path, allow_pickle=True).item())
@@ -238,11 +281,27 @@ def view_and_save_figs(fig_dict):
                 scale=2)
 
 
+def recompute_ens(sample_batch, energy_function):
+    if energy_function == 'uma':
+        sample_batch.uma = sample_batch.uma_pot / (
+                sample_batch.sym_mult * sample_batch.z_prime) - sample_batch.uma_gas_pot
+        sample_energy = sample_batch.uma
+    elif energy_function == 'elj':
+        lj_mean, lj_std, uma_mean, uma_std = [-20.6, 5.7, -3.4, 1.5]
+        atomwise_energy = sample_batch.elj / (sample_batch.num_atoms / sample_batch.z_prime)
+        atomwise_fixed = (atomwise_energy - lj_mean) / lj_std * uma_std + uma_mean
+        sample_energy = atomwise_fixed * (sample_batch.num_atoms / sample_batch.z_prime)
+    else:
+        sample_energy = sample_batch.lj
+
+    return sample_energy
+
+
 if __name__ == '__main__':
     # acridine lj config
     # run = 'xuldud_61_uma'
     # run = 'xuldud_61_elj'
-    #run = 'acridine_14_uma'
+    # run = 'acridine_14_uma'
     run = 'acridine_14_elj'
 
     if run == 'acridine_14_uma':
@@ -270,24 +329,22 @@ if __name__ == '__main__':
         run_name = 'acr_lj'
         device = 'cuda'
         num_samples = 10000
-        batch_size = 1000
+        batch_size = 10000
         energy_function = 'elj'  # 'elj', 'lj' 'uma
         n_steps = 100  # critical to get this right!
         sg_ind = 14
         zp = 1
-        kT = 5.0
+        kT = 2.5
         units = 'kJ/mol'
 
-        model_path = rf"D:\crystal_datasets\acridine\acr13_sg{sg_ind}_zp{zp}_31_model_eval.pt"
-        config_path = rf"D:\crystal_datasets\acridine\acr13_sg{sg_ind}_zp{zp}_31_model_config.npy"
+        model_path = rf"D:\crystal_datasets\acridine\acr17_sg{sg_ind}_zp{zp}_6_model_eval.pt"
+        config_path = rf"D:\crystal_datasets\acridine\acr17_sg{sg_ind}_zp{zp}_6_model_config.npy"
         molecule_path = r"D:\crystal_datasets\acridine\acridine_conformer.pt"
         dataset_path = rf"D:\crystal_datasets\acridine\acridine_sg{sg_ind}_zp{zp}.pt"
         results_dir = rf"D:\crystal_datasets\gfn_results"
         results_path = os.path.join(results_dir, rf"{run_name}_sg{sg_ind}_zp{zp}.pt")
 
         exp_sample_path = r"D:\crystal_datasets\acridine\prot_acrdin_crystals.pt"
-
-
 
     elif run == 'xuldud_61_lj':
         device = 'cuda'
@@ -344,56 +401,26 @@ if __name__ == '__main__':
     data_latents = data_batch.latent_params()
 
     #dataset_tb_analysis()
+
+
     "load presampled results"
     if reload_results and os.path.exists(results_path):
         results_dict = torch.load(results_path, weights_only=False)
     else:
         results_dict = sample_and_analyze()
+    samples = results_dict['samples']
 
     "analyze experimental samples"
     if exp_sample_path is not None:
-        exp_crystals = torch.load(exp_sample_path, weights_only=False)
-        exp_crystals = [cry for cry in exp_crystals if (cry.sg_ind == sg_ind) and (cry.z_prime == zp)]
-        exp_crystals = [exp_crystals[0]]
-        ebatch = collate_data_list(exp_crystals, max_z_prime = zp)
-        pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
-        predictor = init_uma_crystal_predictor(pred_path, device=device)
-        esamples = analyze_samples(
-            None, #ebatch.latent_params(),
-            [molecule] * ebatch.num_graphs,
-            max_z_prime,
-            device,
-            1000,
-            sg_ind,
-            zp,
-            do_uma=True,
-            predictor=predictor,
-            overwrite_latents=False,
-        )
-
-    "recompute energies"
-    samples = results_dict['samples']
-    if exp_sample_path is not None:
+        esamples = load_experimental_structure(exp_sample_path, sg_ind, zp, device, max_z_prime, molecule,
+                                               energy_function)
         samples = samples + esamples
-    sample_batch = collate_data_list(samples)  # results_dict['sample_batch']
-    if energy_function == 'uma':
-        sample_energy = sample_batch.uma_pot / (sample_batch.sym_mult * sample_batch.z_prime) - sample_batch.uma_gas_pot
-    elif energy_function == 'elj':
-        lj_mean, lj_std, uma_mean, uma_std = [-20.6, 5.7, -3.4, 1.5]
-        atomwise_energy = sample_batch.elj / (sample_batch.num_atoms / sample_batch.z_prime)
-        atomwise_fixed = (atomwise_energy - lj_mean) / lj_std * uma_std + uma_mean
-        sample_energy = atomwise_fixed * (sample_batch.num_atoms / sample_batch.z_prime)
-    else:
-        sample_energy = sample_batch.lj
 
-    # sample_energy = results_dict['sample_energy']
-    # sample_cp = results_dict['sample_cp']
+    sample_batch = collate_data_list(samples)
+    sample_energy = recompute_ens(sample_batch, energy_function)
+
     sample_cp = sample_batch.packing_coeff
-    sample_latents = sample_batch.latent_params()  # results_dict['sample_latents']  # these are sometimes wrong for xul
-    # collate_data_list([samples[ind] for ind in torch.argsort(rmsdmat[-1])[:10]]).mol2cluster().visualize(mode='unit cell')
-    if energy_function == 'uma':
-        sample_batch.uma = sample_batch.uma_pot / (
-                sample_batch.sym_mult * sample_batch.z_prime) - sample_batch.uma_gas_pot
+    sample_latents = sample_batch.latent_params()
 
     rewards = generator_reward(
         sample_batch,
@@ -408,7 +435,7 @@ if __name__ == '__main__':
     rmsdmat = get_rmsdmat(sample_batch.clone())
     lat_dmat = crystal_parameter_distmat(sample_latents).fill_diagonal_(0).detach()
     bin_edges = torch.linspace(0, 6, sample_batch.rdf.shape[-1], )
-    rdf_dmat = compute_rdf_distmat(sample_batch.rdf, bin_edges, chunk_size=10000)
+    # rdf_dmat = compute_rdf_distmat(sample_batch.rdf, bin_edges, chunk_size=10000)
     sample_metrics = local_analysis(k_vals, sample_batch, sample_energy, rmsdmat)
 
     """visual and local thermo analysis"""
@@ -418,7 +445,8 @@ if __name__ == '__main__':
     candidates_to_eval = np.argwhere(sample_metrics[200]['is_local_en_minimum']).flatten()
     candi2 = np.argwhere(sample_metrics[200]['is_local_rho_maximum']).flatten()
     candidates_to_eval = np.unique(
-        np.concatenate([candidates_to_eval, [sample_batch.num_graphs - (ebatch.num_graphs + 1)], candi2]))  # add experimental state
+        np.concatenate([candidates_to_eval, [sample_batch.num_graphs - (len(esamples) + 1)],
+                        candi2]))  # add experimental state
 
     candidates_to_eval = candidates_to_eval[np.argsort(sample_energy[candidates_to_eval])]
 
@@ -441,7 +469,6 @@ if __name__ == '__main__':
                                    ])
         fig_dict[f'table_{k}'] = fig
 
-
     for k in k_vals:
         thermos = np.stack(list(sample_metrics[k].values()))
         x = sample_embedding[:, 0]
@@ -458,7 +485,6 @@ if __name__ == '__main__':
                             row=ind // 4 + 1, col=ind % 4 + 1)
         fig_dict[f'umap_{k}'] = fig
 
-
     for fig in fig_dict.values():
         fig.show()
 
@@ -467,14 +493,12 @@ if __name__ == '__main__':
     # todo per-sample reporting
     # energy, local density, d_eff, log_cond, grad_mag, escape barrier (kinetic), over a few representative samples
 
-
     import plotly.graph_objects as go
 
     labels = list(sample_metrics[k].keys())
     corr = np.corrcoef(thermos / (1e-3 + np.std(thermos, axis=1)[:, None]))
     np.fill_diagonal(corr, 0)
     go.Figure(go.Heatmap(z=corr, x=labels, y=labels)).show()
-
 
     fig_dict = general_figs(fig_dict, sample_batch, sample_energy, data_batch, units=units)
 
