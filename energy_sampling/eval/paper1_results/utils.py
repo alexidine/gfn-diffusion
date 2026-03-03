@@ -2,7 +2,6 @@ import gc
 import os
 import re
 from collections import Counter
-from collections import deque
 from time import sleep
 from typing import Optional
 
@@ -23,11 +22,13 @@ from scipy.sparse.csgraph import connected_components
 from scipy.spatial.distance import pdist
 from sklearn.cluster import estimate_bandwidth, MeanShift
 from sklearn.neighbors import NearestNeighbors
+from torch_cluster import radius
 from torch_scatter import scatter
 from tqdm import tqdm
 from umap import UMAP
 
 from energy_sampling.energies.molecular_crystal import density_penalty
+from energy_sampling.models import GFN
 from energy_sampling.utils import uniform_discretizer, get_gfn_init_state, is_cuda_oom
 from mxtaltools.analysis.crystal_rdf import compute_rdf_distmat
 from mxtaltools.common.geometry_utils import crystal_parameter_distmat
@@ -678,7 +679,7 @@ def analyze_samples(x, mol_list, max_z_prime, device, batch_size, sg_ind, zp, do
 
                     batch.to('cpu')
                     samples.extend(batch.batch_to_list())
-                    del batch
+                    del batch, outs
                     cursor += batch_size
                     if (batch_size <= 10000) and (batch_size < num_samples) and not already_oomed:
                         batch_size += max(int(batch_size * 0.01), 1)
@@ -1593,7 +1594,8 @@ def kinetic_knn_interpolation(base_sample,
                               sample_batch,
                               dmat,
                               d_cut: float,
-                              valid_sources: Optional[torch.Tensor] = None):
+                              valid_sources: Optional[torch.Tensor] = None,
+                              ):
     'make latent space knn'
     latents = sample_batch.latent_params()
     lat_knn = dmat.topk(lat_k + 1, largest=False).indices[:, 1:]
@@ -1611,13 +1613,20 @@ def kinetic_knn_interpolation(base_sample,
         keep_edges = torch.isin(edge_index[0], valid_sources)
         edge_index = edge_index[:, keep_edges]
 
+    ens = lin_interpolate_edges(base_sample, edge_index, latents, n_points)
+
+    return edge_index, ens
+
+
+def lin_interpolate_edges(base_sample, edge_index, latents,
+                          n_points, batch_size: int = 500, return_bsz: Optional[bool] = False,
+                          show_tqdm: bool = False, grow_bsz: bool = True):
     'iterate over edges'
     num_trajs = edge_index.shape[1]
-    batch_size = 500
     ens = torch.zeros(num_trajs, n_points, device='cpu', dtype=torch.float32)
     finished = False
     cursor = 0
-    pbar = tqdm(total=num_trajs, unit="samples")
+    pbar = tqdm(total=num_trajs, unit="samples", disable=not show_tqdm)
     while not finished:
         with torch.no_grad():
             try:
@@ -1645,13 +1654,14 @@ def kinetic_knn_interpolation(base_sample,
                 if cursor >= num_trajs:
                     finished = True
                 else:
-                    batch_size = int(batch_size * 1.01)  # keep pushing the batch size between sets
-                    # print(f"Boosting batch size to {batch_size}")
+                    if grow_bsz:
+                        batch_size = int(batch_size * 1.01)  # keep pushing the batch size between sets
+                        # print(f"Boosting batch size to {batch_size}")
 
             except (RuntimeError, ValueError) as e:
                 if is_cuda_oom(e):
-                    batch_size = max(int(batch_size * 0.9), 1)
-                    print(f"OOM error: dropping batch size to {batch_size}")
+                    batch_size = max(int(batch_size * 0.7), 1)
+                    # print(f"OOM error: dropping batch size to {batch_size}")
                     gc.collect()
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
@@ -1659,50 +1669,52 @@ def kinetic_knn_interpolation(base_sample,
 
                 else:
                     raise e
+    if return_bsz:
+        return ens, batch_size
+    else:
+        return ens
 
-    return edge_index, ens
 
-
-def get_rmsdmat(sample_batch, radius: float = 5):
+def get_rmsdmat_sparse(sample_batch, d_cut: float = 5, probe_size: int = 100):
+    N = sample_batch.num_graphs
     sample_batch.pose_aunit(std_orientation=True)
     sample_batch.build_unit_cell()
-    upos = sample_batch.unit_cell_pos.reshape(sample_batch.num_graphs,
+    upos = sample_batch.unit_cell_pos.reshape(N,
                                               sample_batch.sym_mult[0] * sample_batch.num_atoms[0], 3)
-    #
-    # num_graphs = sample_batch.num_graphs
-    # device = upos.device
-    # if num_graphs > 10000:
-    #     all_indices = []
-    #     all_values = []
-    #     for ind in range(num_graphs):
-    #         # Calculate one full row of distances: (1, num_graphs)
-    #         # Using .norm and .mean to get the RMSD-like average distance
-    #         row_dist = (upos[ind, None, ...] - upos).norm(dim=-1).mean(-1)
-    #
-    #         # Apply hard cutoff
-    #         mask = row_dist <= radius
-    #
-    #         # Get the indices where the condition is true
-    #         # .nonzero() returns the indices of the neighbors
-    #         neighbor_idxs = torch.nonzero(mask).flatten()
-    #         vals = row_dist[neighbor_idxs]
-    #
-    #         # Store
-    #         rows = torch.full_all((len(vals),), ind, dtype=torch.long, device=upos.device)
-    #         all_indices.append(torch.stack([rows, neighbor_idxs], dim=0))
-    #         all_values.append(vals)
-    #
-    #     indices = torch.cat(all_indices, dim=1)
-    #     values = torch.cat(all_values)
-    #
-    #     # Create the sparse COO tensor
-    #     sparse_rmsd = torch.sparse_coo_tensor(
-    #         indices, values, size=(num_graphs, num_graphs)
-    #     ).coalesce()
-    # else:
 
-    rmsdmat = torch.zeros(sample_batch.num_graphs, sample_batch.num_graphs)
-    for ind in range(sample_batch.num_graphs):
+    # instantiate a dmat in the all-atom euclidean space, use to draw edges for radial graph
+    # Flatten atomic coordinates
+    X = upos.reshape(upos.shape[0], upos.shape[-1] * upos.shape[-2])  # [N, D]
+    test_dmat1 = torch.cdist(X[:probe_size], X[:probe_size])
+    test_dmat2 = (upos[:probe_size, None] - upos[None, :probe_size]).norm(dim=-1).mean(dim=-1)
+    mask = ~torch.eye(probe_size, dtype=bool, device=X.device)
+    ratio = (test_dmat1[mask] / test_dmat2[mask]).amax()
+
+    edge_index = radius(X, X,
+                        r=float(d_cut * ratio * 1.2),
+                        max_num_neighbors=10000)
+    # symmetrize
+    edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)
+    edge_index = torch.unique(edge_index, dim=1)
+
+    dists = (upos[edge_index[0]] - upos[edge_index[1]]).norm(dim=-1).mean(dim=-1)
+    dists[dists > d_cut] = torch.inf
+    rmsdmat = torch.sparse_coo_tensor(
+        indices=edge_index[:, torch.isfinite(dists)],
+        values=dists[torch.isfinite(dists)],
+        size=(N, N)
+    )
+
+    return rmsdmat
+
+
+def get_rmsdmat(sample_batch):
+    N = sample_batch.num_graphs
+    sample_batch.pose_aunit(std_orientation=True)
+    sample_batch.build_unit_cell()
+    upos = sample_batch.unit_cell_pos.reshape(N, sample_batch.sym_mult[0] * sample_batch.num_atoms[0], 3)
+    rmsdmat = torch.zeros(N, N)
+    for ind in range(N):
         rmsdmat[ind] = (upos[ind, None, ...] - upos).norm(dim=-1).mean(-1)
 
     return rmsdmat
@@ -1864,41 +1876,44 @@ def energy_smoothness(dists, sample_energy_local, **kwargs):
     return corr
 
 
-def local_analysis(k_values, sample_batch, sample_energy, dmat):
-    N = sample_batch.num_graphs
-    d2 = (dmat ** 2).numpy()
+def local_analysis(k_values, sample_batch, sample_energy, rmsdmat, lat_dmat):
+    n_samples = sample_batch.num_graphs
+    d2 = (rmsdmat ** 2).numpy()
     sample_latents = sample_batch.latent_params()
-    D = sample_latents.shape[1]
+    n_dims = sample_latents.shape[1]
 
     all_results = {}
     for k in k_values:
+        # use rmsdmat (physical) for k-NN
         nn = NearestNeighbors(
             n_neighbors=k,
             metric='precomputed'
         )
-        nn.fit(dmat)
-        dists, inds = nn.kneighbors(dmat)
+        nn.fit(rmsdmat)
+        dists, inds = nn.kneighbors(rmsdmat)
 
-        metrics = k_nn_analysis(D, METRIC_REGISTRY, np.arange(N), d2, dists, inds, k, sample_energy)
+        metrics = k_nn_analysis(n_dims, METRIC_REGISTRY,
+                                np.arange(n_samples),
+                                d2, dists, inds, k, sample_energy)
 
         all_results[k] = metrics
 
     return all_results
 
 
-def k_nn_analysis(D, METRICS, indices_to_compute, d2, dists, inds, k, sample_energy):
+def k_nn_analysis(n_dims, METRICS, indices_to_compute, d2, dists, inds, k, sample_energy):
     N = len(indices_to_compute)
     metrics = {key: np.zeros(N) for key in METRICS}
 
     if isinstance(k, list):
         rk = [max(d) for d in dists]
-        log_rho = np.log(k) - D * np.log(rk)
+        log_rho = np.log(k) - n_dims * np.log(rk)
 
     elif isinstance(k, int):
         rk = dists[:, k - 1]
         # Local density estimate
         H = np.eye(k) - np.ones((k, k)) / k
-        log_rho = np.log(k) - D * np.log(rk)
+        log_rho = np.log(k) - n_dims * np.log(rk)
 
     for i in indices_to_compute:
         if isinstance(k, list):
@@ -1959,12 +1974,13 @@ def load_experimental_structure(exp_sample_path, sg_ind, zp, device, max_z_prime
 
 import torch
 
+
 def local_metric_tensor_from_custom_distance(
-    x0,            # (D,)
-    X,             # (N, D)
-    custom_dists,  # (N,) distances from x0
-    k,
-    reg=1e-6
+        x0,  # (D,)
+        X,  # (N, D)
+        custom_dists,  # (N,) distances from x0
+        k,
+        reg=1e-6
 ):
     """
     Estimate local metric tensor G such that:
@@ -1980,7 +1996,7 @@ def local_metric_tensor_from_custom_distance(
     D = x0.shape[0]
 
     # Select k nearest neighbors
-    knn_inds = torch.topk(custom_dists, k+1, largest=False).indices[1:]
+    knn_inds = torch.topk(custom_dists, k + 1, largest=False).indices[1:]
     Xk = X[knn_inds]
     dk = custom_dists[knn_inds]
 
@@ -1998,8 +2014,8 @@ def local_metric_tensor_from_custom_distance(
         A.append(outer.reshape(-1))
         b.append(dk[i] ** 2)
 
-    A = torch.stack(A)           # (k, D*D)
-    b = torch.stack(b)           # (k,)
+    A = torch.stack(A)  # (k, D*D)
+    b = torch.stack(b)  # (k,)
 
     # Solve least squares for vec(G)
     G_vec, *_ = torch.linalg.lstsq(A, b.unsqueeze(-1))
@@ -2017,3 +2033,456 @@ def local_metric_tensor_from_custom_distance(
     eigvals, eigvecs = torch.linalg.eigh(Sigma)
 
     return G, Sigma, eigvals, eigvecs
+
+
+def new_local_analysis(
+        sample_batch,
+        sample_energy,
+        d_cut: float = 3.5,
+        basins: Optional[list] = None
+):
+    upos = init_ucell_pos(sample_batch)
+    cell_params = sample_batch.full_cell_parameters()
+
+    if basins is None:
+        n_samples = sample_batch.num_graphs
+    else:
+        n_samples = len(basins)
+
+    n_dims = cell_params.shape[1]
+
+    metrics = {'count': np.zeros(n_samples, dtype=np.int64),
+               'density': np.zeros(n_samples, dtype=np.float64),
+               'var': np.zeros((n_samples, n_dims)),
+               'is_local_en_minimum': np.zeros(n_samples, dtype=bool),
+               'is_local_density_maximum': np.zeros(n_samples, dtype=bool),
+               'local_dist_mean': np.zeros(n_samples, dtype=np.float64),
+               'local_dist_var': np.zeros(n_samples, dtype=np.float64),
+               'local_laplacian': np.zeros(n_samples, dtype=np.float64),
+               'local_en_mean': np.zeros(n_samples, dtype=np.float64),
+               'local_en_var': np.zeros(n_samples, dtype=np.float64),
+               'local_max_density': np.zeros(n_samples, dtype=np.float64),
+               'local_mean_density': np.zeros(n_samples, dtype=np.float64),
+               }
+
+    for ind in tqdm(range(n_samples)):
+        if basins is not None:
+            sample_ind =  sample_energy[basins[ind]].argmin()
+        else:
+            sample_ind = ind
+        dists = compute_ucell_rmsd(upos, sample_ind)
+
+        if basins is None:
+            neighbors = dists[dists < d_cut].argwhere().flatten()
+        else:
+            neighbors = basins[ind].argwhere().flatten()
+        local_dists = dists[neighbors]
+
+
+        metrics['count'][ind] = len(neighbors)
+        metrics['density'][ind] = torch.sum(torch.exp(-(local_dists ** 2) / (2 * d_cut ** 2))).item()
+
+        neighborhood = cell_params[neighbors]
+        metrics['var'][ind] = torch.var(neighborhood, dim=0).numpy()
+
+        metrics['is_local_en_minimum'][ind] = torch.all(sample_energy[sample_ind] <= sample_energy[neighbors]).item()
+
+        metrics['local_dist_mean'][ind] = torch.mean(local_dists).item()
+        metrics['local_dist_var'][ind] = torch.var(local_dists).item()
+
+        local_energy = sample_energy[neighbors]
+        metrics['local_en_mean'][ind] = torch.mean(local_energy).item()
+        metrics['local_en_var'][ind] = torch.var(local_energy).item()
+
+    if basins is None:
+        for ind in tqdm(range(n_samples)):
+            if basins is not None:
+                sample_ind =  sample_energy[basins[ind]].argmin()
+            else:
+                sample_ind = ind
+            dists = compute_ucell_rmsd(upos, sample_ind)
+
+            if basins is None:
+                neighbors = dists[dists < d_cut].argwhere().flatten()
+            else:
+                neighbors = basins[ind].argwhere().flatten()
+            local_dists = dists[neighbors]
+
+
+            if len(neighbors) > 0:
+                density = torch.as_tensor(metrics['density'])
+                local_density = density[neighbors]
+
+                metrics['local_max_density'][ind] = torch.max(local_density).item()
+                metrics['local_mean_density'][ind] = torch.mean(local_density).item()
+
+                metrics['is_local_density_maximum'][ind] = torch.all(density[ind] >= local_density).item()
+
+                # ---- Laplacian (graph-style discrete Laplacian of density) ----
+                metrics['local_laplacian'][ind] = torch.mean(local_density - density[ind]).item()
+            else:
+                metrics['local_max_density'][ind] = 0
+                metrics['local_mean_density'][ind] = 0
+
+                metrics['is_local_density_maximum'][ind] = False
+
+                # ---- Laplacian (graph-style discrete Laplacian of energy) ----
+                metrics['local_laplacian'][ind] = 0
+
+    return metrics
+
+
+def get_kinetic_basins(sample_energy, sample_batch, kT, dmat, samples, alpha, k_rad, n_points,
+                       max_step_length=5):
+    interp_bsz = 500
+    base_sample = samples[0]
+    latents = sample_batch.latent_params()
+
+    # N = sample_batch.num_graphs
+    # sample_batch.pose_aunit(std_orientation=True)
+    # sample_batch.build_unit_cell()
+    # upos = sample_batch.unit_cell_pos.reshape(N, sample_batch.sym_mult[0] * sample_batch.num_atoms[0], 3)
+    # rmsdmat = torch.zeros(sample_batch.num_graphs, sample_batch.num_graphs)
+    # for ind in range(sample_batch.num_graphs):
+    #     rmsdmat[ind] = (upos[ind, None, ...] - upos).norm(dim=-1).mean(-1)
+    #
+    # dmat = rmsdmat
+    k_rad = min(len(dmat) - 1, k_rad)
+    min_en = torch.amin(sample_energy)
+    global_en_cutoff = min_en + alpha * kT
+    esort_inds = torch.argsort(sample_energy, descending=False)
+    basins = []
+    claimed = torch.zeros(len(sample_energy), dtype=bool)
+    N = len(sample_energy)
+
+    pbar = tqdm(total=int(sum(sample_energy < global_en_cutoff)), unit="samples")
+    sample_ind = -1
+    while True:
+        sample_ind += 1
+        # identify next best local minimum
+        unclaimed_sorted = esort_inds[~claimed[esort_inds]]
+        if len(unclaimed_sorted) == 0:
+            break
+        local_min_ind = unclaimed_sorted[0]
+        local_min_en = sample_energy[local_min_ind]
+        if local_min_en > global_en_cutoff:
+            break
+
+        # iteratively, get all edges
+        local_en_cutoff = local_min_en + alpha * kT
+        energy_mask = torch.zeros(N, dtype=bool)
+        energy_mask[sample_energy > local_en_cutoff] = True
+        basin_mask = torch.zeros(N, dtype=torch.bool, device=sample_energy.device)
+
+        frontier = dmat[local_min_ind].topk(k_rad + 1, largest=False).indices[1:]
+
+        too_long_step = dmat[local_min_ind, frontier] > max_step_length
+        exclude = claimed[frontier] | energy_mask[frontier] | too_long_step
+        frontier = frontier[~exclude]
+
+        sources = local_min_ind.repeat(len(frontier))
+        basin_mask[local_min_ind] = True
+
+        while True:
+            edge_index = torch.stack([sources, frontier])
+            if edge_index.shape[1] == 0:
+                break
+
+            ens, interp_bsz = lin_interpolate_edges(base_sample, edge_index, latents, n_points,
+                                                    batch_size=interp_bsz,
+                                                    return_bsz=True)
+
+            valid_edge = ens.amax(1) < local_en_cutoff
+
+            sources = frontier[valid_edge]
+            basin_mask[sources] = True
+            frontier = dmat[sources].topk(k_rad + 1, largest=False).indices[:, 1:]
+            sources = sources.repeat(k_rad, 1).T
+
+            too_long_step = dmat[sources, frontier] > max_step_length
+            exclude = claimed[frontier] | basin_mask[frontier] | energy_mask[frontier] | too_long_step
+            sources = sources[~exclude]
+            frontier = frontier[~exclude]
+
+        claimed[basin_mask] = True
+        basins.append(basin_mask)
+        if sample_ind % 5 == 0:
+            pbar.update(5)
+
+    basins = torch.stack(basins)
+    return basins
+
+
+"""
+    umap_model = UMAP(n_components=2, n_neighbors=50, min_dist=0.01, metric='precomputed')
+    sample_embedding = umap_model.fit_transform(dmat.numpy().astype(np.float64))
+
+    import plotly.graph_objects as go
+    fig = go.Figure()
+    fig.add_scatter(x=sample_embedding[:, 0], y=sample_embedding[:, 1], marker_color='grey', mode='markers')
+    for c_ind in range(len(basins)):
+        basin = basins[c_ind]
+        if sum(basin) > 25:
+            fig.add_scatter(x=sample_embedding[basin, 0], y=sample_embedding[basin, 1], mode='markers')
+    fig.show()
+"""
+
+
+def get_kinetic_basins_sparse(sample_energy, sample_batch, kT, dmat, samples, alpha, k_rad, n_points,
+                              max_step_length=5):
+    dmat = dmat.coalesce()
+    row, col = dmat.indices()
+    vals = dmat.values()
+
+    interp_bsz = 500
+    base_sample = samples[0]
+    latents = sample_batch.latent_params()
+
+    k_rad = min(len(dmat) - 1, k_rad)
+    min_en = torch.amin(sample_energy)
+    global_en_cutoff = min_en + alpha * kT
+    esort_inds = torch.argsort(sample_energy, descending=False)
+    basins = []
+    claimed = torch.zeros(len(sample_energy), dtype=bool)
+    N = len(sample_energy)
+
+    pbar = tqdm(total=int(sum(sample_energy < global_en_cutoff)), unit="samples")
+    sample_ind = -1
+    while True:
+        sample_ind += 1
+        # identify next best local minimum
+        unclaimed_sorted = esort_inds[~claimed[esort_inds]]
+        if len(unclaimed_sorted) == 0:
+            break
+        local_min_ind = unclaimed_sorted[0]
+        local_min_en = sample_energy[local_min_ind]
+        if local_min_en > global_en_cutoff:
+            break
+
+        # iteratively, get all edges
+        local_en_cutoff = local_min_en + alpha * kT
+        energy_mask = torch.zeros(N, dtype=bool)
+        energy_mask[sample_energy > local_en_cutoff] = True
+        basin_mask = torch.zeros(N, dtype=torch.bool, device=sample_energy.device)
+
+        mask = torch.isin(row, local_min_ind)
+        src = row[mask]
+        nbrs = col[mask]
+        dists = vals[mask]
+
+        frontier = nbrs  # dmat[local_min_ind].topk(k_rad + 1, largest=False).indices[1:]
+
+        too_long_step = (dists > max_step_length) & (dists > 0)
+        exclude = claimed[frontier] | energy_mask[frontier] | too_long_step
+        frontier = frontier[~exclude]
+
+        sources = local_min_ind.repeat(len(frontier))
+        basin_mask[local_min_ind] = True
+
+        while True:
+            edge_index = torch.stack([sources, frontier])
+            if edge_index.shape[1] == 0:
+                break
+
+            ens, interp_bsz = lin_interpolate_edges(base_sample, edge_index, latents, n_points,
+                                                    batch_size=interp_bsz,
+                                                    return_bsz=True)
+
+            valid_edge = ens.amax(1) < local_en_cutoff
+
+            sources = frontier[valid_edge]
+            basin_mask[sources] = True
+
+            mask = torch.isin(row, sources)
+            src = row[mask]
+            nbrs = col[mask]
+            dists = vals[mask]
+
+            # frontier = dmat[sources].topk(k_rad + 1, largest=False).indices[:, 1:]
+            frontier = nbrs
+            sources = src
+
+            too_long_step = (dists > max_step_length) & (dists > 0)
+            exclude = claimed[frontier] | basin_mask[frontier] | energy_mask[frontier] | too_long_step
+            sources = sources[~exclude]
+            frontier = frontier[~exclude]
+
+        claimed[basin_mask] = True
+        basins.append(basin_mask)
+        if sample_ind % 5 == 0:
+            pbar.update(5)
+
+    basins = torch.stack(basins)
+    return basins
+
+
+def init_ucell_pos(sample_batch):
+    """
+    only works for batches of identical molecules & space groups
+    :param sample_batch:
+    :return:
+    """
+    N = sample_batch.num_graphs
+    sample_batch.pose_aunit(std_orientation=True)
+    sample_batch.build_unit_cell()
+    upos = sample_batch.unit_cell_pos.reshape(N,
+                                              sample_batch.sym_mult[0] * sample_batch.num_atoms[0], 3)
+
+    return upos
+
+
+def compute_ucell_rmsd(upos, ind):
+    return (upos[ind, None, ...] - upos).norm(dim=-1).mean(-1)
+
+
+def get_kinetic_basins_light(sample_energy,
+                             kT,
+                             samples,
+                             latents,
+                             upos,
+                             alpha,
+                             k_rad,
+                             n_points,
+                             max_step_length=5):
+    interp_bsz = 500
+    base_sample = samples[0]
+
+    k_rad = min(len(sample_energy) - 1, k_rad)
+    min_en = torch.amin(sample_energy)
+    global_en_cutoff = min_en + alpha * kT
+    esort_inds = torch.argsort(sample_energy, descending=False)
+    basins = []
+    claimed = torch.zeros(len(sample_energy), dtype=bool)
+    N = len(sample_energy)
+
+    sample_ind = -1
+
+    candidate_count = (~claimed * (sample_energy < global_en_cutoff)).sum().item()
+    pbar = tqdm(total=candidate_count, unit="samples")
+
+    while True:
+        sample_ind += 1
+        # identify next best local minimum
+        unclaimed_sorted = esort_inds[~claimed[esort_inds]]
+        if len(unclaimed_sorted) == 0:
+            break
+        local_min_ind = unclaimed_sorted[0]
+        local_min_en = sample_energy[local_min_ind]
+        if local_min_en > global_en_cutoff:
+            break
+
+        # iteratively, get all edges
+        local_en_cutoff = local_min_en + alpha * kT
+        energy_mask = torch.zeros(N, dtype=bool)
+        energy_mask[sample_energy > local_en_cutoff] = True
+        basin_mask = torch.zeros(N, dtype=torch.bool, device=sample_energy.device)
+
+        dists = compute_ucell_rmsd(upos, local_min_ind)
+        frontier = dists.topk(k_rad, largest=False).indices[1:]
+
+        invalid_step_size = (dists[frontier] > max_step_length) | (dists[frontier] == 0)
+        exclude = claimed[frontier] | energy_mask[frontier] | invalid_step_size
+        frontier = frontier[~exclude]
+
+        sources = local_min_ind.repeat(len(frontier))
+        basin_mask[local_min_ind] = True
+        s2 = 0
+        while True:
+            edge_index = torch.stack([sources, frontier])
+            if edge_index.shape[1] == 0:
+                break
+
+            ens, interp_bsz = lin_interpolate_edges(base_sample, edge_index, latents, n_points,
+                                                    batch_size=interp_bsz,
+                                                    return_bsz=True)
+
+            valid_edge = ens.amax(1) < local_en_cutoff
+
+            sources = frontier[valid_edge].unique()
+            basin_mask[sources] = True
+            if sum(valid_edge).item() == 0:
+                break
+
+            dists = torch.stack([compute_ucell_rmsd(upos, src) for src in sources])
+            nbrs = dists.topk(k_rad, largest=False)
+
+            # remove self index properly
+            nbr_inds = nbrs.indices[:, 1:]  # [num_sources, k_rad]
+            nbr_dists = nbrs.values[:, 1:]
+
+            expanded_sources = sources.repeat_interleave(k_rad - 1)
+            expanded_frontier = nbr_inds.reshape(-1)
+            expanded_dists = nbr_dists.reshape(-1)
+
+            invalid_step_size = (expanded_dists > max_step_length) | (expanded_dists == 0)
+            exclude = (claimed[expanded_frontier] |
+                       basin_mask[expanded_frontier] |
+                       energy_mask[expanded_frontier] |
+                       invalid_step_size)
+            sources = expanded_sources[~exclude]
+            frontier = expanded_frontier[~exclude]
+
+        claimed[basin_mask] = True
+        basins.append(basin_mask)
+
+        remaining = (~claimed * (sample_energy < global_en_cutoff)).sum().item()
+        pbar.n = pbar.total - remaining
+        pbar.refresh()
+
+        s2 += 1
+
+    basins = torch.stack(basins)
+    return basins
+
+
+def sample_and_analyze(config_path, model_path, device, num_samples, max_z_prime, n_steps, batch_size, sg_ind, zp,
+                       energy_function, molecule, save_results, results_path, overwrite_results):
+    gfn_model = GFN(**np.load(config_path, allow_pickle=True).item())
+    gfn_model.load_state_dict(torch.load(model_path, weights_only=True))
+    gfn_model.to(device)
+    gfn_model.eval()
+
+    "Sample from GFN & process samples"
+    sample_batch, sample_latents, sample_energy, sample_cp, samples, pfs, pbs = get_gfn_samples(
+        num_samples, max_z_prime,
+        device, n_steps, batch_size, gfn_model,
+        energy_function, molecule, sg_ind, zp
+    )
+
+    results_dict = {
+        'sample_batch': sample_batch,
+        'sample_latents': sample_latents,
+        'sample_energy': sample_energy,
+        'sample_cp': sample_cp,
+        'samples': samples,
+        'log_pfs': pfs,
+        'log_pbs': pbs,
+        'learned_log_z': gfn_model.flow_model().item(),
+    }
+
+    if save_results:
+        if os.path.exists(results_path):
+            if overwrite_results:
+                torch.save(results_dict, results_path)
+            else:
+                pass
+        else:
+            torch.save(results_dict, results_path)
+
+    return results_dict
+
+
+def recompute_ens(sample_batch, energy_function):
+    if energy_function == 'uma':
+        sample_batch.uma = sample_batch.uma_pot / (
+                sample_batch.sym_mult * sample_batch.z_prime) - sample_batch.uma_gas_pot
+        sample_energy = sample_batch.uma
+    elif energy_function == 'elj':
+        lj_mean, lj_std, uma_mean, uma_std = [-20.6, 5.7, -3.4, 1.5]
+        atomwise_energy = sample_batch.elj / (sample_batch.num_atoms / sample_batch.z_prime)
+        atomwise_fixed = (atomwise_energy - lj_mean) / lj_std * uma_std + uma_mean
+        sample_energy = atomwise_fixed * (sample_batch.num_atoms / sample_batch.z_prime)
+    else:
+        sample_energy = sample_batch.lj
+
+    return sample_energy

@@ -146,6 +146,7 @@ class CrystalReplayBuffer:
             # reward scaling is temperature dependent
             self.energy_function.set_reward_clip(rewards)
             self.reward_clip = -self.energy_function.energy_clip / self.energy_function.temperature
+            self.energy_clip = self.energy_function.energy_clip
             # recompute with new clip
             rewards = self.energy_function.prebuilt_sample_to_reward(
                 dataset_batch,

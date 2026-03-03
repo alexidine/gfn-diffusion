@@ -1152,28 +1152,6 @@ def to_loggable(v):
     return v
 
 
-def parity_plot(x_in, y_in):
-    if torch.is_tensor(x_in):
-        x = x_in.cpu().detach().numpy()
-    else:
-        x = x_in
-    if torch.is_tensor(y_in):
-        y = y_in.cpu().detach().numpy()
-    else:
-        y = y_in
-
-    r_value, _ = pearsonr(x, y)
-
-    fig = go.Figure()
-    fig.add_scatter(x=x,
-                    y=y,
-                    name=f'R = {r_value:.3f}',
-                    showlegend=True,
-                    marker_colorscale='Jet',
-                    mode='markers',
-                    )
-    return fig
-
 
 def pf_parity_plot(log_pfs, log_pbs, log_r, log_flow):
     x = log_pfs.sum(-1).cpu().detach().numpy()

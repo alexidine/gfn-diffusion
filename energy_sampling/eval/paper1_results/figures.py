@@ -1,16 +1,15 @@
 from typing import Optional
 
 import numpy as np
+import plotly.colors as pc
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import torch
+from plotly.subplots import make_subplots
 from scipy.stats import linregress
 from umap import UMAP
 
 from mxtaltools.common.utils import get_point_density_knn
 from mxtaltools.reporting.utils import lightweight_one_sided_violin
-import numpy as np
-import plotly.colors as pc
 
 
 def make_thermo_table(Zb, basin_probs, Fb, mean_E, min_ens, Sb, mean_rho, hard_assignment, num_clusters: int,
@@ -275,8 +274,7 @@ def cluster_comparison_fig(top_cluster_inds,
     return fig
 
 
-
-def dim_reduction_fig(sample_embedding,marker_color, colorscale: Optional[str] = 'viridis'):
+def dim_reduction_fig(sample_embedding, marker_color, colorscale: Optional[str] = 'viridis'):
     "Umap visualization"
     fig = go.Figure()
     fig.add_scatter(x=sample_embedding[:, 0],
@@ -314,7 +312,7 @@ def dim_reduction_fig(sample_embedding,marker_color, colorscale: Optional[str] =
 
 
 def dim_reduction_fig_old(dmat, hard_assignment, clusters_to_analyze, cluster_color, basin_inds,
-                      n_neighbors=10, min_dist=0.05):
+                          n_neighbors=10, min_dist=0.05):
     "Umap visualization"
     umap_model = UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=min_dist, metric='precomputed')
     sample_embedding = umap_model.fit_transform(dmat.numpy().astype(np.float64))
@@ -686,24 +684,21 @@ def parity_fig(
     return fig
 
 
-def sample_summary_table(sample_metrics, k_vals, sample_inds, good_keys: Optional[list] = None):
+def sample_summary_table(sample_metrics, sample_energy, sample_inds):
 
+    metric_keys = ['energy', 'count',
+                   'local_dist_mean', 'local_dist_var',
+                   'local_en_mean', 'local_en_var',
+                   #'local_mean_density', 'local_max_density',
+                   #'local_laplacian'
+                   ]
+    metric_keys = [key for key in metric_keys if key not in ['is_local_en_minimum', 'is_local_density_maximum', 'var']]
 
-    if good_keys is not None:
-        metric_keys = good_keys
-    else:
-        metric_keys = list(sample_metrics[k_vals[0]].keys())
-        metric_keys = [key for key in metric_keys if key not in ['is_local_en_minimum']]
-
+    sample_metrics['energy'] = sample_energy
     table_columns = {"Sample #": [ind for ind in range(len(sample_inds))]}
-    # table_columns.update({
-    #     f'{key}_k={k}': [f"{sample_metrics[k][key][ind]:.3g}" for ind in sample_inds]
-    #     for key in metric_keys for k in k_vals
-    # })
     table_columns.update({
-        f'{key}': [f"{sample_metrics[k][key][ind]:.3g}" for ind in sample_inds]
-        for key in metric_keys for k in k_vals
-    })
+        f'{key}': [f"{np.nan_to_num(sample_metrics[key][ind]):.3g}" for ind in sample_inds]
+        for key in metric_keys})
 
     def column_colors(
             vals,
@@ -738,6 +733,85 @@ def sample_summary_table(sample_metrics, k_vals, sample_inds, good_keys: Optiona
         column_colors(vals, "RdBu", alpha=0.35) for vals in table_columns.values()
     ]
     fill_colors[0] = ['rgb(255,255,255)' for _ in range(len(fill_colors[0]))]
+
+    fig = go.Figure(
+        data=[
+            go.Table(
+                header=dict(
+                    values=list(table_columns.keys()),
+                    align="center",
+                    font=dict(size=14, color="white"),
+                    fill_color="rgb(50,50,50)",
+                    height=32,
+                ),
+                cells=dict(
+                    values=list(table_columns.values()),
+                    align="center",
+                    font=dict(size=13),
+                    fill_color=fill_colors,  # "rgb(245,245,245)",
+                    height=28,
+                ),
+            )
+        ]
+    )
+
+    fig.update_layout(
+        font_size=16,
+        # title="Thermodynamic Properties of Dominant Basins",
+        margin=dict(l=10, r=10, t=40, b=10),
+    )
+
+    return fig
+
+
+def var_table(sample_metrics, sample_energy, sample_inds):
+    metric_keys = ['energy', 'count']
+    var = sample_metrics['var']
+    ndims = var.shape[-1]
+    for ind in range(ndims):
+        metric_keys.append(f'var{ind}')
+        sample_metrics.update({f'var{ind}': np.nan_to_num(var[:, ind]) / np.ptp(np.nan_to_num(var[:, ind]))})
+
+    sample_metrics['energy'] = sample_energy
+    table_columns = {"Sample #": [ind for ind in range(len(sample_inds))]}
+    table_columns.update({
+        f'{key}': [f"{np.nan_to_num(sample_metrics[key][ind]):.3g}" for ind in sample_inds]
+        for key in metric_keys})
+
+    def column_colors(
+            vals,
+            colorscale="RdBu",
+            vmin=None,
+            vmax=None,
+            alpha=0.35,
+    ):
+        vals = np.asarray(vals, dtype=float)
+        if vmin is None: vmin = vals.min()
+        if vmax is None: vmax = vals.max()
+
+        denom = max(vmax - vmin, 1e-12)
+        # Normalize values between 0 and 1
+        t = (vals - vmin) / denom
+
+        # Sample the actual colorscale at point t
+        actual_colors = pc.sample_colorscale(colorscale, t)
+
+        # Optional: Apply alpha blending if you want them washed out
+        return [
+            pc.find_intermediate_color(
+                "rgb(255,255,255)",
+                c,
+                alpha,  # Constant blend to make colors pastel
+                colortype="rgb",
+            )
+            for c in actual_colors
+        ]
+
+    fill_colors = [
+        column_colors(vals, "RdBu", alpha=0.35) for vals in table_columns.values()
+    ]
+    fill_colors[0] = ['rgb(255,255,255)' for _ in range(len(fill_colors[0]))]
+
     fig = go.Figure(
         data=[
             go.Table(

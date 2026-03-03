@@ -19,7 +19,7 @@ from tqdm import tqdm
 
 from mxtaltools.common.config_processing import dict2namespace
 from mxtaltools.common.geometry_utils import batch_molecule_principal_axes_torch
-from mxtaltools.common.geometry_utils import crystal_parameter_distance
+from mxtaltools.common.geometry_utils import compute_latent_distance
 from mxtaltools.common.utils import log_rescale_positive
 # from mxtaltools.crystal_building.crystal_latent_transforms import enforce_niggli_plane
 from mxtaltools.dataset_utils.data_classes import MolCrystalData
@@ -926,7 +926,7 @@ def thin_large_dmat(latents, d_cut, energy, B: int = 100000):
             found = False
             for j in range(0, len(kept_inds), B):
                 chunk = kept_inds[j:j + B]
-                if (crystal_parameter_distance(latents[None, i], latents[chunk]) < d_cut).any():
+                if (compute_latent_distance(latents[None, i], latents[chunk]) < d_cut).any():
                     found = True
                     break
             if found:
@@ -961,7 +961,7 @@ def thin_large_dmat_block(latents, energy, d_cut, target_entries=5_000_000):
             # Expansion logic for [n, k] distance function
             lat1_exp = block_latents[:, None, :].expand(b_size, num_kept, K).reshape(-1, K)
             lat2_exp = kept_latents[None, :, :].expand(b_size, num_kept, K).reshape(-1, K)
-            d_to_past = crystal_parameter_distance(lat1_exp, lat2_exp).view(b_size, num_kept)
+            d_to_past = compute_latent_distance(lat1_exp, lat2_exp).view(b_size, num_kept)
             is_far_from_past = ~(d_to_past < d_cut).any(dim=1)
         else:
             is_far_from_past = torch.ones(b_size, dtype=torch.bool, device=latents.device)
@@ -975,7 +975,7 @@ def thin_large_dmat_block(latents, energy, d_cut, target_entries=5_000_000):
             if newly_added_indices:
                 recent_tensor = latents[newly_added_indices]  # [R, K]
                 # Your distance function accepts [1, K] and [R, K]
-                if (crystal_parameter_distance(curr_latent, recent_tensor) < d_cut).any():
+                if (compute_latent_distance(curr_latent, recent_tensor) < d_cut).any():
                     continue
             kept_indices.append(curr_idx)
             keep_mask[curr_idx] = True

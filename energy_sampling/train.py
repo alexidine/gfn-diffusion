@@ -464,41 +464,44 @@ class Modeller:
             buffer = self.add_dataset_to_buffer(self.args.buffer_path,
                                                 buffer,
                                                 filter_unbound=True)
-
-            print("Initializing noised buffer")
-            opt_buffer_path = self.args.buffer_path.replace('.pt',
-                                                            f'_{self.args.energy_function}_kTrange_{self.args.kT_range}_relaxed.pt')
-            if not os.path.exists(opt_buffer_path):
-                local_opt_sample, local_reward_max, reward_record, sample_record = self.relax_noise_buffer(
-                    buffer, energy_function, max_steps=500)
-
-                torch.save({'local_reward_max': local_reward_max,
-                            'local_opt_sample': local_opt_sample,
-                            'reward_record': reward_record,
-                            'sample_record': sample_record,
-                            'log_noise_range': self.log_noise_range,
-                            'turnover_log_sigma': self.turnover_log_sigma, },
-                           opt_buffer_path)
-            else:
-                print("Reloading previously constructed MC opt buffer")
-                opt_buffer_dict = torch.load(opt_buffer_path, weights_only=False)
-                local_reward_max = opt_buffer_dict['local_reward_max']
-                local_opt_sample = opt_buffer_dict['local_opt_sample']
-                reward_record = opt_buffer_dict['reward_record']
-                sample_record = opt_buffer_dict['sample_record']
-                self.log_noise_range = opt_buffer_dict['log_noise_range']
-                self.turnover_log_sigma = opt_buffer_dict['turnover_log_sigma']
-
-                buffer.replace_initial_with_local_optima(local_opt_sample[:len(buffer.original_dataset_inds)],
-                                                         local_reward_max[
-                                                             :len(buffer.original_dataset_inds)])
-
-            good_inds = torch.argwhere(reward_record >= buffer.reward_clip).flatten()
-            buffer.add_to_noised(reward_record[good_inds],
-                                 sample_record[good_inds],
-                                 losses=torch.zeros_like(reward_record[good_inds]),
-                                 override_size=True,
-                                 )
+            rewards, samples, self.log_noise_range, self.turnover_log_sigma = calibrate_prior_noise(
+                buffer, energy_function, log_min=-3, log_max=-0.5, low_cut=0.05, high_cut=self.args.kT_range,
+            )
+            #
+            # print("Initializing noised buffer")
+            # opt_buffer_path = self.args.buffer_path.replace('.pt',
+            #                                                 f'_{self.args.energy_function}_kTrange_{self.args.kT_range}_relaxed.pt')
+            # if not os.path.exists(opt_buffer_path):
+            #     local_opt_sample, local_reward_max, reward_record, sample_record = self.relax_noise_buffer(
+            #         buffer, energy_function, max_steps=500)
+            #
+            #     torch.save({'local_reward_max': local_reward_max,
+            #                 'local_opt_sample': local_opt_sample,
+            #                 'reward_record': reward_record,
+            #                 'sample_record': sample_record,
+            #                 'log_noise_range': self.log_noise_range,
+            #                 'turnover_log_sigma': self.turnover_log_sigma, },
+            #                opt_buffer_path)
+            # else:
+            #     print("Reloading previously constructed MC opt buffer")
+            #     opt_buffer_dict = torch.load(opt_buffer_path, weights_only=False)
+            #     local_reward_max = opt_buffer_dict['local_reward_max']
+            #     local_opt_sample = opt_buffer_dict['local_opt_sample']
+            #     reward_record = opt_buffer_dict['reward_record']
+            #     sample_record = opt_buffer_dict['sample_record']
+            #     self.log_noise_range = opt_buffer_dict['log_noise_range']
+            #     self.turnover_log_sigma = opt_buffer_dict['turnover_log_sigma']
+            #
+            #     buffer.replace_initial_with_local_optima(local_opt_sample[:len(buffer.original_dataset_inds)],
+            #                                              local_reward_max[
+            #                                                  :len(buffer.original_dataset_inds)])
+            #
+            # good_inds = torch.argwhere(reward_record >= buffer.reward_clip).flatten()
+            # buffer.add_to_noised(reward_record[good_inds],
+            #                      sample_record[good_inds],
+            #                      losses=torch.zeros_like(reward_record[good_inds]),
+            #                      override_size=True,
+            #                      )
             print(len(buffer))
 
         if len(buffer) > 0 and (self.args.molecule != 'qm9'):
@@ -1264,8 +1267,29 @@ class Modeller:
                               filter_unbound=True,
                               ):
         print("Loading prebuilt buffer")
-        dataset = torch.load(dataset_path, weights_only=False)
+        prior_file = torch.load(dataset_path, weights_only=False)
+        dataset = prior_file['anchor_samples']
 
+        self.process_anchors(buffer, dataset, filter_unbound)
+
+        energy_record = prior_file['noisy_energies']
+        sample_record = prior_file['noisy_samples']
+
+        batch = collate_data_list([dataset[0].clone() for _ in range(len(energy_record))])  # this is slow
+        batch.set_cell_parameters(sample_record)
+        batch[self.args.energy_function] = energy_record
+        reward_record = buffer.energy_function.prebuilt_sample_to_reward(batch, self.args.energy_static_temperature)
+
+        good_inds = torch.argwhere(reward_record >= buffer.reward_clip).flatten()
+        buffer.add_to_noised(reward_record[good_inds],
+                             sample_record[good_inds],
+                             losses=torch.zeros_like(reward_record[good_inds]),
+                             override_size=True,
+                             )
+
+        return buffer
+
+    def process_anchors(self, buffer, dataset, filter_unbound):
         max_z_prime = max([int(elem.z_prime) for elem in dataset])
         assert max_z_prime == max(self.args.z_primes), "Preloaded data max z prime must match model"
 
@@ -1299,14 +1323,14 @@ class Modeller:
         dataset = [elem for elem in dataset if elem.packing_coeff >= 0.55]
         dataset = [elem for elem in dataset if elem.packing_coeff <= 0.95]
 
-        # filter near-identical samples
-        d_cut = 0.05  # should be relatively sparse or the local density bias becomes large
-        latents = collate_data_list(dataset).latent_params()
-        keep = thin_large_dmat_block(latents.to(self.args.device),
-                                     torch.tensor([elem.lj for elem in dataset], device=self.args.device),
-                                     d_cut).cpu()
-        keep_inds = torch.nonzero(keep, as_tuple=False).squeeze(-1)
-        dataset = [dataset[i] for i in keep_inds]
+        # # filter near-identical samples
+        # d_cut = 0.05  # should be relatively sparse or the local density bias becomes large
+        # latents = collate_data_list(dataset).latent_params()
+        # keep = thin_large_dmat_block(latents.to(self.args.device),
+        #                              torch.tensor([elem.lj for elem in dataset], device=self.args.device),
+        #                              d_cut).cpu()
+        # keep_inds = torch.nonzero(keep, as_tuple=False).squeeze(-1)
+        # dataset = [dataset[i] for i in keep_inds]
 
         # todo remove this eventually, hopefully
         if 'D:' in self.args.buffer_path and self.args.energy_function == 'uma':  # if we're on local, this takes forever
@@ -1318,27 +1342,20 @@ class Modeller:
                                     self.args.energy_function,
                                     uma_path=self.args.uma_path,
                                     batch_size=500)
-
         # always filter awful crystals
         # re-filter this, as sometimes reparameterization happens inside the feat function
         dataset = [elem for elem in dataset if elem.packing_coeff >= 0.55]
         dataset = [elem for elem in dataset if elem.packing_coeff <= 0.95]
-
         dataset = [elem for elem in dataset if elem.reduction_en <= 1e-3]
-
         if filter_unbound:  # filter unbound states under this potential
             dataset = [elem for elem in dataset if elem[self.args.energy_function] < 0]
-
         #  # todo rewrite
         # if self.args.molecule_conditioning:  # embed dataset
         #     assert max(self.args.z_primes) == 1, "Molecule conditioning not yet supported for Z'>1"
         #     print("Getting preloaded dataset molecule embeddings")
         #     dataset = embed_dataset(dataset, self.args.autoencoder_path, self.device, encoder=None)
-
         buffer.add_init(dataset)
-        print(f"Buffer loaded with {len(dataset)} samples")
-
-        return buffer
+        print(f"Buffer loaded with {len(dataset)} anchor states")
 
     def evaluation(self,
                    gfn_model,
