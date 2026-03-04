@@ -68,13 +68,13 @@ fwd_loss_coeffs:
   vg_lme: 0
 fwd_to_bwd_ratio: 1
 gfn_clip: 200.0
-gradient_norm_clip: 0.5
+gradient_norm_clip: 1.0
 grow_batch_size: true
 grow_buffer: false
 harmonics_dim: 64
-hidden_dim: 1536
+hidden_dim: 1024
 init_kld_threshold: 0.05
-joint_layers: 6
+joint_layers: 4
 kT_range: 6
 learn_pb: true
 learned_variance: true
@@ -112,7 +112,7 @@ rank_weight: 1.0
 reduction_coeff: 10.0
 repeats: 2
 reward_range: 100
-run_name: 0_large_hiclip_12
+run_name: 0_hiclip_12
 s_emb_dim: 1024
 sampling: buffer
 scheduler: true
@@ -122,7 +122,7 @@ space_groups:
 - 2
 t_emb_dim: 64
 t_scale: 0.05
-tag: 0_large_hiclip_12
+tag: 0_hiclip_12
 temp_annealing_max_steps: 2000
 temperature_conditioning: false
 temperature_scaling_factor: 0.01

@@ -112,6 +112,10 @@ if __name__ == "__main__":
             "log_var_range": 10,
         },
         {
+            "name": "drift_4",
+            "pb_drift_range": 0.4,
+        },
+        {
             "name": "var6_6",
             "log_var_range": 6,
             "pb_var_range": 6,
@@ -146,7 +150,7 @@ if __name__ == "__main__":
         },
         {
             "name": "hiclip",
-            "gradient_norm_clip": 0.5,
+            "gradient_norm_clip": 1.0,
         },
         {
             "name": "large_hiclip",
@@ -160,7 +164,7 @@ if __name__ == "__main__":
             "joint_layers": 6,
             "T": 25,
             "eval_T": 25,
-            "gradient_norm_clip": 0.5,
+            "gradient_norm_clip": 1.0,
         },
         {
             "name": "T_25_low_t",

@@ -72,9 +72,9 @@ gradient_norm_clip: 0.1
 grow_batch_size: true
 grow_buffer: false
 harmonics_dim: 64
-hidden_dim: 1536
+hidden_dim: 1024
 init_kld_threshold: 0.05
-joint_layers: 6
+joint_layers: 4
 kT_range: 6
 learn_pb: true
 learned_variance: true
@@ -83,7 +83,7 @@ lj_rescale:
 - 5.7
 - -3.4
 - 1.5
-log_var_range: 10
+log_var_range: 6
 lr_anneal_time: 100000
 lr_back: 0.0005
 lr_flow: 1.0
@@ -104,7 +104,7 @@ noised_buffer_length: 20000
 noised_max_steps: 10
 norm: layer
 pb_drift_range: 0.2
-pb_var_range: 6
+pb_var_range: 1
 phase_change_time: 1000
 prior_coverage_ratio: 0.05
 prioritized: null
@@ -112,7 +112,7 @@ rank_weight: 1.0
 reduction_coeff: 10.0
 repeats: 2
 reward_range: 100
-run_name: 0_large_T25_flex_10
+run_name: 0_T_25_low_t_15
 s_emb_dim: 1024
 sampling: buffer
 scheduler: true
@@ -121,8 +121,8 @@ sg_conditioning: false
 space_groups:
 - 2
 t_emb_dim: 64
-t_scale: 0.05
-tag: 0_large_T25_flex_10
+t_scale: 0.025
+tag: 0_T_25_low_t_15
 temp_annealing_max_steps: 2000
 temperature_conditioning: false
 temperature_scaling_factor: 0.01
