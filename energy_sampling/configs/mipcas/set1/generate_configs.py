@@ -196,7 +196,7 @@ if __name__ == "__main__":
         config['run_name'] = run_name
         config['tag'] = run_name
 
-        config_path = f"{ind}_{exp['name']}.yaml"
+        config_path = f"{ind}.yaml"
 
         with open(config_path, 'w') as f:
             yaml.dump(config, f, default_flow_style=False)
