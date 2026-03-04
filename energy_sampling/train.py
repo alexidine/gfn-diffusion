@@ -311,7 +311,7 @@ class Modeller:
             'zp_conditioning': self.args.zp_conditioning,
             'uma_path': self.args.uma_path,
             'reward_range': self.args.reward_range,
-            'lj_rescale': self.args.lj_rescale,
+            'lj_rescale': 1,
         }
         energy_function = MolecularCrystal(**energy_config)
         return energy_function
@@ -461,48 +461,12 @@ class Modeller:
         )
         if ((self.args.both_ways or self.args.bwd) and
                 self.args.buffer_path is not None):  # preload samples into the buffer
-            buffer = self.add_dataset_to_buffer(self.args.buffer_path,
+            prior_file = torch.load(self.args.buffer_path, weights_only=False)
+            energy_function.lj_rescale = prior_file['thermal_scaling_factor']
+            self.log_noise_range = prior_file['log_noise_range']
+            buffer = self.add_dataset_to_buffer(prior_file,
                                                 buffer,
                                                 filter_unbound=True)
-            rewards, samples, self.log_noise_range, self.turnover_log_sigma = calibrate_prior_noise(
-                buffer, energy_function, log_min=-3, log_max=-0.5, low_cut=0.05, high_cut=self.args.kT_range,
-            )
-            #
-            # print("Initializing noised buffer")
-            # opt_buffer_path = self.args.buffer_path.replace('.pt',
-            #                                                 f'_{self.args.energy_function}_kTrange_{self.args.kT_range}_relaxed.pt')
-            # if not os.path.exists(opt_buffer_path):
-            #     local_opt_sample, local_reward_max, reward_record, sample_record = self.relax_noise_buffer(
-            #         buffer, energy_function, max_steps=500)
-            #
-            #     torch.save({'local_reward_max': local_reward_max,
-            #                 'local_opt_sample': local_opt_sample,
-            #                 'reward_record': reward_record,
-            #                 'sample_record': sample_record,
-            #                 'log_noise_range': self.log_noise_range,
-            #                 'turnover_log_sigma': self.turnover_log_sigma, },
-            #                opt_buffer_path)
-            # else:
-            #     print("Reloading previously constructed MC opt buffer")
-            #     opt_buffer_dict = torch.load(opt_buffer_path, weights_only=False)
-            #     local_reward_max = opt_buffer_dict['local_reward_max']
-            #     local_opt_sample = opt_buffer_dict['local_opt_sample']
-            #     reward_record = opt_buffer_dict['reward_record']
-            #     sample_record = opt_buffer_dict['sample_record']
-            #     self.log_noise_range = opt_buffer_dict['log_noise_range']
-            #     self.turnover_log_sigma = opt_buffer_dict['turnover_log_sigma']
-            #
-            #     buffer.replace_initial_with_local_optima(local_opt_sample[:len(buffer.original_dataset_inds)],
-            #                                              local_reward_max[
-            #                                                  :len(buffer.original_dataset_inds)])
-            #
-            # good_inds = torch.argwhere(reward_record >= buffer.reward_clip).flatten()
-            # buffer.add_to_noised(reward_record[good_inds],
-            #                      sample_record[good_inds],
-            #                      losses=torch.zeros_like(reward_record[good_inds]),
-            #                      override_size=True,
-            #                      )
-            print(len(buffer))
 
         if len(buffer) > 0 and (self.args.molecule != 'qm9'):
             mols_list = self.init_mol_from_buffer(buffer, self.args.z_primes)
@@ -563,25 +527,6 @@ class Modeller:
 
         return buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator
 
-    def relax_noise_buffer(self, buffer, energy_function, max_steps: int = 500):
-        rewards, samples, self.log_noise_range, self.turnover_log_sigma = calibrate_prior_noise(
-            buffer, energy_function, log_min=-3, log_max=-0.5, low_cut=0.05, high_cut=self.args.kT_range,
-        )
-        local_opt_sample, local_reward_max, mc_samples, mc_rewards = mc_relax_buffer(
-            buffer, energy_function, self.turnover_log_sigma,
-            max_steps=max_steps, conv_eps=1e-2, conv_hist=10)
-        buffer.replace_initial_with_local_optima(local_opt_sample, local_reward_max)
-        num_noised_samples = max(self.args.noised_buffer_length - len(rewards) - len(mc_rewards), 10)
-        rewards2, samples2 = noise_buffer(self.log_noise_range,
-                                          buffer, energy_function,
-                                          sample_inds=np.random.randint(
-                                              len(buffer),
-                                              size=num_noised_samples,
-                                          ))
-        reward_record = torch.cat([rewards, rewards2, mc_rewards])
-        sample_record = torch.cat([samples, samples2, mc_samples], dim=0)
-        reward_record = torch.tensor(reward_record)
-        return local_opt_sample, local_reward_max, reward_record, sample_record
 
     def init_mol_from_buffer(self, buffer, z_primes):
         # this structure assumes the MXT format, where for Z'>1 samples, the mols are stacked in the same spot, in the same order
@@ -1263,27 +1208,23 @@ class Modeller:
         mol_batch.embedding = mol_batch.rotate_embedding(random_rotations)
 
     def add_dataset_to_buffer(self,
-                              dataset_path, buffer,
+                              prior_file, buffer,
                               filter_unbound=True,
                               ):
         print("Loading prebuilt buffer")
-        prior_file = torch.load(dataset_path, weights_only=False)
-        dataset = prior_file['anchor_samples']
+        prior_batch = prior_file['prior_batch']
+        dataset = prior_batch.batch_to_list()
 
         self.process_anchors(buffer, dataset, filter_unbound)
 
-        energy_record = prior_file['noisy_energies']
-        sample_record = prior_file['noisy_samples']
+        noised_batch = prior_file['noised_batch']
+        noised_latents = noised_batch.latent_params()
+        noised_rewards = buffer.energy_function.prebuilt_sample_to_reward(noised_batch, self.args.energy_static_temperature)
 
-        batch = collate_data_list([dataset[0].clone() for _ in range(len(energy_record))])  # this is slow
-        batch.set_cell_parameters(sample_record)
-        batch[self.args.energy_function] = energy_record
-        reward_record = buffer.energy_function.prebuilt_sample_to_reward(batch, self.args.energy_static_temperature)
-
-        good_inds = torch.argwhere(reward_record >= buffer.reward_clip).flatten()
-        buffer.add_to_noised(reward_record[good_inds],
-                             sample_record[good_inds],
-                             losses=torch.zeros_like(reward_record[good_inds]),
+        good_inds = torch.argwhere(noised_rewards >= buffer.reward_clip).flatten()
+        buffer.add_to_noised(noised_rewards[good_inds],
+                             noised_latents[good_inds],
+                             losses=torch.zeros_like(noised_rewards[good_inds]),
                              override_size=True,
                              )
 
@@ -1476,7 +1417,6 @@ class Modeller:
         if buffer.noised_buffer_length < (len(noised_losses) - num_to_replace):
             num_to_replace = max(1, num_to_replace // 2)
 
-        # print("Log noise range check", self.log_noise_range)
         if num_to_replace >= 4:
             n_rands = max(1, int(num_to_replace * rand_frac))
             rand_inds = np.random.choice(len(buffer), n_rands, replace=True)

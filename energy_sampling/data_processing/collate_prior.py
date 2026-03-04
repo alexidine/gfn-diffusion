@@ -1,207 +1,157 @@
-import torch
-import plotly.graph_objects as go
+import glob
+import os
+import re
 
-from mxtaltools.analysis.crystal_rdf import compute_rdf_distance
-from mxtaltools.common.geometry_utils import compute_latent_distance
+import torch
+from tqdm import tqdm
+
+from energy_sampling.data_processing.utils import calibrate_energy_function_vs_uma
+from energy_sampling.utils import new_calibrate_prior_noise
+from mxtaltools.common.adaptive_batching import adaptive_batched_analysis
+from mxtaltools.common.clustering import greedy_bottom_up_anchors
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 
-opt_outs = torch.load(r"D:\crystal_datasets\opt_outputs\mipcas_test.pt", weights_only=False)
-batch = collate_data_list(opt_outs)
-target = torch.load(r"D:\crystal_datasets\mipcas\MIPCAS_standardized.pt", weights_only=False)
+torch.cuda.set_per_process_memory_fraction(0.9, device=0)
 
-target_latent = target.latent_params()
-tbatch = collate_data_list([target])
-tlats = target_latent.repeat(1000, 1)
-tlats += torch.randn_like(tlats) * 0.01
+if __name__ == '__main__':
+    torch.set_grad_enabled(False)
+    search_output_dir = r"D:\crystal_datasets\mipcas"
+    run_name = 'mipcas_elj'
+    identifier = 'MIPCAS'
+    energy_function = 'elj'
+    target_path = r"D:\crystal_datasets\mipcas\MIPCAS_standardized.pt"
+    uma_model_path = r"D:\crystal_datasets\esen_s.pt"
+    device = 'cuda'
 
-#batch.plot_batch_cell_params(space='latent', ref_dist=tlats)
-#batch.plot_batch_staircase(space='latent', ref_dist=target_latent)
+    kT = 2.5
+    tot_noised_samples = 200000
 
-lat_dist = compute_latent_distance(target_latent, batch.latent_params())
+    predictor = init_uma_crystal_predictor(uma_model_path, device)
 
-pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
-predictor = init_uma_crystal_predictor(pred_path, device='cuda')
+    "get files"
+    os.chdir(search_output_dir)
+    pattern = os.path.join(search_output_dir, run_name + '_*.pt')
+    files = glob.glob(pattern)
 
-best_inds = lat_dist.topk(100, largest=False).indices
-best_batch = collate_data_list([opt_outs[ind] for ind in best_inds])
-best_batch = best_batch.cuda()
-tbatch = tbatch.cuda()
+    traj_records = [
+        f for f in files
+        if re.search(rf'{re.escape(run_name)}_\d{{1,2}}\.pt$', os.path.basename(f))
+    ]
 
-best_batch.analyze(['rdf','uma', 'elj'],assign_outputs=True, elementwise=False, atomwise=True, predictor=predictor)
-tbatch.analyze(['rdf','uma', 'elj'],assign_outputs=True, elementwise=False, atomwise=True, predictor=predictor)
-bins = torch.linspace(0, 10, 500)
+    target_mol = torch.load(target_path, weights_only=False)
+    target_mol.aunit_handedness = target_mol.aunit_handedness.abs()
+    zp = target_mol.z_prime
+    sg = target_mol.sg_ind
 
-rdf_dist = compute_rdf_distance(best_batch.rdf.cpu(), tbatch.rdf, bins)
-go.Figure(go.Scatter(x=lat_dist[best_inds], y=rdf_dist, mode='markers')).show()
+    "load samples"
+    opt_samples = []
+    for tpath in tqdm(traj_records):
+        opt_samples.extend(torch.load(tpath, weights_only=False))
 
+    # huge waste of space here for some reason
+    for sample in opt_samples:
+        if hasattr(sample, 'rdf'):
+            del sample.rdf
+        if hasattr(sample, 'fingerprint'):
+            del sample.fingerprint
 
-aa = 1
+    """ 
+    make sure we are latent-safe, and filter degenerate boxes (ultra-flat cells)
+    """
+    sample_batch = collate_data_list(opt_samples)
+    sample_batch.latent_to_cell_params(sample_batch.latent_params())  # get safely into the latent space
+    sample_batch = adaptive_batched_analysis(
+        sample_batch, analyses=[energy_function], state={},
+        initial_batch_size=10000, predictor=predictor,
+        device=device, show_tqdm=True
+    )
+    sample_batch = sample_batch.to('cpu')
+    opt_samples = sample_batch.batch_to_list()  # corrected latents
+    params = sample_batch.latent_params()
+    ens = sample_batch[energy_function]
+    cell_params = sample_batch.full_cell_parameters()
+    lengths = cell_params[:, :3]
+    angles = cell_params[:, 3:6]
+    volumes = sample_batch.cell_volume
+    angular_factor = volumes / lengths.prod(dim=-1)
+    good_inds = (angular_factor > 0.1).argwhere().flatten()  # nearly degenerate cells
+    good_samples = [opt_samples[ind] for ind in good_inds]
+    sample_batch = collate_data_list(good_samples)
+    sample_batch.latent_to_cell_params(sample_batch.latent_params())  # get safely into the latent space
 
+    """
+    Calibrate distance cutoff on this energy function
+    """
+    "very coarse diverse basin selection"
+    sample_batch = sample_batch.cuda()
+    params = sample_batch.latent_params()
+    ens = sample_batch[energy_function]
+    cps = sample_batch.packing_coeff
+    anchors = greedy_bottom_up_anchors(params, cps, ens, d_cut=0.1, e_cut=torch.quantile(ens, 0.1))
+    anchors = anchors[:1000]  # 1000 is plenty
 
-# from plotly.subplots import make_subplots
-#
-# import os
-# import glob
-# import torch
-# import plotly.graph_objects as go
-# from tqdm import tqdm
-#
-# from mxtaltools.dataset_utils.utils import collate_data_list
-#
-#
-# def norm_lj(lj_en):
-#     lj_mean, lj_std, uma_mean, uma_std = [-20.6, 5.7, -3.4, 1.5]
-#     atomwise_energy = lj_en / (target_mol.num_atoms / zp)
-#     atomwise_fixed = (atomwise_energy - lj_mean) / lj_std * uma_std + uma_mean
-#     return atomwise_fixed * (target_mol.num_atoms / zp)
-#
-#
-# def param_dist(ref, sample, scale):
-#     """
-#     :param ref: [n, k]
-#     :param sample: [k]
-#     :param scale: [k]
-#     :return: [k]
-#     """
-#     return (ref - sample[None, :]).abs() / scale
-#
-#
-# def thin_points_indices(traj, cutoff, eps=1e-8):
-#     """
-#     traj: [n, l, k]
-#
-#     Returns:
-#         indices: list of 1D LongTensors, one per trajectory
-#     """
-#
-#     L, N, D = traj.shape
-#
-#     # per-sample, per-dim scale
-#     ptp = traj.quantile(0.95, dim=0) - traj.quantile(0.05, dim=0)  # [N, D]
-#     scale = ptp.clamp_min(eps)  # avoid div-by-zero
-#
-#     all_indices = []
-#
-#     for i in range(N):
-#         t = traj[:, i]  # [L, D]
-#         s = scale[i]  # [D]
-#
-#         keep = [L - 1]
-#         last = t[L - 1]
-#
-#         for j in range(L - 2, -1, -1):
-#             diff = (t[j] - last).abs() / s  # per-dim scaled diff
-#
-#             # fire if any dimension exceeds cutoff
-#             if (diff >= cutoff).any():
-#                 keep.append(j)
-#                 last = t[j]
-#
-#         keep.reverse()  # restore chronological order
-#         all_indices.append(torch.tensor(keep, device=traj.device))
-#
-#     return all_indices
-#
-# if __name__ == '__main__':
-#
-#     search_output_dir = r'D:\crystal_datasets\opt_outputs'
-#     #run_name = 'acridine_14_local'
-#     #target_path = r"D:\crystal_datasets\acridine\ACRDIN04_standardized_match.pt"
-#     run_name = 'xul_61_local'
-#     target_path = r"D:\crystal_datasets\xuldud\xul_csd.pkl"
-#     identifier = 'XULDUD'
-#     energy_function = 'elj'
-#
-#     os.chdir(search_output_dir)
-#     traj_records = glob.glob(os.path.join(search_output_dir, run_name + '_traj*1.pt'))
-#
-#     target_mol = torch.load(target_path, weights_only=False)
-#     target_mol = [elem for elem in target_mol if elem.identifier == identifier][0]
-#     target_mol.aunit_handedness = target_mol.aunit_handedness.abs()
-#     zp = target_mol.z_prime
-#     sg = target_mol.sg_ind
-#
-#     all_params = []
-#     all_ens = []
-#     for tpath in tqdm(traj_records):
-#         record = torch.load(tpath, weights_only=False)
-#
-#         traj = record['params']
-#         indices = thin_points_indices(traj, 0.1)
-#
-#         ens = record[energy_function]
-#         thinned_traj = torch.cat([traj[idx, i] for i, idx in enumerate(indices)])
-#         thinned_energies = torch.cat([ens[idx, i] for i, idx in enumerate(indices)])
-#
-#         all_ens.extend(thinned_energies)
-#         all_params.append(thinned_traj)
-#
-#     all_params = torch.cat(all_params, dim=0)
-#     all_ens = torch.tensor(all_ens)
-#
-#
-#     anchors = []
-#
-#     eps = 1e-3
-#     scale = torch.quantile(all_params, 0.95, dim=0) - torch.quantile(all_params, 0.05, dim=0) + eps
-#     diff = param_dist(all_params, target_mol.zp1_cell_parameters().cpu()[0], scale)
-#
-#     d_cut = 0.05
-#
-#     e_cut = torch.quantile(all_ens[all_ens < 0], 0.25)
-#     en_sort_inds = torch.argsort(all_ens, descending=False).flatten()
-#     anchors.append(en_sort_inds[0])
-#     for ind in tqdm(en_sort_inds[1:]):
-#         if all_ens[ind] > e_cut:
-#             break
-#         sample = all_params[ind]
-#         ref = all_params[torch.tensor(anchors)]
-#         diff = param_dist(ref, sample, scale)
-#         keep = (diff > d_cut).any(dim=1).all()
-#
-#         if keep:
-#             anchors.append(ind)
-#
-#     print(f"anchors found: {len(anchors)}")
-#
-#     '''
-#     make nice dataset
-#     '''
-#
-#     batch = collate_data_list([target_mol.clone() for _ in range(len(anchors))], max_z_prime=zp)
-#     batch.set_cell_parameters(all_params[anchors])
-#     batch.analyze(['elj', 'reduction_en', 'lj'], cutoff=10, supercell_size=10, assign_outputs=True)
-#     samples = batch.batch_to_list()
-#
-#     prior_dataset = {
-#         'anchor_samples': samples,
-#         'noisy_samples': all_params,
-#         'noisy_energies': all_ens,
-#     }
-#     torch.save(prior_dataset, os.path.join(search_output_dir,target_mol.identifier + '_prior_dataset.pt'))
-#
-#     #
-#     # fig = make_subplots(rows=4, cols=3)
-#     # for ind in range(12):
-#     #     row = ind // 3 + 1
-#     #     col = ind % 3 + 1
-#     #     fig.add_histogram(x=all_params[:, ind], row=row, col=col, nbinsx=100, histnorm='probability density',
-#     #                       marker_color='red')
-#     #     fig.add_histogram(x=all_params[anchors, ind], row=row, col=col, nbinsx=100, histnorm='probability density',
-#     #                       marker_color='blue')
-#     # fig.show()
-#     #
-#     # batch = collate_data_list([target_mol.clone() for _ in range(len(anchors))], max_z_prime=zp)
-#     # batch.reset_sg_info(14)
-#     # batch.set_cell_parameters(all_params[anchors])
-#     # batch.clean_cell_parameters(
-#     #     mode='hard',
-#     #     canonicalize_orientations=True,
-#     # )
-#     #
-#     # en2 = batch.analyze(['elj', 'reduction_en'], cutoff=10, supercell_size=10)['elj']
-#     # en2 = norm_lj(en2)
-#     # go.Figure(go.Scatter(x=all_ens[anchors], y=en2, mode='markers')).show()
-#
-#     aa = 1
+    "run calibration"
+    coarse_batch = collate_data_list([good_samples[ind] for ind in anchors])
+    coarse_batch.latent_to_cell_params(coarse_batch.latent_params())
+
+    if energy_function == 'uma':
+        en_scaling_factor = 1
+    else:
+        en_scaling_factor = calibrate_energy_function_vs_uma(search_output_dir,
+                                                             energy_function,
+                                                             run_name,
+                                                             coarse_batch[energy_function]
+                                                             )
+
+    log_noise_range = new_calibrate_prior_noise(coarse_batch,
+                                                energy_function,
+                                                en_scaling_factor,
+                                                kT=kT,
+                                                low_cut=0.05,
+                                                high_cut=6.0)
+
+    """
+    do actual thinning with physics-informed cutoff
+    """
+    thermal_ens = ens * en_scaling_factor
+    d_cut = 10 ** log_noise_range[1]
+    anchors = greedy_bottom_up_anchors(params, cps, thermal_ens, d_cut=d_cut, e_cut=thermal_ens.amin() + 6 * kT)
+    thinned_batch = collate_data_list([good_samples[ind] for ind in anchors])
+
+    """
+    preliminary noising
+    """
+
+    noised_samples = []
+    state = {}
+    samples_per_anchor = (tot_noised_samples // thinned_batch.num_graphs) + 1
+    for _ in tqdm(range(samples_per_anchor)):
+        batch = thinned_batch.clone()
+        batch.log_noise_latent_parameters(log_noise_range[0], log_noise_range[1])
+        batch, state = adaptive_batched_analysis(
+            batch, analyses=[energy_function, 'reduction_en'],
+            state=state,
+            initial_batch_size=10000,
+            predictor=predictor,
+            return_state=True,
+            device=device,
+            show_tqdm=False,
+        )
+        batch = batch.to('cpu')
+        noised_samples = batch.batch_to_list()
+        valid = torch.argwhere(
+            (batch.reduction_en < 1e-3) & (batch.packing_coeff > 0.55) & (batch.packing_coeff < 0.95)).flatten()
+        noised_samples.extend([noised_samples[ind] for ind in valid])
+        del batch
+
+    dataset_dict = {
+        'thermal_scaling_factor': en_scaling_factor,
+        'log_noise_range': log_noise_range,
+        'prior_batch': thinned_batch.cpu(),
+        'noised_batch': collate_data_list(noised_samples),
+    }
+    dataset_filename = run_name + '_prior_dataset.pt'
+    torch.save(dataset_dict, dataset_filename)
+
+    aa = 1  # thin out reduction_en and save reward stuff here as well - maybe save one big batch?

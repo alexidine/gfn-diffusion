@@ -11,7 +11,7 @@ both_ways: true
 bounding_coeff: 10.0
 btb_threshold: 1.5
 buffer_dist_cutoff: 0.5
-buffer_path: /scratch/mk8347/data/crystal_datasets/mipcas/mipcas_sg2_zp1_elj.pt
+buffer_path: /scratch/mk8347/data/crystal_datasets/mipcas/mipcas_elj_prior_dataset.pt
 buffer_size: 100000
 bwd: false
 bwd_loss_coeffs:
@@ -87,7 +87,7 @@ log_var_range: 10
 lr_anneal_time: 100000
 lr_back: 0.0005
 lr_flow: 1.0
-lr_policy: 5.0e-05
+lr_policy: 0.0005
 lr_warmup_ratio: 25
 lr_warmup_time: 1000
 max_batch_size: 3000

@@ -17,11 +17,10 @@ from scipy.stats import median_abs_deviation
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
+from mxtaltools.common.adaptive_batching import adaptive_batched_analysis
 from mxtaltools.common.config_processing import dict2namespace
-from mxtaltools.common.geometry_utils import batch_molecule_principal_axes_torch
+from mxtaltools.common.geometry_utils import batch_molecule_principal_axes_torch, simple_latent_distance
 from mxtaltools.common.geometry_utils import compute_latent_distance
-from mxtaltools.common.utils import log_rescale_positive
-# from mxtaltools.crystal_building.crystal_latent_transforms import enforce_niggli_plane
 from mxtaltools.dataset_utils.data_classes import MolCrystalData
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
@@ -698,7 +697,7 @@ def calibrate_prior_noise(buffer, energy_function,
     rand_magnitude = torch.logspace(log_min, log_max, len(samples))
 
     noised_samples = (samples + rand_dir * rand_magnitude[:, None]).clip(min=-1, max=1)
-    new_samples = noised_samples
+    new_samples = noised_samples  # todo confirm right latents / dists
 
     # have to update the rewards if we are using any loss functions that require them
     log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(
@@ -775,6 +774,44 @@ def calibrate_prior_noise(buffer, energy_function,
     del crystal_batch
 
     return new_rewards.detach().clone(), new_samples.detach().clone(), [x_min, x_max], turnover_log_sigma
+
+
+@torch.no_grad()
+def new_calibrate_prior_noise(sample_batch, energy_function,
+                              en_scaling_factor, kT,
+                              log_min=-3, log_max=-0.5,
+                              low_cut=0.05, high_cut=10.0,  # in units of kT
+                              predictor = None,
+                              device='cuda'
+                              ):
+
+    energy = sample_batch[energy_function]
+
+    latents = sample_batch.latent_params()
+    rewards = -en_scaling_factor * energy / kT
+
+    noised_batch = sample_batch.clone()
+    noised_batch.log_noise_latent_parameters(log_min, log_max)
+    rand_magnitude = simple_latent_distance(noised_batch.latent_params(), latents)
+    with torch.no_grad():  # reprocess with corrected latents
+        noised_batch = adaptive_batched_analysis(
+            noised_batch,
+            analyses=[energy_function], state = {},
+            initial_batch_size=1000, predictor=predictor,
+            device=device,
+        )
+    new_energy = noised_batch[energy_function]
+    new_rewards = -en_scaling_factor * new_energy / kT
+
+    'calibration'
+    x = torch.nan_to_num(rand_magnitude.log10()).cpu()
+    y = torch.nan_to_num(((rewards - new_rewards).abs() + 1e-4).log10()).cpu()
+    m, b = np.polyfit(x, y, 1)
+
+    x_min = (np.log10(low_cut) - b) / m
+    x_max = (np.log10(high_cut) - b) / m
+
+    return [x_min, x_max]
 
 
 #

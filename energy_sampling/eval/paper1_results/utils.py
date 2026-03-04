@@ -1522,6 +1522,7 @@ def generator_reward(crystal_batch, raw_latents, max_z_prime,
         else:
             assert False
 
+        assert False, "Rewrite this"
         lj_rescale = [-20.6, 5.7, -3.4, 1.5]  # mean and std by which to rescale LJ to align with uma
         if energy_function in ['lj', 'qlj', 'elj'] and lj_rescale is not None:
             # rescale functions with LJ-type minima to uma statistics

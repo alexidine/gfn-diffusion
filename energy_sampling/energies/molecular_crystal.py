@@ -184,10 +184,7 @@ class MolecularCrystal(BaseSet):
 
             if self.energy_function in ['lj', 'qlj', 'elj'] and self.lj_rescale is not None:
                 # rescale functions with LJ-type minima to uma statistics
-                lj_mean, lj_std, uma_mean, uma_std = self.lj_rescale
-                atomwise_energy = mol_energy / (crystal_batch.num_atoms / crystal_batch.z_prime)
-                atomwise_fixed = (atomwise_energy - lj_mean) / lj_std * uma_std + uma_mean
-                mol_energy = atomwise_fixed * (crystal_batch.num_atoms / crystal_batch.z_prime)
+                mol_energy = self.lj_rescale * mol_energy
 
             reduction_energy = F.relu(crystal_batch.reduction_en)  # punish positive energies
 
@@ -216,19 +213,7 @@ class MolecularCrystal(BaseSet):
         else:
             assert False, f'{self.energy_function} not implemented'
 
-        latent_rotvecs = crystal_batch.latent_params()[:, -3*crystal_batch.max_z_prime:]
-        sph_rotvec = lat2sph_rotvec(latent_rotvecs, crystal_batch.max_z_prime)
-        sph = sph_rotvec.view(crystal_batch.num_graphs, crystal_batch.max_z_prime, 3)
-        phi = sph[..., 0]  # polar angle
-        r = sph[..., 2]  # rotation magnitude
-        eps = 1e-8
-        rot_jacob_weight = (  # this comes from composing the transforms of spherical -> cartesian ball and then to uniform rotation
-                torch.sin(r / 2).clamp_min(eps) ** 2
-                * torch.sin(phi).clamp_min(eps)
-        )
-        frac_jacob_weight = - crystal_batch.z_prime * temperature * torch.log(  # this comes from the cartesian -> fractional transform, with a factor for each independent object transformed
-            crystal_batch.cell_volume / crystal_batch.sym_mult)
-        jacobian_energy = - temperature * torch.log(rot_jacob_weight).sum(dim=-1) + frac_jacob_weight # sum, because each dim gets its own correction
+        jacobian_energy = self.compute_jacobian(crystal_batch, temperature)
 
         if self.energy_clip is not None:
 
@@ -244,6 +229,26 @@ class MolecularCrystal(BaseSet):
                             reduction_energy * self.reduction_coeff +
                             jacobian_energy)
             return total_energy, ens_dict
+
+    def compute_jacobian(self, crystal_batch, temperature):
+        """jacobian correction for aunit positions and orientation angles only"""
+        latent_rotvecs = crystal_batch.latent_params()[:, -3 * crystal_batch.max_z_prime:]
+        sph_rotvec = lat2sph_rotvec(latent_rotvecs, crystal_batch.max_z_prime)
+        sph = sph_rotvec.view(crystal_batch.num_graphs, crystal_batch.max_z_prime, 3)
+        phi = sph[..., 0]  # polar angle
+        r = sph[..., 2]  # rotation magnitude
+        eps = 1e-8
+        rot_jacob_weight = (
+        # this comes from composing the transforms of spherical -> cartesian ball and then to uniform rotation
+                torch.sin(r / 2).clamp_min(eps) ** 2
+                * torch.sin(phi).clamp_min(eps)
+        )
+        frac_jacob_weight = - crystal_batch.z_prime * temperature * torch.log(
+            # this comes from the cartesian -> fractional transform, with a factor for each independent object transformed
+            crystal_batch.cell_volume / crystal_batch.sym_mult)
+        jacobian_energy = - temperature * torch.log(rot_jacob_weight).sum(
+            dim=-1) + frac_jacob_weight  # sum, because each dim gets its own correction
+        return jacobian_energy
 
     def compute_zp_order_penalty(self, bounding_energy, crystal_batch):
         # penalize the model for placing asymmetric units out of the canonical order (closest -> furthest from origin)
