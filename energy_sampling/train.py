@@ -26,7 +26,7 @@ from energy_sampling.utils import iter_forever, \
     is_cuda_oom, get_annealing_factor, \
     parse_loss_schedules, dict2namespace, update_loss_schedule, \
     random_discretizer, low_discrepancy_discretizer, low_discrepancy_discretizer2, shifted_equidistant, \
-    calibrate_prior_noise, noise_buffer, mc_relax_buffer, thin_large_dmat_block
+    noise_buffer
 from eval.evaluations import adjust_fig_filesize, log_metrics, fwd_figs, bwd_evaluation, analyze_buffer
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 from models import GFN
@@ -526,7 +526,6 @@ class Modeller:
         test_iterator = iter_forever(test_mol_loader)
 
         return buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator
-
 
     def init_mol_from_buffer(self, buffer, z_primes):
         # this structure assumes the MXT format, where for Z'>1 samples, the mols are stacked in the same spot, in the same order
@@ -1219,7 +1218,8 @@ class Modeller:
 
         noised_batch = prior_file['noised_batch']
         noised_latents = noised_batch.latent_params()
-        noised_rewards = buffer.energy_function.prebuilt_sample_to_reward(noised_batch, self.args.energy_static_temperature)
+        noised_rewards = buffer.energy_function.prebuilt_sample_to_reward(noised_batch,
+                                                                          self.args.energy_static_temperature)
 
         good_inds = torch.argwhere(noised_rewards >= buffer.reward_clip).flatten()
         buffer.add_to_noised(noised_rewards[good_inds],

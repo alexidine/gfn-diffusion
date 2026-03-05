@@ -139,10 +139,10 @@ if __name__ == '__main__':
             show_tqdm=False,
         )
         batch = batch.to('cpu')
-        noised_samples = batch.batch_to_list()
+        noised_samples_i = batch.batch_to_list()
         valid = torch.argwhere(
             (batch.reduction_en < 1e-3) & (batch.packing_coeff > 0.55) & (batch.packing_coeff < 0.95)).flatten()
-        noised_samples.extend([noised_samples[ind] for ind in valid])
+        noised_samples.extend([noised_samples_i[ind] for ind in valid])
         del batch
 
     dataset_dict = {
