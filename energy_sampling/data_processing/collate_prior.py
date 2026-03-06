@@ -17,9 +17,9 @@ torch.cuda.set_per_process_memory_fraction(0.9, device=0)
 if __name__ == '__main__':
     torch.set_grad_enabled(False)
     search_output_dir = r"D:\crystal_datasets\mipcas"
-    run_name = 'mipcas_elj'
+    run_name = 'mipcas_uma'
     identifier = 'MIPCAS'
-    energy_function = 'elj'
+    energy_function = 'uma'
     target_path = r"D:\crystal_datasets\mipcas\MIPCAS_standardized.pt"
     uma_model_path = r"D:\crystal_datasets\esen_s.pt"
     device = 'cuda'
@@ -109,7 +109,8 @@ if __name__ == '__main__':
                                                 en_scaling_factor,
                                                 kT=kT,
                                                 low_cut=0.05,
-                                                high_cut=6.0)
+                                                high_cut=6.0,
+                                                predictor=predictor)
 
     """
     do actual thinning with physics-informed cutoff
@@ -145,13 +146,13 @@ if __name__ == '__main__':
         noised_samples.extend([noised_samples_i[ind] for ind in valid])
         del batch
 
-    dataset_dict = {
-        'thermal_scaling_factor': en_scaling_factor,
-        'log_noise_range': log_noise_range,
-        'prior_batch': thinned_batch.cpu(),
-        'noised_batch': collate_data_list(noised_samples),
-    }
-    dataset_filename = run_name + '_prior_dataset.pt'
-    torch.save(dataset_dict, dataset_filename)
+        dataset_dict = {
+            'thermal_scaling_factor': en_scaling_factor,
+            'log_noise_range': log_noise_range,
+            'prior_batch': thinned_batch.cpu(),
+            'noised_batch': collate_data_list(noised_samples),
+        }
+        dataset_filename = run_name + '_prior_dataset.pt'
+        torch.save(dataset_dict, dataset_filename)
 
     aa = 1  # thin out reduction_en and save reward stuff here as well - maybe save one big batch?
