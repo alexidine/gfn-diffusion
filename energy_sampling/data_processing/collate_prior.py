@@ -14,6 +14,79 @@ from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 
 torch.cuda.set_per_process_memory_fraction(0.9, device=0)
 
+
+def collate_generate_prior():
+    global sample, cell_params, en_scaling_factor, log_noise_range, thinned_batch
+    "load samples"
+    opt_samples = []
+    for tpath in tqdm(traj_records):
+        opt_samples.extend(torch.load(tpath, weights_only=False))
+    # huge waste of space here for some reason
+    for sample in opt_samples:
+        if hasattr(sample, 'rdf'):
+            del sample.rdf
+        if hasattr(sample, 'fingerprint'):
+            del sample.fingerprint
+    """ 
+            make sure we are latent-safe, and filter degenerate boxes (ultra-flat cells)
+            """
+    sample_batch = collate_data_list(opt_samples)
+    sample_batch.latent_to_cell_params(sample_batch.latent_params())  # get safely into the latent space
+    sample_batch = adaptive_batched_analysis(
+        sample_batch, analyses=[energy_function], state={},
+        initial_batch_size=10000, predictor=predictor,
+        device=device, show_tqdm=True
+    )
+    sample_batch = sample_batch.to('cpu')
+    opt_samples = sample_batch.batch_to_list()  # corrected latents
+    params = sample_batch.latent_params()
+    ens = sample_batch[energy_function]
+    cell_params = sample_batch.full_cell_parameters()
+    lengths = cell_params[:, :3]
+    angles = cell_params[:, 3:6]
+    volumes = sample_batch.cell_volume
+    angular_factor = volumes / lengths.prod(dim=-1)
+    good_inds = (angular_factor > 0.1).argwhere().flatten()  # nearly degenerate cells
+    good_samples = [opt_samples[ind] for ind in good_inds]
+    sample_batch = collate_data_list(good_samples)
+    sample_batch.latent_to_cell_params(sample_batch.latent_params())  # get safely into the latent space
+    """
+            Calibrate distance cutoff on this energy function
+            """
+    "very coarse diverse basin selection"
+    sample_batch = sample_batch.cuda()
+    params = sample_batch.latent_params()
+    ens = sample_batch[energy_function]
+    cps = sample_batch.packing_coeff
+    anchors = greedy_bottom_up_anchors(params, cps, ens, d_cut=0.1, e_cut=torch.quantile(ens, 0.1))
+    anchors = anchors[:1000]  # 1000 is plenty
+    "run calibration"
+    coarse_batch = collate_data_list([good_samples[ind] for ind in anchors])
+    coarse_batch.latent_to_cell_params(coarse_batch.latent_params())
+    if energy_function == 'uma':
+        en_scaling_factor = 1
+    else:
+        en_scaling_factor = calibrate_energy_function_vs_uma(search_output_dir,
+                                                             energy_function,
+                                                             run_name,
+                                                             coarse_batch[energy_function]
+                                                             )
+    log_noise_range = new_calibrate_prior_noise(coarse_batch,
+                                                energy_function,
+                                                en_scaling_factor,
+                                                kT=kT,
+                                                low_cut=0.05,
+                                                high_cut=6.0,
+                                                predictor=predictor)
+    """
+            do actual thinning with physics-informed cutoff
+            """
+    thermal_ens = ens * en_scaling_factor
+    d_cut = 10 ** log_noise_range[1]
+    anchors = greedy_bottom_up_anchors(params, cps, thermal_ens, d_cut=d_cut, e_cut=thermal_ens.amin() + 6 * kT)
+    thinned_batch = collate_data_list([good_samples[ind] for ind in anchors])
+
+
 if __name__ == '__main__':
     torch.set_grad_enabled(False)
     search_output_dir = r"D:\crystal_datasets\mipcas"
@@ -44,91 +117,26 @@ if __name__ == '__main__':
     zp = target_mol.z_prime
     sg = target_mol.sg_ind
 
-    "load samples"
-    opt_samples = []
-    for tpath in tqdm(traj_records):
-        opt_samples.extend(torch.load(tpath, weights_only=False))
+    dataset_filename = run_name + '_prior_dataset.pt'
 
-    # huge waste of space here for some reason
-    for sample in opt_samples:
-        if hasattr(sample, 'rdf'):
-            del sample.rdf
-        if hasattr(sample, 'fingerprint'):
-            del sample.fingerprint
-
-    """ 
-    make sure we are latent-safe, and filter degenerate boxes (ultra-flat cells)
-    """
-    sample_batch = collate_data_list(opt_samples)
-    sample_batch.latent_to_cell_params(sample_batch.latent_params())  # get safely into the latent space
-    sample_batch = adaptive_batched_analysis(
-        sample_batch, analyses=[energy_function], state={},
-        initial_batch_size=10000, predictor=predictor,
-        device=device, show_tqdm=True
-    )
-    sample_batch = sample_batch.to('cpu')
-    opt_samples = sample_batch.batch_to_list()  # corrected latents
-    params = sample_batch.latent_params()
-    ens = sample_batch[energy_function]
-    cell_params = sample_batch.full_cell_parameters()
-    lengths = cell_params[:, :3]
-    angles = cell_params[:, 3:6]
-    volumes = sample_batch.cell_volume
-    angular_factor = volumes / lengths.prod(dim=-1)
-    good_inds = (angular_factor > 0.1).argwhere().flatten()  # nearly degenerate cells
-    good_samples = [opt_samples[ind] for ind in good_inds]
-    sample_batch = collate_data_list(good_samples)
-    sample_batch.latent_to_cell_params(sample_batch.latent_params())  # get safely into the latent space
-
-    """
-    Calibrate distance cutoff on this energy function
-    """
-    "very coarse diverse basin selection"
-    sample_batch = sample_batch.cuda()
-    params = sample_batch.latent_params()
-    ens = sample_batch[energy_function]
-    cps = sample_batch.packing_coeff
-    anchors = greedy_bottom_up_anchors(params, cps, ens, d_cut=0.1, e_cut=torch.quantile(ens, 0.1))
-    anchors = anchors[:1000]  # 1000 is plenty
-
-    "run calibration"
-    coarse_batch = collate_data_list([good_samples[ind] for ind in anchors])
-    coarse_batch.latent_to_cell_params(coarse_batch.latent_params())
-
-    if energy_function == 'uma':
-        en_scaling_factor = 1
+    if os.path.exists(dataset_filename):
+        dd = torch.load(dataset_filename, weights_only=False)
+        noised_samples = dd['noised_batch'].batch_to_list()
+        thinned_batch = dd['prior_batch']
+        log_noise_range = dd['log_noise_range']
+        en_scaling_factor = dd['thermal_scaling_factor']
     else:
-        en_scaling_factor = calibrate_energy_function_vs_uma(search_output_dir,
-                                                             energy_function,
-                                                             run_name,
-                                                             coarse_batch[energy_function]
-                                                             )
-
-    log_noise_range = new_calibrate_prior_noise(coarse_batch,
-                                                energy_function,
-                                                en_scaling_factor,
-                                                kT=kT,
-                                                low_cut=0.05,
-                                                high_cut=6.0,
-                                                predictor=predictor)
-
-    """
-    do actual thinning with physics-informed cutoff
-    """
-    thermal_ens = ens * en_scaling_factor
-    d_cut = 10 ** log_noise_range[1]
-    anchors = greedy_bottom_up_anchors(params, cps, thermal_ens, d_cut=d_cut, e_cut=thermal_ens.amin() + 6 * kT)
-    thinned_batch = collate_data_list([good_samples[ind] for ind in anchors])
+        noised_samples = []
+        collate_generate_prior()
 
     """
     preliminary noising
     """
-
-    noised_samples = []
     state = {}
-    samples_per_anchor = (tot_noised_samples // thinned_batch.num_graphs) + 1
+    samples_per_anchor = ((tot_noised_samples - len(noised_samples)) // thinned_batch.num_graphs) + 1
     for _ in tqdm(range(samples_per_anchor)):
         batch = thinned_batch.clone()
+        batch = batch.to(device)
         batch.log_noise_latent_parameters(log_noise_range[0], log_noise_range[1])
         batch, state = adaptive_batched_analysis(
             batch, analyses=[energy_function, 'reduction_en'],
@@ -152,7 +160,6 @@ if __name__ == '__main__':
             'prior_batch': thinned_batch.cpu(),
             'noised_batch': collate_data_list(noised_samples),
         }
-        dataset_filename = run_name + '_prior_dataset.pt'
         torch.save(dataset_dict, dataset_filename)
 
     aa = 1  # thin out reduction_en and save reward stuff here as well - maybe save one big batch?

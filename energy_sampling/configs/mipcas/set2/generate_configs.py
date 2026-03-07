@@ -134,7 +134,20 @@ if __name__ == "__main__":
         {
             "name": 'hot',
             'energy_static_temperature': 5,
-        }
+        },
+        {
+            "name": 'uma_hot',
+            'energy_static_temperature': 5,
+            "energy_function": 'uma',
+            'buffer_path': "/scratch/mk8347/data/crystal_datasets/mipcas/mipcas_uma_prior_dataset.pt"
+
+        },
+        {
+            "name": 'uma_baseline',
+            "energy_function": 'uma',
+            'buffer_path': "/scratch/mk8347/data/crystal_datasets/mipcas/mipcas_uma_prior_dataset.pt"
+
+    },
     ]
     """
     """
