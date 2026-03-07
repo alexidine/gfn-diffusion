@@ -130,7 +130,7 @@ class MolecularCrystal(BaseSet):
         with torch.no_grad():
             out = crystal_batch.analyze(self.computes,
                                         cutoff=cutoff,
-                                        supercell_size=5,
+                                        supercell_size=10,
                                         std_orientation=False,
                                         predictor=self.uma_predictor,)
 
