@@ -79,8 +79,8 @@ def collate_generate_prior():
                                                 high_cut=6.0,
                                                 predictor=predictor)
     """
-            do actual thinning with physics-informed cutoff
-            """
+    do actual thinning with physics-informed cutoff
+    """
     thermal_ens = ens * en_scaling_factor
     d_cut = 10 ** log_noise_range[1]
     anchors = greedy_bottom_up_anchors(params, cps, thermal_ens, d_cut=d_cut, e_cut=thermal_ens.amin() + 6 * kT)
@@ -89,11 +89,20 @@ def collate_generate_prior():
 
 if __name__ == '__main__':
     torch.set_grad_enabled(False)
-    search_output_dir = r"D:\crystal_datasets\mipcas"
-    run_name = 'mipcas_uma'
-    identifier = 'MIPCAS'
-    energy_function = 'uma'
-    target_path = r"D:\crystal_datasets\mipcas\MIPCAS_standardized.pt"
+    # # mipcas
+    # search_output_dir = r"D:\crystal_datasets\mipcas"
+    # run_name = 'mipcas_uma'
+    # identifier = 'MIPCAS'
+    # energy_function = 'uma'
+    # target_path = r"D:\crystal_datasets\mipcas\MIPCAS_standardized.pt"
+    # uma_model_path = r"D:\crystal_datasets\esen_s.pt"
+    # device = 'cuda'
+    # nehzor
+    search_output_dir = r"D:\crystal_datasets\nehzor"
+    run_name = 'nehzor_elj'
+    identifier = 'NEHZOR'
+    energy_function = 'elj'
+    target_path = r"D:\crystal_datasets\nehzor\NEHZOR01_standardized.pt"
     uma_model_path = r"D:\crystal_datasets\esen_s.pt"
     device = 'cuda'
 

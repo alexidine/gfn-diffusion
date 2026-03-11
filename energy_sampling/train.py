@@ -803,10 +803,16 @@ class Modeller:
                 self.reload_running_model(ema_model, gfn_model)
 
                 for opt in optimizers.values():
-                    opt.state = defaultdict(dict)  # wipe also the momentum buffers
+                    if hit_threshold:
+                        opt.state = defaultdict(dict)  # wipe also the momentum buffers
                     for g in opt.param_groups:
                         if g['lr'] > self.args.min_lr:
                             g['lr'] *= 0.85
+
+                if not hasattr(self, 'lr_cut_count'):
+                    self.lr_cut_count = 1
+                else:
+                    self.lr_cut_count += 1
 
                 self.lr_warmup_finished = True
 
