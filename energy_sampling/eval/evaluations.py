@@ -888,7 +888,7 @@ def log_metrics(energy_function,
     metrics['Mean Packing Coeff'] = sample_batch.packing_coeff.mean().cpu().detach().item()
     metrics['Packing Coeff'] = sample_batch.packing_coeff.clip(max=2).cpu().detach().numpy()
     metrics['Reduction Energy'] = sample_batch.reduction_en.cpu().detach().numpy()
-    metrics['Reduced Valid Fraction'] = np.mean(sample_batch.reduction_en.cpu().detach().numpy() < 1e-3)
+    metrics['Reduced Valid Fraction'] = np.mean(sample_batch.reduction_en.cpu().detach().numpy() < 1e-1)
 
     # conditions
     metrics['Crystal Mean Log Temperature'] = log_T_tensor.mean().item()

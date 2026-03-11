@@ -661,7 +661,7 @@ def analyze_samples(x, mol_list, max_z_prime, device, batch_size, sg_ind, zp, do
     already_oomed = False
     computes = ['lj', 'qlj', 'elj', 'silu', 'rdf', 'reduction_en']
     if do_uma:
-        computes.append(['uma'])
+        computes.append('uma')
     with tqdm(total=num_samples) as pbar:
         with torch.no_grad():
             while cursor < num_samples:
@@ -675,7 +675,7 @@ def analyze_samples(x, mol_list, max_z_prime, device, batch_size, sg_ind, zp, do
                         batch.latent_to_cell_params(x[inds])
                     batch = batch.to(device)
                     outs = batch.analyze(computes, cutoff=10, std_orientation=True, assign_outputs=True,
-                                         predictor=predictor)
+                                         predictor=predictor, elementwise=False, atomwise=True)
 
                     batch.to('cpu')
                     samples.extend(batch.batch_to_list())
@@ -959,16 +959,7 @@ def get_gfn_samples(num_samples, max_z_prime, device, n_steps, batch_size, gfn_m
                               zp,
                               do_uma=energy_function == 'uma', predictor=predictor)
     sample_batch = collate_data_list(samples, max_z_prime=max_z_prime)
-
-    if energy_function == 'uma':
-        sample_energy = sample_batch.uma_pot / (sample_batch.sym_mult * sample_batch.z_prime) - sample_batch.uma_gas_pot
-    elif energy_function == 'elj':
-        lj_mean, lj_std, uma_mean, uma_std = [-20.6, 5.7, -3.4, 1.5]
-        atomwise_energy = sample_batch.elj / (sample_batch.num_atoms / sample_batch.z_prime)
-        atomwise_fixed = (atomwise_energy - lj_mean) / lj_std * uma_std + uma_mean
-        sample_energy = atomwise_fixed * (sample_batch.num_atoms / sample_batch.z_prime)
-    else:
-        sample_energy = sample_batch.lj
+    sample_energy = sample_batch[energy_function]
 
     return sample_batch, sample_latents, sample_energy.float(), sample_batch.packing_coeff, samples, pfs, pbs
 
@@ -1522,15 +1513,6 @@ def generator_reward(crystal_batch, raw_latents, max_z_prime,
         else:
             assert False
 
-        assert False, "Rewrite this"
-        lj_rescale = [-20.6, 5.7, -3.4, 1.5]  # mean and std by which to rescale LJ to align with uma
-        if energy_function in ['lj', 'qlj', 'elj'] and lj_rescale is not None:
-            # rescale functions with LJ-type minima to uma statistics
-            lj_mean, lj_std, uma_mean, uma_std = lj_rescale
-            atomwise_energy = mol_energy / (crystal_batch.num_atoms / crystal_batch.z_prime)
-            atomwise_fixed = (atomwise_energy - lj_mean) / lj_std * uma_std + uma_mean
-            mol_energy = atomwise_fixed * (crystal_batch.num_atoms / crystal_batch.z_prime)
-
         reduction_en = crystal_batch.compute(['reduction_en'])['reduction_en']
         reduction_energy = F.relu(reduction_en)  # punish positive energies
 
@@ -1647,7 +1629,7 @@ def lin_interpolate_edges(base_sample, edge_index, latents,
                 en = out['elj'].cpu().detach()
                 ens[batch_inds, :] = en.reshape(paths.shape[:2]).T
 
-                pbar.update(min(batch_size, num_trajs - cursor))  # safe final update
+                pbar.update(num_trajs - cursor)  # safe final update
 
                 cursor += batch_size
                 del x, traj_batch, out, paths
@@ -1953,8 +1935,8 @@ def k_nn_analysis(n_dims, METRICS, indices_to_compute, d2, dists, inds, k, sampl
 
 def load_experimental_structure(exp_sample_path, sg_ind, zp, device, max_z_prime, molecule, energy_function):
     exp_crystals = torch.load(exp_sample_path, weights_only=False)
-    exp_crystals = [cry for cry in exp_crystals if (cry.sg_ind == sg_ind) and (cry.z_prime == zp)]
-    exp_crystals = [exp_crystals[0]]
+    if isinstance(exp_crystals, list):
+        exp_crystals = [exp_crystals[0]]
     ebatch = collate_data_list(exp_crystals, max_z_prime=zp)
     pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
     predictor = init_uma_crystal_predictor(pred_path, device=device)
@@ -2039,16 +2021,14 @@ def local_metric_tensor_from_custom_distance(
 def new_local_analysis(
         sample_batch,
         sample_energy,
-        d_cut: float = 3.5,
-        basins: Optional[list] = None
+        neighbor_lists,
+        neighbor_dists,
+        samples_to_analyze,
+        d_kernel,
+        e_cut: Optional[float] = None,
 ):
-    upos = init_ucell_pos(sample_batch)
-    cell_params = sample_batch.full_cell_parameters()
-
-    if basins is None:
-        n_samples = sample_batch.num_graphs
-    else:
-        n_samples = len(basins)
+    cell_params = sample_batch.latent_params()
+    n_samples = len(samples_to_analyze)
 
     n_dims = cell_params.shape[1]
 
@@ -2064,29 +2044,26 @@ def new_local_analysis(
                'local_en_var': np.zeros(n_samples, dtype=np.float64),
                'local_max_density': np.zeros(n_samples, dtype=np.float64),
                'local_mean_density': np.zeros(n_samples, dtype=np.float64),
+               'local_energy_minimum_id': -np.ones(n_samples, dtype=np.int64),
+               'local_density_maximum_id': -np.ones(n_samples, dtype=np.int64),
                }
 
-    for ind in tqdm(range(n_samples)):
-        if basins is not None:
-            sample_ind =  sample_energy[basins[ind]].argmin()
-        else:
-            sample_ind = ind
-        dists = compute_ucell_rmsd(upos, sample_ind)
-
-        if basins is None:
-            neighbors = dists[dists < d_cut].argwhere().flatten()
-        else:
-            neighbors = basins[ind].argwhere().flatten()
-        local_dists = dists[neighbors]
-
+    for ind, sample_ind in tqdm(enumerate(samples_to_analyze)):
+        neighbors = neighbor_lists[ind]
+        if e_cut is not None:
+            neighbors = neighbors[(sample_energy[neighbors] - sample_energy[ind]) < e_cut]
+        if len(neighbors) == 0:
+            continue
+        local_dists = neighbor_dists[ind]
 
         metrics['count'][ind] = len(neighbors)
-        metrics['density'][ind] = torch.sum(torch.exp(-(local_dists ** 2) / (2 * d_cut ** 2))).item()
+        metrics['density'][ind] = torch.sum(torch.exp(-(local_dists ** 2) / (2 * d_kernel ** 2))).item()
 
         neighborhood = cell_params[neighbors]
         metrics['var'][ind] = torch.var(neighborhood, dim=0).numpy()
 
         metrics['is_local_en_minimum'][ind] = torch.all(sample_energy[sample_ind] <= sample_energy[neighbors]).item()
+        metrics['local_energy_minimum_id'][ind] = neighbors[sample_energy[neighbors].argmin()].item()
 
         metrics['local_dist_mean'][ind] = torch.mean(local_dists).item()
         metrics['local_dist_var'][ind] = torch.var(local_dists).item()
@@ -2095,40 +2072,30 @@ def new_local_analysis(
         metrics['local_en_mean'][ind] = torch.mean(local_energy).item()
         metrics['local_en_var'][ind] = torch.var(local_energy).item()
 
-    if basins is None:
-        for ind in tqdm(range(n_samples)):
-            if basins is not None:
-                sample_ind =  sample_energy[basins[ind]].argmin()
-            else:
-                sample_ind = ind
-            dists = compute_ucell_rmsd(upos, sample_ind)
+    density = torch.as_tensor(metrics['density'])
 
-            if basins is None:
-                neighbors = dists[dists < d_cut].argwhere().flatten()
-            else:
-                neighbors = basins[ind].argwhere().flatten()
-            local_dists = dists[neighbors]
+    for ind, sample_ind in tqdm(enumerate(samples_to_analyze)):
+        neighbors = neighbor_lists[ind]
 
+        if len(neighbors) > 0:
+            local_density = density[neighbors]
 
-            if len(neighbors) > 0:
-                density = torch.as_tensor(metrics['density'])
-                local_density = density[neighbors]
+            metrics['local_max_density'][ind] = torch.max(local_density).item()
+            metrics['local_mean_density'][ind] = torch.mean(local_density).item()
 
-                metrics['local_max_density'][ind] = torch.max(local_density).item()
-                metrics['local_mean_density'][ind] = torch.mean(local_density).item()
+            metrics['is_local_density_maximum'][ind] = torch.all(density[ind] >= local_density).item()
+            metrics['local_density_maximum_id'][ind] = neighbors[local_density.argmax()].item()
 
-                metrics['is_local_density_maximum'][ind] = torch.all(density[ind] >= local_density).item()
+            # ---- Laplacian (graph-style discrete Laplacian of density) ----
+            metrics['local_laplacian'][ind] = torch.mean(local_density - density[ind]).item()
+        else:
+            metrics['local_max_density'][ind] = 0
+            metrics['local_mean_density'][ind] = 0
 
-                # ---- Laplacian (graph-style discrete Laplacian of density) ----
-                metrics['local_laplacian'][ind] = torch.mean(local_density - density[ind]).item()
-            else:
-                metrics['local_max_density'][ind] = 0
-                metrics['local_mean_density'][ind] = 0
+            metrics['is_local_density_maximum'][ind] = False
 
-                metrics['is_local_density_maximum'][ind] = False
-
-                # ---- Laplacian (graph-style discrete Laplacian of energy) ----
-                metrics['local_laplacian'][ind] = 0
+            # ---- Laplacian (graph-style discrete Laplacian of energy) ----
+            metrics['local_laplacian'][ind] = 0
 
     return metrics
 
@@ -2317,6 +2284,12 @@ def get_kinetic_basins_sparse(sample_energy, sample_batch, kT, dmat, samples, al
     return basins
 
 
+def init_asupos(sample_batch):
+    sample_batch.pose_aunit()
+    asupos = sample_batch.pos.reshape(-1, sample_batch.num_atoms[0], 3).clone()
+    return asupos
+
+
 def init_ucell_pos(sample_batch):
     """
     only works for batches of identical molecules & space groups
@@ -2336,11 +2309,15 @@ def compute_ucell_rmsd(upos, ind):
     return (upos[ind, None, ...] - upos).norm(dim=-1).mean(-1)
 
 
+def compute_asu_rmsd(asupos, ind):
+    return (asupos[ind, None, ...] - asupos).norm(dim=-1).mean(-1)
+
+
 def get_kinetic_basins_light(sample_energy,
                              kT,
                              samples,
+                             asupos,
                              latents,
-                             upos,
                              alpha,
                              k_rad,
                              n_points,
@@ -2378,7 +2355,7 @@ def get_kinetic_basins_light(sample_energy,
         energy_mask[sample_energy > local_en_cutoff] = True
         basin_mask = torch.zeros(N, dtype=torch.bool, device=sample_energy.device)
 
-        dists = compute_ucell_rmsd(upos, local_min_ind)
+        dists = compute_asu_rmsd(asupos, local_min_ind)
         frontier = dists.topk(k_rad, largest=False).indices[1:]
 
         invalid_step_size = (dists[frontier] > max_step_length) | (dists[frontier] == 0)
@@ -2404,7 +2381,7 @@ def get_kinetic_basins_light(sample_energy,
             if sum(valid_edge).item() == 0:
                 break
 
-            dists = torch.stack([compute_ucell_rmsd(upos, src) for src in sources])
+            dists = torch.stack([compute_asu_rmsd(asupos, src) for src in sources])
             nbrs = dists.topk(k_rad, largest=False)
 
             # remove self index properly
@@ -2487,3 +2464,12 @@ def recompute_ens(sample_batch, energy_function):
         sample_energy = sample_batch.lj
 
     return sample_energy
+
+
+def assign_basins(pointer_ids, n_samples):
+    assignments = np.array(pointer_ids, dtype=np.int64)
+    unique_basins = np.unique(assignments[assignments >= 0])
+    basin_mask = torch.zeros(len(unique_basins), n_samples, dtype=torch.bool)
+    for i, b in enumerate(unique_basins):
+        basin_mask[i] = torch.from_numpy(assignments == b)
+    return basin_mask, assignments

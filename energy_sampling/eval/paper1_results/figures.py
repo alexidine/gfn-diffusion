@@ -1,4 +1,8 @@
+import numpy as np
+import tempfile
+import webbrowser
 from typing import Optional
+from scipy.stats import linregress, gaussian_kde
 
 import numpy as np
 import plotly.colors as pc
@@ -130,7 +134,7 @@ def add_violin(fig, samples, name, color, row, col, ranges, n_kde, bw_factor):
         row=row, col=col)
 
 
-def general_figs(fig_dict, sample_batch, sample_energy, data_batch, units):
+def general_figs(fig_dict, sample_batch, sample_energy, units):
     fig = sample_batch.plot_batch_staircase(space='real', return_fig=True, show=False)
     fig.update_xaxes(tickfont=dict(size=15))
     fig.update_yaxes(tickfont=dict(size=15))
@@ -138,13 +142,13 @@ def general_figs(fig_dict, sample_batch, sample_energy, data_batch, units):
     fig.update_yaxes(title_font=dict(size=20))
     fig_dict['staircase_fig'] = fig
 
-    fig_dict['std_marginals_fig'] = sample_batch.plot_batch_cell_params(space='real',
-                                                                        ref_dist=data_batch.full_cell_parameters(),
+    fig_dict['std_marginals_fig'] = sample_batch.plot_batch_cell_params(space='latent',
+                                                                        #ref_dist=data_batch.full_cell_parameters(),
                                                                         # quantiles=[0.1],
-                                                                        override_energy=sample_energy, return_fig=True,
+                                                                        #override_energy=sample_energy,
+                                                                        return_fig=True,
                                                                         show=False)
-    fig_dict['std_marginals_fig'].update_traces(name="Prior Dataset",
-                                                selector=dict(name="Reference"))
+    #fig_dict['std_marginals_fig'].update_traces(name="Prior Dataset", selector=dict(name="Reference"))
     fig_dict['std_marginals_fig'].update_annotations(font_size=20)
 
     fig_dict['density_funnel_fig'] = sample_batch.plot_batch_density_funnel(
@@ -152,6 +156,9 @@ def general_figs(fig_dict, sample_batch, sample_energy, data_batch, units):
         return_fig=True, show=False,
         max_y_quantile=0.99,
         overwrite_yaxis_title=rf"Lattice Energy ({units})")
+
+    fig_dict['energy_marginal'] = energy_marginal_fig(sample_energy)
+
     return fig_dict
 
 
@@ -684,14 +691,8 @@ def parity_fig(
     return fig
 
 
-def sample_summary_table(sample_metrics, sample_energy, sample_inds):
-
-    metric_keys = ['energy', 'count',
-                   'local_dist_mean', 'local_dist_var',
-                   'local_en_mean', 'local_en_var',
-                   #'local_mean_density', 'local_max_density',
-                   #'local_laplacian'
-                   ]
+def sample_summary_table(sample_metrics, sample_energy, sample_inds,
+                         metric_keys):
     metric_keys = [key for key in metric_keys if key not in ['is_local_en_minimum', 'is_local_density_maximum', 'var']]
 
     sample_metrics['energy'] = sample_energy
@@ -838,5 +839,349 @@ def var_table(sample_metrics, sample_energy, sample_inds):
         # title="Thermodynamic Properties of Dominant Basins",
         margin=dict(l=10, r=10, t=40, b=10),
     )
+
+    return fig
+
+
+def sparkbar_table(columns: dict,
+                   title: str = "Summary",
+                   subtitle: str = None,
+                   open_browser: bool = True,
+                   show_values: bool = True,
+                   save_path: str = None,
+                   col_colors: Optional[dict] = None):
+    """
+    Generate a styled HTML table with in-cell bars.
+
+    Parameters
+    ----------
+    columns : dict
+        {display_name: array-like of values}
+        Each key becomes a column header, values become rows.
+        Bars are scaled per-column to the min/max of that column.
+    title : str
+    subtitle : str, optional
+    open_browser : bool
+
+    Returns
+    -------
+    html : str
+    """
+    col_names = list(columns.keys())
+    col_vals = {k: np.asarray(v, dtype=float) for k, v in columns.items()}
+    n_rows = len(next(iter(col_vals.values())))
+    n_cols = len(col_names)
+
+    # Normalize each column 0-1
+    col_normed = {}
+    for k, vals in col_vals.items():
+        vmin, vmax = np.nanmin(vals), np.nanmax(vals)
+        col_normed[k] = (vals - vmin) / max(vmax - vmin, 1e-12)
+
+    # Format numbers
+    def fmt(val):
+        if np.isnan(val):
+            return "—"
+        if abs(val) >= 1000:
+            return f"{val:.1f}"
+        elif abs(val) >= 1:
+            return f"{val:.2f}"
+        elif abs(val) >= 0.01:
+            return f"{val:.3f}"
+        else:
+            return f"{val:.2e}"
+
+    # Build rows
+    rows_html = ""
+    for i in range(n_rows):
+        row_class = "even" if i % 2 == 0 else "odd"
+        cells = f'<td class="idx-cell">{i}</td>'
+        for k in col_names:
+            pct = col_normed[k][i] * 100
+            val = col_vals[k][i]
+            val_text = fmt(val) if show_values else ""
+            bg = ""
+            if col_colors and k in col_colors:
+                bg = f"background-color:{col_colors[k]};"
+            cells += f'''<td class="bar-cell {row_class}" style="{bg}">
+                    <div class="bar-bg" style="width:{pct:.1f}%;"></div>
+                    <span class="bar-val">{val_text}</span>
+                </td>'''
+        rows_html += f"<tr>{cells}</tr>\n"
+
+    header_cells = '<th class="idx-header">#</th>'
+    for k in col_names:
+        hbg = ""
+        if col_colors and k in col_colors:
+            hbg = f"background-color:{col_colors[k]};"
+        header_cells += f'<th class="metric-header" style="{hbg}">{k}</th>'
+
+    if subtitle is None:
+        subtitle = f"{n_rows} rows &middot; {n_cols} columns"
+
+    html = f"""<!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="utf-8">
+    <style>
+      * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+
+      body {{
+        font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+        background: #ffffff;
+        color: #222222;
+        padding: 32px;
+        min-height: 100vh;
+      }}
+
+      .container {{
+        max-width: 95vw;
+        margin: 0 auto;
+      }}
+
+      h1 {{
+        font-size: 16px;
+        font-weight: 600;
+        color: #111111;
+        margin-bottom: 2px;
+      }}
+
+      .subtitle {{
+        font-size: 11px;
+        color: #888888;
+        margin-bottom: 16px;
+        font-family: 'Courier New', monospace;
+      }}
+
+      table {{
+        border-collapse: collapse;
+        width: auto;
+        font-size: 12px;
+      }}
+
+      th {{
+        background: #f5f5f5;
+        color: #333333;
+        font-weight: 600;
+        text-align: center;
+        padding: 8px 8px;
+        border-bottom: 2px solid #333333;
+        border-top: 2px solid #333333;
+        font-size: 11px;
+        min-width: 80px;
+        font-family: 'Courier New', monospace;
+      }}
+
+      .idx-header {{
+        min-width: 36px;
+        color: #999999;
+      }}
+
+      tr:hover {{
+        background: #f9f9f9 !important;
+      }}
+
+      .idx-cell {{
+        text-align: center;
+        color: #999999;
+        font-family: 'Courier New', monospace;
+        font-size: 11px;
+        padding: 0 8px;
+        border-right: 1px solid #e0e0e0;
+      }}
+
+      .bar-cell {{
+        position: relative;
+        padding: 0;
+        height: 26px;
+        border-bottom: 1px solid #eeeeee;
+        border-right: 1px solid #eeeeee;
+        overflow: hidden;
+      }}
+
+      .bar-cell.even {{
+        background: #ffffff;
+      }}
+
+      .bar-cell.odd {{
+        background: #fafafa;
+      }}
+
+      .bar-bg {{
+        position: absolute;
+        left: 0;
+        top: 2px;
+        bottom: 2px;
+        border-radius: 1px;
+        background: rgba(0, 0, 0, 0.18);
+      }}
+
+      .bar-val {{
+        position: relative;
+        z-index: 1;
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        height: 100%;
+        padding: 0 8px;
+        font-family: 'Courier New', monospace;
+        font-size: 11px;
+        color: #222222;
+        white-space: nowrap;
+      }}
+
+      .table-wrap {{
+        overflow-x: auto;
+        border: none;
+      }}
+
+      .table-wrap table {{
+        border: none;
+        border-bottom: 2px solid #333333;
+      }}
+    </style>
+    </head>
+    <body>
+      <div class="container">
+        <h1>{title}</h1>
+        <div class="subtitle">{subtitle}</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>{header_cells}</tr></thead>
+            <tbody>
+              {rows_html}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </body>
+    </html>"""
+
+    if open_browser:
+        with tempfile.NamedTemporaryFile('w', suffix='.html', delete=False, encoding='utf-8') as f:
+            f.write(html)
+            webbrowser.open('file://' + f.name)
+
+    if save_path:
+        from playwright.sync_api import sync_playwright
+        with tempfile.NamedTemporaryFile('w', suffix='.html', delete=False, encoding='utf-8') as f:
+            f.write(html)
+            html_path = f.name
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page()
+            page.goto(f"file://{html_path}")
+            page.wait_for_load_state("networkidle")
+            height = page.evaluate("document.body.scrollHeight")
+            page.set_viewport_size({"width": 1200, "height": height + 64})
+            page.screenshot(path=save_path, full_page=True)
+            browser.close()
+
+    return html
+
+
+def energy_marginal_fig(sample_energy):
+    # === Input energies ===
+    energies_np = sample_energy[sample_energy < 0].cpu().detach().numpy()
+
+    # === Histogram ===
+    hist_y, hist_x = np.histogram(energies_np, bins=50, density=True)
+    bin_centers = 0.5 * (hist_x[1:] + hist_x[:-1])
+    nonzero = hist_y > 0
+
+    # === KDE ===
+    kde = gaussian_kde(energies_np, bw_method=0.3)
+    x_kde = np.linspace(energies_np.min(), energies_np.max(), 500)
+    y_kde = kde(x_kde)
+
+    # === Trim fit to low-energy region ===
+    quantile_cutoff = 0.99
+    energy_cutoff = np.quantile(energies_np, quantile_cutoff)
+    low_energy_mask = bin_centers <= energy_cutoff
+    fit_mask = nonzero & low_energy_mask
+
+    x_fit = bin_centers[fit_mask]
+    log_y = np.log(hist_y[fit_mask])
+
+    # === Linear fit to log P(E) ≈ -βE + const
+    try:
+        slope, intercept, _, _, _ = linregress(x_fit, log_y)
+        beta_est = -slope
+    except:
+        slope, intercept = 1, 1
+
+    # === Boltzmann fit in linear space
+    boltzmann_y = np.exp(-beta_est * x_kde)
+    boltzmann_y /= (np.trapz(boltzmann_y, x_kde) + 1e-6)
+    log_fit = slope * bin_centers + intercept
+
+    # === Create subplots
+    fig = make_subplots(rows=1, cols=2, subplot_titles=('Probability Density', 'Log-Probability vs Energy'))
+
+    # --- Left plot: Linear space
+    fig.add_trace(go.Bar(
+        x=bin_centers, y=hist_y,
+        name='Histogram', opacity=0.5, showlegend=False,
+        marker_color='blue'
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=x_kde, y=y_kde,
+        mode='lines', name='KDE', line=dict(width=2),
+        showlegend=False,
+        marker_color='red'
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=x_kde, y=boltzmann_y,
+        mode='lines', name=f'Boltzmann Fit (β ≈ {beta_est:.2f})',
+        line=dict(dash='dot'),
+        showlegend=False,
+        marker_color='black'
+    ), row=1, col=1)
+    #
+    # fig.add_trace(go.Scatter(
+    #     x=[energy_cutoff, energy_cutoff],
+    #     y=[0, max(y_kde.max(), hist_y.max())],
+    #     mode='lines', name='Fit Cutoff',
+    #     line=dict(color='gray', dash='dash')
+    # ), row=1, col=1)
+
+    # --- Right plot: Log-space
+    fig.add_trace(go.Scatter(
+        x=bin_centers[nonzero], y=np.log(hist_y[nonzero]),
+        mode='markers+lines', name='log Histogram',
+        showlegend=False, marker_color='blue',
+        marker=dict(size=5), line=dict(width=2)
+    ), row=1, col=2)
+
+    fig.add_trace(go.Scatter(
+        x=bin_centers, y=log_fit,
+        mode='lines', name=f'Linear Fit (β ≈ {beta_est:.2f})',
+        line=dict(dash='dot', width=2),
+        marker_color='black',
+        showlegend=False
+    ), row=1, col=2)
+
+    # fig.add_trace(go.Scatter(
+    #     x=[energy_cutoff, energy_cutoff],
+    #     y=[min(log_y.min(), log_fit.min()), log_y.max()],
+    #     mode='lines', name='Fit Cutoff',
+    #     line=dict(color='gray', dash='dash')
+    # ), row=1, col=2)
+
+    # === Layout
+    fig.update_layout(
+        # height=500,
+        # width=1000,
+        template='plotly_white'
+    )
+    fig.update_layout(font_size=20)
+
+    fig.update_xaxes(title_text='Energy', row=1, col=1)
+    fig.update_yaxes(title_text='P(E)', row=1, col=1)
+
+    fig.update_xaxes(title_text='Energy', row=1, col=2)
+    fig.update_yaxes(title_text='log P(E)', row=1, col=2)
 
     return fig
