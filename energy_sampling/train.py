@@ -800,7 +800,7 @@ class Modeller:
 
                 self.reload_running_model(ema_model, gfn_model)
 
-                for key, opt in optimizers.items()():
+                for key, opt in optimizers.items():
                     if hit_threshold:
                         opt.state = defaultdict(dict)  # wipe also the momentum buffers
                     for g in opt.param_groups:
