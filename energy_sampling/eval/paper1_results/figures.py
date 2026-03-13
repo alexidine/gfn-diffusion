@@ -143,12 +143,12 @@ def general_figs(fig_dict, sample_batch, sample_energy, units):
     fig_dict['staircase_fig'] = fig
 
     fig_dict['std_marginals_fig'] = sample_batch.plot_batch_cell_params(space='latent',
-                                                                        #ref_dist=data_batch.full_cell_parameters(),
+                                                                        # ref_dist=data_batch.full_cell_parameters(),
                                                                         # quantiles=[0.1],
-                                                                        #override_energy=sample_energy,
+                                                                        # override_energy=sample_energy,
                                                                         return_fig=True,
                                                                         show=False)
-    #fig_dict['std_marginals_fig'].update_traces(name="Prior Dataset", selector=dict(name="Reference"))
+    # fig_dict['std_marginals_fig'].update_traces(name="Prior Dataset", selector=dict(name="Reference"))
     fig_dict['std_marginals_fig'].update_annotations(font_size=20)
 
     fig_dict['density_funnel_fig'] = sample_batch.plot_batch_density_funnel(
@@ -582,6 +582,7 @@ def parity_fig(
         y_raw,
         x_label='Target (Pf + R)',
         y_label='Model (Pb + Z)',
+        quantile_cut: float = None
 ):
     """
     Pure parity plot with a single global regression.
@@ -605,10 +606,15 @@ def parity_fig(
     except Exception:
         c = np.ones(len(x))
 
-    # regression
-    linreg = linregress(x.numpy(), y.numpy())
-    slope, intercept, r = linreg.slope, linreg.intercept, linreg.rvalue
+    if quantile_cut is not None:
+        lo, hi = np.quantile(x.numpy(), quantile_cut), np.quantile(x.numpy(), 1 - quantile_cut)
+        mask = (x.numpy() >= lo) & (x.numpy() <= hi)
+        xr, yr = x.numpy()[mask], y.numpy()[mask]
+    else:
+        xr, yr = x.numpy(), y.numpy()
 
+    linreg = linregress(xr, yr)
+    slope, intercept, r = linreg.slope, linreg.intercept, linreg.rvalue
     xx = np.linspace(xmin, xmax, 300)
     yy = slope * xx + intercept
 
@@ -1184,4 +1190,201 @@ def energy_marginal_fig(sample_energy):
     fig.update_xaxes(title_text='Energy', row=1, col=2)
     fig.update_yaxes(title_text='log P(E)', row=1, col=2)
 
+    return fig
+
+
+def dual_energy_marginal_fig(sample_energy1, sample_energy2,
+                             label1='Energy 1', label2='Energy 2'):
+    colors = {'1': 'steelblue', '2': 'firebrick'}
+
+    def process(sample_energy, color, label, fig, showlegend=True):
+        energies_np = sample_energy[sample_energy < 0].cpu().detach().numpy()
+
+        # histogram
+        hist_y, hist_x = np.histogram(energies_np, bins=50, density=True)
+        bin_centers = 0.5 * (hist_x[1:] + hist_x[:-1])
+        nonzero = hist_y > 0
+
+        # KDE
+        kde = gaussian_kde(energies_np, bw_method=0.3)
+        x_kde = np.linspace(energies_np.min(), energies_np.max(), 500)
+        y_kde = kde(x_kde)
+
+        # fit
+        quantile_cutoff = 0.99
+        energy_cutoff = np.quantile(energies_np, quantile_cutoff)
+        low_energy_mask = bin_centers <= energy_cutoff
+        fit_mask = nonzero & low_energy_mask
+        x_fit = bin_centers[fit_mask]
+        log_y = np.log(hist_y[fit_mask])
+
+        try:
+            slope, intercept, _, _, _ = linregress(x_fit, log_y)
+            beta_est = -slope
+        except:
+            slope, intercept, beta_est = 1, 1, 1
+
+        boltzmann_y = np.exp(-beta_est * x_kde)
+        boltzmann_y /= (np.trapz(boltzmann_y, x_kde) + 1e-6)
+        log_fit = slope * bin_centers + intercept
+
+        # left: linear
+        fig.add_trace(go.Bar(
+            x=bin_centers, y=hist_y,
+            name=label, opacity=0.4, showlegend=False,
+            marker_color=color,
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=x_kde, y=y_kde, mode='lines',
+            name=label, line=dict(width=2, color=color),
+            showlegend=showlegend, legendgroup=label,
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=x_kde, y=boltzmann_y, mode='lines',
+            name=f'{label} Boltzmann (β≈{beta_est:.2f})',
+            line=dict(dash='dot', width=1.5, color=color),
+            showlegend=False, legendgroup=f'{label}_fit',
+        ), row=1, col=1)
+
+        # right: log
+        fig.add_trace(go.Scatter(
+            x=bin_centers[nonzero], y=np.log(hist_y[nonzero]),
+            mode='markers+lines',
+            name=label, line=dict(width=2, color=color),
+            marker=dict(size=5, color=color),
+            showlegend=False, legendgroup=label,
+        ), row=1, col=2)
+        fig.add_trace(go.Scatter(
+            x=bin_centers, y=log_fit, mode='lines',
+            name=f'{label} fit (β≈{beta_est:.2f})',
+            line=dict(dash='dot', width=1.5, color=color),
+            showlegend=False, legendgroup=f'{label}_fit',
+        ), row=1, col=2)
+
+    fig = make_subplots(rows=1, cols=2, subplot_titles=('Probability Density', 'Log-Probability vs Energy'))
+    process(sample_energy1, colors['1'], label1, fig, showlegend=True)
+    process(sample_energy2, colors['2'], label2, fig, showlegend=True)
+
+    fig.update_layout(template='plotly_white', font_size=20)
+    fig.update_xaxes(title_text='Energy', row=1, col=1)
+    fig.update_yaxes(title_text='P(E)', row=1, col=1)
+    fig.update_xaxes(title_text='Energy', row=1, col=2)
+    fig.update_yaxes(title_text='log P(E)', row=1, col=2)
+
+    return fig
+
+
+def bivariate_energy_color(energy, free_energy, clip_quantile=0.01):
+    """
+    Blue = low energy AND low free energy (target basin)
+    Red channel = normalized energy
+    Green channel = normalized free energy
+    Blue channel = 1 - max(r, g)  →  high when both are low
+    """
+    def robust_norm(x, clip_quantile):
+        lo = np.quantile(x, clip_quantile)
+        hi = np.quantile(x, 1 - clip_quantile)
+        return np.clip((x - lo) / (hi - lo), 0, 1)
+
+    r = robust_norm(energy, clip_quantile)
+    g = robust_norm(free_energy, clip_quantile)
+    b = 1 - np.maximum(r, g)
+
+    rgb = np.stack([r, g, b], axis=1)
+    return [f'rgb({int(c[0]*255)},{int(c[1]*255)},{int(c[2]*255)})' for c in rgb]
+
+import numpy as np
+import plotly.graph_objects as go
+from PIL import Image
+import io, base64
+
+def make_bivariate_colorbar_image(size=128):
+    """Returns a base64 PNG of the 2D colorbar."""
+    arr = np.zeros((size, size, 3), dtype=np.uint8)
+    for py in range(size):
+        for px in range(size):
+            r = px / (size - 1)                    # energy: left=low, right=high
+            g = 1 - py / (size - 1)                # free energy: bottom=low, top=high
+            b = max(0.0, 1 - max(r, g))
+            arr[py, px] = [int(r*255), int(g*255), int(b*255)]
+    img = Image.fromarray(arr, 'RGB')
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    return base64.b64encode(buf.getvalue()).decode()
+
+def add_bivariate_colorbar(fig, x0=0.78, y0=0.02, size=0.18):
+    """
+    Inset a 2D colorbar square into an existing figure.
+    x0, y0: bottom-left corner in paper coords (0-1)
+    size: width and height in paper coords
+    """
+    b64 = make_bivariate_colorbar_image()
+
+    fig.add_layout_image(
+        source=f"data:image/png;base64,{b64}",
+        xref="paper", yref="paper",
+        x=x0, y=y0 + size,   # top-left anchor
+        sizex=size, sizey=size,
+        xanchor="left", yanchor="top",
+        layer="above",
+        sizing="stretch",
+    )
+
+    # border rect
+    fig.add_shape(
+        type="rect", xref="paper", yref="paper",
+        x0=x0, y0=y0, x1=x0+size, y1=y0+size,
+        line=dict(color="black", width=0.8),
+        fillcolor="rgba(0,0,0,0)",
+        layer="above",
+    )
+
+    # axis labels
+    mid = x0 + size / 2
+    fig.add_annotation(
+        xref="paper", yref="paper",
+        x=mid, y=y0 - 0.03,
+        text="Lattice Energy →", showarrow=False,
+        font=dict(size=9, family="Helvetica"), xanchor="center",
+    )
+    fig.add_annotation(
+        xref="paper", yref="paper",
+        x=x0 - 0.02, y=y0 + size,
+        text="Free Energy →", showarrow=False,
+        font=dict(size=9, family="Helvetica"), xanchor="center",
+        textangle=-90,
+    )
+
+    # # corner tick labels
+    # for (x, y, label, xa, ya) in [
+    #     (x0,        y0,        "●", "left",   "top"),     # low E, low ΔG  → blue
+    #     (x0+size,   y0,        "●", "right",  "top"),     # high E, low ΔG → red
+    #     (x0,        y0+size,   "●", "left",   "bottom"),  # low E, high ΔG → green
+    #     (x0+size,   y0+size,   "●", "right",  "bottom"),  # high E, high ΔG→ black
+    # ]:
+    #     fig.add_annotation(
+    #         xref="paper", yref="paper",
+    #         x=x, y=y, text=label, showarrow=False,
+    #         font=dict(size=7, color="rgba(0,0,0,0.4)"),
+    #         xanchor=xa, yanchor=ya,
+    #     )
+
+    return fig
+
+
+
+def rdf_embedding_fig(sample_embedding, uma_en, uma_free_energy):
+    en_colors = bivariate_energy_color(uma_en.clip(max=0), uma_free_energy, clip_quantile=0.1)
+
+    fig = go.Figure()
+    fig.add_scattergl(x=sample_embedding[:, 0],
+                      y=sample_embedding[:, 1],
+                      marker_color=en_colors, mode='markers',
+                      opacity=0.65)
+    fig.update_layout(xaxis_showgrid=False, yaxis_showgrid=False, xaxis_zeroline=False, yaxis_zeroline=False,
+                      xaxis_title='CV1', yaxis_title='CV2', xaxis_showticklabels=False, yaxis_showticklabels=False,
+                      plot_bgcolor='rgba(0,0,0,0)')
+    fig = add_bivariate_colorbar(fig, 0.8, 0.85, size=0.2)
+    fig.update_annotations(font_size=20)
+    fig.update_layout(font_size=20)
     return fig

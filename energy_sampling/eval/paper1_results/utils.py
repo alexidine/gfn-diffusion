@@ -1266,6 +1266,38 @@ def bottom_up_cluster(xx, e, d_cut, e_cut, max_new_samples: int, device):
     return keep_inds.cpu()
 
 
+
+def bottom_up_cluster_w_dmat(e, d_cut, e_cut, max_new_samples: int, device, dmat):
+    # Sort by energy ascending
+    sort_inds = torch.argsort(e.to(device))
+    dmat_sorted = dmat.to(device)[sort_inds]
+    e_sorted = e.to(device)[sort_inds]
+    mask = e_sorted < e_cut
+    N = len(dmat)
+
+    blocked = torch.zeros(N, dtype=torch.bool, device=device)
+    keep = torch.zeros(N, dtype=bool, device=device)
+    d_cut_squared = d_cut * d_cut
+    for i in range(N):
+        if not mask[i]:
+            break
+
+        if blocked[i]:
+            continue
+
+        keep[i] = True
+        if torch.sum(keep) == max_new_samples:
+            break
+
+        drow = dmat[i]
+        nearby = drow < d_cut_squared
+        blocked |= nearby
+
+    keep_inds = sort_inds[keep]
+
+    return keep_inds.cpu()
+
+
 def simple_dedupe(samples, d_cut, rdf_cut):
     "Cluster / dedupe"
     batch = collate_data_list(samples)

@@ -159,93 +159,96 @@ if __name__ == '__main__':
 
             d_metrics.append(sample_metrics)
 
-    for sample_metrics, d_cut in zip(d_metrics, d_cuts):
-        # basin_mask_energy, basin_assignments_energy = assign_basins(sample_metrics['local_energy_minimum_id'],
-        #                                                             sample_batch.num_graphs)
-        # basin_mask_density, basin_assignments_density = assign_basins(sample_metrics['local_density_maximum_id'],
-        #                                                               sample_batch.num_graphs)
-
-        minima_inds = np.argwhere(sample_metrics['is_local_en_minimum']).flatten()
-        sorted_minima_inds = minima_inds[np.argsort(sample_energy[minima_inds])]
-        maxima_inds = np.argwhere(
-            sample_metrics['is_local_density_maximum'] & (sample_energy < np.median(sample_energy)).numpy()).flatten()
-        sorted_maxima_inds = maxima_inds[np.argsort(sample_metrics['density'][maxima_inds])][::-1]
-        target_ind = sample_batch.num_graphs - 1
-        sample_inds = np.concatenate([np.ones(1).astype(np.long) * target_ind, sorted_minima_inds[:8]])
-        # sample_inds = np.concatenate([sorted_minima_inds[:12], sorted_maxima_inds[:12]])  # add experimental state
-
-        basins_table(config.results_dir, config.run_name, sample_metrics, sample_inds)
-        vars_table(config.results_dir, config.run_name, sample_metrics, sample_inds)
-
-    fig_dict = {}
-    fig_dict = general_figs(fig_dict,
-                            sample_batch,
-                            sample_energy,
-                            'kJ/mol')
-
-    x = results_dict['log_pbs'] + rewards[:-1]
-    y = results_dict['log_pfs'] + results_dict['learned_log_z']
-    fig_dict['TB_fig'] = parity_fig(x, y, "Pb + R", "Pf + Z")
-
-    """rdf embedding"""
-    from mxtaltools.analysis.crystal_rdf import compute_rdf_distmat
-
-    dmat = compute_rdf_distmat(sample_batch.rdf.cuda(), bins.cuda())
-    umap_model = UMAP(n_components=2, n_neighbors=500, min_dist=0.5,
-                      init='pca', metric='precomputed', low_memory=True, n_jobs=-1)
-    sample_embedding = umap_model.fit_transform(dmat.cpu().numpy().astype(np.float32))
-
-    basin_mask_energy, basin_assignments_energy = assign_basins(d_metrics[-1]['local_energy_minimum_id'], sample_batch.num_graphs)
-    #basin_mask_density, basin_assignments_density = assign_basins(d_metrics[-1]['local_density_maximum_id'],sample_batch.num_graphs)
-    en_basin_inds = np.unique(basin_assignments_energy)
-    en_basin_inds = en_basin_inds[en_basin_inds >= 0]
-
-    den_basin_inds = np.zeros_like(en_basin_inds)
-    for ind in range(len(en_basin_inds)):
-        local_densities = d_metrics[-1]['density'][basin_mask_energy[ind]]
-        max_den = local_densities.argmax()
-        den_basin_inds[ind] = basin_mask_energy[ind].argwhere().flatten()[max_den]
-
-    basins = basin_mask_energy
-    basin_sort_inds = torch.argsort(basins.sum(-1), descending=True).flatten()
-    n_basins = 10
-    top_basins = basins[basin_sort_inds][:n_basins]
-    en_basin_inds = en_basin_inds[basin_sort_inds][:n_basins]
-    den_basin_inds = den_basin_inds[basin_sort_inds][:n_basins]
-
-    fig = go.Figure()
-    fig.add_scatter(x=sample_embedding[:, 0], y=sample_embedding[:, 1], marker_color='grey', mode='markers',
-                    opacity=0.5, marker_size=6)
-    for c_ind, basin in enumerate(top_basins):
-        fig.add_scatter(x=sample_embedding[basin, 0], y=sample_embedding[basin, 1], mode='markers', opacity=0.65,
-                        name=f"{c_ind} : {basin.sum().item()}")
-
-    # Energy minima — big stars
-    fig.add_scatter(x=sample_embedding[en_basin_inds, 0],
-                    y=sample_embedding[en_basin_inds, 1],
-                    mode='markers+text', name='E minima',
-                    text=[str(i) for i in range(10)], textposition='top center',
-                    marker=dict(size=16, symbol='star', color='black', line=dict(width=1, color='white')))
-
-    # Density maxima — big diamonds
-    fig.add_scatter(x=sample_embedding[den_basin_inds, 0],
-                    y=sample_embedding[den_basin_inds, 1],
-                    mode='markers+text', name='ρ maxima',
-                    text=[str(i) for i in range(10)], textposition='top center',
-                    marker=dict(size=14, symbol='diamond', color='red', line=dict(width=1, color='white')))
-
-    fig.add_scatter(x=sample_embedding[target_ind:target_ind + 1, 0],
-                    y=sample_embedding[target_ind:target_ind + 1, 1],
-                    mode='markers', name='Experimental Polymorph',
-                    marker=dict(size=18, symbol='x', color='green',
-                                line=dict(width=2, color='darkgreen')))
-
-    fig_dict['embeddings'] = fig
-    for key, fig in fig_dict.items():
-        fig.show()
-        fig.write_image(os.path.join(config.results_dir, config.run_name + f'_{key}.png'))
-
-    aa = 1
+    results_dict.update(d_metrics[-1])
+    torch.save(results_dict, results_path)
+    #
+    # for sample_metrics, d_cut in zip(d_metrics, d_cuts):
+    #     # basin_mask_energy, basin_assignments_energy = assign_basins(sample_metrics['local_energy_minimum_id'],
+    #     #                                                             sample_batch.num_graphs)
+    #     # basin_mask_density, basin_assignments_density = assign_basins(sample_metrics['local_density_maximum_id'],
+    #     #                                                               sample_batch.num_graphs)
+    #
+    #     minima_inds = np.argwhere(sample_metrics['is_local_en_minimum']).flatten()
+    #     sorted_minima_inds = minima_inds[np.argsort(sample_energy[minima_inds])]
+    #     maxima_inds = np.argwhere(
+    #         sample_metrics['is_local_density_maximum'] & (sample_energy < np.median(sample_energy)).numpy()).flatten()
+    #     sorted_maxima_inds = maxima_inds[np.argsort(sample_metrics['density'][maxima_inds])][::-1]
+    #     target_ind = sample_batch.num_graphs - 1
+    #     sample_inds = np.concatenate([np.ones(1).astype(np.long) * target_ind, sorted_minima_inds[:8]])
+    #     # sample_inds = np.concatenate([sorted_minima_inds[:12], sorted_maxima_inds[:12]])  # add experimental state
+    #
+    #     basins_table(config.results_dir, config.run_name, sample_metrics, sample_inds)
+    #     vars_table(config.results_dir, config.run_name, sample_metrics, sample_inds)
+    #
+    # fig_dict = {}
+    # fig_dict = general_figs(fig_dict,
+    #                         sample_batch,
+    #                         sample_energy,
+    #                         'kJ/mol')
+    #
+    # x = results_dict['log_pbs'] + rewards[:-1]
+    # y = results_dict['log_pfs'] + results_dict['learned_log_z']
+    # fig_dict['TB_fig'] = parity_fig(x, y, "Pb + R", "Pf + Z")
+    #
+    # """rdf embedding"""
+    # from mxtaltools.analysis.crystal_rdf import compute_rdf_distmat
+    #
+    # dmat = compute_rdf_distmat(sample_batch.rdf.cuda(), bins.cuda())
+    # umap_model = UMAP(n_components=2, n_neighbors=500, min_dist=0.5,
+    #                   init='pca', metric='precomputed', low_memory=True, n_jobs=-1)
+    # sample_embedding = umap_model.fit_transform(dmat.cpu().numpy().astype(np.float32))
+    #
+    # basin_mask_energy, basin_assignments_energy = assign_basins(d_metrics[-1]['local_energy_minimum_id'], sample_batch.num_graphs)
+    # #basin_mask_density, basin_assignments_density = assign_basins(d_metrics[-1]['local_density_maximum_id'],sample_batch.num_graphs)
+    # en_basin_inds = np.unique(basin_assignments_energy)
+    # en_basin_inds = en_basin_inds[en_basin_inds >= 0]
+    #
+    # den_basin_inds = np.zeros_like(en_basin_inds)
+    # for ind in range(len(en_basin_inds)):
+    #     local_densities = d_metrics[-1]['density'][basin_mask_energy[ind]]
+    #     max_den = local_densities.argmax()
+    #     den_basin_inds[ind] = basin_mask_energy[ind].argwhere().flatten()[max_den]
+    #
+    # basins = basin_mask_energy
+    # basin_sort_inds = torch.argsort(basins.sum(-1), descending=True).flatten()
+    # n_basins = 10
+    # top_basins = basins[basin_sort_inds][:n_basins]
+    # en_basin_inds = en_basin_inds[basin_sort_inds][:n_basins]
+    # den_basin_inds = den_basin_inds[basin_sort_inds][:n_basins]
+    #
+    # fig = go.Figure()
+    # fig.add_scatter(x=sample_embedding[:, 0], y=sample_embedding[:, 1], marker_color='grey', mode='markers',
+    #                 opacity=0.5, marker_size=6)
+    # for c_ind, basin in enumerate(top_basins):
+    #     fig.add_scatter(x=sample_embedding[basin, 0], y=sample_embedding[basin, 1], mode='markers', opacity=0.65,
+    #                     name=f"{c_ind} : {basin.sum().item()}")
+    #
+    # # Energy minima — big stars
+    # fig.add_scatter(x=sample_embedding[en_basin_inds, 0],
+    #                 y=sample_embedding[en_basin_inds, 1],
+    #                 mode='markers+text', name='E minima',
+    #                 text=[str(i) for i in range(10)], textposition='top center',
+    #                 marker=dict(size=16, symbol='star', color='black', line=dict(width=1, color='white')))
+    #
+    # # Density maxima — big diamonds
+    # fig.add_scatter(x=sample_embedding[den_basin_inds, 0],
+    #                 y=sample_embedding[den_basin_inds, 1],
+    #                 mode='markers+text', name='ρ maxima',
+    #                 text=[str(i) for i in range(10)], textposition='top center',
+    #                 marker=dict(size=14, symbol='diamond', color='red', line=dict(width=1, color='white')))
+    #
+    # fig.add_scatter(x=sample_embedding[target_ind:target_ind + 1, 0],
+    #                 y=sample_embedding[target_ind:target_ind + 1, 1],
+    #                 mode='markers', name='Experimental Polymorph',
+    #                 marker=dict(size=18, symbol='x', color='green',
+    #                             line=dict(width=2, color='darkgreen')))
+    #
+    # fig_dict['embeddings'] = fig
+    # for key, fig in fig_dict.items():
+    #     fig.show()
+    #     fig.write_image(os.path.join(config.results_dir, config.run_name + f'_{key}.png'))
+    #
+    # aa = 1
 
 
     #

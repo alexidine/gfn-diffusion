@@ -31,14 +31,17 @@ def collate_generate_prior():
             make sure we are latent-safe, and filter degenerate boxes (ultra-flat cells)
             """
     sample_batch = collate_data_list(opt_samples)
-    sample_batch.latent_to_cell_params(sample_batch.latent_params())  # get safely into the latent space
+    sample_batch.latent_to_cell_params(sample_batch.latent_params())
+    analyses = ['lj', 'vdw', 'vdw_max']
+    analyses.append(energy_function)
     sample_batch = adaptive_batched_analysis(
-        sample_batch, analyses=[energy_function], state={},
+        sample_batch, analyses=analyses, state={},
         initial_batch_size=10000, predictor=predictor,
         device=device, show_tqdm=True
     )
     sample_batch = sample_batch.to('cpu')
     opt_samples = sample_batch.batch_to_list()  # corrected latents
+    # manually filter severe vdW overlaps
     params = sample_batch.latent_params()
     ens = sample_batch[energy_function]
     cell_params = sample_batch.full_cell_parameters()
@@ -46,7 +49,7 @@ def collate_generate_prior():
     angles = cell_params[:, 3:6]
     volumes = sample_batch.cell_volume
     angular_factor = volumes / lengths.prod(dim=-1)
-    good_inds = (angular_factor > 0.1).argwhere().flatten()  # nearly degenerate cells
+    good_inds = ((angular_factor > 0.1) & (sample_batch.vdw_max < 1.5)).argwhere().flatten()  # nearly degenerate cells
     good_samples = [opt_samples[ind] for ind in good_inds]
     sample_batch = collate_data_list(good_samples)
     sample_batch.latent_to_cell_params(sample_batch.latent_params())  # get safely into the latent space
@@ -99,9 +102,9 @@ if __name__ == '__main__':
     # device = 'cuda'
     # nehzor
     search_output_dir = r"D:\crystal_datasets\nehzor"
-    run_name = 'nehzor_elj'
+    run_name = 'nehzor_uma'
     identifier = 'NEHZOR'
-    energy_function = 'elj'
+    energy_function = 'uma'
     target_path = r"D:\crystal_datasets\nehzor\NEHZOR01_standardized.pt"
     uma_model_path = r"D:\crystal_datasets\esen_s.pt"
     device = 'cuda'
@@ -125,6 +128,8 @@ if __name__ == '__main__':
     target_mol.aunit_handedness = target_mol.aunit_handedness.abs()
     zp = target_mol.z_prime
     sg = target_mol.sg_ind
+
+    # todo we need to filter samples which are obviously insane but UMA for some reason doesn't grok
 
     dataset_filename = run_name + '_prior_dataset.pt'
 

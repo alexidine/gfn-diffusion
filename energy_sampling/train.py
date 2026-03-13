@@ -213,7 +213,6 @@ class Modeller:
             lr = optimizers['fwd'].param_groups[0]['lr']
             if not self.lr_warmup_finished:
                 schedulers['policy_1'].step()
-                schedulers['flow'].step()
                 schedulers['policy_1b'].step()
 
                 if lr >= self.args.lr_policy:
@@ -222,6 +221,8 @@ class Modeller:
             elif lr > self.args.min_lr:
                 schedulers['policy_2'].step()
                 schedulers['policy_2b'].step()
+
+            schedulers['flow'].step()
 
             return lr
         else:
@@ -386,12 +387,12 @@ class Modeller:
     def init_schedulers_optimizers(self, gfn_model):
         if self.args.scheduler:
             init_fwd_lr = self.args.lr_policy / self.args.lr_warmup_ratio
-            init_flow_lr = self.args.lr_flow / self.args.lr_warmup_ratio
             init_bwd_lr = self.args.lr_back / self.args.lr_warmup_ratio
         else:
             init_fwd_lr = self.args.lr_policy
             init_bwd_lr = self.args.lr_back
-            init_flow_lr = self.args.lr_flow
+
+        init_flow_lr = self.args.lr_flow
 
         """
         Initialize Optimizers
@@ -424,21 +425,19 @@ class Modeller:
         schedulers = {}
         if self.args.scheduler:
             lr_warmup_lambda = get_annealing_factor(1, self.args.lr_warmup_ratio, self.args.lr_warmup_time, 10)
-
-            lr_annealing_lambda = get_annealing_factor(self.args.lr_policy, self.args.min_lr, self.args.lr_anneal_time,
-                                                       10)
+            lr_annealing_lambda = get_annealing_factor(self.args.lr_policy, self.args.min_lr, self.args.lr_anneal_time,10)
             schedulers['policy_1'] = lr_scheduler.MultiplicativeLR(
                 optimizers['fwd'], lr_lambda=lambda epoch: lr_warmup_lambda)
             schedulers['policy_2'] = lr_scheduler.MultiplicativeLR(
                 optimizers['fwd'], lr_lambda=lambda epoch: lr_annealing_lambda)
+
             schedulers['policy_1b'] = lr_scheduler.MultiplicativeLR(
                 optimizers['bwd'], lr_lambda=lambda epoch: lr_warmup_lambda)
             schedulers['policy_2b'] = lr_scheduler.MultiplicativeLR(
                 optimizers['bwd'], lr_lambda=lambda epoch: lr_annealing_lambda)
 
-            flow_annealing_lambda = get_annealing_factor(1, self.args.lr_warmup_ratio, self.args.lr_anneal_time, 10)
-            schedulers['flow'] = lr_scheduler.MultiplicativeLR(
-                optimizers['flow'], lr_lambda=lambda epoch: flow_annealing_lambda)
+            flow_annealing_lambda = get_annealing_factor(1, 0.1, self.args.lr_anneal_time, 10)
+            schedulers['flow'] = lr_scheduler.MultiplicativeLR(optimizers['flow'], lr_lambda=lambda epoch: flow_annealing_lambda)
 
         return optimizers, schedulers
 
@@ -760,7 +759,7 @@ class Modeller:
 
     def reload_running_model(self, ema_model, gfn_model):
         try:
-            gfn_model.load_state_dict(torch.load(f'checkpoints/{self.run_name}_model_train.pt'))
+            gfn_model.load_state_dict(torch.load(f'checkpoints/{self.run_name}_model_eval.pt'))  # eval model is a more stable basline to retry from
             ema_model.load_state_dict(torch.load(f'checkpoints/{self.run_name}_model_eval.pt'))
             gfn_model.train()
             ema_model.eval()
@@ -790,8 +789,7 @@ class Modeller:
             diffs = torch.diff(losses, dim=0)
 
             hit_threshold = current_loss > threshold  # loss exploding
-            increasing_loss = (torch.mean((diffs[
-                                               -grace_time:] > 0).float()) > 0.8) and self.increasing_loss_cooldown <= 0  # loss slowly increasing
+            increasing_loss = (torch.mean((diffs[-grace_time:] > 0).float()) > 0.8) and self.increasing_loss_cooldown <= 0  # loss slowly increasing
 
             if hit_threshold or increasing_loss:
                 print("Losses increasing! Reloading best checkpoint and slashing LR.")
@@ -802,19 +800,20 @@ class Modeller:
 
                 self.reload_running_model(ema_model, gfn_model)
 
-                for opt in optimizers.values():
+                for key, opt in optimizers.items()():
                     if hit_threshold:
                         opt.state = defaultdict(dict)  # wipe also the momentum buffers
                     for g in opt.param_groups:
                         if g['lr'] > self.args.min_lr:
-                            g['lr'] *= 0.85
+                            g['lr'] = max(g['lr'] * 0.9, self.args.min_lr)
 
                 if not hasattr(self, 'lr_cut_count'):
                     self.lr_cut_count = 1
                 else:
                     self.lr_cut_count += 1
 
-                self.lr_warmup_finished = True
+                if self.lr_cut_count > 5:
+                    self.lr_warmup_finished = True
 
                 if increasing_loss:
                     self.increasing_loss_cooldown = grace_time
@@ -1433,7 +1432,7 @@ class Modeller:
                 max=min(80, log_importance_weight_i.quantile(0.99)))
 
             importance_weight = (log_importance_weight_i).exp()
-            good_reward = rewards > (rewards.quantile(0.25))  # limit importance sampling to high reward samples
+            good_reward = rewards > (rewards.quantile(0.05))  # limit importance sampling to high reward samples
             importance_weight[~good_reward] = 1e-20
             importance_weight = importance_weight.numpy().astype(np.float64)
             importance_weight /= importance_weight.sum()

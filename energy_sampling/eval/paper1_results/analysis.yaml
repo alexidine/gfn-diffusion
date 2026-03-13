@@ -1,7 +1,44 @@
+# Analysis configuration
+run_name: mipcas_uma
+device: cuda
+energy_function: uma  # elj, uma
+n_steps: 100
+sg_ind: 2
+zp: 1
+kT: 2.5
+units: 'kJ/mol'
+
+# Sampling
+num_samples: 10000
+batch_size: 10
+alpha: 2.0
+
+# Flags
+reload_results: true
+show_figs: true
+write_figs: false
+save_results: true
+overwrite_results: true
+
+# Paths
+data_root: D:\crystal_datasets
+results_dir: D:\crystal_datasets\gfn_results
+
+# Model paths
+model_path: D:\crystal_datasets\mipcas\mipcas_2_mipcas_2_uma_baseline_10_model_eval.pt
+config_path: D:\crystal_datasets\mipcas\mipcas_2_mipcas_2_uma_baseline_10_model_config.npy
+#model_path: D:\crystal_datasets\mipcas\mipcas_2_mipcas_2_baseline_0_model_eval.pt
+#config_path: D:\crystal_datasets\mipcas\mipcas_2_mipcas_2_baseline_0_model_config.npy
+
+# Data paths
+molecule_path: D:\crystal_datasets\mipcas\MIPCAS_standardized.pt
+exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized.pt
+dataset_path: D:\crystal_datasets\mipcas\mipcas_uma_prior_dataset.pt
+#
 ## Analysis configuration
-#run_name: mipcas_uma
+#run_name: mipcas_elj
 #device: cuda
-#energy_function: uma  # elj, uma
+#energy_function: elj  # elj, uma
 #n_steps: 100
 #sg_ind: 2
 #zp: 1
@@ -25,50 +62,13 @@
 #results_dir: D:\crystal_datasets\gfn_results
 #
 ## Model paths
-#model_path: D:\crystal_datasets\mipcas\mipcas_2_mipcas_2_uma_baseline_10_model_eval.pt
-#config_path: D:\crystal_datasets\mipcas\mipcas_2_mipcas_2_uma_baseline_10_model_config.npy
+#model_path: D:\crystal_datasets\mipcas\mipcas_2_mipcas_2_baseline_0_model_eval.pt
+#config_path: D:\crystal_datasets\mipcas\mipcas_2_mipcas_2_baseline_0_model_config.npy
 ##model_path: D:\crystal_datasets\mipcas\mipcas_2_mipcas_2_baseline_0_model_eval.pt
 ##config_path: D:\crystal_datasets\mipcas\mipcas_2_mipcas_2_baseline_0_model_config.npy
 #
 ## Data paths
 #molecule_path: D:\crystal_datasets\mipcas\MIPCAS_standardized.pt
 #exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized.pt
-#dataset_path: D:\crystal_datasets\mipcas\mipcas_uma_prior_dataset.pt
-
-# Analysis configuration
-run_name: mipcas_elj
-device: cuda
-energy_function: elj  # elj, uma
-n_steps: 100
-sg_ind: 2
-zp: 1
-kT: 2.5
-units: 'kJ/mol'
-
-# Sampling
-num_samples: 10000
-batch_size: 10
-alpha: 2.0
-
-# Flags
-reload_results: false
-show_figs: true
-write_figs: false
-save_results: true
-overwrite_results: true
-
-# Paths
-data_root: D:\crystal_datasets
-results_dir: D:\crystal_datasets\gfn_results
-
-# Model paths
-model_path: D:\crystal_datasets\mipcas\mipcas_2_mipcas_2_baseline_0_model_eval.pt
-config_path: D:\crystal_datasets\mipcas\mipcas_2_mipcas_2_baseline_0_model_config.npy
-#model_path: D:\crystal_datasets\mipcas\mipcas_2_mipcas_2_baseline_0_model_eval.pt
-#config_path: D:\crystal_datasets\mipcas\mipcas_2_mipcas_2_baseline_0_model_config.npy
-
-# Data paths
-molecule_path: D:\crystal_datasets\mipcas\MIPCAS_standardized.pt
-exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized.pt
-dataset_path: D:\crystal_datasets\mipcas\mipcas_elj_prior_dataset.pt
-
+#dataset_path: D:\crystal_datasets\mipcas\mipcas_elj_prior_dataset.pt
+#

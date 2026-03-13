@@ -59,7 +59,7 @@ class MolecularCrystal(BaseSet):
                  z_primes: Tuple[int] = (1,),
                  uma_path: Optional[str] = None,
                  reward_range: float = None,
-                 lj_rescale: list = None,
+                 lj_rescale: float = None,
                  ):
 
         super(MolecularCrystal, self).__init__()
