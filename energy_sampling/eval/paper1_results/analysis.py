@@ -2,15 +2,10 @@ import os
 
 import numpy as np
 import torch
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from umap import UMAP
 
-from energy_sampling.eval.paper1_results.figures import sparkbar_table, \
-    general_figs, parity_fig
+from energy_sampling.eval.paper1_results.figures import sparkbar_table
 from energy_sampling.eval.paper1_results.utils import generator_reward, new_local_analysis, sample_and_analyze, \
-    load_experimental_structure, \
-    assign_basins
+    load_experimental_structure
 from energy_sampling.utils import load_yaml, dict2namespace
 from mxtaltools.analysis.crystal_rdf import rdf_radial_graph
 from mxtaltools.dataset_utils.utils import collate_data_list
@@ -29,9 +24,9 @@ def basins_table(results_dir, run_name, sample_metrics, sample_inds):
         'local_en_var': 'σ²(E)',
     }
     metric_keys = ['energy',
-        'density', 'local_max_density',
-        'local_dist_mean', 'local_dist_var',
-        'local_en_mean', 'local_en_var']
+                   'density', 'local_max_density',
+                   'local_dist_mean', 'local_dist_var',
+                   'local_en_mean', 'local_en_var']
     sparkbar_table(
         {display_names[k]: sample_metrics[k][sample_inds] for k in metric_keys},
         save_path=os.path.join(results_dir, run_name + '_basins_table.png'))
@@ -144,7 +139,7 @@ if __name__ == '__main__':
                                                 neighbor_lists,
                                                 neighbor_dists,
                                                 samples_to_analyze=np.arange(sample_batch.num_graphs),
-                                                d_kernel = d_cut / 3,
+                                                d_kernel=d_cut / 3,
                                                 e_cut=config.alpha * config.kT,
                                                 )
             ndims = sample_batch.latent_params().shape[-1]
@@ -161,6 +156,7 @@ if __name__ == '__main__':
 
     results_dict.update(d_metrics[-1])
     torch.save(results_dict, results_path)
+    aa = 1
     #
     # for sample_metrics, d_cut in zip(d_metrics, d_cuts):
     #     # basin_mask_energy, basin_assignments_energy = assign_basins(sample_metrics['local_energy_minimum_id'],
@@ -249,7 +245,6 @@ if __name__ == '__main__':
     #     fig.write_image(os.path.join(config.results_dir, config.run_name + f'_{key}.png'))
     #
     # aa = 1
-
 
     #
     # X = sample_batch.latent_params()

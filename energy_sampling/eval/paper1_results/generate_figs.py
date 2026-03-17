@@ -1,15 +1,17 @@
 """analysis and figures for the results section of the paper"""
+from copy import copy
+
 import numpy as np
-import plotly.graph_objects as go
-from umap import UMAP
-
-from energy_sampling.eval.paper1_results.figures import parity_fig, energy_marginal_fig, dual_energy_marginal_fig, \
-    rdf_embedding_fig
-from energy_sampling.eval.paper1_results.utils import load_experimental_structure, generator_reward, \
-    bottom_up_cluster_w_dmat
 import torch
+from ase.io import write
+from umap import UMAP
+import plotly.graph_objects as go
 
+from energy_sampling.eval.paper1_results.figures import parity_fig, dual_energy_marginal_fig, \
+    rdf_embedding_fig, polymorph_summary_table, pes_cartoon
+from energy_sampling.eval.paper1_results.utils import load_experimental_structure, generator_reward
 from mxtaltools.analysis.crystal_rdf import compute_rdf_distmat
+from mxtaltools.common.ase_interface import ase_mol_from_crystaldata
 from mxtaltools.dataset_utils.data_class_methods.crystal_ops import plot_dual_density_contour
 from mxtaltools.dataset_utils.utils import collate_data_list
 
@@ -123,39 +125,121 @@ fig_dict['elj_staircase'] = elj_staircase
 fig_dict['uma_staircase'] = uma_staircase
 
 '''Big 'ol combo plot'''
-# add here the callout samples
-# then, add callout samples
-# always take experimental polymorphs
 
-uma_rdf = uma_batch.rdf
-rdf_bins = torch.linspace(0,100, uma_rdf.shape[-1])
+rdf_bins = torch.linspace(0, 100, uma_batch.rdf.shape[-1])
 with torch.no_grad():
-    dmat = compute_rdf_distmat(uma_rdf.cuda(), rdf_bins.cuda()).cpu()
+    dmat = compute_rdf_distmat(torch.cat([uma_batch.rdf, ebatch.rdf], dim=0).cuda(), rdf_bins.cuda()).cpu()
+
+sample_energy = torch.cat([uma_batch.uma, ebatch.uma], dim=0)
+minima_inds = np.argwhere(uma_results['is_local_en_minimum']).flatten()
+sorted_minima_inds = minima_inds[np.argsort(sample_energy[minima_inds])]
+related_maxima = uma_results['local_density_maximum_id'][sorted_minima_inds]
+callout_samples = []
+polymorph_inds = [len(uma_results['density']) - 1 - ind for ind in range(ebatch.num_graphs)]
+callout_samples.extend(polymorph_inds)
+callout_samples.extend(sorted_minima_inds)
+callout_samples = list(set(callout_samples))
+callout_samples = [int(elem) for elem in callout_samples]
 
 umap_model = UMAP(n_components=2, n_neighbors=100, min_dist=1,
                   init='pca', metric='precomputed', low_memory=True, n_jobs=-1)
 sample_embedding = umap_model.fit_transform(dmat.cpu().numpy().astype(np.float32))
-uma_free_energy = -2.5 * np.log(uma_results['density'] + np.quantile(uma_results['density'], 0.01))[:-1]
+uma_density = np.log(uma_results['density'] + np.quantile(uma_results['density'], 0.01))[:-1]
 
-fig = rdf_embedding_fig(sample_embedding, uma_en, uma_free_energy)
-callout_samples = []
-polymorph_inds = [len(uma_results['density']) - 1 - ind for ind in range(ebatch.num_graphs)]
-callout_samples.extend(polymorph_inds)
-c_inds = bottom_up_cluster_w_dmat(uma_batch.uma, 3, uma_batch.uma.quantile(0.25), 100, 'cpu', dmat)
-callout_samples.extend(c_inds[:10])
-callout_samples = list(set(callout_samples))
-fig.add_scatter(x=sample_embedding[c_inds, 0], y=sample_embedding[c_inds, 1],
-                mode='markers', marker_color='white', marker_line_color='black', marker_line_width=4, marker_size=12)
-fig.add_scatter(x=sample_embedding[polymorph_inds, 0], y=sample_embedding[polymorph_inds, 1],
-                mode='markers', marker_color='white', marker_line_color='black',marker_line_width=4, marker_size=16)
+fig_dict['embedding_fig'] = rdf_embedding_fig(sample_embedding, uma_en, uma_results, sorted_minima_inds, related_maxima,
+                                              polymorph_inds)
+
+'top samples analysis'
+
+analysis_keys = ['sample_energy', 'sample_cp', 'density', 'local_en_mean', 'local_en_var', 'local_max_density',
+                 'local_mean_density']  # ,'local_energy_minimum_id']
+stats = {key:
+             uma_results[key][sorted_minima_inds] for key in analysis_keys
+         }
+fig_dict['summary_table'] = polymorph_summary_table(stats, sorted_minima_inds, polymorph_inds)
+#
+# samples = uma_results['sample_batch'].batch_to_list()
+# cbatch = collate_data_list([samples[ind] for ind in sorted_minima_inds])
+# cbatch.mol2cluster(cutoff=2)
+# mols = []
+#
+# for ind in range(cbatch.num_graphs):
+#     mol = ase_mol_from_crystaldata(cbatch, ind, mode='convolve with')
+#     write(f"{esamples[0].identifier}_poly_{ind}.png", mol)
+
+'''pes cartoon'''
+fig_dict['pes_cartoon'] = pes_cartoon()
 
 
+"""Exports"""
 
+pub_style = dict(
+    font=dict(family="Arial", size=18),
+    width=1920,
+    height=1080,
+    margin=dict(l=10, r=10, t=30, b=30),
+    paper_bgcolor="white",
+    plot_bgcolor="white",
+    annotations_font_size = 18,
+    scale = 2,
+)
 
-fig_dict['embedding_fig'] = fig
+def custom_style(key):
+    dd = {}
+    if key == 'pes_cartoon':
+        dd = {
+            'width': 1400,
+            'height': 900
+        }
+    if key == 'summary_table':
+        dd = {
+            'font_size': 12,
+            'annotations_font_size': 12,
+            'scale': 4
+        }
+    if 'staircase' in key:
+        dd = {
+            'font_size': 14,
+            'width': 2400,
+            'height': 1200,
+            'scale': 3
+        }
+    if key == 'marginals_fig':
+        dd = {
+            'font_size': 16,
+            'annotations_font_size': 16,
+            'width': 1920,
+            'height': 910,
+        }
+    if 'TB' in key:
+        dd = {
+            'height': 1080,
+            'width': 1080
+        }
+    if key == 'density_contours':
+        dd = {
+            'height': 1080,
+            'width': 1080
+        }
+    if key == 'energy_marginal':
+        dd = {
+            'height': 1400
+        }
+    return dd
 
+for key, fig in fig_dict.items():
+    #fig.show()
+    style = copy(pub_style)
+    style.update(custom_style(key))
+    scale = style['scale']
+    style.pop('scale')
+    for skey in style.keys():
+        if 'annotation' in skey:
+            fs = style[skey]
+            fig.update_annotations(font_size=fs)
+    style = {skey: value for skey, value in style.items() if 'annotation' not in skey}
+    fig.update_layout(**style)
+    fig.write_image(f'_{key}.png', scale=scale)
 
-for fig in fig_dict.values():
-    fig.show()
 
 aa = 1

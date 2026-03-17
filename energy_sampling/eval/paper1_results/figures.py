@@ -1,14 +1,12 @@
-import numpy as np
 import tempfile
 import webbrowser
 from typing import Optional
-from scipy.stats import linregress, gaussian_kde
 
-import numpy as np
 import plotly.colors as pc
-import plotly.graph_objects as go
 import torch
 from plotly.subplots import make_subplots
+from scipy.signal import argrelmin
+from scipy.stats import gaussian_kde
 from scipy.stats import linregress
 from umap import UMAP
 
@@ -1281,6 +1279,7 @@ def bivariate_energy_color(energy, free_energy, clip_quantile=0.01):
     Green channel = normalized free energy
     Blue channel = 1 - max(r, g)  →  high when both are low
     """
+
     def robust_norm(x, clip_quantile):
         lo = np.quantile(x, clip_quantile)
         hi = np.quantile(x, 1 - clip_quantile)
@@ -1291,26 +1290,29 @@ def bivariate_energy_color(energy, free_energy, clip_quantile=0.01):
     b = 1 - np.maximum(r, g)
 
     rgb = np.stack([r, g, b], axis=1)
-    return [f'rgb({int(c[0]*255)},{int(c[1]*255)},{int(c[2]*255)})' for c in rgb]
+    return [f'rgb({int(c[0] * 255)},{int(c[1] * 255)},{int(c[2] * 255)})' for c in rgb]
+
 
 import numpy as np
 import plotly.graph_objects as go
 from PIL import Image
 import io, base64
 
+
 def make_bivariate_colorbar_image(size=128):
     """Returns a base64 PNG of the 2D colorbar."""
     arr = np.zeros((size, size, 3), dtype=np.uint8)
     for py in range(size):
         for px in range(size):
-            r = px / (size - 1)                    # energy: left=low, right=high
-            g = 1 - py / (size - 1)                # free energy: bottom=low, top=high
+            r = px / (size - 1)  # energy: left=low, right=high
+            g = 1 - py / (size - 1)  # free energy: bottom=low, top=high
             b = max(0.0, 1 - max(r, g))
-            arr[py, px] = [int(r*255), int(g*255), int(b*255)]
+            arr[py, px] = [int(r * 255), int(g * 255), int(b * 255)]
     img = Image.fromarray(arr, 'RGB')
     buf = io.BytesIO()
     img.save(buf, format='PNG')
     return base64.b64encode(buf.getvalue()).decode()
+
 
 def add_bivariate_colorbar(fig, x0=0.78, y0=0.02, size=0.18):
     """
@@ -1323,7 +1325,7 @@ def add_bivariate_colorbar(fig, x0=0.78, y0=0.02, size=0.18):
     fig.add_layout_image(
         source=f"data:image/png;base64,{b64}",
         xref="paper", yref="paper",
-        x=x0, y=y0 + size,   # top-left anchor
+        x=x0, y=y0 + size,  # top-left anchor
         sizex=size, sizey=size,
         xanchor="left", yanchor="top",
         layer="above",
@@ -1333,7 +1335,7 @@ def add_bivariate_colorbar(fig, x0=0.78, y0=0.02, size=0.18):
     # border rect
     fig.add_shape(
         type="rect", xref="paper", yref="paper",
-        x0=x0, y0=y0, x1=x0+size, y1=y0+size,
+        x0=x0, y0=y0, x1=x0 + size, y1=y0 + size,
         line=dict(color="black", width=0.8),
         fillcolor="rgba(0,0,0,0)",
         layer="above",
@@ -1344,13 +1346,13 @@ def add_bivariate_colorbar(fig, x0=0.78, y0=0.02, size=0.18):
     fig.add_annotation(
         xref="paper", yref="paper",
         x=mid, y=y0 - 0.03,
-        text="Lattice Energy →", showarrow=False,
+        text="E(x) →", showarrow=False,
         font=dict(size=9, family="Helvetica"), xanchor="center",
     )
     fig.add_annotation(
         xref="paper", yref="paper",
         x=x0 - 0.02, y=y0 + size,
-        text="Free Energy →", showarrow=False,
+        text="← log P(x)", showarrow=False,
         font=dict(size=9, family="Helvetica"), xanchor="center",
         textangle=-90,
     )
@@ -1372,19 +1374,246 @@ def add_bivariate_colorbar(fig, x0=0.78, y0=0.02, size=0.18):
     return fig
 
 
+def rdf_embedding_fig(sample_embedding, uma_en, uma_results, sorted_minima_inds, related_maxima, polymorph_inds):
+    import plotly.express as px
+    uma_density = np.log(uma_results['density'] + np.quantile(uma_results['density'], 0.01))[:-1]
+    en_colors = bivariate_energy_color(uma_en.clip(max=0), -uma_density, clip_quantile=0.1)
 
-def rdf_embedding_fig(sample_embedding, uma_en, uma_free_energy):
-    en_colors = bivariate_energy_color(uma_en.clip(max=0), uma_free_energy, clip_quantile=0.1)
+    rank_map = {sample_id: rank + 1 for rank, sample_id in enumerate(sorted_minima_inds)}
+    basin_inds = np.array([rank_map.get(id, 0) for id in uma_results['local_energy_minimum_id']])
 
-    fig = go.Figure()
+    n_basins = len(np.unique(basin_inds)) - 1
+    colorscale = px.colors.qualitative.Set1[:n_basins + 1]
+    colorscale[0] = 'rgb(100, 100, 100)'
+    basin_colors = [colorscale[i] for i in basin_inds]
+    fig = make_subplots(rows=1, cols=2)  # , subplot_titles=['Basin Assignment','Basin Energy'])
     fig.add_scattergl(x=sample_embedding[:, 0],
                       y=sample_embedding[:, 1],
                       marker_color=en_colors, mode='markers',
-                      opacity=0.65)
-    fig.update_layout(xaxis_showgrid=False, yaxis_showgrid=False, xaxis_zeroline=False, yaxis_zeroline=False,
-                      xaxis_title='CV1', yaxis_title='CV2', xaxis_showticklabels=False, yaxis_showticklabels=False,
-                      plot_bgcolor='rgba(0,0,0,0)')
+                      opacity=0.5, marker_showscale=False,
+                      showlegend=False, row=1, col=2)
+    fig.add_scattergl(x=sample_embedding[:, 0],
+                      y=sample_embedding[:, 1],
+                      marker_color=basin_colors, mode='markers',
+                      # marker_colorscale=basin_colors,
+                      # marker_colorbar=dict(tickvals=list(range(1,len(uniques))), title='Basin'),
+                      opacity=0.5,
+                      showlegend=False, row=1, col=1)
+
+    fig.update_layout(
+        xaxis_showgrid=False, yaxis_showgrid=False,
+        xaxis_zeroline=False, yaxis_zeroline=False,
+        xaxis2_showgrid=False, yaxis2_showgrid=False,
+        xaxis2_zeroline=False, yaxis2_zeroline=False,
+        xaxis_title='CV1', yaxis_title='CV2',
+        xaxis2_title='CV1',  # yaxis2_title='CV2',
+        xaxis_showticklabels=False, yaxis_showticklabels=False,
+        xaxis2_showticklabels=False, yaxis2_showticklabels=False,
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)'
+    )
+    fig.add_scattergl(x=sample_embedding[sorted_minima_inds, 0], y=sample_embedding[sorted_minima_inds, 1],
+                      mode='markers', marker_color='white', marker_line_color='black', marker_line_width=4,
+                      marker_size=22,
+                      showlegend=False, row=1, col=1)
+    fig.add_scattergl(x=sample_embedding[related_maxima, 0], y=sample_embedding[related_maxima, 1],
+                      mode='markers', marker_color='rgb(150, 150, 150)', marker_line_color='black', marker_line_width=4,
+                      marker_size=22,
+                      showlegend=False, row=1, col=1)
+    fig.add_scattergl(x=sample_embedding[sorted_minima_inds, 0], y=sample_embedding[sorted_minima_inds, 1],
+                      mode='markers', marker_color='white', marker_line_color='black', marker_line_width=4,
+                      marker_size=22,
+                      showlegend=False, row=1, col=2)
+    fig.add_scattergl(x=sample_embedding[related_maxima, 0], y=sample_embedding[related_maxima, 1],
+                      mode='markers', marker_color='rgb(150, 150, 150)', marker_line_color='black', marker_line_width=4,
+                      marker_size=22,
+                      showlegend=False, row=1, col=2)
+    fig.add_scattergl(x=sample_embedding[polymorph_inds, 0], y=sample_embedding[polymorph_inds, 1],
+                      mode='markers', marker_color='red', marker_line_color='black', marker_line_width=4,
+                      marker_size=22,
+                      showlegend=False, row=1, col=1)
+    fig.add_scattergl(x=sample_embedding[polymorph_inds, 0], y=sample_embedding[polymorph_inds, 1],
+                      mode='markers', marker_color='red', marker_line_color='black', marker_line_width=4,
+                      marker_size=22,
+                      showlegend=False, row=1, col=2)
     fig = add_bivariate_colorbar(fig, 0.8, 0.85, size=0.2)
     fig.update_annotations(font_size=20)
     fig.update_layout(font_size=20)
+
+    return fig
+
+
+def polymorph_summary_table(stats, sorted_minima_inds, polymorph_inds):
+    n_basins = len(sorted_minima_inds)
+
+    e_min = stats['sample_energy'].numpy()
+    delta_e = e_min - e_min[0]
+    rho_max = np.log(stats['local_max_density'])
+    e_var = stats['local_en_var']
+    cp = stats['sample_cp'].numpy()
+
+    # Each row is one observable, each column is one basin
+    row_labels = ["E_min (kJ/mol)", "ΔE (kJ/mol)", "log ρ_max", "σ²_E", "c_p"]
+    raw_values = [e_min, delta_e, rho_max, e_var, cp]
+    formatters = [
+        lambda v: f"{v:.1f}",
+        lambda v: f"{v:.2f}",
+        lambda v: f"{v:.2f}",
+        lambda v: f"{v:.2f}",
+        lambda v: f"{v:.3f}",
+    ]
+
+    # Header: first cell blank, then one per basin
+    header_vals = [""] + [f"Basin {i + 1}" for i in range(n_basins)]
+
+    # First column is row labels, then one column per basin
+    # cell_vals[0] = row labels
+    # cell_vals[i+1] = formatted values for basin i across all observables
+    cell_vals = [row_labels]
+    for i in range(n_basins):
+        col = [fmt(vals[i]) for vals, fmt in zip(raw_values, formatters)]
+        cell_vals.append(col)
+
+    # Fill colors: same structure — one list per column
+    def row_colors(vals, colorscale="RdBu", alpha=0.35):
+        vals = np.asarray(vals, dtype=float)
+        t = (vals - vals.min()) / max(vals.max() - vals.min(), 1e-12)
+        actual_colors = pc.sample_colorscale(colorscale, t)
+        return [
+            pc.find_intermediate_color("rgb(255,255,255)", c, alpha, colortype="rgb")
+            for c in actual_colors
+        ]
+
+    # Color each observable across basins
+    e_min_colors = row_colors(e_min, "RdBu_r", alpha=0.4)
+    delta_e_colors = row_colors(delta_e, "RdBu_r", alpha=0.4)
+    rho_colors = row_colors(rho_max, "Blues", alpha=0.4)
+    var_colors = row_colors(e_var, "Oranges", alpha=0.35)
+    white = "rgb(255,255,255)"
+    cp_colors = [white] * n_basins
+
+    # all_colors[row][basin] — transpose into all_colors[basin][row] for fill_color
+    by_row = [e_min_colors, delta_e_colors, rho_colors, var_colors, cp_colors]
+    label_col_colors = [white] * len(row_labels)
+    fill_colors = [label_col_colors] + [
+        [by_row[r][i] for r in range(len(row_labels))]
+        for i in range(n_basins)
+    ]
+
+    fig = go.Figure(data=[go.Table(
+        header=dict(
+            values=header_vals,
+            align="center",
+            font=dict(size=14, color="white"),
+            fill_color="rgb(40,40,40)",
+            height=44,
+        ),
+        cells=dict(
+            values=cell_vals,
+            align="center",
+            font=dict(size=13),
+            fill_color=fill_colors,
+            height=32,
+        ),
+    )])
+
+    fig.update_layout(margin=dict(l=10, r=10, t=10, b=10))
+    return fig
+
+
+def pes_cartoon():
+    # --- PES ---
+    x = np.linspace(-6, 6, 2000)
+    well_L = 8.0 * (1 - np.exp(-0.3 * (x + 2.5) ** 2))
+    well_R = 9.5 * (1 - np.exp(-0.3 * (x - 2.5) ** 2))
+    base = np.minimum(well_L, well_R) + 0.12 * x ** 2
+    rng = np.random.default_rng(42)
+
+    # Place sub-basins with controlled randomness
+    n_sub = 30
+    centers = rng.uniform(-5.5, 5.5, n_sub)
+    depths = -rng.uniform(0.3, 2.5, n_sub)
+    widths = rng.uniform(5, 18, n_sub)
+
+    sub = sum(a * np.exp(-w * (x - c) ** 2) for a, w, c in zip(depths, widths, centers))
+    V = base + sub
+    V -= V.min()
+
+    # --- Local minima ---
+    local_min_idx = argrelmin(V, order=30)[0]
+    local_min_x = x[local_min_idx]
+    local_min_V = V[local_min_idx]
+    order = np.argsort(local_min_V)
+    local_min_x, local_min_V = local_min_x[order], local_min_V[order]
+
+    # --- Distributions ---
+    kT = 2.5
+
+    # 1: cold, non-thermalized (trapped in all basins, mild energy weighting)
+    p_cold = sum(
+        np.exp(-0.3 * vm) * np.exp(-0.5 * ((x - xm) / 0.15) ** 2)
+        for xm, vm in zip(local_min_x, local_min_V)
+    )
+    p_cold /= np.trapz(p_cold, x)
+
+    # 2: correct Boltzmann weights, but only near minima
+    p_local = sum(
+        np.exp(-vm / kT) * np.exp(-0.5 * ((x - xm) / 0.25) ** 2)
+        for xm, vm in zip(local_min_x, local_min_V)
+    )
+    p_local /= np.trapz(p_local, x)
+
+    # 3: full Boltzmann
+    logp = -V / kT
+    logp -= logp.max()
+    p_full = np.exp(logp)
+    p_full /= np.trapz(p_full, x)
+
+    # --- Plot ---
+    # fig = make_subplots(
+    #     rows=2, cols=3,
+    #     row_heights=[0.38, 0.62],
+    #     vertical_spacing=0.06,
+    #     horizontal_spacing=0.07,
+    #     subplot_titles=["Phase 1: Prior Distribution",
+    #                     "Phase 2: Prior Thermalization",
+    #                     "Phase 3: Global Thermalization"],
+    # )
+    fig = make_subplots(rows=2, cols=1,
+                        row_heights=[0.62, 0.38])
+    colors = ["#c44e52", "#dd8452", "#4c72b0"]
+
+    for col, (p, c) in enumerate(zip([p_cold, p_local, p_full], colors), 1):
+        fig.add_trace(go.Scatter(x=x, y=p + col * 0.25, fill='toself',
+                                 fillcolor=f"rgba({int(c[1:3], 16)},{int(c[3:5], 16)},{int(c[5:7], 16)},0.25)",
+                                 line=dict(color=c, width=2), showlegend=False), row=1, col=1, )
+        fig.add_trace(go.Scatter(x=x, y=V, line=dict(color="#555", width=2),
+                                 showlegend=False), row=2, col=1)
+
+    for name, c in zip(["Prior Distribution", "Thermalized Prior", "Equilibrium Distribution"], colors):
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None],
+            mode='lines',
+            line=dict(color=c, width=3),
+            name=name,
+        ))
+    fig.update_layout(legend=dict(
+        orientation="h",
+        yanchor="bottom",
+        y=1.05,
+        xanchor="center",
+        x=0.5
+    ), )
+
+    for col in range(1, 4):
+        for row in [1, 2]:
+            fig.update_xaxes(showticklabels=False, row=row, col=col)
+            fig.update_yaxes(showticklabels=False, row=row, col=col)
+
+    fig.update_yaxes(title_text="P(x)", row=1, col=1)
+    fig.update_yaxes(title_text="V(x)", row=2, col=1)
+    fig.update_xaxes(title_text="x ", row=2, col=2)
+    fig.update_layout(  # width=1000, height=550,
+        template="plotly_white",
+        margin=dict(l=60, r=30, t=50, b=50))
     return fig

@@ -38,8 +38,9 @@ if __name__ == "__main__":
     base, spec_dir = load_yaml(base_path)
 
     experiments = [
-        {"name": "uma", "energy_function": 'uma'},
-        {"name": "elj", "energy_function": 'elj'},
+        {"name": "uma", "energy_function": 'uma', 'buffer_path': "/scratch/mk8347/data/crystal_datasets/nehzor/nehzor_uma_prior_dataset.pt"
+},
+        {"name": "elj", "energy_function": 'elj', 'buffer_path': "/scratch/mk8347/data/crystal_datasets/nehzor/nehzor_elj_prior_dataset.pt"},
 
     ]
 

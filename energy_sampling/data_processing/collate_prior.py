@@ -133,7 +133,7 @@ if __name__ == '__main__':
 
     dataset_filename = run_name + '_prior_dataset.pt'
 
-    if os.path.exists(dataset_filename):
+    if False:  # os.path.exists(dataset_filename):
         dd = torch.load(dataset_filename, weights_only=False)
         noised_samples = dd['noised_batch'].batch_to_list()
         thinned_batch = dd['prior_batch']
