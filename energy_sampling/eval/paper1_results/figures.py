@@ -12,7 +12,7 @@ from umap import UMAP
 
 from mxtaltools.common.utils import get_point_density_knn
 from mxtaltools.reporting.utils import lightweight_one_sided_violin
-
+import plotly.express as px
 
 def make_thermo_table(Zb, basin_probs, Fb, mean_E, min_ens, Sb, mean_rho, hard_assignment, num_clusters: int,
                       units: str):
@@ -1190,25 +1190,21 @@ def energy_marginal_fig(sample_energy):
 
     return fig
 
-
 def dual_energy_marginal_fig(sample_energy1, sample_energy2,
                              label1='Energy 1', label2='Energy 2'):
     colors = {'1': 'steelblue', '2': 'firebrick'}
 
-    def process(sample_energy, color, label, fig, showlegend=True):
+    def process(sample_energy, color, label, fig, row):
         energies_np = sample_energy[sample_energy < 0].cpu().detach().numpy()
 
-        # histogram
         hist_y, hist_x = np.histogram(energies_np, bins=50, density=True)
         bin_centers = 0.5 * (hist_x[1:] + hist_x[:-1])
         nonzero = hist_y > 0
 
-        # KDE
         kde = gaussian_kde(energies_np, bw_method=0.3)
         x_kde = np.linspace(energies_np.min(), energies_np.max(), 500)
         y_kde = kde(x_kde)
 
-        # fit
         quantile_cutoff = 0.99
         energy_cutoff = np.quantile(energies_np, quantile_cutoff)
         low_energy_mask = bin_centers <= energy_cutoff
@@ -1231,18 +1227,18 @@ def dual_energy_marginal_fig(sample_energy1, sample_energy2,
             x=bin_centers, y=hist_y,
             name=label, opacity=0.4, showlegend=False,
             marker_color=color,
-        ), row=1, col=1)
+        ), row=row, col=1)
         fig.add_trace(go.Scatter(
             x=x_kde, y=y_kde, mode='lines',
-            name=label, line=dict(width=2, color=color),
-            showlegend=showlegend, legendgroup=label,
-        ), row=1, col=1)
+            name=f'{label} KDE', line=dict(width=2, color=color),
+            showlegend=False,
+        ), row=row, col=1)
         fig.add_trace(go.Scatter(
             x=x_kde, y=boltzmann_y, mode='lines',
             name=f'{label} Boltzmann (β≈{beta_est:.2f})',
             line=dict(dash='dot', width=1.5, color=color),
-            showlegend=False, legendgroup=f'{label}_fit',
-        ), row=1, col=1)
+            showlegend=False,
+        ), row=row, col=1)
 
         # right: log
         fig.add_trace(go.Scatter(
@@ -1250,24 +1246,31 @@ def dual_energy_marginal_fig(sample_energy1, sample_energy2,
             mode='markers+lines',
             name=label, line=dict(width=2, color=color),
             marker=dict(size=5, color=color),
-            showlegend=False, legendgroup=label,
-        ), row=1, col=2)
+            showlegend=False,
+        ), row=row, col=2)
         fig.add_trace(go.Scatter(
             x=bin_centers, y=log_fit, mode='lines',
             name=f'{label} fit (β≈{beta_est:.2f})',
             line=dict(dash='dot', width=1.5, color=color),
-            showlegend=False, legendgroup=f'{label}_fit',
-        ), row=1, col=2)
+            showlegend=False,
+        ), row=row, col=2)
 
-    fig = make_subplots(rows=1, cols=2, subplot_titles=('Probability Density', 'Log-Probability vs Energy'))
-    process(sample_energy1, colors['1'], label1, fig, showlegend=True)
-    process(sample_energy2, colors['2'], label2, fig, showlegend=True)
+    fig = make_subplots(
+        rows=2, cols=2,
+        #subplot_titles=(f'{label1} – P(E)', f'{label1} – log P(E)',
+        #                f'{label2} – P(E)', f'{label2} – log P(E)'),
+    )
+    process(sample_energy1, colors['1'], label1, fig, row=1)
+    process(sample_energy2, colors['2'], label2, fig, row=2)
 
     fig.update_layout(template='plotly_white', font_size=20)
-    fig.update_xaxes(title_text='Energy', row=1, col=1)
-    fig.update_yaxes(title_text='P(E)', row=1, col=1)
-    fig.update_xaxes(title_text='Energy', row=1, col=2)
-    fig.update_yaxes(title_text='log P(E)', row=1, col=2)
+    for row in [1, 2]:
+        en = 'UMA' if row == 2 else 'LJ'
+        fig.update_xaxes(title_text=f'{en} Energy (kJ/mol)', row=row, col=1)
+        fig.update_yaxes(title_text='P(E)', row=row, col=1)
+        fig.update_xaxes(title_text=f'{en} Energy (kJ/mol)', row=row, col=2)
+        fig.update_yaxes(title_text='log P(E)', row=row, col=2)
+    #fig.update_xaxes(range = [min(sample_energy1.amin(), sample_energy2.amin()), max(sample_energy1.amax(), sample_energy2.amax())])
 
     return fig
 
@@ -1352,7 +1355,7 @@ def add_bivariate_colorbar(fig, x0=0.78, y0=0.02, size=0.18):
     fig.add_annotation(
         xref="paper", yref="paper",
         x=x0 - 0.02, y=y0 + size,
-        text="← log P(x)", showarrow=False,
+        text="G(x) →", showarrow=False,
         font=dict(size=9, family="Helvetica"), xanchor="center",
         textangle=-90,
     )
@@ -1374,18 +1377,9 @@ def add_bivariate_colorbar(fig, x0=0.78, y0=0.02, size=0.18):
     return fig
 
 
-def rdf_embedding_fig(sample_embedding, uma_en, uma_results, sorted_minima_inds, related_maxima, polymorph_inds):
-    import plotly.express as px
-    uma_density = np.log(uma_results['density'] + np.quantile(uma_results['density'], 0.01))[:-1]
-    en_colors = bivariate_energy_color(uma_en.clip(max=0), -uma_density, clip_quantile=0.1)
+def rdf_embedding_fig(sample_embedding, uma_en, uma_free_energy, sorted_minima_inds, related_maxima, polymorph_inds, basin_colors):
 
-    rank_map = {sample_id: rank + 1 for rank, sample_id in enumerate(sorted_minima_inds)}
-    basin_inds = np.array([rank_map.get(id, 0) for id in uma_results['local_energy_minimum_id']])
-
-    n_basins = len(np.unique(basin_inds)) - 1
-    colorscale = px.colors.qualitative.Set1[:n_basins + 1]
-    colorscale[0] = 'rgb(100, 100, 100)'
-    basin_colors = [colorscale[i] for i in basin_inds]
+    en_colors = bivariate_energy_color(uma_en.clip(max=0), uma_free_energy, clip_quantile=0.1)
     fig = make_subplots(rows=1, cols=2)  # , subplot_titles=['Basin Assignment','Basin Energy'])
     fig.add_scattergl(x=sample_embedding[:, 0],
                       y=sample_embedding[:, 1],
@@ -1436,6 +1430,19 @@ def rdf_embedding_fig(sample_embedding, uma_en, uma_results, sorted_minima_inds,
                       mode='markers', marker_color='red', marker_line_color='black', marker_line_width=4,
                       marker_size=22,
                       showlegend=False, row=1, col=2)
+
+    for rank, idx in enumerate(sorted_minima_inds):
+        label = str(rank + 1)
+        for col in [1, 2]:
+            fig.add_annotation(
+                x=sample_embedding[idx, 0],
+                y=sample_embedding[idx, 1],
+                text=label,
+                showarrow=False,
+                font=dict(size=14, color='black', family='Arial Black'),
+                row=1, col=col,
+            )
+
     fig = add_bivariate_colorbar(fig, 0.8, 0.85, size=0.2)
     fig.update_annotations(font_size=20)
     fig.update_layout(font_size=20)
@@ -1443,7 +1450,7 @@ def rdf_embedding_fig(sample_embedding, uma_en, uma_results, sorted_minima_inds,
     return fig
 
 
-def polymorph_summary_table(stats, sorted_minima_inds, polymorph_inds):
+def polymorph_summary_table(stats, sorted_minima_inds, polymorph_inds, basin_colors):
     n_basins = len(sorted_minima_inds)
 
     e_min = stats['sample_energy'].numpy()
@@ -1491,6 +1498,7 @@ def polymorph_summary_table(stats, sorted_minima_inds, polymorph_inds):
     var_colors = row_colors(e_var, "Oranges", alpha=0.35)
     white = "rgb(255,255,255)"
     cp_colors = [white] * n_basins
+    header_fill = ["rgb(40,40,40)"] + [basin_colors[i + 1] for i in range(n_basins)]
 
     # all_colors[row][basin] — transpose into all_colors[basin][row] for fill_color
     by_row = [e_min_colors, delta_e_colors, rho_colors, var_colors, cp_colors]
@@ -1505,7 +1513,7 @@ def polymorph_summary_table(stats, sorted_minima_inds, polymorph_inds):
             values=header_vals,
             align="center",
             font=dict(size=14, color="white"),
-            fill_color="rgb(40,40,40)",
+            fill_color=header_fill,
             height=44,
         ),
         cells=dict(

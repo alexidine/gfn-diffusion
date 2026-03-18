@@ -28,9 +28,9 @@ def collate_generate_prior():
         if hasattr(sample, 'fingerprint'):
             del sample.fingerprint
     """ 
-            make sure we are latent-safe, and filter degenerate boxes (ultra-flat cells)
-            """
-    sample_batch = collate_data_list(opt_samples)
+    make sure we are latent-safe, and filter degenerate boxes (ultra-flat cells)
+    """
+    sample_batch = collate_data_list(opt_samples, exclude_keys=['elj'])
     sample_batch.latent_to_cell_params(sample_batch.latent_params())
     analyses = ['lj', 'vdw', 'vdw_max']
     analyses.append(energy_function)
@@ -101,8 +101,8 @@ if __name__ == '__main__':
     # uma_model_path = r"D:\crystal_datasets\esen_s.pt"
     # device = 'cuda'
     # nehzor
-    search_output_dir = r"D:\crystal_datasets\nehzor"
-    run_name = 'nehzor_uma'
+    search_output_dir = r"D:\crystal_datasets\nehzor\p2"
+    run_name = 'nehzor'
     identifier = 'NEHZOR'
     energy_function = 'uma'
     target_path = r"D:\crystal_datasets\nehzor\NEHZOR01_standardized.pt"
@@ -118,11 +118,11 @@ if __name__ == '__main__':
     os.chdir(search_output_dir)
     pattern = os.path.join(search_output_dir, run_name + '_*.pt')
     files = glob.glob(pattern)
-
-    traj_records = [
-        f for f in files
-        if re.search(rf'{re.escape(run_name)}_\d{{1,2}}\.pt$', os.path.basename(f))
-    ]
+    traj_records = glob.glob(f"{run_name}*")
+    # traj_records = [
+    #     f for f in files
+    #     if re.search(rf'{re.escape(run_name)}_\d{{1,2}}\.pt$', os.path.basename(f))
+    # ]
 
     target_mol = torch.load(target_path, weights_only=False)
     target_mol.aunit_handedness = target_mol.aunit_handedness.abs()

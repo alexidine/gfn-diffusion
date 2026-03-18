@@ -1,6 +1,6 @@
 """analysis and figures for the results section of the paper"""
 from copy import copy
-
+import plotly.express as px
 import numpy as np
 import torch
 from ase.io import write
@@ -71,7 +71,6 @@ fig_dict['uma_TB_fig'] = parity_fig(x, y,
                                     "log(Pb) + log(R)", "log(Pf) + log(Z)",
                                     quantile_cut=0.01)
 
-'''Density funnel overlay'''
 uma_batch = uma_results['sample_batch'].clone()
 elj_batch = elj_results['sample_batch'].clone()
 prior_data = torch.load(r"D:\crystal_datasets\mipcas\mipcas_elj_prior_dataset.pt", weights_only=False)
@@ -81,35 +80,53 @@ elj_en = elj_batch.elj * en_scaling_factor
 
 uma_cp = uma_batch.packing_coeff
 elj_cp = elj_batch.packing_coeff
-fig_dict['density_contours'] = plot_dual_density_contour(uma_cp, uma_en.clip(max=0), elj_cp, elj_en.clip(max=0),
-                                                         label_a="UMA", label_b="LJ", ncontours=8,
-                                                         max_y_quantile=0.95,
-                                                         x_min=0.625, x_max=0.9,
-                                                         y_min=-145, y_max=-100,
-                                                         bw=0.1,
-                                                         show=False,
-                                                         return_fig=True,
-                                                         yaxis_title="Lattice Energy (kJ/mol)",
-                                                         xaxis_title="Packing Coefficient"
-                                                         )
+# '''Density funnel overlay'''
+# fig_dict['density_contours'] = plot_dual_density_contour(uma_cp, uma_en.clip(max=0), elj_cp, elj_en.clip(max=0),
+#                                                          label_a="UMA", label_b="LJ", ncontours=8,
+#                                                          max_y_quantile=0.95,
+#                                                          x_min=0.625, x_max=0.9,
+#                                                          y_min=-145, y_max=-100,
+#                                                          bw=0.1,
+#                                                          show=False,
+#                                                          return_fig=True,
+#                                                          yaxis_title="Lattice Energy (kJ/mol)",
+#                                                          xaxis_title="Packing Coefficient"
+#                                                          )
 
 '''Energy marginals'''
-
 fig_dict['energy_marginal'] = dual_energy_marginal_fig(elj_en, uma_en,
                                                        "LJ", "UMA"
                                                        )
 
 '''12 marginals'''
-
 uma_batch = uma_results['sample_batch']
 elj_batch = elj_results['sample_batch']
-marginals_fig = uma_batch.plot_batch_cell_params(
+marginals_fig = elj_batch.plot_batch_cell_params(
     space='latent',
-    ref_dist=elj_batch.latent_params(),
+    ref_dist=uma_batch.latent_params(),
     aux_dists=[eparams],
     return_fig=True,
     show=False
-)  # todo update formatting and legend
+)
+marginals_fig.data[1].name = "UMA Model"
+marginals_fig.data[0].name = "LJ Model"
+marginals_fig.data[2].name = "Experimental Structures"
+subplot_labels = [
+    '(a) Normed a',
+    '(b) Normed b',
+    '(c) Normed c',
+    '(d) Scaled α',
+    '(e) Scaled β',
+    '(f) Scaled γ',
+    '(g) Aunit frac. x',
+    '(h) Aunit frac. y',
+    '(i) Aunit frac. z',
+    '(j) Rotvec θ',
+    '(k) Rotvec φ',
+    '(l) Rotvec r',
+]
+for ii, annotation in enumerate(marginals_fig.layout.annotations):
+    annotation.text = subplot_labels[ii]
 fig_dict['marginals_fig'] = marginals_fig
 
 '''staircase plots'''
@@ -144,10 +161,17 @@ callout_samples = [int(elem) for elem in callout_samples]
 umap_model = UMAP(n_components=2, n_neighbors=100, min_dist=1,
                   init='pca', metric='precomputed', low_memory=True, n_jobs=-1)
 sample_embedding = umap_model.fit_transform(dmat.cpu().numpy().astype(np.float32))
+uma_free_energy = -2.5 * np.log(uma_results['density'])
 uma_density = np.log(uma_results['density'] + np.quantile(uma_results['density'], 0.01))[:-1]
 
-fig_dict['embedding_fig'] = rdf_embedding_fig(sample_embedding, uma_en, uma_results, sorted_minima_inds, related_maxima,
-                                              polymorph_inds)
+rank_map = {sample_id: rank + 1 for rank, sample_id in enumerate(sorted_minima_inds)}
+basin_inds = np.array([rank_map.get(id, 0) for id in uma_results['local_energy_minimum_id']])
+n_basins = len(np.unique(basin_inds)) - 1
+colorscale = px.colors.qualitative.Set1[:n_basins + 1]
+colorscale[0] = 'rgb(100, 100, 100)'
+basin_colors = [colorscale[i] for i in basin_inds]
+fig_dict['embedding_fig'] = rdf_embedding_fig(sample_embedding, uma_en, uma_free_energy, sorted_minima_inds, related_maxima,
+                                              polymorph_inds, basin_colors)
 
 'top samples analysis'
 
@@ -156,7 +180,7 @@ analysis_keys = ['sample_energy', 'sample_cp', 'density', 'local_en_mean', 'loca
 stats = {key:
              uma_results[key][sorted_minima_inds] for key in analysis_keys
          }
-fig_dict['summary_table'] = polymorph_summary_table(stats, sorted_minima_inds, polymorph_inds)
+fig_dict['summary_table'] = polymorph_summary_table(stats, sorted_minima_inds, polymorph_inds, basin_colors)
 #
 # samples = uma_results['sample_batch'].batch_to_list()
 # cbatch = collate_data_list([samples[ind] for ind in sorted_minima_inds])
@@ -170,7 +194,6 @@ fig_dict['summary_table'] = polymorph_summary_table(stats, sorted_minima_inds, p
 '''pes cartoon'''
 fig_dict['pes_cartoon'] = pes_cartoon()
 
-
 """Exports"""
 
 pub_style = dict(
@@ -180,9 +203,10 @@ pub_style = dict(
     margin=dict(l=10, r=10, t=30, b=30),
     paper_bgcolor="white",
     plot_bgcolor="white",
-    annotations_font_size = 18,
-    scale = 2,
+    annotations_font_size=18,
+    scale=2,
 )
+
 
 def custom_style(key):
     dd = {}
@@ -227,8 +251,9 @@ def custom_style(key):
         }
     return dd
 
+
 for key, fig in fig_dict.items():
-    #fig.show()
+    # fig.show()
     style = copy(pub_style)
     style.update(custom_style(key))
     scale = style['scale']
@@ -240,6 +265,5 @@ for key, fig in fig_dict.items():
     style = {skey: value for skey, value in style.items() if 'annotation' not in skey}
     fig.update_layout(**style)
     fig.write_image(f'_{key}.png', scale=scale)
-
 
 aa = 1
