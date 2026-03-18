@@ -161,8 +161,7 @@ callout_samples = [int(elem) for elem in callout_samples]
 umap_model = UMAP(n_components=2, n_neighbors=100, min_dist=1,
                   init='pca', metric='precomputed', low_memory=True, n_jobs=-1)
 sample_embedding = umap_model.fit_transform(dmat.cpu().numpy().astype(np.float32))
-uma_free_energy = -2.5 * np.log(uma_results['density'])
-uma_density = np.log(uma_results['density'] + np.quantile(uma_results['density'], 0.01))[:-1]
+uma_free_energy = -2.5 * np.log(uma_results['density'])[:len(uma_en)]
 
 rank_map = {sample_id: rank + 1 for rank, sample_id in enumerate(sorted_minima_inds)}
 basin_inds = np.array([rank_map.get(id, 0) for id in uma_results['local_energy_minimum_id']])
@@ -174,13 +173,13 @@ fig_dict['embedding_fig'] = rdf_embedding_fig(sample_embedding, uma_en, uma_free
                                               polymorph_inds, basin_colors)
 
 'top samples analysis'
-
+uma_results['free_energy'] = uma_free_energy
 analysis_keys = ['sample_energy', 'sample_cp', 'density', 'local_en_mean', 'local_en_var', 'local_max_density',
-                 'local_mean_density']  # ,'local_energy_minimum_id']
+                 'local_mean_density','free_energy']  # ,'local_energy_minimum_id']
 stats = {key:
              uma_results[key][sorted_minima_inds] for key in analysis_keys
          }
-fig_dict['summary_table'] = polymorph_summary_table(stats, sorted_minima_inds, polymorph_inds, basin_colors)
+fig_dict['summary_table'] = polymorph_summary_table(stats, sorted_minima_inds, polymorph_inds, colorscale)
 #
 # samples = uma_results['sample_batch'].batch_to_list()
 # cbatch = collate_data_list([samples[ind] for ind in sorted_minima_inds])
@@ -213,7 +212,7 @@ def custom_style(key):
     if key == 'pes_cartoon':
         dd = {
             'width': 1400,
-            'height': 900
+            'height': 700
         }
     if key == 'summary_table':
         dd = {

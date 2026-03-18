@@ -14,6 +14,7 @@ from mxtaltools.common.utils import get_point_density_knn
 from mxtaltools.reporting.utils import lightweight_one_sided_violin
 import plotly.express as px
 
+
 def make_thermo_table(Zb, basin_probs, Fb, mean_E, min_ens, Sb, mean_rho, hard_assignment, num_clusters: int,
                       units: str):
     top_inds = torch.argsort(Zb, descending=True)[:num_clusters]
@@ -1190,6 +1191,7 @@ def energy_marginal_fig(sample_energy):
 
     return fig
 
+
 def dual_energy_marginal_fig(sample_energy1, sample_energy2,
                              label1='Energy 1', label2='Energy 2'):
     colors = {'1': 'steelblue', '2': 'firebrick'}
@@ -1257,7 +1259,7 @@ def dual_energy_marginal_fig(sample_energy1, sample_energy2,
 
     fig = make_subplots(
         rows=2, cols=2,
-        #subplot_titles=(f'{label1} – P(E)', f'{label1} – log P(E)',
+        # subplot_titles=(f'{label1} – P(E)', f'{label1} – log P(E)',
         #                f'{label2} – P(E)', f'{label2} – log P(E)'),
     )
     process(sample_energy1, colors['1'], label1, fig, row=1)
@@ -1270,7 +1272,7 @@ def dual_energy_marginal_fig(sample_energy1, sample_energy2,
         fig.update_yaxes(title_text='P(E)', row=row, col=1)
         fig.update_xaxes(title_text=f'{en} Energy (kJ/mol)', row=row, col=2)
         fig.update_yaxes(title_text='log P(E)', row=row, col=2)
-    #fig.update_xaxes(range = [min(sample_energy1.amin(), sample_energy2.amin()), max(sample_energy1.amax(), sample_energy2.amax())])
+    # fig.update_xaxes(range = [min(sample_energy1.amin(), sample_energy2.amin()), max(sample_energy1.amax(), sample_energy2.amax())])
 
     return fig
 
@@ -1377,22 +1379,22 @@ def add_bivariate_colorbar(fig, x0=0.78, y0=0.02, size=0.18):
     return fig
 
 
-def rdf_embedding_fig(sample_embedding, uma_en, uma_free_energy, sorted_minima_inds, related_maxima, polymorph_inds, basin_colors):
-
+def rdf_embedding_fig(sample_embedding, uma_en, uma_free_energy, sorted_minima_inds, related_maxima, polymorph_inds,
+                      basin_colors):
     en_colors = bivariate_energy_color(uma_en.clip(max=0), uma_free_energy, clip_quantile=0.1)
     fig = make_subplots(rows=1, cols=2)  # , subplot_titles=['Basin Assignment','Basin Energy'])
     fig.add_scattergl(x=sample_embedding[:, 0],
                       y=sample_embedding[:, 1],
                       marker_color=en_colors, mode='markers',
                       opacity=0.5, marker_showscale=False,
-                      showlegend=False, row=1, col=2)
+                      showlegend=False, row=1, col=1)
     fig.add_scattergl(x=sample_embedding[:, 0],
                       y=sample_embedding[:, 1],
                       marker_color=basin_colors, mode='markers',
                       # marker_colorscale=basin_colors,
                       # marker_colorbar=dict(tickvals=list(range(1,len(uniques))), title='Basin'),
                       opacity=0.5,
-                      showlegend=False, row=1, col=1)
+                      showlegend=False, row=1, col=2)
 
     fig.update_layout(
         xaxis_showgrid=False, yaxis_showgrid=False,
@@ -1406,34 +1408,35 @@ def rdf_embedding_fig(sample_embedding, uma_en, uma_free_energy, sorted_minima_i
         plot_bgcolor='rgba(0,0,0,0)',
         paper_bgcolor='rgba(0,0,0,0)'
     )
-    fig.add_scattergl(x=sample_embedding[sorted_minima_inds, 0], y=sample_embedding[sorted_minima_inds, 1],
-                      mode='markers', marker_color='white', marker_line_color='black', marker_line_width=4,
-                      marker_size=22,
-                      showlegend=False, row=1, col=1)
-    fig.add_scattergl(x=sample_embedding[related_maxima, 0], y=sample_embedding[related_maxima, 1],
-                      mode='markers', marker_color='rgb(150, 150, 150)', marker_line_color='black', marker_line_width=4,
-                      marker_size=22,
-                      showlegend=False, row=1, col=1)
-    fig.add_scattergl(x=sample_embedding[sorted_minima_inds, 0], y=sample_embedding[sorted_minima_inds, 1],
-                      mode='markers', marker_color='white', marker_line_color='black', marker_line_width=4,
-                      marker_size=22,
-                      showlegend=False, row=1, col=2)
+    # fig.add_scattergl(x=sample_embedding[sorted_minima_inds, 0], y=sample_embedding[sorted_minima_inds, 1],
+    #                   mode='markers', marker_color='white', marker_line_color='black', marker_line_width=4,
+    #                   marker_size=22,
+    #                   showlegend=False, row=1, col=1)
+    # fig.add_scattergl(x=sample_embedding[related_maxima, 0], y=sample_embedding[related_maxima, 1],
+    #                   mode='markers', marker_color='rgb(150, 150, 150)', marker_line_color='black', marker_line_width=4,
+    #                   marker_size=22,
+    #                   showlegend=False, row=1, col=1)
     fig.add_scattergl(x=sample_embedding[related_maxima, 0], y=sample_embedding[related_maxima, 1],
                       mode='markers', marker_color='rgb(150, 150, 150)', marker_line_color='black', marker_line_width=4,
                       marker_size=22,
                       showlegend=False, row=1, col=2)
+
+    # fig.add_scattergl(x=sample_embedding[polymorph_inds, 0], y=sample_embedding[polymorph_inds, 1],
+    #                   mode='markers', marker_color='red', marker_line_color='black', marker_line_width=4,
+    #                   marker_size=22,
+    #                   showlegend=False, row=1, col=1)
     fig.add_scattergl(x=sample_embedding[polymorph_inds, 0], y=sample_embedding[polymorph_inds, 1],
                       mode='markers', marker_color='red', marker_line_color='black', marker_line_width=4,
                       marker_size=22,
-                      showlegend=False, row=1, col=1)
-    fig.add_scattergl(x=sample_embedding[polymorph_inds, 0], y=sample_embedding[polymorph_inds, 1],
-                      mode='markers', marker_color='red', marker_line_color='black', marker_line_width=4,
+                      showlegend=False, row=1, col=2)
+    fig.add_scattergl(x=sample_embedding[sorted_minima_inds, 0], y=sample_embedding[sorted_minima_inds, 1],
+                      mode='markers', marker_color='white', marker_line_color='black', marker_line_width=4,
                       marker_size=22,
                       showlegend=False, row=1, col=2)
 
     for rank, idx in enumerate(sorted_minima_inds):
         label = str(rank + 1)
-        for col in [1, 2]:
+        for col in [2]:
             fig.add_annotation(
                 x=sample_embedding[idx, 0],
                 y=sample_embedding[idx, 1],
@@ -1443,7 +1446,7 @@ def rdf_embedding_fig(sample_embedding, uma_en, uma_free_energy, sorted_minima_i
                 row=1, col=col,
             )
 
-    fig = add_bivariate_colorbar(fig, 0.8, 0.85, size=0.2)
+    fig = add_bivariate_colorbar(fig, 0.3, 0.85, size=0.2)
     fig.update_annotations(font_size=20)
     fig.update_layout(font_size=20)
 
@@ -1455,33 +1458,28 @@ def polymorph_summary_table(stats, sorted_minima_inds, polymorph_inds, basin_col
 
     e_min = stats['sample_energy'].numpy()
     delta_e = e_min - e_min[0]
-    rho_max = np.log(stats['local_max_density'])
+    g = stats['free_energy']
+    delta_g = g - g.min()
     e_var = stats['local_en_var']
     cp = stats['sample_cp'].numpy()
 
-    # Each row is one observable, each column is one basin
-    row_labels = ["E_min (kJ/mol)", "ΔE (kJ/mol)", "log ρ_max", "σ²_E", "c_p"]
-    raw_values = [e_min, delta_e, rho_max, e_var, cp]
+    row_labels = ["E_min (kJ/mol)", "ΔE (kJ/mol)", "ΔG (kT)", "σ²_E", "c_p"]
+    raw_values = [e_min, delta_e, delta_g, e_var, cp]
     formatters = [
         lambda v: f"{v:.1f}",
         lambda v: f"{v:.2f}",
         lambda v: f"{v:.2f}",
         lambda v: f"{v:.2f}",
-        lambda v: f"{v:.3f}",
+        lambda v: f"{v:.2f}",
     ]
 
-    # Header: first cell blank, then one per basin
     header_vals = [""] + [f"Basin {i + 1}" for i in range(n_basins)]
 
-    # First column is row labels, then one column per basin
-    # cell_vals[0] = row labels
-    # cell_vals[i+1] = formatted values for basin i across all observables
     cell_vals = [row_labels]
     for i in range(n_basins):
         col = [fmt(vals[i]) for vals, fmt in zip(raw_values, formatters)]
         cell_vals.append(col)
 
-    # Fill colors: same structure — one list per column
     def row_colors(vals, colorscale="RdBu", alpha=0.35):
         vals = np.asarray(vals, dtype=float)
         t = (vals - vals.min()) / max(vals.max() - vals.min(), 1e-12)
@@ -1491,17 +1489,15 @@ def polymorph_summary_table(stats, sorted_minima_inds, polymorph_inds, basin_col
             for c in actual_colors
         ]
 
-    # Color each observable across basins
     e_min_colors = row_colors(e_min, "RdBu_r", alpha=0.4)
     delta_e_colors = row_colors(delta_e, "RdBu_r", alpha=0.4)
-    rho_colors = row_colors(rho_max, "Blues", alpha=0.4)
+    delta_g_colors = row_colors(delta_g, "RdBu_r", alpha=0.4)
     var_colors = row_colors(e_var, "Oranges", alpha=0.35)
     white = "rgb(255,255,255)"
     cp_colors = [white] * n_basins
     header_fill = ["rgb(40,40,40)"] + [basin_colors[i + 1] for i in range(n_basins)]
 
-    # all_colors[row][basin] — transpose into all_colors[basin][row] for fill_color
-    by_row = [e_min_colors, delta_e_colors, rho_colors, var_colors, cp_colors]
+    by_row = [e_min_colors, delta_e_colors, delta_g_colors, var_colors, cp_colors]
     label_col_colors = [white] * len(row_labels)
     fill_colors = [label_col_colors] + [
         [by_row[r][i] for r in range(len(row_labels))]
@@ -1512,7 +1508,7 @@ def polymorph_summary_table(stats, sorted_minima_inds, polymorph_inds, basin_col
         header=dict(
             values=header_vals,
             align="center",
-            font=dict(size=14, color="white"),
+            font=dict(size=14, color="black"),
             fill_color=header_fill,
             height=44,
         ),
