@@ -101,7 +101,7 @@ if __name__ == '__main__':
     # uma_model_path = r"D:\crystal_datasets\esen_s.pt"
     # device = 'cuda'
     # nehzor
-    search_output_dir = r"D:\crystal_datasets\nehzor\p2"
+    search_output_dir = r"D:\crystal_datasets\nehzor\p5"
     run_name = 'nehzor'
     identifier = 'NEHZOR'
     energy_function = 'uma'

@@ -2,6 +2,11 @@ import tempfile
 import webbrowser
 from typing import Optional
 
+import numpy as np
+import plotly.graph_objects as go
+
+from scipy.stats import gaussian_kde
+
 import plotly.colors as pc
 import torch
 from plotly.subplots import make_subplots
@@ -575,126 +580,82 @@ def rugged_pes_fig():
 
     fig.show()
 
-
 def parity_fig(
         x_raw,
         y_raw,
         x_label='Target (Pf + R)',
         y_label='Model (Pb + Z)',
-        quantile_cut: float = None
+        quantile_cut: float = 0.99,
 ):
-    """
-    Pure parity plot with a single global regression.
-    """
-
     # tensors → cpu
     x = x_raw.detach().cpu().float()
     y = y_raw.detach().cpu().float()
 
+    xn, yn = x.numpy(), y.numpy()
+
     # limits
-    xmin = y.min()  # min(x.min(), y.min())
+    xmin = y.min()
     xmax = max(x.max(), y.max())
     pad = 0.02 * (xmax - xmin)
     xmin -= pad
     xmax += pad
 
     # density coloring
-    xy = np.vstack([x.numpy(), y.numpy()])
+    xy = np.vstack([xn, yn])
     try:
         c = get_point_density_knn(xy)
     except Exception:
         c = np.ones(len(x))
 
-    if quantile_cut is not None:
-        lo, hi = np.quantile(x.numpy(), quantile_cut), np.quantile(x.numpy(), 1 - quantile_cut)
-        mask = (x.numpy() >= lo) & (x.numpy() <= hi)
-        xr, yr = x.numpy()[mask], y.numpy()[mask]
-    else:
-        xr, yr = x.numpy(), y.numpy()
+    # full R
+    r_full = linregress(xn, yn).rvalue
 
-    linreg = linregress(xr, yr)
-    slope, intercept, r = linreg.slope, linreg.intercept, linreg.rvalue
+    # trimmed R
+    lo, hi = np.quantile(xn, 1 - quantile_cut), np.quantile(xn, 1)
+    mask = (xn >= lo) & (xn <= hi)
+    r_cut = linregress(xn[mask], yn[mask]).rvalue
+
+    # regression line (full data)
+    slope, intercept = linregress(xn, yn).slope, linregress(xn, yn).intercept
     xx = np.linspace(xmin, xmax, 300)
     yy = slope * xx + intercept
 
     fig = go.Figure()
 
-    # scatter
     fig.add_scatter(
-        x=x,
-        y=y,
-        mode='markers',
-        marker=dict(
-            size=6,
-            color=c,
-            colorscale='Viridis',
-            opacity=0.55,
-            line=dict(width=0),
-        ),
+        x=x, y=y, mode='markers',
+        marker=dict(size=6, color=c, colorscale='Viridis', opacity=0.55, line=dict(width=0)),
         showlegend=False,
     )
-
-    # y = x reference
     fig.add_scatter(
-        x=xx,
-        y=xx,
-        mode='lines',
-        line=dict(color='gray', width=3, dash='dash'),
-        showlegend=False,
+        x=xx, y=xx, mode='lines',
+        line=dict(color='gray', width=3, dash='dash'), showlegend=False,
     )
+    # fig.add_scatter(
+    #     x=xx, y=yy, mode='lines',
+    #     line=dict(color='black', width=4), showlegend=False,
+    # )
 
-    # regression line
-    fig.add_scatter(
-        x=xx,
-        y=yy,
-        mode='lines',
-        line=dict(color='black', width=4),
-        showlegend=False,
-    )
-
-    # annotation
+    pct = int(quantile_cut * 100)
     fig.add_annotation(
-        x=0.02,
-        y=0.98,
-        xref='paper',
-        yref='paper',
-        showarrow=False,
-        align='left',
-        text=(
-            f"Slope = {slope:.2g}<br>"
-            f"Intercept = {intercept:.3g}<br>"
-            f"R = {r:.2g}"
-        ),
-        font=dict(size=20)
+        x=0.02, y=0.98, xref='paper', yref='paper',
+        showarrow=False, align='left',
+        text=f"R = {r_full:.3g}<br>R<sub>{pct}</sub> = {r_cut:.3g}",
+        font=dict(size=24),
     )
 
-    # layout
     fig.update_layout(
         template='simple_white',
-        xaxis=dict(
-            title=x_label,
-            range=[xmin, xmax],
-            showline=True,
-            zeroline=True,
-            zerolinecolor='grey',
-            zerolinewidth=0.5,
-        ),
-        yaxis=dict(
-            title=y_label,
-            range=[xmin, xmax],
-            showline=True,
-            zeroline=True,
-            zerolinecolor='grey',
-            zerolinewidth=0.5,
-            scaleanchor='x',
-            scaleratio=1,
-        ),
+        xaxis=dict(title=x_label, range=[xmin, xmax], showline=True,
+                    zeroline=True, zerolinecolor='grey', zerolinewidth=0.5),
+        yaxis=dict(title=y_label, range=[xmin, xmax], showline=True,
+                    zeroline=True, zerolinecolor='grey', zerolinewidth=0.5,
+                    scaleanchor='x', scaleratio=1),
         margin=dict(l=70, r=20, t=40, b=60),
         font_size=24,
     )
 
     return fig
-
 
 def sample_summary_table(sample_metrics, sample_energy, sample_inds,
                          metric_keys):
@@ -1356,7 +1317,7 @@ def add_bivariate_colorbar(fig, x0=0.78, y0=0.02, size=0.18):
     )
     fig.add_annotation(
         xref="paper", yref="paper",
-        x=x0 - 0.02, y=y0 + size,
+        x=x0 - 0.02, y=y0 + size * 0.75,
         text="G(x) →", showarrow=False,
         font=dict(size=9, family="Helvetica"), xanchor="center",
         textangle=-90,
@@ -1446,14 +1407,14 @@ def rdf_embedding_fig(sample_embedding, uma_en, uma_free_energy, sorted_minima_i
                 row=1, col=col,
             )
 
-    fig = add_bivariate_colorbar(fig, 0.3, 0.85, size=0.2)
+    fig = add_bivariate_colorbar(fig, 0.3, 0.70, size=0.2)
     fig.update_annotations(font_size=20)
     fig.update_layout(font_size=20)
 
     return fig
 
 
-def polymorph_summary_table(stats, sorted_minima_inds, polymorph_inds, basin_colors):
+def polymorph_summary_table(stats, sorted_minima_inds, polymorph_inds, basin_colors, matches, rmsds):
     n_basins = len(sorted_minima_inds)
 
     e_min = stats['sample_energy'].numpy()
@@ -1463,14 +1424,18 @@ def polymorph_summary_table(stats, sorted_minima_inds, polymorph_inds, basin_col
     e_var = stats['local_en_var']
     cp = stats['sample_cp'].numpy()
 
-    row_labels = ["E_min (kJ/mol)", "ΔE (kJ/mol)", "ΔG (kT)", "σ²_E", "c_p"]
-    raw_values = [e_min, delta_e, delta_g, e_var, cp]
+    row_labels = ["E_min (kJ/mol)", "ΔE (kJ/mol)", "ΔG (kJ/mol)", "σ<sup>2</sup><sub>E</sub>",  # variance of E
+                  "c<sub>p</sub>",
+                  "Matches /20"]
+    raw_values = [e_min, delta_e, delta_g, e_var, cp, matches]#, rmsds]
     formatters = [
         lambda v: f"{v:.1f}",
         lambda v: f"{v:.2f}",
         lambda v: f"{v:.2f}",
         lambda v: f"{v:.2f}",
         lambda v: f"{v:.2f}",
+        lambda v: f"{int(v)}",
+        #lambda v: f"{v:.2f}",
     ]
 
     header_vals = [""] + [f"Basin {i + 1}" for i in range(n_basins)]
@@ -1489,15 +1454,18 @@ def polymorph_summary_table(stats, sorted_minima_inds, polymorph_inds, basin_col
             for c in actual_colors
         ]
 
+    white = "rgb(255,255,255)"
+
     e_min_colors = row_colors(e_min, "RdBu_r", alpha=0.4)
     delta_e_colors = row_colors(delta_e, "RdBu_r", alpha=0.4)
     delta_g_colors = row_colors(delta_g, "RdBu_r", alpha=0.4)
     var_colors = row_colors(e_var, "Oranges", alpha=0.35)
-    white = "rgb(255,255,255)"
     cp_colors = [white] * n_basins
     header_fill = ["rgb(40,40,40)"] + [basin_colors[i + 1] for i in range(n_basins)]
 
-    by_row = [e_min_colors, delta_e_colors, delta_g_colors, var_colors, cp_colors]
+    by_row = [e_min_colors, delta_e_colors, delta_g_colors, var_colors, cp_colors,
+              row_colors(matches, "Greens", alpha=0.35), [white] * n_basins]
+
     label_col_colors = [white] * len(row_labels)
     fill_colors = [label_col_colors] + [
         [by_row[r][i] for r in range(len(row_labels))]
@@ -1508,20 +1476,21 @@ def polymorph_summary_table(stats, sorted_minima_inds, polymorph_inds, basin_col
         header=dict(
             values=header_vals,
             align="center",
-            font=dict(size=14, color="black"),
+            font=dict(size=16, color="black"),
             fill_color=header_fill,
-            height=44,
+            height=30,
         ),
         cells=dict(
             values=cell_vals,
             align="center",
             font=dict(size=13),
             fill_color=fill_colors,
-            height=32,
+            height=22,
         ),
     )])
 
     fig.update_layout(margin=dict(l=10, r=10, t=10, b=10))
+
     return fig
 
 
@@ -1621,3 +1590,104 @@ def pes_cartoon():
         template="plotly_white",
         margin=dict(l=60, r=30, t=50, b=50))
     return fig
+
+def plot_dual_density_contour(
+        x_a, y_a,
+        x_b, y_b,
+        bw: float = 0.15,
+        label_a: str = "Distribution A",
+        label_b: str = "Distribution B",
+        ncontours: int = 8,
+        color_a: str = "steelblue",
+        color_b: str = "firebrick",
+        grid_size: int = 100,
+        fill_opacity: float = 0.10,
+        renderer=None,
+        show: bool = True,
+        return_fig: bool = False,
+        yaxis_title: str = "Energy per Atom / Arb Units",
+        xaxis_title: str = "Packing Coefficient",
+        max_y_quantile: float = 0.99,
+        x_min: float = None,
+        x_max: float = None,
+        y_min: float = None,
+        y_max: float = None,
+):
+    from plotly.subplots import make_subplots
+    import matplotlib.colors as mcolors
+
+    all_y = np.concatenate([y_a, y_b])
+    all_x = np.concatenate([x_a, x_b])
+    if y_max is None: y_max = np.quantile(all_y, max_y_quantile)
+    if y_min is None: y_min = np.amin(all_y) - np.ptp(all_y) * 0.05
+    if x_min is None: x_min = max(0.0, np.amin(all_x) * 0.95)
+    if x_max is None: x_max = min(1.0, np.amax(all_x) * 1.05)
+
+    xi = np.linspace(x_min, x_max, grid_size)
+    yi = np.linspace(y_min, y_max, grid_size)
+    xx, yy = np.meshgrid(xi, yi)
+    grid_points = np.vstack([xx.ravel(), yy.ravel()])
+
+    def compute_kde(x, y, bw_method):
+        kde = gaussian_kde(np.vstack([x, y]), bw_method=bw_method)
+        z = kde(grid_points).reshape(grid_size, grid_size)
+        z = np.log1p(z / z.max() * 100)
+        return z / z.max()
+
+    def hex_to_rgba(color, alpha):
+        r, g, b, _ = mcolors.to_rgba(color)
+        return f'rgba({int(r * 255)},{int(g * 255)},{int(b * 255)},{alpha})'
+
+    def make_colorscale(hex_color, fill_opacity):
+        rgba_zero = hex_to_rgba(hex_color, 0.0)
+        rgba_fill = hex_to_rgba(hex_color, fill_opacity)
+        return [[0.0, rgba_zero], [1.0, rgba_fill]]
+
+    def add_traces(fig, z, color, name, row, col):
+        fig.add_trace(go.Contour(
+            x=xi, y=yi, z=z,
+            ncontours=ncontours,
+            contours=dict(coloring='heatmap', showlines=False),
+            colorscale=make_colorscale(color, fill_opacity),
+            showscale=False, showlegend=False, hoverinfo='skip',
+        ), row=row, col=col)
+        fig.add_trace(go.Contour(
+            x=xi, y=yi, z=z,
+            ncontours=ncontours,
+            contours=dict(coloring='none', showlines=True),
+            line=dict(width=1.5, color=color),
+            showscale=False, showlegend=False, hoverinfo='skip',
+        ), row=row, col=col)
+
+    z_a = compute_kde(x_a, y_a, bw)
+    z_b = compute_kde(x_b, y_b, bw)
+
+    fig = make_subplots(rows=1, cols=2, subplot_titles=[label_a, label_b],
+                        shared_yaxes=True, horizontal_spacing=0.06)
+
+    add_traces(fig, z_a, color_a, label_a, 1, 1)
+    add_traces(fig, z_b, color_b, label_b, 1, 2)
+
+    fig.update_layout(
+        font=dict(family="Helvetica", size=12),
+        plot_bgcolor='white', paper_bgcolor='white',
+        margin=dict(l=60, r=20, t=40, b=50),
+    )
+    for ax in ['xaxis', 'xaxis2']:
+        fig.update_layout(**{ax: dict(
+            title=xaxis_title, range=[x_min, x_max],
+            showgrid=True, gridcolor='rgba(0,0,0,0.15)', gridwidth=0.8,
+            zeroline=False, showline=True, linewidth=1, linecolor='black', mirror=True,
+        )})
+    for ax in ['yaxis', 'yaxis2']:
+        fig.update_layout(**{ax: dict(
+            range=[y_min, y_max],
+            showgrid=True, gridcolor='rgba(0,0,0,0.15)', gridwidth=0.8,
+            zeroline=False, showline=True, linewidth=1, linecolor='black', mirror=True,
+        )})
+    fig.update_layout(yaxis_title=yaxis_title)
+
+    if show:
+        fig.show(renderer=renderer)
+    if return_fig:
+        return fig
