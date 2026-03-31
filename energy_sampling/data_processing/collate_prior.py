@@ -54,8 +54,8 @@ def collate_generate_prior():
     sample_batch = collate_data_list(good_samples)
     sample_batch.latent_to_cell_params(sample_batch.latent_params())  # get safely into the latent space
     """
-            Calibrate distance cutoff on this energy function
-            """
+    Calibrate distance cutoff on this energy function
+    """
     "very coarse diverse basin selection"
     sample_batch = sample_batch.cuda()
     params = sample_batch.latent_params()
@@ -101,10 +101,10 @@ if __name__ == '__main__':
     # uma_model_path = r"D:\crystal_datasets\esen_s.pt"
     # device = 'cuda'
     # nehzor
-    search_output_dir = r"D:\crystal_datasets\nehzor\p5"
-    run_name = 'nehzor'
+    search_output_dir = r"D:\crystal_datasets\nehzor\p6"
+    run_name = 'nehzor_4_elj'
     identifier = 'NEHZOR'
-    energy_function = 'uma'
+    energy_function = 'elj'
     target_path = r"D:\crystal_datasets\nehzor\NEHZOR01_standardized.pt"
     uma_model_path = r"D:\crystal_datasets\esen_s.pt"
     device = 'cuda'
@@ -119,6 +119,7 @@ if __name__ == '__main__':
     pattern = os.path.join(search_output_dir, run_name + '_*.pt')
     files = glob.glob(pattern)
     traj_records = glob.glob(f"{run_name}*")
+    traj_records = [elem for elem in traj_records if 'prior' not in elem]
     # traj_records = [
     #     f for f in files
     #     if re.search(rf'{re.escape(run_name)}_\d{{1,2}}\.pt$', os.path.basename(f))
@@ -133,7 +134,7 @@ if __name__ == '__main__':
 
     dataset_filename = run_name + '_prior_dataset.pt'
 
-    if False:  # os.path.exists(dataset_filename):
+    if os.path.exists(dataset_filename):
         dd = torch.load(dataset_filename, weights_only=False)
         noised_samples = dd['noised_batch'].batch_to_list()
         thinned_batch = dd['prior_batch']
