@@ -1266,7 +1266,6 @@ def bottom_up_cluster(xx, e, d_cut, e_cut, max_new_samples: int, device):
     return keep_inds.cpu()
 
 
-
 def bottom_up_cluster_w_dmat(e, d_cut, e_cut, max_new_samples: int, device, dmat):
     # Sort by energy ascending
     sort_inds = torch.argsort(e.to(device))
@@ -1967,13 +1966,11 @@ def k_nn_analysis(n_dims, METRICS, indices_to_compute, d2, dists, inds, k, sampl
 
 def load_experimental_structure(exp_sample_path, sg_ind, zp, device, max_z_prime, molecule, energy_function):
     exp_crystals = torch.load(exp_sample_path, weights_only=False)
-    if isinstance(exp_crystals, list):
-        exp_crystals = [exp_crystals[0]]
     ebatch = collate_data_list(exp_crystals, max_z_prime=zp)
     pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
     predictor = init_uma_crystal_predictor(pred_path, device=device)
     esamples = analyze_samples(
-        None,  # ebatch.latent_params(),
+        ebatch.latent_params(),
         [molecule] * ebatch.num_graphs,
         max_z_prime,
         device,
@@ -2120,6 +2117,81 @@ def new_local_analysis(
 
             # ---- Laplacian (graph-style discrete Laplacian of density) ----
             metrics['local_laplacian'][ind] = torch.mean(local_density - density[ind]).item()
+        else:
+            metrics['local_max_density'][ind] = 0
+            metrics['local_mean_density'][ind] = 0
+
+            metrics['is_local_density_maximum'][ind] = False
+
+            # ---- Laplacian (graph-style discrete Laplacian of energy) ----
+            metrics['local_laplacian'][ind] = 0
+
+    return metrics
+
+
+def dmat_local_analysis(
+        sample_energy,
+        dmat,
+        d_kernel,
+        d_cut,
+        e_cut: Optional[float] = None,
+):
+    n_samples = len(sample_energy)
+    n_dims = 12
+    # density: full KDE, no cutoff
+
+    metrics = {'count': np.zeros(n_samples, dtype=np.int64),
+               'density': np.zeros(n_samples, dtype=np.float64),
+               'var': np.zeros((n_samples, n_dims)),
+               'is_local_en_minimum': np.zeros(n_samples, dtype=bool),
+               'is_local_density_maximum': np.zeros(n_samples, dtype=bool),
+               'local_dist_mean': np.zeros(n_samples, dtype=np.float64),
+               'local_dist_var': np.zeros(n_samples, dtype=np.float64),
+               'local_laplacian': np.zeros(n_samples, dtype=np.float64),
+               'local_en_mean': np.zeros(n_samples, dtype=np.float64),
+               'local_en_var': np.zeros(n_samples, dtype=np.float64),
+               'local_max_density': np.zeros(n_samples, dtype=np.float64),
+               'local_mean_density': np.zeros(n_samples, dtype=np.float64),
+               'local_energy_minimum_id': -np.ones(n_samples, dtype=np.int64),
+               'local_density_maximum_id': -np.ones(n_samples, dtype=np.int64),
+               }
+
+    metrics['density'] = (torch.exp(-(dmat ** 2) / (2 * d_kernel ** 2)).sum(dim=-1) - 1).numpy()
+
+    for ind in range(n_samples):
+        neighbors = torch.argwhere(dmat[ind] < d_cut).flatten()
+
+        if len(neighbors) > 0:
+            continue
+        if e_cut is not None:
+            neighbors = neighbors[(sample_energy[neighbors] - sample_energy.amin()) < e_cut]
+
+        local_dists = dmat[neighbors]
+
+        metrics['count'][ind] = len(neighbors)
+        metrics['is_local_en_minimum'][ind] = torch.all(sample_energy[ind] <= sample_energy[neighbors]).item()
+        metrics['local_energy_minimum_id'][ind] = neighbors[sample_energy[neighbors].argmin()].item()
+
+        metrics['local_dist_mean'][ind] = torch.mean(local_dists).item()
+        metrics['local_dist_var'][ind] = torch.var(local_dists).item()
+
+        local_energy = sample_energy[neighbors]
+        metrics['local_en_mean'][ind] = torch.mean(local_energy).item()
+        metrics['local_en_var'][ind] = torch.var(local_energy).item()
+    for ind in range(n_samples):
+        neighbors = torch.argwhere(dmat[ind] < d_cut).flatten()
+
+        if len(neighbors) > 0:
+            local_density = metrics['density'][neighbors]
+
+            metrics['local_max_density'][ind] = np.max(local_density)
+            metrics['local_mean_density'][ind] = np.mean(local_density)
+
+            metrics['is_local_density_maximum'][ind] = np.all(metrics['density'][ind] >= local_density)
+            metrics['local_density_maximum_id'][ind] = neighbors[local_density.argmax()]
+
+            # ---- Laplacian (graph-style discrete Laplacian of density) ----
+            metrics['local_laplacian'][ind] = np.mean(local_density - metrics['density'][ind])
         else:
             metrics['local_max_density'][ind] = 0
             metrics['local_mean_density'][ind] = 0
@@ -2505,3 +2577,76 @@ def assign_basins(pointer_ids, n_samples):
     for i, b in enumerate(unique_basins):
         basin_mask[i] = torch.from_numpy(assignments == b)
     return basin_mask, assignments
+
+
+def mean_shift_density(n_samples, max_iter, dmat, cutoff, density):
+#     original_state = torch.arange(n_samples)
+#     current_state = torch.arange(n_samples)
+#     for _ in tqdm(range(max_iter)):
+#         prev_state = current_state.clone()
+#         for i in range(n_samples):
+#             s0 = current_state[i]  # get current walker
+#
+#             neighbors = torch.where(dmat[s0] < cutoff)[0]  # get neighbors
+#
+#             if len(neighbors) == 0:  # nothing in cutoff
+#                 neighbors = torch.tensor([s0])
+#
+#             best_neighbor = neighbors[density[neighbors].argmax()]  # get highest density neighbor
+#
+#             current_state[i] = best_neighbor
+#
+#         if torch.equal(current_state, prev_state):
+#             break
+    # vectorized inner loop
+    current_state = torch.arange(n_samples, device=dmat.device)
+
+    # Precompute once: for each point i, the highest-density neighbor within cutoff.
+    # Mask non-neighbors with -inf so they lose the argmax.
+    neighbor_mask = dmat < cutoff                                  # (N, N) bool
+    masked_density = torch.where(
+        neighbor_mask,
+        torch.as_tensor(density).unsqueeze(0).expand_as(dmat),                      # broadcast row-wise
+        torch.full_like(dmat, float('-inf')),
+    )
+    # Fallback: if a row has no neighbors, point it at itself.
+    has_neighbor = neighbor_mask.any(dim=1)
+    best_from = masked_density.argmax(dim=1)                       # (N,)
+    best_from = torch.where(has_neighbor, best_from, torch.arange(n_samples, device=dmat.device))
+
+    for _ in range(max_iter):
+        prev_state = current_state
+        current_state = best_from[current_state]                   # gather-step all walkers at once
+        if torch.equal(current_state, prev_state):
+            break
+
+    return current_state  # we have to assert these are self pointing and reasonable
+
+
+def basin_opt(basin_minima, samples, energy_function, predictor):
+    all_outs = []
+    all_records = []
+    for minima in basin_minima:
+        opt_batch = collate_data_list(
+            [samples[ind] for ind in minima])
+        opt_batch.cuda()
+        out, record = opt_batch.optimize_crystal_parameters(return_record=True,
+                                                            **{'optimizer_func': 'rprop',
+                                                               'max_num_steps': 200,
+                                                               'init_lr': 0.001,
+                                                               'optim_target': energy_function,
+                                                               'uma_predictor': predictor,
+                                                               'cutoff': 10,
+                                                               'enforce_reduced': True,
+                                                               'show_tqdm': True
+                                                               }
+                                                            )
+
+        all_outs.append(out)
+        all_records.append(record)
+        del opt_batch
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        sleep(0.1)
+    return all_outs, all_records

@@ -78,6 +78,7 @@ def get_gfn_forward_loss(loss_coeffs,
                          exploration_std=None, return_exp=False, condition=None,
                          repeats=10,
                          report_losses: bool = False,
+                         detach_z: bool = False
                          ):
     if gfn.conditional_flow_model and any([
         loss_coeffs.var > 0, loss_coeffs.vg_lb > 0,
@@ -124,7 +125,7 @@ def get_gfn_forward_loss(loss_coeffs,
                                            )
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
-    #del log_pfs, log_pbs
+    # del log_pfs, log_pbs
 
     losses = []
     """greedy loss"""
@@ -161,7 +162,7 @@ def get_gfn_forward_loss(loss_coeffs,
 
     """TB loss"""
     if loss_coeffs.tb > 0:
-        tb_loss = get_tb_loss(log_flow, log_pb, log_pf, log_r)
+        tb_loss = get_tb_loss(log_flow, log_pb, log_pf, log_r, detach_z=detach_z)
         losses.append(tb_loss * loss_coeffs.tb)
 
     """MLE/TPM loss"""
@@ -244,7 +245,6 @@ def get_gfn_forward_loss(loss_coeffs,
         return loss, loss_dict, log_r, log_importance_weight
 
 
-
 def get_gfn_backward_loss(loss_coeffs,
                           samples,
                           gfn,
@@ -290,7 +290,7 @@ def get_gfn_backward_loss(loss_coeffs,
 
     """TB loss"""
     tb_loss = get_tb_loss(log_flow, log_pb, log_pf, log_r,
-                          detach_z = True if loss_coeffs.bwd_tb_z == 0 else False,
+                          detach_z=True if loss_coeffs.bwd_tb_z == 0 else False,
                           z_only=True if loss_coeffs.bwd_tb_z == 2 else False)
     if loss_coeffs.tb > 0:
         losses.append(tb_loss * loss_coeffs.tb)
@@ -330,7 +330,8 @@ def get_gfn_backward_loss(loss_coeffs,
     if report_losses:
         loss_dict = {}
         loss_dict['log_Z_lb'] = log_Z_lb
-        loss_dict['normed_tb'] =  normed_tb_residual.clip(max=normed_tb_residual.quantile(0.95)).mean() # exclude outliers
+        loss_dict['normed_tb'] = normed_tb_residual.clip(
+            max=normed_tb_residual.quantile(0.95)).mean()  # exclude outliers
         loss_dict['scatter_err'] = scatter_err
         loss_dict['slope_err'] = slope_err
         loss_dict['intercept_err'] = intercept_err
@@ -423,7 +424,8 @@ def get_tb_loss(log_flow, log_pb, log_pf, log_r, detach_z=False, z_only=False):
 
 def emp_Z(gfn, log_Z, log_flow, repeats):
     if gfn.conditional_flow_model:
-        emp_z_loss = F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_flow.view(repeats, -1), reduction='none', beta=10).view(-1)
+        emp_z_loss = F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_flow.view(repeats, -1), reduction='none',
+                                      beta=10).view(-1)
     else:
         emp_z_loss = F.smooth_l1_loss(log_Z.repeat(len(log_flow)), log_flow, reduction='none', beta=10)
     return emp_z_loss
@@ -434,7 +436,8 @@ def vg_lme(gfn, log_pb, log_pf, log_r, repeats):
     if gfn.conditional_flow_model:
         log_Z = torch.logsumexp(log_ratio.view(repeats, -1), dim=0, keepdim=True) - math.log(repeats)
         # vg_loss = (0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2).view(-1)
-        vg_loss = F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_ratio.view(repeats, -1), reduction='none', beta=10).view(-1)
+        vg_loss = F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_ratio.view(repeats, -1), reduction='none',
+                                   beta=10).view(-1)
     else:
         log_Z = torch.logsumexp(log_ratio, dim=0, keepdim=True) - math.log(repeats)
         # vg_loss = 0.5 * (log_Z - log_ratio) ** 2
@@ -449,7 +452,8 @@ def vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats):
     if gfn.conditional_flow_model:
         log_Z = log_ratio.view(repeats, -1).mean(dim=0, keepdim=True)
         # vg_loss = (0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2).view(-1)
-        vg_loss = F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_ratio.view(repeats, -1), reduction='none', beta=10).view(-1)
+        vg_loss = F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_ratio.view(repeats, -1), reduction='none',
+                                   beta=10).view(-1)
 
     else:
         log_Z = log_ratio.mean(dim=0, keepdim=True)

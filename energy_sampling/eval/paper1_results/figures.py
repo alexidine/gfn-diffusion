@@ -580,6 +580,7 @@ def rugged_pes_fig():
 
     fig.show()
 
+
 def parity_fig(
         x_raw,
         y_raw,
@@ -609,6 +610,8 @@ def parity_fig(
 
     # full R
     r_full = linregress(xn, yn).rvalue
+    from scipy.stats import spearmanr
+    rho_full, p_full = spearmanr(xn, yn)
 
     # trimmed R
     lo, hi = np.quantile(xn, 1 - quantile_cut), np.quantile(xn, 1)
@@ -647,15 +650,16 @@ def parity_fig(
     fig.update_layout(
         template='simple_white',
         xaxis=dict(title=x_label, range=[xmin, xmax], showline=True,
-                    zeroline=True, zerolinecolor='grey', zerolinewidth=0.5),
+                   zeroline=True, zerolinecolor='grey', zerolinewidth=0.5),
         yaxis=dict(title=y_label, range=[xmin, xmax], showline=True,
-                    zeroline=True, zerolinecolor='grey', zerolinewidth=0.5,
-                    scaleanchor='x', scaleratio=1),
+                   zeroline=True, zerolinecolor='grey', zerolinewidth=0.5,
+                   scaleanchor='x', scaleratio=1),
         margin=dict(l=70, r=20, t=40, b=60),
         font_size=24,
     )
 
     return fig
+
 
 def sample_summary_table(sample_metrics, sample_energy, sample_inds,
                          metric_keys):
@@ -1157,7 +1161,7 @@ def dual_energy_marginal_fig(sample_energy1, sample_energy2,
                              label1='Energy 1', label2='Energy 2'):
     colors = {'1': 'steelblue', '2': 'firebrick'}
 
-    def process(sample_energy, color, label, fig, row):
+    def process(sample_energy, color, label, fig, row, col):
         energies_np = sample_energy[sample_energy < 0].cpu().detach().numpy()
 
         hist_y, hist_x = np.histogram(energies_np, bins=50, density=True)
@@ -1190,49 +1194,50 @@ def dual_energy_marginal_fig(sample_energy1, sample_energy2,
             x=bin_centers, y=hist_y,
             name=label, opacity=0.4, showlegend=False,
             marker_color=color,
-        ), row=row, col=1)
+        ), row=row, col=col)
         fig.add_trace(go.Scatter(
             x=x_kde, y=y_kde, mode='lines',
             name=f'{label} KDE', line=dict(width=2, color=color),
             showlegend=False,
-        ), row=row, col=1)
-        fig.add_trace(go.Scatter(
-            x=x_kde, y=boltzmann_y, mode='lines',
-            name=f'{label} Boltzmann (β≈{beta_est:.2f})',
-            line=dict(dash='dot', width=1.5, color=color),
-            showlegend=False,
-        ), row=row, col=1)
-
-        # right: log
-        fig.add_trace(go.Scatter(
-            x=bin_centers[nonzero], y=np.log(hist_y[nonzero]),
-            mode='markers+lines',
-            name=label, line=dict(width=2, color=color),
-            marker=dict(size=5, color=color),
-            showlegend=False,
-        ), row=row, col=2)
-        fig.add_trace(go.Scatter(
-            x=bin_centers, y=log_fit, mode='lines',
-            name=f'{label} fit (β≈{beta_est:.2f})',
-            line=dict(dash='dot', width=1.5, color=color),
-            showlegend=False,
-        ), row=row, col=2)
+        ), row=row, col=col)
+        # fig.add_trace(go.Scatter(
+        #     x=x_kde, y=boltzmann_y, mode='lines',
+        #     name=f'{label} Boltzmann (β≈{beta_est:.2f})',
+        #     line=dict(dash='dot', width=1.5, color=color),
+        #     showlegend=False,
+        # ), row=row, col=1)
+        #
+        # # right: log
+        # fig.add_trace(go.Scatter(
+        #     x=bin_centers[nonzero], y=np.log(hist_y[nonzero]),
+        #     mode='markers+lines',
+        #     name=label, line=dict(width=2, color=color),
+        #     marker=dict(size=5, color=color),
+        #     showlegend=False,
+        # ), row=row, col=2)
+        # fig.add_trace(go.Scatter(
+        #     x=bin_centers, y=log_fit, mode='lines',
+        #     name=f'{label} fit (β≈{beta_est:.2f})',
+        #     line=dict(dash='dot', width=1.5, color=color),
+        #     showlegend=False,
+        # ), row=row, col=2)
 
     fig = make_subplots(
-        rows=2, cols=2,
-        # subplot_titles=(f'{label1} – P(E)', f'{label1} – log P(E)',
-        #                f'{label2} – P(E)', f'{label2} – log P(E)'),
+        rows=1, cols=2,
+        subplot_titles=(f'LJ', f'UMA')  # ,
+        # f'{label2} – P(E)', f'{label2} – log P(E)'),
     )
-    process(sample_energy1, colors['1'], label1, fig, row=1)
-    process(sample_energy2, colors['2'], label2, fig, row=2)
+    process(sample_energy1, colors['1'], label1, fig, row=1, col=1)
+    process(sample_energy2, colors['2'], label2, fig, row=1, col=2)
 
     fig.update_layout(template='plotly_white', font_size=20)
-    for row in [1, 2]:
-        en = 'UMA' if row == 2 else 'LJ'
-        fig.update_xaxes(title_text=f'{en} Energy (kJ/mol)', row=row, col=1)
-        fig.update_yaxes(title_text='P(E)', row=row, col=1)
-        fig.update_xaxes(title_text=f'{en} Energy (kJ/mol)', row=row, col=2)
-        fig.update_yaxes(title_text='log P(E)', row=row, col=2)
+    for row in [1]:
+        for col in [1, 2]:
+            en = 'UMA' if col == 2 else 'LJ'
+            fig.update_xaxes(title_text=f'Lattice Energy (kJ/mol)', row=row, col=col)
+            fig.update_yaxes(title_text='P(E)', row=row, col=col)
+            # fig.update_xaxes(title_text=f'{en} Energy (kJ/mol)', row=row, col=2)
+            # fig.update_yaxes(title_text='log P(E)', row=row, col=2)
     # fig.update_xaxes(range = [min(sample_energy1.amin(), sample_energy2.amin()), max(sample_energy1.amax(), sample_energy2.amax())])
 
     return fig
@@ -1342,19 +1347,31 @@ def add_bivariate_colorbar(fig, x0=0.78, y0=0.02, size=0.18):
 
 def rdf_embedding_fig(sample_embedding, uma_en, uma_free_energy, sorted_minima_inds, related_maxima, polymorph_inds,
                       basin_colors):
-    en_colors = bivariate_energy_color(uma_en.clip(max=0), uma_free_energy, clip_quantile=0.1)
+    # en_colors = bivariate_energy_color(uma_en.clip(max=0),
+    #                                    uma_free_energy,
+    #                                    clip_quantile=0.1)
+    en_colors = uma_free_energy
     fig = make_subplots(rows=1, cols=2)  # , subplot_titles=['Basin Assignment','Basin Energy'])
     fig.add_scattergl(x=sample_embedding[:, 0],
                       y=sample_embedding[:, 1],
-                      marker_color=en_colors, mode='markers',
-                      opacity=0.5, marker_showscale=False,
+                      marker_colorscale='icefire',
+                      marker_color=np.clip(en_colors, a_min=-np.inf, a_max=np.quantile(en_colors, 0.95)) - np.amin(
+                          en_colors),
+                      mode='markers',
+                      marker_colorbar=dict(
+                          title=dict(text='Free Energy (kJ/mol)', side='right'),
+                          thickness=15,
+                          len=0.8,
+                          x=0.45,  # positions it between the two subplots
+                      ),
+                      opacity=0.5, marker_showscale=True,
                       showlegend=False, row=1, col=1)
     fig.add_scattergl(x=sample_embedding[:, 0],
                       y=sample_embedding[:, 1],
                       marker_color=basin_colors, mode='markers',
                       # marker_colorscale=basin_colors,
                       # marker_colorbar=dict(tickvals=list(range(1,len(uniques))), title='Basin'),
-                      opacity=0.5,
+                      opacity=0.75,
                       showlegend=False, row=1, col=2)
 
     fig.update_layout(
@@ -1377,22 +1394,23 @@ def rdf_embedding_fig(sample_embedding, uma_en, uma_free_energy, sorted_minima_i
     #                   mode='markers', marker_color='rgb(150, 150, 150)', marker_line_color='black', marker_line_width=4,
     #                   marker_size=22,
     #                   showlegend=False, row=1, col=1)
-    fig.add_scattergl(x=sample_embedding[related_maxima, 0], y=sample_embedding[related_maxima, 1],
-                      mode='markers', marker_color='rgb(150, 150, 150)', marker_line_color='black', marker_line_width=4,
-                      marker_size=22,
-                      showlegend=False, row=1, col=2)
+    # fig.add_scattergl(x=sample_embedding[related_maxima, 0], y=sample_embedding[related_maxima, 1],
+    #                   mode='markers', marker_color='rgb(150, 150, 150)', marker_line_color='black', marker_line_width=4,
+    #                   marker_size=22,
+    #                   showlegend=False, row=1, col=2)
 
     # fig.add_scattergl(x=sample_embedding[polymorph_inds, 0], y=sample_embedding[polymorph_inds, 1],
     #                   mode='markers', marker_color='red', marker_line_color='black', marker_line_width=4,
     #                   marker_size=22,
     #                   showlegend=False, row=1, col=1)
-    fig.add_scattergl(x=sample_embedding[polymorph_inds, 0], y=sample_embedding[polymorph_inds, 1],
-                      mode='markers', marker_color='red', marker_line_color='black', marker_line_width=4,
-                      marker_size=22,
-                      showlegend=False, row=1, col=2)
+
     fig.add_scattergl(x=sample_embedding[sorted_minima_inds, 0], y=sample_embedding[sorted_minima_inds, 1],
                       mode='markers', marker_color='white', marker_line_color='black', marker_line_width=4,
-                      marker_size=22,
+                      marker_size=28,
+                      showlegend=False, row=1, col=2)
+    fig.add_scattergl(x=sample_embedding[polymorph_inds, 0], y=sample_embedding[polymorph_inds, 1],
+                      mode='markers', marker_color='red', marker_line_color='black', marker_line_width=4,
+                      marker_size=28, opacity=0.5,
                       showlegend=False, row=1, col=2)
 
     for rank, idx in enumerate(sorted_minima_inds):
@@ -1407,91 +1425,437 @@ def rdf_embedding_fig(sample_embedding, uma_en, uma_free_energy, sorted_minima_i
                 row=1, col=col,
             )
 
-    fig = add_bivariate_colorbar(fig, 0.3, 0.70, size=0.2)
+    # fig = add_bivariate_colorbar(fig, 0.3, 0.70, size=0.2)
     fig.update_annotations(font_size=20)
     fig.update_layout(font_size=20)
+
+    sxmin = np.quantile(sample_embedding[:, 0], 0.01) - 2
+    symin = np.quantile(sample_embedding[:, 1], 0.01) - 2
+    sxmax = np.quantile(sample_embedding[:, 0], 0.99) + 2
+    symax = np.quantile(sample_embedding[:, 1], 0.99) + 2
+
+    fig.update_xaxes(range=[sxmin, sxmax])
+    fig.update_yaxes(range=[symin, symax])
+    return fig
+
+
+def combo_fig(num_polymorphs,
+              n_basins,
+              packing_coeffs,
+              stats,
+              uma_thermos,
+              sample_inds,
+              sample_embedding,
+              p_maxima,
+              polymorph_inds,
+              new_min_inds,
+              sample_energy,
+              polymorph_colorscale,
+              sample_colors,
+              indexed_cluster_labels,
+              basin_colorscale,
+              basin_min_batch,
+              polymorph_basin_index,
+              ):
+    marker_font_size = 16
+
+    # Build subplot_titles aligned to the specs grid
+
+    basin_positions, fig = make_specs_fig(n_basins)
+
+    "embedding fig"
+    point_size = ((uma_thermos['density'] / np.amax(uma_thermos['density'])) * 60).clip(min=8)
+
+    embedding(fig, marker_font_size, new_min_inds, num_polymorphs, p_maxima, point_size, polymorph_inds, sample_colors,
+              sample_embedding, sample_inds)
+
+    fig_grid(basin_min_batch, basin_positions, fig, indexed_cluster_labels, n_basins, p_maxima, packing_coeffs,
+             polymorph_basin_index, sample_energy, stats, uma_thermos)
+
+    table_trace = new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats, n_basins)
+    fig.add_trace(table_trace, row=3, col=1)
+
+    """
+    Annotations and layout changes
+    """
+    #
+    # for name, color, line_color, size, symbol in [
+    #     ("Probability maximum", "rgb(150,150,150)", "black", 14, "circle"),
+    #     ("Energy minimum", "white", "black", 14, "circle"),
+    #     ("Experimental polymorph", "black", "black", 20, "x-thin"),
+    # ]:
+    #     fig.add_trace(go.Scatter(
+    #         x=[None], y=[None],
+    #         mode='markers',
+    #         marker=dict(
+    #             size=size,
+    #             color=color,
+    #             symbol=symbol,
+    #             line=dict(color=line_color, width=4),
+    #         ),
+    #         name=name,
+    #         showlegend=True,
+    #     ), row=1, col=1)
+    # fig.update_layout(
+    #     legend=dict(
+    #         x=0.01,
+    #         y=0.99,
+    #         xanchor='left',
+    #         yanchor='top',
+    #         bgcolor='rgba(255,255,255,0.7)',
+    #         bordercolor='black',
+    #         borderwidth=1,
+    #         font=dict(size=11),
+    #     ),
+    # )
+    # Get the domains of the top-left and bottom-left subplots of your 2x2 grid
+    y_top = fig.layout.yaxis2.domain[1]  # top of top-row subplot
+    y_bot = fig.layout.yaxis4.domain[0]  # bottom of bottom-row subplot
+    x_left = fig.layout.xaxis2.domain[0]  # left edge of left-column subplots
+
+    fig.add_annotation(
+        text="E (kJ/mol)",
+        xref="paper", yref="paper",
+        x=x_left - 0.05,  # small offset left of the grid
+        y=(y_top + y_bot) / 2,  # true midpoint of the grid
+        showarrow=False,
+        textangle=-90,
+        font=dict(size=14),
+        xanchor="center", yanchor="middle",
+    )
+
+    x_left = fig.layout.xaxis5.domain[0]  # left edge of Basin 3 (bottom-left of grid)
+    x_right = fig.layout.xaxis6.domain[1]  # right edge of Basin 4 (bottom-right)
+    y_bot = fig.layout.yaxis5.domain[0]  # bottom of bottom row of grid
+
+    fig.add_annotation(
+        text="Packing Coefficient",  # or whatever your x-axis quantity is
+        xref="paper", yref="paper",
+        x=(x_left + x_right) / 2,
+        y=y_bot - 0.04,
+        showarrow=False,
+        font=dict(size=14),
+        xanchor="center", yanchor="top",
+    )
+    fig.update_layout(
+        xaxis1_title='CV1', yaxis1_title='CV2',
+        font_size=20,
+        plot_bgcolor='white',
+        paper_bgcolor='white'
+    )
+    fig.update_xaxes(showgrid=True, gridcolor='rgb(200,200,200)', zeroline=True)
+    fig.update_yaxes(showgrid=True, gridcolor='rgb(200,200,200)', zeroline=True)
+
+    all_cp = packing_coeffs  # or concatenate just the basin subsets if you prefer
+    all_en = sample_energy
+
+    x_pad = 0.075 * (all_cp.max() - all_cp.min())
+    y_pad = 0.075 * (all_en.max() - all_en.min())
+    x_range = [all_cp.min() - x_pad, all_cp.max() + x_pad]
+    y_range = [all_en.min() - y_pad, all_en.max() + y_pad]
+
+    # after all add_trace calls, before fig.show()
+    for (row, col) in basin_positions:
+        fig.update_xaxes(range=x_range, row=row, col=col)
+        fig.update_yaxes(range=y_range, row=row, col=col)
+    # fig.add_trace(go.Scatter(
+    #     x=[None], y=[None],
+    #     mode='markers',
+    #     marker=dict(size=10, color='gray', opacity=0.5),
+    #     name="Size ∝ P(x)",
+    #     showlegend=True,
+    # ), row=1, col=1)
+    fig.update_xaxes(showgrid=False, showticklabels=False, row=1, col=1)
+    fig.update_yaxes(showgrid=False, showticklabels=False, row=1, col=1)
+
+    fig.update_annotations(font_size=24)
 
     return fig
 
 
-def polymorph_summary_table(stats, sorted_minima_inds, polymorph_inds, basin_colors, matches, rmsds):
-    n_basins = len(sorted_minima_inds)
+def make_specs_fig(n_basins):
+    if n_basins > 4:
+        total_rows = 3
+        total_cols = 5
+        subplot_titles = []
+        specs = [
+            [{"type": "scatter", "colspan": 2, "rowspan": 2}, None, {"type": "scatter"}, {"type": "scatter"},
+             {"type": "scatter"}],
 
-    e_min = stats['sample_energy'].numpy()
-    delta_e = e_min - e_min[0]
-    g = stats['free_energy']
-    delta_g = g - g.min()
-    e_var = stats['local_en_var']
-    cp = stats['sample_cp'].numpy()
+            [{"type": "scatter", "colspan": 2}, None, {"type": "scatter"}, {"type": "scatter"}, {"type": "scatter"}],
 
-    row_labels = ["E_min (kJ/mol)", "ΔE (kJ/mol)", "ΔG (kJ/mol)", "σ<sup>2</sup><sub>E</sub>",  # variance of E
-                  "c<sub>p</sub>",
-                  "Matches /20"]
-    raw_values = [e_min, delta_e, delta_g, e_var, cp, matches]#, rmsds]
-    formatters = [
-        lambda v: f"{v:.1f}",
-        lambda v: f"{v:.2f}",
-        lambda v: f"{v:.2f}",
-        lambda v: f"{v:.2f}",
-        lambda v: f"{v:.2f}",
-        lambda v: f"{int(v)}",
-        #lambda v: f"{v:.2f}",
-    ]
-
-    header_vals = [""] + [f"Basin {i + 1}" for i in range(n_basins)]
-
-    cell_vals = [row_labels]
-    for i in range(n_basins):
-        col = [fmt(vals[i]) for vals, fmt in zip(raw_values, formatters)]
-        cell_vals.append(col)
-
-    def row_colors(vals, colorscale="RdBu", alpha=0.35):
-        vals = np.asarray(vals, dtype=float)
-        t = (vals - vals.min()) / max(vals.max() - vals.min(), 1e-12)
-        actual_colors = pc.sample_colorscale(colorscale, t)
-        return [
-            pc.find_intermediate_color("rgb(255,255,255)", c, alpha, colortype="rgb")
-            for c in actual_colors
+            [{"type": "table", "colspan": 5}, None, None, None, None]
         ]
+        basin_positions = [
+            (1, 3), (1, 4), (1, 5),
+            (2, 3), (2, 4), (2, 5),
+        ]
+        basin_idx = 0
+        for r in range(total_rows):
+            for c in range(total_cols):
+                if specs[r][c] is not None:
+                    if (r + 1, c + 1) in basin_positions:
+                        basin_idx += 1
+                        subplot_titles.append(f"Basin {basin_idx}")
+                    else:
+                        subplot_titles.append("")  # no title for non-basin panels
 
-    white = "rgb(255,255,255)"
+        fig = make_subplots(
+            rows=total_rows, cols=total_cols,
+            row_heights=[1/3, 1/3, 1/3],
+            column_widths=[0.3, 0.3, 0.4 / 3, 0.4 / 3, 0.4 / 3],
+            specs=specs,
+            subplot_titles=subplot_titles,
+            horizontal_spacing=0.05,
+            vertical_spacing=0.1,
+        )
+    elif n_basins <= 4:
+        total_rows = 3
+        total_cols = 4
+        subplot_titles = []
+        specs = [
+            [{"type": "scatter", "colspan": 2, "rowspan": 2}, None, {"type": "scatter"}, {"type": "scatter"}],
 
-    e_min_colors = row_colors(e_min, "RdBu_r", alpha=0.4)
-    delta_e_colors = row_colors(delta_e, "RdBu_r", alpha=0.4)
-    delta_g_colors = row_colors(delta_g, "RdBu_r", alpha=0.4)
-    var_colors = row_colors(e_var, "Oranges", alpha=0.35)
-    cp_colors = [white] * n_basins
-    header_fill = ["rgb(40,40,40)"] + [basin_colors[i + 1] for i in range(n_basins)]
+            [{"type": "scatter", "colspan": 2}, None, {"type": "scatter"}, {"type": "scatter"}],
 
-    by_row = [e_min_colors, delta_e_colors, delta_g_colors, var_colors, cp_colors,
-              row_colors(matches, "Greens", alpha=0.35), [white] * n_basins]
+            [{"type": "table", "colspan": 4}, None, None, None]
+        ]
+        basin_positions = [
+            (1, 3), (1, 4),
+            (2, 3), (2, 4),
+        ]
+        basin_idx = 0
+        for r in range(total_rows):
+            for c in range(total_cols):
+                if specs[r][c] is not None:
+                    if (r + 1, c + 1) in basin_positions:
+                        basin_idx += 1
+                        subplot_titles.append(f"Basin {basin_idx}")
+                    else:
+                        subplot_titles.append("")  # no title for non-basin panels
 
-    label_col_colors = [white] * len(row_labels)
-    fill_colors = [label_col_colors] + [
-        [by_row[r][i] for r in range(len(row_labels))]
-        for i in range(n_basins)
+        fig = make_subplots(
+            rows=total_rows, cols=total_cols,
+            row_heights=[1 / 3, 1 / 3, 1 / 3],
+            column_widths=[0.3, 0.3, 0.4 / 2, 0.4 / 2],
+            specs=specs,
+            subplot_titles=subplot_titles,
+            horizontal_spacing=0.05,
+            vertical_spacing=0.1,
+        )
+
+    return basin_positions, fig
+
+
+def embedding(fig, marker_font_size, new_min_inds, num_polymorphs, p_maxima, point_size, polymorph_inds, sample_colors,
+              sample_embedding, sample_inds):
+    fig.add_scatter(x=sample_embedding[sample_inds, 0],
+                    y=sample_embedding[sample_inds, 1],
+                    marker_color=sample_colors,
+                    mode='markers',
+                    marker_size=point_size,
+                    marker_sizemode='area',
+                    opacity=1.0,
+                    showlegend=False, row=1, col=1)
+    fig.add_scatter(x=sample_embedding[p_maxima, 0], y=sample_embedding[p_maxima, 1],
+                    mode='markers+text', text=np.arange(len(p_maxima)) + 1,
+                    marker_color='rgb(150, 150, 150)', marker_line_color='black', marker_line_width=4,
+                    marker_size=28, opacity=0.8,
+                    textposition='middle center', textfont=dict(size=marker_font_size, color='black'),
+                    showlegend=False, row=1, col=1)
+    fig.add_scatter(x=sample_embedding[new_min_inds, 0], y=sample_embedding[new_min_inds, 1],
+                    mode='markers+text', text=np.arange(len(new_min_inds)) + 1,
+                    marker_color='white', marker_line_color='black', marker_line_width=4,
+                    marker_size=28, opacity=0.8,
+                    textposition='middle center', textfont=dict(size=marker_font_size, color='black'),
+                    showlegend=False, row=1, col=1)
+    # fig.add_scatter(x=sample_embedding[polymorph_inds, 0], y=sample_embedding[polymorph_inds, 1],
+    #                 mode='markers+text', text=['I', 'II'] if num_polymorphs else ['I'],
+    #                 marker_color='black', marker_line_color='black', marker_line_width=4,
+    #                 textfont_color='white',
+    #                 marker_size=28, opacity=0.8,
+    #                 textposition='middle center', textfont=dict(size=marker_font_size),
+    #                 showlegend=False, row=1, col=1)
+    #
+    # # Polymorph markers: X at true location, label offset with arrow
+    # polymorph_labels = ['I', 'II'] if num_polymorphs else ['I']
+    fig.add_scatter(x=sample_embedding[polymorph_inds, 0], y=sample_embedding[polymorph_inds, 1],
+                    mode='markers',
+                    marker_symbol='x-thin',
+                    marker_color='black',
+                    marker_line_color='black',
+                    marker_line_width=4,
+                    marker_size=18,
+                    opacity=0.75,
+                    showlegend=False, row=1, col=1)
+    #
+    # # Compute a direction for the label offset that points away from the data centroid,
+    # # so labels reliably land in empty space rather than on top of other callouts.
+    # centroid = sample_embedding[sample_inds].mean(axis=0)
+    # x_range = np.ptp(sample_embedding[sample_inds, 0])
+    # y_range = np.ptp(sample_embedding[sample_inds, 1])
+    # offset_frac = 0.12  # fraction of the plot span
+    #
+    # for idx, label in zip(polymorph_inds, polymorph_labels):
+    #     px, py = sample_embedding[idx, 0], sample_embedding[idx, 1]
+    #     dx, dy = px - centroid[0], py - centroid[1]
+    #     norm = np.hypot(dx, dy) + 1e-12
+    #     lx = px + (dx / norm) * offset_frac * x_range
+    #     ly = py + (dy / norm) * offset_frac * y_range
+    #
+    #     fig.add_annotation(
+    #         x=px, y=py,  # arrow head at the X
+    #         ax=lx, ay=ly,  # label (tail) offset outward
+    #         xref='x1', yref='y1',
+    #         axref='x1', ayref='y1',
+    #         text=f'<b>{label}</b>',
+    #         showarrow=True,
+    #         arrowhead=2,
+    #         arrowsize=1,
+    #         arrowwidth=2,
+    #         arrowcolor='black',
+    #         font=dict(size=marker_font_size, color='black'),
+    #         bgcolor='rgba(255,255,255,0.85)',
+    #         bordercolor='black',
+    #         borderwidth=1,
+    #         borderpad=3,
+    #         row=1, col=1,
+    #     )
+    #
+
+def fig_grid(basin_min_batch, basin_positions, fig, indexed_cluster_labels, n_basins, p_maxima, packing_coeffs,
+             polymorph_basin_index, sample_energy, stats, uma_thermos):
+    for i, basin_ind in enumerate(np.arange(n_basins)):  # enumerate(sorted_minima_inds[:4]):
+        row, col = basin_positions[i]
+
+        bb = indexed_cluster_labels == basin_ind
+        fig.add_trace(go.Scatter(
+            x=packing_coeffs[bb],
+            y=sample_energy[bb],
+            mode='markers',
+            marker=dict(
+                size=5,
+                color=uma_thermos['density'][bb] / np.amax(uma_thermos['density']),
+                colorscale='Viridis',
+                cmin=0,
+                cmax=1,
+                opacity=0.6,
+                showscale=(i == 0),  # only once
+                colorbar_title="P(x)",
+            ),
+            showlegend=False
+        ), row=row, col=col)
+        fig.add_trace(go.Scatter(
+            x=[stats['sample_cp'][i]],
+            y=[sample_energy[p_maxima[i]]],
+            mode='markers',
+            marker_color='rgb(150, 150, 150)', marker_line_color='black', marker_line_width=4,
+            marker=dict(
+                size=14,
+                opacity=1.0,
+                showscale=False,  # (i == 0)  # only once
+            ),
+            showlegend=False
+        ), row=row, col=col)
+        fig.add_trace(go.Scatter(
+            x=[basin_min_batch.packing_coeff[i]],
+            y=[basin_min_batch.uma[i]],
+            mode='markers',
+            marker_color='white', marker_line_color='black', marker_line_width=4,
+            marker=dict(
+                size=14,
+                opacity=1.0,
+                showscale=False,  # (i == 0)  # only once
+            ),
+            showlegend=False
+        ), row=row, col=col)
+        if basin_ind in polymorph_basin_index:
+            poly_ind = torch.argwhere(polymorph_basin_index == basin_ind ).flatten()[0]
+            fig.add_trace(go.Scatter(
+                x=[stats['sample_cp'][n_basins + poly_ind]],
+                y=[stats['sample_energy'][n_basins + poly_ind]],
+                mode='markers+text', text='I' if poly_ind == 0 else 'II',
+                marker_color='black', marker_line_color='black', marker_line_width=4,
+                textfont_color='white',
+                marker=dict(
+                    size=20,
+                    opacity=1.0,
+                    showscale=False,  # (i == 0)  # only once
+                ),
+                textposition='middle center', textfont=dict(size=14),
+                showlegend=False
+            ), row=row, col=col)
+
+
+def new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats, n_basins):
+    "summary table"
+    e_min = stats['sample_energy']
+    p = stats['density'].numpy()
+    p2 = stats['elj_density']
+    # e_var = stats['local_en_var']
+    cp = stats['sample_cp']
+    row_labels = ["Min Energy (kJ/mol)",
+                  "Normed UMA P(x*)",
+                  "Normed LJ P(x*)",
+                  "c<sub>p</sub>(E<sub>min</sub>)",
+                  ]
+    raw_values = [e_min,
+                  p,
+                  p2,
+                  cp
+                  ]  # , e_var]
+    formatters = [
+        lambda v: f"{v:.1f}" if not np.isnan(v) else "",
+        lambda v: f"{v:.2f}" if not np.isnan(v) else "",
+        lambda v: f"{v:.2f}" if not np.isnan(v) else "",
+        lambda v: f"{v:.2f}" if not np.isnan(v) else "",
+
     ]
-
-    fig = go.Figure(data=[go.Table(
+    # Which rows should have the *minimum* bolded vs the *maximum*?
+    # For most quantities lower is "best"; for TΔS higher (less negative) is notable.
+    bold_min_rows = {0}  # E
+    bold_max_rows = {1}  # P
+    header_vals = [""] + [f"Basin {i + 1}" for i in range(n_basins)]
+    heads = ['I', 'II']
+    for ind in range(num_polymorphs):
+        header_vals.append(f"Polymorph {heads[ind]}")
+    cell_vals = [row_labels]
+    for i in range(n_basins + num_polymorphs):
+        col = []
+        for r, (vals, fmt) in enumerate(zip(raw_values, formatters)):
+            txt = fmt(vals[i])
+            is_min = not np.isnan(vals[i]) and vals[i] == np.nanmin(vals)
+            is_max = not np.isnan(vals[i]) and vals[i] == np.nanmax(vals)
+            if (r in bold_min_rows and is_min) or (r in bold_max_rows and is_max):
+                txt = f"<b>{txt}</b>"
+            col.append(txt)
+        cell_vals.append(col)
+    # Subtle alternating row shading
+    white = "rgb(255,255,255)"
+    light_grey = "rgb(245,245,245)"
+    row_bg = [white if r % 2 == 0 else light_grey for r in range(len(row_labels))]
+    header_fill = ["rgb(255, 255, 255)"] + [basin_colorscale[i + 1] for i in range(n_basins)]
+    for ind in range(num_polymorphs):
+        header_fill.append(polymorph_colorscale[ind])
+    fill_colors = [row_bg] + [row_bg for _ in range(n_basins)]
+    f2 = go.Figure(data=[go.Table(
         header=dict(
             values=header_vals,
             align="center",
-            font=dict(size=16, color="black"),
+            font=dict(size=22, color="black"),
             fill_color=header_fill,
-            height=30,
+            height=36,
         ),
         cells=dict(
             values=cell_vals,
             align="center",
-            font=dict(size=13),
+            font=dict(size=18),
             fill_color=fill_colors,
-            height=22,
+            height=36,
         ),
     )])
-
-    fig.update_layout(margin=dict(l=10, r=10, t=10, b=10))
-
-    return fig
+    table_trace = f2.data[0]
+    return table_trace
 
 
 def pes_cartoon():
@@ -1590,6 +1954,7 @@ def pes_cartoon():
         template="plotly_white",
         margin=dict(l=60, r=30, t=50, b=50))
     return fig
+
 
 def plot_dual_density_contour(
         x_a, y_a,
@@ -1691,3 +2056,106 @@ def plot_dual_density_contour(
         fig.show(renderer=renderer)
     if return_fig:
         return fig
+
+
+def stacked_kde_histograms(
+        scalars,
+        index,
+        label="Value",
+        group_name="Group",
+        colors=None,
+        shared_range=True,
+        height_per_group=150,
+        width=700,
+        side="positive",
+        pointpos=-0.5,
+        jitter=0.3,
+        marker_size=3,
+        bandwidth=None,
+):
+    """
+    Stacked violin plots (one per unique index value) using go.Violin with points.
+
+    Parameters
+    ----------
+    scalars : array-like, shape (n,)
+    index : array-like, shape (n,)
+    label : str
+    group_name : str
+    colors : list[str] or None
+    shared_range : bool
+    height_per_group : int
+    width : int
+    side : str
+        'positive', 'negative', or 'both'
+    pointpos : float
+        Position of points relative to violin (-1 to 1).
+    jitter : float
+    marker_size : int
+
+    Returns
+    -------
+    go.Figure
+    """
+    scalars = np.asarray(scalars, dtype=float)
+    index = np.asarray(index)
+    unique_groups = np.unique(index)
+    k = len(unique_groups)
+
+    if colors is None:
+        base_colors = [
+            "rgba(102,194,165,0.55)", "rgba(252,141,98,0.55)",
+            "rgba(141,160,203,0.55)", "rgba(231,138,195,0.55)",
+            "rgba(166,216,84,0.55)", "rgba(255,217,47,0.55)",
+            "rgba(229,196,148,0.55)", "rgba(179,179,179,0.55)",
+        ]
+        colors = [base_colors[i % len(base_colors)] for i in range(k)]
+
+    line_colors = [c.replace("0.55)", "1.0)") for c in colors]
+
+    fig = make_subplots(
+        rows=k, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.02,
+        subplot_titles=[f"{group_name} {g}" for g in unique_groups],
+    )
+
+    for i, g in enumerate(unique_groups):
+        mask = index == g
+        data_g = scalars[mask]
+
+        fig.add_trace(
+            go.Violin(
+                x=data_g,
+                name=f"{group_name} {g}",
+                side=side,
+                bandwidth=bandwidth,
+                orientation="h",
+                fillcolor=colors[i],
+                line=dict(color=line_colors[i], width=1.2),
+                points="all",
+                pointpos=pointpos,
+                jitter=jitter,
+                marker=dict(size=marker_size, color=line_colors[i], opacity=0.9),
+                meanline_visible=True,
+                showlegend=True,
+            ),
+            row=i + 1, col=1,
+        )
+
+        fig.update_yaxes(showticklabels=False, row=i + 1, col=1)
+
+    if shared_range:
+        global_min, global_max = scalars.min(), scalars.max()
+        pad = 0.05 * (global_max - global_min)
+        for i in range(k):
+            fig.update_xaxes(range=[global_min - pad, global_max + pad], row=i + 1, col=1)
+
+    fig.update_xaxes(title_text=label, row=k, col=1)
+    fig.update_layout(
+        height=height_per_group * k + 80,
+        width=width,
+        template="plotly_white",
+        margin=dict(l=60, r=30, t=40, b=50),
+    )
+    return fig

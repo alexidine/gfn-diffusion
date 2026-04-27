@@ -14,7 +14,7 @@
 #alpha: 2.0
 #
 ## Flags
-#reload_results: true
+#reload_results: false
 #show_figs: true
 #write_figs: false
 #save_results: true
@@ -34,52 +34,17 @@
 #molecule_path: D:\crystal_datasets\mipcas\MIPCAS_standardized.pt
 #exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized.pt
 #dataset_path: D:\crystal_datasets\mipcas\mipcas_uma_prior_dataset.pt
-#
-## Analysis configuration
-#run_name: mipcas_elj
-#device: cuda
-#energy_function: elj  # elj, uma
-#n_steps: 100
-#sg_ind: 2
-#zp: 1
-#kT: 2.5
-#units: 'kJ/mol'
-#
-## Sampling
-#num_samples: 10000
-#batch_size: 10
-#alpha: 2.0
-#
-## Flags
-#reload_results: true
-#show_figs: true
-#write_figs: false
-#save_results: true
-#overwrite_results: true
-#
-## Paths
-#data_root: D:\crystal_datasets
-#results_dir: D:\crystal_datasets\gfn_results
-#
-## Model paths
-#model_path: D:\crystal_datasets\mipcas\mipcas_2_mipcas_2_baseline_0_model_eval.pt
-#config_path: D:\crystal_datasets\mipcas\mipcas_2_mipcas_2_baseline_0_model_config.npy
-##model_path: D:\crystal_datasets\mipcas\mipcas_2_mipcas_2_baseline_0_model_eval.pt
-##config_path: D:\crystal_datasets\mipcas\mipcas_2_mipcas_2_baseline_0_model_config.npy
-#
-## Data paths
-#molecule_path: D:\crystal_datasets\mipcas\MIPCAS_standardized.pt
-#exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized.pt
-#dataset_path: D:\crystal_datasets\mipcas\mipcas_elj_prior_dataset.pt
-#
 
 
+
+
+#
 # Analysis configuration
-run_name: nehzor_uma
+run_name: mipcas_elj
 device: cuda
-energy_function: uma  # elj, uma
+energy_function: elj  # elj, uma
 n_steps: 100
-sg_ind: 14
+sg_ind: 2
 zp: 1
 kT: 2.5
 units: 'kJ/mol'
@@ -101,13 +66,18 @@ data_root: D:\crystal_datasets
 results_dir: D:\crystal_datasets\gfn_results
 
 # Model paths
-model_path: D:\crystal_datasets\nehzor\nehzor_1_nehzor_1_uma_0_model_eval.pt
-config_path: D:\crystal_datasets\nehzor\nehzor_1_nehzor_1_uma_0_model_config.npy
+model_path: D:\crystal_datasets\mipcas\mipcas_2_mipcas_2_baseline_0_model_eval.pt
+config_path: D:\crystal_datasets\mipcas\mipcas_2_mipcas_2_baseline_0_model_config.npy
+#model_path: D:\crystal_datasets\mipcas\mipcas_2_mipcas_2_baseline_0_model_eval.pt
+#config_path: D:\crystal_datasets\mipcas\mipcas_2_mipcas_2_baseline_0_model_config.npy
 
 # Data paths
-molecule_path: D:\crystal_datasets\nehzor\NEHZOR0_standardized.pt
-exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR0_standardized.pt
-dataset_path: D:\crystal_datasets\nehzor\nehzor_uma_prior_dataset.pt
+molecule_path: D:\crystal_datasets\mipcas\MIPCAS_standardized.pt
+exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized.pt
+dataset_path: D:\crystal_datasets\mipcas\mipcas_elj_prior_dataset.pt
+
+
+#
 #
 ## Analysis configuration
 #run_name: nehzor_elj
@@ -122,7 +92,6 @@ dataset_path: D:\crystal_datasets\nehzor\nehzor_uma_prior_dataset.pt
 ## Sampling
 #num_samples: 10000
 #batch_size: 10
-#alpha: 2.0
 #
 ## Flags
 #reload_results: true
@@ -136,11 +105,51 @@ dataset_path: D:\crystal_datasets\nehzor\nehzor_uma_prior_dataset.pt
 #results_dir: D:\crystal_datasets\gfn_results
 #
 ## Model paths
-# Model paths
-#model_path: D:\crystal_datasets\nehzor\nehzor_1_nehzor_1_elj_1_model_eval.pt
-#config_path: D:\crystal_datasets\nehzor\nehzor_1_nehzor_1_elj_1_model_config.npy
+#model_path: D:\crystal_datasets\nehzor\nehzor_2_nehzor_2_elj_1_model_eval.pt
+#config_path: D:\crystal_datasets\nehzor\nehzor_2_nehzor_2_elj_1_model_config.npy
 #
 ## Data paths
-#molecule_path: D:\crystal_datasets\nehzor\NEHZOR0_standardized.pt
-#exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR0_standardized.pt
+#molecule_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+#exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
 #dataset_path: D:\crystal_datasets\nehzor\nehzor_elj_prior_dataset.pt
+###
+##
+
+
+#
+#
+###
+### Analysis configuration
+#run_name: nehzor_uma
+#device: cuda
+#energy_function: uma  # uma, uma
+#n_steps: 100
+#sg_ind: 14
+#zp: 1
+#kT: 2.5
+#units: 'kJ/mol'
+#
+## Sampling
+#num_samples: 10000
+#batch_size: 10
+#
+## Flags
+#reload_results: false
+#show_figs: true
+#write_figs: false
+#save_results: true
+#overwrite_results: true
+#
+## Paths
+#data_root: D:\crystal_datasets
+#results_dir: D:\crystal_datasets\gfn_results
+#
+## Model paths
+#model_path: D:\crystal_datasets\nehzor\nehzor_2_nehzor_2_uma_0_model_eval.pt
+#config_path: D:\crystal_datasets\nehzor\nehzor_2_nehzor_2_uma_0_model_config.npy
+#
+## Data paths
+#molecule_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+#exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
+#dataset_path: D:\crystal_datasets\nehzor\nehzor_uma_prior_dataset.pt
+##

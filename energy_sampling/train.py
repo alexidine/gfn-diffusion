@@ -90,6 +90,8 @@ class Modeller:
         self.last_fwd_it = 0
         self.last_bwd_it = 0
         self.step_ind = 0
+        self.std_boost_prob = 0
+        self.std_boost_var = 0
         self.run_name = str(self.args.tag) + '_' + str(self.args.run_name)
 
     def train_logic(self, buffer, it):
@@ -425,7 +427,8 @@ class Modeller:
         schedulers = {}
         if self.args.scheduler:
             lr_warmup_lambda = get_annealing_factor(1, self.args.lr_warmup_ratio, self.args.lr_warmup_time, 10)
-            lr_annealing_lambda = get_annealing_factor(self.args.lr_policy, self.args.min_lr, self.args.lr_anneal_time,10)
+            lr_annealing_lambda = get_annealing_factor(self.args.lr_policy, self.args.min_lr, self.args.lr_anneal_time,
+                                                       10)
             schedulers['policy_1'] = lr_scheduler.MultiplicativeLR(
                 optimizers['fwd'], lr_lambda=lambda epoch: lr_warmup_lambda)
             schedulers['policy_2'] = lr_scheduler.MultiplicativeLR(
@@ -437,7 +440,8 @@ class Modeller:
                 optimizers['bwd'], lr_lambda=lambda epoch: lr_annealing_lambda)
 
             flow_annealing_lambda = get_annealing_factor(1, 0.1, self.args.lr_anneal_time, 10)
-            schedulers['flow'] = lr_scheduler.MultiplicativeLR(optimizers['flow'], lr_lambda=lambda epoch: flow_annealing_lambda)
+            schedulers['flow'] = lr_scheduler.MultiplicativeLR(optimizers['flow'],
+                                                               lr_lambda=lambda epoch: flow_annealing_lambda)
 
         return optimizers, schedulers
 
@@ -672,7 +676,8 @@ class Modeller:
                                                       self.args.exploratory,
                                                       self.args.wd_max_steps,
                                                       self.args.exploration_factor,
-                                                      self.args.exploration_wd)
+                                                      self.args.exploration_wd,
+                                                      )
                 # print("3")
                 self.times['train_step_start'] = time()
                 try:
@@ -759,7 +764,8 @@ class Modeller:
 
     def reload_running_model(self, ema_model, gfn_model):
         try:
-            gfn_model.load_state_dict(torch.load(f'checkpoints/{self.run_name}_model_eval.pt'))  # eval model is a more stable basline to retry from
+            gfn_model.load_state_dict(torch.load(
+                f'checkpoints/{self.run_name}_model_eval.pt'))  # eval model is a more stable basline to retry from
             ema_model.load_state_dict(torch.load(f'checkpoints/{self.run_name}_model_eval.pt'))
             gfn_model.train()
             ema_model.eval()
@@ -789,7 +795,8 @@ class Modeller:
             diffs = torch.diff(losses, dim=0)
 
             hit_threshold = current_loss > threshold  # loss exploding
-            increasing_loss = (torch.mean((diffs[-grace_time:] > 0).float()) > 0.8) and self.increasing_loss_cooldown <= 0  # loss slowly increasing
+            increasing_loss = (torch.mean((diffs[
+                                               -grace_time:] > 0).float()) > 0.8) and self.increasing_loss_cooldown <= 0  # loss slowly increasing
 
             if hit_threshold or increasing_loss:
                 print("Losses increasing! Reloading best checkpoint and slashing LR.")
@@ -862,6 +869,13 @@ class Modeller:
 
         optimizers['flow'].zero_grad(set_to_none=True)
         if do_forward:
+            if np.random.rand() < self.std_boost_prob:
+                std_boost = self.std_boost_var
+                exploration_std = lambda x: std_boost
+                skip_flow_grad = False if std_boost == 0 else True
+            else:
+                skip_flow_grad = False
+
             optimizers['fwd'].zero_grad(set_to_none=True)
             mol_batch = next(mol_iterator)
             # if self.args.molecule_conditioning:
@@ -878,7 +892,8 @@ class Modeller:
                 mol_batch,
                 return_exp=True,
                 repeats=repeats,
-                report_losses=True
+                report_losses=True,
+                detach_z = skip_flow_grad,
             )
             # p_add = max(0.1, min(1.0, (1 / 10) / self.args.fwd_to_bwd_ratio))
             # if self.grow_buffer and np.random.rand() < p_add:
@@ -1086,7 +1101,8 @@ class Modeller:
     def fwd_train_step(self, energy_function, gfn_model, discretizer,
                        exploration_std, mol_batch, return_exp=False,
                        repeats: int = 10,
-                       report_losses: bool = False):
+                       report_losses: bool = False,
+                       detach_z: bool = False):
         init_state = get_gfn_init_state(self.batch_size, energy_function.data_ndim, self.device)
         log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(mol_batch,
                                                                                    z_primes=mol_batch.z_prime)
@@ -1102,7 +1118,8 @@ class Modeller:
                                     return_exp=return_exp,
                                     condition=condition,
                                     repeats=repeats,
-                                    report_losses=report_losses)
+                                    report_losses=report_losses,
+                                    detach_z=detach_z)
 
     def bwd_train_step(self, gfn_model, discretizer,
                        buffer, repeats: int = 10,
@@ -1590,6 +1607,8 @@ class Modeller:
         "set cooldown"
         self.increasing_loss_cooldown = self.args.phase_change_time
         self.grow_buffer = True
+        self.std_boost_prob = self.args.p3_widevar_prob
+        self.std_boost_var = self.args.p3_widevar_var
 
     def save_modeller_state(self):
         state = dict(

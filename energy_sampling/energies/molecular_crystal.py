@@ -60,6 +60,7 @@ class MolecularCrystal(BaseSet):
                  uma_path: Optional[str] = None,
                  reward_range: float = None,
                  lj_rescale: float = None,
+                 pressure: float = 1,  # in atm
                  ):
 
         super(MolecularCrystal, self).__init__()
@@ -84,6 +85,7 @@ class MolecularCrystal(BaseSet):
         self.zp_conditioning = zp_conditioning
         self.reward_range = reward_range
         self.lj_rescale = lj_rescale
+        self.pressure = pressure
         if self.energy_function == 'uma':
             self.uma_path = uma_path
             self.uma_predictor = init_uma_crystal_predictor(uma_path, device=self.device)
@@ -188,10 +190,15 @@ class MolecularCrystal(BaseSet):
 
             reduction_energy = F.relu(crystal_batch.reduction_en)  # punish positive energies
 
+            atm_conv = 101325 # conversion from atmospheres to Pa
+            PV_en_conv = 6.022 * 10**-10# conversion to energy in Pa*A^3 to kJ/mol
+            pressure_energy = self.pressure * PV_en_conv * atm_conv * crystal_batch.cell_volume / crystal_batch.sym_mult / crystal_batch.z_prime
+
             ens_dict['reduction_energy'] = reduction_energy
             ens_dict['mol_energy'] = mol_energy
             ens_dict['density_energy'] = density_energy
             ens_dict['bounding_energy'] = bounding_energy
+            ens_dict['pressure_energy'] = pressure_energy
         else:
             reduction_energy = torch.zeros_like(bounding_energy)
 
@@ -208,7 +215,7 @@ class MolecularCrystal(BaseSet):
             crystal_energy = self.crystal_multiharmonic_en(crystal_batch, latents)
 
         elif self.energy_function in ['lj', 'qlj', 'elj', 'silu', 'uma']:
-            crystal_energy = self.lj_coeff * mol_energy + self.density_coeff * density_energy
+            crystal_energy = self.lj_coeff * mol_energy + self.density_coeff * density_energy + pressure_energy
 
         else:
             assert False, f'{self.energy_function} not implemented'
@@ -235,13 +242,13 @@ class MolecularCrystal(BaseSet):
         latent_rotvecs = crystal_batch.latent_params()[:, -3 * crystal_batch.max_z_prime:]
         sph_rotvec = lat2sph_rotvec(latent_rotvecs, crystal_batch.max_z_prime)
         sph = sph_rotvec.view(crystal_batch.num_graphs, crystal_batch.max_z_prime, 3)
-        phi = sph[..., 0]  # polar angle
+        theta = sph[..., 0]  # polar angle
         r = sph[..., 2]  # rotation magnitude
         eps = 1e-8
         rot_jacob_weight = (
         # this comes from composing the transforms of spherical -> cartesian ball and then to uniform rotation
                 torch.sin(r / 2).clamp_min(eps) ** 2
-                * torch.sin(phi).clamp_min(eps)
+                * torch.sin(theta).clamp_min(eps)
         )
         frac_jacob_weight = - crystal_batch.z_prime * temperature * torch.log(
             # this comes from the cartesian -> fractional transform, with a factor for each independent object transformed
