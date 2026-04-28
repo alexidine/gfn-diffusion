@@ -44,14 +44,15 @@ if __name__ == "__main__":
             if energy_function == 'elj':
                 vrange = [0]
             else:
-                vrange = [0, 0.69, 0.76, 0.82]
+                vrange = [0] #, 0.69, 0.76, 0.82]
             for var_boost in vrange:
-                config['p3_widevar_prob'] = 0.25
+                if var_boost > 0:
+                    config['p3_widevar_prob'] = 0.25
                 config['p3_widevar_var'] = var_boost
 
                 run_name = f"{base['run_name']}_{energy_function}_{var_boost:.2f}_{ind}"
                 config['run_name'] = run_name
-                config['tag'] = 'PV'
+                config['tag'] = 'PV_set3'
                 config_path = f"{ind}.yaml"#{molname}_{energy_function}_{ind}.yaml"
 
                 with open(config_path, 'w') as f:
