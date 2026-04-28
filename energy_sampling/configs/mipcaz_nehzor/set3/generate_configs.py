@@ -49,6 +49,10 @@ if __name__ == "__main__":
                 if var_boost > 0:
                     config['p3_widevar_prob'] = 0.25
                 config['p3_widevar_var'] = var_boost
+                bp = config['buffer_path']
+                bp = bp.replace('elj', energy_function)
+                bp = bp.replace('uma', energy_function)
+                config['buffer_path'] = bp
 
                 run_name = f"{base['run_name']}_{energy_function}_{var_boost:.2f}_{ind}"
                 config['run_name'] = run_name
