@@ -103,6 +103,7 @@ molecules_path: /scratch/mk8347/data/crystal_datasets/mipcas/MIPCAS_standardized
 noised_buffer_length: 20000
 noised_max_steps: 10
 norm: layer
+p3_widevar_prob: 0.0
 p3_widevar_var: 0
 pb_drift_range: 0.2
 pb_var_range: 6
