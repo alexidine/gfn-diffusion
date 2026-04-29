@@ -672,12 +672,18 @@ class Modeller:
                 if step_ind % 10 == 0:
                     self.set_loss_coeffs(step_ind)
                 # print("2")
-                exploration_std = get_exploration_std(step_ind,
-                                                      self.args.exploratory,
-                                                      self.args.wd_max_steps,
-                                                      self.args.exploration_factor,
-                                                      self.args.exploration_wd,
-                                                      )
+                # exploration_std = get_exploration_std(step_ind,
+                #                                       self.args.exploratory,
+                #                                       self.args.wd_max_steps,
+                #                                       self.args.exploration_factor,
+                #                                       self.args.exploration_wd,
+                #                                       )
+                mask = torch.rand(self.batch_size, device=self.device) < self.std_boost_prob
+                exploration_std = torch.where(
+                    mask,
+                    torch.rand(self.batch_size, device=self.device) * np.log(self.std_boost_var),
+                    torch.zeros(self.batch_size, device=self.device),
+                )
                 # print("3")
                 self.times['train_step_start'] = time()
                 try:
@@ -743,7 +749,7 @@ class Modeller:
                 # train monitoring
                 if step_ind % 10 == 0:
                     loss_record.append(fwd_loss + bwd_loss)
-                    metrics['train/expl'] = exploration_std(0) if exploration_std is not None else 0
+                    metrics['train/expl'] = exploration_std.mean() if exploration_std is not None else 0
                     lr = self.step_lr_schedule(schedulers, optimizers)
                     self.anneal_reward(step_ind, temp_annealing_lambda, energy_function)
                     self.ten_step_reporting(bwd_loss, bwd_loss_dict, fwd_loss, fwd_loss_dict, metrics, optimizers)
@@ -869,19 +875,8 @@ class Modeller:
 
         optimizers['flow'].zero_grad(set_to_none=True)
         if do_forward:
-            if np.random.rand() < self.std_boost_prob:
-                std_boost = self.std_boost_var
-                exploration_std = lambda x: std_boost
-                skip_flow_grad = False if std_boost == 0 else True
-            else:
-                skip_flow_grad = False
-
             optimizers['fwd'].zero_grad(set_to_none=True)
             mol_batch = next(mol_iterator)
-            # if self.args.molecule_conditioning:
-            #     # if doing molecule conditioning, augment over mol orientations, adjusting properly the embedding
-            #     self.scramble_mol_and_embedding(mol_batch)
-            # else:
             mol_batch.orient_molecule(mode='std')
 
             loss, crystal_batch, loss_dict, rewards, log_importance_weight = self.fwd_train_step(
@@ -892,8 +887,7 @@ class Modeller:
                 mol_batch,
                 return_exp=True,
                 repeats=repeats,
-                report_losses=True,
-                detach_z = skip_flow_grad,
+                report_losses=True
             )
             # p_add = max(0.1, min(1.0, (1 / 10) / self.args.fwd_to_bwd_ratio))
             # if self.grow_buffer and np.random.rand() < p_add:
@@ -1102,7 +1096,7 @@ class Modeller:
                        exploration_std, mol_batch, return_exp=False,
                        repeats: int = 10,
                        report_losses: bool = False,
-                       detach_z: bool = False):
+                       ):
         init_state = get_gfn_init_state(self.batch_size, energy_function.data_ndim, self.device)
         log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(mol_batch,
                                                                                    z_primes=mol_batch.z_prime)
@@ -1119,7 +1113,7 @@ class Modeller:
                                     condition=condition,
                                     repeats=repeats,
                                     report_losses=report_losses,
-                                    detach_z=detach_z)
+                                    )
 
     def bwd_train_step(self, gfn_model, discretizer,
                        buffer, repeats: int = 10,

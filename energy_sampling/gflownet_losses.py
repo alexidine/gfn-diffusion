@@ -1,5 +1,5 @@
 import math
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
 import torch
@@ -78,7 +78,7 @@ def get_gfn_forward_loss(loss_coeffs,
                          exploration_std=None, return_exp=False, condition=None,
                          repeats=10,
                          report_losses: bool = False,
-                         detach_z: bool = False
+
                          ):
     if gfn.conditional_flow_model and any([
         loss_coeffs.var > 0, loss_coeffs.vg_lb > 0,
@@ -162,7 +162,8 @@ def get_gfn_forward_loss(loss_coeffs,
 
     """TB loss"""
     if loss_coeffs.tb > 0:
-        tb_loss = get_tb_loss(log_flow, log_pb, log_pf, log_r, detach_z=detach_z)
+        tb_loss = get_tb_loss(log_flow, log_pb, log_pf, log_r,
+                              detach_z = exploration_std>0 if exploration_std is not None else False)
         losses.append(tb_loss * loss_coeffs.tb)
 
     """MLE/TPM loss"""
@@ -409,13 +410,21 @@ def power_saturate(x, power):
     return torch.sign(x) * (torch.abs(x) ** power)
 
 
-def get_tb_loss(log_flow, log_pb, log_pf, log_r, detach_z=False, z_only=False):
-    if detach_z:
-        tb = (log_pf + log_flow.detach() - log_pb - log_r.detach())
-    elif z_only:
-        tb = (log_pf.detach() + log_flow - log_pb.detach() - log_r.detach())
+def get_tb_loss(log_flow, log_pb, log_pf, log_r, detach_z: Union[bool, torch.Tensor]=False, z_only=False):
+    log_reward = log_r.detach()
+    if z_only:
+        tb = (log_pf.detach() + log_flow - log_pb.detach() - log_reward)
+    elif isinstance(detach_z, bool):
+        if detach_z:
+            tb = (log_pf + log_flow.detach() - log_pb - log_reward)
+        else:
+            tb = (log_pf + log_flow - log_pb - log_reward)
+    elif torch.is_tensor(detach_z):
+        log_Z_per_traj = torch.where(detach_z, log_flow.detach(), log_flow)
+        # TB residual uses per-trajectory log_Z
+        tb = (log_pf + log_Z_per_traj - log_pb - log_reward)
     else:
-        tb = (log_pf + log_flow - log_pb - log_r.detach())
+        tb = (log_pf + log_flow - log_pb - log_reward)
 
     # tb_loss = F.mse_loss(tb, torch.zeros_like(tb), reduction='none')
     tb_loss = F.smooth_l1_loss(tb, torch.zeros_like(tb), reduction='none', beta=10)

@@ -158,8 +158,8 @@ class GFN(nn.Module):
             # compute forward logprobs
             fwd_drift = dts.unsqueeze(1) * pf_mean
             fwd_var = dts.unsqueeze(1) * pflogvars.exp()
-            logpf.append(self.gauss_logprob(next_state - current_state, fwd_drift,
-                                            fwd_var))  # -0.5 * (noise ** 2 + logtwopi + dts.log().unsqueeze(1) + pflogvars).sum(1))
+            logpf.append(self.gauss_logprob(next_state - current_state, fwd_drift, fwd_var))
+            # -0.5 * (noise ** 2 + logtwopi + dts.log().unsqueeze(1) + pflogvars).sum(1))
 
             # compute backward logprobs
             expanded_next_state = self.expand_state_for_policy(next_state)
@@ -323,16 +323,13 @@ class GFN(nn.Module):
         return next_state
 
     def fwd_get_logvars(self, detach_traj, dts, exploration_std, i, pflogvars):
+        # log_coeff: (batch_size,) per-trajectory log-multiplier on policy std
+        #   log_coeff = 0 → no change (multiplier 1)
+        #   log_coeff > 0 → widen by exp(log_coeff)
         if exploration_std is not None:
-            expl = exploration_std(None)
-            if expl > 0:
-                add_log_var = torch.full_like(pflogvars, np.log(exploration_std(i)) * 2) / dts.sqrt().unsqueeze(1)
-                pflogvars_sample = torch.logaddexp(pflogvars, add_log_var)
-            else:
-                pflogvars_sample = pflogvars
+            pflogvars_sample = pflogvars + 2 * exploration_std.unsqueeze(-1)
         else:
             pflogvars_sample = pflogvars
-
         if detach_traj:
             return pflogvars_sample.detach()
         else:

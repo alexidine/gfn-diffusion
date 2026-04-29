@@ -35,30 +35,21 @@ EXPERIMENT_TEMPLATE = {
 
 if __name__ == "__main__":
     ind = 0
-    for base_path, molname in zip(['mipcas.yaml','nehzor.yaml'], ['MIPCAS','NEHZOR']):
+    for base_path, molname in zip(['mipcas.yaml'], ['MIPCAS']):
         base, spec_dir = load_yaml(base_path)
-        for energy_function in ['elj','uma']:
+        for energy_function in ['elj']:
             config = deepcopy(base)
             config['energy_function'] = energy_function
 
-            if energy_function == 'elj':
-                vrange = [0]
-            else:
-                vrange = [0] #, 0.69, 0.76, 0.82]
+
+            vrange = [0.25, 0.5, 0.75, 1.0]
             for var_boost in vrange:
-                if var_boost > 0:
-                    config['p3_widevar_prob'] = 0.25
-                else:
-                    config['p3_widevar_prob'] = 0.0
+                config['p3_widevar_prob'] = 0.5
                 config['p3_widevar_var'] = var_boost
-                bp = config['buffer_path']
-                bp = bp.replace('elj', energy_function)
-                bp = bp.replace('uma', energy_function)
-                config['buffer_path'] = bp
 
                 run_name = f"{base['run_name']}_{energy_function}_{var_boost:.2f}_{ind}"
                 config['run_name'] = run_name
-                config['tag'] = 'PV_set3'
+                config['tag'] = '4'
                 config_path = f"{ind}.yaml"#{molname}_{energy_function}_{ind}.yaml"
 
                 with open(config_path, 'w') as f:
