@@ -50,6 +50,7 @@ if __name__ == "__main__":
                     config['p3_widevar_prob'] = 0.25
                 else:
                     config['p3_widevar_prob'] = 0.0
+                config['continue_from_checkpoint'] = True
                 config['p3_widevar_var'] = var_boost
                 bp = config['buffer_path']
                 bp = bp.replace('elj', energy_function)
