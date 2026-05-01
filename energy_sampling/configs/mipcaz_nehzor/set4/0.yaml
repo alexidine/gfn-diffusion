@@ -28,7 +28,7 @@ checkpoint_path: null
 clipping: true
 condition_emb_dim: 1024
 conditional_eval_period: 1000
-continue_from_checkpoint: false
+continue_from_checkpoint: true
 continue_from_hit_prior: false
 device: cuda
 discretizer: uniform

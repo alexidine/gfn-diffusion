@@ -46,6 +46,7 @@ if __name__ == "__main__":
             for var_boost in vrange:
                 config['p3_widevar_prob'] = 0.5
                 config['p3_widevar_var'] = var_boost
+                config['continue_from_checkpoint'] = True
 
                 run_name = f"{base['run_name']}_{energy_function}_{var_boost:.2f}_{ind}"
                 config['run_name'] = run_name
