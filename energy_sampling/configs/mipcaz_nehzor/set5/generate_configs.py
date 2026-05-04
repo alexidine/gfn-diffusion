@@ -40,16 +40,21 @@ if __name__ == "__main__":
         r'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\configs\mipcas\set2\10.yaml',
         r'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\configs\nehzor\set2\1.yaml',
         r'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\configs\nehzor\set2\0.yaml'
-
     ]
-    for base_path in config_paths:
+    model_prepends = [
+        'mipcas_2_',
+        'mipcas_2_',
+        'nehzor_2_',
+        'nehzor_2_',
+    ]
+    for base_path, tag in zip(config_paths, model_prepends):
         base, spec_dir = load_yaml(base_path)
         config = deepcopy(base)
 
         if 'nehzor' in base_path:
             mol = 'nehzor'
         else:
-            mol = 'mipcase'
+            mol = 'mipcas'
 
 
         config['p3_widevar_prob'] = 0
@@ -58,7 +63,7 @@ if __name__ == "__main__":
 
         #run_name = f"{base['run_name']}_{mol}_{config['energy_function']}_{ind}"
         #config['run_name'] = run_name
-        config['tag'] = '5'
+        config['tag'] = tag
         config_path = f"{ind}.yaml"#{molname}_{energy_function}_{ind}.yaml"
 
         with open(config_path, 'w') as f:
