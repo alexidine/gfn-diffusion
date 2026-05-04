@@ -114,7 +114,7 @@ rank_weight: 1.0
 reduction_coeff: 10.0
 repeats: 2
 reward_range: 100
-run_name: mipcas_2_baseline_0_mipcase_elj_0
+run_name: mipcas_2_baseline_0
 s_emb_dim: 1024
 sampling: buffer
 scheduler: true

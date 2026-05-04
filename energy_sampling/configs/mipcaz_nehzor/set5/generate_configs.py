@@ -56,8 +56,8 @@ if __name__ == "__main__":
         config['p3_widevar_var'] = 0
         config['continue_from_checkpoint'] = True
 
-        run_name = f"{base['run_name']}_{mol}_{config['energy_function']}_{ind}"
-        config['run_name'] = run_name
+        #run_name = f"{base['run_name']}_{mol}_{config['energy_function']}_{ind}"
+        #config['run_name'] = run_name
         config['tag'] = '5'
         config_path = f"{ind}.yaml"#{molname}_{energy_function}_{ind}.yaml"
 
