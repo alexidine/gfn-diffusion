@@ -42,10 +42,10 @@ if __name__ == "__main__":
         r'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\configs\nehzor\set2\0.yaml'
     ]
     model_prepends = [
-        'mipcas_2_',
-        'mipcas_2_',
-        'nehzor_2_',
-        'nehzor_2_',
+        'mipcas_2',
+        'mipcas_2',
+        'nehzor_2',
+        'nehzor_2',
     ]
     for base_path, tag in zip(config_paths, model_prepends):
         base, spec_dir = load_yaml(base_path)
