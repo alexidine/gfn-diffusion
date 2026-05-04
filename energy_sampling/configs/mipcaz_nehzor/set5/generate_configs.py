@@ -58,7 +58,7 @@ if __name__ == "__main__":
 
         run_name = f"{base['run_name']}_{mol}_{config['energy_function']}_{ind}"
         config['run_name'] = run_name
-        config['tag'] = 5
+        config['tag'] = '5'
         config_path = f"{ind}.yaml"#{molname}_{energy_function}_{ind}.yaml"
 
         with open(config_path, 'w') as f:
