@@ -93,21 +93,21 @@ def collate_generate_prior():
 if __name__ == '__main__':
     torch.set_grad_enabled(False)
     # # mipcas
-    # search_output_dir = r"D:\crystal_datasets\mipcas"
-    # run_name = 'mipcas_uma'
-    # identifier = 'MIPCAS'
-    # energy_function = 'uma'
-    # target_path = r"D:\crystal_datasets\mipcas\MIPCAS_standardized.pt"
-    # uma_model_path = r"D:\crystal_datasets\esen_s.pt"
-    # device = 'cuda'
-    # nehzor
-    search_output_dir = r"D:\crystal_datasets\nehzor\p6"
-    run_name = 'nehzor_4_elj'
-    identifier = 'NEHZOR'
+    search_output_dir = r"D:\crystal_datasets\mipcas"
+    run_name = 'mipcas_elj'
+    identifier = 'MIPCAS'
     energy_function = 'elj'
-    target_path = r"D:\crystal_datasets\nehzor\NEHZOR01_standardized.pt"
+    target_path = r"D:\crystal_datasets\mipcas\MIPCAS_standardized.pt"
     uma_model_path = r"D:\crystal_datasets\esen_s.pt"
     device = 'cuda'
+    # nehzor
+    # search_output_dir = r"D:\crystal_datasets\nehzor\p6"
+    # run_name = 'nehzor_4_uma'
+    # identifier = 'NEHZOR'
+    # energy_function = 'uma'
+    # target_path = r"D:\crystal_datasets\nehzor\NEHZOR01_standardized.pt"
+    # uma_model_path = r"D:\crystal_datasets\esen_s.pt"
+    # device = 'cuda'
 
     kT = 2.5
     tot_noised_samples = 200000
