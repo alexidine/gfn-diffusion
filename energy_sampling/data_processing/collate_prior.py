@@ -21,7 +21,11 @@ def collate_generate_prior():
     "load samples"
     opt_samples = []
     for tpath in tqdm(traj_records):
-        opt_samples.extend(torch.load(tpath, weights_only=False))
+        try:
+            opt_samples.extend(torch.load(tpath, weights_only=False))
+        except:
+            print(tpath, "bad file")
+            pass
     # huge waste of space here for some reason
     for sample in opt_samples:
         if hasattr(sample, 'rdf'):
@@ -67,7 +71,7 @@ def collate_generate_prior():
     "run calibration"
     coarse_batch = collate_data_list([good_samples[ind] for ind in anchors])
     coarse_batch.latent_to_cell_params(coarse_batch.latent_params())
-    if energy_function == 'uma':
+    if energy_function in ['uma', 'mace']:
         en_scaling_factor = 1
     else:
         en_scaling_factor = calibrate_energy_function_vs_uma(search_output_dir,
