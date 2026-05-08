@@ -10,6 +10,7 @@ from energy_sampling.utils import new_calibrate_prior_noise
 from mxtaltools.common.adaptive_batching import adaptive_batched_analysis
 from mxtaltools.common.clustering import greedy_bottom_up_anchors
 from mxtaltools.dataset_utils.utils import collate_data_list
+from mxtaltools.mlip_interfaces.AL_mace_utils import load_mace_model
 from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 
 torch.cuda.set_per_process_memory_fraction(0.9, device=0)
@@ -93,14 +94,14 @@ def collate_generate_prior():
 if __name__ == '__main__':
     torch.set_grad_enabled(False)
     # # mipcas
-    search_output_dir = r"D:\crystal_datasets\mipcas"
-    run_name = 'mipcas_elj'
-    identifier = 'MIPCAS'
-    energy_function = 'elj'
-    target_path = r"D:\crystal_datasets\mipcas\MIPCAS_standardized.pt"
-    uma_model_path = r"D:\crystal_datasets\esen_s.pt"
-    device = 'cuda'
-    # nehzor
+    # search_output_dir = r"D:\crystal_datasets\mipcas"
+    # run_name = 'mipcas_elj'
+    # identifier = 'MIPCAS'
+    # energy_function = 'elj'
+    # target_path = r"D:\crystal_datasets\mipcas\MIPCAS_standardized.pt"
+    # uma_model_path = r"D:\crystal_datasets\esen_s.pt"
+    # device = 'cuda'
+    # # nehzor
     # search_output_dir = r"D:\crystal_datasets\nehzor\p6"
     # run_name = 'nehzor_4_uma'
     # identifier = 'NEHZOR'
@@ -108,11 +109,22 @@ if __name__ == '__main__':
     # target_path = r"D:\crystal_datasets\nehzor\NEHZOR01_standardized.pt"
     # uma_model_path = r"D:\crystal_datasets\esen_s.pt"
     # device = 'cuda'
+    # acridine
+    search_output_dir = r"D:\crystal_datasets\acridine"
+    run_name = 'may_acridine_sg14_zp1'
+    identifier = 'ACRDIN01'
+    energy_function = 'mace'
+    target_path = r"D:\crystal_datasets\acridine\prot_acrdin_crystals.pt"
+    uma_model_path = r"D:\crystal_datasets\esen_s.pt"
+    mace_model_path = r"C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model"
+    device = 'cuda'
 
     kT = 2.5
     tot_noised_samples = 200000
-
-    predictor = init_uma_crystal_predictor(uma_model_path, device)
+    if energy_function == 'uma':
+        predictor = init_uma_crystal_predictor(uma_model_path, device)
+    elif energy_function == 'mace':
+        predictor = load_mace_model(mace_model_path, device, torch.float32)
 
     "get files"
     os.chdir(search_output_dir)
@@ -126,6 +138,8 @@ if __name__ == '__main__':
     # ]
 
     target_mol = torch.load(target_path, weights_only=False)
+    if isinstance(target_mol, list):
+        target_mol = [elem for elem in target_mol if elem.identifier == identifier][0]
     target_mol.aunit_handedness = target_mol.aunit_handedness.abs()
     zp = target_mol.z_prime
     sg = target_mol.sg_ind
