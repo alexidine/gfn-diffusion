@@ -23,6 +23,7 @@ from mxtaltools.common.geometry_utils import batch_molecule_principal_axes_torch
 from mxtaltools.common.geometry_utils import compute_latent_distance
 from mxtaltools.dataset_utils.data_classes import MolCrystalData
 from mxtaltools.dataset_utils.utils import collate_data_list
+from mxtaltools.mlip_interfaces.AL_mace_utils import load_mace_model
 from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 from mxtaltools.models.utils import load_encoder
 
@@ -259,16 +260,18 @@ def triangle_schedule(it, init, maxval, minval, on, off):
 
 @torch.no_grad()
 def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 500,
-                      uma_path: Optional[str] = None, ):
+                      mlip_path: Optional[str] = None, ):
     cutoff = 10
     computes = ['lj', 'reduction_en']
     if energy_function != 'lj':
         computes.append(energy_function)
 
     if energy_function == 'uma':
-        uma_predictor = init_uma_crystal_predictor(uma_path, device=device)
+        predictor = init_uma_crystal_predictor(mlip_path, device=device)
+    elif energy_function == 'mace':
+        predictor = load_mace_model(mlip_path, device=device, dtype=torch.float32)
     else:
-        uma_predictor = None
+        predictor = None
 
     cursor = 0
     pbar = tqdm(total=len(dataset), unit="reparameterized samples")
@@ -288,7 +291,7 @@ def featurize_dataset(dataset, device, energy_function: str, batch_size: int = 5
                                   supercell_size=10,
                                   std_orientation=True,
                                   assign_outputs=True,
-                                  predictor=uma_predictor
+                                  predictor=predictor
                                   )
             feat_dataset.extend(crystal_batch.cpu().detach().batch_to_list())
             cursor += batch_size
@@ -1022,3 +1025,12 @@ def thin_large_dmat_block(latents, energy, d_cut, target_entries=5_000_000):
     final_keep = torch.zeros(N, dtype=torch.bool, device=latents.device)
     final_keep[sort_inds] = keep_mask
     return final_keep
+
+
+def atomic_save(state_dict, path):
+    try:
+        tmp_path = path + ".tmp"
+        torch.save(state_dict, tmp_path)
+        os.replace(tmp_path, path)
+    except Exception as e:
+        print("Save failed to", path)

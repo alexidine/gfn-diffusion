@@ -382,7 +382,7 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path):
         return dd
 
     for key, fig in fig_dict.items():
-        # fig.show()
+        #fig.show()
         style = copy(pub_style)
         style.update(custom_style(key))
         scale = style['scale']
@@ -407,7 +407,7 @@ def clustering(uma_results, uma_thermos):
     d_cuts = uma_results['d_cuts']
     b_rec = []
     b_sz_rec = []
-    for cc in torch.linspace(0.33, 2, 50):
+    for cc in torch.linspace(0.33, 2, 200):
         cluster_labels = mean_shift_density(len(dmat), 100, dmat, d_cuts[0] * cc, uma_thermos['density'])
 
         i, c = np.unique(cluster_labels, return_counts=True)

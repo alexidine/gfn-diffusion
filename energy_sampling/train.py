@@ -26,7 +26,7 @@ from energy_sampling.utils import iter_forever, \
     is_cuda_oom, get_annealing_factor, \
     parse_loss_schedules, dict2namespace, update_loss_schedule, \
     random_discretizer, low_discrepancy_discretizer, low_discrepancy_discretizer2, shifted_equidistant, \
-    noise_buffer
+    noise_buffer, atomic_save
 from eval.evaluations import adjust_fig_filesize, log_metrics, fwd_figs, bwd_evaluation, analyze_buffer
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 from models import GFN
@@ -34,18 +34,9 @@ from mxtaltools.common.training_utils import flatten_wandb_params
 from mxtaltools.dataset_utils.data_classes import MolData
 from mxtaltools.dataset_utils.utils import collate_data_list
 from utils import get_train_args, get_gfn_init_state, set_seed, \
-    get_exploration_std, uniform_discretizer, \
+    uniform_discretizer, \
     featurize_dataset, embed_dataset, \
     update_ema
-
-
-def atomic_save(state_dict, path):
-    try:
-        tmp_path = path + ".tmp"
-        torch.save(state_dict, tmp_path)
-        os.replace(tmp_path, path)
-    except Exception as e:
-        print("Save failed to", path)
 
 
 class Modeller:
@@ -113,11 +104,9 @@ class Modeller:
 
         elif self.args.bwd:  # backward ONLY
             do_backward = True
-            p_forward = 0
 
         else:  # forward ONLY
             do_forward = True
-            p_forward = 1
 
         if len(buffer) == 0:
             do_forward = True
@@ -312,7 +301,7 @@ class Modeller:
             'z_primes': self.args.z_primes,
             'max_z_prime': max(self.args.z_primes),
             'zp_conditioning': self.args.zp_conditioning,
-            'uma_path': self.args.uma_path,
+            'mlip_path': self.args.mlip_path,
             'reward_range': self.args.reward_range,
             'lj_rescale': 1,
         }
@@ -511,6 +500,12 @@ class Modeller:
             for elem in test_mols_list:
                 elem.uma_gas_pot = pot
 
+        if hasattr(buffer.dataset[0], 'mace_gas_pot'):  # TODO REWRITE ALL THIS
+            pot = buffer.dataset[0].mace_gas_pot
+            for elem in train_mols_list:
+                elem.mace_gas_pot = pot
+            for elem in test_mols_list:
+                elem.mace_gas_pot = pot
         train_mol_loader = DataLoader(
             train_mols_list,
             batch_size=self.batch_size,
@@ -1290,14 +1285,14 @@ class Modeller:
         # dataset = [dataset[i] for i in keep_inds]
 
         # todo remove this eventually, hopefully
-        if 'D:' in self.args.buffer_path and self.args.energy_function == 'uma':  # if we're on local, this takes forever
+        if 'D:' in self.args.buffer_path and self.args.energy_function in ['uma','mace']:  # if we're on local, this takes forever
             dataset = dataset[:250]
 
         print("Re-featurizing preloaded buffer samples")
         dataset = featurize_dataset(dataset,
                                     self.device,
                                     self.args.energy_function,
-                                    uma_path=self.args.uma_path,
+                                    mlip_path=self.args.mlip_path,
                                     batch_size=500)
         # always filter awful crystals
         # re-filter this, as sometimes reparameterization happens inside the feat function

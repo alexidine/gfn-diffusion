@@ -1,27 +1,20 @@
-from copy import copy
-
-import plotly.graph_objects as go
 import os
 
-import numpy as np
-import torch
-from tqdm import tqdm
-import hdbscan
+import os
 
-from energy_sampling.eval.paper1_results.figures import sparkbar_table
-from energy_sampling.eval.paper1_results.utils import generator_reward, new_local_analysis, sample_and_analyze, \
-    load_experimental_structure, dmat_local_analysis, mean_shift_density, basin_opt
+import torch
+
+from energy_sampling.eval.paper1_results.utils import sample_and_analyze, \
+    dmat_local_analysis
 from energy_sampling.utils import load_yaml, dict2namespace
-from mxtaltools.analysis.crystal_rdf import rdf_radial_graph, compute_rdf_distance, compute_rdf_distmat
-from mxtaltools.crystal_search.run_search import crystal_search
+from mxtaltools.analysis.crystal_rdf import compute_rdf_distance, compute_rdf_distmat
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 
 torch.cuda.set_per_process_memory_fraction(0.9, device=0)
 
-if __name__ == '__main__':
 
-    config = dict2namespace(load_yaml('analysis.yaml'))
+def run_analysis(config):
     results_path = os.path.join(config.results_dir, rf"{config.run_name}.pt")
     basins_path = os.path.join(config.results_dir, config.run_name + '_basins.pt')
 
@@ -63,6 +56,8 @@ if __name__ == '__main__':
         computes = ['lj', 'qlj', 'elj', 'silu', 'rdf', 'reduction_en']
         if config.energy_function == 'uma':
             computes.append('uma')
+        elif config.energy_function == 'mace':
+            computes.append('mace')
         with torch.no_grad():
             ebatch.cuda()
             ebatch.analyze(computes, elementwise=False, atomwise=True, assign_outputs=True,
@@ -115,74 +110,21 @@ if __name__ == '__main__':
                          'd_cuts': d_cuts,
                          }, )
 
-    #
-    # samples_per = 20
-    # n_basins = sum(np.unique(cleaned_cluster_labels) > -1)
-    # basin_minima = []
-    # for bind in np.unique(cleaned_cluster_labels):
-    #     if bind == -1:
-    #         continue
-    #     b_inds = torch.argwhere(cleaned_cluster_labels == bind).flatten()
-    #     b_ens = sample_energy[b_inds]
-    #     topk = b_ens.topk(samples_per, largest=False).indices
-    #     basin_minima.extend(b_inds[topk])
-    #
-    # num_polymorphs = ebatch.num_graphs
-    # poly_dists = torch.stack([compute_rdf_distance(ebatch.rdf[ind].cpu(), sample_batch.rdf.cpu(), bins.cpu()) for ind in range(num_polymorphs)]) #dmat[:-num_polymorphs, -num_polymorphs:]
-    # results_dict.update({'poly_dists': poly_dists})
-    # closest = poly_dists.argsort(dim=1, descending=False)[:, :samples_per]
-    # samples = sample_batch.batch_to_list()
-    # opt_samples = [samples[ind] for ind in closest.T.flatten()] + esamples + [samples[ind] for ind in basin_minima]
-    #
-    # opt_config = {
-    #     'device': 'cuda',
-    #     'mol_path': None,
-    #     'dataset_path': None,
-    #     'target_path': None,
-    #     'umbrella_path': None,
-    #     'target_identifier': 'temp_opt',
-    #     'out_dir': 'D:/crystal_datasets/opt_outputs',
-    #     'run_name': 'temp_opt',
-    #     'save_trajs': False,
-    #     'uma_predictor_path': 'D:/crystal_datasets/esen_s.pt',
-    #     'init_sample_method': 'in_config',
-    #     'samples_to_optim': opt_samples,
-    #     'init_reduced': False,
-    #     'mol_seed': 0,
-    #     'opt_seed': 0,
-    #     'sampling_mode': 'all',
-    #     'mols_to_sample': None,
-    #     'num_samples': 10000,
-    #     'sgs_to_search': [opt_samples[0].sg_ind],
-    #     'zp_to_search': [1],
-    #     'batch_size': 200,
-    #     'grow_batch_size': False,
-    #     'init_target_cp': None,
-    #     'opt': [
-    #         {
-    #             'optim_target': config.energy_function,
-    #             'enforce_reduced': True,
-    #             'compression_factor': 0.0,
-    #             'cutoff': 10,
-    #             'init_lr': 0.001,
-    #             'convergence_eps': 0.0001,
-    #             'optimizer_func': 'rprop',
-    #             'anneal_lr': False,
-    #             'grad_norm_clip': 0.1,
-    #             'show_tqdm': True,
-    #             'max_num_steps': 500,
-    #             'rdf_warmup': None,
-    #             'target_packing_coeff': None,
-    #             'umbrella': False,
-    #             'umbrella_sigma': 0.25,
-    #             'umbrella_epsilon': 40.0,
-    #         },
-    #     ],
-    # }
-    # os.remove(r"D:\crystal_datasets\opt_outputs\temp_opt.pt")
-    # opt_outs = crystal_search(dict2namespace(opt_config))
-    # results_dict.update({'poly_opts': opt_outs[:(num_polymorphs * samples_per) + num_polymorphs],
-    #                      'basin_opts': opt_outs[(num_polymorphs * samples_per) + num_polymorphs:],})
-
     torch.save(results_dict, results_path)
     aa = 1
+
+
+if __name__ == '__main__':
+    raw = load_yaml('analysis.yaml')
+    base, runs = raw['base'], raw['runs']
+
+    for run in runs:
+        config = dict2namespace({**base, **run})
+        results_path = os.path.join(config.results_dir, f"{config.run_name}.pt")
+        basins_path = os.path.join(config.results_dir, f"{config.run_name}_basins.pt")
+
+        print(f"\n=== {config.run_name} ===")
+        run_analysis(config)  # whatever your entry point is
+
+
+        aa = 1

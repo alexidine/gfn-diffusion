@@ -1,12 +1,12 @@
 import glob
 import os
-import re
 
 import torch
 from tqdm import tqdm
 
 from energy_sampling.data_processing.utils import calibrate_energy_function_vs_uma
 from energy_sampling.utils import new_calibrate_prior_noise
+from mxtaltools.analysis.crystal_rdf import compute_rdf_distance
 from mxtaltools.common.adaptive_batching import adaptive_batched_analysis
 from mxtaltools.common.clustering import greedy_bottom_up_anchors
 from mxtaltools.dataset_utils.utils import collate_data_list
@@ -37,8 +37,7 @@ def collate_generate_prior():
     """
     sample_batch = collate_data_list(opt_samples, exclude_keys=['elj'])
     sample_batch.latent_to_cell_params(sample_batch.latent_params())
-    analyses = ['lj', 'vdw', 'vdw_max']
-    analyses.append(energy_function)
+    analyses = ['lj', 'vdw', 'vdw_max', 'rdf', energy_function]
     sample_batch = adaptive_batched_analysis(
         sample_batch, analyses=analyses, state={},
         initial_batch_size=10000, predictor=predictor,
@@ -95,6 +94,53 @@ def collate_generate_prior():
     thinned_batch = collate_data_list([good_samples[ind] for ind in anchors])
 
 
+def confirm_polymorphs_in_prior():
+    global identifier, thinned_batch, target_path, target_mol, tbatch, tbatch
+    results = []
+    for identifier in identifiers:
+        for rdtype in ['envwise']:  # [None, 'elementwise', 'atomwise', 'envwise']:
+            thinned_batch = dd['prior_batch'].clone()
+            del thinned_batch.rdf
+
+            # target_path = r"D:\crystal_datasets\opt_outputs\acrdin_mace_test.pt"
+            target_path = r"D:\crystal_datasets\acridine\std_acridine_polymorphs.pt"
+            target_mol = torch.load(target_path, weights_only=False).batch_to_list()
+            if isinstance(target_mol, list):
+                target_mol = [elem for elem in target_mol if elem.identifier in identifier]
+            tbatch = collate_data_list(target_mol)
+
+            # target_path = r"D:\crystal_datasets\acridine\std_acridine_polymorphs.pt"
+            # tbatch = torch.load(target_path, weights_only=False)
+
+            tbatch.aunit_handedness = tbatch.aunit_handedness.abs()
+            zp = tbatch.z_prime
+            sg = tbatch.sg_ind
+            tbatch.analyze(['rdf'], rdf_mode=rdtype, cutoff=10, rdf_cutoff=10, assign_outputs=True)
+            thinned_batch.to('cuda')
+            analyses = ['rdf']
+            thinned_batch = adaptive_batched_analysis(
+                thinned_batch, analyses=analyses, state={},
+                initial_batch_size=1000, predictor=predictor,
+                device=device, show_tqdm=True, rdf_mode=rdtype, cutoff=10, rdf_cutoff=10
+            )
+            thinned_batch.to('cpu')
+            bins = torch.linspace(0, 10, 100)
+            ds = []
+            ds.append(compute_rdf_distance(tbatch.rdf, thinned_batch.rdf, bins))
+
+            dstack = torch.stack(ds)
+            dinds = dstack.argsort(dim=1, descending=False)[:, :20].flatten()
+
+            samps = thinned_batch.batch_to_list()
+            cb = collate_data_list([samps[ind] for ind in dinds])
+            cbatch = cb.mol2cluster()
+
+            tbatch.mol2ucell()
+            tbatch.write_cif(torch.arange(tbatch.num_graphs), 'acr_ref', 'unit cell')
+            matches, rmsds = cb.batch_compack('acr_ref_0.cif', torch.arange(cb.num_graphs))
+            results.append([identifiers, rdtype, matches, rmsds])
+
+
 if __name__ == '__main__':
     torch.set_grad_enabled(False)
     # # mipcas
@@ -116,9 +162,9 @@ if __name__ == '__main__':
     # acridine
     search_output_dir = r"D:\crystal_datasets\acridine"
     run_name = 'may_acridine_sg14_zp1'
-    identifier = 'ACRDIN01'
+    identifiers = ['ACRDIN04', 'ACRDIN12']
     energy_function = 'mace'
-    target_path = r"D:\crystal_datasets\acridine\prot_acrdin_crystals.pt"
+    target_path = r"D:\crystal_datasets\acridine\std_acridine_polymorphs.pt"
     uma_model_path = r"D:\crystal_datasets\esen_s.pt"
     mace_model_path = r"C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model"
     device = 'cuda'
@@ -141,30 +187,46 @@ if __name__ == '__main__':
     #     if re.search(rf'{re.escape(run_name)}_\d{{1,2}}\.pt$', os.path.basename(f))
     # ]
 
-    target_mol = torch.load(target_path, weights_only=False)
+    target_mol = torch.load(target_path, weights_only=False).batch_to_list()
     if isinstance(target_mol, list):
-        target_mol = [elem for elem in target_mol if elem.identifier == identifier][0]
-    target_mol.aunit_handedness = target_mol.aunit_handedness.abs()
-    zp = target_mol.z_prime
-    sg = target_mol.sg_ind
-
-    # todo we need to filter samples which are obviously insane but UMA for some reason doesn't grok
+        target_mol = [elem for elem in target_mol if elem.identifier in identifiers]
+    tbatch = collate_data_list(target_mol)
+    tbatch.aunit_handedness = tbatch.aunit_handedness.abs()
+    zp = tbatch.z_prime
+    sg = tbatch.sg_ind
 
     dataset_filename = run_name + '_prior_dataset.pt'
 
     if os.path.exists(dataset_filename):
         dd = torch.load(dataset_filename, weights_only=False)
-        noised_samples = dd['noised_batch'].batch_to_list()
+
         thinned_batch = dd['prior_batch']
         log_noise_range = dd['log_noise_range']
         en_scaling_factor = dd['thermal_scaling_factor']
+        if hasattr(dd, 'noised_batch'):
+            noised_samples = dd['noised_batch'].batch_to_list()
+        else:
+            noised_samples = []
     else:
         noised_samples = []
         collate_generate_prior()
+        dataset_dict = {
+            'thermal_scaling_factor': en_scaling_factor,
+            'log_noise_range': log_noise_range,
+            'prior_batch': thinned_batch.cpu(),
+        }
+        torch.save(dataset_dict, dataset_filename)
+
+    """
+    confirm that target structures are in the distribution
+    """
+
+    #confirm_polymorphs_in_prior()
 
     """
     preliminary noising
     """
+
     state = {}
     samples_per_anchor = ((tot_noised_samples - len(noised_samples)) // thinned_batch.num_graphs) + 1
     for _ in tqdm(range(samples_per_anchor)):

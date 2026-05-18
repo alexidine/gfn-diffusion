@@ -14,6 +14,7 @@ from mxtaltools.constants.space_group_feature_tensor import SG_FEATURE_TENSOR
 from mxtaltools.constants.space_group_info import SYM_OPS
 from mxtaltools.dataset_utils.data_classes import MolCrystalData
 from mxtaltools.dataset_utils.utils import collate_data_list
+from mxtaltools.mlip_interfaces.AL_mace_utils import load_mace_model
 from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 
 
@@ -57,7 +58,7 @@ class MolecularCrystal(BaseSet):
                  reduction_coeff: float = 1.0,
                  max_z_prime: int = 1,
                  z_primes: Tuple[int] = (1,),
-                 uma_path: Optional[str] = None,
+                 mlip_path: Optional[str] = None,
                  reward_range: float = None,
                  lj_rescale: float = None,
                  pressure: float = 1,  # in atm
@@ -87,10 +88,13 @@ class MolecularCrystal(BaseSet):
         self.lj_rescale = lj_rescale
         self.pressure = pressure
         if self.energy_function == 'uma':
-            self.uma_path = uma_path
-            self.uma_predictor = init_uma_crystal_predictor(uma_path, device=self.device)
+            self.mlip_path = mlip_path
+            self.predictor = init_uma_crystal_predictor(mlip_path, device=self.device)
+        elif self.energy_function == 'mace':
+            self.mlip_path = mlip_path
+            self.predictor = load_mace_model(self.mlip_path, self.device, torch.float32)
         else:
-            self.uma_predictor = None
+            self.predictor = None
 
         self.temperature = temperature  # for static temperature work
         self.energy_clip = None
@@ -125,7 +129,7 @@ class MolecularCrystal(BaseSet):
         crystal_batch.latent_to_cell_params(x)
         return crystal_batch
 
-    def analyze_crystal_batch(self, x, mol_batch,temperature, return_batch=False):  # x is gfn_outputs
+    def analyze_crystal_batch(self, x, mol_batch, temperature, return_batch=False):  # x is gfn_outputs
         crystal_batch = self.instantiate_crystals(x, mol_batch)
 
         cutoff = 10
@@ -134,7 +138,7 @@ class MolecularCrystal(BaseSet):
                                         cutoff=cutoff,
                                         supercell_size=10,
                                         std_orientation=False,
-                                        predictor=self.uma_predictor,)
+                                        predictor=self.predictor, )
 
         for key in out.keys():
             crystal_batch.add_graph_attr(out[key], key)
@@ -169,20 +173,11 @@ class MolecularCrystal(BaseSet):
         if self.max_z_prime > 1:
             bounding_energy = self.compute_zp_order_penalty(bounding_energy, crystal_batch)
 
-        if self.energy_function in ['lj', 'qlj', 'elj', 'silu', 'uma']:
+        if self.energy_function in ['lj', 'qlj', 'elj', 'silu', 'uma', 'mace']:
             density_energy = density_penalty(crystal_batch.packing_coeff)
-            if self.energy_function == 'lj':
-                mol_energy = crystal_batch.lj / crystal_batch.z_prime
-            elif self.energy_function == 'qlj':
-                mol_energy = crystal_batch.qlj / crystal_batch.z_prime
-            elif self.energy_function == 'elj':
-                mol_energy = crystal_batch.elj / crystal_batch.z_prime
-            elif self.energy_function == 'silu':
-                mol_energy = crystal_batch.silu / crystal_batch.z_prime
-            elif self.energy_function == 'uma':
-                mol_energy = crystal_batch.uma
-            else:
-                assert False
+            mol_energy = getattr(crystal_batch, self.energy_function)
+            if self.energy_function not in ['uma', 'mace']:
+                mol_energy = mol_energy / crystal_batch.z_prime
 
             if self.energy_function in ['lj', 'qlj', 'elj'] and self.lj_rescale is not None:
                 # rescale functions with LJ-type minima to uma statistics
@@ -190,8 +185,8 @@ class MolecularCrystal(BaseSet):
 
             reduction_energy = F.relu(crystal_batch.reduction_en)  # punish positive energies
 
-            atm_conv = 101325 # conversion from atmospheres to Pa
-            PV_en_conv = 6.022 * 10**-10# conversion to energy in Pa*A^3 to kJ/mol
+            atm_conv = 101325  # conversion from atmospheres to Pa
+            PV_en_conv = 6.022 * 10 ** -10  # conversion to energy in Pa*A^3 to kJ/mol
             pressure_energy = self.pressure * PV_en_conv * atm_conv * crystal_batch.cell_volume / crystal_batch.sym_mult / crystal_batch.z_prime
 
             ens_dict['reduction_energy'] = reduction_energy
@@ -214,7 +209,7 @@ class MolecularCrystal(BaseSet):
         elif self.energy_function == 'crystal_multiharmonic':
             crystal_energy = self.crystal_multiharmonic_en(crystal_batch, latents)
 
-        elif self.energy_function in ['lj', 'qlj', 'elj', 'silu', 'uma']:
+        elif self.energy_function in ['lj', 'qlj', 'elj', 'silu', 'uma','mace']:
             crystal_energy = self.lj_coeff * mol_energy + self.density_coeff * density_energy + pressure_energy
 
         else:
@@ -227,9 +222,10 @@ class MolecularCrystal(BaseSet):
             total_energy = (log_rescale_positive(crystal_energy, self.energy_clip) +
                             bounding_energy * self.bounding_coeff +
                             reduction_energy * self.reduction_coeff)
-            return (log_rescale_positive(total_energy, self.energy_clip + 0.1 * np.abs(self.energy_clip)) + jacobian_energy,
-                    # to prevent total saturation by the energy function, add a buffer over the clip
-                    ens_dict)
+            return (
+                log_rescale_positive(total_energy, self.energy_clip + 0.1 * np.abs(self.energy_clip)) + jacobian_energy,
+                # to prevent total saturation by the energy function, add a buffer over the clip
+                ens_dict)
         else:
             total_energy = (crystal_energy +
                             bounding_energy * self.bounding_coeff +
@@ -246,7 +242,7 @@ class MolecularCrystal(BaseSet):
         r = sph[..., 2]  # rotation magnitude
         eps = 1e-8
         rot_jacob_weight = (
-        # this comes from composing the transforms of spherical -> cartesian ball and then to uniform rotation
+            # this comes from composing the transforms of spherical -> cartesian ball and then to uniform rotation
                 torch.sin(r / 2).clamp_min(eps) ** 2
                 * torch.sin(theta).clamp_min(eps)
         )
@@ -366,7 +362,8 @@ class MolecularCrystal(BaseSet):
         """
         temperature = 10 ** log_temperature
         if return_exp:
-            energy, crystal_batch = self.batched_analyze_crystal_batch(x, mol_batch, temperature, return_batch=return_exp)
+            energy, crystal_batch = self.batched_analyze_crystal_batch(x, mol_batch, temperature,
+                                                                       return_batch=return_exp)
             return energy / temperature, crystal_batch
         else:
             energy = self.batched_analyze_crystal_batch(x, mol_batch, temperature, return_batch=return_exp)
@@ -374,7 +371,7 @@ class MolecularCrystal(BaseSet):
 
     def batched_analyze_crystal_batch(self, x, mol_batch, temperature, return_batch=False):
         if not hasattr(self, 'batch_size'):
-            if self.energy_function == 'uma':
+            if self.energy_function in ['uma','mace']:
                 self.batch_size = 1000
             else:
                 self.batch_size = 10000
@@ -387,7 +384,7 @@ class MolecularCrystal(BaseSet):
         else:
             data_list = mol_batch.to_data_list()
         already_oomed = False
-        while cursor < n_samples: # todo get a single unified interface for all the places we do this
+        while cursor < n_samples:  # todo get a single unified interface for all the places we do this
             try:
                 inds = np.arange(cursor, min(n_samples, cursor + self.batch_size))
                 mol_batch_i = collate_data_list([data_list[ind] for ind in inds])
@@ -407,13 +404,10 @@ class MolecularCrystal(BaseSet):
                     if self.batch_size == 1:
                         assert False, "Cascading OOM failure in molecule energy evaluation"
                     self.batch_size = max(int(self.batch_size * 0.65), 1)
-                    #print(f"OOM in energy evaluation: dropping batch size to {self.batch_size}")
+                    # print(f"OOM in energy evaluation: dropping batch size to {self.batch_size}")
                     gc.collect()
-                    #del self.uma_predictor, mol_batch_i
                     torch.cuda.empty_cache()
-                    #torch.cuda.reset_peak_memory_stats()
                     torch.cuda.synchronize()
-                    #self.uma_predictor = init_uma_crystal_predictor(self.uma_path, device=self.device)
                     already_oomed = True
                     sleep(0.1)
                 else:
