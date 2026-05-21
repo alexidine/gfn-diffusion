@@ -19,9 +19,21 @@ base:
 
 # Per-run overrides
 runs:
+  - run_name: acridine_14_1
+    energy_function: mace
+    sg_ind: 14
+    z_prime: 1
+    model_path: D:\crystal_datasets\acridine\models\run_1_acridine_14_1_model_eval.pt
+    config_path: D:\crystal_datasets\acridine\models\run_1_acridine_14_1_model_config.npy
+    molecule_path: D:\crystal_datasets\acridine\acridine_conformer.pt
+    exp_sample_path: D:\crystal_datasets\acridine\opt_acrdin.pt #std_acridine_polymorphs.pt
+    dataset_path: D:\crystal_datasets\acridine\may_acridine_sg14_zp1_prior_dataset.pt
+    identifiers: ['ACRDIN04','ACRDIN12']
+
   - run_name: mipcas_elj
     energy_function: elj
     sg_ind: 2
+    z_prime: 1
     model_path:    D:\crystal_datasets\mipcas\new_mipcas_2_mipcas_2_baseline_0_model_eval.pt
     config_path:   D:\crystal_datasets\mipcas\new_mipcas_2_mipcas_2_baseline_0_model_config.npy
     molecule_path: D:\crystal_datasets\mipcas\MIPCAS_standardized.pt
@@ -31,6 +43,7 @@ runs:
   - run_name: mipcas_uma
     energy_function: uma
     sg_ind: 2
+    z_prime: 1
     model_path:    D:\crystal_datasets\mipcas\new_mipcas_2_mipcas_2_uma_baseline_10_model_eval.pt
     config_path:   D:\crystal_datasets\mipcas\new_mipcas_2_mipcas_2_uma_baseline_10_model_config.npy
     molecule_path: D:\crystal_datasets\mipcas\MIPCAS_standardized.pt
@@ -40,6 +53,7 @@ runs:
   - run_name: nehzor_elj
     energy_function: elj
     sg_ind: 14
+    z_prime: 1
     model_path:    D:\crystal_datasets\nehzor\new_nehzor_2_nehzor_2_elj_1_model_eval.pt
     config_path:   D:\crystal_datasets\nehzor\new_nehzor_2_nehzor_2_elj_1_model_config.npy
     molecule_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
@@ -49,6 +63,7 @@ runs:
   - run_name: nehzor_uma
     energy_function: uma
     sg_ind: 14
+    z_prime: 1
     model_path:    D:\crystal_datasets\nehzor\new_nehzor_2_nehzor_2_uma_0_model_eval.pt
     config_path:   D:\crystal_datasets\nehzor\new_nehzor_2_nehzor_2_uma_0_model_config.npy
     molecule_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt

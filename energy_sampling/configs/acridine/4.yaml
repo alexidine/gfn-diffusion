@@ -110,7 +110,7 @@ rank_weight: 1.0
 reduction_coeff: 10.0
 repeats: 2
 reward_range: 100
-run_name: acridine_14_2
+run_name: acridine_9_2
 s_emb_dim: 1024
 sampling: buffer
 scheduler: true

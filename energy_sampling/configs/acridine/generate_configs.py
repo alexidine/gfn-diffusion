@@ -42,16 +42,23 @@ if __name__ == "__main__":
     ind = 0
     base_path = 'base.yaml'
     for zp, sg in zip(zps, sgs):
+        for efunc in ['mace', 'uma']:
 
-        base, spec_dir = load_yaml(base_path)
-        config = deepcopy(base)
+            base, spec_dir = load_yaml(base_path)
+            config = deepcopy(base)
 
-        run_name = f"{base['run_name']}_{sg}_{zp}"
-        config['run_name'] = run_name
-        config['tag'] = 'run_1'
-        config_path = f"{ind}.yaml"
+            run_name = f"{base['run_name']}_{sg}_{zp}"
+            config['run_name'] = run_name
+            config['energy_function'] = efunc
+            if efunc == 'mace':
+                config[
+                    'mlip_path'] = r"scratch/mk8347/data/acr_112025_mh1_stagetwo.model"
+            elif efunc == 'uma':
+                config['mlip_path'] = r"/scratch/mk8347/models/uma/esen_s.pt'"
+            config['tag'] = 'run_1'
+            config_path = f"{ind}.yaml"
 
-        with open(config_path, 'w') as f:
-            yaml.dump(config, f, default_flow_style=False)
+            with open(config_path, 'w') as f:
+                yaml.dump(config, f, default_flow_style=False)
 
-        ind += 1
+            ind += 1

@@ -1456,6 +1456,7 @@ def combo_fig(num_polymorphs,
               basin_colorscale,
               basin_min_batch,
               polymorph_basin_index,
+              energy_function,
               ):
     marker_font_size = 16
 
@@ -1470,7 +1471,7 @@ def combo_fig(num_polymorphs,
               sample_embedding, sample_inds)
 
     fig_grid(basin_min_batch, basin_positions, fig, indexed_cluster_labels, n_basins, p_maxima, packing_coeffs,
-             polymorph_basin_index, sample_energy, stats, uma_thermos)
+             polymorph_basin_index, sample_energy, stats, uma_thermos, energy_function)
 
     table_trace = new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats, n_basins)
     fig.add_trace(table_trace, row=3, col=1)
@@ -1724,7 +1725,7 @@ def embedding(fig, marker_font_size, new_min_inds, num_polymorphs, p_maxima, poi
     #
 
 def fig_grid(basin_min_batch, basin_positions, fig, indexed_cluster_labels, n_basins, p_maxima, packing_coeffs,
-             polymorph_basin_index, sample_energy, stats, uma_thermos):
+             polymorph_basin_index, sample_energy, stats, thermo_metrics, energy_function):
     for i, basin_ind in enumerate(np.arange(n_basins)):  # enumerate(sorted_minima_inds[:4]):
         row, col = basin_positions[i]
 
@@ -1735,7 +1736,7 @@ def fig_grid(basin_min_batch, basin_positions, fig, indexed_cluster_labels, n_ba
             mode='markers',
             marker=dict(
                 size=5,
-                color=uma_thermos['density'][bb] / np.amax(uma_thermos['density']),
+                color=thermo_metrics['density'][bb] / np.amax(thermo_metrics['density']),
                 colorscale='Viridis',
                 cmin=0,
                 cmax=1,
@@ -1759,7 +1760,7 @@ def fig_grid(basin_min_batch, basin_positions, fig, indexed_cluster_labels, n_ba
         ), row=row, col=col)
         fig.add_trace(go.Scatter(
             x=[basin_min_batch.packing_coeff[i]],
-            y=[basin_min_batch.uma[i]],
+            y=[basin_min_batch[energy_function][i]],
             mode='markers',
             marker_color='white', marker_line_color='black', marker_line_width=4,
             marker=dict(

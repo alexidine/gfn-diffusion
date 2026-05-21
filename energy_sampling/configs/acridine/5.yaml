@@ -37,7 +37,7 @@ dropout: 0
 ema_decay: 0.95
 energy: molecular_crystal
 energy_density_coeff: 10.0
-energy_function: mace
+energy_function: uma
 energy_lj_coeff: 1.0
 energy_max_temperature: 10
 energy_min_temperature: 0.1
@@ -91,7 +91,7 @@ max_traj_length: 100
 min_fwd_bwd_ratio: 0.01
 min_lr: 1.0e-05
 min_traj_length: 100
-mlip_path: scratch/mk8347/data/acr_112025_mh1_stagetwo.model
+mlip_path: /scratch/mk8347/models/uma/esen_s.pt'
 mol_embedding_type: autoencoder
 molecule: nehzor
 molecule_conditioning: false
@@ -110,7 +110,7 @@ rank_weight: 1.0
 reduction_coeff: 10.0
 repeats: 2
 reward_range: 100
-run_name: acridine_14_2
+run_name: acridine_9_2
 s_emb_dim: 1024
 sampling: buffer
 scheduler: true

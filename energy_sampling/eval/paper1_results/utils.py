@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 from _plotly_utils.colors import qualitative, hex_to_rgb
 from matplotlib import cm, colors
-from plotly import graph_objects as go
+from plotly import graph_objects as go, express as px
 from plotly.subplots import make_subplots
 from pynndescent.distances import spearmanr
 from scipy.cluster.hierarchy import linkage, to_tree, leaves_list
@@ -30,10 +30,11 @@ from umap import UMAP
 from energy_sampling.energies.molecular_crystal import density_penalty
 from energy_sampling.models import GFN
 from energy_sampling.utils import uniform_discretizer, get_gfn_init_state, is_cuda_oom
-from mxtaltools.analysis.crystal_rdf import compute_rdf_distmat
+from mxtaltools.analysis.crystal_rdf import compute_rdf_distmat, compute_rdf_distance
 from mxtaltools.common.geometry_utils import crystal_parameter_distmat
 from mxtaltools.common.utils import log_rescale_positive
 from mxtaltools.dataset_utils.utils import collate_data_list
+from mxtaltools.mlip_interfaces.AL_mace_utils import load_mace_model
 from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 
 METRIC_REGISTRY = {}
@@ -653,15 +654,16 @@ def sample_from_gfn(num_samples, max_z_prime, device, n_steps, batch_size, gfn_m
     return samples.clip(max=1, min=-1), pfs, pbs
 
 
-def analyze_samples(x, mol_list, max_z_prime, device, batch_size, sg_ind, zp, do_uma: bool = False, predictor=None,
+def analyze_samples(x, mol_list, max_z_prime, device, batch_size, sg_ind, zp, energy_function, predictor=None,
                     overwrite_latents: bool = True):
     num_samples = len(mol_list)
     samples = []
     cursor = 0
     already_oomed = False
     computes = ['lj', 'qlj', 'elj', 'silu', 'rdf', 'reduction_en']
-    if do_uma:
-        computes.append('uma')
+    computes.append(energy_function)
+    computes = list(set(computes))
+
     with tqdm(total=num_samples) as pbar:
         with torch.no_grad():
             while cursor < num_samples:
@@ -675,7 +677,7 @@ def analyze_samples(x, mol_list, max_z_prime, device, batch_size, sg_ind, zp, do
                         batch.latent_to_cell_params(x[inds])
                     batch = batch.to(device)
                     outs = batch.analyze(computes, cutoff=10, std_orientation=True, assign_outputs=True,
-                                         predictor=predictor, elementwise=False, atomwise=True)
+                                         predictor=predictor, rdf_mode='envwise')
 
                     batch.to('cpu')
                     samples.extend(batch.batch_to_list())
@@ -948,6 +950,9 @@ def get_gfn_samples(num_samples, max_z_prime, device, n_steps, batch_size, gfn_m
     if energy_function == 'uma':
         pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
         predictor = init_uma_crystal_predictor(pred_path, device=device)
+    elif energy_function == 'mace':
+        pred_path = r"C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model"
+        predictor = load_mace_model(pred_path, device=device, dtype=torch.torch.float32)
     else:
         predictor = None
 
@@ -956,8 +961,7 @@ def get_gfn_samples(num_samples, max_z_prime, device, n_steps, batch_size, gfn_m
     else:
         mol_list = [molecule]
     samples = analyze_samples(sample_latents, mol_list * num_samples, max_z_prime, device, batch_size, sg_ind,
-                              zp,
-                              do_uma=energy_function == 'uma', predictor=predictor)
+                              zp, energy_function=energy_function, predictor=predictor)
     sample_batch = collate_data_list(samples, max_z_prime=max_z_prime)
     sample_energy = sample_batch[energy_function]
 
@@ -1977,7 +1981,7 @@ def load_experimental_structure(exp_sample_path, sg_ind, zp, device, max_z_prime
         1000,
         sg_ind,
         zp,
-        do_uma=energy_function == 'uma',
+        energy_function=energy_function,
         predictor=predictor,
         overwrite_latents=False,
     )
@@ -2580,43 +2584,43 @@ def assign_basins(pointer_ids, n_samples):
 
 
 def mean_shift_density(n_samples, max_iter, dmat, cutoff, density):
-#     original_state = torch.arange(n_samples)
-#     current_state = torch.arange(n_samples)
-#     for _ in tqdm(range(max_iter)):
-#         prev_state = current_state.clone()
-#         for i in range(n_samples):
-#             s0 = current_state[i]  # get current walker
-#
-#             neighbors = torch.where(dmat[s0] < cutoff)[0]  # get neighbors
-#
-#             if len(neighbors) == 0:  # nothing in cutoff
-#                 neighbors = torch.tensor([s0])
-#
-#             best_neighbor = neighbors[density[neighbors].argmax()]  # get highest density neighbor
-#
-#             current_state[i] = best_neighbor
-#
-#         if torch.equal(current_state, prev_state):
-#             break
+    #     original_state = torch.arange(n_samples)
+    #     current_state = torch.arange(n_samples)
+    #     for _ in tqdm(range(max_iter)):
+    #         prev_state = current_state.clone()
+    #         for i in range(n_samples):
+    #             s0 = current_state[i]  # get current walker
+    #
+    #             neighbors = torch.where(dmat[s0] < cutoff)[0]  # get neighbors
+    #
+    #             if len(neighbors) == 0:  # nothing in cutoff
+    #                 neighbors = torch.tensor([s0])
+    #
+    #             best_neighbor = neighbors[density[neighbors].argmax()]  # get highest density neighbor
+    #
+    #             current_state[i] = best_neighbor
+    #
+    #         if torch.equal(current_state, prev_state):
+    #             break
     # vectorized inner loop
     current_state = torch.arange(n_samples, device=dmat.device)
 
     # Precompute once: for each point i, the highest-density neighbor within cutoff.
     # Mask non-neighbors with -inf so they lose the argmax.
-    neighbor_mask = dmat < cutoff                                  # (N, N) bool
+    neighbor_mask = dmat < cutoff  # (N, N) bool
     masked_density = torch.where(
         neighbor_mask,
-        torch.as_tensor(density).unsqueeze(0).expand_as(dmat),                      # broadcast row-wise
+        torch.as_tensor(density).unsqueeze(0).expand_as(dmat),  # broadcast row-wise
         torch.full_like(dmat, float('-inf')),
     )
     # Fallback: if a row has no neighbors, point it at itself.
     has_neighbor = neighbor_mask.any(dim=1)
-    best_from = masked_density.argmax(dim=1)                       # (N,)
+    best_from = masked_density.argmax(dim=1)  # (N,)
     best_from = torch.where(has_neighbor, best_from, torch.arange(n_samples, device=dmat.device))
 
     for _ in range(max_iter):
         prev_state = current_state
-        current_state = best_from[current_state]                   # gather-step all walkers at once
+        current_state = best_from[current_state]  # gather-step all walkers at once
         if torch.equal(current_state, prev_state):
             break
 
@@ -2650,3 +2654,166 @@ def basin_opt(basin_minima, samples, energy_function, predictor):
         torch.cuda.synchronize()
         sleep(0.1)
     return all_outs, all_records
+
+
+def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch, uma_results, uma_thermos,energy_function, max_n_clusters:int = 4):
+    sample_energy = uma_batch[energy_function]
+    # good_inds = (sample_energy < (sample_energy.amin() + 15*2.5)).argwhere().flatten()
+    good_inds = (sample_energy < sample_energy.amin() + 15 * 2.5).argwhere().flatten()
+    num_filtered_samples = len(good_inds)
+    # good_inds = (sample_energy < (sample_energy.quantile(0.95))).argwhere().flatten()
+    sample_energy = uma_batch[energy_function][good_inds]
+    sample_cps = uma_batch.packing_coeff[good_inds]
+    #
+    cluster_labels, indexed_cluster_labels, p_maxima, n_basins = clustering(uma_results, uma_thermos, max_n_clusters)
+    e_minima = np.array([(cluster_labels == ind).argwhere().flatten()[np.argmin(sample_energy[cluster_labels == ind])]
+                         for ind in p_maxima])  # in order of p_maxima
+    basin_opt_ens = sample_energy[e_minima]
+    ss = uma_batch.batch_to_list()
+    ss = [ss[ind] for ind in good_inds]
+    basin_min_batch = collate_data_list([ss[ind] for ind in e_minima])
+    # opt_samples = uma_results['basin_opts']
+    # opt_batch = collate_data_list(opt_samples)
+    # basin_opt_ens = opt_batch.uma.reshape(n_basins, -1)
+    assert len(basin_opt_ens) == n_basins, "optimizer output mismatch"
+    # basin_mins = torch.argmin(basin_opt_ens, dim=1)
+    # basin_min_inds = []
+    # samples_per_basin = basin_opt_ens.shape[-1]
+    # cursor = 0
+    # for ind in range(n_basins):
+    #     basin_min_inds.append(basin_mins[ind] + cursor)
+    #     cursor += samples_per_basin
+    # basin_min_batch = collate_data_list([opt_samples[ind] for ind in basin_min_inds])
+    # full_dmat rows:
+    # [0 : len(good_inds)]                              → filtered uma samples
+    # [len(good_inds) : len(good_inds)+num_polymorphs]  → polymorph references (ebatch)
+    # [len(good_inds)+num_polymorphs : ]                → basin minima
+    full_dmat = augment_dmat(basin_min_batch, ebatch, uma_batch, uma_results, good_inds)
+    assert full_dmat.shape[0] == len(good_inds) + num_polymorphs + n_basins, "full_dmat shape mismatch"
+    polymorph_inds = [len(good_inds) + ind for ind in range(num_polymorphs)]
+    new_min_inds = [len(good_inds) + num_polymorphs + ind for ind in range(basin_min_batch.num_graphs)]
+    umap_model = UMAP(n_components=2, n_neighbors=300, min_dist=0.75,
+                      init='pca', metric='precomputed', low_memory=True, n_jobs=-1)
+    sample_embedding = umap_model.fit_transform(full_dmat.cpu().numpy().astype(np.float32))
+    basin_colorscale = px.colors.qualitative.Vivid[:n_basins + 2]
+    basin_colorscale[0] = 'rgb(100, 100, 100)'
+    sample_colors = [basin_colorscale[i + 1] for i in indexed_cluster_labels]
+    """get e minima and polymorph state probs under uma"""
+    d_kernel = uma_results['d_cuts'][0] / 3
+    old_dens = (torch.exp(-(full_dmat[:num_filtered_samples, :num_filtered_samples] ** 2) / (2 * d_kernel ** 2)).sum(
+        dim=1) - 1)
+    dnorm = old_dens.sum()
+    new_dens = (torch.exp(-(full_dmat[num_filtered_samples:, :num_filtered_samples] ** 2) / (2 * d_kernel ** 2)).sum(
+        dim=1)) / dnorm  # no minus one because we have deleted the self term
+    old_dens /= dnorm
+    """get polymorph & basin probs under elj"""
+    edmat = elj_results['dmat']
+    bins = torch.linspace(0, 10, elj_batch.rdf.shape[-1], device='cuda')
+    all_new_rdf = torch.cat([uma_batch.rdf[p_maxima], ebatch.rdf, basin_min_batch.rdf], dim=0)
+    # New samples vs. all original samples
+    dists_to_elj = torch.stack([
+        compute_rdf_distance(all_new_rdf[ii], elj_batch.rdf[good_inds], bins.cpu())
+        for ii in range(all_new_rdf.shape[0])
+    ])  # [n, 10k]
+    n_elj_samples = edmat.shape[0]
+    old_elj_dens = (torch.exp(-(edmat ** 2) / (2 * d_kernel ** 2)).sum(
+        dim=1) - 1)
+    dnorm = old_elj_dens.sum()
+    new_elj_dens = (torch.exp(-(dists_to_elj ** 2) / (2 * d_kernel ** 2)).sum(
+        dim=1)) / dnorm  # no minus one because we have deleted the self term
+    old_elj_dens /= dnorm
+    new_elj_dens /= old_elj_dens.amax()
+    stats = {}
+    stats['sample_energy'] = torch.cat([basin_min_batch[energy_function], ebatch[energy_function]]).numpy()
+    stats['sample_cp'] = torch.cat([sample_cps[p_maxima], ebatch.packing_coeff]).numpy()
+    stats['density'] = torch.cat(
+        [old_dens[p_maxima], new_dens[:num_polymorphs]]).numpy() / old_dens.amax()  # replace with per-basin maxima
+    stats['elj_density'] = new_elj_dens[:num_polymorphs + n_basins].numpy()
+    # stats['local_en_var'] = uma_thermos['local_en_var'][p_maxima]
+    poly_to_basin_dists = torch.zeros((num_polymorphs, n_basins))
+    for ind in range(num_polymorphs):
+        for b_ind, bb in enumerate(p_maxima):
+            binds = (cluster_labels == bb).argwhere().flatten()
+            dists = full_dmat[binds, num_filtered_samples + ind]
+            poly_to_basin_dists[ind][b_ind] = dists.amin()
+    polymorph_basin_index = poly_to_basin_dists.argmin(dim=1)
+    polymorph_colorscale = [basin_colorscale[1 + ind] for ind in polymorph_basin_index]
+    num_orig_samples = len(good_inds)
+    packing_coeffs = sample_cps
+    sample_inds = np.arange(num_orig_samples)
+    return basin_colorscale, basin_min_batch, indexed_cluster_labels, n_basins, new_min_inds, p_maxima, packing_coeffs, polymorph_basin_index, polymorph_colorscale, polymorph_inds, sample_colors, sample_embedding, sample_energy, sample_inds, stats
+
+
+def clustering(uma_results, uma_thermos, max_n_clusters: int):
+    """"""
+
+    "get basin anchors"
+    dmat = uma_results['dmat']
+    d_cuts = uma_results['d_cuts']
+    b_rec = []
+    b_sz_rec = []
+    for cc in torch.linspace(0.33, 2, 200):
+        cluster_labels = mean_shift_density(len(dmat), 100, dmat, d_cuts[0] * cc, uma_thermos['density'])
+
+        i, c = np.unique(cluster_labels, return_counts=True)
+        b_rec.append(i)
+        b_sz_rec.append(c)
+        if len(i) <= max_n_clusters:
+            break
+    anchors = i
+
+    "assign samples to basins"
+    sig = d_cuts[0] / 3
+    weights = np.exp(-dmat[anchors] ** 2 / (2 * sig ** 2))
+    weights = weights / weights.sum(0)
+    assignments = weights.argmax(dim=0)
+    assignments[weights.amax(dim=0) < 0.8] = -1
+    cluster_labels = torch.tensor([i[ass] if ass > -1 else -1 for ass in assignments])
+
+    p_maxima, cluster_sizes = np.unique(cluster_labels, return_counts=True)
+    p_maxima = p_maxima[1:]
+
+    density = np.asarray(uma_thermos['density'])
+    order = np.argsort(-density[p_maxima])
+    ordered_p_maxima = p_maxima[order]
+
+    label_map = {old.item(): new for new, old in enumerate(ordered_p_maxima, start=1)}
+    label_map.update({-1: 0})
+    indexed_cluster_labels = torch.tensor([label_map[l.item()] for l in cluster_labels])
+    indexed_cluster_labels -= 1
+    num_filtered_samples = len(cluster_labels)
+
+    n_basins = len(np.unique(cluster_labels)) - 1
+
+    assert torch.all(cluster_labels[p_maxima] == p_maxima)
+    assert len(cluster_labels) == num_filtered_samples, "cluster_labels mismatch"
+
+    return cluster_labels, indexed_cluster_labels, ordered_p_maxima, n_basins
+
+
+def augment_dmat(basin_min_batch, ebatch, uma_batch, uma_results, good_inds):
+    dmat = uma_results['dmat']
+    num_polymorphs = ebatch.num_graphs
+    bins = torch.linspace(0, 10, uma_batch.rdf.shape[-1], device='cuda')
+    all_new_rdf = torch.cat([ebatch.rdf, basin_min_batch.rdf], dim=0)
+    # New samples vs. all original samples
+    new_vs_original = torch.stack([
+        compute_rdf_distance(all_new_rdf[ii], uma_batch.rdf[good_inds], bins.cpu())
+        for ii in range(all_new_rdf.shape[0])
+    ])  # [n, 10k]
+    # New samples vs. each other
+    new_vs_new = torch.stack([
+        compute_rdf_distance(all_new_rdf[ii], all_new_rdf, bins.cpu())
+        for ii in range(all_new_rdf.shape[0])
+    ])  # [n, n]
+    n_orig = dmat.shape[0]
+    n_new = all_new_rdf.shape[0]
+    dmat_augmented = torch.zeros(
+        n_orig + n_new, n_orig + n_new,
+        device=dmat.device, dtype=dmat.dtype
+    )
+    dmat_augmented[:n_orig, :n_orig] = dmat
+    dmat_augmented[n_orig:, :n_orig] = new_vs_original
+    dmat_augmented[:n_orig, n_orig:] = new_vs_original.T
+    dmat_augmented[n_orig:, n_orig:] = new_vs_new
+    return dmat_augmented

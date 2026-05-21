@@ -4,11 +4,13 @@ import os
 
 import torch
 
+from energy_sampling.eval.paper1_results.figures import combo_fig
 from energy_sampling.eval.paper1_results.utils import sample_and_analyze, \
-    dmat_local_analysis
+    dmat_local_analysis, combo_fig_analysis
 from energy_sampling.utils import load_yaml, dict2namespace
 from mxtaltools.analysis.crystal_rdf import compute_rdf_distance, compute_rdf_distmat
 from mxtaltools.dataset_utils.utils import collate_data_list
+from mxtaltools.mlip_interfaces.AL_mace_utils import load_mace_model
 from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 
 torch.cuda.set_per_process_memory_fraction(0.9, device=0)
@@ -49,18 +51,29 @@ def run_analysis(config):
 
     "analyze experimental samples"
     if config.exp_sample_path is not None:
-        pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
-        predictor = init_uma_crystal_predictor(pred_path, device='cuda')
-        exp_crystals = torch.load(config.exp_sample_path, weights_only=False)
-        ebatch = collate_data_list(exp_crystals, max_z_prime=1)
-        computes = ['lj', 'qlj', 'elj', 'silu', 'rdf', 'reduction_en']
-        if config.energy_function == 'uma':
-            computes.append('uma')
+        if config.energy_function=='uma':
+            pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
+            predictor = init_uma_crystal_predictor(pred_path, device='cuda')
         elif config.energy_function == 'mace':
-            computes.append('mace')
+            pred_path = r"C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model"
+            predictor = load_mace_model(pred_path, device='cuda', dtype=torch.torch.float32)
+        else:
+            predictor=None
+
+        exp_crystals = torch.load(config.exp_sample_path, weights_only=False)
+        if hasattr(exp_crystals, 'is_batch'):
+            exp_crystals = exp_crystals.batch_to_list()
+        if hasattr(config, 'identifiers'):
+            exp_crystals = [elem for elem in exp_crystals if elem.identifier in config.identifiers]
+
+        ebatch = collate_data_list(exp_crystals)
+        computes = ['lj', 'qlj', 'elj', 'silu', 'rdf', 'reduction_en']
+        computes.append(config.energy_function)
+        computes = list(set(computes))
+
         with torch.no_grad():
             ebatch.cuda()
-            ebatch.analyze(computes, elementwise=False, atomwise=True, assign_outputs=True,
+            ebatch.analyze(computes, rdf_mode='envwise', assign_outputs=True,
                            predictor=predictor)
             ebatch.cpu()
         esamples = ebatch.batch_to_list()
@@ -92,7 +105,7 @@ def run_analysis(config):
     """start neighborhood analysis"""
     d_metrics = []
     bins = torch.linspace(0, 10, sample_batch.rdf.shape[-1], device='cuda')
-    d = torch.cat([compute_rdf_distance(sample_batch.rdf[ii], sample_batch.rdf, bins.cpu()) for ii in range(5)])
+    d = torch.cat([compute_rdf_distance(sample_batch.rdf[ii], sample_batch.rdf, bins.cpu()) for ii in range(50)])
     d_cuts = [d.quantile(0.15)]
 
     for d_cut in d_cuts:
@@ -112,6 +125,38 @@ def run_analysis(config):
 
     torch.save(results_dict, results_path)
     aa = 1
+
+    thermos = results_dict['metrics'][0]
+    (basin_colorscale, basin_min_batch, indexed_cluster_labels,
+     n_basins, new_min_inds, p_maxima, packing_coeffs, polymorph_basin_index,
+     polymorph_colorscale, polymorph_inds, sample_colors, sample_embedding,
+     sample_energy, sample_inds, stats) = combo_fig_analysis(
+        ebatch, sample_batch, results_dict, len(config.identifiers), sample_batch,
+        results_dict, thermos, config.energy_function, max_n_clusters=5)
+
+    fig = combo_fig(
+        len(config.identifiers),
+        n_basins,
+        packing_coeffs,
+        stats,
+        thermos,
+        sample_inds,
+        sample_embedding,
+        p_maxima,
+        polymorph_inds,
+        new_min_inds,
+        sample_energy,
+        polymorph_colorscale,
+        sample_colors,
+        indexed_cluster_labels,
+        basin_colorscale,
+        basin_min_batch,
+        polymorph_basin_index,
+        config.energy_function
+    )
+    fig.show()
+    aa = 1
+
 
 
 if __name__ == '__main__':
