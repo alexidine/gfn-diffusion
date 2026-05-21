@@ -91,7 +91,7 @@ max_traj_length: 100
 min_fwd_bwd_ratio: 0.01
 min_lr: 1.0e-05
 min_traj_length: 100
-mlip_path: /scratch/mk8347/models/uma/esen_s.pt'
+mlip_path: /scratch/mk8347/models/uma/esen_s.pt
 mol_embedding_type: autoencoder
 molecule: nehzor
 molecule_conditioning: false

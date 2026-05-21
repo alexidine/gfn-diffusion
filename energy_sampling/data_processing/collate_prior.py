@@ -160,9 +160,9 @@ if __name__ == '__main__':
     # uma_model_path = r"D:\crystal_datasets\esen_s.pt"
     # device = 'cuda'
     # acridine
-    search_output_dir = r"D:\crystal_datasets\acridine"
-    run_name = 'may_acridine_sg14_zp1'
-    identifiers = ['ACRDIN04', 'ACRDIN12']
+    search_output_dir = r"D:\crystal_datasets\acridine\prior_chunks"
+    run_name = 'may_acridine_sg14_zp2'
+    identifiers = None #['ACRDIN04', 'ACRDIN12']
     energy_function = 'mace'
     target_path = r"D:\crystal_datasets\acridine\std_acridine_polymorphs.pt"
     uma_model_path = r"D:\crystal_datasets\esen_s.pt"
@@ -189,7 +189,8 @@ if __name__ == '__main__':
 
     target_mol = torch.load(target_path, weights_only=False).batch_to_list()
     if isinstance(target_mol, list):
-        target_mol = [elem for elem in target_mol if elem.identifier in identifiers]
+        if identifiers is not None:
+            target_mol = [elem for elem in target_mol if elem.identifier in identifiers]
     tbatch = collate_data_list(target_mol)
     tbatch.aunit_handedness = tbatch.aunit_handedness.abs()
     zp = tbatch.z_prime

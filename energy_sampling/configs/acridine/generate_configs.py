@@ -54,7 +54,7 @@ if __name__ == "__main__":
                 config[
                     'mlip_path'] = r"scratch/mk8347/data/acr_112025_mh1_stagetwo.model"
             elif efunc == 'uma':
-                config['mlip_path'] = r"/scratch/mk8347/models/uma/esen_s.pt'"
+                config['mlip_path'] = r"/scratch/mk8347/models/uma/esen_s.pt"
             config['tag'] = 'run_1'
             config_path = f"{ind}.yaml"
 
