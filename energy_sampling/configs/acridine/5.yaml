@@ -11,7 +11,7 @@ both_ways: true
 bounding_coeff: 10.0
 btb_threshold: 1.5
 buffer_dist_cutoff: 0.5
-buffer_path: /scratch/mk8347/data/crystal_datasets/acridine/may_acridine_sg14_zp1_prior_dataset.pt
+buffer_path: /scratch/mk8347/data/crystal_datasets/acridine/may_acridine_sg14_zp1_prior_dataset_uma.pt
 buffer_size: 100000
 bwd: false
 bwd_loss_coeffs:

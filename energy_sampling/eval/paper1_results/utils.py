@@ -20,6 +20,7 @@ from pynndescent.distances import spearmanr
 from scipy.cluster.hierarchy import linkage, to_tree, leaves_list
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial.distance import pdist
+from sklearn.cluster import AgglomerativeClustering
 from sklearn.cluster import estimate_bandwidth, MeanShift
 from sklearn.neighbors import NearestNeighbors
 from torch_cluster import radius
@@ -2656,7 +2657,8 @@ def basin_opt(basin_minima, samples, energy_function, predictor):
     return all_outs, all_records
 
 
-def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch, uma_results, uma_thermos,energy_function, max_n_clusters:int = 4):
+def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch, uma_results, energy_function,
+                       cluster_labels, p_maxima, n_basins, indexed_cluster_labels):
     sample_energy = uma_batch[energy_function]
     # good_inds = (sample_energy < (sample_energy.amin() + 15*2.5)).argwhere().flatten()
     good_inds = (sample_energy < sample_energy.amin() + 15 * 2.5).argwhere().flatten()
@@ -2664,8 +2666,6 @@ def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch
     # good_inds = (sample_energy < (sample_energy.quantile(0.95))).argwhere().flatten()
     sample_energy = uma_batch[energy_function][good_inds]
     sample_cps = uma_batch.packing_coeff[good_inds]
-    #
-    cluster_labels, indexed_cluster_labels, p_maxima, n_basins = clustering(uma_results, uma_thermos, max_n_clusters)
     e_minima = np.array([(cluster_labels == ind).argwhere().flatten()[np.argmin(sample_energy[cluster_labels == ind])]
                          for ind in p_maxima])  # in order of p_maxima
     basin_opt_ens = sample_energy[e_minima]
@@ -2744,7 +2744,7 @@ def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch
     return basin_colorscale, basin_min_batch, indexed_cluster_labels, n_basins, new_min_inds, p_maxima, packing_coeffs, polymorph_basin_index, polymorph_colorscale, polymorph_inds, sample_colors, sample_embedding, sample_energy, sample_inds, stats
 
 
-def clustering(uma_results, uma_thermos, max_n_clusters: int):
+def clustering(uma_results, uma_thermos, max_n_clusters: int, min_basin_size: int):
     """"""
 
     "get basin anchors"
@@ -2769,6 +2769,14 @@ def clustering(uma_results, uma_thermos, max_n_clusters: int):
     assignments = weights.argmax(dim=0)
     assignments[weights.amax(dim=0) < 0.8] = -1
     cluster_labels = torch.tensor([i[ass] if ass > -1 else -1 for ass in assignments])
+
+    "kill tiny basins -> noise"
+    if min_basin_size > 0:
+        unique_labels, counts = torch.unique(cluster_labels, return_counts=True)
+        small_labels = unique_labels[(counts < min_basin_size) & (unique_labels != -1)]
+        if len(small_labels) > 0:
+            mask = torch.isin(cluster_labels, small_labels)
+            cluster_labels[mask] = -1
 
     p_maxima, cluster_sizes = np.unique(cluster_labels, return_counts=True)
     p_maxima = p_maxima[1:]
@@ -2817,3 +2825,65 @@ def augment_dmat(basin_min_batch, ebatch, uma_batch, uma_results, good_inds):
     dmat_augmented[:n_orig, n_orig:] = new_vs_original.T
     dmat_augmented[n_orig:, n_orig:] = new_vs_new
     return dmat_augmented
+
+
+def augment_dmat2(all_new_rdf, ref_rdf, dmat):
+    bins = torch.linspace(0, 10, ref_rdf.shape[-1], device='cuda')
+    # New samples vs. all original samples
+    new_vs_original = torch.stack([
+        compute_rdf_distance(all_new_rdf[ii], ref_rdf, bins.cpu())
+        for ii in range(all_new_rdf.shape[0])
+    ])  # [n, 10k]
+    # New samples vs. each other
+    new_vs_new = torch.stack([
+        compute_rdf_distance(all_new_rdf[ii], all_new_rdf, bins.cpu())
+        for ii in range(all_new_rdf.shape[0])
+    ])  # [n, n]
+    n_orig = dmat.shape[0]
+    n_new = all_new_rdf.shape[0]
+    dmat_augmented = torch.zeros(
+        n_orig + n_new, n_orig + n_new,
+        device=dmat.device, dtype=dmat.dtype
+    )
+    dmat_augmented[:n_orig, :n_orig] = dmat
+    dmat_augmented[n_orig:, :n_orig] = new_vs_original
+    dmat_augmented[:n_orig, n_orig:] = new_vs_original.T
+    dmat_augmented[n_orig:, n_orig:] = new_vs_new
+    return dmat_augmented
+
+
+def clustering2(uma_results, uma_thermos, n_clusters: int, n_keep: int):
+    """Cluster with n_clusters, keep n_keep largest, rest -> noise (-1)."""
+    dmat = uma_results['dmat']
+    density = np.asarray(uma_thermos['density'])
+    dmat_np = dmat.cpu().numpy() if torch.is_tensor(dmat) else np.asarray(dmat)
+    dmat_np = 0.5 * (dmat_np + dmat_np.T)
+    np.fill_diagonal(dmat_np, 0.0)
+    agg = AgglomerativeClustering(
+        n_clusters=n_clusters, metric='precomputed', linkage='average',
+    )
+    raw_labels = agg.fit_predict(dmat_np)
+    # rank clusters by size, keep top n_keep
+    unique_ks, sizes = np.unique(raw_labels, return_counts=True)
+    kept_ks = set(unique_ks[np.argsort(-sizes)[:n_keep]].tolist())
+    # anchor = density-max point within each kept cluster
+    anchor_of_cluster = {
+        k: np.where(raw_labels == k)[0][np.argmax(density[raw_labels == k])]
+        for k in kept_ks
+    }
+    # cluster_labels: anchor idx for kept clusters, -1 for detritus
+    cluster_labels = torch.tensor([
+        anchor_of_cluster[k] if k in kept_ks else -1
+        for k in raw_labels
+    ])
+    # reindex by anchor density
+    p_maxima = np.array(list(anchor_of_cluster.values()))
+    ordered_p_maxima = p_maxima[np.argsort(-density[p_maxima])]
+    label_map = {old.item(): new for new, old in enumerate(ordered_p_maxima, start=1)}
+    label_map[-1] = 0
+    indexed_cluster_labels = torch.tensor(
+        [label_map[l.item()] for l in cluster_labels]
+    ) - 1
+    n_basins = len(ordered_p_maxima)
+    assert torch.all(cluster_labels[p_maxima] == torch.as_tensor(p_maxima))
+    return cluster_labels, indexed_cluster_labels, ordered_p_maxima, n_basins

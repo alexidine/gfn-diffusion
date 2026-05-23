@@ -3,14 +3,20 @@ from copy import copy
 
 import torch
 from ase.io import write
+from tqdm import tqdm
 
 from energy_sampling.eval.paper1_results.figures import parity_fig, dual_energy_marginal_fig, \
     pes_cartoon, plot_dual_density_contour, combo_fig
-from energy_sampling.eval.paper1_results.utils import combo_fig_analysis
+from energy_sampling.eval.paper1_results.utils import combo_fig_analysis, augment_dmat, augment_dmat2, clustering, \
+    clustering2
 from energy_sampling.eval.paper1_results.utils import generator_reward
+from mxtaltools.analysis.crystal_rdf import compute_rdf_distance
 from mxtaltools.common.ase_interface import ase_mol_from_crystaldata
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
+
+torch.cuda.set_per_process_memory_fraction(0.9, device=0)
+
 
 
 def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path):
@@ -26,7 +32,7 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path):
     ebatch = collate_data_list(exp_crystals, max_z_prime=1)
     with torch.no_grad():
         ebatch.cuda()
-        ebatch.analyze(['elj', 'uma', 'rdf'], elementwise=False, atomwise=True, assign_outputs=True,
+        ebatch.analyze(['elj', 'uma', 'rdf'], rdf_mode='atomwise', assign_outputs=True,
                        predictor=predictor)
         ebatch.cpu()
     num_polymorphs = ebatch.num_graphs
@@ -146,12 +152,20 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path):
     fig_dict['elj_staircase'] = elj_staircase
     fig_dict['uma_staircase'] = uma_staircase
 
+    #fig_dict['duo_embedding'] = duo_embedding_fig(ebatch, elj_batch, elj_results, en_scaling_factor, uma_batch, uma_results)
+
+    # todo compute a summary statistic that makes this metric real/meaningful
+    # todo consider then maybe whether to combine these as well
+
     '''Big 'ol combo plot'''
+    cluster_labels, indexed_cluster_labels, p_maxima, n_basins = clustering(uma_results, uma_thermos, max_n_clusters = 6, min_basin_size=100)
+    #cluster_labels, indexed_cluster_labels, p_maxima, n_basins = clustering2(uma_results, uma_thermos, n_clusters=10, n_keep=6)
+
     (basin_colorscale, basin_min_batch, indexed_cluster_labels,
      n_basins, new_min_inds, p_maxima, packing_coeffs, polymorph_basin_index,
      polymorph_colorscale, polymorph_inds, sample_colors, sample_embedding,
      sample_energy, sample_inds, stats) = combo_fig_analysis(
-        ebatch, elj_batch, elj_results, num_polymorphs, uma_batch, uma_results, uma_thermos, 'uma')
+        ebatch, elj_batch, elj_results, num_polymorphs, uma_batch, uma_results, 'uma', cluster_labels, p_maxima, n_basins, indexed_cluster_labels)
 
     fig_dict['cluster_analysis'] = combo_fig(
         num_polymorphs,
@@ -298,6 +312,109 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path):
                         width=fig.layout.width, height=fig.layout.height, scale=scale)
 
     aa = 1
+
+
+def duo_embedding_fig(ebatch, elj_batch, elj_results, en_scaling_factor, uma_batch, uma_results):
+    subsamp = 5000
+    dmat_a = uma_results['dmat'].clone()
+    dmat_b = elj_results['dmat'].clone()
+    rdf_a = uma_batch.rdf.clone()
+    rdf_b = elj_batch.rdf.clone()
+    sample_energy = uma_batch['uma']
+    good_inds = (sample_energy < sample_energy.amin() + 15 * 2.5).argwhere().flatten()
+    rdf_a = rdf_a[good_inds]
+    sample_energy = elj_batch['elj'] * en_scaling_factor
+    good_inds = (sample_energy < sample_energy.amin() + 15 * 2.5).argwhere().flatten()
+    rdf_b = rdf_b[good_inds]
+    rdf_a = rdf_a[:subsamp]
+    rdf_b = rdf_b[:subsamp]
+    dmat_a = dmat_a[:subsamp][:, :subsamp]
+    dmat_b = dmat_b[:subsamp][:, :subsamp]
+    n_a, n_b = dmat_a.shape[0], dmat_b.shape[0]
+    assert dmat_a.shape == (n_a, n_a) and dmat_b.shape == (n_b, n_b)
+    assert rdf_a.shape[0] == n_a and rdf_b.shape[0] == n_b
+    device = 'cuda'
+    dtype = torch.float32
+    bins = torch.linspace(0, 10, rdf_a.shape[-1], device=device)
+    rdf_a = rdf_a.to(device=device, dtype=dtype)
+    rdf_b = rdf_b.to(device=device, dtype=dtype)
+    a_vs_b = torch.empty(n_a, n_b, device=device, dtype=dtype)
+    chunk = 32
+    min_chunk = 1
+    i = 0
+    pbar = tqdm(total=n_a, desc="A vs B")
+    while i < n_a:
+        j = min(i + chunk, n_a)
+        try:
+            a_vs_b[i:j] = compute_rdf_distance(
+                rdf_a[i:j, None],
+                rdf_b[None],
+                bins,
+            )
+            pbar.update(j - i)
+            i = j
+        except torch.cuda.OutOfMemoryError:
+            if chunk <= min_chunk:
+                raise
+            torch.cuda.empty_cache()
+            chunk = max(min_chunk, chunk // 2)
+            pbar.write(f"OOM at chunk={j - i}, reducing to {chunk}")
+    pbar.close()
+    a_vs_b = a_vs_b.to('cpu')
+    merged = torch.empty(
+        n_a + n_b, n_a + n_b,
+        device=dmat_a.device, dtype=dmat_a.dtype,
+    )
+    merged[:n_a, :n_a] = dmat_a
+    merged[n_a:, n_a:] = dmat_b.to(device=dmat_a.device, dtype=dmat_a.dtype)
+    merged[:n_a, n_a:] = a_vs_b
+    merged[n_a:, :n_a] = a_vs_b.T
+    merged = augment_dmat2(ebatch.rdf, torch.cat([rdf_a.cpu(), rdf_b.cpu()], dim=0), merged)
+    polymorph_inds = torch.arange(ebatch.num_graphs) + len(merged) - ebatch.num_graphs
+    import numpy as np
+    from umap import UMAP
+    umap_model = UMAP(n_components=2, n_neighbors=300, min_dist=0.75,
+                      init='spectral', metric='precomputed', low_memory=True,
+                      # densmap=True,
+                      repulsion_strength=2.0,
+                      n_jobs=-1)
+    sample_embedding = umap_model.fit_transform(merged.cpu().numpy().astype(np.float32))
+    import plotly.graph_objects as go
+    uma_embed = sample_embedding[:subsamp]
+    lj_embed = sample_embedding[subsamp:-ebatch.num_graphs]
+    from scipy.stats import gaussian_kde
+    def density_alpha(pts, lo=0.15, hi=0.8, log=False):
+        d = gaussian_kde(pts.T)(pts.T)
+        if log:
+            d = np.log(d + 1e-12)
+        d = (d - d.min()) / (d.max() - d.min() + 1e-12)
+        return lo + (hi - lo) * d
+
+    uma_a = density_alpha(uma_embed)
+    lj_a = density_alpha(lj_embed)
+    uma_colors = [f'rgba(65,105,225,{a:.3f})' for a in uma_a]
+    lj_colors = [f'rgba(220,20,60,{a:.3f})' for a in lj_a]
+    fig = go.Figure()
+    fig.add_scatter(x=uma_embed[:, 0], y=uma_embed[:, 1], mode='markers', name='UMA', marker_color=uma_colors)
+    fig.add_scatter(x=lj_embed[:, 0], y=lj_embed[:, 1], mode='markers', name='LJ', marker_color=lj_colors)
+    fig.add_scatter(x=sample_embedding[polymorph_inds, 0], y=sample_embedding[polymorph_inds, 1],
+                    mode='markers',
+                    marker_symbol='x-thin',
+                    marker_color='black',
+                    marker_line_color='black',
+                    marker_line_width=8,
+                    marker_size=28,
+                    opacity=1.0,
+                    showlegend=False)
+    fig.update_xaxes(showgrid=False, showticklabels=False)
+    fig.update_yaxes(showgrid=False, showticklabels=False)
+    fig.update_layout(
+        xaxis1_title='CV1', yaxis1_title='CV2',
+        font_size=20,
+        plot_bgcolor='white',
+        paper_bgcolor='white'
+    )
+    return fig
 
 
 if __name__ == '__main__':

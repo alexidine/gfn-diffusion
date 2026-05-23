@@ -1462,7 +1462,7 @@ def combo_fig(num_polymorphs,
 
     # Build subplot_titles aligned to the specs grid
 
-    basin_positions, fig = make_specs_fig(n_basins)
+    basin_positions, fig, total_cols = make_specs_fig(n_basins)
 
     "embedding fig"
     point_size = ((uma_thermos['density'] / np.amax(uma_thermos['density'])) * 60).clip(min=8)
@@ -1509,28 +1509,32 @@ def combo_fig(num_polymorphs,
     #         font=dict(size=11),
     #     ),
     # )
-    # Get the domains of the top-left and bottom-left subplots of your 2x2 grid
-    y_top = fig.layout.yaxis2.domain[1]  # top of top-row subplot
-    y_bot = fig.layout.yaxis4.domain[0]  # bottom of bottom-row subplot
-    x_left = fig.layout.xaxis2.domain[0]  # left edge of left-column subplots
+    last_col = total_cols  # 4 or 5
 
+    top_left_basin = fig.get_subplot(1, 3)
+    bot_left_basin = fig.get_subplot(2, 3)
+    bot_right_basin = fig.get_subplot(2, last_col)
+
+    y_top = top_left_basin.yaxis.domain[1]
+    y_bot = bot_left_basin.yaxis.domain[0]
+    x_left = top_left_basin.xaxis.domain[0]
+    x_right = bot_right_basin.xaxis.domain[1]
+
+    # y-axis label, centered vertically on basin grid
     fig.add_annotation(
         text="E (kJ/mol)",
         xref="paper", yref="paper",
-        x=x_left - 0.05,  # small offset left of the grid
-        y=(y_top + y_bot) / 2,  # true midpoint of the grid
+        x=x_left - 0.05,
+        y=(y_top + y_bot) / 2,
         showarrow=False,
         textangle=-90,
         font=dict(size=14),
         xanchor="center", yanchor="middle",
     )
 
-    x_left = fig.layout.xaxis5.domain[0]  # left edge of Basin 3 (bottom-left of grid)
-    x_right = fig.layout.xaxis6.domain[1]  # right edge of Basin 4 (bottom-right)
-    y_bot = fig.layout.yaxis5.domain[0]  # bottom of bottom row of grid
-
+    # x-axis label, centered horizontally on bottom row of basins
     fig.add_annotation(
-        text="Packing Coefficient",  # or whatever your x-axis quantity is
+        text="Packing Coefficient",
         xref="paper", yref="paper",
         x=(x_left + x_right) / 2,
         y=y_bot - 0.04,
@@ -1645,7 +1649,7 @@ def make_specs_fig(n_basins):
             vertical_spacing=0.1,
         )
 
-    return basin_positions, fig
+    return basin_positions, fig, total_cols
 
 
 def embedding(fig, marker_font_size, new_min_inds, num_polymorphs, p_maxima, point_size, polymorph_inds, sample_colors,

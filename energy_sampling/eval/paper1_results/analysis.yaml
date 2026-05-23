@@ -10,7 +10,7 @@ base:
   batch_size: 10
   alpha: 2.0
 
-  reload_results: false
+  reload_results: true
   save_results: true
   overwrite_results: true
 

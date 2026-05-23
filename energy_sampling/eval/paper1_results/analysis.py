@@ -51,14 +51,14 @@ def run_analysis(config):
 
     "analyze experimental samples"
     if config.exp_sample_path is not None:
-        if config.energy_function=='uma':
+        if config.energy_function == 'uma':
             pred_path = r"D:\crystal_datasets\esen_s.pt"  # smaller mol crystal model
             predictor = init_uma_crystal_predictor(pred_path, device='cuda')
         elif config.energy_function == 'mace':
             pred_path = r"C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model"
             predictor = load_mace_model(pred_path, device='cuda', dtype=torch.torch.float32)
         else:
-            predictor=None
+            predictor = None
 
         exp_crystals = torch.load(config.exp_sample_path, weights_only=False)
         if hasattr(exp_crystals, 'is_batch'):
@@ -157,6 +157,218 @@ def run_analysis(config):
     fig.show()
     aa = 1
 
+    # for passing top-k samples
+
+    """
+    Cluster a precomputed RDF distance matrix, take the top-N clusters by
+    population, and pull the lowest-energy sample from each.
+    """
+    import numpy as np
+    from sklearn.cluster import AgglomerativeClustering
+    import numpy as np
+    import plotly.graph_objects as go
+    import umap
+
+    def umap_embed(dist_matrix: np.ndarray, n_neighbors: int = 15,
+                   min_dist: float = 0.1, seed: int = 0) -> np.ndarray:
+        reducer = umap.UMAP(
+            n_components=2,
+            metric="precomputed",
+            n_neighbors=n_neighbors,
+            min_dist=min_dist,
+            random_state=seed,
+        )
+        return reducer.fit_transform(dist_matrix)
+
+    def plot_clusters(
+            embedding: np.ndarray,
+            labels: np.ndarray,
+            energies: np.ndarray,
+            reps: list,
+            title: str = "UMAP of RDF distance matrix",
+    ):
+        """
+        embedding : (N, 2) UMAP coords
+        labels    : (N,) cluster assignments
+        energies  : (N,) for hover info
+        reps      : list of dicts from top_cluster_representatives (to mark reps)
+        """
+        rep_ids = {r["cluster_id"] for r in reps}
+        rep_indices = {r["rep_index"] for r in reps}
+
+        fig = go.Figure()
+
+        # Background: non-top clusters in grey, single trace
+        bg_mask = ~np.isin(labels, list(rep_ids))
+        if bg_mask.any():
+            fig.add_trace(go.Scatter(
+                x=embedding[bg_mask, 0],
+                y=embedding[bg_mask, 1],
+                mode="markers",
+                marker=dict(size=5, color="lightgrey", opacity=0.5),
+                name="other",
+                hovertext=[f"idx={i}<br>cluster={labels[i]}<br>E={energies[i]:.3f}"
+                           for i in np.where(bg_mask)[0]],
+                hoverinfo="text",
+            ))
+
+        # Top clusters: one trace each so legend toggles work
+        palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+                   "#8c564b", "#e377c2", "#17becf", "#bcbd22", "#7f7f7f"]
+        for k, r in enumerate(reps):
+            cid = r["cluster_id"]
+            mask = labels == cid
+            idxs = np.where(mask)[0]
+            fig.add_trace(go.Scatter(
+                x=embedding[mask, 0],
+                y=embedding[mask, 1],
+                mode="markers",
+                marker=dict(size=7, color=palette[k % len(palette)], opacity=0.85),
+                name=f"cluster {cid} (n={r['size']})",
+                hovertext=[f"idx={i}<br>cluster={cid}<br>E={energies[i]:.3f}"
+                           for i in idxs],
+                hoverinfo="text",
+            ))
+
+        # Reps as a star overlay
+        rep_idx_arr = np.array(sorted(rep_indices))
+        fig.add_trace(go.Scatter(
+            x=embedding[rep_idx_arr, 0],
+            y=embedding[rep_idx_arr, 1],
+            mode="markers",
+            marker=dict(size=16, color="black", symbol="star",
+                        line=dict(width=1, color="white")),
+            name="rep (min-E)",
+            hovertext=[f"REP idx={i}<br>cluster={labels[i]}<br>E={energies[i]:.3f}"
+                       for i in rep_idx_arr],
+            hoverinfo="text",
+        ))
+
+        fig.update_layout(
+            title=title,
+            xaxis_title="UMAP-1",
+            yaxis_title="UMAP-2",
+            template="plotly_white",
+            width=900, height=700,
+            legend=dict(itemsizing="constant"),
+        )
+        return fig
+
+    def top_cluster_representatives(
+            dist_matrix: np.ndarray,
+            energies: np.ndarray,
+            n_clusters: int = 10,
+            top_n: int = 5,
+            linkage: str = "average",
+    ):
+        """
+        Parameters
+        ----------
+        dist_matrix : (N, N) symmetric, zero diagonal, precomputed distances (e.g. RDF-EMD)
+        energies    : (N,) per-sample energies
+        n_clusters  : total clusters to form. Set larger than top_n so the top-N
+                      selection is meaningful; ~2-3x top_n is a reasonable default.
+        top_n       : how many of the largest clusters to return reps for.
+        linkage     : 'average' (default), 'complete', or 'single'.
+
+        Returns
+        -------
+        reps : list of dicts, one per selected cluster, ordered by population (desc).
+               Each dict has: cluster_id, size, rep_index, rep_energy, member_indices.
+        labels : (N,) cluster assignments for all samples.
+        """
+        dist_matrix = np.asarray(dist_matrix)
+        energies = np.asarray(energies)
+        assert dist_matrix.shape[0] == dist_matrix.shape[1] == energies.shape[0]
+
+        clusterer = AgglomerativeClustering(
+            n_clusters=n_clusters,
+            metric="precomputed",
+            linkage=linkage,
+        )
+        labels = clusterer.fit_predict(dist_matrix)
+
+        # Rank clusters by population
+        cluster_ids, counts = np.unique(labels, return_counts=True)
+        order = np.argsort(-counts)
+        top_clusters = cluster_ids[order][:top_n]
+
+        reps = []
+        for cid in top_clusters:
+            members = np.where(labels == cid)[0]
+            rep = members[np.argmin(energies[members])]
+            reps.append({
+                "cluster_id": int(cid),
+                "size": int(members.size),
+                "rep_index": int(rep),
+                "rep_energy": float(energies[rep]),
+                "member_indices": members,
+            })
+
+        return reps, labels
+
+    # --- load your data ---
+    # dist_matrix = np.load("rdf_emd_distances.npy")
+    # energies    = np.load("energies.npy")
+
+    # demo
+    dist_matrix = dmat
+    energies = sample_energy
+
+    reps, labels = top_cluster_representatives(
+        dist_matrix, energies, n_clusters=15, top_n=5
+    )
+
+    print(f"{'rank':>4} {'cid':>4} {'size':>5} {'rep_idx':>8} {'rep_E':>10}")
+    for rank, r in enumerate(reps, 1):
+        print(f"{rank:>4} {r['cluster_id']:>4} {r['size']:>5} "
+              f"{r['rep_index']:>8} {r['rep_energy']:>10.4f}")
+
+    rep_indices = [r["rep_index"] for r in reps]
+
+    emb = umap_embed(dist_matrix, n_neighbors=500, min_dist=0.75)
+    fig = plot_clusters(emb, labels, energies, reps)
+    # fig.write_html("umap_clusters.html")
+    fig.show()
+    anchors = torch.tensor(rep_indices)
+    ss = sample_batch.batch_to_list()
+    expbatch = collate_data_list([ss[ind] for ind in anchors]).to('cuda')
+    opt_config = {
+        "optim_target": "mace",  # lj qlj elj silu ellipsoid classification_score rdf_score rdf_dist latent_dist
+        "enforce_reduced": False,
+        "compression_factor": 0.0,
+        "cutoff": 10,  # can be as low as 6 for SiLU, 10 otherwise
+        "init_lr": 1e-4,
+        "convergence_eps": 1e-8,
+        "optimizer_func": "rprop",  # NOTE rprop is by far the fastest and most reliable
+        "anneal_lr": False,
+        "grad_norm_clip": 0.1,
+        "show_tqdm": True,
+        "max_num_steps": 500,
+        "rdf_warmup": None,
+        "target_packing_coeff": None,
+        "umbrella": False,
+        "umbrella_sigma": 0.25,
+        "umbrella_epsilon": 40.0,
+        'predictor': predictor,
+    }
+    opt_out, opt_record = expbatch.optimize_crystal_parameters(return_record=True, **opt_config)
+    opbatch = collate_data_list(opt_out)
+    opbatch.mol2ucell()
+    opbatch.write_cif(torch.arange(opbatch.num_graphs), 'acrdin_sg14_zp1_low_en_structures', mode='unit cell')
+
+    #
+    # from mxtaltools.common.clustering import greedy_bottom_up_anchors
+    #
+    # anchors = greedy_bottom_up_anchors(sample_batch.latent_params(),
+    #                                    sample_batch.packing_coeff,
+    #                                    sample_energy,
+    #                                    0.5,
+    #                                    sample_energy.amin() + 3)
+    # ss = sample_batch.batch_to_list()
+    # expbatch = collate_data_list([ss[ind] for ind in anchors])
+    # expbatch.mol2ucell()
+    # expbatch.write_cif(torch.arange(expbatch.num_graphs), 'acrdin_sg14_zp1_low_en_structures', mode='unit cell')
 
 
 if __name__ == '__main__':
@@ -170,6 +382,5 @@ if __name__ == '__main__':
 
         print(f"\n=== {config.run_name} ===")
         run_analysis(config)  # whatever your entry point is
-
 
         aa = 1
