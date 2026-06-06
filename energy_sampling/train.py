@@ -1285,7 +1285,8 @@ class Modeller:
         # dataset = [dataset[i] for i in keep_inds]
 
         # todo remove this eventually, hopefully
-        if 'D:' in self.args.buffer_path and self.args.energy_function in ['uma','mace']:  # if we're on local, this takes forever
+        if 'D:' in self.args.buffer_path and self.args.energy_function in ['uma',
+                                                                           'mace']:  # if we're on local, this takes forever
             dataset = dataset[:250]
 
         print("Re-featurizing preloaded buffer samples")
