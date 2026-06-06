@@ -1034,3 +1034,41 @@ def atomic_save(state_dict, path):
         os.replace(tmp_path, path)
     except Exception as e:
         print("Save failed to", path)
+
+
+def get_discretizer(integrator_config):
+    # discretizer = lambda bsz: uniform_discretizer(bsz, self.args.T)
+    # discretizer = lambda bsz: uniform_discretizer(bsz, np.random.randint(10,self.args.T+1))
+    # discretizer = lambda bsz: random_discretizer(bsz, self.args.T, 10)
+    if integrator_config.traj_length_strategy == 'static':
+        traj_length = integrator_config.T
+    elif integrator_config.traj_length_strategy == 'sampled':
+        traj_length = np.random.randint(low=integrator_config.min_traj_length, high=integrator_config.max_traj_length + 1)
+    else:
+        assert False
+
+    if integrator_config.discretizer == 'random':
+        discretizer = lambda bsz: random_discretizer(bsz, traj_length, max_ratio=integrator_config.discretizer_max_ratio)
+    elif integrator_config.discretizer == 'low_discrepancy':
+        integrator_config.discretizer = lambda bsz: low_discrepancy_discretizer(bsz, traj_length)
+    elif integrator_config.discretizer == 'low_discrepancy2':
+        discretizer = lambda bsz: low_discrepancy_discretizer2(bsz, traj_length)
+    elif integrator_config.discretizer == 'equidistant':
+        discretizer = lambda bsz: shifted_equidistant(bsz, traj_length)
+    elif integrator_config.discretizer == 'uniform':
+        discretizer = lambda bsz: uniform_discretizer(bsz, traj_length)
+    else:
+        assert False
+    return discretizer
+
+
+def log_elapsed_times(times):
+    elapsed_times = {}
+    for key in times.keys():
+        if 'start' in key:
+            start_key = key
+            end_key = start_key.split('_start')[0] + '_end'
+            if end_key in times.keys():
+                elapsed_times[start_key.split('_start')[0] + '_time'] = times[end_key] - times[start_key]
+
+    return elapsed_times

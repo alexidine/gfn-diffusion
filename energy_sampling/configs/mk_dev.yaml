@@ -39,13 +39,15 @@ figs_period: 250             # how often to log custom figures EXPENSIVE # must 
 conditional_eval_period: 1000 # DEPRECATED # how often to do conditional evaluation with figs # must be multiple of eval period
 
 # GFlowNet settings
-T: 10                        # static training diffusion length
 eval_T: 10                  # diffusion trajectory length for inference
-min_traj_length: 10
-max_traj_length: 10
-traj_length_strategy: static # 'static'  or 'sampled'  will do random between min and max traj lengths
-discretizer_max_ratio: 15    # maximum ratio between randomly sampled step sizes - needs to be >25 for 15 steps, or 10 for 30 steps to get good coverage at extrema
-discretizer: uniform #'random'        # 'random' 'low_discrepancy' 'equidistant' 'uniform'
+integrator:
+  T: 10                        # static training diffusion length
+  min_traj_length: 10
+  max_traj_length: 10
+  traj_length_strategy: static # 'static'  or 'sampled'  will do random between min and max traj lengths
+  discretizer_max_ratio: 15    # maximum ratio between randomly sampled step sizes - needs to be >25 for 15 steps, or 10 for 30 steps to get good coverage at extrema
+  discretizer: uniform #'random'        # 'random' 'low_discrepancy' 'equidistant' 'uniform'
+
 t_scale: 0.05                 # scales fixed forward policy variance
 log_var_range: 6           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
 pb_drift_range: 0.2          # range of learned backward drift corrections, only for 'brownian_bridge'

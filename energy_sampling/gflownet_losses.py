@@ -163,7 +163,7 @@ def get_gfn_forward_loss(loss_coeffs,
     """TB loss"""
     if loss_coeffs.tb > 0:
         tb_loss = get_tb_loss(log_flow, log_pb, log_pf, log_r,
-                              detach_z = exploration_std>0 if exploration_std is not None else False)
+                              detach_z=exploration_std > 0 if exploration_std is not None else False)
         losses.append(tb_loss * loss_coeffs.tb)
 
     """MLE/TPM loss"""
@@ -410,7 +410,8 @@ def power_saturate(x, power):
     return torch.sign(x) * (torch.abs(x) ** power)
 
 
-def get_tb_loss(log_flow, log_pb, log_pf, log_r, detach_z: Union[bool, torch.Tensor]=False, z_only=False):
+def get_tb_loss(log_flow, log_pb, log_pf, log_r, detach_z: Union[bool, torch.Tensor] = False, z_only=False,
+                beta: float = 10):
     log_reward = log_r.detach()
     if z_only:
         tb = (log_pf.detach() + log_flow - log_pb.detach() - log_reward)
@@ -427,34 +428,34 @@ def get_tb_loss(log_flow, log_pb, log_pf, log_r, detach_z: Union[bool, torch.Ten
         tb = (log_pf + log_flow - log_pb - log_reward)
 
     # tb_loss = F.mse_loss(tb, torch.zeros_like(tb), reduction='none')
-    tb_loss = F.smooth_l1_loss(tb, torch.zeros_like(tb), reduction='none', beta=10)
+    tb_loss = F.smooth_l1_loss(tb, torch.zeros_like(tb), reduction='none', beta=beta)
     return tb_loss
 
 
-def emp_Z(gfn, log_Z, log_flow, repeats):
+def emp_Z(gfn, log_Z, log_flow, repeats, beta: float = 10):
     if gfn.conditional_flow_model:
         emp_z_loss = F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_flow.view(repeats, -1), reduction='none',
-                                      beta=10).view(-1)
+                                      beta=beta).view(-1)
     else:
-        emp_z_loss = F.smooth_l1_loss(log_Z.repeat(len(log_flow)), log_flow, reduction='none', beta=10)
+        emp_z_loss = F.smooth_l1_loss(log_Z.repeat(len(log_flow)), log_flow, reduction='none', beta=beta)
     return emp_z_loss
 
 
-def vg_lme(gfn, log_pb, log_pf, log_r, repeats):
+def vg_lme(gfn, log_pb, log_pf, log_r, repeats, beta: float = 10):
     log_ratio = log_r.detach() + log_pb - log_pf
     if gfn.conditional_flow_model:
         log_Z = torch.logsumexp(log_ratio.view(repeats, -1), dim=0, keepdim=True) - math.log(repeats)
         # vg_loss = (0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2).view(-1)
         vg_loss = F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_ratio.view(repeats, -1), reduction='none',
-                                   beta=10).view(-1)
+                                   beta=beta).view(-1)
     else:
         log_Z = torch.logsumexp(log_ratio, dim=0, keepdim=True) - math.log(repeats)
         # vg_loss = 0.5 * (log_Z - log_ratio) ** 2
-        vg_loss = F.smooth_l1_loss(log_Z.repeat(len(log_ratio)), log_ratio, reduction='none', beta=10)
+        vg_loss = F.smooth_l1_loss(log_Z.repeat(len(log_ratio)), log_ratio, reduction='none', beta=beta)
     return log_Z, vg_loss
 
 
-def vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats):
+def vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats, beta: float = 10):
     assert not (loss_coeffs.vg_lb > 0 and loss_coeffs.vg_lme > 0), \
         "Cannot use both vg_lb and vg_lme simultaneously"
     log_ratio = log_r.detach() + log_pb - log_pf
@@ -462,12 +463,12 @@ def vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats):
         log_Z = log_ratio.view(repeats, -1).mean(dim=0, keepdim=True)
         # vg_loss = (0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2).view(-1)
         vg_loss = F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_ratio.view(repeats, -1), reduction='none',
-                                   beta=10).view(-1)
+                                   beta=beta).view(-1)
 
     else:
         log_Z = log_ratio.mean(dim=0, keepdim=True)
         # vg_loss = 0.5 * (log_Z - log_ratio) ** 2
-        vg_loss = F.smooth_l1_loss(log_Z.repeat(len(log_ratio)), log_ratio, reduction='none', beta=10)
+        vg_loss = F.smooth_l1_loss(log_Z.repeat(len(log_ratio)), log_ratio, reduction='none', beta=beta)
     return log_Z, vg_loss
 
 #

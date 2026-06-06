@@ -25,8 +25,7 @@ from energy_sampling.eval.utils import sample_eval_fwd_trajs
 from energy_sampling.utils import iter_forever, \
     is_cuda_oom, get_annealing_factor, \
     parse_loss_schedules, dict2namespace, update_loss_schedule, \
-    random_discretizer, low_discrepancy_discretizer, low_discrepancy_discretizer2, shifted_equidistant, \
-    noise_buffer, atomic_save
+    noise_buffer, atomic_save, get_discretizer, log_elapsed_times
 from eval.evaluations import adjust_fig_filesize, log_metrics, fwd_figs, bwd_evaluation, analyze_buffer
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 from models import GFN
@@ -41,8 +40,6 @@ from utils import get_train_args, get_gfn_init_state, set_seed, \
 
 class Modeller:
     def __init__(self):
-        self.hit_init_kld = False
-        self.times = {}
         torch.cuda.set_per_process_memory_fraction(0.9, device=0)
         torch.cuda.init()  # create context with the cap already in place
 
@@ -57,15 +54,19 @@ class Modeller:
 
         config = args.__dict__
         config["Experiment"] = "{args.energy}"
+        self.run_name = str(self.args.tag) + '_' + str(self.args.run_name)
+
+        self.times = {}
         self.args = args
         self.device = self.args.device
+        self.grow_buffer = self.args.grow_buffer
+        self.batch_size = self.args.batch_size
+        self.init_train_constants()
+
+    def init_train_constants(self):
         self.increasing_loss_cooldown = 0
         self.lr_warmup_finished = False
-        self.phase = None
-        self.grow_buffer = self.args.grow_buffer
-        if self.args.anchor_fwd_bwd:
-            self.args.fwd_to_bwd_ratio = 1.0E-6
-        self.batch_size = self.args.batch_size
+        self.hit_init_kld = False
         self.phase = 1
         self.fwd_tb_norm = 10000
         self.bwd_tb_norm = 10000
@@ -83,7 +84,8 @@ class Modeller:
         self.step_ind = 0
         self.std_boost_prob = 0
         self.std_boost_var = 0
-        self.run_name = str(self.args.tag) + '_' + str(self.args.run_name)
+        if self.args.anchor_fwd_bwd:
+            self.args.fwd_to_bwd_ratio = 1.0E-6
 
     def train_logic(self, buffer, it):
         do_forward = False
@@ -130,48 +132,12 @@ class Modeller:
             assert False
         return step_type
 
-    def log_elapsed_times(self):
-        elapsed_times = {}
-        for key in self.times.keys():
-            if 'start' in key:
-                start_key = key
-                end_key = start_key.split('_start')[0] + '_end'
-                if end_key in self.times.keys():
-                    elapsed_times[start_key.split('_start')[0] + '_time'] = self.times[end_key] - self.times[start_key]
-
-        return elapsed_times
-
-    def get_discretizer(self):
-        # discretizer = lambda bsz: uniform_discretizer(bsz, self.args.T)
-        # discretizer = lambda bsz: uniform_discretizer(bsz, np.random.randint(10,self.args.T+1))
-        # discretizer = lambda bsz: random_discretizer(bsz, self.args.T, 10)
-        if self.args.traj_length_strategy == 'static':
-            traj_length = self.args.T
-        elif self.args.traj_length_strategy == 'sampled':
-            traj_length = np.random.randint(low=self.args.min_traj_length, high=self.args.max_traj_length + 1)
-        else:
-            assert False
-
-        if self.args.discretizer == 'random':
-            discretizer = lambda bsz: random_discretizer(bsz, traj_length, max_ratio=self.args.discretizer_max_ratio)
-        elif self.args.discretizer == 'low_discrepancy':
-            self.args.discretizer = lambda bsz: low_discrepancy_discretizer(bsz, traj_length)
-        elif self.args.discretizer == 'low_discrepancy2':
-            discretizer = lambda bsz: low_discrepancy_discretizer2(bsz, traj_length)
-        elif self.args.discretizer == 'equidistant':
-            discretizer = lambda bsz: shifted_equidistant(bsz, traj_length)
-        elif self.args.discretizer == 'uniform':
-            discretizer = lambda bsz: uniform_discretizer(bsz, traj_length)
-        else:
-            assert False
-        return discretizer
-
     def increment_batch_size(self, buffer,
                              train_mol_loader, test_mol_loader,
                              batch_growth_increment,
                              step_type,
                              train_iterator, test_iterator):
-        # print("7")
+        # print("7")  % TODO rewrite
         if self.batch_size < self.args.max_batch_size:
             new_batch_size = min(self.args.max_batch_size,
                                  max(self.batch_size + 1, int(self.batch_size * batch_growth_increment)))
@@ -220,6 +186,7 @@ class Modeller:
             return False, None
 
     def ten_step_reporting(self, bwd_loss, bwd_loss_dict, fwd_loss, fwd_loss_dict, metrics, optimizers):
+        # TODO update / turn into a state which can be quickly managed
         metrics.update({'lr_fwd': optimizers['fwd'].param_groups[0]['lr']})
         metrics.update({'lr_bwd': optimizers['bwd'].param_groups[0]['lr']})
         metrics.update({'lr_flow': optimizers['flow'].param_groups[0]['lr']})
@@ -233,7 +200,7 @@ class Modeller:
         metrics['bwd_intercept_err'] = self.bwd_intercept_err
         metrics['bwd_slope_err'] = self.bwd_slope_err
         metrics['Best TB Norm'] = self.best_tb_norm
-        metrics.update(self.log_elapsed_times())
+        metrics.update(log_elapsed_times())
         metrics['Forward Loss'] = fwd_loss
         metrics['Backward Loss'] = bwd_loss
         if fwd_loss_dict is not None:
@@ -243,18 +210,8 @@ class Modeller:
             metrics.update(bwd_loss_dict)
             bwd_loss_dict = None
 
-    def anneal_reward(self, it, temp_annealing_lambda, energy_function):
-        """anneal reward function"""
-        if self.args.anneal_temperature:
-            if self.args.temperature_conditioning:
-                if energy_function.temperature_scaling_factor < 1:
-                    energy_function.temperature_scaling_factor *= temp_annealing_lambda
-            else:
-                if energy_function.temperature > self.args.energy_min_temperature:
-                    energy_function.temperature *= temp_annealing_lambda
 
     def set_loss_coeffs(self, it):
-        """anneal reward function"""
         if it == 0:
             self.fwd_loss_schedule = parse_loss_schedules(self.args.fwd_loss_coeffs)
             self.bwd_loss_schedule = parse_loss_schedules(self.args.bwd_loss_coeffs)
@@ -265,7 +222,7 @@ class Modeller:
         update_loss_schedule(it, self.fwd_loss_schedule, self.args.fwd_loss_coeffs.__dict__)
         update_loss_schedule(it, self.bwd_loss_schedule, self.args.bwd_loss_coeffs.__dict__)
 
-    def get_conditioning_dim(self):
+    def get_conditioning_dim(self):  # TODO rewrite
         conditioning_dim = 0
         if self.args.temperature_conditioning:
             conditioning_dim += 1
@@ -282,7 +239,7 @@ class Modeller:
             conditioning_dim += 1
         return conditioning_dim
 
-    def init_energy_function(self):
+    def init_energy_function(self):  # todo update / simplify
         energy_config = {
             'device': self.device,
             'energy_function': self.args.energy_function,
@@ -309,7 +266,7 @@ class Modeller:
         return energy_function
 
     def init_gfn_model(self, energy_function):
-        reload = False
+        reload = False  # TODO cleanup / unify model state
         if self.args.checkpoint_path is not None:
             reload = True
             reload_path = self.args.checkpoint_path
@@ -434,7 +391,7 @@ class Modeller:
 
         return optimizers, schedulers
 
-    def init_buffers_datasets(self, energy_function):
+    def init_buffers_datasets(self, energy_function):  # TODO update/rewrite
         # load dataset of prebuilt and scored molecular crystals into the buffer
         buffer = CrystalReplayBuffer(
             self.args.buffer_size,
@@ -546,70 +503,6 @@ class Modeller:
             ))
         return mols
 
-    def init_nicotinamide(self, buffer):
-        if len(buffer) > 0:  # ensure same conformer as dataset, where possible
-            atom_coords = buffer.dataset[0].pos
-            atom_types = buffer.dataset[0].z
-        else:
-            atom_coords = torch.tensor([
-                [-2.3940, 1.1116, -0.0088],
-                [1.7614, -1.2284, -0.0034],
-                [-2.4052, -1.1814, 0.0027],
-                [-0.2969, 0.0397, 0.0024],
-                [0.4261, 1.2273, 0.0039],
-                [0.4117, -1.1510, -0.0013],
-                [1.8161, 1.1886, 0.0018],
-                [-1.7494, 0.0472, 0.0045],
-                [2.4302, -0.0535, -0.0018]
-            ], dtype=torch.float32, device='cpu')
-            atom_types = torch.tensor([8, 7, 7, 6, 6, 6, 6, 6, 6], dtype=torch.long, device='cpu')
-        atom_coords -= atom_coords.mean(dim=0)
-        good_mol = MolData(
-            z=atom_types,
-            pos=atom_coords,
-            x=atom_types,
-            do_mol_analysis=True,
-        )
-        return good_mol
-
-    def init_acridine(self, buffer):
-        if len(buffer) > 0:  # ensure same conformer as dataset, where possible
-            if buffer.dataset[0].z_prime > 1:
-                assert False, "not implemented!"
-
-            atom_coords = buffer.dataset[0].pos
-            atom_types = buffer.dataset[0].z
-        else:
-            assert False, "Must load acridine from buffer!"
-        atom_coords -= atom_coords.mean(dim=0)
-        good_mol = MolData(
-            z=atom_types,
-            pos=atom_coords,
-            x=atom_types,
-            do_mol_analysis=True,
-        )
-        return good_mol
-
-    def init_urea(self, buffer):
-        if len(buffer.dataset) > 0:  # ensure same conformer as dataset, where possible
-            atom_coords = buffer.dataset[0].pos
-            atom_types = buffer.dataset[0].z
-        else:
-            atom_coords = torch.tensor([  # stick with urea for just now
-                [-1.3042, - 0.0008, 0.0001],
-                [0.6903, - 1.1479, 0.0001],
-                [0.6888, 1.1489, 0.0001],
-                [- 0.0749, - 0.0001, - 0.0003],
-            ], dtype=torch.float32, device='cpu')
-            atom_types = torch.tensor([8, 7, 7, 6], dtype=torch.long, device='cpu')
-        atom_coords -= atom_coords.mean(0)
-        good_mol = MolData(
-            z=atom_types,
-            pos=atom_coords,
-            x=atom_types,
-            do_mol_analysis=True,
-        )
-        return good_mol
 
     def train(self):
         with (wandb.init(project="GFN Energy",
@@ -632,16 +525,6 @@ class Modeller:
             (buffer, train_mol_loader, test_mol_loader,
              train_iterator, test_iterator) = self.init_buffers_datasets(energy_function)
 
-            # initialize some annealing factors
-            if self.args.temperature_conditioning:
-                temp_annealing_lambda = get_annealing_factor(self.args.temperature_scaling_factor, 1,
-                                                             self.args.temp_annealing_max_steps, 10)
-
-            else:
-                temp_annealing_lambda = get_annealing_factor(self.args.energy_max_temperature,
-                                                             self.args.energy_min_temperature,
-                                                             self.args.temp_annealing_max_steps, 10)
-
             fwd_loss_dict = None
             bwd_loss_dict = None
             oomed_out = False
@@ -649,37 +532,26 @@ class Modeller:
             loss_record = []
 
             self.times['initialization_end'] = time()
-            # print("-1")
-            # print("-0.5")
+
             wandb.watch(gfn_model,
                         log_graph=False,
                         log_freq=1000,
                         log='gradients')  # for gradient logging
-            # print("-0.25")
 
             gfn_model.train()
             self.set_detect_anomaly(gfn_model, do_anomaly_detection=False)
-            # print("0")
             for step_ind in trange(self.step_ind, self.args.epochs + 1):
-                # print("1")
                 metrics = dict()
                 self.step_ind = step_ind
                 if step_ind % 10 == 0:
                     self.set_loss_coeffs(step_ind)
-                # print("2")
-                # exploration_std = get_exploration_std(step_ind,
-                #                                       self.args.exploratory,
-                #                                       self.args.wd_max_steps,
-                #                                       self.args.exploration_factor,
-                #                                       self.args.exploration_wd,
-                #                                       )
+
                 mask = torch.rand(self.batch_size, device=self.device) < self.std_boost_prob
                 exploration_std = torch.where(
                     mask,
                     torch.rand(self.batch_size, device=self.device) * np.log(self.std_boost_var),
                     torch.zeros(self.batch_size, device=self.device),
                 )
-                # print("3")
                 self.times['train_step_start'] = time()
                 try:
                     step_type = self.train_logic(buffer, step_ind)
@@ -746,7 +618,6 @@ class Modeller:
                     loss_record.append(fwd_loss + bwd_loss)
                     metrics['train/expl'] = exploration_std.mean() if exploration_std is not None else 0
                     lr = self.step_lr_schedule(schedulers, optimizers)
-                    self.anneal_reward(step_ind, temp_annealing_lambda, energy_function)
                     self.ten_step_reporting(bwd_loss, bwd_loss_dict, fwd_loss, fwd_loss_dict, metrics, optimizers)
                     loss_record = self.check_loss_explosion(loss_record, gfn_model, ema_model, optimizers)
                     wandb.log(metrics, step=step_ind)
@@ -866,7 +737,7 @@ class Modeller:
         else:
             assert False
 
-        discretizer = self.get_discretizer()
+        discretizer = get_discretizer(self.args.integrator)
 
         optimizers['flow'].zero_grad(set_to_none=True)
         if do_forward:
@@ -1205,19 +1076,7 @@ class Modeller:
             raise e  # will simply raise error if other or if training on CPU
         return oomed_out, buffer, train_mol_loader, test_mol_loader, train_iterator, test_iterator
 
-    def scramble_mol_and_embedding(self, mol_batch):
-        random_rotations = torch.tensor(
-            Rotation.random(num=mol_batch.num_graphs).as_matrix(),
-            device=mol_batch.device, dtype=torch.float32)
-        mol_batch.orient_molecule(mode='std')
-        mol_batch.orient_molecule(mode='random',
-                                  # important that the rotation is applied *from* the standard
-                                  include_inversion=False,
-                                  correct_orientation=True,
-                                  override_random_rotations=random_rotations)
-        mol_batch.embedding = mol_batch.rotate_embedding(random_rotations)
-
-    def add_dataset_to_buffer(self,
+    def add_dataset_to_buffer(self,  # TODO rewrite
                               prior_file, buffer,
                               filter_unbound=True,
                               ):
@@ -1241,7 +1100,7 @@ class Modeller:
 
         return buffer
 
-    def process_anchors(self, buffer, dataset, filter_unbound):
+    def process_anchors(self, buffer, dataset, filter_unbound): # TODO rewrite
         max_z_prime = max([int(elem.z_prime) for elem in dataset])
         assert max_z_prime == max(self.args.z_primes), "Preloaded data max z prime must match model"
 
@@ -1310,7 +1169,7 @@ class Modeller:
         buffer.add_init(dataset)
         print(f"Buffer loaded with {len(dataset)} anchor states")
 
-    def evaluation(self,
+    def evaluation(self,  # TODO major revision
                    gfn_model,
                    step_ind,
                    buffer,
@@ -1389,7 +1248,7 @@ class Modeller:
 
         metrics.update({'Batch Size': self.batch_size})
         metrics.update({'Eval Batch Size': self.args.eval_batch_size})
-        metrics.update(self.log_elapsed_times())
+        metrics.update(log_elapsed_times())
         self.times['eval_wrapup_end'] = time()
 
         self.times['eval_step_end'] = time()
@@ -1412,7 +1271,7 @@ class Modeller:
         #         metrics.update(conditional_metrics)
 
     def grow_noised_buffer(self, buffer, energy_function, log_importance_weight, rewards, alpha: float = 1.0,
-                           eps: float = 1.0e-2, rand_frac: float = 0.5):
+                           eps: float = 1.0e-2, rand_frac: float = 0.5):  # TODO rewrite
         self.times['eval_bwd_noising_start'] = time()
 
         noised_losses = np.array(buffer.noised_losses)
@@ -1468,7 +1327,7 @@ class Modeller:
         self.times['eval_bwd_noising_end'] = time()
 
     def eval_sampling(self, buffer, energy_function, eval_discretizer, gfn_model, test_mol_loader):
-        flow_states_list = []
+        flow_states_list = []  # todo rewrite / consolidate
         eval_samples = []
         log_Z_list = []
         log_Z_lb_list = []
@@ -1484,10 +1343,7 @@ class Modeller:
                 eval_rands = np.random.randint(len(test_mol_loader.dataset), size=self.args.eval_batch_size)
                 mol_batch = collate_data_list([test_mol_loader.dataset[ind] for ind in eval_rands]).to(self.device)
 
-                if not self.args.molecule_conditioning:  # always std orientation if we're not conditioning
-                    mol_batch.orient_molecule(mode='standard')
-                else:  # if we are conditioning, randomly rotate and make sure we catch the embedding
-                    self.scramble_mol_and_embedding(mol_batch)
+                mol_batch.orient_molecule(mode='standard')
 
                 init_state = get_gfn_init_state(self.args.eval_batch_size,
                                                 energy_function.data_ndim,
@@ -1547,7 +1403,7 @@ class Modeller:
         sample_batch = collate_data_list(eval_samples, skip_default_exclusion=True)
         return flow_states, gauss_params_f, log_T_tensor, log_Z, log_Z_lb, log_Z_learned, log_pbs, log_pfs, log_r, sample_batch
 
-    def manage_prior_anchor(self, step_ind, metrics, gfn_model, ema_model):
+    def manage_prior_anchor(self, step_ind, metrics, gfn_model, ema_model):  # todo rewrite
 
         if self.phase == 1:
             metric = metrics['Max Latent KLD']
@@ -1600,7 +1456,7 @@ class Modeller:
         self.std_boost_prob = self.args.p3_widevar_prob
         self.std_boost_var = self.args.p3_widevar_var
 
-    def save_modeller_state(self):
+    def save_modeller_state(self):  # todo update model state / IO work
         state = dict(
             phase=self.phase,
             fwd_tb_norm=self.fwd_tb_norm,
@@ -1628,7 +1484,7 @@ class Modeller:
         )
         atomic_save(state, f'checkpoints/{self.run_name}_modeller_state.pt')
 
-    def load_modeller_state(self, path):
+    def load_modeller_state(self, path):  # todo update
         if not os.path.exists(path):
             print("No modeller state found; starting fresh.")
             return
