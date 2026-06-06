@@ -152,7 +152,7 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path):
     fig_dict['elj_staircase'] = elj_staircase
     fig_dict['uma_staircase'] = uma_staircase
 
-    #fig_dict['duo_embedding'] = duo_embedding_fig(ebatch, elj_batch, elj_results, en_scaling_factor, uma_batch, uma_results)
+    fig_dict['duo_embedding'] = duo_embedding_fig(ebatch, elj_batch, elj_results, en_scaling_factor, uma_batch, uma_results)
 
     # todo compute a summary statistic that makes this metric real/meaningful
     # todo consider then maybe whether to combine these as well
@@ -397,7 +397,10 @@ def duo_embedding_fig(ebatch, elj_batch, elj_results, en_scaling_factor, uma_bat
     fig = go.Figure()
     fig.add_scatter(x=uma_embed[:, 0], y=uma_embed[:, 1], mode='markers', name='UMA', marker_color=uma_colors)
     fig.add_scatter(x=lj_embed[:, 0], y=lj_embed[:, 1], mode='markers', name='LJ', marker_color=lj_colors)
-    fig.add_scatter(x=sample_embedding[polymorph_inds, 0], y=sample_embedding[polymorph_inds, 1],
+    poly_x = np.atleast_1d(sample_embedding[polymorph_inds, 0])
+    poly_y = np.atleast_1d(sample_embedding[polymorph_inds, 1])
+
+    fig.add_scatter(x=poly_x, y=poly_y,
                     mode='markers',
                     marker_symbol='x-thin',
                     marker_color='black',
@@ -406,6 +409,7 @@ def duo_embedding_fig(ebatch, elj_batch, elj_results, en_scaling_factor, uma_bat
                     marker_size=28,
                     opacity=1.0,
                     showlegend=False)
+
     fig.update_xaxes(showgrid=False, showticklabels=False)
     fig.update_yaxes(showgrid=False, showticklabels=False)
     fig.update_layout(

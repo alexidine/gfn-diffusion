@@ -6,7 +6,7 @@ import torch
 
 from energy_sampling.eval.paper1_results.figures import combo_fig
 from energy_sampling.eval.paper1_results.utils import sample_and_analyze, \
-    dmat_local_analysis, combo_fig_analysis
+    dmat_local_analysis, combo_fig_analysis, clustering
 from energy_sampling.utils import load_yaml, dict2namespace
 from mxtaltools.analysis.crystal_rdf import compute_rdf_distance, compute_rdf_distmat
 from mxtaltools.dataset_utils.utils import collate_data_list
@@ -123,16 +123,23 @@ def run_analysis(config):
                          'd_cuts': d_cuts,
                          }, )
 
-    torch.save(results_dict, results_path)
+    if config.save_results:
+        if os.path.exists(results_path):
+            if config.overwrite_results:
+                torch.save(results_dict, results_path)
+        else:
+            torch.save(results_dict, results_path)
+
     aa = 1
 
     thermos = results_dict['metrics'][0]
+    cluster_labels, indexed_cluster_labels, p_maxima, n_basins = clustering(results_dict, thermos, max_n_clusters = 6, min_basin_size=100)
+
     (basin_colorscale, basin_min_batch, indexed_cluster_labels,
      n_basins, new_min_inds, p_maxima, packing_coeffs, polymorph_basin_index,
      polymorph_colorscale, polymorph_inds, sample_colors, sample_embedding,
      sample_energy, sample_inds, stats) = combo_fig_analysis(
-        ebatch, sample_batch, results_dict, len(config.identifiers), sample_batch,
-        results_dict, thermos, config.energy_function, max_n_clusters=5)
+        ebatch, sample_batch, results_dict, ebatch.num_graphs, sample_batch, results_dict, config.energy_function, cluster_labels, p_maxima, n_basins, indexed_cluster_labels)
 
     fig = combo_fig(
         len(config.identifiers),
@@ -355,7 +362,7 @@ def run_analysis(config):
     opt_out, opt_record = expbatch.optimize_crystal_parameters(return_record=True, **opt_config)
     opbatch = collate_data_list(opt_out)
     opbatch.mol2ucell()
-    opbatch.write_cif(torch.arange(opbatch.num_graphs), 'acrdin_sg14_zp1_low_en_structures', mode='unit cell')
+    opbatch.write_cif(torch.arange(opbatch.num_graphs), 'acrdin_sg14_zp1_low_en_structures2', mode='unit cell')
 
     #
     # from mxtaltools.common.clustering import greedy_bottom_up_anchors

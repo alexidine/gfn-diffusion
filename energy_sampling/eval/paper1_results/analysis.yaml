@@ -11,14 +11,15 @@ base:
   alpha: 2.0
 
   reload_results: true
-  save_results: true
-  overwrite_results: true
+  save_results: false
+  overwrite_results: false
 
   data_root: D:\crystal_datasets
   results_dir: D:\crystal_datasets\gfn_results
 
 # Per-run overrides
 runs:
+
   - run_name: acridine_14_1
     energy_function: mace
     sg_ind: 14

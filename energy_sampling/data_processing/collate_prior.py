@@ -161,8 +161,8 @@ if __name__ == '__main__':
     # device = 'cuda'
     # acridine
     search_output_dir = r"D:\crystal_datasets\acridine\prior_chunks"
-    run_name = 'may_acridine_sg14_zp2'
-    identifiers = None #['ACRDIN04', 'ACRDIN12']
+    run_name = 'may_acridine_sg14_zp1'
+    identifiers = ['ACRDIN04', 'ACRDIN12']
     energy_function = 'mace'
     target_path = r"D:\crystal_datasets\acridine\std_acridine_polymorphs.pt"
     uma_model_path = r"D:\crystal_datasets\esen_s.pt"
