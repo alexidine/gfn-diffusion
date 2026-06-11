@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from energy_sampling.utils import gaussian_params
-from mxtaltools.models.modules.components import scalarMLP
+from mxtaltools.models.modules.components import scalarMLP, vectorMLP
 from .architectures import FlowModel, NoneModule, LearnableScalar, TimeEncoding, StateEncoding, PolicyModel
 
 logtwopi = math.log(2 * math.pi)
@@ -17,10 +17,11 @@ class GFN(nn.Module):
                  harmonics_dim: int, t_dim: int, log_var_range: float = 4.,
                  t_scale: float = 1., learned_variance: bool = True,
                  condition_embedding_dim: int = 32,
+                 conditions_type: float = 'vector',
                  clipping: bool = False,
                  gfn_clip: float = 1e4, pb_drift_range: float = 0.1,
                  pb_var_range: float = 0.1,
-                 conditional_flow_model: bool = False,
+                 conditional: bool = False,
                  learn_pb: bool = False, joint_layers: int = 2,
                  dropout: Optional[float] = 0, norm: Optional[str] = None,
                  zero_init: bool = False, device=torch.device('cuda'),
@@ -38,7 +39,7 @@ class GFN(nn.Module):
         self.clipping = clipping
         self.gfn_clip = gfn_clip  # clipping maximum step size
 
-        self.conditional_flow_model = conditional_flow_model
+        self.conditional = conditional
         self.learn_pb = learn_pb
 
         self.joint_layers = joint_layers
@@ -49,43 +50,44 @@ class GFN(nn.Module):
         self.device = device
         self.max_z_prime = max_z_prime
 
-        angs = [False] * 6
-        for zp in range(self.max_z_prime):
-            angs.extend([False, False, False])
-        for zp in range(self.max_z_prime):
-            angs.extend([False, True, True])
-            # phi and r dimensions arein rotational basis
-        self.ang_mask = torch.tensor(angs, device=device)
+        self.get_periodic_dimensions(device)
 
-        self.ang_dim = (self.ang_mask == True).sum().item()
-        self.lin_dim = self.dim - self.ang_dim
-        self.expanded_dim = self.lin_dim + self.ang_dim * 2
+        if self.conditional:  # todo replace with GNN
+            if conditions_type == 'vector':
+                self.conditions_embedding_model = scalarMLP(input_dim=conditions_dim,
+                                                            norm=norm,
+                                                            dropout=dropout,
+                                                            layers=joint_layers,
+                                                            filters=hidden_dim,
+                                                            output_dim=condition_embedding_dim,
+                                                            )
+                self.flow_model = FlowModel(condition_embedding_dim,
+                                            hidden_dim,
+                                            joint_layers,
+                                            norm=norm,
+                                            dropout=dropout,
+                                            )
 
-        if self.conditional_flow_model:
-            self.conditions_embedding_model = scalarMLP(input_dim=conditions_dim,
-                                                        norm=norm,
-                                                        dropout=dropout,
-                                                        layers=joint_layers,
-                                                        filters=hidden_dim,
-                                                        output_dim=condition_embedding_dim,
-                                                        )
-            """  # will return nice o(3) invariant embeddings from vector inputs
-            self.conditions_embedding_model = vectorMLP(input_dim=scalar_conditions_dim,
-                                                        vector_input_dim = vector_conditions_dim,
-                                                        norm=norm,
-                                                        dropout=dropout,
-                                                        layers=joint_layers,
-                                                        filters=hidden_dim,
-                                                        output_dim=condition_embedding_dim,
-                                                        vector_output_dim=0
-                                                        )
-            """
-            self.flow_model = FlowModel(condition_embedding_dim,
-                                        hidden_dim,
-                                        joint_layers,
-                                        norm=norm,
-                                        dropout=dropout,
-                                        )
+            elif conditions_type == 'molecule':
+                # will return nice o(3) invariant embeddings from vector inputs
+                self.conditions_embedding_model = vectorMLP(input_dim=conditions_dim,
+                                                            vector_input_dim=3,
+                                                            norm=norm,
+                                                            dropout=dropout,
+                                                            layers=joint_layers,
+                                                            filters=hidden_dim,
+                                                            output_dim=condition_embedding_dim,
+                                                            vector_output_dim=0
+                                                            )
+                self.flow_model = scalarMLP(input_dim=conditions_dim,
+                                            norm=norm,
+                                            dropout=dropout,
+                                            layers=joint_layers,
+                                            filters=hidden_dim,
+                                            output_dim=1,
+                                            )
+
+
         else:  # we can pass arguments to this (conditions) but nothing will happen
             self.conditions_embedding_model = NoneModule()  # ditto
             self.flow_model = LearnableScalar()  # unified syntax with this instead of nn.Parameter
@@ -106,6 +108,18 @@ class GFN(nn.Module):
 
         self.pb_drift_range = pb_drift_range
         self.pb_var_range = pb_var_range
+
+    def get_periodic_dimensions(self, device):
+        angs = [False] * 6
+        for zp in range(self.max_z_prime):
+            angs.extend([False, False, False])
+        for zp in range(self.max_z_prime):
+            angs.extend([False, True, True])
+            # phi and r dimensions arein rotational basis
+        self.ang_mask = torch.tensor(angs, device=device)
+        self.ang_dim = (self.ang_mask == True).sum().item()
+        self.lin_dim = self.dim - self.ang_dim
+        self.expanded_dim = self.lin_dim + self.ang_dim * 2
 
     def split_params(self, tensor):
         mean, logvar_i = gaussian_params(tensor)

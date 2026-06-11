@@ -516,3 +516,86 @@ class CrystalReplayBuffer:
 
 def collate_fn(data_list):
     return collate_data_list(data_list, exclude_unit_cell=True)
+
+
+class SimpleDataset:
+    """
+    Lightweight, immutable prior dataset.
+
+    Holds a fixed list of PyG graph objects plus precomputed tensors
+    x (latents) and optional scalars y. Supports random sampling of either
+    the raw tensors or collated PyG batches. No add/remove, no ops.
+    """
+
+    def __init__(self,
+                 data_list,
+                 device,
+                 max_z_prime: int = 1,
+                 x_fn=None,
+                 y_fn=None):
+        self.device = device
+        self.max_z_prime = max_z_prime
+        if not isinstance(data_list, list):  # we accidentally loaded a batch
+            print("Loaded a batch into the prior rather than a data list")
+            data_list = data_list.batch_to_list()
+
+        self.dataset = data_list
+
+        # collate once to pull out tensors
+        batch = collate_data_list(self.dataset, max_z_prime=max_z_prime)
+
+        x = batch.latent_params() if x_fn is None else batch[x_fn]
+        self.x = x.detach().to(device)
+        if y_fn is not None:
+            self.y = batch[y_fn]
+        else:
+            self.y = None
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def sample_indices(self, batch_size, replace: Optional[bool] = None):
+        n = len(self)
+        if replace is None:
+            replace = batch_size > n  # auto: only with-replacement when forced
+
+        if replace:
+            return np.random.choice(n, size=batch_size, replace=True)
+
+        # replace=False
+        if batch_size <= n:
+            return np.random.choice(n, size=batch_size, replace=False)
+
+        # batch_size > n but replace requested False:
+        # include every sample once, fill remainder with replacement
+        base = np.arange(n)
+        remainder = np.random.choice(n, size=batch_size - n, replace=True)
+        return np.concatenate([base, remainder])
+
+
+    @torch.no_grad()
+    def sample_tensors(self, batch_size, replace: Optional[bool] = None):
+        inds = torch.as_tensor(self._sample_indices(batch_size, replace),
+                               device=self.device, dtype=torch.long)
+        x = self.x[inds]
+        y = self.y[inds] if self.y is not None else None
+        return x, y
+
+    @torch.no_grad()
+    def sample_graphs(self, batch_size,
+                      replace: Optional[bool] = None,
+                      exclude_keys=('symmetry_operators',)):
+        inds = self._sample_indices(batch_size, replace)
+        batch = collate_data_list([self.dataset[i] for i in inds],
+                                  max_z_prime=self.max_z_prime,
+                                  exclude_keys=list(exclude_keys))
+        return batch
+
+    def loader(self, batch_size, mode: str = 'tensors'):
+        """Infinite random-batch generator. Use next() on it."""
+        assert mode in ('tensors', 'graphs')
+        while True:
+            if mode == 'tensors':
+                yield self.sample_tensors(batch_size)
+            else:
+                yield self.sample_graphs(batch_size)

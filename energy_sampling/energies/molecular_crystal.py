@@ -46,7 +46,6 @@ class MolecularCrystal(BaseSet):
                  max_temperature: float = 10,
                  min_temperature: float = 0.01,
                  density_coeff: float = 0,
-                 temperature_scaling_factor: float = 1,
                  temperature: float = 1.0,
                  temperature_conditioning: bool = False,
                  lj_coeff: float = 1.0,
@@ -73,7 +72,6 @@ class MolecularCrystal(BaseSet):
         self.density_coeff = density_coeff
         self.max_temperature = max_temperature
         self.min_temperature = min_temperature
-        self.temperature_scaling_factor = temperature_scaling_factor
         self.temperature_conditioning = temperature_conditioning
         self.lj_coeff = lj_coeff
         self.bounding_coeff = bounding_coeff
@@ -507,17 +505,7 @@ class MolecularCrystal(BaseSet):
             """
             sample temp range, or a fixed temp, or an override temp
             """
-            if temperature is None:  # sample randomly in log space
-                rands = torch.rand(mol_batch.num_graphs, device=mol_batch.device, dtype=torch.float32)
-
-                log_min = torch.log10(torch.tensor(self.min_temperature, dtype=torch.float32, device=mol_batch.device))
-                log_max = torch.log10(torch.tensor(self.max_temperature, dtype=torch.float32, device=mol_batch.device))
-
-                log_temps = log_min + (log_max - log_min) * rands ** self.temperature_scaling_factor
-                log_T_tensor = log_temps[:, None]
-            else:
-                log_T_tensor = torch.log10(temperature[:, None])
-
+            log_T_tensor = torch.log10(temperature[:, None])
             conds.append(log_T_tensor)
         else:
             log_T_tensor = torch.log10(

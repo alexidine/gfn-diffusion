@@ -67,6 +67,26 @@ def soft_clip(x, cutoff):
     clipped = cutoff + torch.log1p(delta.clip(min=1e-3))  # log1p = log(1 + x), safer numerically
     return torch.where(abs_x <= cutoff, x, sign_x * clipped)
 
+def compute_tb_diagnostics(log_pf, log_pb, log_r, log_flow) -> dict:
+    X_side = log_pf - log_pb
+    Y_side = log_r - log_flow
+    normed_tb_residual = (X_side - Y_side).abs() / torch.maximum(torch.ones_like(Y_side), Y_side.abs())
+    normed_tb_residual = torch.nan_to_num(normed_tb_residual.detach())
+
+    log_weight = log_r + log_pb - log_pf
+    log_Z_lb = log_weight.mean()
+
+    tb_y = (log_flow + log_pf).cpu().detach().numpy()
+    tb_x = (log_r + log_pb).cpu().detach().numpy()
+    m, b = np.polyfit(tb_x, tb_y, 1)
+
+    return {
+        'log_Z_lb': log_Z_lb,
+        'normed_tb': normed_tb_residual.clip(max=normed_tb_residual.quantile(0.95)).mean(),
+        'slope_err': abs(m - 1),
+        'intercept_err': abs(b) / np.std(tb_y),
+        'scatter_err': np.std(tb_x - tb_y),
+    }
 
 def get_gfn_forward_loss(loss_coeffs,
                          initial_state,
@@ -75,7 +95,9 @@ def get_gfn_forward_loss(loss_coeffs,
                          discretizer,
                          mol_batch,
                          log_T_tensor,
-                         exploration_std=None, return_exp=False, condition=None,
+                         exploration_std=None,
+                         return_exp=False,
+                         condition=None,
                          repeats=10,
                          report_losses: bool = False,
 
@@ -84,7 +106,7 @@ def get_gfn_forward_loss(loss_coeffs,
         loss_coeffs.var > 0, loss_coeffs.vg_lb > 0,
         loss_coeffs.vg_lme > 0, loss_coeffs.buffer > 0,
         loss_coeffs.overlap > 0
-    ]):
+    ]): # todo rewrite all this
         condition = condition.repeat(repeats, 1)
         initial_state = initial_state.repeat(repeats, 1)
         reassign_sgs = False
@@ -101,11 +123,7 @@ def get_gfn_forward_loss(loss_coeffs,
         if reassign_sgs:
             mol_batch.sg_ind = sg_inds
 
-    if loss_coeffs.greedy > 0 or loss_coeffs.var > 0 or loss_coeffs.buffer > 0:
-        keep_grads = True
-    else:
-        keep_grads = False
-
+    keep_grads = False
     condition = condition.to(gfn.device)
     log_T_tensor = log_T_tensor.to(gfn.device)
     (states, log_pfs, log_pbs, log_flow) = gfn.get_traj_fwd(initial_state,
@@ -125,23 +143,8 @@ def get_gfn_forward_loss(loss_coeffs,
                                            )
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
-    # del log_pfs, log_pbs
 
     losses = []
-    """greedy loss"""
-    if loss_coeffs.greedy > 0:
-        assert False, "Grads are hard detached in the energy function currently. Greedy training will fail."
-        greedy_loss = -power_saturate(log_r, 0.7)
-        losses.append(greedy_loss * loss_coeffs.greedy)
-
-    if loss_coeffs.reinforce > 0:  # todo maybe do repeats over conditioning here for the weight
-        log_r_det = log_r.detach()
-        centered_log_r = log_r_det - log_r_det.mean()
-        weight = F.softmax(centered_log_r / 10, dim=0) + 1e-2 / len(log_r)
-        weight /= weight.sum()
-        weight *= len(weight)
-        reinforce_loss = -power_saturate(weight * log_pf, 0.7)
-        losses.append(reinforce_loss * loss_coeffs.reinforce)
 
     """VarGrad - lower bound loss"""
     if loss_coeffs.vg_lb > 0:
@@ -165,26 +168,6 @@ def get_gfn_forward_loss(loss_coeffs,
         tb_loss = get_tb_loss(log_flow, log_pb, log_pf, log_r,
                               detach_z=exploration_std > 0 if exploration_std is not None else False)
         losses.append(tb_loss * loss_coeffs.tb)
-
-    """MLE/TPM loss"""
-    if loss_coeffs.mle > 0:
-        mle_loss = -power_saturate(log_pb, 0.7)
-        losses.append(mle_loss * loss_coeffs.mle)
-
-    # """Variance loss"""
-    # if loss_coeffs.var > 0:
-    #     var_loss = fwd_var_loss(gfn, loss_coeffs, repeats, states)
-    #     losses.append(var_loss * loss_coeffs.var)
-    #
-    # """self overlap loss"""
-    # if loss_coeffs.overlap > 0:
-    #     overlap_loss = fwd_overlap_loss(gfn, loss_coeffs, repeats, states)
-    #     losses.append(overlap_loss * loss_coeffs.overlap)
-    #
-    # """Buffer distance loss"""
-    # if loss_coeffs.buffer > 0:
-    #     buffer_loss = fwd_buffer_loss(buffer, gfn, loss_coeffs, states)
-    #     losses.append(buffer_loss * loss_coeffs.buffer)
 
     if loss_coeffs.loss_clip != -1:
         combined_losses = soft_clip(torch.stack(losses), loss_coeffs.loss_clip).mean(dim=0)
@@ -211,16 +194,12 @@ def get_gfn_forward_loss(loss_coeffs,
     log_Z_lb = log_weight.mean()
 
     if report_losses:
-        loss_dict = {}
+        loss_dict = {} # todo reconsider these
         loss_dict['log_Z_lb'] = log_Z_lb
         loss_dict['normed_tb'] = normed_tb_residual.clip(max=normed_tb_residual.quantile(0.95)).mean()
         loss_dict['scatter_err'] = scatter_err
         loss_dict['slope_err'] = slope_err
         loss_dict['intercept_err'] = intercept_err
-        if loss_coeffs.greedy > 0:
-            loss_dict['greedy'] = greedy_loss.mean().detach()
-        if loss_coeffs.reinforce > 0:
-            loss_dict['reinforce'] = reinforce_loss.mean().detach()
         if loss_coeffs.tb > 0:
             loss_dict['tb'] = tb_loss.mean().detach()
         if loss_coeffs.vg_lb > 0:
@@ -229,14 +208,7 @@ def get_gfn_forward_loss(loss_coeffs,
             loss_dict['vg_lme'] = vg_loss.mean().detach()
         if loss_coeffs.emp_z > 0:
             loss_dict['emp_z'] = emp_z_loss.mean().detach()
-        if loss_coeffs.mle > 0:
-            loss_dict['mle'] = mle_loss.mean().detach()
-        # if loss_coeffs.var > 0:
-        #     loss_dict['var'] = var_loss.mean().detach()
-        # if loss_coeffs.overlap > 0:
-        #     loss_dict['overlap'] = overlap_loss.mean().detach()
-        # if loss_coeffs.buffer > 0:
-        #     loss_dict['buffer'] = buffer_loss.mean().detach()
+
     else:
         loss_dict = None
 
@@ -256,7 +228,7 @@ def get_gfn_backward_loss(loss_coeffs,
                           report_losses: bool = False):
     if gfn.conditional_flow_model and any([
         loss_coeffs.vg_lb > 0, loss_coeffs.vg_lme > 0
-    ]):
+    ]):  # todo rewrite
         condition = condition.repeat(repeats, 1)
         samples = samples.repeat(repeats, 1)
         log_r = log_r.repeat(repeats)
@@ -329,7 +301,7 @@ def get_gfn_backward_loss(loss_coeffs,
     scatter_err = np.std(tb_x - tb_y)
 
     if report_losses:
-        loss_dict = {}
+        loss_dict = {} # todo reconsider these
         loss_dict['log_Z_lb'] = log_Z_lb
         loss_dict['normed_tb'] = normed_tb_residual.clip(
             max=normed_tb_residual.quantile(0.95)).mean()  # exclude outliers
