@@ -589,7 +589,7 @@ def substitute_prior(noised_fraction, log_noise_range,
         new_samples = noised_samples
 
     # have to update the rewards if we are using any loss functions that require them
-    log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(
+    crystal_batch, log_T_tensor, sg_inds, zps, condition = energy_function.condition_samples(
         crystal_batch,
         sg_inds=crystal_batch.sg_ind,
         z_primes=crystal_batch.z_prime)
@@ -703,7 +703,7 @@ def calibrate_prior_noise(buffer, energy_function,
     new_samples = noised_samples  # todo confirm right latents / dists
 
     # have to update the rewards if we are using any loss functions that require them
-    log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(
+    crystal_batch, log_T_tensor, sg_inds,zps, condition = energy_function.condition_samples(
         crystal_batch,
         sg_inds=crystal_batch.sg_ind,
         z_primes=crystal_batch.z_prime)
@@ -1036,26 +1036,25 @@ def atomic_save(state_dict, path):
         print("Save failed to", path)
 
 
-def get_discretizer(integrator_config):
+def get_discretizer(int_cfg):
     # discretizer = lambda bsz: uniform_discretizer(bsz, self.args.T)
     # discretizer = lambda bsz: uniform_discretizer(bsz, np.random.randint(10,self.args.T+1))
     # discretizer = lambda bsz: random_discretizer(bsz, self.args.T, 10)
-    if integrator_config.traj_length_strategy == 'static':
-        traj_length = integrator_config.T
-    elif integrator_config.traj_length_strategy == 'sampled':
-        traj_length = np.random.randint(low=integrator_config.min_traj_length, high=integrator_config.max_traj_length + 1)
+    if int_cfg.traj_length_strategy == 'static':
+        traj_length = int_cfg.T
+    elif int_cfg.traj_length_strategy == 'sampled':
+        traj_length = np.random.randint(low=int_cfg.min_traj_length, high=int_cfg.max_traj_length + 1)
     else:
         assert False
-
-    if integrator_config.discretizer == 'random':
-        discretizer = lambda bsz: random_discretizer(bsz, traj_length, max_ratio=integrator_config.discretizer_max_ratio)
-    elif integrator_config.discretizer == 'low_discrepancy':
-        integrator_config.discretizer = lambda bsz: low_discrepancy_discretizer(bsz, traj_length)
-    elif integrator_config.discretizer == 'low_discrepancy2':
+    if int_cfg.discretizer == 'random':
+        discretizer = lambda bsz: random_discretizer(bsz, traj_length, max_ratio=int_cfg.discretizer_max_ratio)
+    elif int_cfg.discretizer == 'low_discrepancy':
+        int_cfg.discretizer = lambda bsz: low_discrepancy_discretizer(bsz, traj_length)
+    elif int_cfg.discretizer == 'low_discrepancy2':
         discretizer = lambda bsz: low_discrepancy_discretizer2(bsz, traj_length)
-    elif integrator_config.discretizer == 'equidistant':
+    elif int_cfg.discretizer == 'equidistant':
         discretizer = lambda bsz: shifted_equidistant(bsz, traj_length)
-    elif integrator_config.discretizer == 'uniform':
+    elif int_cfg.discretizer == 'uniform':
         discretizer = lambda bsz: uniform_discretizer(bsz, traj_length)
     else:
         assert False

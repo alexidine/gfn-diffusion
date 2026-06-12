@@ -147,8 +147,8 @@ def sample_crystals(
 @torch.no_grad()
 def sample_eval_fwd_trajs(initial_state, gfn, discretizer, energy_function, mol_batch,
                           sg_inds=None):
-    log_T_tensor, sg_inds, condition = (
-        energy_function.get_conditioning_tensor(mol_batch, sg_inds=sg_inds, z_primes=mol_batch.z_prime))
+    mol_batch, log_T_tensor, sg_inds, zps, condition = (
+        energy_function.condition_samples(mol_batch, sg_inds=sg_inds, z_primes=mol_batch.z_prime))
 
     condition = condition.to(gfn.device)
 

@@ -32,15 +32,35 @@ ema_decay: 0.95 #0.99  # set to null for no ema
 
 # model parameters
 ################################################################
-zero_init: False
-joint_layers: 4              # number of layers in forward/backward policy models
-hidden_dim: 1024             # dimensionality of hidden layer
-s_emb_dim: 1024               # dimensionality of state embedding
-condition_emb_dim: 1024         # dimensionality of the conditioning embedding
-t_emb_dim: 64                # dimensionality of time embedding
-harmonics_dim: 64            # dimensionality of harmonic embedding
-dropout: 0                    # dropout probability
-norm: layer                   # null, "layer" - DON'T PUT 'batch'
+model:
+  # shared dimensions
+  s_emb_dim: 1024             # dimensionality of state embedding
+  t_dim: 64                   # dimensionality of time embedding
+  harmonics_dim: 64           # dimensionality of harmonic embedding
+  condition_embedding_dim: 1024  # dimensionality of the conditioning embedding
+  # per-sub-model architecture
+  t_hidden_dim: 1024          # time encoder hidden dim
+  s_hidden_dim: 1024          # state encoder hidden dim
+  s_layers: 4                 # state encoder layers
+  policy_hidden_dim: 1024     # forward/backward policy hidden dim
+  policy_layers: 4            # forward/backward policy layers
+  flow_hidden_dim: 1024       # flow model hidden dim
+  flow_layers: 4              # flow model layers
+  cond_hidden_dim: 1024       # conditioning embedding hidden dim
+  cond_layers: 4              # conditioning embedding layers
+  # regularization (shared)
+  dropout: 0                  # dropout probability
+  norm: layer                 # null, "layer" - DON'T PUT 'batch'
+  zero_init: False
+  # sampling / policy params
+  t_scale: 0.05               # scales fixed forward policy variance
+  log_var_range: 6            # controls dynamic range of learned policy variance
+  pb_drift_range: 0.2         # range of learned backward drift corrections
+  pb_var_range: 1             # range of learned backward policy variance
+  learn_pb: true              # whether to learn a correction to the backward policy
+  learned_variance: True      # whether to learn policy variance
+  clipping: true              # clip the maximum step size induced by the policy model
+  gfn_clip: 200.0             # clip value for policy step size
 
 # training params
 ################################################################
@@ -65,13 +85,6 @@ integrator:
   discretizer_max_ratio: 15    # maximum ratio between randomly sampled step sizes - needs to be >25 for 15 steps, or 10 for 30 steps to get good coverage at extrema
   discretizer: uniform #'random'        # 'random' 'low_discrepancy' 'equidistant' 'uniform'
 
-t_scale: 0.05                 # scales fixed forward policy variance
-log_var_range: 6           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
-pb_drift_range: 0.2          # range of learned backward drift corrections, only for 'brownian_bridge'
-pb_var_range: 1             # range of learned backward policy variance
-learn_pb: true               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
-learned_variance: True       # whether to learn policy variance
-
 # set a constant or
 # as a set of line segments [[step, value], [step, value], ...]
 fwd_loss_coeffs:
@@ -94,9 +107,8 @@ both_ways: true             # forward and backward training
 repeats: 2                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
 fwd_to_bwd_ratio: 1          # whether to do forward (>1) or backward (<1) training more often - automatically set to ~0 for anchoring mode
 bwd: false                   # backward training only
-clipping: true  # clip the maximum step size induced by the policy model
-gfn_clip: 200.0  # clip the maximum step size induced by the policy model
 reward_range: null # range of reward values allowed, null to go unrestricted
+bwd_sampling_mode: 'dataset' # source for samples in backward training
 # for controlling 3-phase convergence protocol # todo consolidate / cleanup
 anchor_fwd_bwd: true #true  # whether to do this at all
 min_fwd_bwd_ratio: 0.01

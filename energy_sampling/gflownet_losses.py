@@ -25,9 +25,8 @@ def diagonal_gaussian_log_density(x, mu, sigma):
 
 
 def get_loss_reward(log_T_tensor, log_reward_fn, mol_batch, return_exp, states, no_grad: bool = True):
-    log_temperature = log_T_tensor if log_T_tensor is not None else None
 
-    x_T = states[:, -1]
+    x_T = states[:, -1]  # terminal state
     if no_grad:
         x_T = x_T.detach()
         ctx = torch.no_grad()
@@ -36,10 +35,10 @@ def get_loss_reward(log_T_tensor, log_reward_fn, mol_batch, return_exp, states, 
 
     with ctx:
         if return_exp:
-            log_r, crystal_batch = log_reward_fn(x_T, mol_batch, log_temperature, return_exp)
+            log_r, crystal_batch = log_reward_fn(x_T, mol_batch, log_T_tensor, return_exp)
             crystal_batch = crystal_batch.detach().to('cpu')
         else:
-            log_r = log_reward_fn(states[:, -1], mol_batch, log_temperature, return_exp)
+            log_r = log_reward_fn(states[:, -1], mol_batch, log_T_tensor, return_exp)
             crystal_batch = None
 
     if no_grad:
@@ -100,28 +99,11 @@ def get_gfn_forward_loss(loss_coeffs,
                          condition=None,
                          repeats=10,
                          report_losses: bool = False,
-
                          ):
     if gfn.conditional_flow_model and any([
         loss_coeffs.var > 0, loss_coeffs.vg_lb > 0,
-        loss_coeffs.vg_lme > 0, loss_coeffs.buffer > 0,
-        loss_coeffs.overlap > 0
-    ]): # todo rewrite all this
-        condition = condition.repeat(repeats, 1)
-        initial_state = initial_state.repeat(repeats, 1)
-        reassign_sgs = False
-        log_T_tensor = log_T_tensor.repeat(repeats)
-        if hasattr(mol_batch, 'sg_ind'):
-            sg_inds = mol_batch.sg_ind.repeat(repeats)
-            reassign_sgs = True
-        z_primes = mol_batch.z_prime
-        mol_batch.max_z_prime = int(torch.amax(mol_batch.z_prime))
-        mol_batch.is_well_defined = torch.ones(mol_batch.num_graphs, dtype=bool, device=mol_batch.device)
-        mol_batch = collate_data_list(mol_batch.batch_to_list() * repeats)
-        mol_batch.z_prime = z_primes.repeat(repeats)
-        mol_batch.max_z_prime = int(torch.amax(mol_batch.z_prime))
-        if reassign_sgs:
-            mol_batch.sg_ind = sg_inds
+        loss_coeffs.vg_lme > 0]): # todo rewrite all this
+        assert False, "Rewrite repeats method from sampler"
 
     keep_grads = False
     condition = condition.to(gfn.device)
@@ -130,6 +112,7 @@ def get_gfn_forward_loss(loss_coeffs,
                                                             discretizer,
                                                             exploration_std,
                                                             condition,
+                                                            mol_batch,
                                                             detach_traj=not keep_grads,
                                                             return_gauss_params=False,
                                                             )
@@ -145,11 +128,9 @@ def get_gfn_forward_loss(loss_coeffs,
     log_pb = log_pbs.sum(-1)
 
     losses = []
-
     """VarGrad - lower bound loss"""
     if loss_coeffs.vg_lb > 0:
         log_Z, vg_loss = vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats)
-
         losses.append(vg_loss * loss_coeffs.vg_lb)
 
         """VarGrad - log mean exp loss"""
@@ -177,29 +158,8 @@ def get_gfn_forward_loss(loss_coeffs,
     assert combined_losses.isfinite().all()
     loss = combined_losses.mean()
 
-    X_side = log_pf - log_pb
-    Y_side = log_r - log_flow
-    normed_tb_residual = (X_side - Y_side).abs() / torch.maximum(torch.ones_like(Y_side), Y_side.abs())
-    normed_tb_residual = torch.nan_to_num(normed_tb_residual.detach())
-    log_importance_weight = (Y_side - X_side).detach()
-
-    tb_y = (log_flow + log_pf).cpu().detach().numpy()
-    tb_x = (log_r + log_pb).cpu().detach().numpy()
-    m, b = np.polyfit(tb_x, tb_y, 1)
-    slope_err = abs(m - 1)
-    intercept_err = abs(b) / np.std(tb_y)
-    scatter_err = np.std(tb_x - tb_y)
-
-    log_weight = log_r + log_pb - log_pf
-    log_Z_lb = log_weight.mean()
-
     if report_losses:
-        loss_dict = {} # todo reconsider these
-        loss_dict['log_Z_lb'] = log_Z_lb
-        loss_dict['normed_tb'] = normed_tb_residual.clip(max=normed_tb_residual.quantile(0.95)).mean()
-        loss_dict['scatter_err'] = scatter_err
-        loss_dict['slope_err'] = slope_err
-        loss_dict['intercept_err'] = intercept_err
+        loss_dict = {'log_pf': log_pf, 'lob_pb': log_pb, 'log_Z': log_flow, 'log_r': log_r}
         if loss_coeffs.tb > 0:
             loss_dict['tb'] = tb_loss.mean().detach()
         if loss_coeffs.vg_lb > 0:
@@ -213,9 +173,9 @@ def get_gfn_forward_loss(loss_coeffs,
         loss_dict = None
 
     if return_exp:
-        return loss, crystal_batch.cpu().detach(), loss_dict, log_r, log_importance_weight
+        return loss, crystal_batch.cpu().detach(), loss_dict
     else:
-        return loss, loss_dict, log_r, log_importance_weight
+        return loss, loss_dict
 
 
 def get_gfn_backward_loss(loss_coeffs,
@@ -223,22 +183,19 @@ def get_gfn_backward_loss(loss_coeffs,
                           gfn,
                           log_r,
                           discretizer,
+                          mol_batch,
                           condition=None,
                           repeats=10,
                           report_losses: bool = False):
     if gfn.conditional_flow_model and any([
         loss_coeffs.vg_lb > 0, loss_coeffs.vg_lme > 0
-    ]):  # todo rewrite
-        condition = condition.repeat(repeats, 1)
-        samples = samples.repeat(repeats, 1)
-        log_r = log_r.repeat(repeats)
-        conditional_repeats = True
-    else:
-        conditional_repeats = False
+    ]):
+        assert False, "Rewrite this method"
+    conditional_repeats = False
 
     condition = condition.to(gfn.device)
     states, log_pfs, log_pbs, log_flow = gfn.get_traj_bwd(
-        samples, discretizer, condition, return_gauss_params=False)
+        samples, discretizer, condition, mol_batch, return_gauss_params=False)
 
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
@@ -284,30 +241,8 @@ def get_gfn_backward_loss(loss_coeffs,
         combined_losses = torch.stack(losses).mean(dim=0)
     loss = combined_losses.mean()
 
-    'normed tb reporting'
-    X_side = log_pf - log_pb
-    Y_side = log_r - log_flow
-    normed_tb_residual = (X_side - Y_side).abs() / torch.maximum(torch.ones_like(Y_side), Y_side.abs())
-    normed_tb_residual = torch.nan_to_num(normed_tb_residual.detach())
-
-    log_weight = log_r + log_pb - log_pf
-    log_Z_lb = log_weight.mean()
-
-    tb_y = (log_flow + log_pf).cpu().detach().numpy()
-    tb_x = (log_r + log_pb).cpu().detach().numpy()
-    m, b = np.polyfit(tb_x, tb_y, 1)
-    slope_err = abs(m - 1)
-    intercept_err = abs(b) / np.std(tb_y)
-    scatter_err = np.std(tb_x - tb_y)
-
     if report_losses:
-        loss_dict = {} # todo reconsider these
-        loss_dict['log_Z_lb'] = log_Z_lb
-        loss_dict['normed_tb'] = normed_tb_residual.clip(
-            max=normed_tb_residual.quantile(0.95)).mean()  # exclude outliers
-        loss_dict['scatter_err'] = scatter_err
-        loss_dict['slope_err'] = slope_err
-        loss_dict['intercept_err'] = intercept_err
+        loss_dict = {'log_pf': log_pf, 'lob_pb': log_pb, 'log_Z': log_flow, 'log_r': log_r}
         if loss_coeffs.tb > 0:
             loss_dict['tb'] = tb_loss.mean().detach()
         if loss_coeffs.vg_lb > 0:
@@ -321,7 +256,7 @@ def get_gfn_backward_loss(loss_coeffs,
     else:
         loss_dict = None
 
-    return loss, loss_dict, tb_loss.detach()
+    return loss, loss_dict
 
 
 def terminal_mle(
@@ -376,10 +311,6 @@ def terminal_mle(
 
     else:
         raise ValueError("estimator must be 'bound' or 'exact'")
-
-
-def power_saturate(x, power):
-    return torch.sign(x) * (torch.abs(x) ** power)
 
 
 def get_tb_loss(log_flow, log_pb, log_pf, log_r, detach_z: Union[bool, torch.Tensor] = False, z_only=False,
@@ -442,63 +373,3 @@ def vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats, beta: float = 10):
         # vg_loss = 0.5 * (log_Z - log_ratio) ** 2
         vg_loss = F.smooth_l1_loss(log_Z.repeat(len(log_ratio)), log_ratio, reduction='none', beta=beta)
     return log_Z, vg_loss
-
-#
-# def fwd_buffer_loss(buffer, gfn, loss_coeffs, states):
-#     assert not gfn.conditional_flow_model, "Buffer loss not yet set up for conditional sampling"
-#     states_to_compare = states[:, -1].clip(min=-6, max=6)  # states[:, -1, 3:].clip(min=-6, max=6)
-#     buffer_states = torch.stack(buffer.x_list).to(gfn.device)
-#     buffer_to_compare = buffer_states[:, -1, 3:].clip(min=-6, max=6)
-#     buffer_loss = compute_sample_overlap(
-#         buffer_to_compare,
-#         states_to_compare,  # don't let it escape - it could cheat
-#         ga=loss_coeffs.buffer_gamma,
-#     )
-#     return buffer_loss
-
-#
-# def fwd_var_loss(gfn, loss_coeffs, repeats, states):
-#     states_to_compare = states[:, -1].clip(min=-6, max=6)  # states[:, -1, 3:].clip(min=-6, max=6)
-#     dimwise_var_cutoff = torch.ones(12, device=states.device) * loss_coeffs.var_cutoff
-#     dimwise_var_cutoff[2] /= 5  # be gentle on the c-dimension
-#     if gfn.conditional_flow_model:
-#         states_reshaped = states_to_compare.view(repeats, -1, states_to_compare.shape[-1])
-#
-#         # Compute variance within each condition
-#         batch_var = states_reshaped.var(dim=0)  # (repeats, batch, features)
-#         # penalize any variant dimensions below the minimum value
-#         small_var_loss = F.relu(dimwise_var_cutoff[None, :] - batch_var) / dimwise_var_cutoff[None, :]
-#         large_var_loss = F.relu(batch_var - 16)  # penalize very high variances
-#         var_gap = small_var_loss + large_var_loss
-#         var_loss = ((var_gap ** 2) * F.softmax(var_gap, dim=1)).sum(dim=1, keepdim=True).repeat(1, repeats).view(-1)
-#     else:
-#         batch_var = states_to_compare.var(dim=0)  # (batch, features)
-#         small_var_loss = F.relu(dimwise_var_cutoff - batch_var) / dimwise_var_cutoff
-#         large_var_loss = F.relu(batch_var - 16)
-#         var_gap = small_var_loss + large_var_loss
-#         var_loss = ((var_gap ** 2) * F.softmax(var_gap, dim=0)).sum(dim=0, keepdim=True).repeat(len(states))
-#     return var_loss
-
-#
-# def fwd_overlap_loss(gfn, loss_coeffs, repeats, states):
-#     states_to_compare = states[:, -1].clip(min=-6, max=6)  # states[:, -1, 3:].clip(min=-6, max=6)
-#     if gfn.conditional_flow_model:
-#         states_reshaped = states_to_compare.view(repeats, -1, states_to_compare.shape[-1])
-#
-#         # Compute overlap within each condition
-#         overlap_loss = torch.zeros((len(states) // repeats, repeats), device=states.device)
-#         for i in range(len(overlap_loss)):
-#             condition_states = states_reshaped[:, i]
-#             overlap_loss[i] = compute_sample_overlap(
-#                 condition_states,
-#                 ga=loss_coeffs.var_gamma,
-#                 agg='mean',
-#             )
-#         overlap_loss = overlap_loss.view(-1)
-#     else:
-#         overlap_loss = compute_sample_overlap(
-#             states_to_compare,  # don't let it escape - it could cheat
-#             ga=loss_coeffs.var_gamma,
-#             agg='mean',
-#         )
-#     return overlap_loss

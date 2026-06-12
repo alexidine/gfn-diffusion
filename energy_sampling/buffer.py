@@ -384,7 +384,7 @@ class CrystalReplayBuffer:
         #     sample_batch.orient_molecule(mode='std',
         #                                  correct_orientation=True)
 
-        T_tensor, sg_inds, condition = self.energy_function.get_conditioning_tensor(
+        T_tensor, sg_inds, condition = self.energy_function.condition_samples(
             sample_batch, sg_inds=sample_batch.sg_ind, z_primes=sample_batch.z_prime)
 
         sample_batch.reset_sg_info(sg_inds)
@@ -589,6 +589,7 @@ class SimpleDataset:
         batch = collate_data_list([self.dataset[i] for i in inds],
                                   max_z_prime=self.max_z_prime,
                                   exclude_keys=list(exclude_keys))
+        batch.orient_molecule(mode='std')
         return batch
 
     def loader(self, batch_size, mode: str = 'tensors'):
