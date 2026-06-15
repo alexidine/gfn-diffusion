@@ -589,7 +589,7 @@ def substitute_prior(noised_fraction, log_noise_range,
         new_samples = noised_samples
 
     # have to update the rewards if we are using any loss functions that require them
-    log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(
+    crystal_batch, log_T_tensor, sg_inds, zps, condition = energy_function.condition_samples(
         crystal_batch,
         sg_inds=crystal_batch.sg_ind,
         z_primes=crystal_batch.z_prime)
@@ -703,7 +703,7 @@ def calibrate_prior_noise(buffer, energy_function,
     new_samples = noised_samples  # todo confirm right latents / dists
 
     # have to update the rewards if we are using any loss functions that require them
-    log_T_tensor, sg_inds, condition = energy_function.get_conditioning_tensor(
+    crystal_batch, log_T_tensor, sg_inds,zps, condition = energy_function.condition_samples(
         crystal_batch,
         sg_inds=crystal_batch.sg_ind,
         z_primes=crystal_batch.z_prime)
@@ -800,7 +800,7 @@ def new_calibrate_prior_noise(sample_batch, energy_function,
         noised_batch = adaptive_batched_analysis(
             noised_batch,
             analyses=[energy_function], state = {},
-            initial_batch_size=1000, predictor=predictor,
+            initial_batch_size=100, predictor=predictor,
             device=device,
         )
     new_energy = noised_batch[energy_function]
@@ -1034,3 +1034,40 @@ def atomic_save(state_dict, path):
         os.replace(tmp_path, path)
     except Exception as e:
         print("Save failed to", path)
+
+
+def get_discretizer(int_cfg):
+    # discretizer = lambda bsz: uniform_discretizer(bsz, self.args.T)
+    # discretizer = lambda bsz: uniform_discretizer(bsz, np.random.randint(10,self.args.T+1))
+    # discretizer = lambda bsz: random_discretizer(bsz, self.args.T, 10)
+    if int_cfg.traj_length_strategy == 'static':
+        traj_length = int_cfg.T
+    elif int_cfg.traj_length_strategy == 'sampled':
+        traj_length = np.random.randint(low=int_cfg.min_traj_length, high=int_cfg.max_traj_length + 1)
+    else:
+        assert False
+    if int_cfg.discretizer == 'random':
+        discretizer = lambda bsz: random_discretizer(bsz, traj_length, max_ratio=int_cfg.discretizer_max_ratio)
+    elif int_cfg.discretizer == 'low_discrepancy':
+        int_cfg.discretizer = lambda bsz: low_discrepancy_discretizer(bsz, traj_length)
+    elif int_cfg.discretizer == 'low_discrepancy2':
+        discretizer = lambda bsz: low_discrepancy_discretizer2(bsz, traj_length)
+    elif int_cfg.discretizer == 'equidistant':
+        discretizer = lambda bsz: shifted_equidistant(bsz, traj_length)
+    elif int_cfg.discretizer == 'uniform':
+        discretizer = lambda bsz: uniform_discretizer(bsz, traj_length)
+    else:
+        assert False
+    return discretizer
+
+
+def log_elapsed_times(times):
+    elapsed_times = {}
+    for key in times.keys():
+        if 'start' in key:
+            start_key = key
+            end_key = start_key.split('_start')[0] + '_end'
+            if end_key in times.keys():
+                elapsed_times[start_key.split('_start')[0] + '_time'] = times[end_key] - times[start_key]
+
+    return elapsed_times

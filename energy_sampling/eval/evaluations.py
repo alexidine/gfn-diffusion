@@ -966,7 +966,7 @@ def log_metrics(energy_function,
 
     # this isn't SG conditioned, but that's OK because we're not really using it anymore anyway
     prior_coverage = get_dimwise_coverage(std_params, prior_sample.to('cpu'),
-                                          n_bins=24, cmin=1, tau=1 / args.prior_coverage_ratio)
+                                          n_bins=24, cmin=1, tau=1 / 0.05)
     lattice_features = ['cell_a', 'cell_b', 'cell_c',
                         'cell_alpha', 'cell_beta', 'cell_gamma',
                         'aunit_x', 'aunit_y', 'aunit_z',

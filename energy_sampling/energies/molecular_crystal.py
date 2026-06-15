@@ -46,7 +46,6 @@ class MolecularCrystal(BaseSet):
                  max_temperature: float = 10,
                  min_temperature: float = 0.01,
                  density_coeff: float = 0,
-                 temperature_scaling_factor: float = 1,
                  temperature: float = 1.0,
                  temperature_conditioning: bool = False,
                  lj_coeff: float = 1.0,
@@ -73,7 +72,6 @@ class MolecularCrystal(BaseSet):
         self.density_coeff = density_coeff
         self.max_temperature = max_temperature
         self.min_temperature = min_temperature
-        self.temperature_scaling_factor = temperature_scaling_factor
         self.temperature_conditioning = temperature_conditioning
         self.lj_coeff = lj_coeff
         self.bounding_coeff = bounding_coeff
@@ -209,7 +207,7 @@ class MolecularCrystal(BaseSet):
         elif self.energy_function == 'crystal_multiharmonic':
             crystal_energy = self.crystal_multiharmonic_en(crystal_batch, latents)
 
-        elif self.energy_function in ['lj', 'qlj', 'elj', 'silu', 'uma','mace']:
+        elif self.energy_function in ['lj', 'qlj', 'elj', 'silu', 'uma', 'mace']:
             crystal_energy = self.lj_coeff * mol_energy + self.density_coeff * density_energy + pressure_energy
 
         else:
@@ -371,7 +369,7 @@ class MolecularCrystal(BaseSet):
 
     def batched_analyze_crystal_batch(self, x, mol_batch, temperature, return_batch=False):
         if not hasattr(self, 'batch_size'):
-            if self.energy_function in ['uma','mace']:
+            if self.energy_function in ['uma', 'mace']:
                 self.batch_size = 1000
             else:
                 self.batch_size = 10000
@@ -495,37 +493,23 @@ class MolecularCrystal(BaseSet):
         #
         #     return crystal_batch.zp1_std_cell_parameters()
 
-    def get_conditioning_tensor(self,
-                                mol_batch,
-                                temperature: torch.tensor = None,
-                                sg_inds: torch.tensor = None,
-                                z_primes: torch.tensor = None,
-                                ):
+    def condition_samples(self,
+                          mol_batch,
+                          temperature: torch.tensor = None,
+                          sg_inds: torch.tensor = None,
+                          z_primes: torch.tensor = None,
+                          ):
 
         conds = []  # feedback of zp information is broken
         if self.temperature_conditioning:
             """
             sample temp range, or a fixed temp, or an override temp
             """
-            if temperature is None:  # sample randomly in log space
-                rands = torch.rand(mol_batch.num_graphs, device=mol_batch.device, dtype=torch.float32)
-
-                log_min = torch.log10(torch.tensor(self.min_temperature, dtype=torch.float32, device=mol_batch.device))
-                log_max = torch.log10(torch.tensor(self.max_temperature, dtype=torch.float32, device=mol_batch.device))
-
-                log_temps = log_min + (log_max - log_min) * rands ** self.temperature_scaling_factor
-                log_T_tensor = log_temps[:, None]
-            else:
-                log_T_tensor = torch.log10(temperature[:, None])
-
+            log_T_tensor = torch.log10(temperature[:, None])
             conds.append(log_T_tensor)
         else:
             log_T_tensor = torch.log10(
                 torch.ones((mol_batch.num_graphs, 1), device=mol_batch.device) * self.temperature)
-
-        if self.molecule_conditioning:
-            mol_embedding = mol_batch.embedding.flatten(1, 2)
-            conds.append(mol_embedding)
 
         if sg_inds is not None:
             sg_to_sample = sg_inds.clone()
@@ -533,12 +517,11 @@ class MolecularCrystal(BaseSet):
             sg_to_sample = torch.tensor(np.random.choice(self.space_groups, mol_batch.num_graphs, replace=True)).to(
                 mol_batch.device)
 
-        # if z_primes is not None:
-        #     zp_to_sample = z_primes.clone()
-        # else:  # can't sample z prime here because of issues in the formatting of the cyrstaldata
-        #
-        #     # zp_to_sample = torch.tensor(np.random.choice(self.z_primes, mol_batch.num_graphs, replace=True)).to(
-        #     #     mol_batch.device)
+        if z_primes is not None:
+            zp_to_sample = z_primes.clone()
+        else:
+            zp_to_sample = torch.tensor(np.random.choice(self.z_primes, mol_batch.num_graphs, replace=True)).to(
+                mol_batch.device)
 
         if self.sg_conditioning:
             conds.append(torch.stack([self.SG_FEATURE_TENSOR[sg]
@@ -546,12 +529,15 @@ class MolecularCrystal(BaseSet):
                          )
 
         if self.zp_conditioning:
-            conds.append(z_primes.clone()[:, None].float())
+            conds.append(zp_to_sample.clone()[:, None].float())
 
-        # todo add z prime information to conditioning tensor
+        mol_batch.z_prime = zp_to_sample
+        mol_batch.reset_sg_info(sg_to_sample)
 
-        return (log_T_tensor.flatten(),
+        return (mol_batch,
+                log_T_tensor.flatten(),
                 sg_to_sample,
+                zp_to_sample,
                 torch.cat(conds, dim=1) if len(conds) > 0 else torch.zeros_like(log_T_tensor),
                 )
 

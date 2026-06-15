@@ -2,6 +2,21 @@ run_name: 'mk_dev'
 tag: 'dev'
 seed: 12345
 device: 'cuda'
+cuda_memory_fraction: 0.9
+anomaly_detection: False  # dramatic slowdown when True
+
+# Checkpoints
+################################################################
+continue_from_checkpoint: false
+continue_from_hit_prior: false
+mlip_path: 'D:\crystal_datasets\esen_s.pt' # C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model
+prior_path: null
+molecules_path: null
+test_molecules_path: null
+checkpoint_path: null
+
+#Optimizers
+################################################################
 lr_policy: 5.0e-4              # learning rate of the policy network
 min_lr: 1.0e-5                # ihn
 lr_flow: 1.0                  # learning rate of the flow network
@@ -16,17 +31,39 @@ gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weigh
 ema_decay: 0.95 #0.99  # set to null for no ema
 
 # model parameters
-checkpoint_path: null
-zero_init: False
-joint_layers: 4              # number of layers in forward/backward policy models
-hidden_dim: 1024             # dimensionality of hidden layer
-s_emb_dim: 1024               # dimensionality of state embedding
-condition_emb_dim: 1024         # dimensionality of the conditioning embedding
-t_emb_dim: 64                # dimensionality of time embedding
-harmonics_dim: 64            # dimensionality of harmonic embedding
-dropout: 0                    # dropout probability
-norm: layer                   # null, "layer" - DON'T PUT 'batch'
+################################################################
+model:
+  # shared dimensions
+  s_emb_dim: 1024             # dimensionality of state embedding
+  t_dim: 64                   # dimensionality of time embedding
+  harmonics_dim: 64           # dimensionality of harmonic embedding
+  condition_embedding_dim: 1024  # dimensionality of the conditioning embedding
+  # per-sub-model architecture
+  t_hidden_dim: 1024          # time encoder hidden dim
+  s_hidden_dim: 1024          # state encoder hidden dim
+  s_layers: 4                 # state encoder layers
+  policy_hidden_dim: 1024     # forward/backward policy hidden dim
+  policy_layers: 4            # forward/backward policy layers
+  flow_hidden_dim: 1024       # flow model hidden dim
+  flow_layers: 4              # flow model layers
+  cond_hidden_dim: 1024       # conditioning embedding hidden dim
+  cond_layers: 4              # conditioning embedding layers
+  # regularization (shared)
+  dropout: 0                  # dropout probability
+  norm: layer                 # null, "layer" - DON'T PUT 'batch'
+  zero_init: False
+  # sampling / policy params
+  t_scale: 0.05               # scales fixed forward policy variance
+  log_var_range: 6            # controls dynamic range of learned policy variance
+  pb_drift_range: 0.2         # range of learned backward drift corrections
+  pb_var_range: 1             # range of learned backward policy variance
+  learn_pb: true              # whether to learn a correction to the backward policy
+  learned_variance: True      # whether to learn policy variance
+  clipping: true              # clip the maximum step size induced by the policy model
+  gfn_clip: 200.0             # clip value for policy step size
 
+# training params
+################################################################
 batch_size: 250              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
 max_batch_size: 2000
@@ -36,21 +73,18 @@ eval_num_samples: 1000       # minimum number of samples for evaluation
 epochs: 1000000000             # number of training epochs
 eval_period: 250              # how often to do evaluation & reporting
 figs_period: 250             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
-conditional_eval_period: 1000 # DEPRECATED # how often to do conditional evaluation with figs # must be multiple of eval period
 
-# GFlowNet settings
-T: 10                        # static training diffusion length
+# SDE integration
+################################################################
 eval_T: 10                  # diffusion trajectory length for inference
-min_traj_length: 10
-max_traj_length: 10
-traj_length_strategy: static # 'static'  or 'sampled'  will do random between min and max traj lengths
-discretizer_max_ratio: 15    # maximum ratio between randomly sampled step sizes - needs to be >25 for 15 steps, or 10 for 30 steps to get good coverage at extrema
-discretizer: uniform #'random'        # 'random' 'low_discrepancy' 'equidistant' 'uniform'
-t_scale: 0.05                 # scales fixed forward policy variance
-log_var_range: 6           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
-pb_drift_range: 0.2          # range of learned backward drift corrections, only for 'brownian_bridge'
-pb_var_range: 1             # range of learned backward policy variance
-energy: "molecular_crystal"  # "molecular_crystal"
+integrator:
+  T: 10                        # static training diffusion length
+  min_traj_length: 10
+  max_traj_length: 10
+  traj_length_strategy: static # 'static'  or 'sampled'  will do random between min and max traj lengths
+  discretizer_max_ratio: 15    # maximum ratio between randomly sampled step sizes - needs to be >25 for 15 steps, or 10 for 30 steps to get good coverage at extrema
+  discretizer: uniform #'random'        # 'random' 'low_discrepancy' 'equidistant' 'uniform'
+
 # set a constant or
 # as a set of line segments [[step, value], [step, value], ...]
 fwd_loss_coeffs:
@@ -58,16 +92,6 @@ fwd_loss_coeffs:
   vg_lb: 0.0
   vg_lme: 0  # exclusive with vg_lb
   emp_z: 0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
-  greedy: 0
-  reinforce: 0
-  mle: 0
-  var: 0  # deprecated
-  overlap: 0  # deprecated
-  buffer: 0  # deprecated
-
-  var_cutoff: 0
-  var_gamma: 0
-  buffer_gamma: 0
   loss_clip: 1.0E+9
 bwd_loss_coeffs:
   tb: 1.0 #1.0  # will be altered by bwd_tb_z - must be nonzero for log Z backwards-trained warm start
@@ -76,11 +100,16 @@ bwd_loss_coeffs:
   vg_lme: 0  # exclusive with vg_lb
   emp_z: 0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
   mle: 1.0 # 1.0  # will do weighted MLE if VG is running with repeats, otherwise trajectory-wise
-  noised_fraction: 0.0 # what fraction of bwd samples to be noised
-  noise_level: 0.0 # std dev of noise to be applied
   loss_clip: 1.0E+9
 
-# for controlling 3-phase convergence protocol
+# training style
+both_ways: true             # forward and backward training
+repeats: 2                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
+fwd_to_bwd_ratio: 1          # whether to do forward (>1) or backward (<1) training more often - automatically set to ~0 for anchoring mode
+bwd: false                   # backward training only
+reward_range: null # range of reward values allowed, null to go unrestricted
+bwd_sampling_mode: 'dataset' # source for samples in backward training
+# for controlling 3-phase convergence protocol # todo consolidate / cleanup
 anchor_fwd_bwd: true #true  # whether to do this at all
 min_fwd_bwd_ratio: 0.01
 max_fwd_bwd_ratio: 1.0
@@ -90,89 +119,19 @@ btb_threshold: 1.5 # DEPRECATED ratio of thermalization_conv_eps at which we act
 phase_change_time: 25 #250 #1000  # time to adjust loss coefficients between phases
 thermalization_conv_eps: 5.0 #0.5 # now used only for phase 2 to 3 transition
 init_kld_threshold: 2.0 #0.05
-anchor_noise_fraction: 1.0
-anchor_noise_level: 0.5  # noise level for bwd samples (unused)
-p3_widevar_prob: 0.25
-p3_widevar_var: 0.65  # range 0.5 to 1.0 is a 10x jump, exponential
 
-prior_coverage_ratio: 0.05  # [0, 1] fraction of uniform bin coverage that will satisfy the coverage metric
-both_ways: true             # forward and backward training
-repeats: 2                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
-fwd_to_bwd_ratio: 1          # whether to do forward (>1) or backward (<1) training more often - automatically set to ~0 for anchoring mode
-bwd: false                   # backward training only
-learn_pb: true               # whether to learn a correction to the backward policy in 'brownian_bridge' mode
-learned_variance: True       # whether to learn policy variance
-clipping: true  # clip the maximum step size induced by the policy model
-gfn_clip: 200.0  # clip the maximum step size induced by the policy model
-reward_range: 100 # range of reward values allowed, null to go unrestricted
-
-# dataset settings
+# energy function settings
 ################################################################
-continue_from_checkpoint: false
-continue_from_hit_prior: false
-mlip_path: C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model #'D:\crystal_datasets\esen_s.pt'
-
-buffer_path: D:\crystal_datasets\acridine\may_acridine_sg14_zp1_prior_dataset.pt
-#molecules_path: 'D:/crystal_datasets/train_qm9.pt'
-molecules_path: D:\crystal_datasets\acridine\acridine_conformer.pt #'D:/crystal_datasets/mipcas\MIPCAS_standardized.pt'
-autoencoder_path: null # DEPRECATED 'D:/crystal_datasets/model_checkpoints/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
-#
-#buffer_path: '/scratch/mk8347/csd_runs/datasets/nicotinamide_sg_1_2.pt'
-#molecules_path: '/scratch/mk8347/csd_runs/datasets/nicotinamide.pt'
-#autoencoder_path: '/scratch/mk8347/csd_runs/models/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
-
-
-# replay buffer settings
-# NOTE THESE SETTINGS CURRENTLY UNUSED - BUFFER IS SET TO PRELOADED PRIOR ONLY WITH RANDOM SAMPLING
-################################################################
-beta: 1.0             # reward prioritized replay sampling: high beta = steep prioritization
-rank_weight: 1.0     # rank-based replay sampling: low rank_weight = steep prioritization
-buffer_dist_cutoff: 0.5  # 0.5 a bit loose, 0.75 a bit tight
-prioritized: null #"boltzmann"   # three kinds of replay training: random, reward prioritized (Boltzmann), rank-based
-kT_range: 6
-sampling: "buffer"  # no alternative for right now
-buffer_size: 20000          # size of replay buffer
-grow_buffer: false  # can be toggled on or off in certain training modes
-noised_buffer_length: 20000
-noised_max_steps: 25
-
-
-# exploration controls
-################################################################
-exploratory: False       # adds variance to optionally learned logvars
-exploration_factor: 0.25  # initial exploration std value
-exploration_wd: True  # decay exploration over time
-wd_max_steps: 10000  # number of steps to terminate the added variance
-
-# molecular crystal settings
-################################################################
-molecule: 'xuldud'  # 'nicotinamide' or 'acridine' or 'qm9' for molecule-conditional training
-temperature_conditioning: False  # if false, temperatures are set to energy_static_temperature, and there is no annealing
-molecule_conditioning: False  # MUST be true for molecule='qm9' and false else - conditions the generative prediction on the molecule
-mol_embedding_type: 'autoencoder'  # principal_axes or autoencoderd
+energy_function: 'elj'
+temperature: 2.5 # 2.5 is room temperature kT in kJ/mol
+temperature_conditioning: False  # if false, temperatures are set to temperature, and there is no annealing
+molecule_conditioning: False  # conditions the generative prediction on the molecule
 sg_conditioning: False  # whether to conditionally sample across space groups
 space_groups: [ 14 ]  # which space groups to sample over
 zp_conditioning: false # whether to condition over z prime values
 z_primes: [ 1 ]
-energy_function: 'mace'
-  # 'latent_harmonic' : unimodal harmonic potential in the latent space
-  # 'crystal_harmonic': unimodal harmonic potential in the crystal space
-  # 'latent_multiharmonic': multimodal harmonic potential in the latent space
-  # 'crystal_multiharmonic': multimodal harmonic potential in the crystal space
-  # 'ellipsoid_overlap' : minimize ellipsoid overlaps subject to energy_density_coeff external pressure
-# 'silu' : silu + bounding terms
-# 'lj' : lj + bounding terms
-# 'qlj' : lj with quadratic repulsion
-# 'elj' : lj with exponential repulsion
-# 'uma' : Fairchem UMA potential
-anneal_temperature: False  # scale temperature over time, when conditional it scales the distribution, when not it just decreases from static to min
-temp_annealing_max_steps: 2000  # time for scaling_factor to reach 1 (uniform sampling from min to max)
+# loss coefficients
 energy_density_coeff: 10.0  # how much to weight the density penalty term in the energy function
 bounding_coeff: 10.0
 reduction_coeff: 10.0
 energy_lj_coeff: 1.0  # loss coefficient
-energy_min_temperature: 0.1  # for conditional or annealing
-energy_max_temperature: 10   # for conditional only
-# note for physical potentials i.e., UMA - kT at room temperature is ~2.5
-energy_static_temperature: 2.5 # 2.5 is kT by the way for certain evaluations or static T training. Also initial temperature on unconditional temperature annealing
-temperature_scaling_factor: 0.01  # controls relative frequency of higher vs lower temperatures in conditional training (higher -> higher)

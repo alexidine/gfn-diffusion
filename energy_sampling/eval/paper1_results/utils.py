@@ -2887,3 +2887,71 @@ def clustering2(uma_results, uma_thermos, n_clusters: int, n_keep: int):
     n_basins = len(ordered_p_maxima)
     assert torch.all(cluster_labels[p_maxima] == torch.as_tensor(p_maxima))
     return cluster_labels, indexed_cluster_labels, ordered_p_maxima, n_basins
+
+
+
+def clustering3(uma_results, uma_thermos, max_n_clusters: int, min_basin_size: int):
+    """HDBSCAN basin identification; same I/O as the mean-shift version."""
+
+    "precomputed distance matrix (dense, symmetric, float64)"
+    dmat = uma_results['dmat']
+    d_cuts = uma_results['d_cuts']
+    D = dmat.detach().cpu().numpy().astype(np.float64)
+    D = 0.5 * (D + D.T)
+    np.fill_diagonal(D, 0.0)
+
+    density = np.asarray(uma_thermos['density'])
+    n_samples = D.shape[0]
+
+    "cluster, raising min_cluster_size until we respect max_n_clusters"
+    raw_labels = None
+    for mcs in range(max(min_basin_size, 2), n_samples, 25):
+        clusterer = hdbscan.HDBSCAN(
+            metric='precomputed',
+            min_cluster_size=int(mcs),
+            min_samples=1,
+            cluster_selection_method='leaf',
+            #cluster_selection_epsilon=float(d_cuts[0]),
+            allow_single_cluster=False,
+        )
+        raw_labels = clusterer.fit_predict(D)
+        if len(np.unique(raw_labels[raw_labels != -1])) <= max_n_clusters:
+            break
+    raw_labels = torch.as_tensor(raw_labels, dtype=torch.long)
+
+    "anchor = densest sample in each cluster; relabel members by anchor index"
+    cluster_labels = torch.full((n_samples,), -1, dtype=torch.long)
+    for lab in torch.unique(raw_labels):
+        if lab.item() == -1:
+            continue
+        members = torch.nonzero(raw_labels == lab, as_tuple=False).flatten()
+        anchor = members[np.argmax(density[members.numpy()])].item()
+        cluster_labels[members] = anchor
+
+    "kill tiny basins -> noise"
+    if min_basin_size > 0:
+        unique_labels, counts = torch.unique(cluster_labels, return_counts=True)
+        small_labels = unique_labels[(counts < min_basin_size) & (unique_labels != -1)]
+        if len(small_labels) > 0:
+            mask = torch.isin(cluster_labels, small_labels)
+            cluster_labels[mask] = -1
+
+    p_maxima, cluster_sizes = np.unique(cluster_labels, return_counts=True)
+    p_maxima = p_maxima[1:]
+
+    order = np.argsort(-density[p_maxima])
+    ordered_p_maxima = p_maxima[order]
+
+    label_map = {old.item(): new for new, old in enumerate(ordered_p_maxima, start=1)}
+    label_map.update({-1: 0})
+    indexed_cluster_labels = torch.tensor([label_map[l.item()] for l in cluster_labels])
+    indexed_cluster_labels -= 1
+    num_filtered_samples = len(cluster_labels)
+
+    n_basins = len(np.unique(cluster_labels)) - 1
+
+    assert torch.all(cluster_labels[p_maxima] == p_maxima)
+    assert len(cluster_labels) == num_filtered_samples, "cluster_labels mismatch"
+
+    return cluster_labels, indexed_cluster_labels, ordered_p_maxima, n_basins
+

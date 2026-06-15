@@ -59,7 +59,7 @@
 #                                    max_temperature=args.energy_max_temperature,
 #                                    temperature_scaling_factor=args.temperature_scaling_factor,
 #                                    temperature_conditioning=args.temperature_conditioning,
-#                                    temperature=args.energy_static_temperature,
+#                                    temperature=args.temperature,
 #                                    density_coeff=args.energy_density_coeff,
 #                                    energy_clip=args.energy_clip,
 #                                    lj_coeff=args.energy_lj_coeff,
