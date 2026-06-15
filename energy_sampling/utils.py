@@ -800,7 +800,7 @@ def new_calibrate_prior_noise(sample_batch, energy_function,
         noised_batch = adaptive_batched_analysis(
             noised_batch,
             analyses=[energy_function], state = {},
-            initial_batch_size=1000, predictor=predictor,
+            initial_batch_size=100, predictor=predictor,
             device=device,
         )
     new_energy = noised_batch[energy_function]

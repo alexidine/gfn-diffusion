@@ -160,17 +160,45 @@ if __name__ == '__main__':
     # uma_model_path = r"D:\crystal_datasets\esen_s.pt"
     # device = 'cuda'
     # acridine
+
+    # search_output_dir = r"D:\crystal_datasets\acridine\prior_chunks"
+    # run_name = 'may_acridine_sg14_zp1'
+    # identifiers = ['ACRDIN04', 'ACRDIN12'] # form II and IX
+    # energy_function = 'mace'
+    # target_path = r"D:\crystal_datasets\acridine\std_acridine_polymorphs.pt"
+    # uma_model_path = r"D:\crystal_datasets\esen_s.pt"
+    # mace_model_path = r"C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model"
+    # device = 'cuda'
+
+    # search_output_dir = r"D:\crystal_datasets\acridine\prior_chunks"
+    # run_name = 'may_acridine_sg14_zp2'
+    # identifiers = ['ACRDIN07', 'ACRDIN06'] # form III and form VII
+    # energy_function = 'mace'
+    # target_path = r"D:\crystal_datasets\acridine\std_acridine_polymorphs.pt"
+    # uma_model_path = r"D:\crystal_datasets\esen_s.pt"
+    # mace_model_path = r"C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model"
+    # device = 'cuda'
+
     search_output_dir = r"D:\crystal_datasets\acridine\prior_chunks"
-    run_name = 'may_acridine_sg14_zp1'
-    identifiers = ['ACRDIN04', 'ACRDIN12']
+    run_name = 'may_acridine_sg9_zp2'
+    identifiers = ['ACRDIN05', 'ACRDIN_VIII']  # form VI and form VIII
     energy_function = 'mace'
     target_path = r"D:\crystal_datasets\acridine\std_acridine_polymorphs.pt"
     uma_model_path = r"D:\crystal_datasets\esen_s.pt"
     mace_model_path = r"C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model"
     device = 'cuda'
 
+    # search_output_dir = r"D:\crystal_datasets\acridine\prior_chunks"
+    # run_name = 'may_acridine_sg19_zp3'
+    # identifiers = ['ACRDIN08'] # form IV
+    # energy_function = 'mace'
+    # target_path = r"D:\crystal_datasets\acridine\std_acridine_polymorphs.pt"
+    # uma_model_path = r"D:\crystal_datasets\esen_s.pt"
+    # mace_model_path = r"C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model"
+    # device = 'cuda'
+
     kT = 2.5
-    tot_noised_samples = 200000
+    tot_noised_samples = 50000
     if energy_function == 'uma':
         predictor = init_uma_crystal_predictor(uma_model_path, device)
     elif energy_function == 'mace':
@@ -222,12 +250,14 @@ if __name__ == '__main__':
     confirm that target structures are in the distribution
     """
 
-    #confirm_polymorphs_in_prior()
+    # confirm_polymorphs_in_prior()
 
     """
     preliminary noising
     """
-
+    # DELETE RDFS
+    if hasattr(thinned_batch, 'rdf'):
+        del thinned_batch.rdf
     state = {}
     samples_per_anchor = ((tot_noised_samples - len(noised_samples)) // thinned_batch.num_graphs) + 1
     for _ in tqdm(range(samples_per_anchor)):
@@ -235,7 +265,8 @@ if __name__ == '__main__':
         batch = batch.to(device)
         batch.log_noise_latent_parameters(log_noise_range[0], log_noise_range[1])
         batch, state = adaptive_batched_analysis(
-            batch, analyses=[energy_function, 'reduction_en'],
+            batch,
+            analyses=[energy_function, 'reduction_en'],
             state=state,
             initial_batch_size=10000,
             predictor=predictor,

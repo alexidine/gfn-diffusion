@@ -207,7 +207,7 @@ class MolecularCrystal(BaseSet):
         elif self.energy_function == 'crystal_multiharmonic':
             crystal_energy = self.crystal_multiharmonic_en(crystal_batch, latents)
 
-        elif self.energy_function in ['lj', 'qlj', 'elj', 'silu', 'uma','mace']:
+        elif self.energy_function in ['lj', 'qlj', 'elj', 'silu', 'uma', 'mace']:
             crystal_energy = self.lj_coeff * mol_energy + self.density_coeff * density_energy + pressure_energy
 
         else:
@@ -369,7 +369,7 @@ class MolecularCrystal(BaseSet):
 
     def batched_analyze_crystal_batch(self, x, mol_batch, temperature, return_batch=False):
         if not hasattr(self, 'batch_size'):
-            if self.energy_function in ['uma','mace']:
+            if self.energy_function in ['uma', 'mace']:
                 self.batch_size = 1000
             else:
                 self.batch_size = 10000

@@ -99,8 +99,8 @@ def plot_density_hist(history, nbins=100):
                       title="Density distribution: before vs after flattening")
     return fig
 
-x_eq, hist = equalize_density(latents, d_cut, k=500, target_quantile=0.95,
-                              spawn_frac=0.5, growth_per_pass = 0.1, tol=0.0001,
+x_eq, hist = equalize_density(latents, d_cut, k=3000, target_quantile=0.99,
+                              spawn_frac=0.5, growth_per_pass = 0.01, tol=0.0001,
                               n_passes = 1000, max_factor=20.0)
 plot_density_hist(hist).show()
 
@@ -115,9 +115,11 @@ full_batch.plot_batch_cell_params(space='latent', ref_dist=batch.latent_params()
 full_batch.plot_batch_staircase(space='latent')
 batch.plot_batch_staircase(space='latent')
 
-fin_density = knn_density(full_batch.latent_params(), k=500, d_cut=d_cut, chunk=2048)
+fin_density = knn_density(full_batch.latent_params(), k=3000, d_cut=d_cut, chunk=2048)
 fig = go.Figure(go.Histogram(x=fin_density.cpu().detach().numpy(), nbinsx=100, histnorm='probability density'))
 fig.add_histogram(x=fin_density[:len(data)].cpu().detach().numpy(), nbinsx=100, histnorm='probability density')
+fig.add_histogram(x=hist[0].cpu().detach().numpy(), nbinsx=100, histnorm='probability density')
+fig.add_histogram(x=hist[-1].cpu().detach().numpy(), nbinsx=100, histnorm='probability density')
 fig.show()
 aa = 1
 
