@@ -42,7 +42,7 @@ if __name__ == "__main__":
     ind = 0
     base_path = 'base.yaml'
     for zp, sg in zip(zps, sgs):
-        for efunc in ['mace', 'uma']:
+        for efunc in ['mace']:#, 'uma']:
 
             base, spec_dir = load_yaml(base_path)
             config = deepcopy(base)
@@ -55,7 +55,7 @@ if __name__ == "__main__":
                     'mlip_path'] = r"scratch/mk8347/data/acr_112025_mh1_stagetwo.model"
             elif efunc == 'uma':
                 config['mlip_path'] = r"/scratch/mk8347/models/uma/esen_s.pt"
-                config['buffer_path'] = r"/scratch/mk8347/data/crystal_datasets/acridine/may_acridine_sg14_zp1_prior_dataset_uma.pt"
+            config['buffer_path'] = rf"/scratch/mk8347/data/crystal_datasets/acridine/may_acridine_sg{sg}_zp{zp}_prior_dataset.pt"
             config['tag'] = 'run_1'
             config_path = f"{ind}.yaml"
 
