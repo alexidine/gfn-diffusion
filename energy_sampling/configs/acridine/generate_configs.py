@@ -50,6 +50,8 @@ if __name__ == "__main__":
             run_name = f"{base['run_name']}_{sg}_{zp}"
             config['run_name'] = run_name
             config['energy_function'] = efunc
+            config['z_primes'] = [zp]
+            config['space_groups'] = [sg]
             if efunc == 'mace':
                 config[
                     'mlip_path'] = r"/scratch/mk8347/data/acr_112025_mh1_stagetwo.model"
