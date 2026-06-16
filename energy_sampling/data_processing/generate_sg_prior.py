@@ -1,29 +1,13 @@
 import numpy as np
 import plotly.graph_objects as go
 import torch
+
+from mxtaltools.common.adaptive_batching import adaptive_batched_analysis
+
 torch.cuda.set_per_process_memory_fraction(0.9)
 
 from mxtaltools.dataset_utils.utils import collate_data_list
-dataset_path = r"D:\crystal_datasets\test_new_new_csd.pt"  # todo re-do with full CSD
-space_group = 14
-z_prime = 1
-energy_function = 'elj'
 
-
-data = torch.load(dataset_path,weights_only=False)
-data = [elem for elem in data if (elem.sg_ind == space_group) & (elem.z_prime == z_prime)]
-batch = collate_data_list(data)
-
-batch.analyze([energy_function], assign_outputs=True)
-
-latents = batch.latent_params()
-
-sample_dmat = torch.cdist(latents[:1000], latents[:1000])
-
-d_cut = sample_dmat.flatten().quantile(0.15)
-
-# sample_dmat.fill_diagonal_(torch.inf)
-# density = torch.exp(-sample_dmat**2/(2*d_cut**2)).sum(dim=-1)
 
 @torch.no_grad()
 def knn_density(x, k=50, d_cut=1.0, chunk=2048):
@@ -32,12 +16,14 @@ def knn_density(x, k=50, d_cut=1.0, chunk=2048):
     density = torch.empty(N, device=x.device)
     inv2s2 = 1.0 / (2 * d_cut ** 2)
     for i in range(0, N, chunk):
-        d = torch.cdist(x[i:i + chunk], x)                       # (b, N)
+        d = torch.cdist(x[i:i + chunk], x)  # (b, N)
         # k+1 smallest includes self at distance 0 -> drop column 0.
         # Robust at chunk boundaries (no fill_diagonal_ bookkeeping needed).
         knn = d.topk(k + 1, dim=-1, largest=False).values[:, 1:]  # (b, k)
         density[i:i + chunk] = torch.exp(-(knn ** 2) * inv2s2).sum(-1)
     return density
+
+
 @torch.no_grad()
 def equalize_density(latents, d_cut, k=500, target_quantile=0.95,
                      spawn_frac=0.5, growth_per_pass=0.1,
@@ -46,31 +32,34 @@ def equalize_density(latents, d_cut, k=500, target_quantile=0.95,
     x = latents.clone().float()
     if torch.cuda.is_available():
         x = x.cuda()
-    d_cut = float(d_cut); D = x.shape[1]
+    d_cut = float(d_cut);
+    D = x.shape[1]
     sigma_spawn = spawn_frac * d_cut / (D ** 0.5)
     N0 = x.shape[0]
-    anchors = torch.arange(N0, device=x.device)        # parents are ONLY the originals
+    anchors = torch.arange(N0, device=x.device)  # parents are ONLY the originals
     max_total = int(max_factor * N0)
 
     density = knn_density(x, k=k, d_cut=d_cut, chunk=chunk)
     target = density.quantile(target_quantile)
-    history = [density[:N0].cpu()]                       # track originals only
+    history = [density[:N0].cpu()]  # track originals only
     if verbose:
         d0 = density[:N0]
-        print(f"pass  0  N={x.shape[0]:>7d}  CV0={ (d0.std()/d0.mean()):.4f}  "
+        print(f"pass  0  N={x.shape[0]:>7d}  CV0={(d0.std() / d0.mean()):.4f}  "
               f"mean0={d0.mean():.1f}  min0={d0.min():.1f}  target={target:.1f}")
 
     for p in range(1, n_passes):
-        d0 = density[:N0]                                # deficit on anchors only
+        d0 = density[:N0]  # deficit on anchors only
         deficit = (target - d0).clamp(min=0.0)
         if deficit.sum() == 0:
-            print("anchors all filled"); break
+            print("anchors all filled");
+            break
         budget = min(int(growth_per_pass * x.shape[0]), max_total - x.shape[0])
         if budget <= 0:
-            print("hit growth cap"); break
+            print("hit growth cap");
+            break
 
         parent_idx = anchors[torch.multinomial(deficit, budget, replacement=True)]
-        children   = x[parent_idx] + sigma_spawn * torch.randn(budget, D, device=x.device)
+        children = x[parent_idx] + sigma_spawn * torch.randn(budget, D, device=x.device)
         children = children.clip(-1, 1)
         x = torch.cat([x, children], dim=0)
 
@@ -86,6 +75,7 @@ def equalize_density(latents, d_cut, k=500, target_quantile=0.95,
 
     return x.cpu(), history
 
+
 def plot_density_hist(history, nbins=100):
     fig = go.Figure()
     fig.add_trace(go.Histogram(x=history[0].numpy(), nbinsx=nbins,
@@ -99,9 +89,29 @@ def plot_density_hist(history, nbins=100):
                       title="Density distribution: before vs after flattening")
     return fig
 
+
+dataset_path = r"D:\crystal_datasets\test_new_prot_csd.pt"  # todo re-do with full CSD
+space_group = 14
+z_prime = 1
+energy_function = 'elj'
+predictor = None
+device = 'cuda'
+
+data = torch.load(dataset_path, weights_only=False)
+data = [elem for elem in data if (elem.sg_ind == space_group) & (elem.z_prime == z_prime)]
+batch = collate_data_list(data)
+
+batch.analyze([energy_function], assign_outputs=True)
+
+latents = batch.latent_params()
+
+sample_dmat = torch.cdist(latents[:1000], latents[:1000])
+
+d_cut = sample_dmat.flatten().quantile(0.15)
+
 x_eq, hist = equalize_density(latents, d_cut, k=3000, target_quantile=0.99,
-                              spawn_frac=0.5, growth_per_pass = 0.01, tol=0.0001,
-                              n_passes = 1000, max_factor=20.0)
+                              spawn_frac=0.1, growth_per_pass=0.01, tol=0.0001,
+                              n_passes=1000, max_factor=20.0)
 plot_density_hist(hist).show()
 
 samps = np.random.choice(len(data), len(x_eq), replace=True)
@@ -111,15 +121,62 @@ full_batch.latent_to_cell_params(x_eq, skip_box_analysis=False, skip_enforce_cry
 reduction = full_batch.compute_cell_reduction_penalty()
 good_inds = torch.argwhere(reduction < 0.01).flatten()
 full_batch = collate_data_list([full_data[ind] for ind in good_inds])
-full_batch.plot_batch_cell_params(space='latent', ref_dist=batch.latent_params())
-full_batch.plot_batch_staircase(space='latent')
-batch.plot_batch_staircase(space='latent')
+# full_batch.plot_batch_cell_params(space='latent', ref_dist=batch.latent_params())
+# full_batch.plot_batch_staircase(space='latent')
+# batch.plot_batch_staircase(space='latent')
 
 fin_density = knn_density(full_batch.latent_params(), k=3000, d_cut=d_cut, chunk=2048)
 fig = go.Figure(go.Histogram(x=fin_density.cpu().detach().numpy(), nbinsx=100, histnorm='probability density'))
 fig.add_histogram(x=fin_density[:len(data)].cpu().detach().numpy(), nbinsx=100, histnorm='probability density')
 fig.add_histogram(x=hist[0].cpu().detach().numpy(), nbinsx=100, histnorm='probability density')
 fig.add_histogram(x=hist[-1].cpu().detach().numpy(), nbinsx=100, histnorm='probability density')
+fig.update_layout(barmode="overlay")
 fig.show()
+
+
+state = {}
+batch = batch.to(device)
+batch, state = adaptive_batched_analysis(
+    batch,
+    analyses=[energy_function, 'reduction_en'],
+    state=state,
+    initial_batch_size=10000,
+    predictor=predictor,
+    return_state=True,
+    device=device,
+    show_tqdm=False,
+)
+batch = batch.to('cpu')
+
+full_batch = full_batch.to(device)
+full_batch, state = adaptive_batched_analysis(
+    full_batch,
+    analyses=[energy_function, 'reduction_en'],
+    state=state,
+    initial_batch_size=10000,
+    predictor=predictor,
+    return_state=True,
+    device=device,
+    show_tqdm=False,
+)
+full_batch = full_batch.to('cpu')
+
+dataset_dict = {
+    'prior': batch,
+    'equalized_prior': full_batch,
+}
+torch.save(dataset_dict, f"D:\crystal_datasets\conditional\priors/{space_group}_{z_prime}_{energy_function}.pt")
+
+"""save some small molecules"""
+data = torch.load(dataset_path, weights_only=False)
+good_elems = torch.tensor([
+    1, 6, 7, 8, 9, 16, 17, 35, 53
+], dtype=torch.long)
+data = [elem for elem in data if (
+(elem.num_atoms < 50) & (torch.isin(elem.z, good_elems).all())
+)]
+batch = collate_data_list(data)
+torch.save(batch, f"D:\crystal_datasets\conditional/test_mols_1.pt")
 aa = 1
+
 

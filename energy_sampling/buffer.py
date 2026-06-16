@@ -554,7 +554,7 @@ class SimpleDataset:
     def __len__(self):
         return len(self.dataset)
 
-    def sample_indices(self, batch_size, replace: Optional[bool] = None):
+    def _sample_indices(self, batch_size, replace: Optional[bool] = None):
         n = len(self)
         if replace is None:
             replace = batch_size > n  # auto: only with-replacement when forced
@@ -584,7 +584,7 @@ class SimpleDataset:
     @torch.no_grad()
     def sample_graphs(self, batch_size,
                       replace: Optional[bool] = None,
-                      exclude_keys=('symmetry_operators',)):
+                      exclude_keys=('symmetry_operators','smiles','identifier')):
         inds = self._sample_indices(batch_size, replace)
         batch = collate_data_list([self.dataset[i] for i in inds],
                                   max_z_prime=self.max_z_prime,

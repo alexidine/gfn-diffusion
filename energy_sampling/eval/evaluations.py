@@ -1,4 +1,5 @@
 import os
+from collections import defaultdict
 from typing import Optional
 
 import numpy as np
@@ -18,7 +19,7 @@ from skimage.segmentation import watershed
 from umap import UMAP
 
 from energy_sampling.eval.utils import sample_eval_fwd_trajs, get_plotly_fig_size_mb
-from energy_sampling.utils import logmeanexp, sample_crystal_prior
+from energy_sampling.utils import logmeanexp, sample_crystal_prior, quick_tb_stats
 from mxtaltools.common.utils import get_point_density, log_rescale_positive
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.reporting.figures import log_crystal_samples
@@ -682,63 +683,25 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
 
 
 @torch.no_grad()
-def bwd_evaluation(log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, b_log_r,
-                   b_packing_coeff, log_importance_weight,
-                   do_figs: Optional[bool] = False):
-    metrics = {}
-    fig_dict = {}
-    metrics['Mean Bwd F Drift'] = b_means_f.abs().mean().item()
-    metrics['Mean Bwd B Drift'] = b_means_b.abs().mean().item()
-    metrics['Mean Bwd F Var'] = b_vars_f.mean().item()
-    metrics['Mean Bwd B Var'] = b_vars_b.mean().item()
+def bwd_evaluation(bwd_stats, log_importance_weight, do_figs=False):
+    metrics, fig_dict = {}, {}
 
-    tb_x = log_z.cpu() + b_log_pfs.sum(-1).cpu()
-    tb_y = b_log_r.cpu() + b_log_pbs.sum(-1).cpu()
-    high_cut, low_cut = torch.quantile(b_log_r, 0.99), torch.quantile(b_log_r, 0.01)
-    good_inds = ((high_cut >= b_log_r) * (b_log_r >= low_cut)).cpu()
-    metrics['Backward TB R Value'] = torch.corrcoef(torch.stack([tb_x[good_inds], tb_y[good_inds]]))[0, 1].item()
+    log_pf = bwd_stats['log_pfs'].sum(-1)
+    log_pb = bwd_stats['log_pbs'].sum(-1)
+    log_z  = bwd_stats['log_z']
+    log_r  = bwd_stats['log_r']
 
-    log_weight = b_log_r + b_log_pbs.sum(-1).cpu() - b_log_pfs.sum(-1).cpu()
-    log_Z_empirical = logmeanexp(log_weight)
-    log_Z_lb = log_weight.mean()
-    log_Z_learned = log_z.mean()
-    metrics['Bwd Empirical log Z'] = log_Z_empirical.cpu().detach().item()
-    metrics['Bwd Empirical log Z LB'] = log_Z_lb.cpu().detach().item()
+    # gaussian drift / variance
+    metrics['Mean Bwd F Drift'] = bwd_stats['means_f'].abs().mean().item()
+    metrics['Mean Bwd B Drift'] = bwd_stats['means_b'].abs().mean().item()
+    metrics['Mean Bwd F Var']   = bwd_stats['vars_f'].mean().item()
+    metrics['Mean Bwd B Var']   = bwd_stats['vars_b'].mean().item()
 
-    log_pf = b_log_pfs.sum(-1)
-    log_pb = b_log_pbs.sum(-1)
-
-    log_ratio = (-log_pf.cpu() - log_z.cpu() + log_pb.cpu() + b_log_r.cpu())
-    tb_residual = F.smooth_l1_loss(log_ratio, torch.ones_like(log_ratio), reduction='none', beta=10)
-    metrics['Bwd TB Residual'] = tb_residual.mean().item()
-
-    X_side = log_pf.cpu() - log_pb.cpu()
-    Y_side = b_log_r.cpu() - log_z.cpu()
-    normed_tb_residual = (X_side - Y_side).abs() / torch.maximum(torch.ones_like(Y_side), Y_side.abs())
-    metrics['Bwd Normed TB Residual'] = normed_tb_residual.mean().item()
-    # importance_weight = (Y_side - X_side).cpu()
-    '''
-    xy_scatter_plot(log_pf - log_pb, log_r.cpu() - log_z.cpu(), 'x', 'y').show()
-    xy_scatter_plot(log_pf.cpu() + log_r.cpu(), log_pb + log_z, 'x', 'y').show()
-    '''
-
-    metrics['Bwd Log Z Residual'] = (log_Z_empirical - log_Z_learned).item()
-    metrics['Bwd Normed Log Z Residual'] = ((log_Z_empirical - log_Z_learned).abs() / log_Z_lb.abs()).item()
-    metrics['Bwd Log Z LB Residual'] = (log_Z_lb - log_Z_learned).item()
-    metrics['Bwd Normed Log Z LB Residual'] = ((log_Z_lb - log_Z_learned).abs() / log_Z_lb.abs()).item()
-
+    # parity / Z diagnostics (shared with fwd)
+    metrics.update({f'Bwd {k}': v for k, v in quick_tb_stats(log_pf, log_pb, log_z, log_r).items()})
     if do_figs:
-        fig_dict = bwd_figs(b_log_pbs, b_log_pfs,
-                            b_means_b, b_means_f, b_vars_b, b_vars_f,
-                            backward_flow_states,
-                            fig_dict,
-                            b_log_r, log_z,
-                            b_packing_coeff,
-                            log_importance_weight,
-                            )
-
-    return metrics, fig_dict, b_log_r, tb_residual, normed_tb_residual
-
+        fig_dict = traj_figs('bwd', bwd_stats, log_importance_weight)
+    return metrics, fig_dict
 
 def bwd_figs(b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, fig_dict, log_r,
              log_z, b_packing_coeff, log_importance_weight):
@@ -769,74 +732,69 @@ def bwd_figs(b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, bac
     )
     return fig_dict
 
+def common_traj_figs(stats):
+    log_pf = stats['log_pfs'].sum(-1)
+    log_pb = stats['log_pbs'].sum(-1)
+    log_z, log_r = stats['log_z'], stats['log_r']
+    fd = {}
+    fd['Latent Trajectories'] = visualize_latent_trajs(
+        stats['backward_flow_states'].cpu().numpy(), 20, log_r.cpu().numpy())
+    fd['TB Parity Plot'], _ = flow_parity_plot(log_r, log_z, stats['log_pbs'], stats['log_pfs'],
+                                               stats['packing_coeff'])
+    fd['TB Residual vs R'] = xy_scatter_plot(
+        log_r, (log_r - log_z - log_pf + log_pb).abs(), 'Reward', 'TB Residual')
+    fd['Gauss Params'] = mean_var_fig(stats['vars_f'], stats['means_f'],
+                                      stats['vars_b'], stats['means_b'])
+    return fd
 
 @torch.no_grad()
-def analyze_buffer(buffer, discretizer, gfn_model, batch_size):
-    sample_inds = torch.arange(len(buffer))
-    num_samples = len(sample_inds)
-    num_batches = num_samples // batch_size + int((num_samples % batch_size) != 0)
-    acc = dict(
-        backward_flow_states=[],
-        b_log_pfs=[],
-        b_log_pbs=[],
-        b_means_f=[],
-        b_vars_f=[],
-        b_means_b=[],
-        b_vars_b=[],
-        log_r=[],
-        log_z=[],
-        b_packing_coeff=[],
-    )
-    for b_ind in range(num_batches):
-        start = b_ind * batch_size
-        end = min((b_ind + 1) * batch_size, num_samples)
-        if start >= end:
-            break
+def evaluate_prior(
+        prior_dataset,
+        energy_function,
+        discretizer,
+        gfn_model,
+        batch_size,
+        n_samples):
+    acc = defaultdict(list)
+    n_batches = n_samples // batch_size + 1
 
-        inds = sample_inds[start:end]
+    for _ in range(n_batches):
+        mol_batch = next(prior_dataset.loader(batch_size=batch_size, mode='graphs'))
+        mol_batch = mol_batch.to(gfn_model.device)
 
-        terminal_state, log_r, crystal_batch, condition = buffer.sample(
-            override_batch=batch_size,
-            override_sample_inds=inds
-        )
+        mol_batch.box_analysis()
+
+
+        terminal_state = mol_batch.latent_params()
+
+        mol_batch, log_T_tensor, sg_inds, zps, condition = energy_function.condition_samples(
+            mol_batch)
+
+        log_r = energy_function.prebuilt_sample_to_reward(mol_batch,
+                                                          temperature=log_T_tensor.exp())
 
         terminal_state = terminal_state.to(gfn_model.device)
         condition = condition.to(gfn_model.device)
-        log_r = log_r.to(gfn_model.device)
 
-        # ---- backward trajectory ----
         (backward_flow_states, b_log_pfs, b_log_pbs, log_z,
          b_means_f, b_vars_f, b_means_b, b_vars_b) = gfn_model.get_traj_bwd(
-            terminal_state,
-            discretizer,
-            condition,
-            return_gauss_params=True
-        )
+            terminal_state, discretizer, condition, mol_batch, return_gauss_params=True)
 
-        # ---- append (detach later, not now) ----
-        acc['backward_flow_states'].append(backward_flow_states.cpu())
-        acc['b_log_pfs'].append(b_log_pfs.cpu())
-        acc['b_log_pbs'].append(b_log_pbs.cpu())
-        acc['b_means_f'].append(b_means_f.cpu())
-        acc['b_vars_f'].append(b_vars_f.cpu())
-        acc['b_means_b'].append(b_means_b.cpu())
-        acc['b_vars_b'].append(b_vars_b.cpu())
-        acc['log_r'].append(log_r.cpu())
-        acc['log_z'].append(log_z.cpu())
-        acc['b_packing_coeff'].append(crystal_batch.packing_coeff.cpu())
-    backward_flow_states = torch.cat(acc['backward_flow_states'], dim=0)
-    b_log_pfs = torch.cat(acc['b_log_pfs'], dim=0)
-    b_log_pbs = torch.cat(acc['b_log_pbs'], dim=0)
-    b_means_f = torch.cat(acc['b_means_f'], dim=0)
-    b_vars_f = torch.cat(acc['b_vars_f'], dim=0)
-    b_means_b = torch.cat(acc['b_means_b'], dim=0)
-    b_vars_b = torch.cat(acc['b_vars_b'], dim=0)
-    log_r = torch.cat(acc['log_r'], dim=0)
-    b_packing_coeff = torch.cat(acc['b_packing_coeff'], dim=0)
-    # log_z may be scalar-per-batch or per-sample
-    log_z = torch.stack(acc['log_z']).mean()
-    return log_z, b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, log_r, b_packing_coeff
+        cpu = lambda t: t.cpu().detach()
+        acc['backward_flow_states'].append(cpu(backward_flow_states))
+        acc['b_log_pfs'].append(cpu(b_log_pfs))
+        acc['b_log_pbs'].append(cpu(b_log_pbs))
+        acc['b_means_f'].append(cpu(b_means_f))
+        acc['b_vars_f'].append(cpu(b_vars_f))
+        acc['b_means_b'].append(cpu(b_means_b))
+        acc['b_vars_b'].append(cpu(b_vars_b))
+        acc['log_r'].append(cpu(log_r))
+        acc['log_z'].append(cpu(log_z))
+        acc['b_packing_coeff'].append(cpu(mol_batch.packing_coeff))
 
+    pooled = {k: torch.cat(v, dim=0) for k, v in acc.items()}
+    pooled['log_z'] = pooled['log_z'].mean()   # reduced once over pooled samples
+    return pooled
 
 def get_buffer_stats(buffer):
     if len(buffer) > 0:
@@ -868,72 +826,56 @@ def mean_flow_step_sizes(flow_states):
                                z=mean_step_size.cpu().detach()))
     return fig
 
-
 def log_metrics(energy_function,
-                log_Z_empirical,
-                log_Z_lb,
-                log_Z_learned,
-                log_r,
-                sample_batch, log_T_tensor,
-                log_pfs, log_pbs, args, buffer=None):
+                fwd_stats, sample_batch, args, buffer=None):
     """Scalar / distribution metrics"""
     metrics = {}
+    arr = lambda t: t.cpu().detach().numpy()
+    val = lambda t: t.cpu().detach().item()
+
+    log_r = fwd_stats['log_r']
+    log_pf = fwd_stats['log_pfs'].sum(-1)
+    log_pb = fwd_stats['log_pbs'].sum(-1)
+    log_Z_learned = fwd_stats['log_z']
+    log_T_tensor = fwd_stats['log_T_tensor']
+
     # energies
     for key in sample_batch.keys():
         if 'energy' in key or 'pot' in key:
-            val = sample_batch[key].mean().cpu().detach().item()
-            metrics['Mean ' + key] = val
+            metrics['Mean ' + key] = val(sample_batch[key].mean())
 
     # physical properties
-    metrics['Mean Packing Coeff'] = sample_batch.packing_coeff.mean().cpu().detach().item()
-    metrics['Packing Coeff'] = sample_batch.packing_coeff.clip(max=2).cpu().detach().numpy()
-    metrics['Reduction Energy'] = sample_batch.reduction_en.cpu().detach().numpy()
-    metrics['Reduced Valid Fraction'] = np.mean(sample_batch.reduction_en.cpu().detach().numpy() < 1e-1)
+    metrics['Mean Packing Coeff'] = val(sample_batch.packing_coeff.mean())
+    metrics['Packing Coeff'] = arr(sample_batch.packing_coeff.clip(max=2))
+    metrics['Reduction Energy'] = arr(sample_batch.reduction_en)
+    metrics['Reduced Valid Fraction'] = np.mean(arr(sample_batch.reduction_en) < 1e-1)
 
     # conditions
-    metrics['Crystal Mean Log Temperature'] = log_T_tensor.mean().item()
-    metrics['Crystal Log Temperature'] = log_T_tensor.cpu().detach().numpy()
+    metrics['Crystal Mean Log Temperature'] = val(log_T_tensor.mean())
+    metrics['Crystal Log Temperature'] = arr(log_T_tensor)
 
     # training metrics
-    metrics['Mean Sample Energy'] = sample_batch.gfn_energy.mean().cpu().detach().item()
-    metrics['Sample Energy'] = sample_batch.gfn_energy.clip(max=50).cpu().detach().numpy()
-    metrics['Scaled LJ'] = log_rescale_positive(sample_batch.lj).cpu().detach().numpy()
+    metrics['Mean Sample Energy'] = val(sample_batch.gfn_energy.mean())
+    metrics['Sample Energy'] = arr(sample_batch.gfn_energy.clip(max=50))
+    metrics['Scaled LJ'] = arr(log_rescale_positive(sample_batch.lj))
 
-    metrics[
-        'Mean Sample Reward'] = log_r.mean().cpu().detach().item()  # todo this should probably be denormed by the temperature
-    metrics['Sample Reward'] = log_r.clip(min=-50).cpu().detach().numpy()
+    metrics['Mean Sample Reward'] = val(log_r.mean())
+    metrics['Sample Reward'] = arr(log_r.clip(min=-50))
 
-    metrics['Empirical log Z'] = log_Z_empirical.cpu().detach().item()
-    metrics['Empirical log Z LB'] = log_Z_lb.cpu().detach().item()
-    metrics['log Z learned'] = log_Z_learned.cpu().detach().item()
+    metrics['Empirical log Z'] = val(fwd_stats['log_Z'])
+    metrics['Empirical log Z LB'] = val(fwd_stats['log_Z_lb'])
+    metrics['log Z learned'] = val(log_Z_learned)
 
-    tb_x = log_Z_learned.cpu() + log_pfs.sum(-1).cpu()
-    tb_y = log_r.cpu() + log_pbs.sum(-1).cpu()
-    high_cut, low_cut = torch.quantile(log_r, 0.99), torch.quantile(log_r, 0.01)
-    good_inds = ((high_cut >= log_r) * (log_r >= low_cut)).cpu()
-    metrics['Forward TB R Value'] = torch.corrcoef(torch.stack([tb_x[good_inds], tb_y[good_inds]]))[0, 1].item()
+    def dump_numeric(metrics, prefix, obj):
+        d = obj if isinstance(obj, dict) else vars(obj)
+        for k, v in d.items():
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                metrics[f'{prefix}{k}'] = v
 
-    # training coefficients
-    for elem in energy_function.__dict__.keys():
-        thing = energy_function.__dict__[elem]
-        if isinstance(thing, float) or isinstance(thing, int):
-            metrics['energy_func/' + elem] = thing
+    dump_numeric(metrics, 'energy_func/', energy_function)
+    dump_numeric(metrics, 'loss_coeffs/fwd_', args.fwd_loss_coeffs)
+    dump_numeric(metrics, 'loss_coeffs/bwd_', args.bwd_loss_coeffs)
 
-    for elem in args.fwd_loss_coeffs.__dict__.keys():
-        thing = args.fwd_loss_coeffs.__dict__[elem]
-        if isinstance(thing, float) or isinstance(thing, int):
-            metrics['loss_coeffs/' + 'fwd_' + elem] = thing
-
-    for elem in args.bwd_loss_coeffs.__dict__.keys():
-        thing = args.bwd_loss_coeffs.__dict__[elem]
-        if isinstance(thing, float) or isinstance(thing, int):
-            metrics['loss_coeffs/' + 'bwd_' + elem] = thing
-
-    # distributional analysis
-    lattice_features = ['cell_a', 'cell_b', 'cell_c',
-                        'cell_alpha', 'cell_beta', 'cell_gamma',
-                        'aunit_x', 'aunit_y', 'aunit_z',
-                        'orientation_1', 'orientation_2', 'orientation_3']
     std_params = sample_batch.latent_params()
 
     metrics['Total Var'] = std_params.var(dim=0).mean().cpu().detach().numpy()
@@ -947,21 +889,6 @@ def log_metrics(energy_function,
     d_eff = (explained_var_ratio ** 2).sum() ** -1
     metrics['Effective Dimension'] = d_eff.item()
 
-    for ind, feat in enumerate(lattice_features):
-        metrics[feat + '_mean'] = std_params[:, ind].mean().item()
-        metrics[feat + '_var'] = std_params[:, ind].var().item()
-        metrics[feat + '_expl_var_rat'] = contrib_per_feature[ind].item()
-
-    if hasattr(sample_batch, 'ellipsoid_overlap'):
-        metrics['mean ellipsoid overlap'] = sample_batch.ellipsoid_overlap.mean().cpu().detach().numpy()
-        metrics['ellipsoid overlap'] = sample_batch.ellipsoid_overlap.clip(min=1e-3).log10().cpu().detach().numpy()
-
-    if buffer is not None:
-        """
-        Buffer / prior metrics
-        """
-        buffer_logging(buffer, metrics, sample_batch)
-
     prior_sample = sample_backward_prior(args, buffer, sample_batch, len(std_params))
 
     # this isn't SG conditioned, but that's OK because we're not really using it anymore anyway
@@ -973,33 +900,14 @@ def log_metrics(energy_function,
                         'orientation_1', 'orientation_2', 'orientation_3']
     for ind, thing in enumerate(lattice_features):
         metrics[f'{thing} coverage'] = prior_coverage[ind].item()
-
     metrics['Minimum 1d coverage'] = torch.amin(prior_coverage).item()
-
-    # unconditional flow metrics
-    log_pf = log_pfs.sum(-1)
-    log_pb = log_pbs.sum(-1)
-
-    log_ratio = -log_pf.cpu() - log_Z_learned.cpu() + log_pb.cpu() + log_r.cpu()
-    tb_residual = F.smooth_l1_loss(log_ratio, torch.ones_like(log_ratio), reduction='none', beta=10)
-    metrics['TB Residual'] = tb_residual.mean().item()
-
-    # todo functionalize this
-    X_side = log_pf.cpu() - log_pb.cpu()
-    Y_side = log_r.cpu() - log_Z_learned.cpu()
-    normed_log_ratio = (X_side - Y_side).abs() / torch.maximum(torch.ones_like(Y_side), Y_side.abs())
-    metrics['Normed TB Residual'] = normed_log_ratio.mean().item()
-
-    metrics['Log Z Residual'] = (log_Z_empirical - log_Z_learned).item()
-    metrics['Normed Log Z Residual'] = ((log_Z_empirical - log_Z_learned).abs() / log_Z_empirical.abs()).item()
-    metrics['Log Z LB Residual'] = (log_Z_lb - log_Z_learned).item()
-    metrics['Normed Log Z LB Residual'] = ((log_Z_lb - log_Z_learned).abs() / log_Z_lb.abs()).item()
 
     # get fraction of samples which are 'reasonable' at this energy,
     en_func = energy_function.energy_function
     sample_is_good = (sample_batch[en_func] < 0) * (sample_batch.packing_coeff > 0.55) * (
             sample_batch.packing_coeff < 0.95)
     metrics["Reasonable Sample Fraction"] = sample_is_good.float().mean().item()
+
     metrics = {k: to_loggable(v) for k, v in metrics.items()}
 
     return metrics
@@ -1507,3 +1415,83 @@ def get_dimwise_coverage(test_samples, ref_samples, n_bins=24, tau=10, cmin=1):
         ref_cov[j] = covered
 
     return (per_dim_cov / ref_cov.clip(min=0.01)).clip(min=0, max=1)
+
+
+@torch.no_grad()
+def log_ess_frac(log_pf, log_pb, repeats):
+    """
+    Effective sample size fraction of the per-x importance weights, used as a
+    support-aware convergence signal for the MLE-bound objective.
+
+    Detects mode *dropping*: when the forward policy abandons buffer modes,
+    those samples get tiny Pf, the weights concentrate, and ESS collapses.
+
+    Args:
+        log_pf: [B*repeats] trajectory-summed forward log-probs (log_pfs.sum(-1)),
+                in the (x repeated K times) layout, K=repeats.
+        log_pb: [B*repeats] trajectory-summed backward log-probs, same layout.
+        repeats: K, number of backward trajectories per terminal state x.
+
+    Returns:
+        float in (-inf, 0]. 0.0 == uniform weights (healthy, full support).
+        Strongly negative == degenerate weights (a few x carry all the mass).
+        Interpret as log(ESS / B): exp(value) is the surviving sample fraction.
+    """
+    B = log_pf.numel() // repeats
+    logw_paths = (log_pf - log_pb).view(B, repeats)
+
+    # per-x marginal log importance weight: logmeanexp over the K paths
+    log_w = torch.logsumexp(logw_paths, dim=-1) - np.log(repeats)  # [B]
+
+    # normalize, then ESS = 1 / sum(w_n^2)  ->  log_ess = -logsumexp(2 log w_n)
+    log_w_n = log_w - torch.logsumexp(log_w, dim=0)
+    log_ess = -torch.logsumexp(2 * log_w_n, dim=0)
+
+    return (log_ess - np.log(B)).item()
+
+
+@torch.no_grad()
+def sliced_wasserstein(sampled_latents, prior_latents, n_proj=50, p=1, generator=None):
+    """
+    Sliced-Wasserstein distance between sampler output and the prior/buffer,
+    used as a support-aware monitoring curve.
+
+    Detects mode *invention* (mass where the target has none) as well as
+    dropping, because the random projections mix dimensions -- unlike per-dim
+    binned coverage it sees joint structure. Sizes need NOT match; compared
+    via quantiles, not sorted pairing.
+
+    Args:
+        sampled_latents: [N, D] latents from the sampler (std_params space).
+        prior_latents:   [M, D] latents from the prior/buffer (same space).
+        n_proj: number of random 1-D projection directions to average over.
+        p: Wasserstein order (1 = mean abs quantile gap, 2 = RMS).
+        generator: optional torch.Generator for reproducible projections.
+
+    Returns:
+        float >= 0. 0 == identical distributions (up to projection noise).
+    """
+    a = sampled_latents.detach()
+    b = prior_latents.detach().to(a.device, a.dtype)
+    D = a.shape[1]
+    assert b.shape[1] == D, "latent dims must match"
+
+    theta = torch.randn(D, n_proj, device=a.device, dtype=a.dtype, generator=generator)
+    theta = theta / theta.norm(dim=0, keepdim=True)
+
+    a_proj = a @ theta  # [N, n_proj]
+    b_proj = b @ theta  # [M, n_proj]
+
+    # 1-D OT per projection via quantile matching (handles N != M)
+    n_q = min(a.shape[0], b.shape[0])
+    qs = torch.linspace(0, 1, n_q, device=a.device, dtype=a.dtype)
+    a_q = torch.quantile(a_proj, qs, dim=0)  # [n_q, n_proj]
+    b_q = torch.quantile(b_proj, qs, dim=0)  # [n_q, n_proj]
+
+    gap = (a_q - b_q).abs()
+    if p == 1:
+        return gap.mean().item()
+    elif p == 2:
+        return gap.pow(2).mean().sqrt().item()
+    else:
+        return (gap.pow(p).mean() ** (1.0 / p)).item()

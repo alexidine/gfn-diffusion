@@ -703,7 +703,7 @@ def calibrate_prior_noise(buffer, energy_function,
     new_samples = noised_samples  # todo confirm right latents / dists
 
     # have to update the rewards if we are using any loss functions that require them
-    crystal_batch, log_T_tensor, sg_inds,zps, condition = energy_function.condition_samples(
+    crystal_batch, log_T_tensor, sg_inds, zps, condition = energy_function.condition_samples(
         crystal_batch,
         sg_inds=crystal_batch.sg_ind,
         z_primes=crystal_batch.z_prime)
@@ -784,10 +784,9 @@ def new_calibrate_prior_noise(sample_batch, energy_function,
                               en_scaling_factor, kT,
                               log_min=-3, log_max=-0.5,
                               low_cut=0.05, high_cut=10.0,  # in units of kT
-                              predictor = None,
+                              predictor=None,
                               device='cuda'
                               ):
-
     energy = sample_batch[energy_function]
 
     latents = sample_batch.latent_params()
@@ -799,7 +798,7 @@ def new_calibrate_prior_noise(sample_batch, energy_function,
     with torch.no_grad():  # reprocess with corrected latents
         noised_batch = adaptive_batched_analysis(
             noised_batch,
-            analyses=[energy_function], state = {},
+            analyses=[energy_function], state={},
             initial_batch_size=100, predictor=predictor,
             device=device,
         )
@@ -1071,3 +1070,73 @@ def log_elapsed_times(times):
                 elapsed_times[start_key.split('_start')[0] + '_time'] = times[end_key] - times[start_key]
 
     return elapsed_times
+
+
+class MetricTracker:
+    """Step-aware EMA over arbitrary scalars, keyed by (direction, name)."""
+
+    def __init__(self, period: float = 25.0):
+        self.period = period
+        self.values = {}  # (direction, name) -> float
+        self.last_it = {}  # direction -> step
+
+    def update(self, direction, scalars: dict, step: int):
+        dt = max(step - self.last_it.get(direction, step), 1)
+        alpha = 1.0 - np.exp(-dt / self.period)
+        for name, v in scalars.items():
+            v = v.item() if torch.is_tensor(v) else float(v)
+            if not np.isfinite(v):
+                continue  # reject, hold previous
+            prev = self.values.get((direction, name))
+            self.values[(direction, name)] = v if prev is None else (1 - alpha) * prev + alpha * v
+        self.last_it[direction] = step
+
+    def get(self, direction, name, default=None):
+        return self.values.get((direction, name), default)
+
+    def snapshot(self):
+        return {f'{d}/{n}': v for (d, n), v in self.values.items() if v is not None}
+
+    def state_dict(self):
+        nested = {}
+        for (d, n), v in self.values.items():
+            nested.setdefault(d, {})[n] = v
+        return {'period': self.period, 'last_it': dict(self.last_it), 'values': nested}
+
+    def load_state_dict(self, sd):
+        self.period = sd.get('period', self.period)
+        self.last_it = dict(sd.get('last_it', {}))
+        self.values = {(d, n): v for d, kv in sd.get('values', {}).items() for n, v in kv.items()}
+
+
+def quick_tb_stats(log_pf, log_pb, log_Z, log_r):
+    x = (log_pb + log_r).detach()
+    y = (log_pf + log_Z).detach()
+    resid = y - x  # TB residual
+    xc, yc = x - x.mean(), y - y.mean()
+    slope = (xc * yc).sum() / (xc * xc).sum().clamp_min(1e-8)
+    intercept = y.mean() - slope * x.mean()
+    r2 = 1 - ((yc - slope * xc) ** 2).sum() / (yc * yc).sum().clamp_min(1e-8)
+
+    log_w = (log_r + log_pb - log_pf).detach()  # per-traj log importance weight
+    z_jensen = log_w.mean()  # Jensen LB:  E[log w] <= log E[w]
+    z_emp = torch.logsumexp(log_w, dim=0) - np.log(log_w.shape[0])  # logmeanexp estimate
+    z_learned = log_Z.detach().mean()
+
+    # TB residual skew
+    resid_c = (resid - resid.mean())
+    skew = (resid_c.pow(3).mean() / resid_c.pow(2).mean().pow(1.5).clamp_min(1e-8))
+
+    return {
+        'slope_err': (slope - 1).abs().item(),
+        'intercept_err': intercept.abs().item(),
+        'scatter_err': resid.std(unbiased=False).item(),
+        'r2': r2.item(),
+        'tb_err': resid.pow(2).mean().sqrt().item(),
+        'jensen_z_err': (z_jensen - z_learned).abs().item(),
+        'emp_z_err': (z_emp - z_learned).abs().item(),
+        'z_gap': (z_emp - z_jensen).item(),
+        'resid_p05': resid.abs().detach().quantile(0.05).item(),
+        'resid_p95': resid.detach().quantile(0.95).item(),
+        'resid_skew': skew.item(),  # sign tells you over- vs under-sampling dominance
+    }

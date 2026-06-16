@@ -143,47 +143,36 @@ def sample_crystals(
     else:
         return params_record, energy_record, density_record, sample_record
 
-
 @torch.no_grad()
-def sample_eval_fwd_trajs(initial_state, gfn, discretizer, energy_function, mol_batch,
-                          sg_inds=None):
-    mol_batch, log_T_tensor, sg_inds, zps, condition = (
-        energy_function.condition_samples(mol_batch, sg_inds=sg_inds, z_primes=mol_batch.z_prime))
-
-    condition = condition.to(gfn.device)
-
-    mol_batch.sg_ind = sg_inds
+def sample_eval_fwd_trajs(init_state,
+                          gfn_model,
+                          discretizer,
+                          energy_function,
+                          mol_batch,
+                          sg_inds=None, z_primes=None):
+    mol_batch, log_T_tensor, sg_inds, zps, condition = energy_function.condition_samples(
+        mol_batch, sg_inds=sg_inds, z_primes=z_primes)
+    condition = condition.to(gfn_model.device)
 
     (states, log_pfs, log_pbs, log_flow,
-     means_f, logvars_f, means_b, logvars_b) = gfn.get_traj_fwd(initial_state,
-                                                                discretizer,
-                                                                None,
-                                                                condition,
-                                                                return_gauss_params=True)
-    gauss_params = {'means_f': means_f.cpu().detach(),
-                    'logvars_f': logvars_f.cpu().detach(),
-                    'means_b': means_b.cpu().detach(),
-                    'logvars_b': logvars_b.cpu().detach()}
+     means_f, logvars_f, means_b, logvars_b) = gfn_model.get_traj_fwd(
+        init_state, discretizer, None, condition, mol_batch, return_gauss_params=True)
 
     log_r, sample_batch = energy_function.log_reward(
-        states[:, -1], mol_batch=mol_batch,
-        log_temperature=log_T_tensor,
-        return_exp=True)
+        states[:, -1], mol_batch=mol_batch, log_temperature=log_T_tensor, return_exp=True)
 
-    log_weight = log_r + log_pbs.sum(-1) - log_pfs.sum(-1)
-
-    log_Z = logmeanexp(log_weight)
-    log_Z_lb = log_weight.mean()
-    log_Z_learned = log_flow.mean()
-
-    outputs = (states, states[:, -1],
-               log_r, log_Z, log_Z_lb, log_Z_learned,
-               sample_batch, condition,
-               log_pfs, log_pbs, log_flow,
-               gauss_params, log_T_tensor)
-    outputs = (o if isinstance(o, dict) else o.cpu().detach()
-               for o in outputs)
-    return outputs
+    cpu = lambda t: t.cpu().detach()
+    return {
+        'flow_states':  cpu(states),
+        'log_r':        cpu(log_r),
+        'log_pfs':      cpu(log_pfs),
+        'log_pbs':      cpu(log_pbs),
+        'log_flow':     cpu(log_flow),
+        'log_T_tensor': cpu(log_T_tensor),
+        'sample_batch': sample_batch.cpu().detach(),
+        'gauss_params': {'means_f': cpu(means_f), 'logvars_f': cpu(logvars_f),
+                         'means_b': cpu(means_b), 'logvars_b': cpu(logvars_b)},
+    }
 
 
 # @torch.no_grad()

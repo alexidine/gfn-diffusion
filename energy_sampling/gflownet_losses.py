@@ -100,8 +100,8 @@ def get_gfn_forward_loss(loss_coeffs,
                          repeats=10,
                          report_losses: bool = False,
                          ):
-    if gfn.conditional_flow_model and any([
-        loss_coeffs.var > 0, loss_coeffs.vg_lb > 0,
+    if gfn.conditional and any([
+        loss_coeffs.vg_lb > 0,
         loss_coeffs.vg_lme > 0]): # todo rewrite all this
         assert False, "Rewrite repeats method from sampler"
 
@@ -122,7 +122,7 @@ def get_gfn_forward_loss(loss_coeffs,
                                            mol_batch,
                                            return_exp,
                                            states,
-                                           no_grad=(loss_coeffs.greedy == 0)
+                                           no_grad=not keep_grads
                                            )
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
@@ -159,7 +159,7 @@ def get_gfn_forward_loss(loss_coeffs,
     loss = combined_losses.mean()
 
     if report_losses:
-        loss_dict = {'log_pf': log_pf, 'lob_pb': log_pb, 'log_Z': log_flow, 'log_r': log_r}
+        loss_dict = {'log_pf': log_pf, 'log_pb': log_pb, 'log_Z': log_flow, 'log_r': log_r}
         if loss_coeffs.tb > 0:
             loss_dict['tb'] = tb_loss.mean().detach()
         if loss_coeffs.vg_lb > 0:
@@ -187,7 +187,7 @@ def get_gfn_backward_loss(loss_coeffs,
                           condition=None,
                           repeats=10,
                           report_losses: bool = False):
-    if gfn.conditional_flow_model and any([
+    if gfn.conditional and any([
         loss_coeffs.vg_lb > 0, loss_coeffs.vg_lme > 0
     ]):
         assert False, "Rewrite this method"
@@ -242,7 +242,7 @@ def get_gfn_backward_loss(loss_coeffs,
     loss = combined_losses.mean()
 
     if report_losses:
-        loss_dict = {'log_pf': log_pf, 'lob_pb': log_pb, 'log_Z': log_flow, 'log_r': log_r}
+        loss_dict = {'log_pf': log_pf, 'log_pb': log_pb, 'log_Z': log_flow, 'log_r': log_r}
         if loss_coeffs.tb > 0:
             loss_dict['tb'] = tb_loss.mean().detach()
         if loss_coeffs.vg_lb > 0:
@@ -336,7 +336,7 @@ def get_tb_loss(log_flow, log_pb, log_pf, log_r, detach_z: Union[bool, torch.Ten
 
 
 def emp_Z(gfn, log_Z, log_flow, repeats, beta: float = 10):
-    if gfn.conditional_flow_model:
+    if gfn.conditional:
         emp_z_loss = F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_flow.view(repeats, -1), reduction='none',
                                       beta=beta).view(-1)
     else:
@@ -346,7 +346,7 @@ def emp_Z(gfn, log_Z, log_flow, repeats, beta: float = 10):
 
 def vg_lme(gfn, log_pb, log_pf, log_r, repeats, beta: float = 10):
     log_ratio = log_r.detach() + log_pb - log_pf
-    if gfn.conditional_flow_model:
+    if gfn.conditional:
         log_Z = torch.logsumexp(log_ratio.view(repeats, -1), dim=0, keepdim=True) - math.log(repeats)
         # vg_loss = (0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2).view(-1)
         vg_loss = F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_ratio.view(repeats, -1), reduction='none',
@@ -362,7 +362,7 @@ def vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats, beta: float = 10):
     assert not (loss_coeffs.vg_lb > 0 and loss_coeffs.vg_lme > 0), \
         "Cannot use both vg_lb and vg_lme simultaneously"
     log_ratio = log_r.detach() + log_pb - log_pf
-    if gfn.conditional_flow_model:
+    if gfn.conditional:
         log_Z = log_ratio.view(repeats, -1).mean(dim=0, keepdim=True)
         # vg_loss = (0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2).view(-1)
         vg_loss = F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_ratio.view(repeats, -1), reduction='none',
