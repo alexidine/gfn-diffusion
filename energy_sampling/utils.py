@@ -571,14 +571,14 @@ def get_annealing_factor(start_value, stop_value, total_time, step_iters):
 @torch.no_grad()
 def substitute_prior(noised_fraction, log_noise_range,
                      crystal_batch, energy_function,
-                     samples, ):
+                     samples, eps: float = 1e-8):
     # noise buffer samples with gaussian magnitude steps
     rand_dir = torch.randn_like(samples)
     rand_dir = rand_dir / rand_dir.norm(dim=-1, keepdim=True)
     # rand_magnitude = torch.randn(len(samples), device=samples.device).abs() * noise_level
     u = torch.rand(len(samples))
     rand_magnitude = 10 ** (log_noise_range[0] + (log_noise_range[1] - log_noise_range[0]) * u)
-    noised_samples = (samples + rand_dir * rand_magnitude[:, None]).clip(min=-1, max=1)
+    noised_samples = (samples + rand_dir * rand_magnitude[:, None]).clip(min=-1 + eps, max=1 - eps)
 
     if noised_fraction < 1:
         new_samples = samples.clone()
