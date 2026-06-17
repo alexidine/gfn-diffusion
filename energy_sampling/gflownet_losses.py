@@ -193,7 +193,6 @@ def get_gfn_backward_loss(loss_coeffs,
         assert False, "Rewrite this method"
     conditional_repeats = False
 
-    condition = condition.to(gfn.device)
     states, log_pfs, log_pbs, log_flow = gfn.get_traj_bwd(
         samples, discretizer, condition, mol_batch, return_gauss_params=False)
 

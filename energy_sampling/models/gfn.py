@@ -58,6 +58,7 @@ class GFN(nn.Module):  # todo add seeding
         self.conditions_type = conditions_type
 
         self.get_periodic_dimensions(device)
+        self.condition_embedding_dim = condition_embedding_dim
 
         self.init_conditioner(cond_hidden_dim, cond_layers, condition_embedding_dim, conditions_dim,
                               dropout, norm)
@@ -67,7 +68,11 @@ class GFN(nn.Module):  # todo add seeding
 
         self.t_model = TimeEncoding(harmonics_dim, t_dim, t_hidden_dim,
                                     norm=norm, dropout=dropout)
-        self.s_model = StateEncoding(self.expanded_dim, s_layers, s_hidden_dim, condition_embedding_dim, s_emb_dim,
+        self.s_model = StateEncoding(self.expanded_dim,
+                                     s_layers,
+                                     s_hidden_dim,
+                                     condition_embedding_dim if self.conditional else 0,
+                                     s_emb_dim,
                                      norm=norm, dropout=dropout)
         self.forward_policy = PolicyModel(dim, s_emb_dim, t_dim,
                                           policy_hidden_dim, policy_layers, 2 * dim,
@@ -184,7 +189,16 @@ class GFN(nn.Module):  # todo add seeding
         current_state = initial_state
         states[:, 0] = current_state
 
-        condition_embedding = self.get_condition_embedding(condition, mol_batch)
+        if self.conditional:
+            if condition is not False:
+                condition_embedding = self.get_condition_embedding(condition, mol_batch)
+            else:  # constant embedding
+                condition_embedding = torch.zeros((batch_size, self.condition_embedding_dim),
+                                                  dtype=torch.float32, device=self.device)
+        else:
+            condition_embedding = None
+
+
         logf = self.flow_model(condition_embedding).flatten()
 
         for i in range(trajectory_length):
@@ -266,7 +280,7 @@ class GFN(nn.Module):  # todo add seeding
         return scalar_embedding
 
     def get_traj_bwd(self, terminal_state, discretizer, condition, mol_batch,
-                     return_gauss_params: bool = False, detach_traj: bool = True):
+                     return_gauss_params: bool = False, detach_traj: bool = True, ):
         batch_size = terminal_state.shape[0]
         ts = discretizer(batch_size).to(self.device)
         trajectory_length = ts.shape[1] - 1
@@ -277,7 +291,14 @@ class GFN(nn.Module):  # todo add seeding
         states[:, -1] = terminal_state.detach()
         current_state = terminal_state.detach()
 
-        condition_embedding = self.get_condition_embedding(condition, mol_batch)
+        if self.conditional:
+            if condition is not False:
+                condition_embedding = self.get_condition_embedding(condition, mol_batch)
+            else:  # constant embedding
+                condition_embedding = torch.zeros((batch_size, self.condition_embedding_dim),
+                                                  dtype=torch.float32, device=self.device)
+        else:
+            condition_embedding = None
 
         logf = self.flow_model(condition_embedding).flatten()
         log_var_base = 2.0 * math.log(float(self.pf_std_per_traj))

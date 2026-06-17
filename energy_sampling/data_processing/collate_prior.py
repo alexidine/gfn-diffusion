@@ -8,7 +8,7 @@ from energy_sampling.data_processing.utils import calibrate_energy_function_vs_u
 from energy_sampling.utils import new_calibrate_prior_noise
 from mxtaltools.analysis.crystal_rdf import compute_rdf_distance
 from mxtaltools.common.adaptive_batching import adaptive_batched_analysis
-from mxtaltools.common.clustering import greedy_bottom_up_anchors
+from mxtaltools.common.clustering import greedy_bottom_up_anchors, greedy_bottom_up_anchors2
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.mlip_interfaces.AL_mace_utils import load_mace_model
 from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
@@ -90,7 +90,7 @@ def collate_generate_prior():
     """
     thermal_ens = ens * en_scaling_factor
     d_cut = 10 ** log_noise_range[1]
-    anchors = greedy_bottom_up_anchors(params, cps, thermal_ens, d_cut=d_cut, e_cut=thermal_ens.amin() + 6 * kT)
+    anchors = greedy_bottom_up_anchors2(params, cps, thermal_ens, d_cut=d_cut, e_cut=thermal_ens.amin() + 6 * kT)
     thinned_batch = collate_data_list([good_samples[ind] for ind in anchors])
 
 

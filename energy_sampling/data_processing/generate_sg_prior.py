@@ -3,6 +3,7 @@ import plotly.graph_objects as go
 import torch
 
 from mxtaltools.common.adaptive_batching import adaptive_batched_analysis
+from mxtaltools.common.clustering import greedy_bottom_up_anchors
 
 torch.cuda.set_per_process_memory_fraction(0.9)
 
@@ -108,8 +109,15 @@ latents = batch.latent_params()
 sample_dmat = torch.cdist(latents[:1000], latents[:1000])
 
 d_cut = sample_dmat.flatten().quantile(0.15)
+thin_cut = sample_dmat.flatten().quantile(0.01)
 
-x_eq, hist = equalize_density(latents, d_cut, k=3000, target_quantile=0.99,
+# thin out over-dense regions
+density = knn_density(latents, k=batch.num_graphs-1, d_cut=d_cut, chunk=2048)
+anchors = greedy_bottom_up_anchors(latents, batch.packing_coeff, -density, d_cut=thin_cut, e_cut=None)
+batch = collate_data_list([data[ind] for ind in anchors])
+latents = batch.latent_params()
+
+x_eq, hist = equalize_density(latents, d_cut, k=batch.num_graphs-1, target_quantile=0.99,
                               spawn_frac=0.1, growth_per_pass=0.01, tol=0.0001,
                               n_passes=1000, max_factor=20.0)
 plot_density_hist(hist).show()
@@ -125,7 +133,7 @@ full_batch = collate_data_list([full_data[ind] for ind in good_inds])
 # full_batch.plot_batch_staircase(space='latent')
 # batch.plot_batch_staircase(space='latent')
 
-fin_density = knn_density(full_batch.latent_params(), k=3000, d_cut=d_cut, chunk=2048)
+fin_density = knn_density(full_batch.latent_params(), k=batch.num_graphs-1, d_cut=d_cut, chunk=2048)
 fig = go.Figure(go.Histogram(x=fin_density.cpu().detach().numpy(), nbinsx=100, histnorm='probability density'))
 fig.add_histogram(x=fin_density[:len(data)].cpu().detach().numpy(), nbinsx=100, histnorm='probability density')
 fig.add_histogram(x=hist[0].cpu().detach().numpy(), nbinsx=100, histnorm='probability density')

@@ -1,0 +1,110 @@
+anchor_fwd_bwd: true
+anomaly_detection: false
+batch_growth_increment: 1.01
+batch_size: 25
+both_ways: true
+bounding_coeff: 10.0
+btb_threshold: 1.5
+bwd: false
+bwd_loss_coeffs:
+  bwd_tb_z: 0.0
+  emp_z: 0
+  loss_clip: 1000000000.0
+  mle: 1.0
+  tb: 0.0
+  vg_lb: 0
+  vg_lme: 0
+bwd_sampling_mode: dataset
+checkpoint_path: null
+continue_from_checkpoint: false
+continue_from_hit_prior: false
+cuda_memory_fraction: 0.9
+device: cuda
+ema_decay: 0.95
+energy_density_coeff: 10.0
+energy_function: elj
+energy_lj_coeff: 1.0
+epochs: 100000
+eval_T: 25
+eval_batch_size: 1000
+eval_num_samples: 1000
+eval_period: 50
+figs_period: 250
+fwd_loss_coeffs:
+  emp_z: 0
+  loss_clip: 1000000000.0
+  tb: 1.0
+  vg_lb: 0.0
+  vg_lme: 0
+fwd_to_bwd_ratio: 1
+gradient_norm_clip: 0.1
+grow_batch_size: true
+integrator:
+  T: 25
+  discretizer: uniform
+  discretizer_max_ratio: 15
+  max_traj_length: 10
+  min_traj_length: 10
+  traj_length_strategy: static
+lr_anneal_time: 20000
+lr_back: 0.0005
+lr_flow: 1.0
+lr_policy: 0.0005
+lr_warmup_ratio: 100
+lr_warmup_time: 2000
+max_batch_size: 10000
+max_fwd_bwd_ratio: 1.0
+min_fwd_bwd_ratio: 0.01
+min_lr: 1.0e-05
+mlip_path: null
+model:
+  clipping: true
+  cond_hidden_dim: 1024
+  cond_layers: 4
+  condition_embedding_dim: 4
+  dropout: 0
+  flow_hidden_dim: 4
+  flow_layers: 1
+  gfn_clip: 200.0
+  harmonics_dim: 128
+  learn_pb: true
+  learned_variance: true
+  log_var_range: 6
+  norm: layer
+  pb_drift_range: 0.2
+  pb_var_range: 6
+  policy_hidden_dim: 1024
+  policy_layers: 4
+  s_emb_dim: 1024
+  s_hidden_dim: 1024
+  s_layers: 4
+  t_dim: 128
+  t_hidden_dim: 128
+  t_scale: 0.05
+  zero_init: false
+molecule_conditioning: false
+molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/test_mols_1.pt
+phase_change_time: 25
+prior_path: /scratch/mk8347/data/crystal_datasets/conditional/prior/14_1_elj.pt
+reduction_coeff: 10.0
+repeats: 1
+reward_range: null
+run_name: uncond_1_2_6_0.025
+scheduler: true
+seed: 12345
+sg_conditioning: false
+space_groups:
+- 14
+tag: uncond_1
+temperature: 2.5
+temperature_conditioning: false
+test_molecules_path: null
+thermalization_conv_eps: 5.0
+thermalization_intercept_err: 100.0
+thermalization_slope_err: 100.0
+use_weight_decay: false
+wass_threshold: 0.01
+weight_decay: 0.0001
+z_primes:
+- 1
+zp_conditioning: false

@@ -3,8 +3,7 @@ import os
 from collections import defaultdict
 from copy import deepcopy
 
-from energy_sampling.eval.evaluations import to_loggable, log_ess_frac, \
-    sliced_wasserstein, adjust_fig_filesize, bwd_evaluation, fwd_figs
+from energy_sampling.eval.evaluations import to_loggable, sliced_wasserstein, adjust_fig_filesize, eval_figs
 from mxtaltools.common.utils import log_rescale_positive
 
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
@@ -23,7 +22,7 @@ from tqdm import trange
 
 from energies.molecular_crystal import MolecularCrystal
 from energy_sampling.buffer import SimpleDataset
-from energy_sampling.eval.utils import sample_eval_fwd_trajs
+from energy_sampling.eval.utils import sample_eval_fwd_trajs, LossSpikeMonitor
 from energy_sampling.utils import is_cuda_oom, get_annealing_factor, \
     parse_loss_schedules, dict2namespace, update_loss_schedule, \
     atomic_save, get_discretizer, log_elapsed_times, MetricTracker, quick_tb_stats, uniform_discretizer, logmeanexp
@@ -39,7 +38,9 @@ MODELLER_STATE_DEFAULTS = {
     'phase': 1,
     'batch_size': 1,
     'fwd_to_bwd_ratio': 1.0,
-    'increasing_loss_cooldown': 0,
+    'increasing_loss_cooldown': {},
+    'loss_records': {},
+    'global_action_cooldown': 0,
     'lr_cut_count': 0,
     'lr_warmup_finished': False,
     'hit_init_kld': False,
@@ -55,6 +56,9 @@ class Modeller:
         self.args = get_train_args()
         torch.cuda.set_per_process_memory_fraction(self.args.cuda_memory_fraction, device=0)
         torch.cuda.init()  # create context with the cap already in place
+
+        self.fwd_loss_monitor = LossSpikeMonitor(window=25, warmup=50, cooldown=100, ceiling_factor=50.0)
+        self.bwd_loss_monitor = LossSpikeMonitor(window=25, warmup=50, cooldown=100, ceiling_factor=50.0)
 
         set_seed(self.args.seed)
         if 'SLURM_PROCID' in os.environ:
@@ -78,7 +82,7 @@ class Modeller:
             else:
                 setattr(self, k, v)
 
-        self.rolling_tracker = MetricTracker(period=25)
+        self.rolling_tracker = MetricTracker(period=100)
 
         if self.args.anchor_fwd_bwd:
             self.args.fwd_to_bwd_ratio = 1.0E-6
@@ -102,11 +106,12 @@ class Modeller:
             'model_eval': self.ema_model.state_dict(),
             'modeller_state': self._get_modeller_state_dict(),
             'metrics': self.rolling_tracker.state_dict(),
+            'optimizers': {k: opt.state_dict() for k, opt in self.optimizers.items()},
         }
         path = self._checkpoint_path(tag)
         atomic_save(checkpoint, path)
 
-    def load_model_state(self, path):
+    def load_model_and_state(self, path, load_opt_state: bool = True):
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.gfn_config = checkpoint['gfn_config']
         self.gfn_model = GFN(**self.gfn_config).to(self.device)
@@ -119,6 +124,19 @@ class Modeller:
 
         self._set_modeller_state_dict(checkpoint['modeller_state'])
         self.rolling_tracker.load_state_dict(checkpoint.get('metrics', {}))
+        if load_opt_state:
+            self.load_optimizer_state(checkpoint)
+
+    def load_optimizer_state(self, checkpoint):
+        for key, opt in self.optimizers.items():
+            opt.load_state_dict(checkpoint['optimizers'][key])
+
+    def load_model_state(self, path):
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        self.gfn_model.load_state_dict(checkpoint['model_train'])
+        self.ema_model.load_state_dict(checkpoint['model_eval'])
+        self.gfn_model.train()
+        self.ema_model.eval()
 
     def _checkpoint_path(self, tag: str) -> str:
         return f'checkpoints/{self.run_name}_{tag}.pt'
@@ -155,28 +173,29 @@ class Modeller:
                                                               )))
             self.batch_size = new_batch_size  # gradually increment batch size
 
-    def step_lr_schedule(self, schedulers, optimizers):
-        lr = optimizers['fwd'].param_groups[0]['lr']
+    def step_lr_schedule(self):
+        lr = self.optimizers['fwd'].param_groups[0]['lr']
         if not self.lr_warmup_finished:
-            schedulers['policy_1'].step()
-            schedulers['policy_1b'].step()
+            self.schedulers['policy_1'].step()
+            self.schedulers['policy_1b'].step()
 
             if lr >= self.args.lr_policy:
                 self.lr_warmup_finished = True
 
         elif lr > self.args.min_lr:
-            schedulers['policy_2'].step()
-            schedulers['policy_2b'].step()
+            self.schedulers['policy_2'].step()
+            self.schedulers['policy_2b'].step()
 
-        schedulers['flow'].step()
+        self.schedulers['flow'].step()
 
         return lr
 
-    def ten_step_reporting(self, optimizers):
-        metrics = self.rolling_tracker.snapshot()
+    def ten_step_reporting(self):
+        metrics = {}
+        metrics.update(self.rolling_tracker.snapshot())
 
         for opt_type in ['fwd', 'bwd', 'flow']:
-            metrics.update({f'lr_{opt_type}': optimizers[opt_type].param_groups[0]['lr']})
+            metrics.update({f'lr_{opt_type}': self.optimizers[opt_type].param_groups[0]['lr']})
 
         metrics['Fwd to Bwd Ratio'] = self.args.fwd_to_bwd_ratio
         metrics.update(log_elapsed_times(self.times))
@@ -246,7 +265,7 @@ class Modeller:
         if self.args.checkpoint_path is not None:
             reload = True
             print(f"Loading model from checkpoint {self.args.checkpoint_path}")
-            self.load_model_state(self.args.checkpoint_path)
+            self.load_model_and_state(self.args.checkpoint_path)
 
         # todo rewrite hash logic
         elif os.path.exists(f'checkpoints/{self.run_name}_model_train.pt') and self.args.continue_from_checkpoint:
@@ -287,15 +306,16 @@ class Modeller:
 
         flow_params = self.gfn_model.flow_model.parameters()
 
-        optimizers = {}
+        self.optimizers = {}
         weight_decay = self.args.weight_decay if self.args.use_weight_decay else 0
-        optimizers['fwd'] = torch.optim.AdamW(get_policy_params(self.gfn_model), init_fwd_lr,
-                                              weight_decay=weight_decay)
-        optimizers['bwd'] = torch.optim.AdamW(get_policy_params(self.gfn_model), init_bwd_lr,
-                                              weight_decay=weight_decay)
-        optimizers['flow'] = torch.optim.AdamW(flow_params, init_flow_lr, weight_decay=weight_decay)
+        self.optimizers['fwd'] = torch.optim.Adam(get_policy_params(self.gfn_model), init_fwd_lr,
+                                                  weight_decay=weight_decay)
 
-        schedulers = {}
+        self.optimizers['bwd'] = torch.optim.Adam(get_policy_params(self.gfn_model), init_bwd_lr,
+                                                  weight_decay=weight_decay)
+        self.optimizers['flow'] = torch.optim.Adam(flow_params, init_flow_lr, weight_decay=weight_decay)
+
+        self.schedulers = {}
         lr_warmup_lambda = get_annealing_factor(1,
                                                 self.args.lr_warmup_ratio,
                                                 self.args.lr_warmup_time,
@@ -305,24 +325,22 @@ class Modeller:
                                                    self.args.lr_anneal_time,
                                                    10)
 
-        schedulers['policy_1'] = lr_scheduler.MultiplicativeLR(
-            optimizers['fwd'], lr_lambda=lambda epoch: lr_warmup_lambda)
-        schedulers['policy_2'] = lr_scheduler.MultiplicativeLR(
-            optimizers['fwd'], lr_lambda=lambda epoch: lr_annealing_lambda)
+        self.schedulers['policy_1'] = lr_scheduler.MultiplicativeLR(
+            self.optimizers['fwd'], lr_lambda=lambda epoch: lr_warmup_lambda)
+        self.schedulers['policy_2'] = lr_scheduler.MultiplicativeLR(
+            self.optimizers['fwd'], lr_lambda=lambda epoch: lr_annealing_lambda)
 
-        schedulers['policy_1b'] = lr_scheduler.MultiplicativeLR(
-            optimizers['bwd'], lr_lambda=lambda epoch: lr_warmup_lambda)
-        schedulers['policy_2b'] = lr_scheduler.MultiplicativeLR(
-            optimizers['bwd'], lr_lambda=lambda epoch: lr_annealing_lambda)
+        self.schedulers['policy_1b'] = lr_scheduler.MultiplicativeLR(
+            self.optimizers['bwd'], lr_lambda=lambda epoch: lr_warmup_lambda)
+        self.schedulers['policy_2b'] = lr_scheduler.MultiplicativeLR(
+            self.optimizers['bwd'], lr_lambda=lambda epoch: lr_annealing_lambda)
 
         flow_annealing_lambda = get_annealing_factor(1,
                                                      0.1,
                                                      self.args.lr_anneal_time,
                                                      10)
-        schedulers['flow'] = lr_scheduler.MultiplicativeLR(optimizers['flow'],
-                                                           lr_lambda=lambda epoch: flow_annealing_lambda)
-
-        return optimizers, schedulers
+        self.schedulers['flow'] = lr_scheduler.MultiplicativeLR(self.optimizers['flow'],
+                                                                lr_lambda=lambda epoch: flow_annealing_lambda)
 
     def init_prior_dataset(self):
         prior_data = torch.load(self.args.prior_path, weights_only=False)
@@ -361,19 +379,14 @@ class Modeller:
             self.init_gfn()
 
             # opt init
-            optimizers, schedulers = self.init_schedulers_optimizers()
+            self.init_schedulers_optimizers()
 
             # data init
             self.init_prior_dataset()
             self.init_mol_dataset()
 
-            # todo update this tracking
-            fwd_loss_dict = None
-            bwd_loss_dict = None
             oomed_out = False
-            fwd_loss, bwd_loss = 0, 0
-            loss_record = []
-
+            combo_loss_record = []
             self.times['initialization_end'] = time()
 
             wandb.watch(self.gfn_model,
@@ -385,6 +398,7 @@ class Modeller:
             self.set_detect_anomaly(do_anomaly_detection=self.args.anomaly_detection)
             init_step = self.step_ind * 1
             for self.step_ind in trange(init_step, self.args.epochs + 1):
+                current_loss = None
                 metrics = {}
                 if self.step_ind % 10 == 0:
                     self.set_loss_coeffs()
@@ -392,28 +406,27 @@ class Modeller:
                 step_type = self.train_logic(self.step_ind)
                 self.times['train_step_start'] = time()
                 try:
-                    self.train_step(step_type, optimizers)
+                    current_loss = self.train_step(step_type)
 
                     if (not oomed_out or (self.step_ind % 500 == 0)) and self.args.grow_batch_size:
                         self.increment_batch_size()
 
                 except (RuntimeError, ValueError) as e:  # if we do hit OOM, slash the batch size
                     oomed_out = self.handle_train_epoch_error(
-                        e, oomed_out, optimizers, step_type)
+                        e, oomed_out, step_type)
                 self.times['train_step_end'] = time()
 
                 # evaluation work
                 if (self.step_ind % self.args.eval_period == 0 and self.step_ind > 0) or self.step_ind == 50:
-                    metrics = self.evaluation(metrics)
+                    metrics.update(self.training_eval())
 
                 # train monitoring
                 if self.step_ind % 10 == 0:
-                    loss_record = self.check_loss_explosion(loss_record, optimizers)
-                    lr = self.step_lr_schedule(schedulers, optimizers)
-                    metrics = self.ten_step_reporting(optimizers)
-
-                    # if (self.fwd_tb_norm + self.bwd_tb_norm) < self.best_tb_norm:  # todo pick a new metric for this
-                    #     self.save_checkpoint('best')
+                    lr = self.step_lr_schedule()
+                    metrics.update(self.ten_step_reporting())
+                    self.monitor_losses(combo_loss_record, current_loss, step_type)
+                    if combo_loss_record[-1] <= np.amin(combo_loss_record):
+                         self.save_checkpoint('best')
 
                 if len(metrics) > 0:
                     wandb.log(metrics, step=self.step_ind, commit=True)
@@ -423,68 +436,43 @@ class Modeller:
 
             self.save_checkpoint('final')
 
+    def monitor_losses(self, combo_loss_record, current_loss, step_type):
+        if current_loss is not None:
+            if step_type[0]:
+                trig = self.fwd_loss_monitor.record(current_loss, self.step_ind)
+            else:
+                trig = self.bwd_loss_monitor.record(current_loss, self.step_ind)
+
+            combo_loss_record.append(self.fwd_loss_monitor.best_loss + self.bwd_loss_monitor.best_loss)
+
+            if trig:
+                self.fire_loss_spike()
+
+    def fire_loss_spike(self):
+        if os.path.exists(self._checkpoint_path('running')):
+            self.load_model_state(self._checkpoint_path('running'))
+
+        if not hasattr(self, 'lr_cut_count'):
+            self.lr_cut_count = 1
+        else:
+            self.lr_cut_count += 1
+
+        lr_cut_val = 0.75
+
+        for key, opt in self.optimizers.items():
+            opt.state = defaultdict(dict)  # wipe momentum buffers too
+            for g in opt.param_groups:
+                if g['lr'] > self.args.min_lr:
+                    g['lr'] = max(g['lr'] * lr_cut_val, self.args.min_lr)
+
+        if self.lr_cut_count > 0:
+            self.lr_warmup_finished = True
+
     def update_ema_model(self):
         if self.args.ema_decay is not None:
             update_ema(self.gfn_model, self.ema_model, decay=self.args.ema_decay)
         else:
             self.ema_model = self.gfn_model
-
-    def check_loss_explosion(self,
-                             loss_record: list,
-                             optimizers,
-                             explosion_buffer: float = 10,
-                             grace_time: int = 10):
-        """
-        If losses are exploding, reload best prior checkpoint and slash the learning rate
-
-        """
-        if len(loss_record) >= (grace_time * 2):
-            self.increasing_loss_cooldown -= 1
-
-            losses = torch.tensor(loss_record)
-            current_loss = losses[-1]
-            best_loss = torch.amin(losses)
-
-            scale = torch.quantile(torch.abs(losses[:-grace_time] - best_loss), 0.95) + 1e-4
-            threshold = best_loss + scale * explosion_buffer
-            diffs = torch.diff(losses, dim=0)
-
-            hit_threshold = current_loss > threshold  # loss exploding
-            increasing_loss = (torch.mean((diffs[
-                                               -grace_time:] > 0).float()) > 0.8) and self.increasing_loss_cooldown <= 0  # loss slowly increasing
-
-            if hit_threshold or increasing_loss:
-                print("Losses increasing! Reloading best checkpoint and slashing LR.")
-                if hit_threshold:
-                    print("Hit loss threshold!")
-                if increasing_loss:
-                    print(f"Losses increasing over prior {grace_time} steps!")
-
-                self.load_model_state(self._checkpoint_path('running'))
-
-                for key, opt in optimizers.items():
-                    if hit_threshold:
-                        opt.state = defaultdict(dict)  # wipe also the momentum buffers
-                    for g in opt.param_groups:
-                        if g['lr'] > self.args.min_lr:
-                            g['lr'] = max(g['lr'] * 0.9, self.args.min_lr)
-
-                if not hasattr(self, 'lr_cut_count'):
-                    self.lr_cut_count = 1
-                else:
-                    self.lr_cut_count += 1
-
-                if self.lr_cut_count > 5:
-                    self.lr_warmup_finished = True
-
-                if increasing_loss:
-                    self.increasing_loss_cooldown = grace_time
-
-                if hit_threshold:
-                    to_keep = torch.argwhere(losses <= threshold).flatten().tolist()
-                    loss_record = [rec for ind, rec in enumerate(loss_record) if ind in to_keep]
-
-        return loss_record
 
     def set_detect_anomaly(self, do_anomaly_detection: bool):
         if do_anomaly_detection:
@@ -501,16 +489,15 @@ class Modeller:
 
     def train_step(self,
                    step_type,
-                   optimizers,
                    ):
         do_forward, do_backward = step_type
 
         discretizer = get_discretizer(self.args.integrator)
 
-        optimizers['flow'].zero_grad(set_to_none=True)
+        self.optimizers['flow'].zero_grad(set_to_none=True)
 
         if do_forward:
-            optimizers['fwd'].zero_grad(set_to_none=True)
+            self.optimizers['fwd'].zero_grad(set_to_none=True)
             loss, crystal_batch, loss_dict = self.fwd_train_step(
                 discretizer,
                 return_exp=True,
@@ -520,7 +507,7 @@ class Modeller:
             del crystal_batch
 
         elif do_backward:
-            optimizers['bwd'].zero_grad(set_to_none=True)
+            self.optimizers['bwd'].zero_grad(set_to_none=True)
             loss, loss_dict = self.bwd_train_step(
                 discretizer,
                 repeats=self.args.repeats,
@@ -528,7 +515,7 @@ class Modeller:
         else:
             assert False
 
-        self.step_loss(do_backward, do_forward, loss, optimizers)
+        self.step_loss(do_backward, do_forward, loss)
 
         if self.step_ind % 5 == 0:
             st = 'fwd' if step_type[0] else 'bwd'
@@ -553,6 +540,7 @@ class Modeller:
 
         torch.cuda.synchronize()
         self.update_ema_model()
+        return loss.cpu().detach().item()
 
     def update_controller(self, it, do_backward, skip_step, eps=1e-3):
         update_this_step = it % 20 == 0
@@ -592,16 +580,16 @@ class Modeller:
 
         return skip_step
 
-    def step_loss(self, do_backward, do_forward, loss, optimizers):
+    def step_loss(self, do_backward, do_forward, loss):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.gfn_model.parameters(),
                                        self.args.gradient_norm_clip)  # gradient clipping
         if do_forward:
-            optimizers['fwd'].step()
-            optimizers['flow'].step()
+            self.optimizers['fwd'].step()
+            self.optimizers['flow'].step()
         elif do_backward:
-            optimizers['bwd'].step()
-            optimizers['flow'].step()
+            self.optimizers['bwd'].step()
+            self.optimizers['flow'].step()
 
     def fwd_train_step(self,
                        discretizer,
@@ -647,25 +635,29 @@ class Modeller:
             mol_batch, log_T_tensor, sg_inds, zps, condition = self.energy_function.condition_samples(
                 mol_batch)
             log_reward = -energy / log_T_tensor.exp()
-
+            if self.phase == 1:
+                condition = False  # ignore conditioning in data-driven prior training
+        assert repeats == 1, "repeats > 1 not yet supported!"
         loss, loss_dict = get_gfn_backward_loss(self.args.bwd_loss_coeffs,
                                                 latents.to(self.device),
                                                 self.gfn_model,
                                                 log_reward.to(self.device),
                                                 discretizer,
                                                 mol_batch,
-                                                condition=condition.to(self.device),
+                                                condition=condition,
                                                 repeats=repeats,
                                                 report_losses=report_losses)
 
         return loss, loss_dict
 
-    def handle_train_epoch_error(self, e, oomed_out, optimizers, step_type):
+    def handle_train_epoch_error(self, e, oomed_out, step_type):
         print(f"Caught error: {str(e)}")
         if is_cuda_oom(e):
             print("OOMED!")
+            if self.step_ind == 0:
+                return oomed_out
 
-            for opt in optimizers.values():
+            for opt in self.optimizers.values():
                 opt.zero_grad(set_to_none=True)
 
             # break reference cycles
@@ -716,6 +708,8 @@ class Modeller:
 
                 terminal_state = terminal_state.to(self.ema_model.device)
                 condition = condition.to(self.ema_model.device)
+                if self.phase == 1:
+                    condition = False
 
                 (backward_flow_states, b_log_pfs, b_log_pbs, log_z,
                  b_means_f, b_vars_f, b_means_b, b_vars_b) = self.ema_model.get_traj_bwd(
@@ -728,22 +722,21 @@ class Modeller:
                 continue
 
             cpu = lambda t: t.cpu().detach()
-            acc['backward_flow_states'].append(cpu(backward_flow_states))
-            acc['b_log_pfs'].append(cpu(b_log_pfs))
-            acc['b_log_pbs'].append(cpu(b_log_pbs))
-            acc['b_means_f'].append(cpu(b_means_f))
-            acc['b_vars_f'].append(cpu(b_vars_f))
-            acc['b_means_b'].append(cpu(b_means_b))
-            acc['b_vars_b'].append(cpu(b_vars_b))
+            acc['flow_states'].append(cpu(backward_flow_states))
+            acc['log_pfs'].append(cpu(b_log_pfs))
+            acc['log_pbs'].append(cpu(b_log_pbs))
+            acc['means_f'].append(cpu(b_means_f))
+            acc['logvars_f'].append(cpu(b_vars_f))
+            acc['means_b'].append(cpu(b_means_b))
+            acc['logvars_b'].append(cpu(b_vars_b))
             acc['log_r'].append(cpu(log_r))
-            acc['log_z'].append(cpu(log_z))
-            acc['b_packing_coeff'].append(cpu(mol_batch.packing_coeff))
+            acc['log_Z_learned'].append(cpu(log_z))
+            acc['packing_coeff'].append(cpu(mol_batch.packing_coeff))
 
         pooled = {k: torch.cat(v, dim=0) for k, v in acc.items()}
-        pooled['log_z'] = pooled['log_z'].mean()  # reduced once over pooled samples
         return pooled
 
-    def log_metrics(self, fwd_stats, sample_batch):
+    def log_metrics(self, fwd_stats, bwd_stats, sample_batch):
 
         metrics = {}
         arr = lambda t: t.cpu().detach().numpy()
@@ -754,6 +747,7 @@ class Modeller:
         log_pb = fwd_stats['log_pbs'].sum(-1)
         log_Z_learned = fwd_stats['log_Z']
         log_T_tensor = fwd_stats['log_T_tensor']
+        metrics.update({f'fwd_{k}': v for k, v in quick_tb_stats(log_pf, log_pb, log_Z_learned, log_r).items()})
 
         # energies
         for key in sample_batch.keys():
@@ -807,7 +801,8 @@ class Modeller:
 
         # metrics['ess'] = log_ess_frac(log_pf, log_pf, repeats=1)  # only useful with repeats > 1
         x, y = next(self.prior_dataset.loader(batch_size=10000, mode='tensors'))
-        metrics['wass'] = sliced_wasserstein(sample_batch.latent_params(), x)
+        metrics['wass'] = sliced_wasserstein(sample_batch.latent_params(), x,
+                                             n_proj=200)
 
         #
         # prior_sample = sample_backward_prior(self.args, buffer, sample_batch, len(std_params))
@@ -829,60 +824,58 @@ class Modeller:
                 sample_batch.packing_coeff < 0.95)
         metrics["Reasonable Sample Fraction"] = sample_is_good.float().mean().item()
 
-        metrics = {k: to_loggable(v) for k, v in metrics.items()}
+        """Backward stats"""
+
+        log_pf = bwd_stats['log_pfs'].sum(-1)
+        log_pb = bwd_stats['log_pbs'].sum(-1)
+        log_z = bwd_stats['log_Z_learned']
+        log_r = bwd_stats['log_r']
+        # parity / Z diagnostics (shared with fwd)
+        metrics.update({f'Bwd {k}': v for k, v in quick_tb_stats(log_pf, log_pb, log_z, log_r).items()})
+
+        "Gauss stats"
+        for prefix in ['Fwd', 'Bwd']:
+            if prefix == 'Fwd':
+                stats = fwd_stats
+            elif prefix == 'Bwd':
+                stats = bwd_stats
+            metrics[f'{prefix} Mean F Drift'] = stats['means_f'].abs().mean()
+            metrics[f'{prefix} Mean B Drift'] = stats['means_b'].abs().mean()
+            metrics[f'{prefix} Mean F Var'] = stats['logvars_f'].mean()
+            metrics[f'{prefix} Mean B Var'] = stats['logvars_b'].mean()
+            metrics = {k: to_loggable(v) for k, v in metrics.items()}
 
         return metrics
 
-    def evaluation(self, metrics):
-
+    def training_eval(self):
+        metrics = {}
         self.times['eval_step_start'] = time()
         eval_discretizer = lambda bsz: uniform_discretizer(bsz, self.args.eval_T)
 
         do_figs = self.step_ind % self.args.figs_period == 0
 
-        fwd_stats, gauss_stats, sample_batch = self.fwd_eval_sampling(eval_discretizer)
+        '''sampling and metrics analysis'''
+        fwd_stats, sample_batch = self.fwd_eval_sampling(eval_discretizer)
         bwd_stats = self.bwd_eval_sampling(eval_discretizer)
+        metrics.update(self.log_metrics(fwd_stats, bwd_stats, sample_batch))
 
-        '''fwd analysis'''
-        metrics.update(self.log_metrics(fwd_stats, sample_batch))
-
-        # run the same diagnostics on both directions, namespaced
-        metrics.update({f'fwd_{k}': v for k, v in quick_tb_stats(
-            fwd_stats['log_pfs'].sum(-1), fwd_stats['log_pbs'].sum(-1),
-            fwd_stats['log_z'], fwd_stats['log_r']).items()})
-        metrics.update({f'bwd_{k}': v for k, v in quick_tb_stats(
-            bwd_stats['log_pfs'].sum(-1), bwd_stats['log_pbs'].sum(-1),
-            bwd_stats['log_z'], bwd_stats['log_r']).items()})
         self.times['eval_figs_start'] = time()
         if do_figs:
+            x, y = self.prior_dataset.sample_tensors(10000, replace=True)
             # always sample from forward policy
-            fig_dict = fwd_figs(buffer,
-                                flow_states,
-                                log_Z_learned,
-                                log_pbs,
-                                log_pfs,
-                                log_r,
-                                gauss_params_f,
-                                sample_batch.detach().cpu(),
-                                )
+            fig_dict, metrics = eval_figs(fwd_stats,
+                                          bwd_stats,
+                                          sample_batch,
+                                          x,
+                                          self.args.energy_function,
+                                          metrics
+                                          )
         else:
             fig_dict = {}
         self.times['eval_figs_end'] = time()
 
-        '''bwd sampling and analysis are combined'''
-        if self.args.both_ways or self.args.bwd:
-            self.times['eval_bwd_figs_start'] = time()
-            bwd_metrics, bwd_fig_dict, rewards, btb_residual, normed_btb_residual = bwd_evaluation(
-                bwd_stats,
-                do_figs=do_figs)
-            self.times['eval_bwd_figs_end'] = time()
-
-            metrics.update(bwd_metrics)
-            fig_dict.update(bwd_fig_dict)
-
         '''logging and wrap up'''
         self.times['eval_wrapup_start'] = time()
-
         if do_figs:
             adjust_fig_filesize(fig_dict)
             metrics.update(fig_dict)
@@ -891,7 +884,6 @@ class Modeller:
         metrics.update({'Eval Batch Size': self.args.eval_batch_size})
         metrics.update(log_elapsed_times(self.times))
         self.times['eval_wrapup_end'] = time()
-
         self.times['eval_step_end'] = time()
 
         for key in metrics.keys():  # cleanup before logging
@@ -899,6 +891,10 @@ class Modeller:
                 metrics[key] = np.nan_to_num(metrics[key])
             elif torch.is_tensor(metrics[key]):
                 metrics[key] = torch.nan_to_num(metrics[key])
+
+        if self.phase == 1:
+            if metrics['wass'] < self.args.wass_threshold:
+                self.phase1to2()
 
         return metrics
 
@@ -922,7 +918,7 @@ class Modeller:
     def fwd_eval_sampling(self, eval_discretizer):
         self.times['eval_sampling_start'] = time()
 
-        acc, gauss_acc, eval_samples = defaultdict(list), defaultdict(list), []
+        acc, eval_samples = defaultdict(list), []
 
         while len(eval_samples) < self.args.eval_num_samples:
             try:
@@ -932,20 +928,18 @@ class Modeller:
                 init_state = get_gfn_init_state(self.args.eval_batch_size,
                                                 self.energy_function.data_ndim, self.device)
                 out = sample_eval_fwd_trajs(init_state, self.ema_model, eval_discretizer,
-                                            self.energy_function, mol_batch)
+                                            self.energy_function, mol_batch, no_conditioning=self.phase == 1)
             except (RuntimeError, ValueError) as e:
                 self._shrink_eval_batch_on_oom(e)
                 continue
 
-            for k, v in out['gauss_params'].items():
-                gauss_acc[k].append(v)
             eval_samples.extend(out.pop('sample_batch').batch_to_list())
-            out.pop('gauss_params')
+            for k, v in out.pop('gauss_params').items():
+                acc[k].append(v)
             for k, v in out.items():
                 acc[k].append(v)
 
         pooled = {k: torch.cat(v) for k, v in acc.items()}
-        gauss_params = {k: torch.cat(v) for k, v in gauss_acc.items()}
         sample_batch = collate_data_list(eval_samples, skip_default_exclusion=True)
 
         # Z estimates computed ONCE over the pooled trajectories
@@ -956,7 +950,7 @@ class Modeller:
 
         self.times['eval_sampling_end'] = time()
 
-        return pooled, gauss_params, sample_batch
+        return pooled, sample_batch
 
     def phase1to2(self):  # todo rewrite
         print("Hit initial KLD threshold. Starting prior thermalization.")
@@ -971,7 +965,8 @@ class Modeller:
         self.bwd_loss_schedule['noised_fraction'] = [(0, 0.0), (self.step_ind, self.args.anchor_noise_fraction)]
         self.bwd_loss_schedule['noise_level'] = [(0, 0.0), (self.step_ind, self.args.anchor_noise_level)]
         "set cooldowns"
-        self.increasing_loss_cooldown = self.args.phase_change_time  # give it time to adjust to new loss landscape
+        for d in self.increasing_loss_cooldown:
+            self.increasing_loss_cooldown[d] = self.args.phase_change_time
         "align log Z to buffer (it will converge to this value)"
         # z = metrics['Bwd Empirical log Z LB']# todo come back to thinking about this
         # with torch.no_grad():
@@ -993,7 +988,8 @@ class Modeller:
         self.fwd_loss_schedule['tb'] = [(0, 1.0), (self.step_ind, 0.0),
                                         (self.step_ind + self.args.phase_change_time // 2, 1.0)]
         "set cooldown"
-        self.increasing_loss_cooldown = self.args.phase_change_time
+        for d in self.increasing_loss_cooldown:
+            self.increasing_loss_cooldown[d] = self.args.phase_change_time
         self.grow_buffer = True
         self.std_boost_prob = self.args.p3_widevar_prob
         self.std_boost_var = self.args.p3_widevar_var

@@ -1,5 +1,12 @@
+from __future__ import annotations
+
 import json
+import math
 import sys
+from collections import deque
+from dataclasses import dataclass
+from statistics import median
+from typing import Deque, List, Optional
 
 import numpy as np
 import plotly
@@ -8,7 +15,7 @@ import torch
 from plotly.subplots import make_subplots
 from tqdm import tqdm
 
-from energy_sampling.utils import uniform_discretizer, get_gfn_init_state, embed_dataset, logmeanexp
+from energy_sampling.utils import uniform_discretizer, get_gfn_init_state, embed_dataset
 from mxtaltools.dataset_utils.utils import collate_data_list
 
 
@@ -143,17 +150,19 @@ def sample_crystals(
     else:
         return params_record, energy_record, density_record, sample_record
 
+
 @torch.no_grad()
 def sample_eval_fwd_trajs(init_state,
                           gfn_model,
                           discretizer,
                           energy_function,
-                          mol_batch,
+                          mol_batch, no_conditioning: bool = False,
                           sg_inds=None, z_primes=None):
     mol_batch, log_T_tensor, sg_inds, zps, condition = energy_function.condition_samples(
         mol_batch, sg_inds=sg_inds, z_primes=z_primes)
     condition = condition.to(gfn_model.device)
-
+    if no_conditioning:
+        condition = False
     (states, log_pfs, log_pbs, log_flow,
      means_f, logvars_f, means_b, logvars_b) = gfn_model.get_traj_fwd(
         init_state, discretizer, None, condition, mol_batch, return_gauss_params=True)
@@ -163,11 +172,11 @@ def sample_eval_fwd_trajs(init_state,
 
     cpu = lambda t: t.cpu().detach()
     return {
-        'flow_states':  cpu(states),
-        'log_r':        cpu(log_r),
-        'log_pfs':      cpu(log_pfs),
-        'log_pbs':      cpu(log_pbs),
-        'log_flow':     cpu(log_flow),
+        'flow_states': cpu(states),
+        'log_r': cpu(log_r),
+        'log_pfs': cpu(log_pfs),
+        'log_pbs': cpu(log_pbs),
+        'log_flow': cpu(log_flow),
         'log_T_tensor': cpu(log_T_tensor),
         'sample_batch': sample_batch.cpu().detach(),
         'gauss_params': {'means_f': cpu(means_f), 'logvars_f': cpu(logvars_f),
@@ -348,3 +357,315 @@ def big_staircse_comparison(dbatch, ebatch):
     fig.update_yaxes(showgrid=False, zeroline=False, ticks='outside', tickwidth=1)  # , range=[-1,1])
     fig.update_layout(height=2400, width=3000)
     return fig
+
+
+@dataclass(frozen=True)
+class Trigger:
+    """Result of a single record() call.
+
+    Truthy when it fires, so you can write `if monitor.record(loss): ...`.
+    `reason` is one of: "non-finite", "ceiling", "spike-factor", "spike-z",
+    "trend", or "" when it did not fire.
+    """
+
+    fire: bool
+    reason: str = ""
+    value: float = float("nan")
+    baseline: float = float("nan")
+    long_baseline: Optional[float] = None
+    z: Optional[float] = None
+    slope_rel: Optional[float] = None
+    call: int = 0
+    step: Optional[int] = None
+
+    def __bool__(self) -> bool:
+        return self.fire
+
+    def __str__(self) -> str:
+        if not self.fire:
+            return f"Trigger(fire=False, call={self.call})"
+        return (
+            f"Trigger(fire=True, reason={self.reason!r}, value={self.value:.4g}, "
+            f"baseline={self.baseline:.4g}, call={self.call}, step={self.step})"
+        )
+
+
+def _to_float(x) -> float:
+    """Coerce a scalar loss to a python float, accepting torch tensors."""
+    if hasattr(x, "detach"):
+        x = x.detach()
+    if hasattr(x, "item"):
+        try:
+            return float(x.item())
+        except Exception:
+            pass
+    return float(x)
+
+
+def _ols_slope(y: List[float]) -> float:
+    """Closed-form least-squares slope of y against x = 0, 1, ..., n-1."""
+    n = len(y)
+    if n < 2:
+        return 0.0
+    sx = (n - 1) * n / 2.0
+    sxx = (n - 1) * n * (2 * n - 1) / 6.0
+    sy = math.fsum(y)
+    sxy = math.fsum(i * yi for i, yi in enumerate(y))
+    denom = n * sxx - sx * sx
+    if denom == 0.0:
+        return 0.0
+    return (n * sxy - sx * sy) / denom
+
+
+class LossSpikeMonitor:
+    """Detects loss explosions / sustained increases / ceiling crossings.
+
+    Typical use (called every N training steps):
+
+        mon = LossSpikeMonitor(warmup=2000, cooldown=3000, ceiling_factor=8.0)
+        ...
+        if step % N == 0:
+            trig = mon.record(loss, step=step)   # pass your global step
+            if trig:
+                cut_lr()  # e.g. multiply every param_group["lr"] by 0.5
+
+    Detectors (disable any relative one by passing None):
+
+        ceiling_factor  blowout cap relative to the long-tail median: fires if
+                        value >= ceiling_factor * median(long_window), and only
+                        when that long median is positive. Tracks your loss
+                        scale instead of needing a hand-tuned constant.
+        spike_factor    fires if value >= spike_factor * baseline_median
+                        (only when the baseline is positive). Intuitive
+                        "the loss doubled" style check.
+        spike_z         robust outlier check: a modified z-score using the
+                        median absolute deviation of the window. Catches spikes
+                        even when the baseline is non-positive or noisy.
+        trend_rel       sustained-increase check: fits a line over the window and
+                        fires if the implied rise across the window is at least
+                        this fraction of the baseline (e.g. 0.5 -> ~50% rise).
+
+    Timescales: `window` and `long_window` are buffer sizes in *samples* (how
+    much history to keep for spike/trend and for the ceiling reference).
+    `warmup` and `cooldown` are measured against the `step` you pass to
+    record(), i.e. in *training steps* -- warmup=2000 means relative checks stay
+    dormant for the first 2000 steps, cooldown=3000 means ~3000 steps of quiet
+    after a fire. If you don't pass `step`, both fall back to counting record()
+    calls. `min_samples` is a separate floor (in samples) so the statistics stay
+    valid even if your step interval makes warmup map to very few samples. Only
+    non-finite ever fires during warmup.
+    """
+
+    def __init__(
+            self,
+            window: int = 20,
+            warmup: int = 200,
+            cooldown: int = 300,
+            ceiling_factor: Optional[float] = 8.0,
+            long_window: int = 200,
+            spike_factor: Optional[float] = 2.0,
+            spike_z: Optional[float] = 4.0,
+            trend_rel: Optional[float] = 0.5,
+            min_samples: int = 5,
+            reset_on_fire: bool = False,
+            name: str = "loss",
+    ):
+        if window < 2:
+            raise ValueError("window must be >= 2")
+        if long_window < window:
+            raise ValueError("long_window must be >= window")
+        self.window = int(window)
+        self.long_window = int(long_window)
+        self.warmup = max(0, int(warmup))  # in clock units (steps)
+        self.cooldown = max(0, int(cooldown))  # in clock units (steps)
+        self.min_samples = max(2, int(min_samples))
+        self.ceiling_factor = ceiling_factor
+        self.spike_factor = spike_factor
+        self.spike_z = spike_z
+        self.trend_rel = trend_rel
+        self.reset_on_fire = bool(reset_on_fire)
+        self.name = name
+        self.best_loss = torch.inf
+
+        self._hist: Deque[float] = deque(maxlen=self.window)
+        self._long_hist: Deque[float] = deque(maxlen=self.long_window)
+        self._calls = 0
+        self._clock: float = float("-inf")  # last seen step (or call no.)
+        self._start_clock: Optional[float] = None  # clock at first record
+        self._cooldown_until: float = float("-inf")
+        self._fires = 0
+
+    # ------------------------------------------------------------------ #
+    # introspection
+    # ------------------------------------------------------------------ #
+    @property
+    def baseline(self) -> float:
+        """Median of the current (short) window (NaN if empty)."""
+        return median(self._hist) if self._hist else float("nan")
+
+    @property
+    def long_baseline(self) -> float:
+        """Median of the long-tail buffer (NaN if empty)."""
+        return median(self._long_hist) if self._long_hist else float("nan")
+
+    @property
+    def in_cooldown(self) -> bool:
+        return self._clock < self._cooldown_until
+
+    @property
+    def num_fires(self) -> int:
+        return self._fires
+
+    def __len__(self) -> int:
+        return len(self._hist)
+
+    # ------------------------------------------------------------------ #
+    # main entry point
+    # ------------------------------------------------------------------ #
+    def record(self, value, step: Optional[int] = None) -> Trigger:
+        """Record one loss value and return a Trigger.
+
+        `value` may be a float or a torch/numpy scalar tensor.
+
+        `step` is your global training-step counter and acts as the clock for
+        `warmup` and `cooldown`. Pass it consistently (e.g. the same `step` you
+        gate the call on) and those windows are measured in training steps. If
+        you omit `step`, the monitor falls back to counting record() calls, so
+        `warmup`/`cooldown` are then in call units instead.
+        """
+        self._calls += 1
+        call = self._calls
+        v = _to_float(value)
+        if v < self.best_loss:
+            self.best_loss = v
+
+        clock = float(step) if step is not None else float(self._calls)
+        if self._start_clock is None:
+            self._start_clock = clock
+        self._clock = clock
+
+        base = median(self._hist) if self._hist else float("nan")
+        long_base = median(self._long_hist) if self._long_hist else float("nan")
+
+        # Warmup is elapsed clock since the first record, not a sample count, so
+        # it tracks training steps regardless of how often you call record().
+        # `min_samples` is a separate floor that keeps the statistics valid.
+        warm = (self._clock - self._start_clock) >= self.warmup
+
+        # --- non-finite is the only check that fires during warmup ------
+        reason: Optional[str] = None
+        if not math.isfinite(v):
+            reason = "non-finite"
+
+        # --- relative ceiling: blowout vs the slow long-tail median -----
+        # Needs the long buffer warmed up, and a positive reference (the
+        # multiplicative comparison is meaningless for a non-positive median;
+        # spike-z still backstops outliers in that regime).
+        if (
+                reason is None
+                and self.ceiling_factor is not None
+                and warm
+                and len(self._long_hist) >= self.min_samples
+                and long_base > 0.0
+                and v >= self.ceiling_factor * long_base
+        ):
+            reason = "ceiling"
+
+        z_val: Optional[float] = None
+        slope_rel: Optional[float] = None
+
+        # --- relative checks over the short window ----------------------
+        if reason is None and warm and len(self._hist) >= self.min_samples:
+            hist = list(self._hist)
+            b = median(hist)
+
+            # multiplicative spike
+            if (
+                    self.spike_factor is not None
+                    and b > 0.0
+                    and v >= self.spike_factor * b
+            ):
+                reason = "spike-factor"
+
+            # robust z-score spike (modified z via MAD)
+            if reason is None and self.spike_z is not None:
+                dev = median([abs(x - b) for x in hist])
+                mad = 1.4826 * dev
+                # Floor the scale so an ultra-stable loss doesn't hair-trigger.
+                scale = max(mad, 1e-3 * abs(b), 1e-12)
+                z_val = (v - b) / scale
+                if z_val >= self.spike_z:
+                    reason = "spike-z"
+
+            # sustained upward trend
+            if reason is None and self.trend_rel is not None:
+                series = hist + [v]
+                slope = _ols_slope(series)
+                rise = slope * (len(series) - 1)
+                slope_rel = rise / max(abs(b), 1e-12)
+                if slope_rel >= self.trend_rel:
+                    reason = "trend"
+
+        # --- fire decision + cooldown ----------------------------------
+        fire = reason is not None and not self.in_cooldown
+
+        # Append AFTER baselines are computed so the current value never
+        # contributes to its own baseline. Keep appending during cooldown so
+        # the buffers stay current after a cut.
+        self._hist.append(v)
+        self._long_hist.append(v)
+
+        if fire:
+            self._fires += 1
+            self._cooldown_until = clock + self.cooldown
+            if self.reset_on_fire:
+                # Restart the short-window detectors on the new loss scale, but
+                # keep the long-tail reference so the ceiling stays meaningful.
+                self._hist.clear()
+
+        return Trigger(
+            fire=fire,
+            reason=reason or "",
+            value=v,
+            baseline=base,
+            long_baseline=long_base,
+            z=z_val,
+            slope_rel=slope_rel,
+            call=call,
+            step=step,
+        )
+
+    # ------------------------------------------------------------------ #
+    # checkpointing
+    # ------------------------------------------------------------------ #
+    def state_dict(self) -> dict:
+        """Serializable runtime state (config is not stored -- it comes from
+        the constructor when you rebuild the object)."""
+        return {
+            "hist": list(self._hist),
+            "long_hist": list(self._long_hist),
+            "calls": self._calls,
+            "clock": self._clock,
+            "start_clock": self._start_clock,
+            "cooldown_until": self._cooldown_until,
+            "fires": self._fires,
+        }
+
+    def load_state_dict(self, sd: dict) -> None:
+        self._hist = deque(sd.get("hist", []), maxlen=self.window)
+        self._long_hist = deque(sd.get("long_hist", []), maxlen=self.long_window)
+        self._calls = int(sd.get("calls", 0))
+        self._clock = float(sd.get("clock", float("-inf")))
+        sc = sd.get("start_clock", None)
+        self._start_clock = None if sc is None else float(sc)
+        self._cooldown_until = float(sd.get("cooldown_until", float("-inf")))
+        self._fires = int(sd.get("fires", 0))
+
+    def reset(self) -> None:
+        self._hist.clear()
+        self._long_hist.clear()
+        self._calls = 0
+        self._clock = float("-inf")
+        self._start_clock = None
+        self._cooldown_until = float("-inf")
+        self._fires = 0

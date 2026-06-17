@@ -1,4 +1,4 @@
-run_name: 'mk_dev'
+run_name: 'uncond_1'
 tag: 'dev'
 seed: 12345
 device: 'cuda'
@@ -9,9 +9,9 @@ anomaly_detection: False  # dramatic slowdown when True
 ################################################################
 continue_from_checkpoint: false
 continue_from_hit_prior: false
-mlip_path: 'D:\crystal_datasets\esen_s.pt' # C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model
-prior_path: 'D:\crystal_datasets\conditional\priors\14_1_elj.pt'
-molecules_path: 'D:\crystal_datasets\conditional\test_mols_1.pt'
+mlip_path:
+prior_path: '/scratch/mk8347/data/crystal_datasets/conditional/prior/14_1_elj.pt'
+molecules_path: '/scratch/mk8347/data/crystal_datasets/conditional/test_mols_1.pt'
 test_molecules_path: null
 checkpoint_path: null #'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints\dev_mk_dev_running.pt'
 
@@ -66,7 +66,7 @@ model:
 ################################################################
 batch_size: 25              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 1000
+max_batch_size: 10000
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
 eval_batch_size: 1000        # batch size for evaluation (adaptive)
 eval_num_samples: 1000       # minimum number of samples for evaluation
@@ -76,9 +76,9 @@ figs_period: 250             # how often to log custom figures EXPENSIVE # must 
 
 # SDE integration
 ################################################################
-eval_T: 5                  # diffusion trajectory length for inference
+eval_T: 25                  # diffusion trajectory length for inference
 integrator:
-  T: 5                        # static training diffusion length
+  T: 25                        # static training diffusion length
   min_traj_length: 10
   max_traj_length: 10
   traj_length_strategy: static # 'static'  or 'sampled'  will do random between min and max traj lengths
