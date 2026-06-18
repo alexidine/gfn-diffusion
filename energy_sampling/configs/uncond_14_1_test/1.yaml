@@ -85,7 +85,7 @@ model:
 molecule_conditioning: false
 molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/test_mols_1.pt
 phase_change_time: 25
-prior_path: /scratch/mk8347/data/crystal_datasets/conditional/prior/14_1_elj.pt
+prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/14_1_elj.pt
 reduction_coeff: 10.0
 repeats: 1
 reward_range: null

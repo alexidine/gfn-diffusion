@@ -10,7 +10,7 @@ anomaly_detection: False  # dramatic slowdown when True
 continue_from_checkpoint: false
 continue_from_hit_prior: false
 mlip_path:
-prior_path: '/scratch/mk8347/data/crystal_datasets/conditional/prior/14_1_elj.pt'
+prior_path: '/scratch/mk8347/data/crystal_datasets/conditional/priors/14_1_elj.pt'
 molecules_path: '/scratch/mk8347/data/crystal_datasets/conditional/test_mols_1.pt'
 test_molecules_path: null
 checkpoint_path: null #'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints\dev_mk_dev_running.pt'
