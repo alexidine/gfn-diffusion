@@ -554,28 +554,29 @@ class SimpleDataset:
     def __len__(self):
         return len(self.dataset)
 
-    def _sample_indices(self, batch_size, replace: Optional[bool] = None):
+    def _sample_indices(self, batch_size, replace: Optional[bool] = None, repeats: int = 1):
         n = len(self)
         if replace is None:
             replace = batch_size > n  # auto: only with-replacement when forced
 
         if replace:
-            return np.random.choice(n, size=batch_size, replace=True)
+            inds = np.random.choice(n, size=batch_size, replace=True)
+        elif batch_size <= n:
+            inds = np.random.choice(n, size=batch_size, replace=False)
+        else:
+            # batch_size > n but replace requested False:
+            # include every sample once, fill remainder with replacement
+            base = np.arange(n)
+            remainder = np.random.choice(n, size=batch_size - n, replace=True)
+            inds = np.concatenate([base, remainder])
 
-        # replace=False
-        if batch_size <= n:
-            return np.random.choice(n, size=batch_size, replace=False)
-
-        # batch_size > n but replace requested False:
-        # include every sample once, fill remainder with replacement
-        base = np.arange(n)
-        remainder = np.random.choice(n, size=batch_size - n, replace=True)
-        return np.concatenate([base, remainder])
-
+        if repeats > 1:
+            inds = np.repeat(inds, repeats)  # [a,a,a,b,b,b,...] consecutive grouping
+        return inds
 
     @torch.no_grad()
-    def sample_tensors(self, batch_size, replace: Optional[bool] = None):
-        inds = torch.as_tensor(self._sample_indices(batch_size, replace),
+    def sample_tensors(self, batch_size, replace: Optional[bool] = None, repeats: int = 1):
+        inds = torch.as_tensor(self._sample_indices(batch_size, replace, repeats),
                                device=self.device, dtype=torch.long)
         x = self.x[inds]
         y = self.y[inds] if self.y is not None else None
@@ -584,19 +585,20 @@ class SimpleDataset:
     @torch.no_grad()
     def sample_graphs(self, batch_size,
                       replace: Optional[bool] = None,
-                      exclude_keys=('symmetry_operators','smiles','identifier')):
-        inds = self._sample_indices(batch_size, replace)
+                      repeats: int = 1,
+                      exclude_keys=('symmetry_operators', 'smiles', 'identifier')):
+        inds = self._sample_indices(batch_size, replace, repeats)
         batch = collate_data_list([self.dataset[i] for i in inds],
                                   max_z_prime=self.max_z_prime,
                                   exclude_keys=list(exclude_keys))
         batch.orient_molecule(mode='std')
         return batch
 
-    def loader(self, batch_size, mode: str = 'tensors'):
+    def loader(self, batch_size, mode: str = 'tensors', repeats: int = 1):
         """Infinite random-batch generator. Use next() on it."""
         assert mode in ('tensors', 'graphs')
         while True:
             if mode == 'tensors':
-                yield self.sample_tensors(batch_size)
+                yield self.sample_tensors(batch_size, repeats=repeats)
             else:
-                yield self.sample_graphs(batch_size)
+                yield self.sample_graphs(batch_size, repeats=repeats)

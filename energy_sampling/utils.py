@@ -1137,6 +1137,6 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r):
         'emp_z_err': (z_emp - z_learned).abs().item(),
         'z_gap': (z_emp - z_jensen).item(),
         'resid_p05': resid.abs().detach().quantile(0.05).item(),
-        'resid_p95': resid.detach().quantile(0.95).item(),
+        'resid_p95': resid.abs().detach().quantile(0.95).item(),
         'resid_skew': skew.item(),  # sign tells you over- vs under-sampling dominance
     }

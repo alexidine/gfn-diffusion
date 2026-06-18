@@ -187,10 +187,10 @@ def get_gfn_backward_loss(loss_coeffs,
                           condition=None,
                           repeats=10,
                           report_losses: bool = False):
-    if gfn.conditional and any([
-        loss_coeffs.vg_lb > 0, loss_coeffs.vg_lme > 0
-    ]):
-        assert False, "Rewrite this method"
+
+    if gfn.conditional and repeats > 1:
+        assert False, "Not yet implemented"
+
     conditional_repeats = False
 
     states, log_pfs, log_pbs, log_flow = gfn.get_traj_bwd(
@@ -228,8 +228,8 @@ def get_gfn_backward_loss(loss_coeffs,
         mle_loss = terminal_mle(
             log_pf, log_pb,
             repeats,
-            conditional_repeats,
-            estimator='exact' if conditional_repeats else 'bound',
+            repeats > 1,
+            estimator='exact' if repeats > 1 else 'bound',
             dreg=True
         )
         losses.append(mle_loss * loss_coeffs.mle)

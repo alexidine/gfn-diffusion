@@ -624,20 +624,19 @@ class Modeller:
                        report_losses: bool = False):
         with torch.no_grad():
             if self.args.bwd_sampling_mode == 'dataset':
-                latents, energy = next(self.prior_dataset.loader(batch_size=self.batch_size, mode='tensors'))
+                latents, energy = next(self.prior_dataset.loader(batch_size=self.batch_size, mode='tensors', repeats=repeats))
             elif self.args.bwd_sampling_mode == 'model':
-                latents, energy = self.prior_model.sample_tensors(self.batch_size)
+                latents, energy = self.prior_model.sample_tensors(self.batch_size, repeats=repeats)
             else:
                 assert False, f"sampling method {self.args.sampling} not implemented"
             latents, energy = latents.to(self.device), energy.to(self.device)
-            mol_batch = next(self.mol_dataset.loader(batch_size=self.batch_size, mode='graphs'))
+            mol_batch = next(self.mol_dataset.loader(batch_size=self.batch_size, mode='graphs', repeats=repeats))
             mol_batch = mol_batch.to(self.device)
             mol_batch, log_T_tensor, sg_inds, zps, condition = self.energy_function.condition_samples(
                 mol_batch)
             log_reward = -energy / log_T_tensor.exp()
             if self.phase == 1:
                 condition = False  # ignore conditioning in data-driven prior training
-        assert repeats == 1, "repeats > 1 not yet supported!"
         loss, loss_dict = get_gfn_backward_loss(self.args.bwd_loss_coeffs,
                                                 latents.to(self.device),
                                                 self.gfn_model,
@@ -965,8 +964,8 @@ class Modeller:
         self.bwd_loss_schedule['noised_fraction'] = [(0, 0.0), (self.step_ind, self.args.anchor_noise_fraction)]
         self.bwd_loss_schedule['noise_level'] = [(0, 0.0), (self.step_ind, self.args.anchor_noise_level)]
         "set cooldowns"
-        for d in self.increasing_loss_cooldown:
-            self.increasing_loss_cooldown[d] = self.args.phase_change_time
+        # for d in self.increasing_loss_cooldown: # todo update this
+        #     self.increasing_loss_cooldown[d] = self.args.phase_change_time
         "align log Z to buffer (it will converge to this value)"
         # z = metrics['Bwd Empirical log Z LB']# todo come back to thinking about this
         # with torch.no_grad():
@@ -988,8 +987,8 @@ class Modeller:
         self.fwd_loss_schedule['tb'] = [(0, 1.0), (self.step_ind, 0.0),
                                         (self.step_ind + self.args.phase_change_time // 2, 1.0)]
         "set cooldown"
-        for d in self.increasing_loss_cooldown:
-            self.increasing_loss_cooldown[d] = self.args.phase_change_time
+        # for d in self.increasing_loss_cooldown:  # todo update this
+        #     self.increasing_loss_cooldown[d] = self.args.phase_change_time
         self.grow_buffer = True
         self.std_boost_prob = self.args.p3_widevar_prob
         self.std_boost_var = self.args.p3_widevar_var

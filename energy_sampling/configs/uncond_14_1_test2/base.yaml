@@ -1,4 +1,4 @@
-run_name: 'mk_dev'
+run_name: 'uncond_2'
 tag: 'dev'
 seed: 12345
 device: 'cuda'
@@ -9,9 +9,9 @@ anomaly_detection: False  # dramatic slowdown when True
 ################################################################
 continue_from_checkpoint: false
 continue_from_hit_prior: false
-mlip_path: 'D:\crystal_datasets\esen_s.pt' # C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model
-prior_path: 'D:\crystal_datasets\conditional\priors\unif.pt' #'D:\crystal_datasets\conditional\priors\14_1_elj.pt'
-molecules_path: 'D:\crystal_datasets\conditional\test_mols_1.pt'
+mlip_path:
+prior_path: '/scratch/mk8347/data/crystal_datasets/conditional/priors/14_1_elj.pt'
+molecules_path: '/scratch/mk8347/data/crystal_datasets/conditional/test_mols_1.pt'
 test_molecules_path: null
 checkpoint_path: null #'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints\dev_mk_dev_running.pt'
 
@@ -34,19 +34,19 @@ ema_decay: 0.95 #0.99  # set to null for no ema
 ################################################################
 model:
   # shared dimensions
-  s_emb_dim: 256             # dimensionality of state embedding
+  s_emb_dim: 1024             # dimensionality of state embedding
   t_dim: 128                   # dimensionality of time embedding
   harmonics_dim: 128           # dimensionality of harmonic embedding
   condition_embedding_dim: 4  # dimensionality of the conditioning embedding
   # per-sub-model architecture
   t_hidden_dim: 128          # time encoder hidden dim
-  s_hidden_dim: 256          # state encoder hidden dim
+  s_hidden_dim: 1024          # state encoder hidden dim
   s_layers: 4                 # state encoder layers
-  policy_hidden_dim: 256     # forward/backward policy hidden dim
+  policy_hidden_dim: 1024     # forward/backward policy hidden dim
   policy_layers: 4            # forward/backward policy layers
   flow_hidden_dim: 4       # flow model hidden dim
   flow_layers: 1              # flow model layers
-  cond_hidden_dim: 256       # conditioning embedding hidden dim
+  cond_hidden_dim: 1024       # conditioning embedding hidden dim
   cond_layers: 4              # conditioning embedding layers
   # regularization (shared)
   dropout: 0                  # dropout probability
@@ -66,13 +66,13 @@ model:
 ################################################################
 batch_size: 25              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 1000
+max_batch_size: 10000
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
-eval_batch_size: 4000        # batch size for evaluation (adaptive)
-eval_num_samples: 4000       # minimum number of samples for evaluation
+eval_batch_size: 1000        # batch size for evaluation (adaptive)
+eval_num_samples: 1000       # minimum number of samples for evaluation
 epochs: 100000             # number of training epochs
-eval_period: 500              # how often to do evaluation & reporting
-figs_period: 500             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+eval_period: 50              # how often to do evaluation & reporting
+figs_period: 250             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # SDE integration
 ################################################################
@@ -104,7 +104,7 @@ bwd_loss_coeffs:
 
 # training style
 both_ways: true             # forward and backward training
-repeats: 5                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
+repeats: 1                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
 fwd_to_bwd_ratio: 1          # whether to do forward (>1) or backward (<1) training more often - automatically set to ~0 for anchoring mode
 bwd: false                   # backward training only
 reward_range: null # range of reward values allowed, null to go unrestricted
@@ -127,7 +127,7 @@ temperature: 2.5 # 2.5 is room temperature kT in kJ/mol
 temperature_conditioning: False  # if false, temperatures are set to temperature, and there is no annealing
 molecule_conditioning: False  # conditions the generative prediction on the molecule
 sg_conditioning: False  # whether to conditionally sample across space groups
-space_groups: [ 1 ]  # which space groups to sample over
+space_groups: [ 14 ]  # which space groups to sample over
 zp_conditioning: false # whether to condition over z prime values
 z_primes: [ 1 ]
 # loss coefficients
