@@ -18,7 +18,7 @@ checkpoint_path: null #'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sam
 #Optimizers
 ################################################################
 lr_policy: 5.0e-4              # learning rate of the policy network
-min_lr: 1.0e-5                # ihn
+min_lr: 1.0e-6                # ihn
 lr_flow: 1.0                  # learning rate of the flow network
 lr_back: 5.0e-4                # learning rate of the backward pass
 lr_warmup_ratio: 100           # how much smaller the initial (warmup) LR should be than the max policy value
