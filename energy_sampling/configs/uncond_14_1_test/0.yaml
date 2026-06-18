@@ -69,10 +69,10 @@ model:
   harmonics_dim: 128
   learn_pb: true
   learned_variance: true
-  log_var_range: 6
+  log_var_range: 2
   norm: layer
   pb_drift_range: 0.2
-  pb_var_range: 6
+  pb_var_range: 2
   policy_hidden_dim: 1024
   policy_layers: 4
   s_emb_dim: 1024
@@ -80,7 +80,7 @@ model:
   s_layers: 4
   t_dim: 128
   t_hidden_dim: 128
-  t_scale: 0.05
+  t_scale: 0.025
   zero_init: false
 molecule_conditioning: false
 molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/test_mols_1.pt

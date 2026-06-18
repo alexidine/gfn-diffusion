@@ -80,7 +80,7 @@ model:
   s_layers: 4
   t_dim: 128
   t_hidden_dim: 128
-  t_scale: 0.05
+  t_scale: 0.75
   zero_init: false
 molecule_conditioning: false
 molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/test_mols_1.pt

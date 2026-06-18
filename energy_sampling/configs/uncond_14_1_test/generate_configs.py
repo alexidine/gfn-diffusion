@@ -36,6 +36,9 @@ if __name__ == "__main__":
                 config = deepcopy(base)
 
                 run_name = f"{base['run_name']}_{log_var_range}_{pb_var_range}_{t_scale}"
+                config['model']['log_var_range'] = log_var_range
+                config['model']['pb_var_range'] = pb_var_range
+                config['model']['t_scale'] = t_scale
                 config['run_name'] = run_name
                 config['tag'] = 'uncond_1'
                 config_path = f"{ind}.yaml"
