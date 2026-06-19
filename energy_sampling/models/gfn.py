@@ -280,7 +280,7 @@ class GFN(nn.Module):  # todo add seeding
         return scalar_embedding
 
     def get_traj_bwd(self, terminal_state, discretizer, condition, mol_batch,
-                     return_gauss_params: bool = False, detach_traj: bool = True, ):
+                     return_gauss_params: bool = False, detach_traj: bool = False):
         batch_size = terminal_state.shape[0]
         ts = discretizer(batch_size).to(self.device)
         trajectory_length = ts.shape[1] - 1

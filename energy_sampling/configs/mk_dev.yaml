@@ -10,7 +10,7 @@ anomaly_detection: False  # dramatic slowdown when True
 continue_from_checkpoint: false
 continue_from_hit_prior: false
 mlip_path: 'D:\crystal_datasets\esen_s.pt' # C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model
-prior_path: 'D:\crystal_datasets\conditional\priors\unif.pt' #'D:\crystal_datasets\conditional\priors\14_1_elj.pt'
+prior_path: 'D:\crystal_datasets\conditional\priors\14_1_elj.pt'
 molecules_path: 'D:\crystal_datasets\conditional\test_mols_1.pt'
 test_molecules_path: null
 checkpoint_path: null #'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints\dev_mk_dev_running.pt'
@@ -34,19 +34,19 @@ ema_decay: 0.95 #0.99  # set to null for no ema
 ################################################################
 model:
   # shared dimensions
-  s_emb_dim: 256             # dimensionality of state embedding
-  t_dim: 128                   # dimensionality of time embedding
-  harmonics_dim: 128           # dimensionality of harmonic embedding
-  condition_embedding_dim: 4  # dimensionality of the conditioning embedding
+  s_emb_dim: 1024             # dimensionality of state embedding
+  t_dim: 64                   # dimensionality of time embedding
+  harmonics_dim: 64           # dimensionality of harmonic embedding
+  condition_embedding_dim: 1024  # dimensionality of the conditioning embedding
   # per-sub-model architecture
-  t_hidden_dim: 128          # time encoder hidden dim
-  s_hidden_dim: 256          # state encoder hidden dim
+  t_hidden_dim: 1024          # time encoder hidden dim
+  s_hidden_dim: 1024          # state encoder hidden dim
   s_layers: 4                 # state encoder layers
-  policy_hidden_dim: 256     # forward/backward policy hidden dim
+  policy_hidden_dim: 1024     # forward/backward policy hidden dim
   policy_layers: 4            # forward/backward policy layers
-  flow_hidden_dim: 4       # flow model hidden dim
+  flow_hidden_dim: 1024       # flow model hidden dim
   flow_layers: 1              # flow model layers
-  cond_hidden_dim: 256       # conditioning embedding hidden dim
+  cond_hidden_dim: 1024       # conditioning embedding hidden dim
   cond_layers: 4              # conditioning embedding layers
   # regularization (shared)
   dropout: 0                  # dropout probability
@@ -68,8 +68,8 @@ batch_size: 25              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
 max_batch_size: 1000
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
-eval_batch_size: 4000        # batch size for evaluation (adaptive)
-eval_num_samples: 4000       # minimum number of samples for evaluation
+eval_batch_size: 1000        # batch size for evaluation (adaptive)
+eval_num_samples: 10000       # minimum number of samples for evaluation
 epochs: 100000             # number of training epochs
 eval_period: 500              # how often to do evaluation & reporting
 figs_period: 500             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
@@ -94,8 +94,8 @@ fwd_loss_coeffs:
   emp_z: 0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
   loss_clip: 1.0E+9
 bwd_loss_coeffs:
-  tb: 0.0 #1.0  # will be altered by bwd_tb_z - must be nonzero for log Z backwards-trained warm start
-  bwd_tb_z: 0.0 #2.0  # 2 if we should only train the Z component in tb, 1 if we should train log Z on backward TB, 0 if not. bwd tb must be >0
+  tb: 1.0 #1.0  # will be altered by bwd_tb_z - must be nonzero for log Z backwards-trained warm start
+  bwd_tb_z: 2.0 #2.0  # 2 if we should only train the Z component in tb, 1 if we should train log Z on backward TB, 0 if not. bwd tb must be >0
   vg_lb: 0
   vg_lme: 0  # exclusive with vg_lb
   emp_z: 0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss

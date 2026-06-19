@@ -3,7 +3,8 @@ import os
 from collections import defaultdict
 from copy import deepcopy
 
-from energy_sampling.eval.evaluations import to_loggable, sliced_wasserstein, adjust_fig_filesize, eval_figs
+from energy_sampling.eval.evaluations import to_loggable, sliced_wasserstein, adjust_fig_filesize, eval_figs, \
+    log_ess_frac
 from mxtaltools.common.utils import log_rescale_positive
 
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
@@ -798,7 +799,8 @@ class Modeller:
         d_eff = (explained_var_ratio ** 2).sum() ** -1
         metrics['Effective Dimension'] = d_eff.item()
 
-        # metrics['ess'] = log_ess_frac(log_pf, log_pf, repeats=1)  # only useful with repeats > 1
+        if self.args.repeats > 1:
+            metrics['ess'] = log_ess_frac(log_pf, log_pf, repeats=1)  # only useful with repeats > 1
         x, y = next(self.prior_dataset.loader(batch_size=10000, mode='tensors'))
         metrics['wass'] = sliced_wasserstein(sample_batch.latent_params(), x,
                                              n_proj=200)
@@ -830,13 +832,13 @@ class Modeller:
         log_z = bwd_stats['log_Z_learned']
         log_r = bwd_stats['log_r']
         # parity / Z diagnostics (shared with fwd)
-        metrics.update({f'Bwd {k}': v for k, v in quick_tb_stats(log_pf, log_pb, log_z, log_r).items()})
+        metrics.update({f'bwd {k}': v for k, v in quick_tb_stats(log_pf, log_pb, log_z, log_r).items()})
 
         "Gauss stats"
-        for prefix in ['Fwd', 'Bwd']:
-            if prefix == 'Fwd':
+        for prefix in ['fwd', 'bwd']:
+            if prefix == 'fwd':
                 stats = fwd_stats
-            elif prefix == 'Bwd':
+            elif prefix == 'bwd':
                 stats = bwd_stats
             metrics[f'{prefix} Mean F Drift'] = stats['means_f'].abs().mean()
             metrics[f'{prefix} Mean B Drift'] = stats['means_b'].abs().mean()
