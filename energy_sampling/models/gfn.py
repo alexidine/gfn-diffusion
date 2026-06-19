@@ -4,8 +4,10 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
+from narwhals._namespace import Namespace
 
 from energy_sampling.utils import gaussian_params
+from mxtaltools.models.graph_models.molecule_graph_model import VectorMoleculeGraphModel
 from mxtaltools.models.modules.components import scalarMLP
 from .architectures import FlowModel, NoneModule, LearnableScalar, TimeEncoding, StateEncoding, PolicyModel
 
@@ -24,7 +26,12 @@ class GFN(nn.Module):
                  learn_pb: bool = False, joint_layers: int = 2,
                  dropout: Optional[float] = 0, norm: Optional[str] = None,
                  zero_init: bool = False, device=torch.device('cuda'),
-                 max_z_prime: int = 1,
+                 max_z_prime: int = 1, conditions_type: str = 'vector',
+                 t_hidden_dim: int = 64,
+                 s_hidden_dim: int = 64, s_layers: int = 4,
+                 policy_hidden_dim: int = 64, policy_layers: int = 4,
+                 flow_hidden_dim: int = 64, flow_layers: int = 4,
+                 cond_hidden_dim: int = 64, cond_layers: int = 4,
                  ):
         super(GFN, self).__init__()
         self.dim = dim
@@ -39,6 +46,7 @@ class GFN(nn.Module):
         self.gfn_clip = gfn_clip  # clipping maximum step size
 
         self.conditional_flow_model = conditional_flow_model
+        self.conditional = conditional_flow_model
         self.learn_pb = learn_pb
 
         self.joint_layers = joint_layers
@@ -48,7 +56,99 @@ class GFN(nn.Module):
         self.var_clip = 16
         self.device = device
         self.max_z_prime = max_z_prime
+        self.conditions_type = conditions_type
 
+        self.get_periodic_dimensions(device)
+
+        #self.conditions_embedding_model = NoneModule()  # ditto
+        #self.flow_model = LearnableScalar()  # unified syntax with this instead of nn.Parameter
+        self.condition_embedding_dim = condition_embedding_dim
+
+        self.init_conditioner(cond_hidden_dim, cond_layers, condition_embedding_dim, conditions_dim,
+                              dropout, norm)
+
+        self.init_flow_model(condition_embedding_dim, dropout, flow_hidden_dim, flow_layers,
+                             norm)
+
+        self.t_model = TimeEncoding(harmonics_dim, t_dim, t_hidden_dim,
+                                    norm=norm, dropout=dropout)
+        self.s_model = StateEncoding(self.expanded_dim,
+                                     s_layers,
+                                     s_hidden_dim,
+                                     condition_embedding_dim if self.conditional else 0,
+                                     s_emb_dim,
+                                     norm=norm, dropout=dropout)
+        self.forward_policy = PolicyModel(dim, s_emb_dim, t_dim,
+                                          policy_hidden_dim, policy_layers, 2 * dim,
+                                          zero_init=zero_init,
+                                          norm=norm, dropout=dropout)
+        self.backward_policy = PolicyModel(dim, s_emb_dim, t_dim,
+                                           policy_hidden_dim, policy_layers, 2 * dim,
+                                           zero_init=zero_init,
+                                           norm=norm, dropout=dropout)
+
+        self.pb_drift_range = pb_drift_range
+        self.pb_var_range = pb_var_range
+
+    def init_conditioner(self, cond_hidden_dim, cond_layers, condition_embedding_dim, conditions_dim,
+                         dropout, norm):
+        if self.conditional:
+            if self.conditions_type == 'vector':
+                self.conditions_embedding_model = scalarMLP(input_dim=conditions_dim,
+                                                            norm=norm,
+                                                            dropout=dropout,
+                                                            layers=cond_layers,
+                                                            filters=cond_hidden_dim,
+                                                            output_dim=condition_embedding_dim,
+                                                            )
+
+            elif self.conditions_type == 'molecule':
+                # will return nice o(3) invariant embeddings from vector inputs
+                self.conditions_embedding_model = VectorMoleculeGraphModel(
+                    input_node_dim=1,
+                    num_mol_feats=conditions_dim,
+                    output_dim=condition_embedding_dim,
+                    concat_pos_to_node_dim=True,
+                    concat_mol_to_node_dim=False,
+                    fc_config=Namespace(
+                        num_layers=cond_layers,
+                        hidden_dim=cond_hidden_dim,
+                        norm=norm,
+                        vector_norm='vector ' + norm if norm is not None else None,
+                        dropout=dropout,
+                    ),
+                    graph_config=Namespace(
+                        node_dim=cond_hidden_dim,
+                        fcs_per_gc=1,
+                        message_dim=cond_hidden_dim // 4,
+                        embedding_dim=cond_hidden_dim,
+                        num_convs=cond_layers,
+                        num_radial=32,
+                        cutoff=6.0,
+                        max_num_neighbors=100,
+                        norm='graph ' + norm if norm is not None else None,
+                        vector_norm='graph vector ' + norm if norm is not None else None,
+                        dropout=0.0,
+                        v_embedding_dim=None,
+                        v_input_node_dim=1,
+                    )
+                )
+        else:  # we can pass arguments to this (conditions) but nothing will happen
+            self.conditions_embedding_model = NoneModule()
+
+    def init_flow_model(self, condition_embedding_dim, dropout, flow_hidden_dim, flow_layers, norm):
+        if self.conditional:
+            self.flow_model = scalarMLP(layers=flow_layers,
+                                        filters=flow_hidden_dim,
+                                        input_dim=condition_embedding_dim,
+                                        output_dim=1,
+                                        norm=norm,
+                                        dropout=dropout,
+                                        )
+        else:
+            self.flow_model = LearnableScalar()  # unified syntax with this instead of nn.Parameter
+
+    def get_periodic_dimensions(self, device):
         angs = [False] * 6
         for zp in range(self.max_z_prime):
             angs.extend([False, False, False])
@@ -56,56 +156,9 @@ class GFN(nn.Module):
             angs.extend([False, True, True])
             # phi and r dimensions arein rotational basis
         self.ang_mask = torch.tensor(angs, device=device)
-
         self.ang_dim = (self.ang_mask == True).sum().item()
         self.lin_dim = self.dim - self.ang_dim
         self.expanded_dim = self.lin_dim + self.ang_dim * 2
-
-        if self.conditional_flow_model:
-            self.conditions_embedding_model = scalarMLP(input_dim=conditions_dim,
-                                                        norm=norm,
-                                                        dropout=dropout,
-                                                        layers=joint_layers,
-                                                        filters=hidden_dim,
-                                                        output_dim=condition_embedding_dim,
-                                                        )
-            """  # will return nice o(3) invariant embeddings from vector inputs
-            self.conditions_embedding_model = vectorMLP(input_dim=scalar_conditions_dim,
-                                                        vector_input_dim = vector_conditions_dim,
-                                                        norm=norm,
-                                                        dropout=dropout,
-                                                        layers=joint_layers,
-                                                        filters=hidden_dim,
-                                                        output_dim=condition_embedding_dim,
-                                                        vector_output_dim=0
-                                                        )
-            """
-            self.flow_model = FlowModel(condition_embedding_dim,
-                                        hidden_dim,
-                                        joint_layers,
-                                        norm=norm,
-                                        dropout=dropout,
-                                        )
-        else:  # we can pass arguments to this (conditions) but nothing will happen
-            self.conditions_embedding_model = NoneModule()  # ditto
-            self.flow_model = LearnableScalar()  # unified syntax with this instead of nn.Parameter
-            condition_embedding_dim = 0
-
-        self.t_model = TimeEncoding(harmonics_dim, t_dim, hidden_dim,
-                                    norm=norm, dropout=dropout)
-        self.s_model = StateEncoding(self.expanded_dim, joint_layers, hidden_dim, condition_embedding_dim, s_emb_dim,
-                                     norm=norm, dropout=dropout)
-        self.forward_policy = PolicyModel(dim, s_emb_dim, t_dim,
-                                          hidden_dim, joint_layers, 2 * dim,
-                                          zero_init=zero_init,
-                                          norm=norm, dropout=dropout)
-        self.backward_policy = PolicyModel(dim, s_emb_dim, t_dim,
-                                           hidden_dim, joint_layers, 2 * dim,
-                                           zero_init=zero_init,
-                                           norm=norm, dropout=dropout)
-
-        self.pb_drift_range = pb_drift_range
-        self.pb_var_range = pb_var_range
 
     def split_params(self, tensor):
         mean, logvar_i = gaussian_params(tensor)
@@ -138,7 +191,15 @@ class GFN(nn.Module):
         current_state = initial_state
         states[:, 0] = current_state
 
-        condition_embedding = self.conditions_embedding_model(condition)
+        if self.conditional:
+            if condition is not False:
+                condition_embedding = self.get_condition_embedding(condition, mol_batch)
+            else:  # constant embedding
+                condition_embedding = torch.zeros((batch_size, self.condition_embedding_dim),
+                                                  dtype=torch.float32, device=self.device)
+        else:
+            condition_embedding = None
+
 
         logf = self.flow_model(condition_embedding).flatten()
 
@@ -204,7 +265,7 @@ class GFN(nn.Module):
         logvars_f[:, i, :] = pflogvars.detach()
 
     def get_traj_bwd(self, terminal_state, discretizer, condition,
-                     return_gauss_params: bool = False, detach_traj: bool = False):
+                     return_gauss_params: bool = False, detach_traj: bool = True):
         batch_size = terminal_state.shape[0]
         ts = discretizer(batch_size).to(self.device)
         trajectory_length = ts.shape[1] - 1

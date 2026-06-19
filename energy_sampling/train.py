@@ -286,11 +286,8 @@ class Modeller:
         energy_config = {
             'device': self.device,
             'energy_function': self.args.energy_function,
-            'min_temperature': self.args.energy_min_temperature,
-            'max_temperature': self.args.energy_max_temperature,
-            'temperature_scaling_factor': self.args.temperature_scaling_factor,
             'temperature_conditioning': self.args.temperature_conditioning,
-            'temperature': self.args.energy_static_temperature,
+            'temperature': self.args.temperature,
             'density_coeff': self.args.energy_density_coeff,
             'lj_coeff': self.args.energy_lj_coeff,
             'molecule_conditioning': self.args.molecule_conditioning,
@@ -307,6 +304,22 @@ class Modeller:
         }
         energy_function = MolecularCrystal(**energy_config)
         return energy_function
+
+    def _build_gfn_config(self, dim):
+        return dict(
+            dim=dim,
+            conditions_dim=self.get_conditioning_dim(),
+            conditions_type='molecule' if self.args.molecule_conditioning else 'vector',
+            conditional=any([
+                self.args.temperature_conditioning,
+                self.args.molecule_conditioning,
+                self.args.sg_conditioning,
+                self.args.zp_conditioning,
+            ]),
+            device=self.device,
+            max_z_prime=max(self.args.z_primes),
+            **vars(self.args.model),
+        )
 
     def init_gfn_model(self, energy_function):
         reload = False
@@ -340,38 +353,53 @@ class Modeller:
             ema_model = deepcopy(gfn_model)
             ema_model.load_state_dict(torch.load(eval_path))
         else:
+            # gfn_config = dict(
+            #     dim=energy_function.data_ndim,
+            #     s_emb_dim=self.args.s_emb_dim,
+            #     hidden_dim=self.args.hidden_dim,
+            #     conditions_dim=self.get_conditioning_dim(),
+            #     harmonics_dim=self.args.harmonics_dim,
+            #     t_dim=self.args.t_emb_dim,
+            #     condition_embedding_dim=self.args.condition_emb_dim,
+            #     clipping=self.args.clipping,
+            #     gfn_clip=self.args.gfn_clip,
+            #     learned_variance=self.args.learned_variance,
+            #     log_var_range=self.args.log_var_range,
+            #     pb_drift_range=self.args.pb_drift_range,
+            #     pb_var_range=self.args.pb_var_range,
+            #     t_scale=self.args.t_scale,
+            #     conditional_flow_model=any([
+            #         self.args.temperature_conditioning,
+            #         self.args.molecule_conditioning,
+            #         self.args.sg_conditioning,
+            #         self.args.zp_conditioning,
+            #     ]
+            #     ),
+            #     learn_pb=self.args.learn_pb,
+            #     joint_layers=self.args.joint_layers,
+            #     dropout=self.args.dropout,
+            #     norm=self.args.norm,
+            #     zero_init=self.args.zero_init,
+            #     device=self.device,
+            #     max_z_prime=max(self.args.z_primes),
+            # )
             gfn_config = dict(
                 dim=energy_function.data_ndim,
-                s_emb_dim=self.args.s_emb_dim,
-                hidden_dim=self.args.hidden_dim,
                 conditions_dim=self.get_conditioning_dim(),
-                harmonics_dim=self.args.harmonics_dim,
-                t_dim=self.args.t_emb_dim,
-                condition_embedding_dim=self.args.condition_emb_dim,
-                clipping=self.args.clipping,
-                gfn_clip=self.args.gfn_clip,
-                learned_variance=self.args.learned_variance,
-                log_var_range=self.args.log_var_range,
-                pb_drift_range=self.args.pb_drift_range,
-                pb_var_range=self.args.pb_var_range,
-                t_scale=self.args.t_scale,
+                conditions_type = 'vector',
                 conditional_flow_model=any([
                     self.args.temperature_conditioning,
                     self.args.molecule_conditioning,
                     self.args.sg_conditioning,
                     self.args.zp_conditioning,
-                ]
-                ),
-                learn_pb=self.args.learn_pb,
-                joint_layers=self.args.joint_layers,
-                dropout=self.args.dropout,
-                norm=self.args.norm,
-                zero_init=self.args.zero_init,
+                ]),
                 device=self.device,
                 max_z_prime=max(self.args.z_primes),
+                **vars(self.args.model)
             )
             gfn_model = GFN(**gfn_config).to(self.device)
             ema_model = deepcopy(gfn_model)
+
 
         return gfn_model, gfn_config, ema_model
 

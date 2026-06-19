@@ -33,10 +33,44 @@ max_batch_size: 2000
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
 eval_batch_size: 1000        # batch size for evaluation (adaptive)
 eval_num_samples: 1000       # minimum number of samples for evaluation
-epochs: 1000000000             # number of training epochs
+epochs: 501             # number of training epochs
 eval_period: 250              # how often to do evaluation & reporting
 figs_period: 250             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 conditional_eval_period: 1000 # DEPRECATED # how often to do conditional evaluation with figs # must be multiple of eval period
+
+model:
+  # shared dimensions
+  s_emb_dim: 1024             # dimensionality of state embedding
+  t_dim: 64                   # dimensionality of time embedding
+  harmonics_dim: 64           # dimensionality of harmonic embedding
+  condition_embedding_dim: 1024  # dimensionality of the conditioning embedding
+  # per-sub-model architecture
+  t_hidden_dim: 1024          # time encoder hidden dim
+  s_hidden_dim: 1024          # state encoder hidden dim
+  s_layers: 4                 # state encoder layers
+  policy_hidden_dim: 1024     # forward/backward policy hidden dim
+  policy_layers: 4            # forward/backward policy layers
+  flow_hidden_dim: 1024       # flow model hidden dim
+  flow_layers: 1              # flow model layers
+  cond_hidden_dim: 1024       # conditioning embedding hidden dim
+  cond_layers: 4              # conditioning embedding layers
+  hidden_dim: 1024
+  joint_layers: 4
+  # regularization (shared)
+  dropout: 0                  # dropout probability
+  norm: layer                 # null, "layer" - DON'T PUT 'batch'
+  zero_init: False
+  # SDE params
+  t_scale: 0.05               # scales fixed forward policy variance
+  log_var_range: 6            # controls dynamic range of learned policy variance
+  pb_drift_range: 0.2         # range of learned backward drift corrections
+  pb_var_range: 1             # range of learned backward policy variance
+  learn_pb: true              # whether to learn a correction to the backward policy
+  learned_variance: True      # whether to learn policy variance
+  clipping: true              # clip the maximum step size induced by the policy model
+  gfn_clip: 200.0             # clip value for policy step size
+
+
 
 # GFlowNet settings
 T: 10                        # static training diffusion length
@@ -175,4 +209,5 @@ energy_min_temperature: 0.1  # for conditional or annealing
 energy_max_temperature: 10   # for conditional only
 # note for physical potentials i.e., UMA - kT at room temperature is ~2.5
 energy_static_temperature: 2.5 # 2.5 is kT by the way for certain evaluations or static T training. Also initial temperature on unconditional temperature annealing
+temperature: 2.5
 temperature_scaling_factor: 0.01  # controls relative frequency of higher vs lower temperatures in conditional training (higher -> higher)
