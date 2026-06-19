@@ -1081,6 +1081,9 @@ def buffer_kld(buffer, metrics, sample_batch):
         latent_klds[ind] = compute_1d_kld(latent_params[:, ind], buffer_latent_params[:, ind])
     log_buffer_kld(cell_klds, metrics, latent_klds)
 
+    metrics['wass'] = sliced_wasserstein(sample_batch.latent_params(), torch.as_tensor(buffer_latent_params),
+                                         n_proj=200)
+
 
 def compute_1d_kld(p_data: np.ndarray,
                    q_data: np.ndarray,
@@ -1507,3 +1510,49 @@ def get_dimwise_coverage(test_samples, ref_samples, n_bins=24, tau=10, cmin=1):
         ref_cov[j] = covered
 
     return (per_dim_cov / ref_cov.clip(min=0.01)).clip(min=0, max=1)
+
+@torch.no_grad()
+def sliced_wasserstein(sampled_latents, prior_latents, n_proj=50, p=1, generator=None):
+    """
+    Sliced-Wasserstein distance between sampler output and the prior/buffer,
+    used as a support-aware monitoring curve.
+
+    Detects mode *invention* (mass where the target has none) as well as
+    dropping, because the random projections mix dimensions -- unlike per-dim
+    binned coverage it sees joint structure. Sizes need NOT match; compared
+    via quantiles, not sorted pairing.
+
+    Args:
+        sampled_latents: [N, D] latents from the sampler (std_params space).
+        prior_latents:   [M, D] latents from the prior/buffer (same space).
+        n_proj: number of random 1-D projection directions to average over.
+        p: Wasserstein order (1 = mean abs quantile gap, 2 = RMS).
+        generator: optional torch.Generator for reproducible projections.
+
+    Returns:
+        float >= 0. 0 == identical distributions (up to projection noise).
+    """
+    a = sampled_latents.detach()
+    b = prior_latents.detach().to(a.device, a.dtype)
+    D = a.shape[1]
+    assert b.shape[1] == D, "latent dims must match"
+
+    theta = torch.randn(D, n_proj, device=a.device, dtype=a.dtype, generator=generator)
+    theta = theta / theta.norm(dim=0, keepdim=True)
+
+    a_proj = a @ theta  # [N, n_proj]
+    b_proj = b @ theta  # [M, n_proj]
+
+    # 1-D OT per projection via quantile matching (handles N != M)
+    n_q = min(a.shape[0], b.shape[0])
+    qs = torch.linspace(0, 1, n_q, device=a.device, dtype=a.dtype)
+    a_q = torch.quantile(a_proj, qs, dim=0)  # [n_q, n_proj]
+    b_q = torch.quantile(b_proj, qs, dim=0)  # [n_q, n_proj]
+
+    gap = (a_q - b_q).abs()
+    if p == 1:
+        return gap.mean().item()
+    elif p == 2:
+        return gap.pow(2).mean().sqrt().item()
+    else:
+        return (gap.pow(p).mean() ** (1.0 / p)).item()
