@@ -89,7 +89,7 @@ thermalization_intercept_err: 100.0 #1.0 #1.0
 btb_threshold: 1.5 # DEPRECATED ratio of thermalization_conv_eps at which we activate emergency bwd training
 phase_change_time: 25 #250 #1000  # time to adjust loss coefficients between phases
 thermalization_conv_eps: 5.0 #0.5 # now used only for phase 2 to 3 transition
-init_kld_threshold: 2.0 #0.05
+init_kld_threshold: 0.0001 #0.05
 anchor_noise_fraction: 1.0
 anchor_noise_level: 0.5  # noise level for bwd samples (unused)
 p3_widevar_prob: 0.25
@@ -154,7 +154,7 @@ sg_conditioning: False  # whether to conditionally sample across space groups
 space_groups: [ 14 ]  # which space groups to sample over
 zp_conditioning: false # whether to condition over z prime values
 z_primes: [ 1 ]
-energy_function: 'mace'
+energy_function: 'elj'
   # 'latent_harmonic' : unimodal harmonic potential in the latent space
   # 'crystal_harmonic': unimodal harmonic potential in the crystal space
   # 'latent_multiharmonic': multimodal harmonic potential in the latent space

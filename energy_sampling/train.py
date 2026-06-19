@@ -456,6 +456,9 @@ class Modeller:
             prior_file = torch.load(self.args.buffer_path, weights_only=False)
             energy_function.lj_rescale = prior_file['thermal_scaling_factor']
             self.log_noise_range = prior_file['log_noise_range']
+            aa = torch.load(r"D:\crystal_datasets\conditional\priors\14_1_elj.pt",weights_only=False)
+            prior_file['prior_batch'] = aa['prior']
+            prior_file['noised_batch'] = aa['equalized_prior']
             buffer = self.add_dataset_to_buffer(prior_file,
                                                 buffer,
                                                 filter_unbound=True)
