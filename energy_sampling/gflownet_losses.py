@@ -101,18 +101,13 @@ def get_gfn_forward_loss(loss_coeffs,
         if reassign_sgs:
             mol_batch.sg_ind = sg_inds
 
-    if loss_coeffs.greedy > 0 or loss_coeffs.var > 0 or loss_coeffs.buffer > 0:
-        keep_grads = True
-    else:
-        keep_grads = False
-
     condition = condition.to(gfn.device)
     log_T_tensor = log_T_tensor.to(gfn.device)
     (states, log_pfs, log_pbs, log_flow) = gfn.get_traj_fwd(initial_state,
                                                             discretizer,
                                                             exploration_std,
                                                             condition,
-                                                            detach_traj=not keep_grads,
+                                                            detach_traj=(loss_coeffs.traj_grads == 0),
                                                             return_gauss_params=False,
                                                             )
 
@@ -121,7 +116,7 @@ def get_gfn_forward_loss(loss_coeffs,
                                            mol_batch,
                                            return_exp,
                                            states,
-                                           no_grad=(loss_coeffs.greedy == 0)
+                                           no_grad=loss_coeffs.reward_grads == 0
                                            )
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)

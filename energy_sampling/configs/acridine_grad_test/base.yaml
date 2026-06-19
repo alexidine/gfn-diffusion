@@ -1,5 +1,5 @@
-run_name: 'mk_dev'
-tag: 'dev'
+run_name: 'acridine_grad_test'
+tag: 'acridine_grad_test'
 seed: 12345
 device: 'cuda'
 lr_policy: 5.0e-4              # learning rate of the policy network
@@ -8,15 +8,15 @@ lr_flow: 1.0                  # learning rate of the flow network
 lr_back: 5.0e-4                # learning rate of the backward pass
 lr_warmup_ratio: 25           # how much smaller the initial (warmup) LR should be than the max policy value
 scheduler: True               # does LR warmup from lr/lr_warup_ratio -> lr -> min_lr over the warmup and annealing period
-lr_warmup_time: 1000
-lr_anneal_time: 200000
+lr_warmup_time: 2000
+lr_anneal_time: 100000
 weight_decay: 1.0E-4
 use_weight_decay: false
 gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weights
 ema_decay: 0.95 #0.99  # set to null for no ema
 
 # model parameters
-checkpoint_path: null
+checkpoint_path: null #/scratch/mk8347/csd_runs/datasets/nic12_model_train_hit_prior.pt # if you put the train model, it will automatically load the relevant config and eval model
 zero_init: False
 joint_layers: 4              # number of layers in forward/backward policy models
 hidden_dim: 1024             # dimensionality of hidden layer
@@ -29,27 +29,27 @@ norm: layer                   # null, "layer" - DON'T PUT 'batch'
 
 batch_size: 50              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 50
+max_batch_size: 3000
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
-eval_batch_size: 100        # batch size for evaluation (adaptive)
-eval_num_samples: 1000       # minimum number of samples for evaluation
-epochs: 1000000000             # number of training epochs
-eval_period: 50              # how often to do evaluation & reporting
-figs_period: 50             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+eval_batch_size: 2000        # batch size for evaluation (adaptive)
+eval_num_samples: 2000       # minimum number of samples for evaluation
+epochs: 1000000             # number of training epochs
+eval_period: 500              # how often to do evaluation & reporting
+figs_period: 1000             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 conditional_eval_period: 1000 # DEPRECATED # how often to do conditional evaluation with figs # must be multiple of eval period
 
 # GFlowNet settings
-T: 10                        # static training diffusion length
-eval_T: 10                  # diffusion trajectory length for inference
-min_traj_length: 10
-max_traj_length: 10
+T: 100                        # static training diffusion length
+eval_T: 100                  # diffusion trajectory length for inference
+min_traj_length: 100
+max_traj_length: 100
 traj_length_strategy: static # 'static'  or 'sampled'  will do random between min and max traj lengths
 discretizer_max_ratio: 15    # maximum ratio between randomly sampled step sizes - needs to be >25 for 15 steps, or 10 for 30 steps to get good coverage at extrema
 discretizer: uniform #'random'        # 'random' 'low_discrepancy' 'equidistant' 'uniform'
 t_scale: 0.05                 # scales fixed forward policy variance
 log_var_range: 6           # controls dynamic range of learned policy variance, when (-1) there is no fixed range or tanh containment
 pb_drift_range: 0.2          # range of learned backward drift corrections, only for 'brownian_bridge'
-pb_var_range: 1             # range of learned backward policy variance
+pb_var_range: 6             # range of learned backward policy variance
 energy: "molecular_crystal"  # "molecular_crystal"
 # set a constant or
 # as a set of line segments [[step, value], [step, value], ...]
@@ -64,8 +64,6 @@ fwd_loss_coeffs:
   var: 0  # deprecated
   overlap: 0  # deprecated
   buffer: 0  # deprecated
-  traj_grads: 1  # 1 or 0
-  reward_grads: 1  # must be 0 if traj_c
 
   var_cutoff: 0
   var_gamma: 0
@@ -83,19 +81,17 @@ bwd_loss_coeffs:
   loss_clip: 1.0E+9
 
 # for controlling 3-phase convergence protocol
-anchor_fwd_bwd: true #true  # whether to do this at all
+anchor_fwd_bwd: true  # whether to do this at all
 min_fwd_bwd_ratio: 0.01
 max_fwd_bwd_ratio: 1.0
-thermalization_slope_err: 100.0 #0.1 #0.1
-thermalization_intercept_err: 100.0 #1.0 #1.0
-btb_threshold: 100 # DEPRECATED ratio of thermalization_conv_eps at which we activate emergency bwd training
-phase_change_time: 25 #250 #1000  # time to adjust loss coefficients between phases
-thermalization_conv_eps: 100 #0.5 # now used only for phase 2 to 3 transition
-init_kld_threshold: 100 #0.05
+thermalization_slope_err: 0.05
+thermalization_intercept_err: 1.0
+btb_threshold: 1.5 # DEPRECATED ratio of thermalization_conv_eps at which we activate emergency bwd training
+phase_change_time: 1000  # time to adjust loss coefficients between phases
+thermalization_conv_eps: 0.5 # phase 2to3 only
+init_kld_threshold: 0.05
 anchor_noise_fraction: 1.0
-anchor_noise_level: 0.5  # noise level for bwd samples (unused)
-p3_widevar_prob: 0.25
-p3_widevar_var: 0.65  # range 0.5 to 1.0 is a 10x jump, exponential
+anchor_noise_level: 0.05 # much higher than this is a total disaster
 
 prior_coverage_ratio: 0.05  # [0, 1] fraction of uniform bin coverage that will satisfy the coverage metric
 both_ways: true             # forward and backward training
@@ -107,22 +103,18 @@ learned_variance: True       # whether to learn policy variance
 clipping: true  # clip the maximum step size induced by the policy model
 gfn_clip: 200.0  # clip the maximum step size induced by the policy model
 reward_range: 100 # range of reward values allowed, null to go unrestricted
+p3_widevar_prob: 0
+p3_widevar_var: 0
+
 
 # dataset settings
 ################################################################
 continue_from_checkpoint: false
 continue_from_hit_prior: false
-mlip_path: C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model #'D:\crystal_datasets\esen_s.pt'
-
-buffer_path: D:\crystal_datasets\acridine\may_acridine_sg14_zp1_prior_dataset.pt
-#molecules_path: 'D:/crystal_datasets/train_qm9.pt'
-molecules_path: D:\crystal_datasets\acridine\acridine_conformer.pt #'D:/crystal_datasets/mipcas\MIPCAS_standardized.pt'
-autoencoder_path: null # DEPRECATED 'D:/crystal_datasets/model_checkpoints/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
-#
-#buffer_path: '/scratch/mk8347/csd_runs/datasets/nicotinamide_sg_1_2.pt'
-#molecules_path: '/scratch/mk8347/csd_runs/datasets/nicotinamide.pt'
-#autoencoder_path: '/scratch/mk8347/csd_runs/models/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
-
+mlip_path: /scratch/mk8347/data/acr_112025_mh1_stagetwo.model #'/scratch/mk8347/models/uma/esen_s.pt'
+buffer_path: /scratch/mk8347/data/crystal_datasets/acridine/may_acridine_sg14_zp1_prior_dataset.pt
+molecules_path: /scratch/mk8347/data/crystal_datasets/acridine/acridine_conformer.pt
+autoencoder_path: null # '/scratch/mk8347/csd_runs/models/best_autoencoder_experiments_autoencoder_tests_otf_zinc_test9_2_24-01-09-15-05'
 
 # replay buffer settings
 # NOTE THESE SETTINGS CURRENTLY UNUSED - BUFFER IS SET TO PRELOADED PRIOR ONLY WITH RANDOM SAMPLING
@@ -131,13 +123,12 @@ beta: 1.0             # reward prioritized replay sampling: high beta = steep pr
 rank_weight: 1.0     # rank-based replay sampling: low rank_weight = steep prioritization
 buffer_dist_cutoff: 0.5  # 0.5 a bit loose, 0.75 a bit tight
 prioritized: null #"boltzmann"   # three kinds of replay training: random, reward prioritized (Boltzmann), rank-based
-kT_range: 6
+kT_range: 6  # confirm what this even does
 sampling: "buffer"  # no alternative for right now
-buffer_size: 20000          # size of replay buffer
+buffer_size: 100000          # size of replay buffer
 grow_buffer: false  # can be toggled on or off in certain training modes
 noised_buffer_length: 20000
-noised_max_steps: 25
-
+noised_max_steps: 10
 
 # exploration controls
 ################################################################
@@ -148,10 +139,10 @@ wd_max_steps: 10000  # number of steps to terminate the added variance
 
 # molecular crystal settings
 ################################################################
-molecule: 'xuldud'  # 'nicotinamide' or 'acridine' or 'qm9' for molecule-conditional training
+molecule: 'nehzor'  # 'nicotinamide' or 'acridine' or 'qm9' for molecule-conditional training
 temperature_conditioning: False  # if false, temperatures are set to energy_static_temperature, and there is no annealing
 molecule_conditioning: False  # MUST be true for molecule='qm9' and false else - conditions the generative prediction on the molecule
-mol_embedding_type: 'autoencoder'  # principal_axes or autoencoderd
+mol_embedding_type: 'autoencoder'  # principal_axes or autoencoder
 sg_conditioning: False  # whether to conditionally sample across space groups
 space_groups: [ 14 ]  # which space groups to sample over
 zp_conditioning: false # whether to condition over z prime values
