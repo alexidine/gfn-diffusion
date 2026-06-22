@@ -64,7 +64,8 @@ def run_analysis(config):
         if hasattr(exp_crystals, 'is_batch'):
             exp_crystals = exp_crystals.batch_to_list()
         if hasattr(config, 'identifiers'):
-            exp_crystals = [elem for elem in exp_crystals if elem.identifier in config.identifiers]
+            if config.identifiers is not None:
+                exp_crystals = [elem for elem in exp_crystals if elem.identifier in config.identifiers]
 
         ebatch = collate_data_list(exp_crystals)
         computes = ['lj', 'qlj', 'elj', 'silu', 'rdf', 'reduction_en']
@@ -142,7 +143,7 @@ def run_analysis(config):
         ebatch, sample_batch, results_dict, ebatch.num_graphs, sample_batch, results_dict, config.energy_function, cluster_labels, p_maxima, n_basins, indexed_cluster_labels)
 
     fig = combo_fig(
-        len(config.identifiers),
+        ebatch.num_graphs,
         n_basins,
         packing_coeffs,
         stats,

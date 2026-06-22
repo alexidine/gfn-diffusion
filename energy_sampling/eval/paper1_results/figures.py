@@ -1821,7 +1821,7 @@ def new_new_table(basin_colorscale, num_polymorphs, polymorph_colorscale, stats,
     bold_min_rows = {0}  # E
     bold_max_rows = {1}  # P
     header_vals = [""] + [f"Basin {i + 1}" for i in range(n_basins)]
-    heads = ['I', 'II']
+    heads = ['I', 'II', 'III','IV','V','VI','VII','VIII','IX','X']
     for ind in range(num_polymorphs):
         header_vals.append(f"Polymorph {heads[ind]}")
     cell_vals = [row_labels]
