@@ -25,7 +25,6 @@ def diagonal_gaussian_log_density(x, mu, sigma):
 
 
 def get_loss_reward(log_T_tensor, log_reward_fn, mol_batch, return_exp, states, no_grad: bool = True):
-
     x_T = states[:, -1]  # terminal state
     if no_grad:
         x_T = x_T.detach()
@@ -66,6 +65,7 @@ def soft_clip(x, cutoff):
     clipped = cutoff + torch.log1p(delta.clip(min=1e-3))  # log1p = log(1 + x), safer numerically
     return torch.where(abs_x <= cutoff, x, sign_x * clipped)
 
+
 def compute_tb_diagnostics(log_pf, log_pb, log_r, log_flow) -> dict:
     X_side = log_pf - log_pb
     Y_side = log_r - log_flow
@@ -87,6 +87,7 @@ def compute_tb_diagnostics(log_pf, log_pb, log_r, log_flow) -> dict:
         'scatter_err': np.std(tb_x - tb_y),
     }
 
+
 def get_gfn_forward_loss(loss_coeffs,
                          initial_state,
                          gfn,
@@ -102,7 +103,7 @@ def get_gfn_forward_loss(loss_coeffs,
                          ):
     if gfn.conditional and any([
         loss_coeffs.vg_lb > 0,
-        loss_coeffs.vg_lme > 0]): # todo rewrite all this
+        loss_coeffs.vg_lme > 0]):  # todo rewrite all this
         assert False, "Rewrite repeats method from sampler"
 
     keep_grads = False
@@ -113,7 +114,7 @@ def get_gfn_forward_loss(loss_coeffs,
                                                             exploration_std,
                                                             condition,
                                                             mol_batch,
-                                                            detach_traj=not keep_grads,
+                                                            detach_traj=loss_coeffs.traj_grads == 0,
                                                             return_gauss_params=False,
                                                             )
 
@@ -122,7 +123,7 @@ def get_gfn_forward_loss(loss_coeffs,
                                            mol_batch,
                                            return_exp,
                                            states,
-                                           no_grad=not keep_grads
+                                           no_grad=loss_coeffs.reward_grads == 0
                                            )
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)
@@ -187,14 +188,13 @@ def get_gfn_backward_loss(loss_coeffs,
                           condition=None,
                           repeats=10,
                           report_losses: bool = False):
-
     if gfn.conditional and repeats > 1:
         assert False, "Not yet implemented"
 
-    conditional_repeats = False
-
     states, log_pfs, log_pbs, log_flow = gfn.get_traj_bwd(
-        samples, discretizer, condition, mol_batch, return_gauss_params=False)
+        samples, discretizer, condition, mol_batch,
+        return_gauss_params=False,
+        detach_traj=loss_coeffs.traj_grads == 0)
 
     log_pf = log_pfs.sum(-1)
     log_pb = log_pbs.sum(-1)

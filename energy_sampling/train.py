@@ -58,8 +58,8 @@ class Modeller:
         torch.cuda.set_per_process_memory_fraction(self.args.cuda_memory_fraction, device=0)
         torch.cuda.init()  # create context with the cap already in place
 
-        self.fwd_loss_monitor = LossSpikeMonitor(window=25, warmup=50, cooldown=100, ceiling_factor=50.0)
-        self.bwd_loss_monitor = LossSpikeMonitor(window=25, warmup=50, cooldown=100, ceiling_factor=50.0)
+        self.fwd_loss_monitor = LossSpikeMonitor(window=200, warmup=250, cooldown=100, ceiling_factor=10.0)
+        self.bwd_loss_monitor = LossSpikeMonitor(window=200, warmup=250, cooldown=100, ceiling_factor=10.0)
 
         set_seed(self.args.seed)
         if 'SLURM_PROCID' in os.environ:
@@ -345,7 +345,19 @@ class Modeller:
 
     def init_prior_dataset(self):
         prior_data = torch.load(self.args.prior_path, weights_only=False)
-        self.prior_dataset = SimpleDataset(prior_data['equalized_prior'],
+        prior = prior_data['equalized_prior']
+        prior['smiles'] = None
+        prior['identifier'] = None
+        if not hasattr(prior, self.args.energy_function):
+            prior = prior.to(self.device)
+            energy, prior = self.energy_function.batched_analyze_crystal_batch(
+                prior.latent_params(),
+                prior,
+                self.args.temperature * torch.ones((prior.num_graphs), dtype=torch.float32, device=self.device),
+                return_batch=True
+            )
+
+        self.prior_dataset = SimpleDataset(prior,
                                            device='cpu',
                                            max_z_prime=max(self.args.z_primes),
                                            x_fn=None,  # 'latent_params',
@@ -427,7 +439,7 @@ class Modeller:
                     metrics.update(self.ten_step_reporting())
                     self.monitor_losses(combo_loss_record, current_loss, step_type)
                     if combo_loss_record[-1] <= np.amin(combo_loss_record):
-                         self.save_checkpoint('best')
+                        self.save_checkpoint('best')
 
                 if len(metrics) > 0:
                     wandb.log(metrics, step=self.step_ind, commit=True)
@@ -446,7 +458,7 @@ class Modeller:
 
             combo_loss_record.append(self.fwd_loss_monitor.best_loss + self.bwd_loss_monitor.best_loss)
 
-            if trig:
+            if False: #trig:
                 self.fire_loss_spike()
 
     def fire_loss_spike(self):
@@ -625,7 +637,8 @@ class Modeller:
                        report_losses: bool = False):
         with torch.no_grad():
             if self.args.bwd_sampling_mode == 'dataset':
-                latents, energy = next(self.prior_dataset.loader(batch_size=self.batch_size, mode='tensors', repeats=repeats))
+                latents, energy = next(
+                    self.prior_dataset.loader(batch_size=self.batch_size, mode='tensors', repeats=repeats))
             elif self.args.bwd_sampling_mode == 'model':
                 latents, energy = self.prior_model.sample_tensors(self.batch_size, repeats=repeats)
             else:
@@ -734,6 +747,8 @@ class Modeller:
             acc['packing_coeff'].append(cpu(mol_batch.packing_coeff))
 
         pooled = {k: torch.cat(v, dim=0) for k, v in acc.items()}
+        if not self.gfn_model.conditional:
+            pooled['log_Z_learned'] = torch.mean(pooled['log_Z_learned'])
         return pooled
 
     def log_metrics(self, fwd_stats, bwd_stats, sample_batch):
@@ -804,20 +819,6 @@ class Modeller:
         x, y = next(self.prior_dataset.loader(batch_size=10000, mode='tensors'))
         metrics['wass'] = sliced_wasserstein(sample_batch.latent_params(), x,
                                              n_proj=200)
-
-        #
-        # prior_sample = sample_backward_prior(self.args, buffer, sample_batch, len(std_params))
-        #
-        # # this isn't SG conditioned, but that's OK because we're not really using it anymore anyway
-        # prior_coverage = get_dimwise_coverage(std_params, prior_sample.to('cpu'),
-        #                                       n_bins=24, cmin=1, tau=1 / 0.05)
-        # lattice_features = ['cell_a', 'cell_b', 'cell_c',
-        #                     'cell_alpha', 'cell_beta', 'cell_gamma',
-        #                     'aunit_x', 'aunit_y', 'aunit_z',
-        #                     'orientation_1', 'orientation_2', 'orientation_3']
-        # for ind, thing in enumerate(lattice_features):
-        #     metrics[f'{thing} coverage'] = prior_coverage[ind].item()
-        # metrics['Minimum 1d coverage'] = torch.amin(prior_coverage).item()
 
         # get fraction of samples which are 'reasonable' at this energy,
         en_func = self.energy_function.energy_function

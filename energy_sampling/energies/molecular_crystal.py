@@ -104,9 +104,8 @@ class MolecularCrystal(BaseSet):
         for sg in range(1, 230):
             self.sg_cache[sg] = np.stack(SYM_OPS[int(sg)])
 
-        self.computes = ['lj', 'reduction_en']
-        if self.energy_function != 'lj':
-            self.computes.append(self.energy_function)
+        self.computes = ['reduction_en']
+        self.computes.append(self.energy_function)
 
     def set_reward_clip(self, dataset_rewards):
         """
@@ -140,7 +139,7 @@ class MolecularCrystal(BaseSet):
 
         for key in out.keys():
             crystal_batch.add_graph_attr(out[key], key)
-        crystal_batch.add_graph_attr(log_rescale_positive(out['lj']), 'scaled_lj')
+        #crystal_batch.add_graph_attr(log_rescale_positive(out['lj']), 'scaled_lj')
 
         crystal_energy, ens_dict = self.generator_energy(crystal_batch, temperature, raw_latents=x)
 
@@ -162,7 +161,7 @@ class MolecularCrystal(BaseSet):
         ens_dict = {}
 
         latents = crystal_batch.latent_params()
-        if raw_latents is not None:
+        if False: #raw_latents is not None: # TODO undo this!
             bounding_energy = (F.relu(raw_latents - 1) ** 2 + F.relu(-(raw_latents + 1)) ** 2).sum(
                 dim=-1)  # discourage exploration beyond clip range
         else:
@@ -196,7 +195,7 @@ class MolecularCrystal(BaseSet):
             reduction_energy = torch.zeros_like(bounding_energy)
 
         if self.energy_function == 'latent_harmonic':
-            crystal_energy = self.latent_harmonic_en(crystal_batch, latents)
+            crystal_energy = getattr(crystal_batch, 'latent_harmonic')
 
         elif self.energy_function == 'crystal_harmonic':
             crystal_energy = self.crystal_harmonic_en(crystal_batch)
@@ -213,7 +212,7 @@ class MolecularCrystal(BaseSet):
         else:
             assert False, f'{self.energy_function} not implemented'
 
-        jacobian_energy = self.compute_jacobian(crystal_batch, temperature)
+        jacobian_energy = torch.zeros_like(bounding_energy) # TODO undo! self.compute_jacobian(crystal_batch, temperature)
 
         if self.energy_clip is not None:
 
@@ -306,17 +305,6 @@ class MolecularCrystal(BaseSet):
                                                                         crystal_batch.sg_ind[:1],
                                                                         crystal_batch.radius[:1])
         crystal_energy = 0.5 * (cell_params - self.crystal_modes[0]).pow(2).sum(dim=1)
-        # analytic Z = (2pi*T)^(d/2)
-        return crystal_energy
-
-    def latent_harmonic_en(self, crystal_batch, latents):
-        # a trivial energy function, for testing
-        if not hasattr(self, 'modes'):
-            self.modes = -torch.ones((1, self.dim), device=self.device)
-            self.crystal_modes = crystal_batch.latent_transform.inverse(self.modes,
-                                                                        crystal_batch.sg_ind[:1],
-                                                                        crystal_batch.radius[:1])
-        crystal_energy = 0.5 * (latents - self.modes[0]).pow(2).sum(dim=1)
         # analytic Z = (2pi*T)^(d/2)
         return crystal_energy
 

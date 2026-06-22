@@ -23,7 +23,7 @@ lr_flow: 1.0                  # learning rate of the flow network
 lr_back: 5.0e-4                # learning rate of the backward pass
 lr_warmup_ratio: 100           # how much smaller the initial (warmup) LR should be than the max policy value
 scheduler: True               # does LR warmup from lr/lr_warup_ratio -> lr -> min_lr over the warmup and annealing period
-lr_warmup_time: 2000
+lr_warmup_time: 1000
 lr_anneal_time: 20000
 weight_decay: 1.0E-4
 use_weight_decay: false
@@ -34,19 +34,19 @@ ema_decay: 0.95 #0.99  # set to null for no ema
 ################################################################
 model:
   # shared dimensions
-  s_emb_dim: 1024             # dimensionality of state embedding
+  s_emb_dim: 256             # dimensionality of state embedding
   t_dim: 64                   # dimensionality of time embedding
   harmonics_dim: 64           # dimensionality of harmonic embedding
-  condition_embedding_dim: 1024  # dimensionality of the conditioning embedding
+  condition_embedding_dim: 256  # dimensionality of the conditioning embedding
   # per-sub-model architecture
-  t_hidden_dim: 1024          # time encoder hidden dim
-  s_hidden_dim: 1024          # state encoder hidden dim
+  t_hidden_dim: 256          # time encoder hidden dim
+  s_hidden_dim: 256          # state encoder hidden dim
   s_layers: 4                 # state encoder layers
-  policy_hidden_dim: 1024     # forward/backward policy hidden dim
+  policy_hidden_dim: 256     # forward/backward policy hidden dim
   policy_layers: 4            # forward/backward policy layers
-  flow_hidden_dim: 1024       # flow model hidden dim
+  flow_hidden_dim: 256       # flow model hidden dim
   flow_layers: 1              # flow model layers
-  cond_hidden_dim: 1024       # conditioning embedding hidden dim
+  cond_hidden_dim: 256       # conditioning embedding hidden dim
   cond_layers: 4              # conditioning embedding layers
   # regularization (shared)
   dropout: 0                  # dropout probability
@@ -66,19 +66,19 @@ model:
 ################################################################
 batch_size: 25              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 1000
+max_batch_size: 10000
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
 eval_batch_size: 1000        # batch size for evaluation (adaptive)
-eval_num_samples: 10000       # minimum number of samples for evaluation
+eval_num_samples: 1000       # minimum number of samples for evaluation
 epochs: 100000             # number of training epochs
 eval_period: 500              # how often to do evaluation & reporting
 figs_period: 500             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # SDE integration
 ################################################################
-eval_T: 25                  # diffusion trajectory length for inference
+eval_T: 10                  # diffusion trajectory length for inference
 integrator:
-  T: 25                        # static training diffusion length
+  T: 10                        # static training diffusion length
   min_traj_length: 10
   max_traj_length: 10
   traj_length_strategy: static # 'static'  or 'sampled'  will do random between min and max traj lengths
@@ -92,6 +92,8 @@ fwd_loss_coeffs:
   vg_lb: 0.0
   vg_lme: 0  # exclusive with vg_lb
   emp_z: 0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
+  traj_grads: 1
+  reward_grads: 1
   loss_clip: 1.0E+9
 bwd_loss_coeffs:
   tb: 1.0 #1.0  # will be altered by bwd_tb_z - must be nonzero for log Z backwards-trained warm start
@@ -100,17 +102,18 @@ bwd_loss_coeffs:
   vg_lme: 0  # exclusive with vg_lb
   emp_z: 0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
   mle: 1.0 # 1.0  # will do weighted MLE if VG is running with repeats, otherwise trajectory-wise
+  traj_grads: 1
   loss_clip: 1.0E+9
 
 # training style
-both_ways: true             # forward and backward training
-repeats: 5                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
+both_ways: false             # forward and backward training
+repeats: 1                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
 fwd_to_bwd_ratio: 1          # whether to do forward (>1) or backward (<1) training more often - automatically set to ~0 for anchoring mode
 bwd: false                   # backward training only
 reward_range: null # range of reward values allowed, null to go unrestricted
 bwd_sampling_mode: 'dataset' # source for samples in backward training
 # for controlling 3-phase convergence protocol # todo consolidate / cleanup
-anchor_fwd_bwd: true #true  # whether to do this at all
+anchor_fwd_bwd: false #true  # whether to do this at all
 min_fwd_bwd_ratio: 0.01
 max_fwd_bwd_ratio: 1.0
 wass_threshold: 0.01  # threshold for phase 1-2 transition
@@ -122,7 +125,7 @@ thermalization_conv_eps: 5.0 #0.5 # now used only for phase 2 to 3 transition
 
 # energy function settings
 ################################################################
-energy_function: 'elj'
+energy_function: 'latent_harmonic'
 temperature: 2.5 # 2.5 is room temperature kT in kJ/mol
 temperature_conditioning: False  # if false, temperatures are set to temperature, and there is no annealing
 molecule_conditioning: False  # conditions the generative prediction on the molecule
