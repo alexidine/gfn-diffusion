@@ -3,36 +3,38 @@ tag: 'dev'
 seed: 12345
 device: 'cuda'
 cuda_memory_fraction: 0.9
-anomaly_detection: False  # dramatic slowdown when True
+anomaly_detection: false  # dramatic slowdown when True
 
 # Checkpoints
 ################################################################
 continue_from_checkpoint: false
-continue_from_hit_prior: false
 mlip_path: 'D:\crystal_datasets\esen_s.pt' # C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model
-prior_path: 'D:\crystal_datasets\conditional\priors\14_1_elj.pt'
+prior_path: 'D:\crystal_datasets\conditional\priors\multigauss.pt' #14_1_elj.pt'
 molecules_path: 'D:\crystal_datasets\conditional\test_mols_1.pt'
 test_molecules_path: null
-checkpoint_path: null #'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints\dev_mk_dev_running.pt'
+checkpoints_dir: 'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints'
+checkpoint_name: null #multip_prior.pt #unif_prior.pt #'t2.pt' #'t1t.pt' #'gauss_thermalized.pt'
+prior_model_name: null
 
 #Optimizers
 ################################################################
-lr_policy: 5.0e-4              # learning rate of the policy network
-min_lr: 1.0e-6                # ihn
-lr_flow: 1.0                  # learning rate of the flow network
-lr_back: 5.0e-4                # learning rate of the backward pass
+lr_policy: 1.0e-3              # learning rate of the policy network
+min_lr: 1.0e-5                # ihn
+lr_flow: 1.0                 # learning rate of the flow network
+lr_back: 1.0e-3                # learning rate of the backward pass
 lr_warmup_ratio: 100           # how much smaller the initial (warmup) LR should be than the max policy value
 scheduler: True               # does LR warmup from lr/lr_warup_ratio -> lr -> min_lr over the warmup and annealing period
-lr_warmup_time: 1000
-lr_anneal_time: 20000
+lr_warmup_time: 2000
+lr_anneal_time: 25000
 weight_decay: 1.0E-4
 use_weight_decay: false
 gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weights
-ema_decay: 0.95 #0.99  # set to null for no ema
+ema_decay: 0.95 #0.95 #0.95 #0.99  # set to null for no ema
 
 # model parameters
 ################################################################
 model:
+  full_flow: false           # true for subtb or db losses
   # shared dimensions
   s_emb_dim: 256             # dimensionality of state embedding
   t_dim: 64                   # dimensionality of time embedding
@@ -51,14 +53,14 @@ model:
   # regularization (shared)
   dropout: 0                  # dropout probability
   norm: layer                 # null, "layer" - DON'T PUT 'batch'
-  zero_init: False
+  zero_init: false
   # SDE params
   t_scale: 0.05               # scales fixed forward policy variance
   log_var_range: 6            # controls dynamic range of learned policy variance
-  pb_drift_range: 0.2         # range of learned backward drift corrections
+  pb_drift_range: 0.4         # range of learned backward drift corrections
   pb_var_range: 6             # range of learned backward policy variance
   learn_pb: true              # whether to learn a correction to the backward policy
-  learned_variance: True      # whether to learn policy variance
+  learned_variance: true      # whether to learn policy variance
   clipping: true              # clip the maximum step size induced by the policy model
   gfn_clip: 200.0             # clip value for policy step size
 
@@ -68,11 +70,11 @@ batch_size: 25              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
 max_batch_size: 10000
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
-eval_batch_size: 1000        # batch size for evaluation (adaptive)
-eval_num_samples: 1000       # minimum number of samples for evaluation
+eval_batch_size: 10000        # batch size for evaluation (adaptive)
+eval_num_samples: 10000       # minimum number of samples for evaluation
 epochs: 100000             # number of training epochs
-eval_period: 500              # how often to do evaluation & reporting
-figs_period: 500             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+eval_period: 250              # how often to do evaluation & reporting
+figs_period: 250             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # SDE integration
 ################################################################
@@ -91,42 +93,51 @@ fwd_loss_coeffs:
   tb: 1.0
   vg_lb: 0.0
   vg_lme: 0  # exclusive with vg_lb
+  db: 0.0
+  subtb: 0.0
+  subtb_lambda: 0.95
   emp_z: 0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
-  traj_grads: 1
-  reward_grads: 1
+  traj_grads: 1.0
+  reward_grads: 1.0
   loss_clip: 1.0E+9
+  beta: 10  # Huber beta
 bwd_loss_coeffs:
-  tb: 1.0 #1.0  # will be altered by bwd_tb_z - must be nonzero for log Z backwards-trained warm start
+  tb: 0.0 #1.0  # will be altered by bwd_tb_z - must be nonzero for log Z backwards-trained warm start
   bwd_tb_z: 2.0 #2.0  # 2 if we should only train the Z component in tb, 1 if we should train log Z on backward TB, 0 if not. bwd tb must be >0
   vg_lb: 0
   vg_lme: 0  # exclusive with vg_lb
+  pf_boost: 0
+  db: 0.0
+  subtb: 0.0
+  subtb_lambda: 0.9
   emp_z: 0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
   mle: 1.0 # 1.0  # will do weighted MLE if VG is running with repeats, otherwise trajectory-wise
-  traj_grads: 1
+  traj_grads: 1.0
   loss_clip: 1.0E+9
+  beta: 10  # Huber beta for TB-style losses
 
 # training style
-both_ways: false             # forward and backward training
-repeats: 1                   # for conditional training, multiplies batch size by this factor for VarGrad, var, buffer losses
+both_ways: true #true             # forward and backward training
+repeats: 1                   # for conditional training, multiplies batch size by this factor for VarGrad, MLE
 fwd_to_bwd_ratio: 1          # whether to do forward (>1) or backward (<1) training more often - automatically set to ~0 for anchoring mode
 bwd: false                   # backward training only
 reward_range: null # range of reward values allowed, null to go unrestricted
 bwd_sampling_mode: 'dataset' # source for samples in backward training
-# for controlling 3-phase convergence protocol # todo consolidate / cleanup
-anchor_fwd_bwd: false #true  # whether to do this at all
+# for controlling 3-phase convergence protocol
+anchor_fwd_bwd: true #true #true  # whether to do this at all
 min_fwd_bwd_ratio: 0.01
-max_fwd_bwd_ratio: 1.0
-wass_threshold: 0.01  # threshold for phase 1-2 transition
-thermalization_slope_err: 100.0 #0.1 #0.1
-thermalization_intercept_err: 100.0 #1.0 #1.0
-btb_threshold: 1.5 # DEPRECATED ratio of thermalization_conv_eps at which we activate emergency bwd training
-phase_change_time: 25 #250 #1000  # time to adjust loss coefficients between phases
-thermalization_conv_eps: 5.0 #0.5 # now used only for phase 2 to 3 transition
+max_fwd_bwd_ratio: 10.0
+wass_threshold: 0.02  # threshold for phase 1-2 transition
+thermal_threshold: 0.95  # threshold for R2 on the prior
+
+# buffer
+prior_buffer_min_size: 10000
+prior_buffer_max_size: 50000
 
 # energy function settings
 ################################################################
-energy_function: 'latent_harmonic'
-temperature: 2.5 # 2.5 is room temperature kT in kJ/mol
+energy_function: 'latent_multiharmonic'
+temperature: 1.0 # 2.5 is room temperature kT in kJ/mol
 temperature_conditioning: False  # if false, temperatures are set to temperature, and there is no annealing
 molecule_conditioning: False  # conditions the generative prediction on the molecule
 sg_conditioning: False  # whether to conditionally sample across space groups

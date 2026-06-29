@@ -221,10 +221,6 @@ def shifted_equidistant(bsz, traj_length, eps=1e-4):
     return torch.cat([torch.zeros(bsz, 1), steps, torch.ones(bsz, 1)], dim=1)
 
 
-def report_mem(tag=""):
-    gc.collect()
-    print(f"[{tag}] RSS = {psutil.Process(os.getpid()).memory_info().rss / 1e6:.2f} MB")
-
 
 def compute_sample_overlap(ref_x, sample_x=None, ga: float = 1.0, agg='sum'):
     if sample_x is None:
@@ -1073,40 +1069,78 @@ def log_elapsed_times(times):
 
 
 class MetricTracker:
-    """Step-aware EMA over arbitrary scalars, keyed by (direction, name)."""
+    """Step-aware EMA over arbitrary scalars, keyed by (direction, name).
+    Also tracks running min/max of the EMA per key."""
 
     def __init__(self, period: float = 25.0):
         self.period = period
         self.values = {}  # (direction, name) -> float
+        self.best = {}  # (direction, name) -> [min, max]
         self.last_it = {}  # direction -> step
+        self.changed_keys = set()
 
     def update(self, direction, scalars: dict, step: int):
         dt = max(step - self.last_it.get(direction, step), 1)
         alpha = 1.0 - np.exp(-dt / self.period)
+        self.changed_keys.clear()  # reset for this update
+
         for name, v in scalars.items():
             v = v.item() if torch.is_tensor(v) else float(v)
             if not np.isfinite(v):
-                continue  # reject, hold previous
-            prev = self.values.get((direction, name))
-            self.values[(direction, name)] = v if prev is None else (1 - alpha) * prev + alpha * v
+                continue
+            key = (direction, name)
+            prev = self.values.get(key)
+            nv = v if prev is None else (1 - alpha) * prev + alpha * v
+
+            self.values[key] = nv
+            self.changed_keys.add(key)  # mark as changed
+
+            b = self.best.get(key)
+            if b is None:
+                self.best[key] = [nv, nv]
+            else:
+                if nv < b[0]: b[0] = nv
+                if nv > b[1]: b[1] = nv
+
         self.last_it[direction] = step
 
     def get(self, direction, name, default=None):
         return self.values.get((direction, name), default)
 
-    def snapshot(self):
+    def get_best(self, direction, name, mode='max', default=None):
+        b = self.best.get((direction, name))
+        if b is None:
+            return default
+        return b[1] if mode == 'max' else b[0]
+
+
+    def snapshot(self, changed_only=False):
+        if changed_only:
+            return {f'{d}/{n}': v for (d, n), v in self.values.items()
+                    if v is not None and (d, n) in self.changed_keys}
         return {f'{d}/{n}': v for (d, n), v in self.values.items() if v is not None}
 
+
     def state_dict(self):
-        nested = {}
+        nested, best = {}, {}
         for (d, n), v in self.values.items():
             nested.setdefault(d, {})[n] = v
-        return {'period': self.period, 'last_it': dict(self.last_it), 'values': nested}
+        for (d, n), mm in self.best.items():
+            best.setdefault(d, {})[n] = list(mm)
+        return {'period': self.period, 'last_it': dict(self.last_it),
+                'values': nested, 'best': best}
 
     def load_state_dict(self, sd):
         self.period = sd.get('period', self.period)
         self.last_it = dict(sd.get('last_it', {}))
         self.values = {(d, n): v for d, kv in sd.get('values', {}).items() for n, v in kv.items()}
+        self.best = {(d, n): list(mm) for d, kv in sd.get('best', {}).items() for n, mm in kv.items()}
+
+    def rebase(self, step):
+        """After restoring values from a checkpoint, reset the EMA clock to `step`
+        so the first post-reload update uses a small dt, not the gap since the save."""
+        for d in self.last_it:
+            self.last_it[d] = step
 
 
 def quick_tb_stats(log_pf, log_pb, log_Z, log_r):
@@ -1116,7 +1150,8 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r):
     xc, yc = x - x.mean(), y - y.mean()
     slope = (xc * yc).sum() / (xc * xc).sum().clamp_min(1e-8)
     intercept = y.mean() - slope * x.mean()
-    r2 = 1 - ((yc - slope * xc) ** 2).sum() / (yc * yc).sum().clamp_min(1e-8)
+    # r2 = 1 - ((yc - slope * xc) ** 2).sum() / (yc * yc).sum().clamp_min(1e-8)
+    r2 = 1 - (resid ** 2).sum() / (yc * yc).sum().clamp_min(1e-8)  # CCC style - against the diagonal
 
     log_w = (log_r + log_pb - log_pf).detach()  # per-traj log importance weight
     z_jensen = log_w.mean()  # Jensen LB:  E[log w] <= log E[w]
@@ -1127,11 +1162,12 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r):
     resid_c = (resid - resid.mean())
     skew = (resid_c.pow(3).mean() / resid_c.pow(2).mean().pow(1.5).clamp_min(1e-8))
 
-    return {
+    mets = {
         'slope_err': (slope - 1).abs().item(),
         'intercept_err': intercept.abs().item(),
         'scatter_err': resid.std(unbiased=False).item(),
         'r2': r2.item(),
+        'tb_resid': resid.mean().item(),
         'tb_err': resid.pow(2).mean().sqrt().item(),
         'jensen_z_err': (z_jensen - z_learned).abs().item(),
         'emp_z_err': (z_emp - z_learned).abs().item(),
@@ -1139,4 +1175,154 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r):
         'resid_p05': resid.abs().detach().quantile(0.05).item(),
         'resid_p95': resid.abs().detach().quantile(0.95).item(),
         'resid_skew': skew.item(),  # sign tells you over- vs under-sampling dominance
+        'jensen_z': z_jensen.item(),
+        'emp_z': z_emp.item()
     }
+    mets.update(
+        online_tb_coverage(
+            log_pf, log_pb, log_Z, log_r, log_w_clamp = 10
+        )
+    )
+    return mets
+
+
+def online_tb_coverage(log_pf, log_pb, log_Z, log_r, log_w_clamp=10.0):
+    """
+    Fast per-batch coverage proxy. No reward bins, no max_reward, no min_count.
+    delta = log_pf + log_Z - log_pb - log_r        (delta < 0 at a terminal => P_F under-weights it)
+
+    Target-reweighted mean residual: E_pi[delta] estimated by self-normalized IS from
+    the on-policy / buffer batch, with weights w ∝ exp(log_r + log_pb - log_pf) = exp(-delta + log_Z).
+    This is the un-binned limit of  sum_b pi(b) * delta_bar_b  — the same forward-KL proxy,
+    without having to resolve the high-reward bin.
+    """
+    delta = (log_pf + log_Z - log_pb - log_r).detach()        # (B,)
+
+    # log importance weight toward pi (drop the constant log_Z; self-norm cancels it)
+    log_w = (log_r + log_pb - log_pf).detach()
+    log_w = log_w - log_w.max()                               # stabilize
+    log_w = log_w.clamp_min(-log_w_clamp)                     # tame the light tail; heavy tail already capped at 0
+    w = log_w.exp()
+    w_sum = w.sum().clamp_min(1e-12)
+
+    # self-normalized target-weighted mean residual  ~  E_pi[delta]
+    wmean = (w * delta).sum() / w_sum
+    ess   = w_sum.pow(2) / w.pow(2).sum().clamp_min(1e-12)    # Kish effective sample size
+
+    return {
+        'resid_wmean':     wmean.item(),                      # target-weighted: THE coverage gauge (<0 => missing high-r mass)
+        'capture_proxy':   wmean.clamp_max(0).exp().item(),   # exp(min(.,0)) — Jensen-style captured-fraction proxy
+        'ess':             ess.item(),                        # trust the wmean only when this isn't ~1
+        'ess_frac':        (ess / delta.numel()).item(),
+    }
+
+def binned_tb_residual(log_pf, log_pb, log_Z, log_r,
+                       bin_width=10.0, max_reward=None, n_bins=5, min_count=10):
+    resid = (log_pf + log_Z - log_pb - log_r).detach()   # δ ; <0 ⇒ missed mass
+    r = log_r.detach()
+    r_max = r.max() if max_reward is None else \
+            torch.as_tensor(max_reward, device=r.device, dtype=r.dtype)
+
+    out = {}
+    for i in range(n_bins):
+        lo = r_max - (i + 1) * bin_width
+        hi = r_max - i * bin_width
+        m = (r >= lo) if i == 0 else (r >= lo) & (r < hi)   # top bin catches r == r_max
+        n = int(m.sum())
+        if n >= min_count:
+            mean_d = resid[m].mean()
+            out[f'bin{i}_mean_resid'] = mean_d.item()                 # signed δ̄_b
+            out[f'bin{i}_capture']    = mean_d.clamp_max(0).exp().item()  # Jensen LB on captured mass
+        else:
+            out[f'bin{i}_mean_resid'] = float('nan')
+            out[f'bin{i}_capture']    = float('nan')
+        out[f'bin{i}_n'] = n
+
+    lo_tail = r_max - n_bins * bin_width                    # coarse catch-all tail
+    m = r < lo_tail
+    n = int(m.sum())
+    out['tail_mean_resid'] = resid[m].mean().item() if n >= min_count else float('nan')
+    out['tail_n'] = n
+    return out
+
+import torch
+
+def residual_reward_curve(log_pf, log_pb, log_Z, log_r,
+                          bin_width=5.0, max_reward=None, min_count=3,
+                          lengthscale=None, signal_var=None, n_grid=200):
+    """
+    Signal: δ̄(r) = E[δ | reward], δ = log_pf + log_Z - log_pb - log_r.
+    δ < 0 ⇒ missed mass at that reward level; capture = exp(min(δ̄, 0)).
+    Bins on the reward axis (comparable across runs), then a heteroscedastic GP
+    on the per-bin means with noise = SE_b^2, so sparse bins get wide bands.
+    Read capture_lo (the pessimistic band) for a conservative coverage statement.
+    """
+    resid = (log_pf + log_Z - log_pb - log_r).detach()       # δ
+    r = log_r.detach()
+    dev, dt = r.device, r.dtype
+    r_max = r.max() if max_reward is None else torch.as_tensor(max_reward, device=dev, dtype=dt)
+
+    # --- bin on reward axis, summarize ---
+    idx = ((r_max - r) / bin_width).floor().long().clamp_min(0)
+    nb  = int(idx.max()) + 1
+    ones = torch.ones_like(resid)
+    cnt = torch.zeros(nb, device=dev, dtype=dt).scatter_add_(0, idx, ones)
+    s1  = torch.zeros(nb, device=dev, dtype=dt).scatter_add_(0, idx, resid)
+    s2  = torch.zeros(nb, device=dev, dtype=dt).scatter_add_(0, idx, resid * resid)
+    mean = s1 / cnt.clamp_min(1)
+    var  = (s2 / cnt.clamp_min(1) - mean ** 2).clamp_min(0)
+    se   = (var / cnt.clamp_min(1)).sqrt()
+    ctr  = r_max - (torch.arange(nb, device=dev, dtype=dt) + 0.5) * bin_width
+
+    keep = cnt >= min_count
+    X, Y, N = ctr[keep], mean[keep], se[keep] ** 2 + 1e-6
+
+    # --- exact GP, RBF kernel, fixed hypers (heuristic; fine for a diagnostic) ---
+    ell = (2.0 * bin_width) if lengthscale is None else lengthscale
+    sf2 = (Y.var().clamp_min(1.0)) if signal_var is None else signal_var
+    rbf = lambda a, b: sf2 * torch.exp(-0.5 * (a[:, None] - b[None, :]) ** 2 / ell ** 2)
+
+    K = rbf(X, X) + torch.diag(N)
+    L = torch.linalg.cholesky(K)
+    alpha = torch.cholesky_solve(Y[:, None], L)
+
+    grid = torch.linspace(r.min(), r_max, n_grid, device=dev, dtype=dt)
+    Ks = rbf(grid, X)
+    mu = (Ks @ alpha).squeeze(-1)
+    v  = torch.cholesky_solve(Ks.t(), L)
+    sd = (sf2 - (Ks * v.t()).sum(-1)).clamp_min(0).sqrt()
+
+    return {
+        # simple per-bin view (this alone may be all you need)
+        "bin_center": ctr[keep], "bin_mean": Y, "bin_se": se[keep], "bin_n": cnt[keep],
+        # smooth GP view
+        "grid": grid, "gp_mean": mu, "gp_sd": sd,
+        "capture":    mu.clamp_max(0).exp(),
+        "capture_lo": (mu - 2 * sd).clamp_max(0).exp(),   # pessimistic — read this
+    }
+
+def _snapshot(opt):
+    return [p.detach().clone() for g in opt.param_groups
+            for p in g['params'] if p.requires_grad]
+
+
+def _update_ratio(opt, snap):
+    cur = [p for g in opt.param_groups for p in g['params'] if p.requires_grad]
+    dsq, wsq = 0.0, 0.0
+    for p, p0 in zip(cur, snap):
+        dsq += (p.detach() - p0).norm() ** 2
+        wsq += p.detach().norm() ** 2
+    return (dsq ** 0.5) / max(wsq ** 0.5, 1e-12)
+
+
+def _uw_from_snaps(pre, post):
+    upd_sq, wt_sq, max_ratio = 0.0, 0.0, 0.0
+    for prev, cur in zip(pre, post):
+        un = (cur - prev).norm().item()
+        wn = prev.norm().item()
+        upd_sq += un * un
+        wt_sq  += wn * wn
+        if wn > 0:
+            max_ratio = max(max_ratio, un / wn)
+    return {'uw_global': (upd_sq ** 0.5) / (wt_sq ** 0.5 + 1e-12),
+            'uw_max': max_ratio}

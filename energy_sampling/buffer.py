@@ -518,87 +518,465 @@ def collate_fn(data_list):
     return collate_data_list(data_list, exclude_unit_cell=True)
 
 
-class SimpleDataset:
+class CrystalBuffer:
     """
-    Lightweight, immutable prior dataset.
+    Prior dataset with per-sample bookkeeping.
 
-    Holds a fixed list of PyG graph objects plus precomputed tensors
-    x (latents) and optional scalars y. Supports random sampling of either
-    the raw tensors or collated PyG batches. No add/remove, no ops.
+    Holds a resident PyG Batch plus precomputed tensors x (latents) and optional
+    scalars y. Tracks an EMA loss and a selection count per sample.
+
+    Avoids batch -> data_list -> batch round trips during sampling, add, and purge.
+    Requires the Batch class to implement:
+        - subsample_new_batch(idx)
+        - append_batch(other)
     """
 
-    def __init__(self,
-                 data_list,
-                 device,
-                 max_z_prime: int = 1,
-                 x_fn=None,
-                 y_fn=None):
+    def __init__(
+            self,
+            data,
+            device,
+            max_z_prime: int = 1,
+            x_fn=None,
+            y_fn=None,
+    ):
         self.device = device
         self.max_z_prime = max_z_prime
-        if not isinstance(data_list, list):  # we accidentally loaded a batch
-            print("Loaded a batch into the prior rather than a data list")
-            data_list = data_list.batch_to_list()
+        self.x_fn = x_fn
+        self.y_fn = y_fn
 
-        self.dataset = data_list
+        self.batch = self._as_batch(data).to(device)
+        self.x, self.y = self._compute_xy(self.batch)
 
-        # collate once to pull out tensors
-        batch = collate_data_list(self.dataset, max_z_prime=max_z_prime)
-
-        x = batch.latent_params() if x_fn is None else batch[x_fn]
-        self.x = x.detach().to(device)
-        if y_fn is not None:
-            self.y = batch[y_fn]
-        else:
-            self.y = None
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def _sample_indices(self, batch_size, replace: Optional[bool] = None, repeats: int = 1):
         n = len(self)
-        if replace is None:
-            replace = batch_size > n  # auto: only with-replacement when forced
+        self.ema_loss = torch.full((n,), float("nan"), dtype=torch.float32)
+        self.select_counts = torch.zeros(n, dtype=torch.long)
 
-        if replace:
-            inds = np.random.choice(n, size=batch_size, replace=True)
-        elif batch_size <= n:
-            inds = np.random.choice(n, size=batch_size, replace=False)
+    # ---------------------------------------------------------------------
+    # Internals
+    # ---------------------------------------------------------------------
+
+    def _as_batch(self, data):
+        """
+        Accept either a list of Data objects or an existing Batch.
+        Collates only when absolutely necessary.
+        """
+        if isinstance(data, list):
+            return collate_data_list(data, max_z_prime=self.max_z_prime)
+
+        # Assume already a compatible PyG batch.
+        # You may want a stricter isinstance check here if you have a known Batch class.
+        if data.max_z_prime != self.max_z_prime:
+            data.max_z_prime = self.max_z_prime
+            data.aunit_handedness = data.aunit_handedness[:, :self.max_z_prime]
+            data.aunit_orientation = data.aunit_orientation[:, :3 * self.max_z_prime]
+            data.aunit_centroid = data.aunit_centroid[:, :3 * self.max_z_prime]
+            data.z_prime = data.z_prime.clip(max=self.max_z_prime)
+
+        data.box_analysis()
+        return data
+
+    def _compute_xy(self, batch):
+        """
+        Compute cached x/y tensors directly from a resident batch.
+        """
+        if self.x_fn is None:
+            x = batch.latent_params()
+        elif callable(self.x_fn):
+            x = self.x_fn(batch)
         else:
-            # batch_size > n but replace requested False:
-            # include every sample once, fill remainder with replacement
-            base = np.arange(n)
-            remainder = np.random.choice(n, size=batch_size - n, replace=True)
-            inds = np.concatenate([base, remainder])
+            x = batch[self.x_fn]
 
-        if repeats > 1:
-            inds = np.repeat(inds, repeats)  # [a,a,a,b,b,b,...] consecutive grouping
-        return inds
+        x = x.detach().to(self.device).contiguous()
 
-    @torch.no_grad()
-    def sample_tensors(self, batch_size, replace: Optional[bool] = None, repeats: int = 1):
-        inds = torch.as_tensor(self._sample_indices(batch_size, replace, repeats),
-                               device=self.device, dtype=torch.long)
-        x = self.x[inds]
-        y = self.y[inds] if self.y is not None else None
+        if self.y_fn is None:
+            y = None
+        elif callable(self.y_fn):
+            y = self.y_fn(batch).detach().to(self.device).contiguous()
+        else:
+            y = batch[self.y_fn].detach().to(self.device).contiguous()
+
         return x, y
 
-    @torch.no_grad()
-    def sample_graphs(self, batch_size,
-                      replace: Optional[bool] = None,
-                      repeats: int = 1,
-                      exclude_keys=('symmetry_operators', 'smiles', 'identifier')):
-        inds = self._sample_indices(batch_size, replace, repeats)
-        batch = collate_data_list([self.dataset[i] for i in inds],
-                                  max_z_prime=self.max_z_prime,
-                                  exclude_keys=list(exclude_keys))
-        batch.orient_molecule(mode='std')
+    def __len__(self):
+        return self.batch.num_graphs
+
+    def _sample_indices(
+            self,
+            batch_size: int,
+            replace: Optional[bool] = None,
+            repeats: int = 1,
+            p: Optional[np.ndarray] = None,
+            beta: float = 0.0,  # fraction drawn uniformly
+    ):
+        n = len(self)
+
+        if n == 0:
+            raise ValueError("Cannot sample from an empty SimpleDataset.")
+
+        if p is not None and beta > 0.0:
+            n_uniform = max(1, int(batch_size * beta))
+            n_weighted = batch_size - n_uniform
+
+            weighted_inds = np.random.choice(n, size=n_weighted, replace=True, p=p)
+            uniform_inds = np.random.choice(n, size=n_uniform, replace=n_uniform > n)
+            inds = np.concatenate([weighted_inds, uniform_inds])
+        elif p is not None:
+            inds = np.random.choice(n, size=n, replace=True, p=p)
+
+        else:
+            if replace is None:
+                replace = batch_size > n
+            inds = np.random.choice(n, size=batch_size, replace=replace, p=p)
+
+        if repeats > 1:
+            inds = np.repeat(inds, repeats)
+
+        return inds
+
+    def _bump_counts(self, inds):
+        """
+        Count by occurrence so repeats / replacement duplicates each register.
+        """
+        bc = np.bincount(np.asarray(inds), minlength=len(self))
+        self.select_counts += torch.as_tensor(bc, dtype=torch.long)
+
+    @staticmethod
+    def _drop_keys(batch, exclude_keys):
+        """
+        Optional post-subsample key removal, matching old sample_graphs behavior.
+
+        This is cheap relative to rebuilding from a data_list.
+        """
+        if exclude_keys is None:
+            return batch
+
+        for key in exclude_keys:
+            if key in batch._store:
+                del batch[key]
+
         return batch
 
-    def loader(self, batch_size, mode: str = 'tensors', repeats: int = 1):
-        """Infinite random-batch generator. Use next() on it."""
-        assert mode in ('tensors', 'graphs')
+    # ---------------------------------------------------------------------
+    # Sampling
+    # ---------------------------------------------------------------------
+
+    @torch.no_grad()
+    def sample_tensors(
+            self,
+            batch_size: int,
+            replace: Optional[bool] = None,
+            repeats: int = 1,
+            weighted: bool = False,
+            temperature: Optional[float] = None,
+            beta: Optional[float] = None,
+    ):
+        p = self._loss_weights(temperature) if weighted else None
+        inds = self._sample_indices(batch_size, replace=replace, repeats=repeats, p=p, beta=beta)
+        self._bump_counts(inds)
+
+        t_inds = torch.as_tensor(inds, device=self.device, dtype=torch.long)
+
+        x = self.x[t_inds]
+        y = self.y[t_inds] if self.y is not None else None
+
+        # numpy inds returned for update_losses
+        return x, y, inds
+
+    @torch.no_grad()
+    def sample_graphs(
+            self,
+            batch_size: int,
+            replace: Optional[bool] = None,
+            repeats: int = 1,
+            exclude_keys=("symmetry_operators", "smiles", "identifier"),
+            orient: bool = True,
+            weighted: bool = False,
+            temperature: Optional[float] = None,
+            beta: Optional[float] = None,
+    ):
+        p = self._loss_weights(temperature) if weighted else None
+        inds = self._sample_indices(batch_size, replace=replace, repeats=repeats, p=p, beta=beta)
+        self._bump_counts(inds)
+
+        # No data_list round trip.
+        graphs = self.batch.subsample_new_batch(inds)
+        graphs = self._drop_keys(graphs, exclude_keys)
+
+        if orient:
+            graphs.orient_molecule(mode="std")
+
+        return graphs, inds
+
+    def loader(
+            self,
+            batch_size: int,
+            mode: str = "tensors",
+            repeats: int = 1,
+            return_inds: bool = False,
+            weighted: bool = False,
+            temperature: Optional[float] = None,
+            beta: Optional[float] = None,
+    ):
+        """
+        Infinite random-batch generator. Use next() on it.
+        """
+        assert mode in ("tensors", "graphs")
+
         while True:
-            if mode == 'tensors':
-                yield self.sample_tensors(batch_size, repeats=repeats)
+            if mode == "tensors":
+                x, y, inds = self.sample_tensors(batch_size,
+                                                 repeats=repeats, weighted=weighted, temperature=temperature, beta=beta)
+                yield (x, y, inds) if return_inds else (x, y)
+
             else:
-                yield self.sample_graphs(batch_size, repeats=repeats)
+                graphs, inds = self.sample_graphs(batch_size,
+                                                  repeats=repeats, weighted=weighted, temperature=temperature, beta=beta)
+                yield (graphs, inds) if return_inds else graphs
+
+    # ---------------------------------------------------------------------
+    # Tracking
+    # ---------------------------------------------------------------------
+
+    @torch.no_grad()
+    def update_losses(
+            self,
+            losses,
+            indices,
+            beta: float = 0.9,
+    ):
+        losses = torch.as_tensor(losses, dtype=self.ema_loss.dtype).detach().cpu().flatten()
+        indices = torch.as_tensor(indices, dtype=torch.long)
+
+        if len(losses) != len(indices):
+            raise ValueError(
+                f"losses and indices must have same length, got "
+                f"{len(losses)} and {len(indices)}."
+            )
+
+        old = self.ema_loss[indices]
+        nan_mask = torch.isnan(old)
+
+        updated = torch.where(nan_mask, losses, beta * old + (1.0 - beta) * losses)
+
+        # handle duplicates: last write wins (same as sequential loop)
+        self.ema_loss[indices] = updated
+
+    # ---------------------------------------------------------------------
+    # Mutation
+    # ---------------------------------------------------------------------
+
+    @torch.no_grad()
+    def add(self, data):
+        """
+        Append new graphs.
+
+        Accepts either a list[Data] or an already-collated Batch. No data_list
+        round trip if a Batch is provided.
+        """
+        if isinstance(data, list) and len(data) == 0:
+            return
+
+        new_batch = self._as_batch(data).to(self.device)
+
+        if new_batch.num_graphs == 0:
+            return
+
+        new_x, new_y = self._compute_xy(new_batch)
+
+        self.batch = self.batch.append_batch(new_batch)
+
+        self.x = torch.cat([self.x, new_x], dim=0)
+
+        if self.y is not None:
+            if new_y is None:
+                raise ValueError("Existing dataset has y, but added batch produced y=None.")
+            self.y = torch.cat([self.y, new_y], dim=0)
+
+        k = new_batch.num_graphs
+        self.ema_loss = torch.cat(
+            [
+                self.ema_loss,
+                torch.full((k,), float("nan"), dtype=self.ema_loss.dtype),
+            ],
+            dim=0,
+        )
+        self.select_counts = torch.cat(
+            [
+                self.select_counts,
+                torch.zeros(k, dtype=torch.long),
+            ],
+            dim=0,
+        )
+
+    @torch.no_grad()
+    def purge_by_index(self, indices_to_remove):
+        """
+        Remove samples by current index.
+
+        Uses batch.subsample_new_batch on the keep indices, avoiding any
+        batch -> list -> batch rebuild.
+        """
+        n = len(self)
+        if n == 0:
+            return
+
+        drop = np.zeros(n, dtype=bool)
+        indices_to_remove = np.asarray(indices_to_remove, dtype=int)
+
+        if indices_to_remove.size == 0:
+            return
+
+        if indices_to_remove.min() < 0 or indices_to_remove.max() >= n:
+            raise IndexError(
+                f"indices_to_remove out of bounds for dataset of length {n}."
+            )
+
+        drop[indices_to_remove] = True
+        keep = ~drop
+
+        if keep.all():
+            return
+
+        keep_idx = np.flatnonzero(keep)
+
+        self.batch = self.batch.subsample_new_batch(keep_idx)
+
+        keep_t = torch.as_tensor(keep_idx, device=self.device, dtype=torch.long)
+        self.x = self.x[keep_t].contiguous()
+        if self.y is not None:
+            self.y = self.y[keep_t].contiguous()
+
+        keep_cpu = torch.as_tensor(keep_idx, dtype=torch.long)
+        self.ema_loss = self.ema_loss[keep_cpu]
+        self.select_counts = self.select_counts[keep_cpu]
+
+    @torch.no_grad()
+    def purge(
+            self,
+            max_count: int,
+            loss_cutoff: Optional[float] = None,
+    ):
+        """
+        Drop well-sampled, below-cutoff samples.
+
+        Purges where:
+            count > max_count
+            ema_loss < loss_cutoff
+
+        Uninitialized NaN losses are never purged.
+        """
+        losses = self.ema_loss
+        counts = self.select_counts
+
+        valid = ~torch.isnan(losses)
+        if valid.sum() == 0:
+            return
+
+        if loss_cutoff is None:
+            loss_cutoff = torch.nanmean(losses).item()
+
+        mask = valid & (losses < loss_cutoff) & (counts > max_count)
+        purge_list = torch.nonzero(mask, as_tuple=False).flatten().tolist()
+
+        self.purge_by_index(purge_list)
+
+    @torch.no_grad()
+    def purge_lowest(
+            self,
+            num_to_purge: int,
+            quantile: float = 0.25,
+            loss_floor: float = 1.0,
+            min_visits: int = 3,
+            temperature: float = 1.0,
+    ):
+        """
+        Purge up to num_to_purge eligible samples.
+
+        Eligible =
+            visited >= min_visits
+            loss is initialized
+            loss <= min(loss_floor, quantile cutoff)
+
+        Samples are chosen without replacement with probability increasing as
+        loss decreases.
+        """
+        if num_to_purge <= 0:
+            return
+
+        losses = self.ema_loss
+        valid = (~torch.isnan(losses)) & (self.select_counts >= min_visits)
+
+        if valid.sum() == 0:
+            return
+
+        cutoff = min(loss_floor, torch.quantile(losses[valid], quantile).item())
+        eligible = valid & (losses <= cutoff)
+
+        elig_idx = torch.nonzero(eligible, as_tuple=False).flatten()
+
+        if elig_idx.numel() == 0:
+            return
+
+        k = min(num_to_purge, elig_idx.numel())
+
+        elig_losses = losses[elig_idx]
+        logits = -elig_losses / max(temperature, 1e-8)
+        logits = logits - logits.max()
+
+        p = torch.softmax(logits, dim=0).double().cpu().numpy()
+        p /= p.sum()
+
+        choice = np.random.choice(
+            elig_idx.cpu().numpy(),
+            size=k,
+            replace=False,
+            p=p,
+        )
+
+        self.purge_by_index(choice.tolist())
+
+    def _loss_weights(
+            self,
+            temperature: float = 1.0,
+            nan_quantile: float = 0.90,
+            epsilon: float = 1e-8,
+    ) -> np.ndarray:
+        """
+        Convert ema_loss to a sampling distribution.
+
+        Higher loss → higher probability.  Unvisited (NaN) samples are
+        assigned the ``nan_quantile``-th observed loss so they are treated
+        as moderately hard and visited promptly rather than starved.
+
+        Parameters
+        ----------
+        temperature:
+            Softmax temperature τ.  Large τ → nearly uniform; small τ →
+            concentrates on the highest-loss sample.
+        nan_quantile:
+            Quantile of observed losses used to fill NaN entries.
+            0.9 keeps unvisited samples competitive without dominating.
+        """
+        losses = self.ema_loss.clone().float()
+        valid = ~torch.isnan(losses)
+
+        if valid.any():
+            nan_fill = torch.quantile(losses[valid], nan_quantile).item()
+        else:
+            # Nothing visited yet — assign high probability.
+            return np.ones(len(self), dtype=np.float64) / len(self)
+
+        losses[~valid] = nan_fill
+
+        loss_range = losses.max() - losses.min()
+        normed = (losses - losses.min()) / (loss_range + 1e-8)  # [0, 1]
+        logits = normed / max(temperature, 1e-8)
+        logits -= logits.max()
+        p = torch.softmax(logits, dim=0).double().cpu().numpy()
+        p = np.clip(p, epsilon, None)  # floor before renorm
+        p /= p.sum()
+        return p
+    '''
+    import plotly.graph_objects as go
+    go.Figure(go.Histogram(x=np.log(p), nbinsx=100)).show()
+    '''

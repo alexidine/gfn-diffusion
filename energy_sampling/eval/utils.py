@@ -519,19 +519,11 @@ class LossSpikeMonitor:
     def __len__(self) -> int:
         return len(self._hist)
 
-    # ------------------------------------------------------------------ #
-    # main entry point
-    # ------------------------------------------------------------------ #
     def record(self, value, step: Optional[int] = None) -> Trigger:
         """Record one loss value and return a Trigger.
 
-        `value` may be a float or a torch/numpy scalar tensor.
-
-        `step` is your global training-step counter and acts as the clock for
-        `warmup` and `cooldown`. Pass it consistently (e.g. the same `step` you
-        gate the call on) and those windows are measured in training steps. If
-        you omit `step`, the monitor falls back to counting record() calls, so
-        `warmup`/`cooldown` are then in call units instead.
+        Fires only on catastrophic explosions: non-finite values, or a value
+        that blows past `ceiling_factor` times the slow long-tail median.
         """
         self._calls += 1
         call = self._calls
@@ -544,26 +536,14 @@ class LossSpikeMonitor:
             self._start_clock = clock
         self._clock = clock
 
-        base = median(self._hist) if self._hist else float("nan")
         long_base = median(self._long_hist) if self._long_hist else float("nan")
-
-        # Warmup is elapsed clock since the first record, not a sample count, so
-        # it tracks training steps regardless of how often you call record().
-        # `min_samples` is a separate floor that keeps the statistics valid.
         warm = (self._clock - self._start_clock) >= self.warmup
 
-        # --- non-finite is the only check that fires during warmup ------
         reason: Optional[str] = None
         if not math.isfinite(v):
             reason = "non-finite"
-
-        # --- relative ceiling: blowout vs the slow long-tail median -----
-        # Needs the long buffer warmed up, and a positive reference (the
-        # multiplicative comparison is meaningless for a non-positive median;
-        # spike-z still backstops outliers in that regime).
-        if (
-                reason is None
-                and self.ceiling_factor is not None
+        elif (
+                self.ceiling_factor is not None
                 and warm
                 and len(self._long_hist) >= self.min_samples
                 and long_base > 0.0
@@ -571,69 +551,25 @@ class LossSpikeMonitor:
         ):
             reason = "ceiling"
 
-        z_val: Optional[float] = None
-        slope_rel: Optional[float] = None
-
-        # --- relative checks over the short window ----------------------
-        if reason is None and warm and len(self._hist) >= self.min_samples:
-            hist = list(self._hist)
-            b = median(hist)
-
-            # multiplicative spike
-            if (
-                    self.spike_factor is not None
-                    and b > 0.0
-                    and v >= self.spike_factor * b
-            ):
-                reason = "spike-factor"
-
-            # robust z-score spike (modified z via MAD)
-            if reason is None and self.spike_z is not None:
-                dev = median([abs(x - b) for x in hist])
-                mad = 1.4826 * dev
-                # Floor the scale so an ultra-stable loss doesn't hair-trigger.
-                scale = max(mad, 1e-3 * abs(b), 1e-12)
-                z_val = (v - b) / scale
-                if z_val >= self.spike_z:
-                    reason = "spike-z"
-
-            # sustained upward trend
-            if reason is None and self.trend_rel is not None:
-                series = hist + [v]
-                slope = _ols_slope(series)
-                rise = slope * (len(series) - 1)
-                slope_rel = rise / max(abs(b), 1e-12)
-                if slope_rel >= self.trend_rel:
-                    reason = "trend"
-
-        # --- fire decision + cooldown ----------------------------------
         fire = reason is not None and not self.in_cooldown
 
-        # Append AFTER baselines are computed so the current value never
-        # contributes to its own baseline. Keep appending during cooldown so
-        # the buffers stay current after a cut.
-        self._hist.append(v)
         self._long_hist.append(v)
 
         if fire:
             self._fires += 1
-            self._cooldown_until = clock + self.cooldown
-            if self.reset_on_fire:
-                # Restart the short-window detectors on the new loss scale, but
-                # keep the long-tail reference so the ceiling stays meaningful.
-                self._hist.clear()
+            self.fire_cooldown(clock)
 
         return Trigger(
             fire=fire,
             reason=reason or "",
             value=v,
-            baseline=base,
             long_baseline=long_base,
-            z=z_val,
-            slope_rel=slope_rel,
             call=call,
             step=step,
         )
+
+    def fire_cooldown(self, clock):
+        self._cooldown_until = clock + self.cooldown
 
     # ------------------------------------------------------------------ #
     # checkpointing
@@ -669,3 +605,21 @@ class LossSpikeMonitor:
         self._start_clock = None
         self._cooldown_until = float("-inf")
         self._fires = 0
+
+
+def cal_subtb_coef_matrix(lamda, N):
+    """
+    diff_matrix: (N+1, N+1)
+    0, 1, 2, ...
+    -1, 0, 1, ...
+    -2, -1, 0, ...
+
+    self.coef[i, j] = lamda^(j-i) / total_lambda  if i < j else 0.
+    """
+    range_vals = torch.arange(N + 1)
+    diff_matrix = range_vals - range_vals.view(-1, 1)
+    B = np.log(lamda) * diff_matrix
+    B[diff_matrix <= 0] = -np.inf
+    log_total_lambda = torch.logsumexp(B.view(-1), dim=0)
+    coef = torch.exp(B - log_total_lambda)
+    return coef

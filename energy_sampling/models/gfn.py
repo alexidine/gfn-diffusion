@@ -34,6 +34,7 @@ class GFN(nn.Module):  # todo add seeding
                  dropout: Optional[float] = 0, norm: Optional[str] = None,
                  zero_init: bool = False, device=torch.device('cuda'),
                  max_z_prime: int = 1,
+                 full_flow: bool = False,
                  ):
         super(GFN, self).__init__()
         self.dim = dim
@@ -56,6 +57,7 @@ class GFN(nn.Module):  # todo add seeding
         self.device = device
         self.max_z_prime = max_z_prime
         self.conditions_type = conditions_type
+        self.full_flow = full_flow
 
         self.get_periodic_dimensions(device)
         self.condition_embedding_dim = condition_embedding_dim
@@ -64,7 +66,7 @@ class GFN(nn.Module):  # todo add seeding
                               dropout, norm)
 
         self.init_flow_model(condition_embedding_dim, dropout, flow_hidden_dim, flow_layers,
-                             norm)
+                             norm, self.full_flow, s_emb_dim, t_dim)
 
         self.t_model = TimeEncoding(harmonics_dim, t_dim, t_hidden_dim,
                                     norm=norm, dropout=dropout)
@@ -134,25 +136,45 @@ class GFN(nn.Module):  # todo add seeding
         else:  # we can pass arguments to this (conditions) but nothing will happen
             self.conditions_embedding_model = NoneModule()
 
-    def init_flow_model(self, condition_embedding_dim, dropout, flow_hidden_dim, flow_layers, norm):
-        if self.conditional:
-            self.flow_model = scalarMLP(layers=flow_layers,
-                                        filters=flow_hidden_dim,
-                                        input_dim=condition_embedding_dim,
-                                        output_dim=1,
-                                        norm=norm,
-                                        dropout=dropout,
-                                        )
+    def init_flow_model(self, condition_embedding_dim, dropout, flow_hidden_dim, flow_layers, norm,
+                        full_flow, s_emb_dim, t_emb_dim):
+        if full_flow:  # time and state-dependent flow model
+            if self.conditional:
+                self.flow_model = scalarMLP(layers=flow_layers,
+                                            filters=flow_hidden_dim,
+                                            input_dim=s_emb_dim + t_emb_dim,
+                                            output_dim=1,
+                                            norm=norm,
+                                            dropout=dropout,
+                                            )
+            else:
+                self.flow_model = scalarMLP(layers=flow_layers,
+                                            filters=flow_hidden_dim,
+                                            input_dim=s_emb_dim + t_emb_dim,
+                                            output_dim=1,
+                                            norm=norm,
+                                            dropout=dropout,
+                                            )
         else:
-            self.flow_model = LearnableScalar()  # unified syntax with this instead of nn.Parameter
+            if self.conditional:
+                self.flow_model = scalarMLP(layers=flow_layers,
+                                            filters=flow_hidden_dim,
+                                            input_dim=condition_embedding_dim,
+                                            output_dim=1,
+                                            norm=norm,
+                                            dropout=dropout,
+                                            )
+            else:
+                self.flow_model = LearnableScalar()  # unified syntax with this instead of nn.Parameter
 
     def get_periodic_dimensions(self, device):
-        angs = [False] * 6
-        for zp in range(self.max_z_prime):
-            angs.extend([False, False, False])
-        for zp in range(self.max_z_prime):
-            angs.extend([False, True, True])
-            # phi and r dimensions arein rotational basis
+        # angs = [False] * 6
+        # for zp in range(self.max_z_prime):
+        #     angs.extend([False, False, False])
+        # for zp in range(self.max_z_prime):
+        #     angs.extend([False, True, True])
+        #     # phi and r dimensions arein rotational basis
+        angs = [False] * 12  # TODO UNDO THIS
         self.ang_mask = torch.tensor(angs, device=device)
         self.ang_dim = (self.ang_mask == True).sum().item()
         self.lin_dim = self.dim - self.ang_dim
@@ -169,8 +191,8 @@ class GFN(nn.Module):  # todo add seeding
                 logvar = torch.tanh(logvar_i / self.log_var_range) * self.log_var_range
         return mean, (logvar + np.log(self.pf_std_per_traj) * 2.0).clip(min=-self.var_clip, max=self.var_clip)
 
-    def predict_next_state(self, s, t, condition_embedding):
-        s_new = self.forward_policy(self.s_model(s, condition_embedding), self.t_model(t))
+    def predict_next_state(self, s_emb, t_emb):
+        s_new = self.forward_policy(s_emb, t_emb)
 
         if self.clipping:
             s_new = torch.clip(s_new, -self.gfn_clip, self.gfn_clip)
@@ -182,8 +204,8 @@ class GFN(nn.Module):  # todo add seeding
         batch_size = initial_state.shape[0]
         ts = discretizer(batch_size).to(self.device)
         trajectory_length = ts.shape[1] - 1
-        logpb, logpf, states, means_f, logvars_f, means_b, logvars_b = self.init_traj_tensors(batch_size,
-                                                                                              trajectory_length)
+        logpb, logpf, states, means_f, logvars_f, means_b, logvars_b, log_flow = self.init_traj_tensors(batch_size,
+                                                                                                        trajectory_length)
 
         initial_state.requires_grad_(not detach_traj)
         current_state = initial_state
@@ -199,26 +221,28 @@ class GFN(nn.Module):  # todo add seeding
             condition_embedding = None
 
 
-        logf = self.flow_model(condition_embedding).flatten()
-
         for i in range(trajectory_length):
             dts = ts[:, i + 1] - ts[:, i]
 
             # PROPAGATION
             expanded_current_state = self.expand_state_for_policy(current_state)
-            state_update = self.predict_next_state(expanded_current_state, ts[:, i], condition_embedding)
+            s_emb = self.s_model(expanded_current_state, condition_embedding)
+            t_emb = self.t_model(ts[:, i])
+            state_update = self.predict_next_state(s_emb, t_emb)
             pf_mean, pflogvars = self.split_params(state_update)
             pflogvars_sample = self.fwd_get_logvars(detach_traj, dts, exploration_std, i, pflogvars)
             next_state = self.fwd_propagate(current_state, detach_traj, dts, pf_mean, pflogvars_sample)
 
-            # noise = ((next_state - current_state) - dts.unsqueeze(1) * pf_mean) / (
-            #        dts.sqrt().unsqueeze(1) * (pflogvars / 2).exp())
+            if not self.full_flow:
+                if i == 0:
+                    log_flow[:, 0] = self.flow_model(torch.cat([s_emb, t_emb], dim=1)).flatten()
+            else:
+                log_flow[:, i] = self.flow_model(torch.cat([s_emb, t_emb], dim=1)).flatten()
 
             # compute forward logprobs
             fwd_drift = dts.unsqueeze(1) * pf_mean
             fwd_var = dts.unsqueeze(1) * pflogvars.exp()
             logpf.append(self.gauss_logprob(next_state - current_state, fwd_drift, fwd_var))
-            # -0.5 * (noise ** 2 + logtwopi + dts.log().unsqueeze(1) + pflogvars).sum(1))
 
             # compute backward logprobs
             expanded_next_state = self.expand_state_for_policy(next_state)
@@ -233,6 +257,7 @@ class GFN(nn.Module):  # todo add seeding
 
             else:  # instead set this as a constant the model will have to learn around
                 back_var = torch.ones_like(back_drift) * 1e-3 * dts.unsqueeze(1)
+                logpb.append(torch.zeros_like(logpf[-1]))
 
             current_state = next_state
             # only wrap after logprob calculations
@@ -249,11 +274,11 @@ class GFN(nn.Module):  # todo add seeding
         logpfs = torch.stack(logpf).T
         logpbs = torch.stack(logpb).T
         if return_gauss_params:
-            return (states, logpfs, logpbs, logf,
+            return (states, logpfs, logpbs, log_flow,
                     means_f.mean(-1), logvars_f.mean(-1),
                     means_b.mean(-1), logvars_b.mean(-1))
         else:
-            return states, logpfs, logpbs, logf
+            return states, logpfs, logpbs, log_flow
 
     def log_gauss_params(self, back_drift, back_var, dts, fwd_drift, i, logvars_b, logvars_f, means_b, means_f,
                          pflogvars):
@@ -285,7 +310,7 @@ class GFN(nn.Module):  # todo add seeding
         ts = discretizer(batch_size).to(self.device)
         trajectory_length = ts.shape[1] - 1
 
-        logpb, logpf, states, means_f, logvars_f, means_b, logvars_b = (
+        logpb, logpf, states, means_f, logvars_f, means_b, logvars_b, log_flow = (
             self.init_traj_tensors(batch_size, trajectory_length))
 
         states[:, -1] = terminal_state.detach()
@@ -300,7 +325,6 @@ class GFN(nn.Module):  # todo add seeding
         else:
             condition_embedding = None
 
-        logf = self.flow_model(condition_embedding).flatten()
         log_var_base = 2.0 * math.log(float(self.pf_std_per_traj))
 
         for i in range(trajectory_length):
@@ -333,18 +357,19 @@ class GFN(nn.Module):  # todo add seeding
                 back_drift = -current_state
                 # back_mean = prev_state  # remember the back_mean in pb is for some reason the actual mean not the drift
                 back_var = torch.ones_like(back_drift) * 1e-3 * dts.unsqueeze(1)
+                logpb.append(torch.zeros_like(logpb[-1]))
 
-            """log pf calculation"""
+            """log pf calculation""" # todo note we are duplicating state and time embedding calls throughout
             expanded_prev_state = self.expand_state_for_policy(prev_state)
-            pfs = self.predict_next_state(expanded_prev_state, ts[:, trajectory_length - i - 1], condition_embedding)
+            s_emb = self.s_model(expanded_prev_state, condition_embedding)
+            t_emb = self.t_model(ts[:, trajectory_length - i - 1])
+            pfs = self.predict_next_state(s_emb, t_emb)
             pf_mean, pflogvars = self.split_params(pfs)
-
-            # noise = ((current_state - prev_state) - dts.unsqueeze(1) * pf_mean) / (
-            #         dts.sqrt().unsqueeze(1) * (pflogvars / 2).exp())
-            #
-            # logpf.append(-0.5 * (
-            #         noise ** 2 + logtwopi + dts.log().unsqueeze(1) + pflogvars).sum(
-            #     1))
+            if not self.full_flow:
+                if (i-1) == 0:
+                    log_flow[:, 0] = self.flow_model(torch.cat([s_emb, t_emb], dim=1)).flatten()
+            else:
+                log_flow[:, (trajectory_length - i-1)] = self.flow_model(torch.cat([s_emb, t_emb], dim=1)).flatten()
 
             fwd_drift = dts.unsqueeze(1) * pf_mean
             fwd_var = dts.unsqueeze(1) * pflogvars.exp()
@@ -364,11 +389,11 @@ class GFN(nn.Module):  # todo add seeding
         logpfs = torch.stack(logpf).T
         logpbs = torch.stack(logpb).T
         if return_gauss_params:
-            return (states, logpfs, logpbs, logf,
+            return (states, logpfs, logpbs, log_flow,
                     means_f.mean(-1), logvars_f.mean(-1),
                     means_b.mean(-1), logvars_b.mean(-1))
         else:
-            return states, logpfs, logpbs, logf
+            return states, logpfs, logpbs, log_flow
 
     def fwd_get_back_correction(self, condition_embedding, i, expanded_next_state, ts):
         if self.learn_pb:
@@ -458,8 +483,9 @@ class GFN(nn.Module):  # todo add seeding
         logvars_f = torch.zeros((batch_size, trajectory_length, self.dim), device=self.device)
         means_b = torch.zeros((batch_size, trajectory_length, self.dim), device=self.device)
         logvars_b = torch.zeros((batch_size, trajectory_length, self.dim), device=self.device)
+        log_flow = torch.zeros((batch_size, trajectory_length + 1), device=self.device)
 
-        return logpb, logpf, states, means_f, logvars_f, means_b, logvars_b
+        return logpb, logpf, states, means_f, logvars_f, means_b, logvars_b, log_flow
 
     def wrap_to_pi(self, x):
         # (-pi, pi]

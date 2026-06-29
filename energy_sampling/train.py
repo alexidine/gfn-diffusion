@@ -1,11 +1,13 @@
 import gc
+import math
 import os
 from collections import defaultdict
 from copy import deepcopy
+from typing import Optional
 
 from energy_sampling.eval.evaluations import to_loggable, sliced_wasserstein, adjust_fig_filesize, eval_figs, \
     log_ess_frac
-from mxtaltools.common.utils import log_rescale_positive
+from energy_sampling.eval.traj_reporting import traj_overlap_report, to_scalars
 
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 # os.environ["TORCH_USE_CUDA_DSA"] = "1"
@@ -22,15 +24,15 @@ from torch.optim import lr_scheduler
 from tqdm import trange
 
 from energies.molecular_crystal import MolecularCrystal
-from energy_sampling.buffer import SimpleDataset
+from energy_sampling.buffer import CrystalBuffer
 from energy_sampling.eval.utils import sample_eval_fwd_trajs, LossSpikeMonitor
 from energy_sampling.utils import is_cuda_oom, get_annealing_factor, \
     parse_loss_schedules, dict2namespace, update_loss_schedule, \
-    atomic_save, get_discretizer, log_elapsed_times, MetricTracker, quick_tb_stats, uniform_discretizer, logmeanexp
+    atomic_save, get_discretizer, log_elapsed_times, MetricTracker, quick_tb_stats, uniform_discretizer, logmeanexp, \
+    cal_subtb_coef_matrix
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 from models import GFN
 from mxtaltools.common.training_utils import flatten_wandb_params
-from mxtaltools.dataset_utils.utils import collate_data_list
 from utils import get_train_args, get_gfn_init_state, set_seed, \
     update_ema
 
@@ -39,15 +41,14 @@ MODELLER_STATE_DEFAULTS = {
     'phase': 1,
     'batch_size': 1,
     'fwd_to_bwd_ratio': 1.0,
-    'increasing_loss_cooldown': {},
-    'loss_records': {},
-    'global_action_cooldown': 0,
-    'lr_cut_count': 0,
     'lr_warmup_finished': False,
     'hit_init_kld': False,
     'grow_buffer': False,
     'fwd_loss_schedule': {},
     'bwd_loss_schedule': {},
+    'bwd_sampling_mode': 'dataset',
+    'fwd_step_count': 0,
+    'bwd_step_count': 0,
 }
 
 
@@ -58,8 +59,8 @@ class Modeller:
         torch.cuda.set_per_process_memory_fraction(self.args.cuda_memory_fraction, device=0)
         torch.cuda.init()  # create context with the cap already in place
 
-        self.fwd_loss_monitor = LossSpikeMonitor(window=200, warmup=250, cooldown=100, ceiling_factor=10.0)
-        self.bwd_loss_monitor = LossSpikeMonitor(window=200, warmup=250, cooldown=100, ceiling_factor=10.0)
+        self.fwd_loss_monitor = LossSpikeMonitor(window=200, warmup=250, cooldown=100, ceiling_factor=100.0)
+        self.bwd_loss_monitor = LossSpikeMonitor(window=200, warmup=250, cooldown=100, ceiling_factor=100.0)
 
         set_seed(self.args.seed)
         if 'SLURM_PROCID' in os.environ:
@@ -86,7 +87,7 @@ class Modeller:
         self.rolling_tracker = MetricTracker(period=100)
 
         if self.args.anchor_fwd_bwd:
-            self.args.fwd_to_bwd_ratio = 1.0E-6
+            self.fwd_to_bwd_ratio = 1.0E-6
 
     def _get_modeller_state_dict(self):
         return {k: getattr(self, k) for k in MODELLER_STATE_DEFAULTS}
@@ -126,30 +127,33 @@ class Modeller:
         self._set_modeller_state_dict(checkpoint['modeller_state'])
         self.rolling_tracker.load_state_dict(checkpoint.get('metrics', {}))
         if load_opt_state:
+            self.init_schedulers_optimizers()
             self.load_optimizer_state(checkpoint)
 
     def load_optimizer_state(self, checkpoint):
         for key, opt in self.optimizers.items():
             opt.load_state_dict(checkpoint['optimizers'][key])
 
-    def load_model_state(self, path):
+    def load_model_state(self, path, load_optimizers: bool = False):
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.gfn_model.load_state_dict(checkpoint['model_train'])
         self.ema_model.load_state_dict(checkpoint['model_eval'])
         self.gfn_model.train()
         self.ema_model.eval()
+        if load_optimizers:
+            self.load_optimizer_state(checkpoint)
 
     def _checkpoint_path(self, tag: str) -> str:
-        return f'checkpoints/{self.run_name}_{tag}.pt'
+        return f'{self.args.checkpoints_dir}/{self.run_name}_{tag}.pt'
 
     def train_logic(self, it):
         do_forward = False
         do_backward = False
         if self.args.both_ways:
-            p_forward = self.args.fwd_to_bwd_ratio / (self.args.fwd_to_bwd_ratio + 1)
+            p_forward = self.fwd_to_bwd_ratio / (self.fwd_to_bwd_ratio + 1)
             if it == 0:
                 do_fwd = True
-            elif self.args.fwd_to_bwd_ratio == 1:
+            elif self.fwd_to_bwd_ratio == 1:
                 do_fwd = it % 2 == 0  # always do fwd first
             else:
                 do_fwd = np.random.choice([0, 1], 1, p=[1 - p_forward, p_forward])
@@ -193,12 +197,13 @@ class Modeller:
 
     def ten_step_reporting(self):
         metrics = {}
-        metrics.update(self.rolling_tracker.snapshot())
+        metrics.update(self.rolling_tracker.snapshot(changed_only=True))
 
         for opt_type in ['fwd', 'bwd', 'flow']:
             metrics.update({f'lr_{opt_type}': self.optimizers[opt_type].param_groups[0]['lr']})
 
-        metrics['Fwd to Bwd Ratio'] = self.args.fwd_to_bwd_ratio
+        metrics['phase'] = self.phase
+        metrics['Fwd to Bwd Ratio'] = self.fwd_to_bwd_ratio
         metrics.update(log_elapsed_times(self.times))
         return metrics
 
@@ -213,7 +218,13 @@ class Modeller:
         update_loss_schedule(self.step_ind, self.fwd_loss_schedule, self.args.fwd_loss_coeffs.__dict__)
         update_loss_schedule(self.step_ind, self.bwd_loss_schedule, self.args.bwd_loss_coeffs.__dict__)
 
-    def get_conditioning_dim(self):  # TODO rewrite wholesale
+        if any([self.args.fwd_loss_coeffs.subtb > 0, self.args.bwd_loss_coeffs.subtb > 0]):
+            self.args.fwd_loss_coeffs.coeff_matrix = cal_subtb_coef_matrix(  # todo delete this re-instantiation
+                self.args.fwd_loss_coeffs.subtb_lambda, self.args.integrator.T).to(self.gfn_model.device)
+            self.args.bwd_loss_coeffs.coeff_matrix = cal_subtb_coef_matrix(
+                self.args.bwd_loss_coeffs.subtb_lambda, self.args.integrator.T).to(self.gfn_model.device)
+
+    def get_conditioning_dim(self):
         conditions_dim = 0
         if self.args.temperature_conditioning:
             conditions_dim += 1
@@ -223,7 +234,7 @@ class Modeller:
             conditions_dim += 1
         return conditions_dim
 
-    def init_energy_function(self):  # todo update / simplify
+    def init_energy_function(self):
         energy_config = {
             'device': self.device,
             'energy_function': self.args.energy_function,
@@ -262,28 +273,27 @@ class Modeller:
         )
 
     def init_gfn(self):
-        reload = False  # TODO cleanup / unify model state
-        if self.args.checkpoint_path is not None:
+        reload = False  #
+        reload_path = f'{self.args.checkpoints_dir}/{self.run_name}'
+
+        if self.args.checkpoint_name is not None:
             reload = True
-            print(f"Loading model from checkpoint {self.args.checkpoint_path}")
-            self.load_model_and_state(self.args.checkpoint_path)
+            reload_path = f'{self.args.checkpoints_dir}/{self.args.checkpoint_name}'
+            print(f"Loading model from checkpoint {reload_path}")
+            self.load_model_and_state(reload_path)
 
         # todo rewrite hash logic
-        elif os.path.exists(f'checkpoints/{self.run_name}_model_train.pt') and self.args.continue_from_checkpoint:
+        elif os.path.exists(reload_path) and self.args.continue_from_checkpoint:
             print("Reloading automatically from this prior checkpoint with same run name")
             reload = True
-            reload_path = f'checkpoints/{self.run_name}_model_train.pt'
-        # todo rewrite hash logic
-        elif os.path.exists(
-                f'checkpoints/{self.run_name}_model_train_hit_prior.pt') and self.args.continue_from_hit_prior:
-            print("Reloading from checkpoint converged on prior")
-            reload = True
-            reload_path = f'checkpoints/{self.run_name}_model_train_hit_prior.pt'
+            self.load_model_and_state(reload_path)
 
         if not reload:
             self.gfn_config = self._build_gfn_config()
             self.gfn_model = GFN(**self.gfn_config).to(self.device)
             self.ema_model = deepcopy(self.gfn_model)
+            # opt init
+            self.init_schedulers_optimizers()
 
     def init_schedulers_optimizers(self):
         init_fwd_lr = self.args.lr_policy / self.args.lr_warmup_ratio
@@ -344,6 +354,7 @@ class Modeller:
                                                                 lr_lambda=lambda epoch: flow_annealing_lambda)
 
     def init_prior_dataset(self):
+
         prior_data = torch.load(self.args.prior_path, weights_only=False)
         prior = prior_data['equalized_prior']
         prior['smiles'] = None
@@ -357,22 +368,31 @@ class Modeller:
                 return_batch=True
             )
 
-        self.prior_dataset = SimpleDataset(prior,
+        self.prior_dataset = CrystalBuffer(prior,
                                            device='cpu',
                                            max_z_prime=max(self.args.z_primes),
                                            x_fn=None,  # 'latent_params',
                                            y_fn=self.args.energy_function
                                            )
 
+        if self.args.prior_model_name is not None:
+            prior_path = f'{self.args.checkpoints_dir}/{self.args.checkpoints_dir}'
+            checkpoint = torch.load(prior_path, map_location=self.device, weights_only=False)
+            gfn_config = checkpoint['gfn_config']
+            self.prior_model = GFN(**gfn_config).to(self.device)
+            self.prior_model.load_state_dict(checkpoint['model_eval'])
+            self.prior_model.eval()
+            self.grow_prior_buffer()
+
     def init_mol_dataset(self):
         data_list = torch.load(self.args.molecules_path, weights_only=False)
-        self.mol_dataset = SimpleDataset(data_list,
+        self.mol_dataset = CrystalBuffer(data_list,
                                          device='cpu',
                                          max_z_prime=max(self.args.z_primes))
 
         if self.args.test_molecules_path is not None:
             data_list = torch.load(self.args.test_molecules_path, weights_only=False)
-            self.test_mol_dataset = SimpleDataset(data_list,
+            self.test_mol_dataset = CrystalBuffer(data_list,
                                                   device='cpu',
                                                   max_z_prime=max(self.args.z_primes))
         else:
@@ -391,12 +411,9 @@ class Modeller:
             # Model Init
             self.init_gfn()
 
-            # opt init
-            self.init_schedulers_optimizers()
-
             # data init
-            self.init_prior_dataset()
             self.init_mol_dataset()
+            self.init_prior_dataset()
 
             oomed_out = False
             combo_loss_record = []
@@ -429,17 +446,21 @@ class Modeller:
                         e, oomed_out, step_type)
                 self.times['train_step_end'] = time()
 
-                # evaluation work
-                if (self.step_ind % self.args.eval_period == 0 and self.step_ind > 0) or self.step_ind == 50:
-                    metrics.update(self.training_eval())
-
                 # train monitoring
                 if self.step_ind % 10 == 0:
                     lr = self.step_lr_schedule()
                     metrics.update(self.ten_step_reporting())
                     self.monitor_losses(combo_loss_record, current_loss, step_type)
+
                     if combo_loss_record[-1] <= np.amin(combo_loss_record):
                         self.save_checkpoint('best')
+
+                    if self.phase == 3:
+                        self.fwd_bwd_controller()
+
+                # evaluation work
+                if (self.step_ind % self.args.eval_period == 0 and self.step_ind > 0) or self.step_ind == 50:
+                    metrics.update(self.training_eval())
 
                 if len(metrics) > 0:
                     wandb.log(metrics, step=self.step_ind, commit=True)
@@ -448,6 +469,7 @@ class Modeller:
                     self.save_checkpoint('running')
 
             self.save_checkpoint('final')
+            print("Finished Training!")
 
     def monitor_losses(self, combo_loss_record, current_loss, step_type):
         if current_loss is not None:
@@ -456,30 +478,40 @@ class Modeller:
             else:
                 trig = self.bwd_loss_monitor.record(current_loss, self.step_ind)
 
-            combo_loss_record.append(self.fwd_loss_monitor.best_loss + self.bwd_loss_monitor.best_loss)
-
-            if False: #trig:
+            if trig:
                 self.fire_loss_spike()
 
-    def fire_loss_spike(self):
-        if os.path.exists(self._checkpoint_path('running')):
-            self.load_model_state(self._checkpoint_path('running'))
+            current_fwd = self.rolling_tracker.get('fwd', 'r2')
+            current_bwd = self.rolling_tracker.get('bwd', 'r2')
 
-        if not hasattr(self, 'lr_cut_count'):
-            self.lr_cut_count = 1
-        else:
-            self.lr_cut_count += 1
+            if current_fwd is None and current_bwd is None:
+                combo_loss_record.append(float('inf'))
+            else:
+                total = (current_fwd or 0) + (current_bwd or 0)
+                combo_loss_record.append(2 - total)  # (1-x) + (1-y) = 2-x-y
+
+    def fire_loss_spike(self):
+        print("Firing LR spike & recovery")
+        running_checkpoint_path = self._checkpoint_path('best')
+        if os.path.exists(running_checkpoint_path):
+            self.load_model_state(running_checkpoint_path,
+                                  load_optimizers=True)
+            # fix also rolling metrics with appropriate rebase
+            checkpoint = torch.load(running_checkpoint_path, map_location=self.device, weights_only=False)
+            step = deepcopy(self.step_ind)
+            self._set_modeller_state_dict(checkpoint['modeller_state'])
+            self.rolling_tracker.load_state_dict(checkpoint.get('metrics', {}))
+            self.step_ind = step
 
         lr_cut_val = 0.75
 
         for key, opt in self.optimizers.items():
-            opt.state = defaultdict(dict)  # wipe momentum buffers too
+            # opt.state = defaultdict(dict)  # wipe momentum buffers too
             for g in opt.param_groups:
                 if g['lr'] > self.args.min_lr:
                     g['lr'] = max(g['lr'] * lr_cut_val, self.args.min_lr)
 
-        if self.lr_cut_count > 0:
-            self.lr_warmup_finished = True
+        self.lr_warmup_finished = True
 
     def update_ema_model(self):
         if self.args.ema_decay is not None:
@@ -518,6 +550,8 @@ class Modeller:
                 report_losses=True
             )
             del crystal_batch
+            self.fwd_step_count += 1
+            current_step_count = self.fwd_step_count
 
         elif do_backward:
             self.optimizers['bwd'].zero_grad(set_to_none=True)
@@ -525,78 +559,52 @@ class Modeller:
                 discretizer,
                 repeats=self.args.repeats,
                 report_losses=True)
+            self.bwd_step_count += 1
+            current_step_count = self.bwd_step_count
         else:
             assert False
 
         self.step_loss(do_backward, do_forward, loss)
 
-        if self.step_ind % 5 == 0:
+        if current_step_count % 10 == 0:
             st = 'fwd' if step_type[0] else 'bwd'
             stats = quick_tb_stats(loss_dict['log_pf'], loss_dict['log_pb'],
                                    loss_dict['log_Z'], loss_dict['log_r'])
             stats.update({k: v.item() for k, v in loss_dict.items() if k not in
-                          ['log_pf', 'log_pb', 'log_Z', 'log_r']})
+                          ['log_pf', 'log_pb', 'log_Z', 'log_r', 'losses']})
             stats.update({'loss': loss.cpu().detach().item()})
+            stats.update({'log_Z_learned': loss_dict['log_Z'].cpu().mean().detach().item()})
             self.rolling_tracker.update(st, stats, self.step_ind)
 
-        # skip_step = False
-        # if self.phase == 2:
-        #     if self.bwd_tb_norm <= self.args.thermalization_conv_eps:  # hit stage 2 convergence criteria
-        #         self.phase2to3(self.args.min_fwd_bwd_ratio)
-        #
-        # if self.phase == 3:
-        #     skip_step = self.update_controller(self.step_ind, do_backward, skip_step)
-
-        # loss_dict_cpu = {step_type + "_loss/" + key: (value.cpu().detach().numpy() if torch.is_tensor(value) else value)
-        #                  for key, value in
-        #                  loss_dict.items()}
-
-        torch.cuda.synchronize()
+        # torch.cuda.synchronize()
         self.update_ema_model()
         return loss.cpu().detach().item()
 
-    def update_controller(self, it, do_backward, skip_step, eps=1e-3):
-        update_this_step = it % 20 == 0
-        slope_ceil = self.args.thermalization_slope_err
-        intercept_ceil = self.args.thermalization_intercept_err
+    def fwd_bwd_controller(self):
+        fwd_r2 = self.rolling_tracker.get('fwd', 'r2')
+        bwd_r2 = self.rolling_tracker.get('bwd', 'r2')
+        fwd_metric = 1 - (fwd_r2 if fwd_r2 else 0)
+        bwd_metric = 1 - (bwd_r2 if bwd_r2 else 0)
 
-        slope_err = self.bwd_slope_err
-        intercept_err = self.bwd_intercept_err
+        bwd_ceiling = min(1 - self.args.thermal_threshold, fwd_metric * 0.75)
+        metric = bwd_metric / bwd_ceiling
+        err = metric - 0.9
 
-        # forward errors (should be smoothed upstream)
-        fwd_slope_err = self.fwd_slope_err
-        fwd_intercept_err = self.fwd_intercept_err
+        gain = 0.1 if err > 0 else 0.5
+        step = np.clip(-gain * err, -2, 2)
+        self.fwd_to_bwd_ratio *= np.exp(step)
 
-        # backward must be at least as good as forward
-        slope_ceil = min(slope_ceil, fwd_slope_err)
-        intercept_ceil = min(intercept_ceil, fwd_intercept_err)
-
-        if update_this_step:
-            metric = max(
-                slope_err / max(slope_ceil, eps),
-                intercept_err / max(intercept_ceil, eps)
-            )
-
-            if metric > 1.2:
-                # buffer unsafe → backward dominance
-                self.args.fwd_to_bwd_ratio *= 0.5
-                if not do_backward:
-                    skip_step = True  # don't do backprop on forward if we're out of range
-            elif metric < 0.8:
-                # buffer safe → allow forward normalization
-                self.args.fwd_to_bwd_ratio *= 1.05
-            # else - safe region
-
-        self.args.fwd_to_bwd_ratio = np.clip(
-            self.args.fwd_to_bwd_ratio, self.args.min_fwd_bwd_ratio,
-            self.args.max_fwd_bwd_ratio)  # need even enough ratios to get reasonable updates to the metrics
-
-        return skip_step
+        self.fwd_to_bwd_ratio = np.clip(
+            self.fwd_to_bwd_ratio, self.args.min_fwd_bwd_ratio,
+            self.args.max_fwd_bwd_ratio)  # bound it overall
 
     def step_loss(self, do_backward, do_forward, loss):
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.gfn_model.parameters(),
-                                       self.args.gradient_norm_clip)  # gradient clipping
+        pre_clip = torch.nn.utils.clip_grad_norm_(
+            self.gfn_model.parameters(), self.args.gradient_norm_clip).item()
+        if not math.isfinite(pre_clip):
+            return  # skip non-finite
+
         if do_forward:
             self.optimizers['fwd'].step()
             self.optimizers['flow'].step()
@@ -635,22 +643,9 @@ class Modeller:
                        discretizer,
                        repeats: int,
                        report_losses: bool = False):
-        with torch.no_grad():
-            if self.args.bwd_sampling_mode == 'dataset':
-                latents, energy = next(
-                    self.prior_dataset.loader(batch_size=self.batch_size, mode='tensors', repeats=repeats))
-            elif self.args.bwd_sampling_mode == 'model':
-                latents, energy = self.prior_model.sample_tensors(self.batch_size, repeats=repeats)
-            else:
-                assert False, f"sampling method {self.args.sampling} not implemented"
-            latents, energy = latents.to(self.device), energy.to(self.device)
-            mol_batch = next(self.mol_dataset.loader(batch_size=self.batch_size, mode='graphs', repeats=repeats))
-            mol_batch = mol_batch.to(self.device)
-            mol_batch, log_T_tensor, sg_inds, zps, condition = self.energy_function.condition_samples(
-                mol_batch)
-            log_reward = -energy / log_T_tensor.exp()
-            if self.phase == 1:
-                condition = False  # ignore conditioning in data-driven prior training
+
+        condition, inds, latents, log_reward, mol_batch = self.draw_bwd_sample(repeats)
+
         loss, loss_dict = get_gfn_backward_loss(self.args.bwd_loss_coeffs,
                                                 latents.to(self.device),
                                                 self.gfn_model,
@@ -661,7 +656,49 @@ class Modeller:
                                                 repeats=repeats,
                                                 report_losses=report_losses)
 
+        if self.bwd_sampling_mode == 'dataset':
+            self.prior_dataset.update_losses(loss_dict['losses'],
+                                             inds)
+        elif self.bwd_sampling_mode == 'prior':
+            self.prior_buffer.update_losses(loss_dict['losses'],
+                                            inds)
+
         return loss, loss_dict
+
+    @torch.no_grad()
+    def draw_bwd_sample(self, repeats):
+        if self.bwd_sampling_mode == 'dataset':
+            latents, energy, inds = next(
+                self.prior_dataset.loader(
+                    batch_size=self.batch_size, mode='tensors',
+                    repeats=repeats, return_inds=True,
+                    weighted=True,
+                    temperature=0.05, beta=1.0))
+
+            latents, energy = latents.to(self.device), energy.to(self.device)
+            mol_batch = next(self.mol_dataset.loader(batch_size=self.batch_size, mode='graphs', repeats=repeats))
+
+        elif self.bwd_sampling_mode == 'prior':
+            mol_batch, inds = next(
+                self.prior_buffer.loader(
+                    batch_size=self.batch_size, mode='graphs',
+                    repeats=repeats, return_inds=True,
+                    weighted=True,
+                    temperature=0.05, beta=1.0))
+
+            latents = mol_batch.latent_params()
+            energy = mol_batch[self.args.energy_function]
+            latents, energy = latents.to(self.device), energy.to(self.device)
+
+        else:
+            assert False, f"sampling method {self.args.sampling} not implemented"
+        mol_batch = mol_batch.to(self.device)
+        mol_batch, log_T_tensor, sg_inds, zps, condition = self.energy_function.condition_samples(
+            mol_batch)
+        log_reward = -energy / (10 ** log_T_tensor)
+        if self.phase == 1 and self.gfn_model.conditional:
+            condition = False  # ignore conditioning in data-driven prior training
+        return condition, inds, latents, log_reward, mol_batch
 
     def handle_train_epoch_error(self, e, oomed_out, step_type):
         print(f"Caught error: {str(e)}")
@@ -690,9 +727,6 @@ class Modeller:
                 raise RuntimeError("Cascading OOM Failure")
             print(f"Reducing batch size to {self.batch_size}")
 
-            gc.collect()
-            torch.cuda.empty_cache()
-
             oomed_out = True
         else:
             raise e  # will simply raise error if other or if training on CPU
@@ -708,25 +742,23 @@ class Modeller:
             try:
                 mol_batch = next(self.prior_dataset.loader(batch_size=self.args.eval_batch_size, mode='graphs'))
                 mol_batch = mol_batch.to(self.ema_model.device)
-
-                mol_batch.box_analysis()
-
                 terminal_state = mol_batch.latent_params()
 
                 mol_batch, log_T_tensor, sg_inds, zps, condition = self.energy_function.condition_samples(
                     mol_batch)
 
                 log_r = self.energy_function.prebuilt_sample_to_reward(mol_batch,
-                                                                       temperature=log_T_tensor.exp())
+                                                                       temperature=10 ** log_T_tensor)
 
                 terminal_state = terminal_state.to(self.ema_model.device)
                 condition = condition.to(self.ema_model.device)
                 if self.phase == 1:
                     condition = False
 
-                (backward_flow_states, b_log_pfs, b_log_pbs, log_z,
+                (backward_flow_states, b_log_pfs, b_log_pbs, log_flow,
                  b_means_f, b_vars_f, b_means_b, b_vars_b) = self.ema_model.get_traj_bwd(
                     terminal_state, discretizer, condition, mol_batch, return_gauss_params=True)
+                log_z = log_flow[:, 0]
 
                 samples += mol_batch.num_graphs
 
@@ -757,85 +789,37 @@ class Modeller:
         arr = lambda t: t.cpu().detach().numpy()
         val = lambda t: t.cpu().detach().item()
 
+        """Forward TB Stats"""
         log_r = fwd_stats['log_r']
         log_pf = fwd_stats['log_pfs'].sum(-1)
         log_pb = fwd_stats['log_pbs'].sum(-1)
-        log_Z_learned = fwd_stats['log_Z']
+        log_Z_learned = fwd_stats['log_Z_learned']
         log_T_tensor = fwd_stats['log_T_tensor']
-        metrics.update({f'fwd_{k}': v for k, v in quick_tb_stats(log_pf, log_pb, log_Z_learned, log_r).items()})
+        metrics.update({f'eval_fwd/{k}': v for k, v in quick_tb_stats(log_pf, log_pb, log_Z_learned, log_r).items()})
 
-        # energies
-        for key in sample_batch.keys():
-            if 'energy' in key or 'pot' in key:
-                metrics['Mean ' + key] = val(sample_batch[key].mean())
-
-        # physical properties
-        metrics['Mean Packing Coeff'] = val(sample_batch.packing_coeff.mean())
-        metrics['Packing Coeff'] = arr(sample_batch.packing_coeff.clip(max=2))
-        metrics['Reduction Energy'] = arr(sample_batch.reduction_en)
-        metrics['Reduced Valid Fraction'] = np.mean(arr(sample_batch.reduction_en) < 1e-1)
-
-        # conditions
-        metrics['Crystal Mean Log Temperature'] = val(log_T_tensor.mean())
-        metrics['Crystal Log Temperature'] = arr(log_T_tensor)
-
-        # training metrics
-        metrics['Mean Sample Energy'] = val(sample_batch.gfn_energy.mean())
-        metrics['Sample Energy'] = arr(sample_batch.gfn_energy.clip(max=50))
-        metrics['Scaled LJ'] = arr(log_rescale_positive(sample_batch.lj))
-
-        metrics['Mean Sample Reward'] = val(log_r.mean())
-        metrics['Sample Reward'] = arr(log_r.clip(min=-50))
-
-        metrics['Empirical log Z'] = val(fwd_stats['log_Z'])
-        metrics['Empirical log Z LB'] = val(fwd_stats['log_Z_lb'])
-        metrics['log Z learned'] = val(log_Z_learned)
-
-        def dump_numeric(metrics, prefix, obj):
-            d = obj if isinstance(obj, dict) else vars(obj)
-            for k, v in d.items():
-                if isinstance(v, (int, float)) and not isinstance(v, bool):
-                    metrics[f'{prefix}{k}'] = v
-
-        dump_numeric(metrics, 'energy_func/', self.energy_function)
-        dump_numeric(metrics, 'loss_coeffs/fwd_', self.args.fwd_loss_coeffs)
-        dump_numeric(metrics, 'loss_coeffs/bwd_', self.args.bwd_loss_coeffs)
-
-        std_params = sample_batch.latent_params()
-
-        metrics['Total Var'] = std_params.var(dim=0).mean().cpu().detach().numpy()
-        metrics['Total Mean'] = std_params.mean(dim=0).mean().cpu().detach().numpy()
-
-        U, S, Vh = torch.linalg.svd(std_params - std_params.mean(0), full_matrices=False)
-        eigvals = S ** 2
-        explained_var_ratio = eigvals / eigvals.sum()
-        loadings = Vh.T  # shape: (num_features, num_components)
-        contrib_per_feature = (loadings ** 2) @ explained_var_ratio  # shape: (num_features,)
-        d_eff = (explained_var_ratio ** 2).sum() ** -1
-        metrics['Effective Dimension'] = d_eff.item()
-
-        if self.args.repeats > 1:
-            metrics['ess'] = log_ess_frac(log_pf, log_pf, repeats=1)  # only useful with repeats > 1
-        x, y = next(self.prior_dataset.loader(batch_size=10000, mode='tensors'))
-        metrics['wass'] = sliced_wasserstein(sample_batch.latent_params(), x,
-                                             n_proj=200)
-
-        # get fraction of samples which are 'reasonable' at this energy,
-        en_func = self.energy_function.energy_function
-        sample_is_good = (sample_batch[en_func] < 0) * (sample_batch.packing_coeff > 0.55) * (
-                sample_batch.packing_coeff < 0.95)
-        metrics["Reasonable Sample Fraction"] = sample_is_good.float().mean().item()
-
-        """Backward stats"""
-
+        """Backward TB Stats"""
         log_pf = bwd_stats['log_pfs'].sum(-1)
         log_pb = bwd_stats['log_pbs'].sum(-1)
         log_z = bwd_stats['log_Z_learned']
         log_r = bwd_stats['log_r']
         # parity / Z diagnostics (shared with fwd)
-        metrics.update({f'bwd {k}': v for k, v in quick_tb_stats(log_pf, log_pb, log_z, log_r).items()})
+        metrics.update({f'eval_bwd/{k}': v for k, v in quick_tb_stats(log_pf, log_pb, log_z, log_r).items()})
 
-        "Gauss stats"
+        self.log_thermo_properties(arr, fwd_stats, log_T_tensor, log_Z_learned, log_r, metrics, sample_batch, val)
+
+        def dump_numeric(metrics, prefix, obj):
+            d = obj if isinstance(obj, dict) else vars(obj)
+            for k, v in d.items():
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    metrics[f'{prefix}/{k}'] = v
+
+        dump_numeric(metrics, 'energy_func/', self.energy_function)
+        dump_numeric(metrics, 'loss_coeffs/fwd_', self.args.fwd_loss_coeffs)
+        dump_numeric(metrics, 'loss_coeffs/bwd_', self.args.bwd_loss_coeffs)
+
+        self.log_dist_stats(log_pf, metrics, sample_batch)
+
+        "Trajectory Stats"
         for prefix in ['fwd', 'bwd']:
             if prefix == 'fwd':
                 stats = fwd_stats
@@ -847,7 +831,56 @@ class Modeller:
             metrics[f'{prefix} Mean B Var'] = stats['logvars_b'].mean()
             metrics = {k: to_loggable(v) for k, v in metrics.items()}
 
+        res = traj_overlap_report(fwd_stats, bwd_stats)  # torch tensors are fine; auto-converted
+        metrics.update({**to_scalars(res)})
+
         return metrics
+
+    def log_dist_stats(self, log_pf, metrics, sample_batch):
+        std_params = sample_batch.latent_params()
+        metrics['Total Var'] = std_params.var(dim=0).mean().cpu().detach().numpy()
+        metrics['Total Mean'] = std_params.mean(dim=0).mean().cpu().detach().numpy()
+        U, S, Vh = torch.linalg.svd(std_params - std_params.mean(0), full_matrices=False)
+        eigvals = S ** 2
+        explained_var_ratio = eigvals / eigvals.sum()
+        loadings = Vh.T  # shape: (num_features, num_components)
+        contrib_per_feature = (loadings ** 2) @ explained_var_ratio  # shape: (num_features,)
+        d_eff = (explained_var_ratio ** 2).sum() ** -1
+        metrics['Effective Dimension'] = d_eff.item()
+        if self.args.repeats > 1:
+            metrics['ess'] = log_ess_frac(log_pf, log_pf, repeats=1)  # only useful with repeats > 1
+        x, y = next(self.prior_dataset.loader(batch_size=10000, mode='tensors'))
+        metrics['wass'] = sliced_wasserstein(sample_batch.latent_params(), x,
+                                             n_proj=200)
+
+    def log_thermo_properties(self, arr, fwd_stats, log_T_tensor, log_Z_learned, log_r, metrics, sample_batch, val):
+        # energies
+        for key in sample_batch.keys():
+            if 'energy' in key or 'pot' in key:
+                metrics['Mean ' + key] = val(sample_batch[key].mean())
+
+        # physical properties
+        metrics['Mean Packing Coeff'] = val(sample_batch.packing_coeff.mean())
+        metrics['Packing Coeff'] = arr(sample_batch.packing_coeff.clip(max=2))
+        metrics['Reduction Energy'] = arr(sample_batch.reduction_en)
+        metrics['Reduced Valid Fraction'] = np.mean(arr(sample_batch.reduction_en) < 1e-1)
+        # conditions
+        metrics['Crystal Mean Log Temperature'] = val(log_T_tensor.mean())
+        metrics['Crystal Log Temperature'] = arr(log_T_tensor)
+        # training metrics
+        metrics['Mean Sample Energy'] = val(sample_batch.gfn_energy.mean())
+        metrics['Sample Energy'] = arr(sample_batch.gfn_energy.clip(max=50))
+        metrics['Mean Sample Reward'] = val(log_r.mean())
+        metrics['Sample Reward'] = arr(log_r.clip(min=-50))
+        metrics['Empirical log Z'] = val(fwd_stats['log_Z'])
+        metrics['Empirical log Z LB'] = val(fwd_stats['log_Z_lb'])
+        metrics['log Z learned'] = val(log_Z_learned)
+
+        # get fraction of samples which are 'reasonable' at this energy,
+        en_func = self.energy_function.energy_function
+        sample_is_good = (sample_batch[en_func] < 0) * (sample_batch.packing_coeff > 0.55) * (
+                sample_batch.packing_coeff < 0.95)
+        metrics["Reasonable Sample Fraction"] = sample_is_good.float().mean().item()
 
     def training_eval(self):
         metrics = {}
@@ -857,13 +890,13 @@ class Modeller:
         do_figs = self.step_ind % self.args.figs_period == 0
 
         '''sampling and metrics analysis'''
-        fwd_stats, sample_batch = self.fwd_eval_sampling(eval_discretizer)
+        fwd_stats, sample_batch = self.fwd_eval_sampling(self.ema_model, eval_discretizer)
         bwd_stats = self.bwd_eval_sampling(eval_discretizer)
         metrics.update(self.log_metrics(fwd_stats, bwd_stats, sample_batch))
 
         self.times['eval_figs_start'] = time()
         if do_figs:
-            x, y = self.prior_dataset.sample_tensors(10000, replace=True)
+            x, y = next(self.prior_dataset.loader(batch_size=10000, mode='tensors'))
             # always sample from forward policy
             fig_dict, metrics = eval_figs(fwd_stats,
                                           bwd_stats,
@@ -898,7 +931,87 @@ class Modeller:
             if metrics['wass'] < self.args.wass_threshold:
                 self.phase1to2()
 
+        elif self.phase == 2:
+            if self.rolling_tracker.get('bwd', 'r2') > self.args.thermal_threshold:
+                self.phase2to3()
+
+        if self.phase in [2, 3]:
+            self.manage_prior_buffer()
+
+        # todo consider adding samples we already scored in our expensive fwd eval steps above to buffers
+
+        metrics.update(self.log_buffer_stats())
+
         return metrics
+
+    def log_buffer_stats(self):
+        if self.phase == 1:
+            if hasattr(self, 'prior_dataset'):
+                buff = self.prior_dataset
+            else:
+                buff = None
+        elif self.phase in [2, 3]:
+            if hasattr(self, 'prior_buffer'):
+                buff = self.prior_buffer
+            else:
+                buff = None
+        else:
+            buff = None
+
+        if buff is not None:
+            metrics = {'prior_buffer_length': len(buff),
+                       'prior_buffer_mean_steps': torch.nanmean(buff.select_counts.float()).item(),
+                       'prior_buffer_median_steps': torch.nanmedian(buff.select_counts.float()).item(),
+                       'prior_buffer_mean_loss': torch.nanmean(buff.ema_loss).item(),
+                       'prior_buffer_median_loss': torch.nanmedian(buff.ema_loss).item(),
+                       # "Buffer Log Loss Dist": buff.ema_loss.float().log().cpu().detach().numpy(),
+                       # "Buffer Step Dist": buff.select_counts.cpu().detach().numpy()
+                       }
+        else:
+            metrics = {}
+        return metrics
+
+    def manage_prior_buffer(self):
+        if hasattr(self, 'prior_buffer'):  # purge prior buffer
+            if len(self.prior_buffer) == self.args.prior_buffer_max_size:
+                num_to_replace = self.args.prior_buffer_min_size
+                self.prior_buffer.purge_lowest(
+                    num_to_replace,
+                    quantile=0.25,
+                    loss_floor=1.0,
+                    min_visits=10,
+                )
+        self.grow_prior_buffer()
+
+    def sample_from_prior(self, num_samples):
+        "sample from prior"
+        eval_discretizer = lambda bsz: uniform_discretizer(bsz, self.args.eval_T)
+        metrics, sample_batch = self.fwd_eval_sampling(self.prior_model,
+                                                       eval_discretizer,
+                                                       override_num_samples=num_samples)
+        return metrics, sample_batch
+
+    def grow_prior_buffer(self):
+        if not hasattr(self, 'prior_buffer'):
+            buffer_length = 0
+        else:
+            buffer_length = len(self.prior_buffer)
+
+        missing = self.args.prior_buffer_max_size - buffer_length
+        num_samples = min(self.args.prior_buffer_min_size, missing)
+        if num_samples > 0:
+            metrics, sample_batch = self.sample_from_prior(num_samples)
+
+            if not hasattr(self, 'prior_buffer'):
+                self.prior_buffer = CrystalBuffer(
+                    sample_batch,
+                    device='cpu',
+                    max_z_prime=max(self.args.z_primes),
+                    x_fn=None,  # 'latent_params',
+                    y_fn=self.args.energy_function
+                )
+            else:
+                self.prior_buffer.add(sample_batch)
 
     def _shrink_eval_batch_on_oom(self, e):
         print(f"Caught error: {str(e)}")
@@ -917,84 +1030,131 @@ class Modeller:
                 pass
 
     @torch.no_grad()
-    def fwd_eval_sampling(self, eval_discretizer):
+    def fwd_eval_sampling(self, model, eval_discretizer, override_num_samples: Optional[int] = None):
         self.times['eval_sampling_start'] = time()
 
-        acc, eval_samples = defaultdict(list), []
+        acc = defaultdict(list)
+        sample_batch = None
+        n_collected = 0
 
-        while len(eval_samples) < self.args.eval_num_samples:
+        if override_num_samples is not None:
+            num_samples = override_num_samples
+        else:
+            num_samples = self.args.eval_num_samples
+
+        while n_collected < num_samples:
             try:
                 mol_batch = next(self.mol_dataset.loader(self.args.eval_batch_size, mode='graphs'))
                 mol_batch = mol_batch.to(self.device)
                 mol_batch.orient_molecule(mode='standard')
                 init_state = get_gfn_init_state(self.args.eval_batch_size,
                                                 self.energy_function.data_ndim, self.device)
-                out = sample_eval_fwd_trajs(init_state, self.ema_model, eval_discretizer,
+                out = sample_eval_fwd_trajs(init_state, model, eval_discretizer,
                                             self.energy_function, mol_batch, no_conditioning=self.phase == 1)
             except (RuntimeError, ValueError) as e:
                 self._shrink_eval_batch_on_oom(e)
                 continue
 
-            eval_samples.extend(out.pop('sample_batch').batch_to_list())
+            sample_batch_i = out.pop('sample_batch')
+            sample_batch_i = sample_batch_i.detach().cpu()
+            if sample_batch is None:
+                sample_batch = sample_batch_i
+            else:
+                sample_batch = sample_batch.append_batch(sample_batch_i)
+            n_collected += sample_batch_i.num_graphs
+
             for k, v in out.pop('gauss_params').items():
                 acc[k].append(v)
             for k, v in out.items():
                 acc[k].append(v)
 
         pooled = {k: torch.cat(v) for k, v in acc.items()}
-        sample_batch = collate_data_list(eval_samples, skip_default_exclusion=True)
 
         # Z estimates computed ONCE over the pooled trajectories
         log_weight = pooled['log_r'] + pooled['log_pbs'].sum(-1) - pooled['log_pfs'].sum(-1)
         pooled['log_Z'] = logmeanexp(log_weight)
         pooled['log_Z_lb'] = log_weight.mean()
-        pooled['log_Z_learned'] = pooled['log_flow'].mean()
+        pooled['log_Z_learned'] = pooled['log_flow'][:, 0].mean()
 
         self.times['eval_sampling_end'] = time()
 
         return pooled, sample_batch
 
-    def phase1to2(self):  # todo rewrite
+    def phase1to2(self):
         print("Hit initial KLD threshold. Starting prior thermalization.")
-        self.hit_init_kld = True
+        self.hit_prior = True
         "adjust loss coefficients"
-        self.args.bwd_loss_coeffs.bwd_tb_z = 1.0
-        self.bwd_loss_schedule['tb'] = [(0, 1.0), (self.step_ind, 0.1),
-                                        (self.step_ind + self.args.phase_change_time, 1.0)]
-        self.bwd_loss_schedule['mle'] = [(0, 1.0), (self.step_ind, 1),
-                                         (self.step_ind + self.args.phase_change_time, 0.0)]
-        self.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0), (self.step_ind, 1.0)]
-        self.bwd_loss_schedule['noised_fraction'] = [(0, 0.0), (self.step_ind, self.args.anchor_noise_fraction)]
-        self.bwd_loss_schedule['noise_level'] = [(0, 0.0), (self.step_ind, self.args.anchor_noise_level)]
-        "set cooldowns"
-        # for d in self.increasing_loss_cooldown: # todo update this
-        #     self.increasing_loss_cooldown[d] = self.args.phase_change_time
-        "align log Z to buffer (it will converge to this value)"
-        # z = metrics['Bwd Empirical log Z LB']# todo come back to thinking about this
-        # with torch.no_grad():
-        #     ema_model.flow_model.weight.data = z
-        #     gfn_model.flow_model.weight.data = z
-        "save checkpoint"
-        self.save_checkpoint('prior')
-        self.phase = 2
-        self.grow_buffer = True
+        "DB and subtb"
 
-    def phase2to3(self):  # todo rewrite
-        print("Thermalization complete. Starting on-policy equilibration.")
-        self.phase = 3
+        self.bwd_loss_schedule['mle'] = [(0, 1.0),
+                                         (self.step_ind, 1),
+                                         (self.step_ind, 0.0)]  # turn off mle
+
+        # self.bwd_loss_schedule['db'] = [(0, 1.0),
+        #                                 (self.step_ind, 0.0),
+        #                                 (self.step_ind, 1.0)]  # turn on DB
+        # self.bwd_loss_schedule['subtb'] = [(0, 1.0),
+        #                                    (self.step_ind, 0.0),
+        #                                    (self.step_ind, 1.0)]  # turn on subtb
+        # self.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0),
+        #                                       (self.step_ind, 0.0)]  # stop log Z learning
+        # self.bwd_loss_schedule['tb'] = [(0, 1.0),
+        #                                 (self.step_ind, 0.0)]  # turn off TB
+        #
+        self.bwd_loss_schedule['tb'] = [(0, 1.0),
+                                        (self.step_ind, 1.0)]  # turn on TB
+        self.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0),
+                                              (self.step_ind, 1.0)]  # learn bwd log z off-policy
+
+        if not self.gfn_model.full_flow:
+            empirical_Z = self.rolling_tracker.values[('bwd', 'emp_z')]
+            self.gfn_model.flow_model.scalar.data.fill_(empirical_Z)  # warm start at the target value
+            self.ema_model.flow_model.scalar.data.fill_(empirical_Z)
+        else:
+            pass
+            # assert False, "TODO put in a quick script to train flow[:, 0] to log Z"
+
+        # self.bwd_loss_schedule['traj_grads'] = [(0, 1.0),
+        #                                         (self.step_ind, 1),
+        #                                         (self.step_ind, 0.0)]  # deactivate reward grads at TB stage
+
+        "set cooldowns"
+        self.fwd_loss_monitor.fire_cooldown(self.step_ind)
+        self.bwd_loss_monitor.fire_cooldown(self.step_ind)
+        self.bwd_loss_monitor.reset()  # new losses
         "save checkpoint"
-        self.save_checkpoint('prior_equil')
+        self.bwd_sampling_mode = 'prior'
+        self.phase = 2
+
+        self.init_schedulers_optimizers()  # re-initialize optimizers for new losses
+        self.set_loss_coeffs()  # take effect immediately
+
+        self.save_checkpoint('prior')
+        self.prior_model = deepcopy(self.ema_model)
+        self.prior_model.eval()
+        self.set_loss_coeffs()
+
+        # delete phase 1 checkpoint - it converged!
+        os.remove(self._checkpoint_path('best'))
+
+    def phase2to3(self):
+        print("Thermalization complete. Starting on-policy equilibration.")
         "adjust loss and balancing coefficients"
-        self.args.fwd_to_bwd_ratio = self.args.min_bwd_ratio
-        self.bwd_loss_schedule['bwd_tb_z'] = [(0, 1.0), (self.step_ind, 0)]
-        self.fwd_loss_schedule['tb'] = [(0, 1.0), (self.step_ind, 0.0),
-                                        (self.step_ind + self.args.phase_change_time // 2, 1.0)]
+        self.fwd_to_bwd_ratio = self.args.min_fwd_bwd_ratio
+        self.bwd_loss_schedule['bwd_tb_z'] = [(0, 1.0),
+                                              (self.step_ind, 1.0),
+                                              (self.step_ind, 0.0)]  # no off-policy log Z
+        self.fwd_loss_schedule['tb'] = [(0, 0.0),
+                                        (self.step_ind, 0.0),
+                                        (self.step_ind, 1.0)]  # on-policy TB ACTIVATE
         "set cooldown"
-        # for d in self.increasing_loss_cooldown:  # todo update this
-        #     self.increasing_loss_cooldown[d] = self.args.phase_change_time
-        self.grow_buffer = True
-        self.std_boost_prob = self.args.p3_widevar_prob
-        self.std_boost_var = self.args.p3_widevar_var
+        self.fwd_loss_monitor.fire_cooldown(self.step_ind)
+        self.bwd_loss_monitor.fire_cooldown(self.step_ind)
+
+        self.set_loss_coeffs()
+
+        self.phase = 3
+        self.save_checkpoint('thermalized')
 
 
 if __name__ == '__main__':

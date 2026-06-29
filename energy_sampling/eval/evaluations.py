@@ -165,7 +165,7 @@ def eval_figs(fwd_stats,
               energy_function,
               metrics
               ):
-    fig_dict = {}
+    fig_dict = {}  # todo add tb GP fig & binned residuals
 
     log_r = fwd_stats['log_r']
     try:
@@ -802,7 +802,7 @@ def log_metrics(energy_function,
         d = obj if isinstance(obj, dict) else vars(obj)
         for k, v in d.items():
             if isinstance(v, (int, float)) and not isinstance(v, bool):
-                metrics[f'{prefix}{k}'] = v
+                metrics[f'{prefix}/{k}'] = v
 
     dump_numeric(metrics, 'energy_func/', energy_function)
     dump_numeric(metrics, 'loss_coeffs/fwd_', args.fwd_loss_coeffs)

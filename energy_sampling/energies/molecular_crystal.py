@@ -12,6 +12,7 @@ from mxtaltools.common.geometry_utils import lat2sph_rotvec
 from mxtaltools.common.utils import log_rescale_positive, is_cuda_oom
 from mxtaltools.constants.space_group_feature_tensor import SG_FEATURE_TENSOR
 from mxtaltools.constants.space_group_info import SYM_OPS
+from mxtaltools.dataset_utils.data_class_methods.crystal_analysis import COMPUTES_REQUIRE_CLUSTER
 from mxtaltools.dataset_utils.data_classes import MolCrystalData
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.mlip_interfaces.AL_mace_utils import load_mace_model
@@ -106,6 +107,7 @@ class MolecularCrystal(BaseSet):
 
         self.computes = ['reduction_en']
         self.computes.append(self.energy_function)
+        self.computes_require_cluster = any(COMPUTES_REQUIRE_CLUSTER.get(k, False) for k in self.computes)
 
     def set_reward_clip(self, dataset_rewards):
         """
@@ -122,24 +124,28 @@ class MolecularCrystal(BaseSet):
         self.reward_clip = min_allowed_reward
 
     def instantiate_crystals(self, x, mol_batch):
-        crystal_batch = self.init_blank_crystal_batch(mol_batch)
+        if self.computes_require_cluster:
+            crystal_batch = self.init_blank_crystal_batch(mol_batch)
+        else:
+            crystal_batch = mol_batch.clone()
         crystal_batch.latent_to_cell_params(x)
         return crystal_batch
 
-    def analyze_crystal_batch(self, x, mol_batch, temperature, return_batch=False):  # x is gfn_outputs
+    def analyze_crystal_batch(self, x, mol_batch, temperature, return_batch=False,
+                              keep_grads: bool = False):  # x is gfn_outputs
         crystal_batch = self.instantiate_crystals(x, mol_batch)
 
         cutoff = 10
-        with torch.no_grad():
+        with torch.set_grad_enabled(keep_grads):
             out = crystal_batch.analyze(self.computes,
                                         cutoff=cutoff,
                                         supercell_size=10,
                                         std_orientation=False,
-                                        predictor=self.predictor, )
+                                        predictor=self.predictor)
 
         for key in out.keys():
             crystal_batch.add_graph_attr(out[key], key)
-        #crystal_batch.add_graph_attr(log_rescale_positive(out['lj']), 'scaled_lj')
+        # crystal_batch.add_graph_attr(log_rescale_positive(out['lj']), 'scaled_lj')
 
         crystal_energy, ens_dict = self.generator_energy(crystal_batch, temperature, raw_latents=x)
 
@@ -157,11 +163,12 @@ class MolecularCrystal(BaseSet):
         else:
             return crystal_energy, None
 
-    def generator_energy(self, crystal_batch, temperature, raw_latents=None):
+    def generator_energy(self, crystal_batch, temperature, raw_latents: Optional[torch.tensor] = None):
         ens_dict = {}
 
         latents = crystal_batch.latent_params()
-        if False: #raw_latents is not None: # TODO undo this!
+        if ((raw_latents is not None) and not
+        (self.energy_function in ['latent_harmonic', 'latent_multiharmonic'])):
             bounding_energy = (F.relu(raw_latents - 1) ** 2 + F.relu(-(raw_latents + 1)) ** 2).sum(
                 dim=-1)  # discourage exploration beyond clip range
         else:
@@ -197,14 +204,8 @@ class MolecularCrystal(BaseSet):
         if self.energy_function == 'latent_harmonic':
             crystal_energy = getattr(crystal_batch, 'latent_harmonic')
 
-        elif self.energy_function == 'crystal_harmonic':
-            crystal_energy = self.crystal_harmonic_en(crystal_batch)
-
         elif self.energy_function == 'latent_multiharmonic':
-            crystal_energy = self.latent_multiharmonic_en(crystal_batch, latents)
-
-        elif self.energy_function == 'crystal_multiharmonic':
-            crystal_energy = self.crystal_multiharmonic_en(crystal_batch, latents)
+            crystal_energy = getattr(crystal_batch, 'latent_multiharmonic')
 
         elif self.energy_function in ['lj', 'qlj', 'elj', 'silu', 'uma', 'mace']:
             crystal_energy = self.lj_coeff * mol_energy + self.density_coeff * density_energy + pressure_energy
@@ -212,7 +213,10 @@ class MolecularCrystal(BaseSet):
         else:
             assert False, f'{self.energy_function} not implemented'
 
-        jacobian_energy = torch.zeros_like(bounding_energy) # TODO undo! self.compute_jacobian(crystal_batch, temperature)
+        if self.energy_function in ['latent_harmonic', 'latent_multiharmonic']:
+            jacobian_energy = torch.zeros_like(bounding_energy)
+        else:
+            jacobian_energy = self.compute_jacobian(crystal_batch, temperature)
 
         if self.energy_clip is not None:
 
@@ -336,7 +340,8 @@ class MolecularCrystal(BaseSet):
                x,
                mol_batch,
                log_temperature: torch.tensor,
-               return_exp: bool = False):
+               return_exp: bool = False,
+               keep_grads: bool = False):
         """
         Energy is not really bounded. Or necessarily well scaled.
         We do exponential rescaling later with a temperature. For higher temperature,
@@ -349,13 +354,17 @@ class MolecularCrystal(BaseSet):
         temperature = 10 ** log_temperature
         if return_exp:
             energy, crystal_batch = self.batched_analyze_crystal_batch(x, mol_batch, temperature,
-                                                                       return_batch=return_exp)
+                                                                       return_batch=return_exp,
+                                                                       keep_grads=keep_grads)
             return energy / temperature, crystal_batch
         else:
-            energy = self.batched_analyze_crystal_batch(x, mol_batch, temperature, return_batch=return_exp)
+            energy = self.batched_analyze_crystal_batch(x, mol_batch, temperature,
+                                                        return_batch=return_exp,
+                                                        keep_grads=keep_grads)
             return energy / temperature
 
-    def batched_analyze_crystal_batch(self, x, mol_batch, temperature, return_batch=False):
+    def batched_analyze_crystal_batch(self, x, mol_batch, temperature,
+                                      return_batch=False, keep_grads: bool = False):
         if not hasattr(self, 'batch_size'):
             if self.energy_function in ['uma', 'mace']:
                 self.batch_size = 1000
@@ -364,22 +373,28 @@ class MolecularCrystal(BaseSet):
         cursor = 0
         n_samples = len(x)
         energies = torch.zeros(len(x), dtype=torch.float32, device='cpu')
-        samples = []
-        if 'Crystal' in mol_batch.__class__.__name__:
-            data_list = mol_batch.batch_to_list()
-        else:
-            data_list = mol_batch.to_data_list()
         already_oomed = False
+        samples_batch = None
         while cursor < n_samples:  # todo get a single unified interface for all the places we do this
             try:
                 inds = np.arange(cursor, min(n_samples, cursor + self.batch_size))
-                mol_batch_i = collate_data_list([data_list[ind] for ind in inds])
+                mol_batch_i = mol_batch.subsample_new_batch(inds)
 
-                outs = self.analyze_crystal_batch(x[inds], mol_batch_i, temperature[inds], return_batch=return_batch)
+                outs = self.analyze_crystal_batch(x[inds], mol_batch_i, temperature[inds],
+                                                  return_batch=return_batch, keep_grads=keep_grads)
 
-                energies[inds] = outs[0].cpu().detach()
+                if not keep_grads:
+                    energies[inds] = outs[0].cpu().detach()
+                else:
+                    energies[inds] = outs[0].cpu()
+
                 if return_batch:
-                    samples.extend(outs[1].cpu().detach().batch_to_list())
+                    batch_i = outs[1].detach().cpu()
+
+                    if samples_batch is None:
+                        samples_batch = batch_i
+                    else:
+                        samples_batch = samples_batch.append_batch(batch_i)
 
                 cursor += len(inds)
                 if (self.batch_size <= 100000) and (self.batch_size < n_samples) and not already_oomed:
@@ -400,36 +415,50 @@ class MolecularCrystal(BaseSet):
                     raise e
 
         del outs
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        # gc.collect()
+        # torch.cuda.empty_cache()
+        # torch.cuda.synchronize()
 
         if return_batch:
-            return energies.to(x.device), collate_data_list(samples, skip_default_exclusion=True)
+            return energies.to(x.device), samples_batch
         else:
             return energies.to(x.device)
 
-    def init_blank_crystal_batch(self, mol_batch):  # todo no possible way this is the most efficient way to do this
+    def init_blank_crystal_batch(self,
+                                 mol_batch):
+        device = mol_batch.device
+        n = mol_batch.num_graphs
+
         if self.sg_conditioning:
             sgs = mol_batch.sg_ind
         else:
-            sgs = [self.space_groups[0] for _ in range(mol_batch.num_graphs)]
+            sgs = torch.full(
+                (n,),
+                int(self.space_groups[0]),
+                dtype=torch.long,
+                device=device,
+            )
 
-        crystal_batch = self.batch.clone()
-        ones3 = torch.ones((mol_batch.num_graphs, 3), device='cpu')
-        zeros1 = torch.zeros((mol_batch.num_graphs), device='cpu')
-        eye3 = torch.eye(3, device='cpu').repeat(mol_batch.num_graphs, 1, 1)
-        ones1 = torch.ones(mol_batch.num_graphs, device='cpu')
-        trues1 = torch.zeros(mol_batch.num_graphs, dtype=torch.bool, device='cpu').fill_(True)
-        zones3 = torch.ones((mol_batch.num_graphs, 3 * self.max_z_prime), device='cpu')
-        zones1 = torch.ones((mol_batch.num_graphs, self.max_z_prime), device='cpu')
+        crystal_batch = self.batch.clone().to(self.device)
+
+        ones3 = torch.ones((n, 3), device=device)
+        zeros1 = torch.zeros(n, device=device)
+        eye3 = torch.eye(3, device=device).expand(n, 3, 3).clone()
+        ones1 = torch.ones(n, device=device)
+        trues1 = torch.ones(n, dtype=torch.bool, device=device)
+
+        z_ones3 = torch.ones((n, 3 * self.max_z_prime), device=device)
+        z_ones1 = torch.ones((n, self.max_z_prime), device=device)
+
+        crystal_batch.set_mol_attrs(mol_batch.clone())
+
         blank_batch_properties = {
-            'aunit_handedness': zones1,
+            'aunit_handedness': z_ones1,
             'nonstandard_symmetry': ~trues1,
             'cell_lengths': ones3,
             'cell_angles': ones3,
-            'aunit_centroid': zones3,
-            'aunit_orientation': zones3,
+            'aunit_centroid': z_ones3,
+            'aunit_orientation': z_ones3,
             'lj': zeros1,
             'scaled_lj': zeros1,
             'reduction_en': zeros1,
@@ -451,8 +480,6 @@ class MolecularCrystal(BaseSet):
 
         crystal_batch.reset_sg_info(sgs)
         crystal_batch.add_graph_attr(mol_batch.z_prime, 'z_prime', slice_dict, inc_dict)
-
-        crystal_batch = crystal_batch.to(self.device)
 
         return crystal_batch
 

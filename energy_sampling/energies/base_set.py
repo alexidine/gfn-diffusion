@@ -32,10 +32,10 @@ class BaseSet(abc.ABC, Dataset):
         del batch_size
         raise NotImplementedError
 
-    def log_reward(self, x, mol_batch, log_temperature, return_exp: bool = False):
+    def log_reward(self, x, mol_batch, log_temperature, return_exp: bool = False, keep_grads: bool = False):
         if return_exp:
-            energy, sample = self.energy(x, mol_batch, log_temperature, return_exp)
+            energy, sample = self.energy(x, mol_batch, log_temperature, return_exp, keep_grads=keep_grads)
             return -energy, sample
         else:
-            return -self.energy(x, mol_batch, log_temperature, return_exp)
+            return -self.energy(x, mol_batch, log_temperature, return_exp, keep_grads=keep_grads)
 
