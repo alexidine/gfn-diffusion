@@ -46,7 +46,8 @@ def run_analysis(config):
                                           molecule,
                                           config.save_results,
                                           results_path,
-                                          config.overwrite_results)
+                                          config.overwrite_results,
+                                          config.rdf_type)
     samples = results_dict['samples']
 
     "analyze experimental samples"
@@ -62,7 +63,8 @@ def run_analysis(config):
 
         exp_crystals = torch.load(config.exp_sample_path, weights_only=False)
         if hasattr(exp_crystals, 'is_batch'):
-            exp_crystals = exp_crystals.batch_to_list()
+            if exp_crystals.is_batch:
+                exp_crystals = exp_crystals.batch_to_list()
         if hasattr(config, 'identifiers'):
             if config.identifiers is not None:
                 exp_crystals = [elem for elem in exp_crystals if elem.identifier in config.identifiers]
@@ -74,7 +76,8 @@ def run_analysis(config):
 
         with torch.no_grad():
             ebatch.cuda()
-            ebatch.analyze(computes, rdf_mode='envwise', assign_outputs=True,
+            ebatch.analyze(computes, rdf_mode=config.rdf_type,
+                           assign_outputs=True,
                            predictor=predictor)
             ebatch.cpu()
         esamples = ebatch.batch_to_list()
@@ -96,7 +99,7 @@ def run_analysis(config):
     sample_cp = sample_batch.packing_coeff
 
     if (not 'dmat' in list(results_dict.keys())) or (not config.reload_results):
-        rdf_bins = torch.linspace(0, 10, sample_batch.rdf.shape[-1])
+        rdf_bins = sample_batch.rdf_bins[0]
         with torch.no_grad():
             dmat = compute_rdf_distmat(sample_batch.rdf.cuda(), rdf_bins.cuda()).cpu()
         results_dict['dmat'] = dmat
@@ -105,7 +108,7 @@ def run_analysis(config):
 
     """start neighborhood analysis"""
     d_metrics = []
-    bins = torch.linspace(0, 10, sample_batch.rdf.shape[-1], device='cuda')
+    bins = sample_batch.rdf_bins[0].to('cuda')
     d = torch.cat([compute_rdf_distance(sample_batch.rdf[ii], sample_batch.rdf, bins.cpu()) for ii in range(50)])
     d_cuts = [d.quantile(0.15)]
 
@@ -132,38 +135,89 @@ def run_analysis(config):
             torch.save(results_dict, results_path)
 
     aa = 1
+    #
+    # thermos = results_dict['metrics'][0]
+    # cluster_labels, indexed_cluster_labels, p_maxima, n_basins = clustering(results_dict, thermos, max_n_clusters = 6, min_basin_size=100)
+    #
+    # (basin_colorscale, basin_min_batch, indexed_cluster_labels,
+    #  n_basins, new_min_inds, p_maxima, packing_coeffs, polymorph_basin_index,
+    #  polymorph_colorscale, polymorph_inds, sample_colors, sample_embedding,
+    #  sample_energy, sample_inds, stats) = combo_fig_analysis(
+    #     ebatch, sample_batch, results_dict, ebatch.num_graphs, sample_batch, results_dict, config.energy_function, cluster_labels, p_maxima, n_basins, indexed_cluster_labels)
+    #
+    # fig = combo_fig(
+    #     ebatch.num_graphs,
+    #     n_basins,
+    #     packing_coeffs,
+    #     stats,
+    #     thermos,
+    #     sample_inds,
+    #     sample_embedding,
+    #     p_maxima,
+    #     polymorph_inds,
+    #     new_min_inds,
+    #     sample_energy,
+    #     polymorph_colorscale,
+    #     sample_colors,
+    #     indexed_cluster_labels,
+    #     basin_colorscale,
+    #     basin_min_batch,
+    #     polymorph_basin_index,
+    #     config.energy_function
+    # )
+    # fig.show()
+    # aa = 1
 
-    thermos = results_dict['metrics'][0]
-    cluster_labels, indexed_cluster_labels, p_maxima, n_basins = clustering(results_dict, thermos, max_n_clusters = 6, min_basin_size=100)
+    """
+    # RMSD business
+    
+    data = sample_batch.batch_to_list()
+    if isinstance(exp_crystals, list):
+        edata = exp_crystals
+    else:
+        edata = [exp_crystals]
+    for pind in range(len(edata)):
+        dists = compute_rdf_distance(ebatch.rdf[pind], sample_batch.rdf, sample_batch.rdf_bins[0])
+        closest_rdfs = dists[:len(dmat)].topk(20, dim=-1, largest=False, sorted=True).indices
+        close_batch = collate_data_list([data[ind] for ind in closest_rdfs])
+    
+        target_batch = collate_data_list([edata[pind]])
+        target_batch.mol2ucell()
+        target_batch.write_cif(torch.arange(target_batch.num_graphs), 'pap_ref', 'unit_cell')
+        matches, rmsds = close_batch.batch_compack('pap_ref_0.cif', torch.arange(close_batch.num_graphs))
+    
+    """
 
-    (basin_colorscale, basin_min_batch, indexed_cluster_labels,
-     n_basins, new_min_inds, p_maxima, packing_coeffs, polymorph_basin_index,
-     polymorph_colorscale, polymorph_inds, sample_colors, sample_embedding,
-     sample_energy, sample_inds, stats) = combo_fig_analysis(
-        ebatch, sample_batch, results_dict, ebatch.num_graphs, sample_batch, results_dict, config.energy_function, cluster_labels, p_maxima, n_basins, indexed_cluster_labels)
+    #
+    # from mxtaltools.common.clustering import greedy_bottom_up_anchors
+    #
+    # anchors = greedy_bottom_up_anchors(sample_batch.latent_params(),
+    #                                    sample_batch.packing_coeff,
+    #                                    sample_energy,
+    #                                    0.5,
+    #                                    sample_energy.amin() + 3)
+    # ss = sample_batch.batch_to_list()
+    # expbatch = collate_data_list([ss[ind] for ind in anchors])
+    # expbatch.mol2ucell()
+    # expbatch.write_cif(torch.arange(expbatch.num_graphs), 'acrdin_sg14_zp1_low_en_structures', mode='unit cell')
 
-    fig = combo_fig(
-        ebatch.num_graphs,
-        n_basins,
-        packing_coeffs,
-        stats,
-        thermos,
-        sample_inds,
-        sample_embedding,
-        p_maxima,
-        polymorph_inds,
-        new_min_inds,
-        sample_energy,
-        polymorph_colorscale,
-        sample_colors,
-        indexed_cluster_labels,
-        basin_colorscale,
-        basin_min_batch,
-        polymorph_basin_index,
-        config.energy_function
-    )
-    fig.show()
-    aa = 1
+
+if __name__ == '__main__':
+    raw = load_yaml('analysis.yaml')
+    base, runs = raw['base'], raw['runs']
+
+    for run in runs:
+        config = dict2namespace({**base, **run})
+        results_path = os.path.join(config.results_dir, f"{config.run_name}.pt")
+        basins_path = os.path.join(config.results_dir, f"{config.run_name}_basins.pt")
+
+        print(f"\n=== {config.run_name} ===")
+        run_analysis(config)  # whatever your entry point is
+
+        aa = 1
+
+
+'''
 
     # for passing top-k samples
 
@@ -316,7 +370,7 @@ def run_analysis(config):
         return reps, labels
 
     # --- load your data ---
-    # dist_matrix = np.load("rdf_emd_distances.npy")
+    # dist_matrix = np.load("rdf_5emd_distances.npy")
     # energies    = np.load("energies.npy")
 
     # demo
@@ -365,30 +419,4 @@ def run_analysis(config):
     opbatch.mol2ucell()
     opbatch.write_cif(torch.arange(opbatch.num_graphs), 'acrdin_sg14_zp1_low_en_structures2', mode='unit cell')
 
-    #
-    # from mxtaltools.common.clustering import greedy_bottom_up_anchors
-    #
-    # anchors = greedy_bottom_up_anchors(sample_batch.latent_params(),
-    #                                    sample_batch.packing_coeff,
-    #                                    sample_energy,
-    #                                    0.5,
-    #                                    sample_energy.amin() + 3)
-    # ss = sample_batch.batch_to_list()
-    # expbatch = collate_data_list([ss[ind] for ind in anchors])
-    # expbatch.mol2ucell()
-    # expbatch.write_cif(torch.arange(expbatch.num_graphs), 'acrdin_sg14_zp1_low_en_structures', mode='unit cell')
-
-
-if __name__ == '__main__':
-    raw = load_yaml('analysis.yaml')
-    base, runs = raw['base'], raw['runs']
-
-    for run in runs:
-        config = dict2namespace({**base, **run})
-        results_path = os.path.join(config.results_dir, f"{config.run_name}.pt")
-        basins_path = os.path.join(config.results_dir, f"{config.run_name}_basins.pt")
-
-        print(f"\n=== {config.run_name} ===")
-        run_analysis(config)  # whatever your entry point is
-
-        aa = 1
+'''

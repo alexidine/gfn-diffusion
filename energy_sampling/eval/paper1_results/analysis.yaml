@@ -11,25 +11,26 @@ base:
   alpha: 2.0
 
   reload_results: false
-  save_results: false
-  overwrite_results: false
+  save_results: true
+  overwrite_results: true
 
   data_root: D:\crystal_datasets
   results_dir: D:\crystal_datasets\gfn_results
 
 # Per-run overrides
 runs:
-
-  - run_name: acridine_14_1
-    energy_function: mace
-    sg_ind: 14
-    z_prime: 1
-    model_path: D:\crystal_datasets\acridine\models\run_1_acridine_14_1_model_eval.pt
-    config_path: D:\crystal_datasets\acridine\models\run_1_acridine_14_1_model_config.npy
-    molecule_path: D:\crystal_datasets\acridine\opt_acridine_conformer.pt
-    exp_sample_path: D:\crystal_datasets\acridine\std_opt_acridine_polymorphs.pt
-    dataset_path: D:\crystal_datasets\acridine\may_acridine_sg14_zp1_prior_dataset.pt
-    identifiers: null #['ACRDIN04','ACRDIN12']
+#
+#  - run_name: acridine_14_1
+#    energy_function: mace
+#    sg_ind: 14
+#    z_prime: 1
+#    model_path: D:\crystal_datasets\acridine\models\run_1_acridine_14_1_model_eval.pt
+#    config_path: D:\crystal_datasets\acridine\models\run_1_acridine_14_1_model_config.npy
+#    molecule_path: D:\crystal_datasets\acridine\opt_acridine_conformer.pt
+#    exp_sample_path: D:\crystal_datasets\acridine\std_opt_acridine_polymorphs.pt
+#    dataset_path: D:\crystal_datasets\acridine\may_acridine_sg14_zp1_prior_dataset.pt
+#    identifiers: null #['ACRDIN04','ACRDIN12']
+#    rdf_type: 'envwise'
 
   - run_name: mipcas_elj
     energy_function: elj
@@ -40,6 +41,7 @@ runs:
     molecule_path: D:\crystal_datasets\mipcas\MIPCAS_standardized.pt
     exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized.pt
     dataset_path:  D:\crystal_datasets\mipcas\mipcas_elj_prior_dataset.pt
+    rdf_type: 'atomwise'
 
   - run_name: mipcas_uma
     energy_function: uma
@@ -50,6 +52,8 @@ runs:
     molecule_path: D:\crystal_datasets\mipcas\MIPCAS_standardized.pt
     exp_sample_path: D:\crystal_datasets\mipcas\MIPCAS_standardized.pt
     dataset_path:  D:\crystal_datasets\mipcas\mipcas_uma_prior_dataset.pt
+    rdf_type: 'atomwise'
+
 
   - run_name: nehzor_elj
     energy_function: elj
@@ -60,6 +64,8 @@ runs:
     molecule_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
     exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
     dataset_path:  D:\crystal_datasets\nehzor\nehzor_elj_prior_dataset.pt
+    rdf_type: 'atomwise'
+
 
   - run_name: nehzor_uma
     energy_function: uma
@@ -70,3 +76,4 @@ runs:
     molecule_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
     exp_sample_path: D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt
     dataset_path:  D:\crystal_datasets\nehzor\nehzor_uma_prior_dataset.pt
+    rdf_type: 'atomwise'

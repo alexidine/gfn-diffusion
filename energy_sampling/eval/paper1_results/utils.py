@@ -656,7 +656,7 @@ def sample_from_gfn(num_samples, max_z_prime, device, n_steps, batch_size, gfn_m
 
 
 def analyze_samples(x, mol_list, max_z_prime, device, batch_size, sg_ind, zp, energy_function, predictor=None,
-                    overwrite_latents: bool = True):
+                    overwrite_latents: bool = True, rdf_type: str = 'atomwise'):
     num_samples = len(mol_list)
     samples = []
     cursor = 0
@@ -678,7 +678,7 @@ def analyze_samples(x, mol_list, max_z_prime, device, batch_size, sg_ind, zp, en
                         batch.latent_to_cell_params(x[inds])
                     batch = batch.to(device)
                     outs = batch.analyze(computes, cutoff=10, std_orientation=True, assign_outputs=True,
-                                         predictor=predictor, rdf_mode='envwise')
+                                         predictor=predictor, rdf_mode=rdf_type)
 
                     batch.to('cpu')
                     samples.extend(batch.batch_to_list())
@@ -945,7 +945,7 @@ def get_committor_weights(clabel, basin_inds, num_committor_steps: int, sample_e
 
 @torch.no_grad()
 def get_gfn_samples(num_samples, max_z_prime, device, n_steps, batch_size, gfn_model, energy_function, molecule, sg_ind,
-                    zp):
+                    zp, rdf_type):
     sample_latents, pfs, pbs = sample_from_gfn(num_samples, max_z_prime, device, n_steps, 1000, gfn_model)
 
     if energy_function == 'uma':
@@ -962,7 +962,7 @@ def get_gfn_samples(num_samples, max_z_prime, device, n_steps, batch_size, gfn_m
     else:
         mol_list = [molecule]
     samples = analyze_samples(sample_latents, mol_list * num_samples, max_z_prime, device, batch_size, sg_ind,
-                              zp, energy_function=energy_function, predictor=predictor)
+                              zp, energy_function=energy_function, predictor=predictor, rdf_type=rdf_type)
     sample_batch = collate_data_list(samples, max_z_prime=max_z_prime)
     sample_energy = sample_batch[energy_function]
 
@@ -2523,7 +2523,8 @@ def get_kinetic_basins_light(sample_energy,
 
 
 def sample_and_analyze(config_path, model_path, device, num_samples, max_z_prime, n_steps, batch_size, sg_ind, zp,
-                       energy_function, molecule, save_results, results_path, overwrite_results):
+                       energy_function, molecule, save_results, results_path, overwrite_results,
+                       rdf_type):
     gfn_model = GFN(**np.load(config_path, allow_pickle=True).item())
     gfn_model.load_state_dict(torch.load(model_path, weights_only=True))
     gfn_model.to(device)
@@ -2533,7 +2534,8 @@ def sample_and_analyze(config_path, model_path, device, num_samples, max_z_prime
     sample_batch, sample_latents, sample_energy, sample_cp, samples, pfs, pbs = get_gfn_samples(
         num_samples, max_z_prime,
         device, n_steps, batch_size, gfn_model,
-        energy_function, molecule, sg_ind, zp
+        energy_function, molecule, sg_ind, zp,
+        rdf_type
     )
 
     results_dict = {
@@ -2657,8 +2659,9 @@ def basin_opt(basin_minima, samples, energy_function, predictor):
     return all_outs, all_records
 
 
-def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch, uma_results, energy_function,
-                       cluster_labels, p_maxima, n_basins, indexed_cluster_labels):
+def combo_fig_analysis(ebatch, elj_batch, elj_results,
+                       num_polymorphs, uma_batch, uma_results,
+                       energy_function, cluster_labels, p_maxima, n_basins, indexed_cluster_labels):
     sample_energy = uma_batch[energy_function]
     # good_inds = (sample_energy < (sample_energy.amin() + 15*2.5)).argwhere().flatten()
     good_inds = (sample_energy < sample_energy.amin() + 15 * 2.5).argwhere().flatten()
@@ -2692,6 +2695,59 @@ def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch
     assert full_dmat.shape[0] == len(good_inds) + num_polymorphs + n_basins, "full_dmat shape mismatch"
     polymorph_inds = [len(good_inds) + ind for ind in range(num_polymorphs)]
     new_min_inds = [len(good_inds) + num_polymorphs + ind for ind in range(basin_min_batch.num_graphs)]
+
+    all_matches, all_rmsds = [], []
+    data = uma_batch.batch_to_list()
+    data = [data[ind] for ind in good_inds]
+    edata = ebatch.batch_to_list()
+    dmat = uma_results['dmat']
+    for pind, ii in enumerate(polymorph_inds):
+        closest_rdfs = full_dmat[ii, :len(dmat)].topk(200, dim=-1, largest=False, sorted=True).indices
+        close_batch = collate_data_list([data[ind] for ind in closest_rdfs])
+
+        target_batch = collate_data_list([edata[pind]])
+        target_batch.mol2ucell()
+        target_batch.write_cif(torch.arange(target_batch.num_graphs), 'pap_ref', 'unit_cell')
+        matches, rmsds = close_batch.batch_compack('pap_ref_0.cif', torch.arange(close_batch.num_graphs))
+        all_matches.append(matches)
+        all_rmsds.append(rmsds)
+        print('Nearest Match', rmsds[matches == 20].min())
+    '''
+    # old method
+    
+    from mxtaltools.common.adaptive_batching import adaptive_batched_analysis
+    predictor = None
+    device = 'cuda'
+    
+    thinned_batch = uma_batch.clone()
+    tbatch = ebatch.clone()
+    rdtype = 'atomwise'
+    
+    tbatch.analyze(['rdf'], rdf_mode=rdtype, cutoff=10, rdf_cutoff=10, assign_outputs=True)
+    thinned_batch.to('cuda')
+    analyses = ['rdf']
+    thinned_batch = adaptive_batched_analysis(
+        thinned_batch, analyses=analyses, state={},
+        initial_batch_size=1000, predictor=predictor,
+        device=device, show_tqdm=True, rdf_mode=rdtype, cutoff=10, rdf_cutoff=10
+    )
+    thinned_batch.to('cpu')
+    bins = torch.linspace(0, 10, 100)
+    ds = [compute_rdf_distance(tbatch.rdf[ind], thinned_batch.rdf, bins) for ind in range(tbatch.num_graphs)]
+    
+    dstack = torch.stack(ds)
+    dinds = dstack.argsort(dim=1, descending=False)[:, :20].flatten()
+    
+    samps = thinned_batch.batch_to_list()
+    cbatch = collate_data_list([samps[ind] for ind in dinds])
+    cbatch.mol2ucell()
+    
+    tbatch.mol2ucell()
+    tbatch.write_cif(torch.arange(tbatch.num_graphs), 'acr_ref', 'unit cell')
+    matches, rmsds = cbatch.batch_compack('acr_ref_0.cif', torch.arange(cbatch.num_graphs))
+    
+    '''
+
     umap_model = UMAP(n_components=2, n_neighbors=300, min_dist=0.75,
                       init='pca', metric='precomputed', low_memory=True, n_jobs=-1)
     sample_embedding = umap_model.fit_transform(full_dmat.cpu().numpy().astype(np.float32))
@@ -2708,7 +2764,7 @@ def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch
     old_dens /= dnorm
     """get polymorph & basin probs under elj"""
     edmat = elj_results['dmat']
-    bins = torch.linspace(0, 10, elj_batch.rdf.shape[-1], device='cuda')
+    bins = elj_batch.rdf_bins[0].to('cuda')
     all_new_rdf = torch.cat([uma_batch.rdf[p_maxima], ebatch.rdf, basin_min_batch.rdf], dim=0)
     # New samples vs. all original samples
     dists_to_elj = torch.stack([
@@ -2741,7 +2797,9 @@ def combo_fig_analysis(ebatch, elj_batch, elj_results, num_polymorphs, uma_batch
     num_orig_samples = len(good_inds)
     packing_coeffs = sample_cps
     sample_inds = np.arange(num_orig_samples)
-    return basin_colorscale, basin_min_batch, indexed_cluster_labels, n_basins, new_min_inds, p_maxima, packing_coeffs, polymorph_basin_index, polymorph_colorscale, polymorph_inds, sample_colors, sample_embedding, sample_energy, sample_inds, stats
+    return (basin_colorscale, basin_min_batch, indexed_cluster_labels, n_basins, new_min_inds, p_maxima, packing_coeffs,
+            polymorph_basin_index, polymorph_colorscale, polymorph_inds, sample_colors, sample_embedding, sample_energy,
+            sample_inds, stats, all_matches, all_rmsds)
 
 
 def clustering(uma_results, uma_thermos, max_n_clusters: int, min_basin_size: int):
@@ -2802,7 +2860,7 @@ def clustering(uma_results, uma_thermos, max_n_clusters: int, min_basin_size: in
 def augment_dmat(basin_min_batch, ebatch, uma_batch, uma_results, good_inds):
     dmat = uma_results['dmat']
     num_polymorphs = ebatch.num_graphs
-    bins = torch.linspace(0, 10, uma_batch.rdf.shape[-1], device='cuda')
+    bins = uma_batch.rdf_bins[0].to('cuda')
     all_new_rdf = torch.cat([ebatch.rdf, basin_min_batch.rdf], dim=0)
     # New samples vs. all original samples
     new_vs_original = torch.stack([
@@ -2827,8 +2885,7 @@ def augment_dmat(basin_min_batch, ebatch, uma_batch, uma_results, good_inds):
     return dmat_augmented
 
 
-def augment_dmat2(all_new_rdf, ref_rdf, dmat):
-    bins = torch.linspace(0, 10, ref_rdf.shape[-1], device='cuda')
+def augment_dmat2(all_new_rdf, ref_rdf, dmat, bins):
     # New samples vs. all original samples
     new_vs_original = torch.stack([
         compute_rdf_distance(all_new_rdf[ii], ref_rdf, bins.cpu())

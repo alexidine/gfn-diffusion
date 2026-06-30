@@ -7,8 +7,7 @@ from tqdm import tqdm
 
 from energy_sampling.eval.paper1_results.figures import parity_fig, dual_energy_marginal_fig, \
     pes_cartoon, plot_dual_density_contour, combo_fig
-from energy_sampling.eval.paper1_results.utils import combo_fig_analysis, augment_dmat, augment_dmat2, clustering, \
-    clustering2
+from energy_sampling.eval.paper1_results.utils import combo_fig_analysis, augment_dmat2, clustering
 from energy_sampling.eval.paper1_results.utils import generator_reward
 from mxtaltools.analysis.crystal_rdf import compute_rdf_distance
 from mxtaltools.common.ase_interface import ase_mol_from_crystaldata
@@ -16,7 +15,6 @@ from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 
 torch.cuda.set_per_process_memory_fraction(0.9, device=0)
-
 
 
 def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path):
@@ -152,20 +150,20 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path):
     fig_dict['elj_staircase'] = elj_staircase
     fig_dict['uma_staircase'] = uma_staircase
 
-    fig_dict['duo_embedding'] = duo_embedding_fig(ebatch, elj_batch, elj_results, en_scaling_factor, uma_batch, uma_results)
-
-    # todo compute a summary statistic that makes this metric real/meaningful
-    # todo consider then maybe whether to combine these as well
+    fig_dict['duo_embedding'] = duo_embedding_fig(ebatch, elj_batch, elj_results, en_scaling_factor, uma_batch,
+                                                  uma_results)
 
     '''Big 'ol combo plot'''
-    cluster_labels, indexed_cluster_labels, p_maxima, n_basins = clustering(uma_results, uma_thermos, max_n_clusters = 6, min_basin_size=100)
-    #cluster_labels, indexed_cluster_labels, p_maxima, n_basins = clustering2(uma_results, uma_thermos, n_clusters=10, n_keep=6)
+    cluster_labels, indexed_cluster_labels, p_maxima, n_basins = clustering(uma_results, uma_thermos, max_n_clusters=6,
+                                                                            min_basin_size=500)
+    # cluster_labels, indexed_cluster_labels, p_maxima, n_basins = clustering2(uma_results, uma_thermos, n_clusters=10, n_keep=6)
 
     (basin_colorscale, basin_min_batch, indexed_cluster_labels,
      n_basins, new_min_inds, p_maxima, packing_coeffs, polymorph_basin_index,
      polymorph_colorscale, polymorph_inds, sample_colors, sample_embedding,
-     sample_energy, sample_inds, stats) = combo_fig_analysis(
-        ebatch, elj_batch, elj_results, num_polymorphs, uma_batch, uma_results, 'uma', cluster_labels, p_maxima, n_basins, indexed_cluster_labels)
+     sample_energy, sample_inds, stats, all_matches, all_rmsds) = combo_fig_analysis(
+        ebatch, elj_batch, elj_results, num_polymorphs, uma_batch, uma_results, 'uma', cluster_labels, p_maxima,
+        n_basins, indexed_cluster_labels)
 
     fig_dict['cluster_analysis'] = combo_fig(
         num_polymorphs,
@@ -297,7 +295,7 @@ def do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path):
         return dd
 
     for key, fig in fig_dict.items():
-        # fig.show()
+        fig.show()
         style = copy(pub_style)
         style.update(custom_style(key))
         scale = style['scale']
@@ -335,7 +333,7 @@ def duo_embedding_fig(ebatch, elj_batch, elj_results, en_scaling_factor, uma_bat
     assert rdf_a.shape[0] == n_a and rdf_b.shape[0] == n_b
     device = 'cuda'
     dtype = torch.float32
-    bins = torch.linspace(0, 10, rdf_a.shape[-1], device=device)
+    bins = elj_batch.rdf_bins[0].to(device)
     rdf_a = rdf_a.to(device=device, dtype=dtype)
     rdf_b = rdf_b.to(device=device, dtype=dtype)
     a_vs_b = torch.empty(n_a, n_b, device=device, dtype=dtype)
@@ -369,7 +367,7 @@ def duo_embedding_fig(ebatch, elj_batch, elj_results, en_scaling_factor, uma_bat
     merged[n_a:, n_a:] = dmat_b.to(device=dmat_a.device, dtype=dmat_a.dtype)
     merged[:n_a, n_a:] = a_vs_b
     merged[n_a:, :n_a] = a_vs_b.T
-    merged = augment_dmat2(ebatch.rdf, torch.cat([rdf_a.cpu(), rdf_b.cpu()], dim=0), merged)
+    merged = augment_dmat2(ebatch.rdf, torch.cat([rdf_a.cpu(), rdf_b.cpu()], dim=0), merged, bins)
     polymorph_inds = torch.arange(ebatch.num_graphs) + len(merged) - ebatch.num_graphs
     import numpy as np
     from umap import UMAP
@@ -425,12 +423,12 @@ if __name__ == '__main__':
     """
     load up elj distribution, uma distribution, and experimental polymorphs
     """
-    mol_name = 'mipcas'
-    exp_path = r"D:\crystal_datasets\mipcas\MIPCAS_standardized.pt"
-    uma_results_path = r"D:\crystal_datasets\gfn_results\mipcas_uma.pt"
-    elj_results_path = r"D:\crystal_datasets\gfn_results\mipcas_elj.pt"
-    prior_path = r"D:\crystal_datasets\mipcas\mipcas_elj_prior_dataset.pt"
-    do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path)
+    # mol_name = 'mipcas'
+    # exp_path = r"D:\crystal_datasets\mipcas\MIPCAS_standardized.pt"
+    # uma_results_path = r"D:\crystal_datasets\gfn_results\mipcas_uma.pt"
+    # elj_results_path = r"D:\crystal_datasets\gfn_results\mipcas_elj.pt"
+    # prior_path = r"D:\crystal_datasets\mipcas\mipcas_elj_prior_dataset.pt"
+    # do_figs(mol_name, exp_path, uma_results_path, elj_results_path, prior_path)
 
     mol_name = 'nehzor'
     exp_path = r"D:\crystal_datasets\nehzor\NEHZOR_structures_std_conf.pt"
