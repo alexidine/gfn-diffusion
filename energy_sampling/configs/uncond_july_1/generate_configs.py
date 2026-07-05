@@ -65,17 +65,17 @@ sgs.append(19)
 if __name__ == "__main__":
     ind = 0
     base_path = 'base.yaml'
-    for mol in ['acridine', 'mipcas', 'nehzor']:
+    for mol in ['mipcas', 'nehzor', 'acridine']:
         if mol == 'mipcas':
             sg = 2
             zp = 1
-            for efunc in ['uma','elj']:
+            for efunc in ['elj','uma']:
                 make_config(sg, zp, mol, efunc, ind)
                 ind +=1
         elif mol == 'nehzor':
             sg = 14
             zp = 1
-            for efunc in ['uma','elj']:
+            for efunc in ['elj','uma']:
                 make_config(sg, zp, mol, efunc, ind)
                 ind +=1
         elif mol == 'acridine':

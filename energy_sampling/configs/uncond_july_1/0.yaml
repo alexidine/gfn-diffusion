@@ -50,7 +50,7 @@ energy_config:
   reduction_coeff: 10.0
   reward_range: null
   temperature: 2.5
-energy_function: mace
+energy_function: elj
 epochs: 1000000
 eval_T: 100
 eval_batch_size: 10000
@@ -89,7 +89,7 @@ lr_warmup_ratio: 100
 lr_warmup_time: 2000
 max_batch_size: 2500
 min_lr: 1.0e-05
-mlip_path: /scratch/mk8347/data/acr_112025_mh1_stagetwo.model
+mlip_path: D:\crystal_datasets\esen_s.pt
 model:
   clipping: true
   cond_hidden_dim: 1024
@@ -117,9 +117,9 @@ model:
   t_scale: 0.05
   zero_init: false
 molecule_conditioning: false
-molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/acridine_sg14_zp1_mace_prior_dataset.pt
+molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_prior_dataset.pt
 prior_model_name: null
-prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/acridine_sg14_zp1_mace_prior_dataset.pt
+prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_prior_dataset.pt
 repeats: 1
 replay_buffer:
   max_size: 100000
@@ -139,7 +139,7 @@ replay_loss_coeffs:
   vg_lb: 0
   vg_lme: 0
 replay_resid_cutoff: 5
-run_name: _acridine_14_1_mace
+run_name: _mipcas_2_1_elj
 scheduler: true
 seed: 12345
 sg_conditioning: false
