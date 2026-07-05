@@ -129,18 +129,6 @@ def conditional_eval_step(energy_function,
     return metrics
 
 
-def log_crystals(sample_batch):
-    cluster_batch = sample_batch.mol2cluster(cutoff=6,
-                                             supercell_size=10,
-                                             std_orientation=True)
-    cluster_batch.construct_radial_graph(cutoff=6)
-    lj_energy = cluster_batch.compute_LJ_energy()
-    cluster_batch.lj = lj_energy
-    samples_to_log, filenames = log_crystal_samples(sample_batch=cluster_batch, return_filenames=True)
-    [wandb.log({f'crystal_sample_{ind}': samples_to_log[ind]}, commit=False) for ind in range(len(samples_to_log))]
-    [os.remove(file) for file in filenames]  # delete this cif as a temporary file
-
-
 def _tb_direction_figs(fig_dict, prefix, log_r, log_pfs, log_pbs, log_flow,
                        flow_states, packing_coeff):
     fig_dict[f'{prefix} TB Parity Plot'], _ = flow_parity_plot(
@@ -163,7 +151,8 @@ def eval_figs(fwd_stats,
               sample_batch,
               prior_latent_params,
               energy_function,
-              metrics
+              metrics,
+              temperature_conditioning: bool = False
               ):
     fig_dict = {}  # todo add tb GP fig & binned residuals
 
@@ -208,8 +197,45 @@ def eval_figs(fwd_stats,
     fig_dict['Sample Scatter'] = sample_batch.plot_batch_density_funnel(
         show=False, return_fig=True, override_energy=energy_function)
 
+    if temperature_conditioning:
+        fig_dict['Z vs T'] = Z_vs_T(fwd_stats)
+
     return fig_dict, metrics
 
+
+def Z_vs_T(fwd_stats):
+
+    log_T = np.asarray(fwd_stats['log_T_tensor'])
+    log_Z = np.asarray(fwd_stats['log_flow'][:, 0])
+
+    # sort so any line/markers read left-to-right
+    order = np.argsort(log_T)
+    log_T, log_Z = log_T[order], log_Z[order]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=log_T, y=log_Z, mode="markers",
+        marker=dict(
+            size=5, color=log_Z, colorscale="Tealgrn", showscale=False,
+            line=dict(width=0), opacity=0.85,
+        ),
+        name="learned log Z",
+        hovertemplate="log T = %{x:.3f}<br>log Z = %{y:.3f}<extra></extra>",
+    ))
+
+    fig.update_layout(
+        template="plotly_white",
+        title=dict(text="Learned log Z vs temperature", font=dict(size=18), x=0.02, xanchor="left"),
+        xaxis=dict(title="log T", showgrid=True, gridcolor="rgba(0,0,0,0.06)", zeroline=False,
+                   ticks="outside", ticklen=4, tickcolor="rgba(0,0,0,0.3)"),
+        yaxis=dict(title="log Z", showgrid=True, gridcolor="rgba(0,0,0,0.06)", zeroline=False,
+                   ticks="outside", ticklen=4, tickcolor="rgba(0,0,0,0.3)"),
+        font=dict(family="Inter, system-ui, sans-serif", size=13, color="#2a2a2a"),
+        width=720, height=560,
+        plot_bgcolor="white", paper_bgcolor="white",
+        showlegend=False,
+    )
+    return fig
 
 def log_traj_params(means_f, vars_f, fig_dict,
                     flow_states,
@@ -698,34 +724,6 @@ def cluster_fig(sample_embedding, anchor_embedding, cluster_ind, anchor_energies
     return fig
 
 
-def bwd_figs(b_log_pbs, b_log_pfs, b_means_b, b_means_f, b_vars_b, b_vars_f, backward_flow_states, fig_dict, log_r,
-             log_z, b_packing_coeff, log_importance_weight):
-    fig_dict['Backward Latents Trajectories'] = visualize_latent_trajs(
-        backward_flow_states.cpu().detach().numpy(),
-        n_trajs=20, log_r=log_r.cpu().detach().numpy())
-    # fig_dict['Backward Pf vs Pb'] = Pf_vs_Pb_fig(b_log_pfs, b_log_pbs, b_log_r)
-    fig_dict['Backward TB Parity Plot'], _ = flow_parity_plot(
-        log_r.to(log_z.device),
-        log_z, b_log_pbs,
-        b_log_pfs,
-        b_packing_coeff)
-    fig_dict['Bwd TB Residual vs R'] = xy_scatter_plot(
-        log_r,
-        torch.abs(log_r.cpu() - log_z.cpu() - b_log_pfs.sum(-1).cpu() + b_log_pbs.sum(-1).cpu()),
-        xaxis_title='Reward',
-        yaxis_title='TB Residual',
-    )
-    fig_dict['Backward Gauss Params'] = mean_var_fig(b_vars_f, b_means_f,
-                                                     b_vars_b, b_means_b)
-    fig_dict['Bwd Traj Mean Step Sizes'] = mean_flow_step_sizes(backward_flow_states)
-    fig_dict['Importance Weight vs R'] = xy_scatter_plot(
-        log_r,
-        log_importance_weight,
-        c=b_log_pfs.sum(-1) - b_log_pbs.sum(-1),
-        xaxis_title='Reward',
-        yaxis_title='Log Importance Weight',
-    )
-
 
 def get_buffer_stats(buffer):
     if len(buffer) > 0:
@@ -757,156 +755,6 @@ def mean_flow_step_sizes(flow_states):
                                z=mean_step_size.cpu().detach()))
     return fig
 
-
-def log_metrics(energy_function,
-                fwd_stats, sample_batch, args, buffer=None):
-    """Scalar / distribution metrics"""
-    metrics = {}
-    arr = lambda t: t.cpu().detach().numpy()
-    val = lambda t: t.cpu().detach().item()
-
-    log_r = fwd_stats['log_r']
-    log_pf = fwd_stats['log_pfs'].sum(-1)
-    log_pb = fwd_stats['log_pbs'].sum(-1)
-    log_Z_learned = fwd_stats['log_z']
-    log_T_tensor = fwd_stats['log_T_tensor']
-
-    # energies
-    for key in sample_batch.keys():
-        if 'energy' in key or 'pot' in key:
-            metrics['Mean ' + key] = val(sample_batch[key].mean())
-
-    # physical properties
-    metrics['Mean Packing Coeff'] = val(sample_batch.packing_coeff.mean())
-    metrics['Packing Coeff'] = arr(sample_batch.packing_coeff.clip(max=2))
-    metrics['Reduction Energy'] = arr(sample_batch.reduction_en)
-    metrics['Reduced Valid Fraction'] = np.mean(arr(sample_batch.reduction_en) < 1e-1)
-
-    # conditions
-    metrics['Crystal Mean Log Temperature'] = val(log_T_tensor.mean())
-    metrics['Crystal Log Temperature'] = arr(log_T_tensor)
-
-    # training metrics
-    metrics['Mean Sample Energy'] = val(sample_batch.gfn_energy.mean())
-    metrics['Sample Energy'] = arr(sample_batch.gfn_energy.clip(max=50))
-    metrics['Scaled LJ'] = arr(log_rescale_positive(sample_batch.lj))
-
-    metrics['Mean Sample Reward'] = val(log_r.mean())
-    metrics['Sample Reward'] = arr(log_r.clip(min=-50))
-
-    metrics['Empirical log Z'] = val(fwd_stats['log_Z'])
-    metrics['Empirical log Z LB'] = val(fwd_stats['log_Z_lb'])
-    metrics['log Z learned'] = val(log_Z_learned)
-
-    def dump_numeric(metrics, prefix, obj):
-        d = obj if isinstance(obj, dict) else vars(obj)
-        for k, v in d.items():
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
-                metrics[f'{prefix}/{k}'] = v
-
-    dump_numeric(metrics, 'energy_func/', energy_function)
-    dump_numeric(metrics, 'loss_coeffs/fwd_', args.fwd_loss_coeffs)
-    dump_numeric(metrics, 'loss_coeffs/bwd_', args.bwd_loss_coeffs)
-
-    std_params = sample_batch.latent_params()
-
-    metrics['Total Var'] = std_params.var(dim=0).mean().cpu().detach().numpy()
-    metrics['Total Mean'] = std_params.mean(dim=0).mean().cpu().detach().numpy()
-
-    U, S, Vh = torch.linalg.svd(std_params - std_params.mean(0), full_matrices=False)
-    eigvals = S ** 2
-    explained_var_ratio = eigvals / eigvals.sum()
-    loadings = Vh.T  # shape: (num_features, num_components)
-    contrib_per_feature = (loadings ** 2) @ explained_var_ratio  # shape: (num_features,)
-    d_eff = (explained_var_ratio ** 2).sum() ** -1
-    metrics['Effective Dimension'] = d_eff.item()
-
-    prior_sample = sample_backward_prior(args, buffer, sample_batch, len(std_params))
-
-    # this isn't SG conditioned, but that's OK because we're not really using it anymore anyway
-    prior_coverage = get_dimwise_coverage(std_params, prior_sample.to('cpu'),
-                                          n_bins=24, cmin=1, tau=1 / 0.05)
-    lattice_features = ['cell_a', 'cell_b', 'cell_c',
-                        'cell_alpha', 'cell_beta', 'cell_gamma',
-                        'aunit_x', 'aunit_y', 'aunit_z',
-                        'orientation_1', 'orientation_2', 'orientation_3']
-    for ind, thing in enumerate(lattice_features):
-        metrics[f'{thing} coverage'] = prior_coverage[ind].item()
-    metrics['Minimum 1d coverage'] = torch.amin(prior_coverage).item()
-
-    # get fraction of samples which are 'reasonable' at this energy,
-    en_func = energy_function.energy_function
-    sample_is_good = (sample_batch[en_func] < 0) * (sample_batch.packing_coeff > 0.55) * (
-            sample_batch.packing_coeff < 0.95)
-    metrics["Reasonable Sample Fraction"] = sample_is_good.float().mean().item()
-
-    metrics = {k: to_loggable(v) for k, v in metrics.items()}
-
-    return metrics
-
-
-def _safe_array(x):
-    """
-    Convert list / tensor / array-like to a clean NumPy array once.
-    """
-    if hasattr(x, "detach"):  # torch tensor
-        x = x.detach().cpu().numpy()
-    return np.asarray(x)
-
-
-def _log_stats(metrics, prefix, values, *,
-               clip_max=None,
-               n_quantiles=50):
-    """
-    Compute length, quantiles, and mean in one place.
-    """
-    arr = _safe_array(values)
-    if arr.size == 0:
-        return
-
-    if clip_max is not None:
-        arr = np.clip(arr, None, clip_max)
-
-    arr = np.nan_to_num(arr)
-
-    qs = np.linspace(0, 1, n_quantiles)
-
-    metrics[f'{prefix} Length'] = arr.size
-    metrics[f'{prefix} Quantiles'] = np.quantile(arr, qs)
-    metrics[f'{prefix} Mean'] = arr.mean()
-
-
-def buffer_logging(buffer, metrics, sample_batch):
-    # ---- main buffer ----
-    if len(buffer) > 0:
-        _log_stats(
-            metrics,
-            'Buffer',
-            buffer.rewards_list,
-        )
-        buffer_kld(buffer, metrics, sample_batch)
-
-    # ---- noised buffer ----
-    if len(buffer.noised_rewards) > 0:
-        _log_stats(
-            metrics,
-            'Noised Buffer',
-            buffer.noised_rewards,
-        )
-
-        _log_stats(
-            metrics,
-            'Noised Buffer Loss',
-            buffer.noised_losses,
-            clip_max=10,
-        )
-
-        _log_stats(
-            metrics,
-            'Noised Buffer Step',
-            buffer.noised_select_counts,
-            clip_max=100,
-        )
 
 
 def buffer_kld(buffer, metrics, sample_batch):

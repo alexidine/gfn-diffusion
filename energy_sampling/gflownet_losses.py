@@ -130,7 +130,6 @@ def get_gfn_forward_loss(loss_coeffs,
     else:
         emp_z_loss = None
 
-
     if loss_coeffs.db > 0:
         db_loss = get_db_loss(log_pfs, log_pbs, log_flow, beta=beta)
         losses.append(db_loss * loss_coeffs.db)
@@ -155,7 +154,11 @@ def get_gfn_forward_loss(loss_coeffs,
     loss = combined_losses.mean()
 
     if report_losses:
-        loss_dict = {'log_pf': log_pf, 'log_pb': log_pb, 'log_Z': log_Z_learned, 'log_r': log_r}
+        loss_dict = {'log_pf': log_pf.detach(),
+                     'log_pb': log_pb.detach(),
+                     'log_Z': log_Z_learned.detach(),
+                     'log_r': log_r.detach(),
+                     'flow_states': states.detach()}
         if loss_coeffs.tb > 0:
             loss_dict['tb'] = tb_loss.mean().detach()
         if loss_coeffs.vg_lb > 0:
@@ -187,14 +190,21 @@ def get_gfn_backward_loss(loss_coeffs,
                           condition=None,
                           repeats=10,
                           report_losses: bool = False,
+                          trajectories: Optional[torch.Tensor] = None,
                           ):
     if gfn.conditional and repeats > 1:
         assert False, "Not yet implemented"
 
-    states, log_pfs, log_pbs, log_flow = gfn.get_traj_bwd(
-        samples, discretizer, condition, mol_batch,
-        return_gauss_params=False,
-        detach_traj=loss_coeffs.traj_grads == 0)
+    if trajectories is not None:
+        # replay a fixed trajectory (e.g. from a buffer) instead of resampling one
+        states, log_pfs, log_pbs, log_flow = gfn.get_traj_replay(
+            trajectories, discretizer, condition, mol_batch,
+            return_gauss_params=False)
+    else:
+        states, log_pfs, log_pbs, log_flow = gfn.get_traj_bwd(
+            samples, discretizer, condition, mol_batch,
+            return_gauss_params=False,
+            detach_traj=loss_coeffs.traj_grads == 0)
     log_Z_learned = log_flow[:, 0]
     log_flow[:, -1] = log_r
 
@@ -261,8 +271,9 @@ def get_gfn_backward_loss(loss_coeffs,
 
     if report_losses:
         loss_dict = {'losses': combined_losses.detach(),
-                     'log_pf': log_pf, 'log_pb': log_pb,
-                     'log_Z': log_Z_learned, 'log_r': log_r}
+                     'log_pf': log_pf.detach(), 'log_pb': log_pb.detach(),
+                     'log_Z': log_Z_learned.detach(), 'log_r': log_r.detach(),
+                     'flow_states': states.detach()}
         if loss_coeffs.tb > 0:
             loss_dict['tb'] = tb_loss.mean().detach()
         if loss_coeffs.vg_lb > 0:
@@ -417,7 +428,6 @@ def vg_lme(gfn, log_pb, log_pf, log_r, repeats, beta: float = 10):
         # vg_loss = 0.5 * (log_Z - log_ratio) ** 2
         vg_loss = beta * F.smooth_l1_loss(log_Z.repeat(len(log_ratio)), log_ratio, reduction='none', beta=beta)
     return log_Z, vg_loss
-
 
 
 def vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats, beta: float = 10):

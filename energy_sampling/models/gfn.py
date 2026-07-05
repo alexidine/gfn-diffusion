@@ -35,6 +35,7 @@ class GFN(nn.Module):  # todo add seeding
                  zero_init: bool = False, device=torch.device('cuda'),
                  max_z_prime: int = 1,
                  full_flow: bool = False,
+                 do_periodic_angles: bool = True
                  ):
         super(GFN, self).__init__()
         self.dim = dim
@@ -59,7 +60,7 @@ class GFN(nn.Module):  # todo add seeding
         self.conditions_type = conditions_type
         self.full_flow = full_flow
 
-        self.get_periodic_dimensions(device)
+        self.get_periodic_dimensions(device, do_periodic_angles=do_periodic_angles)
         self.condition_embedding_dim = condition_embedding_dim
 
         self.init_conditioner(cond_hidden_dim, cond_layers, condition_embedding_dim, conditions_dim,
@@ -167,14 +168,16 @@ class GFN(nn.Module):  # todo add seeding
             else:
                 self.flow_model = LearnableScalar()  # unified syntax with this instead of nn.Parameter
 
-    def get_periodic_dimensions(self, device):
-        # angs = [False] * 6
-        # for zp in range(self.max_z_prime):
-        #     angs.extend([False, False, False])
-        # for zp in range(self.max_z_prime):
-        #     angs.extend([False, True, True])
-        #     # phi and r dimensions arein rotational basis
-        angs = [False] * 12  # TODO UNDO THIS
+    def get_periodic_dimensions(self,device, do_periodic_angles: bool = True, ):
+        if do_periodic_angles:
+            angs = [False] * 6
+            for zp in range(self.max_z_prime):
+                angs.extend([False, False, False])
+            for zp in range(self.max_z_prime):
+                angs.extend([False, True, True])
+                # phi and r dimensions arein rotational basis
+        else:
+            angs = [False] * 12
         self.ang_mask = torch.tensor(angs, device=device)
         self.ang_dim = (self.ang_mask == True).sum().item()
         self.lin_dim = self.dim - self.ang_dim
@@ -235,7 +238,7 @@ class GFN(nn.Module):  # todo add seeding
 
             if not self.full_flow:
                 if i == 0:
-                    log_flow[:, 0] = self.flow_model(torch.cat([s_emb, t_emb], dim=1)).flatten()
+                    log_flow[:, 0] = self.flow_model(condition_embedding).flatten()
             else:
                 log_flow[:, i] = self.flow_model(torch.cat([s_emb, t_emb], dim=1)).flatten()
 
@@ -359,15 +362,15 @@ class GFN(nn.Module):  # todo add seeding
                 back_var = torch.ones_like(back_drift) * 1e-3 * dts.unsqueeze(1)
                 logpb.append(torch.zeros_like(logpb[-1]))
 
-            """log pf calculation""" # todo note we are duplicating state and time embedding calls throughout
+            """log pf calculation"""
             expanded_prev_state = self.expand_state_for_policy(prev_state)
             s_emb = self.s_model(expanded_prev_state, condition_embedding)
             t_emb = self.t_model(ts[:, trajectory_length - i - 1])
             pfs = self.predict_next_state(s_emb, t_emb)
             pf_mean, pflogvars = self.split_params(pfs)
             if not self.full_flow:
-                if (i-1) == 0:
-                    log_flow[:, 0] = self.flow_model(torch.cat([s_emb, t_emb], dim=1)).flatten()
+                if (i-1) == 0: # time-independent conditional embedding
+                    log_flow[:, 0] = self.flow_model(condition_embedding).flatten()
             else:
                 log_flow[:, (trajectory_length - i-1)] = self.flow_model(torch.cat([s_emb, t_emb], dim=1)).flatten()
 
@@ -385,6 +388,92 @@ class GFN(nn.Module):  # todo add seeding
                 current_state[:, self.ang_mask] = self.wrap_to_pi(
                     current_state[:, self.ang_mask] * torch.pi) / torch.pi  # latent space is on [-1, 1]
             states[:, trajectory_length - i - 1] = current_state.detach()
+
+        logpfs = torch.stack(logpf).T
+        logpbs = torch.stack(logpb).T
+        if return_gauss_params:
+            return (states, logpfs, logpbs, log_flow,
+                    means_f.mean(-1), logvars_f.mean(-1),
+                    means_b.mean(-1), logvars_b.mean(-1))
+        else:
+            return states, logpfs, logpbs, log_flow
+
+    def get_traj_replay(self, trajectory, discretizer, condition, mol_batch,
+                        return_gauss_params: bool = False):
+        """
+        Recompute log_flow, logpf and logpb for a fixed batch of trajectories
+        (e.g., replayed from a buffer), instead of generating them. Mirrors
+        get_traj_fwd's semantics exactly, but reads states from `trajectory`
+        rather than sampling them, so the output is naturally detached from
+        the state-generating computation graph (only the policy/flow model
+        evaluations carry gradient).
+
+        trajectory: [batch_size, trajectory_length + 1, dim]
+        """
+        trajectory = trajectory.detach()
+        batch_size = trajectory.shape[0]
+        ts = discretizer(batch_size).to(self.device)
+        trajectory_length = ts.shape[1] - 1
+        assert trajectory.shape[1] == trajectory_length + 1, \
+            f"trajectory has {trajectory.shape[1]} states, expected {trajectory_length + 1}"
+
+        logpb, logpf, states, means_f, logvars_f, means_b, logvars_b, log_flow = self.init_traj_tensors(
+            batch_size, trajectory_length)
+
+        states = trajectory
+        current_state = states[:, 0]
+
+        if self.conditional:
+            if condition is not False:
+                condition_embedding = self.get_condition_embedding(condition, mol_batch)
+            else:  # constant embedding
+                condition_embedding = torch.zeros((batch_size, self.condition_embedding_dim),
+                                                  dtype=torch.float32, device=self.device)
+        else:
+            condition_embedding = None
+
+        for i in range(trajectory_length):
+            dts = ts[:, i + 1] - ts[:, i]
+            next_state = states[:, i + 1]
+
+            # PROPAGATION (evaluated against the given transition, not sampled)
+            expanded_current_state = self.expand_state_for_policy(current_state)
+            s_emb = self.s_model(expanded_current_state, condition_embedding)
+            t_emb = self.t_model(ts[:, i])
+            state_update = self.predict_next_state(s_emb, t_emb)
+            pf_mean, pflogvars = self.split_params(state_update)
+
+            if not self.full_flow:
+                if i == 0:
+                    log_flow[:, 0] = self.flow_model(condition_embedding).flatten()
+            else:
+                log_flow[:, i] = self.flow_model(torch.cat([s_emb, t_emb], dim=1)).flatten()
+
+            # compute forward logprobs
+            fwd_drift = dts.unsqueeze(1) * pf_mean
+            fwd_var = dts.unsqueeze(1) * pflogvars.exp()
+            logpf.append(self.gauss_logprob(next_state - current_state, fwd_drift, fwd_var))
+
+            # compute backward logprobs
+            expanded_next_state = self.expand_state_for_policy(next_state)
+            back_mean_correction, back_var_correction = self.fwd_get_back_correction(
+                condition_embedding, i, expanded_next_state, ts)
+            back_drift = -next_state * (dts / ts[:, i + 1]).unsqueeze(1) * back_mean_correction
+            if i > 0:  # variance is exactly zero for the first step, so we can't use it
+                var = (back_var_correction + np.log(self.pf_std_per_traj) * 2.0).clip(min=-self.var_clip,
+                                                                                      max=self.var_clip).exp()
+                back_var = var * (dts * ts[:, i] / ts[:, i + 1]).unsqueeze(1)
+                logpb.append(self.gauss_logprob(current_state - next_state, back_drift, back_var))
+            else:  # instead set this as a constant the model will have to learn around
+                back_var = torch.ones_like(back_drift) * 1e-3 * dts.unsqueeze(1)
+                logpb.append(torch.zeros_like(logpf[-1]))
+
+            if return_gauss_params:
+                self.log_gauss_params(back_drift, back_var, dts, fwd_drift, i,
+                                      logvars_b, logvars_f, means_b, means_f,
+                                      pflogvars)
+
+            current_state = next_state
 
         logpfs = torch.stack(logpf).T
         logpbs = torch.stack(logpb).T

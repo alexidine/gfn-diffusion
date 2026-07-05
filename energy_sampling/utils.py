@@ -221,7 +221,6 @@ def shifted_equidistant(bsz, traj_length, eps=1e-4):
     return torch.cat([torch.zeros(bsz, 1), steps, torch.ones(bsz, 1)], dim=1)
 
 
-
 def compute_sample_overlap(ref_x, sample_x=None, ga: float = 1.0, agg='sum'):
     if sample_x is None:
         d = torch.cdist(ref_x, ref_x) + torch.eye(len(ref_x), device=ref_x.device) * 100
@@ -1082,7 +1081,6 @@ class MetricTracker:
     def update(self, direction, scalars: dict, step: int):
         dt = max(step - self.last_it.get(direction, step), 1)
         alpha = 1.0 - np.exp(-dt / self.period)
-        self.changed_keys.clear()  # reset for this update
 
         for name, v in scalars.items():
             v = v.item() if torch.is_tensor(v) else float(v)
@@ -1113,13 +1111,13 @@ class MetricTracker:
             return default
         return b[1] if mode == 'max' else b[0]
 
-
     def snapshot(self, changed_only=False):
         if changed_only:
-            return {f'{d}/{n}': v for (d, n), v in self.values.items()
-                    if v is not None and (d, n) in self.changed_keys}
+            result = {f'{d}/{n}': v for (d, n), v in self.values.items()
+                      if v is not None and (d, n) in self.changed_keys}
+            self.changed_keys.clear()  # reset now that this snapshot has consumed them
+            return result
         return {f'{d}/{n}': v for (d, n), v in self.values.items() if v is not None}
-
 
     def state_dict(self):
         nested, best = {}, {}
@@ -1159,8 +1157,14 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r):
     z_learned = log_Z.detach().mean()
 
     # TB residual skew
-    resid_c = (resid - resid.mean())
+    resid_c = (resid)  # center it on zero
     skew = (resid_c.pow(3).mean() / resid_c.pow(2).mean().pow(1.5).clamp_min(1e-8))
+
+    # Under-weighted trajectories
+    neg = resid.clamp(max=0)  # 0 where resid >= 0, negative elsewhere
+    under_severity = neg.pow(2).mean().sqrt().item()  # RMS of negative residuals
+    pos = resid.clamp(min=0)
+    over_severity = pos.pow(2).mean().sqrt().item()
 
     mets = {
         'slope_err': (slope - 1).abs().item(),
@@ -1171,18 +1175,20 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r):
         'tb_err': resid.pow(2).mean().sqrt().item(),
         'jensen_z_err': (z_jensen - z_learned).abs().item(),
         'emp_z_err': (z_emp - z_learned).abs().item(),
+        'under_coverage': under_severity,
+        'over_coverage': over_severity,
         'z_gap': (z_emp - z_jensen).item(),
-        'resid_p05': resid.abs().detach().quantile(0.05).item(),
-        'resid_p95': resid.abs().detach().quantile(0.95).item(),
+        'resid_p05': resid.detach().quantile(0.05).item(),
+        'resid_p95': resid.detach().quantile(0.95).item(),
         'resid_skew': skew.item(),  # sign tells you over- vs under-sampling dominance
         'jensen_z': z_jensen.item(),
         'emp_z': z_emp.item()
     }
-    mets.update(
-        online_tb_coverage(
-            log_pf, log_pb, log_Z, log_r, log_w_clamp = 10
-        )
-    )
+    # mets.update(
+    #     online_tb_coverage(
+    #         log_pf, log_pb, log_Z, log_r, log_w_clamp=10
+    #     )
+    # )
     return mets
 
 
@@ -1196,56 +1202,59 @@ def online_tb_coverage(log_pf, log_pb, log_Z, log_r, log_w_clamp=10.0):
     This is the un-binned limit of  sum_b pi(b) * delta_bar_b  — the same forward-KL proxy,
     without having to resolve the high-reward bin.
     """
-    delta = (log_pf + log_Z - log_pb - log_r).detach()        # (B,)
+    delta = (log_pf + log_Z - log_pb - log_r).detach()  # (B,)
 
     # log importance weight toward pi (drop the constant log_Z; self-norm cancels it)
     log_w = (log_r + log_pb - log_pf).detach()
-    log_w = log_w - log_w.max()                               # stabilize
-    log_w = log_w.clamp_min(-log_w_clamp)                     # tame the light tail; heavy tail already capped at 0
+    log_w = log_w - log_w.max()  # stabilize
+    log_w = log_w.clamp_min(-log_w_clamp)  # tame the light tail; heavy tail already capped at 0
     w = log_w.exp()
     w_sum = w.sum().clamp_min(1e-12)
 
     # self-normalized target-weighted mean residual  ~  E_pi[delta]
     wmean = (w * delta).sum() / w_sum
-    ess   = w_sum.pow(2) / w.pow(2).sum().clamp_min(1e-12)    # Kish effective sample size
+    ess = w_sum.pow(2) / w.pow(2).sum().clamp_min(1e-12)  # Kish effective sample size
 
     return {
-        'resid_wmean':     wmean.item(),                      # target-weighted: THE coverage gauge (<0 => missing high-r mass)
-        'capture_proxy':   wmean.clamp_max(0).exp().item(),   # exp(min(.,0)) — Jensen-style captured-fraction proxy
-        'ess':             ess.item(),                        # trust the wmean only when this isn't ~1
-        'ess_frac':        (ess / delta.numel()).item(),
+        'resid_wmean': wmean.item(),  # target-weighted: THE coverage gauge (<0 => missing high-r mass)
+        'capture_proxy': wmean.clamp_max(0).exp().item(),  # exp(min(.,0)) — Jensen-style captured-fraction proxy
+        'ess': ess.item(),  # trust the wmean only when this isn't ~1
+        'ess_frac': (ess / delta.numel()).item(),
     }
+
 
 def binned_tb_residual(log_pf, log_pb, log_Z, log_r,
                        bin_width=10.0, max_reward=None, n_bins=5, min_count=10):
-    resid = (log_pf + log_Z - log_pb - log_r).detach()   # δ ; <0 ⇒ missed mass
+    resid = (log_pf + log_Z - log_pb - log_r).detach()  # δ ; <0 ⇒ missed mass
     r = log_r.detach()
     r_max = r.max() if max_reward is None else \
-            torch.as_tensor(max_reward, device=r.device, dtype=r.dtype)
+        torch.as_tensor(max_reward, device=r.device, dtype=r.dtype)
 
     out = {}
     for i in range(n_bins):
         lo = r_max - (i + 1) * bin_width
         hi = r_max - i * bin_width
-        m = (r >= lo) if i == 0 else (r >= lo) & (r < hi)   # top bin catches r == r_max
+        m = (r >= lo) if i == 0 else (r >= lo) & (r < hi)  # top bin catches r == r_max
         n = int(m.sum())
         if n >= min_count:
             mean_d = resid[m].mean()
-            out[f'bin{i}_mean_resid'] = mean_d.item()                 # signed δ̄_b
-            out[f'bin{i}_capture']    = mean_d.clamp_max(0).exp().item()  # Jensen LB on captured mass
+            out[f'bin{i}_mean_resid'] = mean_d.item()  # signed δ̄_b
+            out[f'bin{i}_capture'] = mean_d.clamp_max(0).exp().item()  # Jensen LB on captured mass
         else:
             out[f'bin{i}_mean_resid'] = float('nan')
-            out[f'bin{i}_capture']    = float('nan')
+            out[f'bin{i}_capture'] = float('nan')
         out[f'bin{i}_n'] = n
 
-    lo_tail = r_max - n_bins * bin_width                    # coarse catch-all tail
+    lo_tail = r_max - n_bins * bin_width  # coarse catch-all tail
     m = r < lo_tail
     n = int(m.sum())
     out['tail_mean_resid'] = resid[m].mean().item() if n >= min_count else float('nan')
     out['tail_n'] = n
     return out
 
+
 import torch
+
 
 def residual_reward_curve(log_pf, log_pb, log_Z, log_r,
                           bin_width=5.0, max_reward=None, min_count=3,
@@ -1257,22 +1266,22 @@ def residual_reward_curve(log_pf, log_pb, log_Z, log_r,
     on the per-bin means with noise = SE_b^2, so sparse bins get wide bands.
     Read capture_lo (the pessimistic band) for a conservative coverage statement.
     """
-    resid = (log_pf + log_Z - log_pb - log_r).detach()       # δ
+    resid = (log_pf + log_Z - log_pb - log_r).detach()  # δ
     r = log_r.detach()
     dev, dt = r.device, r.dtype
     r_max = r.max() if max_reward is None else torch.as_tensor(max_reward, device=dev, dtype=dt)
 
     # --- bin on reward axis, summarize ---
     idx = ((r_max - r) / bin_width).floor().long().clamp_min(0)
-    nb  = int(idx.max()) + 1
+    nb = int(idx.max()) + 1
     ones = torch.ones_like(resid)
     cnt = torch.zeros(nb, device=dev, dtype=dt).scatter_add_(0, idx, ones)
-    s1  = torch.zeros(nb, device=dev, dtype=dt).scatter_add_(0, idx, resid)
-    s2  = torch.zeros(nb, device=dev, dtype=dt).scatter_add_(0, idx, resid * resid)
+    s1 = torch.zeros(nb, device=dev, dtype=dt).scatter_add_(0, idx, resid)
+    s2 = torch.zeros(nb, device=dev, dtype=dt).scatter_add_(0, idx, resid * resid)
     mean = s1 / cnt.clamp_min(1)
-    var  = (s2 / cnt.clamp_min(1) - mean ** 2).clamp_min(0)
-    se   = (var / cnt.clamp_min(1)).sqrt()
-    ctr  = r_max - (torch.arange(nb, device=dev, dtype=dt) + 0.5) * bin_width
+    var = (s2 / cnt.clamp_min(1) - mean ** 2).clamp_min(0)
+    se = (var / cnt.clamp_min(1)).sqrt()
+    ctr = r_max - (torch.arange(nb, device=dev, dtype=dt) + 0.5) * bin_width
 
     keep = cnt >= min_count
     X, Y, N = ctr[keep], mean[keep], se[keep] ** 2 + 1e-6
@@ -1289,7 +1298,7 @@ def residual_reward_curve(log_pf, log_pb, log_Z, log_r,
     grid = torch.linspace(r.min(), r_max, n_grid, device=dev, dtype=dt)
     Ks = rbf(grid, X)
     mu = (Ks @ alpha).squeeze(-1)
-    v  = torch.cholesky_solve(Ks.t(), L)
+    v = torch.cholesky_solve(Ks.t(), L)
     sd = (sf2 - (Ks * v.t()).sum(-1)).clamp_min(0).sqrt()
 
     return {
@@ -1297,9 +1306,10 @@ def residual_reward_curve(log_pf, log_pb, log_Z, log_r,
         "bin_center": ctr[keep], "bin_mean": Y, "bin_se": se[keep], "bin_n": cnt[keep],
         # smooth GP view
         "grid": grid, "gp_mean": mu, "gp_sd": sd,
-        "capture":    mu.clamp_max(0).exp(),
-        "capture_lo": (mu - 2 * sd).clamp_max(0).exp(),   # pessimistic — read this
+        "capture": mu.clamp_max(0).exp(),
+        "capture_lo": (mu - 2 * sd).clamp_max(0).exp(),  # pessimistic — read this
     }
+
 
 def _snapshot(opt):
     return [p.detach().clone() for g in opt.param_groups
@@ -1321,7 +1331,7 @@ def _uw_from_snaps(pre, post):
         un = (cur - prev).norm().item()
         wn = prev.norm().item()
         upd_sq += un * un
-        wt_sq  += wn * wn
+        wt_sq += wn * wn
         if wn > 0:
             max_ratio = max(max_ratio, un / wn)
     return {'uw_global': (upd_sq ** 0.5) / (wt_sq ** 0.5 + 1e-12),

@@ -62,6 +62,7 @@ class MolecularCrystal(BaseSet):
                  reward_range: float = None,
                  lj_rescale: float = None,
                  pressure: float = 1,  # in atm
+                 log_temperature_range: list = None
                  ):
 
         super(MolecularCrystal, self).__init__()
@@ -86,6 +87,7 @@ class MolecularCrystal(BaseSet):
         self.reward_range = reward_range
         self.lj_rescale = lj_rescale
         self.pressure = pressure
+        self.log_temperature_range = log_temperature_range
         if self.energy_function == 'uma':
             self.mlip_path = mlip_path
             self.predictor = init_uma_crystal_predictor(mlip_path, device=self.device)
@@ -98,6 +100,8 @@ class MolecularCrystal(BaseSet):
         self.temperature = temperature  # for static temperature work
         self.energy_clip = None
         self.reward_clip = None
+
+        self.is_crystal = not self.energy_function in ['latent_harmonic', 'latent_multiharmonic']  # not a toy model
 
         self.batch = collate_data_list([MolCrystalData(max_z_prime=max_z_prime)], max_z_prime=max_z_prime)
 
@@ -167,8 +171,7 @@ class MolecularCrystal(BaseSet):
         ens_dict = {}
 
         latents = crystal_batch.latent_params()
-        if ((raw_latents is not None) and not
-        (self.energy_function in ['latent_harmonic', 'latent_multiharmonic'])):
+        if (raw_latents is not None) and self.is_crystal:
             bounding_energy = (F.relu(raw_latents - 1) ** 2 + F.relu(-(raw_latents + 1)) ** 2).sum(
                 dim=-1)  # discourage exploration beyond clip range
         else:
@@ -213,7 +216,7 @@ class MolecularCrystal(BaseSet):
         else:
             assert False, f'{self.energy_function} not implemented'
 
-        if self.energy_function in ['latent_harmonic', 'latent_multiharmonic']:
+        if not self.is_crystal:
             jacobian_energy = torch.zeros_like(bounding_energy)
         else:
             jacobian_energy = self.compute_jacobian(crystal_batch, temperature)
@@ -449,7 +452,8 @@ class MolecularCrystal(BaseSet):
 
         z_ones3 = torch.ones((n, 3 * self.max_z_prime), device=device)
         z_ones1 = torch.ones((n, self.max_z_prime), device=device)
-
+        setattr(crystal_batch, '_num_graphs', mol_batch.num_graphs)
+        setattr(crystal_batch, 'device', mol_batch.device)
         crystal_batch.set_mol_attrs(mol_batch.clone())
 
         blank_batch_properties = {
@@ -470,8 +474,7 @@ class MolecularCrystal(BaseSet):
             'z_prime': ones1,
             'is_well_defined': trues1,
         }
-        setattr(crystal_batch, '_num_graphs', mol_batch.num_graphs)
-        setattr(crystal_batch, 'device', mol_batch.device)
+
         crystal_batch.set_mol_attrs(mol_batch.clone())
         slice_dict = torch.arange(0, crystal_batch.num_graphs + 1, 1, device='cpu')
         inc_dict = torch.zeros(crystal_batch.num_graphs, dtype=torch.long, device='cpu')
@@ -520,7 +523,16 @@ class MolecularCrystal(BaseSet):
             """
             sample temp range, or a fixed temp, or an override temp
             """
-            log_T_tensor = torch.log10(temperature[:, None])
+            if temperature is not None:
+                log_T_tensor = torch.log10(temperature)
+            else:
+                # Uniform samples in [0, 1]
+                u = torch.rand(mol_batch.num_graphs, dtype=torch.float32)
+                # Transform to [log_low, log_high]
+                log_T_tensor = self.log_temperature_range[0] + u * (
+                            self.log_temperature_range[1] - self.log_temperature_range[0])
+
+            log_T_tensor = log_T_tensor.to(mol_batch.device)
             conds.append(log_T_tensor)
         else:
             log_T_tensor = torch.log10(
@@ -549,11 +561,18 @@ class MolecularCrystal(BaseSet):
         mol_batch.z_prime = zp_to_sample
         mol_batch.reset_sg_info(sg_to_sample)
 
+        if len(conds) == 0:
+            condition = torch.zeros_like(log_T_tensor)
+        elif len(conds) == 1:
+            condition = conds[0][:, None]
+        else:
+            condition = torch.cat(conds, dim=-1)
+
         return (mol_batch,
                 log_T_tensor.flatten(),
                 sg_to_sample,
                 zp_to_sample,
-                torch.cat(conds, dim=1) if len(conds) > 0 else torch.zeros_like(log_T_tensor),
+                condition
                 )
 
 

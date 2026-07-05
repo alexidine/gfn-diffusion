@@ -538,6 +538,7 @@ class CrystalBuffer:
             max_z_prime: int = 1,
             x_fn=None,
             y_fn=None,
+            traj: Optional[torch.Tensor] = None,
     ):
         self.device = device
         self.max_z_prime = max_z_prime
@@ -550,6 +551,12 @@ class CrystalBuffer:
         n = len(self)
         self.ema_loss = torch.full((n,), float("nan"), dtype=torch.float32)
         self.select_counts = torch.zeros(n, dtype=torch.long)
+
+        if traj is not None:
+            assert traj.shape[0] == n, \
+                f"traj has {traj.shape[0]} entries, expected {n} to match dataset size"
+            traj = traj.detach().to(device).contiguous()
+        self.traj = traj
 
     # ---------------------------------------------------------------------
     # Internals
@@ -620,9 +627,6 @@ class CrystalBuffer:
             weighted_inds = np.random.choice(n, size=n_weighted, replace=True, p=p)
             uniform_inds = np.random.choice(n, size=n_uniform, replace=n_uniform > n)
             inds = np.concatenate([weighted_inds, uniform_inds])
-        elif p is not None:
-            inds = np.random.choice(n, size=n, replace=True, p=p)
-
         else:
             if replace is None:
                 replace = batch_size > n
@@ -669,6 +673,7 @@ class CrystalBuffer:
             weighted: bool = False,
             temperature: Optional[float] = None,
             beta: Optional[float] = None,
+            return_traj: bool = False,
     ):
         p = self._loss_weights(temperature) if weighted else None
         inds = self._sample_indices(batch_size, replace=replace, repeats=repeats, p=p, beta=beta)
@@ -678,9 +683,10 @@ class CrystalBuffer:
 
         x = self.x[t_inds]
         y = self.y[t_inds] if self.y is not None else None
+        traj = self.traj[t_inds] if (return_traj and self.traj is not None) else None
 
         # numpy inds returned for update_losses
-        return x, y, inds
+        return x, y, traj, inds
 
     @torch.no_grad()
     def sample_graphs(
@@ -693,6 +699,7 @@ class CrystalBuffer:
             weighted: bool = False,
             temperature: Optional[float] = None,
             beta: Optional[float] = None,
+            return_traj: bool = False,
     ):
         p = self._loss_weights(temperature) if weighted else None
         inds = self._sample_indices(batch_size, replace=replace, repeats=repeats, p=p, beta=beta)
@@ -705,7 +712,13 @@ class CrystalBuffer:
         if orient:
             graphs.orient_molecule(mode="std")
 
-        return graphs, inds
+        if return_traj and self.traj is not None:
+            t_inds = torch.as_tensor(inds, device=self.device, dtype=torch.long)
+            traj = self.traj[t_inds]
+        else:
+            traj = None
+
+        return graphs, inds, traj
 
     def loader(
             self,
@@ -716,22 +729,40 @@ class CrystalBuffer:
             weighted: bool = False,
             temperature: Optional[float] = None,
             beta: Optional[float] = None,
+            return_traj: bool = False,
     ):
         """
         Infinite random-batch generator. Use next() on it.
+
+        return_traj appends the sampled [batch, traj_length, dim] trajectory
+        tensor to the yielded tuple (after y for "tensors" mode, after the
+        graphs batch for "graphs" mode, and before inds if return_inds is
+        also set).
         """
         assert mode in ("tensors", "graphs")
 
         while True:
             if mode == "tensors":
-                x, y, inds = self.sample_tensors(batch_size,
-                                                 repeats=repeats, weighted=weighted, temperature=temperature, beta=beta)
-                yield (x, y, inds) if return_inds else (x, y)
+                x, y, traj, inds = self.sample_tensors(batch_size,
+                                                       repeats=repeats, weighted=weighted, temperature=temperature,
+                                                       beta=beta, return_traj=return_traj)
+                result = (x, y)
+                if return_traj:
+                    result = result + (traj,)
+                if return_inds:
+                    result = result + (inds,)
+                yield result
 
             else:
-                graphs, inds = self.sample_graphs(batch_size,
-                                                  repeats=repeats, weighted=weighted, temperature=temperature, beta=beta)
-                yield (graphs, inds) if return_inds else graphs
+                graphs, inds, traj = self.sample_graphs(batch_size,
+                                                        repeats=repeats, weighted=weighted, temperature=temperature,
+                                                        beta=beta, return_traj=return_traj)
+                result = (graphs,)
+                if return_traj:
+                    result = result + (traj,)
+                if return_inds:
+                    result = result + (inds,)
+                yield result[0] if len(result) == 1 else result
 
     # ---------------------------------------------------------------------
     # Tracking
@@ -766,12 +797,15 @@ class CrystalBuffer:
     # ---------------------------------------------------------------------
 
     @torch.no_grad()
-    def add(self, data):
+    def add(self, data, traj: Optional[torch.Tensor] = None):
         """
         Append new graphs.
 
         Accepts either a list[Data] or an already-collated Batch. No data_list
         round trip if a Batch is provided.
+
+        traj, if given, is a [k, traj_length, dim] tensor of per-entry
+        trajectories aligned with the k new graphs being added.
         """
         if isinstance(data, list) and len(data) == 0:
             return
@@ -791,6 +825,13 @@ class CrystalBuffer:
             if new_y is None:
                 raise ValueError("Existing dataset has y, but added batch produced y=None.")
             self.y = torch.cat([self.y, new_y], dim=0)
+
+        if self.traj is not None:
+            if traj is None:
+                raise ValueError("Existing dataset has traj, but added batch produced traj=None.")
+            assert traj.shape[0] == new_batch.num_graphs, \
+                f"traj has {traj.shape[0]} entries, expected {new_batch.num_graphs} to match added batch size"
+            self.traj = torch.cat([self.traj, traj.detach().to(self.device)], dim=0)
 
         k = new_batch.num_graphs
         self.ema_loss = torch.cat(
@@ -845,6 +886,8 @@ class CrystalBuffer:
         self.x = self.x[keep_t].contiguous()
         if self.y is not None:
             self.y = self.y[keep_t].contiguous()
+        if self.traj is not None:
+            self.traj = self.traj[keep_t].contiguous()
 
         keep_cpu = torch.as_tensor(keep_idx, dtype=torch.long)
         self.ema_loss = self.ema_loss[keep_cpu]
@@ -888,52 +931,96 @@ class CrystalBuffer:
             loss_floor: float = 1.0,
             min_visits: int = 3,
             temperature: float = 1.0,
+            loss_min: float = 1.0,
     ):
         """
-        Purge up to num_to_purge eligible samples.
+        Purge samples with low loss.
 
-        Eligible =
+        Forced purge:
+            valid loss
+            loss < loss_min
+
+        Additional stochastic purge:
             visited >= min_visits
             loss is initialized
             loss <= min(loss_floor, quantile cutoff)
 
-        Samples are chosen without replacement with probability increasing as
-        loss decreases.
+        Stochastic samples are chosen without replacement with probability
+        increasing as loss decreases.
         """
-        if num_to_purge <= 0:
-            return
+        assert loss_min <= loss_floor
 
-        losses = self.ema_loss
-        valid = (~torch.isnan(losses)) & (self.select_counts >= min_visits)
-
-        if valid.sum() == 0:
-            return
-
-        cutoff = min(loss_floor, torch.quantile(losses[valid], quantile).item())
-        eligible = valid & (losses <= cutoff)
-
-        elig_idx = torch.nonzero(eligible, as_tuple=False).flatten()
-
-        if elig_idx.numel() == 0:
-            return
-
-        k = min(num_to_purge, elig_idx.numel())
-
-        elig_losses = losses[elig_idx]
-        logits = -elig_losses / max(temperature, 1e-8)
-        logits = logits - logits.max()
-
-        p = torch.softmax(logits, dim=0).double().cpu().numpy()
-        p /= p.sum()
-
-        choice = np.random.choice(
-            elig_idx.cpu().numpy(),
-            size=k,
-            replace=False,
-            p=p,
+        elig_idx, losses, valid = self.get_elig_drop_count(
+            loss_floor,
+            min_visits,
+            quantile,
         )
 
+        # Hard purge everything below loss_min
+        forced_idx = torch.where(valid & (losses < loss_min))[0]
+
+        # Avoid choosing forced samples again stochastically
+        if forced_idx.numel() > 0 and elig_idx.numel() > 0:
+            forced_mask = torch.zeros_like(valid, dtype=torch.bool)
+            forced_mask[forced_idx] = True
+            elig_idx = elig_idx[~forced_mask[elig_idx]]
+
+        sampled_choice = np.array([], dtype=np.int64)
+
+        remaining = max(num_to_purge - forced_idx.numel(), 0)
+        k = min(remaining, elig_idx.numel())
+
+        if k > 0:
+            elig_losses = losses[elig_idx]
+            logits = -elig_losses / max(temperature, 1e-8)
+            logits = logits - logits.max()
+
+            p = torch.softmax(logits, dim=0).double().cpu().numpy()
+            p /= p.sum()
+
+            sampled_choice = np.random.choice(
+                elig_idx.cpu().numpy(),
+                size=k,
+                replace=False,
+                p=p,
+            )
+            k = min(num_to_purge, elig_idx.numel())
+
+            elig_losses = losses[elig_idx]
+            logits = -elig_losses / max(temperature, 1e-8)
+            logits = logits - logits.max()
+
+            p = torch.softmax(logits, dim=0).double().cpu().numpy()
+            p /= p.sum()
+
+            sampled_choice = np.random.choice(
+                elig_idx.cpu().numpy(),
+                size=k,
+                replace=False,
+                p=p,
+            )
+
+        forced_choice = forced_idx.cpu().numpy()
+
+        if forced_choice.size == 0 and sampled_choice.size == 0:
+            return
+
+        choice = np.concatenate([forced_choice, sampled_choice])
+
+        # continue with your existing purge logic using `choice`
         self.purge_by_index(choice.tolist())
+
+    def get_elig_drop_count(self, loss_floor, min_visits, quantile):
+        losses = self.ema_loss
+        valid = (~torch.isnan(losses)) & (self.select_counts >= min_visits)
+        if valid.sum() == 0:
+            quantile = 0
+        else:
+            quantile = torch.quantile(losses[valid], quantile).item()
+        cutoff = min(loss_floor, quantile)
+        eligible = valid & (losses <= cutoff)
+        elig_idx = torch.nonzero(eligible, as_tuple=False).flatten()
+        return elig_idx, losses, valid
 
     def _loss_weights(
             self,
@@ -976,7 +1063,8 @@ class CrystalBuffer:
         p = np.clip(p, epsilon, None)  # floor before renorm
         p /= p.sum()
         return p
-    '''
-    import plotly.graph_objects as go
-    go.Figure(go.Histogram(x=np.log(p), nbinsx=100)).show()
-    '''
+
+'''
+import plotly.graph_objects as go
+go.Figure(go.Histogram(x=np.log(p), nbinsx=100)).show()
+'''

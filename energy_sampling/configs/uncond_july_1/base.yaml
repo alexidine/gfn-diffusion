@@ -1,20 +1,20 @@
-run_name: 'mk_dev'
+run_name: ''
 tag: 'dev'
 seed: 12345
 device: 'cuda'
-cuda_memory_fraction: 0.9
+cuda_memory_fraction: 0.95
 anomaly_detection: false  # dramatic slowdown when True
 
 # Checkpoints
 ################################################################
 continue_from_checkpoint: true
-mlip_path: 'D:\crystal_datasets\esen_s.pt' # C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model
-prior_path: 'D:\crystal_datasets\conditional\priors\multigauss.pt' #14_1_elj.pt'
-molecules_path: 'D:\crystal_datasets\conditional\test_mols_1.pt'
+mlip_path: 'D:\crystal_datasets\esen_s.pt' 
+prior_path: null
+molecules_path: null
 test_molecules_path: null
-checkpoints_dir: 'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints'
-checkpoint_name: multigauss_mid_conv.pt #new_multig_therm.pt #dev_mk_dev_prior.pt #multigauss_prior.pt #p123.pt
-prior_model_name: pp_prior.pt #new_multig_prior.pt #dev_mk_dev_prior.pt #multigauss_prior.pt #p123.pt
+checkpoints_dir: '/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/'
+checkpoint_name: null #new_multig_therm.pt #dev_mk_dev_prior.pt #multigauss_prior.pt #p123.pt
+prior_model_name: null #new_multig_prior.pt #dev_mk_dev_prior.pt #multigauss_prior.pt #p123.pt
 
 #Optimizers
 ################################################################
@@ -27,7 +27,7 @@ lr_fused: 1.0e-3                # learning rate of the fused fwd/bwd/replay pass
 lr_warmup_ratio: 100           # how much smaller the initial (warmup) LR should be than the max policy value
 scheduler: True               # does LR warmup from lr/lr_warup_ratio -> lr -> min_lr over the warmup and annealing period
 lr_warmup_time: 2000
-lr_anneal_time: 25000
+lr_anneal_time: 40000
 weight_decay: 1.0E-4
 use_weight_decay: false
 gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weights
@@ -38,19 +38,19 @@ ema_decay: 0.9 #0.95  # set to null for no ema
 model:
   full_flow: false           # true for subtb or db losses
   # shared dimensions
-  s_emb_dim: 256             # dimensionality of state embedding
+  s_emb_dim: 1024             # dimensionality of state embedding
   t_dim: 64                   # dimensionality of time embedding
   harmonics_dim: 64           # dimensionality of harmonic embedding
-  condition_embedding_dim: 256  # dimensionality of the conditioning embedding
+  condition_embedding_dim: 1024  # dimensionality of the conditioning embedding
   # per-sub-model architecture
-  t_hidden_dim: 256          # time encoder hidden dim
-  s_hidden_dim: 256          # state encoder hidden dim
+  t_hidden_dim: 1024          # time encoder hidden dim
+  s_hidden_dim: 1024          # state encoder hidden dim
   s_layers: 4                 # state encoder layers
-  policy_hidden_dim: 256     # forward/backward policy hidden dim
+  policy_hidden_dim: 1024     # forward/backward policy hidden dim
   policy_layers: 4            # forward/backward policy layers
-  flow_hidden_dim: 256       # flow model hidden dim
+  flow_hidden_dim: 1024       # flow model hidden dim
   flow_layers: 1              # flow model layers
-  cond_hidden_dim: 256       # conditioning embedding hidden dim
+  cond_hidden_dim: 1024       # conditioning embedding hidden dim
   cond_layers: 4              # conditioning embedding layers
   # regularization (shared)
   dropout: 0                  # dropout probability
@@ -70,19 +70,19 @@ model:
 ################################################################
 batch_size: 25              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 5000
+max_batch_size: 2500
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
 eval_batch_size: 10000        # batch size for evaluation (adaptive)
 eval_num_samples: 10000       # minimum number of samples for evaluation
-epochs: 100000             # number of training epochs
-eval_period: 250              # how often to do evaluation & reporting
-figs_period: 250             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+epochs: 1000000             # number of training epochs
+eval_period: 1000              # how often to do evaluation & reporting
+figs_period: 1000             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # SDE integration
 ################################################################
-eval_T: 10                  # diffusion trajectory length for inference
+eval_T: 100                  # diffusion trajectory length for inference
 integrator:
-  T: 10                        # static training diffusion length
+  T: 100                        # static training diffusion length
   min_traj_length: 10
   max_traj_length: 10
   traj_length_strategy: static # 'static'  or 'sampled'  will do random between min and max traj lengths
@@ -140,7 +140,7 @@ bwd_sampling_mode: 'dataset' # source for samples in backward training: 'dataset
 # for controlling 3-phase convergence protocol
 anchor_fwd_bwd: true #true #true  # whether to do this at all
 fused: true  # phase-3 only: instead of randomly alternating fwd/bwd/replay steps by fraction, fire all three every step and fuse their losses by the same fractions, via its own optimizer
-wass_threshold: 0.01  # threshold for phase 1-2 transition
+wass_threshold: 0.005  # threshold for phase 1-2 transition
 replay_resid_cutoff: 5  # residual threshold in nats for on-policy sample to get added to the buffer
 controller:
   under_threshold: 4  # phase-3 target (nats) for backward under-coverage before easing off replay/bwd
@@ -151,8 +151,8 @@ controller:
   deactivate_threshold: 0.01  # fused loss only: skip computing a branch entirely (not just down-weight it) if its frac falls below this. Keep < 1/3 so at least one branch always runs.
   refresh_every: 10  # fused loss only: force-evaluate every branch at least this often (even if deactivated) so its rolling metric_tracker stats don't go stale; deactivated branches still get zero weight in the fused loss
   decay_rate: 0.999  # how fast convergence criteria will tighten when all are satisfied
-  min_threshold: 1 # the minimum value to which all controller thresholds can be pushed
-  zerr_min_threshold: 0.5
+  min_threshold: 1 # the minimum value to which over/under thresholds can be pushed
+  zerr_min_threshold: 0.5  # minimum threshold for zerr
 
 # buffer
 buffer:
@@ -178,7 +178,7 @@ space_groups: [ 2 ]  # which space groups to sample over
 zp_conditioning: false # whether to condition over z prime values
 z_primes: [ 1 ]
 energy_config:
-  temperature: 1.0 # 2.5 is room temperature kT in kJ/mol
+  temperature: 2.5 # 2.5 is room temperature kT in kJ/mol
   log_temperature_range: [0, 1]
   # loss coefficients
   density_coeff: 10.0  # how much to weight the density penalty term in the energy function
