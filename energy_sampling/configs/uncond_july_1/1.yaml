@@ -89,7 +89,7 @@ lr_warmup_ratio: 100
 lr_warmup_time: 2000
 max_batch_size: 2500
 min_lr: 1.0e-05
-mlip_path: scratch/mk8347/data/acr_112025_mh1_stagetwo.model
+mlip_path: /scratch/mk8347/data/acr_112025_mh1_stagetwo.model
 model:
   clipping: true
   cond_hidden_dim: 1024

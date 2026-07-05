@@ -36,7 +36,7 @@ def make_config(sg, zp, mol, efunc, ind):
     config['energy_function'] = efunc
     if efunc == 'mace':
         config[
-            'mlip_path'] = r"scratch/mk8347/data/acr_112025_mh1_stagetwo.model"
+            'mlip_path'] = r"/scratch/mk8347/data/acr_112025_mh1_stagetwo.model"
     elif efunc == 'uma':
         config['mlip_path'] = r"/scratch/mk8347/models/uma/esen_s.pt"
     config[
