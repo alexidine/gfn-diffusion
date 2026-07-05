@@ -419,6 +419,11 @@ class Modeller:
 
     def init_mol_dataset(self):
         data_list = torch.load(self.args.molecules_path, weights_only=False)
+        if isinstance(data_list, dict):
+            for key, value in data_list.items():
+                if key == 'prior':
+                    data_list = value
+
         self.mol_dataset = CrystalBuffer(data_list,
                                          device='cpu',
                                          max_z_prime=max(self.args.z_primes))

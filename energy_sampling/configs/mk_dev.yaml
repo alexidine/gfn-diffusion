@@ -9,8 +9,12 @@ anomaly_detection: false  # dramatic slowdown when True
 ################################################################
 continue_from_checkpoint: true
 mlip_path: 'D:\crystal_datasets\esen_s.pt' # C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model
-prior_path: 'D:\crystal_datasets\conditional\priors\multigauss.pt' #14_1_elj.pt'
-molecules_path: 'D:\crystal_datasets\conditional\test_mols_1.pt'
+#prior_path: 'D:\crystal_datasets\conditional\priors\multigauss.pt' #14_1_elj.pt'
+prior_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt
+
+molecules_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt
+
+#molecules_path: 'D:\crystal_datasets\conditional\test_mols_1.pt'
 test_molecules_path: null
 checkpoints_dir: 'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints'
 checkpoint_name: multigauss_mid_conv.pt #new_multig_therm.pt #dev_mk_dev_prior.pt #multigauss_prior.pt #p123.pt
