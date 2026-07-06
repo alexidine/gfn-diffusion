@@ -26,16 +26,16 @@ l2 = big_prior.latent_params()
 
 sbatch = deepcopy(prior)
 condition = torch.zeros(8)
-width = 0.1
+width = 0.25
 target_temperature = 1.0
 
 if enfunc == 'latent_harmonic':
     new_lat = sbatch.sample_latent_harmonic(n_samples=prior.num_graphs,
-                                            scale=1/width,
+                                            width=width,
                                             target_temperature=target_temperature,
                                             )
     new_lat2 = sbatch.sample_latent_harmonic(n_samples=big_prior.num_graphs,
-                                             scale=1/width,
+                                             width=width,
                                              target_temperature=target_temperature,
                                              )
 elif enfunc == 'latent_multiharmonic':

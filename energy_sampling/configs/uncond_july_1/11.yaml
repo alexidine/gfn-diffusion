@@ -30,7 +30,7 @@ controller:
   anneal_patience: 5
   beta: 0.005
   deactivate_threshold: 0.01
-  decay_rate: 0.995
+  decay_rate: 0.975
   lookahead_horizon: 5
   lookahead_trend_alpha: 0.1
   min_mode_frac: 0.001
@@ -99,7 +99,7 @@ lr_fused: 0.001
 lr_policy: 0.001
 lr_replay: 0.001
 lr_warmup_ratio: 100
-lr_warmup_time: 5000
+lr_warmup_time: 2000
 max_batch_size: 5000
 min_lr: 1.0e-05
 mlip_path: /scratch/mk8347/models/uma/esen_s.pt
