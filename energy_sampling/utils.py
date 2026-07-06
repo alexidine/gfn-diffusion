@@ -1,5 +1,7 @@
 import argparse
 import gc
+import hashlib
+import json
 import math
 import os
 import random
@@ -160,6 +162,69 @@ def dict2namespace(data_dict: dict):
     data_namespace = Namespace(**data_dict)
 
     return data_namespace
+
+
+def _to_plain(obj):
+    """Recursively turn Namespaces/lists into plain, JSON-serializable Python objects."""
+    if isinstance(obj, Namespace):
+        obj = vars(obj)
+    if isinstance(obj, dict):
+        return {str(k): _to_plain(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_plain(v) for v in obj]
+    return obj
+
+
+
+# energy_config fields that are never varied in practice - excluded from the
+# problem definition so changing them doesn't invalidate checkpoint reuse
+_CONSTANT_ENERGY_CONFIG_KEYS = ('density_coeff', 'bounding_coeff', 'reduction_coeff', 'lj_coeff')
+
+
+def get_problem_definition(args) -> dict:
+    """
+    The subset of the config that defines *what problem* is being solved -
+    the energy landscape and prior distribution - as opposed to training/
+    optimization hyperparameters (lr, batch size, model width, etc.) which
+    can change across runs without changing what a checkpoint represents.
+
+    Omits sg_conditioning/zp_conditioning: they're redundant with
+    len(space_groups) > 1 / len(z_primes) > 1, which are already captured here.
+    """
+    energy_config = _to_plain(args.energy_config)
+    for key in _CONSTANT_ENERGY_CONFIG_KEYS:
+        energy_config.pop(key, None)
+
+    return _to_plain({
+        'energy_function': args.energy_function,
+        'energy_config': energy_config,
+        'prior_path': args.prior_path,
+        'space_groups': args.space_groups,
+        'z_primes': args.z_primes,
+        'mol_cond': args.molecule_conditioning,
+        'temp_cond': args.temperature_conditioning,
+    })
+
+
+def problem_hash(problem_def: dict, n_chars: int = 6) -> str:
+    """Short, deterministic fingerprint of a problem definition dict."""
+    canonical = json.dumps(problem_def, sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode()).hexdigest()[:n_chars]
+
+
+def problem_slug(args, problem_def: dict) -> str:
+    """
+    Human-readable tag for a checkpoint's problem definition, meant for
+    filenames only: <energy_function>-<prior file stem>-T<temperature>-<hash>.
+    The trailing hash covers the whole problem definition (including fields
+    not spelled out in the slug), but this string is never parsed back -
+    the checkpoint itself stores the full 'problem_def' dict plus its hash,
+    and that stored copy is what compatibility checks compare against, so
+    the slug format above is free to change later without breaking reload logic.
+    """
+    prior_stem = Path(args.prior_path).stem if args.prior_path else 'noprior'
+    temperature = args.energy_config.temperature
+    return f"{args.energy_function}-{prior_stem}-T{temperature:g}-{problem_hash(problem_def)}"
 
 
 def get_gfn_init_state(batch_size, ndim, device):

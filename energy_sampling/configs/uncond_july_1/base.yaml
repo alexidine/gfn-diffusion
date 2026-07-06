@@ -7,7 +7,7 @@ anomaly_detection: false  # dramatic slowdown when True
 
 # Checkpoints
 ################################################################
-continue_from_checkpoint: true
+continue_from_checkpoint: false
 mlip_path: 'D:\crystal_datasets\esen_s.pt' 
 prior_path: null
 molecules_path: null
@@ -15,19 +15,21 @@ test_molecules_path: null
 checkpoints_dir: '/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/'
 checkpoint_name: null #new_multig_therm.pt #dev_mk_dev_prior.pt #multigauss_prior.pt #p123.pt
 prior_model_name: null #new_multig_prior.pt #dev_mk_dev_prior.pt #multigauss_prior.pt #p123.pt
+override_loss_coeffs: false  # if true, ignore the loss coeff schedule baked into a resumed checkpoint and re-parse fwd/bwd/replay_loss_coeffs from this config instead
+override_learning_rates: false  # if true, overwrite just the numeric LR restored from a resumed checkpoint's optimizers with this config's lr_* values - warmup/anneal status and Adam momentum buffers are left as-is
 
 #Optimizers
 ################################################################
 lr_policy: 1.0e-3              # learning rate of the policy network
 min_lr: 1.0e-5                # ihn
-lr_flow: 0.01                 # learning rate of the flow network
+lr_flow: 0.1                 # learning rate of the flow network
 lr_back: 1.0e-3                # learning rate of the backward pass
 lr_replay: 1.0e-3               # learning rate of the trajectory replay pass
 lr_fused: 1.0e-3                # learning rate of the fused fwd/bwd/replay pass
 lr_warmup_ratio: 100           # how much smaller the initial (warmup) LR should be than the max policy value
 scheduler: True               # does LR warmup from lr/lr_warup_ratio -> lr -> min_lr over the warmup and annealing period
-lr_warmup_time: 2000
-lr_anneal_time: 40000
+lr_warmup_time: 5000
+lr_anneal_time: 50000
 weight_decay: 1.0E-4
 use_weight_decay: false
 gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weights
@@ -70,19 +72,19 @@ model:
 ################################################################
 batch_size: 25              # number of samples per training batch
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 2500
+max_batch_size: 5000
 batch_growth_increment: 1.01  # batch size to increment at each step - GROWS FAST!  # 1 is static, 1.1 10% growth, etc.
 eval_batch_size: 10000        # batch size for evaluation (adaptive)
 eval_num_samples: 10000       # minimum number of samples for evaluation
 epochs: 1000000             # number of training epochs
-eval_period: 1000              # how often to do evaluation & reporting
-figs_period: 1000             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+eval_period: 500              # how often to do evaluation & reporting
+figs_period: 500             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # SDE integration
 ################################################################
-eval_T: 100                  # diffusion trajectory length for inference
+eval_T: 10                  # diffusion trajectory length for inference
 integrator:
-  T: 100                        # static training diffusion length
+  T: 10                        # static training diffusion length
   min_traj_length: 10
   max_traj_length: 10
   traj_length_strategy: static # 'static'  or 'sampled'  will do random between min and max traj lengths
@@ -99,8 +101,8 @@ fwd_loss_coeffs:
   subtb: 0.0
   subtb_lambda: 0.95
   emp_z: 0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
-  traj_grads: 1.0
-  reward_grads: 1.0
+  traj_grads: 0.0
+  reward_grads: 0.0
   loss_clip: 1.0E+9
   beta: 10  # Huber beta
 bwd_loss_coeffs:
@@ -130,7 +132,7 @@ replay_loss_coeffs:  # applied to trajectories pulled from the replay buffer (se
   mle: 0.0  # will do weighted MLE if VG is running with repeats, otherwise trajectory-wise
   traj_grads: 0.0
   loss_clip: 1.0E+9
-  beta: 1 # Huber beta for TB-style losses
+  beta: 10 # Huber beta for TB-style losses
 
 # training style
 both_ways: true #true             # forward and backward training
@@ -140,8 +142,7 @@ bwd_sampling_mode: 'dataset' # source for samples in backward training: 'dataset
 # for controlling 3-phase convergence protocol
 anchor_fwd_bwd: true #true #true  # whether to do this at all
 fused: true  # phase-3 only: instead of randomly alternating fwd/bwd/replay steps by fraction, fire all three every step and fuse their losses by the same fractions, via its own optimizer
-wass_threshold: 0.005  # threshold for phase 1-2 transition
-replay_resid_cutoff: 5  # residual threshold in nats for on-policy sample to get added to the buffer
+wass_threshold: 0.009  # threshold for phase 1-2 transition
 controller:
   under_threshold: 4  # phase-3 target (nats) for backward under-coverage before easing off replay/bwd
   over_threshold: 4 # phase-3 target (nats) for forward over-coverage before easing off replay
@@ -150,9 +151,12 @@ controller:
   beta: 0.005  # probability mass to add per step
   deactivate_threshold: 0.01  # fused loss only: skip computing a branch entirely (not just down-weight it) if its frac falls below this. Keep < 1/3 so at least one branch always runs.
   refresh_every: 10  # fused loss only: force-evaluate every branch at least this often (even if deactivated) so its rolling metric_tracker stats don't go stale; deactivated branches still get zero weight in the fused loss
-  decay_rate: 0.999  # how fast convergence criteria will tighten when all are satisfied
-  min_threshold: 1 # the minimum value to which over/under thresholds can be pushed
-  zerr_min_threshold: 0.5  # minimum threshold for zerr
+  decay_rate: 0.995  # how fast convergence criteria will tighten when all are satisfied
+  anneal_patience: 5  # consecutive controller ticks the joint (under/over/zerr all within threshold) condition must hold before triggering a threshold decay; guards against noise-triggered anneals
+  min_threshold: 1 # the minimum value to which all controller thresholds can be pushed
+  zerr_min_threshold: 0.5
+  lookahead_horizon: 5  # controller ticks (each ~10 train steps) to extrapolate metrics ahead before thresholding, to avoid overshooting a regime swap
+  lookahead_trend_alpha: 0.1  # EMA smoothing on the estimated per-tick trend (already-EMA'd metrics only need trend smoothing, not a second level EMA)
 
 # buffer
 buffer:
@@ -165,7 +169,7 @@ buffer:
 # (get_traj_replay) during the "replay" training step instead of re-sampled backward from
 # the terminal state alone
 replay_buffer:
-  mean_lifetime: 10 # batch size adjusted mean lifetime to pace admission into the buffer
+  random_churn_rate: 50  # number of random samples to add/purge per replay train step
   max_size: 100000  # if this is too big, or takes too long to churn, it becomes a lagging indicator
 
 # energy function settings
@@ -186,3 +190,4 @@ energy_config:
   reduction_coeff: 10.0
   lj_coeff: 1.0  # loss coefficient
   reward_range: null # range of reward values allowed, null to go unrestricted
+  analyze_kwargs: {c:[0,0,0,0,0,0,0,0]}  # extra kwargs passed through to crystal_batch.analyze(), e.g. noise: 0.01, rdf_mode: 'envwise', cutoff: 6

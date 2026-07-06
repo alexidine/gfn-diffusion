@@ -273,7 +273,8 @@ def get_gfn_backward_loss(loss_coeffs,
         loss_dict = {'losses': combined_losses.detach(),
                      'log_pf': log_pf.detach(), 'log_pb': log_pb.detach(),
                      'log_Z': log_Z_learned.detach(), 'log_r': log_r.detach(),
-                     'flow_states': states.detach()}
+                     'flow_states': states.detach(),
+                     'resid':((log_pf - log_pb) - (log_r - log_Z_learned)).detach()}
         if loss_coeffs.tb > 0:
             loss_dict['tb'] = tb_loss.mean().detach()
         if loss_coeffs.vg_lb > 0:

@@ -3,6 +3,7 @@ import math
 import os
 from collections import defaultdict
 from copy import deepcopy
+from pathlib import Path
 from typing import Optional
 
 from energy_sampling.eval.evaluations import to_loggable, sliced_wasserstein, adjust_fig_filesize, eval_figs, \
@@ -34,7 +35,7 @@ from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
 from models import GFN
 from mxtaltools.common.training_utils import flatten_wandb_params
 from utils import get_train_args, get_gfn_init_state, set_seed, \
-    update_ema
+    update_ema, get_problem_definition, problem_hash, problem_slug
 
 MODELLER_STATE_DEFAULTS = {
     'step_ind': 0,
@@ -54,6 +55,12 @@ MODELLER_STATE_DEFAULTS = {
     'bwd_frac': 1.0,
     'replay_frac': 0.0,
     'combo_loss_record': [],
+    'controller_anneal_streak': 0,
+    'controller_lookahead': {
+        'under': {'level': None, 'trend': 0.0},
+        'over': {'level': None, 'trend': 0.0},
+        'zerr': {'level': None, 'trend': 0.0},
+    },
 }
 
 
@@ -84,6 +91,12 @@ class Modeller:
         config["Experiment"] = "{args.energy}"
         self.run_name = str(self.args.tag) + '_' + str(self.args.run_name)
 
+        # fingerprint of the energy function + prior this run is training against,
+        # as opposed to training hyperparameters - see save_checkpoint / _checkpoint_path
+        self.problem_def = get_problem_definition(self.args)
+        self.problem_hash = problem_hash(self.problem_def)
+        self.problem_slug = problem_slug(self.args, self.problem_def)
+
         self.times = {}
         self.device = self.args.device
         self.init_train_constants()
@@ -112,6 +125,8 @@ class Modeller:
             'tag': tag,
             'run_name': self.run_name,
             'gfn_config': self.gfn_config,  # store once, reload from here
+            'problem_def': self.problem_def,  # human-readable dict: energy function + prior this checkpoint solves
+            'problem_hash': self.problem_hash,  # fast fingerprint of problem_def, also embedded in the filename
             'model_train': self.gfn_model.state_dict(),
             'model_eval': self.ema_model.state_dict(),
             'modeller_state': self._get_modeller_state_dict(),
@@ -134,9 +149,30 @@ class Modeller:
 
         self._set_modeller_state_dict(checkpoint['modeller_state'])
         self.metric_tracker.load_state_dict(checkpoint.get('metrics', {}))
+
+        if getattr(self.args, 'override_loss_coeffs', False):
+            # discard the schedule baked into the checkpoint so set_loss_coeffs()
+            # re-parses fwd/bwd/replay_loss_coeffs from the current config instead
+            self.fwd_loss_schedule = {}
+            self.bwd_loss_schedule = {}
+            self.replay_loss_schedule = {}
+
         if load_opt_state:
             self.init_schedulers_optimizers()
             self.load_optimizer_state(checkpoint)
+
+            if getattr(self.args, 'override_learning_rates', False):
+                # overwrite just the numeric LR the checkpoint's optimizer state
+                # restored with this config's target rate - warmup/anneal status
+                # (lr_warmup_finished) and the schedulers themselves are untouched,
+                # so they carry on stepping from this new value. Adam's momentum
+                # buffers (exp_avg/exp_avg_sq) are also left as-is.
+                target_lrs = {'fwd': self.args.lr_policy, 'bwd': self.args.lr_back,
+                              'replay': self.args.lr_replay, 'fused': self.args.lr_fused,
+                              'flow': self.args.lr_flow}
+                for key, opt in self.optimizers.items():
+                    for group in opt.param_groups:
+                        group['lr'] = target_lrs[key]
 
     def load_optimizer_state(self, checkpoint):
         for key, opt in self.optimizers.items():
@@ -152,7 +188,31 @@ class Modeller:
             self.load_optimizer_state(checkpoint)
 
     def _checkpoint_path(self, tag: str) -> str:
-        return f'{self.args.checkpoints_dir}/{self.run_name}_{tag}.pt'
+        return f'{self.args.checkpoints_dir}/{self.run_name}_{self.problem_slug}_{tag}.pt'
+
+    def _find_matching_checkpoint(self, tag: str) -> Optional[str]:
+        """
+        Look for a checkpoint saved under this run_name/tag whose *stored*
+        problem_def dict matches the current config's - not just its filename
+        hash, since the slug format (and even the hash length) may change
+        later. Refuses to reload (rather than raising) on any mismatch or on
+        older checkpoints saved before problem_def existed, so a stale/renamed
+        checkpoint never gets silently treated as a valid resume point.
+        """
+        path = self._checkpoint_path(tag)
+        if not os.path.exists(path):
+            return None
+
+        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+        stored_def = checkpoint.get('problem_def')
+        if stored_def != self.problem_def:
+            print(f"Checkpoint {path} exists but its stored problem definition "
+                  f"doesn't match the current config - starting fresh instead.\n"
+                  f"  stored:  {stored_def}\n"
+                  f"  current: {self.problem_def}")
+            return None
+
+        return path
 
     def train_logic(self, it):
         replay_available = hasattr(self, 'replay_buffer') and len(self.replay_buffer) > 0
@@ -223,7 +283,7 @@ class Modeller:
         return metrics
 
     def set_loss_coeffs(self):
-        if self.step_ind == 0:
+        if not self.fwd_loss_schedule:
             self.fwd_loss_schedule = parse_loss_schedules(self.args.fwd_loss_coeffs)
             self.bwd_loss_schedule = parse_loss_schedules(self.args.bwd_loss_coeffs)
             self.replay_loss_schedule = parse_loss_schedules(self.args.replay_loss_coeffs)
@@ -288,8 +348,7 @@ class Modeller:
         )
 
     def init_gfn(self):
-        reload = False  #
-        reload_path = f'{self.args.checkpoints_dir}/{self.run_name}'
+        reload = False
 
         if self.args.checkpoint_name is not None:
             reload = True
@@ -297,11 +356,12 @@ class Modeller:
             print(f"Loading model from checkpoint {reload_path}")
             self.load_model_and_state(reload_path)
 
-        # todo rewrite hash logic
-        elif os.path.exists(reload_path) and self.args.continue_from_checkpoint:
-            print("Reloading automatically from this prior checkpoint with same run name")
-            reload = True
-            self.load_model_and_state(reload_path)
+        elif self.args.continue_from_checkpoint:
+            reload_path = self._find_matching_checkpoint('running')
+            if reload_path is not None:
+                print(f"Reloading automatically from prior checkpoint {reload_path}")
+                reload = True
+                self.load_model_and_state(reload_path)
 
         if not reload:
             self.gfn_config = self._build_gfn_config()
@@ -389,7 +449,8 @@ class Modeller:
         prior = prior_data['equalized_prior']
         prior['smiles'] = None
         prior['identifier'] = None
-        if not hasattr(prior, self.args.energy_function):
+        if True:  # not hasattr(prior, self.args.energy_function):
+            print("Re-analyzing prior energies")
             prior = prior.to(self.device)
             energy, prior = self.energy_function.batched_analyze_crystal_batch(
                 prior.latent_params(),
@@ -724,70 +785,134 @@ class Modeller:
         stats = quick_tb_stats(loss_dict['log_pf'], loss_dict['log_pb'],
                                loss_dict['log_Z'], loss_dict['log_r'])
         stats.update({k: v.item() for k, v in loss_dict.items() if k not in
-                      ['log_pf', 'log_pb', 'log_Z', 'log_r', 'losses', 'flow_states']})
+                      ['log_pf', 'log_pb', 'log_Z', 'log_r', 'losses', 'flow_states', 'resid']})
         stats.update({'loss': sub_loss.cpu().detach().item()})
         stats.update({'log_Z_learned': loss_dict['log_Z'].cpu().mean().detach().item()})
         self.metric_tracker.update(sub_type, stats, self.step_ind)
 
     def three_phase_controller(self):
-        floor = self.args.controller.min_mode_frac
+        under, over, zerr = self._get_controller_metrics()
+        under, over, zerr = self._lookahead_controller_metrics(under, over, zerr)
+        state = self._select_controller_state(under, over, zerr)
+        self._nudge_mode_fracs(state)
 
+    def _get_controller_metrics(self):
         under = self.metric_tracker.get('bwd', 'under_coverage')
         over = self.metric_tracker.get('fwd', 'over_coverage')
         # in very, very good terminal convergence, empirical Z becomes the target
-        zerr = min(self.metric_tracker.get('fwd', 'jensen_z_err'),
-                   self.metric_tracker.get('fwd', 'emp_z_err'))
+        jensen_zerr = self.metric_tracker.get('fwd', 'jensen_z_err')
+        zerr = jensen_zerr if jensen_zerr is not None else 0.0
 
         if under is None:
             under = float("inf")  # bootstrap toward bwd
         if over is None:
             over = 0.0  # do not demand replay before fwd stats exist
-        if zerr is None:
-            zerr = 0
 
-        under_on = self.args.controller.under_threshold
-        over_on = self.args.controller.over_threshold
-        zerr_on = self.args.controller.zerr_threshold
+        return under, over, zerr
 
-        # priority order: undercoverage repair > replay repair > forward convergence
-        if under > under_on:
-            state = "bwd"
-        elif zerr > zerr_on:
-            state = 'fwd'
-        elif over > over_on:
-            state = "replay"
-        else:  # nothing left to do but tighten the margins
-            if under_on > self.args.controller.min_threshold:
-                self.args.controller.under_threshold *= self.args.controller.decay_rate
-            if over_on > self.args.controller.min_threshold:
-                self.args.controller.over_threshold *= self.args.controller.decay_rate
-            if zerr_on > self.args.controller.zerr_min_threshold:
-                self.args.controller.zerr_threshold *= self.args.controller.decay_rate
-            state = 'fwd'
+    def _lookahead_controller_metrics(self, under, over, zerr):
+        """
+        Extrapolate each controller metric a few controller ticks into the
+        future by EMA-smoothing its trend and projecting forward linearly, so
+        _select_controller_state reacts to where a metric is heading rather
+        than where it currently sits. Without this, mode-frac mass keeps
+        moving at full speed right up to a threshold crossing and overshoots
+        the optimal balance before the (lagging) raw metric ever reflects it.
+        """
+        ctrl = self.args.controller
+        lookahead = self.controller_lookahead
+        return (
+            self._linear_ema_lookahead(lookahead['under'], under, ctrl),
+            self._linear_ema_lookahead(lookahead['over'], over, ctrl),
+            self._linear_ema_lookahead(lookahead['zerr'], zerr, ctrl),
+        )
 
+    @staticmethod
+    def _linear_ema_lookahead(state, value, ctrl):
+        """
+        under/over/zerr are already EMAs coming out of metric_tracker, so
+        `value` is already a smoothed level - only its trend (the per-tick
+        delta) needs its own EMA here. state: {'level', 'trend'} dict, mutated
+        in place (persisted via MODELLER_STATE_DEFAULTS so it survives
+        checkpoint reloads); 'level' just holds the previous value.
+        Returns value + horizon * trend, i.e. the predicted value
+        `ctrl.lookahead_horizon` controller ticks ahead.
+        """
+        if not math.isfinite(value):
+            return value
+        if state['level'] is None:
+            state['level'] = value
+            return value
+
+        trend_alpha = getattr(ctrl, 'lookahead_trend_alpha', 0.1)
+        horizon = getattr(ctrl, 'lookahead_horizon', 5)
+        state['trend'] = trend_alpha * (value - state['level']) + (1 - trend_alpha) * state['trend']
+        state['level'] = value
+
+        return value + horizon * state['trend']
+
+    def _select_controller_state(self, under, over, zerr):
+        """
+        Priority order: undercoverage repair > Z convergence > replay repair > global
+        tightening. This is the state/step-size selection logic most likely to change
+        later, so it's kept isolated from the metric plumbing and frac math around it.
+        """
+        ctrl = self.args.controller
+        if under > ctrl.under_threshold:
+            self.controller_anneal_streak = 0
+            return "bwd"
+        elif zerr > ctrl.zerr_threshold:
+            self.controller_anneal_streak = 0
+            return "fwd"
+        elif over > ctrl.over_threshold:
+            self.controller_anneal_streak = 0
+            return "replay"
+        else:
+            # joint condition (all three metrics within threshold) satisfied this tick;
+            # require it to hold for `anneal_patience` consecutive ticks before tightening
+            # the margins, since a single tick is too susceptible to metric noise
+            self.controller_anneal_streak += 1
+            if self.controller_anneal_streak >= getattr(ctrl, 'anneal_patience', 1):
+                self._anneal_controller_thresholds()
+                self.controller_anneal_streak = 0
+            return "fwd"
+
+    def _anneal_controller_thresholds(self):
+        ctrl = self.args.controller
+        if ctrl.under_threshold > ctrl.min_threshold:
+            ctrl.under_threshold *= ctrl.decay_rate
+        if ctrl.over_threshold > ctrl.min_threshold:
+            ctrl.over_threshold *= ctrl.decay_rate
+        if ctrl.zerr_threshold > ctrl.zerr_min_threshold:
+            ctrl.zerr_threshold *= ctrl.decay_rate
+
+    def _nudge_mode_fracs(self, state):
+        ctrl = self.args.controller
         probs = np.array([self.fwd_frac, self.bwd_frac, self.replay_frac], dtype=float)
         probs /= probs.sum()
 
         idx = {"fwd": 0, "bwd": 1, "replay": 2}[state]
 
-        probs -= (2 / 3) * self.args.controller.beta
-        probs[idx] = probs[idx] + self.args.controller.beta
-        probs /= probs.sum()
+        m = ctrl.min_mode_frac  # requires m < 1/3
+        free = 1.0 - 3.0 * m  # total mass available above the floors
 
-        too_small = probs < floor
-        delta = floor - probs[too_small]  # mass to be injected
-        probs[too_small] += delta
-        big_enough_weights = probs[~too_small] / np.sum(probs[~too_small])
-        probs[~too_small] -= np.sum(delta) * big_enough_weights
-        probs /= np.sum(probs)
+        # excess space: x_i = p_i - m, with x_i >= 0 and sum(x) = free
+        excess = np.clip(probs - m, 0.0, None)
+        s = excess.sum()
+        excess = excess * (free / s) if s > 0.0 else np.full(3, free / 3.0)
 
-        self.fwd_frac, self.bwd_frac, self.replay_frac = probs
+        # EMA toward the one-hot on the boosted mode
+        excess *= 1.0 - ctrl.beta
+        excess[idx] += ctrl.beta * free
+
+        self.fwd_frac, self.bwd_frac, self.replay_frac = m + excess
 
     def step_loss(self, step_type, loss):
         loss.backward()
         pre_clip = torch.nn.utils.clip_grad_norm_(
             self.gfn_model.parameters(), self.args.gradient_norm_clip).item()
         if not math.isfinite(pre_clip):
+            print(f"Non-finite gradient at {self.step_ind}")
             return  # skip non-finite
 
         self.optimizers[step_type].step()
@@ -839,10 +964,10 @@ class Modeller:
                                                 trajectories=traj)
 
         if self.bwd_sampling_mode == 'dataset':
-            self.prior_dataset.update_losses(loss_dict['losses'],
+            self.prior_dataset.update_losses(loss_dict['resid'].abs(),
                                              inds)
         elif self.bwd_sampling_mode == 'prior':
-            self.prior_buffer.update_losses(loss_dict['losses'],
+            self.prior_buffer.update_losses(loss_dict['resid'].abs(),
                                             inds)
 
         return loss, loss_dict
@@ -865,7 +990,7 @@ class Modeller:
                                                 report_losses=report_losses,
                                                 trajectories=traj)
 
-        self.replay_buffer.update_losses(loss_dict['losses'], inds)
+        self.replay_buffer.update_losses(loss_dict['resid'].abs(), inds)
 
         return loss, loss_dict
 
@@ -877,7 +1002,7 @@ class Modeller:
                 self.prior_dataset.loader(
                     batch_size=self.batch_size, mode='graphs',
                     repeats=repeats, return_inds=True,
-                    weighted=True,
+                    weighted=False,
                     temperature=0.1, beta=1.0))
 
             latents = mol_batch.latent_params()
@@ -1035,6 +1160,8 @@ class Modeller:
         log_T_tensor = fwd_stats['log_T_tensor']
         metrics.update({f'eval_fwd/{k}': v for k, v in quick_tb_stats(log_pf, log_pb, log_Z_learned, log_r).items()})
 
+        self.log_thermo_properties(arr, fwd_stats, log_T_tensor, log_Z_learned, log_r, metrics, sample_batch, val)
+
         """Backward TB Stats"""
         log_pf = bwd_stats['log_pfs'].sum(-1)
         log_pb = bwd_stats['log_pbs'].sum(-1)
@@ -1042,8 +1169,6 @@ class Modeller:
         log_r = bwd_stats['log_r']
         # parity / Z diagnostics (shared with fwd)
         metrics.update({f'eval_bwd/{k}': v for k, v in quick_tb_stats(log_pf, log_pb, log_z, log_r).items()})
-
-        self.log_thermo_properties(arr, fwd_stats, log_T_tensor, log_Z_learned, log_r, metrics, sample_batch, val)
 
         def dump_numeric(metrics, prefix, obj):
             d = obj if isinstance(obj, dict) else vars(obj)
@@ -1101,7 +1226,7 @@ class Modeller:
         # physical properties
         metrics['Mean Packing Coeff'] = val(sample_batch.packing_coeff.mean())
         metrics['Packing Coeff'] = arr(sample_batch.packing_coeff.clip(max=2))
-        metrics['Reduction Energy'] = arr(sample_batch.reduction_en)
+        metrics['Reduction Energy'] = arr((1e-3 + sample_batch.reduction_en).log10())
         metrics['Reduced Valid Fraction'] = np.mean(arr(sample_batch.reduction_en) < 1e-1)
         # conditions
         metrics['Crystal Mean Log Temperature'] = val(log_T_tensor.mean())
@@ -1175,7 +1300,7 @@ class Modeller:
                 self.phase2to3()
 
         if self.phase in [2, 3]:  # add samples to off-policy buffer
-            self.manage_prior_buffer(fwd_stats, sample_batch)
+            self.manage_prior_buffer(sample_batch)
             self.manage_replay_buffer(fwd_stats, sample_batch)
 
         metrics.update(self.log_buffer_stats())
@@ -1206,7 +1331,7 @@ class Modeller:
                        'prior_buffer_step_hist': wandb.Histogram(buff.select_counts.cpu().numpy()),
                        }
             if len(valid_losses) > 0:
-                metrics['prior_buffer_loss_hist'] = wandb.Histogram(np.clip(valid_losses, max=25))
+                metrics['prior_buffer_loss_hist'] = wandb.Histogram(np.clip(np.log10(valid_losses), min=-1, max=3))
         else:
             metrics = {}
 
@@ -1221,10 +1346,11 @@ class Modeller:
                 'replay_buffer_step_hist': wandb.Histogram(self.replay_buffer.select_counts.cpu().numpy()),
             })
             if len(valid_replay_losses) > 0:
-                metrics['replay_buffer_loss_hist'] = wandb.Histogram(np.clip(valid_replay_losses, max=25))
+                metrics['replay_buffer_loss_hist'] = wandb.Histogram(
+                    np.clip(np.log10(valid_replay_losses), min=0, max=3))
         return metrics
 
-    def manage_prior_buffer(self, fwd_stats, sample_batch):
+    def manage_prior_buffer(self, sample_batch):
         if not hasattr(self, 'prior_buffer'):
             self.prior_buffer = CrystalBuffer(
                 sample_batch,
@@ -1262,13 +1388,6 @@ class Modeller:
                 min_visits=5,
             )
 
-        # # sample from on-policy terminals  # we're not doing this anymore
-        # bad_inds = self.get_overweighted_trajs(fwd_stats, n_to_add)
-        #
-        # if len(bad_inds) > 0:
-        #     bad_batch = sample_batch.subsample_new_batch(bad_inds)
-        #     self.prior_buffer.add(bad_batch)
-
         remaining_budget = n_to_add  # - len(bad_inds)
 
         # sample from prior
@@ -1284,6 +1403,14 @@ class Modeller:
         self.prev_bwd_step_count = self.bwd_step_count
         return num_bwd_steps
 
+    def replay_step_delta(self):
+        if not hasattr(self, 'prev_replay_step_count'):
+            num_replay_steps = self.args.eval_period
+        else:
+            num_replay_steps = self.replay_step_count - self.prev_replay_step_count
+        self.prev_replay_step_count = self.replay_step_count
+        return num_replay_steps
+
     def manage_replay_buffer(self, fwd_stats, sample_batch):
         """
         Stash the full forward trajectory of on-policy samples with sufficiently
@@ -1294,94 +1421,97 @@ class Modeller:
         criterion, so there's no source mix to budget between -- but we still
         pace admission by mean_lifetime turnover so a sudden glut of overweighted
         trajectories can't flood the buffer in a single eval cycle.
+
+        On top of the residual-driven admission/eviction above, a small amount of
+        pure random churn is swapped in every call (paced by replay_buffer.random_churn_rate
+        per replay train step, mirroring how the prior buffer paces on num_bwd_steps) so the
+        buffer can't become dominated by a handful of rare, mutually-correlated high-residual
+        events. Random adds are still restricted to the top quartile of this batch's residuals,
+        so churn doesn't dilute the buffer with well-covered "good" samples.
         """
         log_r = fwd_stats['log_r']
         log_pf = fwd_stats['log_pf']
         log_pb = fwd_stats['log_pb']
-        if not hasattr(fwd_stats, 'log_Z_learned'):  # todo unify notations here
-            log_Z_learned = fwd_stats['log_Z']
-        else:
-            log_Z_learned = fwd_stats['log_Z_learned']
+        log_Z_learned = fwd_stats['log_Z_learned'] if 'log_Z_learned' in fwd_stats else fwd_stats['log_Z']
 
-        resid = ((log_pf - log_pb) - (log_r - log_Z_learned)).cpu()
-        bad_inds_all = torch.argwhere(resid > self.args.replay_resid_cutoff).flatten()
+        resid = ((log_pf - log_pb) - (log_r - log_Z_learned)).cpu().abs()
 
-        if len(bad_inds_all) == 0:
-            return
+        floor = 0.1  # low; doubles as below-capacity admission gate
 
-        num_replay_steps = self.replay_step_delta()
+        # one-sided admission: over-covered paths, above the toxic floor, best-first
+        elig = torch.argwhere(resid > floor).flatten()
+        elig = elig[torch.argsort(resid[elig], descending=True)]
+        cand_resid = resid[elig]
+        flow_states = fwd_stats['flow_states'].cpu()
 
-        n_to_add = max(1, int((num_replay_steps / self.args.replay_buffer.mean_lifetime) * self.batch_size))
-
-        if hasattr(self, 'replay_buffer'):
-            headroom = max(0, self.args.replay_buffer.max_size - len(self.replay_buffer))
-            if n_to_add > headroom:
-                elig_idx, _, _ = self.replay_buffer.get_elig_drop_count(
-                    quantile=0.25,
-                    loss_floor=self.args.replay_resid_cutoff,
-                    min_visits=5,
-                )
-                elig_to_drop = elig_idx.numel()
-                # only the overflow portion needs to be backed by eligible drops
-                overflow = n_to_add - headroom
-                n_to_add = headroom + min(elig_to_drop, overflow)
-
-        n_bad = min(bad_inds_all.numel(), n_to_add)
-        if n_bad < bad_inds_all.numel():
-            top = torch.topk(resid[bad_inds_all], n_bad).indices
-            bad_inds = bad_inds_all[top]
-        else:
-            bad_inds = bad_inds_all
-
-        bad_batch = sample_batch.subsample_new_batch(bad_inds)
-        bad_traj = fwd_stats['flow_states'].cpu()[bad_inds]
-
+        # --- bootstrap ---
         if not hasattr(self, 'replay_buffer'):
+            if elig.numel() == 0:
+                return
+            add_inds = elig[:self.args.replay_buffer.max_size]
             self.replay_buffer = CrystalBuffer(
-                bad_batch,
+                sample_batch.subsample_new_batch(add_inds),
                 device='cpu',
                 max_z_prime=max(self.args.z_primes),
-                x_fn=None,  # 'latent_params',
+                x_fn=None,
                 y_fn=self.args.energy_function,
-                traj=bad_traj,
+                traj=flow_states[add_inds],
+                init_loss=resid[add_inds],
             )
-        else:
-            space_needed = max(0, len(self.replay_buffer) + len(bad_inds) - self.args.replay_buffer.max_size)
-            if space_needed > 0:
-                self.replay_buffer.purge_lowest(
-                    space_needed,
-                    quantile=0.25,
-                    loss_floor=self.args.replay_resid_cutoff,
-                    min_visits=5,
-                    loss_min=0.1,  # force overfit samples to purge
+            return
+
+        # --- unconditional toxic eviction: strictly overfit incumbents ---
+        toxic = torch.argwhere(self.replay_buffer.ema_loss < floor).flatten()
+        if toxic.numel() > 0:
+            self.replay_buffer.purge_by_index(toxic)  # buffer reindexes; read ema_loss AFTER this
+
+        # --- fill freed + spare slots, then beat-the-min for the rest ---
+        headroom = max(0, self.args.replay_buffer.max_size - len(self.replay_buffer))
+        free = elig[:headroom]
+        over_idx = elig[headroom:]
+        over_resid = cand_resid[headroom:]
+
+        drop_pos = torch.empty(0, dtype=torch.long)
+        if over_idx.numel() > 0:
+            order = torch.argsort(self.replay_buffer.ema_loss)  # ascending, worst-first
+            inc_loss = self.replay_buffer.ema_loss[order]
+            k = min(over_resid.numel(), order.numel())
+            beats = (over_resid[:k] > inc_loss[:k]).long()  # strict: no churn on ties
+            n_swap = int(torch.cummin(beats, dim=0).values.sum())  # leading True run
+            over_idx = over_idx[:n_swap]
+            drop_pos = order[:n_swap]
+
+        if drop_pos.numel() > 0:
+            self.replay_buffer.purge_by_index(drop_pos)
+
+        add_inds = torch.cat([free, over_idx])
+        if add_inds.numel() > 0:
+            self.replay_buffer.add(
+                sample_batch.subsample_new_batch(add_inds),
+                traj=flow_states[add_inds],
+                init_loss=resid[add_inds],
+            )
+
+        # --- random churn: guard against domination by rare correlated events ---
+        num_replay_steps = self.replay_step_delta()
+        n_churn = int(num_replay_steps * self.args.replay_buffer.random_churn_rate)
+        n_churn = min(n_churn, len(self.replay_buffer))
+        if n_churn > 0:
+            purge_idx = torch.randperm(len(self.replay_buffer))[:n_churn]
+            self.replay_buffer.purge_by_index(purge_idx)
+
+            # only draw random adds from this batch's top quartile of residuals,
+            # so churn doesn't dilute the buffer with well-covered "good" samples
+            top_quartile = torch.quantile(resid, 0.75)
+            churn_cand = torch.argwhere(resid >= top_quartile).flatten()
+            n_add = min(n_churn, churn_cand.numel())
+            if n_add > 0:
+                add_choice = churn_cand[torch.randperm(churn_cand.numel())[:n_add]]
+                self.replay_buffer.add(
+                    sample_batch.subsample_new_batch(add_choice),
+                    traj=flow_states[add_choice],
+                    init_loss=resid[add_choice],
                 )
-            self.replay_buffer.add(bad_batch, traj=bad_traj)
-
-    def replay_step_delta(self):
-        if not hasattr(self, 'prev_replay_step_count'):
-            num_replay_steps = self.args.eval_period
-        else:
-            num_replay_steps = self.replay_step_count - self.prev_replay_step_count
-        self.prev_replay_step_count = self.replay_step_count
-        return num_replay_steps
-
-    def get_overweighted_trajs(self, fwd_stats, n_to_add):
-        log_r = fwd_stats['log_r']
-        log_pf = fwd_stats['log_pfs'].sum(-1)
-        log_pb = fwd_stats['log_pbs'].sum(-1)
-        log_Z_learned = fwd_stats['log_Z_learned']
-        y = (log_pf - log_pb)
-        x = (log_r - log_Z_learned)
-        resid = y - x
-        bad_budget = int(n_to_add * self.args.buffer.on_policy_fraction)
-        bad_inds_all = torch.argwhere(resid > self.args.replay_resid_cutoff).flatten()
-        n_bad = min(bad_inds_all.numel(), bad_budget)
-        if n_bad < bad_inds_all.numel():
-            top = torch.topk(resid[bad_inds_all], n_bad).indices
-            bad_inds = bad_inds_all[top]
-        else:
-            bad_inds = bad_inds_all
-        return bad_inds
 
     def sample_from_prior(self, num_samples):
         "sample from prior"
@@ -1452,7 +1582,7 @@ class Modeller:
                 init_state = get_gfn_init_state(bsz,
                                                 self.energy_function.data_ndim, self.device)
 
-                if False:  # self.args.temperature_conditioning:
+                if self.args.temperature_conditioning:
                     u = torch.rand(mol_batch.num_graphs, dtype=torch.float32, device=self.device)
                     # Transform to [log_low, log_high]
                     random_log_T_tensor = (self.energy_function.log_temperature_range[0] + u *
@@ -1522,7 +1652,7 @@ class Modeller:
                                         (self.step_ind, 1.0)]  # use backward TB for retention
 
         if (not self.gfn_model.full_flow) and (not self.gfn_model.conditional):
-            empirical_Z = metrics['eval_fwd/emp_z']
+            empirical_Z = metrics['eval_fwd/jensen_z']
             self.gfn_model.flow_model.scalar.data.fill_(empirical_Z)  # warm start at the target value
             self.ema_model.flow_model.scalar.data.fill_(empirical_Z)
         else:

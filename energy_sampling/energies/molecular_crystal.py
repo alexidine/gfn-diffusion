@@ -1,5 +1,6 @@
 import copy
 import gc
+from argparse import Namespace
 from time import sleep
 from typing import Optional, Tuple
 
@@ -62,7 +63,8 @@ class MolecularCrystal(BaseSet):
                  reward_range: float = None,
                  lj_rescale: float = None,
                  pressure: float = 1,  # in atm
-                 log_temperature_range: list = None
+                 log_temperature_range: list = None,
+                 analyze_kwargs: Optional[dict] = None,  # extra kwargs passed through to crystal_batch.analyze()
                  ):
 
         super(MolecularCrystal, self).__init__()
@@ -88,6 +90,9 @@ class MolecularCrystal(BaseSet):
         self.lj_rescale = lj_rescale
         self.pressure = pressure
         self.log_temperature_range = log_temperature_range
+        if isinstance(analyze_kwargs, Namespace):  # yaml configs nest dicts as Namespaces
+            analyze_kwargs = vars(analyze_kwargs)
+        self.analyze_kwargs = analyze_kwargs or {}
         if self.energy_function == 'uma':
             self.mlip_path = mlip_path
             self.predictor = init_uma_crystal_predictor(mlip_path, device=self.device)
@@ -139,17 +144,17 @@ class MolecularCrystal(BaseSet):
                               keep_grads: bool = False):  # x is gfn_outputs
         crystal_batch = self.instantiate_crystals(x, mol_batch)
 
-        cutoff = 10
+        analyze_kwargs = dict(cutoff=10,
+                              supercell_size=10,
+                              std_orientation=False,
+                              predictor=self.predictor)
+        analyze_kwargs.update(self.analyze_kwargs)
+
         with torch.set_grad_enabled(keep_grads):
-            out = crystal_batch.analyze(self.computes,
-                                        cutoff=cutoff,
-                                        supercell_size=10,
-                                        std_orientation=False,
-                                        predictor=self.predictor)
+            out = crystal_batch.analyze(self.computes, **analyze_kwargs)
 
         for key in out.keys():
             crystal_batch.add_graph_attr(out[key], key)
-        # crystal_batch.add_graph_attr(log_rescale_positive(out['lj']), 'scaled_lj')
 
         crystal_energy, ens_dict = self.generator_energy(crystal_batch, temperature, raw_latents=x)
 

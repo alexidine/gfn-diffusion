@@ -27,7 +27,7 @@ def apply_experiment(base_config, experiment):
     return config
 
 
-def make_config(sg, zp, mol, efunc, ind):
+def make_config(sg, zp, mol, efunc, ind, T, traj_len):
     base, spec_dir = load_yaml(base_path)
     config = deepcopy(base)
 
@@ -43,6 +43,9 @@ def make_config(sg, zp, mol, efunc, ind):
         'prior_path'] = rf"/scratch/mk8347/data/crystal_datasets/conditional/priors/{mol}_sg{sg}_zp{zp}_{efunc}_prior_dataset.pt"
     config['molecules_path'] = config['prior_path']
     config['tag'] = 'uncond_july_1'
+    config['energy_config']['temperature'] = T
+    config['integrator']['T'] = traj_len
+    config['eval_T'] = traj_len
     config_path = f"{ind}.yaml"
 
     with open(config_path, 'w') as f:
@@ -64,22 +67,48 @@ sgs.append(19)
 
 if __name__ == "__main__":
     ind = 0
+
     base_path = 'base.yaml'
+    traj_len = 100
+    for T in [2.5, 25]:
+        for mol in ['mipcas', 'nehzor', 'acridine']:
+            if mol == 'mipcas':
+                sg = 2
+                zp = 1
+                for efunc in ['elj','uma']:
+                    make_config(sg, zp, mol, efunc, ind, T, traj_len)
+                    ind +=1
+            elif mol == 'nehzor':
+                sg = 14
+                zp = 1
+                for efunc in ['elj','uma']:
+                    make_config(sg, zp, mol, efunc, ind, T, traj_len)
+                    ind +=1
+            elif mol == 'acridine':
+                efunc = 'mace'
+                for sg, zp in zip(sgs, zps):
+                    make_config(sg, zp, mol, efunc, ind, T, traj_len)
+                    ind +=1
+
+    traj_len = 10
+    T = 2.5
     for mol in ['mipcas', 'nehzor', 'acridine']:
         if mol == 'mipcas':
             sg = 2
             zp = 1
-            for efunc in ['elj','uma']:
-                make_config(sg, zp, mol, efunc, ind)
-                ind +=1
+            for efunc in ['elj', 'uma']:
+                make_config(sg, zp, mol, efunc, ind, T, traj_len)
+                ind += 1
         elif mol == 'nehzor':
             sg = 14
             zp = 1
-            for efunc in ['elj','uma']:
-                make_config(sg, zp, mol, efunc, ind)
-                ind +=1
+            for efunc in ['elj', 'uma']:
+                make_config(sg, zp, mol, efunc, ind, T, traj_len)
+                ind += 1
         elif mol == 'acridine':
             efunc = 'mace'
             for sg, zp in zip(sgs, zps):
-                make_config(sg, zp, mol, efunc, ind)
-                ind +=1
+                make_config(sg, zp, mol, efunc, ind, T, traj_len)
+                ind += 1
+
+

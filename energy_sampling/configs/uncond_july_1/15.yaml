@@ -62,7 +62,7 @@ energy_config:
   - 1
   reduction_coeff: 10.0
   reward_range: null
-  temperature: 2.5
+  temperature: 25
 energy_function: mace
 epochs: 1000000
 eval_T: 100

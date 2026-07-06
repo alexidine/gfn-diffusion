@@ -25,11 +25,14 @@ bwd_loss_coeffs:
 bwd_sampling_mode: dataset
 checkpoint_name: null
 checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/
-continue_from_checkpoint: true
+continue_from_checkpoint: false
 controller:
+  anneal_patience: 5
   beta: 0.005
   deactivate_threshold: 0.01
-  decay_rate: 0.999
+  decay_rate: 0.995
+  lookahead_horizon: 5
+  lookahead_trend_alpha: 0.1
   min_mode_frac: 0.001
   min_threshold: 1
   over_threshold: 4
@@ -41,6 +44,16 @@ cuda_memory_fraction: 0.95
 device: cuda
 ema_decay: 0.9
 energy_config:
+  analyze_kwargs:
+    c:
+    - 0
+    - 0
+    - 0
+    - 0
+    - 0
+    - 0
+    - 0
+    - 0
   bounding_coeff: 10.0
   density_coeff: 10.0
   lj_coeff: 1.0
@@ -55,19 +68,19 @@ epochs: 1000000
 eval_T: 100
 eval_batch_size: 10000
 eval_num_samples: 10000
-eval_period: 1000
-figs_period: 1000
+eval_period: 500
+figs_period: 500
 fused: true
 fwd_loss_coeffs:
   beta: 10
   db: 0.0
   emp_z: 0
   loss_clip: 1000000000.0
-  reward_grads: 1.0
+  reward_grads: 0.0
   subtb: 0.0
   subtb_lambda: 0.95
   tb: 1.0
-  traj_grads: 1.0
+  traj_grads: 0.0
   vg_lb: 0.0
   vg_lme: 0
 gradient_norm_clip: 0.1
@@ -79,15 +92,15 @@ integrator:
   max_traj_length: 10
   min_traj_length: 10
   traj_length_strategy: static
-lr_anneal_time: 40000
+lr_anneal_time: 50000
 lr_back: 0.001
-lr_flow: 0.01
+lr_flow: 0.1
 lr_fused: 0.001
 lr_policy: 0.001
 lr_replay: 0.001
 lr_warmup_ratio: 100
-lr_warmup_time: 2000
-max_batch_size: 2500
+lr_warmup_time: 5000
+max_batch_size: 5000
 min_lr: 1.0e-05
 mlip_path: /scratch/mk8347/data/acr_112025_mh1_stagetwo.model
 model:
@@ -118,14 +131,16 @@ model:
   zero_init: false
 molecule_conditioning: false
 molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/acridine_sg14_zp1_mace_prior_dataset.pt
+override_learning_rates: false
+override_loss_coeffs: false
 prior_model_name: null
 prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/acridine_sg14_zp1_mace_prior_dataset.pt
 repeats: 1
 replay_buffer:
   max_size: 100000
-  mean_lifetime: 10
+  random_churn_rate: 50
 replay_loss_coeffs:
-  beta: 1
+  beta: 10
   bwd_tb_z: 0.0
   db: 0.0
   emp_z: 0
@@ -138,7 +153,6 @@ replay_loss_coeffs:
   traj_grads: 0.0
   vg_lb: 0
   vg_lme: 0
-replay_resid_cutoff: 5
 run_name: _acridine_14_1_mace
 scheduler: true
 seed: 12345
@@ -149,7 +163,7 @@ tag: uncond_july_1
 temperature_conditioning: false
 test_molecules_path: null
 use_weight_decay: false
-wass_threshold: 0.005
+wass_threshold: 0.009
 weight_decay: 0.0001
 z_primes:
 - 1

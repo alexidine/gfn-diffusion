@@ -539,6 +539,7 @@ class CrystalBuffer:
             x_fn=None,
             y_fn=None,
             traj: Optional[torch.Tensor] = None,
+            init_loss: Optional[torch.Tensor] = None,
     ):
         self.device = device
         self.max_z_prime = max_z_prime
@@ -549,7 +550,14 @@ class CrystalBuffer:
         self.x, self.y = self._compute_xy(self.batch)
 
         n = len(self)
-        self.ema_loss = torch.full((n,), float("nan"), dtype=torch.float32)
+        if init_loss is None:
+            self.ema_loss = torch.full((n,), float("nan"), dtype=torch.float32)
+        else:
+            self.ema_loss = torch.as_tensor(init_loss, dtype=torch.float32).detach().cpu().flatten()
+            if self.ema_loss.numel() == 1:
+                self.ema_loss = self.ema_loss.expand(n).clone()
+            assert self.ema_loss.shape[0] == n, \
+                f"init_loss has {self.ema_loss.shape[0]} entries, expected {n} to match dataset size"
         self.select_counts = torch.zeros(n, dtype=torch.long)
 
         if traj is not None:
@@ -797,7 +805,7 @@ class CrystalBuffer:
     # ---------------------------------------------------------------------
 
     @torch.no_grad()
-    def add(self, data, traj: Optional[torch.Tensor] = None):
+    def add(self, data, traj: Optional[torch.Tensor] = None, init_loss: Optional[torch.Tensor] = None):
         """
         Append new graphs.
 
@@ -806,6 +814,9 @@ class CrystalBuffer:
 
         traj, if given, is a [k, traj_length, dim] tensor of per-entry
         trajectories aligned with the k new graphs being added.
+
+        init_loss, if given, seeds ema_loss for the k new entries instead of
+        leaving them NaN. Accepts a scalar or a [k] tensor.
         """
         if isinstance(data, list) and len(data) == 0:
             return
@@ -834,10 +845,19 @@ class CrystalBuffer:
             self.traj = torch.cat([self.traj, traj.detach().to(self.device)], dim=0)
 
         k = new_batch.num_graphs
+        if init_loss is None:
+            new_ema_loss = torch.full((k,), float("nan"), dtype=self.ema_loss.dtype)
+        else:
+            new_ema_loss = torch.as_tensor(init_loss, dtype=self.ema_loss.dtype).detach().cpu().flatten()
+            if new_ema_loss.numel() == 1:
+                new_ema_loss = new_ema_loss.expand(k).clone()
+            assert new_ema_loss.shape[0] == k, \
+                f"init_loss has {new_ema_loss.shape[0]} entries, expected {k} to match added batch size"
+
         self.ema_loss = torch.cat(
             [
                 self.ema_loss,
-                torch.full((k,), float("nan"), dtype=self.ema_loss.dtype),
+                new_ema_loss,
             ],
             dim=0,
         )

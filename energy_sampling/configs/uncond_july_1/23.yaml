@@ -65,7 +65,7 @@ energy_config:
   temperature: 2.5
 energy_function: mace
 epochs: 1000000
-eval_T: 100
+eval_T: 10
 eval_batch_size: 10000
 eval_num_samples: 10000
 eval_period: 500
@@ -86,7 +86,7 @@ fwd_loss_coeffs:
 gradient_norm_clip: 0.1
 grow_batch_size: true
 integrator:
-  T: 100
+  T: 10
   discretizer: uniform
   discretizer_max_ratio: 15
   max_traj_length: 10
