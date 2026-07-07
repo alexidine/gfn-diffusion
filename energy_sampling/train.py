@@ -41,6 +41,8 @@ MODELLER_STATE_DEFAULTS = {
     'step_ind': 0,
     'phase': 1,
     'batch_size': 1,
+    'batch_size_ever_oomed': False,  # flips permanently once we've OOM'd at least once - switches growth from fast slow-start to slow congestion-avoidance
+    'batch_size_cooldown_until': -1,  # step_ind until which batch size growth is frozen after a cut
     'lr_warmup_finished': False,
     'hit_init_kld': False,
     'grow_buffer': False,
@@ -132,6 +134,8 @@ class Modeller:
             'modeller_state': self._get_modeller_state_dict(),
             'metrics': self.metric_tracker.state_dict(),
             'optimizers': {k: opt.state_dict() for k, opt in self.optimizers.items()},
+            'prior_buffer': self.prior_buffer.state_dict() if hasattr(self, 'prior_buffer') else None,
+            'replay_buffer': self.replay_buffer.state_dict() if hasattr(self, 'replay_buffer') else None,
         }
         path = self._checkpoint_path(tag)
         atomic_save(checkpoint, path)
@@ -149,6 +153,11 @@ class Modeller:
 
         self._set_modeller_state_dict(checkpoint['modeller_state'])
         self.metric_tracker.load_state_dict(checkpoint.get('metrics', {}))
+
+        if checkpoint.get('prior_buffer') is not None:
+            self.prior_buffer = CrystalBuffer.from_state_dict(checkpoint['prior_buffer'], device='cpu')
+        if checkpoint.get('replay_buffer') is not None:
+            self.replay_buffer = CrystalBuffer.from_state_dict(checkpoint['replay_buffer'], device='cpu')
 
         if getattr(self.args, 'override_loss_coeffs', False):
             # discard the schedule baked into the checkpoint so set_loss_coeffs()
@@ -175,8 +184,17 @@ class Modeller:
                         group['lr'] = target_lrs[key]
 
     def load_optimizer_state(self, checkpoint):
+        saved_optimizers = checkpoint['optimizers']
         for key, opt in self.optimizers.items():
-            opt.load_state_dict(checkpoint['optimizers'][key])
+            if key not in saved_optimizers:
+                print(f"No saved optimizer state for '{key}' - starting it fresh")
+                continue
+            try:
+                opt.load_state_dict(saved_optimizers[key])
+            except (ValueError, RuntimeError) as e:
+                # e.g. checkpoint predates flow params folding into the policy
+                # optimizers, so param group counts no longer line up
+                print(f"Could not restore optimizer state for '{key}' ({e}) - starting it fresh")
 
     def load_model_state(self, path, load_optimizers: bool = False):
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
@@ -238,11 +256,23 @@ class Modeller:
             return 'fwd'
 
     def increment_batch_size(self):
-        if self.batch_size < self.args.max_batch_size:
-            new_batch_size = min(self.args.max_batch_size,
-                                 max(self.batch_size + 1, int(self.batch_size * self.args.batch_growth_increment,
-                                                              )))
-            self.batch_size = new_batch_size  # gradually increment batch size
+        """
+        AIMD-style growth: fast multiplicative growth ("slow start") until the first
+        OOM this run; after that, growth freezes for oom_cooldown_steps following any
+        cut (letting the reduced size prove stable), then resumes at a much slower
+        multiplicative rate ("congestion avoidance") so we don't immediately re-trigger
+        the same OOM. A later OOM (e.g. moving into a more VRAM-hungry training phase)
+        cuts and re-cools exactly the same way.
+        """
+        if self.batch_size >= self.args.max_batch_size:
+            return
+        if self.step_ind < self.batch_size_cooldown_until:
+            return  # recently cut -- hold flat until the new level proves stable
+
+        growth_factor = (self.args.batch_growth_increment if not self.batch_size_ever_oomed
+                         else self.args.batch_growth_slow_increment)
+        self.batch_size = min(self.args.max_batch_size,
+                              max(self.batch_size + 1, int(self.batch_size * growth_factor)))
 
     def step_lr_schedule(self):
         lr = self.optimizers['fwd'].param_groups[0]['lr']
@@ -261,7 +291,8 @@ class Modeller:
             self.schedulers['policy_2r'].step()
             self.schedulers['policy_2u'].step()
 
-        self.schedulers['flow'].step()
+        if 'flow' in self.schedulers:
+            self.schedulers['flow'].step()
 
         return lr
 
@@ -270,7 +301,8 @@ class Modeller:
         metrics.update(self.metric_tracker.snapshot(changed_only=True))
 
         for opt_type in ['fwd', 'bwd', 'replay', 'fused', 'flow']:
-            metrics.update({f'lr_{opt_type}': self.optimizers[opt_type].param_groups[0]['lr']})
+            if opt_type in self.optimizers:
+                metrics.update({f'lr_{opt_type}': self.optimizers[opt_type].param_groups[0]['lr']})
 
         metrics['phase'] = self.phase
         metrics['Fwd Frac'] = self.fwd_frac
@@ -389,10 +421,10 @@ class Modeller:
                      ]
             if gfn_model.conditional:
                 plist += [{'params': gfn_model.conditions_embedding_model.parameters()}]
+                # flow model folds into the policy optimizers rather than getting its own
+                plist += [{'params': gfn_model.flow_model.parameters()}]
 
             return plist
-
-        flow_params = self.gfn_model.flow_model.parameters()
 
         self.optimizers = {}
         weight_decay = self.args.weight_decay if self.args.use_weight_decay else 0
@@ -404,7 +436,9 @@ class Modeller:
                                                      weight_decay=weight_decay)
         self.optimizers['fused'] = torch.optim.Adam(get_policy_params(self.gfn_model), init_fused_lr,
                                                     weight_decay=weight_decay)
-        self.optimizers['flow'] = torch.optim.Adam(flow_params, init_flow_lr, weight_decay=weight_decay)
+        if not self.gfn_model.conditional:
+            flow_params = self.gfn_model.flow_model.parameters()
+            self.optimizers['flow'] = torch.optim.Adam(flow_params, init_flow_lr, weight_decay=weight_decay)
 
         self.schedulers = {}
         lr_warmup_lambda = get_annealing_factor(1,
@@ -436,12 +470,13 @@ class Modeller:
         self.schedulers['policy_2u'] = lr_scheduler.MultiplicativeLR(
             self.optimizers['fused'], lr_lambda=lambda epoch: lr_annealing_lambda)
 
-        flow_annealing_lambda = get_annealing_factor(1,
-                                                     0.1,
-                                                     self.args.lr_anneal_time,
-                                                     10)
-        self.schedulers['flow'] = lr_scheduler.MultiplicativeLR(self.optimizers['flow'],
-                                                                lr_lambda=lambda epoch: flow_annealing_lambda)
+        if not self.gfn_model.conditional:
+            flow_annealing_lambda = get_annealing_factor(1,
+                                                         0.1,
+                                                         self.args.lr_anneal_time,
+                                                         10)
+            self.schedulers['flow'] = lr_scheduler.MultiplicativeLR(self.optimizers['flow'],
+                                                                    lr_lambda=lambda epoch: flow_annealing_lambda)
 
     def init_prior_dataset(self):
 
@@ -457,7 +492,8 @@ class Modeller:
                 prior,
                 self.args.energy_config.temperature * torch.ones((prior.num_graphs), dtype=torch.float32,
                                                                  device=self.device),
-                return_batch=True
+                return_batch=True,
+                internal_oom_recovery=True,  # one-off pass over the whole prior dataset at init -- prefer the adaptive, self-healing chunked path over a hard crash, regardless of the training-time flag
             )
         if hasattr(prior_data, 'thermal_scaling_factor'):
             self.energy_function.lj_coeff = prior_data['thermal_scaling_factor']
@@ -514,7 +550,6 @@ class Modeller:
             self.init_mol_dataset()
             self.init_prior_dataset()
 
-            oomed_out = False
             self.times['initialization_end'] = time()
 
             wandb.watch(self.gfn_model,
@@ -536,12 +571,11 @@ class Modeller:
                 try:
                     current_loss = self.train_step(step_type)
 
-                    if (not oomed_out or (self.step_ind % 500 == 0)) and self.args.grow_batch_size:
+                    if self.args.grow_batch_size:
                         self.increment_batch_size()
 
                 except (RuntimeError, ValueError) as e:  # if we do hit OOM, slash the batch size
-                    oomed_out = self.handle_train_epoch_error(
-                        e, oomed_out, step_type)
+                    self.handle_train_epoch_error(e, step_type)
                 self.times['train_step_end'] = time()
 
                 # train monitoring
@@ -598,6 +632,10 @@ class Modeller:
             self._set_modeller_state_dict(checkpoint['modeller_state'])
             self.metric_tracker.load_state_dict(checkpoint.get('metrics', {}))
             self.step_ind = step
+            if checkpoint.get('prior_buffer') is not None:
+                self.prior_buffer = CrystalBuffer.from_state_dict(checkpoint['prior_buffer'], device='cpu')
+            if checkpoint.get('replay_buffer') is not None:
+                self.replay_buffer = CrystalBuffer.from_state_dict(checkpoint['replay_buffer'], device='cpu')
 
         lr_cut_val = 0.75
 
@@ -633,8 +671,15 @@ class Modeller:
                    ):
         discretizer = get_discretizer(self.args.integrator)
 
-        self.optimizers['flow'].zero_grad(set_to_none=True)
-        self.optimizers[step_type].zero_grad(set_to_none=True)
+        accum_target = self.args.fused_grad_accum_min_samples if step_type == 'fused' else 0
+        accumulating = accum_target > 0
+        self.fused_accum_count = getattr(self, 'fused_accum_count', 0)
+        starting_new_cycle = (not accumulating) or (self.fused_accum_count == 0)
+
+        if starting_new_cycle:
+            if 'flow' in self.optimizers:
+                self.optimizers['flow'].zero_grad(set_to_none=True)
+            self.optimizers[step_type].zero_grad(set_to_none=True)
 
         if step_type == 'fwd':
             loss, crystal_batch, loss_dict = self.fwd_train_step(
@@ -677,7 +722,16 @@ class Modeller:
                                       crystal_batch)
             del crystal_batch
 
-        self.step_loss(step_type, loss)
+        reported_loss = loss.cpu().detach().item()
+
+        if accumulating:
+            self.fused_accum_count += self.batch_size
+            do_step = self.fused_accum_count >= accum_target
+            self.step_loss(step_type, loss * (self.batch_size / accum_target), do_step=do_step)
+            if do_step:
+                self.fused_accum_count = 0
+        else:
+            self.step_loss(step_type, loss)
 
         if step_type == 'fused':
             self.record_fused_substep_losses(sub_losses)
@@ -686,7 +740,7 @@ class Modeller:
 
         # torch.cuda.synchronize()
         self.update_ema_model()
-        return loss.cpu().detach().item()
+        return reported_loss
 
     def fused_train_step(self,
                          discretizer,
@@ -907,8 +961,11 @@ class Modeller:
 
         self.fwd_frac, self.bwd_frac, self.replay_frac = m + excess
 
-    def step_loss(self, step_type, loss):
+    def step_loss(self, step_type, loss, do_step: bool = True):
         loss.backward()
+        if not do_step:
+            return  # mid-accumulation: keep piling up gradients, don't clip/step yet
+
         pre_clip = torch.nn.utils.clip_grad_norm_(
             self.gfn_model.parameters(), self.args.gradient_norm_clip).item()
         if not math.isfinite(pre_clip):
@@ -916,7 +973,8 @@ class Modeller:
             return  # skip non-finite
 
         self.optimizers[step_type].step()
-        self.optimizers['flow'].step()
+        if 'flow' in self.optimizers:
+            self.optimizers['flow'].step()
 
     def fwd_train_step(self,
                        discretizer,
@@ -924,12 +982,12 @@ class Modeller:
                        repeats: int = 1,
                        report_losses: bool = False,
                        ):
-        mol_batch = next(self.mol_dataset.loader(self.batch_size, mode='graphs'))
+        mol_batch = next(self.mol_dataset.loader(self.batch_size, mode='graphs', repeats=repeats))
         mol_batch = mol_batch.to(self.device)
         mol_batch.orient_molecule(mode='std')
-        init_state = get_gfn_init_state(self.batch_size, self.energy_function.data_ndim, self.device)
+        init_state = get_gfn_init_state(mol_batch.num_graphs, self.energy_function.data_ndim, self.device)
         mol_batch, log_T_tensor, sg_inds, zps, condition = self.energy_function.condition_samples(
-            mol_batch)
+            mol_batch, repeats=repeats)
 
         return get_gfn_forward_loss(self.args.fwd_loss_coeffs,
                                     init_state,
@@ -1024,7 +1082,7 @@ class Modeller:
             assert False, f"sampling method {self.args.sampling} not implemented"
         mol_batch = mol_batch.to(self.device)
         mol_batch, log_T_tensor, sg_inds, zps, condition = self.energy_function.condition_samples(
-            mol_batch)
+            mol_batch, repeats=repeats)
         temperature = 10 ** log_T_tensor
         log_reward = self.energy_function.prebuilt_sample_to_reward(mol_batch,
                                                                     temperature)  # relies on the energy terms being attached to the graphs!
@@ -1049,43 +1107,47 @@ class Modeller:
 
         mol_batch = mol_batch.to(self.device)
         mol_batch, log_T_tensor, sg_inds, zps, condition = self.energy_function.condition_samples(
-            mol_batch)
+            mol_batch, repeats=repeats)
         temperature = 10 ** log_T_tensor
         log_reward = self.energy_function.prebuilt_sample_to_reward(mol_batch,
                                                                     temperature)  # relies on the energy terms being attached to the graphs!
         return condition, inds, latents, log_reward, mol_batch, traj
 
-    def handle_train_epoch_error(self, e, oomed_out, step_type):
-        print(f"Caught error: {str(e)}")
-        if is_cuda_oom(e):
-            print("OOMED!")
-            if self.step_ind == 0:
-                return oomed_out
-
-            for opt in self.optimizers.values():
-                opt.zero_grad(set_to_none=True)
-
-            # break reference cycles
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                try:
-                    torch.cuda.ipc_collect()
-                except Exception:
-                    pass
-
-            self.batch_size = max(1, int(self.batch_size * 0.95))
-            if self.batch_size <= 1:
-                raise RuntimeError("Cascading OOM Failure")
-
-            if self.batch_size <= 1:
-                raise RuntimeError("Cascading OOM Failure")
-            print(f"Reducing batch size to {self.batch_size}")
-
-            oomed_out = True
-        else:
+    def handle_train_epoch_error(self, e, step_type):
+        """
+        Single shared OOM recovery path for every VRAM-bound loop (train fwd/bwd/replay/
+        fused steps AND eval sampling all call this) -- there's one batch_size and one
+        recovery policy, rather than several independently-tuned loops that can OOM at
+        different, decorrelated moments. On OOM: zero all grads, free what we can, cut
+        batch_size multiplicatively, and start a cooldown (see increment_batch_size).
+        """
+        print(f"Caught error during '{step_type}' step: {str(e)}")
+        if not is_cuda_oom(e):
             raise e  # will simply raise error if other or if training on CPU
-        return oomed_out
+
+        print("OOMED!")
+        if self.step_ind == 0:
+            return
+
+        for opt in self.optimizers.values():
+            opt.zero_grad(set_to_none=True)
+        self.fused_accum_count = 0  # wiped along with the gradients above
+
+        # break reference cycles
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+
+        self.batch_size = max(1, int(self.batch_size * self.args.oom_batch_shrink_factor))
+        self.batch_size_ever_oomed = True
+        self.batch_size_cooldown_until = self.step_ind + self.args.oom_cooldown_steps
+        if self.batch_size <= 1:
+            raise RuntimeError("Cascading OOM Failure")
+        print(f"Reducing batch size to {self.batch_size}")
 
     @torch.no_grad()
     def bwd_eval_sampling(
@@ -1096,9 +1158,9 @@ class Modeller:
         while samples < self.args.eval_num_samples:
             try:
                 if self.bwd_sampling_mode == 'dataset':
-                    mol_batch = next(self.prior_dataset.loader(batch_size=self.args.eval_batch_size, mode='graphs'))
+                    mol_batch = next(self.prior_dataset.loader(batch_size=self.batch_size, mode='graphs'))
                 elif self.bwd_sampling_mode == 'prior':
-                    mol_batch = next(self.prior_buffer.loader(batch_size=self.args.eval_batch_size, mode='graphs'))
+                    mol_batch = next(self.prior_buffer.loader(batch_size=self.batch_size, mode='graphs'))
                 else:
                     assert False
 
@@ -1115,28 +1177,24 @@ class Modeller:
 
                 terminal_state = terminal_state.to(self.ema_model.device)
                 condition = condition.to(self.ema_model.device)
-                # if self.phase == 1:
-                #     condition = False
 
                 (backward_flow_states, b_log_pfs, b_log_pbs, log_flow,
-                 b_means_f, b_vars_f, b_means_b, b_vars_b) = self.ema_model.get_traj_bwd(
+                 b_gauss_params) = self.ema_model.get_traj_bwd(
                     terminal_state, discretizer, condition, mol_batch, return_gauss_params=True)
                 log_z = log_flow[:, 0]
 
                 samples += mol_batch.num_graphs
 
             except (RuntimeError, ValueError) as e:
-                self._shrink_eval_batch_on_oom(e)
+                self.handle_train_epoch_error(e, 'eval_bwd')
                 continue
 
             cpu = lambda t: t.cpu().detach()
             acc['flow_states'].append(cpu(backward_flow_states))
             acc['log_pfs'].append(cpu(b_log_pfs))
             acc['log_pbs'].append(cpu(b_log_pbs))
-            acc['means_f'].append(cpu(b_means_f))
-            acc['logvars_f'].append(cpu(b_vars_f))
-            acc['means_b'].append(cpu(b_means_b))
-            acc['logvars_b'].append(cpu(b_vars_b))
+            for k, v in b_gauss_params.items():
+                acc[k].append(cpu(v))
             acc['log_r'].append(cpu(log_r))
             acc['log_Z_learned'].append(cpu(log_z))
             acc['packing_coeff'].append(cpu(mol_batch.packing_coeff))
@@ -1191,8 +1249,10 @@ class Modeller:
                 stats = bwd_stats
             metrics[f'{prefix} Mean F Drift'] = stats['means_f'].abs().mean()
             metrics[f'{prefix} Mean B Drift'] = stats['means_b'].abs().mean()
-            metrics[f'{prefix} Mean F Var'] = stats['logvars_f'].mean()
+            metrics[f'{prefix} Mean F Var'] = stats['logvars_f'].mean()  # total per-dim variance budget (s^2)
             metrics[f'{prefix} Mean B Var'] = stats['logvars_b'].mean()
+            metrics[f'{prefix} Mean F Diag Var'] = stats['diag_logvars_f'].mean()  # private (non-DPLR) diagonal
+            metrics[f'{prefix} Mean F Rho'] = stats['rho_f'].mean()  # DPLR correlated variance fraction; 0 when off
             metrics = {k: to_loggable(v) for k, v in metrics.items()}
 
         res = traj_overlap_report(fwd_stats, bwd_stats)  # torch tensors are fine; auto-converted
@@ -1279,8 +1339,7 @@ class Modeller:
             adjust_fig_filesize(fig_dict)
             metrics.update(fig_dict)
 
-        metrics.update({'Batch Size': self.batch_size})
-        metrics.update({'Eval Batch Size': self.args.eval_batch_size})
+        metrics.update({'Batch Size': self.batch_size})  # single shared batch size -- train and eval sampling now use the same value
         metrics.update(log_elapsed_times(self.times))
         self.times['eval_wrapup_end'] = time()
         self.times['eval_step_end'] = time()
@@ -1329,6 +1388,7 @@ class Modeller:
                        'prior_buffer_mean_loss': torch.nanmean(buff.ema_loss).item(),
                        'prior_buffer_median_loss': torch.nanmedian(buff.ema_loss).item(),
                        'prior_buffer_step_hist': wandb.Histogram(buff.select_counts.cpu().numpy()),
+                       'prior_buffer_energy_hist': wandb.Histogram(buff.batch[self.args.energy_function].cpu().numpy())
                        }
             if len(valid_losses) > 0:
                 metrics['prior_buffer_loss_hist'] = wandb.Histogram(np.clip(np.log10(valid_losses), min=-1, max=3))
@@ -1344,6 +1404,8 @@ class Modeller:
                 'replay_buffer_mean_loss': torch.nanmean(self.replay_buffer.ema_loss).item(),
                 'replay_buffer_median_loss': torch.nanmedian(self.replay_buffer.ema_loss).item(),
                 'replay_buffer_step_hist': wandb.Histogram(self.replay_buffer.select_counts.cpu().numpy()),
+                'replay_buffer_energy_hist': wandb.Histogram(
+                    self.replay_buffer.batch[self.args.energy_function].cpu().numpy())
             })
             if len(valid_replay_losses) > 0:
                 metrics['replay_buffer_loss_hist'] = wandb.Histogram(
@@ -1364,9 +1426,9 @@ class Modeller:
 
         # always churn at least a little bit
         n_churn = max(1000,
-                      int((num_bwd_steps / self.args.buffer.mean_lifetime) * self.batch_size))
-        n_to_add = min(self.args.eval_batch_size, n_churn)
-        headroom = max(0, self.args.buffer.max_size - len(self.prior_buffer))
+                      int((num_bwd_steps / self.args.prior_buffer.mean_lifetime) * self.batch_size))
+        n_to_add = min(self.args.eval_num_samples, n_churn)  # cap unrelated to GPU batch size -- eval_batch_size is retired, this is just a churn-rate limiter
+        headroom = max(0, self.args.prior_buffer.max_size - len(self.prior_buffer))
 
         if n_to_add > headroom:
             elig_idx, _, _ = self.prior_buffer.get_elig_drop_count(
@@ -1379,7 +1441,7 @@ class Modeller:
             overflow = n_to_add - headroom
             n_to_add = headroom + min(elig_to_drop, overflow)
 
-        space_needed = max(0, len(self.prior_buffer) + n_to_add - self.args.buffer.max_size)
+        space_needed = max(0, len(self.prior_buffer) + n_to_add - self.args.prior_buffer.max_size)
         if space_needed > 0:
             self.prior_buffer.purge_lowest(
                 space_needed,
@@ -1391,9 +1453,13 @@ class Modeller:
         remaining_budget = n_to_add  # - len(bad_inds)
 
         # sample from prior
-        if remaining_budget > 0:
+        if remaining_budget > 0: # todo track conditioning through this step so rewards are consistent
             metrics, sample_batch = self.sample_from_prior(remaining_budget)
-            self.prior_buffer.add(sample_batch)
+            reward = metrics['log_r']
+            good_inds = torch.argwhere(reward > self.args.prior_buffer.reward_min).flatten()
+            if good_inds.numel() > 0:
+                batch_to_add = sample_batch.subsample_new_batch(good_inds)
+                self.prior_buffer.add(batch_to_add)
 
     def bwd_step_delta(self):
         if not hasattr(self, 'prev_bwd_step_count'):
@@ -1438,7 +1504,7 @@ class Modeller:
 
         floor = 0.1  # low; doubles as below-capacity admission gate
 
-        # one-sided admission: over-covered paths, above the toxic floor, best-first
+        # two-sided admission: though in practice it's almost always positive residuals
         elig = torch.argwhere(resid > floor).flatten()
         elig = elig[torch.argsort(resid[elig], descending=True)]
         cand_resid = resid[elig]
@@ -1527,8 +1593,8 @@ class Modeller:
         else:
             buffer_length = len(self.prior_buffer)
 
-        missing = self.args.buffer.max_size - buffer_length
-        num_samples = min(self.args.buffer.min_size, missing)
+        missing = self.args.prior_buffer.max_size - buffer_length
+        num_samples = min(self.args.prior_buffer.min_size, missing)
         if num_samples > 0:
             metrics, sample_batch = self.sample_from_prior(num_samples)
 
@@ -1543,22 +1609,6 @@ class Modeller:
             else:
                 self.prior_buffer.add(sample_batch)
 
-    def _shrink_eval_batch_on_oom(self, e):
-        print(f"Caught error: {str(e)}")
-        if not is_cuda_oom(e):
-            raise e
-        self.args.eval_batch_size = max(1, int(self.args.eval_batch_size * 0.75))
-        if self.args.eval_batch_size <= 1:
-            raise RuntimeError("Cascading OOM Failure")
-        print(f"Reducing eval batch size to {self.args.eval_batch_size}")
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            try:
-                torch.cuda.ipc_collect()
-            except Exception:
-                pass
-
     @torch.no_grad()
     def fwd_eval_sampling(self, model, eval_discretizer, override_num_samples: Optional[int] = None):
         self.times['eval_sampling_start'] = time()
@@ -1572,9 +1622,8 @@ class Modeller:
         else:
             num_samples = self.args.eval_num_samples
 
-        bsz = min(num_samples, self.args.eval_batch_size)
-
         while n_collected < num_samples:
+            bsz = min(num_samples - n_collected, self.batch_size)
             try:
                 mol_batch = next(self.mol_dataset.loader(bsz, mode='graphs'))
                 mol_batch = mol_batch.to(self.device)
@@ -1592,11 +1641,7 @@ class Modeller:
                                                        0]))
 
                     random_temperatures = 10 ** random_log_T_tensor
-                    temperatures = self.energy_function.temperature * torch.ones(mol_batch.num_graphs,
-                                                                                 dtype=torch.float32,
-                                                                                 device=self.device)
-                    rands = np.random.choice(len(temperatures), len(temperatures) // 2, replace=False)
-                    temperatures[rands] = random_temperatures[rands]
+                    temperatures = random_temperatures
 
                 else:
                     temperatures = self.energy_function.temperature * torch.ones(mol_batch.num_graphs,
@@ -1608,7 +1653,7 @@ class Modeller:
                                             no_conditioning=False,
                                             temperatures=temperatures)
             except (RuntimeError, ValueError) as e:
-                self._shrink_eval_batch_on_oom(e)
+                self.handle_train_epoch_error(e, 'eval_fwd')
                 continue
 
             sample_batch_i = out.pop('sample_batch')
@@ -1667,6 +1712,9 @@ class Modeller:
         self.bwd_loss_monitor.reset()  # new losses
         self.fwd_loss_monitor.fire_cooldown(self.step_ind)
         self.bwd_loss_monitor.fire_cooldown(self.step_ind)
+        self.replay_loss_monitor.fire_cooldown(self.step_ind)
+        self.fused_loss_monitor.fire_cooldown(self.step_ind)
+
         self.lr_warmup_finished = False
         self.init_schedulers_optimizers()  # re-initialize optimizers for new losses
         self.set_loss_coeffs()  # take effect immediately
@@ -1691,11 +1739,14 @@ class Modeller:
                                            (self.step_ind, 1.0)]  # replay TB ACTIVATE
         self.replay_loss_schedule['bwd_tb_z'] = [(0, 1.0),
                                                  (self.step_ind, 0.0)]  # no off-policy log Z
+        # self.fwd_loss_schedule['fwd_tb_z'] = [(0, 1.0),
+        #                                          (self.step_ind, 2.0)]  # ONLY log Z training on-policy
 
         "set cooldown"
         self.fwd_loss_monitor.fire_cooldown(self.step_ind)
         self.bwd_loss_monitor.fire_cooldown(self.step_ind)
         self.replay_loss_monitor.fire_cooldown(self.step_ind)
+        self.fused_loss_monitor.fire_cooldown(self.step_ind)
 
         self.fwd_frac, self.bwd_frac, self.replay_frac = (
             self.args.controller.min_mode_frac, 1 - 2 * self.args.controller.min_mode_frac,

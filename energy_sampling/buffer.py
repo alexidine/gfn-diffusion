@@ -1,3 +1,4 @@
+import math
 from typing import Optional
 
 import numpy as np
@@ -560,11 +561,55 @@ class CrystalBuffer:
                 f"init_loss has {self.ema_loss.shape[0]} entries, expected {n} to match dataset size"
         self.select_counts = torch.zeros(n, dtype=torch.long)
 
+        # per-sample rolling estimates of the log importance weight
+        # logw = log_r + log_pb - log_pf under the current policy.
+        self.ema_logw = torch.full((n,), float("nan"), dtype=torch.float32)
+        self.ema_logw_sq = torch.full((n,), float("nan"), dtype=torch.float32)
+        self.ema_log_z_emp = torch.full((n,), float("nan"), dtype=torch.float32)
+
         if traj is not None:
             assert traj.shape[0] == n, \
                 f"traj has {traj.shape[0]} entries, expected {n} to match dataset size"
             traj = traj.detach().to(device).contiguous()
         self.traj = traj
+
+    # ---------------------------------------------------------------------
+    # Persistence
+    # ---------------------------------------------------------------------
+
+    def state_dict(self):
+        return {
+            'batch': self.batch.cpu(),
+            'max_z_prime': self.max_z_prime,
+            'x_fn': self.x_fn,
+            'y_fn': self.y_fn,
+            'x': self.x.cpu(),
+            'y': self.y.cpu() if self.y is not None else None,
+            'ema_loss': self.ema_loss,
+            'select_counts': self.select_counts,
+            'ema_logw': self.ema_logw,
+            'ema_logw_sq': self.ema_logw_sq,
+            'ema_log_z_emp': self.ema_log_z_emp,
+            'traj': self.traj.cpu() if self.traj is not None else None,
+        }
+
+    @classmethod
+    def from_state_dict(cls, state, device):
+        obj = cls.__new__(cls)
+        obj.device = device
+        obj.max_z_prime = state['max_z_prime']
+        obj.x_fn = state['x_fn']
+        obj.y_fn = state['y_fn']
+        obj.batch = state['batch'].to(device)
+        obj.x = state['x'].to(device)
+        obj.y = state['y'].to(device) if state['y'] is not None else None
+        obj.ema_loss = state['ema_loss']
+        obj.select_counts = state['select_counts']
+        obj.ema_logw = state['ema_logw']
+        obj.ema_logw_sq = state['ema_logw_sq']
+        obj.ema_log_z_emp = state['ema_log_z_emp']
+        obj.traj = state['traj'].to(device) if state['traj'] is not None else None
+        return obj
 
     # ---------------------------------------------------------------------
     # Internals
@@ -800,6 +845,80 @@ class CrystalBuffer:
         # handle duplicates: last write wins (same as sequential loop)
         self.ema_loss[indices] = updated
 
+    @torch.no_grad()
+    def update_logw_stats(
+            self,
+            logw,
+            indices,
+            beta: float = 0.9,
+    ):
+        """
+        Update per-sample rolling estimates of the log importance weight
+
+            logw = log_r + log_pb - log_pf
+
+        under the (approximately) current policy. Maintains, via EMA:
+
+            ema_logw       ~ E[logw]           (Jensen / lower-bound log Z estimate)
+            ema_logw_sq    ~ E[logw ** 2]       (used to derive logw_std)
+            ema_log_z_emp  ~ log E[exp(logw)]   (empirical / upper log Z estimate)
+
+        ema_log_z_emp is updated in log-space via logaddexp so it stays an
+        EMA of exp(logw) without overflowing. z_gap and logw_std are exposed
+        as derived properties rather than stored directly, so they always
+        stay consistent with the underlying EMAs.
+        """
+        logw = torch.as_tensor(logw, dtype=self.ema_logw.dtype).detach().cpu().flatten()
+        indices = torch.as_tensor(indices, dtype=torch.long)
+
+        if len(logw) != len(indices):
+            raise ValueError(
+                f"logw and indices must have same length, got "
+                f"{len(logw)} and {len(indices)}."
+            )
+
+        old_mean = self.ema_logw[indices]
+        old_sq = self.ema_logw_sq[indices]
+        old_log_z = self.ema_log_z_emp[indices]
+
+        nan_mask = torch.isnan(old_mean)
+
+        new_mean = torch.where(nan_mask, logw, beta * old_mean + (1.0 - beta) * logw)
+        new_sq = torch.where(nan_mask, logw ** 2, beta * old_sq + (1.0 - beta) * logw ** 2)
+
+        log_beta = math.log(beta)
+        log_1m_beta = math.log(1.0 - beta)
+        new_log_z = torch.where(
+            nan_mask,
+            logw,
+            torch.logaddexp(log_beta + old_log_z, log_1m_beta + logw),
+        )
+
+        # handle duplicates: last write wins (same as sequential loop)
+        self.ema_logw[indices] = new_mean
+        self.ema_logw_sq[indices] = new_sq
+        self.ema_log_z_emp[indices] = new_log_z
+
+    @property
+    def z_jensen(self):
+        """Per-sample rolling Jensen (lower-bound) log Z estimate: E[logw]."""
+        return self.ema_logw
+
+    @property
+    def z_emp(self):
+        """Per-sample rolling empirical log Z estimate: log E[exp(logw)]."""
+        return self.ema_log_z_emp
+
+    @property
+    def z_gap(self):
+        """Per-sample rolling gap z_emp - z_jensen (>= 0 by Jensen's inequality)."""
+        return self.ema_log_z_emp - self.ema_logw
+
+    @property
+    def logw_std(self):
+        """Per-sample rolling std of logw, from EMA[logw] and EMA[logw ** 2]."""
+        return torch.sqrt(torch.clamp(self.ema_logw_sq - self.ema_logw ** 2, min=0.0))
+
     # ---------------------------------------------------------------------
     # Mutation
     # ---------------------------------------------------------------------
@@ -869,6 +988,11 @@ class CrystalBuffer:
             dim=0,
         )
 
+        new_nan = torch.full((k,), float("nan"), dtype=torch.float32)
+        self.ema_logw = torch.cat([self.ema_logw, new_nan], dim=0)
+        self.ema_logw_sq = torch.cat([self.ema_logw_sq, new_nan.clone()], dim=0)
+        self.ema_log_z_emp = torch.cat([self.ema_log_z_emp, new_nan.clone()], dim=0)
+
     @torch.no_grad()
     def purge_by_index(self, indices_to_remove):
         """
@@ -912,6 +1036,9 @@ class CrystalBuffer:
         keep_cpu = torch.as_tensor(keep_idx, dtype=torch.long)
         self.ema_loss = self.ema_loss[keep_cpu]
         self.select_counts = self.select_counts[keep_cpu]
+        self.ema_logw = self.ema_logw[keep_cpu]
+        self.ema_logw_sq = self.ema_logw_sq[keep_cpu]
+        self.ema_log_z_emp = self.ema_log_z_emp[keep_cpu]
 
     @torch.no_grad()
     def purge(

@@ -79,11 +79,6 @@ def get_gfn_forward_loss(loss_coeffs,
                          repeats=10,
                          report_losses: bool = False,
                          ):
-    if gfn.conditional and any([
-        loss_coeffs.vg_lb > 0,
-        loss_coeffs.vg_lme > 0]):  # todo rewrite all this
-        assert False, "Rewrite repeats method from sampler"
-
     condition = condition.to(gfn.device)
     log_T_tensor = log_T_tensor.to(gfn.device)
     (states, log_pfs, log_pbs, log_flow) = gfn.get_traj_fwd(initial_state,
@@ -140,8 +135,16 @@ def get_gfn_forward_loss(loss_coeffs,
 
     """TB loss"""
     if loss_coeffs.tb > 0:
+        if loss_coeffs.fwd_tb_z == 0:
+            detach_z = True
+        elif loss_coeffs.fwd_tb_z == 2:
+            detach_z = False  # irrelevant when z_only, but keep well-defined
+        else:
+            detach_z = exploration_std > 0 if exploration_std is not None else False
+
         tb_loss = get_tb_loss(log_Z_learned, log_pb, log_pf, log_r,
-                              detach_z=exploration_std > 0 if exploration_std is not None else False,
+                              detach_z=detach_z,
+                              z_only=True if loss_coeffs.fwd_tb_z == 2 else False,
                               beta=beta)
         losses.append(tb_loss * loss_coeffs.tb)
 
@@ -192,9 +195,6 @@ def get_gfn_backward_loss(loss_coeffs,
                           report_losses: bool = False,
                           trajectories: Optional[torch.Tensor] = None,
                           ):
-    if gfn.conditional and repeats > 1:
-        assert False, "Not yet implemented"
-
     if trajectories is not None:
         # replay a fixed trajectory (e.g. from a buffer) instead of resampling one
         states, log_pfs, log_pbs, log_flow = gfn.get_traj_replay(
@@ -408,9 +408,11 @@ def get_tb_loss(log_Z_learned, log_pb, log_pf, log_r, detach_z: Union[bool, torc
 
 def emp_Z(gfn, log_Z, log_Z_learned, repeats, beta: float = 10):
     if gfn.conditional:
-        emp_z_loss = beta * F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_Z_learned.view(repeats, -1),
-                                             reduction='none',
-                                             beta=beta).view(-1)
+        # log_Z is one empirical estimate per condition group [B]; broadcast each
+        # group's value back out over its `repeats` trajectories (x-repeated-K-times
+        # layout, matching how mol_batch/condition were tiled) to compare row-wise.
+        emp_z_loss = beta * F.smooth_l1_loss(log_Z.repeat_interleave(repeats), log_Z_learned, reduction='none',
+                                             beta=beta)
     else:
         emp_z_loss = beta * F.smooth_l1_loss(log_Z.repeat(len(log_Z_learned)), log_Z_learned, reduction='none',
                                              beta=beta)
@@ -420,10 +422,12 @@ def emp_Z(gfn, log_Z, log_Z_learned, repeats, beta: float = 10):
 def vg_lme(gfn, log_pb, log_pf, log_r, repeats, beta: float = 10):
     log_ratio = log_r + log_pb - log_pf
     if gfn.conditional:
-        log_Z = torch.logsumexp(log_ratio.view(repeats, -1), dim=0, keepdim=True) - math.log(repeats)
-        # vg_loss = (0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2).view(-1)
-        vg_loss = beta * F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_ratio.view(repeats, -1), reduction='none',
+        # [B*repeats] -> [B, repeats]; each row is one condition's K trajectories
+        log_ratio_grouped = log_ratio.view(-1, repeats)
+        log_Z = torch.logsumexp(log_ratio_grouped, dim=1, keepdim=True) - math.log(repeats)  # [B, 1]
+        vg_loss = beta * F.smooth_l1_loss(log_Z.expand_as(log_ratio_grouped), log_ratio_grouped, reduction='none',
                                           beta=beta).view(-1)
+        log_Z = log_Z.view(-1)  # [B]
     else:
         log_Z = torch.logsumexp(log_ratio, dim=0, keepdim=True) - math.log(repeats)
         # vg_loss = 0.5 * (log_Z - log_ratio) ** 2
@@ -436,10 +440,12 @@ def vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats, beta: float = 10):
         "Cannot use both vg_lb and vg_lme simultaneously"
     log_ratio = log_r + log_pb - log_pf
     if gfn.conditional:
-        log_Z = log_ratio.view(repeats, -1).mean(dim=0, keepdim=True)
-        # vg_loss = (0.5 * (log_Z - log_ratio.view(repeats, -1)) ** 2).view(-1)
-        vg_loss = beta * F.smooth_l1_loss(log_Z.repeat(repeats, 1), log_ratio.view(repeats, -1), reduction='none',
+        # [B*repeats] -> [B, repeats]; each row is one condition's K trajectories
+        log_ratio_grouped = log_ratio.view(-1, repeats)
+        log_Z = log_ratio_grouped.mean(dim=1, keepdim=True)  # [B, 1]
+        vg_loss = beta * F.smooth_l1_loss(log_Z.expand_as(log_ratio_grouped), log_ratio_grouped, reduction='none',
                                           beta=beta).view(-1)
+        log_Z = log_Z.view(-1)  # [B]
 
     else:
         log_Z = log_ratio.mean(dim=0, keepdim=True)

@@ -8,7 +8,7 @@ path = r'D:\crystal_datasets\conditional\priors'
 os.chdir(path)
 p1 = torch.load('14_1_elj.pt', weights_only=False)  # load a dummy file
 
-enfunc = 'latent_harmonic'
+enfunc = 'latent_multiharmonic'
 
 p1['prior'].reset_sg_info(1)
 p1['equalized_prior'].reset_sg_info(1)
@@ -26,7 +26,7 @@ l2 = big_prior.latent_params()
 
 sbatch = deepcopy(prior)
 condition = torch.zeros(8)
-width = 0.25
+width = 1.0
 target_temperature = 1.0
 
 if enfunc == 'latent_harmonic':

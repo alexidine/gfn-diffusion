@@ -1231,6 +1231,8 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r):
     pos = resid.clamp(min=0)
     over_severity = pos.pow(2).mean().sqrt().item()
 
+    log_ess = 2 * torch.logsumexp(log_w, dim=0) - torch.logsumexp(2 * log_w, dim=0)
+    ess_frac = torch.exp(log_ess - np.log(log_w.shape[0]))
     mets = {
         'slope_err': (slope - 1).abs().item(),
         'intercept_err': intercept.abs().item(),
@@ -1238,7 +1240,7 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r):
         'r2': r2.item(),
         'tb_resid': resid.mean().item(),
         'tb_err': resid.pow(2).mean().sqrt().item(),
-        'jensen_z_err': (z_jensen - z_learned).abs().item(),
+        'jensen_z_err': (log_w - log_Z.detach()).abs().mean().item(),
         'emp_z_err': (z_emp - z_learned).abs().item(),
         'under_coverage': under_severity,
         'over_coverage': over_severity,
@@ -1247,13 +1249,11 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r):
         'resid_p95': resid.detach().quantile(0.95).item(),
         'resid_skew': skew.item(),  # sign tells you over- vs under-sampling dominance
         'jensen_z': z_jensen.item(),
-        'emp_z': z_emp.item()
+        'emp_z': z_emp.item(),
+        "logw_std": log_w.std(unbiased=False).item(),
+        "ess_frac": ess_frac.item(),
     }
-    # mets.update(
-    #     online_tb_coverage(
-    #         log_pf, log_pb, log_Z, log_r, log_w_clamp=10
-    #     )
-    # )
+
     return mets
 
 

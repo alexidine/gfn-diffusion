@@ -1,20 +1,20 @@
-run_name: 'mk_dev'
+run_name: ''
 tag: 'dev'
 seed: 12345
 device: 'cuda'
-cuda_memory_fraction: 0.9
+cuda_memory_fraction: 0.95
 anomaly_detection: false  # dramatic slowdown when True
 
 # Checkpoints
 ################################################################
 continue_from_checkpoint: false
-mlip_path: null #'D:\crystal_datasets\esen_s.pt' # C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model
-prior_path: D:\crystal_datasets\conditional\priors\latent_harmonic_T1.0_sig0.25_cond0.pt
-molecules_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt #'D:\crystal_datasets\conditional\test_mols_1.pt'
+mlip_path: 'D:\crystal_datasets\esen_s.pt' 
+prior_path: null
+molecules_path: null
 test_molecules_path: null
-checkpoints_dir: 'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints'
-checkpoint_name: null 
-prior_model_name: null 
+checkpoints_dir: '/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/'
+checkpoint_name: null #new_multig_therm.pt #dev_mk_dev_prior.pt #multigauss_prior.pt #p123.pt
+prior_model_name: null #new_multig_prior.pt #dev_mk_dev_prior.pt #multigauss_prior.pt #p123.pt
 override_loss_coeffs: false  # if true, ignore the loss coeff schedule baked into a resumed checkpoint and re-parse fwd/bwd/replay_loss_coeffs from this config instead
 override_learning_rates: false  # if true, overwrite just the numeric LR restored from a resumed checkpoint's optimizers with this config's lr_* values - warmup/anneal status and Adam momentum buffers are left as-is
 
@@ -29,7 +29,7 @@ lr_fused: 1.0e-3                # learning rate of the fused fwd/bwd/replay pass
 lr_warmup_ratio: 100           # how much smaller the initial (warmup) LR should be than the max policy value
 scheduler: True               # does LR warmup from lr/lr_warup_ratio -> lr -> min_lr over the warmup and annealing period
 lr_warmup_time: 2000
-lr_anneal_time: 25000
+lr_anneal_time: 50000
 weight_decay: 1.0E-4
 use_weight_decay: false
 gradient_norm_clip: 0.1        # gradient norm clip for updating gfn model weights
@@ -40,20 +40,20 @@ ema_decay: 0.9 #0.95  # set to null for no ema
 model:
   full_flow: false           # true for subtb or db losses
   # shared dimensions
-  s_emb_dim: 256             # dimensionality of state embedding
+  s_emb_dim: 1024             # dimensionality of state embedding
   t_dim: 64                   # dimensionality of time embedding
   harmonics_dim: 64           # dimensionality of harmonic embedding
-  condition_embedding_dim: 16  # dimensionality of the conditioning embedding
+  condition_embedding_dim: 1024  # dimensionality of the conditioning embedding
   # per-sub-model architecture
-  t_hidden_dim: 256          # time encoder hidden dim
-  s_hidden_dim: 256          # state encoder hidden dim
+  t_hidden_dim: 1024          # time encoder hidden dim
+  s_hidden_dim: 1024          # state encoder hidden dim
   s_layers: 4                 # state encoder layers
-  policy_hidden_dim: 256     # forward/backward policy hidden dim
+  policy_hidden_dim: 1024     # forward/backward policy hidden dim
   policy_layers: 4            # forward/backward policy layers
-  flow_hidden_dim: 32       # flow model hidden dim
+  flow_hidden_dim: 1024       # flow model hidden dim
   flow_layers: 1              # flow model layers
-  cond_hidden_dim: 16       # conditioning embedding hidden dim
-  cond_layers: 1              # conditioning embedding layers
+  cond_hidden_dim: 1024       # conditioning embedding hidden dim
+  cond_layers: 4              # conditioning embedding layers
   # regularization (shared)
   dropout: 0                  # dropout probability
   norm: layer                 # null, "layer" - DON'T PUT 'batch'
@@ -78,15 +78,15 @@ model:
 ################################################################
 batch_size: 25              # number of samples per training batch -- single shared batch size for all rollout work (train fwd/bwd/replay/fused AND eval sampling), so there's one adaptive value reacting to OOMs instead of several independently-tuned ones
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 2500
+max_batch_size: 20000
 batch_growth_increment: 1.01  # fast growth rate used before we've ever hit an OOM this run (slow-start) - GROWS FAST! # 1 is static, 1.1 10% growth, etc.
 batch_growth_slow_increment: 1.002  # much slower growth rate used once we've OOM'd at least once and are past cooldown - avoids immediately re-triggering the same OOM
 oom_batch_shrink_factor: 0.6  # multiplicative cut applied to batch_size on ANY OOM (train step or eval sampling share this one batch size/recovery path)
 oom_cooldown_steps: 200  # steps to hold batch_size flat after an OOM before resuming growth, to let the reduced level prove stable first
 eval_num_samples: 10000       # minimum number of samples for evaluation
-epochs: 100000             # number of training epochs
-eval_period: 250              # how often to do evaluation & reporting
-figs_period: 250             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+epochs: 1000000             # number of training epochs
+eval_period: 500              # how often to do evaluation & reporting
+figs_period: 500             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # SDE integration
 ################################################################
@@ -147,6 +147,7 @@ replay_loss_coeffs:  # applied to trajectories pulled from the replay buffer (se
 both_ways: true #true             # forward and backward training
 repeats: 1                   # for conditional training, multiplies batch size by this factor for VarGrad, MLE
 bwd: false                   # backward training only
+bwd_sampling_mode: 'dataset' # source for samples in backward training: 'dataset' | 'prior' (trajectory replay is its own step type, see replay_buffer)
 # for controlling 3-phase convergence protocol
 anchor_fwd_bwd: true #true #true  # whether to do this at all
 fused: true  # phase-3 only: instead of randomly alternating fwd/bwd/replay steps by fraction, fire all three every step and fuse their losses by the same fractions, via its own optimizer
@@ -172,7 +173,7 @@ prior_buffer:
   mean_lifetime: 100 # batch size adjusted mean lifetime to buffer samples
   min_size: 10000
   max_size: 100000
-  reward_min: -100 # minimum allowed reward to be admitted to buffer
+  reward_min: -1000 # minimum allowed reward to be admitted to buffer
 
 # trajectory replay buffer - stores full forward trajectories of overweighted on-policy
 # samples (residual > buffer_resid_cutoff) so they can later be exactly replayed
@@ -184,7 +185,7 @@ replay_buffer:
 
 # energy function settings
 ################################################################
-energy_function: 'latent_harmonic'
+energy_function: 'latent_multiharmonic'
 temperature_conditioning: false  # if false, temperatures are set to temperature, and there is no annealing
 molecule_conditioning: False  # conditions the generative prediction on the molecule
 sg_conditioning: False  # whether to conditionally sample across space groups
@@ -192,19 +193,12 @@ space_groups: [ 2 ]  # which space groups to sample over
 zp_conditioning: false # whether to condition over z prime values
 z_primes: [ 1 ]
 energy_config:
-  internal_oom_recovery: true  # if false, skip the energy function's own adaptive sub-batching/OOM catch-and-shrink loop and analyze the whole batch in one call, so an OOM propagates up to train.py's global batch size reduction instead. Recommended false in fused mode, where the internal recovery destabilizes memory management.
-  temperature: 1.0 # 2.5 is room temperature kT in kJ/mol
-  log_temperature_range: [0, 0.693147]
+  temperature: 2.5 # 2.5 is room temperature kT in kJ/mol
+  log_temperature_range: [0, 1]
   # loss coefficients
   density_coeff: 10.0  # how much to weight the density penalty term in the energy function
   bounding_coeff: 10.0
   reduction_coeff: 10.0
   lj_coeff: 1.0  # loss coefficient
-  reward_range: null # max ptp of reward values allowed, null to go unrestricted
-  analyze_kwargs: {width: 0.25,
-                   c:[0,0,0,0,0,0,0,0],
-                   modes: [0,0,0,0,0,0,0,0,0,0,0,0]
-#  {width: 0.075,
-#                   c:[0,0,0,0,0,0,0,0],
-#                   modes: [.75,.75,.75,.75,.75,.75,.75,.75,.75,.75,.75,.75]
-  }  # extra kwargs passed through to crystal_batch.analyze(), e.g. noise: 0.01, rdf_mode: 'envwise', cutoff: 6
+  reward_range: null # range of reward values allowed, null to go unrestricted
+  analyze_kwargs: {c:[0,0,0,0,0,0,0,0]}  # extra kwargs passed through to crystal_batch.analyze(), e.g. noise: 0.01, rdf_mode: 'envwise', cutoff: 6

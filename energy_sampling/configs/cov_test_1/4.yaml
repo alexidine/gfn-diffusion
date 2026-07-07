@@ -1,0 +1,179 @@
+anchor_fwd_bwd: true
+anomaly_detection: false
+batch_growth_increment: 1.01
+batch_growth_slow_increment: 1.002
+batch_size: 25
+both_ways: true
+bwd: false
+bwd_loss_coeffs:
+  beta: 10
+  bwd_tb_z: 2.0
+  db: 0.0
+  emp_z: 0
+  loss_clip: 1000000000.0
+  mle: 1.0
+  pf_boost: 0
+  subtb: 0.0
+  subtb_lambda: 0.9
+  tb: 1.0
+  traj_grads: 1.0
+  vg_lb: 0
+  vg_lme: 0
+bwd_sampling_mode: dataset
+checkpoint_name: null
+checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/
+continue_from_checkpoint: false
+controller:
+  anneal_patience: 5
+  beta: 0.01
+  deactivate_threshold: 0.01
+  decay_rate: 0.975
+  lookahead_horizon: 5
+  lookahead_trend_alpha: 0.1
+  min_mode_frac: 0.001
+  min_threshold: 1
+  over_threshold: 8
+  refresh_every: 10
+  under_threshold: 8
+  zerr_min_threshold: 0.5
+  zerr_threshold: 1.0
+cuda_memory_fraction: 0.95
+device: cuda
+dplr_rank: 8
+ema_decay: 0.9
+energy_config:
+  analyze_kwargs:
+    c:
+    - 0
+    - 0
+    - 0
+    - 0
+    - 0
+    - 0
+    - 0
+    - 0
+  bounding_coeff: 10.0
+  density_coeff: 10.0
+  lj_coeff: 1.0
+  log_temperature_range:
+  - 0
+  - 1
+  reduction_coeff: 10.0
+  reward_range: null
+  temperature: 2.5
+energy_function: elj
+epochs: 1000000
+eval_T: 100
+eval_num_samples: 10000
+eval_period: 500
+figs_period: 500
+fused: true
+fused_grad_accum_min_samples: 0
+fwd_loss_coeffs:
+  beta: 10
+  db: 0.0
+  emp_z: 0
+  fwd_tb_z: 1.0
+  loss_clip: 1000000000.0
+  reward_grads: 0.0
+  subtb: 0.0
+  subtb_lambda: 0.95
+  tb: 1.0
+  traj_grads: 0.0
+  vg_lb: 0.0
+  vg_lme: 0
+gradient_norm_clip: 0.1
+grow_batch_size: true
+integrator:
+  T: 100
+  discretizer: uniform
+  discretizer_max_ratio: 15
+  max_traj_length: 10
+  min_traj_length: 10
+  traj_length_strategy: static
+lr_anneal_time: 50000
+lr_back: 0.001
+lr_flow: 0.1
+lr_fused: 0.001
+lr_policy: 0.001
+lr_replay: 0.001
+lr_warmup_ratio: 100
+lr_warmup_time: 2000
+max_batch_size: 20000
+min_lr: 1.0e-05
+mlip_path: D:\crystal_datasets\esen_s.pt
+model:
+  clipping: true
+  cond_hidden_dim: 1024
+  cond_layers: 4
+  condition_embedding_dim: 1024
+  dplr_mask_angular: false
+  dplr_rank: 6
+  dplr_rho_max: 0.5
+  dropout: 0
+  flow_hidden_dim: 1024
+  flow_layers: 1
+  full_flow: false
+  gfn_clip: 200.0
+  harmonics_dim: 64
+  learn_pb: true
+  learned_variance: true
+  log_var_range: 6
+  norm: layer
+  pb_drift_range: 0.4
+  pb_var_range: 6
+  policy_hidden_dim: 1024
+  policy_layers: 4
+  s_emb_dim: 1024
+  s_hidden_dim: 1024
+  s_layers: 4
+  t_dim: 64
+  t_hidden_dim: 1024
+  t_scale: 0.05
+  zero_init: false
+molecule_conditioning: false
+molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_prior_dataset.pt
+oom_batch_shrink_factor: 0.6
+oom_cooldown_steps: 200
+override_learning_rates: false
+override_loss_coeffs: false
+prior_buffer:
+  max_size: 100000
+  mean_lifetime: 100
+  min_size: 10000
+  reward_min: -1000
+prior_model_name: null
+prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_prior_dataset.pt
+repeats: 1
+replay_buffer:
+  max_size: 100000
+  random_churn_rate: 50
+replay_loss_coeffs:
+  beta: 10
+  bwd_tb_z: 0.0
+  db: 0.0
+  emp_z: 0
+  loss_clip: 1000000000.0
+  mle: 0.0
+  pf_boost: 0
+  subtb: 0.0
+  subtb_lambda: 0.9
+  tb: 0.0
+  traj_grads: 0.0
+  vg_lb: 0
+  vg_lme: 0
+run_name: 4__mipcas_2_1_elj
+scheduler: true
+seed: 12345
+sg_conditioning: false
+space_groups:
+- 2
+tag: cov_1
+temperature_conditioning: false
+test_molecules_path: null
+use_weight_decay: false
+wass_threshold: 0.01
+weight_decay: 0.0001
+z_primes:
+- 1
+zp_conditioning: false

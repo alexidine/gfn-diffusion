@@ -65,6 +65,7 @@ class MolecularCrystal(BaseSet):
                  pressure: float = 1,  # in atm
                  log_temperature_range: list = None,
                  analyze_kwargs: Optional[dict] = None,  # extra kwargs passed through to crystal_batch.analyze()
+                 internal_oom_recovery: bool = True,  # if False, skip the adaptive sub-batching/OOM catch-and-shrink loop in batched_analyze_crystal_batch and analyze the whole batch in one call, letting any OOM propagate to the caller
                  ):
 
         super(MolecularCrystal, self).__init__()
@@ -90,6 +91,7 @@ class MolecularCrystal(BaseSet):
         self.lj_rescale = lj_rescale
         self.pressure = pressure
         self.log_temperature_range = log_temperature_range
+        self.internal_oom_recovery = internal_oom_recovery
         if isinstance(analyze_kwargs, Namespace):  # yaml configs nest dicts as Namespaces
             analyze_kwargs = vars(analyze_kwargs)
         self.analyze_kwargs = analyze_kwargs or {}
@@ -349,7 +351,8 @@ class MolecularCrystal(BaseSet):
                mol_batch,
                log_temperature: torch.tensor,
                return_exp: bool = False,
-               keep_grads: bool = False):
+               keep_grads: bool = False,
+               internal_oom_recovery: Optional[bool] = None):
         """
         Energy is not really bounded. Or necessarily well scaled.
         We do exponential rescaling later with a temperature. For higher temperature,
@@ -357,22 +360,43 @@ class MolecularCrystal(BaseSet):
         :param mol_batch:
         :param temperature:
         :param x:
+        :param internal_oom_recovery: per-call override of self.internal_oom_recovery -- pass
+            True to force the adaptive sub-batching/OOM catch-and-shrink path for this call
+            regardless of the instance default (e.g. a one-off pass over a huge prior dataset
+            at init, where a slow, self-healing pass is preferable to a hard crash).
         :return:
         """
         temperature = 10 ** log_temperature
         if return_exp:
             energy, crystal_batch = self.batched_analyze_crystal_batch(x, mol_batch, temperature,
                                                                        return_batch=return_exp,
-                                                                       keep_grads=keep_grads)
+                                                                       keep_grads=keep_grads,
+                                                                       internal_oom_recovery=internal_oom_recovery)
             return energy / temperature, crystal_batch
         else:
             energy = self.batched_analyze_crystal_batch(x, mol_batch, temperature,
                                                         return_batch=return_exp,
-                                                        keep_grads=keep_grads)
+                                                        keep_grads=keep_grads,
+                                                        internal_oom_recovery=internal_oom_recovery)
             return energy / temperature
 
     def batched_analyze_crystal_batch(self, x, mol_batch, temperature,
-                                      return_batch=False, keep_grads: bool = False):
+                                      return_batch=False, keep_grads: bool = False,
+                                      internal_oom_recovery: Optional[bool] = None):
+        use_recovery = self.internal_oom_recovery if internal_oom_recovery is None else internal_oom_recovery
+        if not use_recovery:
+            # analyze the whole batch in a single call: no adaptive sub-batching, no OOM
+            # catch-and-shrink here -- any OOM raises straight through to the caller, so
+            # a global batch size reduction (e.g. train.py's handle_train_epoch_error) can
+            # handle it instead of this class quietly shrinking its own internal chunk size.
+            outs = self.analyze_crystal_batch(x, mol_batch, temperature,
+                                              return_batch=return_batch, keep_grads=keep_grads)
+            energy = outs[0] if keep_grads else outs[0].detach()
+            if return_batch:
+                return energy, outs[1]
+            else:
+                return energy
+
         if not hasattr(self, 'batch_size'):
             if self.energy_function in ['uma', 'mace']:
                 self.batch_size = 1000
@@ -521,7 +545,16 @@ class MolecularCrystal(BaseSet):
                           temperature: torch.tensor = None,
                           sg_inds: torch.tensor = None,
                           z_primes: torch.tensor = None,
+                          repeats: int = 1,
                           ):
+        """
+        mol_batch is assumed to already be tiled into `repeats`-sized groups of
+        identical molecules (x-repeated-K-times layout, as produced by
+        CrystalBuffer.loader(..., repeats=repeats)). Conditions are sampled once
+        per group and broadcast across the group via repeat_interleave, so every
+        trajectory drawn for a given molecule shares the same condition.
+        """
+        num_groups = mol_batch.num_graphs // repeats
 
         conds = []  # feedback of zp information is broken
         if self.temperature_conditioning:
@@ -532,10 +565,11 @@ class MolecularCrystal(BaseSet):
                 log_T_tensor = torch.log10(temperature)
             else:
                 # Uniform samples in [0, 1]
-                u = torch.rand(mol_batch.num_graphs, dtype=torch.float32)
+                u = torch.rand(num_groups, dtype=torch.float32)
                 # Transform to [log_low, log_high]
                 log_T_tensor = self.log_temperature_range[0] + u * (
                             self.log_temperature_range[1] - self.log_temperature_range[0])
+                log_T_tensor = log_T_tensor.repeat_interleave(repeats)
 
             log_T_tensor = log_T_tensor.to(mol_batch.device)
             conds.append(log_T_tensor)
@@ -546,14 +580,16 @@ class MolecularCrystal(BaseSet):
         if sg_inds is not None:
             sg_to_sample = sg_inds.clone()
         else:
-            sg_to_sample = torch.tensor(np.random.choice(self.space_groups, mol_batch.num_graphs, replace=True)).to(
-                mol_batch.device)
+            sg_to_sample = torch.tensor(
+                np.random.choice(self.space_groups, num_groups, replace=True)
+            ).repeat_interleave(repeats).to(mol_batch.device)
 
         if z_primes is not None:
             zp_to_sample = z_primes.clone()
         else:
-            zp_to_sample = torch.tensor(np.random.choice(self.z_primes, mol_batch.num_graphs, replace=True)).to(
-                mol_batch.device)
+            zp_to_sample = torch.tensor(
+                np.random.choice(self.z_primes, num_groups, replace=True)
+            ).repeat_interleave(repeats).to(mol_batch.device)
 
         if self.sg_conditioning:
             conds.append(torch.stack([self.SG_FEATURE_TENSOR[sg]

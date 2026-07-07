@@ -165,8 +165,7 @@ def sample_eval_fwd_trajs(init_state,
     condition = condition.to(gfn_model.device)
     if no_conditioning:
         condition = False
-    (states, log_pfs, log_pbs, log_flow,
-     means_f, logvars_f, means_b, logvars_b) = gfn_model.get_traj_fwd(
+    (states, log_pfs, log_pbs, log_flow, gauss_params) = gfn_model.get_traj_fwd(
         init_state, discretizer, None, condition, mol_batch, return_gauss_params=True)
 
     log_r, sample_batch = energy_function.log_reward(
@@ -183,8 +182,7 @@ def sample_eval_fwd_trajs(init_state,
         'log_pb': cpu(log_pbs.sum(-1)),
         'log_T_tensor': cpu(log_T_tensor),
         'sample_batch': sample_batch.cpu().detach(),
-        'gauss_params': {'means_f': cpu(means_f), 'logvars_f': cpu(logvars_f),
-                         'means_b': cpu(means_b), 'logvars_b': cpu(logvars_b)},
+        'gauss_params': {k: cpu(v) for k, v in gauss_params.items()},
     }
 
 
