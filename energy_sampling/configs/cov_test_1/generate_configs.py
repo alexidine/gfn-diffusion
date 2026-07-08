@@ -84,7 +84,7 @@ if __name__ == "__main__":
                     config['energy_config']['temperature'] = T
                     config['integrator']['T'] = traj_len
                     config['eval_T'] = traj_len
-                    config['dplr_rank'] = rank
+                    config['model']['dplr_rank'] = rank
                     config_path = f"{ind}.yaml"
 
                     with open(config_path, 'w') as f:

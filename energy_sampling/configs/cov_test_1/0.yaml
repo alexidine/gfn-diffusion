@@ -39,7 +39,6 @@ controller:
   zerr_threshold: 1.0
 cuda_memory_fraction: 0.95
 device: cuda
-dplr_rank: 0
 ema_decay: 0.9
 energy_config:
   analyze_kwargs:
@@ -108,7 +107,7 @@ model:
   cond_layers: 4
   condition_embedding_dim: 1024
   dplr_mask_angular: false
-  dplr_rank: 6
+  dplr_rank: 0
   dplr_rho_max: 0.5
   dropout: 0
   flow_hidden_dim: 1024

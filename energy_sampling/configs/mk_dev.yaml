@@ -9,7 +9,7 @@ anomaly_detection: false  # dramatic slowdown when True
 ################################################################
 continue_from_checkpoint: false
 mlip_path: null #'D:\crystal_datasets\esen_s.pt' # C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model
-prior_path: D:\crystal_datasets\conditional\priors\latent_harmonic_T1.0_sig0.25_cond0.pt
+prior_path: D:\crystal_datasets\conditional\priors\latent_multiharmonic_T1.0_sig1.0_cond0.pt
 molecules_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt #'D:\crystal_datasets\conditional\test_mols_1.pt'
 test_molecules_path: null
 checkpoints_dir: 'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints'
@@ -184,11 +184,11 @@ replay_buffer:
 
 # energy function settings
 ################################################################
-energy_function: 'latent_harmonic'
+energy_function: 'latent_multiharmonic'
 temperature_conditioning: false  # if false, temperatures are set to temperature, and there is no annealing
 molecule_conditioning: False  # conditions the generative prediction on the molecule
 sg_conditioning: False  # whether to conditionally sample across space groups
-space_groups: [ 2 ]  # which space groups to sample over
+space_groups: [ 1 ]  # which space groups to sample over
 zp_conditioning: false # whether to condition over z prime values
 z_primes: [ 1 ]
 energy_config:
@@ -201,7 +201,7 @@ energy_config:
   reduction_coeff: 10.0
   lj_coeff: 1.0  # loss coefficient
   reward_range: null # max ptp of reward values allowed, null to go unrestricted
-  analyze_kwargs: {width: 0.25,
+  analyze_kwargs: {width: 1.0,
                    c:[0,0,0,0,0,0,0,0],
                    modes: [0,0,0,0,0,0,0,0,0,0,0,0]
 #  {width: 0.075,
