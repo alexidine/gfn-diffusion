@@ -482,8 +482,15 @@ class MolecularCrystal(BaseSet):
         z_ones3 = torch.ones((n, 3 * self.max_z_prime), device=device)
         z_ones1 = torch.ones((n, self.max_z_prime), device=device)
         setattr(crystal_batch, '_num_graphs', mol_batch.num_graphs)
+        # `device` is a computed property (self.z.device) on crystal_batch, but z isn't
+        # set yet, so temporarily force it via setattr so set_mol_attrs can use self.device.
+        # setattr on this class writes straight into the underlying PyG store rather than
+        # the property, so it must be removed again once z is populated below -- otherwise
+        # it leaks a raw torch.device into to_dict()/clone() and breaks any code that later
+        # treats this batch as a plain mol_batch (e.g. crystal batches recycled as anchors).
         setattr(crystal_batch, 'device', mol_batch.device)
         crystal_batch.set_mol_attrs(mol_batch.clone())
+        delattr(crystal_batch, 'device')
 
         blank_batch_properties = {
             'aunit_handedness': z_ones1,
