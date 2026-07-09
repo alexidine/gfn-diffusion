@@ -25,7 +25,7 @@ from torch.optim import lr_scheduler
 from tqdm import trange
 
 from energies.molecular_crystal import MolecularCrystal
-from energy_sampling.buffer import CrystalBuffer
+from energy_sampling.buffer import CrystalBuffer, AnchorBuffer
 from energy_sampling.eval.utils import sample_eval_fwd_trajs, LossSpikeMonitor
 from energy_sampling.utils import is_cuda_oom, get_annealing_factor, \
     parse_loss_schedules, dict2namespace, update_loss_schedule, \
@@ -136,6 +136,7 @@ class Modeller:
             'optimizers': {k: opt.state_dict() for k, opt in self.optimizers.items()},
             'prior_buffer': self.prior_buffer.state_dict() if hasattr(self, 'prior_buffer') else None,
             'replay_buffer': self.replay_buffer.state_dict() if hasattr(self, 'replay_buffer') else None,
+            'anchor_buffer': self.anchor_buffer.state_dict() if hasattr(self, 'anchor_buffer') else None,
         }
         path = self._checkpoint_path(tag)
         atomic_save(checkpoint, path)
@@ -158,6 +159,8 @@ class Modeller:
             self.prior_buffer = CrystalBuffer.from_state_dict(checkpoint['prior_buffer'], device='cpu')
         if checkpoint.get('replay_buffer') is not None:
             self.replay_buffer = CrystalBuffer.from_state_dict(checkpoint['replay_buffer'], device='cpu')
+        if checkpoint.get('anchor_buffer') is not None:
+            self.anchor_buffer = AnchorBuffer.from_state_dict(checkpoint['anchor_buffer'], device='cpu')
 
         if getattr(self.args, 'override_loss_coeffs', False):
             # discard the schedule baked into the checkpoint so set_loss_coeffs()
@@ -636,6 +639,8 @@ class Modeller:
                 self.prior_buffer = CrystalBuffer.from_state_dict(checkpoint['prior_buffer'], device='cpu')
             if checkpoint.get('replay_buffer') is not None:
                 self.replay_buffer = CrystalBuffer.from_state_dict(checkpoint['replay_buffer'], device='cpu')
+            if checkpoint.get('anchor_buffer') is not None:
+                self.anchor_buffer = AnchorBuffer.from_state_dict(checkpoint['anchor_buffer'], device='cpu')
 
         lr_cut_val = 0.75
 
@@ -835,9 +840,38 @@ class Modeller:
             if step_counts[sub_type] % 10 == 0:
                 self._update_rolling(loss_dict, sub_loss, sub_type)
 
+    def _reward_ramp_kwargs(self):
+        """
+        floor/ramp_range for quick_tb_stats' weighted_under_coverage, expressed
+        relative to the current best anchor reward rather than as absolute
+        numbers -- so the ramp automatically tracks the achievable reward scale
+        as it rises over training instead of needing hand-tuned absolute
+        constants. Given anchor_buffer's current max M:
+            floor       = M - prior_buffer.ramp_floor_range   (weight 0 here)
+            ramp_range  = ramp_floor_range - ramp_knee_range
+            -> weight saturates to 1 at M - prior_buffer.ramp_knee_range,
+               and stays at 1 all the way up through M.
+        Falls back to (None, None) -- quick_tb_stats' old uniform-RMS behavior
+        -- until there's an anchor buffer to anchor the scale to.
+        """
+        anchor_buffer = getattr(self, 'anchor_buffer', None)
+        if anchor_buffer is None or len(anchor_buffer) == 0:
+            return dict(reward_floor=None, reward_ramp_range=None)
+
+        buffers_cfg = getattr(self.args, 'buffers', None)
+        prior_buffer_cfg = getattr(buffers_cfg, 'prior_buffer', None)
+        floor_range = getattr(prior_buffer_cfg, 'ramp_floor_range', None)
+        knee_range = getattr(prior_buffer_cfg, 'ramp_knee_range', None)
+        if floor_range is None or knee_range is None:
+            return dict(reward_floor=None, reward_ramp_range=None)
+
+        anchor_max = anchor_buffer.reward.max().item()
+        return dict(reward_floor=anchor_max - floor_range,
+                    reward_ramp_range=floor_range - knee_range)
+
     def _update_rolling(self, loss_dict, sub_loss, sub_type):
         stats = quick_tb_stats(loss_dict['log_pf'], loss_dict['log_pb'],
-                               loss_dict['log_Z'], loss_dict['log_r'])
+                               loss_dict['log_Z'], loss_dict['log_r'], **self._reward_ramp_kwargs())
         stats.update({k: v.item() for k, v in loss_dict.items() if k not in
                       ['log_pf', 'log_pb', 'log_Z', 'log_r', 'losses', 'flow_states', 'resid']})
         stats.update({'loss': sub_loss.cpu().detach().item()})
@@ -1216,7 +1250,8 @@ class Modeller:
         log_pb = fwd_stats['log_pbs'].sum(-1)
         log_Z_learned = fwd_stats['log_Z_learned']
         log_T_tensor = fwd_stats['log_T_tensor']
-        metrics.update({f'eval_fwd/{k}': v for k, v in quick_tb_stats(log_pf, log_pb, log_Z_learned, log_r).items()})
+        metrics.update({f'eval_fwd/{k}': v for k, v in
+                        quick_tb_stats(log_pf, log_pb, log_Z_learned, log_r, **self._reward_ramp_kwargs()).items()})
 
         self.log_thermo_properties(arr, fwd_stats, log_T_tensor, log_Z_learned, log_r, metrics, sample_batch, val)
 
@@ -1226,7 +1261,8 @@ class Modeller:
         log_z = bwd_stats['log_Z_learned']
         log_r = bwd_stats['log_r']
         # parity / Z diagnostics (shared with fwd)
-        metrics.update({f'eval_bwd/{k}': v for k, v in quick_tb_stats(log_pf, log_pb, log_z, log_r).items()})
+        metrics.update({f'eval_bwd/{k}': v for k, v in
+                        quick_tb_stats(log_pf, log_pb, log_z, log_r, **self._reward_ramp_kwargs()).items()})
 
         def dump_numeric(metrics, prefix, obj):
             d = obj if isinstance(obj, dict) else vars(obj)
@@ -1362,6 +1398,12 @@ class Modeller:
             self.manage_prior_buffer(sample_batch)
             self.manage_replay_buffer(fwd_stats, sample_batch)
 
+        if hasattr(self, 'anchor_buffer'):
+            self.anchor_eval_cycle_count = getattr(self, 'anchor_eval_cycle_count', 0) + 1
+            if self.anchor_eval_cycle_count % self.args.buffers.anchor_buffer.thin_every_n_evals == 0:
+                cfg = self.args.buffers.anchor_buffer
+                self.anchor_buffer.thin(cfg.dist_cutoff, max_size=cfg.max_size)
+
         metrics.update(self.log_buffer_stats())
 
         return metrics
@@ -1380,20 +1422,20 @@ class Modeller:
         else:
             buff = None
 
+        metrics = {}
         if buff is not None:
             valid_losses = buff.ema_loss[~torch.isnan(buff.ema_loss)].cpu().numpy()
-            metrics = {'prior_buffer_length': len(buff),
-                       'prior_buffer_mean_steps': torch.nanmean(buff.select_counts.float()).item(),
-                       'prior_buffer_median_steps': torch.nanmedian(buff.select_counts.float()).item(),
-                       'prior_buffer_mean_loss': torch.nanmean(buff.ema_loss).item(),
-                       'prior_buffer_median_loss': torch.nanmedian(buff.ema_loss).item(),
-                       'prior_buffer_step_hist': wandb.Histogram(buff.select_counts.cpu().numpy()),
-                       'prior_buffer_energy_hist': wandb.Histogram(buff.batch[self.args.energy_function].cpu().numpy())
-                       }
+            metrics.update({
+                'prior_buffer_length': len(buff),
+                'prior_buffer_mean_steps': torch.nanmean(buff.select_counts.float()).item(),
+                'prior_buffer_median_steps': torch.nanmedian(buff.select_counts.float()).item(),
+                'prior_buffer_mean_loss': torch.nanmean(buff.ema_loss).item(),
+                'prior_buffer_median_loss': torch.nanmedian(buff.ema_loss).item(),
+                'prior_buffer_step_hist': wandb.Histogram(buff.select_counts.cpu().numpy()),
+            })
+            metrics.update(self.energy_reward_stats('prior_buffer', energy=buff.y))
             if len(valid_losses) > 0:
                 metrics['prior_buffer_loss_hist'] = wandb.Histogram(np.clip(np.log10(valid_losses), min=-1, max=3))
-        else:
-            metrics = {}
 
         if hasattr(self, 'replay_buffer'):
             valid_replay_losses = self.replay_buffer.ema_loss[~torch.isnan(self.replay_buffer.ema_loss)].cpu().numpy()
@@ -1404,13 +1446,49 @@ class Modeller:
                 'replay_buffer_mean_loss': torch.nanmean(self.replay_buffer.ema_loss).item(),
                 'replay_buffer_median_loss': torch.nanmedian(self.replay_buffer.ema_loss).item(),
                 'replay_buffer_step_hist': wandb.Histogram(self.replay_buffer.select_counts.cpu().numpy()),
-                'replay_buffer_energy_hist': wandb.Histogram(
-                    self.replay_buffer.batch[self.args.energy_function].cpu().numpy())
             })
+            metrics.update(self.energy_reward_stats('replay_buffer', energy=self.replay_buffer.y))
             if len(valid_replay_losses) > 0:
                 metrics['replay_buffer_loss_hist'] = wandb.Histogram(
                     np.clip(np.log10(valid_replay_losses), min=0, max=3))
+
+        if hasattr(self, 'anchor_buffer'):
+            metrics['anchor_buffer_length'] = len(self.anchor_buffer)
+            metrics.update(self.energy_reward_stats('anchor_buffer', reward=self.anchor_buffer.reward))
+            if hasattr(self, 'last_anchor_topup'):
+                metrics['anchor_topup_last_n'] = self.last_anchor_topup
+
         return metrics
+
+    def energy_reward_stats(self, prefix, energy=None, reward=None):
+        """
+        Mean, median, and histogram for both energy and reward, deriving
+        whichever one wasn't passed in via the fixed sampling temperature
+        (same reward = -energy / T convention as prebuilt_sample_to_reward
+        and top_up_prior_from_anchors).
+        """
+        assert energy is not None or reward is not None, "must pass energy and/or reward"
+        temperature = self.energy_function.temperature
+        if energy is None:
+            energy = -reward * temperature
+        elif reward is None:
+            reward = -energy / temperature
+
+        energy_np = energy.detach().cpu().numpy()
+        reward_np = reward.detach().cpu().numpy()
+
+        return {
+            f'{prefix}_mean_energy': float(np.mean(energy_np)),
+            f'{prefix}_median_energy': float(np.median(energy_np)),
+            f'{prefix}_min_energy': float(np.min(energy_np)),
+            f'{prefix}_max_energy': float(np.max(energy_np)),
+            f'{prefix}_energy_hist': wandb.Histogram(energy_np, num_bins=128),
+            f'{prefix}_mean_reward': float(np.mean(reward_np)),
+            f'{prefix}_median_reward': float(np.median(reward_np)),
+            f'{prefix}_min_reward': float(np.min(reward_np)),
+            f'{prefix}_max_reward': float(np.max(reward_np)),
+            f'{prefix}_reward_hist': wandb.Histogram(reward_np, num_bins=128),
+        }
 
     def manage_prior_buffer(self, sample_batch):
         if not hasattr(self, 'prior_buffer'):
@@ -1426,9 +1504,9 @@ class Modeller:
 
         # always churn at least a little bit
         n_churn = max(1000,
-                      int((num_bwd_steps / self.args.prior_buffer.mean_lifetime) * self.batch_size))
+                      int((num_bwd_steps / self.args.buffers.prior_buffer.mean_lifetime) * self.batch_size))
         n_to_add = min(self.args.eval_num_samples, n_churn)  # cap unrelated to GPU batch size -- eval_batch_size is retired, this is just a churn-rate limiter
-        headroom = max(0, self.args.prior_buffer.max_size - len(self.prior_buffer))
+        headroom = max(0, self.args.buffers.prior_buffer.max_size - len(self.prior_buffer))
 
         if n_to_add > headroom:
             elig_idx, _, _ = self.prior_buffer.get_elig_drop_count(
@@ -1441,7 +1519,7 @@ class Modeller:
             overflow = n_to_add - headroom
             n_to_add = headroom + min(elig_to_drop, overflow)
 
-        space_needed = max(0, len(self.prior_buffer) + n_to_add - self.args.prior_buffer.max_size)
+        space_needed = max(0, len(self.prior_buffer) + n_to_add - self.args.buffers.prior_buffer.max_size)
         if space_needed > 0:
             self.prior_buffer.purge_lowest(
                 space_needed,
@@ -1456,10 +1534,73 @@ class Modeller:
         if remaining_budget > 0: # todo track conditioning through this step so rewards are consistent
             metrics, sample_batch = self.sample_from_prior(remaining_budget)
             reward = metrics['log_r']
-            good_inds = torch.argwhere(reward > self.args.prior_buffer.reward_min).flatten()
+            good_inds = torch.argwhere(reward > self.args.buffers.prior_buffer.reward_min).flatten()
             if good_inds.numel() > 0:
                 batch_to_add = sample_batch.subsample_new_batch(good_inds)
                 self.prior_buffer.add(batch_to_add)
+
+            # this cycle's prior-model draw came up short of admissible samples --
+            # top up the gap from the permanent anchor archive instead of just
+            # accepting a smaller churn this round
+            shortfall = remaining_budget - good_inds.numel()
+            if shortfall > 0 and getattr(self, 'anchor_buffer', None) is not None and len(self.anchor_buffer) > 0:
+                self.top_up_prior_from_anchors(shortfall)
+
+        # reach trigger: even prior_buffer's own upper tail is still hugging
+        # reward_min instead of reaching up toward the best anchor -- it isn't
+        # discovering/retaining good samples on its own, so actively replace
+        # some of its worst material with anchor-sourced top-up rather than
+        # waiting for a shortfall to expose the problem
+        if getattr(self, 'anchor_buffer', None) is not None and len(self.anchor_buffer) > 0 and len(self.prior_buffer) > 0:
+            cfg = self.args.buffers.anchor_buffer
+            reward_min = self.args.buffers.prior_buffer.reward_min
+            anchor_max = self.anchor_buffer.reward.max().item()
+            span = anchor_max - reward_min
+            if span > 0:
+                prior_reward = -self.prior_buffer.y.cpu() / self.args.energy_config.temperature
+                reach = (torch.quantile(prior_reward, cfg.reach_quantile).item() - reward_min) / span
+                if reach < cfg.reach_threshold:
+                    self.top_up_prior_from_anchors(cfg.reach_topup_size, purge_worst=True)
+
+    @torch.no_grad()
+    def top_up_prior_from_anchors(self, n, purge_worst: bool = False):
+        """
+        Top up prior_buffer from the anchor buffer: isotropically noise a
+        batch of anchors in latent space and rescore them -- the same
+        noise-then-rescore pattern already used by
+        substitute_prior/calibrate_prior_noise in utils.py, just sourced from
+        the permanent archive instead of the live buffer being calibrated.
+
+        purge_worst: if True, first purge up to n of prior_buffer's lowest-
+        reward (highest-energy) entries, so the anchor-sourced batch actively
+        replaces stale/pinned material instead of just padding on top of it
+        (used by the reach trigger; the shortfall trigger leaves this False
+        since headroom for that case is already handled upstream).
+        """
+        cfg = self.args.buffers.anchor_buffer
+
+        if purge_worst and len(self.prior_buffer) > 0:
+            n_purge = min(n, len(self.prior_buffer))
+            worst_first = torch.argsort(self.prior_buffer.y.cpu(), descending=True)  # highest energy = lowest reward
+            self.prior_buffer.purge_by_index(worst_first[:n_purge].numpy())
+
+        n_draw = min(n, len(self.anchor_buffer))
+
+        anchor_batch, _, _ = self.anchor_buffer.sample_graphs(n_draw, replace=False)
+        anchor_batch = anchor_batch.clone().to(self.device)
+        anchor_batch.log_noise_latent_parameters(*cfg.noise_log_range)
+
+        anchor_batch, log_T_tensor, sg_inds, zps, condition = self.energy_function.condition_samples(
+            anchor_batch, sg_inds=anchor_batch.sg_ind, z_primes=anchor_batch.z_prime)
+        anchor_batch.orient_molecule(mode='std')
+
+        reward, anchor_batch = self.energy_function.log_reward(
+            anchor_batch.latent_params(), anchor_batch, log_T_tensor, return_exp=True)
+
+        good_inds = torch.argwhere(reward > self.args.buffers.prior_buffer.reward_min).flatten()
+        if good_inds.numel() > 0:
+            self.prior_buffer.add(anchor_batch.subsample_new_batch(good_inds))
+        self.last_anchor_topup = good_inds.numel()
 
     def bwd_step_delta(self):
         if not hasattr(self, 'prev_bwd_step_count'):
@@ -1514,7 +1655,7 @@ class Modeller:
         if not hasattr(self, 'replay_buffer'):
             if elig.numel() == 0:
                 return
-            add_inds = elig[:self.args.replay_buffer.max_size]
+            add_inds = elig[:self.args.buffers.replay_buffer.max_size]
             self.replay_buffer = CrystalBuffer(
                 sample_batch.subsample_new_batch(add_inds),
                 device='cpu',
@@ -1532,7 +1673,7 @@ class Modeller:
             self.replay_buffer.purge_by_index(toxic)  # buffer reindexes; read ema_loss AFTER this
 
         # --- fill freed + spare slots, then beat-the-min for the rest ---
-        headroom = max(0, self.args.replay_buffer.max_size - len(self.replay_buffer))
+        headroom = max(0, self.args.buffers.replay_buffer.max_size - len(self.replay_buffer))
         free = elig[:headroom]
         over_idx = elig[headroom:]
         over_resid = cand_resid[headroom:]
@@ -1560,7 +1701,7 @@ class Modeller:
 
         # --- random churn: guard against domination by rare correlated events ---
         num_replay_steps = self.replay_step_delta()
-        n_churn = int(num_replay_steps * self.args.replay_buffer.random_churn_rate)
+        n_churn = int(num_replay_steps * self.args.buffers.replay_buffer.random_churn_rate)
         n_churn = min(n_churn, len(self.replay_buffer))
         if n_churn > 0:
             purge_idx = torch.randperm(len(self.replay_buffer))[:n_churn]
@@ -1579,6 +1720,54 @@ class Modeller:
                     init_loss=resid[add_choice],
                 )
 
+    def manage_anchor_buffer(self, reward, sample_batch):
+        """
+        Admit high-quality, mutually latent-distinct samples from a freshly
+        generated (never buffer-replayed) batch into the permanent anchor
+        archive. See AnchorBuffer.admit for the admission/dedup policy.
+
+        Only called at eval cadence (from fwd_eval_sampling -- see its call
+        sites below), not from every training step. Late in training there
+        can be an extreme abundance of high-reward on-policy samples, and
+        both admit()'s incremental dedup and the periodic full thin() pass
+        get expensive if run every fwd/fused step; eval cadence keeps that
+        bounded on the assumption that the forward policy isn't discovering
+        anything genuinely new that on-policy eval sampling won't also see.
+        """
+        cfg = self.args.buffers.anchor_buffer
+
+        if not hasattr(self, 'anchor_buffer'):
+            reward = torch.as_tensor(reward).detach().cpu().flatten()
+            if reward.numel() == 0:
+                return
+            if cfg.admit_range is not None:
+                # no anchor buffer yet to anchor the gate to -- fall back to this
+                # batch's own best as the reference point
+                floor = reward.max().item() - cfg.admit_range
+                keep = torch.nonzero(reward > floor, as_tuple=False).flatten()
+            else:
+                keep = torch.arange(reward.numel())
+            if keep.numel() == 0:
+                return
+            self.anchor_buffer = AnchorBuffer(
+                sample_batch.subsample_new_batch(keep),
+                device='cpu',
+                reward=reward[keep],
+                max_z_prime=max(self.args.z_primes),
+            )
+            self.anchor_buffer.thin(cfg.dist_cutoff)  # dedup within the bootstrap batch itself
+            return
+
+        self.anchor_buffer.admit(
+            sample_batch,
+            reward,
+            dist_cutoff=cfg.dist_cutoff,
+            admit_range=cfg.admit_range,
+        )
+
+        if len(self.anchor_buffer) > cfg.max_size:
+            self.anchor_buffer.thin(cfg.dist_cutoff, max_size=cfg.max_size)
+
     def sample_from_prior(self, num_samples):
         "sample from prior"
         eval_discretizer = lambda bsz: uniform_discretizer(bsz, self.args.eval_T)
@@ -1593,8 +1782,8 @@ class Modeller:
         else:
             buffer_length = len(self.prior_buffer)
 
-        missing = self.args.prior_buffer.max_size - buffer_length
-        num_samples = min(self.args.prior_buffer.min_size, missing)
+        missing = self.args.buffers.prior_buffer.max_size - buffer_length
+        num_samples = min(self.args.buffers.prior_buffer.min_size, missing)
         if num_samples > 0:
             metrics, sample_batch = self.sample_from_prior(num_samples)
 
@@ -1677,6 +1866,12 @@ class Modeller:
         pooled['log_Z'] = logmeanexp(log_weight)
         pooled['log_Z_lb'] = log_weight.mean()
         pooled['log_Z_learned'] = pooled['log_flow'][:, 0]
+
+        # covers both evaluation()'s on-policy eval sampling and sample_from_prior's
+        # prior-model sampling (itself called from manage_prior_buffer's churn and
+        # grow_prior_buffer's init-time bootstrap) -- both are freshly generated,
+        # freshly scored batches, so both are valid anchor candidates
+        self.manage_anchor_buffer(pooled['log_r'], sample_batch)
 
         self.times['eval_sampling_end'] = time()
 

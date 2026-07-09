@@ -4,6 +4,16 @@ batch_growth_increment: 1.01
 batch_growth_slow_increment: 1.002
 batch_size: 25
 both_ways: true
+buffers:
+  prior_buffer:
+    max_size: 100000
+    mean_lifetime: 100
+    min_size: 10000
+    reward_min: -1000
+    reward_range: 100
+  replay_buffer:
+    max_size: 100000
+    random_churn_rate: 50
 bwd: false
 bwd_loss_coeffs:
   beta: 10
@@ -136,17 +146,9 @@ oom_batch_shrink_factor: 0.6
 oom_cooldown_steps: 200
 override_learning_rates: false
 override_loss_coeffs: false
-prior_buffer:
-  max_size: 100000
-  mean_lifetime: 100
-  min_size: 10000
-  reward_min: -1000
 prior_model_name: null
 prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_prior_dataset.pt
 repeats: 1
-replay_buffer:
-  max_size: 100000
-  random_churn_rate: 50
 replay_loss_coeffs:
   beta: 10
   bwd_tb_z: 0.0

@@ -168,20 +168,22 @@ controller:
   lookahead_horizon: 5  # controller ticks (each ~10 train steps) to extrapolate metrics ahead before thresholding, to avoid overshooting a regime swap
   lookahead_trend_alpha: 0.1  # EMA smoothing on the estimated per-tick trend (already-EMA'd metrics only need trend smoothing, not a second level EMA)
 
-# buffer
-prior_buffer:
-  mean_lifetime: 100 # batch size adjusted mean lifetime to buffer samples
-  min_size: 10000
-  max_size: 100000
-  reward_min: -1000 # minimum allowed reward to be admitted to buffer
+buffers:
+  # buffer
+  prior_buffer:
+    mean_lifetime: 100 # batch size adjusted mean lifetime to buffer samples
+    min_size: 10000
+    max_size: 100000
+    reward_min: -1000 # minimum allowed reward to be admitted to buffer
+    reward_range: 100 # nats above reward_min over which quick_tb_stats' weighted_under_coverage ramps sample weight 0->1
 
-# trajectory replay buffer - stores full forward trajectories of overweighted on-policy
-# samples (residual > buffer_resid_cutoff) so they can later be exactly replayed
-# (get_traj_replay) during the "replay" training step instead of re-sampled backward from
-# the terminal state alone
-replay_buffer:
-  random_churn_rate: 50  # number of random samples to add/purge per replay train step
-  max_size: 100000  # if this is too big, or takes too long to churn, it becomes a lagging indicator
+  # trajectory replay buffer - stores full forward trajectories of overweighted on-policy
+  # samples (residual > buffer_resid_cutoff) so they can later be exactly replayed
+  # (get_traj_replay) during the "replay" training step instead of re-sampled backward from
+  # the terminal state alone
+  replay_buffer:
+    random_churn_rate: 50  # number of random samples to add/purge per replay train step
+    max_size: 100000  # if this is too big, or takes too long to churn, it becomes a lagging indicator
 
 # energy function settings
 ################################################################

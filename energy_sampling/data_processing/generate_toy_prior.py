@@ -8,7 +8,7 @@ path = r'D:\crystal_datasets\conditional\priors'
 os.chdir(path)
 p1 = torch.load('14_1_elj.pt', weights_only=False)  # load a dummy file
 
-enfunc = 'latent_multiharmonic'
+enfunc = 'latent_harmonic'
 
 p1['prior'].reset_sg_info(1)
 p1['equalized_prior'].reset_sg_info(1)
@@ -25,18 +25,20 @@ l1 = p1['prior'].latent_params()
 l2 = big_prior.latent_params()
 
 sbatch = deepcopy(prior)
-condition = torch.zeros(8)
-width = 1.0
+condition = torch.ones(12) * 0.5
+width = 0.1
 target_temperature = 1.0
 
 if enfunc == 'latent_harmonic':
     new_lat = sbatch.sample_latent_harmonic(n_samples=prior.num_graphs,
                                             width=width,
                                             target_temperature=target_temperature,
+                                            c=condition
                                             )
     new_lat2 = sbatch.sample_latent_harmonic(n_samples=big_prior.num_graphs,
                                              width=width,
                                              target_temperature=target_temperature,
+                                             c=condition,
                                              )
 elif enfunc == 'latent_multiharmonic':
     new_lat = sbatch.sample_latent_multiharmonic(n_samples=prior.num_graphs,
@@ -49,6 +51,10 @@ elif enfunc == 'latent_multiharmonic':
                                                   width=width,
                                                   target_temperature=target_temperature
                                                   )
+eps = 1e-3
+new_lat = new_lat.clamp(min=-1 + eps, max=1 - eps)
+new_lat2 = new_lat2.clamp(min=-1 + eps, max=1 - eps)
+
 prior.latent_to_cell_params(new_lat)
 big_prior.latent_to_cell_params(new_lat2)
 

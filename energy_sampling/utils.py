@@ -1206,7 +1206,14 @@ class MetricTracker:
             self.last_it[d] = step
 
 
-def quick_tb_stats(log_pf, log_pb, log_Z, log_r):
+def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, reward_ramp_range=None):
+    """
+    reward_floor/reward_ramp_range gate under_coverage by a reward ramp (see
+    weighted_under_coverage spec): w_raw = clamp((log_r - floor) / ramp_range, 0, 1),
+    self-normalized, so a heavy low-reward tail can't inflate under_coverage while
+    real (even if modest) modes still register. Pass both as None to fall back to the
+    old uniform-RMS behavior (also always reported as 'under_coverage_uniform').
+    """
     x = (log_pb + log_r).detach()
     y = (log_pf + log_Z).detach()
     resid = y - x  # TB residual
@@ -1226,9 +1233,15 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r):
     skew = (resid_c.pow(3).mean() / resid_c.pow(2).mean().pow(1.5).clamp_min(1e-8))
 
     # Under-weighted trajectories
-    neg = resid.clamp(max=0)  # 0 where resid >= 0, negative elsewhere
-    under_severity = neg.pow(2).mean().sqrt().item()  # RMS of negative residuals
-    pos = resid.clamp(min=0)
+    neg = resid.clamp(max=0)  # 0 where resid >= 0, negative elsewhere (RAW resid, not centered)
+    under_severity_uniform = neg.pow(2).mean().sqrt().item()  # RMS of negative residuals
+    if reward_floor is not None and reward_ramp_range is not None:
+        w_raw = ((log_r.detach() - reward_floor) / reward_ramp_range).clamp(0, 1)
+        w = w_raw / w_raw.sum().clamp_min(1e-8)
+        under_severity = (w * neg.pow(2)).sum().sqrt().item()  # reward-weighted RMS of negatives
+    else:
+        under_severity = under_severity_uniform
+    pos = resid.clamp(min=0)  # over_coverage stays uniform: replay must see over-weighted junk
     over_severity = pos.pow(2).mean().sqrt().item()
 
     log_ess = 2 * torch.logsumexp(log_w, dim=0) - torch.logsumexp(2 * log_w, dim=0)
@@ -1243,6 +1256,7 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r):
         'jensen_z_err': (log_w - log_Z.detach()).abs().mean().item(),
         'emp_z_err': (z_emp - z_learned).abs().item(),
         'under_coverage': under_severity,
+        'under_coverage_uniform': under_severity_uniform,
         'over_coverage': over_severity,
         'z_gap': (z_emp - z_jensen).item(),
         'resid_p05': resid.detach().quantile(0.05).item(),

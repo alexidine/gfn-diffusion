@@ -585,11 +585,11 @@ class CrystalBuffer:
             'y_fn': self.y_fn,
             'x': self.x.cpu(),
             'y': self.y.cpu() if self.y is not None else None,
-            'ema_loss': self.ema_loss,
-            'select_counts': self.select_counts,
-            'ema_logw': self.ema_logw,
-            'ema_logw_sq': self.ema_logw_sq,
-            'ema_log_z_emp': self.ema_log_z_emp,
+            'ema_loss': self.ema_loss.cpu(),
+            'select_counts': self.select_counts.cpu(),
+            'ema_logw': self.ema_logw.cpu(),
+            'ema_logw_sq': self.ema_logw_sq.cpu(),
+            'ema_log_z_emp': self.ema_log_z_emp.cpu(),
             'traj': self.traj.cpu() if self.traj is not None else None,
         }
 
@@ -603,11 +603,14 @@ class CrystalBuffer:
         obj.batch = state['batch'].to(device)
         obj.x = state['x'].to(device)
         obj.y = state['y'].to(device) if state['y'] is not None else None
-        obj.ema_loss = state['ema_loss']
-        obj.select_counts = state['select_counts']
-        obj.ema_logw = state['ema_logw']
-        obj.ema_logw_sq = state['ema_logw_sq']
-        obj.ema_log_z_emp = state['ema_log_z_emp']
+        # These are CPU-resident bookkeeping tensors, but torch.load's map_location
+        # remaps every tensor in the pickle (even nested ones), so force them back
+        # to cpu here regardless of what device the checkpoint was loaded onto.
+        obj.ema_loss = state['ema_loss'].cpu()
+        obj.select_counts = state['select_counts'].cpu()
+        obj.ema_logw = state['ema_logw'].cpu()
+        obj.ema_logw_sq = state['ema_logw_sq'].cpu()
+        obj.ema_log_z_emp = state['ema_log_z_emp'].cpu()
         obj.traj = state['traj'].to(device) if state['traj'] is not None else None
         return obj
 
@@ -1210,6 +1213,249 @@ class CrystalBuffer:
         p = np.clip(p, epsilon, None)  # floor before renorm
         p /= p.sum()
         return p
+
+
+def bottom_up_cluster(xx, e, d_cut, e_cut, max_new_samples: int, device):
+    """
+    Greedily keep the lowest-e point in each d_cut neighborhood: sort by e
+    ascending, accept a point if it isn't already blocked by an accepted
+    neighbor, then block everything within d_cut of it. Standalone (not a
+    buffer method) so it can be reused without depending on the legacy
+    CrystalReplayBuffer this pattern originated in.
+    """
+    sort_inds = torch.argsort(e.to(device))
+    xx_sorted = xx.to(device)[sort_inds]
+    e_sorted = e.to(device)[sort_inds]
+    mask = e_sorted < e_cut
+
+    blocked = torch.zeros(len(xx_sorted), dtype=torch.bool, device=device)
+    keep = torch.zeros(len(xx_sorted), dtype=torch.bool, device=device)
+    d_cut_squared = d_cut * d_cut
+    for i in range(len(xx_sorted)):
+        if not mask[i]:
+            break
+
+        if blocked[i]:
+            continue
+
+        keep[i] = True
+        if torch.sum(keep) == max_new_samples:
+            break
+
+        drow = ((xx_sorted - xx_sorted[i, None, :]) ** 2).sum(-1)  # faster, skips sqrt
+        nearby = drow < d_cut_squared
+        blocked |= nearby
+
+    keep_inds = sort_inds[keep]
+
+    return keep_inds.cpu()
+
+
+class AnchorBuffer(CrystalBuffer):
+    """
+    Permanent archive of high-quality, mutually latent-distinct samples.
+
+    Grows only through admit(); nothing is evicted by ordinary training
+    churn -- only thin() or an explicit purge_by_index() call can shrink it.
+    purge()/purge_lowest() are inherited from CrystalBuffer but are EMA-loss
+    driven churn mechanisms with no meaning here (anchors are never trained
+    against directly) and should not be called on an AnchorBuffer.
+
+    Reward is stored explicitly per entry (self.reward) rather than derived
+    on demand from the resident batch, because temperature isn't persisted
+    per-graph -- condition_samples returns it as a separate tensor rather
+    than writing it back onto the batch, so re-deriving reward later would
+    require re-sampling temperature, which is wrong under
+    temperature_conditioning=True.
+    """
+
+    def __init__(
+            self,
+            data,
+            device,
+            reward,
+            max_z_prime: int = 1,
+            x_fn=None,
+    ):
+        super().__init__(data, device, max_z_prime=max_z_prime, x_fn=x_fn, y_fn=None)
+        n = len(self)
+        self.reward = torch.as_tensor(reward, dtype=torch.float32).detach().cpu().flatten()
+        assert self.reward.shape[0] == n, \
+            f"reward has {self.reward.shape[0]} entries, expected {n} to match dataset size"
+
+    # ---------------------------------------------------------------------
+    # Persistence
+    # ---------------------------------------------------------------------
+
+    def state_dict(self):
+        state = super().state_dict()
+        state['reward'] = self.reward.cpu()
+        return state
+
+    @classmethod
+    def from_state_dict(cls, state, device):
+        obj = super(AnchorBuffer, cls).from_state_dict(state, device)
+        obj.reward = state['reward'].cpu()
+        return obj
+
+    # ---------------------------------------------------------------------
+    # Mutation
+    # ---------------------------------------------------------------------
+
+    @torch.no_grad()
+    def add(self, data, reward, traj=None, init_loss=None):
+        reward = torch.as_tensor(reward, dtype=torch.float32).detach().cpu().flatten()
+        n_before = len(self)
+        super().add(data, traj=traj, init_loss=init_loss)
+        k = len(self) - n_before
+        assert reward.shape[0] == k, \
+            f"reward has {reward.shape[0]} entries, expected {k} to match added batch size"
+        self.reward = torch.cat([self.reward, reward], dim=0)
+
+    @torch.no_grad()
+    def purge_by_index(self, indices_to_remove):
+        n = len(self)
+        if n == 0:
+            return
+        indices_to_remove = np.asarray(indices_to_remove, dtype=int)
+        if indices_to_remove.size == 0:
+            return
+
+        drop = np.zeros(n, dtype=bool)
+        drop[indices_to_remove] = True
+        keep_cpu = torch.as_tensor(np.flatnonzero(~drop), dtype=torch.long)
+
+        super().purge_by_index(indices_to_remove)
+        self.reward = self.reward[keep_cpu]
+
+    @torch.no_grad()
+    def admit(self, candidate_batch, reward, dist_cutoff, admit_range: Optional[float] = None):
+        """
+        Filter (candidate_batch, reward) down to whatever clears the gate
+        (self.reward.max() - admit_range), then greedily admit survivors --
+        processed best-reward-first -- against a reference set seeded with
+        the current anchors and grown as candidates are accepted. A survivor
+        within dist_cutoff of the nearest reference point only displaces it
+        if strictly better; otherwise it's dropped. This handles both
+        intra-batch duplicates and duplicates against existing anchors in
+        one pass, and never evicts an existing anchor except by something
+        strictly better appearing within dist_cutoff of it -- so an
+        isolated, merely-adequate anchor is never displaced just for being
+        rare.
+
+        The gate is relative to the buffer's own current best reward rather
+        than an absolute number, so it automatically tracks the achievable
+        reward scale as it rises over training. admit_range=None disables
+        the gate entirely (every candidate considered).
+
+        Cost is bounded by the gate: the O(candidates x |buffer|) distance
+        work below only ever runs on whatever clears it, which is what keeps
+        this cheap enough to call regularly as long as admit_range is set to
+        something only a small fraction of a batch clears.
+
+        Returns the number of anchors admitted or replaced.
+        """
+        reward = torch.as_tensor(reward, dtype=torch.float32).detach().cpu().flatten()
+        if reward.numel() == 0:
+            return 0
+
+        if admit_range is not None:
+            floor = self.reward.max().item() - admit_range
+            keep = torch.nonzero(reward > floor, as_tuple=False).flatten()
+        else:
+            keep = torch.arange(reward.numel())
+        if keep.numel() == 0:
+            return 0
+
+        candidate_batch = candidate_batch.subsample_new_batch(keep)
+        reward = reward[keep]
+
+        if self.x_fn is None:
+            cand_x = candidate_batch.latent_params()
+        elif callable(self.x_fn):
+            cand_x = self.x_fn(candidate_batch)
+        else:
+            cand_x = candidate_batch[self.x_fn]
+        cand_x = cand_x.detach().to(self.device).contiguous()
+
+        order = torch.argsort(reward, descending=True)
+
+        ref_x = self.x.clone()
+        ref_reward = self.reward.clone()
+        n_existing = ref_x.shape[0]
+
+        replace_map = {}      # existing-anchor slot idx -> winning local candidate idx
+        new_slot_owner = []   # local candidate idx currently occupying each newly created slot
+
+        for local_idx in order.tolist():
+            x_i = cand_x[local_idx:local_idx + 1]
+            r_i = reward[local_idx]
+
+            if ref_x.shape[0] > 0:
+                d = torch.cdist(x_i, ref_x).flatten()
+                nn_val, nn_pos = d.min(0)
+                nn_val = nn_val.item()
+                nn_pos = int(nn_pos.item())
+            else:
+                nn_val = float('inf')
+                nn_pos = -1
+
+            if nn_val <= dist_cutoff:
+                if r_i.item() > ref_reward[nn_pos].item():
+                    if nn_pos < n_existing:
+                        replace_map[nn_pos] = local_idx
+                    else:
+                        new_slot_owner[nn_pos - n_existing] = local_idx
+                    ref_x[nn_pos] = x_i[0]
+                    ref_reward[nn_pos] = r_i
+                # else: candidate is a worse duplicate -- dropped
+            else:
+                new_slot_owner.append(local_idx)
+                ref_x = torch.cat([ref_x, x_i], dim=0)
+                ref_reward = torch.cat([ref_reward, r_i[None]], dim=0)
+
+        n_admitted = len(replace_map) + len(new_slot_owner)
+        if n_admitted == 0:
+            return 0
+
+        if replace_map:
+            self.purge_by_index(list(replace_map.keys()))
+
+        add_local = list(replace_map.values()) + new_slot_owner
+        add_inds = torch.tensor(add_local, dtype=torch.long)
+        self.add(candidate_batch.subsample_new_batch(add_inds), reward=reward[add_inds])
+
+        return n_admitted
+
+    @torch.no_grad()
+    def thin(self, dist_cutoff, max_size: Optional[int] = None):
+        """
+        Full O(N^2) dedup pass over the whole buffer: greedily keep the
+        highest-reward representative in each dist_cutoff neighborhood
+        (bottom_up_cluster on -reward), correcting any drift admit()'s
+        incremental/approximate process leaves behind. If the buffer is
+        still over max_size afterward, additionally drops the lowest-reward
+        excess -- the one place a rare-but-passable anchor can be evicted
+        purely for space, i.e. the "explicitly thinned out" escape hatch.
+        """
+        n = len(self)
+        if n == 0:
+            return
+
+        device = 'cuda' if torch.cuda.is_available() else self.device
+        keep_inds = bottom_up_cluster(
+            self.x, -self.reward, d_cut=dist_cutoff, e_cut=float('inf'),
+            max_new_samples=n, device=device,
+        )
+        drop = np.setdiff1d(np.arange(n), keep_inds.numpy())
+        if drop.size > 0:
+            self.purge_by_index(drop)
+
+        if max_size is not None and len(self) > max_size:
+            excess = len(self) - max_size
+            order = torch.argsort(self.reward)  # ascending -- worst first
+            self.purge_by_index(order[:excess].numpy())
+
 
 '''
 import plotly.graph_objects as go
