@@ -291,7 +291,8 @@ class GFN(nn.Module):  # todo add seeding
         return pf_mean, logvar, d, V, s_emb, t_emb
 
     def get_traj_fwd(self, initial_state, discretizer, exploration_std, condition, mol_batch,
-                     return_gauss_params: bool = False, detach_traj: bool = True):
+                     return_gauss_params: bool = False, detach_traj: bool = True,
+                     freeze_policy: bool = False):
         batch_size = initial_state.shape[0]
         ts = discretizer(batch_size).to(self.device)
         trajectory_length = ts.shape[1] - 1
@@ -307,6 +308,8 @@ class GFN(nn.Module):  # todo add seeding
             else:  # constant embedding
                 condition_embedding = torch.zeros((batch_size, self.condition_embedding_dim),
                                                   dtype=torch.float32, device=self.device)
+            if freeze_policy:  # Z-only training: cut gradient to the conditioner at the source
+                condition_embedding = condition_embedding.detach()
         else:
             condition_embedding = None
 
@@ -385,7 +388,8 @@ class GFN(nn.Module):  # todo add seeding
         return scalar_embedding
 
     def get_traj_bwd(self, terminal_state, discretizer, condition, mol_batch,
-                     return_gauss_params: bool = False, detach_traj: bool = False):
+                     return_gauss_params: bool = False, detach_traj: bool = False,
+                     freeze_policy: bool = False):
         batch_size = terminal_state.shape[0]
         ts = discretizer(batch_size).to(self.device)
         trajectory_length = ts.shape[1] - 1
@@ -401,6 +405,8 @@ class GFN(nn.Module):  # todo add seeding
             else:  # constant embedding
                 condition_embedding = torch.zeros((batch_size, self.condition_embedding_dim),
                                                   dtype=torch.float32, device=self.device)
+            if freeze_policy:  # Z-only training: cut gradient to the conditioner at the source
+                condition_embedding = condition_embedding.detach()
         else:
             condition_embedding = None
 
@@ -466,7 +472,7 @@ class GFN(nn.Module):  # todo add seeding
             return states, logpfs, logpbs, log_flow
 
     def get_traj_replay(self, trajectory, discretizer, condition, mol_batch,
-                        return_gauss_params: bool = False):
+                        return_gauss_params: bool = False, freeze_policy: bool = False):
         """
         Recompute log_flow, logpf and logpb for a fixed batch of trajectories
         (e.g., replayed from a buffer), instead of generating them. Mirrors
@@ -495,6 +501,8 @@ class GFN(nn.Module):  # todo add seeding
             else:  # constant embedding
                 condition_embedding = torch.zeros((batch_size, self.condition_embedding_dim),
                                                   dtype=torch.float32, device=self.device)
+            if freeze_policy:  # Z-only training: cut gradient to the conditioner at the source
+                condition_embedding = condition_embedding.detach()
         else:
             condition_embedding = None
 
@@ -536,6 +544,13 @@ class GFN(nn.Module):  # todo add seeding
         pass whatever index condition already identifies it, since fwd/replay
         and bwd walk the step index in opposite directions). With full_flow
         on, every step gets its own state/time-dependent value at full_flow_idx.
+
+        Z-only training (freeze_policy) is handled upstream by detaching
+        condition_embedding at its source (see get_traj_fwd/bwd/replay), so the
+        flow head trains its own parameters while the conditioner stays frozen.
+        NB: that source detach isolates flow_model only while full_flow is off;
+        under full_flow the flow head reads [s_emb, t_emb], so it would still
+        train s_model -- revisit here if full_flow + freeze_policy is ever used.
         """
         if not self.full_flow:
             if write_constant_flow:

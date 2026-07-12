@@ -159,7 +159,7 @@ def sample_eval_fwd_trajs(init_state,
                           mol_batch, no_conditioning: bool = False,
                           sg_inds=None, z_primes=None,
                           temperatures: torch.tensor = None):
-    mol_batch, log_T_tensor, sg_inds, zps, condition = energy_function.condition_samples(
+    mol_batch, log_T_tensor, sg_inds, zps, condition, condition_id = energy_function.condition_samples(
         mol_batch, sg_inds=sg_inds, z_primes=z_primes, temperature=temperatures)
 
     condition = condition.to(gfn_model.device)
@@ -183,6 +183,7 @@ def sample_eval_fwd_trajs(init_state,
         'log_T_tensor': cpu(log_T_tensor),
         'sample_batch': sample_batch.cpu().detach(),
         'gauss_params': {k: cpu(v) for k, v in gauss_params.items()},
+        'condition_id': cpu(condition_id),
     }
 
 

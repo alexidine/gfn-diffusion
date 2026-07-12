@@ -1,0 +1,92 @@
+# Config for generate_toy_prior.py.
+seed: 0
+
+# any existing prior/molecule .pt works -- only its crystal-structure
+# scaffolding (molecule graph, cell system, etc.) is reused; its latents
+# and energies are discarded and regenerated from scratch below
+template_path: D:\crystal_datasets\conditional\priors\14_1_elj.pt
+
+output_dir: D:\crystal_datasets\conditional\priors
+tag: toy_2cond   # used to build default output filenames
+
+# 'latent_harmonic' or 'latent_multiharmonic' -- see the module docstring in
+# generate_toy_prior.py for why latent_harmonic can only ever be baked one
+# condition per batch (this script already does that), and why
+# latent_multiharmonic's condition vectors don't need to be the same
+# dimensionality as the latent space (they default to 8-dim regardless of
+# data_ndim -- see mxtaltools' _build_latent_field(cond_dim=...))
+energy_function: latent_multiharmonic
+
+# the preset library of unique toy conditions -- each becomes one distinct
+# `identifier` in the condition set / prior, and one axis of condition_id
+# once loaded as molecules_path / prior_path in training
+conditions:
+  - identifier: mode_a
+    c: [ 1, 1, 1, 1, 1, 1, 1, 1, 1,1,1,1 ]
+    width: 1.5
+  - identifier: mode_b
+    c: [ -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 ]
+    width: 1.0
+
+# optional: if enabled, the `conditions` above are treated as ANCHORS and
+# expanded (see expand_condition_manifold in generate_toy_prior.py) into a
+# much larger set of unnamed draws spanning the connected region between
+# them -- random convex (Dirichlet) combinations of the anchors' own
+# (c, width), reducing to uniform-on-a-line for 2 anchors -- for testing
+# generalization over a continuous manifold rather than at fixed discrete
+# modes. All draws share ONE identifier (below), so downstream per-condition
+# bookkeeping (identifier_registry / ConditionLogZTracker) and
+# coverage_check's ESS/histograms treat the whole manifold as a single
+# pooled distribution rather than exploding into one entry per draw.
+# NOTE: total graphs generated = (n_conditions [+ len(conditions) if
+# include_anchors] ) * condition_set.n_replicas_per_condition -- turn down
+# n_replicas_per_condition when enabling this (e.g. 2-10) or the condition
+# set/prior will get huge.
+condition_manifold:
+  enabled: false
+  identifier: manifold_ab
+  n_conditions: 200        # number of distinct manifold draws
+  noise_std: 0.0           # optional isotropic Gaussian jitter added after interpolation
+  include_anchors: true    # also keep the exact anchor points themselves in the set
+
+# the molecules_path-type object: crystal-structure scaffolding + c/width/
+# identifier per condition, no baked energy needed (forward sampling always
+# recomputes energy fresh from whatever latents the GFN produces)
+condition_set:
+  generate: true
+  n_replicas_per_condition: 500   # lower this (e.g. 2-10) if condition_manifold.enabled
+  output_name: null   # null -> {tag}_conditions.pt
+
+# the prior_path-type object -- see the module docstring for full detail on
+# both modes:
+#   mode: shared        -- ONE zero-centered (shared_center) Gaussian, wide
+#                           enough (shared_width) to cover every condition,
+#                           with no knowledge of which condition a given
+#                           draw will end up labeled with (the actual
+#                           "broad unconditional prior")
+#   mode: per_condition  -- for later: each condition gets its own Gaussian
+#                           centered on that condition's own c, scaled up by
+#                           width_multiplier
+# Either way energy is baked under each labeled sample's own (narrow)
+# condition width, and every analyze() call only ever contains one
+# condition at a time.
+prior:
+  generate: true
+  mode: shared
+  shared_center: null    # null -> zeros(data_ndim); only used in shared mode
+  shared_width: 0.35       # must be wide enough to cover every condition's c and width; only used in shared mode
+  width_multiplier: 2     # prior width = condition width * this; only used in per_condition mode
+  n_samples_per_condition: 2000   # per cfg.conditions entry -- lower this too if condition_manifold.enabled
+  equalized_n_samples_per_condition: 20000
+  target_temperature: 1.0
+  output_name: null   # null -> {tag}_prior.pt
+
+# empirical confirmation of q_target << q_prior via self-normalized
+# importance-sampling ESS (prior as proposal, target as the distribution of
+# interest) -- plus a visual histogram comparison, for inspection
+coverage_check:
+  run: true
+  n_is_samples: 5000
+  min_ess_frac: 0.01
+  show_figures: true
+  save_figures: false

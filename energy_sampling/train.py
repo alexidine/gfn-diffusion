@@ -3,7 +3,6 @@ import math
 import os
 from collections import defaultdict
 from copy import deepcopy
-from pathlib import Path
 from typing import Optional
 
 from energy_sampling.eval.evaluations import to_loggable, sliced_wasserstein, adjust_fig_filesize, eval_figs, \
@@ -20,50 +19,66 @@ from time import time
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import wandb
 from torch.optim import lr_scheduler
 from tqdm import trange
 
 from energies.molecular_crystal import MolecularCrystal
-from energy_sampling.buffer import CrystalBuffer, AnchorBuffer
+from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker, _per_condition_min, \
+    _per_condition_max, strip_lazy_sg_caches
+from energy_sampling.checkpointing import Checkpointer, MODELLER_STATE_DEFAULTS
+from energy_sampling.controller import ModeBalanceController
 from energy_sampling.eval.utils import sample_eval_fwd_trajs, LossSpikeMonitor
 from energy_sampling.utils import is_cuda_oom, get_annealing_factor, \
     parse_loss_schedules, dict2namespace, update_loss_schedule, \
-    atomic_save, get_discretizer, log_elapsed_times, MetricTracker, quick_tb_stats, uniform_discretizer, logmeanexp, \
+    get_discretizer, log_elapsed_times, MetricTracker, quick_tb_stats, uniform_discretizer, logmeanexp, \
     cal_subtb_coef_matrix
-from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss
+from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss, log_pf_estimate
 from models import GFN
 from mxtaltools.common.training_utils import flatten_wandb_params
+from mxtaltools.dataset_utils.utils import collate_data_list
 from utils import get_train_args, get_gfn_init_state, set_seed, \
     update_ema, get_problem_definition, problem_hash, problem_slug
 
-MODELLER_STATE_DEFAULTS = {
-    'step_ind': 0,
-    'phase': 1,
-    'batch_size': 1,
-    'batch_size_ever_oomed': False,  # flips permanently once we've OOM'd at least once - switches growth from fast slow-start to slow congestion-avoidance
-    'batch_size_cooldown_until': -1,  # step_ind until which batch size growth is frozen after a cut
-    'lr_warmup_finished': False,
-    'hit_init_kld': False,
-    'grow_buffer': False,
-    'fwd_loss_schedule': {},
-    'bwd_loss_schedule': {},
-    'replay_loss_schedule': {},
-    'bwd_sampling_mode': 'dataset',
-    'fwd_step_count': 0,
-    'bwd_step_count': 0,
-    'replay_step_count': 0,
-    'fwd_frac': 0.0,
-    'bwd_frac': 1.0,
-    'replay_frac': 0.0,
-    'combo_loss_record': [],
-    'controller_anneal_streak': 0,
-    'controller_lookahead': {
-        'under': {'level': None, 'trend': 0.0},
-        'over': {'level': None, 'trend': 0.0},
-        'zerr': {'level': None, 'trend': 0.0},
-    },
-}
+
+def safe_histogram(data, num_bins=32):
+    """
+    wandb.Histogram that tolerates degenerate input. numpy's histogram raises
+    "Too many bins for data range" not only on constant data but on any tiny
+    float32 range -- the reported crash was a log-temperature array with amax
+    3.1659272 / amin 3.165927 (range ~2e-7), which overflows float32 bin-edge
+    math even though it is nominally non-constant. Casting to float64 gives
+    enough headroom to bin such data; empty/all-nonfinite and exactly-constant
+    inputs (e.g. a Jensen gap that is all-zeros before conditions diverge) get an
+    explicit single-bin histogram; and a try/except catches any residual
+    degenerate case so logging never crashes.
+    """
+    a = np.asarray(data, dtype=np.float64).ravel()
+    a = a[np.isfinite(a)]
+    if a.size == 0:
+        return wandb.Histogram(np_histogram=([0], [0.0, 1.0]))
+    lo, hi = float(a.min()), float(a.max())
+    if hi > lo:
+        try:
+            return wandb.Histogram(a, num_bins=num_bins)
+        except ValueError:
+            pass
+    return wandb.Histogram(np_histogram=([int(a.size)], [lo - 0.5, lo + 0.5]))
+
+
+def loggable_array(a, num_bins=32):
+    """
+    Prep an array-valued metric for wandb.log. wandb auto-compresses any raw
+    array (>32 elements) into a 32-bin histogram via the same fragile
+    numpy.histogram path safe_histogram guards -- so build the histogram
+    ourselves instead of handing wandb a raw array. Size<=1 (incl. 0-d) reduces
+    to a plain scalar.
+    """
+    a = np.nan_to_num(np.asarray(a, dtype=np.float64)).ravel()
+    if a.size <= 1:
+        return float(a[0]) if a.size else 0.0
+    return safe_histogram(a, num_bins=num_bins)
 
 
 class Modeller:
@@ -73,6 +88,33 @@ class Modeller:
         torch.cuda.set_per_process_memory_fraction(self.args.cuda_memory_fraction, device=0)
         torch.cuda.init()  # create context with the cap already in place
 
+        self.init_loss_spike_monitors()
+
+        set_seed(self.args.seed)
+        if 'SLURM_PROCID' in os.environ:
+            self.args.seed += int(os.environ["SLURM_PROCID"])
+
+        if self.args.both_ways and self.args.bwd:
+            print("both ways and bwd only are mutually exclusive, ignoring bwd")
+            self.args.bwd = False
+
+        config = self.args.__dict__
+        config["Experiment"] = "{args.energy}"
+        self.run_name = str(self.args.tag) + '_' + str(self.args.run_name)
+
+        # fingerprint of the energy function + prior this run is training against,
+        # as opposed to training hyperparameters - see checkpointer.save / checkpointer.path_for
+        self.problem_def = get_problem_definition(self.args)
+        self.problem_hash = problem_hash(self.problem_def)
+        self.problem_slug = problem_slug(self.args, self.problem_def)
+
+        self.times = {}
+        self.device = self.args.device
+        self.checkpointer = Checkpointer(self)
+        self.mode_balance_controller = ModeBalanceController(self)
+        self.init_train_constants()
+
+    def init_loss_spike_monitors(self):
         self.fwd_loss_monitor = LossSpikeMonitor(window=200, warmup=250, cooldown=100, ceiling_factor=100.0)
         self.bwd_loss_monitor = LossSpikeMonitor(window=200, warmup=250, cooldown=100, ceiling_factor=100.0)
         self.replay_loss_monitor = LossSpikeMonitor(window=200, warmup=250, cooldown=100, ceiling_factor=100.0)
@@ -82,27 +124,6 @@ class Modeller:
                               'replay': self.replay_loss_monitor,
                               'fused': self.fused_loss_monitor}
 
-        set_seed(self.args.seed)
-        if 'SLURM_PROCID' in os.environ:
-            self.args.seed += int(os.environ["SLURM_PROCID"])
-
-        if self.args.both_ways and self.args.bwd:
-            self.args.bwd = False
-
-        config = self.args.__dict__
-        config["Experiment"] = "{args.energy}"
-        self.run_name = str(self.args.tag) + '_' + str(self.args.run_name)
-
-        # fingerprint of the energy function + prior this run is training against,
-        # as opposed to training hyperparameters - see save_checkpoint / _checkpoint_path
-        self.problem_def = get_problem_definition(self.args)
-        self.problem_hash = problem_hash(self.problem_def)
-        self.problem_slug = problem_slug(self.args, self.problem_def)
-
-        self.times = {}
-        self.device = self.args.device
-        self.init_train_constants()
-
     def init_train_constants(self):
         for k, v in MODELLER_STATE_DEFAULTS.items():
             if k in self.args.__dict__:
@@ -111,129 +132,6 @@ class Modeller:
                 setattr(self, k, deepcopy(v))
 
         self.metric_tracker = MetricTracker(period=100)
-
-    def _get_modeller_state_dict(self):
-        return {k: getattr(self, k) for k in MODELLER_STATE_DEFAULTS}
-
-    def _set_modeller_state_dict(self, state):
-        for k, default in MODELLER_STATE_DEFAULTS.items():
-            setattr(self, k, state[k] if k in state else deepcopy(default))
-
-    def save_checkpoint(self, tag: str):
-        """
-        tag: 'best' | 'hit_prior' | 'thermalized' | 'final'
-        """
-        checkpoint = {
-            'tag': tag,
-            'run_name': self.run_name,
-            'gfn_config': self.gfn_config,  # store once, reload from here
-            'problem_def': self.problem_def,  # human-readable dict: energy function + prior this checkpoint solves
-            'problem_hash': self.problem_hash,  # fast fingerprint of problem_def, also embedded in the filename
-            'model_train': self.gfn_model.state_dict(),
-            'model_eval': self.ema_model.state_dict(),
-            'modeller_state': self._get_modeller_state_dict(),
-            'metrics': self.metric_tracker.state_dict(),
-            'optimizers': {k: opt.state_dict() for k, opt in self.optimizers.items()},
-            'prior_buffer': self.prior_buffer.state_dict() if hasattr(self, 'prior_buffer') else None,
-            'replay_buffer': self.replay_buffer.state_dict() if hasattr(self, 'replay_buffer') else None,
-            'anchor_buffer': self.anchor_buffer.state_dict() if hasattr(self, 'anchor_buffer') else None,
-        }
-        path = self._checkpoint_path(tag)
-        atomic_save(checkpoint, path)
-
-    def load_model_and_state(self, path, load_opt_state: bool = True):
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.gfn_config = checkpoint['gfn_config']
-        self.gfn_model = GFN(**self.gfn_config).to(self.device)
-        self.gfn_model.load_state_dict(checkpoint['model_train'])
-        self.ema_model = deepcopy(self.gfn_model)
-        self.ema_model.load_state_dict(checkpoint['model_eval'])
-
-        self.gfn_model.train()
-        self.ema_model.eval()
-
-        self._set_modeller_state_dict(checkpoint['modeller_state'])
-        self.metric_tracker.load_state_dict(checkpoint.get('metrics', {}))
-
-        if checkpoint.get('prior_buffer') is not None:
-            self.prior_buffer = CrystalBuffer.from_state_dict(checkpoint['prior_buffer'], device='cpu')
-        if checkpoint.get('replay_buffer') is not None:
-            self.replay_buffer = CrystalBuffer.from_state_dict(checkpoint['replay_buffer'], device='cpu')
-        if checkpoint.get('anchor_buffer') is not None:
-            self.anchor_buffer = AnchorBuffer.from_state_dict(checkpoint['anchor_buffer'], device='cpu')
-
-        if getattr(self.args, 'override_loss_coeffs', False):
-            # discard the schedule baked into the checkpoint so set_loss_coeffs()
-            # re-parses fwd/bwd/replay_loss_coeffs from the current config instead
-            self.fwd_loss_schedule = {}
-            self.bwd_loss_schedule = {}
-            self.replay_loss_schedule = {}
-
-        if load_opt_state:
-            self.init_schedulers_optimizers()
-            self.load_optimizer_state(checkpoint)
-
-            if getattr(self.args, 'override_learning_rates', False):
-                # overwrite just the numeric LR the checkpoint's optimizer state
-                # restored with this config's target rate - warmup/anneal status
-                # (lr_warmup_finished) and the schedulers themselves are untouched,
-                # so they carry on stepping from this new value. Adam's momentum
-                # buffers (exp_avg/exp_avg_sq) are also left as-is.
-                target_lrs = {'fwd': self.args.lr_policy, 'bwd': self.args.lr_back,
-                              'replay': self.args.lr_replay, 'fused': self.args.lr_fused,
-                              'flow': self.args.lr_flow}
-                for key, opt in self.optimizers.items():
-                    for group in opt.param_groups:
-                        group['lr'] = target_lrs[key]
-
-    def load_optimizer_state(self, checkpoint):
-        saved_optimizers = checkpoint['optimizers']
-        for key, opt in self.optimizers.items():
-            if key not in saved_optimizers:
-                print(f"No saved optimizer state for '{key}' - starting it fresh")
-                continue
-            try:
-                opt.load_state_dict(saved_optimizers[key])
-            except (ValueError, RuntimeError) as e:
-                # e.g. checkpoint predates flow params folding into the policy
-                # optimizers, so param group counts no longer line up
-                print(f"Could not restore optimizer state for '{key}' ({e}) - starting it fresh")
-
-    def load_model_state(self, path, load_optimizers: bool = False):
-        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.gfn_model.load_state_dict(checkpoint['model_train'])
-        self.ema_model.load_state_dict(checkpoint['model_eval'])
-        self.gfn_model.train()
-        self.ema_model.eval()
-        if load_optimizers:
-            self.load_optimizer_state(checkpoint)
-
-    def _checkpoint_path(self, tag: str) -> str:
-        return f'{self.args.checkpoints_dir}/{self.run_name}_{self.problem_slug}_{tag}.pt'
-
-    def _find_matching_checkpoint(self, tag: str) -> Optional[str]:
-        """
-        Look for a checkpoint saved under this run_name/tag whose *stored*
-        problem_def dict matches the current config's - not just its filename
-        hash, since the slug format (and even the hash length) may change
-        later. Refuses to reload (rather than raising) on any mismatch or on
-        older checkpoints saved before problem_def existed, so a stale/renamed
-        checkpoint never gets silently treated as a valid resume point.
-        """
-        path = self._checkpoint_path(tag)
-        if not os.path.exists(path):
-            return None
-
-        checkpoint = torch.load(path, map_location='cpu', weights_only=False)
-        stored_def = checkpoint.get('problem_def')
-        if stored_def != self.problem_def:
-            print(f"Checkpoint {path} exists but its stored problem definition "
-                  f"doesn't match the current config - starting fresh instead.\n"
-                  f"  stored:  {stored_def}\n"
-                  f"  current: {self.problem_def}")
-            return None
-
-        return path
 
     def train_logic(self, it):
         replay_available = hasattr(self, 'replay_buffer') and len(self.replay_buffer) > 0
@@ -315,6 +213,19 @@ class Modeller:
         metrics['over_coverage_threshold'] = self.args.controller.over_threshold
         metrics['zerr_threshold'] = self.args.controller.zerr_threshold
         metrics.update(log_elapsed_times(self.times))
+        metrics['zerr'] = self.condition_log_z.rms_z_lag()
+        metrics['z_bias'] = self.condition_log_z.rms_z_bias()  # location-only companion to zerr: ~0 when Z(c) sits on mean(log w), immune to spread
+        metrics['logw_std_rms'] = self.condition_log_z.rms_logw_std()  # phase-2 gate signal; +inf until warmed (loggable as inf)
+        # lookahead-projected metrics the controller actually thresholds on
+        for key, val in getattr(self, 'controller_projections', {}).items():
+            metrics[f'controller_projected/{key}'] = val
+
+        if hasattr(self, 'condition_log_z'):
+            for cid, val in enumerate(self.condition_log_z.ema_logw.tolist()):
+                metrics[f'condition_log_z_ema_logw/{cid}'] = val
+            for cid, val in enumerate(self.condition_log_z.ema_log_z_emp.tolist()):
+                metrics[f'condition_log_z_ema_log_z_emp/{cid}'] = val
+
         return metrics
 
     def set_loss_coeffs(self):
@@ -348,6 +259,9 @@ class Modeller:
             conditions_dim += 237
         if self.args.zp_conditioning:
             conditions_dim += 1
+        if getattr(self.args, 'vector_conditioning', False):
+            conditions_dim += self.args.vector_conditioning_dim
+        # if we do pre-embedded molecule conditions, we'll add the dimension here
         return conditions_dim
 
     def init_energy_function(self):
@@ -358,12 +272,369 @@ class Modeller:
             'space_groups': self.args.space_groups,
             'z_primes': self.args.z_primes,
             'sg_conditioning': self.args.sg_conditioning,
-            'molecule_conditioning': self.args.molecule_conditioning,
             'temperature_conditioning': self.args.temperature_conditioning,
             'zp_conditioning': self.args.zp_conditioning,
+            'vector_conditioning': getattr(self.args, 'vector_conditioning', False),
+            'vector_conditioning_dim': getattr(self.args, 'vector_conditioning_dim', None),
         }
         energy_config.update(self.args.energy_config.__dict__)
         self.energy_function = MolecularCrystal(**energy_config)
+
+    def tb_z_source(self, group: str) -> str:
+        """
+        Safe accessor for condition_log_z.{fwd,bwd,replay}_tb_z_source --
+        falls back to 'learned' (today's exact behavior) if the
+        condition_log_z config section, or this field within it, is absent
+        (e.g. an older/other config that predates this feature).
+        """
+        cfg = getattr(self.args, 'condition_log_z', None)
+        if cfg is None:
+            return 'learned'
+        return getattr(cfg, f'{group}_tb_z_source', 'learned')
+
+    def mode_repeats(self, mode: str) -> int:
+        """
+        Per-mode K-tiling factor, read from {mode}_loss_coeffs.repeats so it
+        can be phase-scheduled like any other coefficient (e.g. bwd repeats
+        > 1 only during phase-1 MLE/TBC pre-training, where K same-terminal
+        rollouts define the exact-MLE and consistency objectives, and 1
+        everywhere else so no mode pays the K-times batch tiling for losses
+        that don't need it). Falls back to the legacy global top-level
+        `repeats` (exactly the old behavior) for configs that predate the
+        per-mode key, then to 1. Schedules interpolate as floats, so round
+        and floor at 1 here.
+        """
+        coeffs = getattr(self.args, f'{mode}_loss_coeffs', None)
+        r = getattr(coeffs, 'repeats', None) if coeffs is not None else None
+        if r is None:
+            r = getattr(self.args, 'repeats', 1)
+        return max(1, int(round(float(r))))
+
+    def init_condition_log_z(self):
+        """
+        Persistent per-condition empirical log Z tracker (buffer.py's
+        ConditionLogZTracker) -- decoupled from prior/replay/anchor buffers
+        entirely, keyed by the immutable condition_id computed in
+        energy_function.condition_samples(). init_gfn() (called before this,
+        in train()) may already have reloaded one from a checkpoint via
+        checkpointer.load_full() -- don't clobber it with a fresh table sized
+        off this run's (possibly different) mol_dataset. condition_log_z
+        config section is optional -- missing fields (or the whole section)
+        fall back to ConditionLogZTracker's own defaults.
+        """
+        if hasattr(self, 'condition_log_z'):
+            return
+
+        cfg = getattr(self.args, 'condition_log_z', None)
+        min_visits = getattr(cfg, 'min_visits', 20) if cfg is not None else 20
+        half_life_steps = getattr(cfg, 'half_life_steps', 7.0) if cfg is not None else 7.0
+        trim_frac = getattr(cfg, 'trim_frac', 0.1) if cfg is not None else 0.1
+        max_batch_weight = getattr(cfg, 'max_batch_weight', 200.0) if cfg is not None else 200.0
+        self.condition_log_z = ConditionLogZTracker(
+            library_size=self.energy_function.condition_library_size,
+            min_visits=min_visits,
+            half_life_steps=half_life_steps,
+            trim_frac=trim_frac,
+            max_batch_weight=max_batch_weight,
+        )
+
+    def bootstrap_log_z(self, max_steps: int = 1000, lr_ramp_steps: int = 200,
+                        holdout_frac: float = 0.1, min_conditions_for_holdout: int = 50,
+                        lr: Optional[float] = None, target_rms: float = 0.5,
+                        max_attempts: int = 3, lr_restart_factor: float = 0.3,
+                        coverage_quantile: float = 0.99, coverage_tol: float = 2.0,
+                        n_eval_batches: Optional[int] = None, seed: int = 0):
+        """
+        Fast, rollout-free supervised fit of the flow head's Z(c) prediction
+        onto condition_log_z's ema_logw:
+
+            min_theta  MSE(Z(c; theta), ema_logw(c))   over conditions c with
+                                                        a trustworthy estimate
+
+        Intended to run once, at the phase 1 -> 2 transition (see
+        phase1to2), on whatever ema_logw the tracker accumulated during
+        phase 1's MLE warm-start -- purely to get the flow head starting
+        from a reasonable baseline instead of its random init, before
+        ordinary (rollout-driven) training resumes. Deliberately regresses
+        onto ema_logw, never ema_log_z_emp: this runs in exactly the
+        cold-start regime (right after phase 1, before the policy has had
+        time to build real overlap with the reward-tilted target) that we
+        directly observed can send ema_log_z_emp to billions of nats -- see
+        ConditionLogZTracker.lookup's docstring. ema_logw is rank-trimmed
+        and evidence-capped, so it can't hand this a corrupted target the
+        same way.
+
+        No trajectory sampling, no reward evaluation -- each step draws a
+        batch of conditions the same way fwd_train_step does, but only
+        needs gfn_model.get_condition_embedding() + flow_model(), skipping
+        get_traj_fwd entirely, so this converges in seconds rather than
+        needing real rollouts. Trains only flow_model, via a fresh, local
+        Adam instance -- deliberately NOT self.optimizers['flow'] (that one's
+        for ordinary training's per-step Z updates and persists across the
+        whole run; reusing it would mean this "from-scratch" fit starts with
+        whatever momentum/variance state it happened to have accumulated).
+
+        This Z(c) head is load-bearing: phase-2 training can't proceed
+        usefully until it predicts every trustworthy condition well, not just
+        on average. So the fit is structured as an outer restart loop around
+        a deliberately simple single run, gated on a real per-condition
+        acceptance test rather than a batch-mean:
+
+          single run  -- LR is one linear decay from lr to lr/100 over
+            lr_ramp_steps, held at lr/100 after (large early steps to close
+            the bulk of the gap, small fixed steps to settle without
+            overshoot; no reactive cuts / plateau detection that can fight
+            itself). target_rms is the in-run early stop: stop once the
+            monitored RMS(MSE) drops to it (default 0.5 ~ half a nat). Two
+            deterministic safety nets, neither reactive: best_state snapshots
+            the trough weights on every improvement and is restored at the
+            end (so a final step that rang up off the trough -- or one that
+            corrupted the weights, since a good snapshot can't be retroed --
+            is discarded), and a non-finite loss (a genuine NaN/inf
+            explosion, not a mere increase) breaks straight to that restore.
+
+          holdout     -- with >= min_conditions_for_holdout trustworthy
+            conditions, holdout_frac are excluded from the gradient (still
+            drawn, never backpropped) and the in-run monitor tracks that
+            held-out MSE, so early stopping reflects generalization, not
+            memorization. Below that, the split isn't meaningful and this
+            falls back to training loss.
+
+          acceptance  -- after each run, coverage_eval sweeps n_eval_batches
+            under the deployment draw and records per-condition abs error,
+            then checks the coverage_quantile (default 0.99) of those errors
+            against coverage_tol (default 2.0 nats): "~every trustworthy
+            condition is within 2 nats". This is the gate that actually
+            matters; the batch-mean target_rms above only decides when a
+            single run has stopped improving.
+
+          restart     -- if a run's coverage fails, re-seed, re-initialize
+            the flow head, and retry at a lower starting LR (lr *
+            lr_restart_factor ** attempt), up to max_attempts. Cheaper and
+            more robust than making one run bulletproof: a bad basin or an
+            unlucky overshoot just gets a fresh draw. The best-by-coverage
+            attempt is kept regardless of whether any run passed.
+        """
+        if not hasattr(self, 'condition_log_z'):
+            return
+
+        lr = 0.05 if lr is None else lr
+        tracker = self.condition_log_z
+        valid_mask = (tracker.count >= tracker.min_visits) & (~torch.isnan(tracker.ema_logw))
+        valid_ids = torch.nonzero(valid_mask, as_tuple=True)[0]
+        target_mse = target_rms ** 2
+
+        # holdout split drawn ONCE, up front, so every attempt trains and is judged
+        # on the same partition -- keeps best-by-coverage an apples-to-apples choice
+        # across attempts rather than each getting a different lucky/unlucky split
+        is_val = None
+        if valid_ids.numel() >= min_conditions_for_holdout:
+            n_val = max(1, int(round(valid_ids.numel() * holdout_frac)))
+            perm = valid_ids[torch.randperm(valid_ids.numel())]
+            val_ids = perm[:n_val]
+            is_val = torch.zeros(tracker.library_size, dtype=torch.bool)
+            is_val[val_ids] = True
+
+        # cover the trustworthy set a few times over on average; discrete-condition
+        # draws hit each id stochastically, so a handful of passes keeps the tail of
+        # the coverage quantile honest without a full deterministic enumeration
+        if n_eval_batches is None:
+            n_eval_batches = max(20, math.ceil(3 * max(valid_ids.numel(), 1) / int(self.batch_size)))
+
+        def _draw_batch():
+            mol_batch = next(self.mol_dataset.loader(int(self.batch_size), mode='graphs'))
+            mol_batch = mol_batch.to(self.device)
+            mol_batch.orient_molecule(mode='std')
+            mol_batch, _, _, _, condition, condition_id = \
+                self.energy_function.condition_samples(mol_batch)
+            return mol_batch, condition.to(self.device), condition_id
+
+        def _reinit_flow():
+            for m in self.gfn_model.flow_model.modules():
+                if hasattr(m, 'reset_parameters'):
+                    m.reset_parameters()
+
+        def _run_attempt(attempt_lr):
+            """One simple fit; returns (best_state, best_monitored_mse, steps)."""
+            optimizer = torch.optim.Adam(self.gfn_model.flow_model.parameters(), lr=attempt_lr)
+            scheduler = torch.optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=1.0, end_factor=0.01, total_iters=lr_ramp_steps)
+            best_loss, best_state, steps_run = float('inf'), None, 0
+            for steps_run in range(1, max_steps + 1):
+                mol_batch, condition, condition_id = _draw_batch()
+                target, mask = tracker.lookup(condition_id)
+                target, mask = target.to(self.device), mask.to(self.device)
+                if mask.sum() == 0:
+                    continue
+
+                if is_val is not None:
+                    batch_is_val = is_val[condition_id.cpu()].to(self.device)
+                    train_mask = mask & ~batch_is_val
+                    val_mask = mask & batch_is_val
+                else:
+                    train_mask = mask
+                    val_mask = torch.zeros_like(mask)
+
+                # no_grad on the embedding: only flow_model trains here, so backprop
+                # through the (frozen-for-this-purpose) conditioner is wasted compute
+                with torch.no_grad():
+                    condition_embedding = self.gfn_model.get_condition_embedding(condition, mol_batch)
+                z_pred = self.gfn_model.flow_model(condition_embedding).flatten()
+
+                monitored_loss = None
+                if train_mask.sum() > 0:
+                    train_loss = F.mse_loss(z_pred[train_mask], target[train_mask])
+                    optimizer.zero_grad(set_to_none=True)
+                    train_loss.backward()
+                    optimizer.step()
+                    scheduler.step()  # linear decay, fixed schedule
+                    if is_val is None:  # no holdout -- fall back to training loss
+                        monitored_loss = train_loss.item()
+
+                if val_mask.sum() > 0:
+                    with torch.no_grad():
+                        monitored_loss = F.mse_loss(z_pred[val_mask], target[val_mask]).item()
+
+                if monitored_loss is None:
+                    continue
+
+                # explosion tripwire: only a non-finite loss (not a mere increase)
+                # bails, straight to the best_state restore
+                if not math.isfinite(monitored_loss):
+                    break
+                if monitored_loss < best_loss:
+                    best_loss = monitored_loss
+                    best_state = deepcopy(self.gfn_model.flow_model.state_dict())
+                if monitored_loss <= target_mse:
+                    break
+
+            if best_state is not None:
+                self.gfn_model.flow_model.load_state_dict(best_state)
+            return best_state, best_loss, steps_run
+
+        @torch.no_grad()
+        def _coverage_eval():
+            """
+            Per-condition acceptance test on the current flow weights: sweep the
+            deployment draw, accumulate mean abs error per trustworthy condition_id
+            seen, return (quantile error, #conditions covered). Runs in eval mode
+            so the number is deterministic (no dropout) -- this is a quality gate,
+            not a training signal.
+            """
+            was_training = self.gfn_model.flow_model.training
+            self.gfn_model.flow_model.eval()
+            lib = tracker.library_size
+            err_sum = torch.zeros(lib)
+            err_cnt = torch.zeros(lib)
+            for _ in range(n_eval_batches):
+                mol_batch, condition, condition_id = _draw_batch()
+                target, mask = tracker.lookup(condition_id)
+                target = target.to(self.device)
+                mask = mask.to(self.device)
+                if mask.sum() == 0:
+                    continue
+                condition_embedding = self.gfn_model.get_condition_embedding(condition, mol_batch)
+                z_pred = self.gfn_model.flow_model(condition_embedding).flatten()
+                abs_err = (z_pred - target).abs().cpu()
+                cid = condition_id.cpu().flatten().long()
+                keep = mask.cpu()
+                err_sum.index_add_(0, cid[keep], abs_err[keep])
+                err_cnt.index_add_(0, cid[keep], torch.ones(int(keep.sum())))
+            if was_training:
+                self.gfn_model.flow_model.train()
+            seen = err_cnt > 0
+            if seen.sum() == 0:
+                return float('inf'), 0
+            per_id = err_sum[seen] / err_cnt[seen]
+            q = torch.quantile(per_id, coverage_quantile).item()
+            return q, int(seen.sum())
+
+        # snapshot global RNG state: the per-attempt seeding below makes restarts
+        # reproducible, but must not leak into the outer run's stochastic stream --
+        # restore whatever the main training loop was about to draw next
+        torch_rng_state = torch.get_rng_state()
+        numpy_rng_state = np.random.get_state()
+
+        best_cov, best_overall_state, best_meta = float('inf'), None, None
+        for attempt in range(max_attempts):
+            torch.manual_seed(seed + attempt)
+            np.random.seed(seed + attempt)
+            _reinit_flow()  # genuine fresh start, not the same basin re-drawn
+            attempt_lr = lr * (lr_restart_factor ** attempt)
+
+            best_state, best_loss, steps_run = _run_attempt(attempt_lr)
+            cov_q, n_cov = _coverage_eval()
+
+            print(f"Z(c) bootstrap attempt {attempt + 1}/{max_attempts}: "
+                  f"{steps_run} steps, lr {attempt_lr:.3g}, best monitored MSE {best_loss:.4g}, "
+                  f"P{coverage_quantile * 100:.0f} abs err {cov_q:.3g} over {n_cov} conditions "
+                  f"(accept <= {coverage_tol:.3g})")
+
+            if cov_q < best_cov:
+                best_cov, best_overall_state = cov_q, best_state
+                best_meta = (attempt + 1, steps_run, n_cov)
+            if cov_q <= coverage_tol:
+                break
+
+        torch.set_rng_state(torch_rng_state)
+        np.random.set_state(numpy_rng_state)
+
+        # keep the best-by-coverage attempt regardless of whether any run passed --
+        # a marginal fit is still better to hand phase 2 than a fresh random head
+        if best_overall_state is not None:
+            self.gfn_model.flow_model.load_state_dict(best_overall_state)
+        # keep ema_model's flow head in sync (a no-op when ema_decay is null and
+        # ema_model literally is gfn_model, but correct if EMA is ever re-enabled)
+        self.ema_model.flow_model.load_state_dict(self.gfn_model.flow_model.state_dict())
+
+        passed = best_cov <= coverage_tol
+        holdout_msg = f", {int(is_val.sum())} held out" if is_val is not None \
+            else f", no holdout ({valid_ids.numel()} conditions)"
+        attempt_msg = f" on attempt {best_meta[0]}" if best_meta is not None else ""
+        print(f"Z(c) bootstrap: {'ACCEPTED' if passed else 'FAILED'}{attempt_msg} -- "
+              f"P{coverage_quantile * 100:.0f} abs err {best_cov:.3g} nats "
+              f"(accept <= {coverage_tol:.3g}){holdout_msg}")
+        if not passed:
+            print("  WARNING: Z(c) bootstrap did not reach the coverage bar; phase-2 "
+                  "training may be unreliable. Consider more attempts or a lower lr.")
+
+
+    def mol_dataset_z_gap_weights(self, temperature: float = 1.0) -> Optional[np.ndarray]:
+        """
+        Per-row sampling distribution over self.mol_dataset, weighting each
+        molecule toward its tracked z_gap in self.condition_log_z (the
+        empirical/Jensen log Z disagreement for that molecule's base
+        condition_id -- SG/Z' local index 0) instead of sampling uniformly,
+        so molecules whose log Z estimate hasn't converged get drawn more
+        often. Mirrors CrystalBuffer._loss_weights (same softmax-over-
+        temperature shape, same moderate-fill treatment for not-yet-visited
+        entries), just sourced from condition_log_z instead of ema_loss.
+
+        Returns None (falls back to uniform sampling) if condition_log_z
+        isn't initialized yet, mol_dataset's resident batch has no mol_id
+        (predates init_identifiers()), or nothing has been visited yet.
+        """
+        tracker = getattr(self, 'condition_log_z', None)
+        mol_id = getattr(self.mol_dataset.batch, 'mol_id', None)
+        if tracker is None or mol_id is None:
+            return None
+
+        n_combos = self.energy_function.n_sg * self.energy_function.n_zp
+        condition_id = mol_id.detach().cpu() * n_combos
+        gap, mask = tracker.lookup_z_gap(condition_id)
+
+        if not mask.any():
+            return None
+
+        fill = gap[mask].mean()
+        gap = torch.where(mask, gap, fill)
+
+        logits = gap / max(temperature, 1e-8)
+        logits = logits - logits.max()
+        p = torch.softmax(logits, dim=0).double().numpy()
+        p = np.clip(p, 1e-8, None)
+        p /= p.sum()
+        return p
 
     def _build_gfn_config(self):
         return dict(
@@ -375,6 +646,7 @@ class Modeller:
                 self.args.molecule_conditioning,
                 self.args.sg_conditioning,
                 self.args.zp_conditioning,
+                getattr(self.args, 'vector_conditioning', False),
             ]),
             device=self.device,
             max_z_prime=max(self.args.z_primes),
@@ -389,20 +661,19 @@ class Modeller:
             reload = True
             reload_path = f'{self.args.checkpoints_dir}/{self.args.checkpoint_name}'
             print(f"Loading model from checkpoint {reload_path}")
-            self.load_model_and_state(reload_path)
+            self.checkpointer.load_full(reload_path)
 
         elif self.args.continue_from_checkpoint:
-            reload_path = self._find_matching_checkpoint('running')
+            reload_path = self.checkpointer.find_matching('running')
             if reload_path is not None:
                 print(f"Reloading automatically from prior checkpoint {reload_path}")
                 reload = True
-                self.load_model_and_state(reload_path)
+                self.checkpointer.load_full(reload_path)
 
         if not reload:
             self.gfn_config = self._build_gfn_config()
             self.gfn_model = GFN(**self.gfn_config).to(self.device)
             self.ema_model = deepcopy(self.gfn_model)
-            # opt init
             self.init_schedulers_optimizers()
 
     def init_schedulers_optimizers(self):
@@ -424,8 +695,9 @@ class Modeller:
                      ]
             if gfn_model.conditional:
                 plist += [{'params': gfn_model.conditions_embedding_model.parameters()}]
-                # flow model folds into the policy optimizers rather than getting its own
-                plist += [{'params': gfn_model.flow_model.parameters()}]
+                # flow_model gets its own optimizer (below) unconditionally now, so it's
+                # deliberately NOT folded in here -- Z-head training needs to run at its
+                # own LR/momentum, decoupled from whatever the policy optimizers are doing.
 
             return plist
 
@@ -437,11 +709,22 @@ class Modeller:
                                                   weight_decay=weight_decay)
         self.optimizers['replay'] = torch.optim.Adam(get_policy_params(self.gfn_model), init_replay_lr,
                                                      weight_decay=weight_decay)
-        self.optimizers['fused'] = torch.optim.Adam(get_policy_params(self.gfn_model), init_fused_lr,
-                                                    weight_decay=weight_decay)
-        if not self.gfn_model.conditional:
-            flow_params = self.gfn_model.flow_model.parameters()
-            self.optimizers['flow'] = torch.optim.Adam(flow_params, init_flow_lr, weight_decay=weight_decay)
+        # fused fires fwd/bwd/replay in one backward() (phase 3), so -- unlike the
+        # turn-taking fwd/bwd/replay optimizers, which piggyback on optimizers['flow']
+        # via step_loss's non-fused branch -- the flow (Z head) params must ride the
+        # fused optimizer directly or they'd never get stepped on a fused step. They go
+        # in as their OWN param group at init_flow_lr (not the policy's init_fused_lr),
+        # and the fused schedulers below leave that group's LR flat, so Z keeps its
+        # dedicated, decoupled learning rate rather than inheriting the policy warmup/
+        # anneal. On a fused step where the fwd sub-loss (the only Z-training branch) is
+        # skipped, these params simply get grad=None and Adam skips them -- no spurious
+        # update.
+        self.optimizers['fused'] = torch.optim.Adam(
+            get_policy_params(self.gfn_model) + [{'params': self.gfn_model.flow_model.parameters(),
+                                                  'lr': init_flow_lr}],
+            init_fused_lr, weight_decay=weight_decay)
+        flow_params = self.gfn_model.flow_model.parameters()
+        self.optimizers['flow'] = torch.optim.Adam(flow_params, init_flow_lr, weight_decay=weight_decay)
 
         self.schedulers = {}
         lr_warmup_lambda = get_annealing_factor(1,
@@ -468,25 +751,39 @@ class Modeller:
         self.schedulers['policy_2r'] = lr_scheduler.MultiplicativeLR(
             self.optimizers['replay'], lr_lambda=lambda epoch: lr_annealing_lambda)
 
+        # per-group lambdas: warmup/anneal the policy groups, leave the trailing flow
+        # group (added above) at its flat init_flow_lr (lambda -> 1.0 every step).
+        n_fused_groups = len(self.optimizers['fused'].param_groups)
         self.schedulers['policy_1u'] = lr_scheduler.MultiplicativeLR(
-            self.optimizers['fused'], lr_lambda=lambda epoch: lr_warmup_lambda)
+            self.optimizers['fused'],
+            lr_lambda=[lambda epoch: lr_warmup_lambda] * (n_fused_groups - 1) + [lambda epoch: 1.0])
         self.schedulers['policy_2u'] = lr_scheduler.MultiplicativeLR(
-            self.optimizers['fused'], lr_lambda=lambda epoch: lr_annealing_lambda)
+            self.optimizers['fused'],
+            lr_lambda=[lambda epoch: lr_annealing_lambda] * (n_fused_groups - 1) + [lambda epoch: 1.0])
 
-        if not self.gfn_model.conditional:
-            flow_annealing_lambda = get_annealing_factor(1,
-                                                         0.1,
-                                                         self.args.lr_anneal_time,
-                                                         10)
-            self.schedulers['flow'] = lr_scheduler.MultiplicativeLR(self.optimizers['flow'],
-                                                                    lr_lambda=lambda epoch: flow_annealing_lambda)
+        flow_annealing_lambda = get_annealing_factor(1,
+                                                     0.1,
+                                                     self.args.lr_anneal_time,
+                                                     10)
+        self.schedulers['flow'] = lr_scheduler.MultiplicativeLR(self.optimizers['flow'],
+                                                                lr_lambda=lambda epoch: flow_annealing_lambda)
 
     def init_prior_dataset(self):
 
         prior_data = torch.load(self.args.prior_path, weights_only=False)
         prior = prior_data['equalized_prior']
         prior['smiles'] = None
-        prior['identifier'] = None
+        # identifier is NOT wiped (unlike smiles) -- init_identifiers() needs it
+        # to build the mol_id registry, and since backward training draws
+        # directly from this prior_dataset, an identifier-less prior can never
+        # be matched back to the right condition_id (see init_identifiers()'s
+        # docstring)
+        # A pickled .pt file may carry stale/differently-shaped versions of the
+        # lazily-built space-group caches (e.g. from an older codebase or a
+        # dataset covering fewer space groups). Strip them so they rebuild fresh
+        # and consistent with every other batch in this run. See
+        # buffer.strip_lazy_sg_caches for details.
+        strip_lazy_sg_caches(prior)
         if True:  # not hasattr(prior, self.args.energy_function):
             print("Re-analyzing prior energies")
             prior = prior.to(self.device)
@@ -496,9 +793,10 @@ class Modeller:
                 self.args.energy_config.temperature * torch.ones((prior.num_graphs), dtype=torch.float32,
                                                                  device=self.device),
                 return_batch=True,
-                internal_oom_recovery=True,  # one-off pass over the whole prior dataset at init -- prefer the adaptive, self-healing chunked path over a hard crash, regardless of the training-time flag
+                internal_oom_recovery=True,
+                # one-off pass over the whole prior dataset at init -- prefer the adaptive, self-healing chunked path over a hard crash, regardless of the training-time flag
             )
-        if hasattr(prior_data, 'thermal_scaling_factor'):
+        if 'thermal_scaling_factor' in prior_data:
             self.energy_function.lj_coeff = prior_data['thermal_scaling_factor']
 
         self.prior_dataset = CrystalBuffer(prior,
@@ -511,14 +809,22 @@ class Modeller:
         if self.args.prior_model_name is not None:
             prior_path = f'{self.args.checkpoints_dir}/{self.args.prior_model_name}'
             checkpoint = torch.load(prior_path, map_location=self.device, weights_only=False)
+            # a prior model from a different problem wouldn't crash, but it would
+            # silently grow the prior buffer with samples from the wrong target
+            self.checkpointer.assert_problem_match(checkpoint, prior_path, 'prior_model_name')
             gfn_config = checkpoint['gfn_config']
             self.prior_model = GFN(**gfn_config).to(self.device)
             self.prior_model.load_state_dict(checkpoint['model_eval'])
             self.prior_model.eval()
-            self.grow_prior_buffer()
+            # NB: grow_prior_buffer() is deliberately NOT called here. It samples
+            # from mol_dataset, whose batch only gains mol_id in init_identifiers()
+            # (which runs after this). Growing here would append a mol_id-less
+            # sample to a checkpoint-restored prior_buffer that already carries
+            # mol_id, and append_batch would reject the key mismatch. train()
+            # calls grow_prior_buffer() once init_identifiers() has run.
 
     def init_mol_dataset(self):
-        data_list = torch.load(self.args.molecules_path, weights_only=False)
+        data_list = torch.load(self.args.molecules_path, weights_only=False)  # todo cleanup formatting here
         if isinstance(data_list, dict):
             for key, value in data_list.items():
                 if key == 'prior':
@@ -536,6 +842,49 @@ class Modeller:
         else:
             self.test_mol_dataset = None
 
+    def init_identifiers(self):
+        """
+        Assigns every distinct crystal_batch.identifier (a molecule for
+        physical runs, or a standalone condition for toy runs) a stable
+        integer `mol_id`, and attaches it to mol_dataset/prior_dataset/
+        test_mol_dataset's resident batches -- condition_samples() reads it
+        straight off the batch, the same way sg_ind/z_prime already ride
+        along, to build condition_id.
+
+        Backward training draws directly from prior_dataset (a separately
+        loaded file, not sourced from mol_dataset), so the registry spans
+        both -- otherwise samples drawn from prior_dataset would have no
+        way to match the condition_id of the molecule they actually are.
+        This assumes molecules_path/prior_path are prepared with matching
+        .identifier fields for the same underlying molecule/condition
+        (prep-side responsibility, not resolved here via fingerprint or
+        geometric matching).
+
+        Must run after mol_dataset/prior_dataset/test_mol_dataset are all
+        loaded (registry needs every identifier upfront) and before
+        init_condition_log_z() (which sizes the tracker table off
+        energy_function.condition_library_size == n_molecules * n_sg * n_zp).
+        """
+        datasets = [self.mol_dataset, self.prior_dataset]
+        if self.test_mol_dataset is not None:
+            datasets.append(self.test_mol_dataset)
+
+        identifiers = set()
+        for dataset in datasets:
+            if hasattr(dataset.batch, 'identifier'):
+                identifiers.update(dataset.batch.identifier)
+
+        self.identifier_registry = {ident: i for i, ident in enumerate(sorted(identifiers))}
+
+        for dataset in datasets:
+            if hasattr(dataset.batch, 'identifier'):
+                mol_id = torch.tensor(
+                    [self.identifier_registry[ident] for ident in dataset.batch.identifier],
+                    dtype=torch.long)
+                dataset.batch.add_graph_attr(mol_id, 'mol_id')
+
+        self.energy_function.set_n_molecules(max(len(self.identifier_registry), 1))
+
     def train(self):
         with (wandb.init(project="GFN Energy",
                          config=flatten_wandb_params(self.args),
@@ -549,9 +898,22 @@ class Modeller:
             # Model Init
             self.init_gfn()
 
-            # data init
+            # data init -- init_identifiers() needs mol_dataset/prior_dataset/test_mol_dataset
+            # all loaded first (it builds one registry spanning all of them), and must itself
+            # run before init_condition_log_z() (which preallocates the tracker table off
+            # energy_function.condition_library_size, set by init_identifiers())
             self.init_mol_dataset()
             self.init_prior_dataset()
+            self.init_identifiers()
+            # grow_prior_buffer() must run after init_identifiers() so the freshly
+            # sampled batch inherits mol_id (via mol_dataset's registry) and matches
+            # a checkpoint-restored prior_buffer. Kept before init_condition_log_z()
+            # so the prior-sampling pass still sees no condition_log_z (its updates
+            # are hasattr-gated), preserving the previous init-time behaviour.
+            if self.args.prior_model_name is not None:
+                self.grow_prior_buffer()
+            self.init_condition_log_z()
+            self.init_anchor_buffer_seed()
 
             self.times['initialization_end'] = time()
 
@@ -588,10 +950,10 @@ class Modeller:
                     self.monitor_losses(current_loss, step_type)
 
                     if self.combo_loss_record[-1] <= np.amin(self.combo_loss_record):
-                        self.save_checkpoint('best')
+                        self.checkpointer.save('best')
 
                     if self.phase == 3:
-                        self.three_phase_controller()
+                        self.mode_balance_controller.step()
 
                 # evaluation work
                 if (self.step_ind % self.args.eval_period == 0 and self.step_ind > 0) or self.step_ind == 50:
@@ -601,9 +963,9 @@ class Modeller:
                     wandb.log(metrics, step=self.step_ind, commit=True)
 
                 if self.step_ind % 50 == 0:  # save running model
-                    self.save_checkpoint('running')
+                    self.checkpointer.save('running')
 
-            self.save_checkpoint('final')
+            self.checkpointer.save('final')
             print("Finished Training!")
 
     def monitor_losses(self, current_loss, step_type):
@@ -625,14 +987,14 @@ class Modeller:
 
     def fire_loss_spike(self):
         print("Firing LR spike & recovery")
-        running_checkpoint_path = self._checkpoint_path('best')
+        running_checkpoint_path = self.checkpointer.path_for('best')
         if os.path.exists(running_checkpoint_path):
-            self.load_model_state(running_checkpoint_path,
-                                  load_optimizers=True)
+            self.checkpointer.load_model_only(running_checkpoint_path,
+                                              load_optimizers=True)
             # fix also rolling metrics with appropriate rebase
             checkpoint = torch.load(running_checkpoint_path, map_location=self.device, weights_only=False)
             step = deepcopy(self.step_ind)
-            self._set_modeller_state_dict(checkpoint['modeller_state'])
+            self.checkpointer.set_state_dict(checkpoint['modeller_state'])
             self.metric_tracker.load_state_dict(checkpoint.get('metrics', {}))
             self.step_ind = step
             if checkpoint.get('prior_buffer') is not None:
@@ -641,6 +1003,9 @@ class Modeller:
                 self.replay_buffer = CrystalBuffer.from_state_dict(checkpoint['replay_buffer'], device='cpu')
             if checkpoint.get('anchor_buffer') is not None:
                 self.anchor_buffer = AnchorBuffer.from_state_dict(checkpoint['anchor_buffer'], device='cpu')
+            if checkpoint.get('condition_log_z') is not None:
+                self.condition_log_z = ConditionLogZTracker.from_state_dict(
+                    checkpoint['condition_log_z'], current_step=self.step_ind)
 
         lr_cut_val = 0.75
 
@@ -682,7 +1047,11 @@ class Modeller:
         starting_new_cycle = (not accumulating) or (self.fused_accum_count == 0)
 
         if starting_new_cycle:
-            if 'flow' in self.optimizers:
+            # flow (Z head) params live in optimizers['flow'] for non-fused steps and
+            # as a dedicated param group of optimizers['fused'] for fused steps, so the
+            # right owner zeroes them either way: skip the standalone flow optimizer on
+            # fused steps (optimizers[step_type] == 'fused' already covers its group).
+            if 'flow' in self.optimizers and step_type != 'fused':
                 self.optimizers['flow'].zero_grad(set_to_none=True)
             self.optimizers[step_type].zero_grad(set_to_none=True)
 
@@ -690,7 +1059,7 @@ class Modeller:
             loss, crystal_batch, loss_dict = self.fwd_train_step(
                 discretizer,
                 return_exp=True,
-                repeats=self.args.repeats,
+                repeats=self.mode_repeats('fwd'),
                 report_losses=True
             )
             self.fwd_step_count += 1
@@ -699,7 +1068,7 @@ class Modeller:
         elif step_type == 'bwd':
             loss, loss_dict = self.bwd_train_step(
                 discretizer,
-                repeats=self.args.repeats,
+                repeats=self.mode_repeats('bwd'),
                 report_losses=True)
             self.bwd_step_count += 1
             current_step_count = self.bwd_step_count
@@ -707,7 +1076,7 @@ class Modeller:
         elif step_type == 'replay':
             loss, loss_dict = self.replay_train_step(
                 discretizer,
-                repeats=self.args.repeats,
+                repeats=self.mode_repeats('replay'),
                 report_losses=True)
             self.replay_step_count += 1
             current_step_count = self.replay_step_count
@@ -715,7 +1084,6 @@ class Modeller:
         elif step_type == 'fused':
             loss, sub_losses = self.fused_train_step(
                 discretizer,
-                repeats=self.args.repeats,
                 report_losses=True)
 
         else:
@@ -749,7 +1117,6 @@ class Modeller:
 
     def fused_train_step(self,
                          discretizer,
-                         repeats: int,
                          report_losses: bool = True):
         """
         Fires fwd, bwd, and replay steps together and fuses their losses into a single
@@ -781,7 +1148,7 @@ class Modeller:
             fwd_loss, crystal_batch, fwd_loss_dict = self.fwd_train_step(
                 discretizer,
                 return_exp=True,
-                repeats=repeats,
+                repeats=self.mode_repeats('fwd'),
                 report_losses=report_losses)
             if not fwd_active:  # force-refresh only -- keep its graph out of the fused loss
                 fwd_loss = fwd_loss.detach()
@@ -792,7 +1159,7 @@ class Modeller:
         if bwd_active or force_refresh:
             bwd_loss, bwd_loss_dict = self.bwd_train_step(
                 discretizer,
-                repeats=repeats,
+                repeats=self.mode_repeats('bwd'),
                 report_losses=report_losses)
             if not bwd_active:
                 bwd_loss = bwd_loss.detach()
@@ -804,7 +1171,7 @@ class Modeller:
             if replay_active or force_refresh:
                 replay_loss, replay_loss_dict = self.replay_train_step(
                     discretizer,
-                    repeats=repeats,
+                    repeats=self.mode_repeats('replay'),
                     report_losses=report_losses)
                 if not replay_active:
                     replay_loss = replay_loss.detach()
@@ -840,22 +1207,29 @@ class Modeller:
             if step_counts[sub_type] % 10 == 0:
                 self._update_rolling(loss_dict, sub_loss, sub_type)
 
-    def _reward_ramp_kwargs(self):
+    def _reward_ramp_kwargs(self, condition_id=None):
         """
         floor/ramp_range for quick_tb_stats' weighted_under_coverage, expressed
         relative to the current best anchor reward rather than as absolute
         numbers -- so the ramp automatically tracks the achievable reward scale
         as it rises over training instead of needing hand-tuned absolute
-        constants. Given anchor_buffer's current max M:
-            floor       = M - prior_buffer.ramp_floor_range   (weight 0 here)
+        constants. Given anchor_buffer's PER-CONDITION current max M_c (each
+        sample in `condition_id` looked up against its own condition's anchors,
+        via _per_condition_max):
+            floor       = M_c - prior_buffer.ramp_floor_range   (weight 0 here)
             ramp_range  = ramp_floor_range - ramp_knee_range
-            -> weight saturates to 1 at M - prior_buffer.ramp_knee_range,
-               and stays at 1 all the way up through M.
+            -> weight saturates to 1 at M_c - prior_buffer.ramp_knee_range,
+               and stays at 1 all the way up through M_c.
+        Per-condition rather than a single buffer-wide max because conditions
+        can sit on very different achievable reward scales (e.g. under
+        temperature_conditioning=True) -- a global max would let the
+        best-off condition's scale gate every other condition's ramp.
+        Conditions with no anchors yet fall back to the buffer-wide max.
         Falls back to (None, None) -- quick_tb_stats' old uniform-RMS behavior
-        -- until there's an anchor buffer to anchor the scale to.
+        -- until there's an anchor buffer (and condition_id) to anchor the scale to.
         """
         anchor_buffer = getattr(self, 'anchor_buffer', None)
-        if anchor_buffer is None or len(anchor_buffer) == 0:
+        if anchor_buffer is None or len(anchor_buffer) == 0 or condition_id is None:
             return dict(reward_floor=None, reward_ramp_range=None)
 
         buffers_cfg = getattr(self.args, 'buffers', None)
@@ -865,135 +1239,62 @@ class Modeller:
         if floor_range is None or knee_range is None:
             return dict(reward_floor=None, reward_ramp_range=None)
 
-        anchor_max = anchor_buffer.reward.max().item()
-        return dict(reward_floor=anchor_max - floor_range,
+        condition_id = torch.as_tensor(condition_id)
+        query_ids = condition_id.detach().cpu().long().flatten()
+        anchor_max = _per_condition_max(anchor_buffer.condition_id, anchor_buffer.reward, query_ids)
+        missing = ~torch.isfinite(anchor_max)
+        if missing.any():
+            anchor_max = anchor_max.clone()
+            anchor_max[missing] = anchor_buffer.reward.max()
+
+        return dict(reward_floor=(anchor_max - floor_range).to(condition_id.device),
                     reward_ramp_range=floor_range - knee_range)
+
+    def _condition_energy_floor(self, condition_id):
+        """
+        Per-sample best-known energy for that sample's own condition_id --
+        the E_min(condition) baseline manage_prior_buffer's admission gate
+        and reach trigger measure relative excess against, instead of an
+        absolute reward threshold (mirrors AnchorBuffer.admit's per-condition
+        energy gate; see _per_condition_min). Prefers condition_log_z's
+        persistent best_energy, since it's updated from every fwd-eval batch
+        and so sees a strict superset of what the anchor buffer's own
+        (thinned) per-condition min sees; falls back to the anchor buffer's
+        per-condition min when the tracker isn't configured. A condition with
+        no observations from either source gets +inf, the same convention
+        _per_condition_min/AnchorBuffer.admit use, so its first sample is
+        always admitted regardless of margin. Returns None only when neither
+        source exists yet at all (pre-bootstrap), signaling callers to fall
+        back to the absolute reward_min floor. Result is moved back onto
+        condition_id's original device, so it can be compared directly
+        against energy computed upstream on either CPU (fwd-eval-sourced
+        batches) or GPU (top_up_prior_from_anchors' freshly-rescored batch)
+        without callers having to think about it.
+        """
+        condition_id = torch.as_tensor(condition_id)
+        device = condition_id.device
+        condition_id = condition_id.detach().cpu().long().flatten()
+
+        tracker = getattr(self, 'condition_log_z', None)
+        if tracker is not None:
+            best_energy, mask = tracker.lookup_best_energy(condition_id)
+            return torch.where(mask, best_energy, torch.full_like(best_energy, float('inf'))).to(device)
+
+        anchor_buffer = getattr(self, 'anchor_buffer', None)
+        if anchor_buffer is not None and len(anchor_buffer) > 0:
+            return _per_condition_min(anchor_buffer.condition_id, anchor_buffer.energy, condition_id).to(device)
+
+        return None
 
     def _update_rolling(self, loss_dict, sub_loss, sub_type):
         stats = quick_tb_stats(loss_dict['log_pf'], loss_dict['log_pb'],
-                               loss_dict['log_Z'], loss_dict['log_r'], **self._reward_ramp_kwargs())
+                               loss_dict['log_Z'], loss_dict['log_r'],
+                               **self._reward_ramp_kwargs(loss_dict.get('condition_id')))
         stats.update({k: v.item() for k, v in loss_dict.items() if k not in
-                      ['log_pf', 'log_pb', 'log_Z', 'log_r', 'losses', 'flow_states', 'resid']})
+                      ['log_pf', 'log_pb', 'log_Z', 'log_r', 'losses', 'flow_states', 'resid', 'condition_id']})
         stats.update({'loss': sub_loss.cpu().detach().item()})
         stats.update({'log_Z_learned': loss_dict['log_Z'].cpu().mean().detach().item()})
         self.metric_tracker.update(sub_type, stats, self.step_ind)
-
-    def three_phase_controller(self):
-        under, over, zerr = self._get_controller_metrics()
-        under, over, zerr = self._lookahead_controller_metrics(under, over, zerr)
-        state = self._select_controller_state(under, over, zerr)
-        self._nudge_mode_fracs(state)
-
-    def _get_controller_metrics(self):
-        under = self.metric_tracker.get('bwd', 'under_coverage')
-        over = self.metric_tracker.get('fwd', 'over_coverage')
-        # in very, very good terminal convergence, empirical Z becomes the target
-        jensen_zerr = self.metric_tracker.get('fwd', 'jensen_z_err')
-        zerr = jensen_zerr if jensen_zerr is not None else 0.0
-
-        if under is None:
-            under = float("inf")  # bootstrap toward bwd
-        if over is None:
-            over = 0.0  # do not demand replay before fwd stats exist
-
-        return under, over, zerr
-
-    def _lookahead_controller_metrics(self, under, over, zerr):
-        """
-        Extrapolate each controller metric a few controller ticks into the
-        future by EMA-smoothing its trend and projecting forward linearly, so
-        _select_controller_state reacts to where a metric is heading rather
-        than where it currently sits. Without this, mode-frac mass keeps
-        moving at full speed right up to a threshold crossing and overshoots
-        the optimal balance before the (lagging) raw metric ever reflects it.
-        """
-        ctrl = self.args.controller
-        lookahead = self.controller_lookahead
-        return (
-            self._linear_ema_lookahead(lookahead['under'], under, ctrl),
-            self._linear_ema_lookahead(lookahead['over'], over, ctrl),
-            self._linear_ema_lookahead(lookahead['zerr'], zerr, ctrl),
-        )
-
-    @staticmethod
-    def _linear_ema_lookahead(state, value, ctrl):
-        """
-        under/over/zerr are already EMAs coming out of metric_tracker, so
-        `value` is already a smoothed level - only its trend (the per-tick
-        delta) needs its own EMA here. state: {'level', 'trend'} dict, mutated
-        in place (persisted via MODELLER_STATE_DEFAULTS so it survives
-        checkpoint reloads); 'level' just holds the previous value.
-        Returns value + horizon * trend, i.e. the predicted value
-        `ctrl.lookahead_horizon` controller ticks ahead.
-        """
-        if not math.isfinite(value):
-            return value
-        if state['level'] is None:
-            state['level'] = value
-            return value
-
-        trend_alpha = getattr(ctrl, 'lookahead_trend_alpha', 0.1)
-        horizon = getattr(ctrl, 'lookahead_horizon', 5)
-        state['trend'] = trend_alpha * (value - state['level']) + (1 - trend_alpha) * state['trend']
-        state['level'] = value
-
-        return value + horizon * state['trend']
-
-    def _select_controller_state(self, under, over, zerr):
-        """
-        Priority order: undercoverage repair > Z convergence > replay repair > global
-        tightening. This is the state/step-size selection logic most likely to change
-        later, so it's kept isolated from the metric plumbing and frac math around it.
-        """
-        ctrl = self.args.controller
-        if under > ctrl.under_threshold:
-            self.controller_anneal_streak = 0
-            return "bwd"
-        elif zerr > ctrl.zerr_threshold:
-            self.controller_anneal_streak = 0
-            return "fwd"
-        elif over > ctrl.over_threshold:
-            self.controller_anneal_streak = 0
-            return "replay"
-        else:
-            # joint condition (all three metrics within threshold) satisfied this tick;
-            # require it to hold for `anneal_patience` consecutive ticks before tightening
-            # the margins, since a single tick is too susceptible to metric noise
-            self.controller_anneal_streak += 1
-            if self.controller_anneal_streak >= getattr(ctrl, 'anneal_patience', 1):
-                self._anneal_controller_thresholds()
-                self.controller_anneal_streak = 0
-            return "fwd"
-
-    def _anneal_controller_thresholds(self):
-        ctrl = self.args.controller
-        if ctrl.under_threshold > ctrl.min_threshold:
-            ctrl.under_threshold *= ctrl.decay_rate
-        if ctrl.over_threshold > ctrl.min_threshold:
-            ctrl.over_threshold *= ctrl.decay_rate
-        if ctrl.zerr_threshold > ctrl.zerr_min_threshold:
-            ctrl.zerr_threshold *= ctrl.decay_rate
-
-    def _nudge_mode_fracs(self, state):
-        ctrl = self.args.controller
-        probs = np.array([self.fwd_frac, self.bwd_frac, self.replay_frac], dtype=float)
-        probs /= probs.sum()
-
-        idx = {"fwd": 0, "bwd": 1, "replay": 2}[state]
-
-        m = ctrl.min_mode_frac  # requires m < 1/3
-        free = 1.0 - 3.0 * m  # total mass available above the floors
-
-        # excess space: x_i = p_i - m, with x_i >= 0 and sum(x) = free
-        excess = np.clip(probs - m, 0.0, None)
-        s = excess.sum()
-        excess = excess * (free / s) if s > 0.0 else np.full(3, free / 3.0)
-
-        # EMA toward the one-hot on the boosted mode
-        excess *= 1.0 - ctrl.beta
-        excess[idx] += ctrl.beta * free
-
-        self.fwd_frac, self.bwd_frac, self.replay_frac = m + excess
 
     def step_loss(self, step_type, loss, do_step: bool = True):
         loss.backward()
@@ -1007,7 +1308,13 @@ class Modeller:
             return  # skip non-finite
 
         self.optimizers[step_type].step()
-        if 'flow' in self.optimizers:
+        # Non-fused steps: step the standalone flow optimizer here (fwd/bwd/replay run
+        # separately, so whichever one had freeze_z=False unambiguously trained Z).
+        # Fused steps: skip it -- flow is a param group of optimizers['fused'], so the
+        # .step() above already updated Z, using only the grad from whichever sub-loss
+        # trained it (the fwd branch); if none did, those params had grad=None and Adam
+        # skipped them, so there's no spurious update to guard against.
+        if 'flow' in self.optimizers and step_type != 'fused':
             self.optimizers['flow'].step()
 
     def fwd_train_step(self,
@@ -1016,11 +1323,18 @@ class Modeller:
                        repeats: int = 1,
                        report_losses: bool = False,
                        ):
-        mol_batch = next(self.mol_dataset.loader(self.batch_size, mode='graphs', repeats=repeats))
+        cfg = getattr(self.args, 'condition_log_z', None)
+        p = None
+        if getattr(cfg, 'mol_sampling_weighted_by_z_gap', False):
+            p = self.mol_dataset_z_gap_weights(
+                temperature=getattr(cfg, 'mol_sampling_z_gap_temperature', 1.0))
+        mol_batch = next(self.mol_dataset.loader(
+            self.batch_size, mode='graphs', repeats=repeats, p=p,
+            beta=getattr(cfg, 'mol_sampling_uniform_beta', 0.0) if p is not None else None))
         mol_batch = mol_batch.to(self.device)
         mol_batch.orient_molecule(mode='std')
         init_state = get_gfn_init_state(mol_batch.num_graphs, self.energy_function.data_ndim, self.device)
-        mol_batch, log_T_tensor, sg_inds, zps, condition = self.energy_function.condition_samples(
+        mol_batch, log_T_tensor, sg_inds, zps, condition, condition_id = self.energy_function.condition_samples(
             mol_batch, repeats=repeats)
 
         return get_gfn_forward_loss(self.args.fwd_loss_coeffs,
@@ -1035,6 +1349,10 @@ class Modeller:
                                     condition=condition,
                                     repeats=repeats,
                                     report_losses=report_losses,
+                                    condition_log_z=self.condition_log_z,
+                                    condition_id=condition_id,
+                                    tb_z_source=self.tb_z_source('fwd'),
+                                    step=self.step_ind,
                                     )
 
     def bwd_train_step(self,
@@ -1042,7 +1360,7 @@ class Modeller:
                        repeats: int,
                        report_losses: bool = False):
 
-        condition, inds, latents, log_reward, mol_batch, traj = self.draw_bwd_sample(repeats)
+        condition, condition_id, inds, latents, log_reward, mol_batch, traj = self.draw_bwd_sample(repeats)
 
         loss, loss_dict = get_gfn_backward_loss(self.args.bwd_loss_coeffs,
                                                 latents.to(self.device),
@@ -1053,7 +1371,12 @@ class Modeller:
                                                 condition=condition,
                                                 repeats=repeats,
                                                 report_losses=report_losses,
-                                                trajectories=traj)
+                                                trajectories=traj,
+                                                condition_log_z=self.condition_log_z,
+                                                condition_id=condition_id,
+                                                tb_z_source=self.tb_z_source('bwd'),
+                                                update_log_z=self.phase in (1, 2),
+                                                step=self.step_ind)
 
         if self.bwd_sampling_mode == 'dataset':
             self.prior_dataset.update_losses(loss_dict['resid'].abs(),
@@ -1069,7 +1392,7 @@ class Modeller:
                           repeats: int,
                           report_losses: bool = False):
 
-        condition, inds, latents, log_reward, mol_batch, traj = self.draw_replay_sample(repeats)
+        condition, condition_id, inds, latents, log_reward, mol_batch, traj = self.draw_replay_sample(repeats)
 
         loss, loss_dict = get_gfn_backward_loss(self.args.replay_loss_coeffs,
                                                 latents.to(self.device),
@@ -1080,7 +1403,12 @@ class Modeller:
                                                 condition=condition,
                                                 repeats=repeats,
                                                 report_losses=report_losses,
-                                                trajectories=traj)
+                                                trajectories=traj,
+                                                condition_log_z=self.condition_log_z,
+                                                condition_id=condition_id,
+                                                tb_z_source=self.tb_z_source('replay'),
+                                                update_log_z=self.phase in (1, 2),
+                                                step=self.step_ind)
 
         self.replay_buffer.update_losses(loss_dict['resid'].abs(), inds)
 
@@ -1098,8 +1426,7 @@ class Modeller:
                     temperature=0.1, beta=1.0))
 
             latents = mol_batch.latent_params()
-            energy = mol_batch[self.args.energy_function]
-            latents, energy = latents.to(self.device), energy.to(self.device)
+            latents = latents.to(self.device)
 
         elif self.bwd_sampling_mode == 'prior':
             mol_batch, inds = next(
@@ -1110,19 +1437,17 @@ class Modeller:
                     temperature=0.1, beta=1.0))
 
             latents = mol_batch.latent_params()
-            energy = mol_batch[self.args.energy_function]
-            latents, energy = latents.to(self.device), energy.to(self.device)
+            latents = latents.to(self.device)
         else:
             assert False, f"sampling method {self.args.sampling} not implemented"
         mol_batch = mol_batch.to(self.device)
-        mol_batch, log_T_tensor, sg_inds, zps, condition = self.energy_function.condition_samples(
+        mol_batch, log_T_tensor, sg_inds, zps, condition, condition_id = self.energy_function.condition_samples(
             mol_batch, repeats=repeats)
         temperature = 10 ** log_T_tensor
         log_reward = self.energy_function.prebuilt_sample_to_reward(mol_batch,
                                                                     temperature)  # relies on the energy terms being attached to the graphs!
-        # if self.phase == 1 and self.gfn_model.conditional:
-        #     condition = False  # ignore conditioning in data-driven prior training
-        return condition, inds, latents, log_reward, mol_batch, traj
+
+        return condition, condition_id, inds, latents, log_reward, mol_batch, traj
 
     @torch.no_grad()
     def draw_replay_sample(self, repeats):
@@ -1135,17 +1460,16 @@ class Modeller:
                 return_traj=True))
 
         latents = mol_batch.latent_params()
-        energy = mol_batch[self.args.energy_function]
-        latents, energy = latents.to(self.device), energy.to(self.device)
+        latents = latents.to(self.device)
         traj = traj.to(self.device)
 
         mol_batch = mol_batch.to(self.device)
-        mol_batch, log_T_tensor, sg_inds, zps, condition = self.energy_function.condition_samples(
+        mol_batch, log_T_tensor, sg_inds, zps, condition, condition_id = self.energy_function.condition_samples(
             mol_batch, repeats=repeats)
         temperature = 10 ** log_T_tensor
         log_reward = self.energy_function.prebuilt_sample_to_reward(mol_batch,
                                                                     temperature)  # relies on the energy terms being attached to the graphs!
-        return condition, inds, latents, log_reward, mol_batch, traj
+        return condition, condition_id, inds, latents, log_reward, mol_batch, traj
 
     def handle_train_epoch_error(self, e, step_type):
         """
@@ -1191,7 +1515,7 @@ class Modeller:
         samples = 0
         while samples < self.args.eval_num_samples:
             try:
-                if self.bwd_sampling_mode == 'dataset':
+                if self.bwd_sampling_mode == 'dataset':  # todo consider mixing, or adding anchor states
                     mol_batch = next(self.prior_dataset.loader(batch_size=self.batch_size, mode='graphs'))
                 elif self.bwd_sampling_mode == 'prior':
                     mol_batch = next(self.prior_buffer.loader(batch_size=self.batch_size, mode='graphs'))
@@ -1201,7 +1525,7 @@ class Modeller:
                 mol_batch = mol_batch.to(self.ema_model.device)
                 terminal_state = mol_batch.latent_params()
 
-                mol_batch, log_T_tensor, sg_inds, zps, condition = self.energy_function.condition_samples(
+                mol_batch, log_T_tensor, sg_inds, zps, condition, condition_id = self.energy_function.condition_samples(
                     mol_batch,
                     temperature=torch.ones(mol_batch.num_graphs, dtype=torch.float32,
                                            device=mol_batch.device) * self.args.energy_config.temperature)
@@ -1232,10 +1556,21 @@ class Modeller:
             acc['log_r'].append(cpu(log_r))
             acc['log_Z_learned'].append(cpu(log_z))
             acc['packing_coeff'].append(cpu(mol_batch.packing_coeff))
+            acc['condition_id'].append(cpu(condition_id))
 
         pooled = {k: torch.cat(v, dim=0) for k, v in acc.items()}
         if not self.gfn_model.conditional:
             pooled['log_Z_learned'] = torch.mean(pooled['log_Z_learned'])
+
+        # deliberately NO tracker update() here (there used to be a phase-gated
+        # one): same single-protocol principle as fwd_eval_sampling -- eval-time
+        # backward sampling (ema_model, fixed eval temperature) is a different
+        # measurement protocol from the train-step bwd stream that feeds the
+        # tracker, and mixing protocols inflates the tracker's second moment by
+        # the between-stream mean shift, spiking the phase-2 logw_std gate (and
+        # the ema_logw sawblade) at every eval. The train-time bwd/replay
+        # update() calls (phase-gated, in get_gfn_backward_loss) are untouched.
+
         return pooled
 
     def log_metrics(self, fwd_stats, bwd_stats, sample_batch):
@@ -1251,7 +1586,8 @@ class Modeller:
         log_Z_learned = fwd_stats['log_Z_learned']
         log_T_tensor = fwd_stats['log_T_tensor']
         metrics.update({f'eval_fwd/{k}': v for k, v in
-                        quick_tb_stats(log_pf, log_pb, log_Z_learned, log_r, **self._reward_ramp_kwargs()).items()})
+                        quick_tb_stats(log_pf, log_pb, log_Z_learned, log_r,
+                                       **self._reward_ramp_kwargs(fwd_stats.get('condition_id'))).items()})
 
         self.log_thermo_properties(arr, fwd_stats, log_T_tensor, log_Z_learned, log_r, metrics, sample_batch, val)
 
@@ -1262,7 +1598,8 @@ class Modeller:
         log_r = bwd_stats['log_r']
         # parity / Z diagnostics (shared with fwd)
         metrics.update({f'eval_bwd/{k}': v for k, v in
-                        quick_tb_stats(log_pf, log_pb, log_z, log_r, **self._reward_ramp_kwargs()).items()})
+                        quick_tb_stats(log_pf, log_pb, log_z, log_r,
+                                       **self._reward_ramp_kwargs(bwd_stats.get('condition_id'))).items()})
 
         def dump_numeric(metrics, prefix, obj):
             d = obj if isinstance(obj, dict) else vars(obj)
@@ -1307,11 +1644,36 @@ class Modeller:
         contrib_per_feature = (loadings ** 2) @ explained_var_ratio  # shape: (num_features,)
         d_eff = (explained_var_ratio ** 2).sum() ** -1
         metrics['Effective Dimension'] = d_eff.item()
-        if self.args.repeats > 1:
+        if getattr(self.args, 'repeats', 1) > 1:  # legacy global-repeats configs only; repeats now lives per-mode in *_loss_coeffs
             metrics['ess'] = log_ess_frac(log_pf, log_pf, repeats=1)  # only useful with repeats > 1
-        x, y = next(self.prior_dataset.loader(batch_size=10000, mode='tensors'))
-        metrics['wass'] = sliced_wasserstein(sample_batch.latent_params(), x,
-                                             n_proj=200)
+        sampled = std_params  # forward-sampled latents, already computed above
+        n = sampled.shape[0]
+        # draw the reference -- and an independent SECOND reference for the null
+        # floor -- at the SAME sample count as the sampler, so the raw and null
+        # sliced-W estimates share the same finite-sample floor (see below).
+        x, _ = next(self.prior_dataset.loader(batch_size=n, mode='tensors'))
+        x2, _ = next(self.prior_dataset.loader(batch_size=n, mode='tensors'))
+        x = x.to(sampled.device, sampled.dtype)
+        x2 = x2.to(sampled.device, sampled.dtype)
+        # Debiased sliced-Wasserstein. SW has a positive, distribution-dependent
+        # finite-sample floor: two independent N-sample empirical clouds of the
+        # SAME distribution sit ~C/sqrt(N) apart, not at 0. We estimate that floor
+        # directly on the reference (null = SW(ref, ref')) and subtract it. This is
+        # valid exactly where it matters: near convergence sampler ~= ref, so the
+        # raw and null floors coincide and cancel; far from convergence the true
+        # signal swamps the floor, so the imperfect cancellation is negligible.
+        # Both terms use the SAME seeded projections, so projection-level MC noise
+        # is correlated between them and partly cancels in the difference too.
+        proj_seed = 0
+        raw = sliced_wasserstein(
+            sampled, x, n_proj=500,
+            generator=torch.Generator(device=sampled.device).manual_seed(proj_seed))
+        null = sliced_wasserstein(
+            x, x2, n_proj=500,
+            generator=torch.Generator(device=sampled.device).manual_seed(proj_seed))
+        metrics['wass'] = raw  # raw SW, logged for reference; phase1to2 gate uses wass_debiased
+        metrics['wass_null'] = null
+        metrics['wass_debiased'] = raw - null
 
     def log_thermo_properties(self, arr, fwd_stats, log_T_tensor, log_Z_learned, log_r, metrics, sample_batch, val):
         # energies
@@ -1337,8 +1699,14 @@ class Modeller:
         metrics['log Z learned'] = val(log_Z_learned.mean())
 
         # get fraction of samples which are 'reasonable' at this energy,
+        # prefer the rescaled mol_energy (matches the actual loss scale) over
+        # the bare energy_function attribute, which is only correct for toy
+        # (non lj-rescaled) energy functions that never set mol_energy
         en_func = self.energy_function.energy_function
-        sample_is_good = (sample_batch[en_func] < 0) * (sample_batch.packing_coeff > 0.55) * (
+        scaled_mol_energy = getattr(sample_batch, 'mol_energy', None)
+        if scaled_mol_energy is None:
+            scaled_mol_energy = sample_batch[en_func]
+        sample_is_good = (scaled_mol_energy < 0) * (sample_batch.packing_coeff > 0.55) * (
                 sample_batch.packing_coeff < 0.95)
         metrics["Reasonable Sample Fraction"] = sample_is_good.float().mean().item()
 
@@ -1360,7 +1728,7 @@ class Modeller:
             # always sample from forward policy
             fig_dict, metrics = eval_figs(fwd_stats,
                                           bwd_stats,
-                                          sample_batch,
+                                          sample_batch.cpu(),
                                           x,
                                           self.args.energy_function,
                                           metrics,
@@ -1375,24 +1743,42 @@ class Modeller:
             adjust_fig_filesize(fig_dict)
             metrics.update(fig_dict)
 
-        metrics.update({'Batch Size': self.batch_size})  # single shared batch size -- train and eval sampling now use the same value
+        metrics.update({
+            'Batch Size': self.batch_size})  # single shared batch size -- train and eval sampling now use the same value
         metrics.update(log_elapsed_times(self.times))
         self.times['eval_wrapup_end'] = time()
         self.times['eval_step_end'] = time()
 
         for key in metrics.keys():  # cleanup before logging
             if isinstance(metrics[key], np.ndarray):
-                metrics[key] = np.nan_to_num(metrics[key])
+                metrics[key] = loggable_array(metrics[key])
             elif torch.is_tensor(metrics[key]):
-                metrics[key] = torch.nan_to_num(metrics[key])
+                metrics[key] = loggable_array(metrics[key].detach().cpu().numpy())
 
         if self.phase == 1:
-            if metrics['wass'] < self.args.wass_threshold:
-                self.phase1to2(metrics)
+            # when TBC is active in phase 1, its rolling train-time EMA must also be
+            # converged before leaving the MLE warm start -- the point of TBC (see
+            # get_tbc_loss) is to enter TB/Z training with tame intra-terminal
+            # Var(log w), so distribution match (wass) alone no longer qualifies
+            tbc_active = getattr(self.args.bwd_loss_coeffs, 'tbc', 0) > 0
+            tbc_converged = (not tbc_active or
+                             self.metric_tracker.get('bwd', 'tbc', float('inf')) < self.args.tbc_threshold)
+            if metrics['wass_debiased'] < self.args.wass_threshold and tbc_converged:
+                if getattr(self.args, 'variance_conditioning_phase', False):
+                    self.phase1to2(metrics)  # route through phase 2: variance conditioning
+                else:
+                    self.phase1to3(metrics)  # direct to equilibration
 
         elif self.phase == 2:
-            if self.metric_tracker.get('bwd', 'under_coverage') < self.args.controller.under_threshold:
-                self.phase2to3()
+            # variance-conditioning exit: the policy is self-consistent enough for
+            # Z learning to get traction when the tracker-implied per-condition
+            # std of log w is tight -- NOT when it has reached the true target
+            # (that's phase 3's job). rms_logw_std returns +inf until conditions
+            # have evidence, so this can't fire on ignorance.
+            logw_std = self.condition_log_z.rms_logw_std()
+            metrics['logw_std_rms'] = logw_std
+            if logw_std < self.args.logw_std_threshold:
+                self.phase2to3(metrics)
 
         if self.phase in [2, 3]:  # add samples to off-policy buffer
             self.manage_prior_buffer(sample_batch)
@@ -1400,11 +1786,19 @@ class Modeller:
 
         if hasattr(self, 'anchor_buffer'):
             self.anchor_eval_cycle_count = getattr(self, 'anchor_eval_cycle_count', 0) + 1
-            if self.anchor_eval_cycle_count % self.args.buffers.anchor_buffer.thin_every_n_evals == 0:
-                cfg = self.args.buffers.anchor_buffer
-                self.anchor_buffer.thin(cfg.dist_cutoff, max_size=cfg.max_size)
+            cfg = self.args.buffers.anchor_buffer
+            if self.anchor_eval_cycle_count % cfg.thin_every_n_evals == 0:
+                self.anchor_buffer.thin(
+                    self.condition_log_z.best_energy,
+                    energy_window=cfg.thin_energy_window,
+                    max_size=cfg.max_size,
+                    max_per_condition=getattr(cfg, 'max_per_condition', None),
+                )
+            if self.anchor_eval_cycle_count % cfg.refresh_every_n_evals == 0:
+                self.refresh_anchor_buffer_surprise()
 
         metrics.update(self.log_buffer_stats())
+        metrics.update(self.log_condition_log_z_stats())
 
         return metrics
 
@@ -1431,11 +1825,11 @@ class Modeller:
                 'prior_buffer_median_steps': torch.nanmedian(buff.select_counts.float()).item(),
                 'prior_buffer_mean_loss': torch.nanmean(buff.ema_loss).item(),
                 'prior_buffer_median_loss': torch.nanmedian(buff.ema_loss).item(),
-                'prior_buffer_step_hist': wandb.Histogram(buff.select_counts.cpu().numpy()),
+                'prior_buffer_step_hist': safe_histogram(buff.select_counts.cpu().numpy()),
             })
             metrics.update(self.energy_reward_stats('prior_buffer', energy=buff.y))
             if len(valid_losses) > 0:
-                metrics['prior_buffer_loss_hist'] = wandb.Histogram(np.clip(np.log10(valid_losses), min=-1, max=3))
+                metrics['prior_buffer_loss_hist'] = safe_histogram(np.clip(np.log10(valid_losses), min=-1, max=3))
 
         if hasattr(self, 'replay_buffer'):
             valid_replay_losses = self.replay_buffer.ema_loss[~torch.isnan(self.replay_buffer.ema_loss)].cpu().numpy()
@@ -1445,20 +1839,63 @@ class Modeller:
                 'replay_buffer_median_steps': torch.nanmedian(self.replay_buffer.select_counts.float()).item(),
                 'replay_buffer_mean_loss': torch.nanmean(self.replay_buffer.ema_loss).item(),
                 'replay_buffer_median_loss': torch.nanmedian(self.replay_buffer.ema_loss).item(),
-                'replay_buffer_step_hist': wandb.Histogram(self.replay_buffer.select_counts.cpu().numpy()),
+                'replay_buffer_step_hist': safe_histogram(self.replay_buffer.select_counts.cpu().numpy()),
             })
             metrics.update(self.energy_reward_stats('replay_buffer', energy=self.replay_buffer.y))
             if len(valid_replay_losses) > 0:
-                metrics['replay_buffer_loss_hist'] = wandb.Histogram(
+                metrics['replay_buffer_loss_hist'] = safe_histogram(
                     np.clip(np.log10(valid_replay_losses), min=0, max=3))
 
         if hasattr(self, 'anchor_buffer'):
             metrics['anchor_buffer_length'] = len(self.anchor_buffer)
-            metrics.update(self.energy_reward_stats('anchor_buffer', reward=self.anchor_buffer.reward))
+            metrics.update(self.energy_reward_stats('anchor_buffer', energy=self.anchor_buffer.energy))
             if hasattr(self, 'last_anchor_topup'):
                 metrics['anchor_topup_last_n'] = self.last_anchor_topup
+            if hasattr(self, 'last_anchor_confirm_spread'):
+                metrics['anchor_confirm_spread_last'] = self.last_anchor_confirm_spread
+            valid_surprise = self.anchor_buffer.original_surprise[
+                ~torch.isnan(self.anchor_buffer.original_surprise)].cpu().numpy()
+            if len(valid_surprise) > 0:
+                metrics['anchor_original_surprise_hist'] = safe_histogram(valid_surprise, num_bins=128)
+            valid_priority = self.anchor_buffer.ema_loss[~torch.isnan(self.anchor_buffer.ema_loss)].cpu().numpy()
+            if len(valid_priority) > 0:
+                metrics['anchor_replay_priority_hist'] = safe_histogram(valid_priority, num_bins=128)
 
         return metrics
+
+    def log_condition_log_z_stats(self):
+        """
+        Histograms/summary stats over all visited conditions in
+        self.condition_log_z: ema_logw (the Jensen lower-bound estimate
+        actually fed back into training, see ConditionLogZTracker.lookup),
+        ema_log_z_emp (the logmeanexp/empirical estimate), and their gap
+        (ema_log_z_emp - ema_logw >= 0 by Jensen's inequality -- large gap
+        means high-variance log importance weights for that condition).
+        """
+        if not hasattr(self, 'condition_log_z'):
+            return {}
+
+        tracker = self.condition_log_z
+        valid = ~torch.isnan(tracker.ema_logw)
+        if valid.sum() == 0:
+            return {}
+
+        ema_logw = tracker.ema_logw[valid].cpu().numpy()
+        ema_log_z_emp = tracker.ema_log_z_emp[valid].cpu().numpy()
+        gap = ema_log_z_emp - ema_logw
+
+        return {
+            'condition_log_z_num_visited': int(valid.sum().item()),
+            'condition_log_z_mean_ema_logw': float(np.mean(ema_logw)),
+            'condition_log_z_median_ema_logw': float(np.median(ema_logw)),
+            'condition_log_z_ema_logw_hist': safe_histogram(ema_logw, num_bins=128),
+            'condition_log_z_mean_ema_log_z_emp': float(np.mean(ema_log_z_emp)),
+            'condition_log_z_median_ema_log_z_emp': float(np.median(ema_log_z_emp)),
+            'condition_log_z_ema_log_z_emp_hist': safe_histogram(ema_log_z_emp, num_bins=128),
+            'condition_log_z_mean_gap': float(np.mean(gap)),
+            'condition_log_z_median_gap': float(np.median(gap)),
+            'condition_log_z_gap_hist': safe_histogram(gap, num_bins=128),
+        }
 
     def energy_reward_stats(self, prefix, energy=None, reward=None):
         """
@@ -1482,12 +1919,12 @@ class Modeller:
             f'{prefix}_median_energy': float(np.median(energy_np)),
             f'{prefix}_min_energy': float(np.min(energy_np)),
             f'{prefix}_max_energy': float(np.max(energy_np)),
-            f'{prefix}_energy_hist': wandb.Histogram(energy_np, num_bins=128),
+            f'{prefix}_energy_hist': safe_histogram(energy_np, num_bins=128),
             f'{prefix}_mean_reward': float(np.mean(reward_np)),
             f'{prefix}_median_reward': float(np.median(reward_np)),
             f'{prefix}_min_reward': float(np.min(reward_np)),
             f'{prefix}_max_reward': float(np.max(reward_np)),
-            f'{prefix}_reward_hist': wandb.Histogram(reward_np, num_bins=128),
+            f'{prefix}_reward_hist': safe_histogram(reward_np, num_bins=128),
         }
 
     def manage_prior_buffer(self, sample_batch):
@@ -1505,7 +1942,8 @@ class Modeller:
         # always churn at least a little bit
         n_churn = max(1000,
                       int((num_bwd_steps / self.args.buffers.prior_buffer.mean_lifetime) * self.batch_size))
-        n_to_add = min(self.args.eval_num_samples, n_churn)  # cap unrelated to GPU batch size -- eval_batch_size is retired, this is just a churn-rate limiter
+        n_to_add = min(self.args.eval_num_samples,
+                       n_churn)  # cap unrelated to GPU batch size -- eval_batch_size is retired, this is just a churn-rate limiter
         headroom = max(0, self.args.buffers.prior_buffer.max_size - len(self.prior_buffer))
 
         if n_to_add > headroom:
@@ -1531,10 +1969,16 @@ class Modeller:
         remaining_budget = n_to_add  # - len(bad_inds)
 
         # sample from prior
-        if remaining_budget > 0: # todo track conditioning through this step so rewards are consistent
+        if remaining_budget > 0:
             metrics, sample_batch = self.sample_from_prior(remaining_budget)
             reward = metrics['log_r']
-            good_inds = torch.argwhere(reward > self.args.buffers.prior_buffer.reward_min).flatten()
+            energy = -reward * (10 ** metrics['log_T_tensor'])
+            energy_floor = self._condition_energy_floor(metrics['condition_id'])
+            if energy_floor is not None:
+                good_inds = torch.argwhere(
+                    energy < energy_floor + self.args.buffers.prior_buffer.ramp_floor_range).flatten()
+            else:
+                good_inds = torch.argwhere(reward > self.args.buffers.prior_buffer.reward_min).flatten()
             if good_inds.numel() > 0:
                 batch_to_add = sample_batch.subsample_new_batch(good_inds)
                 self.prior_buffer.add(batch_to_add)
@@ -1546,21 +1990,27 @@ class Modeller:
             if shortfall > 0 and getattr(self, 'anchor_buffer', None) is not None and len(self.anchor_buffer) > 0:
                 self.top_up_prior_from_anchors(shortfall)
 
-        # reach trigger: even prior_buffer's own upper tail is still hugging
-        # reward_min instead of reaching up toward the best anchor -- it isn't
-        # discovering/retaining good samples on its own, so actively replace
-        # some of its worst material with anchor-sourced top-up rather than
-        # waiting for a shortfall to expose the problem
-        if getattr(self, 'anchor_buffer', None) is not None and len(self.anchor_buffer) > 0 and len(self.prior_buffer) > 0:
+        # reach trigger: even prior_buffer's own upper tail is still hugging its
+        # own condition's floor instead of reaching up toward that condition's
+        # best anchor -- it isn't discovering/retaining good samples on its own,
+        # so actively replace some of its worst material with anchor-sourced
+        # top-up rather than waiting for a shortfall to expose the problem.
+        # excess-above-condition-best (not raw energy/reward) is pooled across
+        # the whole buffer for the quantile, so one condition's easier scale
+        # can't make the buffer look healthier than it actually is elsewhere.
+        if getattr(self, 'anchor_buffer', None) is not None and len(self.anchor_buffer) > 0 and len(
+                self.prior_buffer) > 0:
             cfg = self.args.buffers.anchor_buffer
-            reward_min = self.args.buffers.prior_buffer.reward_min
-            anchor_max = self.anchor_buffer.reward.max().item()
-            span = anchor_max - reward_min
-            if span > 0:
-                prior_reward = -self.prior_buffer.y.cpu() / self.args.energy_config.temperature
-                reach = (torch.quantile(prior_reward, cfg.reach_quantile).item() - reward_min) / span
-                if reach < cfg.reach_threshold:
-                    self.top_up_prior_from_anchors(cfg.reach_topup_size, purge_worst=True)
+            margin = self.args.buffers.prior_buffer.ramp_floor_range
+            prior_condition_id = self.prior_buffer.batch.condition_id
+            energy_floor = self._condition_energy_floor(prior_condition_id)
+            if energy_floor is not None:
+                valid = torch.isfinite(energy_floor)
+                if valid.any():
+                    excess = self.prior_buffer.y.cpu()[valid] - energy_floor[valid]
+                    reach = 1.0 - torch.quantile(excess, cfg.reach_quantile).item() / margin
+                    if reach < cfg.reach_threshold:
+                        self.top_up_prior_from_anchors(cfg.reach_topup_size, purge_worst=True)
 
     @torch.no_grad()
     def top_up_prior_from_anchors(self, n, purge_worst: bool = False):
@@ -1570,6 +2020,17 @@ class Modeller:
         noise-then-rescore pattern already used by
         substitute_prior/calibrate_prior_noise in utils.py, just sourced from
         the permanent archive instead of the live buffer being calibrated.
+
+        Anchors are drawn priority-weighted (AnchorBuffer.ema_loss, repurposed
+        here as a replay-priority EMA -- see AnchorBuffer's docstring) with a
+        random floor (cfg.replay_beta), rather than uniformly. The priority
+        EMA itself is refreshed elsewhere, by refresh_anchor_buffer_surprise's
+        periodic full sweep over the whole anchor buffer -- not here. An
+        earlier version of this method measured each noised child's own
+        surprise and routed it back to its parent per-draw, but that's a
+        biased partial refresh (only touches priority-weighted-plus-floor
+        draws) and was dropped once the full sweep existed to do the same job
+        uniformly and without that bias.
 
         purge_worst: if True, first purge up to n of prior_buffer's lowest-
         reward (highest-energy) entries, so the anchor-sourced batch actively
@@ -1586,21 +2047,95 @@ class Modeller:
 
         n_draw = min(n, len(self.anchor_buffer))
 
-        anchor_batch, _, _ = self.anchor_buffer.sample_graphs(n_draw, replace=False)
+        anchor_batch, _, _ = self.anchor_buffer.sample_graphs(
+            n_draw, replace=False, weighted=True, temperature=1.0, beta=cfg.replay_beta)
         anchor_batch = anchor_batch.clone().to(self.device)
         anchor_batch.log_noise_latent_parameters(*cfg.noise_log_range)
 
-        anchor_batch, log_T_tensor, sg_inds, zps, condition = self.energy_function.condition_samples(
+        anchor_batch, log_T_tensor, sg_inds, zps, condition, condition_id = self.energy_function.condition_samples(
             anchor_batch, sg_inds=anchor_batch.sg_ind, z_primes=anchor_batch.z_prime)
         anchor_batch.orient_molecule(mode='std')
 
+        terminal_latents = anchor_batch.latent_params()
         reward, anchor_batch = self.energy_function.log_reward(
-            anchor_batch.latent_params(), anchor_batch, log_T_tensor, return_exp=True)
+            terminal_latents, anchor_batch, log_T_tensor, return_exp=True)
 
-        good_inds = torch.argwhere(reward > self.args.buffers.prior_buffer.reward_min).flatten()
+        temperature = 10 ** log_T_tensor
+        energy = -reward.detach() * temperature
+
+        if hasattr(self, 'condition_log_z'):
+            # the one buffer-fill path that doesn't route through fwd_eval_sampling
+            # (it noises+rescores stored anchors directly), so it needs its own hook
+            self.condition_log_z.update_best_energy(condition_id, energy)
+
+        energy_floor = self._condition_energy_floor(condition_id)
+        if energy_floor is not None:
+            good_inds = torch.argwhere(
+                energy < energy_floor + self.args.buffers.prior_buffer.ramp_floor_range).flatten()
+        else:
+            good_inds = torch.argwhere(reward > self.args.buffers.prior_buffer.reward_min).flatten()
         if good_inds.numel() > 0:
             self.prior_buffer.add(anchor_batch.subsample_new_batch(good_inds))
         self.last_anchor_topup = good_inds.numel()
+
+    @torch.no_grad()
+    def refresh_anchor_buffer_surprise(self):
+        """
+        Full periodic re-measurement of every anchor's current surprise,
+        refreshing AnchorBuffer.ema_loss (the replay-priority EMA -- see
+        AnchorBuffer's docstring) directly. Almost identical to
+        bwd_eval_sampling's backward-rollout call, except:
+          - one rollout (K=1) per anchor, not the confirm-grade K=5-10 used
+            at admission -- this is meant to be cheap and just needs to
+            cover every anchor, not produce a low-variance estimate
+          - iterated as a deterministic sweep over the whole anchor buffer
+            (index chunks 0:bsz, bsz:2*bsz, ...), not a random draw-with-
+            replacement over a held-out eval set -- every anchor gets
+            touched exactly once per call, not a sample of them
+          - no loss/metric aggregation or condition_log_z update; the only
+            effect is the routed update_losses call at the end
+
+        This is the sole source of replay-priority signal: routing from
+        top_up_prior_from_anchors's own noised-child rollouts was dropped
+        as a biased partial refresh (only touches priority-weighted-plus-
+        floor draws), and continuous routing from real backward-training
+        draws was ruled out as too invasive (anchor_buffer positions aren't
+        stable across thin()'s reindexing, so it would need its own stable-
+        id scheme). A periodic full sweep sidesteps both: every anchor is
+        touched uniformly, and since indices are this call's own fresh
+        torch.arange(n) rather than anything held across calls, there's no
+        staleness to worry about.
+
+        Called from evaluation()'s anchor_buffer block on its own cadence
+        (buffers.anchor_buffer.refresh_every_n_evals), independent of
+        thin()'s cadence -- a full sweep needs to guarantee coverage, so
+        it's paced by a period rather than the rate-based churn prior_buffer/
+        replay_buffer use elsewhere (see discussion at the call site).
+        """
+        if not hasattr(self, 'anchor_buffer') or len(self.anchor_buffer) == 0:
+            return
+
+        eval_discretizer = lambda bsz: uniform_discretizer(bsz, self.args.eval_T)
+        n = len(self.anchor_buffer)
+        condition = self.anchor_buffer.batch.conditions.detach().to(self.device)
+        latents = self.anchor_buffer.x.to(self.device)
+
+        surprise = torch.empty(n, dtype=torch.float32)
+        start = 0
+        while start < n:
+            end = min(start + self.batch_size, n)
+            idx = torch.arange(start, end, device=self.device)
+            try:
+                chunk_batch = self.anchor_buffer.batch.subsample_new_batch(idx).to(self.device)
+                _, log_pfs, log_pbs, _ = self.ema_model.get_traj_bwd(
+                    latents[idx], eval_discretizer, condition[idx], chunk_batch)
+            except (RuntimeError, ValueError) as e:
+                self.handle_train_epoch_error(e, 'anchor_refresh')
+                continue
+            surprise[start:end] = (-(log_pfs.sum(-1) - log_pbs.sum(-1))).cpu()
+            start = end
+
+        self.anchor_buffer.update_losses(surprise, torch.arange(n))
 
     def bwd_step_delta(self):
         if not hasattr(self, 'prev_bwd_step_count'):
@@ -1720,53 +2255,204 @@ class Modeller:
                     init_loss=resid[add_choice],
                 )
 
-    def manage_anchor_buffer(self, reward, sample_batch):
+    def init_anchor_buffer_seed(self):
         """
-        Admit high-quality, mutually latent-distinct samples from a freshly
-        generated (never buffer-replayed) batch into the permanent anchor
-        archive. See AnchorBuffer.admit for the admission/dedup policy.
+        Optionally pre-populate self.anchor_buffer at init time instead of
+        letting screen_and_admit_anchors's lazy bootstrap build it from the
+        first fwd-eval-sampled batch (its `if not hasattr(self,
+        'anchor_buffer')` branch). buffers.anchor_buffer.seed_source:
+          'generated'      -- default, unchanged: lazy bootstrap from generated samples
+          'prior_dataset'  -- seed from self.prior_dataset, the real high-quality
+                              dataset already loaded for backward training
+          <a path>         -- anything else is treated as a path and torch.load'd
+                              the same way molecules_path/prior_path are, for
+                              side-loading a curated set of good seeds
+        Since screen_and_admit_anchors only bootstraps when self.anchor_buffer
+        doesn't exist yet, pre-populating it here fully replaces that path --
+        no changes needed there. Seed entries carry no rollout-based surprise
+        measurement (original_surprise is left NaN, per AnchorBuffer's legacy
+        fallback), so they're immune to thin()'s original-surprise-ranked
+        hard-cap backstop until they're confirmed/re-admitted through normal
+        training.
+        """
+        if hasattr(self, 'anchor_buffer'):
+            return  # already populated from a reloaded checkpoint -- don't clobber it
 
-        Only called at eval cadence (from fwd_eval_sampling -- see its call
-        sites below), not from every training step. Late in training there
-        can be an extreme abundance of high-reward on-policy samples, and
-        both admit()'s incremental dedup and the periodic full thin() pass
-        get expensive if run every fwd/fused step; eval cadence keeps that
-        bounded on the assumption that the forward policy isn't discovering
-        anything genuinely new that on-policy eval sampling won't also see.
+        cfg = self.args.buffers.anchor_buffer
+        seed_source = getattr(cfg, 'seed_source', 'generated')
+        if seed_source == 'generated':
+            return
+
+        if seed_source == 'prior_dataset':
+            seed_batch = self.prior_dataset.batch.clone().to(self.device)
+        else:
+            seed_data = torch.load(seed_source, weights_only=False)
+            if isinstance(seed_data, dict):
+                seed_data = seed_data.get('equalized_prior', seed_data.get('prior', seed_data))
+            seed_batch = collate_data_list(seed_data, max_z_prime=max(self.args.z_primes)) \
+                if isinstance(seed_data, list) else seed_data
+            seed_batch = seed_batch.to(self.device)
+            # Strip lazily-built caches before anything computes off a
+            # side-loaded batch. See buffer.strip_lazy_sg_caches for why.
+            strip_lazy_sg_caches(seed_batch)
+            _, seed_batch = self.energy_function.batched_analyze_crystal_batch(
+                seed_batch.latent_params(), seed_batch,
+                self.args.energy_config.temperature * torch.ones(
+                    seed_batch.num_graphs, dtype=torch.float32, device=self.device),
+                return_batch=True, internal_oom_recovery=True)
+            seed_batch = seed_batch.to(self.device)
+
+        seed_batch, log_T_tensor, sg_inds, zps, condition, condition_id = self.energy_function.condition_samples(
+            seed_batch, sg_inds=getattr(seed_batch, 'sg_ind', None), z_primes=getattr(seed_batch, 'z_prime', None))
+        temperature = 10 ** log_T_tensor
+        reward = self.energy_function.prebuilt_sample_to_reward(seed_batch, temperature)
+        energy = -reward.detach() * temperature
+
+        self.anchor_buffer = AnchorBuffer(
+            seed_batch.cpu(),
+            device='cpu',
+            reward=reward.cpu(),
+            energy=energy.cpu(),
+            max_z_prime=max(self.args.z_primes),
+        )
+
+    @torch.no_grad()
+    def screen_and_admit_anchors(self, sample_batch, log_r, energy, log_pf_est):
+        """
+        Surprise-gated anchor promotion: a state is anchor-worthy iff it has
+        good Boltzmann weight (energy near Emin(c), the per-condition running
+        best tracked by condition_log_z) *and* the current forward policy
+        under-samples it *relative to its Boltzmann weight* -- not in an
+        absolute sense.
+
+        "Surprise" is the trajectory-balance residual itself: the forward/
+        backward log-ratio measured against the reward/Z log-ratio,
+
+            surprise = (log_pf - log_pb) - (log_r - log_Z(c))
+                     = log_Z(c) + log_pf - log_pb - log_r
+
+        which is 0 at the TB fixed point. surprise << 0 means the policy's
+        forward-vs-backward ratio falls far short of what the state's reward
+        (relative to Z(c)) warrants -- an under-weighted high-reward mode.
+        log_Z(c) = condition_log_z.lookup(c) (its stable ema_logw target).
+        Since log_r and log_Z(c) are both deterministic given x/condition,
+        centering is a per-candidate shift that adds no rollout variance to
+        the log_pf - log_pb estimate. Two-stage:
+
+          1. Screen: cheap energy pre-filter AND'd with the surprise gate. The
+             log_pf - log_pb term here is the free k=1 forward-path value
+             computed in fwd_eval_sampling and passed in as log_pf_est, so no
+             backward rollout is spent screening. Both gates are pure tensor
+             comparisons; nothing is rolled out until confirm. Candidates
+             whose condition lacks a warmed-up log_Z(c) (lookup mask False)
+             are held back -- the axis isn't yet trustworthy.
+          2. Confirm: K backward rollouts (gflownet_losses.log_pf_estimate,
+             IWAE/logsumexp) on screen-survivors only give an accurate
+             log p_hat in place of log_pf - log_pb, fed through the *same*
+             residual form -- rare, so K=5-10 is cheap in aggregate. Dominated
+             by the best rollout, so a single unlucky trajectory can't fake
+             surprise; still poor -> admitted.
+
+        Runs on both prior-model-sampled batches (via sample_from_prior ->
+        fwd_eval_sampling) and on-policy eval batches (evaluation() ->
+        fwd_eval_sampling) -- both are freshly generated, freshly scored
+        terminal batches routed through fwd_eval_sampling's single call site,
+        so one criterion gates both instead of two divergent admission rules.
+
+        original_surprise (the TB residual at admission) is stored frozen on
+        each admitted anchor and used by thin() to rank the buffer -- centered
+        on log_Z(c), so it's comparable across conditions. AnchorBuffer.admit's
+        dup_cutoff is a cheap literal-duplicate catch on this (already rare)
+        confirmed set, not a novelty judgment -- see AnchorBuffer's docstring.
         """
         cfg = self.args.buffers.anchor_buffer
+        log_r = torch.as_tensor(log_r).detach().to(self.device).flatten()
+        energy = torch.as_tensor(energy).detach().to(self.device).flatten()
+        log_pf_est = torch.as_tensor(log_pf_est).detach().to(self.device).flatten()
+        if energy.numel() == 0:
+            return
+
+        sample_batch = sample_batch.clone().to(self.device)
+        condition = sample_batch.conditions.detach().to(self.device)
+        condition_id = sample_batch.condition_id.detach().to(self.device).flatten()
+
+        best_energy = self.condition_log_z.best_energy.to(self.device)[condition_id]
+        visited = torch.isfinite(best_energy)
+        plausible = visited & (energy < best_energy + cfg.screen_energy_window)
+
+        # per-condition log Z (stable ema_logw target) anchoring the TB-residual
+        # axis; z_mask is False for conditions not yet warmed up, where the
+        # axis -- and therefore the gate -- can't be trusted.
+        log_Z_c, z_mask = self.condition_log_z.lookup(condition_id)
+        log_Z_c = log_Z_c.to(self.device)
+        z_mask = z_mask.to(self.device)
+
+        # TB residual from the free k=1 forward-path estimate of log_pf - log_pb.
+        # No backward rollout spent screening; confirm below re-checks
+        # survivors with the proper K-sample IWAE under the same residual
+        # form, so this cheap gate only narrows the confirm set.
+        screen_surprise = log_Z_c + log_pf_est - log_r
+        screen_idx = torch.nonzero(
+            plausible & z_mask & (screen_surprise < cfg.surprise_cutoff),
+            as_tuple=False).flatten()
+        if screen_idx.numel() == 0:
+            return
+
+        eval_discretizer = lambda bsz: uniform_discretizer(bsz, self.args.eval_T)
+        latents = sample_batch.latent_params()
+
+        K = cfg.confirm_k
+        n_cand = screen_idx.numel()
+        confirm_batch = sample_batch.subsample_new_batch(screen_idx)
+        tile = torch.arange(n_cand, device=self.device).repeat_interleave(K)
+        tiled_batch = confirm_batch.subsample_new_batch(tile)
+
+        _, c_log_pfs, c_log_pbs, _ = self.ema_model.get_traj_bwd(
+            latents[screen_idx][tile], eval_discretizer,
+            condition[screen_idx][tile], tiled_batch)
+        log_w_k, log_p_hat = log_pf_estimate(c_log_pfs.sum(-1), c_log_pbs.sum(-1), K)
+
+        # same TB-residual axis as the screen gate, now on the accurate
+        # K-sample log_p_hat (IWAE estimate of log_pf - log_pb) instead of the
+        # k=1 screen estimate.
+        confirm_surprise = log_Z_c[screen_idx] + log_p_hat - log_r[screen_idx]
+        confirmed_local = torch.nonzero(confirm_surprise < cfg.confirm_cutoff, as_tuple=False).flatten()
+        if confirmed_local.numel() == 0:
+            return
+        confirmed_idx = screen_idx[confirmed_local]
+
+        spread = (log_w_k.max(dim=1).values - log_w_k.min(dim=1).values)[confirmed_local]
+        self.last_anchor_confirm_spread = spread.mean().item()
+
+        # store the TB residual itself, not -log_p_hat: sign flipped so larger
+        # = more surprising, matching thin()'s "drop lowest first".
+        original_surprise = (-confirm_surprise[confirmed_local]).cpu()
+        admit_batch = sample_batch.subsample_new_batch(confirmed_idx).cpu()
+        admit_reward = log_r[confirmed_idx].cpu()
+        admit_energy = energy[confirmed_idx].cpu()
 
         if not hasattr(self, 'anchor_buffer'):
-            reward = torch.as_tensor(reward).detach().cpu().flatten()
-            if reward.numel() == 0:
-                return
-            if cfg.admit_range is not None:
-                # no anchor buffer yet to anchor the gate to -- fall back to this
-                # batch's own best as the reference point
-                floor = reward.max().item() - cfg.admit_range
-                keep = torch.nonzero(reward > floor, as_tuple=False).flatten()
-            else:
-                keep = torch.arange(reward.numel())
-            if keep.numel() == 0:
-                return
             self.anchor_buffer = AnchorBuffer(
-                sample_batch.subsample_new_batch(keep),
-                device='cpu',
-                reward=reward[keep],
+                admit_batch, device='cpu',
+                reward=admit_reward, energy=admit_energy,
+                original_surprise=original_surprise,
                 max_z_prime=max(self.args.z_primes),
             )
-            self.anchor_buffer.thin(cfg.dist_cutoff)  # dedup within the bootstrap batch itself
             return
 
         self.anchor_buffer.admit(
-            sample_batch,
-            reward,
-            dist_cutoff=cfg.dist_cutoff,
-            admit_range=cfg.admit_range,
+            admit_batch, admit_reward, admit_energy,
+            dup_cutoff=cfg.dup_cutoff, admit_range=None,
+            original_surprise=original_surprise,
         )
 
         if len(self.anchor_buffer) > cfg.max_size:
-            self.anchor_buffer.thin(cfg.dist_cutoff, max_size=cfg.max_size)
+            self.anchor_buffer.thin(
+                self.condition_log_z.best_energy,
+                energy_window=cfg.thin_energy_window,
+                max_size=cfg.max_size,
+                max_per_condition=getattr(cfg, 'max_per_condition', None),
+            )
 
     def sample_from_prior(self, num_samples):
         "sample from prior"
@@ -1867,41 +2553,197 @@ class Modeller:
         pooled['log_Z_lb'] = log_weight.mean()
         pooled['log_Z_learned'] = pooled['log_flow'][:, 0]
 
+        # energy computed unconditionally (not just under condition_log_z) since
+        # screen_and_admit_anchors below needs it regardless of whether the persistent
+        # per-condition tracker is present
+        temperature = 10 ** pooled['log_T_tensor']
+        energy = -pooled['log_r'] * temperature
+
+        # deliberately NO tracker update() or update_z_residual() here (both used
+        # to be): this eval batch is a different measurement protocol on several
+        # axes at once -- ema_model weights, a fresh log-uniform temperature
+        # sweep, uniform mol draws, ~eval_num_samples pooled rows -- while the
+        # ConditionLogZTracker is a rolling estimate over the *train-step*
+        # stream, and every training-facing consumer of it (phase-2 logw_std
+        # gate, phase-3 bootstrap_log_z target, zerr/controller, persistent
+        # tb_z_source) needs a single, homogeneous protocol. Mixing the eval
+        # stream in spiked those statistics at every eval: the z-residual and
+        # (worse) the second moment, since folding in a stream with a shifted
+        # mean inflates ema_logw_sq - ema_logw^2 by the between-stream
+        # (delta mean)^2 term even when both streams are individually tight --
+        # and the phase gates read the tracker moments immediately after this
+        # function runs, i.e. at peak contamination. This was also the root of
+        # the old ema_logw "sawblade at eval cycles" that max_batch_weight only
+        # bandaged (it caps trust, but can't fix a shifted value). The train
+        # stream updates every step and dominates on evidence anyway; eval-batch
+        # statistics remain fully available in the eval metrics themselves.
+        if hasattr(self, 'condition_log_z'):
+            # best-seen energy IS protocol-independent (a running min), so it
+            # still takes eval evidence -- covers eval sampling
+            # itself, and (since sample_from_prior/manage_prior_buffer/
+            # screen_and_admit_anchors all consume this same pooled batch) transitively
+            # covers prior-buffer churn and anchor-buffer admission too, with no
+            # separate hook needed at either of those call sites. Runs before
+            # screen_and_admit_anchors below, so this batch's own energies are
+            # already folded into Emin(c) by the time it screens against it.
+            self.condition_log_z.update_best_energy(pooled['condition_id'], energy)
+
         # covers both evaluation()'s on-policy eval sampling and sample_from_prior's
         # prior-model sampling (itself called from manage_prior_buffer's churn and
         # grow_prior_buffer's init-time bootstrap) -- both are freshly generated,
-        # freshly scored batches, so both are valid anchor candidates
-        self.manage_anchor_buffer(pooled['log_r'], sample_batch)
+        # freshly scored batches, so both are valid anchor candidates.
+        # log_pf_est = k=1 forward-path estimate of log_pf - log_pb; reused by
+        # the screen stage (TB-residual axis built inside) so it spends no
+        # backward rollouts pre-filtering.
+        log_pf_est = pooled['log_pf'] - pooled['log_pb']
+        self.screen_and_admit_anchors(sample_batch, pooled['log_r'], energy, log_pf_est)
 
         self.times['eval_sampling_end'] = time()
 
         return pooled, sample_batch
 
     def phase1to2(self, metrics):
-        print("Hit initial KLD threshold. Starting prior thermalization.")
+        print("Hit initial KLD threshold. Starting variance conditioning.")
         self.hit_prior = True
         self.phase = 2
         self.bwd_sampling_mode = 'prior'
 
         "adjust loss coefficients"
+        # phase 2 = variance conditioning: make the current policy self-consistent
+        # and well-behaved BEFORE Z ever trains -- deliberately NOT thermalization
+        # toward the true target; the exit criterion is tightness of log w, not
+        # correctness. fwd flips from phase-1 Z-only TB to grouped VarGrad
+        # (vg_by_condition), which attacks the cross-terminal component of
+        # Var(log w) -- the part phase-1 TBC structurally can't touch (TBC -> 0
+        # makes log w a pure function of the terminal, so ALL remaining spread is
+        # cross-terminal: empirically hundreds of nats of reward-vs-prior
+        # mismatch). bwd swaps MLE for grouped VarGrad too: MLE's fixed point is
+        # P_F = mu (the prior), and at P_F = mu, Var(log w) IS the reward-vs-prior
+        # mismatch -- full-weight MLE would anchor the policy at exactly the point
+        # the exit gate measures distance from, making the gate structurally
+        # unreachable. Backward VarGrad has the SAME fixed point as the forward
+        # one (zero variance is measure-independent; the off-policy bias lives
+        # only in the group center, which nothing consumes) and doubles as the
+        # mode-retention anchor: a dropped buffer terminal is an extreme positive
+        # log w outlier, the variance's loudest gradient. TBC carries over
+        # unchanged. Z stays completely untrained until the phase-3 bootstrap,
+        # which the tightened w (via ema_logw) strictly improves.
+        self.fwd_loss_schedule['tb'] = [(0, self.args.fwd_loss_coeffs.tb),
+                                        (self.step_ind, 0.0)]  # phase-1 fwd Z-only TB off; Z untouched until phase 3
+        self.fwd_loss_schedule['vg_lb'] = [(0, 0.0),
+                                           (self.step_ind, getattr(self.args, 'phase2_fwd_vg_lb', 1.0))]  # grouped VarGrad ON
+        self.fwd_loss_schedule['freeze_policy'] = [(0, 1.0),
+                                                   (self.step_ind, 0.0)]  # the policy must move: VarGrad trains it on-policy
+        self.fwd_loss_schedule['freeze_z'] = [(0, 0.0),
+                                              (self.step_ind, 1.0)]  # belt and suspenders: nothing fwd touches Z this phase
+        self.bwd_loss_schedule['mle'] = [(0, self.args.bwd_loss_coeffs.mle),
+                                         (self.step_ind, getattr(self.args, 'phase2_bwd_mle', 0.0))]  # MLE off (or tiny): its P_F=mu anchor fights the gate
+        self.bwd_loss_schedule['vg_lb'] = [(0, 0.0),
+                                           (self.step_ind, getattr(self.args, 'phase2_bwd_vg_lb', 1.0))]  # grouped bwd VarGrad ON: retention + consistency at buffer terminals
+
+        "refresh optimization machinery"
+        self.fwd_loss_monitor.reset()  # new fwd losses
+        self.bwd_loss_monitor.reset()  # new bwd losses
+        self.fwd_loss_monitor.fire_cooldown(self.step_ind)
+        self.bwd_loss_monitor.fire_cooldown(self.step_ind)
+        self.replay_loss_monitor.fire_cooldown(self.step_ind)
+        self.fused_loss_monitor.fire_cooldown(self.step_ind)
+
+        self.lr_warmup_finished = False
+        self.init_schedulers_optimizers()  # re-initialize optimizers for new losses
+        self.set_loss_coeffs()  # take effect immediately
+
+        # even split: mass fwd VarGrad, bwd carrying the MLE/TBC retention anchor
+        self.fwd_frac = 0.5
+        self.bwd_frac = 0.5
+        self.replay_frac = 0.0
+
+        "save checkpoint"
+        self.checkpointer.save('prior')
+        self.prior_model = deepcopy(self.ema_model)
+        self.prior_model.eval()
+        self.set_loss_coeffs()
+
+        # delete phase 1 checkpoint - it converged!
+        os.remove(self.checkpointer.path_for('best'))
+
+    def phase2to3(self, metrics):
+        print("Variance conditioning complete. Starting on-policy equilibration.")
+        # same phase-3 entry as phase1to3 (shared block), minus what phase1to2
+        # already did at the 1->2 boundary: prior snapshot, 'prior' checkpoint,
+        # bwd_sampling_mode switch, and deleting the phase-1 'best' checkpoint
+        self._activate_phase3_losses(metrics)
+        self.checkpointer.save('thermalized')
+
+    def _activate_phase3_losses(self, metrics):
+        """
+        Shared phase-3 entry block for phase1to3 (direct route) and phase2to3
+        (after variance conditioning): loss schedules, Z warm start, optimizer/
+        monitor refresh, and mode fractions. Callers own the route-specific
+        work (prior snapshot/checkpoints, bwd_sampling_mode, print).
+        """
+        "adjust loss coefficients"
         self.bwd_loss_schedule['mle'] = [(0, 1.0),
                                          (self.step_ind, 0.0)]  # turn off mle
-        self.bwd_loss_schedule['bwd_tb_z'] = [(0, 2.0),
-                                              (self.step_ind, 1.0)]  # start log Z learning
+        # tbc: pre-training aid off; optionally retained at a small supplementary
+        # weight (tbc_supplementary) -- it's implied at the TB fixed point, so as
+        # auxiliary pressure it can't fight convergence, and bwd rewards are
+        # prebuilt so its K-tiling costs rollouts only, no extra energy
+        tbc_supp = getattr(self.args, 'tbc_supplementary', 0.0)
+        self.bwd_loss_schedule['tbc'] = [(0, 1.0),
+                                         (self.step_ind, tbc_supp)]
+        if 'repeats' in self.bwd_loss_schedule:  # per-mode repeats configs only; legacy global-repeats configs untouched
+            post_repeats = self.args.bwd_loss_coeffs.repeats if tbc_supp > 0 else 1.0
+            self.bwd_loss_schedule['repeats'] = [(0, self.args.bwd_loss_coeffs.repeats),
+                                                 (self.step_ind, post_repeats)]  # keep K-tiling only if supplementary tbc still consumes it
+        # phase-2 variance conditioning off, both directions (no-op on the
+        # direct 1->3 route, where vg_lb never turned on)
+        self.fwd_loss_schedule['vg_lb'] = [(0, getattr(self.args.fwd_loss_coeffs, 'vg_lb', 0.0)),
+                                           (self.step_ind, 0.0)]
+        self.bwd_loss_schedule['vg_lb'] = [(0, getattr(self.args.bwd_loss_coeffs, 'vg_lb', 0.0)),
+                                           (self.step_ind, 0.0)]
+        # turn on tb everywhere...
+        # ...except fwd when emp_z owns on-policy Z training (the vargrad-Z
+        # experiment): under freeze_policy, per-trajectory fwd TB trains nothing
+        # BUT Z, and its gradient is exactly the stalled one emp_z exists to
+        # replace -- keeping it on would just mix the stalling pull back into
+        # the Z fixed point. emp_z: 0 in the config restores old behavior.
+        fwd_tb_on = 0.0 if getattr(self.args.fwd_loss_coeffs, 'emp_z', 0) > 0 else 1.0
+        self.fwd_loss_schedule['tb'] = [(0, 0.0),
+                                        (self.step_ind, fwd_tb_on)]  # on-policy TB ACTIVATE (unless emp_z owns Z)
         self.bwd_loss_schedule['tb'] = [(0, 0.0),
-                                        (self.step_ind, 1.0)]  # use backward TB for retention
+                                        (self.step_ind, 1.0)]  # off-policy TB ACTIVATE
+        self.replay_loss_schedule['tb'] = [(0, 0.0),
+                                           (self.step_ind, 1.0)]  # replay TB ACTIVATE
+
+        # on-policy Z only
+        self.fwd_loss_schedule['freeze_policy'] = [(0, 0.0),
+                                                   (self.step_ind, 1.0)]  # on-policy log Z ONLY (train Z, freeze policy + conditioner)
+        self.fwd_loss_schedule['freeze_z'] = [(0, 0.0),
+                                                   (self.step_ind, 0.0)]  # on-policy log Z ONLY (train Z, freeze policy + conditioner)
+        # off-policy policy only
+        self.bwd_loss_schedule['freeze_policy'] = [(0, 0.0),
+                                              (self.step_ind, 0.0)]  # ...but detach Z: no off-policy log Z
+        self.replay_loss_schedule['freeze_policy'] = [(0, 0.0),
+                                                 (self.step_ind, 0.0)]  # no off-policy log Z
+        self.bwd_loss_schedule['freeze_z'] = [(0, 0.0),
+                                              (self.step_ind, 1.0)]  # ...but detach Z: no off-policy log Z
+        self.replay_loss_schedule['freeze_z'] = [(0, 0.0),
+                                                 (self.step_ind, 1.0)]  # no off-policy log Z
 
         if (not self.gfn_model.full_flow) and (not self.gfn_model.conditional):
             empirical_Z = metrics['eval_fwd/jensen_z']
             self.gfn_model.flow_model.scalar.data.fill_(empirical_Z)  # warm start at the target value
             self.ema_model.flow_model.scalar.data.fill_(empirical_Z)
         else:
-            pass
-            # assert False, "put in a quick script to train flow[:, 0] to log Z if we're going to use this"
-
-        # self.bwd_loss_schedule['traj_grads'] = [(0, 1.0),
-        #                                         (self.step_ind, 1),
-        #                                         (self.step_ind, 0.0)]  # deactivate reward grads at TB stage
+            # conditional analog of the unconditional .fill_() above -- a single
+            # scalar can't warm-start a per-condition function, so instead fit
+            # flow_model's Z(c) directly onto condition_log_z's ema_logw (built up
+            # during the MLE warm-start, and tightened by phase-2 variance
+            # conditioning when that route is taken) via a short, rollout-free
+            # regression. See bootstrap_log_z's docstring for why ema_logw and
+            # not ema_log_z_emp.
+            self.bootstrap_log_z()
 
         "refresh optimization machinery"
         self.bwd_loss_monitor.reset()  # new losses
@@ -1914,46 +2756,25 @@ class Modeller:
         self.init_schedulers_optimizers()  # re-initialize optimizers for new losses
         self.set_loss_coeffs()  # take effect immediately
 
-        "save checkpoint"
-        self.save_checkpoint('prior')
-        self.prior_model = deepcopy(self.ema_model)
-        self.prior_model.eval()
-        self.set_loss_coeffs()
-
-        # delete phase 1 checkpoint - it converged!
-        os.remove(self._checkpoint_path('best'))
-
-    def phase2to3(self):
-        print("Thermalization complete. Starting on-policy equilibration.")
-        "adjust loss and balancing coefficients"
-        self.bwd_loss_schedule['bwd_tb_z'] = [(0, 1.0),
-                                              (self.step_ind, 0.0)]  # no off-policy log Z
-        self.fwd_loss_schedule['tb'] = [(0, 0.0),
-                                        (self.step_ind, 1.0)]  # on-policy TB ACTIVATE
-        self.replay_loss_schedule['tb'] = [(0, 0.0),
-                                           (self.step_ind, 1.0)]  # replay TB ACTIVATE
-        self.replay_loss_schedule['bwd_tb_z'] = [(0, 1.0),
-                                                 (self.step_ind, 0.0)]  # no off-policy log Z
-        # self.fwd_loss_schedule['fwd_tb_z'] = [(0, 1.0),
-        #                                          (self.step_ind, 2.0)]  # ONLY log Z training on-policy
-
-        "set cooldown"
-        self.fwd_loss_monitor.fire_cooldown(self.step_ind)
-        self.bwd_loss_monitor.fire_cooldown(self.step_ind)
-        self.replay_loss_monitor.fire_cooldown(self.step_ind)
-        self.fused_loss_monitor.fire_cooldown(self.step_ind)
-
-        self.fwd_frac, self.bwd_frac, self.replay_frac = (
-            self.args.controller.min_mode_frac, 1 - 2 * self.args.controller.min_mode_frac,
-            self.args.controller.min_mode_frac)
-        self.set_loss_coeffs()
-
-        self.bwd_frac = 1.0
-        self.fwd_frac = 0.0
+        self.bwd_frac = 0.0
+        self.fwd_frac = 1.0
         self.replay_frac = 0.0
 
         self.phase = 3
-        self.save_checkpoint('thermalized')
+
+    def phase1to3(self, metrics):
+        print("Hit initial KLD threshold. Equilibration.")
+        self.hit_prior = True
+        self.bwd_sampling_mode = 'prior'
+
+        self._activate_phase3_losses(metrics)
+
+        "save checkpoint"
+        self.checkpointer.save('prior')
+        os.remove(self.checkpointer.path_for('best'))
+        self.prior_model = deepcopy(self.ema_model)
+        self.prior_model.eval()
+        self.set_loss_coeffs()
 
 
 if __name__ == '__main__':

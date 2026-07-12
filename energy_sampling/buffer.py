@@ -9,510 +9,23 @@ from torch_geometric.loader import DataLoader
 from mxtaltools.dataset_utils.utils import collate_data_list
 from utils import compute_sample_overlap, iter_forever, stdz
 
-
-def robust_range(x, k=8):
-    med = np.median(x)
-    mad = np.median(np.abs(x - med))
-    sigma_robust = 1.4826 * mad  # consistent with Gaussian σ
-
-    lower = med - k * sigma_robust
-    upper = med + k * sigma_robust
-    return lower, upper
-
-
-class CrystalReplayBuffer:
-    def __init__(self, buffer_size,
-                 device,
-                 energy_function,
-                 batch_size,
-                 beta=1.0,
-                 rank_weight=1e-2,
-                 prioritized=None,
-                 keep_initial_samples: bool = False,
-                 diversity_coeff: float = 0.0,
-                 max_z_prime: int = 1,
-                 buffer_dist_cutoff: float = 0.25,
-                 noised_buffer_length: int = 100000,
-                 noised_max_steps: int = 50,
-                 kT_range: float = 6.0,
-                 ):
-        self.buffer_size = buffer_size
-        self.prioritized = prioritized
-        self.device = device
-        self.batch_size = batch_size
-        self.dataset = None
-        self.buffer_idx = 0
-        self.buffer_full = False
-        self.energy_function = energy_function
-        self.beta = beta
-        self.rank_weight = rank_weight
-        self.beta = beta
-        self.keep_initial_samples = keep_initial_samples  # never delete originally loaded dataset
-        self.rewards_list = None
-        self.x = None
-        self.kT_range = kT_range
-        self.diversity_check_size = 1000
-        self.original_dataset_inds = None
-        self.diversity_coeff = diversity_coeff
-        self.max_z_prime = max_z_prime
-        self.buffer_dist_cutoff = buffer_dist_cutoff
-        self.staging_buffer = []
-        self.noised_buffer_length = noised_buffer_length
-        self.noised_rewards = []  # torch.zeros(self.noised_buffer_length, dtype=torch.float32, device='cpu')
-        self.noised_samples = []  # torch.zeros((self.noised_buffer_length, 6 + 6 * max_z_prime), dtype=torch.float32, device='cpu')
-        self.noised_losses = []  # torch.zeros(self.noised_buffer_length, dtype=torch.float32, device='cpu')
-        self.noised_select_counts = []
-        self.noised_max_steps = noised_max_steps
-
-    @torch.no_grad()
-    def add_to_staging(self, importance_weight, data_list=None, data_batch=None):
-        if len(self.staging_buffer) < len(
-                self):  # don't stage a crazy number of samples - downstream cost becomes too high
-            if data_list is None and data_batch is not None:
-                data_list = data_batch.cpu().detach().batch_to_list()
-
-            self.staging_buffer.extend([elem for ind, elem in enumerate(data_list) if
-                                        importance_weight[ind] > 0])  # keep any plausibly underweighted states
-
-    @torch.no_grad()
-    def add_init(self,
-                 data_list):
-        self.init_fresh_dataset(data_list)
-
-        assert len(self.dataset) == len(self.x_list) == len(self.rewards_list)
-
-    def incorporate_staging_buffer(self):
-        if len(self.staging_buffer) > 0:  # will fail if staging buffer is empty
-            self.add_samples_to_dataset(self.staging_buffer, skip_staging=False)
-            assert len(self.dataset) == len(self.x_list) == len(self.rewards_list)
-
-    def add_samples_to_dataset(self, data_list, skip_staging: bool = False):
-        # batch samples
-        assert False, "This needs to be rewritten / checked for index issues"  # todo
-        if not skip_staging:
-            if len(self.staging_buffer) > 0:  # include staged samples
-                data_list.extend(self.staging_buffer)
-                self.staging_buffer = []
-
-        data_batch = collate_data_list(data_list, max_z_prime=self.max_z_prime)
-        new_latents = data_batch.latent_params()
-        new_sgs = data_batch.sg_ind
-        # get new samples rewards
-        rewards = self.energy_function.prebuilt_sample_to_reward(
-            data_batch,
-            temperature=torch.ones(data_batch.num_graphs) * self.energy_function.temperature)
-
-        # enforce standards for consideration in the buffer
-        score_cut = np.amax(self.rewards_list) - 2  # don't keep things more than 2*kT worse than the best sample
-        # the lowest reward in our dynamical range
-        packing_coeffs = data_batch.packing_coeff.cpu().detach().numpy()
-        good_inds = [ind for ind in range(len(data_list)) if
-                     (data_list[ind].reduction_en <= 1e-3) and (rewards[ind] > score_cut) and (
-                             packing_coeffs[ind] > 0.55) and (packing_coeffs[ind] < 0.95)]
-
-        data_list = [data_batch[ind] for ind in good_inds]
-        data_batch = collate_data_list(data_list, max_z_prime=self.max_z_prime)
-
-        # add anything reasonable
-        if len(good_inds) > 0:
-            data_to_add = [data_list[ind] for ind in good_inds]
-            self.dataset.extend(data_to_add)
-            good_scores = rewards[torch.tensor(good_inds, dtype=torch.long)]
-            self.x_list.extend([new_latents[i] for i in good_inds])
-            self.rewards_list.extend(good_scores.flatten().cpu().detach().numpy())
-            self.sg_list.extend([new_sgs[i] for i in good_inds])
-
-    def init_fresh_dataset(self, data_list):
-        self.dataset = list(data_list)  # I think this is memory safe and faster #copy.deepcopy(data_list)
-        for elem in self.dataset:  # have to do this now because collation is a mess
-            del elem.fingerprint, elem.smiles, elem.mol_ind, elem.identifier, (
-                elem.aunit_batch), elem.skip_box_analysis, elem.cocrystal, elem.symmetry_operators
-
-        dataset_batch = collate_data_list(self.dataset, max_z_prime=self.max_z_prime)
-        x_tensor = dataset_batch.latent_params()
-        rewards = self.energy_function.prebuilt_sample_to_reward(
-            dataset_batch,
-            temperature=torch.ones(len(self)) * self.energy_function.temperature)
-
-        l, u = robust_range(x=rewards, k=4)
-        good_inds = rewards > l
-        self.dataset = [self.dataset[ind] for ind in torch.argwhere(good_inds).flatten()]
-        dataset_batch = collate_data_list(self.dataset, max_z_prime=self.max_z_prime)
-        x_tensor = dataset_batch.latent_params()
-        rewards = self.energy_function.prebuilt_sample_to_reward(
-            dataset_batch,
-            temperature=torch.ones(len(self)) * self.energy_function.temperature)
-
-        if self.energy_function.reward_range is not None:
-            # reward scaling is temperature dependent
-            self.energy_function.set_reward_clip(rewards)
-            self.reward_clip = -self.energy_function.energy_clip / self.energy_function.temperature
-            self.energy_clip = self.energy_function.energy_clip
-            # recompute with new clip
-            rewards = self.energy_function.prebuilt_sample_to_reward(
-                dataset_batch,
-                temperature=torch.ones(len(self)) * self.energy_function.temperature)
-
-        self.x_list = [x_tensor[i] for i in range(x_tensor.shape[0])]
-        self.rewards_list = list(rewards.flatten().cpu().detach().numpy())
-        self.original_dataset_inds = list(np.arange(len(self.dataset)))
-        self.sg_list = list(dataset_batch.sg_ind.cpu())
-
-    def truncate_buffer(self, importance_weight):
-        """
-        1 - keep initial states
-        2 - bottom-up energy greedy selection
-        3 - clustering
-        :return:
-        """
-        new_inds = self.find_new_permanent_candidates(
-            dist_cutoff=0.05,
-            energy_window=1.0
-        )
-
-        for ind in new_inds:
-            self.original_dataset_inds.append(ind)
-
-        inds_to_keep = torch.argsort(importance_weight, descending=True)
-
-        if self.keep_initial_samples:
-            orig_dataset_ind_tensor = torch.tensor(self.original_dataset_inds, device=self.device, dtype=torch.long)
-            combined = torch.unique(torch.cat([orig_dataset_ind_tensor, inds_to_keep]))[:self.buffer_size]
-
-        inds_to_keep = combined.tolist()  # for convenience
-        self.dataset = [self.dataset[ind] for ind in inds_to_keep]
-        self.rewards_list = [self.rewards_list[ind] for ind in inds_to_keep]
-        self.x_list = [self.x_list[ind] for ind in inds_to_keep]
-        self.sg_list = [self.sg_list[ind] for ind in inds_to_keep]
-
-    def find_new_permanent_candidates(self, dist_cutoff=0.05, energy_window=1.0):
-        """
-        Identify high-reward, geometrically distinct samples to promote
-        to the permanent buffer.
-
-        Returns
-        -------
-        List[int]
-            Indices of samples suitable for promotion.
-        """
-
-        rewards = np.array(self.rewards_list)
-        best_reward = np.amax(rewards)
-
-        # candidates: within 1 kT of best, but NOT already original
-        candidate_inds = [
-            i for i in range(len(rewards))
-            if (i not in self.original_dataset_inds)
-               and (rewards[i] >= best_reward - energy_window)
-        ]
-
-        if len(candidate_inds) == 0:
-            return []
-
-        # Latents
-        x_all = torch.stack(self.x_list).to(self.device)
-        x_candidates = x_all[candidate_inds]
-
-        # Reference set: existing protected samples
-        ref_inds = self.original_dataset_inds
-        if len(ref_inds) == 0:
-            # If nothing is protected yet, accept all candidates
-            return candidate_inds
-
-        x_ref = x_all[ref_inds]
-
-        # Compute pairwise distances (candidate → protected)
-        # shape: [N_candidates, N_ref]
-        dists = torch.cdist(x_candidates, x_ref)
-
-        # Minimum distance to protected set
-        min_dists = dists.min(dim=1).values
-
-        # Accept only sufficiently distinct samples
-        accepted = [
-            candidate_inds[i]
-            for i in range(len(candidate_inds))
-            if min_dists[i].item() > dist_cutoff
-        ]
-
-        return accepted
-
-    def __len__(self):
-        if self.dataset is None:
-            return 0
-        else:
-            return len(self.dataset)
-
-    @torch.no_grad()
-    def bottom_up_cluster(self, xx, e, d_cut, e_cut, max_new_samples: int):
-
-        if torch.cuda.is_available():
-            device = 'cuda'
-        else:
-            device = self.device
-
-        # Sort by energy ascending
-        sort_inds = torch.argsort(e.to(device))
-        xx_sorted = xx.to(device)[sort_inds]
-        e_sorted = e.to(device)[sort_inds]
-        mask = e_sorted < e_cut
-
-        xx_sorted_cuda = xx_sorted.to(device)
-        blocked = torch.zeros(len(xx_sorted), dtype=torch.bool, device=device)
-        keep = torch.zeros(len(xx_sorted), dtype=bool, device=device)
-        d_cut_squared = d_cut * d_cut
-        for i in range(len(xx_sorted)):
-            if not mask[i]:
-                break
-
-            if blocked[i]:
-                continue
-
-            keep[i] = True
-            if torch.sum(keep) == max_new_samples:
-                break
-
-            drow = ((xx_sorted_cuda - xx_sorted_cuda[i, None, :]) ** 2).sum(-1)  # faster, skips sqrt
-            nearby = drow < d_cut_squared
-            blocked |= nearby
-
-        keep_inds = sort_inds[keep]
-
-        return keep_inds.cpu()
-
-    def sample_indices(self, batch_size,
-                       replace: bool,
-                       diversity_coeff: float,
-                       override_method: Optional[str] = None):
-        inds = np.random.choice(len(self),
-                                size=batch_size,
-                                replace=replace,
-                                p=self.get_sampler_weights(diversity_coeff=diversity_coeff,
-                                                           override_method=override_method,
-                                                           ))
-        return inds
-
-    @torch.no_grad()
-    def get_sampler_weights(self,
-                            diversity_coeff,
-                            eps: float = 1e-3,
-                            override_method: Optional[str] = None):
-        if override_method is not None:
-            method = override_method
-        else:
-            method = self.prioritized
-
-        if method is not None:
-            if method in ['rank', 'boltzmann']:
-                scores = np.array(self.rewards_list)
-                if diversity_coeff > 0:
-                    x_tensor = torch.stack(self.x_list).to(self.device)
-                    if len(x_tensor) > 1000:
-                        subsample_inds = np.random.choice(len(self), 1000, replace=False)
-                        scores -= diversity_coeff * ((compute_sample_overlap(x_tensor[subsample_inds].float(),
-                                                                             x_tensor.float(),
-                                                                             ga=0.01,
-                                                                             agg='sum')).cpu().detach().numpy() - 1)  # subtract self contribution
-                    else:
-                        scores -= diversity_coeff * ((compute_sample_overlap(x_tensor.float(),
-                                                                             ga=0.01,
-                                                                             agg='sum')).cpu().detach().numpy() - 1)  # subtract self contribution
-
-                if method == 'rank':
-                    ranks = np.argsort(np.argsort(-1 * scores))
-                    weights_i = 1.0 / (self.rank_weight * len(scores) + ranks)
-                elif method == 'boltzmann':
-                    logits = self.beta * scores
-                    logits -= np.max(logits)  # subtract max for stability
-                    weights_i = np.nan_to_num(np.exp(logits)) + eps  # all samples need nonzero probability
-
-        else:
-            weights_i = np.ones(len(self.x_list))
-
-        return weights_i / np.sum(weights_i)  # enforce explicit normalization
-
-    @torch.no_grad()
-    def sample(self,
-               override_batch: Optional[int] = None,
-               return_preload: Optional[bool] = False,
-               override_sampler: Optional[str] = None,
-               randomize_orientations: Optional[bool] = False,
-               return_sample_inds: Optional[bool] = False,
-               override_sample_inds: Optional[torch.Tensor] = None,
-               ):
-
-        if override_batch is not None:
-            self.batch_size = override_batch
-
-        # manual dataloader
-        if return_preload:
-            rand_inds = self.original_dataset_inds
-        elif override_sample_inds is not None:
-            rand_inds = override_sample_inds
-        else:
-            if self.batch_size > len(self):
-                rand_inds = np.arange(len(self))
-                missing_len = self.batch_size - len(self)
-                rand_inds = np.concatenate(
-                    [rand_inds, self.sample_indices(missing_len, replace=True, diversity_coeff=self.diversity_coeff,
-                                                    override_method=override_sampler)])
-            else:
-                rand_inds = self.sample_indices(self.batch_size, replace=False, diversity_coeff=self.diversity_coeff,
-                                                override_method=override_sampler)
-
-        sample_batch = collate_data_list([self.dataset[ind] for ind in rand_inds],
-                                         max_z_prime=self.max_z_prime,
-                                         exclude_keys=['symmetry_operators']
-                                         )
-
-        if randomize_orientations:
-            assert False, "Orientation work currently deprecated"
-            # # this is a form of sample augmentation, where we rotate the molecule and its applied orientation
-            # # in order to construct the identical crystal, but with a distinct conditioning vector & sample
-            # # also rotate the embedding vector which is passed to conditioning
-            # random_rotations = torch.tensor(
-            #     Rotation.random(num=sample_batch.num_graphs).as_matrix(),
-            #     device=sample_batch.device, dtype=torch.float32)
-            # sample_batch.orient_molecule(mode='std')
-            # sample_batch.orient_molecule(mode='random',  # important that the rotation is applied *from* the standard
-            #                              include_inversion=False,
-            #                              correct_orientation=True,
-            #                              override_random_rotations=random_rotations)
-            # sample_batch.embedding = sample_batch.rotate_embedding(random_rotations)
-
-        # if standardize_orientations:
-        #     assert not randomize_orientations
-        #     sample_batch.orient_molecule(mode='std',
-        #                                  correct_orientation=True)
-
-        T_tensor, sg_inds, condition = self.energy_function.condition_samples(
-            sample_batch, sg_inds=sample_batch.sg_ind, z_primes=sample_batch.z_prime)
-
-        sample_batch.reset_sg_info(sg_inds)
-        temperature = 10 ** T_tensor  # first dimension is the log temperature
-        reward = self.energy_function.prebuilt_sample_to_reward(
-            sample_batch, temperature)  # recompute reward in case parameters have changed
-
-        latents = sample_batch.latent_params()
-
-        if return_sample_inds:
-            return latents, reward, sample_batch, condition, rand_inds
-        else:
-            return latents, reward, sample_batch, condition
-
-    def init_loader(self):  # todo this is almost never used, currently
-        self.loader = DataLoader(
-            self.dataset,
-            batch_size=self.batch_size,
-            collate_fn=collate_fn,
-            shuffle=True,
-            num_workers=0,  # os.cpu_count() - 2,  # use all but two available CPUs
-            persistent_workers=False,  # True,
-            drop_last=True,
-            pin_memory=True,
-            # prefetch_factor=4,
-        )
-        self._loader_iter = iter_forever(self.loader)
-
-    def adjust_batch_size(self, new_batch_size: int):  # todo almost never used
-        self.loader.batch_sampler.batch_size = new_batch_size
-        self._loader_iter = iter_forever(self.loader)
-
-    def add_to_noised(self, rewards, samples, losses, override_size: bool = False):
-        rewards = rewards.detach().to(self.device)
-        samples = samples.detach().to(self.device)
-        losses = losses.detach().to(self.device)
-        B = rewards.shape[0]
-
-        for i in range(B):
-            # If buffer is full, remove oldest entry (FIFO)
-            if not override_size:
-                if len(self.noised_rewards) >= self.noised_buffer_length:
-                    self.noised_rewards.pop(0)
-                    self.noised_samples.pop(0)
-                    self.noised_losses.pop(0)
-                    self.noised_select_counts.pop(0)
-
-            self.noised_rewards.append(rewards[i])
-            self.noised_samples.append(samples[i])
-            self.noised_losses.append(losses[i])
-            self.noised_select_counts.append(0)
-
-    @torch.no_grad()
-    def update_noised_losses(self, losses, indices, beta: float = 0.9):
-        """Update losses for specific indices with EMA."""
-        losses = losses.detach().cpu()
-        for i, idx in enumerate(indices):
-            old_loss = self.noised_losses[idx]
-            if old_loss == 0:
-                self.noised_losses[idx] = losses[i]
-            else:
-                self.noised_losses[idx] = beta * old_loss + (1.0 - beta) * losses[i]
-
-    def sample_from_noised(self, num_samples):
-        buffer_size = len(self.noised_rewards)
-
-        if num_samples <= buffer_size:
-            indices = np.random.choice(range(buffer_size), num_samples, replace=False)
-        else:
-            indices = np.random.choice(range(buffer_size), num_samples, replace=True)
-
-        rewards = torch.stack([self.noised_rewards[i] for i in indices])
-        samples = torch.stack([self.noised_samples[i] for i in indices])
-
-        # Increment selection counts
-        for idx in indices:
-            self.noised_select_counts[idx] += 1
-
-        return rewards, samples, indices
-
-    def purge_noised_buffer(self):
-        steps_cutoff = self.noised_max_steps
-        loss_cutoff = np.mean(self.noised_losses)
-
-        losses = np.array(self.noised_losses)
-        steps = np.array(self.noised_select_counts)
-
-        purge_list = np.argwhere(
-            (losses < loss_cutoff) * (steps > steps_cutoff)
-        ).flatten()
-
-        self.purge_noised_by_index(purge_list)
-
-    def purge_noised_by_index(self, indices_to_remove):
-        """Remove samples by their current indices. Indices should be sorted in descending order."""
-        # Sort in descending order to avoid index shifting issues
-        for idx in sorted(indices_to_remove, reverse=True):
-            if 0 <= idx < len(self.noised_rewards):
-                self.noised_rewards.pop(idx)
-                self.noised_samples.pop(idx)
-                self.noised_losses.pop(idx)
-                self.noised_select_counts.pop(idx)
-
-    @torch.no_grad()
-    def replace_initial_with_local_optima(self,
-                                          opt_latents: torch.Tensor,
-                                          opt_rewards: torch.Tensor
-                                          ):
-        """
-        Replace protected initial samples with their local optima
-        when clearly better and geometrically equivalent.
-        """
-
-        assert self.original_dataset_inds is not None
-        assert len(self.original_dataset_inds) == len(opt_latents)
-
-        for k, buf_idx in enumerate(self.original_dataset_inds):
-            x_new = opt_latents[k]
-            r_new = opt_rewards[k]
-
-            # Replace latent + reward
-            self.x_list[buf_idx] = x_new.detach().cpu()
-            self.rewards_list[buf_idx] = float(r_new)
-
-            self.dataset[buf_idx].latent_to_cell_params(x_new[None, :])
-        for elem in self.dataset:
-            del elem.asym_unit_dict
+# Space-group lookup tables (indexed 0..230) that data_classes builds lazily the
+# first time a batch runs a latent transform. They are deterministic globals, not
+# per-graph data, but they get attached to whichever batch happens to trigger the
+# build. That leaves two batches disagreeing on whether the attr exists (or on its
+# shape, if built under an older codebase covering fewer space groups), so a merge
+# via Batch.append_batch(validate=True) raises. Strip them before any merge so they
+# rebuild fresh and consistent. See train.py init_prior_dataset / this file's
+# checkpoint load and anchor-seed paths for the same fix at other side-load points.
+_LAZY_SG_CACHES = ('asym_unit_lut', 'asym_unit_dict', 'sym_mult_lut')
+
+
+def strip_lazy_sg_caches(batch):
+    """Drop lazily-built space-group caches so batches merge without mismatch."""
+    for attr in _LAZY_SG_CACHES:
+        if hasattr(batch, attr):
+            delattr(batch, attr)
+    return batch
 
 
 def collate_fn(data_list):
@@ -601,6 +114,11 @@ class CrystalBuffer:
         obj.x_fn = state['x_fn']
         obj.y_fn = state['y_fn']
         obj.batch = state['batch'].to(device)
+        # A checkpoint may have been pickled with stale/differently-shaped
+        # versions of these caches (e.g. from an older codebase covering fewer
+        # space groups). Strip them so they rebuild fresh and consistent with
+        # every other batch in this run. See strip_lazy_sg_caches for details.
+        strip_lazy_sg_caches(obj.batch)
         obj.x = state['x'].to(device)
         obj.y = state['y'].to(device) if state['y'] is not None else None
         # These are CPU-resident bookkeeping tensors, but torch.load's map_location
@@ -730,8 +248,13 @@ class CrystalBuffer:
             temperature: Optional[float] = None,
             beta: Optional[float] = None,
             return_traj: bool = False,
+            p: Optional[np.ndarray] = None,
     ):
-        p = self._loss_weights(temperature) if weighted else None
+        # p, if given, overrides the built-in loss-weighted distribution entirely
+        # (e.g. an externally-computed per-condition z_gap weighting) -- weighted/
+        # temperature are ignored in that case.
+        if p is None:
+            p = self._loss_weights(temperature) if weighted else None
         inds = self._sample_indices(batch_size, replace=replace, repeats=repeats, p=p, beta=beta)
         self._bump_counts(inds)
 
@@ -756,8 +279,13 @@ class CrystalBuffer:
             temperature: Optional[float] = None,
             beta: Optional[float] = None,
             return_traj: bool = False,
+            p: Optional[np.ndarray] = None,
     ):
-        p = self._loss_weights(temperature) if weighted else None
+        # p, if given, overrides the built-in loss-weighted distribution entirely
+        # (e.g. an externally-computed per-condition z_gap weighting) -- weighted/
+        # temperature are ignored in that case.
+        if p is None:
+            p = self._loss_weights(temperature) if weighted else None
         inds = self._sample_indices(batch_size, replace=replace, repeats=repeats, p=p, beta=beta)
         self._bump_counts(inds)
 
@@ -786,6 +314,7 @@ class CrystalBuffer:
             temperature: Optional[float] = None,
             beta: Optional[float] = None,
             return_traj: bool = False,
+            p: Optional[np.ndarray] = None,
     ):
         """
         Infinite random-batch generator. Use next() on it.
@@ -794,6 +323,12 @@ class CrystalBuffer:
         tensor to the yielded tuple (after y for "tensors" mode, after the
         graphs batch for "graphs" mode, and before inds if return_inds is
         also set).
+
+        p, if given, is used directly as the per-row sampling distribution
+        (bypassing the built-in loss-weighted one from weighted/temperature) --
+        e.g. an externally-computed per-condition z_gap weighting over this
+        buffer's rows. beta (fraction drawn uniformly instead) still applies
+        on top of it.
         """
         assert mode in ("tensors", "graphs")
 
@@ -801,7 +336,7 @@ class CrystalBuffer:
             if mode == "tensors":
                 x, y, traj, inds = self.sample_tensors(batch_size,
                                                        repeats=repeats, weighted=weighted, temperature=temperature,
-                                                       beta=beta, return_traj=return_traj)
+                                                       beta=beta, return_traj=return_traj, p=p)
                 result = (x, y)
                 if return_traj:
                     result = result + (traj,)
@@ -812,7 +347,7 @@ class CrystalBuffer:
             else:
                 graphs, inds, traj = self.sample_graphs(batch_size,
                                                         repeats=repeats, weighted=weighted, temperature=temperature,
-                                                        beta=beta, return_traj=return_traj)
+                                                        beta=beta, return_traj=return_traj, p=p)
                 result = (graphs,)
                 if return_traj:
                     result = result + (traj,)
@@ -949,6 +484,12 @@ class CrystalBuffer:
             return
 
         new_x, new_y = self._compute_xy(new_batch)
+
+        # _compute_xy's latent transform lazily builds the space-group caches on
+        # new_batch; strip both sides so append_batch never sees one batch with
+        # the attr and the other without. They rebuild on demand.
+        strip_lazy_sg_caches(self.batch)
+        strip_lazy_sg_caches(new_batch)
 
         self.batch = self.batch.append_batch(new_batch)
 
@@ -1215,6 +756,646 @@ class CrystalBuffer:
         return p
 
 
+class ConditionLogZTracker:
+    """
+    Persistent per-condition EMA of the empirical log Z, decoupled from any
+    buffer: keyed by an immutable integer `condition_id` (a deterministic
+    mixed-radix combination of whichever discrete conditioning axes are
+    active -- see energy_function.condition_samples), never by buffer row
+    index and never by hashing the (potentially large, float) condition
+    vector itself.
+
+    Storage is a flat preallocated tensor per stat, sized to the full
+    condition library (`library_size`), not a Python dict -- so cost is
+    O(unique ids touched per update/lookup call), independent of both the
+    library size and the condition vector's dimensionality (only a handful
+    of scalars are ever stored per id).
+
+    Also tracks a per-condition running minimum energy (`best_energy`),
+    independent of the logw/log_Z EMA machinery above -- an exact order
+    statistic (monotone, no beta/decay/variance concerns), updated via a
+    plain scatter-min rather than any EMA math. See update_best_energy().
+
+    EMA math (logw, logw_sq, log_z_emp via logaddexp) is structurally like
+    CrystalBuffer.update_logw_stats, applied to the group-mean/group-logsumexp
+    of whichever samples in a given update() call share a condition_id --
+    duplicates within one call (e.g. repeats-tiled trajectories) are folded
+    into a single observation for that step rather than applied sequentially.
+    Unlike CrystalBuffer's per-sample version, the mixing weight here is NOT
+    the fixed (1 - beta): CrystalBuffer's updates are inherently one sample
+    at a time, so a fixed weight is fine, but a single ConditionLogZTracker
+    update() call can fold together anywhere from 1 to hundreds of samples
+    for the same condition_id (depending on how that condition happened to
+    get sampled this step). A fixed weight would let a 1-sample step swing
+    the estimate exactly as much as a 500-sample step. Instead, `half_life_steps`
+    decays a per-condition `effective_count` (a time-discounted running
+    sample size, keyed off elapsed training steps -- see update()'s
+    docstring for why), and each step's actual mixing weight is its share of
+    (decayed old effective_count + this step's evidence) -- see update()'s
+    docstring.
+    """
+
+    def __init__(self, library_size: int, min_visits: int = 20, half_life_steps: float = 7.0,
+                 trim_frac: float = 0.1, max_batch_weight: float = 200.0):
+        self.library_size = library_size
+        self.min_visits = min_visits
+        self.half_life_steps = half_life_steps
+        self.trim_frac = trim_frac
+        self.max_batch_weight = max_batch_weight
+        self.ema_logw = torch.full((library_size,), float("nan"), dtype=torch.float32)
+        self.ema_logw_sq = torch.full((library_size,), float("nan"), dtype=torch.float32)
+        self.ema_log_z_emp = torch.full((library_size,), float("nan"), dtype=torch.float32)
+        self.count = torch.zeros((library_size,), dtype=torch.long)
+        self.effective_count = torch.zeros((library_size,), dtype=torch.float32)
+        # -1 sentinel ("never updated") for conditions not yet visited -- see
+        # update()'s docstring for why decay is keyed off elapsed training
+        # steps rather than elapsed update() calls.
+        self.last_update_step = torch.full((library_size,), -1, dtype=torch.long)
+        self.best_energy = torch.full((library_size,), float("inf"), dtype=torch.float32)
+        # per-condition EMA of |logw - log_Z_learned| -- how far the network's
+        # OWN Z prediction currently is from the fresh, per-sample importance
+        # weight, live (not smoothed through ema_logw). See update_z_residual/
+        # rms_z_lag.
+        self.z_resid_ema = torch.full((library_size,), float("nan"), dtype=torch.float32)
+        # SIGNED batch-mean residual EMA, sharing z_resid's evidence/decay state:
+        # the location/calibration component of the z error, decoupled from
+        # spread -- see update_z_residual/rms_z_bias
+        self.z_bias_ema = torch.full((library_size,), float("nan"), dtype=torch.float32)
+        self.z_resid_effective_count = torch.zeros((library_size,), dtype=torch.float32)
+        self.z_resid_last_step = torch.full((library_size,), -1, dtype=torch.long)
+
+    def __len__(self):
+        return self.library_size
+
+    @torch.no_grad()
+    def update(self, condition_id, logw, step: int,
+               trim_frac: Optional[float] = None, max_batch_weight: Optional[float] = None,
+               half_life_steps: Optional[float] = None):
+        """
+        Effective-sample-size-weighted EMA update. `step` is the caller's
+        current global training step (self.step_ind); it drives the decay
+        of a per-condition `effective_count`:
+
+            decay             = 0.5 ** (1 / half_life_steps)
+            delta_t           = step - last_update_step[condition]   (>= 0)
+            decayed_eff_count = old_eff_count * decay ** delta_t
+            new_eff_count     = decayed_eff_count + evidence_count
+            w_new             = evidence_count / new_eff_count
+
+        Decay is keyed off elapsed *training steps* since that condition's
+        own last visit, not elapsed *update() calls*. The two are not the
+        same thing: call() cadence is wildly uneven across conditions (a
+        library of hundreds of conditions might see any given one only once
+        every dozens of steps, and phase/loss-coefficient gating means not
+        every train step even calls update() for every mode), so decaying
+        by a flat factor "per call" gives old evidence a forgetting rate
+        that implicitly depends on how often the condition happened to be
+        revisited -- not a stable, portable notion of "how stale is this."
+        Decaying by elapsed steps instead gives half_life_steps a fixed,
+        literal meaning (the number of *training steps* for old evidence's
+        weight to halve) that doesn't need retuning as visit frequency
+        varies across conditions or across differently-sized condition
+        libraries/configs.
+
+        w_new is this step's actual mixing weight into the running
+        estimate -- it's 1.0 on a condition's first-ever visit (old_eff_count
+        == 0, so the running estimate is just set to this step's value) and
+        shrinks as old_eff_count grows relative to evidence_count, so a step
+        with many samples for a condition properly outweighs a step with
+        few, instead of both getting the same fixed decay. half_life_steps
+        still controls the forgetting rate of old evidence (effective_count
+        itself decays with elapsed time), it just no longer doubles as the
+        per-call weight.
+
+        evidence_count is NOT simply counts_this_step (the raw number of
+        samples this call saw for a condition) -- it's that, further capped
+        by (a) the batch's effective sample size (ESS = (sum w)^2 / sum w^2
+        on the shifted importance weights w = exp(logw - max), the standard
+        IS diagnostic for "how much real information is in this batch") and
+        (b) a hard ceiling `max_batch_weight`. Two failure modes this guards
+        against, both observed in practice:
+
+        - A batch whose weights are internally degenerate (dominated by one
+          or two samples, e.g. a badly-calibrated off-policy trajectory)
+          has ESS << counts_this_step regardless of how large the batch is,
+          so it can't buy outsized trust just by being big.
+        - Even a perfectly well-behaved large batch (ESS ~= counts_this_step)
+          -- e.g. a pooled eval batch orders of magnitude larger than a
+          train-step batch -- is capped at max_batch_weight, so no single
+          update() call can claim more trust than a few hundred samples'
+          worth, however large it actually was. Without this, a huge but
+          otherwise-clean batch could still nearly overwrite hundreds of
+          steps of accumulated training-time evidence in one call, purely
+          because of its size (empirically: a persistent "sawblade" pattern
+          coinciding with eval cycles).
+
+        Note evidence_count only affects *how much this call is trusted*,
+        not the *value* being mixed in -- self.count (lifetime observation
+        count, used for the min_visits gate) still accumulates the true,
+        uncapped counts_this_step.
+
+        mean_logw (the arithmetic mean fed into the Jensen/lower-bound
+        estimate ema_logw) is a trimmed mean within each condition group --
+        drop the top/bottom `trim_frac` of that group's logw values by rank
+        before averaging. This protects the *value* of a batch's mean from
+        a minority of outliers (e.g. unbounded-below energy blowups from
+        clashing geometries); it's a separate, complementary concern from
+        evidence_count above, which protects the *trust* given to the
+        resulting value regardless of how it was computed. Small train-step
+        batches rarely have enough samples per group to trim anything, so
+        this is essentially a no-op there and only bites on large batches.
+        group_log_mean_exp (the empirical estimate, via logsumexp -- see
+        below) is left untrimmed, deliberately: it's already outlier-robust
+        in the opposite direction (dominated by the best samples, via
+        exp()), and keeping it untrimmed preserves its role as an
+        independent cross-check -- a large persistent gap between it and
+        ema_logw (z_gap) is a signal the Jensen estimate is still being
+        distorted, and trimming both would mute that signal.
+        """
+        trim_frac = self.trim_frac if trim_frac is None else trim_frac
+        max_batch_weight = self.max_batch_weight if max_batch_weight is None else max_batch_weight
+        half_life_steps = self.half_life_steps if half_life_steps is None else half_life_steps
+        decay_per_step = 0.5 ** (1.0 / half_life_steps)
+        condition_id = torch.as_tensor(condition_id, dtype=torch.long).detach().cpu().flatten()
+        logw = torch.as_tensor(logw, dtype=torch.float32).detach().cpu().flatten()
+
+        if condition_id.numel() == 0:
+            return
+
+        if condition_id.shape[0] != logw.shape[0]:
+            raise ValueError(
+                f"condition_id and logw must have same length, got "
+                f"{condition_id.shape[0]} and {logw.shape[0]}."
+            )
+
+        n = logw.shape[0]
+        unique_ids, inverse = torch.unique(condition_id, return_inverse=True)
+        k = unique_ids.shape[0]
+
+        counts_this_step = torch.zeros(k, dtype=torch.float32).scatter_add_(
+            0, inverse, torch.ones_like(logw))
+
+        # trimmed mean/mean-of-squares per condition group: sort samples by
+        # (group, value) via a value-sort followed by a stable group-sort,
+        # then rank each sample within its group to mask off the top/bottom
+        # trim_k on each side before averaging. trim_k is floor(trim_frac *
+        # count), capped so at least one sample always survives.
+        value_order = torch.argsort(logw)
+        group_order = torch.argsort(inverse[value_order], stable=True)
+        sorted_idx = value_order[group_order]
+        sorted_group = inverse[sorted_idx]
+        sorted_logw = logw[sorted_idx]
+
+        group_start = torch.zeros(k, dtype=torch.long)
+        group_start[1:] = torch.cumsum(counts_this_step, dim=0)[:-1].long()
+        rank_in_group = torch.arange(n) - group_start[sorted_group]
+
+        counts_long = counts_this_step.long()
+        trim_k = torch.clamp((trim_frac * counts_this_step).floor().long(),
+                             max=(counts_long - 1) // 2)
+        kept_counts = counts_this_step - 2 * trim_k.float()
+        keep_mask = (rank_in_group >= trim_k[sorted_group]) & \
+                    (rank_in_group < counts_long[sorted_group] - trim_k[sorted_group])
+
+        trimmed_logw = torch.where(keep_mask, sorted_logw, torch.zeros_like(sorted_logw))
+        mean_logw = torch.zeros(k, dtype=torch.float32).scatter_add_(
+            0, sorted_group, trimmed_logw) / kept_counts
+        mean_logw_sq = torch.zeros(k, dtype=torch.float32).scatter_add_(
+            0, sorted_group, torch.where(keep_mask, sorted_logw ** 2, torch.zeros_like(sorted_logw))) / kept_counts
+
+        # group logsumexp(logw) - log(count), computed manually for numerical
+        # stability (no built-in scatter-logsumexp reduction) -- over the
+        # FULL untrimmed batch, deliberately (see docstring above). The same
+        # shifted exponentials also give us this batch's per-group effective
+        # sample size (ESS), used below to cap evidence_count.
+        group_max = torch.full((k,), float("-inf"), dtype=torch.float32).scatter_reduce_(
+            0, inverse, logw, reduce="amax", include_self=True)
+        shifted = (logw - group_max[inverse]).exp()
+        sum_exp = torch.zeros(k, dtype=torch.float32).scatter_add_(0, inverse, shifted)
+        sum_exp_sq = torch.zeros(k, dtype=torch.float32).scatter_add_(0, inverse, shifted ** 2)
+        group_log_mean_exp = group_max + sum_exp.log() - counts_this_step.log()
+        ess = sum_exp ** 2 / sum_exp_sq  # in [1, counts_this_step], scale-invariant
+
+        evidence_count = torch.clamp(ess, max=max_batch_weight)
+
+        old_mean = self.ema_logw[unique_ids]
+        old_sq = self.ema_logw_sq[unique_ids]
+        old_log_z = self.ema_log_z_emp[unique_ids]
+        old_eff_count = self.effective_count[unique_ids]
+        old_last_step = self.last_update_step[unique_ids]
+
+        nan_mask = torch.isnan(old_mean)
+
+        # delta_t clamped to >= 0 as a defensive guard (step should be
+        # monotonically non-decreasing across calls); for a condition's
+        # first-ever visit old_last_step is the -1 sentinel, so delta_t is
+        # large and decayed_eff_count underflows toward 0 harmlessly -- that
+        # path is bypassed by nan_mask below regardless.
+        delta_t = torch.clamp((step - old_last_step).float(), min=0.0)
+        decayed_eff_count = old_eff_count * decay_per_step ** delta_t
+
+        # evidence_count > 0 for every id in unique_ids (they only appear here
+        # because they were observed this step, and ESS >= 1 for any nonempty
+        # group), so new_eff_count > 0 always -- no div-by-zero. w_new == 1.0
+        # exactly on a condition's first visit.
+        new_eff_count = decayed_eff_count + evidence_count
+        w_new = evidence_count / new_eff_count
+
+        new_mean = torch.where(nan_mask, mean_logw, (1.0 - w_new) * old_mean + w_new * mean_logw)
+        new_sq = torch.where(nan_mask, mean_logw_sq, (1.0 - w_new) * old_sq + w_new * mean_logw_sq)
+
+        log_w_new = torch.log(w_new)
+        log_1m_w_new = torch.log1p(-w_new)  # log1p for precision as w_new -> 0 (well-established conditions)
+        new_log_z = torch.where(
+            nan_mask,
+            group_log_mean_exp,
+            torch.logaddexp(log_1m_w_new + old_log_z, log_w_new + group_log_mean_exp),
+        )
+
+        self.ema_logw[unique_ids] = new_mean
+        self.ema_logw_sq[unique_ids] = new_sq
+        self.ema_log_z_emp[unique_ids] = new_log_z
+        self.effective_count[unique_ids] = new_eff_count
+        self.count[unique_ids] += counts_this_step.long()
+        self.last_update_step[unique_ids] = int(step)
+
+    @torch.no_grad()
+    def update_z_residual(self, condition_id, logw, log_Z_learned, step: int,
+                          half_life_steps: Optional[float] = None):
+        """
+        Per-condition EMA of |logw - log_Z_learned|: how far the network's
+        own Z prediction currently is for this condition, measured directly
+        against this call's fresh per-sample logw -- not against ema_logw,
+        which is itself smoothed and therefore a step removed from "right
+        now". This is what rms_z_lag() reduces over the library to give the
+        controller a richer, per-condition-aware miscalibration signal than
+        a single global batch-mean (quick_tb_stats' jensen_z_err) can: a
+        mean lets a majority of well-calibrated conditions dilute away a
+        badly-miscalibrated minority, which is exactly the failure mode this
+        whole tracker exists to guard against elsewhere (see update()'s
+        trim_frac docstring) -- no reason the detection signal should be
+        vulnerable to the same thing the estimator itself was hardened
+        against.
+
+        Same time-based decay and evidence-capping as update() (elapsed
+        training steps since this condition's own last z-residual update,
+        capped effective evidence per call), for the same reasons -- kept
+        as separate state (z_resid_*) so this monitoring signal's own decay
+        dynamics can't interact with the primary logw/log_z_emp EMA math.
+        """
+        half_life_steps = self.half_life_steps if half_life_steps is None else half_life_steps
+        decay_per_step = 0.5 ** (1.0 / half_life_steps)
+
+        condition_id = torch.as_tensor(condition_id, dtype=torch.long).detach().cpu().flatten()
+        logw = torch.as_tensor(logw, dtype=torch.float32).detach().cpu().flatten()
+        log_Z_learned = torch.as_tensor(log_Z_learned, dtype=torch.float32).detach().cpu().flatten()
+
+        if condition_id.numel() == 0:
+            return
+
+        # two views of the same residual stream, EMA'd side by side with shared
+        # evidence/decay state: the ABS mean (z_resid_ema, behind rms_z_lag) is
+        # floored at the per-condition MAD of log w no matter how well Z is
+        # placed -- a spread metric. The SIGNED batch mean (z_bias_ema, behind
+        # rms_z_bias) averages the spread away BEFORE the abs, so it goes to ~0
+        # exactly when Z(c) sits on the stream's mean(log w) -- the pure
+        # location/calibration component. zerr >> z_bias means the 'error' is
+        # spread (only policy work shrinks it); z_bias large means Z genuinely
+        # lags (Z training shrinks it). The two together disambiguate what a
+        # high zerr alone cannot.
+        resid_signed = logw - log_Z_learned
+        residual = resid_signed.abs()
+
+        unique_ids, inverse = torch.unique(condition_id, return_inverse=True)
+        k = unique_ids.shape[0]
+        counts_this_step = torch.zeros(k, dtype=torch.float32).scatter_add_(
+            0, inverse, torch.ones_like(residual))
+        mean_resid = torch.zeros(k, dtype=torch.float32).scatter_add_(
+            0, inverse, residual) / counts_this_step
+        mean_bias = torch.zeros(k, dtype=torch.float32).scatter_add_(
+            0, inverse, resid_signed) / counts_this_step
+
+        old_mean = self.z_resid_ema[unique_ids]
+        old_bias = self.z_bias_ema[unique_ids]
+        old_eff_count = self.z_resid_effective_count[unique_ids]
+        old_last_step = self.z_resid_last_step[unique_ids]
+        nan_mask = torch.isnan(old_mean)
+        # separate NaN mask: checkpoints predating z_bias_ema restore it as NaN
+        # while z_resid_ema is warm, so the two can disagree after a reload
+        bias_nan_mask = torch.isnan(old_bias)
+
+        delta_t = torch.clamp((step - old_last_step).float(), min=0.0)
+        decayed_eff_count = old_eff_count * decay_per_step ** delta_t
+        evidence_count = torch.clamp(counts_this_step, max=self.max_batch_weight)
+        new_eff_count = decayed_eff_count + evidence_count
+        w_new = evidence_count / new_eff_count
+
+        new_mean = torch.where(nan_mask, mean_resid, (1.0 - w_new) * old_mean + w_new * mean_resid)
+        new_bias = torch.where(bias_nan_mask, mean_bias, (1.0 - w_new) * old_bias + w_new * mean_bias)
+
+        self.z_resid_ema[unique_ids] = new_mean
+        self.z_bias_ema[unique_ids] = new_bias
+        self.z_resid_effective_count[unique_ids] = new_eff_count
+        self.z_resid_last_step[unique_ids] = int(step)
+
+    @torch.no_grad()
+    def rms_z_lag(self, min_effective_count: Optional[float] = None):
+        """
+        RMS of z_resid_ema over conditions with enough evidence to trust
+        (effective count >= min_effective_count, defaulting to min_visits).
+        RMS rather than mean deliberately: it doesn't let a majority of
+        well-calibrated conditions dilute away a badly-miscalibrated
+        minority the way an arithmetic mean would (see update_z_residual's
+        docstring). Returns 0.0 (not NaN) when no condition currently has
+        enough evidence, so this is always safe to compare directly against
+        a threshold.
+        """
+        min_effective_count = self.min_visits if min_effective_count is None else min_effective_count
+        mask = (~torch.isnan(self.z_resid_ema)) & (self.z_resid_effective_count >= min_effective_count)
+        if not mask.any():
+            return 0.0
+        return torch.sqrt((self.z_resid_ema[mask] ** 2).mean()).item()
+
+    @torch.no_grad()
+    def rms_z_bias(self, min_effective_count: Optional[float] = None):
+        """
+        RMS over trusted conditions of the SIGNED z-residual EMA (z_bias_ema)
+        -- the location/calibration component of the z error, decoupled from
+        spread. rms_z_lag EMAs |logw - Z| per sample, which is floored at the
+        per-condition MAD of log w no matter how well Z is placed (a spread
+        metric wearing a calibration metric's name); the signed batch mean
+        averages the spread away BEFORE any abs, so this goes to ~0 exactly
+        when Z(c) sits on the stream's mean(log w). Read the pair together:
+        zerr >> z_bias means the 'error' is spread (only policy work shrinks
+        it); z_bias large means Z genuinely lags (Z training shrinks it).
+        Same trust mask/state as rms_z_lag; returns 0.0 when nothing is
+        trusted (same fire-on-large semantics as rms_z_lag).
+        """
+        min_effective_count = self.min_visits if min_effective_count is None else min_effective_count
+        mask = (~torch.isnan(self.z_bias_ema)) & (self.z_resid_effective_count >= min_effective_count)
+        if not mask.any():
+            return 0.0
+        return torch.sqrt((self.z_bias_ema[mask] ** 2).mean()).item()
+
+    @torch.no_grad()
+    def rms_logw_std(self, min_visits: Optional[int] = None):
+        """
+        RMS over trusted conditions (count >= min_visits, non-nan) of the
+        per-condition std of logw implied by the tracker's running moments:
+        sqrt(clamp(ema_logw_sq - ema_logw^2, 0)). The phase-2
+        (variance-conditioning) exit signal: 'the policy is self-consistent
+        enough for Z learning to get traction', measured as tightness of the
+        per-condition log-importance-weight distribution -- NOT distance to
+        the true target. RMS over conditions for the same anti-dilution
+        reason as rms_z_lag. Mildly underestimates tails (both moments come
+        from trim_frac-trimmed group means), fine for a gate.
+
+        Returns +inf (not 0) when no condition has enough evidence: unlike
+        rms_z_lag, whose callers act on LARGE values (so an ignorant 0 is
+        the safe default), this gates a phase transition that fires on SMALL
+        values -- a gate that must wait for proof of tightness should never
+        pass on ignorance.
+        """
+        min_visits = self.min_visits if min_visits is None else min_visits
+        var = self.ema_logw_sq - self.ema_logw ** 2
+        mask = (~torch.isnan(var)) & (self.count >= min_visits)
+        if not mask.any():
+            return float('inf')
+        return torch.sqrt(var[mask].clamp(min=0.0).mean()).item()
+
+    @torch.no_grad()
+    def lookup(self, condition_id):
+        """
+        Returns (log_z_target, mask) where mask is True for entries that
+        have been visited at least `min_visits` times. log_z_target is
+        self.ema_logw (the Jensen lower-bound / EMA of mean log importance
+        weight), NOT self.ema_log_z_emp (EMA of logsumexp(logw) - log(count)).
+
+        These estimate different things, and which one is safe to put here
+        (i.e. to actually feed gradients) is a separate question from which
+        one is the statistically "correct" estimator of log Z:
+
+        ema_log_z_emp IS the (nearly) unbiased one -- the importance-sampling
+        identity E_pi[exp(logw)] = Z holds exactly for any policy pi with
+        full support, so mean(exp(logw)) is exactly unbiased for Z, and
+        ema_log_z_emp = log(mean(exp(logw))) is consistent for log Z with
+        only a small, n-shrinking finite-sample bias. ema_logw is an
+        unbiased estimator of a *different*, structurally lower quantity,
+        E_pi[logw] <= log Z (Jensen), with a permanent gap (see z_gap below)
+        that doesn't vanish with more samples, only at the TB fixed point.
+
+        But being unbiased for Z requires giving large importance weights
+        their full, unclipped influence -- which is exactly what makes
+        ema_log_z_emp dangerous as a live gradient target: logsumexp has no
+        1/n dilution the way a plain mean does, so one badly-calibrated
+        off-policy sample (e.g. log_pf collapsing under an under-warmed
+        proposal) can send it to billions of nats in a single update, and
+        because it was feeding the TB residual, that corrupted value then
+        pushed log_pf/log_pb in a fixed direction every step, which can
+        actively degrade calibration network-wide and produce more of the
+        same mismatched-trajectory events -- a closed loop that measurably
+        broke a live run. ema_logw's arithmetic mean dilutes any single
+        sample by 1/n and is additionally rank-trimmed in update() above, so
+        it can't blow up the same way; it's the "wrong" (structurally
+        biased) number asymptotically, but the safe one to close a gradient
+        loop around. ema_log_z_emp is still fully tracked and logged
+        (ten_step_reporting, log_condition_log_z_stats) as a diagnostic --
+        its stability there is a genuinely useful convergence signal (see
+        z_gap) -- it's just not what gets fed back into training. log_z_target
+        is 0 (not NaN) wherever mask is False, so it's always safe to use
+        directly in a torch.where without a separate NaN-guard.
+        """
+        condition_id = torch.as_tensor(condition_id, dtype=torch.long).detach().cpu().flatten()
+        log_z = self.ema_logw[condition_id]
+        mask = (self.count[condition_id] >= self.min_visits) & (~torch.isnan(log_z))
+        log_z = torch.nan_to_num(log_z, nan=0.0)
+        return log_z, mask
+
+    @property
+    def z_gap(self):
+        """Per-condition rolling gap ema_log_z_emp - ema_logw (>= 0 by Jensen's inequality)."""
+        return self.ema_log_z_emp - self.ema_logw
+
+    @torch.no_grad()
+    def lookup_z_gap(self, condition_id):
+        """
+        Returns (gap, mask) where gap is the per-condition Jensen/logmeanexp
+        divergence (z_emp - z_jensen) and mask is True for entries visited at
+        least once. Unlike lookup()'s min_visits gate (which guards a value
+        that gets fed back into training), any single visit already gives an
+        exact-enough gap to prioritize sampling attention toward, so no
+        warm-up threshold is applied here. gap is 0 (not NaN) wherever mask
+        is False, so it's always safe to use directly without a NaN-guard.
+        """
+        condition_id = torch.as_tensor(condition_id, dtype=torch.long).detach().cpu().flatten()
+        gap = self.z_gap[condition_id]
+        mask = self.count[condition_id] >= 1
+        gap = torch.nan_to_num(gap, nan=0.0)
+        return gap, mask
+
+    @torch.no_grad()
+    def update_best_energy(self, condition_id, energy):
+        """
+        Per-condition running minimum energy. Unlike update()'s EMA math,
+        this needs no torch.unique/inverse pass: torch.scatter_reduce_
+        already folds together duplicate condition_id entries within one
+        call natively, so a single scatter-min directly against the
+        persistent tensor is sufficient. best_energy is initialized to
+        +inf, so a condition's first-ever visit is handled by the reduce
+        itself (min(inf, x) == x) with no special-casing.
+        """
+        condition_id = torch.as_tensor(condition_id, dtype=torch.long).detach().cpu().flatten()
+        energy = torch.as_tensor(energy, dtype=torch.float32).detach().cpu().flatten()
+
+        if condition_id.numel() == 0:
+            return
+
+        if condition_id.shape[0] != energy.shape[0]:
+            raise ValueError(
+                f"condition_id and energy must have same length, got "
+                f"{condition_id.shape[0]} and {energy.shape[0]}."
+            )
+
+        self.best_energy.scatter_reduce_(0, condition_id, energy, reduce="amin", include_self=True)
+
+    @torch.no_grad()
+    def lookup_best_energy(self, condition_id):
+        """
+        Returns (best_energy, mask) where mask is True for entries that
+        have been visited at least once -- no min_visits threshold here,
+        since a single observed minimum is already an exact record, not a
+        noisy estimate needing warm-up. best_energy is 0 (not inf) wherever
+        mask is False, so it's always safe to use directly without a
+        separate inf-guard.
+        """
+        condition_id = torch.as_tensor(condition_id, dtype=torch.long).detach().cpu().flatten()
+        best = self.best_energy[condition_id]
+        mask = torch.isfinite(best)
+        best = torch.where(mask, best, torch.zeros_like(best))
+        return best, mask
+
+    def state_dict(self):
+        return {
+            "library_size": self.library_size,
+            "min_visits": self.min_visits,
+            "half_life_steps": self.half_life_steps,
+            "trim_frac": self.trim_frac,
+            "max_batch_weight": self.max_batch_weight,
+            "ema_logw": self.ema_logw.cpu(),
+            "ema_logw_sq": self.ema_logw_sq.cpu(),
+            "ema_log_z_emp": self.ema_log_z_emp.cpu(),
+            "count": self.count.cpu(),
+            "effective_count": self.effective_count.cpu(),
+            "last_update_step": self.last_update_step.cpu(),
+            "best_energy": self.best_energy.cpu(),
+            "z_resid_ema": self.z_resid_ema.cpu(),
+            "z_bias_ema": self.z_bias_ema.cpu(),
+            "z_resid_effective_count": self.z_resid_effective_count.cpu(),
+            "z_resid_last_step": self.z_resid_last_step.cpu(),
+        }
+
+    @classmethod
+    def from_state_dict(cls, state, current_step: int = 0):
+        """
+        current_step is only consulted as a fallback for checkpoints saved
+        before last_update_step existed (see below) -- it should be the step
+        training is resuming at (e.g. Modeller.step_ind after restoring it),
+        not a step recorded inside `state` itself.
+        """
+        obj = cls.__new__(cls)
+        obj.library_size = state["library_size"]
+        obj.min_visits = state["min_visits"]
+        # older checkpoints predate half_life_steps and stored a per-call
+        # `beta` instead -- there's no exact conversion (that depends on how
+        # often update() happened to be called, which is exactly what this
+        # change moves away from), so just fall back to the new default
+        # rather than reverse-engineer a number from the old semantics.
+        obj.half_life_steps = state.get("half_life_steps", 7.0)
+        obj.trim_frac = state.get("trim_frac", 0.1)
+        obj.max_batch_weight = state.get("max_batch_weight", 200.0)
+        obj.ema_logw = state["ema_logw"].cpu()
+        obj.ema_logw_sq = state["ema_logw_sq"].cpu()
+        obj.ema_log_z_emp = state["ema_log_z_emp"].cpu()
+        obj.count = state["count"].cpu()
+        # older checkpoints predate effective_count -- fall back to the lifetime
+        # count (a mild over-estimate of "true" decayed effective count, but a
+        # far better prior than 0, which would make the very next update() call
+        # after reload treat every already-warmed-up condition as brand new)
+        obj.effective_count = state.get(
+            "effective_count", obj.count.float()).cpu()
+        # older checkpoints predate last_update_step -- default to current_step
+        # (not the -1 "never visited" sentinel) so the first post-reload
+        # update() call sees delta_t=0 for already-warmed-up conditions,
+        # rather than a huge fabricated gap that would decay effective_count
+        # to ~0 and silently discard everything just restored above.
+        obj.last_update_step = state.get(
+            "last_update_step",
+            torch.full_like(obj.count, int(current_step))).cpu()
+        # older checkpoints predate best_energy -- +inf ("never visited") is the
+        # only honest fallback; there's no lifetime stat to reconstruct it from
+        obj.best_energy = state.get(
+            "best_energy", torch.full_like(obj.count, float("inf"), dtype=torch.float32)).cpu()
+        # older checkpoints predate the z-residual monitor entirely -- NaN/0/current_step
+        # (never-updated sentinels) are the only honest fallback, same reasoning as above
+        obj.z_resid_ema = state.get(
+            "z_resid_ema", torch.full_like(obj.count, float("nan"), dtype=torch.float32)).cpu()
+        # older checkpoints predate the signed-bias track -- NaN sentinel; the
+        # bias_nan_mask in update_z_residual warm-starts it from the first
+        # post-reload batch even where z_resid_ema is already warm
+        obj.z_bias_ema = state.get(
+            "z_bias_ema", torch.full_like(obj.count, float("nan"), dtype=torch.float32)).cpu()
+        obj.z_resid_effective_count = state.get(
+            "z_resid_effective_count", torch.zeros_like(obj.count, dtype=torch.float32)).cpu()
+        obj.z_resid_last_step = state.get(
+            "z_resid_last_step", torch.full_like(obj.count, int(current_step))).cpu()
+        return obj
+
+
+def _per_condition_min(ids: torch.Tensor, values: torch.Tensor, query_ids: torch.Tensor) -> torch.Tensor:
+    """
+    Per-condition minimum of `values` grouped by `ids`, evaluated at each of
+    `query_ids`; +inf wherever a query id has no representative in `ids`.
+
+    Shared by AnchorBuffer.admit's per-condition admission gate and thin's
+    per-condition max_size protection, so a single dominant condition's
+    energy scale can never be used (via a buffer-wide scalar) to gate or
+    evict anchors belonging to some other condition.
+    """
+    out = torch.full((query_ids.numel(),), float('inf'), dtype=torch.float32)
+    if ids.numel() == 0:
+        return out
+    uniq_ids, inverse = torch.unique(ids, return_inverse=True)
+    mins = torch.full((uniq_ids.numel(),), float('inf'), dtype=torch.float32)
+    mins.scatter_reduce_(0, inverse, values, reduce='amin', include_self=True)
+    pos = torch.searchsorted(uniq_ids, query_ids).clamp(max=uniq_ids.numel() - 1)
+    found = uniq_ids[pos] == query_ids
+    out[found] = mins[pos[found]]
+    return out
+
+
+def _per_condition_max(ids: torch.Tensor, values: torch.Tensor, query_ids: torch.Tensor) -> torch.Tensor:
+    """
+    Per-condition maximum of `values` grouped by `ids`, evaluated at each of
+    `query_ids`; -inf wherever a query id has no representative in `ids`.
+
+    Mirrors _per_condition_min but for reward (to be maximized rather than
+    minimized) -- used to anchor train.py's reward-ramp kwargs to each
+    condition's own best achievable reward instead of the anchor buffer's
+    global max, since conditions can sit on very different reward scales
+    (e.g. under temperature_conditioning=True).
+    """
+    out = torch.full((query_ids.numel(),), float('-inf'), dtype=torch.float32)
+    if ids.numel() == 0:
+        return out
+    uniq_ids, inverse = torch.unique(ids, return_inverse=True)
+    maxs = torch.full((uniq_ids.numel(),), float('-inf'), dtype=torch.float32)
+    maxs.scatter_reduce_(0, inverse, values, reduce='amax', include_self=True)
+    pos = torch.searchsorted(uniq_ids, query_ids).clamp(max=uniq_ids.numel() - 1)
+    found = uniq_ids[pos] == query_ids
+    out[found] = maxs[pos[found]]
+    return out
+
+
 def bottom_up_cluster(xx, e, d_cut, e_cut, max_new_samples: int, device):
     """
     Greedily keep the lowest-e point in each d_cut neighborhood: sort by e
@@ -1253,20 +1434,66 @@ def bottom_up_cluster(xx, e, d_cut, e_cut, max_new_samples: int, device):
 
 class AnchorBuffer(CrystalBuffer):
     """
-    Permanent archive of high-quality, mutually latent-distinct samples.
+    Permanent archive of surprising, high-quality samples: states the
+    forward policy assigns low probability despite good Boltzmann weight
+    (see train.py's screen_and_admit_anchors). Grows only through admit();
+    nothing is evicted by ordinary training churn -- only thin() or an
+    explicit purge_by_index() call can shrink it.
 
-    Grows only through admit(); nothing is evicted by ordinary training
-    churn -- only thin() or an explicit purge_by_index() call can shrink it.
-    purge()/purge_lowest() are inherited from CrystalBuffer but are EMA-loss
-    driven churn mechanisms with no meaning here (anchors are never trained
-    against directly) and should not be called on an AnchorBuffer.
+    ema_loss/update_losses/_loss_weights (inherited from CrystalBuffer) are
+    repurposed here as the *replay priority* signal rather than a training
+    loss: train.py's top_up_prior_from_anchors routes each noised child's
+    freshly-measured surprise back to its parent anchor via update_losses,
+    and then samples anchors for replay weighted by that EMA (with a random
+    floor via sample_graphs(weighted=True, beta=...)) -- a well-learned
+    anchor draws little replay; one the policy is drifting off draws more,
+    automatically. purge()/purge_lowest() are still meaningless here (no
+    "training loss" is ever computed against an anchor) and should not be
+    called on an AnchorBuffer.
 
     Reward is stored explicitly per entry (self.reward) rather than derived
     on demand from the resident batch, because temperature isn't persisted
     per-graph -- condition_samples returns it as a separate tensor rather
     than writing it back onto the batch, so re-deriving reward later would
     require re-sampling temperature, which is wrong under
-    temperature_conditioning=True.
+    temperature_conditioning=True. Energy (self.energy) is stored the same
+    way and for the same reason, and is the quantity all of this class's own
+    accounting (thin's energy-window/max_size trim) is actually done in:
+    reward = -energy / temperature folds temperature into the number, so
+    comparing raw reward across anchors sampled under different conditions
+    (e.g. temperature_conditioning=True) silently conflates real energy
+    differences with temperature differences. Energy has no such
+    dependence, so it's the physically meaningful quantity to rank/gate on;
+    reward is kept only for logging and for the reward-scale ramps
+    elsewhere in train.py that were already written in reward space.
+
+    original_surprise (self.original_surprise) is stored per entry at
+    admission time and never updated afterward -- it's the one non-adaptive
+    quantity on an anchor, used only by thin()'s hard-cap backstop (evict
+    lowest original_surprise first on overflow). Every other quantity here
+    is adaptive (ema_loss/replay-priority tracks current policy drift,
+    energy tracks Emin(c) as it falls), so keeping eviction keyed to a
+    frozen quantity keeps that one destructive decision outside the
+    feedback loop -- see the design doc for why.
+
+    Per-anchor condition_id/conditions need no separate storage --
+    condition_samples already writes them onto the resident batch
+    (mol_batch.condition_id/mol_batch.conditions), and CrystalBuffer.add/
+    subsample_new_batch carry the whole batch through generically, so
+    self.batch.condition_id (exposed via the condition_id property below)
+    always stays aligned with self.energy/self.reward/self.x with no
+    bookkeeping of its own. This is what admit()/thin() key their
+    per-condition logic on: without it, admission and space-pressure
+    trimming both compare across the whole buffer, so a single condition
+    whose achievable energy happens to be lowest can gate out or evict every
+    other condition's anchors even though each condition has its own
+    distinct target.
+
+    Novelty admission is gated entirely by surprise (see
+    screen_and_admit_anchors), not by latent distance -- admit()'s
+    dup_cutoff (formerly dist_cutoff) is kept only as a cheap literal-
+    duplicate catch among the rare confirmed-surprising candidates handed
+    to it, restricted to same-condition pairs, same as before.
     """
 
     def __init__(
@@ -1274,6 +1501,8 @@ class AnchorBuffer(CrystalBuffer):
             data,
             device,
             reward,
+            energy,
+            original_surprise=None,
             max_z_prime: int = 1,
             x_fn=None,
     ):
@@ -1282,6 +1511,24 @@ class AnchorBuffer(CrystalBuffer):
         self.reward = torch.as_tensor(reward, dtype=torch.float32).detach().cpu().flatten()
         assert self.reward.shape[0] == n, \
             f"reward has {self.reward.shape[0]} entries, expected {n} to match dataset size"
+        self.energy = torch.as_tensor(energy, dtype=torch.float32).detach().cpu().flatten()
+        assert self.energy.shape[0] == n, \
+            f"energy has {self.energy.shape[0]} entries, expected {n} to match dataset size"
+        if original_surprise is None:
+            # bootstrap/legacy path (e.g. seeding from a curated dataset with no
+            # rollout-based surprise measurement) -- NaN rather than 0 or -inf so
+            # it never dominates a thin() hard-cap eviction ranking silently.
+            self.original_surprise = torch.full((n,), float('nan'), dtype=torch.float32)
+        else:
+            self.original_surprise = torch.as_tensor(
+                original_surprise, dtype=torch.float32).detach().cpu().flatten()
+            assert self.original_surprise.shape[0] == n, \
+                f"original_surprise has {self.original_surprise.shape[0]} entries, expected {n} to match dataset size"
+
+    @property
+    def condition_id(self):
+        """Per-anchor condition_id, read straight off the resident batch -- see class docstring."""
+        return self.batch.condition_id.detach().cpu().flatten()
 
     # ---------------------------------------------------------------------
     # Persistence
@@ -1290,12 +1537,23 @@ class AnchorBuffer(CrystalBuffer):
     def state_dict(self):
         state = super().state_dict()
         state['reward'] = self.reward.cpu()
+        state['energy'] = self.energy.cpu()
+        state['original_surprise'] = self.original_surprise.cpu()
         return state
 
     @classmethod
     def from_state_dict(cls, state, device):
         obj = super(AnchorBuffer, cls).from_state_dict(state, device)
         obj.reward = state['reward'].cpu()
+        # older checkpoints predate storing energy explicitly -- fall back to
+        # -reward (exact at temperature == 1; otherwise an approximation
+        # until the buffer churns in fresh, correctly energy-scored
+        # admissions)
+        obj.energy = state.get('energy', -state['reward']).cpu()
+        # older checkpoints predate original_surprise -- NaN ("unmeasured") is
+        # the only honest fallback; see __init__'s legacy-path comment
+        obj.original_surprise = state.get(
+            'original_surprise', torch.full_like(obj.energy, float('nan'))).cpu()
         return obj
 
     # ---------------------------------------------------------------------
@@ -1303,14 +1561,26 @@ class AnchorBuffer(CrystalBuffer):
     # ---------------------------------------------------------------------
 
     @torch.no_grad()
-    def add(self, data, reward, traj=None, init_loss=None):
+    def add(self, data, reward, energy, original_surprise=None, traj=None, init_loss=None):
         reward = torch.as_tensor(reward, dtype=torch.float32).detach().cpu().flatten()
+        energy = torch.as_tensor(energy, dtype=torch.float32).detach().cpu().flatten()
         n_before = len(self)
         super().add(data, traj=traj, init_loss=init_loss)
         k = len(self) - n_before
         assert reward.shape[0] == k, \
             f"reward has {reward.shape[0]} entries, expected {k} to match added batch size"
+        assert energy.shape[0] == k, \
+            f"energy has {energy.shape[0]} entries, expected {k} to match added batch size"
         self.reward = torch.cat([self.reward, reward], dim=0)
+        self.energy = torch.cat([self.energy, energy], dim=0)
+        if original_surprise is None:
+            new_surprise = torch.full((k,), float('nan'), dtype=torch.float32)
+        else:
+            new_surprise = torch.as_tensor(
+                original_surprise, dtype=torch.float32).detach().cpu().flatten()
+            assert new_surprise.shape[0] == k, \
+                f"original_surprise has {new_surprise.shape[0]} entries, expected {k} to match added batch size"
+        self.original_surprise = torch.cat([self.original_surprise, new_surprise], dim=0)
 
     @torch.no_grad()
     def purge_by_index(self, indices_to_remove):
@@ -1327,48 +1597,68 @@ class AnchorBuffer(CrystalBuffer):
 
         super().purge_by_index(indices_to_remove)
         self.reward = self.reward[keep_cpu]
+        self.energy = self.energy[keep_cpu]
+        self.original_surprise = self.original_surprise[keep_cpu]
 
     @torch.no_grad()
-    def admit(self, candidate_batch, reward, dist_cutoff, admit_range: Optional[float] = None):
+    def admit(self, candidate_batch, reward, energy, dup_cutoff, admit_range: Optional[float] = None,
+              original_surprise=None):
         """
-        Filter (candidate_batch, reward) down to whatever clears the gate
-        (self.reward.max() - admit_range), then greedily admit survivors --
-        processed best-reward-first -- against a reference set seeded with
-        the current anchors and grown as candidates are accepted. A survivor
-        within dist_cutoff of the nearest reference point only displaces it
-        if strictly better; otherwise it's dropped. This handles both
-        intra-batch duplicates and duplicates against existing anchors in
-        one pass, and never evicts an existing anchor except by something
-        strictly better appearing within dist_cutoff of it -- so an
-        isolated, merely-adequate anchor is never displaced just for being
-        rare.
+        candidate_batch/reward/energy are expected to already be the
+        confirmed-surprising set (see train.py's screen_and_admit_anchors) --
+        surprise, not distance or energy proximity, is the novelty gate.
+        admit_range is kept only for the legacy/bootstrap fallback path (see
+        train.py's manage_anchor_buffer bootstrap branch); pass None to admit
+        every candidate handed in, which is the normal case now.
 
-        The gate is relative to the buffer's own current best reward rather
-        than an absolute number, so it automatically tracks the achievable
-        reward scale as it rises over training. admit_range=None disables
-        the gate entirely (every candidate considered).
+        Greedily admit survivors -- processed best-energy-first -- against a
+        reference set seeded with the current anchors and grown as
+        candidates are accepted. A survivor within dup_cutoff of the nearest
+        same-condition reference point only displaces it if strictly lower
+        energy; otherwise it's dropped as a near-duplicate. This is a cheap
+        literal-duplicate catch, not a novelty judgment -- it only ever runs
+        on the rare confirmed set handed in here, restricted to reference
+        entries sharing the candidate's condition_id so two anchors that
+        happen to sit close together in latent space but arose under
+        different conditions are never compared against each other -- they're
+        distinct targets, not duplicates. This handles both intra-batch
+        duplicates and duplicates against existing anchors in one pass, and
+        never evicts an existing anchor except by something strictly
+        lower-energy appearing within dup_cutoff of it under the same
+        condition -- so an isolated, merely-adequate anchor is never
+        displaced just for being rare.
 
-        Cost is bounded by the gate: the O(candidates x |buffer|) distance
-        work below only ever runs on whatever clears it, which is what keeps
-        this cheap enough to call regularly as long as admit_range is set to
-        something only a small fraction of a batch clears.
+        original_surprise, if given, is a per-candidate tensor aligned with
+        reward/energy, threaded through to whichever candidates end up
+        admitted or replacing an existing slot -- see AnchorBuffer's
+        docstring for why it's stored frozen rather than updated later.
 
         Returns the number of anchors admitted or replaced.
         """
         reward = torch.as_tensor(reward, dtype=torch.float32).detach().cpu().flatten()
+        energy = torch.as_tensor(energy, dtype=torch.float32).detach().cpu().flatten()
         if reward.numel() == 0:
             return 0
+        if original_surprise is not None:
+            original_surprise = torch.as_tensor(
+                original_surprise, dtype=torch.float32).detach().cpu().flatten()
+
+        cand_condition_id = candidate_batch.condition_id.detach().cpu().flatten()
 
         if admit_range is not None:
-            floor = self.reward.max().item() - admit_range
-            keep = torch.nonzero(reward > floor, as_tuple=False).flatten()
+            cond_best = _per_condition_min(self.condition_id, self.energy, cand_condition_id)
+            keep = torch.nonzero(energy < cond_best + admit_range, as_tuple=False).flatten()
         else:
-            keep = torch.arange(reward.numel())
+            keep = torch.arange(energy.numel())
         if keep.numel() == 0:
             return 0
 
         candidate_batch = candidate_batch.subsample_new_batch(keep)
         reward = reward[keep]
+        energy = energy[keep]
+        cand_condition_id = cand_condition_id[keep]
+        if original_surprise is not None:
+            original_surprise = original_surprise[keep]
 
         if self.x_fn is None:
             cand_x = candidate_batch.latent_params()
@@ -1378,41 +1668,49 @@ class AnchorBuffer(CrystalBuffer):
             cand_x = candidate_batch[self.x_fn]
         cand_x = cand_x.detach().to(self.device).contiguous()
 
-        order = torch.argsort(reward, descending=True)
+        order = torch.argsort(energy)  # ascending -- lowest energy (best) first
 
         ref_x = self.x.clone()
         ref_reward = self.reward.clone()
+        ref_energy = self.energy.clone()
+        ref_condition_id = self.condition_id.clone()
         n_existing = ref_x.shape[0]
 
-        replace_map = {}      # existing-anchor slot idx -> winning local candidate idx
-        new_slot_owner = []   # local candidate idx currently occupying each newly created slot
+        replace_map = {}  # existing-anchor slot idx -> winning local candidate idx
+        new_slot_owner = []  # local candidate idx currently occupying each newly created slot
 
         for local_idx in order.tolist():
             x_i = cand_x[local_idx:local_idx + 1]
             r_i = reward[local_idx]
+            e_i = energy[local_idx]
+            cid_i = cand_condition_id[local_idx]
 
-            if ref_x.shape[0] > 0:
-                d = torch.cdist(x_i, ref_x).flatten()
-                nn_val, nn_pos = d.min(0)
+            same_cond = torch.nonzero(ref_condition_id == cid_i, as_tuple=False).flatten()
+            if same_cond.numel() > 0:
+                d = torch.cdist(x_i, ref_x[same_cond]).flatten()
+                nn_val, nn_local = d.min(0)
                 nn_val = nn_val.item()
-                nn_pos = int(nn_pos.item())
+                nn_pos = int(same_cond[nn_local].item())
             else:
                 nn_val = float('inf')
                 nn_pos = -1
 
-            if nn_val <= dist_cutoff:
-                if r_i.item() > ref_reward[nn_pos].item():
+            if nn_val <= dup_cutoff:
+                if e_i.item() < ref_energy[nn_pos].item():
                     if nn_pos < n_existing:
                         replace_map[nn_pos] = local_idx
                     else:
                         new_slot_owner[nn_pos - n_existing] = local_idx
                     ref_x[nn_pos] = x_i[0]
                     ref_reward[nn_pos] = r_i
+                    ref_energy[nn_pos] = e_i
                 # else: candidate is a worse duplicate -- dropped
             else:
                 new_slot_owner.append(local_idx)
                 ref_x = torch.cat([ref_x, x_i], dim=0)
                 ref_reward = torch.cat([ref_reward, r_i[None]], dim=0)
+                ref_energy = torch.cat([ref_energy, e_i[None]], dim=0)
+                ref_condition_id = torch.cat([ref_condition_id, cid_i[None]], dim=0)
 
         n_admitted = len(replace_map) + len(new_slot_owner)
         if n_admitted == 0:
@@ -1423,38 +1721,105 @@ class AnchorBuffer(CrystalBuffer):
 
         add_local = list(replace_map.values()) + new_slot_owner
         add_inds = torch.tensor(add_local, dtype=torch.long)
-        self.add(candidate_batch.subsample_new_batch(add_inds), reward=reward[add_inds])
+        self.add(candidate_batch.subsample_new_batch(add_inds),
+                 reward=reward[add_inds], energy=energy[add_inds],
+                 original_surprise=original_surprise[add_inds] if original_surprise is not None else None)
 
         return n_admitted
 
     @torch.no_grad()
-    def thin(self, dist_cutoff, max_size: Optional[int] = None):
+    def thin(self, per_condition_min_energy, energy_window: Optional[float] = None,
+             max_size: Optional[int] = None, max_per_condition: Optional[int] = None):
         """
-        Full O(N^2) dedup pass over the whole buffer: greedily keep the
-        highest-reward representative in each dist_cutoff neighborhood
-        (bottom_up_cluster on -reward), correcting any drift admit()'s
-        incremental/approximate process leaves behind. If the buffer is
-        still over max_size afterward, additionally drops the lowest-reward
-        excess -- the one place a rare-but-passable anchor can be evicted
-        purely for space, i.e. the "explicitly thinned out" escape hatch.
+        Energy-window trim, run per condition_id group: drop anchors whose
+        energy - per_condition_min_energy[cid] exceeds energy_window (deliberately
+        wide -- an anchor irrelevant at low T may carry real weight at high T,
+        so this should stay generous). per_condition_min_energy is supplied by
+        the caller (train.py's condition_log_z.best_energy, i.e. Emin(c)) rather
+        than recomputed here, so buffer.py stays free of any condition_log_z
+        coupling -- pass a [library_size] tensor indexable by condition_id, or a
+        dict/Tensor-like keyed the same way; energy_window=None skips this pass.
+
+        This replaces the old distance-based dedup pass: novelty admission is
+        now gated by surprise (see AnchorBuffer.admit/screen_and_admit_anchors),
+        so a periodic re-clustering correction is no longer needed -- an anchor
+        near an existing one will simply fail re-confirmation once the policy
+        has generalized locally, and Emin(c) is monotonically non-increasing, so
+        this trim is a one-way, always-safe operation: an anchor that falls out
+        can never re-qualify.
+
+        Hard-cap backstop: if the buffer is still over max_size (or a single
+        condition is over max_per_condition) afterward, each condition's own
+        current-best (lowest-energy) anchor is protected first, then the
+        remaining pool is trimmed by lowest original_surprise first (NaN --
+        i.e. unmeasured, legacy-seeded anchors -- sorts last, so freshly
+        confirmed anchors are the ones actually exposed to this backstop). This
+        is the one non-adaptive, explicitly irreversible eviction path -- see
+        AnchorBuffer's docstring. If this fires regularly, energy_window is too
+        wide; that's the diagnostic, not a reason for a smarter eviction rule.
         """
         n = len(self)
         if n == 0:
             return
 
-        device = 'cuda' if torch.cuda.is_available() else self.device
-        keep_inds = bottom_up_cluster(
-            self.x, -self.reward, d_cut=dist_cutoff, e_cut=float('inf'),
-            max_new_samples=n, device=device,
-        )
-        drop = np.setdiff1d(np.arange(n), keep_inds.numpy())
-        if drop.size > 0:
-            self.purge_by_index(drop)
+        if energy_window is not None:
+            condition_id = self.condition_id
+            cond_min = torch.as_tensor(per_condition_min_energy)[condition_id].to(self.energy.device)
+            drop = torch.nonzero(
+                self.energy - cond_min > energy_window, as_tuple=False).flatten()
+            if drop.numel() > 0:
+                self.purge_by_index(drop.numpy())
+
+        over_global = max_size is not None and len(self) > max_size
+        over_per_condition = max_per_condition is not None and len(self) > 0 and \
+                             int(torch.bincount(self.condition_id).max().item()) > max_per_condition
+        if not (over_global or over_per_condition):
+            return
+
+        condition_id = self.condition_id
+        energy = self.energy
+        surprise = self.original_surprise
+        protected = {
+            int(rows[torch.argmin(energy[rows])].item())
+            for cid in torch.unique(condition_id)
+            for rows in [torch.nonzero(condition_id == cid, as_tuple=False).flatten()]
+        }
+
+        drop_idx_parts = []
+
+        if max_per_condition is not None:
+            for cid in torch.unique(condition_id):
+                rows = torch.nonzero(condition_id == cid, as_tuple=False).flatten()
+                excess = rows.numel() - max_per_condition
+                if excess <= 0:
+                    continue
+                cand = torch.tensor([r.item() for r in rows if r.item() not in protected], dtype=torch.long)
+                if cand.numel() == 0:
+                    continue
+                # lowest original_surprise first; NaN (unmeasured) sorts last via nan_to_num(+inf)
+                order = torch.argsort(torch.nan_to_num(surprise[cand], nan=float('inf')))
+                drop_idx_parts.append(cand[order[:min(excess, cand.numel())]])
+
+        if drop_idx_parts:
+            self.purge_by_index(torch.cat(drop_idx_parts).numpy())
 
         if max_size is not None and len(self) > max_size:
+            condition_id = self.condition_id  # re-read: indices shifted after any drop above
+            energy = self.energy
+            surprise = self.original_surprise
+            protected = {
+                int(rows[torch.argmin(energy[rows])].item())
+                for cid in torch.unique(condition_id)
+                for rows in [torch.nonzero(condition_id == cid, as_tuple=False).flatten()]
+            }
+
             excess = len(self) - max_size
-            order = torch.argsort(self.reward)  # ascending -- worst first
-            self.purge_by_index(order[:excess].numpy())
+            candidates = [i for i in range(len(self)) if i not in protected]
+            if excess > 0 and candidates:
+                cand_idx = torch.tensor(candidates, dtype=torch.long)
+                order = torch.argsort(torch.nan_to_num(surprise[cand_idx], nan=float('inf')))  # lowest surprise first
+                drop_idx = cand_idx[order[:min(excess, cand_idx.numel())]]
+                self.purge_by_index(drop_idx.numpy())
 
 
 '''

@@ -232,7 +232,7 @@ if __name__ == '__main__':
         thinned_batch = dd['prior_batch']
         log_noise_range = dd['log_noise_range']
         en_scaling_factor = dd['thermal_scaling_factor']
-        if hasattr(dd, 'noised_batch'):
+        if 'noised_batch' in dd:
             noised_samples = dd['noised_batch'].batch_to_list()
         else:
             noised_samples = []

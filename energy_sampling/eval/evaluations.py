@@ -1,3 +1,4 @@
+import math
 import os
 from typing import Optional
 
@@ -130,9 +131,9 @@ def conditional_eval_step(energy_function,
 
 
 def _tb_direction_figs(fig_dict, prefix, log_r, log_pfs, log_pbs, log_flow,
-                       flow_states, packing_coeff):
+                       flow_states, packing_coeff, cond_inds=None):
     fig_dict[f'{prefix} TB Parity Plot'], _ = flow_parity_plot(
-        log_r, log_flow, log_pbs, log_pfs, packing_coeff)
+        log_r, log_flow, log_pbs, log_pfs, packing_coeff, cond_inds=cond_inds)
     # _, fig_dict[f'{prefix} Pf Parity R Value'] = pf_parity_plot(
     #     log_pfs, log_pbs, log_r, log_flow)
 
@@ -171,6 +172,7 @@ def eval_figs(fwd_stats,
         log_flow=fwd_stats['log_Z_learned'],
         flow_states=fwd_stats['flow_states'],
         packing_coeff=sample_batch.packing_coeff,
+        cond_inds=fwd_stats.get('condition_id'),
     )
     _tb_direction_figs(
         fig_dict, 'Backward',
@@ -180,6 +182,7 @@ def eval_figs(fwd_stats,
         log_flow=bwd_stats['log_Z_learned'],  # constant log Z stands in for per-state flow
         flow_states=bwd_stats['flow_states'],
         packing_coeff=bwd_stats['packing_coeff'],
+        cond_inds=bwd_stats.get('condition_id'),
     )
 
     log_traj_params(
@@ -191,11 +194,18 @@ def eval_figs(fwd_stats,
         bwd_stats['flow_states'], bwd_stats['means_b'],
         bwd_stats['logvars_b'], prefix='Bwd')
 
+    # prefer the rescaled mol_energy (matches the actual loss scale) over the
+    # bare energy_function attribute, which is only correct for toy (non
+    # lj-rescaled) energy functions that never set mol_energy
+    scaled_energy = getattr(sample_batch, 'mol_energy', None)
+    if scaled_energy is None:
+        scaled_energy = sample_batch[energy_function]
+
     fig_dict['Lattice Latents Distribution'] = sample_batch.plot_batch_cell_params(
         space='latent', ref_dist=prior_latent_params, quantiles=[0.1],
-        show=False, return_fig=True, override_energy=sample_batch[energy_function])
+        show=False, return_fig=True, override_energy=scaled_energy)
     fig_dict['Sample Scatter'] = sample_batch.plot_batch_density_funnel(
-        show=False, return_fig=True, override_energy=energy_function)
+        show=False, return_fig=True, override_energy=scaled_energy)
 
     if temperature_conditioning:
         fig_dict['Z vs T'] = Z_vs_T(fwd_stats)
@@ -967,7 +977,7 @@ def visualize_latent_trajs(states, n_trajs, log_r):
     return fig
 
 
-def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs, packing_coeff):
+def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs, packing_coeff, cond_inds=None):
     # Compute x and y
     x = (log_r + log_pbs.sum(-1)).cpu().detach().numpy()
     y = (log_Z_learned + log_pfs.sum(-1)).cpu().detach().numpy()
@@ -1026,7 +1036,11 @@ def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs, packing_coeff):
         "Density": packing_coeff.clip(max=2),
         "Importance Weight": log_importance_weight,
     }
-    fig = add_color_switcher(fig, color_fields)
+    colorscales = {}
+    if cond_inds is not None:
+        color_fields["Condition"] = cond_inds
+        colorscales["Condition"] = "Rainbow"
+    fig = add_color_switcher(fig, color_fields, colorscales=colorscales)
 
     return fig, r_value
 
@@ -1228,6 +1242,7 @@ def log_ess_frac(log_pf, log_pb, repeats):
     log_ess = -torch.logsumexp(2 * log_w_n, dim=0)
 
     return (log_ess - np.log(B)).item()
+
 
 
 @torch.no_grad()

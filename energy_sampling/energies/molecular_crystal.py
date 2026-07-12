@@ -51,9 +51,10 @@ class MolecularCrystal(BaseSet):
                  temperature: float = 1.0,
                  temperature_conditioning: bool = False,
                  lj_coeff: float = 1.0,
-                 molecule_conditioning: bool = False,
                  sg_conditioning: bool = False,
                  zp_conditioning: bool = False,
+                 vector_conditioning: bool = False,
+                 vector_conditioning_dim: Optional[int] = None,
                  space_groups: Optional[list] = [2],
                  bounding_coeff: float = 1.0,
                  reduction_coeff: float = 1.0,
@@ -81,12 +82,18 @@ class MolecularCrystal(BaseSet):
         self.lj_coeff = lj_coeff
         self.bounding_coeff = bounding_coeff
         self.reduction_coeff = reduction_coeff
-        self.molecule_conditioning = molecule_conditioning
         self.sg_conditioning = sg_conditioning
         self.space_groups = space_groups
         self.max_z_prime = max_z_prime
         self.z_primes = z_primes
         self.zp_conditioning = zp_conditioning
+        self.vector_conditioning = vector_conditioning
+        if self.vector_conditioning:
+            assert vector_conditioning_dim is not None, \
+                "vector_conditioning requires vector_conditioning_dim to be set (the dimensionality of the `c` " \
+                "vectors carried by molecules_path/prior_path entries -- e.g. mxtaltools' cond_dim for " \
+                "latent_multiharmonic, or data_ndim for latent_harmonic)"
+        self.vector_conditioning_dim = vector_conditioning_dim
         self.reward_range = reward_range
         self.lj_rescale = lj_rescale
         self.pressure = pressure
@@ -120,6 +127,50 @@ class MolecularCrystal(BaseSet):
         self.computes.append(self.energy_function)
         self.computes_require_cluster = any(COMPUTES_REQUIRE_CLUSTER.get(k, False) for k in self.computes)
 
+        self._init_condition_library()
+
+    def _init_condition_library(self):
+        """
+        Lookup tables for the per-sample, immutable `condition_id` computed
+        in condition_samples(): a mixed-radix combination of molecule index
+        (mol_id -- a dense registry built from crystal_batch.identifier,
+        spanning both mol_dataset and prior_dataset, in train.py's
+        init_identifiers()) and dense-local SG/Z' index. condition_id keys
+        ConditionLogZTracker only -- it never touches the (potentially
+        large) condition vector itself, so its cost doesn't depend on
+        conditions_dim.
+
+        n_molecules defaults to 1 here (library sized as if there's a single
+        molecule) and is corrected via set_n_molecules() once the identifier
+        registry is built in train.py -- MolecularCrystal is constructed
+        before that, so it can't know the true count upfront.
+        """
+        self.n_sg = len(self.space_groups)
+        self.n_zp = len(self.z_primes)
+        self.n_molecules = 1
+
+        max_sg = max(self.space_groups)
+        sg_lookup = torch.full((max_sg + 1,), -1, dtype=torch.long)
+        sg_lookup[torch.tensor(self.space_groups, dtype=torch.long)] = torch.arange(self.n_sg)
+        self.sg_to_local = sg_lookup
+
+        max_zp = max(self.z_primes)
+        zp_lookup = torch.full((max_zp + 1,), -1, dtype=torch.long)
+        zp_lookup[torch.tensor(self.z_primes, dtype=torch.long)] = torch.arange(self.n_zp)
+        self.zp_to_local = zp_lookup
+
+        # upfront library size for ConditionLogZTracker preallocation
+        self.condition_library_size = self.n_molecules * self.n_sg * self.n_zp
+
+    def set_n_molecules(self, n_molecules: int):
+        """
+        Called once from train.py's init_identifiers(), after the
+        identifier -> mol_id registry (spanning mol_dataset and
+        prior_dataset) is built, to correct condition_id's library sizing.
+        """
+        self.n_molecules = n_molecules
+        self.condition_library_size = self.n_molecules * self.n_sg * self.n_zp
+
     def set_reward_clip(self, dataset_rewards):
         """
         We want to restrain the range of allowable rewards, by log-clipping the log reward below a certain threshold.
@@ -152,6 +203,25 @@ class MolecularCrystal(BaseSet):
                               predictor=self.predictor)
         analyze_kwargs.update(self.analyze_kwargs)
 
+        if self.vector_conditioning:
+            # per-sample condition override: today's static self.analyze_kwargs['c']/['width']
+            # (a single fixed vector from YAML) isn't valid once distinct molecules_path entries
+            # carry their own condition vectors, so replace them with the per-sample values
+            # carried on the batch itself (set on each entry when the toy dataset was built,
+            # riding through condition_samples/instantiate_crystals like any other attribute).
+            # mxtaltools' latent_multiharmonic_en/_latent_field_params already broadcasts a
+            # [B, cond_dim] `c` correctly (einsum 'kdc,...c->...kd').
+            if not hasattr(crystal_batch, 'c'):
+                raise RuntimeError(
+                    "vector_conditioning is enabled but crystal_batch has no `c` attribute -- "
+                    "instantiate_crystals likely dropped it (e.g. via init_blank_crystal_batch's "
+                    "set_mol_attrs), or molecules_path/prior_path entries weren't built with `c` set "
+                    "(see data_processing/generate_toy_prior.py)."
+                )
+            analyze_kwargs['c'] = crystal_batch.c.to(x.device)
+            if hasattr(crystal_batch, 'width'):
+                analyze_kwargs['width'] = crystal_batch.width.to(x.device)
+
         with torch.set_grad_enabled(keep_grads):
             out = crystal_batch.analyze(self.computes, **analyze_kwargs)
 
@@ -179,13 +249,23 @@ class MolecularCrystal(BaseSet):
 
         latents = crystal_batch.latent_params()
         if (raw_latents is not None) and self.is_crystal:
-            bounding_energy = (F.relu(raw_latents - 1) ** 2 + F.relu(-(raw_latents + 1)) ** 2).sum(
+            upper_violation = F.relu(raw_latents - 1)
+            lower_violation = F.relu(-(raw_latents + 1))
+            # quadratic term gives a gentle, zero-slope onset right at the boundary; quartic
+            # term steepens the wall for larger excursions without sharpening that onset
+            bounding_energy = (upper_violation ** 2 + upper_violation ** 4 +
+                               lower_violation ** 2 + lower_violation ** 4).sum(
                 dim=-1)  # discourage exploration beyond clip range
         else:
             bounding_energy = torch.zeros_like(latents[:, 0])
 
         if self.max_z_prime > 1:
             bounding_energy = self.compute_zp_order_penalty(bounding_energy, crystal_batch)
+
+        # energy() divides the total energy by temperature before use; pre-multiply here so
+        # this domain-validity constraint stays equally stiff across sampling temperatures,
+        # matching the same compensation already applied to jacobian_energy below
+        bounding_energy = bounding_energy * temperature
 
         if self.energy_function in ['lj', 'qlj', 'elj', 'silu', 'uma', 'mace']:
             density_energy = density_penalty(crystal_batch.packing_coeff)
@@ -198,6 +278,9 @@ class MolecularCrystal(BaseSet):
                 mol_energy = self.lj_rescale * mol_energy
 
             reduction_energy = F.relu(crystal_batch.reduction_en)  # punish positive energies
+            # same temperature compensation as bounding_energy above -- this is a validity
+            # constraint, not part of the target Boltzmann distribution, so it shouldn't soften at high T
+            reduction_energy = reduction_energy * temperature
 
             atm_conv = 101325  # conversion from atmospheres to Pa
             PV_en_conv = 6.022 * 10 ** -10  # conversion to energy in Pa*A^3 to kJ/mol
@@ -560,6 +643,32 @@ class MolecularCrystal(BaseSet):
         CrystalBuffer.loader(..., repeats=repeats)). Conditions are sampled once
         per group and broadcast across the group via repeat_interleave, so every
         trajectory drawn for a given molecule shares the same condition.
+
+        Also computes and attaches, as plain attributes on `mol_batch`
+        (matching the existing z_prime/sg_ind convention rather than
+        add_graph_attr), two immutable per-sample fields:
+          - `conditions`: the realized float condition vector (detached)
+          - `condition_id`: a mixed-radix combination of mol_id (identifier
+            -> dense integer registry spanning mol_dataset AND prior_dataset,
+            built once in train.py's init_identifiers()) and dense-local
+            SG/Z' index, used only to key ConditionLogZTracker
+        Both ride along automatically into any buffer this batch is later
+        added to, since CrystalBuffer/AnchorBuffer.add carries the whole
+        resident Batch through generically -- no buffer.py changes needed.
+
+        When vector_conditioning is on, toy energy functions read their
+        condition vector directly off the batch too: molecules_path entries
+        carry a `c` attribute (and optionally `width`), which gets appended
+        into the condition tensor here and read again in
+        analyze_crystal_batch. This is deliberately independent of
+        molecule_conditioning: that flag routes the condition through
+        VectorMoleculeGraphModel (a GNN over the actual molecule graph, for
+        physical runs where "the condition is the graph itself");
+        vector_conditioning instead keeps conditions_type='vector' (a plain
+        scalarMLP over the condition tensor -- see models/gfn.py's
+        init_conditioner) since toy `c` vectors aren't tied to any real
+        molecular graph and running the GNN over blank/dummy scaffolding
+        would be wasted machinery.
         """
         num_groups = mol_batch.num_graphs // repeats
 
@@ -606,21 +715,49 @@ class MolecularCrystal(BaseSet):
         if self.zp_conditioning:
             conds.append(zp_to_sample.clone()[:, None].float())
 
+        if self.vector_conditioning:
+            if not hasattr(mol_batch, 'c'):
+                raise RuntimeError(
+                    "vector_conditioning is enabled but mol_batch has no `c` attribute -- "
+                    "molecules_path/prior_path entries weren't built with `c` set (see "
+                    "data_processing/generate_toy_prior.py)."
+                )
+            conds.append(mol_batch.c.to(mol_batch.device))
+
         mol_batch.z_prime = zp_to_sample
         mol_batch.reset_sg_info(sg_to_sample)
 
+        conds = [c if c.dim() > 1 else c[:, None] for c in conds]
         if len(conds) == 0:
-            condition = torch.zeros_like(log_T_tensor)
-        elif len(conds) == 1:
-            condition = conds[0][:, None]
+            condition = torch.zeros((mol_batch.num_graphs, 1), device=mol_batch.device)
         else:
             condition = torch.cat(conds, dim=-1)
+
+        mol_id = getattr(mol_batch, 'mol_id', None)
+        if mol_id is None:
+            # a batch whose dataset had no .identifier field to register (e.g. an
+            # older/synthetic prior file that predates init_identifiers()) has no
+            # molecule identity of its own -- collapse onto molecule index 0
+            # rather than erroring, so condition_id there only resolves SG/Z'.
+            mol_id = torch.zeros(mol_batch.num_graphs, dtype=torch.long, device=mol_batch.device)
+        else:
+            mol_id = mol_id.to(mol_batch.device)
+
+        sg_local = self.sg_to_local.to(mol_batch.device)[sg_to_sample]
+        zp_local = self.zp_to_local.to(mol_batch.device)[zp_to_sample]
+        condition_id = (mol_id * (self.n_sg * self.n_zp) +
+                        sg_local * self.n_zp +
+                        zp_local)
+
+        mol_batch.conditions = condition.detach()
+        mol_batch.condition_id = condition_id
 
         return (mol_batch,
                 log_T_tensor.flatten(),
                 sg_to_sample,
                 zp_to_sample,
-                condition
+                condition,
+                condition_id,
                 )
 
 
