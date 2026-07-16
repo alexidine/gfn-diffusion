@@ -153,7 +153,8 @@ def eval_figs(fwd_stats,
               prior_latent_params,
               energy_function,
               metrics,
-              temperature_conditioning: bool = False
+              temperature_conditioning: bool = False,
+              anchor_latents=None,
               ):
     fig_dict = {}  # todo add tb GP fig & binned residuals
 
@@ -203,7 +204,8 @@ def eval_figs(fwd_stats,
 
     fig_dict['Lattice Latents Distribution'] = sample_batch.plot_batch_cell_params(
         space='latent', ref_dist=prior_latent_params, quantiles=[0.1],
-        show=False, return_fig=True, override_energy=scaled_energy)
+        show=False, return_fig=True, override_energy=scaled_energy,
+        aux_dists=[anchor_latents] if anchor_latents is not None else None)
     fig_dict['Sample Scatter'] = sample_batch.plot_batch_density_funnel(
         show=False, return_fig=True, override_energy=scaled_energy)
 
@@ -246,6 +248,214 @@ def Z_vs_T(fwd_stats):
         showlegend=False,
     )
     return fig
+
+def _decode_condition_ids(cid, energy_function):
+    """
+    Invert condition_samples()'s mixed-radix condition_id
+    (mol_id * n_sg * n_zp + sg_local * n_zp + zp_local) back into
+    (mol_id, SG symbol-index, Z') arrays for hover labels / heatmap axes.
+    Returns None for energy functions without the SG/Z' condition library
+    (toy energies), in which case callers fall back to raw cid labels.
+    """
+    n_sg = getattr(energy_function, 'n_sg', None)
+    n_zp = getattr(energy_function, 'n_zp', None)
+    if not n_sg or not n_zp:
+        return None
+    n_combos = n_sg * n_zp
+    mol = cid // n_combos
+    sg_local = (cid % n_combos) // n_zp
+    zp_local = cid % n_zp
+    sgs = np.asarray(energy_function.space_groups)[sg_local]
+    zps = np.asarray(energy_function.z_primes)[zp_local]
+    return mol, sgs, zps
+
+
+# per-condition scatter diagnostics (splom + Z-calibration funnel) are off by
+# default -- see the note inside condition_tracker_figs
+CONDITION_SCATTER_FIGS = False
+
+
+def condition_tracker_figs(tracker, energy_function, current_step):
+    """
+    Per-condition diagnostic figures built ENTIRELY from ConditionLogZTracker's
+    persistent running statistics -- no sampling, no forward energy calls -- so
+    they're free to log on figs cadence regardless of energy-function cost.
+    They replace squinting at wandb's per-condition 1D time series with direct
+    cross-sections of the whole condition library at the current step.
+
+    Note z_resid_ema IS a per-condition TB residual: |log w - log Z_learned| =
+    |log Z + log_pf - log_pb - log_r|, EMA'd per condition on fresh train-time
+    samples (see ConditionLogZTracker.update_z_residual) -- read alongside the
+    signed z_bias_ema to split spread (policy work) from Z miscalibration
+    (Z training). The CONDITION_SCATTER_FIGS-gated calibration scatter makes
+    that split explicit per condition.
+    """
+    valid = ~torch.isnan(tracker.ema_logw)
+    n_visited = int(valid.sum().item())
+    if n_visited < 2:
+        return {}
+
+    cid = torch.arange(tracker.library_size)[valid].numpy()
+    ema_logw = tracker.ema_logw[valid].cpu().numpy()
+    z_gap = (tracker.ema_log_z_emp - tracker.ema_logw)[valid].cpu().numpy()
+    logw_std = np.sqrt(
+        (tracker.ema_logw_sq - tracker.ema_logw ** 2).clamp(min=0.0)[valid].cpu().numpy())
+    best_energy = tracker.best_energy[valid].cpu().numpy().copy()
+    best_energy[~np.isfinite(best_energy)] = np.nan  # visited via logw but no energy recorded yet
+    z_resid = tracker.z_resid_ema[valid].cpu().numpy()
+    z_bias = tracker.z_bias_ema[valid].cpu().numpy()
+    log_count = np.log10(1.0 + tracker.count[valid].float().cpu().numpy())
+    staleness = np.clip(current_step - tracker.last_update_step[valid].cpu().numpy(), 0, None).astype(float)
+
+    decoded = _decode_condition_ids(cid, energy_function)
+
+    fig_dict = {}
+    n_trusted = int((tracker.count[valid] >= tracker.min_visits).sum().item())
+    nbins = int(min(64, max(10, n_visited // 5)))
+
+    # --- 1: cross-sectional histograms over the condition library ---
+    # strictly-positive metrics are log10'd: their per-condition spreads are
+    # heavy-tailed (z_gap spans orders of magnitude), so linear bins put all
+    # the structure in one bar. Non-positive entries (e.g. exact-zero gap on
+    # a single-visit condition) go -inf and are dropped by the finite filter.
+    with np.errstate(divide='ignore', invalid='ignore'):
+        hist_metrics = [
+            ('log10 z_gap (emp - jensen)', np.log10(z_gap)),
+            ('log10 std(log w)', np.log10(logw_std)),
+            ('best energy', best_energy),
+            ('log10 TB resid |logw - Z| EMA', np.log10(z_resid)),
+            ('signed Z bias EMA', z_bias),
+            ('ema_logw (Z target)', ema_logw),
+            ('log10(1 + visits)', log_count),
+            ('log10(1 + steps since update)', np.log10(1.0 + staleness)),
+        ]
+    fig = make_subplots(rows=2, cols=4, subplot_titles=[m[0] for m in hist_metrics])
+    for i, (name, arr) in enumerate(hist_metrics):
+        arr = arr[np.isfinite(arr)]
+        fig.add_trace(
+            go.Histogram(x=arr, nbinsx=nbins, showlegend=False, marker_color='#3f7fbf'),
+            row=i // 4 + 1, col=i % 4 + 1)
+    fig.update_layout(
+        template='plotly_white', width=1100, height=560,
+        title=f'Per-condition tracker stats ({n_visited} visited, {n_trusted} trusted)')
+    fig_dict['Condition Tracker Histograms'] = fig
+
+    # --- 2 & 3 (disabled): correlation splom and Z-calibration scatter.
+    # Early runs showed no actionable structure in either, and per-condition
+    # scatters are the heaviest figures here (one marker per condition x 5
+    # dims), so they're off by default to keep uploads small. Flip on when
+    # hunting for cross-metric correlations.
+    if CONDITION_SCATTER_FIGS:
+        if decoded is not None:
+            mol, sgs, zps = decoded
+            hover = [f"cid {c} | mol {m} | SG {s} | Z'={z}"
+                     for c, m, s, z in zip(cid, mol, sgs, zps)]
+        else:
+            hover = [f"cid {c}" for c in cid]
+
+        # pairwise correlations (scatter matrix), colored by signed Z bias
+        color = z_bias if np.isfinite(z_bias).any() else z_gap
+        cscale = float(np.nanpercentile(np.abs(color), 99)) if np.isfinite(color).any() else 1.0
+        fig = go.Figure(go.Splom(
+            dimensions=[dict(label=name, values=vals) for name, vals in [
+                ('z_gap', z_gap),
+                ('std(log w)', logw_std),
+                ('best energy', best_energy),
+                ('TB resid', z_resid),
+                ('log10 visits', log_count),
+            ]],
+            text=hover,
+            marker=dict(size=4, color=color, colorscale='RdBu', cmin=-cscale, cmax=cscale,
+                        showscale=True, colorbar=dict(title='Z bias'), opacity=0.7,
+                        line=dict(width=0)),
+            diagonal_visible=False, showupperhalf=False,
+        ))
+        fig.update_layout(template='plotly_white', width=900, height=900,
+                          title='Per-condition metric correlations')
+        fig_dict['Condition Metric Correlations'] = fig
+
+        # Z calibration -- spread vs bias decomposition: points hugging the
+        # +-y=x guides: the residual IS the bias (Z genuinely lags; Z training
+        # fixes it). Points near y=0 with large x: residual is spread of log w
+        # (only policy work shrinks it).
+        calib_mask = np.isfinite(z_resid) & np.isfinite(z_bias)
+        if calib_mask.sum() >= 2:
+            lim = float(np.nanmax(z_resid[calib_mask])) * 1.05 + 1e-6
+            fig = go.Figure()
+            for sign in (1.0, -1.0):
+                fig.add_trace(go.Scatter(
+                    x=[0, lim], y=[0, sign * lim], mode='lines',
+                    line=dict(color='gray', dash='dash', width=1), showlegend=False))
+            fig.add_trace(go.Scatter(
+                x=z_resid[calib_mask], y=z_bias[calib_mask], mode='markers',
+                text=[h for h, m in zip(hover, calib_mask) if m],
+                marker=dict(size=5, color=log_count[calib_mask], colorscale='Viridis',
+                            showscale=True, colorbar=dict(title='log10 visits'), opacity=0.8),
+                hovertemplate='%{text}<br>resid=%{x:.3f}<br>bias=%{y:.3f}<extra></extra>',
+                showlegend=False))
+            fig.update_layout(
+                template='plotly_white', width=720, height=560,
+                title='Per-condition Z calibration: spread-limited (y~0) vs Z-lag (y~+-x)',
+                xaxis_title='|log w - log Z| EMA (TB resid)',
+                yaxis_title='signed mean(log w - log Z) EMA (Z bias)')
+            fig_dict['Condition Z Calibration'] = fig
+
+    # --- 4: metric map over the (SG/Z' combo) x molecule grid, with a metric
+    # dropdown. Unvisited conditions render as blank cells, making per-
+    # condition sparsity directly visible.
+    if decoded is not None:
+        n_sg, n_zp = energy_function.n_sg, energy_function.n_zp
+        n_combos = n_sg * n_zp
+        n_mols = tracker.library_size // n_combos
+        if n_mols * n_combos == tracker.library_size and n_mols <= 2048:
+            def to_grid(vec):
+                full = np.full(tracker.library_size, np.nan, dtype=np.float64)
+                full[cid] = vec
+                # rounded so the 6 dropdown grids serialize compactly (full
+                # float64 repr triples the JSON size for no visual gain)
+                return np.round(full.reshape(n_mols, n_combos).T, 4)  # rows: SG/Z' combo, cols: mol
+
+            combo_labels = [f"SG {sg} Z'={zp}"
+                            for sg in energy_function.space_groups
+                            for zp in energy_function.z_primes]
+            map_metrics = [
+                ('z_gap', z_gap, 'Viridis'),
+                ('std(log w)', logw_std, 'Viridis'),
+                ('best energy', best_energy, 'Viridis'),
+                ('TB resid', z_resid, 'Viridis'),
+                ('Z bias', z_bias, 'RdBu'),
+                ('log10 visits', log_count, 'Viridis'),
+            ]
+            buttons = []
+            for name, vec, cs in map_metrics:
+                grid = to_grid(vec)
+                if np.isfinite(grid).any():
+                    lo, hi = (float(np.nanpercentile(grid, 1)), float(np.nanpercentile(grid, 99)))
+                    if name == 'Z bias':  # symmetric range so the diverging scale is centered
+                        hi = max(abs(lo), abs(hi))
+                        lo = -hi
+                else:
+                    lo, hi = 0.0, 1.0
+                buttons.append(dict(
+                    label=name, method='restyle',
+                    args=[{'z': [grid.tolist()], 'zmin': lo, 'zmax': hi,
+                           'colorscale': cs, 'colorbar.title.text': name}, [0]]))
+            first_name, first_vec, first_cs = map_metrics[0]
+            first_grid = to_grid(first_vec)
+            fig = go.Figure(go.Heatmap(
+                z=first_grid, y=combo_labels, colorscale=first_cs,
+                zmin=buttons[0]['args'][0]['zmin'], zmax=buttons[0]['args'][0]['zmax'],
+                colorbar=dict(title=first_name),
+                hovertemplate="mol %{x} | %{y}<br>%{z:.3f}<extra></extra>"))
+            fig.update_layout(
+                template='plotly_white', width=max(720, min(1400, 40 + 6 * n_mols)), height=200 + 24 * n_combos,
+                title='Per-condition metric map (blank = unvisited)',
+                xaxis_title='molecule index', yaxis_title='condition combo',
+                updatemenus=[dict(buttons=buttons, direction='down', x=1.02, y=1.15, showactive=True)])
+            fig_dict['Condition Metric Map'] = fig
+
+    return fig_dict
+
 
 def log_traj_params(means_f, vars_f, fig_dict,
                     flow_states,

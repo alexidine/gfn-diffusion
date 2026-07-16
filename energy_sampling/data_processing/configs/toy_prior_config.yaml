@@ -7,7 +7,7 @@ seed: 0
 template_path: D:\crystal_datasets\conditional\priors\14_1_elj.pt
 
 output_dir: D:\crystal_datasets\conditional\priors
-tag: toy_2cond   # used to build default output filenames
+tag: toy_multiharm_uncond   # used to build default output filenames
 
 # 'latent_harmonic' or 'latent_multiharmonic' -- see the module docstring in
 # generate_toy_prior.py for why latent_harmonic can only ever be baked one
@@ -22,39 +22,69 @@ energy_function: latent_multiharmonic
 # once loaded as molecules_path / prior_path in training
 conditions:
   - identifier: mode_a
-    c: [ 1, 1, 1, 1, 1, 1, 1, 1, 1,1,1,1 ]
-    width: 1.5
-  - identifier: mode_b
-    c: [ -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 ]
+    c: [0,0,0]
     width: 1.0
+
+#  - identifier: mode_a
+#    c: [ 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,0.5,0.5,0.5 ]
+#    width: 2.25
+#  - identifier: mode_b
+#    c: [ -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5 ]
+#    width: 1.0
 
 # optional: if enabled, the `conditions` above are treated as ANCHORS and
 # expanded (see expand_condition_manifold in generate_toy_prior.py) into a
-# much larger set of unnamed draws spanning the connected region between
-# them -- random convex (Dirichlet) combinations of the anchors' own
-# (c, width), reducing to uniform-on-a-line for 2 anchors -- for testing
-# generalization over a continuous manifold rather than at fixed discrete
-# modes. All draws share ONE identifier (below), so downstream per-condition
-# bookkeeping (identifier_registry / ConditionLogZTracker) and
-# coverage_check's ESS/histograms treat the whole manifold as a single
-# pooled distribution rather than exploding into one entry per draw.
+# much larger set of unnamed draws, per `mode`:
+#   interpolate (default) -- draws span the connected region between the
+#     anchors: random convex (Dirichlet) combinations of the anchors' own
+#     (c, width), reducing to uniform-on-a-line for 2 anchors, optionally
+#     jittered by noise_std
+#   gaussian -- c ~ center + scale * N(0, I); no connectivity structure,
+#     scale is the std
+#   uniform -- c uniform over the axis-aligned hypercube of full side length
+#     `scale` centered on `center`
+# In the noise modes anchors only supply defaults (cond_dim from the first
+# anchor's c length, draw_width from the anchors' mean width), so one dummy
+# anchor entry is enough. Each draw gets its OWN unique identifier
+# ({identifier}_NNNN), because
+# train.py resolves condition identity purely through the identifier string;
+# a shared identifier would collapse every draw into one condition_id and
+# smear all their logZ/best-energy bookkeeping (ConditionLogZTracker, anchor
+# buffers) into a single slot. The `identifier` field below is therefore just
+# the shared PREFIX, not a pooled label. Cost of unique ids: sparse
+# per-condition stats -- each tracker slot only accumulates evidence on the
+# steps its exact condition is drawn (revisit if draws grow to many thousands).
 # NOTE: total graphs generated = (n_conditions [+ len(conditions) if
 # include_anchors] ) * condition_set.n_replicas_per_condition -- turn down
 # n_replicas_per_condition when enabling this (e.g. 2-10) or the condition
 # set/prior will get huge.
 condition_manifold:
   enabled: false
-  identifier: manifold_ab
-  n_conditions: 200        # number of distinct manifold draws
-  noise_std: 0.0           # optional isotropic Gaussian jitter added after interpolation
-  include_anchors: true    # also keep the exact anchor points themselves in the set
+  mode: gaussian        # interpolate | gaussian | uniform (see above)
+  identifier: manifold_ab  # PREFIX for per-draw ids (manifold_ab_NNNN), not a pooled label
+  n_conditions: 10000        # number of distinct manifold draws
+  include_anchors: false    # also keep the exact anchor points themselves in the set
+  # interpolate mode only:
+  noise_std: 0.1           # optional isotropic Gaussian jitter added after interpolation
+  # gaussian/uniform modes only:
+  scale: 1.0               # gaussian: std; uniform: full hypercube side length
+  center: null             # null -> zeros(cond_dim)
+  cond_dim: 3           # null -> length of the first anchor's c
+  draw_width: 1.0         # energy width for every draw; null -> mean anchor width
 
 # the molecules_path-type object: crystal-structure scaffolding + c/width/
 # identifier per condition, no baked energy needed (forward sampling always
 # recomputes energy fresh from whatever latents the GFN produces)
 condition_set:
   generate: true
-  n_replicas_per_condition: 500   # lower this (e.g. 2-10) if condition_manifold.enabled
+  n_replicas_per_condition: 10000   # lower this (e.g. 2-10) if condition_manifold.enabled
+  # true (default): each condition's replicas get latents genuinely sampled
+  # from that condition's OWN target distribution, plus baked energy -- so
+  # the file doubles as an on-mode, per-condition seed set (feed as
+  # buffers.anchor_buffer.seed_source to hand the anchor set every mode
+  # explicitly and obviate mode discovery). false: old behavior -- leftover
+  # template cell params, no baked energy (metadata-only molecules_path).
+  sample_latents: true
   output_name: null   # null -> {tag}_conditions.pt
 
 # the prior_path-type object -- see the module docstring for full detail on
@@ -76,8 +106,10 @@ prior:
   shared_center: null    # null -> zeros(data_ndim); only used in shared mode
   shared_width: 0.35       # must be wide enough to cover every condition's c and width; only used in shared mode
   width_multiplier: 2     # prior width = condition width * this; only used in per_condition mode
-  n_samples_per_condition: 2000   # per cfg.conditions entry -- lower this too if condition_manifold.enabled
-  equalized_n_samples_per_condition: 20000
+  n_samples_per_condition: 20   # per cfg.conditions entry -- lower this too if condition_manifold.enabled
+  equalized_n_samples_per_condition: 100
+  n_samples_total: 20000
+  equalized_n_samples_total: 100000
   target_temperature: 1.0
   output_name: null   # null -> {tag}_prior.pt
 
@@ -86,6 +118,7 @@ prior:
 # interest) -- plus a visual histogram comparison, for inspection
 coverage_check:
   run: true
+  n_check_conditions: 200  # cost is linear in conditions checked -- on big manifold/noise runs, check a random subset (null -> all)
   n_is_samples: 5000
   min_ess_frac: 0.01
   show_figures: true

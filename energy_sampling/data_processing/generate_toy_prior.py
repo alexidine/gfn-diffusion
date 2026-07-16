@@ -7,11 +7,18 @@ in training (see train.py's init_mol_dataset / init_prior_dataset):
 
   - condition set (molecules_path-type): one entry per configured condition,
     carrying `identifier` / `c` / `width` plus ordinary crystal-structure
-    scaffolding borrowed from an existing template file. No baked energy --
-    forward sampling always recomputes energy fresh from whatever latents
-    the GFN actually produces (see analyze_crystal_batch's per-sample `c`
-    override), so the scaffolding's starting cell params don't matter, only
-    the identifier/c/width metadata and graph content do.
+    scaffolding borrowed from an existing template file. For its
+    molecules_path role only the identifier/c/width metadata and graph
+    content matter -- forward sampling always recomputes energy fresh from
+    whatever latents the GFN actually produces (see analyze_crystal_batch's
+    per-sample `c` override). But by default
+    (condition_set.sample_latents: true) each condition's replicas ALSO get
+    latent positions genuinely sampled from that condition's own target
+    distribution, with energy baked in, so the same file doubles as a set of
+    on-mode, per-condition seeds -- e.g. buffers.anchor_buffer.seed_source in
+    training, to hand the anchor set every mode explicitly instead of
+    relying on mode discovery. Set sample_latents: false to recover the old
+    behavior (template's leftover cell params, no baked energy).
 
   - prior (prior_path-type): backward training draws directly from this file
     and gets its reward via prebuilt_sample_to_reward, which reads a STATIC,
@@ -41,12 +48,15 @@ direct testing against mxtaltools -- not a design choice made here:
     sample. It is NOT safe to bake more than one condition into a single
     analyze() call for this energy function.
   - latent_multiharmonic_en broadcasts a per-sample [n, cond_dim] `c`
-    correctly (confirmed via its 'kdc,...c->...kd' einsum).
-  Both build_condition_set and build_prior sidestep this by construction --
-  every analyze()/sample_* call here only ever contains one condition, then
-  the per-condition batches are concatenated -- so this is safe either way,
-  but latent_harmonic remains unsafe if you batch multiple conditions into
-  one analyze() call anywhere else.
+    correctly (confirmed via its 'kdc,...c->...kd' einsum) and likewise a
+    per-sample [n] `width`; analyze() forwards both untouched. Its
+    SAMPLING-side helpers (sample_latent_multiharmonic,
+    log_partition_latent) remain single-shared-c / scalar-width only.
+  _build_prior_shared exploits this for multiharmonic (one multi-condition
+  analyze() call for the whole prior); everything else here stays one
+  condition per analyze()/sample_* call, which keeps latent_harmonic safe.
+  latent_harmonic remains unsafe if you batch multiple conditions into one
+  analyze() call anywhere else.
 
 Also note: multiharmonic's condition vectors are NOT tied to the latent
 space's dimensionality (data_ndim) -- they control mxtaltools'
@@ -57,12 +67,14 @@ default).
 
 Optional condition_manifold (see expand_condition_manifold): instead of N
 discrete named conditions, expands the `conditions` list (treated as
-anchors) into a much larger set of unnamed draws spanning the connected
-region between them -- random convex combinations of the anchors' own
-(c, width), optionally jittered -- for testing generalization over a
-continuous manifold rather than at fixed modes. All draws share one
-identifier, so coverage_check reports/plots the whole manifold as a single
-pooled distribution rather than one row per draw.
+anchors) into a much larger set of draws spanning the connected region
+between them -- random convex combinations of the anchors' own (c, width),
+optionally jittered -- for testing generalization over a continuous
+manifold rather than at fixed modes. Every draw gets its own unique
+identifier (train.py's condition_id resolves purely through the identifier
+string, so shared identifiers would collapse distinct conditions into one
+bookkeeping slot); coverage_check compacts its reporting/plots past a
+handful of conditions rather than printing one row per draw.
 
 Usage:
     python generate_toy_prior.py [path/to/config.yaml]
@@ -194,63 +206,87 @@ def prior_log_density(cfg, template, cond, x):
 def expand_condition_manifold(cfg, anchors):
     """
     Replaces a small set of named anchor conditions with a much larger set of
-    unnamed draws spanning the connected region between them -- for testing
-    generalization over a continuous conditional manifold rather than at N
-    fixed discrete modes.
+    draws -- for testing generalization over a continuous conditional region
+    rather than at N fixed discrete modes.
 
-    Every draw shares ONE identifier (condition_manifold.identifier) instead
-    of getting its own: train.py's init_identifiers() builds an
-    identifier_registry sized to however many distinct identifiers exist
-    across molecules_path/prior_path, and buffer.py's ConditionLogZTracker
-    preallocates its EMA/best-energy tables to that same size, one slot per
-    identifier -- so giving every manifold draw a unique identifier would
-    both explode that library and leave each slot with ~1 visit, defeating
-    the tracker's whole point. One shared identifier keeps condition_id
-    small and lets per-condition bookkeeping accumulate evidence across the
-    whole manifold, same as it would for a single ordinary discrete
-    condition. coverage_check pools its ESS check and histograms by
-    identifier for the same reason -- the manifold is reported as ONE
-    distribution ("does the prior cover this connected region at all"),
-    not as many separate per-point checks.
+    Every draw gets its OWN unique identifier ({condition_manifold.identifier}
+    _{i}), because train.py resolves condition identity purely through the
+    identifier string: init_identifiers() maps distinct identifiers to dense
+    mol_ids, and condition_samples() builds condition_id from mol_id alone --
+    the c vector itself never enters the ID. Draws sharing one identifier
+    would therefore collapse into a single condition_id and smear every
+    manifold point's logZ/best-energy bookkeeping (ConditionLogZTracker,
+    anchor buffers) into one slot. The cost of unique identifiers is sparse
+    per-condition statistics -- each tracker slot only accumulates evidence
+    when its exact condition is drawn -- which we accept for now (revisit if
+    the manifold grows to many thousands of draws). Anchors keep their own
+    configured identifiers.
 
-    Each draw's (c, width) is a random convex combination of the anchors'
-    own (c, width) -- weights ~ Dirichlet(1,...,1) over the K anchors, which
-    is uniform over the simplex and reduces to uniform-on-a-line-segment for
-    K=2 -- optionally broadened by isotropic Gaussian noise
-    (condition_manifold.noise_std) to also probe just outside the anchors'
-    convex hull, not only strictly between them.
+    Three modes (condition_manifold.mode):
+      'interpolate' (default) -- each draw's (c, width) is a random convex
+        combination of the anchors' own (c, width) -- weights ~
+        Dirichlet(1,...,1) over the K anchors, which is uniform over the
+        simplex and reduces to uniform-on-a-line-segment for K=2 --
+        optionally broadened by isotropic Gaussian noise
+        (condition_manifold.noise_std) to also probe just outside the
+        anchors' convex hull, not only strictly between them.
+      'gaussian' -- c ~ center + scale * N(0, I): plain isotropic Gaussian
+        noise, no connectivity structure at all.
+      'uniform' -- c ~ Uniform over the axis-aligned hypercube of full side
+        length `scale` centered on `center`.
+    In the noise modes anchors are only used to infer cond_dim / the default
+    draw width, so a single dummy anchor entry in `conditions` is enough
+    (build_condition_set/build_prior only ever see the expanded list, plus
+    the anchors themselves iff include_anchors).
     """
     m = cfg.condition_manifold
+    mode = getattr(m, 'mode', 'interpolate')
+    n = int(m.n_conditions)
     K = len(anchors)
-    if K < 2:
-        raise ValueError("condition_manifold needs >= 2 anchors in `conditions` to interpolate between")
 
     anchor_c = torch.stack([torch.as_tensor(a.c, dtype=torch.float32) for a in anchors])
     anchor_w = torch.as_tensor([float(a.width) for a in anchors], dtype=torch.float32)
 
-    n = int(m.n_conditions)
-    weights = torch.distributions.Dirichlet(torch.ones(K)).sample((n,))  # [n, K], uniform on simplex
-    c = weights @ anchor_c      # [n, cond_dim]
-    width = weights @ anchor_w  # [n]
+    if mode == 'interpolate':
+        if K < 2:
+            raise ValueError("condition_manifold mode 'interpolate' needs >= 2 anchors in `conditions`")
+        weights = torch.distributions.Dirichlet(torch.ones(K)).sample((n,))  # [n, K], uniform on simplex
+        c = weights @ anchor_c      # [n, cond_dim]
+        width = weights @ anchor_w  # [n]
 
-    noise_std = float(getattr(m, 'noise_std', 0.0) or 0.0)
-    if noise_std > 0:
-        c = c + noise_std * torch.randn_like(c)
+        noise_std = float(getattr(m, 'noise_std', 0.0) or 0.0)
+        if noise_std > 0:
+            c = c + noise_std * torch.randn_like(c)
+    elif mode in ('gaussian', 'uniform'):
+        d = int(getattr(m, 'cond_dim', None) or anchor_c.shape[-1])
+        center = torch.zeros(d) if getattr(m, 'center', None) is None \
+            else torch.as_tensor(m.center, dtype=torch.float32)
+        scale = float(m.scale)
+        if mode == 'gaussian':
+            c = center[None] + scale * torch.randn(n, d)  # scale = std
+        else:
+            c = center[None] + scale * (torch.rand(n, d) - 0.5)  # hypercube of full width `scale`
+        # noise modes have no per-draw width structure -- one shared width for
+        # every draw, defaulting to the anchors' mean if not configured
+        draw_width = float(getattr(m, 'draw_width', None) or anchor_w.mean())
+        width = torch.full((n,), draw_width)
+    else:
+        raise ValueError(f"condition_manifold.mode must be 'interpolate', 'gaussian' or 'uniform', got {mode!r}")
 
-    identifier = m.identifier
-    draws = [dict2namespace({'identifier': identifier, 'c': c[i].tolist(), 'width': width[i].item()})
+    base = m.identifier
+    draws = [dict2namespace({'identifier': f'{base}_{i:04d}', 'c': c[i].tolist(), 'width': width[i].item()})
              for i in range(n)]
 
     if getattr(m, 'include_anchors', True):
-        # also keep the exact anchor points themselves in the set, so the
-        # manifold's boundary is guaranteed to be covered/reported, not just
-        # its randomly-sampled interior
-        anchor_draws = [dict2namespace({'identifier': identifier, 'c': a.c, 'width': float(a.width)})
+        # also keep the exact anchor points themselves in the set (under their
+        # own configured identifiers), so the manifold's boundary is guaranteed
+        # to be covered/reported, not just its randomly-sampled interior
+        anchor_draws = [dict2namespace({'identifier': a.identifier, 'c': a.c, 'width': float(a.width)})
                          for a in anchors]
         draws = anchor_draws + draws
 
-    print(f"condition_manifold: expanded {K} anchors -> {len(draws)} conditions "
-          f"under shared identifier '{identifier}'")
+    print(f"condition_manifold ({mode}): expanded {K} anchors -> {len(draws)} conditions, "
+          f"each with its own unique identifier ('{base}_NNNN' + anchor names)")
     return draws
 
 
@@ -262,19 +298,107 @@ def append_all(parts):
 
 
 def build_condition_set(cfg, template):
+    """
+    See the module docstring: with condition_set.sample_latents (default
+    true) each condition's replicas carry latents drawn from that condition's
+    OWN target distribution, plus baked energy, so the file is directly
+    usable as a per-condition on-mode seed set (anchor_buffer seed_source)
+    and not just molecules_path metadata.
+
+    For latent_multiharmonic the whole build is vectorized like
+    _build_prior_shared: ONE replicate() for every graph + ONE
+    latent_to_cell_params/analyze(), with per-condition c/width/identifier
+    laid out by repeat_interleave. The old per-condition replicate() +
+    append_all(parts) was O(n_conditions^2) (each append_batch
+    re-concatenates the growing batch) and dominated runtime on big
+    condition_manifold runs -- this removes it. Only the target SAMPLING
+    itself stays a per-condition loop: multiharmonic's SAMPLING-side helpers
+    are single-shared-c (see the module docstring's ASYMMETRY note), but that
+    loop is linear and cheap. latent_harmonic keeps the fully per-condition
+    build + append_all -- its energy silently uses only c[0], so it can't be
+    baked more than one condition per analyze() call.
+    """
+    sample_latents = getattr(cfg.condition_set, 'sample_latents', True)
+    n_rep = cfg.condition_set.n_replicas_per_condition
+
+    if cfg.energy_function == 'latent_multiharmonic':
+        # ONE replicate() + ONE latent_to_cell_params/analyze for the whole
+        # set, mirroring _build_prior_shared's vectorized path -- the old
+        # per-condition replicate + append_all(parts) was O(n_conditions^2)
+        # in append_batch (each call re-concatenates the growing batch) and
+        # dominated runtime on big condition_manifold runs. Metadata is laid
+        # out per condition by repeat_interleave; multiharmonic's energy bake
+        # broadcasts per-sample c/width in one analyze() call (see the module
+        # docstring's ASYMMETRY note). Only the target SAMPLING itself stays a
+        # per-condition loop (its single-shared-c constraint), but that's
+        # linear and cheap next to what append_all cost.
+        n_rep = max(2, n_rep)  # replicate()'s own clamp -- keep the layout exact
+        n_conditions = len(cfg.conditions)
+        n_total = n_rep * n_conditions
+        c = torch.stack([torch.as_tensor(cond.c, dtype=torch.float32) for cond in cfg.conditions]) \
+            .repeat_interleave(n_rep, dim=0)
+        widths = torch.as_tensor([float(cond.width) for cond in cfg.conditions], dtype=torch.float32) \
+            .repeat_interleave(n_rep)
+        batch = replicate(template, n_total)
+        batch.add_graph_attr(c, 'c')
+        batch.add_graph_attr(widths, 'width')
+        batch.identifier = [cond.identifier for cond in cfg.conditions for _ in range(n_rep)]
+        if sample_latents:
+            x_all = torch.cat([
+                sample_condition_latents(template, cfg.energy_function, cond.c, float(cond.width),
+                                         n_rep, cfg.prior.target_temperature)
+                for cond in cfg.conditions])
+            batch.latent_to_cell_params(x_all)
+            batch.analyze([cfg.energy_function], c=batch.c, width=batch.width, assign_outputs=True)
+        return batch
+
+    # latent_harmonic: c[0]-only energy forces a per-condition analyze()
+    # (see the module docstring's ASYMMETRY note), so it keeps the original
+    # per-condition build + append_all.
     parts = []
     for cond in cfg.conditions:
         # replicate() may return more graphs than requested (see its
         # docstring -- group size is clamped to >= 2), so every subsequent
         # per-graph tensor here must be sized off sub.num_graphs, not the
         # originally-requested count
-        sub = replicate(template, cfg.condition_set.n_replicas_per_condition)
+        sub = replicate(template, n_rep)
         n = sub.num_graphs
         sub.add_graph_attr(torch.as_tensor(cond.c, dtype=torch.float32)[None].repeat(n, 1), 'c')
         sub.add_graph_attr(torch.full((n,), float(cond.width)), 'width')
         sub.identifier = [cond.identifier] * n
+        if sample_latents:
+            x = sample_condition_latents(
+                template, cfg.energy_function, cond.c, float(cond.width), n, cfg.prior.target_temperature)
+            sub.latent_to_cell_params(x)
+            sub.analyze([cfg.energy_function], c=sub.c, width=float(cond.width), assign_outputs=True)
         parts.append(sub)
     return append_all(parts)
+
+
+def prior_samples_per_condition(cfg, total_key, legacy_per_condition_key):
+    """
+    Resolves the per-condition sample count build_prior actually needs from a
+    TOTAL budget (total_key, split evenly across cfg.conditions -- the natural
+    knob now that a condition_manifold run multiplies len(cfg.conditions) by
+    hundreds), falling back to the old per-condition key if the total isn't
+    configured. Per-condition counts are floored at 2 to match replicate()'s
+    append_batch clamp (see its docstring), so the realized total can exceed
+    the requested one when total_key < 2 * len(cfg.conditions).
+    """
+    n_conditions = len(cfg.conditions)
+    total = getattr(cfg.prior, total_key, None)
+    if total is not None:
+        n = max(2, math.ceil(int(total) / n_conditions))
+        print(f"prior: {total_key}={total} over {n_conditions} conditions -> "
+              f"{n} samples per condition ({n * n_conditions} realized total)")
+        return n
+    legacy = getattr(cfg.prior, legacy_per_condition_key, None)
+    if legacy is None:
+        raise ValueError(f"prior config needs either {total_key} (preferred, a total split "
+                         f"across conditions) or {legacy_per_condition_key}")
+    print(f"prior: {total_key} not set, using legacy {legacy_per_condition_key}={legacy} "
+          f"-> {int(legacy) * n_conditions} total over {n_conditions} conditions")
+    return int(legacy)
 
 
 def build_prior(cfg, template, n_per_condition):
@@ -304,6 +428,19 @@ def _build_prior_shared(cfg, template, n_per_condition):
     n_per_condition is clamped to >= 2 upfront (matching replicate()'s own
     clamp -- see its docstring) so each chunk's sample count always exactly
     matches what replicate() actually returns for that chunk.
+
+    Since the latent positions are label-independent by construction, the
+    per-condition loop here is pure bookkeeping -- so for
+    latent_multiharmonic the whole build collapses to ONE replicate() + ONE
+    analyze() call: latent_multiharmonic_en broadcasts per-sample
+    [n, cond_dim] `c` (see the module docstring's ASYMMETRY note) AND
+    per-sample [n] `width` (its own docstring: "width may be scalar or a
+    per-sample tensor [B]"), and analyze() passes both straight through
+    (compute() just forwards **kwargs). The single-shared-c / scalar-width
+    restriction lives only in sample_latent_multiharmonic /
+    log_partition_latent, which shared mode never calls. latent_harmonic
+    keeps the per-condition loop (it silently uses only c[0] for the whole
+    batch).
     """
     n_per_condition = max(2, n_per_condition)
     n_conditions = len(cfg.conditions)
@@ -312,6 +449,24 @@ def _build_prior_shared(cfg, template, n_per_condition):
 
     eps = 1e-3
     x_all = (center[None] + width * torch.randn(n_per_condition * n_conditions, d)).clamp(min=-1 + eps, max=1 - eps)
+
+    if cfg.energy_function == 'latent_multiharmonic':
+        n_total = n_per_condition * n_conditions
+        c = torch.stack([torch.as_tensor(cond.c, dtype=torch.float32) for cond in cfg.conditions]) \
+            .repeat_interleave(n_per_condition, dim=0)
+        widths = torch.as_tensor([float(cond.width) for cond in cfg.conditions], dtype=torch.float32) \
+            .repeat_interleave(n_per_condition)
+        print(f"prior (shared, vectorized): {n_conditions} conditions baked in one analyze() call")
+        sub = replicate(template, n_total)
+        sub.add_graph_attr(c, 'c')
+        sub.add_graph_attr(widths, 'width')
+        sub.identifier = [cond.identifier for cond in cfg.conditions for _ in range(n_per_condition)]
+        sub.latent_to_cell_params(x_all)
+        # bake energy under each condition's own (narrow) width -- not the
+        # shared prior's width -- prebuilt_sample_to_reward needs the real
+        # target energy
+        sub.analyze([cfg.energy_function], c=sub.c, width=sub.width, assign_outputs=True)
+        return sub
 
     parts = []
     for i, cond in enumerate(cfg.conditions):
@@ -322,9 +477,7 @@ def _build_prior_shared(cfg, template, n_per_condition):
         sub.add_graph_attr(torch.full((n,), float(cond.width)), 'width')
         sub.identifier = [cond.identifier] * n
         sub.latent_to_cell_params(x)
-        # bake energy under the condition's own (narrow) width -- not the
-        # shared prior's width -- prebuilt_sample_to_reward needs the real
-        # target energy
+        # bake energy under the condition's own (narrow) width -- see above
         sub.analyze([cfg.energy_function], c=sub.c, width=float(cond.width), assign_outputs=True)
         parts.append(sub)
     return append_all(parts)
@@ -358,28 +511,26 @@ def _build_prior_per_condition(cfg, template, n_per_condition):
 
 def coverage_check(cfg, template):
     """
-    Direct, quantitative form of "q_target << q_prior": for each IDENTIFIER
-    (not each cfg.conditions entry -- see below), draws n_is_samples from the
-    prior (mode-dispatched -- see draw_prior_samples/build_prior for what
-    'shared' vs 'per_condition' mean) and computes the self-normalized
-    importance-sampling effective sample size (ESS) fraction of the TARGET
-    density under that prior. Low ESS means the prior rarely produces samples
-    where the target actually has mass -- backward training seeded from it
-    will struggle.
+    Direct, quantitative form of "q_target << q_prior": for each condition,
+    draws prior samples (mode-dispatched -- see draw_prior_samples/build_prior
+    for what 'shared' vs 'per_condition' mean) and computes the
+    self-normalized importance-sampling effective sample size (ESS) fraction
+    of the TARGET density under that prior. Low ESS means the prior rarely
+    produces samples where the target actually has mass -- backward training
+    seeded from it will struggle.
 
-    Pooled by identifier rather than iterated per cfg.conditions entry: an
-    ordinary discrete run has exactly one entry per identifier, so pooling is
-    a no-op and this reduces to the original per-condition check. A
-    condition_manifold run (see expand_condition_manifold) has MANY entries
-    sharing one identifier, each a different point in the manifold -- pooling
-    their prior/target draws together before the ESS calc is exactly "treat
-    the whole conditional set as a single distribution and report whether the
-    prior covers it", rather than reporting (or plotting) hundreds of
-    near-identical single-point rows.
+    n_is_samples is a TOTAL budget, split evenly across all conditions --
+    every condition now carries its own unique identifier (see
+    expand_condition_manifold), so a per-condition budget would scale the
+    check's cost linearly with manifold size. Raise n_is_samples if you want
+    more IS samples per condition on a big manifold. Reporting/plotting is
+    also compacted past MANY_CONDITIONS conditions: a summary line
+    (min/median ESS, worst offenders) instead of one line each, and two
+    pooled histogram traces instead of two per condition.
 
-    Also plots, for both prior-drawn and genuine target-drawn samples, the
-    negative log target density ("energy under target") -- NOT a Euclidean
-    distance to `c`, since `c` doesn't live in latent space for
+    The histograms plot, for both prior-drawn and genuine target-drawn
+    samples, the negative log target density ("energy under target") -- NOT
+    a Euclidean distance to `c`, since `c` doesn't live in latent space for
     latent_multiharmonic (it's a separate, independently-dimensioned
     condition-embedding input to mxtaltools' Gaussian-mixture field, not a
     mode center itself), so this is the one comparison that's meaningful and
@@ -387,59 +538,85 @@ def coverage_check(cfg, template):
     sit at much higher (more atypical) energy under the target than genuine
     target samples if coverage is healthy but not degenerate.
     """
+    MANY_CONDITIONS = 8
     T = cfg.prior.target_temperature
-    n_total = cfg.coverage_check.n_is_samples
+    # the per-condition pipeline below (2 sampling calls + 2 density
+    # evaluations, each with fixed mxtaltools overhead) makes the check's cost
+    # linear in condition count, so on big manifold/noise runs check a random
+    # subset -- a few hundred conditions with a real per-condition IS budget
+    # says the same thing about coverage as all of them with 2 samples each
+    conditions = list(cfg.conditions)
+    n_check = getattr(cfg.coverage_check, 'n_check_conditions', None)
+    if n_check is not None and len(conditions) > int(n_check):
+        idx = np.random.choice(len(conditions), int(n_check), replace=False)
+        conditions = [conditions[i] for i in idx]
+        print(f"coverage_check: subsampling {len(conditions)} of {len(cfg.conditions)} conditions "
+              f"(coverage_check.n_check_conditions)")
+    n_conditions = len(conditions)
+    n_per = max(2, cfg.coverage_check.n_is_samples // n_conditions)
+    compact = n_conditions > MANY_CONDITIONS
     results = {}
     fig = go.Figure()
     all_prior_x, all_target_x = [], []
+    neg_log_target_prior, neg_log_target_target = [], []
 
-    groups = {}
-    for cond in cfg.conditions:
-        groups.setdefault(cond.identifier, []).append(cond)
+    for cond in conditions:
+        x = draw_prior_samples(cfg, template, cond, n_per)
+        log_prior = prior_log_density(cfg, template, cond, x)
+        log_target = condition_log_density(template, cfg.energy_function, cond.c, float(cond.width), x, T)
+        all_prior_x.append(x)
+        neg_log_target_prior.append(-log_target)
 
-    for identifier, group in groups.items():
-        # split the identifier's sample budget evenly across however many
-        # manifold points share it (1, for an ordinary discrete condition)
-        n_per = max(1, n_total // len(group))
+        target_x = sample_condition_latents(template, cfg.energy_function, cond.c, float(cond.width), n_per, T)
+        log_target_at_target = condition_log_density(template, cfg.energy_function, cond.c, float(cond.width),
+                                                      target_x, T)
+        all_target_x.append(target_x)
+        neg_log_target_target.append(-log_target_at_target)
 
-        log_w_parts, neg_log_target_prior, neg_log_target_target = [], [], []
-        group_prior_x, group_target_x = [], []
-        for cond in group:
-            x = draw_prior_samples(cfg, template, cond, n_per)
-            log_prior = prior_log_density(cfg, template, cond, x)
-            log_target = condition_log_density(template, cfg.energy_function, cond.c, float(cond.width), x, T)
-            log_w_parts.append(log_target - log_prior)
-            neg_log_target_prior.append(-log_target)
-            group_prior_x.append(x)
-
-            target_x = sample_condition_latents(template, cfg.energy_function, cond.c, float(cond.width), n_per, T)
-            log_target_at_target = condition_log_density(template, cfg.energy_function, cond.c, float(cond.width),
-                                                          target_x, T)
-            neg_log_target_target.append(-log_target_at_target)
-            group_target_x.append(target_x)
-
-        log_w = torch.cat(log_w_parts)
+        log_w = log_target - log_prior
         n = log_w.shape[0]
         log_w = log_w - torch.logsumexp(log_w, dim=0)
         ess_frac = (1.0 / (n * (log_w.exp() ** 2).sum())).item()
-        results[identifier] = ess_frac
+        results[cond.identifier] = ess_frac
 
-        status = 'OK' if ess_frac >= cfg.coverage_check.min_ess_frac else 'WARNING -- prior may not cover this condition'
-        pooled_note = f"  (pooled over {len(group)} manifold draws)" if len(group) > 1 else ""
-        print(f"[{identifier}] q_target ESS fraction under prior: {ess_frac:.4g}  ({status}){pooled_note}")
+        if not compact:
+            status = 'OK' if ess_frac >= cfg.coverage_check.min_ess_frac \
+                else 'WARNING -- prior may not cover this condition'
+            print(f"[{cond.identifier}] q_target ESS fraction under prior: {ess_frac:.4g}  ({status})")
+            fig.add_trace(go.Histogram(x=(-log_target).numpy(), nbinsx=60, opacity=0.5,
+                                       histnorm='probability density', name=f'prior samples: {cond.identifier}'))
+            fig.add_trace(go.Histogram(x=(-log_target_at_target).numpy(), nbinsx=60, opacity=0.5,
+                                       histnorm='probability density', name=f'target samples: {cond.identifier}'))
 
+    if compact:
+        ess = torch.tensor(list(results.values()))
+        n_below = int((ess < cfg.coverage_check.min_ess_frac).sum())
+        worst = sorted(results.items(), key=lambda kv: kv[1])[:5]
+        print(f"coverage_check: {n_conditions} conditions, {n_per} IS samples each -- "
+              f"ESS fraction min {ess.min():.4g} / median {ess.median():.4g} / max {ess.max():.4g}; "
+              f"{n_below} below min_ess_frac={cfg.coverage_check.min_ess_frac}")
+        if n_below:
+            print("  worst: " + ", ".join(f"{k}={v:.3g}" for k, v in worst))
         fig.add_trace(go.Histogram(x=torch.cat(neg_log_target_prior).numpy(), nbinsx=60, opacity=0.5,
-                                   histnorm='probability density', name=f'prior samples: {identifier}'))
+                                   histnorm='probability density', name=f'prior samples ({n_conditions} conditions)'))
         fig.add_trace(go.Histogram(x=torch.cat(neg_log_target_target).numpy(), nbinsx=60, opacity=0.5,
-                                   histnorm='probability density', name=f'target samples: {identifier}'))
-        all_prior_x.append(torch.cat(group_prior_x))
-        all_target_x.append(torch.cat(group_target_x))
+                                   histnorm='probability density', name=f'target samples ({n_conditions} conditions)'))
+        # pool the latent-space aux plots the same way -- one prior cloud, one
+        # target cloud, instead of 2 * n_conditions separate distributions
+        all_prior_x = [torch.cat(all_prior_x)]
+        all_target_x = [torch.cat(all_target_x)]
     fig.update_layout(
         barmode='overlay',
         title="Prior-drawn vs. target-drawn samples, scored by -log(target density)",
         xaxis_title='-log q_target(x)', yaxis_title='density')
 
-    template.plot_batch_cell_params(space='latent', aux_dists=all_prior_x + all_target_x)
+    clats = torch.cat(all_target_x)
+    cbatch = template.subsample_new_batch(torch.tensor([0 for _ in range(len(clats))]))
+    cbatch.reset_sg_info(1)
+    cbatch.latent_to_cell_params(clats)
+    cbatch.plot_batch_cell_params(space='latent', ref_dist=all_prior_x[0])
+    cbatch.plot_batch_staircase(space='latent')
+
     if cfg.coverage_check.show_figures:
         fig.show()
     if cfg.coverage_check.save_figures:
@@ -477,12 +654,17 @@ def main(config_path):
         out_name = getattr(cfg.condition_set, 'output_name', None) or f'{cfg.tag}_conditions.pt'
         out_path = os.path.join(cfg.output_dir, out_name)
         torch.save({'prior': cond_batch}, out_path)
+        cond_batch.plot_batch_cell_params(space='latent')
+        cond_batch.plot_batch_staircase(space='latent')
         print(f"Saved condition set -> {out_path} "
               f"({cond_batch.num_graphs} graphs, {len(cfg.conditions)} unique identifiers)")
 
     if getattr(cfg.prior, 'generate', True):
-        prior_batch = build_prior(cfg, template, cfg.prior.n_samples_per_condition)
-        eq_batch = build_prior(cfg, template, cfg.prior.equalized_n_samples_per_condition)
+        prior_batch = build_prior(
+            cfg, template, prior_samples_per_condition(cfg, 'n_samples_total', 'n_samples_per_condition'))
+        eq_batch = build_prior(
+            cfg, template,
+            prior_samples_per_condition(cfg, 'equalized_n_samples_total', 'equalized_n_samples_per_condition'))
         out_name = getattr(cfg.prior, 'output_name', None) or f'{cfg.tag}_prior.pt'
         out_path = os.path.join(cfg.output_dir, out_name)
         torch.save({'prior': prior_batch, 'equalized_prior': eq_batch}, out_path)

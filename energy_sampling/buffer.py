@@ -181,6 +181,49 @@ class CrystalBuffer:
     def __len__(self):
         return self.batch.num_graphs
 
+    def _sample_condition_blocked_indices(self, batch_size: int, m: int):
+        """
+        Condition-blocked draw: sample conditions, then up to m DISTINCT rows
+        (different terminals) within each, until batch_size rows are
+        collected. Exists because condition-grouped VarGrad's cross-terminal
+        signal needs multiple distinct terminals per condition per batch,
+        which independent row draws only provide via birthday collisions
+        (~B^2/2N of rows at 10k conditions). `repeats` tiling (same-terminal
+        rollouts -- the TBC/MLE axis) applies downstream exactly as for the
+        plain path: this changes only WHICH distinct rows are drawn, so all
+        layout conventions (terminal-major tiles, update_losses inds) hold.
+        Conditions with a single row carry no cross-terminal information and
+        are skipped; if eligible conditions can't fill the budget, the
+        remainder falls back to uniform draws, degrading gracefully to the
+        old behavior on thin or singleton-heavy buffers. Row choice within a
+        condition is uniform without replacement -- deliberately no energy
+        stratification: trust the buffer not to be degenerate.
+        """
+        n = len(self)
+        cid = np.asarray(self.batch.condition_id.detach().cpu().flatten())
+        order = np.argsort(cid, kind="stable")
+        sorted_cid = cid[order]
+        boundaries = np.flatnonzero(np.r_[True, sorted_cid[1:] != sorted_cid[:-1]])
+        counts = np.diff(np.r_[boundaries, sorted_cid.size])
+
+        eligible = np.flatnonzero(counts >= 2)
+        budget = min(batch_size, n)
+        chosen = []
+        n_chosen = 0
+        for g in np.random.permutation(eligible):
+            take = min(m, int(counts[g]), budget - n_chosen)
+            if take <= 0:
+                break
+            rows = order[boundaries[g]:boundaries[g] + counts[g]]
+            chosen.append(np.random.choice(rows, size=take, replace=False))
+            n_chosen += take
+        inds = np.concatenate(chosen) if chosen else np.empty(0, dtype=np.int64)
+
+        if inds.size < batch_size:  # thin/singleton-heavy buffer: top off uniformly
+            extra = np.random.choice(n, size=batch_size - inds.size, replace=batch_size > n)
+            inds = np.concatenate([inds, extra])
+        return inds.astype(np.int64)
+
     def _sample_indices(
             self,
             batch_size: int,
@@ -188,11 +231,20 @@ class CrystalBuffer:
             repeats: int = 1,
             p: Optional[np.ndarray] = None,
             beta: float = 0.0,  # fraction drawn uniformly
+            condition_block_m: int = 0,
     ):
         n = len(self)
 
         if n == 0:
             raise ValueError("Cannot sample from an empty SimpleDataset.")
+
+        if condition_block_m >= 2:
+            # blocked draws bypass the weighted/p machinery (bwd training draws
+            # pass weighted=False anyway) -- see _sample_condition_blocked_indices
+            inds = self._sample_condition_blocked_indices(batch_size, condition_block_m)
+            if repeats > 1:
+                inds = np.repeat(inds, repeats)
+            return inds
 
         if p is not None and beta > 0.0:
             n_uniform = max(1, int(batch_size * beta))
@@ -280,13 +332,15 @@ class CrystalBuffer:
             beta: Optional[float] = None,
             return_traj: bool = False,
             p: Optional[np.ndarray] = None,
+            condition_block_m: int = 0,
     ):
         # p, if given, overrides the built-in loss-weighted distribution entirely
         # (e.g. an externally-computed per-condition z_gap weighting) -- weighted/
         # temperature are ignored in that case.
         if p is None:
             p = self._loss_weights(temperature) if weighted else None
-        inds = self._sample_indices(batch_size, replace=replace, repeats=repeats, p=p, beta=beta)
+        inds = self._sample_indices(batch_size, replace=replace, repeats=repeats, p=p, beta=beta,
+                                    condition_block_m=condition_block_m)
         self._bump_counts(inds)
 
         # No data_list round trip.
@@ -315,6 +369,7 @@ class CrystalBuffer:
             beta: Optional[float] = None,
             return_traj: bool = False,
             p: Optional[np.ndarray] = None,
+            condition_block_m: int = 0,
     ):
         """
         Infinite random-batch generator. Use next() on it.
@@ -347,7 +402,8 @@ class CrystalBuffer:
             else:
                 graphs, inds, traj = self.sample_graphs(batch_size,
                                                         repeats=repeats, weighted=weighted, temperature=temperature,
-                                                        beta=beta, return_traj=return_traj, p=p)
+                                                        beta=beta, return_traj=return_traj, p=p,
+                                                        condition_block_m=condition_block_m)
                 result = (graphs,)
                 if return_traj:
                     result = result + (traj,)
@@ -796,12 +852,14 @@ class ConditionLogZTracker:
     """
 
     def __init__(self, library_size: int, min_visits: int = 20, half_life_steps: float = 7.0,
-                 trim_frac: float = 0.1, max_batch_weight: float = 200.0):
+                 trim_frac: float = 0.1, max_batch_weight: float = 200.0,
+                 discovery_half_life_steps: float = 200.0):
         self.library_size = library_size
         self.min_visits = min_visits
         self.half_life_steps = half_life_steps
         self.trim_frac = trim_frac
         self.max_batch_weight = max_batch_weight
+        self.discovery_half_life_steps = discovery_half_life_steps
         self.ema_logw = torch.full((library_size,), float("nan"), dtype=torch.float32)
         self.ema_logw_sq = torch.full((library_size,), float("nan"), dtype=torch.float32)
         self.ema_log_z_emp = torch.full((library_size,), float("nan"), dtype=torch.float32)
@@ -823,6 +881,19 @@ class ConditionLogZTracker:
         self.z_bias_ema = torch.full((library_size,), float("nan"), dtype=torch.float32)
         self.z_resid_effective_count = torch.zeros((library_size,), dtype=torch.float32)
         self.z_resid_last_step = torch.full((library_size,), -1, dtype=torch.long)
+        # discovery-rate telemetry over best_energy: update_best_energy()
+        # accumulates strict per-condition minimum improvements (count/depth)
+        # and first visits into the _window_* scalars; pop_discovery_stats()
+        # drains them into time-decayed per-step rate EMAs. Pure monitoring --
+        # nothing here feeds back into training. See pop_discovery_stats.
+        self.minima_improved_total = 0
+        self.minima_depth_total = 0.0
+        self._window_improved = 0
+        self._window_depth = 0.0
+        self._window_first_visits = 0
+        self.discovery_rate_ema = 0.0
+        self.discovery_depth_rate_ema = 0.0
+        self.discovery_last_step = -1
 
     def __len__(self):
         return self.library_size
@@ -1243,6 +1314,13 @@ class ConditionLogZTracker:
         persistent tensor is sufficient. best_energy is initialized to
         +inf, so a condition's first-ever visit is handled by the reduce
         itself (min(inf, x) == x) with no special-casing.
+
+        A torch.unique pass IS spent on the discovery telemetry: comparing
+        each touched condition's best_energy before/after the scatter gives
+        the number of strict minimum improvements this call, their summed
+        depth (old - new, only defined where the old minimum was finite),
+        and first visits (inf -> finite). These accumulate into the
+        _window_* scalars for pop_discovery_stats to drain.
         """
         condition_id = torch.as_tensor(condition_id, dtype=torch.long).detach().cpu().flatten()
         energy = torch.as_tensor(energy, dtype=torch.float32).detach().cpu().flatten()
@@ -1256,7 +1334,83 @@ class ConditionLogZTracker:
                 f"{condition_id.shape[0]} and {energy.shape[0]}."
             )
 
+        unique_ids = torch.unique(condition_id)
+        old_best = self.best_energy[unique_ids]
+
         self.best_energy.scatter_reduce_(0, condition_id, energy, reduce="amin", include_self=True)
+
+        new_best = self.best_energy[unique_ids]
+        had_min = torch.isfinite(old_best)
+        improved = had_min & (new_best < old_best)
+        n_improved = int(improved.sum().item())
+        depth = float((old_best[improved] - new_best[improved]).sum().item())
+        self._window_improved += n_improved
+        self._window_depth += depth
+        self._window_first_visits += int((~had_min & torch.isfinite(new_best)).sum().item())
+        self.minima_improved_total += n_improved
+        self.minima_depth_total += depth
+
+    @torch.no_grad()
+    def pop_discovery_stats(self, step: int, half_life_steps: Optional[float] = None):
+        """
+        Drain the discovery-rate accumulators fed by update_best_energy()
+        and fold this window's per-step rates into their EMAs -- the
+        "minima discovery velocity" readout for the anchor buffer /
+        conditional controller: near 0 when per-condition minima have gone
+        static, rising quickly when fresh conditional minima are being
+        found. `step` is the caller's current global training step
+        (Modeller.step_ind); rates are in events (or energy units of
+        reduction per visited condition) per TRAINING STEP, so they're
+        comparable across eval cadences and window lengths.
+
+        EMA mixing uses the same elapsed-training-steps convention as
+        update(): the window's mean rate (count / elapsed) enters with
+        weight 1 - 0.5 ** (elapsed / half_life), so a long window carries
+        proportionally more weight and quiet windows decay the EMA toward
+        0 on the same clock regardless of how often this is called.
+        Intended to be drained from exactly one call site per period (the
+        eval-cycle logger) -- each call resets the window.
+
+        The count rate is scale-free (an improvement is an improvement in
+        any condition's own energy scale). All depth outputs are INTENSIVE:
+        the raw summed energy reduction is divided by the number of visited
+        conditions (finite best_energy) at drain time, so "mean deepening
+        per tracked condition" (energy units) is comparable across runs
+        with different condition-library sizes. The internal accumulators
+        stay raw sums (checkpoint layout unchanged); normalization happens
+        only here. A single deep drop -- real or a scoring outlier -- can
+        still dominate a window. Read the pair together: count rate for
+        churn, depth rate for magnitude.
+        """
+        half_life = self.discovery_half_life_steps if half_life_steps is None else half_life_steps
+        improved = self._window_improved
+        n_visited = max(int(torch.isfinite(self.best_energy).sum().item()), 1)
+        depth = self._window_depth / n_visited
+        first_visits = self._window_first_visits
+        self._window_improved = 0
+        self._window_depth = 0.0
+        self._window_first_visits = 0
+
+        # fresh runs start the clock at step 0; from_state_dict seeds
+        # discovery_last_step to the resume step for reloaded runs (and to
+        # current_step for checkpoints predating this telemetry)
+        last = self.discovery_last_step if self.discovery_last_step >= 0 else 0
+        elapsed = max(int(step) - last, 1)
+        self.discovery_last_step = int(step)
+
+        alpha = 1.0 - 0.5 ** (elapsed / half_life)
+        self.discovery_rate_ema += alpha * (improved / elapsed - self.discovery_rate_ema)
+        self.discovery_depth_rate_ema += alpha * (depth / elapsed - self.discovery_depth_rate_ema)
+
+        return {
+            'improved': improved,
+            'first_visits': first_visits,
+            'depth': depth,
+            'rate_ema': self.discovery_rate_ema,
+            'depth_rate_ema': self.discovery_depth_rate_ema,
+            'improved_total': self.minima_improved_total,
+            'depth_total': self.minima_depth_total / n_visited,
+        }
 
     @torch.no_grad()
     def lookup_best_energy(self, condition_id):
@@ -1292,6 +1446,15 @@ class ConditionLogZTracker:
             "z_bias_ema": self.z_bias_ema.cpu(),
             "z_resid_effective_count": self.z_resid_effective_count.cpu(),
             "z_resid_last_step": self.z_resid_last_step.cpu(),
+            "discovery_half_life_steps": self.discovery_half_life_steps,
+            "minima_improved_total": self.minima_improved_total,
+            "minima_depth_total": self.minima_depth_total,
+            "window_improved": self._window_improved,
+            "window_depth": self._window_depth,
+            "window_first_visits": self._window_first_visits,
+            "discovery_rate_ema": self.discovery_rate_ema,
+            "discovery_depth_rate_ema": self.discovery_depth_rate_ema,
+            "discovery_last_step": self.discovery_last_step,
         }
 
     @classmethod
@@ -1348,6 +1511,19 @@ class ConditionLogZTracker:
             "z_resid_effective_count", torch.zeros_like(obj.count, dtype=torch.float32)).cpu()
         obj.z_resid_last_step = state.get(
             "z_resid_last_step", torch.full_like(obj.count, int(current_step))).cpu()
+        # older checkpoints predate the discovery telemetry -- zeroed
+        # accumulators/EMAs are the honest fallback (rates rebuild within a
+        # half-life), and discovery_last_step falls back to current_step so
+        # the first post-reload pop doesn't see a huge fabricated window
+        obj.discovery_half_life_steps = state.get("discovery_half_life_steps", 200.0)
+        obj.minima_improved_total = state.get("minima_improved_total", 0)
+        obj.minima_depth_total = state.get("minima_depth_total", 0.0)
+        obj._window_improved = state.get("window_improved", 0)
+        obj._window_depth = state.get("window_depth", 0.0)
+        obj._window_first_visits = state.get("window_first_visits", 0)
+        obj.discovery_rate_ema = state.get("discovery_rate_ema", 0.0)
+        obj.discovery_depth_rate_ema = state.get("discovery_depth_rate_ema", 0.0)
+        obj.discovery_last_step = state.get("discovery_last_step", int(current_step))
         return obj
 
 
@@ -1524,6 +1700,10 @@ class AnchorBuffer(CrystalBuffer):
                 original_surprise, dtype=torch.float32).detach().cpu().flatten()
             assert self.original_surprise.shape[0] == n, \
                 f"original_surprise has {self.original_surprise.shape[0]} entries, expected {n} to match dataset size"
+        # previous eval-window snapshot of per-condition mean stored energy,
+        # consumed/refreshed by pop_mean_energy_improvement()
+        self._prev_cond_ids = None
+        self._prev_cond_mean_energy = None
 
     @property
     def condition_id(self):
@@ -1539,6 +1719,9 @@ class AnchorBuffer(CrystalBuffer):
         state['reward'] = self.reward.cpu()
         state['energy'] = self.energy.cpu()
         state['original_surprise'] = self.original_surprise.cpu()
+        if self._prev_cond_ids is not None:
+            state['prev_cond_ids'] = self._prev_cond_ids.cpu()
+            state['prev_cond_mean_energy'] = self._prev_cond_mean_energy.cpu()
         return state
 
     @classmethod
@@ -1554,7 +1737,70 @@ class AnchorBuffer(CrystalBuffer):
         # the only honest fallback; see __init__'s legacy-path comment
         obj.original_surprise = state.get(
             'original_surprise', torch.full_like(obj.energy, float('nan'))).cpu()
+        # older checkpoints predate the mean-energy-improvement snapshot --
+        # None just means the first post-reload window reports nothing
+        obj._prev_cond_ids = state.get('prev_cond_ids', None)
+        obj._prev_cond_mean_energy = state.get('prev_cond_mean_energy', None)
         return obj
+
+    # ---------------------------------------------------------------------
+    # Monitoring
+    # ---------------------------------------------------------------------
+
+    @torch.no_grad()
+    def pop_mean_energy_improvement(self):
+        """
+        Windowed "the average anchor sample got this much better" readout,
+        in energy units. Each call snapshots the current per-condition mean
+        stored energy and returns the mean drop since the previous call's
+        snapshot (prev - current, positive = the population deepened),
+        averaged with equal weight over the conditions present in BOTH
+        snapshots. The condition decomposition matters: conditions sit on
+        very different absolute energy scales, so a raw whole-buffer mean
+        delta would mostly measure cross-condition composition churn (which
+        conditions happened to gain anchors), not actual deepening. For the
+        same reason, conditions appearing or vanishing between snapshots
+        are composition changes rather than improvement and are excluded --
+        n_conditions reports how many were actually compared. Within a
+        shared condition, freshly admitted anchors DO count: new low-energy
+        admissions pulling that condition's mean down is exactly the
+        population improving.
+
+        Returns (improvement, n_conditions); (None, 0) on the first call,
+        on an empty buffer (the stored snapshot is kept so a transient
+        empty read doesn't erase the baseline), or when no condition is
+        shared. Intended to be drained from exactly one call site per eval
+        period (the buffer-stats logger), same convention as
+        ConditionLogZTracker.pop_discovery_stats; the snapshot persists
+        through state_dict so a resume doesn't fabricate a giant first
+        window.
+        """
+        if len(self) == 0:
+            return None, 0
+        ids = self.condition_id
+        uniq, inverse = torch.unique(ids, return_inverse=True)
+        sums = torch.zeros(uniq.shape[0], dtype=torch.float64).scatter_add_(
+            0, inverse, self.energy.double())
+        counts = torch.bincount(inverse, minlength=uniq.shape[0]).double()
+        means = (sums / counts).float()
+
+        prev_ids, prev_means = self._prev_cond_ids, self._prev_cond_mean_energy
+        self._prev_cond_ids, self._prev_cond_mean_energy = uniq, means
+
+        if prev_ids is None or prev_ids.numel() == 0:
+            return None, 0
+        # checkpointed snapshots live on cpu while the buffer tensors may be on
+        # device, so align before comparing (first call after a resume)
+        prev_ids = prev_ids.to(uniq.device)
+        prev_means = prev_means.to(means.device)
+        # torch.unique output is sorted, so shared conditions match by searchsorted
+        pos = torch.searchsorted(prev_ids, uniq).clamp(max=prev_ids.numel() - 1)
+        shared = prev_ids[pos] == uniq
+        n_shared = int(shared.sum().item())
+        if n_shared == 0:
+            return None, 0
+        improvement = float((prev_means[pos[shared]] - means[shared]).mean().item())
+        return improvement, n_shared
 
     # ---------------------------------------------------------------------
     # Mutation
@@ -1679,7 +1925,7 @@ class AnchorBuffer(CrystalBuffer):
         replace_map = {}  # existing-anchor slot idx -> winning local candidate idx
         new_slot_owner = []  # local candidate idx currently occupying each newly created slot
 
-        for local_idx in order.tolist():
+        for local_idx in order.tolist():  # todo check speed here
             x_i = cand_x[local_idx:local_idx + 1]
             r_i = reward[local_idx]
             e_i = energy[local_idx]
@@ -1729,7 +1975,7 @@ class AnchorBuffer(CrystalBuffer):
 
     @torch.no_grad()
     def thin(self, per_condition_min_energy, energy_window: Optional[float] = None,
-             max_size: Optional[int] = None, max_per_condition: Optional[int] = None):
+             max_size: Optional[int] = None):
         """
         Energy-window trim, run per condition_id group: drop anchors whose
         energy - per_condition_min_energy[cid] exceeds energy_window (deliberately
@@ -1748,8 +1994,8 @@ class AnchorBuffer(CrystalBuffer):
         this trim is a one-way, always-safe operation: an anchor that falls out
         can never re-qualify.
 
-        Hard-cap backstop: if the buffer is still over max_size (or a single
-        condition is over max_per_condition) afterward, each condition's own
+        Hard-cap backstop: if the buffer is still over max_size afterward,
+        each condition's own
         current-best (lowest-energy) anchor is protected first, then the
         remaining pool is trimmed by lowest original_surprise first (NaN --
         i.e. unmeasured, legacy-seeded anchors -- sorts last, so freshly
@@ -1770,41 +2016,8 @@ class AnchorBuffer(CrystalBuffer):
             if drop.numel() > 0:
                 self.purge_by_index(drop.numpy())
 
-        over_global = max_size is not None and len(self) > max_size
-        over_per_condition = max_per_condition is not None and len(self) > 0 and \
-                             int(torch.bincount(self.condition_id).max().item()) > max_per_condition
-        if not (over_global or over_per_condition):
-            return
-
-        condition_id = self.condition_id
-        energy = self.energy
-        surprise = self.original_surprise
-        protected = {
-            int(rows[torch.argmin(energy[rows])].item())
-            for cid in torch.unique(condition_id)
-            for rows in [torch.nonzero(condition_id == cid, as_tuple=False).flatten()]
-        }
-
-        drop_idx_parts = []
-
-        if max_per_condition is not None:
-            for cid in torch.unique(condition_id):
-                rows = torch.nonzero(condition_id == cid, as_tuple=False).flatten()
-                excess = rows.numel() - max_per_condition
-                if excess <= 0:
-                    continue
-                cand = torch.tensor([r.item() for r in rows if r.item() not in protected], dtype=torch.long)
-                if cand.numel() == 0:
-                    continue
-                # lowest original_surprise first; NaN (unmeasured) sorts last via nan_to_num(+inf)
-                order = torch.argsort(torch.nan_to_num(surprise[cand], nan=float('inf')))
-                drop_idx_parts.append(cand[order[:min(excess, cand.numel())]])
-
-        if drop_idx_parts:
-            self.purge_by_index(torch.cat(drop_idx_parts).numpy())
-
         if max_size is not None and len(self) > max_size:
-            condition_id = self.condition_id  # re-read: indices shifted after any drop above
+            condition_id = self.condition_id
             energy = self.energy
             surprise = self.original_surprise
             protected = {

@@ -1206,13 +1206,49 @@ class MetricTracker:
             self.last_it[d] = step
 
 
-def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, reward_ramp_range=None):
+def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=None,
+                   clip_beta=None):
     """
-    reward_floor/reward_ramp_range gate under_coverage by a reward ramp (see
-    weighted_under_coverage spec): w_raw = clamp((log_r - floor) / ramp_range, 0, 1),
-    self-normalized, so a heavy low-reward tail can't inflate under_coverage while
-    real (even if modest) modes still register. Pass both as None to fall back to the
-    old uniform-RMS behavior (also always reported as 'under_coverage_uniform').
+    reward_floor/ramp_width gate under_coverage by a per-sample reward ramp:
+
+        w_raw = clamp((log_r - reward_floor) / ramp_width, 0, 1)
+
+    reward_floor is per-sample (M_c - ramp_floor, from the sample's own
+    condition's anchor max; see Modeller._reward_ramp_kwargs for the
+    depth-space definition) and ramp_width is the width of the linear
+    transition band sitting directly above the floor: weight 0 at or below
+    reward_floor, saturating to 1 at reward_floor + ramp_width and staying 1
+    up through M_c. Weights are self-normalized, so a heavy low-reward tail
+    can't inflate under_coverage while real (even if modest) modes still
+    register. ramp_width must be > 0 (asserted -- a non-positive width is the
+    silent-inversion bug this parameterization replaced). If no sample in the
+    batch clears the floor, under_coverage is nan ("no qualifying samples")
+    rather than a fake 0; MetricTracker skips non-finite updates so EMAs hold.
+    Pass both as None to fall back to the old uniform-RMS behavior (always
+    also reported as 'under_coverage_uniform').
+
+    clip_beta (the direction's Huber beta from *_loss_coeffs) adds
+    'tb_resid_clipped': the signed batch mean of the residual clamped to
+    [-beta, beta], which IS dL/dZ (up to the constant beta scale) when Z
+    trains via Huber TB. It reads ~0 exactly at the loss's own fixed point
+    (the self-consistent beta-Winsorized mean of log w) and, unlike
+    'tb_resid' (the Jensen delta -- offset by the clipped-off tail mass) or
+    'tb_err' (RMS, floored at std(log w)), is bounded by beta, so fat or
+    skewed tails can't inflate it and a lagging Z shows as a persistent
+    sign. None (e.g. legacy callers) skips the metric.
+
+    'relative_under' is the under_coverage computation re-centered on THIS
+    batch's own empirical normalizer (z_jensen = mean log w) instead of
+    log_Z. The collective level gap (learned Z vs buffer-implied Z) is not
+    something backward training can act on -- E_mu[log P_F] is capped at
+    -H(mu) by normalization, so the whole cloud cannot translate -- and it
+    makes the Z-anchored under_coverage read "everything is under-covered"
+    whenever Z lags, starving the controller's other modes. Re-centered,
+    'under-covered' means under-covered relative to the rest of the batch:
+    the spread component that IS the policy's to fix. The phase-3 controller
+    keys backward allocation on this; the Z-anchored under_coverage stays
+    reported as the absolute-merge gauge (its gap to relative_under, like
+    jensen_z vs log_Z_learned, is the has-forward-caught-up signal).
     """
     x = (log_pb + log_r).detach()
     y = (log_pf + log_Z).detach()
@@ -1235,14 +1271,32 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, reward_ramp_
     # Under-weighted trajectories
     neg = resid.clamp(max=0)  # 0 where resid >= 0, negative elsewhere (RAW resid, not centered)
     under_severity_uniform = neg.pow(2).mean().sqrt().item()  # RMS of negative residuals
-    if reward_floor is not None and reward_ramp_range is not None:
-        w_raw = ((log_r.detach() - reward_floor) / reward_ramp_range).clamp(0, 1)
-        w = w_raw / w_raw.sum().clamp_min(1e-8)
-        under_severity = (w * neg.pow(2)).sum().sqrt().item()  # reward-weighted RMS of negatives
+    if reward_floor is not None and ramp_width is not None:
+        assert ramp_width > 0, f"ramp_width must be positive, got {ramp_width}"
+        w_raw = ((log_r.detach() - reward_floor) / ramp_width).clamp(0, 1)
+        total = w_raw.sum()
+        if total > 0:
+            under_severity = ((w_raw / total) * neg.pow(2)).sum().sqrt().item()  # reward-weighted RMS of negatives
+        else:
+            under_severity = float('nan')  # no sample cleared its condition's floor this batch
     else:
+        # the docstring's promised no-ramp fallback (was an UnboundLocalError
+        # if this path was ever reached; production always has a ramp once the
+        # anchor buffer seeds, so it lay dormant)
         under_severity = under_severity_uniform
     pos = resid.clamp(min=0)  # over_coverage stays uniform: replay must see over-weighted junk
     over_severity = pos.pow(2).mean().sqrt().item()
+
+    # relative_under: same negative-tail RMS, centered on the batch's own z_jensen
+    # instead of log_Z (see docstring) -- the level gap drops out, leaving the
+    # within-batch spread component the policy can actually fix. Same reward-ramp
+    # weighting as under_coverage, for the same low-reward-tail hygiene.
+    neg_rel = (z_jensen - log_w).clamp(max=0)
+    if reward_floor is not None and ramp_width is not None:
+        relative_under = (((w_raw / total) * neg_rel.pow(2)).sum().sqrt().item()
+                          if total > 0 else float('nan'))
+    else:
+        relative_under = neg_rel.pow(2).mean().sqrt().item()
 
     log_ess = 2 * torch.logsumexp(log_w, dim=0) - torch.logsumexp(2 * log_w, dim=0)
     ess_frac = torch.exp(log_ess - np.log(log_w.shape[0]))
@@ -1257,6 +1311,7 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, reward_ramp_
         'emp_z_err': (z_emp - z_learned).abs().item(),
         'under_coverage': under_severity,
         'under_coverage_uniform': under_severity_uniform,
+        'relative_under': relative_under,
         'over_coverage': over_severity,
         'z_gap': (z_emp - z_jensen).item(),
         'resid_p05': resid.detach().quantile(0.05).item(),
@@ -1268,7 +1323,48 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, reward_ramp_
         "ess_frac": ess_frac.item(),
     }
 
+    if clip_beta is not None:
+        mets['tb_resid_clipped'] = resid.clamp(-clip_beta, clip_beta).mean().item()
+
     return mets
+
+
+def within_condition_logw_std(log_pf, log_pb, log_r, condition_id):
+    """
+    Pooled WITHIN-condition std of log w = log_r + log_pb - log_pf: the
+    batch-wide logw_std (quick_tb_stats) with the between-condition component
+    removed. That between-condition part -- the spread of the per-condition
+    Jensen means / log Z(c) -- dominates the plain batch-wide std whenever the
+    condition set is large and dissimilar (hundreds of nats over a broad
+    library; recall ~365 nats between just two conditions in the 2-cond toy),
+    and it is NOT what condition-grouped VarGrad reduces. So the batch-wide
+    logw_std is a misleading convergence signal at scale (it barely moves as
+    VarGrad works, and rises when conditions are made more dissimilar);
+    THIS is the quantity VarGrad actually optimizes.
+
+    Each sample is centered on its own condition's group mean before the RMS.
+    Only multi-member groups contribute -- a singleton's deviation from its own
+    mean is trivially 0 and carries no within-condition signal, so it's masked
+    out of both numerator and denominator rather than diluting the estimate
+    with zeros. Returns nan when no group in the batch has >= 2 members (e.g. a
+    forward batch drawn with repeats == 1 over a large library, where every
+    condition appears once); callers must treat nan as "no signal this batch",
+    NOT as zero.
+    """
+    log_w = (log_r + log_pb - log_pf).detach().flatten()
+    cid = condition_id.detach().flatten().to(log_w.device)
+    uniq, inverse = torch.unique(cid, return_inverse=True)
+    k = uniq.numel()
+    counts = torch.zeros(k, device=log_w.device, dtype=log_w.dtype).scatter_add_(
+        0, inverse, torch.ones_like(log_w))
+    group_sum = torch.zeros(k, device=log_w.device, dtype=log_w.dtype).scatter_add_(
+        0, inverse, log_w)
+    group_mean = group_sum / counts.clamp(min=1)
+    centered = log_w - group_mean[inverse]
+    multi = counts[inverse] >= 2  # only samples in >=2-member groups carry signal
+    if not bool(multi.any()):
+        return float('nan')
+    return centered[multi].pow(2).mean().sqrt().item()
 
 
 def online_tb_coverage(log_pf, log_pb, log_Z, log_r, log_w_clamp=10.0):

@@ -342,12 +342,19 @@ def get_gfn_backward_loss(loss_coeffs,
                           tb_z_source: str = 'learned',
                           update_log_z: bool = True,
                           step: int = 0,
+                          scramble_condition_tiles: int = 0,
                           ):
     """
     freeze_policy/freeze_z (read from loss_coeffs): see get_gfn_forward_loss's
     docstring -- same contract, applied here right after log_pf/log_pb/
     log_Z_learned are computed, and freeze_policy threaded into the traj
     sampler so the conditioner->flow path is detached too.
+
+    scramble_condition_tiles: passed straight through to the traj sampler --
+    unconditional-prior phase-1 MLE detaches and tile-permutes the condition
+    embedding INSIDE the model, at the conditioner->trunk seam; `condition`
+    itself stays correctly paired everywhere in this function (see
+    GFN._maybe_scramble_condition_embedding). 0 = off.
     """
     freeze_policy = getattr(loss_coeffs, 'freeze_policy', 0) > 0.5
     freeze_z = getattr(loss_coeffs, 'freeze_z', 0) > 0.5
@@ -356,12 +363,14 @@ def get_gfn_backward_loss(loss_coeffs,
         # replay a fixed trajectory (e.g. from a buffer) instead of resampling one
         states, log_pfs, log_pbs, log_flow = gfn.get_traj_replay(
             trajectories, discretizer, condition, mol_batch,
-            return_gauss_params=False, freeze_policy=freeze_policy)
+            return_gauss_params=False, freeze_policy=freeze_policy,
+            scramble_condition_tiles=scramble_condition_tiles)
     else:
         states, log_pfs, log_pbs, log_flow = gfn.get_traj_bwd(
             samples, discretizer, condition, mol_batch,
             return_gauss_params=False,
-            detach_traj=loss_coeffs.traj_grads == 0, freeze_policy=freeze_policy)
+            detach_traj=loss_coeffs.traj_grads == 0, freeze_policy=freeze_policy,
+            scramble_condition_tiles=scramble_condition_tiles)
     log_Z_learned = log_flow[:, 0]
     log_flow[:, -1] = log_r
 

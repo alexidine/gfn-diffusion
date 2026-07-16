@@ -370,6 +370,32 @@ class GFN(nn.Module):  # todo add seeding
         gauss_params['diag_logvars_f'][:, i, :] = d.detach().log()
         gauss_params['rho_f'][:, i, :] = (1.0 - d / pflogvars.exp()).detach()
 
+    def _maybe_scramble_condition_embedding(self, condition_embedding, batch_size,
+                                            scramble_condition_tiles: int):
+        """
+        Unconditional-prior training (see Modeller.uncond_prior_mode): the
+        conditioner runs on the TRUE, correctly-paired conditions -- so the
+        state model sees embeddings of exactly the scale and distribution
+        later (conditional) phases will feed it -- but its output is detached
+        (the conditioner itself must stay at init) and its ROWS are permuted
+        tile-wise before the state model ever consumes them, so MLE/TBC
+        actively train the trunk to ignore the embedding. Tile size = the
+        caller's K-repeats grouping: same-terminal rollouts keep sharing one
+        (scrambled) condition, preserving the exact-MLE (IWAE) and TBC group
+        semantics. Deliberately contained HERE, at the conditioner->trunk
+        seam, so no scrambled tensor can leak back into buffers, per-sample
+        losses, or condition bookkeeping upstream. 0 = off (default).
+        """
+        if scramble_condition_tiles <= 0:
+            return condition_embedding
+        k = scramble_condition_tiles
+        assert batch_size % k == 0, \
+            f"batch size {batch_size} not divisible by scramble tile size {k}"
+        perm = torch.randperm(batch_size // k, device=condition_embedding.device)
+        return (condition_embedding.detach()
+                .reshape(batch_size // k, k, -1)[perm]
+                .reshape(batch_size, -1))
+
     def get_condition_embedding(self, condition, mol_batch):
         if self.conditions_type == 'molecule':
             scalar_embedding, vector_embedding = self.conditions_embedding_model(
@@ -389,7 +415,7 @@ class GFN(nn.Module):  # todo add seeding
 
     def get_traj_bwd(self, terminal_state, discretizer, condition, mol_batch,
                      return_gauss_params: bool = False, detach_traj: bool = False,
-                     freeze_policy: bool = False):
+                     freeze_policy: bool = False, scramble_condition_tiles: int = 0):
         batch_size = terminal_state.shape[0]
         ts = discretizer(batch_size).to(self.device)
         trajectory_length = ts.shape[1] - 1
@@ -405,6 +431,8 @@ class GFN(nn.Module):  # todo add seeding
             else:  # constant embedding
                 condition_embedding = torch.zeros((batch_size, self.condition_embedding_dim),
                                                   dtype=torch.float32, device=self.device)
+            condition_embedding = self._maybe_scramble_condition_embedding(
+                condition_embedding, batch_size, scramble_condition_tiles)
             if freeze_policy:  # Z-only training: cut gradient to the conditioner at the source
                 condition_embedding = condition_embedding.detach()
         else:
@@ -472,7 +500,8 @@ class GFN(nn.Module):  # todo add seeding
             return states, logpfs, logpbs, log_flow
 
     def get_traj_replay(self, trajectory, discretizer, condition, mol_batch,
-                        return_gauss_params: bool = False, freeze_policy: bool = False):
+                        return_gauss_params: bool = False, freeze_policy: bool = False,
+                        scramble_condition_tiles: int = 0):
         """
         Recompute log_flow, logpf and logpb for a fixed batch of trajectories
         (e.g., replayed from a buffer), instead of generating them. Mirrors
@@ -501,6 +530,8 @@ class GFN(nn.Module):  # todo add seeding
             else:  # constant embedding
                 condition_embedding = torch.zeros((batch_size, self.condition_embedding_dim),
                                                   dtype=torch.float32, device=self.device)
+            condition_embedding = self._maybe_scramble_condition_embedding(
+                condition_embedding, batch_size, scramble_condition_tiles)
             if freeze_policy:  # Z-only training: cut gradient to the conditioner at the source
                 condition_embedding = condition_embedding.detach()
         else:
