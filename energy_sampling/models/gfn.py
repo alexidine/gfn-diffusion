@@ -1,6 +1,6 @@
 import math
 from argparse import Namespace
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import torch
@@ -36,6 +36,8 @@ class GFN(nn.Module):  # todo add seeding
                  max_z_prime: int = 1,
                  full_flow: bool = False,
                  do_periodic_angles: bool = True,
+                 periodic_centroids: bool = False,
+                 periodic_centroid_axes: Optional[Sequence[int]] = None,
                  dplr_rank: int = 0,
                  dplr_rho_max: float = 0.9,
                  dplr_mask_angular: bool = True,
@@ -79,7 +81,12 @@ class GFN(nn.Module):  # todo add seeding
         # has the same effect: sigmoid(0 - 4) ~ 0.018 at initialization.
         self.dplr_rho_init_bias = 4.0
 
-        self.get_periodic_dimensions(device, do_periodic_angles=do_periodic_angles)
+        # `periodic_centroids` is the on/off switch (config-level); the axes themselves are
+        # a space group property and so are resolved by the caller (train.py) rather than here
+        self.periodic_centroids = periodic_centroids
+        self.get_periodic_dimensions(
+            device, do_periodic_angles=do_periodic_angles,
+            periodic_centroid_axes=periodic_centroid_axes if periodic_centroids else None)
         self.condition_embedding_dim = condition_embedding_dim
 
         self.init_conditioner(cond_hidden_dim, cond_layers, condition_embedding_dim, conditions_dim,
@@ -203,7 +210,30 @@ class GFN(nn.Module):  # todo add seeding
             else:
                 self.flow_model = LearnableScalar()  # unified syntax with this instead of nn.Parameter
 
-    def get_periodic_dimensions(self, device, do_periodic_angles: bool = True, ):
+    def get_periodic_dimensions(self, device, do_periodic_angles: bool = True,
+                                periodic_centroid_axes: Optional[Sequence[int]] = None):
+        """
+        Build the mask of state dims that live on a circle. ang_mask means exactly
+        "this dim is wrapped": it drives the sin/cos policy encoding
+        (expand_state_for_policy) and the post-step wrap in get_traj_fwd/bwd.
+
+        State layout is
+            [6 box params | 3*max_z_prime aunit centroids | 3*max_z_prime aunit orientations]
+        Orientation dims: phi and r are periodic in the rotational basis.
+
+        Centroid dims are periodic ONLY for the axes in `periodic_centroid_axes`. The
+        aunit is generally not periodic -- crossing a face re-enters through a symmetry
+        operation rather than a translation (e.g. P21/c at y=1/4), a genuine
+        discontinuity -- but on axes where the shift by the aunit width is itself a
+        lattice translation the coordinate really is circular, and wrapping lets the SDE
+        flow through the face instead of being held off it by the bounding-energy wall.
+        Which axes qualify depends on the space group, so the caller supplies them; see
+        models/aunit_periodicity.py for the derivation and its empirical validation.
+
+        Note this also extends `dplr_mask_angular` (get_dplr_cov) to the wrapped centroid
+        dims, which is the consistent reading: that mask exists to keep the shared
+        low-rank noise direction off circular coordinates, and these are now circular.
+        """
         if do_periodic_angles:
             angs = [False] * 6
             for zp in range(self.max_z_prime):
@@ -213,6 +243,25 @@ class GFN(nn.Module):  # todo add seeding
                 # phi and r dimensions arein rotational basis
         else:
             angs = [False] * 12
+
+        self.periodic_centroid_axes = tuple(sorted(set(periodic_centroid_axes or ())))
+        if self.periodic_centroid_axes:
+            if not do_periodic_angles:
+                raise ValueError(
+                    "periodic centroid axes are a molecular-crystal property, but this GFN was "
+                    "built with do_periodic_angles=False (i.e. a toy/latent energy whose state "
+                    "is not a crystal parameterization)")
+            if any(a not in (0, 1, 2) for a in self.periodic_centroid_axes):
+                raise ValueError(f"centroid axes must be in (0, 1, 2), got {self.periodic_centroid_axes}")
+            expected_dim = 6 + 6 * self.max_z_prime
+            if self.dim != expected_dim:
+                raise ValueError(
+                    f"expected crystal state dim {expected_dim} for max_z_prime={self.max_z_prime}, "
+                    f"got {self.dim}; refusing to index centroid dims into an unknown layout")
+            for zp in range(self.max_z_prime):
+                for axis in self.periodic_centroid_axes:
+                    angs[6 + 3 * zp + axis] = True
+
         self.ang_mask = torch.tensor(angs, device=device)
         self.ang_dim = (self.ang_mask == True).sum().item()
         self.lin_dim = self.dim - self.ang_dim

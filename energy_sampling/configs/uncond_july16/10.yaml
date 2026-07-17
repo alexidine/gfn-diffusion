@@ -1,0 +1,281 @@
+adaptive_lr:
+  best_drift: 0.003
+  breach_fraction: 0.66
+  breach_persistence: 3
+  ceiling_relax: 0.001
+  channel_margin: 1.3
+  channel_min_frac: 0.01
+  channel_stale_steps: 200
+  climb_above_base: false
+  climb_increment: 0.02
+  climb_patience: 10
+  control_flow_lr: false
+  cooldown_ticks: 20
+  cut_ratio: 0.5
+  enabled: true
+  scale_max: 2.0
+  warmup_ticks: 100
+anchor_fwd_bwd: true
+anomaly_detection: false
+batch_growth_increment: 1.01
+batch_growth_slow_increment: 1.002
+batch_size: 25
+both_ways: true
+buffers:
+  anchor_buffer:
+    confirm_cutoff: -5
+    confirm_k: 5
+    dup_cutoff: 0.05
+    max_size: 200000
+    noise_log_range:
+    - -2.5
+    - -1.5
+    reach_quantile: 0.9
+    reach_threshold: 0.75
+    reach_topup_size: 1000
+    refresh_every_n_evals: 5
+    replay_beta: 0.5
+    screen_energy_window: 20
+    seed_source: prior_dataset
+    surprise_cutoff: -5
+    thin_energy_window: 50
+    thin_every_n_evals: 5
+    topup_admit_record_breakers: true
+  prior_buffer:
+    condition_block_m: 2
+    max_size: 100000
+    mean_lifetime: 100
+    min_size: 10000
+    ramp_floor: 100
+    ramp_width: 50
+    reward_min: -600
+    seed_source: prior_dataset
+  replay_buffer:
+    max_size: 100000
+    random_churn_rate: 50
+bwd: false
+bwd_loss_coeffs:
+  beta: 10.0
+  db: 0.0
+  emp_z: 0
+  emp_z_persistent: 0
+  freeze_policy: 0.0
+  freeze_z: 1.0
+  loss_clip: 1000000000.0
+  mle: 1.0
+  pf_boost: 0
+  repeats: 2.0
+  subtb: 0.0
+  subtb_lambda: 0.9
+  tb: 0.0
+  tbc: 1.0
+  traj_grads: 1.0
+  vg_by_condition: 1.0
+  vg_lb: 0
+  vg_lme: 0
+checkpoint_name: null
+checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/
+condition_log_z:
+  bwd_tb_z_source: learned
+  discovery_half_life_steps: 200.0
+  fwd_tb_z_source: learned
+  half_life_steps: 7.0
+  max_batch_weight: 200.0
+  min_visits: 20
+  mol_sampling_uniform_beta: 0.5
+  mol_sampling_weighted_by_z_gap: true
+  mol_sampling_z_gap_clip_quantile: 0.99
+  mol_sampling_z_gap_phase3: false
+  mol_sampling_z_gap_temperature: 0.5
+  replay_tb_z_source: learned
+  trim_frac: 0.1
+continue_from_checkpoint: false
+controller:
+  anneal_patience: 5
+  beta: 0.025
+  deactivate_threshold: 0.01
+  decay_rate: 0.95
+  lookahead_horizon: 2
+  lookahead_trend_alpha: 0.1
+  min_mode_frac: 0.001
+  min_threshold: 1
+  over_threshold: 8
+  refresh_every: 10
+  under_threshold: 8
+  zerr_min_threshold: 0.5
+  zerr_threshold: 0.5
+cuda_memory_fraction: 0.9
+device: cuda
+ema_decay: null
+energy_config:
+  analyze_kwargs: {}
+  bounding_coeff: 10.0
+  density_coeff: 10.0
+  internal_oom_recovery: true
+  lj_coeff: 1.0
+  log_temperature_range:
+  - 0
+  - 0.693147
+  reduction_coeff: 10.0
+  reward_range: 1000
+  temperature: 2.5
+energy_function: elj
+epochs: 100000
+eval_T: 10
+eval_num_samples: 10000
+eval_period: 500
+figs_period: 500
+forward_first:
+  boundary_floor: 0.001
+  boundary_margin: 3.0
+  calib_best_drift: 0.003
+  calib_margin: 1.3
+  calib_patience: 2
+  calib_r2_min: 0.95
+  calib_scatter_max: 5.0
+  churn_down: 0.99
+  churn_max_mult: 20.0
+  churn_min_buffer: 1000
+  churn_up: 1.05
+  enabled: true
+  floor_improve_frac: 0.02
+  floor_patience: 50
+  floor_reset_frac: 0.5
+  min_steps: 500
+  replay_share: 0.2
+fused: true
+fused_grad_accum_min_samples: 0
+fwd_loss_coeffs:
+  beta: 10.0
+  db: 0.0
+  emp_z: 0
+  emp_z_persistent: 0
+  freeze_policy: 1.0
+  freeze_z: 0.0
+  loss_clip: 1000000000.0
+  repeats: 1.0
+  reward_grads: 0.0
+  subtb: 0.0
+  subtb_lambda: 0.95
+  tb: 1.0
+  traj_grads: 0.0
+  vg_by_condition: 1.0
+  vg_lb: 0.0
+  vg_lme: 0
+gradient_norm_clip: 100.0
+grow_batch_size: true
+integrator:
+  T: 10
+  discretizer: uniform
+  discretizer_max_ratio: 15
+  max_traj_length: 10
+  min_traj_length: 10
+  traj_length_strategy: static
+load_weights_only: true
+logw_std_rms_ceiling: 25.0
+logw_std_threshold: 8.0
+logw_std_within_threshold: 6.0
+lr_anneal_time: 10000
+lr_back: 0.0001
+lr_flow: 0.1
+lr_fused: 5.0e-05
+lr_policy: 5.0e-05
+lr_replay: 5.0e-05
+lr_warmup_ratio: 100
+lr_warmup_time: 2000
+max_batch_size: 2500
+min_lr: 1.0e-06
+mle_gate_min_steps: 250
+mle_min_rate: 0.05
+mle_plateau_patience: 5
+mle_rho_max: 0.95
+mle_slope_t: 2.0
+mle_slope_window: 1000
+mlip_path: null
+model:
+  clipping: true
+  cond_hidden_dim: 1024
+  cond_layers: 4
+  condition_embedding_dim: 16
+  dplr_mask_angular: false
+  dplr_rank: 10
+  dplr_rho_max: 0.5
+  dropout: 0
+  flow_hidden_dim: 1024
+  flow_layers: 4
+  full_flow: false
+  gfn_clip: 200.0
+  harmonics_dim: 64
+  learn_pb: true
+  learned_variance: true
+  log_var_range: 6
+  norm: layer
+  pb_drift_range: 0.4
+  pb_var_range: 6
+  periodic_centroids: true
+  policy_hidden_dim: 1024
+  policy_layers: 4
+  s_emb_dim: 1024
+  s_hidden_dim: 1024
+  s_layers: 4
+  t_dim: 64
+  t_hidden_dim: 1024
+  t_scale: 0.05
+  zero_init: false
+molecule_conditioning: false
+molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_prior_dataset.pt
+oom_batch_shrink_factor: 0.6
+oom_cooldown_steps: 200
+override_learning_rates: false
+override_loss_coeffs: false
+phase2_bwd_mle: 0.0
+phase2_bwd_vg_lb: 1.0
+phase2_dynamic_frac: true
+phase2_frac_alpha: 0.05
+phase2_frac_floor: 0.01
+phase2_fwd_frac: 0.5
+phase2_fwd_repeats: 2
+phase2_fwd_vg_lb: 1.0
+prior_model_name: null
+prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_prior_dataset.pt
+replay_loss_coeffs:
+  beta: 10.0
+  db: 0.0
+  emp_z: 0
+  emp_z_persistent: 0
+  freeze_policy: 0.0
+  freeze_z: 1.0
+  loss_clip: 1000000000.0
+  mle: 0.0
+  pf_boost: 0
+  repeats: 1.0
+  subtb: 0.0
+  subtb_lambda: 0.9
+  tb: 1.0
+  traj_grads: 0.0
+  vg_lb: 0
+  vg_lme: 0
+run_name: uncond_july16_h1024_dplr10_T10_clip100.0
+scheduler: true
+seed: 12345
+sg_conditioning: false
+space_groups:
+- 2
+tag: uncond_july16
+tbc_supplementary: 0
+tbc_threshold: 2.0
+temperature_conditioning: false
+terminal_box_violation: 1.0
+terminal_logw_std: 1000.0
+test_molecules_path: null
+unconditional_prior: true
+use_weight_decay: false
+variance_conditioning_phase: true
+vector_conditioning: false
+vector_conditioning_dim: 3
+wass_ceiling: 0.015
+wass_threshold: 0.007
+weight_decay: 5.0e-05
+z_primes:
+- 1
+zp_conditioning: false

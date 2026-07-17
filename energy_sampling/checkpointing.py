@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 
 from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker
-from energy_sampling.utils import atomic_save
+from energy_sampling.utils import atomic_save, normalize_problem_def
 from models import GFN
 
 MODELLER_STATE_DEFAULTS = {
@@ -112,7 +112,7 @@ class Checkpointer:
 
         checkpoint = torch.load(path, map_location='cpu', weights_only=False)
         stored_def = checkpoint.get('problem_def')
-        if stored_def != m.problem_def:
+        if normalize_problem_def(stored_def) != normalize_problem_def(m.problem_def):
             print(f"Checkpoint {path} exists but its stored problem definition "
                   f"doesn't match the current config - starting fresh instead.\n"
                   f"{self.problem_mismatch_report(stored_def)}")
@@ -122,10 +122,11 @@ class Checkpointer:
 
     def problem_mismatch_report(self, stored_def: Optional[dict]) -> str:
         """Readable stored-vs-current problem_def comparison, one line per differing field."""
-        current_def = self.modeller.problem_def
+        current_def = normalize_problem_def(self.modeller.problem_def)
         if stored_def is None:
             return ("  stored:  <none - checkpoint predates problem_def>\n"
                     f"  current: {current_def}")
+        stored_def = normalize_problem_def(stored_def)
         lines = []
         for key in sorted(set(stored_def) | set(current_def)):
             stored_val = stored_def.get(key, '<missing>')
@@ -147,7 +148,7 @@ class Checkpointer:
         self-explanatory config error.
         """
         stored_def = checkpoint.get('problem_def')
-        if stored_def != self.modeller.problem_def:
+        if normalize_problem_def(stored_def) != normalize_problem_def(self.modeller.problem_def):
             raise ValueError(
                 f"{config_key} checkpoint {path} was trained on a different problem "
                 f"than the current config solves - either point {config_key} at a "
@@ -184,7 +185,8 @@ class Checkpointer:
     def buffer_state(self) -> dict:
         m = self.modeller
         return {
-            'problem_hash': m.problem_hash,  # guards against pairing buffers with another problem's checkpoint
+            'problem_def': m.problem_def,  # guards against pairing buffers with another problem's checkpoint
+            'problem_hash': m.problem_hash,  # legacy guard - hash changes whenever the exclusion list grows, the def compare doesn't
             'step_ind': m.step_ind,  # buffers lag their checkpoint by up to eval_period; this reports by how much
             'prior_buffer': m.prior_buffer.state_dict() if hasattr(m, 'prior_buffer') else None,
             'replay_buffer': m.replay_buffer.state_dict() if hasattr(m, 'replay_buffer') else None,
@@ -197,9 +199,17 @@ class Checkpointer:
 
     def restore_buffers(self, state: dict, source: str):
         m = self.modeller
-        if state.get('problem_hash') is not None and state['problem_hash'] != m.problem_hash:
+        # prefer the stored problem_def (compared normalized, so it survives
+        # non-identity keys leaving the definition); older sidecars only carry
+        # the hash, which is exact-def-sensitive but better than no guard
+        stored_def = state.get('problem_def')
+        if stored_def is not None:
+            mismatched = normalize_problem_def(stored_def) != normalize_problem_def(m.problem_def)
+        else:
+            mismatched = state.get('problem_hash') is not None and state['problem_hash'] != m.problem_hash
+        if mismatched:
             print(f"Buffer sidecar {source} was saved under a different problem "
-                  f"({state['problem_hash']} vs {m.problem_hash}) - ignoring it, buffers start fresh")
+                  f"- ignoring it, buffers start fresh")
             return
         if state.get('prior_buffer') is not None:
             m.prior_buffer = CrystalBuffer.from_state_dict(state['prior_buffer'], device='cpu')

@@ -28,21 +28,29 @@ class AdaptiveLRController:
         together) while mode addition is LOCAL (only channels touching the new
         mode degrade), so "most channels breaching together" cleanly separates
         damage from purposeful mode-growth churn -- the confounder is the
-        discriminator;
+        discriminator. The fraction is taken over the channels that could
+        actually vote (see _channels): a dormant or saturated channel is an
+        abstention, not a NO, and counting it in the denominator is what
+        silently disarmed the controller in tngticqq;
       - safety-net-only: it can never strand LR low the way the probe did
         (warmup lands at the configured operating point, and recovery climbs
         back to it after any cut), and it can never scramble fast (the optional
         headroom climb is additive, health-gated, and soft-ceilinged at the
         last cut).
 
-    Phase-agnostic: the scatter/slope channels are meaningful in every phase
-    (spread of the TB residual, Z-invariant), so there is no phase-1 special
-    case. A phase change re-seeds the channel bests and cools down (the loss
-    levels jump) but keeps the running scale -- a phase change is not an LR
-    event, so no re-warmup.
+    Phase-agnostic in FORM (scatter/slope mean the same thing in every phase --
+    spread of the TB residual, Z-invariant -- so there is no phase-1 special
+    case), but not in MEMBERSHIP: which branches are live is a phase/mode-frac
+    fact, so the channel set is recomputed every tick rather than fixed at 6.
+    A phase change re-seeds the channel bests and cools down (the loss levels
+    jump) but keeps the running scale -- a phase change is not an LR event, so
+    no re-warmup.
 
     Config knobs you actually tune: lr_policy/lr_back/lr_replay/lr_fused (the
-    operating LR), breach_fraction (4/6 = 0.67 or 5/6 = 0.83), channel_margin.
+    operating LR), breach_fraction (a fraction of the LIVE channels -- 0.66 is
+    4/6 with all three branches training, 2/3 with only fwd+replay live; note
+    it is a >= test on a ratio, so 0.67 does NOT mean 4/6, it means 5/6),
+    channel_margin.
     Everything else has a sensible default. Enabled iff adaptive_lr.enabled;
     when disabled, step_lr_schedule runs the legacy warmup/anneal (revert).
 
@@ -56,6 +64,14 @@ class AdaptiveLRController:
     # centered covariances) are both Z-shift invariant by construction.
     CHANNEL_METRICS = ('scatter_err', 'slope_err')
     CHANNEL_DIRS = ('fwd', 'bwd', 'replay')
+
+    # Metrics that saturate: past this value the channel is already maximally
+    # damaged and carries no further information (slope_err = |slope-1|, so a
+    # fully decorrelated fit sits at ~1.0 and cannot rise further). A channel
+    # whose running-best is seeded at/near its ceiling can never satisfy
+    # best x channel_margin, so it is silently unbreachable -- see _channels.
+    # scatter_err is unbounded above and has no entry.
+    CHANNEL_CEILING = {'slope_err': 1.0}
 
     def __init__(self, modeller):
         self.modeller = modeller
@@ -71,29 +87,87 @@ class AdaptiveLRController:
 
     # ------------------------------------------------------------------ health
 
-    def _channels(self):
-        """The available Z-invariant health channels this tick: {name: value}
-        over {fwd,bwd,replay} x {scatter_err, slope_err}, skipping any that
-        haven't reported (dormant branch, cold start)."""
+    def _live_dirs(self):
+        """Branches actually being trained right now, with a fresh reading."""
         m = self.modeller
-        out = {}
+        min_frac = self._cfg('channel_min_frac', 0.01)
+        stale_steps = self._cfg('channel_stale_steps', 200)
+        out = set()
         for d in self.CHANNEL_DIRS:
+            if float(getattr(m, f'{d}_frac', 0.0) or 0.0) < min_frac:
+                continue
+            last_it = m.metric_tracker.last_it.get(d)
+            if (last_it is None or m.step_ind is None
+                    or (m.step_ind - last_it) > stale_steps):
+                continue
+            out.add(d)
+        return out
+
+    def _channels(self, st=None):
+        """The RELEVANT Z-invariant health channels this tick: {name: value}
+        over {fwd,bwd,replay} x {scatter_err, slope_err}, skipping any that
+        can't carry evidence about LR damage. A channel is dropped when:
+
+          - it hasn't reported (cold start, never-run branch);
+          - its branch is dormant -- frac below channel_min_frac, or its
+            metric-tracker reading is staler than channel_stale_steps. A
+            dormant branch isn't being trained, so its EMA is a frozen echo of
+            an older policy: it drifts monotonically to its own best and pins
+            elevation at exactly 1.0 forever (tngticqq: bwd_frac 0.001 in
+            phase 3 held bwd/scatter_err + bwd/slope_err at elev 1.000 for the
+            whole run);
+          - the channel is SATURATED -- its running-best already sits so high
+            that best x channel_margin exceeds the metric's ceiling, so no
+            reading can ever breach it (tngticqq: fwd/slope_err re-seeded at
+            0.9466 on the phase 1->3 transition, i.e. already fully
+            decorrelated, needing 1.23 from a metric capped near 1.0).
+
+        This matters because breach_fraction is a fraction: an unbreachable
+        channel is not a neutral abstention, it's a permanent NO vote that
+        silently lowers the ceiling on breach_frac. In tngticqq three of the
+        six were unbreachable, capping breach_frac at 0.5 against a 0.67
+        threshold -- the controller could not fire regardless of the damage.
+        Keeping the denominator to channels that could actually vote is what
+        makes the global-vs-local discriminator mean what it claims."""
+        m = self.modeller
+        margin = self._cfg('channel_margin', 1.3)
+        cb = (st or {}).get('chan_best', {})
+        out = {}
+        for d in self._live_dirs():
             for k in self.CHANNEL_METRICS:
                 v = m.metric_tracker.get(d, k)
-                if v is not None and math.isfinite(v):
-                    out[f'{d}/{k}'] = float(v)
+                if v is None or not math.isfinite(v):
+                    continue
+                name = f'{d}/{k}'
+                ceiling = self.CHANNEL_CEILING.get(k)
+                best = cb.get(name)
+                if ceiling is not None and best is not None and best * margin > ceiling:
+                    continue  # saturated: unbreachable, so it gets no vote
+                out[name] = float(v)
         return out
+
+    def _prune_bests(self, st):
+        """Drop running-bests for branches that have gone dormant, so a branch
+        that later reactivates re-seeds against its own fresh baseline instead
+        of a stale best set by a policy that has since moved on. Saturated
+        channels keep their best: it's what marks them unbreachable, and
+        dropping it would make them re-seed and flicker back into the vote."""
+        live = self._live_dirs()
+        for name in [n for n in st['chan_best'] if n.split('/')[0] not in live]:
+            del st['chan_best'][name]
 
     def _update_bests_and_breach(self, st):
         """Update each channel's running best (a MINIMUM -- lower scatter/slope
         error is better -- that relaxes UPWARD by best_drift/tick so a lucky low
         reading can't pin the bar unreachably), and return (breach_fraction,
         n_available). A channel breaches when its value exceeds its own best x
-        channel_margin: a purely relative, per-channel, scale-free test."""
+        channel_margin: a purely relative, per-channel, scale-free test. Only
+        channels that could actually breach are counted (see _channels)."""
         margin = self._cfg('channel_margin', 1.3)
         drift = self._cfg('best_drift', 0.003)
         cb = st['chan_best']
-        chans = self._channels()
+        self._prune_bests(st)
+        chans = self._channels(st)
         breaches = 0
         for name, val in chans.items():
             prev = cb.get(name)
@@ -135,13 +209,22 @@ class AdaptiveLRController:
                     g['lr'] = max(a.min_lr, base * st['scale'])
 
     def _cut(self, st, new_scale):
-        """Multiplicative decrease. Remember the pre-cut scale as a soft ceiling
-        (only consulted by the headroom climb), arm a cooldown, and clear the
-        streaks so post-cut transients don't immediately re-trigger."""
+        """Multiplicative decrease. The cut level becomes the new CRUISE ceiling,
+        arm a cooldown, and clear the streaks so post-cut transients don't
+        immediately re-trigger.
+
+        The ceiling is the post-cut scale, not the pre-cut one. Pre-cut was
+        useless: below the configured LR the climb caps at 1.0 anyway, so a
+        ceiling recording "where damage was" only ever restated the cap already in
+        force, and the climb walked straight back to the scale that caused the cut
+        (~250 ticks from a 0.5 cut). Cutting is evidence about THIS surface -- the
+        level we cut TO is the level we now believe is safe, so that is what we sit
+        at, and ceiling_relax decides if/how slowly we ever try higher again.
+        """
         m = self.modeller
         floor = m.args.min_lr / m.args.lr_policy
-        st['ceiling'] = st['scale']  # don't headroom-climb back above where damage was
         st['scale'] = float(max(new_scale, floor))
+        st['ceiling'] = st['scale']  # cruise here; ceiling_relax may lift it later
         st['cooldown_until'] = st['tick'] + self._cfg('cooldown_ticks', 20)
         st['last_action_tick'] = st['tick']
         st['breach_streak'] = 0
@@ -153,15 +236,15 @@ class AdaptiveLRController:
         m = self.modeller
         return {
             'ver': 4,  # v4 = safety-net (warmup/hold/cut) -- invalidates v1-v3 probe/cruise state,
-                       # whose 'scale'/'best'/'eta_star' are in incompatible (thrash) semantics
+            # whose 'scale'/'best'/'eta_star' are in incompatible (thrash) semantics
             'phase_seen': phase,
             'scale': 1.0 / m.args.lr_warmup_ratio,  # warmup start; ramps to 1.0 (= configured LR)
             'warmup_done': False,
-            'chan_best': {},       # channel name -> running-best (min, drifts up)
+            'chan_best': {},  # channel name -> running-best (min, drifts up)
             'breach_streak': 0,
             'clean_streak': 0,
             'breach_frac': 0.0,
-            'ceiling': None,       # soft last-cut ceiling for the headroom climb; None until a cut
+            'ceiling': None,  # soft last-cut ceiling for the headroom climb; None until a cut
             'tick': 0,
             'cooldown_until': 0,
             'last_action_tick': 0,
@@ -184,6 +267,39 @@ class AdaptiveLRController:
             st['cooldown_until'] = st['tick'] + self._cfg('cooldown_ticks', 20)
             st['warmup_done'] = True
         return st
+
+    def rearm_warmup(self):
+        """Re-run the blind warmup ramp (1/lr_warmup_ratio -> 1.0 over
+        warmup_ticks) from here, as if the run had just started.
+
+        The generic phase-change branch above deliberately does NOT do this: a
+        phase change is not an LR event, and re-warming on every transition
+        would keep stranding the LR low. The prior-training -> TB changeover is
+        the exception, and the only caller: it is the one boundary where the
+        optimizers are rebuilt (PhaseController._refresh_optimization) onto a
+        loss surface with a completely different curvature, so the first TB
+        step would otherwise land at the full operating LR with empty Adam
+        moments. Ramping in is what makes the changeover survivable without
+        cross-fading the losses themselves.
+
+        Must be called with m.phase already set to its post-transition value,
+        so _state()'s phase-change branch (which forces warmup_done) runs first
+        and this overrides it rather than the other way round."""
+        m = self.modeller
+        if not self.enabled:
+            return  # legacy path owns the ramp via m.lr_warmup_finished
+        st = self._state()
+        st['warmup_done'] = False
+        st['tick'] = 0
+        st['scale'] = 1.0 / m.args.lr_warmup_ratio
+        st['cooldown_until'] = 0
+        st['last_action_tick'] = 0
+        # a soft ceiling left by a phase-1 cut describes damage on the MLE
+        # surface; the ramp is heading back to the operating point regardless,
+        # so an inherited cap would only mis-describe the climb it gates
+        st['ceiling'] = None
+        self._apply_lrs(st)
+        return int(self._cfg('warmup_ticks', 100))
 
     # ------------------------------------------------------------------ tick
 
@@ -222,20 +338,20 @@ class AdaptiveLRController:
                 # CUT: broad, sustained degradation across the reward channels
                 self._cut(st, st['scale'] * self._cfg('cut_ratio', 0.5))
             elif st['clean_streak'] >= self._cfg('climb_patience', 10):
-                # gentle additive climb, health-gated. Recovery to the configured
-                # LR (cap 1.0) is always on -- it undoes spurious cuts and can't
-                # exceed your chosen operating point. Exploring ABOVE it needs
-                # climb_above_base, and is soft-ceilinged at the last cut (which
-                # relaxes up slowly) so a creep past the edge can't be re-entered.
-                climb_above = self._cfg('climb_above_base', False)
-                cap = 1.0
-                if climb_above:
-                    cap = self._cfg('scale_max', 2.0)
-                    ceil = st.get('ceiling')
-                    if ceil is not None:
-                        ceil = min(cap, ceil * (1.0 + self._cfg('ceiling_relax', 0.001)))
-                        st['ceiling'] = ceil
-                        cap = min(cap, ceil)
+                # gentle additive climb, health-gated, hard-capped by the last cut's
+                # soft ceiling. climb_above_base only decides the ABSOLUTE cap
+                # (your LR, or scale_max above it); the ceiling applies in BOTH
+                # regimes, so after a cut we CRUISE at the cut level instead of
+                # walking back into the scale that caused it. ceiling_relax is the
+                # only way back up: 0.0 makes a cut permanent, 0.001/tick takes
+                # ~693 clean ticks (~7k steps) to lift the ceiling 2x -- "after a
+                # good long time, optionally climb slowly".
+                cap = self._cfg('scale_max', 2.0) if self._cfg('climb_above_base', False) else 1.0
+                ceil = st.get('ceiling')
+                if ceil is not None:
+                    ceil = min(cap, ceil * (1.0 + self._cfg('ceiling_relax', 0.001)))
+                    st['ceiling'] = ceil
+                    cap = min(cap, ceil)
                 new_scale = min(st['scale'] + self._cfg('climb_increment', 0.02), cap)
                 if new_scale > st['scale']:
                     st['scale'] = new_scale
@@ -260,7 +376,7 @@ class AdaptiveLRController:
         # channel_margin is a breaching channel -- reads the cut's reasoning
         # straight off the run page.
         cb = st.get('chan_best', {})
-        for name, val in self._channels().items():
+        for name, val in self._channels(st).items():
             b = cb.get(name)
             if b:
                 self._report[f'lr_ctrl/elev_{name}'] = val / b
@@ -268,13 +384,22 @@ class AdaptiveLRController:
     def report(self):
         return dict(self._report)
 
-    def on_explosion(self):
+    def on_explosion(self, count: int = 1):
         """fire_loss_spike hook (replaces the legacy flat 0.75 cut when enabled).
         Runs AFTER the best-checkpoint rewind restored lr_ctrl from healthy
         times, so the cut applies to the pre-damage scale. Same multiplicative
-        cut as a breach, plus a cooldown."""
+        cut as a breach, plus a cooldown.
+
+        count is the number of TERMINAL rewinds so far (1 for an ordinary loss
+        spike), and compounds the cut to cut_ratio**count. The rewind restores
+        this controller's scale from a checkpoint written while the run was still
+        healthy, which necessarily erases the evidence that this very scale
+        already killed the policy -- so a single flat cut is undone by the next
+        clean-streak recovery and the run walks back into the same detonation
+        (djr13t0j's lr_fwd sawtooth). count is the only memory that survives.
+        """
         st = self._state()
-        self._cut(st, st['scale'] * self._cfg('cut_ratio', 0.5))
+        self._cut(st, st['scale'] * (self._cfg('cut_ratio', 0.5) ** max(count, 1)))
         self._apply_lrs(st)
 
 
@@ -536,6 +661,32 @@ class ForwardFirstController:
         m = self.modeller
         return m.metric_tracker.get('fwd', 'r2'), m.metric_tracker.get('fwd', 'scatter_err')
 
+    def _boundary_elevation(self):
+        """
+        Box-containment elevation: fwd/box_violation over the LOWEST containment
+        this run has achieved. Same best x margin idiom as _calib_elevation, and
+        for the same reason -- box_violation's absolute scale carries no
+        information (1219ddv9 ran 0.004 -> 19.8, a 4500x range) but its rise off
+        the floor is the earliest warning in the panel: it moved 4.4x a full ~100
+        steps before r2 collapsed and ~100 before the LR controller's first
+        breach, while still three orders of magnitude below the eventual damage.
+
+        Denominator floored: an early near-zero batch must not pin `best` so low
+        that the ratio is hypersensitive for the rest of the run.
+
+        Returns None when the channel hasn't reported -- runs predating train.py's
+        _update_rolling plumbing, or a cold tracker -- so the branch no-ops rather
+        than crashing.
+        """
+        m = self.modeller
+        cur = m.metric_tracker.get('fwd', 'box_violation')
+        best = m.metric_tracker.get_best('fwd', 'box_violation', mode='min')
+        if cur is None or best is None:
+            return None
+        if not (math.isfinite(cur) and math.isfinite(best)):
+            return None
+        return cur / max(best, self._cfg('boundary_floor', 1e-3))
+
     def _set_fracs(self, bwd_frac):
         m = self.modeller
         floor = m.args.controller.min_mode_frac
@@ -566,8 +717,15 @@ class ForwardFirstController:
         st = m.forward_first_state
         st['stage'] = 'A'
         st['streak'] = 0
+        # phase is already 3 above, so this overrides the phase-change branch's
+        # no-re-warmup rule for this one boundary (see rearm_warmup)
+        warmup_ticks = m.lr_controller.rearm_warmup()
         print(f"forward-first: stage A engaged -- forward+replay build-out, backward dormant "
               f"(fwd {m.fwd_frac:.3f} / replay {m.replay_frac:.3f} / bwd {m.bwd_frac:.4f})")
+        if warmup_ticks:
+            print(f"forward-first: LR re-warming for the TB surface -- "
+                  f"lr_policy/{m.args.lr_warmup_ratio:g} -> lr_policy over "
+                  f"{warmup_ticks} ticks (~{warmup_ticks * 10} train steps)")
 
     def maybe_begin(self):
         """
@@ -624,9 +782,35 @@ class ForwardFirstController:
         replay's frac would abandon calibration outright) and reaches for churn
         instead; see _churn_control.
 
-        bwd needs no special handling: it is never boosted, so _nudge_mode_fracs'
-        EMA decays it to min_mode_frac on its own (dormancy emerges rather than
-        being forced), and bwd_dormant still skips its force-refresh entirely.
+        bwd is normally never boosted, so _nudge_mode_fracs' EMA decays it to
+        min_mode_frac on its own (dormancy emerges rather than being forced) and
+        bwd_dormant skips its force-refresh entirely. The ONE exception is the
+        boundary servo below -- stage A's exclusion of bwd is about COVERAGE
+        (don't grow support before calibrating), not about containment, and the
+        two are separable.
+
+        The boundary servo: 1219ddv9 died with mass in the box wall, and no LR
+        response could touch it -- the controller cut 100x while every channel
+        degraded monotonically, because escape is an objective pull, not a
+        step-size instability. LR is not the actuator for it; bwd_frac is. The
+        wall can only oppose further escape, while bwd is the only force pointing
+        back AT the basin, so admitting bwd exactly when containment slips is the
+        minimum intervention that addresses the actual failure.
+
+        Deliberately ABOVE zerr in the chain: containment is causally upstream of
+        calibration. In 1219ddv9 the boundary moved at 6800 while Z was still
+        fine; by the time Z degrades you are calibrating against a distribution
+        that is about to stop existing. Getting this order wrong costs the run.
+
+        Bang-bang, not proportional, and that is enough because _nudge_mode_facs
+        is ALREADY bidirectional: when the drift stops, 'bwd' stops firing, the
+        EMA decays bwd back to min_mode_frac on its own, and the servo's output
+        returns to zero. So this is NOT a ratchet -- no new one-way mechanism is
+        introduced, and while fwd is healthy and off the wall the branch never
+        fires and stage A behaves exactly as before. bwd_dormant needs no change:
+        train.py's bwd_active (bwd_frac >= deactivate_threshold) admits the real
+        backward branch on frac alone, and dormant only ever skipped the
+        stats-refresh rollout, which is moot once bwd is genuinely training.
         """
         m = self.modeller
         ctrl = m.args.controller
@@ -634,9 +818,12 @@ class ForwardFirstController:
         zerr = self._zerr()
         elev = self._calib_elevation(st)
         over = m.metric_tracker.get('fwd', 'over_coverage')
+        boundary = self._boundary_elevation()
 
-        if zerr is not None and zerr > ctrl.zerr_threshold:
-            state = 'fwd'   # Z is the ruler: calibrate it first, here as everywhere
+        if boundary is not None and boundary > self._cfg('boundary_margin', 3.0):
+            state = 'bwd'  # containment first: nothing downstream survives escape
+        elif zerr is not None and zerr > ctrl.zerr_threshold:
+            state = 'fwd'  # Z is the ruler: calibrate it first, here as everywhere
         elif (((elev is not None and elev > self._cfg('calib_margin', 1.3))
                or (over is not None and math.isfinite(over) and over > ctrl.over_threshold))
               and not self._replay_outcompeting()):
@@ -764,7 +951,7 @@ class ForwardFirstController:
         rec = st.setdefault('floors', {}).setdefault(
             name, {'best': value, 'stall': 0, 'floored': False})
         if value < rec['best'] * (1.0 - self._cfg('floor_improve_frac', 0.02)):
-            rec['best'] = value       # still responding
+            rec['best'] = value  # still responding
             rec['stall'] = 0
             rec['floored'] = False
         elif value > rec['best'] * (1.0 + self._cfg('floor_reset_frac', 0.5)):

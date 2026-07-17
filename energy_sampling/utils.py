@@ -176,9 +176,12 @@ def _to_plain(obj):
 
 
 
-# energy_config fields that are never varied in practice - excluded from the
-# problem definition so changing them doesn't invalidate checkpoint reuse
-_CONSTANT_ENERGY_CONFIG_KEYS = ('density_coeff', 'bounding_coeff', 'reduction_coeff', 'lj_coeff')
+# energy_config fields excluded from the problem definition so changing them
+# doesn't invalidate checkpoint reuse: the coeffs because they're never varied
+# in practice, reward_range because it's a reward-shaping/training knob layered
+# on top of the same energy landscape rather than part of its identity
+_NON_IDENTITY_ENERGY_CONFIG_KEYS = ('density_coeff', 'bounding_coeff', 'reduction_coeff', 'lj_coeff',
+                                    'reward_range')
 
 
 def get_problem_definition(args) -> dict:
@@ -192,7 +195,7 @@ def get_problem_definition(args) -> dict:
     len(space_groups) > 1 / len(z_primes) > 1, which are already captured here.
     """
     energy_config = _to_plain(args.energy_config)
-    for key in _CONSTANT_ENERGY_CONFIG_KEYS:
+    for key in _NON_IDENTITY_ENERGY_CONFIG_KEYS:
         energy_config.pop(key, None)
 
     return _to_plain({
@@ -204,6 +207,26 @@ def get_problem_definition(args) -> dict:
         'mol_cond': args.molecule_conditioning,
         'temp_cond': args.temperature_conditioning,
     })
+
+
+def normalize_problem_def(problem_def):
+    """
+    Strip the non-identity energy_config keys from a problem_def dict.
+    Freshly built defs never contain them (get_problem_definition pops them),
+    but defs stored inside checkpoints keep whatever the exclusion list looked
+    like at save time - so compatibility checks must normalize BOTH sides
+    before comparing, or growing the exclusion list would orphan every
+    checkpoint saved before the key was excluded.
+    """
+    if not isinstance(problem_def, dict):
+        return problem_def
+    normalized = dict(problem_def)
+    if isinstance(normalized.get('energy_config'), dict):
+        energy_config = dict(normalized['energy_config'])
+        for key in _NON_IDENTITY_ENERGY_CONFIG_KEYS:
+            energy_config.pop(key, None)
+        normalized['energy_config'] = energy_config
+    return normalized
 
 
 def problem_hash(problem_def: dict, n_chars: int = 6) -> str:

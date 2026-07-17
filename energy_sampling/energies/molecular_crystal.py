@@ -20,15 +20,18 @@ from mxtaltools.mlip_interfaces.AL_mace_utils import load_mace_model
 from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 
 
-def density_penalty(packing_coeff):
+def density_penalty(packing_coeff, turnover = 1):
     """
     draw crystals into the physically reasonable region
     :param packing_coeff:
     :return:
     """
-    cp = packing_coeff.clip(min=0.1, max=2)  # clip here for safety - this loss term can explode
-    return F.relu(-(torch.log(cp) - np.log(0.55))) ** 2 + F.relu(cp - 0.95) ** 2
-
+    cp = packing_coeff.clamp_min(1e-6)          # numerical guard only, NOT a gradient cap
+    u = F.relu(np.log(0.55) - torch.log(cp))    # >0 when too loose; 0 in the physical region
+    # quadratic onset, linear tail: C1 at u == turnover
+    loose = torch.where(u <= turnover, u ** 2,
+                        turnover ** 2 + 2 * turnover * (u - turnover))
+    return loose + F.relu(cp - 0.95) ** 2
 
 def soften_high(energy, turnover_pot, coeff, clip: Optional[float] = None):
     # soften the repulsion
@@ -253,8 +256,9 @@ class MolecularCrystal(BaseSet):
             lower_violation = F.relu(-(raw_latents + 1))
             # quadratic term gives a gentle, zero-slope onset right at the boundary; quartic
             # term steepens the wall for larger excursions without sharpening that onset
-            bounding_energy = (upper_violation ** 2 + upper_violation ** 4 +
-                               lower_violation ** 2 + lower_violation ** 4).sum(
+            bounding_energy = (upper_violation ** 2# + upper_violation ** 4
+                               + lower_violation ** 2# + lower_violation ** 4
+                               ).sum(
                 dim=-1)  # discourage exploration beyond clip range
         else:
             bounding_energy = torch.zeros_like(latents[:, 0])
@@ -267,7 +271,7 @@ class MolecularCrystal(BaseSet):
         # matching the same compensation already applied to jacobian_energy below
         bounding_energy = bounding_energy * temperature
 
-        if self.energy_function in ['lj', 'qlj', 'elj', 'silu', 'uma', 'mace']:
+        if self.is_crystal:
             density_energy = density_penalty(crystal_batch.packing_coeff)
             mol_energy = getattr(crystal_batch, self.energy_function)
             if self.energy_function not in ['uma', 'mace']:

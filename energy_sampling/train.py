@@ -37,6 +37,7 @@ from energy_sampling.utils import is_cuda_oom, get_annealing_factor, \
     cal_subtb_coef_matrix, within_condition_logw_std
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss, log_pf_estimate
 from models import GFN
+from energy_sampling.models.aunit_periodicity import sg_periodic_centroid_axes, describe
 from mxtaltools.common.training_utils import flatten_wandb_params
 from mxtaltools.dataset_utils.utils import collate_data_list
 from utils import get_train_args, get_gfn_init_state, set_seed, \
@@ -140,6 +141,11 @@ class Modeller:
                               'bwd': self.bwd_loss_monitor,
                               'replay': self.replay_loss_monitor,
                               'fused': self.fused_loss_monitor}
+        # counts TERMINAL reloads only (not ordinary loss spikes), and deliberately
+        # does NOT live in MODELLER_STATE_DEFAULTS: fire_loss_spike restores modeller
+        # state from the healthy checkpoint, so anything tracked there is wiped by the
+        # very event this needs to remember. See _terminal_policy_state.
+        self.terminal_reloads = 0
 
     def init_train_constants(self):
         for k, v in MODELLER_STATE_DEFAULTS.items():
@@ -803,11 +809,38 @@ class Modeller:
         p /= p.sum()
         return p
 
+    def _resolve_periodic_centroid_axes(self):
+        """
+        Which aunit centroid axes may be wrapped. Returns None when the feature is off.
+
+        Which axes are periodic is a property of the space group, so this makes the model
+        space-group specific: we require exactly one. Intersecting over several would
+        "work", but it would quietly hand back a weaker (possibly empty) wrap instead of
+        surfacing that the config asked for something this feature doesn't cover.
+        """
+        if not getattr(self.args.model, 'periodic_centroids', False):
+            return None
+        if not self.energy_function.is_crystal:
+            raise ValueError("model.periodic_centroids is a molecular-crystal feature, but "
+                             f"energy_function={self.args.energy_function!r} is not a crystal")
+        if len(self.args.space_groups) != 1:
+            raise ValueError(
+                "model.periodic_centroids makes the model space-group specific, so it needs "
+                f"exactly one entry in space_groups; got {list(self.args.space_groups)}")
+        sg = int(self.args.space_groups[0])
+        axes = sg_periodic_centroid_axes(sg)
+        print(describe(sg))
+        if not axes:
+            print(f"WARNING: model.periodic_centroids is on but SG{sg} has no full-width "
+                  "(auv == 1) aunit axis -- no centroid dim will be wrapped")
+        return axes
+
     def _build_gfn_config(self):
         return dict(
             dim=self.energy_function.data_ndim,
             conditions_dim=self.get_conditioning_dim(),
             conditions_type='molecule' if self.args.molecule_conditioning else 'vector',
+            periodic_centroid_axes=self._resolve_periodic_centroid_axes(),
             conditional=any([
                 self.args.temperature_conditioning,
                 self.args.molecule_conditioning,
@@ -961,11 +994,6 @@ class Modeller:
             # (it used to apply after, leaving the re-analyzed gfn_energy stamps in
             # config units).
             self.energy_function.lj_coeff = prior_data['thermal_scaling_factor']
-            print(f"lj_coeff OVERRIDDEN by prior dataset thermal_scaling_factor: "
-                  f"{self.args.energy_config.lj_coeff} (config) -> "
-                  f"{self.energy_function.lj_coeff:.4f}; effective kT = "
-                  f"{self.args.energy_config.temperature / self.energy_function.lj_coeff:.3f} "
-                  f"in raw {self.args.energy_function} units")
         if True:  # not hasattr(prior, self.args.energy_function):
             print("Re-analyzing prior energies")
             prior = prior.to(self.device)
@@ -1159,7 +1187,7 @@ class Modeller:
                     # this is the pre-transition buffer state, and a transition
                     # freezes its own tagged copy on top (_snapshot_pre_transition)
                     self.checkpointer.save_buffers()
-                    metrics.update(self.evaluation())
+                    metrics.update(self.evaluation(override_do_figs = self.mle_gate.get('request_eval', False)))
 
                 if len(metrics) > 0:
                     wandb.log(metrics, step=self.step_ind, commit=True)
@@ -1178,11 +1206,56 @@ class Modeller:
             self.checkpointer.save('final', with_buffers=True)
             print("Finished Training!")
 
+    def _terminal_policy_state(self):
+        """
+        Standalone terminal-failure detector: the policy is emitting numerically
+        absurd samples and is not coming back on its own. Returns a reason string
+        (truthy) or None.
+
+        Distinct from LossSpikeMonitor, and deliberately so. That monitor is
+        RELATIVE -- a spike against its own rolling median -- which makes it blind
+        exactly when it matters most: a few hundred steps at logw_std ~1e5 and that
+        IS the median, so nothing reads as a spike any more and the run grinds on
+        producing garbage. These are ABSOLUTE bounds. Not "worse than lately" but
+        "no longer physics".
+
+        Two channels OR'd, because the two observed deaths do not look alike:
+          djr13t0j  detonation -- logw_std 8.6 -> 1.8e5 inside 100 steps; box
+                    violation 0.0012 -> ~1100 inside ONE eval interval.
+          1219ddv9  slow creep -- logw_std only ever reached ~994 (under the bound),
+                    but box_violation climbed to 19.8 over ~3000 steps.
+        Neither channel catches both; together they catch both. Observed healthy
+        ranges are logw_std 8-46 and box_violation 0.001-0.004, so each bound sits
+        >20x above anything legitimate and >100x below the observed death, which is
+        as wide a margin as this failure offers. NOT an early warning -- the policy
+        variance channels move only 0.85 nats at the kill vs 1.2 nats on a benign
+        excursion, so nothing here leads; it is a terminal-state detector, and the
+        actuator is a rewind, not a nudge.
+
+        Reads 'fwd' only: bwd/replay share the same policy network, so a genuine
+        policy blowup shows up here regardless of which branch is stepping.
+        """
+        t = self.metric_tracker
+        bounds = (('logw_std', getattr(self.args, 'terminal_logw_std', 1000.0)),
+                  ('box_violation', getattr(self.args, 'terminal_box_violation', 1.0)))
+        for name, bound in bounds:
+            v = t.get('fwd', name)
+            if v is None or bound is None:
+                continue
+            if not math.isfinite(v) or v > bound:
+                return f"fwd/{name}={v:.4g} (bound {bound:g})"
+        return None
+
     def monitor_losses(self, current_loss, step_type):
         if current_loss is not None:
             trig = self.loss_monitors[step_type].record(current_loss, self.step_ind)
 
-            if trig:
+            terminal = self._terminal_policy_state()
+            if terminal is not None:
+                print(f"TERMINAL policy state at step {self.step_ind}: {terminal} "
+                      f"-- rewinding to best and ratcheting LR down")
+                self.fire_loss_spike(terminal=True)
+            elif trig:
                 self.fire_loss_spike()
 
             current_fwd = self.metric_tracker.get('fwd', 'r2')
@@ -1195,8 +1268,30 @@ class Modeller:
                 total = (current_fwd or 0) + (current_bwd or 0) + (current_replay or 0)
                 self.combo_loss_record.append(3 - total)  # (1-x) + (1-y) + (1-z) = 3-x-y-z
 
-    def fire_loss_spike(self):
-        print("Firing LR spike & recovery")
+    def fire_loss_spike(self, terminal: bool = False):
+        """
+        Rewind to the best checkpoint and cut LR.
+
+        terminal=True marks a _terminal_policy_state rewind rather than an
+        ordinary loss spike, and ratchets the LR cut by the number of terminal
+        rewinds so far. That ratchet exists because of a real loop: set_state_dict
+        below restores lr_ctrl from the HEALTHY checkpoint (deliberately -- we want
+        to cut from the pre-damage scale, not the exploded one), which also wipes
+        every record that this LR already detonated once. So without a counter the
+        cycle is: restore scale -> cut once -> controller's clean-streak recovery
+        walks it straight back to the same scale -> detonate -> restore -> ...
+        forever, which is exactly the lr_fwd sawtooth in djr13t0j. Explosion n now
+        cuts to cut_ratio**n, so the ceiling actually descends.
+
+        A one-way ratchet is the right shape HERE, unlike the threshold anneal it
+        superficially resembles: it is driven by an unambiguous catastrophic event,
+        not by a marginal metric, so it cannot creep its way into a permanent
+        breach -- it only moves when the policy has already died.
+        """
+        if terminal:
+            self.terminal_reloads += 1
+        print("Firing LR spike & recovery"
+              + (f" (TERMINAL rewind #{self.terminal_reloads})" if terminal else ""))
         running_checkpoint_path = self.checkpointer.path_for('best')
         if os.path.exists(running_checkpoint_path):
             self.checkpointer.load_model_only(running_checkpoint_path,
@@ -1220,11 +1315,17 @@ class Modeller:
 
         if self.lr_controller.enabled:
             # set_state_dict above restored lr_ctrl from the (healthy) best
-            # checkpoint; cut from that pre-damage scale, not the exploded one
-            self.lr_controller.on_explosion()
+            # checkpoint; cut from that pre-damage scale, not the exploded one.
+            # terminal_reloads carries the one thing that restore just erased --
+            # that this scale has already detonated N times -- so the cut compounds
+            # instead of being re-litigated from scratch every rewind. Ordinary
+            # spikes keep their single flat cut: they are recoverable events, and
+            # inheriting the terminal ratchet's depth would let unrelated noise
+            # inherit a punishment meant for a death.
+            self.lr_controller.on_explosion(count=self.terminal_reloads if terminal else 1)
             return
 
-        lr_cut_val = 0.75
+        lr_cut_val = 0.75 ** (self.terminal_reloads if terminal else 1)
 
         for key, opt in self.optimizers.items():
             # opt.state = defaultdict(dict)  # wipe momentum buffers too
@@ -1582,6 +1683,21 @@ class Modeller:
                 loss_dict['log_pf'], loss_dict['log_pb'], loss_dict['log_r'], cid)
             if math.isfinite(within):
                 stats['logw_std_within'] = within
+        # box containment on the TRAIN-step cadence. 'Mean bounding_energy' exists
+        # already but is EVAL-cadence (log_thermo_properties loops the eval batch),
+        # far too coarse to gate a controller on: in 1219ddv9 boundary drift led the
+        # r2 collapse by ~100 steps and unrecoverability by ~1300, so the warning
+        # window is shorter than the eval interval. Mirrors generator_energy's
+        # bounding_energy -- relu(|x|-1)^2 summed over dims, pre-temperature and
+        # pre-bounding_coeff -- but read straight off the terminal latents, so it
+        # costs no extra energy evaluation. contact_frac is the bounded companion:
+        # box_violation spans 4500x over a run and says nothing on its own about how
+        # much of the batch is involved.
+        states = loss_dict.get('flow_states')
+        if states is not None and states.ndim == 3:
+            viol = (states[:, -1].abs() - 1.0).clamp(min=0.0)
+            stats['box_violation'] = (viol ** 2).sum(dim=-1).mean().item()
+            stats['box_contact_frac'] = (viol > 0).any(dim=-1).float().mean().item()
         self.metric_tracker.update(sub_type, stats, self.step_ind)
 
     def step_loss(self, step_type, loss, do_step: bool = True):
@@ -2096,15 +2212,35 @@ class Modeller:
         last reset, so a long shallow descent (the hard systems' MLE tail)
         accumulates enough to beat any min_delta every few evals and resets
         its patience forever. The slope is least-squares fit over the last
-        mle_slope_window TRAIN STEPS of gate samples (one per 10 steps) and
-        normalized by the smoothed curve's observed dynamic range
-        (ema_max - ema_min), giving a scale-free descent rate in
-        range-fractions per 100 train steps (~one tracker EMA time
-        constant); the absolute MLE level carries the target's differential
-        entropy, so +5-plateau and -25-plateau systems need no retuning.
-        'Flat' = descending slower than mle_slope_eps; a RISING MLE
-        (double-decay onset / overfitting) also counts as flat, since it's
-        an exit signal, not progress. mle_plateau_patience consecutive flat
+        mle_slope_window TRAIN STEPS of gate samples (one per 10 steps).
+        'Flat' = an EQUIVALENCE test on that slope: the upper mle_slope_t
+        sigma bound on the descent rate lies below mle_min_rate, i.e. we are
+        confident further training buys less than a negligible rate. A
+        RISING MLE (double-decay onset / overfitting) also counts as flat,
+        since it's an exit signal, not progress.
+
+        Deliberately NOT a significance test on the slope. 'Descent is not
+        significantly nonzero' also holds when the data is uninformative,
+        so such a gate fires hardest exactly where it knows least -- a
+        window straddling a reload/LR-warmup transient has huge residuals,
+        so the standard error swamps the trend and the gate reads 'flat'
+        while the MLE is visibly descending. Bounding the rate makes noise
+        argue against exiting instead: an uncertain window cannot clear the
+        bound.
+
+        The rate is in nats per 100 train steps and needs no normalization:
+        the MLE LEVEL carries the target's differential entropy (so +5- and
+        -25-plateau systems differ), but the RATE does not -- nats are nats.
+        This replaces an earlier rate normalized by the EMA's dynamic range
+        (ema_max - ema_min), whose denominator is dominated by the initial
+        transient: an init artifact that inflates for the rest of the run
+        and silently tightens the threshold the worse the init was.
+
+        Because the samples are an EMA, the standard error carries an AR(1)
+        effective-sample-size correction -- see the inline note; without it
+        the gate credits itself ~4x more precision than it has.
+
+        mle_plateau_patience consecutive flat
         checks LATCH self.mle_gate['flat'] and request an immediate eval
         (train loop honors 'request_eval' once), so the wass/tbc-gated
         transition runs against a fresh eval right at the plateau instead of
@@ -2118,29 +2254,99 @@ class Modeller:
         cur = self.metric_tracker.get('bwd', 'mle')
         if cur is None or self.step_ind < getattr(self.args, 'mle_gate_min_steps', 250):
             return metrics
-        checks = max(int(getattr(self.args, 'mle_slope_window', 150)) // 10, 2)
+        checks = max(int(getattr(self.args, 'mle_slope_window', 1000)) // 10, 2)
         window = self.mle_gate.setdefault('window', [])
         window.append(cur)
         del window[:-checks]
         if len(window) < checks:
+            # No evidence yet, so a 'flat' inherited from a checkpoint cannot be
+            # tested and must not stand: 'flat' rides in MODELLER_STATE_DEFAULTS by
+            # design, and while the window normally rides with it (a latch implies a
+            # full window), it does NOT after mle_slope_window is lengthened -- every
+            # older checkpoint then loads a short window and would spend `checks`
+            # steps with a stale latch that the un-latch below never gets to clear,
+            # leaving wass/tbc as the only real phase-1 exit gate. That is exactly
+            # how lcmft1z4 exited at step 1260 while its MLE was still descending.
+            # A genuinely plateaued resume simply re-proves it over one window.
+            self.mle_gate['flat'] = False
+            self.mle_gate['stall'] = 0
             return metrics
-        lo = self.metric_tracker.get_best('bwd', 'mle', mode='min', default=cur)
-        hi = self.metric_tracker.get_best('bwd', 'mle', mode='max', default=cur)
-        slope = np.polyfit(np.arange(len(window)), window, 1)[0]  # per check = per 10 steps
-        slope_norm = -slope * 10.0 / max(hi - lo, 1e-12)  # range-fraction per 100 steps; >0 = descending
-        if slope_norm < getattr(self.args, 'mle_slope_eps', 0.001):
+        y = np.asarray(window, dtype=float)
+        n = len(y)
+        x = np.arange(n, dtype=float)
+        slope, intercept = np.polyfit(x, y, 1)  # slope per check = per 10 steps
+        resid = y - (slope * x + intercept)
+        # OLS standard error of the slope
+        sxx = float(((x - x.mean()) ** 2).sum())
+        s2 = float((resid ** 2).sum()) / max(n - 2, 1)
+        se = np.sqrt(s2 / sxx) if sxx > 0 and s2 > 0 else 0.0
+        # AR(1) correction. `cur` is a 100-step-time-constant EMA sampled every 10
+        # steps, so its residuals are ~exp(-10/100) = 0.9 autocorrelated and OLS
+        # (which assumes independence) understates the slope's true uncertainty by
+        # ~4x. Inflate by the effective-sample-size factor (1+r)/(1-r): at r = 0.9 a
+        # 50-sample window carries only ~2.6 independent samples. rho is clamped
+        # because it is itself estimated from few samples and the factor diverges
+        # as r -> 1.
+        rho = 0.0
+        if n > 3 and resid.std() > 0:
+            rho = float(np.corrcoef(resid[:-1], resid[1:])[0, 1])
+        if not np.isfinite(rho):
+            rho = 0.0
+        rho = min(max(rho, 0.0), float(getattr(self.args, 'mle_rho_max', 0.95)))
+        se *= np.sqrt((1.0 + rho) / (1.0 - rho))
+        rate = -slope * 10.0  # nats per 100 train steps; > 0 = descending = improving
+        se_rate = se * 10.0
+        # EQUIVALENCE test, not a significance test: flat = the UPPER confidence
+        # bound on the descent is below a negligible rate. Testing instead whether
+        # the descent is significantly nonzero (t = rate / se_rate < t_min) is the
+        # absence-of-evidence fallacy and fires on uninformative data: a window
+        # straddling a reload/LR-warmup transient has enormous residuals, so se_rate
+        # swamps the trend and the gate reads 'flat' while the MLE is visibly
+        # descending. lcmft1z4 at step 1250 had rate +0.96 nats/100 (descending
+        # hard) yet t = 1.09, and a significance gate exits there. Bounding the rate
+        # instead makes noise ARGUE AGAINST exiting, which is the safe direction: an
+        # uncertain window cannot clear the bound.
+        #
+        # A RISING MLE (double-decay onset / overfitting) still counts as flat --
+        # rate < 0 puts the whole interval below min_rate -- since that's an exit
+        # signal, not progress.
+        #
+        # Units are nats per 100 train steps. Unlike the MLE LEVEL (which carries
+        # the target's differential entropy and so varies by system), the RATE needs
+        # no normalization: nats are nats. That is what the old
+        # rate / (ema_max - ema_min) was reaching for, but its denominator was set
+        # by the initial transient -- an init artifact that inflates for the rest of
+        # the run and silently tightens the threshold the worse the init was.
+        rate_hi = rate + float(getattr(self.args, 'mle_slope_t', 2.0)) * se_rate
+        t_stat = rate / se_rate if se_rate > 0 else np.inf  # logged as a diagnostic only
+        if rate_hi < float(getattr(self.args, 'mle_min_rate', 0.05)):
             self.mle_gate['stall'] = self.mle_gate.get('stall', 0) + 1
         else:
+            # MLE is significantly descending again, so any earlier 'flat' no
+            # longer describes the curve: re-arm rather than leave it latched.
+            # 'flat' rides in checkpoints by design (MODELLER_STATE_DEFAULTS), so
+            # without this a stale latch from the run that WROTE the checkpoint
+            # permits the phase-1 exit forever after, leaving wass/tbc as the only
+            # real gate. lcmft1z4 reloaded a prior warm-start with flat already
+            # true and exited at step 1260 on wass alone, while MLE was still
+            # descending and 5.8 nats below the level it latched at. A resume whose
+            # MLE is genuinely still plateaued keeps stalling and keeps flat -- only
+            # a real resumed descent clears it.
             self.mle_gate['stall'] = 0
+            self.mle_gate['flat'] = False
         if (not self.mle_gate.get('flat', False)
                 and self.mle_gate['stall'] >= getattr(self.args, 'mle_plateau_patience', 3)):
             self.mle_gate['flat'] = True
             self.mle_gate['request_eval'] = True
-        metrics['mle_gate_slope'] = slope_norm
+        metrics['mle_gate_rate'] = rate  # nats/100 train steps; > 0 = improving
+        metrics['mle_gate_rate_se'] = se_rate
+        metrics['mle_gate_rate_hi'] = rate_hi  # the quantity actually tested
+        metrics['mle_gate_t'] = t_stat
+        metrics['mle_gate_rho'] = rho
         metrics['mle_gate_stall'] = self.mle_gate['stall']
         return metrics
 
-    def evaluation(self):
+    def evaluation(self, override_do_figs: bool = False):
         metrics = {}
         # this eval satisfies any pending pulled-forward request, whatever set
         # it: the phase-1 MLE gate, or a reloaded 'phase1_exit'/'phase2_exit'
@@ -2167,7 +2373,7 @@ class Modeller:
         metrics.update(self.log_metrics(fwd_stats, bwd_stats, sample_batch))
 
         self.times['eval_figs_start'] = time()
-        if do_figs:
+        if do_figs or override_do_figs:
             x, y = next(self.prior_dataset.loader(batch_size=10000, mode='tensors'))
             anchor_buffer = getattr(self, 'anchor_buffer', None)
             anchor_latents = (anchor_buffer.x.detach().cpu().numpy()
