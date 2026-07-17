@@ -178,9 +178,9 @@ logw_std_within_threshold: 6.0
 lr_anneal_time: 10000
 lr_back: 0.0001
 lr_flow: 0.1
-lr_fused: 5.0e-05
-lr_policy: 5.0e-05
-lr_replay: 5.0e-05
+lr_fused: 1.0e-05
+lr_policy: 1.0e-05
+lr_replay: 1.0e-05
 lr_warmup_ratio: 100
 lr_warmup_time: 2000
 max_batch_size: 2500

@@ -21,12 +21,12 @@ override_learning_rates: false  # if true, overwrite just the numeric LR restore
 
 #Optimizers
 ################################################################
-lr_policy: 5.0e-5              # learning rate of the policy network -- the OPERATING LR now (v4 safety-net controller warms up TO this and holds here; scale=1.0 == this value). Not a ceiling. mipcas A/B: 7.5e-5 flat-stable, ~3e-4 the edge; toys more forgiving. If lr_ctrl/breach_frac never trips, nudge up next run; if it cuts early, too high
+lr_policy: 1.0e-5              # learning rate of the policy network -- the OPERATING LR now (v4 safety-net controller warms up TO this and holds here; scale=1.0 == this value). Not a ceiling. mipcas A/B: 7.5e-5 flat-stable, ~3e-4 the edge; toys more forgiving. If lr_ctrl/breach_frac never trips, nudge up next run; if it cuts early, too high
 min_lr: 1.0e-6                # ihn
 lr_flow: 0.1                # learning rate of the flow network -- can be rather large for unconditional problems
 lr_back: 1.0e-4                # learning rate of the backward pass (operating LR, see lr_policy). MLE tolerates a HIGHER LR than TB -- structurally, not by luck: TB is on-policy (a bad step relocates the sample distribution, so the next gradient is computed from worse samples), carries an unbounded -log R in a SQUARED residual, and sums log_pf over T steps. MLE has none of the four; its data is fixed and it never evaluates the energy. So an MLE-measured LR is always an UPPER BOUND on TB's, and phase 1 (not fused -> rides this knob via bwd) can keep 1e-4 while phase 3 (fused -> lr_fused) must not
-lr_replay: 5.0e-5               # learning rate of the trajectory replay pass (operating LR, see lr_policy)
-lr_fused: 5.0e-5                # learning rate of the fused fwd/bwd/replay pass (operating LR, see lr_policy)
+lr_replay: 1.0e-5               # learning rate of the trajectory replay pass (operating LR, see lr_policy)
+lr_fused: 1.0e-5                # learning rate of the fused fwd/bwd/replay pass (operating LR, see lr_policy)
 lr_warmup_ratio: 100           # how much smaller the initial (warmup) LR should be than the max policy value
 scheduler: True               # does LR warmup from lr/lr_warup_ratio -> lr -> min_lr over the warmup and annealing period
 lr_warmup_time: 2000

@@ -312,15 +312,28 @@ class AdaptiveLRController:
         in_cooldown = st['tick'] < st['cooldown_until']
 
         warmup_ticks = int(self._cfg('warmup_ticks', 100))
+        # the warmup TARGET is the cruise ceiling, not a blind 1.0. fire_loss_spike
+        # restores lr_ctrl from the best checkpoint, which re-arms warmup -- so
+        # without this cap a rewind re-ramps straight back through the ceiling the
+        # cut just set and into the scale that caused it (fn6erccw: two terminal
+        # rewinds set ceiling 0.397 then 0.199, and scale was back at 1.0 within
+        # ~50 steps of each -- 5x its own ceiling). The climb branch below already
+        # respects the ceiling but never runs while breach_frac keeps clean_streak
+        # at 0, so warmup is the ONLY path back up after a rewind, and it has to
+        # honour the cap. ceiling is None on a genuine phase change (_state clears
+        # it: a cut on the previous surface doesn't describe this one), so a normal
+        # phase-transition warmup still targets 1.0 exactly as before.
+        ceil = st.get('ceiling')
+        target = 1.0 if ceil is None else min(1.0, ceil)
         if not st.get('warmup_done'):
-            # blind exponential ramp (1/warmup_ratio -> 1.0); metrics are still
+            # blind exponential ramp (1/warmup_ratio -> target); metrics are still
             # warming and the LR itself is moving, so no breach logic here. Bests
             # seed lazily at HOLD entry, off the near-operating-LR baseline.
             frac = min(1.0, st['tick'] / max(1, warmup_ticks))
-            st['scale'] = (1.0 / m.args.lr_warmup_ratio) ** (1.0 - frac)
+            st['scale'] = min((1.0 / m.args.lr_warmup_ratio) ** (1.0 - frac), target)
             if st['tick'] >= warmup_ticks:
                 st['warmup_done'] = True
-                st['scale'] = 1.0
+                st['scale'] = target
             self._apply_lrs(st)
             self._emit(st, warmup=True, breach_frac=0.0, n_avail=0)
             return m.optimizers['fwd'].param_groups[0]['lr']
