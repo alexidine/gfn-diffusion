@@ -1,5 +1,5 @@
-run_name: 'mk_dev'
-tag: 'dev'
+run_name: 'uncond_july17'
+tag: 'uncond_july17'
 seed: 12345
 device: 'cuda'
 cuda_memory_fraction: 0.9
@@ -9,10 +9,10 @@ anomaly_detection: false  # dramatic slowdown when True
 ################################################################
 continue_from_checkpoint: false
 mlip_path: null #'D:\crystal_datasets\esen_s.pt' # C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model
-prior_path: D:\crystal_datasets\conditional\priors\toy_2harm_prior.pt
-molecules_path: D:\crystal_datasets\conditional\priors\toy_2harm_conditions.pt
+prior_path: /scratch/mk8347/data/crystal_datasets/priors/toy_2harm_prior.pt
+molecules_path: /scratch/mk8347/data/crystal_datasets/priors/toy_2harm_conditions.pt
 test_molecules_path: null
-checkpoints_dir: 'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints'
+checkpoints_dir: '/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/'
 checkpoint_name: null #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-88792d_phase1_exit #dev_mk_dev_latent_harmonic-toy_2cond_prior-T1-48d154_prior.pt #dev_mk_dev_latent_multiharmonic-toy_2cond_prior-T1-73224a_prior.pt
 prior_model_name: null #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-88792d_prior.pt #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-88792d_prior.pt #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-88792d_prior.pt #dev_mk_dev_latent_harmonic-toy_2cond_prior-T1-48d154_prior.pt #dev_mk_dev_latent_multiharmonic-toy_2cond_prior-T1-73224a_prior.pt
 # prior_model_name loads a SEPARATE frozen GFN used only for prior-buffer sampling. It is rebuilt from its
@@ -141,7 +141,7 @@ model:
 ################################################################
 batch_size: 25              # number of samples per training batch -- single shared batch size for all rollout work (train fwd/bwd/replay/fused AND eval sampling), so there's one adaptive value reacting to OOMs instead of several independently-tuned ones
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 2500
+max_batch_size: 50000        # A100 battery: cluster kills under-utilized jobs, so let the adaptive growth run all the way up (OOM backoff finds the real ceiling)
 batch_growth_increment: 1.01  # fast growth rate used before we've ever hit an OOM this run (slow-start) - GROWS FAST! # 1 is static, 1.1 10% growth, etc.
 batch_growth_slow_increment: 1.002  # much slower growth rate used once we've OOM'd at least once and are past cooldown - avoids immediately re-triggering the same OOM
 oom_batch_shrink_factor: 0.6  # multiplicative cut applied to batch_size on ANY OOM (train step or eval sampling share this one batch size/recovery path)
@@ -503,7 +503,7 @@ buffers:
   # up prior_buffer via isotropic noising + rescoring whenever a prior-sampling churn
   # cycle comes up short of admissible samples on its own
   anchor_buffer:
-    seed_source: D:\crystal_datasets\conditional\priors\toy_2harm_conditions.pt #'prior_dataset'   # 'generated' (default, unchanged: lazy-bootstrap from the first fwd-eval-sampled batch), 'prior_dataset' (seed from the real high-quality dataset already loaded for backward training), or a path to torch.load a curated set of good seeds from
+    seed_source: /scratch/mk8347/data/crystal_datasets/priors/toy_2harm_conditions.pt #'prior_dataset'   # 'generated' (default, unchanged: lazy-bootstrap from the first fwd-eval-sampled batch), 'prior_dataset' (seed from the real high-quality dataset already loaded for backward training), or a path to torch.load a curated set of good seeds from
     max_size: 50000
     dup_cutoff: 0.05          # latent L2 distance below which two CONFIRMED-SURPRISING candidates are treated as literal duplicates; restricted to same-condition_id pairs. Not a novelty gate (surprise is) -- only ever runs on the rare confirmed set, so kept tight (see AnchorBuffer.admit)
     screen_energy_window: 20  # cheap one-rollout screen's energy pre-filter: candidate's energy must be within this many ENERGY units of that condition's Emin(c) (condition_log_z.best_energy) before spending a backward rollout on it

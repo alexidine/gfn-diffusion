@@ -7,7 +7,7 @@ seed: 0
 template_path: D:\crystal_datasets\conditional\priors\14_1_elj.pt
 
 output_dir: D:\crystal_datasets\conditional\priors
-tag: toy_multiharm_uncond   # used to build default output filenames
+tag: toy_2harm   # used to build default output filenames
 
 # 'latent_harmonic' or 'latent_multiharmonic' -- see the module docstring in
 # generate_toy_prior.py for why latent_harmonic can only ever be baked one
@@ -22,8 +22,8 @@ energy_function: latent_multiharmonic
 # once loaded as molecules_path / prior_path in training
 conditions:
   - identifier: mode_a
-    c: [0,0,0]
-    width: 1.0
+    c: [0, 0]
+    width: 2.0
 
 #  - identifier: mode_a
 #    c: [ 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,0.5,0.5,0.5 ]

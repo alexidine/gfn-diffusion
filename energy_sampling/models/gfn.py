@@ -422,7 +422,8 @@ class GFN(nn.Module):  # todo add seeding
     def _maybe_scramble_condition_embedding(self, condition_embedding, batch_size,
                                             scramble_condition_tiles: int):
         """
-        Unconditional-prior training (see Modeller.uncond_prior_mode): the
+        Unconditional-prior training (the scramble_conditions stage flag,
+        gated by Modeller.scramble_applicable): the
         conditioner runs on the TRUE, correctly-paired conditions -- so the
         state model sees embeddings of exactly the scale and distribution
         later (conditional) phases will feed it -- but its output is detached

@@ -19,20 +19,18 @@ from time import time
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import wandb
-from torch.optim import lr_scheduler
 from tqdm import trange
 
 from energies.molecular_crystal import MolecularCrystal
 from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker, _per_condition_min, \
     _per_condition_max, strip_lazy_sg_caches
 from energy_sampling.checkpointing import Checkpointer, MODELLER_STATE_DEFAULTS
-from energy_sampling.controller import ModeBalanceController, AdaptiveLRController, ForwardFirstController
-from energy_sampling.phases import PhaseController
-from energy_sampling.eval.utils import sample_eval_fwd_trajs, LossSpikeMonitor
-from energy_sampling.utils import is_cuda_oom, get_annealing_factor, \
-    parse_loss_schedules, dict2namespace, update_loss_schedule, \
+from energy_sampling.controller import AdaptiveLRController
+from energy_sampling.protocol import StageProtocol
+from energy_sampling.eval.utils import sample_eval_fwd_trajs
+from energy_sampling.utils import is_cuda_oom, \
+    dict2namespace, \
     get_discretizer, log_elapsed_times, MetricTracker, quick_tb_stats, uniform_discretizer, logmeanexp, \
     cal_subtb_coef_matrix, within_condition_logw_std
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss, log_pf_estimate
@@ -90,15 +88,9 @@ class Modeller:
         torch.cuda.set_per_process_memory_fraction(self.args.cuda_memory_fraction, device=0)
         torch.cuda.init()  # create context with the cap already in place
 
-        self.init_loss_spike_monitors()
-
         set_seed(self.args.seed)
         if 'SLURM_PROCID' in os.environ:
             self.args.seed += int(os.environ["SLURM_PROCID"])
-
-        if self.args.both_ways and self.args.bwd:
-            print("both ways and bwd only are mutually exclusive, ignoring bwd")
-            self.args.bwd = False
 
         config = self.args.__dict__
         config["Experiment"] = "{args.energy}"
@@ -126,21 +118,10 @@ class Modeller:
                             'evicted': 0, 'budget': 0}
         self.device = self.args.device
         self.checkpointer = Checkpointer(self)
-        self.mode_balance_controller = ModeBalanceController(self)
         self.lr_controller = AdaptiveLRController(self)  # inert unless config carries adaptive_lr.enabled: true
-        self.phase_controller = PhaseController(self)  # phase 1->2->3 transitions + phase-2 balance tick
-        self.forward_first_controller = ForwardFirstController(self)  # inert unless forward_first.enabled: true
+        self.protocol = StageProtocol(self)  # the declarative stage engine: coeffs, balance, exits, transitions
         self.init_train_constants()
 
-    def init_loss_spike_monitors(self):
-        self.fwd_loss_monitor = LossSpikeMonitor(window=200, warmup=250, cooldown=100, ceiling_factor=100.0)
-        self.bwd_loss_monitor = LossSpikeMonitor(window=200, warmup=250, cooldown=100, ceiling_factor=100.0)
-        self.replay_loss_monitor = LossSpikeMonitor(window=200, warmup=250, cooldown=100, ceiling_factor=100.0)
-        self.fused_loss_monitor = LossSpikeMonitor(window=200, warmup=250, cooldown=100, ceiling_factor=100.0)
-        self.loss_monitors = {'fwd': self.fwd_loss_monitor,
-                              'bwd': self.bwd_loss_monitor,
-                              'replay': self.replay_loss_monitor,
-                              'fused': self.fused_loss_monitor}
         # counts TERMINAL reloads only (not ordinary loss spikes), and deliberately
         # does NOT live in MODELLER_STATE_DEFAULTS: fire_loss_spike restores modeller
         # state from the healthy checkpoint, so anything tracked there is wiped by the
@@ -155,40 +136,23 @@ class Modeller:
                 setattr(self, k, deepcopy(v))
 
         self.metric_tracker = MetricTracker(period=100)
+        # latest RAW per-branch loss stats (pre-EMA), refreshed by _update_rolling.
+        # Deliberately not checkpointed: it's a one-step cache (the MLE slope gate
+        # samples it every 10 steps into its own checkpointed window).
+        self._last_stats = {}
+
+    # position in the protocol, derived -- checkpoints store the stage NAME; the
+    # int only feeds wandb continuity and the LR controller's stage-change marker
+    @property
+    def phase(self):
+        return self.protocol.stage.index + 1
+
+    @property
+    def bwd_sampling_mode(self):
+        return self.protocol.stage.bwd_sampling_mode
 
     def train_logic(self, it):
-        replay_available = hasattr(self, 'replay_buffer') and len(self.replay_buffer) > 0
-
-        if self.args.anchor_fwd_bwd:
-            if self.phase == 1:
-                return 'bwd'
-            elif self.phase == 2:
-                # variance conditioning is two-sided: fwd VarGrad needs actual fwd
-                # train steps. (This used to fall into the phase < 3 'bwd' return,
-                # which silently made phase 2 backward-only -- the fwd VarGrad loss
-                # never fired, fwd/logw_std never recorded, and the 'forward policy
-                # left behind' divergence was observed under literally zero forward
-                # training.) replay stays off in phase 2; fold its share into bwd.
-                if self.args.fused:  # fwd+bwd fire together every step, fused by frac weight
-                    return 'fused'  # (fused_train_step keeps replay out until phase 3)
-                probs = np.array([self.fwd_frac, self.bwd_frac + self.replay_frac])
-                return np.random.choice(['fwd', 'bwd'], p=probs / probs.sum())
-            elif self.phase == 3:
-                if self.args.fused:  # fwd/bwd/replay fire together every step, fused by loss weight instead of turn-taking
-                    return 'fused'
-                probs = np.array([self.fwd_frac, self.bwd_frac, self.replay_frac])
-                if not replay_available:  # buffer not populated yet - fold its share into backward
-                    probs = np.array([probs[0], probs[1] + probs[2], 0.0])
-                return np.random.choice(['fwd', 'bwd', 'replay'], p=probs)
-
-        elif self.args.both_ways:
-            return 'fwd' if it % 2 == 0 else 'bwd'  # alternate, always fwd first
-
-        elif self.args.bwd:  # backward ONLY
-            return 'bwd'
-
-        else:  # forward ONLY
-            return 'fwd'
+        return self.protocol.stage.train_mode
 
     def increment_batch_size(self):
         """
@@ -210,31 +174,11 @@ class Modeller:
                               max(self.batch_size + 1, int(self.batch_size * growth_factor)))
 
     def step_lr_schedule(self):
-        if self.lr_controller.enabled:
-            # the safety-net LR controller owns the LRs; the legacy scheduler
-            # objects below still exist but are never stepped
-            return self.lr_controller.step()
-
-        lr = self.optimizers['fwd'].param_groups[0]['lr']
-        if not self.lr_warmup_finished:
-            self.schedulers['policy_1'].step()
-            self.schedulers['policy_1b'].step()
-            self.schedulers['policy_1r'].step()
-            self.schedulers['policy_1u'].step()
-
-            if lr >= self.args.lr_policy:
-                self.lr_warmup_finished = True
-
-        elif lr > self.args.min_lr:
-            self.schedulers['policy_2'].step()
-            self.schedulers['policy_2b'].step()
-            self.schedulers['policy_2r'].step()
-            self.schedulers['policy_2u'].step()
-
-        if 'flow' in self.schedulers:
-            self.schedulers['flow'].step()
-
-        return lr
+        # the AdaptiveLRController owns the LRs unconditionally now (v5) --
+        # adaptive_lr.enabled toggles its own ADAPT half internally (flat
+        # scale=1.0 when off; see AdaptiveLRController.step). There is no
+        # separate legacy scheduler path left to fall back to.
+        return self.lr_controller.step()
 
     def ten_step_reporting(self):
         metrics = {}
@@ -250,33 +194,28 @@ class Modeller:
             metrics['lr_fused_flow'] = self.optimizers['fused'].param_groups[-1]['lr']
 
         metrics['phase'] = self.phase
-        if self.forward_first_controller.enabled:
-            metrics['forward_first_stage'] = ForwardFirstController.STAGES.get(
-                self.forward_first_state.get('stage'), -1)
         if hasattr(self, 'last_grad_norm_pre_clip'):
             metrics['grad_norm_pre_clip'] = self.last_grad_norm_pre_clip
         metrics['Fwd Frac'] = self.fwd_frac
         metrics['Bwd Frac'] = self.bwd_frac
         metrics['Replay Frac'] = self.replay_frac
-        metrics['under_coverage_threshold'] = self.args.controller.under_threshold
-        metrics['over_coverage_threshold'] = self.args.controller.over_threshold
-        metrics['zerr_threshold'] = self.args.controller.zerr_threshold
+        # boost state, per-rule live (annealed) thresholds/elevations, exit streaks
+        metrics.update(self.protocol.report())
         metrics.update(log_elapsed_times(self.times))
-        # diagnostics only -- the controller's zerr is now fwd/tb_err (see
-        # ModeBalanceController._get_controller_metrics); rms_z_lag's trust
-        # gate keeps it at a fail-open 0.0 whenever no condition has enough
-        # decayed evidence, so it must not be read as a control variable
+        # diagnostics only -- the balance rules threshold on fwd/tb_resid_clipped
+        # (see the protocol block's zerr rules); rms_z_lag's trust gate keeps it
+        # at a fail-open 0.0 whenever no condition has enough decayed evidence,
+        # so it must not be read as a control variable
         metrics['zerr_tracker'] = self.condition_log_z.rms_z_lag()
         metrics[
             'z_bias'] = self.condition_log_z.rms_z_bias()  # location-only companion to zerr_tracker: ~0 when Z(c) sits on mean(log w), immune to spread
         metrics[
-            'logw_std_rms'] = self.condition_log_z.rms_logw_std()  # phase-2 gate signal; +inf until warmed (loggable as inf)
-        # lookahead-projected metrics the controller actually thresholds on
-        for key, val in getattr(self, 'controller_projections', {}).items():
-            metrics[f'controller_projected/{key}'] = val
+            'logw_std_rms'] = self.condition_log_z.rms_logw_std()  # +inf until warmed (loggable as inf)
 
-        if self.lr_controller.enabled:
-            metrics.update(self.lr_controller.report())
+        # always logged now -- report() is meaningful whether or not
+        # adaptive_lr.enabled (scale sits flat at 1.0 when disabled, which is
+        # itself worth seeing on the dashboard rather than silently absent)
+        metrics.update(self.lr_controller.report())
 
         if hasattr(self, 'condition_log_z'):
             if self.condition_log_z.library_size == 2:
@@ -288,18 +227,13 @@ class Modeller:
         return metrics
 
     def set_loss_coeffs(self):
-        if not self.fwd_loss_schedule:
-            self.fwd_loss_schedule = parse_loss_schedules(self.args.fwd_loss_coeffs)
-            self.bwd_loss_schedule = parse_loss_schedules(self.args.bwd_loss_coeffs)
-            self.replay_loss_schedule = parse_loss_schedules(self.args.replay_loss_coeffs)
-
-            self.args.fwd_loss_coeffs = dict2namespace({k: 0.0 for k in self.fwd_loss_schedule})
-            self.args.bwd_loss_coeffs = dict2namespace({k: 0.0 for k in self.bwd_loss_schedule})
-            self.args.replay_loss_coeffs = dict2namespace({k: 0.0 for k in self.replay_loss_schedule})
-
-        update_loss_schedule(self.step_ind, self.fwd_loss_schedule, self.args.fwd_loss_coeffs.__dict__)
-        update_loss_schedule(self.step_ind, self.bwd_loss_schedule, self.args.bwd_loss_coeffs.__dict__)
-        update_loss_schedule(self.step_ind, self.replay_loss_schedule, self.args.replay_loss_coeffs.__dict__)
+        """Live loss coefficients are a pure function of (base config defaults,
+        current stage): the protocol overlays the stage's non-default overrides
+        on the base fwd/bwd/replay_loss_coeffs blocks. No schedules, no
+        mutation across steps -- the namespaces are rebuilt each call, so a
+        stage transition takes effect the moment this runs."""
+        for mode in ('fwd', 'bwd', 'replay'):
+            setattr(self.args, f'{mode}_loss_coeffs', dict2namespace(self.protocol.coeffs(mode)))
 
         if any([self.args.fwd_loss_coeffs.subtb > 0, self.args.bwd_loss_coeffs.subtb > 0,
                 self.args.replay_loss_coeffs.subtb > 0]):
@@ -494,16 +428,18 @@ class Modeller:
             attempt is kept regardless of whether any run passed.
 
         train_conditioner: also fit conditions_embedding_model, not just the
-        flow head. Only for the direct phase 1->3 route under
-        uncond_prior_mode(), where phase 1 deliberately never trained the
-        conditioner (bwd MLE detached it; fwd Z-only TB freezes the policy) so
+        flow head. Declared per-protocol via the 'bootstrap_z:train_conditioner'
+        action -- only correct when the preceding prior stage scrambled its
+        conditions (scramble_conditions), so nothing ever trained the
+        conditioner (bwd MLE detached it; fwd Z-only TB freezes the policy) and
         its random-init features may not separate conditions well enough for a
         frozen-embedding regression -- this fit is then the first thing that
-        ever trains it. Safe there precisely BECAUSE of that phase 1: the trunk
-        was trained to ignore the embedding, so reshaping the conditioner can't
-        move the policy. On the 2->3 route this must stay False -- phase-2
-        VarGrad gave the conditioner policy-relevant structure that a Z
-        regression has no business rewriting. Each restart attempt resets the
+        ever trains it. Safe there precisely BECAUSE of that scrambled prior:
+        the trunk was trained to ignore the embedding, so reshaping the
+        conditioner can't move the policy. After a stage that DID train the
+        conditioner (e.g. condition-grouped VarGrad), leave the action plain
+        ('bootstrap_z') -- that structure is policy-relevant and a Z regression
+        has no business rewriting it. Each restart attempt resets the
         conditioner to its at-entry weights (the analog of _reinit_flow), and
         snapshots/ema-sync cover both modules.
         """
@@ -884,10 +820,18 @@ class Modeller:
 
     def init_schedulers_optimizers(self):
         """
-        (Re)build every optimizer and LR scheduler from scratch. Called at
-        startup and again at each phase transition (phases.PhaseController):
-        each phase optimizes a different loss surface, so Adam moments and
-        warmup/anneal state must not carry across the boundary.
+        (Re)build every optimizer from scratch. Called at startup and again
+        at each stage transition (protocol.StageProtocol.advance): each stage
+        optimizes a different loss surface, so Adam moments must not carry
+        across the boundary.
+
+        No LR scheduler objects here any more -- the AdaptiveLRController
+        (controller.py) sets every param group's LR directly, every tick
+        (step_lr_schedule -> lr_controller.step -> _apply_lrs), so there is
+        nothing left to build or step. init_policy_lrs/init_flow_lr below
+        still matter for exactly the first train_step of a (re)build: it runs
+        before step_lr_schedule's first call fires, so the optimizer needs a
+        safe (warmup-start) initial value to construct with.
         """
         init_flow_lr = self.args.lr_flow
         init_policy_lrs = {'fwd': self.args.lr_policy / self.args.lr_warmup_ratio,
@@ -935,36 +879,6 @@ class Modeller:
             init_policy_lrs['fused'], weight_decay=weight_decay)
         flow_params = self.gfn_model.flow_model.parameters()
         self.optimizers['flow'] = torch.optim.Adam(flow_params, init_flow_lr, weight_decay=weight_decay)
-
-        self.schedulers = {}
-        lr_warmup_lambda = get_annealing_factor(1,
-                                                self.args.lr_warmup_ratio,
-                                                self.args.lr_warmup_time,
-                                                10)
-        lr_annealing_lambda = get_annealing_factor(self.args.lr_policy,
-                                                   self.args.min_lr,
-                                                   self.args.lr_anneal_time,
-                                                   10)
-
-        # one warmup ('policy_1*') / anneal ('policy_2*') scheduler pair per policy
-        # optimizer -- step_lr_schedule steps whichever family is active. Per-group
-        # lambdas on 'fused' warmup/anneal its policy groups but leave the trailing
-        # flow group (added above) at its flat init_flow_lr (lambda -> 1.0 every step).
-        for mode, suffix in (('fwd', ''), ('bwd', 'b'), ('replay', 'r'), ('fused', 'u')):
-            opt = self.optimizers[mode]
-            n_flat = 1 if mode == 'fused' else 0
-            n_scheduled = len(opt.param_groups) - n_flat
-            self.schedulers[f'policy_1{suffix}'] = lr_scheduler.MultiplicativeLR(
-                opt, lr_lambda=[lambda epoch: lr_warmup_lambda] * n_scheduled + [lambda epoch: 1.0] * n_flat)
-            self.schedulers[f'policy_2{suffix}'] = lr_scheduler.MultiplicativeLR(
-                opt, lr_lambda=[lambda epoch: lr_annealing_lambda] * n_scheduled + [lambda epoch: 1.0] * n_flat)
-
-        flow_annealing_lambda = get_annealing_factor(1,
-                                                     0.1,
-                                                     self.args.lr_anneal_time,
-                                                     10)
-        self.schedulers['flow'] = lr_scheduler.MultiplicativeLR(self.optimizers['flow'],
-                                                                lr_lambda=lambda epoch: flow_annealing_lambda)
 
     def init_prior_dataset(self):
 
@@ -1018,9 +932,18 @@ class Modeller:
             prior_path = f'{self.args.checkpoints_dir}/{self.args.prior_model_name}'
             checkpoint = torch.load(prior_path, map_location=self.device, weights_only=False)
             # a prior model from a different problem wouldn't crash, but it would
-            # silently grow the prior buffer with samples from the wrong target
-            self.checkpointer.assert_problem_match(checkpoint, prior_path, 'prior_model_name')
-            gfn_config = checkpoint['gfn_config']
+            # silently grow the prior buffer with samples from the wrong target.
+            # The conditioning flags are exempt: the prior is a frozen
+            # sampling-only object, rebuilt below from its OWN stored
+            # gfn_config, so it may be any architecture/conditioning (an
+            # unconditional model just ignores the condition tensors it's
+            # handed at sampling time) -- only the TARGET has to match.
+            self.checkpointer.assert_problem_match(checkpoint, prior_path, 'prior_model_name',
+                                                   ignore_keys=('mol_cond', 'temp_cond'))
+            # the stored config stamps the device it was trained on; GFN uses
+            # its device arg internally at sampling time, so override it or a
+            # cross-device load breaks past .to()
+            gfn_config = {**checkpoint['gfn_config'], 'device': self.device}
             self.prior_model = GFN(**gfn_config).to(self.device)
             self.prior_model.load_state_dict(checkpoint['model_eval'])
             self.prior_model.eval()
@@ -1127,9 +1050,10 @@ class Modeller:
             self.init_condition_log_z()
             self.init_anchor_buffer_seed()
 
-            # forward-first protocol (no-op unless forward_first.enabled on a FRESH
-            # run): skips the MLE phase entirely and enters the build-out at phase 3
-            self.forward_first_controller.maybe_begin()
+            # pin the starting stage on a fresh run and walk any skip_if chain
+            # (e.g. a prior loaded by path skips the MLE warm-start stage);
+            # resumed runs stay wherever their checkpoint says
+            self.protocol.begin()
 
             self.times['initialization_end'] = time()
 
@@ -1164,30 +1088,27 @@ class Modeller:
                     lr = self.step_lr_schedule()
                     metrics.update(self.ten_step_reporting())
                     self.monitor_losses(current_loss, step_type)
-
-                    if self.phase == 3:
-                        if self.forward_first_controller.active:
-                            self.forward_first_controller.step()  # build-out protocol owns the fracs until handover
-                        else:
-                            self.mode_balance_controller.step()
-                    elif self.phase == 2:
-                        self.phase_controller.phase2_balance_step()
-                    elif self.phase == 1:
+                    # gate publishers feed the exit triggers (gates/*); the
+                    # protocol tick then runs the stage's balance nudge and
+                    # arms the exit trigger (which pulls the next eval forward)
+                    if self.protocol.flag('mle_gate'):
                         metrics.update(self.update_mle_gate())
+                    self.protocol.tick()
 
-                # evaluation work -- mle_gate 'request_eval' pulls the phase-1
-                # exit eval forward to the step the MLE plateau latched, instead
-                # of waiting out the rest of the eval period while wass degrades
+                # evaluation work -- stage_ctrl 'request_eval' pulls the eval
+                # forward to the step an exit trigger armed (or a reloaded
+                # pre-transition snapshot stamped it), instead of waiting out
+                # the rest of the eval period while the exit metrics degrade
                 if ((self.step_ind % self.args.eval_period == 0 and self.step_ind > 0)
                         or self.step_ind == 50
-                        or self.mle_gate.get('request_eval', False)):
+                        or self.stage_ctrl.get('request_eval', False)):
                     # buffers are ~90% of a full save's bytes, so they ride the
                     # eval cadence rather than every 'running' save. Written
-                    # BEFORE evaluation(), which is where the phase gates fire:
+                    # BEFORE evaluation(), which is where stage transitions fire:
                     # this is the pre-transition buffer state, and a transition
-                    # freezes its own tagged copy on top (_snapshot_pre_transition)
+                    # freezes its own tagged copy on top (protocol._snapshot)
                     self.checkpointer.save_buffers()
-                    metrics.update(self.evaluation(override_do_figs = self.mle_gate.get('request_eval', False)))
+                    metrics.update(self.evaluation(override_do_figs=self.stage_ctrl.get('request_eval', False)))
 
                 if len(metrics) > 0:
                     wandb.log(metrics, step=self.step_ind, commit=True)
@@ -1248,7 +1169,17 @@ class Modeller:
 
     def monitor_losses(self, current_loss, step_type):
         if current_loss is not None:
-            trig = self.loss_monitors[step_type].record(current_loss, self.step_ind)
+            # check_spike (AdaptiveLRController) fires on EITHER a per-branch
+            # loss-ceiling breach (folded in from the old standalone
+            # LossSpikeMonitor instances) or a pre-clip grad-norm spike -- a
+            # hot gradient is treated as spike-worthy in its own right, not
+            # just as a precursor the loss channel would eventually catch,
+            # since gradient_norm_clip is now loose (100.0) and a spike there
+            # can do real damage before the loss itself moves. Always checked
+            # regardless of adaptive_lr.enabled -- this is the FIRE half, and
+            # it was never gated on that flag even in the old design.
+            trig = self.lr_controller.check_spike(
+                step_type, current_loss, getattr(self, 'last_grad_norm_pre_clip', None))
 
             terminal = self._terminal_policy_state()
             if terminal is not None:
@@ -1313,27 +1244,18 @@ class Modeller:
                 self.condition_log_z = ConditionLogZTracker.from_state_dict(
                     checkpoint['condition_log_z'], current_step=self.step_ind)
 
-        if self.lr_controller.enabled:
-            # set_state_dict above restored lr_ctrl from the (healthy) best
-            # checkpoint; cut from that pre-damage scale, not the exploded one.
-            # terminal_reloads carries the one thing that restore just erased --
-            # that this scale has already detonated N times -- so the cut compounds
-            # instead of being re-litigated from scratch every rewind. Ordinary
-            # spikes keep their single flat cut: they are recoverable events, and
-            # inheriting the terminal ratchet's depth would let unrelated noise
-            # inherit a punishment meant for a death.
-            self.lr_controller.on_explosion(count=self.terminal_reloads if terminal else 1)
-            return
-
-        lr_cut_val = 0.75 ** (self.terminal_reloads if terminal else 1)
-
-        for key, opt in self.optimizers.items():
-            # opt.state = defaultdict(dict)  # wipe momentum buffers too
-            for g in opt.param_groups:
-                if g['lr'] > self.args.min_lr:
-                    g['lr'] = max(g['lr'] * lr_cut_val, self.args.min_lr)
-
-        self.lr_warmup_finished = True
+        # set_state_dict above restored lr_ctrl from the (healthy) best
+        # checkpoint; cut from that pre-damage scale, not the exploded one.
+        # terminal_reloads carries the one thing that restore just erased --
+        # that this scale has already detonated N times -- so the cut compounds
+        # instead of being re-litigated from scratch every rewind. Ordinary
+        # spikes (loss OR grad-norm) keep their single flat cut: they are
+        # recoverable events, and inheriting the terminal ratchet's depth would
+        # let unrelated noise inherit a punishment meant for a death. Always
+        # routes through the controller now -- there is no separate disabled-
+        # path cut left; adaptive_lr.enabled only toggles ADAPT (the climb),
+        # not this rewind mechanism.
+        self.lr_controller.on_explosion(count=self.terminal_reloads if terminal else 1)
 
     def update_ema_model(self):
         if self.args.ema_decay is not None:
@@ -1437,28 +1359,28 @@ class Modeller:
                          discretizer,
                          report_losses: bool = True):
         """
-        Fires fwd, bwd, and replay steps together and fuses their losses into a single
-        weighted-sum loss (weighted by fwd_frac/bwd_frac/replay_frac), backed by its own
-        optimizer, rather than randomly picking one per step as the alternating
-        controllers do. Serves phase 2 (fwd VarGrad + bwd VarGrad/TBC, replay excluded
-        by phase below; phase2_balance_step's fracs act as loss weights instead of
-        throughput shares) as well as phase 3.
+        Fires fwd, bwd, and replay steps together and fuses their losses into a
+        single weighted-sum loss (weighted by fwd_frac/bwd_frac/replay_frac),
+        backed by its own optimizer -- the stage's balance rules move the fracs,
+        which act here as loss weights rather than throughput shares.
 
         A branch whose frac has fallen below controller.deactivate_threshold is skipped
         entirely (not just down-weighted) to save its compute; the remaining active
         branches' weights are renormalized to sum to 1. Since the three fracs always sum
         to 1, at least one is guaranteed to survive as long as the threshold is < 1/3.
 
-        Every controller.refresh_every steps, every branch is force-evaluated regardless
-        of its frac, so a long-deactivated branch's rolling metric_tracker stats don't go
-        stale. A force-evaluated branch that's still below threshold contributes zero
-        weight to the fused loss -- it's run only to refresh its stats, not for gradient.
+        Every controller.refresh_every steps, each NON-DORMANT branch (a branch some
+        rule or exit term actually reads -- protocol.mode_dormant) is force-evaluated
+        regardless of its frac, so its rolling metric_tracker stats don't go stale. A
+        force-evaluated branch that's still below threshold contributes zero weight to
+        the fused loss -- it's run only to refresh its stats, not for gradient.
         """
-        # replay joins the fused loss in phase 3 only: phase 2 trains variance
-        # conditioning with Z untouched, and replay_frac is pinned to 0 there anyway --
-        # the phase gate additionally keeps force_refresh from burning a replay pass
-        # (and polluting its rolling stats) on a branch that isn't part of the phase
-        replay_available = (self.phase >= 3
+        # replay joins the fused loss only in stages whose balance can boost it
+        # (mode_boostable, derived from the rule list -- the old 'phase 3 only'
+        # check): a stage that never boosts replay pins its frac at zero, and
+        # the gate additionally keeps force_refresh from burning a replay pass
+        # (and polluting its rolling stats) on a branch that isn't part of the stage
+        replay_available = (self.protocol.mode_boostable('replay')
                             and hasattr(self, 'replay_buffer') and len(self.replay_buffer) > 0)
         deactivate_threshold = self.args.controller.deactivate_threshold
 
@@ -1469,7 +1391,8 @@ class Modeller:
         weights = {}
 
         fwd_active = self.fwd_frac >= deactivate_threshold
-        if fwd_active or force_refresh:
+        fwd_ran = fwd_active or (force_refresh and not self.protocol.mode_dormant('fwd'))
+        if fwd_ran:
             fwd_loss, crystal_batch, fwd_loss_dict = self.fwd_train_step(
                 discretizer,
                 return_exp=True,
@@ -1477,16 +1400,16 @@ class Modeller:
                 report_losses=report_losses)
             if not fwd_active:  # force-refresh only -- keep its graph out of the fused loss
                 fwd_loss = fwd_loss.detach()
-            sub_losses['fwd'] = (fwd_loss, fwd_loss_dict)
+            sub_losses['fwd'] = (fwd_loss, fwd_loss_dict, fwd_active)
             weights['fwd'] = self.fwd_frac if fwd_active else 0.0
 
-        # forward-first stage A: backward is genuinely dormant and NOTHING reads
-        # its rolling stats until stage B, so skip its force-refresh entirely --
-        # a full backward rollout every refresh_every steps purely to keep unread
-        # stats fresh is the dominant waste in an otherwise fwd+replay-only stage
-        # (at T=100 especially). Stats just start stale in stage B and populate
-        # once the controller admits backward.
-        bwd_refresh = force_refresh and not self.forward_first_controller.bwd_dormant
+        # a DORMANT mode (protocol.mode_dormant: nothing in this stage's rules
+        # or exit trigger reads its rolling stats) skips its force-refresh
+        # entirely -- a full rollout every refresh_every steps purely to keep
+        # unread stats fresh is the dominant waste in a stage that doesn't use
+        # them (the old forward-first stage-A bwd_dormant, generalized). Stats
+        # just start stale in the next stage and populate once it reads them.
+        bwd_refresh = force_refresh and not self.protocol.mode_dormant('bwd')
         bwd_active = self.bwd_frac >= deactivate_threshold
         if bwd_active or bwd_refresh:
             bwd_loss, bwd_loss_dict = self.bwd_train_step(
@@ -1495,19 +1418,19 @@ class Modeller:
                 report_losses=report_losses)
             if not bwd_active:
                 bwd_loss = bwd_loss.detach()
-            sub_losses['bwd'] = (bwd_loss, bwd_loss_dict)
+            sub_losses['bwd'] = (bwd_loss, bwd_loss_dict, bwd_active)
             weights['bwd'] = self.bwd_frac if bwd_active else 0.0
 
         if replay_available:
             replay_active = self.replay_frac >= deactivate_threshold
-            if replay_active or force_refresh:
+            if replay_active or (force_refresh and not self.protocol.mode_dormant('replay')):
                 replay_loss, replay_loss_dict = self.replay_train_step(
                     discretizer,
                     repeats=self.mode_repeats('replay'),
                     report_losses=report_losses)
                 if not replay_active:
                     replay_loss = replay_loss.detach()
-                sub_losses['replay'] = (replay_loss, replay_loss_dict)
+                sub_losses['replay'] = (replay_loss, replay_loss_dict, replay_active)
                 weights['replay'] = self.replay_frac if replay_active else 0.0
         elif bwd_active:  # buffer not populated yet - fold its share into backward, as the alternating controller does
             weights['bwd'] += self.replay_frac
@@ -1518,7 +1441,7 @@ class Modeller:
         fused_loss = sum((weights[k] / total_weight) * sub_losses[k][0]
                          for k in sub_losses if weights[k] > 0)
 
-        if fwd_active or force_refresh:
+        if fwd_ran:
             # churn on the fly
             self.manage_replay_buffer(fwd_loss_dict,
                                       crystal_batch)
@@ -1527,16 +1450,19 @@ class Modeller:
         return fused_loss, sub_losses
 
     def record_fused_substep_losses(self, sub_losses):
-        for sub_type in ('fwd', 'bwd', 'replay'):
-            if sub_type in sub_losses:
-                setattr(self, f'{sub_type}_step_count', getattr(self, f'{sub_type}_step_count') + 1)
-
-        step_counts = {'fwd': self.fwd_step_count,
-                       'bwd': self.bwd_step_count,
-                       'replay': self.replay_step_count}
-
-        for sub_type, (sub_loss, loss_dict) in sub_losses.items():
-            if step_counts[sub_type] % 10 == 0:
+        # *_step_count means "times trained on" -- it paces buffer churn via
+        # bwd_step_delta/replay_step_delta -- so a force-refresh-only run
+        # (trained=False, zero weight in the fused loss) must not advance it.
+        # Its rolling stats update unconditionally instead: fresh stats are the
+        # run's whole purpose, and its frozen counter would otherwise pin the
+        # %10 gate open or shut forever.
+        for sub_type, (sub_loss, loss_dict, trained) in sub_losses.items():
+            if trained:
+                count = getattr(self, f'{sub_type}_step_count') + 1
+                setattr(self, f'{sub_type}_step_count', count)
+                if count % 10 == 0:
+                    self._update_rolling(loss_dict, sub_loss, sub_type)
+            else:
                 self._update_rolling(loss_dict, sub_loss, sub_type)
 
     def _ramp_params(self):
@@ -1698,6 +1624,10 @@ class Modeller:
             viol = (states[:, -1].abs() - 1.0).clamp(min=0.0)
             stats['box_violation'] = (viol ** 2).sum(dim=-1).mean().item()
             stats['box_contact_frac'] = (viol > 0).any(dim=-1).float().mean().item()
+        # RAW (pre-EMA) stats cache, one step deep: the MLE slope gate samples
+        # bwd/mle from here every 10 steps -- raw batch losses are ~independent
+        # across steps, so its OLS slope needs no autocorrelation correction
+        self._last_stats[sub_type] = stats
         self.metric_tracker.update(sub_type, stats, self.step_ind)
 
     def step_loss(self, step_type, loss, do_step: bool = True):
@@ -1733,17 +1663,16 @@ class Modeller:
                        ):
         cfg = getattr(self.args, 'condition_log_z', None)
         p = None
-        # z_gap-weighted forward sampling is a PHASE-2 lever only. There forward
-        # trains the POLICY (VarGrad), so steering at high-z_gap conditions
-        # reduces their Var(log w) -- it fixes the root cause. In phase 3 forward
-        # is Z-only (policy frozen): high z_gap == high Var(log w) is exactly
-        # where per-trajectory TB gives Z the WORST gradient (the stall regime
-        # phase 2 exists to prevent), and forward can't lower that variance
-        # anyway (frozen policy) -- so weighting there aims the weak lever at its
-        # worst conditions while starving the clean-gradient bulk. Off in phase 3
-        # (override with mol_sampling_z_gap_phase3 for A/B).
-        z_gap_phase_ok = self.phase == 2 or getattr(cfg, 'mol_sampling_z_gap_phase3', False)
-        if z_gap_phase_ok and getattr(cfg, 'mol_sampling_weighted_by_z_gap', False):
+        # z_gap-weighted forward sampling is a stage flag (zgap_mol_sampling):
+        # it belongs to stages where forward trains the POLICY, so steering at
+        # high-z_gap conditions reduces their Var(log w) -- it fixes the root
+        # cause. In a Z-only forward stage (policy frozen), high z_gap == high
+        # Var(log w) is exactly where per-trajectory TB gives Z the WORST
+        # gradient, and forward can't lower that variance anyway -- weighting
+        # there aims the weak lever at its worst conditions while starving the
+        # clean-gradient bulk. Declare the flag per-stage to A/B it.
+        if (self.protocol.flag('zgap_mol_sampling')
+                and getattr(cfg, 'mol_sampling_weighted_by_z_gap', False)):
             p = self.mol_dataset_z_gap_weights(
                 temperature=getattr(cfg, 'mol_sampling_z_gap_temperature', 0.5),
                 clip_quantile=getattr(cfg, 'mol_sampling_z_gap_clip_quantile', 0.99))
@@ -1774,27 +1703,23 @@ class Modeller:
                                     step=self.step_ind,
                                     )
 
-    def uncond_prior_mode(self):
+    def scramble_applicable(self):
         """
-        True when phase-1 unconditional-prior training is configured AND
-        applicable: bwd MLE/TBC steps scramble the condition embedding inside
-        the model itself (GFN._maybe_scramble_condition_embedding: conditioner
+        Structural applicability guard for the condition-embedding scramble
+        (the stage flag scramble_conditions decides intent; this decides
+        whether the mechanism can apply at all): the model must be conditional,
+        and on vector conditions only -- under conditions_type='molecule'
+        erasing molecule identity isn't the goal. The scramble itself lives
+        inside the model (GFN._maybe_scramble_condition_embedding: conditioner
         runs on the TRUE pairing so the trunk sees real-scale embeddings, then
         its detached output rows are tile-permuted at the conditioner->trunk
         seam), so the trunk is actively trained to ignore the embedding and the
-        phase-1 product is the unconditional mixture by construction rather
+        stage's product is the unconditional mixture by construction rather
         than by MLE's empirical insensitivity to conditioning. No scrambled
         tensor ever exists outside the model, so condition/condition_id pairing
         in buffers, trackers, and per-sample losses is structurally safe.
-        Vector conditions only: under conditions_type='molecule' erasing
-        molecule identity isn't the goal. Also gates the phase-3 Z(c)
-        bootstrap's conditioner unfreeze on the direct 1->3 route (see
-        phase1to3/bootstrap_log_z): with the conditioner untouched all phase 1,
-        the bootstrap regression is the first thing that ever trains it.
         """
-        return (getattr(self.args, 'unconditional_prior', False)
-                and self.gfn_model.conditional
-                and self.gfn_model.conditions_type == 'vector')
+        return self.gfn_model.conditional and self.gfn_model.conditions_type == 'vector'
 
     def bwd_train_step(self,
                        discretizer,
@@ -1803,12 +1728,13 @@ class Modeller:
 
         condition, condition_id, inds, latents, log_reward, mol_batch, traj = self.draw_bwd_sample(repeats)
 
-        # unconditional-prior phase 1: the scramble lives INSIDE the model, at the
+        # unconditional-prior training: the scramble lives INSIDE the model, at the
         # conditioner->trunk seam (see GFN._maybe_scramble_condition_embedding) --
         # train.py hands down only the K-tile size. `condition`/`condition_id` here
         # stay correctly paired everywhere they flow: buffers, the tracker update
         # inside the loss, and the per-sample resids written back below.
-        scramble_tiles = repeats if (self.phase == 1 and self.uncond_prior_mode()) else 0
+        scramble_tiles = repeats if (self.protocol.flag('scramble_conditions')
+                                     and self.scramble_applicable()) else 0
 
         loss, loss_dict = get_gfn_backward_loss(self.args.bwd_loss_coeffs,
                                                 latents.to(self.device),
@@ -1824,7 +1750,7 @@ class Modeller:
                                                 condition_log_z=self.condition_log_z,
                                                 condition_id=condition_id,
                                                 tb_z_source=self.tb_z_source('bwd'),
-                                                update_log_z=self.phase in (1, 2),
+                                                update_log_z=self.protocol.flag('update_log_z'),
                                                 step=self.step_ind)
 
         priority = self._bwd_retention_priority(loss_dict)
@@ -1882,7 +1808,7 @@ class Modeller:
                                                 condition_log_z=self.condition_log_z,
                                                 condition_id=condition_id,
                                                 tb_z_source=self.tb_z_source('replay'),
-                                                update_log_z=self.phase in (1, 2),
+                                                update_log_z=self.protocol.flag('update_log_z'),
                                                 step=self.step_ind)
 
         self.replay_buffer.update_losses(loss_dict['resid'].abs(), inds)
@@ -2162,6 +2088,28 @@ class Modeller:
         metrics['wass_null'] = null
         metrics['wass_debiased'] = raw - null
 
+        # Same debiased sliced-W, but against the anchor buffer's latent cloud:
+        # how far the on-policy distribution sits from the confirmed-good
+        # archive. The buffer is split into two disjoint draws (and the sampler
+        # subsampled to match) so raw and null share the same finite-sample
+        # floor, mirroring the prior-reference construction above.
+        anchor_buffer = getattr(self, 'anchor_buffer', None)
+        if anchor_buffer is not None and len(anchor_buffer) >= 4:
+            ax = anchor_buffer.x.to(sampled.device, sampled.dtype)
+            m = min(n, len(ax) // 2)
+            perm = torch.randperm(len(ax), device=ax.device)
+            a1, a2 = ax[perm[:m]], ax[perm[m:2 * m]]
+            sub = sampled if m == n else sampled[torch.randperm(n, device=sampled.device)[:m]]
+            raw = sliced_wasserstein(
+                sub, a1, n_proj=500,
+                generator=torch.Generator(device=sampled.device).manual_seed(proj_seed))
+            null = sliced_wasserstein(
+                a1, a2, n_proj=500,
+                generator=torch.Generator(device=sampled.device).manual_seed(proj_seed))
+            metrics['wass_anchor'] = raw
+            metrics['wass_anchor_null'] = null
+            metrics['wass_anchor_debiased'] = raw - null
+
     def log_thermo_properties(self, arr, fwd_stats, log_T_tensor, log_Z_learned, log_r, metrics, sample_batch, val):
         # energies
         for key in sample_batch.keys():
@@ -2199,164 +2147,78 @@ class Modeller:
 
     def update_mle_gate(self):
         """
-        Phase-1 exit trigger: relative-slope flatness gate with patience on
-        the rolling bwd MLE EMA (metric_tracker 'bwd'/'mle'), updated at
-        TRAIN cadence (every 10 steps, alongside the other 10-step
-        monitoring) rather than eval cadence -- on easy systems the MLE
-        converges within the first eval or two, so an eval-sampled slope
-        window is hopelessly undersampled and the run keeps overfitting
-        (wass rising) while the window fills.
+        MLE flatness gate, publishing gates/mle_flat for the warm-start
+        stage's exit trigger. Runs at train cadence (every 10 steps) on the
+        stages that declare the mle_gate flag.
 
-        Keyed to the RATE of descent, not to improvement over a best-so-far
-        ratchet: a best-based gate measures cumulative progress since its
-        last reset, so a long shallow descent (the hard systems' MLE tail)
-        accumulates enough to beat any min_delta every few evals and resets
-        its patience forever. The slope is least-squares fit over the last
-        mle_slope_window TRAIN STEPS of gate samples (one per 10 steps).
-        'Flat' = an EQUIVALENCE test on that slope: the upper mle_slope_t
-        sigma bound on the descent rate lies below mle_min_rate, i.e. we are
-        confident further training buys less than a negligible rate. A
-        RISING MLE (double-decay onset / overfitting) also counts as flat,
-        since it's an exit signal, not progress.
+        Samples the RAW per-step bwd MLE batch loss (self._last_stats, the
+        pre-EMA value _update_rolling just computed) every 10 steps into a
+        window of mle_slope_window train steps, then least-squares fits the
+        slope. Raw batch losses are ~independent across steps -- unlike the
+        old 100-step-time-constant EMA input, whose ~0.9 autocorrelation
+        needed an AR(1) effective-sample-size correction and forced the
+        window out to 1000 steps just to hold ~5 independent samples. On raw
+        input, plain OLS standard errors apply and the same confidence fits
+        in a ~3x shorter window.
 
-        Deliberately NOT a significance test on the slope. 'Descent is not
-        significantly nonzero' also holds when the data is uninformative,
-        so such a gate fires hardest exactly where it knows least -- a
-        window straddling a reload/LR-warmup transient has huge residuals,
-        so the standard error swamps the trend and the gate reads 'flat'
-        while the MLE is visibly descending. Bounding the rate makes noise
-        argue against exiting instead: an uncertain window cannot clear the
-        bound.
+        'Flat' = an EQUIVALENCE test on the descent rate: the upper
+        mle_slope_t-sigma bound on the rate (nats per 100 train steps -- the
+        RATE needs no per-system normalization; nats are nats) lies below
+        mle_min_rate. Deliberately NOT a significance test: 'descent not
+        significantly nonzero' also holds when the data is uninformative, so
+        a significance gate fires hardest where it knows least (lcmft1z4:
+        rate +0.96 nats/100 across a reload transient read as 'flat').
+        Bounding the rate makes noise argue AGAINST exiting: an uncertain
+        window cannot clear the bound. A RISING MLE (overfitting onset) still
+        counts as flat -- the whole interval sits below min_rate -- since
+        that's an exit signal, not progress.
 
-        The rate is in nats per 100 train steps and needs no normalization:
-        the MLE LEVEL carries the target's differential entropy (so +5- and
-        -25-plateau systems differ), but the RATE does not -- nats are nats.
-        This replaces an earlier rate normalized by the EMA's dynamic range
-        (ema_max - ema_min), whose denominator is dominated by the initial
-        transient: an init artifact that inflates for the rest of the run
-        and silently tightens the threshold the worse the init was.
-
-        Because the samples are an EMA, the standard error carries an AR(1)
-        effective-sample-size correction -- see the inline note; without it
-        the gate credits itself ~4x more precision than it has.
-
-        mle_plateau_patience consecutive flat
-        checks LATCH self.mle_gate['flat'] and request an immediate eval
-        (train loop honors 'request_eval' once), so the wass/tbc-gated
-        transition runs against a fresh eval right at the plateau instead of
-        up to an eval_period later, after wass may already have degraded.
-        Inactive before mle_gate_min_steps: the tracker EMA needs ~its
-        100-step time constant of data before its slope means anything.
-        State lives in self.mle_gate (MODELLER_STATE_DEFAULTS) so it
-        survives checkpoint reloads. Returns loggable metrics.
+        No internal latch or patience any more: the verdict is published
+        per-check as gates/mle_flat in {0, 1} and the exit trigger's own
+        `patience` does the latching (a resumed descent publishes 0 and
+        resets the trigger streak -- the old un-latch-on-descent behavior,
+        for free). The window rides in stage_ctrl['gate_state'], so it is
+        checkpointed with the trigger streaks it feeds, and a short restored
+        window publishes 0 until re-proven -- the old stale-latch guard,
+        also for free. Returns loggable metrics.
         """
         metrics = {}
-        cur = self.metric_tracker.get('bwd', 'mle')
-        if cur is None or self.step_ind < getattr(self.args, 'mle_gate_min_steps', 250):
+        raw = self._last_stats.get('bwd', {}).get('mle')
+        if raw is None or not math.isfinite(raw):
             return metrics
-        checks = max(int(getattr(self.args, 'mle_slope_window', 1000)) // 10, 2)
-        window = self.mle_gate.setdefault('window', [])
-        window.append(cur)
+        gs = self.protocol.gate_state('mle')
+        checks = max(int(getattr(self.args, 'mle_slope_window', 300)) // 10, 4)
+        window = gs.setdefault('window', [])
+        window.append(float(raw))
         del window[:-checks]
         if len(window) < checks:
-            # No evidence yet, so a 'flat' inherited from a checkpoint cannot be
-            # tested and must not stand: 'flat' rides in MODELLER_STATE_DEFAULTS by
-            # design, and while the window normally rides with it (a latch implies a
-            # full window), it does NOT after mle_slope_window is lengthened -- every
-            # older checkpoint then loads a short window and would spend `checks`
-            # steps with a stale latch that the un-latch below never gets to clear,
-            # leaving wass/tbc as the only real phase-1 exit gate. That is exactly
-            # how lcmft1z4 exited at step 1260 while its MLE was still descending.
-            # A genuinely plateaued resume simply re-proves it over one window.
-            self.mle_gate['flat'] = False
-            self.mle_gate['stall'] = 0
+            self.protocol.publish_gate('mle_flat', 0.0)
             return metrics
         y = np.asarray(window, dtype=float)
         n = len(y)
         x = np.arange(n, dtype=float)
         slope, intercept = np.polyfit(x, y, 1)  # slope per check = per 10 steps
         resid = y - (slope * x + intercept)
-        # OLS standard error of the slope
         sxx = float(((x - x.mean()) ** 2).sum())
         s2 = float((resid ** 2).sum()) / max(n - 2, 1)
         se = np.sqrt(s2 / sxx) if sxx > 0 and s2 > 0 else 0.0
-        # AR(1) correction. `cur` is a 100-step-time-constant EMA sampled every 10
-        # steps, so its residuals are ~exp(-10/100) = 0.9 autocorrelated and OLS
-        # (which assumes independence) understates the slope's true uncertainty by
-        # ~4x. Inflate by the effective-sample-size factor (1+r)/(1-r): at r = 0.9 a
-        # 50-sample window carries only ~2.6 independent samples. rho is clamped
-        # because it is itself estimated from few samples and the factor diverges
-        # as r -> 1.
-        rho = 0.0
-        if n > 3 and resid.std() > 0:
-            rho = float(np.corrcoef(resid[:-1], resid[1:])[0, 1])
-        if not np.isfinite(rho):
-            rho = 0.0
-        rho = min(max(rho, 0.0), float(getattr(self.args, 'mle_rho_max', 0.95)))
-        se *= np.sqrt((1.0 + rho) / (1.0 - rho))
         rate = -slope * 10.0  # nats per 100 train steps; > 0 = descending = improving
         se_rate = se * 10.0
-        # EQUIVALENCE test, not a significance test: flat = the UPPER confidence
-        # bound on the descent is below a negligible rate. Testing instead whether
-        # the descent is significantly nonzero (t = rate / se_rate < t_min) is the
-        # absence-of-evidence fallacy and fires on uninformative data: a window
-        # straddling a reload/LR-warmup transient has enormous residuals, so se_rate
-        # swamps the trend and the gate reads 'flat' while the MLE is visibly
-        # descending. lcmft1z4 at step 1250 had rate +0.96 nats/100 (descending
-        # hard) yet t = 1.09, and a significance gate exits there. Bounding the rate
-        # instead makes noise ARGUE AGAINST exiting, which is the safe direction: an
-        # uncertain window cannot clear the bound.
-        #
-        # A RISING MLE (double-decay onset / overfitting) still counts as flat --
-        # rate < 0 puts the whole interval below min_rate -- since that's an exit
-        # signal, not progress.
-        #
-        # Units are nats per 100 train steps. Unlike the MLE LEVEL (which carries
-        # the target's differential entropy and so varies by system), the RATE needs
-        # no normalization: nats are nats. That is what the old
-        # rate / (ema_max - ema_min) was reaching for, but its denominator was set
-        # by the initial transient -- an init artifact that inflates for the rest of
-        # the run and silently tightens the threshold the worse the init was.
         rate_hi = rate + float(getattr(self.args, 'mle_slope_t', 2.0)) * se_rate
-        t_stat = rate / se_rate if se_rate > 0 else np.inf  # logged as a diagnostic only
-        if rate_hi < float(getattr(self.args, 'mle_min_rate', 0.05)):
-            self.mle_gate['stall'] = self.mle_gate.get('stall', 0) + 1
-        else:
-            # MLE is significantly descending again, so any earlier 'flat' no
-            # longer describes the curve: re-arm rather than leave it latched.
-            # 'flat' rides in checkpoints by design (MODELLER_STATE_DEFAULTS), so
-            # without this a stale latch from the run that WROTE the checkpoint
-            # permits the phase-1 exit forever after, leaving wass/tbc as the only
-            # real gate. lcmft1z4 reloaded a prior warm-start with flat already
-            # true and exited at step 1260 on wass alone, while MLE was still
-            # descending and 5.8 nats below the level it latched at. A resume whose
-            # MLE is genuinely still plateaued keeps stalling and keeps flat -- only
-            # a real resumed descent clears it.
-            self.mle_gate['stall'] = 0
-            self.mle_gate['flat'] = False
-        if (not self.mle_gate.get('flat', False)
-                and self.mle_gate['stall'] >= getattr(self.args, 'mle_plateau_patience', 3)):
-            self.mle_gate['flat'] = True
-            self.mle_gate['request_eval'] = True
+        flat = rate_hi < float(getattr(self.args, 'mle_min_rate', 0.05))
+        self.protocol.publish_gate('mle_flat', float(flat))
         metrics['mle_gate_rate'] = rate  # nats/100 train steps; > 0 = improving
         metrics['mle_gate_rate_se'] = se_rate
         metrics['mle_gate_rate_hi'] = rate_hi  # the quantity actually tested
-        metrics['mle_gate_t'] = t_stat
-        metrics['mle_gate_rho'] = rho
-        metrics['mle_gate_stall'] = self.mle_gate['stall']
+        metrics['mle_gate_flat'] = float(flat)
         return metrics
 
     def evaluation(self, override_do_figs: bool = False):
         metrics = {}
-        # this eval satisfies any pending pulled-forward request, whatever set
-        # it: the phase-1 MLE gate, or a reloaded 'phase1_exit'/'phase2_exit'
-        # pre-transition checkpoint (which stamps request_eval True so the
-        # exit gate re-fires on the first post-resume step -- see
-        # phases.PhaseController._snapshot_pre_transition). Cleared here
-        # unconditionally, NOT in the phase-1 gate branch below: a phase-2
-        # resume never visits that branch and would otherwise re-eval every
-        # step forever.
-        self.mle_gate['request_eval'] = False
+        # NB any pending pulled-forward request (stage_ctrl['request_eval'] --
+        # set by an exit trigger arming, or stamped into a reloaded
+        # pre-transition snapshot) is cleared by protocol.maybe_advance below,
+        # which every evaluation reaches regardless of stage.
         # wall clock spent in the train loop since the last eval finished --
         # skipped on the first eval, which has no predecessor to measure from
         if 'eval_step_end' in self.times:
@@ -2414,84 +2276,15 @@ class Modeller:
             elif torch.is_tensor(metrics[key]):
                 metrics[key] = loggable_array(metrics[key].detach().cpu().numpy())
 
-        if self.phase == 1:
-            # phase-1 exit is TRIGGERED by the MLE slope gate (train-time flat
-            # relative slope with patience, latched in update_mle_gate --
-            # self-calibrating, unlike an absolute wass threshold that needs
-            # retuning per system), with wass_debiased kept only as a loose
-            # sanity ceiling against the underfit-plateau case: optimizer
-            # stalled (flat MLE) while the distribution match is still bad.
-            # Defaults to 4x the old wass_threshold gate value.
-            mle_flat = self.mle_gate.get('flat', False)
-            wass_sane = metrics['wass_debiased'] < getattr(
-                self.args, 'wass_ceiling', 4 * self.args.wass_threshold)
-            # when TBC is active in phase 1, its rolling train-time EMA must also be
-            # converged before leaving the MLE warm start -- the point of TBC (see
-            # get_tbc_loss) is to enter TB/Z training with tame intra-terminal
-            # Var(log w), so distribution match (wass) alone no longer qualifies
-            tbc_active = getattr(self.args.bwd_loss_coeffs, 'tbc', 0) > 0
-            tbc_converged = (not tbc_active or
-                             self.metric_tracker.get('bwd', 'tbc', float('inf')) < self.args.tbc_threshold)
-            if mle_flat and wass_sane and tbc_converged:
-                # phase 2 is CONDITIONAL-ONLY: with an unconditional model (or a
-                # single-condition library) condition-grouped VarGrad degenerates to
-                # plain whole-batch VarGrad -- a pure variance objective with no
-                # location anchor, which runs away on-policy regardless of LR
-                # (hrpy4uuq: fwd logw_std_within 11 -> 1870 while the controller cut
-                # to 1e-6). Those runs go direct 1->3, where TB's learned Z anchors
-                # the policy.
-                if self.forward_first_controller.enabled:
-                    # forward-first build-out replaces phases 2/3: the MLE
-                    # warm-start we just finished IS the prior training (broad
-                    # range + self-consistency), snapshotted as the prior model
-                    # exactly as the 1->3 route does, then stages A/B/C
-                    self.phase_controller.phase1_to_forward_first(metrics)
-                else:
-                    conditional_run = (self.gfn_model.conditional
-                                       and self.energy_function.condition_library_size > 1)
-                    if getattr(self.args, 'variance_conditioning_phase', False) and conditional_run:
-                        self.phase_controller.phase1to2(metrics)  # route through phase 2: variance conditioning
-                    else:
-                        if getattr(self.args, 'variance_conditioning_phase', False):
-                            print("variance_conditioning_phase requested but the run is "
-                                  "unconditional (or the condition library is size 1): "
-                                  "skipping phase 2, going direct 1->3")
-                        self.phase_controller.phase1to3(metrics)  # direct to equilibration
+        # stage-exit check + transition: the trigger's tick-resolvable terms
+        # were latched at train cadence; eval/* terms (e.g. eval/wass_debiased)
+        # are checked here against the fresh metrics, and the transition --
+        # snapshots, coeff switch, optimizer rebuild, LR re-warm, on_enter
+        # actions -- executes inside this call. Also clears any pending
+        # pulled-forward eval request, whoever set it.
+        self.protocol.maybe_advance(metrics)
 
-
-        elif self.phase == 2:
-            # variance-conditioning exit: the policy is self-consistent enough for
-            # Z learning to get traction when within-condition std of log w is
-            # tight -- NOT when it has reached the true target (that's phase 3's
-            # job). PRIMARY gate (logw_std_within_threshold set): max of the
-            # rolling fwd/bwd 'logw_std_within' EMAs -- the quantity VarGrad
-            # actually optimizes, at the current policy, with no sparse-visit
-            # estimation-noise floor; max not mean so BOTH directions must be
-            # tight (they certify different things: on-policy rollouts vs buffer
-            # terminals). rms_logw_std is demoted to a loose sanity ceiling
-            # (same pattern as wass_threshold -> wass_ceiling at the phase-1
-            # exit): it certifies the tracker's ema_logw -- the phase-3
-            # bootstrap's regression targets -- but its per-condition estimation
-            # noise + drift floor sits well above the true policy spread and
-            # gates late. +inf until the tracker warms, so the exit still can't
-            # fire before the bootstrap has targets to fit. Configs without
-            # logw_std_within_threshold keep the legacy rms-only gate.
-            logw_std = self.condition_log_z.rms_logw_std()
-            metrics['logw_std_rms'] = logw_std
-            within_threshold = getattr(self.args, 'logw_std_within_threshold', None)
-            if within_threshold is None:  # legacy gate
-                if logw_std < self.args.logw_std_threshold:
-                    self.phase_controller.phase2to3(metrics)
-            else:
-                s_f = self.metric_tracker.get('fwd', 'logw_std_within')
-                s_b = self.metric_tracker.get('bwd', 'logw_std_within')
-                rms_ceiling = getattr(self.args, 'logw_std_rms_ceiling', 4 * within_threshold)
-                if (s_f is not None and s_b is not None
-                        and max(s_f, s_b) < within_threshold
-                        and logw_std < rms_ceiling):
-                    self.phase_controller.phase2to3(metrics)
-
-        if self.phase in [2, 3]:  # add samples to off-policy buffer
+        if self.protocol.flag('buffers_active'):  # add samples to off-policy buffer
             self.manage_prior_buffer(sample_batch)
             self.manage_replay_buffer(fwd_stats, sample_batch)
 
@@ -2513,18 +2306,13 @@ class Modeller:
         return metrics
 
     def log_buffer_stats(self):
-        if self.phase == 1:
-            if hasattr(self, 'prior_dataset'):
-                buff = self.prior_dataset
-            else:
-                buff = None
-        elif self.phase in [2, 3]:
-            if hasattr(self, 'prior_buffer'):
-                buff = self.prior_buffer
-            else:
-                buff = None
+        # report on whatever backward is actually drawing from this stage:
+        # the churned prior_buffer once buffers are live, the static
+        # prior_dataset during the warm-start
+        if self.protocol.flag('buffers_active'):
+            buff = getattr(self, 'prior_buffer', None)
         else:
-            buff = None
+            buff = getattr(self, 'prior_dataset', None)
 
         metrics = {}
         if buff is not None:
@@ -2789,11 +2577,12 @@ class Modeller:
 
         remaining_budget = n_to_add  # - len(bad_inds)
 
-        # sample from prior. Under the forward-first protocol no prior model ever
-        # exists (the run never exits an MLE phase -- see ForwardFirstController),
-        # so the churn draw is skipped: prior_buffer stays the dataset-seeded set,
-        # refreshed only by the anchor top-up paths below. Safe with the dataset
-        # seed under max_size (headroom > n_to_add), so no purge fires above either.
+        # sample from prior. Before the warm-start stage's snapshot_prior action
+        # has run (or on a run whose protocol never takes one), no prior model
+        # exists yet, so the churn draw is skipped: prior_buffer stays the
+        # dataset-seeded set, refreshed only by the anchor top-up paths below.
+        # Safe with the dataset seed under max_size (headroom > n_to_add), so no
+        # purge fires above either.
         if remaining_budget > 0 and hasattr(self, 'prior_model'):
             metrics, sample_batch = self.sample_from_prior(remaining_budget)
             reward = metrics['log_r']

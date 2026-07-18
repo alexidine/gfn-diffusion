@@ -470,6 +470,7 @@ class LossSpikeMonitor:
             spike_z: Optional[float] = 4.0,
             trend_rel: Optional[float] = 0.5,
             min_samples: int = 5,
+            min_baseline: float = 0.0,
             reset_on_fire: bool = False,
             name: str = "loss",
     ):
@@ -482,6 +483,18 @@ class LossSpikeMonitor:
         self.warmup = max(0, int(warmup))  # in clock units (steps)
         self.cooldown = max(0, int(cooldown))  # in clock units (steps)
         self.min_samples = max(2, int(min_samples))
+        # absolute floor under the ceiling reference. The relative bar
+        # (ceiling_factor x median) inverts into a hair trigger on a CONVERGED
+        # run: as the loss median collapses toward zero, "100x the median"
+        # becomes a microscopic absolute bar and routine batch fluctuations
+        # fire it every cooldown (hnh70s0g: fused-loss median ~0.03 -> bar ~3,
+        # 7 spurious fires at metronomic 100-step spacing on a healthy, fully
+        # converged toy). Flooring the reference at min_baseline keeps early
+        # training untouched (median >> floor there, the relative bar rules)
+        # while the late-run bar bottoms out at ceiling_factor x floor --
+        # still far below a genuine detonation (losses run 1e3-1e5) but above
+        # convergence noise. 0.0 = legacy behavior.
+        self.min_baseline = float(min_baseline)
         self.ceiling_factor = ceiling_factor
         self.spike_factor = spike_factor
         self.spike_z = spike_z
@@ -541,6 +554,8 @@ class LossSpikeMonitor:
 
         long_base = median(self._long_hist) if self._long_hist else float("nan")
         warm = (self._clock - self._start_clock) >= self.warmup
+        # the ceiling reference never drops below min_baseline (see __init__)
+        floored_base = max(long_base, self.min_baseline) if math.isfinite(long_base) else long_base
 
         reason: Optional[str] = None
         if not math.isfinite(v):
@@ -549,8 +564,8 @@ class LossSpikeMonitor:
                 self.ceiling_factor is not None
                 and warm
                 and len(self._long_hist) >= self.min_samples
-                and long_base > 0.0
-                and v >= self.ceiling_factor * long_base
+                and floored_base > 0.0
+                and v >= self.ceiling_factor * floored_base
         ):
             reason = "ceiling"
 
@@ -566,7 +581,7 @@ class LossSpikeMonitor:
             fire=fire,
             reason=reason or "",
             value=v,
-            long_baseline=long_base,
+            long_baseline=floored_base,  # the OPERATIVE reference (median, floored)
             call=call,
             step=step,
         )

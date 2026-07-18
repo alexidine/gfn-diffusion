@@ -5,31 +5,32 @@ from typing import Optional
 import torch
 
 from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker
+from energy_sampling.protocol import fresh_stage_ctrl
 from energy_sampling.utils import atomic_save, normalize_problem_def
 from models import GFN
 
 MODELLER_STATE_DEFAULTS = {
     'step_ind': 0,
-    'phase': 1,
+    # the run's position in the config's protocol.stages list, BY NAME --
+    # checkpoints carry position only; behavior (coeffs, balance rules, exit
+    # thresholds) is always re-derived from the current config, so editing the
+    # config rewrites a resumed run's future without any override flag. None =
+    # fresh run; StageProtocol.begin pins it to the first stage.
+    'stage': None,
+    # all mutable stage-engine state (see protocol.fresh_stage_ctrl): exit-term
+    # pass streaks, balance-rule running bests / floors / live annealed
+    # thresholds, gate windows + published values (gates/mle_flat), the chosen
+    # boost, and the pulled-forward-eval request. request_eval is stamped True
+    # into pre-transition snapshots ('phase1_exit' etc.) so a resumed run pulls
+    # its eval to the first post-resume step and the exit trigger -- whose
+    # streaks ride in this same dict -- re-fires the transition through the
+    # normal eval -> maybe_advance path. Reset at every stage transition.
+    'stage_ctrl': fresh_stage_ctrl(),
     'batch_size': 1,
     'batch_size_ever_oomed': False,
     # flips permanently once we've OOM'd at least once - switches growth from fast slow-start to slow congestion-avoidance
     'batch_size_cooldown_until': -1,  # step_ind until which batch size growth is frozen after a cut
-    'lr_warmup_finished': False,
-    'hit_init_kld': False,
     'grow_buffer': False,
-    'fwd_loss_schedule': {},
-    'bwd_loss_schedule': {},
-    'replay_loss_schedule': {},
-    'bwd_sampling_mode': 'dataset',
-    # phase-1 MLE slope gate (see Modeller.update_mle_gate): recent 10-step
-    # samples of the smoothed bwd MLE, consecutive flat-slope checks so far,
-    # the latched flat verdict, and a one-shot pulled-forward-eval request.
-    # request_eval is also stamped True into the 'phase1_exit'/'phase2_exit'
-    # pre-transition checkpoints so a resumed run re-runs the exit eval (and
-    # thus the transition) on its first step -- see
-    # phases.PhaseController._snapshot_pre_transition
-    'mle_gate': {'window': [], 'stall': 0, 'flat': False, 'request_eval': False},
     'fwd_step_count': 0,
     'bwd_step_count': 0,
     'replay_step_count': 0,
@@ -38,22 +39,10 @@ MODELLER_STATE_DEFAULTS = {
     'replay_frac': 0.0,
     'combo_loss_record': [],
     # AdaptiveLRController state (see controller.py): None 'scale' means "not yet
-    # attached" -- the controller builds a fresh per-phase state on its first tick
-    # (and whenever 'phase_seen' stops matching the live phase), so old checkpoints
-    # and disabled runs carry this dict around inertly
+    # attached" -- the controller builds a fresh state on its first tick (and
+    # whenever 'phase_seen' stops matching the live stage index), so disabled
+    # runs carry this dict around inertly
     'lr_ctrl': {'phase_seen': None, 'scale': None},
-    # ForwardFirstController state (see controller.py): stage None means the
-    # protocol never engaged (standard phase path, or forward_first disabled);
-    # 'A'/'B' = active build-out/ramp, 'C' = handed over to ModeBalanceController.
-    # Named _state to avoid colliding with the config block `forward_first`
-    # (both would land on Modeller; init_train_constants prefers the config one).
-    'forward_first_state': {'stage': None, 'streak': 0},
-    'controller_anneal_streak': 0,
-    'controller_lookahead': {
-        'under': {'level': None, 'trend': 0.0},
-        'over': {'level': None, 'trend': 0.0},
-        'zerr': {'level': None, 'trend': 0.0},
-    },
 }
 
 # Buffers live in their own sidecar file rather than inside each checkpoint:
@@ -120,7 +109,7 @@ class Checkpointer:
 
         return path
 
-    def problem_mismatch_report(self, stored_def: Optional[dict]) -> str:
+    def problem_mismatch_report(self, stored_def: Optional[dict], ignore_keys: tuple = ()) -> str:
         """Readable stored-vs-current problem_def comparison, one line per differing field."""
         current_def = normalize_problem_def(self.modeller.problem_def)
         if stored_def is None:
@@ -128,14 +117,15 @@ class Checkpointer:
                     f"  current: {current_def}")
         stored_def = normalize_problem_def(stored_def)
         lines = []
-        for key in sorted(set(stored_def) | set(current_def)):
+        for key in sorted((set(stored_def) | set(current_def)) - set(ignore_keys)):
             stored_val = stored_def.get(key, '<missing>')
             current_val = current_def.get(key, '<missing>')
             if stored_val != current_val:
                 lines.append(f"  {key}: stored={stored_val!r}  current={current_val!r}")
         return '\n'.join(lines) if lines else f"  stored:  {stored_def}\n  current: {current_def}"
 
-    def assert_problem_match(self, checkpoint: dict, path: str, config_key: str):
+    def assert_problem_match(self, checkpoint: dict, path: str, config_key: str,
+                             ignore_keys: tuple = ()):
         """
         Hard-fail when an explicitly requested checkpoint (checkpoint_name /
         prior_model_name) was trained on a different problem than the current
@@ -146,14 +136,26 @@ class Checkpointer:
         samples arrive stamped with the new energy's keys instead. Failing
         here turns that deep, inscrutable KeyError into an immediate,
         self-explanatory config error.
+
+        ignore_keys: problem_def keys exempt from the comparison. The prior-
+        model load passes the conditioning flags (mol_cond/temp_cond) here:
+        they describe a model's INTERFACE rather than the target it samples,
+        and the prior model is a sampling-only object rebuilt from its own
+        stored gfn_config, so it need not share the live model's interface.
         """
-        stored_def = checkpoint.get('problem_def')
-        if normalize_problem_def(stored_def) != normalize_problem_def(self.modeller.problem_def):
+        stored_def = normalize_problem_def(checkpoint.get('problem_def'))
+        current_def = normalize_problem_def(self.modeller.problem_def)
+        if isinstance(stored_def, dict):
+            stored_def_cmp = {k: v for k, v in stored_def.items() if k not in ignore_keys}
+        else:
+            stored_def_cmp = stored_def
+        current_def_cmp = {k: v for k, v in current_def.items() if k not in ignore_keys}
+        if stored_def_cmp != current_def_cmp:
             raise ValueError(
                 f"{config_key} checkpoint {path} was trained on a different problem "
                 f"than the current config solves - either point {config_key} at a "
                 f"checkpoint for this problem, or change the config to match it.\n"
-                f"{self.problem_mismatch_report(stored_def)}")
+                f"{self.problem_mismatch_report(checkpoint.get('problem_def'), ignore_keys)}")
 
     def buffers_path(self, tag: Optional[str] = None) -> str:
         """
@@ -237,9 +239,9 @@ class Checkpointer:
 
     def save(self, tag: str, with_buffers: bool = False):
         """
-        tag: 'best' | 'running' | 'prior' | 'thermalized' | 'final'
-             | 'phase1_exit' | 'phase2_exit' (pre-transition snapshots --
-             see phases.PhaseController._snapshot_pre_transition)
+        tag: 'best' | 'running' | 'prior' | 'final', or a pre-transition
+             snapshot tag from a stage's on_exit actions ('phase1_exit',
+             'ff_calibrated', ... -- see protocol.StageProtocol._snapshot)
 
         Buffers are NOT written here - they live in a sidecar (see
         BUFFER_SUFFIX). with_buffers=True additionally freezes a tagged copy
@@ -301,6 +303,12 @@ class Checkpointer:
         m.gfn_model.train()
         m.ema_model.eval()
 
+        if 'stage' not in checkpoint['modeller_state']:
+            raise ValueError(
+                f"checkpoint {path} predates the stage protocol (it stores a numeric "
+                f"'phase' instead of a stage name) and cannot be resumed -- no backward "
+                f"compatibility is kept. Start fresh, or load just its weights with "
+                f"load_weights_only.")
         self.set_state_dict(checkpoint['modeller_state'])
         m.metric_tracker.load_state_dict(checkpoint.get('metrics', {}))
 
@@ -316,12 +324,9 @@ class Checkpointer:
             m.condition_log_z = ConditionLogZTracker.from_state_dict(
                 checkpoint['condition_log_z'], current_step=m.step_ind)
 
-        if getattr(m.args, 'override_loss_coeffs', False):
-            # discard the schedule baked into the checkpoint so set_loss_coeffs()
-            # re-parses fwd/bwd/replay_loss_coeffs from the current config instead
-            m.fwd_loss_schedule = {}
-            m.bwd_loss_schedule = {}
-            m.replay_loss_schedule = {}
+        # NB no override_loss_coeffs any more: checkpoints carry only the stage
+        # NAME, and live coefficients are always re-derived from the current
+        # config's protocol block -- the config owns behavior unconditionally.
 
         if load_opt_state:
             m.init_schedulers_optimizers()
@@ -329,10 +334,12 @@ class Checkpointer:
 
             if getattr(m.args, 'override_learning_rates', False):
                 # overwrite just the numeric LR the checkpoint's optimizer state
-                # restored with this config's target rate - warmup/anneal status
-                # (lr_warmup_finished) and the schedulers themselves are untouched,
-                # so they carry on stepping from this new value. Adam's momentum
-                # buffers (exp_avg/exp_avg_sq) are also left as-is.
+                # restored with this config's target rate - AdaptiveLRController's
+                # own state (lr_ctrl: scale/warmup/probe) is untouched, so it
+                # carries on adapting from this new value on its very next tick
+                # (which will itself overwrite whatever is set here -- this only
+                # matters for the steps between restore and that next tick).
+                # Adam's momentum buffers (exp_avg/exp_avg_sq) are also left as-is.
                 target_lrs = {'fwd': m.args.lr_policy, 'bwd': m.args.lr_back,
                               'replay': m.args.lr_replay, 'fused': m.args.lr_fused,
                               'flow': m.args.lr_flow}
