@@ -33,7 +33,7 @@ buffers:
     refresh_every_n_evals: 5
     replay_beta: 0.5
     screen_energy_window: 20
-    seed_source: /scratch/mk8347/data/crystal_datasets/priors/toy_2harm_conditions.pt
+    seed_source: /scratch/mk8347/data/crystal_datasets/conditional/priors/toy_2harm_conditions.pt
     surprise_cutoff: -5
     thin_energy_window: 50
     thin_every_n_evals: 5
@@ -192,12 +192,12 @@ model:
   t_scale: 0.05
   zero_init: false
 molecule_conditioning: false
-molecules_path: /scratch/mk8347/data/crystal_datasets/priors/toy_2harm_conditions.pt
+molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/toy_2harm_conditions.pt
 oom_batch_shrink_factor: 0.6
 oom_cooldown_steps: 200
 override_learning_rates: false
 prior_model_name: null
-prior_path: /scratch/mk8347/data/crystal_datasets/priors/toy_2harm_prior.pt
+prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/toy_2harm_prior.pt
 protocol:
   stages:
   - bwd_sampling_mode: dataset
