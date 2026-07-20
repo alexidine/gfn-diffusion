@@ -1307,6 +1307,78 @@ def within_condition_logw_std(log_pf, log_pb, log_r, condition_id):
     return centered[multi].pow(2).mean().sqrt().item()
 
 
+def _condition_r2_groups(log_pf, log_pb, log_r, log_Z, condition_id, min_group_size=2):
+    """
+    Shared groupwork for within_condition_r2 / per_condition_r2_worst: per-condition
+    sum(resid**2) and sum((y - group_mean_y)**2), where resid = y - x is the same
+    raw diagonal residual quick_tb_stats' 'r2' uses (y = log_pf + log_Z, x = log_pb +
+    log_r). Since log_Z is constant within a condition, group-centering y removes
+    exactly the between-condition component that inflates the pooled 'r2' at scale
+    (see the r2-pooled-conditional-gate concern). Returns (ss_resid, ss_total, counts,
+    valid_mask) over all unique conditions in the batch; valid_mask selects groups
+    with >= min_group_size members, same convention as within_condition_logw_std.
+    """
+    x = (log_pb + log_r).detach().flatten()
+    y = (log_pf + log_Z).detach().flatten()
+    resid = y - x
+    cid = condition_id.detach().flatten().to(resid.device)
+    uniq, inverse = torch.unique(cid, return_inverse=True)
+    k = uniq.numel()
+    counts = torch.zeros(k, device=resid.device, dtype=resid.dtype).scatter_add_(
+        0, inverse, torch.ones_like(resid))
+    group_sum_y = torch.zeros(k, device=resid.device, dtype=resid.dtype).scatter_add_(
+        0, inverse, y)
+    group_mean_y = group_sum_y / counts.clamp(min=1)
+    yc = y - group_mean_y[inverse]
+    ss_resid = torch.zeros(k, device=resid.device, dtype=resid.dtype).scatter_add_(
+        0, inverse, resid ** 2)
+    ss_total = torch.zeros(k, device=resid.device, dtype=resid.dtype).scatter_add_(
+        0, inverse, yc ** 2)
+    valid = counts >= min_group_size
+    return ss_resid, ss_total, counts, valid
+
+
+def within_condition_r2(log_pf, log_pb, log_r, log_Z, condition_id):
+    """
+    Pooled WITHIN-condition r2: quick_tb_stats' 'r2' with the between-condition
+    component of the normalizer removed, the r2 analog of within_condition_logw_std
+    above (same rationale -- see its docstring). Conditionally, the pooled r2's
+    denominator sum((y - y.mean())**2) is dominated by the spread of per-condition
+    log Z(c) (huge between different molecules/conditions), so a trunk that reads
+    nothing from the condition can still score r2 ~ 1 (see the
+    r2-pooled-conditional-gate memory). Centering y on its own condition's group
+    mean instead of the batch mean removes that component; every sample in a
+    qualifying (>= 2 member) group is pooled sample-weighted into one ratio, same
+    masking convention as within_condition_logw_std. Returns nan when no group in
+    the batch qualifies -- callers must treat nan as "no signal this batch".
+    """
+    ss_resid, ss_total, counts, valid = _condition_r2_groups(log_pf, log_pb, log_r, log_Z, condition_id)
+    if not bool(valid.any()):
+        return float('nan')
+    return (1 - ss_resid[valid].sum() / ss_total[valid].sum().clamp_min(1e-8)).item()
+
+
+def per_condition_r2_worst(log_pf, log_pb, log_r, log_Z, condition_id, quantile=0.0, min_group_size=2):
+    """
+    Worst-case per-condition r2, for the invariant "fwd/r2 > 0.9 for ALL
+    conditions" (a min across conditions, not a pooled mean). Unlike
+    within_condition_r2 (sample-weighted pooling, so a handful of badly-fit small
+    conditions can't move it much), each qualifying condition group contributes
+    exactly ONE r2 value from its own samples, and this returns the `quantile`
+    across those group values (0.0 = strict min). Noisier batch to batch than the
+    pooled version -- each group is a much smaller sample -- so lean on the
+    caller's own EMA (MetricTracker) to smooth it over batches, same as every
+    other quick_tb_stats-derived metric. Returns nan under the same no-qualifying-
+    group convention as within_condition_r2/within_condition_logw_std.
+    """
+    ss_resid, ss_total, counts, valid = _condition_r2_groups(log_pf, log_pb, log_r, log_Z, condition_id,
+                                                              min_group_size=min_group_size)
+    if not bool(valid.any()):
+        return float('nan')
+    r2_g = 1 - ss_resid[valid] / ss_total[valid].clamp_min(1e-8)
+    return torch.quantile(r2_g, quantile).item()
+
+
 def online_tb_coverage(log_pf, log_pb, log_Z, log_r, log_w_clamp=10.0):
     """
     Fast per-batch coverage proxy. No reward bins, no max_reward, no min_count.

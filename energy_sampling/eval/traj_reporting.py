@@ -37,6 +37,7 @@ If your tensors aren't (N, T, D) / (N, T), set the axis hints in report().
 
 from __future__ import annotations
 import numpy as np
+import torch
 
 # -----------------------------------------------------------------------------
 # helpers
@@ -49,6 +50,24 @@ def _np(x):
     if hasattr(x, "detach"):          # torch tensor
         x = x.detach().cpu().numpy()
     return np.asarray(x, dtype=np.float64)
+
+
+def _t(x):
+    """torch.Tensor | np.ndarray | list -> float torch.Tensor, KEEPING the
+    device it already lives on. The O(n^2) state-cloud metrics use this so GPU
+    trajectories are scored on the GPU instead of being downloaded first."""
+    if x is None:
+        return None
+    if torch.is_tensor(x):
+        return x.detach().float()
+    return torch.as_tensor(np.asarray(x), dtype=torch.float32)
+
+
+def _choice_idx(rng, n, size, device, replace=False, p=None):
+    """numpy-rng index draw (keeps the historical rng stream) as a device
+    tensor, so subsampling never moves the data itself."""
+    idx = rng.choice(n, size=size, replace=replace, p=p)
+    return torch.as_tensor(idx, dtype=torch.long, device=device)
 
 
 def _logsumexp(a, axis=None):
@@ -73,11 +92,11 @@ def _per_traj_logprob(lp, step_axis=1):
 
 
 def _flatten_states(states, time_axis=1):
-    """(N, T, D) -> dict t -> (N, D)."""
-    states = _np(states)
+    """(N, T, D) -> dict t -> (N, D) torch tensors, device preserved."""
+    states = _t(states)
     if states.ndim == 2:              # (N, D) single snapshot
         return {0: states}
-    states = np.moveaxis(states, time_axis, 0)        # (T, N, D)
+    states = states.movedim(time_axis, 0)             # (T, N, D)
     return {t: states[t] for t in range(states.shape[0])}
 
 
@@ -203,28 +222,28 @@ def gaussian_step_kl(means_f, logvars_f, means_b, logvars_b, dim_axis=-1):
 # -----------------------------------------------------------------------------
 
 def _pairwise_sq(X, Y):
-    xx = np.sum(X * X, 1)[:, None]
-    yy = np.sum(Y * Y, 1)[None, :]
-    return np.maximum(xx + yy - 2.0 * X @ Y.T, 0.0)
+    xx = (X * X).sum(1)[:, None]
+    yy = (Y * Y).sum(1)[None, :]
+    return (xx + yy - 2.0 * X @ Y.T).clamp_(min=0.0)
 
 
 def mmd2_rbf(X, Y, gamma=None, max_n=800, rng=None):
     """Unbiased-ish RBF MMD^2 with median-heuristic bandwidth.
     Subsamples to max_n per cloud for tractability."""
     rng = rng or np.random.default_rng(0)
-    X, Y = _np(X), _np(Y)
+    X, Y = _t(X), _t(Y)
     if X.shape[0] > max_n:
-        X = X[rng.choice(X.shape[0], max_n, replace=False)]
+        X = X[_choice_idx(rng, X.shape[0], max_n, X.device)]
     if Y.shape[0] > max_n:
-        Y = Y[rng.choice(Y.shape[0], max_n, replace=False)]
+        Y = Y[_choice_idx(rng, Y.shape[0], max_n, Y.device)]
     Dxx, Dyy, Dxy = _pairwise_sq(X, X), _pairwise_sq(Y, Y), _pairwise_sq(X, Y)
     if gamma is None:
-        med = np.median(np.concatenate([Dxx.ravel(), Dyy.ravel(), Dxy.ravel()]))
-        gamma = 1.0 / (med + 1e-12)
-    Kxx, Kyy, Kxy = np.exp(-gamma * Dxx), np.exp(-gamma * Dyy), np.exp(-gamma * Dxy)
+        med = torch.cat([Dxx.reshape(-1), Dyy.reshape(-1), Dxy.reshape(-1)]).median()
+        gamma = 1.0 / (float(med) + 1e-12)
+    Kxx, Kyy, Kxy = torch.exp(-gamma * Dxx), torch.exp(-gamma * Dyy), torch.exp(-gamma * Dxy)
     m, n = X.shape[0], Y.shape[0]
     # remove diagonal for the within terms
-    np.fill_diagonal(Kxx, 0.0); np.fill_diagonal(Kyy, 0.0)
+    Kxx.fill_diagonal_(0.0); Kyy.fill_diagonal_(0.0)
     return float(Kxx.sum() / (m * (m - 1)) + Kyy.sum() / (n * (n - 1))
                  - 2.0 * Kxy.mean())
 
@@ -247,17 +266,18 @@ def nn_overlap(X, Y, k=5, max_n=1500, rng=None):
     near 1.0                               -> cleanly separated (diff manifold)
     """
     rng = rng or np.random.default_rng(0)
-    X, Y = _np(X), _np(Y)
+    X, Y = _t(X), _t(Y)
     if X.shape[0] > max_n:
-        X = X[rng.choice(X.shape[0], max_n, replace=False)]
+        X = X[_choice_idx(rng, X.shape[0], max_n, X.device)]
     if Y.shape[0] > max_n:
-        Y = Y[rng.choice(Y.shape[0], max_n, replace=False)]
-    Z = np.vstack([X, Y])
-    lbl = np.concatenate([np.zeros(len(X)), np.ones(len(Y))]).astype(int)
+        Y = Y[_choice_idx(rng, Y.shape[0], max_n, Y.device)]
+    Z = torch.cat([X, Y], dim=0)
+    lbl = torch.cat([torch.zeros(len(X), dtype=torch.long, device=Z.device),
+                     torch.ones(len(Y), dtype=torch.long, device=Z.device)])
     D = _pairwise_sq(Z, Z)
-    np.fill_diagonal(D, np.inf)
-    nn = np.argpartition(D, kth=k, axis=1)[:, :k]
-    same = (lbl[nn] == lbl[:, None]).mean()
+    D.fill_diagonal_(float("inf"))
+    nn = D.topk(k, dim=1, largest=False).indices
+    same = (lbl[nn] == lbl[:, None]).float().mean()
     chance = max(len(X), len(Y)) / (len(X) + len(Y))
     return float(same), float(chance)
 
@@ -281,9 +301,9 @@ def _knn_radius(X, k):
     """For each x in X, distance to its k-th nearest neighbour within X.
     These radii define X's manifold estimate: union of balls B(x_i, r_i)."""
     D = _pairwise_sq(X, X)
-    np.fill_diagonal(D, np.inf)
+    D.fill_diagonal_(float("inf"))
     kk = min(k, X.shape[0] - 1)
-    r2 = np.partition(D, kth=kk - 1, axis=1)[:, kk - 1]   # squared radius
+    r2 = D.kthvalue(kk, dim=1).values      # squared radius
     return r2
 
 
@@ -291,15 +311,15 @@ def _covered_mask(Q, R, r2_R):
     """Boolean over Q: is q inside the union of balls B(r_i, sqrt(r2_R[i]))?
     i.e. does q fall within *any* reference point's own k-NN ball."""
     D = _pairwise_sq(Q, R)                 # (nq, nr)
-    return (D <= r2_R[None, :]).any(axis=1)
+    return (D <= r2_R[None, :]).any(dim=1)
 
 
 def _resample_weighted(X, w, n, rng):
     w = np.clip(_np(w).ravel(), 0.0, None)
     if w.sum() <= 0 or not np.isfinite(w.sum()):
-        idx = rng.choice(len(X), size=min(n, len(X)), replace=False)
+        idx = _choice_idx(rng, len(X), min(n, len(X)), X.device)
     else:
-        idx = rng.choice(len(X), size=n, replace=True, p=w / w.sum())
+        idx = _choice_idx(rng, len(X), n, X.device, replace=True, p=w / w.sum())
     return X[idx]
 
 
@@ -317,21 +337,21 @@ def coverage(X_F, X_B, k=5, weights_B=None, max_n=1000, rng=None):
     its manifold estimate and its query points reflect the true target mass.
     """
     rng = rng or np.random.default_rng(0)
-    X_F, X_B = _np(X_F), _np(X_B)
+    X_F, X_B = _t(X_F), _t(X_B)
 
     # forward: plain subsample (model samples are what they are)
     if X_F.shape[0] > max_n:
-        X_F = X_F[rng.choice(X_F.shape[0], max_n, replace=False)]
+        X_F = X_F[_choice_idx(rng, X_F.shape[0], max_n, X_F.device)]
     # backward: weight-resample if weights given, else plain subsample
     if weights_B is not None:
         X_B = _resample_weighted(X_B, weights_B, min(max_n, len(X_B)), rng)
     elif X_B.shape[0] > max_n:
-        X_B = X_B[rng.choice(X_B.shape[0], max_n, replace=False)]
+        X_B = X_B[_choice_idx(rng, X_B.shape[0], max_n, X_B.device)]
 
     r2_B = _knn_radius(X_B, k)
     r2_F = _knn_radius(X_F, k)
-    precision = float(_covered_mask(X_F, X_B, r2_B).mean())   # forward in backward
-    recall    = float(_covered_mask(X_B, X_F, r2_F).mean())   # backward in forward
+    precision = float(_covered_mask(X_F, X_B, r2_B).float().mean())   # forward in backward
+    recall    = float(_covered_mask(X_B, X_F, r2_F).float().mean())   # backward in forward
     return precision, recall
 
 
@@ -441,17 +461,6 @@ def to_scalars(res):
 def traj_overlap_report(data_F, data_B=None, step_axis=1, dim_axis=2, time_axis=1,
                         bins=60, k=5, log_Z=None, weights_B=None):
     line = "=" * 70
-
-    def shapes(name, d):
-        # print(f"\n[{name}] tensor shapes")
-        for key, v in d.items():
-            v = _np(v)
-            # print(f"  {key:16s} {None if v is None else v.shape}")
-
-    # print(line); print("TRAJECTORY OVERLAP REPORT"); print(line)
-    shapes("data_F", data_F)
-    if data_B is not None:
-        shapes("data_B", data_B)
 
     # ---- (A) TB-residual / target overlap ----------------------------------
     # print("\n" + line)

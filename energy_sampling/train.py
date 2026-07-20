@@ -26,13 +26,13 @@ from energies.molecular_crystal import MolecularCrystal
 from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker, _per_condition_min, \
     _per_condition_max, strip_lazy_sg_caches
 from energy_sampling.checkpointing import Checkpointer, MODELLER_STATE_DEFAULTS
-from energy_sampling.controller import AdaptiveLRController
+from energy_sampling.controller import LRController
 from energy_sampling.protocol import StageProtocol
 from energy_sampling.eval.utils import sample_eval_fwd_trajs
 from energy_sampling.utils import is_cuda_oom, \
     dict2namespace, \
     get_discretizer, log_elapsed_times, MetricTracker, quick_tb_stats, uniform_discretizer, logmeanexp, \
-    cal_subtb_coef_matrix, within_condition_logw_std
+    cal_subtb_coef_matrix, within_condition_logw_std, within_condition_r2, per_condition_r2_worst
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss, log_pf_estimate
 from models import GFN
 from energy_sampling.models.aunit_periodicity import sg_periodic_centroid_axes, describe
@@ -40,6 +40,19 @@ from mxtaltools.common.training_utils import flatten_wandb_params
 from mxtaltools.dataset_utils.utils import collate_data_list
 from utils import get_train_args, get_gfn_init_state, set_seed, \
     update_ema, get_problem_definition, problem_hash, problem_slug
+
+
+# bulky per-sample analysis artifacts (fingerprints, RDFs -- huge tensors) that
+# can ride in on loaded datasets or analyzed batches; never read off any buffer
+# draw, so stripped from EVERY buffer's storage just in case they are present
+BULKY_ATTR_EXCLUDE_KEYS = ('fingerprint', 'rdf')
+
+# stripped from churned-buffer STORAGE at admission (draws already drop them):
+# string/list attrs are never read off a buffer draw, and python-list keys make
+# every subsample pay a per-element copy plus -- on GPU-resident buffers -- an
+# idx.tolist() device sync. mol_dataset/prior_dataset keep them (init_identifiers
+# reads .identifier); the anchor buffer keeps them (eval-cadence only).
+CHURNED_BUFFER_EXCLUDE_KEYS = ('symmetry_operators', 'smiles', 'identifier') + BULKY_ATTR_EXCLUDE_KEYS
 
 
 def safe_histogram(data, num_bins=32):
@@ -118,7 +131,7 @@ class Modeller:
                             'evicted': 0, 'budget': 0}
         self.device = self.args.device
         self.checkpointer = Checkpointer(self)
-        self.lr_controller = AdaptiveLRController(self)  # inert unless config carries adaptive_lr.enabled: true
+        self.lr_controller = LRController(self)  # fixed-peak ramp/hold/decay; tripwires always on
         self.protocol = StageProtocol(self)  # the declarative stage engine: coeffs, balance, exits, transitions
         self.init_train_constants()
 
@@ -148,6 +161,22 @@ class Modeller:
         return self.protocol.stage.index + 1
 
     @property
+    def buffer_device(self):
+        """
+        Where the sample stores live ('cpu' default, 'cuda' opt-in): the
+        churned prior/replay buffers, the static mol/prior datasets, AND the
+        anchor buffer. GPU residency turns every per-step buffer op -- draws,
+        admits, and purge_by_index's full-store rebuild -- into async device
+        gathers instead of serial CPU work + host<->device round trips; for
+        the anchor buffer specifically it keeps the every-5th-eval full-sweep
+        maintenance (refresh/thin) on-device, which is what the tall
+        eval_step_time blocks are made of. Measured footprint is ~1 KB/graph
+        (250k graphs ~ 250 MB), so VRAM cost is a rounding error next to
+        activations.
+        """
+        return getattr(self.args, 'buffer_device', 'cpu')
+
+    @property
     def bwd_sampling_mode(self):
         return self.protocol.stage.bwd_sampling_mode
 
@@ -156,28 +185,42 @@ class Modeller:
 
     def increment_batch_size(self):
         """
-        AIMD-style growth: fast multiplicative growth ("slow start") until the first
-        OOM this run; after that, growth freezes for oom_cooldown_steps following any
-        cut (letting the reduced size prove stable), then resumes at a much slower
-        multiplicative rate ("congestion avoidance") so we don't immediately re-trigger
-        the same OOM. A later OOM (e.g. moving into a more VRAM-hungry training phase)
-        cuts and re-cools exactly the same way.
+        Batch growth, still AIMD-shaped (grow until OOM, cut + cooldown, regrow
+        slower), in one of two modes:
+
+        JUMP mode (batch_growth_interval > 0): multiply by batch_growth_factor
+        once every batch_growth_interval steps (batch_growth_slow_interval after
+        the first OOM), capped at max_batch_size. The run then visits only
+        ~log_f(max/base) distinct batch sizes -- torch.compile treats every
+        distinct size as a recompile + its own CUDA graph, so rare large jumps
+        are what make compile viable alongside growth. OOM cuts divide by the
+        same factor (exactly one rung down, so the ladder stays closed).
+
+        LEGACY continuous mode (interval absent/0): the original per-step
+        multiplicative walk (batch_growth_increment until first OOM,
+        batch_growth_slow_increment after), OOM cut by oom_batch_shrink_factor.
         """
         if self.batch_size >= self.args.max_batch_size:
             return
         if self.step_ind < self.batch_size_cooldown_until:
             return  # recently cut -- hold flat until the new level proves stable
 
-        growth_factor = (self.args.batch_growth_increment if not self.batch_size_ever_oomed
-                         else self.args.batch_growth_slow_increment)
+        interval = int(getattr(self.args, 'batch_growth_interval', 0) or 0)
+        slow = int(getattr(self.args, 'batch_growth_slow_interval', 0) or 0) or interval
+        wait = slow if self.batch_size_ever_oomed else interval
+        if self.step_ind - getattr(self, 'batch_size_last_grow', 0) < wait:
+            return
+        f = float(getattr(self.args, 'batch_growth_factor', 2.0))
         self.batch_size = min(self.args.max_batch_size,
-                              max(self.batch_size + 1, int(self.batch_size * growth_factor)))
+                              max(self.batch_size + 1, int(round(self.batch_size * f))))
+        self.batch_size_last_grow = self.step_ind
+
 
     def step_lr_schedule(self):
-        # the AdaptiveLRController owns the LRs unconditionally now (v5) --
-        # adaptive_lr.enabled toggles its own ADAPT half internally (flat
-        # scale=1.0 when off; see AdaptiveLRController.step). There is no
-        # separate legacy scheduler path left to fall back to.
+        # the LRController owns the LRs unconditionally (v6): fixed-peak
+        # ramp/hold/decay -- adaptive_lr.enabled toggles the schedule (flat
+        # scale=1.0 when off; see LRController.step). There is no separate
+        # legacy scheduler path left to fall back to.
         return self.lr_controller.step()
 
     def ten_step_reporting(self):
@@ -224,7 +267,34 @@ class Modeller:
                 for cid, val in enumerate(self.condition_log_z.ema_log_z_emp.tolist()):
                     metrics[f'condition_log_z_ema_log_z_emp/{cid}'] = val
 
+        # --- step-time tail probes: WINDOW-MAX over the 10 steps since the last
+        # report, so a rare slow step can't slip between the 1-in-10 samples the
+        # way plain train_step_time does. Convicts the spike source by
+        # correlation: a step-time spike + a churn-cohort spike = avalanche; a
+        # step-time spike + a device_alloc burst = CUDA allocator expansion; a
+        # step-time spike with neither = look elsewhere.
+        probe = getattr(self, 'probe_window', None)
+        if probe is not None:
+            metrics.update({f'probe/{k}': v for k, v in probe.items()})
+        self.probe_window = {}  # reset the window
+        if torch.cuda.is_available():
+            stats = torch.cuda.memory_stats()
+            prev = getattr(self, '_prev_alloc_stats', None)
+            cur = {k: stats.get(k, 0) for k in ('num_device_alloc', 'num_device_free')}
+            if prev is not None:
+                metrics['probe/device_alloc_delta'] = cur['num_device_alloc'] - prev['num_device_alloc']
+                metrics['probe/device_free_delta'] = cur['num_device_free'] - prev['num_device_free']
+            self._prev_alloc_stats = cur
+
         return metrics
+
+    def _probe_max(self, key, value):
+        """Roll value into the 10-step probe window as a running max."""
+        w = getattr(self, 'probe_window', None)
+        if w is None:
+            w = self.probe_window = {}
+        if value > w.get(key, float('-inf')):
+            w[key] = value
 
     def set_loss_coeffs(self):
         """Live loss coefficients are a pure function of (base config defaults,
@@ -243,6 +313,17 @@ class Modeller:
                 self.args.bwd_loss_coeffs.subtb_lambda, self.args.integrator.T).to(self.gfn_model.device)
             self.args.replay_loss_coeffs.coeff_matrix = cal_subtb_coef_matrix(
                 self.args.replay_loss_coeffs.subtb_lambda, self.args.integrator.T).to(self.gfn_model.device)
+
+    def set_energy_coeffs(self):
+        """Live energy-function coefficients (e.g. bounding_coeff,
+        reduction_coeff): mirrors set_loss_coeffs, but unlike loss_coeffs
+        these CAN mutate step-to-step within a stage -- the terminal stage's
+        balance.anneal_coeffs ramps them up from a soft `start` toward their
+        full config value once its balance rules run clean (protocol.py
+        StageProtocol.energy_coeffs)."""
+        for name, value in self.protocol.energy_coeffs().items():
+            if hasattr(self.energy_function, name):
+                setattr(self.energy_function, name, value)
 
     def get_conditioning_dim(self):
         conditions_dim = 0
@@ -818,6 +899,56 @@ class Modeller:
             self.ema_model = deepcopy(self.gfn_model)
             self.init_schedulers_optimizers()
 
+        self.maybe_compile_policy()
+
+    def maybe_compile_policy(self):
+        """
+        torch.compile the dense per-step trunk of the policy. The trajectory
+        loop launches many tiny kernels (T steps x several small MLPs x 3
+        fused branches), so launch overhead caps GPU utilization even at large
+        batch; mode='reduce-overhead' (CUDA-graph capture) is the standard fix.
+
+        compile_policy: false (default) | true | 'auto'. 'auto' enables only on
+        Linux+CUDA -- inductor does not support CUDA on native Windows, so dev
+        boxes stay eager while cluster runs pick it up. The conditioner is
+        deliberately NOT compiled (the molecule-GNN variant has dynamic node
+        counts). Compilation happens lazily at first forward, so backend
+        failures surface there -- suppress_errors degrades those to eager with
+        a warning instead of killing the run. NB every distinct batch size is a
+        recompile: run this with a static batch OR grow_batch_size + jump-mode
+        growth (batch_growth_interval > 0 -- ~8 shapes total, within the raised
+        recompile limit below); legacy continuous 1.01x growth blows the limit
+        immediately and silently reverts to eager. Uses in-place
+        nn.Module.compile(), so state_dict keys (and therefore checkpoints) are
+        unaffected.
+        """
+        setting = getattr(self.args, 'compile_policy', False)
+        if setting == 'auto':
+            import platform
+            enable = platform.system() == 'Linux' and torch.cuda.is_available()
+        else:
+            enable = bool(setting)
+        if not enable:
+            return
+
+        trunk = ('t_model', 's_model', 'forward_policy', 'backward_policy', 'flow_model')
+        try:
+            import torch._dynamo
+            torch._dynamo.config.suppress_errors = True
+            # jump-mode batch growth is ~8 shapes end to end, exactly at
+            # dynamo's default recompile limit of 8 -- give it headroom so the
+            # top rungs don't silently fall back to eager
+            torch._dynamo.config.cache_size_limit = 24
+            for model in (self.gfn_model, self.ema_model):
+                for name in trunk:
+                    mod = getattr(model, name, None)
+                    if isinstance(mod, torch.nn.Module):
+                        mod.compile(mode='reduce-overhead')
+        except Exception as e:
+            print(f"compile_policy: torch.compile unavailable here ({e}); continuing eager")
+            return
+        print(f"compile_policy: trunk {trunk} compiled (mode=reduce-overhead, lazy on first forward)")
+
     def init_schedulers_optimizers(self):
         """
         (Re)build every optimizer from scratch. Called at startup and again
@@ -922,14 +1053,29 @@ class Modeller:
             )
 
         self.prior_dataset = CrystalBuffer(prior,
-                                           device='cpu',
+                                           device=self.buffer_device,
                                            max_z_prime=max(self.args.z_primes),
                                            x_fn=None,  # 'latent_params',
-                                           y_fn=self.args.energy_function
+                                           y_fn=self.args.energy_function,
+                                           exclude_keys=BULKY_ATTR_EXCLUDE_KEYS,
                                            )
 
+        prior_path = None
         if self.args.prior_model_name is not None:
             prior_path = f'{self.args.checkpoints_dir}/{self.args.prior_model_name}'
+        elif getattr(self.args, 'reuse_prior', False):
+            # this run identity's own earlier phase-1 product, if already on
+            # disk. find_matching validates the stored problem_def against the
+            # current config (full match, stricter than the exempted check
+            # below), so missing/mismatched resolves to None and the warm-start
+            # stage simply runs -- and re-saves the prior for the next rerun.
+            # On a RESUMED run past phase 1 this also restores prior_model,
+            # which snapshot_prior only ever set live at the transition.
+            prior_path = self.checkpointer.find_matching('prior')
+            if prior_path is not None:
+                print(f"reuse_prior: reloading existing prior checkpoint {prior_path} "
+                      f"as the frozen prior model")
+        if prior_path is not None:
             checkpoint = torch.load(prior_path, map_location=self.device, weights_only=False)
             # a prior model from a different problem wouldn't crash, but it would
             # silently grow the prior buffer with samples from the wrong target.
@@ -962,14 +1108,16 @@ class Modeller:
                     data_list = value
 
         self.mol_dataset = CrystalBuffer(data_list,
-                                         device='cpu',
-                                         max_z_prime=max(self.args.z_primes))
+                                         device=self.buffer_device,
+                                         max_z_prime=max(self.args.z_primes),
+                                         exclude_keys=BULKY_ATTR_EXCLUDE_KEYS)
 
         if self.args.test_molecules_path is not None:
             data_list = torch.load(self.args.test_molecules_path, weights_only=False)
             self.test_mol_dataset = CrystalBuffer(data_list,
-                                                  device='cpu',
-                                                  max_z_prime=max(self.args.z_primes))
+                                                  device=self.buffer_device,
+                                                  max_z_prime=max(self.args.z_primes),
+                                                  exclude_keys=BULKY_ATTR_EXCLUDE_KEYS)
         else:
             self.test_mol_dataset = None
 
@@ -1011,7 +1159,7 @@ class Modeller:
             if hasattr(dataset.batch, 'identifier'):
                 mol_id = torch.tensor(
                     [self.identifier_registry[ident] for ident in dataset.batch.identifier],
-                    dtype=torch.long)
+                    dtype=torch.long, device=dataset.batch.device)  # match the (possibly GPU-resident) store
                 dataset.batch.add_graph_attr(mol_id, 'mol_id')
 
         self.energy_function.set_n_molecules(max(len(self.identifier_registry), 1))
@@ -1045,7 +1193,7 @@ class Modeller:
             # mol_id on prior_dataset.batch; no sampling/energy involved). Runs
             # first so grow_prior_buffer's top-up sees the seeded fill level.
             self.init_prior_buffer_seed()
-            if self.args.prior_model_name is not None:
+            if hasattr(self, 'prior_model'):
                 self.grow_prior_buffer()
             self.init_condition_log_z()
             self.init_anchor_buffer_seed()
@@ -1070,6 +1218,7 @@ class Modeller:
                 metrics = {}
                 if self.step_ind % 10 == 0:
                     self.set_loss_coeffs()
+                    self.set_energy_coeffs()
 
                 step_type = self.train_logic(self.step_ind)
                 self.times['train_step_start'] = time()
@@ -1082,6 +1231,8 @@ class Modeller:
                 except (RuntimeError, ValueError) as e:  # if we do hit OOM, slash the batch size
                     self.handle_train_epoch_error(e, step_type)
                 self.times['train_step_end'] = time()
+                self._probe_max('step_time_max10',
+                                self.times['train_step_end'] - self.times['train_step_start'])
 
                 # train monitoring
                 if self.step_ind % 10 == 0:
@@ -1133,12 +1284,11 @@ class Modeller:
         absurd samples and is not coming back on its own. Returns a reason string
         (truthy) or None.
 
-        Distinct from LossSpikeMonitor, and deliberately so. That monitor is
-        RELATIVE -- a spike against its own rolling median -- which makes it blind
-        exactly when it matters most: a few hundred steps at logw_std ~1e5 and that
-        IS the median, so nothing reads as a spike any more and the run grinds on
-        producing garbage. These are ABSOLUTE bounds. Not "worse than lately" but
-        "no longer physics".
+        Distinct from the LRController tripwires, and deliberately so: those
+        read the per-step training signals (branch loss, pre-clip grad norm),
+        which a policy can keep numerically tame while emitting garbage
+        states. These are ABSOLUTE bounds on the sampled-state statistics
+        themselves. Not "worse than lately" but "no longer physics".
 
         Two channels OR'd, because the two observed deaths do not look alike:
           djr13t0j  detonation -- logw_std 8.6 -> 1.8e5 inside 100 steps; box
@@ -1169,13 +1319,11 @@ class Modeller:
 
     def monitor_losses(self, current_loss, step_type):
         if current_loss is not None:
-            # check_spike (AdaptiveLRController) fires on EITHER a per-branch
-            # loss-ceiling breach (folded in from the old standalone
-            # LossSpikeMonitor instances) or a pre-clip grad-norm spike -- a
-            # hot gradient is treated as spike-worthy in its own right, not
-            # just as a precursor the loss channel would eventually catch,
-            # since gradient_norm_clip is now loose (100.0) and a spike there
-            # can do real damage before the loss itself moves. Always checked
+            # check_spike (LRController) runs two ABSOLUTE tripwire tiers per
+            # branch loss and pre-clip grad norm (no medians, no relative
+            # bars): 'cut' = parameter thrash, the LR is cut in place and
+            # training continues on the live weights; 'reset' = true
+            # explosion (or non-finite), rewind to best + cut. Always checked
             # regardless of adaptive_lr.enabled -- this is the FIRE half, and
             # it was never gated on that flag even in the old design.
             trig = self.lr_controller.check_spike(
@@ -1186,8 +1334,11 @@ class Modeller:
                 print(f"TERMINAL policy state at step {self.step_ind}: {terminal} "
                       f"-- rewinding to best and ratcheting LR down")
                 self.fire_loss_spike(terminal=True)
-            elif trig:
+            elif trig == 'reset':
                 self.fire_loss_spike()
+            elif trig == 'cut':
+                print("Firing LR cut (thrash tier -- no rewind)")
+                self.lr_controller.on_explosion()
 
             current_fwd = self.metric_tracker.get('fwd', 'r2')
             current_bwd = self.metric_tracker.get('bwd', 'r2')
@@ -1203,16 +1354,14 @@ class Modeller:
         """
         Rewind to the best checkpoint and cut LR.
 
-        terminal=True marks a _terminal_policy_state rewind rather than an
-        ordinary loss spike, and ratchets the LR cut by the number of terminal
-        rewinds so far. That ratchet exists because of a real loop: set_state_dict
-        below restores lr_ctrl from the HEALTHY checkpoint (deliberately -- we want
-        to cut from the pre-damage scale, not the exploded one), which also wipes
-        every record that this LR already detonated once. So without a counter the
-        cycle is: restore scale -> cut once -> controller's clean-streak recovery
-        walks it straight back to the same scale -> detonate -> restore -> ...
-        forever, which is exactly the lr_fwd sawtooth in djr13t0j. Explosion n now
-        cuts to cut_ratio**n, so the ceiling actually descends.
+        terminal=True marks a _terminal_policy_state rewind rather than a
+        reset-tier tripwire fire, and ratchets the LR cut by the number of
+        terminal rewinds so far, so repeated policy deaths cut to
+        cut_ratio**n and the ceiling actually descends (the djr13t0j
+        sawtooth: rewind restores checkpointed LR state, and without a
+        rewind-proof memory the run walks back into the same detonation --
+        the cut factor itself is instance-held on the controller for the
+        same reason).
 
         A one-way ratchet is the right shape HERE, unlike the threshold anneal it
         superficially resembles: it is driven by an unambiguous catastrophic event,
@@ -1244,17 +1393,12 @@ class Modeller:
                 self.condition_log_z = ConditionLogZTracker.from_state_dict(
                     checkpoint['condition_log_z'], current_step=self.step_ind)
 
-        # set_state_dict above restored lr_ctrl from the (healthy) best
-        # checkpoint; cut from that pre-damage scale, not the exploded one.
-        # terminal_reloads carries the one thing that restore just erased --
-        # that this scale has already detonated N times -- so the cut compounds
-        # instead of being re-litigated from scratch every rewind. Ordinary
-        # spikes (loss OR grad-norm) keep their single flat cut: they are
-        # recoverable events, and inheriting the terminal ratchet's depth would
-        # let unrelated noise inherit a punishment meant for a death. Always
-        # routes through the controller now -- there is no separate disabled-
-        # path cut left; adaptive_lr.enabled only toggles ADAPT (the climb),
-        # not this rewind mechanism.
+        # set_state_dict above restored lr_ctrl (schedule clock) from the
+        # healthy best checkpoint; the cut factor lives on the controller
+        # INSTANCE and survives the rewind. terminal_reloads compounds the
+        # cut across policy deaths; a reset-tier tripwire fire keeps its
+        # single flat cut -- a recoverable event must not inherit a
+        # punishment meant for a death.
         self.lr_controller.on_explosion(count=self.terminal_reloads if terminal else 1)
 
     def update_ema_model(self):
@@ -1382,7 +1526,13 @@ class Modeller:
         # (and polluting its rolling stats) on a branch that isn't part of the stage
         replay_available = (self.protocol.mode_boostable('replay')
                             and hasattr(self, 'replay_buffer') and len(self.replay_buffer) > 0)
-        deactivate_threshold = self.args.controller.deactivate_threshold
+        # per-stage override first (stage.deactivate_threshold), global default
+        # otherwise -- pairs with the stage's min_fracs so each phase states
+        # explicitly which modes may switch off (a min_frac at or above the
+        # deactivate threshold = that mode is never skipped)
+        stage_deact = self.protocol.stage.deactivate_threshold
+        deactivate_threshold = (self.args.controller.deactivate_threshold
+                                if stage_deact is None else stage_deact)
 
         self.fused_step_count = getattr(self, 'fused_step_count', 0) + 1
         force_refresh = self.fused_step_count % self.args.controller.refresh_every == 0
@@ -1609,6 +1759,22 @@ class Modeller:
                 loss_dict['log_pf'], loss_dict['log_pb'], loss_dict['log_r'], cid)
             if math.isfinite(within):
                 stats['logw_std_within'] = within
+            # condition-aware r2: same between-condition-inflation problem as
+            # logw_std (see r2-pooled-conditional-gate) applied to quick_tb_stats'
+            # 'r2' -- a trunk that reads nothing from the condition can score
+            # pooled r2 ~ 1 once Z(c) explains away the between-condition target
+            # variance. r2_within is the sample-weighted pooled fix; r2_worst is
+            # the stricter per-condition-quantile version the "r2 > 0.9 for ALL
+            # conditions" invariant actually asks for.
+            r2_within = within_condition_r2(
+                loss_dict['log_pf'], loss_dict['log_pb'], loss_dict['log_r'], loss_dict['log_Z'], cid)
+            if math.isfinite(r2_within):
+                stats['r2_within'] = r2_within
+            r2_worst = per_condition_r2_worst(
+                loss_dict['log_pf'], loss_dict['log_pb'], loss_dict['log_r'], loss_dict['log_Z'], cid,
+                quantile=getattr(self.args, 'r2_worst_quantile', 0.0))
+            if math.isfinite(r2_worst):
+                stats['r2_worst'] = r2_worst
         # box containment on the TRAIN-step cadence. 'Mean bounding_energy' exists
         # already but is EVAL-cadence (log_thermo_properties loops the eval batch),
         # far too coarse to gate a controller on: in 1219ddv9 boundary drift led the
@@ -2535,10 +2701,11 @@ class Modeller:
         if not hasattr(self, 'prior_buffer'):
             self.prior_buffer = CrystalBuffer(
                 sample_batch,
-                device='cpu',
+                device=self.buffer_device,
                 max_z_prime=max(self.args.z_primes),
                 x_fn=None,  # 'latent_params',
-                y_fn=self.args.energy_function
+                y_fn=self.args.energy_function,
+                exclude_keys=CHURNED_BUFFER_EXCLUDE_KEYS,
             )
 
         num_bwd_steps = self.bwd_step_delta()
@@ -2620,7 +2787,10 @@ class Modeller:
                 self.prior_buffer) > 0:
             cfg = self.args.buffers.anchor_buffer
             margin = self._ramp_params()[0]
-            prior_condition_id = self.prior_buffer.batch.condition_id
+            # host-side cid: _condition_energy_floor returns on the input's
+            # device, and everything below (y, quantile) is CPU bookkeeping --
+            # with buffer_device: cuda the raw batch attr is a CUDA tensor
+            prior_condition_id = self.prior_buffer.batch.condition_id.detach().cpu()
             energy_floor = self._condition_energy_floor(prior_condition_id)
             if energy_floor is not None:
                 valid = torch.isfinite(energy_floor)
@@ -2871,6 +3041,8 @@ class Modeller:
         log_pb = fwd_stats['log_pb']
         log_Z_learned = fwd_stats['log_Z_learned'] if 'log_Z_learned' in fwd_stats else fwd_stats['log_Z']
 
+        # resid stays on CPU: all the eviction logic below runs against the
+        # buffer's CPU-resident ema_loss bookkeeping
         resid = ((log_pf - log_pb) - (log_r - log_Z_learned)).cpu().abs()
 
         floor = 0.1  # low; doubles as below-capacity admission gate
@@ -2879,7 +3051,8 @@ class Modeller:
         elig = torch.argwhere(resid > floor).flatten()
         elig = elig[torch.argsort(resid[elig], descending=True)]
         cand_resid = resid[elig]
-        flow_states = fwd_stats['flow_states'].cpu()
+        # trajectories go wherever the buffer lives -- no forced D2H when GPU-resident
+        flow_states = fwd_stats['flow_states'].detach().to(self.buffer_device)
 
         # --- bootstrap ---
         if not hasattr(self, 'replay_buffer'):
@@ -2888,73 +3061,92 @@ class Modeller:
             add_inds = elig[:self.args.buffers.replay_buffer.max_size]
             self.replay_buffer = CrystalBuffer(
                 sample_batch.subsample_new_batch(add_inds),
-                device='cpu',
+                device=self.buffer_device,
                 max_z_prime=max(self.args.z_primes),
                 x_fn=None,
                 y_fn=self.args.energy_function,
-                traj=flow_states[add_inds],
+                traj=flow_states[add_inds.to(flow_states.device)],
                 init_loss=resid[add_inds],
+                exclude_keys=CHURNED_BUFFER_EXCLUDE_KEYS,
             )
             self.replay_churn['admitted'] += int(add_inds.numel())
             return
 
+        # Single-pass churn: every eviction source (toxic, beat-the-min, random)
+        # is collected against the CURRENT indexing, then ONE purge_by_index and
+        # ONE add run at the end. purge_by_index rebuilds the whole resident
+        # store, so the old purge->add->purge sequence paid that full-store
+        # rebuild up to three times per train step. Only behavioral delta:
+        # random churn can no longer evict a row admitted in this same call.
+        ema = self.replay_buffer.ema_loss
+        n = len(self.replay_buffer)
+
         # --- unconditional toxic eviction: strictly overfit incumbents ---
-        toxic = torch.argwhere(self.replay_buffer.ema_loss < floor).flatten()
-        if toxic.numel() > 0:
-            self.replay_buffer.purge_by_index(toxic)  # buffer reindexes; read ema_loss AFTER this
-            self.replay_churn['evicted'] += int(toxic.numel())
+        toxic_mask = ema < floor
+        toxic = torch.argwhere(toxic_mask).flatten()
 
         # --- fill freed + spare slots, then beat-the-min for the rest ---
-        headroom = max(0, self.args.buffers.replay_buffer.max_size - len(self.replay_buffer))
+        headroom = max(0, self.args.buffers.replay_buffer.max_size - (n - toxic.numel()))
         free = elig[:headroom]
         over_idx = elig[headroom:]
         over_resid = cand_resid[headroom:]
 
         drop_pos = torch.empty(0, dtype=torch.long)
         if over_idx.numel() > 0:
-            order = torch.argsort(self.replay_buffer.ema_loss)  # ascending, worst-first
-            inc_loss = self.replay_buffer.ema_loss[order]
+            live = torch.argwhere(~toxic_mask).flatten()
+            order = live[torch.argsort(ema[live])]  # ascending, worst-first, toxic excluded
+            inc_loss = ema[order]
             k = min(over_resid.numel(), order.numel())
             beats = (over_resid[:k] > inc_loss[:k]).long()  # strict: no churn on ties
             n_swap = int(torch.cummin(beats, dim=0).values.sum())  # leading True run
             over_idx = over_idx[:n_swap]
             drop_pos = order[:n_swap]
 
-        if drop_pos.numel() > 0:
-            self.replay_buffer.purge_by_index(drop_pos)
-            self.replay_churn['evicted'] += int(drop_pos.numel())
-
-        add_inds = torch.cat([free, over_idx])
-        if add_inds.numel() > 0:
-            self.replay_buffer.add(
-                sample_batch.subsample_new_batch(add_inds),
-                traj=flow_states[add_inds],
-                init_loss=resid[add_inds],
-            )
-            self.replay_churn['admitted'] += int(add_inds.numel())
+        purge_idx = torch.cat([toxic, drop_pos])
 
         # --- random churn: guard against domination by rare correlated events ---
         num_replay_steps = self.replay_step_delta()
         n_churn = int(num_replay_steps * self.args.buffers.replay_buffer.random_churn_rate)
-        n_churn = min(n_churn, len(self.replay_buffer))
+        churn_add = torch.empty(0, dtype=torch.long)
         if n_churn > 0:
-            purge_idx = torch.randperm(len(self.replay_buffer))[:n_churn]
+            survivor_mask = torch.ones(n, dtype=torch.bool)
+            survivor_mask[purge_idx] = False
+            survivors = torch.argwhere(survivor_mask).flatten()
+            n_churn = min(n_churn, survivors.numel())
+            if n_churn > 0:
+                churn_purge = survivors[torch.randperm(survivors.numel())[:n_churn]]
+                purge_idx = torch.cat([purge_idx, churn_purge])
+                # only draw random adds from this batch's top quartile of residuals,
+                # so churn doesn't dilute the buffer with well-covered "good" samples
+                top_quartile = torch.quantile(resid, 0.75)
+                churn_cand = torch.argwhere(resid >= top_quartile).flatten()
+                n_add = min(n_churn, churn_cand.numel())
+                if n_add > 0:
+                    churn_add = churn_cand[torch.randperm(churn_cand.numel())[:n_add]]
+
+        t_purge = time()
+        if purge_idx.numel() > 0:
             self.replay_buffer.purge_by_index(purge_idx)
             self.replay_churn['evicted'] += int(purge_idx.numel())
+        t_add = time()
 
-            # only draw random adds from this batch's top quartile of residuals,
-            # so churn doesn't dilute the buffer with well-covered "good" samples
-            top_quartile = torch.quantile(resid, 0.75)
-            churn_cand = torch.argwhere(resid >= top_quartile).flatten()
-            n_add = min(n_churn, churn_cand.numel())
-            if n_add > 0:
-                add_choice = churn_cand[torch.randperm(churn_cand.numel())[:n_add]]
-                self.replay_buffer.add(
-                    sample_batch.subsample_new_batch(add_choice),
-                    traj=flow_states[add_choice],
-                    init_loss=resid[add_choice],
-                )
-                self.replay_churn['random_admitted'] += int(add_choice.numel())
+        add_inds = torch.cat([free, over_idx])
+        all_add = torch.cat([add_inds, churn_add])
+        if all_add.numel() > 0:
+            self.replay_buffer.add(
+                sample_batch.subsample_new_batch(all_add),
+                traj=flow_states[all_add.to(flow_states.device)],
+                init_loss=resid[all_add],
+            )
+            self.replay_churn['admitted'] += int(add_inds.numel())
+            self.replay_churn['random_admitted'] += int(churn_add.numel())
+
+        # tail probes (see ten_step_reporting): wall time is what the train step
+        # actually pays, syncs included -- deliberately no cuda.synchronize here
+        self._probe_max('churn_purge_ms_max', (t_add - t_purge) * 1e3)
+        self._probe_max('churn_add_ms_max', (time() - t_add) * 1e3)
+        self._probe_max('churn_purged_max', int(purge_idx.numel()))
+        self._probe_max('churn_added_max', int(all_add.numel()))
 
     def init_prior_buffer_seed(self):
         """
@@ -3001,11 +3193,12 @@ class Modeller:
             z_primes=getattr(seed_batch, 'z_prime', None))
         seed_batch = AnchorBuffer._drop_keys(seed_batch, ("smiles", "identifier"))
         self.prior_buffer = CrystalBuffer(
-            seed_batch.cpu(),
-            device='cpu',
+            seed_batch,
+            device=self.buffer_device,
             max_z_prime=max(self.args.z_primes),
             x_fn=None,
             y_fn=self.args.energy_function,
+            exclude_keys=CHURNED_BUFFER_EXCLUDE_KEYS,
         )
         print(f"Seeded prior_buffer with {len(self.prior_buffer)} prior-dataset samples (fresh loss records)")
 
@@ -3111,11 +3304,12 @@ class Modeller:
         seed_batch = AnchorBuffer._drop_keys(seed_batch, ("smiles", "identifier"))
 
         self.anchor_buffer = AnchorBuffer(
-            seed_batch.cpu(),
-            device='cpu',
+            seed_batch,  # function-owned transient; the buffer moves it to buffer_device itself
+            device=self.buffer_device,
             reward=reward.cpu(),
             energy=energy.cpu(),
             max_z_prime=max(self.args.z_primes),
+            exclude_keys=BULKY_ATTR_EXCLUDE_KEYS,
         )
 
     @torch.no_grad()
@@ -3162,7 +3356,15 @@ class Modeller:
         so one criterion gates both instead of two divergent admission rules.
         (top_up_prior_from_anchors' record-breaker children deliberately
         bypass this gate: a strictly deeper version of an already-admitted
-        anchor needs no fresh novelty judgment -- see that method.)
+        anchor needs no fresh novelty judgment -- and a damaged policy cannot
+        fake a record-breaker, since energies are real; see that method.)
+
+        The whole screen is additionally behind a POLICY-HEALTH gate
+        (health_gate_r2 / health_gate_zerr, see the body): admissions pause
+        while forward calibration or Z's gradient signal is unhealthy --
+        which also means they pause through early buildout and briefly after
+        stage transitions, by design (novelty judged against a miscalibrated
+        ruler isn't novelty).
 
         original_surprise (the TB residual at admission) is stored frozen on
         each admitted anchor and used by thin() to rank the buffer -- centered
@@ -3185,6 +3387,22 @@ class Modeller:
         # gate correctly rejects, making the logged count read 0 while the
         # buffer grows
         self.last_anchor_admitted = getattr(self, 'last_anchor_admitted', 0)
+        # policy-health gate: refuse to adjudicate novelty while the ruler is
+        # broken. Surprise is measured THROUGH the live policy's log_pf, so a
+        # damaged policy reads its own log_pf collapse as nats of fake
+        # surprise on everything (c8utdn8q: 382 admissions in the single eval
+        # inside the 20-22k LR excursion, with fwd/r2 at 0.84-0.89 the whole
+        # window -- and the flood beats condition_log_z's ema_logw absorption,
+        # which cancels a uniform shift only after its half-life lag). Gate on
+        # the same two axes the balance rules trust: calibration (fwd/r2) and
+        # Z's own gradient signal (|EMA'd fwd/tb_resid_clipped|, the zerr
+        # channel). A cold channel (phase-1 seeding: no fwd stats yet)
+        # abstains rather than blocks, preserving seeding behavior exactly.
+        r2 = self.metric_tracker.get('fwd', 'r2')
+        zerr = self.metric_tracker.get('fwd', 'tb_resid_clipped')
+        if ((r2 is not None and r2 < getattr(cfg, 'health_gate_r2', 0.9))
+                or (zerr is not None and abs(zerr) > getattr(cfg, 'health_gate_zerr', 0.5))):
+            return
         log_r = torch.as_tensor(log_r).detach().to(self.device).flatten()
         energy = torch.as_tensor(energy).detach().to(self.device).flatten()
         log_pf_est = torch.as_tensor(log_pf_est).detach().to(self.device).flatten()
@@ -3252,10 +3470,11 @@ class Modeller:
 
         if not hasattr(self, 'anchor_buffer'):
             self.anchor_buffer = AnchorBuffer(
-                admit_batch, device='cpu',
+                admit_batch, device=self.buffer_device,
                 reward=admit_reward, energy=admit_energy,
                 original_surprise=original_surprise,
                 max_z_prime=max(self.args.z_primes),
+                exclude_keys=BULKY_ATTR_EXCLUDE_KEYS,
             )
             self.last_anchor_admitted += len(self.anchor_buffer)
             return
@@ -3295,10 +3514,11 @@ class Modeller:
             if not hasattr(self, 'prior_buffer'):
                 self.prior_buffer = CrystalBuffer(
                     sample_batch,
-                    device='cpu',
+                    device=self.buffer_device,
                     max_z_prime=max(self.args.z_primes),
                     x_fn=None,  # 'latent_params',
-                    y_fn=self.args.energy_function
+                    y_fn=self.args.energy_function,
+                    exclude_keys=CHURNED_BUFFER_EXCLUDE_KEYS,
                 )
             else:
                 self.prior_buffer.add(sample_batch)

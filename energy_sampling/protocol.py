@@ -31,7 +31,8 @@ declares:
                     happens automatically at EVERY transition
   skip_if           entry condition ('prior_loaded'): on a fresh run the stage
                     is skipped when the condition holds (e.g. the MLE warm-
-                    start is redundant when a prior model was loaded by path)
+                    start is redundant when a prior model was loaded by path
+                    or auto-refound via reuse_prior)
 
 Balance rules (kind: lexicographic) walk in order; the FIRST violated rule's
 `boost` mode gets the frac nudge this tick (the same EMA-toward-one-hot nudge
@@ -41,18 +42,30 @@ controller.anneal_patience ticks tightens every annealed rule's threshold.
 A rule is either absolute (`above: X`, annealable) or relative to its own
 running best (`relative: best, margin: M` -- "is this metric DEGRADING",
 never "is it below an absolute bar"; the calibration floor legitimately
-rises as coverage grows, so absolute bars deadlock -- see b9ze0p5c). Rules
-with `anneal` get floor tracking: a metric that stalls while its own mode
-holds priority has hit its achievable floor, so it yields priority and stops
-annealing until a large upward jump (new work) re-arms it -- without this,
-annealing walks the threshold below the floor and pins that priority forever
-(the old tb_err deadlock). kind: proportional instead splits two modes'
-combined mass proportionally to a pair of lagging-spread metrics (the old
-phase-2 balancer, generalized).
+rises as coverage grows, so absolute bars deadlock -- see b9ze0p5c).
+kind: proportional instead splits two modes' combined mass proportionally to
+a pair of lagging-spread metrics (the old phase-2 balancer, generalized).
 
-Mode dormancy is DERIVED, not flagged: a mode no rule (and no default_boost)
-ever boosts has no way off the frac floor, so it is dormant -- the fused step
-skips even its force-refresh rollout (the old bwd_dormant, generalized).
+The same clean-streak anneal event can also RAMP UP energy_config
+coefficients (balance.anneal_coeffs: {bounding_coeff: {start: 1.0}, ...})
+from a soft `start` toward their full config value by controller.decay_rate
+(dividing, not multiplying -- the mirror image of the rule-threshold
+tightening above). Since it only fires once every rule above has gone quiet
+for anneal_patience ticks, it is lexicographically LAST -- the boundary/
+reduction penalty only firms back up to full strength once the terminal
+stage's whole balance has converged, never in place of chasing an active
+violation.
+
+Frac floors are EXPLICIT per stage: min_fracs {mode: floor} (fallback
+controller.min_mode_frac) and an optional per-stage deactivate_threshold. A
+floor at or above the deactivate threshold means that branch is always
+computed; below it, the mode can switch off entirely (s706frkh: bwd sat
+below the global deactivate threshold for ~1700 steps of terminal --
+zero backward gradients -- because the floor/deactivate relationship was
+implicit; each stage now states which modes may go dark). Mode dormancy for
+force-refresh purposes stays DERIVED: a mode no rule (and no default_boost)
+ever boosts is dormant -- the fused step skips even its force-refresh
+rollout (the old bwd_dormant, generalized).
 
 Exit triggers resolve metric names against the RUNNING metric_tracker values
 ('dir/name'), gate-published values ('gates/name', e.g. the MLE slope gate's
@@ -66,7 +79,7 @@ pre-transition snapshot ('phase1_exit' etc., saved with request_eval stamped
 True) replay its transition through the normal path on its first post-resume
 eval.
 
-All mutable engine state (rule bests / floors / streaks, live annealed
+All mutable engine state (rule bests / streaks, live annealed
 thresholds, gate latches, request_eval) lives in modeller.stage_ctrl, which
 is checkpointed and reset at every stage transition. Live thresholds riding
 in stage_ctrl also fixes a latent legacy bug: the old controllers annealed
@@ -98,7 +111,8 @@ def fresh_stage_ctrl():
     return {
         'gates': {},        # gate-published values, e.g. {'mle_flat': 1.0}
         'gate_state': {},   # gate internals, e.g. the MLE slope gate's window
-        'rules': {},        # rule index -> {'best', 'thr', 'floor', 'look'}
+        'rules': {},        # rule index -> {'best', 'thr', 'look'}
+        'coeffs': {},       # anneal_coeffs name -> {'val': live value}
         'exit': {},         # exit term index -> consecutive-pass streak
         'anneal_streak': 0,
         'boost': None,      # last chosen boost mode (logging)
@@ -115,7 +129,8 @@ class Stage:
         if not isinstance(spec, dict):
             raise TypeError(f"protocol.stages[{index}] must be a mapping, got {type(spec)}")
         unknown = set(spec) - {'name', 'train_mode', 'bwd_sampling_mode', 'flags',
-                               'loss_coeffs', 'fracs', 'balance', 'exit',
+                               'loss_coeffs', 'fracs', 'min_fracs',
+                               'deactivate_threshold', 'balance', 'exit',
                                'on_exit', 'on_enter', 'skip_if'}
         if unknown:
             raise ValueError(f"protocol.stages[{index}] has unknown keys {sorted(unknown)}")
@@ -146,6 +161,28 @@ class Stage:
             bad = set(self.fracs) - set(MODES)
             if bad:
                 raise ValueError(f"stage '{self.name}': fracs for unknown modes {sorted(bad)}")
+
+        # explicit per-stage frac floors and branch-deactivation threshold.
+        # min_fracs: {mode: floor} -- unspecified modes fall back to
+        # controller.min_mode_frac. A floor AT OR ABOVE the deactivate
+        # threshold keeps that mode's branch always computed (never skipped by
+        # fused_train_step); a floor below it lets the mode go truly dormant.
+        # Each stage states its intent explicitly -- nothing is derived.
+        self.min_fracs = dict(spec.get('min_fracs') or {})
+        bad = set(self.min_fracs) - set(MODES)
+        if bad:
+            raise ValueError(f"stage '{self.name}': min_fracs for unknown modes {sorted(bad)}")
+        for mode, v in self.min_fracs.items():
+            if not isinstance(v, (int, float)) or not 0.0 <= v < 1.0 / 3:
+                raise ValueError(f"stage '{self.name}': min_fracs.{mode} must be in [0, 1/3), got {v}")
+        if sum(self.min_fracs.values()) >= 1.0:
+            raise ValueError(f"stage '{self.name}': min_fracs sum to >= 1")
+        self.deactivate_threshold = spec.get('deactivate_threshold')
+        if self.deactivate_threshold is not None:
+            v = self.deactivate_threshold
+            if not isinstance(v, (int, float)) or not 0.0 <= v < 1.0 / 3:
+                raise ValueError(f"stage '{self.name}': deactivate_threshold must be in [0, 1/3), got {v}")
+            self.deactivate_threshold = float(v)
 
         self.balance = self._parse_balance(spec.get('balance'))
         self.exit = self._parse_exit(spec.get('exit'))
@@ -202,7 +239,29 @@ class Stage:
                 raise ValueError(f"stage '{self.name}': balance.default_boost must be one of "
                                  f"{MODES} or a {{mode: weight}} mix")
             node['rules'] = [dict(r) for r in rules]
+            # coefficients (e.g. energy_config.bounding_coeff/reduction_coeff)
+            # RAMPED UP from 'start' toward their full energy_config value at
+            # the SAME anneal event as the rule thresholds above -- i.e. only
+            # once every rule has run clean for anneal_patience ticks, so
+            # this is strictly lower priority than (lexicographically after)
+            # all of them: the boundary/reduction penalty only firms up once
+            # the terminal balance is fully converged, never at the cost of
+            # an active violation. Validated against actual energy_config
+            # attributes in StageProtocol.energy_coeffs, since the set of
+            # numeric coefficients is config-defined, not fixed here.
+            anneal_coeffs = dict(node.get('anneal_coeffs') or {})
+            for name, spec in anneal_coeffs.items():
+                if not isinstance(spec, dict) or 'start' not in spec:
+                    raise ValueError(f"stage '{self.name}': anneal_coeffs.{name} needs a 'start'")
+                bad = set(spec) - {'start', 'rate'}
+                if bad:
+                    raise ValueError(f"stage '{self.name}': anneal_coeffs.{name} "
+                                     f"unknown keys {sorted(bad)}")
+            node['anneal_coeffs'] = anneal_coeffs
         elif kind == 'proportional':
+            if node.get('anneal_coeffs'):
+                raise ValueError(f"stage '{self.name}': anneal_coeffs needs kind: lexicographic "
+                                 f"(it anneals off the lexicographic clean-streak event)")
             metrics = node.get('metrics') or {}
             if len(metrics) != 2 or set(metrics) - set(MODES):
                 raise ValueError(f"stage '{self.name}': proportional balance needs a "
@@ -290,6 +349,7 @@ class StageProtocol:
         self.m = modeller
         self._stages = None       # parsed lazily: args may still be assembling at __init__
         self._coeff_defaults = None
+        self._energy_coeff_defaults = None
 
     # ------------------------------------------------------------------ parse
 
@@ -363,6 +423,34 @@ class StageProtocol:
                              f"keys {sorted(unknown)} -- add them to the base "
                              f"{mode}_loss_coeffs block first")
         return {**base, **overrides}
+
+    def energy_coeffs(self) -> dict:
+        """Live values for whichever energy_config coefficients the CURRENT
+        stage's balance.anneal_coeffs names (e.g. {bounding_coeff: 4.2}) --
+        seeded at the stage's `start` (soft) and RAMPED UP toward the
+        config's full value (the ceiling) as anneal events fire (see
+        _anneal). Coefficients no stage ever names are NOT returned here and
+        so are left untouched by set_energy_coeffs -- e.g. lj_coeff, which
+        train.py calibrates once at init from the prior's
+        thermal_scaling_factor (see lj_coeff_silent_override) and this must
+        never clobber back to its static config value."""
+        if self._energy_coeff_defaults is None:
+            self._energy_coeff_defaults = {
+                k: v for k, v in vars(self.m.args.energy_config).items()
+                if isinstance(v, (int, float))}
+        bal = self.stage.balance
+        if not bal or bal['kind'] != 'lexicographic':
+            return {}
+        out = {}
+        for name, spec in bal['anneal_coeffs'].items():
+            if name not in self._energy_coeff_defaults:
+                raise ValueError(f"stage '{self.stage.name}': anneal_coeffs.{name} is not "
+                                 f"a numeric energy_config key")
+            rs = self.ctrl['coeffs'].setdefault(name, {})
+            if 'val' not in rs:
+                rs['val'] = float(spec['start'])
+            out[name] = rs['val']
+        return out
 
     # ---------------------------------------------------------------- metrics
 
@@ -480,8 +568,8 @@ class StageProtocol:
                 # deliberately NOT warm-started from it -- warm-start explicitly
                 # via checkpoint_name + load_weights_only when the architectures
                 # do match
-                print(f"protocol: prior loaded by path -- skipping stage "
-                      f"'{self.stage.name}' (policy weights untouched)")
+                print(f"protocol: prior model loaded (prior_model_name or reuse_prior) "
+                      f"-- skipping stage '{self.stage.name}' (policy weights untouched)")
             self.advance(None, run_exit_actions=False)
 
     def advance(self, eval_metrics, run_exit_actions: bool = True):
@@ -520,10 +608,9 @@ class StageProtocol:
         m.combo_loss_record = []
         m.init_schedulers_optimizers()
         m.set_loss_coeffs()
-        warmup_ticks = m.lr_controller.rearm_warmup()
-        if warmup_ticks:
-            print(f"protocol: optimizers rebuilt, LR re-warming over {warmup_ticks} ticks "
-                  f"(~{warmup_ticks * 10} train steps)")
+        warmup_steps = m.lr_controller.rearm_warmup()
+        if warmup_steps:
+            print(f"protocol: optimizers rebuilt, LR re-warming over {warmup_steps} train steps")
 
         for name, arg in new.on_enter:
             self._run_action(name, arg, eval_metrics)
@@ -647,8 +734,6 @@ class StageProtocol:
     def _rule_violated(self, rule, rs, value):
         if value is None:
             return rule.get('if_missing', 'clean') == 'violated'
-        if rs.get('floor', {}).get('floored'):
-            return False  # at its achievable floor: yields priority (see _floor_track)
         if 'below' in rule:
             # floor violation (e.g. fwd/r2 below 0.9): fixed bar, no anneal.
             # Bounded, saturating metrics like r2 make LOOSE gates here -- they
@@ -670,56 +755,11 @@ class StageProtocol:
         rs['elevation'] = elevation
         return elevation > float(rule.get('margin', 1.3))
 
-    def _floor_track(self, rule, rs, value, held_priority):
-        """A metric that stalls while its own mode holds priority has hit its
-        achievable floor -- it yields priority and stops annealing; a jump of
-        floor_reset_frac above the anchor means new work appeared and re-arms.
-
-        'Stalls' is a WINDOWED NET-improvement test, deliberately not a
-        per-dip best-chase: the stall clock runs while priority is held, and
-        at floor_patience ticks the rule floors unless the metric improved by
-        floor_improve_frac NET against the window's anchor (in which case the
-        anchor re-bases and the clock restarts -- genuine descent never
-        floors). The original form reset the clock on ANY 2% dip below a
-        ratcheting all-time best, which a noisy metric defeats forever:
-        over_coverage is an order-statistic RMS wiggling +-20% around its
-        sampling floor, so it printed a fresh 'best' every few ticks and held
-        replay priority for 6000+ steps against a hard-violated under rule
-        (aijrfwuy, relative_under 5.7 -> 9.0 while bwd sat at the frac floor)
-        -- the exact unreachable-threshold deadlock this tracker exists to
-        break, re-entered through the noise loophole."""
-        if value is None or not math.isfinite(value):
-            return
-        bal = self.stage.balance
-        improve = bal.get('floor_improve_frac', 0.02)
-        fl = rs.setdefault('floor', {'anchor': value, 'stall': 0, 'floored': False})
-        if 'anchor' not in fl:  # state written by the pre-fix ('best'-keyed) tracker
-            fl['anchor'] = fl.pop('best', value)
-        if value > fl['anchor'] * (1.0 + bal.get('floor_reset_frac', 0.5)):
-            fl['anchor'] = value  # new work appeared: re-base and re-arm
-            fl['stall'] = 0
-            fl['floored'] = False
-        elif fl['floored']:
-            # yielded: something else may still improve it -- a genuine net
-            # descent below the anchor proves it responsive again
-            if value < fl['anchor'] * (1.0 - improve):
-                fl['anchor'] = value
-                fl['stall'] = 0
-                fl['floored'] = False
-        elif held_priority:
-            fl['stall'] += 1
-            if fl['stall'] >= bal.get('floor_patience', 50):
-                if value < fl['anchor'] * (1.0 - improve):
-                    fl['anchor'] = value  # net descent over the window: still responding
-                    fl['stall'] = 0
-                else:
-                    fl['floored'] = True
-
     def _anneal(self):
-        """All rules clean for anneal_patience ticks: tighten every annealed,
-        un-floored ABSOLUTE rule's live threshold by controller.decay_rate
-        (per-rule 'rate' overrides), down to its 'min' -- a number, or a metric
-        name resolved live (the dynamic floor that replaced the old
+        """All rules clean for anneal_patience ticks: tighten every annealed
+        ABSOLUTE rule's live threshold by controller.decay_rate (per-rule
+        'rate' overrides), down to its 'min' -- a number, or a metric name
+        resolved live (the dynamic floor that replaced the old
         replay-outcompeting guard: e.g. min: fwd/scatter_err says 'never
         require replay to beat fresh on-policy')."""
         ctrl = self.m.args.controller
@@ -728,8 +768,6 @@ class StageProtocol:
             if not spec or 'above' not in rule:
                 continue
             rs = self._rule_state(i)
-            if rs.get('floor', {}).get('floored'):
-                continue
             rate = float(spec.get('rate', getattr(ctrl, 'decay_rate', 0.95)))
             floor = spec.get('min', 0.0)
             if isinstance(floor, str):
@@ -740,6 +778,21 @@ class StageProtocol:
             if thr > floor:
                 rs['thr'] = max(thr * rate, float(floor))
 
+        # energy_config coefficients (bounding_coeff, reduction_coeff, ...):
+        # same clean-streak event, RAMPED UP from their 'start' toward the
+        # full config value (the ceiling). Since this only runs once every
+        # rule above has gone quiet for anneal_patience ticks, it is
+        # strictly lower priority than all of them -- the lexicographically
+        # last thing to move: the boundary/reduction penalty only firms back
+        # up once the terminal balance is fully converged.
+        for name, spec in self.stage.balance['anneal_coeffs'].items():
+            rate = float(spec.get('rate', getattr(ctrl, 'decay_rate', 0.95)))
+            ceiling = getattr(self.m.args.energy_config, name)
+            rs = self.ctrl['coeffs'].setdefault(name, {})
+            cur = rs.get('val', float(spec['start']))
+            if cur < ceiling:
+                rs['val'] = min(cur / rate, ceiling)
+
     def _balance_tick(self):
         bal = self.stage.balance
         if bal['kind'] == 'proportional':
@@ -748,11 +801,9 @@ class StageProtocol:
         ctrl = self.m.args.controller
 
         chosen = None
-        values = {}
         for i, rule in enumerate(bal['rules']):
             rs = self._rule_state(i)
             v = self._rule_value(rule, rs)
-            values[i] = v
             # every rule is evaluated EVERY tick, even once a higher rule has
             # already won: a relative rule's running best must keep tracking
             # while it is outranked (the legacy controllers computed every
@@ -770,17 +821,9 @@ class StageProtocol:
         else:
             self.ctrl['anneal_streak'] = 0
 
-        # the boost's NAME for floor tracking and logging: a mix default counts
-        # as its dominant mode (so e.g. the over rule keeps accumulating floor
-        # stall through idle ticks exactly as it did under a one-hot replay
-        # default), while the nudge below receives the full mix
+        # the boost's NAME for logging: a mix default counts as its dominant
+        # mode, while the nudge below receives the full mix
         chosen_name = (max(chosen, key=chosen.get) if isinstance(chosen, dict) else chosen)
-
-        # floor tracking counts only while that rule's own mode holds the boost
-        for i, rule in enumerate(bal['rules']):
-            if rule.get('anneal'):
-                self._floor_track(rule, self._rule_state(i), values[i],
-                                  held_priority=(chosen_name == rule['boost']))
 
         self.ctrl['boost'] = chosen_name
         self._nudge_mode_fracs(chosen)
@@ -810,10 +853,12 @@ class StageProtocol:
         self.ctrl['boost'] = mode_a if target > frac_a / total else mode_b
 
     def _nudge_mode_fracs(self, boost):
-        """EMA nudge of the fracs toward a target split, with the
-        min_mode_frac floor -- the mechanics both old controllers shared,
-        generalized from a one-hot: `boost` is a mode name (one-hot target,
-        every rule) or a normalized {mode: weight} mix (idle default)."""
+        """EMA nudge of the fracs toward a target split, with PER-MODE floors
+        -- the stage's explicit min_fracs where given, controller.min_mode_frac
+        otherwise. A floor at or above the stage's deactivate threshold keeps
+        that branch always computed; below it, the mode can go truly dormant.
+        `boost` is a mode name (one-hot target, every rule) or a normalized
+        {mode: weight} mix (idle default)."""
         m = self.m
         ctrl = m.args.controller
         probs = np.array([m.fwd_frac, m.bwd_frac, m.replay_frac], dtype=float)
@@ -821,13 +866,14 @@ class StageProtocol:
         weights = boost if isinstance(boost, dict) else {boost: 1.0}
         target = np.array([weights.get('fwd', 0.0), weights.get('bwd', 0.0),
                            weights.get('replay', 0.0)], dtype=float)
-        m_floor = ctrl.min_mode_frac  # requires m_floor < 1/3
-        free = 1.0 - 3.0 * m_floor
-        excess = np.clip(probs - m_floor, 0.0, None)
+        floors = np.array([self.stage.min_fracs.get(mode, ctrl.min_mode_frac)
+                           for mode in ('fwd', 'bwd', 'replay')], dtype=float)
+        free = 1.0 - floors.sum()  # > 0: floors validated to sum below 1
+        excess = np.clip(probs - floors, 0.0, None)
         s = excess.sum()
         excess = excess * (free / s) if s > 0.0 else np.full(3, free / 3.0)
         excess = (1.0 - ctrl.beta) * excess + ctrl.beta * free * target
-        m.fwd_frac, m.bwd_frac, m.replay_frac = m_floor + excess
+        m.fwd_frac, m.bwd_frac, m.replay_frac = floors + excess
 
     # ---------------------------------------------------------------- logging
 
@@ -856,8 +902,10 @@ class StageProtocol:
                     out[f'protocol/thr_{tag}'] = float(rule.get('margin', 1.3))
                 if 'elevation' in rs:
                     out[f'protocol/elev_{tag}'] = rs['elevation']
-                if rs.get('floor', {}).get('floored'):
-                    out[f'protocol/floored_{tag}'] = 1.0
+            for name in stage.balance['anneal_coeffs']:
+                rs = self.ctrl['coeffs'].get(name)
+                if rs and 'val' in rs:
+                    out[f'protocol/coeff_{name}'] = rs['val']
         if stage.exit:
             for i, term in enumerate(stage.exit):
                 tag = term['metric'].replace('/', '_')

@@ -1,67 +1,97 @@
 import math
 
-import numpy as np
-import torch
 
-from energy_sampling.eval.utils import LossSpikeMonitor
-from energy_sampling.utils import get_discretizer
-
-
-class AdaptiveLRController:
+class LRController:
     """
-    Safety-net LR controller (v5): a single global multiplicative `scale`
-    over the configured per-branch base LRs (lr_policy/lr_back/lr_replay/
-    lr_fused), continuously adapted. No fixed "operating point" to hold at,
-    no reward-channel breach-fraction bookkeeping (that whole apparatus --
-    channel liveness/saturation/pruning, running-bests, warmup-then-HOLD --
-    is gone; see git history on this class for why v1-v4 needed it and why
-    this one doesn't). Two independent halves:
+    Fixed-peak LR controller (v6): a deterministic ramp -> hold -> decay
+    schedule under a FIXED peak (scale never exceeds 1.0 = the configured
+    base LRs), plus two-tier ABSOLUTE tripwires. Replaces the v5 adaptive
+    (probe/coherence) controller wholesale -- see git history. The probe
+    measured update AGREEMENT, which stayed honestly positive straight into
+    detonations (aijrfwuy scale-1.94, s706frkh scale-1.46), and the climb it
+    licensed manufactured the very breaches the balance layer then spent
+    thousands of steps repairing. There is no climb any more: the configured
+    LR is the peak, full stop.
 
-    ADAPT (soft, continuous, every tick): replay a small FIXED batch of
-    stored trajectories -- drawn once from replay_buffer and held fixed --
-    through the CURRENT policy under no_grad (`_score_probe`), and read off
-    log_pf/log_pb. How far has the model's behaviour on these exact inputs
-    moved since last tick (`_probe_mag`), and is that movement accumulating
-    in a consistent direction (`_probe_coh` > 0 -> climb) or reversing tick
-    to tick (`_probe_coh` < 0 -> ease off)? This is a direct, dimensionless
-    read on step size vs local curvature -- the function-space analogue of
-    "do successive updates agree or fight" -- and it survives what would
-    blind a parameter-space version of the same idea: it's phase-agnostic
-    (get_traj_replay doesn't care which branches are "live" right now), it
-    never touches a parameter norm (so it's immune to reparameterization
-    and, unlike an update-magnitude probe, immune to whatever the grad clip
-    does upstream of it), and it catches diffusive scrambling (no consistent
-    update direction to read a sign off of) that a purely directional
-    parameter-space probe would read as neutral.
+    SCHEDULE (ALL durations in TRAIN STEPS -- a pure function of
+    step_ind - stage_start_step, so the controller's own call cadence
+    (currently every 10 steps) can never change what a config value means;
+    restarted by rearm_warmup at every stage transition, so each stage runs
+    its own ramp/hold/decay):
+      ramp:   blind exponential 1/lr_warmup_ratio -> 1.0 over warmup_steps
+              (rebuilt optimizers must not land at the full operating LR on
+              cold Adam moments)
+      hold:   scale 1.0 for hold_steps
+      decay:  exponential toward decay_floor_scale with half-life
+              decay_halflife_steps (0/null = hold at 1.0 forever). Decay buys
+              back the late-run precision the LR jitter floor otherwise caps
+              (weight jitter at the operating LR bounds attainable wass/r2).
+    adaptive_lr.enabled: false pins scale flat at 1.0 -- no ramp, no decay.
+    FIRE runs regardless of the flag.
 
-    FIRE (hard, event-triggered): the same rewind-to-best-checkpoint +
-    ratcheting cut already used for a loss explosion (train.py's
-    fire_loss_spike/on_explosion, unchanged), now armed by THREE independent
-    detectors instead of one: a per-branch loss ceiling breach (`check_spike`
-    -- folded in from the four standalone LossSpikeMonitor instances this
-    replaces, same detection algorithm, same defaults), a pre-clip grad-norm
-    spike (new: the FAST catch, firing in a single tick rather than waiting
-    on a persistence streak or on the loss to follow -- a genuine leading
-    indicator now that gradient_norm_clip is loose (100.0) and rarely binds,
-    so the clip is no longer laundering it away before anyone sees it), and
-    the pre-existing absolute terminal-state bounds check in train.py
-    (_terminal_policy_state, untouched -- that one stays a hard kill switch,
-    not a detector here). All three converge on the same fire_loss_spike()
-    rewind; only the terminal channel compounds the cut via terminal_reloads
-    -- an ordinary spike (loss or gradient) is treated as a recoverable event
-    and gets a flat cut_ratio, same as before.
+    FIRE (two tiers, event-triggered, ABSOLUTE bars -- no medians, no
+    relative baselines. The old floored-median bars failed two-sided in
+    s706frkh: with the median riding the floor they fired on a
+    clip-neutralized grad 745 -- the applied update was identical to any
+    at-clip step -- and once the incident's own 1e4 norms raised the median
+    they went blind exactly when the real excursion began):
+      cut tier   (cut_loss_abs / cut_grad_abs): parameter thrash -- LR cut
+                 only, no rewind. Training state is intact, just too hot.
+      reset tier (reset_loss_abs / reset_grad_abs, or a non-finite reading):
+                 true explosion (tb err at +1e4 scale) -- train.py routes
+                 this to fire_loss_spike's rewind-to-best + cut. Stale best
+                 weights against fresher live buffers re-synchronize quickly
+                 and are an accepted cost here.
+    Cuts multiply an INSTANCE-held _cut_factor -- deliberately NOT in
+    lr_ctrl, which the rewind restores from a healthy checkpoint, erasing
+    any evidence kept there that this LR already detonated (the djr13t0j
+    sawtooth). The factor resets at stage transitions: optimizers are
+    rebuilt onto a new loss surface and the old stage's fire evidence does
+    not transfer.
 
-    Config knobs you actually tune (adaptive_lr.*): adapt_gain (how fast the
-    scale climbs when steps agree / eases off when they fight -- also the
-    per-tick cap, since it multiplies an EMA'd cosine already bounded in
-    [-1, 1]), loss_tripwire_mult and grad_tripwire_mult (how many multiples
-    of a channel's own rolling median counts as an explosion). Everything
-    else below is a sensible default.
+    LATCH: a fire disarms its channel's CUT tier until the metric has
+    recrossed BELOW the cut bar (still pure level logic -- no trends, no
+    baselines). An excursion's decay tail re-tripping the absolute bar at
+    every cooldown expiry is the same single event, and cutting again does
+    not drain it faster (g8d8se26: the first cut did the work; four tail
+    fires on a 17k->1k grad drain dug the factor from 0.25 to the 0.01
+    floor). The reset tier and non-finite readings ignore the latch -- an
+    excursion that ESCALATES past the reset bar is a new fact and must not
+    be blind-windowed (which is also why the fix is a latch and not a
+    longer cooldown: the cooldown suppresses ALL finite readings on the
+    channel, reset tier included). If the metric NEVER recrosses -- a
+    sustained simmer between the bars -- the cut tier stays disarmed, on
+    purpose: repeat cuts demonstrably do not drain a sustained excursion
+    (1219ddv9 degraded monotonically through a 100x cut; the s706frkh
+    runaway ran at policy lr 1e-6), so the stuck state belongs to the
+    reset tier and _terminal_policy_state. What a simmer must NOT do is
+    let recovery re-ramp into it -- see the hot clock below.
 
-    The flow (Z head) LR is still PINNED at lr_flow, exempt from scaling --
-    unchanged from v4 (ylmtpqjy): the ADAPT signal has no sensor mandate over
-    Z, and scaling it with the policy ran the Z head ~20x under design.
-    control_flow_lr: true restores uniform scaling for A/B.
+    RECOVERY (recovery_target_frac > 0): a fire records the cut factor
+    that was running when its episode started -- the measured ceiling.
+    Once the system has been COLD (every monitored reading below its cut
+    bar, no fires) for recovery_wait_steps, the factor re-ramps
+    exponentially over recovery_ramp_steps toward recovery_target_frac x
+    that ceiling, then cruises there (the schedule envelope stays
+    authoritative on top, so ramp/decay behave normally). The wait clock
+    runs from the last HOT reading, not the last fire: a latched channel
+    simmering between the bars fires nothing, and recovery must not raise
+    the LR back into a still-hot state whose cut tier the latch has
+    disarmed -- if the metric never recrosses, recovery never starts. A
+    hot reading during the ramp pauses it in place (anchor resets, clock
+    pushes out) without needing a fire. Episode grouping uses the same
+    clock: a fire after a full cold wait fired at a level recovery
+    deliberately returned to -- new evidence, the ceiling re-records and
+    the cruise target ratchets down (AIMD) instead of sawtoothing;
+    fires inside an ongoing episode keep the original ceiling.
+    Without recovery a cut is permanent for the stage: g8d8se26 spent 24k
+    of its 27k steps pinned at the 0.01 floor with grads 30-50x under the
+    bar, still slowly improving -- pure LR starvation.
+
+    The flow (Z head) LR stays PINNED at lr_flow, exempt from scaling -- the
+    schedule has no sensor mandate over Z, and scaling it ran the Z head
+    ~20x under design (ylmtpqjy). control_flow_lr: true restores uniform
+    scaling for A/B.
     """
 
     CHANNELS = ('fwd', 'bwd', 'replay', 'fused')
@@ -69,20 +99,20 @@ class AdaptiveLRController:
     def __init__(self, modeller):
         self.modeller = modeller
         self._report = {}
-        self._spike_loss = None
-        self._spike_grad = None
-        self._probe_src = None  # lazily-drawn fixed (traj, condition, mol_batch)
         # fire memory, deliberately INSTANCE state and NOT in lr_ctrl: the
-        # rewind that follows every fire restores lr_ctrl from the 'best'
-        # checkpoint, which erases any evidence kept there that this scale
-        # already detonated (the djr13t0j sawtooth; same reasoning as
-        # train.py's terminal_reloads). _fire_steps drives the repeat-fire
-        # escalation in on_explosion; _fire_scales [(step, post-cut scale)]
-        # drives the recent-fire climb ceiling; _fire_counts is per-channel
-        # telemetry.
-        self._fire_steps = []
-        self._fire_scales = []
+        # rewind that follows a reset-tier fire restores lr_ctrl from the
+        # 'best' checkpoint, which would erase any evidence kept there.
+        self._cut_factor = 1.0
         self._fire_counts = {}
+        self._channel_cooldown_until = {}
+        # per-channel cut-tier latch + fire memory for the recovery ramp;
+        # instance state for the same rewind-proofness reason as _cut_factor
+        self._latched = set()
+        self._last_fire_step = None
+        self._last_hot_step = None   # last reading at/above any cut bar (or non-finite)
+        self._pre_trigger_cold = True  # was there a >= recovery_wait cold gap before this tick's readings
+        self._fire_cut_factor = None
+        self._recovery_anchor = None
 
     @property
     def enabled(self):
@@ -94,197 +124,116 @@ class AdaptiveLRController:
 
     # ------------------------------------------------------------- fire (spikes)
 
-    def _spikes(self):
-        """Lazy so a config that isn't fully populated at __init__ time (same
-        laziness as v4's _cfg-per-tick pattern) doesn't matter. window/warmup/
-        cooldown are the same shape LossSpikeMonitor always ran with here;
-        only the ceiling multiple is exposed, per channel-family, as the two
-        knobs users actually look at."""
-        if self._spike_loss is None:
-            self._spike_loss = {
-                name: LossSpikeMonitor(window=200, warmup=250, cooldown=100,
-                                       ceiling_factor=self._cfg('loss_tripwire_mult', 100.0),
-                                       min_baseline=self._cfg('loss_tripwire_floor', 1.0),
-                                       name=f'{name}_loss')
-                for name in self.CHANNELS}
-            # the grad channel's floor defaults to gradient_norm_clip: a
-            # pre-clip norm below ~the clip produces the SAME applied update as
-            # one exactly at it (the clip normalizes magnitude away), so
-            # excursions in that range are already neutralized and firing a
-            # rewind on them punishes a step that was never taken (lepiqh54:
-            # 9 fires at 106-344 vs medians 10-39, all under 6x the bar once
-            # floored at clip=100). The bar bottoms out at
-            # grad_tripwire_mult x clip -- a genuine detonation's grads blow
-            # orders beyond that.
-            grad_floor = self._cfg('grad_tripwire_floor',
-                                   float(getattr(self.modeller.args, 'gradient_norm_clip', 0.0)))
-            self._spike_grad = LossSpikeMonitor(window=200, warmup=250, cooldown=100,
-                                                ceiling_factor=self._cfg('grad_tripwire_mult', 6.0),
-                                                min_baseline=grad_floor,
-                                                name='grad_norm')
-        return self._spike_loss, self._spike_grad
-
     def check_spike(self, step_type, current_loss, grad_norm):
-        """Fast, event-triggered detector feeding train.py's fire_loss_spike().
-        Ports LossSpikeMonitor's actual behaviour unchanged for loss (non-
-        finite, or >= loss_tripwire_mult x this branch's own long-window
-        median, floored -- see LossSpikeMonitor.min_baseline), and applies the
-        identical algorithm to the pre-clip grad norm as a second, faster
-        channel. Either firing routes to the SAME ordinary (non-terminal)
-        rewind-and-cut as before -- see this class's docstring, FIRE
-        paragraph. Every fire is attributed: channel + value + operative bar
-        printed, per-channel counts logged as lr_ctrl/fires_* -- reverse-
-        engineering the firing channel from scale discontinuities (hnh70s0g)
-        is not a diagnosis workflow to repeat."""
-        loss_monitors, grad_monitor = self._spikes()
-        step = self.modeller.step_ind
-        fired = False
-        if current_loss is not None and step_type in loss_monitors:
-            trig = loss_monitors[step_type].record(current_loss, step)
-            if trig:
-                self._note_fire(f'{step_type}_loss', trig)
-                fired = True
-        if grad_norm is not None and math.isfinite(grad_norm):
-            trig = grad_monitor.record(grad_norm, step)
-            if trig:
-                self._note_fire('grad_norm', trig)
-                fired = True
-        return fired
+        """Absolute two-tier tripwires feeding train.py's monitor_losses.
+        Returns None, 'cut' (thrash: LR cut only), or 'reset' (true
+        explosion: rewind + cut). Always on regardless of adaptive_lr.enabled.
 
-    def _note_fire(self, channel: str, trig):
-        """Attribution: say WHICH tripwire fired and against what bar."""
-        self._fire_counts[channel] = self._fire_counts.get(channel, 0) + 1
-        base = trig.long_baseline
-        bar = 'non-finite' if trig.reason == 'non-finite' else (
-            f'bar {base:.4g} (floored median) x factor' if base is not None else '?')
-        print(f"lr_ctrl tripwire FIRED: {channel} [{trig.reason}] value {trig.value:.4g}, "
-              f"{bar}, fire #{self._fire_counts[channel]} on this channel "
-              f"(step {self.modeller.step_ind})")
+        A finite fire arms fire_cooldown_steps on its channel; further finite
+        fires on that channel are suppressed until it expires, so a sustained
+        excursion (or the post-rewind re-sync transient) can't machine-gun
+        cuts/rewinds at the check cadence (the s706frkh 18-fire loop ran at
+        exactly the old cooldown period). Non-finite readings ignore the
+        cooldown -- NaN weights are not going to re-sync on their own."""
+        step = self.modeller.step_ind
+        checks = []
+        if current_loss is not None and step_type in self.CHANNELS:
+            checks.append((f'{step_type}_loss', float(current_loss),
+                           self._cfg('cut_loss_abs', 1.0e3),
+                           self._cfg('reset_loss_abs', 1.0e4)))
+        if grad_norm is not None:
+            checks.append(('grad_norm', float(grad_norm),
+                           self._cfg('cut_grad_abs', 3.0e3),
+                           self._cfg('reset_grad_abs', 3.0e4)))
+
+        cooldown = int(self._cfg('fire_cooldown_steps', 200))
+        # episode grouping for on_explosion: was the system cold (all readings
+        # below the cut bars) for a full recovery_wait before this tick? Uses
+        # the PRE-tick hot clock, because the triggering reading is itself hot.
+        wait = int(self._cfg('recovery_wait_steps', 5000))
+        self._pre_trigger_cold = (self._last_hot_step is None
+                                  or step - int(self._last_hot_step) >= wait)
+        tier = None
+        for channel, value, cut_bar, reset_bar in checks:
+            if (math.isfinite(value) and cut_bar is not None
+                    and value < float(cut_bar)):
+                # healthy reading: the excursion has drained -- re-arm the latch
+                self._latched.discard(channel)
+                continue
+            if not math.isfinite(value):
+                this, bar = 'reset', float('nan')
+            elif reset_bar is not None and value >= float(reset_bar):
+                this, bar = 'reset', float(reset_bar)
+            elif cut_bar is not None and value >= float(cut_bar):
+                this, bar = 'cut', float(cut_bar)
+            else:
+                continue
+            self._last_hot_step = step
+            if math.isfinite(value) and step < self._channel_cooldown_until.get(channel, -1):
+                continue
+            if this == 'cut' and channel in self._latched:
+                # decay tail of an already-cut excursion (still between the
+                # bars): one event, one cut. Reset tier stays armed above.
+                continue
+            self._channel_cooldown_until[channel] = step + cooldown
+            self._latched.add(channel)
+            self._fire_counts[channel] = self._fire_counts.get(channel, 0) + 1
+            print(f"lr_ctrl tripwire FIRED [{this}]: {channel} value {value:.4g} "
+                  f">= bar {bar:.4g} (absolute), fire #{self._fire_counts[channel]} "
+                  f"on this channel (step {step})")
+            if this == 'reset':
+                tier = 'reset'
+            elif tier is None:
+                tier = 'cut'
+        return tier
 
     def reset_spike_monitors(self, names):
-        """Stage-transition hook (protocol.StageProtocol.advance, part of the
-        automatic optimization reset every transition runs). The named
-        branches' loss windows describe the OUTGOING stage's loss scale -- a
-        stale ceiling for the incoming stream -- so those reset. EVERY monitor
-        (including grad_norm, and branches not named) still gets a cooldown: a
-        stage transition can cause transient turbulence anywhere even when
-        that branch's own loss definition didn't change."""
-        loss_monitors, grad_monitor = self._spikes()
+        """Stage-transition hook (protocol.StageProtocol.advance): arm a fire
+        cooldown on every channel. A transition can cause transient
+        turbulence anywhere (rebuilt optimizers, new loss definitions), and
+        that turbulence must not eat a fire."""
         step = self.modeller.step_ind
+        cooldown = int(self._cfg('fire_cooldown_steps', 200))
         for name in names:
-            if name in loss_monitors:
-                loss_monitors[name].reset()
-        for mon in loss_monitors.values():
-            mon.fire_cooldown(step)
-        grad_monitor.fire_cooldown(step)
+            self._channel_cooldown_until[f'{name}_loss'] = step + cooldown
+        self._channel_cooldown_until['grad_norm'] = step + cooldown
 
-    # ------------------------------------------------------------ adapt (probe)
-
-    def _draw_probe(self):
-        """Draw and freeze a small batch of REPLAYED (not resampled)
-        trajectories from replay_buffer. Mirrors draw_replay_sample's body
-        exactly, parameterized on probe_size instead of the live (possibly
-        grown) training batch_size, so the probe's cost stays constant across
-        the run. Only replay_buffer carries stored states -- draw_bwd_sample
-        regenerates its trajectory fresh every step regardless of sampling
-        mode, so 'fixed inputs' is only available here -- which means the
-        probe is unavailable until replay_buffer has samples (early phase 1,
-        typically). That's a bootstrap gap, not a bug: ADAPT simply holds
-        scale flat while polling, the same graceful-degradation idiom this
-        codebase already uses for dormant branches elsewhere."""
+    def on_explosion(self, count: int = 1):
+        """Cut hook, called for BOTH tiers (cut tier directly from
+        monitor_losses; reset tier after fire_loss_spike's rewind). Multiplies
+        the instance-held cut factor by cut_ratio**count -- count > 1 only
+        from repeated TERMINAL rewinds (train.py terminal_reloads), which
+        compound so the ceiling actually descends across policy deaths.
+        Being instance state, the factor survives the rewind that typically
+        precedes this call."""
         m = self.modeller
-        if not (hasattr(m, 'replay_buffer') and len(m.replay_buffer) > 0):
-            return None
-        size = min(int(self._cfg('probe_size', 32)), len(m.replay_buffer))
-        if size < 2:
-            return None
-        with torch.no_grad():
-            mol_batch, traj, inds = next(m.replay_buffer.loader(
-                batch_size=size, mode='graphs', repeats=1, return_inds=True,
-                weighted=False, temperature=0.1, beta=1.0, return_traj=True))
-            traj = traj.to(m.device)
-            mol_batch = mol_batch.to(m.device)
-            mol_batch, log_T_tensor, sg_inds, zps, condition, condition_id = \
-                m.energy_function.condition_samples(mol_batch, repeats=1)
-        return {'traj': traj.detach(), 'condition': condition, 'mol_batch': mol_batch}
-
-    def _score_probe(self, probe):
-        """log_pf/log_pb of the CURRENT policy against the frozen probe
-        trajectories, under no_grad -- get_traj_replay reads states from
-        `trajectory` rather than sampling them, so this never resamples and
-        never touches the training computation graph."""
-        m = self.modeller
-        discretizer = get_discretizer(m.args.integrator)
-        with torch.no_grad():
-            states, log_pfs, log_pbs, log_flow = m.gfn_model.get_traj_replay(
-                probe['traj'], discretizer, probe['condition'], probe['mol_batch'],
-                return_gauss_params=False, freeze_policy=False)
-            y = torch.cat([log_pfs.sum(-1), log_pbs.sum(-1)], dim=0).detach().cpu()
-        return y
-
-    def _probe_tick(self, st):
-        """One ADAPT reading: draw the probe if needed, score it, and fold
-        the resulting displacement into the running EMAs. Returns the
-        coherence EMA to drive the climb/ease step, or None if no probe is
-        available yet (ADAPT should hold flat) or this is the first reading
-        (nothing to compare against yet)."""
-        if self._probe_src is None:
-            self._probe_src = self._draw_probe()
-        if self._probe_src is None:
-            return None
-        y = self._score_probe(self._probe_src)
-        if not torch.isfinite(y).all():
-            # a non-finite probe score is itself spike material, but that's
-            # check_spike's job (loss/grad channels already cover it); here
-            # just decline to adapt off garbage and try a fresh probe next tick
-            self._probe_src = None
-            st['probe_y'] = None
-            return None
-
-        a = 1.0 / max(1, int(self._cfg('ema_horizon', 20)))
-        y_prev = st.get('probe_y')
-        st['probe_y'] = y
-        if y_prev is None or y_prev.shape != y.shape:
-            st['probe_d_ema'] = torch.zeros_like(y)
-            st['probe_mag_ema'] = 0.0
-            st['probe_coh_ema'] = 0.0
-            return None  # need a prior reading to form a displacement
-
-        d = y - y_prev
-        d_ema = st.get('probe_d_ema')
-        if d_ema is None or d_ema.shape != d.shape:
-            d_ema = torch.zeros_like(d)
-        d_ema_norm = d_ema.norm()
-        coh = torch.dot(d, d_ema) / (d.norm() * d_ema_norm) if d_ema_norm > 1e-12 else torch.zeros(())
-        coh = float(torch.nan_to_num(coh, nan=0.0, posinf=0.0, neginf=0.0))
-        mag = float(d.pow(2).mean().sqrt())
-
-        st['probe_d_ema'] = (1 - a) * d_ema + a * d
-        st['probe_mag_ema'] = (1 - a) * st.get('probe_mag_ema', 0.0) + a * mag
-        st['probe_coh_ema'] = (1 - a) * st.get('probe_coh_ema', 0.0) + a * coh
-        return st['probe_coh_ema']
-
-    def _invalidate_probe(self, st):
-        """Force a fresh probe baseline: the next _probe_tick draws a new
-        source (if the buffer's contents have moved on) and treats the next
-        reading as a first sample rather than diffing against a baseline
-        that no longer describes the current policy. Required after any
-        weight-discontinuous event (a checkpoint rewind) and any point where
-        the run's own semantics change under it (phase transition, forced
-        re-warm) -- otherwise the next displacement compares two unrelated
-        policies and both the magnitude and coherence signals are garbage."""
-        self._probe_src = None
-        st['probe_y'] = None
-        st['probe_d_ema'] = None
-        st['probe_mag_ema'] = 0.0
-        st['probe_coh_ema'] = 0.0
+        ratio = float(self._cfg('cut_ratio', 0.5))
+        floor = m.args.min_lr / m.args.lr_policy
+        # fire memory for the recovery ramp: the cut factor RUNNING at the
+        # START of a fire episode is the measured ceiling. An episode begins
+        # with a hot reading after a full recovery_wait of cold ones
+        # (_pre_trigger_cold, stamped by the check_spike call that triggered
+        # this) -- fires inside an ongoing episode (draining tail past the
+        # latch on another channel, sustained simmer escalating to reset,
+        # NaN storm) happened at an already-cut level that proves nothing
+        # about the ceiling, so they keep the recorded level. A new-episode
+        # fire fired at a level recovery deliberately returned to -- new
+        # evidence, re-record, and the cruise target ratchets down (AIMD).
+        if self._pre_trigger_cold or self._fire_cut_factor is None:
+            self._fire_cut_factor = self._cut_factor
+        self._last_fire_step = int(m.step_ind)
+        self._recovery_anchor = None
+        self._cut_factor = max(self._cut_factor * ratio ** max(count, 1), floor)
+        print(f"lr_ctrl: cut factor -> {self._cut_factor:.4g}")
+        st = self._state()
+        st['scale'] = self._schedule_scale(st) * self._cut_factor
+        self._apply_lrs(st)
 
     # ------------------------------------------------------------------ actuator
 
     def _apply_lrs(self, st):
         """lr = configured base x scale per group, floored at min_lr -- EXCEPT
-        the flow (Z head) groups, pinned flat at lr_flow. Unchanged from v4;
-        see class docstring."""
+        the flow (Z head) groups, pinned flat at lr_flow. See class docstring."""
         m = self.modeller
         a = m.args
         control_flow = self._cfg('control_flow_lr', False)
@@ -302,224 +251,133 @@ class AdaptiveLRController:
                 else:
                     g['lr'] = max(a.min_lr, base * st['scale'])
 
-    def _cut(self, st, new_scale, cooldown_mult: int = 1):
-        """Multiplicative decrease, arm a cooldown (scaled by cooldown_mult for
-        repeat-fire escalation), and force a fresh probe baseline (see
-        _invalidate_probe -- the scale just moved, so the next displacement
-        reading must not be diffed against pre-cut history)."""
-        m = self.modeller
-        floor = m.args.min_lr / m.args.lr_policy
-        st['scale'] = float(max(new_scale, floor))
-        st['cooldown_until'] = st['tick'] + self._cfg('cooldown_ticks', 20) * max(1, cooldown_mult)
-        self._invalidate_probe(st)
-
     # ------------------------------------------------------------------ state
 
     def _fresh_state(self, phase):
-        m = self.modeller
         return {
-            'ver': 5,  # v5 = global-scale + function-space ADAPT/FIRE -- invalidates v1-v4 state
+            'ver': 6,  # v6 = fixed-peak schedule -- invalidates v1-v5 state
             'phase_seen': phase,
-            'scale': 1.0 / m.args.lr_warmup_ratio,  # warmup start; ramps to 1.0 (= configured LR)
-            'warmup_done': False,
-            'tick': 0,
-            'cooldown_until': 0,
-            'probe_y': None,
-            'probe_d_ema': None,
-            'probe_mag_ema': 0.0,
-            'probe_coh_ema': 0.0,
+            'stage_start_step': int(self.modeller.step_ind),
+            'scale': 1.0 / self.modeller.args.lr_warmup_ratio,
         }
 
     def _state(self):
         m = self.modeller
         st = getattr(m, 'lr_ctrl', None)
-        if not isinstance(st, dict) or st.get('scale') is None or st.get('ver') != 5:
+        if not isinstance(st, dict) or st.get('ver') != 6:
             st = self._fresh_state(m.phase)
             m.lr_ctrl = st
         elif st.get('phase_seen') != m.phase:
-            # phase change: not an LR event, so keep the running scale (no
-            # re-warmup), but the loss/log-prob levels differ across the
-            # boundary -- cool down and force a fresh probe baseline so the
-            # jump can't spurious-cut or spurious-climb.
+            # stage transitions run rearm_warmup, which owns the reset; this
+            # branch only catches a rewind restoring state from another phase
             st['phase_seen'] = m.phase
-            st['cooldown_until'] = st['tick'] + self._cfg('cooldown_ticks', 20)
-            st['warmup_done'] = True
-            self._invalidate_probe(st)
+        if st.get('stage_start_step', 0) > m.step_ind:
+            # a restore stamped a start ahead of the live clock -- re-anchor
+            st['stage_start_step'] = int(m.step_ind)
         return st
 
     def rearm_warmup(self):
-        """Re-run the blind warmup ramp (1/lr_warmup_ratio -> 1.0 over
-        warmup_ticks) from here, as if the run had just started. Called by
-        protocol.StageProtocol.advance as part of the automatic optimization
-        reset at EVERY stage transition: the optimizers were just rebuilt onto
-        a loss surface with different curvature, so the first steps must not
-        land at the full operating LR with empty Adam moments. Also forces a
-        fresh probe baseline -- the boundary changes what the displacement
-        readings mean.
-
-        Must be called with the stage (and thus m.phase) already switched to
-        its post-transition value, so _state()'s stage-change branch (which
-        forces warmup_done) runs first and this overrides it rather than the
-        other way round."""
+        """Protocol.advance hook at EVERY stage transition: restart the
+        ramp/hold/decay clock (the optimizers were just rebuilt onto a loss
+        surface with different curvature, so the first steps must not land at
+        the full operating LR with empty Adam moments) and forgive
+        accumulated cuts -- the old stage's fire evidence describes a surface
+        that no longer exists. Returns the warmup length in TRAIN STEPS."""
         m = self.modeller
+        st = self._state()
+        st['phase_seen'] = m.phase
+        self._cut_factor = 1.0
+        self._latched.clear()
+        self._last_fire_step = None
+        self._last_hot_step = None
+        self._pre_trigger_cold = True
+        self._fire_cut_factor = None
+        self._recovery_anchor = None
         if not self.enabled:
             return  # disabled: LRs sit flat at configured values, nothing to ramp
-        st = self._state()
-        st['warmup_done'] = False
-        st['tick'] = 0
-        st['scale'] = 1.0 / m.args.lr_warmup_ratio
-        st['cooldown_until'] = 0
-        self._invalidate_probe(st)
+        st['stage_start_step'] = int(m.step_ind)
+        st['scale'] = self._schedule_scale(st)
         self._apply_lrs(st)
-        return int(self._cfg('warmup_ticks', 100))
+        return int(self._cfg('warmup_steps', 1000))
+
+    # ------------------------------------------------------------------ schedule
+
+    def _elapsed(self, st):
+        """TRAIN STEPS since the current stage's schedule started."""
+        return max(0, int(self.modeller.step_ind) - int(st.get('stage_start_step', 0)))
+
+    def _schedule_scale(self, st):
+        """Pure function of train steps since stage start: ramp -> hold ->
+        decay, in [~0, 1.0]. Never above 1.0 -- the configured LR is the peak."""
+        if not self.enabled:
+            return 1.0
+        warmup_steps = max(1, int(self._cfg('warmup_steps', 1000)))
+        elapsed = self._elapsed(st)
+        if elapsed < warmup_steps:
+            frac = elapsed / warmup_steps
+            return (1.0 / self.modeller.args.lr_warmup_ratio) ** (1.0 - frac)
+        half = self._cfg('decay_halflife_steps', 0) or 0
+        past = elapsed - warmup_steps - int(self._cfg('hold_steps', 20000))
+        if half <= 0 or past <= 0:
+            return 1.0
+        return max(float(self._cfg('decay_floor_scale', 0.05)),
+                   0.5 ** (past / float(half)))
+
+    # ---------------------------------------------------------------- recovery
+
+    def _advance_recovery(self):
+        """Re-ramp the cut factor after a quiet period (see class docstring).
+        recovery_target_frac <= 0 (the default) disables recovery entirely --
+        a cut then stays for the stage, the pre-recovery behavior."""
+        frac = float(self._cfg('recovery_target_frac', 0.0))
+        if frac <= 0 or self._last_fire_step is None or self._fire_cut_factor is None:
+            return
+        target = min(1.0, frac * self._fire_cut_factor)
+        if self._cut_factor >= target:
+            return
+        step = int(self.modeller.step_ind)
+        # the wait clock runs from the last HOT reading (any value at/above a
+        # cut bar), not just the last fire: a latched channel simmering
+        # between the bars fires nothing, and ramping the LR back up into a
+        # still-hot state -- with its cut tier disarmed -- must not happen.
+        # If the metric never recrosses, recovery simply never starts.
+        last_event = int(self._last_fire_step)
+        if self._last_hot_step is not None:
+            last_event = max(last_event, int(self._last_hot_step))
+        if step - last_event < int(self._cfg('recovery_wait_steps', 5000)):
+            self._recovery_anchor = None
+            return
+        if self._recovery_anchor is None:
+            self._recovery_anchor = (step, self._cut_factor)
+        a_step, a_val = self._recovery_anchor
+        ramp = max(1, int(self._cfg('recovery_ramp_steps', 1000)))
+        prog = min(1.0, (step - a_step) / ramp)
+        self._cut_factor = min(target, a_val * (target / a_val) ** prog)
 
     # ------------------------------------------------------------------ tick
 
     def step(self):
-        """One controller tick (every 10 train steps from step_lr_schedule).
-        Returns the applied fwd LR, mirroring the legacy path."""
+        """One controller evaluation (called every 10 train steps from
+        step_lr_schedule; the schedule itself is keyed on step_ind, so the
+        call cadence only sets how often LRs are re-stamped). Returns the
+        applied fwd LR, mirroring the legacy path."""
         m = self.modeller
         st = self._state()
-        st['tick'] += 1
-        in_cooldown = st['tick'] < st['cooldown_until']
-
-        if not self.enabled:
-            # ADAPT is off; FIRE (check_spike/on_explosion) is NOT gated by
-            # this flag and keeps running regardless -- same always-on
-            # rewind-on-explosion behaviour this class has always had, only
-            # the climbing/warming half is a switch. Flat at the configured
-            # base LRs, no warmup, no probe.
-            st['scale'] = 1.0
-            self._apply_lrs(st)
-            self._emit(st, warmup=False)
-            return m.optimizers['fwd'].param_groups[0]['lr']
-
-        warmup_ticks = int(self._cfg('warmup_ticks', 100))
-        if not st.get('warmup_done'):
-            # blind exponential ramp (1/warmup_ratio -> 1.0). Keep the probe
-            # warming in the background (cheap, and means ADAPT has a real
-            # baseline the instant warmup ends) without acting on it yet --
-            # the LR itself is moving, so a displacement reading here would
-            # be measuring the ramp, not the model.
-            self._probe_tick(st)
-            frac = min(1.0, st['tick'] / max(1, warmup_ticks))
-            st['scale'] = (1.0 / m.args.lr_warmup_ratio) ** (1.0 - frac)
-            if st['tick'] >= warmup_ticks:
-                st['warmup_done'] = True
-                st['scale'] = 1.0
-            self._apply_lrs(st)
-            self._emit(st, warmup=True)
-            return m.optimizers['fwd'].param_groups[0]['lr']
-
-        # ADAPT regime: continuous climb/ease driven by function-space
-        # displacement coherence. No PERMANENT ceiling -- but two
-        # evidence-based restraints on the climb (aijrfwuy: coherence stayed
-        # honestly positive all the way into a scale-1.94 detonation that took
-        # 13 fires and an ~8k-step repair; coherence measures update
-        # AGREEMENT, not safety margin, so the climb must not outrun the
-        # tripwires that do measure damage):
-        #   1. HEADROOM TAPER: above scale 1.0 the climb gain drops to
-        #      climb_gain_above_base (easing keeps full gain) -- beyond the
-        #      configured LR is exploration, and a ~4x slower approach gives
-        #      the leading grad tripwire many cheap chances to fire NEAR the
-        #      edge instead of deep past it.
-        #   2. RECENT-FIRE CEILING: while any fire is inside
-        #      fire_memory_steps, the climb cannot pass the most conservative
-        #      post-cut level in memory ("the level we cut TO is the level we
-        #      now believe"). Expires with the memory -- a cooling-off, not
-        #      the v4 ratchet.
-        coh = self._probe_tick(st)
-        if not in_cooldown and coh is not None:
-            gain = self._cfg('adapt_gain', 0.02)
-            if coh > 0 and st['scale'] > 1.0:
-                gain = self._cfg('climb_gain_above_base', 0.25 * gain)
-            floor = m.args.min_lr / m.args.lr_policy
-            new_scale = max(floor, st['scale'] * math.exp(gain * coh))
-            if new_scale > st['scale']:
-                horizon = self._cfg('fire_memory_steps', 2000)
-                live = [s for (t, s) in self._fire_scales
-                        if m.step_ind - t <= horizon]
-                if live:
-                    new_scale = min(new_scale, max(st['scale'], min(live)))
-            st['scale'] = new_scale
-
+        self._advance_recovery()
+        st['scale'] = self._schedule_scale(st) * self._cut_factor
         self._apply_lrs(st)
-        self._emit(st, warmup=False)
+        in_warmup = self.enabled and self._elapsed(st) < int(self._cfg('warmup_steps', 1000))
+        self._emit(st, warmup=in_warmup)
         return m.optimizers['fwd'].param_groups[0]['lr']
 
     def _emit(self, st, warmup):
         self._report = {
             'lr_ctrl/scale': st['scale'],
             'lr_ctrl/warmup': float(warmup),
-            'lr_ctrl/probe_coh_ema': st.get('probe_coh_ema', 0.0),
-            'lr_ctrl/probe_mag_ema': st.get('probe_mag_ema', 0.0),
-            'lr_ctrl/probe_available': float(self._probe_src is not None),
-            'lr_ctrl/cooldown': float(st['tick'] < st['cooldown_until']),
+            'lr_ctrl/cut_factor': self._cut_factor,
         }
         for channel, n in self._fire_counts.items():
             self._report[f'lr_ctrl/fires_{channel}'] = n
-        horizon = self._cfg('fire_memory_steps', 2000)
-        live = [s for (t, s) in self._fire_scales
-                if self.modeller.step_ind - t <= horizon]
-        self._report['lr_ctrl/fire_ceiling'] = min(live) if live else float('nan')
 
     def report(self):
         return dict(self._report)
-
-    def on_explosion(self, count: int = 1):
-        """fire_loss_spike hook. Runs AFTER the best-checkpoint rewind
-        restored lr_ctrl from healthy times, so the cut applies to the
-        pre-damage scale. Same multiplicative cut as before, plus a cooldown
-        and a fresh probe baseline (_cut).
-
-        count is the number of TERMINAL rewinds so far (1 for an ordinary
-        loss or grad-norm spike) and compounds the cut to cut_ratio**count.
-        The rewind restores this controller's scale from a checkpoint written
-        while the run was still healthy, which necessarily erases the
-        evidence that this very scale already killed the policy -- so a
-        single flat cut is undone by the next climb and the run walks back
-        into the same detonation (djr13t0j's lr_fwd sawtooth, the original
-        motivation for this ratchet).
-
-        ORDINARY fires now escalate the same way, via the instance-held fire
-        memory (_fire_steps, rewind-proof by construction -- see __init__):
-        each additional fire within fire_memory_steps deepens the cut by one
-        more cut_ratio factor and stretches the cooldown, so a repeatedly
-        detonating run cools longer and retries lower instead of flat-cutting
-        into the same wall every cooldown. The memory DECAYS -- fires older
-        than the horizon drop out -- so this is a cooling-off period, not a
-        permanent ceiling: once fires stop, ADAPT climbs freely again (a
-        one-way ratchet's fixed point is a permanently strangled LR, the
-        exact deadlock shape the threshold anneals also guard against).
-        """
-        st = self._state()
-        step = self.modeller.step_ind
-        horizon = self._cfg('fire_memory_steps', 2000)
-        self._fire_steps = [s for s in self._fire_steps if step - s <= horizon]
-        self._fire_scales = [(t, s) for (t, s) in self._fire_scales if step - t <= horizon]
-        repeat = min(len(self._fire_steps), int(self._cfg('fire_escalation_cap', 4)))
-        self._fire_steps.append(step)
-        exponent = max(count, 1) + repeat
-        self._cut(st, st['scale'] * (self._cfg('cut_ratio', 0.5) ** exponent),
-                  cooldown_mult=1 + repeat)
-        # the level we cut TO is the level we now believe safe: it becomes a
-        # climb ceiling for as long as this fire stays in memory (see step())
-        self._fire_scales.append((step, st['scale']))
-        # a fire ENDS the blind warmup ramp. The ramp's mission -- approach the
-        # configured LR safely on cold Adam moments -- is over the moment
-        # something detonates below its target: the stability edge is now known
-        # to sit under the ramp's destination, and the moments are warm. The
-        # rewind restores lr_ctrl from a mid-warmup 'best', so without this the
-        # ramp resumes immediately (it never consults the cooldown) and
-        # bulldozes back to the edge at a ~150-step doubling time, ignoring
-        # every escalated cool-off (7laa8lbl: four ramp->knee->fire cycles at
-        # the same scale~0.11 knee). Ending warmup hands recovery to ADAPT,
-        # which honors the cooldown and climbs at adapt_gain per tick only
-        # while updates cohere -- the damped approach escalation intends.
-        st['warmup_done'] = True
-        if repeat:
-            print(f"lr_ctrl: fire #{len(self._fire_steps)} within {horizon} steps -- "
-                  f"escalating: cut {self._cfg('cut_ratio', 0.5) ** exponent:.3g}x, "
-                  f"cooldown x{1 + repeat}")
-        self._apply_lrs(st)
-

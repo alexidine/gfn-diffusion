@@ -653,6 +653,7 @@ def main(config_path):
         cond_batch = build_condition_set(cfg, template)
         out_name = getattr(cfg.condition_set, 'output_name', None) or f'{cfg.tag}_conditions.pt'
         out_path = os.path.join(cfg.output_dir, out_name)
+        del cond_batch.fingerprint
         torch.save({'prior': cond_batch}, out_path)
         cond_batch.plot_batch_cell_params(space='latent')
         cond_batch.plot_batch_staircase(space='latent')
@@ -667,6 +668,7 @@ def main(config_path):
             prior_samples_per_condition(cfg, 'equalized_n_samples_total', 'equalized_n_samples_per_condition'))
         out_name = getattr(cfg.prior, 'output_name', None) or f'{cfg.tag}_prior.pt'
         out_path = os.path.join(cfg.output_dir, out_name)
+        del prior_batch.fingerprint, eq_batch.fingerprint
         torch.save({'prior': prior_batch, 'equalized_prior': eq_batch}, out_path)
         print(f"Saved prior -> {out_path} ({prior_batch.num_graphs} / {eq_batch.num_graphs} graphs)")
 

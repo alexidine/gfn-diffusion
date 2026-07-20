@@ -27,6 +27,9 @@ MODELLER_STATE_DEFAULTS = {
     # normal eval -> maybe_advance path. Reset at every stage transition.
     'stage_ctrl': fresh_stage_ctrl(),
     'batch_size': 1,
+    # jump-mode growth (batch_growth_interval > 0): step of the last size jump
+    # (or OOM cut), so the growth clock survives resume
+    'batch_size_last_grow': 0,
     'batch_size_ever_oomed': False,
     # flips permanently once we've OOM'd at least once - switches growth from fast slow-start to slow congestion-avoidance
     'batch_size_cooldown_until': -1,  # step_ind until which batch size growth is frozen after a cut
@@ -38,10 +41,9 @@ MODELLER_STATE_DEFAULTS = {
     'bwd_frac': 1.0,
     'replay_frac': 0.0,
     'combo_loss_record': [],
-    # AdaptiveLRController state (see controller.py): None 'scale' means "not yet
-    # attached" -- the controller builds a fresh state on its first tick (and
-    # whenever 'phase_seen' stops matching the live stage index), so disabled
-    # runs carry this dict around inertly
+    # LRController state (see controller.py): a missing/mismatched 'ver' means
+    # "not yet attached" -- the controller builds a fresh state on its first
+    # tick, so disabled runs carry this dict around inertly
     'lr_ctrl': {'phase_seen': None, 'scale': None},
 }
 
@@ -213,12 +215,13 @@ class Checkpointer:
             print(f"Buffer sidecar {source} was saved under a different problem "
                   f"- ignoring it, buffers start fresh")
             return
+        # all resident stores restore onto the configured buffer_device
         if state.get('prior_buffer') is not None:
-            m.prior_buffer = CrystalBuffer.from_state_dict(state['prior_buffer'], device='cpu')
+            m.prior_buffer = CrystalBuffer.from_state_dict(state['prior_buffer'], device=m.buffer_device)
         if state.get('replay_buffer') is not None:
-            m.replay_buffer = CrystalBuffer.from_state_dict(state['replay_buffer'], device='cpu')
+            m.replay_buffer = CrystalBuffer.from_state_dict(state['replay_buffer'], device=m.buffer_device)
         if state.get('anchor_buffer') is not None:
-            m.anchor_buffer = AnchorBuffer.from_state_dict(state['anchor_buffer'], device='cpu')
+            m.anchor_buffer = AnchorBuffer.from_state_dict(state['anchor_buffer'], device=m.buffer_device)
 
     def load_buffers_for(self, checkpoint_path: str) -> bool:
         """
@@ -334,9 +337,9 @@ class Checkpointer:
 
             if getattr(m.args, 'override_learning_rates', False):
                 # overwrite just the numeric LR the checkpoint's optimizer state
-                # restored with this config's target rate - AdaptiveLRController's
-                # own state (lr_ctrl: scale/warmup/probe) is untouched, so it
-                # carries on adapting from this new value on its very next tick
+                # restored with this config's target rate - LRController's
+                # own state (lr_ctrl: stage_start_step/scale) is untouched, so its
+                # schedule re-stamps every LR on its very next tick
                 # (which will itself overwrite whatever is set here -- this only
                 # matters for the steps between restore and that next tick).
                 # Adam's momentum buffers (exp_avg/exp_avg_sq) are also left as-is.

@@ -1166,16 +1166,18 @@ def visualize_latent_trajs(states, n_trajs, log_r):
         for j in range(n_trajs):
             row = i // 3 + 1
             col = i % 3 + 1
+            # NB no marker_* kwargs here: mode='lines' never draws them, and
+            # marker_color=log_r used to embed the full [batch] array in every
+            # trace (~12 MB of figure JSON at batch 2500), tripping
+            # adjust_fig_filesize's 1 MB gate and a multi-second kaleido
+            # rasterization per eval
             fig.add_trace(go.Scatter(
                 x=trajs[j, :, i], y=steps,
                 name=f"Traj {j}",
                 legendgroup=f"Traj {j}",
                 opacity=0.5,
                 mode='lines',
-                marker_line_width=0.5,
                 showlegend=True if i == 0 else False,
-                marker_color=log_r,  # color_hex[j],
-                marker_colorscale='Jet',
             ),
                 row=row, col=col
             )

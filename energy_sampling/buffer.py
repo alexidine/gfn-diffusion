@@ -1,3 +1,4 @@
+import copy
 import math
 from typing import Optional
 
@@ -54,13 +55,21 @@ class CrystalBuffer:
             y_fn=None,
             traj: Optional[torch.Tensor] = None,
             init_loss: Optional[torch.Tensor] = None,
+            exclude_keys: Optional[tuple] = None,
     ):
         self.device = device
         self.max_z_prime = max_z_prime
         self.x_fn = x_fn
         self.y_fn = y_fn
+        # keys stripped from STORAGE at admission (draws already drop them):
+        # churned buffers don't need string/list attrs, and python-list keys
+        # force a per-subsample idx.tolist() -- a device sync on GPU-resident
+        # buffers -- plus per-element copying on every rebuild
+        self.exclude_keys = tuple(exclude_keys) if exclude_keys else ()
 
         self.batch = self._as_batch(data).to(device)
+        self._drop_keys(self.batch, self.exclude_keys)
+        self._orient_stored_batch(self.batch)
         self.x, self.y = self._compute_xy(self.batch)
 
         n = len(self)
@@ -91,11 +100,19 @@ class CrystalBuffer:
     # ---------------------------------------------------------------------
 
     def state_dict(self):
+        # NB copy.copy first: PyG's Data.cpu()/.to() MUTATE IN PLACE (apply
+        # rewrites the store and returns self), so a bare self.batch.cpu()
+        # here silently demoted the entire live GPU-resident buffer to CPU at
+        # every save_buffers -- i.e. at the first eval -- which is exactly the
+        # bug that made buffer_device: cuda appear to change nothing. The
+        # shallow copy gives .cpu() its own store to rewrite; tensor-level
+        # .cpu() is non-mutating, so the live tensors are untouched.
         return {
-            'batch': self.batch.cpu(),
+            'batch': copy.copy(self.batch).cpu(),
             'max_z_prime': self.max_z_prime,
             'x_fn': self.x_fn,
             'y_fn': self.y_fn,
+            'exclude_keys': getattr(self, 'exclude_keys', ()),
             'x': self.x.cpu(),
             'y': self.y.cpu() if self.y is not None else None,
             'ema_loss': self.ema_loss.cpu(),
@@ -113,12 +130,16 @@ class CrystalBuffer:
         obj.max_z_prime = state['max_z_prime']
         obj.x_fn = state['x_fn']
         obj.y_fn = state['y_fn']
+        obj.exclude_keys = tuple(state.get('exclude_keys', ()) or ())
         obj.batch = state['batch'].to(device)
         # A checkpoint may have been pickled with stale/differently-shaped
         # versions of these caches (e.g. from an older codebase covering fewer
         # space groups). Strip them so they rebuild fresh and consistent with
         # every other batch in this run. See strip_lazy_sg_caches for details.
         strip_lazy_sg_caches(obj.batch)
+        # Older checkpoints stored unoriented graphs (orientation used to
+        # happen per-draw in sample_graphs).
+        cls._orient_stored_batch(obj.batch)
         obj.x = state['x'].to(device)
         obj.y = state['y'].to(device) if state['y'] is not None else None
         # These are CPU-resident bookkeeping tensors, but torch.load's map_location
@@ -155,6 +176,16 @@ class CrystalBuffer:
 
         data.box_analysis()
         return data
+
+    @staticmethod
+    def _orient_stored_batch(batch):
+        """
+        Std-orient molecules once at admission, so sample_graphs draws skip the
+        per-draw recenter + principal-axes work (rows are drawn far more often
+        than they are admitted, and std orientation is idempotent).
+        """
+        if batch.num_graphs > 0:
+            batch.orient_molecule(mode="std")
 
     def _compute_xy(self, batch):
         """
@@ -326,7 +357,6 @@ class CrystalBuffer:
             replace: Optional[bool] = None,
             repeats: int = 1,
             exclude_keys=("symmetry_operators", "smiles", "identifier"),
-            orient: bool = True,
             weighted: bool = False,
             temperature: Optional[float] = None,
             beta: Optional[float] = None,
@@ -343,12 +373,10 @@ class CrystalBuffer:
                                     condition_block_m=condition_block_m)
         self._bump_counts(inds)
 
-        # No data_list round trip.
+        # No data_list round trip. Storage is std-oriented at admission
+        # (_orient_stored_batch), so draws need no per-draw orientation.
         graphs = self.batch.subsample_new_batch(inds)
         graphs = self._drop_keys(graphs, exclude_keys)
-
-        if orient:
-            graphs.orient_molecule(mode="std")
 
         if return_traj and self.traj is not None:
             t_inds = torch.as_tensor(inds, device=self.device, dtype=torch.long)
@@ -539,6 +567,8 @@ class CrystalBuffer:
         if new_batch.num_graphs == 0:
             return
 
+        self._drop_keys(new_batch, getattr(self, 'exclude_keys', ()))
+        self._orient_stored_batch(new_batch)
         new_x, new_y = self._compute_xy(new_batch)
 
         # _compute_xy's latent transform lazily builds the space-group caches on
@@ -547,7 +577,13 @@ class CrystalBuffer:
         strip_lazy_sg_caches(self.batch)
         strip_lazy_sg_caches(new_batch)
 
-        self.batch = self.batch.append_batch(new_batch)
+        # validate=False: the shared-metadata equality checks are torch.equal
+        # on device tensors -- each one is a stream sync, priced at whatever
+        # the GPU has queued (the buffer-churn spike mechanism). This admission
+        # path runs every train step on homogeneous same-pipeline batches;
+        # shared metadata here is uniform by construction (_as_batch enforces
+        # max_z_prime, lazy SG caches are stripped above).
+        self.batch = self.batch.append_batch(new_batch, validate=False)
 
         self.x = torch.cat([self.x, new_x], dim=0)
 
@@ -1681,8 +1717,10 @@ class AnchorBuffer(CrystalBuffer):
             original_surprise=None,
             max_z_prime: int = 1,
             x_fn=None,
+            exclude_keys: Optional[tuple] = None,
     ):
-        super().__init__(data, device, max_z_prime=max_z_prime, x_fn=x_fn, y_fn=None)
+        super().__init__(data, device, max_z_prime=max_z_prime, x_fn=x_fn, y_fn=None,
+                         exclude_keys=exclude_keys)
         n = len(self)
         self.reward = torch.as_tensor(reward, dtype=torch.float32).detach().cpu().flatten()
         assert self.reward.shape[0] == n, \
