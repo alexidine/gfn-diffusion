@@ -1,0 +1,160 @@
+- index: 0
+  run_name: toy_h1024x4_T40_lr1.0e-4
+  family: toy
+  width: 1024
+  layers: 4
+  T: 40
+  peak_lr: 0.0001
+  warmup_steps: null
+  wall_off: false
+  note: 'anchor: reproduce uncond_july20 best'
+- index: 1
+  run_name: toy_h1024x4_T40_lr2.0e-4
+  family: toy
+  width: 1024
+  layers: 4
+  T: 40
+  peak_lr: 0.0002
+  warmup_steps: null
+  wall_off: false
+  note: T40 ceiling probe from above
+- index: 2
+  run_name: toy_h1024x4_T40_lr1.0e-4_w300
+  family: toy
+  width: 1024
+  layers: 4
+  T: 40
+  peak_lr: 0.0001
+  warmup_steps: 300
+  wall_off: false
+  note: fast per-stage ramp
+- index: 3
+  run_name: toy_h512x4_T40_lr5.0e-5
+  family: toy
+  width: 512
+  layers: 4
+  T: 40
+  peak_lr: 5.0e-05
+  warmup_steps: null
+  wall_off: false
+  note: half measured 512x4 ceiling
+- index: 4
+  run_name: toy_h1024x4_T20_lr1.0e-5
+  family: toy
+  width: 1024
+  layers: 4
+  T: 20
+  peak_lr: 1.0e-05
+  warmup_steps: null
+  wall_off: false
+  note: T-deconfound at safe peak
+- index: 5
+  run_name: toy_h512x4_T20_lr2.5e-5
+  family: toy
+  width: 512
+  layers: 4
+  T: 20
+  peak_lr: 2.5e-05
+  warmup_steps: null
+  wall_off: false
+  note: T-deconfound at safe peak
+- index: 6
+  run_name: toy_h512x4_T10_lr3.0e-5
+  family: toy
+  width: 512
+  layers: 4
+  T: 10
+  peak_lr: 3.0e-05
+  warmup_steps: null
+  wall_off: false
+  note: fastest-per-step candidate
+- index: 7
+  run_name: toy_h512x4_T10_lr3.0e-5_nowall
+  family: toy
+  width: 512
+  layers: 4
+  T: 10
+  peak_lr: 3.0e-05
+  warmup_steps: null
+  wall_off: true
+  note: soft-wall A/B pair with run 6
+- index: 8
+  run_name: elj_h512x4_T25_lr7.5e-5
+  family: elj
+  width: 512
+  layers: 4
+  T: 25
+  peak_lr: 7.5e-05
+  warmup_steps: null
+  wall_off: false
+  note: anchor at known-stable point
+- index: 9
+  run_name: elj_h512x4_T40_lr7.5e-5
+  family: elj
+  width: 512
+  layers: 4
+  T: 40
+  peak_lr: 7.5e-05
+  warmup_steps: null
+  wall_off: false
+  note: T40 transfer
+- index: 10
+  run_name: elj_h512x4_T10_lr7.5e-5
+  family: elj
+  width: 512
+  layers: 4
+  T: 10
+  peak_lr: 7.5e-05
+  warmup_steps: null
+  wall_off: false
+  note: short-T transfer
+- index: 11
+  run_name: elj_h1024x4_T25_lr2.0e-5
+  family: elj
+  width: 1024
+  layers: 4
+  T: 25
+  peak_lr: 2.0e-05
+  warmup_steps: null
+  wall_off: false
+  note: width transfer at toy-scaled peak
+- index: 12
+  run_name: elj_h1024x4_T40_lr2.0e-5
+  family: elj
+  width: 1024
+  layers: 4
+  T: 40
+  peak_lr: 2.0e-05
+  warmup_steps: null
+  wall_off: false
+  note: toy best corner on real problem
+- index: 13
+  run_name: elj_h512x4_T25_lr1.5e-4
+  family: elj
+  width: 512
+  layers: 4
+  T: 25
+  peak_lr: 0.00015
+  warmup_steps: null
+  wall_off: false
+  note: 512 ceiling probe (overshoot expected)
+- index: 14
+  run_name: elj_h1024x4_T25_lr6.0e-5
+  family: elj
+  width: 1024
+  layers: 4
+  T: 25
+  peak_lr: 6.0e-05
+  warmup_steps: null
+  wall_off: false
+  note: 1024 ceiling probe (overshoot expected)
+- index: 15
+  run_name: elj_h512x6_T25_lr4.0e-5
+  family: elj
+  width: 512
+  layers: 6
+  T: 25
+  peak_lr: 4.0e-05
+  warmup_steps: null
+  wall_off: false
+  note: depth transfer

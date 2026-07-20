@@ -251,7 +251,7 @@ class MolecularCrystal(BaseSet):
         ens_dict = {}
 
         latents = crystal_batch.latent_params()
-        if (raw_latents is not None and self.is_crystal):
+        if raw_latents is not None:
             upper_violation = F.relu(raw_latents - 1)
             lower_violation = F.relu(-(raw_latents + 1))
             # quadratic term gives a gentle, zero-slope onset right at the boundary; quartic

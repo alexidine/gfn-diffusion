@@ -47,14 +47,17 @@ kind: proportional instead splits two modes' combined mass proportionally to
 a pair of lagging-spread metrics (the old phase-2 balancer, generalized).
 
 The same clean-streak anneal event can also RAMP UP energy_config
-coefficients (balance.anneal_coeffs: {bounding_coeff: {start: 1.0}, ...})
-from a soft `start` toward their full config value by controller.decay_rate
-(dividing, not multiplying -- the mirror image of the rule-threshold
-tightening above). Since it only fires once every rule above has gone quiet
-for anneal_patience ticks, it is lexicographically LAST -- the boundary/
-reduction penalty only firms back up to full strength once the terminal
-stage's whole balance has converged, never in place of chasing an active
-violation.
+coefficients (balance.anneal_coeffs: {bounding_coeff: {target: 10.0}, ...})
+by controller.decay_rate (dividing, not multiplying -- the mirror image of
+the rule-threshold tightening above). The base energy_config value is the
+SOFT one -- it's what the energy function is constructed with, so it holds
+for every stage from run start, including stages that name nothing here;
+only once a stage's own anneal events fire does its live value climb off
+that base toward its `target`. Since that only happens once every rule
+above has gone quiet for anneal_patience ticks, it is lexicographically
+LAST -- the boundary/reduction penalty only firms back up to full strength
+once that stage's whole balance has converged, never in place of chasing an
+active violation.
 
 Frac floors are EXPLICIT per stage: min_fracs {mode: floor} (fallback
 controller.min_mode_frac) and an optional per-stage deactivate_threshold. A
@@ -240,20 +243,21 @@ class Stage:
                                  f"{MODES} or a {{mode: weight}} mix")
             node['rules'] = [dict(r) for r in rules]
             # coefficients (e.g. energy_config.bounding_coeff/reduction_coeff)
-            # RAMPED UP from 'start' toward their full energy_config value at
-            # the SAME anneal event as the rule thresholds above -- i.e. only
-            # once every rule has run clean for anneal_patience ticks, so
-            # this is strictly lower priority than (lexicographically after)
-            # all of them: the boundary/reduction penalty only firms up once
-            # the terminal balance is fully converged, never at the cost of
-            # an active violation. Validated against actual energy_config
-            # attributes in StageProtocol.energy_coeffs, since the set of
-            # numeric coefficients is config-defined, not fixed here.
+            # RAMPED UP from the base energy_config value (kept LOW there so
+            # it's soft for every stage, from run start) toward 'target' once
+            # THIS stage's balance runs clean -- the SAME anneal event as the
+            # rule thresholds above, so strictly lower priority than
+            # (lexicographically after) all of them: the boundary/reduction
+            # penalty only firms up to full strength once this stage is fully
+            # converged, never at the cost of an active violation. Validated
+            # against actual energy_config attributes in
+            # StageProtocol.energy_coeffs, since the set of numeric
+            # coefficients is config-defined, not fixed here.
             anneal_coeffs = dict(node.get('anneal_coeffs') or {})
             for name, spec in anneal_coeffs.items():
-                if not isinstance(spec, dict) or 'start' not in spec:
-                    raise ValueError(f"stage '{self.name}': anneal_coeffs.{name} needs a 'start'")
-                bad = set(spec) - {'start', 'rate'}
+                if not isinstance(spec, dict) or 'target' not in spec:
+                    raise ValueError(f"stage '{self.name}': anneal_coeffs.{name} needs a 'target'")
+                bad = set(spec) - {'target', 'rate'}
                 if bad:
                     raise ValueError(f"stage '{self.name}': anneal_coeffs.{name} "
                                      f"unknown keys {sorted(bad)}")
@@ -426,12 +430,15 @@ class StageProtocol:
 
     def energy_coeffs(self) -> dict:
         """Live values for whichever energy_config coefficients the CURRENT
-        stage's balance.anneal_coeffs names (e.g. {bounding_coeff: 4.2}) --
-        seeded at the stage's `start` (soft) and RAMPED UP toward the
-        config's full value (the ceiling) as anneal events fire (see
-        _anneal). Coefficients no stage ever names are NOT returned here and
-        so are left untouched by set_energy_coeffs -- e.g. lj_coeff, which
-        train.py calibrates once at init from the prior's
+        stage's balance.anneal_coeffs names (e.g. {bounding_coeff: 4.2}).
+        The base energy_config value is the SOFT one -- it's what
+        self.energy_function is constructed with, so it's already in effect
+        for every stage from run start, including stages that name nothing
+        here. Only once THIS stage's anneal events start firing (see
+        _anneal) does the live value leave that base and ramp up toward the
+        stage's own `target`. Coefficients no stage ever names are NOT
+        returned here and so are left untouched by set_energy_coeffs -- e.g.
+        lj_coeff, which train.py calibrates once at init from the prior's
         thermal_scaling_factor (see lj_coeff_silent_override) and this must
         never clobber back to its static config value."""
         if self._energy_coeff_defaults is None:
@@ -448,7 +455,7 @@ class StageProtocol:
                                  f"a numeric energy_config key")
             rs = self.ctrl['coeffs'].setdefault(name, {})
             if 'val' not in rs:
-                rs['val'] = float(spec['start'])
+                rs['val'] = self._energy_coeff_defaults[name]
             out[name] = rs['val']
         return out
 
@@ -779,19 +786,24 @@ class StageProtocol:
                 rs['thr'] = max(thr * rate, float(floor))
 
         # energy_config coefficients (bounding_coeff, reduction_coeff, ...):
-        # same clean-streak event, RAMPED UP from their 'start' toward the
-        # full config value (the ceiling). Since this only runs once every
-        # rule above has gone quiet for anneal_patience ticks, it is
-        # strictly lower priority than all of them -- the lexicographically
-        # last thing to move: the boundary/reduction penalty only firms back
-        # up once the terminal balance is fully converged.
+        # same clean-streak event, RAMPED UP from the base config value
+        # (soft, in effect since run start) toward this stage's 'target'.
+        # Since this only runs once every rule above has gone quiet for
+        # anneal_patience ticks, it is strictly lower priority than all of
+        # them -- the lexicographically last thing to move: the
+        # boundary/reduction penalty only firms up to full strength once
+        # THIS stage's balance is fully converged.
+        if self._energy_coeff_defaults is None:  # normally seeded by energy_coeffs() first
+            self._energy_coeff_defaults = {
+                k: v for k, v in vars(self.m.args.energy_config).items()
+                if isinstance(v, (int, float))}
         for name, spec in self.stage.balance['anneal_coeffs'].items():
             rate = float(spec.get('rate', getattr(ctrl, 'decay_rate', 0.95)))
-            ceiling = getattr(self.m.args.energy_config, name)
+            target = float(spec['target'])
             rs = self.ctrl['coeffs'].setdefault(name, {})
-            cur = rs.get('val', float(spec['start']))
-            if cur < ceiling:
-                rs['val'] = min(cur / rate, ceiling)
+            cur = rs.get('val', self._energy_coeff_defaults[name])
+            if cur < target:
+                rs['val'] = min(cur / rate, target)
 
     def _balance_tick(self):
         bal = self.stage.balance

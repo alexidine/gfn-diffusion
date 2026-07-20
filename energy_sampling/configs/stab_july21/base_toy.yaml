@@ -1,5 +1,5 @@
-run_name: 'mk_dev'
-tag: 'dev'
+run_name: 'stab_july21'
+tag: 'stab_july21'
 seed: 12345
 device: 'cuda'
 cuda_memory_fraction: 0.9
@@ -9,11 +9,11 @@ anomaly_detection: false  # dramatic slowdown when True
 ################################################################
 continue_from_checkpoint: false
 mlip_path: null #'D:\crystal_datasets\esen_s.pt' # C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model
-prior_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt
-molecules_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt
+prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/toy_2harm_prior.pt
+molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/toy_2harm_conditions.pt
 test_molecules_path: null
-checkpoints_dir: 'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints'
-checkpoint_name: dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-22b5c5_prior.pt #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-88792d_phase1_exit #dev_mk_dev_latent_harmonic-toy_2cond_prior-T1-48d154_prior.pt #dev_mk_dev_latent_multiharmonic-toy_2cond_prior-T1-73224a_prior.pt
+checkpoints_dir: '/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/'
+checkpoint_name: null #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-88792d_phase1_exit #dev_mk_dev_latent_harmonic-toy_2cond_prior-T1-48d154_prior.pt #dev_mk_dev_latent_multiharmonic-toy_2cond_prior-T1-73224a_prior.pt
 prior_model_name: null #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-88792d_prior.pt #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-88792d_prior.pt #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-88792d_prior.pt #dev_mk_dev_latent_harmonic-toy_2cond_prior-T1-48d154_prior.pt #dev_mk_dev_latent_multiharmonic-toy_2cond_prior-T1-73224a_prior.pt
 # prior_model_name loads a SEPARATE frozen GFN used only for prior-buffer sampling. It is rebuilt from its
 # own stored gfn_config, so it may be any architecture/conditioning (only the problem TARGET must match --
@@ -21,7 +21,7 @@ prior_model_name: null #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-887
 # weights. To ALSO warm-start the policy from it, point checkpoint_name at the same file with
 # load_weights_only: true (requires matching architecture).
 reuse_prior: true  # if true and prior_model_name is null, auto-reload this run's own saved prior checkpoint ({run_name}_{problem_slug}_prior.pt) as the frozen prior model, provided its stored problem_def matches this config exactly (stricter than prior_model_name: no conditioning exemption -- the file was written under this same identity). A fresh run then skips the warm-start stage via skip_if: prior_loaded, exactly as if the path were given; missing/mismatched checkpoint = train phase 1 normally (which re-saves it). Policy weights/optimizers/buffers untouched -- warm-starting stays explicit via checkpoint_name + load_weights_only
-load_weights_only: true  # if true, checkpoint_name loads just the model/EMA weights into an otherwise-fresh run - optimizers, buffers, metrics, and phase/step state all initialize from scratch
+load_weights_only: false  # if true, checkpoint_name loads just the model/EMA weights into an otherwise-fresh run - optimizers, buffers, metrics, and phase/step state all initialize from scratch
 # (no override_loss_coeffs any more: checkpoints carry only the stage name; live
 # coefficients always re-derive from this config's protocol block on resume)
 override_learning_rates: false  # if true, overwrite just the numeric LR restored from a resumed checkpoint's optimizers with this config's lr_* values - warmup/anneal status and Adam momentum buffers are left as-is
@@ -75,12 +75,12 @@ adaptive_lr:
   # re-records the firing level, so repeat detonations ratchet the cruise
   # target down (AIMD) rather than sawtoothing at the ceiling.
   recovery_target_frac: 0.5    # cruise at this fraction of the cut factor that was running at the last fire (0 = no recovery, cuts are stage-permanent)
-  recovery_wait_steps: 3000    # COLD train steps (no fires AND every monitored reading below its cut bar) before the re-ramp starts -- a latched channel simmering between the bars blocks recovery indefinitely rather than being ramped back into (the drain after g8d8se26's caught excursion took ~600 steps; LR cuts do not accelerate it -- LR is the trigger, not the sustainer)
+  recovery_wait_steps: 5000    # COLD train steps (no fires AND every monitored reading below its cut bar) before the re-ramp starts -- a latched channel simmering between the bars blocks recovery indefinitely rather than being ramped back into (the drain after g8d8se26's caught excursion took ~600 steps; LR cuts do not accelerate it -- LR is the trigger, not the sustainer)
   recovery_ramp_steps: 1000    # exponential re-ramp duration from the cut level to the cruise target
   control_flow_lr: false       # false (default): flow/Z-head groups PINNED at lr_flow, exempt from scaling (the schedule has no sensor mandate over Z; scaling it ran the Z head ~20x under design, ylmtpqjy). true = uniform scaling, for A/B
 weight_decay: 1.0e-4
 use_weight_decay: false
-compile_policy: auto           # torch.compile the dense policy trunk (t/s encoders, fwd/bwd policies, flow) with inductor kernel fusion (default mode; CUDA graphs are incompatible with the T-times-per-rollout module re-invocation pattern) -- the fused loop is launch-overhead-bound (~30% GPU util at batch 2500 locally), this is the lever. 'auto' = Linux+CUDA only (inductor has no CUDA support on native Windows, so dev boxes stay eager); true/false force it. Compile errors degrade to eager with a warning rather than crashing. Recompiles on every new batch size, so prefer grow_batch_size: false alongside it
+compile_policy: auto           # torch.compile the dense policy trunk (t/s encoders, fwd/bwd policies, flow) with mode='reduce-overhead' (CUDA graphs) -- the fused loop is launch-overhead-bound (~30% GPU util at batch 2500 locally), this is the lever. 'auto' = Linux+CUDA only (inductor has no CUDA support on native Windows, so dev boxes stay eager); true/false force it. Compile errors degrade to eager with a warning rather than crashing. Recompiles on every new batch size, so prefer grow_batch_size: false alongside it
 gradient_norm_clip: 100.0        # gradient norm clip for updating gfn model weights
 ema_decay: null #0.95  # set to null for no ema # NOTE this breaks some important statistics - leave as null for now
 
@@ -130,7 +130,7 @@ model:
   # identifies points within the fundamental domain, which we aren't exploring yet.
   # Changes expanded_dim (wrapped dims get a sin/cos encoding), so it is NOT checkpoint
   # compatible with a run trained without it.
-  periodic_centroids: true  # for physical problems on crystals, not toy problems
+  periodic_centroids: false
   # diagonal-plus-low-rank (DPLR) forward covariance: C = diag(d) + V V^T, forward SDE only.
   # fixed marginal-variance budget: rho redistributes the existing policy variance
   # between private (d) and correlated (V) parts, it never inflates the marginal.
@@ -143,7 +143,7 @@ model:
 buffer_device: cuda           # where the churned/static sample stores live (replay + prior + anchor buffers, mol/prior datasets). 'cuda' turns per-step buffer draws/admits/purges into async device gathers instead of serial CPU work + host round trips; footprint is ~1KB/graph (250k graphs ~ 250MB) so VRAM cost is negligible next to activations. 'cpu' = legacy
 batch_size: 1000              # number of samples per training batch -- single shared batch size for all rollout work (train fwd/bwd/replay/fused AND eval sampling), so there's one adaptive value reacting to OOMs instead of several independently-tuned ones
 grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 50000
+max_batch_size: 2500
 # jump-mode batch growth: multiply by batch_growth_factor once every batch_growth_interval steps
 # instead of a little every step, so the run visits only ~log_f(max/base) distinct batch sizes
 # (torch.compile treats each distinct size as a recompile + its own CUDA graph; continuous growth
@@ -176,9 +176,9 @@ figs_period: 250             # how often to log custom figures EXPENSIVE # must 
 
 # SDE integration
 ################################################################
-eval_T: 25                  # diffusion trajectory length for inference
+eval_T: 10                  # diffusion trajectory length for inference
 integrator:
-  T: 25                        # static training diffusion length
+  T: 10                        # static training diffusion length
   min_traj_length: 10
   max_traj_length: 10
   traj_length_strategy: static # 'static'  or 'sampled'  will do random between min and max traj lengths
@@ -350,18 +350,16 @@ condition_log_z:
 # of lagging-spread metrics: {kind: proportional, metrics: {fwd: fwd/x, bwd:
 # bwd/x}, alpha: 0.05, floor: 0.01} -- the old phase-2 balancer, kept as a
 # capability.
-# `anneal_coeffs: {energy_config_key: {target: X, rate?: Y}}` (lexicographic
+# `anneal_coeffs: {energy_config_key: {start: X, rate?: Y}}` (lexicographic
 # only) RAMPS UP a numeric energy_config coefficient (e.g. bounding_coeff,
-# reduction_coeff) toward `target` at the SAME clean-streak anneal event as
-# the rule thresholds above -- i.e. strictly lower priority than every rule,
-# since it only moves once the whole balance has been clean for
-# anneal_patience ticks in a row. The coefficient's base energy_config value
-# is the SOFT one: it's what the energy function is built with, so it's in
-# effect for every stage from run start (including stages that name nothing
-# here); a stage's anneal_coeffs only climbs its named coefficients off that
-# base once ITS balance is fully converged. Coefficients no stage names stay
-# pinned at their energy_config default forever (e.g. lj_coeff, which is
-# calibrated separately at init and must not be listed here).
+# reduction_coeff) from a soft `start` toward its full config value at the
+# SAME clean-streak anneal event as the rule thresholds above -- i.e.
+# strictly lower priority than every rule, since it only moves once the
+# whole balance has been clean for anneal_patience ticks in a row: the
+# boundary/reduction penalty only firms back up to full strength once the
+# terminal stage is fully converged. Coefficients no stage names stay pinned
+# at their energy_config default (e.g. lj_coeff, which is calibrated
+# separately at init and must not be listed here).
 # ============================================================================
 
 # MLE slope gate (train.py update_mle_gate, runs on stages flagged mle_gate;
@@ -581,8 +579,8 @@ buffers:
   # up prior_buffer via isotropic noising + rescoring whenever a prior-sampling churn
   # cycle comes up short of admissible samples on its own
   anchor_buffer:
-    seed_source: 'prior_dataset' #D:\crystal_datasets\conditional\priors\toy_2harm_conditions.pt #'prior_dataset'   # 'generated' (default, unchanged: lazy-bootstrap from the first fwd-eval-sampled batch), 'prior_dataset' (seed from the real high-quality dataset already loaded for backward training), or a path to torch.load a curated set of good seeds from
-    max_size: 200000
+    seed_source: /scratch/mk8347/data/crystal_datasets/conditional/priors/toy_2harm_conditions.pt #'prior_dataset'   # 'generated' (default, unchanged: lazy-bootstrap from the first fwd-eval-sampled batch), 'prior_dataset' (seed from the real high-quality dataset already loaded for backward training), or a path to torch.load a curated set of good seeds from
+    max_size: 50000
     dup_cutoff: 0.05          # latent L2 distance below which two CONFIRMED-SURPRISING candidates are treated as literal duplicates; restricted to same-condition_id pairs. Not a novelty gate (surprise is) -- only ever runs on the rare confirmed set, so kept tight (see AnchorBuffer.admit)
     screen_energy_window: 20  # cheap one-rollout screen's energy pre-filter: candidate's energy must be within this many ENERGY units of that condition's Emin(c) (condition_log_z.best_energy) before spending a backward rollout on it
     thin_energy_window: 50   # deliberately wider than screen_energy_window -- thin()'s energy-window trim drops anchors whose energy - Emin(c) exceeds this; monotonic and safe since Emin(c) only ever decreases
@@ -609,18 +607,18 @@ buffers:
 
 # energy function settings
 ################################################################
-energy_function: 'elj'
+energy_function: 'latent_multiharmonic'
 temperature_conditioning: false  # if false, temperatures are set to temperature, and there is no annealing
 molecule_conditioning: false  # conditions the generative prediction on the molecule
 sg_conditioning: False  # whether to conditionally sample across space groups
-space_groups: [ 2 ]  # which space groups to sample over
+space_groups: [ 1 ]  # which space groups to sample over
 zp_conditioning: false # whether to condition over z prime values
 z_primes: [ 1 ]
 vector_conditioning: false  # per-sample condition vectors (molecules_path/prior_path entries' `c` attribute) embedded through a plain MLP (conditions_type stays 'vector') rather than molecule_conditioning's GNN -- for toy energy functions, where `c` isn't tied to any real molecular graph
 vector_conditioning_dim: 3  # dimensionality of the `c` vectors -- must match whatever data_processing/generate_toy_prior.py's config built molecules_path/prior_path with (data_ndim for latent_harmonic, cond_dim for latent_multiharmonic)
 energy_config:
   internal_oom_recovery: true  # if false, skip the energy function's own adaptive sub-batching/OOM catch-and-shrink loop and analyze the whole batch in one call, so an OOM propagates up to train.py's global batch size reduction instead. Recommended false in fused mode, where the internal recovery destabilizes memory management.
-  temperature: 2.5 # 2.5 is room temperature kT in kJ/mol
+  temperature: 1.0 # 2.5 is room temperature kT in kJ/mol
   log_temperature_range: [ 0, 0.693147 ]
   # loss coefficients
   density_coeff: 10.0  # how much to weight the density penalty term in the energy function
@@ -633,7 +631,7 @@ energy_config:
   reduction_coeff: 1.0
   lj_coeff: 1.0  # loss coefficient
   reward_range: 500 # max ptp of reward values allowed, null to go unrestricted
-  analyze_kwargs: {}#{ width: 2.0, c: [ 0, 0] } #{width: 0.15}  # extra kwargs passed through to crystal_batch.analyze(), e.g. noise: 0.01, rdf_mode: 'envwise', cutoff: 6
+  analyze_kwargs: { width: 2.0, c: [ 0, 0] } #{width: 0.15}  # extra kwargs passed through to crystal_batch.analyze(), e.g. noise: 0.01, rdf_mode: 'envwise', cutoff: 6
 #                   c: [.5,.5,.5,.5,.5,.5,.5,.5,.5,.5,.5,.5]
 #  {width: 0.075,
 #                   c:[0,0,0,0,0,0,0,0],

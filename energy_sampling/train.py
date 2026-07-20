@@ -1,7 +1,7 @@
 import gc
 import math
 import os
-from collections import defaultdict
+from collections import defaultdict, deque
 from copy import deepcopy
 from typing import Optional
 
@@ -186,20 +186,45 @@ class Modeller:
     def increment_batch_size(self):
         """
         Batch growth, still AIMD-shaped (grow until OOM, cut + cooldown, regrow
-        slower), in one of two modes:
-
-        JUMP mode (batch_growth_interval > 0): multiply by batch_growth_factor
-        once every batch_growth_interval steps (batch_growth_slow_interval after
-        the first OOM), capped at max_batch_size. The run then visits only
+        slower): multiply by batch_growth_factor once every
+        batch_growth_interval steps (batch_growth_slow_interval after the first
+        OOM), capped at max_batch_size. The run then visits only
         ~log_f(max/base) distinct batch sizes -- torch.compile treats every
         distinct size as a recompile + its own CUDA graph, so rare large jumps
-        are what make compile viable alongside growth. OOM cuts divide by the
-        same factor (exactly one rung down, so the ladder stays closed).
+        are what make compile viable alongside growth.
 
-        LEGACY continuous mode (interval absent/0): the original per-step
-        multiplicative walk (batch_growth_increment until first OOM,
-        batch_growth_slow_increment after), OOM cut by oom_batch_shrink_factor.
+        THROUGHPUT KNEE (auto_batch_throughput_opt: true): before each jump,
+        check whether the PREVIOUS jump actually paid in samples/sec (median
+        step time over the trailing window x batch). Past GPU saturation a
+        factor-f batch jump returns ~x1.0 throughput while step time grows xf
+        -- pure steps/hour loss (rpvez6ep: batch 50k ran the same 13.3k
+        samples/s as batch 1.6k at 31x the step time). A jump that gains less
+        than batch_growth_min_gain reverts one rung and PINS the batch for the
+        current protocol stage (stages have different step-cost profiles, so
+        the pin re-arms at every stage transition and the walk re-measures
+        upward from the pinned rung). With the flag on, max_batch_size is a
+        safety ceiling rather than a target. NB nvidia-smi-style utilization
+        can't drive this: it saturates at 100% below the knee; marginal
+        throughput is the discriminating signal on both sides.
         """
+        knee_on = bool(getattr(self.args, 'auto_batch_throughput_opt', False))
+        stage_name = getattr(getattr(self.protocol, 'stage', None), 'name', None)
+        if (knee_on and stage_name is not None
+                and getattr(self, 'batch_size_saturated_stage', None) == stage_name):
+            # periodic re-estimation: the knee moves WITHIN a stage as the fused
+            # composition drifts (branch fracs shift, fwd activates/deactivates,
+            # buffers grow), so a pin decays -- drop one rung and re-climb,
+            # which adapts in BOTH directions: a healthy re-climb re-pins at or
+            # above the old knee, a failed one pins lower
+            recheck = int(getattr(self.args, 'batch_knee_recheck_steps', 0) or 0)
+            if recheck > 0 and self.step_ind - getattr(self, 'batch_size_pinned_at', 0) >= recheck:
+                f = float(getattr(self.args, 'batch_growth_factor', 2.0))
+                self.batch_size = max(1, int(round(self.batch_size / f)))
+                self.batch_size_saturated_stage = None
+                self._rung_throughput = None
+                self.batch_size_last_grow = self.step_ind
+                print(f"batch growth: knee recheck -- dropping to {self.batch_size} and re-measuring")
+            return  # throughput knee already found for this stage's step profile
         if self.batch_size >= self.args.max_batch_size:
             return
         if self.step_ind < self.batch_size_cooldown_until:
@@ -210,6 +235,34 @@ class Modeller:
         wait = slow if self.batch_size_ever_oomed else interval
         if self.step_ind - getattr(self, 'batch_size_last_grow', 0) < wait:
             return
+
+        min_gain = float(getattr(self.args, 'batch_growth_min_gain', 0.15) or 0)
+        times = getattr(self, '_recent_step_times', None)
+        if knee_on and min_gain > 0 and times is not None and len(times) >= 10:
+            # median over the trailing window: robust to the one-off compile
+            # stall at rung entry and any churn/OS spikes inside the dwell
+            med = float(np.median(list(times)[-20:]))
+            sps = self.batch_size / max(med, 1e-9)
+            base = getattr(self, '_rung_throughput', None)
+            if base is not None and base[0] < self.batch_size:
+                prev_batch, prev_sps = base
+                if sps < prev_sps * (1.0 + min_gain):
+                    # pin at the TRUE knee; gradient stability below
+                    # fused_grad_accum_min_samples is provided by fused-step
+                    # accumulation (see train_step), not batch inflation
+                    accum = int(getattr(self.args, 'fused_grad_accum_min_samples', 0) or 0)
+                    print(f"batch growth: throughput knee -- {prev_batch}->{self.batch_size} bought "
+                          f"{prev_sps:.0f}->{sps:.0f} samples/s (< +{min_gain * 100:.0f}%); pinning "
+                          f"{prev_batch} for stage '{stage_name}'"
+                          + (f" (fused steps will grad-accumulate to {accum})" if prev_batch < accum else ""))
+                    self.batch_size = prev_batch
+                    self.batch_size_saturated_stage = stage_name
+                    self.batch_size_pinned_at = self.step_ind
+                    self._rung_throughput = None
+                    self.batch_size_last_grow = self.step_ind
+                    return
+            self._rung_throughput = (self.batch_size, sps)
+
         f = float(getattr(self.args, 'batch_growth_factor', 2.0))
         self.batch_size = min(self.args.max_batch_size,
                               max(self.batch_size + 1, int(round(self.batch_size * f))))
@@ -237,6 +290,9 @@ class Modeller:
             metrics['lr_fused_flow'] = self.optimizers['fused'].param_groups[-1]['lr']
 
         metrics['phase'] = self.phase
+        # live batch size at step-time resolution: paired with train_step_time
+        # this makes every run a samples/sec-vs-batch knee scan for free
+        metrics['Batch Size'] = self.batch_size
         if hasattr(self, 'last_grad_norm_pre_clip'):
             metrics['grad_norm_pre_clip'] = self.last_grad_norm_pre_clip
         metrics['Fwd Frac'] = self.fwd_frac
@@ -317,10 +373,12 @@ class Modeller:
     def set_energy_coeffs(self):
         """Live energy-function coefficients (e.g. bounding_coeff,
         reduction_coeff): mirrors set_loss_coeffs, but unlike loss_coeffs
-        these CAN mutate step-to-step within a stage -- the terminal stage's
-        balance.anneal_coeffs ramps them up from a soft `start` toward their
-        full config value once its balance rules run clean (protocol.py
-        StageProtocol.energy_coeffs)."""
+        these CAN mutate step-to-step within a stage. The base energy_config
+        value is the SOFT one -- self.energy_function is constructed with
+        it, so it's already in effect from run start; a stage's
+        balance.anneal_coeffs only ramps its named coefficients UP toward
+        their own `target` once that stage's balance rules run clean
+        (protocol.py StageProtocol.energy_coeffs)."""
         for name, value in self.protocol.energy_coeffs().items():
             if hasattr(self.energy_function, name):
                 setattr(self.energy_function, name, value)
@@ -1245,8 +1303,11 @@ class Modeller:
                 except (RuntimeError, ValueError) as e:  # if we do hit OOM, slash the batch size
                     self.handle_train_epoch_error(e, step_type)
                 self.times['train_step_end'] = time()
-                self._probe_max('step_time_max10',
-                                self.times['train_step_end'] - self.times['train_step_start'])
+                step_dt = self.times['train_step_end'] - self.times['train_step_start']
+                self._probe_max('step_time_max10', step_dt)
+                if not hasattr(self, '_recent_step_times'):
+                    self._recent_step_times = deque(maxlen=64)
+                self._recent_step_times.append(step_dt)  # feeds the throughput-knee check
 
                 # train monitoring
                 if self.step_ind % 10 == 0:
@@ -1440,7 +1501,13 @@ class Modeller:
         discretizer = get_discretizer(self.args.integrator)
 
         accum_target = self.args.fused_grad_accum_min_samples if step_type == 'fused' else 0
-        accumulating = accum_target > 0
+        # batch >= target degenerates to a plain unscaled step: accumulation
+        # only engages BELOW the target (e.g. a knee-pinned batch under the
+        # gradient-stability floor), so a large batch is never loss-scaled by
+        # batch/target > 1
+        accumulating = accum_target > self.batch_size
+        if not accumulating:
+            self.fused_accum_count = 0  # drop any partial cycle from before a batch jump
         self.fused_accum_count = getattr(self, 'fused_accum_count', 0)
         starting_new_cycle = (not accumulating) or (self.fused_accum_count == 0)
 
@@ -2093,6 +2160,9 @@ class Modeller:
         self.batch_size = max(1, int(self.batch_size * self.args.oom_batch_shrink_factor))
         self.batch_size_ever_oomed = True
         self.batch_size_cooldown_until = self.step_ind + self.args.oom_cooldown_steps
+        # stale throughput baseline/latch would compare across the cut -- re-measure
+        self._rung_throughput = None
+        self.batch_size_saturated_stage = None
         if self.batch_size <= 1:
             raise RuntimeError("Cascading OOM Failure")
         print(f"Reducing batch size to {self.batch_size}")
