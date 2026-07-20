@@ -270,12 +270,12 @@ protocol:
     on_exit:
     - snapshot:fwd_calibrated
     train_mode: fused
-  - anneal_coeffs:
-      bounding_coeff:
-        start: 2.0
-      reduction_coeff:
-        start: 2.0
-    balance:
+  - balance:
+      anneal_coeffs:
+        bounding_coeff:
+          start: 2.0
+        reduction_coeff:
+          start: 2.0
       default_boost:
         fwd: 0.1
         replay: 0.9

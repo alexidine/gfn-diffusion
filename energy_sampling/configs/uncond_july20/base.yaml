@@ -463,17 +463,17 @@ protocol:
           # resuming a pre-reorder checkpoint maps anneal/floor state to the
           # wrong rules -- fresh runs only
           - { metric: fwd/over_coverage, above: 8.0, boost: replay }
-      # lexicographically LAST: soft at stage entry (start), only ramping
-      # up toward the full energy_config.{bounding,reduction}_coeff (10.0,
-      # above) once every rule above has run clean for anneal_patience
-      # ticks in a row (the same clean-streak event that tightens their
-      # thresholds) -- the boundary penalty only firms back up to full
-      # strength once the terminal balance is fully converged, never traded
-      # against an active violation. reduction_coeff co-anneals with
-      # bounding_coeff since both introduce similar boundary artifacts.
-      anneal_coeffs:
-        bounding_coeff: { start: 2.0 }
-        reduction_coeff: { start: 2.0 }
+        # lexicographically LAST: soft at stage entry (start), only ramping
+        # up toward the full energy_config.{bounding,reduction}_coeff (10.0,
+        # above) once every rule above has run clean for anneal_patience
+        # ticks in a row (the same clean-streak event that tightens their
+        # thresholds) -- the boundary penalty only firms back up to full
+        # strength once the terminal balance is fully converged, never traded
+        # against an active violation. reduction_coeff co-anneals with
+        # bounding_coeff since both introduce similar boundary artifacts.
+        anneal_coeffs:
+          bounding_coeff: { start: 2.0 }
+          reduction_coeff: { start: 2.0 }
 
     # -- standard equilibration route (unused while the forward-first stages
     #    above are the protocol; swap it in for the buildout/terminal pair to
