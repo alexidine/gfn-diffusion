@@ -906,7 +906,17 @@ class Modeller:
         torch.compile the dense per-step trunk of the policy. The trajectory
         loop launches many tiny kernels (T steps x several small MLPs x 3
         fused branches), so launch overhead caps GPU utilization even at large
-        batch; mode='reduce-overhead' (CUDA-graph capture) is the standard fix.
+        batch; inductor's kernel fusion (MLP + layernorm + gelu collapse to a
+        few kernels) recovers most of the launch-count reduction.
+
+        Deliberately DEFAULT mode, not 'reduce-overhead': CUDA-graph capture
+        gives each compiled module STATIC output buffers that every
+        re-invocation overwrites, and the trajectory loop re-invokes the same
+        modules T times per rollout while earlier outputs are still referenced
+        (and autograd retains all T iterations' activations until backward) --
+        crashes at best ("accessing tensor output of CUDAGraphs that has been
+        overwritten"), silent corruption at worst. Revisit cudagraphs only
+        with cudagraph_mark_step_begin/cloning discipline around the loop.
 
         compile_policy: false (default) | true | 'auto'. 'auto' enables only on
         Linux+CUDA -- inductor does not support CUDA on native Windows, so dev
@@ -947,11 +957,11 @@ class Modeller:
                 for name in trunk:
                     mod = getattr(model, name, None)
                     if isinstance(mod, torch.nn.Module):
-                        mod.compile(mode='reduce-overhead')
+                        mod.compile()  # default mode -- see docstring for why not reduce-overhead
         except Exception as e:
             print(f"compile_policy: torch.compile unavailable here ({e}); continuing eager")
             return
-        print(f"compile_policy: trunk {trunk} compiled (mode=reduce-overhead, lazy on first forward)")
+        print(f"compile_policy: trunk {trunk} compiled (default mode, lazy on first forward)")
 
     def init_schedulers_optimizers(self):
         """
