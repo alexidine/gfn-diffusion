@@ -933,12 +933,16 @@ class Modeller:
 
         trunk = ('t_model', 's_model', 'forward_policy', 'backward_policy', 'flow_model')
         try:
-            import torch._dynamo
-            torch._dynamo.config.suppress_errors = True
+            # NB "as _dynamo": a bare `import torch._dynamo` would bind `torch`
+            # as a LOCAL for this whole function, making the module-level torch
+            # unreachable at the is_available() call above (UnboundLocalError
+            # -- and only on Linux, since the `and` short-circuits elsewhere)
+            import torch._dynamo as _dynamo
+            _dynamo.config.suppress_errors = True
             # jump-mode batch growth is ~8 shapes end to end, exactly at
             # dynamo's default recompile limit of 8 -- give it headroom so the
             # top rungs don't silently fall back to eager
-            torch._dynamo.config.cache_size_limit = 24
+            _dynamo.config.cache_size_limit = 24
             for model in (self.gfn_model, self.ema_model):
                 for name in trunk:
                     mod = getattr(model, name, None)
