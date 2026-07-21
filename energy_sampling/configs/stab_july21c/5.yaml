@@ -371,7 +371,7 @@ terminal_box_violation: 1.0
 terminal_logw_std: 1000.0
 test_molecules_path: null
 use_weight_decay: false
-vector_conditioning: true
+vector_conditioning: false
 vector_conditioning_dim: 3
 weight_decay: 0.0001
 z_primes:
