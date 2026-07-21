@@ -7,7 +7,7 @@ seed: 0
 template_path: D:\crystal_datasets\conditional\priors\14_1_elj.pt
 
 output_dir: D:\crystal_datasets\conditional\priors
-tag: toy_2harm   # used to build default output filenames
+tag: toy_2cond_conn   # used to build default output filenames
 
 # 'latent_harmonic' or 'latent_multiharmonic' -- see the module docstring in
 # generate_toy_prior.py for why latent_harmonic can only ever be baked one
@@ -21,16 +21,16 @@ energy_function: latent_multiharmonic
 # `identifier` in the condition set / prior, and one axis of condition_id
 # once loaded as molecules_path / prior_path in training
 conditions:
-  - identifier: mode_a
-    c: [0, 0]
-    width: 2.0
-
 #  - identifier: mode_a
-#    c: [ 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,0.5,0.5,0.5 ]
-#    width: 2.25
-#  - identifier: mode_b
-#    c: [ -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5 ]
-#    width: 1.0
+#    c: [0, 0]
+#    width: 2.0
+
+  - identifier: mode_a
+    c: [ 0.5, 0.5] #, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,0.5,0.5,0.5 ]
+    width: 5.0
+  - identifier: mode_b
+    c: [ -0.5, -0.5] #, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5 ]
+    width: 4.0
 
 # optional: if enabled, the `conditions` above are treated as ANCHORS and
 # expanded (see expand_condition_manifold in generate_toy_prior.py) into a
@@ -59,8 +59,8 @@ conditions:
 # n_replicas_per_condition when enabling this (e.g. 2-10) or the condition
 # set/prior will get huge.
 condition_manifold:
-  enabled: false
-  mode: gaussian        # interpolate | gaussian | uniform (see above)
+  enabled: true
+  mode: interpolate        # interpolate | gaussian | uniform (see above)
   identifier: manifold_ab  # PREFIX for per-draw ids (manifold_ab_NNNN), not a pooled label
   n_conditions: 10000        # number of distinct manifold draws
   include_anchors: false    # also keep the exact anchor points themselves in the set
@@ -77,7 +77,7 @@ condition_manifold:
 # recomputes energy fresh from whatever latents the GFN produces)
 condition_set:
   generate: true
-  n_replicas_per_condition: 10000   # lower this (e.g. 2-10) if condition_manifold.enabled
+  n_replicas_per_condition: 10   # lower this (e.g. 2-10) if condition_manifold.enabled
   # true (default): each condition's replicas get latents genuinely sampled
   # from that condition's OWN target distribution, plus baked energy -- so
   # the file doubles as an on-mode, per-condition seed set (feed as
@@ -106,8 +106,8 @@ prior:
   shared_center: null    # null -> zeros(data_ndim); only used in shared mode
   shared_width: 0.35       # must be wide enough to cover every condition's c and width; only used in shared mode
   width_multiplier: 2     # prior width = condition width * this; only used in per_condition mode
-  n_samples_per_condition: 20   # per cfg.conditions entry -- lower this too if condition_manifold.enabled
-  equalized_n_samples_per_condition: 100
+  n_samples_per_condition: 10   # per cfg.conditions entry -- lower this too if condition_manifold.enabled
+  equalized_n_samples_per_condition: 10
   n_samples_total: 20000
   equalized_n_samples_total: 100000
   target_temperature: 1.0

@@ -1,3 +1,4 @@
+import glob
 import os
 from copy import deepcopy
 from typing import Optional
@@ -110,6 +111,36 @@ class Checkpointer:
             return None
 
         return path
+
+    def find_shared_prior(self) -> Optional[str]:
+        """
+        Any *_prior.pt in checkpoints_dir - regardless of which run saved it -
+        whose stored problem_def matches the current config's exactly (the
+        same strict comparison as find_matching: no conditioning exemption).
+        problem_def carries only the target identity (energy function/config,
+        prior_path, space groups, z_primes, conditioning flags), never
+        architecture/T/lr, so one pretrained prior matches every run on the
+        same problem. Candidates are tried newest-mtime-first; ties in
+        content are the caller's responsibility to avoid (one shared prior
+        per problem per checkpoints_dir). The run's own path_for('prior') is
+        skipped here since find_matching already covers it.
+        """
+        m = self.modeller
+        own = os.path.abspath(self.path_for('prior'))
+        pattern = os.path.join(m.args.checkpoints_dir, '*_prior.pt')
+        candidates = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+        for path in candidates:
+            if os.path.abspath(path) == own:
+                continue
+            try:
+                checkpoint = torch.load(path, map_location='cpu', weights_only=False)
+            except Exception as e:
+                print(f"find_shared_prior: skipping unreadable candidate {path}: {e}")
+                continue
+            stored_def = checkpoint.get('problem_def')
+            if normalize_problem_def(stored_def) == normalize_problem_def(m.problem_def):
+                return path
+        return None
 
     def problem_mismatch_report(self, stored_def: Optional[dict], ignore_keys: tuple = ()) -> str:
         """Readable stored-vs-current problem_def comparison, one line per differing field."""

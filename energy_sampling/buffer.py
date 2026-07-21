@@ -577,27 +577,34 @@ class CrystalBuffer:
         strip_lazy_sg_caches(self.batch)
         strip_lazy_sg_caches(new_batch)
 
+        # Stage every allocation before committing any of it: train.py's OOM
+        # handler catches CUDA OOM mid-train-step and keeps going, so a partial
+        # commit here (batch appended, side arrays not) leaves a corrupted
+        # buffer that only detonates on a later draw.
+
         # validate=False: the shared-metadata equality checks are torch.equal
         # on device tensors -- each one is a stream sync, priced at whatever
         # the GPU has queued (the buffer-churn spike mechanism). This admission
         # path runs every train step on homogeneous same-pipeline batches;
         # shared metadata here is uniform by construction (_as_batch enforces
         # max_z_prime, lazy SG caches are stripped above).
-        self.batch = self.batch.append_batch(new_batch, validate=False)
+        new_resident = self.batch.append_batch(new_batch, validate=False)
 
-        self.x = torch.cat([self.x, new_x], dim=0)
+        new_x_full = torch.cat([self.x, new_x], dim=0)
 
+        new_y_full = None
         if self.y is not None:
             if new_y is None:
                 raise ValueError("Existing dataset has y, but added batch produced y=None.")
-            self.y = torch.cat([self.y, new_y], dim=0)
+            new_y_full = torch.cat([self.y, new_y], dim=0)
 
+        new_traj_full = None
         if self.traj is not None:
             if traj is None:
                 raise ValueError("Existing dataset has traj, but added batch produced traj=None.")
             assert traj.shape[0] == new_batch.num_graphs, \
                 f"traj has {traj.shape[0]} entries, expected {new_batch.num_graphs} to match added batch size"
-            self.traj = torch.cat([self.traj, traj.detach().to(self.device)], dim=0)
+            new_traj_full = torch.cat([self.traj, traj.detach().to(self.device)], dim=0)
 
         k = new_batch.num_graphs
         if init_loss is None:
@@ -609,25 +616,25 @@ class CrystalBuffer:
             assert new_ema_loss.shape[0] == k, \
                 f"init_loss has {new_ema_loss.shape[0]} entries, expected {k} to match added batch size"
 
-        self.ema_loss = torch.cat(
-            [
-                self.ema_loss,
-                new_ema_loss,
-            ],
-            dim=0,
-        )
-        self.select_counts = torch.cat(
-            [
-                self.select_counts,
-                torch.zeros(k, dtype=torch.long),
-            ],
-            dim=0,
-        )
+        new_ema_loss_full = torch.cat([self.ema_loss, new_ema_loss], dim=0)
+        new_select_counts_full = torch.cat([self.select_counts, torch.zeros(k, dtype=torch.long)], dim=0)
 
         new_nan = torch.full((k,), float("nan"), dtype=torch.float32)
-        self.ema_logw = torch.cat([self.ema_logw, new_nan], dim=0)
-        self.ema_logw_sq = torch.cat([self.ema_logw_sq, new_nan.clone()], dim=0)
-        self.ema_log_z_emp = torch.cat([self.ema_log_z_emp, new_nan.clone()], dim=0)
+        new_ema_logw_full = torch.cat([self.ema_logw, new_nan], dim=0)
+        new_ema_logw_sq_full = torch.cat([self.ema_logw_sq, new_nan.clone()], dim=0)
+        new_ema_log_z_emp_full = torch.cat([self.ema_log_z_emp, new_nan.clone()], dim=0)
+
+        self.batch = new_resident
+        self.x = new_x_full
+        if new_y_full is not None:
+            self.y = new_y_full
+        if new_traj_full is not None:
+            self.traj = new_traj_full
+        self.ema_loss = new_ema_loss_full
+        self.select_counts = new_select_counts_full
+        self.ema_logw = new_ema_logw_full
+        self.ema_logw_sq = new_ema_logw_sq_full
+        self.ema_log_z_emp = new_ema_log_z_emp_full
 
     @torch.no_grad()
     def purge_by_index(self, indices_to_remove):
@@ -660,21 +667,35 @@ class CrystalBuffer:
 
         keep_idx = np.flatnonzero(keep)
 
-        self.batch = self.batch.subsample_new_batch(keep_idx)
+        # Stage every allocation before committing any of it: train.py's OOM
+        # handler catches CUDA OOM mid-train-step and keeps going, so a partial
+        # commit here (batch shrunk, side arrays not) leaves a corrupted buffer
+        # that only detonates on a later draw.
+        new_resident = self.batch.subsample_new_batch(keep_idx)
 
         keep_t = torch.as_tensor(keep_idx, device=self.device, dtype=torch.long)
-        self.x = self.x[keep_t].contiguous()
-        if self.y is not None:
-            self.y = self.y[keep_t].contiguous()
-        if self.traj is not None:
-            self.traj = self.traj[keep_t].contiguous()
+        new_x = self.x[keep_t].contiguous()
+        new_y = self.y[keep_t].contiguous() if self.y is not None else None
+        new_traj = self.traj[keep_t].contiguous() if self.traj is not None else None
 
         keep_cpu = torch.as_tensor(keep_idx, dtype=torch.long)
-        self.ema_loss = self.ema_loss[keep_cpu]
-        self.select_counts = self.select_counts[keep_cpu]
-        self.ema_logw = self.ema_logw[keep_cpu]
-        self.ema_logw_sq = self.ema_logw_sq[keep_cpu]
-        self.ema_log_z_emp = self.ema_log_z_emp[keep_cpu]
+        new_ema_loss = self.ema_loss[keep_cpu]
+        new_select_counts = self.select_counts[keep_cpu]
+        new_ema_logw = self.ema_logw[keep_cpu]
+        new_ema_logw_sq = self.ema_logw_sq[keep_cpu]
+        new_ema_log_z_emp = self.ema_log_z_emp[keep_cpu]
+
+        self.batch = new_resident
+        self.x = new_x
+        if new_y is not None:
+            self.y = new_y
+        if new_traj is not None:
+            self.traj = new_traj
+        self.ema_loss = new_ema_loss
+        self.select_counts = new_select_counts
+        self.ema_logw = new_ema_logw
+        self.ema_logw_sq = new_ema_logw_sq
+        self.ema_log_z_emp = new_ema_log_z_emp
 
     @torch.no_grad()
     def purge(

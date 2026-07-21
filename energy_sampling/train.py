@@ -201,8 +201,11 @@ class Modeller:
         samples/s as batch 1.6k at 31x the step time). A jump that gains less
         than batch_growth_min_gain reverts one rung and PINS the batch for the
         current protocol stage (stages have different step-cost profiles, so
-        the pin re-arms at every stage transition and the walk re-measures
-        upward from the pinned rung). With the flag on, max_batch_size is a
+        protocol.advance clears the pin, the rung baseline, and the step-time
+        window at every stage transition -- a baseline measured under the
+        outgoing stage's step cost would poison the incoming stage's first
+        knee comparison -- and the walk re-measures upward from the current
+        rung on in-stage timings). With the flag on, max_batch_size is a
         safety ceiling rather than a target. NB nvidia-smi-style utilization
         can't drive this: it saturates at 100% below the knee; marginal
         throughput is the discriminating signal on both sides.
@@ -1144,6 +1147,13 @@ class Modeller:
             # On a RESUMED run past phase 1 this also restores prior_model,
             # which snapshot_prior only ever set live at the transition.
             prior_path = self.checkpointer.find_matching('prior')
+            if prior_path is None:
+                # no prior under this run's own identity -- fall back to any
+                # other run's *_prior.pt with an exactly matching problem_def,
+                # so a battery of runs shares one pretrained prior without
+                # naming it (problem_def has no architecture/T/lr, only the
+                # target identity)
+                prior_path = self.checkpointer.find_shared_prior()
             if prior_path is not None:
                 print(f"reuse_prior: reloading existing prior checkpoint {prior_path} "
                       f"as the frozen prior model")
@@ -2795,8 +2805,10 @@ class Modeller:
         num_bwd_steps = self.bwd_step_delta()
 
         # always churn at least a little bit
+        churn_batch_ref = getattr(self.args.buffers.prior_buffer, 'churn_batch_ref', self.batch_size)
         n_churn = max(1000,
-                      int((num_bwd_steps / self.args.buffers.prior_buffer.mean_lifetime) * self.batch_size))
+                      int((num_bwd_steps / self.args.buffers.prior_buffer.mean_lifetime)
+                          * churn_batch_ref))
         n_to_add = min(self.args.eval_num_samples,
                        n_churn)  # cap unrelated to GPU batch size -- eval_batch_size is retired, this is just a churn-rate limiter
         headroom = max(0, self.args.buffers.prior_buffer.max_size - len(self.prior_buffer))

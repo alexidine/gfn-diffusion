@@ -35,7 +35,8 @@ declares:
                     or auto-refound via reuse_prior)
 
 Balance rules (kind: lexicographic) walk in order; the FIRST violated rule's
-`boost` mode gets the frac nudge this tick (the same EMA-toward-one-hot nudge
+`boost` (a mode name, or a {mode: weight} mix -- same form as default_boost)
+gets the frac nudge this tick (the same EMA-toward-target nudge
 ModeBalanceController and ForwardFirstController both used); `default_boost`
 takes it when all rules are clean, and a clean streak of
 controller.anneal_patience ticks tightens every annealed rule's threshold.
@@ -198,6 +199,23 @@ class Stage:
 
     # ------------------------------------------------------------ sub-parsers
 
+    def _normalize_boost(self, raw, where):
+        """A boost value: a single mode name, or a {mode: weight} mix (positive
+        weights, normalized to sum 1) -- shared by rule 'boost' and
+        default_boost, so a rule can cap its target at a fixed mixed share
+        instead of one-hotting a mode to 100%."""
+        if isinstance(raw, dict):
+            bad = set(raw) - set(MODES)
+            if bad or not raw:
+                raise ValueError(f"stage '{self.name}': {where} mix has unknown/empty modes {sorted(bad)}")
+            if any(not isinstance(w, (int, float)) or w <= 0 for w in raw.values()):
+                raise ValueError(f"stage '{self.name}': {where} mix weights must be positive")
+            total = float(sum(raw.values()))
+            return {m: w / total for m, w in raw.items()}
+        if raw not in MODES:
+            raise ValueError(f"stage '{self.name}': {where} must be one of {MODES} or a {{mode: weight}} mix")
+        return raw
+
     def _parse_balance(self, node):
         if node is None:
             return None
@@ -209,8 +227,7 @@ class Stage:
                 bad = set(r) - RULE_KEYS
                 if bad:
                     raise ValueError(f"stage '{self.name}' rule {i}: unknown keys {sorted(bad)}")
-                if r.get('boost') not in MODES:
-                    raise ValueError(f"stage '{self.name}' rule {i}: boost must be one of {MODES}")
+                r['boost'] = self._normalize_boost(r.get('boost'), f'rule {i} boost')
                 forms = ('above' in r) + ('below' in r) + ('relative' in r)
                 if forms != 1:
                     raise ValueError(f"stage '{self.name}' rule {i}: exactly one of "
@@ -223,24 +240,14 @@ class Stage:
                                      f"(tightening would RAISE the bar -- set it where you mean it)")
                 if r.get('if_missing', 'clean') not in ('clean', 'violated'):
                     raise ValueError(f"stage '{self.name}' rule {i}: if_missing must be clean|violated")
-            default = node.get('default_boost')
-            if isinstance(default, dict):
-                # idle MIX: when all rules are clean, nudge toward this frac
-                # split instead of a one-hot (e.g. {replay: 0.9, fwd: 0.1} --
-                # keep the fit clean AND hold Z gently at its fixed point,
-                # rather than letting fwd decay below the deactivate threshold
-                # and only revisiting Z after zerr has drifted over its bar)
-                bad = set(default) - set(MODES)
-                if bad or not default:
-                    raise ValueError(f"stage '{self.name}': default_boost mix has "
-                                     f"unknown/empty modes {sorted(bad)}")
-                if any(not isinstance(w, (int, float)) or w <= 0 for w in default.values()):
-                    raise ValueError(f"stage '{self.name}': default_boost mix weights must be positive")
-                total = float(sum(default.values()))
-                node['default_boost'] = {m: w / total for m, w in default.items()}
-            elif default not in MODES:
-                raise ValueError(f"stage '{self.name}': balance.default_boost must be one of "
-                                 f"{MODES} or a {{mode: weight}} mix")
+            # idle MIX: when all rules are clean (or, for a rule's own boost, when
+            # that rule fires), nudge toward this frac split instead of a one-hot
+            # (e.g. {replay: 0.9, fwd: 0.1} -- keep the fit clean AND hold Z gently
+            # at its fixed point, rather than letting fwd decay below the
+            # deactivate threshold and only revisiting Z after zerr has drifted
+            # over its bar; a rule can use the same form to cap ITS boosted mode's
+            # share instead of letting a persistent violation pull it to 100%)
+            node['default_boost'] = self._normalize_boost(node.get('default_boost'), 'default_boost')
             node['rules'] = [dict(r) for r in rules]
             # coefficients (e.g. energy_config.bounding_coeff/reduction_coeff)
             # RAMPED UP from the base energy_config value (kept LOW there so
@@ -311,7 +318,10 @@ class Stage:
             return set(MODES)
         if self.balance['kind'] == 'proportional':
             return set(self.balance['metrics'])
-        out = {r['boost'] for r in self.balance['rules']}
+        out = set()
+        for r in self.balance['rules']:
+            b = r['boost']
+            out.update(b if isinstance(b, dict) else {b})
         default = self.balance['default_boost']
         out.update(default if isinstance(default, dict) else {default})
         return out
@@ -613,6 +623,16 @@ class StageProtocol:
         # _state() phase-sync branch runs first and it overrides).
         m.lr_controller.reset_spike_monitors(m.lr_controller.CHANNELS)
         m.combo_loss_record = []
+        # batch controller: the throughput-knee state describes the OUTGOING
+        # stage's step-cost profile -- a rung baseline or step-time window
+        # measured there would cross-phase-contaminate the incoming stage's
+        # first knee comparison (same rationale as the OOM path's reset)
+        m._rung_throughput = None
+        m.batch_size_saturated_stage = None
+        times = getattr(m, '_recent_step_times', None)
+        if times is not None:
+            times.clear()
+        m.batch_size_last_grow = m.step_ind  # full dwell of in-stage steps before the first grow
         m.init_schedulers_optimizers()
         m.set_loss_coeffs()
         warmup_steps = m.lr_controller.rearm_warmup()
