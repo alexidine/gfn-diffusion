@@ -17,15 +17,16 @@ below 1.0. Pass criterion: zero genuine cuts per run.
 
 Runs 8-15 (base_elj.yaml = mk_dev as of 2026-07-21 with cluster paths,
 fresh-run checkpoint fields): real-problem transfer, mipcas sg2 zp1 elj.
-Known 512x4 points: 7.5e-5 flat-stable, ~3e-4 the edge.
-  8  : 512x4  T25 lr 7.5e-5  -- anchor at the known-stable operating point
-  9  : 512x4  T40 lr 7.5e-5  -- does the T40 win transfer
-  10 : 512x4  T10 lr 7.5e-5  -- or does short-T suffice on the real problem
-  11 : 1024x4 T25 lr 2e-5    -- width transfer at the toy-scaled peak
-  12 : 1024x4 T40 lr 2e-5    -- the toy battery's best corner, real problem
-  13 : 512x4  T25 lr 1.5e-4  -- ceiling probe (between stable and the edge)
-  14 : 1024x4 T25 lr 6e-5    -- ceiling probe at 3x the scaled guess
-  15 : 512x6  T25 lr 4e-5    -- depth transfer
+Known 512x4 points: 7.5e-5 flat-stable, ~3e-4 the edge. All elj trajectory
+lengths sit in [40, 100]; eval_T = 2x train T, capped at 100.
+  8  : 512x4  T40  lr 7.5e-5  -- anchor at the known-stable point
+  9  : 512x4  T70  lr 7.5e-5  -- T transfer
+  10 : 512x4  T100 lr 7.5e-5  -- T transfer
+  11 : 1024x4 T40  lr 2e-5    -- width transfer at the toy-scaled peak
+  12 : 1024x4 T100 lr 2e-5    -- width x long-T corner
+  13 : 512x4  T40  lr 1.5e-4  -- ceiling probe (between stable and the edge)
+  14 : 1024x4 T40  lr 6e-5    -- ceiling probe at 3x the scaled guess
+  15 : 512x6  T40  lr 4e-5    -- depth transfer
 
 dplr_rank stays 6 everywhere. max_batch_size 50000 flat (A100 utilization
 policy; the adaptive growth finds each config's real ceiling).
@@ -54,7 +55,8 @@ def fmt_lr(x):
 
 
 def make_config(ind, base, family, width, layers, traj_len, peak_lr,
-                warmup_steps=None, wall_off=False, note=''):
+                warmup_steps=None, wall_off=False, eval_T=None, seed=None,
+                note=''):
     config = deepcopy(base)
 
     for key in WIDTH_KEYS:
@@ -65,7 +67,9 @@ def make_config(ind, base, family, width, layers, traj_len, peak_lr,
     config['integrator']['T'] = traj_len
     config['integrator']['min_traj_length'] = traj_len
     config['integrator']['max_traj_length'] = traj_len
-    config['eval_T'] = traj_len
+    config['eval_T'] = eval_T if eval_T is not None else traj_len
+    if seed is not None:
+        config['seed'] = seed
 
     for key in LR_KEYS:
         config[key] = round(float(peak_lr), 12)
@@ -86,6 +90,8 @@ def make_config(ind, base, family, width, layers, traj_len, peak_lr,
         name += f"_w{warmup_steps}"
     if wall_off:
         name += "_nowall"
+    if seed is not None:
+        name += f"_s{seed % 100}"
     config['run_name'] = name
 
     with open(OUTDIR / f'{ind}.yaml', 'w') as f:
@@ -93,6 +99,7 @@ def make_config(ind, base, family, width, layers, traj_len, peak_lr,
 
     return {'index': ind, 'run_name': name, 'family': family,
             'width': width, 'layers': layers, 'T': traj_len,
+            'eval_T': config['eval_T'], 'seed': config['seed'],
             'peak_lr': float(peak_lr), 'warmup_steps': warmup_steps,
             'wall_off': wall_off, 'note': note}
 
@@ -120,22 +127,25 @@ if __name__ == '__main__':
     log.append(make_config(7, toy, 'toy', 512, 4, 10, 3.0e-5, wall_off=True,
                            note='soft-wall A/B pair with run 6'))
 
-    # ---- real-problem transfer battery: 8-15 ----
-    log.append(make_config(8, elj, 'elj', 512, 4, 25, 7.5e-5,
+    # ---- real-problem transfer battery: 8-15 (T in [40, 100]) ----
+    def elj_eval_T(t):
+        return min(2 * t, 100)
+
+    log.append(make_config(8, elj, 'elj', 512, 4, 40, 7.5e-5, eval_T=elj_eval_T(40),
                            note='anchor at known-stable point'))
-    log.append(make_config(9, elj, 'elj', 512, 4, 40, 7.5e-5,
-                           note='T40 transfer'))
-    log.append(make_config(10, elj, 'elj', 512, 4, 10, 7.5e-5,
-                           note='short-T transfer'))
-    log.append(make_config(11, elj, 'elj', 1024, 4, 25, 2.0e-5,
+    log.append(make_config(9, elj, 'elj', 512, 4, 70, 7.5e-5, eval_T=elj_eval_T(70),
+                           note='T transfer'))
+    log.append(make_config(10, elj, 'elj', 512, 4, 100, 7.5e-5, eval_T=elj_eval_T(100),
+                           note='T transfer'))
+    log.append(make_config(11, elj, 'elj', 1024, 4, 40, 2.0e-5, eval_T=elj_eval_T(40),
                            note='width transfer at toy-scaled peak'))
-    log.append(make_config(12, elj, 'elj', 1024, 4, 40, 2.0e-5,
-                           note='toy best corner on real problem'))
-    log.append(make_config(13, elj, 'elj', 512, 4, 25, 1.5e-4,
+    log.append(make_config(12, elj, 'elj', 1024, 4, 100, 2.0e-5, eval_T=elj_eval_T(100),
+                           note='width x long-T corner'))
+    log.append(make_config(13, elj, 'elj', 512, 4, 40, 1.5e-4, eval_T=elj_eval_T(40),
                            note='512 ceiling probe (overshoot expected)'))
-    log.append(make_config(14, elj, 'elj', 1024, 4, 25, 6.0e-5,
+    log.append(make_config(14, elj, 'elj', 1024, 4, 40, 6.0e-5, eval_T=elj_eval_T(40),
                            note='1024 ceiling probe (overshoot expected)'))
-    log.append(make_config(15, elj, 'elj', 512, 6, 25, 4.0e-5,
+    log.append(make_config(15, elj, 'elj', 512, 6, 40, 4.0e-5, eval_T=elj_eval_T(40),
                            note='depth transfer'))
 
     with open(OUTDIR / 'experiment_log.yaml', 'w') as f:
