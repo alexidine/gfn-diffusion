@@ -574,7 +574,7 @@ buffers:
   # the terminal state alone
   replay_buffer:
     random_churn_rate: 50  # number of random samples to add/purge per replay train step
-    max_size: 10000  # if this is too big, or takes too long to churn, it becomes a lagging indicator
+    max_size: 100000  # if this is too big, or takes too long to churn, it becomes a lagging indicator
 
   # permanent archive of high-quality, mutually latent-distinct samples -- grows only
   # through admission (never churned like prior_buffer/replay_buffer above), and tops

@@ -55,7 +55,7 @@ buffers:
     reward_min: -600
     seed_source: prior_dataset
   replay_buffer:
-    max_size: 10000
+    max_size: 100000
     random_churn_rate: 50
 bwd_loss_coeffs:
   beta: 10.0
