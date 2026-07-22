@@ -171,7 +171,7 @@ class Checkpointer:
         self-explanatory config error.
 
         ignore_keys: problem_def keys exempt from the comparison. The prior-
-        model load passes the conditioning flags (mol_cond/temp_cond) here:
+        model load passes the conditioning flags (mol_cond/temp_cond/vec_cond) here:
         they describe a model's INTERFACE rather than the target it samples,
         and the prior model is a sampling-only object rebuilt from its own
         stored gfn_config, so it need not share the live model's interface.

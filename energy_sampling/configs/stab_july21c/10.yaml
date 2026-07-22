@@ -227,24 +227,67 @@ protocol:
     - snapshot_prior
     skip_if: prior_loaded
     train_mode: bwd
-  - bwd_sampling_mode: dataset
+  - bwd_sampling_mode: prior
     exit:
-    - below: 0.03
-      metric: eval/wass_debiased
-    - below: 2.0
-      metric: bwd/tbc
+    - above: 0.95
+      metric: bwd/r2_worst
+      patience: 2
+    - below: 50.0
+      metric: bwd/scatter_err
+      patience: 2
     flags:
-      scramble_conditions: true
+      buffers_active: false
       update_log_z: true
     loss_coeffs:
       bwd:
-        mle: 1.0
-        repeats: 2.0
-        tbc: 1.0
-    name: warmstart
+        freeze_z: 0.0
+        tb: 1.0
+    name: anchor_seed
+    on_enter:
+    - seed_prior_from_anchors:10000:flush
     on_exit:
-    - snapshot:warmstart_exit
+    - snapshot:anchor_seed_exit
     train_mode: bwd
+  - balance:
+      default_boost:
+        bwd: 0.3
+        fwd: 0.7
+      kind: lexicographic
+      rules:
+      - above: 60.0
+        boost:
+          bwd: 0.9
+          fwd: 0.1
+        metric: bwd/scatter_err
+    bwd_sampling_mode: prior
+    deactivate_threshold: 0.01
+    exit:
+    - below: 5.0
+      metric: gates/delta_worst
+      patience: 5
+    - below: 50.0
+      metric: bwd/scatter_err
+    flags:
+      buffers_active: false
+    fracs:
+      bwd: 0.499
+      fwd: 0.5
+      replay: 0.001
+    loss_coeffs:
+      bwd:
+        tb: 1.0
+      fwd:
+        beta: 2.0
+        freeze_policy: 1.0
+        tb: 1.0
+    min_fracs:
+      bwd: 0.05
+      fwd: 0.05
+      replay: 0.0001
+    name: z_match
+    on_exit:
+    - snapshot:z_matched
+    train_mode: fused
   - balance:
       default_boost:
         fwd: 0.9
@@ -292,6 +335,8 @@ protocol:
       fwd: 0.02
       replay: 0.02
     name: buildout
+    on_enter:
+    - reseed_prior_from_dataset
     on_exit:
     - snapshot:fwd_calibrated
     train_mode: fused

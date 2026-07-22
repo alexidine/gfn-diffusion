@@ -206,6 +206,9 @@ def get_problem_definition(args) -> dict:
         'z_primes': args.z_primes,
         'mol_cond': args.molecule_conditioning,
         'temp_cond': args.temperature_conditioning,
+        # a vector-conditional policy expects `c` inputs an unconditional
+        # problem doesn't provide, so the flag is part of the identity
+        'vec_cond': getattr(args, 'vector_conditioning', False),
     })
 
 
@@ -1147,7 +1150,7 @@ class MetricTracker:
 
 
 def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=None,
-                   clip_beta=None):
+                   clip_beta=None, condition_id=None):
     """
     reward_floor/ramp_width gate under_coverage by a per-sample reward ramp:
 
@@ -1189,6 +1192,19 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=N
     keys backward allocation on this; the Z-anchored under_coverage stays
     reported as the absolute-merge gauge (its gap to relative_under, like
     jensen_z vs log_Z_learned, is the has-forward-caught-up signal).
+
+    condition_id, when given, re-centers relative_under's z_jensen PER
+    CONDITION (each sample against its own condition's group mean of log_w,
+    same scatter-mean pattern as within_condition_logw_std/within_condition_r2)
+    instead of the single batch-wide pooled z_jensen. A pooled z_jensen mixes
+    conditions with different true log Z into one mean, which is not any
+    condition's own normalizer -- cazwlyy1: bwd's per-condition log_Z_learned
+    had converged to the per-condition level while the pooled 'jensen_z'
+    metric sat far off from either, and relative_under (built on the pooled
+    value) read as a large spurious violation. condition_id=None reproduces
+    the old pooled behavior exactly (unconditional callers unaffected). The
+    reported 'jensen_z'/'z_gap' metrics stay pooled either way -- only
+    relative_under's own centering changes.
     """
     x = (log_pb + log_r).detach()
     y = (log_pf + log_Z).detach()
@@ -1200,9 +1216,21 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=N
     r2 = 1 - (resid ** 2).sum() / (yc * yc).sum().clamp_min(1e-8)  # CCC style - against the diagonal
 
     log_w = (log_r + log_pb - log_pf).detach()  # per-traj log importance weight
-    z_jensen = log_w.mean()  # Jensen LB:  E[log w] <= log E[w]
+    z_jensen = log_w.mean()  # Jensen LB:  E[log w] <= log E[w] (pooled, batch-wide)
     z_emp = torch.logsumexp(log_w, dim=0) - np.log(log_w.shape[0])  # logmeanexp estimate
     z_learned = log_Z.detach().mean()
+
+    if condition_id is not None:
+        cid = condition_id.detach().flatten().to(log_w.device)
+        uniq, inverse = torch.unique(cid, return_inverse=True)
+        k = uniq.numel()
+        counts = torch.zeros(k, device=log_w.device, dtype=log_w.dtype).scatter_add_(
+            0, inverse, torch.ones_like(log_w))
+        group_sum = torch.zeros(k, device=log_w.device, dtype=log_w.dtype).scatter_add_(
+            0, inverse, log_w)
+        z_jensen_ref = (group_sum / counts.clamp(min=1))[inverse]  # each sample's OWN condition's Jensen mean
+    else:
+        z_jensen_ref = z_jensen  # scalar broadcasts -- old pooled behavior
 
     # TB residual skew
     resid_c = (resid)  # center it on zero
@@ -1227,11 +1255,12 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=N
     pos = resid.clamp(min=0)  # over_coverage stays uniform: replay must see over-weighted junk
     over_severity = pos.pow(2).mean().sqrt().item()
 
-    # relative_under: same negative-tail RMS, centered on the batch's own z_jensen
-    # instead of log_Z (see docstring) -- the level gap drops out, leaving the
+    # relative_under: same negative-tail RMS, centered on z_jensen_ref (per-
+    # condition when condition_id is given, else the pooled batch mean --
+    # see docstring) instead of log_Z -- the level gap drops out, leaving the
     # within-batch spread component the policy can actually fix. Same reward-ramp
     # weighting as under_coverage, for the same low-reward-tail hygiene.
-    neg_rel = (z_jensen - log_w).clamp(max=0)
+    neg_rel = (z_jensen_ref - log_w).clamp(max=0)
     if reward_floor is not None and ramp_width is not None:
         relative_under = (((w_raw / total) * neg_rel.pow(2)).sum().sqrt().item()
                           if total > 0 else float('nan'))

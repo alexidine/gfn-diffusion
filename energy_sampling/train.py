@@ -313,6 +313,21 @@ class Modeller:
             'z_bias'] = self.condition_log_z.rms_z_bias()  # location-only companion to zerr_tracker: ~0 when Z(c) sits on mean(log w), immune to spread
         metrics[
             'logw_std_rms'] = self.condition_log_z.rms_logw_std()  # +inf until warmed (loggable as inf)
+        # z_match level-matching gap: worst-condition |bwd_level - fwd_level|
+        # over the two single-mode streams (+inf until both are warm, so the
+        # gates/delta_worst exit term can never pass on ignorance -- protocol's
+        # _resolve drops non-finite values)
+        delta = self.condition_log_z.delta_stats()
+        metrics['zmatch/delta_worst'] = delta['worst']
+        metrics['zmatch/delta_mean'] = delta['mean']
+        metrics['zmatch/delta_n_trusted'] = delta['n']
+        self.protocol.publish_gate('delta_worst', delta['worst'])
+        # the two sides of the gap on the gate's own fast clock -- the
+        # bwd/fwd jensen_z panels are longer-horizon metric_tracker EMAs and
+        # lag the true levels by nats during a fast z_match walkdown
+        levels = self.condition_log_z.pooled_levels()
+        metrics['zmatch/fwd_level'] = levels['fwd']
+        metrics['zmatch/bwd_level'] = levels['bwd']
 
         # always logged now -- report() is meaningful whether or not
         # adaptive_lr.enabled (scale sits flat at 1.0 when disabled, which is
@@ -325,6 +340,10 @@ class Modeller:
                     metrics[f'condition_log_z_ema_logw/{cid}'] = val
                 for cid, val in enumerate(self.condition_log_z.ema_log_z_emp.tolist()):
                     metrics[f'condition_log_z_ema_log_z_emp/{cid}'] = val
+                for cid, val in enumerate(self.condition_log_z.fwd_level_ema.tolist()):
+                    metrics[f'condition_fwd_level/{cid}'] = val
+                for cid, val in enumerate(self.condition_log_z.bwd_level_ema.tolist()):
+                    metrics[f'condition_bwd_level/{cid}'] = val
 
         # --- step-time tail probes: WINDOW-MAX over the 10 steps since the last
         # report, so a rare slow step can't slip between the 1-in-10 samples the
@@ -1167,7 +1186,7 @@ class Modeller:
             # unconditional model just ignores the condition tensors it's
             # handed at sampling time) -- only the TARGET has to match.
             self.checkpointer.assert_problem_match(checkpoint, prior_path, 'prior_model_name',
-                                                   ignore_keys=('mol_cond', 'temp_cond'))
+                                                   ignore_keys=('mol_cond', 'temp_cond', 'vec_cond'))
             # the stored config stamps the device it was trained on; GFN uses
             # its device arg internally at sampling time, so override it or a
             # cross-device load breaks past .to()
@@ -1833,6 +1852,7 @@ class Modeller:
         stats = quick_tb_stats(loss_dict['log_pf'], loss_dict['log_pb'],
                                loss_dict['log_Z'], loss_dict['log_r'],
                                clip_beta=getattr(getattr(self.args, f'{sub_type}_loss_coeffs'), 'beta', None),
+                               condition_id=loss_dict.get('condition_id'),
                                **self._reward_ramp_kwargs(loss_dict.get('condition_id')))
         stats.update({k: v.item() for k, v in loss_dict.items() if k not in
                       ['log_pf', 'log_pb', 'log_Z', 'log_r', 'losses', 'flow_states', 'resid', 'condition_id']})
@@ -2008,7 +2028,12 @@ class Modeller:
                                                 condition_id=condition_id,
                                                 tb_z_source=self.tb_z_source('bwd'),
                                                 update_log_z=self.protocol.flag('update_log_z'),
-                                                step=self.step_ind)
+                                                step=self.step_ind,
+                                                # J_B side of the z_match delta gate; a scrambled
+                                                # embedding's log_pf is not the conditional
+                                                # policy's level, so skip the feed there. Replay
+                                                # deliberately never feeds either stream.
+                                                mode_level_stream=None if scramble_tiles else 'bwd')
 
         priority = self._bwd_retention_priority(loss_dict)
         if self.bwd_sampling_mode == 'dataset':
@@ -2258,6 +2283,7 @@ class Modeller:
         metrics.update({f'eval_fwd/{k}': v for k, v in
                         quick_tb_stats(log_pf, log_pb, log_Z_learned, log_r,
                                        clip_beta=getattr(self.args.fwd_loss_coeffs, 'beta', None),
+                                       condition_id=fwd_stats.get('condition_id'),
                                        **self._reward_ramp_kwargs(fwd_stats.get('condition_id'))).items()})
 
         self.log_thermo_properties(arr, fwd_stats, log_T_tensor, log_Z_learned, log_r, metrics, sample_batch, val)
@@ -2271,6 +2297,7 @@ class Modeller:
         metrics.update({f'eval_bwd/{k}': v for k, v in
                         quick_tb_stats(log_pf, log_pb, log_z, log_r,
                                        clip_beta=getattr(self.args.bwd_loss_coeffs, 'beta', None),
+                                       condition_id=bwd_stats.get('condition_id'),
                                        **self._reward_ramp_kwargs(bwd_stats.get('condition_id'))).items()})
 
         def dump_numeric(metrics, prefix, obj):
@@ -2567,9 +2594,13 @@ class Modeller:
 
     def log_buffer_stats(self):
         # report on whatever backward is actually drawing from this stage:
-        # the churned prior_buffer once buffers are live, the static
-        # prior_dataset during the warm-start
-        if self.protocol.flag('buffers_active'):
+        # the prior_buffer whenever bwd samples 'prior' (churned or -- in the
+        # localized stages, buffers_active off -- frozen), the static
+        # prior_dataset during the warm-start. Keyed on bwd_sampling_mode,
+        # not buffers_active: the flag gates buffer MANAGEMENT, and the
+        # localized anchor_seed/z_match variant deliberately draws from a
+        # frozen prior_buffer with management paused
+        if self.bwd_sampling_mode == 'prior':
             buff = getattr(self, 'prior_buffer', None)
         else:
             buff = getattr(self, 'prior_dataset', None)
@@ -3016,6 +3047,65 @@ class Modeller:
                     )
 
     @torch.no_grad()
+    def seed_prior_from_condition_minima(self, n_per_condition: int = 1, flush: bool = False):
+        """
+        Deterministic prior_buffer seed: one row per condition present in
+        anchor_buffer (its lowest-energy entry, AnchorBuffer.
+        best_per_condition_indices -- not a priority-weighted random draw, so
+        coverage doesn't degrade as the condition library grows), tiled
+        n_per_condition times and isotropically noised
+        (log_noise_latent_parameters, same cfg.noise_log_range as
+        top_up_prior_from_anchors). Total set size is exactly
+        n_conditions_present * n_per_condition. Rescored and added to
+        prior_buffer unconditionally (no energy-floor gate: these are each
+        condition's own best known state, tiled and noised).
+
+        flush=True ('seed_prior_from_anchors:N:flush') REPLACES the buffer
+        with the seed set instead of adding to it: the localized-anchor_seed
+        variant, where backward TB must fit the tight noise ball around each
+        condition's best anchor rather than the (possibly broad, dataset-
+        seeded) incumbent content. Pair with buffers_active: false on the
+        localized stages -- otherwise eval-cadence churn (admissions within
+        ramp_floor of best + anchor top-ups) re-broadens the buffer -- and
+        with reseed_prior_from_dataset at the following stage boundary to
+        restore coverage wholesale.
+        """
+        cfg = self.args.buffers.anchor_buffer
+        uniq_ids, row_idx = self.anchor_buffer.best_per_condition_indices()
+        if row_idx.numel() == 0:
+            return
+
+        tiled_idx = row_idx.repeat_interleave(n_per_condition)
+        seed_batch = self.anchor_buffer.batch.subsample_new_batch(tiled_idx).clone().to(self.device)
+        seed_batch.log_noise_latent_parameters(*cfg.noise_log_range)
+
+        seed_batch, log_T_tensor, sg_inds, zps, condition, condition_id = self.energy_function.condition_samples(
+            seed_batch, sg_inds=seed_batch.sg_ind, z_primes=seed_batch.z_prime)
+        seed_batch.orient_molecule(mode='std')
+
+        terminal_latents = seed_batch.latent_params()
+        reward, seed_batch = self.energy_function.log_reward(
+            terminal_latents, seed_batch, log_T_tensor, return_exp=True)
+
+        temperature = 10 ** log_T_tensor
+        energy = -reward.detach() * temperature
+
+        if hasattr(self, 'condition_log_z'):
+            self.condition_log_z.update_best_energy(condition_id, energy)
+
+        good_inds = torch.argwhere(torch.isfinite(energy)).flatten()
+        if good_inds.numel() > 0:
+            if flush:
+                n_before = len(self.prior_buffer) if hasattr(self, 'prior_buffer') else 0
+                self.prior_buffer = self._fresh_prior_buffer(seed_batch.subsample_new_batch(good_inds))
+                print(f"seed_prior_from_anchors (flush): prior_buffer {n_before} -> "
+                      f"{len(self.prior_buffer)} rows ({n_per_condition} noised best-anchor "
+                      f"copies x {uniq_ids.numel()} conditions, minus non-finite rescores)")
+            else:
+                self.prior_buffer.add(seed_batch.subsample_new_batch(good_inds))
+        self.prior_churn['from_anchors'] += int(good_inds.numel())
+
+    @torch.no_grad()
     def refresh_anchor_buffer_surprise(self):
         """
         Full periodic re-measurement of every anchor's current surprise,
@@ -3268,27 +3358,40 @@ class Modeller:
         if getattr(self.args.buffers.prior_buffer, 'seed_source', 'generated') != 'prior_dataset':
             return
 
+        seed_batch = self._prior_dataset_seed_batch(self.args.buffers.prior_buffer.max_size)
+        self.prior_buffer = self._fresh_prior_buffer(seed_batch)
+        print(f"Seeded prior_buffer with {len(self.prior_buffer)} prior-dataset samples (fresh loss records)")
+
+    def _prior_dataset_seed_batch(self, limit: int):
+        """
+        The prior-dataset draw both seeding paths share (init_prior_buffer_seed
+        and the reseed_prior_from_dataset stage action): clone, random-subsample
+        to `limit` if larger, then give it the exact treatment manage_prior_buffer's
+        generated candidates get -- append_batch demands exact key parity, so
+        condition_samples attaches `conditions`/`condition_id` (riding along
+        into the buffer generically), with the batch's own sg_ind/z_prime
+        passed through so prebuilt values are honored rather than resampled;
+        then drop the string keys candidates never carry (sample_graphs drops
+        them at draw time; identifier was already consumed into mol_id by
+        init_identifiers()).
+        """
         seed_batch = self.prior_dataset.batch.clone()
-        max_size = self.args.buffers.prior_buffer.max_size
-        if seed_batch.num_graphs > max_size:
-            keep = torch.randperm(seed_batch.num_graphs)[:max_size]
+        if seed_batch.num_graphs > limit:
+            keep = torch.randperm(seed_batch.num_graphs)[:limit]
             seed_batch = seed_batch.subsample_new_batch(keep)
         seed_batch = seed_batch.to(self.device)
-        # append_batch demands exact key parity with the generated candidates
-        # manage_prior_buffer will later add, so give the seed the identical
-        # treatment they get (same recipe as init_anchor_buffer_seed):
-        # condition_samples attaches `conditions`/`condition_id` (riding along
-        # into the buffer generically), with the batch's own sg_ind/z_prime
-        # passed through so prebuilt values are honored rather than resampled;
-        # then drop the string keys candidates never carry (sample_graphs
-        # drops them at draw time; identifier was already consumed into
-        # mol_id by init_identifiers()).
         seed_batch, _, _, _, _, _ = self.energy_function.condition_samples(
             seed_batch,
             sg_inds=getattr(seed_batch, 'sg_ind', None),
             z_primes=getattr(seed_batch, 'z_prime', None))
         seed_batch = AnchorBuffer._drop_keys(seed_batch, ("smiles", "identifier"))
-        self.prior_buffer = CrystalBuffer(
+        return seed_batch
+
+    def _fresh_prior_buffer(self, seed_batch):
+        """Construct a new CrystalBuffer around seed_batch with clean
+        per-sample records -- the single construction recipe shared by init
+        seeding and seed_prior_from_condition_minima's flush path."""
+        return CrystalBuffer(
             seed_batch,
             device=self.buffer_device,
             max_z_prime=max(self.args.z_primes),
@@ -3296,7 +3399,33 @@ class Modeller:
             y_fn=self.args.energy_function,
             exclude_keys=CHURNED_BUFFER_EXCLUDE_KEYS,
         )
-        print(f"Seeded prior_buffer with {len(self.prior_buffer)} prior-dataset samples (fresh loss records)")
+
+    def reseed_prior_from_dataset(self):
+        """
+        Stage action (protocol: 'reseed_prior_from_dataset'): re-add the prior
+        dataset into prior_buffer with fresh per-sample records -- the
+        coverage counterpart to seed_prior_from_anchors:N:flush. A localized
+        anchor_seed/z_match runs on the flushed-down buffer (with
+        buffers_active off so churn can't re-broaden it); this restores broad
+        coverage wholesale at the next stage boundary instead of waiting on
+        churn top-ups (~1k/eval window never re-broadens a 150k dataset).
+        Additive: the current (local) content is untouched; the dataset draw
+        is subsampled to the buffer's remaining headroom.
+        """
+        if not hasattr(self, 'prior_dataset'):
+            return
+        current = len(self.prior_buffer) if hasattr(self, 'prior_buffer') else 0
+        headroom = self.args.buffers.prior_buffer.max_size - current
+        if headroom <= 0:
+            return
+        seed_batch = self._prior_dataset_seed_batch(headroom)
+        if hasattr(self, 'prior_buffer'):
+            self.prior_buffer.add(seed_batch)
+        else:
+            self.prior_buffer = self._fresh_prior_buffer(seed_batch)
+        self.prior_churn['from_seed'] += int(seed_batch.num_graphs)
+        print(f"reseed_prior_from_dataset: prior_buffer {current} -> {len(self.prior_buffer)} rows "
+              f"(+{seed_batch.num_graphs} prior-dataset samples, fresh loss records)")
 
     def init_anchor_buffer_seed(self):
         """

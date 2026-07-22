@@ -1,0 +1,89 @@
+# Reference only -- never loaded by train.py. Records the mk_dev.yaml key
+# values for each mode combination actually run, so switching modes is a
+# lookup instead of a git-diff archaeology exercise. Update this file
+# whenever mk_dev.yaml's mode-defining keys change for a mode that's on
+# record here, or add a new column for a mode combination not yet listed.
+#
+# Two independent axes:
+#   conditioning: unconditional | conditional
+#   domain:       molecule (real crystal physics) | toy (latent_* energy fn)
+#
+# Keys NOT listed here (scramble_conditions, the anchor_seed stage and its
+# seed_prior_from_anchors action, the fwd/r2_within + fwd/r2_worst gate keys)
+# are mode-safe as of 2026-07-21: they no-op or fall back correctly when
+# vector_conditioning/molecule_conditioning are both false, so they don't
+# need to change between modes and are left as-is in mk_dev.yaml.
+
+unconditional_molecule:
+  # last run as elj/mipcas single-molecule, pre-2026-07-21 toy-2cond switch
+  lr_flow: 0.1  # flow_model is LearnableScalar (unconditional) -- convex 1-D, O(lr) jitter only at this LR
+  prior_path: 'D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt'
+  molecules_path: 'D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt'
+  model.periodic_centroids: true
+  energy_function: 'elj'
+  space_groups: [ 2 ]
+  vector_conditioning: false
+  vector_conditioning_dim: 3
+  molecule_conditioning: false
+  energy_config.temperature: 2.5
+  energy_config.analyze_kwargs: { }
+  buffers.anchor_buffer.seed_source: 'prior_dataset'
+
+conditional_toy:
+  # current mk_dev.yaml state as of 2026-07-21: toy_2cond, latent_multiharmonic
+  lr_flow: 1.0e-4  # flow_model is a real network (scalarMLP) -- match lr_fused/lr_policy, not the unconditional scalar's 0.1 (cazwlyy1: 0.1 detonated Z(c))
+  prior_path: 'D:\crystal_datasets\conditional\priors\toy_2cond_conn_prior.pt'
+  molecules_path: 'D:\crystal_datasets\conditional\priors\toy_2cond_conditions.pt'
+  model.periodic_centroids: false
+  energy_function: 'latent_multiharmonic'
+  space_groups: [ 1 ]
+  vector_conditioning: true
+  vector_conditioning_dim: 2
+  molecule_conditioning: false
+  energy_config.temperature: 1.0
+  energy_config.analyze_kwargs: {
+    cond_dim: 2,
+    n_core: 1,
+    n_ghost: 0,
+    sigma_range: [ 0.04, 0.12 ],
+    aniso_scale: 0.0,
+    depth_range: [ 0.0, 4.0 ],
+    mu_scale: 0.5,
+    disp_max: 0.15,
+    logsig_scale: 0.5,
+    gate_steep: 4.0,
+    edge_sigmas: 0.1,
+    max_temperature: 3.0,
+    max_width: 2.5,
+    seed: 0
+  }
+  buffers.anchor_buffer.seed_source: 'D:\crystal_datasets\conditional\priors\toy_2cond_conn_conditions.pt'
+
+# Anchor-seeding rule by domain (NOT a per-mode key):
+#   toy (cond + uncond): the prior dataset is a broad junk Gaussian and the
+#     CONDITIONS dataset is genuine target-distribution samples (generate_
+#     toy_prior.py condition_set.sample_latents: true) -- seed anchors from
+#     the conditions .pt to hand the answer set over and obviate mode
+#     discovery (convergence-dynamics-only experiments)
+#   unconditional molecule: prior is high-quality (not target) -- seed_source
+#     'prior_dataset'
+#   conditional molecule: seed anchors with reasonable samples; coverage per
+#     condition will be partial
+unconditional_toy:
+  # configured 2026-07-21 for the toy_hard_uncond_multi intermediate
+  # (16-core/16-ghost multiharmonic field, single identifier mode_a)
+  lr_flow: 0.1  # flow_model is LearnableScalar (unconditional) -- convex 1-D, O(lr) jitter only at this LR
+  prior_path: 'D:\crystal_datasets\conditional\priors\toy_hard_uncond_multi_prior.pt'
+  molecules_path: 'D:\crystal_datasets\conditional\priors\toy_hard_uncond_multi_conditions.pt'
+  model.periodic_centroids: false
+  energy_function: 'latent_multiharmonic'
+  space_groups: [ 1 ]
+  vector_conditioning: false
+  vector_conditioning_dim: 2  # inert while vector_conditioning is false
+  molecule_conditioning: false
+  energy_config.temperature: 1.0
+  energy_config.analyze_kwargs: 'match the generator run''s latent_field block (toy_prior_config.yaml)'
+  buffers.anchor_buffer.seed_source: 'D:\crystal_datasets\conditional\priors\toy_hard_uncond_multi_conditions.pt'  # toys: conditions file = target samples (see domain rule above)
+
+# not yet run/configured -- add columns here once tried:
+#   conditional_molecule

@@ -284,24 +284,57 @@ protocol:
         - { metric: bwd/tbc, below: 2.0 }
       on_exit: [ 'snapshot:phase1_exit', 'snapshot_prior' ]
 
-    # -- policy warm start for runs that loaded a shared prior and skipped
-    #    train_prior: same MLE+TBC loss on the dataset, but exits on the
-    #    matched-eval wass bar (fast) instead of the mle_flat slope gate
-    #    (slow), and never runs snapshot_prior -- the loaded prior model is
-    #    kept as-is. When no prior was found and train_prior ran, this stage
-    #    exits at its first eval (wass/tbc are already under these bars).
-    - name: warmstart
+    # -- anchor seed: fresh-policy backward-TB warm start on the prior buffer
+    #    with LIVE Z. Replaces the old MLE 'warmstart' stage: the
+    #    anchor_seed -> z_match chain is the validated handoff (mk_dev
+    #    2026-07-21, runs ona8i747/fxr4h4zy -- fresh policies enter here
+    #    directly, no MLE head start needed). Toy domain: buffer
+    #    seeding/churn stay ACTIVE (junk prior seed + anchor-transfusion
+    #    churn is the toys' localization engine) and the seed action is
+    #    additive. REQUIRES the 2026-07-21 evening code (ConditionLogZTracker
+    #    level streams, gates/delta_worst, seed action arg parsing).
+    - name: anchor_seed
       train_mode: bwd
-      bwd_sampling_mode: dataset
+      bwd_sampling_mode: prior
       flags:
         update_log_z: true
-        scramble_conditions: true
+        buffers_active: true
+      on_enter: [ 'seed_prior_from_anchors:500' ]
       loss_coeffs:
-        bwd: { mle: 1.0, tbc: 1.0, repeats: 2.0 }
+        bwd: { tb: 1.0, freeze_z: 0.0 }
       exit:
-        - { metric: eval/wass_debiased, below: 0.03 }
-        - { metric: bwd/tbc, below: 2.0 }
-      on_exit: [ 'snapshot:warmstart_exit' ]
+        - { metric: bwd/r2_worst, above: 0.95, patience: 2 }
+        - { metric: bwd/scatter_err, below: 30.0, patience: 2 }  # coarse floor; z_match's exit bar owns final scatter quality
+      on_exit: [ 'snapshot:anchor_seed_exit' ]
+
+    # -- z_match: level-matching handoff. bwd maintains the backward fit
+    #    against DETACHED Z (freeze_z stays 1 from base); fwd trains Z only
+    #    (freeze_policy) on on-policy rollouts. gates/delta_worst =
+    #    worst-condition |bwd_level - fwd_level| from the tracker's per-mode
+    #    level streams (zmatch/fwd_level + zmatch/bwd_level panels show the
+    #    two sides on the gate's own clock). Toy gate values: fxr4h4zy
+    #    entered at delta 5.9, exited at 0.14 in 80 steps.
+    - name: z_match
+      train_mode: fused
+      bwd_sampling_mode: prior
+      flags:
+        buffers_active: true
+      fracs: { fwd: 0.5, bwd: 0.499, replay: 0.001 }
+      min_fracs: { fwd: 0.05, bwd: 0.05, replay: 0.0001 }
+      deactivate_threshold: 0.01
+      loss_coeffs:
+        fwd: { tb: 1.0, freeze_policy: 1.0 }   # Z-only Huberized TB (beta from base coeffs)
+        bwd: { tb: 1.0 }                       # policy-only vs detached moving Z
+      balance:
+        kind: lexicographic
+        default_boost: { fwd: 0.7, bwd: 0.3 }
+        rules:
+          # backward fit degrading = Z's demand outpacing the policy
+          - { metric: bwd/scatter_err, above: 25.0, boost: { bwd: 0.9, fwd: 0.1 } }
+      exit:
+        - { metric: gates/delta_worst, below: 1.5, patience: 5 }
+        - { metric: bwd/scatter_err, below: 20.0 }
+      on_exit: [ 'snapshot:z_matched' ]
 
     # -- forward-first stage A: fwd TB trains policy AND Z on-policy, replay
     #    retains, backward dormant at the floor (admitted only by the boundary
@@ -388,7 +421,12 @@ buffers:
     max_size: 10000
 
   anchor_buffer:
-    seed_source: 'prior_dataset'
+    # toy domain rule (mode_presets.yaml): the CONDITIONS file carries genuine
+    # target samples (generate_toy_prior condition_set.sample_latents), the
+    # prior is a junk Gaussian -- anchors seed from the answers, obviating
+    # search. VERIFY toy_2harm_conditions.pt was generated with
+    # sample_latents: true; if not, revert to 'prior_dataset'
+    seed_source: /scratch/mk8347/data/crystal_datasets/conditional/priors/toy_2harm_conditions.pt #'prior_dataset'
     max_size: 200000
     dup_cutoff: 0.05
     screen_energy_window: 20
@@ -416,7 +454,7 @@ sg_conditioning: False
 space_groups: [ 1 ]
 zp_conditioning: false
 z_primes: [ 1 ]
-vector_conditioning: true
+vector_conditioning: false
 vector_conditioning_dim: 3
 energy_config:
   internal_oom_recovery: true

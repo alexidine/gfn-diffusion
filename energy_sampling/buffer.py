@@ -938,6 +938,21 @@ class ConditionLogZTracker:
         self.z_bias_ema = torch.full((library_size,), float("nan"), dtype=torch.float32)
         self.z_resid_effective_count = torch.zeros((library_size,), dtype=torch.float32)
         self.z_resid_last_step = torch.full((library_size,), -1, dtype=torch.long)
+        # per-mode level EMAs (the z_match delta gate): per-condition mean log w
+        # kept as two SEPARATE streams -- 'bwd' (backward rollouts from the local
+        # buffer: the buffer-implied level J_B) and 'fwd' (on-policy forward
+        # rollouts: the on-policy level J_F). ema_logw above blends whatever
+        # feeds it (do_update gating); the level-matching gap
+        # delta(c) = J_B(c) - J_F(c) needs the two sides unblended, so these
+        # are fed from their own loss paths regardless of do_update (see
+        # update_and_lookup_condition_log_z's mode_level_stream) and are never
+        # fed back into training -- pure measurement. delta_stats() reduces them.
+        self.fwd_level_ema = torch.full((library_size,), float("nan"), dtype=torch.float32)
+        self.bwd_level_ema = torch.full((library_size,), float("nan"), dtype=torch.float32)
+        self.fwd_level_effective_count = torch.zeros((library_size,), dtype=torch.float32)
+        self.bwd_level_effective_count = torch.zeros((library_size,), dtype=torch.float32)
+        self.fwd_level_last_step = torch.full((library_size,), -1, dtype=torch.long)
+        self.bwd_level_last_step = torch.full((library_size,), -1, dtype=torch.long)
         # discovery-rate telemetry over best_energy: update_best_energy()
         # accumulates strict per-condition minimum improvements (count/depth)
         # and first visits into the _window_* scalars; pop_discovery_stats()
@@ -1226,6 +1241,132 @@ class ConditionLogZTracker:
         self.z_resid_effective_count[unique_ids] = new_eff_count
         self.z_resid_last_step[unique_ids] = int(step)
 
+    def _group_trimmed_mean(self, inverse, values, k, trim_frac: Optional[float] = None):
+        """
+        Per-group trimmed mean over k groups indexed by `inverse` (same
+        scheme as update(): drop the top/bottom trim_frac of each group by
+        rank, keep at least one sample). Returns (means, counts).
+        """
+        trim_frac = self.trim_frac if trim_frac is None else trim_frac
+        n = values.shape[0]
+        counts = torch.zeros(k, dtype=torch.float32).scatter_add_(
+            0, inverse, torch.ones_like(values))
+        value_order = torch.argsort(values)
+        group_order = torch.argsort(inverse[value_order], stable=True)
+        sorted_idx = value_order[group_order]
+        sorted_group = inverse[sorted_idx]
+        sorted_vals = values[sorted_idx]
+        group_start = torch.zeros(k, dtype=torch.long)
+        group_start[1:] = torch.cumsum(counts, dim=0)[:-1].long()
+        rank_in_group = torch.arange(n) - group_start[sorted_group]
+        counts_long = counts.long()
+        trim_k = torch.clamp((trim_frac * counts).floor().long(),
+                             max=(counts_long - 1) // 2)
+        kept_counts = counts - 2 * trim_k.float()
+        keep_mask = (rank_in_group >= trim_k[sorted_group]) & \
+                    (rank_in_group < counts_long[sorted_group] - trim_k[sorted_group])
+        means = torch.zeros(k, dtype=torch.float32).scatter_add_(
+            0, sorted_group,
+            torch.where(keep_mask, sorted_vals, torch.zeros_like(sorted_vals))) / kept_counts
+        return means, counts
+
+    @torch.no_grad()
+    def update_mode_level(self, mode: str, condition_id, logw, step: int,
+                          half_life_steps: Optional[float] = None):
+        """
+        Feed one mode's per-condition level stream (fwd_level_ema /
+        bwd_level_ema, see __init__): a time-decayed, evidence-capped EMA of
+        the per-condition trimmed mean of log w, same decay convention as
+        update()/update_z_residual() (elapsed training steps since this
+        condition's own last visit on THIS stream). Trimming for the same
+        reason as update()'s ema_logw: the delta gate reads levels, and one
+        catastrophic-energy outlier in a batch mean would otherwise swing a
+        whole condition's level reading for a half-life.
+        """
+        if mode == 'fwd':
+            level_ema = self.fwd_level_ema
+            eff_count = self.fwd_level_effective_count
+            last_step_t = self.fwd_level_last_step
+        elif mode == 'bwd':
+            level_ema = self.bwd_level_ema
+            eff_count = self.bwd_level_effective_count
+            last_step_t = self.bwd_level_last_step
+        else:
+            raise ValueError(f"unknown mode-level stream '{mode}' (expected 'fwd' or 'bwd')")
+
+        half_life_steps = self.half_life_steps if half_life_steps is None else half_life_steps
+        decay_per_step = 0.5 ** (1.0 / half_life_steps)
+        condition_id = torch.as_tensor(condition_id, dtype=torch.long).detach().cpu().flatten()
+        logw = torch.as_tensor(logw, dtype=torch.float32).detach().cpu().flatten()
+
+        if condition_id.numel() == 0:
+            return
+        if condition_id.shape[0] != logw.shape[0]:
+            raise ValueError(
+                f"condition_id and logw must have same length, got "
+                f"{condition_id.shape[0]} and {logw.shape[0]}.")
+
+        unique_ids, inverse = torch.unique(condition_id, return_inverse=True)
+        mean_logw, counts = self._group_trimmed_mean(inverse, logw, unique_ids.shape[0])
+
+        old_mean = level_ema[unique_ids]
+        old_eff_count = eff_count[unique_ids]
+        old_last_step = last_step_t[unique_ids]
+        nan_mask = torch.isnan(old_mean)
+
+        delta_t = torch.clamp((step - old_last_step).float(), min=0.0)
+        decayed_eff_count = old_eff_count * decay_per_step ** delta_t
+        evidence_count = torch.clamp(counts, max=self.max_batch_weight)
+        new_eff_count = decayed_eff_count + evidence_count
+        w_new = evidence_count / new_eff_count
+
+        level_ema[unique_ids] = torch.where(
+            nan_mask, mean_logw, (1.0 - w_new) * old_mean + w_new * mean_logw)
+        eff_count[unique_ids] = new_eff_count
+        last_step_t[unique_ids] = int(step)
+
+    @torch.no_grad()
+    def delta_stats(self, min_effective_count: Optional[float] = None):
+        """
+        The z_match level-matching gap: per-condition
+        delta(c) = bwd_level_ema - fwd_level_ema (buffer-implied minus
+        on-policy level; equals minus the mean backward TB residual at
+        Z-stationarity), reduced over conditions where BOTH streams carry
+        enough decayed evidence. 'worst' is max |delta(c)| -- +inf when no
+        condition qualifies, same never-pass-on-ignorance convention as
+        rms_logw_std (the exit gate fires on SMALL values). 'mean' is the
+        trusted mean of |delta(c)|, 'n' the trusted-condition count.
+        """
+        min_effective_count = self.min_visits if min_effective_count is None else min_effective_count
+        mask = (~torch.isnan(self.fwd_level_ema)) & (~torch.isnan(self.bwd_level_ema)) \
+               & (self.fwd_level_effective_count >= min_effective_count) \
+               & (self.bwd_level_effective_count >= min_effective_count)
+        if not mask.any():
+            return {'worst': float('inf'), 'mean': float('inf'), 'n': 0}
+        gap = (self.bwd_level_ema[mask] - self.fwd_level_ema[mask]).abs()
+        return {'worst': gap.max().item(), 'mean': gap.mean().item(),
+                'n': int(mask.sum().item())}
+
+    @torch.no_grad()
+    def pooled_levels(self, min_effective_count: Optional[float] = None):
+        """
+        Dashboard companions to delta_stats(): the trusted-masked mean of each
+        per-mode level stream, so the two sides of the level-matching gap are
+        visible on the SAME fast clock (half_life_steps) the delta gate reads.
+        The logged bwd/jensen_z / fwd/jensen_z pair are metric_tracker EMAs
+        with a much longer horizon -- during an 80-step z_match walkdown they
+        lag the true levels by nats (fxr4h4zy: apparent 4-nat gap at exit vs
+        0.1 real). NaN (not inf) when a stream has no trusted condition:
+        display-only, never gated on.
+        """
+        min_effective_count = self.min_visits if min_effective_count is None else min_effective_count
+        out = {}
+        for name, ema, eff in (('fwd', self.fwd_level_ema, self.fwd_level_effective_count),
+                               ('bwd', self.bwd_level_ema, self.bwd_level_effective_count)):
+            mask = (~torch.isnan(ema)) & (eff >= min_effective_count)
+            out[name] = ema[mask].mean().item() if mask.any() else float('nan')
+        return out
+
     @torch.no_grad()
     def rms_z_lag(self, min_effective_count: Optional[float] = None):
         """
@@ -1503,6 +1644,12 @@ class ConditionLogZTracker:
             "z_bias_ema": self.z_bias_ema.cpu(),
             "z_resid_effective_count": self.z_resid_effective_count.cpu(),
             "z_resid_last_step": self.z_resid_last_step.cpu(),
+            "fwd_level_ema": self.fwd_level_ema.cpu(),
+            "bwd_level_ema": self.bwd_level_ema.cpu(),
+            "fwd_level_effective_count": self.fwd_level_effective_count.cpu(),
+            "bwd_level_effective_count": self.bwd_level_effective_count.cpu(),
+            "fwd_level_last_step": self.fwd_level_last_step.cpu(),
+            "bwd_level_last_step": self.bwd_level_last_step.cpu(),
             "discovery_half_life_steps": self.discovery_half_life_steps,
             "minima_improved_total": self.minima_improved_total,
             "minima_depth_total": self.minima_depth_total,
@@ -1568,6 +1715,21 @@ class ConditionLogZTracker:
             "z_resid_effective_count", torch.zeros_like(obj.count, dtype=torch.float32)).cpu()
         obj.z_resid_last_step = state.get(
             "z_resid_last_step", torch.full_like(obj.count, int(current_step))).cpu()
+        # older checkpoints predate the per-mode level streams (z_match delta
+        # gate) -- NaN/0/current_step never-updated sentinels, same reasoning
+        # as the z-residual monitor above
+        obj.fwd_level_ema = state.get(
+            "fwd_level_ema", torch.full_like(obj.count, float("nan"), dtype=torch.float32)).cpu()
+        obj.bwd_level_ema = state.get(
+            "bwd_level_ema", torch.full_like(obj.count, float("nan"), dtype=torch.float32)).cpu()
+        obj.fwd_level_effective_count = state.get(
+            "fwd_level_effective_count", torch.zeros_like(obj.count, dtype=torch.float32)).cpu()
+        obj.bwd_level_effective_count = state.get(
+            "bwd_level_effective_count", torch.zeros_like(obj.count, dtype=torch.float32)).cpu()
+        obj.fwd_level_last_step = state.get(
+            "fwd_level_last_step", torch.full_like(obj.count, int(current_step))).cpu()
+        obj.bwd_level_last_step = state.get(
+            "bwd_level_last_step", torch.full_like(obj.count, int(current_step))).cpu()
         # older checkpoints predate the discovery telemetry -- zeroed
         # accumulators/EMAs are the honest fallback (rates rebuild within a
         # half-life), and discovery_last_step falls back to current_step so
@@ -2031,6 +2193,31 @@ class AnchorBuffer(CrystalBuffer):
                  original_surprise=original_surprise[add_inds] if original_surprise is not None else None)
 
         return n_admitted
+
+    @torch.no_grad()
+    def best_per_condition_indices(self):
+        """
+        For every condition_id present in the buffer, the row index of its
+        lowest-energy entry. Deterministic (one row per distinct
+        condition_id, ties broken to the lowest row index), unlike
+        sample_graphs' priority-weighted random draw. Returns
+        (unique_condition_ids, row_idx), both empty if the buffer is empty.
+        """
+        condition_id = self.condition_id
+        energy = self.energy
+        n = condition_id.numel()
+        if n == 0:
+            return condition_id.new_empty(0), torch.empty(0, dtype=torch.long)
+
+        uniq_ids, inverse = torch.unique(condition_id, return_inverse=True)
+        k = uniq_ids.numel()
+        group_min = torch.full((k,), float('inf'), dtype=torch.float32)
+        group_min.scatter_reduce_(0, inverse, energy, reduce='amin', include_self=True)
+        is_min = energy == group_min[inverse]
+        row_idx = torch.full((k,), -1, dtype=torch.long)
+        all_rows = torch.arange(n, dtype=torch.long)
+        row_idx.scatter_reduce_(0, inverse[is_min], all_rows[is_min], reduce='amin', include_self=False)
+        return uniq_ids, row_idx
 
     @torch.no_grad()
     def thin(self, per_condition_min_energy, energy_window: Optional[float] = None,

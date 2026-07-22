@@ -34,6 +34,22 @@ Three changes from stab_july21/stab_july21b:
    stably, same question as the preload runs but without warmstart's head
    start).
 
+4. z_match protocol (regenerated 2026-07-21 evening): both bases replace the
+   'warmstart' stage with the validated anchor_seed -> z_match handoff chain
+   (mk_dev 2026-07-21, runs ona8i747/fxr4h4zy/wdsb4ylp). base_toy keeps the
+   additive/active anchor_seed (junk prior + anchor-transfusion churn is the
+   toys' localization engine; anchors now seed from the conditions file per
+   the domain rule -- VERIFY toy_2harm_conditions.pt has baked target
+   latents); base_elj runs the LOCALIZED variant (seed_prior_from_anchors:
+   10000:flush + buffers_active false through the handoff +
+   reseed_prior_from_dataset at buildout entry -- see 1wwyjp6x for why
+   whole-buffer anchor_seed fails on molecule problems). REQUIRES the
+   2026-07-21 evening code drop (ConditionLogZTracker per-mode level
+   streams, gates/delta_worst, flush/reseed protocol actions) -- configs
+   fail at parse on older code. Runs 0-2 launched under the pre-z_match
+   bases are the old-handoff control arm; their yamls here no longer match
+   what they ran (wandb carries the as-run configs).
+
 Focus is stable convergence, not ceiling probing: every peak LR below is a
 DOWN-scaled extrapolation from a previously-observed-safe T40 point (LR ~
 1/T scaling, matching this codebase's T-compounding principle for TB

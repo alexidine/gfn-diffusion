@@ -26,9 +26,10 @@ declares:
                     terms; when it fires, the run advances to the next stage.
                     A stage with no exit is terminal.
   on_exit/on_enter  transition actions (snapshot:<tag>, snapshot_prior,
-                    bootstrap_z) -- the route-specific physics; everything
-                    generic (optimizer rebuild, monitor cooldown, LR re-warm)
-                    happens automatically at EVERY transition
+                    bootstrap_z, seed_prior_from_anchors) -- the
+                    route-specific physics; everything generic (optimizer
+                    rebuild, monitor cooldown, LR re-warm) happens
+                    automatically at EVERY transition
   skip_if           entry condition ('prior_loaded'): on a fresh run the stage
                     is skipped when the condition holds (e.g. the MLE warm-
                     start is redundant when a prior model was loaded by path
@@ -102,7 +103,8 @@ TRAIN_MODES = ('bwd', 'fused')
 BWD_SAMPLING_MODES = ('dataset', 'prior')
 STAGE_FLAGS = ('update_log_z', 'scramble_conditions', 'zgap_mol_sampling',
                'buffers_active', 'mle_gate')
-ACTIONS = ('snapshot', 'snapshot_prior', 'bootstrap_z')
+ACTIONS = ('snapshot', 'snapshot_prior', 'bootstrap_z', 'seed_prior_from_anchors',
+           'reseed_prior_from_dataset')
 SKIP_CONDITIONS = ('prior_loaded',)
 RULE_KEYS = {'metric', 'boost', 'above', 'below', 'relative', 'margin', 'drift', 'floor',
              'abs', 'if_missing', 'lookahead', 'anneal'}
@@ -305,6 +307,15 @@ class Stage:
             if name not in ACTIONS:
                 raise ValueError(f"stage '{self.name}' {where}: unknown action '{a}' "
                                  f"(known: {ACTIONS})")
+            if name == 'seed_prior_from_anchors' and arg:
+                # 'N' or 'N:flush' -- validate at parse time so a config typo
+                # fails at startup, not mid-transition
+                parts = arg.split(':')
+                if (not parts[0].isdigit()
+                        or len(parts) > 2
+                        or (len(parts) == 2 and parts[1] != 'flush')):
+                    raise ValueError(f"stage '{self.name}' {where}: '{a}' -- expected "
+                                     f"seed_prior_from_anchors:<int> or seed_prior_from_anchors:<int>:flush")
             actions.append((name, arg))
         return actions
 
@@ -652,6 +663,13 @@ class StageProtocol:
             self._snapshot_prior()
         elif name == 'bootstrap_z':
             self._bootstrap_z(eval_metrics, train_conditioner=(arg == 'train_conditioner'))
+        elif name == 'seed_prior_from_anchors':
+            parts = arg.split(':') if arg else []
+            n_per_condition = int(parts[0]) if parts else 1
+            flush = len(parts) > 1 and parts[1] == 'flush'
+            self.m.seed_prior_from_condition_minima(n_per_condition, flush=flush)
+        elif name == 'reseed_prior_from_dataset':
+            self.m.reseed_prior_from_dataset()
 
     def _snapshot(self, tag: str):
         """Pre-transition snapshot: the untouched end-state of the outgoing

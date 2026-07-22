@@ -7,7 +7,7 @@ seed: 0
 template_path: D:\crystal_datasets\conditional\priors\14_1_elj.pt
 
 output_dir: D:\crystal_datasets\conditional\priors
-tag: toy_2cond_conn   # used to build default output filenames
+tag: toy_hard_uncond_multi   # used to build default output filenames
 
 # 'latent_harmonic' or 'latent_multiharmonic' -- see the module docstring in
 # generate_toy_prior.py for why latent_harmonic can only ever be baked one
@@ -16,6 +16,29 @@ tag: toy_2cond_conn   # used to build default output filenames
 # dimensionality as the latent space (they default to 8-dim regardless of
 # data_ndim -- see mxtaltools' _build_latent_field(cond_dim=...))
 energy_function: latent_multiharmonic
+
+# optional -- forwarded verbatim to mxtaltools' _build_latent_field, which
+# builds the Gaussian-mixture field latent_multiharmonic scores against
+# (irrelevant for latent_harmonic). Only consumed the FIRST time the field
+# is built for a run, so keep this fixed for the whole run; leave the block
+# out (or leave a key null/absent) to fall back to mxtaltools' own defaults.
+# See _build_latent_field's docstring in crystal_analysis.py for what each
+# knob does.
+latent_field:
+ cond_dim: 2
+ n_core: 16
+ n_ghost: 16
+ sigma_range: [0.04, 0.12]
+ aniso_scale: 0.3
+ depth_range: [0.0, 4.0]
+ mu_scale: 0.5
+ disp_max: 0.15
+ logsig_scale: 0.5
+ gate_steep: 4.0
+ edge_sigmas: 0.1
+ max_temperature: 3.0
+ max_width: 2.5
+ seed: 0
 
 # the preset library of unique toy conditions -- each becomes one distinct
 # `identifier` in the condition set / prior, and one axis of condition_id
@@ -26,11 +49,11 @@ conditions:
 #    width: 2.0
 
   - identifier: mode_a
-    c: [ 0.5, 0.5] #, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,0.5,0.5,0.5 ]
-    width: 5.0
-  - identifier: mode_b
-    c: [ -0.5, -0.5] #, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5 ]
-    width: 4.0
+    c: [ 0.0, 0.0] #, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,0.5,0.5,0.5 ]
+    width: 1.0
+#  - identifier: mode_b
+#    c: [ -2.0, -2.0] #, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5 ]
+#    width: 1.0
 
 # optional: if enabled, the `conditions` above are treated as ANCHORS and
 # expanded (see expand_condition_manifold in generate_toy_prior.py) into a
@@ -59,7 +82,7 @@ conditions:
 # n_replicas_per_condition when enabling this (e.g. 2-10) or the condition
 # set/prior will get huge.
 condition_manifold:
-  enabled: true
+  enabled: false
   mode: interpolate        # interpolate | gaussian | uniform (see above)
   identifier: manifold_ab  # PREFIX for per-draw ids (manifold_ab_NNNN), not a pooled label
   n_conditions: 10000        # number of distinct manifold draws
@@ -77,7 +100,7 @@ condition_manifold:
 # recomputes energy fresh from whatever latents the GFN produces)
 condition_set:
   generate: true
-  n_replicas_per_condition: 10   # lower this (e.g. 2-10) if condition_manifold.enabled
+  n_replicas_per_condition: 10000   # lower this (e.g. 2-10) if condition_manifold.enabled
   # true (default): each condition's replicas get latents genuinely sampled
   # from that condition's OWN target distribution, plus baked energy -- so
   # the file doubles as an on-mode, per-condition seed set (feed as

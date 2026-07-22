@@ -9,18 +9,18 @@ anomaly_detection: false  # dramatic slowdown when True
 ################################################################
 continue_from_checkpoint: false
 mlip_path: null #'D:\crystal_datasets\esen_s.pt' # C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model
-prior_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt
-molecules_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt
+prior_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt #toy_hard_uncond_multi_prior.pt
+molecules_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt #toy_hard_uncond_multi_conditions.pt
 test_molecules_path: null
 checkpoints_dir: 'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints'
-checkpoint_name: dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-22b5c5_prior.pt #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-88792d_phase1_exit #dev_mk_dev_latent_harmonic-toy_2cond_prior-T1-48d154_prior.pt #dev_mk_dev_latent_multiharmonic-toy_2cond_prior-T1-73224a_prior.pt
-prior_model_name: null #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-88792d_prior.pt #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-88792d_prior.pt #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-88792d_prior.pt #dev_mk_dev_latent_harmonic-toy_2cond_prior-T1-48d154_prior.pt #dev_mk_dev_latent_multiharmonic-toy_2cond_prior-T1-73224a_prior.pt
+checkpoint_name: null # fresh policy so anchor_seed/z_match are actually exercised (a converged running.pt warm start passes every gate within 60 steps) #dev_mk_dev_latent_multiharmonic-toy_2cond_conn_prior-T1-90a45e_running.pt #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-22b5c5_prior.pt #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-88792d_phase1_exit #dev_mk_dev_latent_harmonic-toy_2cond_prior-T1-48d154_prior.pt #dev_mk_dev_latent_multiharmonic-toy_2cond_prior-T1-73224a_prior.pt
+prior_model_name: dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-22b5c5_prior.pt # stale toy_2cond prior would fail the target compat check under a new problem; reuse_prior below auto-refinds per problem slug once phase 1 has run #dev_mk_dev_latent_multiharmonic-toy_2cond_conn_prior-T1-90a45e_prior.pt #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-88792d_prior.pt #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-88792d_prior.pt #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-88792d_prior.pt #dev_mk_dev_latent_harmonic-toy_2cond_prior-T1-48d154_prior.pt #dev_mk_dev_latent_multiharmonic-toy_2cond_prior-T1-73224a_prior.pt
 # prior_model_name loads a SEPARATE frozen GFN used only for prior-buffer sampling. It is rebuilt from its
 # own stored gfn_config, so it may be any architecture/conditioning (only the problem TARGET must match --
 # mol_cond/temp_cond are exempt from the compatibility check) and it never touches the live policy's
 # weights. To ALSO warm-start the policy from it, point checkpoint_name at the same file with
 # load_weights_only: true (requires matching architecture).
-reuse_prior: false  # if true and prior_model_name is null, auto-reload this run's own saved prior checkpoint ({run_name}_{problem_slug}_prior.pt) as the frozen prior model, provided its stored problem_def matches this config exactly (stricter than prior_model_name: no conditioning exemption -- the file was written under this same identity). A fresh run then skips the warm-start stage via skip_if: prior_loaded, exactly as if the path were given; missing/mismatched checkpoint = train phase 1 normally (which re-saves it). Policy weights/optimizers/buffers untouched -- warm-starting stays explicit via checkpoint_name + load_weights_only
+reuse_prior: true  # if true and prior_model_name is null, auto-reload this run's own saved prior checkpoint ({run_name}_{problem_slug}_prior.pt) as the frozen prior model, provided its stored problem_def matches this config exactly (stricter than prior_model_name: no conditioning exemption -- the file was written under this same identity). A fresh run then skips the warm-start stage via skip_if: prior_loaded, exactly as if the path were given; missing/mismatched checkpoint = train phase 1 normally (which re-saves it). Policy weights/optimizers/buffers untouched -- warm-starting stays explicit via checkpoint_name + load_weights_only
 load_weights_only: true  # if true, checkpoint_name loads just the model/EMA weights into an otherwise-fresh run - optimizers, buffers, metrics, and phase/step state all initialize from scratch
 # (no override_loss_coeffs any more: checkpoints carry only the stage name; live
 # coefficients always re-derive from this config's protocol block on resume)
@@ -30,10 +30,10 @@ override_learning_rates: false  # if true, overwrite just the numeric LR restore
 ################################################################
 lr_policy: 1.0e-4              # learning rate of the policy network -- the PEAK (v6 controller: scale ramps to 1.0 == this value and NEVER exceeds it). mipcas A/B: 7.5e-5 flat-stable, ~3e-4 the edge; toys more forgiving
 min_lr: 1.0e-6                # ihn
-lr_flow: 0.1                # learning rate of the flow network -- can be rather large for unconditional problems
+lr_flow: 0.1              # learning rate of the flow network. UNCONDITIONAL mode: flow_model is LearnableScalar (convex 1-D, O(lr) jitter only at this LR). Conditional mode: flow_model is a real Z(c) network trained by Adam -- use 1.0e-4 (match lr_fused/lr_policy; cazwlyy1: log_Z_learned diverged within ~10 steps of live Z(c) training at 0.1). See mode_presets.yaml
 lr_back: 1.0e-4                # learning rate of the backward pass (operating LR, see lr_policy). MLE tolerates a HIGHER LR than TB -- structurally, not by luck: TB is on-policy (a bad step relocates the sample distribution, so the next gradient is computed from worse samples), carries an unbounded -log R in a SQUARED residual, and sums log_pf over T steps. MLE has none of the four; its data is fixed and it never evaluates the energy. So an MLE-measured LR is always an UPPER BOUND on TB's, and phase 1 (not fused -> rides this knob via bwd) can keep 1e-4 while phase 3 (fused -> lr_fused) must not
 lr_replay: 1.0e-4               # learning rate of the trajectory replay pass (operating LR, see lr_policy)
-lr_fused: 1.0e-4                # learning rate of the fused fwd/bwd/replay pass -- the PEAK for phases 2+3.
+lr_fused: 5.0e-5                # learning rate of the fused fwd/bwd/replay pass -- the PEAK for the fused stages. mipcas: 1e-4 fused detonated (tpkdbegv); 5e-5 is the documented ceiling (see tb-surface principle in lr_back's comment). Toys ran 1e-4 fine
 lr_warmup_ratio: 100           # how much smaller the initial (warmup) LR should be than the peak
 # v6 LR controller (controller.py LRController). Radical simplification of v5:
 # the configured LRs are a FIXED PEAK (scale <= 1.0 always -- the v5 probe/
@@ -134,7 +134,7 @@ model:
   # identifies points within the fundamental domain, which we aren't exploring yet.
   # Changes expanded_dim (wrapped dims get a sin/cos encoding), so it is NOT checkpoint
   # compatible with a run trained without it.
-  periodic_centroids: true  # for physical problems on crystals, not toy problems
+  periodic_centroids: true  # for physical problems on crystals, not toy problems (false for toys)
   # diagonal-plus-low-rank (DPLR) forward covariance: C = diag(d) + V V^T, forward SDE only.
   # fixed marginal-variance budget: rho redistributes the existing policy variance
   # between private (d) and correlated (V) parts, it never inflates the marginal.
@@ -405,6 +405,88 @@ protocol:
         - { metric: bwd/tbc, below: 2.0 }
       on_exit: [ 'snapshot:phase1_exit', 'snapshot_prior' ]
 
+    # -- anchor seed: replaces buildout's former bootstrap_z:train_conditioner
+    #    (a one-shot regression of flow_model onto condition_log_z's ema_logw,
+    #    which under a scrambled/unconditional train_prior policy measured
+    #    ~230 nats off the per-condition level in cazwlyy1). on_enter seeds
+    #    prior_buffer deterministically: seed_prior_from_condition_minima
+    #    takes each condition's own lowest-energy anchor_buffer entry
+    #    (AnchorBuffer.best_per_condition_indices, an argmin per condition_id
+    #    -- not a priority-weighted random draw, so coverage doesn't degrade
+    #    as the condition library grows), tiles it (arg = copies per
+    #    condition) and isotropically noises each copy
+    #    (log_noise_latent_parameters, cfg.noise_log_range). Additive --
+    #    prior_buffer's existing seed_source content is untouched. bwd tb
+    #    with freeze_z/freeze_policy both left at 0 trains flow_model,
+    #    conditions_embedding_model, and the policy directly off this
+    #    buffer's TB residual via the normal optimizers (lr_flow for
+    #    flow_model, lr_back-scaled for the rest) -- ordinary Adam steps, not
+    #    a fitted regression.
+    #    LOCALIZED variant (molecule problems): :flush REPLACES the buffer with
+    #    the noised best-anchor copies instead of adding 500 rows to a 150k
+    #    dataset-seeded incumbent, and buffers_active: false freezes it there
+    #    (churn admissions within ramp_floor of best + top-ups from dataset-
+    #    anchors re-broaden at ~2.5k/eval window otherwise; 1wwyjp6x trained
+    #    bwd on the whole 150k buffer -- fwd eval level drifted to -1400 vs
+    #    buffer level +60, no basin coupling). Coverage returns wholesale via
+    #    buildout's reseed_prior_from_dataset. On toys the additive/active
+    #    form is fine (buffer seed is junk, churn transfusion of answer-
+    #    anchors IS the localization engine).
+    - name: anchor_seed
+      train_mode: bwd
+      bwd_sampling_mode: prior
+      flags:
+        update_log_z: true
+        buffers_active: false
+      on_enter: [ 'seed_prior_from_anchors:10000:flush' ]
+      loss_coeffs:
+        bwd: { tb: 1.0, freeze_z: 0.0 }
+      exit:
+        - { metric: bwd/r2_worst, above: 0.95, patience: 2 }
+        - { metric: bwd/scatter_err, below: 50.0, patience: 2 }  # coarse sanity floor only; z_match's exit bar owns final scatter quality (polishing transfers -- same bwd fit). Toy value 30 (ona8i747 exited at 18-19, fxr4h4zy at 7.5); mipcas scale unknown, healthy logw_std ran 8-46, so 50 = loose first-run bar -- tighten from this run's record
+      on_exit: [ 'snapshot:anchor_seed_exit' ]
+
+    # -- z_match: level-matching handoff. bwd maintains the backward TB fit
+    #    against the DETACHED Z(c) (freeze_z stays 1 from base); fwd trains
+    #    Z(c) only (freeze_policy) on on-policy rollouts. gates/delta_worst =
+    #    worst-condition |bwd_level - fwd_level| from ConditionLogZTracker's
+    #    per-mode level streams (delta = -mean bwd residual at Z-stationarity,
+    #    so bwd r2 recovery coincides with the gate closing). replay dark.
+    - name: z_match
+      train_mode: fused
+      bwd_sampling_mode: prior
+      flags:
+        buffers_active: false   # keep the flushed local buffer frozen through the handoff (see anchor_seed)
+      fracs: { fwd: 0.5, bwd: 0.499, replay: 0.001 }
+      min_fracs: { fwd: 0.05, bwd: 0.05, replay: 0.0001 }
+      deactivate_threshold: 0.01
+      loss_coeffs:
+        # beta 2.0 (base 10.0): elj cold-forward log w can sit hundreds of
+        # nats below the buffer level, so the Z-only entry loss at beta 10
+        # can stay above cut_loss_abs (2.5e3) past the 500-step transition
+        # cooldown; beta scales the far-field Huber loss linearly AND caps
+        # the per-sample Z gradient, so this is simultaneously the walkdown
+        # rate limit. Toys ran beta 10 (entry loss 2.4e3 < bar, fxr4h4zy)
+        fwd: { tb: 1.0, freeze_policy: 1.0, beta: 2.0 }   # Z-only Huberized TB
+        bwd: { tb: 1.0 }                       # policy-only vs detached moving Z
+      balance:
+        kind: lexicographic
+        default_boost: { fwd: 0.7, bwd: 0.3 }
+        rules:
+          # backward fit degrading = Z's demand outpacing the policy: shift
+          # weight to policy maintenance until scatter recovers (toy bar: 25)
+          - { metric: bwd/scatter_err, above: 60.0, boost: { bwd: 0.9, fwd: 0.1 } }
+      exit:
+        # delta tolerance 5.0 for the first mipcas run -- the equilibrium gap
+        # is leakage-mass x leak-severity and the elj floor is unmeasured; if
+        # delta plateaus ABOVE this bar, the plateau level is the leakage
+        # floor readout, not a defect. Toy values: 1.5 / patience 3 (fxr4h4zy
+        # exited at 0.14). patience 5 guards against latching on a transient
+        # level crossing mid-walkdown
+        - { metric: gates/delta_worst, below: 5.0, patience: 5 }
+        - { metric: bwd/scatter_err, below: 50.0 }  # toy value 20
+      on_exit: [ 'snapshot:z_matched' ]
+
     # -- forward-first stage A: fwd TB trains policy AND Z on-policy, replay
     #    retains, backward dormant at the floor (admitted only by the boundary
     #    servo). Collapse expected -- calibration over coverage.
@@ -413,6 +495,7 @@ protocol:
       bwd_sampling_mode: prior       # churned prior_buffer, never the atomic dataset
       flags:
         buffers_active: true
+      on_enter: [ 'reseed_prior_from_dataset' ]  # restore broad coverage wholesale post-handoff (fresh records; additive over the local set)
       fracs: { fwd: 0.799, bwd: 0.001, replay: 0.2 }
       # explicit floor/deactivation intent: bwd is TRULY dormant here (floor
       # below the deactivate threshold -> its branch is never computed); fwd
@@ -441,7 +524,7 @@ protocol:
               anneal: { min: fwd/scatter_err } }
       exit:
         # calibration gate: on-policy parity healthy for 2 consecutive ticks
-        - { metric: fwd/r2, above: 0.95, patience: 2 }
+        - { metric: fwd/r2_within, above: 0.95, patience: 2 }
       on_exit: [ 'snapshot:fwd_calibrated' ]
 
     # -- forward-first stage B, TERMINAL: fwd policy frozen (Z-only), backward
@@ -460,20 +543,20 @@ protocol:
       # 0.001 floor and was skipped outright for ~1700 steps while
       # relative_under sat 4x over its bar; if Pf gets bad enough to demand
       # zero backward, the run is better restarted from a healthy snapshot)
-      min_fracs: { fwd: 0.0009, bwd: 0.01, replay: 0.0009}
+      min_fracs: { fwd: 0.0009, bwd: 0.01, replay: 0.0009 }
       deactivate_threshold: 0.001
       loss_coeffs:
         fwd: { tb: 1.0, freeze_policy: 1.0 }   # THE stage flip: forward becomes Z-only
         bwd: { tb: 1.0 }
       balance:
         kind: lexicographic
-        default_boost: {replay: 0.9, fwd: 0.1}   # idle: keep the fit clean + hold Z at its fixed point
+        default_boost: { replay: 0.9, fwd: 0.1 }   # idle: keep the fit clean + hold Z at its fixed point
         rules:
           - { metric: fwd/tb_resid_clipped, abs: true, above: 0.5, boost: fwd }
           # calibration: elevation over own running best (NEVER absolute, never
           # annealed -- the floor legitimately rises with each adopted mode;
           # an absolute bar would pin replay forever after mode 2, b9ze0p5c)
-          - { metric: fwd/r2, below: 0.9, boost: replay }
+          - { metric: fwd/r2_worst, below: 0.9, boost: replay }
           - { metric: bwd/relative_under, above: 8.0, boost: bwd, anneal: { min: 1.0 } }
           # over_coverage: egregious-outliers-only tamp, LAST and UNANNEALED
           # (c8utdn8q). What we care about is overall fwd calibration (the r2
@@ -548,9 +631,9 @@ terminal_box_violation: 1.0    # ~300x above healthy (0.004); "samples a full un
 # spread at scale (r2-pooled-conditional-gate). '{fwd,bwd,replay}/r2_within' (sample-
 # weighted, group-mean-centered) and '.../r2_worst' (per-condition quantile, the
 # stricter "r2 > 0.9 for ALL conditions" reading) are always computed and logged
-# whenever condition_id is present; not yet wired into any gate/rule below -- swap
-# fwd/r2 for one of these in the buildout exit gate and terminal calibration rule
-# once a conditional run is actually configured.
+# whenever condition_id is present. The buildout exit gate uses fwd/r2_within
+# (stable enough to latch patience); the terminal calibration rule uses
+# fwd/r2_worst (smoothed by the balance controller's own EMA).
 r2_worst_quantile: 0.0  # quantile across condition groups for r2_worst; 0.0 = strict min
 
 buffers:
@@ -575,8 +658,8 @@ buffers:
     # ramp_floor also doubles as manage_prior_buffer's admission/reach-trigger margin above each
     # condition's best known energy -- equivalence with the reward-space ramp holds only while
     # energy_config.temperature==1.0; will need separating if temperature varies.
-    ramp_floor: 100
-    ramp_width: 50
+    ramp_floor: 50
+    ramp_width: 40
 
   # trajectory replay buffer - stores full forward trajectories of overweighted on-policy
   # samples (residual > buffer_resid_cutoff) so they can later be exactly replayed
@@ -591,7 +674,7 @@ buffers:
   # up prior_buffer via isotropic noising + rescoring whenever a prior-sampling churn
   # cycle comes up short of admissible samples on its own
   anchor_buffer:
-    seed_source: 'prior_dataset' #D:\crystal_datasets\conditional\priors\toy_2harm_conditions.pt #'prior_dataset'   # 'generated' (default, unchanged: lazy-bootstrap from the first fwd-eval-sampled batch), 'prior_dataset' (seed from the real high-quality dataset already loaded for backward training), or a path to torch.load a curated set of good seeds from
+    seed_source: 'prior_dataset' #D:\crystal_datasets\conditional\priors\toy_hard_uncond_multi_conditions.pt   # domain rule (mode_presets.yaml): molecule problems seed from prior_dataset (high-quality, not target); toys seed from the CONDITIONS .pt (target samples, obviates search). 'generated' = lazy-bootstrap from the first fwd-eval batch
     max_size: 200000
     dup_cutoff: 0.05          # latent L2 distance below which two CONFIRMED-SURPRISING candidates are treated as literal duplicates; restricted to same-condition_id pairs. Not a novelty gate (surprise is) -- only ever runs on the rare confirmed set, so kept tight (see AnchorBuffer.admit)
     screen_energy_window: 20  # cheap one-rollout screen's energy pre-filter: candidate's energy must be within this many ENERGY units of that condition's Emin(c) (condition_log_z.best_energy) before spending a backward rollout on it
@@ -619,18 +702,18 @@ buffers:
 
 # energy function settings
 ################################################################
-energy_function: 'elj'
+energy_function: 'elj' #'latent_multiharmonic'
 temperature_conditioning: false  # if false, temperatures are set to temperature, and there is no annealing
 molecule_conditioning: false  # conditions the generative prediction on the molecule
 sg_conditioning: False  # whether to conditionally sample across space groups
-space_groups: [ 2 ]  # which space groups to sample over
+space_groups: [ 2 ]  # which space groups to sample over ([1] for toys)
 zp_conditioning: false # whether to condition over z prime values
 z_primes: [ 1 ]
 vector_conditioning: false  # per-sample condition vectors (molecules_path/prior_path entries' `c` attribute) embedded through a plain MLP (conditions_type stays 'vector') rather than molecule_conditioning's GNN -- for toy energy functions, where `c` isn't tied to any real molecular graph
-vector_conditioning_dim: 3  # dimensionality of the `c` vectors -- must match whatever data_processing/generate_toy_prior.py's config built molecules_path/prior_path with (data_ndim for latent_harmonic, cond_dim for latent_multiharmonic)
+vector_conditioning_dim: 3  # (2 for the toy problems; inert while vector_conditioning is false) dimensionality of the `c` vectors -- must match whatever data_processing/generate_toy_prior.py's config built molecules_path/prior_path with (data_ndim for latent_harmonic, cond_dim for latent_multiharmonic)
 energy_config:
   internal_oom_recovery: true  # if false, skip the energy function's own adaptive sub-batching/OOM catch-and-shrink loop and analyze the whole batch in one call, so an OOM propagates up to train.py's global batch size reduction instead. Recommended false in fused mode, where the internal recovery destabilizes memory management.
-  temperature: 2.5 # 2.5 is room temperature kT in kJ/mol
+  temperature: 2.5 # 2.5 is room temperature kT in kJ/mol (1.0 for toys)
   log_temperature_range: [ 0, 0.693147 ]
   # loss coefficients
   density_coeff: 10.0  # how much to weight the density penalty term in the energy function
@@ -643,7 +726,25 @@ energy_config:
   reduction_coeff: 1.0
   lj_coeff: 1.0  # loss coefficient
   reward_range: 500 # max ptp of reward values allowed, null to go unrestricted
-  analyze_kwargs: {}#{ width: 2.0, c: [ 0, 0] } #{width: 0.15}  # extra kwargs passed through to crystal_batch.analyze(), e.g. noise: 0.01, rdf_mode: 'envwise', cutoff: 6
+  analyze_kwargs: { }  # elj: none. toy_hard_uncond_multi block preserved below:
+  #analyze_kwargs: { cond_dim: 2,
+  #                  n_core: 1,
+  #                  n_ghost: 0,
+  #                  sigma_range: [ 0.04, 0.12 ],
+  #                  aniso_scale: 0.0,
+  #                  depth_range: [ 0.0, 4.0 ],
+  #                  mu_scale: 0.5,
+  #                  disp_max: 0.15,
+  #                  logsig_scale: 0.5,
+  #                  gate_steep: 4.0,
+  #                  edge_sigmas: 0.1,
+  #                  max_temperature: 3.0,
+  #                  max_width: 2.5,
+  #                  seed: 0,
+  #                  width: 1.0,
+  #                  c: [ 0.0, 0.0 ]
+  #}
+  #{ width: 2.0, c: [ 0, 0] } #{width: 0.15}  # extra kwargs passed through to crystal_batch.analyze(), e.g. noise: 0.01, rdf_mode: 'envwise', cutoff: 6
 #                   c: [.5,.5,.5,.5,.5,.5,.5,.5,.5,.5,.5,.5]
 #  {width: 0.075,
 #                   c:[0,0,0,0,0,0,0,0],

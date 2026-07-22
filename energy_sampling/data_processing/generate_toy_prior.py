@@ -65,6 +65,20 @@ _build_latent_field's Gaussian-mixture field and default to 8-dim
 vectors' length to whatever cond_dim you're using (8, if left at the
 default).
 
+Optional top-level `latent_field` config block forwards its keys straight
+through to mxtaltools' _build_latent_field (cond_dim, n_core, n_ghost,
+sigma_range, aniso_scale, depth_range, mu_scale, disp_max, logsig_scale,
+gate_steep, edge_sigmas, max_temperature, max_width, seed) -- see that
+function's docstring in crystal_analysis.py for what each knob does. Only
+relevant for latent_multiharmonic (latent_harmonic doesn't use the GMM
+field at all). Every latent_multiharmonic-touching call in this script
+(sampling, density, analyze()) forwards these same kwargs, and
+mxtaltools only actually consumes them the FIRST time the field is built
+on a given batch object (_ensure_latent_field is a no-op once `_field` is
+cached) -- so as long as `latent_field` stays fixed for a whole run, every
+call sees the same field regardless of which one happened to trigger the
+build. Leave the block out (or empty) to use mxtaltools' own defaults.
+
 Optional condition_manifold (see expand_condition_manifold): instead of N
 discrete named conditions, expands the `conditions` list (treated as
 anchors) into a much larger set of draws spanning the connected region
@@ -136,33 +150,76 @@ def replicate(base_batch, n):
     return rep
 
 
-def sample_condition_latents(base_batch, energy_function, c, width, n, target_temperature):
+def latent_field_kwargs(cfg):
+    """Extract the optional `latent_field` config block as a plain kwargs
+    dict for mxtaltools' _build_latent_field, forwarded through every
+    latent_multiharmonic call site below. Empty if the block isn't
+    configured (mxtaltools' own defaults apply)."""
+    block = getattr(cfg, 'latent_field', None)
+    if block is None:
+        return {}
+    return {k: v for k, v in vars(block).items() if v is not None}
+
+
+def sample_condition_latents(base_batch, energy_function, c, width, n, target_temperature,
+                             field_kwargs=None):
     c_t = torch.as_tensor(c, dtype=torch.float32)
     if energy_function == 'latent_harmonic':
         x = base_batch.sample_latent_harmonic(
             n_samples=n, c=c_t[None], width=width, target_temperature=target_temperature)
     elif energy_function == 'latent_multiharmonic':
         x = base_batch.sample_latent_multiharmonic(
-            n_samples=n, c=c_t, width=width, target_temperature=target_temperature)
+            n_samples=n, c=c_t, width=width, target_temperature=target_temperature,
+            **(field_kwargs or {}))
     else:
         raise ValueError(f"'{energy_function}' is not a toy energy function")
     eps = 1e-3
     return x.clamp(min=-1 + eps, max=1 - eps)
 
 
-def condition_log_density(base_batch, energy_function, c, width, x, target_temperature):
+def condition_log_partition(base_batch, energy_function, c, width, target_temperature, d, field_kwargs=None):
+    """log-normalizer log Z of the target distribution defined by (c, width, T)
+    -- the x-independent term factored out of condition_log_density, reused
+    directly by print_partition_functions."""
+    c_t = torch.as_tensor(c, dtype=torch.float32)
+    if energy_function == 'latent_harmonic':
+        return 0.5 * d * math.log(2 * math.pi * target_temperature) + d * math.log(width)
+    else:
+        return base_batch.log_partition_latent(c=c_t, target_temperature=target_temperature, width=width,
+                                                **(field_kwargs or {}))
+
+
+def condition_log_density(base_batch, energy_function, c, width, x, target_temperature,
+                          field_kwargs=None):
     """Normalized log-density of the target/prior distribution defined by
     (c, width) at points x -- both toy energy functions have a closed-form
     normalizer, so no self-normalization/MC estimate is needed here."""
     c_t = torch.as_tensor(c, dtype=torch.float32)
     if energy_function == 'latent_harmonic':
         energy = base_batch.latent_harmonic_en(c=c_t[None], width=width, x=x)
-        d = x.shape[-1]
-        log_z = 0.5 * d * math.log(2 * math.pi * target_temperature) + d * math.log(width)
     else:
-        energy = base_batch.latent_multiharmonic_en(c=c_t, width=width, x=x)
-        log_z = base_batch.log_partition_latent(c=c_t, target_temperature=target_temperature, width=width)
+        energy = base_batch.latent_multiharmonic_en(c=c_t, width=width, x=x, **(field_kwargs or {}))
+    log_z = condition_log_partition(base_batch, energy_function, c, width, target_temperature, x.shape[-1],
+                                    field_kwargs=field_kwargs)
     return -energy / target_temperature - log_z
+
+
+def print_partition_functions(cfg, template, conditions, field_kwargs=None):
+    """Prints each condition's target-distribution partition function
+    (log Z and Z, evaluated at that condition's own (c, width) under
+    prior.target_temperature) -- callers pass the originally configured
+    `conditions` list, not any condition_manifold-expanded draws."""
+    d = template.latent_params().shape[-1]
+    T = cfg.prior.target_temperature
+    print(f"Partition functions per condition (target_temperature={T}):")
+    for cond in conditions:
+        log_z = float(condition_log_partition(template, cfg.energy_function, cond.c, float(cond.width), T, d,
+                                              field_kwargs=field_kwargs))
+        try:
+            z = f'{math.exp(log_z):.6g}'
+        except OverflowError:
+            z = 'inf' if log_z > 0 else '0'
+        print(f"  [{cond.identifier}] log Z = {log_z:.6g}   Z = {z}")
 
 
 def shared_prior_center_width(cfg, d):
@@ -171,7 +228,7 @@ def shared_prior_center_width(cfg, d):
     return center, float(cfg.prior.shared_width)
 
 
-def draw_prior_samples(cfg, template, cond, n):
+def draw_prior_samples(cfg, template, cond, n, field_kwargs=None):
     """Mode-dispatching prior draw -- see build_prior's docstrings for what
     each mode means. Shared/dispatched with coverage_check so its ESS check
     always matches whatever prior.mode actually produced the saved file."""
@@ -184,10 +241,11 @@ def draw_prior_samples(cfg, template, cond, n):
     else:
         prior_width = float(cond.width) * cfg.prior.width_multiplier
         return sample_condition_latents(
-            template, cfg.energy_function, cond.c, prior_width, n, cfg.prior.target_temperature)
+            template, cfg.energy_function, cond.c, prior_width, n, cfg.prior.target_temperature,
+            field_kwargs=field_kwargs)
 
 
-def prior_log_density(cfg, template, cond, x):
+def prior_log_density(cfg, template, cond, x, field_kwargs=None):
     """Mode-dispatching prior log-density at points x, paired with
     draw_prior_samples -- see its docstring."""
     mode = getattr(cfg.prior, 'mode', 'shared')
@@ -200,7 +258,8 @@ def prior_log_density(cfg, template, cond, x):
     else:
         prior_width = float(cond.width) * cfg.prior.width_multiplier
         return condition_log_density(
-            template, cfg.energy_function, cond.c, prior_width, x, cfg.prior.target_temperature)
+            template, cfg.energy_function, cond.c, prior_width, x, cfg.prior.target_temperature,
+            field_kwargs=field_kwargs)
 
 
 def expand_condition_manifold(cfg, anchors):
@@ -297,7 +356,7 @@ def append_all(parts):
     return batch
 
 
-def build_condition_set(cfg, template):
+def build_condition_set(cfg, template, field_kwargs=None):
     """
     See the module docstring: with condition_set.sample_latents (default
     true) each condition's replicas carry latents drawn from that condition's
@@ -346,10 +405,11 @@ def build_condition_set(cfg, template):
         if sample_latents:
             x_all = torch.cat([
                 sample_condition_latents(template, cfg.energy_function, cond.c, float(cond.width),
-                                         n_rep, cfg.prior.target_temperature)
+                                         n_rep, cfg.prior.target_temperature, field_kwargs=field_kwargs)
                 for cond in cfg.conditions])
             batch.latent_to_cell_params(x_all)
-            batch.analyze([cfg.energy_function], c=batch.c, width=batch.width, assign_outputs=True)
+            batch.analyze([cfg.energy_function], c=batch.c, width=batch.width, assign_outputs=True,
+                          **(field_kwargs or {}))
         return batch
 
     # latent_harmonic: c[0]-only energy forces a per-condition analyze()
@@ -401,17 +461,17 @@ def prior_samples_per_condition(cfg, total_key, legacy_per_condition_key):
     return int(legacy)
 
 
-def build_prior(cfg, template, n_per_condition):
+def build_prior(cfg, template, n_per_condition, field_kwargs=None):
     mode = getattr(cfg.prior, 'mode', 'shared')
     if mode == 'shared':
-        return _build_prior_shared(cfg, template, n_per_condition)
+        return _build_prior_shared(cfg, template, n_per_condition, field_kwargs=field_kwargs)
     elif mode == 'per_condition':
-        return _build_prior_per_condition(cfg, template, n_per_condition)
+        return _build_prior_per_condition(cfg, template, n_per_condition, field_kwargs=field_kwargs)
     else:
         raise ValueError(f"prior.mode must be 'shared' or 'per_condition', got {mode!r}")
 
 
-def _build_prior_shared(cfg, template, n_per_condition):
+def _build_prior_shared(cfg, template, n_per_condition, field_kwargs=None):
     """
     ONE zero-centered (prior.shared_center) Gaussian, wide enough
     (prior.shared_width) to cover every configured condition, with no
@@ -465,7 +525,8 @@ def _build_prior_shared(cfg, template, n_per_condition):
         # bake energy under each condition's own (narrow) width -- not the
         # shared prior's width -- prebuilt_sample_to_reward needs the real
         # target energy
-        sub.analyze([cfg.energy_function], c=sub.c, width=sub.width, assign_outputs=True)
+        sub.analyze([cfg.energy_function], c=sub.c, width=sub.width, assign_outputs=True,
+                    **(field_kwargs or {}))
         return sub
 
     parts = []
@@ -483,7 +544,7 @@ def _build_prior_shared(cfg, template, n_per_condition):
     return append_all(parts)
 
 
-def _build_prior_per_condition(cfg, template, n_per_condition):
+def _build_prior_per_condition(cfg, template, n_per_condition, field_kwargs=None):
     """
     For later: each condition gets its own Gaussian CENTERED on that
     condition's own `c` but scaled up by prior.width_multiplier, so
@@ -495,7 +556,8 @@ def _build_prior_per_condition(cfg, template, n_per_condition):
         n = sub.num_graphs  # see build_condition_set's comment on why this, not n_per_condition
         prior_width = float(cond.width) * cfg.prior.width_multiplier
         x = sample_condition_latents(
-            template, cfg.energy_function, cond.c, prior_width, n, cfg.prior.target_temperature)
+            template, cfg.energy_function, cond.c, prior_width, n, cfg.prior.target_temperature,
+            field_kwargs=field_kwargs)
 
         sub.add_graph_attr(torch.as_tensor(cond.c, dtype=torch.float32)[None].repeat(n, 1), 'c')
         sub.add_graph_attr(torch.full((n,), float(cond.width)), 'width')
@@ -504,12 +566,13 @@ def _build_prior_per_condition(cfg, template, n_per_condition):
         # bake energy under the condition's own (narrow) width, not the
         # broadened prior_width used only to position these samples --
         # prebuilt_sample_to_reward needs the real target energy
-        sub.analyze([cfg.energy_function], c=sub.c, width=float(cond.width), assign_outputs=True)
+        sub.analyze([cfg.energy_function], c=sub.c, width=float(cond.width), assign_outputs=True,
+                    **(field_kwargs or {}))
         parts.append(sub)
     return append_all(parts)
 
 
-def coverage_check(cfg, template):
+def coverage_check(cfg, template, field_kwargs=None):
     """
     Direct, quantitative form of "q_target << q_prior": for each condition,
     draws prior samples (mode-dispatched -- see draw_prior_samples/build_prior
@@ -561,15 +624,17 @@ def coverage_check(cfg, template):
     neg_log_target_prior, neg_log_target_target = [], []
 
     for cond in conditions:
-        x = draw_prior_samples(cfg, template, cond, n_per)
-        log_prior = prior_log_density(cfg, template, cond, x)
-        log_target = condition_log_density(template, cfg.energy_function, cond.c, float(cond.width), x, T)
+        x = draw_prior_samples(cfg, template, cond, n_per, field_kwargs=field_kwargs)
+        log_prior = prior_log_density(cfg, template, cond, x, field_kwargs=field_kwargs)
+        log_target = condition_log_density(template, cfg.energy_function, cond.c, float(cond.width), x, T,
+                                           field_kwargs=field_kwargs)
         all_prior_x.append(x)
         neg_log_target_prior.append(-log_target)
 
-        target_x = sample_condition_latents(template, cfg.energy_function, cond.c, float(cond.width), n_per, T)
+        target_x = sample_condition_latents(template, cfg.energy_function, cond.c, float(cond.width), n_per, T,
+                                            field_kwargs=field_kwargs)
         log_target_at_target = condition_log_density(template, cfg.energy_function, cond.c, float(cond.width),
-                                                      target_x, T)
+                                                      target_x, T, field_kwargs=field_kwargs)
         all_target_x.append(target_x)
         neg_log_target_target.append(-log_target_at_target)
 
@@ -610,12 +675,16 @@ def coverage_check(cfg, template):
         title="Prior-drawn vs. target-drawn samples, scored by -log(target density)",
         xaxis_title='-log q_target(x)', yaxis_title='density')
 
+    '''
+    
     clats = torch.cat(all_target_x)
     cbatch = template.subsample_new_batch(torch.tensor([0 for _ in range(len(clats))]))
     cbatch.reset_sg_info(1)
     cbatch.latent_to_cell_params(clats)
     cbatch.plot_batch_cell_params(space='latent', ref_dist=all_prior_x[0])
     cbatch.plot_batch_staircase(space='latent')
+    
+    '''
 
     if cfg.coverage_check.show_figures:
         fig.show()
@@ -636,6 +705,8 @@ def main(config_path):
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
+    anchors = list(cfg.conditions)  # preserved for print_partition_functions below, pre-manifold-expansion
+
     # optional: replace the discrete anchor conditions above with a much
     # larger set of draws spanning the connected region between them -- must
     # run before build_condition_set/build_prior/coverage_check below, which
@@ -648,9 +719,12 @@ def main(config_path):
     os.makedirs(cfg.output_dir, exist_ok=True)
 
     template = load_template(cfg.template_path)
+    field_kwargs = latent_field_kwargs(cfg)
+
+    print_partition_functions(cfg, template, anchors, field_kwargs=field_kwargs)
 
     if getattr(cfg.condition_set, 'generate', True):
-        cond_batch = build_condition_set(cfg, template)
+        cond_batch = build_condition_set(cfg, template, field_kwargs=field_kwargs)
         out_name = getattr(cfg.condition_set, 'output_name', None) or f'{cfg.tag}_conditions.pt'
         out_path = os.path.join(cfg.output_dir, out_name)
         del cond_batch.fingerprint
@@ -662,10 +736,12 @@ def main(config_path):
 
     if getattr(cfg.prior, 'generate', True):
         prior_batch = build_prior(
-            cfg, template, prior_samples_per_condition(cfg, 'n_samples_total', 'n_samples_per_condition'))
+            cfg, template, prior_samples_per_condition(cfg, 'n_samples_total', 'n_samples_per_condition'),
+            field_kwargs=field_kwargs)
         eq_batch = build_prior(
             cfg, template,
-            prior_samples_per_condition(cfg, 'equalized_n_samples_total', 'equalized_n_samples_per_condition'))
+            prior_samples_per_condition(cfg, 'equalized_n_samples_total', 'equalized_n_samples_per_condition'),
+            field_kwargs=field_kwargs)
         out_name = getattr(cfg.prior, 'output_name', None) or f'{cfg.tag}_prior.pt'
         out_path = os.path.join(cfg.output_dir, out_name)
         del prior_batch.fingerprint, eq_batch.fingerprint
@@ -673,7 +749,7 @@ def main(config_path):
         print(f"Saved prior -> {out_path} ({prior_batch.num_graphs} / {eq_batch.num_graphs} graphs)")
 
     if getattr(cfg.coverage_check, 'run', True):
-        coverage_check(cfg, template)
+        coverage_check(cfg, template, field_kwargs=field_kwargs)
 
 
 if __name__ == '__main__':

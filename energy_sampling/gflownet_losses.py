@@ -25,7 +25,8 @@ def diagonal_gaussian_log_density(x, mu, sigma):
 
 
 def update_and_lookup_condition_log_z(condition_log_z, condition_id, log_r, log_pb, log_pf, device,
-                                      step: int, log_Z_learned=None, do_update: bool = True):
+                                      step: int, log_Z_learned=None, do_update: bool = True,
+                                      mode_level_stream: Optional[str] = None):
     """
     Shared by get_gfn_forward_loss/get_gfn_backward_loss: whenever a
     ConditionLogZTracker is supplied, optionally feed it this step's
@@ -49,11 +50,19 @@ def update_and_lookup_condition_log_z(condition_log_z, condition_id, log_r, log_
     monitor is deliberately on-policy only: the Z model is trained and judged
     on forward rollouts, bwd/replay are off-policy and it's the policy
     model's job (mode retention/coverage) to fix those, not the Z model's.
+    mode_level_stream ('fwd'/'bwd'/None) additionally feeds this batch's logw
+    into the tracker's matching per-mode level EMA (the z_match delta gate's
+    two sides) -- NOT gated by do_update, deliberately: do_update guards
+    ema_logw (a gradient-feeding blend of whatever touches it), while the
+    level streams are pure measurements of the CURRENT policy's mean log w on
+    that stream, which is exactly what delta(c) = J_B(c) - J_F(c) compares.
     """
     if condition_log_z is None or condition_id is None:
         return None, None
 
     logw = (log_r + log_pb - log_pf).detach()
+    if mode_level_stream is not None:
+        condition_log_z.update_mode_level(mode_level_stream, condition_id, logw, step=step)
     if do_update:
         condition_log_z.update(condition_id, logw, step=step)
         if log_Z_learned is not None:
@@ -195,9 +204,12 @@ def get_gfn_forward_loss(loss_coeffs,
 
     beta = loss_coeffs.beta
 
+    # mode_level_stream='fwd': forward-loss trajectories are always fresh
+    # on-policy rollouts (no replay path through here), so this is the J_F
+    # side of the z_match delta gate
     log_z_target, log_z_target_mask = update_and_lookup_condition_log_z(
         condition_log_z, condition_id, log_r, log_pb, log_pf, gfn.device, step=step,
-        log_Z_learned=log_Z_learned)
+        log_Z_learned=log_Z_learned, mode_level_stream='fwd')
     update_condition_best_energy(condition_log_z, condition_id, log_r, log_T_tensor)
 
     losses = []
@@ -343,6 +355,7 @@ def get_gfn_backward_loss(loss_coeffs,
                           update_log_z: bool = True,
                           step: int = 0,
                           scramble_condition_tiles: int = 0,
+                          mode_level_stream: Optional[str] = None,
                           ):
     """
     freeze_policy/freeze_z (read from loss_coeffs): see get_gfn_forward_loss's
@@ -394,7 +407,7 @@ def get_gfn_backward_loss(loss_coeffs,
     # the Z model's, which is trained and judged on forward rollouts only.
     log_z_target, log_z_target_mask = update_and_lookup_condition_log_z(
         condition_log_z, condition_id, log_r, log_pb, log_pf, gfn.device, step=step,
-        do_update=update_log_z)
+        do_update=update_log_z, mode_level_stream=mode_level_stream)
 
     losses = []
     """VarGrad losses"""

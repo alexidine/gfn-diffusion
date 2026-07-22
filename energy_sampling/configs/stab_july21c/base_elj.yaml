@@ -284,24 +284,64 @@ protocol:
         - { metric: bwd/tbc, below: 2.0 }
       on_exit: [ 'snapshot:phase1_exit', 'snapshot_prior' ]
 
-    # -- policy warm start for runs that loaded a shared prior and skipped
-    #    train_prior: same MLE+TBC loss on the dataset, but exits on the
-    #    matched-eval wass bar (fast) instead of the mle_flat slope gate
-    #    (slow), and never runs snapshot_prior -- the loaded prior model is
-    #    kept as-is. When no prior was found and train_prior ran, this stage
-    #    exits at its first eval (wass/tbc are already under these bars).
-    - name: warmstart
+    # -- anchor seed, LOCALIZED molecule variant (replaces the old MLE
+    #    'warmstart' stage; anchor_seed -> z_match is the validated handoff,
+    #    mk_dev 2026-07-21). :flush REPLACES the dataset-seeded buffer with
+    #    the noised best-anchor copies, and buffers_active: false freezes it
+    #    (churn admissions within ramp_floor of best + top-ups from
+    #    dataset-anchors re-broaden otherwise; 1wwyjp6x trained bwd on the
+    #    whole 150k buffer -- capacity plateau r2 0.57, fwd eval level
+    #    drifted to -1400 vs buffer +60, no basin coupling). Coverage
+    #    returns wholesale via buildout's reseed_prior_from_dataset.
+    #    REQUIRES the 2026-07-21 evening code (flush/reseed actions,
+    #    ConditionLogZTracker level streams, gates/delta_worst).
+    - name: anchor_seed
       train_mode: bwd
-      bwd_sampling_mode: dataset
+      bwd_sampling_mode: prior
       flags:
         update_log_z: true
-        scramble_conditions: true
+        buffers_active: false
+      on_enter: [ 'seed_prior_from_anchors:10000:flush' ]
       loss_coeffs:
-        bwd: { mle: 1.0, tbc: 1.0, repeats: 2.0 }
+        bwd: { tb: 1.0, freeze_z: 0.0 }
       exit:
-        - { metric: eval/wass_debiased, below: 0.03 }
-        - { metric: bwd/tbc, below: 2.0 }
-      on_exit: [ 'snapshot:warmstart_exit' ]
+        - { metric: bwd/r2_worst, above: 0.95, patience: 2 }
+        - { metric: bwd/scatter_err, below: 50.0, patience: 2 }  # loose first-battery bar (wdsb4ylp's noise ball earned ~2-3 within 300 steps; tighten from this battery's record)
+      on_exit: [ 'snapshot:anchor_seed_exit' ]
+
+    # -- z_match: level-matching handoff on the FROZEN local buffer. bwd
+    #    maintains the fit against DETACHED Z; fwd trains Z only
+    #    (freeze_policy) on on-policy rollouts. gates/delta_worst =
+    #    |bwd_level - fwd_level| from the tracker's per-mode level streams
+    #    (zmatch/fwd_level + zmatch/bwd_level panels). fwd beta 2.0: elj
+    #    cold-forward log w can sit hundreds of nats low, so the Z-only
+    #    entry loss at base beta 10 can outlast the 500-step transition
+    #    cooldown against cut_loss_abs; beta scales the far-field loss
+    #    linearly AND caps the per-sample Z gradient (walkdown rate limit).
+    #    delta bar 5.0: the equilibrium gap is leakage-mass x severity and
+    #    the elj floor is unmeasured -- a plateau ABOVE the bar is the
+    #    leakage-floor readout, not a defect.
+    - name: z_match
+      train_mode: fused
+      bwd_sampling_mode: prior
+      flags:
+        buffers_active: false
+      fracs: { fwd: 0.5, bwd: 0.499, replay: 0.001 }
+      min_fracs: { fwd: 0.05, bwd: 0.05, replay: 0.0001 }
+      deactivate_threshold: 0.01
+      loss_coeffs:
+        fwd: { tb: 1.0, freeze_policy: 1.0, beta: 2.0 }
+        bwd: { tb: 1.0 }                       # policy-only vs detached moving Z
+      balance:
+        kind: lexicographic
+        default_boost: { fwd: 0.7, bwd: 0.3 }
+        rules:
+          # backward fit degrading = Z's demand outpacing the policy
+          - { metric: bwd/scatter_err, above: 60.0, boost: { bwd: 0.9, fwd: 0.1 } }
+      exit:
+        - { metric: gates/delta_worst, below: 5.0, patience: 5 }
+        - { metric: bwd/scatter_err, below: 50.0 }
+      on_exit: [ 'snapshot:z_matched' ]
 
     # -- forward-first stage A: fwd TB trains policy AND Z on-policy, replay
     #    retains, backward dormant at the floor (admitted only by the boundary
@@ -311,6 +351,7 @@ protocol:
       bwd_sampling_mode: prior       # churned prior_buffer, never the atomic dataset
       flags:
         buffers_active: true
+      on_enter: [ 'reseed_prior_from_dataset' ]  # restore broad coverage wholesale post-handoff (fresh records; additive over the local set)
       fracs: { fwd: 0.799, bwd: 0.001, replay: 0.2 }
       min_fracs: { fwd: 0.02, bwd: 0.001, replay: 0.02 }
       deactivate_threshold: 0.01
