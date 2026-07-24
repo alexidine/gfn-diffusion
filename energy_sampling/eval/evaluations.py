@@ -1,5 +1,7 @@
 import math
 import os
+import traceback
+from contextlib import contextmanager
 from typing import Optional
 
 import numpy as np
@@ -25,11 +27,67 @@ from mxtaltools.reporting.figures import log_crystal_samples
 from mxtaltools.reporting.utils import lightweight_one_sided_violin
 
 
+@contextmanager
+def fig_guard(label):
+    """Figure faults must never interrupt a live run: print and continue."""
+    try:
+        yield
+    except Exception:
+        print(f"Figure block '{label}' failed (run continues):")
+        traceback.print_exc()
+
+
+# --- figure upload budget -------------------------------------------------
+# wandb bills for stored media, so figures are logged as compactly as they can
+# be while staying readable. Three levers, in order of preference:
+#   1. never ship raw per-sample arrays where a binned summary reads the same
+#      (see _hist_bar) -- 10k samples -> 100 bars;
+#   2. thin overplotted scatters to SCATTER_MAX_POINTS (summary stats are
+#      always computed on the FULL sample first, so numbers don't move);
+#   3. rasterize anything still over FIG_SIZE_LIMIT_MB, except the figures
+#      named in KEEP_INTERACTIVE, which stay real plotly objects.
+SCATTER_MAX_POINTS = 4000
+FIG_SIZE_LIMIT_MB = 0.25
+KEEP_INTERACTIVE = ('TB Parity Plot', 'Lattice Latents Distribution')
+
+
+def _np(x, dtype=np.float32):
+    """Detached numpy view at plotting precision (plotly base64-encodes f4 at
+    half the bytes of f8, and no figure here resolves past float32)."""
+    if torch.is_tensor(x):
+        x = x.detach().cpu()
+    return np.asarray(x, dtype=dtype)
+
+
+def _thin_idx(n, cap=SCATTER_MAX_POINTS, seed=0):
+    """Sorted index set thinning n points to `cap`, or None if no thinning is
+    needed. Shared across a figure's x/y/color arrays so they stay aligned."""
+    if cap is None or n <= cap:
+        return None
+    idx = np.random.default_rng(seed).choice(n, cap, replace=False)
+    idx.sort()
+    return idx
+
+
+def _hist_bar(values, nbins=100, **bar_kwargs):
+    """Pre-binned stand-in for go.Histogram, which ships the raw sample array
+    and bins it client-side (10k floats ~ 52 kB per panel)."""
+    values = _np(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return go.Bar(x=[], y=[], **bar_kwargs)
+    counts, edges = np.histogram(values, bins=nbins)
+    centers = np.round(0.5 * (edges[1:] + edges[:-1]), 4)
+    return go.Bar(x=centers, y=counts, width=float(edges[1] - edges[0]), **bar_kwargs)
+
+
 def adjust_fig_filesize(fig_dict):
     for key in fig_dict.keys():
         fig = fig_dict[key]
+        if any(keep in key for keep in KEEP_INTERACTIVE):
+            continue
         try:
-            if get_plotly_fig_size_mb(fig) > 1:  # bigger than 1 MB
+            if get_plotly_fig_size_mb(fig) > FIG_SIZE_LIMIT_MB:
                 fig.write_image(key + 'fig.png', width=720,
                                 height=512)  # save the image rather than the fig, for size reasons
                 fig_dict[key] = wandb.Image(key + 'fig.png')
@@ -41,8 +99,28 @@ def add_color_switcher(fig, color_fields, *, colorscales=None, clip=(1, 99), tra
     # trace_index = index of the scatter you want to recolor
     # (0 = identity line, 1 = fit line, 2 = scatter)
 
+    # restyle args live in an untyped layout dict, so plotly can't base64 these
+    # the way it does trace arrays -- they serialize as literal JSON lists.
+    # Rounding to 3 dp roughly halves the character count per element and is
+    # invisible on a colorbar (4 color fields x 10k samples was ~600 kB/fig).
+    color_fields = {k: np.round(_np(v, dtype=np.float64), 3) for k, v in color_fields.items()}
     cmins = {k: np.percentile(v, clip[0]) for k, v in color_fields.items()}
     cmaxs = {k: np.percentile(v, clip[1]) for k, v in color_fields.items()}
+
+    if len(color_fields) == 1:
+        # nothing to switch between: colour the trace directly, which both
+        # renders coloured on open (a button has to be clicked first) and stays
+        # a base64 trace array instead of a JSON list
+        name, z = next(iter(color_fields.items()))
+        fig.data[trace_index].marker.update(
+            color=_np(z), cmin=cmins[name], cmax=cmaxs[name],
+            colorscale=(colorscales or {}).get(name, "Viridis"),
+            colorbar=dict(title=name))
+        # legend moves inside the axes so it doesn't sit under the colorbar
+        fig.update_layout(margin=dict(r=90),
+                          legend=dict(x=0.01, y=0.99, xanchor='left', yanchor='top',
+                                      bgcolor='rgba(255,255,255,0.6)'))
+        return fig
 
     buttons = []
     for name, z in color_fields.items():
@@ -131,9 +209,9 @@ def conditional_eval_step(energy_function,
 
 
 def _tb_direction_figs(fig_dict, prefix, log_r, log_pfs, log_pbs, log_flow,
-                       flow_states, packing_coeff, cond_inds=None):
+                       flow_states, cond_inds=None):
     fig_dict[f'{prefix} TB Parity Plot'], _ = flow_parity_plot(
-        log_r, log_flow, log_pbs, log_pfs, packing_coeff, cond_inds=cond_inds)
+        log_r, log_flow, log_pbs, log_pfs, cond_inds=cond_inds)
     # _, fig_dict[f'{prefix} Pf Parity R Value'] = pf_parity_plot(
     #     log_pfs, log_pbs, log_r, log_flow)
 
@@ -159,41 +237,41 @@ def eval_figs(fwd_stats,
     fig_dict = {}  # todo add tb GP fig & binned residuals
 
     log_r = fwd_stats['log_r']
-    try:
+    with fig_guard('Boltzmann Fit'):
         fig_dict['Boltzmann Fit'], metrics['Boltzmann Temp Estimate'] = boltzmann_fig(log_r)
-    except:  # some issues in the above I don't care to fix
-        pass
 
     # --- per-direction TB diagnostics ---
-    _tb_direction_figs(
-        fig_dict, 'Forward',
-        log_r=fwd_stats['log_r'],
-        log_pfs=fwd_stats['log_pfs'],
-        log_pbs=fwd_stats['log_pbs'],
-        log_flow=fwd_stats['log_Z_learned'],
-        flow_states=fwd_stats['flow_states'],
-        packing_coeff=sample_batch.packing_coeff,
-        cond_inds=fwd_stats.get('condition_id'),
-    )
-    _tb_direction_figs(
-        fig_dict, 'Backward',
-        log_r=bwd_stats['log_r'],
-        log_pfs=bwd_stats['log_pfs'],
-        log_pbs=bwd_stats['log_pbs'],
-        log_flow=bwd_stats['log_Z_learned'],  # constant log Z stands in for per-state flow
-        flow_states=bwd_stats['flow_states'],
-        packing_coeff=bwd_stats['packing_coeff'],
-        cond_inds=bwd_stats.get('condition_id'),
-    )
+    with fig_guard('Forward TB diagnostics'):
+        _tb_direction_figs(
+            fig_dict, 'Forward',
+            log_r=fwd_stats['log_r'],
+            log_pfs=fwd_stats['log_pfs'],
+            log_pbs=fwd_stats['log_pbs'],
+            log_flow=fwd_stats['log_Z_learned'],
+            flow_states=fwd_stats['flow_states'],
+            cond_inds=fwd_stats.get('condition_id'),
+        )
+    with fig_guard('Backward TB diagnostics'):
+        _tb_direction_figs(
+            fig_dict, 'Backward',
+            log_r=bwd_stats['log_r'],
+            log_pfs=bwd_stats['log_pfs'],
+            log_pbs=bwd_stats['log_pbs'],
+            log_flow=bwd_stats['log_Z_learned'],  # constant log Z stands in for per-state flow
+            flow_states=bwd_stats['flow_states'],
+            cond_inds=bwd_stats.get('condition_id'),
+        )
 
-    log_traj_params(
-        fwd_stats['means_f'], fwd_stats['logvars_f'], fig_dict,
-        fwd_stats['flow_states'], fwd_stats['means_b'],
-        fwd_stats['logvars_b'], prefix='Fwd')
-    log_traj_params(
-        bwd_stats['means_f'], bwd_stats['logvars_f'], fig_dict,
-        bwd_stats['flow_states'], bwd_stats['means_b'],
-        bwd_stats['logvars_b'], prefix='Bwd')
+    with fig_guard('Fwd traj params'):
+        log_traj_params(
+            fwd_stats['means_f'], fwd_stats['logvars_f'], fig_dict,
+            fwd_stats['flow_states'], fwd_stats['means_b'],
+            fwd_stats['logvars_b'], prefix='Fwd')
+    with fig_guard('Bwd traj params'):
+        log_traj_params(
+            bwd_stats['means_f'], bwd_stats['logvars_f'], fig_dict,
+            bwd_stats['flow_states'], bwd_stats['means_b'],
+            bwd_stats['logvars_b'], prefix='Bwd')
 
     # prefer the rescaled mol_energy (matches the actual loss scale) over the
     # bare energy_function attribute, which is only correct for toy (non
@@ -202,15 +280,18 @@ def eval_figs(fwd_stats,
     if scaled_energy is None:
         scaled_energy = sample_batch[energy_function]
 
-    fig_dict['Lattice Latents Distribution'] = sample_batch.plot_batch_cell_params(
-        space='latent', ref_dist=prior_latent_params, quantiles=[0.1],
-        show=False, return_fig=True, override_energy=scaled_energy,
-        aux_dists=[anchor_latents] if anchor_latents is not None else None)
-    fig_dict['Sample Scatter'] = sample_batch.plot_batch_density_funnel(
-        show=False, return_fig=True, override_energy=scaled_energy)
+    with fig_guard('Lattice Latents Distribution'):
+        fig_dict['Lattice Latents Distribution'] = sample_batch.plot_batch_cell_params(
+            space='latent', ref_dist=prior_latent_params, quantiles=[0.1],
+            show=False, return_fig=True, override_energy=scaled_energy,
+            aux_dists=[anchor_latents] if anchor_latents is not None else None)
+    with fig_guard('Sample Scatter'):
+        fig_dict['Sample Scatter'] = sample_batch.plot_batch_density_funnel(
+            show=False, return_fig=True, override_energy=scaled_energy)
 
     if temperature_conditioning:
-        fig_dict['Z vs T'] = Z_vs_T(fwd_stats)
+        with fig_guard('Z vs T'):
+            fig_dict['Z vs T'] = Z_vs_T(fwd_stats)
 
     return fig_dict, metrics
 
@@ -331,12 +412,11 @@ def condition_tracker_figs(tracker, energy_function, current_step):
         ]
     fig = make_subplots(rows=2, cols=4, subplot_titles=[m[0] for m in hist_metrics])
     for i, (name, arr) in enumerate(hist_metrics):
-        arr = arr[np.isfinite(arr)]
         fig.add_trace(
-            go.Histogram(x=arr, nbinsx=nbins, showlegend=False, marker_color='#3f7fbf'),
+            _hist_bar(arr, nbins=nbins, showlegend=False, marker_color='#3f7fbf'),
             row=i // 4 + 1, col=i % 4 + 1)
     fig.update_layout(
-        template='plotly_white', width=1100, height=560,
+        template='plotly_white', width=1100, height=560, bargap=0,
         title=f'Per-condition tracker stats ({n_visited} visited, {n_trusted} trusted)')
     fig_dict['Condition Tracker Histograms'] = fig
 
@@ -442,17 +522,17 @@ def condition_tracker_figs(tracker, energy_function, current_step):
                            'colorscale': cs, 'colorbar.title.text': name}, [0]]))
             first_name, first_vec, first_cs = map_metrics[0]
             first_grid = to_grid(first_vec)
-            fig = go.Figure(go.Heatmap(
-                z=first_grid, y=combo_labels, colorscale=first_cs,
-                zmin=buttons[0]['args'][0]['zmin'], zmax=buttons[0]['args'][0]['zmax'],
-                colorbar=dict(title=first_name),
-                hovertemplate="mol %{x} | %{y}<br>%{z:.3f}<extra></extra>"))
-            fig.update_layout(
-                template='plotly_white', width=max(720, min(1400, 40 + 6 * n_mols)), height=200 + 24 * n_combos,
-                title='Per-condition metric map (blank = unvisited)',
-                xaxis_title='molecule index', yaxis_title='condition combo',
-                updatemenus=[dict(buttons=buttons, direction='down', x=1.02, y=1.15, showactive=True)])
-            fig_dict['Condition Metric Map'] = fig
+            # fig = go.Figure(go.Heatmap(
+            #     z=first_grid, y=combo_labels, colorscale=first_cs,
+            #     zmin=buttons[0]['args'][0]['zmin'], zmax=buttons[0]['args'][0]['zmax'],
+            #     colorbar=dict(title=first_name),
+            #     hovertemplate="mol %{x} | %{y}<br>%{z:.3f}<extra></extra>"))
+            # fig.update_layout(
+            #     template='plotly_white', width=max(720, min(1400, 40 + 6 * n_mols)), height=200 + 24 * n_combos,
+            #     title='Per-condition metric map (blank = unvisited)',
+            #     xaxis_title='molecule index', yaxis_title='condition combo',
+            #     updatemenus=[dict(buttons=buttons, direction='down', x=1.02, y=1.15, showactive=True)])
+            # fig_dict['Condition Metric Map'] = fig
 
     return fig_dict
 
@@ -1017,11 +1097,13 @@ def compute_1d_kld(p_data: np.ndarray,
         data_max=data_range[1],
     )
 
-    x_common = x_samp
+    # the violin helper returns float32 (it exists to make small figures);
+    # integrate in float64 since this one is a metric, not a plot
+    x_common = np.asarray(x_samp, dtype=np.float64)
 
     # Remove the arbitrary "width" scaling for probability normalization
-    y_ref = np.maximum(y_ref, epsilon)
-    y_q = np.maximum(y_samp, epsilon)
+    y_ref = np.maximum(y_ref, epsilon).astype(np.float64)
+    y_q = np.maximum(y_samp, epsilon).astype(np.float64)
     P = y_ref / (np.trapz(y_ref, x_common) + epsilon)
     Q = y_q / (np.trapz(y_q, x_common) + epsilon)
 
@@ -1093,17 +1175,22 @@ def xy_scatter_plot(
     except:
         r_value = 0
 
+    x, y = _np(x, dtype=np.float64), _np(y, dtype=np.float64)
     if c is None:
-        xy = np.vstack([x.cpu().detach().numpy(), y.cpu().detach().numpy()])
         try:
-            c = get_point_density(xy, bins=c_bins)
+            c = get_point_density(np.vstack([x, y]), bins=c_bins)
         except:
-            c = np.ones(len(xy))
+            c = np.ones(len(x))
+
+    # density is estimated on the full sample, then the drawn points are thinned
+    thin = _thin_idx(len(x))
+    if thin is not None:
+        x, y, c = x[thin], y[thin], _np(c, dtype=np.float64)[thin]
 
     fig = go.Figure()
-    fig.add_scatter(x=x.cpu().detach().numpy(),
-                    y=y.cpu().detach().numpy(),
-                    marker_color=c,
+    fig.add_scatter(x=_np(x),
+                    y=_np(y),
+                    marker_color=_np(c),
                     marker_colorscale='Jet',
                     name=f'R = {r_value:.3f}',
                     showlegend=True,
@@ -1189,11 +1276,10 @@ def visualize_latent_trajs(states, n_trajs, log_r):
     return fig
 
 
-def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs, packing_coeff, cond_inds=None):
+def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs, cond_inds=None):
     # Compute x and y
     x = (log_r + log_pbs.sum(-1)).cpu().detach().numpy()
     y = (log_Z_learned + log_pfs.sum(-1)).cpu().detach().numpy()
-    log_importance_weight = ((log_r - log_Z_learned) - (log_pfs.sum(-1) - log_pbs.sum(-1))).cpu().detach().numpy()
 
     # Get symmetric limits
     min_val = min(x.min(), y.min())
@@ -1204,6 +1290,25 @@ def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs, packing_coeff, cond
     mae = np.mean(np.abs(x - y))
     r_value, _ = pearsonr(x, y)
     slope, intercept = np.polyfit(x, y, deg=1)
+
+    color_fields = {"Reward": log_r}
+    colorscales = {}
+    if cond_inds is not None:
+        color_fields["Condition"] = cond_inds
+        colorscales["Condition"] = "Rainbow"
+
+    # all summary stats above are computed on the full sample; only the drawn
+    # points are thinned, and every color field is thinned by the same index
+    # set so markers keep their values
+    n = len(x)
+    thin = _thin_idx(n)
+    if thin is not None:
+        x, y = x[thin], y[thin]
+        # a color field that isn't per-sample was already mis-aligned with the
+        # scatter; leave it be rather than index out of bounds
+        color_fields = {k: (v[thin] if len(v) == n else v)
+                        for k, v in ((k, _np(v, dtype=np.float64)) for k, v in color_fields.items())}
+
     # Build figure
     fig = go.Figure()
 
@@ -1226,7 +1331,7 @@ def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs, packing_coeff, cond
 
     # Scatter points
     fig.add_trace(go.Scatter(
-        x=x, y=y,
+        x=_np(x), y=_np(y),
         mode='markers',
         marker=dict(size=6, opacity=0.7,
                     # color=log_r.cpu().detach(), colorscale='Jet'
@@ -1243,15 +1348,6 @@ def flow_parity_plot(log_r, log_Z_learned, log_pbs, log_pfs, packing_coeff, cond
         # height=600,
         template='plotly_white'
     )
-    color_fields = {
-        "Reward": log_r,
-        "Density": packing_coeff.clip(max=2),
-        "Importance Weight": log_importance_weight,
-    }
-    colorscales = {}
-    if cond_inds is not None:
-        color_fields["Condition"] = cond_inds
-        colorscales["Condition"] = "Rainbow"
     fig = add_color_switcher(fig, color_fields, colorscales=colorscales)
 
     return fig, r_value
@@ -1320,8 +1416,8 @@ def vargrad_error(log_r, log_pbs, log_pfs):
     log_z = log_ratio.mean()
 
     mae = np.abs(log_z - log_ratio).mean()
-    fig = go.Figure(go.Histogram(x=(log_z - log_ratio), nbinsx=100, name=f'MAE={mae:.2f}', showlegend=True))
-    fig.update_layout(xaxis_title='Log Ratio Error', yaxis_title='Count')
+    fig = go.Figure(_hist_bar(log_z - log_ratio, nbins=100, name=f'MAE={mae:.2f}', showlegend=True))
+    fig.update_layout(xaxis_title='Log Ratio Error', yaxis_title='Count', bargap=0)
 
     return fig
 

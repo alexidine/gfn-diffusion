@@ -1,0 +1,40 @@
+- index: 0
+  run_name: jacob_control
+  note: measure jacobian components under the unmodified failure
+  launch_env: null
+  checkpoint_name: stab_july21c_elj_h512x4_T60_lr5.0e-5_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-68890c_z_matched.pt
+  gradient_norm_clip: 600.0
+  huber_beta: 10.0
+  loss_clip: 1000000000.0
+- index: 1
+  run_name: jacob_soften_d0.05
+  note: rotational Haar singularities softened; config identical to 0
+  launch_env: MXT_JACOBIAN_DELTA=0.05
+  checkpoint_name: stab_july21c_elj_h512x4_T60_lr5.0e-5_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-68890c_z_matched.pt
+  gradient_norm_clip: 600.0
+  huber_beta: 10.0
+  loss_clip: 1000000000.0
+- index: 2
+  run_name: jacob_beta2
+  note: Huber beta 10 -> 2 on all loss-coeff defaults
+  launch_env: null
+  checkpoint_name: stab_july21c_elj_h512x4_T60_lr5.0e-5_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-68890c_z_matched.pt
+  gradient_norm_clip: 600.0
+  huber_beta: 2.0
+  loss_clip: 1000000000.0
+- index: 3
+  run_name: jacob_lossclip100
+  note: per-sample soft loss clip 1e9 -> 100 on all defaults
+  launch_env: null
+  checkpoint_name: stab_july21c_elj_h512x4_T60_lr5.0e-5_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-68890c_z_matched.pt
+  gradient_norm_clip: 600.0
+  huber_beta: 10.0
+  loss_clip: 100.0
+- index: 4
+  run_name: jacob_gradclip100
+  note: global gradient norm clip 600 -> 100
+  launch_env: null
+  checkpoint_name: stab_july21c_elj_h512x4_T60_lr5.0e-5_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-68890c_z_matched.pt
+  gradient_norm_clip: 100.0
+  huber_beta: 10.0
+  loss_clip: 1000000000.0

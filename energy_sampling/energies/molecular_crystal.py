@@ -1,5 +1,6 @@
 import copy
 import gc
+import os
 from argparse import Namespace
 from time import sleep
 from typing import Optional, Tuple
@@ -77,6 +78,18 @@ class MolecularCrystal(BaseSet):
         self.data_ndim = 6 + 6 * max_z_prime
         self.energy_function = energy_function
         self.SG_FEATURE_TENSOR = SG_FEATURE_TENSOR.clone()  # store space group information
+
+        # Additive smooth floor for the rotational Haar jacobian's log-singularities
+        # (sin^2(r/2) at r->0, sin(theta) at theta->0/pi). Read from the environment
+        # rather than energy_config: any new energy_config key enters problem_def and
+        # would make assert_problem_match refuse pre-existing checkpoints, and the
+        # jacob_july24 battery must cross-load stab_july21c's. 0 (unset) = exact
+        # legacy clamp_min behavior. delta=0.05 caps the r-term at ~6 nats (vs ~37
+        # under the 1e-8 clamp) and adds ~delta^3 spurious orientation mass.
+        self.jacobian_softening = float(os.environ.get('MXT_JACOBIAN_DELTA', '0') or 0)
+        if self.jacobian_softening > 0:
+            print(f"MXT_JACOBIAN_DELTA={self.jacobian_softening:g}: rotational jacobian "
+                  f"log-singularities softened with an additive floor")
 
         self.density_coeff = density_coeff
         self.max_temperature = max_temperature
@@ -313,7 +326,8 @@ class MolecularCrystal(BaseSet):
         if not self.is_crystal:
             jacobian_energy = torch.zeros_like(bounding_energy)
         else:
-            jacobian_energy = self.compute_jacobian(crystal_batch, temperature)
+            jacobian_energy, jacobian_components = self.compute_jacobian(crystal_batch, temperature)
+            ens_dict.update(jacobian_components)
 
         if self.energy_clip is not None:
 
@@ -339,17 +353,36 @@ class MolecularCrystal(BaseSet):
         theta = sph[..., 0]  # polar angle
         r = sph[..., 2]  # rotation magnitude
         eps = 1e-8
-        rot_jacob_weight = (
-            # this comes from composing the transforms of spherical -> cartesian ball and then to uniform rotation
-                torch.sin(r / 2).clamp_min(eps) ** 2
-                * torch.sin(theta).clamp_min(eps)
-        )
-        frac_jacob_weight = - crystal_batch.z_prime * temperature * torch.log(
+        # these come from composing the transforms of spherical -> cartesian ball and then to uniform rotation;
+        # sum over z', because each dim gets its own correction
+        delta = self.jacobian_softening
+        if delta > 0:
+            # additive smooth floor: bounds the log-divergences (r-term cap -2*log(delta),
+            # theta-term cap -log(delta)) with C-inf gradients through the singular loci,
+            # at the cost of ~delta^3 spurious orientation mass in a disc around them
+            rot_r_energy = - temperature * torch.log(torch.sin(r / 2) ** 2 + delta ** 2).sum(dim=-1)
+            rot_theta_energy = - temperature * torch.log(torch.sin(theta).abs() + delta).sum(dim=-1)
+        else:
+            rot_r_energy = - temperature * 2 * torch.log(torch.sin(r / 2).clamp_min(eps)).sum(dim=-1)
+            rot_theta_energy = - temperature * torch.log(torch.sin(theta).clamp_min(eps)).sum(dim=-1)
+        frac_jacobian_energy = - crystal_batch.z_prime * temperature * torch.log(
             # this comes from the cartesian -> fractional transform, with a factor for each independent object transformed
             crystal_batch.cell_volume / crystal_batch.sym_mult)
-        jacobian_energy = - temperature * torch.log(rot_jacob_weight).sum(
-            dim=-1) + frac_jacob_weight  # sum, because each dim gets its own correction
-        return jacobian_energy
+        jacobian_energy = rot_r_energy + rot_theta_energy + frac_jacobian_energy
+        components = {
+            'jacobian_energy': jacobian_energy,
+            'rot_r_jacobian_energy': rot_r_energy,
+            'rot_theta_jacobian_energy': rot_theta_energy,
+            'frac_jacobian_energy': frac_jacobian_energy,
+            # batch-max of the two divergent terms, broadcast per-graph so the standard
+            # 'Mean <key>' logging path (train.py log_thermo_properties) surfaces them:
+            # a rare singularity graze is invisible in a batch mean, and train.py is
+            # frozen for the jacob_july24 battery (only this file ships), so the max
+            # rides in as a constant column whose mean IS the max
+            'rot_r_jacobian_peak_energy': torch.full_like(rot_r_energy, rot_r_energy.max().item()),
+            'rot_theta_jacobian_peak_energy': torch.full_like(rot_theta_energy, rot_theta_energy.max().item()),
+        }
+        return jacobian_energy, components
 
     def compute_zp_order_penalty(self, bounding_energy, crystal_batch):
         # penalize the model for placing asymmetric units out of the canonical order (closest -> furthest from origin)
