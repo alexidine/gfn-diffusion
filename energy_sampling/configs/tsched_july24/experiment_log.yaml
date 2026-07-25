@@ -10,11 +10,11 @@
   variance_budget_V1: 0.05
   last_step_std_at_T60: 0.02892
   replay_admit_T: 5.0
-  replay_ttl: 500
+  replay_ttl: 250
   replay_cap_min_max_h0:
-  - 16.0
-  - 50.0
   - 8.0
+  - 30.0
+  - 10.0
 - index: 1
   run_name: tsched_flat_r10
   note: constant rate cut 10x, no schedule
@@ -27,11 +27,11 @@
   variance_budget_V1: 0.005
   last_step_std_at_T60: 0.009144
   replay_admit_T: 5.0
-  replay_ttl: 500
+  replay_ttl: 250
   replay_cap_min_max_h0:
-  - 16.0
-  - 50.0
   - 8.0
+  - 30.0
+  - 10.0
 - index: 2
   run_name: tsched_flat_match
   note: 'constant rate at arm 4''s terminal rate: matched floor, ~1/50th the budget'
@@ -44,11 +44,11 @@
   variance_budget_V1: 0.00177854
   last_step_std_at_T60: 0.005454
   replay_admit_T: 5.0
-  replay_ttl: 500
+  replay_ttl: 250
   replay_cap_min_max_h0:
-  - 16.0
-  - 50.0
   - 8.0
+  - 30.0
+  - 10.0
 - index: 3
   run_name: tsched_p16_r50
   note: power 16, ratio 1/50 -- drop confined to the last ~15%
@@ -61,11 +61,11 @@
   variance_budget_V1: 0.05
   last_step_std_at_T60: 0.00562
   replay_admit_T: 5.0
-  replay_ttl: 500
+  replay_ttl: 250
   replay_cap_min_max_h0:
-  - 16.0
-  - 50.0
   - 8.0
+  - 30.0
+  - 10.0
 - index: 4
   run_name: tsched_p4_r50
   note: power 4, ratio 1/50 -- grid centre
@@ -78,11 +78,11 @@
   variance_budget_V1: 0.05
   last_step_std_at_T60: 0.005444
   replay_admit_T: 5.0
-  replay_ttl: 500
+  replay_ttl: 250
   replay_cap_min_max_h0:
-  - 16.0
-  - 50.0
   - 8.0
+  - 30.0
+  - 10.0
 - index: 5
   run_name: tsched_p1_r50
   note: power 1, ratio 1/50 -- decay across the whole rollout
@@ -95,11 +95,11 @@
   variance_budget_V1: 0.05
   last_step_std_at_T60: 0.008306
   replay_admit_T: 5.0
-  replay_ttl: 500
+  replay_ttl: 250
   replay_cap_min_max_h0:
-  - 16.0
-  - 50.0
   - 8.0
+  - 30.0
+  - 10.0
 - index: 6
   run_name: tsched_p4_r15
   note: power 4, ratio 1/15 -- shallow
@@ -112,11 +112,11 @@
   variance_budget_V1: 0.05
   last_step_std_at_T60: 0.009326
   replay_admit_T: 5.0
-  replay_ttl: 500
+  replay_ttl: 250
   replay_cap_min_max_h0:
-  - 16.0
-  - 50.0
   - 8.0
+  - 30.0
+  - 10.0
 - index: 7
   run_name: tsched_p4_r150
   note: power 4, ratio 1/150 -- deep
@@ -129,11 +129,11 @@
   variance_budget_V1: 0.05
   last_step_std_at_T60: 0.003302
   replay_admit_T: 5.0
-  replay_ttl: 500
+  replay_ttl: 250
   replay_cap_min_max_h0:
-  - 16.0
-  - 50.0
   - 8.0
+  - 30.0
+  - 10.0
 - index: 8
   run_name: tsched_p4_r50_raw
   note: power 4, ratio 1/50, preserve_budget off -- control on the budget knob
@@ -146,11 +146,11 @@
   variance_budget_V1: 0.0321698
   last_step_std_at_T60: 0.004367
   replay_admit_T: 5.0
-  replay_ttl: 500
+  replay_ttl: 250
   replay_cap_min_max_h0:
-  - 16.0
-  - 50.0
   - 8.0
+  - 30.0
+  - 10.0
 - index: 9
   run_name: tsched_replay_t2
   note: 'replay softmax T 5 -> 2: sharp tail focus'
@@ -163,11 +163,11 @@
   variance_budget_V1: 0.05
   last_step_std_at_T60: 0.02892
   replay_admit_T: 2.0
-  replay_ttl: 500
+  replay_ttl: 250
   replay_cap_min_max_h0:
-  - 16.0
-  - 50.0
   - 8.0
+  - 30.0
+  - 10.0
 - index: 10
   run_name: tsched_replay_t20
   note: 'replay softmax T 5 -> 20: near-uniform reservoir'
@@ -180,14 +180,14 @@
   variance_budget_V1: 0.05
   last_step_std_at_T60: 0.02892
   replay_admit_T: 20.0
-  replay_ttl: 500
+  replay_ttl: 250
   replay_cap_min_max_h0:
-  - 16.0
-  - 50.0
   - 8.0
+  - 30.0
+  - 10.0
 - index: 11
-  run_name: tsched_replay_ttl150
-  note: 'replay TTL 500 -> 150: continuous fresh-buffer limit'
+  run_name: tsched_replay_ttl100
+  note: 'replay TTL 250 -> 100: continuous fresh-buffer limit'
   t_scale: 0.05
   t_scale_ratio: null
   t_scale_power: 4.0
@@ -197,14 +197,14 @@
   variance_budget_V1: 0.05
   last_step_std_at_T60: 0.02892
   replay_admit_T: 5.0
-  replay_ttl: 150
+  replay_ttl: 100
   replay_cap_min_max_h0:
-  - 16.0
-  - 50.0
   - 8.0
+  - 30.0
+  - 10.0
 - index: 12
-  run_name: tsched_replay_ttl2000
-  note: 'replay TTL 500 -> 2000: staleness vs supersampling trade'
+  run_name: tsched_replay_ttl1000
+  note: 'replay TTL 250 -> 1000: staleness vs supersampling trade'
   t_scale: 0.05
   t_scale_ratio: null
   t_scale_power: 4.0
@@ -214,14 +214,14 @@
   variance_budget_V1: 0.05
   last_step_std_at_T60: 0.02892
   replay_admit_T: 5.0
-  replay_ttl: 2000
+  replay_ttl: 1000
   replay_cap_min_max_h0:
-  - 16.0
-  - 50.0
   - 8.0
+  - 30.0
+  - 10.0
 - index: 13
   run_name: tsched_replay_fixedcap
-  note: 'admit_cap_min = admit_cap_max = 50: health modulation off, static cap only'
+  note: 'admit_cap_min = admit_cap_max = 30: health modulation off, static cap only'
   t_scale: 0.05
   t_scale_ratio: null
   t_scale_power: 4.0
@@ -231,8 +231,8 @@
   variance_budget_V1: 0.05
   last_step_std_at_T60: 0.02892
   replay_admit_T: 5.0
-  replay_ttl: 500
+  replay_ttl: 250
   replay_cap_min_max_h0:
-  - 50.0
-  - 50.0
-  - 8.0
+  - 30.0
+  - 30.0
+  - 10.0

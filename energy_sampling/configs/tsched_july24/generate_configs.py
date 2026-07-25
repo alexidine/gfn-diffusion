@@ -89,8 +89,9 @@ cap(h) = cap_min + (cap_max-cap_min)/(1 + h/h0) with h = the fwd/scatter_err
 EMA, residence TTL, TTL-cohort telemetry). Shipping those REPLACES the old
 replay mechanism for EVERY arm -- there is no old-behavior fallback -- so
 base_elj.yaml now carries the new replay keys and arms 0-8 run the new
-mechanism at reference settings (T 5, cap 16-50 @ h0 8, TTL 500,
-churn_rate 50). Arm 0's "bit-identical to the parent code" claim is
+mechanism at reference settings (T 5, cap 8-30 @ h0 10, TTL 250,
+churn_rate 50 -- mk_dev's tuning as of 2026-07-24 evening). Arm 0's
+"bit-identical to the parent code" claim is
 accordingly narrowed to the VARIANCE SCHEDULE: the replay subsystem differs
 from the parent run in all arms. Motivation for accepting that: fresh-replay-
 buffer runs (2026-07-24) got total stability from discarding accumulated
@@ -104,10 +105,10 @@ so the battery is two independent one-factor scans sharing one control:
    9 : tsched_replay_t2       -- admit_temperature 2: sharp tail focus
                                  (T->0 recovers argsort-like admission)
   10 : tsched_replay_t20      -- admit_temperature 20: near-uniform reservoir
-  11 : tsched_replay_ttl150   -- TTL 150: aggressive freshness, the
+  11 : tsched_replay_ttl100   -- TTL 100: aggressive freshness, the
                                  continuous version of the fresh-buffer result
-  12 : tsched_replay_ttl2000  -- TTL 2000: staleness vs supersampling trade
-  13 : tsched_replay_fixedcap -- cap_min = cap_max = 50: health modulation
+  12 : tsched_replay_ttl1000  -- TTL 1000: staleness vs supersampling trade
+  13 : tsched_replay_fixedcap -- cap_min = cap_max = 30: health modulation
                                  OFF, static cap only -- is cap(h) load-bearing
                                  or is a fixed belt enough?
 
@@ -302,12 +303,12 @@ if __name__ == '__main__':
                     'replay softmax T 5 -> 2: sharp tail focus'))
     entries.append(emit(10, replay_arm(admit_temperature=20.0), 'tsched_replay_t20',
                     'replay softmax T 5 -> 20: near-uniform reservoir'))
-    entries.append(emit(11, replay_arm(max_residence_steps=150), 'tsched_replay_ttl150',
-                    'replay TTL 500 -> 150: continuous fresh-buffer limit'))
-    entries.append(emit(12, replay_arm(max_residence_steps=2000), 'tsched_replay_ttl2000',
-                    'replay TTL 500 -> 2000: staleness vs supersampling trade'))
-    entries.append(emit(13, replay_arm(admit_cap_min=50.0), 'tsched_replay_fixedcap',
-                    'admit_cap_min = admit_cap_max = 50: health modulation off, static cap only'))
+    entries.append(emit(11, replay_arm(max_residence_steps=100), 'tsched_replay_ttl100',
+                    'replay TTL 250 -> 100: continuous fresh-buffer limit'))
+    entries.append(emit(12, replay_arm(max_residence_steps=1000), 'tsched_replay_ttl1000',
+                    'replay TTL 250 -> 1000: staleness vs supersampling trade'))
+    entries.append(emit(13, replay_arm(admit_cap_min=30.0), 'tsched_replay_fixedcap',
+                    'admit_cap_min = admit_cap_max = 30: health modulation off, static cap only'))
 
     with open(OUTDIR / 'experiment_log.yaml', 'w') as f:
         yaml.dump(entries, f, sort_keys=False)

@@ -4,10 +4,10 @@ adaptive_lr:
   cut_loss_abs: 6000.0
   cut_ratio: 0.5
   decay_floor_scale: 0.05
-  decay_halflife_steps: 20000
+  decay_halflife_steps: 8000
   enabled: true
   fire_cooldown_steps: 500
-  hold_steps: 10000
+  hold_steps: 4000
   recovery_ramp_steps: 1000
   recovery_target_frac: 0.5
   recovery_wait_steps: 3000
@@ -31,13 +31,23 @@ buffers:
     health_gate_r2: 0.9
     health_gate_zerr: 0.5
     max_size: 200000
+    mcmc:
+      burn_in: 2000
+      energy_ceiling_kt: null
+      init_sigma: 0.02
+      log_geometry: true
+      sigma_adapt_rate: 0.1
+      sigma_max: 0.5
+      sigma_min: 0.0001
+      sweeps: 0
+      target_accept: 0.3
     noise_log_range:
     - -2.5
     - -1.5
     reach_quantile: 0.9
     reach_threshold: 0.75
     reach_topup_size: 1000
-    refresh_every_n_evals: 5
+    refresh_every_n_evals: 3
     replay_beta: 0.5
     screen_energy_window: 20
     seed_source: prior_dataset
@@ -48,6 +58,7 @@ buffers:
   prior_buffer:
     churn_batch_ref: 1000
     condition_block_m: 2
+    init_fraction: 0.25
     max_size: 250000
     mean_lifetime: 100
     min_size: 10000
@@ -55,13 +66,14 @@ buffers:
     ramp_width: 50
     reward_min: -600
     seed_source: prior_dataset
+    weighted_bwd_beta: 0.9
   replay_buffer:
-    admit_cap_health_h0: 8.0
-    admit_cap_max: 50.0
-    admit_cap_min: 16.0
+    admit_cap_health_h0: 10.0
+    admit_cap_max: 30.0
+    admit_cap_min: 8.0
     admit_temperature: 2.0
     churn_rate: 50
-    max_residence_steps: 500
+    max_residence_steps: 250
     max_size: 10000
 bwd_loss_coeffs:
   beta: 10.0
@@ -89,15 +101,16 @@ condition_log_z:
   bwd_tb_z_source: learned
   discovery_half_life_steps: 200.0
   fwd_tb_z_source: learned
-  half_life_steps: 7.0
+  half_life_visits: 7.0
   max_batch_weight: 200.0
   min_visits: 20
-  mol_sampling_uniform_beta: 0.5
-  mol_sampling_weighted_by_z_gap: true
-  mol_sampling_z_gap_clip_quantile: 0.99
-  mol_sampling_z_gap_temperature: 0.5
   replay_tb_z_source: learned
   trim_frac: 0.1
+  weighted_condition_sampling: true
+  weighted_condition_sampling_clip_quantile: 0.99
+  weighted_condition_sampling_temperature: 0.3
+  weighted_condition_sampling_uniform_beta: 0.5
+conditional_worst_quantile: 0.25
 continue_from_checkpoint: false
 controller:
   anneal_patience: 5
@@ -113,14 +126,14 @@ device: cuda
 ema_decay: null
 energy_config:
   analyze_kwargs: {}
-  bounding_coeff: 1.0
+  bounding_coeff: 10.0
   density_coeff: 10.0
   internal_oom_recovery: true
   lj_coeff: 1.0
   log_temperature_range:
   - 0
   - 0.693147
-  reduction_coeff: 1.0
+  reduction_coeff: 10.0
   reward_range: 500
   temperature: 2.5
 energy_function: elj
@@ -237,15 +250,13 @@ protocol:
     train_mode: bwd
   - bwd_sampling_mode: prior
     exit:
-    - above: 0.95
-      metric: bwd/r2_worst
-      patience: 2
-    - below: 50.0
-      metric: bwd/scatter_err
+    - below: 5.0
+      metric: bwd/tb_err_worst
       patience: 2
     flags:
       buffers_active: false
       update_log_z: true
+      weighted_bwd_sampling: true
     loss_coeffs:
       bwd:
         freeze_z: 0.0
@@ -262,30 +273,25 @@ protocol:
         fwd: 0.7
       kind: lexicographic
       rules:
-      - above: 60.0
-        boost:
-          bwd: 0.9
-          fwd: 0.1
-        metric: bwd/scatter_err
+      - above: 5.0
+        boost: bwd
+        metric: bwd/tb_err_worst
     bwd_sampling_mode: prior
     deactivate_threshold: 0.01
     exit:
-    - below: 5.0
+    - below: 2.0
       metric: gates/delta_worst
-      patience: 5
-    - below: 50.0
-      metric: bwd/scatter_err
+      patience: 15
     flags:
       buffers_active: false
     fracs:
-      bwd: 0.499
-      fwd: 0.5
+      bwd: 0.899
+      fwd: 0.1
       replay: 0.001
     loss_coeffs:
       bwd:
         tb: 1.0
       fwd:
-        beta: 2.0
         freeze_policy: 1.0
         tb: 1.0
     min_fracs:
@@ -306,33 +312,24 @@ protocol:
         abs: true
         boost: fwd
         metric: fwd/tb_resid_clipped
-      - above: 8.0
-        boost: fwd
-        metric: fwd/scatter_err
       - boost: fwd
         drift: 0.003
         margin: 1.3
-        metric: fwd/scatter_err
+        metric: fwd/tb_err_worst
         relative: best
-      - above: 150.0
-        anneal:
-          min: fwd/scatter_err
-        boost:
-          fwd: 0.65
-          replay: 0.35
-        metric: replay/scatter_err
     bwd_sampling_mode: prior
     deactivate_threshold: 0.01
     exit:
-    - above: 0.95
-      metric: fwd/r2
+    - below: 5.0
+      metric: fwd/tb_err_worst
       patience: 2
     flags:
       buffers_active: true
+      weighted_condition_sampling: true
     fracs:
       bwd: 0.001
-      fwd: 0.799
-      replay: 0.2
+      fwd: 0.989
+      replay: 0.01
     loss_coeffs:
       bwd:
         tb: 1.0
@@ -341,31 +338,28 @@ protocol:
     min_fracs:
       bwd: 0.001
       fwd: 0.02
-      replay: 0.02
+      replay: 0.009
     name: buildout
     on_enter:
-    - reseed_prior_from_dataset
+    - rebuild_prior_by_churn
     on_exit:
     - snapshot:fwd_calibrated
     train_mode: fused
   - balance:
-      anneal_coeffs:
-        bounding_coeff:
-          target: 10.0
-        reduction_coeff:
-          target: 10.0
       default_boost:
-        fwd: 0.1
-        replay: 0.9
+        fwd: 0.9
+        replay: 0.1
       kind: lexicographic
       rules:
       - above: 0.5
         abs: true
         boost: fwd
         metric: fwd/tb_resid_clipped
-      - below: 0.9
-        boost: replay
-        metric: fwd/r2
+      - boost: replay
+        drift: 0.003
+        margin: 1.3
+        metric: fwd/tb_err_worst
+        relative: best
       - above: 8.0
         anneal:
           min: 1.0
@@ -390,7 +384,6 @@ protocol:
       replay: 0.0009
     name: terminal
     train_mode: fused
-r2_worst_quantile: 0.0
 replay_loss_coeffs:
   beta: 10.0
   db: 0.0
@@ -418,7 +411,9 @@ tag: tsched_july24
 temperature_conditioning: false
 terminal_box_violation: 1.0
 terminal_logw_std: 1000.0
+test_eval_num_samples: 2000
 test_molecules_path: null
+traj_checkpoint: false
 use_weight_decay: false
 vector_conditioning: false
 vector_conditioning_dim: 3
