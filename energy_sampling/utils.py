@@ -115,7 +115,100 @@ def get_train_args():
     parser = argparse.ArgumentParser(description='GFN Linear Regression')
     args, remaining = parser.parse_known_args()
 
-    return dict2namespace(load_yaml(remaining[1]))
+    return resolve_derived_config(dict2namespace(load_yaml(remaining[1])))
+
+
+# ---------------------------------------------------------------------------
+# Derived-config resolution. Values that are pure functions of the primitives
+# (W = model hidden width, T = integrator.T, the grad clip) are computed here
+# instead of being hand-materialized in the YAML, so they can never drift out
+# of sync. A key set to `auto` (or null/absent) is derived; an explicit numeric
+# value is respected as an override. The scaling anchors are the validated
+# W512/T25 state documented in configs/mode_presets.yaml (SCALING REFERENCE) --
+# THIS function is the executable source of truth for them.
+# ---------------------------------------------------------------------------
+_SCALING_W_REF = 512
+_SCALING_T_REF = 25
+_LR_ANCHORS = {            # peak LR at the anchor; scaled x T_REF/T, W-flat
+    'lr_policy': 1.0e-4,
+    'lr_replay': 1.0e-4,
+    'lr_back':   1.0e-4,   # 1/T end (shared with the anchor_seed/z_match bwd-TB stages)
+    'lr_fused':  5.0e-5,
+}
+_CLIP_ANCHOR = 250.0
+_GRAD_MEDIAN = {10: 1.0e3, 25: 6.6e3, 100: 1.7e4}  # empirical pre-clip grad medians (mipcas)
+_CUT_GRAD_OVER_CLIP = 30.0
+_RESET_OVER_CUT = 10.0
+
+
+def _is_auto(v):
+    """A config value the resolver should fill in: absent, null, or 'auto'."""
+    return v is None or (isinstance(v, str) and v.strip().lower() == 'auto')
+
+
+def _grad_median(T):
+    """Empirical pre-clip grad-norm median at rollout length T, log-log
+    interpolated over _GRAD_MEDIAN (and extrapolated past the table ends via the
+    nearest segment). Drives the width/length scaling of gradient_norm_clip."""
+    ts = sorted(_GRAD_MEDIAN)
+    if T in _GRAD_MEDIAN:
+        return _GRAD_MEDIAN[T]
+    if T < ts[0]:
+        lo, hi = ts[0], ts[1]
+    elif T > ts[-1]:
+        lo, hi = ts[-2], ts[-1]
+    else:
+        lo = max(t for t in ts if t <= T)
+        hi = min(t for t in ts if t >= T)
+    f = (math.log(T) - math.log(lo)) / (math.log(hi) - math.log(lo))
+    return math.exp(math.log(_GRAD_MEDIAN[lo]) + f * (math.log(_GRAD_MEDIAN[hi]) - math.log(_GRAD_MEDIAN[lo])))
+
+
+def resolve_derived_config(args):
+    """Fill in (W, T)-derived config values from the primitives, in place, and
+    return args. See the block comment above. Idempotent given fixed primitives;
+    logs what it derived so the run record shows resolved numbers, not `auto`."""
+    integrator = getattr(args, 'integrator', None)
+    model = getattr(args, 'model', None)
+    T = int(getattr(integrator, 'T', 0) or 0)
+    W = int(getattr(model, 'policy_hidden_dim', 0) or 0)  # canonical width (all *_hidden_dim expected equal)
+    if not T or not W:
+        return args  # no primitives to scale from -- leave everything as written
+
+    resolved = {}
+
+    # LRs: anchor x T_REF/T, W-flat (lr_flow is mode-dependent, never auto-scaled)
+    for name, anchor in _LR_ANCHORS.items():
+        if _is_auto(getattr(args, name, None)):
+            val = anchor * _SCALING_T_REF / T
+            setattr(args, name, val)
+            resolved[name] = val
+
+    # grad clip: anchor x grad_median(T)/grad_median(T_REF) x sqrt(W/W_REF)
+    if _is_auto(getattr(args, 'gradient_norm_clip', None)):
+        clip = (_CLIP_ANCHOR
+                * (_grad_median(T) / _GRAD_MEDIAN[_SCALING_T_REF])
+                * math.sqrt(W / _SCALING_W_REF))
+        args.gradient_norm_clip = clip
+        resolved['gradient_norm_clip'] = clip
+
+    # tripwire bars: fixed ratios off (already-resolved) clip / cut_loss
+    alr = getattr(args, 'adaptive_lr', None)
+    if alr is not None:
+        if _is_auto(getattr(alr, 'cut_grad_abs', None)) and getattr(args, 'gradient_norm_clip', None) is not None:
+            alr.cut_grad_abs = _CUT_GRAD_OVER_CLIP * float(args.gradient_norm_clip)
+            resolved['adaptive_lr.cut_grad_abs'] = alr.cut_grad_abs
+        if _is_auto(getattr(alr, 'reset_grad_abs', None)) and getattr(alr, 'cut_grad_abs', None) is not None:
+            alr.reset_grad_abs = _RESET_OVER_CUT * float(alr.cut_grad_abs)
+            resolved['adaptive_lr.reset_grad_abs'] = alr.reset_grad_abs
+        if _is_auto(getattr(alr, 'reset_loss_abs', None)) and getattr(alr, 'cut_loss_abs', None) is not None:
+            alr.reset_loss_abs = _RESET_OVER_CUT * float(alr.cut_loss_abs)
+            resolved['adaptive_lr.reset_loss_abs'] = alr.reset_loss_abs
+
+    if resolved:
+        summary = ', '.join(f'{k}={v:.4g}' for k, v in resolved.items())
+        print(f'resolve_derived_config (W={W}, T={T}): {summary}')
+    return args
 
 
 def load_yaml(path):
@@ -183,6 +276,16 @@ def _to_plain(obj):
 _NON_IDENTITY_ENERGY_CONFIG_KEYS = ('density_coeff', 'bounding_coeff', 'reduction_coeff', 'lj_coeff',
                                     'reward_range')
 
+# Explicit version of the problem_def SCHEMA (the set of fields below that
+# constitute a problem's identity). It rides in the dict and therefore in the
+# hash, so a bump cleanly orphans every prior on disk with a legible diff line
+# ("schema_version: stored N vs current N+1") instead of a silent field-by-field
+# mismatch. BUMP THIS whenever the fields of get_problem_definition change --
+# that is the whole point: adding a field silently (vec_cond, 2026-07-21)
+# orphaned a battery's shared priors with no signal. FREEZE it (leave it be)
+# before baking a one-for-all prior meant to be reused across many runs.
+PROBLEM_DEF_SCHEMA_VERSION = 1
+
 
 def get_problem_definition(args) -> dict:
     """
@@ -199,6 +302,9 @@ def get_problem_definition(args) -> dict:
         energy_config.pop(key, None)
 
     return _to_plain({
+        # explicit schema version -- bump when adding/removing a field below
+        # (see PROBLEM_DEF_SCHEMA_VERSION); freeze before baking a shared prior
+        'schema_version': PROBLEM_DEF_SCHEMA_VERSION,
         'energy_function': args.energy_function,
         'energy_config': energy_config,
         'prior_path': args.prior_path,
@@ -1150,7 +1256,7 @@ class MetricTracker:
 
 
 def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=None,
-                   clip_beta=None, condition_id=None):
+                   clip_beta=None, condition_id=None, worst_quantile=0.5):
     """
     reward_floor/ramp_width gate under_coverage by a per-sample reward ramp:
 
@@ -1178,7 +1284,44 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=N
     'tb_resid' (the Jensen delta -- offset by the clipped-off tail mass) or
     'tb_err' (RMS, floored at std(log w)), is bounded by beta, so fat or
     skewed tails can't inflate it and a lagging Z shows as a persistent
-    sign. None (e.g. legacy callers) skips the metric.
+    sign. None (e.g. legacy callers) skips the metric. The Huber beta must
+    be held FIXED across the whole protocol for this to mean one thing.
+
+    THE CONTROL-METRIC FAMILY (all in nats, all EMA-safe per-sample means --
+    never ratios; the conditional r2 family this replaced could not be EMA'd
+    and was unreachable at ~2-3 samples/condition):
+
+      'tb_err'          pooled batch RMS residual: the global quality of fit.
+                        Uncentered second moment about zero, so unlike an r2
+                        it has no group-mean denominator to collapse or
+                        Bessel-bias at small groups.
+      'cond_tb_err'     the TYPICAL condition: unweighted mean over conditions
+                        of each one's own RMS residual. NOT the same number as
+                        tb_err -- sqrt is concave, so this sits at or below the
+                        pooled value (equality only when every condition is
+                        fit equally well). The gap between them is itself a
+                        reading: pooled tb_err squares before averaging and so
+                        is dominated by the worst conditions, while this is
+                        what a randomly chosen condition looks like.
+      'tb_err_worst'    the worst-case CONDITION: the `worst_quantile` upper
+                        tail across per-condition RMS residuals. This is the
+                        control metric (exit gates, calibration guards).
+      'z_grad_worst'    same construction on the CLIPPED SIGNED per-condition
+                        mean -- the per-condition dL/dZ ruler, level-only
+                        (spread averages out before the abs). Pairs with the
+                        pooled 'tb_resid_clipped'.
+
+    Whether a residual is level or spread is exactly the actuator question:
+    E[r^2] = mean(r)^2 + Var(r), so z_grad_worst is the part Z training can
+    fix and the excess of tb_err_worst over it is the part only policy
+    training can. worst_quantile is the fraction of conditions allowed to sit
+    beyond the bar (0.5 = median condition, 0.05 = 95% must clear).
+
+    With condition_id=None (unconditional runs, or any caller without a
+    condition axis) the whole batch is ONE group, so cond_tb_err/tb_err_worst
+    degrade exactly to tb_err and z_grad_worst to |tb_resid_clipped| -- the
+    same metric names carry the same meaning on conditional and unconditional
+    runs, so protocol rules need no per-problem rewriting.
 
     'relative_under' is the under_coverage computation re-centered on THIS
     batch's own empirical normalizer (z_jensen = mean log w) instead of
@@ -1195,7 +1338,7 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=N
 
     condition_id, when given, re-centers relative_under's z_jensen PER
     CONDITION (each sample against its own condition's group mean of log_w,
-    same scatter-mean pattern as within_condition_logw_std/within_condition_r2)
+    same scatter-mean pattern as within_condition_logw_std / cond_tb_err)
     instead of the single batch-wide pooled z_jensen. A pooled z_jensen mixes
     conditions with different true log Z into one mean, which is not any
     condition's own normalizer -- cazwlyy1: bwd's per-condition log_Z_learned
@@ -1231,6 +1374,11 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=N
         z_jensen_ref = (group_sum / counts.clamp(min=1))[inverse]  # each sample's OWN condition's Jensen mean
     else:
         z_jensen_ref = z_jensen  # scalar broadcasts -- old pooled behavior
+        # ONE group covering the batch: the conditional metrics below then
+        # reduce exactly to their pooled counterparts (see docstring)
+        inverse = torch.zeros_like(resid, dtype=torch.long)
+        counts = torch.full((1,), float(resid.numel()), device=resid.device, dtype=resid.dtype)
+        k = 1
 
     # TB residual skew
     resid_c = (resid)  # center it on zero
@@ -1292,8 +1440,29 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=N
         "ess_frac": ess_frac.item(),
     }
 
+    # --- the control-metric family (see docstring): per-condition RMS residual
+    # and per-condition clipped signed mean, reduced to a worst-case quantile
+    # across conditions. Groups of size 1 are kept: the RMS here is about ZERO,
+    # not about a group mean, so a singleton contributes |resid| -- a perfectly
+    # valid one-sample estimate of that condition's fit. (The r2 family this
+    # replaced had to drop singletons and Bessel-correct the survivors, which is
+    # exactly what made it unreachable at ~2-3 samples/condition.)
+    q_hi = min(max(1.0 - float(worst_quantile), 0.0), 1.0)  # tb_err: larger is worse
+    ss_resid = torch.zeros(k, device=resid.device, dtype=resid.dtype).scatter_add_(
+        0, inverse, resid ** 2)
+    cond_tb_err = (ss_resid / counts.clamp(min=1)).sqrt()
+    # mean and quantile over the SAME population (conditions, unweighted), so
+    # 'the typical condition' and 'the worst condition' are directly comparable
+    mets['cond_tb_err'] = cond_tb_err.mean().item()
+    mets['tb_err_worst'] = torch.quantile(cond_tb_err, q_hi).item()
+
     if clip_beta is not None:
-        mets['tb_resid_clipped'] = resid.clamp(-clip_beta, clip_beta).mean().item()
+        clipped = resid.clamp(-clip_beta, clip_beta)
+        mets['tb_resid_clipped'] = clipped.mean().item()
+        # per-condition dL/dZ: clip, group-mean (spread averages out), THEN abs
+        cond_z_grad = torch.zeros(k, device=resid.device, dtype=resid.dtype).scatter_add_(
+            0, inverse, clipped) / counts.clamp(min=1)
+        mets['z_grad_worst'] = torch.quantile(cond_z_grad.abs(), q_hi).item()
 
     return mets
 
@@ -1334,78 +1503,6 @@ def within_condition_logw_std(log_pf, log_pb, log_r, condition_id):
     if not bool(multi.any()):
         return float('nan')
     return centered[multi].pow(2).mean().sqrt().item()
-
-
-def _condition_r2_groups(log_pf, log_pb, log_r, log_Z, condition_id, min_group_size=2):
-    """
-    Shared groupwork for within_condition_r2 / per_condition_r2_worst: per-condition
-    sum(resid**2) and sum((y - group_mean_y)**2), where resid = y - x is the same
-    raw diagonal residual quick_tb_stats' 'r2' uses (y = log_pf + log_Z, x = log_pb +
-    log_r). Since log_Z is constant within a condition, group-centering y removes
-    exactly the between-condition component that inflates the pooled 'r2' at scale
-    (see the r2-pooled-conditional-gate concern). Returns (ss_resid, ss_total, counts,
-    valid_mask) over all unique conditions in the batch; valid_mask selects groups
-    with >= min_group_size members, same convention as within_condition_logw_std.
-    """
-    x = (log_pb + log_r).detach().flatten()
-    y = (log_pf + log_Z).detach().flatten()
-    resid = y - x
-    cid = condition_id.detach().flatten().to(resid.device)
-    uniq, inverse = torch.unique(cid, return_inverse=True)
-    k = uniq.numel()
-    counts = torch.zeros(k, device=resid.device, dtype=resid.dtype).scatter_add_(
-        0, inverse, torch.ones_like(resid))
-    group_sum_y = torch.zeros(k, device=resid.device, dtype=resid.dtype).scatter_add_(
-        0, inverse, y)
-    group_mean_y = group_sum_y / counts.clamp(min=1)
-    yc = y - group_mean_y[inverse]
-    ss_resid = torch.zeros(k, device=resid.device, dtype=resid.dtype).scatter_add_(
-        0, inverse, resid ** 2)
-    ss_total = torch.zeros(k, device=resid.device, dtype=resid.dtype).scatter_add_(
-        0, inverse, yc ** 2)
-    valid = counts >= min_group_size
-    return ss_resid, ss_total, counts, valid
-
-
-def within_condition_r2(log_pf, log_pb, log_r, log_Z, condition_id):
-    """
-    Pooled WITHIN-condition r2: quick_tb_stats' 'r2' with the between-condition
-    component of the normalizer removed, the r2 analog of within_condition_logw_std
-    above (same rationale -- see its docstring). Conditionally, the pooled r2's
-    denominator sum((y - y.mean())**2) is dominated by the spread of per-condition
-    log Z(c) (huge between different molecules/conditions), so a trunk that reads
-    nothing from the condition can still score r2 ~ 1 (see the
-    r2-pooled-conditional-gate memory). Centering y on its own condition's group
-    mean instead of the batch mean removes that component; every sample in a
-    qualifying (>= 2 member) group is pooled sample-weighted into one ratio, same
-    masking convention as within_condition_logw_std. Returns nan when no group in
-    the batch qualifies -- callers must treat nan as "no signal this batch".
-    """
-    ss_resid, ss_total, counts, valid = _condition_r2_groups(log_pf, log_pb, log_r, log_Z, condition_id)
-    if not bool(valid.any()):
-        return float('nan')
-    return (1 - ss_resid[valid].sum() / ss_total[valid].sum().clamp_min(1e-8)).item()
-
-
-def per_condition_r2_worst(log_pf, log_pb, log_r, log_Z, condition_id, quantile=0.0, min_group_size=2):
-    """
-    Worst-case per-condition r2, for the invariant "fwd/r2 > 0.9 for ALL
-    conditions" (a min across conditions, not a pooled mean). Unlike
-    within_condition_r2 (sample-weighted pooling, so a handful of badly-fit small
-    conditions can't move it much), each qualifying condition group contributes
-    exactly ONE r2 value from its own samples, and this returns the `quantile`
-    across those group values (0.0 = strict min). Noisier batch to batch than the
-    pooled version -- each group is a much smaller sample -- so lean on the
-    caller's own EMA (MetricTracker) to smooth it over batches, same as every
-    other quick_tb_stats-derived metric. Returns nan under the same no-qualifying-
-    group convention as within_condition_r2/within_condition_logw_std.
-    """
-    ss_resid, ss_total, counts, valid = _condition_r2_groups(log_pf, log_pb, log_r, log_Z, condition_id,
-                                                              min_group_size=min_group_size)
-    if not bool(valid.any()):
-        return float('nan')
-    r2_g = 1 - ss_resid[valid] / ss_total[valid].clamp_min(1e-8)
-    return torch.quantile(r2_g, quantile).item()
 
 
 def online_tb_coverage(log_pf, log_pb, log_Z, log_r, log_w_clamp=10.0):

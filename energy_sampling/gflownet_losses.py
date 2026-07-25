@@ -46,7 +46,7 @@ def update_and_lookup_condition_log_z(condition_log_z, condition_id, log_r, log_
     log_Z_learned, if given, also feeds ConditionLogZTracker.update_z_residual
     (same do_update gate -- an untrustworthy logw is untrustworthy for
     judging network calibration too), the per-condition monitoring signal
-    behind rms_z_lag(). Only get_gfn_forward_loss passes it -- the z-residual
+    behind rms_z_grad()/worst_tb_err(). Only get_gfn_forward_loss passes it -- the z-residual
     monitor is deliberately on-policy only: the Z model is trained and judged
     on forward rollouts, bwd/replay are off-policy and it's the policy
     model's job (mode retention/coverage) to fix those, not the Z model's.

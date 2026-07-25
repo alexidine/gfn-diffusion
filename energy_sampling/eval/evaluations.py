@@ -356,7 +356,7 @@ def _decode_condition_ids(cid, energy_function):
 CONDITION_SCATTER_FIGS = False
 
 
-def condition_tracker_figs(tracker, energy_function, current_step):
+def condition_tracker_figs(tracker, energy_function, current_step, worst_quantile=None):
     """
     Per-condition diagnostic figures built ENTIRELY from ConditionLogZTracker's
     persistent running statistics -- no sampling, no forward energy calls -- so
@@ -364,12 +364,20 @@ def condition_tracker_figs(tracker, energy_function, current_step):
     They replace squinting at wandb's per-condition 1D time series with direct
     cross-sections of the whole condition library at the current step.
 
-    Note z_resid_ema IS a per-condition TB residual: |log w - log Z_learned| =
-    |log Z + log_pf - log_pb - log_r|, EMA'd per condition on fresh train-time
-    samples (see ConditionLogZTracker.update_z_residual) -- read alongside the
-    signed z_bias_ema to split spread (policy work) from Z miscalibration
-    (Z training). The CONDITION_SCATTER_FIGS-gated calibration scatter makes
-    that split explicit per condition.
+    The histogram panel is the set of distributions the CONDITIONAL GATES take
+    their quantiles of, in nats:
+      cond_tb_err  total quality of fit, sqrt(z_bias_ema^2 + Var(log w))
+      z_grad_ema   clipped signed residual = the per-condition dL/dZ ruler
+      z_bias_ema   the same, unclipped (moves when a condition is > clip_beta off)
+      std(log w)   the spread half of that same square
+      delta        bwd_level_ema - fwd_level_ema, the z_match level handoff
+    Read tb_err against z_grad/z_bias to split spread (only policy work shrinks
+    it) from Z miscalibration (Z training shrinks it) -- they are the exact
+    additive parts of one square. `worst_quantile` (conditional_worst_quantile)
+    draws each gate's own bar onto its distribution, so a gate that is not
+    moving can be read as "one blown condition in the tail" vs "the whole
+    library sits beyond the bar". The CONDITION_SCATTER_FIGS-gated calibration
+    scatter makes the spread/level split explicit per condition.
     """
     valid = ~torch.isnan(tracker.ema_logw)
     n_visited = int(valid.sum().item())
@@ -383,10 +391,15 @@ def condition_tracker_figs(tracker, energy_function, current_step):
         (tracker.ema_logw_sq - tracker.ema_logw ** 2).clamp(min=0.0)[valid].cpu().numpy())
     best_energy = tracker.best_energy[valid].cpu().numpy().copy()
     best_energy[~np.isfinite(best_energy)] = np.nan  # visited via logw but no energy recorded yet
-    z_resid = tracker.z_resid_ema[valid].cpu().numpy()
+    tb_err = tracker.cond_tb_err[valid].cpu().numpy()
+    z_grad = tracker.z_grad_ema[valid].cpu().numpy()
     z_bias = tracker.z_bias_ema[valid].cpu().numpy()
     log_count = np.log10(1.0 + tracker.count[valid].float().cpu().numpy())
-    staleness = np.clip(current_step - tracker.last_update_step[valid].cpu().numpy(), 0, None).astype(float)
+    # level-matching gap on its OWN mask: the two per-mode level streams are fed
+    # from their loss paths regardless of the do_update gating behind ema_logw,
+    # so `valid` is the wrong mask for them (a condition can be characterized on
+    # both streams with no ema_logw yet, and vice versa).
+    delta = (tracker.bwd_level_ema - tracker.fwd_level_ema).cpu().numpy()
 
     decoded = _decode_condition_ids(cid, energy_function)
 
@@ -395,29 +408,54 @@ def condition_tracker_figs(tracker, energy_function, current_step):
     nbins = int(min(64, max(10, n_visited // 5)))
 
     # --- 1: cross-sectional histograms over the condition library ---
+    # Row 1 is the TB-residual decomposition (total / clipped level / unclipped
+    # level / spread), row 2 the levels themselves and the target. Visit-count
+    # and staleness panels were dropped: the trusted/visited counts in the title
+    # carry the coverage question, and the per-condition counts are already
+    # native wandb histograms.
+    #
     # strictly-positive metrics are log10'd: their per-condition spreads are
     # heavy-tailed (z_gap spans orders of magnitude), so linear bins put all
     # the structure in one bar. Non-positive entries (e.g. exact-zero gap on
     # a single-visit condition) go -inf and are dropped by the finite filter.
+    #
+    # `bar` is the gate's own quantile for the gated distributions, drawn as a
+    # vline (two, symmetric, for the signed ones -- the gates read |x|) and set
+    # in the SAME units as the panel. None = not gated / gate still cold.
+    q = worst_quantile
     with np.errstate(divide='ignore', invalid='ignore'):
+        # `or None` on the 0.0-when-cold convention worst_tb_err/worst_z_grad
+        # return before any condition is characterized -- a bar at exactly 0 is
+        # the absence of a reading, not a tight one
+        tb_bar = (tracker.worst_tb_err(q) or None) if q is not None else None
+        z_grad_bar = (tracker.worst_z_grad(q) or None) if q is not None else None
+        delta_bar = tracker.delta_stats(q)['worst'] if q is not None else None
         hist_metrics = [
-            ('log10 z_gap (emp - jensen)', np.log10(z_gap)),
-            ('log10 std(log w)', np.log10(logw_std)),
-            ('best energy', best_energy),
-            ('log10 TB resid |logw - Z| EMA', np.log10(z_resid)),
-            ('signed Z bias EMA', z_bias),
-            ('ema_logw (Z target)', ema_logw),
-            ('log10(1 + visits)', log_count),
-            ('log10(1 + steps since update)', np.log10(1.0 + staleness)),
+            ('log10 cond_tb_err (RMS TB resid)', np.log10(tb_err),
+             np.log10(tb_bar) if tb_bar else None, False),
+            ('signed z_grad EMA (clipped dL/dZ)', z_grad, z_grad_bar, True),
+            ('signed Z bias EMA (unclipped)', z_bias, None, False),
+            ('log10 std(log w)', np.log10(logw_std), None, False),
+            ('delta = bwd - fwd level', delta, delta_bar, True),
+            ('log10 z_gap (emp - jensen)', np.log10(z_gap), None, False),
+            ('ema_logw (Z target)', ema_logw, None, False),
+            ('best energy', best_energy, None, False),
         ]
     fig = make_subplots(rows=2, cols=4, subplot_titles=[m[0] for m in hist_metrics])
-    for i, (name, arr) in enumerate(hist_metrics):
+    for i, (name, arr, bar, symmetric) in enumerate(hist_metrics):
+        row, col = i // 4 + 1, i % 4 + 1
         fig.add_trace(
             _hist_bar(arr, nbins=nbins, showlegend=False, marker_color='#3f7fbf'),
-            row=i // 4 + 1, col=i % 4 + 1)
-    fig.update_layout(
-        template='plotly_white', width=1100, height=560, bargap=0,
-        title=f'Per-condition tracker stats ({n_visited} visited, {n_trusted} trusted)')
+            row=row, col=col)
+        if bar is not None and np.isfinite(bar):
+            for x in ((bar, -bar) if symmetric else (bar,)):
+                fig.add_vline(x=x, row=row, col=col,
+                              line=dict(color='#c0392b', dash='dash', width=1))
+    title = (f'Per-condition tracker stats, step {current_step} '
+             f'({n_visited} visited, {n_trusted} trusted)')
+    if q is not None:
+        title += f' -- dashed: gate quantile q={q}'
+    fig.update_layout(template='plotly_white', width=1100, height=560, bargap=0, title=title)
     fig_dict['Condition Tracker Histograms'] = fig
 
     # --- 2 & 3 (disabled): correlation splom and Z-calibration scatter.
@@ -441,7 +479,7 @@ def condition_tracker_figs(tracker, energy_function, current_step):
                 ('z_gap', z_gap),
                 ('std(log w)', logw_std),
                 ('best energy', best_energy),
-                ('TB resid', z_resid),
+                ('cond_tb_err', tb_err),
                 ('log10 visits', log_count),
             ]],
             text=hover,
@@ -458,16 +496,16 @@ def condition_tracker_figs(tracker, energy_function, current_step):
         # +-y=x guides: the residual IS the bias (Z genuinely lags; Z training
         # fixes it). Points near y=0 with large x: residual is spread of log w
         # (only policy work shrinks it).
-        calib_mask = np.isfinite(z_resid) & np.isfinite(z_bias)
+        calib_mask = np.isfinite(tb_err) & np.isfinite(z_bias)
         if calib_mask.sum() >= 2:
-            lim = float(np.nanmax(z_resid[calib_mask])) * 1.05 + 1e-6
+            lim = float(np.nanmax(tb_err[calib_mask])) * 1.05 + 1e-6
             fig = go.Figure()
             for sign in (1.0, -1.0):
                 fig.add_trace(go.Scatter(
                     x=[0, lim], y=[0, sign * lim], mode='lines',
                     line=dict(color='gray', dash='dash', width=1), showlegend=False))
             fig.add_trace(go.Scatter(
-                x=z_resid[calib_mask], y=z_bias[calib_mask], mode='markers',
+                x=tb_err[calib_mask], y=z_bias[calib_mask], mode='markers',
                 text=[h for h, m in zip(hover, calib_mask) if m],
                 marker=dict(size=5, color=log_count[calib_mask], colorscale='Viridis',
                             showscale=True, colorbar=dict(title='log10 visits'), opacity=0.8),
@@ -502,7 +540,7 @@ def condition_tracker_figs(tracker, energy_function, current_step):
                 ('z_gap', z_gap, 'Viridis'),
                 ('std(log w)', logw_std, 'Viridis'),
                 ('best energy', best_energy, 'Viridis'),
-                ('TB resid', z_resid, 'Viridis'),
+                ('cond_tb_err', tb_err, 'Viridis'),
                 ('Z bias', z_bias, 'RdBu'),
                 ('log10 visits', log_count, 'Viridis'),
             ]

@@ -349,6 +349,44 @@ def expand_condition_manifold(cfg, anchors):
     return draws
 
 
+def split_test_conditions(cfg, conditions):
+    """
+    Randomly hold out a subset of the (already manifold-expanded) conditions as a
+    generalization test set -- an INTERPOLATION split: the held-out draws come from
+    exactly the same distribution as the training ones, they were simply never
+    trained on.
+
+    Must run before anything is built: the held-out conditions are removed from
+    cfg.conditions so they appear in neither the prior (which seeds prior_buffer and
+    supplies the warm-start's backward samples) nor the condition set used for
+    molecules_path / anchor seeding. They exist only in the separate test file, read
+    at evaluation time via test_molecules_path.
+
+    Size comes from condition_set.test_n_conditions, else condition_set.test_fraction
+    (of the expanded set); absent/zero -> no split, empty test list.
+    """
+    block = getattr(cfg, 'condition_set', None)
+    n_total = len(conditions)
+    n_test = getattr(block, 'test_n_conditions', None)
+    if n_test is None:
+        frac = getattr(block, 'test_fraction', None)
+        if not frac:
+            return conditions, []
+        n_test = int(round(float(frac) * n_total))
+    n_test = int(n_test)
+    if n_test <= 0:
+        return conditions, []
+    if n_test >= n_total:
+        raise ValueError(f"condition test split wants {n_test} of {n_total} conditions -- "
+                         f"leaves nothing to train on")
+    perm = np.random.permutation(n_total)
+    test_pos = set(perm[:n_test].tolist())
+    train = [c for i, c in enumerate(conditions) if i not in test_pos]
+    test = [c for i, c in enumerate(conditions) if i in test_pos]
+    print(f"condition test split: {len(train)} train / {len(test)} held-out test conditions")
+    return train, test
+
+
 def append_all(parts):
     batch = parts[0]
     for part in parts[1:]:
@@ -686,7 +724,7 @@ def coverage_check(cfg, template, field_kwargs=None):
     
     '''
 
-    if cfg.coverage_check.show_figures:
+    if getattr(cfg, 'show_figures', True) and cfg.coverage_check.show_figures:
         fig.show()
     if cfg.coverage_check.save_figures:
         out_path = os.path.join(cfg.output_dir, f'{cfg.tag}_coverage_check.html')
@@ -705,6 +743,12 @@ def main(config_path):
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
+    # top-level master switch over every figure this script displays (the
+    # condition-set plot_batch calls below AND coverage_check's histogram).
+    # Heavy on big condition_manifold runs, so batteries set it false; absent
+    # (older configs) -> true, preserving prior behavior.
+    show_figs = getattr(cfg, 'show_figures', True)
+
     anchors = list(cfg.conditions)  # preserved for print_partition_functions below, pre-manifold-expansion
 
     # optional: replace the discrete anchor conditions above with a much
@@ -715,6 +759,12 @@ def main(config_path):
     # these share ONE identifier rather than getting their own
     if getattr(cfg, 'condition_manifold', None) is not None and getattr(cfg.condition_manifold, 'enabled', False):
         cfg.conditions = expand_condition_manifold(cfg, cfg.conditions)
+
+    # hold out a random subsample BEFORE any artifact is built -- see
+    # split_test_conditions: the prior, the condition set and the anchor seed
+    # source must all see train conditions only, or the held-out set leaks
+    train_conditions, test_conditions = split_test_conditions(cfg, cfg.conditions)
+    cfg.conditions = train_conditions
 
     os.makedirs(cfg.output_dir, exist_ok=True)
 
@@ -729,10 +779,25 @@ def main(config_path):
         out_path = os.path.join(cfg.output_dir, out_name)
         del cond_batch.fingerprint
         torch.save({'prior': cond_batch}, out_path)
-        cond_batch.plot_batch_cell_params(space='latent')
-        cond_batch.plot_batch_staircase(space='latent')
+        if show_figs:
+            cond_batch.plot_batch_cell_params(space='latent')
+            cond_batch.plot_batch_staircase(space='latent')
         print(f"Saved condition set -> {out_path} "
               f"({cond_batch.num_graphs} graphs, {len(cfg.conditions)} unique identifiers)")
+
+        # held-out set, built the same way but saved separately and excluded from
+        # the prior below (cfg.conditions is restored immediately)
+        if test_conditions:
+            cfg.conditions = test_conditions
+            test_batch = build_condition_set(cfg, template, field_kwargs=field_kwargs)
+            test_name = (getattr(cfg.condition_set, 'test_output_name', None)
+                         or f'{cfg.tag}_test_conditions.pt')
+            test_path = os.path.join(cfg.output_dir, test_name)
+            del test_batch.fingerprint
+            torch.save({'prior': test_batch}, test_path)
+            print(f"Saved HELD-OUT test condition set -> {test_path} "
+                  f"({test_batch.num_graphs} graphs, {len(test_conditions)} unique identifiers)")
+            cfg.conditions = train_conditions
 
     if getattr(cfg.prior, 'generate', True):
         prior_batch = build_prior(

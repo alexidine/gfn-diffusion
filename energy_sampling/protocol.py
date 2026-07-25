@@ -11,9 +11,9 @@ declares:
   train_mode        'bwd' | 'fused' -- what train_logic returns every step
   bwd_sampling_mode 'dataset' | 'prior' -- where backward draws terminals from
   flags             explicit behavior switches read by train.py (update_log_z,
-                    scramble_conditions, zgap_mol_sampling, buffers_active,
-                    mle_gate) -- the replacements for the old `self.phase == N`
-                    integer checks
+                    scramble_conditions, weighted_condition_sampling,
+                    buffers_active, mle_gate) -- the replacements for the old
+                    `self.phase == N` integer checks
   loss_coeffs       per-mode dicts of NON-DEFAULT coefficient overrides; the
                     base config's fwd/bwd/replay_loss_coeffs blocks are the
                     defaults, and a stage's live coeffs are a pure function of
@@ -101,10 +101,10 @@ import numpy as np
 MODES = ('fwd', 'bwd', 'replay')
 TRAIN_MODES = ('bwd', 'fused')
 BWD_SAMPLING_MODES = ('dataset', 'prior')
-STAGE_FLAGS = ('update_log_z', 'scramble_conditions', 'zgap_mol_sampling',
-               'buffers_active', 'mle_gate')
+STAGE_FLAGS = ('update_log_z', 'scramble_conditions', 'weighted_condition_sampling',
+               'buffers_active', 'mle_gate', 'weighted_bwd_sampling')
 ACTIONS = ('snapshot', 'snapshot_prior', 'bootstrap_z', 'seed_prior_from_anchors',
-           'reseed_prior_from_dataset')
+           'reseed_prior_from_dataset', 'rebuild_prior_by_churn')
 SKIP_CONDITIONS = ('prior_loaded',)
 RULE_KEYS = {'metric', 'boost', 'above', 'below', 'relative', 'margin', 'drift', 'floor',
              'abs', 'if_missing', 'lookahead', 'anneal'}
@@ -316,6 +316,12 @@ class Stage:
                         or (len(parts) == 2 and parts[1] != 'flush')):
                     raise ValueError(f"stage '{self.name}' {where}: '{a}' -- expected "
                                      f"seed_prior_from_anchors:<int> or seed_prior_from_anchors:<int>:flush")
+            if name == 'reseed_prior_from_dataset' and arg and arg != 'flush':
+                raise ValueError(f"stage '{self.name}' {where}: '{a}' -- expected "
+                                 f"reseed_prior_from_dataset or reseed_prior_from_dataset:flush")
+            if name == 'rebuild_prior_by_churn' and arg and not arg.isdigit():
+                raise ValueError(f"stage '{self.name}' {where}: '{a}' -- expected "
+                                 f"rebuild_prior_by_churn or rebuild_prior_by_churn:<int>")
             actions.append((name, arg))
         return actions
 
@@ -652,6 +658,13 @@ class StageProtocol:
 
         for name, arg in new.on_enter:
             self._run_action(name, arg, eval_metrics)
+        # freeze this stage's healthy turnover point AFTER on_enter's buffer
+        # surgery has run, for fire_loss_spike to rewind to instead of reversing
+        # a phase. modeller_state.stage is already the NEW stage here (unlike the
+        # outgoing on_exit snapshot, which records the old one), so the rewind
+        # can tell them apart. No buffers: the spike path keeps the live
+        # (same-stage, strictly fresher) buffers, exactly as for a 'best' rewind.
+        m.checkpointer.save('stage_start')
         print(f"protocol: stage '{new.name}' engaged (fwd {m.fwd_frac:.3f} / "
               f"bwd {m.bwd_frac:.4f} / replay {m.replay_frac:.3f}, "
               f"train_mode {new.train_mode}, bwd_sampling {new.bwd_sampling_mode})")
@@ -669,7 +682,9 @@ class StageProtocol:
             flush = len(parts) > 1 and parts[1] == 'flush'
             self.m.seed_prior_from_condition_minima(n_per_condition, flush=flush)
         elif name == 'reseed_prior_from_dataset':
-            self.m.reseed_prior_from_dataset()
+            self.m.reseed_prior_from_dataset(flush=(arg == 'flush'))
+        elif name == 'rebuild_prior_by_churn':
+            self.m.rebuild_prior_by_churn(int(arg) if arg else None)
 
     def _snapshot(self, tag: str):
         """Pre-transition snapshot: the untouched end-state of the outgoing

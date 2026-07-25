@@ -6,11 +6,30 @@ point -- and running the failing stage directly. Base = stab_july21c's base_elj.
 run's exact geometry (512x4, T60, lr 5e-5, T-scaled tripwires) so the ONLY
 difference vs the parent is the single intervention per run.
 
-Code prerequisite: the 2026-07-24 molecular_crystal.py (jacobian component
-logging + MXT_JACOBIAN_DELTA softening + rot_*_jacobian_peak_energy channels).
-ONLY molecular_crystal.py ships to the cluster -- no other file changed
-behavior-wise, and the peak channels deliberately ride through the existing
-'Mean <key>' logging path so train.py stays frozen.
+Code prerequisite AS RUN: the 2026-07-24 molecular_crystal.py (jacobian
+component logging + MXT_JACOBIAN_DELTA softening + rot_*_jacobian_peak_energy
+channels). ONLY molecular_crystal.py shipped to the cluster -- no other file
+changed behavior-wise, and the peak channels deliberately rode through the
+existing 'Mean <key>' logging path so train.py stayed frozen.
+
+RESULTS (2026-07-24/25) -- the softening arm was DISCONFIRMED and the code it
+needed has since been REMOVED, so run 1 is no longer reproducible as specified
+(it now duplicates run 0):
+  - Healthy-window rotational peaks measured 0.8-3.5 nats, not the tens the
+    graze hypothesis required; soften_d0.05 matched control on every channel.
+    The clamp cap (~37 nats) was only ever hit DURING an excursion already
+    underway. MXT_JACOBIAN_DELTA was dropped afterwards -- an env var that
+    changes the target without entering problem_def lets two checkpoints share
+    a hash while solving different problems.
+  - beta2 and lossclip100 both CRASHED (earliest of the six); gradclip100 was
+    the healthiest arm. Suppressing the residual tail's RELATIVE weight removes
+    the restoring force; a uniform grad-norm rescale preserves it.
+  - control/soften/gradclip all SATURATED (Fvar flat, r2 ~0.85 rising, replay
+    buffer mean energy oscillating about zero) past the step where the parent
+    had already committed to its ramp -- injecting from z_matched's clean frozen
+    buffer was itself sufficient to prevent the blowup.
+The component logging survives in molecular_crystal.py + train.py's Max
+channels; only the softening branch and the peak-column workaround are gone.
 
 Runs:
   0 : jacob_control       -- measure only: jacobian components under the
@@ -28,15 +47,20 @@ Runs:
                              mainly squashing the replay-garbage terms
                              (replay/tb ran 240-7000 during the parent ramp).
   4 : jacob_gradclip100   -- gradient_norm_clip 600 -> 100 (global norm).
+  5 : jacob_noreplay      -- buildout replay training share zeroed (fracs 0.0,
+                             below deactivate_threshold; replay balance rule
+                             removed; buffer still fills, never sampled).
+                             Direct test of the replay-drives-it hypothesis
+                             (added 2026-07-24 after launch of 0-4; submit as
+                             array index 5).
 
-Why the env var for run 1: any NEW energy_config yaml key enters problem_def
-(only the _NON_IDENTITY_ENERGY_CONFIG_KEYS are popped), and assert_problem_match
-then hard-refuses the parent checkpoint. utils.py can't ship, so the knob rides
-in the environment. Launch run 1 as:
+Why the env var was used for run 1 (historical): any NEW energy_config yaml key
+enters problem_def (only the _NON_IDENTITY_ENERGY_CONFIG_KEYS are popped), and
+assert_problem_match then hard-refuses the parent checkpoint. utils.py couldn't
+ship, so the knob rode in the environment:
     MXT_JACOBIAN_DELTA=0.05 python train.py --config configs/jacob_july24/1.yaml
-Forgetting it degrades run 1 to a duplicate of run 0 -- the init log prints
-"MXT_JACOBIAN_DELTA=0.05: ..." when active, and Mean/peak rot_r channels cap
-at ~6 nats, so a silent miss is visible both ways.
+That same property -- a target change invisible to problem_def -- is why the
+knob was removed rather than kept once the hypothesis died.
 
 Resume mechanics (what the checkpoint carries vs what the config owns):
   - Injection point = the parent's z_matched SNAPSHOT (z_match exit = buildout
@@ -173,6 +197,26 @@ if __name__ == '__main__':
     config['gradient_norm_clip'] = 100.0
     log.append(emit(4, config, 'jacob_gradclip100',
                     'global gradient norm clip 600 -> 100'))
+
+    # 5: replay excised from buildout -- the direct test of "the replay buffer
+    # retaining extreme trajectories drives the instability". fracs.replay 0.0
+    # sits below deactivate_threshold (0.01) so the mode is skipped outright;
+    # buffers_active stays true (prior/anchor churn identical to control, the
+    # replay BUFFER still fills -- only the training draw from it is removed),
+    # and the replay/scatter_err balance rule goes with it so the lexicographic
+    # layer never routes share to a dead mode. Terminal untouched (no parent
+    # run ever exited buildout).
+    config = make_base()
+    for stage in config['protocol']['stages']:
+        if stage['name'] == 'buildout':
+            stage['fracs'] = {'fwd': 0.999, 'bwd': 0.001, 'replay': 0.0}
+            stage['min_fracs'] = {'fwd': 0.02, 'bwd': 0.001, 'replay': 0.0}
+            stage['balance']['default_boost'] = {'fwd': 1.0}
+            stage['balance']['rules'] = [
+                r for r in stage['balance']['rules']
+                if not str(r.get('metric', '')).startswith('replay/')]
+    log.append(emit(5, config, 'jacob_noreplay',
+                    'buildout replay training share zeroed; buffer still fills, never sampled'))
 
     with open(OUTDIR / 'experiment_log.yaml', 'w') as f:
         yaml.dump(log, f, sort_keys=False)

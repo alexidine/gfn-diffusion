@@ -56,6 +56,7 @@ class CrystalBuffer:
             traj: Optional[torch.Tensor] = None,
             init_loss: Optional[torch.Tensor] = None,
             exclude_keys: Optional[tuple] = None,
+            birth_step: int = 0,
     ):
         self.device = device
         self.max_z_prime = max_z_prime
@@ -82,6 +83,14 @@ class CrystalBuffer:
             assert self.ema_loss.shape[0] == n, \
                 f"init_loss has {self.ema_loss.shape[0]} entries, expected {n} to match dataset size"
         self.select_counts = torch.zeros(n, dtype=torch.long)
+        # global training step at which each row was admitted (CPU bookkeeping,
+        # like ema_loss) -- lets callers enforce a residence-time ceiling.
+        # Callers that don't care leave the default 0.
+        self.birth_step = torch.full((n,), int(birth_step), dtype=torch.long)
+        # admission-time snapshot of the ema_loss seed. ema_loss evolves via
+        # update_losses; birth_loss never does -- the pair gives death-vs-birth
+        # residual deltas at eviction (replay TTL-cohort telemetry).
+        self.birth_loss = self.ema_loss.clone()
 
         # per-sample rolling estimates of the log importance weight
         # logw = log_r + log_pb - log_pf under the current policy.
@@ -117,6 +126,8 @@ class CrystalBuffer:
             'y': self.y.cpu() if self.y is not None else None,
             'ema_loss': self.ema_loss.cpu(),
             'select_counts': self.select_counts.cpu(),
+            'birth_step': self.birth_step.cpu(),
+            'birth_loss': self.birth_loss.cpu(),
             'ema_logw': self.ema_logw.cpu(),
             'ema_logw_sq': self.ema_logw_sq.cpu(),
             'ema_log_z_emp': self.ema_log_z_emp.cpu(),
@@ -147,6 +158,10 @@ class CrystalBuffer:
         # to cpu here regardless of what device the checkpoint was loaded onto.
         obj.ema_loss = state['ema_loss'].cpu()
         obj.select_counts = state['select_counts'].cpu()
+        obj.birth_step = state.get(
+            'birth_step', torch.zeros_like(obj.select_counts)).cpu()
+        obj.birth_loss = state.get(
+            'birth_loss', torch.full_like(obj.ema_loss, float('nan'))).cpu()
         obj.ema_logw = state['ema_logw'].cpu()
         obj.ema_logw_sq = state['ema_logw_sq'].cpu()
         obj.ema_log_z_emp = state['ema_log_z_emp'].cpu()
@@ -546,7 +561,8 @@ class CrystalBuffer:
     # ---------------------------------------------------------------------
 
     @torch.no_grad()
-    def add(self, data, traj: Optional[torch.Tensor] = None, init_loss: Optional[torch.Tensor] = None):
+    def add(self, data, traj: Optional[torch.Tensor] = None, init_loss: Optional[torch.Tensor] = None,
+            birth_step: int = 0):
         """
         Append new graphs.
 
@@ -618,6 +634,9 @@ class CrystalBuffer:
 
         new_ema_loss_full = torch.cat([self.ema_loss, new_ema_loss], dim=0)
         new_select_counts_full = torch.cat([self.select_counts, torch.zeros(k, dtype=torch.long)], dim=0)
+        new_birth_step_full = torch.cat(
+            [self.birth_step, torch.full((k,), int(birth_step), dtype=torch.long)], dim=0)
+        new_birth_loss_full = torch.cat([self.birth_loss, new_ema_loss.clone()], dim=0)
 
         new_nan = torch.full((k,), float("nan"), dtype=torch.float32)
         new_ema_logw_full = torch.cat([self.ema_logw, new_nan], dim=0)
@@ -632,6 +651,8 @@ class CrystalBuffer:
             self.traj = new_traj_full
         self.ema_loss = new_ema_loss_full
         self.select_counts = new_select_counts_full
+        self.birth_step = new_birth_step_full
+        self.birth_loss = new_birth_loss_full
         self.ema_logw = new_ema_logw_full
         self.ema_logw_sq = new_ema_logw_sq_full
         self.ema_log_z_emp = new_ema_log_z_emp_full
@@ -681,6 +702,8 @@ class CrystalBuffer:
         keep_cpu = torch.as_tensor(keep_idx, dtype=torch.long)
         new_ema_loss = self.ema_loss[keep_cpu]
         new_select_counts = self.select_counts[keep_cpu]
+        new_birth_step = self.birth_step[keep_cpu]
+        new_birth_loss = self.birth_loss[keep_cpu]
         new_ema_logw = self.ema_logw[keep_cpu]
         new_ema_logw_sq = self.ema_logw_sq[keep_cpu]
         new_ema_log_z_emp = self.ema_log_z_emp[keep_cpu]
@@ -693,6 +716,8 @@ class CrystalBuffer:
             self.traj = new_traj
         self.ema_loss = new_ema_loss
         self.select_counts = new_select_counts
+        self.birth_step = new_birth_step
+        self.birth_loss = new_birth_loss
         self.ema_logw = new_ema_logw
         self.ema_logw_sq = new_ema_logw_sq
         self.ema_log_z_emp = new_ema_log_z_emp
@@ -869,6 +894,16 @@ class CrystalBuffer:
         return p
 
 
+def _upper_tail(quantile: float) -> float:
+    """conditional_worst_quantile -> the torch.quantile position for a
+    'larger is worse' metric. The config value is the FRACTION OF CONDITIONS
+    ALLOWED BEYOND THE BAR (0.5 = median, 0.05 = 95% must clear), so every
+    worst-case reducer here converts it the same way and callers pass the raw
+    config value. Clamped, since a quantile outside [0, 1] is a hard error in
+    torch and a silent nonsense bar here."""
+    return min(max(1.0 - float(quantile), 0.0), 1.0)
+
+
 class ConditionLogZTracker:
     """
     Persistent per-condition EMA of the empirical log Z, decoupled from any
@@ -900,23 +935,28 @@ class ConditionLogZTracker:
     update() call can fold together anywhere from 1 to hundreds of samples
     for the same condition_id (depending on how that condition happened to
     get sampled this step). A fixed weight would let a 1-sample step swing
-    the estimate exactly as much as a 500-sample step. Instead, `half_life_steps`
-    decays a per-condition `effective_count` (a time-discounted running
-    sample size, keyed off elapsed training steps -- see update()'s
+    the estimate exactly as much as a 500-sample step. Instead, `half_life_visits`
+    decays a per-condition `effective_count` (a discounted running sample
+    size, keyed off that condition's own visit count -- see update()'s
     docstring for why), and each step's actual mixing weight is its share of
     (decayed old effective_count + this step's evidence) -- see update()'s
     docstring.
     """
 
-    def __init__(self, library_size: int, min_visits: int = 20, half_life_steps: float = 7.0,
+    def __init__(self, library_size: int, min_visits: int = 20, half_life_visits: float = 7.0,
                  trim_frac: float = 0.1, max_batch_weight: float = 200.0,
-                 discovery_half_life_steps: float = 200.0):
+                 discovery_half_life_steps: float = 200.0, clip_beta: float = 10.0):
         self.library_size = library_size
         self.min_visits = min_visits
-        self.half_life_steps = half_life_steps
+        self.half_life_visits = half_life_visits
         self.trim_frac = trim_frac
         self.max_batch_weight = max_batch_weight
         self.discovery_half_life_steps = discovery_half_life_steps
+        # FIXED reference Huber beta for the z_grad stream. Taken once from the
+        # base fwd_loss_coeffs rather than the live stage's beta on purpose: a
+        # per-stage beta would silently rescale the ruler at every transition,
+        # so the same reading would mean different things in different stages.
+        self.clip_beta = float(clip_beta)
         self.ema_logw = torch.full((library_size,), float("nan"), dtype=torch.float32)
         self.ema_logw_sq = torch.full((library_size,), float("nan"), dtype=torch.float32)
         self.ema_log_z_emp = torch.full((library_size,), float("nan"), dtype=torch.float32)
@@ -927,17 +967,26 @@ class ConditionLogZTracker:
         # steps rather than elapsed update() calls.
         self.last_update_step = torch.full((library_size,), -1, dtype=torch.long)
         self.best_energy = torch.full((library_size,), float("inf"), dtype=torch.float32)
-        # per-condition EMA of |logw - log_Z_learned| -- how far the network's
-        # OWN Z prediction currently is from the fresh, per-sample importance
-        # weight, live (not smoothed through ema_logw). See update_z_residual/
-        # rms_z_lag.
-        self.z_resid_ema = torch.full((library_size,), float("nan"), dtype=torch.float32)
-        # SIGNED batch-mean residual EMA, sharing z_resid's evidence/decay state:
-        # the location/calibration component of the z error, decoupled from
-        # spread -- see update_z_residual/rms_z_bias
+        # per-condition EMA of the CLIPPED signed residual mean(clamp(logw -
+        # log_Z_learned, +-clip_beta)) -- the per-condition dL/dZ ruler, the
+        # persistent analog of quick_tb_stats' pooled 'tb_resid_clipped'. Clip,
+        # group-mean, THEN abs at read time (worst_z_grad), so within-condition
+        # spread averages out and this is purely the LEVEL error Z training can
+        # fix. Bounded by clip_beta, so one degenerate off-policy log_pf cannot
+        # inflate it. See update_z_residual/rms_z_grad.
+        self.z_grad_ema = torch.full((library_size,), float("nan"), dtype=torch.float32)
+        # UNCLIPPED signed batch-mean residual EMA, sharing z_grad's
+        # evidence/decay state. Kept separate from z_grad_ema because the exact
+        # decomposition E[r^2] = mean(r)^2 + Var(log w) behind tb_err/
+        # lookup_fit_error needs the true (unwinsorized) level term -- see
+        # update_z_residual/rms_z_bias/cond_tb_err
         self.z_bias_ema = torch.full((library_size,), float("nan"), dtype=torch.float32)
         self.z_resid_effective_count = torch.zeros((library_size,), dtype=torch.float32)
         self.z_resid_last_step = torch.full((library_size,), -1, dtype=torch.long)
+        # monotonic (NEVER decayed) count of update_z_residual calls per
+        # condition -- the trust mask for rms_tb_err/rms_z_grad/rms_z_bias,
+        # same role and reasoning as fwd_level_visits/bwd_level_visits below.
+        self.z_resid_visits = torch.zeros((library_size,), dtype=torch.long)
         # per-mode level EMAs (the z_match delta gate): per-condition mean log w
         # kept as two SEPARATE streams -- 'bwd' (backward rollouts from the local
         # buffer: the buffer-implied level J_B) and 'fwd' (on-policy forward
@@ -953,6 +1002,20 @@ class ConditionLogZTracker:
         self.bwd_level_effective_count = torch.zeros((library_size,), dtype=torch.float32)
         self.fwd_level_last_step = torch.full((library_size,), -1, dtype=torch.long)
         self.bwd_level_last_step = torch.full((library_size,), -1, dtype=torch.long)
+        # monotonic per-stream visit counts (NEVER decayed): how many
+        # update_mode_level calls a condition has ever received on each stream.
+        # The delta gate's TRUST mask reads these, NOT the decayed
+        # *_level_effective_count above -- kept as a separate signal from the
+        # EMA's own smoothing weight on purpose (see z_resid_visits below for
+        # why "have I visited this enough to trust it" and "how should new
+        # evidence be weighted" are different questions even though effective_count
+        # decay is now keyed to own-visits too and no longer collapses on a large,
+        # sparsely-revisited library -- cw02, library 10000, is what motivated
+        # splitting them). Freshness (step - *_level_last_step) is still
+        # recorded above for an optional staleness filter but is deliberately
+        # not gated on.
+        self.fwd_level_visits = torch.zeros((library_size,), dtype=torch.long)
+        self.bwd_level_visits = torch.zeros((library_size,), dtype=torch.long)
         # discovery-rate telemetry over best_energy: update_best_energy()
         # accumulates strict per-condition minimum improvements (count/depth)
         # and first visits into the _window_* scalars; pop_discovery_stats()
@@ -973,39 +1036,48 @@ class ConditionLogZTracker:
     @torch.no_grad()
     def update(self, condition_id, logw, step: int,
                trim_frac: Optional[float] = None, max_batch_weight: Optional[float] = None,
-               half_life_steps: Optional[float] = None):
+               half_life_visits: Optional[float] = None):
         """
         Effective-sample-size-weighted EMA update. `step` is the caller's
-        current global training step (self.step_ind); it drives the decay
+        current global training step (self.step_ind); it is recorded into
+        `last_update_step` for freshness telemetry only. It drives the decay
         of a per-condition `effective_count`:
 
-            decay             = 0.5 ** (1 / half_life_steps)
-            delta_t           = step - last_update_step[condition]   (>= 0)
-            decayed_eff_count = old_eff_count * decay ** delta_t
+            decay             = 0.5 ** (1 / half_life_visits)
+            decayed_eff_count = old_eff_count * decay
             new_eff_count     = decayed_eff_count + evidence_count
             w_new             = evidence_count / new_eff_count
 
-        Decay is keyed off elapsed *training steps* since that condition's
-        own last visit, not elapsed *update() calls*. The two are not the
-        same thing: call() cadence is wildly uneven across conditions (a
-        library of hundreds of conditions might see any given one only once
-        every dozens of steps, and phase/loss-coefficient gating means not
-        every train step even calls update() for every mode), so decaying
-        by a flat factor "per call" gives old evidence a forgetting rate
-        that implicitly depends on how often the condition happened to be
-        revisited -- not a stable, portable notion of "how stale is this."
-        Decaying by elapsed steps instead gives half_life_steps a fixed,
-        literal meaning (the number of *training steps* for old evidence's
-        weight to halve) that doesn't need retuning as visit frequency
-        varies across conditions or across differently-sized condition
-        libraries/configs.
+        Decay is applied exactly once per update() call for a condition --
+        keyed to that condition's own visit count, not elapsed training
+        steps. This used to be step-keyed (a fixed decay per elapsed
+        training step since the condition's own last visit), on the theory
+        that "how stale is old evidence" should track how much the policy
+        has moved rather than how often any given condition gets sampled.
+        That reasoning holds for a small/dense condition library where
+        revisits are frequent relative to the half-life, but breaks down at
+        the scale this tracker actually runs at: with thousands of
+        conditions, a condition's revisit interval is routinely hundreds of
+        steps, so a 7-step half-life decayed old evidence to ~0 on every
+        single revisit -- not smoothing, just silently replacing the
+        estimate with the latest batch's raw value every time, and starving
+        every downstream min-visits gate reading effective_count in the
+        process (the cw02 / library-10000 failure that motivated the
+        separate monotonic *_visits trust counters elsewhere in this class).
+        Keying decay to own-visit count instead makes half_life_visits mean
+        the same thing (a memory window of a few visits) regardless of how
+        sparsely or densely a condition happens to get revisited or how
+        large the library is -- at the cost of no longer discounting
+        evidence for wall-clock policy drift between visits; last_update_step
+        is still recorded for anyone who wants that as a separate staleness
+        filter, but nothing here gates on it.
 
         w_new is this step's actual mixing weight into the running
         estimate -- it's 1.0 on a condition's first-ever visit (old_eff_count
         == 0, so the running estimate is just set to this step's value) and
         shrinks as old_eff_count grows relative to evidence_count, so a step
         with many samples for a condition properly outweighs a step with
-        few, instead of both getting the same fixed decay. half_life_steps
+        few, instead of both getting the same fixed decay. half_life_visits
         still controls the forgetting rate of old evidence (effective_count
         itself decays with elapsed time), it just no longer doubles as the
         per-call weight.
@@ -1057,8 +1129,8 @@ class ConditionLogZTracker:
         """
         trim_frac = self.trim_frac if trim_frac is None else trim_frac
         max_batch_weight = self.max_batch_weight if max_batch_weight is None else max_batch_weight
-        half_life_steps = self.half_life_steps if half_life_steps is None else half_life_steps
-        decay_per_step = 0.5 ** (1.0 / half_life_steps)
+        half_life_visits = self.half_life_visits if half_life_visits is None else half_life_visits
+        decay_per_visit = 0.5 ** (1.0 / half_life_visits)
         condition_id = torch.as_tensor(condition_id, dtype=torch.long).detach().cpu().flatten()
         logw = torch.as_tensor(logw, dtype=torch.float32).detach().cpu().flatten()
 
@@ -1125,17 +1197,14 @@ class ConditionLogZTracker:
         old_sq = self.ema_logw_sq[unique_ids]
         old_log_z = self.ema_log_z_emp[unique_ids]
         old_eff_count = self.effective_count[unique_ids]
-        old_last_step = self.last_update_step[unique_ids]
 
         nan_mask = torch.isnan(old_mean)
 
-        # delta_t clamped to >= 0 as a defensive guard (step should be
-        # monotonically non-decreasing across calls); for a condition's
-        # first-ever visit old_last_step is the -1 sentinel, so delta_t is
-        # large and decayed_eff_count underflows toward 0 harmlessly -- that
-        # path is bypassed by nan_mask below regardless.
-        delta_t = torch.clamp((step - old_last_step).float(), min=0.0)
-        decayed_eff_count = old_eff_count * decay_per_step ** delta_t
+        # one decay step per own visit, regardless of elapsed training steps
+        # since the last one -- see docstring. old_eff_count is 0 on a
+        # condition's first-ever visit, so decayed_eff_count is trivially 0
+        # there too (nan_mask handles that path regardless).
+        decayed_eff_count = old_eff_count * decay_per_visit
 
         # evidence_count > 0 for every id in unique_ids (they only appear here
         # because they were observed this step, and ESS >= 1 for any nonempty
@@ -1164,30 +1233,32 @@ class ConditionLogZTracker:
 
     @torch.no_grad()
     def update_z_residual(self, condition_id, logw, log_Z_learned, step: int,
-                          half_life_steps: Optional[float] = None):
+                          half_life_visits: Optional[float] = None):
         """
-        Per-condition EMA of |logw - log_Z_learned|: how far the network's
-        own Z prediction currently is for this condition, measured directly
-        against this call's fresh per-sample logw -- not against ema_logw,
-        which is itself smoothed and therefore a step removed from "right
-        now". This is what rms_z_lag() reduces over the library to give the
-        controller a richer, per-condition-aware miscalibration signal than
-        a single global batch-mean (quick_tb_stats' jensen_z_err) can: a
-        mean lets a majority of well-calibrated conditions dilute away a
-        badly-miscalibrated minority, which is exactly the failure mode this
-        whole tracker exists to guard against elsewhere (see update()'s
-        trim_frac docstring) -- no reason the detection signal should be
-        vulnerable to the same thing the estimator itself was hardened
-        against.
+        Per-condition EMAs of the TB residual logw - log_Z_learned: how far
+        the network's own Z prediction currently is for this condition,
+        measured directly against this call's fresh per-sample logw -- not
+        against ema_logw, which is itself smoothed and therefore a step
+        removed from "right now". These are what rms_z_grad()/worst_z_grad()
+        reduce over the library to give the controller a per-condition-aware
+        miscalibration signal that a single global batch-mean
+        (quick_tb_stats' jensen_z_err) cannot: a mean lets a majority of
+        well-calibrated conditions dilute away a badly-miscalibrated
+        minority, which is exactly the failure mode this whole tracker exists
+        to guard against elsewhere (see update()'s trim_frac docstring) -- no
+        reason the detection signal should be vulnerable to the same thing
+        the estimator itself was hardened against.
 
-        Same time-based decay and evidence-capping as update() (elapsed
-        training steps since this condition's own last z-residual update,
-        capped effective evidence per call), for the same reasons -- kept
-        as separate state (z_resid_*) so this monitoring signal's own decay
-        dynamics can't interact with the primary logw/log_z_emp EMA math.
+        Same own-visit decay and evidence-capping as update() (see its
+        docstring), for the same reasons -- kept as separate state
+        (z_resid_*) so this monitoring signal's own decay dynamics can't
+        interact with the primary logw/log_z_emp EMA math. z_resid_visits is
+        the monotonic (never-decayed) counterpart that rms_tb_err/rms_z_grad/
+        rms_z_bias trust-gate on, same split as effective_count vs. *_visits
+        elsewhere in this class.
         """
-        half_life_steps = self.half_life_steps if half_life_steps is None else half_life_steps
-        decay_per_step = 0.5 ** (1.0 / half_life_steps)
+        half_life_visits = self.half_life_visits if half_life_visits is None else half_life_visits
+        decay_per_visit = 0.5 ** (1.0 / half_life_visits)
 
         condition_id = torch.as_tensor(condition_id, dtype=torch.long).detach().cpu().flatten()
         logw = torch.as_tensor(logw, dtype=torch.float32).detach().cpu().flatten()
@@ -1196,39 +1267,39 @@ class ConditionLogZTracker:
         if condition_id.numel() == 0:
             return
 
-        # two views of the same residual stream, EMA'd side by side with shared
-        # evidence/decay state: the ABS mean (z_resid_ema, behind rms_z_lag) is
-        # floored at the per-condition MAD of log w no matter how well Z is
-        # placed -- a spread metric. The SIGNED batch mean (z_bias_ema, behind
-        # rms_z_bias) averages the spread away BEFORE the abs, so it goes to ~0
-        # exactly when Z(c) sits on the stream's mean(log w) -- the pure
-        # location/calibration component. zerr >> z_bias means the 'error' is
-        # spread (only policy work shrinks it); z_bias large means Z genuinely
-        # lags (Z training shrinks it). The two together disambiguate what a
-        # high zerr alone cannot.
+        # two LEVEL views of the same residual stream, EMA'd side by side with
+        # shared evidence/decay state. Both take the group mean BEFORE any abs,
+        # so within-condition spread averages out of each and neither is floored
+        # at the condition's MAD of log w the way an abs-then-mean (E|r|) stream
+        # is -- spread is carried separately by ema_logw_sq, and mixing the two
+        # into one number is what made the old MAE stream impossible to act on.
+        #   z_grad_ema  CLIPPED (+-clip_beta): the dL/dZ ruler. Bounded, so a fat
+        #               tail can't inflate it and a lagging Z shows as sign.
+        #   z_bias_ema  UNCLIPPED: the true level term, so that
+        #               z_bias^2 + Var(log w) is EXACTLY the mean squared
+        #               residual (cond_tb_err / lookup_fit_error). Winsorizing
+        #               here would break that identity.
+        # tb_err >> |z_bias| means the error is spread (only policy work shrinks
+        # it); |z_bias| large means Z genuinely lags (Z training shrinks it).
         resid_signed = logw - log_Z_learned
-        residual = resid_signed.abs()
+        resid_clipped = resid_signed.clamp(-self.clip_beta, self.clip_beta)
 
         unique_ids, inverse = torch.unique(condition_id, return_inverse=True)
         k = unique_ids.shape[0]
         counts_this_step = torch.zeros(k, dtype=torch.float32).scatter_add_(
-            0, inverse, torch.ones_like(residual))
+            0, inverse, torch.ones_like(resid_signed))
         mean_resid = torch.zeros(k, dtype=torch.float32).scatter_add_(
-            0, inverse, residual) / counts_this_step
+            0, inverse, resid_clipped) / counts_this_step
         mean_bias = torch.zeros(k, dtype=torch.float32).scatter_add_(
             0, inverse, resid_signed) / counts_this_step
 
-        old_mean = self.z_resid_ema[unique_ids]
+        old_mean = self.z_grad_ema[unique_ids]
         old_bias = self.z_bias_ema[unique_ids]
         old_eff_count = self.z_resid_effective_count[unique_ids]
-        old_last_step = self.z_resid_last_step[unique_ids]
         nan_mask = torch.isnan(old_mean)
-        # separate NaN mask: checkpoints predating z_bias_ema restore it as NaN
-        # while z_resid_ema is warm, so the two can disagree after a reload
         bias_nan_mask = torch.isnan(old_bias)
 
-        delta_t = torch.clamp((step - old_last_step).float(), min=0.0)
-        decayed_eff_count = old_eff_count * decay_per_step ** delta_t
+        decayed_eff_count = old_eff_count * decay_per_visit
         evidence_count = torch.clamp(counts_this_step, max=self.max_batch_weight)
         new_eff_count = decayed_eff_count + evidence_count
         w_new = evidence_count / new_eff_count
@@ -1236,10 +1307,11 @@ class ConditionLogZTracker:
         new_mean = torch.where(nan_mask, mean_resid, (1.0 - w_new) * old_mean + w_new * mean_resid)
         new_bias = torch.where(bias_nan_mask, mean_bias, (1.0 - w_new) * old_bias + w_new * mean_bias)
 
-        self.z_resid_ema[unique_ids] = new_mean
+        self.z_grad_ema[unique_ids] = new_mean
         self.z_bias_ema[unique_ids] = new_bias
         self.z_resid_effective_count[unique_ids] = new_eff_count
         self.z_resid_last_step[unique_ids] = int(step)
+        self.z_resid_visits[unique_ids] += 1
 
     def _group_trimmed_mean(self, inverse, values, k, trim_frac: Optional[float] = None):
         """
@@ -1272,30 +1344,33 @@ class ConditionLogZTracker:
 
     @torch.no_grad()
     def update_mode_level(self, mode: str, condition_id, logw, step: int,
-                          half_life_steps: Optional[float] = None):
+                          half_life_visits: Optional[float] = None):
         """
         Feed one mode's per-condition level stream (fwd_level_ema /
-        bwd_level_ema, see __init__): a time-decayed, evidence-capped EMA of
-        the per-condition trimmed mean of log w, same decay convention as
-        update()/update_z_residual() (elapsed training steps since this
-        condition's own last visit on THIS stream). Trimming for the same
-        reason as update()'s ema_logw: the delta gate reads levels, and one
-        catastrophic-energy outlier in a batch mean would otherwise swing a
-        whole condition's level reading for a half-life.
+        bwd_level_ema, see __init__): an own-visit-decayed, evidence-capped
+        EMA of the per-condition trimmed mean of log w, same decay
+        convention as update()/update_z_residual() (decayed once per own
+        visit on THIS stream, not by elapsed training steps -- see update()'s
+        docstring). Trimming for the same reason as update()'s ema_logw: the
+        delta gate reads levels, and one catastrophic-energy outlier in a
+        batch mean would otherwise swing a whole condition's level reading
+        for a half-life.
         """
         if mode == 'fwd':
             level_ema = self.fwd_level_ema
             eff_count = self.fwd_level_effective_count
             last_step_t = self.fwd_level_last_step
+            visits = self.fwd_level_visits
         elif mode == 'bwd':
             level_ema = self.bwd_level_ema
             eff_count = self.bwd_level_effective_count
             last_step_t = self.bwd_level_last_step
+            visits = self.bwd_level_visits
         else:
             raise ValueError(f"unknown mode-level stream '{mode}' (expected 'fwd' or 'bwd')")
 
-        half_life_steps = self.half_life_steps if half_life_steps is None else half_life_steps
-        decay_per_step = 0.5 ** (1.0 / half_life_steps)
+        half_life_visits = self.half_life_visits if half_life_visits is None else half_life_visits
+        decay_per_visit = 0.5 ** (1.0 / half_life_visits)
         condition_id = torch.as_tensor(condition_id, dtype=torch.long).detach().cpu().flatten()
         logw = torch.as_tensor(logw, dtype=torch.float32).detach().cpu().flatten()
 
@@ -1311,11 +1386,9 @@ class ConditionLogZTracker:
 
         old_mean = level_ema[unique_ids]
         old_eff_count = eff_count[unique_ids]
-        old_last_step = last_step_t[unique_ids]
         nan_mask = torch.isnan(old_mean)
 
-        delta_t = torch.clamp((step - old_last_step).float(), min=0.0)
-        decayed_eff_count = old_eff_count * decay_per_step ** delta_t
+        decayed_eff_count = old_eff_count * decay_per_visit
         evidence_count = torch.clamp(counts, max=self.max_batch_weight)
         new_eff_count = decayed_eff_count + evidence_count
         w_new = evidence_count / new_eff_count
@@ -1324,35 +1397,49 @@ class ConditionLogZTracker:
             nan_mask, mean_logw, (1.0 - w_new) * old_mean + w_new * mean_logw)
         eff_count[unique_ids] = new_eff_count
         last_step_t[unique_ids] = int(step)
+        visits[unique_ids] += 1   # monotonic: one increment per step this condition appears on this stream
 
     @torch.no_grad()
-    def delta_stats(self, min_effective_count: Optional[float] = None):
+    def delta_stats(self, quantile: float = 0.0, min_visits: Optional[float] = None,
+                    min_trusted_frac: float = 0.5):
         """
         The z_match level-matching gap: per-condition
         delta(c) = bwd_level_ema - fwd_level_ema (buffer-implied minus
         on-policy level; equals minus the mean backward TB residual at
-        Z-stationarity), reduced over conditions where BOTH streams carry
-        enough decayed evidence. 'worst' is max |delta(c)| -- +inf when no
-        condition qualifies, same never-pass-on-ignorance convention as
-        rms_logw_std (the exit gate fires on SMALL values). 'mean' is the
-        trusted mean of |delta(c)|, 'n' the trusted-condition count.
+        Z-stationarity), reduced over conditions CHARACTERIZED on BOTH streams
+        -- monotonic visit count >= min_visits, NOT the decayed
+        effective_count (which is unreachable for a large library and pinned
+        'worst' to +inf; see fwd_level_visits in __init__).
+
+        'worst' is the (1 - `quantile`) UPPER-tail quantile of |delta(c)|, so
+        `quantile` carries the same meaning it has on tb_err_worst
+        (conditional_worst_quantile): the fraction of worst-case conditions
+        allowed to sit beyond the bar. Both read the high tail, since for the
+        gap as for the residual, larger is worse. quantile=0.0
+        recovers the strict max (old behaviour). +inf on the same
+        never-pass-on-ignorance convention as rms_logw_std (the exit gate fires
+        on SMALL values), held until at least `min_trusted_frac` of the library
+        is characterized on both streams, so a fresh/resumed run cannot exit
+        z_match before the level EMAs have saturated. 'mean' is the trusted mean
+        of |delta(c)|, 'n' the trusted-condition count.
         """
-        min_effective_count = self.min_visits if min_effective_count is None else min_effective_count
+        min_visits = self.min_visits if min_visits is None else min_visits
         mask = (~torch.isnan(self.fwd_level_ema)) & (~torch.isnan(self.bwd_level_ema)) \
-               & (self.fwd_level_effective_count >= min_effective_count) \
-               & (self.bwd_level_effective_count >= min_effective_count)
-        if not mask.any():
-            return {'worst': float('inf'), 'mean': float('inf'), 'n': 0}
+               & (self.fwd_level_visits >= min_visits) \
+               & (self.bwd_level_visits >= min_visits)
+        n = int(mask.sum().item())
+        if n == 0 or n < min_trusted_frac * self.library_size:
+            return {'worst': float('inf'), 'mean': float('inf'), 'n': n}
         gap = (self.bwd_level_ema[mask] - self.fwd_level_ema[mask]).abs()
-        return {'worst': gap.max().item(), 'mean': gap.mean().item(),
-                'n': int(mask.sum().item())}
+        worst = torch.quantile(gap, _upper_tail(quantile)).item()
+        return {'worst': worst, 'mean': gap.mean().item(), 'n': n}
 
     @torch.no_grad()
     def pooled_levels(self, min_effective_count: Optional[float] = None):
         """
         Dashboard companions to delta_stats(): the trusted-masked mean of each
         per-mode level stream, so the two sides of the level-matching gap are
-        visible on the SAME fast clock (half_life_steps) the delta gate reads.
+        visible on the SAME monotonic-visits trust mask the delta gate reads.
         The logged bwd/jensen_z / fwd/jensen_z pair are metric_tracker EMAs
         with a much longer horizon -- during an 80-step z_match walkdown they
         lag the true levels by nats (fxr4h4zy: apparent 4-nat gap at exit vs
@@ -1361,50 +1448,129 @@ class ConditionLogZTracker:
         """
         min_effective_count = self.min_visits if min_effective_count is None else min_effective_count
         out = {}
-        for name, ema, eff in (('fwd', self.fwd_level_ema, self.fwd_level_effective_count),
-                               ('bwd', self.bwd_level_ema, self.bwd_level_effective_count)):
-            mask = (~torch.isnan(ema)) & (eff >= min_effective_count)
+        for name, ema, visits in (('fwd', self.fwd_level_ema, self.fwd_level_visits),
+                                   ('bwd', self.bwd_level_ema, self.bwd_level_visits)):
+            mask = (~torch.isnan(ema)) & (visits >= min_effective_count)
             out[name] = ema[mask].mean().item() if mask.any() else float('nan')
         return out
 
+    @property
+    def cond_tb_err(self):
+        """Per-condition RMS TB residual, in NATS: sqrt(z_bias_ema^2 +
+        Var(log w)). The residual decomposes EXACTLY into a LEVEL term
+        (z_bias_ema, the signed mean) and a SPREAD term (within-condition
+        Var(log w)), and the mean square is their sum -- so this is the whole
+        quality of fit, and subtracting the level part recovers what only
+        policy training can fix. The persistent (cross-visit) analog of
+        quick_tb_stats' per-batch cond_tb_err. NaN where a condition has
+        neither component yet."""
+        return (self.z_bias_ema ** 2 + self.logw_var).sqrt()
+
     @torch.no_grad()
-    def rms_z_lag(self, min_effective_count: Optional[float] = None):
+    def rms_tb_err(self, min_visits: Optional[float] = None):
         """
-        RMS of z_resid_ema over conditions with enough evidence to trust
-        (effective count >= min_effective_count, defaulting to min_visits).
-        RMS rather than mean deliberately: it doesn't let a majority of
-        well-calibrated conditions dilute away a badly-miscalibrated
-        minority the way an arithmetic mean would (see update_z_residual's
+        RMS of cond_tb_err over conditions with enough evidence to trust
+        (monotonic z_resid_visits >= min_visits, NOT the decayed
+        z_resid_effective_count -- same reasoning as worst_tb_err/delta_stats:
+        gating on the decayed count risks starving this on a large, sparsely
+        revisited library). RMS rather than mean deliberately: it doesn't let
+        a majority of well-fit conditions dilute away a badly-fit minority
+        the way an arithmetic mean would (see update_z_residual's
         docstring). Returns 0.0 (not NaN) when no condition currently has
         enough evidence, so this is always safe to compare directly against
         a threshold.
         """
-        min_effective_count = self.min_visits if min_effective_count is None else min_effective_count
-        mask = (~torch.isnan(self.z_resid_ema)) & (self.z_resid_effective_count >= min_effective_count)
+        min_visits = self.min_visits if min_visits is None else min_visits
+        err = self.cond_tb_err
+        mask = (~torch.isnan(err)) & (self.z_resid_visits >= min_visits)
         if not mask.any():
             return 0.0
-        return torch.sqrt((self.z_resid_ema[mask] ** 2).mean()).item()
+        return torch.sqrt((err[mask] ** 2).mean()).item()
 
     @torch.no_grad()
-    def rms_z_bias(self, min_effective_count: Optional[float] = None):
+    def rms_z_grad(self, min_visits: Optional[float] = None):
         """
-        RMS over trusted conditions of the SIGNED z-residual EMA (z_bias_ema)
-        -- the location/calibration component of the z error, decoupled from
-        spread. rms_z_lag EMAs |logw - Z| per sample, which is floored at the
-        per-condition MAD of log w no matter how well Z is placed (a spread
-        metric wearing a calibration metric's name); the signed batch mean
-        averages the spread away BEFORE any abs, so this goes to ~0 exactly
-        when Z(c) sits on the stream's mean(log w). Read the pair together:
-        zerr >> z_bias means the 'error' is spread (only policy work shrinks
-        it); z_bias large means Z genuinely lags (Z training shrinks it).
-        Same trust mask/state as rms_z_lag; returns 0.0 when nothing is
-        trusted (same fire-on-large semantics as rms_z_lag).
+        RMS over trusted conditions of the CLIPPED signed residual EMA
+        (z_grad_ema) -- the per-condition dL/dZ ruler, level-only. Read the
+        pair together: rms_tb_err >> rms_z_grad means the error is spread
+        (only policy work shrinks it); a large rms_z_grad means Z genuinely
+        lags (Z training shrinks it). Same trust mask/state as rms_tb_err;
+        returns 0.0 when nothing is trusted (same fire-on-large semantics).
         """
-        min_effective_count = self.min_visits if min_effective_count is None else min_effective_count
-        mask = (~torch.isnan(self.z_bias_ema)) & (self.z_resid_effective_count >= min_effective_count)
+        min_visits = self.min_visits if min_visits is None else min_visits
+        mask = (~torch.isnan(self.z_grad_ema)) & (self.z_resid_visits >= min_visits)
+        if not mask.any():
+            return 0.0
+        return torch.sqrt((self.z_grad_ema[mask] ** 2).mean()).item()
+
+    @torch.no_grad()
+    def rms_z_bias(self, min_visits: Optional[float] = None):
+        """RMS over trusted conditions of the UNCLIPPED signed residual EMA --
+        rms_z_grad without the Winsorization, so it still moves once a condition
+        is further off than clip_beta. Diagnostic companion to the ruler, never
+        a control variable (unbounded: one degenerate off-policy log_pf can
+        dominate it, which is exactly what clipping the ruler protects against).
+        Same trust mask/state and 0.0-when-cold convention as rms_z_grad."""
+        min_visits = self.min_visits if min_visits is None else min_visits
+        mask = (~torch.isnan(self.z_bias_ema)) & (self.z_resid_visits >= min_visits)
         if not mask.any():
             return 0.0
         return torch.sqrt((self.z_bias_ema[mask] ** 2).mean()).item()
+
+    @torch.no_grad()
+    def worst_tb_err(self, quantile: float = 0.5):
+        """
+        Worst-case CONDITION quality of fit: the upper-tail quantile of
+        cond_tb_err (RMS TB residual in NATS) across all EVER-VISITED
+        conditions.
+
+        `quantile` is the fraction of conditions allowed to sit beyond the bar
+        (0.5 = median condition, 0.05 = 95% must clear), i.e. the same
+        conditional_worst_quantile the config documents and delta_stats takes;
+        the (1 - quantile) upper-tail conversion happens HERE. Passing the
+        already-converted value would silently read the BEST condition for any
+        q < 0.5 -- which is what the predecessor of this method did, harmless
+        only because the config happened to sit at the self-inverse 0.5.
+
+        The persistent analog of quick_tb_stats' per-batch 'tb_err_worst', and
+        the EMA-safe replacement for the retired fwd/r2_worst:
+          * r2 is a RATIO (1 - ss_resid/ss_total); a ratio does not EMA
+            (E[A/B] != E[A]/E[B]) and its denominator (within-condition
+            Var(log_pf)) collapses for tight conditions, so the per-batch value
+            was unbounded-below noise no smoothing could recover. Every term
+            here is a per-sample mean already accumulated across visits, so it
+            EMAs exactly.
+          * It is in nats, so a bar means something physical and transfers
+            across problems -- unlike a bounded saturating ratio.
+
+        Masked on the MONOTONIC count (>= 1), NOT effective_count: even
+        though effective_count now decays per own-visit rather than per
+        elapsed step (so it no longer collapses to 0 between revisits on a
+        large library -- the cw02 / delta-gate failure this mask split was
+        originally built to route around), the monotonic count remains the
+        simpler and more direct "has this condition ever been characterized"
+        question, decoupled from the EMA's own smoothing weight. Returns 0.0
+        when nothing has
+        ever been visited, matching the fire-on-large convention above.
+        """
+        err = self.cond_tb_err
+        mask = (~torch.isnan(err)) & (self.count >= 1)
+        if not mask.any():
+            return 0.0
+        return torch.quantile(err[mask], _upper_tail(quantile)).item()
+
+    @torch.no_grad()
+    def worst_z_grad(self, quantile: float = 0.5):
+        """Upper-tail quantile of |z_grad_ema| (clipped signed mean residual,
+        level-only) -- the per-condition dL/dZ ruler, in nats. Use as the Z-only
+        gate in z_match/terminal where the frozen policy can move level but not
+        spread (see the weighted_condition_sampling rationale). Same `quantile`
+        convention, monotonic-count mask and no-freshness-gate as
+        worst_tb_err."""
+        mask = (~torch.isnan(self.z_grad_ema)) & (self.count >= 1)
+        if not mask.any():
+            return 0.0
+        return torch.quantile(self.z_grad_ema[mask].abs(), _upper_tail(quantile)).item()
 
     @torch.no_grad()
     def rms_logw_std(self, min_visits: Optional[int] = None):
@@ -1416,18 +1582,23 @@ class ConditionLogZTracker:
         enough for Z learning to get traction', measured as tightness of the
         per-condition log-importance-weight distribution -- NOT distance to
         the true target. RMS over conditions for the same anti-dilution
-        reason as rms_z_lag. Mildly underestimates tails (both moments come
+        reason as rms_tb_err. Mildly underestimates tails (both moments come
         from trim_frac-trimmed group means), fine for a gate.
 
-        Returns +inf (not 0) when no condition has enough evidence: unlike
-        rms_z_lag, whose callers act on LARGE values (so an ignorant 0 is
-        the safe default), this gates a phase transition that fires on SMALL
-        values -- a gate that must wait for proof of tightness should never
-        pass on ignorance.
+        Masks on the MONOTONIC count (>= 1), NOT a min_visits freshness threshold:
+        the EMA already discounts stale evidence via its own decay, so on a large
+        library a condition with a wide revisit interval still carries a usable
+        running moment and must not be gated out for "not enough recent visits" --
+        that freshness gate is what emptied the mask on big libraries (cw02). A
+        condition seen once has weak but real evidence, ranked accordingly.
+
+        Returns +inf only on a genuine cold start (NOTHING ever visited): callers
+        act on SMALL values (a tightness gate that must not pass on ignorance), and
+        the old logw_std_rms_ceiling configs still depend on that default. The
+        min_visits arg is retained for signature compatibility but no longer gates.
         """
-        min_visits = self.min_visits if min_visits is None else min_visits
         var = self.ema_logw_sq - self.ema_logw ** 2
-        mask = (~torch.isnan(var)) & (self.count >= min_visits)
+        mask = (~torch.isnan(var)) & (self.count >= 1)
         if not mask.any():
             return float('inf')
         return torch.sqrt(var[mask].clamp(min=0.0).mean()).item()
@@ -1485,22 +1656,52 @@ class ConditionLogZTracker:
         """Per-condition rolling gap ema_log_z_emp - ema_logw (>= 0 by Jensen's inequality)."""
         return self.ema_log_z_emp - self.ema_logw
 
+    @property
+    def logw_var(self):
+        """Per-condition within-condition Var(log w) = E[logw^2] - E[logw]^2.
+        Clamped at 0 -- EMA noise can push the difference slightly negative."""
+        return (self.ema_logw_sq - self.ema_logw ** 2).clamp(min=0.0)
+
     @torch.no_grad()
-    def lookup_z_gap(self, condition_id):
+    def lookup_fit_error(self, condition_id):
         """
-        Returns (gap, mask) where gap is the per-condition Jensen/logmeanexp
-        divergence (z_emp - z_jensen) and mask is True for entries visited at
-        least once. Unlike lookup()'s min_visits gate (which guards a value
-        that gets fed back into training), any single visit already gives an
-        exact-enough gap to prioritize sampling attention toward, so no
-        warm-up threshold is applied here. gap is 0 (not NaN) wherever mask
-        is False, so it's always safe to use directly without a NaN-guard.
+        Returns (err, mask) with err = z_bias_ema^2 + Var(log w): the per-condition
+        MEAN SQUARED TB residual. The residual log_Z_learned - log w decomposes
+        exactly into a LEVEL term (z_bias_ema, the signed mean residual) and a
+        SPREAD term (within-condition Var(log w)), and the mean square is the sum
+        of the two. Both matter and neither alone is "the fit": bias^2 is what a
+        Z-only forward branch can fix, Var(log w) is what the policy can fix.
+
+        This is cond_tb_err SQUARED (the property above), kept unrooted because a
+        sampling weight only needs a monotone priority and the square keeps the
+        two components additive. Uses z_bias_ema, NOT the clipped z_grad_ema: the
+        Winsorized level would break the exact bias^2 + Var identity and would
+        cap the priority of exactly the worst-fit conditions this is meant to
+        steer toward.
+
+        Deliberately NOT normalized into a per-condition r2. That needs the
+        within-condition variance of the target in the denominator, which is noisy
+        at the ~10-20 samples per condition an eval batch affords and degenerate
+        for tight conditions (denominator ~ 0). Callers make it scale-free with a
+        quantile clip instead, which is robust to both.
+
+        Masked on the MONOTONIC count (>= 1), never effective_count: same
+        decoupling as worst_tb_err -- the monotonic count is the simpler,
+        more direct "has this condition ever been characterized" question,
+        independent of the EMA's own smoothing weight. A condition is never
+        declared dead here. err is 0 where mask is False;
+        callers fill those with a neutral value rather than starving them.
         """
         condition_id = torch.as_tensor(condition_id, dtype=torch.long).detach().cpu().flatten()
-        gap = self.z_gap[condition_id]
-        mask = self.count[condition_id] >= 1
-        gap = torch.nan_to_num(gap, nan=0.0)
-        return gap, mask
+        bias = self.z_bias_ema[condition_id]
+        var = self.logw_var[condition_id]
+        err = torch.nan_to_num(bias, nan=0.0) ** 2 + torch.nan_to_num(var, nan=0.0)
+        # z_bias_ema is fed by update_z_residual and ema_logw_sq by update(), which
+        # need not both have run for a given condition -- one live component is
+        # enough to rank on, both missing is not
+        valid = (~torch.isnan(bias)) | (~torch.isnan(var))
+        mask = (self.count[condition_id] >= 1) & valid
+        return err, mask
 
     @torch.no_grad()
     def update_best_energy(self, condition_id, energy):
@@ -1630,9 +1831,10 @@ class ConditionLogZTracker:
         return {
             "library_size": self.library_size,
             "min_visits": self.min_visits,
-            "half_life_steps": self.half_life_steps,
+            "half_life_visits": self.half_life_visits,
             "trim_frac": self.trim_frac,
             "max_batch_weight": self.max_batch_weight,
+            "clip_beta": self.clip_beta,
             "ema_logw": self.ema_logw.cpu(),
             "ema_logw_sq": self.ema_logw_sq.cpu(),
             "ema_log_z_emp": self.ema_log_z_emp.cpu(),
@@ -1640,16 +1842,19 @@ class ConditionLogZTracker:
             "effective_count": self.effective_count.cpu(),
             "last_update_step": self.last_update_step.cpu(),
             "best_energy": self.best_energy.cpu(),
-            "z_resid_ema": self.z_resid_ema.cpu(),
+            "z_grad_ema": self.z_grad_ema.cpu(),
             "z_bias_ema": self.z_bias_ema.cpu(),
             "z_resid_effective_count": self.z_resid_effective_count.cpu(),
             "z_resid_last_step": self.z_resid_last_step.cpu(),
+            "z_resid_visits": self.z_resid_visits.cpu(),
             "fwd_level_ema": self.fwd_level_ema.cpu(),
             "bwd_level_ema": self.bwd_level_ema.cpu(),
             "fwd_level_effective_count": self.fwd_level_effective_count.cpu(),
             "bwd_level_effective_count": self.bwd_level_effective_count.cpu(),
             "fwd_level_last_step": self.fwd_level_last_step.cpu(),
             "bwd_level_last_step": self.bwd_level_last_step.cpu(),
+            "fwd_level_visits": self.fwd_level_visits.cpu(),
+            "bwd_level_visits": self.bwd_level_visits.cpu(),
             "discovery_half_life_steps": self.discovery_half_life_steps,
             "minima_improved_total": self.minima_improved_total,
             "minima_depth_total": self.minima_depth_total,
@@ -1672,14 +1877,19 @@ class ConditionLogZTracker:
         obj = cls.__new__(cls)
         obj.library_size = state["library_size"]
         obj.min_visits = state["min_visits"]
-        # older checkpoints predate half_life_steps and stored a per-call
-        # `beta` instead -- there's no exact conversion (that depends on how
-        # often update() happened to be called, which is exactly what this
-        # change moves away from), so just fall back to the new default
-        # rather than reverse-engineer a number from the old semantics.
-        obj.half_life_steps = state.get("half_life_steps", 7.0)
+        # older checkpoints predate half_life_visits (formerly half_life_steps,
+        # a step-elapsed clock rather than an own-visit one) -- no exact
+        # conversion between the two decay bases, so just fall back to the
+        # default rather than reverse-engineer a number from the old semantics.
+        obj.half_life_visits = state.get("half_life_visits", 7.0)
         obj.trim_frac = state.get("trim_frac", 0.1)
         obj.max_batch_weight = state.get("max_batch_weight", 200.0)
+        # restored from the checkpoint rather than re-read from the live config
+        # on purpose: z_grad_ema below was accumulated under THIS beta, and
+        # swapping the ruler mid-stream would silently rescale an EMA whose
+        # history can't be rescaled with it (same fixed-reference reasoning as
+        # __init__'s "never a stage override")
+        obj.clip_beta = float(state.get("clip_beta", 10.0))
         obj.ema_logw = state["ema_logw"].cpu()
         obj.ema_logw_sq = state["ema_logw_sq"].cpu()
         obj.ema_log_z_emp = state["ema_log_z_emp"].cpu()
@@ -1690,11 +1900,10 @@ class ConditionLogZTracker:
         # after reload treat every already-warmed-up condition as brand new)
         obj.effective_count = state.get(
             "effective_count", obj.count.float()).cpu()
-        # older checkpoints predate last_update_step -- default to current_step
-        # (not the -1 "never visited" sentinel) so the first post-reload
-        # update() call sees delta_t=0 for already-warmed-up conditions,
-        # rather than a huge fabricated gap that would decay effective_count
-        # to ~0 and silently discard everything just restored above.
+        # last_update_step is freshness telemetry only (decay no longer keys
+        # off it) -- default to current_step rather than the -1 "never
+        # visited" sentinel purely so a freshly reloaded run doesn't report
+        # every already-warmed-up condition as infinitely stale.
         obj.last_update_step = state.get(
             "last_update_step",
             torch.full_like(obj.count, int(current_step))).cpu()
@@ -1702,19 +1911,22 @@ class ConditionLogZTracker:
         # only honest fallback; there's no lifetime stat to reconstruct it from
         obj.best_energy = state.get(
             "best_energy", torch.full_like(obj.count, float("inf"), dtype=torch.float32)).cpu()
-        # older checkpoints predate the z-residual monitor entirely -- NaN/0/current_step
-        # (never-updated sentinels) are the only honest fallback, same reasoning as above
-        obj.z_resid_ema = state.get(
-            "z_resid_ema", torch.full_like(obj.count, float("nan"), dtype=torch.float32)).cpu()
-        # older checkpoints predate the signed-bias track -- NaN sentinel; the
-        # bias_nan_mask in update_z_residual warm-starts it from the first
-        # post-reload batch even where z_resid_ema is already warm
+        # NaN/0/current_step (never-updated sentinels) are the only honest
+        # fallback for a stream a checkpoint doesn't carry, same reasoning as above:
+        # update_z_residual's nan masks warm it from the first post-reload batch
+        obj.z_grad_ema = state.get(
+            "z_grad_ema", torch.full_like(obj.count, float("nan"), dtype=torch.float32)).cpu()
         obj.z_bias_ema = state.get(
             "z_bias_ema", torch.full_like(obj.count, float("nan"), dtype=torch.float32)).cpu()
         obj.z_resid_effective_count = state.get(
             "z_resid_effective_count", torch.zeros_like(obj.count, dtype=torch.float32)).cpu()
         obj.z_resid_last_step = state.get(
             "z_resid_last_step", torch.full_like(obj.count, int(current_step))).cpu()
+        # older checkpoints predate this monotonic counter -- zero is the
+        # honest fallback (same reasoning as fwd/bwd_level_visits below): the
+        # RMS gates re-earn trust as z_resid_visits reaccumulates post-reload.
+        obj.z_resid_visits = state.get(
+            "z_resid_visits", torch.zeros_like(obj.count)).cpu()
         # older checkpoints predate the per-mode level streams (z_match delta
         # gate) -- NaN/0/current_step never-updated sentinels, same reasoning
         # as the z-residual monitor above
@@ -1730,6 +1942,15 @@ class ConditionLogZTracker:
             "fwd_level_last_step", torch.full_like(obj.count, int(current_step))).cpu()
         obj.bwd_level_last_step = state.get(
             "bwd_level_last_step", torch.full_like(obj.count, int(current_step))).cpu()
+        # older checkpoints predate the monotonic level-visit counters -- fall
+        # back to zeros: the delta gate then re-earns trust as the level EMAs
+        # re-saturate post-reload (the count climbs one per per-stream visit),
+        # which is exactly the intended resume behaviour, never a fabricated
+        # over-credit from the decayed effective_count
+        obj.fwd_level_visits = state.get(
+            "fwd_level_visits", torch.zeros_like(obj.count)).cpu()
+        obj.bwd_level_visits = state.get(
+            "bwd_level_visits", torch.zeros_like(obj.count)).cpu()
         # older checkpoints predate the discovery telemetry -- zeroed
         # accumulators/EMAs are the honest fallback (rates rebuild within a
         # half-life), and discovery_last_step falls back to current_step so

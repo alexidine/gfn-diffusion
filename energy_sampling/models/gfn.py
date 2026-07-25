@@ -5,6 +5,7 @@ from typing import Optional, Sequence
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from energy_sampling.utils import gaussian_params
 from mxtaltools.models.graph_models.molecule_graph_model import VectorMoleculeGraphModel
@@ -24,6 +25,9 @@ class GFN(nn.Module):  # todo add seeding
                  cond_hidden_dim: int = 64, cond_layers: int = 4,
                  log_var_range: float = 4.,
                  t_scale: float = 1., learned_variance: bool = True,
+                 t_scale_ratio: Optional[float] = None,
+                 t_scale_power: float = 4.,
+                 t_scale_preserve_budget: bool = True,
                  condition_embedding_dim: int = 0,
                  conditions_type: str = 'vector',
                  clipping: bool = False,
@@ -58,9 +62,11 @@ class GFN(nn.Module):  # todo add seeding
         self.learn_pb = learn_pb
 
         self.pf_std_per_traj = np.sqrt(self.t_scale)
-        self._log_var_base = 2.0 * float(np.log(self.pf_std_per_traj))  # shared additive shift onto any policy logvar
+        self._log_var_base = 2.0 * float(np.log(self.pf_std_per_traj))  # constant-rate additive shift onto any policy logvar
         self.log_var_range = log_var_range
         self.var_clip = 16
+        self.var_floor = 1e-12  # guards V(t) in denominators; the pinned t=0 step is special-cased upstream
+        self.init_var_schedule(t_scale_ratio, t_scale_power, t_scale_preserve_budget)
         self.device = device
         self.max_z_prime = max_z_prime
         self.conditions_type = conditions_type
@@ -107,6 +113,14 @@ class GFN(nn.Module):  # todo add seeding
 
         self.pb_drift_range = pb_drift_range
         self.pb_var_range = pb_var_range
+
+        # runtime flag, set post-construction (train.py) like compile_policy --
+        # deliberately NOT a constructor arg, so it stays out of gfn_config and
+        # therefore out of checkpoints/problem hashing. When on, each trajectory
+        # step is gradient-checkpointed (activations recomputed in backward):
+        # rollout activation memory becomes ~O(1) in T for one extra policy
+        # forward per step. Values and gradients are identical either way.
+        self.traj_checkpoint = False
 
     def init_policies(self, s_emb_dim, t_dim, policy_hidden_dim, policy_layers, zero_init, norm, dropout):
         # head layout when dplr_rank > 0: [mean(dim), log(s^2)(dim), rho_logit(dim), U(dim*rank)]
@@ -271,7 +285,107 @@ class GFN(nn.Module):  # todo add seeding
         self.ang_idx = self.ang_mask.nonzero(as_tuple=False).flatten()
         self.lin_idx = (~self.ang_mask).nonzero(as_tuple=False).flatten()
 
-    def split_params(self, tensor):
+    VAR_SCHEDULE_GRID = 8192
+
+    def init_var_schedule(self, ratio, power, preserve_budget):
+        """
+        Optional in-rollout schedule for the forward noise RATE (variance per
+        unit trajectory time), decaying from t=0 to t=1:
+
+            sigma^2(t) = sigma^2(0) * ratio ** (t ** power)
+
+        `ratio` = sigma^2(1)/sigma^2(0); None disables the schedule entirely
+        and every method below short-circuits to the constant-rate expression
+        the original code wrote, verbatim (see the parity note there).
+
+        Everything downstream runs on the ACCUMULATED variance
+        V(t) = int_0^t sigma^2(s) ds rather than on t. With a constant rate
+        V(t) = t_scale * t, so the two are proportional and t was a valid
+        stand-in; once the rate varies they come apart, and every place the
+        old code wrote a time ratio it meant a variance ratio. P_B is the
+        Brownian bridge of this process, so it has to move with the schedule
+        -- its drift coefficient can only be rescaled by +-40%
+        (pb_drift_range), which is nowhere near enough to absorb the
+        difference over the last third of the rollout.
+
+        preserve_budget rescales sigma^2(0) so V(1) = t_scale exactly. The
+        trajectory starts from a deterministic x_0 = 0 under a deterministic
+        drift, so V(1) is the entire stock of randomness available to build
+        the terminal distribution: without this, a schedule shrinks the
+        reachable support at the same time as the terminal step, and the two
+        effects can't be separated afterwards.
+        """
+        self.t_scale_ratio = ratio
+        self.t_scale_power = power
+        self.t_scale_preserve_budget = preserve_budget
+        self.var_scheduled = ratio is not None
+        if not self.var_scheduled:
+            return
+        if not 0 < ratio <= 1:
+            raise ValueError(f"t_scale_ratio is sigma^2(1)/sigma^2(0) and must lie in (0, 1], got {ratio}")
+        if power <= 0:
+            raise ValueError(f"t_scale_power must be positive, got {power}")
+
+        n = self.VAR_SCHEDULE_GRID
+        grid = torch.linspace(0, 1, n + 1, dtype=torch.float64)
+        rate = torch.exp(math.log(ratio) * grid ** power)  # sigma^2(t) / sigma^2(0)
+        increments = torch.zeros(n + 1, dtype=torch.float64)
+        increments[1:] = 0.5 * (rate[1:] + rate[:-1]) / n  # cumulative trapezoid; V(0) = 0 exactly
+        accum = increments.cumsum(0)
+        scale = self.t_scale / accum[-1].item() if preserve_budget else self.t_scale
+        # derived wholly from config, so non-persistent: it stays out of the
+        # state_dict and checkpoints are identical with or without a schedule
+        self.register_buffer('_var_accum', (accum * scale).to(torch.float32), persistent=False)
+
+    def var_accum(self, t):
+        """
+        V(t), by linear interpolation on the precomputed grid. Exact zero at
+        t=0, so the pinned first backward step keeps its existing branch.
+        """
+        x = t.clamp(min=0.0, max=1.0) * self.VAR_SCHEDULE_GRID
+        idx = x.floor().long().clamp(max=self.VAR_SCHEDULE_GRID - 1)
+        frac = x - idx.to(x.dtype)
+        v0 = self._var_accum[idx]
+        return v0 + frac * (self._var_accum[idx + 1] - v0)
+
+    def var_log_rate(self, t_prev, t_next, dts):
+        """
+        Additive baseline on a policy logvar for the step [t_prev, t_next]:
+        the log of that step's mean rate, so the per-step variance a caller
+        forms as exp(logvar) * dt is exactly the variance the schedule
+        allocates to the step. Constant rate -> the original scalar
+        log(t_scale), returned as a float so the caller's add is unchanged.
+        """
+        if not self.var_scheduled:
+            return self._log_var_base
+        dv = self.var_accum(t_next) - self.var_accum(t_prev)
+        return dv.clamp(min=self.var_floor).div(dts).log().unsqueeze(1)
+
+    def var_drift_coeff(self, t_prev, t_next, dts):
+        """
+        dV/V(t_next): the fraction of accumulated variance the backward bridge
+        removes in one step, i.e. how hard P_B pulls toward the origin.
+        Constant rate -> dt/t_next, the original expression verbatim.
+        """
+        if not self.var_scheduled:
+            return dts / t_next
+        v_next = self.var_accum(t_next).clamp(min=self.var_floor)
+        return (v_next - self.var_accum(t_prev)) / v_next
+
+    def var_bridge_step(self, t_prev, t_next, dts):
+        """
+        The whole factor multiplying P_B's variance, dt * V(t_prev)/V(t_next)
+        -- bridge contraction toward the pin at the origin. Constant rate ->
+        dt * t_prev/t_next, written with the original grouping so the result
+        is bit-identical, not merely equal.
+        """
+        if not self.var_scheduled:
+            return dts * t_prev / t_next
+        v_prev = self.var_accum(t_prev)
+        v_next = self.var_accum(t_next).clamp(min=self.var_floor)
+        return dts * v_prev / v_next
+
+    def split_params(self, tensor, log_var_base):
         if self.dplr_rank > 0:
             mean, logvar_i, rho_logit, u_raw = torch.split(
                 tensor, [self.dim, self.dim, self.dim, self.dim * self.dplr_rank], dim=-1)
@@ -286,7 +400,7 @@ class GFN(nn.Module):  # todo add seeding
                 logvar = logvar_i
             else:
                 logvar = torch.tanh(logvar_i / self.log_var_range) * self.log_var_range
-        logvar = (logvar + self._log_var_base).clip(min=-self.var_clip, max=self.var_clip)
+        logvar = (logvar + log_var_base).clip(min=-self.var_clip, max=self.var_clip)
         return mean, logvar, rho_logit, u_raw
 
     def get_dplr_cov(self, logvar, rho_logit, u_raw):
@@ -315,9 +429,9 @@ class GFN(nn.Module):  # todo add seeding
         V = (rho.sqrt() * s2.sqrt()).unsqueeze(-1) * u_hat
         return d, V
 
-    def eval_forward_head(self, state_update):
+    def eval_forward_head(self, state_update, log_var_base):
         """split_params + get_dplr_cov, chained: every caller needs both together."""
-        pf_mean, logvar, rho_logit, u_raw = self.split_params(state_update)
+        pf_mean, logvar, rho_logit, u_raw = self.split_params(state_update, log_var_base)
         d, V = self.get_dplr_cov(logvar, rho_logit, u_raw)
         return pf_mean, logvar, d, V
 
@@ -329,19 +443,168 @@ class GFN(nn.Module):  # todo add seeding
 
         return s_new
 
-    def _forward_kernel(self, state, t, condition_embedding):
+    def _forward_kernel(self, state, t, condition_embedding, t_next, dts):
         """
         Evaluate the forward policy at `state`/`t`: this is the one density
         (mean, d, V) shared by get_traj_fwd, get_traj_bwd's pf term, and
         get_traj_replay -- DPLR (when enabled) always applies here, since
         it's always the same forward_policy network being scored.
+
+        The policy network sees the step's START time `t` (unchanged), while
+        the variance baseline is taken over the whole step [t, t_next]: the
+        noise on this step is what lands the sample at t_next, so that's the
+        interval whose variance budget it should spend. It also makes P_F and
+        P_B read the same baseline for the same interval.
         """
         expanded_state = self.expand_state_for_policy(state)
         s_emb = self.s_model(expanded_state, condition_embedding)
         t_emb = self.t_model(t)
         state_update = self.predict_next_state(s_emb, t_emb)
-        pf_mean, logvar, d, V = self.eval_forward_head(state_update)
+        pf_mean, logvar, d, V = self.eval_forward_head(
+            state_update, self.var_log_rate(t, t_next, dts))
         return pf_mean, logvar, d, V, s_emb, t_emb
+
+    def _use_traj_checkpoint(self):
+        return self.traj_checkpoint and torch.is_grad_enabled()
+
+    def _run_step(self, use_ckpt, step_fn, *args):
+        """
+        Execute one trajectory step, optionally under gradient checkpointing.
+        Step functions must be pure w.r.t. their inputs (all randomness is
+        pre-drawn at loop level and passed in as eps tensors) so the backward
+        recompute replays them exactly. NB the conditioner (PyG scatter ops,
+        nondeterministic on CUDA) must stay OUTSIDE the step functions:
+        condition_embedding is computed once per trajectory and passed in.
+        """
+        if use_ckpt:
+            return grad_checkpoint(step_fn, *args, use_reentrant=False)
+        return step_fn(*args)
+
+    def _wrap_ang(self, state):
+        """Out-of-place twin of the old in-place post-step angular wrap."""
+        if self.ang_dim == 0:
+            return state
+        wrapped = self.wrap_to_pi(state.index_select(1, self.ang_idx) * torch.pi) / torch.pi  # latent space is on [-1, 1]
+        return state.index_copy(1, self.ang_idx, wrapped)
+
+    def _step_flow(self, s_emb, t_emb):
+        """
+        Per-step flow value under full_flow (state/time-dependent head); None
+        otherwise -- the constant-flow case is state-independent, so the traj
+        functions write log_flow[:, 0] once from the condition embedding,
+        outside the step loop.
+
+        Z-only training (freeze_policy) is handled upstream by detaching
+        condition_embedding at its source (see get_traj_fwd/bwd/replay), so the
+        flow head trains its own parameters while the conditioner stays frozen.
+        NB: that source detach isolates flow_model only while full_flow is off;
+        under full_flow the flow head reads [s_emb, t_emb], so it would still
+        train s_model -- revisit here if full_flow + freeze_policy is ever used.
+        """
+        if not self.full_flow:
+            return None
+        return self.flow_model(torch.cat([s_emb, t_emb], dim=1)).flatten()
+
+    def _fwd_step(self, current_state, dts, ts, condition_embedding, eps, eps_r,
+                  exploration_std, i: int, detach_traj: bool):
+        """
+        One forward-rollout step: propagate current_state -> next_state and
+        score the transition. Returns the (angular-wrapped) next state plus
+        everything the loop needs downstream; the trailing Gaussian-parameter
+        tensors are only consumed under return_gauss_params.
+        """
+        pf_mean, pflogvars, d, V, s_emb, t_emb = self._forward_kernel(
+            current_state, ts[:, i], condition_embedding, ts[:, i + 1], dts)
+        pflogvars_sample = self.fwd_get_logvars(detach_traj, dts, exploration_std, i, d.log())
+        # exploration only inflates the diagonal; V is never inflated for sampling
+        V_sample = V.detach() if (detach_traj and V is not None) else V
+        next_state = self.fwd_propagate(current_state, detach_traj, dts, pf_mean, pflogvars_sample,
+                                        V_sample, eps=eps, eps_r=eps_r)
+
+        flow_i = self._step_flow(s_emb, t_emb)
+
+        # compute forward logprobs under the actual (un-inflated) policy density
+        fwd_drift = dts.unsqueeze(1) * pf_mean
+        logpf_i = self.fwd_gauss_logprob(next_state - current_state, fwd_drift, d, dts, V)
+
+        # compute backward logprobs
+        back_drift, back_var, logpb_i = self._eval_pb_logprob(
+            condition_embedding, i, current_state, next_state, dts, ts, logpf_i)
+
+        # only wrap after logprob calculations
+        next_state = self._wrap_ang(next_state)
+        return next_state, logpf_i, logpb_i, flow_i, back_drift, back_var, fwd_drift, pflogvars, d
+
+    def _bwd_step(self, current_state, dts, ts, condition_embedding, eps,
+                  i: int, trajectory_length: int, detach_traj: bool):
+        """
+        One backward-rollout step: propagate current_state -> prev_state under
+        P_B (deterministically to the source on the final step) and score both
+        directions. Returns the (angular-wrapped) previous state.
+        """
+        if i < trajectory_length - 1:
+            # backward propagate
+            expanded_current_state = self.expand_state_for_policy(current_state)
+
+            back_mean_correction, back_var_correction \
+                = self.get_bwd_correction(
+                condition_embedding, expanded_current_state, i, trajectory_length, ts)
+
+            t_prev, t_next = ts[:, trajectory_length - i - 1], ts[:, trajectory_length - i]
+            drift_coeff = self.var_drift_coeff(t_prev, t_next, dts).unsqueeze(1)
+
+            # directly x_t-u\Delta t
+            back_mean = current_state - current_state * drift_coeff * back_mean_correction
+
+            back_drift = - current_state * drift_coeff * back_mean_correction
+            var = (back_var_correction + self.var_log_rate(t_prev, t_next, dts)).clip(
+                min=-self.var_clip, max=self.var_clip).exp()
+            back_var = var * self.var_bridge_step(t_prev, t_next, dts).unsqueeze(1)
+            prev_state = self.bwd_propagate(back_mean, back_var, current_state, detach_traj, eps=eps)
+
+            # log Pb calculation
+            logpb_i = self.gauss_logprob(prev_state - current_state, back_drift, back_var)
+        else:
+            # send it identically to the source state (0)
+            prev_state = torch.zeros_like(current_state)
+            back_drift = -current_state
+            back_var = torch.ones_like(back_drift) * 1e-3 * dts.unsqueeze(1)
+            logpb_i = current_state.new_zeros(current_state.shape[0])
+
+        """log pf calculation"""
+        # forward kernel: same policy density as get_traj_fwd/get_traj_replay, so DPLR
+        # applies here too when enabled. Only the backward policy (P_B, above) stays diagonal.
+        pf_mean, pflogvars, d, V, s_emb, t_emb = self._forward_kernel(
+            prev_state, ts[:, trajectory_length - i - 1], condition_embedding,
+            ts[:, trajectory_length - i], dts)
+
+        flow_i = self._step_flow(s_emb, t_emb)
+
+        fwd_drift = dts.unsqueeze(1) * pf_mean
+        logpf_i = self.fwd_gauss_logprob(current_state - prev_state, fwd_drift, d, dts, V)
+
+        prev_state = self._wrap_ang(prev_state)
+        return prev_state, logpf_i, logpb_i, flow_i, back_drift, back_var, fwd_drift, pflogvars, d
+
+    def _replay_step(self, current_state, next_state, dts, ts, condition_embedding, i: int):
+        """
+        Score one fixed transition (replayed trajectory): no propagation, no
+        wrap -- states are read as given.
+        """
+        # PROPAGATION (evaluated against the given transition, not sampled)
+        pf_mean, pflogvars, d, V, s_emb, t_emb = self._forward_kernel(
+            current_state, ts[:, i], condition_embedding, ts[:, i + 1], dts)
+
+        flow_i = self._step_flow(s_emb, t_emb)
+
+        # compute forward logprobs (mirrors get_traj_fwd's un-inflated policy density)
+        fwd_drift = dts.unsqueeze(1) * pf_mean
+        logpf_i = self.fwd_gauss_logprob(next_state - current_state, fwd_drift, d, dts, V)
+
+        # compute backward logprobs
+        back_drift, back_var, logpb_i = self._eval_pb_logprob(
+            condition_embedding, i, current_state, next_state, dts, ts, logpf_i)
+        return logpf_i, logpb_i, flow_i, back_drift, back_var, fwd_drift, pflogvars, d
 
     def get_traj_fwd(self, initial_state, discretizer, exploration_std, condition, mol_batch,
                      return_gauss_params: bool = False, detach_traj: bool = True,
@@ -366,36 +629,32 @@ class GFN(nn.Module):  # todo add seeding
         else:
             condition_embedding = None
 
+        use_ckpt = self._use_traj_checkpoint()
+        if not self.full_flow:
+            log_flow[:, 0] = self.flow_model(condition_embedding).flatten()
+
         for i in range(trajectory_length):
             dts = ts[:, i + 1] - ts[:, i]
+            # pre-draw the step's noise at loop level (outside any checkpoint
+            # region) so recompute-in-backward replays the step exactly
+            eps = torch.randn(batch_size, self.dim, dtype=current_state.dtype, device=self.device)
+            eps_r = (torch.randn(batch_size, self.dplr_rank, device=self.device)
+                     if self.dplr_rank > 0 else None)
 
-            # PROPAGATION
-            pf_mean, pflogvars, d, V, s_emb, t_emb = self._forward_kernel(current_state, ts[:, i], condition_embedding)
-            pflogvars_sample = self.fwd_get_logvars(detach_traj, dts, exploration_std, i, d.log())
-            # exploration only inflates the diagonal; V is never inflated for sampling
-            V_sample = V.detach() if (detach_traj and V is not None) else V
-            next_state = self.fwd_propagate(current_state, detach_traj, dts, pf_mean, pflogvars_sample, V_sample)
+            (next_state, logpf_i, logpb_i, flow_i,
+             back_drift, back_var, fwd_drift, pflogvars, d) = self._run_step(
+                use_ckpt, self._fwd_step, current_state, dts, ts, condition_embedding,
+                eps, eps_r, exploration_std, i, detach_traj)
 
-            self._update_log_flow(log_flow, s_emb, t_emb, condition_embedding, i == 0, i)
-
-            # compute forward logprobs under the actual (un-inflated) policy density
-            fwd_drift = dts.unsqueeze(1) * pf_mean
-            logpf.append(self.fwd_gauss_logprob(next_state - current_state, fwd_drift, d, dts, V))
-
-            # compute backward logprobs
-            back_drift, back_var, logpb_i = self._eval_pb_logprob(
-                condition_embedding, i, current_state, next_state, dts, ts, logpf[-1])
+            logpf.append(logpf_i)
             logpb.append(logpb_i)
-
-            current_state = next_state
-            # only wrap after logprob calculations
-            if self.ang_dim > 0:
-                current_state[:, self.ang_idx] = self.wrap_to_pi(
-                    current_state[:, self.ang_idx] * torch.pi) / torch.pi  # latent space is on [-1, 1]
-            states[:, i + 1] = current_state
-
+            if self.full_flow:
+                log_flow[:, i] = flow_i
             if return_gauss_params:
                 self.log_gauss_params(gauss_params, i, back_drift, back_var, dts, fwd_drift, pflogvars, d)
+
+            current_state = next_state
+            states[:, i + 1] = current_state
 
         logpfs = torch.stack(logpf).T
         logpbs = torch.stack(logpb).T
@@ -492,58 +751,32 @@ class GFN(nn.Module):  # todo add seeding
         else:
             condition_embedding = None
 
+        use_ckpt = self._use_traj_checkpoint()
+        # matches the old (i - 1) == 0 gating: a T=1 backward traj never wrote
+        # the constant flow and left log_flow[:, 0] at zero
+        if not self.full_flow and trajectory_length > 1:
+            log_flow[:, 0] = self.flow_model(condition_embedding).flatten()
+
         for i in range(trajectory_length):
             dts = ts[:, trajectory_length - i] - ts[:, trajectory_length - i - 1]
+            # pre-draw the step's noise at loop level (outside any checkpoint
+            # region); the final step is deterministic and draws none
+            eps = (torch.randn(batch_size, self.dim, dtype=current_state.dtype, device=self.device)
+                   if i < trajectory_length - 1 else None)
 
-            if i < trajectory_length - 1:
-                # backward propagate
-                expanded_current_state = self.expand_state_for_policy(current_state)
+            (prev_state, logpf_i, logpb_i, flow_i,
+             back_drift, back_var, fwd_drift, pflogvars, d) = self._run_step(
+                use_ckpt, self._bwd_step, current_state, dts, ts, condition_embedding,
+                eps, i, trajectory_length, detach_traj)
 
-                back_mean_correction, back_var_correction \
-                    = self.get_bwd_correction(
-                    condition_embedding, expanded_current_state, i, trajectory_length, ts)
-
-                # directly x_t-u\Delta t
-                back_mean = (current_state -
-                             current_state * (dts / ts[:, trajectory_length - i]).unsqueeze(1) * back_mean_correction)
-
-                back_drift = - current_state * (dts / ts[:, trajectory_length - i]).unsqueeze(1) * back_mean_correction
-                var = (back_var_correction + self._log_var_base).clip(min=-self.var_clip, max=self.var_clip).exp()
-                back_var = var * (dts * ts[:, trajectory_length - i - 1] / ts[:, trajectory_length - i]).unsqueeze(1)
-                prev_state = self.bwd_propagate(back_mean, back_var, current_state, detach_traj)
-
-                # log Pb calculation
-                # noise_backward = (prev_state - back_mean) / back_var.sqrt()
-                # logpb.append(-0.5 * (noise_backward ** 2 + logtwopi + back_var.log()).sum(1))
-                logpb.append(self.gauss_logprob(prev_state - current_state, back_drift, back_var))
-            else:
-                # send it identically to the source state (0)
-                prev_state = torch.zeros_like(current_state)
-                back_drift = -current_state
-                # back_mean = prev_state  # remember the back_mean in pb is for some reason the actual mean not the drift
-                back_var = torch.ones_like(back_drift) * 1e-3 * dts.unsqueeze(1)
-                logpb.append(torch.zeros_like(logpb[-1]))
-
-            """log pf calculation"""
-            # forward kernel: same policy density as get_traj_fwd/get_traj_replay, so DPLR
-            # applies here too when enabled. Only the backward policy (P_B, above) stays diagonal.
-            pf_mean, pflogvars, d, V, s_emb, t_emb = self._forward_kernel(
-                prev_state, ts[:, trajectory_length - i - 1], condition_embedding)
-
-            self._update_log_flow(log_flow, s_emb, t_emb, condition_embedding,
-                                  (i - 1) == 0, trajectory_length - i - 1)
-
-            fwd_drift = dts.unsqueeze(1) * pf_mean
-
-            logpf.append(self.fwd_gauss_logprob(current_state - prev_state, fwd_drift, d, dts, V))
-
+            logpf.append(logpf_i)
+            logpb.append(logpb_i)
+            if self.full_flow:
+                log_flow[:, trajectory_length - i - 1] = flow_i
             if return_gauss_params:
                 self.log_gauss_params(gauss_params, i, back_drift, back_var, dts, fwd_drift, pflogvars, d)
 
             current_state = prev_state
-            if self.ang_dim > 0:
-                current_state[:, self.ang_idx] = self.wrap_to_pi(
-                    current_state[:, self.ang_idx] * torch.pi) / torch.pi  # latent space is on [-1, 1]
             states[:, trajectory_length - i - 1] = current_state.detach()
 
         logpfs = torch.stack(logpf).T
@@ -591,24 +824,22 @@ class GFN(nn.Module):  # todo add seeding
         else:
             condition_embedding = None
 
+        use_ckpt = self._use_traj_checkpoint()
+        if not self.full_flow:
+            log_flow[:, 0] = self.flow_model(condition_embedding).flatten()
+
         for i in range(trajectory_length):
             dts = ts[:, i + 1] - ts[:, i]
             next_state = states[:, i + 1]
 
-            # PROPAGATION (evaluated against the given transition, not sampled)
-            pf_mean, pflogvars, d, V, s_emb, t_emb = self._forward_kernel(current_state, ts[:, i], condition_embedding)
+            (logpf_i, logpb_i, flow_i,
+             back_drift, back_var, fwd_drift, pflogvars, d) = self._run_step(
+                use_ckpt, self._replay_step, current_state, next_state, dts, ts, condition_embedding, i)
 
-            self._update_log_flow(log_flow, s_emb, t_emb, condition_embedding, i == 0, i)
-
-            # compute forward logprobs (mirrors get_traj_fwd's un-inflated policy density)
-            fwd_drift = dts.unsqueeze(1) * pf_mean
-            logpf.append(self.fwd_gauss_logprob(next_state - current_state, fwd_drift, d, dts, V))
-
-            # compute backward logprobs
-            back_drift, back_var, logpb_i = self._eval_pb_logprob(
-                condition_embedding, i, current_state, next_state, dts, ts, logpf[-1])
+            logpf.append(logpf_i)
             logpb.append(logpb_i)
-
+            if self.full_flow:
+                log_flow[:, i] = flow_i
             if return_gauss_params:
                 self.log_gauss_params(gauss_params, i, back_drift, back_var, dts, fwd_drift, pflogvars, d)
 
@@ -621,28 +852,6 @@ class GFN(nn.Module):  # todo add seeding
         else:
             return states, logpfs, logpbs, log_flow
 
-    def _update_log_flow(self, log_flow, s_emb, t_emb, condition_embedding, write_constant_flow, full_flow_idx):
-        """
-        Shared by get_traj_fwd/get_traj_bwd/get_traj_replay. With full_flow
-        off, log_flow[:, 0] is written once from the (time-independent)
-        condition embedding; write_constant_flow marks that one step (callers
-        pass whatever index condition already identifies it, since fwd/replay
-        and bwd walk the step index in opposite directions). With full_flow
-        on, every step gets its own state/time-dependent value at full_flow_idx.
-
-        Z-only training (freeze_policy) is handled upstream by detaching
-        condition_embedding at its source (see get_traj_fwd/bwd/replay), so the
-        flow head trains its own parameters while the conditioner stays frozen.
-        NB: that source detach isolates flow_model only while full_flow is off;
-        under full_flow the flow head reads [s_emb, t_emb], so it would still
-        train s_model -- revisit here if full_flow + freeze_policy is ever used.
-        """
-        if not self.full_flow:
-            if write_constant_flow:
-                log_flow[:, 0] = self.flow_model(condition_embedding).flatten()
-        else:
-            log_flow[:, full_flow_idx] = self.flow_model(torch.cat([s_emb, t_emb], dim=1)).flatten()
-
     def _eval_pb_logprob(self, condition_embedding, i, current_state, next_state, dts, ts, fallback_logpf):
         """
         P_B step log-prob for the forward-direction transition current_state
@@ -654,10 +863,12 @@ class GFN(nn.Module):  # todo add seeding
         expanded_next_state = self.expand_state_for_policy(next_state)
         back_mean_correction, back_var_correction = self.fwd_get_back_correction(
             condition_embedding, i, expanded_next_state, ts)
-        back_drift = -next_state * (dts / ts[:, i + 1]).unsqueeze(1) * back_mean_correction
+        t_prev, t_next = ts[:, i], ts[:, i + 1]
+        back_drift = -next_state * self.var_drift_coeff(t_prev, t_next, dts).unsqueeze(1) * back_mean_correction
         if i > 0:  # variance is exactly zero for the first step, so we can't use it
-            var = (back_var_correction + self._log_var_base).clip(min=-self.var_clip, max=self.var_clip).exp()
-            back_var = var * (dts * ts[:, i] / ts[:, i + 1]).unsqueeze(1)
+            var = (back_var_correction + self.var_log_rate(t_prev, t_next, dts)).clip(
+                min=-self.var_clip, max=self.var_clip).exp()
+            back_var = var * self.var_bridge_step(t_prev, t_next, dts).unsqueeze(1)
             logpb_i = self.gauss_logprob(current_state - next_state, back_drift, back_var)
         else:  # instead set this as a constant the model will have to learn around
             back_var = torch.ones_like(back_drift) * 1e-3 * dts.unsqueeze(1)
@@ -686,11 +897,17 @@ class GFN(nn.Module):  # todo add seeding
                                                           )
         return back_mean_correction, back_additive_logvar
 
-    def fwd_propagate(self, current_state, detach_traj, dts, pf_mean, pflogvars_sample, V_sample=None):
-        # eps1 ~ N(0, I_n): diagonal contribution; eps2 ~ N(0, I_r): low-rank contribution (if DPLR is active)
-        noise = (pflogvars_sample / 2).exp() * torch.randn_like(current_state, device=self.device)
+    def fwd_propagate(self, current_state, detach_traj, dts, pf_mean, pflogvars_sample, V_sample=None,
+                      eps=None, eps_r=None):
+        # eps ~ N(0, I_n): diagonal contribution; eps_r ~ N(0, I_r): low-rank contribution (if DPLR is active).
+        # The trajectory loops pre-draw and pass both (checkpoint-safe: the step must
+        # be deterministic given its inputs); drawn here only if a caller omits them.
+        if eps is None:
+            eps = torch.randn_like(current_state, device=self.device)
+        noise = (pflogvars_sample / 2).exp() * eps
         if V_sample is not None:
-            eps_r = torch.randn(current_state.shape[0], V_sample.shape[-1], device=self.device)
+            if eps_r is None:
+                eps_r = torch.randn(current_state.shape[0], V_sample.shape[-1], device=self.device)
             noise = noise + torch.einsum('bnr,br->bn', V_sample, eps_r)
         if detach_traj:
             next_state = (current_state +
@@ -715,13 +932,14 @@ class GFN(nn.Module):  # todo add seeding
         else:
             return pflogvars_sample
 
-    def bwd_propagate(self, back_mean, back_var, current_state, detach_traj):
+    def bwd_propagate(self, back_mean, back_var, current_state, detach_traj, eps=None):
+        # eps is pre-drawn by the trajectory loop (checkpoint-safe); drawn here only if omitted
+        if eps is None:
+            eps = torch.randn_like(current_state, device=self.device)
         if detach_traj:
-            s_ = (back_mean.detach() +
-                  back_var.sqrt().detach() * torch.randn_like(current_state, device=self.device))
+            s_ = back_mean.detach() + back_var.sqrt().detach() * eps
         else:
-            s_ = (back_mean +
-                  back_var.sqrt() * torch.randn_like(current_state, device=self.device))
+            s_ = back_mean + back_var.sqrt() * eps
         return s_
 
     def get_bwd_correction(self, condition_embedding, expanded_current_state, i, trajectory_length, ts):

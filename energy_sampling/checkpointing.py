@@ -292,6 +292,12 @@ class Checkpointer:
             'problem_hash': m.problem_hash,  # fast fingerprint of problem_def, also embedded in the filename
             'model_train': m.gfn_model.state_dict(),
             'model_eval': m.ema_model.state_dict(),
+            # the rollout length this checkpoint was trained at. A prior reused
+            # by another run (reuse_prior / prior_model_name) must be SAMPLED at
+            # its own training T, not the consumer's eval_T -- a T=10 prior fed
+            # into a T=100 run is a 10x discretization mismatch (see
+            # sample_from_prior). None on pre-2026-07-23 checkpoints.
+            'train_T': getattr(getattr(m.args, 'integrator', None), 'T', None),
             'modeller_state': self.get_state_dict(),
             'metrics': m.metric_tracker.state_dict(),
             'optimizers': {k: opt.state_dict() for k, opt in m.optimizers.items()},
@@ -324,11 +330,35 @@ class Checkpointer:
             print(f"Could not hardlink {dst_tag} -> {src_tag} ({e}) - saving a full copy instead")
             self.save(dst_tag)
 
+    # gfn_config keys carrying NO parameters and no state_dict entries, so a
+    # resumed run may take them from its own config. Everything else fixes the
+    # weight layout and has to come from the file.
+    RECONFIGURABLE_GFN_KEYS = ('t_scale_ratio', 't_scale_power', 't_scale_preserve_budget')
+
+    def _gfn_config_from(self, checkpoint):
+        """
+        The checkpoint's gfn_config, with RECONFIGURABLE_GFN_KEYS re-derived
+        from THIS run's config. The in-rollout variance schedule adds no
+        parameters and registers no persistent buffer, so it is behaviour
+        rather than architecture -- a battery that varies it while resuming a
+        shared snapshot would otherwise inherit the parent's value and run
+        every arm as the control. Changes print, so a silent miss can't happen.
+        """
+        config = dict(checkpoint['gfn_config'])
+        current = vars(self.modeller.args.model)
+        for key in self.RECONFIGURABLE_GFN_KEYS:
+            if key not in current:
+                continue
+            if current[key] != config.get(key):
+                print(f"gfn_config['{key}']: checkpoint {config.get(key)!r} -> config {current[key]!r}")
+            config[key] = current[key]
+        return config
+
     def load_full(self, path, load_opt_state: bool = True):
         m = self.modeller
         checkpoint = torch.load(path, map_location=m.device, weights_only=False)
         self.assert_problem_match(checkpoint, path, 'checkpoint_name')
-        m.gfn_config = checkpoint['gfn_config']
+        m.gfn_config = self._gfn_config_from(checkpoint)
         m.gfn_model = GFN(**m.gfn_config).to(m.device)
         m.gfn_model.load_state_dict(checkpoint['model_train'])
         m.ema_model = deepcopy(m.gfn_model)
@@ -394,16 +424,17 @@ class Checkpointer:
     def load_weights_only(self, path):
         """
         Warm-start from a checkpoint's model weights alone: rebuilds the GFN
-        from the checkpoint's stored gfn_config and loads the train/EMA
-        weights, but restores nothing else - optimizers, schedulers, buffers,
-        metrics, condition_log_z, and every MODELLER_STATE_DEFAULTS field are
-        left for the caller to initialize fresh (phase 1, step 0, LR warmup
-        from scratch).
+        from the checkpoint's stored gfn_config (bar RECONFIGURABLE_GFN_KEYS,
+        which follow this run's config) and loads the train/EMA weights, but
+        restores nothing else - optimizers, schedulers, buffers, metrics,
+        condition_log_z, and every MODELLER_STATE_DEFAULTS field are left for
+        the caller to initialize fresh (phase 1, step 0, LR warmup from
+        scratch).
         """
         m = self.modeller
         checkpoint = torch.load(path, map_location=m.device, weights_only=False)
         self.assert_problem_match(checkpoint, path, 'checkpoint_name')
-        m.gfn_config = checkpoint['gfn_config']
+        m.gfn_config = self._gfn_config_from(checkpoint)
         m.gfn_model = GFN(**m.gfn_config).to(m.device)
         m.gfn_model.load_state_dict(checkpoint['model_train'])
         m.ema_model = deepcopy(m.gfn_model)

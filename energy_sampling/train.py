@@ -6,7 +6,7 @@ from copy import deepcopy
 from typing import Optional
 
 from energy_sampling.eval.evaluations import to_loggable, sliced_wasserstein, adjust_fig_filesize, eval_figs, \
-    log_ess_frac, condition_tracker_figs
+    log_ess_frac, condition_tracker_figs, fig_guard
 from energy_sampling.eval.traj_reporting import traj_overlap_report, to_scalars
 
 # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
@@ -32,7 +32,7 @@ from energy_sampling.eval.utils import sample_eval_fwd_trajs
 from energy_sampling.utils import is_cuda_oom, \
     dict2namespace, \
     get_discretizer, log_elapsed_times, MetricTracker, quick_tb_stats, uniform_discretizer, logmeanexp, \
-    cal_subtb_coef_matrix, within_condition_logw_std, within_condition_r2, per_condition_r2_worst
+    cal_subtb_coef_matrix, within_condition_logw_std
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss, log_pf_estimate
 from models import GFN
 from energy_sampling.models.aunit_periodicity import sg_periodic_centroid_axes, describe
@@ -94,6 +94,32 @@ def loggable_array(a, num_bins=32):
     return safe_histogram(a, num_bins=num_bins)
 
 
+def _softmax_draw(scores: torch.Tensor, k: int, temperature: float) -> torch.Tensor:
+    """
+    Draw up to k positions into `scores`, without replacement, weighted by
+    softmax(scores / temperature). Returns positions (0..scores.numel()-1),
+    NOT the caller's original indices -- callers index their own index
+    tensor by the result (e.g. `elig[_softmax_draw(...)]`).
+
+    Used for replay-buffer admission/purge (see manage_replay_buffer):
+    `scores` is expected to already be clipped to an absolute cap by the
+    caller BEFORE this divides by temperature, so a single extreme value
+    can't dominate the softmax (see the buffer-redesign discussion this
+    implements -- clip-then-divide keeps the cap's meaning independent of T).
+    """
+    n = scores.numel()
+    k = min(k, n)
+    if k <= 0:
+        return torch.zeros(0, dtype=torch.long)
+    logits = scores.double() / max(temperature, 1e-8)
+    logits = logits - logits.max()
+    p = torch.softmax(logits, dim=0).cpu().numpy()
+    p = np.clip(p, 1e-12, None)
+    p /= p.sum()
+    choice = np.random.choice(n, size=k, replace=False, p=p)
+    return torch.as_tensor(choice, dtype=torch.long)
+
+
 class Modeller:
     def __init__(self):
         self.step_ind = None
@@ -118,7 +144,12 @@ class Modeller:
         self.times = {}
         # replay churn tallied across every manage_replay_buffer call (train
         # steps and eval alike), drained and logged once per eval in log_metrics
-        self.replay_churn = {'admitted': 0, 'random_admitted': 0, 'evicted': 0}
+        self.replay_churn = {'admitted': 0, 'evicted': 0}
+        # TTL-cohort tallies (see manage_replay_buffer's eviction split):
+        # drained and logged once per eval alongside replay_churn
+        self.replay_cohort = {'absorbed': 0, 'expired': 0, 'expired_undrawn': 0,
+                              'expired_drawn': 0, 'expired_draws_sum': 0,
+                              'expired_delta_sum': 0.0, 'expired_delta_n': 0}
         # prior_buffer churn decomposed by admission SOURCE, tallied across every
         # manage_prior_buffer/top_up_prior_from_anchors/grow_prior_buffer call and
         # drained once per eval in log_buffer_stats. The point is the source mix:
@@ -304,20 +335,29 @@ class Modeller:
         # boost state, per-rule live (annealed) thresholds/elevations, exit streaks
         metrics.update(self.protocol.report())
         metrics.update(log_elapsed_times(self.times))
-        # diagnostics only -- the balance rules threshold on fwd/tb_resid_clipped
-        # (see the protocol block's zerr rules); rms_z_lag's trust gate keeps it
-        # at a fail-open 0.0 whenever no condition has enough decayed evidence,
-        # so it must not be read as a control variable
-        metrics['zerr_tracker'] = self.condition_log_z.rms_z_lag()
-        metrics[
-            'z_bias'] = self.condition_log_z.rms_z_bias()  # location-only companion to zerr_tracker: ~0 when Z(c) sits on mean(log w), immune to spread
-        metrics[
-            'logw_std_rms'] = self.condition_log_z.rms_logw_std()  # +inf until warmed (loggable as inf)
+        # PERSISTENT (cross-visit) views of the same quantities the rolling
+        # fwd|bwd|replay channels carry per batch. Namespaced 'tracker/' on
+        # purpose: only the rolling channels reach metric_tracker, so only THEY
+        # are resolvable by protocol rules/exit terms ('dir/name'). Anything
+        # published here is a dashboard reading, never a control variable --
+        # which also matters because these reductions fail OPEN (0.0) whenever
+        # no condition has enough evidence yet.
+        cwq = self.args.conditional_worst_quantile
+        metrics['tracker/tb_err_rms'] = self.condition_log_z.rms_tb_err()      # quality of fit, nats
+        metrics['tracker/tb_err_worst'] = self.condition_log_z.worst_tb_err(quantile=cwq)
+        metrics['tracker/z_grad_rms'] = self.condition_log_z.rms_z_grad()      # dL/dZ ruler, level-only
+        metrics['tracker/z_grad_worst'] = self.condition_log_z.worst_z_grad(quantile=cwq)
+        metrics['tracker/z_bias_rms'] = self.condition_log_z.rms_z_bias()      # unclipped level (diagnostic)
+        metrics['tracker/logw_std_rms'] = self.condition_log_z.rms_logw_std()  # spread; +inf until warmed
         # z_match level-matching gap: worst-condition |bwd_level - fwd_level|
-        # over the two single-mode streams (+inf until both are warm, so the
-        # gates/delta_worst exit term can never pass on ignorance -- protocol's
-        # _resolve drops non-finite values)
-        delta = self.condition_log_z.delta_stats()
+        # over the two single-mode streams (+inf until enough conditions are
+        # characterized, so the gates/delta_worst exit term can never pass on
+        # ignorance -- protocol's _resolve drops non-finite values). 'worst' is
+        # the conditional_worst_quantile upper-tail quantile across conditions,
+        # the same worst-case-tolerance knob tb_err_worst uses -- so a handful of
+        # stale/outlier conditions can't hold the gate hostage the way the strict
+        # max did on a large condition library (cw02).
+        delta = self.condition_log_z.delta_stats(quantile=cwq)
         metrics['zmatch/delta_worst'] = delta['worst']
         metrics['zmatch/delta_mean'] = delta['mean']
         metrics['zmatch/delta_n_trusted'] = delta['n']
@@ -481,17 +521,21 @@ class Modeller:
 
         cfg = getattr(self.args, 'condition_log_z', None)
         min_visits = getattr(cfg, 'min_visits', 20) if cfg is not None else 20
-        half_life_steps = getattr(cfg, 'half_life_steps', 7.0) if cfg is not None else 7.0
+        half_life_visits = getattr(cfg, 'half_life_visits', 7.0) if cfg is not None else 7.0
         trim_frac = getattr(cfg, 'trim_frac', 0.1) if cfg is not None else 0.1
         max_batch_weight = getattr(cfg, 'max_batch_weight', 200.0) if cfg is not None else 200.0
         discovery_half_life_steps = getattr(cfg, 'discovery_half_life_steps', 200.0) if cfg is not None else 200.0
         self.condition_log_z = ConditionLogZTracker(
             library_size=self.energy_function.condition_library_size,
             min_visits=min_visits,
-            half_life_steps=half_life_steps,
+            half_life_visits=half_life_visits,
             trim_frac=trim_frac,
             max_batch_weight=max_batch_weight,
             discovery_half_life_steps=discovery_half_life_steps,
+            # FIXED reference beta for the tracker's z_grad ruler: the BASE fwd
+            # coefficient, never a stage override, so the ruler reads the same in
+            # every stage (see ConditionLogZTracker.clip_beta)
+            clip_beta=getattr(self.args.fwd_loss_coeffs, 'beta', 10.0),
         )
 
     def bootstrap_log_z(self, max_steps: int = 1000, lr_ramp_steps: int = 200,
@@ -848,17 +892,31 @@ class Modeller:
             print("  WARNING: Z(c) bootstrap did not reach the coverage bar; phase-2 "
                   "training may be unreliable. Consider more attempts or a lower lr.")
 
-    def mol_dataset_z_gap_weights(self, temperature: float = 1.0,
-                                  clip_quantile: Optional[float] = None) -> Optional[np.ndarray]:
+    def weighted_condition_sampling(self, temperature: float = 1.0,
+                                    clip_quantile: Optional[float] = None) -> Optional[np.ndarray]:
         """
         Per-row sampling distribution over self.mol_dataset, weighting each
-        molecule toward its tracked z_gap in self.condition_log_z (the
-        empirical/Jensen log Z disagreement for that molecule's base
-        condition_id -- SG/Z' local index 0) instead of sampling uniformly,
-        so molecules whose log Z estimate hasn't converged get drawn more
-        often. Mirrors CrystalBuffer._loss_weights (same softmax-over-
-        temperature shape, same moderate-fill treatment for not-yet-visited
-        entries), just sourced from condition_log_z instead of ema_loss.
+        molecule toward its tracked per-condition QUALITY OF FIT instead of
+        sampling uniformly, so badly-fit conditions get drawn more often.
+        Mirrors CrystalBuffer._loss_weights (same softmax-over-temperature
+        shape, same moderate-fill treatment for not-yet-visited entries), just
+        sourced from condition_log_z instead of ema_loss.
+
+        This is the FORWARD half of the sampling-weight pair: forward draws
+        pick CONDITIONS, so they weight on a per-condition statistic (each
+        condition is judged by how well it is fit); backward draws pick stored
+        terminal STATES, so they weight on each row's own ema_loss (each state
+        is its own keeper). The signals are deliberately different because the
+        unit of choice is different.
+
+        A molecule's tracked statistics are spread over its whole SG/Z' BLOCK
+        (condition_id is mixed-radix: mol_id * n_sg*n_zp + sg_local*n_zp +
+        zp_local), and training draws sample SG/Z' per batch -- so the block is
+        averaged over its VISITED members here. Reading only local index 0, as
+        this used to, addressed a condition that need never have been visited
+        on a multi-SG/Z' run, leaving the weighting to fall back to the
+        unvisited-fill for every molecule. Single-SG/Z' problems (all toys)
+        have a one-member block, so their behavior is unchanged.
 
         Returns None (falls back to uniform sampling) if condition_log_z
         isn't initialized yet, mol_dataset's resident batch has no mol_id
@@ -870,36 +928,48 @@ class Modeller:
             return None
 
         n_combos = self.energy_function.n_sg * self.energy_function.n_zp
-        condition_id = mol_id.detach().cpu() * n_combos
-        gap, mask = tracker.lookup_z_gap(condition_id)
+        block = (mol_id.detach().cpu().long().flatten()[:, None] * n_combos
+                 + torch.arange(n_combos, dtype=torch.long)[None, :])
+        # signal = z_bias_ema^2 + Var(log w), the per-condition mean SQUARED TB
+        # residual (level + spread) -- left unrooted because a sampling weight
+        # only needs a monotone priority.
+        err, mask = tracker.lookup_fit_error(block.flatten())
+        err = err.reshape(block.shape)
+        mask = mask.reshape(block.shape)
+        # per-molecule mean over VISITED block members; molecules with no visited
+        # member anywhere in their block fall through to the unvisited-fill below
+        n_seen = mask.sum(dim=1)
+        err = torch.where(mask, err, torch.zeros_like(err)).sum(dim=1) / n_seen.clamp(min=1)
+        mask = n_seen > 0
 
         if not mask.any():
             return None
 
-        fill = gap[mask].mean()
-        gap = torch.where(mask, gap, fill)
+        # unvisited conditions take the visited MEAN, never zero: a zero priority
+        # is self-reinforcing (never sampled -> never warms -> never sampled)
+        fill = err[mask].mean()
+        err = torch.where(mask, err, fill)
 
-        # Robust, SCALE-FREE priority from z_gap. The absolute z_gap range is
-        # problem- and time-dependent (hundreds-to-thousands of nats here, and
-        # it shrinks as training converges + differs per energy function), so a
-        # raw softmax over gap/temperature would need the temperature retuned
-        # constantly, and a single blowup condition -- z_gap rides
-        # ema_log_z_emp, which one degenerate off-policy log_pf can send
-        # enormous (see ConditionLogZTracker.lookup) -- would take all the mass.
-        # Instead: take a high quantile as the scale (also excludes blowups from
-        # setting it), clip to it, and NORMALIZE by it -> priority in [0, 1].
-        # temperature then acts on [0, 1], so ~0.3-1.0 is sensible on ANY
-        # problem and never needs rescaling. If that scale is ~0 (no meaningful
-        # tail -- everything converged), there's nothing to steer toward, so
-        # fall back to uniform. clip_quantile=None keeps the legacy raw-gap
-        # behavior (temperature then in nats, scale-dependent).
+        # Robust, SCALE-FREE priority. The absolute range is problem- and
+        # time-dependent (hundreds-to-thousands of nats here, and it shrinks as
+        # training converges + differs per energy function), so a raw softmax
+        # over err/temperature would need the temperature retuned constantly,
+        # and a single blowup condition -- z_bias_ema can be sent enormous by one
+        # degenerate off-policy log_pf (see ConditionLogZTracker.lookup) -- would
+        # take all the mass. Instead: take a high quantile as the scale (also
+        # excludes blowups from setting it), clip to it, and NORMALIZE by it ->
+        # priority in [0, 1]. temperature then acts on [0, 1], so ~0.3-1.0 is
+        # sensible on ANY problem and never needs rescaling. If that scale is ~0
+        # (no meaningful tail -- everything converged), there's nothing to steer
+        # toward, so fall back to uniform. clip_quantile=None keeps the legacy
+        # raw-err behavior (temperature then in nats, scale-dependent).
         if clip_quantile is not None:
-            cap = torch.quantile(gap, clip_quantile)
+            cap = torch.quantile(err, clip_quantile)
             if cap <= 1e-6:
                 return None
-            gap = gap.clamp(min=0.0, max=cap) / cap
+            err = err.clamp(min=0.0, max=cap) / cap
 
-        logits = gap / max(temperature, 1e-8)
+        logits = err / max(temperature, 1e-8)
         logits = logits - logits.max()
         p = torch.softmax(logits, dim=0).double().numpy()
         p = np.clip(p, 1e-8, None)
@@ -978,6 +1048,12 @@ class Modeller:
             self.gfn_model = GFN(**self.gfn_config).to(self.device)
             self.ema_model = deepcopy(self.gfn_model)
             self.init_schedulers_optimizers()
+
+        # runtime flag like compile_policy, set on both fresh-build and reload
+        # paths; deliberately not part of gfn_config (checkpoints/problem
+        # hashing unaffected)
+        for model in (self.gfn_model, self.ema_model):
+            model.traj_checkpoint = bool(getattr(self.args, 'traj_checkpoint', False))
 
         self.maybe_compile_policy()
 
@@ -1194,6 +1270,10 @@ class Modeller:
             self.prior_model = GFN(**gfn_config).to(self.device)
             self.prior_model.load_state_dict(checkpoint['model_eval'])
             self.prior_model.eval()
+            # sample this reused prior at ITS OWN training T, not the consumer's
+            # eval_T (None on pre-2026-07-23 priors -> sample_from_prior falls
+            # back to the run's integrator.T)
+            self.prior_train_T = checkpoint.get('train_T')
             # NB: grow_prior_buffer() is deliberately NOT called here. It samples
             # from mol_dataset, whose batch only gains mol_id in init_identifiers()
             # (which runs after this). Growing here would append a mol_id-less
@@ -1201,21 +1281,27 @@ class Modeller:
             # mol_id, and append_batch would reject the key mismatch. train()
             # calls grow_prior_buffer() once init_identifiers() has run.
 
-    def init_mol_dataset(self):
-        data_list = torch.load(self.args.molecules_path, weights_only=False)  # todo cleanup formatting here
-        if isinstance(data_list, dict):
-            for key, value in data_list.items():
+    @staticmethod
+    def _load_condition_file(path):
+        """Condition sets are saved as {'prior': batch} (see generate_toy_prior);
+        unwrap to the batch. Shared by molecules_path and test_molecules_path -- the
+        test branch used to hand the raw dict to CrystalBuffer, which fails on
+        data.max_z_prime, so test_molecules_path could never load."""
+        data = torch.load(path, weights_only=False)
+        if isinstance(data, dict):
+            for key, value in data.items():
                 if key == 'prior':
-                    data_list = value
+                    return value
+        return data
 
-        self.mol_dataset = CrystalBuffer(data_list,
+    def init_mol_dataset(self):
+        self.mol_dataset = CrystalBuffer(self._load_condition_file(self.args.molecules_path),
                                          device=self.buffer_device,
                                          max_z_prime=max(self.args.z_primes),
                                          exclude_keys=BULKY_ATTR_EXCLUDE_KEYS)
 
         if self.args.test_molecules_path is not None:
-            data_list = torch.load(self.args.test_molecules_path, weights_only=False)
-            self.test_mol_dataset = CrystalBuffer(data_list,
+            self.test_mol_dataset = CrystalBuffer(self._load_condition_file(self.args.test_molecules_path),
                                                   device=self.buffer_device,
                                                   max_z_prime=max(self.args.z_primes),
                                                   exclude_keys=BULKY_ATTR_EXCLUDE_KEYS)
@@ -1454,6 +1540,43 @@ class Modeller:
                 total = (current_fwd or 0) + (current_bwd or 0) + (current_replay or 0)
                 self.combo_loss_record.append(3 - total)  # (1-x) + (1-y) + (1-z) = 3-x-y-z
 
+    def _rewind_checkpoint_path(self):
+        """Pick fire_loss_spike's rewind target, NEVER reverting to an earlier
+        stage than the current one. Reloading a stale 'best' from a prior stage
+        restores that stage's name + stage_ctrl but not its on_enter buffer
+        surgery, so the run resumes the old stage against the current stage's
+        live buffers (stab_july21c 512x6_T60: rewound buildout -> z_match and
+        hung 11k steps fitting a 174k broad buffer a z_match Z was never
+        calibrated for).
+
+        Prefer the same-stage 'best' (freshest). Else this stage's 'stage_start'
+        turnover point, saved post-on_enter in protocol.advance and healthy by
+        construction (it cleared the previous stage's exit gate). Else fall back
+        to 'best' so behavior is never worse than before the fix.
+        """
+        idx = {s.name: s.index for s in self.protocol.stages}
+        current = idx.get(self.protocol.stage.name, -1)
+
+        def stage_index(tag):
+            path = self.checkpointer.path_for(tag)
+            if not os.path.exists(path):
+                return None, path
+            try:
+                ck = torch.load(path, map_location='cpu', weights_only=False)
+                return idx.get(ck.get('modeller_state', {}).get('stage')), path
+            except Exception:
+                return None, path
+
+        best_idx, best_path = stage_index('best')
+        if best_idx is not None and best_idx >= current:
+            return best_path
+        start_idx, start_path = stage_index('stage_start')
+        if start_idx == current:
+            print(f"rewind: 'best' stage {best_idx} precedes current stage {current}; "
+                  f"reverting to this stage's start rather than reversing the phase")
+            return start_path
+        return best_path if os.path.exists(best_path) else None
+
     def fire_loss_spike(self, terminal: bool = False):
         """
         Rewind to the best checkpoint and cut LR.
@@ -1476,8 +1599,8 @@ class Modeller:
             self.terminal_reloads += 1
         print("Firing LR spike & recovery"
               + (f" (TERMINAL rewind #{self.terminal_reloads})" if terminal else ""))
-        running_checkpoint_path = self.checkpointer.path_for('best')
-        if os.path.exists(running_checkpoint_path):
+        running_checkpoint_path = self._rewind_checkpoint_path()
+        if running_checkpoint_path and os.path.exists(running_checkpoint_path):
             self.checkpointer.load_model_only(running_checkpoint_path,
                                               load_optimizers=True)
             # fix also rolling metrics with appropriate rebase
@@ -1853,6 +1976,7 @@ class Modeller:
                                loss_dict['log_Z'], loss_dict['log_r'],
                                clip_beta=getattr(getattr(self.args, f'{sub_type}_loss_coeffs'), 'beta', None),
                                condition_id=loss_dict.get('condition_id'),
+                               worst_quantile=self.args.conditional_worst_quantile,
                                **self._reward_ramp_kwargs(loss_dict.get('condition_id')))
         stats.update({k: v.item() for k, v in loss_dict.items() if k not in
                       ['log_pf', 'log_pb', 'log_Z', 'log_r', 'losses', 'flow_states', 'resid', 'condition_id']})
@@ -1870,22 +1994,12 @@ class Modeller:
                 loss_dict['log_pf'], loss_dict['log_pb'], loss_dict['log_r'], cid)
             if math.isfinite(within):
                 stats['logw_std_within'] = within
-            # condition-aware r2: same between-condition-inflation problem as
-            # logw_std (see r2-pooled-conditional-gate) applied to quick_tb_stats'
-            # 'r2' -- a trunk that reads nothing from the condition can score
-            # pooled r2 ~ 1 once Z(c) explains away the between-condition target
-            # variance. r2_within is the sample-weighted pooled fix; r2_worst is
-            # the stricter per-condition-quantile version the "r2 > 0.9 for ALL
-            # conditions" invariant actually asks for.
-            r2_within = within_condition_r2(
-                loss_dict['log_pf'], loss_dict['log_pb'], loss_dict['log_r'], loss_dict['log_Z'], cid)
-            if math.isfinite(r2_within):
-                stats['r2_within'] = r2_within
-            r2_worst = per_condition_r2_worst(
-                loss_dict['log_pf'], loss_dict['log_pb'], loss_dict['log_r'], loss_dict['log_Z'], cid,
-                quantile=getattr(self.args, 'r2_worst_quantile', 0.0))
-            if math.isfinite(r2_worst):
-                stats['r2_worst'] = r2_worst
+            # NB the conditional CALIBRATION metrics (cond_tb_err / tb_err_worst /
+            # z_grad_worst) come straight out of quick_tb_stats above, which does
+            # its own condition grouping -- they need no branch here because they
+            # are defined on unconditional batches too (one group). Only
+            # logw_std_within is conditional-only: a within-group spread is
+            # undefined without groups.
         # box containment on the TRAIN-step cadence. 'Mean bounding_energy' exists
         # already but is EVAL-cadence (log_thermo_properties loops the eval batch),
         # far too coarse to gate a controller on: in 1219ddv9 boundary drift led the
@@ -1940,22 +2054,22 @@ class Modeller:
                        ):
         cfg = getattr(self.args, 'condition_log_z', None)
         p = None
-        # z_gap-weighted forward sampling is a stage flag (zgap_mol_sampling):
+        # weighted condition sampling is a stage flag (weighted_condition_sampling):
         # it belongs to stages where forward trains the POLICY, so steering at
-        # high-z_gap conditions reduces their Var(log w) -- it fixes the root
-        # cause. In a Z-only forward stage (policy frozen), high z_gap == high
-        # Var(log w) is exactly where per-trajectory TB gives Z the WORST
-        # gradient, and forward can't lower that variance anyway -- weighting
-        # there aims the weak lever at its worst conditions while starving the
-        # clean-gradient bulk. Declare the flag per-stage to A/B it.
-        if (self.protocol.flag('zgap_mol_sampling')
-                and getattr(cfg, 'mol_sampling_weighted_by_z_gap', False)):
-            p = self.mol_dataset_z_gap_weights(
-                temperature=getattr(cfg, 'mol_sampling_z_gap_temperature', 0.5),
-                clip_quantile=getattr(cfg, 'mol_sampling_z_gap_clip_quantile', 0.99))
+        # badly-fit conditions reduces their Var(log w) -- it fixes the root
+        # cause. In a Z-only forward stage (policy frozen), high fit-error is
+        # exactly where per-trajectory TB gives Z the WORST gradient, and
+        # forward can't lower that variance anyway -- weighting there aims the
+        # weak lever at its worst conditions while starving the clean-gradient
+        # bulk. Declare the flag per-stage to A/B it.
+        if (self.protocol.flag('weighted_condition_sampling')
+                and getattr(cfg, 'weighted_condition_sampling', False)):
+            p = self.weighted_condition_sampling(
+                temperature=getattr(cfg, 'weighted_condition_sampling_temperature', 0.5),
+                clip_quantile=getattr(cfg, 'weighted_condition_sampling_clip_quantile', 0.99))
         mol_batch = next(self.mol_dataset.loader(
             self.batch_size, mode='graphs', repeats=repeats, p=p,
-            beta=getattr(cfg, 'mol_sampling_uniform_beta', 0.0) if p is not None else None))
+            beta=getattr(cfg, 'weighted_condition_sampling_uniform_beta', 0.0) if p is not None else None))
         mol_batch = mol_batch.to(self.device)
         mol_batch.orient_molecule(mode='std')
         init_state = get_gfn_init_state(mol_batch.num_graphs, self.energy_function.data_ndim, self.device)
@@ -2120,12 +2234,21 @@ class Modeller:
             # independent draws, which block_m = 0 restores automatically.
             block_m = getattr(self.args.buffers.prior_buffer, 'condition_block_m', 0) \
                 if getattr(self.args.bwd_loss_coeffs, 'vg_lb', 0) > 0 else 0
+            # gentle loss-weighted draw when the stage sets weighted_bwd_sampling:
+            # tilt a small slice of the batch toward high-residual conditions via
+            # the buffer's own ema_loss (the _bwd_retention_priority signal), so a
+            # lagging condition draws extra bwd gradient without starving the rest.
+            # beta is the UNIFORM fraction (floor): 0.9 => 10% of the batch
+            # loss-weighted, 90% uniform. block_m draws bypass weighting entirely.
+            weighted_bwd = self.protocol.flag('weighted_bwd_sampling')
+            bwd_beta = getattr(self.args.buffers.prior_buffer, 'weighted_bwd_beta', 0.9) \
+                if weighted_bwd else 1.0
             mol_batch, inds = next(
                 self.prior_buffer.loader(
                     batch_size=self.batch_size, mode='graphs',
                     repeats=repeats, return_inds=True,
-                    weighted=False,
-                    temperature=0.1, beta=1.0,
+                    weighted=weighted_bwd,
+                    temperature=0.5, beta=bwd_beta,
                     condition_block_m=block_m))
 
             latents = mol_batch.latent_params()
@@ -2268,6 +2391,58 @@ class Modeller:
 
         return pooled
 
+    def _eval_conditional_stats(self, stats):
+        """quick_tb_stats plus the condition-aware metrics (_update_rolling's set)
+        for a pooled EVAL batch. log_metrics runs quick_tb_stats on the eval streams
+        without a condition axis, which omits logw_std_within -- exactly the kind of
+        metric a conditional generalization check turns on -- so it is computed here
+        for train and held-out alike, off the same code path, to keep the comparison
+        like-for-like."""
+        log_pf = stats['log_pfs'].sum(-1)
+        log_pb = stats['log_pbs'].sum(-1)
+        log_z = stats['log_Z_learned']
+        log_r = stats['log_r']
+        cid = stats.get('condition_id')
+        out = quick_tb_stats(log_pf, log_pb, log_z, log_r,
+                             clip_beta=getattr(self.args.fwd_loss_coeffs, 'beta', None),
+                             condition_id=cid,
+                             worst_quantile=self.args.conditional_worst_quantile,
+                             **self._reward_ramp_kwargs(cid))
+        if cid is not None:
+            within = within_condition_logw_std(log_pf, log_pb, log_r, cid)
+            if math.isfinite(within):
+                out['logw_std_within'] = within
+        return out
+
+    @torch.no_grad()
+    def log_test_metrics(self, eval_discretizer, fwd_stats):
+        """
+        Conditional generalization check: the same on-policy eval protocol run
+        against HELD-OUT conditions (test_molecules_path), logged under
+        'eval_test/', with 'eval_gap/' = train - test on the headline metrics.
+
+        Pure measurement. fwd_eval_sampling runs with side_effects=False, so the
+        held-out conditions never reach condition_log_z, the anchor buffer, or
+        prior-buffer churn, and nothing here feeds a gate, controller or loss.
+        """
+        n = getattr(self.args, 'test_eval_num_samples', None) or self.args.eval_num_samples
+        test_stats, _ = self.fwd_eval_sampling(self.ema_model, eval_discretizer,
+                                               override_num_samples=int(n),
+                                               dataset=self.test_mol_dataset,
+                                               side_effects=False)
+        train_m = self._eval_conditional_stats(fwd_stats)
+        test_m = self._eval_conditional_stats(test_stats)
+
+        metrics = {f'eval_test/{k}': v for k, v in test_m.items()}
+        for k in ('logw_std_within', 'cond_tb_err', 'tb_err_worst', 'z_grad_worst'):
+            if k in train_m:
+                metrics[f'eval_fwd/{k}'] = train_m[k]
+        for k in ('cond_tb_err', 'tb_err_worst', 'z_grad_worst', 'scatter_err',
+                  'logw_std_within', 'relative_under'):
+            if k in train_m and k in test_m:
+                metrics[f'eval_gap/{k}'] = train_m[k] - test_m[k]
+        return metrics
+
     def log_metrics(self, fwd_stats, bwd_stats, sample_batch):
 
         metrics = {}
@@ -2403,6 +2578,15 @@ class Modeller:
             if 'energy' in key or 'pot' in key:
                 metrics['Mean ' + key] = val(sample_batch[key].mean())
 
+        # the rotational Haar jacobian terms diverge (log) at r -> 0 and theta -> 0/pi
+        # (clamped at ~37 nats), so a rare singularity graze moves the batch mean by
+        # ~nothing -- the max is the diagnostic. jacob_july24: healthy-window peaks run
+        # 0.8-3.5 nats and only hit the cap during an excursion already underway, so a
+        # peak in the tens is a symptom to read, not a cause to chase
+        for key in ['rot_r_jacobian_energy', 'rot_theta_jacobian_energy']:
+            if key in sample_batch.keys():
+                metrics['Max ' + key] = val(sample_batch[key].max())
+
         # physical properties
         metrics['Mean Packing Coeff'] = val(sample_batch.packing_coeff.mean())
         metrics['Packing Coeff'] = arr(sample_batch.packing_coeff.clip(max=2))
@@ -2520,35 +2704,42 @@ class Modeller:
         fwd_stats, sample_batch = self.fwd_eval_sampling(self.ema_model, eval_discretizer)
         bwd_stats = self.bwd_eval_sampling(eval_discretizer)
         metrics.update(self.log_metrics(fwd_stats, bwd_stats, sample_batch))
+        if getattr(self, 'test_mol_dataset', None) is not None:
+            metrics.update(self.log_test_metrics(eval_discretizer, fwd_stats))
 
         self.times['eval_figs_start'] = time()
+        fig_dict = {}
         if do_figs or override_do_figs:
-            x, y = next(self.prior_dataset.loader(batch_size=10000, mode='tensors'))
-            anchor_buffer = getattr(self, 'anchor_buffer', None)
-            anchor_latents = (anchor_buffer.x.detach().cpu().numpy()
-                              if anchor_buffer is not None and len(anchor_buffer) > 0 else None)
-            # always sample from forward policy
-            fig_dict, metrics = eval_figs(fwd_stats,
-                                          bwd_stats,
-                                          sample_batch.cpu(),
-                                          x,
-                                          self.args.energy_function,
-                                          metrics,
-                                          temperature_conditioning=self.args.temperature_conditioning,
-                                          anchor_latents=anchor_latents)
+            # backstop on top of eval_figs' per-block guards: nothing in
+            # figure land may interrupt a live run
+            with fig_guard('eval figure generation'):
+                x, y = next(self.prior_dataset.loader(batch_size=10000, mode='tensors'))
+                anchor_buffer = getattr(self, 'anchor_buffer', None)
+                anchor_latents = (anchor_buffer.x.detach().cpu().numpy()
+                                  if anchor_buffer is not None and len(anchor_buffer) > 0 else None)
+                # always sample from forward policy
+                fig_dict, metrics = eval_figs(fwd_stats,
+                                              bwd_stats,
+                                              sample_batch.cpu(),
+                                              x,
+                                              self.args.energy_function,
+                                              metrics,
+                                              temperature_conditioning=self.args.temperature_conditioning,
+                                              anchor_latents=anchor_latents)
             if hasattr(self, 'condition_log_z'):
                 # cross-sections of the per-condition tracker state -- built
                 # purely from its running stats, no sampling / energy calls
-                fig_dict.update(condition_tracker_figs(
-                    self.condition_log_z, self.energy_function, self.step_ind))
-        else:
-            fig_dict = {}
+                with fig_guard('condition tracker figs'):
+                    fig_dict.update(condition_tracker_figs(
+                        self.condition_log_z, self.energy_function, self.step_ind,
+                        worst_quantile=self.args.conditional_worst_quantile))
         self.times['eval_figs_end'] = time()
 
         '''logging and wrap up'''
         self.times['eval_wrapup_start'] = time()
         if do_figs:
-            adjust_fig_filesize(fig_dict)
+            with fig_guard('fig filesize adjustment'):
+                adjust_fig_filesize(fig_dict)
             metrics.update(fig_dict)
 
         metrics.update({
@@ -2663,6 +2854,7 @@ class Modeller:
 
         if hasattr(self, 'replay_buffer'):
             valid_replay_losses = self.replay_buffer.ema_loss[~torch.isnan(self.replay_buffer.ema_loss)].cpu().numpy()
+            replay_age = (self.step_ind - self.replay_buffer.birth_step).float()
             metrics.update({
                 'replay_buffer_length': len(self.replay_buffer),
                 'replay_buffer_mean_steps': torch.nanmean(self.replay_buffer.select_counts.float()).item(),
@@ -2670,7 +2862,12 @@ class Modeller:
                 'replay_buffer_mean_loss': torch.nanmean(self.replay_buffer.ema_loss).item(),
                 'replay_buffer_median_loss': torch.nanmedian(self.replay_buffer.ema_loss).item(),
                 'replay_buffer_step_hist': safe_histogram(self.replay_buffer.select_counts.cpu().numpy()),
+                'replay_buffer_mean_age': replay_age.mean().item(),
+                'replay_buffer_max_age': replay_age.max().item() if replay_age.numel() > 0 else 0.0,
             })
+            if hasattr(self, '_replay_admit_cap'):
+                metrics['replay_buffer_admit_cap'] = self._replay_admit_cap
+                metrics['replay_buffer_admit_health'] = self._replay_admit_health
             metrics.update(self.energy_reward_stats('replay_buffer', energy=self.replay_buffer.y))
             if len(valid_replay_losses) > 0:
                 metrics['replay_buffer_loss_hist'] = safe_histogram(
@@ -2679,15 +2876,37 @@ class Modeller:
             # churn accumulated since the previous eval's drain, i.e. one full
             # eval period of train steps; drained here so the counts are a rate
             # per window rather than a run-total
-            admitted = self.replay_churn['admitted'] + self.replay_churn['random_admitted']
+            admitted = self.replay_churn['admitted']
             metrics.update({
                 'replay_buffer_admitted': admitted,
-                'replay_buffer_random_admitted': self.replay_churn['random_admitted'],
                 'replay_buffer_evicted': self.replay_churn['evicted'],
                 'replay_buffer_turnover': admitted / max(len(self.replay_buffer), 1),
             })
             for key in self.replay_churn:
                 self.replay_churn[key] = 0
+
+            # TTL-cohort readouts (see manage_replay_buffer's tally comments):
+            # absorbed_frac = of rows resolved this window (corrected below the
+            # floor OR expired), the fraction replay finished before the clock
+            # -- the direct "is the TTL long enough for the supersampling rate"
+            # signal. expired_undrawn_frac = expiries that never got a single
+            # draw (wasted slots: buffer oversized or replay share too low).
+            # expired_delta = mean death-minus-birth |resid| over drawn
+            # expiries (negative = partial progress on the rows replay didn't
+            # finish). expired_draws = mean draws those rows received.
+            coh = self.replay_cohort
+            resolved = coh['absorbed'] + coh['expired']
+            if resolved > 0:
+                metrics['replay_buffer_absorbed_frac'] = coh['absorbed'] / resolved
+            if coh['expired'] > 0:
+                metrics['replay_buffer_expired_undrawn_frac'] = coh['expired_undrawn'] / coh['expired']
+            if coh['expired_delta_n'] > 0:
+                metrics['replay_buffer_expired_delta'] = coh['expired_delta_sum'] / coh['expired_delta_n']
+            if coh['expired_drawn'] > 0:
+                metrics['replay_buffer_expired_draws'] = coh['expired_draws_sum'] / coh['expired_drawn']
+            self.replay_cohort = {'absorbed': 0, 'expired': 0, 'expired_undrawn': 0,
+                                  'expired_drawn': 0, 'expired_draws_sum': 0,
+                                  'expired_delta_sum': 0.0, 'expired_delta_n': 0}
 
         if hasattr(self, 'anchor_buffer'):
             metrics['anchor_buffer_length'] = len(self.anchor_buffer)
@@ -2778,6 +2997,22 @@ class Modeller:
         ema_log_z_emp = tracker.ema_log_z_emp[valid].cpu().numpy()
         gap = ema_log_z_emp - ema_logw
 
+        # other per-condition tracker fields, already maintained per condition
+        # (same cross-sections the Condition Tracker Histograms plotly builds) --
+        # surfaced here as native wandb histograms too. The tb_err distribution is
+        # what the tb_err_worst gate takes its quantile OF, so this histogram is
+        # the gate's own tail made visible: a single blown condition sits out here
+        # while the pooled fit reads fine. tb_err/z_grad/z_bias are nan on
+        # conditions not yet residual-warm; safe_histogram drops non-finite
+        # entries, so no extra masking is needed.
+        logw_std = np.sqrt(
+            (tracker.ema_logw_sq - tracker.ema_logw ** 2).clamp(min=0.0)[valid].cpu().numpy())
+        tb_err = tracker.cond_tb_err[valid].cpu().numpy()
+        z_grad = tracker.z_grad_ema[valid].cpu().numpy()
+        z_bias = tracker.z_bias_ema[valid].cpu().numpy()
+        best_energy = tracker.best_energy[valid].cpu().numpy()
+        best_energy = best_energy[np.isfinite(best_energy)]  # inf == visited but no energy yet
+
         metrics.update({
             'condition_log_z_num_visited': int(valid.sum().item()),
             'condition_log_z_mean_ema_logw': float(np.mean(ema_logw)),
@@ -2789,7 +3024,16 @@ class Modeller:
             'condition_log_z_mean_gap': float(np.mean(gap)),
             'condition_log_z_median_gap': float(np.median(gap)),
             'condition_log_z_gap_hist': safe_histogram(gap, num_bins=128),
+            'condition_logw_std_hist': safe_histogram(logw_std, num_bins=128),
+            'condition_tb_err_hist': safe_histogram(tb_err, num_bins=128),
+            'condition_z_grad_hist': safe_histogram(z_grad, num_bins=128),
+            'condition_z_bias_hist': safe_histogram(z_bias, num_bins=128),
+            'condition_best_energy_hist': safe_histogram(best_energy, num_bins=128),
         })
+        if np.isfinite(tb_err).any():
+            metrics['condition_tb_err_median'] = float(np.nanmedian(tb_err))
+        if best_energy.size:
+            metrics['condition_best_energy_median'] = float(np.median(best_energy))
         return metrics
 
     def energy_reward_stats(self, prefix, energy=None, reward=None):
@@ -2808,6 +3052,13 @@ class Modeller:
 
         energy_np = energy.detach().cpu().numpy()
         reward_np = reward.detach().cpu().numpy()
+
+        # an empty buffer is a legitimate state (a fresh/flushed replay buffer
+        # before its first admission, or one the TTL has fully drained), and
+        # min/max have no identity on an empty array -- log nothing rather than
+        # crash the eval; the corresponding *_length metric carries the fact
+        if energy_np.size == 0:
+            return {}
 
         return {
             f'{prefix}_mean_energy': float(np.mean(energy_np)),
@@ -2869,38 +3120,7 @@ class Modeller:
             )
             self.prior_churn['evicted'] += len_before - len(self.prior_buffer)
 
-        remaining_budget = n_to_add  # - len(bad_inds)
-
-        # sample from prior. Before the warm-start stage's snapshot_prior action
-        # has run (or on a run whose protocol never takes one), no prior model
-        # exists yet, so the churn draw is skipped: prior_buffer stays the
-        # dataset-seeded set, refreshed only by the anchor top-up paths below.
-        # Safe with the dataset seed under max_size (headroom > n_to_add), so no
-        # purge fires above either.
-        if remaining_budget > 0 and hasattr(self, 'prior_model'):
-            metrics, sample_batch = self.sample_from_prior(remaining_budget)
-            reward = metrics['log_r']
-            energy = -reward * (10 ** metrics['log_T_tensor'])
-            energy_floor = self._condition_energy_floor(metrics['condition_id'])
-            if energy_floor is not None:
-                good_inds = torch.argwhere(
-                    energy < energy_floor + self._ramp_params()[0]).flatten()
-            else:
-                good_inds = torch.argwhere(reward > self.args.buffers.prior_buffer.reward_min).flatten()
-            if good_inds.numel() > 0:
-                batch_to_add = sample_batch.subsample_new_batch(good_inds)
-                self.prior_buffer.add(batch_to_add)
-            # denominator for the source mix: how much of the churn budget the
-            # prior model earned before any anchor fallback fires below
-            self.prior_churn['from_prior_model'] += int(good_inds.numel())
-            self.prior_churn['budget'] += int(remaining_budget)
-
-            # this cycle's prior-model draw came up short of admissible samples --
-            # top up the gap from the permanent anchor archive instead of just
-            # accepting a smaller churn this round
-            shortfall = remaining_budget - good_inds.numel()
-            if shortfall > 0 and getattr(self, 'anchor_buffer', None) is not None and len(self.anchor_buffer) > 0:
-                self.top_up_prior_from_anchors(shortfall)
+        self._prior_churn_cycle(n_to_add)
 
         # reach trigger: even prior_buffer's own upper tail is still hugging its
         # own condition's floor instead of reaching up toward that condition's
@@ -2926,6 +3146,150 @@ class Modeller:
                     reach = 1.0 - torch.quantile(excess, cfg.reach_quantile).item() / margin
                     if reach < cfg.reach_threshold:
                         self.top_up_prior_from_anchors(cfg.reach_topup_size, purge_worst=True)
+
+    def _prior_buffer_len(self):
+        """len(prior_buffer) that tolerates the buffer not existing --
+        rebuild_prior_by_churn deletes it and refills from nothing, so its loop
+        can't assume the attribute is there yet."""
+        buff = getattr(self, 'prior_buffer', None)
+        return 0 if buff is None else len(buff)
+
+    def _admit_to_prior_buffer(self, batch):
+        """Add an admitted batch, constructing prior_buffer around the first one
+        when it doesn't exist yet. manage_prior_buffer builds the buffer up
+        front from its own sample_batch, but the from-zero rebuild has no such
+        batch in hand, and either source (prior model or anchor top-up) may be
+        the one that lands first."""
+        if getattr(self, 'prior_buffer', None) is None:
+            self.prior_buffer = self._fresh_prior_buffer(batch)
+        else:
+            self.prior_buffer.add(batch)
+
+    def _prior_churn_cycle(self, budget: int):
+        """
+        One churn admission cycle: draw `budget` from the prior model, admit
+        what sits within ramp_floor of its own condition's best known energy,
+        and backfill the shortfall from the permanent anchor archive.
+
+        Shared by manage_prior_buffer's eval-cadence churn and
+        rebuild_prior_by_churn's from-zero fill, so a rebuilt buffer holds the
+        same source mix the running churn would have produced rather than a
+        composition that has to be ground out afterwards.
+
+        Before the warm-start stage's snapshot_prior action has run (or on a
+        run whose protocol never takes one) no prior model exists, so the draw
+        is skipped entirely and the caller's buffer is left to the anchor
+        top-up paths.
+        """
+        if budget <= 0 or not hasattr(self, 'prior_model'):
+            return
+
+        metrics, sample_batch = self.sample_from_prior(budget)
+        reward = metrics['log_r']
+        energy = -reward * (10 ** metrics['log_T_tensor'])
+        energy_floor = self._condition_energy_floor(metrics['condition_id'])
+        if energy_floor is not None:
+            good_inds = torch.argwhere(
+                energy < energy_floor + self._ramp_params()[0]).flatten()
+        else:
+            good_inds = torch.argwhere(reward > self.args.buffers.prior_buffer.reward_min).flatten()
+        if good_inds.numel() > 0:
+            self._admit_to_prior_buffer(sample_batch.subsample_new_batch(good_inds))
+        # denominator for the source mix: how much of the churn budget the
+        # prior model earned before any anchor fallback fires below
+        self.prior_churn['from_prior_model'] += int(good_inds.numel())
+        self.prior_churn['budget'] += int(budget)
+
+        # this cycle's prior-model draw came up short of admissible samples --
+        # top up the gap from the permanent anchor archive instead of just
+        # accepting a smaller churn this round
+        shortfall = budget - int(good_inds.numel())
+        if shortfall > 0 and getattr(self, 'anchor_buffer', None) is not None and len(self.anchor_buffer) > 0:
+            self.top_up_prior_from_anchors(shortfall)
+
+    @torch.no_grad()
+    def rebuild_prior_by_churn(self, target_size: Optional[int] = None):
+        """
+        Stage action ('rebuild_prior_by_churn[:N]'): discard prior_buffer and
+        refill it from zero by repeating the ordinary churn admission cycle
+        (_prior_churn_cycle) until it holds target_size rows.
+
+        Replaces reseed_prior_from_dataset:flush at the post-handoff boundary,
+        which refilled to max_size straight from the prior dataset with no
+        admission gate. That left two problems this avoids:
+
+          composition -- the buffer arrived holding material the online gate
+          would never have admitted, so backward TB trained against it while
+          churn slowly ground it back out;
+
+          rate -- a buffer at max_size has no headroom, so manage_prior_buffer
+          falls through to the eligible-drop branch, and get_elig_drop_count
+          needs select_counts >= min_visits, which only draws supply. Across a
+          stage whose backward branch sits below deactivate_threshold nothing
+          is ever drawn, so the eligible set stays empty, n_to_add collapses to
+          zero and the prior-model draw is skipped for the whole stage -- the
+          reach trigger's fixed top-up becomes the only intake.
+
+        target_size defaults to buffers.prior_buffer.init_fraction of max_size.
+        Stopping short of max_size is the point: the leftover headroom is what
+        keeps the draw path open afterwards.
+
+        Re-drawing each cycle (rather than one large draw split by source)
+        keeps the result a genuine sample of what churn produces -- a low-yield
+        prior lands anchor-dominated through the same shortfall backfill the
+        eval-cadence path uses, instead of a fixed ratio imposed up front. A
+        cycle that admits nothing at all ends the loop: with no prior model and
+        no anchors to backfill from, further rounds cannot make progress.
+
+        Admissions tally into prior_churn as usual, so the eval window
+        containing this transition reports the rebuild's own source mix rather
+        than a steady-state rate.
+        """
+        cfg = self.args.buffers.prior_buffer
+        if target_size is None:
+            target_size = int(cfg.max_size * getattr(cfg, 'init_fraction', 0.25))
+        target_size = max(0, min(int(target_size), cfg.max_size))
+
+        n_before = self._prior_buffer_len()
+        # the outgoing buffer is held, not dropped, until the rebuild has
+        # something to replace it with: bwd_train_step's draw doesn't guard on
+        # the attribute existing, so a rebuild that admitted nothing must leave
+        # the incumbent in place rather than a hole
+        incumbent = getattr(self, 'prior_buffer', None)
+        if hasattr(self, 'prior_buffer'):
+            del self.prior_buffer
+        if target_size == 0:
+            print("rebuild_prior_by_churn: target_size 0, prior_buffer left empty")
+            return
+
+        per_cycle = max(1, min(cfg.min_size, target_size))
+        # ceil division without importing math; 4x slack over the ideal cycle
+        # count absorbs partial-admission rounds without spinning forever
+        max_cycles = 4 * (-(-target_size // per_cycle)) + 4
+
+        cycles = 0
+        while self._prior_buffer_len() < target_size and cycles < max_cycles:
+            before = self._prior_buffer_len()
+            self._prior_churn_cycle(min(per_cycle, target_size - before))
+            cycles += 1
+            if self._prior_buffer_len() == before:
+                print(f"rebuild_prior_by_churn: cycle {cycles} admitted nothing, stopping early")
+                break
+        else:
+            if self._prior_buffer_len() < target_size:
+                print(f"rebuild_prior_by_churn: hit the {max_cycles}-cycle cap "
+                      f"{self._prior_buffer_len()}/{target_size} rows short of target -- "
+                      f"admission yield is low, not a stall")
+
+        if getattr(self, 'prior_buffer', None) is None and incumbent is not None:
+            self.prior_buffer = incumbent
+            print(f"rebuild_prior_by_churn: nothing admitted, restored the incumbent "
+                  f"{n_before}-row buffer (no prior model and no anchors to draw from)")
+            return
+
+        print(f"rebuild_prior_by_churn: prior_buffer {n_before} -> {self._prior_buffer_len()} rows "
+              f"(target {target_size}, {cycles} churn cycles, {cfg.max_size - self._prior_buffer_len()} "
+              f"rows of headroom left for churn)")
 
     @torch.no_grad()
     def top_up_prior_from_anchors(self, n, purge_worst: bool = False):
@@ -2962,7 +3326,7 @@ class Modeller:
         """
         cfg = self.args.buffers.anchor_buffer
 
-        if purge_worst and len(self.prior_buffer) > 0:
+        if purge_worst and self._prior_buffer_len() > 0:
             n_purge = min(n, len(self.prior_buffer))
             worst_first = torch.argsort(self.prior_buffer.y.cpu(), descending=True)  # highest energy = lowest reward
             self.prior_buffer.purge_by_index(worst_first[:n_purge].numpy())
@@ -3002,7 +3366,7 @@ class Modeller:
         else:
             good_inds = torch.argwhere(reward > self.args.buffers.prior_buffer.reward_min).flatten()
         if good_inds.numel() > 0:
-            self.prior_buffer.add(anchor_batch.subsample_new_batch(good_inds))
+            self._admit_to_prior_buffer(anchor_batch.subsample_new_batch(good_inds))
         # accumulated across calls (shortfall + reach trigger can both fire in
         # one cycle); log_buffer_stats zeroes it on read
         self.prior_churn['from_anchors'] += int(good_inds.numel())
@@ -3069,6 +3433,14 @@ class Modeller:
         ramp_floor of best + anchor top-ups) re-broadens the buffer -- and
         with reseed_prior_from_dataset at the following stage boundary to
         restore coverage wholesale.
+
+        If buffers.anchor_buffer.mcmc is set (sweeps > 0), each tiled copy is
+        relaxed by a short local Metropolis walk at its own target temperature
+        (_metropolis_reheat) instead of a single isotropic kick, so the seed
+        approximates each basin's local thermal shape -- a near-calibrated
+        z_match log-Z handoff and a realistic mode handed to buildout, rather
+        than a fixed-width noise ball. noise_log_range still drives the isotropic
+        fallback (and top_up_prior_from_anchors, which is unchanged).
         """
         cfg = self.args.buffers.anchor_buffer
         uniq_ids, row_idx = self.anchor_buffer.best_per_condition_indices()
@@ -3077,13 +3449,27 @@ class Modeller:
 
         tiled_idx = row_idx.repeat_interleave(n_per_condition)
         seed_batch = self.anchor_buffer.batch.subsample_new_batch(tiled_idx).clone().to(self.device)
-        seed_batch.log_noise_latent_parameters(*cfg.noise_log_range)
+
+        mcmc_cfg = getattr(cfg, 'mcmc', None)
+        use_mcmc = mcmc_cfg is not None and getattr(mcmc_cfg, 'sweeps', 0) > 0
+        if not use_mcmc:
+            # isotropic fallback: one log-uniform latent kick per copy, applied
+            # (as before) before conditioning so the noised state is what gets
+            # conditioned, oriented and scored
+            seed_batch.log_noise_latent_parameters(*cfg.noise_log_range)
 
         seed_batch, log_T_tensor, sg_inds, zps, condition, condition_id = self.energy_function.condition_samples(
             seed_batch, sg_inds=seed_batch.sg_ind, z_primes=seed_batch.z_prime)
         seed_batch.orient_molecule(mode='std')
 
-        terminal_latents = seed_batch.latent_params()
+        if use_mcmc:
+            # replace the single kick with a local MH walk at target T; conditions
+            # and log_T are now fixed per row (each chain lives at one condition)
+            terminal_latents = self._metropolis_reheat(seed_batch, log_T_tensor, mcmc_cfg)
+            if getattr(mcmc_cfg, 'log_geometry', True):
+                self._reheat_geometry(terminal_latents, n_per_condition, uniq_ids)
+        else:
+            terminal_latents = seed_batch.latent_params()
         reward, seed_batch = self.energy_function.log_reward(
             terminal_latents, seed_batch, log_T_tensor, return_exp=True)
 
@@ -3104,6 +3490,228 @@ class Modeller:
             else:
                 self.prior_buffer.add(seed_batch.subsample_new_batch(good_inds))
         self.prior_churn['from_anchors'] += int(good_inds.numel())
+
+    @torch.no_grad()
+    def _metropolis_reheat(self, batch, log_T_tensor, mcfg):
+        """
+        Local Metropolis-Hastings reheat of the seed anchors, replacing the
+        single isotropic-noise kick in seed_prior_from_condition_minima. Every
+        row of `batch` is an INDEPENDENT chain started at its own (argmin-anchor)
+        latent; the ensemble of terminal latents is returned [B, D] and becomes
+        the flushed prior seed.
+
+        Rationale: a log-uniform noise shell has an entropy unrelated to the
+        target, so the level backward-TB converges to on it (bounded by the
+        buffer's own entropy) carries an E_q[log q/p] bias that z_match then has
+        to walk off. MH at target T instead relaxes each anchor toward the LOCAL
+        thermal shape of its basin, so the seeded buffer's level sits near the
+        local free energy (near-calibrated handoff) and the mode shape handed to
+        buildout's forward policy is realistic rather than a fixed-radius ball.
+
+        Correctness notes (see energies/molecular_crystal.py):
+          - energy() builds the crystal straight from the raw latent x, so we
+            score proposals directly -- no latent_to_cell_params round trip.
+          - the +-1 latent box is a SOFT temperature-scaled quadratic wall in
+            generator_energy (the raw_latents penalty), and the change of
+            variables is already in jacobian_energy, so plain MH on log_reward
+            samples the true target with NO boundary clip/reject or Jacobian
+            bookkeeping. Non-finite scores are rejected defensively (they should
+            not arise: inf/nan crystal terms are patched to 0, which scores worse
+            than a cohesive minimum and so is rejected on its own).
+
+        Locality: single-basin is held by starting at the one lowest-energy
+        anchor and taking SMALL isotropic steps (barriers >> kT at target T), not
+        by a geometric radius (which would re-impose the shape bias we remove).
+        Optional energy_ceiling_kt rejects proposals more than that many kT above
+        the chain's running-best reward -- a barrier guard that preserves the
+        thermal shape; it works in log_reward space, already per-row-kT-scaled,
+        so one dimensionless value is correct across conditions. Default off.
+
+        sigma is per-row Robbins-Monro toward target_accept during burn_in, then
+        frozen so the collected terminal is a draw from a fixed-kernel chain.
+        """
+        sweeps = int(getattr(mcfg, 'sweeps', 200))
+        burn_in = min(int(getattr(mcfg, 'burn_in', sweeps // 2)), sweeps)
+        target_accept = float(getattr(mcfg, 'target_accept', 0.3))
+        adapt_rate = float(getattr(mcfg, 'sigma_adapt_rate', 0.1))
+        sigma_min = float(getattr(mcfg, 'sigma_min', 1.0e-4))
+        sigma_max = float(getattr(mcfg, 'sigma_max', 0.5))
+        ceiling = getattr(mcfg, 'energy_ceiling_kt', None)
+        ceiling = None if ceiling is None else float(ceiling)
+
+        x = batch.latent_params().clone()                # [B, D], std-oriented start
+        B, device = x.shape[0], x.device
+
+        def score(latents):
+            # log_reward = -energy/T, per row; the one-time big-batch pass is made
+            # self-healing (chunk-on-OOM) rather than a hard crash at the boundary
+            return -self.energy_function.energy(
+                latents, batch, log_T_tensor,
+                return_exp=False, internal_oom_recovery=True).to(device)
+
+        lr = score(x)                                    # [B]
+        best_lr = lr.clone()                             # running basin floor (max reward)
+        sigma = torch.full((B, 1), float(getattr(mcfg, 'init_sigma', 0.02)),
+                           device=device, dtype=x.dtype)
+
+        x0 = x.clone()
+        acc_ema = torch.full((B,), target_accept, device=device)  # log-only
+        max_drift = torch.zeros(B, device=device)
+
+        for t in range(sweeps):
+            x_prop = x + sigma * torch.randn_like(x)
+            lr_prop = score(x_prop)
+            accept = torch.isfinite(lr_prop) & (
+                torch.log(torch.rand(B, device=device)) < (lr_prop - lr))
+            if ceiling is not None:
+                accept = accept & (lr_prop >= best_lr - ceiling)
+
+            x = torch.where(accept[:, None], x_prop, x)
+            lr = torch.where(accept, lr_prop, lr)
+
+            if t < burn_in:
+                best_lr = torch.maximum(best_lr, lr)
+                sigma = (sigma * torch.exp(
+                    adapt_rate * (accept.float()[:, None] - target_accept))
+                         ).clamp_(sigma_min, sigma_max)
+
+            acc_ema = 0.98 * acc_ema + 0.02 * accept.float()
+            max_drift = torch.maximum(max_drift, (x - x0).norm(dim=-1))
+
+        # eyeball diagnostics: excursion = best_lr - lr is the terminal energy
+        # above the basin floor in units of that row's kT; equipartition puts its
+        # mean near D/2 for a ~D-dim basin, so a mean near 0 means the walk never
+        # heated (sigma too small / burn_in too short) and a very large mean or
+        # drift means chains ran out of the basin
+        excursion = best_lr - lr
+        print(
+            f"metropolis_reheat: {sweeps} sweeps (burn {burn_in}), {B} chains | "
+            f"accept {acc_ema.mean().item():.2f} (min {acc_ema.min().item():.2f}) | "
+            f"sigma mean {sigma.mean().item():.3f} [{sigma.min().item():.3f}, {sigma.max().item():.3f}] | "
+            f"terminal excursion/kT mean {excursion.mean().item():.2f} max {excursion.max().item():.2f} | "
+            f"latent drift max {max_drift.max().item():.3f}"
+            + ("" if ceiling is None else f" | ceiling {ceiling:.1f} kT"))
+        return x
+
+    @torch.no_grad()
+    def _reheat_geometry(self, x, n_per_condition, uniq_ids=None):
+        """
+        Landscape survey riding along free on _metropolis_reheat's terminal
+        ensemble: per condition, the shape of its local thermal mode IN LATENT
+        SPACE -- the space the policy actually has to fit, so this is the
+        anisotropy that matters for fitting, not the physical-space one.
+
+        One DxD covariance + eigendecomposition per condition, once at the stage
+        boundary. Per condition:
+
+          log10_kappa   log10 of the covariance condition number lam_max/lam_min
+                        -- the anisotropy. Large = the mode is a thin sliver:
+                        stiff cooperative contact-compression directions against
+                        soft collective slide/libration directions.
+          n_soft        participation ratio (sum lam)^2 / sum(lam^2): the
+                        effective number of directions carrying the thermal
+                        variance, i.e. the floppy-mode count. The jamming
+                        reading is that denser / higher-coordination targets have
+                        FEWER of these and should be correspondingly harder.
+          bend_deg      angle between the leading eigenvector of the low half and
+                        of the high half of the cloud (split at the median
+                        projection onto the global leading eigenvector). ~0 for a
+                        straight anisotropic valley; large means the principal
+                        axis ROTATES as you traverse the mode -- a curved valley,
+                        which no whitening / linear reparameterization can
+                        straighten, and the reason plain ill-conditioning
+                        understates the difficulty.
+          lam_gap       log10(lam_max / lam_2nd). ONLY read bend_deg where this
+                        is appreciable: with no well-separated leading axis the
+                        two half-clouds pick near-orthogonal noise directions and
+                        bend saturates near 90 for a perfectly isotropic mode.
+                        The printed bend summary is restricted to lam_gap > 0.1.
+                        That bar has to stay LOW: curvature itself inflates
+                        lam_2nd (the bent coordinate carries real variance), so a
+                        strict bar throws away exactly the curved modes it is
+                        meant to qualify. Calibrated on synthetics -- isotropic
+                        0.02, curved valley 0.38, straight sliver 3.8.
+          max_abs_skew  largest |skewness| over the principal axes: the signature
+                        of asymmetric truncation -- a direction that is soft one
+                        way and runs into an exponential contact wall the other.
+
+        Read bend and skew together: straight-but-wall-clipped is (low bend, high
+        skew); a curved valley is (high bend, high skew) since bending itself
+        skews the bent coordinate. Curvature is what bend alone identifies.
+
+        Needs n_per_condition > D + 1 for the covariance (and > 2D + 2 for the
+        bend's half-cloud split); returns None otherwise. Full per-condition
+        tensors are stashed on self._last_reheat_geometry for inspection.
+        """
+        n = int(n_per_condition)
+        if n < 2 or x.shape[0] % n != 0:
+            return None
+        M, D = x.shape[0] // n, x.shape[1]
+        if n <= D + 1:
+            print(f"reheat geometry: skipped -- n_per_condition {n} <= latent dim {D} + 1, "
+                  f"the per-condition covariance would be rank-deficient")
+            return None
+
+        xc = x.detach().to(torch.float64).reshape(M, n, D)
+        dx = xc - xc.mean(dim=1, keepdim=True)
+        cov = dx.transpose(1, 2) @ dx / (n - 1)                   # [M, D, D]
+        lam, vec = torch.linalg.eigh(cov)                         # ascending
+        lam = lam.clamp_min(1e-30)
+
+        log10_kappa = torch.log10(lam[:, -1] / lam[:, 0])
+        lam_gap = torch.log10(lam[:, -1] / lam[:, -2])   # leading-axis separation
+        n_soft = lam.sum(dim=1) ** 2 / (lam ** 2).sum(dim=1)
+
+        proj = dx @ vec                                           # [M, n, D] principal basis
+        skew = ((proj / proj.std(dim=1, keepdim=True).clamp_min(1e-30)) ** 3).mean(dim=1)
+        max_abs_skew = skew.abs().max(dim=1).values
+
+        half = n // 2
+        if half > D + 1:
+            order = proj[:, :, -1].argsort(dim=1)
+
+            def half_cloud(idx):
+                return torch.gather(dx, 1, idx[:, :, None].expand(-1, -1, D))
+
+            def lead_vec(block):
+                b = block - block.mean(dim=1, keepdim=True)
+                _, v = torch.linalg.eigh(b.transpose(1, 2) @ b / (b.shape[1] - 1))
+                return v[:, :, -1]
+
+            cos = (lead_vec(half_cloud(order[:, :half])) *
+                   lead_vec(half_cloud(order[:, -half:]))
+                   ).sum(dim=1).abs().clamp(max=1.0)             # sign-folded
+            bend_deg = torch.rad2deg(torch.arccos(cos))
+        else:
+            bend_deg = torch.full((M,), float('nan'), dtype=torch.float64, device=x.device)
+
+        stats = {'log10_kappa': log10_kappa.cpu(), 'n_soft': n_soft.cpu(),
+                 'bend_deg': bend_deg.cpu(), 'max_abs_skew': max_abs_skew.cpu(),
+                 'lam_gap': lam_gap.cpu()}
+        if uniq_ids is not None:
+            stats['condition_id'] = uniq_ids.detach().cpu().flatten()
+        self._last_reheat_geometry = stats
+
+        def med(t):
+            finite = t[torch.isfinite(t)]
+            return float(finite.median()) if finite.numel() else float('nan')
+
+        # bend is only meaningful where a leading axis is actually resolved
+        bend_ok = stats['bend_deg'][torch.isfinite(stats['bend_deg']) & (stats['lam_gap'] > 0.1)]
+        bend_worst = float(bend_ok.max()) if bend_ok.numel() else float('nan')
+        bend_med = float(bend_ok.median()) if bend_ok.numel() else float('nan')
+        worst = int(torch.argmax(stats['log10_kappa']))
+        worst_id = ('' if uniq_ids is None
+                    else f" @condition_id {int(stats['condition_id'][worst])}")
+        print(
+            f"reheat geometry: {M} conditions, D={D}, n={n} per condition | "
+            f"log10 kappa med {med(stats['log10_kappa']):.2f} "
+            f"worst {float(stats['log10_kappa'].max()):.2f}{worst_id} | "
+            f"n_soft med {med(stats['n_soft']):.1f} min {float(stats['n_soft'].min()):.1f} | "
+            f"bend deg [{bend_ok.numel()}/{M} resolved] med {bend_med:.0f} worst {bend_worst:.0f} | "
+            f"max|skew| med {med(stats['max_abs_skew']):.2f} "
+            f"worst {float(stats['max_abs_skew'].max()):.2f}")
+        return stats
 
     @torch.no_grad()
     def refresh_anchor_buffer_surprise(self):
@@ -3207,20 +3815,55 @@ class Modeller:
     def manage_replay_buffer(self, fwd_stats, sample_batch):
         """
         Stash the full forward trajectory of on-policy samples with sufficiently
-        overweighted (high positive residual) terminal states, so they can later
-        be exactly replayed (get_traj_replay) rather than re-sampled backward.
+        overweighted (high positive or negative residual) terminal states, so
+        they can later be exactly replayed (get_traj_replay) rather than
+        re-sampled backward.
 
-        Unlike the prior buffer, every entry here comes from the same residual
-        criterion, so there's no source mix to budget between -- but we still
-        pace admission by mean_lifetime turnover so a sudden glut of overweighted
-        trajectories can't flood the buffer in a single eval cycle.
+        Two-parameter softmax admission/purge (admit_temperature T, a health-
+        modulated cap) plus a residence TTL, replacing rank-based argsort /
+        beat-the-min admission:
 
-        On top of the residual-driven admission/eviction above, a small amount of
-        pure random churn is swapped in every call (paced by replay_buffer.random_churn_rate
-        per replay train step, mirroring how the prior buffer paces on num_bwd_steps) so the
-        buffer can't become dominated by a handful of rare, mutually-correlated high-residual
-        events. Random adds are still restricted to the top quartile of this batch's residuals,
-        so churn doesn't dilute the buffer with well-covered "good" samples.
+        - Score each candidate/incumbent by |resid| (admission) or ema_loss
+          (purge), CLIPPED to `cap` before dividing by T, then draw without
+          replacement from softmax(clipped_score / T) -- rather than always
+          taking the top-k. Clip-then-divide keeps `cap`'s meaning (an
+          absolute nats bound) independent of whatever T is set to. A single
+          T can't both preserve fine discrimination among ordinary candidates
+          AND stop one extreme value from dominating (the two live at
+          different score scales); clipping is what makes the softmax
+          indifferent among everything past `cap`, so no single outlier can
+          monopolize admission -- it merely competes on equal footing with
+          whatever else is also pinned at the ceiling. Purge mirrors this:
+          LOW ema_loss (boring, already-corrected incumbents) gets high
+          eviction weight.
+        - `cap` is health-modulated: cap(h) = cap_min + (cap_max-cap_min) /
+          (1 + h/h0), h = the tracker's EMA of fwd/scatter_err -- a signal
+          computed off fresh on-policy rollouts, external to this buffer's
+          own contents, so it can't ratchet off its own contamination the
+          way a self-referential (buffer-derived) ceiling would. Healthy
+          policy -> cap ~ cap_max, softmax sharply prefers the worst-
+          surviving candidates (supersample the shoulder -- stiff-wall
+          margins etc., under-visited by on-policy forward sampling alone).
+          Unhealthy policy -> cap ~ cap_min, most candidates clip to the
+          same logit and admission goes near-uniform across a bounded
+          population: a live, representative, non-poisoning snapshot of the
+          CURRENT (bad) distribution rather than a targeted chase of
+          whatever's currently worst -- and the buffer stays populated
+          through the excursion instead of draining, so it's ready the
+          moment health recovers. T stays FIXED throughout -- it only
+          governs shoulder sharpness and must not be recoupled to health,
+          for the same reason a single T can't serve both cap's jobs above:
+          making T health-dependent would re-couple shoulder sharpness to
+          health even though cap already isolates the tail response.
+        - Domain-sanity gate: candidates with non-finite log_r/resid are
+          hard-excluded upstream of the softmax entirely (never merely
+          throttled) -- a NaN/inf-energy state isn't "a real sample that's
+          extreme," there's no slow-not-stop tradeoff to make there.
+        - Residence TTL (max_residence_steps, counted in TRAIN STEPS, not
+          select_counts): unconditional age eviction regardless of ema_loss,
+          so the buffer is a decaying reservoir of the CURRENT policy's tail
+          rather than an accumulating one -- any one row's contents are
+          meaningless on their own, only the live population matters.
         """
         log_r = fwd_stats['log_r']
         log_pf = fwd_stats['log_pf']
@@ -3229,14 +3872,26 @@ class Modeller:
 
         # resid stays on CPU: all the eviction logic below runs against the
         # buffer's CPU-resident ema_loss bookkeeping
-        resid = ((log_pf - log_pb) - (log_r - log_Z_learned)).cpu().abs()
+        resid = ((log_pf - log_pb) - (log_r - log_Z_learned)).cpu()
+        # domain-sanity gate: hard-exclude, never throttled (see docstring)
+        sane = torch.isfinite(log_r).cpu() & torch.isfinite(resid)
 
-        floor = 0.1  # low; doubles as below-capacity admission gate
+        rb_cfg = self.args.buffers.replay_buffer
+        floor = 0.1  # pool-definition cutoff only -- all real discrimination
+        # happens in the softmax + cap below, not in this threshold
 
-        # two-sided admission: though in practice it's almost always positive residuals
-        elig = torch.argwhere(resid > floor).flatten()
-        elig = elig[torch.argsort(resid[elig], descending=True)]
-        cand_resid = resid[elig]
+        h = self.metric_tracker.get('fwd', 'scatter_err')
+        h = max(float(h), 0.0) if h is not None else 0.0  # cold start: treat as healthy
+        cap_max = float(rb_cfg.admit_cap_max)
+        cap_min = float(rb_cfg.admit_cap_min)
+        h0 = float(rb_cfg.admit_cap_health_h0)
+        cap = cap_min + (cap_max - cap_min) / (1.0 + h / h0)
+        T = float(rb_cfg.admit_temperature)
+        self._replay_admit_cap = cap
+        self._replay_admit_health = h
+
+        elig = torch.argwhere(sane & (resid.abs() > floor)).flatten()
+        clipped_score = resid[elig].abs().clamp(max=cap)
         # trajectories go wherever the buffer lives -- no forced D2H when GPU-resident
         flow_states = fwd_stats['flow_states'].detach().to(self.buffer_device)
 
@@ -3244,7 +3899,7 @@ class Modeller:
         if not hasattr(self, 'replay_buffer'):
             if elig.numel() == 0:
                 return
-            add_inds = elig[:self.args.buffers.replay_buffer.max_size]
+            add_inds = elig[_softmax_draw(clipped_score, rb_cfg.max_size, T)]
             self.replay_buffer = CrystalBuffer(
                 sample_batch.subsample_new_batch(add_inds),
                 device=self.buffer_device,
@@ -3252,63 +3907,77 @@ class Modeller:
                 x_fn=None,
                 y_fn=self.args.energy_function,
                 traj=flow_states[add_inds.to(flow_states.device)],
-                init_loss=resid[add_inds],
+                init_loss=resid[add_inds].abs(),
                 exclude_keys=CHURNED_BUFFER_EXCLUDE_KEYS,
+                birth_step=self.step_ind,
             )
             self.replay_churn['admitted'] += int(add_inds.numel())
             return
 
-        # Single-pass churn: every eviction source (toxic, beat-the-min, random)
-        # is collected against the CURRENT indexing, then ONE purge_by_index and
-        # ONE add run at the end. purge_by_index rebuilds the whole resident
-        # store, so the old purge->add->purge sequence paid that full-store
-        # rebuild up to three times per train step. Only behavioral delta:
-        # random churn can no longer evict a row admitted in this same call.
+        # Single-pass churn: every eviction source (toxic/TTL, softmax purge)
+        # is collected against the CURRENT indexing, then ONE purge_by_index
+        # and ONE add run at the end -- purge_by_index rebuilds the whole
+        # resident store, so doing it once instead of per-source matters.
         ema = self.replay_buffer.ema_loss
         n = len(self.replay_buffer)
 
-        # --- unconditional toxic eviction: strictly overfit incumbents ---
-        toxic_mask = ema < floor
+        # --- unconditional eviction: strictly overfit incumbents (ema below
+        # floor -- resid corrected toward zero) plus rows past the residence
+        # ceiling. This is the buffer's primary turnover mechanism: "any one
+        # row should be meaningless" is enforced by age, not by a separate
+        # random-churn pass -- see docstring ---
+        floor_mask = ema < floor
+        expired_mask = torch.zeros_like(floor_mask)
+        max_residence = int(getattr(rb_cfg, 'max_residence_steps', 0) or 0)
+        if max_residence > 0:
+            expired_mask = (self.step_ind - self.replay_buffer.birth_step) > max_residence
+        toxic_mask = floor_mask | expired_mask
         toxic = torch.argwhere(toxic_mask).flatten()
 
-        # --- fill freed + spare slots, then beat-the-min for the rest ---
-        headroom = max(0, self.args.buffers.replay_buffer.max_size - (n - toxic.numel()))
-        free = elig[:headroom]
-        over_idx = elig[headroom:]
-        over_resid = cand_resid[headroom:]
+        # --- TTL-cohort telemetry, tallied by eviction CAUSE. Floor eviction =
+        # absorbed (a row admitted above the floor only gets under it by being
+        # drawn and corrected). TTL expiry = death-by-clock, exogenous to the
+        # loss value, so death-vs-birth deltas on that cohort carry no
+        # selection-on-outcome bias -- unlike floor/displacement evictions,
+        # which are excluded from the delta for exactly that reason. NB an
+        # undrawn row's ema never updates after admission (update_losses only
+        # touches drawn rows), so deltas are only defined on the drawn subset;
+        # undrawn expiries are counted separately as wasted slots.
+        self.replay_cohort['absorbed'] += int(floor_mask.sum())
+        expired_only = expired_mask & ~floor_mask
+        n_expired = int(expired_only.sum())
+        if n_expired > 0:
+            counts = self.replay_buffer.select_counts[expired_only]
+            drawn = counts > 0
+            delta = (ema[expired_only] - self.replay_buffer.birth_loss[expired_only])[drawn]
+            delta = delta[torch.isfinite(delta)]
+            self.replay_cohort['expired'] += n_expired
+            self.replay_cohort['expired_undrawn'] += int((~drawn).sum())
+            self.replay_cohort['expired_drawn'] += int(drawn.sum())
+            self.replay_cohort['expired_draws_sum'] += int(counts[drawn].sum())
+            self.replay_cohort['expired_delta_sum'] += float(delta.sum())
+            self.replay_cohort['expired_delta_n'] += int(delta.numel())
 
-        drop_pos = torch.empty(0, dtype=torch.long)
-        if over_idx.numel() > 0:
-            live = torch.argwhere(~toxic_mask).flatten()
-            order = live[torch.argsort(ema[live])]  # ascending, worst-first, toxic excluded
-            inc_loss = ema[order]
-            k = min(over_resid.numel(), order.numel())
-            beats = (over_resid[:k] > inc_loss[:k]).long()  # strict: no churn on ties
-            n_swap = int(torch.cummin(beats, dim=0).values.sum())  # leading True run
-            over_idx = over_idx[:n_swap]
-            drop_pos = order[:n_swap]
-
-        purge_idx = torch.cat([toxic, drop_pos])
-
-        # --- random churn: guard against domination by rare correlated events ---
+        # --- admission, paced by elapsed replay steps (mirrors how the prior
+        # buffer paces on num_bwd_steps): draw without replacement from
+        # softmax(clipped |resid| / T) over this batch's eligible pool ---
         num_replay_steps = self.replay_step_delta()
-        n_churn = int(num_replay_steps * self.args.buffers.replay_buffer.random_churn_rate)
-        churn_add = torch.empty(0, dtype=torch.long)
-        if n_churn > 0:
-            survivor_mask = torch.ones(n, dtype=torch.bool)
-            survivor_mask[purge_idx] = False
-            survivors = torch.argwhere(survivor_mask).flatten()
-            n_churn = min(n_churn, survivors.numel())
-            if n_churn > 0:
-                churn_purge = survivors[torch.randperm(survivors.numel())[:n_churn]]
-                purge_idx = torch.cat([purge_idx, churn_purge])
-                # only draw random adds from this batch's top quartile of residuals,
-                # so churn doesn't dilute the buffer with well-covered "good" samples
-                top_quartile = torch.quantile(resid, 0.75)
-                churn_cand = torch.argwhere(resid >= top_quartile).flatten()
-                n_add = min(n_churn, churn_cand.numel())
-                if n_add > 0:
-                    churn_add = churn_cand[torch.randperm(churn_cand.numel())[:n_add]]
+        n_admit = min(elig.numel(), int(num_replay_steps * rb_cfg.churn_rate))
+        add_inds = elig[_softmax_draw(clipped_score, n_admit, T)]
+
+        # --- purge: TTL/toxic eviction frees headroom first; softmax-drawn
+        # displacement of the weakest LIVE incumbents (low ema_loss = high
+        # eviction weight, same cap/T basis as admission) covers whatever
+        # admission needs beyond that ---
+        headroom = max(0, rb_cfg.max_size - (n - toxic.numel()))
+        n_extra_purge = max(0, add_inds.numel() - headroom)
+        extra_purge = torch.zeros(0, dtype=torch.long)
+        if n_extra_purge > 0:
+            live = torch.argwhere(~toxic_mask).flatten()
+            purge_score = ema[live].clamp(max=cap)
+            extra_purge = live[_softmax_draw(-purge_score, n_extra_purge, T)]
+
+        purge_idx = torch.cat([toxic, extra_purge])
 
         t_purge = time()
         if purge_idx.numel() > 0:
@@ -3316,23 +3985,21 @@ class Modeller:
             self.replay_churn['evicted'] += int(purge_idx.numel())
         t_add = time()
 
-        add_inds = torch.cat([free, over_idx])
-        all_add = torch.cat([add_inds, churn_add])
-        if all_add.numel() > 0:
+        if add_inds.numel() > 0:
             self.replay_buffer.add(
-                sample_batch.subsample_new_batch(all_add),
-                traj=flow_states[all_add.to(flow_states.device)],
-                init_loss=resid[all_add],
+                sample_batch.subsample_new_batch(add_inds),
+                traj=flow_states[add_inds.to(flow_states.device)],
+                init_loss=resid[add_inds].abs(),
+                birth_step=self.step_ind,
             )
             self.replay_churn['admitted'] += int(add_inds.numel())
-            self.replay_churn['random_admitted'] += int(churn_add.numel())
 
         # tail probes (see ten_step_reporting): wall time is what the train step
         # actually pays, syncs included -- deliberately no cuda.synchronize here
         self._probe_max('churn_purge_ms_max', (t_add - t_purge) * 1e3)
         self._probe_max('churn_add_ms_max', (time() - t_add) * 1e3)
         self._probe_max('churn_purged_max', int(purge_idx.numel()))
-        self._probe_max('churn_added_max', int(all_add.numel()))
+        self._probe_max('churn_added_max', int(add_inds.numel()))
 
     def init_prior_buffer_seed(self):
         """
@@ -3400,32 +4067,42 @@ class Modeller:
             exclude_keys=CHURNED_BUFFER_EXCLUDE_KEYS,
         )
 
-    def reseed_prior_from_dataset(self):
+    def reseed_prior_from_dataset(self, flush: bool = False):
         """
-        Stage action (protocol: 'reseed_prior_from_dataset'): re-add the prior
-        dataset into prior_buffer with fresh per-sample records -- the
+        Stage action (protocol: 'reseed_prior_from_dataset[:flush]'): re-add the
+        prior dataset into prior_buffer with fresh per-sample records -- the
         coverage counterpart to seed_prior_from_anchors:N:flush. A localized
         anchor_seed/z_match runs on the flushed-down buffer (with
         buffers_active off so churn can't re-broaden it); this restores broad
         coverage wholesale at the next stage boundary instead of waiting on
         churn top-ups (~1k/eval window never re-broadens a 150k dataset).
-        Additive: the current (local) content is untouched; the dataset draw
-        is subsampled to the buffer's remaining headroom.
+
+        flush=True REPLACES the buffer with a fresh full-size dataset draw,
+        discarding the localized anchor_seed content first. That content is the
+        tight noised ball around each condition's single lowest-energy anchor --
+        a heavily biased sub-population, all mass at one point -- so adding the
+        dataset over it (flush=False) leaves a stripe of it in the reseeded
+        buffer (a distinct diagonal cluster in the backward-TB parity plot).
+        flush=False (default) is additive: the current (local) content is
+        untouched and the dataset draw is subsampled to the remaining headroom.
         """
         if not hasattr(self, 'prior_dataset'):
             return
         current = len(self.prior_buffer) if hasattr(self, 'prior_buffer') else 0
-        headroom = self.args.buffers.prior_buffer.max_size - current
-        if headroom <= 0:
+        max_size = self.args.buffers.prior_buffer.max_size
+        limit = max_size if flush else max_size - current
+        if limit <= 0:
             return
-        seed_batch = self._prior_dataset_seed_batch(headroom)
-        if hasattr(self, 'prior_buffer'):
-            self.prior_buffer.add(seed_batch)
-        else:
+        seed_batch = self._prior_dataset_seed_batch(limit)
+        if flush or not hasattr(self, 'prior_buffer'):
             self.prior_buffer = self._fresh_prior_buffer(seed_batch)
+        else:
+            self.prior_buffer.add(seed_batch)
         self.prior_churn['from_seed'] += int(seed_batch.num_graphs)
-        print(f"reseed_prior_from_dataset: prior_buffer {current} -> {len(self.prior_buffer)} rows "
-              f"(+{seed_batch.num_graphs} prior-dataset samples, fresh loss records)")
+        mode = '(flush, replaced)' if flush else '(additive)'
+        print(f"reseed_prior_from_dataset {mode}: prior_buffer {current} -> {len(self.prior_buffer)} rows "
+              f"({'replaced with ' if flush else '+'}{seed_batch.num_graphs} prior-dataset samples, "
+              f"fresh loss records)")
 
     def init_anchor_buffer_seed(self):
         """
@@ -3619,14 +4296,18 @@ class Modeller:
         # inside the 20-22k LR excursion, with fwd/r2 at 0.84-0.89 the whole
         # window -- and the flood beats condition_log_z's ema_logw absorption,
         # which cancels a uniform shift only after its half-life lag). Gate on
-        # the same two axes the balance rules trust: calibration (fwd/r2) and
-        # Z's own gradient signal (|EMA'd fwd/tb_resid_clipped|, the zerr
-        # channel). A cold channel (phase-1 seeding: no fwd stats yet)
-        # abstains rather than blocks, preserving seeding behavior exactly.
+        # POOLED fwd/r2 plus Z's own gradient signal (|EMA'd
+        # fwd/tb_resid_clipped|). Pooled r2 deliberately, even though the
+        # conditional gates elsewhere no longer use it: this is a DAMAGE
+        # detector ('is the policy still physics', bar 0.9 vs the 0.84-0.89
+        # collapse), not a calibration gate, and pooled r2's between-condition
+        # inflation doesn't hide a collapse that severe. A cold channel (phase-1
+        # seeding: no fwd stats yet) abstains rather than blocks, preserving
+        # seeding behavior exactly.
         r2 = self.metric_tracker.get('fwd', 'r2')
-        zerr = self.metric_tracker.get('fwd', 'tb_resid_clipped')
+        z_grad = self.metric_tracker.get('fwd', 'tb_resid_clipped')
         if ((r2 is not None and r2 < getattr(cfg, 'health_gate_r2', 0.9))
-                or (zerr is not None and abs(zerr) > getattr(cfg, 'health_gate_zerr', 0.5))):
+                or (z_grad is not None and abs(z_grad) > getattr(cfg, 'health_gate_zerr', 0.5))):
             return
         log_r = torch.as_tensor(log_r).detach().to(self.device).flatten()
         energy = torch.as_tensor(energy).detach().to(self.device).flatten()
@@ -3719,7 +4400,13 @@ class Modeller:
 
     def sample_from_prior(self, num_samples):
         "sample from prior"
-        eval_discretizer = lambda bsz: uniform_discretizer(bsz, self.args.eval_T)
+        # a reused prior carries its own training T (checkpoint 'train_T'); a
+        # prior trained live in this run's phase 1 does not, so fall back to the
+        # run's own rollout length. Either way, sample at the T the prior was
+        # TRAINED at -- not eval_T, which need not match it (a T=10 shared prior
+        # sampled at T=100 integrates 10x finer than it was fit to).
+        prior_T = getattr(self, 'prior_train_T', None) or self.args.integrator.T
+        eval_discretizer = lambda bsz: uniform_discretizer(bsz, prior_T)
         metrics, sample_batch = self.fwd_eval_sampling(self.prior_model,
                                                        eval_discretizer,
                                                        override_num_samples=num_samples)
@@ -3752,8 +4439,24 @@ class Modeller:
             self.prior_churn['from_seed'] += int(num_samples)
 
     @torch.no_grad()
-    def fwd_eval_sampling(self, model, eval_discretizer, override_num_samples: Optional[int] = None):
-        self.times['eval_sampling_start'] = time()
+    def fwd_eval_sampling(self, model, eval_discretizer, override_num_samples: Optional[int] = None,
+                          dataset=None, side_effects: bool = True):
+        """
+        On-policy evaluation sampling.
+
+        dataset: condition source, defaulting to mol_dataset. Pass test_mol_dataset
+        to run the same protocol against held-out conditions.
+
+        side_effects: when False this pass updates NOTHING -- no condition_log_z
+        best-energy, no anchor screen/admit, no eval-timing writes. Required for the
+        held-out pass: both update paths below would otherwise fold test conditions
+        into training state (tracker Emin(c), anchor buffer, and transitively
+        prior-buffer churn, since manage_prior_buffer consumes the same pooled
+        batch), which is exactly what a held-out set must never touch.
+        """
+        dataset = self.mol_dataset if dataset is None else dataset
+        if side_effects:
+            self.times['eval_sampling_start'] = time()
 
         acc = defaultdict(list)
         sample_batch = None
@@ -3767,7 +4470,7 @@ class Modeller:
         while n_collected < num_samples:
             bsz = min(num_samples - n_collected, self.batch_size)
             try:
-                mol_batch = next(self.mol_dataset.loader(bsz, mode='graphs'))
+                mol_batch = next(dataset.loader(bsz, mode='graphs'))
                 mol_batch = mol_batch.to(self.device)
                 mol_batch.orient_molecule(mode='standard')
                 init_state = get_gfn_init_state(bsz,
@@ -3832,7 +4535,7 @@ class Modeller:
         # sweep, uniform mol draws, ~eval_num_samples pooled rows -- while the
         # ConditionLogZTracker is a rolling estimate over the *train-step*
         # stream, and every training-facing consumer of it (phase-2 logw_std
-        # gate, phase-3 bootstrap_log_z target, zerr/controller, persistent
+        # gate, phase-3 bootstrap_log_z target, z_grad/controller, persistent
         # tb_z_source) needs a single, homogeneous protocol. Mixing the eval
         # stream in spiked those statistics at every eval: the z-residual and
         # (worse) the second moment, since folding in a stream with a shifted
@@ -3844,7 +4547,7 @@ class Modeller:
         # bandaged (it caps trust, but can't fix a shifted value). The train
         # stream updates every step and dominates on evidence anyway; eval-batch
         # statistics remain fully available in the eval metrics themselves.
-        if hasattr(self, 'condition_log_z'):
+        if side_effects and hasattr(self, 'condition_log_z'):
             # best-seen energy IS protocol-independent (a running min), so it
             # still takes eval evidence -- covers eval sampling
             # itself, and (since sample_from_prior/manage_prior_buffer/
@@ -3862,10 +4565,11 @@ class Modeller:
         # log_pf_est = k=1 forward-path estimate of log_pf - log_pb; reused by
         # the screen stage (TB-residual axis built inside) so it spends no
         # backward rollouts pre-filtering.
-        log_pf_est = pooled['log_pf'] - pooled['log_pb']
-        self.screen_and_admit_anchors(sample_batch, pooled['log_r'], energy, log_pf_est)
+        if side_effects:
+            log_pf_est = pooled['log_pf'] - pooled['log_pb']
+            self.screen_and_admit_anchors(sample_batch, pooled['log_r'], energy, log_pf_est)
 
-        self.times['eval_sampling_end'] = time()
+            self.times['eval_sampling_end'] = time()
 
         return pooled, sample_batch
 

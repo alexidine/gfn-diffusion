@@ -38,3 +38,11 @@
   gradient_norm_clip: 100.0
   huber_beta: 10.0
   loss_clip: 1000000000.0
+- index: 5
+  run_name: jacob_noreplay
+  note: buildout replay training share zeroed; buffer still fills, never sampled
+  launch_env: null
+  checkpoint_name: stab_july21c_elj_h512x4_T60_lr5.0e-5_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-68890c_z_matched.pt
+  gradient_norm_clip: 600.0
+  huber_beta: 10.0
+  loss_clip: 1000000000.0
