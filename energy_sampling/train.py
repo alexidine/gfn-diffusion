@@ -3804,14 +3804,6 @@ class Modeller:
         self.prev_bwd_step_count = self.bwd_step_count
         return num_bwd_steps
 
-    def replay_step_delta(self):
-        if not hasattr(self, 'prev_replay_step_count'):
-            num_replay_steps = self.args.eval_period
-        else:
-            num_replay_steps = self.replay_step_count - self.prev_replay_step_count
-        self.prev_replay_step_count = self.replay_step_count
-        return num_replay_steps
-
     def manage_replay_buffer(self, fwd_stats, sample_batch):
         """
         Stash the full forward trajectory of on-policy samples with sufficiently
@@ -3958,11 +3950,20 @@ class Modeller:
             self.replay_cohort['expired_delta_sum'] += float(delta.sum())
             self.replay_cohort['expired_delta_n'] += int(delta.numel())
 
-        # --- admission, paced by elapsed replay steps (mirrors how the prior
-        # buffer paces on num_bwd_steps): draw without replacement from
-        # softmax(clipped |resid| / T) over this batch's eligible pool ---
-        num_replay_steps = self.replay_step_delta()
-        n_admit = min(elig.numel(), int(num_replay_steps * rb_cfg.churn_rate))
+        # --- admission: draw without replacement from softmax(clipped
+        # |resid| / T) over this batch's eligible pool, budgeted churn_rate
+        # rows PER MANAGE CALL (one call per fwd/fused train step, plus one
+        # per eval). SUPPLY-side pacing, deliberately: v1 paced this by
+        # elapsed REPLAY steps (demand-side), which deadlocked -- replay only
+        # runs on a non-empty buffer, so the admission budget required replay
+        # steps while replay steps required admissions. Any TTL mass-expiry
+        # during a replay-dormant stage (z_match, replay frac 0.001) zeroed
+        # the buffer PERMANENTLY, and buildout then rode the variance blowup
+        # into terminal-rewind sawtooths (tsched_july24: 10/14 arms died this
+        # way; survival = z_match duration < max_residence_steps, a race).
+        # Supply-side intake runs whether or not replay is training, so the
+        # buffer is warm whenever a stage wants to draw from it ---
+        n_admit = min(elig.numel(), int(rb_cfg.churn_rate))
         add_inds = elig[_softmax_draw(clipped_score, n_admit, T)]
 
         # --- purge: TTL/toxic eviction frees headroom first; softmax-drawn
