@@ -7,13 +7,13 @@ anomaly_detection: false  # dramatic slowdown when True
 
 # Checkpoints
 ################################################################
-continue_from_checkpoint: false
+continue_from_checkpoint: true   # resuming c17erxo7 from its thermalized snapshot to replay z_match under the corrected guard rule
 mlip_path: null #'D:\crystal_datasets\esen_s.pt' # C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model
 prior_path: D:\crystal_datasets\conditional\priors\toy_big_unif_prior.pt
 molecules_path: D:\crystal_datasets\conditional\priors\toy_big_unif_conditions.pt
 test_molecules_path: D:\crystal_datasets\conditional\priors\toy_big_unif_test_conditions.pt
 checkpoints_dir: 'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints'
-checkpoint_name: dev_mk_dev_latent_multiharmonic-toy_big_unif_prior-T1-87913f_best.pt # fresh policy so anchor_seed/z_match are actually exercised (a converged running.pt warm start passes every gate within 60 steps) #dev_mk_dev_latent_multiharmonic-toy_2cond_conn_prior-T1-90a45e_running.pt #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-22b5c5_prior.pt #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-88792d_phase1_exit #dev_mk_dev_latent_harmonic-toy_2cond_prior-T1-48d154_prior.pt #dev_mk_dev_latent_multiharmonic-toy_2cond_prior-T1-73224a_prior.pt
+checkpoint_name: dev_mk_dev_latent_multiharmonic-toy_big_unif_prior-T1-87913f_z_matched.pt  # RESUME POINT: the thermalize->z_match pre-transition snapshot (request_eval stamped, so the transition replays through the normal eval path under the edited config). Swap back to ..._prior.pt + load_weights_only: true for a fresh BROAD-ROUTE ENTRY: warm-start the policy FROM the phase-1 MLE prior. reuse_prior separately reloads this same file as the frozen sampling prior and skips train_prior -- but that skip is sampling-only and leaves the policy random, which is wrong here: thermalize's premise is backward TB starting from the broad prior policy. Set to null + load_weights_only false to retrain phase 1 from scratch. NB a full (load_weights_only: false) resume off an older _best.pt will now ABORT -- those checkpoints carry stage 'buildout'/'anchor_seed', which this protocol no longer defines #dev_mk_dev_latent_multiharmonic-toy_2cond_conn_prior-T1-90a45e_running.pt
 prior_model_name: null  # fresh toy problem: reuse_prior auto-refinds {run_name}_{problem_slug}_prior.pt once train_prior has run
 # prior_model_name loads a SEPARATE frozen GFN used only for prior-buffer sampling. It is rebuilt from its
 # own stored gfn_config, so it may be any architecture/conditioning (only the problem TARGET must match --
@@ -70,7 +70,21 @@ adaptive_lr:
   # residual converges to its continuous-time limit rather than growing with T
   # -- loss bars keep their T=25 values. Revisit if integrator.T changes, and
   # re-derive from an actual healthy T=100 window once one is on record.
-  cut_loss_abs: 2.5e+3         # branch loss above this = thrash -> cut
+  # MEASURED on the broad route (c17erxo7, thermalize): healthy bwd loss ~25-38,
+  # NOT the thousands I first budgeted for. The reason is structural -- the
+  # policy enters thermalize as the phase-1 MLE prior, so P_F ~= mu by
+  # construction and the backward residual starts small. (The huge-residual
+  # case belongs to the LOCALIZED route, where the buffer is flushed to a
+  # target the policy has never seen.)
+  # The one legitimately large residual on this route is the z_match handoff:
+  # the measured J_b - J_f gap at thermalize is ~150 nats (eval_fwd/tb_err_worst
+  # 160 vs bwd 9.8), and the Huber far-field loss is ~beta * |resid|, so expect
+  # a fwd entry loss ~1.5e3 at the fixed beta 10. This bar sits ~3x above that
+  # and ~200x above the healthy backward loss.
+  # The grad tripwire (cut_grad_abs, auto = 30 * gradient_norm_clip = 1.03e4
+  # here, vs observed pre-clip grads 60-135) is the other half of the
+  # protection and is unaffected by a large-but-honest residual.
+  cut_loss_abs: 5.0e+3         # branch loss above this = thrash -> cut
   cut_grad_abs: auto         # pre-clip grad norm above this = thrash -> cut. auto -> resolve_derived_config = 30 * gradient_norm_clip. Explicit = override
   reset_loss_abs: auto       # true explosion -> rewind + cut. auto -> resolve_derived_config = 10 * cut_loss_abs. Explicit = override
   reset_grad_abs: auto       # true explosion -> rewind + cut. auto -> resolve_derived_config = 10 * cut_grad_abs. Explicit = override
@@ -412,50 +426,50 @@ protocol:
         - { metric: bwd/tbc, below: 2.0 }
       on_exit: [ 'snapshot:phase1_exit', 'snapshot_prior' ]
 
-    # -- anchor seed: replaces buildout's former bootstrap_z:train_conditioner
-    #    (a one-shot regression of flow_model onto condition_log_z's ema_logw,
-    #    which under a scrambled/unconditional train_prior policy measured
-    #    ~230 nats off the per-condition level in cazwlyy1). on_enter seeds
-    #    prior_buffer deterministically: seed_prior_from_condition_minima
-    #    takes each condition's own lowest-energy anchor_buffer entry
-    #    (AnchorBuffer.best_per_condition_indices, an argmin per condition_id
-    #    -- not a priority-weighted random draw, so coverage doesn't degrade
-    #    as the condition library grows), tiles it (arg = copies per
-    #    condition) and isotropically noises each copy
-    #    (log_noise_latent_parameters, cfg.noise_log_range). Additive --
-    #    prior_buffer's existing seed_source content is untouched. bwd tb
-    #    with freeze_z/freeze_policy both left at 0 trains flow_model,
-    #    conditions_embedding_model, and the policy directly off this
-    #    buffer's TB residual via the normal optimizers (lr_flow for
-    #    flow_model, lr_back-scaled for the rest) -- ordinary Adam steps, not
-    #    a fitted regression.
-    #    LOCALIZED variant (molecule problems): :flush REPLACES the buffer with
-    #    the noised best-anchor copies instead of adding 500 rows to a 150k
-    #    dataset-seeded incumbent, and buffers_active: false freezes it there
-    #    (churn admissions within ramp_floor of best + top-ups from dataset-
-    #    anchors re-broaden at ~2.5k/eval window otherwise; 1wwyjp6x trained
-    #    bwd on the whole 150k buffer -- fwd eval level drifted to -1400 vs
-    #    buffer level +60, no basin coupling). Coverage returns wholesale via
-    #    buildout's reseed_prior_from_dataset. On toys the additive/active
-    #    form is fine (buffer seed is junk, churn transfusion of answer-
-    #    anchors IS the localization engine).
-    - name: anchor_seed
+    # -- thermalize: backward TB against the FULL, BROAD prior buffer. This is
+    #    the original paper route (broad prior -> thermalize on prior buffer ->
+    #    active forward), restored in place of the localized anchor_seed +
+    #    buildout pair, which is archived at the bottom of this stage list.
+    #
+    #    WHY the swap: argmin-per-condition seeding makes the buffer's target
+    #    location jump discontinuously in c wherever two modes cross in depth
+    #    (mode identity is discontinuous even though pi(c) is not), so the
+    #    policy is asked to learn a map no smooth conditioner can represent.
+    #    A broad buffer holds every mode at once, so c -> mu_c stays smooth and
+    #    the discontinuity never enters.
+    #
+    #    on_enter rebuilds prior_buffer from ZERO through the online admission
+    #    gate (init_fraction * max_size), so the buffer is model-generated and
+    #    gate-screened rather than a static dataset dump -- the energy screen
+    #    (prior_buffer.ramp_floor above each condition's own Emin(c)) is what
+    #    prunes the high-energy junk that would otherwise inflate Var(log w).
+    #    anchor_buffer is seeded from the CONDITIONS file -- 100 samples per
+    #    condition from the ACTUAL TARGET distribution -- so shortfall backfill
+    #    and reach top-ups inject genuine thermal samples. That is what keeps
+    #    KL(buffer || pi) small, and since the z_match walk distance IS that
+    #    KL, it is also what should keep the handoff short.
+    #
+    #    bwd tb with freeze_z: 0.0 trains flow_model, the conditioner and the
+    #    policy together off this buffer's TB residual (ordinary Adam steps,
+    #    not a fitted regression). The conditioner is untrained coming out of
+    #    train_prior (scramble_conditions), so this is the stage that first
+    #    fits the whole conditional field at once -- the concept under test.
+    - name: thermalize
       train_mode: bwd
       bwd_sampling_mode: prior
       flags:
         update_log_z: true
-        buffers_active: false
-        weighted_bwd_sampling: true
-      on_enter: [ 'seed_prior_from_anchors:100:flush' ]
+        buffers_active: true         # live buffer: churn + anchor top-ups keep improving it
+        weighted_bwd_sampling: true  # 10% of each bwd batch drawn ~ema_loss (weighted_bwd_beta 0.9)
+      on_enter: [ 'rebuild_prior_by_churn' ]
       loss_coeffs:
-        bwd: { tb: 1.0, freeze_z: 0.0 }
+        bwd: { tb: 1.0, freeze_z: 0.0 }   # policy + conditioner + Z(c) together
       exit:
-        # worst-condition RMS TB residual in NATS (the r2_worst replacement:
-        # ratios can't EMA and were unreachable at ~2-3 samples/condition).
-        # Level+spread together, which is what 'is this condition fit' asks;
-        # bwd trains both here (freeze_z: 0.0), so both are actionable
+        # worst-condition RMS TB residual in NATS. FIRST-RUN VALUE: the floor
+        # here is the buffer's own within-condition Var(log w), which is
+        # unmeasured for a broad buffer -- set this from the run's record.
         - { metric: bwd/tb_err_worst, below: 5.0, patience: 2 }
-      on_exit: [ 'snapshot:anchor_seed_exit' ]
+      on_exit: [ 'snapshot:thermalized' ]
 
     # -- z_match: level-matching handoff. bwd maintains the backward TB fit
     #    against the DETACHED Z(c) (freeze_z stays 1 from base); fwd trains
@@ -467,7 +481,7 @@ protocol:
       train_mode: fused
       bwd_sampling_mode: prior
       flags:
-        buffers_active: false   # keep the flushed local buffer frozen through the handoff (see anchor_seed)
+        buffers_active: false   # freeze the buffer through the handoff: bwd_level must be a STATIONARY target while Z walks toward the forward level. Churn resumes in terminal
       fracs: { fwd: 0.1, bwd: 0.899, replay: 0.001 }
       min_fracs: { fwd: 0.05, bwd: 0.05, replay: 0.0001 }
       deactivate_threshold: 0.01
@@ -482,11 +496,27 @@ protocol:
         bwd: { tb: 1.0 }                       # policy-only vs detached moving Z
       balance:
         kind: lexicographic
-        default_boost: { fwd: 0.7, bwd: 0.3 }
+        # BWD-HEAVY IDLE, measured on c17erxo7 vs 4ravi7j7 (A/B at matched steps).
+        # Z is Adam-trained, so its step size is gradient-NORMALIZED: extra fwd
+        # share buys a better gradient estimate, not a faster walkdown. What
+        # actually closes delta is fwd_level RISING, which happens when the
+        # POLICY improves -- and the policy is trained by bwd. The A/B: raising
+        # Fwd Frac 0.05 -> 0.67 left delta unchanged-to-worse (13.38 -> 13.86 at
+        # step 5200) and degraded the backward fit (scatter 4.93 -> 7.12).
+        # So during z_match the forward branch needs only enough share to keep
+        # Z's estimate honest; everything else belongs to the policy.
+        default_boost: { fwd: 0.1, bwd: 0.9 }
         rules:
           # backward fit degrading = Z's demand outpacing the policy: shift
-          # weight to policy maintenance until scatter recovers (toy bar: 25)
-          - { metric: bwd/tb_err_worst, above: 5.0, boost: bwd }
+          # weight to policy maintenance until the fit recovers.
+          # SAFETY NET only -- the bwd-heavy default above is what carries the
+          # stage. scatter_err (SPREAD only) is the right channel: tb_err_worst
+          # is level+spread and tb_err^2 = delta^2 + scatter^2 almost exactly on
+          # this route, so a tb_err bar near the spread floor can never go clean
+          # until delta is already ~0. Bar 10.0 = ~2.3x the 4.4 healthy floor;
+          # scatter peaks ~15-28 during the entry walkdown (Z genuinely
+          # outrunning the policy) and recovers below the bar by ~step 3700.
+          - { metric: bwd/scatter_err, above: 10.0, boost: bwd }
       exit:
         # delta tolerance 2.0 -- the equilibrium gap is leakage-mass x
         # leak-severity and the elj floor is unmeasured; if delta plateaus
@@ -495,104 +525,113 @@ protocol:
         # patience 15: fwd_level updates only on fwd rollouts (~1 per 10 steps),
         # so a shorter patience lets the gate fire on a stale phase-1 level
         # before the walkdown is real (stab_july21c: 30-step exits at min_lr)
-        - { metric: gates/delta_worst, below: 2.0, patience: 15 }
+        # MEASURED PLATEAU, not an aspiration: on this route delta_worst runs
+        # 46 -> ~12 over ~5000 steps and then crawls (~0.3 per 300 steps and
+        # decelerating), with the SAME trajectory under both guard variants
+        # tested -- so ~10-12 is the leakage floor readout for this buffer, not
+        # a controller defect (see the stage comment). A 2.0 bar simply never
+        # fires and the run never reaches terminal. Re-tighten if a future
+        # buffer (MC-thermalized / Boltzmann-reweighted seeds) lowers the floor.
+        - { metric: gates/delta_worst, below: 10.0, patience: 15 }
       on_exit: [ 'snapshot:z_matched' ]
 
-    # -- forward-first stage A: fwd TB trains policy AND Z on-policy, replay
-    #    retains, backward dormant at the floor (admitted only by the boundary
-    #    servo). Collapse expected -- calibration over coverage.
-    - name: buildout
-      train_mode: fused
-      bwd_sampling_mode: prior       # churned prior_buffer, never the atomic dataset
-      flags:
-        buffers_active: true
-        weighted_condition_sampling: true  # fit-error-weighted mol draws; forward trains the policy here, so steering at badly-fit conditions can fix them
-      on_enter: [ 'rebuild_prior_by_churn' ]  # discard the localized anchor_seed set and refill from zero through the online admission gate to init_fraction * max_size
-      fracs: { fwd: 0.989, bwd: 0.001, replay: 0.01 }
-      # explicit floor/deactivation intent: bwd is TRULY dormant here (floor
-      # below the deactivate threshold -> its branch is never computed); fwd
-      # and replay may never switch off
-      min_fracs: { fwd: 0.02, bwd: 0.001, replay: 0.009 }
-      deactivate_threshold: 0.01
-      loss_coeffs:
-        fwd: { tb: 1.0 }               # policy + Z together; no Z bootstrap -- Z learns on-policy
-        bwd: { tb: 1.0 }               # armed but dormant (freeze_z stays 1 from base)
-      balance:
-        kind: lexicographic
-        default_boost: { fwd: 0.9, replay: 0.1 }
-        rules:
-          # Z is the ruler: calibrate it before chasing anything measured against it
-          - { metric: fwd/tb_resid_clipped, abs: true, above: 0.5, boost: fwd }
-          # absolute floor: fwd must reach a usable state before replay's co-convergence
-          # chase (rule below) is allowed to engage at all
-          # fast-regression guard below that floor (own-best elevation, not absolute)
-          - { metric: fwd/tb_err_worst, relative: best, margin: 1.3, drift: 0.003, boost: fwd }
-          # co-convergence, gated by the two rules above: chase replay's scatter down
-          # toward fwd's LIVE level; capped at a 0.35 replay share (never one-hot), so
-          # a persistent violation (replay's floor sitting above the bar) plateaus
-          # instead of annexing the whole batch the way plain boost: replay did
-      exit:
-        # calibration gate: on-policy fit healthy for 2 consecutive ticks.
-        # Worst-condition RMS TB residual in nats -- an ABSOLUTE bar is
-        # meaningful here in a way the old r2_within ratio never was, but note
-        # its floor is the target's own within-condition log w spread, so this
-        # bar has to sit above that; tighten from this run's record
-        - { metric: fwd/tb_err_worst, below: 5.0, patience: 2 }
-      on_exit: [ 'snapshot:fwd_calibrated' ]
-
-    # -- forward-first stage B, TERMINAL: fwd policy frozen (Z-only), backward
-    #    pries open support as fast as calibration absorbs it.
-    #      Z > calibration-not-degrading > coverage-while-it-still-moves
-    #    Coverage is EARNED, never taken at the cost of the fit.
+    # -- TERMINAL: active forward training. fwd policy frozen (Z-only), so the
+    #    policy work is bwd (coverage off the churning buffer) + replay
+    #    (on-policy retention). Ordering here is COVERAGE-FIRST, the old paper
+    #    ordering, restored deliberately: on this route coverage is the thing
+    #    that must not be lost, and by this stage the calibration ceiling is
+    #    largely a capacity question the controller can't move anyway.
+    #      Z > coverage-while-it-still-moves > calibration-not-degrading
     - name: terminal
       train_mode: fused
       bwd_sampling_mode: prior
       flags:
-        buffers_active: true
-      # no fracs: carries buildout's split across the boundary
+        buffers_active: true         # churn resumes: the buffer tracks the policy
+      # explicit entry split (buildout used to hand one over): z_match exits at
+      # bwd ~0.9 / replay ~0.001, which would leave replay dark for thousands of
+      # steps at the controller's 0.025/tick nudge rate
+      # replay-leaning entry: the OBJECTIVE here is A = KL(P_F || pi P_B), and
+      # replay is the branch that reduces it. bwd is the CONSTRAINT branch.
+      # (Until the replay buffer refills, its share folds into bwd anyway --
+      # fused_train_step does that explicitly -- so the effective entry is
+      # bwd-heavy regardless for the first ~200 steps.)
+      fracs: { fwd: 0.2, bwd: 0.3, replay: 0.5 }
       # explicit floor/deactivation intent: NO mode may switch off in terminal.
       # bwd's floor sits ABOVE the deactivate threshold -- backward training
       # never goes to zero here (s706frkh: bwd starved to the old implicit
       # 0.001 floor and was skipped outright for ~1700 steps while
       # relative_under sat 4x over its bar; if Pf gets bad enough to demand
       # zero backward, the run is better restarted from a healthy snapshot)
-      min_fracs: { fwd: 0.0009, bwd: 0.01, replay: 0.0009 }
+      # fwd's floor is the Z-MAINTENANCE floor: bwd and replay both train the
+      # policy against a DETACHED Z, so a stale Z shifts the whole log_pf
+      # surface and (since log_pf normalizes) distorts the policy. ioq6wapu:
+      # fwd decayed to 0.023, Z stopped tracking, and bwd/tb_resid_clipped ran
+      # to -6.2 while delta went 6 -> 29 with every channel degrading together.
+      min_fracs: { fwd: 0.05, bwd: 0.01, replay: 0.0009 }
       deactivate_threshold: 0.001
       loss_coeffs:
         fwd: { tb: 1.0, freeze_policy: 1.0 }   # THE stage flip: forward becomes Z-only
         bwd: { tb: 1.0 }
       balance:
         kind: lexicographic
-        default_boost: { fwd: 0.9, replay: 0.1 }   # idle: keep the fit clean + hold Z at its fixed point
+        # ===================================================================
+        # TERMINAL = "reduce A without letting B blow up."
+        #   A = KL(P_F || pi P_B)   mode-seeking error  -- THE OBJECTIVE
+        #                           reduced by REPLAY (forward-population grads)
+        #   B = KL(mu P_B || P_F)   mass-covering error -- THE CONSTRAINT
+        #                           reduced by BWD (buffer-population grads)
+        #   Z                       a NUISANCE PARAMETER, not an objective: it
+        #                           has one d.o.f. but two populations want it
+        #                           delta apart, so its placement decides WHICH
+        #                           branch eats the error, never whether error
+        #                           exists. Maintained by the fwd min_frac
+        #                           floor above, NOT by a rule -- Z is
+        #                           Adam-normalized, so it needs gradient
+        #                           DIRECTION (a guaranteed slice), not volume.
+        # NB delta_worst = A + B - C (C = KL(mu||pi), buffer quality) is
+        # deliberately NOT gated on here: a WORSE buffer raises C and so LOWERS
+        # delta, i.e. gating on it rewards degrading the buffer. It stays a
+        # z_match handoff diagnostic only.
+        # ===================================================================
+        default_boost: { replay: 0.8, fwd: 0.2 }   # idle: work the objective, keep Z fed
         rules:
-          # 1. Z is the ruler. Pooled clipped residual = dL/dZ; fwd is Z-only
-          #    here, so this is the one thing fwd can actually fix
-          - { metric: fwd/tb_resid_clipped, abs: true, above: 0.5, boost: fwd }
-          # 2. calibration-not-degrading. Worst-condition RMS TB residual,
-          #    RELATIVE to its own running best rather than an absolute bar:
-          #    the achievable floor legitimately RISES as coverage grows (an
-          #    absolute bar deadlocks, b9ze0p5c). Boosts REPLAY because with
-          #    the level rule above already satisfied, what remains in this
-          #    metric is spread -- and spread is policy work, which in terminal
-          #    (fwd frozen) only replay and bwd can do. This slot was empty
-          #    between the r2 family's retirement and now, leaving nothing
-          #    between Z and the coverage rules
-          - { metric: fwd/tb_err_worst, relative: best, margin: 1.3, drift: 0.003, boost: replay }
-          # 3. coverage, while it still moves
-          - { metric: bwd/relative_under, above: 8.0, boost: bwd, anneal: { min: 1.0 } }
-          # 4. over_coverage: egregious-outliers-only tamp, LAST and UNANNEALED
-          # (c8utdn8q). What we care about is overall fwd calibration (rule 2),
-          # not tightly clipped tails. The old anneal (min: 2.0)
-          # ratcheted this bar to its floor by ~6k steps -- right at the
-          # metric's natural 1.7-2.0 level -- so a marginal tail-clipping
-          # breach outranked a hard-violated under rule through the 20-22k
-          # absorption crisis (relative_under 6.5->13.4 while replay held
-          # ~0.77 and bwd starved at 0.21). The 8.0 bar itself was never
-          # crossed post-warm-start, so unannealed + demoted = dormant unless
-          # genuinely pathological. NB rule ctrl state is keyed by rule INDEX:
-          # resuming a pre-reorder checkpoint maps anneal/floor state to the
-          # wrong rules -- fresh runs only
-          - { metric: fwd/over_coverage, above: 8.0, boost: replay }
+          # 1. Z-STALENESS TRIPWIRE. Watches the branch that TRAINS THE POLICY
+          #    against a detached Z, never fwd/tb_resid_clipped -- fwd is
+          #    freeze_policy here, so it trains Z and only Z and self-zeroes:
+          #    ioq6wapu held it at +-0.1 for the whole stage (rule never fired,
+          #    protocol/boost never once read 'fwd') while bwd's ran to -6.2
+          #    and delta went 6 -> 29. A tautology, not a ruler.
+          #    RELATIVE, not absolute: z_match parks Z at fwd_level by
+          #    construction, so bwd's residual STARTS at ~-delta (-3.7 here).
+          #    An absolute bar would latch on day one exactly like the 5.0
+          #    tb_err bar did. This fires only when the offset GROWS, which is
+          #    the divergence signature.
+          - { metric: bwd/tb_resid_clipped, abs: true, relative: best, margin: 1.5, drift: 0.003, boost: fwd }
+          # 2. CONSTRAINT: B bounded. Coverage is the asset the route is built
+          #    on and its loss is unrecoverable, so it outranks the objective.
+          #    DELIBERATELY UNANNEALED. A constraint that tightens toward its
+          #    own operating level latches into permanent breach and turns the
+          #    lexicographic controller into a bang-bang oscillator. v3mmzucb
+          #    ran the annealed version (min 1.0) and produced a GROWING limit
+          #    cycle: bar ratcheted below relU's natural ~4-5 level, fired at
+          #    relU 4.79, bwd annexed the batch (0.81) and starved fwd to its
+          #    floor, A blew up (fwd/tb_err_worst 5.5 -> 24.3), coverage
+          #    recovered, repeat -- with the second excursion 2.2x the first.
+          #    8.0 fixed sits ~1.7x above the operating level, so it is quiet
+          #    until coverage genuinely degrades. See controller-ratchet-
+          #    marginal-breach: the anneal is one-way, its fixed point IS
+          #    permanent breach, so retuning decay_rate/min was never the fix.
+          - { metric: bwd/relative_under, above: 8.0, boost: bwd }
+          # 3. OBJECTIVE: A down. With Z well-placed on the fwd stream (rule 1
+          #    keeps it so), fwd/tb_err_worst is ~the within-condition spread of
+          #    log w on-policy, and A ~ spread^2/2 -- monotone in the objective.
+          #    relative:best because the achievable floor RISES as coverage
+          #    grows (an absolute bar deadlocks, b9ze0p5c).
+          - { metric: fwd/tb_err_worst, relative: best, margin: 1.15, drift: 0.003, boost: replay }
+          # over_coverage RETIRED as a rule: it is the positive tail of the same
+          # A that rule 3 measures completely, and as a separate 8.0 bar it was
+          # already breached at 8.4 on entry -- it would fire permanently and
+          # annex the batch (the c8utdn8q pattern). Still logged.
         # lexicographically LAST: bounding/reduction_coeff above are set LOW
         # (1.0) so they're soft for the WHOLE run, from train_prior onward --
         # only once every rule above has run clean for anneal_patience ticks
@@ -605,9 +644,58 @@ protocol:
 #          bounding_coeff: { target: 10.0 }
 #          reduction_coeff: { target: 10.0 }
 
-    # -- standard equilibration route (unused while the forward-first stages
-    #    above are the protocol; swap it in for the buildout/terminal pair to
-    #    recover the old direct 1->3 behavior):
+    # =====================================================================
+    # ARCHIVED ALTERNATE METHOD -- the LOCALIZED FORWARD-FIRST route.
+    # To restore it: replace the `thermalize` stage above with `anchor_seed`
+    # below, and insert `buildout` between z_match and terminal. z_match and
+    # terminal are shared by both routes (terminal's rule ORDER differs --
+    # forward-first wants calibration above coverage, since it is rebuilding
+    # coverage it deliberately gave up; see terminal's rules 2/3).
+    #
+    # The method: seed prior_buffer with 100 noised copies of each condition's
+    # ARGMIN anchor (:flush replaces the buffer outright), freeze it, fit that
+    # localized target, hand Z over, then let forward collapse onto it
+    # (calibration over coverage) before terminal pries support back open.
+    # Its known cost, and the reason for the swap: argmin-per-condition makes
+    # c -> mu_c DISCONTINUOUS wherever two modes cross in depth, so the policy
+    # is taught a map no smooth conditioner can fit, and terminal spends its
+    # life unlearning it.
+    #
+    # - name: anchor_seed
+    #   train_mode: bwd
+    #   bwd_sampling_mode: prior
+    #   flags: {update_log_z: true, buffers_active: false, weighted_bwd_sampling: true}
+    #   on_enter: [ 'seed_prior_from_anchors:100:flush' ]
+    #   loss_coeffs:
+    #     bwd: { tb: 1.0, freeze_z: 0.0 }
+    #   exit:
+    #     - { metric: bwd/tb_err_worst, below: 5.0, patience: 2 }
+    #   on_exit: [ 'snapshot:anchor_seed_exit' ]
+    #
+    # - name: buildout            # forward-first stage A; collapse EXPECTED
+    #   train_mode: fused
+    #   bwd_sampling_mode: prior
+    #   flags: {buffers_active: true, weighted_condition_sampling: true}
+    #   on_enter: [ 'rebuild_prior_by_churn' ]
+    #   fracs: { fwd: 0.989, bwd: 0.001, replay: 0.01 }
+    #   min_fracs: { fwd: 0.02, bwd: 0.001, replay: 0.009 }   # bwd TRULY dormant
+    #   deactivate_threshold: 0.01
+    #   loss_coeffs:
+    #     fwd: { tb: 1.0 }        # policy + Z on-policy together
+    #     bwd: { tb: 1.0 }        # armed but dormant
+    #   balance:
+    #     kind: lexicographic
+    #     default_boost: { fwd: 0.9, replay: 0.1 }
+    #     rules:
+    #       - { metric: fwd/tb_resid_clipped, abs: true, above: 0.5, boost: fwd }
+    #       - { metric: fwd/tb_err_worst, relative: best, margin: 1.3, drift: 0.003, boost: fwd }
+    #   exit:
+    #     - { metric: fwd/tb_err_worst, below: 5.0, patience: 2 }
+    #   on_exit: [ 'snapshot:fwd_calibrated' ]
+    # =====================================================================
+
+    # -- standard equilibration route (unused; swap it in for the terminal
+    #    stage to recover the old direct 1->3 behavior):
     # - name: equilibrate
     #   train_mode: fused
     #   bwd_sampling_mode: prior
@@ -700,7 +788,7 @@ buffers:
   # (get_traj_replay) during the "replay" training step instead of re-sampled backward from
   # the terminal state alone
   replay_buffer:
-    churn_rate: 50  # softmax-drawn admission attempts budgeted per elapsed replay train step (purge mirrors whatever admission needs beyond freed headroom)
+    churn_rate: 50  # softmax-drawn admission attempts budgeted per manage call (~ per train step with a fwd component); SUPPLY-side -- intake runs whether or not replay is training (purge mirrors whatever admission needs beyond freed headroom)
     max_size: 10000  # if this is too big, or takes too long to churn, it becomes a lagging indicator
     max_residence_steps: 250  # hard age eviction: rows older than this many train steps are purged regardless of ema_loss; 0 disables
     admit_temperature: 5.0  # softmax T (nats) over clipped |resid| (admission) / ema_loss (purge); fixed -- governs shoulder discrimination sharpness only, never health-modulated (see admit_cap_* for that)

@@ -133,6 +133,12 @@ OUTDIR = Path(__file__).parent
 # entry. CONFIRM THIS FILE EXISTS on the cluster before submitting: jacob_july24
 # used the _z_matched sibling, and if phase-1 snapshots were not retained this
 # battery needs a fresh-run fallback instead.
+# PREREQUISITE (2026-07-25): the parent's .pt files predate the problem_def
+# schema_version stamp and refuse to load under current code ("schema_version:
+# stored='<missing>' current=1"). Run restamp_schema_v1.py (this directory,
+# docstring has the exact command) over the parent stem ONCE on the cluster
+# before submitting -- it back-fills the stamp on the checkpoint, its buffer
+# sidecars, AND the *_prior.pt files (all three are def-compared at load).
 CKPT_FILE = ('stab_july21c_elj_h512x4_T60_lr5.0e-5_elj-mipcas_sg2_zp1_'
              'elj_prior_dataset-T2.5-68890c_phase1_exit.pt')
 

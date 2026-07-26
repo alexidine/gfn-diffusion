@@ -1,4 +1,4 @@
-run_name: 'stab_july21c'
+﻿run_name: 'stab_july21c'
 tag: 'stab_july21c'
 seed: 12345
 device: 'cuda'
@@ -454,7 +454,7 @@ buffers:
     churn_rate: 50  # softmax-drawn admission attempts budgeted per manage call (~ per train step with a fwd component); SUPPLY-side -- intake runs whether or not replay is training
     max_size: 10000
     max_residence_steps: 250  # hard age eviction (train steps); 0 disables
-    admit_temperature: 5.0  # softmax T (nats) over clipped |resid| / ema_loss; fixed, never health-modulated
+    admit_temperature: 2.0  # softmax T (nats) over clipped |resid| / ema_loss; fixed, never health-modulated
     admit_cap_max: 30.0  # admission/purge score clip (nats) at fwd/scatter_err == 0
     admit_cap_min: 8.0  # score clip (nats) as fwd/scatter_err -> inf
     admit_cap_health_h0: 10.0  # fwd/scatter_err at which the cap is halfway between max and min
@@ -510,3 +510,4 @@ energy_config:
   lj_coeff: 1.0
   reward_range: 500
   analyze_kwargs: {}
+

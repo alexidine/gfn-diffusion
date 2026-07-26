@@ -1,0 +1,192 @@
+- index: 0
+  run_name: control_t2
+  note: 'reference: T 2, TTL 250, share 0.1 -- fresh replication of sw2v8yas'
+  admit_temperature: 2.0
+  max_residence_steps: 250
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 50
+  buildout_replay_share: 0.1
+  buildout_bwd_share: 0.0
+- index: 1
+  run_name: t05
+  note: 'admit_temperature 0.5: near-argmax admission'
+  admit_temperature: 0.5
+  max_residence_steps: 250
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 50
+  buildout_replay_share: 0.1
+  buildout_bwd_share: 0.0
+- index: 2
+  run_name: t1
+  note: admit_temperature 1
+  admit_temperature: 1.0
+  max_residence_steps: 250
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 50
+  buildout_replay_share: 0.1
+  buildout_bwd_share: 0.0
+- index: 3
+  run_name: t5
+  note: 'admit_temperature 5: cross-battery bridge to the tsched control'
+  admit_temperature: 5.0
+  max_residence_steps: 250
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 50
+  buildout_replay_share: 0.1
+  buildout_bwd_share: 0.0
+- index: 4
+  run_name: share005
+  note: buildout replay share 0.1 -> 0.05
+  admit_temperature: 2.0
+  max_residence_steps: 250
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 50
+  buildout_replay_share: 0.05
+  buildout_bwd_share: 0.0
+- index: 5
+  run_name: share02
+  note: buildout replay share 0.1 -> 0.2
+  admit_temperature: 2.0
+  max_residence_steps: 250
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 50
+  buildout_replay_share: 0.2
+  buildout_bwd_share: 0.0
+- index: 6
+  run_name: share03
+  note: buildout replay share 0.1 -> 0.3
+  admit_temperature: 2.0
+  max_residence_steps: 250
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 50
+  buildout_replay_share: 0.3
+  buildout_bwd_share: 0.0
+- index: 7
+  run_name: ttl150
+  note: TTL 250 -> 150
+  admit_temperature: 2.0
+  max_residence_steps: 150
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 50
+  buildout_replay_share: 0.1
+  buildout_bwd_share: 0.0
+- index: 8
+  run_name: ttl400
+  note: TTL 250 -> 400
+  admit_temperature: 2.0
+  max_residence_steps: 400
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 50
+  buildout_replay_share: 0.1
+  buildout_bwd_share: 0.0
+- index: 9
+  run_name: norep
+  note: 'replay excised, bwd dormant: designed replication of fwd-alone instability'
+  admit_temperature: 2.0
+  max_residence_steps: 250
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 50
+  buildout_replay_share: 0.0
+  buildout_bwd_share: 0.0
+- index: 10
+  run_name: bwd01_norep
+  note: 'replay excised, bwd pinned 0.1: can bwd own spread instead?'
+  admit_temperature: 2.0
+  max_residence_steps: 250
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 50
+  buildout_replay_share: 0.0
+  buildout_bwd_share: 0.1
+- index: 11
+  run_name: bwd03_norep
+  note: replay excised, bwd pinned 0.3
+  admit_temperature: 2.0
+  max_residence_steps: 250
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 50
+  buildout_replay_share: 0.0
+  buildout_bwd_share: 0.3
+- index: 12
+  run_name: t1_share02
+  note: 'compound best-guess: T 1 + share 0.2'
+  admit_temperature: 1.0
+  max_residence_steps: 250
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 50
+  buildout_replay_share: 0.2
+  buildout_bwd_share: 0.0
+- index: 13
+  run_name: fixedcap
+  note: 'cap_min = cap_max = 30: health modulation off, at the T=2 reference'
+  admit_temperature: 2.0
+  max_residence_steps: 250
+  cap_min_max_h0:
+  - 30.0
+  - 30.0
+  - 10.0
+  churn_rate: 50
+  buildout_replay_share: 0.1
+  buildout_bwd_share: 0.0
+- index: 14
+  run_name: churn25
+  note: 'churn_rate 25: thin equilibrium buffer ~6.2k'
+  admit_temperature: 2.0
+  max_residence_steps: 250
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 25
+  buildout_replay_share: 0.1
+  buildout_bwd_share: 0.0
+- index: 15
+  run_name: churn100
+  note: 'churn_rate 100: fast displacement churn, mean age ~50'
+  admit_temperature: 2.0
+  max_residence_steps: 250
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 100
+  buildout_replay_share: 0.1
+  buildout_bwd_share: 0.0
