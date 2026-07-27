@@ -304,8 +304,8 @@ protocol:
     train_mode: fused
   - balance:
       default_boost:
-        fwd: 0.95
-        replay: 0.05
+        bwd: 0.3
+        fwd: 0.7
       kind: lexicographic
       rules:
       - above: 0.5
@@ -327,18 +327,18 @@ protocol:
       buffers_active: true
       weighted_condition_sampling: true
     fracs:
-      bwd: 0.001
-      fwd: 0.989
-      replay: 0.01
+      bwd: 0.3
+      fwd: 0.699
+      replay: 0.0
     loss_coeffs:
       bwd:
         tb: 1.0
       fwd:
         tb: 1.0
     min_fracs:
-      bwd: 0.001
+      bwd: 0.3
       fwd: 0.02
-      replay: 0.009
+      replay: 0.0
     name: buildout
     on_enter:
     - rebuild_prior_by_churn
@@ -402,7 +402,7 @@ replay_loss_coeffs:
   vg_lb: 0
   vg_lme: 0
 reuse_prior: true
-run_name: share005
+run_name: bwd03_norep
 seed: 12345
 sg_conditioning: false
 space_groups:

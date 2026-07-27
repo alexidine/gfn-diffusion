@@ -1,6 +1,8 @@
 - index: 0
   run_name: control_t2
   note: 'reference: T 2, TTL 250, share 0.1 -- fresh replication of sw2v8yas'
+  protocol: forward_first
+  n_rules: 2
   admit_temperature: 2.0
   max_residence_steps: 250
   cap_min_max_h0:
@@ -8,11 +10,14 @@
   - 30.0
   - 10.0
   churn_rate: 50
-  buildout_replay_share: 0.1
-  buildout_bwd_share: 0.0
+  fwd_share: 0.9
+  bwd_share: 0.0
+  replay_share: 0.1
 - index: 1
   run_name: t05
   note: 'admit_temperature 0.5: near-argmax admission'
+  protocol: forward_first
+  n_rules: 2
   admit_temperature: 0.5
   max_residence_steps: 250
   cap_min_max_h0:
@@ -20,59 +25,14 @@
   - 30.0
   - 10.0
   churn_rate: 50
-  buildout_replay_share: 0.1
-  buildout_bwd_share: 0.0
+  fwd_share: 0.9
+  bwd_share: 0.0
+  replay_share: 0.1
 - index: 2
-  run_name: t1
-  note: admit_temperature 1
-  admit_temperature: 1.0
-  max_residence_steps: 250
-  cap_min_max_h0:
-  - 8.0
-  - 30.0
-  - 10.0
-  churn_rate: 50
-  buildout_replay_share: 0.1
-  buildout_bwd_share: 0.0
-- index: 3
-  run_name: t5
-  note: 'admit_temperature 5: cross-battery bridge to the tsched control'
-  admit_temperature: 5.0
-  max_residence_steps: 250
-  cap_min_max_h0:
-  - 8.0
-  - 30.0
-  - 10.0
-  churn_rate: 50
-  buildout_replay_share: 0.1
-  buildout_bwd_share: 0.0
-- index: 4
-  run_name: share005
-  note: buildout replay share 0.1 -> 0.05
-  admit_temperature: 2.0
-  max_residence_steps: 250
-  cap_min_max_h0:
-  - 8.0
-  - 30.0
-  - 10.0
-  churn_rate: 50
-  buildout_replay_share: 0.05
-  buildout_bwd_share: 0.0
-- index: 5
-  run_name: share02
-  note: buildout replay share 0.1 -> 0.2
-  admit_temperature: 2.0
-  max_residence_steps: 250
-  cap_min_max_h0:
-  - 8.0
-  - 30.0
-  - 10.0
-  churn_rate: 50
-  buildout_replay_share: 0.2
-  buildout_bwd_share: 0.0
-- index: 6
   run_name: share03
   note: buildout replay share 0.1 -> 0.3
+  protocol: forward_first
+  n_rules: 2
   admit_temperature: 2.0
   max_residence_steps: 250
   cap_min_max_h0:
@@ -80,35 +40,14 @@
   - 30.0
   - 10.0
   churn_rate: 50
-  buildout_replay_share: 0.3
-  buildout_bwd_share: 0.0
-- index: 7
-  run_name: ttl150
-  note: TTL 250 -> 150
-  admit_temperature: 2.0
-  max_residence_steps: 150
-  cap_min_max_h0:
-  - 8.0
-  - 30.0
-  - 10.0
-  churn_rate: 50
-  buildout_replay_share: 0.1
-  buildout_bwd_share: 0.0
-- index: 8
-  run_name: ttl400
-  note: TTL 250 -> 400
-  admit_temperature: 2.0
-  max_residence_steps: 400
-  cap_min_max_h0:
-  - 8.0
-  - 30.0
-  - 10.0
-  churn_rate: 50
-  buildout_replay_share: 0.1
-  buildout_bwd_share: 0.0
-- index: 9
+  fwd_share: 0.7
+  bwd_share: 0.0
+  replay_share: 0.3
+- index: 3
   run_name: norep
   note: 'replay excised, bwd dormant: designed replication of fwd-alone instability'
+  protocol: forward_first
+  n_rules: 2
   admit_temperature: 2.0
   max_residence_steps: 250
   cap_min_max_h0:
@@ -116,23 +55,14 @@
   - 30.0
   - 10.0
   churn_rate: 50
-  buildout_replay_share: 0.0
-  buildout_bwd_share: 0.0
-- index: 10
-  run_name: bwd01_norep
-  note: 'replay excised, bwd pinned 0.1: can bwd own spread instead?'
-  admit_temperature: 2.0
-  max_residence_steps: 250
-  cap_min_max_h0:
-  - 8.0
-  - 30.0
-  - 10.0
-  churn_rate: 50
-  buildout_replay_share: 0.0
-  buildout_bwd_share: 0.1
-- index: 11
+  fwd_share: 1.0
+  bwd_share: 0.0
+  replay_share: 0.0
+- index: 4
   run_name: bwd03_norep
-  note: replay excised, bwd pinned 0.3
+  note: 'replay excised, bwd pinned 0.3: can bwd own spread instead?'
+  protocol: forward_first
+  n_rules: 2
   admit_temperature: 2.0
   max_residence_steps: 250
   cap_min_max_h0:
@@ -140,23 +70,14 @@
   - 30.0
   - 10.0
   churn_rate: 50
-  buildout_replay_share: 0.0
-  buildout_bwd_share: 0.3
-- index: 12
-  run_name: t1_share02
-  note: 'compound best-guess: T 1 + share 0.2'
-  admit_temperature: 1.0
-  max_residence_steps: 250
-  cap_min_max_h0:
-  - 8.0
-  - 30.0
-  - 10.0
-  churn_rate: 50
-  buildout_replay_share: 0.2
-  buildout_bwd_share: 0.0
-- index: 13
+  fwd_share: 0.7
+  bwd_share: 0.3
+  replay_share: 0.0
+- index: 5
   run_name: fixedcap
   note: 'cap_min = cap_max = 30: health modulation off, at the T=2 reference'
+  protocol: forward_first
+  n_rules: 2
   admit_temperature: 2.0
   max_residence_steps: 250
   cap_min_max_h0:
@@ -164,29 +85,157 @@
   - 30.0
   - 10.0
   churn_rate: 50
-  buildout_replay_share: 0.1
-  buildout_bwd_share: 0.0
+  fwd_share: 0.9
+  bwd_share: 0.0
+  replay_share: 0.1
+- index: 6
+  run_name: naive_fixed
+  note: single-phase naive, fracs pinned (0.05/0.9/0.05), NO controller
+  protocol: naive
+  n_rules: 0
+  admit_temperature: 2.0
+  max_residence_steps: 250
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 50
+  fwd_share: 0.05
+  bwd_share: 0.9
+  replay_share: 0.05
+- index: 7
+  run_name: naive_fixed_b80
+  note: single-phase naive, fracs pinned (0.1/0.8/0.1), NO controller
+  protocol: naive
+  n_rules: 0
+  admit_temperature: 2.0
+  max_residence_steps: 250
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 50
+  fwd_share: 0.1
+  bwd_share: 0.8
+  replay_share: 0.1
+- index: 8
+  run_name: naive_gentle
+  note: single-phase naive (0.05/0.9/0.05) + gentle 4-rule controller
+  protocol: naive
+  n_rules: 4
+  admit_temperature: 2.0
+  max_residence_steps: 250
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 50
+  fwd_share: 0.05
+  bwd_share: 0.9
+  replay_share: 0.05
+- index: 9
+  run_name: naive_gentle_b80
+  note: single-phase naive (0.1/0.8/0.1)
+  protocol: naive
+  n_rules: 4
+  admit_temperature: 2.0
+  max_residence_steps: 250
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 50
+  fwd_share: 0.1
+  bwd_share: 0.8
+  replay_share: 0.1
+- index: 10
+  run_name: naive_gentle_b70
+  note: single-phase naive (0.2/0.7/0.1)
+  protocol: naive
+  n_rules: 4
+  admit_temperature: 2.0
+  max_residence_steps: 250
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 50
+  fwd_share: 0.2
+  bwd_share: 0.7
+  replay_share: 0.1
+- index: 11
+  run_name: naive_gentle_r25
+  note: 'single-phase naive (0.05/0.7/0.25): replay-heavy anchor'
+  protocol: naive
+  n_rules: 4
+  admit_temperature: 2.0
+  max_residence_steps: 250
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 50
+  fwd_share: 0.05
+  bwd_share: 0.7
+  replay_share: 0.25
+- index: 12
+  run_name: naive_gentle_r40
+  note: 'single-phase naive (0.05/0.55/0.4): replay-dominance saturation probe'
+  protocol: naive
+  n_rules: 4
+  admit_temperature: 2.0
+  max_residence_steps: 250
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 50
+  fwd_share: 0.05
+  bwd_share: 0.55
+  replay_share: 0.4
+- index: 13
+  run_name: naive_gentle_fwd30
+  note: 'single-phase naive (0.3/0.6/0.1): faster Z, more on-policy exposure'
+  protocol: naive
+  n_rules: 4
+  admit_temperature: 2.0
+  max_residence_steps: 250
+  cap_min_max_h0:
+  - 8.0
+  - 30.0
+  - 10.0
+  churn_rate: 50
+  fwd_share: 0.3
+  bwd_share: 0.6
+  replay_share: 0.1
 - index: 14
-  run_name: churn25
-  note: 'churn_rate 25: thin equilibrium buffer ~6.2k'
+  run_name: naive_gentle_repidle
+  note: 'entry (0.05/0.9/0.05), idle default_boost (0.05/0.65/0.3): boost replay on
+    default'
+  protocol: naive
+  n_rules: 4
   admit_temperature: 2.0
   max_residence_steps: 250
   cap_min_max_h0:
   - 8.0
   - 30.0
   - 10.0
-  churn_rate: 25
-  buildout_replay_share: 0.1
-  buildout_bwd_share: 0.0
+  churn_rate: 50
+  fwd_share: 0.05
+  bwd_share: 0.65
+  replay_share: 0.3
 - index: 15
-  run_name: churn100
-  note: 'churn_rate 100: fast displacement churn, mean age ~50'
+  run_name: naive_gentle_lr1e4
+  note: 'single-phase naive (0.05/0.9/0.05) at LR 1e-4: the TB-LR-ceiling acid test'
+  protocol: naive
+  n_rules: 4
   admit_temperature: 2.0
   max_residence_steps: 250
   cap_min_max_h0:
   - 8.0
   - 30.0
   - 10.0
-  churn_rate: 100
-  buildout_replay_share: 0.1
-  buildout_bwd_share: 0.0
+  churn_rate: 50
+  fwd_share: 0.05
+  bwd_share: 0.9
+  replay_share: 0.05

@@ -71,7 +71,7 @@ buffers:
     admit_cap_health_h0: 10.0
     admit_cap_max: 30.0
     admit_cap_min: 8.0
-    admit_temperature: 1.0
+    admit_temperature: 2.0
     churn_rate: 50
     max_residence_steps: 250
     max_size: 10000
@@ -248,141 +248,50 @@ protocol:
     - snapshot_prior
     skip_if: prior_loaded
     train_mode: bwd
-  - bwd_sampling_mode: prior
-    exit:
-    - below: 5.0
-      metric: bwd/tb_err_worst
-      patience: 2
-    flags:
-      buffers_active: false
-      update_log_z: true
-      weighted_bwd_sampling: true
-    loss_coeffs:
-      bwd:
-        freeze_z: 0.0
-        tb: 1.0
-    name: anchor_seed
-    on_enter:
-    - seed_prior_from_anchors:10000:flush
-    on_exit:
-    - snapshot:anchor_seed_exit
-    train_mode: bwd
   - balance:
       default_boost:
-        bwd: 0.3
-        fwd: 0.7
+        bwd: 0.55
+        fwd: 0.05
+        replay: 0.4
       kind: lexicographic
       rules:
-      - above: 5.0
+      - above: 0.5
+        abs: true
+        boost: fwd
+        metric: fwd/tb_resid_clipped
+      - above: 25.0
+        anneal:
+          min: 5.0
+          rate: 0.98
         boost: bwd
         metric: bwd/tb_err_worst
-    bwd_sampling_mode: prior
-    deactivate_threshold: 0.01
-    exit:
-    - below: 2.0
-      metric: gates/delta_worst
-      patience: 15
-    flags:
-      buffers_active: false
-    fracs:
-      bwd: 0.899
-      fwd: 0.1
-      replay: 0.001
-    loss_coeffs:
-      bwd:
-        tb: 1.0
-      fwd:
-        freeze_policy: 1.0
-        tb: 1.0
-    min_fracs:
-      bwd: 0.05
-      fwd: 0.05
-      replay: 0.0001
-    name: z_match
-    on_exit:
-    - snapshot:z_matched
-    train_mode: fused
-  - balance:
-      default_boost:
-        fwd: 0.8
-        replay: 0.2
-      kind: lexicographic
-      rules:
-      - above: 0.5
-        abs: true
-        boost: fwd
-        metric: fwd/tb_resid_clipped
-      - boost: fwd
-        drift: 0.003
-        margin: 1.3
-        metric: fwd/tb_err_worst
-        relative: best
-    bwd_sampling_mode: prior
-    deactivate_threshold: 0.01
-    exit:
-    - below: 5.0
-      metric: fwd/tb_err_worst
-      patience: 2
-    flags:
-      buffers_active: true
-      weighted_condition_sampling: true
-    fracs:
-      bwd: 0.001
-      fwd: 0.989
-      replay: 0.01
-    loss_coeffs:
-      bwd:
-        tb: 1.0
-      fwd:
-        tb: 1.0
-    min_fracs:
-      bwd: 0.001
-      fwd: 0.02
-      replay: 0.009
-    name: buildout
-    on_enter:
-    - rebuild_prior_by_churn
-    on_exit:
-    - snapshot:fwd_calibrated
-    train_mode: fused
-  - balance:
-      default_boost:
-        fwd: 0.9
-        replay: 0.1
-      kind: lexicographic
-      rules:
-      - above: 0.5
-        abs: true
-        boost: fwd
-        metric: fwd/tb_resid_clipped
       - boost: replay
         drift: 0.003
-        margin: 1.3
+        margin: 1.5
         metric: fwd/tb_err_worst
         relative: best
-      - above: 8.0
-        anneal:
-          min: 1.0
-        boost: bwd
-        metric: bwd/relative_under
       - above: 8.0
         boost: replay
         metric: fwd/over_coverage
     bwd_sampling_mode: prior
-    deactivate_threshold: 0.001
+    deactivate_threshold: 0.01
     flags:
       buffers_active: true
+      update_log_z: true
+    fracs:
+      bwd: 0.55
+      fwd: 0.05
+      replay: 0.4
     loss_coeffs:
       bwd:
         tb: 1.0
       fwd:
-        freeze_policy: 1.0
         tb: 1.0
     min_fracs:
-      bwd: 0.01
-      fwd: 0.0009
-      replay: 0.0009
-    name: terminal
+      bwd: 0.05
+      fwd: 0.02
+      replay: 0.02
+    name: naive
     train_mode: fused
 replay_loss_coeffs:
   beta: 10.0
@@ -402,7 +311,7 @@ replay_loss_coeffs:
   vg_lb: 0
   vg_lme: 0
 reuse_prior: true
-run_name: t1_share02
+run_name: naive_gentle_r40
 seed: 12345
 sg_conditioning: false
 space_groups:

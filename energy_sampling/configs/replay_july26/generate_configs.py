@@ -53,20 +53,12 @@ unless noted):
 
    0 : control_t2     -- reference; replicates sw2v8yas fresh
    1 : t05            -- admit_temperature 0.5 (near-argmax)
-   2 : t1             -- admit_temperature 1
-   3 : t5             -- admit_temperature 5 (tsched-control bridge)
-   4 : share005       -- buildout default_boost replay 0.05
-   5 : share02        -- 0.2
-   6 : share03        -- 0.3
-   7 : ttl150         -- max_residence_steps 150
-   8 : ttl400         -- max_residence_steps 400
-   9 : norep          -- replay share 0, bwd left dormant (0.001)
-  10 : bwd01_norep    -- replay 0, bwd pinned at 0.1
-  11 : bwd03_norep    -- replay 0, bwd pinned at 0.3
-  12 : t1_share02     -- T 1 + share 0.2 compound
-  13 : fixedcap       -- admit_cap_min = admit_cap_max = 30 (cap(h) off)
-  14 : churn25        -- churn_rate 25 (thin buffer ~6.2k)
-  15 : churn100       -- churn_rate 100 (fast displacement, age ~50)
+   2 : share03        -- buildout default_boost replay 0.3
+   3 : norep          -- replay share 0, bwd left dormant (0.001)
+   4 : bwd03_norep    -- replay 0, bwd pinned at 0.3 (if 0.3 can't
+                         substitute for replay's anchoring, 0.1 can't)
+   5 : fixedcap       -- admit_cap_min = admit_cap_max = 30 (cap(h) off)
+  6-15 : single-phase naive protocol -- see REVISION v2/v3 below
 
 READING GUIDE: outcome = step-matched fwd/tb_err_worst (floor LEVEL and
 arrival step), fwd/r2, fwd/logw_std stability (sawtooth = lost anchor).
@@ -74,14 +66,83 @@ replay_buffer_expired_delta SIGN is the anchor-health readout (negative =
 resident rows improving; positive on every diverging tsched arm).
 absorbed_frac stays near zero by design (calibration mandate: rows cycle).
 Watch replay_buffer_admit_cap/admit_health around the ~15k transition
-kick -- if cap never leaves its healthy end, arm 13 is uninformative on
-the health axis. The best tsched arms plateaued at ~7 nats independent of
-terminal noise -- if ANY arm here goes well below 7 (t1/share03 are the
-candidates), the plateau was anchor-limited, NOT the target's own
-within-condition spread, and the buildout exit bar (5.0) may finally be
-reachable.
+kick -- if cap never leaves its healthy end, the fixedcap arm is
+uninformative on the health axis. The best tsched arms plateaued at ~7
+nats independent of terminal noise -- if ANY arm here goes well below 7
+(t1/share03 are the candidates), the plateau was anchor-limited, NOT the
+target's own within-condition spread, and the buildout exit bar (5.0) may
+finally be reachable.
+
+REVISION v2 (2026-07-26, arms 0-1 already running and byte-untouched;
+2-15 reorganized before launch). Six refinement arms cut (t5, share005,
+ttl150, ttl400, churn25, churn100 -- bridges and fine brackets, not
+direction-setters) to make room for the SINGLE-PHASE NAIVE protocol
+(arms 10-15): one always-on stage after train_prior, no other stages, no
+transitions, no on_enter surgery. fwd (tb: Z + policy grads), bwd
+(tb, freeze_z from base: policy only), replay (tb, freeze_z from base:
+policy only) all permanently active; buffers_active + churn from step
+one; entry fracs = idle default_boost, bwd-DOMINANT (spread owned from
+step one, per the bwd-owns-spread stationarity result -- buildout's
+instability traced to spread being unowned at bwd 0.001). Zero code: the
+declarative stage engine makes this a config-only protocol variant.
+
+The gentle controller (naive_gentle_* arms), v3 per user direction --
+replay is the workhorse for everything downstream of Z: it tames fwd
+scatter_err at the extremes and combats mode concentration, while
+boosting FWD for its own calibration is inefficient (fwd is bad at
+converging fwd r2) and unmanaged fwd share costs mode forgetting:
+  1. fwd/tb_resid_clipped > 0.5 -> boost fwd. The Z ruler -- fwd is Z's
+     only trainer, the one job that genuinely needs fwd share. NB at
+     phase1_exit entry Z sits at the MLE warm-start level, so this rule
+     fires hard early and boosts fwd until Z walks down to the on-policy
+     level -- an EMERGENT, continuous z_match with no stage boundary.
+  2. bwd/tb_err_worst > 25 -> boost bwd, annealing toward 5 at per-rule
+     rate 0.98 (slow: ~4k+ clean steps to close).
+  3. fwd/tb_err_worst relative-to-own-best (margin 1.5, drift 0.003) ->
+     boost REPLAY: on-policy calibration degrading = spread/retention
+     work, replay's job -- not fwd's.
+  4. fwd/over_coverage > 8 -> boost replay: mode-concentration tamp,
+     egregious-outliers-only, UNANNEALED (the c8utdn8q lesson: annealing
+     this bar ratchets onto the metric's natural level).
+Still deliberately NO replay-side-metric rule: replay error metrics are
+admission-policy artifacts and may never GROW replay's share (the
+buildout rule-3 lesson).
+naive_fixed_* arms have NO rules at all -- fracs pinned at entry values
+(the user's 'constant low replay level' variant), the zero-controller
+null that prices the gentle controller itself.
+
+   6 : naive_fixed        -- (fwd 0.05, bwd 0.9, replay 0.05), no rules
+   7 : naive_fixed_b80    -- (0.1, 0.8, 0.1), no rules
+   8 : naive_gentle       -- (0.05, 0.9, 0.05) + gentle controller
+   9 : naive_gentle_b80   -- (0.1, 0.8, 0.1)
+  10 : naive_gentle_b70   -- (0.2, 0.7, 0.1)
+  11 : naive_gentle_r25   -- (0.05, 0.7, 0.25): replay-heavy anchor
+  12 : naive_gentle_r40   -- (0.05, 0.55, 0.4): where does replay
+                             dominance saturate or hurt?
+  13 : naive_gentle_fwd30 -- (0.3, 0.6, 0.1): faster Z / more on-policy
+  14 : naive_gentle_repidle -- entry (0.05, 0.9, 0.05) but IDLE
+                             default_boost (0.05, 0.65, 0.3): the literal
+                             'boost replay on default' -- idle drifts
+                             replay-ward, rules unchanged
+  15 : naive_gentle_lr1e4 -- (0.05, 0.9, 0.05) at DOUBLE LR (1e-4 on
+                             policy/back/replay/fused). Forward-first
+                             detonates at 1e-4 (the TB LR ceiling); if
+                             bwd-dominant naive survives it, the
+                             stability claim has teeth AND the protocol
+                             buys wall-clock
+
+Naive reading guide: stability first (fwd/logw_std flat vs sawtooth, LR
+controller quiet, no terminal rewinds -- lr1e4 is the acid test), then
+time-to-plateau and floor LEVEL vs the staged arms 0-5. Watch
+gates/delta_worst as a passive diagnostic of the emergent z_match (no
+gate reads it here); early fwd-frac elevation then relaxation = rule 1
+doing the handoff. naive_fixed vs naive_gentle (x2 mixes) prices the
+controller; b90->b70 + r25/r40 scan how the anchor share trades against
+bwd dominance; repidle isolates idle-attractor placement from rule
+response.
 """
 
+from copy import deepcopy
 from pathlib import Path
 
 import yaml
@@ -168,6 +229,63 @@ def share_arm(replay_share, config=None):
     return config
 
 
+NAIVE_RULES = [
+    # Z is the ruler -- fires hard at entry (Z at the MLE warm-start level)
+    # and quiets once Z reaches the on-policy level: the emergent z_match.
+    # The one job that genuinely needs fwd share (fwd is Z's only trainer)
+    {'metric': 'fwd/tb_resid_clipped', 'abs': True, 'above': 0.5, 'boost': 'fwd'},
+    # bwd fit floor: high start, slow per-rule anneal toward the staged
+    # protocol's working bar
+    {'metric': 'bwd/tb_err_worst', 'above': 25.0, 'boost': 'bwd',
+     'anneal': {'min': 5.0, 'rate': 0.98}},
+    # on-policy calibration degrading vs own best -> REPLAY, not fwd:
+    # replay tames fwd scatter extremes; boosting fwd is inefficient at
+    # converging fwd's own fit and unmanaged fwd costs mode forgetting
+    {'metric': 'fwd/tb_err_worst', 'relative': 'best', 'margin': 1.5,
+     'drift': 0.003, 'boost': 'replay'},
+    # mode-concentration tamp: egregious-outliers-only, UNANNEALED
+    # (c8utdn8q: annealing ratchets this bar onto the metric's natural level)
+    {'metric': 'fwd/over_coverage', 'above': 8.0, 'boost': 'replay'},
+]
+
+
+def naive_arm(fwd, bwd, replay, rules=True, default_boost=None, peak_lr=None):
+    """
+    Single-phase naive protocol: [train_prior, naive] -- one always-on
+    fused stage, no transitions, no on_enter surgery. Entry fracs double
+    as the idle default_boost unless default_boost overrides (the
+    'boost replay on default' variant). min_fracs all sit above
+    deactivate_threshold: nothing may ever switch off. peak_lr overrides
+    the four rollout LRs (lr_flow untouched).
+    """
+    config = make_base()
+    train_prior = next(s for s in config['protocol']['stages']
+                       if s['name'] == 'train_prior')
+    naive = {
+        'name': 'naive',
+        'train_mode': 'fused',
+        'bwd_sampling_mode': 'prior',
+        'flags': {'buffers_active': True, 'update_log_z': True},
+        'fracs': {'fwd': fwd, 'bwd': bwd, 'replay': replay},
+        'min_fracs': {'fwd': 0.02, 'bwd': 0.05, 'replay': 0.02},
+        'deactivate_threshold': 0.01,
+        'loss_coeffs': {
+            'fwd': {'tb': 1.0},   # Z + policy grads
+            'bwd': {'tb': 1.0},   # freeze_z: 1 from base -> policy only
+        },
+        'balance': {
+            'kind': 'lexicographic',
+            'default_boost': default_boost or {'fwd': fwd, 'bwd': bwd, 'replay': replay},
+            'rules': deepcopy(NAIVE_RULES) if rules else [],
+        },
+    }
+    config['protocol']['stages'] = [train_prior, naive]
+    if peak_lr is not None:
+        for key in LR_KEYS:
+            config[key] = peak_lr
+    return config
+
+
 def falsifier_arm(bwd_frac):
     """
     Replay excised from buildout (share 0; the buffer still FILLS via
@@ -195,15 +313,22 @@ def emit(ind, config, name, note):
         yaml.dump(config, f, default_flow_style=False)
 
     rb = config['buffers']['replay_buffer']
-    boost = buildout_stage(config)['balance']['default_boost']
+    stage_names = [s['name'] for s in config['protocol']['stages']]
+    protocol = 'naive' if 'naive' in stage_names else 'forward_first'
+    active = next(s for s in config['protocol']['stages']
+                  if s['name'] in ('naive', 'buildout'))
+    boost = active['balance']['default_boost']
     return {'index': ind, 'run_name': name, 'note': note,
+            'protocol': protocol,
+            'n_rules': len(active['balance']['rules']),
             'admit_temperature': rb['admit_temperature'],
             'max_residence_steps': rb['max_residence_steps'],
             'cap_min_max_h0': [rb['admit_cap_min'], rb['admit_cap_max'],
                                rb['admit_cap_health_h0']],
             'churn_rate': rb['churn_rate'],
-            'buildout_replay_share': boost.get('replay', 0.0),
-            'buildout_bwd_share': boost.get('bwd', 0.0)}
+            'fwd_share': boost.get('fwd', 0.0),
+            'bwd_share': boost.get('bwd', 0.0),
+            'replay_share': boost.get('replay', 0.0)}
 
 
 if __name__ == '__main__':
@@ -214,47 +339,47 @@ if __name__ == '__main__':
 
     entries.append(emit(1, replay_arm(admit_temperature=0.5), 't05',
                     'admit_temperature 0.5: near-argmax admission'))
-    entries.append(emit(2, replay_arm(admit_temperature=1.0), 't1',
-                    'admit_temperature 1'))
-    entries.append(emit(3, replay_arm(admit_temperature=5.0), 't5',
-                    'admit_temperature 5: cross-battery bridge to the tsched control'))
 
-    entries.append(emit(4, share_arm(0.05), 'share005',
-                    'buildout replay share 0.1 -> 0.05'))
-    entries.append(emit(5, share_arm(0.2), 'share02',
-                    'buildout replay share 0.1 -> 0.2'))
-    entries.append(emit(6, share_arm(0.3), 'share03',
+    entries.append(emit(2, share_arm(0.3), 'share03',
                     'buildout replay share 0.1 -> 0.3'))
-
-    entries.append(emit(7, replay_arm(max_residence_steps=150), 'ttl150',
-                    'TTL 250 -> 150'))
-    entries.append(emit(8, replay_arm(max_residence_steps=400), 'ttl400',
-                    'TTL 250 -> 400'))
-
-    entries.append(emit(9, falsifier_arm(0.0), 'norep',
+    entries.append(emit(3, falsifier_arm(0.0), 'norep',
                     'replay excised, bwd dormant: designed replication of fwd-alone instability'))
-    entries.append(emit(10, falsifier_arm(0.1), 'bwd01_norep',
-                    'replay excised, bwd pinned 0.1: can bwd own spread instead?'))
-    entries.append(emit(11, falsifier_arm(0.3), 'bwd03_norep',
-                    'replay excised, bwd pinned 0.3'))
-
-    entries.append(emit(12, share_arm(0.2, replay_arm(admit_temperature=1.0)), 't1_share02',
-                    'compound best-guess: T 1 + share 0.2'))
-    entries.append(emit(13, replay_arm(admit_cap_min=30.0), 'fixedcap',
+    entries.append(emit(4, falsifier_arm(0.3), 'bwd03_norep',
+                    'replay excised, bwd pinned 0.3: can bwd own spread instead?'))
+    entries.append(emit(5, replay_arm(admit_cap_min=30.0), 'fixedcap',
                     'cap_min = cap_max = 30: health modulation off, at the T=2 reference'))
-    entries.append(emit(14, replay_arm(churn_rate=25), 'churn25',
-                    'churn_rate 25: thin equilibrium buffer ~6.2k'))
-    entries.append(emit(15, replay_arm(churn_rate=100), 'churn100',
-                    'churn_rate 100: fast displacement churn, mean age ~50'))
+
+    entries.append(emit(6, naive_arm(0.05, 0.9, 0.05, rules=False), 'naive_fixed',
+                    'single-phase naive, fracs pinned (0.05/0.9/0.05), NO controller'))
+    entries.append(emit(7, naive_arm(0.1, 0.8, 0.1, rules=False), 'naive_fixed_b80',
+                    'single-phase naive, fracs pinned (0.1/0.8/0.1), NO controller'))
+    entries.append(emit(8, naive_arm(0.05, 0.9, 0.05), 'naive_gentle',
+                    'single-phase naive (0.05/0.9/0.05) + gentle 4-rule controller'))
+    entries.append(emit(9, naive_arm(0.1, 0.8, 0.1), 'naive_gentle_b80',
+                    'single-phase naive (0.1/0.8/0.1)'))
+    entries.append(emit(10, naive_arm(0.2, 0.7, 0.1), 'naive_gentle_b70',
+                    'single-phase naive (0.2/0.7/0.1)'))
+    entries.append(emit(11, naive_arm(0.05, 0.7, 0.25), 'naive_gentle_r25',
+                    'single-phase naive (0.05/0.7/0.25): replay-heavy anchor'))
+    entries.append(emit(12, naive_arm(0.05, 0.55, 0.4), 'naive_gentle_r40',
+                    'single-phase naive (0.05/0.55/0.4): replay-dominance saturation probe'))
+    entries.append(emit(13, naive_arm(0.3, 0.6, 0.1), 'naive_gentle_fwd30',
+                    'single-phase naive (0.3/0.6/0.1): faster Z, more on-policy exposure'))
+    entries.append(emit(14, naive_arm(0.05, 0.9, 0.05,
+                                      default_boost={'fwd': 0.05, 'bwd': 0.65, 'replay': 0.3}),
+                    'naive_gentle_repidle',
+                    'entry (0.05/0.9/0.05), idle default_boost (0.05/0.65/0.3): boost replay on default'))
+    entries.append(emit(15, naive_arm(0.05, 0.9, 0.05, peak_lr=1.0e-4), 'naive_gentle_lr1e4',
+                    'single-phase naive (0.05/0.9/0.05) at LR 1e-4: the TB-LR-ceiling acid test'))
 
     with open(OUTDIR / 'experiment_log.yaml', 'w') as f:
         yaml.dump(entries, f, sort_keys=False)
 
     print(f'Generated {len(entries)} configs with log at {OUTDIR / "experiment_log.yaml"}')
-    print(f'{"idx":>3s} {"run":>14s} {"T":>5s} {"ttl":>5s} {"cap":>14s} '
-          f'{"churn":>5s} {"share":>6s} {"bwd":>5s}')
+    print(f'{"idx":>3s} {"run":>18s} {"proto":>13s} {"rules":>5s} {"T":>5s} '
+          f'{"ttl":>5s} {"cap":>16s} {"fwd":>5s} {"bwd":>5s} {"rep":>5s}')
     for row in entries:
-        print(f'{row["index"]:>3d} {row["run_name"]:>14s} {row["admit_temperature"]:>5.1f} '
-              f'{row["max_residence_steps"]:>5d} {str(row["cap_min_max_h0"]):>14s} '
-              f'{row["churn_rate"]:>5d} {row["buildout_replay_share"]:>6.2f} '
-              f'{row["buildout_bwd_share"]:>5.2f}')
+        print(f'{row["index"]:>3d} {row["run_name"]:>18s} {row["protocol"]:>13s} '
+              f'{row["n_rules"]:>5d} {row["admit_temperature"]:>5.1f} '
+              f'{row["max_residence_steps"]:>5d} {str(row["cap_min_max_h0"]):>16s} '
+              f'{row["fwd_share"]:>5.2f} {row["bwd_share"]:>5.2f} {row["replay_share"]:>5.2f}')

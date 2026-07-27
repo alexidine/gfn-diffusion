@@ -71,7 +71,7 @@ buffers:
     admit_cap_health_h0: 10.0
     admit_cap_max: 30.0
     admit_cap_min: 8.0
-    admit_temperature: 5.0
+    admit_temperature: 2.0
     churn_rate: 50
     max_residence_steps: 250
     max_size: 10000
@@ -304,8 +304,7 @@ protocol:
     train_mode: fused
   - balance:
       default_boost:
-        fwd: 0.9
-        replay: 0.1
+        fwd: 1.0
       kind: lexicographic
       rules:
       - above: 0.5
@@ -328,8 +327,8 @@ protocol:
       weighted_condition_sampling: true
     fracs:
       bwd: 0.001
-      fwd: 0.989
-      replay: 0.01
+      fwd: 0.998
+      replay: 0.0
     loss_coeffs:
       bwd:
         tb: 1.0
@@ -338,7 +337,7 @@ protocol:
     min_fracs:
       bwd: 0.001
       fwd: 0.02
-      replay: 0.009
+      replay: 0.0
     name: buildout
     on_enter:
     - rebuild_prior_by_churn
@@ -402,7 +401,7 @@ replay_loss_coeffs:
   vg_lb: 0
   vg_lme: 0
 reuse_prior: true
-run_name: t5
+run_name: norep
 seed: 12345
 sg_conditioning: false
 space_groups:
