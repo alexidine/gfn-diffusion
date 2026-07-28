@@ -31,7 +31,7 @@ from energy_sampling.protocol import StageProtocol
 from energy_sampling.eval.utils import sample_eval_fwd_trajs
 from energy_sampling.utils import is_cuda_oom, \
     dict2namespace, \
-    get_discretizer, log_elapsed_times, MetricTracker, quick_tb_stats, uniform_discretizer, logmeanexp, \
+    get_discretizer, drain_elapsed_times, MetricTracker, quick_tb_stats, uniform_discretizer, logmeanexp, \
     cal_subtb_coef_matrix, within_condition_logw_std
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss, log_pf_estimate
 from models import GFN
@@ -144,7 +144,7 @@ class Modeller:
         self.times = {}
         # replay churn tallied across every manage_replay_buffer call (train
         # steps and eval alike), drained and logged once per eval in log_metrics
-        self.replay_churn = {'admitted': 0, 'evicted': 0}
+        self.replay_churn = {'admitted': 0, 'evicted': 0, 'reward_rejected': 0}
         # TTL-cohort tallies (see manage_replay_buffer's eviction split):
         # drained and logged once per eval alongside replay_churn
         self.replay_cohort = {'absorbed': 0, 'expired': 0, 'expired_undrawn': 0,
@@ -184,6 +184,19 @@ class Modeller:
         # Deliberately not checkpointed: it's a one-step cache (the MLE slope gate
         # samples it every 10 steps into its own checkpointed window).
         self._last_stats = {}
+        # last-logged value of every energy_func/ and loss_coeffs/ setting, so
+        # dump_numeric can emit only the ones a stage transition actually moved.
+        # Not checkpointed: an empty cache on resume just re-logs the full set
+        # once, which is the right baseline for a fresh wandb run anyway.
+        self._settings_log_cache = {}
+        # per-submodel grad norms from the most recent reporting step, and the
+        # count of non-finite-gradient steps since the last report
+        self._last_grad_norms = {}
+        self._grad_nonfinite = 0
+        # samples and seconds accumulated since the last report, so throughput
+        # is a true window ratio rather than batch_size / one sampled step time
+        # (batch_size moves by 3-4x over a run, so the two are not the same)
+        self._throughput = {'samples': 0, 'seconds': 0.0}
 
     # position in the protocol, derived -- checkpoints store the stage NAME; the
     # int only feeds wandb continuity and the LR controller's stage-change marker
@@ -329,12 +342,25 @@ class Modeller:
         metrics['Batch Size'] = self.batch_size
         if hasattr(self, 'last_grad_norm_pre_clip'):
             metrics['grad_norm_pre_clip'] = self.last_grad_norm_pre_clip
+        # per-submodel grad norms (see _submodel_grad_norms) + how many steps
+        # since the last report had a non-finite gradient and were skipped
+        metrics.update(self._last_grad_norms)
+        metrics['gradnorm/nonfinite_steps'] = self._grad_nonfinite
+        self._grad_nonfinite = 0
+        # true throughput over the window: total samples / total seconds. Step
+        # time alone can't answer 'did that change make it faster' while
+        # batch_size is a moving denominator (982-3000 on dev, 1650-7410 on
+        # cluster runs), which is exactly the regime the grow/OOM cycle creates
+        if self._throughput['seconds'] > 0:
+            metrics['samples_per_sec'] = (
+                    self._throughput['samples'] / self._throughput['seconds'])
+        self._throughput = {'samples': 0, 'seconds': 0.0}
         metrics['Fwd Frac'] = self.fwd_frac
         metrics['Bwd Frac'] = self.bwd_frac
         metrics['Replay Frac'] = self.replay_frac
         # boost state, per-rule live (annealed) thresholds/elevations, exit streaks
         metrics.update(self.protocol.report())
-        metrics.update(log_elapsed_times(self.times))
+        metrics.update(drain_elapsed_times(self.times))
         # PERSISTENT (cross-visit) views of the same quantities the rolling
         # fwd|bwd|replay channels carry per batch. Namespaced 'tracker/' on
         # purpose: only the rolling channels reach metric_tracker, so only THEY
@@ -348,6 +374,17 @@ class Modeller:
         metrics['tracker/z_grad_rms'] = self.condition_log_z.rms_z_grad()      # dL/dZ ruler, level-only
         metrics['tracker/z_grad_worst'] = self.condition_log_z.worst_z_grad(quantile=cwq)
         metrics['tracker/z_bias_rms'] = self.condition_log_z.rms_z_bias()      # unclipped level (diagnostic)
+        # UNCLIPPED tail + dispersion. z_grad_worst above reads the CLIPPED
+        # stream, so it saturates at clip_beta and goes blind exactly where the
+        # damage is: a condition mis-levelled by 30 nats reads the same as one
+        # off by 10, while the policy's only way to comply with a too-high Z is
+        # to spread mass off-support (P_F is normalized), which inflates
+        # variance, worsens samples, and grows the residual that caused it.
+        # 'z_bias narrow and light-tailed' is the health condition -- rms gives
+        # the width, worst gives the tail, var gives what the z_var loss term
+        # actually penalizes.
+        metrics['tracker/z_bias_worst'] = self.condition_log_z.worst_z_bias(quantile=cwq)
+        metrics['tracker/z_bias_var'] = self.condition_log_z.var_z_bias()
         metrics['tracker/logw_std_rms'] = self.condition_log_z.rms_logw_std()  # spread; +inf until warmed
         # z_match level-matching gap: worst-condition |bwd_level - fwd_level|
         # over the two single-mode streams (+inf until enough conditions are
@@ -1392,10 +1429,11 @@ class Modeller:
 
             self.times['initialization_end'] = time()
 
-            wandb.watch(self.gfn_model,
-                        log_graph=False,
-                        log_freq=1000,
-                        log='gradients')
+            # no wandb.watch(log='gradients'): 110 per-tensor histograms answered
+            # 'is gradient reaching every submodel / is one cooling off' badly and
+            # only every few thousand steps. gradnorm/* in ten_step_reporting is
+            # the same question as six plottable, gateable scalars at train cadence
+            # (see _submodel_grad_norms).
 
             self.gfn_model.train()
             self.set_detect_anomaly(do_anomaly_detection=self.args.anomaly_detection)
@@ -1408,6 +1446,10 @@ class Modeller:
                     self.set_energy_coeffs()
 
                 step_type = self.train_logic(self.step_ind)
+                # captured BEFORE the step: an OOM slashes self.batch_size in
+                # handle_train_epoch_error, and the throughput denominator wants
+                # the size that was actually attempted at that cost
+                attempted_batch = self.batch_size
                 self.times['train_step_start'] = time()
                 try:
                     current_loss = self.train_step(step_type)
@@ -1423,6 +1465,8 @@ class Modeller:
                 if not hasattr(self, '_recent_step_times'):
                     self._recent_step_times = deque(maxlen=64)
                 self._recent_step_times.append(step_dt)  # feeds the throughput-knee check
+                self._throughput['samples'] += attempted_batch
+                self._throughput['seconds'] += step_dt
 
                 # train monitoring
                 if self.step_ind % 10 == 0:
@@ -2015,21 +2059,78 @@ class Modeller:
             viol = (states[:, -1].abs() - 1.0).clamp(min=0.0)
             stats['box_violation'] = (viol ** 2).sum(dim=-1).mean().item()
             stats['box_contact_frac'] = (viol > 0).any(dim=-1).float().mean().item()
+            # REALIZED spread, on the train-step clock. 'Mean F/B Var' are the
+            # model's logvar PARAMETERS and are only available at eval cadence
+            # (the train sampler runs return_gauss_params=False, so retaining
+            # them would cost per-step tensors) -- but the quantity that
+            # actually matters, how wide the sampled cloud is and how big its
+            # steps are, is already sitting in flow_states for free. Both are
+            # per-dim means so they're comparable across problems:
+            #   terminal_var -- variance of the terminal latents across the
+            #     batch: the width of what the policy is actually producing
+            #   step_var -- mean squared increment along the trajectory: the
+            #     realized per-step noise+drift budget, i.e. the train-cadence
+            #     proxy for the joint P_F/P_B inflation that runs along TB's
+            #     flat direction. Logged so the variance breathing can be
+            #     phase-resolved against logw_std/box_contact instead of being
+            #     sampled ~3x per cycle at eval cadence.
+            stats['terminal_var'] = states[:, -1].var(dim=0).mean().item()
+            if states.shape[1] > 1:
+                stats['step_var'] = (states[:, 1:] - states[:, :-1]).pow(2).mean().item()
         # RAW (pre-EMA) stats cache, one step deep: the MLE slope gate samples
         # bwd/mle from here every 10 steps -- raw batch losses are ~independent
         # across steps, so its OLS slope needs no autocorrelation correction
         self._last_stats[sub_type] = stats
         self.metric_tracker.update(sub_type, stats, self.step_ind)
 
+    def _submodel_grad_norms(self):
+        """
+        Per-submodel gradient L2 norm, one row per named child of the GFN
+        (forward_policy, backward_policy, flow_model, conditions_embedding_model,
+        s_model, t_model -- whatever the arch actually has; nothing is hardcoded,
+        so an arch change is picked up for free).
+
+        This replaces wandb.watch(log='gradients'), which spent 110 histogram
+        channels (~7000 bins per event) on two questions these scalars answer
+        directly and at train cadence: is gradient reaching every part of the
+        model (a line pinned at 0 = it is not), and is any sub-model cooling off
+        (a line trending down). A submodel whose params all have grad=None
+        reports 0.0 rather than being omitted -- a missing key vanishes silently
+        on a dashboard, a zero is visible.
+
+        MUST be called before clip_grad_norm_, which rescales grads in place.
+        One stacked .cpu() so the whole set costs a single device sync, and only
+        on reporting steps.
+        """
+        names, norms = [], []
+        for name, mod in self.gfn_model.named_children():
+            grads = [p.grad.detach() for p in mod.parameters(recurse=True)
+                     if p.grad is not None]
+            names.append(name)
+            norms.append(torch.linalg.vector_norm(torch.stack(
+                [torch.linalg.vector_norm(g) for g in grads]))
+                if grads else torch.zeros((), device=self.device))
+        if not names:
+            return {}
+        return {f'gradnorm/{n}': v for n, v in
+                zip(names, torch.stack(norms).cpu().tolist())}
+
     def step_loss(self, step_type, loss, do_step: bool = True):
         loss.backward()
         if not do_step:
             return  # mid-accumulation: keep piling up gradients, don't clip/step yet
 
+        # sampled on the same 1-in-10 clock as the rest of ten_step_reporting.
+        # When a step runs more than one branch (unfused phase 1), this holds
+        # the LAST branch to reach an optimizer step, not their sum.
+        if self.step_ind % 10 == 0:
+            self._last_grad_norms = self._submodel_grad_norms()
+
         pre_clip = torch.nn.utils.clip_grad_norm_(
             self.gfn_model.parameters(), self.args.gradient_norm_clip).item()
         if not math.isfinite(pre_clip):
             print(f"Non-finite gradient at {self.step_ind}")
+            self._grad_nonfinite += 1  # drained into gradnorm/nonfinite_steps
             return  # skip non-finite
         # raw (pre-clip) global grad norm, for reading how hard the clip binds:
         # persistently >> gradient_norm_clip means every step is rescaled and
@@ -2419,7 +2520,9 @@ class Modeller:
         """
         Conditional generalization check: the same on-policy eval protocol run
         against HELD-OUT conditions (test_molecules_path), logged under
-        'eval_test/', with 'eval_gap/' = train - test on the headline metrics.
+        'eval_test/', against the matching train-condition readings under
+        'eval_fwd/'. The generalization gap is the difference between the two
+        and is left to the dashboard rather than logged as its own channels.
 
         Pure measurement. fwd_eval_sampling runs with side_effects=False, so the
         held-out conditions never reach condition_log_z, the anchor buffer, or
@@ -2437,10 +2540,9 @@ class Modeller:
         for k in ('logw_std_within', 'cond_tb_err', 'tb_err_worst', 'z_grad_worst'):
             if k in train_m:
                 metrics[f'eval_fwd/{k}'] = train_m[k]
-        for k in ('cond_tb_err', 'tb_err_worst', 'z_grad_worst', 'scatter_err',
-                  'logw_std_within', 'relative_under'):
-            if k in train_m and k in test_m:
-                metrics[f'eval_gap/{k}'] = train_m[k] - test_m[k]
+        # no 'eval_gap/' block: it was exactly eval_fwd - eval_test on six keys
+        # that are both already logged, so the generalization gap is a wandb
+        # panel expression rather than six more channels.
         return metrics
 
     def log_metrics(self, fwd_stats, bwd_stats, sample_batch):
@@ -2476,10 +2578,26 @@ class Modeller:
                                        **self._reward_ramp_kwargs(bwd_stats.get('condition_id'))).items()})
 
         def dump_numeric(metrics, prefix, obj):
+            """Log the numeric settings behind this eval, but ONLY the ones that
+            moved since the last eval (plus everything once, on the first eval,
+            to establish the baseline).
+
+            These are settings, not measurements: the energy function's
+            constants never change at all within a run, and the loss
+            coefficients change only when the protocol swaps stages. Re-logging
+            all 68 of them every eval put a wall of flat lines in the run --
+            the whole point of having them here is to see the STEP where a
+            stage transition retuned something, and a channel that only emits
+            on change shows exactly that (wandb holds the last value forward
+            between points, so the panels still read correctly)."""
+            cache = self._settings_log_cache
             d = obj if isinstance(obj, dict) else vars(obj)
             for k, v in d.items():
                 if isinstance(v, (int, float)) and not isinstance(v, bool):
-                    metrics[f'{prefix}/{k}'] = v
+                    key = f'{prefix}/{k}'
+                    if key not in cache or cache[key] != v:
+                        metrics[key] = v
+                        cache[key] = v
 
         dump_numeric(metrics, 'energy_func/', self.energy_function)
         dump_numeric(metrics, 'loss_coeffs/fwd_', self.args.fwd_loss_coeffs)
@@ -2573,9 +2691,11 @@ class Modeller:
             metrics['wass_anchor_debiased'] = raw - null
 
     def log_thermo_properties(self, arr, fwd_stats, log_T_tensor, log_Z_learned, log_r, metrics, sample_batch, val):
-        # energies
+        # energies. gfn_energy is skipped: it is logged just below as 'Mean
+        # Sample Energy' (identical to float precision), and that name says
+        # which of the several energies on the batch is the one the loss sees.
         for key in sample_batch.keys():
-            if 'energy' in key or 'pot' in key:
+            if ('energy' in key or 'pot' in key) and key != 'gfn_energy':
                 metrics['Mean ' + key] = val(sample_batch[key].mean())
 
         # the rotational Haar jacobian terms diverge (log) at r -> 0 and theta -> 0/pi
@@ -2599,9 +2719,11 @@ class Modeller:
         metrics['Mean Sample Energy'] = val(sample_batch.gfn_energy.mean())
         metrics['Sample Energy'] = arr(sample_batch.gfn_energy.clip(max=50))
         metrics['Mean Sample Reward'] = val(log_r.mean())
-        metrics['Sample Reward'] = arr(log_r.clip(min=-50))
-        metrics['Empirical log Z'] = val(fwd_stats['log_Z'])
-        metrics['Empirical log Z LB'] = val(fwd_stats['log_Z_lb'])
+        # no 'Sample Reward' histogram: log_r is -energy/T, so it was the
+        # 'Sample Energy' histogram mirrored and rescaled, nothing more.
+        # 'Empirical log Z' / 'Empirical log Z LB' are likewise gone -- they
+        # were bit-identical to eval_fwd/emp_z and eval_fwd/jensen_z, which
+        # sit next to the rest of the forward parity block where they belong.
         metrics['log Z learned'] = val(log_Z_learned.mean())
 
         # get fraction of samples which are 'reasonable' at this energy,
@@ -2744,9 +2866,16 @@ class Modeller:
 
         metrics.update({
             'Batch Size': self.batch_size})  # single shared batch size -- train and eval sampling now use the same value
-        metrics.update(log_elapsed_times(self.times))
         self.times['eval_wrapup_end'] = time()
         self.times['eval_step_end'] = time()
+        # drained AFTER the two end stamps above, so every pair this eval opened
+        # is closed by the time it is read. It used to run before them, which
+        # paired THIS eval's eval_step_start with the PREVIOUS eval's
+        # eval_step_end -- one garbage point per eval, at minus the inter-eval
+        # gap (eval_step_time bottomed at -358 s against a true 9.2 s median,
+        # eval_wrapup_time at -363 s), and the real value only arrived on the
+        # next train-cadence report. Both now land once, correct, on the eval step.
+        metrics.update(drain_elapsed_times(self.times))
 
         for key in metrics.keys():  # cleanup before logging
             if isinstance(metrics[key], np.ndarray):
@@ -2807,7 +2936,7 @@ class Modeller:
                 'prior_buffer_median_loss': torch.nanmedian(buff.ema_loss).item(),
                 'prior_buffer_step_hist': safe_histogram(buff.select_counts.cpu().numpy()),
             })
-            metrics.update(self.energy_reward_stats('prior_buffer', energy=buff.y))
+            metrics.update(self.energy_stats('prior_buffer', energy=buff.y))
             if len(valid_losses) > 0:
                 metrics['prior_buffer_loss_hist'] = safe_histogram(np.clip(np.log10(valid_losses), min=-1, max=3))
 
@@ -2868,7 +2997,7 @@ class Modeller:
             if hasattr(self, '_replay_admit_cap'):
                 metrics['replay_buffer_admit_cap'] = self._replay_admit_cap
                 metrics['replay_buffer_admit_health'] = self._replay_admit_health
-            metrics.update(self.energy_reward_stats('replay_buffer', energy=self.replay_buffer.y))
+            metrics.update(self.energy_stats('replay_buffer', energy=self.replay_buffer.y))
             if len(valid_replay_losses) > 0:
                 metrics['replay_buffer_loss_hist'] = safe_histogram(
                     np.clip(np.log10(valid_replay_losses), min=0, max=3))
@@ -2881,6 +3010,10 @@ class Modeller:
                 'replay_buffer_admitted': admitted,
                 'replay_buffer_evicted': self.replay_churn['evicted'],
                 'replay_buffer_turnover': admitted / max(len(self.replay_buffer), 1),
+                # candidates hard-excluded by admit_reward_min this window --
+                # counted pre-softmax over the whole batch, so this is a rate
+                # against sampled candidates, not against churn_rate
+                'replay_buffer_reward_rejected': self.replay_churn['reward_rejected'],
             })
             for key in self.replay_churn:
                 self.replay_churn[key] = 0
@@ -2910,7 +3043,7 @@ class Modeller:
 
         if hasattr(self, 'anchor_buffer'):
             metrics['anchor_buffer_length'] = len(self.anchor_buffer)
-            metrics.update(self.energy_reward_stats('anchor_buffer', energy=self.anchor_buffer.energy))
+            metrics.update(self.energy_stats('anchor_buffer', energy=self.anchor_buffer.energy))
             # "the average anchor sample got XX (energy units) better this
             # window": per-condition mean energy drop since last eval,
             # averaged over conditions present in both snapshots -- see
@@ -3036,22 +3169,22 @@ class Modeller:
             metrics['condition_best_energy_median'] = float(np.median(best_energy))
         return metrics
 
-    def energy_reward_stats(self, prefix, energy=None, reward=None):
+    def energy_stats(self, prefix, energy=None, reward=None):
         """
-        Mean, median, and histogram for both energy and reward, deriving
-        whichever one wasn't passed in via the fixed sampling temperature
-        (same reward = -energy / T convention as prebuilt_sample_to_reward
-        and top_up_prior_from_anchors).
+        Mean, median, min/max and histogram of a buffer's energies.
+
+        Reward is NOT reported alongside: it is -energy / temperature (the same
+        fixed-T convention as prebuilt_sample_to_reward and
+        top_up_prior_from_anchors), so every reward panel was the energy panel
+        mirrored and rescaled by a constant -- verified at pearson -1.0000
+        across prior/replay/anchor. Callers that only hold reward can still
+        pass reward= and get it converted.
         """
         assert energy is not None or reward is not None, "must pass energy and/or reward"
-        temperature = self.energy_function.temperature
         if energy is None:
-            energy = -reward * temperature
-        elif reward is None:
-            reward = -energy / temperature
+            energy = -reward * self.energy_function.temperature
 
         energy_np = energy.detach().cpu().numpy()
-        reward_np = reward.detach().cpu().numpy()
 
         # an empty buffer is a legitimate state (a fresh/flushed replay buffer
         # before its first admission, or one the TTL has fully drained), and
@@ -3066,11 +3199,6 @@ class Modeller:
             f'{prefix}_min_energy': float(np.min(energy_np)),
             f'{prefix}_max_energy': float(np.max(energy_np)),
             f'{prefix}_energy_hist': safe_histogram(energy_np, num_bins=128),
-            f'{prefix}_mean_reward': float(np.mean(reward_np)),
-            f'{prefix}_median_reward': float(np.median(reward_np)),
-            f'{prefix}_min_reward': float(np.min(reward_np)),
-            f'{prefix}_max_reward': float(np.max(reward_np)),
-            f'{prefix}_reward_hist': safe_histogram(reward_np, num_bins=128),
         }
 
     def manage_prior_buffer(self, sample_batch):
@@ -3095,11 +3223,25 @@ class Modeller:
                        n_churn)  # cap unrelated to GPU batch size -- eval_batch_size is retired, this is just a churn-rate limiter
         headroom = max(0, self.args.buffers.prior_buffer.max_size - len(self.prior_buffer))
 
+        # Eligibility for eviction is RELATIVE (the bottom `quantile` of
+        # visited rows), never an absolute loss bar. get_elig_drop_count cuts
+        # at min(loss_floor, quantile), so a finite loss_floor in NATS turns
+        # into a rate gate the moment the buffer is full: with headroom 0 the
+        # eligible set is the ONLY intake path, and on any problem whose
+        # per-sample backward residuals sit above that bar (elj plateaus at
+        # 24-27) nothing is ever eligible, n_to_add collapses to 0, and churn
+        # stops for good -- silently, since the buffer just looks full and
+        # quiet. Passing +inf keeps the cut at the quantile alone, so ~25% of
+        # visited rows are always evictable: the RATE stays owned by the churn
+        # policy (n_churn) and loss only decides WHICH rows go, which was the
+        # intent. This is what makes prior_buffer.init_fraction: 1.0 safe.
+        _EVICT_QUANTILE, _EVICT_MIN_VISITS = 0.25, 5
+
         if n_to_add > headroom:
             elig_idx, _, _ = self.prior_buffer.get_elig_drop_count(
-                quantile=0.25,
-                loss_floor=10.0,
-                min_visits=5,
+                quantile=_EVICT_QUANTILE,
+                loss_floor=float('inf'),
+                min_visits=_EVICT_MIN_VISITS,
             )
             elig_to_drop = elig_idx.numel()
             # only the overflow portion needs to be backed by eligible drops
@@ -3114,9 +3256,9 @@ class Modeller:
             len_before = len(self.prior_buffer)
             self.prior_buffer.purge_lowest(
                 space_needed,
-                quantile=0.25,
-                loss_floor=10.0,
-                min_visits=5,
+                quantile=_EVICT_QUANTILE,
+                loss_floor=float('inf'),
+                min_visits=_EVICT_MIN_VISITS,
             )
             self.prior_churn['evicted'] += len_before - len(self.prior_buffer)
 
@@ -3851,6 +3993,10 @@ class Modeller:
           hard-excluded upstream of the softmax entirely (never merely
           throttled) -- a NaN/inf-energy state isn't "a real sample that's
           extreme," there's no slow-not-stop tradeoff to make there.
+          admit_reward_min extends the same hard exclusion to finite-but-
+          garbage rewards: nothing else in this path looks at sample quality
+          at all (eligibility is |resid| > floor, a BADNESS criterion), so
+          absent a floor the buffer's energy distribution is unbounded above.
         - Residence TTL (max_residence_steps, counted in TRAIN STEPS, not
           select_counts): unconditional age eviction regardless of ema_loss,
           so the buffer is a decaying reservoir of the CURRENT policy's tail
@@ -3864,11 +4010,25 @@ class Modeller:
 
         # resid stays on CPU: all the eviction logic below runs against the
         # buffer's CPU-resident ema_loss bookkeeping
+        log_r_cpu = log_r.cpu()
         resid = ((log_pf - log_pb) - (log_r - log_Z_learned)).cpu()
         # domain-sanity gate: hard-exclude, never throttled (see docstring)
-        sane = torch.isfinite(log_r).cpu() & torch.isfinite(resid)
+        sane = torch.isfinite(log_r_cpu) & torch.isfinite(resid)
 
         rb_cfg = self.args.buffers.replay_buffer
+        # Absolute reward floor, on the same hard-exclude footing as the
+        # finiteness check above and deliberately NOT part of the softmax
+        # score: admission is scored purely on |resid|, so without this a
+        # physically garbage state is admitted at full weight the moment the
+        # policy is badly calibrated on it, and the capped purge score then
+        # can't tell it apart from a merely-mediocre incumbent (every row at
+        # or above the cap shares one eviction weight). None disables.
+        reward_min = getattr(rb_cfg, 'admit_reward_min', None)
+        if reward_min is not None:
+            below = sane & (log_r_cpu < float(reward_min))
+            self.replay_churn['reward_rejected'] += int(below.sum())
+            sane &= ~below
+
         floor = 0.1  # pool-definition cutoff only -- all real discrimination
         # happens in the softmax + cap below, not in this threshold
 

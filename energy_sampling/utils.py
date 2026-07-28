@@ -1169,14 +1169,28 @@ def get_discretizer(int_cfg):
     return discretizer
 
 
-def log_elapsed_times(times):
+def drain_elapsed_times(times):
+    """
+    Turn completed <name>_start / <name>_end pairs into <name>_time, and CONSUME
+    them: the start key is deleted so the same interval is not re-reported until
+    a new one is timed.
+
+    MUTATES `times`. Without the drain, any pair that is written once and never
+    rewritten is re-emitted on every single report -- 'initialization_time' was
+    logging the same constant 204 times in a run, and a flat line that long
+    reads like a measurement rather than a leftover.
+
+    Only the START key is dropped. The ends are left in place because the eval
+    path chains off one of them (inter_eval_start = times['eval_step_end']), and
+    an end with no start can't re-form a pair on its own anyway.
+    """
     elapsed_times = {}
-    for key in times.keys():
-        if 'start' in key:
-            start_key = key
-            end_key = start_key.split('_start')[0] + '_end'
-            if end_key in times.keys():
-                elapsed_times[start_key.split('_start')[0] + '_time'] = times[end_key] - times[start_key]
+    for start_key in [k for k in times if 'start' in k]:
+        name = start_key.split('_start')[0]
+        end_key = name + '_end'
+        if end_key in times:
+            elapsed_times[name + '_time'] = times[end_key] - times[start_key]
+            del times[start_key]
 
     return elapsed_times
 

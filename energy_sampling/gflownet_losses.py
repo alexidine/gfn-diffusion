@@ -297,6 +297,18 @@ def get_gfn_forward_loss(loss_coeffs,
     else:
         emp_z_persistent_loss = None
 
+    # Z-only condition-grouped level regression (see z_level_loss). Rides the
+    # fwd rollout that ALREADY EXISTS -- no extra sampling, no extra reward
+    # call -- and detaches log w, so it adds Z gradient WITHOUT adding
+    # on-policy policy gradient. That separation is the point: it isolates
+    # "Z tracks each condition" from "the policy samples itself", which are
+    # otherwise confounded in any change to fwd's share. Scalar, so expand to
+    # per-row for the shared stack/mean below (the mean recovers it exactly).
+    z_level_coeff = getattr(loss_coeffs, 'z_level', 0)
+    if z_level_coeff > 0 and condition_id is not None:
+        z_lvl = z_level_loss(log_pf, log_pb, log_r, log_Z_learned, condition_id)
+        losses.append(z_lvl.expand(log_pf.shape[0]) * z_level_coeff)
+
     if loss_coeffs.loss_clip != -1:
         combined_losses = soft_clip(torch.stack(losses), loss_coeffs.loss_clip).mean(dim=0)
     else:
@@ -737,6 +749,62 @@ def emp_Z(gfn, log_Z, log_Z_learned, repeats, beta: float = 10):
         emp_z_loss = beta * F.smooth_l1_loss(log_Z.repeat(len(log_Z_learned)), log_Z_learned, reduction='none',
                                              beta=beta)
     return emp_z_loss
+
+
+def z_level_loss(log_pf, log_pb, log_r, log_Z_learned, condition_id):
+    """
+    Condition-grouped regression of log_Z(c) onto the LIVE per-condition mean
+    importance weight:
+
+        L = mean_c ( log_Z(c) - mean_{i in c} log w_i )^2
+
+    Z-ONLY: log w is detached, so this never touches the policy. Rides an
+    existing forward rollout, so it costs no extra sampling and no extra
+    reward call -- and Z must be regressed on capital-F FRESH on-policy log w,
+    which is why it piggybacks rather than sampling its own.
+
+    MAGNITUDE, NOT DISPERSION (corrected 2026-07-27). An earlier version
+    mean-centered this into Var_c(e_c), on the reasoning that a uniform offset
+    is "just a global Z shift TB already owns". That was wrong twice over.
+    First, a uniform offset is NOT harmless: if every condition sits at
+    e_c = +4 then every sample's TB residual is +4, so log_pf is pushed down
+    EVERYWHERE, and since P_F is normalized the only way to comply is to move
+    mass off-support -- the policy inflates at every condition at once, which
+    is the same uphill mechanism as the dispersion case, just global. Second,
+    TB is empirically NOT driving that mean to zero: the per-condition z_bias
+    histogram sits centered near -4, not 0. Centering therefore discarded the
+    single largest component of the level error. The target is every condition
+    on its OWN right level, i.e. z_bias_rms / z_bias_worst -> 0, so the loss
+    is the plain squared magnitude.
+
+    WHAT IT STILL ADDS OVER TB's Z GRADIENT. It overlaps TB rather than being
+    orthogonal to it (both pull log_Z toward log w), so part of its effect is
+    simply a Z learning-rate multiplier. The parts that are NOT redundant:
+    (a) it is QUADRATIC where TB's Huber has gone LINEAR -- past |resid| >
+    beta the Huber caps magnitude but not sign, and Adam normalizes a
+    persistent sign-consistent gradient to a full step, so a condition 30 nats
+    off pushes exactly as hard as one 10 nats off, forever, without tripping a
+    grad-norm wire. Here it pulls ~3x harder, in proportion to how wrong it
+    actually is. (b) it groups by condition BEFORE squaring, so within-
+    condition sampling noise averages out instead of being fitted.
+
+    Bias note: with ~1 sample per condition per batch the group means are
+    noisy, so the LOSS VALUE is biased upward by within-condition variance.
+    The GRADIENT w.r.t. log_Z(c) is unbiased, which is what is used. No
+    internal clip -- the tail's pull is the point -- so gradient_norm_clip is
+    the backstop.
+
+    Returns a scalar; callers expand it to per-row for the usual stack/mean.
+    """
+    logw = (log_r + log_pb - log_pf).detach()
+    err = log_Z_learned - logw
+    uniq, inverse = torch.unique(condition_id.to(err.device), return_inverse=True)
+    k = uniq.numel()
+    counts = torch.zeros(k, device=err.device, dtype=err.dtype).scatter_add_(
+        0, inverse, torch.ones_like(err))
+    group_mean = torch.zeros(k, device=err.device, dtype=err.dtype).scatter_add_(
+        0, inverse, err) / counts.clamp(min=1)
+    return (group_mean ** 2).mean()
 
 
 def condition_grouped_empirical_z(log_pb, log_pf, log_r, condition_id,

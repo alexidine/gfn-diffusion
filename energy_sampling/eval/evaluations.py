@@ -47,6 +47,11 @@ def fig_guard(label):
 #   3. rasterize anything still over FIG_SIZE_LIMIT_MB, except the figures
 #      named in KEEP_INTERACTIVE, which stay real plotly objects.
 SCATTER_MAX_POINTS = 4000
+# the density funnel is built inside mxtaltools, so it never passes through the
+# compaction above -- thinned at its own call site instead, and it is a density
+# plot rather than a per-point readout, so it needs fewer markers than a parity
+# scatter to say the same thing
+FUNNEL_MAX_POINTS = 2000
 FIG_SIZE_LIMIT_MB = 0.25
 KEEP_INTERACTIVE = ('TB Parity Plot', 'Lattice Latents Distribution')
 
@@ -286,8 +291,18 @@ def eval_figs(fwd_stats,
             show=False, return_fig=True, override_energy=scaled_energy,
             aux_dists=[anchor_latents] if anchor_latents is not None else None)
     with fig_guard('Sample Scatter'):
-        fig_dict['Sample Scatter'] = sample_batch.plot_batch_density_funnel(
-            show=False, return_fig=True, override_energy=scaled_energy)
+        # subsampled: the funnel is a density scatter and reads the same at 2k
+        # points as at the full eval batch, but plotly serializes every marker
+        # (this was the single heaviest figure in the run, ~235 KB)
+        n = sample_batch.num_graphs
+        if n > FUNNEL_MAX_POINTS:
+            idx = torch.randperm(n, device=scaled_energy.device)[:FUNNEL_MAX_POINTS]
+            scatter_batch = sample_batch.subsample_new_batch(idx)
+            scatter_energy = scaled_energy[idx]
+        else:
+            scatter_batch, scatter_energy = sample_batch, scaled_energy
+        fig_dict['Sample Scatter'] = scatter_batch.plot_batch_density_funnel(
+            show=False, return_fig=True, override_energy=scatter_energy)
 
     if temperature_conditioning:
         with fig_guard('Z vs T'):

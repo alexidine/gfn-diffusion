@@ -13,7 +13,7 @@ prior_path: D:\crystal_datasets\conditional\priors\toy_big_unif_prior.pt
 molecules_path: D:\crystal_datasets\conditional\priors\toy_big_unif_conditions.pt
 test_molecules_path: D:\crystal_datasets\conditional\priors\toy_big_unif_test_conditions.pt
 checkpoints_dir: 'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints'
-checkpoint_name: dev_mk_dev_latent_multiharmonic-toy_big_unif_prior-T1-87913f_z_matched.pt  # RESUME POINT: the thermalize->z_match pre-transition snapshot (request_eval stamped, so the transition replays through the normal eval path under the edited config). Swap back to ..._prior.pt + load_weights_only: true for a fresh BROAD-ROUTE ENTRY: warm-start the policy FROM the phase-1 MLE prior. reuse_prior separately reloads this same file as the frozen sampling prior and skips train_prior -- but that skip is sampling-only and leaves the policy random, which is wrong here: thermalize's premise is backward TB starting from the broad prior policy. Set to null + load_weights_only false to retrain phase 1 from scratch. NB a full (load_weights_only: false) resume off an older _best.pt will now ABORT -- those checkpoints carry stage 'buildout'/'anchor_seed', which this protocol no longer defines #dev_mk_dev_latent_multiharmonic-toy_2cond_conn_prior-T1-90a45e_running.pt
+checkpoint_name: dev_mk_dev_latent_multiharmonic-toy_big_unif_prior-T1-87913f_phase1_exit.pt  # DEFAULT: train_prior's own exit snapshot, so a resume replays that transition straight into the 'naive' stage with the broad MLE policy in hand and nothing localized. For a MID-STAGE intervention instead (skips the first ~3k steps and lands already inside naive, so on_enter does NOT re-run and the prior buffer is kept as-is), point this at a copy of a run's _running.pt with its sidecar copied alongside as <name>_buffers.pt -- checkpoints/zsrc_intervene.pt + _buffers.pt is one such snapshot (8oz5frdi at step ~4500), kept for that purpose  # OLD NOTE: the prior buffer is kept as-is -- the only delta vs that run is bwd/replay_tb_z_source. Swap back to ..._phase1_exit.pt for a clean full-route run  # OLD: dev_mk_dev_latent_multiharmonic-toy_big_unif_prior-T1-87913f_phase1_exit.pt  # RESUME POINT for the naive route: train_prior's own exit snapshot, so the resume replays that transition straight into the 'naive' stage (broad MLE policy in hand, nothing localized). Was ..._z_matched.pt for the staged route  # OLD NOTE: the thermalize->z_match pre-transition snapshot (request_eval stamped, so the transition replays through the normal eval path under the edited config). Swap back to ..._prior.pt + load_weights_only: true for a fresh BROAD-ROUTE ENTRY: warm-start the policy FROM the phase-1 MLE prior. reuse_prior separately reloads this same file as the frozen sampling prior and skips train_prior -- but that skip is sampling-only and leaves the policy random, which is wrong here: thermalize's premise is backward TB starting from the broad prior policy. Set to null + load_weights_only false to retrain phase 1 from scratch. NB a full (load_weights_only: false) resume off an older _best.pt will now ABORT -- those checkpoints carry stage 'buildout'/'anchor_seed', which this protocol no longer defines #dev_mk_dev_latent_multiharmonic-toy_2cond_conn_prior-T1-90a45e_running.pt
 prior_model_name: null  # fresh toy problem: reuse_prior auto-refinds {run_name}_{problem_slug}_prior.pt once train_prior has run
 # prior_model_name loads a SEPARATE frozen GFN used only for prior-buffer sampling. It is rebuilt from its
 # own stored gfn_config, so it may be any architecture/conditioning (only the problem TARGET must match --
@@ -218,6 +218,7 @@ integrator:
 # turns on in that stage's own override dict.
 fwd_loss_coeffs:
   tb: 0.0
+  z_level: 0.0  # Z-ONLY condition-grouped regression of log_Z(c) onto the LIVE per-condition mean log w: mean_c (log_Z(c) - mean_c log w)^2. Computed on the fwd rollout that already exists (no extra sampling / no extra reward call) with log w DETACHED, so it buys Z gradient WITHOUT buying on-policy policy gradient -- the two things raising fwd's share otherwise moves together, which is why this is the only clean way to test "is it Z tracking or is it the on-policy signal". MAGNITUDE, not dispersion: an earlier cut mean-centered this into Var_c(e_c) on the theory that a uniform offset is a harmless global Z shift TB already owns, and that was wrong twice -- a uniform e_c = +4 pushes log_pf down at EVERY sample (so the policy inflates everywhere, same uphill mechanism, just global), and TB is empirically not driving that mean to zero anyway (the z_bias histogram sits centered near -4). Target is every condition on its own level, i.e. tracker/z_bias_rms and tracker/z_bias_worst -> 0. Overlaps TB's Z gradient so part of the effect is just a Z learning-rate multiplier; the non-redundant parts are that it stays QUADRATIC where TB's Huber has gone linear (a 30-nat condition pulls ~3x a 10-nat one instead of identically -- past beta the Huber caps magnitude but not sign, and Adam turns a persistent sign-consistent gradient into a full step forever) and that it groups by condition BEFORE squaring so within-condition noise averages out. 0 = off
   freeze_policy: 0.0  # 1 => train Z only (detach policy + conditioner from the loss, replaces old tb_z=2)
   freeze_z: 0.0       # 1 => train policy only, log_Z_learned detached from the loss (replaces old tb_z=0). neither set => train both (old tb_z=1). fwd tb must be >0
   vg_lb: 0.0
@@ -282,6 +283,25 @@ condition_log_z:
   max_batch_weight: 200.0  # caps how much effective evidence (min of a batch's ESS and this ceiling) any single update() call can contribute, regardless of raw batch size -- guards against one huge batch (e.g. eval, ~5000/condition here) nearly overwriting hundreds of steps of accumulated training-time evidence just by being large
   discovery_half_life_steps: 200.0  # half-life (TRAINING STEPS) of the minima-discovery rate EMAs (condition_minima_rate_ema / condition_minima_depth_rate_ema): per-step rate of strict per-condition best_energy improvements -- ~0 when minima have gone static, rising with discovery churn. Depth metrics are intensive: energy units of reduction PER VISITED CONDITION, so they don't scale with condition-library size. Pure monitoring; nothing feeds back into training
   fwd_tb_z_source: learned  # 'learned' (default, unchanged) or 'persistent': once a condition has enough visits, swap the persistent per-condition empirical log Z in for log_Z_learned in the TB residual instead
+  # PERSISTENT for the two POLICY-training losses (95% of the batch), learned
+  # for fwd (which must keep training the flow model on-policy). Testing the
+  # per-condition-Z hypothesis: the pooled dL/dZ is ~0 while the per-condition
+  # z_grad spreads roughly -3..+4 and z_bias runs -20..+5, so the SHARED policy
+  # is pulled in conflicting directions by conditions whose Z is individually
+  # wrong but cancels in the mean -- unbalanced TB. The persistent source
+  # substitutes ConditionLogZTracker's own per-condition empirical log Z (a
+  # separate scalar per condition: no network capacity limit, no cross-
+  # condition interference) into the TB residual, so the policy is trained
+  # against a per-condition-correct level. If the conflicting-gradient story
+  # drives the variance walk, the ~800-step ringing should damp.
+  # REVERTED to learned 2026-07-27: the persistent substitution was tested on
+  # 0j0tg0iq (from step 4500) and made the oscillation WORSE, not better --
+  # fwd/logw_std peaked 61 vs the learned-Z control's ~33 at matched phase. The
+  # tracker's per-condition Z is an EMA over visits, so it is LEAST reliable for
+  # exactly the hard/rare conditions carrying the largest level error, and
+  # feeding it to 95% of the batch added lag where the error was biggest. Read
+  # together with tracker/z_grad_rms (~1.5 nats, flat, and LAGGING the blow-up
+  # by 111 steps): per-condition Z accuracy is not what drives this.
   bwd_tb_z_source: learned
   replay_tb_z_source: learned
   weighted_condition_sampling: true  # if true, fwd_train_step draws mol_dataset rows weighted toward higher tracked fit error (z_bias_ema^2 + Var(log w), at each molecule's base condition_id) instead of uniformly, so molecules whose log Z estimate hasn't converged (the under-covered extrema tail) get sampled more often -- concentrates forward attention on the tail instead of the already-converged bulk. Applies ONLY in stages declaring the weighted_condition_sampling flag (stages where forward trains the POLICY, so steering reduces the tail's Var(log w)); in a Z-only forward stage high fit error = high Var(log w) = worst TB-Z gradient the policy can't fix, so leave the flag off there
@@ -426,6 +446,94 @@ protocol:
         - { metric: bwd/tbc, below: 2.0 }
       on_exit: [ 'snapshot:phase1_exit', 'snapshot_prior' ]
 
+    # -- naive: ONE always-on stage, no transitions. fwd (Z + policy), bwd and
+    #    replay (freeze_z from base, policy-only) all permanently active;
+    #    buffers churn from entry. No exit term, so this stage is TERMINAL --
+    #    thermalize/z_match/terminal below are unreachable while it is here
+    #    (left in place, not deleted; delete this stage to restore that route).
+    #
+    #    on_enter rebuilds prior_buffer from zero through the online admission
+    #    gate to init_fraction (1.0) * max_size, so bwd trains against the
+    #    designed composition at full size from step one instead of against a
+    #    dataset seed that churn grinds out over ~10k steps (measured: 2.5%
+    #    turnover per 250-step window at 135k rows).
+    #
+    #    fwd is PINNED at its entry frac; bwd and replay split the remaining
+    #    mass proportionally (see balance). From replay_july26 (elj, ~18k
+    #    steps) a fixed mix beat a 4-rule lexicographic controller 29 vs 41.4
+    #    nats at matched step -- the rules limit-cycled (Replay Frac swinging
+    #    0.05<->0.89) because lexicographic is winner-take-all and all three
+    #    concerns are live at once here. Proportional replaces the switching
+    #    with a continuous blend. Same battery: bwd share sets mode retention
+    #    (0.001 -> EffDim ~1.6, 0.3 -> 5.33, 0.9 -> 5.90), and
+    #    fwd/tb_resid_clipped walks to ~0 within ~500-700 steps on a ~5% fwd
+    #    share with no controller at all (z_match, emergent).
+    - name: naive
+      train_mode: fused
+      bwd_sampling_mode: prior
+      flags:
+        update_log_z: true
+        buffers_active: true
+        weighted_bwd_sampling: true
+        weighted_condition_sampling: true
+      on_enter: [ 'rebuild_prior_by_churn' ]
+      # under kind: proportional these are the LITERAL entry split. fwd is
+      # re-asserted to pinned.fwd every tick; bwd/replay are then rewritten by
+      # the split, so their entry values only set where the alpha EMA starts
+      fracs: { fwd: 0.1, bwd: 0.85, replay: 0.05 }
+      # NB min_fracs is INERT under kind: proportional -- floors are applied in
+      # _nudge_mode_fracs, which only the lexicographic path calls. The
+      # proportional floor below does that job instead. Kept here so switching
+      # this stage back to lexicographic doesn't silently lose its floors.
+      min_fracs: { fwd: 0.02, bwd: 0.05, replay: 0.02 }
+      deactivate_threshold: 0.01
+      loss_coeffs:
+        # z_level ARMED: Z-only condition-grouped level regression. Rides
+        # this same fwd rollout (no extra sampling / no extra reward call) with
+        # log w detached, so it adds Z gradient WITHOUT adding on-policy policy
+        # gradient -- the only change that separates "Z tracks each condition"
+        # from "the policy samples itself", which every fwd-share change
+        # confounds (fwd is tb: 1.0 with neither freeze, so raising it raises
+        # both at once).
+        #   SCALE: losses are stacked and MEANED, so tb:z_level = 1:c is the
+        #   gradient ratio directly. At batch ~1400 over ~300 live conditions,
+        #   TB contributes ~(n_c/N)*beta ~ 0.034 per condition in its LINEAR
+        #   (|resid| > beta) regime, while z_level contributes (2/K)*e_c ~ 0.03
+        #   at a typical 4-5 nat level error -- so c = 1.0 is roughly balanced
+        #   in the bulk and ~6x TB out at a 30-nat tail condition, which is the
+        #   intended asymmetry (TB's Huber is flat there). NB this is the
+        #   UNCENTERED form, so unlike the earlier Var_c version it also picks
+        #   up the ~-4 global offset rather than only the spread -- expect it
+        #   to bite harder than the same coefficient did before, and consider
+        #   c < 1.0 if log_Z_learned starts getting DRAGGED (over-constrained
+        #   Z) instead of staying smooth.
+        #   READOUT: tracker/z_bias_rms and tracker/z_bias_worst are the target;
+        #   tracker/z_bias_var stays as the diagnostic that splits the level
+        #   error into global vs per-condition via rms^2 - var = mean^2.
+        fwd: { tb: 1.0, z_level: 1.0 }   # policy + Z(c) on-policy, plus Z-only level regression
+        bwd: { tb: 1.0 }               # freeze_z stays 1 from base: policy only
+      balance:
+        kind: proportional
+        pinned: { fwd: 0.1 }               # must equal fracs.fwd
+        metrics: { bwd: bwd/relative_under, replay: fwd/over_coverage }
+        drive: relative                    # s = metric/target - 1
+        # measured open-loop on zcdgtwfv (fixed mix, no controller feedback),
+        # settled = last 40% of 3.7k steps:
+        #   bwd/relative_under  2.48 - 3.18 (med 2.94)
+        #   fwd/over_coverage  17.00 - 17.81 (med 17.42)
+        # each target is set at the good end of its own measured band
+        targets: { bwd: 2.5, replay: 15.0 }
+        # healthy-point drives 0.176 / 0.160; the split tilts default_boost by
+        # (1 + s), so both-healthy reproduces default_boost exactly
+        max_fracs: { replay: 0.2 }         # replay absolute ceiling
+        # idle mix = the fixed split that ran clean on zcdgtwfv (bwd 0.82-0.85,
+        # replay 0.05-0.07 absolute); 0.94 * 0.9 = 0.846, 0.06 * 0.9 = 0.054
+        default_boost: { bwd: 0.94, replay: 0.06 }
+        alpha: 0.002                       # ~5k-step time constant at a ~10-step tick
+        floor: 0.03                        # share of the pair; 0.03 * 0.9 = 0.027 > deactivate_threshold
+        # no anneal: it fires only when BOTH drives are 0, and replay's is
+        # 0.16 at the measured settled point, so it would never fire
+
     # -- thermalize: backward TB against the FULL, BROAD prior buffer. This is
     #    the original paper route (broad prior -> thermalize on prior buffer ->
     #    active forward), restored in place of the localized anchor_seed +
@@ -454,22 +562,27 @@ protocol:
     #    not a fitted regression). The conditioner is untrained coming out of
     #    train_prior (scramble_conditions), so this is the stage that first
     #    fits the whole conditional field at once -- the concept under test.
-    - name: thermalize
-      train_mode: bwd
-      bwd_sampling_mode: prior
-      flags:
-        update_log_z: true
-        buffers_active: true         # live buffer: churn + anchor top-ups keep improving it
-        weighted_bwd_sampling: true  # 10% of each bwd batch drawn ~ema_loss (weighted_bwd_beta 0.9)
-      on_enter: [ 'rebuild_prior_by_churn' ]
-      loss_coeffs:
-        bwd: { tb: 1.0, freeze_z: 0.0 }   # policy + conditioner + Z(c) together
-      exit:
+    # ===================================================================
+    # STAGED ROUTE, commented out. The live route is train_prior -> naive,
+    # and naive declares no exit terms, so it is terminal: these three were
+    # already unreachable and commenting them changes no behavior.
+    # ===================================================================
+#    - name: thermalize
+#      train_mode: bwd
+#      bwd_sampling_mode: prior
+#      flags:
+#        update_log_z: true
+#        buffers_active: true         # live buffer: churn + anchor top-ups keep improving it
+#        weighted_bwd_sampling: true  # 10% of each bwd batch drawn ~ema_loss (weighted_bwd_beta 0.9)
+#      on_enter: [ 'rebuild_prior_by_churn' ]
+#      loss_coeffs:
+#        bwd: { tb: 1.0, freeze_z: 0.0 }   # policy + conditioner + Z(c) together
+#      exit:
         # worst-condition RMS TB residual in NATS. FIRST-RUN VALUE: the floor
         # here is the buffer's own within-condition Var(log w), which is
         # unmeasured for a broad buffer -- set this from the run's record.
-        - { metric: bwd/tb_err_worst, below: 5.0, patience: 2 }
-      on_exit: [ 'snapshot:thermalized' ]
+#        - { metric: bwd/tb_err_worst, below: 5.0, patience: 2 }
+#      on_exit: [ 'snapshot:thermalized' ]
 
     # -- z_match: level-matching handoff. bwd maintains the backward TB fit
     #    against the DETACHED Z(c) (freeze_z stays 1 from base); fwd trains
@@ -477,25 +590,25 @@ protocol:
     #    worst-condition |bwd_level - fwd_level| from ConditionLogZTracker's
     #    per-mode level streams (delta = -mean bwd residual at Z-stationarity,
     #    so bwd r2 recovery coincides with the gate closing). replay dark.
-    - name: z_match
-      train_mode: fused
-      bwd_sampling_mode: prior
-      flags:
-        buffers_active: false   # freeze the buffer through the handoff: bwd_level must be a STATIONARY target while Z walks toward the forward level. Churn resumes in terminal
-      fracs: { fwd: 0.1, bwd: 0.899, replay: 0.001 }
-      min_fracs: { fwd: 0.05, bwd: 0.05, replay: 0.0001 }
-      deactivate_threshold: 0.01
-      loss_coeffs:
+#    - name: z_match
+#      train_mode: fused
+#      bwd_sampling_mode: prior
+#      flags:
+#        buffers_active: false   # freeze the buffer through the handoff: bwd_level must be a STATIONARY target while Z walks toward the forward level. Churn resumes in terminal
+#      fracs: { fwd: 0.1, bwd: 0.899, replay: 0.001 }
+#      min_fracs: { fwd: 0.05, bwd: 0.05, replay: 0.0001 }
+#      deactivate_threshold: 0.01
+#      loss_coeffs:
         # beta stays at the base 10.0 here and in every stage: it sets the
         # scale of the clipped-residual ruler (fwd/tb_resid_clipped,
         # fwd/z_grad_worst, and the tracker's z_grad stream), so a per-stage
         # override silently rescales the metric the whole protocol is judged
         # against. If the elj Z-only entry loss needs a walkdown rate limit,
         # take it from the LR, not from beta.
-        fwd: { tb: 1.0, freeze_policy: 1.0 }   # Z-only Huberized TB
-        bwd: { tb: 1.0 }                       # policy-only vs detached moving Z
-      balance:
-        kind: lexicographic
+#        fwd: { tb: 1.0, freeze_policy: 1.0 }   # Z-only Huberized TB
+#        bwd: { tb: 1.0 }                       # policy-only vs detached moving Z
+#      balance:
+#        kind: lexicographic
         # BWD-HEAVY IDLE, measured on c17erxo7 vs 4ravi7j7 (A/B at matched steps).
         # Z is Adam-trained, so its step size is gradient-NORMALIZED: extra fwd
         # share buys a better gradient estimate, not a faster walkdown. What
@@ -505,8 +618,8 @@ protocol:
         # step 5200) and degraded the backward fit (scatter 4.93 -> 7.12).
         # So during z_match the forward branch needs only enough share to keep
         # Z's estimate honest; everything else belongs to the policy.
-        default_boost: { fwd: 0.1, bwd: 0.9 }
-        rules:
+#        default_boost: { fwd: 0.1, bwd: 0.9 }
+#        rules:
           # backward fit degrading = Z's demand outpacing the policy: shift
           # weight to policy maintenance until the fit recovers.
           # SAFETY NET only -- the bwd-heavy default above is what carries the
@@ -516,8 +629,8 @@ protocol:
           # until delta is already ~0. Bar 10.0 = ~2.3x the 4.4 healthy floor;
           # scatter peaks ~15-28 during the entry walkdown (Z genuinely
           # outrunning the policy) and recovers below the bar by ~step 3700.
-          - { metric: bwd/scatter_err, above: 10.0, boost: bwd }
-      exit:
+#          - { metric: bwd/scatter_err, above: 10.0, boost: bwd }
+#      exit:
         # delta tolerance 2.0 -- the equilibrium gap is leakage-mass x
         # leak-severity and the elj floor is unmeasured; if delta plateaus
         # ABOVE this bar, the plateau level is the leakage floor readout, not a
@@ -532,8 +645,8 @@ protocol:
         # a controller defect (see the stage comment). A 2.0 bar simply never
         # fires and the run never reaches terminal. Re-tighten if a future
         # buffer (MC-thermalized / Boltzmann-reweighted seeds) lowers the floor.
-        - { metric: gates/delta_worst, below: 10.0, patience: 15 }
-      on_exit: [ 'snapshot:z_matched' ]
+#        - { metric: gates/delta_worst, below: 10.0, patience: 15 }
+#      on_exit: [ 'snapshot:z_matched' ]
 
     # -- TERMINAL: active forward training. fwd policy frozen (Z-only), so the
     #    policy work is bwd (coverage off the churning buffer) + replay
@@ -542,11 +655,11 @@ protocol:
     #    that must not be lost, and by this stage the calibration ceiling is
     #    largely a capacity question the controller can't move anyway.
     #      Z > coverage-while-it-still-moves > calibration-not-degrading
-    - name: terminal
-      train_mode: fused
-      bwd_sampling_mode: prior
-      flags:
-        buffers_active: true         # churn resumes: the buffer tracks the policy
+#    - name: terminal
+#      train_mode: fused
+#      bwd_sampling_mode: prior
+#      flags:
+#        buffers_active: true         # churn resumes: the buffer tracks the policy
       # explicit entry split (buildout used to hand one over): z_match exits at
       # bwd ~0.9 / replay ~0.001, which would leave replay dark for thousands of
       # steps at the controller's 0.025/tick nudge rate
@@ -555,7 +668,7 @@ protocol:
       # (Until the replay buffer refills, its share folds into bwd anyway --
       # fused_train_step does that explicitly -- so the effective entry is
       # bwd-heavy regardless for the first ~200 steps.)
-      fracs: { fwd: 0.2, bwd: 0.3, replay: 0.5 }
+#      fracs: { fwd: 0.2, bwd: 0.3, replay: 0.5 }
       # explicit floor/deactivation intent: NO mode may switch off in terminal.
       # bwd's floor sits ABOVE the deactivate threshold -- backward training
       # never goes to zero here (s706frkh: bwd starved to the old implicit
@@ -567,13 +680,13 @@ protocol:
       # surface and (since log_pf normalizes) distorts the policy. ioq6wapu:
       # fwd decayed to 0.023, Z stopped tracking, and bwd/tb_resid_clipped ran
       # to -6.2 while delta went 6 -> 29 with every channel degrading together.
-      min_fracs: { fwd: 0.05, bwd: 0.01, replay: 0.0009 }
-      deactivate_threshold: 0.001
-      loss_coeffs:
-        fwd: { tb: 1.0, freeze_policy: 1.0 }   # THE stage flip: forward becomes Z-only
-        bwd: { tb: 1.0 }
-      balance:
-        kind: lexicographic
+#      min_fracs: { fwd: 0.05, bwd: 0.01, replay: 0.0009 }
+#      deactivate_threshold: 0.001
+#      loss_coeffs:
+#        fwd: { tb: 1.0, freeze_policy: 1.0 }   # THE stage flip: forward becomes Z-only
+#        bwd: { tb: 1.0 }
+#      balance:
+#        kind: lexicographic
         # ===================================================================
         # TERMINAL = "reduce A without letting B blow up."
         #   A = KL(P_F || pi P_B)   mode-seeking error  -- THE OBJECTIVE
@@ -593,8 +706,8 @@ protocol:
         # delta, i.e. gating on it rewards degrading the buffer. It stays a
         # z_match handoff diagnostic only.
         # ===================================================================
-        default_boost: { replay: 0.8, fwd: 0.2 }   # idle: work the objective, keep Z fed
-        rules:
+#        default_boost: { replay: 0.8, fwd: 0.2 }   # idle: work the objective, keep Z fed
+#        rules:
           # 1. Z-STALENESS TRIPWIRE. Watches the branch that TRAINS THE POLICY
           #    against a detached Z, never fwd/tb_resid_clipped -- fwd is
           #    freeze_policy here, so it trains Z and only Z and self-zeroes:
@@ -606,7 +719,7 @@ protocol:
           #    An absolute bar would latch on day one exactly like the 5.0
           #    tb_err bar did. This fires only when the offset GROWS, which is
           #    the divergence signature.
-          - { metric: bwd/tb_resid_clipped, abs: true, relative: best, margin: 1.5, drift: 0.003, boost: fwd }
+#          - { metric: bwd/tb_resid_clipped, abs: true, relative: best, margin: 1.5, drift: 0.003, boost: fwd }
           # 2. CONSTRAINT: B bounded. Coverage is the asset the route is built
           #    on and its loss is unrecoverable, so it outranks the objective.
           #    DELIBERATELY UNANNEALED. A constraint that tightens toward its
@@ -621,13 +734,13 @@ protocol:
           #    until coverage genuinely degrades. See controller-ratchet-
           #    marginal-breach: the anneal is one-way, its fixed point IS
           #    permanent breach, so retuning decay_rate/min was never the fix.
-          - { metric: bwd/relative_under, above: 8.0, boost: bwd }
+#          - { metric: bwd/relative_under, above: 8.0, boost: bwd }
           # 3. OBJECTIVE: A down. With Z well-placed on the fwd stream (rule 1
           #    keeps it so), fwd/tb_err_worst is ~the within-condition spread of
           #    log w on-policy, and A ~ spread^2/2 -- monotone in the objective.
           #    relative:best because the achievable floor RISES as coverage
           #    grows (an absolute bar deadlocks, b9ze0p5c).
-          - { metric: fwd/tb_err_worst, relative: best, margin: 1.15, drift: 0.003, boost: replay }
+#          - { metric: fwd/tb_err_worst, relative: best, margin: 1.15, drift: 0.003, boost: replay }
           # over_coverage RETIRED as a rule: it is the positive tail of the same
           # A that rule 3 measures completely, and as a separate 8.0 bar it was
           # already breached at 8.4 on entry -- it would fire permanently and
@@ -765,9 +878,9 @@ buffers:
     churn_batch_ref: 1000  # fixed reference batch size for churn pacing (n_churn = num_bwd_steps / mean_lifetime * churn_batch_ref) -- decoupled from the live (dynamically grown) self.batch_size so a batch-controller growth event doesn't multiply prior_buffer turnover; see stab_july21_toy gejezmjg (batch 1650->4491 at step 3500 permanently raised the buffer's loss floor)
     min_size: 10000
     max_size: 250000
-    init_fraction: 0.25  # rebuild_prior_by_churn fill target as a fraction of max_size; the remainder is headroom, which manage_prior_buffer needs non-zero to run its prior-model draw (a full buffer falls through to the eligible-drop branch, which needs select_counts >= min_visits)
+    init_fraction: 1.0  # rebuild_prior_by_churn fill target as a fraction of max_size. 1.0 = build the designed composition at full size up front: a buffer that grows/equilibrates for thousands of steps is a slowly-warming TARGET, which confounds every bwd metric while it settles. Safe here only because naive's bwd is always-on: a full buffer has no headroom, so manage_prior_buffer falls through to the eligible-drop branch, which needs select_counts >= min_visits (5) -- satisfied within ~600 steps at bwd 0.9 (~2.2k rows drawn/step over 250k rows), but NOT in a stage whose bwd sits below deactivate_threshold, where intake would freeze entirely
     condition_block_m: 2  # >= 2: bwd 'prior' draws are condition-blocked -- sample conditions, then up to M DISTINCT rows (different terminals) each, so condition-grouped bwd VarGrad gets cross-terminal signal in ~every row instead of only via birthday collisions (~25% of rows at batch 2500 over 10k conditions). Auto-active only while bwd vg_lb > 0 (phase 2); `repeats` same-terminal tiles (TBC) stack on top; singleton conditions are skipped with uniform fallback fill. 0 = off
-    reward_min: -600 # bootstrap-only fallback admission floor (absolute), used only until a condition_log_z tracker or anchor_buffer exists to admit/reach-check relative to each sample's own condition_id's best energy instead (see Modeller._condition_energy_floor)
+    reward_min: -50 # bootstrap-only fallback admission floor (absolute), used only until a condition_log_z tracker or anchor_buffer exists to admit/reach-check relative to each sample's own condition_id's best energy instead (see Modeller._condition_energy_floor)
     # quick_tb_stats' weighted under_coverage ramp, in ENERGY units of per-condition depth
     # d = E - E*_c above each sample's own condition's best known energy (tracks the achievable
     # scale as it rises over training):  w_raw(d) = clamp((ramp_floor - d) / ramp_width, 0, 1)
@@ -790,11 +903,12 @@ buffers:
   replay_buffer:
     churn_rate: 50  # softmax-drawn admission attempts budgeted per manage call (~ per train step with a fwd component); SUPPLY-side -- intake runs whether or not replay is training (purge mirrors whatever admission needs beyond freed headroom)
     max_size: 10000  # if this is too big, or takes too long to churn, it becomes a lagging indicator
-    max_residence_steps: 250  # hard age eviction: rows older than this many train steps are purged regardless of ema_loss; 0 disables
-    admit_temperature: 5.0  # softmax T (nats) over clipped |resid| (admission) / ema_loss (purge); fixed -- governs shoulder discrimination sharpness only, never health-modulated (see admit_cap_* for that)
+    max_residence_steps: 250  # hard age eviction (train steps), 0 disables. MUST STAY ABOVE the occupancy cliff max_size/churn_rate (= 10000/50 = 200) or TTL becomes the BINDING constraint instead of a backstop: at 100 the buffer pinned at churn_rate*TTL = 5100 rows with max_age exactly 100 and mean_age 49.5, displacement never fired, and every row therefore had an IDENTICAL lifetime -- coherent cohorts turning the buffer into a pure 100-step delay line on policy history. Combined with replay's share growing ~4x (0.077 -> 0.297) that is delayed feedback with rising gain, and the run rang at ~800 steps with growing peaks (hhg6ux10). Above the cliff, loss-weighted displacement does the bulk eviction at VARIED ages (diffuse delay, self-damping) and TTL only catches high-loss stragglers displacement won't pick
+    admit_temperature: 2.0  # softmax T (nats) over clipped |resid| (admission) / ema_loss (purge); fixed -- governs shoulder discrimination sharpness only, never health-modulated (see admit_cap_* for that). 2.0 from replay_july26/tsched_july24: T 2 beat T 5 to a LOWER fwd/tb_err_worst floor (6.9 vs 7.4) ~20k steps sooner, and T 20 diverged
     admit_cap_max: 30.0  # admission/purge score clip (nats) when fwd/scatter_err == 0 (fully healthy)
     admit_cap_min: 8.0  # admission/purge score clip (nats) as fwd/scatter_err -> inf (fully unhealthy)
     admit_cap_health_h0: 10.0  # fwd/scatter_err (nats) at which the cap sits halfway between admit_cap_max and admit_cap_min; reused from the buildout stage's own fwd/scatter_err > 8.0 gate
+    admit_reward_min: -200  # absolute log_r floor for admission, hard-exclude alongside the finiteness check (never softmax-throttled); null disables. Same units/sense as prior_buffer.reward_min. Rejections logged as replay_buffer_reward_rejected
 
   # permanent archive of high-quality, mutually latent-distinct samples -- grows only
   # through admission (never churned like prior_buffer/replay_buffer above), and tops

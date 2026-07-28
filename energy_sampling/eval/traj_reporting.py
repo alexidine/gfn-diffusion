@@ -400,9 +400,8 @@ def to_scalars(res):
         out["tb_gap"] = float(d.mean())          # KL(P_F||pi); depends on log_Z
         out["tb_resid_std"] = float(d.std())     # ~ sqrt(TB loss); Z-invariant
 
-    et = res.get("ess_target")
-    if et and "F_to_pi" in et:
-        out["ess_frac"] = float(et["F_to_pi"][1])  # watch the TREND, not abs
+    # 'ess_frac' dropped: it duplicated eval_fwd/ess_frac (quick_tb_stats
+    # computes the same Kish ESS on the same forward batch) to 1e-7.
 
     pr = _np(res.get("policy_ratio_F"))
     if pr is not None:
@@ -431,7 +430,10 @@ def to_scalars(res):
         out["mmd_mean"] = float(m.mean())
         out["mmd_max"] = float(m.max())
         out["mmd_final"] = float(m[-1])
-        out["mmd_drift"] = float(m[-1] - m[0])
+        # no 'mmd_drift': both clouds are pinned at the source, so m[0] is
+        # identically 0 and m[-1] - m[0] was a bit-exact copy of mmd_final
+        # (verified 0.0 max deviation on 0j0tg0iq and 1xz7zd9n). Same for
+        # nn_sep_drift below.
 
     nv = res.get("nn_vs_t")
     if nv is not None:
@@ -441,14 +443,15 @@ def to_scalars(res):
         out["nn_sep_mean"] = float(sep.mean())
         out["nn_sep_final"] = float(sep[-1])     # late-t separation: THE metric
         out["nn_sep_max"] = float(sep.max())
-        out["nn_sep_drift"] = float(sep[-1] - sep[0])
+        # no 'nn_sep_drift': sep is clipped at 0 and the clouds start mixed, so
+        # sep[0] is exactly 0 every eval and the drift was a copy of nn_sep_final
 
     cv = res.get("coverage_pr")
     if cv is not None:
         ts, prec, rec = _np(cv[0]), _np(cv[1]), _np(cv[2])
-        # precision = forward-in-backward ; recall = backward-in-forward
-        out["precision_final"] = float(prec[-1])
-        out["recall_final"] = float(rec[-1])
+        # precision = forward-in-backward ; recall = backward-in-forward.
+        # Only the 'outside' complements are logged -- precision_final and
+        # recall_final were exactly 1 - these, i.e. the same two numbers twice.
         out["fwd_outside_bwd_final"] = float(1.0 - prec[-1])   # the headline
         out["bwd_outside_fwd_final"] = float(1.0 - rec[-1])    # dropped data
         # area under the 'outside' profiles over t (mean across steps)

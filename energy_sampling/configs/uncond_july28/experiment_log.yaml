@@ -1,0 +1,238 @@
+- index: 0
+  run_name: prop_ref
+  note: 'reference proportional controller: targets 3.0/18.0, cap 0.2, alpha 0.002'
+  kind: proportional
+  T: 60
+  lr_fused: 5.0e-05
+  traj_checkpoint: false
+  fracs:
+    fwd: 0.1
+    bwd: 0.846
+    replay: 0.054
+  targets:
+    bwd: 3.0
+    replay: 18.0
+  alpha: 0.002
+  cap_replay: 0.2
+- index: 1
+  run_name: fixed_null
+  note: fixed mix, entry 0.05/0.9/0.05 -> settles 0.0655/0.869/0.0655 = 1xz7zd9n exactly
+  kind: lexicographic
+  T: 60
+  lr_fused: 5.0e-05
+  traj_checkpoint: false
+  fracs:
+    fwd: 0.05
+    bwd: 0.9
+    replay: 0.05
+  targets: null
+  alpha: null
+  cap_replay: null
+- index: 2
+  run_name: prop_alpha01
+  note: 'alpha 0.002 -> 0.01: response INSIDE the absorption cycle'
+  kind: proportional
+  T: 60
+  lr_fused: 5.0e-05
+  traj_checkpoint: false
+  fracs:
+    fwd: 0.1
+    bwd: 0.846
+    replay: 0.054
+  targets:
+    bwd: 3.0
+    replay: 18.0
+  alpha: 0.01
+  cap_replay: 0.2
+- index: 3
+  run_name: prop_r15
+  note: 'idle replay share 0.06 -> 0.15 (replay ~0.135): dose-response step 1'
+  kind: proportional
+  T: 60
+  lr_fused: 5.0e-05
+  traj_checkpoint: false
+  fracs:
+    fwd: 0.1
+    bwd: 0.765
+    replay: 0.135
+  targets:
+    bwd: 3.0
+    replay: 18.0
+  alpha: 0.002
+  cap_replay: 0.25
+- index: 4
+  run_name: prop_fwd20
+  note: 'fwd pinned 0.1 -> 0.2: more on-policy exposure / faster Z'
+  kind: proportional
+  T: 60
+  lr_fused: 5.0e-05
+  traj_checkpoint: false
+  fracs:
+    fwd: 0.2
+    bwd: 0.752
+    replay: 0.048
+  targets:
+    bwd: 3.0
+    replay: 18.0
+  alpha: 0.002
+  cap_replay: 0.2
+- index: 5
+  run_name: prop_T60_auto
+  note: 'T=60 at resolver LRs (lr_fused 2.08e-5): T-axis + LR-axis anchor'
+  kind: proportional
+  T: 60
+  lr_fused: auto
+  traj_checkpoint: false
+  fracs:
+    fwd: 0.1
+    bwd: 0.846
+    replay: 0.054
+  targets:
+    bwd: 3.0
+    replay: 18.0
+  alpha: 0.002
+  cap_replay: 0.2
+- index: 6
+  run_name: prop_T100
+  note: T=100, resolver LRs
+  kind: proportional
+  T: 100
+  lr_fused: auto
+  traj_checkpoint: false
+  fracs:
+    fwd: 0.1
+    bwd: 0.846
+    replay: 0.054
+  targets:
+    bwd: 3.0
+    replay: 18.0
+  alpha: 0.002
+  cap_replay: 0.2
+- index: 7
+  run_name: prop_T150
+  note: T=150, resolver LRs
+  kind: proportional
+  T: 150
+  lr_fused: auto
+  traj_checkpoint: false
+  fracs:
+    fwd: 0.1
+    bwd: 0.846
+    replay: 0.054
+  targets:
+    bwd: 3.0
+    replay: 18.0
+  alpha: 0.002
+  cap_replay: 0.2
+- index: 8
+  run_name: prop_T200
+  note: T=200, resolver LRs
+  kind: proportional
+  T: 200
+  lr_fused: auto
+  traj_checkpoint: false
+  fracs:
+    fwd: 0.1
+    bwd: 0.846
+    replay: 0.054
+  targets:
+    bwd: 3.0
+    replay: 18.0
+  alpha: 0.002
+  cap_replay: 0.2
+- index: 9
+  run_name: prop_lr2x
+  note: 2x resolver LR (lr_fused 4.17e-5)
+  kind: proportional
+  T: 60
+  lr_fused: 4.1666666666666665e-05
+  traj_checkpoint: false
+  fracs:
+    fwd: 0.1
+    bwd: 0.846
+    replay: 0.054
+  targets:
+    bwd: 3.0
+    replay: 18.0
+  alpha: 0.002
+  cap_replay: 0.2
+- index: 10
+  run_name: prop_lr_half
+  note: 0.5x resolver LR (lr_fused 1.04e-5)
+  kind: proportional
+  T: 60
+  lr_fused: 1.0416666666666666e-05
+  traj_checkpoint: false
+  fracs:
+    fwd: 0.1
+    bwd: 0.846
+    replay: 0.054
+  targets:
+    bwd: 3.0
+    replay: 18.0
+  alpha: 0.002
+  cap_replay: 0.2
+- index: 11
+  run_name: prop_r30
+  note: 'idle replay share 0.30 (replay ~0.27): dose-response step 2'
+  kind: proportional
+  T: 60
+  lr_fused: 5.0e-05
+  traj_checkpoint: false
+  fracs:
+    fwd: 0.1
+    bwd: 0.63
+    replay: 0.27
+  targets:
+    bwd: 3.0
+    replay: 18.0
+  alpha: 0.002
+  cap_replay: 0.4
+- index: 12
+  run_name: prop_r50
+  note: 'idle replay share 0.50 (replay ~0.45): LEVEL-vs-MOVEMENT test'
+  kind: proportional
+  T: 60
+  lr_fused: 5.0e-05
+  traj_checkpoint: false
+  fracs:
+    fwd: 0.1
+    bwd: 0.45
+    replay: 0.45
+  targets:
+    bwd: 3.0
+    replay: 18.0
+  alpha: 0.002
+  cap_replay: 0.55
+- index: 13
+  run_name: prop_T100_ckpt
+  note: 'arm 6 + traj_checkpoint: O(1)-in-T activations, validates vs arm 6'
+  kind: proportional
+  T: 100
+  lr_fused: auto
+  traj_checkpoint: true
+  fracs:
+    fwd: 0.1
+    bwd: 0.846
+    replay: 0.054
+  targets:
+    bwd: 3.0
+    replay: 18.0
+  alpha: 0.002
+  cap_replay: 0.2
+- index: 14
+  run_name: prop_compound
+  note: 'compound best-guess: T=100 + alpha 0.005 + cap 0.3'
+  kind: proportional
+  T: 100
+  lr_fused: auto
+  traj_checkpoint: false
+  fracs:
+    fwd: 0.1
+    bwd: 0.846
+    replay: 0.054
+  targets:
+    bwd: 3.0
+    replay: 18.0
+  alpha: 0.005
+  cap_replay: 0.3

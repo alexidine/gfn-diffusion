@@ -124,6 +124,11 @@ def fresh_stage_ctrl():
         'boost': None,      # last chosen boost mode (logging)
         'exit_armed': False,
         'request_eval': False,
+        # proportional balance: one multiplicative scale over the WHOLE target
+        # vector (so every target ratio is preserved exactly by construction),
+        # plus its both-satisfied streak. See _proportional_tick.
+        'prop_scale': 1.0,
+        'prop_streak': 0,
     }
 
 
@@ -280,6 +285,155 @@ class Stage:
                 raise ValueError(f"stage '{self.name}': proportional balance needs a "
                                  f"'metrics' mapping of exactly two modes to metric names")
             node['metrics'] = dict(metrics)
+            # modes HELD at a fixed frac, outside the split. Declaring them is
+            # mandatory rather than implied by absence from 'metrics': a
+            # proportional split only rewrites its own two modes, so a third
+            # mode's pin was previously invisible in the config and readable
+            # only from the implementation. Spelled out here, it is also
+            # re-asserted every tick (see _proportional_tick), so the pin is
+            # enforced rather than merely emergent.
+            pinned = dict(node.get('pinned') or {})
+            bad = set(pinned) - set(MODES)
+            if bad:
+                raise ValueError(f"stage '{self.name}': pinned has unknown modes {sorted(bad)}")
+            overlap = set(pinned) & set(metrics)
+            if overlap:
+                raise ValueError(f"stage '{self.name}': modes {sorted(overlap)} are both "
+                                 f"'pinned' and in 'metrics' -- a mode is either held or split")
+            for mode, v in pinned.items():
+                if not isinstance(v, (int, float)) or not 0.0 <= v < 1.0:
+                    raise ValueError(f"stage '{self.name}': pinned.{mode} must be in [0, 1), got {v}")
+                entry = self.fracs.get(mode)
+                if entry is not None and abs(float(entry) - float(v)) > 1e-9:
+                    raise ValueError(
+                        f"stage '{self.name}': pinned.{mode} ({v}) disagrees with "
+                        f"fracs.{mode} ({entry}) -- they are the same quantity")
+            # nothing carrying entry mass may be left unmanaged: a mode that is
+            # neither split nor pinned would silently sit wherever it landed
+            unmanaged = {mode for mode, v in self.fracs.items()
+                         if isinstance(v, (int, float)) and v > 0} - set(metrics) - set(pinned)
+            if unmanaged:
+                raise ValueError(
+                    f"stage '{self.name}': modes {sorted(unmanaged)} have nonzero entry fracs but "
+                    f"are neither in 'metrics' (split) nor 'pinned' (held) -- declare them")
+            node['pinned'] = pinned
+            # optional anneal of the TARGET VECTOR: a single multiplicative
+            # scale decaying toward min_scale, applied to every target. One
+            # scale rather than per-target rates so the ratios between targets
+            # (which encode the priority trade) are preserved exactly -- a
+            # per-target anneal would silently rewrite that trade as the
+            # targets hit their own floors at different times. Fires only when
+            # BOTH sides have been at/under their live targets for `patience`
+            # consecutive ticks, i.e. the same "nothing left to arbitrate"
+            # event that would otherwise be a stage exit -- tighten and keep
+            # going instead of handing over. min_scale bounds it: targets can
+            # never anneal below min_scale x their configured value, which is
+            # what keeps them from dropping under the metric's irreducible
+            # floor and leaving that side with permanent drive.
+            anneal = node.get('anneal')
+            if anneal is not None:
+                bad = set(anneal) - {'rate', 'patience', 'min_scale'}
+                if bad:
+                    raise ValueError(f"stage '{self.name}': proportional anneal unknown keys {sorted(bad)}")
+                rate = float(anneal.get('rate', 0.98))
+                if not 0.0 < rate < 1.0:
+                    raise ValueError(f"stage '{self.name}': proportional anneal.rate must be in (0, 1), got {rate}")
+                min_scale = float(anneal.get('min_scale', 0.25))
+                if not 0.0 < min_scale <= 1.0:
+                    raise ValueError(f"stage '{self.name}': proportional anneal.min_scale "
+                                     f"must be in (0, 1], got {min_scale}")
+                patience = int(anneal.get('patience', 20))
+                if patience < 1:
+                    raise ValueError(f"stage '{self.name}': proportional anneal.patience must be >= 1")
+                anneal = {'rate': rate, 'patience': patience, 'min_scale': min_scale}
+            node['anneal'] = anneal
+            # per-mode SOFT reference levels subtracted before the split (see
+            # _proportional_tick). Not gates: crossing one only zeroes that
+            # side's contribution, it never switches control -- which is the
+            # whole difference from a lexicographic threshold.
+            targets = dict(node.get('targets') or {})
+            bad = set(targets) - set(metrics)
+            if bad:
+                raise ValueError(f"stage '{self.name}': proportional targets for modes "
+                                 f"{sorted(bad)} that aren't in 'metrics'")
+            for mode, v in targets.items():
+                if not isinstance(v, (int, float)) or v < 0:
+                    raise ValueError(f"stage '{self.name}': proportional targets.{mode} "
+                                     f"must be a non-negative number, got {v}")
+            node['targets'] = targets
+            # how a target converts a metric into a DRIVE (see _proportional_tick).
+            #   absolute: s = max(metric - target, 0)      -- metric's own units
+            #   relative: s = max(metric / target - 1, 0)  -- dimensionless
+            # The split is a RATIO of the two drives, so with 'absolute' the two
+            # metrics' units and dynamic ranges set the gain. Measured on the
+            # fixed-mix dev run: bwd/relative_under settles 2.48-3.18 while
+            # fwd/over_coverage settles 17.0-17.8, so even with both targets
+            # placed inside their own bands (2.5 / 15.0) the healthy drives are
+            # 0.44 vs 2.4 and replay takes 85% of the pair on scale alone.
+            # 'relative' divides that out -- the same pair gives 0.176 vs 0.16
+            # -- and is combined by TILTING the idle split rather than by
+            # equalizing the drives (see _proportional_tick), so both sides
+            # healthy reproduces default_boost exactly and only a side
+            # degrading RELATIVE TO ITS OWN target moves the mix. Default stays
+            # 'absolute' so configs written against the old semantics keep them.
+            drive = node.get('drive', 'absolute')
+            if drive not in ('absolute', 'relative'):
+                raise ValueError(f"stage '{self.name}': proportional drive must be "
+                                 f"absolute|relative, got {drive}")
+            if drive == 'relative':
+                missing = sorted(m for m in metrics if float(targets.get(m, 0.0)) <= 0.0)
+                if missing:
+                    raise ValueError(
+                        f"stage '{self.name}': proportional drive 'relative' divides by the "
+                        f"target, so modes {missing} need a strictly positive target")
+            node['drive'] = drive
+            # optional ABSOLUTE per-mode ceilings on the split's own two modes.
+            # `floor` bounds each side's SHARE OF THE PAIR symmetrically, so it
+            # cannot express "replay may never exceed 0.15" while leaving bwd
+            # free to take the rest. Without a ceiling a structurally one-sided
+            # drive walks the split to floor/(1-floor) -- which is what the
+            # previous targets did (bwd's drive pinned at 0, replay's fixed
+            # point at ~0.90 of the pair, converging toward mode collapse since
+            # bwd share is the mode-retention dial). The ceiling bounds the
+            # damage a miscalibrated target can do, rather than trusting the
+            # calibration.
+            caps = dict(node.get('max_fracs') or {})
+            bad = set(caps) - set(metrics)
+            if bad:
+                raise ValueError(f"stage '{self.name}': proportional max_fracs for modes "
+                                 f"{sorted(bad)} that aren't in 'metrics'")
+            for mode, v in caps.items():
+                if not isinstance(v, (int, float)) or not 0.0 < v <= 1.0:
+                    raise ValueError(f"stage '{self.name}': proportional max_fracs.{mode} "
+                                     f"must be in (0, 1], got {v}")
+            if caps:
+                # the pair has to be able to HOLD its own mass: pinned modes are
+                # re-asserted every tick, so the split's two modes always carry
+                # 1 - sum(pinned) between them and ceilings summing below that
+                # are unsatisfiable (the clamp would silently not bind)
+                pair_mass = 1.0 - sum(float(v) for v in pinned.values())
+                ceiling = sum(float(caps.get(m, 1.0)) for m in metrics)
+                if ceiling < pair_mass - 1e-9:
+                    raise ValueError(
+                        f"stage '{self.name}': proportional max_fracs sum to {ceiling:.3f} but the "
+                        f"split's modes must hold {pair_mass:.3f} between them (1 - pinned)")
+            node['max_fracs'] = caps
+            # optional idle split, used when BOTH sides are at/under target
+            # (see _proportional_tick). Must be a mix over the two split modes;
+            # omitted means "fall back to the stage's entry fracs".
+            idle = node.get('default_boost')
+            if idle is not None:
+                idle = self._normalize_boost(idle, 'default_boost')
+                if not isinstance(idle, dict) or set(idle) - set(metrics):
+                    raise ValueError(
+                        f"stage '{self.name}': proportional default_boost must be a "
+                        f"{{mode: weight}} mix over the two split modes {sorted(metrics)}")
+            node['default_boost'] = idle
+            alpha = float(node.get('alpha', 0.05))
+            if not 0.0 < alpha <= 1.0:
+                raise ValueError(f"stage '{self.name}': proportional alpha must be in (0, 1], got {alpha}")
+            node['alpha'] = alpha
+            node['floor'] = float(node.get('floor', 0.01))
         else:
             raise ValueError(f"stage '{self.name}': balance.kind must be lexicographic|proportional")
         node['kind'] = kind
@@ -334,7 +488,16 @@ class Stage:
         if self.balance is None:
             return set(MODES)
         if self.balance['kind'] == 'proportional':
-            return set(self.balance['metrics'])
+            # the two split modes, PLUS any mode the stage pins at a nonzero
+            # entry frac. A proportional split only redistributes its two
+            # modes' combined mass, so a third mode held fixed (e.g. fwd
+            # pinned while bwd/replay co-converge) is never "boosted" yet is
+            # very much active -- omitting it here made the fused step drop it
+            # from the loss entirely.
+            return (set(self.balance['metrics'])
+                    | set(self.balance.get('pinned') or {})
+                    | {mode for mode, v in self.fracs.items()
+                       if isinstance(v, (int, float)) and v > 0})
         out = set()
         for r in self.balance['rules']:
             b = r['boost']
@@ -893,16 +1056,66 @@ class StageProtocol:
         self.ctrl['boost'] = chosen_name
         self._nudge_mode_fracs(chosen)
 
+    @staticmethod
+    def _drive(value, live_target, kind):
+        """Metric -> unmet-need drive, in whichever form the stage declared.
+        Shared by _proportional_tick and report() so the logged prop_drive_* is
+        the SAME number the split is computed from (they diverged silently once
+        report() hardcoded the absolute form, which is how a welded-off drive
+        got read as 'one thing to watch' instead of the cause)."""
+        if kind == 'relative':
+            return max(value / live_target - 1.0, 0.0) if live_target > 0.0 else 0.0
+        return max(value - live_target, 0.0)
+
     def _proportional_tick(self, bal):
-        """Port of PhaseController.phase2_balance_step, generalized to any two
-        modes: split their combined frac mass proportionally to each side's
-        remaining spread metric, EMA-nudged, floored both sides; hold when
-        either metric is missing rather than starving on absent data."""
+        """Split two modes' COMBINED frac mass in proportion to how far each
+        side still is from its own target, EMA-nudged by alpha, floored both
+        sides. Any third mode is untouched, so a stage can pin it (see
+        active_modes).
+
+            s_i    = max(metric_i - targets_i, 0)
+            target = s_a / (s_a + s_b)
+            share_a <- (1 - alpha) * share_a + alpha * target
+
+        `targets` are SOFT reference levels, not gates. Subtracting them is
+        what makes the equilibrium mean something: raw metrics rarely reach
+        zero (fwd/over_coverage floors near its natural level, c8utdn8q), so
+        an un-offset ratio equilibrates on those floors rather than on need,
+        and the side with the larger floor wins permanently. Setting one
+        target BELOW another expresses a priority -- the mode whose target is
+        tighter keeps drawing share for longer.
+
+        This is deliberately NOT a lexicographic threshold: crossing a target
+        only zeroes that side's contribution, it never hands the whole batch
+        to one mode, so there is no switching and therefore no limit cycle
+        (which is what the rule-based controller did in replay_july26). When
+        BOTH sides are at or under target there is nothing to arbitrate, so
+        the current split is held rather than snapped to an arbitrary ratio.
+
+        alpha sets the response time (~10 train steps per tick, so the time
+        constant is ~10/alpha steps). It MUST be slower than the natural
+        absorption cycle -- bwd dragging in buffer states degrades forward
+        calibration for ~1-2k steps before recovering, and a controller fast
+        enough to react to that fights the mechanism instead of the
+        pathology. Default 0.05 (~200 steps) is far too fast for that; use
+        ~0.002-0.005 unless the plant is known to be quicker.
+        """
         m = self.m
+        # re-assert held modes first, so the pin survives a resume (fracs come
+        # back from the checkpoint, but config owns behavior) and holds even on
+        # the early-return paths below
+        for mode, value in (bal.get('pinned') or {}).items():
+            setattr(m, f'{mode}_frac', float(value))
         (mode_a, metric_a), (mode_b, metric_b) = bal['metrics'].items()
         s_a, s_b = self._resolve(metric_a), self._resolve(metric_b)
         if s_a is None or s_b is None:
-            return
+            return  # hold rather than starve on absent data
+        targets = bal.get('targets') or {}
+        # live targets = configured targets x the annealed scale (see the
+        # 'anneal' block in _parse_balance for why it is ONE scale)
+        scale = float(self.ctrl.get('prop_scale', 1.0))
+        s_a = self._drive(s_a, float(targets.get(mode_a, 0.0)) * scale, bal.get('drive'))
+        s_b = self._drive(s_b, float(targets.get(mode_b, 0.0)) * scale, bal.get('drive'))
         floor = float(bal.get('floor', 0.01))
         alpha = float(bal.get('alpha', 0.05))
         frac_a = getattr(m, f'{mode_a}_frac')
@@ -910,11 +1123,78 @@ class StageProtocol:
         total = frac_a + frac_b
         if total <= 0:
             return
-        target = s_a / max(s_a + s_b, 1e-8)
+        # anneal bookkeeping, on the drives computed at the CURRENT scale: a
+        # streak of both-satisfied ticks tightens the whole target vector for
+        # the NEXT tick. Any drive at all resets the streak, so the anneal
+        # only ever fires from a genuinely quiet stretch.
+        spec = bal.get('anneal')
+        if spec:
+            if s_a + s_b <= 0.0:
+                streak = int(self.ctrl.get('prop_streak', 0)) + 1
+                if streak >= spec['patience']:
+                    self.ctrl['prop_scale'] = max(scale * spec['rate'], spec['min_scale'])
+                    streak = 0
+                self.ctrl['prop_streak'] = streak
+            else:
+                self.ctrl['prop_streak'] = 0
+        # the idle split: the allocation this stage wants when nothing is
+        # wrong. `default_boost` declares it; absent that, the stage's own
+        # entry fracs are the idle by construction.
+        idle = bal.get('default_boost')
+        src = idle if isinstance(idle, dict) else self.stage.fracs
+        w_a, w_b = float(src.get(mode_a, 0.0)), float(src.get(mode_b, 0.0))
+        if bal.get('drive') == 'relative':
+            # TILT the idle allocation by each side's relative unmet need:
+            #     share_a = w_a(1+s_a) / [w_a(1+s_a) + w_b(1+s_b)]
+            # Equalizing the drives alone (the 'absolute' form below) targets
+            # EQUAL RELATIVE DISTANCE FROM TARGET, which is not the same as a
+            # good allocation: at the measured healthy point the drives are
+            # 0.176/0.160, so that form lands on share_bwd 0.52 -- replay at
+            # ~0.43 of the batch, inside the 0.29-0.40 range where every
+            # ratcheted dev run rang. Anchoring on the idle mix instead makes
+            # the healthy fixed point the known-good mix and the controller a
+            # BOUNDED PERTURBATION around it. Both sides at target gives
+            # exactly w, so the "nothing to arbitrate" case is the continuous
+            # limit of this rule rather than a separate branch that the split
+            # discontinuously snaps to.
+            if w_a + w_b <= 0.0:
+                self.ctrl['prop_target'] = frac_a / total  # nothing to aim at: hold
+                return
+            num_a, num_b = w_a * (1.0 + s_a), w_b * (1.0 + s_b)
+            target = num_a / (num_a + num_b)
+        elif s_a + s_b > 0.0:
+            target = s_a / (s_a + s_b)
+        else:
+            # BOTH at or under target: nothing left to arbitrate. Relax toward
+            # the idle split rather than freezing wherever the path happened to
+            # end -- the split at the moment of satisfaction is an artifact of
+            # the route taken, not a designed state, and if one side later
+            # degrades the controller should be starting from a sane mix rather
+            # than an extreme.
+            if w_a + w_b <= 0.0:
+                self.ctrl['prop_target'] = frac_a / total  # nothing to aim at: hold
+                return
+            target = w_a / (w_a + w_b)
         target = min(max(target, floor), 1.0 - floor)
+        # ABSOLUTE ceilings, converted into bounds on mode_a's share of the pair
+        # (mode_b's ceiling is a LOWER bound on mode_a's share). Applied to the
+        # aim AND to the post-EMA share: clamping the target alone bounds the
+        # fixed point but not a share that arrives out of bounds from a resumed
+        # checkpoint. Infeasible bounds are validated away at parse time; the
+        # lo <= hi guard is belt-and-braces against a pinned frac drifting.
+        caps = bal.get('max_fracs') or {}
+        lo, hi = 0.0, 1.0
+        if caps:
+            hi = min(hi, float(caps.get(mode_a, 1.0)) / total)
+            lo = max(lo, 1.0 - float(caps.get(mode_b, 1.0)) / total)
+            if lo <= hi:
+                target = min(max(target, lo), hi)
         share_a = (1.0 - alpha) * (frac_a / total) + alpha * target
+        if caps and lo <= hi:
+            share_a = min(max(share_a, lo), hi)
         setattr(m, f'{mode_a}_frac', share_a * total)
         setattr(m, f'{mode_b}_frac', (1.0 - share_a) * total)
+        self.ctrl['prop_target'] = target
         self.ctrl['boost'] = mode_a if target > frac_a / total else mode_b
 
     def _nudge_mode_fracs(self, boost):
@@ -952,19 +1232,49 @@ class StageProtocol:
         if boost is not None:
             out['protocol/boost'] = {'fwd': 0, 'bwd': 1, 'replay': 2}[boost]
         out['protocol/anneal_streak'] = self.ctrl.get('anneal_streak', 0)
+        if stage.balance is not None and stage.balance['kind'] == 'proportional':
+            # the split the controller is steering toward (share of the two
+            # modes' COMBINED mass going to the first), alongside each side's
+            # target-offset drive -- so a stalled split can be read as either
+            # 'both at target' (drives ~0) or 'alpha too slow'
+            if 'prop_target' in self.ctrl:
+                out['protocol/prop_target'] = self.ctrl['prop_target']
+            targets = stage.balance.get('targets') or {}
+            scale = float(self.ctrl.get('prop_scale', 1.0))
+            if stage.balance.get('anneal'):
+                out['protocol/prop_scale'] = scale
+                out['protocol/prop_streak'] = int(self.ctrl.get('prop_streak', 0))
+            for mode, metric in stage.balance['metrics'].items():
+                live = float(targets.get(mode, 0.0)) * scale
+                out[f'protocol/prop_bar_{mode}'] = live  # the live target, in the metric's units
+                v = self._resolve(metric)
+                if v is not None:
+                    # drive in the stage's declared form -- dimensionless under
+                    # 'relative', so the two modes' drives are directly
+                    # comparable on one axis and the split is readable as
+                    # drive_a / (drive_a + drive_b)
+                    out[f'protocol/prop_drive_{mode}'] = self._drive(
+                        v, live, stage.balance.get('drive'))
         if stage.balance is not None and stage.balance['kind'] == 'lexicographic':
             for i, rule in enumerate(stage.balance['rules']):
                 rs = self.ctrl['rules'].get(i, {})
                 tag = rule['metric'].replace('/', '_')
-                # every rule reports its bar: live annealed threshold for
-                # 'above' rules, the static floor for 'below' rules, and the
-                # margin (the line elev_* is judged against) for relative ones
+                # every rule reports its bar IN THE METRIC'S OWN UNITS, so
+                # thr_* overlays directly on the metric it gates and tracks
+                # down with it: the live annealed threshold for 'above' rules,
+                # the static floor for 'below' rules, and best x margin for
+                # relative ones. (Relative rules used to report the raw
+                # `margin` -- a dimensionless config constant that never
+                # moves, so the plot showed a flat 1.3 line next to a metric
+                # in nats. The running best is also exported so the bar and
+                # the floor it rides on are both visible.)
                 if 'thr' in rs:
                     out[f'protocol/thr_{tag}'] = rs['thr']
                 elif 'below' in rule:
                     out[f'protocol/thr_{tag}'] = float(rule['below'])
-                elif 'relative' in rule:
-                    out[f'protocol/thr_{tag}'] = float(rule.get('margin', 1.3))
+                elif 'relative' in rule and rs.get('best') is not None:
+                    out[f'protocol/thr_{tag}'] = rs['best'] * float(rule.get('margin', 1.3))
+                    out[f'protocol/best_{tag}'] = rs['best']
                 if 'elevation' in rs:
                     out[f'protocol/elev_{tag}'] = rs['elevation']
             for name in stage.balance['anneal_coeffs']:

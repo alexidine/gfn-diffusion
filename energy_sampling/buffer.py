@@ -807,21 +807,11 @@ class CrystalBuffer:
             p = torch.softmax(logits, dim=0).double().cpu().numpy()
             p /= p.sum()
 
-            sampled_choice = np.random.choice(
-                elig_idx.cpu().numpy(),
-                size=k,
-                replace=False,
-                p=p,
-            )
-            k = min(num_to_purge, elig_idx.numel())
-
-            elig_losses = losses[elig_idx]
-            logits = -elig_losses / max(temperature, 1e-8)
-            logits = logits - logits.max()
-
-            p = torch.softmax(logits, dim=0).double().cpu().numpy()
-            p /= p.sum()
-
+            # NB k is min(REMAINING, eligible) -- remaining already nets out the
+            # forced drops above. A duplicate of this block used to follow,
+            # recomputing k as min(num_to_purge, eligible) (ignoring the forced
+            # count) and overwriting sampled_choice, so any forced purge made
+            # the call evict forced + num_to_purge rows instead of num_to_purge.
             sampled_choice = np.random.choice(
                 elig_idx.cpu().numpy(),
                 size=k,
@@ -1571,6 +1561,53 @@ class ConditionLogZTracker:
         if not mask.any():
             return 0.0
         return torch.quantile(self.z_grad_ema[mask].abs(), _upper_tail(quantile)).item()
+
+    @torch.no_grad()
+    def worst_z_bias(self, quantile: float = 0.5):
+        """
+        Upper-tail quantile of |z_bias_ema| -- the UNCLIPPED per-condition level
+        error, in nats. The tail companion to rms_z_bias, and the only reading
+        that sees the population that actually does damage.
+
+        Why this exists separately from worst_z_grad: that one reads the
+        CLIPPED stream (winsorized at clip_beta), so it saturates and stops
+        distinguishing exactly where it matters. A condition sitting 30 nats
+        off and one sitting 10 nats off read identically there. But a
+        badly-mis-levelled condition forces the policy to lower log_pf across
+        its own samples, and since P_F is normalized the only way to comply is
+        to spread mass off-support -- so the policy inflates, its samples get
+        worse, log_r falls, and the residual grows. The Huber caps that push's
+        MAGNITUDE but not its SIGN, and Adam normalizes a persistent
+        sign-consistent gradient to a full step, so the shove repeats every
+        step indefinitely without ever tripping a grad-norm wire.
+
+        Read as a PAIR with rms_z_bias: rms is bulk-weighted (a handful of
+        extreme conditions barely move it), this is the tail. 'Narrow and
+        light-tailed' is the health condition; both readings are needed to
+        state it. Same quantile convention and mask as worst_z_grad.
+        """
+        mask = (~torch.isnan(self.z_bias_ema)) & (self.count >= 1)
+        if not mask.any():
+            return 0.0
+        return torch.quantile(self.z_bias_ema[mask].abs(), _upper_tail(quantile)).item()
+
+    @torch.no_grad()
+    def var_z_bias(self, min_visits: Optional[float] = None):
+        """
+        VARIANCE across trusted conditions of the unclipped per-condition level
+        error -- the dispersion the z_var loss term penalizes, reported so the
+        loss has a matching diagnostic.
+
+        Variance, not RMS, deliberately: a UNIFORM offset in z_bias is
+        harmless (it is a global Z shift, and TB's own gradient owns the
+        global level). What hurts is conditions disagreeing about where the
+        level is, because a single shared policy cannot satisfy them at once.
+        """
+        min_visits = self.min_visits if min_visits is None else min_visits
+        mask = (~torch.isnan(self.z_bias_ema)) & (self.z_resid_visits >= min_visits)
+        if mask.sum() < 2:
+            return 0.0
+        return self.z_bias_ema[mask].var(unbiased=False).item()
 
     @torch.no_grad()
     def rms_logw_std(self, min_visits: Optional[int] = None):
