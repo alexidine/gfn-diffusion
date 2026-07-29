@@ -1,0 +1,61 @@
+run_name: 'conformer_dev'
+tag: 'v01'
+seed: 0
+device: 'cpu'
+wandb_mode: 'online'   # online | offline | disabled
+num_threads: 2
+
+# Problem
+################################################################
+problem:
+  smiles: 'CCCCO'
+  epsilon: 0.1                 # LJ well depth, kcal/mol
+  log_temperature: 0.0         # energy() returns E / 10**log_temperature
+  min_separation: 3            # include nonbonded pairs >= 3 bonds apart (1-2, 1-3 excluded)
+  scale_14: 0.5                # epsilon multiplier for separation-3 pairs
+  lj_k_factor: 2.5             # soft-core exponential stiffness below sigma
+  include_trivial_rotations: false   # exclude methyl / amine / hydroxyl rotations
+
+# Integrator
+################################################################
+integrator:
+  T: 32
+
+# Model
+################################################################
+model:
+  policy_hidden_dim: 128
+  policy_layers: 3
+  s_emb_dim: 128
+  harmonics_dim: 128
+  t_dim: 128
+  flow_hidden_dim: 128
+  flow_layers: 2
+  t_scale: 1.0
+  zero_init: true
+  clipping: true
+  gfn_clip: 1.0e+4   # unsigned exponents (1.0e4) parse as strings in YAML 1.1
+
+# Optimizers
+################################################################
+# Top level: resolve_derived_config reads these off the root namespace and treats a
+# missing key as `auto`.
+lr_policy: 1.0e-3
+lr_flow: 1.0e-2
+gradient_norm_clip: 1.0
+
+# Training
+################################################################
+training:
+  steps: 4000
+  batch_size: 128
+  exploration_std: 0.0
+  buffer_path: null            # .pt from build_conformer_buffer.py
+  bwd_frac: 0.5
+
+# Evaluation
+################################################################
+eval:
+  report_every: 250
+  brute_force_grid: 48         # exact references by quadrature; k <= 3 only, 0 to skip
+  out: 'conformer_v01_run.json'

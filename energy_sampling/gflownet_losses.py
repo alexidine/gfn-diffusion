@@ -465,6 +465,35 @@ def get_gfn_backward_loss(loss_coeffs,
                                     beta=beta)
         losses.append(vg_loss * loss_coeffs.vg_lme)
 
+    """Level-gap term: the z_match delta as a training signal, not only a gate"""
+    # Pulls J_B(c) down onto J_F(c) using the tracker's EMA gap as a DETACHED
+    # per-row coefficient: sign and magnitude come from the well-averaged level
+    # stream, only the gradient direction comes from this batch, so a noisy
+    # per-step gap estimate is never squared. Descending raises E_q[log P_F] on
+    # the buffer's support. Deliberately ONE-SIDED -- the matching forward half
+    # (-coeff * gap * log w, which would raise J_F) is not added to the forward
+    # loss, so the on-policy level is a target, never a follower. No log_Z term
+    # appears, so this cannot move Z.
+    #
+    # Self-limiting: gap is re-read each step, so the coefficient -- and the
+    # term -- vanish once the levels match. Structurally this is a PROPORTIONAL
+    # CONTROLLER on J_B with gain level_gap and lag = the level stream's
+    # half_life_visits, so the failure mode is limit-cycling at high gain, not
+    # divergence. level_gap_clamp bounds the per-row force to |gap| nats.
+    # The term's VALUE is g*log w, not a distance -- either sign, dominated by
+    # |log w|, and not a convergence signal. level_gap_coeff_rms (= rms |gap|,
+    # reported below) is the one that goes to zero on success.
+    level_gap_coeff = getattr(loss_coeffs, 'level_gap', 0)
+    if level_gap_coeff > 0 and condition_log_z is not None and condition_id is not None:
+        level_gap_clamp = getattr(loss_coeffs, 'level_gap_clamp', 10.0)
+        gap, gap_mask = condition_log_z.lookup_delta(condition_id)
+        gap = gap.to(gfn.device).clamp(-level_gap_clamp, level_gap_clamp) \
+              * gap_mask.to(gfn.device).float()
+        level_gap_loss = gap * (log_r + log_pb - log_pf)
+        losses.append(level_gap_loss * level_gap_coeff)
+    else:
+        level_gap_loss = None
+
     if loss_coeffs.pf_boost > 0:
         pf_boost_loss = get_pf_retention_loss(log_Z_learned, log_pb, log_pf, log_r, beta=beta)
         losses.append(pf_boost_loss * loss_coeffs.pf_boost)
@@ -551,6 +580,11 @@ def get_gfn_backward_loss(loss_coeffs,
             loss_dict['subtb'] = subtb_loss.mean().detach()
         if loss_coeffs.pf_boost > 0:
             loss_dict['pf_boost'] = pf_boost_loss.mean().detach()
+        if level_gap_loss is not None:
+            loss_dict['level_gap'] = level_gap_loss.mean().detach()
+            # the clamped+masked coefficient actually applied, so a level_gap
+            # reading ~0 can be told apart from an untrusted-mask no-op
+            loss_dict['level_gap_coeff_rms'] = gap.pow(2).mean().sqrt().detach()
         if emp_z_persistent_loss is not None:
             loss_dict['emp_z_persistent'] = emp_z_persistent_loss.mean().detach()
         if log_z_target_mask is not None:

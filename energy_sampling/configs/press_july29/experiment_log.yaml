@@ -1,0 +1,158 @@
+- index: 0
+  run_name: A_lr2x
+  tier: A
+  note: 'LR ladder: all lr_* x2 = 1.0e-04, constant (nodecay)'
+  epochs: 16000
+  lr_fused: 0.0001
+  T: 60
+  from_scratch: false
+- index: 1
+  run_name: A_lr4x
+  tier: A
+  note: 'LR ladder: all lr_* x4 = 2.0e-04, constant (nodecay)'
+  epochs: 16000
+  lr_fused: 0.0002
+  T: 60
+  from_scratch: false
+- index: 2
+  run_name: A_lr8x
+  tier: A
+  note: 'LR ladder: all lr_* x8 = 4.0e-04, constant (nodecay)'
+  epochs: 16000
+  lr_fused: 0.0004
+  T: 60
+  from_scratch: false
+- index: 3
+  run_name: A_lr16x
+  tier: A
+  note: 'LR ladder: all lr_* x16 = 8.0e-04, constant (nodecay)'
+  epochs: 16000
+  lr_fused: 0.0008
+  T: 60
+  from_scratch: false
+- index: 4
+  run_name: A_lr4x_ema
+  tier: A
+  note: LR x4 + ema_decay 0.95 (target-network A/B vs arm 1)
+  epochs: 16000
+  lr_fused: 0.0002
+  T: 60
+  from_scratch: false
+- index: 5
+  run_name: A_lr8x_ema
+  tier: A
+  note: LR x8 + ema_decay 0.95 (target-network A/B vs arm 2)
+  epochs: 16000
+  lr_fused: 0.0004
+  T: 60
+  from_scratch: false
+- index: 6
+  run_name: A_lr4x_clip3x
+  tier: A
+  note: LR x4 + gradient_norm_clip 454.8 -> 1364.4; cut_grad_abs/reset_grad_abs follow
+    at 30x/300x
+  epochs: 16000
+  lr_fused: 0.0002
+  T: 60
+  from_scratch: false
+- index: 7
+  run_name: A_lr4x_clip033x
+  tier: A
+  note: LR x4 + gradient_norm_clip 454.8 -> 150.0
+  epochs: 16000
+  lr_fused: 0.0002
+  T: 60
+  from_scratch: false
+- index: 8
+  run_name: A_lr4x_rr100
+  tier: A
+  note: 'LR x4 + reward_range 500 -> 100. CHANGES THE TARGET: log Z is not comparable
+    across this arm; score on fwd/r2, EffDim, fwd/logw_std'
+  epochs: 16000
+  lr_fused: 0.0002
+  T: 60
+  from_scratch: false
+- index: 9
+  run_name: A_ema
+  tier: A
+  note: ema_decay 0.95 at baseline LR (separates EMA-helps from EMA-enables)
+  epochs: 16000
+  lr_fused: 5.0e-05
+  T: 60
+  from_scratch: false
+- index: 10
+  run_name: A_var_r10_p4
+  tier: A
+  note: 't_scale_ratio 0.1 power 4: late sharp variance taper, budget preserved'
+  epochs: 16000
+  lr_fused: 5.0e-05
+  T: 60
+  from_scratch: false
+- index: 11
+  run_name: A_var_r01_p4
+  tier: A
+  note: 't_scale_ratio 0.01 power 4: aggressive taper'
+  epochs: 16000
+  lr_fused: 5.0e-05
+  T: 60
+  from_scratch: false
+- index: 12
+  run_name: A_var_r10_p1
+  tier: A
+  note: 't_scale_ratio 0.1 power 1: taper spread through the rollout'
+  epochs: 16000
+  lr_fused: 5.0e-05
+  T: 60
+  from_scratch: false
+- index: 13
+  run_name: A_replay_r100
+  tier: A
+  note: 'replay residence 200 -> 100: churn_rate 50 -> 100, max_residence_steps 250
+    -> 125 (occupancy held at max_size)'
+  epochs: 16000
+  lr_fused: 5.0e-05
+  T: 60
+  from_scratch: false
+- index: 14
+  run_name: A_replay_r50
+  tier: A
+  note: 'replay residence 200 -> 50: churn_rate 50 -> 200, max_residence_steps 250
+    -> 60 (occupancy held at max_size)'
+  epochs: 16000
+  lr_fused: 5.0e-05
+  T: 60
+  from_scratch: false
+- index: 15
+  run_name: C_w1024
+  tier: C
+  note: width 512 -> 1024 (six *_hidden_dim + s_emb_dim); gradient_norm_clip stays
+    auto so the resolver scales it by sqrt(2)
+  epochs: 40000
+  lr_fused: 5.0e-05
+  T: 60
+  from_scratch: true
+- index: 16
+  run_name: C_dplr12
+  tier: C
+  note: dplr_rank 6 -> 12
+  epochs: 40000
+  lr_fused: 5.0e-05
+  T: 60
+  from_scratch: true
+- index: 17
+  run_name: C_noperiodic
+  tier: C
+  note: periodic_centroids true -> false
+  epochs: 40000
+  lr_fused: 5.0e-05
+  T: 60
+  from_scratch: true
+- index: 18
+  run_name: C_T100
+  tier: C
+  note: T 60 -> 100 with its OWN phase 1. lr_* = 3.0e-5 = resolver anchor at T=100
+    (1.25e-5) x 2.4, the same multiplier arm 4 uses at T=60
+  epochs: 40000
+  lr_fused: 3.0e-05
+  T: 100
+  from_scratch: true

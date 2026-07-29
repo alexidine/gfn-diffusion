@@ -124,11 +124,20 @@ def fresh_stage_ctrl():
         'boost': None,      # last chosen boost mode (logging)
         'exit_armed': False,
         'request_eval': False,
+        # stamped by advance() for tween_steps: which stage this one was
+        # entered FROM and at what step. None on fresh runs and checkpoint
+        # remaps, so the tween only ever runs across a real transition.
+        'prev_stage': None,
+        'entered_step': None,
         # proportional balance: one multiplicative scale over the WHOLE target
         # vector (so every target ratio is preserved exactly by construction),
         # plus its both-satisfied streak. See _proportional_tick.
         'prop_scale': 1.0,
         'prop_streak': 0,
+        # distress-override state: per-mode raw (step, value) rings for the
+        # control metrics + the latest [slope, boost] per mode (diagnostics)
+        'trend_buf': {},
+        'trend_state': {},
     }
 
 
@@ -142,9 +151,14 @@ class Stage:
         unknown = set(spec) - {'name', 'train_mode', 'bwd_sampling_mode', 'flags',
                                'loss_coeffs', 'fracs', 'min_fracs',
                                'deactivate_threshold', 'balance', 'exit',
-                               'on_exit', 'on_enter', 'skip_if'}
+                               'on_exit', 'on_enter', 'skip_if', 'tween_steps'}
         if unknown:
             raise ValueError(f"protocol.stages[{index}] has unknown keys {sorted(unknown)}")
+        tw = spec.get('tween_steps')
+        if tw is not None and (not isinstance(tw, int) or isinstance(tw, bool) or tw <= 0):
+            raise ValueError(
+                f"protocol.stages[{index}].tween_steps must be a positive int, got {tw!r}")
+        self.tween_steps = tw
         self.index = index
         self.name = spec.get('name')
         if not self.name or not isinstance(self.name, str):
@@ -347,6 +361,22 @@ class Stage:
                     raise ValueError(f"stage '{self.name}': proportional anneal.patience must be >= 1")
                 anneal = {'rate': rate, 'patience': patience, 'min_scale': min_scale}
             node['anneal'] = anneal
+            # distress override (see _trend_boost): a side whose control
+            # metric is DETERIORATING gets a multiplicative boost on top of
+            # its level drive. Absent = level rule only.
+            trend = node.get('trend')
+            if trend is not None:
+                bad = set(trend) - {'window', 'kappa', 'cap'}
+                if bad:
+                    raise ValueError(f"stage '{self.name}': trend unknown keys {sorted(bad)}")
+                window = float(trend.get('window', 800.0))
+                kappa = float(trend.get('kappa', 1.0))
+                cap = float(trend.get('cap', 3.0))
+                if window <= 0 or kappa < 0 or cap < 1.0:
+                    raise ValueError(f"stage '{self.name}': trend needs window > 0, "
+                                     f"kappa >= 0, cap >= 1.0")
+                trend = {'window': window, 'kappa': kappa, 'cap': cap}
+            node['trend'] = trend
             # per-mode SOFT reference levels subtracted before the split (see
             # _proportional_tick). Not gates: crossing one only zeroes that
             # side's contribution, it never switches control -- which is the
@@ -616,7 +646,41 @@ class StageProtocol:
             raise ValueError(f"stage '{self.stage.name}' {mode} loss_coeffs override unknown "
                              f"keys {sorted(unknown)} -- add them to the base "
                              f"{mode}_loss_coeffs block first")
-        return {**base, **overrides}
+        cur = {**base, **overrides}
+        # tween_steps: for the first N steps after a REAL transition into this
+        # stage, blend linearly from the previous stage's coefficient vector
+        # to this one's, so the gradient transformation is a smooth morph
+        # instead of a step (every key is numeric by construction of
+        # _coeff_defaults, and both vectors share the same key space).
+        # Open-loop by design -- no feedback, no controller. Fresh runs and
+        # checkpoint remaps carry no prev_stage/entered_step and get the
+        # stage's own coefficients immediately.
+        w = self._tween_weight()
+        if w is not None:
+            prev_stage = next(
+                (s for s in self.stages
+                 if s.name == self.ctrl.get('prev_stage')), None)
+            if prev_stage is not None:
+                prev = {**base, **prev_stage.loss_coeffs.get(mode, {})}
+                cur = {k: (1.0 - w) * float(prev[k]) + w * float(v)
+                       for k, v in cur.items()}
+        return cur
+
+    def _tween_weight(self):
+        """0..1 progress through the current stage's tween window, or None
+        when no tween is active: the stage has no tween_steps, the stage was
+        entered without a real transition (fresh run / checkpoint remap, so
+        no prev_stage/entered_step stamps), or the window has passed."""
+        tween = getattr(self.stage, 'tween_steps', None)
+        if not tween:
+            return None
+        entered = self.ctrl.get('entered_step')
+        if self.ctrl.get('prev_stage') is None or entered is None:
+            return None
+        t = int(self.m.step_ind) - int(entered)
+        if t >= tween:
+            return None
+        return max(t, 0) / float(tween)
 
     def energy_coeffs(self) -> dict:
         """Live values for whichever energy_config coefficients the CURRENT
@@ -789,7 +853,16 @@ class StageProtocol:
         print(f"protocol: stage '{old.name}' -> '{new.name}'")
         m.stage = new.name
         m.stage_ctrl = fresh_stage_ctrl()
-        if new.fracs:
+        m.stage_ctrl['prev_stage'] = old.name
+        m.stage_ctrl['entered_step'] = int(m.step_ind)
+        if new.tween_steps:
+            # tweened entry: fracs SURVIVE the boundary -- the new stage's
+            # balance walks them from here, and the pin GLIDES from the entry
+            # value to its configured value over the tween window (see
+            # _proportional_tick). Stamp the entry values as the glide source.
+            m.stage_ctrl['entry_fracs'] = {
+                mode: float(getattr(m, f'{mode}_frac')) for mode in MODES}
+        elif new.fracs:
             total = float(sum(new.fracs.values()))
             for mode in MODES:
                 setattr(m, f'{mode}_frac', float(new.fracs.get(mode, 0.0)) / total)
@@ -813,11 +886,20 @@ class StageProtocol:
         if times is not None:
             times.clear()
         m.batch_size_last_grow = m.step_ind  # full dwell of in-stage steps before the first grow
-        m.init_schedulers_optimizers()
-        m.set_loss_coeffs()
-        warmup_steps = m.lr_controller.rearm_warmup()
-        if warmup_steps:
-            print(f"protocol: optimizers rebuilt, LR re-warming over {warmup_steps} train steps")
+        if new.tween_steps:
+            # tweened entry: at w=0 the blended loss is IDENTICAL to the
+            # outgoing stage's, so the reset premise ("Adam moments describe
+            # the wrong loss surface") does not hold -- keep the optimizers
+            # and the running LR schedule; the tween itself is the re-warm.
+            m.set_loss_coeffs()
+            print(f"protocol: tweened entry -- optimizers and LR schedule "
+                  f"kept, coeffs blending over {new.tween_steps} steps")
+        else:
+            m.init_schedulers_optimizers()
+            m.set_loss_coeffs()
+            warmup_steps = m.lr_controller.rearm_warmup()
+            if warmup_steps:
+                print(f"protocol: optimizers rebuilt, LR re-warming over {warmup_steps} train steps")
 
         for name, arg in new.on_enter:
             self._run_action(name, arg, eval_metrics)
@@ -1067,6 +1149,58 @@ class StageProtocol:
             return max(value / live_target - 1.0, 0.0) if live_target > 0.0 else 0.0
         return max(value - live_target, 0.0)
 
+    def _trend_record(self, mode, value, bal):
+        """Append the raw resolved control metric to this mode's trend ring.
+        Ring lives in stage_ctrl (plain lists of [step, value]) so it
+        checkpoints with the run and resets at stage transitions."""
+        if value is None or not bal.get('trend'):
+            return
+        window = bal['trend']['window']
+        buf = self.ctrl.setdefault('trend_buf', {}).setdefault(mode, [])
+        step = float(self.m.step_ind)
+        if not buf or step > buf[-1][0]:
+            buf.append([step, float(value)])
+        while len(buf) > 2 and buf[0][0] < step - 1.5 * window:
+            buf.pop(0)
+
+    def _trend_boost(self, mode, bal):
+        """Distress override: boost a side whose control metric is
+        DETERIORATING (trailing least-squares slope significantly positive;
+        every control metric here is lower-is-better), so the split resists
+        active damage instead of tolerating it until a threshold is crossed
+        -- degradation is fast and repair is slow (lost log Z takes far
+        longer to re-climb than to lose), so preventing a sag beats allowing
+        it and recovering. Exactly 1.0 when improving, flat, or
+        under-sampled: the level rule's equilibrium is untouched.
+        significance = slope * span / detrended-noise-sigma;
+        boost = min(1 + kappa * max(sig - 2, 0), cap). With real
+        deterioration sig reaches O(10) quickly, so cap is the operative
+        knob (default 3)."""
+        spec = bal.get('trend')
+        if not spec:
+            return 1.0
+        buf = (self.ctrl.get('trend_buf') or {}).get(mode) or []
+        step = float(self.m.step_ind)
+        pts = [(s, v) for s, v in buf if s >= step - spec['window']]
+        state = self.ctrl.setdefault('trend_state', {})
+        if len(pts) < 12:
+            state[mode] = [0.0, 1.0]
+            return 1.0
+        s = np.asarray([p[0] for p in pts])
+        v = np.asarray([p[1] for p in pts])
+        sc = s - s.mean()
+        denom = float((sc * sc).sum())
+        if denom <= 0:
+            state[mode] = [0.0, 1.0]
+            return 1.0
+        slope = float((sc * (v - v.mean())).sum() / denom)
+        resid = v - (v.mean() + slope * sc)
+        sigma = max(float(resid.std()), 1e-12)
+        sig = slope * (s[-1] - s[0]) / sigma
+        boost = min(1.0 + spec['kappa'] * max(sig - 2.0, 0.0), spec['cap'])
+        state[mode] = [slope, boost]
+        return boost
+
     def _proportional_tick(self, bal):
         """Split two modes' COMBINED frac mass in proportion to how far each
         side still is from its own target, EMA-nudged by alpha, floored both
@@ -1104,12 +1238,37 @@ class StageProtocol:
         # re-assert held modes first, so the pin survives a resume (fracs come
         # back from the checkpoint, but config owns behavior) and holds even on
         # the early-return paths below
+        pin_w = self._tween_weight()
+        entry = self.ctrl.get('entry_fracs') or {}
+        pinned_live = {}
         for mode, value in (bal.get('pinned') or {}).items():
-            setattr(m, f'{mode}_frac', float(value))
+            v = float(value)
+            if pin_w is not None and mode in entry:
+                # tweened entry: the pin GLIDES from the entry frac to its
+                # configured value over the tween window
+                v = (1.0 - pin_w) * float(entry[mode]) + pin_w * v
+            pinned_live[mode] = v
+            setattr(m, f'{mode}_frac', v)
+        if pin_w is not None and pinned_live:
+            # keep the batch weights summing to 1 while the pin glides: scale
+            # the un-pinned pair to the remaining mass (their internal ratio,
+            # owned by the EMA split below, is untouched)
+            pair = [mo for mo in MODES if mo not in pinned_live]
+            pair_sum = sum(float(getattr(m, f'{mo}_frac')) for mo in pair)
+            target = max(1.0 - sum(pinned_live.values()), 0.0)
+            if pair_sum > 0:
+                for mo in pair:
+                    setattr(m, f'{mo}_frac',
+                            float(getattr(m, f'{mo}_frac')) * target / pair_sum)
         (mode_a, metric_a), (mode_b, metric_b) = bal['metrics'].items()
-        s_a, s_b = self._resolve(metric_a), self._resolve(metric_b)
-        if s_a is None or s_b is None:
+        raw_a, raw_b = self._resolve(metric_a), self._resolve(metric_b)
+        # record the RAW control metrics for the distress override every tick
+        # (never EMA'd stats: slope tests on EMA'd series are invalid)
+        self._trend_record(mode_a, raw_a, bal)
+        self._trend_record(mode_b, raw_b, bal)
+        if raw_a is None or raw_b is None:
             return  # hold rather than starve on absent data
+        s_a, s_b = raw_a, raw_b
         targets = bal.get('targets') or {}
         # live targets = configured targets x the annealed scale (see the
         # 'anneal' block in _parse_balance for why it is ONE scale)
@@ -1161,6 +1320,13 @@ class StageProtocol:
                 self.ctrl['prop_target'] = frac_a / total  # nothing to aim at: hold
                 return
             num_a, num_b = w_a * (1.0 + s_a), w_b * (1.0 + s_b)
+            # distress override: multiply in each side's deterioration boost.
+            # 1.0 when improving/flat/under-sampled, so the both-at-target
+            # equilibrium (= default_boost exactly) is untouched. Both sides
+            # deteriorating -> both boosted -> ratio unchanged (a frac split
+            # can't fix a global detonation; that's the watchdog's job).
+            num_a *= self._trend_boost(mode_a, bal)
+            num_b *= self._trend_boost(mode_b, bal)
             target = num_a / (num_a + num_b)
         elif s_a + s_b > 0.0:
             target = s_a / (s_a + s_b)

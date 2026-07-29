@@ -1444,6 +1444,30 @@ class ConditionLogZTracker:
             out[name] = ema[mask].mean().item() if mask.any() else float('nan')
         return out
 
+    @torch.no_grad()
+    def lookup_delta(self, condition_id, min_visits: Optional[float] = None):
+        """
+        Row-aligned SIGNED per-condition level gap delta(c) = J_B(c) - J_F(c),
+        the same quantity delta_stats() reduces over the library -- but
+        un-abs'd, un-reduced, and per row, for use as a detached coefficient in
+        a loss term (see get_gfn_backward_loss's level_gap).
+
+        Returns (delta, mask), same contract as lookup(): delta is 0 (not NaN)
+        wherever a stream is uncharacterized, and the caller applies the mask.
+        The mask requires BOTH streams past min_visits on the monotonic visit
+        count (same trust rule as delta_stats), so a condition seen on only one
+        stream carries no gap gradient.
+        """
+        min_visits = self.min_visits if min_visits is None else min_visits
+        condition_id = torch.as_tensor(condition_id, dtype=torch.long).detach().cpu().flatten()
+        fwd = self.fwd_level_ema[condition_id]
+        bwd = self.bwd_level_ema[condition_id]
+        mask = (~torch.isnan(fwd)) & (~torch.isnan(bwd)) \
+               & (self.fwd_level_visits[condition_id] >= min_visits) \
+               & (self.bwd_level_visits[condition_id] >= min_visits)
+        delta = torch.nan_to_num(bwd - fwd, nan=0.0)
+        return delta, mask
+
     @property
     def cond_tb_err(self):
         """Per-condition RMS TB residual, in NATS: sqrt(z_bias_ema^2 +
@@ -1641,6 +1665,45 @@ class ConditionLogZTracker:
         return torch.sqrt(var[mask].clamp(min=0.0).mean()).item()
 
     @torch.no_grad()
+    @torch.no_grad()
+    def calibration_targets(self, condition_id, step: int,
+                            min_visits: Optional[int] = None,
+                            freshness_half_life_steps: float = 300.0,
+                            se2_floor: float = 0.25):
+        """
+        (targets, weights) for the interspersed z-calibration step (train.py
+        z_calibration_tick). Targets are ema_logw -- the same estimator
+        lookup() serves, for the same reason (see lookup()'s docstring on why
+        ema_log_z_emp must never feed gradients). Weights are a trust score:
+
+            w_c = valid_c * freshness_c / (SE^2_c + se2_floor)
+
+        - valid: non-nan and count >= min_visits (lookup()'s own gate)
+        - freshness = 0.5 ** (steps_since_last_update / freshness_half_life_steps).
+          update()'s own EMA decay is keyed to own-visits, deliberately NOT
+          wall-clock; calibration is exactly the consumer that DOES want
+          wall-clock staleness discounted, because it fires between visits --
+          so the discount lives here, on the read, not in the tracker state.
+        - SE^2 = (ema_logw_sq - ema_logw^2) / effective_count: the sampling
+          noise of the MEAN being regressed to, so a heavily-sampled condition
+          outweighs a thinly-sampled one at equal spread. se2_floor caps any
+          single condition's weight (the EMA lags even when perfectly sampled).
+
+        Invalid conditions come back with weight 0.0 AND target 0.0 (never
+        nan), so callers can use both tensors directly without masking.
+        """
+        min_visits = self.min_visits if min_visits is None else min_visits
+        ids = torch.as_tensor(condition_id, dtype=torch.long).detach().cpu().flatten()
+        tgt = self.ema_logw[ids]
+        valid = (~torch.isnan(tgt)) & (self.count[ids] >= min_visits)
+        age = (float(step) - self.last_update_step[ids].float()).clamp(min=0.0)
+        fresh = torch.pow(0.5, age / max(freshness_half_life_steps, 1.0))
+        var = (self.ema_logw_sq[ids] - tgt ** 2).clamp(min=0.0)
+        se2 = var / self.effective_count[ids].clamp(min=1.0)
+        w = fresh / (se2 + se2_floor)
+        zeros = torch.zeros_like(tgt)
+        return torch.where(valid, tgt, zeros), torch.where(valid, w, zeros)
+
     def lookup(self, condition_id):
         """
         Returns (log_z_target, mask) where mask is True for entries that

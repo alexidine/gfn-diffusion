@@ -629,6 +629,14 @@ class GFN(nn.Module):  # todo add seeding
         else:
             condition_embedding = None
 
+        # detached copy for the interspersed z-calibration step (train.py
+        # z_calibration_tick), paired with condition_id by fwd_train_step
+        # immediately after this rollout's loss returns. fwd rollouts are
+        # never condition-scrambled (that lives on the bwd-side paths), so
+        # this is always the TRUE embedding/condition pairing.
+        self._z_cal_embedding = (condition_embedding.detach()
+                                 if condition_embedding is not None else None)
+
         use_ckpt = self._use_traj_checkpoint()
         if not self.full_flow:
             log_flow[:, 0] = self.flow_model(condition_embedding).flatten()

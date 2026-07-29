@@ -1,3 +1,4 @@
+import copy
 import gc
 import math
 import os
@@ -347,6 +348,11 @@ class Modeller:
         metrics.update(self._last_grad_norms)
         metrics['gradnorm/nonfinite_steps'] = self._grad_nonfinite
         self._grad_nonfinite = 0
+        # interspersed z-calibration telemetry, drained each report
+        # (z_cal/steps is a count SINCE the last report, not a rate)
+        if getattr(self, '_z_cal_report', None):
+            metrics.update(self._z_cal_report)
+            self._z_cal_report = {}
         # true throughput over the window: total samples / total seconds. Step
         # time alone can't answer 'did that change make it faster' while
         # batch_size is a moving denominator (982-3000 on dev, 1650-7410 on
@@ -1459,6 +1465,10 @@ class Modeller:
 
                 except (RuntimeError, ValueError) as e:  # if we do hit OOM, slash the batch size
                     self.handle_train_epoch_error(e, step_type)
+                # interspersed Z-only calibration steps (z_calibration_tick);
+                # inside the timing window so their cost shows in step_dt
+                if current_loss is not None:
+                    self.z_calibration_tick(step_type)
                 self.times['train_step_end'] = time()
                 step_dt = self.times['train_step_end'] - self.times['train_step_start']
                 self._probe_max('step_time_max10', step_dt)
@@ -1508,6 +1518,15 @@ class Modeller:
                     if (self.combo_loss_record
                             and self.combo_loss_record[-1] <= np.amin(self.combo_loss_record)):
                         self.checkpointer.link('running', 'best')
+                    # PERIODIC ARCHIVE. The single-stage protocol fires no
+                    # on_exit snapshots, so 'running'/'best' are the only saves
+                    # and both are rewritten in place -- a killed run leaves no
+                    # static reload point behind (this is how flwl4jxz's
+                    # oscillating state was lost to the next launch within
+                    # minutes). Linked, not re-serialized: atomic_save swaps the
+                    # directory entry, so the archive keeps the old inode and
+                    # these bytes are frozen at zero write cost.
+                    self.checkpointer.archive(self.step_ind)
 
             self.checkpointer.save('final', with_buffers=True)
             print("Finished Training!")
@@ -1663,6 +1682,18 @@ class Modeller:
             if checkpoint.get('condition_log_z') is not None:
                 self.condition_log_z = ConditionLogZTracker.from_state_dict(
                     checkpoint['condition_log_z'], current_step=self.step_ind)
+                # config owns behavior: mixing-rate/trust hyperparams re-assert
+                # from the live config on every resume (from_state_dict restores
+                # the stored ones, which silently deadens the config knobs).
+                # clip_beta deliberately excluded: z_grad_ema's accumulated
+                # history is denominated in it (fixed-ruler reasoning).
+                cz = getattr(self.args, 'condition_log_z', None)
+                if cz is not None:
+                    for key in ('min_visits', 'half_life_visits', 'trim_frac',
+                                'max_batch_weight'):
+                        val = getattr(cz, key, None)
+                        if val is not None:
+                            setattr(self.condition_log_z, key, val)
 
         # set_state_dict above restored lr_ctrl (schedule clock) from the
         # healthy best checkpoint; the cut factor lives on the controller
@@ -2147,6 +2178,228 @@ class Modeller:
         if 'flow' in self.optimizers and step_type != 'fused':
             self.optimizers['flow'].step()
 
+    def z_calibration_tick(self, step_type):
+        """
+        Interspersed Z-only calibration: the 'more Z updates per policy
+        update' actuator. (The companion on the other axis,
+        fwd_loss_coeffs.emp_z_persistent, is the same regression as an
+        in-batch fused TERM -- a mix change Adam largely normalizes away.
+        Extra optimizer steps are the one thing Adam cannot cancel: frequency
+        is real distance, magnitude is not.)
+
+        mode selects the step body:
+        - 'rollout' (the reference implementation): each calibration step is a
+          FRESH forward rollout scored by the standard fwd loss under
+          freeze_policy=1 with every auxiliary Z term zeroed, so the flow head
+          receives exactly the fused step's own Huber TB Z gradient on new
+          on-policy data. Sensor, actuator, and the fused loss share ONE
+          fixed point -- no estimator mismatch anywhere -- at the price of a
+          rollout + energy call per step. In the large-ratio limit this pins
+          Z(c) to TB's fixed point under the current policy, so any surviving
+          instability is provably not Z-currency.
+        - 'regression': the ~free approximation -- flow_model regressed onto
+          the tracker's trust-weighted ema_logw over condition embeddings
+          cached from the last fwd rollout (_stash_z_cal_cache). Mean-family
+          target whose optimum differs from TB's winsorized one under skew;
+          benchmark it against rollout mode, not the other way around.
+
+        sensor selects the trigger reading:
+        - 'grad_rms': condition_log_z.rms_z_grad() -- RMS of the per-condition
+                    CLIPPED signed residual, the loss's own first-order
+                    condition: zeroes exactly at the rollout actuator's fixed
+                    point, so it cannot latch. Captures level AND dispersion
+                    (a uniform 3-nat offset reads 3); saturates at clip_beta,
+                    so z_bias_worst stays the tail alarm.
+        - 'rms':    condition_log_z.rms_z_bias() -- UNCLIPPED, mean-referenced
+                    level dispersion, in nats. Floors at
+                    the per-condition winsorized-vs-mean skew gap under the
+                    rollout actuator, so it reads a standing offset at the
+                    loss's own fixed point -- a latch, not convergence.
+        - 'worst':  condition_log_z.worst_z_bias(sensor_quantile) -- the tail
+        - 'pooled': |EMA fwd/tb_resid_clipped| -- zero when the pooled batch
+                    is level; blind to per-condition disagreement that cancels
+        Expected steps per train step = min(gain * (sensor/threshold - 1),
+        max_steps_per_step), Bernoulli on the fractional part. Frequency-
+        modulated, never size-modulated: every step taken is an ordinary Adam
+        step at the live flow LR, so there is no discontinuous re-level.
+
+        Silent (zero compute) whenever: disabled/absent config, sensor inside
+        its deadband, cold tracker/cache, mid-gradient-accumulation, or a
+        condition-scrambled stage (calibrating Z(c) against deliberately
+        unconditional training would fight the stage's intent).
+        """
+        cfg = getattr(self.args, 'z_calibration', None)
+        if cfg is None or not getattr(cfg, 'enabled', False):
+            return
+        rep = self._z_cal_report = getattr(self, '_z_cal_report', {})
+        rep['z_cal/p'] = 0.0
+        if getattr(self, 'fused_accum_count', 0):
+            return  # mid-accumulation: a zero_grad here would clobber piled-up grads
+        if self.protocol.flag('scramble_conditions'):
+            return
+        mode = getattr(cfg, 'mode', 'rollout')
+        if mode == 'regression' and getattr(self, '_z_cal_cache', None) is None:
+            return
+        owner = (self.optimizers.get('fused') if step_type == 'fused'
+                 else self.optimizers.get('flow'))
+        if owner is None:
+            return
+        sensor_name = getattr(cfg, 'sensor', 'grad_rms')
+        if sensor_name == 'grad_rms':
+            sensor = self.condition_log_z.rms_z_grad()  # 0.0 when cold
+        elif sensor_name == 'rms':
+            sensor = self.condition_log_z.rms_z_bias()  # 0.0 when cold
+        elif sensor_name == 'worst':
+            sensor = self.condition_log_z.worst_z_bias(
+                quantile=getattr(cfg, 'sensor_quantile', 0.5))
+        else:
+            pooled = self.metric_tracker.get('fwd', 'tb_resid_clipped')
+            sensor = abs(pooled) if pooled is not None else 0.0
+        if not math.isfinite(sensor):
+            return
+        rep['z_cal/sensor'] = sensor
+        threshold = getattr(cfg, 'threshold', 2.0)
+        excess = sensor / max(threshold, 1e-9) - 1.0
+        if excess <= 0:
+            return
+        p = min(getattr(cfg, 'gain', 1.0) * excess,
+                getattr(cfg, 'max_steps_per_step', 2.0))
+        rep['z_cal/p'] = p
+        n = int(p)
+        if torch.rand(()).item() < p - n:
+            n += 1
+        for _ in range(n):
+            ok = (self._z_rollout_step(owner, cfg) if mode == 'rollout'
+                  else self._z_calibration_step(owner, cfg))
+            if not ok:
+                break
+            rep['z_cal/steps'] = rep.get('z_cal/steps', 0) + 1
+
+    def _z_rollout_step(self, owner, cfg):
+        """
+        One rollout-mode calibration step: a fresh forward rollout scored by
+        the standard fwd loss with freeze_policy=1 (policy + conditioner
+        detached at the source) and every non-TB Z term zeroed, so the flow
+        head receives exactly the Huber TB Z gradient the fused step itself
+        produces -- same estimator, same fixed point -- on new on-policy data.
+        The rollout also feeds the tracker (update_and_lookup inside the
+        loss), so persistent per-condition evidence accrues at the
+        calibration rate for free.
+
+        Deliberately NO replay-buffer intake and no rolling-metric updates:
+        this is a measurement/update instrument, and coupling it to buffer
+        churn would confound its first live test (churn accounting is batch-
+        keyed; see the churn_batch_ref episode).
+
+        The first call verifies the gradient really is confined to flow_model
+        params and raises otherwise -- the freeze_policy contract this step
+        leans on, checked once at runtime rather than trusted silently.
+
+        Returns False (skip the tick's remaining steps) on rollout error or a
+        graph-free loss; never touches batch-size machinery.
+        """
+        coeffs = copy.deepcopy(self.args.fwd_loss_coeffs)
+        coeffs.freeze_policy = 1.0
+        for k in ('z_level', 'z_var', 'emp_z', 'emp_z_persistent'):
+            if hasattr(coeffs, k):
+                setattr(coeffs, k, 0.0)
+        if getattr(cfg, 'unclipped', False):
+            # get_tb_loss is beta * smooth_l1(resid, beta) = 0.5*resid^2 for
+            # |resid| < beta, so a huge beta IS the exact MSE limit: the
+            # z-step's fixed point moves from the winsorized mean to the
+            # arithmetic mean, tails at full influence. loss_clip is disabled
+            # in the copy for the same reason. gradient_norm_clip on the flow
+            # params remains the only backstop.
+            coeffs.beta = 1.0e6
+            if hasattr(coeffs, 'loss_clip'):
+                coeffs.loss_clip = -1
+        saved = self.args.fwd_loss_coeffs
+        self.args.fwd_loss_coeffs = coeffs
+        try:
+            loss, _ = self.fwd_train_step(
+                get_discretizer(self.args.integrator),
+                return_exp=False,
+                repeats=self.mode_repeats('fwd'),
+                report_losses=False)
+        except (RuntimeError, ValueError):
+            self._z_cal_report['z_cal/rollout_errors'] = (
+                self._z_cal_report.get('z_cal/rollout_errors', 0) + 1)
+            return False
+        finally:
+            self.args.fwd_loss_coeffs = saved
+        if not loss.requires_grad:
+            return False  # e.g. a stage running fwd freeze_z: nothing trains Z
+        owner.zero_grad(set_to_none=True)
+        loss.backward()
+        if not getattr(self, '_z_rollout_grads_verified', False):
+            flow_ids = {id(p) for p in self.gfn_model.flow_model.parameters()}
+            stray = [name for name, p in self.gfn_model.named_parameters()
+                     if p.grad is not None and id(p) not in flow_ids]
+            if stray:
+                raise RuntimeError(
+                    "z_calibration rollout step leaked gradient outside "
+                    f"flow_model: {stray[:5]}")
+            self._z_rollout_grads_verified = True
+        torch.nn.utils.clip_grad_norm_(self.gfn_model.flow_model.parameters(),
+                                       self.args.gradient_norm_clip)
+        owner.step()
+        owner.zero_grad(set_to_none=True)
+        self._z_cal_report['z_cal/rollout_loss'] = float(loss.detach().cpu())
+        return True
+
+    def _z_calibration_step(self, owner, cfg):
+        """
+        One Z-only calibration step: weighted least squares of flow_model's
+        log_Z(c) onto condition_log_z.ema_logw over the cached fwd-batch
+        conditions (targets/weights: ConditionLogZTracker.calibration_targets).
+
+        Only flow_model params ever receive gradients -- the cached embedding
+        is detached -- so owner.step() moves nothing else (grad=None params
+        are skipped by Adam entirely: no moment decay, no movement) and the
+        flow group's Adam state stays the single warm one the training loop
+        itself uses. Conditions with id % holdout_modulus == 0 are excluded
+        from the loss and reported as an out-of-sample residual
+        (z_cal/holdout_rms vs z_cal/train_rms: a growing gap means the head is
+        fitting tracker noise rather than the level field).
+
+        Returns False when nothing trustworthy was available to regress to.
+        """
+        emb, ids = self._z_cal_cache
+        tgt, w = self.condition_log_z.calibration_targets(
+            ids, step=self.step_ind,
+            min_visits=getattr(cfg, 'min_visits', None),
+            freshness_half_life_steps=getattr(cfg, 'freshness_half_life_steps', 300.0),
+            se2_floor=getattr(cfg, 'se2_floor', 0.25))
+        holdout_modulus = getattr(cfg, 'holdout_modulus', 8)
+        holdout = ((ids % holdout_modulus == 0) if holdout_modulus > 0
+                   else torch.zeros_like(ids, dtype=torch.bool))
+        train_w = torch.where(holdout, torch.zeros_like(w), w)
+        wsum = train_w.sum()
+        if wsum <= 0:
+            return False
+        owner.zero_grad(set_to_none=True)
+        pred = self.gfn_model.flow_model(emb).flatten()
+        resid = pred - tgt.to(self.device)
+        loss = ((train_w / wsum).to(self.device) * resid.pow(2)).sum()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.gfn_model.flow_model.parameters(),
+                                       self.args.gradient_norm_clip)
+        owner.step()
+        owner.zero_grad(set_to_none=True)
+        rep = self._z_cal_report
+        with torch.no_grad():
+            r2 = resid.detach().pow(2).cpu()
+            tr = (~holdout) & (w > 0)
+            ho = holdout & (w > 0)
+            if tr.any():
+                rep['z_cal/train_rms'] = float(torch.sqrt(
+                    (r2[tr] * w[tr]).sum() / w[tr].sum()))
+                rep['z_cal/n_conditions'] = int(tr.sum())
+            if ho.any():
+                rep['z_cal/holdout_rms'] = float(torch.sqrt(
+                    (r2[ho] * w[ho]).sum() / w[ho].sum()))
+        return True
+
     def fwd_train_step(self,
                        discretizer,
                        return_exp=False,
@@ -2177,23 +2430,54 @@ class Modeller:
         mol_batch, log_T_tensor, sg_inds, zps, condition, condition_id = self.energy_function.condition_samples(
             mol_batch, repeats=repeats)
 
-        return get_gfn_forward_loss(self.args.fwd_loss_coeffs,
-                                    init_state,
-                                    self.gfn_model,
-                                    self.energy_function.log_reward,
-                                    discretizer,
-                                    mol_batch,
-                                    log_T_tensor,
-                                    exploration_std=None,
-                                    return_exp=return_exp,
-                                    condition=condition,
-                                    repeats=repeats,
-                                    report_losses=report_losses,
-                                    condition_log_z=self.condition_log_z,
-                                    condition_id=condition_id,
-                                    tb_z_source=self.tb_z_source('fwd'),
-                                    step=self.step_ind,
-                                    )
+        out = get_gfn_forward_loss(self.args.fwd_loss_coeffs,
+                                   init_state,
+                                   self.gfn_model,
+                                   self.energy_function.log_reward,
+                                   discretizer,
+                                   mol_batch,
+                                   log_T_tensor,
+                                   exploration_std=None,
+                                   return_exp=return_exp,
+                                   condition=condition,
+                                   repeats=repeats,
+                                   report_losses=report_losses,
+                                   condition_log_z=self.condition_log_z,
+                                   condition_id=condition_id,
+                                   tb_z_source=self.tb_z_source('fwd'),
+                                   step=self.step_ind,
+                                   )
+        self._stash_z_cal_cache(condition_id)
+        return out
+
+    def _stash_z_cal_cache(self, condition_id):
+        """
+        Pair the detached condition embedding the model stashed during the fwd
+        rollout that just ran (gfn._z_cal_embedding, written in get_traj_fwd)
+        with that rollout's condition_ids, reduced to one row per unique
+        condition (repeats/tiling broadcast identical embedding rows per id).
+        Consumed by z_calibration_tick, which re-feeds the cached embeddings to
+        flow_model between rollouts -- so calibration steps never need their
+        own rollout or conditioner pass. The cache is at most one train step
+        stale in embedding terms (conditioner params move under it), which is
+        the same one-step staleness every other use of the batch tolerates.
+        """
+        cfg = getattr(self.args, 'z_calibration', None)
+        if cfg is None or not getattr(cfg, 'enabled', False):
+            return
+        emb = getattr(self.gfn_model, '_z_cal_embedding', None)
+        if emb is None or condition_id is None:
+            return
+        ids = condition_id.detach().to(emb.device).flatten()
+        if ids.shape[0] != emb.shape[0]:
+            return  # unexpected pairing; drop rather than mis-pair
+        uniq, inverse = torch.unique(ids, return_inverse=True)
+        first = torch.full((uniq.shape[0],), ids.shape[0],
+                           dtype=torch.long, device=emb.device)
+        first.scatter_reduce_(0, inverse,
+                              torch.arange(ids.shape[0], device=emb.device),
+                              reduce='amin', include_self=True)
+        self._z_cal_cache = (emb[first], uniq.cpu())
 
     def scramble_applicable(self):
         """

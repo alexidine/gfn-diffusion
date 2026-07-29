@@ -1,7 +1,9 @@
 """
-uncond_july28 -- 15 runs (slurm array 0-14) on the UNCONDITIONAL mipcas ELJ
+uncond_july28 -- 19 runs (slurm array 0-18) on the UNCONDITIONAL mipcas ELJ
 problem (sg2/zp1, all four conditioning flags false), single-phase naive
 protocol, driven by the 2026-07-27 PROPORTIONAL controller rewrite.
+Arms 15-18 are a second wave added 2026-07-28 (faster-convergence follow-ups
+to the arm-4 diagnosis; see their section below) -- arms 0-14 are unchanged.
 
 Lineage: base_elj.yaml is replay_july26's verbatim (BOM-stripped). Every arm
 warm-starts from the same T=60 phase1_exit snapshot at step 12970, so all 15
@@ -118,6 +120,49 @@ imbalance -- by construction, not by luck.
                        cap 0.3. The only multi-knob arm; uninterpretable
                        alone, informative if the single-knob arms agree
 
+  FASTER CONVERGENCE (15-18, second wave 2026-07-28) -- follow-ups to the
+  arm-4 (prop_fwd20, 2z5oo55f) convergence diagnosis; arm 4 is the control
+  for all four (same fwd 0.2 / hand LR / T=60 / warm-start). Measured on
+  arm 4 over steps 13k-19.6k: fwd/tb_err fell LINEARLY (-1.56 nats/1k,
+  linear-fit R2 0.963) because (a) 65-84% of samples sat beyond the +-10-nat
+  huber core the whole run (bwd/tb_resid -21 -> -13.6 at logw_std ~10), so
+  the loss surface is a cone -- constant per-sample drive, no curvature
+  feedback; and (b) LR was flat 5e-5 the whole stretch (decay engaged
+  ~17.5k). The always-saturated grad clip (99.8% of steps, median 4.9x) is
+  near-inert under Adam -- a slowly-varying global rescale cancels in
+  m/sqrt(v). Shape is huber-set, rate is LR-set; these arms price each.
+  15 : prop_fwd20_beta20   huber beta 10 -> 20, WHOLE-RUN (a per-stage
+                           override is what base_elj.yaml's z_match comment
+                           forbids -- it would desync the clipped-residual
+                           ruler mid-protocol; whole-run keeps it internally
+                           consistent). 2x per-sample drive cap; predicts
+                           ~2x slope iff huber-limited. Guard rails (clip +
+                           the four bars) hand-scaled x2: the resolver's
+                           auto path carries (W,T) terms but NO beta term,
+                           and in the huber-linear regime loss and pre-clip
+                           grads are both ~proportional to beta (arm 4's
+                           spikes already grazed cut_grad_abs, so unscaled
+                           bars would fire spurious LR cuts). Cross-arm
+                           caveat: tb_resid_clipped / z_grad / tracker-zerr
+                           streams read on a 2x-wider ruler vs arms 0-14;
+                           nat-space metrics (tb_err, coverage drives, r2,
+                           EffDim) are unchanged.
+  16 : prop_fwd20_lr2x     hand LR 5e-5 -> 1e-4: prices rate-vs-LR at the
+                           winner's operating point, and probes the TB LR
+                           ceiling under the v6 tripwires (1e-4 fused
+                           detonated once, tpkdbegv, but that run carried
+                           10x boundary coeffs as a confound).
+  17 : prop_fwd20_nodecay  adaptive_lr.decay_halflife_steps 8000 -> 0 =
+                           hold at peak scale forever (warmup, tripwires,
+                           cut/recovery machinery all unaffected). Prices
+                           the scheduled anneal, which otherwise multiplies
+                           the linear slope by the decaying scale from
+                           ~18k on, against the late-run jitter floor the
+                           decay exists to buy back.
+  18 : prop_fwd20_beta20_nodecay   15 + 17 compound: fast-default candidate;
+                           uninterpretable alone, informative if 15 and 17
+                           agree.
+
 NOT SWEPT, deliberately: model width/depth. The phase1_exit checkpoint is
 architecture-locked, so any width change forces a fresh ~13k-step phase 1
 (~7.5h of an overnight window) and leaves almost no naive-stage signal. Width
@@ -162,6 +207,15 @@ T_REF = 25
 REF_TARGETS = {'bwd': 3.0, 'replay': 18.0}
 REF_IDLE = {'bwd': 0.94, 'replay': 0.06}
 REF_FWD = 0.1
+
+# resolver output for (W=512, T=60), mirrored ONLY for the beta arms: the
+# resolver's auto bars carry (W,T) terms but no beta term, so beta arms must
+# scale all five guard rails by beta/10 by hand (loss and pre-clip grads are
+# both ~proportional to beta in the huber-linear regime, which is where this
+# problem lives -- see the 15-18 docstring section).
+CLIP_W512_T60 = 454.39503356883216
+CUT_LOSS_HAND = 2.5e3            # base_elj.yaml's hand-set cut_loss_abs
+BASE_BETA = 10.0
 
 
 def make_base(traj_len=TRAJ_LEN, auto_lr=False, lr_scale=None,
@@ -274,6 +328,37 @@ def prop_arm(config=None, fwd=REF_FWD, idle=None, **balance_kwargs):
     return config
 
 
+def beta_arm(config, beta):
+    """WHOLE-RUN huber beta override plus beta-scaled guard rails (per-stage
+    overrides are what base_elj.yaml's z_match comment forbids: they desync the
+    clipped-residual ruler mid-protocol; a whole-run value keeps it internally
+    consistent). All five rails scale by beta/BASE_BETA -- see the constants
+    block for why the resolver cannot do this."""
+    ratio = beta / BASE_BETA
+    for mode in ('fwd', 'bwd', 'replay'):
+        config[f'{mode}_loss_coeffs']['beta'] = beta
+    config['gradient_norm_clip'] = CLIP_W512_T60 * ratio
+    alr = config['adaptive_lr']
+    alr['cut_grad_abs'] = 30.0 * config['gradient_norm_clip']
+    alr['reset_grad_abs'] = 10.0 * alr['cut_grad_abs']
+    alr['cut_loss_abs'] = CUT_LOSS_HAND * ratio
+    alr['reset_loss_abs'] = 10.0 * alr['cut_loss_abs']
+    return config
+
+
+def nodecay_arm(config):
+    """Hold the adaptive_lr schedule at peak scale forever (0 = no decay);
+    warmup, tripwires and cut/recovery machinery are unaffected."""
+    config['adaptive_lr']['decay_halflife_steps'] = 0
+    return config
+
+
+def hand_lr_arm(config, lr):
+    for key in LR_KEYS:
+        config[key] = lr
+    return config
+
+
 def fixed_arm(config=None, fracs=None):
     """
     Zero-controller null: lexicographic with an EMPTY rule list = pure idle
@@ -312,7 +397,9 @@ def emit(ind, config, name, note):
             'fracs': naive['fracs'],
             'targets': bal.get('targets'),
             'alpha': bal.get('alpha'),
-            'cap_replay': (bal.get('max_fracs') or {}).get('replay')}
+            'cap_replay': (bal.get('max_fracs') or {}).get('replay'),
+            'beta': config['fwd_loss_coeffs']['beta'],
+            'lr_decay_halflife': config['adaptive_lr']['decay_halflife_steps']}
 
 
 if __name__ == '__main__':
@@ -363,21 +450,33 @@ if __name__ == '__main__':
                                alpha=0.005, cap_replay=0.3), 'prop_compound',
                   'compound best-guess: T=100 + alpha 0.005 + cap 0.3'))
 
+    # ---- faster convergence (15-18), all vs arm 4 as control ----
+    e.append(emit(15, beta_arm(prop_arm(fwd=0.2), 20.0), 'prop_fwd20_beta20',
+                  'huber beta 20 whole-run + guard rails x2: shape-limiter test vs arm 4'))
+    e.append(emit(16, hand_lr_arm(prop_arm(fwd=0.2), 2 * HAND_LR), 'prop_fwd20_lr2x',
+                  'hand LR 1e-4: rate-limiter test + TB LR-ceiling probe vs arm 4'))
+    e.append(emit(17, nodecay_arm(prop_arm(fwd=0.2)), 'prop_fwd20_nodecay',
+                  'decay_halflife 0 (hold peak LR forever): prices the scheduled anneal vs arm 4'))
+    e.append(emit(18, nodecay_arm(beta_arm(prop_arm(fwd=0.2), 20.0)),
+                  'prop_fwd20_beta20_nodecay',
+                  'arms 15+17 compound: fast-default candidate'))
+
     with open(OUTDIR / 'experiment_log.yaml', 'w') as f:
         yaml.dump(e, f, sort_keys=False)
 
     print(f'Generated {len(e)} configs with log at {OUTDIR / "experiment_log.yaml"}')
-    hdr = (f'{"idx":>3s} {"run":>16s} {"kind":>13s} {"T":>4s} {"lr_fused":>10s} '
+    hdr = (f'{"idx":>3s} {"run":>25s} {"kind":>13s} {"T":>4s} {"lr_fused":>10s} '
            f'{"ckpt":>5s} {"fwd":>5s} {"bwd":>6s} {"rep":>5s} {"targets":>16s} '
-           f'{"alpha":>6s} {"cap":>4s}')
+           f'{"alpha":>6s} {"cap":>4s} {"beta":>5s} {"decay":>6s}')
     print(hdr)
     for r in e:
         t = r['targets']
         ts = f"{t['bwd']}/{t['replay']}" if t else '-'
         lr = r['lr_fused']
         lrs = lr if isinstance(lr, str) else f'{lr:.3g}'
-        print(f'{r["index"]:>3d} {r["run_name"]:>16s} {r["kind"]:>13s} {r["T"]:>4d} '
+        print(f'{r["index"]:>3d} {r["run_name"]:>25s} {r["kind"]:>13s} {r["T"]:>4d} '
               f'{lrs:>10s} {str(r["traj_checkpoint"]):>5s} '
               f'{r["fracs"]["fwd"]:>5.3f} {r["fracs"]["bwd"]:>6.3f} '
               f'{r["fracs"]["replay"]:>5.3f} {ts:>16s} '
-              f'{str(r["alpha"]):>6s} {str(r["cap_replay"]):>4s}')
+              f'{str(r["alpha"]):>6s} {str(r["cap_replay"]):>4s} '
+              f'{r["beta"]:>5.0f} {r["lr_decay_halflife"]:>6d}')

@@ -1,5 +1,7 @@
 import glob
 import os
+import re
+import shutil
 from copy import deepcopy
 from typing import Optional
 
@@ -215,6 +217,14 @@ class Checkpointer:
             if stem.endswith(f'_{tag}'):
                 candidates.append(stem[:-(len(tag) + 1)] + BUFFER_SUFFIX)
                 break
+        else:
+            # periodic archives (Checkpointer.archive) are tagged '_step<N>',
+            # an open-ended family that can't live in CHECKPOINT_TAGS. They
+            # only get their own frozen sidecar when archive_buffers is on, so
+            # falling back to the run's rolling one is the normal path.
+            trimmed = re.sub(r'_step\d+$', '', stem)
+            if trimmed != stem:
+                candidates.append(trimmed + BUFFER_SUFFIX)
         return candidates
 
     def buffer_state(self) -> dict:
@@ -307,6 +317,59 @@ class Checkpointer:
         atomic_save(checkpoint, path)
         if with_buffers:
             self.save_buffers(tag)
+
+    def archive(self, step: int):
+        """
+        Freeze a step-tagged copy of the CURRENT 'running' checkpoint every
+        `archive_period` steps (config: archive_period, 0/null = off).
+
+        Exists because the single-stage naive protocol fires no on_exit
+        snapshots: 'running' and 'best' are the only saves, both are rewritten
+        in place, and every run shares one run_name -- so relaunching destroys
+        the previous run's state within minutes and any interesting
+        intermediate (a mid-oscillation branch point) is unrecoverable.
+
+        Model state rides `link`, so it is a hardlink off the bytes 'running'
+        just wrote: no extra serialization, and atomic_save's swap-the-
+        directory-entry semantics leave this archive on the old inode when
+        'running' is next written. ~30MB per archive.
+
+        Buffers are ~880MB (30x the model state) and are only written at eval
+        cadence, so they are OPT-IN via archive_buffers -- and they are a real
+        copy, not a link, because the sidecar this would link to may be many
+        steps stale. Without them an archive still restores the model and
+        optimizers; the buffer state (which is part of the dynamics -- a
+        corrupted replay buffer acts as hidden state) starts fresh.
+        """
+        m = self.modeller
+        period = int(getattr(m.args, 'archive_period', 0) or 0)
+        if period <= 0 or step <= 0 or step % period != 0:
+            return None
+        tag = f'step{step}'
+        self.link('running', tag)
+        if getattr(m.args, 'archive_buffers', True):
+            # HARDLINK the rolling sidecar too, for the same reason: it is
+            # written by atomic_save, so a later save swaps the directory entry
+            # and leaves this archive on the old inode. Same disk footprint as a
+            # copy (the old inode stops being freed) but no ~880MB of I/O inside
+            # the train loop. Falls back to a real copy if the filesystem
+            # refuses the link.
+            src = self.buffers_path()          # the rolling sidecar
+            dst = self.buffers_path(tag)
+            if os.path.exists(src):
+                try:
+                    tmp = dst + '.tmp'
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                    os.link(src, tmp)
+                    os.replace(tmp, dst)
+                except OSError:
+                    try:
+                        shutil.copy2(src, dst)
+                    except OSError as e:
+                        print(f'archive: buffer freeze failed for {tag}: {e}')
+        print(f'archived checkpoint at step {step} -> {self.path_for(tag)}')
+        return tag
 
     def link(self, src_tag: str, dst_tag: str):
         """
