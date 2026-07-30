@@ -76,6 +76,25 @@ class Checkpointer:
 
     def __init__(self, modeller):
         self.modeller = modeller
+        self._read_only_announced = False
+
+    @property
+    def read_only(self) -> bool:
+        """Suppress every checkpoint WRITE; loading is unaffected.
+
+        For smoke tests and refactor validation, which need to resume real state and run
+        a few steps but must not touch the run's checkpoints. Without this, any launch
+        reusing a run_name rewrites 'running' every 50 steps and 'final' unconditionally
+        at exit -- including a launch that trains zero steps, since 'final' is outside
+        the loop. Defaults False, so configs that don't set it behave exactly as before.
+        """
+        if not getattr(self.modeller.args, 'checkpoint_read_only', False):
+            return False
+        if not self._read_only_announced:
+            print("checkpoint_read_only: checkpoint WRITES ARE SUPPRESSED for this run "
+                  "(loading still active)")
+            self._read_only_announced = True
+        return True
 
     def get_state_dict(self):
         m = self.modeller
@@ -240,6 +259,8 @@ class Checkpointer:
 
     def save_buffers(self, tag: Optional[str] = None):
         """Write the buffer sidecar. Called only at eval cadence -- see BUFFER_SUFFIX."""
+        if self.read_only:
+            return
         atomic_save(self.buffer_state(), self.buffers_path(tag))
 
     def restore_buffers(self, state: dict, source: str):
@@ -293,6 +314,8 @@ class Checkpointer:
         buffer state they were taken with; only pass it from call sites that
         run during evaluation.
         """
+        if self.read_only:
+            return
         m = self.modeller
         checkpoint = {
             'tag': tag,
@@ -341,6 +364,8 @@ class Checkpointer:
         optimizers; the buffer state (which is part of the dynamics -- a
         corrupted replay buffer acts as hidden state) starts fresh.
         """
+        if self.read_only:
+            return
         m = self.modeller
         period = int(getattr(m.args, 'archive_period', 0) or 0)
         if period <= 0 or step <= 0 or step % period != 0:
@@ -382,6 +407,8 @@ class Checkpointer:
         'best' snapshot semantics. Falls back to a real save if the
         filesystem refuses the link.
         """
+        if self.read_only:
+            return
         src, dst = self.path_for(src_tag), self.path_for(dst_tag)
         try:
             tmp = dst + '.tmp'

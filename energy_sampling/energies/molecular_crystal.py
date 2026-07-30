@@ -766,10 +766,13 @@ class MolecularCrystal(BaseSet):
         mol_batch.conditions = condition.detach()
         mol_batch.condition_id = condition_id
 
+        # sg_to_sample / zp_to_sample used to ride along here and were unpacked but never
+        # read at any of the 11 call sites -- they are already on the batch as
+        # `sg_ind` / `z_prime`, which is where callers that want them get them. Dropping
+        # them also removes the last crystal-shaped members of this signature, so a
+        # non-crystal energy_function can implement it without padding.
         return (mol_batch,
                 log_T_tensor.flatten(),
-                sg_to_sample,
-                zp_to_sample,
                 condition,
                 condition_id,
                 )

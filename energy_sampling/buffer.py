@@ -884,6 +884,76 @@ class CrystalBuffer:
         return p
 
 
+class ConformerBuffer(CrystalBuffer):
+    """CrystalBuffer over conformer graphs (``MolData`` + internal-coordinate tree).
+
+    Everything the buffer actually does -- row-wise draws, EMA loss/logw bookkeeping,
+    admission, purge, TTL, persistence -- is graph-agnostic. Only three hooks reach into
+    the crystal data model, and they are the three overridden here:
+
+      ``_as_batch``        touches ``max_z_prime`` / ``aunit_*`` and calls
+                           ``box_analysis()``. A conformer has no asymmetric unit and no
+                           cell; ``max_z_prime`` is not merely unused, it raises
+                           (``MXtalBase.__getattr__`` defers to the PyG store).
+      ``_orient_stored_batch``  std-orients molecules so per-draw principal-axis work is
+                           paid once. Pointless here: the state is internal coordinates,
+                           and geometry is rebuilt in the tree's own canonical frame, so
+                           the stored orientation is never read.
+      ``_compute_xy``      derives the GFN state via ``latent_params()`` (cell params).
+                           The conformer state is the stored ``torsion_state``.
+
+    Subclassing rather than generalising CrystalBuffer keeps every crystal run bit-identical
+    -- the same call made for ``ConformerModeller(Modeller)``. Rolling the split back into
+    the base class is a separate decision, once there is a second non-crystal consumer to
+    tell which parts are genuinely shared.
+    """
+
+    def _as_batch(self, data):
+        """Collate if needed; no cell/Z' normalisation to do."""
+        from energies.conformer_data import require_conformer_fields
+
+        if isinstance(data, list):
+            batch = collate_data_list(data)
+        else:
+            batch = data
+        return require_conformer_fields(batch)
+
+    @staticmethod
+    def _orient_stored_batch(batch):
+        """No-op: the stored orientation of a conformer graph is never read."""
+        return batch
+
+    def _compute_xy(self, batch):
+        """x = the torsion state; y as configured.
+
+        A conditions-only batch carries no ``torsion_state`` (a condition is a molecule,
+        not a sample), and ``mol_dataset`` is exactly that -- so x falls back to the
+        reference conformer, state 0, rather than raising. That is the honest value: the
+        reference conformer IS the zero of this parameterisation. A prior/replay buffer
+        without a state, by contrast, would be a real prep bug -- but it is
+        ``prebuilt_sample_to_reward`` that catches it, on the energy it cannot fake.
+        """
+        from energies.conformer_data import batch_states, state_dim
+
+        if callable(self.x_fn):
+            x = self.x_fn(batch)
+        elif 'torsion_state' in batch._store:
+            x = batch_states(batch)
+        else:
+            x = torch.zeros((batch.num_graphs, state_dim(batch)))
+
+        x = x.detach().to(self.device).contiguous()
+
+        if self.y_fn is None:
+            y = None
+        elif callable(self.y_fn):
+            y = self.y_fn(batch).detach().to(self.device).contiguous()
+        else:
+            y = batch[self.y_fn].detach().to(self.device).contiguous()
+
+        return x, y
+
+
 def _upper_tail(quantile: float) -> float:
     """conditional_worst_quantile -> the torch.quantile position for a
     'larger is worse' metric. The config value is the FRACTION OF CONDITIONS

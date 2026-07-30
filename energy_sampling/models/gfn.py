@@ -45,6 +45,7 @@ class GFN(nn.Module):  # todo add seeding
                  dplr_rank: int = 0,
                  dplr_rho_max: float = 0.9,
                  dplr_mask_angular: bool = True,
+                 pb_exact_reversal: bool = True,
                  ):
         super(GFN, self).__init__()
         self.dim = dim
@@ -93,6 +94,19 @@ class GFN(nn.Module):  # todo add seeding
         self.get_periodic_dimensions(
             device, do_periodic_angles=do_periodic_angles,
             periodic_centroid_axes=periodic_centroid_axes if periodic_centroids else None)
+        # P_B kernel on angular dims: True = exact reversal of the wrapped
+        # reference bridge (mixture over arrival lifts, doc eq. 4); False =
+        # its max-weight single-image term. Both are consistent kernels of the
+        # wrapped state; the mixture additionally removes the L*c-sized kernel
+        # discontinuity at the seam. See docs/periodic_scoring_fix.html.
+        self.pb_exact_reversal = pb_exact_reversal
+        if self.ang_dim > 0 and self.dplr_rank > 0:
+            # nearest-image residuals are applied per-dim inside the DPLR
+            # (Woodbury) forward density, which is exact only while angular
+            # dims carry no low-rank component
+            assert self.dplr_mask_angular, \
+                "DPLR with periodic dims requires dplr_mask_angular=True (per-dim " \
+                "nearest-image scoring inside a correlated Gaussian is not exact)"
         self.condition_embedding_dim = condition_embedding_dim
 
         self.init_conditioner(cond_hidden_dim, cond_layers, condition_embedding_dim, conditions_dim,
@@ -348,6 +362,16 @@ class GFN(nn.Module):  # todo add seeding
         v0 = self._var_accum[idx]
         return v0 + frac * (self._var_accum[idx + 1] - v0)
 
+    def accum_var(self, t):
+        """
+        V(t) in absolute units for either rate mode. The bridge-ratio methods
+        below only ever need V ratios, so they bypass this; the P_B mixture
+        weights (\pi_k over arrival lifts) are the one consumer of the scale.
+        """
+        if self.var_scheduled:
+            return self.var_accum(t)
+        return self.t_scale * t
+
     def var_log_rate(self, t_prev, t_next, dts):
         """
         Additive baseline on a policy logvar for the step [t_prev, t_next]:
@@ -520,6 +544,10 @@ class GFN(nn.Module):  # todo add seeding
         V_sample = V.detach() if (detach_traj and V is not None) else V
         next_state = self.fwd_propagate(current_state, detach_traj, dts, pf_mean, pflogvars_sample,
                                         V_sample, eps=eps, eps_r=eps_r)
+        # R3: wrap before any scoring -- no scorer ever sees a pre-wrap
+        # coordinate. Nearest-image residuals (R1) make the scored values
+        # independent of this ordering; the wrap here makes that manifest.
+        next_state = self._wrap_ang(next_state)
 
         flow_i = self._step_flow(s_emb, t_emb)
 
@@ -531,16 +559,21 @@ class GFN(nn.Module):  # todo add seeding
         back_drift, back_var, logpb_i = self._eval_pb_logprob(
             condition_embedding, i, current_state, next_state, dts, ts, logpf_i)
 
-        # only wrap after logprob calculations
-        next_state = self._wrap_ang(next_state)
         return next_state, logpf_i, logpb_i, flow_i, back_drift, back_var, fwd_drift, pflogvars, d
 
-    def _bwd_step(self, current_state, dts, ts, condition_embedding, eps,
+    def _bwd_step(self, current_state, dts, ts, condition_embedding, eps, u_lift,
                   i: int, trajectory_length: int, detach_traj: bool):
         """
         One backward-rollout step: propagate current_state -> prev_state under
         P_B (deterministically to the source on the final step) and score both
         directions. Returns the (angular-wrapped) previous state.
+
+        Under pb_exact_reversal the propagation samples the mixture kernel
+        exactly -- a per-angular-dim categorical over arrival lifts (driven by
+        u_lift, pre-drawn at loop level for checkpoint purity), then the
+        component Gaussian -- and the score is the same mixture density
+        _eval_pb_logprob computes, so bwd-generated trajectories replay
+        bit-identically.
         """
         if i < trajectory_length - 1:
             # backward propagate
@@ -553,17 +586,26 @@ class GFN(nn.Module):  # todo add seeding
             t_prev, t_next = ts[:, trajectory_length - i - 1], ts[:, trajectory_length - i]
             drift_coeff = self.var_drift_coeff(t_prev, t_next, dts).unsqueeze(1)
 
-            # directly x_t-u\Delta t
-            back_mean = current_state - current_state * drift_coeff * back_mean_correction
-
+            # canonical (k=0) drift; under the mixture this is the diagnostic
+            # summary, and the sampled component replaces the mean below
             back_drift = - current_state * drift_coeff * back_mean_correction
+            # directly x_t-u\Delta t
+            back_mean = current_state + back_drift
             var = (back_var_correction + self.var_log_rate(t_prev, t_next, dts)).clip(
                 min=-self.var_clip, max=self.var_clip).exp()
             back_var = var * self.var_bridge_step(t_prev, t_next, dts).unsqueeze(1)
-            prev_state = self.bwd_propagate(back_mean, back_var, current_state, detach_traj, eps=eps)
 
-            # log Pb calculation
-            logpb_i = self.gauss_logprob(prev_state - current_state, back_drift, back_var)
+            if self.pb_exact_reversal and self.ang_dim > 0:
+                back_mean = self._pb_mixture_ang_mean(
+                    back_mean, current_state, drift_coeff, back_mean_correction, t_next, u_lift)
+
+            prev_state = self.bwd_propagate(back_mean, back_var, current_state, detach_traj, eps=eps)
+            # R3: wrap before any scoring -- no scorer ever sees a pre-wrap coordinate
+            prev_state = self._wrap_ang(prev_state)
+
+            # log Pb: the one kernel every scoring path evaluates
+            logpb_i = self._pb_logprob(prev_state, current_state, drift_coeff,
+                                       back_mean_correction, back_var, t_next)
         else:
             # send it identically to the source state (0)
             prev_state = torch.zeros_like(current_state)
@@ -583,8 +625,29 @@ class GFN(nn.Module):  # todo add seeding
         fwd_drift = dts.unsqueeze(1) * pf_mean
         logpf_i = self.fwd_gauss_logprob(current_state - prev_state, fwd_drift, d, dts, V)
 
-        prev_state = self._wrap_ang(prev_state)
         return prev_state, logpf_i, logpb_i, flow_i, back_drift, back_var, fwd_drift, pflogvars, d
+
+    def _pb_mixture_ang_mean(self, back_mean, current_state, drift_coeff, back_mean_correction,
+                             t_next, u_lift):
+        """
+        Replace the angular dims of back_mean with a sampled mixture
+        component's mean: draw the arrival lift k ~ pi by inverse-CDF on the
+        pre-drawn uniform u_lift, then mean = (1 - c*kappa) * (y + L*k).
+        Lift-then-Gaussian is exactly the mixture _pb_mixture_ang_logprob
+        scores (its inner image sum is the wrap pushforward), so sampler and
+        scorer agree by construction.
+        """
+        ang = self.ang_idx
+        y = current_state.index_select(1, ang)                                   # [B, ang]
+        lifts = torch.tensor(self.PB_LIFTS, device=y.device, dtype=y.dtype) * 2.0  # [K]
+        y_lifts = y.unsqueeze(-1) + lifts                                        # [B, ang, K]
+        v_next = self.accum_var(t_next).clamp(min=self.var_floor)                # [B]
+        log_pi = -0.5 * y_lifts.pow(2) / v_next.view(-1, 1, 1)                   # [B, ang, K]
+        cdf = torch.softmax(log_pi, dim=-1).cumsum(-1)                           # [B, ang, K]
+        idx = (u_lift.unsqueeze(-1) > cdf).sum(-1).clamp(max=len(self.PB_LIFTS) - 1)  # [B, ang]
+        picked_lift = y_lifts.gather(-1, idx.unsqueeze(-1)).squeeze(-1)          # [B, ang]
+        contraction = 1.0 - drift_coeff * back_mean_correction.index_select(1, ang)
+        return back_mean.index_copy(1, ang, contraction * picked_lift)
 
     def _replay_step(self, current_state, next_state, dts, ts, condition_embedding, i: int):
         """
@@ -743,8 +806,10 @@ class GFN(nn.Module):  # todo add seeding
 
         logpb, logpf, states, gauss_params, log_flow = self.init_traj_tensors(batch_size, trajectory_length)
 
-        states[:, -1] = terminal_state.detach()
-        current_state = terminal_state.detach()
+        # canonical representative at entry: buffer/anchor terminals are stored
+        # wrapped already, so this is defensive (and free) for other intakes
+        current_state = self._wrap_ang(terminal_state.detach())
+        states[:, -1] = current_state
 
         if self.conditional:
             if condition is not False:
@@ -768,14 +833,18 @@ class GFN(nn.Module):  # todo add seeding
         for i in range(trajectory_length):
             dts = ts[:, trajectory_length - i] - ts[:, trajectory_length - i - 1]
             # pre-draw the step's noise at loop level (outside any checkpoint
-            # region); the final step is deterministic and draws none
+            # region); the final step is deterministic and draws none. u_lift
+            # drives the mixture's arrival-lift categorical (pb_exact_reversal)
             eps = (torch.randn(batch_size, self.dim, dtype=current_state.dtype, device=self.device)
                    if i < trajectory_length - 1 else None)
+            u_lift = (torch.rand(batch_size, self.ang_dim, dtype=current_state.dtype, device=self.device)
+                      if (self.pb_exact_reversal and self.ang_dim > 0 and i < trajectory_length - 1)
+                      else None)
 
             (prev_state, logpf_i, logpb_i, flow_i,
              back_drift, back_var, fwd_drift, pflogvars, d) = self._run_step(
                 use_ckpt, self._bwd_step, current_state, dts, ts, condition_embedding,
-                eps, i, trajectory_length, detach_traj)
+                eps, u_lift, i, trajectory_length, detach_traj)
 
             logpf.append(logpf_i)
             logpb.append(logpb_i)
@@ -865,23 +934,105 @@ class GFN(nn.Module):  # todo add seeding
         P_B step log-prob for the forward-direction transition current_state
         -> next_state at forward step i. Shared by get_traj_fwd and
         get_traj_replay (both walk forward through the same time grid);
-        get_traj_bwd computes its own logpb directly since it's driven by
-        backward propagation rather than scored against a given transition.
+        get_traj_bwd scores the same kernel through _pb_logprob after
+        backward propagation, so all three paths compute one identical
+        function of the wrapped trajectory.
+
+        The returned back_drift is the canonical (k=0) component's drift --
+        under pb_exact_reversal it is a diagnostic summary of the mixture,
+        not the full kernel (see _pb_logprob).
         """
+        # R2: P_B is a kernel of the state on the circle; condition on the
+        # canonical representative, never a rollout's pre-wrap coordinate
+        next_state = self._wrap_ang(next_state)
         expanded_next_state = self.expand_state_for_policy(next_state)
         back_mean_correction, back_var_correction = self.fwd_get_back_correction(
             condition_embedding, i, expanded_next_state, ts)
         t_prev, t_next = ts[:, i], ts[:, i + 1]
-        back_drift = -next_state * self.var_drift_coeff(t_prev, t_next, dts).unsqueeze(1) * back_mean_correction
+        drift_coeff = self.var_drift_coeff(t_prev, t_next, dts).unsqueeze(1)
+        back_drift = -next_state * drift_coeff * back_mean_correction
         if i > 0:  # variance is exactly zero for the first step, so we can't use it
             var = (back_var_correction + self.var_log_rate(t_prev, t_next, dts)).clip(
                 min=-self.var_clip, max=self.var_clip).exp()
             back_var = var * self.var_bridge_step(t_prev, t_next, dts).unsqueeze(1)
-            logpb_i = self.gauss_logprob(current_state - next_state, back_drift, back_var)
+            logpb_i = self._pb_logprob(current_state, next_state, drift_coeff,
+                                       back_mean_correction, back_var, t_next)
         else:  # instead set this as a constant the model will have to learn around
             back_var = torch.ones_like(back_drift) * 1e-3 * dts.unsqueeze(1)
             logpb_i = torch.zeros_like(fallback_logpf)
         return back_drift, back_var, logpb_i
+
+    # winding offsets (in periods) for the P_B mixture, applied to CANONICAL
+    # (wrapped) inputs -- _pb_logprob wraps at entry, which is also what makes
+    # the truncation exact-by-construction under representative shifts.
+    # Arrival lifts: canonical y puts |k| = 3 lifts >= 5 half-periods out
+    # (relative weight e^{-12/V}; V <= t_scale in practice). Image lifts for
+    # the previous state must cover every component mean (|mean| <= 5), so the
+    # wider grid keeps the nearest image within half a period of all of them.
+    PB_LIFTS = (-2.0, -1.0, 0.0, 1.0, 2.0)
+    PB_IMAGE_LIFTS = (-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0)
+
+    def _pb_logprob(self, prev_state, next_state, drift_coeff, back_mean_correction, back_var, t_next):
+        """
+        One-step log P_B(prev | next), shared by all scoring paths (fwd,
+        replay via _eval_pb_logprob; bwd via _bwd_step). next_state must
+        already be wrapped. Linear dims always use the diagonal bridge.
+        Angular dims: pb_exact_reversal=False scores the single-image kernel
+        (gauss_logprob's nearest-image residual, drift from the canonical
+        representative); =True scores the exact reversal of the wrapped
+        reference bridge (docs/periodic_scoring_fix.html eq. 4).
+        """
+        if not (self.pb_exact_reversal and self.ang_dim > 0):
+            back_drift = -next_state * drift_coeff * back_mean_correction
+            return self.gauss_logprob(prev_state - next_state, back_drift, back_var)
+
+        # canonicalize both endpoints: the truncated image grids below are
+        # complete only for wrapped inputs, and wrapping here is what makes
+        # the kernel exactly representative-invariant
+        prev_state = self._wrap_ang(prev_state)
+        next_state = self._wrap_ang(next_state)
+        lin, ang = self.lin_idx, self.ang_idx
+        next_lin = next_state.index_select(1, lin)
+        back_drift_lin = -next_lin * drift_coeff * back_mean_correction.index_select(1, lin)
+        z_lin = (prev_state.index_select(1, lin) - next_lin) - back_drift_lin
+        var_lin = back_var.index_select(1, lin)
+        logpb_lin = -0.5 * (z_lin ** 2 / var_lin + logtwopi + var_lin.log()).sum(1)
+
+        logpb_ang = self._pb_mixture_ang_logprob(
+            prev_state.index_select(1, ang), next_state.index_select(1, ang),
+            drift_coeff, back_mean_correction.index_select(1, ang),
+            back_var.index_select(1, ang), t_next)
+        return logpb_lin + logpb_ang
+
+    def _pb_mixture_ang_logprob(self, x, y, drift_coeff, kappa, beta_sq, t_next):
+        """
+        Exact reversal of the wrapped reference bridge on angular dims, in
+        double-image form: an outer mixture over arrival lifts y + L*k of the
+        canonical next state, weighted by the forward marginal at t_next
+        (only the quadratic term matters -- the Gaussian normalizer is
+        k-independent and cancels in the softmax), each component the
+        familiar bridge toward the source, image-summed over the previous
+        state's lifts x + L*m. Truncation to |k|,|m| <= 1 is complete for
+        canonical inputs (see PB_LIFTS). x, y: [B, ang] wrapped; kappa,
+        beta_sq: [B, ang]; drift_coeff: [B, 1]; t_next: [B]. Returns [B].
+        """
+        period = 2.0
+        lifts = torch.tensor(self.PB_LIFTS, device=x.device, dtype=x.dtype) * period  # [K]
+        y_lifts = y.unsqueeze(-1) + lifts                                # [B, ang, K]
+        v_next = self.accum_var(t_next).clamp(min=self.var_floor)        # [B]
+        log_pi = -0.5 * y_lifts.pow(2) / v_next.view(-1, 1, 1)           # [B, ang, K]
+        log_pi = log_pi - torch.logsumexp(log_pi, dim=-1, keepdim=True)
+
+        contraction = 1.0 - drift_coeff * kappa                          # [B, ang]
+        component_mean = contraction.unsqueeze(-1) * y_lifts             # [B, ang, K]
+
+        image_lifts = torch.tensor(self.PB_IMAGE_LIFTS, device=x.device, dtype=x.dtype) * period
+        x_lifts = x.unsqueeze(-1).unsqueeze(-1) + image_lifts.view(1, 1, 1, -1)  # [B, ang, 1, M]
+        z = x_lifts - component_mean.unsqueeze(-1)                       # [B, ang, K, M]
+        beta = beta_sq.unsqueeze(-1).unsqueeze(-1)                       # [B, ang, 1, 1]
+        comp_logp = -0.5 * (z.pow(2) / beta + logtwopi + beta.log())     # [B, ang, K, M]
+        wrapped_comp_logp = torch.logsumexp(comp_logp, dim=-1)           # [B, ang, K]
+        return torch.logsumexp(log_pi + wrapped_comp_logp, dim=-1).sum(1)
 
     def fwd_get_back_correction(self, condition_embedding, i, expanded_next_state, ts):
         if self.learn_pb:
@@ -995,9 +1146,10 @@ class GFN(nn.Module):  # todo add seeding
         return torch.cat([lin, orient], dim=-1)  # [B, expanded_dim]
 
     def gauss_logprob(self, delta_x, drift, var):
-        noise = (delta_x - drift) / var.sqrt()
-        # noise_raw[:, self.ang_mask] = self.wrap_to_pi(noise_raw[:, self.ang_mask])
-
+        # nearest-image residual on periodic dims (R1): the scored density is
+        # then invariant to which representative either endpoint carries
+        z = self._wrap_ang(delta_x - drift)
+        noise = z / var.sqrt()
         return -0.5 * (noise ** 2 + logtwopi + var.log()).sum(1)
 
     def fwd_gauss_logprob(self, delta_x, drift, d, dt, V=None):
@@ -1012,7 +1164,10 @@ class GFN(nn.Module):  # todo add seeding
             var = dt.unsqueeze(1) * d
             return self.gauss_logprob(delta_x, drift, var)
 
-        z = delta_x - drift
+        # nearest-image residual (R1); per-dim wrapping inside the joint DPLR
+        # density is exact because dplr_mask_angular keeps angular dims out of
+        # the low-rank block (asserted at construction)
+        z = self._wrap_ang(delta_x - drift)
         r = V.shape[-1]
         Dinv_V = V / d.unsqueeze(-1)  # [B, n, r]
         M = torch.eye(r, device=V.device, dtype=V.dtype) + torch.einsum('bnr,bns->brs', V, Dinv_V)

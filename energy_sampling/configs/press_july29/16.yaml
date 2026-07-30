@@ -1,4 +1,4 @@
-adaptive_lr:
+﻿adaptive_lr:
   control_flow_lr: false
   cut_grad_abs: auto
   cut_loss_abs: 2500.0
@@ -187,7 +187,7 @@ model:
   cond_hidden_dim: 512
   cond_layers: 4
   condition_embedding_dim: 16
-  dplr_mask_angular: false
+  dplr_mask_angular: true
   dplr_rank: 12
   dplr_rho_max: 0.5
   dropout: 0

@@ -34,23 +34,31 @@ unconditional_molecule:
   buffers.anchor_buffer.seed_source: 'prior_dataset'
 
 conditional_toy:
-  # current mk_dev.yaml state as of 2026-07-22: toy_2cond_manif, latent_multiharmonic (model at W256/T40 -- see QUICK RESCALE CHECKLIST below)
+  # mk_dev.yaml state as of 2026-07-29 (toy_big_unif, latent_multiharmonic, W512/T40),
+  # snapshotted when mk_dev was rewired to unconditional_molecule for the
+  # post-periodic-fix ELJ test. The full protocol block for this mode is
+  # preserved VERBATIM in conditional_toy_protocol_2026_07_29 below.
   lr_flow: 1.0e-4  # flow_model is a real network (scalarMLP) -- match lr_fused/lr_policy, not the unconditional scalar's 0.1 (cazwlyy1: 0.1 detonated Z(c))
-  prior_path: 'D:\crystal_datasets\conditional\priors\toy_2cond_manif_prior.pt'
-  molecules_path: 'D:\crystal_datasets\conditional\priors\toy_2cond_manif_conditions.pt'
+  continue_from_checkpoint: true      # mk_dev was staged mid-experiment: resuming c17erxo7's thermalized snapshot
+  checkpoint_name: 'vargrad_island.pt'  # resumes inside var_conditioning; sidecar <name>_buffers.pt loads alongside
+  prior_path: 'D:\crystal_datasets\conditional\priors\toy_big_unif_prior.pt'
+  molecules_path: 'D:\crystal_datasets\conditional\priors\toy_big_unif_conditions.pt'
+  test_molecules_path: 'D:\crystal_datasets\conditional\priors\toy_big_unif_test_conditions.pt'
   model.periodic_centroids: false
+  model.dplr_rank: 10
+  model.dplr_rho_max: 0.9
   energy_function: 'latent_multiharmonic'
   space_groups: [ 1 ]
   vector_conditioning: true
-  vector_conditioning_dim: 2
+  vector_conditioning_dim: 3
   molecule_conditioning: false
   energy_config.temperature: 1.0
   energy_config.analyze_kwargs: {
-    cond_dim: 2,
-    n_core: 1,
-    n_ghost: 0,
+    cond_dim: 3,
+    n_core: 16,
+    n_ghost: 16,
     sigma_range: [ 0.04, 0.12 ],
-    aniso_scale: 0.0,
+    aniso_scale: 0.4,
     depth_range: [ 0.0, 4.0 ],
     mu_scale: 0.5,
     disp_max: 0.3,
@@ -61,7 +69,93 @@ conditional_toy:
     max_width: 2.5,
     seed: 0
   }  # MUST match the generator run's latent_field block (toy_prior_config.yaml)
-  buffers.anchor_buffer.seed_source: 'D:\crystal_datasets\conditional\priors\toy_2cond_manif_conditions.pt'
+  buffers.anchor_buffer.seed_source: 'D:\crystal_datasets\conditional\priors\toy_big_unif_conditions.pt'
+  condition_log_z.half_life_visits: 28.0    # persistent-Z regime (SE ~0.4-0.5 nats)
+  condition_log_z.fwd_tb_z_source: persistent  # 2026-07-28 handoff v3: tracker EMA IS Z, learned head = cache via emp_z_persistent
+  condition_log_z.bwd_tb_z_source: persistent
+  condition_log_z.replay_tb_z_source: persistent
+  grow_batch_size: false   # oscillation-diagnostic setting: removes the grow/OOM/slash sawtooth as a candidate external clock (flwl4jxz)
+  z_calibration.enabled: false  # machinery retired to hygiene duty after the 9x mean-pinned-Z falsification
+
+# --------------------------------------------------------------------------
+# conditional_toy PROTOCOL -- verbatim snapshot of mk_dev.yaml's protocol
+# block as of 2026-07-29, taken when mk_dev was rewired for the unconditional
+# ELJ periodic-fix test. Restore by copying `stages:` back under `protocol:`
+# (plus the mode keys above). The commented-out alternate routes that lived
+# alongside these stages (thermalize / z_match / terminal staged route,
+# archived anchor_seed+buildout localized route, equilibrate) are preserved in
+# mk_dev.yaml's git history and unchanged from it.
+# --------------------------------------------------------------------------
+conditional_toy_protocol_2026_07_29:
+  stages:
+    - name: train_prior
+      train_mode: bwd
+      bwd_sampling_mode: dataset
+      skip_if: prior_loaded
+      flags: { update_log_z: true, scramble_conditions: true, mle_gate: true }
+      loss_coeffs:
+        bwd: { mle: 1.0, tbc: 1.0, repeats: 2.0 }
+      exit:
+        - { metric: gates/mle_flat, above: 0.5, patience: 5 }
+        - { metric: eval/wass_debiased, below: 0.015 }
+        - { metric: bwd/tbc, below: 2.0 }
+      on_exit: [ 'snapshot:phase1_exit', 'snapshot_prior' ]
+
+    # condition-grouped VarGrad on fwd + bwd; Z(c) trains as fwd-only emp_z
+    # sidecar; prior_buffer.condition_block_m auto-activates while bwd vg_lb>0
+    - name: var_conditioning
+      train_mode: fused
+      bwd_sampling_mode: prior
+      flags: { update_log_z: true, buffers_active: true, weighted_bwd_sampling: true,
+               weighted_condition_sampling: true }
+      on_enter: [ 'rebuild_prior_by_churn' ]
+      fracs: { fwd: 0.5, bwd: 0.5, replay: 0.0 }
+      deactivate_threshold: 0.01
+      loss_coeffs:
+        # beta stays at base 10: 30 was tried (louder tail pull) and came back noisier-and-worse
+        fwd: { vg_lb: 1.0, vg_by_condition: 1.0, emp_z: 1.0, repeats: 2.0 }
+        bwd: { vg_lb: 1.0, repeats: 2.0, level_gap: 1.0 }
+      balance:
+        kind: proportional
+        pinned: { replay: 0.0 }
+        metrics: { fwd: fwd/logw_std_within, bwd: bwd/logw_std_within }
+        drive: relative
+        targets: { fwd: 1.0, bwd: 1.0 }
+        default_boost: { fwd: 0.5, bwd: 0.5 }
+        floor: 0.1     # bwd VG is the anti-degeneracy anchor
+        alpha: 0.01
+      on_exit: [ 'snapshot:var_conditioned' ]
+      exit:
+        # thresholds sit just above observed structural floors (fwd ~5.5, bwd ~2.4 in m=6 units)
+        # NB rolling channels only: a tracker/* exit term resolves None and its streak stays 0 forever (sbb9491u)
+        - { metric: fwd/logw_std_within, below: 6.0, patience: 5 }
+        - { metric: bwd/logw_std_within, below: 3.0, patience: 5 }
+
+    # ONE always-on terminal stage; fwd pinned, bwd/replay split proportionally
+    - name: naive
+      train_mode: fused
+      bwd_sampling_mode: prior
+      flags: { update_log_z: true, buffers_active: true, weighted_bwd_sampling: true,
+               weighted_condition_sampling: true }
+      # no on_enter: rebuild_prior_by_churn fires at var_conditioning entry and must not repeat
+      fracs: { fwd: 0.4, bwd: 0.55, replay: 0.05 }
+      min_fracs: { fwd: 0.02, bwd: 0.05, replay: 0.02 }  # INERT under kind: proportional; kept for a lexicographic switch-back
+      deactivate_threshold: 0.01
+      loss_coeffs:
+        fwd: { tb: 1.0, z_level: 1.0, emp_z_persistent: 1.0 }
+        bwd: { tb: 1.0 }               # freeze_z stays 1 from base: policy only
+      balance:
+        kind: proportional
+        pinned: { fwd: 0.4 }               # must equal fracs.fwd
+        metrics: { bwd: bwd/relative_under, replay: fwd/over_coverage }
+        drive: relative
+        # measured open-loop on zcdgtwfv (fixed mix, settled = last 40% of 3.7k steps):
+        # bwd/relative_under 2.48-3.18, fwd/over_coverage 17.00-17.81
+        targets: { bwd: 5.0, replay: 15.0 }
+        max_fracs: { replay: 0.2 }
+        default_boost: { bwd: 0.94, replay: 0.06 }
+        alpha: 0.002
+        floor: 0.03
 
 # Anchor-seeding rule by domain (NOT a per-mode key):
 #   toy (cond + uncond): the prior dataset is a broad junk Gaussian and the

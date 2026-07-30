@@ -698,7 +698,7 @@ def substitute_prior(noised_fraction, log_noise_range,
         new_samples = noised_samples
 
     # have to update the rewards if we are using any loss functions that require them
-    crystal_batch, log_T_tensor, sg_inds, zps, condition, condition_id = energy_function.condition_samples(
+    crystal_batch, log_T_tensor, condition, condition_id = energy_function.condition_samples(
         crystal_batch,
         sg_inds=crystal_batch.sg_ind,
         z_primes=crystal_batch.z_prime)
@@ -812,7 +812,7 @@ def calibrate_prior_noise(buffer, energy_function,
     new_samples = noised_samples  # todo confirm right latents / dists
 
     # have to update the rewards if we are using any loss functions that require them
-    crystal_batch, log_T_tensor, sg_inds, zps, condition, condition_id = energy_function.condition_samples(
+    crystal_batch, log_T_tensor, condition, condition_id = energy_function.condition_samples(
         crystal_batch,
         sg_inds=crystal_batch.sg_ind,
         z_primes=crystal_batch.z_prime)

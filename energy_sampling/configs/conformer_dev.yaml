@@ -1,7 +1,7 @@
-run_name: 'conformer_dev'
+run_name: 'conformer_butanol_v01'
 tag: 'v01'
 seed: 0
-device: 'cpu'
+device: 'cuda'
 wandb_mode: 'online'   # online | offline | disabled
 num_threads: 2
 
@@ -31,7 +31,7 @@ model:
   t_dim: 128
   flow_hidden_dim: 128
   flow_layers: 2
-  t_scale: 1.0
+  t_scale: 0.05               # sigma_step must stay << the wrap period
   zero_init: true
   clipping: true
   gfn_clip: 1.0e+4   # unsigned exponents (1.0e4) parse as strings in YAML 1.1
@@ -40,15 +40,36 @@ model:
 ################################################################
 # Top level: resolve_derived_config reads these off the root namespace and treats a
 # missing key as `auto`.
-lr_policy: 1.0e-3
-lr_flow: 1.0e-2
+lr_policy: auto
+lr_back: auto
+lr_replay: auto
+lr_fused: auto
+lr_flow: 1.0e-1
+min_lr: 1.0e-6
+lr_warmup_ratio: 100
 gradient_norm_clip: 1.0
+weight_decay: 1.0e-4
+use_weight_decay: false
+
+adaptive_lr:
+  enabled: true
+  warmup_steps: 200
+  hold_steps: 800
+  decay_halflife_steps: 1500
+  decay_floor_scale: 0.05
 
 # Training
 ################################################################
 training:
-  steps: 4000
+  steps: 10000000
   batch_size: 128
+  grow_batch_size: true       # CPU: no OOM headroom to climb into
+  max_batch_size: 2048
+  batch_growth_factor: 1.65
+  batch_growth_interval: 50
+  batch_growth_slow_interval: 300
+  auto_batch_throughput_opt: true
+  batch_growth_min_gain: 0.15
   exploration_std: 0.0
   buffer_path: null            # .pt from build_conformer_buffer.py
   bwd_frac: 0.5
@@ -57,5 +78,6 @@ training:
 ################################################################
 eval:
   report_every: 250
+  figs_period: 500            # figures are heavier than scalars; 0 to disable
   brute_force_grid: 48         # exact references by quadrature; k <= 3 only, 0 to skip
   out: 'conformer_v01_run.json'

@@ -2427,7 +2427,7 @@ class Modeller:
         mol_batch = mol_batch.to(self.device)
         mol_batch.orient_molecule(mode='std')
         init_state = get_gfn_init_state(mol_batch.num_graphs, self.energy_function.data_ndim, self.device)
-        mol_batch, log_T_tensor, sg_inds, zps, condition, condition_id = self.energy_function.condition_samples(
+        mol_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
             mol_batch, repeats=repeats)
 
         out = get_gfn_forward_loss(self.args.fwd_loss_coeffs,
@@ -2641,7 +2641,7 @@ class Modeller:
         else:
             assert False, f"sampling method {self.args.sampling} not implemented"
         mol_batch = mol_batch.to(self.device)
-        mol_batch, log_T_tensor, sg_inds, zps, condition, condition_id = self.energy_function.condition_samples(
+        mol_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
             mol_batch, repeats=repeats)
         temperature = 10 ** log_T_tensor
         log_reward = self.energy_function.prebuilt_sample_to_reward(mol_batch,
@@ -2664,7 +2664,7 @@ class Modeller:
         traj = traj.to(self.device)
 
         mol_batch = mol_batch.to(self.device)
-        mol_batch, log_T_tensor, sg_inds, zps, condition, condition_id = self.energy_function.condition_samples(
+        mol_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
             mol_batch, repeats=repeats)
         temperature = 10 ** log_T_tensor
         log_reward = self.energy_function.prebuilt_sample_to_reward(mol_batch,
@@ -2728,7 +2728,7 @@ class Modeller:
                 mol_batch = mol_batch.to(self.ema_model.device)
                 terminal_state = mol_batch.latent_params()
 
-                mol_batch, log_T_tensor, sg_inds, zps, condition, condition_id = self.energy_function.condition_samples(
+                mol_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
                     mol_batch,
                     temperature=torch.ones(mol_batch.num_graphs, dtype=torch.float32,
                                            device=mol_batch.device) * self.args.energy_config.temperature)
@@ -3765,7 +3765,7 @@ class Modeller:
         anchor_batch = anchor_batch.clone().to(self.device)
         anchor_batch.log_noise_latent_parameters(*cfg.noise_log_range)
 
-        anchor_batch, log_T_tensor, sg_inds, zps, condition, condition_id = self.energy_function.condition_samples(
+        anchor_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
             anchor_batch, sg_inds=anchor_batch.sg_ind, z_primes=anchor_batch.z_prime)
         anchor_batch.orient_molecule(mode='std')
 
@@ -3884,7 +3884,7 @@ class Modeller:
             # conditioned, oriented and scored
             seed_batch.log_noise_latent_parameters(*cfg.noise_log_range)
 
-        seed_batch, log_T_tensor, sg_inds, zps, condition, condition_id = self.energy_function.condition_samples(
+        seed_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
             seed_batch, sg_inds=seed_batch.sg_ind, z_primes=seed_batch.z_prime)
         seed_batch.orient_molecule(mode='std')
 
@@ -4492,7 +4492,7 @@ class Modeller:
             keep = torch.randperm(seed_batch.num_graphs)[:limit]
             seed_batch = seed_batch.subsample_new_batch(keep)
         seed_batch = seed_batch.to(self.device)
-        seed_batch, _, _, _, _, _ = self.energy_function.condition_samples(
+        seed_batch, _, _, _ = self.energy_function.condition_samples(
             seed_batch,
             sg_inds=getattr(seed_batch, 'sg_ind', None),
             z_primes=getattr(seed_batch, 'z_prime', None))
@@ -4622,7 +4622,7 @@ class Modeller:
                              dtype=torch.long, device=seed_batch.device),
                 'mol_id')
 
-        seed_batch, log_T_tensor, sg_inds, zps, condition, condition_id = self.energy_function.condition_samples(
+        seed_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
             seed_batch, sg_inds=getattr(seed_batch, 'sg_ind', None), z_primes=getattr(seed_batch, 'z_prime', None))
         temperature = 10 ** log_T_tensor
         reward = self.energy_function.prebuilt_sample_to_reward(seed_batch, temperature)
