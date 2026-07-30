@@ -1,0 +1,212 @@
+- index: 0
+  run_name: postfix_ref
+  parent: uncond_july28/4.yaml
+  note: 'arm 4 (prop_fwd20) from scratch: post-fix floors/bands; stamps the shared
+    phase1_exit + prior'
+  lr_fused: 5.0e-05
+  lr_decay_halflife: 8000
+  kind: proportional
+  fracs:
+    bwd: 0.752
+    fwd: 0.2
+    replay: 0.048
+  epochs: 100000
+  from_scratch: true
+- index: 1
+  run_name: postfix_nodecay
+  parent: uncond_july28/17.yaml
+  note: 'arm 17 from scratch: constant-LR floor, pre/post A/B, press Tier-A control'
+  lr_fused: 5.0e-05
+  lr_decay_halflife: 0
+  kind: proportional
+  fracs:
+    bwd: 0.752
+    fwd: 0.2
+    replay: 0.048
+  epochs: 100000
+  from_scratch: true
+- index: 2
+  run_name: postfix_fixed_null
+  parent: uncond_july28/1.yaml
+  note: 'arm 1 from scratch: fixed mix, rules []; controller-free band read, 1xz7zd9n
+    successor'
+  lr_fused: 5.0e-05
+  lr_decay_halflife: 8000
+  kind: lexicographic
+  fracs:
+    bwd: 0.9
+    fwd: 0.05
+    replay: 0.05
+  epochs: 100000
+  from_scratch: true
+- index: 3
+  run_name: postfix_r15
+  parent: uncond_july28/3.yaml
+  note: 'dose-response: idle replay 0.15 (held ~0.135), cap 0.25'
+  lr_fused: 5.0e-05
+  lr_decay_halflife: 8000
+  kind: proportional
+  fracs:
+    bwd: 0.765
+    fwd: 0.1
+    replay: 0.135
+  epochs: 100000
+  from_scratch: true
+- index: 4
+  run_name: postfix_r30
+  parent: uncond_july28/11.yaml
+  note: 'dose-response: idle replay 0.30 (held ~0.27), cap 0.40'
+  lr_fused: 5.0e-05
+  lr_decay_halflife: 8000
+  kind: proportional
+  fracs:
+    bwd: 0.63
+    fwd: 0.1
+    replay: 0.27
+  epochs: 100000
+  from_scratch: true
+- index: 5
+  run_name: postfix_r50
+  parent: uncond_july28/12.yaml
+  note: 'dose-response: idle replay 0.50 (held ~0.45), cap 0.55'
+  lr_fused: 5.0e-05
+  lr_decay_halflife: 8000
+  kind: proportional
+  fracs:
+    bwd: 0.45
+    fwd: 0.1
+    replay: 0.45
+  epochs: 100000
+  from_scratch: true
+- index: 6
+  run_name: postfix_lr2x
+  parent: uncond_july28/17.yaml
+  note: LR ladder x2 = 1.0e-4, constant
+  lr_fused: 0.0001
+  lr_decay_halflife: 0
+  kind: proportional
+  fracs:
+    bwd: 0.752
+    fwd: 0.2
+    replay: 0.048
+  epochs: 100000
+  from_scratch: true
+- index: 7
+  run_name: postfix_lr4x
+  parent: uncond_july28/17.yaml
+  note: LR ladder x4 = 2.0e-4, constant
+  lr_fused: 0.0002
+  lr_decay_halflife: 0
+  kind: proportional
+  fracs:
+    bwd: 0.752
+    fwd: 0.2
+    replay: 0.048
+  epochs: 100000
+  from_scratch: true
+- index: 8
+  run_name: postfix_lr8x
+  parent: uncond_july28/17.yaml
+  note: LR ladder x8 = 4.0e-4, constant
+  lr_fused: 0.0004
+  lr_decay_halflife: 0
+  kind: proportional
+  fracs:
+    bwd: 0.752
+    fwd: 0.2
+    replay: 0.048
+  epochs: 100000
+  from_scratch: true
+- index: 9
+  run_name: postfix_lr16x
+  parent: uncond_july28/17.yaml
+  note: LR ladder x16 = 8.0e-4, constant
+  lr_fused: 0.0008
+  lr_decay_halflife: 0
+  kind: proportional
+  fracs:
+    bwd: 0.752
+    fwd: 0.2
+    replay: 0.048
+  epochs: 100000
+  from_scratch: true
+- index: 10
+  run_name: postfix_beta20
+  parent: uncond_july28/15.yaml
+  note: 'arm 15 from scratch: beta 20 whole-run, rails x2; 2x-ruler caveat on clipped-residual
+    metrics'
+  lr_fused: 5.0e-05
+  lr_decay_halflife: 8000
+  kind: proportional
+  fracs:
+    bwd: 0.752
+    fwd: 0.2
+    replay: 0.048
+  epochs: 100000
+  from_scratch: true
+- index: 11
+  run_name: postfix_beta20_nodecay
+  parent: uncond_july28/18.yaml
+  note: 'arm 18 from scratch: beta 20 + decay 0 compound, fast-default candidate'
+  lr_fused: 5.0e-05
+  lr_decay_halflife: 0
+  kind: proportional
+  fracs:
+    bwd: 0.752
+    fwd: 0.2
+    replay: 0.048
+  epochs: 100000
+  from_scratch: true
+- index: 12
+  run_name: postfix_pb_single
+  parent: uncond_july28/4.yaml
+  note: 'fix ablation: pb_exact_reversal false (single-image P_B term) vs arm 0'
+  lr_fused: 5.0e-05
+  lr_decay_halflife: 8000
+  kind: proportional
+  fracs:
+    bwd: 0.752
+    fwd: 0.2
+    replay: 0.048
+  epochs: 100000
+  from_scratch: true
+- index: 13
+  run_name: postfix_r06
+  parent: uncond_july28/0.yaml
+  note: 'prop_ref clone: dose-response zero point (fwd 0.1, idle replay 0.06); control
+    for 3-5/14'
+  lr_fused: 5.0e-05
+  lr_decay_halflife: 8000
+  kind: proportional
+  fracs:
+    bwd: 0.846
+    fwd: 0.1
+    replay: 0.054
+  epochs: 100000
+  from_scratch: true
+- index: 14
+  run_name: postfix_r70
+  parent: uncond_july28/12.yaml
+  note: 'dose-response: idle replay 0.70 (fracs 0.1/0.27/0.63), cap 0.80'
+  lr_fused: 5.0e-05
+  lr_decay_halflife: 8000
+  kind: proportional
+  fracs:
+    fwd: 0.1
+    bwd: 0.27
+    replay: 0.63
+  epochs: 100000
+  from_scratch: true
+- index: 15
+  run_name: postfix_fresh50
+  parent: uncond_july28/4.yaml
+  note: 'replay residence ~50: churn_rate 200, max_residence_steps 60, occupancy held'
+  lr_fused: 5.0e-05
+  lr_decay_halflife: 8000
+  kind: proportional
+  fracs:
+    bwd: 0.752
+    fwd: 0.2
+    replay: 0.048
+  epochs: 100000
+  from_scratch: true
