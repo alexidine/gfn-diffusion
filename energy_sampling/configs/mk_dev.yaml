@@ -50,7 +50,7 @@ min_lr: 1.0e-6                # ihn
 # Silent when disabled, inside the deadband, cold, mid-accumulation, or in a
 # scramble_conditions stage.
 z_calibration:
-  enabled: false            # retired to hygiene duty after the 9x mean-pinned-Z falsification; parameters below are now set for the UNCONDITIONAL route, so re-enabling is a one-word change
+  enabled: true             # retired to hygiene duty after the 9x mean-pinned-Z falsification; parameters below are now set for the UNCONDITIONAL route, so re-enabling is a one-word change
   mode: rollout              # rollout = fresh fwd rollout under freeze_policy, TB's own Z gradient; regression = ~free fit onto tracker ema_logw
   unclipped: false           # false => the sidecar's Z fixed point IS the fused Huber loss's (beta from fwd_loss_coeffs). true substitutes beta 1e6, moving it to the arithmetic mean while the fused step keeps pulling to the winsorized one
   sensor: pooled             # |EMA fwd/tb_resid_clipped|, clipped at fwd_loss_coeffs.beta => exactly dL/dZ of the fused loss. rms/worst are per-condition dispersion and read identically zero on a single-condition (unconditional) run
@@ -213,7 +213,7 @@ fwd_loss_coeffs:
   reward_grads: 0.0
   repeats: 1.0  # per-mode K-tiling factor
   loss_clip: 1.0E+9
-  beta: 1000.0  # Huber beta
+  beta: 10.0  # Huber beta
 bwd_loss_coeffs:
   tb: 0.0  # must be nonzero for log Z backwards-trained warm start
   freeze_policy: 0.0  # 1 => train Z only

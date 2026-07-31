@@ -49,16 +49,22 @@ CEILING measurement a fire must be terminal and unambiguous; the new 0.85
 recovery in mk_dev would let marginal arms re-ramp and smear the ceiling.
 Enable it for production runs, not for this one.
 
-BATCH IS FIXED, AND MODEST. The postfix arms ran grow_batch_size and drifted
-apart -- lr8x sat at 3438 while nodecay sat at 5064, both off a 1000 start
-with an OOM sawtooth. That is a live confound in the ladder. Every arm here
-fixes batch_size (grow off, max = base), so the batch axis is measured rather
-than suffered. Base is mk_dev's 2831 throughput knee, so the grid's operating
-point is the production default rather than a battery-only number; the batch
-arms bracket it x0.5 / x2 (1416 / 5662), both inside proven territory --
-44gt5whr peaked at 6357 at T=10. Batch above ~1000 is understood here as a
-GPU-UTILISATION knob, not a quality knob; arms 6-7 exist only to check that
-it is not also quietly setting the gradient-noise floor, i.e. k.
+BATCH STAYS ADAPTIVE (parent's batch_size 1000 / grow true / max 50000).
+An earlier draft pinned it to remove the postfix arms' drift (lr8x sat at
+3438, nodecay at 5064). That was wrong twice over:
+  - 2831 is the throughput knee on the ~17 GB LOCAL card. On the ~86 GB
+    cluster card a pinned 2831 at T=10 holds ~15% of VRAM and, more to the
+    point, drops GPU utilisation and power draw -- at T=10 each SDE step is a
+    small kernel, so phase 2 goes launch-bound and more samples per kernel is
+    nearly free. Adaptive batching is the mechanism built for exactly that.
+  - Above the critical batch size the gradient-noise reduction saturates, so
+    two arms at 3438 and 5064 make the same per-step progress; the drift
+    biases WALL-CLOCK, not the step-matched readouts this grid is built on
+    (the ceiling, and k fitted against phase-2 steps).
+That premise is assumed, not measured, and if it is false every step-matched
+comparison in BOTH batteries is biased -- so arm 6 pins a deliberately small
+batch against arm 1's adaptive one. Matching per-step progress means we are
+past the knee and the drift never mattered.
 
 FROM SCRATCH, AND reuse_prior MUST STAY FALSE. checkpointing.find_shared_prior
 matches ANY run's *_prior.pt in checkpoints_dir on problem_def alone, and its
@@ -73,7 +79,7 @@ kept byte-identical so arm 9 anchors this grid to that one.
 
 ARMS (16 = one cluster submission)
 
-  T=10 LR LADDER (0-2, +12) -- W512, batch 3000. The ceiling at T=10,
+  T=10 LR LADDER (0-2, +12) -- W512. The ceiling at T=10,
   measured rather than inferred. The lr ~ 1/T rule predicts 2.4e-3 from
   T=60's measured 4e-4; 0-2 bracket it and 12 is insurance in case 3.2e-3
   rides.
@@ -82,7 +88,7 @@ ARMS (16 = one cluster submission)
    2 : T10_lr32     3.2e-3    (just above the 1/T prediction)
   12 : T10_lr64     6.4e-3
 
-  WIDTH (3-5, +15) -- T=10, batch 3000. Does capacity bend k? W1024 gets TWO
+  WIDTH (3-5, +15) -- T=10. Does capacity bend k? W1024 gets TWO
   LRs so "worse" cannot be confused with "detonated"; W256 gets the mid and
   the high rung because a narrower net should tolerate MORE LR (MLE tolerance
   shrinks with width) and "smaller and much faster" is a live candidate for
@@ -92,12 +98,15 @@ ARMS (16 = one cluster submission)
    4 : T10_w1024_lr08   W 1024, 8.0e-4
    5 : T10_w1024_lr16   W 1024, 1.6e-3
 
-  BATCH (6-7) -- T=10, W512, 1.6e-3. The other candidate k-lever, bracketed
-  both ways: fewer/noisier steps vs more/cleaner ones per unit time.
-   6 : T10_b1500    batch 1500
-   7 : T10_b6000    batch 6000
+  CRITICAL-BATCH CHECK (6) -- T=10, W512, 1.6e-3, batch PINNED at 1000 with
+  growth off; the only arm in the grid that does not batch adaptively. Its
+  treatment leg is arm 1. Matching per-step progress means we are past the
+  knee where extra samples stop reducing gradient noise -- which is the
+  premise that makes the postfix arms' batch drift (3438 vs 5064) harmless
+  for every step-matched comparison in both batteries.
+   6 : T10_b_fixed1000
 
-  CLIP A/B (8) -- T=10, W512, 1.6e-3, batch 3000, clip left at the resolver's
+  CLIP A/B (8) -- T=10, W512, 1.6e-3, clip left at the resolver's
   37.9 (100% saturation). Its treatment leg is arm 1, which is identical
   except for the raised clip. If clipping is inert under Adam (2z5oo55f) the
   pair reads flat and we have bought certainty for one slot; if the low-LR
@@ -105,11 +114,11 @@ ARMS (16 = one cluster submission)
   spending stability margin.
    8 : T10_clip_resolver
 
-  ANCHOR + T=60 CEILING RECHECK (9, 14) -- W512, batch 3000.
-   9 : T60_anchor   4.0e-4  replicates lr8x's T/W/LR under this grid's fixed
-                    batch and explicit bars; the only arm commensurable with
-                    postfix_july30, and the correction term for the batch and
-                    bar changes between the two batteries.
+  ANCHOR + T=60 CEILING RECHECK (9, 14) -- W512.
+   9 : T60_anchor   4.0e-4  replicates lr8x's T/W/LR/batching exactly; the
+                    only difference is this grid's explicit clip and tripwire
+                    bars, so it is both the cross-battery anchor and the
+                    correction term for the bar change.
   14 : T60_lr08     8.0e-4  lr16x fired at 8e-4 against cut_grad_abs = 30 x
                     clip = 13632, on a WOBBLE (tb_err 10.2 -> 11.4, max
                     grad 9.5e5 in one spike). utils._CUT_GRAD_OVER_CLIP is
@@ -117,12 +126,13 @@ ARMS (16 = one cluster submission)
                     So "8e-4 breaks at T=60" is currently bar-dependent, not
                     physics. This arm settles it.
 
-  T=25 (10-11) -- W512, batch 3000. Two rungs, not a full column: with T=10
-  measured directly the exponent is only needed to re-anchor the resolver,
-  and T=60 already has four rungs from postfix_july30. The 1/T rule predicts
-  a 9.6e-4 ceiling here.
+  T=25 (10-11, +7) -- W512. Three rungs, bracketing the T=25 ceiling as
+  densely as T=10's, which is what a ceiling-vs-T exponent fit needs; T=60
+  already has four rungs from postfix_july30. The 1/T rule predicts a 9.6e-4
+  ceiling here.
   10 : T25_lr08     8.0e-4
   11 : T25_lr16     1.6e-3
+   7 : T25_lr32     3.2e-3
 
   REPLICATE (13) -- arm 1 at a different seed. Every conclusion in the
   postfix analysis rests on single arms; one replicate at the mid cell
@@ -168,8 +178,7 @@ CLIP_OVER_MEDIAN = 3.0
 CUT_OVER_CLIP = 10.0
 RESET_OVER_CUT = 10.0
 
-BASE_BATCH = 2831        # mk_dev's throughput knee -- the grid's operating point
-                         # IS the production default, not a battery-only number
+PINNED_BATCH = 1000      # arm 6 only: the critical-batch check
 BASE_EPOCHS = 100000     # parent's value, kept: see the epochs note in the docstring
 W_REF = 512
 
@@ -217,9 +226,9 @@ def set_lrs(cfg, lr):
     return cfg
 
 
-def set_batch(cfg, batch):
-    """Fixed batch: grow off, max = base. Removes the postfix arms' growth
-    drift + OOM sawtooth from every comparison in this grid."""
+def pin_batch(cfg, batch):
+    """Pin the batch (growth off). Used by ONE arm only -- the critical-batch
+    check. Every other arm inherits the parent's adaptive batching."""
     cfg['batch_size'] = batch
     cfg['grow_batch_size'] = False
     cfg['max_batch_size'] = batch
@@ -265,37 +274,39 @@ def from_scratch(cfg):
 
 # (index, run_name, T, W, lr, batch, seed_override, clip_override, note)
 ARMS = [
-    (0,  'tw_T10_lr08',        10,  512, 8.0e-4, BASE_BATCH, None, None,
+    (0,  'tw_T10_lr08',        10,  512, 8.0e-4, None, None, None,
      'T=10 ladder: 8e-4 (T=60 ceiling carried across unscaled)'),
-    (1,  'tw_T10_lr16',        10,  512, 1.6e-3, BASE_BATCH, None, None,
+    (1,  'tw_T10_lr16',        10,  512, 1.6e-3, None, None, None,
      'T=10 ladder: 1.6e-3. MID CELL -- reference for width/batch/clip blocks'),
-    (2,  'tw_T10_lr32',        10,  512, 3.2e-3, BASE_BATCH, None, None,
+    (2,  'tw_T10_lr32',        10,  512, 3.2e-3, None, None, None,
      'T=10 ladder: 3.2e-3, just above the lr~1/T prediction of 2.4e-3'),
-    (3,  'tw_T10_w256_lr16',   10,  256, 1.6e-3, BASE_BATCH, None, None,
+    (3,  'tw_T10_w256_lr16',   10,  256, 1.6e-3, None, None, None,
      'width 256 at the mid rung; narrower should tolerate MORE LR'),
-    (4,  'tw_T10_w1024_lr08',  10, 1024, 8.0e-4, BASE_BATCH, None, None,
+    (4,  'tw_T10_w1024_lr08',  10, 1024, 8.0e-4, None, None, None,
      'width 1024, low rung -- the safe leg of the capacity pair'),
-    (5,  'tw_T10_w1024_lr16',  10, 1024, 1.6e-3, BASE_BATCH, None, None,
+    (5,  'tw_T10_w1024_lr16',  10, 1024, 1.6e-3, None, None, None,
      'width 1024, mid rung -- pairs with arm 4 so worse != detonated'),
-    (6,  'tw_T10_b1416',       10,  512, 1.6e-3, 1416,       None, None,
-     'batch x0.5: noisier steps, more of them per unit time'),
-    (7,  'tw_T10_b5662',       10,  512, 1.6e-3, 5662,       None, None,
-     'batch x2: cleaner gradient, does it move k? (44gt5whr peaked 6357 at T=10)'),
-    (8,  'tw_T10_clip_resolver', 10, 512, 1.6e-3, BASE_BATCH, None, 37.9,
+    (6,  'tw_T10_b_fixed1000', 10,  512, 1.6e-3, 1000,       None, None,
+     'CRITICAL-BATCH CHECK: batch pinned at 1000 vs arm 1 adaptive. Matching '
+     'per-step progress => past the knee, so the postfix batch drift was benign'),
+    (7,  'tw_T25_lr32',        25,  512, 3.2e-3, None,       None, None,
+     'T=25 third rung: brackets the T=25 ceiling as densely as T=10, which is '
+     'what the ceiling-vs-T exponent fit actually needs'),
+    (8,  'tw_T10_clip_resolver', 10, 512, 1.6e-3, None, None, 37.9,
      'clip A/B control leg: resolver clip 37.9 = 100% saturation. Treatment = arm 1'),
-    (9,  'tw_T60_anchor',      60,  512, 4.0e-4, BASE_BATCH, None, None,
+    (9,  'tw_T60_anchor',      60,  512, 4.0e-4, None, None, None,
      'anchor to postfix_july30 lr8x: same T/W/LR, fixed batch + explicit bars'),
-    (10, 'tw_T25_lr08',        25,  512, 8.0e-4, BASE_BATCH, None, None,
+    (10, 'tw_T25_lr08',        25,  512, 8.0e-4, None, None, None,
      'T=25: 8e-4, just below the 1/T prediction of 9.6e-4'),
-    (11, 'tw_T25_lr16',        25,  512, 1.6e-3, BASE_BATCH, None, None,
+    (11, 'tw_T25_lr16',        25,  512, 1.6e-3, None, None, None,
      'T=25: 1.6e-3, above the 1/T prediction'),
-    (12, 'tw_T10_lr64',        10,  512, 6.4e-3, BASE_BATCH, None, None,
+    (12, 'tw_T10_lr64',        10,  512, 6.4e-3, None, None, None,
      'T=10 ladder insurance rung, in case 3.2e-3 rides'),
-    (13, 'tw_T10_lr16_s2',     10,  512, 1.6e-3, BASE_BATCH, 20260731, None,
+    (13, 'tw_T10_lr16_s2',     10,  512, 1.6e-3, None, 20260731, None,
      'seed replicate of arm 1: calibrates between-arm noise'),
-    (14, 'tw_T60_lr08',        60,  512, 8.0e-4, BASE_BATCH, None, None,
+    (14, 'tw_T60_lr08',        60,  512, 8.0e-4, None, None, None,
      'T=60 at 8e-4 under the new bars: was lr16x fire physics or a 30x-clip bar?'),
-    (15, 'tw_T10_w256_lr32',   10,  256, 3.2e-3, BASE_BATCH, None, None,
+    (15, 'tw_T10_w256_lr32',   10,  256, 3.2e-3, None, None, None,
      'width 256 at the high rung -- the "smaller and much faster" candidate'),
 ]
 
@@ -307,7 +318,8 @@ def build_all():
         set_T(cfg, T)
         set_width(cfg, W)
         set_lrs(cfg, lr)
-        set_batch(cfg, batch)
+        if batch is not None:
+            pin_batch(cfg, batch)
         clip = clip_for(T, W)
         set_bars(cfg, clip, clip_override)
         keep_recovery_inert(cfg)
@@ -323,7 +335,8 @@ def build_all():
         log.append({
             'index': index, 'run_name': run_name, 'note': note,
             'T': T, 'eval_T': cfg['eval_T'], 'W': W,
-            'lr_fused': lr, 'batch_size': batch, 'seed': cfg['seed'],
+            'lr_fused': lr, 'batch_size': cfg['batch_size'],
+            'batch_adaptive': bool(cfg['grow_batch_size']), 'seed': cfg['seed'],
             'gradient_norm_clip': cfg['gradient_norm_clip'],
             'clip_source': ('resolver value, A/B control leg (bars kept on the '
                             'grid scale so the clip is the only variable)'

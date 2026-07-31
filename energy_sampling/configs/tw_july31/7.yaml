@@ -1,6 +1,6 @@
 adaptive_lr:
   control_flow_lr: false
-  cut_grad_abs: 10110.0
+  cut_grad_abs: 20069.0
   cut_loss_abs: 2500.0
   cut_ratio: 0.5
   decay_floor_scale: 0.05
@@ -11,7 +11,7 @@ adaptive_lr:
   recovery_ramp_steps: 1000
   recovery_target_frac: 0.5
   recovery_wait_steps: 3000
-  reset_grad_abs: 101100.0
+  reset_grad_abs: 200690.0
   reset_loss_abs: auto
   warmup_steps: 1000
 anomaly_detection: false
@@ -23,7 +23,7 @@ batch_growth_interval: 50
 batch_growth_min_gain: 0.15
 batch_growth_slow_interval: 300
 batch_knee_recheck_steps: 2000
-batch_size: 5662
+batch_size: 1000
 buffer_device: cuda
 buffers:
   anchor_buffer:
@@ -141,7 +141,7 @@ energy_config:
   temperature: 2.5
 energy_function: elj
 epochs: 100000
-eval_T: 10
+eval_T: 25
 eval_num_samples: 10000
 eval_period: 500
 figs_period: 1000
@@ -163,23 +163,23 @@ fwd_loss_coeffs:
   vg_by_condition: 0.0
   vg_lb: 0.0
   vg_lme: 0
-gradient_norm_clip: 1011.0
-grow_batch_size: false
+gradient_norm_clip: 2006.9
+grow_batch_size: true
 integrator:
-  T: 10
+  T: 25
   discretizer: uniform
   discretizer_max_ratio: 15
   max_traj_length: 60
   min_traj_length: 60
   traj_length_strategy: static
 load_weights_only: false
-lr_back: 0.0016
+lr_back: 0.0032
 lr_flow: 0.1
-lr_fused: 0.0016
-lr_policy: 0.0016
-lr_replay: 0.0016
+lr_fused: 0.0032
+lr_policy: 0.0032
+lr_replay: 0.0032
 lr_warmup_ratio: 100
-max_batch_size: 5662
+max_batch_size: 50000
 min_lr: 1.0e-06
 mle_min_rate: 0.05
 mle_slope_t: 2.0
@@ -308,7 +308,7 @@ replay_loss_coeffs:
   vg_lb: 0
   vg_lme: 0
 reuse_prior: false
-run_name: tw_T10_b5662
+run_name: tw_T25_lr32
 seed: 12345
 sg_conditioning: false
 space_groups:

@@ -23,7 +23,7 @@ batch_growth_interval: 50
 batch_growth_min_gain: 0.15
 batch_growth_slow_interval: 300
 batch_knee_recheck_steps: 2000
-batch_size: 2831
+batch_size: 1000
 buffer_device: cuda
 buffers:
   anchor_buffer:
@@ -164,7 +164,7 @@ fwd_loss_coeffs:
   vg_lb: 0.0
   vg_lme: 0
 gradient_norm_clip: 1011.0
-grow_batch_size: false
+grow_batch_size: true
 integrator:
   T: 10
   discretizer: uniform
@@ -179,7 +179,7 @@ lr_fused: 0.0016
 lr_policy: 0.0016
 lr_replay: 0.0016
 lr_warmup_ratio: 100
-max_batch_size: 2831
+max_batch_size: 50000
 min_lr: 1.0e-06
 mle_min_rate: 0.05
 mle_slope_t: 2.0

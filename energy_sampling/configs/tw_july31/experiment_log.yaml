@@ -5,7 +5,8 @@
   eval_T: 10
   W: 512
   lr_fused: 0.0008
-  batch_size: 2831
+  batch_size: 1000
+  batch_adaptive: true
   seed: 12345
   gradient_norm_clip: 1011.0
   clip_source: 3 x MEASURED median
@@ -21,7 +22,8 @@
   eval_T: 10
   W: 512
   lr_fused: 0.0016
-  batch_size: 2831
+  batch_size: 1000
+  batch_adaptive: true
   seed: 12345
   gradient_norm_clip: 1011.0
   clip_source: 3 x MEASURED median
@@ -37,7 +39,8 @@
   eval_T: 10
   W: 512
   lr_fused: 0.0032
-  batch_size: 2831
+  batch_size: 1000
+  batch_adaptive: true
   seed: 12345
   gradient_norm_clip: 1011.0
   clip_source: 3 x MEASURED median
@@ -53,7 +56,8 @@
   eval_T: 10
   W: 256
   lr_fused: 0.0016
-  batch_size: 2831
+  batch_size: 1000
+  batch_adaptive: true
   seed: 12345
   gradient_norm_clip: 714.9
   clip_source: 3 x MEASURED median
@@ -69,7 +73,8 @@
   eval_T: 10
   W: 1024
   lr_fused: 0.0008
-  batch_size: 2831
+  batch_size: 1000
+  batch_adaptive: true
   seed: 12345
   gradient_norm_clip: 1429.8
   clip_source: 3 x MEASURED median
@@ -85,7 +90,8 @@
   eval_T: 10
   W: 1024
   lr_fused: 0.0016
-  batch_size: 2831
+  batch_size: 1000
+  batch_adaptive: true
   seed: 12345
   gradient_norm_clip: 1429.8
   clip_source: 3 x MEASURED median
@@ -95,13 +101,15 @@
   recovery_inert: true
   from_scratch: true
 - index: 6
-  run_name: tw_T10_b1416
-  note: 'batch x0.5: noisier steps, more of them per unit time'
+  run_name: tw_T10_b_fixed1000
+  note: 'CRITICAL-BATCH CHECK: batch pinned at 1000 vs arm 1 adaptive. Matching per-step
+    progress => past the knee, so the postfix batch drift was benign'
   T: 10
   eval_T: 10
   W: 512
   lr_fused: 0.0016
-  batch_size: 1416
+  batch_size: 1000
+  batch_adaptive: false
   seed: 12345
   gradient_norm_clip: 1011.0
   clip_source: 3 x MEASURED median
@@ -111,17 +119,19 @@
   recovery_inert: true
   from_scratch: true
 - index: 7
-  run_name: tw_T10_b5662
-  note: 'batch x2: cleaner gradient, does it move k? (44gt5whr peaked 6357 at T=10)'
-  T: 10
-  eval_T: 10
+  run_name: tw_T25_lr32
+  note: 'T=25 third rung: brackets the T=25 ceiling as densely as T=10, which is what
+    the ceiling-vs-T exponent fit actually needs'
+  T: 25
+  eval_T: 25
   W: 512
-  lr_fused: 0.0016
-  batch_size: 5662
+  lr_fused: 0.0032
+  batch_size: 1000
+  batch_adaptive: true
   seed: 12345
-  gradient_norm_clip: 1011.0
-  clip_source: 3 x MEASURED median
-  cut_grad_abs: 10110.0
+  gradient_norm_clip: 2006.9
+  clip_source: 3 x INTERPOLATED median (T=25 unmeasured)
+  cut_grad_abs: 20069.0
   epochs: 100000
   decay_halflife_steps: 0
   recovery_inert: true
@@ -134,7 +144,8 @@
   eval_T: 10
   W: 512
   lr_fused: 0.0016
-  batch_size: 2831
+  batch_size: 1000
+  batch_adaptive: true
   seed: 12345
   gradient_norm_clip: 37.9
   clip_source: resolver value, A/B control leg (bars kept on the grid scale so the
@@ -151,7 +162,8 @@
   eval_T: 60
   W: 512
   lr_fused: 0.0004
-  batch_size: 2831
+  batch_size: 1000
+  batch_adaptive: true
   seed: 12345
   gradient_norm_clip: 3864.0
   clip_source: 3 x MEASURED median
@@ -167,7 +179,8 @@
   eval_T: 25
   W: 512
   lr_fused: 0.0008
-  batch_size: 2831
+  batch_size: 1000
+  batch_adaptive: true
   seed: 12345
   gradient_norm_clip: 2006.9
   clip_source: 3 x INTERPOLATED median (T=25 unmeasured)
@@ -183,7 +196,8 @@
   eval_T: 25
   W: 512
   lr_fused: 0.0016
-  batch_size: 2831
+  batch_size: 1000
+  batch_adaptive: true
   seed: 12345
   gradient_norm_clip: 2006.9
   clip_source: 3 x INTERPOLATED median (T=25 unmeasured)
@@ -199,7 +213,8 @@
   eval_T: 10
   W: 512
   lr_fused: 0.0064
-  batch_size: 2831
+  batch_size: 1000
+  batch_adaptive: true
   seed: 12345
   gradient_norm_clip: 1011.0
   clip_source: 3 x MEASURED median
@@ -215,7 +230,8 @@
   eval_T: 10
   W: 512
   lr_fused: 0.0016
-  batch_size: 2831
+  batch_size: 1000
+  batch_adaptive: true
   seed: 20260731
   gradient_norm_clip: 1011.0
   clip_source: 3 x MEASURED median
@@ -231,7 +247,8 @@
   eval_T: 60
   W: 512
   lr_fused: 0.0008
-  batch_size: 2831
+  batch_size: 1000
+  batch_adaptive: true
   seed: 12345
   gradient_norm_clip: 3864.0
   clip_source: 3 x MEASURED median
@@ -247,7 +264,8 @@
   eval_T: 10
   W: 256
   lr_fused: 0.0032
-  batch_size: 2831
+  batch_size: 1000
+  batch_adaptive: true
   seed: 12345
   gradient_norm_clip: 714.9
   clip_source: 3 x MEASURED median
