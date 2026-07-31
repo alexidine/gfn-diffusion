@@ -1,0 +1,258 @@
+- index: 0
+  run_name: tw_T10_lr08
+  note: 'T=10 ladder: 8e-4 (T=60 ceiling carried across unscaled)'
+  T: 10
+  eval_T: 10
+  W: 512
+  lr_fused: 0.0008
+  batch_size: 2831
+  seed: 12345
+  gradient_norm_clip: 1011.0
+  clip_source: 3 x MEASURED median
+  cut_grad_abs: 10110.0
+  epochs: 100000
+  decay_halflife_steps: 0
+  recovery_inert: true
+  from_scratch: true
+- index: 1
+  run_name: tw_T10_lr16
+  note: 'T=10 ladder: 1.6e-3. MID CELL -- reference for width/batch/clip blocks'
+  T: 10
+  eval_T: 10
+  W: 512
+  lr_fused: 0.0016
+  batch_size: 2831
+  seed: 12345
+  gradient_norm_clip: 1011.0
+  clip_source: 3 x MEASURED median
+  cut_grad_abs: 10110.0
+  epochs: 100000
+  decay_halflife_steps: 0
+  recovery_inert: true
+  from_scratch: true
+- index: 2
+  run_name: tw_T10_lr32
+  note: 'T=10 ladder: 3.2e-3, just above the lr~1/T prediction of 2.4e-3'
+  T: 10
+  eval_T: 10
+  W: 512
+  lr_fused: 0.0032
+  batch_size: 2831
+  seed: 12345
+  gradient_norm_clip: 1011.0
+  clip_source: 3 x MEASURED median
+  cut_grad_abs: 10110.0
+  epochs: 100000
+  decay_halflife_steps: 0
+  recovery_inert: true
+  from_scratch: true
+- index: 3
+  run_name: tw_T10_w256_lr16
+  note: width 256 at the mid rung; narrower should tolerate MORE LR
+  T: 10
+  eval_T: 10
+  W: 256
+  lr_fused: 0.0016
+  batch_size: 2831
+  seed: 12345
+  gradient_norm_clip: 714.9
+  clip_source: 3 x MEASURED median
+  cut_grad_abs: 7149.0
+  epochs: 100000
+  decay_halflife_steps: 0
+  recovery_inert: true
+  from_scratch: true
+- index: 4
+  run_name: tw_T10_w1024_lr08
+  note: width 1024, low rung -- the safe leg of the capacity pair
+  T: 10
+  eval_T: 10
+  W: 1024
+  lr_fused: 0.0008
+  batch_size: 2831
+  seed: 12345
+  gradient_norm_clip: 1429.8
+  clip_source: 3 x MEASURED median
+  cut_grad_abs: 14298.0
+  epochs: 100000
+  decay_halflife_steps: 0
+  recovery_inert: true
+  from_scratch: true
+- index: 5
+  run_name: tw_T10_w1024_lr16
+  note: width 1024, mid rung -- pairs with arm 4 so worse != detonated
+  T: 10
+  eval_T: 10
+  W: 1024
+  lr_fused: 0.0016
+  batch_size: 2831
+  seed: 12345
+  gradient_norm_clip: 1429.8
+  clip_source: 3 x MEASURED median
+  cut_grad_abs: 14298.0
+  epochs: 100000
+  decay_halflife_steps: 0
+  recovery_inert: true
+  from_scratch: true
+- index: 6
+  run_name: tw_T10_b1416
+  note: 'batch x0.5: noisier steps, more of them per unit time'
+  T: 10
+  eval_T: 10
+  W: 512
+  lr_fused: 0.0016
+  batch_size: 1416
+  seed: 12345
+  gradient_norm_clip: 1011.0
+  clip_source: 3 x MEASURED median
+  cut_grad_abs: 10110.0
+  epochs: 100000
+  decay_halflife_steps: 0
+  recovery_inert: true
+  from_scratch: true
+- index: 7
+  run_name: tw_T10_b5662
+  note: 'batch x2: cleaner gradient, does it move k? (44gt5whr peaked 6357 at T=10)'
+  T: 10
+  eval_T: 10
+  W: 512
+  lr_fused: 0.0016
+  batch_size: 5662
+  seed: 12345
+  gradient_norm_clip: 1011.0
+  clip_source: 3 x MEASURED median
+  cut_grad_abs: 10110.0
+  epochs: 100000
+  decay_halflife_steps: 0
+  recovery_inert: true
+  from_scratch: true
+- index: 8
+  run_name: tw_T10_clip_resolver
+  note: 'clip A/B control leg: resolver clip 37.9 = 100% saturation. Treatment = arm
+    1'
+  T: 10
+  eval_T: 10
+  W: 512
+  lr_fused: 0.0016
+  batch_size: 2831
+  seed: 12345
+  gradient_norm_clip: 37.9
+  clip_source: resolver value, A/B control leg (bars kept on the grid scale so the
+    clip is the only variable)
+  cut_grad_abs: 10110.0
+  epochs: 100000
+  decay_halflife_steps: 0
+  recovery_inert: true
+  from_scratch: true
+- index: 9
+  run_name: tw_T60_anchor
+  note: 'anchor to postfix_july30 lr8x: same T/W/LR, fixed batch + explicit bars'
+  T: 60
+  eval_T: 60
+  W: 512
+  lr_fused: 0.0004
+  batch_size: 2831
+  seed: 12345
+  gradient_norm_clip: 3864.0
+  clip_source: 3 x MEASURED median
+  cut_grad_abs: 38640.0
+  epochs: 100000
+  decay_halflife_steps: 0
+  recovery_inert: true
+  from_scratch: true
+- index: 10
+  run_name: tw_T25_lr08
+  note: 'T=25: 8e-4, just below the 1/T prediction of 9.6e-4'
+  T: 25
+  eval_T: 25
+  W: 512
+  lr_fused: 0.0008
+  batch_size: 2831
+  seed: 12345
+  gradient_norm_clip: 2006.9
+  clip_source: 3 x INTERPOLATED median (T=25 unmeasured)
+  cut_grad_abs: 20069.0
+  epochs: 100000
+  decay_halflife_steps: 0
+  recovery_inert: true
+  from_scratch: true
+- index: 11
+  run_name: tw_T25_lr16
+  note: 'T=25: 1.6e-3, above the 1/T prediction'
+  T: 25
+  eval_T: 25
+  W: 512
+  lr_fused: 0.0016
+  batch_size: 2831
+  seed: 12345
+  gradient_norm_clip: 2006.9
+  clip_source: 3 x INTERPOLATED median (T=25 unmeasured)
+  cut_grad_abs: 20069.0
+  epochs: 100000
+  decay_halflife_steps: 0
+  recovery_inert: true
+  from_scratch: true
+- index: 12
+  run_name: tw_T10_lr64
+  note: T=10 ladder insurance rung, in case 3.2e-3 rides
+  T: 10
+  eval_T: 10
+  W: 512
+  lr_fused: 0.0064
+  batch_size: 2831
+  seed: 12345
+  gradient_norm_clip: 1011.0
+  clip_source: 3 x MEASURED median
+  cut_grad_abs: 10110.0
+  epochs: 100000
+  decay_halflife_steps: 0
+  recovery_inert: true
+  from_scratch: true
+- index: 13
+  run_name: tw_T10_lr16_s2
+  note: 'seed replicate of arm 1: calibrates between-arm noise'
+  T: 10
+  eval_T: 10
+  W: 512
+  lr_fused: 0.0016
+  batch_size: 2831
+  seed: 20260731
+  gradient_norm_clip: 1011.0
+  clip_source: 3 x MEASURED median
+  cut_grad_abs: 10110.0
+  epochs: 100000
+  decay_halflife_steps: 0
+  recovery_inert: true
+  from_scratch: true
+- index: 14
+  run_name: tw_T60_lr08
+  note: 'T=60 at 8e-4 under the new bars: was lr16x fire physics or a 30x-clip bar?'
+  T: 60
+  eval_T: 60
+  W: 512
+  lr_fused: 0.0008
+  batch_size: 2831
+  seed: 12345
+  gradient_norm_clip: 3864.0
+  clip_source: 3 x MEASURED median
+  cut_grad_abs: 38640.0
+  epochs: 100000
+  decay_halflife_steps: 0
+  recovery_inert: true
+  from_scratch: true
+- index: 15
+  run_name: tw_T10_w256_lr32
+  note: width 256 at the high rung -- the "smaller and much faster" candidate
+  T: 10
+  eval_T: 10
+  W: 256
+  lr_fused: 0.0032
+  batch_size: 2831
+  seed: 12345
+  gradient_norm_clip: 714.9
+  clip_source: 3 x MEASURED median
+  cut_grad_abs: 7149.0
+  epochs: 100000
+  decay_halflife_steps: 0
+  recovery_inert: true
+  from_scratch: true

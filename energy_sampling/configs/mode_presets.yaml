@@ -78,13 +78,18 @@ conditional_toy:
   z_calibration.enabled: false  # machinery retired to hygiene duty after the 9x mean-pinned-Z falsification
 
 # --------------------------------------------------------------------------
-# conditional_toy PROTOCOL -- verbatim snapshot of mk_dev.yaml's protocol
-# block as of 2026-07-29, taken when mk_dev was rewired for the unconditional
-# ELJ periodic-fix test. Restore by copying `stages:` back under `protocol:`
+# conditional_toy PROTOCOL -- snapshot of mk_dev.yaml's protocol block as of
+# 2026-07-29, taken when mk_dev was rewired for the unconditional ELJ
+# periodic-fix test. Restore by copying `stages:` back under `protocol:`
 # (plus the mode keys above). The commented-out alternate routes that lived
 # alongside these stages (thermalize / z_match / terminal staged route,
 # archived anchor_seed+buildout localized route, equilibrate) are preserved in
 # mk_dev.yaml's git history and unchanged from it.
+#
+# ONE deviation from the 2026-07-29 snapshot, applied so this stays usable as a
+# restore template rather than only as an archive: the naive stage's bwd
+# balance metric is bwd/relative_under_wcen, not the bwd/relative_under it
+# carried on 07-29. The 07-29 reading is in git history.
 # --------------------------------------------------------------------------
 conditional_toy_protocol_2026_07_29:
   stages:
@@ -147,10 +152,15 @@ conditional_toy_protocol_2026_07_29:
       balance:
         kind: proportional
         pinned: { fwd: 0.4 }               # must equal fracs.fwd
-        metrics: { bwd: bwd/relative_under, replay: fwd/over_coverage }
+        metrics: { bwd: bwd/relative_under_wcen, replay: fwd/over_coverage }
         drive: relative
         # measured open-loop on zcdgtwfv (fixed mix, settled = last 40% of 3.7k steps):
         # bwd/relative_under 2.48-3.18, fwd/over_coverage 17.00-17.81
+        # bwd 5.0 is UNCALIBRATED for relative_under_wcen (2026-07-30 metric
+        # swap): it was set off relative_under, which carries a batch-
+        # composition offset the wcen form drops, so wcen reads lower by an
+        # unmeasured amount. Under drive: relative that pins the bwd drive at 0
+        # and the split at default_boost until the band is re-read.
         targets: { bwd: 5.0, replay: 15.0 }
         max_fracs: { replay: 0.2 }
         default_boost: { bwd: 0.94, replay: 0.06 }

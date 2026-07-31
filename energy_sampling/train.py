@@ -33,7 +33,7 @@ from energy_sampling.eval.utils import sample_eval_fwd_trajs
 from energy_sampling.utils import is_cuda_oom, \
     dict2namespace, \
     get_discretizer, drain_elapsed_times, MetricTracker, quick_tb_stats, uniform_discretizer, logmeanexp, \
-    cal_subtb_coef_matrix, within_condition_logw_std
+    cal_subtb_coef_matrix
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss, log_pf_estimate
 from models import GFN
 from energy_sampling.models.aunit_periodicity import sg_periodic_centroid_axes, describe
@@ -1506,6 +1506,15 @@ class Modeller:
                     metrics.update(self.evaluation(override_do_figs=self.stage_ctrl.get('request_eval', False)))
 
                 if len(metrics) > 0:
+                    # array-valued metrics ride the eval_period grid only, so their
+                    # wandb histogram-over-time panels get a uniform x-spacing --
+                    # the off-grid evals (step 50, and the stage-transition
+                    # request_eval pull-forwards) rendered the panels illegible.
+                    # Those steps still log all their scalars.
+                    if self.step_ind % self.args.eval_period != 0:
+                        metrics = {k: v for k, v in metrics.items()
+                                   if not (isinstance(v, wandb.Histogram)
+                                           or (isinstance(v, np.ndarray) and v.size > 1))}
                     wandb.log(metrics, step=self.step_ind, commit=True)
 
                 if self.step_ind % 50 == 0:  # save running model
@@ -2057,24 +2066,14 @@ class Modeller:
                       ['log_pf', 'log_pb', 'log_Z', 'log_r', 'losses', 'flow_states', 'resid', 'condition_id']})
         stats.update({'loss': sub_loss.cpu().detach().item()})
         stats.update({'log_Z_learned': loss_dict['log_Z'].cpu().mean().detach().item()})
-        # clean per-direction convergence signal: quick_tb_stats' 'logw_std' is
-        # BATCH-WIDE, dominated by between-condition log Z(c) spread at scale and
-        # a misleading VarGrad convergence signal. logw_std_within removes that,
-        # measuring only the within-condition spread VarGrad reduces. Omitted
-        # (not logged) on batches with no multi-member condition group -- nan --
-        # so metric_tracker never sees a spurious value.
-        cid = loss_dict.get('condition_id')
-        if cid is not None:
-            within = within_condition_logw_std(
-                loss_dict['log_pf'], loss_dict['log_pb'], loss_dict['log_r'], cid)
-            if math.isfinite(within):
-                stats['logw_std_within'] = within
-            # NB the conditional CALIBRATION metrics (cond_tb_err / tb_err_worst /
-            # z_grad_worst) come straight out of quick_tb_stats above, which does
-            # its own condition grouping -- they need no branch here because they
-            # are defined on unconditional batches too (one group). Only
-            # logw_std_within is conditional-only: a within-group spread is
-            # undefined without groups.
+        # NB the condition-aware metrics -- 'logw_std_within' (the clean
+        # per-direction convergence signal, vs the batch-wide 'logw_std' that
+        # between-condition log Z(c) spread dominates at scale) and the
+        # calibration family (cond_tb_err / tb_err_worst / z_grad_worst) -- all
+        # come straight out of quick_tb_stats above off the condition_id passed
+        # in, so there is no branch here. See its docstring for which of them
+        # degrade to their pooled counterparts on an unconditional batch and
+        # which (only logw_std_within) are omitted outright.
         # box containment on the TRAIN-step cadence. 'Mean bounding_energy' exists
         # already but is EVAL-cadence (log_thermo_properties loops the eval batch),
         # far too coarse to gate a controller on: in 1219ddv9 boundary drift led the
@@ -2219,7 +2218,9 @@ class Modeller:
         - 'pooled': |EMA fwd/tb_resid_clipped| -- zero when the pooled batch
                     is level; blind to per-condition disagreement that cancels
         Expected steps per train step = min(gain * (sensor/threshold - 1),
-        max_steps_per_step), Bernoulli on the fractional part. Frequency-
+        max_steps_per_step), Bernoulli on the fractional part, then cut short
+        by the early-out once a rollout's own fresh first-order reading falls
+        under threshold * grace (rollout mode only -- see the loop). Frequency-
         modulated, never size-modulated: every step taken is an ordinary Adam
         step at the live flow LR, so there is no discontinuous re-level.
 
@@ -2268,12 +2269,39 @@ class Modeller:
         n = int(p)
         if torch.rand(()).item() < p - n:
             n += 1
+        # ARM off the EMA'd sensor above, DISARM off each rollout's OWN fresh
+        # first-order reading: the sensor is a smoothed decision to start, the
+        # early-out is an unsmoothed measurement of whether there is anything
+        # left to do. The two cannot be the same reading -- calibration steps
+        # deliberately don't feed the rolling metrics (see _z_rollout_step), so
+        # a loop keyed on the EMA never observes its own effect and always runs
+        # to n. grace < 1 keeps arm and disarm from chattering across the bar.
+        #
+        # The fresh reading is single-batch and therefore noisy (SE ~ beta /
+        # sqrt(batch)), but it does not need to be precise: the tick re-fires
+        # every train step, so breaking one step early costs a re-entry and
+        # breaking one step late costs one Adam step at lr_flow. Averaging
+        # across the tick's steps would be WORSE -- Z moves between them, so
+        # the mean is biased toward the pre-catch-up level and would overshoot.
+        grace = float(getattr(cfg, 'grace', 0.8))
+        bar = threshold * grace
         for _ in range(n):
-            ok = (self._z_rollout_step(owner, cfg) if mode == 'rollout'
-                  else self._z_calibration_step(owner, cfg))
+            if mode == 'rollout':
+                ok, fresh = self._z_rollout_step(owner, cfg)
+            else:
+                ok, fresh = self._z_calibration_step(owner, cfg), None
             if not ok:
                 break
             rep['z_cal/steps'] = rep.get('z_cal/steps', 0) + 1
+            if fresh is not None:
+                rep['z_cal/fresh'] = fresh
+                if fresh <= bar:
+                    # Z is already inside the bar at the level this step STARTED
+                    # from, so the step just taken was the last one worth paying
+                    # for. Stale-EMA overshoot costs 1 rollout/train step here
+                    # instead of max_steps_per_step of them.
+                    rep['z_cal/early_out'] = rep.get('z_cal/early_out', 0) + 1
+                    break
 
     def _z_rollout_step(self, owner, cfg):
         """
@@ -2286,17 +2314,50 @@ class Modeller:
         loss), so persistent per-condition evidence accrues at the
         calibration rate for free.
 
-        Deliberately NO replay-buffer intake and no rolling-metric updates:
-        this is a measurement/update instrument, and coupling it to buffer
-        churn would confound its first live test (churn accounting is batch-
-        keyed; see the churn_batch_ref episode).
+        DOES feed replay-buffer intake, one manage_replay_buffer call per
+        calibration step (see the REVISIT note below). Still no rolling-metric
+        updates: fwd/* drives the balance controller and must stay a reading of
+        the TRAIN batch stream, not of an instrument that fires at its own rate.
+
+        REVISIT -- accepted cost of per-step churn. Policy: a reward call is the
+        expensive thing (dominant on real energy models), so a rollout that has
+        already paid for one should never be discarded unconsidered. The cost is
+        that churn_rate is a per-CALL budget, so intake multiplies by the number
+        of calibration steps in the tick: a saturated tick admits up to
+        (1 + max_steps_per_step) * churn_rate in one train step instead of
+        churn_rate, transiently compressing buffer turnover (max_size /
+        churn_rate) by the same factor. Bounded in practice -- calibration only
+        fires above the sensor threshold and the early-out ends the tick as soon
+        as Z is back inside the bar, so saturation needs a sustained excursion --
+        but unbounded in principle. Watch replay_buffer_admitted / the TTL-cohort
+        tallies per eval. If the buffer starts reading as one-instant:
+          1. Pool candidates across the tick's rollouts + the train step's own
+             fwd batch into ONE manage call at the normal churn_rate. Keeps every
+             sample eligible at unchanged intake, and the draw gets MORE
+             selective (50 from ~8k rather than from ~1k). NB admit_temperature
+             was tuned against a ~1k pool, so revisit T alongside it.
+          2. These rollouts fire exactly when Z is off, so their residuals carry
+             a level offset that admission (scored on |resid|) reads as badness;
+             init_loss = |resid| then keeps those rows alive longer through
+             purge. Scoring on |resid - mean(resid)| makes admission measure
+             per-sample miscalibration instead of the batch's Z offset, the same
+             level-free logic as relative_under.
+        Also note return_exp=True below is a D2H copy of the crystal batch per
+        calibration rollout -- the price of admission, literally.
 
         The first call verifies the gradient really is confined to flow_model
         params and raises otherwise -- the freeze_policy contract this step
         leans on, checked once at runtime rather than trusted silently.
 
-        Returns False (skip the tick's remaining steps) on rollout error or a
-        graph-free loss; never touches batch-size machinery.
+        Returns (ok, fresh) where `fresh` is |mean clip(resid, +/-beta)| on this
+        rollout's own batch -- the loss's first-order condition in Z, at the Z
+        level this step STARTED from (the update lands after it is read, so it
+        lags the post-step state by one). It is clipped at the SAME beta this
+        step's loss uses, including the 1e6 substituted under `unclipped`, so
+        sensor and actuator share a fixed point by construction rather than by
+        a config invariant someone has to remember. Consumed by
+        z_calibration_tick's early-out. `fresh` is None when ok is False.
+        Never touches batch-size machinery.
         """
         coeffs = copy.deepcopy(self.args.fwd_loss_coeffs)
         coeffs.freeze_policy = 1.0
@@ -2316,19 +2377,37 @@ class Modeller:
         saved = self.args.fwd_loss_coeffs
         self.args.fwd_loss_coeffs = coeffs
         try:
-            loss, _ = self.fwd_train_step(
+            # report_losses=True for the early-out reading below and for the
+            # churn call's fwd_stats; return_exp=True for the crystal batch the
+            # buffer stores (a D2H copy -- see the REVISIT note).
+            loss, crystal_batch, loss_dict = self.fwd_train_step(
                 get_discretizer(self.args.integrator),
-                return_exp=False,
+                return_exp=True,
                 repeats=self.mode_repeats('fwd'),
-                report_losses=False)
+                report_losses=True)
         except (RuntimeError, ValueError):
             self._z_cal_report['z_cal/rollout_errors'] = (
                 self._z_cal_report.get('z_cal/rollout_errors', 0) + 1)
-            return False
+            return False, None
         finally:
             self.args.fwd_loss_coeffs = saved
+
+        # churn BEFORE the requires_grad bail: the reward call is paid either
+        # way, and these samples are on-policy regardless of whether this step
+        # can train Z. Everything the buffer reads is already detached.
+        if loss_dict is not None and self.protocol.flag('buffers_active'):
+            self.manage_replay_buffer(loss_dict, crystal_batch)
+        del crystal_batch
+
         if not loss.requires_grad:
-            return False  # e.g. a stage running fwd freeze_z: nothing trains Z
+            return False, None  # e.g. a stage running fwd freeze_z: nothing trains Z
+
+        fresh = None
+        if loss_dict is not None:
+            with torch.no_grad():
+                resid = ((loss_dict['log_pf'] + loss_dict['log_Z'])
+                         - (loss_dict['log_pb'] + loss_dict['log_r']))
+                fresh = float(resid.clamp(-coeffs.beta, coeffs.beta).mean().abs())
         owner.zero_grad(set_to_none=True)
         loss.backward()
         if not getattr(self, '_z_rollout_grads_verified', False):
@@ -2345,7 +2424,7 @@ class Modeller:
         owner.step()
         owner.zero_grad(set_to_none=True)
         self._z_cal_report['z_cal/rollout_loss'] = float(loss.detach().cpu())
-        return True
+        return True, fresh
 
     def _z_calibration_step(self, owner, cfg):
         """
@@ -2777,27 +2856,20 @@ class Modeller:
         return pooled
 
     def _eval_conditional_stats(self, stats):
-        """quick_tb_stats plus the condition-aware metrics (_update_rolling's set)
-        for a pooled EVAL batch. log_metrics runs quick_tb_stats on the eval streams
-        without a condition axis, which omits logw_std_within -- exactly the kind of
-        metric a conditional generalization check turns on -- so it is computed here
-        for train and held-out alike, off the same code path, to keep the comparison
-        like-for-like."""
+        """quick_tb_stats over a pooled EVAL batch's accumulated tensors, with the
+        condition axis wired through (and the protocol's worst_quantile), so the
+        held-out comparison in log_test_metrics runs off the same code path as the
+        train-condition one and stays like-for-like."""
         log_pf = stats['log_pfs'].sum(-1)
         log_pb = stats['log_pbs'].sum(-1)
         log_z = stats['log_Z_learned']
         log_r = stats['log_r']
         cid = stats.get('condition_id')
-        out = quick_tb_stats(log_pf, log_pb, log_z, log_r,
-                             clip_beta=getattr(self.args.fwd_loss_coeffs, 'beta', None),
-                             condition_id=cid,
-                             worst_quantile=self.args.conditional_worst_quantile,
-                             **self._reward_ramp_kwargs(cid))
-        if cid is not None:
-            within = within_condition_logw_std(log_pf, log_pb, log_r, cid)
-            if math.isfinite(within):
-                out['logw_std_within'] = within
-        return out
+        return quick_tb_stats(log_pf, log_pb, log_z, log_r,
+                              clip_beta=getattr(self.args.fwd_loss_coeffs, 'beta', None),
+                              condition_id=cid,
+                              worst_quantile=self.args.conditional_worst_quantile,
+                              **self._reward_ramp_kwargs(cid))
 
     @torch.no_grad()
     def log_test_metrics(self, eval_discretizer, fwd_stats):

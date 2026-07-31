@@ -137,7 +137,15 @@ _LR_ANCHORS = {            # peak LR at the anchor; scaled x T_REF/T, W-flat
 }
 _CLIP_ANCHOR = 250.0
 _GRAD_MEDIAN = {10: 1.0e3, 25: 6.6e3, 100: 1.7e4}  # empirical pre-clip grad medians (mipcas)
-_CUT_GRAD_OVER_CLIP = 30.0
+# NB this composes with _CLIP_ANCHOR: cut_grad_abs = _CUT_GRAD_OVER_CLIP *
+# _CLIP_ANCHOR * grad_median(T)/_GRAD_MEDIAN[T_REF], so the bar sits at
+# (_CUT_GRAD_OVER_CLIP * 250/6600) x grad_median(T) at EVERY T and W. At the old
+# value of 30 that is 1.14x the tabulated median -- a "parameter thrash" bar
+# barely above the typical gradient. 44gt5whr's only fire was 1288 vs a bar of
+# 1136 (13% over) on a run whose pre-clip median ran ~300-350, and it cost a
+# permanent 2x LR cut for 17k steps. 100 puts the bar at ~3.8x the tabulated
+# median. Raise the pair together, never one alone.
+_CUT_GRAD_OVER_CLIP = 100.0
 _RESET_OVER_CUT = 10.0
 
 
@@ -1337,6 +1345,25 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=N
     same metric names carry the same meaning on conditional and unconditional
     runs, so protocol rules need no per-problem rewriting.
 
+    'logw_std_within' is the pooled WITHIN-condition std of log w: the
+    batch-wide 'logw_std' with the between-condition component removed. That
+    between-condition part -- the spread of the per-condition Jensen means /
+    log Z(c) -- dominates the plain batch-wide std whenever the condition set
+    is large and dissimilar (hundreds of nats over a broad library; ~365 nats
+    between just two conditions in the 2-cond toy), and it is NOT what
+    condition-grouped VarGrad reduces. So 'logw_std' is a misleading
+    convergence signal at scale (it barely moves as VarGrad works, and RISES
+    when conditions are made more dissimilar); this is the quantity VarGrad
+    actually optimizes. Unlike the control family above it is conditional-ONLY
+    and is the one metric here that can be absent: with condition_id=None the
+    single group spans the batch and it would merely duplicate 'logw_std', and
+    only multi-member groups carry signal -- a singleton's deviation from its
+    own mean is trivially 0, so singletons are masked out of numerator and
+    denominator rather than diluting the estimate with zeros. When no group has
+    >= 2 members (e.g. a forward batch drawn with repeats == 1 over a large
+    library) the key is OMITTED rather than reported as nan or 0, so neither
+    MetricTracker nor a raw wandb.log ever sees a spurious value.
+
     'relative_under' is the under_coverage computation re-centered on THIS
     batch's own empirical normalizer (z_jensen = mean log w) instead of
     log_Z. The collective level gap (learned Z vs buffer-implied Z) is not
@@ -1352,7 +1379,7 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=N
 
     condition_id, when given, re-centers relative_under's z_jensen PER
     CONDITION (each sample against its own condition's group mean of log_w,
-    same scatter-mean pattern as within_condition_logw_std / cond_tb_err)
+    same scatter-mean pattern as logw_std_within / cond_tb_err)
     instead of the single batch-wide pooled z_jensen. A pooled z_jensen mixes
     conditions with different true log Z into one mean, which is not any
     condition's own normalizer -- cazwlyy1: bwd's per-condition log_Z_learned
@@ -1362,6 +1389,24 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=N
     the old pooled behavior exactly (unconditional callers unaffected). The
     reported 'jensen_z'/'z_gap' metrics stay pooled either way -- only
     relative_under's own centering changes.
+
+    'relative_under_wcen' is relative_under with that centre computed under the
+    SAME reward-ramp weights the RMS uses, instead of unweighted. As written,
+    relative_under scores only ramp-qualifying samples but centres on all of
+    them, so the two halves run over different populations and the number
+    inherits a floor from BATCH COMPOSITION: a bwd batch that is a fraction f
+    of low-reward prior-buffer draws sitting Delta below the anchor-sourced
+    material puts the centre at mu_scored - f*Delta, and every scored sample
+    picks up that offset before the one-sided clamp (~f*Delta of apparent
+    under-coverage with a perfectly fit scored population). f is a buffer knob
+    -- anchor top-up rate, churn, weighted_bwd_beta, purge -- so the metric is
+    not comparable across a run whose mix drifts, and the phase-3 controller
+    that keys backward allocation on it also moves the mix that sets it.
+    Weighting the centre removes f from both sides. Keep BOTH: their gap is the
+    composition reading (large gap == the batch is mostly material the ramp
+    scores at ~0), and 'ramp_ess_frac' says how many samples the weighted
+    centre is actually averaging. Identical to relative_under by construction
+    when the ramp is unconfigured (uniform weights).
     """
     x = (log_pb + log_r).detach()
     y = (log_pf + log_Z).detach()
@@ -1385,14 +1430,15 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=N
             0, inverse, torch.ones_like(log_w))
         group_sum = torch.zeros(k, device=log_w.device, dtype=log_w.dtype).scatter_add_(
             0, inverse, log_w)
-        z_jensen_ref = (group_sum / counts.clamp(min=1))[inverse]  # each sample's OWN condition's Jensen mean
+        z_jensen_g = group_sum / counts.clamp(min=1)  # per-condition Jensen mean
     else:
-        z_jensen_ref = z_jensen  # scalar broadcasts -- old pooled behavior
         # ONE group covering the batch: the conditional metrics below then
         # reduce exactly to their pooled counterparts (see docstring)
         inverse = torch.zeros_like(resid, dtype=torch.long)
         counts = torch.full((1,), float(resid.numel()), device=resid.device, dtype=resid.dtype)
         k = 1
+        z_jensen_g = z_jensen.reshape(1)  # old pooled behavior
+    z_jensen_ref = z_jensen_g[inverse]  # each sample's OWN group's Jensen mean
 
     # TB residual skew
     resid_c = (resid)  # center it on zero
@@ -1429,6 +1475,47 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=N
     else:
         relative_under = neg_rel.pow(2).mean().sqrt().item()
 
+    # relative_under_wcen: relative_under with the CENTERING moved onto the same
+    # reward-ramp weights the RMS already uses (per group, so the per-condition
+    # re-centering above is preserved). 'relative_under' centers on the
+    # UNWEIGHTED group mean of log_w while scoring only ramp-qualifying samples,
+    # so the two are computed over different populations: a bwd batch mixing
+    # low-reward prior-buffer draws (ramp weight ~0, low log_w) with anchor-
+    # sourced states (weight 1, high log_w) has its reference dragged down by
+    # material that contributes nothing to the numerator. Writing that mixture
+    # as a fraction f of junk sitting Delta below the scored population,
+    #     z_ref = mu_scored - f*Delta,
+    # every scored sample picks up a +f*Delta offset before the one-sided
+    # clamp, so relative_under carries a floor of ~f*Delta set purely by batch
+    # composition -- a buffer/controller quantity (anchor top-up rate, churn,
+    # weighted_bwd_beta) rather than a policy one. Weighting the centre makes
+    # the junk drop out of numerator and reference alike, leaving the spread
+    # among the samples the ramp says matter.
+    #
+    # This is NOT a strictly-better restatement: the junk/anchor gap Delta is a
+    # real level-free defect (P_F over-weighting junk relative to anchors) that
+    # backward training can fix. 'relative_under' keeps that in and so moves
+    # with the buffer mix; this one takes it out and so is comparable across a
+    # drifting mix. Both are reported -- their GAP is the composition reading.
+    #
+    # With no ramp configured the weights are uniform and the two are identical
+    # by construction, so the pre-anchor warmup is unaffected. Groups where no
+    # sample clears the floor fall back to the unweighted group mean (those
+    # samples carry weight 0 and contribute nothing regardless).
+    if reward_floor is not None and ramp_width is not None:
+        if total > 0:
+            wsum_g = torch.zeros(k, device=log_w.device, dtype=log_w.dtype).scatter_add_(
+                0, inverse, w_raw)
+            wdot_g = torch.zeros(k, device=log_w.device, dtype=log_w.dtype).scatter_add_(
+                0, inverse, w_raw * log_w)
+            z_wcen_g = torch.where(wsum_g > 0, wdot_g / wsum_g.clamp_min(1e-12), z_jensen_g)
+            neg_rel_w = (z_wcen_g[inverse] - log_w).clamp(max=0)
+            relative_under_wcen = ((w_raw / total) * neg_rel_w.pow(2)).sum().sqrt().item()
+        else:
+            relative_under_wcen = float('nan')
+    else:
+        relative_under_wcen = relative_under  # uniform weights => identical centre
+
     log_ess = 2 * torch.logsumexp(log_w, dim=0) - torch.logsumexp(2 * log_w, dim=0)
     ess_frac = torch.exp(log_ess - np.log(log_w.shape[0]))
     mets = {
@@ -1443,6 +1530,7 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=N
         'under_coverage': under_severity,
         'under_coverage_uniform': under_severity_uniform,
         'relative_under': relative_under,
+        'relative_under_wcen': relative_under_wcen,
         'over_coverage': over_severity,
         'z_gap': (z_emp - z_jensen).item(),
         'resid_p05': resid.detach().quantile(0.05).item(),
@@ -1453,6 +1541,18 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=N
         "logw_std": log_w.std(unbiased=False).item(),
         "ess_frac": ess_frac.item(),
     }
+
+    if reward_floor is not None and ramp_width is not None:
+        # Kish ESS of the reward-ramp weights as a fraction of the batch:
+        # (sum w)^2 / (n * sum w^2). relative_under_wcen's centre is a weighted
+        # mean over exactly this population, so a small value means a noisy
+        # centre -- read it before trusting either reward-weighted metric as a
+        # controller input. 0.0 when nothing cleared the floor (the same batch
+        # that sends under_coverage/relative_under* to nan). Omitted, not 1.0,
+        # when the ramp is unconfigured, so 'ramp is off' and 'ramp is wide
+        # enough to score everything' stay distinguishable.
+        mets['ramp_ess_frac'] = (total.pow(2) / w_raw.pow(2).sum().clamp_min(1e-12)
+                                 / w_raw.numel()).item()
 
     # --- the control-metric family (see docstring): per-condition RMS residual
     # and per-condition clipped signed mean, reduced to a worst-case quantile
@@ -1478,45 +1578,17 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=N
             0, inverse, clipped) / counts.clamp(min=1)
         mets['z_grad_worst'] = torch.quantile(cond_z_grad.abs(), q_hi).item()
 
+    # within-condition spread of log w (see docstring): each sample centered on
+    # its OWN condition's Jensen mean, which z_jensen_ref already is on this
+    # branch, so this reuses the grouping above rather than repeating the
+    # scatter. Conditional-only and singleton-masked -- key omitted, not nan.
+    if condition_id is not None:
+        multi = counts[inverse] >= 2
+        if bool(multi.any()):
+            centered_w = (log_w - z_jensen_ref)[multi]
+            mets['logw_std_within'] = centered_w.pow(2).mean().sqrt().item()
+
     return mets
-
-
-def within_condition_logw_std(log_pf, log_pb, log_r, condition_id):
-    """
-    Pooled WITHIN-condition std of log w = log_r + log_pb - log_pf: the
-    batch-wide logw_std (quick_tb_stats) with the between-condition component
-    removed. That between-condition part -- the spread of the per-condition
-    Jensen means / log Z(c) -- dominates the plain batch-wide std whenever the
-    condition set is large and dissimilar (hundreds of nats over a broad
-    library; recall ~365 nats between just two conditions in the 2-cond toy),
-    and it is NOT what condition-grouped VarGrad reduces. So the batch-wide
-    logw_std is a misleading convergence signal at scale (it barely moves as
-    VarGrad works, and rises when conditions are made more dissimilar);
-    THIS is the quantity VarGrad actually optimizes.
-
-    Each sample is centered on its own condition's group mean before the RMS.
-    Only multi-member groups contribute -- a singleton's deviation from its own
-    mean is trivially 0 and carries no within-condition signal, so it's masked
-    out of both numerator and denominator rather than diluting the estimate
-    with zeros. Returns nan when no group in the batch has >= 2 members (e.g. a
-    forward batch drawn with repeats == 1 over a large library, where every
-    condition appears once); callers must treat nan as "no signal this batch",
-    NOT as zero.
-    """
-    log_w = (log_r + log_pb - log_pf).detach().flatten()
-    cid = condition_id.detach().flatten().to(log_w.device)
-    uniq, inverse = torch.unique(cid, return_inverse=True)
-    k = uniq.numel()
-    counts = torch.zeros(k, device=log_w.device, dtype=log_w.dtype).scatter_add_(
-        0, inverse, torch.ones_like(log_w))
-    group_sum = torch.zeros(k, device=log_w.device, dtype=log_w.dtype).scatter_add_(
-        0, inverse, log_w)
-    group_mean = group_sum / counts.clamp(min=1)
-    centered = log_w - group_mean[inverse]
-    multi = counts[inverse] >= 2  # only samples in >=2-member groups carry signal
-    if not bool(multi.any()):
-        return float('nan')
-    return centered[multi].pow(2).mean().sqrt().item()
 
 
 def online_tb_coverage(log_pf, log_pb, log_Z, log_r, log_w_clamp=10.0):

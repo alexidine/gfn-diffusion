@@ -332,6 +332,19 @@ class LRController:
         frac = float(self._cfg('recovery_target_frac', 0.0))
         if frac <= 0 or self._last_fire_step is None or self._fire_cut_factor is None:
             return
+        # A cut lands at cut_ratio x the pre-fire factor, and the recovery target
+        # is frac x that SAME factor -- so frac <= cut_ratio means the cut always
+        # lands at or below the target and the `>=` below returns immediately.
+        # Recovery is then dead code for every FIRST fire in a stage, silently,
+        # which is what shipped (both were 0.5). Warn once rather than let a
+        # whole subsystem be disabled by an unremarkable-looking coefficient.
+        ratio = float(self._cfg('cut_ratio', 0.5))
+        if frac <= ratio and not getattr(self, '_recovery_inert_warned', False):
+            self._recovery_inert_warned = True
+            print(f"lr_ctrl WARNING: recovery_target_frac ({frac}) <= cut_ratio "
+                  f"({ratio}) -- recovery can never raise the cut factor, so the "
+                  f"recovery_wait/recovery_ramp/AIMD path is inert. Set "
+                  f"recovery_target_frac > cut_ratio to enable it.")
         target = min(1.0, frac * self._fire_cut_factor)
         if self._cut_factor >= target:
             return

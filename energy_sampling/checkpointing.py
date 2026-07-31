@@ -29,6 +29,9 @@ MODELLER_STATE_DEFAULTS = {
     # streaks ride in this same dict -- re-fires the transition through the
     # normal eval -> maybe_advance path. Reset at every stage transition.
     'stage_ctrl': fresh_stage_ctrl(),
+    # restored, but never above the current config's max_batch_size, and not at
+    # all when that config pins the batch (grow_batch_size: false) -- see
+    # Checkpointer.reconcile_batch_size
     'batch_size': 1,
     # jump-mode growth (batch_growth_interval > 0): step of the last size jump
     # (or OOM cut), so the growth clock survives resume
@@ -104,6 +107,43 @@ class Checkpointer:
         m = self.modeller
         for k, default in MODELLER_STATE_DEFAULTS.items():
             setattr(m, k, state[k] if k in state else deepcopy(default))
+        self.reconcile_batch_size()
+
+    def reconcile_batch_size(self):
+        """
+        Give the current config's batch settings authority over the restored ones.
+
+        batch_size and its growth bookkeeping are run state, so a resume used to
+        inherit whatever size the checkpoint had grown to and ignore both
+        `batch_size:` and `max_batch_size:` outright: increment_batch_size only
+        ever moves the size UP, and it returns early once the restored size is
+        already at or above the ceiling, so nothing ever pulled an oversized
+        batch back down. Run p307hzip resumed with `batch_size: 1000` +
+        `max_batch_size: 1000` and trained at 2831, silently.
+
+        With growth ON the checkpoint's size is legitimate run state, so it is
+        kept - just clamped to this config's ceiling. With growth OFF the
+        config's batch_size is an explicit pin, so it is restored verbatim and
+        the growth clock / OOM history go with it: they exist only to pace
+        growth that can no longer happen, and carrying an old cooldown or
+        ever_oomed flag into a pinned run just leaves stale state lying around.
+        The OOM path is untouched either way - handle_oom still cuts and re-arms
+        them if the configured size turns out not to fit.
+        """
+        m = self.modeller
+        args = m.args
+        restored = m.batch_size
+        grow = bool(getattr(args, 'grow_batch_size', True))
+        if not grow:
+            m.batch_size = int(args.batch_size)
+            m.batch_size_last_grow = 0
+            m.batch_size_ever_oomed = False
+            m.batch_size_cooldown_until = -1
+        m.batch_size = min(m.batch_size, int(args.max_batch_size))
+        if m.batch_size != restored:
+            print(f"batch_size: checkpoint restored {restored} -> using {m.batch_size} "
+                  f"(config batch_size={args.batch_size}, max_batch_size={args.max_batch_size}, "
+                  f"grow_batch_size={grow})")
 
     def path_for(self, tag: str) -> str:
         m = self.modeller
