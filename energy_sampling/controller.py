@@ -113,6 +113,51 @@ class LRController:
         self._pre_trigger_cold = True  # was there a >= recovery_wait cold gap before this tick's readings
         self._fire_cut_factor = None
         self._recovery_anchor = None
+        self._report_bars()
+
+    def _report_bars(self):
+        """Print the grad tripwires in CLIP-RELATIVE units at construction, and
+        hard-check their ordering.
+
+        Motivation, and its limit. tw_july31 raised gradient_norm_clip 8.5x and
+        cut/reset_grad_abs 2.8x over postfix_july30, and its arm 14 then
+        detonated at pre-clip grad norm 154,299 -- above that battery's cut bar
+        (38,640) but below its reset bar (386,400). Cut-tier only means no
+        rewind, the cut tier latches, the metric never recrosses so recovery
+        never starts, and the run parks forever. That is exactly the 'sustained
+        simmer between the bars' this class's docstring warns about.
+
+        What this check does NOT do is claim a calibrated ceiling, because the
+        battery does not support one: postfix_july30 and tw_july31 ran the SAME
+        reset/cut ratio of 10x, so no ratio rule separates them, and in
+        clip-relative terms the battery's bars were TIGHTER (10x/100x the clip
+        vs 30x/300x), not looser. The absolute level is what moved. So this
+        prints rather than prescribes -- the bars become visible at launch
+        instead of being buried in a generated yaml -- and the real backstop
+        for the simmer case is train.py's _frozen_training_state, which keys on
+        non-recovery rather than on level and so needs no calibration at all.
+        """
+        cut = self._cfg('cut_grad_abs', None)
+        reset = self._cfg('reset_grad_abs', None)
+        clip = getattr(self.modeller.args, 'gradient_norm_clip', None)
+        if cut is None or reset is None:
+            return
+        cut, reset = float(cut), float(reset)
+        if reset <= cut:
+            raise ValueError(
+                f"adaptive_lr.reset_grad_abs ({reset:g}) must exceed cut_grad_abs "
+                f"({cut:g}): the reset tier is the escalation tier, and inverting "
+                f"them makes every explosion a cut-only fire with no rewind.")
+        rel = ""
+        if clip:
+            clip = float(clip)
+            rel = (f"  |  in clip units: clip={clip:g}, cut={cut / clip:.0f}x, "
+                   f"reset={reset / clip:.0f}x")
+            if cut <= clip:
+                print(f"lr_ctrl WARNING: cut_grad_abs ({cut:g}) is at or below "
+                      f"gradient_norm_clip ({clip:g}) -- every clipped step is a "
+                      f"fire, so the cut tier will chatter.")
+        print(f"lr_ctrl bars: cut_grad_abs={cut:g} reset_grad_abs={reset:g}{rel}")
 
     @property
     def enabled(self):

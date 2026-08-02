@@ -56,6 +56,14 @@ BULKY_ATTR_EXCLUDE_KEYS = ('fingerprint', 'rdf')
 CHURNED_BUFFER_EXCLUDE_KEYS = ('symmetry_operators', 'smiles', 'identifier') + BULKY_ATTR_EXCLUDE_KEYS
 
 
+class FrozenTrainingState(RuntimeError):
+    """Raised by _frozen_training_state: the run is saturated and emitting
+    identical numbers, so its remaining wall clock is waste. Named distinctly
+    so a log sweep can tell it apart from a KeyboardInterrupt (a manual kill,
+    not a crash -- the replay_july26 postmortem lesson) and from an ordinary
+    exception."""
+
+
 def safe_histogram(data, num_bins=32):
     """
     wandb.Histogram that tolerates degenerate input. numpy's histogram raises
@@ -146,9 +154,13 @@ class Modeller:
         # replay churn tallied across every manage_replay_buffer call (train
         # steps and eval alike), drained and logged once per eval in log_metrics
         self.replay_churn = {'admitted': 0, 'evicted': 0, 'reward_rejected': 0}
-        # TTL-cohort tallies (see manage_replay_buffer's eviction split):
-        # drained and logged once per eval alongside replay_churn
-        self.replay_cohort = {'absorbed': 0, 'expired': 0, 'expired_undrawn': 0,
+        # eviction-cause tallies (see manage_replay_buffer's eviction split):
+        # drained and logged once per eval alongside replay_churn. 'expired*'
+        # keys now carry the HAZARD (random-eviction) cohort -- the unbiased
+        # readout of the live population -- while 'stalled'/'backstop' count
+        # the two targeted causes.
+        self.replay_cohort = {'absorbed': 0, 'stalled': 0, 'backstop': 0,
+                              'expired': 0, 'expired_undrawn': 0,
                               'expired_drawn': 0, 'expired_draws_sum': 0,
                               'expired_delta_sum': 0.0, 'expired_delta_n': 0}
         # prior_buffer churn decomposed by admission SOURCE, tallied across every
@@ -1565,18 +1577,105 @@ class Modeller:
         excursion, so nothing here leads; it is a terminal-state detector, and the
         actuator is a rewind, not a nudge.
 
-        Reads 'fwd' only: bwd/replay share the same policy network, so a genuine
-        policy blowup shows up here regardless of which branch is stepping.
+        Scans whichever branches are LIVE, in fwd -> replay -> bwd priority,
+        and trips on the first one that reads. bwd/replay share the same policy
+        network as fwd, so a genuine policy blowup shows up on any of them --
+        the original 'fwd only' read was correct for a fused stage but silently
+        inert in phase 1, which runs no forward branch at all. tw_july31 lost 8
+        of 16 arms to that hole: they detonated inside phase 1 (grad norm to
+        1.5e5-4.9e9, bwd/mle to +3e3) and then sat emitting bitwise-identical
+        numbers for up to 56k steps, ~68 GPU-hours, with this detector reading
+        an empty 'fwd' slot the whole time. quick_tb_stats and the
+        flow_states block in _update_rolling both run per branch, so
+        bwd/logw_std and bwd/box_violation are already populated every step in
+        phase 1 -- nothing new has to be computed, the detector just has to
+        look. Per-step is also strictly better than the eval-cadence
+        eval_fwd/* mirror of these same quantities (500x coarser, and
+        1219ddv9's warning window was shorter than one eval interval).
+
+        The bounds are calibrated on fwd's observed healthy range. bwd's is
+        not independently established -- these are 20x above anything
+        legitimate on fwd, so they should be loose enough to be safe on any
+        branch, but a bwd-side false negative is likelier than a false positive.
         """
         t = self.metric_tracker
         bounds = (('logw_std', getattr(self.args, 'terminal_logw_std', 1000.0)),
                   ('box_violation', getattr(self.args, 'terminal_box_violation', 1.0)))
-        for name, bound in bounds:
-            v = t.get('fwd', name)
-            if v is None or bound is None:
-                continue
-            if not math.isfinite(v) or v > bound:
-                return f"fwd/{name}={v:.4g} (bound {bound:g})"
+        for direction in ('fwd', 'replay', 'bwd'):
+            for name, bound in bounds:
+                v = t.get(direction, name)
+                if v is None or bound is None:
+                    continue
+                if not math.isfinite(v) or v > bound:
+                    return f"{direction}/{name}={v:.4g} (bound {bound:g})"
+        return None
+
+    def _frozen_training_state(self, current_loss):
+        """
+        Stuck-run detector: the training signal has stopped changing at all.
+
+        Distinct from both _terminal_policy_state (absolute bounds on sample
+        statistics) and the LRController tripwires (absolute bounds on loss /
+        grad norm), and necessary because NEITHER separates the two populations
+        that matter. Across tw_july31 essentially every arm -- including ones
+        that went on to train perfectly well -- threw transient pre-clip grad
+        norms above 1e4. Spike MAGNITUDE does not predict death; failure to
+        RECOVER does. No level bar can split those, because they overlap in
+        level: the same 1.5e5 reading was survivable in one arm and terminal in
+        another.
+
+        What a dead run does that a live one never does is repeat itself
+        exactly. Once the policy saturates (model_clipping / gfn_clip pins the
+        outputs) the gradient stops depending on the batch, so the pre-clip
+        grad norm goes bitwise constant: arm 14 held 154298.8 for 27,600
+        consecutive steps, arm 4 held 4890569728.0 for 56,500.
+
+        Keyed on grad norm ALONE, deliberately. The batch loss is NOT a usable
+        channel: it keeps jittering in its low digits after death because the
+        batch still changes (arm 14's bwd/tb_err wandered over 3226.67-3226.97
+        the whole time it was dead), so pairing it with the grad norm just
+        resets the clock forever and catches nothing -- which is exactly how
+        the first cut of this detector missed all 8 real detonations. Measured
+        over the post-detonation tail of every tw_july31 arm, the separation on
+        grad norm alone is total:
+
+          8 dead arms     longest identical run = 1052-1800 samples (the whole
+                          tail), relative spread exactly 0
+          4 healthy arms  longest identical run = 1, relative spread 1.9-17.2
+
+        A live run never repeats this value even once, so 2000 consecutive
+        identical readings cannot happen by chance and the patience is a
+        formality rather than a tuned threshold. Raw per-step only, never an
+        EMA -- an EMA of a live signal also settles and would false-positive on
+        a converged run.
+
+        Deliberately fires an ABORT, not a rewind. The reset tier already
+        offers a rewind and it demonstrably did not rescue these runs (arm 4
+        crossed reset_grad_abs at step ~1500 and stayed dead through 58k). A
+        run in this state is not recoverable in-place and its remaining wall
+        clock is pure waste; the useful action is to free the GPU and say so
+        loudly.
+        """
+        patience = int(getattr(self.args, 'terminal_frozen_steps', 2000) or 0)
+        if patience <= 0:
+            return None
+        g = getattr(self, 'last_grad_norm_pre_clip', None)
+        # a missing or non-finite reading is not evidence of freezing: the
+        # non-finite case is already the reset tier's business, and treating
+        # either as "unchanged" would let a gap in the signal age the clock.
+        if g is None or not math.isfinite(float(g)):
+            self._frozen_sig = None
+            self._frozen_since = self.step_ind
+            return None
+        g = float(g)
+        if g == getattr(self, '_frozen_sig', None):
+            start = getattr(self, '_frozen_since', self.step_ind)
+            if self.step_ind - start >= patience:
+                return (f"grad_norm_pre_clip={g:.10g} bitwise unchanged for "
+                        f"{self.step_ind - start} steps (patience {patience})")
+        else:
+            self._frozen_sig = g
+            self._frozen_since = self.step_ind
         return None
 
     def monitor_losses(self, current_loss, step_type):
@@ -1590,6 +1689,23 @@ class Modeller:
             # it was never gated on that flag even in the old design.
             trig = self.lr_controller.check_spike(
                 step_type, current_loss, getattr(self, 'last_grad_norm_pre_clip', None))
+
+            # checked BEFORE the rewind tiers: a frozen run is past the point
+            # where a rewind helps (arm 4 of tw_july31 crossed reset_grad_abs
+            # at ~1500 and was still dead at 58k), and firing one first would
+            # only reset the signature and restart the patience clock.
+            frozen = self._frozen_training_state(current_loss)
+            if frozen is not None:
+                msg = (f"FROZEN training state at step {self.step_ind}: {frozen}. "
+                       f"The policy is saturated and this run cannot recover -- "
+                       f"aborting so the GPU is released.")
+                print(msg)
+                try:
+                    wandb.log({'frozen_abort_step': self.step_ind}, commit=True)
+                    wandb.run.summary['frozen_abort'] = frozen
+                except Exception:
+                    pass
+                raise FrozenTrainingState(msg)
 
             terminal = self._terminal_policy_state()
             if terminal is not None:
@@ -3349,7 +3465,29 @@ class Modeller:
                 'replay_buffer_step_hist': safe_histogram(self.replay_buffer.select_counts.cpu().numpy()),
                 'replay_buffer_mean_age': replay_age.mean().item(),
                 'replay_buffer_max_age': replay_age.max().item() if replay_age.numel() > 0 else 0.0,
+                # WIDTH of the residence distribution, not its centre: this is
+                # the quantity that governs how much the policy->buffer->
+                # gradient path lowpasses itself, and mean/max say nothing
+                # about it. A hard age cap gives a ~uniform age profile, CV
+                # ~0.58; memoryless eviction gives exponential residence,
+                # CV ~1. Watch this rise when max_residence_steps is retired.
+                'replay_buffer_age_cv': (
+                    (replay_age.std(unbiased=False) / replay_age.mean().clamp(min=1e-6)).item()
+                    if replay_age.numel() > 1 else 0.0),
             })
+            # LIVE improvement-since-admission, over rows drawn at least once.
+            # The expired_delta below only sees rows on their way out; this is
+            # the standing population, and it is what says whether the buffer
+            # is full of rows still being incorporated (negative) or of
+            # unincorporable ones (>= 0). stalled_frac is the acted-on slice of
+            # this same distribution.
+            live_delta = (self.replay_buffer.ema_loss - self.replay_buffer.birth_loss)
+            live_delta = live_delta[(self.replay_buffer.select_counts > 0)
+                                    & torch.isfinite(live_delta)]
+            if live_delta.numel() > 0:
+                metrics['replay_buffer_live_delta_mean'] = live_delta.mean().item()
+                metrics['replay_buffer_live_delta_stalled_frac'] = (
+                    (live_delta >= 0).float().mean().item())
             if hasattr(self, '_replay_admit_cap'):
                 metrics['replay_buffer_admit_cap'] = self._replay_admit_cap
                 metrics['replay_buffer_admit_health'] = self._replay_admit_health
@@ -3374,26 +3512,36 @@ class Modeller:
             for key in self.replay_churn:
                 self.replay_churn[key] = 0
 
-            # TTL-cohort readouts (see manage_replay_buffer's tally comments):
-            # absorbed_frac = of rows resolved this window (corrected below the
-            # floor OR expired), the fraction replay finished before the clock
-            # -- the direct "is the TTL long enough for the supersampling rate"
-            # signal. expired_undrawn_frac = expiries that never got a single
-            # draw (wasted slots: buffer oversized or replay share too low).
-            # expired_delta = mean death-minus-birth |resid| over drawn
-            # expiries (negative = partial progress on the rows replay didn't
-            # finish). expired_draws = mean draws those rows received.
+            # Eviction-cause readouts (see manage_replay_buffer's tally
+            # comments). The *_frac keys are shares of everything evicted this
+            # window and are the primary diagnostic: under the old hard TTL
+            # absorbed_frac read 0.000 while age silently did 100% of eviction,
+            # which is precisely the failure that was invisible without this
+            # split. absorbed = corrected below the floor (replay finished the
+            # row); stalled = drawn >= toxic_min_draws with no improvement
+            # since admission (unincorporable); backstop = hit the absolute age
+            # ceiling, which should stay NEAR ZERO -- a non-trivial backstop
+            # share means tau is set too long for the intake rate. hazard =
+            # ordinary memoryless turnover and should dominate.
+            # expired_* keys describe the hazard cohort: expired_undrawn_frac =
+            # evicted without a single draw (wasted slots), expired_delta =
+            # mean death-minus-birth |resid| (negative = the live population is
+            # being incorporated), expired_draws = draws received.
             coh = self.replay_cohort
-            resolved = coh['absorbed'] + coh['expired']
+            resolved = coh['absorbed'] + coh['stalled'] + coh['backstop'] + coh['expired']
             if resolved > 0:
                 metrics['replay_buffer_absorbed_frac'] = coh['absorbed'] / resolved
+                metrics['replay_buffer_stalled_frac'] = coh['stalled'] / resolved
+                metrics['replay_buffer_backstop_frac'] = coh['backstop'] / resolved
+                metrics['replay_buffer_hazard_frac'] = coh['expired'] / resolved
             if coh['expired'] > 0:
                 metrics['replay_buffer_expired_undrawn_frac'] = coh['expired_undrawn'] / coh['expired']
             if coh['expired_delta_n'] > 0:
                 metrics['replay_buffer_expired_delta'] = coh['expired_delta_sum'] / coh['expired_delta_n']
             if coh['expired_drawn'] > 0:
                 metrics['replay_buffer_expired_draws'] = coh['expired_draws_sum'] / coh['expired_drawn']
-            self.replay_cohort = {'absorbed': 0, 'expired': 0, 'expired_undrawn': 0,
+            self.replay_cohort = {'absorbed': 0, 'stalled': 0, 'backstop': 0,
+                                  'expired': 0, 'expired_undrawn': 0,
                                   'expired_drawn': 0, 'expired_draws_sum': 0,
                                   'expired_delta_sum': 0.0, 'expired_delta_n': 0}
 
@@ -4429,17 +4577,83 @@ class Modeller:
         ema = self.replay_buffer.ema_loss
         n = len(self.replay_buffer)
 
-        # --- unconditional eviction: strictly overfit incumbents (ema below
-        # floor -- resid corrected toward zero) plus rows past the residence
-        # ceiling. This is the buffer's primary turnover mechanism: "any one
-        # row should be meaningless" is enforced by age, not by a separate
-        # random-churn pass -- see docstring ---
+        # --- unconditional eviction, four causes. None of them shapes the BULK
+        # of the age distribution, which is the whole point:
+        #   floor    -- overfit incumbents (ema corrected below the floor)
+        #   stalled  -- drawn often enough to carry a real signal and NOT
+        #               improving since admission. A direct test of "can this
+        #               row ever be incorporated", which is what the old
+        #               max_residence_steps TTL was only a proxy for. Fires at
+        #               any age, so genuinely dead rows leave FASTER than a
+        #               250-step clock, and live ones are not culled at all.
+        #   hazard   -- memoryless residence: evict n/tau rows per call drawn
+        #               uniformly at random, giving exponential residence with
+        #               mean tau. Keeps the buffer's lag distribution WIDE
+        #               (CV ~1 vs ~0.58 for a hard cap). A wide lag is a strong
+        #               lowpass on the policy->buffer->gradient path; a hard
+        #               age cap instead produces a uniform age profile with a
+        #               sharp edge, which concentrates phase lag at one
+        #               frequency. Exponential decay is also what "any one row
+        #               should be meaningless" actually asks for -- a hard cap
+        #               gives a FLAT reservoir, not a decaying one.
+        #   backstop -- absolute ceiling at backstop_mult * tau, binding on
+        #               ~exp(-backstop_mult) of rows: bounds worst-case
+        #               staleness without reshaping the bulk. Safety limits go
+        #               where they do not bind; a gradient acting on the bulk
+        #               is a change of policy, not a safety limit.
+        # Why the TTL had to go: displacement purge below is a softmax on LOW
+        # ema_loss, so it protects high-|resid| rows BY CONSTRUCTION, and the
+        # TTL was the only thing removing them -- on a clock, regardless of
+        # progress. Measured expired_delta ran -12..-28 nats across the
+        # postfix_july30 arms, i.e. it was culling the informative tail
+        # mid-learning, and absorbed_frac was 0.000 (age was doing 100% of
+        # eviction). The stalled test keeps that tail while it is still moving
+        # and drops it the moment it stops.
+        # Occupancy is emergent (Little's law: n = admit_rate * tau) and
+        # max_size is a memory guard, not a target -- an under-full buffer
+        # means intake is low, which is the correct response to not having
+        # enough bad samples, not a quota to pad. Unlike the TTL this cannot
+        # zero the buffer during a replay-dormant stage: eviction is
+        # proportional to n, so occupancy decays toward the intake equilibrium
+        # instead of falling off a cliff at a fixed age (the tsched_july24
+        # failure the supply-side pacing note above describes).
+        # NB the hazard budget is per manage CALL, the same convention
+        # churn_rate already uses, so both scale together with call frequency.
+        if getattr(rb_cfg, 'max_residence_steps', None) is not None:
+            raise ValueError(
+                "buffers.replay_buffer.max_residence_steps is retired -- the hard age "
+                "cap was doing 100% of eviction and culling the improving tail. Replace "
+                "it with mean_residence_steps (memoryless hazard) + toxic_min_draws "
+                "(stalled-row eviction); backstop_mult defaults to 5. Sizing is now "
+                "Little's law: occupancy = churn_rate * mean_residence_steps.")
+
         floor_mask = ema < floor
+        age = self.step_ind - self.replay_buffer.birth_step
+
+        stalled_mask = torch.zeros_like(floor_mask)
+        min_draws = int(getattr(rb_cfg, 'toxic_min_draws', 0) or 0)
+        if min_draws > 0:
+            delta_thresh = float(getattr(rb_cfg, 'toxic_delta_threshold', 0.0))
+            delta = ema - self.replay_buffer.birth_loss
+            stalled_mask = ((self.replay_buffer.select_counts >= min_draws)
+                            & torch.isfinite(delta) & (delta >= delta_thresh))
+
+        tau = float(getattr(rb_cfg, 'mean_residence_steps', 0) or 0)
         expired_mask = torch.zeros_like(floor_mask)
-        max_residence = int(getattr(rb_cfg, 'max_residence_steps', 0) or 0)
-        if max_residence > 0:
-            expired_mask = (self.step_ind - self.replay_buffer.birth_step) > max_residence
-        toxic_mask = floor_mask | expired_mask
+        hazard_mask = torch.zeros_like(floor_mask)
+        if tau > 0:
+            backstop = int(tau * float(getattr(rb_cfg, 'backstop_mult', 5.0)))
+            if backstop > 0:
+                expired_mask = age > backstop
+            # hazard draws only from rows no other cause already claimed, so
+            # the per-call budget is not silently spent on rows that were
+            # leaving anyway
+            surv = torch.argwhere(~(floor_mask | stalled_mask | expired_mask)).flatten()
+            n_hazard = int(round(surv.numel() / tau))
+            if n_hazard > 0:
+                hazard_mask[surv[torch.randperm(surv.numel())[:n_hazard]]] = True
+
+        toxic_mask = floor_mask | stalled_mask | expired_mask | hazard_mask
         toxic = torch.argwhere(toxic_mask).flatten()
 
         # --- TTL-cohort telemetry, tallied by eviction CAUSE. Floor eviction =
@@ -4452,7 +4666,17 @@ class Modeller:
         # touches drawn rows), so deltas are only defined on the drawn subset;
         # undrawn expiries are counted separately as wasted slots.
         self.replay_cohort['absorbed'] += int(floor_mask.sum())
-        expired_only = expired_mask & ~floor_mask
+        self.replay_cohort['stalled'] += int((stalled_mask & ~floor_mask).sum())
+        self.replay_cohort['backstop'] += int(
+            (expired_mask & ~(floor_mask | stalled_mask)).sum())
+        # Death-vs-birth deltas are now tallied on the HAZARD cohort. Random
+        # eviction is independent of the loss value AND of age, so it is the
+        # one exit carrying no selection bias in either direction -- it reads
+        # the live population. The old TTL cohort was exogenous to the loss but
+        # NOT to age, so it over-sampled exactly the long-lived high-|resid|
+        # rows the displacement softmax protects, which is what made the -28
+        # nat delta ambiguous between "learning" and "survivor composition".
+        expired_only = hazard_mask
         n_expired = int(expired_only.sum())
         if n_expired > 0:
             counts = self.replay_buffer.select_counts[expired_only]

@@ -410,9 +410,10 @@ buffers:
   # samples so they can later be exactly replayed (get_traj_replay) during the "replay"
   # training step
   replay_buffer:
-    churn_rate: 20  # softmax-drawn admission attempts budgeted per manage call; SUPPLY-side
+    churn_rate: 80  # softmax-drawn admission attempts budgeted per manage call; SUPPLY-side
     max_size: 4000  # if too big or slow to churn it becomes a lagging indicator
-    max_residence_steps: 250  # hard age eviction (train steps), 0 disables. MUST STAY ABOVE the occupancy cliff max_size/churn_rate (= 200) or TTL becomes the BINDING constraint and the buffer turns into a pure delay line (hhg6ux10)
+    mean_residence_steps: 50  # memoryless hazard; occupancy = churn_rate * this (Little's law)
+    toxic_min_draws: 20        # backstop only: at ~0.14 draws/row/step and tau=50, ~6% of rows reach it
     admit_temperature: 2.0  # softmax T (nats) over clipped |resid| (admission) / ema_loss (purge); fixed. replay_july26/tsched_july24: T 2 beat T 5, T 20 diverged
     admit_cap_max: 30.0  # admission/purge score clip (nats) when fwd/scatter_err == 0
     admit_cap_min: 8.0  # score clip (nats) as fwd/scatter_err -> inf
