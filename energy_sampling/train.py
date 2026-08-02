@@ -1659,6 +1659,30 @@ class Modeller:
         patience = int(getattr(self.args, 'terminal_frozen_steps', 2000) or 0)
         if patience <= 0:
             return None
+
+        # CHANNEL 1 -- every gradient non-finite. Measured live on the abort
+        # test (jgyk2lzl): after detonation gradnorm/nonfinite_steps pinned at
+        # 10-per-10-steps, i.e. EVERY step hit the non-finite return, skipped
+        # the optimizer, and left last_grad_norm_pre_clip stale at its last
+        # finite value (71587416.0). The run made exactly zero progress while
+        # still inflating (terminal_var 5.9 -> 37.1 over 70 steps).
+        #
+        # This channel exists because the stale value makes channel 2 fire for
+        # the WRONG REASON and ~200x too late: a constant-because-stale reading
+        # is indistinguishable from a constant-because-saturated one, and the
+        # patience clock has to run out either way. Zero finite gradients over
+        # a few hundred steps is already conclusive -- nothing downstream can
+        # act on a gradient that never arrives. Note the non-finite guard in
+        # channel 2 is unreachable for the same reason: last_grad_norm_pre_clip
+        # is only ever ASSIGNED a finite value.
+        streak_bar = max(200, patience // 10)
+        streak = int(getattr(self, '_grad_nonfinite_streak', 0) or 0)
+        if streak >= streak_bar:
+            return (f"{streak} consecutive non-finite gradients "
+                    f"(bar {streak_bar}); no optimizer step has landed since "
+                    f"step {self.step_ind - streak}")
+
+        # CHANNEL 2 -- saturated policy: finite but bitwise-constant grad norm.
         g = getattr(self, 'last_grad_norm_pre_clip', None)
         # a missing or non-finite reading is not evidence of freezing: the
         # non-finite case is already the reset tier's business, and treating
@@ -1785,9 +1809,56 @@ class Modeller:
         """
         if terminal:
             self.terminal_reloads += 1
-        print("Firing LR spike & recovery"
+        # ALL rewinds, both tiers. terminal_reloads counts only the
+        # _terminal_policy_state kind, so it cannot see a reset-tier rewind
+        # loop -- which is the one actually observed (aug02 arm
+        # a2_T25_lr16_tight / d7z705wc: 6 grad-norm + 5 bwd-loss fires, every
+        # one reset-tier, rewinding to 'best' each time).
+        self.total_reloads = getattr(self, 'total_reloads', 0) + 1
+        cap = int(getattr(self.args, 'max_reloads', 8) or 0)
+        if cap > 0 and self.total_reloads > cap:
+            # A rewind restores healthy WEIGHTS but not a survivable LR. Under
+            # cut_ratio 1.0 (configs/aug02 holds LRs live) on_explosion is a
+            # no-op and the terminal ratchet's cut_ratio**count is 1, so the
+            # run rewinds, re-detonates at the same LR, and repeats forever --
+            # never dying, never recovering, holding a GPU indefinitely. N
+            # rewinds without recovery IS the unrecoverable signal; the frozen
+            # detector cannot see it because the grad norm keeps CHANGING
+            # (2471 -> 1.3e5 -> 4.2e6 -> 9.2e7 on that arm).
+            msg = (f"UNRECOVERABLE at step {self.step_ind}: {self.total_reloads} rewinds "
+                   f"(cap {cap}) and the run keeps re-detonating -- rewinding restores "
+                   f"weights but not a survivable LR. Aborting so the GPU is released.")
+            print(msg)
+            try:
+                wandb.run.summary['unrecoverable_abort'] = msg
+            except Exception:
+                pass
+            raise FrozenTrainingState(msg)
+        print(f"Firing LR spike & recovery (rewind #{self.total_reloads})"
               + (f" (TERMINAL rewind #{self.terminal_reloads})" if terminal else ""))
         running_checkpoint_path = self._rewind_checkpoint_path()
+        if not (running_checkpoint_path and os.path.exists(running_checkpoint_path)):
+            # NO REWIND TARGET. Previously this fell straight through to
+            # on_explosion in silence, which is how the abort test (jgyk2lzl)
+            # detonated and then ran on with no brake whatsoever: the run had a
+            # fresh run_name so no '<prefix>_best.pt' existed yet, and with
+            # cut_ratio 1.0 the LR cut below is a no-op too. Reset-tier fire,
+            # rewind unavailable, cut disabled == nothing happened.
+            #
+            # This is reachable in normal use: 'best' is only written once an
+            # eval has improved, so any detonation inside the first eval_period
+            # of a from-scratch run lands here. Say so LOUDLY, and force a real
+            # cut regardless of cut_ratio -- an arm deliberately holding its LR
+            # live (see configs/aug02) still must not be left with zero brakes
+            # on a confirmed explosion. The arm's LR ladder reading is void the
+            # moment it detonates, so overriding the held LR costs nothing.
+            print(f"lr_ctrl WARNING: reset-tier fire at step {self.step_ind} but NO rewind "
+                  f"target exists (looked for {running_checkpoint_path}). Cannot restore "
+                  f"healthy weights; forcing an LR cut instead. If this run holds its LR "
+                  f"live (cut_ratio >= 1), that hold is now overridden.")
+            self.lr_controller.on_explosion(
+                count=self.terminal_reloads if terminal else 1, force_ratio=0.5)
+            return
         if running_checkpoint_path and os.path.exists(running_checkpoint_path):
             self.checkpointer.load_model_only(running_checkpoint_path,
                                               load_optimizers=True)
@@ -2040,6 +2111,9 @@ class Modeller:
         # run's whole purpose, and its frozen counter would otherwise pin the
         # %10 gate open or shut forever.
         for sub_type, (sub_loss, loss_dict, trained) in sub_losses.items():
+            # unconditional, ahead of the %10 gate: the probe's whole purpose is
+            # to sample faster than that gate allows (no-op unless armed)
+            self._per_step_probe(loss_dict, sub_type)
             if trained:
                 count = getattr(self, f'{sub_type}_step_count') + 1
                 setattr(self, f'{sub_type}_step_count', count)
@@ -2171,6 +2245,83 @@ class Modeller:
 
         return None
 
+    def _per_step_probe(self, loss_dict, sub_type):
+        """EVERY-STEP capture of the flat-direction coordinates, for the one
+        test that the ordinary 1-in-10 logging cannot do.
+
+        [[flat-direction-limit-cycle-phase2]] leaves one degeneracy open: every
+        scalar is logged 1-in-10, and a true ~2.004-step mode (edge-of-stability
+        period 2) sampled at that cadence aliases to a clean ~550-step
+        sinusoid, which is exactly what the ripple looks like. A lag problem and
+        a curvature problem want opposite fixes, so this has to be settled
+        before any mechanism work. The discriminator is the lag-1
+        autocorrelation of the DETRENDED per-step series:
+
+            true ~550-step mode  -> rho_1 close to +1
+            aliased 2-step mode  -> rho_1 close to -1
+
+        Off unless per_step_probe_steps > 0, and it captures a bounded window
+        (start at the first step taken, run for N steps, dump, stop) so it can
+        never grow without limit on a long run. Cost while armed is two
+        reductions over flow_states -- the same ones _update_rolling already
+        does -- which is negligible against a rollout.
+
+        Deliberately raw per-step values, no EMA and no tracker: the tracker is
+        an EMA whose smoothing is precisely what would destroy a 2-step mode.
+        """
+        n = int(getattr(self.args, 'per_step_probe_steps', 0) or 0)
+        if n <= 0 or sub_type != 'fwd':
+            return
+        buf = getattr(self, '_probe_buf', None)
+        if buf is None:
+            buf = self._probe_buf = []
+            self._probe_start = self.step_ind
+        if self.step_ind - self._probe_start >= n:
+            return
+        states = loss_dict.get('flow_states')
+        if states is None or states.ndim != 3:
+            return
+        # CALIBRATION PANEL, not just the variance coordinates. The first probe
+        # run (vlqklgmy) captured step_var/terminal_var only and came back
+        # near-white at T=10 -- but [[flat-direction-limit-cycle-phase2]] already
+        # says that at T=10 the ~120 step-dims are ~6x stiffer, the noise budget
+        # cannot move, and the mode surfaces in slope_err/intercept_err instead.
+        # So that null was measured on an observable predicted to be quiet.
+        # These come from the same quick_tb_stats _update_rolling uses; one extra
+        # call per step while armed is cheap against a rollout.
+        cal = {}
+        try:
+            cal = quick_tb_stats(
+                loss_dict['log_pf'], loss_dict['log_pb'],
+                loss_dict['log_Z'], loss_dict['log_r'],
+                clip_beta=getattr(getattr(self.args, f'{sub_type}_loss_coeffs'),
+                                  'beta', None),
+                condition_id=loss_dict.get('condition_id'),
+                worst_quantile=self.args.conditional_worst_quantile,
+                **self._reward_ramp_kwargs(loss_dict.get('condition_id')))
+        except Exception:
+            pass  # a diagnostic probe must never be able to kill a run
+        row = [float(self.step_ind),
+               float(states[:, -1].var(dim=0).mean()),
+               float((states[:, 1:] - states[:, :-1]).pow(2).mean())
+               if states.shape[1] > 1 else float('nan'),
+               float(getattr(self, 'last_grad_norm_pre_clip', float('nan')) or float('nan')),
+               float(cal.get('slope_err', float('nan'))),
+               float(cal.get('intercept_err', float('nan'))),
+               float(cal.get('scatter_err', float('nan'))),
+               float(cal.get('tb_err', float('nan')))]
+        buf.append(row)
+        if self.step_ind - self._probe_start == n - 1:
+            import numpy as _np
+            path = os.path.join(self.args.checkpoints_dir,
+                                f'per_step_probe_{self.args.run_name}.npz')
+            arr = _np.asarray(buf, dtype=float)
+            _np.savez(path, probe=arr,
+                      columns=_np.array(['step', 'terminal_var', 'step_var',
+                                         'grad_norm_pre_clip', 'slope_err',
+                                         'intercept_err', 'scatter_err', 'tb_err']))
+            print(f"per-step probe: wrote {arr.shape[0]} rows to {path}")
+
     def _update_rolling(self, loss_dict, sub_loss, sub_type):
         stats = quick_tb_stats(loss_dict['log_pf'], loss_dict['log_pb'],
                                loss_dict['log_Z'], loss_dict['log_r'],
@@ -2277,7 +2428,15 @@ class Modeller:
         if not math.isfinite(pre_clip):
             print(f"Non-finite gradient at {self.step_ind}")
             self._grad_nonfinite += 1  # drained into gradnorm/nonfinite_steps
+            # CONSECUTIVE streak, deliberately NOT drained by the reporter:
+            # every non-finite step returns here without stepping the optimizer
+            # AND without updating last_grad_norm_pre_clip, so a run in this
+            # state makes literally zero progress while presenting a STALE
+            # finite grad norm to every downstream check. Fed to
+            # _frozen_training_state as its own channel.
+            self._grad_nonfinite_streak = getattr(self, '_grad_nonfinite_streak', 0) + 1
             return  # skip non-finite
+        self._grad_nonfinite_streak = 0  # a finite gradient landed: streak broken
         # raw (pre-clip) global grad norm, for reading how hard the clip binds:
         # persistently >> gradient_norm_clip means every step is rescaled and
         # Adam is effectively running on normalized gradients

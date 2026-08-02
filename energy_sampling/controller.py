@@ -243,16 +243,23 @@ class LRController:
             self._channel_cooldown_until[f'{name}_loss'] = step + cooldown
         self._channel_cooldown_until['grad_norm'] = step + cooldown
 
-    def on_explosion(self, count: int = 1):
+    def on_explosion(self, count: int = 1, force_ratio: float = None):
         """Cut hook, called for BOTH tiers (cut tier directly from
         monitor_losses; reset tier after fire_loss_spike's rewind). Multiplies
         the instance-held cut factor by cut_ratio**count -- count > 1 only
         from repeated TERMINAL rewinds (train.py terminal_reloads), which
         compound so the ceiling actually descends across policy deaths.
         Being instance state, the factor survives the rewind that typically
-        precedes this call."""
+        precedes this call.
+
+        force_ratio overrides the configured cut_ratio for ONE call. Its only
+        caller is fire_loss_spike's no-rewind-target path: a config running
+        cut_ratio 1.0 to hold an LR live (configs/aug02) has deliberately
+        disabled this hook, which is fine while the rewind still works and
+        catastrophic when it does not -- reset fire + no target + no cut leaves
+        a detonated run with nothing at all stopping it."""
         m = self.modeller
-        ratio = float(self._cfg('cut_ratio', 0.5))
+        ratio = float(self._cfg('cut_ratio', 0.5) if force_ratio is None else force_ratio)
         floor = m.args.min_lr / m.args.lr_policy
         # fire memory for the recovery ramp: the cut factor RUNNING at the
         # START of a fire episode is the measured ceiling. An episode begins

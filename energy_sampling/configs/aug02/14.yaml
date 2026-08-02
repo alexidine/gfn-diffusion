@@ -76,8 +76,9 @@ buffers:
     admit_reward_min: -600
     admit_temperature: 2.0
     churn_rate: 50
-    max_residence_steps: 250
     max_size: 10000
+    mean_residence_steps: 200
+    toxic_min_draws: 80
 bwd_loss_coeffs:
   beta: 10.0
   db: 0.0

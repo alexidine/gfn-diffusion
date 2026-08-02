@@ -114,6 +114,77 @@ def load_parent():
         return yaml.safe_load(f)
 
 
+def modernize_buffers(cfg):
+    """The tw_july31 parent predates the replay-buffer TTL retirement, and
+    train.py:4781 HARD-FAILS on the old key at the first fused step -- i.e. at
+    the phase 1 -> 2 transition, hours in, after phase 1 has already been paid
+    for. The first aug02 launch lost arms exactly that way.
+
+        max_residence_steps (hard age cap, retired)
+          -> mean_residence_steps (memoryless hazard) + toxic_min_draws
+
+    Sizing is Little's law, as the error message instructs:
+    occupancy = churn_rate * mean_residence_steps. This grid runs churn_rate 50
+    and max_size 10000, so 200 keeps the buffer at its intended full occupancy
+    (and sits near the old 250 hard cap). toxic_min_draws is scaled from
+    mk_dev's 20-at-tau-50 by the same 4x, since a row accumulates draws for 4x
+    longer before natural eviction -- DERIVED, not measured; if the backstop
+    turns out to bite too rarely, that is the knob.
+    """
+    rb = cfg.get('buffers', {}).get('replay_buffer')
+    if rb is None:
+        return cfg
+    if 'max_residence_steps' in rb:
+        churn = float(rb.get('churn_rate', 50))
+        size = float(rb.get('max_size', 10000))
+        rb.pop('max_residence_steps')
+        rb['mean_residence_steps'] = int(round(size / max(churn, 1e-9)))
+        rb['toxic_min_draws'] = 80
+    return cfg
+
+
+RETIRED_KEYS = ('max_residence_steps',)
+
+
+def check_schema(cfg, reference=OUTDIR.parent / 'mk_dev.yaml'):
+    """Fail LOUDLY at generation time on schema drift from the parent.
+
+    Two checks. First, any key train.py is known to reject outright. Second,
+    a diff of the buffers/* key sets against mk_dev.yaml -- the user's own
+    config, which by construction tracks whatever the code currently accepts.
+    Generating from an older battery's yaml is convenient and is exactly how a
+    retired key reaches the cluster; the parent is a snapshot, mk_dev is live.
+    """
+    flat = []
+
+    def walk(d, path=''):
+        for k, v in (d or {}).items():
+            flat.append((f'{path}{k}', v))
+            if isinstance(v, dict):
+                walk(v, f'{path}{k}.')
+    walk(cfg)
+    bad = [p for p, _ in flat if p.rsplit('.', 1)[-1] in RETIRED_KEYS]
+    if bad:
+        raise ValueError(f"retired config key(s) present: {bad}")
+    try:
+        with open(reference, 'r', encoding='utf-8') as f:
+            ref = yaml.safe_load(f)
+    except Exception:
+        return cfg
+    def keyset(d, prefix):
+        node = d
+        for part in prefix.split('.'):
+            node = (node or {}).get(part, {})
+        return set((node or {}).keys())
+    for block in ('buffers.replay_buffer', 'buffers.prior_buffer'):
+        mine, theirs = keyset(cfg, block), keyset(ref, block)
+        only_mine = mine - theirs
+        if only_mine:
+            print(f"  WARNING {block}: keys not present in mk_dev.yaml "
+                  f"(possible schema drift): {sorted(only_mine)}")
+    return cfg
+
+
 def set_T(cfg, T):
     cfg['integrator']['T'] = T
     cfg['eval_T'] = T
@@ -208,6 +279,7 @@ def build():
     log = []
     for (idx, name, T, lr, clip_kind, seed_key, ratio, tier, note) in ARMS:
         cfg = load_parent()
+        modernize_buffers(cfg)
         clip = clip_tight(T) if clip_kind == 'tight' else CLIP_LOOSE[T]
         set_T(cfg, T)
         set_lrs(cfg, lr)
@@ -221,6 +293,7 @@ def build():
         cfg['epochs'] = BASE_EPOCHS
         cfg['tag'] = TAG
         cfg['run_name'] = f'a2_{name}'
+        check_schema(cfg)
         with (OUTDIR / f'{idx}.yaml').open('w', encoding='utf-8') as f:
             yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
         log.append({
