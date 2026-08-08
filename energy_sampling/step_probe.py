@@ -1,0 +1,270 @@
+"""
+Two-point step probe -- the LR sensor from docs/to_do_rebuild.md Part A.
+
+WHAT IT MEASURES. Not gradient magnitude (which under Adam with tight clipping
+is decoupled from the step actually taken -- see to_do_rebuild.md A2) but the
+step itself: given the move the optimizer just made, was it the right SIZE?
+
+Let  d = theta_after - theta_before  be the real optimizer step, momentum and
+clipping included, and define the ray
+
+    theta(alpha) = theta_before + alpha * d
+
+so alpha is a dimensionless multiplier on the step actually taken: alpha=0 is
+"didn't move", alpha=1 is "the step you took", alpha=2 is "twice that step,
+same direction". Evaluate the loss at alpha in {0, 1/2, 1} on ONE frozen batch,
+fit a parabola, and take alpha* = argmin:
+
+    a      = 2 * (L0 + L1 - 2*Lh)                 (fitted curvature)
+    alpha* = (3*L0 + L1 - 4*Lh) / (2 * a)
+
+    alpha* ~ 1   step size correct
+    alpha* < 1   overshot by 1/alpha*
+    alpha* > 1   undershooting -- affirmative permission to grow
+
+alpha* is dimensionless with a physical setpoint at 1.0, which is the whole
+point: an absolute gradient bar has never transferred across T, energy
+function, or clip setting, and a setpoint does not need to.
+
+SCOPE (docs decision D26, option b). d is taken over POLICY parameters only.
+The flow (Z) head is LR-pinned separately and the servo would not control it,
+so including it would make alpha* rate a composite step. The head is held at
+its post-step value for all three evaluations, so it contributes an identical
+constant to L0/Lh/L1 and drops out of the fit entirely.
+
+STAGE 1 (this module) is sensor + logging with NO actuation. It commits to no
+design and cannot destabilise a run: every parameter it touches is restored
+before returning, and it runs entirely under no_grad.
+
+COST. Three forward passes over STORED trajectories per probe -- states and
+energies are already in the batch, so no resampling and no energy calls. At the
+default cadence this is a few percent of wall clock.
+"""
+
+import math
+from collections import deque
+
+import torch
+
+
+# Relative floor on the second difference |L0 + L1 - 2*Lh|, as a fraction of the
+# loss scale. Below this the parabola is flat to within float32 precision and
+# alpha* is numerically meaningless -- see the `precision-limited` note in
+# report(). float32 carries ~7 decimal digits, so a TB loss of ~1e3 resolves
+# second differences no finer than ~1e-4 absolute; 1e-6 relative is a
+# deliberately generous floor that only rejects the genuinely degenerate.
+SECOND_DIFF_REL_FLOOR = 1e-6
+
+# alpha* readings beyond this are recorded but not counted toward the windowed
+# median -- a near-flat fit sends the argmin to +-inf, and one such reading
+# would otherwise dominate any mean. The median is robust anyway; this is belt
+# and braces for the dispersion statistic.
+ALPHA_SANE_MAX = 64.0
+
+
+def _fit_alpha_star(l0, lh, l1):
+    """
+    Fit L(alpha) = a*alpha^2 + b*alpha + c through (0,l0), (1/2,lh), (1,l1) and
+    return (alpha_star, a, status).
+
+    Derivation:
+        c = l0
+        l1 = a + b + l0                 =>  a +  b = l1 - l0
+        lh = a/4 + b/2 + l0             =>  a + 2b = 4*lh - 4*l0
+        subtract  =>  b = 4*lh - l1 - 3*l0
+                      a = (l1 - l0) - b = 2*(l0 + l1 - 2*lh)
+
+        alpha* = -b / (2a) = (3*l0 + l1 - 4*lh) / (4 * (l0 + l1 - 2*lh))
+
+    so the whole fit turns on the second difference (l0 + l1 - 2*lh), which is
+    a/2 and carries both the validity guards below.
+
+    status is one of 'ok' | 'nonfinite' | 'flat' | 'downward'.
+    """
+    if not all(math.isfinite(v) for v in (l0, lh, l1)):
+        return float('nan'), float('nan'), 'nonfinite'
+
+    second_diff = l0 + l1 - 2.0 * lh
+    scale = max(abs(l0), abs(lh), abs(l1), 1e-30)
+
+    # Flat / precision-limited: the three points are collinear to within what
+    # float32 can resolve. Reported separately from 'downward' because the
+    # remedies differ -- flat means the probe is under-resolved (raise the step
+    # or the batch), downward means the local quadratic model is simply wrong.
+    if abs(second_diff) < SECOND_DIFF_REL_FLOOR * scale:
+        return float('nan'), 2.0 * second_diff, 'flat'
+
+    # Downward-opening: the midpoint sits ABOVE the chord, so the parabola's
+    # stationary point is a MAXIMUM and alpha* is meaningless even though the
+    # arithmetic still returns a number. Condition is lh > (l0+l1)/2, i.e.
+    # second_diff < 0 -- strictly weaker than "lh exceeds both endpoints",
+    # which an earlier draft of the doc used and which would miss most
+    # degenerate fits.
+    if second_diff < 0.0:
+        return float('nan'), 2.0 * second_diff, 'downward'
+
+    alpha = (3.0 * l0 + l1 - 4.0 * lh) / (4.0 * second_diff)
+    return alpha, 2.0 * second_diff, 'ok'
+
+
+class StepProbe:
+    """
+    Sensor only. Call arm() immediately before the optimizer step and measure()
+    immediately after; measure() restores every parameter it touches.
+
+    `params` must be the POLICY parameters (D26 option b) -- the same list the
+    servo would eventually drive. Passing the flow head in here would silently
+    change what alpha* means.
+    """
+
+    def __init__(self,
+                 params,
+                 cadence: int = 20,
+                 window: int = 25,
+                 enabled: bool = False,
+                 span: float = 2.0):
+        self.enabled = bool(enabled)
+        self.cadence = max(1, int(cadence))
+        # Evaluate at alpha in {0, span/2, span} rather than {0, 1/2, 1}.
+        #
+        # WHY (measured 2026-08-07, r2_wiring). The fit turns entirely on the
+        # second difference, which scales as (arc length)^2 -- so a wider arc is
+        # QUADRATICALLY better conditioned. It has to be, because the probe was
+        # observed dying in phase 2: second_diff_rel fell to 8.7e-8, BELOW the
+        # float32 resolution of ~1e-7, and fit_flat_rate climbed to 0.63 with
+        # fit_ok_rate down to 0.25. The probe was rejecting three quarters of
+        # its own readings.
+        #
+        # The driver is loss MAGNITUDE, not the step: a de-huberized (quadratic)
+        # TB loss on ~25-nat residuals is ~625, and float32 resolves that to
+        # ~6e-5, against a second difference of the same order. Huber's cap
+        # actually kept the loss small enough to measure -- which is why the
+        # de-huberized arm is where this showed up first, exactly opposite to
+        # the Huber-suppression hypothesis I had going in.
+        #
+        # span=2 buys 4x. It still brackets the observed alpha* ~ 0.5 (which
+        # sits at u = 0.25 of the arc), so the minimum stays interior.
+        self.span = float(span)
+        self._params = [p for p in params if p.requires_grad]
+        self._before = None
+        self._armed_at = None
+        self.alpha_hist = deque(maxlen=int(window))
+        # status tallies are cumulative over the run, drained by report() into
+        # rates -- a rising 'downward' or 'flat' rate voids the sensor
+        # independently of what the alpha* values say (to_do_rebuild A3a.3)
+        self.counts = {'ok': 0, 'flat': 0, 'downward': 0, 'nonfinite': 0, 'nostep': 0}
+        self.last = {}
+
+    def due(self, step_ind: int) -> bool:
+        return self.enabled and (step_ind % self.cadence == 0)
+
+    @torch.no_grad()
+    def arm(self, step_ind: int) -> bool:
+        """Snapshot policy params. Cheap clone, one parameter-sized buffer."""
+        if not self.due(step_ind):
+            return False
+        self._before = [p.detach().clone() for p in self._params]
+        self._armed_at = step_ind
+        return True
+
+    @torch.no_grad()
+    def measure(self, loss_fn) -> dict | None:
+        """
+        loss_fn() -> float. MUST evaluate on one frozen batch (identical data at
+        all three alpha) and MUST NOT mutate training state -- no tracker
+        updates, no buffer writes, no log Z updates. It is called three times.
+
+        Returns the reading dict, or None if the probe could not run.
+        """
+        if self._before is None:
+            return None
+        try:
+            deltas = [p.detach() - b for p, b in zip(self._params, self._before)]
+
+            # No step happened -- non-finite gradient, or mid-accumulation. Not
+            # a sensor failure, so tallied separately from the fit statuses.
+            sq = sum(float(d.pow(2).sum()) for d in deltas)
+            if not math.isfinite(sq) or sq == 0.0:
+                self.counts['nostep'] += 1
+                return None
+
+            def _set(alpha):
+                for p, b, d in zip(self._params, self._before, deltas):
+                    p.copy_(b).add_(d, alpha=alpha)
+
+            # Three points at alpha in {0, span/2, span}. The fit is done in
+            # normalised u = alpha/span (so the closed form is unchanged) and
+            # alpha* = span * u* converts back to multiples-of-the-taken-step.
+            s = self.span
+            _set(0.0)
+            l0 = float(loss_fn())
+            _set(0.5 * s)
+            lh = float(loss_fn())
+            _set(s)
+            l1 = float(loss_fn())
+            _set(1.0)  # restore: bitwise theta_before + delta == theta_after
+
+            u, a, status = _fit_alpha_star(l0, lh, l1)
+            alpha = u * s if math.isfinite(u) else u
+            self.counts[status] += 1
+            if status == 'ok' and abs(alpha) <= ALPHA_SANE_MAX:
+                self.alpha_hist.append(alpha)
+
+            scale = max(abs(l0), abs(lh), abs(l1), 1e-30)
+            self.last = {
+                'alpha_star': alpha,
+                'curvature': a,
+                'status': status,
+                'step_norm': math.sqrt(sq),
+                'l0': l0, 'l_half': lh, 'l1': l1,
+                # |second difference| / loss scale. If this sits near
+                # SECOND_DIFF_REL_FLOOR the probe is PRECISION-LIMITED, not
+                # measuring curvature -- the failure mode A3a did not
+                # anticipate, and it voids alpha* as surely as a downward fit.
+                'second_diff_rel': abs(l0 + l1 - 2.0 * lh) / scale,
+                # Did the step REDUCE held-out loss at all? (l1-l0)/|l0| < 0 is a
+                # descent step, > 0 means the step increased loss on data it was
+                # not fitted to. Logged because a high downward-fit rate has two
+                # very different explanations and this separates them: a step
+                # that lands past the basin (l1 > l0, edge-of-stability /
+                # catapult, normal per A7) versus a step direction along which
+                # the surface is genuinely non-quadratic. dropout is 0 here, so
+                # all three evaluations are deterministic and NEITHER can be
+                # evaluation noise.
+                'loss_delta_rel': (l1 - l0) / max(abs(l0), 1e-30),
+                'span': s,
+            }
+            return self.last
+        finally:
+            self._before = None
+            self._armed_at = None
+
+    def report(self) -> dict:
+        """Loggable view. Empty until the first successful fit."""
+        if not self.enabled:
+            return {}
+        total = sum(self.counts.values()) or 1
+        out = {
+            'lrprobe/fit_ok_rate': self.counts['ok'] / total,
+            'lrprobe/fit_flat_rate': self.counts['flat'] / total,
+            'lrprobe/fit_downward_rate': self.counts['downward'] / total,
+            'lrprobe/nostep_rate': self.counts['nostep'] / total,
+        }
+        if self.last:
+            out['lrprobe/alpha_star'] = self.last['alpha_star']
+            out['lrprobe/curvature'] = self.last['curvature']
+            out['lrprobe/step_norm'] = self.last['step_norm']
+            out['lrprobe/second_diff_rel'] = self.last['second_diff_rel']
+            out['lrprobe/loss_delta_rel'] = self.last['loss_delta_rel']
+        if len(self.alpha_hist) >= 3:
+            xs = sorted(self.alpha_hist)
+            n = len(xs)
+            med = xs[n // 2] if n % 2 else 0.5 * (xs[n // 2 - 1] + xs[n // 2])
+            q1, q3 = xs[n // 4], xs[(3 * n) // 4]
+            # The windowed MEDIAN is the servo's eventual input; the IQR is the
+            # kill switch. A3a.2: wide per-probe spread with a stable median is
+            # acceptable -- kill only if the median itself wanders.
+            out['lrprobe/alpha_median'] = med
+            out['lrprobe/alpha_iqr'] = q3 - q1
+            out['lrprobe/alpha_n'] = n
+        return out
