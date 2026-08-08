@@ -671,7 +671,24 @@ class GFN(nn.Module):  # todo add seeding
 
     def get_traj_fwd(self, initial_state, discretizer, exploration_std, condition, mol_batch,
                      return_gauss_params: bool = False, detach_traj: bool = True,
-                     freeze_policy: bool = False):
+                     freeze_policy: bool = False, path_grad_last_k: int = 0):
+        """
+        path_grad_last_k > 0 = TRUNCATED path gradient: keep the reparameterized
+        state gradient alive for the LAST k steps only, detaching everything
+        before. 0 (default) reproduces the old bool behaviour bitwise, so this
+        is inert unless a config asks for it.
+
+        Why truncated rather than all-or-nothing: full-T path gradient in the
+        FORWARD direction is BPTT through T reparameterized SDE steps -- a
+        product of T Jacobians -- and was measured to be badly destabilizing.
+        Truncation bounds that product while keeping the only part that carries
+        the reward signal, since x_T (and hence log R) is set by the final
+        steps. Detaching the first T-k steps leaves current_state a non-grad
+        leaf at step T-k, but next_state = f(current_state, theta) still carries
+        gradient through the drift/variance heads, so the last k steps' policy
+        params get a genuine pathwise gradient. initial_state.requires_grad_ is
+        therefore left keyed on detach_traj alone and does NOT need to change.
+        """
         batch_size = initial_state.shape[0]
         ts = discretizer(batch_size).to(self.device)
         trajectory_length = ts.shape[1] - 1
@@ -712,10 +729,16 @@ class GFN(nn.Module):  # todo add seeding
             eps_r = (torch.randn(batch_size, self.dplr_rank, device=self.device)
                      if self.dplr_rank > 0 else None)
 
+            # per-step detach: identical to `detach_traj` unless the caller asked
+            # for a truncated path gradient over the final k steps
+            step_detach = detach_traj
+            if path_grad_last_k > 0 and i >= trajectory_length - path_grad_last_k:
+                step_detach = False
+
             (next_state, logpf_i, logpb_i, flow_i,
              back_drift, back_var, fwd_drift, pflogvars, d) = self._run_step(
                 use_ckpt, self._fwd_step, current_state, dts, ts, condition_embedding,
-                eps, eps_r, exploration_std, i, detach_traj)
+                eps, eps_r, exploration_std, i, step_detach)
 
             logpf.append(logpf_i)
             logpb.append(logpb_i)

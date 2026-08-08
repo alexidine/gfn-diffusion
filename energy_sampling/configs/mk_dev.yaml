@@ -293,7 +293,7 @@ protocol:
       skip_if: prior_loaded          # a prior loaded by path IS this stage's product
       flags:
         update_log_z: true           # accumulate ema_logw / best_energy evidence
-        scramble_conditions: true    # unconditional prior by construction
+        scramble_conditions: true    # intent flag; applies only where scramble_applicable() holds (conditional model, conditions_type vector). Inert on this route
         mle_gate: true
       loss_coeffs:
         bwd: { mle: 1.0, tbc: 1.0, repeats: 2.0 }
@@ -327,46 +327,34 @@ protocol:
       flags:
         update_log_z: true
         buffers_active: true
-      # entry split puts the bwd/replay pair's mass at the idle ratio
-      # (default_boost) so the controller starts at its own operating point
+      # theta seeds from these fracs, so the controller's first tick is
+      # identical to the matching fixed-mix arm
       fracs: { fwd: 0.2, bwd: 0.6, replay: 0.2 }
-      min_fracs: { fwd: 0.02, bwd: 0.05, replay: 0.02 }  # INERT under kind: proportional; kept for a lexicographic switch-back
+      min_fracs: { fwd: 0.02, bwd: 0.05, replay: 0.02 }  # INERT under kind: ratio; kept for a lexicographic switch-back
       deactivate_threshold: 0.01
       loss_coeffs:
         fwd: { tb: 1.0, freeze_policy: 1.0 }   # Z ONLY: policy + conditioner detached at the source
         bwd: { tb: 1.0 }               # freeze_z stays 1 from base: policy only
       balance:
-        kind: proportional
+        kind: ratio
         pinned: { fwd: 0.2 }               # must equal fracs.fwd
-        metrics: { bwd: bwd/relative_under_wcen, replay: fwd/over_coverage }
-        drive: relative
-        # SOFT reference levels, not gates, and NOT a priority ratio: the two
-        # metrics have different units, and 'relative' drive divides that out.
-        # over_coverage 18.0 is the top of its settling band on the fixed-mix
-        # dev run (17.0-17.8). Bound to that run -- re-read off a live trace
-        # before trusting it on a different system.
-        #
-        # bwd 3.0 is UNCALIBRATED for this metric. It was read off the same run
-        # as the top of relative_under's 2.48-3.18 band; the bwd metric has
-        # since been swapped to relative_under_wcen, which drops the batch-
-        # composition offset relative_under carries and so reads LOWER by an
-        # unmeasured amount. Under drive: relative a target above the metric's
-        # operating range pins the bwd drive at 0, which under the tilt makes
-        # the split exactly default_boost. Read bwd/relative_under_wcen's
-        # settled band off the next run and reset this before treating the bwd
-        # side of the split as live.
-        targets: { bwd: 3.0, replay: 18.0 }
-        max_fracs: { replay: 0.45 }
-        # The idle mix IS the controller's authority. At 0.94/0.06 the tilt was
-        # one-sided and nearly inert: bwd sat at 94% of the pair with no
-        # headroom, and replay needed over_coverage ~5x target to reach its cap.
-        # With fwd no longer training the policy, replay is the ONLY corrector
-        # for the policy's own over-weighted samples, so it needs a real dose
-        # and real authority. At 0.75/0.25 a 2x over_coverage moves replay
-        # 0.20 -> 0.32 and a 2x relative_under_wcen moves it 0.20 -> 0.11.
-        default_boost: { bwd: 0.75, replay: 0.25 }
-        alpha: 0.005
-        floor: 0.03
+        metrics: { replay: fwd/over_coverage, bwd: bwd/relative_under_wcen }
+        numerator: replay                  # rho = fwd/over_coverage / bwd/relative_under_wcen
+        # The only judgement in the loop: the exchange rate between the two
+        # halves of the residual field. rho measured 5.4-6.2 across the four
+        # ctrl_aug03 arms (2000 steps each, buffer servo on in three).
+        # 5.0 moves replay 0.20 -> ~0.35 at the measured plant gain
+        # d log rho / d theta ~ 0.15; 4.0 needs replay ~0.62 and would park at
+        # the bound.
+        setpoint: 5.0
+        gain: 0.02                         # time constant 1/(gain * d log rho/d theta) ~ 3.3k steps at the measured gain
+        max_step: 0.05                     # per-tick theta clip; binds only when rho is off by ~12x
+        # Absolute frac bounds, required. These are what a wrong setpoint
+        # degrades to. Implied bwd range [0.35, 0.75]; bwd share 0.3 held
+        # EffDim 5.33 and 0.001 dropped it to 1.6 (replay_july26). Parser
+        # rejects a lower bound below deactivate_threshold.
+        bounds: { replay: [ 0.05, 0.45 ] }
+        converge_floor: 1.5                # nats: gain fades to 0 as max(metrics) drops to this
 
 # shared balance/fused mechanics (per-stage thresholds live in the rules above)
 controller:

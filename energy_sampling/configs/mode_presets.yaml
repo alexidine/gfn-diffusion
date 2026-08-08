@@ -136,7 +136,14 @@ conditional_toy_protocol_2026_07_29:
         - { metric: fwd/logw_std_within, below: 6.0, patience: 5 }
         - { metric: bwd/logw_std_within, below: 3.0, patience: 5 }
 
-    # ONE always-on terminal stage; fwd pinned, bwd/replay split proportionally
+    # ONE always-on terminal stage; fwd pinned, bwd/replay split proportionally.
+    # ARCHIVE, and deliberately NOT migrated: mk_dev moved to kind: ratio on
+    # 2026-08-06 (one setpoint on over_coverage / relative_under_wcen instead of
+    # a target per side). Restoring this block restores kind: proportional AND
+    # its known-inert bwd target -- targets.bwd 5.0 was set off relative_under
+    # and the metric is relative_under_wcen, so that drive reads 0 and the split
+    # sits at default_boost. Migrate on restore; no setpoint is recorded here
+    # because rho has never been measured on the conditional route.
     - name: naive
       train_mode: fused
       bwd_sampling_mode: prior

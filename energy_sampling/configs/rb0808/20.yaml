@@ -1,0 +1,361 @@
+run_name: rep_starve_servo
+tag: rb0808
+seed: 12345
+device: cuda
+cuda_memory_fraction: 0.9
+anomaly_detection: false
+continue_from_checkpoint: false
+mlip_path: null
+prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_prior_dataset.pt
+molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_prior_dataset.pt
+test_molecules_path: null
+checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/
+archive_period: 5000
+archive_buffers: false
+checkpoint_name: '@@WARM:aug02_a2_T25_lr2_tight@@'
+prior_model_name: null
+reuse_prior: false
+load_weights_only: true
+override_learning_rates: false
+lr_policy: 0.0004
+min_lr: 1.0e-06
+z_calibration:
+  enabled: true
+  mode: rollout
+  unclipped: false
+  sensor: pooled
+  sensor_quantile: 0.5
+  threshold: 0.5
+  grace: 0.8
+  gain: 1.0
+  max_steps_per_step: 8.0
+  min_visits: null
+  freshness_half_life_steps: 300.0
+  se2_floor: 0.25
+  holdout_modulus: 8
+lr_flow: 0.1
+lr_back: 0.0004
+lr_replay: 0.0004
+lr_fused: 0.0004
+lr_warmup_ratio: 100
+adaptive_lr:
+  enabled: true
+  warmup_steps: 1000
+  hold_steps: 20000
+  decay_halflife_steps: 25000
+  decay_floor_scale: 0.05
+  cut_loss_abs: 2500.0
+  cut_grad_abs: 3800
+  reset_loss_abs: auto
+  reset_grad_abs: auto
+  cut_ratio: 0.5
+  fire_cooldown_steps: 500
+  recovery_target_frac: 0.85
+  recovery_wait_steps: 3000
+  recovery_ramp_steps: 1000
+  control_flow_lr: false
+weight_decay: 0.0001
+use_weight_decay: false
+compile_policy: auto
+traj_checkpoint: false
+gradient_norm_clip: auto
+ema_decay: null
+model:
+  full_flow: false
+  s_emb_dim: 512
+  t_dim: 64
+  harmonics_dim: 64
+  condition_embedding_dim: 16
+  t_hidden_dim: 512
+  s_hidden_dim: 512
+  s_layers: 4
+  policy_hidden_dim: 512
+  policy_layers: 4
+  flow_hidden_dim: 512
+  flow_layers: 4
+  cond_hidden_dim: 512
+  cond_layers: 4
+  dropout: 0
+  norm: layer
+  zero_init: false
+  t_scale: 0.05
+  log_var_range: 6
+  pb_drift_range: 0.4
+  pb_var_range: 6
+  learn_pb: true
+  learned_variance: true
+  clipping: true
+  gfn_clip: 200.0
+  periodic_centroids: true
+  dplr_rank: 6
+  dplr_rho_max: 0.5
+  dplr_mask_angular: true
+  pb_exact_reversal: true
+buffer_device: cuda
+batch_size: 2831
+grow_batch_size: true
+max_batch_size: 50000
+batch_growth_factor: 1.65
+batch_growth_interval: 50
+batch_growth_slow_interval: 300
+auto_batch_throughput_opt: true
+batch_growth_min_gain: 0.15
+batch_knee_recheck_steps: 2000
+oom_batch_shrink_factor: 0.5
+oom_cooldown_steps: 200
+eval_num_samples: 10000
+test_eval_num_samples: 2000
+fused_grad_accum_min_samples: 1000
+epochs: 35000
+eval_period: 500
+figs_period: 1000
+eval_T: 25
+integrator:
+  T: 25
+  min_traj_length: 25
+  max_traj_length: 25
+  traj_length_strategy: static
+  discretizer_max_ratio: 15
+  discretizer: uniform
+fwd_loss_coeffs:
+  tb: 0.0
+  z_level: 0.0
+  freeze_policy: 0.0
+  freeze_z: 0.0
+  vg_lb: 0.0
+  vg_lme: 0
+  vg_by_condition: 0.0
+  db: 0.0
+  subtb: 0.0
+  subtb_lambda: 0.95
+  emp_z: 0
+  emp_z_persistent: 0
+  traj_grads: 0.0
+  reward_grads: 0.0
+  repeats: 1.0
+  loss_clip: 1000000000.0
+  beta: 10.0
+bwd_loss_coeffs:
+  tb: 0.0
+  freeze_policy: 0.0
+  freeze_z: 1.0
+  vg_lb: 0
+  vg_lme: 0
+  vg_by_condition: 1.0
+  pf_boost: 0
+  db: 0.0
+  subtb: 0.0
+  subtb_lambda: 0.95
+  emp_z: 0
+  emp_z_persistent: 0
+  level_gap: 0.0
+  level_gap_clamp: 10.0
+  mle: 0.0
+  tbc: 0.0
+  repeats: 1.0
+  traj_grads: 1.0
+  loss_clip: 1000000000.0
+  beta: 10.0
+replay_loss_coeffs:
+  tb: 1.0
+  freeze_policy: 0.0
+  freeze_z: 1.0
+  vg_lb: 0
+  vg_lme: 0
+  pf_boost: 0
+  db: 0.0
+  subtb: 0.0
+  subtb_lambda: 0.95
+  emp_z: 0
+  emp_z_persistent: 0
+  mle: 0.0
+  repeats: 1.0
+  traj_grads: 0.0
+  loss_clip: 1000000000.0
+  beta: 10.0
+condition_log_z:
+  min_visits: 20
+  half_life_visits: 7.0
+  trim_frac: 0.1
+  max_batch_weight: 200.0
+  discovery_half_life_steps: 200.0
+  fwd_tb_z_source: learned
+  bwd_tb_z_source: learned
+  replay_tb_z_source: learned
+  weighted_condition_sampling: true
+  weighted_condition_sampling_clip_quantile: 0.99
+  weighted_condition_sampling_temperature: 0.3
+  weighted_condition_sampling_uniform_beta: 0.5
+mle_slope_t: 2.0
+mle_min_rate: 0.05
+mle_slope_window: 300
+protocol:
+  stages:
+  - name: train_prior
+    train_mode: bwd
+    bwd_sampling_mode: dataset
+    skip_if: prior_loaded
+    flags:
+      update_log_z: true
+      scramble_conditions: true
+      mle_gate: true
+    loss_coeffs:
+      bwd:
+        mle: 1.0
+        tbc: 1.0
+        repeats: 2.0
+    exit:
+    - metric: gates/mle_flat
+      above: 0.5
+      patience: 5
+    - metric: eval/wass_debiased
+      below: 0.015
+    - metric: bwd/tbc
+      below: 2.0
+    on_exit:
+    - snapshot:phase1_exit
+    - snapshot_prior
+  - name: naive
+    train_mode: fused
+    bwd_sampling_mode: prior
+    flags:
+      update_log_z: true
+      buffers_active: true
+    fracs:
+      fwd: 0.2
+      bwd: 0.6
+      replay: 0.2
+    min_fracs:
+      fwd: 0.02
+      bwd: 0.05
+      replay: 0.02
+    deactivate_threshold: 0.01
+    loss_coeffs:
+      fwd:
+        tb: 1.0
+        freeze_policy: 1.0
+      bwd:
+        tb: 1.0
+    balance:
+      kind: ratio
+      pinned:
+        fwd: 0.2
+      metrics:
+        replay: fwd/over_coverage
+        bwd: bwd/relative_under_wcen
+      numerator: replay
+      setpoint: 5.0
+      gain: 0.02
+      max_step: 0.05
+      bounds:
+        replay:
+        - 0.05
+        - 0.45
+      converge_floor: 1.5
+    buffer_servo:
+      numerator: replay/ema_loss_mean
+      denominator: replay/birth_loss_mean
+      bar: 0.368
+      release: 0.6
+      scale: 0.15
+      gain: 0.01
+      relax: 0.5
+      max_step: 0.03
+      max_boost: 12.0
+controller:
+  min_mode_frac: 0.001
+  beta: 0.025
+  deactivate_threshold: 0.01
+  refresh_every: 10
+  decay_rate: 0.95
+  anneal_patience: 5
+  lookahead_horizon: 5
+  lookahead_trend_alpha: 0.1
+terminal_logw_std: 1000.0
+terminal_box_violation: 1.0
+conditional_worst_quantile: 0.25
+buffers:
+  prior_buffer:
+    seed_source: prior_dataset
+    mean_lifetime: 100
+    weighted_bwd_beta: 0.9
+    churn_batch_ref: 1000
+    min_size: 10000
+    max_size: 250000
+    init_fraction: 0.25
+    condition_block_m: 1
+    reward_min: 0
+    ramp_floor: 100
+    ramp_width: 50
+  replay_buffer:
+    churn_rate: 20
+    max_size: 12000
+    mean_residence_steps: 200
+    toxic_min_draws: 20
+    admit_temperature: 2.0
+    admit_cap_max: 30.0
+    admit_cap_min: 8.0
+    admit_cap_health_h0: 10.0
+    admit_reward_min: -50
+    prioritise:
+      enabled: true
+      kappa: 0.0
+  anchor_buffer:
+    seed_source: prior_dataset
+    max_size: 200000
+    dup_cutoff: 0.05
+    screen_energy_window: 20
+    thin_energy_window: 50
+    surprise_cutoff: -5
+    confirm_cutoff: -5
+    confirm_k: 5
+    health_gate_r2: 0.9
+    health_gate_zerr: 0.5
+    replay_beta: 0.5
+    thin_every_n_evals: 5
+    refresh_every_n_evals: 3
+    noise_log_range:
+    - -2.5
+    - -1.5
+    topup_admit_record_breakers: true
+    mcmc:
+      sweeps: 0
+      burn_in: 2000
+      init_sigma: 0.02
+      target_accept: 0.3
+      sigma_adapt_rate: 0.1
+      sigma_min: 0.0001
+      sigma_max: 0.5
+      energy_ceiling_kt: null
+      log_geometry: true
+    reach_quantile: 0.9
+    reach_threshold: 0.75
+    reach_topup_size: 1000
+energy_function: elj
+temperature_conditioning: false
+molecule_conditioning: false
+sg_conditioning: false
+space_groups:
+- 2
+zp_conditioning: false
+z_primes:
+- 1
+vector_conditioning: false
+vector_conditioning_dim: 3
+energy_config:
+  internal_oom_recovery: true
+  temperature: 2.5
+  log_temperature_range:
+  - 0
+  - 0.693147
+  density_coeff: 10.0
+  bounding_coeff: 10.0
+  reduction_coeff: 10.0
+  lj_coeff: 1.0
+  reward_range: 250
+  analyze_kwargs: {}
+step_probe:
+  enabled: true
+  cadence: 20
+  window: 25
+  span: 2.0

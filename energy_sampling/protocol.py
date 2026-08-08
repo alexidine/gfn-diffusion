@@ -47,6 +47,15 @@ never "is it below an absolute bar"; the calibration floor legitimately
 rises as coverage grows, so absolute bars deadlock -- see b9ze0p5c).
 kind: proportional instead splits two modes' combined mass proportionally to
 a pair of lagging-spread metrics (the old phase-2 balancer, generalized).
+kind: constraint treats the same two modes ASYMMETRICALLY -- one side's metric
+is a bar that must hold, the other's is a best-effort objective -- and drives
+the split with an INTEGRATOR rather than a static map (see _constraint_tick).
+
+A stage may also declare `buffer_servo`: a second, independent controller whose
+actuator is the replay buffer's freshness rather than the loss weights (see
+_buffer_servo_tick). It exists because branch weights cannot fix replay
+OVERFITTING -- down-weighting a memorized buffer trains less on it but does not
+make it less memorized -- so the two pathologies need two actuators.
 
 The same clean-streak anneal event can also RAMP UP energy_config
 coefficients (balance.anneal_coeffs: {bounding_coeff: {target: 10.0}, ...})
@@ -129,6 +138,14 @@ def fresh_stage_ctrl():
         # plus its both-satisfied streak. See _proportional_tick.
         'prop_scale': 1.0,
         'prop_streak': 0,
+        # constraint balance: the integrator state IS the actuator -- the
+        # logit of the best-effort mode's share of the split pair. None = not
+        # yet seeded (first tick seeds it from the stage's entry fracs, so the
+        # controller starts exactly where a fixed-mix arm would sit).
+        'cs_theta': None,
+        # buffer freshness servo: log of the multiplicative churn/residence
+        # boost. 0.0 = the configured buffer, i.e. inert.
+        'bs_log_boost': 0.0,
     }
 
 
@@ -141,8 +158,8 @@ class Stage:
             raise TypeError(f"protocol.stages[{index}] must be a mapping, got {type(spec)}")
         unknown = set(spec) - {'name', 'train_mode', 'bwd_sampling_mode', 'flags',
                                'loss_coeffs', 'fracs', 'min_fracs',
-                               'deactivate_threshold', 'balance', 'exit',
-                               'on_exit', 'on_enter', 'skip_if'}
+                               'deactivate_threshold', 'balance', 'buffer_servo',
+                               'exit', 'on_exit', 'on_enter', 'skip_if'}
         if unknown:
             raise ValueError(f"protocol.stages[{index}] has unknown keys {sorted(unknown)}")
         self.index = index
@@ -196,6 +213,7 @@ class Stage:
             self.deactivate_threshold = float(v)
 
         self.balance = self._parse_balance(spec.get('balance'))
+        self.buffer_servo = self._parse_buffer_servo(spec.get('buffer_servo'))
         self.exit = self._parse_exit(spec.get('exit'))
         self.on_exit = self._parse_actions(spec.get('on_exit'), 'on_exit')
         self.on_enter = self._parse_actions(spec.get('on_enter'), 'on_enter')
@@ -222,6 +240,79 @@ class Stage:
         if raw not in MODES:
             raise ValueError(f"stage '{self.name}': {where} must be one of {MODES} or a {{mode: weight}} mix")
         return raw
+
+    def _parse_pinned(self, node, metrics):
+        """Modes HELD at a fixed frac, outside a two-mode split (shared by
+        kind: proportional and kind: constraint). Declaring them is mandatory
+        rather than implied by absence from 'metrics': a split only rewrites
+        its own two modes, so a third mode's pin was previously invisible in
+        the config and readable only from the implementation. Spelled out here,
+        it is also re-asserted every tick, so the pin is enforced rather than
+        merely emergent."""
+        pinned = dict(node.get('pinned') or {})
+        bad = set(pinned) - set(MODES)
+        if bad:
+            raise ValueError(f"stage '{self.name}': pinned has unknown modes {sorted(bad)}")
+        overlap = set(pinned) & set(metrics)
+        if overlap:
+            raise ValueError(f"stage '{self.name}': modes {sorted(overlap)} are both "
+                             f"'pinned' and in 'metrics' -- a mode is either held or split")
+        for mode, v in pinned.items():
+            if not isinstance(v, (int, float)) or not 0.0 <= v < 1.0:
+                raise ValueError(f"stage '{self.name}': pinned.{mode} must be in [0, 1), got {v}")
+            entry = self.fracs.get(mode)
+            if entry is not None and abs(float(entry) - float(v)) > 1e-9:
+                raise ValueError(
+                    f"stage '{self.name}': pinned.{mode} ({v}) disagrees with "
+                    f"fracs.{mode} ({entry}) -- they are the same quantity")
+        # nothing carrying entry mass may be left unmanaged: a mode that is
+        # neither split nor pinned would silently sit wherever it landed
+        unmanaged = {mode for mode, v in self.fracs.items()
+                     if isinstance(v, (int, float)) and v > 0} - set(metrics) - set(pinned)
+        if unmanaged:
+            raise ValueError(
+                f"stage '{self.name}': modes {sorted(unmanaged)} have nonzero entry fracs but "
+                f"are neither in 'metrics' (split) nor 'pinned' (held) -- declare them")
+        return pinned
+
+    def _parse_bounds(self, node, metrics, pinned, kind):
+        """ABSOLUTE [lo, hi] frac bounds on a two-mode split's own modes,
+        shared by kind: constraint and kind: ratio. These are the load-bearing
+        safety element, not a nicety: they are what makes a MISCALIBRATED bar
+        or setpoint degrade to a fixed mix instead of to a collapse. An
+        integrator whose drive never reaches zero walks to a bound and parks --
+        so the bound is the mix the run actually gets, and it must be one that
+        is safe to run forever. (replay_july26: bwd_frac 0.001 dropped EffDim
+        5.99 -> 1.3 inside one eval window.)"""
+        bounds = dict(node.get('bounds') or {})
+        bad = set(bounds) - set(metrics)
+        if bad:
+            raise ValueError(f"stage '{self.name}': {kind} bounds for modes "
+                             f"{sorted(bad)} that aren't in 'metrics'")
+        if not bounds:
+            raise ValueError(f"stage '{self.name}': {kind} balance needs 'bounds' on at "
+                             f"least one split mode -- an unbounded integrator against a "
+                             f"target it cannot reach walks to a degenerate mix")
+        pair_mass = 1.0 - sum(float(v) for v in (pinned or {}).values())
+        for mode, lohi in bounds.items():
+            if (not isinstance(lohi, (list, tuple)) or len(lohi) != 2
+                    or not all(isinstance(v, (int, float)) for v in lohi)):
+                raise ValueError(f"stage '{self.name}': bounds.{mode} must be [lo, hi], got {lohi}")
+            lo, hi = float(lohi[0]), float(lohi[1])
+            if not 0.0 < lo <= hi < pair_mass + 1e-9:
+                raise ValueError(
+                    f"stage '{self.name}': bounds.{mode} = [{lo}, {hi}] must satisfy "
+                    f"0 < lo <= hi <= {pair_mass:.4f} (the split pair's total mass)")
+            # a floor UNDER the deactivate threshold means the branch can
+            # switch off entirely while the controller still believes it is
+            # steering that mode -- the s706frkh silent-dark-branch failure
+            if self.deactivate_threshold is not None and lo < self.deactivate_threshold:
+                raise ValueError(
+                    f"stage '{self.name}': bounds.{mode} lower bound {lo} is below the "
+                    f"stage's deactivate_threshold ({self.deactivate_threshold}) -- the "
+                    f"branch would go dark while the controller still steers it")
+            bounds[mode] = [lo, hi]
+        return bounds
 
     def _parse_balance(self, node):
         if node is None:
@@ -285,37 +376,7 @@ class Stage:
                 raise ValueError(f"stage '{self.name}': proportional balance needs a "
                                  f"'metrics' mapping of exactly two modes to metric names")
             node['metrics'] = dict(metrics)
-            # modes HELD at a fixed frac, outside the split. Declaring them is
-            # mandatory rather than implied by absence from 'metrics': a
-            # proportional split only rewrites its own two modes, so a third
-            # mode's pin was previously invisible in the config and readable
-            # only from the implementation. Spelled out here, it is also
-            # re-asserted every tick (see _proportional_tick), so the pin is
-            # enforced rather than merely emergent.
-            pinned = dict(node.get('pinned') or {})
-            bad = set(pinned) - set(MODES)
-            if bad:
-                raise ValueError(f"stage '{self.name}': pinned has unknown modes {sorted(bad)}")
-            overlap = set(pinned) & set(metrics)
-            if overlap:
-                raise ValueError(f"stage '{self.name}': modes {sorted(overlap)} are both "
-                                 f"'pinned' and in 'metrics' -- a mode is either held or split")
-            for mode, v in pinned.items():
-                if not isinstance(v, (int, float)) or not 0.0 <= v < 1.0:
-                    raise ValueError(f"stage '{self.name}': pinned.{mode} must be in [0, 1), got {v}")
-                entry = self.fracs.get(mode)
-                if entry is not None and abs(float(entry) - float(v)) > 1e-9:
-                    raise ValueError(
-                        f"stage '{self.name}': pinned.{mode} ({v}) disagrees with "
-                        f"fracs.{mode} ({entry}) -- they are the same quantity")
-            # nothing carrying entry mass may be left unmanaged: a mode that is
-            # neither split nor pinned would silently sit wherever it landed
-            unmanaged = {mode for mode, v in self.fracs.items()
-                         if isinstance(v, (int, float)) and v > 0} - set(metrics) - set(pinned)
-            if unmanaged:
-                raise ValueError(
-                    f"stage '{self.name}': modes {sorted(unmanaged)} have nonzero entry fracs but "
-                    f"are neither in 'metrics' (split) nor 'pinned' (held) -- declare them")
+            pinned = self._parse_pinned(node, metrics)
             node['pinned'] = pinned
             # optional anneal of the TARGET VECTOR: a single multiplicative
             # scale decaying toward min_scale, applied to every target. One
@@ -434,10 +495,175 @@ class Stage:
                 raise ValueError(f"stage '{self.name}': proportional alpha must be in (0, 1], got {alpha}")
             node['alpha'] = alpha
             node['floor'] = float(node.get('floor', 0.01))
+        elif kind == 'constraint':
+            if node.get('anneal_coeffs'):
+                raise ValueError(f"stage '{self.name}': anneal_coeffs needs kind: lexicographic "
+                                 f"(it anneals off the lexicographic clean-streak event)")
+            metrics = node.get('metrics') or {}
+            if len(metrics) != 2 or set(metrics) - set(MODES):
+                raise ValueError(f"stage '{self.name}': constraint balance needs a "
+                                 f"'metrics' mapping of exactly two modes to metric names")
+            node['metrics'] = dict(metrics)
+            node['pinned'] = self._parse_pinned(node, metrics)
+            # WHICH side is the hard one. The asymmetry is the whole point (see
+            # _constraint_tick): the constrained mode's bar has to be a level
+            # you actually know, and the other mode's is allowed to be a guess.
+            constrain = node.get('constrain')
+            if constrain not in metrics:
+                raise ValueError(f"stage '{self.name}': balance.constrain must name one of "
+                                 f"the two split modes {sorted(metrics)}, got {constrain!r}")
+            node['constrain'] = constrain
+            # Both bars are STRICTLY POSITIVE because both drives are relative
+            # (metric/bar - 1). Relative is not a style choice here: the two
+            # metrics are RMS nats on different tails with different dynamic
+            # ranges (bwd/relative_under_wcen settles ~2-3, fwd/over_coverage
+            # ~17-18), so an absolute-difference drive would hand the split to
+            # whichever metric happens to be numerically larger -- the exact
+            # scale artifact the proportional controller's 'drive: relative'
+            # was added to divide out.
+            bars = dict(node.get('bars') or {})
+            if set(bars) != set(metrics):
+                raise ValueError(f"stage '{self.name}': constraint balance needs a 'bars' "
+                                 f"entry for each of {sorted(metrics)}, got {sorted(bars)}")
+            for mode, v in bars.items():
+                if not isinstance(v, (int, float)) or v <= 0:
+                    raise ValueError(f"stage '{self.name}': bars.{mode} must be strictly "
+                                     f"positive (drives are relative), got {v}")
+            node['bars'] = dict(bars)
+            node['bounds'] = self._parse_bounds(node, metrics, node['pinned'], 'constraint')
+            gain = float(node.get('gain', 0.02))
+            if not 0.0 < gain <= 1.0:
+                raise ValueError(f"stage '{self.name}': constraint gain must be in (0, 1], got {gain}")
+            node['gain'] = gain
+            priority = float(node.get('priority', 3.0))
+            if priority < 1.0:
+                raise ValueError(f"stage '{self.name}': constraint priority must be >= 1 -- it is "
+                                 f"the gain MULTIPLE on the constrained side, and below 1 it "
+                                 f"would make the best-effort objective the dominant one")
+            node['priority'] = priority
+            max_step = float(node.get('max_step', 0.03))
+            if not 0.0 < max_step <= 1.0:
+                raise ValueError(f"stage '{self.name}': constraint max_step must be in (0, 1], got {max_step}")
+            node['max_step'] = max_step
+        elif kind == 'ratio':
+            if node.get('anneal_coeffs'):
+                raise ValueError(f"stage '{self.name}': anneal_coeffs needs kind: lexicographic "
+                                 f"(it anneals off the lexicographic clean-streak event)")
+            bad = set(node) - {'kind', 'metrics', 'pinned', 'numerator', 'setpoint',
+                               'gain', 'max_step', 'bounds', 'converge_floor'}
+            if bad:
+                raise ValueError(f"stage '{self.name}': ratio balance unknown keys {sorted(bad)}")
+            metrics = node.get('metrics') or {}
+            if len(metrics) != 2 or set(metrics) - set(MODES):
+                raise ValueError(f"stage '{self.name}': ratio balance needs a "
+                                 f"'metrics' mapping of exactly two modes to metric names")
+            node['metrics'] = dict(metrics)
+            node['pinned'] = self._parse_pinned(node, metrics)
+            # WHICH metric is on top of rho. Named explicitly rather than taken
+            # from mapping order, because 'setpoint' is meaningless without it
+            # and a silently inverted rho is a sign flip on the whole loop.
+            numerator = node.get('numerator')
+            if numerator not in metrics:
+                raise ValueError(f"stage '{self.name}': balance.numerator must name one of the "
+                                 f"two split modes {sorted(metrics)}, got {numerator!r}")
+            node['numerator'] = numerator
+            setpoint = node.get('setpoint')
+            if not isinstance(setpoint, (int, float)) or setpoint <= 0:
+                raise ValueError(f"stage '{self.name}': ratio setpoint must be strictly "
+                                 f"positive (it is a ratio of two positive metrics), got {setpoint!r}")
+            node['setpoint'] = float(setpoint)
+            node['bounds'] = self._parse_bounds(node, metrics, node['pinned'], 'ratio')
+            gain = float(node.get('gain', 0.02))
+            if not 0.0 < gain <= 1.0:
+                raise ValueError(f"stage '{self.name}': ratio gain must be in (0, 1], got {gain}")
+            node['gain'] = gain
+            max_step = float(node.get('max_step', 0.05))
+            if not 0.0 < max_step <= 1.0:
+                raise ValueError(f"stage '{self.name}': ratio max_step must be in (0, 1], got {max_step}")
+            node['max_step'] = max_step
+            # convergence gate, in the metrics' own units (nats). A scale-free
+            # setpoint keeps demanding the same RATIO whether the two halves
+            # are 20 nats apart or 2, so once both are inside the convergence
+            # scale the loop would be steering on noise. Null = never fade.
+            floor = node.get('converge_floor')
+            if floor is not None:
+                floor = float(floor)
+                if floor <= 0:
+                    raise ValueError(f"stage '{self.name}': ratio converge_floor must be "
+                                     f"strictly positive or null, got {floor}")
+            node['converge_floor'] = floor
         else:
-            raise ValueError(f"stage '{self.name}': balance.kind must be lexicographic|proportional")
+            raise ValueError(f"stage '{self.name}': balance.kind must be "
+                             f"lexicographic|proportional|constraint|ratio")
         node['kind'] = kind
         return node
+
+    def _parse_buffer_servo(self, node):
+        """The replay-buffer freshness servo (see _buffer_servo_tick). Declared
+        per stage because it is only meaningful where replay trains, and
+        because its state resets at transitions like every other controller
+        here. Absent = the buffer runs exactly at its configured knobs."""
+        if node is None:
+            return None
+        bad = set(node) - {'numerator', 'denominator', 'bar', 'release', 'scale',
+                           'gain', 'relax', 'max_boost', 'max_step'}
+        if bad:
+            raise ValueError(f"stage '{self.name}': buffer_servo unknown keys {sorted(bad)}")
+        out = {'numerator': node.get('numerator', 'replay/scatter_err'),
+               'denominator': node.get('denominator', 'fwd/scatter_err')}
+        for key in ('numerator', 'denominator'):
+            if not isinstance(out[key], str) or '/' not in out[key]:
+                raise ValueError(f"stage '{self.name}': buffer_servo.{key} must be a "
+                                 f"'dir/metric' name, got {out[key]!r}")
+        bar = float(node.get('bar', 1.0))
+        release = float(node.get('release', 1.5))
+        if not 0.0 < bar <= release:
+            raise ValueError(f"stage '{self.name}': buffer_servo needs 0 < bar <= release "
+                             f"(got bar={bar}, release={release}) -- bar > release would make "
+                             f"the tighten and release terms fire simultaneously and fight")
+        out['bar'], out['release'] = bar, release
+        # Deviation at which the servo runs at FULL rate. Without it the drive
+        # is the raw deficit (bar - ratio), which is bounded above by `bar` and
+        # in practice sits at ~0.03: measured live, replay/fwd scatter entered
+        # at 0.964, so a raw-deficit servo would need ~23k steps to traverse
+        # its boost range and is effectively inert exactly where it lives. The
+        # inversion is a THRESHOLD phenomenon -- crossing below 1 at all is the
+        # pathology, and depth below it is not proportionally meaningful -- so
+        # the drive saturates at `scale` and the servo behaves like a
+        # constant-rate ramp with a deadband, which is also why it cannot
+        # chatter (the two ramp directions are separated by bar..release).
+        scale = float(node.get('scale', 0.1))
+        if scale <= 0.0:
+            raise ValueError(f"stage '{self.name}': buffer_servo.scale must be > 0, got {scale}")
+        out['scale'] = scale
+        # Sized against the LOOP DELAY, which is what limits this servo: the
+        # sensor is a metric_tracker EMA refreshed once per 10 replay steps
+        # (~250 train steps of smoothing) sitting on top of a buffer that needs
+        # ~mean_residence_steps to turn over. An integrator whose traverse time
+        # is comparable to that delay will overshoot and hunt, so the default
+        # puts a full-drive traverse of the boost range at ~1200 train steps,
+        # several times the delay.
+        gain = float(node.get('gain', 0.02))
+        if not 0.0 < gain <= 1.0:
+            raise ValueError(f"stage '{self.name}': buffer_servo.gain must be in (0, 1], got {gain}")
+        out['gain'] = gain
+        # relax < 1 releases SLOWER than it tightens. It must be > 0: a
+        # one-way servo's fixed point is the maximum boost, which is the same
+        # ratchet failure the LR controller's recovery ramp exists to avoid.
+        relax = float(node.get('relax', 0.25))
+        if not 0.0 < relax <= 1.0:
+            raise ValueError(f"stage '{self.name}': buffer_servo.relax must be in (0, 1] -- 0 "
+                             f"makes the servo one-way and its fixed point max_boost")
+        out['relax'] = relax
+        max_boost = float(node.get('max_boost', 12.0))
+        if max_boost < 1.0:
+            raise ValueError(f"stage '{self.name}': buffer_servo.max_boost must be >= 1, got {max_boost}")
+        out['max_boost'] = max_boost
+        max_step = float(node.get('max_step', 0.03))
+        if not 0.0 < max_step <= 1.0:
+            raise ValueError(f"stage '{self.name}': buffer_servo.max_step must be in (0, 1], got {max_step}")
+        out['max_step'] = max_step
+        return out
 
     def _parse_exit(self, node):
         if node is None:
@@ -487,13 +713,17 @@ class Stage:
         stage without balance makes no claims."""
         if self.balance is None:
             return set(MODES)
-        if self.balance['kind'] == 'proportional':
+        if self.balance['kind'] in ('proportional', 'constraint', 'ratio'):
             # the two split modes, PLUS any mode the stage pins at a nonzero
-            # entry frac. A proportional split only redistributes its two
+            # entry frac. A two-mode split only redistributes its two
             # modes' combined mass, so a third mode held fixed (e.g. fwd
             # pinned while bwd/replay co-converge) is never "boosted" yet is
             # very much active -- omitting it here made the fused step drop it
             # from the loss entirely.
+            # 'ratio' belongs here for the same reason: like the other two it
+            # is a two-mode split parsed into {'metrics', 'pinned'} and it has
+            # no 'rules', so falling through to the lexicographic branch below
+            # raises KeyError on the first fused step of the stage.
             return (set(self.balance['metrics'])
                     | set(self.balance.get('pinned') or {})
                     | {mode for mode, v in self.fracs.items()
@@ -519,12 +749,16 @@ class Stage:
         if self.balance is None:
             return set(MODES)
         names = []
-        if self.balance['kind'] == 'proportional':
+        if self.balance['kind'] in ('proportional', 'constraint', 'ratio'):
             names += list(self.balance['metrics'].values())
         else:
             names += [r['metric'] for r in self.balance['rules']]
         for term in (self.exit or []):
             names.append(term['metric'])
+        # the buffer servo reads two branch metrics of its own, and a branch it
+        # reads must not be allowed to skip its force-refresh rollout
+        if self.buffer_servo is not None:
+            names += [self.buffer_servo['numerator'], self.buffer_servo['denominator']]
         out = set()
         for name in names:
             direction = name.partition('/')[0]
@@ -544,6 +778,13 @@ class StageProtocol:
         self._stages = None       # parsed lazily: args may still be assembling at __init__
         self._coeff_defaults = None
         self._energy_coeff_defaults = None
+        # pristine replay-buffer knobs, captured the first time the buffer
+        # servo runs and never written back. Instance state is correct here
+        # BECAUSE args are re-parsed from the yaml at every launch while the
+        # boost itself rides in stage_ctrl: base x checkpointed boost
+        # reconstructs the live values exactly, with no risk of a boosted value
+        # being mistaken for the base after a resume.
+        self._rb_base = None
 
     # ------------------------------------------------------------------ parse
 
@@ -682,11 +923,12 @@ class StageProtocol:
     # ------------------------------------------------------------------- tick
 
     def tick(self):
-        """10-step-cadence work: the balance nudge, then exit-trigger arming.
-        Transitions themselves only execute inside evaluation() (maybe_advance),
-        with fresh eval metrics in hand."""
+        """10-step-cadence work: the balance nudge, the buffer servo, then
+        exit-trigger arming. Transitions themselves only execute inside
+        evaluation() (maybe_advance), with fresh eval metrics in hand."""
         if self.stage.balance is not None:
             self._balance_tick()
+        self._buffer_servo_tick()
         self._exit_tick()
 
     # ------------------------------------------------------------- exit logic
@@ -1026,6 +1268,12 @@ class StageProtocol:
         if bal['kind'] == 'proportional':
             self._proportional_tick(bal)
             return
+        if bal['kind'] == 'constraint':
+            self._constraint_tick(bal)
+            return
+        if bal['kind'] == 'ratio':
+            self._ratio_tick(bal)
+            return
         ctrl = self.m.args.controller
 
         chosen = None
@@ -1197,6 +1445,322 @@ class StageProtocol:
         self.ctrl['prop_target'] = target
         self.ctrl['boost'] = mode_a if target > frac_a / total else mode_b
 
+    @staticmethod
+    def _logit(p, eps=1e-6):
+        p = min(max(float(p), eps), 1.0 - eps)
+        return math.log(p / (1.0 - p))
+
+    def _share_interval(self, bal, mode_num, mode_den, pair):
+        """Turn ABSOLUTE frac bounds into an interval on mode_num's SHARE OF
+        THE PAIR, then into theta limits. A ceiling on one mode is a floor on
+        the other, so either bound constrains both; naming both simply
+        intersects. Shared by the two integrator laws so the two cannot drift
+        apart on the direction of that conversion."""
+        s_lo, s_hi = 0.0, 1.0
+        bounds = bal.get('bounds') or {}
+        if mode_num in bounds:
+            s_lo = max(s_lo, bounds[mode_num][0] / pair)
+            s_hi = min(s_hi, bounds[mode_num][1] / pair)
+        if mode_den in bounds:
+            s_lo = max(s_lo, 1.0 - bounds[mode_den][1] / pair)
+            s_hi = min(s_hi, 1.0 - bounds[mode_den][0] / pair)
+        if s_lo > s_hi:  # only reachable if a pinned frac drifted off its declared value
+            s_lo = s_hi = 0.5 * (s_lo + s_hi)
+        return self._logit(s_lo), self._logit(s_hi)
+
+    def _ratio_tick(self, bal):
+        """Hold the RATIO of the two split modes' error metrics at a setpoint,
+        by integrating in the logit of the numerator mode's share:
+
+            e     = log(v_num / v_den) - log(setpoint)
+            theta <- clip(theta + clip(gain * k * e, +-max_step), th_lo, th_hi)
+            share_num = sigmoid(theta)
+
+        WHAT IT ASSUMES, AND WHY THAT IS THE WHOLE DESIGN. Each mode owns the
+        error it is the instrument for -- replay owns fwd/over_coverage (the
+        policy over-weighting its own support, delta > 0), bwd owns
+        bwd/relative_under_wcen (buffer modes the policy under-weights,
+        delta < 0). By the blindness bound each branch is exponentially blind
+        to the other's half of the residual field, so the split is an
+        allocation between two DISJOINT halves of one error, and the only
+        thing that has to be declared is their exchange rate. `setpoint` is
+        that exchange rate and it is the only judgement in the loop: 1.0 says
+        the two halves should be equally large, 4.0 says the under side should
+        settle at a quarter of the over side.
+
+        WHY A RATIO AND NOT TWO BARS. kind: proportional and kind: constraint
+        both carry one target/bar PER SIDE, which is one more number than the
+        problem has: only their exchange rate moves the equilibrium, and the
+        redundant dimension is free to be set wrong. Worse, both convert a
+        metric to a drive through max(v/t - 1, 0), so a side sitting under its
+        target contributes NOTHING and the loop silently goes one-sided --
+        which is the live defect on this route (bwd's target was read off a
+        metric it has since been swapped away from, pinning that drive at 0).
+        A signed log-ratio has no clamp: both sides always contribute, the
+        error changes sign rather than vanishing, and 'inert' is not a state
+        this loop can enter.
+
+        WHY LOGS. The two metrics are positive and their observed oscillation
+        has constant RELATIVE amplitude (~2x peak-to-trough on ty4xdlzo while
+        the level falls 10x), i.e. the noise is multiplicative. In logs that
+        cycle is a symmetric additive perturbation the integrator averages to
+        zero; in linear units the same cycle biases the mean.
+
+        SIGN. Raising the numerator mode's share reduces its own metric and
+        raises the other's, so rho falls as theta rises: e > 0 must RAISE
+        theta for negative feedback. Getting this backwards is a runaway to a
+        bound, which is why `numerator` is declared rather than inferred.
+
+        RATE. theta moves at most gain*max_step per tick at 10 train steps per
+        tick, so the time constant must exceed the ~1-2k-step absorption cycle
+        (bwd dragging in buffer states degrades forward calibration before
+        recovering, and a controller fast enough to react to that fights the
+        mechanism instead of the pathology).
+
+        CONVERGENCE GATE. A scale-free setpoint demands the same ratio whether
+        the halves are 20 nats apart or 2. converge_floor fades the gain to
+        zero as the larger metric approaches it, so the loop steers while
+        there is a real imbalance and retires itself once both halves are
+        inside the convergence scale -- where the objective it is a proxy for
+        has gone flat anyway.
+        """
+        m = self.m
+        for mode, value in (bal.get('pinned') or {}).items():
+            setattr(m, f'{mode}_frac', float(value))
+        mode_n = bal['numerator']
+        mode_d = next(mode for mode in bal['metrics'] if mode != mode_n)
+        v_n, v_d = self._resolve(bal['metrics'][mode_n]), self._resolve(bal['metrics'][mode_d])
+        frac_n, frac_d = getattr(m, f'{mode_n}_frac'), getattr(m, f'{mode_d}_frac')
+        pair = frac_n + frac_d
+        if pair <= 0:
+            return
+        th_lo, th_hi = self._share_interval(bal, mode_n, mode_d, pair)
+
+        theta = self.ctrl.get('rt_theta')
+        if theta is None:
+            # seed from where the stage actually entered, so tick 0 of the
+            # controller is bit-identical to the matching fixed-mix arm
+            theta = self._logit(frac_n / pair)
+        theta = min(max(float(theta), th_lo), th_hi)
+
+        # a non-positive reading is a degenerate metric, not a perfect one
+        # (relative_under_wcen goes nan when no sample clears the reward ramp,
+        # and 0 would send log to -inf): hold the actuator, do not guess
+        if v_n is None or v_d is None or v_n <= 0.0 or v_d <= 0.0:
+            # rt_hold, not rt_gain_scale = 0: the two reasons the loop stops
+            # moving are 'converged past converge_floor' and 'the sensor is
+            # not reporting', and collapsing them onto one zero is exactly the
+            # ambiguity this controller exists to avoid. rt_gain_scale keeps
+            # its last real value rather than being overwritten with a reading
+            # that was never taken.
+            self.ctrl['rt_theta'] = theta
+            self.ctrl['rt_hold'] = 1.0
+            return
+        rho = v_n / v_d
+        err = math.log(rho) - math.log(bal['setpoint'])
+        floor = bal.get('converge_floor')
+        k = 1.0 if not floor else min(max((max(v_n, v_d) - floor) / floor, 0.0), 1.0)
+        step = bal['gain'] * k * err
+        step = min(max(step, -bal['max_step']), bal['max_step'])
+        # clamping theta IS the anti-windup: the integrator state is the
+        # actuator, so a bounded theta cannot accumulate unrealizable demand
+        theta = min(max(theta + step, th_lo), th_hi)
+
+        share_n = 1.0 / (1.0 + math.exp(-theta))
+        setattr(m, f'{mode_n}_frac', share_n * pair)
+        setattr(m, f'{mode_d}_frac', (1.0 - share_n) * pair)
+        self.ctrl['rt_theta'] = theta
+        self.ctrl['rt_rho'] = rho
+        self.ctrl['rt_err'] = err
+        self.ctrl['rt_gain_scale'] = k
+        self.ctrl['rt_hold'] = 0.0
+        self.ctrl['rt_at_bound'] = (-1.0 if theta <= th_lo + 1e-9
+                                    else 1.0 if theta >= th_hi - 1e-9 else 0.0)
+        self.ctrl['boost'] = mode_n if step > 0 else mode_d
+
+    def _constraint_tick(self, bal):
+        """Split two modes' combined mass by INTEGRATING a one-sided
+        constraint violation against a one-sided objective shortfall, in the
+        logit of one side's share:
+
+            d_c = max(metric_c / bar_c - 1, 0)     # constrained side
+            d_r = max(metric_r / bar_r - 1, 0)     # best-effort side
+            theta <- clip(theta + clip(gain * (d_r - priority * d_c),
+                                       +-max_step),  theta_lo, theta_hi)
+            share_r = sigmoid(theta)
+
+        WHY AN INTEGRATOR, AND NOT THE PROPORTIONAL MAP. kind: proportional is
+        a static function of the metrics: the split it lands on is set by where
+        the two targets sit relative to each other, so a target that is merely
+        a guess produces a confidently wrong equilibrium and nothing ever
+        corrects it. That is a real cost here and not a hypothetical -- this
+        stage's own config carried `targets.bwd: 3.0` annotated UNCALIBRATED
+        for a metric it had already been swapped away from. An integrator moves
+        the actuator whenever a drive is nonzero and holds it when both are
+        zero, so the equilibrium is a property of the BARS, not of their ratio,
+        and only bars that are actually reachable have to be right.
+
+        WHY ASYMMETRIC. The two sides are not the same kind of quantity. The
+        constrained one (bwd absorbing the buffer's modes) is a level we can
+        state a priori -- relative_under_wcen ~ 2 means "no mode is badly
+        under-weighted" -- while the best-effort one (over_coverage on fresh
+        forward samples) has no known reachable level. `priority` (a gain
+        MULTIPLE, not a switch) makes the constraint win contests without ever
+        handing it the whole batch, so this is a soft lexicographic order:
+        there is no discontinuity for the split to limit-cycle on, which is
+        what the rule-based controller did in replay_july26.
+
+        WHAT AN UNREACHABLE BAR DOES. If the best-effort bar is set below its
+        metric's floor -- expected, since over_coverage's floor is unknown --
+        its drive never reaches zero and theta walks up until either the
+        constrained side pushes back or theta hits its bound. Both outcomes are
+        the intended answer to "take as good as we can get provided the
+        constraint holds", and both are legible in the log: prop of the run
+        spent at a bound is reported as cs_at_bound. The bound is therefore
+        load-bearing -- see the `bounds` validation for why it is required.
+
+        RATE. theta moves at most gain*max_step per tick and ticks every 10
+        train steps. Sized so a typical contest traverses the full bounded
+        range in ~1000-2000 steps: slower than the ~200-step proportional
+        default (which is far quicker than the plant), and slower than the
+        1-2k-step absorption cycle in the direction that STARVES bwd, while
+        `priority` lets the restoring direction move ~3x faster. That asymmetry
+        matches the failure asymmetry: starving bwd collapses coverage fast but
+        recovers fast, whereas starving replay/fwd degrades the policy slowly
+        and recovers slowly.
+        """
+        m = self.m
+        for mode, value in (bal.get('pinned') or {}).items():
+            setattr(m, f'{mode}_frac', float(value))
+        mode_c = bal['constrain']
+        mode_r = next(mode for mode in bal['metrics'] if mode != mode_c)
+        v_c, v_r = self._resolve(bal['metrics'][mode_c]), self._resolve(bal['metrics'][mode_r])
+        frac_c, frac_r = getattr(m, f'{mode_c}_frac'), getattr(m, f'{mode_r}_frac')
+        pair = frac_c + frac_r
+        if pair <= 0:
+            return
+
+        th_lo, th_hi = self._share_interval(bal, mode_r, mode_c, pair)
+
+        theta = self.ctrl.get('cs_theta')
+        if theta is None:
+            # seed from where the stage actually entered, so step 0 of the
+            # controller is bit-identical to the matching fixed-mix arm
+            theta = self._logit(frac_r / pair)
+        theta = min(max(float(theta), th_lo), th_hi)
+
+        if v_c is None or v_r is None:
+            # absent/non-finite metric (relative_under_wcen goes nan when no
+            # sample clears the reward ramp): hold the actuator, do not guess
+            self.ctrl['cs_theta'] = theta
+            return
+        d_c = max(v_c / float(bal['bars'][mode_c]) - 1.0, 0.0)
+        d_r = max(v_r / float(bal['bars'][mode_r]) - 1.0, 0.0)
+        step = bal['gain'] * (d_r - bal['priority'] * d_c)
+        step = min(max(step, -bal['max_step']), bal['max_step'])
+        # clamping theta IS the anti-windup: the integrator state is the
+        # actuator, so a bounded theta cannot accumulate unrealizable demand
+        theta = min(max(theta + step, th_lo), th_hi)
+
+        share_r = 1.0 / (1.0 + math.exp(-theta))
+        setattr(m, f'{mode_r}_frac', share_r * pair)
+        setattr(m, f'{mode_c}_frac', (1.0 - share_r) * pair)
+        self.ctrl['cs_theta'] = theta
+        self.ctrl['cs_drive'] = {mode_c: d_c, mode_r: d_r}
+        self.ctrl['cs_at_bound'] = (-1.0 if theta <= th_lo + 1e-9
+                                    else 1.0 if theta >= th_hi - 1e-9 else 0.0)
+        self.ctrl['boost'] = mode_r if step > 0 else mode_c
+
+    # ---------------------------------------------------------- buffer servo
+
+    def _buffer_servo_tick(self):
+        """Hold the replay buffer on the healthy side of the train/test
+        crossover by moving its FRESHNESS, not its loss weight.
+
+        SENSOR: ratio = replay/scatter_err over fwd/scatter_err. Replay draws
+        are a |resid|-prioritized resample of stored forward rollouts, so a
+        replay batch is by construction the HARD tail of the forward
+        distribution and its residual spread should exceed fresh forward's --
+        the observed healthy value is ~2x. The ratio crossing below 1 says the
+        policy fits reused stored trajectories BETTER than the fresh draws they
+        were selected from, which is memorization of the buffer's contents and
+        nothing else. Both branches now carry policy gradient (fwd runs
+        freeze_policy 0 in this route), so the two sides differ only in their
+        sampler, which is what makes the ratio a clean generalization gap
+        rather than a train-vs-heldout artifact.
+
+        ACTUATOR: one multiplicative boost B applied as churn_rate x B and
+        mean_residence_steps / B. In steady state (train.py manage_replay_buffer,
+        Little's law) occupancy = churn_rate x mean_residence_steps and
+        draws_per_row = batch_size / churn_rate, so this leaves OCCUPANCY
+        exactly invariant and moves only reuse (1/B) and policy lag (1/B). One
+        knob with one invariant is deliberate: churn_rate, mean_residence_steps
+        and max_size are three handles on the same steady state, and moving
+        them independently is how a buffer ends up in a corner nobody meant.
+        toxic_min_draws rides 1/B too, because it is defined relative to the
+        expected number of draws a row sees and would otherwise silently change
+        meaning as B moves.
+
+        WHY THIS IS A SECOND CONTROLLER AND NOT A BALANCE RULE. Loss weights
+        cannot fix overfitting. Down-weighting replay trains less on a
+        memorized buffer; it does not make the buffer less memorized, and it
+        also gives up the residual-tail correction replay exists to provide.
+        Freshness is the actuator that acts on the cause, so it gets its own
+        loop -- and the two loops are near-orthogonal by construction (this one
+        holds occupancy fixed and changes no frac; the balance controller
+        changes fracs and touches no buffer knob).
+
+        DEADBAND AND RELEASE. Tighten below `bar`, release above `release`,
+        hold in between, with `relax` < 1 making release the slower direction.
+        Each side's drive is the deviation normalized by `scale` and saturated
+        at 1, so the rate is set by the CONFIGURED ramp speed rather than by
+        how deep the excursion happens to be -- see the `scale` note in
+        _parse_buffer_servo for why the raw deficit is unusable here.
+        The deadband keeps the servo off during normal ratio jitter, and the
+        release term is what keeps it from being a ratchet whose fixed point is
+        max_boost -- the same one-way-anneal failure mode as
+        controller-ratchet-marginal-breach. Cost of over-churning is real
+        (admission work rises with B, and at high B replay degenerates into an
+        on-policy duplicate of fwd), which is why release exists at all.
+        """
+        spec = self.stage.buffer_servo
+        if spec is None:
+            # a previous stage's boost must not survive into a stage that
+            # declares no servo (stage_ctrl resets, so nothing else would undo it)
+            if self._rb_base is not None:
+                self._apply_buffer_boost(1.0)
+            return
+        num, den = self._resolve(spec['numerator']), self._resolve(spec['denominator'])
+        if num is None or den is None or den <= 0.0:
+            return  # cold start (replay has not trained yet): hold at the configured buffer
+        ratio = num / den
+        sc = spec['scale']
+        drive = (min(max(spec['bar'] - ratio, 0.0) / sc, 1.0)
+                 - spec['relax'] * min(max(ratio - spec['release'], 0.0) / sc, 1.0))
+        step = min(max(spec['gain'] * drive, -spec['max_step']), spec['max_step'])
+        log_boost = float(self.ctrl.get('bs_log_boost', 0.0)) + step
+        log_boost = min(max(log_boost, 0.0), math.log(spec['max_boost']))
+        self.ctrl['bs_log_boost'] = log_boost
+        self.ctrl['bs_ratio'] = ratio
+        self._apply_buffer_boost(math.exp(log_boost))
+
+    def _apply_buffer_boost(self, boost):
+        """Write the live replay-buffer knobs as base x boost. train.py reads
+        these off args on every manage call, so the change takes effect on the
+        next churn with no plumbing."""
+        rb = self.m.args.buffers.replay_buffer
+        if self._rb_base is None:
+            self._rb_base = {'churn_rate': float(rb.churn_rate),
+                             'mean_residence_steps': float(rb.mean_residence_steps),
+                             'toxic_min_draws': float(getattr(rb, 'toxic_min_draws', 0) or 0)}
+        base = self._rb_base
+        rb.churn_rate = max(1, int(round(base['churn_rate'] * boost)))
+        # floor at 2 steps: below that the hazard evicts essentially the whole
+        # buffer every call and replay stops being a buffer at all
+        rb.mean_residence_steps = max(2.0, base['mean_residence_steps'] / boost)
+        if base['toxic_min_draws'] > 0:
+            rb.toxic_min_draws = max(2, int(round(base['toxic_min_draws'] / boost)))
+
     def _nudge_mode_fracs(self, boost):
         """EMA nudge of the fracs toward a target split, with PER-MODE floors
         -- the stage's explicit min_fracs where given, controller.min_mode_frac
@@ -1229,9 +1793,18 @@ class StageProtocol:
         stage = self.stage
         out = {}
         boost = self.ctrl.get('boost')
-        if boost is not None:
+        kind = stage.balance['kind'] if stage.balance is not None else None
+        if boost is not None and kind != 'ratio':
+            # under kind: ratio this is just sign(rt_err) recoded as a 3-valued
+            # categorical, i.e. strictly less information than rt_err itself.
+            # It stays for the rule-based kinds, where WHICH mode won a contest
+            # is not recoverable from any other series.
             out['protocol/boost'] = {'fwd': 0, 'bwd': 1, 'replay': 2}[boost]
-        out['protocol/anneal_streak'] = self.ctrl.get('anneal_streak', 0)
+        if stage.balance is not None and stage.balance['kind'] == 'lexicographic':
+            # only _balance_tick's lexicographic path ever writes this, so
+            # emitting it unconditionally publishes a constant 0 on every other
+            # kind -- a flat series that looks like a reading
+            out['protocol/anneal_streak'] = self.ctrl.get('anneal_streak', 0)
         if stage.balance is not None and stage.balance['kind'] == 'proportional':
             # the split the controller is steering toward (share of the two
             # modes' COMBINED mass going to the first), alongside each side's
@@ -1255,6 +1828,59 @@ class StageProtocol:
                     # drive_a / (drive_a + drive_b)
                     out[f'protocol/prop_drive_{mode}'] = self._drive(
                         v, live, stage.balance.get('drive'))
+        if stage.balance is not None and stage.balance['kind'] == 'constraint':
+            # theta is the integrator state AND the actuator, so it is the one
+            # series that says what the controller is doing; cs_at_bound says
+            # whether it is still steering (0) or has parked against a bound
+            # (+-1), which is the difference between "converged" and
+            # "the bar was unreachable and the bound is the answer"
+            if self.ctrl.get('cs_theta') is not None:
+                theta = float(self.ctrl['cs_theta'])
+                out['protocol/cs_theta'] = theta
+                out['protocol/cs_share'] = 1.0 / (1.0 + math.exp(-theta))
+            if 'cs_at_bound' in self.ctrl:
+                out['protocol/cs_at_bound'] = self.ctrl['cs_at_bound']
+            for mode, d in (self.ctrl.get('cs_drive') or {}).items():
+                # dimensionless (metric/bar - 1), so the two are directly
+                # comparable and the contest is readable as d_r vs priority*d_c
+                out[f'protocol/cs_drive_{mode}'] = d
+            for mode, bar in stage.balance['bars'].items():
+                out[f'protocol/cs_bar_{mode}'] = float(bar)
+        if stage.balance is not None and stage.balance['kind'] == 'ratio':
+            # rt_err is the whole loop in one series: SIGNED, never clamped, so
+            # unlike a one-sided drive it cannot read the same when satisfied
+            # and when welded off. Sign says which mode is being fed, magnitude
+            # says by how many nats of log-ratio the split is off its setpoint,
+            # and it crossing zero is the equilibrium.
+            if self.ctrl.get('rt_theta') is not None:
+                theta = float(self.ctrl['rt_theta'])
+                out['protocol/rt_theta'] = theta
+                out['protocol/rt_share'] = 1.0 / (1.0 + math.exp(-theta))
+            for key in ('rt_rho', 'rt_err', 'rt_gain_scale', 'rt_at_bound', 'rt_hold'):
+                if key in self.ctrl:
+                    out[f'protocol/{key}'] = float(self.ctrl[key])
+            out['protocol/rt_setpoint'] = float(stage.balance['setpoint'])
+            # both metrics in their own units next to the ratio they form, so a
+            # gain_scale that has faded to 0 can be read as 'converged' rather
+            # than 'sensor died'
+            for mode, metric in stage.balance['metrics'].items():
+                v = self._resolve(metric)
+                if v is not None:
+                    out[f'protocol/rt_metric_{mode}'] = v
+        if stage.buffer_servo is not None:
+            out['protocol/bs_boost'] = math.exp(float(self.ctrl.get('bs_log_boost', 0.0)))
+            if 'bs_ratio' in self.ctrl:
+                out['protocol/bs_ratio'] = self.ctrl['bs_ratio']
+            # The ACTUATOR, not just the sensor. Without this a servo that is
+            # reading fine but has no authority looks identical to one that is
+            # correctly holding -- the S2 drive-liveness failure shape again.
+            if 'bs_log_boost' in self.ctrl:
+                out['protocol/bs_log_boost'] = self.ctrl['bs_log_boost']
+            rb = self.m.args.buffers.replay_buffer
+            # the LIVE knobs, so the servo's effect is visible next to its
+            # sensor rather than having to be recomputed from boost x base
+            out['protocol/bs_churn_rate'] = float(rb.churn_rate)
+            out['protocol/bs_residence'] = float(rb.mean_residence_steps)
         if stage.balance is not None and stage.balance['kind'] == 'lexicographic':
             for i, rule in enumerate(stage.balance['rules']):
                 rs = self.ctrl['rules'].get(i, {})

@@ -29,6 +29,7 @@ from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTra
 from energy_sampling.checkpointing import Checkpointer, MODELLER_STATE_DEFAULTS
 from energy_sampling.controller import LRController
 from energy_sampling.protocol import StageProtocol
+from energy_sampling.step_probe import StepProbe
 from energy_sampling.eval.utils import sample_eval_fwd_trajs
 from energy_sampling.utils import is_cuda_oom, \
     dict2namespace, \
@@ -353,6 +354,17 @@ class Modeller:
         # live batch size at step-time resolution: paired with train_step_time
         # this makes every run a samples/sec-vs-batch knee scan for free
         metrics['Batch Size'] = self.batch_size
+        # step-probe readings (empty dict unless step_probe.enabled). Read
+        # probe/alpha_median against probe/alpha_iqr and probe/fit_*_rate: a
+        # wandering median, or a rising downward/flat rate, voids the sensor
+        # independently of what the alpha* values say.
+        metrics.update(self.step_probe.report())
+        metrics.update(getattr(self, '_replay_is_stats', {}) or {})
+        # Memorisation sensor. replay/resid_vs_intake is the servo's input:
+        # 1.0 = delay line, 1/e = 0.368 = the lambda*tau = 1 boundary, below
+        # that the buffer is being fitted at its own trajectories.
+        if getattr(self, 'replay_buffer', None) is not None and len(self.replay_buffer) > 0:
+            metrics.update(self.replay_buffer.absorption_stats())
         if hasattr(self, 'last_grad_norm_pre_clip'):
             metrics['grad_norm_pre_clip'] = self.last_grad_norm_pre_clip
         # per-submodel grad norms (see _submodel_grad_norms) + how many steps
@@ -486,6 +498,32 @@ class Modeller:
                 self.args.bwd_loss_coeffs.subtb_lambda, self.args.integrator.T).to(self.gfn_model.device)
             self.args.replay_loss_coeffs.coeff_matrix = cal_subtb_coef_matrix(
                 self.args.replay_loss_coeffs.subtb_lambda, self.args.integrator.T).to(self.gfn_model.device)
+
+        self._warn_if_z_untrained()
+
+    def _warn_if_z_untrained(self):
+        """Warn when the live coefficients leave the flow (Z) head with no
+        trainer at all. The silent combination is tb_z_source: 'persistent' with
+        no sidecar: get_tb_loss substitutes a DETACHED per-condition target
+        wherever the tracker is warmed, so those rows give the flow model no TB
+        gradient, and emp_z_persistent is the term that is supposed to take over
+        (see gflownet_losses.get_tb_loss). Config-level mistake rather than a
+        code path, so this reports rather than raises."""
+        trainers = []
+        for mode in ('fwd', 'bwd', 'replay'):
+            c = getattr(self.args, f'{mode}_loss_coeffs', None)
+            if c is None or getattr(c, 'freeze_z', 0) > 0.5:
+                continue
+            tb_trains_z = (getattr(c, 'tb', 0) > 0
+                           and self.tb_z_source(mode) != 'persistent')
+            if tb_trains_z or any(getattr(c, k, 0) > 0 for k in
+                                  ('emp_z', 'emp_z_persistent', 'z_level', 'db', 'subtb')):
+                trainers.append(mode)
+        if not trainers:
+            print(f"WARNING [stage '{self.protocol.stage.name}']: no mode trains the flow "
+                  f"(Z) head -- every branch is freeze_z, or its TB reads a detached "
+                  f"persistent target with no emp_z/emp_z_persistent/z_level sidecar. "
+                  f"log_Z will not move for this stage.")
 
     def set_energy_coeffs(self):
         """Live energy-function coefficients (e.g. bounding_coeff,
@@ -1236,6 +1274,21 @@ class Modeller:
         flow_params = self.gfn_model.flow_model.parameters()
         self.optimizers['flow'] = torch.optim.Adam(flow_params, init_flow_lr, weight_decay=weight_decay)
 
+        # Two-point step probe (docs/to_do_rebuild.md A3/A4b) -- SENSOR ONLY, no
+        # actuation. Built over the same param list the fused optimizer's policy
+        # groups cover and NOT the flow head, per decision D26 option (b): the Z
+        # head is LR-pinned separately, so folding it in would make alpha* rate a
+        # composite step the servo would not control. Absent config block =>
+        # disabled, so this is inert for every existing config.
+        sp_cfg = getattr(self.args, 'step_probe', None)
+        self.step_probe = StepProbe(
+            [p for g in get_policy_params(self.gfn_model) for p in g['params']],
+            cadence=getattr(sp_cfg, 'cadence', 20),
+            window=getattr(sp_cfg, 'window', 25),
+            enabled=bool(getattr(sp_cfg, 'enabled', False)),
+            span=float(getattr(sp_cfg, 'span', 2.0)),
+        )
+
     def init_prior_dataset(self):
 
         prior_data = torch.load(self.args.prior_path, weights_only=False)
@@ -1985,6 +2038,15 @@ class Modeller:
 
         reported_loss = loss.cpu().detach().item()
 
+        # Step probe: snapshot policy params, let the optimizer step land, then
+        # re-score a frozen held-out batch at alpha in {0, 1/2, 1} along the step
+        # actually taken. Sensor only -- measure() restores every parameter it
+        # touches bitwise, and a probe that finds no step (non-finite gradient,
+        # or mid-accumulation) tallies 'nostep' and returns without reading.
+        probe_armed = self.step_probe.arm(self.step_ind)
+        if probe_armed:
+            probe_batch, probe_coeffs, probe_source, probe_repeats = self._draw_probe_batch()
+
         if accumulating:
             self.fused_accum_count += self.batch_size
             do_step = self.fused_accum_count >= accum_target
@@ -1993,6 +2055,11 @@ class Modeller:
                 self.fused_accum_count = 0
         else:
             self.step_loss(step_type, loss)
+
+        if probe_armed:
+            self.step_probe.measure(
+                lambda: self._probe_loss(probe_batch, probe_coeffs, probe_source,
+                                         discretizer, probe_repeats))
 
         if step_type == 'fused':
             self.record_fused_substep_losses(sub_losses)
@@ -2411,6 +2478,84 @@ class Modeller:
             return {}
         return {f'gradnorm/{n}': v for n, v in
                 zip(names, torch.stack(norms).cpu().tolist())}
+
+    def _draw_probe_batch(self):
+        """
+        Draw the batch the step probe scores at all three alpha. FRESH EVERY
+        PROBE -- the invariant that matters is 'identical data across the three
+        alpha WITHIN one probe', not 'identical across probes'. Only the former
+        keeps the second difference free of trajectory/condition noise; the
+        latter just goes stale, and re-drawing per probe averages the particular
+        draw out for free (a buffer draw costs no energy calls).
+
+        SOURCE: replay, i.e. ON-POLICY ROLLOUTS. Replay rows are fed by the fwd
+        branch (to_do_rebuild B2 -- 'it inherits Q's blindness, by intake'), so a
+        replay draw IS the on-policy distribution, with stored energies. That is
+        the right distribution to probe on because it carries the highest loss
+        variance in the system, and a step-size sensor should be read at its
+        worst case for stability rather than its most forgiving one. Falls back
+        to the backward draw only when replay is unavailable (phase 1, or an
+        empty buffer).
+
+        HELD OUT: a fresh draw is disjoint from this step's training batch in
+        expectation, which is the property that matters -- same-batch probing is
+        biased high, because a step reduces loss on its own batch more than on
+        the population and would systematically license too-large steps.
+        """
+        # repeats MUST come from the branch whose coeffs we score with: a coeff
+        # bank is only valid at its own branch's K. bwd_loss_coeffs carries tbc,
+        # whose residual is defined over K same-terminal rollouts and which
+        # asserts K > 1 -- so scoring a bwd draw at replay's K crashes in phase 1,
+        # where replay does not exist yet and the fallback is the only path.
+        if getattr(self, 'replay_buffer', None) is not None and len(self.replay_buffer) > 0:
+            k = self.mode_repeats('replay')
+            return self.draw_replay_sample(k), self.args.replay_loss_coeffs, 'replay', k
+        k = self.mode_repeats('bwd')
+        return self.draw_bwd_sample(k), self.args.bwd_loss_coeffs, 'bwd', k
+
+    @torch.no_grad()
+    def _probe_loss(self, batch, coeffs, source, discretizer, repeats):
+        """
+        Re-score the probe batch under the CURRENT parameters. Stored
+        trajectories and stored energies, so no resampling and no energy calls.
+
+        FORWARD ONLY -- the whole probe runs under no_grad and builds no graph,
+        so it costs three forward passes and zero backward passes.
+
+Two things deliberately NOT done here, both recorded in
+        docs/to_do_rebuild.md A4c so they are not re-proposed:
+
+        - Running one evaluation WITH grad to harvest a 'free' gradient. A
+          backward is ~2x a forward, so the already-paid forward is the cheap
+          third of a forward+backward; the saving is under 1% of training
+          compute and it would put probe gradients into the training path.
+        - Moving to alpha* instead of restoring to alpha=1. That is a line
+          search, a live stage-2 option, but stage 1 restores so the probe
+          cannot influence the trajectory it is measuring.
+
+        Must not mutate training state: update_log_z=False is the single gate on
+        the condition-log-Z tracker (gflownet_losses.py:432), report_losses=False
+        keeps it cheap, and unlike replay_train_step this deliberately does NOT
+        call buffer.update_losses -- a probe draw is not a training visit and
+        must not count as one for churn, priority, or residence.
+        """
+        condition, condition_id, _inds, latents, log_reward, mol_batch, traj = batch
+        loss, _ = get_gfn_backward_loss(coeffs,
+                                        latents.to(self.device),
+                                        self.gfn_model,
+                                        log_reward.to(self.device),
+                                        discretizer,
+                                        mol_batch,
+                                        condition=condition,
+                                        repeats=repeats,
+                                        report_losses=False,
+                                        trajectories=traj,
+                                        condition_log_z=self.condition_log_z,
+                                        condition_id=condition_id,
+                                        tb_z_source=self.tb_z_source(source),
+                                        update_log_z=False,
+                                        step=self.step_ind)
+        return loss.detach().item()
 
     def step_loss(self, step_type, loss, do_step: bool = True):
         loss.backward()
@@ -2944,9 +3089,37 @@ class Modeller:
                                                 condition_id=condition_id,
                                                 tb_z_source=self.tb_z_source('replay'),
                                                 update_log_z=self.protocol.flag('update_log_z'),
-                                                step=self.step_ind)
+                                                step=self.step_ind,
+                                                sample_weights=self._replay_is_w)
 
         self.replay_buffer.update_losses(loss_dict['resid'].abs(), inds)
+        # Refresh the per-row log w EMA. This is what makes the prioritised draw
+        # possible at all -- prioritised_weights reconstructs the SIGNED residual
+        # as log_Z - ema_logw, and ema_loss (|resid|) cannot supply the sign.
+        # The field and its checkpoint round-trip already existed; nothing
+        # called it until now.
+        logw = (loss_dict['log_r'] + loss_dict['log_pb'] - loss_dict['log_pf']).detach()
+        self.replay_buffer.update_logw_stats(logw, inds)
+
+        # Publish the memorisation sensor into the METRIC TRACKER, not just into
+        # the wandb metrics dict. StageProtocol._resolve reads every servo sensor
+        # via metric_tracker.get(direction, metric) -- so a stat that only ever
+        # reaches the report path is invisible to the buffer servo, which then
+        # resolves None and returns early on every tick as if cold-started.
+        #
+        # That is exactly what happened in r4_overfit_servo on 2026-08-07: the
+        # deliberate overfit worked (lambda_tau peaked at 1.43, ratio 0.24, well
+        # past the 0.368 bar) and the servo never moved, because
+        # protocol/bs_log_boost was never even emitted.
+        st = self.replay_buffer.absorption_stats()
+        if st:
+            self.metric_tracker.update(
+                'replay',
+                {'ema_loss_mean': st['replay/ema_loss_mean'],
+                 'birth_loss_mean': st['replay/birth_loss_mean'],
+                 'resid_vs_intake': st['replay/resid_vs_intake'],
+                 'lambda_tau': st['replay/lambda_tau']},
+                self.step_ind)
 
         return loss, loss_dict
 
@@ -3004,14 +3177,88 @@ class Modeller:
         return condition, condition_id, inds, latents, log_reward, mol_batch, traj
 
     @torch.no_grad()
+    @torch.no_grad()
+    def current_log_z(self):
+        """
+        Live log Z_learned as a plain float, without a rollout -- the
+        prioritised draw needs it BEFORE any trajectory is scored, to turn the
+        buffer's stored ema_logw into a signed residual (delta = log_Z - log_w).
+
+        Unconditional route: flow_model is a LearnableScalar, so calling it with
+        no arguments returns the scalar. Anything else (a conditional FlowModel
+        needing an embedding) returns None, and the caller degrades to a uniform
+        draw rather than guessing a level.
+        """
+        try:
+            v = self.gfn_model.flow_model()
+        except Exception:
+            return None
+        if v is None:
+            return None
+        v = torch.as_tensor(v).detach().flatten()
+        if v.numel() != 1 or not torch.isfinite(v).all():
+            return None
+        return float(v[0])
+
+    def replay_priority_config(self):
+        """kappa for the prioritised replay draw; None/<=0 disables it and the
+        draw stays uniform. Absent config block => off, so this is inert for
+        every existing config."""
+        cfg = getattr(self.args.buffers.replay_buffer, 'prioritise', None)
+        if cfg is None or not bool(getattr(cfg, 'enabled', False)):
+            return None
+        return float(getattr(cfg, 'kappa', 1.0))
+
     def draw_replay_sample(self, repeats):
+        # Prioritised-IS draw (docs/to_do_rebuild.md B5): p ~ delta_plus^kappa
+        # with the row weights that undo it. delta is reconstructed from the
+        # buffer's ema_logw against the live log Z -- signed, which |resid|
+        # is not. self._replay_is_w carries the drawn rows' weights to
+        # replay_train_step.
+        kappa = self.replay_priority_config()
+        p = None
+        self._replay_is_w = None
+        if kappa is not None:
+            log_z = self.current_log_z()
+            if log_z is not None:
+                p, w_row = self.replay_buffer.prioritised_weights(log_z, kappa=kappa)
+
+        # beta is the fraction of the batch drawn UNIFORMLY, not a temperature:
+        # _sample_indices splits the batch into n_uniform = batch*beta and
+        # n_weighted = batch - n_uniform. The legacy call passed beta=1.0, which
+        # is 100% uniform -- so a supplied `p` was silently ignored.
+        #
+        # That is fatal for the prioritised estimator rather than merely
+        # suboptimal: the IS weights w ~ 1/delta_plus^kappa were still applied to
+        # the loss, so a UNIFORM draw carrying 1/p weights targets a measure
+        # ~ 1/delta^kappa -- the INVERSE of the intended one, up-weighting the
+        # lowest-residual rows. It also drew ineligible (w = 0) rows, which is
+        # why is_ess_frac tracked is_elig_frac exactly (0.40 vs 0.39 at kappa=0).
+        #
+        # With a computed p the draw must come entirely from it.
+        draw_beta = 0.0 if p is not None else 1.0
         mol_batch, traj, inds = next(
             self.replay_buffer.loader(
                 batch_size=self.batch_size, mode='graphs',
                 repeats=repeats, return_inds=True,
                 weighted=False,
-                temperature=0.1, beta=1.0,
-                return_traj=True))
+                temperature=0.1, beta=draw_beta,
+                return_traj=True, p=p))
+
+        if p is not None:
+            wb = np.asarray(w_row)[np.asarray(inds).ravel()]
+            self._replay_is_w = torch.as_tensor(wb, dtype=torch.float32)
+            # ESS of the BATCH weights is the load-bearing diagnostic: the
+            # estimator is unbiased at every kappa by construction, so the only
+            # thing that can go wrong is variance -- and it goes wrong through
+            # a heavy weight tail, not through the mean. ess_frac near 1 is
+            # near-uniform; near 0 means a handful of rows own the batch.
+            s1, s2 = float(wb.sum()), float((wb ** 2).sum())
+            self._replay_is_stats = {
+                'replay/is_ess_frac': (s1 * s1 / s2 / len(wb)) if s2 > 0 else 1.0,
+                'replay/is_w_max_ratio': float(wb.max() / max(wb.mean(), 1e-12)),
+                'replay/is_elig_frac': float((np.asarray(p) > 0).mean()),
+            }
 
         latents = mol_batch.latent_params()
         latents = latents.to(self.device)
@@ -4705,8 +4952,26 @@ class Modeller:
         self._replay_admit_cap = cap
         self._replay_admit_health = h
 
-        elig = torch.argwhere(sane & (resid.abs() > floor)).flatten()
-        clipped_score = resid[elig].abs().clamp(max=cap)
+        # UNIFORM INTAKE (docs/to_do_rebuild.md B7b) when the prioritised draw
+        # is on. Every selective admission step multiplies into the buffer's
+        # density -- mu_buf ~ Q_admit * p_admit * p_survive -- and the draw's
+        # importance weight divides by the DRAW only, so a residual-dependent
+        # admission rule re-enters the force spectrum uncorrected, counting the
+        # residual twice and once stale. Gates may depend on energy, age, or
+        # randomness; never on the residual.
+        #
+        # Negative-residual rows are admitted deliberately: they are dormant,
+        # not dead (delta moves as the policy moves), they draw with p ~ 0 under
+        # delta_plus so they cost memory rather than gradient budget, and
+        # filtering them CENSORS rather than reweights -- a row admitted at
+        # delta < 0 that would have gone positive is unrecoverable.
+        uniform_intake = self.replay_priority_config() is not None
+        if uniform_intake:
+            elig = torch.argwhere(sane).flatten()
+            clipped_score = torch.ones(elig.numel(), device=resid.device)
+        else:
+            elig = torch.argwhere(sane & (resid.abs() > floor)).flatten()
+            clipped_score = resid[elig].abs().clamp(max=cap)
         # trajectories go wherever the buffer lives -- no forced D2H when GPU-resident
         flow_states = fwd_stats['flow_states'].detach().to(self.buffer_device)
 
@@ -4786,11 +5051,25 @@ class Modeller:
                 "(stalled-row eviction); backstop_mult defaults to 5. Sizing is now "
                 "Little's law: occupancy = churn_rate * mean_residence_steps.")
 
-        floor_mask = ema < floor
+        # HAZARD-ONLY PURGE under the prioritised scheme (B7b). floor and
+        # stalled both condition p_survive on the residual, which biases the
+        # population exactly as residual-dependent admission does. Two further
+        # reasons they go:
+        #   - under a delta_plus^kappa draw a corrected row already has p ~ 0,
+        #     so the floor was never buying gradient budget, only memory --
+        #     and the hazard reclaims memory without the bias.
+        #   - a row driven to delta ~ 0 BY REPEATED REPLAY is delta ~ 0 at that
+        #     exact trajectory, i.e. memorisation. The low value is the
+        #     EVIDENCE the weighted_replay_err >= fwd_err precept reads;
+        #     purging it destroys the signal.
+        # hazard (uniform-random) and backstop (age) stay: both are independent
+        # of the residual, so p_survive drops out of the weight.
+        floor_mask = (torch.zeros_like(ema, dtype=torch.bool) if uniform_intake
+                      else ema < floor)
         age = self.step_ind - self.replay_buffer.birth_step
 
         stalled_mask = torch.zeros_like(floor_mask)
-        min_draws = int(getattr(rb_cfg, 'toxic_min_draws', 0) or 0)
+        min_draws = 0 if uniform_intake else int(getattr(rb_cfg, 'toxic_min_draws', 0) or 0)
         if min_draws > 0:
             delta_thresh = float(getattr(rb_cfg, 'toxic_delta_threshold', 0.0))
             delta = ema - self.replay_buffer.birth_loss
@@ -5204,10 +5483,23 @@ class Modeller:
         # inflation doesn't hide a collapse that severe. A cold channel (phase-1
         # seeding: no fwd stats yet) abstains rather than blocks, preserving
         # seeding behavior exactly.
-        r2 = self.metric_tracker.get('fwd', 'r2')
-        z_grad = self.metric_tracker.get('fwd', 'tb_resid_clipped')
-        if ((r2 is not None and r2 < getattr(cfg, 'health_gate_r2', 0.9))
-                or (z_grad is not None and abs(z_grad) > getattr(cfg, 'health_gate_zerr', 0.5))):
+        # Both channels are now NAMED in config so the ruler can be swapped
+        # without a code change: health_gate_floor_metric is compared as a
+        # lower bound (below the bar = unhealthy), health_gate_ceiling_metric
+        # as an upper bound on its ABSOLUTE value. Defaults reproduce the
+        # historical pair exactly. The natural upgrade is to point the ceiling
+        # at a modern control metric (fwd/tb_err_worst) instead of r2, which
+        # survives here only as a damage detector.
+        floor_name = getattr(cfg, 'health_gate_floor_metric', 'r2')
+        ceil_name = getattr(cfg, 'health_gate_ceiling_metric', 'tb_resid_clipped')
+        # defaults preserved from the pre-2026-08-03 hardcoded form, so a config
+        # that names neither key gates exactly as it always did
+        floor_bar = getattr(cfg, 'health_gate_r2', 0.9)
+        ceil_bar = getattr(cfg, 'health_gate_zerr', 0.5)
+        floor_val = self.metric_tracker.get('fwd', floor_name) if floor_bar is not None else None
+        ceil_val = self.metric_tracker.get('fwd', ceil_name) if ceil_bar is not None else None
+        if ((floor_val is not None and floor_val < float(floor_bar))
+                or (ceil_val is not None and abs(ceil_val) > float(ceil_bar))):
             return
         log_r = torch.as_tensor(log_r).detach().to(self.device).flatten()
         energy = torch.as_tensor(energy).detach().to(self.device).flatten()

@@ -301,7 +301,14 @@ class CrystalBuffer:
             inds = np.concatenate([weighted_inds, uniform_inds])
         else:
             if replace is None:
-                replace = batch_size > n
+                # A supplied `p` is a DESIGN MEASURE, and importance-sampling
+                # correctness assumes iid draws from it -- so it must be drawn
+                # WITH replacement. Without-replacement also fails outright when
+                # p has zeros: the one-sided prioritised draw (B5) zeroes every
+                # delta_plus <= 0 row, and once the eligible pool falls below
+                # batch_size numpy raises "Fewer non-zero entries in p than
+                # size". That killed the kappa=0 arm at step 119 on 2026-08-07.
+                replace = True if p is not None else batch_size > n
             inds = np.random.choice(n, size=batch_size, replace=replace, p=p)
 
         if repeats > 1:
@@ -723,36 +730,6 @@ class CrystalBuffer:
         self.ema_log_z_emp = new_ema_log_z_emp
 
     @torch.no_grad()
-    def purge(
-            self,
-            max_count: int,
-            loss_cutoff: Optional[float] = None,
-    ):
-        """
-        Drop well-sampled, below-cutoff samples.
-
-        Purges where:
-            count > max_count
-            ema_loss < loss_cutoff
-
-        Uninitialized NaN losses are never purged.
-        """
-        losses = self.ema_loss
-        counts = self.select_counts
-
-        valid = ~torch.isnan(losses)
-        if valid.sum() == 0:
-            return
-
-        if loss_cutoff is None:
-            loss_cutoff = torch.nanmean(losses).item()
-
-        mask = valid & (losses < loss_cutoff) & (counts > max_count)
-        purge_list = torch.nonzero(mask, as_tuple=False).flatten().tolist()
-
-        self.purge_by_index(purge_list)
-
-    @torch.no_grad()
     def purge_lowest(
             self,
             num_to_purge: int,
@@ -882,6 +859,175 @@ class CrystalBuffer:
         p = np.clip(p, epsilon, None)  # floor before renorm
         p /= p.sum()
         return p
+
+    def absorption_stats(self):
+        """
+        Memorisation sensor (docs/to_do_rebuild.md B7d). Compares each resident
+        row's CURRENT residual against the residual it was ADMITTED with:
+
+            ratio    = mean(ema_loss) / mean(birth_loss)     in (0, 1]
+            absorbed = 1 - ratio
+            lambda_tau = -ln(ratio)
+
+        `ratio` is the whole sensor. 1.0 = the buffer is a pure delay line, its
+        composition is the intake distribution, nothing has been fitted. Falling
+        toward 0 = resident rows have been corrected *at those exact
+        trajectories* while the intake distribution has not moved, which is
+        memorisation by definition.
+
+        WHY THIS NEEDS NO CALIBRATION. Under exponential relaxation at rate
+        lambda and exponential residence with mean tau, ratio ~ exp(-lambda*tau),
+        so the B7a boundary lambda*tau = 1 -- rows corrected faster than they
+        are evicted -- lands at ratio = 1/e = 0.368. That is a DERIVED setpoint,
+        not a measured band, so it transfers across problem, T and buffer size.
+
+        WHY THERE IS NO SURVIVORSHIP BIAS. birth_loss is only available for rows
+        still resident, so it is the intake distribution *of survivors*. Under
+        the uniform-random hazard (B7b) survivors are an unbiased sample of
+        admits, so that equals the intake distribution. This property is a
+        direct consequence of making the purge uniform and would NOT hold under
+        the old floor/stalled eviction.
+
+        Undrawn rows have ema_loss == birth_loss exactly (update_losses only
+        touches drawn rows) and so contribute ratio 1. That is correct: a row
+        nothing has trained on cannot have been memorised, and a buffer churning
+        fast enough that most rows are never drawn genuinely is not memorising.
+        """
+        e = self.ema_loss.double()
+        b = self.birth_loss.double()
+        m = torch.isfinite(e) & torch.isfinite(b) & (b > 0)
+        n = int(m.sum())
+        if n < 8:
+            return {}
+        em, bm = float(e[m].mean()), float(b[m].mean())
+        if bm <= 0:
+            return {}
+        ratio = max(em / bm, 1e-9)
+        return {
+            'replay/ema_loss_mean': em,
+            'replay/birth_loss_mean': bm,
+            'replay/resid_vs_intake': ratio,          # the servo's sensor
+            'replay/absorbed_frac': 1.0 - ratio,
+            'replay/lambda_tau': -math.log(ratio),    # 1.0 is the B7a boundary
+            'replay/absorption_n': float(n),
+        }
+
+    def prioritised_weights(
+            self,
+            log_z: float,
+            kappa: float = 1.0,
+            nan_quantile: float = 0.90,
+            floor_frac: float = 0.25,
+    ):
+        """
+        Prioritised-IS sampling distribution over rows (docs/to_do_rebuild.md
+        B5/B5b). Returns (p, w_of_row) where p is the draw distribution and
+        w_of_row is the per-row importance weight that UNDOES it, so that
+
+            E_p[w * f]  ==  E_uniform[f]
+
+        i.e. the estimator is unbiased for the uniform-buffer average at every
+        kappa. Only the VARIANCE changes with kappa -- that is the whole point
+        of the kappa ladder, and it is why any difference a ladder measures is
+        estimator variance and nothing else.
+
+        THE RESIDUAL IS RECONSTRUCTED, NOT STORED. delta = log_Z - log_w, and
+        ema_logw already carries a per-row EMA of log_w, so
+
+            delta_i = log_z - ema_logw[i]
+
+        is available signed with no new per-row field. `ema_loss` cannot serve
+        here: it stores |resid|, and the sign is exactly what the one-sided
+        priority needs.
+
+        ONE-SIDED BY DESIGN: delta_plus = max(delta, 0). A row the policy has
+        moved off has a fallen log_pf and therefore a strongly NEGATIVE delta,
+        so it takes priority ~0 automatically -- which is both the intended
+        replay/backward split (B2) and, incidentally, most of what the drift
+        term was introduced to do (B8).
+
+        Unvisited rows (ema_logw NaN) get the nan_quantile of the observed
+        delta_plus, matching _loss_weights' policy: moderately hard, visited
+        promptly, never starved.
+
+        floor_frac is the RELATIVE floor on delta_plus, as a fraction of its
+        median among eligible rows. It bounds the weight range, and it is the
+        knob that decides whether this estimator is usable at all.
+
+        MEASURED 2026-08-07 against r2_wiring's live buffer (kappa=1, 1000-row
+        draws) -- the shipped 0.01 was far too permissive:
+
+            floor_frac   ESS/n_drawn   max(w)/mean(w)
+                  0.01         0.11              73
+                  0.15         0.50             5.3
+                  0.25         0.63             3.3
+                  0.50         0.80             1.9
+
+        At 0.01 the live run reported is_ess_frac 0.02-0.06: a 1000-row batch
+        was doing the work of ~20-60 rows, because a row just barely above zero
+        residual draws with p ~ 0 and therefore carries w ~ 1/p. 0.25 is the
+        knee -- it restores the ESS the synthetic test predicted (0.65) while
+        keeping most of the prioritisation. Watch replay/is_ess_frac; if it
+        falls below ~0.3 this is the first knob to move.
+
+        floor_frac keeps a small uniform component so that a row at
+        delta_plus == 0 is not permanently unreachable (its delta can go
+        positive again as the policy moves) and so w stays bounded.
+        """
+        n = len(self)
+        if n == 0:
+            return np.ones(0, dtype=np.float64), np.ones(0, dtype=np.float64)
+
+        logw = self.ema_logw.clone().float()
+        valid = ~torch.isnan(logw)
+        if not bool(valid.any()):
+            p = np.ones(n, dtype=np.float64) / n
+            return p, np.ones(n, dtype=np.float64)
+
+        delta = float(log_z) - logw
+        dplus = torch.clamp(delta, min=0.0)
+        dplus[~valid] = torch.quantile(dplus[valid], nan_quantile)
+
+        # ELIGIBILITY: delta_plus == 0 rows are excluded from the draw outright
+        # (p = 0), not floored into it. They contribute zero force by
+        # construction -- delta_plus IS the priority -- so the estimator's
+        # target is the uniform mean over the POSITIVE half, which is exactly
+        # what the replay branch is for (B2). Including them via a uniform floor
+        # is what made max(w) blow up to 1/floor_frac: a row drawn at
+        # probability ~0 carries weight ~inf and single-handedly owns a
+        # self-normalised batch.
+        elig = dplus > 0
+        n_elig = int(elig.sum())
+        if n_elig == 0:
+            p = np.ones(n, dtype=np.float64) / n
+            return p, np.ones(n, dtype=np.float64)
+
+        # RELATIVE FLOOR on the surviving positive values, so the weight's
+        # dynamic range is bounded by (median/floor)^kappa rather than by the
+        # smallest residual that happens to be in the buffer. w ~ 1/delta_plus^
+        # kappa is unbounded as delta_plus -> 0+, and a near-zero-but-positive
+        # row is exactly as uninformative as a zero one.
+        med = float(torch.median(dplus[elig]))
+        floor_abs = max(floor_frac * med, 1e-12)
+        d = torch.where(elig, torch.clamp(dplus, min=floor_abs),
+                        torch.zeros_like(dplus))
+
+        raw = torch.pow(d.double(), float(kappa))
+        raw[~elig] = 0.0
+        s = float(raw.sum())
+        if not np.isfinite(s) or s <= 0.0:
+            p = np.ones(n, dtype=np.float64) / n
+            return p, np.ones(n, dtype=np.float64)
+        p = (raw / s).cpu().numpy()
+
+        # Importance weight per ROW: uniform target over the ELIGIBLE rows,
+        # divided by the draw density. Self-normalisation over the drawn batch
+        # happens at the call site, so only the ratio matters. Ineligible rows
+        # get w = 0; they are never drawn, so it is never read.
+        w = np.zeros(n, dtype=np.float64)
+        pe = p[elig.cpu().numpy()]
+        w[elig.cpu().numpy()] = (1.0 / n_elig) / pe
+        return p, w
 
 
 class ConformerBuffer(CrystalBuffer):

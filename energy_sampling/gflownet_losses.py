@@ -113,17 +113,6 @@ def get_loss_reward(log_T_tensor, log_reward_fn, mol_batch, return_exp, states, 
     return crystal_batch, log_r
 
 
-def normed_smoothness_loss(x, eps=1e-5):
-    second_diff = torch.diff(x, n=2, dim=-1)
-    curvature = (second_diff ** 4).mean(dim=-1)  # specifically punish very large changes
-    variance = torch.var(x, dim=-1, correction=0)
-    return curvature / (variance + eps)
-
-
-def soft_saturate(x, scale: Optional[float] = 10.0):
-    return torch.log(torch.abs(x / scale) + 1) * torch.sign(x)
-
-
 def soft_clip(x, cutoff):
     abs_x = x.abs()
     sign_x = x.sign()
@@ -178,6 +167,8 @@ def get_gfn_forward_loss(loss_coeffs,
                                                             detach_traj=loss_coeffs.traj_grads == 0,
                                                             return_gauss_params=False,
                                                             freeze_policy=freeze_policy,
+                                                            path_grad_last_k=getattr(
+                                                                loss_coeffs, 'path_grad_last_k', 0),
                                                             )
     log_Z_learned = log_flow[:, 0]
 
@@ -188,6 +179,19 @@ def get_gfn_forward_loss(loss_coeffs,
                                            states,
                                            no_grad=loss_coeffs.reward_grads == 0
                                            )
+    # OPTIONAL per-sample clip on the REWARD's own gradient path, separate from
+    # the global grad clip. Defaults to 0 = off, so this is inert unless asked
+    # for. Rationale: with reward_grads on, d log R / d x_T for an LJ-type
+    # energy is near-singular whenever atoms clash, so a handful of overlapping
+    # samples can dominate the whole batch gradient. That is a DIFFERENT
+    # destabilizer from the BPTT-Jacobian one path_grad_last_k addresses, and
+    # the global clip cannot separate them -- by the time gradients are summed
+    # at the parameters the reward path is indistinguishable from the density
+    # path. Clipping at the source keeps a clashed sample's contribution
+    # bounded without silencing the rest of the batch.
+    _rg_clip = float(getattr(loss_coeffs, 'reward_grad_clip', 0) or 0)
+    if _rg_clip > 0 and log_r.requires_grad:
+        log_r.register_hook(lambda g: g.clamp(-_rg_clip, _rg_clip))
     log_flow[:, -1] = log_r
 
     log_pf = log_pfs.sum(-1)
@@ -314,7 +318,13 @@ def get_gfn_forward_loss(loss_coeffs,
     else:
         combined_losses = torch.stack(losses).mean(dim=0)
 
-    assert combined_losses.isfinite().all()
+    # No finiteness assert here (there never was one on the backward path, and
+    # the asymmetry meant forward NaNs crashed the process while backward NaNs
+    # were contained). Non-finite losses are handled where they can be handled
+    # gracefully: step_loss clips and checks the GRADIENT norm, skips the
+    # optimizer step on a non-finite reading, and feeds a consecutive-streak
+    # counter to _frozen_training_state -- so weights are never stepped on a
+    # NaN, and the LR controller's reset tier sees the loss on its own clock.
     loss = combined_losses.mean()
 
     if report_losses:
@@ -368,6 +378,7 @@ def get_gfn_backward_loss(loss_coeffs,
                           step: int = 0,
                           scramble_condition_tiles: int = 0,
                           mode_level_stream: Optional[str] = None,
+                          sample_weights: Optional[torch.Tensor] = None,
                           ):
     """
     freeze_policy/freeze_z (read from loss_coeffs): see get_gfn_forward_loss's
@@ -552,7 +563,31 @@ def get_gfn_backward_loss(loss_coeffs,
         combined_losses = soft_clip(torch.stack(losses), loss_coeffs.loss_clip).mean(dim=0)
     else:
         combined_losses = torch.stack(losses).mean(dim=0)
-    loss = combined_losses.mean()
+
+    if sample_weights is None:
+        loss = combined_losses.mean()
+    else:
+        # Self-normalised importance weighting for a prioritised draw
+        # (docs/to_do_rebuild.md B5). Applied at the FINAL reduction so it
+        # covers every active term at once, and self-normalised so the overall
+        # loss scale -- and therefore the LR the run is tuned at -- is unchanged
+        # by turning prioritisation on.
+        #
+        # NB per B5b this belongs with a QUADRATIC branch loss. Combining it
+        # with an active Huber knee makes per-row push ~ beta/delta, so the
+        # deepest rows push LEAST; set beta inactive wherever this is used.
+        w = sample_weights.to(combined_losses.device, combined_losses.dtype).flatten()
+        if w.numel() != combined_losses.numel():
+            # K repeats are tiled over the batch: broadcast one weight per row
+            # across its tile rather than silently mis-pairing.
+            reps = combined_losses.numel() // max(w.numel(), 1)
+            assert reps * w.numel() == combined_losses.numel(), (
+                f"sample_weights length {w.numel()} does not tile into "
+                f"{combined_losses.numel()} losses")
+            w = w.repeat_interleave(reps) if reps > 1 else w
+        w = torch.clamp(w, min=0.0)
+        denom = w.sum()
+        loss = (combined_losses.flatten() * w).sum() / torch.clamp(denom, min=1e-12)
 
     if report_losses:
         loss_dict = {'losses': combined_losses.detach(),
@@ -908,7 +943,16 @@ def vg_lme(gfn, log_pb, log_pf, log_r, repeats, beta: float = 10):
                                           beta=beta).view(-1)
         log_Z = log_Z.view(-1)  # [B]
     else:
-        log_Z = torch.logsumexp(log_ratio, dim=0, keepdim=True) - math.log(repeats)
+        # the group here is the WHOLE batch, so log-mean-exp normalizes by the
+        # batch size -- NOT by `repeats`, which is the conditional branch's
+        # group size and was copied down here. Subtracting log(repeats) left the
+        # centre high by log(N/repeats) = log(B) nats (~5.7 at a 300-row batch
+        # with repeats 1); since the shift is constant it survives into the
+        # gradient, pushing every log_ratio up, i.e. log_pf DOWN everywhere --
+        # and a normalized P_F can only comply by moving mass off-support (the
+        # uphill mechanism in z_level_loss's docstring). vg_lb's unconditional
+        # branch takes a plain mean over the same group and was always correct.
+        log_Z = torch.logsumexp(log_ratio, dim=0, keepdim=True) - math.log(log_ratio.shape[0])
         # vg_loss = 0.5 * (log_Z - log_ratio) ** 2
         vg_loss = beta * F.smooth_l1_loss(log_Z.repeat(len(log_ratio)), log_ratio, reduction='none', beta=beta)
     return log_Z, vg_loss
