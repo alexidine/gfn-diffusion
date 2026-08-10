@@ -1,0 +1,578 @@
+<title>One Kernel on the Circle</title>
+<style>
+:root{
+  --paper:#FCFCFD; --ink:#15181F; --muted:#646C7E; --rule:#E3E5EA;
+  --panel:#F5F6F8; --panel-edge:#E7E9EE;
+  --qa:#2563A8; --qb:#7A4FA3; --qc:#B0742F;
+  --good:#2E7D4F; --bad:#B3452F;
+  --shadow:0 1px 2px rgba(20,24,34,.05), 0 6px 20px -12px rgba(20,24,34,.18);
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --paper:#12141A; --ink:#E6E8EE; --muted:#9AA2B4; --rule:#272B35;
+    --panel:#171A21; --panel-edge:#242832;
+    --qa:#79A9E0; --qb:#B694DA; --qc:#DCA764;
+    --good:#6FBF8F; --bad:#E08A72;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -14px rgba(0,0,0,.7);
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#12141A; --ink:#E6E8EE; --muted:#9AA2B4; --rule:#272B35;
+  --panel:#171A21; --panel-edge:#242832;
+  --qa:#79A9E0; --qb:#B694DA; --qc:#DCA764;
+  --good:#6FBF8F; --bad:#E08A72;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -14px rgba(0,0,0,.7);
+}
+:root[data-theme="light"]{
+  --paper:#FCFCFD; --ink:#15181F; --muted:#646C7E; --rule:#E3E5EA;
+  --panel:#F5F6F8; --panel-edge:#E7E9EE;
+  --qa:#2563A8; --qb:#7A4FA3; --qc:#B0742F;
+  --good:#2E7D4F; --bad:#B3452F;
+  --shadow:0 1px 2px rgba(20,24,34,.05), 0 6px 20px -12px rgba(20,24,34,.18);
+}
+
+.page{
+  background:var(--paper); color:var(--ink);
+  font-family:Cambria,Constantia,"Iowan Old Style","Palatino Linotype",Georgia,serif;
+  font-size:18px; line-height:1.62;
+  padding:clamp(2rem,6vw,5.5rem) clamp(1.1rem,5vw,2rem) 6rem;
+  display:flex; flex-direction:column; align-items:center;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{width:100%; max-width:41rem; display:flex; flex-direction:column; gap:2.1rem;}
+
+math{font-family:"Cambria Math","Latin Modern Math","STIX Two Math",Cambria,serif;}
+math[display="block"]{font-size:1.06em;}
+
+.masthead{display:flex; flex-direction:column; gap:.85rem; padding-bottom:1.9rem;
+  border-bottom:1px solid var(--rule);}
+.eyebrow{font-family:"Segoe UI",system-ui,sans-serif; font-size:.7rem; font-weight:600;
+  letter-spacing:.15em; text-transform:uppercase; color:var(--muted);}
+h1{font-size:clamp(1.85rem,5vw,2.6rem); line-height:1.15; font-weight:700; margin:0;
+  text-wrap:balance; letter-spacing:-.012em;}
+.standfirst{font-size:1.14rem; color:var(--muted); font-style:italic; text-wrap:balance; margin:0;}
+.abstract{font-size:.97rem; color:var(--muted); border-left:2px solid var(--rule);
+  padding-left:1.15rem; margin:.5rem 0 0;}
+
+section{display:flex; flex-direction:column; gap:1.05rem;}
+h2{font-size:1.32rem; font-weight:700; margin:1.6rem 0 0; letter-spacing:-.008em; text-wrap:balance;
+  display:flex; align-items:baseline; gap:.7rem;}
+h2 .num{font-family:"Segoe UI",system-ui,sans-serif; font-size:.78rem; font-weight:600;
+  color:var(--muted); letter-spacing:.06em; flex:none;}
+h3{font-size:1.02rem; font-weight:700; margin:.9rem 0 0; letter-spacing:-.004em;}
+p{margin:0;}
+.page a{color:var(--qa);}
+
+.eq{overflow-x:auto; overflow-y:hidden; padding:.35rem 0; margin:.15rem 0;}
+.eq-num{display:flex; align-items:center; gap:1rem;}
+.eq-num math{flex:1;}
+.eqno{font-family:"Segoe UI",system-ui,sans-serif; font-size:.82rem; color:var(--muted); flex:none;}
+.eq-hero{background:var(--panel); border:1px solid var(--panel-edge); border-radius:3px;
+  padding:1.5rem 1.25rem; box-shadow:var(--shadow);}
+.eq-hero math{font-size:1.15em;}
+.eq-hero .gloss{font-size:.9rem; color:var(--muted); font-style:italic; margin-top:.7rem;}
+
+.thm{border-left:2.5px solid var(--rule); padding:.15rem 0 .15rem 1.15rem;
+  display:flex; flex-direction:column; gap:.6rem;}
+.thm.a{border-left-color:var(--qa);} .thm.b{border-left-color:var(--qb);}
+.thm.c{border-left-color:var(--qc);}
+.thm-head{font-family:"Segoe UI",system-ui,sans-serif; font-size:.72rem; font-weight:700;
+  letter-spacing:.12em; text-transform:uppercase; color:var(--muted);}
+.thm-body{font-style:italic;}
+.thm-body math{font-style:normal;}
+
+.trio{display:grid; grid-template-columns:repeat(auto-fit,minmax(11rem,1fr)); gap:1px;
+  background:var(--panel-edge); border:1px solid var(--panel-edge); border-radius:3px;
+  overflow:hidden;}
+.q{background:var(--paper); padding:1.15rem 1.05rem; display:flex; flex-direction:column; gap:.5rem;}
+.q .sym{font-family:Consolas,"Cascadia Mono",Menlo,monospace; font-size:.95rem; font-weight:700; line-height:1.2;}
+.q.a .sym{color:var(--qa);} .q.b .sym{color:var(--qb);} .q.c .sym{color:var(--qc);}
+.q .def{font-size:.92rem;}
+.q .gloss{font-size:.86rem; color:var(--muted); font-style:italic;}
+b.qa{color:var(--qa);} b.qb{color:var(--qb);} b.qc{color:var(--qc);}
+
+.tw{overflow-x:auto;}
+table{border-collapse:collapse; width:100%; font-family:"Segoe UI",system-ui,sans-serif;
+  font-size:.88rem; font-variant-numeric:tabular-nums;}
+th{text-align:left; font-size:.68rem; font-weight:700; letter-spacing:.1em; text-transform:uppercase;
+  color:var(--muted); padding:0 .8rem .55rem 0; border-bottom:1px solid var(--rule); white-space:nowrap;}
+td{padding:.62rem .8rem .62rem 0; border-bottom:1px solid var(--rule); vertical-align:top;}
+tr:last-child td{border-bottom:none;}
+td math{font-size:.95em;}
+td.ok{color:var(--good);} td.bad{color:var(--bad);}
+
+code{font-family:Consolas,"Cascadia Mono",Menlo,monospace; font-size:.82em;
+  background:var(--panel); border:1px solid var(--panel-edge); border-radius:3px; padding:.05em .32em;}
+pre.code{background:var(--panel); border:1px solid var(--panel-edge); border-radius:3px;
+  padding:.95rem 1.1rem; overflow-x:auto; margin:0;
+  font-family:Consolas,"Cascadia Mono",Menlo,monospace; font-size:.8rem; line-height:1.6;
+  box-shadow:var(--shadow);}
+pre.code code{background:none; border:none; padding:0; font-size:1em;}
+.dm{color:var(--bad);} .dp{color:var(--good);} .dc{color:var(--muted);}
+
+.ledger{display:flex; flex-direction:column; border:1px solid var(--panel-edge);
+  border-radius:3px; overflow:hidden;}
+.lrow{display:flex; flex-direction:column; gap:.55rem;
+  padding:1rem 1.15rem; background:var(--paper); border-bottom:1px solid var(--panel-edge);}
+.lrow:last-child{border-bottom:none;}
+.lrow .where{font-family:Consolas,"Cascadia Mono",Menlo,monospace; font-size:.8rem; font-weight:700;}
+.lrow .note{font-size:.9rem;}
+.lrow .aside{font-size:.85rem; color:var(--muted); font-style:italic;}
+
+ol.takeaways{margin:0; padding:0; list-style:none; counter-reset:t;
+  display:flex; flex-direction:column; gap:.85rem;}
+ol.takeaways li{counter-increment:t; display:grid; grid-template-columns:auto 1fr; gap:.9rem;
+  align-items:baseline;}
+ol.takeaways li::before{content:counter(t); font-family:"Segoe UI",system-ui,sans-serif;
+  font-size:.72rem; font-weight:700; color:var(--muted); font-variant-numeric:tabular-nums;}
+ol.takeaways .lead{font-weight:700;}
+
+ul.plain{margin:0; padding-left:1.2rem; display:flex; flex-direction:column; gap:.6rem;}
+
+.foot{font-size:.86rem; color:var(--muted); border-top:1px solid var(--rule);
+  padding-top:1.4rem; margin-top:1rem;}
+</style>
+<div class="page"><div class="wrap">
+<header class="masthead">
+  <div class="eyebrow">Fix specification &middot; models/gfn.py &middot; periodic DoF</div>
+  <h1>One Kernel on the Circle</h1>
+  <p class="standfirst">Forward rollouts, backward rollouts, and replay must score the same
+     backward kernel. Today each scores a different one whenever a trajectory crosses a
+     periodic bound &mdash; and replay scores garbage.</p>
+  <p class="abstract">Angular state dims are wrapped after every SDE step, but the log-probability
+     computations are not wrap-aware. Two defects follow: the Brownian-bridge backward drift
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mi>y</mi><mo>&#x022C5;</mo><msub><mi>c</mi><mi>t</mi></msub></mrow></math>
+     is linear in the raw coordinate and hence depends on which representative of the wrapped state
+     scores it (forward paths use the pre-wrap state, backward and replay paths the post-wrap state);
+     and replayed trajectories, which store only wrapped states, are scored with displacements off by
+     a full period at every crossing. The fix is one invariance rule &mdash; every scored log-density
+     must be a function of the <em>wrapped</em> trajectory &mdash; implemented as three small edits:
+     nearest-image residuals in the two Gaussian log-prob functions, the bridge drift evaluated at the
+     wrapped representative, and wrapping moved to immediately after sampling. On-policy
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><msub><mi>P</mi><mi>F</mi></msub></mrow></math>
+     is numerically unchanged; only
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><msub><mi>P</mi><mi>B</mi></msub></mrow></math>
+     at crossing steps moves, and replay becomes exactly consistent with generation.</p>
+</header>
+
+<section>
+  <h2><span class="num">01</span>Setup</h2>
+  <p>Dims flagged in <code>ang_mask</code> live on a circle. In latent units the domain is
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">&#x00028;</mo><mo>&#x02212;</mo><mn>1</mn><mo>&#x0002C;</mo><mn>1</mn><mo stretchy="false">&#x0005D;</mo></mrow></math>
+     with period <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi><mo>&#x0003D;</mo><mn>2</mn></mrow></math>;
+     the wrap operator (implemented by <code>_wrap_ang</code>, gfn.py:483) is</p>
+  <div class="eq"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>W</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mo stretchy="false">&#x00028;</mo><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo>&#x0002B;</mo><mn>1</mn><mo stretchy="false">&#x00029;</mo><mspace width="0.278em" /><mo>mod</mo><mspace width="0.278em" /><mn>2</mn><mo stretchy="false">&#x00029;</mo><mo>&#x02212;</mo><mn>1</mn><mspace width="0.278em" /><mo>&#x02208;</mo><mspace width="0.278em" /><mo stretchy="false">&#x00028;</mo><mo>&#x02212;</mo><mn>1</mn><mo>&#x0002C;</mo><mn>1</mn><mo stretchy="false">&#x0005D;</mo><mo>&#x0002C;</mo></mrow></math></div>
+  <p>applied per angular dim, identity on linear dims. Two states are the <em>same physical point</em>
+     iff they differ by <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi><mi>k</mi></mrow></math>,
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>k</mi><mo>&#x02208;</mo><mi>&#x02124;</mi></mrow></math>,
+     on angular dims. The policy networks never see the raw coordinate &mdash;
+     <code>expand_state_for_policy</code> (gfn.py:990) feeds
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">&#x00028;</mo><mi>sin</mi><mi>&#x003C0;</mi><mi>x</mi><mo>&#x0002C;</mo><mi>cos</mi><mi>&#x003C0;</mi><mi>x</mi><mo stretchy="false">&#x00029;</mo></mrow></math>,
+     which is exactly <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>W</mi></mrow></math>-invariant.
+     The per-step kernels, per angular dim:</p>
+  <div class="eq eq-num"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>P</mi><mi>F</mi></msub><mo stretchy="false">&#x00028;</mo><mi>y</mi><mo>&#x02223;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mi>&#x1D4A9;</mi><mo stretchy="false">&#x00028;</mo><mi>y</mi><mo>;</mo><mspace width="0.167em" /><mi>x</mi><mo>&#x0002B;</mo><msub><mi>&#x003BC;</mi><mi>&#x003B8;</mi></msub><mo stretchy="false">&#x00028;</mo><mover><mi>x</mi><mo>&#x0007E;</mo></mover><mo>&#x0002C;</mo><mi>t</mi><mo stretchy="false">&#x00029;</mo><mi>&#x00394;</mi><mi>t</mi><mo>&#x0002C;</mo><mspace width="0.278em" /><msubsup><mi>&#x003C3;</mi><mi>&#x003B8;</mi><mn>2</mn></msubsup><mi>&#x00394;</mi><mi>t</mi><mo stretchy="false">&#x00029;</mo></mrow></math><span class="eqno">(1)</span></div>
+  <div class="eq eq-num"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo>&#x02223;</mo><mi>y</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mi>&#x1D4A9;</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo>;</mo><mspace width="0.167em" /><mi>y</mi><mo>&#x0002B;</mo><mi>b</mi><mo stretchy="false">&#x00028;</mo><mi>y</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0002C;</mo><mspace width="0.278em" /><msubsup><mi>&#x003B2;</mi><mi>t</mi><mn>2</mn></msubsup><mo stretchy="false">&#x00029;</mo><mo>&#x0002C;</mo><mspace width="1.5em" /><mi>b</mi><mo stretchy="false">&#x00028;</mo><mi>y</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mo>&#x02212;</mo><mi>y</mi><mo>&#x022C5;</mo><msub><mi>c</mi><mi>t</mi></msub><mo>&#x022C5;</mo><msub><mi>&#x003BA;</mi><mi>&#x003B8;</mi></msub><mo stretchy="false">&#x00028;</mo><mover><mi>y</mi><mo>&#x0007E;</mo></mover><mo stretchy="false">&#x00029;</mo><mo>&#x0002C;</mo></mrow></math><span class="eqno">(2)</span></div>
+  <p>where <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>c</mi><mi>t</mi></msub><mo>&#x0003D;</mo><mi>&#x00394;</mi><mi>V</mi><mo>/</mo><mi>V</mi><mo stretchy="false">&#x00028;</mo><msub><mi>t</mi><mrow><mi>n</mi><mi>e</mi><mi>x</mi><mi>t</mi></mrow></msub><mo stretchy="false">&#x00029;</mo></mrow></math>
+     is the bridge contraction (<code>var_drift_coeff</code>, gfn.py:364) and
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x003BA;</mi><mi>&#x003B8;</mi></msub></mrow></math>
+     the learned <code>learn_pb</code> correction, bounded to
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>1</mn><mo>&#x000B1;</mo><mn>40</mn><mi>%</mi></mrow></math>.
+     Everything network-produced (<math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x003BC;</mi><mi>&#x003B8;</mi></msub><mo>&#x0002C;</mo><msub><mi>&#x003C3;</mi><mi>&#x003B8;</mi></msub><mo>&#x0002C;</mo><msub><mi>&#x003BA;</mi><mi>&#x003B8;</mi></msub></mrow></math>)
+     is <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>W</mi></mrow></math>-invariant
+     by construction. The <em>one</em> term in the entire per-step computation that is not is the bare
+     factor <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mi>y</mi></mrow></math>
+     in the backward drift.</p>
+
+  <h3>Three code paths score transitions</h3>
+  <div class="trio">
+    <div class="q a"><div class="sym">_fwd_step</div>
+      <div class="def">Samples raw <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>y</mi></mrow></math>, scores both densities on the <em>pre-wrap</em> pair, then wraps (gfn.py:527&ndash;535).</div>
+      <div class="gloss">P<sub>B</sub> drift evaluated at raw y</div></div>
+    <div class="q b"><div class="sym">_bwd_step</div>
+      <div class="def">Drift from the <em>wrapped</em> current state (gfn.py:557&ndash;559), samples raw prev, scores, then wraps.</div>
+      <div class="gloss">P<sub>B</sub> drift evaluated at W(y)</div></div>
+    <div class="q c"><div class="sym">_replay_step</div>
+      <div class="def">Reads stored trajectories &mdash; which contain only <em>wrapped</em> states (gfn.py:664, 788) &mdash; and differences them directly.</div>
+      <div class="gloss">drift at W(y), displacement from W&middot;states</div></div>
+  </div>
+  <p>Neither <code>gauss_logprob</code> (gfn.py:997) nor <code>fwd_gauss_logprob</code> (gfn.py:1003)
+     applies any wrap to the residual &mdash; the one attempt is commented out at gfn.py:999, and it was
+     on the wrong variable anyway (the standardized residual, whose period is
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi><mo>/</mo><mover><mi>&#x003C3;</mi><mo>&#x0005E;</mo></mover></mrow></math>,
+     not <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>2</mn><mi>&#x003C0;</mi></mrow></math>).</p>
+</section>
+
+<section>
+  <h2><span class="num">02</span>Defect 1 &mdash; the backward drift is representative-dependent</h2>
+  <p>Because <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>b</mi></mrow></math> is linear in the raw coordinate,</p>
+  <div class="eq eq-num"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>b</mi><mo stretchy="false">&#x00028;</mo><mi>y</mi><mo>&#x0002B;</mo><mi>L</mi><mi>k</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mi>b</mi><mo stretchy="false">&#x00028;</mo><mi>y</mi><mo stretchy="false">&#x00029;</mo><mo>&#x02212;</mo><mi>L</mi><mi>k</mi><mo>&#x022C5;</mo><msub><mi>c</mi><mi>t</mi></msub><mo>&#x022C5;</mo><msub><mi>&#x003BA;</mi><mi>&#x003B8;</mi></msub><mo>&#x0002C;</mo></mrow></math><span class="eqno">(3)</span></div>
+  <p>and <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi><mi>k</mi><msub><mi>c</mi><mi>t</mi></msub><msub><mi>&#x003BA;</mi><mi>&#x003B8;</mi></msub></mrow></math>
+     is not a lattice translation of the density: the two representatives of the same physical state
+     define two <em>different</em> backward kernels. A forward rollout that crosses scores
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>P</mi><mi>B</mi></msub></mrow></math>
+     at the raw next state; backward rollouts and replay evaluate the identical physical state at the
+     wrapped representative.</p>
+  <div class="thm b">
+    <div class="thm-head">Defect 1</div>
+    <div class="thm-body">P<sub>B</sub> is not a function of the state on the circle. The same physical
+      transition receives different backward densities depending on which code path scores it &mdash; and
+      <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x003BA;</mi><mi>&#x003B8;</mi></msub></mrow></math>,
+      fed sin/cos features, is wrap-invariant by construction and <em>cannot</em> express the difference.</div>
+  </div>
+  <p>Worked example, one angular dim: the state sits at
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>x</mi><mo>&#x0003D;</mo><mn>0.95</mn></mrow></math>
+     and steps by <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0002B;</mo><mn>0.10</mn></mrow></math>:
+     raw <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>y</mi><mo>&#x0003D;</mo><mn>1.05</mn></mrow></math>,
+     stored <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>W</mi><mo stretchy="false">&#x00028;</mo><mi>y</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mo>&#x02212;</mo><mn>0.95</mn></mrow></math>.
+     The forward path uses drift
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mn>1.05</mn><msub><mi>c</mi><mi>t</mi></msub><msub><mi>&#x003BA;</mi><mi>&#x003B8;</mi></msub></mrow></math>;
+     the backward/replay representative gives
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0002B;</mo><mn>0.95</mn><msub><mi>c</mi><mi>t</mi></msub><msub><mi>&#x003BA;</mi><mi>&#x003B8;</mi></msub></mrow></math>
+     &mdash; opposite directions around the circle. With a uniform grid
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>c</mi><mi>t</mi></msub><mo>&#x02248;</mo><mn>1</mn><mo>/</mo><mo stretchy="false">&#x00028;</mo><mi>i</mi><mo>&#x0002B;</mo><mn>1</mn><mo stretchy="false">&#x00029;</mo></mrow></math>
+     at step <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>i</mi></mrow></math>, so early
+     crossings carry a drift gap of order the step noise itself; late crossings a small one. This defect
+     alone is a persistent <em>bias</em> between the kernels the three paths train against, not a blowup.</p>
+</section>
+
+<section>
+  <h2><span class="num">03</span>Defect 2 &mdash; replay is off by a full period</h2>
+  <p>Stored trajectories keep only wrapped states, and <code>_replay_step</code> differences them raw.
+     At the crossing step of the example, the stored displacement is
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mn>0.95</mn><mo>&#x02212;</mo><mn>0.95</mn><mo>&#x0003D;</mo><mo>&#x02212;</mo><mn>1.90</mn></mrow></math>
+     where the true step was <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0002B;</mo><mn>0.10</mn></mrow></math>.
+     Against a per-step std of
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mover><mi>&#x003C3;</mi><mo>&#x0005E;</mo></mover><mo>&#x02248;</mo><mn>0.1</mn></mrow></math>&ndash;<math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>0.3</mn></mrow></math>
+     that is a residual of tens of standard deviations &mdash;
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msup><mn>10</mn><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math>
+     spurious nats &mdash; in <em>both</em>
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><msub><mi>P</mi><mi>F</mi></msub></mrow></math>
+     and <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><msub><mi>P</mi><mi>B</mi></msub></mrow></math>,
+     at every crossing step of every replayed trajectory. The gradient side is worse than the loss side:
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x003BC;</mi><mi>&#x003B8;</mi></msub></mrow></math>
+     at boundary-adjacent states is pushed toward a
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x000B1;</mo><mi>L</mi><mo>/</mo><mi>&#x00394;</mi><mi>t</mi></mrow></math>
+     jump it can never realize.</p>
+  <div class="thm c">
+    <div class="thm-head">Defect 2 &middot; the instability mechanism</div>
+    <div class="thm-body">Every trajectory that crosses a periodic bound enters the buffer as a
+      replay-time outlier: two huge, fictitious residuals and violent policy gradients localized
+      exactly at the walls. Poison rate &prop; (replay fraction) &times; (crossing rate). Forward-only
+      training is immune, because <code>_fwd_step</code> scores its own crossings on the raw pair.</div>
+  </div>
+  <p>This also breaks the stated contract that buffered trajectories can be
+     &ldquo;exactly replayed&rdquo; (train.py:4237): for any trajectory with a crossing, replay does not
+     reproduce the rollout&rsquo;s own log-probabilities. Note the buffered <em>data</em> was never wrong
+     &mdash; wrapped states are the right thing to store; only the scoring is.</p>
+</section>
+
+<section>
+  <h2><span class="num">04</span>The fix &mdash; one invariance rule</h2>
+  <div class="eq-hero">
+    <math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mtext>Every&#x000A0;scored&#x000A0;log-density&#x000A0;must&#x000A0;be&#x000A0;a&#x000A0;function&#x000A0;of&#x000A0;the&#x000A0;</mtext><mi>wrapped</mi><mtext>&#x000A0;trajectory:</mtext><mspace width="0.5em" /><mi>log</mi><mi>P</mi><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mi>log</mi><mi>P</mi><mo stretchy="false">&#x00028;</mo><mi>W</mi><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo stretchy="false">&#x00029;</mo><mo stretchy="false">&#x00029;</mo><mo>&#x0002E;</mo></mrow></math>
+    <div class="gloss">Invariant under shifting any state of the trajectory by any multiple of the period,
+      independently per state. Then all three paths compute the identical number from the stored
+      representation, by construction &mdash; exact replay is restored as a theorem, not a hope.</div>
+  </div>
+  <p>Three rules achieve it:</p>
+  <div class="ledger">
+    <div class="lrow">
+      <div class="where">R1 &middot; nearest-image residuals</div>
+      <div class="note">In both log-prob functions, wrap the residual on angular dims before
+        standardizing: <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>z</mi><mo>&#x0003D;</mo><mi>W</mi><mo stretchy="false">&#x00028;</mo><mi>&#x00394;</mi><mi>x</mi><mo>&#x02212;</mo><mtext>drift</mtext><mo stretchy="false">&#x00029;</mo></mrow></math>.
+        Shifting either endpoint by <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi><mi>k</mi></mrow></math>
+        shifts <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x00394;</mi><mi>x</mi></mrow></math>
+        by a multiple of <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi></mrow></math>,
+        which <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>W</mi></mrow></math> absorbs.
+        This is the maximum-likelihood image of the wrapped Gaussian &mdash; the correct single-term
+        approximation of the true circular kernel.</div>
+    </div>
+    <div class="lrow">
+      <div class="where">R2 &middot; bridge drift at the wrapped representative</div>
+      <div class="note">In <code>_eval_pb_logprob</code>, evaluate
+        <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>b</mi><mo stretchy="false">&#x00028;</mo><mi>y</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mo>&#x02212;</mo><mi>W</mi><mo stretchy="false">&#x00028;</mo><mi>y</mi><mo stretchy="false">&#x00029;</mo><mo>&#x022C5;</mo><msub><mi>c</mi><mi>t</mi></msub><mo>&#x022C5;</mo><msub><mi>&#x003BA;</mi><mi>&#x003B8;</mi></msub></mrow></math>.
+        This makes <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>P</mi><mi>B</mi></msub></mrow></math>
+        single-valued on the circle and identical to what <code>_bwd_step</code> already does: the bridge
+        pulls toward the source the short way around, from the canonical representative.</div>
+    </div>
+    <div class="lrow">
+      <div class="where">R3 &middot; wrap immediately after sampling</div>
+      <div class="note">In <code>_fwd_step</code> and <code>_bwd_step</code>, move
+        <code>_wrap_ang</code> from after the log-prob block to directly after propagation. With R1+R2
+        in place the scored values no longer depend on this ordering &mdash; the move just makes the
+        invariant manifest and keeps &ldquo;the state&rdquo; meaning one thing everywhere.</div>
+    </div>
+  </div>
+  <p>Under the fixed convention the worked example scores identically on every path: the backward
+     residual is
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>W</mi><mo stretchy="false">&#x00028;</mo><mn>1.90</mn><mo>&#x02212;</mo><mn>0.95</mn><msub><mi>c</mi><mi>t</mi></msub><msub><mi>&#x003BA;</mi><mi>&#x003B8;</mi></msub><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mo>&#x02212;</mo><mn>0.10</mn><mo>&#x02212;</mo><mn>0.95</mn><msub><mi>c</mi><mi>t</mi></msub><msub><mi>&#x003BA;</mi><mi>&#x003B8;</mi></msub></mrow></math>
+     &mdash; small, because on the circle
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>0.95</mn></mrow></math> really is close to
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mn>0.95</mn></mrow></math>.
+     Crossing transitions get sane backward mass; replay reproduces generation bit-for-bit.</p>
+</section>
+
+<section>
+  <h2><span class="num">05</span>What changes numerically</h2>
+  <p>The reason to trust this change is how little it moves:</p>
+  <div class="tw"><table>
+    <tr><th>Quantity</th><th>Where</th><th>Effect of the fix</th></tr>
+    <tr><td><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><msub><mi>P</mi><mi>F</mi></msub></mrow></math>, on-policy (fwd &amp; bwd rollouts)</td>
+        <td>all steps</td>
+        <td class="ok">unchanged &mdash; the residual is the drawn noise, far inside one period, so
+            <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>W</mi></mrow></math> is the identity on it</td></tr>
+    <tr><td><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><msub><mi>P</mi><mi>B</mi></msub></mrow></math>, non-crossing steps</td>
+        <td>all paths</td>
+        <td class="ok">unchanged &mdash; <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>W</mi><mo stretchy="false">&#x00028;</mo><mi>y</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mi>y</mi></mrow></math> already</td></tr>
+    <tr><td><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><msub><mi>P</mi><mi>B</mi></msub></mrow></math>, crossing steps, fwd path</td>
+        <td>gfn.py:875</td>
+        <td>shifts by the drift gap <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi><msub><mi>c</mi><mi>t</mi></msub><msub><mi>&#x003BA;</mi><mi>&#x003B8;</mi></msub></mrow></math> &mdash; the <em>only</em> on-policy value that moves</td></tr>
+    <tr><td>replay of crossing trajectories</td>
+        <td>both densities</td>
+        <td class="ok">repaired: <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><msup><mn>10</mn><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math>-nat fictitious residuals collapse to the on-policy values</td></tr>
+    <tr><td>steps of size <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02265;</mo><mi>L</mi><mo>/</mo><mn>2</mn></mrow></math> (large-exploration tails)</td>
+        <td>rare</td>
+        <td>now scored at the nearer image &mdash; the correct circular density, slightly higher than today&rsquo;s</td></tr>
+    <tr><td><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x003BA;</mi><mi>&#x003B8;</mi></msub></mrow></math> (learned P<sub>B</sub> correction)</td>
+        <td>checkpoints</td>
+        <td>was trained against the inconsistent kernel; expect brief re-adaptation, no schema change</td></tr>
+  </table></div>
+
+  <h3>Expected magnitudes with boundary modes (2&ndash;4 angular dims, T &#x02248; 100)</h3>
+  <p>Per crossing, the fwd-vs-canonical gap is
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02248;</mo><mi>L</mi><mo stretchy="false">&#x0007C;</mo><mi>&#x003B4;</mi><mo stretchy="false">&#x0007C;</mo><mo>/</mo><mi>V</mi><mo stretchy="false">&#x00028;</mo><mi>t</mi><mo stretchy="false">&#x00029;</mo><mo>&#x02248;</mo><mn>0.1</mn></mrow></math>&ndash;<math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mn>0.3</mn></mrow></math>
+     nats (the <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x00394;</mi><mi>V</mi></mrow></math>
+     cancels between <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>c</mi><mi>t</mi></msub></mrow></math>
+     and <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msubsup><mi>&#x003B2;</mi><mi>t</mi><mn>2</mn></msubsup></mrow></math>)
+     &mdash; and it is <em>one-signed</em>: the raw convention&rsquo;s drift always points back along the
+     actual history, so it always flatters the observed transition. A chain converged onto a boundary
+     mode flickers across the seam every few steps for the last quarter of the rollout: ~5&ndash;15
+     crossings per boundary dim, so ~10&ndash;40 per trajectory over 2&ndash;4 dims &mdash; a standing
+     bias of <b>~1&ndash;5 nats per boundary-mode trajectory</b>, ~0 on interior trajectories.
+     Downstream channels: a persistent fwd-vs-bwd log&nbsp;Z handoff gap of ~0.5&ndash;3 nats
+     concentrated on boundary-mode conditions; over-visiting of wall modes under fwd-dominant mixes
+     (the TB target for log&nbsp;P<sub>F</sub> inherits the inflation); and an un-fittable tb_err floor
+     of ~1&ndash;3 nats on the boundary subpopulation &mdash; invisible at tb_err&nbsp;20, binding below
+     ~3. <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x003BA;</mi><mi>&#x003B8;</mi></msub></mrow></math>
+     cannot cancel it: it shifts both streams together, so it re-centers the disagreement without
+     closing it.</p>
+  <p>Scaling: per-crossing cost <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0221D;</mo><msup><mi>T</mi><mrow><mo>&#x02212;</mo><mn>1</mn><mo>/</mo><mn>2</mn></mrow></msup></mrow></math>
+     but flicker count grows like <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>T</mi></mrow></math>
+     when mode width sits at the noise floor, so the total bias is constant-to-<math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msqrt><mi>T</mi></msqrt></mrow></math>
+     <em>growing</em> under refinement, while the single-winding truncation error dies
+     super-exponentially: small steps rescue the approximation, not the bias. Replay, for scale:
+     ~180 nats &times; 10&ndash;40 crossings &#x02248; thousands of nats of fiction per stored
+     boundary-mode trajectory, in both densities &mdash; and softmax admission preferentially retains
+     exactly those low-energy wall-mode entries. Post-fix falsifiable signatures: fwd-vs-bwd
+     log&nbsp;Z deltas close by ~1 nat specifically on boundary-mode conditions, and the
+     boundary-condition tail of the tb_err distribution compresses. The conformer sampler is the
+     maximal-exposure case: anti torsions sit exactly at &plusmn;&#x003C0;, so every anti-state
+     trajectory is a boundary-mode trajectory by construction.</p>
+</section>
+
+<section>
+  <h2><span class="num">06</span>Approximation honesty</h2>
+  <p>The true kernel on the circle is the wrapped Gaussian
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mo>&#x02211;</mo><mi>k</mi></msub><mi>&#x1D4A9;</mi><mo stretchy="false">&#x00028;</mo><mi>z</mi><mo>&#x0002B;</mo><mi>L</mi><mi>k</mi><mo stretchy="false">&#x00029;</mo></mrow></math>;
+     R1 keeps only the largest term. The nearest neglected image sits at least
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">&#x00028;</mo><mi>L</mi><mo>&#x02212;</mo><mo stretchy="false">&#x0007C;</mo><mi>z</mi><mo stretchy="false">&#x0007C;</mo><mo stretchy="false">&#x00029;</mo><mo>/</mo><mover><mi>&#x003C3;</mi><mo>&#x0005E;</mo></mover></mrow></math>
+     away &mdash; ten-plus standard deviations at operating noise levels, a relative mass below
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msup><mi>e</mi><mrow><mo>&#x02212;</mo><mn>50</mn></mrow></msup></mrow></math>
+     &mdash; and both directions share the convention, so the truncation largely cancels in the TB ratio.
+     If it ever matters (very hot exploration), the exact version is a logsumexp over
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>k</mi><mo>&#x02208;</mo><mo stretchy="false">&#x0007B;</mo><mo>&#x02212;</mo><mn>1</mn><mo>&#x0002C;</mo><mn>0</mn><mo>&#x0002C;</mo><mn>1</mn><mo stretchy="false">&#x0007D;</mo></mrow></math>;
+     not warranted now.</p>
+  <h3>The exact circular reversal, and where the single image sits inside it</h3>
+  <p>For the reference process (wrapped Brownian motion from the source), the exact backward kernel
+     follows from two lines of Bayes on the image sums &mdash; complete the square once per image:</p>
+  <div class="eq eq-num"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msubsup><mi>P</mi><mi>B</mi><mo>&#x022C6;</mo></msubsup><mo stretchy="false">&#x00028;</mo><mi>u</mi><mo>&#x02223;</mo><mi>s</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><munder><mo>&#x02211;</mo><mrow><mi>k</mi><mo>&#x02208;</mo><mo stretchy="false">&#x0007B;</mo><mo>&#x02212;</mo><mn>1</mn><mo>&#x0002C;</mo><mn>0</mn><mo>&#x0002C;</mo><mn>1</mn><mo stretchy="false">&#x0007D;</mo></mrow></munder><msub><mi>&#x003C0;</mi><mi>k</mi></msub><mspace width="0.167em" /><mi>&#x1D4A9;</mi><mo stretchy="false">&#x00028;</mo><mi>u</mi><mo>;</mo><mspace width="0.167em" /><mo stretchy="false">&#x00028;</mo><mi>W</mi><mo stretchy="false">&#x00028;</mo><mi>s</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0002B;</mo><mi>L</mi><mi>k</mi><mo stretchy="false">&#x00029;</mo><mo stretchy="false">&#x00028;</mo><mn>1</mn><mo>&#x02212;</mo><msub><mi>c</mi><mi>t</mi></msub><msub><mi>&#x003BA;</mi><mi>&#x003B8;</mi></msub><mo stretchy="false">&#x00029;</mo><mo>&#x0002C;</mo><mspace width="0.278em" /><msubsup><mi>&#x003B2;</mi><mi>t</mi><mn>2</mn></msubsup><mo stretchy="false">&#x00029;</mo><mo>&#x0002C;</mo><mspace width="1.5em" /><msub><mi>&#x003C0;</mi><mi>k</mi></msub><mo>&#x0221D;</mo><mi>&#x003C6;</mi><mo stretchy="false">&#x00028;</mo><mi>W</mi><mo stretchy="false">&#x00028;</mo><mi>s</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0002B;</mo><mi>L</mi><mi>k</mi><mo>;</mo><mspace width="0.167em" /><mn>0</mn><mo>&#x0002C;</mo><mi>V</mi><mo stretchy="false">&#x00028;</mo><msub><mi>t</mi><mrow><mi>n</mi><mi>e</mi><mi>x</mi><mi>t</mi></mrow></msub><mo stretchy="false">&#x00029;</mo><mo stretchy="false">&#x00029;</mo><mo>&#x0002E;</mo></mrow></math><span class="eqno">(4)</span></div>
+  <p>A <em>mixture over lifts</em>: each component is the code&rsquo;s own bridge applied to one image of
+     the state, weighted by the probability the reference process arrived via that image. The two
+     &ldquo;candidate drifts&rdquo; one is tempted to argue about at a crossing are exactly the
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>k</mi><mo>&#x0003D;</mo><mn>0</mn></mrow></math>
+     and <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>k</mi><mo>&#x0003D;</mo><mn>1</mn></mrow></math>
+     components of (4). The single-image kernel of R1+R2 is the max-weight term
+     (<math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>k</mi><mo>&#x0003D;</mo><mn>0</mn></mrow></math>,
+     since <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">&#x0007C;</mo><mi>W</mi><mo stretchy="false">&#x00028;</mo><mi>s</mi><mo stretchy="false">&#x00029;</mo><mo stretchy="false">&#x0007C;</mo><mo>&#x02264;</mo><mi>L</mi><mo>/</mo><mn>2</mn></mrow></math>),
+     and it is the dominant term in <em>both</em> regimes: early in the trajectory
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>V</mi></mrow></math> is small and the
+     weights collapse exponentially onto the near lift; late in the trajectory the weights can approach
+     50/50 near the antipode, but the component means are separated by only
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi><msub><mi>c</mi><mi>t</mi></msub><mo>&#x0226A;</mo><msub><mi>&#x003B2;</mi><mi>t</mi></msub></mrow></math>,
+     so the components nearly coincide. Worst-case error of the single image:
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>O</mi><mo stretchy="false">&#x00028;</mo><mo stretchy="false">&#x00028;</mo><mi>L</mi><msub><mi>c</mi><mi>t</mi></msub><mo>/</mo><msub><mi>&#x003B2;</mi><mi>t</mi></msub><msup><mo stretchy="false">&#x00029;</mo><mn>2</mn></msup><mo stretchy="false">&#x00029;</mo></mrow></math>
+     nats, in the antipodal band. If post-fix diagnostics ever show a residual floor pinned there, (4)
+     is the drop-in exact kernel: three means and a logsumexp on angular dims, still a function of
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">&#x00028;</mo><mi>W</mi><mo stretchy="false">&#x00028;</mo><mi>s</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0002C;</mo><mi>t</mi><mo stretchy="false">&#x00029;</mo></mrow></math>
+     only &mdash; no winding required.</p>
+  <p>Adopting (4) &mdash; implementation notes: it is a P<sub>B</sub>-only change (~30&ndash;40 lines).
+     Score: per-dim 3-component logsumexp in <code>_eval_pb_logprob</code>, lifts
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>W</mi><mo stretchy="false">&#x00028;</mo><mi>y</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0002B;</mo><mo stretchy="false">&#x0007B;</mo><mo>&#x02212;</mo><mi>L</mi><mo>&#x0002C;</mo><mn>0</mn><mo>&#x0002C;</mo><mi>L</mi><mo stretchy="false">&#x0007D;</mo></mrow></math>,
+     weights from <code>var_accum(t_next)</code>,
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x003BA;</mi><mi>&#x003B8;</mi></msub></mrow></math>
+     applied per component; linear dims unchanged. Sample: <code>_bwd_step</code> draws a per-ang-dim
+     categorical over the three lifts (one pre-drawn uniform tensor alongside <code>eps</code>, keeping
+     the step checkpoint-pure), then the existing Gaussian. P<sub>F</sub>, endpoints, and all tests are
+     untouched; add one continuity check across the seam. What (4) buys over the single image:
+     removal of the <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi><msub><mi>c</mi><mi>t</mi></msub></mrow></math>-sized
+     kernel discontinuity at the seam (a kink smooth sin/cos-fed networks cannot represent &mdash; a
+     residual floor of roughly 0.1&ndash;0.2 nats pinned at seam conditions) plus a systematic
+     ~0.1&ndash;0.5 nats per boundary trajectory. Cosmetic at crystal precision (1&ndash;3 nat tb_err);
+     material for conformer benchmarks measuring log&nbsp;Z at the 0.1-nat level with anti modes on the
+     seam. Suggested wiring: one config boolean (<code>pb_exact_reversal</code>, default on) &mdash; a
+     legitimate two-kernel A/B arm, not a compat shim.</p>
+  <p>DPLR: no interaction, twice over. DPLR is a forward-covariance feature &mdash; P<sub>B</sub> stays
+     diagonal by design (gfn.py:575) &mdash; so the mixture never meets it; and with
+     <code>dplr_mask_angular</code> on (the intended setting &mdash; see the
+     <code>get_periodic_dimensions</code> docstring), angular dims carry no low-rank component, making
+     the per-dim residual wrap exact for P<sub>F</sub> as well. Guardrail: assert the mask whenever
+     angular dims and DPLR coexist.</p>
+</section>
+
+<section>
+  <h2><span class="num">07</span>Implementation</h2>
+  <p>The whole fix is small because <code>_wrap_ang</code> already does per-ang-dim wrapping on a
+     full-width tensor &mdash; it works on residuals as well as states.</p>
+  <div class="ledger">
+    <div class="lrow">
+      <div class="where">gauss_logprob &middot; gfn.py:997</div>
+<pre class="code"><code><span class="dm">- noise = (delta_x - drift) / var.sqrt()</span>
+<span class="dp">+ z = self._wrap_ang(delta_x - drift)</span>
+<span class="dp">+ noise = z / var.sqrt()</span>
+<span class="dc">  (delete the dead commented wrap at :999)</span></code></pre>
+    </div>
+    <div class="lrow">
+      <div class="where">fwd_gauss_logprob &middot; gfn.py:1015</div>
+<pre class="code"><code><span class="dm">- z = delta_x - drift</span>
+<span class="dp">+ z = self._wrap_ang(delta_x - drift)</span>
+<span class="dc">  (V=None path inherits via gauss_logprob)</span></code></pre>
+    </div>
+    <div class="lrow">
+      <div class="where">_eval_pb_logprob &middot; gfn.py:863</div>
+<pre class="code"><code><span class="dp">+ next_state = self._wrap_ang(next_state)   # first line: canonical rep</span>
+<span class="dc">  ... expansion, back_drift (:875), displacement (:880) all read it</span></code></pre>
+      <div class="aside">R2. The expansion input was already invariant; the drift is the part that changes.</div>
+    </div>
+    <div class="lrow">
+      <div class="where">_fwd_step &middot; gfn.py:521/535 &nbsp;and&nbsp; _bwd_step &middot; gfn.py:563/586</div>
+<pre class="code"><code><span class="dp">+ next_state = self._wrap_ang(next_state)   # right after fwd_propagate</span>
+<span class="dm">- next_state = self._wrap_ang(next_state)   # remove post-logprob wrap (:535)</span>
+<span class="dp">+ prev_state = self._wrap_ang(prev_state)   # right after bwd_propagate</span>
+<span class="dm">- prev_state = self._wrap_ang(prev_state)   # remove post-logprob wrap (:586)</span></code></pre>
+      <div class="aside">R3. <code>_replay_step</code> needs no change &mdash; it inherits the fixed log-probs.</div>
+    </div>
+  </div>
+  <p>Step functions stay pure (the wrap is a deterministic tensor op), so
+     <code>traj_checkpoint</code> recompute and <code>compile_policy</code> are unaffected; the wrap uses
+     the same <code>ang_idx</code> index machinery already on the hot path. Deterministic endpoints need
+     nothing: the pinned first forward step keeps
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><msub><mi>P</mi><mi>B</mi></msub><mo>&#x0003D;</mo><mn>0</mn></mrow></math>,
+     and the deterministic jump to the source in <code>_bwd_step</code> is covered by R1
+     automatically.</p>
+</section>
+
+<section>
+  <h2><span class="num">08</span>Tests, in order</h2>
+  <ol class="takeaways">
+    <li><div><span class="lead">Representative invariance.</span> Random transitions; shift any angular
+      input by <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x000B1;</mo><mi>L</mi></mrow></math>;
+      assert <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><msub><mi>P</mi><mi>F</mi></msub></mrow></math>
+      and <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><msub><mi>P</mi><mi>B</mi></msub></mrow></math>
+      unchanged to fp tolerance. Impossible before the fix.</div></li>
+    <li><div><span class="lead">Exact replay round-trip.</span> Seeded <code>get_traj_fwd</code> with
+      forced crossings (bias the init toward the bound, or crank exploration), feed the returned states
+      to <code>get_traj_replay</code>: <code>allclose</code> on both log-prob stacks. Must <em>fail</em>
+      pre-fix on any crossing batch, pass post-fix.</div></li>
+    <li><div><span class="lead">No-crossing regression.</span> Seeded batch with no angular step
+      exceeding <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi><mo>/</mo><mn>2</mn></mrow></math>:
+      pre- and post-fix values identical. Proves nothing moved off the boundary.</div></li>
+    <li><div><span class="lead">(Optional) boundary-mode toy.</span> 1D periodic target with the mode at
+      <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x000B1;</mo><mn>1</mn></mrow></math>,
+      replay-heavy mix: destabilizes pre-fix, trains post-fix.</div></li>
+  </ol>
+</section>
+
+<section>
+  <h2><span class="num">09</span>Rollout notes</h2>
+  <ul class="plain">
+    <li><b>No config flag.</b> A broken kernel is not a behavior to preserve (house no-backward-compat
+      policy). Old checkpoints load unchanged;
+      <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x003BA;</mi><mi>&#x003B8;</mi></msub></mrow></math>
+      re-adapts within its &plusmn;40% range.</li>
+    <li><b>Buffers stay valid.</b> Wrapped states were always the correct stored representation; no
+      rebuild, no flush.</li>
+    <li><b>Expected signatures on periodic problems:</b> the replay tb-error outlier band should collapse
+      immediately; <code>means_b</code> diagnostics shift at crossings; z-level estimators may move
+      slightly, so compare runs only within matched code.</li>
+    <li><b>Falsifiable pre-check on existing data:</b> score any stored buffer, flag trajectories with a
+      consecutive-state angular jump above <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi><mo>/</mo><mn>2</mn></mrow></math>,
+      and compare their replay residuals against the rest. Today the two populations should separate
+      almost perfectly; post-fix they should merge.</li>
+    <li><b>Scope note:</b> the conformer sampler&rsquo;s state is <em>entirely</em> angular (torsions),
+      so it inherits every part of this fix; crystal problems inherit it on phi/r and on the
+      <code>periodic_centroids</code> axes. Eval-side KDE/figure code that differences wrapped samples is
+      out of scope here.</li>
+  </ul>
+</section>
+
+<section>
+  <h2><span class="num">10</span>Alternative considered &mdash; storing unwrapped trajectories</h2>
+  <p>Storing raw (never-wrapped) states makes replay exact by construction, so it matches the
+     nearest-image fix on Defect&nbsp;2. The question is whether it additionally rescues
+     &ldquo;drift toward the pre-wrap origin.&rdquo; It cannot, for three stacked reasons:</p>
+  <ol class="takeaways">
+    <li><div><span class="lead">Winding intake.</span> Backward rollouts start from buffer anchors,
+      MCMC-reheated seeds, and dataset/curated terminals &mdash; none of which possess a winding. They
+      would necessarily start at <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>k</mi><mo>&#x0003D;</mo><mn>0</mn></mrow></math>,
+      i.e. the wrapped representative. Forward-generated and backward-generated visits to the same
+      physical state would still score different backward kernels: Defect&nbsp;1 survives, relocated to
+      the anchor intake. Worse, <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x003BA;</mi><mi>&#x003B8;</mi></msub></mrow></math>
+      then receives <em>identical</em> sin/cos inputs carrying two path-family-dependent regression
+      targets &mdash; a single function must average them, an irreducible loss floor pinned exactly at
+      the walls.</div></li>
+    <li><div><span class="lead">Winding as physical state.</span> Followed to completion (reward defined
+      on the covering line as <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>R</mi><mo stretchy="false">&#x00028;</mo><mi>W</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><mo stretchy="false">&#x00029;</mo></mrow></math>),
+      the target is improper: a periodic reward on
+      <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x0211D;</mi></mrow></math>
+      has infinite total mass, so exact TB balance is unattainable and the reachable images of each
+      boundary mode split its mass while <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Z</mi></mrow></math>
+      inflates by the covered-image count &mdash; a wrapped-marginal bias concentrated precisely on
+      wall-adjacent modes. The alternative closure &mdash; confining the sampler to the fundamental
+      domain with energy walls &mdash; reinstates the face-pinning that the periodic feature exists to
+      remove.</div></li>
+    <li><div><span class="lead">No middle ground.</span> The winding is either part of the state (with
+      the pathologies above) or a gauge degree of freedom &mdash; and gauge variables must not appear in
+      scored quantities. The nearest-image fix is exactly the gauge-invariant scoring.</div></li>
+  </ol>
+  <p>Relatedly: agreement of the forward and backward <em>drifts</em> is not a requirement of the
+     framework and never held anywhere &mdash; on linear dims the bridge points at the source while
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>P</mi><mi>F</mi></msub></mrow></math>
+     points outward toward modes on every step of every outbound trajectory. What the two directions
+     must agree on is the <em>identity of the displacement being scored</em>, which is what R1
+     enforces. The entire cost of the source-image convention is a residual shift of exactly
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi><mo>&#x022C5;</mo><msub><mi>c</mi><mi>t</mi></msub><mo>&#x022C5;</mo><msub><mi>&#x003BA;</mi><mi>&#x003B8;</mi></msub></mrow></math>
+     between the two candidate images &mdash; sub-<math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mover><mi>&#x003C3;</mi><mo>&#x0005E;</mo></mover></mrow></math>
+     beyond the earliest steps &mdash; versus the
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>L</mi><mo>&#x02248;</mo><mn>19</mn><mover><mi>&#x003C3;</mi><mo>&#x0005E;</mo></mover></mrow></math>
+     cliff that was the actual bug.</p>
+</section>
+
+<p class="foot">Files: models/gfn.py (<code>_fwd_step</code>, <code>_bwd_step</code>,
+   <code>_replay_step</code>, <code>_eval_pb_logprob</code>, <code>_pb_logprob</code>,
+   <code>_pb_mixture_ang_logprob</code>, <code>gauss_logprob</code>, <code>fwd_gauss_logprob</code>,
+   <code>_wrap_ang</code>); tests in test_periodic_scoring.py. Companion note:
+   docs/tb_level_decomposition.html.<br><br>
+   <b>Status: implemented 2026-07-29, all tests green.</b> Measured: fwd&rarr;replay and
+   bwd&rarr;replay round trips bitwise exact (max deviation 0.0) at 566 / 260 forced crossings, both
+   kernel modes; mixture inert off-boundary (7.6e&minus;6); seam gap 5.1e&minus;4 (mixture) vs the
+   predicted single-image kink measured at 0.403 nats; mixture mass over one period 1.00000;
+   traj_checkpoint parity bitwise with finite grads to both policies. Implementation deltas vs the
+   spec above: (1) <code>_pb_logprob</code> canonicalizes both endpoints at entry &mdash; the truncated
+   image grids are complete only for wrapped inputs, and wrapping inside the kernel is what makes
+   representative invariance exact by construction; (2) grids widened to arrival lifts
+   k &isin; {&minus;2..2} and image lifts m &isin; {&minus;3..3} so the inner wrapped Gaussian covers
+   every component mean at any t_scale. Fleet note: the new construction-time assert rejects
+   <code>dplr_rank &gt; 0</code> with <code>dplr_mask_angular: false</code> on periodic problems;
+   press_july29, uncond_july28, and postfix_july30 configs all carry that combination and need the
+   mask flipped true (or rank 0) before launching under this code. mk_dev.yaml is already flipped.</p>
+</div></div>

@@ -40,10 +40,15 @@ model:
 ################################################################
 # Top level: resolve_derived_config reads these off the root namespace and treats a
 # missing key as `auto`.
-lr_policy: auto
-lr_back: auto
-lr_replay: auto
-lr_fused: auto
+# EXPLICIT since 2026-08-08. `auto` used to mean the T-scaling rule (anchor x
+# 25/T); it now means SERVO-MANAGED, and the conformer route has no step_probe
+# block, so `auto` here is a hard config error rather than a silent pin at the
+# servo seed. These four are the values the old rule gave at T=32, so this
+# migration changes no learning rate.
+lr_policy: 7.8125e-05
+lr_back: 7.8125e-05
+lr_replay: 7.8125e-05
+lr_fused: 3.90625e-05
 lr_flow: 1.0e-1
 min_lr: 1.0e-6
 lr_warmup_ratio: 100
@@ -52,11 +57,16 @@ weight_decay: 1.0e-4
 use_weight_decay: false
 
 adaptive_lr:
-  enabled: true
+  # v7 (2026-08-08): the envelope is ramp -> hold, unconditionally. `enabled`,
+  # `hold_steps` and the decay leg were deleted -- alpha* rates the PRODUCT
+  # peak x envelope(t), so a scheduled decay is absorbed by the servo and only
+  # inflates `peak`. To run flat LRs set lr_warmup_ratio: 1.
   warmup_steps: 200
-  hold_steps: 800
-  decay_halflife_steps: 1500
-  decay_floor_scale: 0.05
+  divergence_loss_abs: 1.0e+9   # non-finite or past this -> reload + peak cut
+  divergence_grad_abs: 1.0e+9
+  divergence_cut: 0.5
+  servo:
+    enabled: false   # the conformer route sets its LRs explicitly; no `auto` key
 
 # Training
 ################################################################

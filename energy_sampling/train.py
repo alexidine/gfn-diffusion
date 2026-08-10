@@ -58,7 +58,7 @@ CHURNED_BUFFER_EXCLUDE_KEYS = ('symmetry_operators', 'smiles', 'identifier') + B
 
 
 class FrozenTrainingState(RuntimeError):
-    """Raised by _frozen_training_state: the run is saturated and emitting
+    """Raised when a run is unrecoverable and should release the GPU. Emitting
     identical numbers, so its remaining wall clock is waste. Named distinctly
     so a log sweep can tell it apart from a KeyboardInterrupt (a manual kill,
     not a crash -- the replay_july26 postmortem lesson) and from an ordinary
@@ -179,12 +179,6 @@ class Modeller:
         self.lr_controller = LRController(self)  # fixed-peak ramp/hold/decay; tripwires always on
         self.protocol = StageProtocol(self)  # the declarative stage engine: coeffs, balance, exits, transitions
         self.init_train_constants()
-
-        # counts TERMINAL reloads only (not ordinary loss spikes), and deliberately
-        # does NOT live in MODELLER_STATE_DEFAULTS: fire_loss_spike restores modeller
-        # state from the healthy checkpoint, so anything tracked there is wiped by the
-        # very event this needs to remember. See _terminal_policy_state.
-        self.terminal_reloads = 0
 
     def init_train_constants(self):
         for k, v in MODELLER_STATE_DEFAULTS.items():
@@ -331,10 +325,9 @@ class Modeller:
 
 
     def step_lr_schedule(self):
-        # the LRController owns the LRs unconditionally (v6): fixed-peak
-        # ramp/hold/decay -- adaptive_lr.enabled toggles the schedule (flat
-        # scale=1.0 when off; see LRController.step). There is no separate
-        # legacy scheduler path left to fall back to.
+        # the LRController owns the LRs unconditionally (v7): warmup envelope x
+        # a peak the alpha* servo owns on any group whose config key was written
+        # `auto`. There is no separate legacy scheduler path to fall back to.
         return self.lr_controller.step()
 
     def ten_step_reporting(self):
@@ -436,9 +429,10 @@ class Modeller:
         metrics['zmatch/fwd_level'] = levels['fwd']
         metrics['zmatch/bwd_level'] = levels['bwd']
 
-        # always logged now -- report() is meaningful whether or not
-        # adaptive_lr.enabled (scale sits flat at 1.0 when disabled, which is
-        # itself worth seeing on the dashboard rather than silently absent)
+        # always logged, including on arms with no servo-managed LR: a flat
+        # peak_scale is itself the reading, and lr_ctrl/servo_hold says WHY the
+        # loop is not moving. A silently absent block and a satisfied
+        # controller must not look the same.
         metrics.update(self.lr_controller.report())
 
         if hasattr(self, 'condition_log_z'):
@@ -490,14 +484,19 @@ class Modeller:
         for mode in ('fwd', 'bwd', 'replay'):
             setattr(self.args, f'{mode}_loss_coeffs', dict2namespace(self.protocol.coeffs(mode)))
 
-        if any([self.args.fwd_loss_coeffs.subtb > 0, self.args.bwd_loss_coeffs.subtb > 0,
-                self.args.replay_loss_coeffs.subtb > 0]):
-            self.args.fwd_loss_coeffs.coeff_matrix = cal_subtb_coef_matrix(  # todo delete this re-instantiation
-                self.args.fwd_loss_coeffs.subtb_lambda, self.args.integrator.T).to(self.gfn_model.device)
-            self.args.bwd_loss_coeffs.coeff_matrix = cal_subtb_coef_matrix(
-                self.args.bwd_loss_coeffs.subtb_lambda, self.args.integrator.T).to(self.gfn_model.device)
-            self.args.replay_loss_coeffs.coeff_matrix = cal_subtb_coef_matrix(
-                self.args.replay_loss_coeffs.subtb_lambda, self.args.integrator.T).to(self.gfn_model.device)
+        # SubTB coefficient matrix: a pure function of (subtb_lambda, T), both
+        # static for the run, so build each distinct one once and hand out the
+        # same tensor. Only materialised if some branch actually runs subtb.
+        if any(getattr(self.args, f'{m}_loss_coeffs').subtb > 0 for m in ('fwd', 'bwd', 'replay')):
+            cache = getattr(self, '_subtb_coeff_cache', None)
+            if cache is None:
+                cache = self._subtb_coeff_cache = {}
+            for mode in ('fwd', 'bwd', 'replay'):
+                coeffs = getattr(self.args, f'{mode}_loss_coeffs')
+                key = (coeffs.subtb_lambda, self.args.integrator.T)
+                if key not in cache:
+                    cache[key] = cal_subtb_coef_matrix(*key).to(self.gfn_model.device)
+                coeffs.coeff_matrix = cache[key]
 
         self._warn_if_z_untrained()
 
@@ -639,107 +638,46 @@ class Modeller:
                         n_eval_batches: Optional[int] = None, seed: int = 0,
                         train_conditioner: bool = False):
         """
-        Fast, rollout-free supervised fit of the flow head's Z(c) prediction
-        onto condition_log_z's ema_logw:
+        Supervised fit of the flow head's Z(c) onto condition_log_z's ema_logw:
 
-            min_theta  sum_c trust_c * MSE(Z(c; theta), ema_logw(c))
-                                                        over conditions c with
-                                                        a trustworthy estimate
+            min_theta  sum_c  trust_c * MSE(Z(c; theta), ema_logw(c))
 
-        trust_c = eff_c / (eff_c + min_visits) is an evidence-confidence
-        weight built from the tracker's effective_count -- time-decayed AND
-        ESS-capped, so a condition whose lifetime count passed the
-        min_visits gate but whose evidence is stale or came from degenerate
-        (ESS ~ 1) batches still reads as low-confidence. Low-trust targets
-        pull weakly and the network resolves them by interpolating from
-        trusted neighbors (the right prior for a badly-sampled condition);
-        a genuine discontinuity backed by strong evidence still carries the
-        weight to be learned. Weights are normalized to mean 1 over the
-        trustworthy set so target_rms/best-loss bookkeeping keeps its
-        unweighted calibration, and the coverage acceptance gate uses a
-        trust-weighted quantile for consistency -- a condition the fit was
-        told to down-weight must not fail the gate for missing that same
-        target.
+        No rollouts and no reward calls -- draws conditions like fwd_train_step
+        but only needs get_condition_embedding() + flow_model(), so it converges
+        in seconds. Trains flow_model through a FRESH local Adam, not
+        self.optimizers['flow'], so it starts from clean moments.
 
-        Intended to run once, at the phase 1 -> 2 transition (see
-        phase1to2), on whatever ema_logw the tracker accumulated during
-        phase 1's MLE warm-start -- purely to get the flow head starting
-        from a reasonable baseline instead of its random init, before
-        ordinary (rollout-driven) training resumes. Deliberately regresses
-        onto ema_logw, never ema_log_z_emp: this runs in exactly the
-        cold-start regime (right after phase 1, before the policy has had
-        time to build real overlap with the reward-tilted target) that we
-        directly observed can send ema_log_z_emp to billions of nats -- see
-        ConditionLogZTracker.lookup's docstring. ema_logw is rank-trimmed
-        and evidence-capped, so it can't hand this a corrupted target the
-        same way.
+        Runs once at the phase 1 -> 2 transition, to put the flow head somewhere
+        reasonable before rollout-driven training resumes.
 
-        No trajectory sampling, no reward evaluation -- each step draws a
-        batch of conditions the same way fwd_train_step does, but only
-        needs gfn_model.get_condition_embedding() + flow_model(), skipping
-        get_traj_fwd entirely, so this converges in seconds rather than
-        needing real rollouts. Trains only flow_model, via a fresh, local
-        Adam instance -- deliberately NOT self.optimizers['flow'] (that one's
-        for ordinary training's per-step Z updates and persists across the
-        whole run; reusing it would mean this "from-scratch" fit starts with
-        whatever momentum/variance state it happened to have accumulated).
+        trust_c = eff_c / (eff_c + min_visits), from the tracker's time-decayed,
+        ESS-capped effective_count. Normalised to mean 1 over the trustworthy
+        set, so target_rms and the coverage gate keep an unweighted calibration.
 
-        This Z(c) head is load-bearing: phase-2 training can't proceed
-        usefully until it predicts every trustworthy condition well, not just
-        on average. So the fit is structured as an outer restart loop around
-        a deliberately simple single run, gated on a real per-condition
-        acceptance test rather than a batch-mean:
+        ⚠ Regresses onto ema_logw, NEVER ema_log_z_emp: this runs in exactly the
+        cold-start regime where ema_log_z_emp can reach billions of nats.
+        ema_logw is rank-trimmed and evidence-capped.
 
-          single run  -- LR is one linear decay from lr to lr/100 over
-            lr_ramp_steps, held at lr/100 after (large early steps to close
-            the bulk of the gap, small fixed steps to settle without
-            overshoot; no reactive cuts / plateau detection that can fight
-            itself). target_rms is the in-run early stop: stop once the
-            monitored RMS(MSE) drops to it (default 0.5 ~ half a nat). Two
-            deterministic safety nets, neither reactive: best_state snapshots
-            the trough weights on every improvement and is restored at the
-            end (so a final step that rang up off the trough -- or one that
-            corrupted the weights, since a good snapshot can't be retroed --
-            is discarded), and a non-finite loss (a genuine NaN/inf
-            explosion, not a mere increase) breaks straight to that restore.
+        Structure -- one simple run, wrapped in a restart loop gated on a
+        per-condition test rather than a batch mean:
 
-          holdout     -- with >= min_conditions_for_holdout trustworthy
-            conditions, holdout_frac are excluded from the gradient (still
-            drawn, never backpropped) and the in-run monitor tracks that
-            held-out MSE, so early stopping reflects generalization, not
-            memorization. Below that, the split isn't meaningful and this
-            falls back to training loss.
+          run         LR decays linearly lr -> lr/100 over lr_ramp_steps, flat
+                      after. Early stop at target_rms (0.5 nats). best_state
+                      snapshots the trough and is restored at the end; a
+                      non-finite loss breaks straight to that restore.
+          holdout     with >= min_conditions_for_holdout (50) trustworthy
+                      conditions, holdout_frac (0.1) are drawn but never
+                      backpropped and the early stop watches THEIR error.
+          acceptance  coverage_quantile (0.99) of per-condition abs error must
+                      be within coverage_tol (2.0 nats). This is the real gate.
+          restart     on failure, re-seed and re-init at lr * lr_restart_factor
+                      ** attempt, up to max_attempts (10). Best-by-coverage
+                      attempt is kept either way.
 
-          acceptance  -- after each run, coverage_eval sweeps n_eval_batches
-            under the deployment draw and records per-condition abs error,
-            then checks the coverage_quantile (default 0.99) of those errors
-            against coverage_tol (default 2.0 nats): "~every trustworthy
-            condition is within 2 nats". This is the gate that actually
-            matters; the batch-mean target_rms above only decides when a
-            single run has stopped improving.
-
-          restart     -- if a run's coverage fails, re-seed, re-initialize
-            the flow head, and retry at a lower starting LR (lr *
-            lr_restart_factor ** attempt), up to max_attempts. Cheaper and
-            more robust than making one run bulletproof: a bad basin or an
-            unlucky overshoot just gets a fresh draw. The best-by-coverage
-            attempt is kept regardless of whether any run passed.
-
-        train_conditioner: also fit conditions_embedding_model, not just the
-        flow head. Declared per-protocol via the 'bootstrap_z:train_conditioner'
-        action -- only correct when the preceding prior stage scrambled its
-        conditions (scramble_conditions), so nothing ever trained the
-        conditioner (bwd MLE detached it; fwd Z-only TB freezes the policy) and
-        its random-init features may not separate conditions well enough for a
-        frozen-embedding regression -- this fit is then the first thing that
-        ever trains it. Safe there precisely BECAUSE of that scrambled prior:
-        the trunk was trained to ignore the embedding, so reshaping the
-        conditioner can't move the policy. After a stage that DID train the
-        conditioner (e.g. condition-grouped VarGrad), leave the action plain
-        ('bootstrap_z') -- that structure is policy-relevant and a Z regression
-        has no business rewriting it. Each restart attempt resets the
-        conditioner to its at-entry weights (the analog of _reinit_flow), and
-        snapshots/ema-sync cover both modules.
+        train_conditioner also fits conditions_embedding_model. ⚠ Only valid
+        when the preceding stage ran scramble_conditions -- the trunk was then
+        trained to ignore the embedding, so reshaping it cannot move the policy.
+        After a stage that DID train the conditioner, use plain 'bootstrap_z'.
         """
         if not hasattr(self, 'condition_log_z'):
             return
@@ -1338,28 +1276,17 @@ class Modeller:
                                            exclude_keys=BULKY_ATTR_EXCLUDE_KEYS,
                                            )
 
+        # The frozen prior model is named EXPLICITLY or it is not loaded. The
+        # old `reuse_prior` auto-discovery (this run identity's own *_prior.pt,
+        # then find_shared_prior over any matching problem_def) is deleted: it
+        # made "which prior did this arm train against" a function of what
+        # happened to be on disk, so a battery silently inherited a prior
+        # trained under a different scoring rule, and every generator script in
+        # the tree had to set `reuse_prior: false` defensively to stop it. A
+        # stage that needs a prior now either gets a path or trains one.
         prior_path = None
         if self.args.prior_model_name is not None:
             prior_path = f'{self.args.checkpoints_dir}/{self.args.prior_model_name}'
-        elif getattr(self.args, 'reuse_prior', False):
-            # this run identity's own earlier phase-1 product, if already on
-            # disk. find_matching validates the stored problem_def against the
-            # current config (full match, stricter than the exempted check
-            # below), so missing/mismatched resolves to None and the warm-start
-            # stage simply runs -- and re-saves the prior for the next rerun.
-            # On a RESUMED run past phase 1 this also restores prior_model,
-            # which snapshot_prior only ever set live at the transition.
-            prior_path = self.checkpointer.find_matching('prior')
-            if prior_path is None:
-                # no prior under this run's own identity -- fall back to any
-                # other run's *_prior.pt with an exactly matching problem_def,
-                # so a battery of runs shares one pretrained prior without
-                # naming it (problem_def has no architecture/T/lr, only the
-                # target identity)
-                prior_path = self.checkpointer.find_shared_prior()
-            if prior_path is not None:
-                print(f"reuse_prior: reloading existing prior checkpoint {prior_path} "
-                      f"as the frozen prior model")
         if prior_path is not None:
             checkpoint = torch.load(prior_path, map_location=self.device, weights_only=False)
             # a prior model from a different problem wouldn't crash, but it would
@@ -1605,195 +1532,15 @@ class Modeller:
             self.checkpointer.save('final', with_buffers=True)
             print("Finished Training!")
 
-    def _terminal_policy_state(self):
-        """
-        Standalone terminal-failure detector: the policy is emitting numerically
-        absurd samples and is not coming back on its own. Returns a reason string
-        (truthy) or None.
-
-        Distinct from the LRController tripwires, and deliberately so: those
-        read the per-step training signals (branch loss, pre-clip grad norm),
-        which a policy can keep numerically tame while emitting garbage
-        states. These are ABSOLUTE bounds on the sampled-state statistics
-        themselves. Not "worse than lately" but "no longer physics".
-
-        Two channels OR'd, because the two observed deaths do not look alike:
-          djr13t0j  detonation -- logw_std 8.6 -> 1.8e5 inside 100 steps; box
-                    violation 0.0012 -> ~1100 inside ONE eval interval.
-          1219ddv9  slow creep -- logw_std only ever reached ~994 (under the bound),
-                    but box_violation climbed to 19.8 over ~3000 steps.
-        Neither channel catches both; together they catch both. Observed healthy
-        ranges are logw_std 8-46 and box_violation 0.001-0.004, so each bound sits
-        >20x above anything legitimate and >100x below the observed death, which is
-        as wide a margin as this failure offers. NOT an early warning -- the policy
-        variance channels move only 0.85 nats at the kill vs 1.2 nats on a benign
-        excursion, so nothing here leads; it is a terminal-state detector, and the
-        actuator is a rewind, not a nudge.
-
-        Scans whichever branches are LIVE, in fwd -> replay -> bwd priority,
-        and trips on the first one that reads. bwd/replay share the same policy
-        network as fwd, so a genuine policy blowup shows up on any of them --
-        the original 'fwd only' read was correct for a fused stage but silently
-        inert in phase 1, which runs no forward branch at all. tw_july31 lost 8
-        of 16 arms to that hole: they detonated inside phase 1 (grad norm to
-        1.5e5-4.9e9, bwd/mle to +3e3) and then sat emitting bitwise-identical
-        numbers for up to 56k steps, ~68 GPU-hours, with this detector reading
-        an empty 'fwd' slot the whole time. quick_tb_stats and the
-        flow_states block in _update_rolling both run per branch, so
-        bwd/logw_std and bwd/box_violation are already populated every step in
-        phase 1 -- nothing new has to be computed, the detector just has to
-        look. Per-step is also strictly better than the eval-cadence
-        eval_fwd/* mirror of these same quantities (500x coarser, and
-        1219ddv9's warning window was shorter than one eval interval).
-
-        The bounds are calibrated on fwd's observed healthy range. bwd's is
-        not independently established -- these are 20x above anything
-        legitimate on fwd, so they should be loose enough to be safe on any
-        branch, but a bwd-side false negative is likelier than a false positive.
-        """
-        t = self.metric_tracker
-        bounds = (('logw_std', getattr(self.args, 'terminal_logw_std', 1000.0)),
-                  ('box_violation', getattr(self.args, 'terminal_box_violation', 1.0)))
-        for direction in ('fwd', 'replay', 'bwd'):
-            for name, bound in bounds:
-                v = t.get(direction, name)
-                if v is None or bound is None:
-                    continue
-                if not math.isfinite(v) or v > bound:
-                    return f"{direction}/{name}={v:.4g} (bound {bound:g})"
-        return None
-
-    def _frozen_training_state(self, current_loss):
-        """
-        Stuck-run detector: the training signal has stopped changing at all.
-
-        Distinct from both _terminal_policy_state (absolute bounds on sample
-        statistics) and the LRController tripwires (absolute bounds on loss /
-        grad norm), and necessary because NEITHER separates the two populations
-        that matter. Across tw_july31 essentially every arm -- including ones
-        that went on to train perfectly well -- threw transient pre-clip grad
-        norms above 1e4. Spike MAGNITUDE does not predict death; failure to
-        RECOVER does. No level bar can split those, because they overlap in
-        level: the same 1.5e5 reading was survivable in one arm and terminal in
-        another.
-
-        What a dead run does that a live one never does is repeat itself
-        exactly. Once the policy saturates (model_clipping / gfn_clip pins the
-        outputs) the gradient stops depending on the batch, so the pre-clip
-        grad norm goes bitwise constant: arm 14 held 154298.8 for 27,600
-        consecutive steps, arm 4 held 4890569728.0 for 56,500.
-
-        Keyed on grad norm ALONE, deliberately. The batch loss is NOT a usable
-        channel: it keeps jittering in its low digits after death because the
-        batch still changes (arm 14's bwd/tb_err wandered over 3226.67-3226.97
-        the whole time it was dead), so pairing it with the grad norm just
-        resets the clock forever and catches nothing -- which is exactly how
-        the first cut of this detector missed all 8 real detonations. Measured
-        over the post-detonation tail of every tw_july31 arm, the separation on
-        grad norm alone is total:
-
-          8 dead arms     longest identical run = 1052-1800 samples (the whole
-                          tail), relative spread exactly 0
-          4 healthy arms  longest identical run = 1, relative spread 1.9-17.2
-
-        A live run never repeats this value even once, so 2000 consecutive
-        identical readings cannot happen by chance and the patience is a
-        formality rather than a tuned threshold. Raw per-step only, never an
-        EMA -- an EMA of a live signal also settles and would false-positive on
-        a converged run.
-
-        Deliberately fires an ABORT, not a rewind. The reset tier already
-        offers a rewind and it demonstrably did not rescue these runs (arm 4
-        crossed reset_grad_abs at step ~1500 and stayed dead through 58k). A
-        run in this state is not recoverable in-place and its remaining wall
-        clock is pure waste; the useful action is to free the GPU and say so
-        loudly.
-        """
-        patience = int(getattr(self.args, 'terminal_frozen_steps', 2000) or 0)
-        if patience <= 0:
-            return None
-
-        # CHANNEL 1 -- every gradient non-finite. Measured live on the abort
-        # test (jgyk2lzl): after detonation gradnorm/nonfinite_steps pinned at
-        # 10-per-10-steps, i.e. EVERY step hit the non-finite return, skipped
-        # the optimizer, and left last_grad_norm_pre_clip stale at its last
-        # finite value (71587416.0). The run made exactly zero progress while
-        # still inflating (terminal_var 5.9 -> 37.1 over 70 steps).
-        #
-        # This channel exists because the stale value makes channel 2 fire for
-        # the WRONG REASON and ~200x too late: a constant-because-stale reading
-        # is indistinguishable from a constant-because-saturated one, and the
-        # patience clock has to run out either way. Zero finite gradients over
-        # a few hundred steps is already conclusive -- nothing downstream can
-        # act on a gradient that never arrives. Note the non-finite guard in
-        # channel 2 is unreachable for the same reason: last_grad_norm_pre_clip
-        # is only ever ASSIGNED a finite value.
-        streak_bar = max(200, patience // 10)
-        streak = int(getattr(self, '_grad_nonfinite_streak', 0) or 0)
-        if streak >= streak_bar:
-            return (f"{streak} consecutive non-finite gradients "
-                    f"(bar {streak_bar}); no optimizer step has landed since "
-                    f"step {self.step_ind - streak}")
-
-        # CHANNEL 2 -- saturated policy: finite but bitwise-constant grad norm.
-        g = getattr(self, 'last_grad_norm_pre_clip', None)
-        # a missing or non-finite reading is not evidence of freezing: the
-        # non-finite case is already the reset tier's business, and treating
-        # either as "unchanged" would let a gap in the signal age the clock.
-        if g is None or not math.isfinite(float(g)):
-            self._frozen_sig = None
-            self._frozen_since = self.step_ind
-            return None
-        g = float(g)
-        if g == getattr(self, '_frozen_sig', None):
-            start = getattr(self, '_frozen_since', self.step_ind)
-            if self.step_ind - start >= patience:
-                return (f"grad_norm_pre_clip={g:.10g} bitwise unchanged for "
-                        f"{self.step_ind - start} steps (patience {patience})")
-        else:
-            self._frozen_sig = g
-            self._frozen_since = self.step_ind
-        return None
-
     def monitor_losses(self, current_loss, step_type):
         if current_loss is not None:
-            # check_spike (LRController) runs two ABSOLUTE tripwire tiers per
-            # branch loss and pre-clip grad norm (no medians, no relative
-            # bars): 'cut' = parameter thrash, the LR is cut in place and
-            # training continues on the live weights; 'reset' = true
-            # explosion (or non-finite), rewind to best + cut. Always checked
-            # regardless of adaptive_lr.enabled -- this is the FIRE half, and
-            # it was never gated on that flag even in the old design.
+            # check_spike (LRController) is the one remaining tripwire: an
+            # absolute ~1e9 bar on branch loss / pre-clip grad norm, or a
+            # non-finite reading. fire_loss_spike does the rewind + peak cut.
             trig = self.lr_controller.check_spike(
                 step_type, current_loss, getattr(self, 'last_grad_norm_pre_clip', None))
-
-            # checked BEFORE the rewind tiers: a frozen run is past the point
-            # where a rewind helps (arm 4 of tw_july31 crossed reset_grad_abs
-            # at ~1500 and was still dead at 58k), and firing one first would
-            # only reset the signature and restart the patience clock.
-            frozen = self._frozen_training_state(current_loss)
-            if frozen is not None:
-                msg = (f"FROZEN training state at step {self.step_ind}: {frozen}. "
-                       f"The policy is saturated and this run cannot recover -- "
-                       f"aborting so the GPU is released.")
-                print(msg)
-                try:
-                    wandb.log({'frozen_abort_step': self.step_ind}, commit=True)
-                    wandb.run.summary['frozen_abort'] = frozen
-                except Exception:
-                    pass
-                raise FrozenTrainingState(msg)
-
-            terminal = self._terminal_policy_state()
-            if terminal is not None:
-                print(f"TERMINAL policy state at step {self.step_ind}: {terminal} "
-                      f"-- rewinding to best and ratcheting LR down")
-                self.fire_loss_spike(terminal=True)
-            elif trig == 'reset':
+            if trig == 'diverged':
                 self.fire_loss_spike()
-            elif trig == 'cut':
-                print("Firing LR cut (thrash tier -- no rewind)")
-                self.lr_controller.on_explosion()
 
             current_fwd = self.metric_tracker.get('fwd', 'r2')
             current_bwd = self.metric_tracker.get('bwd', 'r2')
@@ -1842,44 +1589,41 @@ class Modeller:
             return start_path
         return best_path if os.path.exists(best_path) else None
 
-    def fire_loss_spike(self, terminal: bool = False):
+    def fire_loss_spike(self):
         """
-        Rewind to the best checkpoint and cut LR.
+        Divergence response: rewind to the best checkpoint AND cut the servo
+        peak, recording the ceiling.
 
-        terminal=True marks a _terminal_policy_state rewind rather than a
-        reset-tier tripwire fire, and ratchets the LR cut by the number of
-        terminal rewinds so far, so repeated policy deaths cut to
-        cut_ratio**n and the ceiling actually descends (the djr13t0j
-        sawtooth: rewind restores checkpointed LR state, and without a
-        rewind-proof memory the run walks back into the same detonation --
-        the cut factor itself is instance-held on the controller for the
-        same reason).
+        The pairing is the point (docs/to_do_rebuild.md A5). A reload without
+        an LR cut re-enters the same state at the same LR and explodes again;
+        an LR cut without a reload keeps the damaged weights. The deleted
+        middle layer's failure was never that it did both -- it was that it did
+        them on a graduated trigger with a latch and a recovery ramp.
 
-        A one-way ratchet is the right shape HERE, unlike the threshold anneal it
-        superficially resembles: it is driven by an unambiguous catastrophic event,
-        not by a marginal metric, so it cannot creep its way into a permanent
-        breach -- it only moves when the policy has already died.
+        Repeated divergences compound: each one halves the peak from wherever
+        it stood, so the ceiling descends across policy deaths instead of
+        sawtoothing (the djr13t0j failure -- a rewind restores checkpointed LR
+        state, so the ceiling is held on the controller INSTANCE where the
+        rewind cannot reach it).
         """
-        if terminal:
-            self.terminal_reloads += 1
-        # ALL rewinds, both tiers. terminal_reloads counts only the
-        # _terminal_policy_state kind, so it cannot see a reset-tier rewind
-        # loop -- which is the one actually observed (aug02 arm
-        # a2_T25_lr16_tight / d7z705wc: 6 grad-norm + 5 bwd-loss fires, every
-        # one reset-tier, rewinding to 'best' each time).
         self.total_reloads = getattr(self, 'total_reloads', 0) + 1
-        cap = int(getattr(self.args, 'max_reloads', 8) or 0)
+        # RATE, not a count: a fixed cap makes a long run likelier to abort for
+        # the same per-step behaviour. Budget scales with steps elapsed, with a
+        # floor so a detonation in the first few hundred steps still aborts.
+        per_k = float(getattr(self.args, 'max_reloads_per_1k_steps', 0.2) or 0)
+        cap = max(3.0, per_k * self.step_ind / 1000.0) if per_k > 0 else 0
         if cap > 0 and self.total_reloads > cap:
-            # A rewind restores healthy WEIGHTS but not a survivable LR. Under
-            # cut_ratio 1.0 (configs/aug02 holds LRs live) on_explosion is a
-            # no-op and the terminal ratchet's cut_ratio**count is 1, so the
-            # run rewinds, re-detonates at the same LR, and repeats forever --
-            # never dying, never recovering, holding a GPU indefinitely. N
-            # rewinds without recovery IS the unrecoverable signal; the frozen
-            # detector cannot see it because the grad norm keeps CHANGING
-            # (2471 -> 1.3e5 -> 4.2e6 -> 9.2e7 on that arm).
+            # A rewind restores healthy WEIGHTS but not necessarily a
+            # survivable LR: the peak cut applies to servo-managed groups, and
+            # a config pinning every LR to an explicit float can rewind,
+            # re-detonate at the same LR, and repeat forever -- never dying,
+            # never recovering, holding a GPU indefinitely. N rewinds without
+            # recovery IS the unrecoverable signal; the frozen detector cannot
+            # see it because the grad norm keeps CHANGING (2471 -> 1.3e5 ->
+            # 4.2e6 -> 9.2e7 on aug02 arm a2_T25_lr16_tight / d7z705wc).
             msg = (f"UNRECOVERABLE at step {self.step_ind}: {self.total_reloads} rewinds "
-                   f"(cap {cap}) and the run keeps re-detonating -- rewinding restores "
+                   f"(budget {cap:.1f} at {per_k}/1k steps) and the run keeps "
+                   f"re-detonating -- rewinding restores "
                    f"weights but not a survivable LR. Aborting so the GPU is released.")
             print(msg)
             try:
@@ -1887,30 +1631,22 @@ class Modeller:
             except Exception:
                 pass
             raise FrozenTrainingState(msg)
-        print(f"Firing LR spike & recovery (rewind #{self.total_reloads})"
-              + (f" (TERMINAL rewind #{self.terminal_reloads})" if terminal else ""))
+        print(f"Divergence response: rewind #{self.total_reloads} + peak cut")
         running_checkpoint_path = self._rewind_checkpoint_path()
         if not (running_checkpoint_path and os.path.exists(running_checkpoint_path)):
-            # NO REWIND TARGET. Previously this fell straight through to
-            # on_explosion in silence, which is how the abort test (jgyk2lzl)
-            # detonated and then ran on with no brake whatsoever: the run had a
-            # fresh run_name so no '<prefix>_best.pt' existed yet, and with
-            # cut_ratio 1.0 the LR cut below is a no-op too. Reset-tier fire,
-            # rewind unavailable, cut disabled == nothing happened.
+            # NO REWIND TARGET. Previously this fell straight through in
+            # silence, which is how the abort test (jgyk2lzl) detonated and
+            # then ran on with no brake whatsoever: the run had a fresh
+            # run_name so no '<prefix>_best.pt' existed yet.
             #
             # This is reachable in normal use: 'best' is only written once an
             # eval has improved, so any detonation inside the first eval_period
-            # of a from-scratch run lands here. Say so LOUDLY, and force a real
-            # cut regardless of cut_ratio -- an arm deliberately holding its LR
-            # live (see configs/aug02) still must not be left with zero brakes
-            # on a confirmed explosion. The arm's LR ladder reading is void the
-            # moment it detonates, so overriding the held LR costs nothing.
-            print(f"lr_ctrl WARNING: reset-tier fire at step {self.step_ind} but NO rewind "
+            # of a from-scratch run lands here. Say so LOUDLY and still take
+            # the half of the response that is available.
+            print(f"lr_ctrl WARNING: divergence at step {self.step_ind} but NO rewind "
                   f"target exists (looked for {running_checkpoint_path}). Cannot restore "
-                  f"healthy weights; forcing an LR cut instead. If this run holds its LR "
-                  f"live (cut_ratio >= 1), that hold is now overridden.")
-            self.lr_controller.on_explosion(
-                count=self.terminal_reloads if terminal else 1, force_ratio=0.5)
+                  f"healthy weights; cutting the peak alone.")
+            self.lr_controller.on_divergence()
             return
         if running_checkpoint_path and os.path.exists(running_checkpoint_path):
             self.checkpointer.load_model_only(running_checkpoint_path,
@@ -1944,13 +1680,11 @@ class Modeller:
                         if val is not None:
                             setattr(self.condition_log_z, key, val)
 
-        # set_state_dict above restored lr_ctrl (schedule clock) from the
-        # healthy best checkpoint; the cut factor lives on the controller
-        # INSTANCE and survives the rewind. terminal_reloads compounds the
-        # cut across policy deaths; a reset-tier tripwire fire keeps its
-        # single flat cut -- a recoverable event must not inherit a
-        # punishment meant for a death.
-        self.lr_controller.on_explosion(count=self.terminal_reloads if terminal else 1)
+        # set_state_dict above restored lr_ctrl (warmup clock + peak_scale)
+        # from the healthy best checkpoint; the CEILING lives on the controller
+        # instance and survives the rewind, so the cut below is applied to a
+        # healthy peak and then clamped by evidence the rewind cannot erase.
+        self.lr_controller.on_divergence()
 
     def update_ema_model(self):
         if self.args.ema_decay is not None:
@@ -2577,8 +2311,8 @@ Two things deliberately NOT done here, both recorded in
             # every non-finite step returns here without stepping the optimizer
             # AND without updating last_grad_norm_pre_clip, so a run in this
             # state makes literally zero progress while presenting a STALE
-            # finite grad norm to every downstream check. Fed to
-            # _frozen_training_state as its own channel.
+            # finite grad norm to every downstream check. The streak counter is
+            # kept as telemetry (gradnorm/nonfinite_steps).
             self._grad_nonfinite_streak = getattr(self, '_grad_nonfinite_streak', 0) + 1
             return  # skip non-finite
         self._grad_nonfinite_streak = 0  # a finite gradient landed: streak broken
@@ -2599,55 +2333,40 @@ Two things deliberately NOT done here, both recorded in
 
     def z_calibration_tick(self, step_type):
         """
-        Interspersed Z-only calibration: the 'more Z updates per policy
-        update' actuator. (The companion on the other axis,
-        fwd_loss_coeffs.emp_z_persistent, is the same regression as an
-        in-batch fused TERM -- a mix change Adam largely normalizes away.
-        Extra optimizer steps are the one thing Adam cannot cancel: frequency
-        is real distance, magnitude is not.)
+        Interspersed Z-only optimizer steps, on top of the ordinary training
+        step. Frequency-modulated, never size-modulated: each step taken is a
+        plain Adam step at the live flow LR, so there is no discontinuous
+        re-level. (Frequency is the axis Adam cannot normalise away; an in-batch
+        coefficient like emp_z_persistent is largely cancelled.)
 
-        mode selects the step body:
-        - 'rollout' (the reference implementation): each calibration step is a
-          FRESH forward rollout scored by the standard fwd loss under
-          freeze_policy=1 with every auxiliary Z term zeroed, so the flow head
-          receives exactly the fused step's own Huber TB Z gradient on new
-          on-policy data. Sensor, actuator, and the fused loss share ONE
-          fixed point -- no estimator mismatch anywhere -- at the price of a
-          rollout + energy call per step. In the large-ratio limit this pins
-          Z(c) to TB's fixed point under the current policy, so any surviving
-          instability is provably not Z-currency.
-        - 'regression': the ~free approximation -- flow_model regressed onto
-          the tracker's trust-weighted ema_logw over condition embeddings
-          cached from the last fwd rollout (_stash_z_cal_cache). Mean-family
-          target whose optimum differs from TB's winsorized one under skew;
-          benchmark it against rollout mode, not the other way around.
+        mode -- the step body:
+          rollout      fresh fwd rollout under freeze_policy with the auxiliary
+                       Z terms zeroed, so the head gets the fused step's own
+                       Huber TB Z gradient. Sensor, actuator and fused loss then
+                       share one fixed point. Costs a rollout + energy call.
+          replay       same gradient over stored trajectories: no energy call,
+                       but Z is calibrated to the buffer's measure, which lags
+                       the policy. Raises unless intake and purge are both
+                       residual-independent. Not recommended.
+          regression   least squares onto the tracker's ema_logw over cached
+                       condition embeddings. Nearly free; a mean-family target,
+                       so its optimum differs from TB's winsorized one.
 
-        sensor selects the trigger reading:
-        - 'grad_rms': condition_log_z.rms_z_grad() -- RMS of the per-condition
-                    CLIPPED signed residual, the loss's own first-order
-                    condition: zeroes exactly at the rollout actuator's fixed
-                    point, so it cannot latch. Captures level AND dispersion
-                    (a uniform 3-nat offset reads 3); saturates at clip_beta,
-                    so z_bias_worst stays the tail alarm.
-        - 'rms':    condition_log_z.rms_z_bias() -- UNCLIPPED, mean-referenced
-                    level dispersion, in nats. Floors at
-                    the per-condition winsorized-vs-mean skew gap under the
-                    rollout actuator, so it reads a standing offset at the
-                    loss's own fixed point -- a latch, not convergence.
-        - 'worst':  condition_log_z.worst_z_bias(sensor_quantile) -- the tail
-        - 'pooled': |EMA fwd/tb_resid_clipped| -- zero when the pooled batch
-                    is level; blind to per-condition disagreement that cancels
-        Expected steps per train step = min(gain * (sensor/threshold - 1),
-        max_steps_per_step), Bernoulli on the fractional part, then cut short
-        by the early-out once a rollout's own fresh first-order reading falls
-        under threshold * grace (rollout mode only -- see the loop). Frequency-
-        modulated, never size-modulated: every step taken is an ordinary Adam
-        step at the live flow LR, so there is no discontinuous re-level.
+        sensor -- the trigger reading, all compared against `threshold`:
+          grad_rms     RMS per-condition CLIPPED signed residual = the loss's
+                       own first-order condition. Zeroes at the rollout
+                       actuator's fixed point, so it cannot latch.
+          rms          UNCLIPPED level dispersion. Floors at the winsorized-vs-
+                       mean skew gap, i.e. reads a standing offset at the fixed
+                       point -- a latch, not convergence.
+          worst        upper-tail quantile over conditions (sensor_quantile).
+          pooled       |EMA fwd/tb_resid_clipped|. Blind to per-condition
+                       disagreement that cancels in the pool.
 
-        Silent (zero compute) whenever: disabled/absent config, sensor inside
-        its deadband, cold tracker/cache, mid-gradient-accumulation, or a
-        condition-scrambled stage (calibrating Z(c) against deliberately
-        unconditional training would fight the stage's intent).
+        Steps taken per train step = min(gain * (sensor/threshold - 1),
+        max_steps_per_step), Bernoulli on the fraction, cut short once a
+        rollout's own fresh reading falls under threshold * grace (rollout
+        mode only).
         """
         cfg = getattr(self.args, 'z_calibration', None)
         if cfg is None or not getattr(cfg, 'enabled', False):
@@ -2708,6 +2427,8 @@ Two things deliberately NOT done here, both recorded in
         for _ in range(n):
             if mode == 'rollout':
                 ok, fresh = self._z_rollout_step(owner, cfg)
+            elif mode == 'replay':
+                ok, fresh = self._z_replay_step(owner, cfg)
             else:
                 ok, fresh = self._z_calibration_step(owner, cfg), None
             if not ok:
@@ -2725,75 +2446,37 @@ Two things deliberately NOT done here, both recorded in
 
     def _z_rollout_step(self, owner, cfg):
         """
-        One rollout-mode calibration step: a fresh forward rollout scored by
-        the standard fwd loss with freeze_policy=1 (policy + conditioner
-        detached at the source) and every non-TB Z term zeroed, so the flow
-        head receives exactly the Huber TB Z gradient the fused step itself
-        produces -- same estimator, same fixed point -- on new on-policy data.
-        The rollout also feeds the tracker (update_and_lookup inside the
-        loss), so persistent per-condition evidence accrues at the
-        calibration rate for free.
+        One Z-only step on a FRESH forward rollout, under freeze_policy with the
+        auxiliary Z terms (z_level, z_var, emp_z, emp_z_persistent) zeroed, so
+        the flow head receives exactly the fused step's own Huber TB Z gradient
+        on new on-policy data. Sensor, actuator and fused loss share one fixed
+        point by construction.
 
-        DOES feed replay-buffer intake, one manage_replay_buffer call per
-        calibration step (see the REVISIT note below). Still no rolling-metric
-        updates: fwd/* drives the balance controller and must stay a reading of
-        the TRAIN batch stream, not of an instrument that fires at its own rate.
+        DOES feed replay-buffer intake -- one manage_replay_buffer call per
+        step. A reward call is the expensive thing, so a rollout that has paid
+        for one is never discarded unconsidered. Cost: churn_rate is a
+        per-CALL budget, so a saturated tick admits up to
+        (1 + max_steps_per_step) x churn_rate in one train step. Watch
+        replay_buffer_admitted if the buffer starts reading as one instant.
 
-        REVISIT -- accepted cost of per-step churn. Policy: a reward call is the
-        expensive thing (dominant on real energy models), so a rollout that has
-        already paid for one should never be discarded unconsidered. The cost is
-        that churn_rate is a per-CALL budget, so intake multiplies by the number
-        of calibration steps in the tick: a saturated tick admits up to
-        (1 + max_steps_per_step) * churn_rate in one train step instead of
-        churn_rate, transiently compressing buffer turnover (max_size /
-        churn_rate) by the same factor. Bounded in practice -- calibration only
-        fires above the sensor threshold and the early-out ends the tick as soon
-        as Z is back inside the bar, so saturation needs a sustained excursion --
-        but unbounded in principle. Watch replay_buffer_admitted / the TTL-cohort
-        tallies per eval. If the buffer starts reading as one-instant:
-          1. Pool candidates across the tick's rollouts + the train step's own
-             fwd batch into ONE manage call at the normal churn_rate. Keeps every
-             sample eligible at unchanged intake, and the draw gets MORE
-             selective (50 from ~8k rather than from ~1k). NB admit_temperature
-             was tuned against a ~1k pool, so revisit T alongside it.
-          2. These rollouts fire exactly when Z is off, so their residuals carry
-             a level offset that admission (scored on |resid|) reads as badness;
-             init_loss = |resid| then keeps those rows alive longer through
-             purge. Scoring on |resid - mean(resid)| makes admission measure
-             per-sample miscalibration instead of the batch's Z offset, the same
-             level-free logic as relative_under.
-        Also note return_exp=True below is a D2H copy of the crystal batch per
-        calibration rollout -- the price of admission, literally.
+        Does NOT update the rolling metrics: fwd/* drives the balance
+        controller and must stay a reading of the TRAIN batch stream, not of an
+        instrument firing at its own rate.
 
-        The first call verifies the gradient really is confined to flow_model
-        params and raises otherwise -- the freeze_policy contract this step
-        leans on, checked once at runtime rather than trusted silently.
+        The first call asserts the gradient really is confined to flow_model
+        and raises otherwise -- the freeze_policy contract, checked once rather
+        than trusted.
 
-        Returns (ok, fresh) where `fresh` is |mean clip(resid, +/-beta)| on this
-        rollout's own batch -- the loss's first-order condition in Z, at the Z
-        level this step STARTED from (the update lands after it is read, so it
-        lags the post-step state by one). It is clipped at the SAME beta this
-        step's loss uses, including the 1e6 substituted under `unclipped`, so
-        sensor and actuator share a fixed point by construction rather than by
-        a config invariant someone has to remember. Consumed by
-        z_calibration_tick's early-out. `fresh` is None when ok is False.
-        Never touches batch-size machinery.
+        Returns (ok, fresh). `fresh` = |mean clip(resid, +/-beta)| on this
+        rollout's own batch, i.e. the loss's first-order condition in Z at the
+        level this step STARTED from, clipped at the SAME beta the step's loss
+        uses. Consumed by z_calibration_tick's early-out. None when ok is False.
         """
         coeffs = copy.deepcopy(self.args.fwd_loss_coeffs)
         coeffs.freeze_policy = 1.0
         for k in ('z_level', 'z_var', 'emp_z', 'emp_z_persistent'):
             if hasattr(coeffs, k):
                 setattr(coeffs, k, 0.0)
-        if getattr(cfg, 'unclipped', False):
-            # get_tb_loss is beta * smooth_l1(resid, beta) = 0.5*resid^2 for
-            # |resid| < beta, so a huge beta IS the exact MSE limit: the
-            # z-step's fixed point moves from the winsorized mean to the
-            # arithmetic mean, tails at full influence. loss_clip is disabled
-            # in the copy for the same reason. gradient_norm_clip on the flow
-            # params remains the only backstop.
-            coeffs.beta = 1.0e6
-            if hasattr(coeffs, 'loss_clip'):
-                coeffs.loss_clip = -1
         saved = self.args.fwd_loss_coeffs
         self.args.fwd_loss_coeffs = coeffs
         try:
@@ -2844,6 +2527,77 @@ Two things deliberately NOT done here, both recorded in
         owner.step()
         owner.zero_grad(set_to_none=True)
         self._z_cal_report['z_cal/rollout_loss'] = float(loss.detach().cpu())
+        return True, fresh
+
+    def _z_replay_step(self, owner, cfg):
+        """
+        One Z-only step over a REPLAY draw: the same Huber TB Z gradient as
+        rollout mode but over stored trajectories, so no policy rollout and no
+        energy call.
+
+        ⚠ Calibrates Z to the BUFFER's measure. TB's Z fixed point belongs to
+        the measure the batch was drawn from, and the buffer differs from the
+        on-policy stream in two ways:
+          - scored admission skims the residual tail (raises rather than run)
+          - even under uniform intake it LAGS the policy by ~tau steps
+        The lag alone mis-centres the fused fwd loss, which reads the same
+        log_Z. Not recommended; rollout mode is the reference.
+
+        Draws read-only (side_effects=False): this tick fires at its own rate,
+        and its corrections would otherwise reach the memorisation sensor as
+        absorption the training branch never performed.
+
+        Returns (ok, fresh) as _z_rollout_step does.
+        """
+        if not len(getattr(self, 'replay_buffer', []) or []):
+            return False, None
+        if self.replay_priority_config() is None:
+            raise ValueError(
+                "z_calibration.mode: replay requires buffers.replay_buffer.prioritise."
+                "enabled -- without it the buffer runs SCORED admission (softmax over "
+                "clipped |resid|), which skims the residual tail, so Z would be "
+                "calibrated to that tail rather than to the on-policy mean. Use mode: "
+                "rollout, or turn uniform intake on.")
+        coeffs = copy.deepcopy(self.args.replay_loss_coeffs)
+        coeffs.freeze_policy = 1.0
+        coeffs.freeze_z = 0.0        # base config freezes Z on replay; this step IS the Z step
+        for k in ('z_level', 'z_var', 'emp_z', 'emp_z_persistent', 'mle', 'vg_lb', 'vg_lme'):
+            if hasattr(coeffs, k):
+                setattr(coeffs, k, 0.0)
+        saved = self.args.replay_loss_coeffs
+        self.args.replay_loss_coeffs = coeffs
+        try:
+            loss, loss_dict = self.replay_train_step(
+                get_discretizer(self.args.integrator),
+                repeats=self.mode_repeats('replay'),
+                report_losses=True,
+                # read-only on the buffer: see replay_train_step's docstring.
+                # This tick fires at its own rate, and its corrections would
+                # otherwise reach the memorisation sensor as absorption the
+                # training branch never performed.
+                side_effects=False)
+        except (RuntimeError, ValueError):
+            self._z_cal_report['z_cal/replay_errors'] = (
+                self._z_cal_report.get('z_cal/replay_errors', 0) + 1)
+            return False, None
+        finally:
+            self.args.replay_loss_coeffs = saved
+
+        if not loss.requires_grad:
+            return False, None
+        fresh = None
+        if loss_dict is not None:
+            with torch.no_grad():
+                resid = ((loss_dict['log_pf'] + loss_dict['log_Z'])
+                         - (loss_dict['log_pb'] + loss_dict['log_r']))
+                fresh = float(resid.clamp(-coeffs.beta, coeffs.beta).mean().abs())
+        owner.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.gfn_model.flow_model.parameters(),
+                                       self.args.gradient_norm_clip)
+        owner.step()
+        owner.zero_grad(set_to_none=True)
+        self._z_cal_report['z_cal/replay_loss'] = float(loss.detach().cpu())
         return True, fresh
 
     def _z_calibration_step(self, owner, cfg):
@@ -3071,7 +2825,19 @@ Two things deliberately NOT done here, both recorded in
     def replay_train_step(self,
                           discretizer,
                           repeats: int,
-                          report_losses: bool = False):
+                          report_losses: bool = False,
+                          side_effects: bool = True):
+        """side_effects=False draws and scores WITHOUT writing back to the
+        buffer or the metric tracker. Used by z_calibration's replay mode, which
+        fires at its own rate and must not be mistaken for training.
+
+        The three writes below are not bookkeeping, they are the inputs to two
+        other controllers: `ema_loss` and `ema_logw` set the prioritised draw
+        and the displacement purge, and `ema_loss` against the frozen
+        `birth_loss` IS the memorisation sensor (module_buffers.md B8). A
+        calibration tick correcting rows at its own cadence would show up there
+        as absorption the training branch did not do, so the servo would read a
+        memorisation signal manufactured by the instrument watching for it."""
 
         condition, condition_id, inds, latents, log_reward, mol_batch, traj = self.draw_replay_sample(repeats)
 
@@ -3092,6 +2858,9 @@ Two things deliberately NOT done here, both recorded in
                                                 step=self.step_ind,
                                                 sample_weights=self._replay_is_w)
 
+        if not side_effects:
+            return loss, loss_dict
+
         self.replay_buffer.update_losses(loss_dict['resid'].abs(), inds)
         # Refresh the per-row log w EMA. This is what makes the prioritised draw
         # possible at all -- prioritised_weights reconstructs the SIGNED residual
@@ -3101,18 +2870,13 @@ Two things deliberately NOT done here, both recorded in
         logw = (loss_dict['log_r'] + loss_dict['log_pb'] - loss_dict['log_pf']).detach()
         self.replay_buffer.update_logw_stats(logw, inds)
 
-        # Publish the memorisation sensor into the METRIC TRACKER, not just into
-        # the wandb metrics dict. StageProtocol._resolve reads every servo sensor
-        # via metric_tracker.get(direction, metric) -- so a stat that only ever
-        # reaches the report path is invisible to the buffer servo, which then
-        # resolves None and returns early on every tick as if cold-started.
-        #
-        # That is exactly what happened in r4_overfit_servo on 2026-08-07: the
-        # deliberate overfit worked (lambda_tau peaked at 1.43, ratio 0.24, well
-        # past the 0.368 bar) and the servo never moved, because
-        # protocol/bs_log_boost was never even emitted.
-        st = self.replay_buffer.absorption_stats()
-        if st:
+        # Memorisation sensor -> the METRIC TRACKER, not just the wandb metrics
+        # dict: buffer_servo resolves its sensor through metric_tracker.get, so
+        # a stat that only reaches the report path is invisible to it.
+        # On the 10-step metric cadence, like every other rolling stat -- it is
+        # a mean over all resident rows, and the only consumer (the servo) ticks
+        # every 10 steps.
+        if self.step_ind % 10 == 0 and (st := self.replay_buffer.absorption_stats()):
             self.metric_tracker.update(
                 'replay',
                 {'ema_loss_mean': st['replay/ema_loss_mean'],
@@ -4486,13 +4250,12 @@ Two things deliberately NOT done here, both recorded in
         with reseed_prior_from_dataset at the following stage boundary to
         restore coverage wholesale.
 
-        If buffers.anchor_buffer.mcmc is set (sweeps > 0), each tiled copy is
-        relaxed by a short local Metropolis walk at its own target temperature
-        (_metropolis_reheat) instead of a single isotropic kick, so the seed
-        approximates each basin's local thermal shape -- a near-calibrated
-        z_match log-Z handoff and a realistic mode handed to buildout, rather
-        than a fixed-width noise ball. noise_log_range still drives the isotropic
-        fallback (and top_up_prior_from_anchors, which is unchanged).
+        Each tiled copy gets ONE log-uniform isotropic latent kick
+        (noise_log_range). The local Metropolis reheat that used to replace
+        that kick -- relaxing every copy at its own target temperature so the
+        seed approximated each basin's thermal shape -- is deleted along with
+        its `mcmc` config block; it is in git history if the staged
+        anchor_seed -> z_match route it was built for ever returns.
         """
         cfg = self.args.buffers.anchor_buffer
         uniq_ids, row_idx = self.anchor_buffer.best_per_condition_indices()
@@ -4502,26 +4265,15 @@ Two things deliberately NOT done here, both recorded in
         tiled_idx = row_idx.repeat_interleave(n_per_condition)
         seed_batch = self.anchor_buffer.batch.subsample_new_batch(tiled_idx).clone().to(self.device)
 
-        mcmc_cfg = getattr(cfg, 'mcmc', None)
-        use_mcmc = mcmc_cfg is not None and getattr(mcmc_cfg, 'sweeps', 0) > 0
-        if not use_mcmc:
-            # isotropic fallback: one log-uniform latent kick per copy, applied
-            # (as before) before conditioning so the noised state is what gets
-            # conditioned, oriented and scored
-            seed_batch.log_noise_latent_parameters(*cfg.noise_log_range)
+        # noised BEFORE conditioning, so the noised state is what gets
+        # conditioned, oriented and scored
+        seed_batch.log_noise_latent_parameters(*cfg.noise_log_range)
 
         seed_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
             seed_batch, sg_inds=seed_batch.sg_ind, z_primes=seed_batch.z_prime)
         seed_batch.orient_molecule(mode='std')
 
-        if use_mcmc:
-            # replace the single kick with a local MH walk at target T; conditions
-            # and log_T are now fixed per row (each chain lives at one condition)
-            terminal_latents = self._metropolis_reheat(seed_batch, log_T_tensor, mcmc_cfg)
-            if getattr(mcmc_cfg, 'log_geometry', True):
-                self._reheat_geometry(terminal_latents, n_per_condition, uniq_ids)
-        else:
-            terminal_latents = seed_batch.latent_params()
+        terminal_latents = seed_batch.latent_params()
         reward, seed_batch = self.energy_function.log_reward(
             terminal_latents, seed_batch, log_T_tensor, return_exp=True)
 
@@ -4542,228 +4294,6 @@ Two things deliberately NOT done here, both recorded in
             else:
                 self.prior_buffer.add(seed_batch.subsample_new_batch(good_inds))
         self.prior_churn['from_anchors'] += int(good_inds.numel())
-
-    @torch.no_grad()
-    def _metropolis_reheat(self, batch, log_T_tensor, mcfg):
-        """
-        Local Metropolis-Hastings reheat of the seed anchors, replacing the
-        single isotropic-noise kick in seed_prior_from_condition_minima. Every
-        row of `batch` is an INDEPENDENT chain started at its own (argmin-anchor)
-        latent; the ensemble of terminal latents is returned [B, D] and becomes
-        the flushed prior seed.
-
-        Rationale: a log-uniform noise shell has an entropy unrelated to the
-        target, so the level backward-TB converges to on it (bounded by the
-        buffer's own entropy) carries an E_q[log q/p] bias that z_match then has
-        to walk off. MH at target T instead relaxes each anchor toward the LOCAL
-        thermal shape of its basin, so the seeded buffer's level sits near the
-        local free energy (near-calibrated handoff) and the mode shape handed to
-        buildout's forward policy is realistic rather than a fixed-radius ball.
-
-        Correctness notes (see energies/molecular_crystal.py):
-          - energy() builds the crystal straight from the raw latent x, so we
-            score proposals directly -- no latent_to_cell_params round trip.
-          - the +-1 latent box is a SOFT temperature-scaled quadratic wall in
-            generator_energy (the raw_latents penalty), and the change of
-            variables is already in jacobian_energy, so plain MH on log_reward
-            samples the true target with NO boundary clip/reject or Jacobian
-            bookkeeping. Non-finite scores are rejected defensively (they should
-            not arise: inf/nan crystal terms are patched to 0, which scores worse
-            than a cohesive minimum and so is rejected on its own).
-
-        Locality: single-basin is held by starting at the one lowest-energy
-        anchor and taking SMALL isotropic steps (barriers >> kT at target T), not
-        by a geometric radius (which would re-impose the shape bias we remove).
-        Optional energy_ceiling_kt rejects proposals more than that many kT above
-        the chain's running-best reward -- a barrier guard that preserves the
-        thermal shape; it works in log_reward space, already per-row-kT-scaled,
-        so one dimensionless value is correct across conditions. Default off.
-
-        sigma is per-row Robbins-Monro toward target_accept during burn_in, then
-        frozen so the collected terminal is a draw from a fixed-kernel chain.
-        """
-        sweeps = int(getattr(mcfg, 'sweeps', 200))
-        burn_in = min(int(getattr(mcfg, 'burn_in', sweeps // 2)), sweeps)
-        target_accept = float(getattr(mcfg, 'target_accept', 0.3))
-        adapt_rate = float(getattr(mcfg, 'sigma_adapt_rate', 0.1))
-        sigma_min = float(getattr(mcfg, 'sigma_min', 1.0e-4))
-        sigma_max = float(getattr(mcfg, 'sigma_max', 0.5))
-        ceiling = getattr(mcfg, 'energy_ceiling_kt', None)
-        ceiling = None if ceiling is None else float(ceiling)
-
-        x = batch.latent_params().clone()                # [B, D], std-oriented start
-        B, device = x.shape[0], x.device
-
-        def score(latents):
-            # log_reward = -energy/T, per row; the one-time big-batch pass is made
-            # self-healing (chunk-on-OOM) rather than a hard crash at the boundary
-            return -self.energy_function.energy(
-                latents, batch, log_T_tensor,
-                return_exp=False, internal_oom_recovery=True).to(device)
-
-        lr = score(x)                                    # [B]
-        best_lr = lr.clone()                             # running basin floor (max reward)
-        sigma = torch.full((B, 1), float(getattr(mcfg, 'init_sigma', 0.02)),
-                           device=device, dtype=x.dtype)
-
-        x0 = x.clone()
-        acc_ema = torch.full((B,), target_accept, device=device)  # log-only
-        max_drift = torch.zeros(B, device=device)
-
-        for t in range(sweeps):
-            x_prop = x + sigma * torch.randn_like(x)
-            lr_prop = score(x_prop)
-            accept = torch.isfinite(lr_prop) & (
-                torch.log(torch.rand(B, device=device)) < (lr_prop - lr))
-            if ceiling is not None:
-                accept = accept & (lr_prop >= best_lr - ceiling)
-
-            x = torch.where(accept[:, None], x_prop, x)
-            lr = torch.where(accept, lr_prop, lr)
-
-            if t < burn_in:
-                best_lr = torch.maximum(best_lr, lr)
-                sigma = (sigma * torch.exp(
-                    adapt_rate * (accept.float()[:, None] - target_accept))
-                         ).clamp_(sigma_min, sigma_max)
-
-            acc_ema = 0.98 * acc_ema + 0.02 * accept.float()
-            max_drift = torch.maximum(max_drift, (x - x0).norm(dim=-1))
-
-        # eyeball diagnostics: excursion = best_lr - lr is the terminal energy
-        # above the basin floor in units of that row's kT; equipartition puts its
-        # mean near D/2 for a ~D-dim basin, so a mean near 0 means the walk never
-        # heated (sigma too small / burn_in too short) and a very large mean or
-        # drift means chains ran out of the basin
-        excursion = best_lr - lr
-        print(
-            f"metropolis_reheat: {sweeps} sweeps (burn {burn_in}), {B} chains | "
-            f"accept {acc_ema.mean().item():.2f} (min {acc_ema.min().item():.2f}) | "
-            f"sigma mean {sigma.mean().item():.3f} [{sigma.min().item():.3f}, {sigma.max().item():.3f}] | "
-            f"terminal excursion/kT mean {excursion.mean().item():.2f} max {excursion.max().item():.2f} | "
-            f"latent drift max {max_drift.max().item():.3f}"
-            + ("" if ceiling is None else f" | ceiling {ceiling:.1f} kT"))
-        return x
-
-    @torch.no_grad()
-    def _reheat_geometry(self, x, n_per_condition, uniq_ids=None):
-        """
-        Landscape survey riding along free on _metropolis_reheat's terminal
-        ensemble: per condition, the shape of its local thermal mode IN LATENT
-        SPACE -- the space the policy actually has to fit, so this is the
-        anisotropy that matters for fitting, not the physical-space one.
-
-        One DxD covariance + eigendecomposition per condition, once at the stage
-        boundary. Per condition:
-
-          log10_kappa   log10 of the covariance condition number lam_max/lam_min
-                        -- the anisotropy. Large = the mode is a thin sliver:
-                        stiff cooperative contact-compression directions against
-                        soft collective slide/libration directions.
-          n_soft        participation ratio (sum lam)^2 / sum(lam^2): the
-                        effective number of directions carrying the thermal
-                        variance, i.e. the floppy-mode count. The jamming
-                        reading is that denser / higher-coordination targets have
-                        FEWER of these and should be correspondingly harder.
-          bend_deg      angle between the leading eigenvector of the low half and
-                        of the high half of the cloud (split at the median
-                        projection onto the global leading eigenvector). ~0 for a
-                        straight anisotropic valley; large means the principal
-                        axis ROTATES as you traverse the mode -- a curved valley,
-                        which no whitening / linear reparameterization can
-                        straighten, and the reason plain ill-conditioning
-                        understates the difficulty.
-          lam_gap       log10(lam_max / lam_2nd). ONLY read bend_deg where this
-                        is appreciable: with no well-separated leading axis the
-                        two half-clouds pick near-orthogonal noise directions and
-                        bend saturates near 90 for a perfectly isotropic mode.
-                        The printed bend summary is restricted to lam_gap > 0.1.
-                        That bar has to stay LOW: curvature itself inflates
-                        lam_2nd (the bent coordinate carries real variance), so a
-                        strict bar throws away exactly the curved modes it is
-                        meant to qualify. Calibrated on synthetics -- isotropic
-                        0.02, curved valley 0.38, straight sliver 3.8.
-          max_abs_skew  largest |skewness| over the principal axes: the signature
-                        of asymmetric truncation -- a direction that is soft one
-                        way and runs into an exponential contact wall the other.
-
-        Read bend and skew together: straight-but-wall-clipped is (low bend, high
-        skew); a curved valley is (high bend, high skew) since bending itself
-        skews the bent coordinate. Curvature is what bend alone identifies.
-
-        Needs n_per_condition > D + 1 for the covariance (and > 2D + 2 for the
-        bend's half-cloud split); returns None otherwise. Full per-condition
-        tensors are stashed on self._last_reheat_geometry for inspection.
-        """
-        n = int(n_per_condition)
-        if n < 2 or x.shape[0] % n != 0:
-            return None
-        M, D = x.shape[0] // n, x.shape[1]
-        if n <= D + 1:
-            print(f"reheat geometry: skipped -- n_per_condition {n} <= latent dim {D} + 1, "
-                  f"the per-condition covariance would be rank-deficient")
-            return None
-
-        xc = x.detach().to(torch.float64).reshape(M, n, D)
-        dx = xc - xc.mean(dim=1, keepdim=True)
-        cov = dx.transpose(1, 2) @ dx / (n - 1)                   # [M, D, D]
-        lam, vec = torch.linalg.eigh(cov)                         # ascending
-        lam = lam.clamp_min(1e-30)
-
-        log10_kappa = torch.log10(lam[:, -1] / lam[:, 0])
-        lam_gap = torch.log10(lam[:, -1] / lam[:, -2])   # leading-axis separation
-        n_soft = lam.sum(dim=1) ** 2 / (lam ** 2).sum(dim=1)
-
-        proj = dx @ vec                                           # [M, n, D] principal basis
-        skew = ((proj / proj.std(dim=1, keepdim=True).clamp_min(1e-30)) ** 3).mean(dim=1)
-        max_abs_skew = skew.abs().max(dim=1).values
-
-        half = n // 2
-        if half > D + 1:
-            order = proj[:, :, -1].argsort(dim=1)
-
-            def half_cloud(idx):
-                return torch.gather(dx, 1, idx[:, :, None].expand(-1, -1, D))
-
-            def lead_vec(block):
-                b = block - block.mean(dim=1, keepdim=True)
-                _, v = torch.linalg.eigh(b.transpose(1, 2) @ b / (b.shape[1] - 1))
-                return v[:, :, -1]
-
-            cos = (lead_vec(half_cloud(order[:, :half])) *
-                   lead_vec(half_cloud(order[:, -half:]))
-                   ).sum(dim=1).abs().clamp(max=1.0)             # sign-folded
-            bend_deg = torch.rad2deg(torch.arccos(cos))
-        else:
-            bend_deg = torch.full((M,), float('nan'), dtype=torch.float64, device=x.device)
-
-        stats = {'log10_kappa': log10_kappa.cpu(), 'n_soft': n_soft.cpu(),
-                 'bend_deg': bend_deg.cpu(), 'max_abs_skew': max_abs_skew.cpu(),
-                 'lam_gap': lam_gap.cpu()}
-        if uniq_ids is not None:
-            stats['condition_id'] = uniq_ids.detach().cpu().flatten()
-        self._last_reheat_geometry = stats
-
-        def med(t):
-            finite = t[torch.isfinite(t)]
-            return float(finite.median()) if finite.numel() else float('nan')
-
-        # bend is only meaningful where a leading axis is actually resolved
-        bend_ok = stats['bend_deg'][torch.isfinite(stats['bend_deg']) & (stats['lam_gap'] > 0.1)]
-        bend_worst = float(bend_ok.max()) if bend_ok.numel() else float('nan')
-        bend_med = float(bend_ok.median()) if bend_ok.numel() else float('nan')
-        worst = int(torch.argmax(stats['log10_kappa']))
-        worst_id = ('' if uniq_ids is None
-                    else f" @condition_id {int(stats['condition_id'][worst])}")
-        print(
-            f"reheat geometry: {M} conditions, D={D}, n={n} per condition | "
-            f"log10 kappa med {med(stats['log10_kappa']):.2f} "
-            f"worst {float(stats['log10_kappa'].max()):.2f}{worst_id} | "
-            f"n_soft med {med(stats['n_soft']):.1f} min {float(stats['n_soft'].min()):.1f} | "
-            f"bend deg [{bend_ok.numel()}/{M} resolved] med {bend_med:.0f} worst {bend_worst:.0f} | "
-            f"max|skew| med {med(stats['max_abs_skew']):.2f} "
-            f"worst {float(stats['max_abs_skew'].max()):.2f}")
-        return stats
 
     @torch.no_grad()
     def refresh_anchor_buffer_surprise(self):
@@ -4858,60 +4388,46 @@ Two things deliberately NOT done here, both recorded in
 
     def manage_replay_buffer(self, fwd_stats, sample_batch):
         """
-        Stash the full forward trajectory of on-policy samples with sufficiently
-        overweighted (high positive or negative residual) terminal states, so
-        they can later be exactly replayed (get_traj_replay) rather than
-        re-sampled backward.
+        Store the full forward trajectory of on-policy samples with strongly
+        over- or under-weighted terminals, so they can be replayed exactly
+        (get_traj_replay) instead of re-sampled backward.
 
-        Two-parameter softmax admission/purge (admit_temperature T, a health-
-        modulated cap) plus a residence TTL, replacing rank-based argsort /
-        beat-the-min admission:
+        SCORED path (default). Score candidates by |resid| (admission) or
+        ema_loss (purge), CLIP to `cap`, then draw without replacement from
+        softmax(score / admit_temperature). Clip-then-divide keeps `cap` an
+        absolute nats bound independent of T. Everything past `cap` is
+        indifferent, so no single outlier monopolises admission. Purge mirrors
+        it: LOW ema_loss (already-corrected rows) gets high eviction weight.
 
-        - Score each candidate/incumbent by |resid| (admission) or ema_loss
-          (purge), CLIPPED to `cap` before dividing by T, then draw without
-          replacement from softmax(clipped_score / T) -- rather than always
-          taking the top-k. Clip-then-divide keeps `cap`'s meaning (an
-          absolute nats bound) independent of whatever T is set to. A single
-          T can't both preserve fine discrimination among ordinary candidates
-          AND stop one extreme value from dominating (the two live at
-          different score scales); clipping is what makes the softmax
-          indifferent among everything past `cap`, so no single outlier can
-          monopolize admission -- it merely competes on equal footing with
-          whatever else is also pinned at the ceiling. Purge mirrors this:
-          LOW ema_loss (boring, already-corrected incumbents) gets high
-          eviction weight.
-        - `cap` is health-modulated: cap(h) = cap_min + (cap_max-cap_min) /
-          (1 + h/h0), h = the tracker's EMA of fwd/scatter_err -- a signal
-          computed off fresh on-policy rollouts, external to this buffer's
-          own contents, so it can't ratchet off its own contamination the
-          way a self-referential (buffer-derived) ceiling would. Healthy
-          policy -> cap ~ cap_max, softmax sharply prefers the worst-
-          surviving candidates (supersample the shoulder -- stiff-wall
-          margins etc., under-visited by on-policy forward sampling alone).
-          Unhealthy policy -> cap ~ cap_min, most candidates clip to the
-          same logit and admission goes near-uniform across a bounded
-          population: a live, representative, non-poisoning snapshot of the
-          CURRENT (bad) distribution rather than a targeted chase of
-          whatever's currently worst -- and the buffer stays populated
-          through the excursion instead of draining, so it's ready the
-          moment health recovers. T stays FIXED throughout -- it only
-          governs shoulder sharpness and must not be recoupled to health,
-          for the same reason a single T can't serve both cap's jobs above:
-          making T health-dependent would re-couple shoulder sharpness to
-          health even though cap already isolates the tail response.
-        - Domain-sanity gate: candidates with non-finite log_r/resid are
-          hard-excluded upstream of the softmax entirely (never merely
-          throttled) -- a NaN/inf-energy state isn't "a real sample that's
-          extreme," there's no slow-not-stop tradeoff to make there.
-          admit_reward_min extends the same hard exclusion to finite-but-
-          garbage rewards: nothing else in this path looks at sample quality
-          at all (eligibility is |resid| > floor, a BADNESS criterion), so
-          absent a floor the buffer's energy distribution is unbounded above.
-        - Residence TTL (max_residence_steps, counted in TRAIN STEPS, not
-          select_counts): unconditional age eviction regardless of ema_loss,
-          so the buffer is a decaying reservoir of the CURRENT policy's tail
-          rather than an accumulating one -- any one row's contents are
-          meaningless on their own, only the live population matters.
+        `cap` is health-modulated:
+
+            cap(h) = cap_min + (cap_max - cap_min) / (1 + h / h0)
+            h      = EMA of fwd/scatter_err
+
+          healthy   cap -> cap_max, softmax sharply prefers the worst survivors
+          unhealthy cap -> cap_min, admission goes near-uniform: a
+                    representative snapshot of the current bad distribution,
+                    and the buffer stays populated through the excursion
+
+        ⚠ h is a FWD metric, so a degrading fwd branch tightens the cap and
+        admission stops skimming the hard tail -- exactly when replay's
+        correction is most needed. Watch replay/birth_loss_mean falling while
+        fwd/scatter_err rises.
+
+        T stays FIXED. It governs shoulder sharpness only; making it
+        health-dependent would re-couple that to health, which `cap` already
+        handles.
+
+        UNIFORM path (buffers.replay_buffer.prioritise): intake is uniform over
+        the sane pool and the two residual-dependent purge causes are switched
+        off, because prioritisation moves to the DRAW where the IS weight
+        divides it back out. Anything else residual-dependent would re-enter
+        the force spectrum uncorrected.
+
+        Hard exclusions, both upstream of the softmax and applied on both paths:
+        non-finite log_r/resid, and log_r < admit_reward_min. Eligibility is a
+        BADNESS criterion, so without a reward floor the buffer's energy
+        distribution is unbounded above.
         """
         log_r = fwd_stats['log_r']
         log_pf = fwd_stats['log_pf']
@@ -5001,48 +4517,31 @@ Two things deliberately NOT done here, both recorded in
         ema = self.replay_buffer.ema_loss
         n = len(self.replay_buffer)
 
-        # --- unconditional eviction, four causes. None of them shapes the BULK
-        # of the age distribution, which is the whole point:
-        #   floor    -- overfit incumbents (ema corrected below the floor)
-        #   stalled  -- drawn often enough to carry a real signal and NOT
-        #               improving since admission. A direct test of "can this
-        #               row ever be incorporated", which is what the old
-        #               max_residence_steps TTL was only a proxy for. Fires at
-        #               any age, so genuinely dead rows leave FASTER than a
-        #               250-step clock, and live ones are not culled at all.
-        #   hazard   -- memoryless residence: evict n/tau rows per call drawn
-        #               uniformly at random, giving exponential residence with
-        #               mean tau. Keeps the buffer's lag distribution WIDE
-        #               (CV ~1 vs ~0.58 for a hard cap). A wide lag is a strong
-        #               lowpass on the policy->buffer->gradient path; a hard
-        #               age cap instead produces a uniform age profile with a
-        #               sharp edge, which concentrates phase lag at one
-        #               frequency. Exponential decay is also what "any one row
-        #               should be meaningless" actually asks for -- a hard cap
-        #               gives a FLAT reservoir, not a decaying one.
-        #   backstop -- absolute ceiling at backstop_mult * tau, binding on
-        #               ~exp(-backstop_mult) of rows: bounds worst-case
-        #               staleness without reshaping the bulk. Safety limits go
-        #               where they do not bind; a gradient acting on the bulk
-        #               is a change of policy, not a safety limit.
-        # Why the TTL had to go: displacement purge below is a softmax on LOW
-        # ema_loss, so it protects high-|resid| rows BY CONSTRUCTION, and the
-        # TTL was the only thing removing them -- on a clock, regardless of
-        # progress. Measured expired_delta ran -12..-28 nats across the
-        # postfix_july30 arms, i.e. it was culling the informative tail
-        # mid-learning, and absorbed_frac was 0.000 (age was doing 100% of
-        # eviction). The stalled test keeps that tail while it is still moving
-        # and drops it the moment it stops.
-        # Occupancy is emergent (Little's law: n = admit_rate * tau) and
-        # max_size is a memory guard, not a target -- an under-full buffer
-        # means intake is low, which is the correct response to not having
-        # enough bad samples, not a quota to pad. Unlike the TTL this cannot
-        # zero the buffer during a replay-dormant stage: eviction is
-        # proportional to n, so occupancy decays toward the intake equilibrium
-        # instead of falling off a cliff at a fixed age (the tsched_july24
-        # failure the supply-side pacing note above describes).
-        # NB the hazard budget is per manage CALL, the same convention
-        # churn_rate already uses, so both scale together with call frequency.
+        # --- eviction, four causes. None shapes the BULK of the age
+        # distribution, which is the point.
+        #   floor     ema_loss corrected below the floor. Residual-dependent.
+        #   stalled   drawn >= toxic_min_draws and not improving since
+        #             admission. Residual-dependent. Fires at any age.
+        #   hazard    memoryless: evict n/tau rows per call, uniformly at
+        #             random -> exponential residence, mean tau, CV ~1. A WIDE
+        #             lag distribution, so a strong lowpass on the
+        #             policy->buffer->gradient path. A hard age cap instead
+        #             gives a uniform age profile with a sharp edge, which
+        #             concentrates phase lag at one frequency.
+        #   backstop  hard ceiling at backstop_mult * tau, binding on
+        #             ~exp(-backstop_mult) of rows. Bounds worst-case staleness
+        #             without reshaping the bulk.
+        # floor and stalled are DISABLED under prioritise: the draw's IS weight
+        # divides out the draw only, so a residual-dependent survival
+        # probability re-enters the force spectrum uncorrected. They are also
+        # what makes the memorisation sensor unbiased -- birth_loss is the
+        # intake distribution OF SURVIVORS, which equals intake only if
+        # survival is residual-independent.
+        # Occupancy is emergent (Little's law: n = admit_rate * tau); max_size
+        # is a memory guard, not a target. Eviction is proportional to n, so
+        # occupancy decays toward the intake equilibrium rather than falling off
+        # a cliff at a fixed age.
+        # The hazard budget is per manage CALL, matching churn_rate.
         if getattr(rb_cfg, 'max_residence_steps', None) is not None:
             raise ValueError(
                 "buffers.replay_buffer.max_residence_steps is retired -- the hard age "
@@ -5396,62 +4895,41 @@ Two things deliberately NOT done here, both recorded in
     @torch.no_grad()
     def screen_and_admit_anchors(self, sample_batch, log_r, energy, log_pf_est):
         """
-        Surprise-gated anchor promotion: a state is anchor-worthy iff it has
-        good Boltzmann weight (energy near Emin(c), the per-condition running
-        best tracked by condition_log_z) *and* the current forward policy
-        under-samples it *relative to its Boltzmann weight* -- not in an
-        absolute sense.
+        Promote a state to the anchor buffer iff it has good Boltzmann weight
+        (energy near Emin(c)) AND the forward policy under-samples it relative
+        to that weight.
 
-        "Surprise" is the trajectory-balance residual itself: the forward/
-        backward log-ratio measured against the reward/Z log-ratio,
+        "Surprise" is the TB residual, 0 at the fixed point:
 
-            surprise = (log_pf - log_pb) - (log_r - log_Z(c))
-                     = log_Z(c) + log_pf - log_pb - log_r
+            surprise = log_Z(c) + log_pf - log_pb - log_r
 
-        which is 0 at the TB fixed point. surprise << 0 means the policy's
-        forward-vs-backward ratio falls far short of what the state's reward
-        (relative to Z(c)) warrants -- an under-weighted high-reward mode.
-        log_Z(c) = condition_log_z.lookup(c) (its stable ema_logw target).
-        Since log_r and log_Z(c) are both deterministic given x/condition,
-        centering is a per-candidate shift that adds no rollout variance to
-        the log_pf - log_pb estimate. Two-stage:
+        surprise << 0 = an under-weighted high-reward mode. log_r and log_Z(c)
+        are deterministic given (x, condition), so centring adds no rollout
+        variance to log_pf - log_pb.
 
-          1. Screen: cheap energy pre-filter AND'd with the surprise gate. The
-             log_pf - log_pb term here is the free k=1 forward-path value
-             computed in fwd_eval_sampling and passed in as log_pf_est, so no
-             backward rollout is spent screening. Both gates are pure tensor
-             comparisons; nothing is rolled out until confirm. Candidates
-             whose condition lacks a warmed-up log_Z(c) (lookup mask False)
-             are held back -- the axis isn't yet trustworthy.
-          2. Confirm: K backward rollouts (gflownet_losses.log_pf_estimate,
-             IWAE/logsumexp) on screen-survivors only give an accurate
-             log p_hat in place of log_pf - log_pb, fed through the *same*
-             residual form -- rare, so K=5-10 is cheap in aggregate. Dominated
-             by the best rollout, so a single unlucky trajectory can't fake
-             surprise; still poor -> admitted.
+        Two stages:
+          1. screen   energy pre-filter AND the surprise gate, both pure tensor
+                      comparisons. Uses the free k=1 log_pf_est from
+                      fwd_eval_sampling, so no backward rollout is spent.
+                      Candidates whose condition has no warmed-up log_Z(c) are
+                      held back -- the axis is not trustworthy yet.
+          2. confirm  K backward rollouts (IWAE/logsumexp) on survivors only,
+                      through the SAME residual form. Dominated by the best
+                      rollout, so one unlucky trajectory cannot fake surprise.
 
-        Runs on both prior-model-sampled batches (via sample_from_prior ->
-        fwd_eval_sampling) and on-policy eval batches (evaluation() ->
-        fwd_eval_sampling) -- both are freshly generated, freshly scored
-        terminal batches routed through fwd_eval_sampling's single call site,
-        so one criterion gates both instead of two divergent admission rules.
-        (top_up_prior_from_anchors' record-breaker children deliberately
-        bypass this gate: a strictly deeper version of an already-admitted
-        anchor needs no fresh novelty judgment -- and a damaged policy cannot
-        fake a record-breaker, since energies are real; see that method.)
+        Called on both prior-model batches and on-policy eval batches, via
+        fwd_eval_sampling's single call site, so one criterion gates both.
+        top_up_prior_from_anchors' record-breaker children bypass it: a strictly
+        deeper version of an admitted anchor needs no novelty judgement, and
+        energies are real so a damaged policy cannot fake one.
 
-        The whole screen is additionally behind a POLICY-HEALTH gate
-        (health_gate_r2 / health_gate_zerr, see the body): admissions pause
-        while forward calibration or Z's gradient signal is unhealthy --
-        which also means they pause through early buildout and briefly after
-        stage transitions, by design (novelty judged against a miscalibrated
-        ruler isn't novelty).
+        Behind a policy-health gate (health_gate_floor / health_gate_ceiling):
+        admissions pause while the ruler is miscalibrated, which also means they
+        pause through early buildout and briefly after stage transitions.
 
-        original_surprise (the TB residual at admission) is stored frozen on
-        each admitted anchor and used by thin() to rank the buffer -- centered
-        on log_Z(c), so it's comparable across conditions. AnchorBuffer.admit's
-        dup_cutoff is a cheap literal-duplicate catch on this (already rare)
-        confirmed set, not a novelty judgment -- see AnchorBuffer's docstring.
+        original_surprise is stored frozen at admission and used by thin() to
+        rank the buffer; AnchorBuffer.admit's dup_cutoff is a literal-duplicate
+        catch on the confirmed set, not a novelty judgement.
         """
         if not hasattr(self, 'condition_log_z'):
             # init-time grow_prior_buffer() runs before init_condition_log_z()
@@ -5468,34 +4946,28 @@ Two things deliberately NOT done here, both recorded in
         # gate correctly rejects, making the logged count read 0 while the
         # buffer grows
         self.last_anchor_admitted = getattr(self, 'last_anchor_admitted', 0)
-        # policy-health gate: refuse to adjudicate novelty while the ruler is
+        # Policy-health gate: refuse to adjudicate novelty while the ruler is
         # broken. Surprise is measured THROUGH the live policy's log_pf, so a
-        # damaged policy reads its own log_pf collapse as nats of fake
-        # surprise on everything (c8utdn8q: 382 admissions in the single eval
-        # inside the 20-22k LR excursion, with fwd/r2 at 0.84-0.89 the whole
-        # window -- and the flood beats condition_log_z's ema_logw absorption,
-        # which cancels a uniform shift only after its half-life lag). Gate on
-        # POOLED fwd/r2 plus Z's own gradient signal (|EMA'd
-        # fwd/tb_resid_clipped|). Pooled r2 deliberately, even though the
-        # conditional gates elsewhere no longer use it: this is a DAMAGE
-        # detector ('is the policy still physics', bar 0.9 vs the 0.84-0.89
-        # collapse), not a calibration gate, and pooled r2's between-condition
-        # inflation doesn't hide a collapse that severe. A cold channel (phase-1
-        # seeding: no fwd stats yet) abstains rather than blocks, preserving
-        # seeding behavior exactly.
-        # Both channels are now NAMED in config so the ruler can be swapped
-        # without a code change: health_gate_floor_metric is compared as a
-        # lower bound (below the bar = unhealthy), health_gate_ceiling_metric
-        # as an upper bound on its ABSOLUTE value. Defaults reproduce the
-        # historical pair exactly. The natural upgrade is to point the ceiling
-        # at a modern control metric (fwd/tb_err_worst) instead of r2, which
-        # survives here only as a damage detector.
+        # damaged policy reads its own log_pf collapse as fake surprise on
+        # everything, and the resulting flood outruns condition_log_z's
+        # absorption (which cancels a uniform shift only after its half-life).
+        #
+        # Two channels, both naming a fwd metric in config so the ruler can be
+        # swapped without a code change: FLOOR blocks when its metric falls
+        # below the bar, CEILING when |its metric| rises above. Bars are named
+        # for their ROLE (health_gate_floor / _ceiling), not for a metric, so a
+        # swap cannot leave a bar named after the metric it no longer uses.
+        # A cold channel abstains rather than blocks, so phase-1 seeding is
+        # unaffected. floor_metric: null disables that channel.
+        #
+        # ⚠ A BAR DOES NOT SURVIVE A RULER SWAP. tb_resid_clipped is signed and
+        # beta-bounded and its 0.5 is the Z-currency bar z_calibration holds;
+        # tb_err_worst is an unbounded RMS reading 18-21 when healthy. Change
+        # metric and bar together or not at all.
         floor_name = getattr(cfg, 'health_gate_floor_metric', 'r2')
         ceil_name = getattr(cfg, 'health_gate_ceiling_metric', 'tb_resid_clipped')
-        # defaults preserved from the pre-2026-08-03 hardcoded form, so a config
-        # that names neither key gates exactly as it always did
-        floor_bar = getattr(cfg, 'health_gate_r2', 0.9)
-        ceil_bar = getattr(cfg, 'health_gate_zerr', 0.5)
+        floor_bar = getattr(cfg, 'health_gate_floor', 0.9)
+        ceil_bar = getattr(cfg, 'health_gate_ceiling', 0.5)
         floor_val = self.metric_tracker.get('fwd', floor_name) if floor_bar is not None else None
         ceil_val = self.metric_tracker.get('fwd', ceil_name) if ceil_bar is not None else None
         if ((floor_val is not None and floor_val < float(floor_bar))

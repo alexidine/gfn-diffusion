@@ -33,7 +33,7 @@ declares:
   skip_if           entry condition ('prior_loaded'): on a fresh run the stage
                     is skipped when the condition holds (e.g. the MLE warm-
                     start is redundant when a prior model was loaded by path
-                    or auto-refound via reuse_prior)
+                    given by prior_model_name)
 
 Balance rules (kind: lexicographic) walk in order; the FIRST violated rule's
 `boost` (a mode name, or a {mode: weight} mix -- same form as default_boost)
@@ -196,6 +196,10 @@ class Stage:
         # threshold keeps that mode's branch always computed (never skipped by
         # fused_train_step); a floor below it lets the mode go truly dormant.
         # Each stage states its intent explicitly -- nothing is derived.
+        # Binds under EVERY balance kind: the lexicographic nudge reads it
+        # directly (_nudge_mode_fracs) and the two integrator kinds fold it into
+        # their `bounds` at parse (_parse_bounds), which is also where an
+        # inconsistent pair of declarations fails.
         self.min_fracs = dict(spec.get('min_fracs') or {})
         bad = set(self.min_fracs) - set(MODES)
         if bad:
@@ -294,6 +298,32 @@ class Stage:
                              f"least one split mode -- an unbounded integrator against a "
                              f"target it cannot reach walks to a degenerate mix")
         pair_mass = 1.0 - sum(float(v) for v in (pinned or {}).values())
+        # min_fracs BINDS UNDER EVERY KIND. It used to be read only by
+        # _nudge_mode_fracs (the lexicographic path), so a stage declaring both
+        # min_fracs and an integrator balance had its floors silently ignored
+        # by the integrator -- the floor was there, it just wasn't a floor.
+        # Folding it in here rather than adding a check in each tick keeps ONE
+        # live bound per mode (R3: three frac bounds in three files is already
+        # the confusing part) and makes the two declarations either agree or
+        # fail loudly at parse.
+        for mode in metrics:
+            floor = self.min_fracs.get(mode)
+            if floor is None:
+                continue
+            if mode not in bounds:
+                bounds[mode] = [float(floor), pair_mass]
+            elif float(bounds[mode][0]) < float(floor):
+                raise ValueError(
+                    f"stage '{self.name}': bounds.{mode} lower bound {bounds[mode][0]} is "
+                    f"below min_fracs.{mode} ({floor}). They are the same quantity -- a "
+                    f"floor on this mode's frac -- so declaring them inconsistently means "
+                    f"one of them is not doing what it says.")
+        for mode, v in (pinned or {}).items():
+            floor = self.min_fracs.get(mode)
+            if floor is not None and float(v) < float(floor):
+                raise ValueError(
+                    f"stage '{self.name}': pinned.{mode} ({v}) is below min_fracs.{mode} "
+                    f"({floor}) -- the pin would hold the mode under its own floor")
         for mode, lohi in bounds.items():
             if (not isinstance(lohi, (list, tuple)) or len(lohi) != 2
                     or not all(isinstance(v, (int, float)) for v in lohi)):
@@ -1007,7 +1037,7 @@ class StageProtocol:
                 # deliberately NOT warm-started from it -- warm-start explicitly
                 # via checkpoint_name + load_weights_only when the architectures
                 # do match
-                print(f"protocol: prior model loaded (prior_model_name or reuse_prior) "
+                print(f"protocol: prior model loaded (prior_model_name) "
                       f"-- skipping stage '{self.stage.name}' (policy weights untouched)")
             self.advance(None, run_exit_actions=False)
 
@@ -1039,11 +1069,12 @@ class StageProtocol:
         # automatic optimization reset -- every transition, uniformly:
         # the outgoing stage's loss windows are a stale ceiling for the incoming
         # stream, its best-checkpoint minima shouldn't gate the new stage's
-        # 'best' saves, its Adam moments describe the wrong loss surface, and
-        # the LR controller's probe baseline describes the wrong policy
-        # semantics. rearm_warmup must run with m.stage already switched (its
-        # _state() phase-sync branch runs first and it overrides).
-        m.lr_controller.reset_spike_monitors(m.lr_controller.CHANNELS)
+        # 'best' saves, and its Adam moments describe the wrong loss surface.
+        # rearm_warmup must run with m.stage already switched (its _state()
+        # phase-sync branch runs first and it overrides). No fire-cooldown
+        # re-arm any more: the v7 divergence bar sits at ~1e9, which transition
+        # turbulence does not reach, so there is nothing for a transition to
+        # protect it from.
         m.combo_loss_record = []
         # batch controller: the throughput-knee state describes the OUTGOING
         # stage's step-cost profile -- a rung baseline or step-time window

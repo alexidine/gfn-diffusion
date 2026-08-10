@@ -366,7 +366,7 @@ class Checkpointer:
             'model_train': m.gfn_model.state_dict(),
             'model_eval': m.ema_model.state_dict(),
             # the rollout length this checkpoint was trained at. A prior reused
-            # by another run (reuse_prior / prior_model_name) must be SAMPLED at
+            # by another run (prior_model_name) must be SAMPLED at
             # its own training T, not the consumer's eval_T -- a T=10 prior fed
             # into a T=100 run is a 10x discretization mismatch (see
             # sample_from_prior). None on pre-2026-07-23 checkpoints.

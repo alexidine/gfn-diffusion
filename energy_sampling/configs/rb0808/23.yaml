@@ -1,4 +1,4 @@
-run_name: rep_ctrl_ratio
+run_name: rep_fixed_fracs
 tag: rb0808
 seed: 12345
 device: cuda
@@ -236,22 +236,7 @@ protocol:
         freeze_policy: 1.0
       bwd:
         tb: 1.0
-    balance:
-      kind: ratio
-      pinned:
-        fwd: 0.2
-      metrics:
-        replay: fwd/over_coverage
-        bwd: bwd/relative_under_wcen
-      numerator: replay
-      setpoint: 5.0
-      gain: 0.02
-      max_step: 0.05
-      bounds:
-        replay:
-        - 0.05
-        - 0.45
-      converge_floor: 1.5
+    balance: null
 controller:
   min_mode_frac: 0.001
   beta: 0.025

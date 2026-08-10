@@ -115,38 +115,154 @@ def get_train_args():
     parser = argparse.ArgumentParser(description='GFN Linear Regression')
     args, remaining = parser.parse_known_args()
 
-    return resolve_derived_config(dict2namespace(load_yaml(remaining[1])))
+    return resolve_derived_config(preflight_config(dict2namespace(load_yaml(remaining[1]))))
 
 
 # ---------------------------------------------------------------------------
 # Derived-config resolution. Values that are pure functions of the primitives
-# (W = model hidden width, T = integrator.T, the grad clip) are computed here
-# instead of being hand-materialized in the YAML, so they can never drift out
-# of sync. A key set to `auto` (or null/absent) is derived; an explicit numeric
-# value is respected as an override. The scaling anchors are the validated
-# W512/T25 state documented in configs/mode_presets.yaml (SCALING REFERENCE) --
-# THIS function is the executable source of truth for them.
+# (W = model hidden width, T = integrator.T) are computed here instead of being
+# hand-materialized in the YAML, so they can never drift out of sync.
+#
+# `auto` MEANS TWO DIFFERENT THINGS and the difference is deliberate:
+#   gradient_norm_clip: auto  -> DERIVED from (W, T) by the anchor rule below.
+#   lr_*:               auto  -> SERVO-MANAGED. Seeded low and then owned by the
+#                                alpha* loop in controller.py, which probes the
+#                                usable peak per stage. An explicit float is a
+#                                FIXED peak the servo never touches.
+#
+# The old T-scaling rule for the LRs (anchor x 25/T) is GONE. It was a single
+# battery's number promoted to a law -- aug02 measured one point, at one energy,
+# one T, one W, one clip -- and decisions.md D3 (revisited) records why that
+# generalisation fails: the problem shifts constantly, so there is no stable
+# `here` for an anchor to be anchored to. Every run is a transfer. The servo
+# replaces it with a per-run measurement.
 # ---------------------------------------------------------------------------
 _SCALING_W_REF = 512
 _SCALING_T_REF = 25
-_LR_ANCHORS = {            # peak LR at the anchor; scaled x T_REF/T, W-flat
-    'lr_policy': 1.0e-4,
-    'lr_replay': 1.0e-4,
-    'lr_back':   1.0e-4,   # 1/T end (shared with the anchor_seed/z_match bwd-TB stages)
-    'lr_fused':  5.0e-5,
-}
+# Seed for a servo-managed (`auto`) LR. Deliberately BELOW every measured
+# optimum on this codebase (aug02 4e-4 at T=25, ty4xdlzo ~8e-4, local_aug08
+# ~1.25e-4 at T=10) rather than near one: alpha* > 1 is affirmative permission
+# to grow, so the servo climbs out of an undershoot cheaply and on evidence,
+# whereas it can only learn about an overshoot by taking one. Seeding low costs
+# a few thousand steps of climb; seeding high costs a detonation.
+_SERVO_SEED_LR = 1.0e-5
+_LR_KEYS = ('lr_policy', 'lr_replay', 'lr_back', 'lr_fused')
 _CLIP_ANCHOR = 250.0
 _GRAD_MEDIAN = {10: 1.0e3, 25: 6.6e3, 100: 1.7e4}  # empirical pre-clip grad medians (mipcas)
-# NB this composes with _CLIP_ANCHOR: cut_grad_abs = _CUT_GRAD_OVER_CLIP *
-# _CLIP_ANCHOR * grad_median(T)/_GRAD_MEDIAN[T_REF], so the bar sits at
-# (_CUT_GRAD_OVER_CLIP * 250/6600) x grad_median(T) at EVERY T and W. At the old
-# value of 30 that is 1.14x the tabulated median -- a "parameter thrash" bar
-# barely above the typical gradient. 44gt5whr's only fire was 1288 vs a bar of
-# 1136 (13% over) on a run whose pre-clip median ran ~300-350, and it cost a
-# permanent 2x LR cut for 17k steps. 100 puts the bar at ~3.8x the tabulated
-# median. Raise the pair together, never one alone.
-_CUT_GRAD_OVER_CLIP = 100.0
-_RESET_OVER_CUT = 10.0
+
+# Keys deleted from the schema, with the reason the config author needs. Checked
+# at LOAD, not at first use: the aug02 battery lost all 16 arms' entire phase 1
+# (1.1-7.8 h each) because a retired-key guard lived inside manage_replay_buffer,
+# which first runs at the phase-1 -> 2 transition (module_buffers.md B4).
+_RETIRED_KEYS = {
+    'reuse_prior':
+        "deleted -- point checkpoint_name/prior_model_name at the prior explicitly, "
+        "or let the train_prior stage rebuild it. Auto-refinding a prior by run_name "
+        "silently reloaded pre-fix checkpoints across scoring changes.",
+    'terminal_logw_std':
+        "deleted with _terminal_policy_state -- _frozen_training_state (bitwise-"
+        "constant grad norm) separates dead from live runs with no calibration.",
+    'terminal_box_violation': "deleted with _terminal_policy_state (see terminal_logw_std).",
+    'adaptive_lr.enabled':
+        "deleted -- the envelope is unconditional. To run flat LRs set "
+        "lr_warmup_ratio: 1 (which makes the ramp a no-op).",
+    'adaptive_lr.hold_steps':
+        "deleted with the decay leg -- the envelope now holds at 1.0 forever.",
+    'adaptive_lr.decay_halflife_steps':
+        "deleted (decisions.md D7/N2) -- there is no step budget to schedule "
+        "against, and under the servo a deterministic multiplier on the LR is "
+        "absorbed: alpha* rates peak x envelope, so the servo just raises peak.",
+    'adaptive_lr.decay_floor_scale':
+        "deleted -- redundant with min_lr, which already floors every group in "
+        "_apply_lrs, and the decay leg it floored is gone.",
+    'adaptive_lr.cut_loss_abs':
+        "deleted with the cut tier (decisions.md D4). Use adaptive_lr."
+        "divergence_loss_abs for the coarse ~1e9 reload bar.",
+    'adaptive_lr.cut_grad_abs':
+        "deleted with the cut tier -- see adaptive_lr.divergence_grad_abs.",
+    'adaptive_lr.reset_loss_abs': "renamed -> adaptive_lr.divergence_loss_abs.",
+    'adaptive_lr.reset_grad_abs': "renamed -> adaptive_lr.divergence_grad_abs.",
+    'adaptive_lr.cut_ratio': "renamed -> adaptive_lr.divergence_cut.",
+    'adaptive_lr.fire_cooldown_steps':
+        "deleted -- no cooldown is needed on a bar that only non-finite values "
+        "and 1e9 blow-ups can reach.",
+    'adaptive_lr.recovery_target_frac':
+        "deleted with the recovery ramp -- the servo re-climbs continuously on "
+        "alpha*, so there is nothing to recover from a latch.",
+    'adaptive_lr.recovery_wait_steps': "deleted with the recovery ramp.",
+    'adaptive_lr.recovery_ramp_steps': "deleted with the recovery ramp.",
+    'integrator.min_traj_length':
+        "deleted -- the discretizer is always uniform with a static strategy, so "
+        "T is the only trajectory-length parameter.",
+    'integrator.max_traj_length': "deleted (see integrator.min_traj_length).",
+    'integrator.traj_length_strategy': "deleted -- always 'static'.",
+    'integrator.discretizer': "deleted -- always 'uniform'.",
+    'integrator.discretizer_max_ratio': "deleted -- only the 'random' discretizer read it.",
+    'max_reloads':
+        "renamed -> max_reloads_per_1k_steps, and it is now a RATE. A fixed "
+        "count aborts a long run for the same per-step behaviour a short one "
+        "survives.",
+    'terminal_frozen_steps':
+        "deleted with _frozen_training_state. Its job -- catching an "
+        "unrecoverable run -- is covered by the divergence bar plus the rewind "
+        "budget (max_reloads_per_1k_steps).",
+    'z_calibration.unclipped':
+        "deleted. The Z sidecar now always uses the fwd TB loss's own beta, so "
+        "sensor and actuator share a fixed point by construction.",
+    'buffers.anchor_buffer.health_gate_r2':
+        "renamed -> health_gate_floor (the bar is named after its role, not after "
+        "whichever metric health_gate_floor_metric currently names).",
+    'buffers.anchor_buffer.health_gate_zerr':
+        "renamed -> health_gate_ceiling. NB a bar does not survive a ruler swap: "
+        "0.5 belongs to tb_resid_clipped (signed, beta-bounded, derived from the D29 "
+        "Z-currency invariant), not to tb_err_worst (an unbounded RMS ~18-21 when healthy).",
+    'buffers.anchor_buffer.mcmc':
+        "deleted -- the Metropolis reheat is archived in git history "
+        "(anchor_seed_mcmc_reheat); anchors seed from prior_dataset.",
+}
+
+
+def _walk_key(args, dotted):
+    """(container, leaf, present) for a dotted config path, or (None, leaf,
+    False) if any ancestor is missing."""
+    node = args
+    parts = dotted.split('.')
+    for p in parts[:-1]:
+        node = getattr(node, p, None)
+        if node is None:
+            return None, parts[-1], False
+    return node, parts[-1], hasattr(node, parts[-1])
+
+
+def preflight_config(args):
+    """Reject retired keys at load, before a single energy call is spent.
+
+    Hard failure rather than a warning, deliberately. A retired key in a config
+    is almost always a value the author believes is doing something: silently
+    ignoring `cut_grad_abs` leaves them reading an LR ladder whose brake they
+    think they set. The message names the replacement so the fix is mechanical."""
+    dead = []
+    for dotted, why in _RETIRED_KEYS.items():
+        node, leaf, present = _walk_key(args, dotted)
+        if present:
+            dead.append(f"  {dotted}: {why}")
+    if dead:
+        raise ValueError("retired config keys found:\n" + "\n".join(dead))
+
+    # Integration time must agree between training and eval. The stab_july21
+    # elj battery ran eval_T = 2T and floored wass_debiased on what turned out
+    # to be an integration-dt mismatch artifact, not a modelling result: the
+    # policy learns a drift per step at ONE dt, so scoring it at another
+    # changes the SDE being integrated. There is no legitimate reason to differ.
+    T = int(getattr(getattr(args, 'integrator', None), 'T', 0) or 0)
+    eval_T = getattr(args, 'eval_T', None)
+    if T and eval_T is not None and int(eval_T) != T:
+        raise ValueError(
+            f"eval_T ({eval_T}) must equal integrator.T ({T}). The policy's drift and "
+            f"variance heads are learned at one dt; evaluating at another integrates a "
+            f"different SDE, and the resulting wass/r2 numbers are a dt artifact rather "
+            f"than a measurement of the model.")
+    return args
 
 
 def _is_auto(v):
@@ -185,33 +301,52 @@ def resolve_derived_config(args):
 
     resolved = {}
 
-    # LRs: anchor x T_REF/T, W-flat (lr_flow is mode-dependent, never auto-scaled)
-    for name, anchor in _LR_ANCHORS.items():
+    # LRs: `auto` hands the key to the servo, seeded low. The set of managed
+    # keys is recorded on args because _apply_lrs needs to know which groups
+    # peak_scale applies to -- once resolved, `auto` and an explicit float are
+    # indistinguishable as values, and that distinction IS the semantics.
+    servo_node = getattr(getattr(args, 'adaptive_lr', None), 'servo', None)
+    seed_lr = float(getattr(servo_node, 'seed_lr', None) or _SERVO_SEED_LR)
+    managed = []
+    for name in _LR_KEYS:
         if _is_auto(getattr(args, name, None)):
-            val = anchor * _SCALING_T_REF / T
-            setattr(args, name, val)
-            resolved[name] = val
+            setattr(args, name, seed_lr)
+            resolved[name] = seed_lr
+            managed.append(name)
+    args.lr_servo_managed = tuple(managed)
+    if managed:
+        # `auto` means SERVO-MANAGED now. Silently resolving it to the seed with
+        # no servo to move it would leave the run training at 1e-5 forever while
+        # the config still says `auto` -- a config that reads as "let the system
+        # choose" and behaves as "pinned an order of magnitude low". That is the
+        # exact class of silent change the retired-key preflight exists to stop,
+        # so it is an error rather than a default.
+        servo = getattr(getattr(args, 'adaptive_lr', None), 'servo', None)
+        if servo is None or not getattr(servo, 'enabled', False):
+            raise ValueError(
+                f"{', '.join(managed)} set to `auto` but adaptive_lr.servo is absent or "
+                f"disabled. `auto` no longer means the old T-scaling rule (anchor x 25/T) "
+                f"-- it means the alpha* loop OWNS this LR. Either enable the servo (it "
+                f"also needs a step_probe block), or write an explicit float for a fixed "
+                f"peak. The old rule at T={T} would have given "
+                f"lr_policy/back/replay {1.0e-4 * 25 / T:.3g}, lr_fused {5.0e-5 * 25 / T:.3g}.")
+        if getattr(args, 'step_probe', None) is None:
+            raise ValueError(
+                f"{', '.join(managed)} set to `auto` (servo-managed) but no `step_probe` "
+                f"block is configured. The servo's only sensor is alpha*, and with the "
+                f"probe absent it would hold at 'no_probe' forever -- pinning these LRs "
+                f"at the seed while the config claims they are adaptive.")
 
-    # grad clip: anchor x grad_median(T)/grad_median(T_REF) x sqrt(W/W_REF)
+    # grad clip: anchor x grad_median(T)/grad_median(T_REF) x sqrt(W/W_REF).
+    # This one IS still derived -- it scales with the gradient's own measured
+    # magnitude, which is a property of the rollout length rather than of a
+    # tuning choice, and nothing servos it.
     if _is_auto(getattr(args, 'gradient_norm_clip', None)):
         clip = (_CLIP_ANCHOR
                 * (_grad_median(T) / _GRAD_MEDIAN[_SCALING_T_REF])
                 * math.sqrt(W / _SCALING_W_REF))
         args.gradient_norm_clip = clip
         resolved['gradient_norm_clip'] = clip
-
-    # tripwire bars: fixed ratios off (already-resolved) clip / cut_loss
-    alr = getattr(args, 'adaptive_lr', None)
-    if alr is not None:
-        if _is_auto(getattr(alr, 'cut_grad_abs', None)) and getattr(args, 'gradient_norm_clip', None) is not None:
-            alr.cut_grad_abs = _CUT_GRAD_OVER_CLIP * float(args.gradient_norm_clip)
-            resolved['adaptive_lr.cut_grad_abs'] = alr.cut_grad_abs
-        if _is_auto(getattr(alr, 'reset_grad_abs', None)) and getattr(alr, 'cut_grad_abs', None) is not None:
-            alr.reset_grad_abs = _RESET_OVER_CUT * float(alr.cut_grad_abs)
-            resolved['adaptive_lr.reset_grad_abs'] = alr.reset_grad_abs
-        if _is_auto(getattr(alr, 'reset_loss_abs', None)) and getattr(alr, 'cut_loss_abs', None) is not None:
-            alr.reset_loss_abs = _RESET_OVER_CUT * float(alr.cut_loss_abs)
-            resolved['adaptive_lr.reset_loss_abs'] = alr.reset_loss_abs
 
     if resolved:
         summary = ', '.join(f'{k}={v:.4g}' for k, v in resolved.items())
@@ -234,7 +369,11 @@ def load_yaml(path):
     yaml_path = Path(path)
     assert yaml_path.exists()
     assert yaml_path.suffix in {".yaml", ".yml"}
-    with yaml_path.open("r") as f:
+    # encoding pinned: the default is the LOCALE's (cp1252 on Windows), so a
+    # config carrying any non-ASCII byte -- a mu, a degree sign, an accented
+    # name in a path -- raises UnicodeDecodeError on one machine and loads fine
+    # on another.
+    with yaml_path.open("r", encoding="utf-8") as f:
         target_dict = yaml.safe_load(f)
 
     return target_dict
@@ -375,55 +514,6 @@ def get_gfn_init_state(batch_size, ndim, device):
 
 def uniform_discretizer(bsz, trajectory_length):
     return torch.linspace(0, 1, trajectory_length + 1).repeat(bsz, 1)
-
-
-def random_discretizer(bsz, trajectory_length, max_ratio):
-    x = (torch.rand(bsz, trajectory_length) * (max_ratio - 1) + 1).cumsum(1)
-    x = torch.cat([torch.zeros(bsz, 1), x], 1) / x[:, -1].unsqueeze(1)
-    return x
-
-
-def low_discrepancy_discretizer(bsz, traj_length=2):
-    u = torch.rand(1, traj_length - 1)
-    u_sorted, _ = torch.sort(u, dim=-1, descending=False)
-    # print(u_sorted)
-    # print(u_sorted.shape)
-    shift_vector = (torch.arange(bsz) / bsz).unsqueeze(1).repeat(1, traj_length - 1)
-    timestep = u + shift_vector
-    timesteps_in_range = timestep % 1.0
-    timesteps_sorted, indices = torch.sort(timesteps_in_range, dim=-1, descending=False)
-    x = torch.cat([torch.zeros(bsz, 1), timesteps_sorted, torch.ones(bsz, 1)], dim=1)
-    # dt = x.diff(dim=1)
-    # too_small = dt < 5e-3
-
-    return x
-
-    # old code below:
-    # u = torch.rand(1)
-    # shift_vector = torch.arange(bsz)/bsz
-    # timestep = u + shift_vector
-    # timestep_in_range = timestep % 1.0
-    # timestep_in_range = timestep_in_range.unsqueeze(-1)
-    # x = torch.cat([torch.zeros(bsz, 1), timestep_in_range, torch.ones(bsz, 1)], 1)
-    # return x
-
-
-def low_discrepancy_discretizer2(bsz, traj_length=2):
-    s = traj_length - 1
-    u = torch.rand(1, s)
-    shift_vector = torch.arange(bsz) / bsz
-    timestep = u + shift_vector.unsqueeze(-1)
-    timestep_in_range = timestep % 1.0
-    x = (timestep_in_range + torch.arange(s).unsqueeze(0)) / s
-    x = torch.stack([col[torch.randperm(col.size(0))] for col in x.t()]).t()
-    return x
-
-
-def shifted_equidistant(bsz, traj_length, eps=1e-4):
-    bound = 1 / traj_length - eps
-    noise = torch.empty(bsz, 1).uniform_(- bound, bound)
-    steps = (torch.arange(1, traj_length) / traj_length).unsqueeze(0) + noise
-    return torch.cat([torch.zeros(bsz, 1), steps, torch.ones(bsz, 1)], dim=1)
 
 
 def compute_sample_overlap(ref_x, sample_x=None, ga: float = 1.0, agg='sum'):
@@ -1153,28 +1243,19 @@ def atomic_save(state_dict, path):
 
 
 def get_discretizer(int_cfg):
-    # discretizer = lambda bsz: uniform_discretizer(bsz, self.args.T)
-    # discretizer = lambda bsz: uniform_discretizer(bsz, np.random.randint(10,self.args.T+1))
-    # discretizer = lambda bsz: random_discretizer(bsz, self.args.T, 10)
-    if int_cfg.traj_length_strategy == 'static':
-        traj_length = int_cfg.T
-    elif int_cfg.traj_length_strategy == 'sampled':
-        traj_length = np.random.randint(low=int_cfg.min_traj_length, high=int_cfg.max_traj_length + 1)
-    else:
-        assert False
-    if int_cfg.discretizer == 'random':
-        discretizer = lambda bsz: random_discretizer(bsz, traj_length, max_ratio=int_cfg.discretizer_max_ratio)
-    elif int_cfg.discretizer == 'low_discrepancy':
-        int_cfg.discretizer = lambda bsz: low_discrepancy_discretizer(bsz, traj_length)
-    elif int_cfg.discretizer == 'low_discrepancy2':
-        discretizer = lambda bsz: low_discrepancy_discretizer2(bsz, traj_length)
-    elif int_cfg.discretizer == 'equidistant':
-        discretizer = lambda bsz: shifted_equidistant(bsz, traj_length)
-    elif int_cfg.discretizer == 'uniform':
-        discretizer = lambda bsz: uniform_discretizer(bsz, traj_length)
-    else:
-        assert False
-    return discretizer
+    """Uniform steps over integrator.T, always.
+
+    The variable-length / alternative-discretizer branches (random,
+    low_discrepancy, equidistant; 'sampled' trajectory lengths between
+    min_traj_length and max_traj_length) were deleted with their five config
+    keys. Nothing on any live route selected them, and a non-uniform dt is not
+    a free choice here: the policy learns a drift and variance PER STEP at one
+    dt, and P_B's reference bridge is written in accumulated-variance time, so
+    changing the step schedule changes the SDE being integrated rather than
+    just its quadrature. The alternatives are in git history if a variable-dt
+    experiment is ever wanted; they should come back with the density
+    correction that would make them valid, not as a config switch."""
+    return lambda bsz: uniform_discretizer(bsz, int_cfg.T)
 
 
 def drain_elapsed_times(times):

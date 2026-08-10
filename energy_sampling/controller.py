@@ -3,320 +3,267 @@ import math
 
 class LRController:
     """
-    Fixed-peak LR controller (v6): a deterministic ramp -> hold -> decay
-    schedule under a FIXED peak (scale never exceeds 1.0 = the configured
-    base LRs), plus two-tier ABSOLUTE tripwires. Replaces the v5 adaptive
-    (probe/coherence) controller wholesale -- see git history. The probe
-    measured update AGREEMENT, which stayed honestly positive straight into
-    detonations (aijrfwuy scale-1.94, s706frkh scale-1.46), and the climb it
-    licensed manufactured the very breaches the balance layer then spent
-    thousands of steps repairing. There is no climb any more: the configured
-    LR is the peak, full stop.
+    Two-regime LR controller (v7): a per-stage warmup envelope under a peak the
+    ALPHA-STAR SERVO owns, plus one coarse divergence bar that reloads and cuts.
+    Nothing in between. See docs/to_do_rebuild.md A4/A4a/A5 and decisions.md D4.
 
-    SCHEDULE (ALL durations in TRAIN STEPS -- a pure function of
-    step_ind - stage_start_step, so the controller's own call cadence
-    (currently every 10 steps) can never change what a config value means;
-    restarted by rearm_warmup at every stage transition, so each stage runs
-    its own ramp/hold/decay):
-      ramp:   blind exponential 1/lr_warmup_ratio -> 1.0 over warmup_steps
-              (rebuilt optimizers must not land at the full operating LR on
-              cold Adam moments)
-      hold:   scale 1.0 for hold_steps
-      decay:  exponential toward decay_floor_scale with half-life
-              decay_halflife_steps (0/null = hold at 1.0 forever). Decay buys
-              back the late-run precision the LR jitter floor otherwise caps
-              (weight jitter at the operating LR bounds attainable wass/r2).
-    adaptive_lr.enabled: false pins scale flat at 1.0 -- no ramp, no decay.
-    FIRE runs regardless of the flag.
+    WHAT V7 DELETED, AND WHY. v6 had a third regime between those two -- the cut
+    tier, its latch, its hot clock, the recovery ramp and the cut-factor AIMD.
+    Every mechanism in it existed to contain a problem the tier itself created
+    (module_lr_controller.md 9), it demonstrably could not arrest a live
+    explosion (1219ddv9 degraded monotonically THROUGH a 100x cut; s706frkh's
+    runaway ran at policy lr 1e-6), and both documented deadlock modes lived
+    inside it. It is gone. The scheduled decay leg went with it: alpha* rates
+    the PRODUCT peak x envelope(t), so a deterministic multiplier on that
+    product is absorbed -- the servo just raises peak to compensate, leaving
+    peak inflated against the units its own ceiling is expressed in.
 
-    FIRE (two tiers, event-triggered, ABSOLUTE bars -- no medians, no
-    relative baselines. The old floored-median bars failed two-sided in
-    s706frkh: with the median riding the floor they fired on a
-    clip-neutralized grad 745 -- the applied update was identical to any
-    at-clip step -- and once the incident's own 1e4 norms raised the median
-    they went blind exactly when the real excursion began):
-      cut tier   (cut_loss_abs / cut_grad_abs): parameter thrash -- LR cut
-                 only, no rewind. Training state is intact, just too hot.
-      reset tier (reset_loss_abs / reset_grad_abs, or a non-finite reading):
-                 true explosion (tb err at +1e4 scale) -- train.py routes
-                 this to fire_loss_spike's rewind-to-best + cut. Stale best
-                 weights against fresher live buffers re-synchronize quickly
-                 and are an accepted cost here.
-    Cuts multiply an INSTANCE-held _cut_factor -- deliberately NOT in
-    lr_ctrl, which the rewind restores from a healthy checkpoint, erasing
-    any evidence kept there that this LR already detonated (the djr13t0j
-    sawtooth). The factor resets at stage transitions: optimizers are
-    rebuilt onto a new loss surface and the old stage's fire evidence does
-    not transfer.
+    THE ENVELOPE is now ramp -> hold, forever:
+      ramp: blind exponential 1/lr_warmup_ratio -> 1.0 over warmup_steps,
+            restarted by rearm_warmup at every stage transition (rebuilt
+            optimizers must not land at the operating LR on cold Adam moments).
+            It survives the decay deletion on a different warrant: it runs
+            BEFORE the servo has any alpha* to act on.
+      hold: scale 1.0 thereafter.
+    Durations are TRAIN STEPS and the schedule is a pure function of
+    step_ind - stage_start_step, so the call cadence cannot change what a
+    config value means.
 
-    LATCH: a fire disarms its channel's CUT tier until the metric has
-    recrossed BELOW the cut bar (still pure level logic -- no trends, no
-    baselines). An excursion's decay tail re-tripping the absolute bar at
-    every cooldown expiry is the same single event, and cutting again does
-    not drain it faster (g8d8se26: the first cut did the work; four tail
-    fires on a 17k->1k grad drain dug the factor from 0.25 to the 0.01
-    floor). The reset tier and non-finite readings ignore the latch -- an
-    excursion that ESCALATES past the reset bar is a new fact and must not
-    be blind-windowed (which is also why the fix is a latch and not a
-    longer cooldown: the cooldown suppresses ALL finite readings on the
-    channel, reset tier included). If the metric NEVER recrosses -- a
-    sustained simmer between the bars -- the cut tier stays disarmed, on
-    purpose: repeat cuts demonstrably do not drain a sustained excursion
-    (1219ddv9 degraded monotonically through a 100x cut; the s706frkh
-    runaway ran at policy lr 1e-6), so the stuck state belongs to the
-    reset tier and _terminal_policy_state. What a simmer must NOT do is
-    let recovery re-ramp into it -- see the hot clock below.
+    THE SERVO (adaptive_lr.servo) drives one multiplicative `peak_scale` on the
+    policy groups:
 
-    RECOVERY (recovery_target_frac > 0): a fire records the cut factor
-    that was running when its episode started -- the measured ceiling.
-    Once the system has been COLD (every monitored reading below its cut
-    bar, no fires) for recovery_wait_steps, the factor re-ramps
-    exponentially over recovery_ramp_steps toward recovery_target_frac x
-    that ceiling, then cruises there (the schedule envelope stays
-    authoritative on top, so ramp/decay behave normally). The wait clock
-    runs from the last HOT reading, not the last fire: a latched channel
-    simmering between the bars fires nothing, and recovery must not raise
-    the LR back into a still-hot state whose cut tier the latch has
-    disarmed -- if the metric never recrosses, recovery never starts. A
-    hot reading during the ramp pauses it in place (anchor resets, clock
-    pushes out) without needing a fire. Episode grouping uses the same
-    clock: a fire after a full cold wait fired at a level recovery
-    deliberately returned to -- new evidence, the ceiling re-records and
-    the cruise target ratchets down (AIMD) instead of sawtoothing;
-    fires inside an ongoing episode keep the original ceiling.
-    Without recovery a cut is permanent for the stage: g8d8se26 spent 24k
-    of its 27k steps pinned at the 0.01 floor with grads 30-50x under the
-    bar, still slowly improving -- pure LR starvation.
+        peak_scale <- peak_scale * clip(median(alpha*) / target, clip_lo, clip_hi)
 
-    The flow (Z head) LR stays PINNED at lr_flow, exempt from scaling -- the
-    schedule has no sensor mandate over Z, and scaling it ran the Z head
-    ~20x under design (ylmtpqjy). control_flow_lr: true restores uniform
-    scaling for A/B.
+    alpha* is step_probe.py's two-point reading: a dimensionless multiplier on
+    the step actually taken. It was designed as a GROWTH signal -- "alpha* > 1
+    is affirmative permission to climb", which a breach-only AIMD can never
+    have -- and measurement withdrew that half. AS SHIPPED clip_hi is 1.0, so
+    the multiplier is <= 1 always and peak_scale can only FALL: the servo is a
+    one-sided brake and `seed_lr` is the operating LR, not a starting point.
+    See THE SETPOINT below.
+
+    WHICH GROUPS IT DRIVES is a per-key config choice, per the `auto` semantics
+    in utils.resolve_derived_config: a key written `auto` is servo-managed
+    (seeded at _SERVO_SEED_LR and then owned by the loop); a key written as a
+    float is a FIXED peak the servo never touches. So `lr_fused: auto` with
+    `lr_back: 2e-4` is a legal and meaningful configuration, and a config with
+    no `auto` at all still logs alpha* while actuating nothing -- which is the
+    servo's own A/B control arm.
+
+    CEILING WITH FORGETTING. A divergence records ceiling = the peak_scale that
+    was running, cut by divergence_cut; growth is damped by distance below it,
+    so approach is asymptotic and re-breach is rare. The ceiling then relaxes
+    upward with ceiling_halflife_steps -- an LR the surface refused at step 2k
+    should not still bind at step 40k. The ceiling is INSTANCE state, never in
+    lr_ctrl: the rewind that follows a divergence restores lr_ctrl from a
+    healthy checkpoint and would otherwise erase the evidence that this LR just
+    detonated (the djr13t0j sawtooth). peak_scale itself IS checkpointed, so a
+    resume keeps the climb instead of re-deriving it from the seed, and it is
+    clamped to the live ceiling on every read.
+
+    THE SETPOINT: alpha* transfers as a SHAPE, not as a setpoint (lr_aug08,
+    2026-08-08; module_lr_controller.md F6/F8).
+
+      * the shape holds. lr x alpha* is constant to ~10% across 26x within one
+        run, and pair D got 1.73 against a predicted 1.72 across two.
+      * the setpoint does not. Following target 1.0 to its fixed point (3.2e-4,
+        alpha_median 1.006 -- the loop tracks perfectly) cost 2.2 nats of
+        bwd/tb_err and 2.8 of fwd against a hand-set 1.25e-4.
+      * ⚠ and target 1.0 is a POSITIVE FEEDBACK LOOP. b_descend blew fwd/tb_err
+        21 -> 35 with alpha_median pinned at ~1.0 throughout and the LR creeping
+        3.1e-4 -> 4.5e-4 BECAUSE of the degradation: a flattening surface reads
+        as more headroom. bwd/tb_err IMPROVED across the whole collapse, so
+        neither branch metric saw it either, and no containment bar fired.
+
+    clip_hi: 1.0 makes that loop impossible by construction rather than
+    avoided by tuning. `target` then means "the hottest LR you will tolerate"
+    and must sit WELL BELOW the alpha* actually observed at the operating LR --
+    a target AT it would ratchet, since SE(windowed median) is ~9% and a
+    one-sided clip can never give back what noise takes.
+
+    Restoring the growth servo (clip_hi > 1) needs a guard that is not alpha*
+    first: a local ray measurement is structurally blind to a sampling
+    distribution collapsing. See decisions.md D32.
+
+    DIVERGENCE (the only actuating bar left) is deliberately coarse: non-finite
+    loss or gradient, or either past an absolute ~1e9 bar. Per D4, if we are
+    only looking at hard blow-ups then almost any metric works, so this bar
+    needs no calibration and must never be tuned into a graduated one. It fires
+    BOTH actions together -- train.py reloads the checkpoint AND on_divergence
+    cuts the peak -- because a reload without a cut re-enters the same state at
+    the same LR and explodes again, while a cut without a reload keeps the
+    damaged weights.
+
+    The flow (Z head) LR stays PINNED at lr_flow, exempt from envelope and
+    servo alike: alpha* is measured over POLICY parameters only (decision D26
+    option b), so the servo has no sensor mandate over Z, and scaling it ran
+    the Z head ~20x under design (ylmtpqjy). control_flow_lr: true restores
+    uniform scaling for A/B.
+
+    lr_ctrl state ver=7 invalidates v1-v6 checkpoint state.
     """
 
     CHANNELS = ('fwd', 'bwd', 'replay', 'fused')
 
+    # Policy optimizer keys -> the args attribute holding their base LR. The
+    # flow head is deliberately absent: it is pinned, not scheduled.
+    _POLICY_BASE = {'fwd': 'lr_policy', 'bwd': 'lr_back', 'replay': 'lr_replay',
+                    'fused': 'lr_fused'}
+
     def __init__(self, modeller):
         self.modeller = modeller
         self._report = {}
-        # fire memory, deliberately INSTANCE state and NOT in lr_ctrl: the
-        # rewind that follows a reset-tier fire restores lr_ctrl from the
-        # 'best' checkpoint, which would erase any evidence kept there.
-        self._cut_factor = 1.0
-        self._fire_counts = {}
-        self._channel_cooldown_until = {}
-        # per-channel cut-tier latch + fire memory for the recovery ramp;
-        # instance state for the same rewind-proofness reason as _cut_factor
-        self._latched = set()
-        self._last_fire_step = None
-        self._last_hot_step = None   # last reading at/above any cut bar (or non-finite)
-        self._pre_trigger_cold = True  # was there a >= recovery_wait cold gap before this tick's readings
-        self._fire_cut_factor = None
-        self._recovery_anchor = None
-        self._report_bars()
+        # Ceiling evidence, deliberately INSTANCE state and NOT in lr_ctrl: the
+        # rewind that follows a divergence restores lr_ctrl from the 'best'
+        # checkpoint, which would erase the record that this LR detonated.
+        self._ceiling = None          # peak_scale the servo must not exceed
+        self._ceiling_step = None     # when it was recorded (drives forgetting)
+        self._divergences = 0
+        self._last_servo_step = None
+        self._servo_hold_reason = ''
+        # has the warmup ramp completed since the last flush? False forces the
+        # probe's window to be emptied on the first post-ramp tick, so the servo
+        # never acts on readings taken at the envelope-suppressed LR (F7)
+        self._warm = False
+        self._check_bars()
 
-    def _report_bars(self):
-        """Print the grad tripwires in CLIP-RELATIVE units at construction, and
-        hard-check their ordering.
-
-        Motivation, and its limit. tw_july31 raised gradient_norm_clip 8.5x and
-        cut/reset_grad_abs 2.8x over postfix_july30, and its arm 14 then
-        detonated at pre-clip grad norm 154,299 -- above that battery's cut bar
-        (38,640) but below its reset bar (386,400). Cut-tier only means no
-        rewind, the cut tier latches, the metric never recrosses so recovery
-        never starts, and the run parks forever. That is exactly the 'sustained
-        simmer between the bars' this class's docstring warns about.
-
-        What this check does NOT do is claim a calibrated ceiling, because the
-        battery does not support one: postfix_july30 and tw_july31 ran the SAME
-        reset/cut ratio of 10x, so no ratio rule separates them, and in
-        clip-relative terms the battery's bars were TIGHTER (10x/100x the clip
-        vs 30x/300x), not looser. The absolute level is what moved. So this
-        prints rather than prescribes -- the bars become visible at launch
-        instead of being buried in a generated yaml -- and the real backstop
-        for the simmer case is train.py's _frozen_training_state, which keys on
-        non-recovery rather than on level and so needs no calibration at all.
-        """
-        cut = self._cfg('cut_grad_abs', None)
-        reset = self._cfg('reset_grad_abs', None)
-        clip = getattr(self.modeller.args, 'gradient_norm_clip', None)
-        if cut is None or reset is None:
-            return
-        cut, reset = float(cut), float(reset)
-        if reset <= cut:
-            raise ValueError(
-                f"adaptive_lr.reset_grad_abs ({reset:g}) must exceed cut_grad_abs "
-                f"({cut:g}): the reset tier is the escalation tier, and inverting "
-                f"them makes every explosion a cut-only fire with no rewind.")
-        rel = ""
-        if clip:
-            clip = float(clip)
-            rel = (f"  |  in clip units: clip={clip:g}, cut={cut / clip:.0f}x, "
-                   f"reset={reset / clip:.0f}x")
-            if cut <= clip:
-                print(f"lr_ctrl WARNING: cut_grad_abs ({cut:g}) is at or below "
-                      f"gradient_norm_clip ({clip:g}) -- every clipped step is a "
-                      f"fire, so the cut tier will chatter.")
-        print(f"lr_ctrl bars: cut_grad_abs={cut:g} reset_grad_abs={reset:g}{rel}")
-
-    @property
-    def enabled(self):
-        cfg = getattr(self.modeller.args, 'adaptive_lr', None)
-        return cfg is not None and getattr(cfg, 'enabled', False)
+    # ------------------------------------------------------------------ config
 
     def _cfg(self, name, default):
         return getattr(getattr(self.modeller.args, 'adaptive_lr', None), name, default)
 
-    # ------------------------------------------------------------- fire (spikes)
+    def _servo_cfg(self, name, default):
+        node = getattr(getattr(self.modeller.args, 'adaptive_lr', None), 'servo', None)
+        return getattr(node, name, default) if node is not None else default
+
+    @property
+    def servo_enabled(self):
+        return bool(self._servo_cfg('enabled', False)) and bool(self._managed_keys())
+
+    def _managed_keys(self):
+        """Config keys the servo owns -- the ones written `auto`, recorded by
+        resolve_derived_config at load. Empty set = the servo reads and logs
+        but actuates nothing, which is its own control arm."""
+        return set(getattr(self.modeller.args, 'lr_servo_managed', ()) or ())
+
+    def _check_bars(self):
+        """Divergence bars are a sanity floor, not a calibration. Refuse a bar
+        low enough to fire on ordinary training: a graduated divergence bar is
+        the cut tier coming back in through the config."""
+        for name in ('divergence_loss_abs', 'divergence_grad_abs'):
+            bar = self._cfg(name, None)
+            if bar is None:
+                continue
+            bar = float(bar)
+            if bar < 1.0e5:
+                raise ValueError(
+                    f"adaptive_lr.{name} = {bar:g} is too low to be a divergence bar. "
+                    f"This tier reloads the checkpoint and discards progress; it exists "
+                    f"for non-finite values and ~1e9 blow-ups only. A bar tuned to fire "
+                    f"on merely-hot training is the deleted cut tier by another name.")
+        print(f"lr_ctrl v7: divergence bars loss={self._cfg('divergence_loss_abs', None)} "
+              f"grad={self._cfg('divergence_grad_abs', None)}  |  servo "
+              f"{'ON ' + ','.join(sorted(self._managed_keys())) if self.servo_enabled else 'off'}")
+
+    # -------------------------------------------------------------- divergence
 
     def check_spike(self, step_type, current_loss, grad_norm):
-        """Absolute two-tier tripwires feeding train.py's monitor_losses.
-        Returns None, 'cut' (thrash: LR cut only), or 'reset' (true
-        explosion: rewind + cut). Always on regardless of adaptive_lr.enabled.
+        """The one remaining tripwire. Returns 'diverged' or None.
 
-        A finite fire arms fire_cooldown_steps on its channel; further finite
-        fires on that channel are suppressed until it expires, so a sustained
-        excursion (or the post-rewind re-sync transient) can't machine-gun
-        cuts/rewinds at the check cadence (the s706frkh 18-fire loop ran at
-        exactly the old cooldown period). Non-finite readings ignore the
-        cooldown -- NaN weights are not going to re-sync on their own."""
-        step = self.modeller.step_ind
+        Non-finite readings, or a finite reading past an absolute ~1e9 bar.
+        No cooldown, no latch, no per-channel memory: at this bar a second
+        reading is a second explosion, and train.py's max_reloads cap is what
+        stops a rewind loop. Always on -- there is no flag that disables it."""
         checks = []
         if current_loss is not None and step_type in self.CHANNELS:
             checks.append((f'{step_type}_loss', float(current_loss),
-                           self._cfg('cut_loss_abs', 1.0e3),
-                           self._cfg('reset_loss_abs', 1.0e4)))
+                           self._cfg('divergence_loss_abs', 1.0e9)))
         if grad_norm is not None:
             checks.append(('grad_norm', float(grad_norm),
-                           self._cfg('cut_grad_abs', 3.0e3),
-                           self._cfg('reset_grad_abs', 3.0e4)))
-
-        cooldown = int(self._cfg('fire_cooldown_steps', 200))
-        # episode grouping for on_explosion: was the system cold (all readings
-        # below the cut bars) for a full recovery_wait before this tick? Uses
-        # the PRE-tick hot clock, because the triggering reading is itself hot.
-        wait = int(self._cfg('recovery_wait_steps', 5000))
-        self._pre_trigger_cold = (self._last_hot_step is None
-                                  or step - int(self._last_hot_step) >= wait)
-        tier = None
-        for channel, value, cut_bar, reset_bar in checks:
-            if (math.isfinite(value) and cut_bar is not None
-                    and value < float(cut_bar)):
-                # healthy reading: the excursion has drained -- re-arm the latch
-                self._latched.discard(channel)
+                           self._cfg('divergence_grad_abs', 1.0e9)))
+        for channel, value, bar in checks:
+            if math.isfinite(value) and (bar is None or value < float(bar)):
                 continue
-            if not math.isfinite(value):
-                this, bar = 'reset', float('nan')
-            elif reset_bar is not None and value >= float(reset_bar):
-                this, bar = 'reset', float(reset_bar)
-            elif cut_bar is not None and value >= float(cut_bar):
-                this, bar = 'cut', float(cut_bar)
-            else:
-                continue
-            self._last_hot_step = step
-            if math.isfinite(value) and step < self._channel_cooldown_until.get(channel, -1):
-                continue
-            if this == 'cut' and channel in self._latched:
-                # decay tail of an already-cut excursion (still between the
-                # bars): one event, one cut. Reset tier stays armed above.
-                continue
-            self._channel_cooldown_until[channel] = step + cooldown
-            self._latched.add(channel)
-            self._fire_counts[channel] = self._fire_counts.get(channel, 0) + 1
-            print(f"lr_ctrl tripwire FIRED [{this}]: {channel} value {value:.4g} "
-                  f">= bar {bar:.4g} (absolute), fire #{self._fire_counts[channel]} "
-                  f"on this channel (step {step})")
-            if this == 'reset':
-                tier = 'reset'
-            elif tier is None:
-                tier = 'cut'
-        return tier
+            self._divergences += 1
+            print(f"lr_ctrl DIVERGENCE: {channel} = {value:.4g} "
+                  f"(bar {float(bar) if bar is not None else float('nan'):.4g}) "
+                  f"at step {self.modeller.step_ind} -- reload + peak cut")
+            return 'diverged'
+        return None
 
-    def reset_spike_monitors(self, names):
-        """Stage-transition hook (protocol.StageProtocol.advance): arm a fire
-        cooldown on every channel. A transition can cause transient
-        turbulence anywhere (rebuilt optimizers, new loss definitions), and
-        that turbulence must not eat a fire."""
-        step = self.modeller.step_ind
-        cooldown = int(self._cfg('fire_cooldown_steps', 200))
-        for name in names:
-            self._channel_cooldown_until[f'{name}_loss'] = step + cooldown
-        self._channel_cooldown_until['grad_norm'] = step + cooldown
+    def on_divergence(self, count: int = 1):
+        """Cut the servo peak and record the ceiling. Called by train.py's
+        fire_loss_spike AFTER the rewind, for both the tripwire and the
+        terminal-policy path; `count` compounds the cut across repeated
+        terminal rewinds so the ceiling actually descends across policy deaths
+        instead of sawtoothing.
 
-    def on_explosion(self, count: int = 1, force_ratio: float = None):
-        """Cut hook, called for BOTH tiers (cut tier directly from
-        monitor_losses; reset tier after fire_loss_spike's rewind). Multiplies
-        the instance-held cut factor by cut_ratio**count -- count > 1 only
-        from repeated TERMINAL rewinds (train.py terminal_reloads), which
-        compound so the ceiling actually descends across policy deaths.
-        Being instance state, the factor survives the rewind that typically
-        precedes this call.
-
-        force_ratio overrides the configured cut_ratio for ONE call. Its only
-        caller is fire_loss_spike's no-rewind-target path: a config running
-        cut_ratio 1.0 to hold an LR live (configs/aug02) has deliberately
-        disabled this hook, which is fine while the rewind still works and
-        catastrophic when it does not -- reset fire + no target + no cut leaves
-        a detonated run with nothing at all stopping it."""
-        m = self.modeller
-        ratio = float(self._cfg('cut_ratio', 0.5) if force_ratio is None else force_ratio)
-        floor = m.args.min_lr / m.args.lr_policy
-        # fire memory for the recovery ramp: the cut factor RUNNING at the
-        # START of a fire episode is the measured ceiling. An episode begins
-        # with a hot reading after a full recovery_wait of cold ones
-        # (_pre_trigger_cold, stamped by the check_spike call that triggered
-        # this) -- fires inside an ongoing episode (draining tail past the
-        # latch on another channel, sustained simmer escalating to reset,
-        # NaN storm) happened at an already-cut level that proves nothing
-        # about the ceiling, so they keep the recorded level. A new-episode
-        # fire fired at a level recovery deliberately returned to -- new
-        # evidence, re-record, and the cruise target ratchets down (AIMD).
-        if self._pre_trigger_cold or self._fire_cut_factor is None:
-            self._fire_cut_factor = self._cut_factor
-        self._last_fire_step = int(m.step_ind)
-        self._recovery_anchor = None
-        self._cut_factor = max(self._cut_factor * ratio ** max(count, 1), floor)
-        print(f"lr_ctrl: cut factor -> {self._cut_factor:.4g}")
+        Being instance state, the ceiling survives the rewind that precedes
+        this call. If the servo is off this still runs -- the ceiling is then
+        simply the record, and the LRs are whatever the config fixed them at."""
+        cut = float(self._cfg('divergence_cut', 0.5)) ** max(int(count), 1)
         st = self._state()
-        st['scale'] = self._schedule_scale(st) * self._cut_factor
+        # recompute rather than trust the stored value: this is called from
+        # fire_loss_spike, which runs AFTER a checkpoint restore has overwritten
+        # lr_ctrl wholesale, so st['envelope'] here can be the saved checkpoint's
+        # and not this step's. _apply_lrs below multiplies by it.
+        st['envelope'] = self._envelope(st)
+        lo, hi = self._peak_bounds()
+        st['peak_scale'] = max(lo, min(hi, float(st['peak_scale']) * cut))
+        self._ceiling = st['peak_scale']
+        self._ceiling_step = int(self.modeller.step_ind)
+        print(f"lr_ctrl: peak_scale -> {st['peak_scale']:.4g} (ceiling recorded)")
         self._apply_lrs(st)
 
     # ------------------------------------------------------------------ actuator
 
+    def _peak_bounds(self):
+        b = self._servo_cfg('bounds', (0.02, 20.0))
+        return float(b[0]), float(b[1])
+
     def _apply_lrs(self, st):
-        """lr = configured base x scale per group, floored at min_lr -- EXCEPT
-        the flow (Z head) groups, pinned flat at lr_flow. See class docstring."""
+        """lr = base x peak_scale x envelope, floored at min_lr -- EXCEPT the
+        flow (Z head) groups, pinned flat at lr_flow, and except groups whose
+        base LR was configured as an explicit float, which the servo does not
+        own (peak_scale does not apply to them; the envelope still does)."""
         m = self.modeller
         a = m.args
         control_flow = self._cfg('control_flow_lr', False)
+        managed = self._managed_keys()
+        env = st['envelope']
+        peak = float(st['peak_scale'])
         for key, opt in m.optimizers.items():
             n_groups = len(opt.param_groups)
             for gi, g in enumerate(opt.param_groups):
-                if key == 'fused':
-                    base = a.lr_flow if gi == n_groups - 1 else a.lr_fused
-                else:
-                    base = {'fwd': a.lr_policy, 'bwd': a.lr_back,
-                            'replay': a.lr_replay, 'flow': a.lr_flow}[key]
                 is_flow_group = key == 'flow' or (key == 'fused' and gi == n_groups - 1)
                 if is_flow_group and not control_flow:
-                    g['lr'] = base
+                    g['lr'] = a.lr_flow
+                    continue
+                if key == 'fused':
+                    base_key = 'lr_fused'
+                elif key == 'flow':
+                    base_key = 'lr_flow'   # only reachable under control_flow_lr
                 else:
-                    g['lr'] = max(a.min_lr, base * st['scale'])
+                    base_key = self._POLICY_BASE[key]
+                base = getattr(a, base_key)
+                scale = env * (peak if base_key in managed else 1.0)
+                g['lr'] = max(a.min_lr, base * scale)
 
     # ------------------------------------------------------------------ state
 
     def _fresh_state(self, phase):
         return {
-            'ver': 6,  # v6 = fixed-peak schedule -- invalidates v1-v5 state
+            'ver': 7,  # v7 = servo peak + coarse divergence -- invalidates v1-v6
             'phase_seen': phase,
             'stage_start_step': int(self.modeller.step_ind),
-            'scale': 1.0 / self.modeller.args.lr_warmup_ratio,
+            'peak_scale': 1.0,
+            'envelope': 1.0 / self.modeller.args.lr_warmup_ratio,
         }
 
     def _state(self):
         m = self.modeller
         st = getattr(m, 'lr_ctrl', None)
-        if not isinstance(st, dict) or st.get('ver') != 6:
+        if not isinstance(st, dict) or st.get('ver') != 7:
             st = self._fresh_state(m.phase)
             m.lr_ctrl = st
         elif st.get('phase_seen') != m.phase:
@@ -326,123 +273,179 @@ class LRController:
         if st.get('stage_start_step', 0) > m.step_ind:
             # a restore stamped a start ahead of the live clock -- re-anchor
             st['stage_start_step'] = int(m.step_ind)
+        st.setdefault('peak_scale', 1.0)
+        st.setdefault('envelope', 1.0)
         return st
 
     def rearm_warmup(self):
-        """Protocol.advance hook at EVERY stage transition: restart the
-        ramp/hold/decay clock (the optimizers were just rebuilt onto a loss
-        surface with different curvature, so the first steps must not land at
-        the full operating LR with empty Adam moments) and forgive
-        accumulated cuts -- the old stage's fire evidence describes a surface
-        that no longer exists. Returns the warmup length in TRAIN STEPS."""
+        """Protocol.advance hook at EVERY stage transition: restart the warmup
+        clock (the optimizers were just rebuilt onto a loss surface with
+        different curvature) and forget the ceiling -- the old stage's
+        divergence evidence describes a surface that no longer exists.
+
+        peak_scale is deliberately CARRIED across the transition. It is the
+        servo's accumulated estimate of the right LR for this problem, and
+        re-deriving it from the seed at every stage would spend thousands of
+        steps re-climbing ground alpha* has already covered. The ceiling reset
+        is what lets it climb again if the new surface allows it.
+
+        Returns the warmup length in TRAIN STEPS."""
         m = self.modeller
         st = self._state()
         st['phase_seen'] = m.phase
-        self._cut_factor = 1.0
-        self._latched.clear()
-        self._last_fire_step = None
-        self._last_hot_step = None
-        self._pre_trigger_cold = True
-        self._fire_cut_factor = None
-        self._recovery_anchor = None
-        if not self.enabled:
-            return  # disabled: LRs sit flat at configured values, nothing to ramp
+        self._ceiling = None
+        self._ceiling_step = None
+        self._last_servo_step = None
+        # the incoming stage re-ramps, so the probe's buffered readings describe
+        # both the old stage's loss surface AND a pre-ramp LR -- flushed here as
+        # well as at the ramp's end, since a transition changes both at once
+        self._warm = False
+        probe = getattr(m, 'step_probe', None)
+        if probe is not None and hasattr(probe, 'flush_window'):
+            probe.flush_window()
         st['stage_start_step'] = int(m.step_ind)
-        st['scale'] = self._schedule_scale(st)
+        st['envelope'] = self._envelope(st)
         self._apply_lrs(st)
         return int(self._cfg('warmup_steps', 1000))
 
-    # ------------------------------------------------------------------ schedule
+    # ------------------------------------------------------------------ envelope
 
     def _elapsed(self, st):
         """TRAIN STEPS since the current stage's schedule started."""
         return max(0, int(self.modeller.step_ind) - int(st.get('stage_start_step', 0)))
 
-    def _schedule_scale(self, st):
-        """Pure function of train steps since stage start: ramp -> hold ->
-        decay, in [~0, 1.0]. Never above 1.0 -- the configured LR is the peak."""
-        if not self.enabled:
-            return 1.0
+    def _envelope(self, st):
+        """Ramp -> hold, in [1/lr_warmup_ratio, 1.0]. No decay leg (A4a)."""
         warmup_steps = max(1, int(self._cfg('warmup_steps', 1000)))
         elapsed = self._elapsed(st)
-        if elapsed < warmup_steps:
-            frac = elapsed / warmup_steps
-            return (1.0 / self.modeller.args.lr_warmup_ratio) ** (1.0 - frac)
-        half = self._cfg('decay_halflife_steps', 0) or 0
-        past = elapsed - warmup_steps - int(self._cfg('hold_steps', 20000))
-        if half <= 0 or past <= 0:
+        if elapsed >= warmup_steps:
             return 1.0
-        return max(float(self._cfg('decay_floor_scale', 0.05)),
-                   0.5 ** (past / float(half)))
+        frac = elapsed / warmup_steps
+        return (1.0 / self.modeller.args.lr_warmup_ratio) ** (1.0 - frac)
 
-    # ---------------------------------------------------------------- recovery
+    # --------------------------------------------------------------------- servo
 
-    def _advance_recovery(self):
-        """Re-ramp the cut factor after a quiet period (see class docstring).
-        recovery_target_frac <= 0 (the default) disables recovery entirely --
-        a cut then stays for the stage, the pre-recovery behavior."""
-        frac = float(self._cfg('recovery_target_frac', 0.0))
-        if frac <= 0 or self._last_fire_step is None or self._fire_cut_factor is None:
+    def _current_ceiling(self):
+        """The recorded ceiling, relaxed upward with its forgetting half-life.
+        None = never breached, so growth is undamped."""
+        if self._ceiling is None:
+            return None
+        half = float(self._servo_cfg('ceiling_halflife_steps', 20000.0) or 0.0)
+        if half <= 0:
+            return self._ceiling
+        dt = max(0, int(self.modeller.step_ind) - int(self._ceiling_step or 0))
+        return min(self._peak_bounds()[1], self._ceiling * (2.0 ** (dt / half)))
+
+    def _advance_servo(self, st):
+        """One servo tick. Holds (and says why) rather than guessing whenever
+        the sensor is not reporting something it is entitled to act on."""
+        self._servo_hold_reason = ''
+        if not self.servo_enabled:
+            self._servo_hold_reason = 'disabled'
             return
-        # A cut lands at cut_ratio x the pre-fire factor, and the recovery target
-        # is frac x that SAME factor -- so frac <= cut_ratio means the cut always
-        # lands at or below the target and the `>=` below returns immediately.
-        # Recovery is then dead code for every FIRST fire in a stage, silently,
-        # which is what shipped (both were 0.5). Warn once rather than let a
-        # whole subsystem be disabled by an unremarkable-looking coefficient.
-        ratio = float(self._cfg('cut_ratio', 0.5))
-        if frac <= ratio and not getattr(self, '_recovery_inert_warned', False):
-            self._recovery_inert_warned = True
-            print(f"lr_ctrl WARNING: recovery_target_frac ({frac}) <= cut_ratio "
-                  f"({ratio}) -- recovery can never raise the cut factor, so the "
-                  f"recovery_wait/recovery_ramp/AIMD path is inert. Set "
-                  f"recovery_target_frac > cut_ratio to enable it.")
-        target = min(1.0, frac * self._fire_cut_factor)
-        if self._cut_factor >= target:
+        probe = getattr(self.modeller, 'step_probe', None)
+        if probe is None or not getattr(probe, 'enabled', False):
+            # A servo whose sensor was never switched on is the exact failure
+            # this codebase keeps rediscovering -- an unreadable sensor and a
+            # satisfied controller produce identical silence. resolve_derived_
+            # config refuses this combination at load; the guard is here because
+            # the servo must not act on a sensor it cannot see either way.
+            self._servo_hold_reason = 'no_probe'
             return
+        # HOLD THROUGH WARMUP. The envelope is below 1 there, so alpha* rates a
+        # deliberately shrunken step and reads high; acting on it would inflate
+        # peak_scale by exactly the warmup factor and then hand that back as a
+        # real LR the moment the ramp completes.
+        if self._elapsed(st) < int(self._cfg('warmup_steps', 1000)):
+            self._servo_hold_reason = 'warmup'
+            self._warm = False
+            return
+        if not self._warm:
+            # FIRST tick after the ramp. Holding the servo was not enough: the
+            # probe kept BUFFERING through warmup, and its window is 500 train
+            # steps deep at the defaults, so the median still describes the
+            # envelope-suppressed LR. alpha* ~ 1/lr, so those readings are biased
+            # high by exactly the warmup factor and the first tick climbs on
+            # them. Measured overshoot before this flush: 34%, in the wrong
+            # direction, on lr_aug08 b_descend.
+            self._warm = True
+            probe.flush_window()
+            self._servo_hold_reason = 'cold'
+            return
+        period = max(1, int(self._servo_cfg('period', 200)))
         step = int(self.modeller.step_ind)
-        # the wait clock runs from the last HOT reading (any value at/above a
-        # cut bar), not just the last fire: a latched channel simmering
-        # between the bars fires nothing, and ramping the LR back up into a
-        # still-hot state -- with its cut tier disarmed -- must not happen.
-        # If the metric never recrosses, recovery simply never starts.
-        last_event = int(self._last_fire_step)
-        if self._last_hot_step is not None:
-            last_event = max(last_event, int(self._last_hot_step))
-        if step - last_event < int(self._cfg('recovery_wait_steps', 5000)):
-            self._recovery_anchor = None
+        if self._last_servo_step is not None and step - self._last_servo_step < period:
             return
-        if self._recovery_anchor is None:
-            self._recovery_anchor = (step, self._cut_factor)
-        a_step, a_val = self._recovery_anchor
-        ramp = max(1, int(self._cfg('recovery_ramp_steps', 1000)))
-        prog = min(1.0, (step - a_step) / ramp)
-        self._cut_factor = min(target, a_val * (target / a_val) ** prog)
+        reading = probe.servo_reading()
+        if reading is None:
+            self._servo_hold_reason = 'cold'
+            return
+        median, n, bad_rate = reading
+        if n < int(self._servo_cfg('min_readings', 10)):
+            self._servo_hold_reason = 'few_readings'
+            return
+        # A rising flat/downward rate voids the sensor independently of what
+        # the alpha* values say (to_do_rebuild A3a.3): a downward-opening fit
+        # means the local quadratic model is simply wrong, and a flat one means
+        # the probe is under-resolved. Either way the median is not a reading.
+        if bad_rate > float(self._servo_cfg('max_bad_rate', 0.5)):
+            self._servo_hold_reason = 'fit_invalid'
+            return
+        self._last_servo_step = step
+
+        target = float(self._servo_cfg('target', 1.0))
+        clip = self._servo_cfg('clip', (0.7, 1.5))
+        clip_lo, clip_hi = float(clip[0]), float(clip[1])
+        raw = min(max(median / max(target, 1e-9), clip_lo), clip_hi)
+        ceiling = self._current_ceiling()
+        if raw > 1.0 and ceiling is not None:
+            # Asymptotic approach: growth is proportional to the fraction of
+            # the gap to the ceiling still unspent, so the servo slows as it
+            # returns to a level that has already blown up once instead of
+            # walking straight back into it.
+            room = max(0.0, 1.0 - float(st['peak_scale']) / max(ceiling, 1e-12))
+            raw = 1.0 + (raw - 1.0) * room
+        lo, hi = self._peak_bounds()
+        if ceiling is not None:
+            hi = min(hi, ceiling)
+        st['peak_scale'] = max(lo, min(hi, float(st['peak_scale']) * raw))
 
     # ------------------------------------------------------------------ tick
 
     def step(self):
         """One controller evaluation (called every 10 train steps from
-        step_lr_schedule; the schedule itself is keyed on step_ind, so the
-        call cadence only sets how often LRs are re-stamped). Returns the
-        applied fwd LR, mirroring the legacy path."""
+        step_lr_schedule; the envelope is keyed on step_ind, so the call
+        cadence only sets how often LRs are re-stamped). Returns the applied
+        fwd LR, mirroring the legacy path."""
         m = self.modeller
         st = self._state()
-        self._advance_recovery()
-        st['scale'] = self._schedule_scale(st) * self._cut_factor
+        st['envelope'] = self._envelope(st)
+        self._advance_servo(st)
+        ceiling = self._current_ceiling()
+        if ceiling is not None:
+            st['peak_scale'] = min(float(st['peak_scale']), ceiling)
         self._apply_lrs(st)
-        in_warmup = self.enabled and self._elapsed(st) < int(self._cfg('warmup_steps', 1000))
-        self._emit(st, warmup=in_warmup)
+        self._emit(st)
         return m.optimizers['fwd'].param_groups[0]['lr']
 
-    def _emit(self, st, warmup):
+    def _emit(self, st):
         self._report = {
-            'lr_ctrl/scale': st['scale'],
-            'lr_ctrl/warmup': float(warmup),
-            'lr_ctrl/cut_factor': self._cut_factor,
+            'lr_ctrl/envelope': st['envelope'],
+            'lr_ctrl/peak_scale': st['peak_scale'],
+            'lr_ctrl/scale': st['envelope'] * st['peak_scale'],
+            'lr_ctrl/warmup': float(self._elapsed(st) < int(self._cfg('warmup_steps', 1000))),
+            'lr_ctrl/divergences': self._divergences,
         }
-        for channel, n in self._fire_counts.items():
-            self._report[f'lr_ctrl/fires_{channel}'] = n
+        # Emit the ACTUATOR alongside the sensor, always. A servo that is
+        # holding and a servo that is satisfied are indistinguishable from
+        # peak_scale alone, which is the general failure this doc set records
+        # three separate instances of.
+        holds = ('', 'disabled', 'no_probe', 'warmup', 'cold', 'few_readings', 'fit_invalid')
+        self._report['lr_ctrl/servo_hold'] = float(holds.index(self._servo_hold_reason)
+                                                   if self._servo_hold_reason in holds else 0)
+        ceiling = self._current_ceiling()
+        if ceiling is not None:
+            self._report['lr_ctrl/peak_ceiling'] = ceiling
 
     def report(self):
         return dict(self._report)

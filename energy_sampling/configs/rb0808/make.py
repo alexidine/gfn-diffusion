@@ -25,7 +25,7 @@ on. Run the preflight on the cluster before submitting anything.
 =============================================================================
 WARM START -- the only correct pattern
 =============================================================================
-    checkpoint_name: <same-T *_phase1_exit.pt or *_best.pt>
+    checkpoint_name: <same-T *_phase1_exit.pt>   # phase1_exit ONLY, never _best.pt
     load_weights_only: true
     continue_from_checkpoint: false
     reuse_prior: false          # MUST stay false
@@ -61,6 +61,7 @@ OTHER TRAPS ENCODED HERE
 import argparse
 import copy
 import glob
+import json
 import os
 from pathlib import Path
 
@@ -83,8 +84,11 @@ CLUSTER_CKPT_DIR = ('/scratch/mk8347/projects/gfn_cond/gfn-diffusion/'
 # sph:  conservative long-run steps/hour (NOT the median -- long runs are
 #       slower as batch grows and eval accumulates).
 T_BLOCK = {
-    10:  dict(lr=1.25e-4, sph=3500, warm='tw_july31_tw_T10_lr64',
-              note='weakest warm start of the four; no tb_err/r2 recorded, EffDim 9.37'),
+    10:  dict(lr=1.25e-4, sph=3500, warm='tw_july31_tw_T10_clip_resolver',
+              note='reached phase 2 at step 6640 and ran 13.2h; clip 37.9 matches the '
+                   'resolver clip these arms run at. Do NOT use tw_T10_lr64: it never '
+                   'left phase 1, so its only checkpoint is a _best.pt off a frozen '
+                   'detonation and it kills the run at step 0 (93o36you)'),
     25:  dict(lr=4.0e-4,  sph=1700, warm='aug02_a2_T25_lr2_tight',
               note='BEST source: tb_err 3.89, r2 0.95, EffDim 5.85. The workhorse T'),
     60:  dict(lr=4.0e-4,  sph=1250, warm='aug02_a2_T60_lr2_tight',
@@ -178,6 +182,18 @@ def set_fracs(cfg, fracs):
     return cfg
 
 
+def unfreeze(cfg):
+    """Drop freeze_policy from the fwd branch, so fwd trains the POLICY too.
+
+    mk_dev's naive stage ships `fwd: {tb: 1.0, freeze_policy: 1.0}`, so FROZEN is
+    the inherited default and an arm is unfrozen only by explicit removal.
+    `gflownet_losses.py:157` reads `freeze_policy > 0.5`, so popping the key and
+    setting it to 0 are equivalent; pop matches the local_aug07 idiom.
+    """
+    naive(cfg)['loss_coeffs']['fwd'].pop('freeze_policy', None)
+    return cfg
+
+
 def add(name, T, hours, priority, cfg, decides):
     cfg['run_name'] = name
     cfg['tag'] = TAG
@@ -197,11 +213,28 @@ def main():
             f'reference trace at T={T}; closes D2(a). {T_BLOCK[T]["note"]}')
 
     # ---------------- D30: freeze_policy x LR, 4 arms, 96 h ---------------
-    # The assumption every other area rests on. base_T25 is the unfrozen@4e-4
-    # cell, so only three more are needed for the 2x2 plus the dose control.
+    # The assumption every other area rests on.
+    #
+    # CORRECTED 2026-08-08. An earlier draft of this block read "base_T25 is the
+    # unfrozen@4e-4 cell, so only three more are needed" -- which was FALSE.
+    # mk_dev's naive stage ships freeze_policy: 1.0, so every arm in this file
+    # inherits FROZEN and the two cells written by omission were duplicates:
+    # d30_unf_lr2 differed from d30_frz_lr2 in run_name ALONE, and d30_frz_lr4
+    # differed from base_T25 only in `epochs`. The freeze axis was never varied,
+    # so D30 -- the discriminator every other area depends on -- got no answer,
+    # and ~48 GPU-h went to duplicates. See decisions.md D30.
+    #
+    # The 2x2, now that FROZEN is correctly understood as the inherited default:
+    #     frz@4e-4  = base_T25 (index 1, already the frozen reference trace)
+    #     unf@4e-4  = d30_unf_lr4   <- this arm, repointed
+    #     frz@2e-4  = d30_frz_lr2
+    #     unf@2e-4  = d30_unf_lr2   <- now actually unfrozen
+    # Repointing rather than adding keeps the battery at 26 arms and 632 GPU-h.
     c = warm(common(base(), 25), 25); c['epochs'] = 45000
-    naive(c)['loss_coeffs']['fwd'] = {'tb': 1.0, 'freeze_policy': 1.0}
-    add('d30_frz_lr4', 25, 24, 1, c, 'frozen at optimum LR; D30 replication at 41k steps not 800')
+    unfreeze(c)
+    add('d30_unf_lr4', 25, 24, 1, c,
+        'unfrozen at optimum LR -- the cell base_T25 was wrongly assumed to be. Pairs with '
+        'base_T25 (frz@4e-4) for the freeze contrast at fixed LR, which is D30 stated directly')
 
     c = warm(common(base(), 25), 25); c['epochs'] = 45000
     naive(c)['loss_coeffs']['fwd'] = {'tb': 1.0, 'freeze_policy': 1.0}
@@ -212,8 +245,11 @@ def main():
         'and synthesis.md section 1 is in trouble')
 
     c = warm(common(base(), 25), 25); c['epochs'] = 45000
+    unfreeze(c)
     for k in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'): c[k] = 2.0e-4
-    add('d30_unf_lr2', 25, 24, 1, c, 'unfrozen half of the LR leg; without it the 2x2 is 3 cells')
+    add('d30_unf_lr2', 25, 24, 1, c, 'unfrozen half of the LR leg; without it the 2x2 is 3 cells. '
+        'Was a byte-identical duplicate of d30_frz_lr2 until 2026-08-08 -- unfrozen by omission, '
+        'but FROZEN is the inherited default')
 
     c = warm(common(base(), 25), 25); c['epochs'] = 45000
     set_fracs(c, {'fwd': 0.05, 'bwd': 0.75, 'replay': 0.20})
@@ -340,11 +376,23 @@ def main():
     add('rep_hi', 25, 24, 3, c, 'P7: replay share up, fwd down. Pairs with d30_dose to separate '
         'fwd-frac dose from replay-frac dose')
 
+    # CORRECTED 2026-08-08, same root cause as the D30 block. This arm was
+    # `rep_ctrl_ratio`, described as "RESTORE mk_dev balance + min_fracs" on the
+    # premise that "every other arm here runs fixed fracs deliberately". That
+    # premise was false: NO arm ever strips `balance`, so all 26 inherit
+    # mk_dev's `kind: ratio` controller and this arm applied no delta at all --
+    # it was base_T25 with a different name. The intended contrast survives with
+    # the roles swapped: base_T25 IS the ratio-controller arm, and the missing
+    # cell is the fixed-mix control, which is what this arm now is.
     c = warm(common(base(), 25), 25); c['epochs'] = 45000
-    add('rep_ctrl_ratio', 25, 24, 3, c,
-        'RESTORE mk_dev balance + min_fracs (kind: ratio). D8 landed the ratio controller and '
-        'it has NEVER run long. Every other arm here runs fixed fracs deliberately, so this is '
-        'the only arm that exercises it')
+    naive(c)['balance'] = None          # protocol.py:714 -- None disables the controller
+    add('rep_fixed_fracs', 25, 24, 3, c,
+        'FIXED MIX -- balance controller OFF, fracs held at the 0.2/0.6/0.2 entry split. '
+        'D8 landed kind: ratio and every other arm in this battery runs it (inherited from '
+        'mk_dev, not chosen per-arm), so this is the only cell that does NOT. Against base_T25 '
+        'it asks whether the ratio controller earns its keep at length -- the question '
+        'replay_july26 answered for the GENTLE controller and which has never been put to the '
+        'ratio one')
 
     write_all()
 
@@ -403,13 +451,42 @@ def _slurm_ranges(idxs):
     return ','.join(out)
 
 
+IDENTITY_EXEMPT = ('run_name', '_decides', 'epochs')
+
+
+def assert_distinct(name, cfg, seen_cfgs):
+    """No two arms may differ only in label.
+
+    An arm written by OMISSION -- "leave the key out and it defaults to off" --
+    is a duplicate whenever the omitted key is actually inherited from mk_dev.
+    That is not hypothetical: on 2026-08-08 `d30_unf_lr2` was found to differ
+    from `d30_frz_lr2` in `run_name` alone, and `d30_frz_lr4` from `base_T25`
+    only in `epochs`, because mk_dev ships freeze_policy: 1.0. The freeze axis
+    of the D30 2x2 was never varied and the battery could not have answered it.
+
+    `epochs` is exempt because run LENGTH is a scheduling choice, not an
+    experimental variable -- but two arms alike in everything else are then
+    reported as a WARNING, since one is a strict prefix of the other and only
+    the longer carries information.
+    """
+    key = json.dumps({k: v for k, v in sorted(cfg.items())
+                      if k not in IDENTITY_EXEMPT}, sort_keys=True, default=str)
+    if key in seen_cfgs:
+        other = seen_cfgs[key]
+        raise AssertionError(
+            f'{name} is identical to {other} except for {IDENTITY_EXEMPT}. '
+            f'An arm that varies nothing measures nothing -- if the delta was '
+            f'written by omission, check whether mk_dev already sets that key.')
+    seen_cfgs[key] = name
+
+
 def write_all():
     HERE.mkdir(parents=True, exist_ok=True)
     # INDEX ORDER IS PRIORITY ORDER. With --array=0-25%16 slurm starts the low
     # indices first, so if only half the queue ever runs, the decision-relevant
     # arms are the half that ran.
     ordered = sorted(ARMS, key=lambda a: (a[3], -a[2], a[0]))
-    seen, rows, total = set(), [], 0.0
+    seen, seen_cfgs, rows, total = set(), {}, [], 0.0
     for idx, (name, T, hours, pri, cfg) in enumerate(ordered):
         assert name not in seen, f'duplicate run_name {name}'
         seen.add(name)
@@ -418,6 +495,7 @@ def write_all():
         assert cfg['reuse_prior'] is False, f'{name}: reuse_prior would blank the policy'
         assert cfg['prior_model_name'] is None, f'{name}: prior_model_name skips phase 1'
         assert cfg['prior_path'] == CLUSTER_PRIOR, f'{name}: wrong prior_path -> wrong hash'
+        assert_distinct(name, cfg, seen_cfgs)
         decides = ' '.join((cfg.pop('_decides', '') or '').split())
         prefix = cfg.pop('_warm_prefix', None)
         if prefix:
@@ -485,14 +563,25 @@ def preflight():
             continue
         prefix = cn[len('@@WARM:'):-2]
         if prefix not in cache:
-            # phase1_exit preferred; fall back to best. NEVER hardcode the slug --
-            # prior_path is in the problem identity so it differs per filesystem.
-            hits = (sorted(glob.glob(os.path.join(CLUSTER_CKPT_DIR, f'{prefix}_*_phase1_exit.pt')))
-                    or sorted(glob.glob(os.path.join(CLUSTER_CKPT_DIR, f'{prefix}_*_best.pt'))))
+            # phase1_exit ONLY. NEVER hardcode the slug -- prior_path is in the
+            # problem identity so it differs per filesystem.
+            #
+            # There is deliberately no _best.pt fallback. A source with no
+            # phase1_exit never left phase 1, so its on_exit snapshot never fired
+            # and its _best.pt is a mid-phase-1 frame off whatever trajectory
+            # killed it. rb0808 arm 0 warm-started from one such file
+            # (tw_T10_lr64, run 93o36you) and died at step 0 with logw_std 6.4e6
+            # and a non-finite gradient before the first update -- 49 GPU-h across
+            # arms 0 and 11. The old fallback made that silent; a missing
+            # phase1_exit is now a hard preflight failure. Pick another source.
+            hits = sorted(glob.glob(os.path.join(CLUSTER_CKPT_DIR, f'{prefix}_*_phase1_exit.pt')))
             cache[prefix] = os.path.basename(hits[0]) if hits else None
         resolved = cache[prefix]
         if resolved is None:
-            print(f'  MISSING  {path.name:<26} <- no checkpoint for prefix {prefix}')
+            stalled = sorted(glob.glob(os.path.join(CLUSTER_CKPT_DIR, f'{prefix}_*_best.pt')))
+            why = ('never left phase 1 (only _best.pt exists)' if stalled
+                   else f'no checkpoint at all for prefix {prefix}')
+            print(f'  MISSING  {path.name:<26} <- {prefix} {why}')
             bad += 1
             continue
         cfg['checkpoint_name'] = resolved

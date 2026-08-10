@@ -1,0 +1,448 @@
+% ---------------------------------------------------------------------------
+% The Level Decomposition for Trajectory-Balance Samplers
+% Compiles with any standard TeX Live / Overleaf installation:
+%     pdflatex tb_level_decomposition.tex   (twice, for cross-references)
+% ---------------------------------------------------------------------------
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=1.15in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{microtype}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=black,citecolor=black,urlcolor=blue]{hyperref}
+
+% --- theorem environments --------------------------------------------------
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\theoremstyle{remark}
+\newtheorem{remark}[theorem]{Remark}
+
+% --- notation --------------------------------------------------------------
+\newcommand{\KL}[2]{D_{\mathrm{KL}}\!\left(#1 \,\middle\|\, #2\right)}
+\newcommand{\E}[2]{\mathbb{E}_{#1}\!\left[#2\right]}
+\newcommand{\PF}{P_{F}}
+\newcommand{\PB}{P_{B}}
+\newcommand{\Zstar}{Z^{\star}}
+\newcommand{\JF}{J_{F}}
+\newcommand{\JB}{J_{B}}
+\newcommand{\ent}{\mathbb{H}}
+
+\title{\textbf{The Level Decomposition for Trajectory-Balance Samplers}\\[0.4em]
+\large What the forward and backward log-partition estimates actually measure}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-3.5em}
+
+\begin{abstract}
+\noindent
+When training a GFlowNet with the trajectory-balance (TB) objective one routinely
+monitors two quantities that both look like estimates of $\log Z$: one computed
+from on-policy forward rollouts, one from backward rollouts out of a replay or
+prior buffer. They disagree, and the size of the disagreement---call it
+$\Delta$---is often used as a convergence criterion. This note shows that
+$\Delta$ is \emph{exactly} a signed combination of three Kullback--Leibler
+divergences,
+\[
+  \Delta \;=\; A + B - C,
+\]
+measuring respectively the policy's mode-seeking error, its mass-covering error,
+and the quality of the buffer. Four practical consequences follow, the sharpest
+being that $\Delta$ is \emph{not} a valid optimisation target: it can be driven
+toward zero by making the buffer worse. We also derive the one-sided constraint
+that bounds how low the learned normaliser may be placed before backward
+training is asked for something impossible. Everything is elementary---the only
+tools are Jensen's inequality and the chain rule for KL divergence---but the
+bookkeeping is easy to get wrong, which is the reason for writing it down.
+\end{abstract}
+
+\section{Motivation}
+
+A TB sampler carries a learned scalar $\log Z$ (or, in the conditional case, a
+learned function $\log Z(c)$) that is supposed to converge to the true log
+partition function. In practice one estimates it in two different ways, and the
+two estimates disagree persistently. It is tempting to read the disagreement as
+``$Z$ has not converged yet'' and to train until it closes.
+
+That reading is wrong, and the purpose of this note is to say precisely what the
+disagreement \emph{is}. The short answer: it is a statement about the
+\emph{policy} and the \emph{buffer}, and contains no information about $Z$ at
+all. $Z$ cannot reduce it, and one of the three terms can be manipulated in a
+direction that makes the diagnostic look better while the sampler gets worse.
+
+\section{Setup and notation}
+
+\paragraph{Objects.}
+Let $\tau = (s_0 \to s_1 \to \cdots \to s_T)$ denote a complete trajectory from a
+fixed initial state $s_0$, and write $x = x(\tau) := s_T$ for its terminal state.
+We are given a strictly positive reward $R(x) > 0$ and wish to sample from the
+associated Boltzmann target
+\[
+  \pi(x) \;:=\; \frac{R(x)}{\Zstar},
+  \qquad
+  \Zstar \;:=\; \sum_{x} R(x).
+\]
+The model consists of
+\begin{itemize}
+  \item a \emph{forward policy} $\PF(\tau)$, a normalised distribution over
+        complete trajectories, $\sum_\tau \PF(\tau) = 1$;
+  \item a \emph{backward policy} $\PB(\tau \mid x)$, normalised over the
+        trajectories terminating at $x$, i.e.\ $\sum_{\tau \to x} \PB(\tau\mid x) = 1$
+        for every $x$;
+  \item a learned scalar $Z$.
+\end{itemize}
+We write $\PF^{\top}(x) := \sum_{\tau \to x} \PF(\tau)$ for the \emph{terminal
+marginal} of the forward policy---the distribution we ultimately care about.
+
+\paragraph{A notational convention that does all the work.}
+Given any distribution $q$ over terminal states, let $q\PB$ denote the
+distribution over \emph{trajectories} obtained by first drawing $x \sim q$ and
+then $\tau \sim \PB(\cdot \mid x)$:
+\[
+  (q\PB)(\tau) \;:=\; q\bigl(x(\tau)\bigr)\,\PB\bigl(\tau \mid x(\tau)\bigr).
+\]
+This is normalised, because $\sum_\tau q(x)\PB(\tau\mid x) = \sum_x q(x) \sum_{\tau\to x}\PB(\tau\mid x) = \sum_x q(x) = 1$.
+In particular $\pi\PB$ is a perfectly good distribution over trajectories, and it
+is the object the forward policy is really trying to match.
+
+\paragraph{The trajectory-balance condition.}
+TB seeks parameters such that
+\begin{equation}\label{eq:tb}
+  Z\,\PF(\tau) \;=\; R\bigl(x(\tau)\bigr)\,\PB\bigl(\tau \mid x(\tau)\bigr)
+  \qquad \text{for every } \tau .
+\end{equation}
+Summing \eqref{eq:tb} over the trajectories terminating at a fixed $x$ gives
+$Z\,\PF^{\top}(x) = R(x)$; summing that over $x$ forces $Z = \Zstar$ and hence
+$\PF^{\top} = \pi$. So \eqref{eq:tb} is exactly the statement ``the sampler is
+correct and $Z$ is the true partition function''.
+
+\paragraph{The importance weight.}
+Define, for a trajectory $\tau$,
+\begin{equation}\label{eq:logw}
+  \log w(\tau) \;:=\; \log R\bigl(x(\tau)\bigr) \;+\; \log \PB\bigl(\tau\mid x(\tau)\bigr) \;-\; \log \PF(\tau).
+\end{equation}
+Comparing with \eqref{eq:tb}: TB holds exactly if and only if $\log w(\tau) = \log Z$
+for \emph{every} $\tau$. Thus $\log w$ is constant at the optimum, and both its
+\emph{level} and its \emph{spread} are diagnostics of TB violation. This note is
+about the level.
+
+\begin{remark}[Conditional case]
+Everything below holds verbatim per condition $c$: replace $R, \pi, \Zstar, Z$ by
+$R(\cdot\mid c), \pi(\cdot\mid c), \Zstar(c), Z(c)$ and let all policies be
+conditioned on $c$. Nothing in the algebra couples different conditions. In an
+implementation the quantities are therefore computed per condition and then
+reduced across conditions (by a mean, or by a worst-case quantile).
+\end{remark}
+
+\subsection{Two facts we will use twice}
+
+\begin{lemma}[Importance-sampling identity]\label{lem:is}
+$\E{\PF}{w} = \Zstar$.
+\end{lemma}
+\begin{proof}
+$\displaystyle \E{\PF}{w} = \sum_\tau \PF(\tau)\,\frac{R(x)\PB(\tau\mid x)}{\PF(\tau)}
+ = \sum_x R(x)\!\!\sum_{\tau \to x}\!\!\PB(\tau\mid x) = \sum_x R(x) = \Zstar.$
+\end{proof}
+
+\noindent
+Note this holds for the \emph{forward} sampling distribution specifically; it is
+not true for an arbitrary sampler, and that asymmetry is the source of everything
+that follows.
+
+\begin{lemma}[KL chain rule with a shared kernel]\label{lem:chain}
+For distributions $q, p$ over terminal states, $\KL{q\PB}{p\PB} = \KL{q}{p}$.
+\end{lemma}
+\begin{proof}
+$\displaystyle \KL{q\PB}{p\PB} = \sum_\tau q(x)\PB(\tau\mid x)\log\frac{q(x)\PB(\tau\mid x)}{p(x)\PB(\tau\mid x)}
+= \sum_x q(x) \log\frac{q(x)}{p(x)} = \KL{q}{p},$
+since the $\PB$ factors cancel inside the logarithm and $\PB(\cdot\mid x)$ sums to one.
+\end{proof}
+
+\section{Two sampling distributions, two levels}
+
+In training we evaluate $\log w$ under two different distributions over
+trajectories.
+
+\begin{definition}[The two levels]
+Let $\mu$ be the distribution over terminal states held in the buffer. Define
+\[
+  \JF \;:=\; \E{\PF}{\log w}
+  \qquad\text{(forward level)},
+  \qquad\qquad
+  \JB \;:=\; \E{\mu\PB}{\log w}
+  \qquad\text{(backward level)} .
+\]
+$\JF$ is the empirical mean of $\log w$ over on-policy rollouts; $\JB$ is the
+same average taken over buffer draws with backward rollouts.
+\end{definition}
+
+\begin{definition}[The three divergences]\label{def:abc}
+\[
+  A \;:=\; \KL{\PF}{\pi\PB},
+  \qquad
+  B \;:=\; \KL{\mu\PB}{\PF},
+  \qquad
+  C \;:=\; \KL{\mu}{\pi}.
+\]
+All three are non-negative. Informally: $A$ is how far the policy is from the
+target (\emph{mode-seeking} error, model in the first argument); $B$ is how badly
+the policy fails to cover what the buffer contains (\emph{mass-covering} error,
+model in the second argument); $C$ is the quality of the buffer itself.
+\end{definition}
+
+\begin{lemma}[Forward level]\label{lem:JF}
+$\JF = \log \Zstar - A$. In particular $\JF \le \log\Zstar$ always.
+\end{lemma}
+\begin{proof}
+Substituting $R = \Zstar\pi$ into \eqref{eq:logw},
+\[
+  \JF = \E{\PF}{\log \frac{\Zstar\,\pi(x)\PB(\tau\mid x)}{\PF(\tau)}}
+      = \log\Zstar + \E{\PF}{\log\frac{(\pi\PB)(\tau)}{\PF(\tau)}}
+      = \log\Zstar - \KL{\PF}{\pi\PB}. \qedhere
+\]
+\end{proof}
+
+\begin{remark}
+Lemma~\ref{lem:JF} is the usual ELBO/Jensen statement in disguise: by
+Lemma~\ref{lem:is} and Jensen, $\JF = \E{\PF}{\log w} \le \log \E{\PF}{w} = \log\Zstar$,
+and Lemma~\ref{lem:JF} identifies the gap exactly as $A$.
+\end{remark}
+
+\begin{lemma}[Backward level]\label{lem:JB}
+$\JB = \log\Zstar - C + B$.
+\end{lemma}
+\begin{proof}
+Write $Q := \mu\PB$. As before,
+$\JB = \log\Zstar + \E{Q}{\log\frac{(\pi\PB)(\tau)}{\PF(\tau)}}$.
+Insert $Q$ inside the logarithm:
+\[
+  \E{Q}{\log\frac{\pi\PB}{\PF}}
+  = \underbrace{\E{Q}{\log\frac{\pi\PB}{Q}}}_{=\,-\KL{Q}{\pi\PB}}
+  \;+\; \underbrace{\E{Q}{\log\frac{Q}{\PF}}}_{=\,\KL{Q}{\PF}\,=\,B}.
+\]
+By Lemma~\ref{lem:chain}, $\KL{Q}{\pi\PB} = \KL{\mu\PB}{\pi\PB} = \KL{\mu}{\pi} = C$.
+\end{proof}
+
+\begin{remark}[$\JB$ is \emph{not} a lower bound on $\log\Zstar$]
+Unlike $\JF$, the backward level can exceed $\log\Zstar$: by Lemma~\ref{lem:JB}
+it does so whenever $B > C$. This is not a paradox---Lemma~\ref{lem:is} only
+guarantees unbiasedness of $w$ under $\PF$. It is a common source of confusion
+when the two levels are treated as interchangeable ``estimates of $\log Z$''.
+\end{remark}
+
+\section{The master identity}
+
+\begin{theorem}[Level decomposition]\label{thm:master}
+With $A,B,C$ as in Definition~\ref{def:abc},
+\[
+  \boxed{\;\Delta \;:=\; \JB - \JF \;=\; A + B - C\;}
+\]
+\end{theorem}
+\begin{proof}
+Subtract Lemma~\ref{lem:JF} from Lemma~\ref{lem:JB}; the $\log\Zstar$ cancels.
+\end{proof}
+
+Two sanity checks. If the sampler is perfect ($\PF = \pi\PB$, so $A = 0$) and the
+buffer is thermal ($\mu = \pi$, so $C = 0$), then $B = \KL{\pi\PB}{\pi\PB} = 0$ and
+$\Delta = 0$. If instead the policy is perfect but the buffer is arbitrary, then
+$A=0$ and $B = \KL{\mu\PB}{\pi\PB} = C$, so $\Delta = 0$ again: a bad buffer alone
+does not open a gap. Conversely, if the buffer is thermal but the policy is not,
+\[
+  \Delta \;=\; \KL{\pi\PB}{\PF} + \KL{\PF}{\pi\PB},
+\]
+the \emph{symmetrised} KL (Jeffreys divergence) between the policy and its
+target. So in the well-prepared-buffer regime, $\Delta$ is a genuine
+distributional distance, vanishing only when $\PF = \pi\PB$ exactly.
+
+\section{The one-sided constraint on \texorpdfstring{$\log Z$}{log Z}}
+
+The learned normaliser enters through the TB residual
+\begin{equation}\label{eq:resid}
+  r(\tau) \;:=\; \log Z + \log\PF(\tau) - \log\PB(\tau\mid x) - \log R(x)
+  \;=\; \log Z - \log w(\tau),
+\end{equation}
+whose square is the TB loss. Averaging \eqref{eq:resid} under the backward stream
+gives $\E{\mu\PB}{r} = \log Z - \JB$. So the backward residual is centred exactly
+when $\log Z = \JB$. How low can that be?
+
+\begin{proposition}[ELBO floor]\label{prop:floor}
+Let $\mathrm{ELBO}(\mu) := \E{\mu}{\log R} + \ent(\mu) = \log\Zstar - C$, where
+$\ent$ denotes Shannon entropy. Then
+\[
+  \JB \;\ge\; \mathrm{ELBO}(\mu),
+\]
+with equality if and only if $\PF = \mu\PB$.
+\end{proposition}
+\begin{proof}
+Immediate from Lemma~\ref{lem:JB}: $\JB - \mathrm{ELBO}(\mu) = B \ge 0$, and
+$B = \KL{\mu\PB}{\PF} = 0$ iff $\PF = \mu\PB$. The identity
+$\log\Zstar - C = \E{\mu}{\log R} + \ent(\mu)$ is a one-line expansion of
+$\KL{\mu}{\pi}$.
+\end{proof}
+
+\begin{corollary}[Backward training can be asked for the impossible]\label{cor:impossible}
+Suppose $\log Z$ is held fixed (detached) at a value $z_0$. Then the mean backward
+residual $\E{\mu\PB}{r} = z_0 - \JB$ can be driven to zero by training $\PF$ only
+if $z_0 \ge \mathrm{ELBO}(\mu)$. If $z_0 < \mathrm{ELBO}(\mu)$, no forward policy
+whatsoever makes the backward residual mean-zero.
+\end{corollary}
+\begin{proof}
+$\JB$ ranges over $[\mathrm{ELBO}(\mu), \infty)$ as $\PF$ varies: the lower end is
+Proposition~\ref{prop:floor}, and $\JB$ can be made arbitrarily large by letting
+$\PF$ assign vanishing mass to the buffer's trajectories, since
+$B = \E{\mu\PB}{\log(\mu\PB/\PF)} \to \infty$. Setting $z_0 = \JB$ is therefore
+achievable exactly when $z_0 \ge \mathrm{ELBO}(\mu)$.
+\end{proof}
+
+This is a genuinely \emph{one-sided} constraint, and it is worth stating the
+asymmetry plainly: placing $\log Z$ \emph{too high} is harmless---the policy
+simply raises $\JB$ to meet it---whereas placing it \emph{below} $\mathrm{ELBO}(\mu)$
+demands more forward probability mass on the buffer than normalisation permits.
+Under a squared-error loss the optimiser does not stop when asked for the
+impossible; it distorts $\PF$ as far as it can in the demanded direction, which
+degrades the sampler rather than merely stalling it.
+
+\section{Consequences}
+
+\subsection{$Z$ is a nuisance parameter, not an objective}
+
+$\log Z$ is a single number, but the two streams place it in two different spots,
+separated by $\Delta$:
+\[
+  \E{\PF}{r} = \log Z - \JF,
+  \qquad
+  \E{\mu\PB}{r} = \log Z - \JB
+  = \bigl(\log Z - \JF\bigr) - \Delta .
+\]
+Choosing $\log Z = \JF$ zeroes the forward residual and leaves the backward
+residual at $-\Delta$; choosing $\log Z = \JB$ does the reverse. There is no
+choice that zeroes both unless $\Delta = 0$, and by Theorem~\ref{thm:master}
+$\Delta$ depends only on $(\PF,\PB,\mu,\pi)$---not on $Z$.
+
+\begin{center}
+\emph{The placement of $Z$ decides which stream absorbs the error.\\
+It does not decide whether error exists.}
+\end{center}
+
+A practical corollary: a controller rule that watches the residual of the branch
+that \emph{trains} $Z$ is measuring a tautology. If the forward branch updates
+$Z$ and only $Z$, then $\log Z \to \JF$ and the forward residual self-zeroes
+regardless of how bad the policy is. The informative quantity is the residual on
+the branches that train the \emph{policy}.
+
+\subsection{$\Delta$ is not a valid optimisation target}
+
+By Theorem~\ref{thm:master}, $\Delta = A + B - C$ is \emph{decreasing} in $C$.
+Since $C = \KL{\mu}{\pi}$ measures how bad the buffer is, degrading the buffer
+reduces $\Delta$. A training loop that churns its own buffer and gates on
+$\Delta$ therefore has a direct incentive to make the buffer worse. Whatever
+$\Delta$ is used for, it should not be a success criterion; it is a
+\emph{handoff diagnostic}---an indicator of whether the placement of $Z$ is
+currently contentious.
+
+\subsection{$A$ is the objective}
+
+Of the three terms only $A$ is an unambiguous statement about the thing we want.
+Moreover it controls the error in the terminal marginal, which is what is
+actually sampled:
+
+\begin{proposition}\label{prop:dpi}
+$\KL{\PF^{\top}}{\pi} \;\le\; A$.
+\end{proposition}
+\begin{proof}
+Factor each trajectory distribution into its terminal marginal and the
+conditional over trajectories given the terminal state. The chain rule for KL
+gives
+\[
+  A = \KL{\PF}{\pi\PB} = \KL{\PF^{\top}}{\pi} \;+\; \E{x\sim \PF^{\top}}{\KL{\PF(\cdot\mid x)}{\PB(\cdot\mid x)}},
+\]
+and the second term is non-negative.
+\end{proof}
+
+So driving $A$ down drives the sampling error down, with the slack being exactly
+the mismatch between the forward posterior over trajectories and the backward
+policy. Neither $B$ nor $\Delta$ admits such a bound.
+
+\subsection{$A$ and $B$ require different data}
+
+$A = \KL{\PF}{\pi\PB}$ has the model in the first argument: it is the
+\emph{reverse} (mode-seeking) KL, and its gradient is naturally estimated from
+samples drawn from $\PF$---that is, from forward rollouts, or from a replay buffer
+of previously generated forward trajectories. $B = \KL{\mu\PB}{\PF}$ has the model
+in the second argument: it is a \emph{forward} (mass-covering) KL, estimated from
+samples drawn from $\mu$---that is, from backward rollouts out of the buffer.
+
+Consequently:
+\begin{itemize}
+  \item Training on buffer data alone reduces $B$ and leaves $A$ unattended: the
+        sampler learns to cover what it is shown and never sharpens.
+  \item Training on forward data alone reduces $A$ and lets $B$ grow: the classic
+        mode collapse.
+  \item Since $\Delta = A + B - C$ contains both, a system in which one of the two
+        data streams is inactive cannot reduce $\Delta$ past the term nothing is
+        attacking, no matter how long it runs or how the remaining branch is
+        weighted.
+\end{itemize}
+The last point is worth emphasising because it is easy to misdiagnose as slow
+convergence rather than as a stalled component.
+
+\subsection{What is estimable in practice}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+Quantity & Estimator & Notes \\
+\midrule
+$\JF$ & mean of $\log w$ over forward rollouts & unbiased for $\log\Zstar - A$ \\
+$\JB$ & mean of $\log w$ over buffer draws & may exceed $\log\Zstar$ \\
+$\Delta$ & $\JB - \JF$ & $= A + B - C$ \\
+$\log\Zstar$ & $\operatorname{logmeanexp}$ of $w$ on the \emph{forward} stream & Lemma~\ref{lem:is}; biased low \\
+$A$ & $\operatorname{logmeanexp}(\log w) - \operatorname{mean}(\log w)$, forward & the ``Jensen gap'' \\
+$C$ & --- & not identifiable without $\pi$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+Two cautions. First, the $\operatorname{logmeanexp}$ estimator of $\log\Zstar$ is
+biased low by Jensen and has variance growing with $\operatorname{Var}(\log w)$,
+precisely the regime where one wants it most; the resulting estimate of $A$ is
+therefore an underestimate. Second, $B$ and $C$ are not separately identifiable
+from $\JF$ and $\JB$ alone---only the combination $C - B$ is, since
+$\log\Zstar - \JB = C - B$. Separating them requires an independent handle on the
+buffer, e.g.\ knowing $\mu$ was drawn from a thermalised procedure.
+
+\section{Summary}
+
+\begin{align*}
+  \JF &= \log\Zstar - A                 && A = \KL{\PF}{\pi\PB} && \text{(policy: mode-seeking)}\\
+  \JB &= \log\Zstar - C + B             && B = \KL{\mu\PB}{\PF} && \text{(policy: mass-covering)}\\
+  \Delta &= A + B - C                   && C = \KL{\mu}{\pi}    && \text{(buffer quality)}
+\end{align*}
+
+\noindent
+Reading the identity as a design principle:
+\begin{enumerate}
+  \item \textbf{Objective:} $A$ down. It bounds the terminal-marginal error
+        (Proposition~\ref{prop:dpi}) and nothing else on this list does.
+  \item \textbf{Constraint:} $B$ bounded. Losing coverage is not recoverable by
+        further optimisation of $A$.
+  \item \textbf{Precondition:} $C$ small. No gradient reduces it; it is a
+        data-preparation problem.
+  \item \textbf{Nuisance:} $Z$. Maintain it well enough that neither residual is
+        systematically corrupted, and never below $\mathrm{ELBO}(\mu)$
+        (Corollary~\ref{cor:impossible}).
+  \item \textbf{Diagnostic, never a target:} $\Delta$, which improves when the
+        buffer degrades.
+\end{enumerate}
+
+\end{document}

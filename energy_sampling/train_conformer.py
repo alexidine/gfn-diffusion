@@ -48,7 +48,7 @@ from models.gfn import GFN
 from controller import LRController
 from train import Modeller, safe_histogram
 from eval.evaluations import flow_parity_plot
-from utils import (dict2namespace, load_yaml, quick_tb_stats,
+from utils import (dict2namespace, load_yaml, preflight_config, quick_tb_stats,
                    resolve_derived_config, uniform_discretizer)
 
 WANDB_PROJECT = "GFN Conformers"
@@ -71,7 +71,7 @@ def load_config(default: Path = DEFAULT_CONFIG):
                          f"(default: {default})")
     if not candidates:
         print(f"no config given; using default {path}")
-    return resolve_derived_config(dict2namespace(load_yaml(path)))
+    return resolve_derived_config(preflight_config(dict2namespace(load_yaml(path))))
 
 
 class TorsionGFN(GFN):

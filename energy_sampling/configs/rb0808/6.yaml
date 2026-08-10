@@ -1,4 +1,4 @@
-run_name: d30_unf_lr2
+run_name: d30_unf_lr4
 tag: rb0808
 seed: 12345
 device: cuda
@@ -17,7 +17,7 @@ prior_model_name: null
 reuse_prior: false
 load_weights_only: true
 override_learning_rates: false
-lr_policy: 0.0002
+lr_policy: 0.0004
 min_lr: 1.0e-06
 z_calibration:
   enabled: true
@@ -34,9 +34,9 @@ z_calibration:
   se2_floor: 0.25
   holdout_modulus: 8
 lr_flow: 0.1
-lr_back: 0.0002
-lr_replay: 0.0002
-lr_fused: 0.0002
+lr_back: 0.0004
+lr_replay: 0.0004
+lr_fused: 0.0004
 lr_warmup_ratio: 100
 adaptive_lr:
   enabled: true
@@ -233,7 +233,6 @@ protocol:
     loss_coeffs:
       fwd:
         tb: 1.0
-        freeze_policy: 1.0
       bwd:
         tb: 1.0
     balance:

@@ -12,7 +12,7 @@ test_molecules_path: null
 checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/
 archive_period: 5000
 archive_buffers: false
-checkpoint_name: '@@WARM:tw_july31_tw_T10_lr64@@'
+checkpoint_name: '@@WARM:tw_july31_tw_T10_clip_resolver@@'
 prior_model_name: null
 reuse_prior: false
 load_weights_only: true

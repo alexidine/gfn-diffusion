@@ -1,0 +1,439 @@
+<title>The Level Decomposition</title>
+<style>
+:root{
+  --paper:#FCFCFD; --ink:#15181F; --muted:#646C7E; --rule:#E3E5EA;
+  --panel:#F5F6F8; --panel-edge:#E7E9EE;
+  --qa:#2563A8; --qb:#7A4FA3; --qc:#B0742F;
+  --shadow:0 1px 2px rgba(20,24,34,.05), 0 6px 20px -12px rgba(20,24,34,.18);
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --paper:#12141A; --ink:#E6E8EE; --muted:#9AA2B4; --rule:#272B35;
+    --panel:#171A21; --panel-edge:#242832;
+    --qa:#79A9E0; --qb:#B694DA; --qc:#DCA764;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -14px rgba(0,0,0,.7);
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#12141A; --ink:#E6E8EE; --muted:#9AA2B4; --rule:#272B35;
+  --panel:#171A21; --panel-edge:#242832;
+  --qa:#79A9E0; --qb:#B694DA; --qc:#DCA764;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px -14px rgba(0,0,0,.7);
+}
+:root[data-theme="light"]{
+  --paper:#FCFCFD; --ink:#15181F; --muted:#646C7E; --rule:#E3E5EA;
+  --panel:#F5F6F8; --panel-edge:#E7E9EE;
+  --qa:#2563A8; --qb:#7A4FA3; --qc:#B0742F;
+  --shadow:0 1px 2px rgba(20,24,34,.05), 0 6px 20px -12px rgba(20,24,34,.18);
+}
+
+.page{
+  background:var(--paper); color:var(--ink);
+  font-family:Cambria,Constantia,"Iowan Old Style","Palatino Linotype",Georgia,serif;
+  font-size:18px; line-height:1.62;
+  padding:clamp(2rem,6vw,5.5rem) clamp(1.1rem,5vw,2rem) 6rem;
+  display:flex; flex-direction:column; align-items:center;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{width:100%; max-width:41rem; display:flex; flex-direction:column; gap:2.1rem;}
+
+math{font-family:"Cambria Math","Latin Modern Math","STIX Two Math",Cambria,serif;}
+math[display="block"]{font-size:1.06em;}
+
+.masthead{display:flex; flex-direction:column; gap:.85rem; padding-bottom:1.9rem;
+  border-bottom:1px solid var(--rule);}
+.eyebrow{font-family:"Segoe UI",system-ui,sans-serif; font-size:.7rem; font-weight:600;
+  letter-spacing:.15em; text-transform:uppercase; color:var(--muted);}
+h1{font-size:clamp(1.85rem,5vw,2.6rem); line-height:1.15; font-weight:700; margin:0;
+  text-wrap:balance; letter-spacing:-.012em;}
+.standfirst{font-size:1.14rem; color:var(--muted); font-style:italic; text-wrap:balance; margin:0;}
+.abstract{font-size:.97rem; color:var(--muted); border-left:2px solid var(--rule);
+  padding-left:1.15rem; margin:.5rem 0 0;}
+
+section{display:flex; flex-direction:column; gap:1.05rem;}
+h2{font-size:1.32rem; font-weight:700; margin:1.6rem 0 0; letter-spacing:-.008em; text-wrap:balance;
+  display:flex; align-items:baseline; gap:.7rem;}
+h2 .num{font-family:"Segoe UI",system-ui,sans-serif; font-size:.78rem; font-weight:600;
+  color:var(--muted); letter-spacing:.06em; flex:none;}
+h3{font-size:1.02rem; font-weight:700; margin:.9rem 0 0; letter-spacing:-.004em;}
+p{margin:0;}
+.page a{color:var(--qa);}
+
+.eq{overflow-x:auto; overflow-y:hidden; padding:.35rem 0; margin:.15rem 0;}
+.eq-num{display:flex; align-items:center; gap:1rem;}
+.eq-num math{flex:1;}
+.eqno{font-family:"Segoe UI",system-ui,sans-serif; font-size:.82rem; color:var(--muted); flex:none;}
+.eq-hero{background:var(--panel); border:1px solid var(--panel-edge); border-radius:3px;
+  padding:1.5rem 1.25rem; box-shadow:var(--shadow);}
+.eq-hero math{font-size:1.3em;}
+
+.thm{border-left:2.5px solid var(--rule); padding:.15rem 0 .15rem 1.15rem;
+  display:flex; flex-direction:column; gap:.6rem;}
+.thm.a{border-left-color:var(--qa);} .thm.b{border-left-color:var(--qb);}
+.thm.c{border-left-color:var(--qc);}
+.thm-head{font-family:"Segoe UI",system-ui,sans-serif; font-size:.72rem; font-weight:700;
+  letter-spacing:.12em; text-transform:uppercase; color:var(--muted);}
+.thm-body{font-style:italic;}
+.thm-body math{font-style:normal;}
+.proof{font-size:.92rem; color:var(--muted); padding-left:1.15rem;
+  border-left:1px dotted var(--rule); display:flex; flex-direction:column; gap:.5rem;}
+.proof .lbl{font-family:"Segoe UI",system-ui,sans-serif; font-size:.68rem; font-weight:600;
+  letter-spacing:.11em; text-transform:uppercase;}
+
+.trio{display:grid; grid-template-columns:repeat(auto-fit,minmax(11rem,1fr)); gap:1px;
+  background:var(--panel-edge); border:1px solid var(--panel-edge); border-radius:3px;
+  overflow:hidden;}
+.q{background:var(--paper); padding:1.15rem 1.05rem; display:flex; flex-direction:column; gap:.5rem;}
+.q .sym{font-size:1.5rem; font-weight:700; line-height:1;}
+.q.a .sym{color:var(--qa);} .q.b .sym{color:var(--qb);} .q.c .sym{color:var(--qc);}
+.q .def{font-size:.92rem;}
+.q .gloss{font-size:.86rem; color:var(--muted); font-style:italic;}
+.q .who{font-family:"Segoe UI",system-ui,sans-serif; font-size:.68rem; font-weight:600;
+  letter-spacing:.1em; text-transform:uppercase; color:var(--muted); margin-top:.1rem;}
+b.qa{color:var(--qa);} b.qb{color:var(--qb);} b.qc{color:var(--qc);}
+
+.pull{text-align:center; font-size:1.12rem; font-style:italic; line-height:1.45;
+  padding:1.4rem 1rem; color:var(--ink); border-top:1px solid var(--rule);
+  border-bottom:1px solid var(--rule);}
+
+.tw{overflow-x:auto;}
+table{border-collapse:collapse; width:100%; font-family:"Segoe UI",system-ui,sans-serif;
+  font-size:.88rem; font-variant-numeric:tabular-nums;}
+th{text-align:left; font-size:.68rem; font-weight:700; letter-spacing:.1em; text-transform:uppercase;
+  color:var(--muted); padding:0 .8rem .55rem 0; border-bottom:1px solid var(--rule); white-space:nowrap;}
+td{padding:.62rem .8rem .62rem 0; border-bottom:1px solid var(--rule); vertical-align:top;}
+tr:last-child td{border-bottom:none;}
+td math{font-size:.95em;}
+
+.ledger{display:flex; flex-direction:column; border:1px solid var(--panel-edge);
+  border-radius:3px; overflow:hidden;}
+.lrow{display:grid; grid-template-columns:auto 1fr; gap:1.2rem; align-items:center;
+  padding:1rem 1.15rem; background:var(--paper); border-bottom:1px solid var(--panel-edge);}
+.lrow:last-child{border-bottom:none;}
+.lrow .note{font-size:.87rem; color:var(--muted); font-style:italic;}
+
+ol.takeaways{margin:0; padding:0; list-style:none; counter-reset:t;
+  display:flex; flex-direction:column; gap:.85rem;}
+ol.takeaways li{counter-increment:t; display:grid; grid-template-columns:auto 1fr; gap:.9rem;
+  align-items:baseline;}
+ol.takeaways li::before{content:counter(t); font-family:"Segoe UI",system-ui,sans-serif;
+  font-size:.72rem; font-weight:700; color:var(--muted); font-variant-numeric:tabular-nums;}
+ol.takeaways .lead{font-weight:700;}
+
+ul.plain{margin:0; padding-left:1.2rem; display:flex; flex-direction:column; gap:.6rem;}
+
+.foot{font-size:.86rem; color:var(--muted); border-top:1px solid var(--rule);
+  padding-top:1.4rem; margin-top:1rem;}
+</style>
+<div class="page"><div class="wrap">
+<header class="masthead">
+  <div class="eyebrow">Technical note &middot; trajectory-balance samplers</div>
+  <h1>The Level Decomposition</h1>
+  <p class="standfirst">What the forward and backward log-partition estimates actually measure &mdash;
+     and why their disagreement is not a convergence criterion.</p>
+  <p class="abstract">Training a GFlowNet with the trajectory-balance objective gives two quantities that
+     both look like estimates of <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><mi>Z</mi></mrow></math>: one from on-policy rollouts, one from backward rollouts out of a
+     buffer. They disagree. This note shows the disagreement is exactly a signed combination of three
+     Kullback&ndash;Leibler divergences, and draws out the consequences &mdash; the sharpest being that the
+     gap can be closed by making the buffer <em>worse</em>. The only tools are Jensen&rsquo;s inequality and
+     the chain rule for KL.</p>
+</header>
+
+<section>
+  <h2><span class="num">01</span>Setup</h2>
+  <p>Write <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003C4;</mi><mo>&#x0003D;</mo><mo stretchy="false">&#x00028;</mo><msub><mi>s</mi><mn>0</mn></msub><mo>&#x02192;</mo><mo>&#x022EF;</mo><mo>&#x02192;</mo><msub><mi>s</mi><mi>T</mi></msub><mo stretchy="false">&#x00029;</mo></mrow></math> for a complete trajectory and <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>x</mi><mo>&#x0003D;</mo><mi>x</mi><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo stretchy="false">&#x00029;</mo><mi>:</mi><mo>&#x0003D;</mo><msub><mi>s</mi><mi>T</mi></msub></mrow></math> for its
+     terminal state. Given a strictly positive reward <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>R</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo></mrow></math> we want to sample the Boltzmann target</p>
+  <div class="eq"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>&#x003C0;</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><mi>:</mi><mo>&#x0003D;</mo><mfrac><mrow><mi>R</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo></mrow><mrow><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup></mrow></mfrac><mo>&#x0002C;</mo><mspace width="2em" /><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup><mi>:</mi><mo>&#x0003D;</mo><munder><mo>&#x02211;</mo><mi>x</mi></munder><mi>R</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0002E;</mo></mrow></math></div>
+  <p>The model is a forward policy <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>P</mi><mi>F</mi></msub><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo stretchy="false">&#x00029;</mo></mrow></math> over complete trajectories, a backward policy
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo>&#x02223;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo></mrow></math> normalised over the trajectories ending at <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>x</mi></mrow></math>, and a learned scalar <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Z</mi></mrow></math>. We write
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msubsup><mi>P</mi><mi>F</mi><mrow><mo>&#x022A4;</mo></mrow></msubsup><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><mi>:</mi><mo>&#x0003D;</mo><msub><mo>&#x02211;</mo><mrow><mi>&#x003C4;</mi><mo>&#x02192;</mo><mi>x</mi></mrow></msub><msub><mi>P</mi><mi>F</mi></msub><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo stretchy="false">&#x00029;</mo></mrow></math> for the <em>terminal marginal</em> &mdash; the
+     distribution actually sampled.</p>
+
+  <h3>One notational convention does all the work</h3>
+  <p>For any distribution <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>q</mi></mrow></math> over terminal states, let <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>q</mi><msub><mi>P</mi><mi>B</mi></msub></mrow></math> denote the distribution over
+     <em>trajectories</em> given by drawing <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>x</mi><mi>&#x0007E;</mi><mi>q</mi></mrow></math> then <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003C4;</mi><mi>&#x0007E;</mi><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="false">&#x00028;</mo><mo>&#x000B7;</mo><mo>&#x02223;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo></mrow></math>:</p>
+  <div class="eq"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mo stretchy="false">&#x00028;</mo><mi>q</mi><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="false">&#x00029;</mo><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo stretchy="false">&#x00029;</mo><mi>:</mi><mo>&#x0003D;</mo><mi>q</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo stretchy="false">&#x00029;</mo><mo stretchy="false">&#x00029;</mo><mspace width="0.167em" /><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo>&#x02223;</mo><mi>x</mi><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo stretchy="false">&#x00029;</mo><mo stretchy="false">&#x00029;</mo><mo>&#x0002E;</mo></mrow></math></div>
+  <p>This is normalised, since <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="false">&#x00028;</mo><mo>&#x000B7;</mo><mo>&#x02223;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo></mrow></math> sums to one for each <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>x</mi></mrow></math>. In particular <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003C0;</mi><msub><mi>P</mi><mi>B</mi></msub></mrow></math> is a
+     perfectly ordinary distribution over trajectories &mdash; and it is the object the forward policy is
+     really trying to match. Every divergence below is between trajectory distributions.</p>
+
+  <h3>Trajectory balance and the importance weight</h3>
+  <p>TB seeks parameters satisfying</p>
+  <div class="eq eq-num"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>Z</mi><mspace width="0.167em" /><msub><mi>P</mi><mi>F</mi></msub><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mi>R</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo stretchy="false">&#x00029;</mo><mo stretchy="false">&#x00029;</mo><mspace width="0.167em" /><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo>&#x02223;</mo><mi>x</mi><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo stretchy="false">&#x00029;</mo><mo stretchy="false">&#x00029;</mo><mspace width="1em" /><mtext>for&#x000A0;every&#x000A0;</mtext><mi>&#x003C4;</mi><mo>&#x0002E;</mo></mrow></math><span class="eqno">(1)</span></div>
+  <p>Summing (1) over trajectories ending at a fixed <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>x</mi></mrow></math> gives <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Z</mi><mspace width="0.167em" /><msubsup><mi>P</mi><mi>F</mi><mrow><mo>&#x022A4;</mo></mrow></msubsup><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mi>R</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo></mrow></math>; summing that over
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>x</mi></mrow></math> forces <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Z</mi><mo>&#x0003D;</mo><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup></mrow></math> and <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msubsup><mi>P</mi><mi>F</mi><mrow><mo>&#x022A4;</mo></mrow></msubsup><mo>&#x0003D;</mo><mi>&#x003C0;</mi></mrow></math>. So (1) says exactly &ldquo;the sampler is correct and
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Z</mi></mrow></math> is the true partition function&rdquo;. Define</p>
+  <div class="eq eq-num"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>log</mi><mi>w</mi><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo stretchy="false">&#x00029;</mo><mi>:</mi><mo>&#x0003D;</mo><mi>log</mi><mi>R</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0002B;</mo><mi>log</mi><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo>&#x02223;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><mo>&#x02212;</mo><mi>log</mi><msub><mi>P</mi><mi>F</mi></msub><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0002E;</mo></mrow></math><span class="eqno">(2)</span></div>
+  <p>Comparing with (1): TB holds if and only if <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><mi>w</mi><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mi>log</mi><mi>Z</mi></mrow></math> for <em>every</em> <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003C4;</mi></mrow></math>. So
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><mi>w</mi></mrow></math> is constant at the optimum, and both its <em>level</em> and its <em>spread</em> diagnose TB
+     violation. This note is about the level.</p>
+</section>
+
+<section>
+  <h2><span class="num">02</span>Two facts, used twice each</h2>
+
+  <div class="thm">
+    <div class="thm-head">Lemma 1 &middot; Importance-sampling identity</div>
+    <div class="thm-body"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x1D53C;</mi><mrow><msub><mi>P</mi><mi>F</mi></msub></mrow></msub><mo stretchy="false">[</mo><mi>w</mi><mo stretchy="false">]</mo><mo>&#x0003D;</mo><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup></mrow></math>.</div>
+  </div>
+  <div class="proof">
+    <span class="lbl">Proof</span>
+    <div class="eq"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>&#x1D53C;</mi><mrow><msub><mi>P</mi><mi>F</mi></msub></mrow></msub><mo stretchy="false">[</mo><mi>w</mi><mo stretchy="false">]</mo><mo>&#x0003D;</mo><munder><mo>&#x02211;</mo><mi>&#x003C4;</mi></munder><msub><mi>P</mi><mi>F</mi></msub><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo stretchy="false">&#x00029;</mo><mfrac><mrow><mi>R</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo>&#x02223;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo></mrow><mrow><msub><mi>P</mi><mi>F</mi></msub><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo stretchy="false">&#x00029;</mo></mrow></mfrac><mo>&#x0003D;</mo><munder><mo>&#x02211;</mo><mi>x</mi></munder><mi>R</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><munder><mo>&#x02211;</mo><mrow><mi>&#x003C4;</mi><mo>&#x02192;</mo><mi>x</mi></mrow></munder><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo>&#x02223;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><munder><mo>&#x02211;</mo><mi>x</mi></munder><mi>R</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup><mo>&#x0002E;</mo></mrow></math></div>
+    <p>Note this holds for the <em>forward</em> sampling distribution specifically. It is not true for an
+       arbitrary sampler, and that asymmetry is the source of everything below.</p>
+  </div>
+
+  <div class="thm">
+    <div class="thm-head">Lemma 2 &middot; KL chain rule with a shared kernel</div>
+    <div class="thm-body">For distributions <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>q</mi><mo>&#x0002C;</mo><mi>p</mi></mrow></math> over terminal states,
+      <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>D</mi><mrow><mrow><mi mathvariant="normal">K</mi><mi mathvariant="normal">L</mi></mrow></mrow></msub><mrow><mo stretchy="true" fence="true" form="prefix">&#x00028;</mo><mi>q</mi><msub><mi>P</mi><mi>B</mi></msub><mspace width="0.167em" /><mo fence="false" stretchy="false">&#x02016;</mo><mspace width="0.167em" /><mi>p</mi><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="true" fence="true" form="postfix">&#x00029;</mo></mrow><mo>&#x0003D;</mo><msub><mi>D</mi><mrow><mrow><mi mathvariant="normal">K</mi><mi mathvariant="normal">L</mi></mrow></mrow></msub><mrow><mo stretchy="true" fence="true" form="prefix">&#x00028;</mo><mi>q</mi><mspace width="0.167em" /><mo fence="false" stretchy="false">&#x02016;</mo><mspace width="0.167em" /><mi>p</mi><mo stretchy="true" fence="true" form="postfix">&#x00029;</mo></mrow></mrow></math>.</div>
+  </div>
+  <div class="proof">
+    <span class="lbl">Proof</span>
+    <div class="eq"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>D</mi><mrow><mrow><mi mathvariant="normal">K</mi><mi mathvariant="normal">L</mi></mrow></mrow></msub><mrow><mo stretchy="true" fence="true" form="prefix">&#x00028;</mo><mi>q</mi><msub><mi>P</mi><mi>B</mi></msub><mspace width="0.167em" /><mo fence="false" stretchy="false">&#x02016;</mo><mspace width="0.167em" /><mi>p</mi><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="true" fence="true" form="postfix">&#x00029;</mo></mrow><mo>&#x0003D;</mo><munder><mo>&#x02211;</mo><mi>&#x003C4;</mi></munder><mi>q</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo>&#x02223;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><mi>log</mi><mfrac><mrow><mi>q</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo>&#x02223;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo></mrow><mrow><mi>p</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo>&#x02223;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo></mrow></mfrac><mo>&#x0003D;</mo><munder><mo>&#x02211;</mo><mi>x</mi></munder><mi>q</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><mi>log</mi><mfrac><mrow><mi>q</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo></mrow><mrow><mi>p</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo></mrow></mfrac><mo>&#x0002C;</mo></mrow></math></div>
+    <p>since the <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>P</mi><mi>B</mi></msub></mrow></math> factors cancel inside the logarithm and each sums to one.</p>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">03</span>Two levels, three divergences</h2>
+  <p>In training we evaluate <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><mi>w</mi></mrow></math> under two different distributions. Let <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003BC;</mi></mrow></math> be the distribution over
+     terminal states held in the buffer, and set</p>
+  <div class="eq"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>J</mi><mi>F</mi></msub><mi>:</mi><mo>&#x0003D;</mo><msub><mi>&#x1D53C;</mi><mrow><msub><mi>P</mi><mi>F</mi></msub></mrow></msub><mo stretchy="false">[</mo><mi>log</mi><mi>w</mi><mo stretchy="false">]</mo><mspace width="1em" /><mtext>(forward&#x000A0;level)</mtext><mo>&#x0002C;</mo><mspace width="2em" /><msub><mi>J</mi><mi>B</mi></msub><mi>:</mi><mo>&#x0003D;</mo><msub><mi>&#x1D53C;</mi><mrow><mi>&#x003BC;</mi><msub><mi>P</mi><mi>B</mi></msub></mrow></msub><mo stretchy="false">[</mo><mi>log</mi><mi>w</mi><mo stretchy="false">]</mo><mspace width="1em" /><mtext>(backward&#x000A0;level)</mtext><mo>&#x0002E;</mo></mrow></math></div>
+  <p><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>J</mi><mi>F</mi></msub></mrow></math> is the mean of <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><mi>w</mi></mrow></math> over on-policy rollouts; <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>J</mi><mi>B</mi></msub></mrow></math> the same average over buffer draws with
+     backward rollouts. Three non-negative quantities govern them.</p>
+
+  <div class="trio">
+    <div class="q a">
+      <div class="sym">A</div>
+      <div class="def"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>D</mi><mrow><mrow><mi mathvariant="normal">K</mi><mi mathvariant="normal">L</mi></mrow></mrow></msub><mrow><mo stretchy="true" fence="true" form="prefix">&#x00028;</mo><msub><mi>P</mi><mi>F</mi></msub><mspace width="0.167em" /><mo fence="false" stretchy="false">&#x02016;</mo><mspace width="0.167em" /><mi>&#x003C0;</mi><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="true" fence="true" form="postfix">&#x00029;</mo></mrow></mrow></math></div>
+      <div class="gloss">How far the policy is from the target.</div>
+      <div class="who">Mode-seeking &middot; forward data</div>
+    </div>
+    <div class="q b">
+      <div class="sym">B</div>
+      <div class="def"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>D</mi><mrow><mrow><mi mathvariant="normal">K</mi><mi mathvariant="normal">L</mi></mrow></mrow></msub><mrow><mo stretchy="true" fence="true" form="prefix">&#x00028;</mo><mi>&#x003BC;</mi><msub><mi>P</mi><mi>B</mi></msub><mspace width="0.167em" /><mo fence="false" stretchy="false">&#x02016;</mo><mspace width="0.167em" /><msub><mi>P</mi><mi>F</mi></msub><mo stretchy="true" fence="true" form="postfix">&#x00029;</mo></mrow></mrow></math></div>
+      <div class="gloss">How badly the policy fails to cover the buffer.</div>
+      <div class="who">Mass-covering &middot; buffer data</div>
+    </div>
+    <div class="q c">
+      <div class="sym">C</div>
+      <div class="def"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>D</mi><mrow><mrow><mi mathvariant="normal">K</mi><mi mathvariant="normal">L</mi></mrow></mrow></msub><mrow><mo stretchy="true" fence="true" form="prefix">&#x00028;</mo><mi>&#x003BC;</mi><mspace width="0.167em" /><mo fence="false" stretchy="false">&#x02016;</mo><mspace width="0.167em" /><mi>&#x003C0;</mi><mo stretchy="true" fence="true" form="postfix">&#x00029;</mo></mrow></mrow></math></div>
+      <div class="gloss">How far the buffer is from the target.</div>
+      <div class="who">Data quality &middot; no gradient</div>
+    </div>
+  </div>
+
+  <p>The distinction between <b class="qa">A</b> and <b class="qb">B</b> is which argument the model sits in:
+     <b class="qa">A</b> is the <em>reverse</em> KL (mode-seeking), <b class="qb">B</b> the <em>forward</em> KL
+     (mass-covering). <b class="qc">C</b> involves no model at all &mdash; it is a property of the data.</p>
+
+  <div class="thm a">
+    <div class="thm-head">Lemma 3 &middot; Forward level</div>
+    <div class="thm-body"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>J</mi><mi>F</mi></msub><mo>&#x0003D;</mo><mi>log</mi><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup><mo>&#x02212;</mo><mi>A</mi></mrow></math>. In particular <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>J</mi><mi>F</mi></msub><mo>&#x02264;</mo><mi>log</mi><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup></mrow></math> always.</div>
+  </div>
+  <div class="proof">
+    <span class="lbl">Proof</span>
+    <div class="eq"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>J</mi><mi>F</mi></msub><mo>&#x0003D;</mo><msub><mi>&#x1D53C;</mi><mrow><msub><mi>P</mi><mi>F</mi></msub></mrow></msub><mrow><mo stretchy="true" fence="true" form="prefix">[</mo><mi>log</mi><mfrac><mrow><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup><mi>&#x003C0;</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo>&#x02223;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo></mrow><mrow><msub><mi>P</mi><mi>F</mi></msub><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo stretchy="false">&#x00029;</mo></mrow></mfrac><mo stretchy="true" fence="true" form="postfix">]</mo></mrow><mo>&#x0003D;</mo><mi>log</mi><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup><mo>&#x0002B;</mo><msub><mi>&#x1D53C;</mi><mrow><msub><mi>P</mi><mi>F</mi></msub></mrow></msub><mrow><mo stretchy="true" fence="true" form="prefix">[</mo><mi>log</mi><mfrac><mrow><mo stretchy="false">&#x00028;</mo><mi>&#x003C0;</mi><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="false">&#x00029;</mo><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo stretchy="false">&#x00029;</mo></mrow><mrow><msub><mi>P</mi><mi>F</mi></msub><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo stretchy="false">&#x00029;</mo></mrow></mfrac><mo stretchy="true" fence="true" form="postfix">]</mo></mrow><mo>&#x0003D;</mo><mi>log</mi><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup><mo>&#x02212;</mo><mi>A</mi><mo>&#x0002E;</mo></mrow></math></div>
+    <p>This is the usual ELBO statement in disguise: by Lemma&nbsp;1 and Jensen,
+       <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>J</mi><mi>F</mi></msub><mo>&#x02264;</mo><mi>log</mi><msub><mi>&#x1D53C;</mi><mrow><msub><mi>P</mi><mi>F</mi></msub></mrow></msub><mo stretchy="false">[</mo><mi>w</mi><mo stretchy="false">]</mo><mo>&#x0003D;</mo><mi>log</mi><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup></mrow></math>, and Lemma&nbsp;3 identifies the gap exactly as
+       <b class="qa">A</b>.</p>
+  </div>
+
+  <div class="thm b">
+    <div class="thm-head">Lemma 4 &middot; Backward level</div>
+    <div class="thm-body"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>J</mi><mi>B</mi></msub><mo>&#x0003D;</mo><mi>log</mi><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup><mo>&#x02212;</mo><mi>C</mi><mo>&#x0002B;</mo><mi>B</mi></mrow></math>.</div>
+  </div>
+  <div class="proof">
+    <span class="lbl">Proof</span>
+    <p>Write <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Q</mi><mi>:</mi><mo>&#x0003D;</mo><mi>&#x003BC;</mi><msub><mi>P</mi><mi>B</mi></msub></mrow></math>. As before <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>J</mi><mi>B</mi></msub><mo>&#x0003D;</mo><mi>log</mi><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup><mo>&#x0002B;</mo><msub><mi>&#x1D53C;</mi><mrow><mi>Q</mi></mrow></msub><mrow><mo stretchy="true" fence="true" form="prefix">[</mo><mi>log</mi><mo stretchy="false">&#x00028;</mo><mi>&#x003C0;</mi><msub><mi>P</mi><mi>B</mi></msub><mo>&#x0002F;</mo><msub><mi>P</mi><mi>F</mi></msub><mo stretchy="false">&#x00029;</mo><mo stretchy="true" fence="true" form="postfix">]</mo></mrow></mrow></math>.
+       Insert <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Q</mi></mrow></math> inside the logarithm:</p>
+    <div class="eq"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>&#x1D53C;</mi><mrow><mi>Q</mi></mrow></msub><mrow><mo stretchy="true" fence="true" form="prefix">[</mo><mi>log</mi><mfrac><mrow><mi>&#x003C0;</mi><msub><mi>P</mi><mi>B</mi></msub></mrow><mrow><msub><mi>P</mi><mi>F</mi></msub></mrow></mfrac><mo stretchy="true" fence="true" form="postfix">]</mo></mrow><mo>&#x0003D;</mo><mo>&#x02212;</mo><msub><mi>D</mi><mrow><mrow><mi mathvariant="normal">K</mi><mi mathvariant="normal">L</mi></mrow></mrow></msub><mrow><mo stretchy="true" fence="true" form="prefix">&#x00028;</mo><mi>Q</mi><mspace width="0.167em" /><mo fence="false" stretchy="false">&#x02016;</mo><mspace width="0.167em" /><mi>&#x003C0;</mi><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="true" fence="true" form="postfix">&#x00029;</mo></mrow><mo>&#x0002B;</mo><msub><mi>D</mi><mrow><mrow><mi mathvariant="normal">K</mi><mi mathvariant="normal">L</mi></mrow></mrow></msub><mrow><mo stretchy="true" fence="true" form="prefix">&#x00028;</mo><mi>Q</mi><mspace width="0.167em" /><mo fence="false" stretchy="false">&#x02016;</mo><mspace width="0.167em" /><msub><mi>P</mi><mi>F</mi></msub><mo stretchy="true" fence="true" form="postfix">&#x00029;</mo></mrow><mo>&#x0002E;</mo></mrow></math></div>
+    <p>The second term is <b class="qb">B</b> by definition; the first is
+       <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>D</mi><mrow><mrow><mi mathvariant="normal">K</mi><mi mathvariant="normal">L</mi></mrow></mrow></msub><mrow><mo stretchy="true" fence="true" form="prefix">&#x00028;</mo><mi>&#x003BC;</mi><msub><mi>P</mi><mi>B</mi></msub><mspace width="0.167em" /><mo fence="false" stretchy="false">&#x02016;</mo><mspace width="0.167em" /><mi>&#x003C0;</mi><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="true" fence="true" form="postfix">&#x00029;</mo></mrow><mo>&#x0003D;</mo><msub><mi>D</mi><mrow><mrow><mi mathvariant="normal">K</mi><mi mathvariant="normal">L</mi></mrow></mrow></msub><mrow><mo stretchy="true" fence="true" form="prefix">&#x00028;</mo><mi>&#x003BC;</mi><mspace width="0.167em" /><mo fence="false" stretchy="false">&#x02016;</mo><mspace width="0.167em" /><mi>&#x003C0;</mi><mo stretchy="true" fence="true" form="postfix">&#x00029;</mo></mrow><mo>&#x0003D;</mo><mi>C</mi></mrow></math>
+       by Lemma&nbsp;2.</p>
+  </div>
+
+  <div class="thm">
+    <div class="thm-head">Remark &middot; the backward level is not a lower bound</div>
+    <div class="thm-body">Unlike <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>J</mi><mi>F</mi></msub></mrow></math>, the backward level can <em>exceed</em> <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup></mrow></math> &mdash; by
+      Lemma&nbsp;4 it does so whenever <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x0003E;</mo><mi>C</mi></mrow></math>. Lemma&nbsp;1 only guarantees unbiasedness of <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>w</mi></mrow></math> under <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>P</mi><mi>F</mi></msub></mrow></math>.
+      Treating the two levels as interchangeable estimates of <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><mi>Z</mi></mrow></math> is a common and consequential
+      slip.</div>
+  </div>
+</section>
+
+<section>
+  <h2><span class="num">04</span>The master identity</h2>
+  <div class="eq eq-hero"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>&#x00394;</mi><mi>:</mi><mo>&#x0003D;</mo><msub><mi>J</mi><mi>B</mi></msub><mo>&#x02212;</mo><msub><mi>J</mi><mi>F</mi></msub><mo>&#x0003D;</mo><mi>A</mi><mo>&#x0002B;</mo><mi>B</mi><mo>&#x02212;</mo><mi>C</mi></mrow></math></div>
+  <p>Subtract Lemma&nbsp;3 from Lemma&nbsp;4; the <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup></mrow></math> cancels. Two sanity checks. If the sampler
+     is perfect (<math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>A</mi><mo>&#x0003D;</mo><mn>0</mn></mrow></math>) and the buffer thermal (<math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>C</mi><mo>&#x0003D;</mo><mn>0</mn></mrow></math>), then <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>B</mi><mo>&#x0003D;</mo><mn>0</mn></mrow></math> and <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x00394;</mi><mo>&#x0003D;</mo><mn>0</mn></mrow></math>. If the policy is
+     perfect but the buffer arbitrary, then <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>A</mi><mo>&#x0003D;</mo><mn>0</mn></mrow></math> and
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>D</mi><mrow><mrow><mi mathvariant="normal">K</mi><mi mathvariant="normal">L</mi></mrow></mrow></msub><mrow><mo stretchy="true" fence="true" form="prefix">&#x00028;</mo><mi>&#x003BC;</mi><msub><mi>P</mi><mi>B</mi></msub><mspace width="0.167em" /><mo fence="false" stretchy="false">&#x02016;</mo><mspace width="0.167em" /><mi>&#x003C0;</mi><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="true" fence="true" form="postfix">&#x00029;</mo></mrow><mo>&#x0003D;</mo><mi>C</mi></mrow></math>, so <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x00394;</mi><mo>&#x0003D;</mo><mn>0</mn></mrow></math> again &mdash; a bad buffer
+     <em>alone</em> opens no gap. Conversely, with a thermal buffer but an imperfect policy,</p>
+  <div class="eq"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>&#x00394;</mi><mo>&#x0003D;</mo><msub><mi>D</mi><mrow><mrow><mi mathvariant="normal">K</mi><mi mathvariant="normal">L</mi></mrow></mrow></msub><mrow><mo stretchy="true" fence="true" form="prefix">&#x00028;</mo><mi>&#x003C0;</mi><msub><mi>P</mi><mi>B</mi></msub><mspace width="0.167em" /><mo fence="false" stretchy="false">&#x02016;</mo><mspace width="0.167em" /><msub><mi>P</mi><mi>F</mi></msub><mo stretchy="true" fence="true" form="postfix">&#x00029;</mo></mrow><mo>&#x0002B;</mo><msub><mi>D</mi><mrow><mrow><mi mathvariant="normal">K</mi><mi mathvariant="normal">L</mi></mrow></mrow></msub><mrow><mo stretchy="true" fence="true" form="prefix">&#x00028;</mo><msub><mi>P</mi><mi>F</mi></msub><mspace width="0.167em" /><mo fence="false" stretchy="false">&#x02016;</mo><mspace width="0.167em" /><mi>&#x003C0;</mi><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="true" fence="true" form="postfix">&#x00029;</mo></mrow><mo>&#x0002C;</mo></mrow></math></div>
+  <p>the <em>symmetrised</em> KL (Jeffreys divergence) between policy and target &mdash; a genuine
+     distributional distance, vanishing only at <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>P</mi><mi>F</mi></msub><mo>&#x0003D;</mo><mi>&#x003C0;</mi><msub><mi>P</mi><mi>B</mi></msub></mrow></math>.</p>
+</section>
+
+<section>
+  <h2><span class="num">05</span>The one-sided constraint on the normaliser</h2>
+  <p>The learned normaliser enters through the TB residual, whose square is the loss:</p>
+  <div class="eq eq-num"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>r</mi><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo stretchy="false">&#x00029;</mo><mi>:</mi><mo>&#x0003D;</mo><mi>log</mi><mi>Z</mi><mo>&#x0002B;</mo><mi>log</mi><msub><mi>P</mi><mi>F</mi></msub><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo stretchy="false">&#x00029;</mo><mo>&#x02212;</mo><mi>log</mi><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo>&#x02223;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><mo>&#x02212;</mo><mi>log</mi><mi>R</mi><mo stretchy="false">&#x00028;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mi>log</mi><mi>Z</mi><mo>&#x02212;</mo><mi>log</mi><mi>w</mi><mo stretchy="false">&#x00028;</mo><mi>&#x003C4;</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0002E;</mo></mrow></math><span class="eqno">(3)</span></div>
+  <p>Averaging (3) under the backward stream gives <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>&#x1D53C;</mi><mrow><mi>&#x003BC;</mi><msub><mi>P</mi><mi>B</mi></msub></mrow></msub><mo stretchy="false">[</mo><mi>r</mi><mo stretchy="false">]</mo><mo>&#x0003D;</mo><mi>log</mi><mi>Z</mi><mo>&#x02212;</mo><msub><mi>J</mi><mi>B</mi></msub></mrow></math>, so the backward
+     residual is centred exactly when <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><mi>Z</mi><mo>&#x0003D;</mo><msub><mi>J</mi><mi>B</mi></msub></mrow></math>. How low can that be?</p>
+
+  <div class="thm c">
+    <div class="thm-head">Proposition &middot; ELBO floor</div>
+    <div class="thm-body">Let
+      <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mrow><mi mathvariant="normal">E</mi><mi mathvariant="normal">L</mi><mi mathvariant="normal">B</mi><mi mathvariant="normal">O</mi></mrow><mo stretchy="false">&#x00028;</mo><mi>&#x003BC;</mi><mo stretchy="false">&#x00029;</mo><mi>:</mi><mo>&#x0003D;</mo><msub><mi>&#x1D53C;</mi><mrow><mi>&#x003BC;</mi></mrow></msub><mo stretchy="false">[</mo><mi>log</mi><mi>R</mi><mo stretchy="false">]</mo><mo>&#x0002B;</mo><mi>&#x0210D;</mi><mo stretchy="false">&#x00028;</mo><mi>&#x003BC;</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mi>log</mi><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup><mo>&#x02212;</mo><mi>C</mi></mrow></math>. Then
+      <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>J</mi><mi>B</mi></msub><mo>&#x02265;</mo><mrow><mi mathvariant="normal">E</mi><mi mathvariant="normal">L</mi><mi mathvariant="normal">B</mi><mi mathvariant="normal">O</mi></mrow><mo stretchy="false">&#x00028;</mo><mi>&#x003BC;</mi><mo stretchy="false">&#x00029;</mo></mrow></math>, with equality if and only if <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>P</mi><mi>F</mi></msub><mo>&#x0003D;</mo><mi>&#x003BC;</mi><msub><mi>P</mi><mi>B</mi></msub></mrow></math>.</div>
+  </div>
+  <div class="proof">
+    <span class="lbl">Proof</span>
+    <p>Immediate from Lemma&nbsp;4: <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>J</mi><mi>B</mi></msub><mo>&#x02212;</mo><mrow><mi mathvariant="normal">E</mi><mi mathvariant="normal">L</mi><mi mathvariant="normal">B</mi><mi mathvariant="normal">O</mi></mrow><mo stretchy="false">&#x00028;</mo><mi>&#x003BC;</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0003D;</mo><mi>B</mi><mo>&#x02265;</mo><mn>0</mn></mrow></math>, vanishing iff <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>P</mi><mi>F</mi></msub><mo>&#x0003D;</mo><mi>&#x003BC;</mi><msub><mi>P</mi><mi>B</mi></msub></mrow></math>. The
+       identity <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup><mo>&#x02212;</mo><mi>C</mi><mo>&#x0003D;</mo><msub><mi>&#x1D53C;</mi><mrow><mi>&#x003BC;</mi></mrow></msub><mo stretchy="false">[</mo><mi>log</mi><mi>R</mi><mo stretchy="false">]</mo><mo>&#x0002B;</mo><mi>&#x0210D;</mi><mo stretchy="false">&#x00028;</mo><mi>&#x003BC;</mi><mo stretchy="false">&#x00029;</mo></mrow></math> is a one-line expansion of
+       <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>D</mi><mrow><mrow><mi mathvariant="normal">K</mi><mi mathvariant="normal">L</mi></mrow></mrow></msub><mrow><mo stretchy="true" fence="true" form="prefix">&#x00028;</mo><mi>&#x003BC;</mi><mspace width="0.167em" /><mo fence="false" stretchy="false">&#x02016;</mo><mspace width="0.167em" /><mi>&#x003C0;</mi><mo stretchy="true" fence="true" form="postfix">&#x00029;</mo></mrow></mrow></math>.</p>
+  </div>
+
+  <div class="thm c">
+    <div class="thm-head">Corollary &middot; backward training can be asked for the impossible</div>
+    <div class="thm-body">Suppose <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><mi>Z</mi></mrow></math> is held fixed (detached) at <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>z</mi><mn>0</mn></msub></mrow></math>. The mean backward residual can
+      be driven to zero by training <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>P</mi><mi>F</mi></msub></mrow></math> <em>only if</em> <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>z</mi><mn>0</mn></msub><mo>&#x02265;</mo><mrow><mi mathvariant="normal">E</mi><mi mathvariant="normal">L</mi><mi mathvariant="normal">B</mi><mi mathvariant="normal">O</mi></mrow><mo stretchy="false">&#x00028;</mo><mi>&#x003BC;</mi><mo stretchy="false">&#x00029;</mo></mrow></math>. Below that, no
+      forward policy whatsoever centres it.</div>
+  </div>
+  <div class="proof">
+    <span class="lbl">Proof</span>
+    <p>As <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>P</mi><mi>F</mi></msub></mrow></math> varies, <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>J</mi><mi>B</mi></msub></mrow></math> ranges over <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">[</mo><mrow><mi mathvariant="normal">E</mi><mi mathvariant="normal">L</mi><mi mathvariant="normal">B</mi><mi mathvariant="normal">O</mi></mrow><mo stretchy="false">&#x00028;</mo><mi>&#x003BC;</mi><mo stretchy="false">&#x00029;</mo><mo>&#x0002C;</mo><mo>&#x0221E;</mo><mo stretchy="false">&#x00029;</mo></mrow></math>: the lower end is the Proposition,
+       and <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>J</mi><mi>B</mi></msub></mrow></math> grows without bound as <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>P</mi><mi>F</mi></msub></mrow></math> assigns vanishing mass to the buffer&rsquo;s trajectories.
+       Setting <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>z</mi><mn>0</mn></msub><mo>&#x0003D;</mo><msub><mi>J</mi><mi>B</mi></msub></mrow></math> is achievable exactly when <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>z</mi><mn>0</mn></msub><mo>&#x02265;</mo><mrow><mi mathvariant="normal">E</mi><mi mathvariant="normal">L</mi><mi mathvariant="normal">B</mi><mi mathvariant="normal">O</mi></mrow><mo stretchy="false">&#x00028;</mo><mi>&#x003BC;</mi><mo stretchy="false">&#x00029;</mo></mrow></math>.</p>
+  </div>
+
+  <p>The asymmetry is worth stating plainly. Placing <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><mi>Z</mi></mrow></math> <em>too high</em> is harmless &mdash; the policy
+     simply raises <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>J</mi><mi>B</mi></msub></mrow></math> to meet it. Placing it <em>below</em> <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mrow><mi mathvariant="normal">E</mi><mi mathvariant="normal">L</mi><mi mathvariant="normal">B</mi><mi mathvariant="normal">O</mi></mrow><mo stretchy="false">&#x00028;</mo><mi>&#x003BC;</mi><mo stretchy="false">&#x00029;</mo></mrow></math> demands more forward
+     probability mass on the buffer than normalisation permits. Under a squared loss the optimiser does not
+     stop when asked for the impossible; it distorts <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>P</mi><mi>F</mi></msub></mrow></math> as far as it can in the demanded direction,
+     degrading the sampler rather than merely stalling it.</p>
+</section>
+
+<section>
+  <h2><span class="num">06</span>Consequences</h2>
+
+  <h3>The normaliser is a nuisance parameter, not an objective</h3>
+  <p><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><mi>Z</mi></mrow></math> is one number, but the two streams place it in two spots separated by <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x00394;</mi></mrow></math>:</p>
+  <div class="eq"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><msub><mi>&#x1D53C;</mi><mrow><msub><mi>P</mi><mi>F</mi></msub></mrow></msub><mo stretchy="false">[</mo><mi>r</mi><mo stretchy="false">]</mo><mo>&#x0003D;</mo><mi>log</mi><mi>Z</mi><mo>&#x02212;</mo><msub><mi>J</mi><mi>F</mi></msub><mo>&#x0002C;</mo><mspace width="2em" /><msub><mi>&#x1D53C;</mi><mrow><mi>&#x003BC;</mi><msub><mi>P</mi><mi>B</mi></msub></mrow></msub><mo stretchy="false">[</mo><mi>r</mi><mo stretchy="false">]</mo><mo>&#x0003D;</mo><mrow><mo stretchy="true" fence="true" form="prefix">&#x00028;</mo><mi>log</mi><mi>Z</mi><mo>&#x02212;</mo><msub><mi>J</mi><mi>F</mi></msub><mo stretchy="true" fence="true" form="postfix">&#x00029;</mo></mrow><mo>&#x02212;</mo><mi>&#x00394;</mi><mo>&#x0002E;</mo></mrow></math></div>
+  <p>Choosing <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><mi>Z</mi><mo>&#x0003D;</mo><msub><mi>J</mi><mi>F</mi></msub></mrow></math> zeroes the forward residual and leaves the backward one at <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x02212;</mo><mi>&#x00394;</mi></mrow></math>; choosing
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><mi>Z</mi><mo>&#x0003D;</mo><msub><mi>J</mi><mi>B</mi></msub></mrow></math> does the reverse. No choice zeroes both unless <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x00394;</mi><mo>&#x0003D;</mo><mn>0</mn></mrow></math> &mdash; and <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x00394;</mi></mrow></math> depends
+     only on <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo stretchy="false">&#x00028;</mo><msub><mi>P</mi><mi>F</mi></msub><mo>&#x0002C;</mo><msub><mi>P</mi><mi>B</mi></msub><mo>&#x0002C;</mo><mi>&#x003BC;</mi><mo>&#x0002C;</mo><mi>&#x003C0;</mi><mo stretchy="false">&#x00029;</mo></mrow></math>, not on <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Z</mi></mrow></math>.</p>
+
+  <div class="pull">The placement of the normaliser decides which stream absorbs the error.<br>
+    It does not decide whether error exists.</div>
+
+  <p>A practical corollary: a controller rule watching the residual of the branch that <em>trains</em> <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Z</mi></mrow></math> is
+     measuring a tautology. If the forward branch updates <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Z</mi></mrow></math> and only <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Z</mi></mrow></math>, then <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><mi>Z</mi><mo>&#x02192;</mo><msub><mi>J</mi><mi>F</mi></msub></mrow></math> and the
+     forward residual self-zeroes no matter how bad the policy is. The informative residuals are on the
+     branches that train the <em>policy</em>.</p>
+
+  <h3>The gap is not a valid optimisation target</h3>
+  <p><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x00394;</mi><mo>&#x0003D;</mo><mi>A</mi><mo>&#x0002B;</mo><mi>B</mi><mo>&#x02212;</mo><mi>C</mi></mrow></math> is <em>decreasing</em> in <b class="qc">C</b>. Since <b class="qc">C</b> measures
+     how bad the buffer is, degrading the buffer reduces <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x00394;</mi></mrow></math>. A loop that churns its own buffer and
+     gates on <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x00394;</mi></mrow></math> therefore has a direct incentive to make the buffer worse. Whatever <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x00394;</mi></mrow></math> is for,
+     it is not a success criterion &mdash; it is a handoff diagnostic, an indicator of whether the placement
+     of <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>Z</mi></mrow></math> is currently contentious.</p>
+
+  <h3>Only one term is the objective</h3>
+  <p>Of the three, only <b class="qa">A</b> is an unambiguous statement about what we want &mdash; and it
+     controls the error in the terminal marginal, which is what is actually sampled.</p>
+
+  <div class="thm a">
+    <div class="thm-head">Proposition &middot; data processing</div>
+    <div class="thm-body"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>D</mi><mrow><mrow><mi mathvariant="normal">K</mi><mi mathvariant="normal">L</mi></mrow></mrow></msub><mrow><mo stretchy="true" fence="true" form="prefix">&#x00028;</mo><msubsup><mi>P</mi><mi>F</mi><mrow><mo>&#x022A4;</mo></mrow></msubsup><mspace width="0.167em" /><mo fence="false" stretchy="false">&#x02016;</mo><mspace width="0.167em" /><mi>&#x003C0;</mi><mo stretchy="true" fence="true" form="postfix">&#x00029;</mo></mrow><mo>&#x02264;</mo><mi>A</mi></mrow></math>.</div>
+  </div>
+  <div class="proof">
+    <span class="lbl">Proof</span>
+    <p>Factor each trajectory distribution into its terminal marginal and the conditional over trajectories
+       given the terminal state; the KL chain rule gives</p>
+    <div class="eq"><math xmlns="http://www.w3.org/1998/Math/MathML" display="block"><mrow><mi>A</mi><mo>&#x0003D;</mo><msub><mi>D</mi><mrow><mrow><mi mathvariant="normal">K</mi><mi mathvariant="normal">L</mi></mrow></mrow></msub><mrow><mo stretchy="true" fence="true" form="prefix">&#x00028;</mo><msubsup><mi>P</mi><mi>F</mi><mrow><mo>&#x022A4;</mo></mrow></msubsup><mspace width="0.167em" /><mo fence="false" stretchy="false">&#x02016;</mo><mspace width="0.167em" /><mi>&#x003C0;</mi><mo stretchy="true" fence="true" form="postfix">&#x00029;</mo></mrow><mo>&#x0002B;</mo><msub><mi>&#x1D53C;</mi><mrow><mi>x</mi><mi>&#x0007E;</mi><msubsup><mi>P</mi><mi>F</mi><mrow><mo>&#x022A4;</mo></mrow></msubsup></mrow></msub><mrow><mo stretchy="true" fence="true" form="prefix">[</mo><msub><mi>D</mi><mrow><mrow><mi mathvariant="normal">K</mi><mi mathvariant="normal">L</mi></mrow></mrow></msub><mrow><mo stretchy="true" fence="true" form="prefix">&#x00028;</mo><msub><mi>P</mi><mi>F</mi></msub><mo stretchy="false">&#x00028;</mo><mo>&#x000B7;</mo><mo>&#x02223;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><mspace width="0.167em" /><mo fence="false" stretchy="false">&#x02016;</mo><mspace width="0.167em" /><msub><mi>P</mi><mi>B</mi></msub><mo stretchy="false">&#x00028;</mo><mo>&#x000B7;</mo><mo>&#x02223;</mo><mi>x</mi><mo stretchy="false">&#x00029;</mo><mo stretchy="true" fence="true" form="postfix">&#x00029;</mo></mrow><mo stretchy="true" fence="true" form="postfix">]</mo></mrow><mo>&#x0002C;</mo></mrow></math></div>
+    <p>and the second term is non-negative.</p>
+  </div>
+
+  <p>So driving <b class="qa">A</b> down drives the sampling error down, the slack being exactly the mismatch
+     between the forward posterior over trajectories and the backward policy. Neither <b class="qb">B</b> nor
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x00394;</mi></mrow></math> admits such a bound.</p>
+
+  <h3>The two policy terms require different data</h3>
+  <p><b class="qa">A</b> has the model in the first argument &mdash; reverse KL, estimated from samples drawn
+     from <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>P</mi><mi>F</mi></msub></mrow></math>: forward rollouts, or a replay buffer of previously generated forward trajectories.
+     <b class="qb">B</b> has the model in the second &mdash; forward KL, estimated from samples drawn from
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003BC;</mi></mrow></math>: backward rollouts out of the buffer. Hence:</p>
+  <ul class="plain">
+    <li>Training on buffer data alone reduces <b class="qb">B</b> and leaves <b class="qa">A</b> unattended:
+        the sampler learns to cover what it is shown and never sharpens.</li>
+    <li>Training on forward data alone reduces <b class="qa">A</b> and lets <b class="qb">B</b> grow: the
+        classic mode collapse.</li>
+    <li>Since <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x00394;</mi></mrow></math> contains both, a system in which one data stream is <em>inactive</em> cannot reduce
+        <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x00394;</mi></mrow></math> past the term nothing is attacking &mdash; no matter how long it runs, or how the remaining
+        branch is weighted.</li>
+  </ul>
+  <p>The last point is worth emphasising because it presents as slow convergence rather than as a stalled
+     component.</p>
+</section>
+
+<section>
+  <h2><span class="num">07</span>What is estimable</h2>
+  <div class="tw">
+  <table>
+    <thead><tr><th>Quantity</th><th>Estimator</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>J</mi><mi>F</mi></msub></mrow></math></td><td>mean of <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><mi>w</mi></mrow></math>, forward rollouts</td>
+          <td>unbiased for <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup><mo>&#x02212;</mo><mi>A</mi></mrow></math></td></tr>
+      <tr><td><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>J</mi><mi>B</mi></msub></mrow></math></td><td>mean of <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><mi>w</mi></mrow></math>, buffer draws</td>
+          <td>may exceed <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup></mrow></math></td></tr>
+      <tr><td><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x00394;</mi></mrow></math></td><td><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>J</mi><mi>B</mi></msub><mo>&#x02212;</mo><msub><mi>J</mi><mi>F</mi></msub></mrow></math></td><td><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mo>&#x0003D;</mo><mi>A</mi><mo>&#x0002B;</mo><mi>B</mi><mo>&#x02212;</mo><mi>C</mi></mrow></math></td></tr>
+      <tr><td><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup></mrow></math></td><td>log-mean-exp of <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>w</mi></mrow></math>, <em>forward</em> stream</td>
+          <td>Lemma&nbsp;1; biased low</td></tr>
+      <tr><td><b class="qa">A</b></td><td>log-mean-exp minus mean, forward</td>
+          <td>the &ldquo;Jensen gap&rdquo;</td></tr>
+      <tr><td><b class="qc">C</b></td><td>&mdash;</td><td>not identifiable without <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003C0;</mi></mrow></math></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Two cautions. The log-mean-exp estimator of <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>log</mi><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup></mrow></math> is biased low by Jensen and its variance
+     grows with <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mrow><mi mathvariant="normal">V</mi><mi mathvariant="normal">a</mi><mi mathvariant="normal">r</mi></mrow><mo stretchy="false">&#x00028;</mo><mi>log</mi><mi>w</mi><mo stretchy="false">&#x00029;</mo></mrow></math> &mdash; precisely the regime where one wants it most &mdash; so the
+     resulting estimate of <b class="qa">A</b> is an <em>under</em>estimate. And <b class="qb">B</b> and
+     <b class="qc">C</b> are not separately identifiable from the two levels: only the combination
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>C</mi><mo>&#x02212;</mo><mi>B</mi><mo>&#x0003D;</mo><mi>log</mi><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup><mo>&#x02212;</mo><msub><mi>J</mi><mi>B</mi></msub></mrow></math> is. Separating them needs an independent handle on the buffer, such as
+     knowing <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x003BC;</mi></mrow></math> came from a thermalised procedure.</p>
+</section>
+
+<section>
+  <h2><span class="num">08</span>Summary</h2>
+  <div class="ledger">
+    <div class="lrow"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>J</mi><mi>F</mi></msub><mo>&#x0003D;</mo><mi>log</mi><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup><mo>&#x02212;</mo><mi>A</mi></mrow></math>
+      <span class="note">policy error, mode-seeking &mdash; bounds the sampling error</span></div>
+    <div class="lrow"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><msub><mi>J</mi><mi>B</mi></msub><mo>&#x0003D;</mo><mi>log</mi><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup><mo>&#x02212;</mo><mi>C</mi><mo>&#x0002B;</mo><mi>B</mi></mrow></math>
+      <span class="note">policy coverage against buffer quality &mdash; not a bound</span></div>
+    <div class="lrow"><math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>&#x00394;</mi><mo>&#x0003D;</mo><mi>A</mi><mo>&#x0002B;</mo><mi>B</mi><mo>&#x02212;</mo><mi>C</mi></mrow></math>
+      <span class="note">improves when the buffer degrades &mdash; diagnostic only</span></div>
+  </div>
+
+  <p>Read as a design principle:</p>
+  <ol class="takeaways">
+    <li><span><span class="lead">Objective &mdash; <b class="qa">A</b> down.</span> It bounds the
+        terminal-marginal error; nothing else here does.</span></li>
+    <li><span><span class="lead">Constraint &mdash; <b class="qb">B</b> bounded.</span> Lost coverage is not
+        recoverable by further optimisation of <b class="qa">A</b>.</span></li>
+    <li><span><span class="lead">Precondition &mdash; <b class="qc">C</b> small.</span> No gradient reduces
+        it. It is a data-preparation problem.</span></li>
+    <li><span><span class="lead">Nuisance &mdash; the normaliser.</span> Keep it accurate enough that neither
+        residual is systematically corrupted, and never below <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mrow><mi mathvariant="normal">E</mi><mi mathvariant="normal">L</mi><mi mathvariant="normal">B</mi><mi mathvariant="normal">O</mi></mrow><mo stretchy="false">&#x00028;</mo><mi>&#x003BC;</mi><mo stretchy="false">&#x00029;</mo></mrow></math>.</span></li>
+    <li><span><span class="lead">Diagnostic, never a target &mdash; the gap.</span> It improves when the
+        buffer gets worse.</span></li>
+  </ol>
+
+  <p class="foot">Everything above is exact and holds per condition <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>c</mi></mrow></math> in the conditional case: replace
+     <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>R</mi><mo>&#x0002C;</mo><mi>&#x003C0;</mi><mo>&#x0002C;</mo><msup><mi>Z</mi><mrow><mo>&#x022C6;</mo></mrow></msup><mo>&#x0002C;</mo><mi>Z</mi></mrow></math> by their <math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mrow><mi>c</mi></mrow></math>-indexed versions and condition every policy. No step couples
+     distinct conditions, so the quantities are computed per condition and then reduced across them &mdash;
+     by a mean, or by a worst-case quantile.</p>
+</section>
+</div></div>
