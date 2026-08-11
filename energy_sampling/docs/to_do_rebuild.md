@@ -2416,8 +2416,10 @@ that silently voids a battery:
    not replacing one: `draw_replay_sample` currently passes `weighted=False`, so
    replay draws uniformly today. Start κ=1, drift out of the draw, quadratic on
    the replay branch, `freeze_z` on. Report ESS every step.
-3. **Uniform admission** (§B7), retiring `admit_cap_*` / `admit_temperature`.
-   Pairs with 2 — the draw has to be in place before admission stops selecting.
+3. ✅ **DONE 2026-08-10. Uniform admission** (§B7), retiring `admit_cap_*` /
+   `admit_temperature`. Paired with 2 (already shipped) as required — the
+   draw was in place before admission stopped selecting. See `decisions.md`
+   D5, `module_buffers.md` B0.
 4. **The same draw on `bwd`** (§B5a), priority `δ₋`, on terminal-averaged
    `δ̄(x)`. Shares all of step 2's machinery. After replay only because replay is
    the simpler validation, not because it is the more valuable one.

@@ -29,7 +29,7 @@ from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTra
 from energy_sampling.checkpointing import Checkpointer, MODELLER_STATE_DEFAULTS
 from energy_sampling.controller import LRController
 from energy_sampling.protocol import StageProtocol
-from energy_sampling.step_probe import StepProbe
+from energy_sampling.ray_calibration import RayCalibration
 from energy_sampling.eval.utils import sample_eval_fwd_trajs
 from energy_sampling.utils import is_cuda_oom, \
     dict2namespace, \
@@ -104,30 +104,20 @@ def loggable_array(a, num_bins=32):
     return safe_histogram(a, num_bins=num_bins)
 
 
-def _softmax_draw(scores: torch.Tensor, k: int, temperature: float) -> torch.Tensor:
+def _uniform_draw(n: int, k: int) -> torch.Tensor:
     """
-    Draw up to k positions into `scores`, without replacement, weighted by
-    softmax(scores / temperature). Returns positions (0..scores.numel()-1),
+    Draw up to k positions from range(n), uniformly, without replacement.
     NOT the caller's original indices -- callers index their own index
-    tensor by the result (e.g. `elig[_softmax_draw(...)]`).
+    tensor by the result (e.g. `elig[_uniform_draw(elig.numel(), k)]`).
 
     Used for replay-buffer admission/purge (see manage_replay_buffer):
-    `scores` is expected to already be clipped to an absolute cap by the
-    caller BEFORE this divides by temperature, so a single extreme value
-    can't dominate the softmax (see the buffer-redesign discussion this
-    implements -- clip-then-divide keeps the cap's meaning independent of T).
+    selection lives at the draw (prioritise/kappa), not at intake, so both
+    sides of buffer churn are residual-independent by construction.
     """
-    n = scores.numel()
     k = min(k, n)
     if k <= 0:
         return torch.zeros(0, dtype=torch.long)
-    logits = scores.double() / max(temperature, 1e-8)
-    logits = logits - logits.max()
-    p = torch.softmax(logits, dim=0).cpu().numpy()
-    p = np.clip(p, 1e-12, None)
-    p /= p.sum()
-    choice = np.random.choice(n, size=k, replace=False, p=p)
-    return torch.as_tensor(choice, dtype=torch.long)
+    return torch.randperm(n)[:k]
 
 
 class Modeller:
@@ -157,10 +147,10 @@ class Modeller:
         self.replay_churn = {'admitted': 0, 'evicted': 0, 'reward_rejected': 0}
         # eviction-cause tallies (see manage_replay_buffer's eviction split):
         # drained and logged once per eval alongside replay_churn. 'expired*'
-        # keys now carry the HAZARD (random-eviction) cohort -- the unbiased
-        # readout of the live population -- while 'stalled'/'backstop' count
-        # the two targeted causes.
-        self.replay_cohort = {'absorbed': 0, 'stalled': 0, 'backstop': 0,
+        # keys carry the HAZARD (random-eviction) cohort -- the unbiased
+        # readout of the live population -- while 'backstop' counts the one
+        # remaining age-targeted cause.
+        self.replay_cohort = {'backstop': 0,
                               'expired': 0, 'expired_undrawn': 0,
                               'expired_drawn': 0, 'expired_draws_sum': 0,
                               'expired_delta_sum': 0.0, 'expired_delta_n': 0}
@@ -347,11 +337,11 @@ class Modeller:
         # live batch size at step-time resolution: paired with train_step_time
         # this makes every run a samples/sec-vs-batch knee scan for free
         metrics['Batch Size'] = self.batch_size
-        # step-probe readings (empty dict unless step_probe.enabled). Read
+        # ray-calibration readings (empty dict unless ray_calibration.enabled). Read
         # probe/alpha_median against probe/alpha_iqr and probe/fit_*_rate: a
         # wandering median, or a rising downward/flat rate, voids the sensor
         # independently of what the alpha* values say.
-        metrics.update(self.step_probe.report())
+        metrics.update(self.ray_cal.report())
         metrics.update(getattr(self, '_replay_is_stats', {}) or {})
         # Memorisation sensor. replay/resid_vs_intake is the servo's input:
         # 1.0 = delay line, 1/e = 0.368 = the lambda*tau = 1 boundary, below
@@ -518,11 +508,16 @@ class Modeller:
             if tb_trains_z or any(getattr(c, k, 0) > 0 for k in
                                   ('emp_z', 'emp_z_persistent', 'z_level', 'db', 'subtb')):
                 trainers.append(mode)
+        stage_name = self.protocol.stage.name
         if not trainers:
-            print(f"WARNING [stage '{self.protocol.stage.name}']: no mode trains the flow "
-                  f"(Z) head -- every branch is freeze_z, or its TB reads a detached "
-                  f"persistent target with no emp_z/emp_z_persistent/z_level sidecar. "
-                  f"log_Z will not move for this stage.")
+            if getattr(self, '_z_untrained_warned_stage', None) != stage_name:
+                self._z_untrained_warned_stage = stage_name
+                print(f"WARNING [stage '{stage_name}']: no mode trains the flow "
+                      f"(Z) head -- every branch is freeze_z, or its TB reads a detached "
+                      f"persistent target with no emp_z/emp_z_persistent/z_level sidecar. "
+                      f"log_Z will not move for this stage.")
+        else:
+            self._z_untrained_warned_stage = None
 
     def set_energy_coeffs(self):
         """Live energy-function coefficients (e.g. bounding_coeff,
@@ -1218,14 +1213,17 @@ class Modeller:
         # head is LR-pinned separately, so folding it in would make alpha* rate a
         # composite step the servo would not control. Absent config block =>
         # disabled, so this is inert for every existing config.
-        sp_cfg = getattr(self.args, 'step_probe', None)
-        self.step_probe = StepProbe(
+        sp_cfg = getattr(self.args, 'ray_calibration', None)
+        self.ray_cal = RayCalibration(
             [p for g in get_policy_params(self.gfn_model) for p in g['params']],
-            cadence=getattr(sp_cfg, 'cadence', 20),
-            window=getattr(sp_cfg, 'window', 25),
+            alphas=tuple(getattr(sp_cfg, 'alphas', (0.0, 1.0, 2.0, 4.0, 8.0))),
+            n_sub=int(getattr(sp_cfg, 'n_sub', 8)),
+            period=int(getattr(sp_cfg, 'period', 500)),
             enabled=bool(getattr(sp_cfg, 'enabled', False)),
-            span=float(getattr(sp_cfg, 'span', 2.0)),
         )
+        # Announced HERE and not in LRController.__init__: the controller is built
+        # before the calibrator exists, so it cannot describe its own sensor there.
+        self.lr_controller.announce()
 
     def init_prior_dataset(self):
 
@@ -1777,9 +1775,7 @@ class Modeller:
         # actually taken. Sensor only -- measure() restores every parameter it
         # touches bitwise, and a probe that finds no step (non-finite gradient,
         # or mid-accumulation) tallies 'nostep' and returns without reading.
-        probe_armed = self.step_probe.arm(self.step_ind)
-        if probe_armed:
-            probe_batch, probe_coeffs, probe_source, probe_repeats = self._draw_probe_batch()
+        probe_armed = self.ray_cal.arm(self.step_ind)
 
         if accumulating:
             self.fused_accum_count += self.batch_size
@@ -1791,9 +1787,16 @@ class Modeller:
             self.step_loss(step_type, loss)
 
         if probe_armed:
-            self.step_probe.measure(
-                lambda: self._probe_loss(probe_batch, probe_coeffs, probe_source,
-                                         discretizer, probe_repeats))
+            # Sub-batches are drawn lazily, one at a time, inside measure(): the
+            # loop is sub-batch outer / alpha inner, so peak memory is one draw
+            # regardless of n_sub while every contrast stays within one batch.
+            def _loss(drawn):
+                batch, coeffs, source, repeats = drawn
+                return self._probe_loss(batch, coeffs, source, discretizer, repeats)
+
+            reading = self.ray_cal.measure(self._draw_probe_batch, _loss)
+            if reading is not None:
+                self.lr_controller.on_calibration(reading)
 
         if step_type == 'fused':
             self.record_fused_substep_losses(sub_losses)
@@ -2241,11 +2244,19 @@ class Modeller:
         # whose residual is defined over K same-terminal rollouts and which
         # asserts K > 1 -- so scoring a bwd draw at replay's K crashes in phase 1,
         # where replay does not exist yet and the fallback is the only path.
-        if getattr(self, 'replay_buffer', None) is not None and len(self.replay_buffer) > 0:
-            k = self.mode_repeats('replay')
-            return self.draw_replay_sample(k), self.args.replay_loss_coeffs, 'replay', k
-        k = self.mode_repeats('bwd')
-        return self.draw_bwd_sample(k), self.args.bwd_loss_coeffs, 'bwd', k
+        # REPLAY ONLY, and the fallback to bwd is deliberately GONE. The whole
+        # calibration rests on evaluating one fixed batch at several alpha, and
+        # that requires the batch to carry its STORED trajectories: a replay draw
+        # does (return_traj=True), a bwd/dataset draw sets traj = None, so
+        # get_gfn_backward_loss would re-sample a fresh backward trajectory at
+        # every alpha. The differences would then be dominated by trajectory
+        # noise rather than by the step -- pairing silently broken, and the CI
+        # would report high confidence in nothing. Returning None instead makes
+        # the calibration visibly skip (raycal/skipped) rather than lie.
+        if getattr(self, 'replay_buffer', None) is None or len(self.replay_buffer) == 0:
+            return None
+        k = self.mode_repeats('replay')
+        return self.draw_replay_sample(k), self.args.replay_loss_coeffs, 'replay', k
 
     @torch.no_grad()
     def _probe_loss(self, batch, coeffs, source, discretizer, repeats):
@@ -2973,11 +2984,22 @@ Two things deliberately NOT done here, both recorded in
             return None
         return float(getattr(cfg, 'kappa', 1.0))
 
+    def replay_priority_symmetric(self):
+        """`prioritise.symmetric` (default False): draw on |delta|^kappa instead
+        of delta_plus^kappa, admitting UNDER-weighted rows (delta < 0) into the
+        eligible set instead of zeroing them. See F-003 (docs/findings.md) --
+        the default one-sided draw measurably leaves the forward tail
+        uncorrected; this is the untested alternative it names. Absent =>
+        False, so inert for every existing config."""
+        cfg = getattr(self.args.buffers.replay_buffer, 'prioritise', None)
+        return bool(getattr(cfg, 'symmetric', False))
+
     def draw_replay_sample(self, repeats):
         # Prioritised-IS draw (docs/to_do_rebuild.md B5): p ~ delta_plus^kappa
-        # with the row weights that undo it. delta is reconstructed from the
-        # buffer's ema_logw against the live log Z -- signed, which |resid|
-        # is not. self._replay_is_w carries the drawn rows' weights to
+        # (or |delta|^kappa under prioritise.symmetric) with the row weights
+        # that undo it. delta is reconstructed from the buffer's ema_logw
+        # against the live log Z -- signed, which |resid| is not.
+        # self._replay_is_w carries the drawn rows' weights to
         # replay_train_step.
         kappa = self.replay_priority_config()
         p = None
@@ -2985,7 +3007,8 @@ Two things deliberately NOT done here, both recorded in
         if kappa is not None:
             log_z = self.current_log_z()
             if log_z is not None:
-                p, w_row = self.replay_buffer.prioritised_weights(log_z, kappa=kappa)
+                p, w_row = self.replay_buffer.prioritised_weights(
+                    log_z, kappa=kappa, symmetric=self.replay_priority_symmetric())
 
         # beta is the fraction of the batch drawn UNIFORMLY, not a temperature:
         # _sample_indices splits the batch into n_uniform = batch*beta and
@@ -3380,6 +3403,111 @@ Two things deliberately NOT done here, both recorded in
                 sample_batch.packing_coeff < 0.95)
         metrics["Reasonable Sample Fraction"] = sample_is_good.float().mean().item()
 
+        # 'Reasonable Sample Fraction' just above is an ABSOLUTE, hand-set
+        # physical window. This is the distribution-relative counterpart: how
+        # much of the batch is so far above its own condition's best known
+        # energy that no realisable density of states could explain it.
+        self.log_nonthermal_tail(arr, fwd_stats, log_T_tensor, log_r, metrics)
+
+    def log_nonthermal_tail(self, arr, fwd_stats, log_T_tensor, log_r, metrics):
+        """
+        The high-energy tail stated DIRECTLY, rather than inferred from mean
+        energy, reasonable-sample fraction or an effective temperature.
+
+        Per sample, the reduced excess energy -- its log-Boltzmann deficit
+        against the best state known for its own condition:
+
+            u = (E - Emin(c)) / T   ==   log R*(c) - log R
+
+        u is in nats and is already both condition- and temperature-reduced,
+        so it pools legitimately across a mixed-condition, mixed-T eval batch
+        (unlike a raw energy, and unlike r2 -- module_metrics.md T0).
+
+        HOW BIG IS OBVIOUSLY NON-THERMAL? Under any Boltzmann target, drawing a
+        state u nats up costs e^-u, and the only thing that can pay for it is
+        the number of states available up there:
+
+            P(u > u*) = int_{u>u*} g(E) e^-E/T dE / Z  <=  (V_acc / V_ref) e^-u*
+
+        so log P <= S - u*, where S = log(V_acc / V_ref) is the ENTROPY BUDGET
+        -- the log-ratio of accessible configuration volume to that of the
+        reference low-energy region. The latents live in a bounded box, so S is
+        finite and extensive in the latent dimension:
+
+            u* = data_ndim * nonthermal_entropy_per_dim
+
+        with s = nonthermal_entropy_per_dim the per-axis budget in nats. Two
+        equivalent readings of the default s = 4 (u* = 48 at data_ndim 12): as a
+        pure entropy budget it grants the reference region as little as e^-4 ~
+        1.8% of each axis; or, taking anchor_buffer's dup_cutoff (5% of an axis)
+        as the reference size instead, S = 12*log(1/0.05) = 36 and the remaining
+        12 nats are rarity margin, e^-12 ~ 1 draw in 1.6e5. Either way it is a
+        conservative bar, which is what 'obviously' requires.
+
+        `Nonthermal Fraction` is then the fraction of the batch that NO density
+        of states this problem could have is able to explain -- a strictly
+        stronger claim than 'high energy'. At elj/T=2.5 with data_ndim 12 and
+        s=4, u* = 48 nats = 120 kJ/mol above Emin(c), well past anchor_buffer's
+        thin_energy_window (50 kJ/mol, 'hopeless under any reweighting').
+
+        The threshold is one bar on a distribution, so the tail's SHAPE is
+        logged next to it: a fraction that is 0 while P99 climbs is a tail
+        growing under the bar, which is the same event seen earlier.
+
+        Emin(c) is the running per-condition record from condition_log_z, which
+        fwd_eval_sampling has already updated with THIS batch, so u >= 0 by
+        construction on that path and the metric cannot be flattered by a batch
+        that is uniformly bad. The mirror-image weakness: early in a run Emin(c)
+        is only as deep as what has been seen, so the tail is UNDER-reported
+        until the records mature. Same direction as the other soft spot --
+        non-finite energies are patched to 0 upstream (molecular_crystal.py's
+        generator_energy), so a numerically blown-up sample reads as mildly
+        excited rather than as tail. Both make this a lower bound on the tail;
+        neither can manufacture one.
+
+        Conditions with no record yet are excluded and counted in
+        `Excess Energy Referenced Fraction`. Off when
+        nonthermal_entropy_per_dim is 0 or null.
+        """
+        s_per_dim = getattr(self.args, 'nonthermal_entropy_per_dim', 4.0)
+        s_per_dim = 0.0 if s_per_dim is None else float(s_per_dim)
+        condition_id = fwd_stats.get('condition_id')
+        if s_per_dim <= 0 or condition_id is None:
+            return
+        floor = self._condition_energy_floor(condition_id)
+        if floor is None:  # pre-bootstrap: no tracker and no anchors to measure against
+            return
+
+        temperature = (10 ** log_T_tensor).detach().cpu().flatten()
+        energy = -log_r.detach().cpu().flatten() * temperature
+        floor = floor.detach().cpu().flatten().to(energy.dtype)
+        seen = torch.isfinite(floor)
+        metrics['Excess Energy Referenced Fraction'] = seen.float().mean().item()
+        if not bool(seen.any()):
+            return
+
+        # clamped at 0: a negative excess means this sample IS the new record
+        # for its condition, reachable only on the anchor-buffer fallback path
+        # (which this batch has not been folded into). That is not a tail event.
+        u = ((energy[seen] - floor[seen]) / temperature[seen]).clamp_min(0.0)
+        u_star = s_per_dim * float(self.energy_function.data_ndim)
+
+        metrics['Nonthermal Fraction'] = (u > u_star).float().mean().item()
+        q = torch.quantile(u, torch.tensor([0.5, 0.9, 0.99], dtype=u.dtype))
+        metrics['Excess Energy Nats Mean'] = u.mean().item()
+        metrics['Excess Energy Nats P50'] = q[0].item()
+        metrics['Excess Energy Nats P90'] = q[1].item()
+        metrics['Excess Energy Nats P99'] = q[2].item()
+        metrics['Excess Energy Nats Max'] = u.max().item()
+        metrics['Excess Energy Nats'] = arr(torch.log10(1.0 + u))  # log10 hist: u is non-negative and heavy-tailed
+
+        # the bar itself, emitted only when it moves: a reading in nats is
+        # uninterpretable later without the threshold it was scored against
+        # (module_metrics.md S3), but it is a setting, not a series
+        if self._settings_log_cache.get('Nonthermal Threshold') != u_star:
+            metrics['Nonthermal Threshold'] = u_star
+            self._settings_log_cache['Nonthermal Threshold'] = u_star
+
     def update_mle_gate(self):
         """
         MLE flatness gate, publishing gates/mle_flat for the warm-start
@@ -3554,6 +3682,26 @@ Two things deliberately NOT done here, both recorded in
 
         return metrics
 
+    def _buffer_core_stats(self, buff, prefix, loss_clip_min=0):
+        """Length/steps/loss/energy readout shared by prior_buffer and
+        replay_buffer -- both are CrystalBuffers scored by select_counts +
+        ema_loss. loss_clip_min differs per caller (prior allows slightly
+        negative log-loss; replay clips at 0)."""
+        metrics = {
+            f'{prefix}_length': len(buff),
+            f'{prefix}_mean_steps': torch.nanmean(buff.select_counts.float()).item(),
+            f'{prefix}_median_steps': torch.nanmedian(buff.select_counts.float()).item(),
+            f'{prefix}_mean_loss': torch.nanmean(buff.ema_loss).item(),
+            f'{prefix}_median_loss': torch.nanmedian(buff.ema_loss).item(),
+            f'{prefix}_step_hist': safe_histogram(buff.select_counts.cpu().numpy()),
+        }
+        metrics.update(self.energy_stats(prefix, energy=buff.y))
+        valid_losses = buff.ema_loss[~torch.isnan(buff.ema_loss)].cpu().numpy()
+        if len(valid_losses) > 0:
+            metrics[f'{prefix}_loss_hist'] = safe_histogram(
+                np.clip(np.log10(valid_losses), min=loss_clip_min, max=3))
+        return metrics
+
     def log_buffer_stats(self):
         # report on whatever backward is actually drawing from this stage:
         # the prior_buffer whenever bwd samples 'prior' (churned or -- in the
@@ -3569,18 +3717,7 @@ Two things deliberately NOT done here, both recorded in
 
         metrics = {}
         if buff is not None:
-            valid_losses = buff.ema_loss[~torch.isnan(buff.ema_loss)].cpu().numpy()
-            metrics.update({
-                'prior_buffer_length': len(buff),
-                'prior_buffer_mean_steps': torch.nanmean(buff.select_counts.float()).item(),
-                'prior_buffer_median_steps': torch.nanmedian(buff.select_counts.float()).item(),
-                'prior_buffer_mean_loss': torch.nanmean(buff.ema_loss).item(),
-                'prior_buffer_median_loss': torch.nanmedian(buff.ema_loss).item(),
-                'prior_buffer_step_hist': safe_histogram(buff.select_counts.cpu().numpy()),
-            })
-            metrics.update(self.energy_stats('prior_buffer', energy=buff.y))
-            if len(valid_losses) > 0:
-                metrics['prior_buffer_loss_hist'] = safe_histogram(np.clip(np.log10(valid_losses), min=-1, max=3))
+            metrics.update(self._buffer_core_stats(buff, 'prior_buffer', loss_clip_min=-1))
 
         # Prior churn decomposed by source, accumulated since the previous eval's
         # drain (manage_prior_buffer runs inside eval, immediately before this) and
@@ -3624,15 +3761,9 @@ Two things deliberately NOT done here, both recorded in
             churn[key] = 0
 
         if hasattr(self, 'replay_buffer'):
-            valid_replay_losses = self.replay_buffer.ema_loss[~torch.isnan(self.replay_buffer.ema_loss)].cpu().numpy()
+            metrics.update(self._buffer_core_stats(self.replay_buffer, 'replay_buffer'))
             replay_age = (self.step_ind - self.replay_buffer.birth_step).float()
             metrics.update({
-                'replay_buffer_length': len(self.replay_buffer),
-                'replay_buffer_mean_steps': torch.nanmean(self.replay_buffer.select_counts.float()).item(),
-                'replay_buffer_median_steps': torch.nanmedian(self.replay_buffer.select_counts.float()).item(),
-                'replay_buffer_mean_loss': torch.nanmean(self.replay_buffer.ema_loss).item(),
-                'replay_buffer_median_loss': torch.nanmedian(self.replay_buffer.ema_loss).item(),
-                'replay_buffer_step_hist': safe_histogram(self.replay_buffer.select_counts.cpu().numpy()),
                 'replay_buffer_mean_age': replay_age.mean().item(),
                 'replay_buffer_max_age': replay_age.max().item() if replay_age.numel() > 0 else 0.0,
                 # WIDTH of the residence distribution, not its centre: this is
@@ -3658,13 +3789,6 @@ Two things deliberately NOT done here, both recorded in
                 metrics['replay_buffer_live_delta_mean'] = live_delta.mean().item()
                 metrics['replay_buffer_live_delta_stalled_frac'] = (
                     (live_delta >= 0).float().mean().item())
-            if hasattr(self, '_replay_admit_cap'):
-                metrics['replay_buffer_admit_cap'] = self._replay_admit_cap
-                metrics['replay_buffer_admit_health'] = self._replay_admit_health
-            metrics.update(self.energy_stats('replay_buffer', energy=self.replay_buffer.y))
-            if len(valid_replay_losses) > 0:
-                metrics['replay_buffer_loss_hist'] = safe_histogram(
-                    np.clip(np.log10(valid_replay_losses), min=0, max=3))
 
             # churn accumulated since the previous eval's drain, i.e. one full
             # eval period of train steps; drained here so the counts are a rate
@@ -3675,8 +3799,8 @@ Two things deliberately NOT done here, both recorded in
                 'replay_buffer_evicted': self.replay_churn['evicted'],
                 'replay_buffer_turnover': admitted / max(len(self.replay_buffer), 1),
                 # candidates hard-excluded by admit_reward_min this window --
-                # counted pre-softmax over the whole batch, so this is a rate
-                # against sampled candidates, not against churn_rate
+                # counted upstream of eligibility over the whole batch, so
+                # this is a rate against sampled candidates, not churn_rate
                 'replay_buffer_reward_rejected': self.replay_churn['reward_rejected'],
             })
             for key in self.replay_churn:
@@ -3684,24 +3808,19 @@ Two things deliberately NOT done here, both recorded in
 
             # Eviction-cause readouts (see manage_replay_buffer's tally
             # comments). The *_frac keys are shares of everything evicted this
-            # window and are the primary diagnostic: under the old hard TTL
-            # absorbed_frac read 0.000 while age silently did 100% of eviction,
-            # which is precisely the failure that was invisible without this
-            # split. absorbed = corrected below the floor (replay finished the
-            # row); stalled = drawn >= toxic_min_draws with no improvement
-            # since admission (unincorporable); backstop = hit the absolute age
-            # ceiling, which should stay NEAR ZERO -- a non-trivial backstop
-            # share means tau is set too long for the intake rate. hazard =
-            # ordinary memoryless turnover and should dominate.
+            # window and are the primary diagnostic: under the old hard TTL,
+            # age silently did 100% of eviction and that was invisible without
+            # this split. backstop = hit the absolute age ceiling, which
+            # should stay NEAR ZERO -- a non-trivial share means tau is set
+            # too long for the intake rate. hazard = ordinary memoryless
+            # turnover and should dominate.
             # expired_* keys describe the hazard cohort: expired_undrawn_frac =
             # evicted without a single draw (wasted slots), expired_delta =
             # mean death-minus-birth |resid| (negative = the live population is
             # being incorporated), expired_draws = draws received.
             coh = self.replay_cohort
-            resolved = coh['absorbed'] + coh['stalled'] + coh['backstop'] + coh['expired']
+            resolved = coh['backstop'] + coh['expired']
             if resolved > 0:
-                metrics['replay_buffer_absorbed_frac'] = coh['absorbed'] / resolved
-                metrics['replay_buffer_stalled_frac'] = coh['stalled'] / resolved
                 metrics['replay_buffer_backstop_frac'] = coh['backstop'] / resolved
                 metrics['replay_buffer_hazard_frac'] = coh['expired'] / resolved
             if coh['expired'] > 0:
@@ -3710,7 +3829,7 @@ Two things deliberately NOT done here, both recorded in
                 metrics['replay_buffer_expired_delta'] = coh['expired_delta_sum'] / coh['expired_delta_n']
             if coh['expired_drawn'] > 0:
                 metrics['replay_buffer_expired_draws'] = coh['expired_draws_sum'] / coh['expired_drawn']
-            self.replay_cohort = {'absorbed': 0, 'stalled': 0, 'backstop': 0,
+            self.replay_cohort = {'backstop': 0,
                                   'expired': 0, 'expired_undrawn': 0,
                                   'expired_drawn': 0, 'expired_draws_sum': 0,
                                   'expired_delta_sum': 0.0, 'expired_delta_n': 0}
@@ -4392,39 +4511,39 @@ Two things deliberately NOT done here, both recorded in
         over- or under-weighted terminals, so they can be replayed exactly
         (get_traj_replay) instead of re-sampled backward.
 
-        SCORED path (default). Score candidates by |resid| (admission) or
-        ema_loss (purge), CLIP to `cap`, then draw without replacement from
-        softmax(score / admit_temperature). Clip-then-divide keeps `cap` an
-        absolute nats bound independent of T. Everything past `cap` is
-        indifferent, so no single outlier monopolises admission. Purge mirrors
-        it: LOW ema_loss (already-corrected rows) gets high eviction weight.
+        ADMISSION is unconditionally uniform over the sane pool (decisions.md
+        D5, to_do_rebuild.md Phase 3 step 3). Selection lives entirely at the
+        DRAW (buffers.replay_buffer.prioritise, draw_replay_sample): p ~
+        delta_plus^kappa with self-normalised IS weights that undo it. A
+        residual-scored admission rule would shape the buffer's density on
+        top of that correction, re-entering the force spectrum uncorrected
+        and counting the residual twice.
 
-        `cap` is health-modulated:
+        PURGE is hazard (memoryless) + backstop (age) only -- both are
+        residual-independent, so p_survive drops out of the IS weight cleanly.
+        The old residual-dependent causes (floor: ema_loss corrected below a
+        threshold; stalled: drawn >= toxic_min_draws and not improving) are
+        retired: once the draw itself is prioritised, a corrected row already
+        draws at p ~ 0, so they were buying memory, not gradient budget, and
+        hazard reclaims that memory without reintroducing a residual-dependent
+        survival probability (see the toxic_min_draws ValueError below).
 
-            cap(h) = cap_min + (cap_max - cap_min) / (1 + h / h0)
-            h      = EMA of fwd/scatter_err
+        Not just a variance-reduction gap -- it fabricated evidence. A row
+        driven to delta ~ 0 by repeated replay IS the memorisation sensor's
+        positive case (birth_loss vs ema_loss); floor/stalled purging it
+        early would have deleted the evidence the sensor reads.
 
-          healthy   cap -> cap_max, softmax sharply prefers the worst survivors
-          unhealthy cap -> cap_min, admission goes near-uniform: a
-                    representative snapshot of the current bad distribution,
-                    and the buffer stays populated through the excursion
+        DISPLACEMENT purge (freeing headroom beyond what toxic eviction frees)
+        is uniform-random over the live pool, same reasoning: no residual-
+        scored cap survives now that admission itself carries none.
 
-        ⚠ h is a FWD metric, so a degrading fwd branch tightens the cap and
-        admission stops skimming the hard tail -- exactly when replay's
-        correction is most needed. Watch replay/birth_loss_mean falling while
-        fwd/scatter_err rises.
+        Negative-residual rows are admitted deliberately: they are dormant,
+        not dead (delta moves as the policy moves), they draw with p ~ 0 under
+        delta_plus so they cost memory rather than gradient budget, and
+        filtering them CENSORS rather than reweights -- a row admitted at
+        delta < 0 that would have gone positive is unrecoverable.
 
-        T stays FIXED. It governs shoulder sharpness only; making it
-        health-dependent would re-couple that to health, which `cap` already
-        handles.
-
-        UNIFORM path (buffers.replay_buffer.prioritise): intake is uniform over
-        the sane pool and the two residual-dependent purge causes are switched
-        off, because prioritisation moves to the DRAW where the IS weight
-        divides it back out. Anything else residual-dependent would re-enter
-        the force spectrum uncorrected.
-
-        Hard exclusions, both upstream of the softmax and applied on both paths:
+        Hard exclusions, upstream of admission and applied unconditionally:
         non-finite log_r/resid, and log_r < admit_reward_min. Eligibility is a
         BADNESS criterion, so without a reward floor the buffer's energy
         distribution is unbounded above.
@@ -4443,51 +4562,16 @@ Two things deliberately NOT done here, both recorded in
 
         rb_cfg = self.args.buffers.replay_buffer
         # Absolute reward floor, on the same hard-exclude footing as the
-        # finiteness check above and deliberately NOT part of the softmax
-        # score: admission is scored purely on |resid|, so without this a
-        # physically garbage state is admitted at full weight the moment the
-        # policy is badly calibrated on it, and the capped purge score then
-        # can't tell it apart from a merely-mediocre incumbent (every row at
-        # or above the cap shares one eviction weight). None disables.
+        # finiteness check above: without it a physically garbage state is
+        # admitted at full weight the moment the policy is badly calibrated
+        # on it. None disables.
         reward_min = getattr(rb_cfg, 'admit_reward_min', None)
         if reward_min is not None:
             below = sane & (log_r_cpu < float(reward_min))
             self.replay_churn['reward_rejected'] += int(below.sum())
             sane &= ~below
 
-        floor = 0.1  # pool-definition cutoff only -- all real discrimination
-        # happens in the softmax + cap below, not in this threshold
-
-        h = self.metric_tracker.get('fwd', 'scatter_err')
-        h = max(float(h), 0.0) if h is not None else 0.0  # cold start: treat as healthy
-        cap_max = float(rb_cfg.admit_cap_max)
-        cap_min = float(rb_cfg.admit_cap_min)
-        h0 = float(rb_cfg.admit_cap_health_h0)
-        cap = cap_min + (cap_max - cap_min) / (1.0 + h / h0)
-        T = float(rb_cfg.admit_temperature)
-        self._replay_admit_cap = cap
-        self._replay_admit_health = h
-
-        # UNIFORM INTAKE (docs/to_do_rebuild.md B7b) when the prioritised draw
-        # is on. Every selective admission step multiplies into the buffer's
-        # density -- mu_buf ~ Q_admit * p_admit * p_survive -- and the draw's
-        # importance weight divides by the DRAW only, so a residual-dependent
-        # admission rule re-enters the force spectrum uncorrected, counting the
-        # residual twice and once stale. Gates may depend on energy, age, or
-        # randomness; never on the residual.
-        #
-        # Negative-residual rows are admitted deliberately: they are dormant,
-        # not dead (delta moves as the policy moves), they draw with p ~ 0 under
-        # delta_plus so they cost memory rather than gradient budget, and
-        # filtering them CENSORS rather than reweights -- a row admitted at
-        # delta < 0 that would have gone positive is unrecoverable.
-        uniform_intake = self.replay_priority_config() is not None
-        if uniform_intake:
-            elig = torch.argwhere(sane).flatten()
-            clipped_score = torch.ones(elig.numel(), device=resid.device)
-        else:
-            elig = torch.argwhere(sane & (resid.abs() > floor)).flatten()
-            clipped_score = resid[elig].abs().clamp(max=cap)
+        elig = torch.argwhere(sane).flatten()
         # trajectories go wherever the buffer lives -- no forced D2H when GPU-resident
         flow_states = fwd_stats['flow_states'].detach().to(self.buffer_device)
 
@@ -4495,7 +4579,7 @@ Two things deliberately NOT done here, both recorded in
         if not hasattr(self, 'replay_buffer'):
             if elig.numel() == 0:
                 return
-            add_inds = elig[_softmax_draw(clipped_score, rb_cfg.max_size, T)]
+            add_inds = elig[_uniform_draw(elig.numel(), rb_cfg.max_size)]
             self.replay_buffer = CrystalBuffer(
                 sample_batch.subsample_new_batch(add_inds),
                 device=self.buffer_device,
@@ -4517,108 +4601,77 @@ Two things deliberately NOT done here, both recorded in
         ema = self.replay_buffer.ema_loss
         n = len(self.replay_buffer)
 
-        # --- eviction, four causes. None shapes the BULK of the age
-        # distribution, which is the point.
-        #   floor     ema_loss corrected below the floor. Residual-dependent.
-        #   stalled   drawn >= toxic_min_draws and not improving since
-        #             admission. Residual-dependent. Fires at any age.
-        #   hazard    memoryless: evict n/tau rows per call, uniformly at
-        #             random -> exponential residence, mean tau, CV ~1. A WIDE
-        #             lag distribution, so a strong lowpass on the
-        #             policy->buffer->gradient path. A hard age cap instead
-        #             gives a uniform age profile with a sharp edge, which
-        #             concentrates phase lag at one frequency.
-        #   backstop  hard ceiling at backstop_mult * tau, binding on
-        #             ~exp(-backstop_mult) of rows. Bounds worst-case staleness
-        #             without reshaping the bulk.
-        # floor and stalled are DISABLED under prioritise: the draw's IS weight
-        # divides out the draw only, so a residual-dependent survival
-        # probability re-enters the force spectrum uncorrected. They are also
-        # what makes the memorisation sensor unbiased -- birth_loss is the
-        # intake distribution OF SURVIVORS, which equals intake only if
-        # survival is residual-independent.
-        # Occupancy is emergent (Little's law: n = admit_rate * tau); max_size
-        # is a memory guard, not a target. Eviction is proportional to n, so
-        # occupancy decays toward the intake equilibrium rather than falling off
-        # a cliff at a fixed age.
-        # The hazard budget is per manage CALL, matching churn_rate.
         if getattr(rb_cfg, 'max_residence_steps', None) is not None:
             raise ValueError(
                 "buffers.replay_buffer.max_residence_steps is retired -- the hard age "
                 "cap was doing 100% of eviction and culling the improving tail. Replace "
-                "it with mean_residence_steps (memoryless hazard) + toxic_min_draws "
-                "(stalled-row eviction); backstop_mult defaults to 5. Sizing is now "
-                "Little's law: occupancy = churn_rate * mean_residence_steps.")
+                "it with mean_residence_steps (memoryless hazard); backstop_mult "
+                "defaults to 5. Sizing is now Little's law: occupancy = churn_rate * "
+                "mean_residence_steps.")
+        if getattr(rb_cfg, 'toxic_min_draws', None) or getattr(rb_cfg, 'toxic_delta_threshold', None):
+            raise ValueError(
+                "buffers.replay_buffer.toxic_min_draws/toxic_delta_threshold are retired "
+                "-- the stalled-row purge they fed was residual-dependent, exactly "
+                "redundant with hazard+backstop once the draw itself is prioritised "
+                "(weighted sampling already drives a corrected row's draw probability "
+                "to ~0; hazard reclaims its memory without reintroducing survival bias). "
+                "Remove both keys; eviction is hazard+backstop only now.")
 
-        # HAZARD-ONLY PURGE under the prioritised scheme (B7b). floor and
-        # stalled both condition p_survive on the residual, which biases the
-        # population exactly as residual-dependent admission does. Two further
-        # reasons they go:
-        #   - under a delta_plus^kappa draw a corrected row already has p ~ 0,
-        #     so the floor was never buying gradient budget, only memory --
-        #     and the hazard reclaims memory without the bias.
-        #   - a row driven to delta ~ 0 BY REPEATED REPLAY is delta ~ 0 at that
-        #     exact trajectory, i.e. memorisation. The low value is the
-        #     EVIDENCE the weighted_replay_err >= fwd_err precept reads;
-        #     purging it destroys the signal.
-        # hazard (uniform-random) and backstop (age) stay: both are independent
-        # of the residual, so p_survive drops out of the weight.
-        floor_mask = (torch.zeros_like(ema, dtype=torch.bool) if uniform_intake
-                      else ema < floor)
+        # EVICTION, two causes -- neither shapes the bulk of the age
+        # distribution, which is the point:
+        #   hazard    memoryless: evict n/tau rows per call, uniformly at
+        #             random -> exponential residence, mean tau, CV ~1. A WIDE
+        #             lag distribution, so a strong lowpass on the
+        #             policy->buffer->gradient path.
+        #   backstop  hard ceiling at backstop_mult * tau, binding on
+        #             ~exp(-backstop_mult) of rows. Bounds worst-case staleness
+        #             without reshaping the bulk.
+        # Both are residual-independent, so p_survive drops out of the IS
+        # weight cleanly -- no residual-scored purge cause survives now that
+        # the draw itself carries the prioritisation (see the retirement
+        # ValueError above for what used to live here and why it's gone).
+        # Occupancy is emergent (Little's law: n = admit_rate * tau); max_size
+        # is a memory guard, not a target. Eviction is proportional to n, so
+        # occupancy decays toward the intake equilibrium rather than falling off
+        # a cliff at a fixed age. The hazard budget is per manage CALL, matching
+        # churn_rate.
         age = self.step_ind - self.replay_buffer.birth_step
-
-        stalled_mask = torch.zeros_like(floor_mask)
-        min_draws = 0 if uniform_intake else int(getattr(rb_cfg, 'toxic_min_draws', 0) or 0)
-        if min_draws > 0:
-            delta_thresh = float(getattr(rb_cfg, 'toxic_delta_threshold', 0.0))
-            delta = ema - self.replay_buffer.birth_loss
-            stalled_mask = ((self.replay_buffer.select_counts >= min_draws)
-                            & torch.isfinite(delta) & (delta >= delta_thresh))
-
         tau = float(getattr(rb_cfg, 'mean_residence_steps', 0) or 0)
-        expired_mask = torch.zeros_like(floor_mask)
-        hazard_mask = torch.zeros_like(floor_mask)
+        expired_mask = torch.zeros(n, dtype=torch.bool)
+        hazard_mask = torch.zeros(n, dtype=torch.bool)
         if tau > 0:
             backstop = int(tau * float(getattr(rb_cfg, 'backstop_mult', 5.0)))
             if backstop > 0:
                 expired_mask = age > backstop
-            # hazard draws only from rows no other cause already claimed, so
+            # hazard draws only from rows backstop didn't already claim, so
             # the per-call budget is not silently spent on rows that were
             # leaving anyway
-            surv = torch.argwhere(~(floor_mask | stalled_mask | expired_mask)).flatten()
+            surv = torch.argwhere(~expired_mask).flatten()
             n_hazard = int(round(surv.numel() / tau))
             if n_hazard > 0:
                 hazard_mask[surv[torch.randperm(surv.numel())[:n_hazard]]] = True
 
-        toxic_mask = floor_mask | stalled_mask | expired_mask | hazard_mask
+        toxic_mask = expired_mask | hazard_mask
         toxic = torch.argwhere(toxic_mask).flatten()
 
-        # --- TTL-cohort telemetry, tallied by eviction CAUSE. Floor eviction =
-        # absorbed (a row admitted above the floor only gets under it by being
-        # drawn and corrected). TTL expiry = death-by-clock, exogenous to the
-        # loss value, so death-vs-birth deltas on that cohort carry no
-        # selection-on-outcome bias -- unlike floor/displacement evictions,
-        # which are excluded from the delta for exactly that reason. NB an
-        # undrawn row's ema never updates after admission (update_losses only
-        # touches drawn rows), so deltas are only defined on the drawn subset;
-        # undrawn expiries are counted separately as wasted slots.
-        self.replay_cohort['absorbed'] += int(floor_mask.sum())
-        self.replay_cohort['stalled'] += int((stalled_mask & ~floor_mask).sum())
-        self.replay_cohort['backstop'] += int(
-            (expired_mask & ~(floor_mask | stalled_mask)).sum())
-        # Death-vs-birth deltas are now tallied on the HAZARD cohort. Random
-        # eviction is independent of the loss value AND of age, so it is the
+        # --- cohort telemetry. backstop is tallied as a plain count. Death-vs
+        # -birth deltas are tallied on the HAZARD cohort specifically: random
+        # eviction is independent of both the loss value and age, so it's the
         # one exit carrying no selection bias in either direction -- it reads
-        # the live population. The old TTL cohort was exogenous to the loss but
-        # NOT to age, so it over-sampled exactly the long-lived high-|resid|
-        # rows the displacement softmax protects, which is what made the -28
-        # nat delta ambiguous between "learning" and "survivor composition".
-        expired_only = hazard_mask
-        n_expired = int(expired_only.sum())
+        # the live population. (An age-based TTL cohort would over-sample the
+        # long-lived high-|resid| rows the draw protects, which is what made
+        # an earlier version of this delta ambiguous between "learning" and
+        # "survivor composition".) NB an undrawn row's ema never updates after
+        # admission (update_losses only touches drawn rows), so deltas are
+        # only defined on the drawn subset; undrawn expiries are counted
+        # separately as wasted slots.
+        self.replay_cohort['backstop'] += int(expired_mask.sum())
+        hazard_cohort = hazard_mask
+        n_expired = int(hazard_cohort.sum())
         if n_expired > 0:
-            counts = self.replay_buffer.select_counts[expired_only]
+            counts = self.replay_buffer.select_counts[hazard_cohort]
             drawn = counts > 0
-            delta = (ema[expired_only] - self.replay_buffer.birth_loss[expired_only])[drawn]
+            delta = (ema[hazard_cohort] - self.replay_buffer.birth_loss[hazard_cohort])[drawn]
             delta = delta[torch.isfinite(delta)]
             self.replay_cohort['expired'] += n_expired
             self.replay_cohort['expired_undrawn'] += int((~drawn).sum())
@@ -4627,33 +4680,31 @@ Two things deliberately NOT done here, both recorded in
             self.replay_cohort['expired_delta_sum'] += float(delta.sum())
             self.replay_cohort['expired_delta_n'] += int(delta.numel())
 
-        # --- admission: draw without replacement from softmax(clipped
-        # |resid| / T) over this batch's eligible pool, budgeted churn_rate
-        # rows PER MANAGE CALL (one call per fwd/fused train step, plus one
-        # per eval). SUPPLY-side pacing, deliberately: v1 paced this by
-        # elapsed REPLAY steps (demand-side), which deadlocked -- replay only
-        # runs on a non-empty buffer, so the admission budget required replay
-        # steps while replay steps required admissions. Any TTL mass-expiry
-        # during a replay-dormant stage (z_match, replay frac 0.001) zeroed
-        # the buffer PERMANENTLY, and buildout then rode the variance blowup
-        # into terminal-rewind sawtooths (tsched_july24: 10/14 arms died this
-        # way; survival = z_match duration < max_residence_steps, a race).
-        # Supply-side intake runs whether or not replay is training, so the
-        # buffer is warm whenever a stage wants to draw from it ---
+        # --- admission: uniform draw without replacement over this batch's
+        # eligible pool, budgeted churn_rate rows PER MANAGE CALL (one call
+        # per fwd/fused train step, plus one per eval). SUPPLY-side pacing,
+        # deliberately: v1 paced this by elapsed REPLAY steps (demand-side),
+        # which deadlocked -- replay only runs on a non-empty buffer, so the
+        # admission budget required replay steps while replay steps required
+        # admissions. Any TTL mass-expiry during a replay-dormant stage
+        # (z_match, replay frac 0.001) zeroed the buffer PERMANENTLY, and
+        # buildout then rode the variance blowup into terminal-rewind
+        # sawtooths (tsched_july24: 10/14 arms died this way; survival =
+        # z_match duration < max_residence_steps, a race). Supply-side intake
+        # runs whether or not replay is training, so the buffer is warm
+        # whenever a stage wants to draw from it ---
         n_admit = min(elig.numel(), int(rb_cfg.churn_rate))
-        add_inds = elig[_softmax_draw(clipped_score, n_admit, T)]
+        add_inds = elig[_uniform_draw(elig.numel(), n_admit)]
 
-        # --- purge: TTL/toxic eviction frees headroom first; softmax-drawn
-        # displacement of the weakest LIVE incumbents (low ema_loss = high
-        # eviction weight, same cap/T basis as admission) covers whatever
-        # admission needs beyond that ---
+        # --- purge: TTL/toxic eviction frees headroom first; a uniform-random
+        # draw over the LIVE incumbents covers whatever admission needs beyond
+        # that -- residual-independent, same reasoning as hazard/backstop ---
         headroom = max(0, rb_cfg.max_size - (n - toxic.numel()))
         n_extra_purge = max(0, add_inds.numel() - headroom)
         extra_purge = torch.zeros(0, dtype=torch.long)
         if n_extra_purge > 0:
             live = torch.argwhere(~toxic_mask).flatten()
-            purge_score = ema[live].clamp(max=cap)
-            extra_purge = live[_softmax_draw(-purge_score, n_extra_purge, T)]
+            extra_purge = live[_uniform_draw(live.numel(), n_extra_purge)]
 
         purge_idx = torch.cat([toxic, extra_purge])
 

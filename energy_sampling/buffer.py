@@ -918,6 +918,7 @@ class CrystalBuffer:
             kappa: float = 1.0,
             nan_quantile: float = 0.90,
             floor_frac: float = 0.25,
+            symmetric: bool = False,
     ):
         """
         Prioritised-IS sampling distribution over rows (docs/to_do_rebuild.md
@@ -929,7 +930,9 @@ class CrystalBuffer:
         i.e. the estimator is unbiased for the uniform-buffer average at every
         kappa. Only the VARIANCE changes with kappa -- that is the whole point
         of the kappa ladder, and it is why any difference a ladder measures is
-        estimator variance and nothing else.
+        estimator variance and nothing else. `symmetric` changes the ELIGIBLE
+        SET and therefore the TARGET this unbiasedness is relative to (see
+        below); it is not just another variance knob.
 
         THE RESIDUAL IS RECONSTRUCTED, NOT STORED. delta = log_Z - log_w, and
         ema_logw already carries a per-row EMA of log_w, so
@@ -940,11 +943,27 @@ class CrystalBuffer:
         here: it stores |resid|, and the sign is exactly what the one-sided
         priority needs.
 
-        ONE-SIDED BY DESIGN: delta_plus = max(delta, 0). A row the policy has
+        ONE-SIDED BY DEFAULT: delta_plus = max(delta, 0). A row the policy has
         moved off has a fallen log_pf and therefore a strongly NEGATIVE delta,
         so it takes priority ~0 automatically -- which is both the intended
         replay/backward split (B2) and, incidentally, most of what the drift
         term was introduced to do (B8).
+
+        ABSORBING STARVATION, one-sided mode only: p == 0 rows are never drawn,
+        and ema_logw is written ONLY at draw time (update_logw_stats, called
+        with the drawn `inds` -- train.py's replay_train_step). So a row that
+        falls to delta <= 0 has its ema_logw frozen -- delta can only re-cross
+        zero via log_z drifting back up past that stale value, not via the
+        row's own estimate being refreshed. That escape closes once log_z
+        converges, which is the expected end state, not a corner case: the
+        row's residual becomes a frozen, unfalsifiable snapshot for the rest of
+        the run. This is a plausible mechanism behind the monotonic
+        is_elig_frac drift F-003 measured (0.74 -> 0.33 over 1500 steps) --
+        a one-way exclusion ratchets, it does not equilibrate. `symmetric`
+        closes this trap as a side effect of what it is for: elig = |delta| > 0
+        is false only at exact float equality, so every row stays eligible,
+        gets floored, and keeps getting redrawn regardless of which side of
+        zero it is on -- there is no absorbing region left to fall into.
 
         Unvisited rows (ema_logw NaN) get the nan_quantile of the observed
         delta_plus, matching _loss_weights' policy: moderately hard, visited
@@ -954,7 +973,7 @@ class CrystalBuffer:
         median among eligible rows. It bounds the weight range, and it is the
         knob that decides whether this estimator is usable at all.
 
-        MEASURED 2026-08-07 against r2_wiring's live buffer (kappa=1, 1000-row
+        MEASURED 2026-08-07 against r2_wiring's live buffer (kappa=1, 1000-row  # todo shorten comment
         draws) -- the shipped 0.01 was far too permissive:
 
             floor_frac   ESS/n_drawn   max(w)/mean(w)
@@ -970,9 +989,11 @@ class CrystalBuffer:
         keeping most of the prioritisation. Watch replay/is_ess_frac; if it
         falls below ~0.3 this is the first knob to move.
 
-        floor_frac keeps a small uniform component so that a row at
-        delta_plus == 0 is not permanently unreachable (its delta can go
-        positive again as the policy moves) and so w stays bounded.
+        floor_frac keeps a small uniform component among ELIGIBLE rows, so a
+        row just barely above zero is not drawn at p ~ 0 with w ~ 1/p, and so w
+        stays bounded. It does NOT rescue rows already at delta_plus == 0 --
+        those are excluded outright (see ABSORBING STARVATION above), and the
+        floor never applies to them.
         """
         n = len(self)
         if n == 0:
@@ -985,18 +1006,26 @@ class CrystalBuffer:
             return p, np.ones(n, dtype=np.float64)
 
         delta = float(log_z) - logw
-        dplus = torch.clamp(delta, min=0.0)
-        dplus[~valid] = torch.quantile(dplus[valid], nan_quantile)
+        # score IS delta_plus in the default (one-sided) mode; `symmetric`
+        # swaps it for |delta|, which admits UNDER-weighted rows (delta < 0,
+        # the forward tail F-003 measured this draw leaving uncorrected) into
+        # the same eligible set instead of zeroing them. Everything below
+        # (nan fill, floor, kappa power, IS weight) is unchanged either way --
+        # only which rows have score > 0 differs.
+        score = delta.abs() if symmetric else torch.clamp(delta, min=0.0)
+        score[~valid] = torch.quantile(score[valid], nan_quantile)
 
-        # ELIGIBILITY: delta_plus == 0 rows are excluded from the draw outright
+        # ELIGIBILITY: score == 0 rows are excluded from the draw outright  # todo comment vastly too long
         # (p = 0), not floored into it. They contribute zero force by
-        # construction -- delta_plus IS the priority -- so the estimator's
-        # target is the uniform mean over the POSITIVE half, which is exactly
-        # what the replay branch is for (B2). Including them via a uniform floor
-        # is what made max(w) blow up to 1/floor_frac: a row drawn at
+        # construction -- score IS the priority -- so the estimator's target
+        # is the uniform mean over the eligible set (the positive half in the
+        # default mode; effectively the whole buffer under `symmetric`, since
+        # delta == 0 exactly is measure-zero), which is exactly what the
+        # replay branch is for (B2). Including them via a uniform floor is
+        # what made max(w) blow up to 1/floor_frac: a row drawn at
         # probability ~0 carries weight ~inf and single-handedly owns a
         # self-normalised batch.
-        elig = dplus > 0
+        elig = score > 0
         n_elig = int(elig.sum())
         if n_elig == 0:
             p = np.ones(n, dtype=np.float64) / n
@@ -1004,13 +1033,13 @@ class CrystalBuffer:
 
         # RELATIVE FLOOR on the surviving positive values, so the weight's
         # dynamic range is bounded by (median/floor)^kappa rather than by the
-        # smallest residual that happens to be in the buffer. w ~ 1/delta_plus^
-        # kappa is unbounded as delta_plus -> 0+, and a near-zero-but-positive
-        # row is exactly as uninformative as a zero one.
-        med = float(torch.median(dplus[elig]))
+        # smallest residual that happens to be in the buffer. w ~ 1/score^
+        # kappa is unbounded as score -> 0+, and a near-zero-but-positive row
+        # is exactly as uninformative as a zero one.
+        med = float(torch.median(score[elig]))
         floor_abs = max(floor_frac * med, 1e-12)
-        d = torch.where(elig, torch.clamp(dplus, min=floor_abs),
-                        torch.zeros_like(dplus))
+        d = torch.where(elig, torch.clamp(score, min=floor_abs),
+                        torch.zeros_like(score))
 
         raw = torch.pow(d.double(), float(kappa))
         raw[~elig] = 0.0

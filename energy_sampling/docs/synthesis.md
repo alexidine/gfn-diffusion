@@ -358,8 +358,14 @@ failures live.
 | [`audit_since_ty4xdlzo.md`](audit_since_ty4xdlzo.md) | code + config diff of the current HEAD against the trusted `ty4xdlzo` reference |
 | ~~`register.md`~~, ~~`questions.md`~~ | **deleted 2026-08-06** — consolidated into `decisions.md` after they drifted into contradicting each other. Do not recreate; new open items go straight there |
 
-**Convention worth knowing before cross-referencing.** Finding IDs are
-**module-local**: `B1…B10` in `module_buffers.md`, `L1…L11` in `module_losses.md`,
+**Convention worth knowing before cross-referencing.** `F-*` is the **global**
+evidence series in [`findings.md`](findings.md) and is the ID to prefer. Under
+[`PROTOCOL.md`](PROTOCOL.md), measurements migrate out of the module docs into
+that series as each module is reworked — `module_buffers.md` has been done, so
+its `B1`, `B6`, `B9` and `B10` no longer exist (B9's κ=0 identity is now `F-004`).
+
+The remaining finding IDs are **module-local**: `B0…B8` in `module_buffers.md`,
+`L1…L11` in `module_losses.md`,
 `P1…P8` in `module_protocol.md`, `T0…T7` in `module_metrics.md`, `M1…M8` in
 `module_training_modes.md`, `D1…D8` in `module_modulators.md`, `S*` per document.
 Two of these collide with other series and the collisions are live: `to_do_rebuild.md`

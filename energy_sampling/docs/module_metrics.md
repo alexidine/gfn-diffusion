@@ -137,6 +137,63 @@ validity gate exactly — a logged gate that disagrees with the live one
 misreports why the loop held, which is the same class of defect as the two
 reporting rules above.
 
+### 3c. The non-thermal tail family, 2026-08-10 — class 2, and deliberately so
+
+The high-energy tail was previously only inferable — from `Mean Sample Energy`,
+`Reasonable Sample Fraction`, an effective temperature read off a histogram. The
+family at [`train.py:3396`](../train.py:3396) states it directly. All class 2:
+nothing reads them, and nothing should until the bar has been watched on a real
+battery.
+
+The quantity is the **reduced excess energy**, per sample:
+
+```
+u = (E - Emin(c)) / T   ==   log R*(c) - log R
+```
+
+in nats. Both condition- and temperature-reduced, so unlike a raw energy — and
+unlike `r2` (T0) — it **pools legitimately** across a mixed-condition, mixed-T
+eval batch. Emin(c) is `condition_log_z`'s running record, which
+`fwd_eval_sampling` has already updated with the same batch, so `u >= 0` holds
+by construction and a uniformly bad batch cannot flatter itself.
+
+| Key | Meaning |
+|---|---|
+| `Nonthermal Fraction` | **headline** — frac(`u > u*`) |
+| `Nonthermal Threshold` | `u*` in nats; emitted only when it moves (S3's rule, applied at birth) |
+| `Excess Energy Nats P50/P90/P99/Max/Mean` | the tail's **shape**, so the bar is not the only view |
+| `Excess Energy Nats` | histogram of `log10(1+u)` |
+| `Excess Energy Referenced Fraction` | share of the batch that had an Emin(c) to score against |
+
+**Where the bar comes from is the whole point.** Under any Boltzmann target,
+the cost of sitting `u` nats up is `e^-u` and the only thing that can pay it is
+the number of states up there:
+
+```
+P(u > u*) = int_{u>u*} g(E) e^-E/T dE / Z  <=  (V_acc / V_ref) e^-u*
+```
+
+so `log P <= S - u*` with `S = log(V_acc/V_ref)` the **entropy budget**. The
+latents live in a bounded box, so `S` is finite and extensive in the latent
+dimension — hence `u* = data_ndim * nonthermal_entropy_per_dim`, one knob that
+transfers across problem and T by construction. The default `s = 4` reads two
+ways at `data_ndim` 12: as a pure budget it grants the reference region as
+little as `e^-4` ~ 1.8% of each axis; or, taking `dup_cutoff` (5% of an axis) as
+the reference size, `S = 36` and the other 12 nats are rarity margin (~1 draw in
+1.6e5). Measured on synthetic thermal batches (harmonic well, `data_ndim` 12,
+both fixed T=2.5 and the mk_dev log-T sweep, n=2000): `max(u)` 16.8–19.7 against
+a bar at 48. A known 5% contamination is recovered as 0.055.
+
+Two biases, **both toward under-reporting**, which is the right direction for a
+metric whose claim is "obviously": early in a run Emin(c) is only as deep as
+what has been seen; and non-finite energies are patched to 0 upstream
+([`molecular_crystal.py:238`](../energies/molecular_crystal.py:238)), so a
+numerically blown-up sample reads as mildly excited rather than as tail. Neither
+can manufacture a tail that is not there.
+
+Read `P99` before `Nonthermal Fraction`: the fraction is one bar on a
+distribution, and a tail growing *under* the bar is the same event seen earlier.
+
 ## 4. Unconditional degeneracies
 
 With one condition, a large part of the family collapses:
@@ -320,6 +377,9 @@ the same silence.**
 | `resid_vs_intake` bar at `1/e` | **derived** — `ratio ≈ exp(−λτ)` puts the `λτ = 1` boundary exactly there, so it transfers across problem, T and buffer size | `module_buffers.md` B8 |
 | Shipping `is_ess_frac` / `is_w_max_ratio` / `is_elig_frac` at all | **derived** — a self-normalised IS estimator is unbiased by construction, so the weight *tail* is the only failure channel and it needs its own instrument | `module_buffers.md` B7 |
 | Suppressing a series on kinds that never write it | **derived** — an unconditional emit publishes a constant 0, which reads as a measurement | §3a |
+| Non-thermal bar at `data_ndim * s` rather than an absolute energy | **derived** — the entropy budget of a bounded latent box is extensive in its dimension, so this is the one form that transfers across problem, T and Z' | §3c |
+| `nonthermal_entropy_per_dim: 4.0` | **arbitrary, conservative** — two readings both land near it (§3c), and synthetic thermal batches top out at `u` ~ 19 against a bar at 48 | §3c |
+| Reducing by T and by Emin(c) before pooling | **derived** — `u` is dimensionless and per-condition-referenced, so pooling carries none of T0's denominator hazard | §3c |
 
 ## 7. Failure signatures
 
@@ -332,8 +392,11 @@ the same silence.**
 | `*_worst` == pooled metric | `condition_library_size` | expected unconditionally (§4) |
 | `logw_std` rising while VarGrad works | `logw_std_within` | between-condition component dominating — conditional only |
 | A controller's series never appear at all | is the sensor in `metric_tracker`, or only the report dict? | T7 — resolving `None` and cold-starting every tick. **Absence of the series is the only tell**; it looks exactly like correct holding |
-| `is_ess_frac` not exactly 1.000 at κ=0 | compare to `is_elig_frac` | the draw is not coming from `p` — `module_buffers.md` B9(a) |
+| `is_ess_frac` not exactly 1.000 at κ=0 | compare to `is_elig_frac` | the draw is not coming from `p` — [`findings.md`](findings.md) `F-004` |
 | `probe/alpha_median` wandering, or `fit_*_rate` rising | `alpha_iqr`, `fit_ok` | the probe's parabola fit is failing; the α reading is void regardless of its value |
+| `Nonthermal Fraction` 0 while samples plainly look bad | `Excess Energy Nats P99`/`Max` | a tail growing under the bar — the fraction is one threshold, the quantiles are the shape (§3c) |
+| The whole non-thermal family absent | `condition_id` in `fwd_stats`; `nonthermal_entropy_per_dim` | no-ops silently pre-bootstrap (no tracker, no anchors) and when the knob is 0/null |
+| `Excess Energy Referenced Fraction` well below 1 | `condition_log_z` coverage | those conditions have no Emin(c) yet, so the tail is measured on a subset |
 
 ## 8. Simplification candidates
 

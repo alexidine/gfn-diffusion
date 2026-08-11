@@ -1,12 +1,15 @@
 # Module: buffers (`buffer.py` + management in `train.py`)
 
 Pass 1 (audit + rationalize). Verified against the working tree, 2026-08-03;
-**revised 2026-08-08** for the prioritised-replay package (`to_do_rebuild.md`
-§B5/§B7b/§B7c) and the memorisation sensor (§B7d), which shipped 2026-08-07.
+revised 2026-08-08 for the prioritised-replay package (`to_do_rebuild.md`
+§B5/§B7b/§B7c) and the memorisation sensor (§B7d), which shipped 2026-08-07;
+**revised 2026-08-10** for D5 (admission's cap/temperature retired — see B0);
+**revised again 2026-08-10** for the `floor`/`stalled` eviction retirement
+(see B10) and the untested `prioritise.symmetric` draw option (see B11).
 Unconditional route. `ConditionLogZTracker` also lives in `buffer.py` but is
 covered in `module_metrics.md` — it is a statistics tracker, not a buffer.
 
-> **Numbering.** `B1…B10` here are **module-local finding IDs**.
+> **Numbering.** `B1…B11` here are **module-local finding IDs**.
 > `to_do_rebuild.md`'s `§B1…§B9` are a *different* series — the design argument
 > for the replay rebuild. When a reference matters, this document always writes
 > the latter as `to_do_rebuild.md §Bn`.
@@ -31,18 +34,23 @@ The three roles:
 | Class | `CrystalBuffer` | `CrystalBuffer` | `AnchorBuffer(CrystalBuffer)` |
 | Holds | terminal states | terminal states **+ trajectories** | terminal states |
 | Seed | full prebuilt `prior_dataset` | first eligible fwd batch | `prior_dataset` |
-| Intake | prior-model draws within `ramp_floor` of Emin(c); anchor backfill | **two regimes** (B0): softmax over clipped \|resid\|, *or* uniform | surprise-gated screen → confirm |
+| Intake | prior-model draws within `ramp_floor` of Emin(c); anchor backfill | **unconditionally uniform** over the sane pool (D5, done) | surprise-gated screen → confirm |
 | Draw | uniform (or `_loss_weights` under `weighted_bwd_sampling`) | **two regimes** (B7): uniform, *or* `p ∝ δ₊^κ` with IS weights | — |
-| Eviction | relative quantile (bottom 25% of visited) | four causes, **two of them regime-gated** (below) | periodic thin; otherwise permanent |
+| Eviction | relative quantile (bottom 25% of visited) | hazard + backstop, **both residual-independent** (below) | periodic thin; otherwise permanent |
 | Size | 10k–250k | 4000 | ≤ 200k |
 | Consumed by | `bwd` training | `replay` training | nothing directly — it refills `prior` |
-| Manager | [`manage_prior_buffer`](train.py:4114) | [`manage_replay_buffer`](train.py:4859) | [`screen_and_admit_anchors`](train.py:5397) |
+| Manager | [`manage_prior_buffer`](train.py:3876) | [`manage_replay_buffer`](train.py:4387) | [`screen_and_admit_anchors`](train.py:4826) |
 
-**The replay column now has two mutually exclusive configurations**, switched by a
-single key (`buffers.replay_buffer.prioritise.enabled`). All three of its rows
-change together, because they are one design — see B0 for the intake/purge side
-and B7 for the draw. Nothing below that says "replay does X" is true
-unconditionally; check which regime the config selects first.
+**Intake, draw and eviction are now three separate axes.** Admission is
+always uniform (D5: `admit_cap_max/min/health_h0/admit_temperature` are
+retired keys — `utils.py` `_RETIRED_KEYS` rejects them at load). The draw is
+config-gated by `buffers.replay_buffer.prioritise.enabled` (B7): unset means
+a uniform draw, set means `p ∝ δ₊^κ` with the IS correction (or `p ∝ |δ|^κ`
+under the untested `prioritise.symmetric`, B11). Eviction no longer depends
+on that flag at all — `floor`/`stalled` (the old residual-dependent purge
+causes it used to gate) are retired outright, not merely switched off, so
+eviction is unconditionally hazard + backstop regardless of `prioritise`
+(B10).
 
 Paper voice: *training draws from a large, slowly-churned prior buffer that
 supplies distributional diversity, and from a small, fast-turnover replay buffer
@@ -86,24 +94,52 @@ since the buffer just looks full and quiet. Passing `+inf` keeps ~25% of visited
 rows always evictable, so the *rate* stays owned by `n_churn` and loss only
 decides *which* rows go.
 
-**Replay — four causes, none of which shapes the bulk age distribution. Two of
-the four are switched off under `prioritise`** *(revised 2026-08-08)*:
+**Replay — two causes, neither shapes the bulk age distribution, neither
+depends on `prioritise`** *(revised again 2026-08-10 — B10: `floor`/`stalled`
+retired outright, not gated)*:
 
-| Cause | Depends on the residual? | Under `prioritise` |
-|---|---|---|
-| `floor` — `ema_loss` fell below 0.1 (corrected, now boring) | **yes** | **disabled** |
-| `stalled` — drawn ≥ `toxic_min_draws` and `ema_loss - birth_loss >= 0` | **yes** | **disabled** (`min_draws` forced to 0) |
-| `hazard` — memoryless: evict `n/τ` rows per call, uniformly at random | no | live |
-| `backstop` — hard ceiling at `5τ`, binding on ~exp(−5) of rows | no (age) | live |
+| Cause | Depends on the residual? |
+|---|---|
+| `hazard` — memoryless: evict `n/τ` rows per call, uniformly at random | no |
+| `backstop` — hard ceiling at `backstop_mult·τ` (default 5τ), binding on ~exp(−backstop_mult) of rows | no (age) |
 
-The gate is the same `uniform_intake` flag as B0's, at
-[train.py:5067](train.py:5067). **The reason is the force spectrum, not
-convenience.** Every selective step multiplies into the buffer's density —
-`μ_buf ∝ Q_admit · p_admit · p_survive` — and the draw's importance weight
-divides by the **draw** only. A residual-dependent `p_survive` therefore re-enters
-Φ uncorrected, counting the residual twice and once stale (`to_do_rebuild.md`
-§B4/§B7b). `hazard` and `backstop` are independent of the residual, so
-`p_survive` drops out of the weight and they survive.
+There is no gate any more — hazard + backstop run unconditionally in
+[`manage_replay_buffer`](train.py:4387), whether or not `prioritise.enabled`
+is set. The old residual-dependent causes (`floor`: `ema_loss` fell below a
+threshold; `stalled`: drawn ≥ `toxic_min_draws` and not improving) are gone —
+code, config keys, and telemetry all removed, not merely disabled — B10.
+**The reason is the force spectrum, not convenience.** Every selective step
+multiplies into the buffer's density — `μ_buf ∝ Q_admit · p_admit · p_survive` —
+and the draw's importance weight divides by the **draw** only. A
+residual-dependent `p_survive` therefore re-enters Φ uncorrected, counting the
+residual twice and once stale (`to_do_rebuild.md` §B4/§B7b). `hazard` and
+`backstop` are independent of the residual, so `p_survive` drops out of the
+weight and they survive. The displacement purge (headroom top-up beyond
+hazard/backstop eviction) is uniform-random unconditionally too, for the same
+reason admission is: there is no cap left to score it against.
+
+**The same argument applied to `p_admit`, and that is what B7b changed, now
+finished (D5):**
+
+| | admission | draw | weight | Φ vs δ |
+|---|---|---|---|---|
+| pre-B7b (retired) | `∝ softmax(\|δ\|/T)` | uniform | none | **superlinear**, uncorrected |
+| current | uniform, unconditionally | `∝ δ₊^κ` *(if `prioritise`)* | `(1/n_elig)/p` | **linear**, unbiased |
+
+B7b moved the prioritisation from admission to the draw and made it *correct* —
+the IS weight divides by the draw, so the estimator is unbiased for the
+uniform-over-eligible mean. The cost is that the old, formally-wrong pipeline
+delivered **more** force to high-δ regions, precisely because its admission bias
+multiplied into the density and was never divided out. The estimator got right
+and the signal got weaker (`F-003`). That trade is no longer a per-arm config
+choice — the softmax-admission path is deleted, not merely unused.
+
+So the open question is not whether B7b is correct — it is. It is **whether
+uniform-over-eligible is the target wanted.** Unbiasedness is a property relative
+to a target, and B7b silently moved the target from "the hard tail" to "the
+buffer". `is_elig_frac ≈ 0.40` says the estimator's actual support is the
+positive-δ 40% — a partial restoration of the old bias, but far weaker than
+`softmax(|δ|/2.0)`.
 
 Two further reasons `floor` had to go, both recorded at the call site:
 
@@ -131,301 +167,199 @@ the sensor.
 behind a policy-health gate (`health_gate_floor`, `health_gate_ceiling`) so
 novelty is never adjudicated against a miscalibrated ruler.
 
+**The anchor → prior feedback path** is the buffer system's only closed loop, and
+it is one number: `reach = 1 − quantile_0.9(excess) / margin`, firing below
+`reach_threshold: 0.75`. Unconditionally this reduces to *"is the buffer's 90th
+percentile within 25% of `ramp_floor` of the best known energy."* Pooling
+excess-above-own-condition-best is what makes it correct in the conditional case,
+where one condition's easier scale must not mask another. Recorded so the
+coupling is visible — nothing is wrong with it.
+
 ## 4. Findings
 
-**B0 — uniform intake never became the default. `admit_temperature` is LIVE on
-every unprioritised config, and that is nearly all of them.**
-*(verified 2026-08-08 against the code, not the design docs)*
+Current state only. Measurements live in [`findings.md`](findings.md); history in
+git. `B`-ids are retained as stable anchors for existing cross-references.
 
-> **Update, later the same day: `mk_dev` now sets `prioritise.enabled: true`**,
-> so the dev config is on the B7b path — but the statement below still holds for
-> every generated battery config in the tree, and `admit_temperature` /
-> `admit_cap_*` remain live on `mk_dev` too, because the **displacement purge**
-> reads them regardless of the flag. The `lr_aug08` battery deliberately reverts
-> to scored admission so its LR readings stay comparable to `local_aug08`.
+### B0 — `admit_temperature` is retired (D5, done 2026-08-10)
 
-The question "shouldn't `admit_temperature` be dead now that we do uniform
-admission?" has an inverted premise: **we do not do uniform admission by
-default.** B7b shipped as an **opt-in**, gated on one key:
+Admission is now unconditionally uniform over the sane pool
+(`manage_replay_buffer`, `train.py`) — the softmax-over-`|resid|` path is
+deleted, not config-gated. `admit_cap_max`, `admit_cap_min`,
+`admit_cap_health_h0`, and `admit_temperature` are retired keys
+(`utils.py` `_RETIRED_KEYS`); a config that still sets any of them fails at
+load with a message naming the replacement. The displacement purge (headroom
+top-up beyond toxic eviction) is uniform-random too now, for the same reason —
+there is no cap left to score it against.
 
-```python
-uniform_intake = self.replay_priority_config() is not None    # train.py:4968
-if uniform_intake:
-    elig = torch.argwhere(sane).flatten()
-    clipped_score = torch.ones(elig.numel(), device=resid.device)
-else:
-    elig = torch.argwhere(sane & (resid.abs() > floor)).flatten()   # floor = 0.1
-    clipped_score = resid[elig].abs().clamp(max=cap)
-```
+**Historical note, for reading old runs.** Every arm before this date that did
+**not** set `buffers.replay_buffer.prioritise.enabled` ran the softmax
+admission path at whatever `admit_temperature`/`admit_cap_*` its config
+specified — that includes all 8 `local_aug08` arms and 22 of 26 rb0808 arms.
+`admit_reward_min` is unaffected (optional, `train.py`, constrains `sane`
+upstream of admission on every path, retired or not).
 
-`replay_priority_config` ([train.py:3203](../train.py:3203)) returns `None` unless
-`buffers.replay_buffer.prioritise` exists **and** `enabled: true`. `mk_dev.yaml`
-has no such block. So the default path is the **else** branch: admission is a
-softmax over clipped `|resid|` at `T = admit_temperature = 2.0`, over a pool
-pre-filtered by a hardcoded `|resid| > 0.1`.
+Two traps that are now moot but explain old rb0808 results:
 
-Exactly **13 configs** in the tree set `prioritise` — 9 in `local_aug07`, and
-rb0808 arms **7, 16, 19, 20** only. Every other arm, including all 8 of
-`local_aug08` and 22 of 26 rb0808 arms, runs scored admission.
+1. **The docstring at old `train.py:3204` was wrong** for that era: it said
+   "None/<=0 disables it", but `kappa: 0.0` returns `float(0.0)`, which `is not
+   None` — so `{enabled: true, kappa: 0}` engaged the **whole** B7b package.
+   rb0808 arms 7, 19, 20 were set that way.
+2. **rb0808's replay block was heterogeneous in admission policy.** A `rep_hi`
+   (24) vs `rep_b7b` (7) comparison varied frac dose **and** admission policy
+   together — irrelevant to any run started after this retirement, since there
+   is now only one admission policy.
 
-| | admission | `admit_temperature` |
-|---|---|---|
-| no `prioritise` (default) | softmax over clipped \|resid\|, floor 0.1 | **live — sets the sharpness** |
-| `prioritise.enabled` | uniform over the sane pool | inert *for admission* |
+### B0a/B0b — uniform intake was a trade, not an upgrade — `F-003`
 
-**It is never fully dead.** Even under `uniform_intake`, `cap` and `T` still
-drive the **displacement purge** ([train.py:5155](../train.py:5155)):
-`purge_score = ema[live].clamp(max=cap)` then `_softmax_draw(-purge_score, …, T)`.
-That branch is not gated on `uniform_intake`, so composition is shaped on the way
-*out* even when intake is uniform.
+Buffer hardness comes from **admission, not eviction**. Uniform intake fits the
+typical population better (`bwd/tb_err` −0.50) and leaves the forward tail
+uncorrected (`fwd/tb_err` +4.40, stable). Standing constraints, now that uniform
+admission is the only mode (B0):
 
-Three traps this exposes:
+- **κ ≈ 1 is the practical ceiling** — the IS variance bound bites before κ = 2.
+- **`max_size` is not a lever here** — the displacement purge is not the mechanism.
+- **Keep the IS weights** — removing them is worse than any κ setting.
+- **Keep Huber** — de-huberising costs ~6.6 nats.
 
-1. **The retirement is scheduled, not done.** `decisions.md` D5 and
-   `to_do_rebuild.md` §C Phase 3 step 3 plan to retire these keys. Reading that
-   as a statement about the code is wrong — and the four cap/temperature keys are
-   read by **direct attribute access with no default**
-   ([train.py:4947–4951](../train.py:4947)), so deleting them from a config
-   raises `AttributeError` rather than falling back.
-2. **The docstring is wrong.** [train.py:3204](../train.py:3204) says
-   "None/<=0 disables it". `kappa: 0.0` returns `float(0.0)`, which `is not
-   None`, so `{enabled: true, kappa: 0}` engages the **whole** B7b package. Three
-   rb0808 arms (7, 19, 20) are set that way.
-3. **rb0808's replay block is heterogeneous in admission policy.** `rep_b7b` (7)
-   and `rep_kappa1` (16) run uniform intake; `rep_hi` (24), `rep_fixed_fracs`
-   (23) and `rep_off` (8) run scored admission. A `rep_hi` vs `rep_b7b`
-   comparison therefore varies frac dose **and** admission policy together.
+**The discriminating arm is retired, not merely unreachable.** Before D5,
+`prioritise.enabled` gated intake and draw together, so "old (softmax)
+admission + new (κ) draw" — the one configuration that would have isolated
+admission's contribution from the draw's — could not be expressed by config.
+D5 didn't split the flag to make that arm reachable; it deleted the old
+admission side outright, so the comparison can no longer be run going
+forward. `F-003`'s measurement stands as a historical A/B (old admission vs
+new), not as a currently-selectable config choice.
 
-`admit_reward_min` sits on a different footing: it is optional
-(`getattr(..., None)`, [train.py:4936](../train.py:4936)) and it constrains
-`sane` **upstream of the branch**, so it binds on both paths by design.
+**`bounds.replay: [0.05, 0.45]` saturates** under this construction — pinned at
+0.45 from ~step 3450 with `rt_rho` still above setpoint — so the ratio controller
+loses authority.
 
-**B0a — the replay buffer's *hardness* came from ADMISSION, not eviction — and
-B7b's uniform intake gives it up.** *(measured 2026-08-08, `local_aug09` v0/v3)*
+### B2 — `_loss_weights` min-max normalises
 
-Turning the B7b package on dropped `replay_buffer_mean_loss` from **16.9 to
-7.2**, and the forward branch degraded with it (`fwd/tb_err` 21.5 → 33.9,
-`over_coverage` 20.7 → 33.2) while the *drawn* batch's `replay/tb_err` barely
-moved (15.8 → 16.2).
+[buffer.py:855](../buffer.py:855) maps `[min, max] → [0, 1]` before applying the
+temperature, so (a) a converged buffer whose loss spread has collapsed still gets
+full-strength prioritisation, and (b) one outlier compresses everyone else toward
+uniform. Rank-based or robust-quantile normalisation is stable against both.
+**Dormant on the unconditional route** — `weighted_bwd_sampling` is per-stage and
+`naive` does not set it.
 
-**The first hypothesis was wrong and the isolation arm killed it.** I proposed
-that sizing `max_size` above equilibrium had made the displacement purge dormant,
-and that the purge — which evicts preferentially on low `ema_loss` — had been
-keeping the buffer hard as a side effect. `v3_size4000` reverts `max_size` to
-4000 and changes nothing else. Result: buffer mean 7.35 vs v0's 7.30,
-`fwd/tb_err` 33.84 vs 33.87. **Identical.** The purge is not the mechanism.
+### B3 — replay occupancy equilibrium sits exactly at `max_size`
 
-**The mechanism is admission, and `birth_loss` proves it.** `birth_loss` is
-snapshotted once at admission ([buffer.py:93](../buffer.py:93), and
-[:646](../buffer.py:646) on add) and **never updated** — so it is a pure
-admission statistic that no amount of subsequent training can move.
-
-| | `birth_loss_mean` | `ema_loss_mean` |
-|---|---|---|
-| scored admission (old) | **23.73** | 16.76 |
-| uniform intake (B7b) | **10.86** | 7.49 |
-
-Rows now *enter* the buffer with less than half the residual they used to. The
-old softmax-over-clipped-`|resid|` admission was skimming the hard tail of each
-forward batch; uniform intake admits a representative sample. That is exactly
-what B7b intended — and the size of the effect was not anticipated.
-
-**Restated in §B4's terms, this is a change in the force spectrum's shape:**
-
-| | admission | draw | weight | Φ vs δ |
-|---|---|---|---|---|
-| old | `∝ softmax(\|δ\|/T)` | uniform | none | **superlinear** (and uncorrected) |
-| B7b | uniform | `∝ δ₊^κ` | `(1/n_elig)/p` | **linear** (and unbiased) |
-
-B7b moved the prioritisation from admission to the draw and made it *correct* —
-the IS weight divides by the draw, so the estimator is unbiased for the
-uniform-over-eligible mean. The cost is that the old, formally-wrong pipeline
-delivered **more** force to high-δ regions, because its admission bias multiplied
-into the density and was never divided out. The estimator got right and the
-signal got weaker.
-
-> So the open design question is not "is B7b correct" — it is. It is **whether
-> uniform-over-eligible is the target we want.** Unbiasedness is a property
-> relative to a target, and B7b silently changed the target from "the hard tail"
-> to "the buffer". `is_elig_frac ≈ 0.40` says the estimator's actual support is
-> the positive-δ 40%, which is a partial restoration of the old bias — but a much
-> weaker one than `softmax(|δ|/2.0)`.
-
-Second-order, consistent: `grad_norm_pre_clip` 536 → 397 and `lrprobe/
-alpha_median` 1.66 → 3.17, i.e. the step probe independently reports the step is
-~3× smaller than local curvature permits. With `is_ess_frac ≈ 0.39` the IS
-estimator discards ~60% of its effective sample, so the replay gradient is both
-smaller and noisier.
-
-### B0b — settled at 3600 steps: a TRADE, not a regression, and κ cannot fix it
-
-Five isolation arms plus two full-length runs. `fwd/tb_err` at matched steps
-against the a_frz control (21.46):
-
-| arm | κ | replay `beta` | `is_ess` | `w_max` | `fwd/tb_err` |
-|---|---|---|---|---|---|
-| **v4** | 1 | **10** | 0.363 | 7.3 | **27.29** ← best |
-| v0 | 1 | 1e6 | 0.393 | 6.7 | 33.87 |
-| v3 | 1 | 1e6, `max_size` 4000 | 0.396 | 6.7 | 33.84 |
-| v6 | **2** | 10 | **0.073** | **58.4** | 36.29 |
-| v5 | **0** | 1e6 | **1.000** | 1.0 | 38.60 ← worst |
-
-Three hypotheses died to their own isolation arms: the displacement purge (v3 ≡
-v0), IS-weight variance (v5 removes the weights entirely and is *worse*), and
-κ-sharpening (v6 targeted harder rows exactly as designed and blew `is_ess_frac`
-to 7% with one row at 58× the mean weight). **The variance bound bites before
-κ = 2, so κ ≈ 1 is the practical ceiling and the admission gap cannot be bought
-back through the draw.**
-
-**What survives: κ = 1, keep Huber, and the residual gap is admission.**
-De-huberisation costs ~6.6 nats — B5b requires quadratic so Φ ∝ δ holds under IS
-correction, and on this route that correctness costs more than it buys. It
-independently replicates the `local_aug07` β ladder.
-
-**The verdict at 3600 steps** (v7 = κ 1 / β 10, final window vs a_frz):
-
-| | a_frz | v7 | gap | seed floor |
-|---|---|---|---|---|
-| **`bwd/tb_err`** | 15.14 | **14.64** | **−0.50** | 0.04 ✅ |
-| `fwd/tb_err` | 18.72 | 23.12 | +4.40 | 0.52 ❌ |
-| `EffDim` | 5.80 | 5.90 | +0.11 | 0.10 — |
-
-`bwd` draws from the prior buffer — a fixed, diverse population — while `fwd` is
-fresh on-policy rollouts. **The new construction fits the typical population
-better and leaves the forward tail uncorrected**, which is precisely what the old
-hard-tail-skimming admission was buying. The fwd gap is *stable*, not closing
-(per-window: 3.12, 3.97, 5.61, 5.09, 4.27, 4.09, 4.39).
-
-> `replay/tb_err` rising 16.9 → 23.5 while `replay_buffer_mean_loss` falls to
-> 5.75 is the draw **working**, not failing — a κ = 1 draw skimming the hard tail
-> of a softening buffer. Read the two together or the draw looks broken.
-
-**Two consequences needing action.** `bounds.replay: [0.05, 0.45]` **saturates**
-in both long arms (pinned at 0.45 from ~step 3450 with `rt_rho` still above
-setpoint), so the ratio controller loses authority under this construction. And
-`prioritise.enabled` gates **intake and draw together**
-([train.py:4968](../train.py:4968) and [:3218](../train.py:3218) read the same
-flag), so "old admission + new draw" — the one configuration that would test the
-admission hypothesis directly — is unreachable by config. Splitting that flag is
-the prerequisite for settling B0a.
-
-**B1 — `CrystalBuffer.purge()` was dead code. ✅ REMOVED 2026-08-03.** The
-`max_count`/`loss_cutoff` variant had zero callers; `purge_lowest` and
-`purge_by_index` are the live paths.
-
-**B2 — `_loss_weights` min-max normalises, which makes prioritisation
-scale-free in a way that may not be wanted.** *(confirmed, low severity)*
-
-[Line 855](buffer.py:855) maps `[min, max] → [0, 1]` before applying the
-temperature. Two consequences: (a) a converged buffer whose real loss spread has
-collapsed still gets **full-strength** prioritisation, amplifying noise into the
-sampling distribution; (b) one outlier compresses everyone else toward 0, making
-the remaining rows near-uniform. Rank-based or robust-quantile normalisation
-would be stable against both. Currently low-impact — `weighted_bwd_sampling` is
-a per-stage flag and the `naive` stage does not set it, so this path is dormant
-on the unconditional route.
-
-**B3 — the replay occupancy equilibrium sits exactly at `max_size`.** *(confirmed, marginal)*
-
-The design is explicit that occupancy should be *emergent* (Little's law,
-`n = admit_rate × τ`) and that `max_size` is "a memory guard, not a target …
-safety limits go where they do not bind." mk_dev runs `churn_rate: 80`,
+Occupancy is designed to be emergent (`n = admit_rate × τ`), with `max_size` a
+memory guard that should not bind. mk_dev runs `churn_rate: 80`,
 `mean_residence_steps: 50`, `max_size: 4000` — and 80 × 50 = 4000 exactly.
+Headroom is zero at full admission efficiency. It probably does not bind, because
+`churn_rate` budgets admission *attempts*, but if it ever does, `max_size` rather
+than the hazard starts shaping eviction at the margin. Raise to ~2× equilibrium
+or state that the guard is meant to be tight.
 
-It probably does not bind, because `churn_rate` budgets admission *attempts*
-rather than successes, so realised intake is below 80. But the headroom is zero
-at full admission efficiency, and if it ever binds, `max_size` — not the hazard
-— starts shaping eviction at the margin, which is precisely what the design says
-must not happen. Either raise `max_size` to ~2× the equilibrium or state that the
-guard is intended to be tight.
+### B4 — retired-key guards fire hours into a run
 
-**B4 — `max_residence_steps` retirement is enforced only at first
-`manage_replay_buffer` call.** *(confirmed, operationally expensive)*
+The `ValueError` on `max_residence_steps` ([train.py:4483](../train.py:4483)) is
+correct but lives in the manage path, which first runs at the phase-1 → 2
+transition. **There is no load-time config preflight.** The aug02 battery lost
+all 16 arms' entire phase 1 (1.1–7.8 h each) to exactly this. B10's
+`toxic_min_draws`/`toxic_delta_threshold` retirement guard
+([train.py:4490](../train.py:4490)) is a second instance of the same pattern —
+same call site, same failure mode, nothing new to fix.
 
-The guard at [train.py:5046](train.py:5046) raises `ValueError` on the retired
-key — correctly. But it lives inside the manage path, which first runs at the
-phase-1 → 2 transition. The aug02 battery lost **all 16 arms' entire phase 1**
-(1.1–7.8 h each) to exactly this: every arm trained phase 1 to completion, then
-died at the transition. A config preflight that walks every stage's key surface
-at load time would have cost seconds.
+### B5 — `min_size` does two unrelated jobs
 
-**B5 — `init_fraction` is documented inert; `min_size` is doing two unrelated
-jobs.** `min_size: 10000` is used as a per-cycle chunk bound in
-`rebuild_prior_by_churn` ([train.py:4263](train.py:4263)) *and* as a sampling
-count in `grow_prior_buffer` ([train.py:5607](train.py:5607)). It is not a
+`init_fraction` is inert. `min_size: 10000` is a per-cycle chunk bound in
+`rebuild_prior_by_churn` ([train.py:4025](../train.py:4025)) *and* a sampling
+count in `grow_prior_buffer` ([train.py:5009](../train.py:5009)). It is not a
 minimum size anywhere. Rename or split.
 
-**B6 — the prior buffer's reach trigger, described (no defect).** *(user-confirmed fine)*
+### B7 — the prioritised draw, as built — `F-005`
 
-`reach = 1 − quantile_0.9(excess) / margin`, fires below `reach_threshold: 0.75`.
-Pooling excess-above-own-condition-best is correct for the conditional case (one
-condition's easier scale can't mask another); unconditionally there is one
-condition, so the pooling is a no-op and this reduces to "is the buffer's 90th
-percentile within 25% of `ramp_floor` of the best known energy." **This entry is
-descriptive** — it is the only anchor→prior feedback path and is recorded so the
-coupling is visible, not because anything is wrong with it.
+Unbiasedness is exact at every κ and the variance payoff does not exist; see the
+finding. Four design points that are load-bearing and easy to get wrong:
 
-**B7 — the prioritised draw: `p ∝ δ₊^κ` with row weights that undo it.**
-*(built 2026-08-07; unbiasedness verified exactly, payoff not established)*
+1. **δ is reconstructed, not stored** — `δ = log Z − log w`, from `ema_logw`.
+   `ema_loss` cannot serve: it stores `|resid|`, and the *sign* is what a
+   one-sided priority needs.
+2. **One-sided by design** — `δ₊ = max(δ, 0)`. A row the policy has moved off has
+   a fallen `log_pf` and takes priority ~0 automatically, which is both the
+   intended replay/backward split and most of what the §B8 drift term was for.
+3. **Zero-priority rows are EXCLUDED, not floored.** A row drawn at probability
+   ~0 carries weight ~∞ and owns a self-normalised batch. `δ₊ = 0 ⇒ p = 0`, and
+   the estimator targets the uniform mean over the **positive half**.
+4. **A supplied `p` is drawn with replacement** ([buffer.py:311](../buffer.py:311)).
+   IS correctness assumes iid draws from the design measure; without-replacement
+   is both wrong and a crash source once the eligible pool falls below the batch.
 
-[`prioritised_weights`](buffer.py:915) returns `(p, w_of_row)` with
-`w = (1/n_elig)/p`, so `E_p[w·f] = E_uniform[f]` **at every κ**. The estimator is
-unbiased by construction; only its *variance* changes with κ. That is the whole
-claim of the κ ladder, and it means any difference a ladder measures is estimator
-variance and nothing else.
+`floor_frac` default is **0.25**, the measured knee. Point 2's one-sidedness
+has an **untested** symmetric alternative — see B11.
 
-Four design points, each of which was changed by testing:
+### B10 — `floor`/`stalled` eviction is retired, not gated (2026-08-10)
 
-1. **δ is reconstructed, not stored.** `δ = log Z − log w`, and `ema_logw` already
-   carried a per-row EMA of `log w` — checkpointed, resized on grow/purge, and
-   **called by nothing** until now. `ema_loss` cannot serve: it stores `|resid|`,
-   and the *sign* is exactly what a one-sided priority needs.
-2. **One-sided by design.** `δ₊ = max(δ, 0)`. A row the policy has moved off has a
-   fallen `log_pf` and therefore a strongly negative δ, so it takes priority ~0
-   automatically — which is both the intended replay/backward split and most of
-   what the §B8 drift term was introduced to do.
-3. **Zero-priority rows are EXCLUDED, not floored.** The first cut mixed a uniform
-   floor into `p` so every row stayed drawable, and measured `max(w) = 10⁴`: a row
-   drawn at probability ~0 carries weight ~∞ and single-handedly owns a
-   self-normalised batch. Now `δ₊ = 0` ⇒ `p = 0`, and the estimator targets the
-   uniform mean over the **positive half** — which is what the replay branch is
-   for.
-4. **`floor_frac` is a RELATIVE floor on the survivors**, as a fraction of the
-   median `δ₊`, so the weight range is bounded by `(median/floor)^κ` rather than by
-   the smallest residual that happens to be resident. **The shipped 0.01 was far
-   too permissive** and was re-measured against a live buffer on 2026-08-07:
+[`manage_replay_buffer`](../train.py:4387) no longer has a residual-dependent
+purge path at all. `floor` (`ema_loss` fell below a threshold) and `stalled`
+(drawn ≥ `toxic_min_draws` and `ema_loss − birth_loss ≥ 0`) are deleted — the
+code, the `toxic_min_draws`/`toxic_delta_threshold` config keys, and the
+`self.replay_cohort` `'absorbed'`/`'stalled'` telemetry (and the
+`replay_buffer_absorbed_frac`/`replay_buffer_stalled_frac` wandb metrics they
+fed) are all gone. Eviction is unconditionally hazard + backstop (§3);
+`replay_buffer_backstop_frac`, `replay_buffer_hazard_frac`, and the
+`expired_*` hazard-cohort metrics still exist and are unaffected.
 
-   | `floor_frac` | ESS/n | max(w)/mean(w) |
-   |---|---|---|
-   | 0.01 | 0.11 | 73 |
-   | 0.15 | 0.50 | 5.3 |
-   | **0.25** | **0.63** | **3.3** |
-   | 0.50 | 0.80 | 1.9 |
+Setting `buffers.replay_buffer.toxic_min_draws` or `toxic_delta_threshold` in
+a config now raises `ValueError` at the same guard site as the pre-existing
+`max_residence_steps` retirement ([train.py:4490](../train.py:4490)) — the
+same B4 precedent applies: over a hundred old configs still set
+`max_residence_steps` and were never patched, because they are closed-out
+historical battery runs and this protocol treats git as their log, not the
+configs. Old configs that set `toxic_min_draws`/`toxic_delta_threshold` will
+fail to load the same way, for the same reason. Not a bug to fix.
 
-   At 0.01 the live run reported `is_ess_frac` 0.02–0.06 — a 1000-row batch doing
-   the work of ~20–60 rows. **0.25 is the knee and is now the default.**
+Two reasons `floor`/`stalled` had to go, both recorded at the call site
+(`manage_replay_buffer`'s docstring) and already covered in §3: under a
+prioritised draw a corrected row already has `p ≈ 0`, so a residual-dependent
+purge was only reclaiming memory, not gradient budget — hazard reclaims the
+same memory without reintroducing a residual-dependent survival probability.
+And a row driven to `δ ≈ 0` by repeated replay **is** B8's memorisation
+sensor's positive evidence (`birth_loss` vs `ema_loss`); purging it early
+destroyed the signal rather than merely wasting variance budget.
 
-**The variance claim did NOT reproduce, and the reason is not a bug.**
-`to_do_rebuild.md` §B5 predicted variance minimised at κ=1 by Cauchy–Schwarz;
-measured over 300 draws of 1000 rows, ESS/n runs 1.00 / 0.85 / 0.65 / 0.34 at
-κ = 0 / 0.5 / 1 / 2 and batch sd goes the **wrong way** (0.38 → 2.23). The optimal
-draw for a *self-normalised* estimator is `p ∝ |f − μ|`, not `p ∝ |f|`; for a mean
-of δ, δ is tightly clustered about its own mean, so prioritising by δ over-samples
-where the integrand is least informative. **Correctness is established, the payoff
-is not** — which makes the κ ladder diagnostic rather than confirmatory, and is why
-`replay/is_ess_frac`, `is_w_max_ratio` and `is_elig_frac` all ship. If
-`is_ess_frac` falls below ~0.3, lower κ.
+### B11 — `prioritise.symmetric`: an untested draw-eligibility alternative
 
-**Watch `is_elig_frac`.** It drifted 0.74 → 0.33 over 1500 steps locally: the
-buffer trending toward mostly-negative δ. If it approaches 0 the prioritised
-branch has nothing to draw.
+[`prioritised_weights`](../buffer.py:915) gained a `symmetric: bool = False`
+parameter. Default (`symmetric=False`) is exactly B7's existing one-sided
+draw, unchanged: `score = delta_plus = max(δ, 0)`. `symmetric=True` swaps the
+score for `score = |δ|`, which admits **under-weighted** rows (`δ < 0`) into
+the eligible set instead of zeroing them — everything downstream (nan fill,
+relative floor, `κ` power, IS weight) is unchanged; only which rows have
+`score > 0` differs.
 
-**B8 — the memorisation sensor, and why it needs no calibration.**
-*(built 2026-08-07; `to_do_rebuild.md` §B7d)*
+Two motivations, both from the code:
 
-[`absorption_stats`](buffer.py:863) compares each resident row's **current**
-residual against the one it was **admitted with** — both already stored, no new
-field:
+- **F-003** measured that the one-sided draw leaves the forward tail
+  uncorrected (`fwd/tb_err` +4.40, stable) while fitting the typical
+  population better. `symmetric` is the untested alternative that widens the
+  eligible set to include that tail rather than excluding it.
+- **Absorbing starvation** (one-sided mode only): `ema_logw` is written only
+  at draw time, so a row that falls to `δ ≤ 0` has its estimate frozen and can
+  only re-cross zero via `log_Z` drifting back up past the stale value — an
+  escape that closes once `log_Z` converges, which is the expected end state.
+  This is a plausible mechanism behind `is_elig_frac`'s monotonic drift (F-003
+  measured 0.74 → 0.33 over 1500 steps): a one-way exclusion ratchets, it does
+  not equilibrate. `symmetric` closes the trap as a side effect — `elig =
+  |δ| > 0` is false only at exact float equality, so virtually no row is ever
+  hard-excluded.
+
+**Status: config-reachable, untested.** `mk_dev.yaml` sets
+`prioritise.symmetric: true` (`configs/mk_dev.yaml:418`) and so do
+`configs/prod0810/{0..6}.yaml`; no isolation arm has run with it yet, so
+neither motivation above is confirmed on-policy — both are read off the
+docstring's reasoning, not a measurement. Read `replay/is_elig_frac` and
+`replay/is_ess_frac` on the first run that carries it: `symmetric` trades a
+narrower, harder-prioritised eligible set for a wider, softer one, so `κ ≈ 1`
+being the practical ceiling (B0a/B0b) is not guaranteed to transfer.
+
+### B8 — the memorisation sensor — `F-006`
+
+[`absorption_stats`](../buffer.py:863) compares each row's current residual
+against the one it was admitted with — both already stored, no new field:
 
 ```
 ratio       = mean(ema_loss) / mean(birth_loss)     in (0, 1]
@@ -433,103 +367,42 @@ absorbed    = 1 - ratio
 lambda_tau  = -ln(ratio)
 ```
 
-`ratio = 1` is a pure delay line: composition equals intake, nothing has been
-fitted. Falling toward 0 means residents have been corrected **at their own
-trajectories** while the intake distribution has not moved — memorisation by
-definition.
+`ratio = 1` is a pure delay line. Falling toward 0 means residents were corrected
+at their own trajectories while intake did not move — memorisation by definition.
+**Setpoint `ratio = 1/e = 0.368`, derived, so it transfers across problem, `T`
+and buffer size.**
 
-**The setpoint is derived, not measured.** Under exponential relaxation at rate λ
-and exponential residence with mean τ, `ratio ≈ exp(−λτ)`, so the `λτ = 1`
-boundary lands at **`ratio = 1/e = 0.368`**. Nothing in it was measured, so it
-transfers across problem, `T` and buffer size — which is the property every
-previous buffer threshold lacked.
+Undrawn rows have `ema_loss == birth_loss` and contribute `ratio` 1 — correct, a
+row nothing trained on cannot have been memorised. Returns `{}` below 8 valid
+rows, so pre-schema buffers make the servo hold at cold start rather than act on
+garbage.
 
-**No survivorship bias, and that is a dividend of the uniform hazard** (§3).
-`birth_loss` exists only for resident rows, so it is the intake distribution *of
-survivors*; under a residual-independent hazard survivors are an unbiased sample
-of admits. This would **not** hold under the old floor/stalled eviction.
+### Anchor health gate — bars are named after their role
 
-Undrawn rows have `ema_loss == birth_loss` exactly and contribute `ratio` 1.
-Correct: a row nothing trained on cannot have been memorised, and a buffer
-churning fast enough that most rows are never drawn genuinely is not memorising.
-
-Returns `{}` below 8 valid rows, so pre-schema buffers lacking `birth_loss` make
-the servo hold at cold start rather than act on garbage. Validated as a
-*discriminator* on 33 historical runs: λτ > 1.0 on four arms (BASE32K 1.54,
-local_aug02 1.44, neat_dev 1.10), 0.5–1.0 on five, < 0.5 on the rest.
-
-A 1-D Wasserstein between the intake and resident loss histograms matched the
-mean-shift statistic to three decimals on every arm — the distributions differ by
-a translation, so the histogram machinery buys nothing. Recorded so it is not
-re-proposed.
-
-**B9 — two wiring bugs the prioritised draw shipped with. ✅ BOTH FIXED
-2026-08-07.** *(the estimator was correct; the plumbing was not)*
-
-**(a) The draw was never prioritised — `beta` is a uniform FRACTION, not a
-temperature.** `_sample_indices` splits the batch as
-`n_uniform = int(batch_size · beta)`, so the legacy `beta=1.0` inherited by
-`draw_replay_sample` meant **100% uniform** and a supplied `p` was silently
-ignored. Worse than a no-op: the IS weights `w ∝ 1/δ₊^κ` were *still applied to
-the loss*, so a uniform draw carrying `1/p` weights targets a measure `∝ 1/δ^κ` —
-**the inverse of the design**, up-weighting the lowest-residual rows. Fixed by
-`draw_beta = 0.0` whenever `p` is computed ([train.py:3239](train.py:3239)).
-
-*The tell was an identity that should have been impossible*: at κ=0 the draw and
-the weights are both uniform, so `is_ess_frac` must be **exactly 1**. It read
-0.40 — equal to `is_elig_frac`'s 0.39 — because the uniform draw kept pulling
-ineligible `w = 0` rows. Post-fix κ=0 reads 1.000 with `is_w_max_ratio` 1.000.
-**A unit test of the estimator cannot catch a mis-wired draw**; the degenerate
-cell is what exposed it, which is an argument for always putting one in a ladder.
-
-**(b) One-sided draw + without-replacement = crash.** `ValueError: Fewer non-zero
-entries in p than size`, killing the κ=0 arm at step 119, because `δ₊ ≤ 0` rows
-get `p = 0` by design and the eligible pool fell below the batch size. **Fixed at
-the principle rather than with a guard**: a supplied `p` is a *design measure* and
-IS correctness assumes iid draws from it, so it is drawn **with replacement**
-([buffer.py:311](buffer.py:311)). Without-replacement was both theoretically wrong
-and the proximate crash.
-
-**B10 — `update_logw_stats` existed, was checkpointed, and was called by
-nothing.** *(✅ wired 2026-08-07)* The field, its resize-on-grow/purge handling and
-its checkpoint round-trip all predated any consumer. `replay_train_step` now
-refreshes it from `log_r + log_pb − log_pf`, which is what makes B7's signed
-residual available at all. Worth recording as a *class*: a checkpointed per-row
-field with no reader is indistinguishable from a live one when reading the schema,
-and this codebase had one for months.
-
-**Anchor health gate — config-driven metrics, and the bars are now named after
-their ROLE.** *(changed 2026-08-03; bar keys renamed 2026-08-08)*
-
-The gate previously hardcoded `fwd/r2` and `fwd/tb_resid_clipped`. It reads
-`anchor_buffer.health_gate_floor_metric` (lower bound) and
+Reads `anchor_buffer.health_gate_floor_metric` (lower bound) and
 `health_gate_ceiling_metric` (upper bound on |value|), against
-`health_gate_floor` / `health_gate_ceiling` — renamed from `health_gate_r2` /
-`health_gate_zerr`, which encoded the *old metric names* into the bar keys, so
-swapping the ruler left a key called `health_gate_r2` holding a number with
-nothing to do with r2.
+`health_gate_floor` / `health_gate_ceiling`. Renamed from `health_gate_r2` /
+`health_gate_zerr`, which encoded the *old metric names* into the bar keys.
 
-**The D9/N3 upgrade to `tb_err_worst` is deliberately NOT taken, and N3's own
-rationale is why.** No bar transfers across a ruler swap — and the incumbent is
-the better-warranted one:
+**The D9/N3 upgrade to `tb_err_worst` is deliberately not taken.** No bar
+transfers across a ruler swap, and the incumbent is better warranted:
 
 | | `tb_resid_clipped @ 0.5` (shipped) | `tb_err_worst @ ?` |
 |---|---|---|
 | shape | signed, bounded by `beta` | unbounded RMS, floored at `std(log w)` |
 | healthy value | ~0 | **18–21 on this route** |
-| warrant for the bar | **derived** — it is the D29 Z-currency invariant, the same bar `z_calibration` actively holds | none yet; would need a battery |
+| warrant | **derived** — the D29 Z-currency invariant | none yet; needs a battery |
 
-So the swap trades a derived bar for one nobody can state. It stays on the
-docket (`decisions.md` N3) as a question rather than a pending edit.
+Stays on the docket as a question, not a pending edit.
 
 ## 5. Warrants
 
 | Choice | Warrant | Evidence |
 |---|---|---|
 | Memoryless hazard over hard TTL | **measured** | `expired_delta` ran −12…−28 nats across postfix_july30 arms — the TTL was culling the *improving* tail; `absorbed_frac` 0.000 meant age was doing 100% of eviction |
-| `stalled` test replaces the TTL's job | **derived** — tests the thing the TTL proxied | docstring at [train.py:5010](train.py:5010) |
-| `admit_temperature: 2.0` | **measured** — and still live on 22 of 26 rb0808 arms (B0) | T=2 beat T=5; T=20 diverged (replay_july26 / tsched_july24) |
-| Residual-independent intake *and* purge under `prioritise` | **derived** — `μ_buf ∝ Q·p_admit·p_survive` and the IS weight divides by the draw only, so any other residual dependence enters Φ uncorrected | `to_do_rebuild.md` §B4/§B7b |
+| `floor`/`stalled` retired outright, not gated (B10, retired D5-era) | **derived** — a corrected row already draws at `p ≈ 0` under `prioritise`, so the residual-dependent purge was reclaiming memory, not gradient budget, and it was destroying B8's memorisation evidence in the process | manage_replay_buffer docstring |
+| `admit_temperature: 2.0` (retired D5, historical) | **measured**, on the softmax-admission path before it was deleted (B0) | T=2 beat T=5; T=20 diverged (replay_july26 / tsched_july24) |
+| Residual-independent intake *and* purge, unconditionally (not just under `prioritise`) | **derived** — `μ_buf ∝ Q·p_admit·p_survive` and the IS weight divides by the draw only, so any other residual dependence enters Φ uncorrected | `to_do_rebuild.md` §B4/§B7b; B10 |
 | Draw *with replacement* whenever `p` is supplied | **derived** — IS correctness assumes iid draws from the design measure; without-replacement also crashes once the eligible pool falls under the batch | B9(b), reproduced at 1500 / 900 / 300 eligible |
 | `δ₊ = 0` rows excluded rather than floored | **measured** — a uniform floor put `max(w)` at 10⁴ and one row owned the batch | B7 |
 | `floor_frac: 0.25` | **measured** — the ESS knee on a live buffer; the shipped 0.01 gave `is_ess_frac` 0.02–0.06 | B7 table, 2026-08-07 |
@@ -538,7 +411,7 @@ docket (`decisions.md` N3) as a question rather than a pending edit.
 | Mean-shift over a histogram distance for the sensor | **measured** — 1-D Wasserstein matched it to 3 dp on all 33 arms | B8 |
 | Clip-then-divide (cap before T) | **derived** — keeps `cap` an absolute nats bound independent of T | docstring |
 | Health-modulated cap off `fwd/scatter_err` | **derived** — an *external* signal cannot ratchet off the buffer's own contamination | docstring |
-| `loss_floor=+inf` in prior eviction | **measured** — a finite bar silently stopped churn | docstring at [train.py:4146](train.py:4146) |
+| `loss_floor=+inf` in prior eviction | **measured** — a finite bar silently stopped churn | docstring at [train.py:3898](train.py:3898) |
 | `churn_batch_ref: 1000` | **measured** — decouples churn pacing from live batch size after a growth event | run gejezmjg |
 | Hard exclusion for non-finite / sub-`admit_reward_min` | **derived** — admission scores badness, so without a floor the energy distribution is unbounded above | docstring |
 | `mean_lifetime: 100`, `max_size: 250000` (prior) | **arbitrary** | — |
@@ -607,11 +480,10 @@ The right time to calibrate them is when that route is live.
    strongly on the problem*: conditional routes have very low mean prior quality
    (so the archive matters), unconditional typically fairly high (so it matters
    less, and its value is the shoulder-discovery channel in S4).
-2. **Open.** `admit_cap_max: 30 / admit_cap_min: 8 / h0: 10` — the *shape* of
-   the health modulation is well argued, the three constants are unmeasured.
-   User: "they seem reasonable. Would be better to derive even just
-   qualitatively." A qualitative derivation is the deliverable here, not a
-   battery.
+2. **Closed by deletion (D5, 2026-08-10).** `admit_cap_max/min/h0`'s health
+   modulation no longer exists — admission is unconditionally uniform, so
+   there is no cap left to shape. The unmeasured-constants question is moot
+   rather than answered.
 3. **Open, and live — but the framing has changed.** `mean_lifetime: 100` (prior)
    vs `mean_residence_steps: 50` (replay). "Sufficient freshness" now has a
    *derived* target on the replay side: B8 says hold `λτ` under 1, i.e.

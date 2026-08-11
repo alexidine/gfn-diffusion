@@ -155,6 +155,28 @@ _GRAD_MEDIAN = {10: 1.0e3, 25: 6.6e3, 100: 1.7e4}  # empirical pre-clip grad med
 # (1.1-7.8 h each) because a retired-key guard lived inside manage_replay_buffer,
 # which first runs at the phase-1 -> 2 transition (module_buffers.md B4).
 _RETIRED_KEYS = {
+    'step_probe':
+        "deleted with the online alpha* servo (controller v8) -- replaced by the "
+        "`ray_calibration` block. The online probe estimated alpha* as a ratio whose "
+        "denominator straddled zero (per-probe sd/mean ~3.3), which is what forced the "
+        "censoring, windowing and quorum machinery that has now gone with it.",
+    'adaptive_lr.servo':
+        "deleted (controller v8). seed_lr moved to adaptive_lr.seed_lr and bounds to "
+        "adaptive_lr.bounds; target/clip/period/min_readings/max_bad_rate belonged to "
+        "the online median servo, which no longer exists.",
+    'adaptive_lr.trigger':
+        "deleted (controller v8) -- the quorum-below-a-bar trigger. Its statistic put "
+        "censored readings in the denominator but never the numerator, so its quorum "
+        "became unreachable exactly as the LR got dangerous (lrdisc v1).",
+    'adaptive_lr.boost':
+        "deleted (controller v8) -- growth now comes only from the periodic calibration.",
+    'adaptive_lr.discovery':
+        "deleted (controller v8) -- the ramp/cruise state machine. Periodic "
+        "recalibration provides re-discovery without a state machine.",
+    'adaptive_lr.damage':
+        "deleted (controller v8) -- the relative fwd/tb_err tripwire. Between "
+        "calibrations only catastrophic protection remains, by design: a loss-based "
+        "hot indicator on this problem fires too late to be a useful LR sensor.",
     'reuse_prior':
         "deleted -- point checkpoint_name/prior_model_name at the prior explicitly, "
         "or let the train_prior stage rebuild it. Auto-refinding a prior by run_name "
@@ -191,6 +213,14 @@ _RETIRED_KEYS = {
         "alpha*, so there is nothing to recover from a latch.",
     'adaptive_lr.recovery_wait_steps': "deleted with the recovery ramp.",
     'adaptive_lr.recovery_ramp_steps': "deleted with the recovery ramp.",
+    'adaptive_lr.servo.ceiling_halflife_steps':
+        "deleted -- the divergence ceiling is permanent for the run. The "
+        "discovery ramp re-tests the edge on sensor evidence, so relaxing the "
+        "same cap on a timer was a second mechanism with nothing measuring it.",
+    'adaptive_lr.servo.trigger':
+        "moved -> adaptive_lr.trigger. The trigger both stops a ramp and brakes "
+        "during cruise, so it is not a property of the servo's mechanics.",
+    'adaptive_lr.servo.discovery': "moved -> adaptive_lr.discovery.",
     'integrator.min_traj_length':
         "deleted -- the discretizer is always uniform with a static strategy, so "
         "T is the only trajectory-length parameter.",
@@ -219,6 +249,17 @@ _RETIRED_KEYS = {
     'buffers.anchor_buffer.mcmc':
         "deleted -- the Metropolis reheat is archived in git history "
         "(anchor_seed_mcmc_reheat); anchors seed from prior_dataset.",
+    'buffers.replay_buffer.admit_cap_max':
+        "deleted (decisions.md D5, to_do_rebuild.md Phase 3 step 3) -- replay "
+        "admission is now unconditionally uniform over the sane pool. "
+        "Selection moved entirely to the draw (buffers.replay_buffer.prioritise), "
+        "which already carries an IS correction; a residual-scored admission cap "
+        "would re-enter the force spectrum uncorrected on top of it.",
+    'buffers.replay_buffer.admit_cap_min': "deleted (see admit_cap_max).",
+    'buffers.replay_buffer.admit_cap_health_h0': "deleted (see admit_cap_max).",
+    'buffers.replay_buffer.admit_temperature':
+        "deleted (see admit_cap_max) -- admission and the displacement purge "
+        "both draw uniformly now, so there is no softmax temperature left to set.",
 }
 
 
@@ -305,8 +346,8 @@ def resolve_derived_config(args):
     # keys is recorded on args because _apply_lrs needs to know which groups
     # peak_scale applies to -- once resolved, `auto` and an explicit float are
     # indistinguishable as values, and that distinction IS the semantics.
-    servo_node = getattr(getattr(args, 'adaptive_lr', None), 'servo', None)
-    seed_lr = float(getattr(servo_node, 'seed_lr', None) or _SERVO_SEED_LR)
+    seed_lr = float(getattr(getattr(args, 'adaptive_lr', None), 'seed_lr', None)
+                    or _SERVO_SEED_LR)
     managed = []
     for name in _LR_KEYS:
         if _is_auto(getattr(args, name, None)):
@@ -321,21 +362,14 @@ def resolve_derived_config(args):
         # choose" and behaves as "pinned an order of magnitude low". That is the
         # exact class of silent change the retired-key preflight exists to stop,
         # so it is an error rather than a default.
-        servo = getattr(getattr(args, 'adaptive_lr', None), 'servo', None)
-        if servo is None or not getattr(servo, 'enabled', False):
+        cal = getattr(args, 'ray_calibration', None)
+        if cal is None or not getattr(cal, 'enabled', False):
             raise ValueError(
-                f"{', '.join(managed)} set to `auto` but adaptive_lr.servo is absent or "
-                f"disabled. `auto` no longer means the old T-scaling rule (anchor x 25/T) "
-                f"-- it means the alpha* loop OWNS this LR. Either enable the servo (it "
-                f"also needs a step_probe block), or write an explicit float for a fixed "
-                f"peak. The old rule at T={T} would have given "
-                f"lr_policy/back/replay {1.0e-4 * 25 / T:.3g}, lr_fused {5.0e-5 * 25 / T:.3g}.")
-        if getattr(args, 'step_probe', None) is None:
-            raise ValueError(
-                f"{', '.join(managed)} set to `auto` (servo-managed) but no `step_probe` "
-                f"block is configured. The servo's only sensor is alpha*, and with the "
-                f"probe absent it would hold at 'no_probe' forever -- pinning these LRs "
-                f"at the seed while the config claims they are adaptive.")
+                f"{', '.join(managed)} set to `auto` (controller-managed) but "
+                f"ray_calibration is absent or disabled. `auto` means the periodic ray "
+                f"calibration OWNS this LR; with no sensor it would sit at the seed "
+                f"{seed_lr:.3g} forever while the config claims it is adaptive. Either "
+                f"enable ray_calibration or write an explicit float for a fixed LR.")
 
     # grad clip: anchor x grad_median(T)/grad_median(T_REF) x sqrt(W/W_REF).
     # This one IS still derived -- it scales with the gradient's own measured

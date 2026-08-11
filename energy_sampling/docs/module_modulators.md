@@ -3,7 +3,11 @@
 Pass 1 (audit + rationalize). Verified against the working tree, 2026-08-03;
 **buffer-servo sections revised 2026-08-08** — the servo acquired a second,
 *derived* sensor on 2026-08-07 (`to_do_rebuild.md` §B7d) and was configured for
-the first time. Unconditional route. Covers
+the first time. **D3 revised 2026-08-10** — `train.py`'s `floor`/`stalled`
+replay-eviction causes were retired outright (`module_buffers.md` B10),
+which retires `toxic_min_draws` as a config key everywhere and makes the
+servo's `toxic_min_draws` boost path permanently inert as a side effect (D3
+below). Unconditional route. Covers
 [`increment_batch_size`](train.py:244), the OOM recovery path, and
 [`_buffer_servo_tick`](protocol.py:1676). The LR controller — the third
 modulator — has its own document.
@@ -121,8 +125,12 @@ currently being used for, which is what went stale in A.
 B carries one coupling worth stating: **it is only unbiased under the uniform
 hazard.** `birth_loss` exists only for residents, so it is the intake distribution
 *of survivors*, and that equals the intake distribution only if survival is
-independent of the residual (`module_buffers.md` §3). Reinstating a
-residual-conditioned purge silently invalidates this sensor.
+independent of the residual (`module_buffers.md` §3). As of 2026-08-10 this
+holds unconditionally — the residual-conditioned purge (`floor`/`stalled`)
+that could invalidate it is retired outright, not merely disabled under
+`prioritise` (`module_buffers.md` B10), so there is currently no code path
+that would reintroduce the bias. Recorded here as a coupling to watch, should
+a residual-conditioned purge ever come back.
 
 **A note on what the actuator can and cannot reach.** §B7a proves intake *rate* is
 the only lever on `λτ` — buffer size cancels out. So the boost below is not one
@@ -132,8 +140,12 @@ option among several; it is the only actuator that acts on this sensor at all.
 `mean_residence_steps ÷ B`. Since occupancy = `churn_rate × mean_residence_steps`
 (Little's law) and `draws_per_row = batch_size / churn_rate`, this leaves
 **occupancy exactly invariant** and moves only reuse (1/B) and policy lag (1/B).
-`toxic_min_draws` rides 1/B too, because it is defined relative to expected draws
-per row and would otherwise silently change meaning as B moves.
+The code (`protocol.py` `_apply_buffer_boost`) also carries a `toxic_min_draws
+÷ B` term, on the same reasoning — it was defined relative to expected draws
+per row and would otherwise silently change meaning as B moves — but that term
+is now dead: `toxic_min_draws` is a retired config key everywhere
+(`module_buffers.md` B10), so the snapshot it would scale is always zero. The
+boost the servo actually delivers today is two knobs, not three (D3).
 
 One knob with one invariant is the best single piece of control design in the
 codebase. `churn_rate`, `mean_residence_steps`, and `max_size` are three handles
@@ -272,7 +284,18 @@ for), and it is stored in three places, one of which is the config it is
 supposed to be modifying.**
 
 The three knobs the servo moves are `churn_rate`, `mean_residence_steps` and
-`toxic_min_draws`. `_apply_buffer_boost` **overwrites them on `args`**:
+`toxic_min_draws`. **Revised 2026-08-10: the third is now dead.**
+`buffers.replay_buffer.toxic_min_draws` (and `toxic_delta_threshold`) are
+retired config keys — setting either raises `ValueError` at load
+(`module_buffers.md` B10, `train.py:4490`), because the `stalled` eviction
+cause they fed is deleted outright, not merely gated. `_apply_buffer_boost`
+below still contains the `toxic_min_draws` branch, but it can never fire: the
+snapshot `getattr(rb, 'toxic_min_draws', 0) or 0` is always `0` now, since no
+valid config can set the attribute, so `base['toxic_min_draws'] > 0` is
+always false. Harmless — it just means the servo has moved two live knobs,
+not three, since this change, and the code below (and the read-site table
+past it) describes one more store than currently does anything.
+`_apply_buffer_boost` **overwrites them on `args`**:
 
 ```python
 rb.churn_rate = max(1, int(round(base['churn_rate'] * boost)))     # protocol.py:1757
@@ -301,20 +324,24 @@ There is no separate immutable copy anywhere.
 
 **The fix that does work: stop mutating `args` at all.** `bs_log_boost` is already
 in `stage_ctrl` and already checkpointed, so the boost is already durable — it just
-needs to be applied at **read** time instead of write time. The read sites are
-exactly three, all inside `manage_replay_buffer`:
+needs to be applied at **read** time instead of write time. The read sites were
+three, all inside `manage_replay_buffer`; as of 2026-08-10 (`toxic_min_draws`
+retired) they are down to two, and the line numbers below have moved with the
+`floor`/`stalled` deletion (`module_buffers.md` B10):
 
 | Knob | Read at | Becomes |
 |---|---|---|
-| `toxic_min_draws` | [train.py:5072](train.py:5072) | `base / B` |
-| `mean_residence_steps` | [train.py:5079](train.py:5079) | `base / B` |
-| `churn_rate` | [train.py:5144](train.py:5144) | `base × B` |
+| ~~`toxic_min_draws`~~ | — retired key, no longer read anywhere | — moot |
+| `mean_residence_steps` | [train.py:4518](train.py:4518) | `base / B` |
+| `churn_rate` | [train.py:4575](train.py:4575) | `base × B` |
 
-One accessor, three call sites, and **both** `_rb_base` and `_apply_buffer_boost`
+One accessor, two live call sites, and **both** `_rb_base` and `_apply_buffer_boost`
 delete outright. That removes two of the three stores rather than one, makes the
 compounding failure unrepresentable rather than merely unlikely, and drops the
 `_apply_buffer_boost(1.0)` reset-on-stage-exit special case (below) because there
-is no longer any state to reset.
+is no longer any state to reset. The `toxic_min_draws` branch inside
+`_apply_buffer_boost` can simply be deleted along with the rest rather than
+ported — see the note above D3's code block.
 
 ⏳ **Outstanding as of 2026-08-08**, and deliberately not done while the rb0808
 battery is in flight — arm 20 is the servo arm, and this changes the manage path it
@@ -349,7 +376,7 @@ probably fine; worth knowing when reading a step-time trace across a transition.
 | `batch_growth_min_gain: 0.15` | **arbitrary** | — |
 | Grow-until-OOM as the operating mode | **accepted** — documented and deliberate | — |
 | Boost holds occupancy invariant | **derived** — Little's law | docstring |
-| `toxic_min_draws` rides 1/B | **derived** — preserves its definition | docstring |
+| `toxic_min_draws` rides 1/B | **derived, now moot** — preserved its definition while the key was live; the key is retired 2026-08-10 (`module_buffers.md` B10) and the servo's corresponding boost term is permanently inert | docstring; D3 |
 | Release term (non-ratchet) | **measured** — one-way anneals fixed-point at the bound | prior controller-ratchet failure |
 | Servo `bar` / `release` / `scale` **on sensor A** | **measured but stale** | D1 |
 | `bar: 0.368` **on sensor B** | **derived** — `ratio ≈ exp(−λτ)` puts `λτ = 1` there, so it transfers across problem, T and buffer size | `module_buffers.md` B8 |
@@ -385,7 +412,8 @@ D8 (authority) and D3 (`_rb_base`), neither of which is about what replay *is*.
 **S2 — ~~derive `_rb_base` from config each tick~~; apply the boost at READ time
 and delete the cache** (D3). *(restated 2026-08-08 — the original form was
 unworkable: the config is the thing being overwritten, so there is no pristine
-value left to re-read. See D3 for the three read sites.)* Still chosen over
+value left to re-read. See D3 for the read sites — two of them, live, as of
+the 2026-08-10 `toxic_min_draws` retirement.)* Still chosen over
 checkpointing `_rb_base`: it removes two stores instead of one, and the compounding
 failure becomes unrepresentable rather than unlikely. **Sequenced after rb0808
 lands** — it changes the manage path arm 20 is running.

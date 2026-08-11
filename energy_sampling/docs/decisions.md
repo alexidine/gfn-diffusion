@@ -821,10 +821,15 @@ sensor and a satisfied controller produce identical silence.** Two cheap guards
 follow — a metric a controller reads must go through `metric_tracker.update`, and
 every controller must emit its *actuator* alongside its sensor.
 
-**Also corrected:** `D5`'s row below says uniform admission "retires
-`admit_temperature`". It does not, yet — B7b shipped opt-in, so `admit_temperature`
-is live on `mk_dev` and on 22 of 26 rb0808 arms, and the four cap/temperature keys
-are read with no default (deleting them raises). See `module_buffers.md` B0.
+**Also corrected, then done:** `D5`'s row below says uniform admission "retires
+`admit_temperature`". As of 2026-08-08 it did not yet -- B7b shipped opt-in, so
+`admit_temperature` was live on `mk_dev` and on 22 of 26 rb0808 arms, and the
+four cap/temperature keys were read with no default (deleting them raised).
+**As of 2026-08-10, D5 is finished**: admission is unconditionally uniform and
+the four keys are retired (`utils.py` `_RETIRED_KEYS`) -- a config setting any
+of them now fails at load. `mk_dev.yaml` still sets `admit_temperature` and
+friends as of this note; those lines need deleting by hand (mk_dev is
+user-owned). See `module_buffers.md` B0.
 
 ## 2026-08-06 — decisions session
 
@@ -838,7 +843,7 @@ are read with no default (deleting them raises). See `module_buffers.md` B0.
 | **D1** | **(b) — the plan is the whole plan.** Fold the missing areas in as Parts C+ | → `N1`. Sharpened by your framing that replay must re-earn its place: if it doesn't, most of Part B is moot and the balance controller becomes the *whole* mix question |
 | **D3** | **Build the servo** — proceed with §A3/§A4 as proposed | §A6's probe demotes from kill-gate to instrumentation. Honest residue: if α\* *is* flat up to the cliff, the servo can't prevent it, so the probe still scopes whether a separate hard ceiling is needed |
 | **D4** | **Delete the LR middle layer** — resolved *by* D3, not independently | Your reframe was right and it dissolves the question. Three regimes, two owners: *slightly hot* → α\* < 1 → smooth `peak` nudge, false-positive cost ≈ 0; *diverged* → coarse bar → reload. The middle layer occupied a third regime — "cut hard and latch, but don't reload" — which has **no distinct response left** once the servo cuts continuously on a better sensor. So "should we always reload when a little hot?" answers **no**: a little hot now has a response that costs nothing, so it never needs escalating. And your own point — *"if we are only looking at hard blow-ups we can use almost any metric"* — retires §A2's entire calibration problem (the 3.3× bar drift; tw_july31 arm 14 dying in the gap between cut bar and reset bar) |
-| **D5** | **Uniform admission** — simpler for a start | → §C Phase-3 step 3. Retires `admit_cap_max` / `admit_cap_min` / `admit_cap_health_h0` / `admit_temperature` |
+| **D5** | **Uniform admission** — simpler for a start | ✅ **DONE 2026-08-10.** → `to_do_rebuild.md` §C Phase-3 step 3. Retired `admit_cap_max` / `admit_cap_min` / `admit_cap_health_h0` / `admit_temperature` (`utils.py` `_RETIRED_KEYS`); admission is unconditionally uniform (`train.py` `manage_replay_buffer`). `mk_dev.yaml` still needs the keys deleted by hand |
 | **D6** | **Branch-asymmetric `beta` is always available**, at minimum as an option. Consistency in *reporting* is the real constraint | → `N4`. Unblocks §B6, the β×κ arm, and `P9`'s `beta_bwd` lever |
 | **D7** | **No step budget.** ~7 days on an A100, typically <100k steps. Train to convergence, don't strangle it | → `N2`, and `P2` retired. A scheduled decay presupposes a horizon that does not exist |
 | **D9** | **`fwd/tb_err_worst`** — the simplest, most direct health metric | → `N3`. Bar needs recalibrating; also moves the gate off the metric D6 would make non-portable |

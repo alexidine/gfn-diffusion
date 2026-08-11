@@ -205,7 +205,7 @@ call, so a supplied `p` was silently ignored — and because the IS weights
 `w ∝ 1/δ₊^κ` were *still applied to the loss*, a uniform draw carrying `1/p`
 weights targets a measure `∝ 1/δ^κ`: **the inverse of the design**, up-weighting
 the lowest-residual rows. Details and the κ=0 identity that exposed it are in
-`module_buffers.md` B9.
+[`findings.md`](findings.md) `F-004`.
 
 **Why it belongs in this module and not only in buffers:** the draw and the
 weighting are wired in *two different places* — `draw_replay_sample` picks the

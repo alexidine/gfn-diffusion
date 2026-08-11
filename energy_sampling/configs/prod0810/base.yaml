@@ -1,5 +1,10 @@
-run_name: 'mk_dev'
-tag: 'dev'
+# prod0810 battery base. Snapshot of configs/mk_dev.yaml taken 2026-08-11, with the
+# cluster/no-warm-start layer folded in. make.py in this directory deep-merges the
+# per-arm overrides in TARGETS on top of this file; it applies NO other defaults, so
+# every shared setting for this battery is editable here. NOT loadable on its own:
+# the per-arm keys below are placeholders make.py always overwrites.
+run_name: 'mk_dev'                  # PER-ARM: set from TARGETS
+tag: 'dev'                          # PER-ARM: set to the battery TAG
 seed: 12345
 device: 'cuda'
 cuda_memory_fraction: 0.9
@@ -8,19 +13,20 @@ anomaly_detection: false  # dramatic slowdown when True
 # Checkpoints
 ################################################################
 continue_from_checkpoint: false  # inert while checkpoint_name is set (train.py init_gfn takes that branch first); true resolves to this run identity's own _running.pt
-mlip_path: null #'D:\crystal_datasets\esen_s.pt'
-checkpoints_dir: 'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints'
-# T=10 train_prior exit, step 6680, post-periodic-fix. A copy of this run identity's own
-# _phase1_exit.pt under a prefix no run writes, so train_prior's on_exit snapshot can't
-# overwrite the warm-start source. Its _phase1_exit_buffers.pt sidecar is copied alongside
-checkpoint_name: 'dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-573c92_phase1_exit.pt'
+mlip_path: null                     # PER-ARM: null for elj, the uma/mace model path otherwise
+checkpoints_dir: '/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/'
+# No warm start: every arm trains phase 1 (train_prior) in-run. mk_dev's checkpoint is
+# keyed to mipcas+elj through prior_path and hard-raises under any other target here --
+# see make.py's docstring. reuse_prior was RETIRED (controller v7); clearing
+# checkpoint_name/prior_model_name is what "no warm start" means now.
+checkpoint_name: null
 prior_model_name: null  # a SEPARATE frozen GFN for prior-buffer sampling only; rebuilt from its own stored gfn_config, so any architecture. To also warm-start the policy, point checkpoint_name at the same file with load_weights_only: true
 load_weights_only: false
-prior_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt
-molecules_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt
+prior_path: null                    # PER-ARM: <CLUSTER_PRIOR_DIR>/<mol>_sg<N>_zp<N>_<efunc>_prior_dataset.pt
+molecules_path: null                # PER-ARM: same file as prior_path
 test_molecules_path: null
 archive_period: 5000  # freeze a step-tagged copy of 'running' every N steps (0/null = off). Hardlinked off bytes already on disk: no write I/O, ~910MB of disk per archive
-archive_buffers: true
+archive_buffers: false
 override_learning_rates: false  # on resume, overwrite the numeric LR restored from the checkpoint's optimizers with this config's lr_* values. Warmup state and Adam moments are left as-is
 
 #Optimizers
@@ -59,7 +65,7 @@ adaptive_lr:
   # a one-step measurement that cannot see multi-step effects, while lowering is
   # the safe direction (undertraining is recovered, damage is not).
   calibration:
-    alpha_target: 4.0
+    alpha_target: 6.0
     eta_up: 0.25
     eta_down: 0.5
 
@@ -141,8 +147,8 @@ model:
 ################################################################
 buffer_device: cuda           # where the churned/static sample stores live (replay + prior + anchor buffers, mol/prior datasets). 'cuda' turns per-step buffer draws/admits/purges into async device gathers instead of serial CPU work + host round trips; footprint ~1KB/graph. 'cpu' = legacy
 batch_size: 1000              # number of samples per training batch -- single shared batch size for all rollout work (train fwd/bwd/replay/fused AND eval sampling)
-grow_batch_size: false        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 1000
+grow_batch_size: true         # whether to dynamically grow the batch size to fill the RAM
+max_batch_size: 50000         # a safety ceiling, not a target, while auto_batch_throughput_opt is on
 # jump-mode batch growth: multiply by batch_growth_factor once every batch_growth_interval steps
 # so the run visits only ~log_f(max/base) distinct batch sizes (torch.compile treats each
 # distinct size as a recompile). OOM cuts divide by the same factor, then cool down.
@@ -162,18 +168,18 @@ oom_cooldown_steps: 200  # steps to hold batch_size flat after an OOM before res
 eval_num_samples: 10000       # minimum number of samples for evaluation
 test_eval_num_samples: 2000   # held-out conditional eval batch; inert while test_molecules_path is null
 fused_grad_accum_min_samples: 1000  # fused steps only: effective-gradient floor. Batches BELOW this accumulate micro-steps until this many samples contribute; batches AT/ABOVE it take a plain unscaled step. 0 disables
-epochs: 100000             # number of training epochs
-eval_period: 250              # how often to do evaluation & reporting
-figs_period: 500             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+epochs: 1000000             # number of training epochs
+eval_period: 500              # how often to do evaluation & reporting. Cluster cadence -- never 250/250
+figs_period: 1000            # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # SDE integration
 ################################################################
 # MUST equal integrator.T -- enforced at config load. Drift and variance are
 # learned per step at one dt, and P_B's reference bridge is written in
 # accumulated-variance time, so a different dt integrates a different SDE.
-eval_T: 10
+eval_T: 60
 integrator:
-  T: 10                        # training diffusion length, and the only trajectory-length parameter -- the discretizer is always uniform over T
+  T: 60                        # training diffusion length, and the only trajectory-length parameter -- the discretizer is always uniform over T
 
 # BASE DEFAULTS for the per-mode loss coefficients. The live values on any
 # given step are these blocks overlaid with the CURRENT protocol stage's
@@ -479,13 +485,13 @@ buffers:
 
 # energy function settings
 ################################################################
-energy_function: 'elj'
+energy_function: 'elj'  # PER-ARM: elj / uma / mace
 temperature_conditioning: false  # if false, temperatures are set to temperature, and there is no annealing
 molecule_conditioning: false  # conditions the generative prediction on the molecule
 sg_conditioning: False  # whether to conditionally sample across space groups
-space_groups: [ 2 ]  # which space groups to sample over ([1] for toys)
+space_groups: [ 2 ]  # PER-ARM: the single space group of this arm's polymorph
 zp_conditioning: false # whether to condition over z prime values
-z_primes: [ 1 ]
+z_primes: [ 1 ]  # PER-ARM: the single z' of this arm's polymorph
 vector_conditioning: false  # per-sample condition vectors embedded through a plain MLP -- for toy energy functions
 vector_conditioning_dim: 3  # inert while vector_conditioning is false
 energy_config:

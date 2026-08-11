@@ -1,0 +1,8 @@
+index	name	molecule	polymorph	energy_function
+0	mipcas_elj	mipcas	sg2_zp1	elj
+1	mipcas_uma	mipcas	sg2_zp1	uma
+2	nehzor_elj	nehzor	sg14_zp1	elj
+3	nehzor_uma	nehzor	sg14_zp1	uma
+4	acridine_sg14_zp1_mace	acridine	sg14_zp1	mace
+5	acridine_sg14_zp2_mace	acridine	sg14_zp2	mace
+6	acridine_sg9_zp2_mace	acridine	sg9_zp2	mace

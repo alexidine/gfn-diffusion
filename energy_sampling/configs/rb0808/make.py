@@ -50,9 +50,9 @@ OTHER TRAPS ENCODED HERE
   Do not pin it -- these are A100s and the knee is not where the laptop's was.
 * eval_T must equal train T.
 * eval_period 500 / figs_period 1000 on cluster. NEVER 250/250.
-* lrprobe/fit_*_rate are LIFETIME-CUMULATIVE (step_probe.report divides by
-  sum(counts), never reset), so a late spike is diluted. Read the ramps on
-  lr_opt = lrprobe/alpha_median * live lr_fused, NOT on fit_downward_rate.
+* lrprobe/fit_*_rate are WINDOWED (last `window` probes, ~500 train steps at
+  the defaults) -- step_probe.report() reads status_hist, not a run-lifetime
+  count. Read the ramps on lr_opt = lrprobe/alpha_median * live lr_fused.
 * prioritise {enabled: true, kappa: 0} is NOT a null -- replay_priority_config
   returns 0.0 (not None), so the whole package engages: uniform intake,
   hazard-only purge, AND the delta_plus>0 eligibility filter. kappa=0 draws

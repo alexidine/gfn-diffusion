@@ -1,0 +1,298 @@
+"""
+prod0810 -- config generator for the MIPCAS/NEHZOR/acridine production runs.
+
+    python configs/prod0810/make.py            # write configs + INDEX + sbatch
+    python configs/prod0810/make.py --preflight  # verify every referenced file exists ON THE
+                                                   # MACHINE THIS RUNS ON. Run on the cluster
+                                                   # before submitting -- the prior/mlip paths
+                                                   # below are cluster paths mirrored from this
+                                                   # repo's local D:\crystal_datasets\conditional\
+                                                   # priors\ tree, and that mirror has not been
+                                                   # verified from here.
+
+Reusable shape: base.yaml IN THIS DIRECTORY is the battery's whole shared config, and TARGETS
+is a flat list of per-arm overrides deep-merged on top of it via the same overwrite_nested_dict
+helper configs/generate_configs.py uses elsewhere in this repo. This file applies NO defaults of
+its own -- every setting shared across arms is edited in base.yaml, and only the six keys in
+build_config() below vary per arm. To generate a different battery, copy this directory, edit
+base.yaml, and replace TARGETS.
+
+base.yaml is a snapshot of configs/mk_dev.yaml taken 2026-08-11 with the cluster/no-warm-start
+layer folded in. It is a SNAPSHOT, deliberately: mk_dev is the user's live dev config and
+changes under this battery otherwise. Re-snapshot by hand to pick up mk_dev changes.
+
+=============================================================================
+WHY EVERY ARM HERE TRAINS PHASE 1 FROM SCRATCH
+=============================================================================
+mk_dev.yaml ships checkpoint_name pointed at a mipcas/elj/T=10 warm-start file.
+get_problem_definition() keys the problem identity on prior_path (among other fields), so that
+checkpoint is specific to mipcas+elj -- loading it under nehzor, mipcas+uma, or any acridine
+target hits assert_problem_match() and hard-raises (see configs/rb0808/make.py's docstring for
+the same trap). None of these 7 targets has an existing phase1_exit checkpoint anywhere in this
+repo's checkpoints/ directory, so base.yaml clears checkpoint_name/prior_model_name: phase 1
+(train_prior) runs in-run before equilibration starts. write_all() asserts this per arm.
+
+=============================================================================
+KNOWN GAP: acridine sg19/zp1 zp3 (Form IV) has no built prior dataset
+=============================================================================
+The old 4-polymorph sweep (configs/old/acridine/generate_configs.py) covered sg14/zp1, sg14/zp2,
+sg9/zp2, sg19/zp3. Only the first three have an assembled
+<mol>_sg<N>_zp<N>_mace_prior_dataset.pt under crystal_datasets/conditional/priors/ -- sg19/zp3
+only has raw, unassembled prior_chunks/may_acridine_sg19_zp3_*.pt fragments. This generator
+writes 7 arms, not 8, and skips that polymorph rather than pointing at data that doesn't exist.
+Build its prior dataset first if the fourth polymorph is wanted here.
+
+=============================================================================
+UNVERIFIED: uma/mace step throughput and reward/temperature calibration
+=============================================================================
+Every other production/battery config in this repo (rb0808, aug02, tw_july31, ...) runs energy_
+function: elj, and every measured steps/hour number in docs/decisions.md and this repo's memory
+comes from elj runs. uma and mace route through an external MLIP call per energy evaluation
+(mxtaltools MolecularCrystal.__init__, energies/molecular_crystal.py) that is far more expensive
+than the analytic elj potential -- confirmed by batched_analyze_crystal_batch's own internal
+MLIP sub-batch chunk size (1000 for uma/mace vs 10000 otherwise), independent of this config's
+batch_size. There is no measured sph (steps/hour) figure for uma or mace to size an epochs
+budget against, so `epochs` itself is NOT re-tuned per arm -- it stays mk_dev's own absolute
+step ceiling, inherited unmodified. --time IS set explicitly per TIME_CLASSES below (user call,
+2026-08-10): 7 days for MIPCAS/NEHZOR (elj+uma), 48h for acridine (mace) -- these are wall-clock
+budgets, not a throughput measurement, so a run hitting its wall before `epochs` just means the
+SLURM ceiling bound it first. Watch the first uma/mace arm's throughput and revisit epochs/
+TIME_CLASSES once it's measured -- do not assume it matches the elj sph numbers in T_BLOCK
+(configs/rb0808/make.py).
+
+reward_range, energy_config.temperature, and lj_coeff (which despite the name is the generic
+potential-scale coefficient applied to lj/qlj/elj/silu/uma/mace alike -- energies/
+molecular_crystal.py) all sit in base.yaml at mk_dev's values, which were tuned against elj.
+Nothing here re-tunes them for uma/mace; watch reward/energy histograms on the first run of each.
+"""
+import argparse
+import os
+from copy import deepcopy
+from pathlib import Path
+
+import yaml
+
+HERE = Path(__file__).parent
+BASE_CONFIG = HERE / 'base.yaml'   # this battery's own base -- NOT configs/mk_dev.yaml
+TAG = 'prod0810'
+
+# --- cluster paths -----------------------------------------------------------
+# checkpoints_dir is NOT here: it lives in base.yaml with everything else shared.
+CLUSTER_PRIOR_DIR = '/scratch/mk8347/data/crystal_datasets/conditional/priors/'
+CLUSTER_UMA_MLIP = '/scratch/mk8347/models/uma/esen_s.pt'
+CLUSTER_MACE_MLIP = '/scratch/mk8347/data/acr_112025_mh1_stagetwo.model'
+
+
+def load_yaml(path):
+    path = Path(path)
+    with path.open('r', encoding='utf-8') as f:
+        return yaml.safe_load(f)
+
+
+def overwrite_nested_dict(d1, d2):
+    """Deep-merge d2 onto d1. Shared with configs/generate_configs.py's helper of the same name."""
+    for k, v in d2.items():
+        if isinstance(v, dict) and k in d1 and isinstance(d1[k], dict):
+            d1[k] = overwrite_nested_dict(d1[k], v)
+        else:
+            d1[k] = v
+    return d1
+
+
+def prior(mol, sg, zp, efunc):
+    return f'{CLUSTER_PRIOR_DIR}{mol}_sg{sg}_zp{zp}_{efunc}_prior_dataset.pt'
+
+
+# name -> (molecule, sg, zp, energy_function, mlip_path)
+TARGETS = [
+    ('mipcas_elj', 'mipcas', 2, 1, 'elj', None),
+    ('mipcas_uma', 'mipcas', 2, 1, 'uma', CLUSTER_UMA_MLIP),
+    ('nehzor_elj', 'nehzor', 14, 1, 'elj', None),
+    ('nehzor_uma', 'nehzor', 14, 1, 'uma', CLUSTER_UMA_MLIP),
+    ('acridine_sg14_zp1_mace', 'acridine', 14, 1, 'mace', CLUSTER_MACE_MLIP),
+    ('acridine_sg14_zp2_mace', 'acridine', 14, 2, 'mace', CLUSTER_MACE_MLIP),
+    ('acridine_sg9_zp2_mace', 'acridine', 9, 2, 'mace', CLUSTER_MACE_MLIP),
+    # acridine sg19/zp3 (Form IV) intentionally excluded -- see module docstring.
+]
+
+
+def build_config(base, name, mol, sg, zp, efunc, mlip_path):
+    """The ONLY keys that vary per arm. Everything else comes from base.yaml untouched.
+    Deep-merged, so a nested override (e.g. energy_config: {temperature: ...}) can be added
+    to this dict without flattening it."""
+    cfg = deepcopy(base)
+    p = prior(mol, sg, zp, efunc)
+    overwrite_nested_dict(cfg, dict(
+        prior_path=p,
+        molecules_path=p,
+        mlip_path=mlip_path,
+        energy_function=efunc,
+        space_groups=[sg],
+        z_primes=[zp],
+        # bare, human-readable run_name -- tag carries the battery id separately.
+        # Matches configs/rb0808/make.py's add() (run_name='base_T25', tag='rb0808'),
+        # not the tag-prefixed form: every current battery generator keeps these separate.
+        run_name=name,
+        tag=TAG,
+    ))
+    return cfg
+
+
+# --- SLURM time classes ------------------------------------------------------
+# MIPCAS/NEHZOR (elj+uma) run longer; acridine (mace) is capped at 48h. Sizes are
+# the user's explicit call, not a throughput measurement -- see docstring above.
+TIME_CLASSES = [
+    ('mipcas_nehzor', '7-00:00:00', lambda mol: mol in ('mipcas', 'nehzor')),
+    ('acridine',      '2-00:00:00', lambda mol: mol == 'acridine'),
+]
+
+
+def _slurm_ranges(idxs):
+    """Compact a sorted index list into slurm array syntax: 0-3,7,11-13."""
+    out, i = [], 0
+    while i < len(idxs):
+        j = i
+        while j + 1 < len(idxs) and idxs[j + 1] == idxs[j] + 1:
+            j += 1
+        out.append(str(idxs[i]) if j == i else f'{idxs[i]}-{idxs[j]}')
+        i = j + 1
+    return ','.join(out)
+
+
+def write_all():
+    assert BASE_CONFIG.is_file(), (
+        f'{BASE_CONFIG} not found. This battery builds from its OWN base, not configs/mk_dev.yaml '
+        f'-- re-snapshot it with:  cp configs/mk_dev.yaml {BASE_CONFIG}  then re-apply the '
+        f'cluster/no-warm-start edits described in that file\'s header.')
+    base = load_yaml(BASE_CONFIG)
+    # base.yaml owns everything shared, so a stale local path there would silently ship to
+    # all 7 arms. Catch the ones a mk_dev re-snapshot would reintroduce.
+    assert base['checkpoint_name'] is None and base['prior_model_name'] is None, \
+        'base.yaml carries a warm start -- see WHY EVERY ARM HERE TRAINS PHASE 1 FROM SCRATCH'
+    assert str(base['checkpoints_dir']).startswith('/'), \
+        f"base.yaml checkpoints_dir is not a cluster path: {base['checkpoints_dir']}"
+    assert base['eval_period'] == 500 and base['figs_period'] == 1000, \
+        'base.yaml must carry the cluster eval/figs cadence (500/1000), never 250/250'
+    HERE.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    seen_names = set()
+    for idx, (name, mol, sg, zp, efunc, mlip_path) in enumerate(TARGETS):
+        assert name not in seen_names, f'duplicate target name {name}'
+        seen_names.add(name)
+        cfg = build_config(base, name, mol, sg, zp, efunc, mlip_path)
+
+        assert cfg['checkpoint_name'] is None, f'{name}: must train phase 1 from scratch'
+        assert (cfg['mlip_path'] is None) == (efunc == 'elj'), \
+            f'{name}: mlip_path must be null for elj and set for uma/mace'
+
+        with (HERE / f'{idx}.yaml').open('w', encoding='utf-8') as f:
+            yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
+        rows.append((idx, name, mol, f'sg{sg}_zp{zp}', efunc))
+        print(f'  {idx}  {name:<26} {efunc:<5} sg{sg} zp{zp}')
+
+    (HERE / 'INDEX.tsv').write_text(
+        'index\tname\tmolecule\tpolymorph\tenergy_function\n' +
+        '\n'.join('\t'.join(str(x) for x in r) for r in rows) + '\n', encoding='utf-8')
+
+    unclassed = [r[0] for r in rows if not any(pred(r[2]) for _, _, pred in TIME_CLASSES)]
+    assert not unclassed, f'arms with no TIME_CLASSES match: {unclassed}'
+    made = []
+    for label, tlim, pred in TIME_CLASSES:
+        idxs = [r[0] for r in rows if pred(r[2])]
+        if not idxs:
+            continue
+        (HERE / f'submit_{label}.sbatch').write_text(SBATCH_TEMPLATE.format(
+            time=tlim, array=_slurm_ranges(idxs), label=label), encoding='utf-8')
+        made.append((label, tlim, _slurm_ranges(idxs), len(idxs)))
+
+    print(f'\nwrote {len(rows)} configs + INDEX.tsv in {HERE}  (base: {BASE_CONFIG.name})')
+    print('acridine sg19/zp3 (Form IV) excluded -- no assembled prior dataset (see docstring)')
+    print('uma/mace epochs are an UNMEASURED guess inherited from base.yaml -- see docstring')
+    print('submit files:')
+    for label, tlim, arr, n in made:
+        print(f'  submit_{label}.sbatch   --time={tlim:<11} --array={arr}   ({n} arms)')
+    print('\nNEXT: run  python configs/prod0810/make.py --preflight  ON THE CLUSTER')
+
+
+SBATCH_TEMPLATE = """#!/bin/bash
+#SBATCH --time={time}
+#SBATCH --gres=gpu:a100:1
+#SBATCH --mem=48G
+#SBATCH --cpus-per-task=1
+#SBATCH --tasks-per-node=1
+#SBATCH --mail-user=mjakilgour@gmail.com
+#SBATCH --mail-type=END
+#SBATCH --array={array}
+#SBATCH --account=torch_pr_226_chemistry
+#SBATCH --job-name=prod0810_{label}
+
+# prod0810 :: {label}
+# index -> arm mapping is in configs/prod0810/INDEX.tsv
+module purge
+
+# ---- paths ----
+IMAGE=/share/apps/images/cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif
+OVERLAY=/scratch/mk8347/venvs/mxt_container/overlay-50G-10M-copy.ext3
+PROJECT_ROOT=/scratch/mk8347/projects/gfn_cond
+WORKDIR=${{PROJECT_ROOT}}/gfn-diffusion/energy_sampling
+
+# ---- config selection ----
+CONFIG=${{WORKDIR}}/configs/prod0810/${{SLURM_ARRAY_TASK_ID}}.yaml
+
+# ---- run ----
+srun singularity exec --nv \\
+    --overlay ${{OVERLAY}}:ro \\
+    --bind ${{PROJECT_ROOT}}:${{PROJECT_ROOT}} \\
+    --pwd ${{WORKDIR}} \\
+    ${{IMAGE}} \\
+    /bin/bash -c "
+        source /ext3/env.sh
+        export PYTHONPATH=${{PROJECT_ROOT}}/MXtalTools:${{PROJECT_ROOT}}/gfn-diffusion:\\$PYTHONPATH
+        python train.py --config ${{CONFIG}}
+    "
+"""
+
+
+def arm_configs():
+    """The generated per-arm yamls -- base.yaml is not one of them."""
+    return sorted(HERE.glob('[0-9]*.yaml'), key=lambda p: int(p.stem))
+
+
+def preflight():
+    """Verify every checkpoints_dir/prior_path/molecules_path/mlip_path this battery references
+    actually exists ON THIS MACHINE. Run on the cluster: the paths assume the local
+    D:\\crystal_datasets\\conditional\\priors\\ tree was mirrored under CLUSTER_PRIOR_DIR,
+    which has not been checked from the machine that generated these configs."""
+    paths = arm_configs()
+    if not paths:
+        print(f'no arm configs in {HERE} -- run make.py first'); return 1
+    ckpt_dir = yaml.safe_load(paths[0].read_text(encoding='utf-8'))['checkpoints_dir']
+    print(f'checkpoints_dir: {ckpt_dir}')
+    if not os.path.isdir(ckpt_dir):
+        print('  !! directory does not exist -- edit checkpoints_dir in base.yaml, re-run make.py')
+        return 1
+    bad = 0
+    for path in paths:
+        cfg = yaml.safe_load(path.read_text(encoding='utf-8'))
+        for key in ('prior_path', 'molecules_path', 'mlip_path'):
+            val = cfg.get(key)
+            if val and not os.path.isfile(val):
+                print(f'  MISSING  {path.name:<12} {key} -> {val}')
+                bad += 1
+    if bad:
+        print(f'\n{bad} missing file(s). Fix CLUSTER_PRIOR_DIR/CLUSTER_UMA_MLIP/CLUSTER_MACE_MLIP '
+              f'above or the cluster mirror, then re-run make.py before submitting.')
+        return 1
+    print('preflight OK -- every referenced file exists. Safe to submit.')
+    return 0
+
+
+if __name__ == '__main__':
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--preflight', action='store_true',
+                    help='verify referenced files exist ON THIS MACHINE (run on the cluster)')
+    a = ap.parse_args()
+    if a.preflight:
+        raise SystemExit(preflight())
+    write_all()
