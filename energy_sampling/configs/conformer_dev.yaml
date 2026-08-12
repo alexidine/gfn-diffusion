@@ -78,7 +78,7 @@ training:
   batch_growth_interval: 50
   batch_growth_slow_interval: 300
   auto_batch_throughput_opt: true
-  batch_growth_min_gain: 0.15
+  batch_growth_max_step_regression: 0.25  # how much slower a step may get in exchange for a jump's throughput (replaces batch_growth_min_gain, which scored raw samples/sec and accepted jumps that made steps 43% slower)
   exploration_std: 0.0
   buffer_path: null            # .pt from build_conformer_buffer.py
   bwd_frac: 0.5

@@ -155,6 +155,13 @@ _GRAD_MEDIAN = {10: 1.0e3, 25: 6.6e3, 100: 1.7e4}  # empirical pre-clip grad med
 # (1.1-7.8 h each) because a retired-key guard lived inside manage_replay_buffer,
 # which first runs at the phase-1 -> 2 transition (module_buffers.md B4).
 _RETIRED_KEYS = {
+    'batch_growth_min_gain':
+        "deleted -- replaced by `batch_growth_max_step_regression`. It asked for a "
+        "fixed samples/sec gain, which is not a knee criterion: at growth factor f a "
+        "rung returning exactly min_gain has grown step time by f/(1+min_gain), so the "
+        "shipped 1.65/0.15 pair ACCEPTED every jump that made steps 43% slower and "
+        "walked prod0810's batch to 12226 before OOM stopped it. The replacement bounds "
+        "the step-time regression directly (accept iff t_new/t_old <= 1 + tol).",
     'step_probe':
         "deleted with the online alpha* servo (controller v8) -- replaced by the "
         "`ray_calibration` block. The online probe estimated alpha* as a ratio whose "
@@ -453,9 +460,14 @@ def _to_plain(obj):
 # energy_config fields excluded from the problem definition so changing them
 # doesn't invalidate checkpoint reuse: the coeffs because they're never varied
 # in practice, reward_range because it's a reward-shaping/training knob layered
-# on top of the same energy landscape rather than part of its identity
+# on top of the same energy landscape rather than part of its identity,
+# internal_oom_recovery because it only chooses HOW a batch is fed to the energy
+# (one call vs adaptive sub-batching), not what the energy is -- and flipping it
+# would otherwise re-hash every slug and orphan the prod0810 phase1_exit
+# checkpoints. normalize_problem_def drops these from BOTH sides of a
+# compatibility check, so checkpoints saved before an entry was added still load.
 _NON_IDENTITY_ENERGY_CONFIG_KEYS = ('density_coeff', 'bounding_coeff', 'reduction_coeff', 'lj_coeff',
-                                    'reward_range')
+                                    'reward_range', 'internal_oom_recovery')
 
 # Explicit version of the problem_def SCHEMA (the set of fields below that
 # constitute a problem's identity). It rides in the dict and therefore in the
@@ -482,7 +494,7 @@ def get_problem_definition(args) -> dict:
     for key in _NON_IDENTITY_ENERGY_CONFIG_KEYS:
         energy_config.pop(key, None)
 
-    return _to_plain({
+    definition = {
         # explicit schema version -- bump when adding/removing a field below
         # (see PROBLEM_DEF_SCHEMA_VERSION); freeze before baking a shared prior
         'schema_version': PROBLEM_DEF_SCHEMA_VERSION,
@@ -496,7 +508,20 @@ def get_problem_definition(args) -> dict:
         # a vector-conditional policy expects `c` inputs an unconditional
         # problem doesn't provide, so the flag is part of the identity
         'vec_cond': getattr(args, 'vector_conditioning', False),
-    })
+    }
+
+    # Pre-embedded molecule conditioning belongs to the identity for the same reason
+    # vec_cond does: the policy expects per-molecule embedding inputs an unconditional
+    # problem never supplies. It is added ONLY WHEN ON, rather than as an always-present
+    # False, deliberately -- every key here feeds problem_hash, so writing it
+    # unconditionally would change the hash of every existing run and orphan checkpoints
+    # that are otherwise still valid (there are production runs queued against them). A
+    # run that never sets the flag keeps the exact identity it had before this key existed.
+    if getattr(args, 'embedding_conditioning', False):
+        definition['emb_cond'] = True
+        definition['emb_cond_dim'] = getattr(args, 'embedding_conditioning_dim', None)
+
+    return _to_plain(definition)
 
 
 def normalize_problem_def(problem_def):

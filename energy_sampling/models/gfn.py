@@ -42,6 +42,9 @@ class GFN(nn.Module):  # todo add seeding
                  do_periodic_angles: bool = True,
                  periodic_centroids: bool = False,
                  periodic_centroid_axes: Optional[Sequence[int]] = None,
+                 hold_dead_latent_rows: bool = True,
+                 dead_latent_rows: Optional[Sequence[int]] = None,
+                 dead_latent_values: Optional[Sequence[float]] = None,
                  dplr_rank: int = 0,
                  dplr_rho_max: float = 0.9,
                  dplr_mask_angular: bool = True,
@@ -91,9 +94,15 @@ class GFN(nn.Module):  # todo add seeding
         # `periodic_centroids` is the on/off switch (config-level); the axes themselves are
         # a space group property and so are resolved by the caller (train.py) rather than here
         self.periodic_centroids = periodic_centroids
+        # `hold_dead_latent_rows` is the on/off switch (config-level); the rows themselves
+        # are a space group property and so are resolved by the caller (train.py), which
+        # also owns the is_crystal gate. Same split as periodic_centroids above.
+        self.hold_dead_latent_rows = hold_dead_latent_rows
         self.get_periodic_dimensions(
             device, do_periodic_angles=do_periodic_angles,
-            periodic_centroid_axes=periodic_centroid_axes if periodic_centroids else None)
+            periodic_centroid_axes=periodic_centroid_axes if periodic_centroids else None,
+            dead_latent_rows=dead_latent_rows if hold_dead_latent_rows else None,
+            dead_latent_values=dead_latent_values if hold_dead_latent_rows else None)
         # P_B kernel on angular dims: True = exact reversal of the wrapped
         # reference bridge (mixture over arrival lifts, doc eq. 4); False =
         # its max-weight single-image term. Both are consistent kernels of the
@@ -239,7 +248,9 @@ class GFN(nn.Module):  # todo add seeding
                 self.flow_model = LearnableScalar()  # unified syntax with this instead of nn.Parameter
 
     def get_periodic_dimensions(self, device, do_periodic_angles: bool = True,
-                                periodic_centroid_axes: Optional[Sequence[int]] = None):
+                                periodic_centroid_axes: Optional[Sequence[int]] = None,
+                                dead_latent_rows: Optional[Sequence[int]] = None,
+                                dead_latent_values: Optional[Sequence[float]] = None):
         """
         Build the mask of state dims that live on a circle. ang_mask means exactly
         "this dim is wrapped": it drives the sin/cos policy encoding
@@ -263,6 +274,17 @@ class GFN(nn.Module):  # todo add seeding
         low-rank noise direction off circular coordinates, and these are now circular.
         """
         if do_periodic_angles:
+            # The crystal layout below is the ONLY thing that makes dim and max_z_prime
+            # two views of one fact, so check them here rather than inside the
+            # periodic-centroid branch -- with periodic_centroids off, a mismatch used to
+            # sail past and build a policy of the wrong width for the problem (how
+            # prod0810's Z'=2 arms were sized before the energy learned to read z_primes).
+            expected_dim = 6 + 6 * self.max_z_prime
+            if self.dim != expected_dim:
+                raise ValueError(
+                    f"expected crystal state dim {expected_dim} for max_z_prime={self.max_z_prime}, "
+                    f"got {self.dim}; the energy's data_ndim and the policy's max_z_prime "
+                    f"disagree about how many asymmetric units the state carries")
             angs = [False] * 6
             for zp in range(self.max_z_prime):
                 angs.extend([False, False, False])
@@ -281,23 +303,117 @@ class GFN(nn.Module):  # todo add seeding
                     "is not a crystal parameterization)")
             if any(a not in (0, 1, 2) for a in self.periodic_centroid_axes):
                 raise ValueError(f"centroid axes must be in (0, 1, 2), got {self.periodic_centroid_axes}")
-            expected_dim = 6 + 6 * self.max_z_prime
-            if self.dim != expected_dim:
-                raise ValueError(
-                    f"expected crystal state dim {expected_dim} for max_z_prime={self.max_z_prime}, "
-                    f"got {self.dim}; refusing to index centroid dims into an unknown layout")
+            # layout width already checked above, so the centroid indices below are safe
             for zp in range(self.max_z_prime):
                 for axis in self.periodic_centroid_axes:
                     angs[6 + 3 * zp + axis] = True
 
-        self.ang_mask = torch.tensor(angs, device=device)
-        self.ang_dim = (self.ang_mask == True).sum().item()
-        self.lin_dim = self.dim - self.ang_dim
+        self._finalize_dim_partition(device, angs, dead_latent_rows, dead_latent_values)
+
+    def _finalize_dim_partition(self, device, angs,
+                                dead_latent_rows: Optional[Sequence[int]] = None,
+                                dead_latent_values: Optional[Sequence[float]] = None):
+        """
+        Turn a per-dim angular flag list into the (ang, lin, dead) index sets, the block
+        widths, expanded_dim, and the pinned dead values.
+
+        Factored out of get_periodic_dimensions so SUBCLASSES with their own state layout
+        (TorsionGFN, whose every dim wraps) share this bookkeeping instead of
+        reimplementing it. That is not cosmetic: the previous arrangement had the subclass
+        hand-maintain ang_mask/ang_dim/lin_dim/expanded_dim/ang_idx/lin_idx, so adding the
+        dead-row attributes to the base method left the override silently short of seven
+        of them and broke construction outright. Anything that overrides the layout must
+        end by calling this, and then gets the partition assertions for free.
+
+        `angs` is a length-dim sequence of bools (or a tensor).
+        """
+        # ---- structurally-dead dims: held out of the diffusion entirely (D33) ----
+        # Resolved by the caller (train.py) via
+        # models/dead_latent_rows.resolve_dead_rows, gated on is_crystal, exactly like
+        # periodic_centroid_axes. A dead dim may be ANGULAR or LINEAR and nothing here
+        # may assume which: 26 space groups have an aunit centroid axis that is both
+        # free (dead) and auv == 1 (wrapped) -- P1 has all three -- see findings.md
+        # F-008. `dead` wins over `angs`, because a dim held at a constant is neither
+        # wrapped nor worth feeding to the policy.
+        raw_rows = [int(d) for d in (dead_latent_rows or ())]
+        dead = tuple(sorted(set(raw_rows)))
+        if any(d < 0 or d >= self.dim for d in dead):
+            raise ValueError(f"dead_latent_rows must index [0, {self.dim}), got {dead}")
+        self.dead_rows = dead
+
+        ang_bool = torch.as_tensor(angs, device=device, dtype=torch.bool)
+        if ang_bool.ndim != 1 or ang_bool.numel() != self.dim:
+            raise ValueError(
+                f"the angular flag list must be 1-D of length dim={self.dim}, got shape "
+                f"{tuple(ang_bool.shape)}; a subclass supplying its own layout must emit "
+                f"one flag per state dim")
+        dead_mask = torch.zeros(self.dim, dtype=torch.bool, device=device)
+        if dead:
+            dead_mask[torch.tensor(dead, dtype=torch.long, device=device)] = True
+        lin_bool = (~ang_bool) & (~dead_mask)
+
+        self.dead_mask = dead_mask
+        self.ang_mask = ang_bool & (~dead_mask)
+        # zeroing target for the DPLR correlated fraction: ORIGINAL angular dims plus
+        # dead dims. Must not be self.ang_mask, which no longer contains dead-angular
+        # dims -- using it would leave a dead dim carrying a low-rank component.
+        self.dplr_zero_mask = ang_bool | dead_mask
+
+        self.ang_dim = int(self.ang_mask.sum().item())
+        self.lin_dim = int(lin_bool.sum().item())
+        # From the FINAL sets, never `dim - len(dead)`: a dead ANGULAR dim removes 2
+        # slots (sin, cos) from the policy input while a dead LINEAR dim removes 1.
         self.expanded_dim = self.lin_dim + self.ang_dim * 2
         # integer twins of ang_mask for the per-step hot paths: bool-mask
         # indexing on CUDA runs nonzero() and forces a host sync every call
         self.ang_idx = self.ang_mask.nonzero(as_tuple=False).flatten()
-        self.lin_idx = (~self.ang_mask).nonzero(as_tuple=False).flatten()
+        self.lin_idx = lin_bool.nonzero(as_tuple=False).flatten()
+        self.dead_idx = dead_mask.nonzero(as_tuple=False).flatten()
+        self.live_idx = (~dead_mask).nonzero(as_tuple=False).flatten()
+        self.live_dim = int(self.live_idx.numel())
+
+        # THE invariant: (ang, lin, dead) is a three-way partition of range(dim).
+        # This is the check that catches a single-digit index error. The
+        # characteristic failure -- a dim dropped from one block without being added
+        # to another, or counted in two -- changes no tensor's dtype, rank or device,
+        # so nothing else in the stack would notice, and the symptom would be a
+        # trained model with a quietly wrong log Z.
+        parts = torch.cat([self.ang_idx, self.lin_idx, self.dead_idx]).sort().values
+        if not torch.equal(parts, torch.arange(self.dim, device=device)):
+            raise AssertionError(
+                f"(ang, lin, dead) is not a partition of range({self.dim}): "
+                f"ang={self.ang_idx.tolist()} lin={self.lin_idx.tolist()} "
+                f"dead={self.dead_idx.tolist()}")
+        if self.ang_dim + self.lin_dim + len(dead) != self.dim:
+            raise AssertionError(
+                f"block widths {self.ang_dim}+{self.lin_dim}+{len(dead)} != dim {self.dim}")
+        if self.live_dim + len(dead) != self.dim:
+            raise AssertionError(
+                f"live_dim {self.live_dim} + dead {len(dead)} != dim {self.dim}")
+
+        # Canonical value each dead dim is held at. Measured 0.0 for every space group
+        # reachable today (pi/2 -> latent 0.0 exactly; verified sg 4/14/15 rows 3,5 and
+        # sg 19/61 rows 3,4,5). Hexagonal gamma = 2pi/3 is the sole exception in
+        # principle, which is why this is a parameter rather than a hardcoded zero.
+        # persistent=False so it stays out of state_dict and checkpoint keys don't move
+        # (same reason as _var_accum).
+        vals = torch.zeros(self.dim, device=device, dtype=torch.float32)
+        if dead_latent_values is not None:
+            dv = [float(v) for v in dead_latent_values]
+            if len(dv) != len(raw_rows):
+                raise ValueError(
+                    f"dead_latent_values has {len(dv)} entries but dead_latent_rows has "
+                    f"{len(raw_rows)}; they are positionally paired")
+            if len(set(raw_rows)) != len(raw_rows):
+                raise ValueError(
+                    f"dead_latent_rows={tuple(raw_rows)} repeats a row, so pairing it with "
+                    f"dead_latent_values is ambiguous")
+            # Pair with the CALLER's ordering, not the sorted one. `dead` is sorted for the
+            # index sets, so writing dv straight into vals[dead_idx] would silently assign
+            # rows=(5,3), values=(a,b) as row3=a, row5=b -- the reverse of what was asked.
+            for row, val in zip(raw_rows, dv):
+                vals[row] = val
+        self.register_buffer('_dead_values', vals, persistent=False)
 
     VAR_SCHEDULE_GRID = 8192
 
@@ -446,8 +562,15 @@ class GFN(nn.Module):  # todo add seeding
         rho = torch.sigmoid(rho_logit - self.dplr_rho_init_bias) * self.dplr_rho_max
         if self.dplr_mask_angular and self.ang_dim > 0:
             # mask the fraction, not V directly: the diagonal then reabsorbs
-            # the freed budget automatically (d_k = s_k^2 exactly on these dims)
-            rho = rho.masked_fill(self.ang_mask.view(1, -1), 0.0)
+            # the freed budget automatically (d_k = s_k^2 exactly on these dims).
+            # dplr_zero_mask = original angular | dead, so a dead dim never carries a
+            # low-rank component either (its row of V would otherwise enter the
+            # Woodbury logdet even though the dim is not part of the process).
+            rho = rho.masked_fill(self.dplr_zero_mask.view(1, -1), 0.0)
+        elif self.dead_idx.numel() > 0:
+            # dplr_mask_angular off (or no angular dims) but dead dims present: they
+            # still must not carry a correlated component
+            rho = rho.masked_fill(self.dead_mask.view(1, -1), 0.0)
         u_hat = u_raw / (u_raw.norm(dim=-1, keepdim=True) + self.dplr_eps)
         d = (1.0 - rho) * s2
         V = (rho.sqrt() * s2.sqrt()).unsqueeze(-1) * u_hat
@@ -511,6 +634,57 @@ class GFN(nn.Module):  # todo add seeding
         wrapped = self.wrap_to_pi(state.index_select(1, self.ang_idx) * torch.pi) / torch.pi  # latent space is on [-1, 1]
         return state.index_copy(1, self.ang_idx, wrapped)
 
+    def _pin_dead(self, state):
+        """
+        Hold structurally-dead dims at their canonical value. Applied at exactly the
+        points _wrap_ang is, plus both trajectory endpoints, so constancy along the
+        whole trajectory holds BY CONSTRUCTION rather than by the drift and noise masks
+        having been written correctly.
+
+        That is the point. A misplaced mask is the error this change is most exposed to,
+        and it would not crash -- it would produce a model that trains to a quietly
+        wrong log Z. Pinning is immune, because it writes the value rather than relying
+        on nothing having disturbed it. Whatever the policy predicted for these dims is
+        simply discarded here, and the log-prob reductions exclude them, so the drift
+        and noise on dead dims need no masking at all.
+
+        Returns `state` unchanged (same object) when there are no dead dims, which is
+        what makes the no-dead-rows path bitwise identical to the pre-change code.
+        """
+        if self.dead_idx.numel() == 0:
+            return state
+        vals = (self._dead_values.index_select(0, self.dead_idx)
+                .to(state.dtype).unsqueeze(0).expand(state.shape[0], -1).contiguous())
+        return state.index_copy(1, self.dead_idx, vals)
+
+    def _mean_over_live(self, t):
+        """
+        Per-dim mean over LIVE dims of a [..., dim] diagnostic tensor.
+
+        Dead dims must be excluded or every per-dim average is diluted: their policy
+        heads receive exactly zero gradient (nothing they emit reaches the loss), so they
+        sit at initialization forever and would drag the mean toward junk by a factor
+        live_dim/dim. Identical to `t.mean(-1)` when nothing is dead.
+        """
+        if self.dead_idx.numel() == 0:
+            return t.mean(-1)
+        return t.index_select(-1, self.live_idx).mean(-1)
+
+    def dead_invariant_violation(self, states):
+        """
+        Largest deviation of any dead dim from its canonical value, over a
+        [B, T+1, dim] trajectory tensor. 0.0 means the dims never moved.
+
+        Deliberately NOT called on the hot path -- it forces a host sync. Used by
+        startup validation and tests: this is the property we actually want, measured,
+        rather than the masks inspected.
+        """
+        if self.dead_idx.numel() == 0:
+            return 0.0
+        got = states.index_select(-1, self.dead_idx)
+        want = self._dead_values.index_select(0, self.dead_idx).to(got.dtype)
+        return float((got - want).abs().max().item())
+
     def _step_flow(self, s_emb, t_emb):
         """
         Per-step flow value under full_flow (state/time-dependent head); None
@@ -548,6 +722,7 @@ class GFN(nn.Module):  # todo add seeding
         # coordinate. Nearest-image residuals (R1) make the scored values
         # independent of this ordering; the wrap here makes that manifest.
         next_state = self._wrap_ang(next_state)
+        next_state = self._pin_dead(next_state)  # dead dims never move (D33)
 
         flow_i = self._step_flow(s_emb, t_emb)
 
@@ -602,13 +777,16 @@ class GFN(nn.Module):  # todo add seeding
             prev_state = self.bwd_propagate(back_mean, back_var, current_state, detach_traj, eps=eps)
             # R3: wrap before any scoring -- no scorer ever sees a pre-wrap coordinate
             prev_state = self._wrap_ang(prev_state)
+            prev_state = self._pin_dead(prev_state)  # dead dims never move (D33)
 
             # log Pb: the one kernel every scoring path evaluates
             logpb_i = self._pb_logprob(prev_state, current_state, drift_coeff,
                                        back_mean_correction, back_var, t_next)
         else:
             # send it identically to the source state (0)
-            prev_state = torch.zeros_like(current_state)
+            # pinned too: with a nonzero canonical value (hexagonal gamma) the source
+            # would otherwise be the one step on the trajectory where a dead dim moves
+            prev_state = self._pin_dead(torch.zeros_like(current_state))
             back_drift = -current_state
             back_var = torch.ones_like(back_drift) * 1e-3 * dts.unsqueeze(1)
             logpb_i = current_state.new_zeros(current_state.shape[0])
@@ -695,7 +873,10 @@ class GFN(nn.Module):  # todo add seeding
         logpb, logpf, states, gauss_params, log_flow = self.init_traj_tensors(batch_size, trajectory_length)
 
         initial_state.requires_grad_(not detach_traj)
-        current_state = initial_state
+        # pin the source so a nonzero canonical value is present from step 0; a no-op
+        # returning the same object when there are no dead dims, so requires_grad_
+        # above still applies to the tensor this rollout actually uses
+        current_state = self._pin_dead(initial_state)
         states[:, 0] = current_state
 
         if self.conditional:
@@ -753,7 +934,7 @@ class GFN(nn.Module):  # todo add seeding
         logpfs = torch.stack(logpf).T
         logpbs = torch.stack(logpb).T
         if return_gauss_params:
-            return states, logpfs, logpbs, log_flow, {k: v.mean(-1) for k, v in gauss_params.items()}
+            return states, logpfs, logpbs, log_flow, {k: self._mean_over_live(v) for k, v in gauss_params.items()}
         else:
             return states, logpfs, logpbs, log_flow
 
@@ -830,8 +1011,12 @@ class GFN(nn.Module):  # todo add seeding
         logpb, logpf, states, gauss_params, log_flow = self.init_traj_tensors(batch_size, trajectory_length)
 
         # canonical representative at entry: buffer/anchor terminals are stored
-        # wrapped already, so this is defensive (and free) for other intakes
-        current_state = self._wrap_ang(terminal_state.detach())
+        # wrapped already, so this is defensive (and free) for other intakes.
+        # Pinning here is the same kind of defence for dead dims: latent_params()
+        # already writes the canonical value into them, so a well-formed buffer row
+        # needs no correction, but a stale one must not leak a moved dead dim into the
+        # terminal handed back to the energy.
+        current_state = self._pin_dead(self._wrap_ang(terminal_state.detach()))
         states[:, -1] = current_state
 
         if self.conditional:
@@ -882,7 +1067,7 @@ class GFN(nn.Module):  # todo add seeding
         logpfs = torch.stack(logpf).T
         logpbs = torch.stack(logpb).T
         if return_gauss_params:
-            return states, logpfs, logpbs, log_flow, {k: v.mean(-1) for k, v in gauss_params.items()}
+            return states, logpfs, logpbs, log_flow, {k: self._mean_over_live(v) for k, v in gauss_params.items()}
         else:
             return states, logpfs, logpbs, log_flow
 
@@ -948,7 +1133,7 @@ class GFN(nn.Module):  # todo add seeding
         logpfs = torch.stack(logpf).T
         logpbs = torch.stack(logpb).T
         if return_gauss_params:
-            return states, logpfs, logpbs, log_flow, {k: v.mean(-1) for k, v in gauss_params.items()}
+            return states, logpfs, logpbs, log_flow, {k: self._mean_over_live(v) for k, v in gauss_params.items()}
         else:
             return states, logpfs, logpbs, log_flow
 
@@ -1172,8 +1357,25 @@ class GFN(nn.Module):  # todo add seeding
         # nearest-image residual on periodic dims (R1): the scored density is
         # then invariant to which representative either endpoint carries
         z = self._wrap_ang(delta_x - drift)
+        # Dead dims are not part of the process, so they must not be scored (D33).
+        # Their delta is 0 by construction while the policy's drift for them is not,
+        # so including them would add drift^2/var + log(var) -- a nonzero term that
+        # differs between P_F and P_B, which log Z would silently absorb.
+        # Wrap FIRST: ang_idx indexes the full width, so restricting before the wrap
+        # would misalign it.
+        z, var = self._live_only(z, var)
         noise = z / var.sqrt()
         return -0.5 * (noise ** 2 + logtwopi + var.log()).sum(1)
+
+    def _live_only(self, *tensors):
+        """
+        Restrict [B, dim] tensors to live dims. Returns them untouched (same objects)
+        when there are no dead dims, which is what keeps that path bitwise identical.
+        """
+        if self.dead_idx.numel() == 0:
+            return tensors if len(tensors) > 1 else tensors[0]
+        out = tuple(t.index_select(1, self.live_idx) for t in tensors)
+        return out if len(out) > 1 else out[0]
 
     def fwd_gauss_logprob(self, delta_x, drift, d, dt, V=None):
         """
@@ -1191,6 +1393,13 @@ class GFN(nn.Module):  # todo add seeding
         # density is exact because dplr_mask_angular keeps angular dims out of
         # the low-rank block (asserted at construction)
         z = self._wrap_ang(delta_x - drift)
+        # restrict to live dims, after the wrap (see gauss_logprob). Dead rows of V are
+        # already zero (dplr_zero_mask) so M and w would be unaffected, but d and z are
+        # NOT: z[dead] = -drift[dead] != 0, so quad and logdet_C would both pick up a
+        # spurious term. `n` below is read off d, so it follows automatically.
+        z, d = self._live_only(z, d)
+        if self.dead_idx.numel() > 0:
+            V = V.index_select(1, self.live_idx)
         r = V.shape[-1]
         Dinv_V = V / d.unsqueeze(-1)  # [B, n, r]
         M = torch.eye(r, device=V.device, dtype=V.dtype) + torch.einsum('bnr,bns->brs', V, Dinv_V)

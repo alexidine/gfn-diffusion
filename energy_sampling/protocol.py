@@ -115,6 +115,10 @@ STAGE_FLAGS = ('update_log_z', 'scramble_conditions', 'weighted_condition_sampli
 ACTIONS = ('snapshot', 'snapshot_prior', 'bootstrap_z', 'seed_prior_from_anchors',
            'reseed_prior_from_dataset', 'rebuild_prior_by_churn')
 SKIP_CONDITIONS = ('prior_loaded',)
+
+# Per-stage LR sensor kinds -- see Stage._parse_lr_sensor for why this is
+# declared rather than derived from the active loss coefficients.
+LR_SENSOR_KINDS = ('ray', 'plateau', 'none')
 RULE_KEYS = {'metric', 'boost', 'above', 'below', 'relative', 'margin', 'drift', 'floor',
              'abs', 'if_missing', 'lookahead', 'anneal'}
 TERM_KEYS = {'metric', 'above', 'below', 'abs', 'patience'}
@@ -159,7 +163,7 @@ class Stage:
         unknown = set(spec) - {'name', 'train_mode', 'bwd_sampling_mode', 'flags',
                                'loss_coeffs', 'fracs', 'min_fracs',
                                'deactivate_threshold', 'balance', 'buffer_servo',
-                               'exit', 'on_exit', 'on_enter', 'skip_if'}
+                               'lr_sensor', 'exit', 'on_exit', 'on_enter', 'skip_if'}
         if unknown:
             raise ValueError(f"protocol.stages[{index}] has unknown keys {sorted(unknown)}")
         self.index = index
@@ -218,6 +222,7 @@ class Stage:
 
         self.balance = self._parse_balance(spec.get('balance'))
         self.buffer_servo = self._parse_buffer_servo(spec.get('buffer_servo'))
+        self.lr_sensor = self._parse_lr_sensor(spec.get('lr_sensor'))
         self.exit = self._parse_exit(spec.get('exit'))
         self.on_exit = self._parse_actions(spec.get('on_exit'), 'on_exit')
         self.on_enter = self._parse_actions(spec.get('on_enter'), 'on_enter')
@@ -343,6 +348,77 @@ class Stage:
                     f"branch would go dark while the controller still steers it")
             bounds[mode] = [lo, hi]
         return bounds
+
+    def _parse_lr_sensor(self, node):
+        """
+        Which LR sensor this stage runs.
+
+          kind: plateau   ReduceLROnPlateau. Track each channel's best value and
+                          cut the LR when none of them has improved for
+                          `patience` checks. One criterion covers rising,
+                          stalled and blown-up alike -- all three are just "no
+                          improvement over best".
+          kind: ray       the alpha* ray calibration. Only coherent in a fused
+                          stage that trains replay TB: the probe draws from
+                          replay (needing stored trajectories) and scores with
+                          replay_loss_coeffs, so anywhere else it rates a loss
+                          nobody is optimising.
+          kind: none      this stage deliberately has no LR sensor.
+
+        `none` is spelled out rather than left to omission, so "no sensor" is a
+        decision in the config and not an oversight.
+        """
+        if node is None:
+            return None
+        if not isinstance(node, dict):
+            raise TypeError(f"stage '{self.name}': lr_sensor must be a mapping, got {type(node)}")
+        node = dict(node)
+        kind = node.get('kind')
+        if kind not in LR_SENSOR_KINDS:
+            raise ValueError(f"stage '{self.name}': lr_sensor.kind must be one of "
+                             f"{LR_SENSOR_KINDS}, got {kind!r}")
+        if kind in ('ray', 'none'):
+            bad = set(node) - {'kind'}
+            if bad:
+                raise ValueError(f"stage '{self.name}': lr_sensor kind '{kind}' takes no "
+                                 f"other keys, got {sorted(bad)}")
+            return {'kind': kind}
+
+        bad = set(node) - {'kind', 'metrics', 'factor', 'patience', 'threshold', 'cooldown'}
+        if bad:
+            raise ValueError(f"stage '{self.name}': lr_sensor unknown keys {sorted(bad)}")
+
+        metrics = [str(m) for m in (node.get('metrics') or [])]
+        if not metrics:
+            raise ValueError(f"stage '{self.name}': lr_sensor kind 'plateau' needs a "
+                             f"non-empty 'metrics' list, e.g. [fwd/vg_lb, bwd/vg_lb]")
+        for m in metrics:
+            if m.partition('/')[0] not in MODES:
+                raise ValueError(f"stage '{self.name}': lr_sensor metric {m!r} must be "
+                                 f"'<mode>/<channel>' with mode in {MODES}")
+        node['metrics'] = metrics
+
+        factor = float(node.get('factor', 0.5))
+        if not 0.0 < factor < 1.0:
+            raise ValueError(f"stage '{self.name}': lr_sensor.factor must be in (0, 1), got {factor}")
+        node['factor'] = factor
+        # checks, not train steps -- one check per 10 train steps
+        node['patience'] = int(node.get('patience', 30))
+        node['cooldown'] = int(node.get('cooldown', 10))
+        if node['patience'] < 1 or node['cooldown'] < 0:
+            raise ValueError(f"stage '{self.name}': lr_sensor.patience must be >= 1 and "
+                             f"cooldown >= 0")
+        # ABSOLUTE improvement that counts as progress, in the channel's own
+        # units. Absolute rather than relative because these channels are
+        # unbounded below (bwd/mle has no lower bound and crosses zero), so a
+        # fractional bar has nothing to be relative to: abs(best) * frac grows
+        # without limit as the run improves, and the multiplicative form flips
+        # sign once best goes negative. 0.0 = any improvement counts, which is
+        # the right default on a SMOOTHED input.
+        node['threshold'] = float(node.get('threshold', 0.0))
+        if node['threshold'] < 0:
+            raise ValueError(f"stage '{self.name}': lr_sensor.threshold must be >= 0")
+        return node
 
     def _parse_balance(self, node):
         if node is None:
@@ -789,6 +865,11 @@ class Stage:
         # reads must not be allowed to skip its force-refresh rollout
         if self.buffer_servo is not None:
             names += [self.buffer_servo['numerator'], self.buffer_servo['denominator']]
+        # ...and so does a plateau LR sensor: a branch whose channel it watches
+        # must keep producing fresh stats, or the sensor reads a frozen series and
+        # never sees an improvement -- which would make it cut forever.
+        if self.lr_sensor is not None and self.lr_sensor['kind'] == 'plateau':
+            names += list(self.lr_sensor['metrics'])
         out = set()
         for name in names:
             direction = name.partition('/')[0]
@@ -1082,9 +1163,24 @@ class StageProtocol:
         # first knee comparison (same rationale as the OOM path's reset)
         m._rung_throughput = None
         m.batch_size_saturated_stage = None
+        m.batch_size_oom_ceiling = None  # the incoming stage has its own memory profile
         times = getattr(m, '_recent_step_times', None)
         if times is not None:
             times.clear()
+            m._recent_step_work.clear()
+        # THE LEVEL IS STAGE STATE TOO, not just the bookkeeping around it. It
+        # used to carry over, so equilibration inherited train_prior's knee --
+        # and since the walk only ever moves UP from where it starts, an
+        # MLE-sized batch became a FLOOR for a stage whose steps cost ~100x more
+        # (prod0810: 2722 cheap bwd/dataset steps -> 2722 fused steps at 181 s,
+        # then grown further). Re-enter every stage at the configured base and
+        # let the knee re-derive the level from in-stage timings.
+        if bool(getattr(m.args, 'grow_batch_size', True)):
+            base_batch = min(int(m.args.batch_size), int(m.args.max_batch_size))
+            if m.batch_size != base_batch:
+                print(f"batch: stage change -- resetting {m.batch_size} -> {base_batch} "
+                      f"(re-deriving the knee under '{new.name}' step costs)")
+                m.batch_size = base_batch
         m.batch_size_last_grow = m.step_ind  # full dwell of in-stage steps before the first grow
         m.init_schedulers_optimizers()
         m.set_loss_coeffs()

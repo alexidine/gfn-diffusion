@@ -96,7 +96,8 @@ batch_growth_factor: 1.65
 batch_growth_interval: 50
 batch_growth_slow_interval: 300
 auto_batch_throughput_opt: true
-batch_growth_min_gain: 0.15
+batch_growth_max_step_regression: 0.25
+max_step_seconds: 10
 batch_knee_recheck_steps: 2000
 oom_batch_shrink_factor: 0.5
 oom_cooldown_steps: 200
@@ -342,7 +343,7 @@ z_primes:
 vector_conditioning: false
 vector_conditioning_dim: 3
 energy_config:
-  internal_oom_recovery: true
+  internal_oom_recovery: false
   temperature: 2.5
   log_temperature_range:
   - 0

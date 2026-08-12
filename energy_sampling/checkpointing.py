@@ -39,6 +39,11 @@ MODELLER_STATE_DEFAULTS = {
     'batch_size_ever_oomed': False,
     # flips permanently once we've OOM'd at least once - switches growth from fast slow-start to slow congestion-avoidance
     'batch_size_cooldown_until': -1,  # step_ind until which batch size growth is frozen after a cut
+    # smallest batch known to OOM in the CURRENT stage (None = none seen). The
+    # growth walk refuses to re-enter it; protocol.advance clears it because the
+    # incoming stage has its own memory profile. Worth checkpointing so a
+    # mid-stage resume doesn't have to rediscover the ceiling the hard way.
+    'batch_size_oom_ceiling': None,
     'grow_buffer': False,
     'fwd_step_count': 0,
     'bwd_step_count': 0,
@@ -482,7 +487,41 @@ class Checkpointer:
             if current[key] != config.get(key):
                 print(f"gfn_config['{key}']: checkpoint {config.get(key)!r} -> config {current[key]!r}")
             config[key] = current[key]
+        self._assert_dead_rows_match(config)
         return config
+
+    def _assert_dead_rows_match(self, config):
+        """
+        Dead latent rows fix the weight layout (they shrink `expanded_dim`), so they can
+        NOT be reconfigured on resume -- the checkpoint's value has to win, like every
+        other architectural key. That makes a stale value dangerous rather than merely
+        wrong: a pre-change monoclinic checkpoint carries no `dead_latent_rows` at all, so
+        the model would silently rebuild with the rows LIVE while this run's startup probe
+        prints reassurance that they are held. log Z would quietly revert to the old
+        scale with nothing in the log to say so. See decisions.md D33.
+
+        So compare and refuse. Orphaning affected checkpoints is the accepted cost.
+        Triclinic and toys resolve to (), which matches a pre-change checkpoint's absent
+        key, so existing sg-1/sg-2 resumes are unaffected.
+        """
+        m = self.modeller
+        if not hasattr(m, '_resolve_dead_latent_rows'):
+            return
+        try:
+            wanted = m._resolve_dead_latent_rows(quiet=True) or ()
+        except Exception:
+            return  # resolution itself is broken; let the normal path report it
+        stored = tuple(config.get('dead_latent_rows') or ())
+        if tuple(wanted) == stored:
+            return
+        raise ValueError(
+            f"dead_latent_rows mismatch: this run resolves {tuple(wanted)} for "
+            f"space_groups={list(m.args.space_groups)}, but the checkpoint was built with "
+            f"{stored}. These fix the policy input width (expanded_dim), so they cannot be "
+            f"swapped on resume. The checkpoint predates the dead-row work (decisions.md "
+            f"D33) or was trained on a different crystal system -- retrain from scratch, or "
+            f"set model.hold_dead_latent_rows: false to reproduce the old architecture "
+            f"exactly (which also restores the D33 defect).")
 
     def load_full(self, path, load_opt_state: bool = True):
         m = self.modeller

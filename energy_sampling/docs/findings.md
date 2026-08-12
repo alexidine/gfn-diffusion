@@ -7,6 +7,120 @@ Newest first.
 
 ---
 
+## F-009 · The reduced-cell rewrite orphaned the monoclinic+ angle latents, and prior/energy disagree on them · `MECHANISM`
+
+*2026-08-11. `mono_reduction_penalty` ([sym_utils.py:110](../../../mxtaltools/mxtaltools/common/sym_utils.py)), `enforce_crystal_system` ([geometry_utils.py:1310](../../../mxtaltools/mxtaltools/common/geometry_utils.py)), `instantiate_crystals` ([molecular_crystal.py:225](../energies/molecular_crystal.py:225)).*
+
+The crystal-system pin exists — `(α − π/2)²`, `(γ − π/2)²` in
+`mono_reduction_penalty` (ortho: all three; tetra/hex: `(a−b)²`), reaching the GFN
+as `reduction_energy`. **In the GFN path it cannot fire.** `instantiate_crystals`
+uses the default `skip=False`, so `enforce_crystal_system` sets those angles to
+exactly π/2 *before* `analyze` evaluates `reduction_en` — the pin's argument is set
+to its own target. It is live only in the crystal-search optimiser, which passes
+`skip_enforce_crystal_system=True` ([crystal_opt_utils.py:635](../../../mxtaltools/mxtaltools/crystal_search/crystal_opt_utils.py)).
+
+Each angle latent forced to −0.9/−0.3/+0.3/+0.9 through the real path,
+`mean reduction_en`:
+
+| latent | sg 2 (triclinic) | sg 14 (monoclinic) |
+|---|---|---|
+| `[3]` α | 15676 / 4935 / 137 / 0.74 — **live** | **0 / 0 / 0 / 0 — dead** |
+| `[4]` β | 16931 / 6895 / 1039 / 1.14 — live | 0.563 / 0.078 / 0 / 0.009 — live |
+| `[5]` γ | 10537 / 3635 / 208 / 0.46 — **live** | **0 / 0 / 0 / 0 — dead** |
+
+Δ`zp1_cell_parameters` is also exactly 0 for sg-14 α/γ. β survives via the
+reduced-cell inequality `cos β ∈ [−a/c, 0]`.
+
+**The harm is not merely wasted capacity.** `latent_params()` round-trips the
+clobbered angles to 0.0, so **every prior/buffer row has `latent[3] = latent[5] =
+0.0` exactly** — measured on the stored sg-14 prior, std `0.0e+00` across n=535 and
+n=3582. The energy is meanwhile flat over the whole box there. So `bwd` (starting
+from buffer states) trains P_F toward a delta at 0 while `fwd` gets no gradient
+signal at all: 2 of 12 dims trained against inconsistent targets.
+
+**Provenance.** `8dea6b56` — "Niggli sampling ripped out in favor of general latent
+space and an energy based penalty". The old design sampled *inside* the reduced
+domain. The rewrite moved reduction into a penalty, which works for triclinic but is
+preempted for monoclinic+ by a clobber that predates it (`33905974`).
+
+**Scope.** Triclinic is `enforce_crystal_system`'s "anything goes" branch, so
+**sg 1 and sg 2 are unaffected** — 63 sg-2 and 9 sg-1 configs are clean, including
+`mk_dev`, `aug02` and `tw_july31` (all sg 2). Affected live configs: `acridine/`,
+`uncond_14_1_test{,2}` (36 further sg-14 configs are under `configs/old/`). Dead
+angle latents of 12: monoclinic **2**, orthorhombic/tetragonal **3**.
+
+**`CONJECTURE`:** this should show as a floor on the fwd/bwd gap and on `tb_err` in
+monoclinic+ runs that no training removes. The driver is measured; the consequence
+is not.
+
+---
+
+## F-008 · Free aunit axes are the shared +1 eigenspace of G, and no discrete fold can reduce them · `MECHANISM`
+
+*2026-08-11. `CONTINUOUS_DIMS` ([space_group_info.py:15217](../../../mxtaltools/mxtaltools/constants/space_group_info.py)).*
+
+Moving the aunit centroid by δ displaces each symmetry copy by `R_k δ`. That is a
+rigid translation of the whole crystal — hence exactly energy-preserving — iff
+`R_k δ = δ` for every rotation part in G. So the free subspace is
+`∩_k ker(R_k − I)`, and its dimension is `3 − rank[R_k − I]`.
+
+Derived from `SYM_OPS` alone, this **agrees with cctbx `structure_seminvariants`
+on 230/230 space groups**. 68 of 230 have ≥1 free dim, 42 of those have a real
+aunit box. **All 230 have axis-aligned (principal) continuous shifts**, so gauge
+fixing is deleting a fractional axis — no change of basis anywhere.
+
+The orbit is continuous, so the N_E coset fold has nothing to compare against and
+cannot canonicalise it. Signature, sg 4 (P21, free axis y), n=6: post-fold x
+reduces to 0.240 and z to 0.378, **y still spans to 0.879**.
+
+At Z'>1 the free translation is **one global** shift shared by all Z' molecules —
+delete it from one centroid block only. Per-molecule zeroing would destroy the
+physical relative offsets along that axis.
+
+`sg_periodic_centroid_axes` ([aunit_periodicity.py](../models/aunit_periodicity.py))
+under-reports: 16 of the 42 have a free axis with `auv < 1` (C2 y, Cmc21 z, I4 z,
+P4cc z, …), flat and wrapping at period `auv_d` but currently walled.
+
+---
+
+## F-007 · The N_E fold reproduces the P21/c fundamental domain, and the domain depends on molecular chirality · `REPLICATED`
+
+*2026-08-11. `get_fd_params` ([crystal_ops.py:843](../../../mxtaltools/mxtaltools/dataset_utils/data_class_methods/crystal_ops.py)).*
+
+**Scope:** `mini_new_csd.pt`, Z'=1, n as tabled — a different dataset from the
+7/3 session's `test_new_new_csd.pt` (n=100), which is the replicate. Geometry
+only; no training.
+
+Post-fold max fractional centroid, achiral / chiral gate:
+
+| sg | n | index | aunit | post-fold max x,y,z |
+|---|---|---|---|---|
+| 14 P21/c | 41 | 8 | [1, .25, 1] | **.250 / .247 / .499** (both) |
+| 2 P-1 | 10 | 8 | [.5, 1, 1] | .247 / .423 / .327 (both) |
+| 15 C2/c | 9 | 4 | [.5, .5, .5] | .211 / .246 / .466 (both) |
+| 19 P212121 | 12 | 16 | [.5, .5, 1] | .249/.216/**.241** vs .249/.216/**.406** |
+| 61 Pbca | 5 | 8 | [.5, .5, .5] | .185 / .234 / .227 (both) |
+
+sg 14 lands on `[0.25, 0.25, 0.5]`, volume 0.03125 = aunit/8 exactly, confirming
+the 7/3 lexicographic tie-break result. Small n elsewhere — extents are lower
+bounds, not saturated.
+
+**The FD box is not derivable by per-axis division of the seminvariant moduli.**
+That gives sg 14 `[0.5, 0.125, 0.5]` — correct volume, wrong shape, because the
+(0,½,0) generator is already consumed by G's own screw fold while x and z absorb a
+coupled extra factor.
+
+**132 SGs have an improper element in N_E, so their FD is chirality-dependent** —
+per-molecule, not per-space-group. `is_chiral` is unplumbed; the `None` default
+resolves through `(~True) | (det>0)` → int64, collapsing to "all chiral" by
+two's-complement accident.
+
+Re-ran the G-box Monte Carlo: **the same 12 SGs still fail** (Pnnn, Pban, Pmmn,
+Ccce, Fddd, P4/n, P42/n, P4/nnc, P4/ncc, P42/nbc, P42/nmc, I41/amd — 0.00 single-image
+coverage). 123 of 230 have real box data.
+
+---
+
 ## F-006 · The memorisation setpoint is derived, so it transfers · `MECHANISM`
 
 *2026-08-07. `absorption_stats` ([buffer.py:863](../buffer.py:863)).*

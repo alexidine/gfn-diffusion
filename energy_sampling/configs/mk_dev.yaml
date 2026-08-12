@@ -150,12 +150,14 @@ batch_growth_factor: 1.65
 batch_growth_interval: 50       # steps between jumps before the first OOM. WITH compile_policy active use ~250-500 (each new size is a ~30-60s recompile stall); 50 is fine locally where compile is off
 batch_growth_slow_interval: 300 # jump spacing after any OOM (congestion avoidance)
 # --- automatic batch-size throughput optimization (train.py increment_batch_size) ---
-# The growth walk measures marginal samples/sec at every jump; a jump that underperforms
-# min_gain reverts one rung and PINS the batch for the current protocol stage. The pin
-# re-arms at stage transitions and after OOM cuts. With this ON, max_batch_size is a
-# safety ceiling rather than a target.
+# The growth walk scores every jump by how much it slowed the STEP down, not by raw
+# samples/sec: a jump that fails reverts one rung and PINS the batch for the current
+# protocol stage. The pin re-arms at stage transitions and after OOM cuts, and the batch
+# LEVEL itself resets to batch_size at every stage transition (the walk only moves up, so
+# an inherited level is a floor). With this ON, max_batch_size is a safety ceiling.
 auto_batch_throughput_opt: true  # master switch; false = grow to max_batch_size/OOM as before
-batch_growth_min_gain: 0.15  # marginal samples/sec gain a jump must clear to be kept. LOWER = climb higher up the saturation shoulder. 0.05-0.10 throughput-leaning, 0.15 steps-leaning
+batch_growth_max_step_regression: 0.25  # how much slower a step may get in exchange for a jump's throughput. 0 = demand perfect linear scaling; 0.25 = accept up to 25% slower steps. Must be < batch_growth_factor-1 or every jump passes
+max_step_seconds: 10  # absolute wall-clock ceiling on a train step; over this the batch is cut a rung regardless of throughput. 0 = off
 batch_knee_recheck_steps: 2000  # re-estimate a pinned knee every N steps: drop one rung and re-climb. 0 = pin holds until stage transition/OOM
 oom_batch_shrink_factor: 0.5
 oom_cooldown_steps: 200  # steps to hold batch_size flat after an OOM before resuming growth
@@ -402,7 +404,7 @@ buffers:
     min_size: 10000
     max_size: 250000
     init_fraction: 0.25  # rebuild_prior_by_churn refill target as a fraction of max_size, admitted through the online gate. Fires at equilibration's on_enter
-    condition_block_m: 1  # >= 2: bwd 'prior' draws are condition-blocked (M distinct same-condition terminals per block). Auto-active only while bwd vg_lb > 0. 0 = off
+    condition_block_m: 2  # >= 2: bwd 'prior' draws are condition-blocked (M distinct same-condition terminals per block). Auto-active only while bwd vg_lb > 0. 0 = off
     reward_min: 0 # bootstrap-only fallback admission floor (absolute), used until a tracker/anchor_buffer exists to admit relative to each condition's best energy
     # quick_tb_stats' weighted under_coverage ramp, in ENERGY units of per-condition depth
     # above each condition's best known energy. ramp_floor doubles as manage_prior_buffer's
@@ -489,7 +491,7 @@ z_primes: [ 1 ]
 vector_conditioning: false  # per-sample condition vectors embedded through a plain MLP -- for toy energy functions
 vector_conditioning_dim: 3  # inert while vector_conditioning is false
 energy_config:
-  internal_oom_recovery: true  # if false, an OOM propagates up to train.py's global batch size reduction instead of the energy function's own sub-batching loop
+  internal_oom_recovery: false  # false = energy is scored on the SDE rollout's own batch in one call, and an OOM propagates up to train.py's global batch reduction. true made the energy chunk on a sticky internal size set by the init-time prior re-analysis (prod0810 uma: 2150 vs a 2722 rollout) and swallowed OOMs the batch controller needed to see. The two init passes override it back to true for their one-off whole-dataset scans. Not part of the problem identity, so flipping it does not orphan checkpoints
   temperature: 2.5 # room temperature kT in kJ/mol (1.0 for toys)
   log_temperature_range: [ 0, 0.693147 ]
   # loss coefficients

@@ -335,6 +335,7 @@ def get_gfn_forward_loss(loss_coeffs,
                      'flow_states': states.detach()}
         if condition_id is not None:
             loss_dict['condition_id'] = condition_id.detach()
+            loss_dict.update(condition_group_stats(condition_id))
         if loss_coeffs.tb > 0:
             loss_dict['tb'] = tb_loss.mean().detach()
         if loss_coeffs.vg_lb > 0:
@@ -597,6 +598,7 @@ def get_gfn_backward_loss(loss_coeffs,
                      'resid': ((log_pf - log_pb) - (log_r - log_Z_learned)).detach()}
         if condition_id is not None:
             loss_dict['condition_id'] = condition_id.detach()
+            loss_dict.update(condition_group_stats(condition_id))
         if loss_coeffs.tb > 0:
             loss_dict['tb'] = tb_loss.mean().detach()
         if loss_coeffs.vg_lb > 0:
@@ -874,6 +876,31 @@ def z_level_loss(log_pf, log_pb, log_r, log_Z_learned, condition_id):
     group_mean = torch.zeros(k, device=err.device, dtype=err.dtype).scatter_add_(
         0, inverse, err) / counts.clamp(min=1)
     return (group_mean ** 2).mean()
+
+
+def condition_group_stats(condition_id, min_group_count: int = 2):
+    """
+    Draw-composition readout for condition-grouped VarGrad: how a batch's rows
+    actually distribute over conditions. Measures the DRAW rather than a
+    downstream mask, so it reports identically whichever estimator branch ran,
+    and both knobs that move group occupancy land in it -- `repeats` tiling and
+    prior_buffer.condition_block_m.
+
+    Row-weighted deliberately. 'The average ROW sits in a group of size g' is
+    what the estimator's variance depends on; an unweighted mean over groups is
+    dominated by the singletons, which contribute no gradient at all (vg_loss is
+    identically zero there, see condition_grouped_empirical_z).
+
+    vg_live_frac is the load-bearing one: it is the fraction of the batch that
+    carries any VarGrad gradient. A configuration that looks well-tuned but runs
+    at live_frac 0.3 is training on a third of what it paid to roll out.
+    """
+    uniq, inverse, counts = torch.unique(condition_id, return_inverse=True,
+                                         return_counts=True)
+    per_row = counts[inverse].float()
+    return {'vg_n_groups': per_row.new_tensor(float(uniq.numel())),
+            'vg_group_size_mean': per_row.mean().detach(),
+            'vg_live_frac': (per_row >= min_group_count).float().mean().detach()}
 
 
 def condition_grouped_empirical_z(log_pb, log_pf, log_r, condition_id,

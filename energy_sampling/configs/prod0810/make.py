@@ -22,15 +22,22 @@ layer folded in. It is a SNAPSHOT, deliberately: mk_dev is the user's live dev c
 changes under this battery otherwise. Re-snapshot by hand to pick up mk_dev changes.
 
 =============================================================================
-WHY EVERY ARM HERE TRAINS PHASE 1 FROM SCRATCH
+WARM STARTS: THREE ARMS RESUME, FOUR STILL TRAIN PHASE 1 FROM SCRATCH  (v2)
 =============================================================================
-mk_dev.yaml ships checkpoint_name pointed at a mipcas/elj/T=10 warm-start file.
-get_problem_definition() keys the problem identity on prior_path (among other fields), so that
-checkpoint is specific to mipcas+elj -- loading it under nehzor, mipcas+uma, or any acridine
-target hits assert_problem_match() and hard-raises (see configs/rb0808/make.py's docstring for
-the same trap). None of these 7 targets has an existing phase1_exit checkpoint anywhere in this
-repo's checkpoints/ directory, so base.yaml clears checkpoint_name/prior_model_name: phase 1
-(train_prior) runs in-run before equilibration starts. write_all() asserts this per arm.
+Each arm's warm start must be ITS OWN. get_problem_definition() keys the problem identity on
+prior_path (among other fields), so a mipcas+elj checkpoint loaded under nehzor, mipcas+uma or
+any acridine target hits assert_problem_match() and hard-raises (see configs/rb0808/make.py's
+docstring for the same trap). base.yaml therefore still carries checkpoint_name: null and
+write_all() asserts it -- the per-arm value comes from WARM_STARTS below, keyed by arm name.
+
+v1 (submitted 2026-08-11) got three arms through train_prior, so those three resume from their
+own phase1_exit snapshot; the other four never left phase 1 and have no exit file to resume
+from. See WARM_STARTS for the per-arm evidence and for why a missing exit file must never be
+papered over with _best.pt.
+
+prior_model_name stays null on every arm: a phase1_exit resume re-enters train_prior and
+replays its own exit, whose on_exit runs snapshot_prior -- so the prior is regenerated in-run
+rather than side-loaded. Only a resume that starts INSIDE equilibration needs it.
 
 =============================================================================
 KNOWN GAP: acridine sg19/zp1 zp3 (Form IV) has no built prior dataset
@@ -103,6 +110,34 @@ def prior(mol, sg, zp, efunc):
     return f'{CLUSTER_PRIOR_DIR}{mol}_sg{sg}_zp{zp}_{efunc}_prior_dataset.pt'
 
 
+# --- phase-1 warm starts (v2) -------------------------------------------------
+# The v1 submission got three arms through train_prior; those three resume from their
+# own phase1_exit snapshot instead of re-running ~8700 steps of MLE. The other four
+# never left phase 1 and MUST stay null: `_best.pt` without a sibling `_phase1_exit.pt`
+# is proof the exit conditions were never met, and warm-starting off one is fatal at
+# step 0 with a non-finite gradient (rb0808 arm 0). Verified against wandb `phase`:
+#   0 mipcas_elj  phase2@8730 | 1 mipcas_uma phase2@8740 | 2 nehzor_elj phase2@5580
+#   3 nehzor_uma  max phase 1 | 4 acridine_sg14_zp1_mace max phase 1 | 5,6 no history
+#
+# The hashes below are the PRE-internal_oom_recovery-exemption slugs, i.e. the names
+# actually on disk. Adding that key to _NON_IDENTITY_ENERGY_CONFIG_KEYS re-hashes every
+# slug this config would generate today, but the compatibility check normalizes BOTH
+# sides, so the old file still loads under the new config -- only the FILENAME is
+# frozen at the old hash. Reconstruction validated against mipcas_uma's a29ef0, which
+# appears in that run's own output.log.
+#
+# load_weights_only stays false: these are pre-transition snapshots carrying optimizer
+# state, buffers (save(tag, with_buffers=True)) and stage_ctrl with request_eval stamped
+# on, so the resumed run pulls an eval to its first step and re-fires the train_prior
+# exit gate through the normal path. Weights-only would restart at step 0 in train_prior
+# and throw away the thing we are trying to skip.
+WARM_STARTS = {
+    'mipcas_elj': 'prod0810_mipcas_elj_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-2df5a5_phase1_exit.pt',
+    'mipcas_uma': 'prod0810_mipcas_uma_uma-mipcas_sg2_zp1_uma_prior_dataset-T2.5-a29ef0_phase1_exit.pt',
+    'nehzor_elj': 'prod0810_nehzor_elj_elj-nehzor_sg14_zp1_elj_prior_dataset-T2.5-255bf7_phase1_exit.pt',
+}
+
+
 # name -> (molecule, sg, zp, energy_function, mlip_path)
 TARGETS = [
     ('mipcas_elj', 'mipcas', 2, 1, 'elj', None),
@@ -134,6 +169,9 @@ def build_config(base, name, mol, sg, zp, efunc, mlip_path):
         # not the tag-prefixed form: every current battery generator keeps these separate.
         run_name=name,
         tag=TAG,
+        # null for the four arms with no phase1_exit on disk -- see WARM_STARTS
+        checkpoint_name=WARM_STARTS.get(name),
+        load_weights_only=False,
     ))
     return cfg
 
@@ -182,7 +220,18 @@ def write_all():
         seen_names.add(name)
         cfg = build_config(base, name, mol, sg, zp, efunc, mlip_path)
 
-        assert cfg['checkpoint_name'] is None, f'{name}: must train phase 1 from scratch'
+        assert cfg['checkpoint_name'] == WARM_STARTS.get(name), \
+            f'{name}: checkpoint_name must come from WARM_STARTS (or be null)'
+        if cfg['checkpoint_name'] is not None:
+            # a warm start that silently falls back to training from scratch wastes a
+            # week of cluster time before anyone notices; one that silently loads the
+            # WRONG arm's weights is worse. Both are visible right here.
+            assert cfg['checkpoint_name'].startswith(f'{TAG}_{name}_'), \
+                (f'{name}: warm start {cfg["checkpoint_name"]} belongs to another arm -- '
+                 f'the problem identity would reject it at load, but not before burning '
+                 f'the queue slot')
+            assert cfg['load_weights_only'] is False, \
+                f'{name}: a phase1_exit resume needs full state, not weights-only'
         assert (cfg['mlip_path'] is None) == (efunc == 'elj'), \
             f'{name}: mlip_path must be null for elj and set for uma/mace'
 
@@ -280,9 +329,27 @@ def preflight():
             if val and not os.path.isfile(val):
                 print(f'  MISSING  {path.name:<12} {key} -> {val}')
                 bad += 1
+        # warm starts are resolved relative to checkpoints_dir by train.py's init_gfn.
+        # HARD FAIL rather than warn: rb0808 lost a battery to a preflight that let a
+        # missing exit file fall back to _best.pt, and the fallback was itself the
+        # warning nobody read. A missing sidecar is equally fatal -- the resumed run
+        # would rebuild empty buffers and re-derive the stage from nothing.
+        ckpt = cfg.get('checkpoint_name')
+        if ckpt:
+            full = os.path.join(ckpt_dir, ckpt)
+            if not os.path.isfile(full):
+                print(f'  MISSING  {path.name:<12} checkpoint_name -> {full}')
+                bad += 1
+            sidecar = full.replace('.pt', '_buffers.pt')
+            if not os.path.isfile(sidecar):
+                print(f'  MISSING  {path.name:<12} buffer sidecar   -> {sidecar}')
+                bad += 1
     if bad:
         print(f'\n{bad} missing file(s). Fix CLUSTER_PRIOR_DIR/CLUSTER_UMA_MLIP/CLUSTER_MACE_MLIP '
-              f'above or the cluster mirror, then re-run make.py before submitting.')
+              f'or WARM_STARTS above, or the cluster mirror, then re-run make.py before '
+              f'submitting. Do NOT null out a warm start to make this pass without checking '
+              f'why the file is absent -- an arm that never reached phase 2 has no exit '
+              f'snapshot by construction.')
         return 1
     print('preflight OK -- every referenced file exists. Safe to submit.')
     return 0

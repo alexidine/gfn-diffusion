@@ -107,7 +107,21 @@ conditional_toy_protocol_2026_07_29:
       on_exit: [ 'snapshot:phase1_exit', 'snapshot_prior' ]
 
     # condition-grouped VarGrad on fwd + bwd; Z(c) trains as fwd-only emp_z
-    # sidecar; prior_buffer.condition_block_m auto-activates while bwd vg_lb>0
+    # sidecar.
+    #
+    # REQUIRES buffers.prior_buffer.condition_block_m: 2. The gate is `>= 2`, so
+    # the value 1 is OFF, not "auto-activating" as this comment used to claim.
+    # blocks_aug11 (2026-08-11) measured the whole ladder: getting every row into
+    # an estimable group at all is what matters, depth beyond 2 is not.
+    #   m=1 Kb=2   baseline
+    #   m=2 Kb=1   the win, and the CHEAPEST (500 bwd rows vs 1000)   <-- default
+    #   m=2 Kb=2   no gain over m=2 Kb=1, costs 2x the bwd rows
+    #   m=4 Kb=1   marginal gain, free
+    #   m=2 Kf=3   no gain, costs 500 extra fwd rows AND energy calls
+    # bwd repeats is therefore 1: same-terminal tiles cancel the reward and give
+    # TBC, not cross-terminal VarGrad. fwd repeats STAYS 2 -- on that branch the
+    # tiles share a condition but land on DISTINCT terminals, so it is the
+    # fwd-side blocking lever, and 2 is what clears min_group_count.
     - name: var_conditioning
       train_mode: fused
       bwd_sampling_mode: prior
@@ -119,7 +133,7 @@ conditional_toy_protocol_2026_07_29:
       loss_coeffs:
         # beta stays at base 10: 30 was tried (louder tail pull) and came back noisier-and-worse
         fwd: { vg_lb: 1.0, vg_by_condition: 1.0, emp_z: 1.0, repeats: 2.0 }
-        bwd: { vg_lb: 1.0, repeats: 2.0, level_gap: 1.0 }
+        bwd: { vg_lb: 1.0, repeats: 1.0, level_gap: 1.0 }
       balance:
         kind: proportional
         pinned: { replay: 0.0 }

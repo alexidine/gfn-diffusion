@@ -38,6 +38,8 @@ from energy_sampling.utils import is_cuda_oom, \
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss, log_pf_estimate
 from models import GFN
 from energy_sampling.models.aunit_periodicity import sg_periodic_centroid_axes, describe
+from energy_sampling.models.dead_latent_rows import (
+    resolve_dead_rows, verify_dead_rows, describe as describe_dead_rows)
 from mxtaltools.common.training_utils import flatten_wandb_params
 from mxtaltools.dataset_utils.utils import collate_data_list
 from utils import get_train_args, get_gfn_init_state, set_seed, \
@@ -48,6 +50,7 @@ from utils import get_train_args, get_gfn_init_state, set_seed, \
 # can ride in on loaded datasets or analyzed batches; never read off any buffer
 # draw, so stripped from EVERY buffer's storage just in case they are present
 BULKY_ATTR_EXCLUDE_KEYS = ('fingerprint', 'rdf')
+
 
 # stripped from churned-buffer STORAGE at admission (draws already drop them):
 # string/list attrs are never read off a buffer draw, and python-list keys make
@@ -225,6 +228,24 @@ class Modeller:
     def train_logic(self, it):
         return self.protocol.stage.train_mode
 
+    def _batch_floor(self) -> int:
+        """
+        Lower bound on the knee walk: the configured `batch_size`, which is the base
+        the run was designed around (and what protocol.advance re-enters each stage at).
+
+        This floor is load-bearing, not defensive. The knee test asks whether a jump's
+        throughput gain was worth its step-time cost, so in a REGIME WITH NO KNEE --
+        throughput flat in batch, i.e. perfectly linear scaling -- every jump fails and
+        the periodic recheck walks the batch down a rung at a time forever (1000 -> 606
+        -> 367 -> ...), because each recheck re-tests one rung lower than the last pin
+        and never re-tests the level above it. Flat throughput genuinely does argue for
+        the smallest batch (same samples/sec, faster steps), so the walk is not wrong --
+        it just has no reason of its own to stop, and gradient quality is not something
+        it can see. max_step_seconds may still cut BELOW this: a hard wall-clock ceiling
+        outranks a batch-size preference.
+        """
+        return max(1, min(int(self.args.batch_size), int(self.args.max_batch_size)))
+
     def increment_batch_size(self):
         """
         Batch growth, still AIMD-shaped (grow until OOM, cut + cooldown, regrow
@@ -236,24 +257,95 @@ class Modeller:
         are what make compile viable alongside growth.
 
         THROUGHPUT KNEE (auto_batch_throughput_opt: true): before each jump,
-        check whether the PREVIOUS jump actually paid in samples/sec (median
-        step time over the trailing window x batch). Past GPU saturation a
+        check whether the PREVIOUS jump actually paid. Past GPU saturation a
         factor-f batch jump returns ~x1.0 throughput while step time grows xf
         -- pure steps/hour loss (rpvez6ep: batch 50k ran the same 13.3k
-        samples/s as batch 1.6k at 31x the step time). A jump that gains less
-        than batch_growth_min_gain reverts one rung and PINS the batch for the
-        current protocol stage (stages have different step-cost profiles, so
-        protocol.advance clears the pin, the rung baseline, and the step-time
-        window at every stage transition -- a baseline measured under the
-        outgoing stage's step cost would poison the incoming stage's first
-        knee comparison -- and the walk re-measures upward from the current
-        rung on in-stage timings). With the flag on, max_batch_size is a
-        safety ceiling rather than a target. NB nvidia-smi-style utilization
-        can't drive this: it saturates at 100% below the knee; marginal
-        throughput is the discriminating signal on both sides.
+        samples/s as batch 1.6k at 31x the step time). A jump that fails the
+        test reverts one rung and PINS the batch for the current protocol stage
+        (stages have different step-cost profiles, so protocol.advance clears
+        the pin, the rung baseline, the OOM ceiling and the step-time window at
+        every stage transition -- a baseline measured under the outgoing stage's
+        step cost would poison the incoming stage's first knee comparison).
+        With the flag on, max_batch_size is a safety ceiling rather than a
+        target. NB nvidia-smi-style utilization can't drive this: it saturates
+        at 100% below the knee; marginal throughput is the discriminating signal
+        on both sides.
+
+        THE TEST IS STEP-TIME REGRESSION, NOT RAW THROUGHPUT GAIN. The retired
+        batch_growth_min_gain asked for a fixed +15% samples/sec, which is not a
+        knee criterion at all: at growth factor f a rung that returns exactly
+        +15% has grown step time by f/1.15 = x1.43, a 30% steps/hour LOSS scored
+        as a win. Chained, that walks the batch up until OOM stops it (prod0810
+        mipcas_elj: 2722 -> 12226, then a permanent OOM sawtooth). The honest
+        question is how much slower a step may get in exchange for throughput,
+        so the gate is batch_growth_max_step_regression: accept iff
+        t_new/t_old <= 1 + tol, i.e. sps_new >= sps_old * f / (1 + tol).
+
+        Three further guards, each from an observed prod0810 failure:
+          * NEVER GROW BLIND. The old code fell through to an unconditional
+            multiply whenever _rung_throughput was None -- which handle_oom sets
+            on every OOM -- so after the first OOM every jump was taken with no
+            measurement, straight back into the same OOM. A rung with no
+            baseline is now MEASURED first and grown on the next interval.
+          * REMEMBER WHAT OOM'd. The size that OOM'd is the most informative
+            reading the controller ever gets; it used to be discarded. It is now
+            a hard ceiling for the stage.
+          * max_step_seconds is an absolute wall-clock ceiling on a train step.
+            Throughput arguments are blind to it -- a 180 s step can be perfectly
+            'efficient' in samples/sec and still be useless to train against.
         """
         knee_on = bool(getattr(self.args, 'auto_batch_throughput_opt', False))
         stage_name = getattr(getattr(self.protocol, 'stage', None), 'name', None)
+        times = getattr(self, '_recent_step_times', None)
+        med = float(np.median(list(times)[-20:])) if times and len(times) >= 10 else None
+
+        # absolute step-time ceiling, checked before any throughput reasoning and
+        # in BOTH directions: an oversized batch inherited across a transition (or
+        # restored from a checkpoint) has to be able to come back down, and the
+        # knee walk alone only ever moves up from where it starts
+        max_step_s = float(getattr(self.args, 'max_step_seconds', 0) or 0)
+        if max_step_s > 0 and med is not None and med > max_step_s:
+            if self.step_ind < getattr(self, 'batch_size_cooldown_until', -1):
+                return
+            f = float(getattr(self.args, 'batch_growth_factor', 2.0))
+            # PROPORTIONAL, not one rung: step cost is close enough to linear in batch
+            # that the overshoot ratio estimates the target directly, and a fixed /f
+            # ladder converges far too slowly in exactly the case that matters -- a
+            # 181 s step needs 4 cuts at oom_cooldown_steps apart, i.e. ~40 h of
+            # 181 s steps to reach a size it should have taken in one. Never cut less
+            # than one rung, and keep 10% margin so the next measurement lands under
+            # the ceiling rather than on it.
+            shrunk = max(1, min(int(round(self.batch_size / f)),
+                                int(self.batch_size * (max_step_s / med) * 0.9)))
+            # ...but not into the grad-accumulation regime. Below
+            # fused_grad_accum_min_samples a fused step is a MICRO-step: cutting the
+            # batch buys proportionally more micro-steps for the same samples, so
+            # time per OPTIMIZER UPDATE does not fall at all -- only the per-iteration
+            # number this ceiling happens to measure. Cutting 1000->400 against a
+            # 1000-sample target turns one 25 s update into three 10 s micro-steps:
+            # ceiling satisfied, update rate slightly worse. Memory pressure is the
+            # OOM path's job, not this one's.
+            accum = int(getattr(self.args, 'fused_grad_accum_min_samples', 0) or 0)
+            if accum > 0 and getattr(self.protocol.stage, 'train_mode', None) == 'fused':
+                shrunk = max(shrunk, min(accum, self.batch_size))
+            if shrunk >= self.batch_size:
+                print(f"batch: step time {med:.1f}s over max_step_seconds {max_step_s:.1f}s "
+                      f"at batch {self.batch_size}, which is already the smallest size that "
+                      f"still makes one optimizer update ({accum} samples). Cutting further "
+                      f"cannot speed the update up -- lower fused_grad_accum_min_samples, "
+                      f"raise max_step_seconds, or accept the step cost.")
+            if shrunk < self.batch_size:
+                print(f"batch: step time {med:.1f}s over max_step_seconds {max_step_s:.1f}s "
+                      f"-- cutting {self.batch_size} -> {shrunk}")
+                self.batch_size = shrunk
+                self.batch_size_saturated_stage = None
+                self._rung_throughput = None
+                self.batch_size_last_grow = self.step_ind
+                self.batch_size_cooldown_until = self.step_ind + int(
+                    getattr(self.args, 'oom_cooldown_steps', 200) or 0)
+                times.clear()
+                self._recent_step_work.clear()
+            return
         if (knee_on and stage_name is not None
                 and getattr(self, 'batch_size_saturated_stage', None) == stage_name):
             # periodic re-estimation: the knee moves WITHIN a stage as the fused
@@ -264,7 +356,10 @@ class Modeller:
             recheck = int(getattr(self.args, 'batch_knee_recheck_steps', 0) or 0)
             if recheck > 0 and self.step_ind - getattr(self, 'batch_size_pinned_at', 0) >= recheck:
                 f = float(getattr(self.args, 'batch_growth_factor', 2.0))
-                self.batch_size = max(1, int(round(self.batch_size / f)))
+                dropped = max(self._batch_floor(), int(round(self.batch_size / f)))
+                if dropped >= self.batch_size:
+                    return  # already at the floor -- nothing below to re-measure against
+                self.batch_size = dropped
                 self.batch_size_saturated_stage = None
                 self._rung_throughput = None
                 self.batch_size_last_grow = self.step_ind
@@ -281,26 +376,53 @@ class Modeller:
         if self.step_ind - getattr(self, 'batch_size_last_grow', 0) < wait:
             return
 
-        min_gain = float(getattr(self.args, 'batch_growth_min_gain', 0.15) or 0)
-        times = getattr(self, '_recent_step_times', None)
-        if knee_on and min_gain > 0 and times is not None and len(times) >= 10:
-            # median over the trailing window: robust to the one-off compile
-            # stall at rung entry and any churn/OS spikes inside the dwell
-            med = float(np.median(list(times)[-20:]))
-            sps = self.batch_size / max(med, 1e-9)
+        f = float(getattr(self.args, 'batch_growth_factor', 2.0))
+        target = min(self.args.max_batch_size,
+                     max(self.batch_size + 1, int(round(self.batch_size * f))))
+
+        # a size that OOM'd in this stage is a measurement, not noise: never walk
+        # back into it. Without this the post-OOM baseline reset below made every
+        # subsequent jump a blind re-entry into the same failure.
+        ceiling = getattr(self, 'batch_size_oom_ceiling', None)
+        if ceiling is not None and target >= ceiling:
+            if self.batch_size_saturated_stage != stage_name:
+                print(f"batch growth: {target} would re-enter the OOM ceiling {ceiling} "
+                      f"-- pinning {self.batch_size} for stage '{stage_name}'")
+                self.batch_size_saturated_stage = stage_name
+                self.batch_size_pinned_at = self.step_ind
+            return
+
+        if knee_on:
+            if med is None:
+                return  # not enough in-stage timings yet -- measure, never guess
+            work = float(np.sum(list(self._recent_step_work)[-20:]))
+            secs = float(np.sum(list(self._recent_step_times)[-20:]))
+            sps = work / max(secs, 1e-9)
             base = getattr(self, '_rung_throughput', None)
-            if base is not None and base[0] < self.batch_size:
-                prev_batch, prev_sps = base
-                if sps < prev_sps * (1.0 + min_gain):
+            if base is None:
+                # NO BASELINE = NO JUMP. Record this rung and grow on the next
+                # interval, so every jump is scored against a measured rung.
+                self._rung_throughput = (self.batch_size, sps)
+                self.batch_size_last_grow = self.step_ind
+                return
+            prev_batch, prev_sps = base
+            if prev_batch < self.batch_size:
+                # step time scales as batch/throughput, so the previous jump grew
+                # it by (b1/s1)/(b0/s0). Accept only if that regression is within
+                # tolerance -- a throughput gain bought with a slower step is a
+                # steps/hour loss, which is what actually matters for training.
+                tol = float(getattr(self.args, 'batch_growth_max_step_regression', 0.25) or 0)
+                regression = (self.batch_size / max(sps, 1e-9)) / (prev_batch / max(prev_sps, 1e-9))
+                if regression > 1.0 + tol:
                     # pin at the TRUE knee; gradient stability below
                     # fused_grad_accum_min_samples is provided by fused-step
                     # accumulation (see train_step), not batch inflation
                     accum = int(getattr(self.args, 'fused_grad_accum_min_samples', 0) or 0)
                     print(f"batch growth: throughput knee -- {prev_batch}->{self.batch_size} bought "
-                          f"{prev_sps:.0f}->{sps:.0f} samples/s (< +{min_gain * 100:.0f}%); pinning "
-                          f"{prev_batch} for stage '{stage_name}'"
+                          f"{prev_sps:.0f}->{sps:.0f} samples/s for x{regression:.2f} step time "
+                          f"(> +{tol * 100:.0f}%); pinning {prev_batch} for stage '{stage_name}'"
                           + (f" (fused steps will grad-accumulate to {accum})" if prev_batch < accum else ""))
-                    self.batch_size = prev_batch
+                    self.batch_size = max(self._batch_floor(), prev_batch)
                     self.batch_size_saturated_stage = stage_name
                     self.batch_size_pinned_at = self.step_ind
                     self._rung_throughput = None
@@ -308,9 +430,7 @@ class Modeller:
                     return
             self._rung_throughput = (self.batch_size, sps)
 
-        f = float(getattr(self.args, 'batch_growth_factor', 2.0))
-        self.batch_size = min(self.args.max_batch_size,
-                              max(self.batch_size + 1, int(round(self.batch_size * f))))
+        self.batch_size = target
         self.batch_size_last_grow = self.step_ind
 
 
@@ -542,7 +662,11 @@ class Modeller:
             conditions_dim += 1
         if getattr(self.args, 'vector_conditioning', False):
             conditions_dim += self.args.vector_conditioning_dim
-        # if we do pre-embedded molecule conditions, we'll add the dimension here
+        if getattr(self.args, 'embedding_conditioning', False):
+            # pre-embedded molecule conditions: the FLATTENED encoder latent baked onto
+            # each molecules_path entry (3 * bottleneck). conditions_type stays 'vector',
+            # so this rides the same scalarMLP conditioner as `c` does
+            conditions_dim += self.args.embedding_conditioning_dim
         return conditions_dim
 
     def init_energy_function(self):
@@ -557,6 +681,8 @@ class Modeller:
             'zp_conditioning': self.args.zp_conditioning,
             'vector_conditioning': getattr(self.args, 'vector_conditioning', False),
             'vector_conditioning_dim': getattr(self.args, 'vector_conditioning_dim', None),
+            'embedding_conditioning': getattr(self.args, 'embedding_conditioning', False),
+            'embedding_conditioning_dim': getattr(self.args, 'embedding_conditioning_dim', None),
         }
         energy_config.update(self.args.energy_config.__dict__)
         self.energy_function = MolecularCrystal(**energy_config)
@@ -1028,18 +1154,110 @@ class Modeller:
                   "(auv == 1) aunit axis -- no centroid dim will be wrapped")
         return axes
 
+    def _resolve_dead_latent_rows(self, quiet: bool = False):
+        """
+        Which latent rows are structurally dead and so held out of the SDE. Returns
+        None when the feature is off or does not apply. See decisions.md D33.
+
+        Crystal-only. Toy energies carry `space_groups: [1]` as a PLACEHOLDER, and P1
+        has all three aunit centroid axes free, so keying off the space group without
+        the is_crystal gate would eventually freeze three dims a toy genuinely uses --
+        silently, as lost coverage rather than an error. `resolve_dead_rows` enforces
+        the gate; this method also skips the probe, which is crystal machinery.
+
+        Like periodic_centroids this makes the model space-group specific, so the space
+        groups present must agree on their dead rows. They always do within a crystal
+        system; a mixed-system list cannot be served by one index set and raises.
+        """
+        if not getattr(self.args.model, 'hold_dead_latent_rows', True):
+            return None
+        if not self.energy_function.is_crystal:
+            if not quiet:
+                print(describe_dead_rows(1, max(self.args.z_primes), is_crystal=False))
+            return None
+        if not len(self.args.space_groups):
+            raise ValueError(
+                "hold_dead_latent_rows needs at least one entry in space_groups to know "
+                "which latent rows are dead; got an empty list")
+
+        zp = max(self.args.z_primes)
+        per_sg = {int(sg): resolve_dead_rows(int(sg), is_crystal=True, max_z_prime=zp)
+                  for sg in self.args.space_groups}
+        distinct = set(per_sg.values())
+        if len(distinct) > 1:
+            raise ValueError(
+                "hold_dead_latent_rows makes the model space-group specific, but the "
+                f"configured space_groups disagree about which latent rows are dead: "
+                f"{per_sg}. One index set cannot serve them; split the run by crystal "
+                f"system, or set model.hold_dead_latent_rows: false to opt out (which "
+                f"restores the D33 defect -- prior rows pinned at the canonical value "
+                f"while the energy is flat there).")
+        rows = distinct.pop() if distinct else ()
+        if not quiet:
+            print(describe_dead_rows(int(self.args.space_groups[0]), max(self.args.z_primes)))
+        return rows
+
+    def _verify_dead_latent_rows(self, crystal_batch, n_probe: int = 8):
+        """
+        Assert the tabulated dead rows still match what the crystal build actually
+        ignores. This is the guard against the exact failure that motivated D33: a
+        table drifting away from enforce_crystal_system, unnoticed because nothing
+        crashes. Cheap -- one small clone, a dozen forward transforms.
+
+        Probes a CLONE: probe_dead_rows drives latent_to_cell_params repeatedly and
+        must not perturb the live prior batch.
+        """
+        if not self.energy_function.is_crystal:
+            return
+        if not getattr(self.args.model, 'hold_dead_latent_rows', True):
+            return
+        sg = int(self.args.space_groups[0])
+        try:
+            n = min(n_probe, crystal_batch.num_graphs)
+            probe_batch = crystal_batch.subsample_new_batch(
+                torch.arange(n, device=crystal_batch.device)).clone()
+            probe_batch.pose_aunit()
+            probe_batch.build_unit_cell()
+            found = verify_dead_rows(probe_batch, sg, max(self.args.z_primes))
+            print(f"dead-row probe: latent_to_cell_params confirms rows {found} "
+                  f"are ignored for SG{sg} (n={n})")
+            # The value the SDE pins these rows to must equal the value latent_params()
+            # writes into them, or bwd terminals drawn from the buffer would disagree
+            # with fwd terminals. Zero holds for every space group reachable today
+            # (pi/2 -> latent 0.0); hexagonal gamma = 2pi/3 does not, and must surface
+            # here rather than be silently pinned to the wrong constant.
+            if found:
+                lat = probe_batch.latent_params()[:, list(found)]
+                worst = float(lat.abs().max().item())
+                if worst > 1e-6:
+                    raise AssertionError(
+                        f"SG{sg} dead rows {found} round-trip to a NONZERO canonical "
+                        f"latent value (max |v| = {worst:.6g}), but the SDE pins them to "
+                        f"0. Resolve dead_latent_values alongside dead_latent_rows and "
+                        f"pass it through _build_gfn_config before running this space "
+                        f"group -- see decisions.md D33.")
+        except AssertionError:
+            raise
+        except Exception as e:
+            # a probe that cannot run is not evidence the table is wrong; say so loudly
+            # rather than either crashing the run or implying the check passed
+            print(f"WARNING: dead-row probe could not run ({type(e).__name__}: {e}); "
+                  f"the tabulated rows for SG{sg} are UNVERIFIED this run")
+
     def _build_gfn_config(self):
         return dict(
             dim=self.energy_function.data_ndim,
             conditions_dim=self.get_conditioning_dim(),
             conditions_type='molecule' if self.args.molecule_conditioning else 'vector',
             periodic_centroid_axes=self._resolve_periodic_centroid_axes(),
+            dead_latent_rows=self._resolve_dead_latent_rows(),
             conditional=any([
                 self.args.temperature_conditioning,
                 self.args.molecule_conditioning,
                 self.args.sg_conditioning,
                 self.args.zp_conditioning,
                 getattr(self.args, 'vector_conditioning', False),
+                getattr(self.args, 'embedding_conditioning', False),
             ]),
             device=self.device,
             max_z_prime=max(self.args.z_primes),
@@ -1266,6 +1484,12 @@ class Modeller:
                 # one-off pass over the whole prior dataset at init -- prefer the adaptive, self-healing chunked path over a hard crash, regardless of the training-time flag
             )
 
+        # D33: confirm the tabulated dead latent rows still match what the crystal build
+        # actually discards, now that a real batch with physical cell parameters exists.
+        # Must run on real structures: a degenerate batch (a == b) cannot reveal the
+        # tetragonal length constraint and would misreport a live row as dead.
+        self._verify_dead_latent_rows(prior)
+
         self.prior_dataset = CrystalBuffer(prior,
                                            device=self.buffer_device,
                                            max_z_prime=max(self.args.z_primes),
@@ -1447,12 +1671,9 @@ class Modeller:
                 # the size that was actually attempted at that cost
                 attempted_batch = self.batch_size
                 self.times['train_step_start'] = time()
+                self._z_cal_rollouts = 0
                 try:
                     current_loss = self.train_step(step_type)
-
-                    if self.args.grow_batch_size:
-                        self.increment_batch_size()
-
                 except (RuntimeError, ValueError) as e:  # if we do hit OOM, slash the batch size
                     self.handle_train_epoch_error(e, step_type)
                 # interspersed Z-only calibration steps (z_calibration_tick);
@@ -1464,9 +1685,24 @@ class Modeller:
                 self._probe_max('step_time_max10', step_dt)
                 if not hasattr(self, '_recent_step_times'):
                     self._recent_step_times = deque(maxlen=64)
+                    self._recent_step_work = deque(maxlen=64)
                 self._recent_step_times.append(step_dt)  # feeds the throughput-knee check
+                # WORK, not just the training batch: z_calibration_tick runs
+                # self._z_cal_rollouts extra full-batch rollouts inside the timing
+                # window above, and its rate is frequency-modulated by a sensor that
+                # decays on its own clock. Charging the rung only for attempted_batch
+                # while timing all of it made step_dt fall at CONSTANT batch as the
+                # sensor converged, and the knee credited that decay to its own
+                # growth -- which is what walked prod0810 to batch 12226.
+                self._recent_step_work.append(attempted_batch * (1 + self._z_cal_rollouts))
                 self._throughput['samples'] += attempted_batch
                 self._throughput['seconds'] += step_dt
+                # the controller scores the step it just timed, at the batch that
+                # actually ran it: growing before the append paired a new batch
+                # with the old rung's timings (and made 'Batch Size' log one rung
+                # ahead of train_step_time)
+                if self.args.grow_batch_size:
+                    self.increment_batch_size()
 
                 # train monitoring
                 if self.step_ind % 10 == 0:
@@ -1478,6 +1714,10 @@ class Modeller:
                     # arms the exit trigger (which pulls the next eval forward)
                     if self.protocol.flag('mle_gate'):
                         metrics.update(self.update_mle_gate())
+                    # the stage's declared LR sensor. Returns {} (and touches
+                    # nothing) unless the stage declares lr_sensor kind:
+                    # plateau, so this is inert for every config without one.
+                    metrics.update(self.update_lr_plateau())
                     self.protocol.tick()
 
                 # evaluation work -- stage_ctrl 'request_eval' pulls the eval
@@ -1775,7 +2015,15 @@ class Modeller:
         # actually taken. Sensor only -- measure() restores every parameter it
         # touches bitwise, and a probe that finds no step (non-finite gradient,
         # or mid-accumulation) tallies 'nostep' and returns without reading.
-        probe_armed = self.ray_cal.arm(self.step_ind)
+        # The ray probe runs only where the stage asks for it. It is coherent
+        # ONLY in a fused stage that trains replay TB -- it draws from replay
+        # (needing STORED trajectories) and scores with replay_loss_coeffs, so
+        # anywhere else it rates a loss nobody is optimising. A stage with no
+        # lr_sensor block keeps the legacy always-on behaviour governed by
+        # ray_calibration.enabled, so existing configs are unaffected.
+        _sensor = self.protocol.stage.lr_sensor
+        probe_armed = (self.ray_cal.arm(self.step_ind)
+                       if (_sensor is None or _sensor['kind'] == 'ray') else False)
 
         if accumulating:
             self.fused_accum_count += self.batch_size
@@ -2175,9 +2423,20 @@ class Modeller:
             #     flat direction. Logged so the variance breathing can be
             #     phase-resolved against logw_std/box_contact instead of being
             #     sampled ~3x per cycle at eval cadence.
-            stats['terminal_var'] = states[:, -1].var(dim=0).mean().item()
+            # Averaged over LIVE dims only. The claim just above -- "both are per-dim
+            # means so they're comparable across problems" -- fails if the denominator
+            # counts dims that structurally cannot move: a monoclinic run holds 2 of 12
+            # dead (D33), so a full-width mean would report terminal_var and step_var
+            # ~10/12 of their true per-dof value and would drop DISCONTINUOUSLY at the
+            # change, which reads as a coverage regression that never happened. Exactly
+            # equal to the full-width mean for triclinic and toys.
+            live_states = states
+            live_idx = getattr(getattr(self, 'gfn_model', None), 'live_idx', None)
+            if live_idx is not None and live_idx.numel() != states.shape[-1]:
+                live_states = states.index_select(-1, live_idx.to(states.device))
+            stats['terminal_var'] = live_states[:, -1].var(dim=0).mean().item()
             if states.shape[1] > 1:
-                stats['step_var'] = (states[:, 1:] - states[:, :-1]).pow(2).mean().item()
+                stats['step_var'] = (live_states[:, 1:] - live_states[:, :-1]).pow(2).mean().item()
         # RAW (pre-EMA) stats cache, one step deep: the MLE slope gate samples
         # bwd/mle from here every 10 steps -- raw batch losses are ~independent
         # across steps, so its OLS slope needs no autocorrelation correction
@@ -2445,6 +2704,11 @@ Two things deliberately NOT done here, both recorded in
             if not ok:
                 break
             rep['z_cal/steps'] = rep.get('z_cal/steps', 0) + 1
+            # per-STEP tally (the rep counter above is cumulative-since-report).
+            # Each rollout/replay step processes a full self.batch_size, so the
+            # batch controller needs this to charge the rung for the calibration
+            # work it caused -- see increment_batch_size.
+            self._z_cal_rollouts += 1
             if fresh is not None:
                 rep['z_cal/fresh'] = fresh
                 if fresh <= bar:
@@ -3088,12 +3352,25 @@ Two things deliberately NOT done here, both recorded in
             except Exception:
                 pass
 
+        # the size that just failed is a hard ceiling for this stage. Clearing the
+        # baseline below re-arms the growth walk, and without a remembered ceiling
+        # that walk climbs straight back into this same OOM -- prod0810 mipcas_elj
+        # ran that sawtooth (6113->10086->OOM->5043->8321->OOM->4160->...) for the
+        # rest of the run, burning a step plus a gc/empty_cache cycle each lap.
+        oomed_at = self.batch_size
+        prior_ceiling = getattr(self, 'batch_size_oom_ceiling', None)
+        self.batch_size_oom_ceiling = (oomed_at if prior_ceiling is None
+                                       else min(prior_ceiling, oomed_at))
         self.batch_size = max(1, int(self.batch_size * self.args.oom_batch_shrink_factor))
         self.batch_size_ever_oomed = True
         self.batch_size_cooldown_until = self.step_ind + self.args.oom_cooldown_steps
         # stale throughput baseline/latch would compare across the cut -- re-measure
         self._rung_throughput = None
         self.batch_size_saturated_stage = None
+        # timings from the pre-cut rung would be scored against the post-cut batch
+        if getattr(self, '_recent_step_times', None) is not None:
+            self._recent_step_times.clear()
+            self._recent_step_work.clear()
         if self.batch_size <= 1:
             raise RuntimeError("Cascading OOM Failure")
         print(f"Reducing batch size to {self.batch_size}")
@@ -3490,7 +3767,16 @@ Two things deliberately NOT done here, both recorded in
         # for its condition, reachable only on the anchor-buffer fallback path
         # (which this batch has not been folded into). That is not a tail event.
         u = ((energy[seen] - floor[seen]) / temperature[seen]).clamp_min(0.0)
-        u_star = s_per_dim * float(self.energy_function.data_ndim)
+        # Per DEGREE OF FREEDOM, not per state slot: with dead latent rows held out of
+        # the SDE (D33) the reachable entropy lives on live_dim dims, so scaling by the
+        # full data_ndim would set the threshold too lenient by exactly the dead
+        # fraction (12 -> 10 for monoclinic, i.e. 20% too high). Exactly identical for
+        # triclinic and for toys, where live_dim == data_ndim, so no existing run or
+        # logged threshold moves.
+        n_dof = getattr(getattr(self, 'gfn_model', None), 'live_dim', None)
+        if n_dof is None:
+            n_dof = self.energy_function.data_ndim
+        u_star = s_per_dim * float(n_dof)
 
         metrics['Nonthermal Fraction'] = (u > u_star).float().mean().item()
         q = torch.quantile(u, torch.tensor([0.5, 0.9, 0.99], dtype=u.dtype))
@@ -3575,6 +3861,79 @@ Two things deliberately NOT done here, both recorded in
         metrics['mle_gate_rate_hi'] = rate_hi  # the quantity actually tested
         metrics['mle_gate_flat'] = float(flat)
         return metrics
+
+    def update_lr_plateau(self):
+        """
+        ReduceLROnPlateau over the stage's declared loss channels.
+
+        Track each channel's best value; a check counts as progress if any
+        channel improved on its best by more than `threshold` (relative). If no
+        channel has improved for `patience` checks, cut the LR by `factor` and
+        wait `cooldown` checks before counting again.
+
+        One criterion covers every failure mode: a rising loss, a stalled one,
+        and one that has blown up and plateaued at a ruinous level are all
+        simply "no improvement over best". The earlier slope-fitting version
+        tested only whether the loss was RISING, and so sat clean for 3000 steps
+        through lrs_normal, which was merely stalled at 8x the healthy LR.
+
+        WHY DECLARED AND NOT DERIVED from the active coefficients: bwd level_gap
+        carries a coefficient while being sign-indefinite and not a convergence
+        signal, and vg_by_condition carries one while being a boolean switch
+        with no series behind it.
+        """
+        sensor = self.protocol.stage.lr_sensor
+        if sensor is None or sensor['kind'] != 'plateau':
+            return {}
+        # The LR is deliberately non-stationary while the envelope ramps, so a
+        # lack of progress there says nothing about the operating point.
+        if self.lr_controller.in_warmup():
+            return {}
+
+        gs = self.protocol.gate_state('lr_plateau')
+        best = gs.setdefault('best', {})
+        improved = False
+        for name in sensor['metrics']:
+            mode, _, channel = name.partition('/')
+            # The SMOOTHED value (metric_tracker EMA), not the raw per-step one.
+            # Tracking a best-ever over raw values ratchets the best down to the
+            # luckiest noise sample, after which nothing beats it and the sensor
+            # cuts while the run is still genuinely improving -- observed on
+            # lrs_blowup, where stale climbed to patience over steps 770-850
+            # while the logged (EMA) curve was setting new lows. A slope test
+            # wants raw input, because EMA autocorrelation wrecks its standard
+            # errors; a best-tracking test wants the opposite.
+            raw = self.metric_tracker.get(mode, channel)
+            if raw is None or not math.isfinite(float(raw)):
+                continue
+            val = float(raw)
+            prev = best.get(name)
+            # ABSOLUTE threshold. A relative one has nothing to be relative to
+            # here: bwd/mle is unbounded below, so abs(best) * frac grows without
+            # limit as the run improves, and the multiplicative form flips sign
+            # outright once best goes negative.
+            if prev is None or val < prev - sensor['threshold']:
+                improved = True
+            if prev is None or val < prev:
+                best[name] = val
+
+        if gs.get('cooldown', 0) > 0:
+            gs['cooldown'] -= 1
+            gs['stale'] = 0
+        elif improved:
+            gs['stale'] = 0
+        else:
+            gs['stale'] = int(gs.get('stale', 0)) + 1
+
+        fired = gs['stale'] >= sensor['patience']
+        if fired:
+            gs['stale'] = 0
+            gs['cooldown'] = sensor['cooldown']
+        # called unconditionally so a satisfied sensor and an absent one are
+        # distinguishable in lr_ctrl/plateau_status
+        self.lr_controller.on_plateau(fired, sensor['factor'])
+        return {'lr_plateau/stale': float(gs['stale']),
+                'lr_plateau/fired': float(fired)}
 
     def evaluation(self, override_do_figs: bool = False):
         metrics = {}

@@ -79,6 +79,9 @@ class LRController:
         self._divergences = 0
         self._calibrations = 0
         self._last = {}               # last calibration's decision, for the log
+        self._plateau_last = {}       # last plateau decision, same purpose
+        self._plateau_cuts = 0
+        self._restarts = 0
         self._check_bars()
 
     # ------------------------------------------------------------------ config
@@ -202,6 +205,33 @@ class LRController:
         st['envelope'] = self._envelope(st)
         self._apply_lrs(st)
 
+    def on_plateau(self, fired: bool, factor: float):
+        """
+        Apply one ReduceLROnPlateau verdict. Held through warmup for the same
+        reason the sensor declines to look: the envelope is deliberately moving
+        the LR there, so a lack of progress is not evidence about the operating
+        point.
+        """
+        st = self._state()
+        self._plateau_last = {'fired': bool(fired), 'applied': 0.0, 'status': 'clean'}
+        if self._elapsed(st) < int(self._cfg('warmup_steps', 1000)):
+            self._plateau_last['status'] = 'warmup'
+            return
+        if not fired:
+            return
+        lo, hi = self._peak_bounds()
+        ceiling = self._current_ceiling()
+        if ceiling is not None:
+            hi = min(hi, ceiling)
+        before = float(st['peak_scale'])
+        st['peak_scale'] = max(lo, min(hi, before * float(factor)))
+        self._plateau_last['applied'] = st['peak_scale'] / before if before else 1.0
+        self._plateau_last['status'] = 'cut'
+        self._plateau_cuts += 1
+        st['envelope'] = self._envelope(st)
+        self._apply_lrs(st)
+        print(f"lr_ctrl: plateau cut -> peak_scale {st['peak_scale']:.4g}")
+
     # -------------------------------------------------------------------- state
 
     def _fresh_state(self, phase):
@@ -240,15 +270,21 @@ class LRController:
         curvature) and forget the ceiling, whose evidence describes a surface
         that no longer exists.
 
-        peak_scale is deliberately CARRIED across the transition -- it is the
-        accumulated estimate of the right LR for this problem, and re-deriving it
-        from the seed each stage would spend thousands of steps re-climbing.
+        peak_scale is RESET to 1.0, so each stage re-discovers its own peak. It
+        used to be carried, on the grounds that it was an accumulated estimate
+        and re-deriving it would "spend thousands of steps re-climbing" -- but
+        that reasoning belongs to a sensor that CLIMBS. The plateau rule only
+        ever cuts, so there is nothing to re-climb, and carrying a cut forward
+        just imposes the previous stage's verdict on a surface with different
+        curvature. Measured peaks differ substantially between stages and runs.
 
         Returns the warmup length in TRAIN STEPS."""
         m = self.modeller
         st = self._state()
         st['phase_seen'] = m.phase
         self._ceiling = None
+        st['peak_scale'] = 1.0
+        st['restart_step'] = int(m.step_ind)
         st['stage_start_step'] = int(m.step_ind)
         st['envelope'] = self._envelope(st)
         self._apply_lrs(st)
@@ -307,8 +343,10 @@ class LRController:
 
     def step(self):
         """One controller evaluation. Re-stamps the envelope and the LRs; it does
-        NOT move peak_scale -- only on_calibration and on_divergence do."""
+        NOT move peak_scale, except for a warm restart -- otherwise only
+        on_calibration, on_plateau and on_divergence do."""
         st = self._state()
+        self._maybe_restart(st)
         st['envelope'] = self._envelope(st)
         ceiling = self._current_ceiling()
         if ceiling is not None:
@@ -317,8 +355,44 @@ class LRController:
         self._emit(st)
         return self.modeller.optimizers['fwd'].param_groups[0]['lr']
 
+    def _maybe_restart(self, st):
+        """Warm restart (SGDR-style): put peak_scale back to 1.0 and let the
+        plateau rule decay it again.
+
+        The plateau rule is a pure ratchet, and "no improvement" cannot tell
+        too-hot from too-cold -- descent rate is an inverted U in LR -- so an
+        over-cut run keeps cutting toward the floor. A periodic reset bounds that
+        without a servo that tries to hunt the peak, and cannot oscillate.
+
+        Two triggers, both cheap:
+          - the peak has hit its floor, so further cuts do nothing anyway;
+          - restart_after train steps have passed since the last restart.
+        adaptive_lr.restart_after: null disables the timed one.
+        """
+        lo, _ = self._peak_bounds()
+        every = self._cfg('restart_after', None)
+        since = int(self.modeller.step_ind) - int(st.get('restart_step', 0))
+        floored = float(st['peak_scale']) <= lo * 1.000001
+        timed = every is not None and since >= int(every)
+        if not (floored or timed):
+            return
+        st['peak_scale'] = 1.0
+        st['restart_step'] = int(self.modeller.step_ind)
+        self._restarts += 1
+        print(f"lr_ctrl: warm restart ({'floor' if floored else f'{since} steps'}) "
+              f"-- peak_scale -> 1.0")
+
     _STATUS = {'unresolved': 0, 'bracketed': 1, 'above_range': 2,
                'below_range': 3, 'inconsistent': 4, 'warmup': 5}
+    # 'warmup' deliberately shares code 5 with _STATUS so the two sensors' status
+    # channels read on one scale
+    _PLATEAU_STATUS = {'clean': 0, 'cut': 1, 'warmup': 5}
+
+    def in_warmup(self) -> bool:
+        """Whether the LR envelope is still ramping. Public because a sensor may
+        need to decline to SAMPLE during warmup, not merely to act."""
+        st = self._state()
+        return self._elapsed(st) < int(self._cfg('warmup_steps', 1000))
 
     def _emit(self, st):
         self._report = {
@@ -337,6 +411,14 @@ class LRController:
             self._report['lr_ctrl/cal_applied'] = float(self._last.get('applied', 0.0))
             s = self._last.get('status')
             self._report['lr_ctrl/cal_status'] = float(self._STATUS.get(s, -1))
+        # Same discipline for the plateau sensor: publish the ACTUATOR beside the
+        # sensor, so a sensor that is never firing and one that is never running
+        # can be told apart from the log alone.
+        if self._plateau_last:
+            self._report['lr_ctrl/plateau_applied'] = float(self._plateau_last.get('applied', 0.0))
+            self._report['lr_ctrl/plateau_status'] = float(
+                self._PLATEAU_STATUS.get(self._plateau_last.get('status'), -1))
+            self._report['lr_ctrl/plateau_cuts'] = float(self._plateau_cuts)
         ceiling = self._current_ceiling()
         if ceiling is not None:
             self._report['lr_ctrl/peak_ceiling'] = ceiling

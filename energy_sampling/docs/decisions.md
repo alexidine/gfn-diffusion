@@ -25,6 +25,135 @@ open and who closes it; that one is why and in what order.
 
 # Part 1 — The docket
 
+## D33. Dead latent rows — flow the reduced object, do not pin ✅ DECIDED 2026-08-11
+
+**Ruling: the SDE flows only the physically-real latent rows.** Rows that
+`enforce_crystal_system` overwrites with a constant are held at their canonical value
+and excluded from the diffusion. Evidence: `findings.md` F-009; argument:
+[`design/fundamental_domain.md`](design/fundamental_domain.md) §3.
+
+**Implementation: entirely inside `models/gfn.py`. BUILT 2026-08-11.** States stay full
+width, so no consumer's index semantics move — `compute_zp_order_penalty` reads
+`raw_latents[:, 6:6+3k]`, `compute_jacobian` slices the orientation block, and four
+call sites pass `latent_params()` (already full width) rather than an SDE output. An
+energy-boundary scatter/gather was considered and rejected for touching all of that.
+
+`self.dim` is deliberately **unchanged**, so the `dim != 6+6·max_z_prime` guard
+(`gfn.py:283`) stays meaningful and the drift head keeps its indexing. What changes:
+
+- `get_periodic_dimensions` builds a **three-way partition** `ang_idx ⊎ lin_idx ⊎
+  dead_idx = range(dim)`, asserted at construction. A dead dim leaves whichever block
+  it was in — nothing may assume which, since 26 space groups have a centroid axis that
+  is both free and `auv == 1` (F-008).
+- `expanded_dim = lin_dim + 2·ang_dim` from the **final** sets: a dead *angular* dim
+  removes 2 policy-input slots, a dead *linear* dim removes 1. Never `dim − n_dead`.
+- `_pin_dead` writes the canonical value after each propagation and at both trajectory
+  endpoints. Drift and noise are **not** masked — pinning discards them, so a misplaced
+  mask cannot leave a dead dim moving. That was chosen over masking precisely because
+  the failure mode is silent.
+- `gauss_logprob` and the DPLR Woodbury path restrict to live dims via `_live_only`,
+  **after** the angular wrap (`ang_idx` indexes full width). Leaving dead dims in the
+  reductions would add a constant offset to the TB residual that `log Z` absorbs.
+- `get_dplr_cov` zeroes ρ on `dplr_zero_mask = original_angular | dead`.
+- Both helpers return the **same objects** when `dead_idx` is empty, which is what makes
+  the no-dead-rows path bitwise identical rather than merely equal.
+
+**One diagnostic was mis-scaled and is fixed:** `u_star = s_per_dim · data_ndim`
+(`train.py`) is nats per *degree of freedom*, so it now scales by `live_dim` — was 17%
+too lenient for monoclinic, 25% for orthorhombic. Identical for triclinic and toys.
+`Effective Dimension` needs no change: it reads `sample_batch.latent_params()`, which
+round-trips dead rows to 0.0 both before and after, so it is unaffected.
+
+**Tests:** `test_dead_latent_rows.py`, 18 groups, all passing; the pre-existing
+`test_periodic_scoring.py` passes unchanged. The load-bearing ones are the bitwise
+pre-change comparison (recorded numbers inlined), measured trajectory constancy, the
+density checked against an independent `MultivariateNormal`, and exact log-prob
+invariance to the held constant.
+
+**Found by adversarial review after the suite was green** — the tests missed all of
+these, which is the argument for running the review at all:
+
+1. **`TorsionGFN` construction broke outright.** It overrides
+   `get_periodic_dimensions`, so changing that signature raised `TypeError` before step
+   0 for *every* conformer run; a signature-only patch would then have `AttributeError`ed
+   in `_pin_dead`, because the override hand-maintained six layout attributes and the base
+   class had grown seven more. Fixed by extracting `_finalize_dim_partition` and having
+   the override delegate, so the subclass now shares the partition assertions instead of
+   a parallel copy. The suite had no subclass coverage at all.
+2. **Stale checkpoints silently disabled the fix.** `_gfn_config_from` takes every
+   architectural key from the file, so a pre-change monoclinic resume rebuilt with the
+   rows LIVE while the startup probe printed reassurance. Now refused loudly
+   (`_assert_dead_rows_match`); triclinic resumes still load, since they resolve to `()`.
+3. **`dead_latent_values` paired against the *sorted* rows**, so `rows=(5,3),
+   values=(a,b)` assigned them reversed. Now paired with the caller's ordering.
+4. **`step_var` / `terminal_var` / the Gaussian diagnostics averaged over dead dims**,
+   which would have made them drop by exactly `live_dim/dim` at this change and read as a
+   coverage regression that never happened. All now average over live dims.
+5. Minor: out-of-range space group raised `KeyError`; empty `space_groups` reached an
+   `IndexError`.
+
+Review coverage was **partial** — 20 of 42 verifier agents died on a spend limit, so
+their findings were never adjudicated. Triaged by hand afterwards; the unresolved
+remainder are diagnostic/cosmetic (per-dim figure labels hardcoding 12 latent names,
+`Total Var` dividing by `data_ndim`, `get_traj_replay` not pinning — inert, since dead
+values reach neither the policy input nor the log-probs).
+
+**The defect.** `latent_params()` round-trips the clobbered angles to 0.0, so every
+prior/buffer row carries `latent[3] = latent[5] = 0.0` exactly (std `0.0e+00`,
+n=535 and n=3582) while the energy is flat across the whole box there. `bwd` trains
+P_F toward a delta at 0; `fwd` gets no gradient. 2 of 12 dims trained against
+inconsistent targets. Introduced by `8dea6b56`, which moved reduction from
+Niggli *sampling* into an energy penalty that `enforce_crystal_system` preempts for
+monoclinic and above.
+
+**Why not pin the raw latent** (`E += k·z²`), which was the first proposal and will
+look attractive again:
+
+| | verdict |
+|---|---|
+| target correctness | **fine** — factorizes exactly, y-marginal is physical, `log Z_pin = log Z_phys + log(π/k)` analytic |
+| prior consistency | **not fixable** — buffer rows are an exact delta, the pinned target has finite width. k→∞ is required for agreement and is capped by the terminal SDE resolution floor |
+| free-energy cost | **additive** — target and policy both factorize, so `Var(log w) = Var_y + Var_z`. Pure ESS tax, zero information. Grows with k, since log-density scale is `−log σ` |
+
+So the pin reduces the disagreement from *delta vs uniform-over-box* to *delta vs
+narrow-Gaussian*. Mitigation, not repair. Flowing the reduced object removes it
+outright: buffer rows and the target marginal become the same object.
+
+**Scope and the cost we accepted.** `lin_dim` shrinks by `n_dead`, so
+`expanded_dim = lin_dim + 2·ang_dim` shrinks and `StateEncoding`'s first layer changes
+shape: **monoclinic+ checkpoints are orphaned.** That is the same class of break
+`periodic_centroids` already causes (it moves dims between the two blocks, so
+`expanded_dim` is already space-group dependent), which also means cross-SG warm
+starting was never available for crystal runs and is not being given up here.
+`n_dead = 0` for triclinic, so **sg 1 and sg 2 are an exact no-op** — `lin_dim`
+unchanged, checkpoints still load, results bit-identical. No existing result is
+invalidated, since every live battery is sg 2.
+
+**Canonical dead value.** Measured 0.0 for every reachable case: π/2 maps to latent
+0.0 exactly, verified on sg 4/14/15 (rows 3,5) and sg 19/61 (rows 3,4,5), min==max==0
+across all rows. Hexagonal is the sole exception in principle (γ = 2π/3), so the
+implementation asserts incoming terminals carry the pinned value rather than assuming
+zero.
+
+**Crystal problems only.** Resolution goes through `resolve_dead_rows(sg, is_crystal)`
+(`models/dead_latent_rows.py`), which returns `()` for toy energies. Toys carry
+`space_groups: [1]` as a placeholder; gating on the SG alone would pass today (P1 is
+triclinic, no dead angles) and then break silently when free axes join the table — P1
+has all three centroid axes free, so an ungated resolver would freeze 3 of a toy's 12
+dims that its energy genuinely depends on. Same gate as `do_periodic_angles` and
+`_resolve_periodic_centroid_axes`, for the same reason.
+
+**Deliberately deferred.** (a) A genuinely multi-SG conditional model needs the max
+width plus per-sample handling; there, masking the TB log-probs is the sound route
+and pinning is the pragmatic one, with a tax that varies by `n_dead` and so biases
+the mixture toward low-symmetry groups. (b) Rhombohedral, and the `a=b` averaging in
+tetragonal/hexagonal/cubic, are **diagonal** degenerate directions — they need
+reparameterisation, not row deletion, and are not covered. (c) Free aunit axes
+(F-008) are the same class of defect but need a *new* projection first, since nothing
+canonicalises them today.
+
+---
+
 ## D30. `freeze_policy` on fwd — the thesis may be what costs convergence ⚠
 
 **Measured 2026-08-07** (`to_do_rebuild.md` §0c). A three-way comparison at

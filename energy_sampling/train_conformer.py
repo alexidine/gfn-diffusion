@@ -84,14 +84,23 @@ class TorsionGFN(GFN):
     """
 
     def get_periodic_dimensions(self, device, do_periodic_angles: bool = True,
-                                periodic_centroid_axes=None):
+                                periodic_centroid_axes=None,
+                                dead_latent_rows=None, dead_latent_values=None):
+        # Only the LAYOUT is overridden -- every torsion dimension wraps. The index-set
+        # bookkeeping (block widths, expanded_dim, the ang/lin/dead partition and its
+        # assertions, the pinned dead values) is delegated to the base class, so this
+        # override cannot drift out of step with it. It previously set those six
+        # attributes by hand, which is how the dead-row work broke conformer
+        # construction: the base class grew seven more and this copy did not.
+        #
+        # dead rows are passed through rather than dropped: torsions have no
+        # crystal-system projection so nothing is dead today (the conformer builder never
+        # sets them, giving ()), but hardcoding None here would silently ignore them if
+        # that ever changes.
         self.periodic_centroid_axes = ()
-        self.ang_mask = torch.ones(self.dim, dtype=torch.bool, device=device)
-        self.ang_dim = self.dim
-        self.lin_dim = 0
-        self.expanded_dim = 2 * self.dim
-        self.ang_idx = self.ang_mask.nonzero(as_tuple=False).flatten()
-        self.lin_idx = (~self.ang_mask).nonzero(as_tuple=False).flatten()
+        self._finalize_dim_partition(device, [True] * self.dim,
+                                     dead_latent_rows=dead_latent_rows,
+                                     dead_latent_values=dead_latent_values)
 
 
 def build_gfn(dim: int, mdl, device) -> TorsionGFN:

@@ -58,10 +58,12 @@ class MolecularCrystal(BaseSet):
                  zp_conditioning: bool = False,
                  vector_conditioning: bool = False,
                  vector_conditioning_dim: Optional[int] = None,
+                 embedding_conditioning: bool = False,
+                 embedding_conditioning_dim: Optional[int] = None,
                  space_groups: Optional[list] = [2],
                  bounding_coeff: float = 1.0,
                  reduction_coeff: float = 1.0,
-                 max_z_prime: int = 1,
+                 max_z_prime: Optional[int] = None,  # defaults to max(z_primes); see below
                  z_primes: Tuple[int] = (1,),
                  mlip_path: Optional[str] = None,
                  reward_range: float = None,
@@ -74,6 +76,21 @@ class MolecularCrystal(BaseSet):
 
         super(MolecularCrystal, self).__init__()
         self.device = device
+        # max_z_prime is the STATE-LAYOUT width (6 box params + 6 per z'), so it is not a
+        # free knob -- it must cover the largest z' this problem can present. It used to
+        # default to 1 while train.py's init_energy_function passed only `z_primes`, which
+        # is inert at z'=1 (both are 1) and silently wrong above it: prod0810's two Z'=2
+        # arms built a 12-dim energy while _build_gfn_config sized the policy from
+        # max(z_primes)=2, and died at startup in GFN.get_periodic_dimensions. Derive it
+        # from z_primes so the two can't drift again; an explicit value is still honoured
+        # (a zp-conditioned run may want headroom) but may not be SMALLER than the z' it
+        # will be asked to represent.
+        derived_max_zp = max(int(zp) for zp in z_primes)
+        if max_z_prime is None:
+            max_z_prime = derived_max_zp
+        elif max_z_prime < derived_max_zp:
+            raise ValueError(f"max_z_prime={max_z_prime} cannot represent z_primes={list(z_primes)}; "
+                             f"the state layout needs at least {derived_max_zp}")
         self.data_ndim = 6 + 6 * max_z_prime
         self.energy_function = energy_function
         self.SG_FEATURE_TENSOR = SG_FEATURE_TENSOR.clone()  # store space group information
@@ -97,6 +114,23 @@ class MolecularCrystal(BaseSet):
                 "vectors carried by molecules_path/prior_path entries -- e.g. mxtaltools' cond_dim for " \
                 "latent_multiharmonic, or data_ndim for latent_harmonic)"
         self.vector_conditioning_dim = vector_conditioning_dim
+        # Pre-embedded molecule conditioning: each molecules_path/prior_path entry carries
+        # an `embedding` baked by a FROZEN encoder (build_qm9_conditions.py), appended to
+        # the condition tensor and read by the same scalarMLP conditioner vector_conditioning
+        # uses (conditions_type stays 'vector'). Deliberately separate from
+        # vector_conditioning: `c` is a TARGET parameter that also goes into analyze() as the
+        # energy's condition, whereas an embedding is only ever an INPUT to the policy -- the
+        # energy of a crystal does not depend on how the molecule was encoded. Also distinct
+        # from molecule_conditioning, which runs a GNN over the graph inside the training
+        # loop; here the encoder ran once, offline, so there is no per-step cost and no
+        # gradient into it.
+        self.embedding_conditioning = embedding_conditioning
+        if self.embedding_conditioning:
+            assert embedding_conditioning_dim is not None, \
+                "embedding_conditioning requires embedding_conditioning_dim (the FLATTENED " \
+                "width of the `embedding` on molecules_path/prior_path entries -- 3 * the " \
+                "encoder bottleneck, e.g. 192 for Mo3ENet's 64)"
+        self.embedding_conditioning_dim = embedding_conditioning_dim
         self.reward_range = reward_range
         self.lj_rescale = lj_rescale
         self.pressure = pressure
@@ -194,6 +228,14 @@ class MolecularCrystal(BaseSet):
         else:
             crystal_batch = mol_batch.clone()
         crystal_batch.latent_to_cell_params(x)
+        if self.max_z_prime > 1:
+            # Aunit labelling is a gauge: relabelling the z' units describes the same
+            # crystal, and the reward is invariant to it (measured on real Z'=2 acridine:
+            # median |d elj| 0.003 on a -1200 scale). Pin the gauge here anyway so the
+            # physics, and every crystal that leaves this function for a buffer, is
+            # ordering-independent by construction rather than only to within numerics.
+            # The Z'>1 ordering penalty is unaffected -- it reads the raw latents.
+            crystal_batch.canonicalize_zp_aunits()
         return crystal_batch
 
     def analyze_crystal_batch(self, x, mol_batch, temperature, return_batch=False,
@@ -250,6 +292,15 @@ class MolecularCrystal(BaseSet):
     def generator_energy(self, crystal_batch, temperature, raw_latents: Optional[torch.tensor] = None):
         ens_dict = {}
 
+        # BEFORE latent_params() below, which calls canonicalize_zp_aunits() IN PLACE:
+        # the Z'>1 ordering term punishes the POLICY for emitting a non-canonical aunit
+        # order, so it has to be read off the emitted state. Reading it after the batch
+        # had been canonicalized is what made it identically zero (it was unreachable
+        # anyway while max_z_prime was pinned at 1).
+        zp_ordering_energy = None
+        if self.max_z_prime > 1:
+            zp_ordering_energy = self.compute_zp_order_penalty(crystal_batch, raw_latents)
+
         latents = crystal_batch.latent_params()
         if raw_latents is not None:
             upper_violation = F.relu(raw_latents - 1)
@@ -263,8 +314,8 @@ class MolecularCrystal(BaseSet):
         else:
             bounding_energy = torch.zeros_like(latents[:, 0])
 
-        if self.max_z_prime > 1:
-            bounding_energy = self.compute_zp_order_penalty(bounding_energy, crystal_batch)
+        if zp_ordering_energy is not None:
+            bounding_energy = bounding_energy + zp_ordering_energy
 
         # energy() divides the total energy by temperature before use; pre-multiply here so
         # this domain-validity constraint stays equally stiff across sampling temperatures,
@@ -361,18 +412,46 @@ class MolecularCrystal(BaseSet):
         }
         return jacobian_energy, components
 
-    def compute_zp_order_penalty(self, bounding_energy, crystal_batch):
-        # penalize the model for placing asymmetric units out of the canonical order (closest -> furthest from origin)
-        per_aunit_centroids = crystal_batch.aunit_centroid.reshape(crystal_batch.num_graphs,
-                                                                   crystal_batch.max_z_prime, 3)
-        idx = torch.arange(crystal_batch.max_z_prime, device=crystal_batch.device)[None, ...]
+    def compute_zp_order_penalty(self, crystal_batch, raw_latents: Optional[torch.tensor] = None):
+        """
+        Penalize the policy for emitting asymmetric units out of the canonical order
+        (closest -> furthest from the origin). A domain-validity term on the raw latent,
+        exactly like the [-1, 1] range term it is added to.
+
+        Reads `raw_latents` rather than crystal_batch.aunit_centroid so the penalty does
+        not depend on whether anything has canonicalized the batch: mxtaltools'
+        `latent_params()` calls `canonicalize_zp_aunits()` in place, and the crystal
+        builder may canonicalize too, either of which silently zeroes a batch-read
+        version of this term. Datasets are stored canonical by construction, so the
+        raw_latents=None fallback (prebuilt_sample_to_reward) reads the batch and
+        legitimately scores ~0 there.
+
+        The comparison is done on the CELL-fractional centroid, not on the latent
+        directly: that is the quantity canonicalize_aunit_order sorts on, and the two
+        orderings differ because the aunit box is anisotropic (SG14 auv = [1, .25, 1]),
+        so ranking by |latent| would punish states that are already canonical.
+        """
+        n, k = crystal_batch.num_graphs, self.max_z_prime
+        if raw_latents is not None:
+            # same [-1,1] -> [0,1] -> *auv chain as inv_latent_transform's centroid leg
+            if not hasattr(crystal_batch, 'asym_unit_lut'):
+                crystal_batch.build_asym_unit_tensor()
+            auvs = crystal_batch.asym_unit_lut[crystal_batch.sg_ind].to(raw_latents.device)
+            lat_centroids = raw_latents[:, 6:6 + 3 * k].reshape(n, k, 3)
+            per_aunit_centroids = (lat_centroids / 2 + 0.5) * auvs.unsqueeze(1)
+        else:
+            per_aunit_centroids = crystal_batch.aunit_centroid.reshape(n, k, 3)
+
+        idx = torch.arange(k, device=crystal_batch.device)[None, ...]
         mask = (idx >= (crystal_batch.z_prime[..., None]))[..., None].expand(-1, -1, 3)
-        per_aunit_centroids[mask] = 1  # this will put lower Z' options always at the end
+        # fill unused z' slots with 1 so they sort last -- OUT OF PLACE: reshape of a
+        # contiguous (n, 3*max_z_prime) returns a VIEW, so writing through it would mutate
+        # crystal_batch.aunit_centroid itself and sever the autograd path the bounding
+        # energy rides on. Same idiom as mxtaltools' canonicalize_aunit_order.
+        per_aunit_centroids = torch.where(mask, torch.ones_like(per_aunit_centroids), per_aunit_centroids)
         origin_dists = per_aunit_centroids.norm(dim=2)
         overlaps = -origin_dists.diff(dim=1)
-        zp_ordering_energy = F.relu(overlaps).mean(dim=-1) ** 2
-        bounding_energy = bounding_energy + zp_ordering_energy
-        return bounding_energy
+        return F.relu(overlaps).mean(dim=-1) ** 2
 
     def crystal_multiharmonic_en(self, crystal_batch, latents):
         if not hasattr(self, 'modes'):
@@ -737,6 +816,26 @@ class MolecularCrystal(BaseSet):
                     "data_processing/generate_toy_prior.py)."
                 )
             conds.append(mol_batch.c.to(mol_batch.device))
+
+        if self.embedding_conditioning:
+            if not hasattr(mol_batch, 'embedding') or mol_batch.embedding is None:
+                raise RuntimeError(
+                    "embedding_conditioning is enabled but mol_batch has no `embedding` "
+                    "attribute -- molecules_path/prior_path entries weren't built with one "
+                    "(see build_qm9_conditions.py).")
+            # stored [n_graphs, 3, bottleneck] (equivariant, kept in that shape so a future
+            # augmentation can rotate it with the molecule); the conditioner takes a flat
+            # vector, and flattening is well defined ONLY because the molecule frame is
+            # pinned -- build_qm9_conditions.py makes the file a fixed point of the
+            # trainer's own orient_molecule(mode='std') for exactly this reason
+            emb = mol_batch.embedding.to(mol_batch.device)
+            emb = emb.reshape(mol_batch.num_graphs, -1)
+            if emb.shape[-1] != self.embedding_conditioning_dim:
+                raise RuntimeError(
+                    f"embedding width {emb.shape[-1]} != embedding_conditioning_dim "
+                    f"{self.embedding_conditioning_dim}; the conditioner was built for a "
+                    f"different encoder than the one that baked this file")
+            conds.append(emb)
 
         mol_batch.z_prime = zp_to_sample
         mol_batch.reset_sg_info(sg_to_sample)
