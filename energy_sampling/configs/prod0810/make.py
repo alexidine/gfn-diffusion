@@ -172,17 +172,68 @@ def build_config(base, name, mol, sg, zp, efunc, mlip_path):
         # null for the four arms with no phase1_exit on disk -- see WARM_STARTS
         checkpoint_name=WARM_STARTS.get(name),
         load_weights_only=False,
+        max_step_seconds=MAX_STEP_SECONDS[efunc],
+        traj_checkpoint=TRAJ_CHECKPOINT[efunc],
     ))
     return cfg
+
+
+# --- rollout gradient checkpointing, MLIP arms only -------------------------------
+# This is what makes internal_oom_recovery: false survivable. That flag means the
+# whole batch goes through the MLIP in ONE call (the point: energy batch == rollout
+# batch), so the MLIP's memory ceiling now sets the training batch instead of being
+# hidden by the energy function's own sub-batching. On v2's uma arm at T=60 that
+# ceiling was under 1000 crystals: the run OOM'd at 1000, halved to 500, OOM'd again,
+# halved to 250 (oom_batch_shrink_factor 0.5), and a batch that small left the GPU at
+# 48% utilization until the scheduler cancelled it for low usage.
+#
+# traj_checkpoint makes rollout activation memory ~O(1) in T (models/gfn.py:144) for
+# one extra policy forward in backward -- ~1.7x step time, ~33x VRAM at T=100. Trading
+# step time for the headroom to run a BIG batch is the right way round here: a big
+# batch with slower steps keeps the GPU busy, which is what the usage policy checks.
+# elj does not need it and should not pay the 1.7x -- its energy is analytic and it
+# already runs at batch 1650-4491 without OOM.
+TRAJ_CHECKPOINT = {'elj': False, 'uma': True, 'mace': True}
+
+
+# --- per-energy wall-clock step ceiling -------------------------------------------
+# base.yaml's 10 s is right for elj and UNREACHABLE for an MLIP arm, which is not a
+# tuning nicety: chasing it is what got v2's uma arm killed. During the z_calibration
+# transient a step costs ~(1 + p) x 5.5 ms x batch with p ~ 10, so a 10 s step needs
+# batch <= ~165 -- small enough that the GPU is guaranteed to idle. The controller
+# duly cut 1000 -> 500 -> 250, utilization fell 75% -> 48%, and the scheduler
+# cancelled the job for low usage at 5.2 h.
+#
+# So on a usage-policed cluster the ceiling and GPU occupancy pull in OPPOSITE
+# directions, and for an expensive energy occupancy wins: a bigger batch with slower
+# steps is the configuration that survives. 60 s still catches a genuine runaway (v1
+# sat at 181-262 s) without cutting into the idle regime. elj keeps 10 s -- it holds
+# that comfortably at batch 1650-4491 and runs at 66% utilization.
+MAX_STEP_SECONDS = {'elj': 10, 'uma': 60, 'mace': 60}
 
 
 # --- SLURM time classes ------------------------------------------------------
 # MIPCAS/NEHZOR (elj+uma) run longer; acridine (mace) is capped at 48h. Sizes are
 # the user's explicit call, not a throughput measurement -- see docstring above.
 TIME_CLASSES = [
-    ('mipcas_nehzor', '7-00:00:00', lambda mol: mol in ('mipcas', 'nehzor')),
-    ('acridine',      '2-00:00:00', lambda mol: mol == 'acridine'),
+    ('mipcas_nehzor', '7-00:00:00', 8, lambda mol: mol in ('mipcas', 'nehzor')),
+    ('acridine',      '2-00:00:00', 8, lambda mol: mol == 'acridine'),
 ]
+
+# --- why cpus-per-task is 8 and not 1 --------------------------------------------
+# v2's uma arm (4r351oqm) was cancelled at 5.2 h for LOW GPU USAGE: median utilization
+# 45%, 31% of samples under 30%, power 190-215 W on a 400 W A100. Low utilization AND
+# low power together mean the GPU is idle waiting, not saturated -- and the whole
+# host side (fairchem AtomicData construction, the PBCv2 neighbour-list build that
+# warns "very large box ... slower than optimal", PyG collation, buffer draws) ran
+# single-threaded under --cpus-per-task=1.
+#
+# This is a HYPOTHESIS, not a measurement: this cluster logs no CPU columns to wandb,
+# so the host-bound story is inferred from the utilization/power signature, not
+# observed. energy/* metrics were added to train.py in the same change to settle it --
+# read energy/frac_of_step on the next run before spending more effort here.
+# CPUs are near-free next to an A100, so all classes get the bump; the elj arms run
+# the same collation/buffer path and sat at 66%, not 100%, so they may benefit too.
 
 
 def _slurm_ranges(idxs):
@@ -244,23 +295,24 @@ def write_all():
         'index\tname\tmolecule\tpolymorph\tenergy_function\n' +
         '\n'.join('\t'.join(str(x) for x in r) for r in rows) + '\n', encoding='utf-8')
 
-    unclassed = [r[0] for r in rows if not any(pred(r[2]) for _, _, pred in TIME_CLASSES)]
+    unclassed = [r[0] for r in rows if not any(pred(r[2]) for _, _, _, pred in TIME_CLASSES)]
     assert not unclassed, f'arms with no TIME_CLASSES match: {unclassed}'
     made = []
-    for label, tlim, pred in TIME_CLASSES:
+    for label, tlim, cpus, pred in TIME_CLASSES:
         idxs = [r[0] for r in rows if pred(r[2])]
         if not idxs:
             continue
         (HERE / f'submit_{label}.sbatch').write_text(SBATCH_TEMPLATE.format(
-            time=tlim, array=_slurm_ranges(idxs), label=label), encoding='utf-8')
-        made.append((label, tlim, _slurm_ranges(idxs), len(idxs)))
+            time=tlim, array=_slurm_ranges(idxs), label=label, cpus=cpus), encoding='utf-8')
+        made.append((label, tlim, _slurm_ranges(idxs), len(idxs), cpus))
 
     print(f'\nwrote {len(rows)} configs + INDEX.tsv in {HERE}  (base: {BASE_CONFIG.name})')
     print('acridine sg19/zp3 (Form IV) excluded -- no assembled prior dataset (see docstring)')
     print('uma/mace epochs are an UNMEASURED guess inherited from base.yaml -- see docstring')
     print('submit files:')
-    for label, tlim, arr, n in made:
-        print(f'  submit_{label}.sbatch   --time={tlim:<11} --array={arr}   ({n} arms)')
+    for label, tlim, arr, n, cpus in made:
+        print(f'  submit_{label}.sbatch   --time={tlim:<11} --array={arr}   '
+              f'({n} arms, {cpus} cpus)')
     print('\nNEXT: run  python configs/prod0810/make.py --preflight  ON THE CLUSTER')
 
 
@@ -268,7 +320,7 @@ SBATCH_TEMPLATE = """#!/bin/bash
 #SBATCH --time={time}
 #SBATCH --gres=gpu:a100:1
 #SBATCH --mem=48G
-#SBATCH --cpus-per-task=1
+#SBATCH --cpus-per-task={cpus}
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
 #SBATCH --mail-type=END

@@ -53,7 +53,7 @@ ray_calibration:
 weight_decay: 0.0001
 use_weight_decay: false
 compile_policy: auto
-traj_checkpoint: false
+traj_checkpoint: true
 gradient_norm_clip: auto
 ema_decay: null
 max_reloads_per_1k_steps: 0.2
@@ -97,7 +97,7 @@ batch_growth_interval: 50
 batch_growth_slow_interval: 300
 auto_batch_throughput_opt: true
 batch_growth_max_step_regression: 0.25
-max_step_seconds: 10
+max_step_seconds: 60
 batch_knee_recheck_steps: 2000
 oom_batch_shrink_factor: 0.5
 oom_cooldown_steps: 200

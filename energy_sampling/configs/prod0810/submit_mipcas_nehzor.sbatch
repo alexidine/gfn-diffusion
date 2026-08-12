@@ -2,7 +2,7 @@
 #SBATCH --time=7-00:00:00
 #SBATCH --gres=gpu:a100:1
 #SBATCH --mem=48G
-#SBATCH --cpus-per-task=1
+#SBATCH --cpus-per-task=8
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
 #SBATCH --mail-type=END

@@ -127,8 +127,16 @@ class Modeller:
     def __init__(self):
         self.step_ind = None
         self.args = get_train_args()
-        torch.cuda.set_per_process_memory_fraction(self.args.cuda_memory_fraction, device=0)
-        torch.cuda.init()  # create context with the cap already in place
+        if torch.cuda.is_available():
+            torch.cuda.set_per_process_memory_fraction(self.args.cuda_memory_fraction, device=0)
+            torch.cuda.init()  # create context with the cap already in place
+        else:
+            # CPU-only construction has to be possible: without this guard both
+            # calls raise, so Modeller could not be built at all on a machine
+            # with no visible GPU -- a CI box, a login node, or any local probe
+            # run under CUDA_VISIBLE_DEVICES="". The memory cap is meaningless
+            # there; nothing else in __init__ needs a device.
+            print("cuda unavailable -- skipping memory-fraction cap and context init")
 
         set_seed(self.args.seed)
         if 'SLURM_PROCID' in os.environ:
@@ -487,6 +495,17 @@ class Modeller:
         if self._throughput['seconds'] > 0:
             metrics['samples_per_sec'] = (
                     self._throughput['samples'] / self._throughput['seconds'])
+        # WHERE THE STEP'S SECONDS GO. energy/frac_of_step is the load-bearing one:
+        # paired with GPU utilization it separates 'the MLIP call is expensive' from
+        # 'the MLIP call is idle waiting on the host'. Denominator is the same window
+        # the throughput numbers use, so the fraction is directly comparable to them.
+        # Empty dict on stages that never evaluate the energy (bwd/dataset MLE), so
+        # nothing misleading gets logged there.
+        energy_timing = self.energy_function.drain_energy_timing()
+        if energy_timing and self._throughput['seconds'] > 0:
+            energy_timing['energy/frac_of_step'] = (
+                    energy_timing['energy/seconds'] / self._throughput['seconds'])
+        metrics.update(energy_timing)
         self._throughput = {'samples': 0, 'seconds': 0.0}
         metrics['Fwd Frac'] = self.fwd_frac
         metrics['Bwd Frac'] = self.bwd_frac
