@@ -35,6 +35,8 @@ from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 
+from bench.fake_modeller import MK_DEV_ADAPTIVE
+from bench.harness import BenchRun
 from bench.oracle import (OracleResult, Surface, final_distance, find_oracle,
                           median_trace)
 from bench.scenarios import SEED_LR, steps_to_target
@@ -403,6 +405,48 @@ def _time_oracle(base, cell, seeds=(0, 1, 2)):
     return best, best_t
 
 
+def _cold_start_feasible(oracle_lr, denom):
+    """
+    Can ANY rate-limited climber pass `cold_start` on this cell, or does the
+    budget forbid it?
+
+    THE MIRROR IMAGE OF THE UNREACHABLE BUDGET. `_oracle_task` already refuses a
+    cell whose budget is too LOOSE to fail (`BUDGET*denom >= steps`, where "over
+    budget" degenerates into "never converged"). Nothing checked the other end,
+    and wiring in `_time_oracle` moved three cells straight through it: the
+    time-optimal rate is much faster than the distance-optimal one, so `denom`
+    collapsed -- `h eq base` went to 50 steps of a 3000-step run -- and the
+    cold-start budget went with it.
+
+    Two independent walls, both from the SHIPPING controller, not the bench:
+
+      * `peak_scale` is bounded by `adaptive_lr.bounds` (mk_dev ships
+        [0.01, 2000]). A cell needing more than 2000x the seed rate is
+        unreachable at any speed, by any arm. `h eq w_rep.3` needs 9840x.
+      * hypergradient's climb is capped at `exp(hyper_beta)` per step, so
+        closing a gap of R takes at least `ln(R)/hyper_beta` steps -- 408 for
+        `h eq base`, against a 100-step budget.
+
+    Checked against the run of 2026-08-13: every cell where an arm scored 100%
+    of cold starts is one this rejects, and every cell it accepts was passed by
+    all three hyper variants. A 100% column on a rejected cell is a property of
+    the budget, and reporting it as a controller score inflated every arm --
+    including a hypothetical perfect one -- by about 4.6 points.
+    """
+    need = float(oracle_lr) / SEED_LR
+    cap = float(MK_DEV_ADAPTIVE['bounds'][1])
+    if need > cap:
+        return False, (f'cold_start UNREACHABLE: needs peak_scale {need:.0f} '
+                       f'> the controller cap {cap:.0f}')
+    beta = float(BenchRun.STANDARD['hyper_beta'])
+    climb = math.log(need) / beta
+    if climb > BUDGET * denom:
+        return False, (f'cold_start UNREACHABLE: >= {climb:.0f} steps to climb '
+                       f'{need:.0f}x at exp({beta}) / step, vs a '
+                       f'{BUDGET * denom:.0f}-step budget')
+    return True, ''
+
+
 def _oracle_task(cell):
     label = cell[0]
     surface = _mk(cell)
@@ -435,7 +479,8 @@ def _oracle_task(cell):
         return label, None, (f'BUDGET {BUDGET} unreachable: {denom:.0f} x '
                              f'{BUDGET} >= {surface.steps} steps')
     reg = _regime_oracle(cell)
-    return label, (oracle, denom, drop, reg), None
+    return label, (oracle, denom, drop, reg,
+                   _cold_start_feasible(oracle.lr, denom)), None
 
 
 def _arm_task(item):
@@ -499,17 +544,27 @@ def main(seeds=20, workers=None, cells=None):
         label = c[0]
         if label not in oracles:
             continue
-        oracle, denom, drop, reg = oracles[label]
+        oracle, denom, drop, reg, (feasible, why) = oracles[label]
         print(f'  {label:<18} oracle lr {oracle.lr:.3g}  drop {drop:.3g}x  '
               f'deep target at {denom} of {c[3]} steps'
               + ('' if reg else '   [regime cell has NO oracle -- scored vs base]'))
+        if not feasible:
+            print(f'    >> {why}\n       That column is a property of the budget, '
+                  f'not of any arm -- excluded from the second aggregate below.')
         print(f'    {"arm":<14} {"%over":>7} {"med":>7} {"p90":>7}   '
               f'{list(SCENARIOS)}')
         for r in [r for r in rows if r['cell'] == label]:
             a = agg.setdefault(r['arm'], {'over': 0.0, 'n': 0, 'worst': 0.0,
-                                          'cell': '-'})
+                                          'cell': '-', 'fover': 0.0, 'fn': 0})
             a['over'] += r['over'] * r['n']
             a['n'] += r['n']
+            # ... and again over the scenarios an arm could actually have passed
+            per_n = r['n'] / len(SCENARIOS)
+            for sc, p in zip(SCENARIOS, r['per']):
+                if sc == 'cold_start' and not feasible:
+                    continue
+                a['fover'] += p * per_n
+                a['fn'] += per_n
             if r['over'] > a['worst']:
                 a['worst'], a['cell'] = r['over'], label
             med = f'{r["med"]:.2f}' if math.isfinite(r['med']) else 'never'
@@ -518,12 +573,20 @@ def main(seeds=20, workers=None, cells=None):
         print()
 
     print(f'{"=" * 88}\nACROSS EVERY MEASURABLE CELL\n{"=" * 88}')
-    print(f'  {"arm":<14} {"%over budget":>13} {"worst cell":>12}  where')
+    print(f'  {"arm":<14} {"%over budget":>13} {"passable only":>14} '
+          f'{"worst cell":>12}  where')
     for name, a in sorted(agg.items(),
                           key=lambda kv: (kv[1]['over'] / max(kv[1]['n'], 1),
                                           kv[1]['worst'])):
         print(f'  {name:<14} {a["over"] / max(a["n"], 1):>12.1%} '
+              f'{a["fover"] / max(a["fn"], 1):>13.1%} '
               f'{a["worst"]:>11.0%}  {a["cell"]}')
+    # THE SECOND COLUMN IS THE ONE THAT SCORES CONTROLLERS. The first includes
+    # cold starts the budget forbids anyone from passing, which adds the same
+    # ~4.6 points to every arm and compresses the differences that matter.
+    print('\n  "passable only" drops the cold_start column on cells where the '
+          'budget makes it\n  unreachable for ANY arm (see the per-cell notes). '
+          'Read that column, not the first.')
     return rows
 
 

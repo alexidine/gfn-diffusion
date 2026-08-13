@@ -57,8 +57,29 @@ the run ends. It would have produced a clean-looking file of nothing -- the
 documented "swallowed diagnostics fail as REASSURANCE" mode. The wrapper below
 cannot fail that way: it asserts it captured samples and raises if it did not.
 
-NO TRAINING IS KEPT. `save_checkpoints` is forced off so this cannot clobber a
-user checkpoint, and the run is aborted after `steps` via a sentinel exception.
+NO TRAINING IS KEPT -- AND THE FIRST TWO MECHANISMS FOR THAT WERE BOTH FICTION.
+
+This file used to set `m.args.save_checkpoints = False` and claim on that basis
+that it "cannot clobber a user checkpoint". **There is no `save_checkpoints`
+anywhere in the codebase.** It was an attribute assigned to an args object that
+nothing reads -- the same inert-flag shape as the `checkpoint_path` /
+`model_path` / `load_checkpoint` trio described above, in the same file, one
+paragraph apart. Every run of this diagnostic wrote checkpoints under the
+CONFIG'S OWN run name for as long as the promise had been in the docstring.
+
+Measured damage on 2026-08-13: runs of this file overwrote `_running.pt`,
+`_best.pt`, `_buffers.pt`, `_prior.pt`, `_stage_start.pt` and -- via the
+`train_prior -> equilibration` transition, which writes it -- `phase1_exit.pt`,
+for `d33elj_elj_nehzor_sg14_t10_r2`.
+
+The suppression is now the only kind that can be checked: `Checkpointer.save`
+and `.save_buffers` are replaced with recording no-ops on the instance's own
+class, so every call site in `train.py` AND `protocol.py` (stage_start,
+phase1_exit, prior) hits the same wall regardless of which name imported it.
+`run()` prints what WOULD have been written, so the suppression is visible when
+it works rather than only when it fails.
+
+The run is aborted after `steps` via a sentinel exception.
 
 GPU CO-TENANCY. The card had 3.4 of 16.3 GB resident when this was written and
 the box has a BSOD history from over-subscription, so `cuda_memory_fraction` is
@@ -112,10 +133,17 @@ CK = ('checkpoints/d33elj_elj_nehzor_sg14_t10_r2_elj-nehzor_sg14_zp1_'
       'elj_prior_dataset-T2.5-990198_')
 CK_OLD = ('checkpoints/d33elj_elj_nehzor_sg14_t10_elj-nehzor_sg14_zp1_'
           'elj_prior_dataset-T2.5-990198_')
+#: A REGIME MUST NAME AN IMMUTABLE CHECKPOINT. `eq_descent` used to point at
+#: `_running.pt`, which every run of this config overwrites -- so the regime
+#: silently meant "whatever ran last". Measured: on the morning of 2026-08-13 it
+#: resolved to step 11001, and by midday to step 350, because runs in between
+#: had rewritten it. Two measurements under one regime name, of two different
+#: models, with nothing in the output to say so. `step15000.pt` is a periodic
+#: checkpoint of the user's own r2 run, mid-equilibration and never rewritten.
 REGIMES = {
     'mle_fresh':      None,                    # no reload: phase 1 from scratch
     'eq_phase1exit':  CK + 'phase1_exit.pt',
-    'eq_descent':     CK + 'running.pt',
+    'eq_descent':     CK + 'step15000.pt',
     'mle_converged':  CK_OLD + 'final.pt',
 }
 
@@ -173,23 +201,51 @@ def run(steps=STEPS, config=CONFIG, out=OUT, ckpt=CKPT):
     # cooperation from the arg parser and creates no offline run to sync.
     os.environ['WANDB_MODE'] = 'disabled'
     sys.argv = ['train.py', '--config', config]
-    import checkpointing
     import train
 
     m = train.Modeller()
     m.args.cuda_memory_fraction = MEM_FRACTION
-    m.args.save_checkpoints = False
-    m.args.use_wandb = False
+    # `m.args.use_wandb = False` used to sit here too. There is no `use_wandb`
+    # in the codebase either -- it read as a second layer of wandb suppression
+    # and was a second inert assignment. `WANDB_MODE=disabled` above is the one
+    # that works, and it needs no cooperation from the arg parser.
 
     # WHAT LOADED, READ AT THE LOADER. Both reload paths in `init_gfn` funnel
-    # through these two methods, so this records the file the run actually opened
-    # -- the only statement about the checkpoint that is not an inference from
-    # the args we set. Patched on the CLASS: `m.checkpointer` is built in
-    # `Modeller.__init__` (train.py:179) and never rebuilt, but a class patch
-    # survives that assumption being wrong.
+    # through these two methods, so this records the file the run actually
+    # opened -- the only statement about the checkpoint that is not an inference
+    # from the args we set.
+    #
+    # PATCH THE INSTANCE'S OWN CLASS, NEVER THE IMPORTED ONE. `import
+    # checkpointing` and train.py:29's `from energy_sampling.checkpointing
+    # import Checkpointer` produce TWO DISTINCT MODULE OBJECTS with two distinct
+    # class objects -- PYTHONPATH carries both `gfn_diffusion` and
+    # `gfn_diffusion/energy_sampling`, so every module here is importable under
+    # two names. Verified: `checkpointing.Checkpointer is
+    # energy_sampling.checkpointing.Checkpointer` -> False.
+    #
+    # The first version of this spy patched the imported one and recorded
+    # NOTHING while the log printed `Loading model from checkpoint ...` two lines
+    # later. It was caught only because the step-index check is independent and
+    # disagreed. `type(m.checkpointer)` is whatever train.py actually built,
+    # under any import name.
     loaded = []
-    _ck = checkpointing.Checkpointer
+    _ck = type(m.checkpointer)
     _real_full, _real_weights = _ck.load_full, _ck.load_weights_only
+
+    # NOTHING MAY BE WRITTEN. Not a flag asking the run not to save -- the
+    # methods that do the writing, replaced. `train.py` saves 'running',
+    # 'final' and the buffers; `protocol.py` saves 'stage_start', 'prior' and
+    # the phase-exit tag on a stage transition, and a resume from
+    # `phase1_exit.pt` transitions on its FIRST step, so that path is not
+    # hypothetical -- it is how this diagnostic overwrote the checkpoint that
+    # defines its own regime.
+    blocked = []
+    _real_save, _real_save_buf = _ck.save, _ck.save_buffers
+
+    def _no_save(self, tag='?', *a, **kw):
+        blocked.append(str(tag))
+
+    _ck.save, _ck.save_buffers = _no_save, _no_save
 
     def _spy_full(self, path, *a, **kw):
         loaded.append(str(path))
@@ -302,6 +358,16 @@ def run(steps=STEPS, config=CONFIG, out=OUT, ckpt=CKPT):
         type(m).train_step = original
         torch.nn.utils.clip_grad_norm_ = _real_clip
         _ck.load_full, _ck.load_weights_only = _real_full, _real_weights
+        _ck.save, _ck.save_buffers = _real_save, _real_save_buf
+        # PRINT THE SUPPRESSION WHEN IT WORKS. A guard that is only visible on
+        # failure is indistinguishable from an absent one, which is exactly how
+        # `save_checkpoints=False` survived as a docstring promise.
+        if blocked:
+            from collections import Counter
+            print(f'  [calib] BLOCKED {len(blocked)} checkpoint writes: '
+                  f'{dict(Counter(blocked))}', flush=True)
+        else:
+            print('  [calib] no checkpoint writes were attempted', flush=True)
 
     # A run that logged nothing is a FAILURE, not a quiet success.
     if not rec:
@@ -351,11 +417,22 @@ def report(rec, out=OUT):
     fall = g0 / max(g1, 1e-12)
     print(f'\n  ||g||  {g0:.4g} -> {g1:.4g}   '
           f'({fall:.2f}x fall over the window)')
-    if fall < MIN_GNORM_FALL:
-        print('  >> NOT DESCENDING. cos ~ 0 at a stationary point is the '
-              'CORRECT reading,\n     not a noise verdict. This window cannot '
-              'answer whether cos carries\n     signal during active '
+    # THREE CASES, NOT TWO. `fall < MIN_GNORM_FALL` is true both when ||g|| is
+    # FLAT and when it RISES, and the two mean opposite things -- the first run
+    # of the fixed fresh regime rose 5.9x and was told it looked stationary and
+    # should "pick an earlier checkpoint", on a run that starts at step 0. A
+    # warning that points the wrong way costs more than no warning.
+    if fall > 1.0 / MIN_GNORM_FALL and fall < MIN_GNORM_FALL:
+        print('  >> FLAT ||g||. If cos is also ~0 that is the CORRECT reading at '
+              'a stationary\n     point and not a noise verdict; this window '
+              'cannot say whether cos carries\n     signal during active '
               'convergence -- pick an earlier checkpoint.')
+    elif fall <= 1.0 / MIN_GNORM_FALL:
+        print(f'  >> ||g|| is RISING ({1 / fall:.2f}x), not flat. On a fresh '
+              'model that is ordinary\n     early training, not a stationary '
+              'point, and the cos reading below is from\n     an ACTIVE regime. '
+              '||g|| is a weak descent proxy here either way: it can\n     rise '
+              'while the loss falls.')
 
     allc = sorted(r['cos'] for r in rec)
     med = st.median(allc)

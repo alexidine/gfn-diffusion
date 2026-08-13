@@ -78,3 +78,27 @@ are on disk, so three of these predictions are checkable against a control.
 Seed/dataloader order is not pinned, so "reproduce" means close, not identical
 -- and an EXACTLY identical median across two separate processes would itself be
 suspicious.
+
+---
+
+## 2026-08-13 -- crucible re-run with the cold-start feasibility guard
+
+Nothing that affects a measurement changed: same seeds, same surfaces, same
+arms. Only the REPORTING moved (a per-cell feasibility note and a second
+aggregate column). So:
+
+1. **The first column must come back BIT-IDENTICAL** -- hyper sym / 2:1 / gated
+   5.3%, ray+ray 6.5%, ramp+plateau 8.5%, NULL 21.0%, and every per-cell row
+   unchanged. This is the one place in this project where an identical number is
+   the CORRECT outcome rather than a bug, because it is the same deterministic
+   computation; a difference here means the bench is not reproducible across
+   processes and that is a bigger finding than anything about learning rates.
+2. **Exactly three cells print the UNREACHABLE note**: `h cond=30` (deadline),
+   `h eq base` and `h eq w_rep.3` (peak_scale cap). No others.
+3. **The `passable only` column, by hand from the per-cell tables:** hyper
+   0.73%, ray+ray 1.94%, ramp+plateau 4.11%, NULL 17.2%. If the code disagrees
+   with these, my arithmetic in the write-up is wrong and the write-up must
+   follow the code.
+4. The ORDER is unchanged either way. The point of the second column is not a
+   new winner, it is that the gaps stop being buried under ~4.6 points of budget
+   artifact that every arm pays equally.
