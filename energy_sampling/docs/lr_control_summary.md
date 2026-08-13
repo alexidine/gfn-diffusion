@@ -40,6 +40,25 @@ the shipping controller's own `peak_scale` cap and maximum climb rate make
 unreachable for *any* arm, on 3 of 13 cells — F-032. Those columns add the same
 ~4.6 points to every arm and bury the differences that matter.
 
+**The same order holds on a second, unrelated surface family.** `EQ_HARD`, 8
+three-player equilibration cells (2 refused — their best fixed rate sat at the
+edge of the searched range), 20 seeds:
+
+| arm | % over | passable only | vs. standing still |
+|---|---|---|---|
+| **`hyper` symmetric** | 23.7% | **8.4%** | −4.0 |
+| `hyper` 2:1 / gated | 24.2% | 9.0% | −3.4 |
+| `ray+ray` | 24.7% | 9.6% | −2.8 |
+| **NULL (no sensor)** | 27.0% | 12.4% | — |
+| `ramp+plateau` | 29.3% | **15.2%** | **+2.8 — worse than nothing** |
+
+Two things this adds. **The blind ramp does active damage on a multi-player
+surface** — on `eq kappa.002` (a nearly frozen buffer, the one genuinely
+discriminating cell here) it fails 45% of drifts, 45% of regime changes and 85%
+of mixture drifts against hyper's 5% overall. And **the sensors are worth much
+less here**: 4 points over the control, against 16.5 on the held-out battery.
+Most of these cells are saturated, not discriminating.
+
 ### The one place the shipping probe genuinely wins
 
 `h eq base`, `hot_90pct`: `ray+ray` fails 35% where all three hyper variants fail
@@ -206,7 +225,7 @@ the free status that made it interesting.
 |---|---|---|
 | **`hyper`** | free | Best guarantee measured; the SYMMETRIC published form is the one to use. |
 | `ray+ray` (shipping) | ~2% | Sound architecture (abstention + fallback), never tuned as one object. |
-| `ramp+plateau` | free | Noise-immune (no sensor to corrupt) but cannot track an optimum that moves UP. |
+| `ramp+plateau` | free | Noise-immune (no sensor to corrupt) but cannot track an optimum that moves UP — and on a MULTI-PLAYER surface it is **worse than having no sensor at all** (15.2% vs 12.4%). |
 | `bb` | free | Structurally biased, §5. Best on the moving target where noise is low. |
 | `armijo` | ~50%/step | Fastest median anywhere; worst thing on the board at high noise. §4. |
 | `dog` | free | Cold-start bootstrap failure. **Wrong family member tested** — DoG is SGD-derived; Prodigy is the Adam variant. |
@@ -237,7 +256,16 @@ denominator finishes**, and this was got wrong at both ends:
 
 Also live: a **cell guard** — `find_oracle` accepts a cell if a best LR *exists*,
 which is not the same as the run converging, so cells failing a 100× drop are
-skipped.
+skipped. `EQ_HARD` exercised a second form of it: two cells were refused because
+the best fixed rate sat at the *edge of the searched range*, which is the best of
+a badly chosen set rather than an oracle.
+
+**One saturated column is still unguarded.** On `eq n3` every arm fails 100% of
+hot starts, including the no-sensor control — the same signature the cold-start
+guard catches, for the same reason: the deep target is at 56 steps of a
+3000-step run, so the budget is 112 steps and cooling from 90% of the way to the
+cliff at 2%/step does not fit either. `_cold_start_feasible` should grow a hot
+counterpart; the arithmetic is the same with the sign flipped.
 
 **A stated fix with no guard is one edit from being undone.** Both ends are now
 assertions, not prose.

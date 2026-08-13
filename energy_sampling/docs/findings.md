@@ -7,6 +7,47 @@ Newest first.
 
 ---
 
+## F-034 · The ranking holds on a second surface family, and the blind ramp is worse than no sensor there · `REPLICATED`
+
+*2026-08-13. Second battery for §0's table; same arms, same scoring, an unrelated
+surface family.*
+
+**Scope:** `bench/crucible.py EQ_HARD` — 8 three-player `equilibration` cells swept
+along noise, coupling (a=b), buffer churn κ, width and flow rate; 3000 steps, 5
+scenarios, 20 seeds. 2 cells refused (best fixed rate at the edge of the searched
+range). Compare against the 13 held-out cells, 11 of which are one quadratic bowl.
+
+| arm | % over | passable only | vs. NULL |
+|---|---|---|---|
+| `hyper` symmetric | 23.7% | **8.4%** | −4.0 |
+| `hyper` 2:1 / gated | 24.2% | 9.0% | −3.4 |
+| `ray+ray` | 24.7% | 9.6% | −2.8 |
+| NULL (no sensor) | 27.0% | 12.4% | — |
+| `ramp+plateau` | 29.3% | 15.2% | **+2.8** |
+
+**The order is identical to the held-out battery**, which is the first evidence
+that §0's ranking is a property of the arms rather than of the quadratic bowl.
+
+**`ramp+plateau` is worse than standing still on a multi-player surface.** On
+`eq kappa.002` — a nearly frozen buffer (κ=0.002), and the one cell here that
+genuinely discriminates — it fails 45% of `drift_10x`, 45% of `regime_change` and
+85% of `mixture_drift`, against `hyper sym` at 5% overall and NULL at 25%. A
+sensor that cannot measure and ramps anyway is a liability once a second player
+is moving.
+
+**But the sensors are worth much less here**: 4 points over the control, against
+16.5 points on the held-out battery. Most of these cells are saturated rather
+than discriminating.
+
+**A saturated column the guard does not catch.** On `eq n3` every arm fails 100%
+of `hot_90pct`, NULL included — the same signature as F-032's cold starts, and
+the same arithmetic with the sign flipped: the deep target is at 56 of 3000
+steps, so the budget is 112 steps, and cooling from `hot_lr(0.9)` at the maximum
+`exp(−0.02)` per step does not fit. Until `_cold_start_feasible` grows a hot
+counterpart, read `eq n3`'s 40% as a budget property.
+
+---
+
 ## F-033 · `cos(g_t, g_{t-1})` measures the LEARNING RATE, not the gradient noise · `REPLICATED`
 
 *2026-08-13. Retires the "calibrate the bench's noise axis" action in
@@ -53,9 +94,23 @@ and `cos_axis.py` is the first implementation.
 | eq mid-descent (step ~11000) | equilibration | `fused` | 0.2901 | 0.240–0.350 | 903 |
 | eq from phase1_exit | equilibration | `fused` | 0.2871 | — | 893 |
 | eq mid-run (step ~10500) | equilibration | `fused` | 0.2889 | — | 899 |
-| **MLE fresh** | `train_prior` | `bwd` | **0.3441** | **−0.649–0.771** | 1071 |
+| **MLE fresh (step 0)** | `train_prior` | `bwd` | **0.3441** | **−0.649–0.771** | 1071 |
+| MLE half way (step 5000) | `train_prior` | `bwd` | −0.1205 | −0.379–0.324 | −375 |
+| MLE converged (step 10000) | `train_prior` | `bwd` | −0.0448 | −0.277–0.275 | −140 |
 | eq mid-run (same run, same window) | equilibration | `bwd` | 0.0150 | — | 47 |
-| converged (`CK_OLD final.pt`) | — | `bwd` | **−0.0448** | — | −140 |
+
+**The MLE trajectory runs slightly HOT and equilibration runs COLD.** Read as a
+rate statistic, `bwd` goes +0.344 → −0.121 → −0.045 across one MLE run — at or
+above its optimal rate from the middle onwards — while `fused` sits at +0.29
+throughout. They do not want the same rate, and today they get the same one. At
+step 5000 the gradient norm is flat (51.13 → 51.31 over 400 steps), so that model
+is at its noise floor and the negative reading is the expected bouncing
+signature; it also suggests the back half of phase 1 may be buying little.
+
+**The converged measurement reproduces −0.0448 to four decimals** against the
+file the broken `mle_fresh` regime wrote this morning — same 399 samples, same
+steps 10001–10399, same ‖g‖ 50.96. That is not consistency with the diagnosis,
+it is proof of it: those two regimes were always one measurement.
 
 The three `fused` medians — 0.2871, 0.2889, 0.2901 — are three separate runs at
 three checkpoints and agree to within 0.003, which is the only replication in
