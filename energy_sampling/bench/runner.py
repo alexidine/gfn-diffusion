@@ -82,6 +82,9 @@ class Run:
 
     def step(self):
         m, game = self.m, self.game
+        # move any non-stationary part of the surface FIRST, so this step's
+        # gradient is measured against the target as it now stands
+        game.advance()
         batch = game.draw(self.batch)
 
         # BEFORE the step: the ray probe snapshots parameters here. train.py

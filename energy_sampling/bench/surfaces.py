@@ -118,6 +118,16 @@ class _Game:
     def distance_to_opt(self):
         raise NotImplementedError
 
+    def advance(self):
+        """
+        Move any non-stationary part of the surface by one step. Default no-op.
+
+        Called once per step by the runner. Exists so a surface can pose a
+        TRACKING problem rather than a convergence one -- every cell built so far
+        converges, so its optimal rate only ever decays, and a controller whose
+        natural shape is overshoot-then-decay matches that trajectory for free.
+        """
+
     def grad_on(self, batch):
         """
         Flat gradient at the CURRENT parameters on `batch`, WITHOUT stepping and
@@ -192,7 +202,7 @@ class MLEGame(_Game):
 
     def __init__(self, dim=32, cond=30.0, quartic=0.0, noise=0.5, lr=1e-2,
                  optimizer='sgd', init_scale=1.0, seed=0, device='cpu',
-                 floor=0.0):
+                 floor=0.0, drift=0.0):
         g = torch.Generator(device='cpu').manual_seed(seed)
         self.device = device
         self.dim = dim
@@ -221,6 +231,17 @@ class MLEGame(_Game):
         self.H = torch.logspace(0, math.log10(cond), dim, dtype=torch.float64).float()
         theta0 = torch.randn(dim, generator=g) * init_scale
         self.theta = torch.nn.Parameter(theta0.clone())
+        # A MOVING OPTIMUM. `drift` is the per-step speed; the direction is a
+        # fixed random unit vector, so the target recedes steadily and the run
+        # NEVER converges -- the rate has to stay up to keep tracking rather
+        # than decay to a noise floor.
+        self.theta_opt = torch.zeros(dim)
+        self.drift = float(drift)
+        if self.drift:
+            v = torch.randn(dim, generator=g)
+            self._drift_vec = v / v.norm() * self.drift
+        else:
+            self._drift_vec = None
         # a Z head that exists but does not enter this stage's loss -- mk_dev's
         # unconditional flow_model is a LearnableScalar, and phase 1 does not
         # train it either. Present so the flow-pinning branch is still exercised.
@@ -240,8 +261,12 @@ class MLEGame(_Game):
 
     # ---- objective
 
+    def advance(self):
+        if self._drift_vec is not None:
+            self.theta_opt = self.theta_opt + self._drift_vec
+
     def _loss(self, noise_vec, theta=None):
-        t = self.theta if theta is None else theta
+        t = (self.theta if theta is None else theta) - self.theta_opt
         quad = 0.5 * (self.H * t * t).sum()
         quart = self.quartic * (t ** 4).sum() if self.quartic else 0.0
         return quad + quart + (noise_vec * t).sum() + self.floor
@@ -264,14 +289,14 @@ class MLEGame(_Game):
     # ---- ground truth
 
     def hessian_diag(self, theta=None):
-        t = (self.theta if theta is None else theta).detach()
+        t = (self.theta if theta is None else theta).detach() - self.theta_opt
         h = self.H.clone()
         if self.quartic:
             h = h + 12.0 * self.quartic * t * t
         return h
 
     def true_grad(self, theta=None):
-        t = (self.theta if theta is None else theta).detach()
+        t = (self.theta if theta is None else theta).detach() - self.theta_opt
         g = self.H * t
         if self.quartic:
             g = g + 4.0 * self.quartic * t ** 3
@@ -294,7 +319,7 @@ class MLEGame(_Game):
         return num / den if den > 0 else float('nan')
 
     def distance_to_opt(self):
-        return float(self.theta.detach().norm())
+        return float((self.theta.detach() - self.theta_opt).norm())
 
     def expected_loss(self):
         with torch.no_grad():

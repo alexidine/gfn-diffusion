@@ -48,7 +48,7 @@ LADDER = (1e-4, 1e-3, 3e-3, 1e-2, 1e-1)
 
 
 def _mutate_soften(game):
-    """Curvature /8 -> the optimal rate jumps ~8x UP, mid-run."""
+    """Curvature /8 mid-run. NOT an upward shift -- see the module note."""
     game.H = game.H / 8.0
 
 
@@ -61,6 +61,14 @@ CELLS = [
     ('quartic .1',  dict(cond=300.0, noise=0.1, quartic=0.1),  64, None),
     ('illcond 3k',  dict(cond=3000.0, noise=0.5, quartic=0.0), 64, None),
     ('regime /8',   dict(cond=300.0, noise=0.5, quartic=0.0),  64, _mutate_soften),
+    # A MOVING TARGET: the optimum recedes at a constant speed, so the run never
+    # converges and a too-slow rate FALLS BEHIND rather than merely converging
+    # slowly -- measured, at lr 1e-4 the loss RISES 8.7e3 -> 1.7e4 over the run,
+    # which no other cell does. Its optimal rate still decays (0.1 -> 0.01), just
+    # less than base's (0.1 -> 0.003); see the note above about why an upward
+    # moving optimum is not reachable on this family.
+    ('drift 2e-3',  dict(cond=300.0, noise=0.5, quartic=0.0, drift=2e-3),
+     64, None),
 ]
 
 
