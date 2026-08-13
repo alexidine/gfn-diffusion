@@ -140,11 +140,17 @@ CK_OLD = ('checkpoints/d33elj_elj_nehzor_sg14_t10_elj-nehzor_sg14_zp1_'
 #: had rewritten it. Two measurements under one regime name, of two different
 #: models, with nothing in the output to say so. `step15000.pt` is a periodic
 #: checkpoint of the user's own r2 run, mid-equilibration and never rewritten.
+#: A LADDER ALONG ONE TRAJECTORY, not four unrelated points. The first three are
+#: the same MLE run at step 0 / 5000 / 10000 (its `final.pt` never left
+#: `train_prior`, so "converged MLE" is literally what it is), which makes cos
+#: comparable across them -- same problem, same width, same branch, only the
+#: distance-from-convergence changes. The last two are the other stage.
 REGIMES = {
-    'mle_fresh':      None,                    # no reload: phase 1 from scratch
-    'eq_phase1exit':  CK + 'phase1_exit.pt',
-    'eq_descent':     CK + 'step15000.pt',
-    'mle_converged':  CK_OLD + 'final.pt',
+    'mle_fresh':      None,                        # step 0, from scratch
+    'mle_mid':        CK_OLD + 'step5000.pt',      # step 5000, train_prior
+    'mle_converged':  CK_OLD + 'final.pt',         # step 10000, train_prior
+    'eq_phase1exit':  CK + 'phase1_exit.pt',       # step 10640 -> equilibration
+    'eq_descent':     CK + 'step15000.pt',         # equilibration, past the exit
 }
 
 
@@ -232,20 +238,41 @@ def run(steps=STEPS, config=CONFIG, out=OUT, ckpt=CKPT):
     _ck = type(m.checkpointer)
     _real_full, _real_weights = _ck.load_full, _ck.load_weights_only
 
-    # NOTHING MAY BE WRITTEN. Not a flag asking the run not to save -- the
-    # methods that do the writing, replaced. `train.py` saves 'running',
-    # 'final' and the buffers; `protocol.py` saves 'stage_start', 'prior' and
-    # the phase-exit tag on a stage transition, and a resume from
-    # `phase1_exit.pt` transitions on its FIRST step, so that path is not
-    # hypothetical -- it is how this diagnostic overwrote the checkpoint that
-    # defines its own regime.
+    # NOTHING MAY BE WRITTEN -- TWO LAYERS, THE FIRST ONE SUPPORTED.
+    #
+    # `checkpoint_read_only` is a REAL field. `Checkpointer.read_only`
+    # (checkpointing.py:101) reads it and every write path checks it: `save`,
+    # `save_buffers`, `archive` and `link`. This is the mechanism the codebase
+    # already provides, and the earlier `save_checkpoints = False` was an
+    # invented name standing where it should have been.
+    #
+    # The second layer exists because the first version of THIS block patched
+    # only `save`/`save_buffers` -- reasoning from the call sites in `train.py`
+    # and `protocol.py` -- and missed `archive`, which calls `link` directly and
+    # never goes through `save`. `archive` hardlinks `stepNNNNN.pt` onto the
+    # CURRENT `running.pt` bytes, so a resume at step 15000 with archiving on
+    # pointed the user's `_step15000.pt` at this diagnostic's step-10700 state
+    # and destroyed it. Enumerating call sites is not enumerating write paths;
+    # the list below comes from the WRITER's own methods.
+    m.args.checkpoint_read_only = True
     blocked = []
-    _real_save, _real_save_buf = _ck.save, _ck.save_buffers
+    _writers = ('save', 'save_buffers', 'archive', 'link')
+    _real_writers = {n: getattr(_ck, n) for n in _writers}
 
-    def _no_save(self, tag='?', *a, **kw):
-        blocked.append(str(tag))
+    def _blocker(name):
+        def _no_write(self, tag='?', *a, **kw):
+            blocked.append(f'{name}:{tag}')
+        return _no_write
 
-    _ck.save, _ck.save_buffers = _no_save, _no_save
+    for _n in _writers:
+        setattr(_ck, _n, _blocker(_n))
+    # If a write path is ever ADDED, this is the line that notices.
+    _unknown = [n for n in dir(_ck)
+                if n.startswith('save') and n not in _writers]
+    if _unknown:
+        raise RuntimeError(
+            f'Checkpointer grew write methods this file does not block: '
+            f'{_unknown}. Add them to _writers before running.')
 
     def _spy_full(self, path, *a, **kw):
         loaded.append(str(path))
@@ -358,7 +385,8 @@ def run(steps=STEPS, config=CONFIG, out=OUT, ckpt=CKPT):
         type(m).train_step = original
         torch.nn.utils.clip_grad_norm_ = _real_clip
         _ck.load_full, _ck.load_weights_only = _real_full, _real_weights
-        _ck.save, _ck.save_buffers = _real_save, _real_save_buf
+        for _n, _fn in _real_writers.items():
+            setattr(_ck, _n, _fn)
         # PRINT THE SUPPRESSION WHEN IT WORKS. A guard that is only visible on
         # failure is indistinguishable from an absent one, which is exactly how
         # `save_checkpoints=False` survived as a docstring promise.
