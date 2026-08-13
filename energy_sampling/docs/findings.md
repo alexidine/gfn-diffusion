@@ -50,10 +50,16 @@ and `cos_axis.py` is the first implementation.
 
 | regime | stage | branch | median | IQR | ×null |
 |---|---|---|---|---|---|
-| eq mid-descent | equilibration | `fused` | 0.2901 | 0.240–0.350 | 903 |
+| eq mid-descent (step ~11000) | equilibration | `fused` | 0.2901 | 0.240–0.350 | 903 |
 | eq from phase1_exit | equilibration | `fused` | 0.2871 | — | 893 |
+| eq mid-run (step ~10500) | equilibration | `fused` | 0.2889 | — | 899 |
 | **MLE fresh** | `train_prior` | `bwd` | **0.3441** | **−0.649–0.771** | 1071 |
-| MLE converged | — | `bwd` | 0.015 | — | 47 |
+| eq mid-run (same run, same window) | equilibration | `bwd` | 0.0150 | — | 47 |
+| converged (`CK_OLD final.pt`) | — | `bwd` | **−0.0448** | — | −140 |
+
+The three `fused` medians — 0.2871, 0.2889, 0.2901 — are three separate runs at
+three checkpoints and agree to within 0.003, which is the only replication in
+this table.
 
 Null |cos| for independent vectors is `sqrt(2/πd)` = 0.00032 at the policy's
 6,163,969 params, against 0.141 at the bench's d=32.
@@ -72,6 +78,10 @@ Null |cos| for independent vectors is `sqrt(2/πd)` = 0.00032 at the policy's
    A hypergradient controller running through phase 1 is running on a different
    statistic than the one measured in equilibration, not a noisier version of
    the same one.
+3. **`bwd` is unusable everywhere except fresh.** 0.0150 mid-run and −0.0448 at
+   convergence, against a null of 0.00032 — nominally significant and far too
+   small to control on, while `fused` in the SAME window reads 0.2889. The
+   branch, not the noise, is what separates them.
 
 **Reading of the real number:** fused cos 0.29 says the production rate sits
 somewhat BELOW its optimum — mildly cold — at whatever the noise is. It is not

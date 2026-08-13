@@ -102,3 +102,24 @@ aggregate column). So:
 4. The ORDER is unchanged either way. The point of the second column is not a
    new winner, it is that the gaps stop being buried under ~4.6 points of budget
    artifact that every arm pays equally.
+
+### Outcome
+
+**All four confirmed.** First column bit-identical (5.3 / 5.3 / 5.3 / 6.5 / 8.5 /
+21.0); exactly three UNREACHABLE notes on exactly the three predicted cells, with
+the two wall types correctly separated; `passable only` came back 0.7 / 1.9 / 4.1
+/ 17.2 against a hand computation of 0.73 / 1.94 / 4.11 / 17.2.
+
+**The calibration predictions scored 3 confirmed, 1 partial, 1 pending:**
+(1) fresh really starts at step 1, (2) it is `bwd`-only in `train_prior`, (3)
+median 0.3441, inside the predicted 0.05-0.4 and nothing like the −0.0448 the
+broken regime reported. (4) `eq_phase1exit` came back 0.3037 against this
+morning's 0.2871 over the IDENTICAL step range — close, but not the clean control
+I claimed it would be, because the checkpoint itself had been rewritten in
+between by the clobbering bug. A cleaner reproduction is not available; that file
+is gone.
+
+**Unpredicted, and the most useful thing the run produced:** `[calib] BLOCKED 14
+checkpoint writes` in a single 400-step regime — 8 × `running`, plus
+`phase1_exit`, `prior`, `stage_start` and three buffer saves. I had reasoned the
+diagnostic was writing checkpoints; I had not guessed the rate.

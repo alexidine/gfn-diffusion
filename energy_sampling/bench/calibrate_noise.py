@@ -428,10 +428,11 @@ def report(rec, out=OUT):
               'cannot say whether cos carries\n     signal during active '
               'convergence -- pick an earlier checkpoint.')
     elif fall <= 1.0 / MIN_GNORM_FALL:
-        print(f'  >> ||g|| is RISING ({1 / fall:.2f}x), not flat. On a fresh '
-              'model that is ordinary\n     early training, not a stationary '
-              'point, and the cos reading below is from\n     an ACTIVE regime. '
-              '||g|| is a weak descent proxy here either way: it can\n     rise '
+        print(f'  >> ||g|| is RISING ({1 / fall:.2f}x), not flat -- so this is '
+              'NOT a stationary point\n     and the cos reading below is from an '
+              'ACTIVE regime. Ordinary on a fresh\n     model, and after a stage '
+              'transition, which rebuilds the optimizers and\n     re-warms the '
+              'LR. ||g|| is a weak descent proxy either way: it can rise\n     '
               'while the loss falls.')
 
     allc = sorted(r['cos'] for r in rec)
