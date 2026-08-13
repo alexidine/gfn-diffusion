@@ -290,7 +290,11 @@ class RayRay(Arm):
     PROBE_BATCH = 512
 
     def __init__(self, lr, period=100):
-        super().__init__('ray+ray')
+        # THE PERIOD IS IN THE NAME. Results are keyed by arm name, so two ray
+        # arms at different cadences silently MERGED into one row -- the board
+        # printed two identical 'ray+ray' lines and one config's numbers were
+        # simply gone.
+        super().__init__(f'ray+ray p={period}')
         self.lr = float(lr)
         self.period = int(period)
 

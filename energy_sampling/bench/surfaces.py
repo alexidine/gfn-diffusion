@@ -519,6 +519,23 @@ class EquilibrationGame(_Game):
         # is the one bwd finds softest. That is what "multiple competing
         # optimizations on a shared policy model" means mechanically, and it is
         # the part the scalar game left out.
+        #
+        # THE BRANCHES STILL SHARE A FIXED POINT and must: MK, on the real
+        # system, "var(w) optimizes to zero on both in the very terminal stage".
+        # Verified here -- all three branch losses are exactly 0 at
+        # theta = zeta = mu = 0, while cos(replay grad, bwd grad) = +0.85 away
+        # from it. They agree on WHERE, disagree on HOW FAR. The spectra move
+        # curvature, never the location of a minimum.
+        #
+        # AND THE CONFLICT DOES NOT FADE AT CONVERGENCE, which is why these are
+        # constant rather than decaying. MK: in terminal training the forward
+        # policy samples buffer states thermally PLUS whatever else it wants to
+        # hold, while backward training samples ONLY buffer states. The bwd
+        # branch's support is a SUBSET of the forward branch's, permanently -- so
+        # the two never see the same geometry even at the end. (A closer
+        # caricature would give bwd a strict subspace rather than an opposed
+        # spectrum; the coordinates only the forward branch touches would then be
+        # unconstrained by bwd and soft in the combined problem. Not modelled.)
         self.S_rep = torch.logspace(0, math.log10(max(cond_rep, 1.0)),
                                     dim, dtype=torch.float64).float()
         self.S_bwd = torch.logspace(math.log10(max(cond_bwd, 1.0)), 0,
