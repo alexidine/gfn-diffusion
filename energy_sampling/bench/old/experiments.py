@@ -23,8 +23,8 @@ import sys
 
 import numpy as np
 
-from bench.clock import SyntheticGPU
-from bench.harness import BenchRun
+from bench.old.clock import SyntheticGPU
+from bench.old.harness import BenchRun
 from bench.surfaces import EquilibrationGame
 
 
@@ -306,7 +306,7 @@ def knee_jitter():
     decisive rung the true step-time ratio is 1.2766 against a 1.25 threshold --
     a 2.1% margin, decided from 20 timings.
     """
-    from bench.test_batch_sizer import batch_run
+    from bench.old.test_batch_sizer import batch_run
     _hr('knee_jitter: pin distribution vs step-time noise')
     gpu = SyntheticGPU(t_fixed=2.0, sps_max=5000.0)
     print(f'analytic knee bound {gpu.knee_bound(1.65, 0.25):.0f}; '
@@ -340,7 +340,7 @@ def knee_realism():
         local two-point comparison, so a one-off step between two rungs is
         indistinguishable from saturation, and it pins there permanently.
     """
-    from bench.test_batch_sizer import batch_run
+    from bench.old.test_batch_sizer import batch_run
     _hr('knee_realism: the gate under discrete cost models')
     BASE = dict(t_fixed=2.0, sps_max=5000.0)
     cases = {

@@ -14,7 +14,7 @@ If the predicate and the measurement ever disagree, one of them is wrong and the
 """
 import pytest
 
-from bench.crucible import _cold_start_feasible
+from bench.old.crucible import _cold_start_feasible
 
 #: (label, oracle lr, denom, cold_start % for `hyper sym` over 20 seeds)
 #: Read off the run's per-cell tables; see docs/lr_control_summary.md section 0.

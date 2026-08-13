@@ -32,7 +32,7 @@ import math
 
 import numpy as np
 
-from bench.harness import BenchRun
+from bench.old.harness import BenchRun
 from bench.surfaces import GAMES
 
 #: game train_key -> the args key holding that optimizer's base LR

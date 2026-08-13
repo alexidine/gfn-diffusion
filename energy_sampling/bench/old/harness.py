@@ -33,7 +33,7 @@ import math
 
 import torch
 
-from bench.clock import SyntheticGPU
+from bench.old.clock import SyntheticGPU
 from bench.fake_modeller import FakeModeller, FakeStage, attach_real_batch_sizer, make_args
 from bench.surfaces import GAMES
 

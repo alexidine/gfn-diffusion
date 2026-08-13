@@ -35,9 +35,9 @@ import sys
 import numpy as np
 import torch
 
-from bench.oracle import Surface
-from bench.robustness import BASE
-from bench.scenarios import SEED_LR
+from bench.old.oracle import Surface
+from bench.old.robustness import BASE
+from bench.old.scenarios import SEED_LR
 
 NOISES = (0.01, 0.1, 0.5, 2.0)
 WINDOWS = (1, 10, 50, 200)

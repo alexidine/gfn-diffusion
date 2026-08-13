@@ -25,9 +25,9 @@ import sys
 
 import numpy as np
 
-from bench.oracle import Surface, find_oracle
-from bench.robustness import BASE, BUDGET, SCENARIOS
-from bench.scenarios import SEED_LR, sc_blowup, steps_to_target
+from bench.old.oracle import Surface, find_oracle
+from bench.old.robustness import BASE, BUDGET, SCENARIOS
+from bench.old.scenarios import SEED_LR, sc_blowup, steps_to_target
 
 WINDOWS = (1, 10, 50, 200)
 NOISES = (0.01, 0.5, 2.0)

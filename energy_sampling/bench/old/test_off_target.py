@@ -14,7 +14,7 @@ import math
 
 import pytest
 
-from bench.scenarios import (ON_TARGET_BAND, longest_off_target,
+from bench.old.scenarios import (ON_TARGET_BAND, longest_off_target,
                              time_off_target)
 
 

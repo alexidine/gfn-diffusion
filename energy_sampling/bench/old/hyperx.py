@@ -26,9 +26,9 @@ import sys
 
 import numpy as np
 
-from bench.oracle import Surface, find_oracle
-from bench.robustness import BASE, BUDGET
-from bench.scenarios import SEED_LR, sc_blowup, steps_to_target
+from bench.old.oracle import Surface, find_oracle
+from bench.old.robustness import BASE, BUDGET
+from bench.old.scenarios import SEED_LR, sc_blowup, steps_to_target
 
 ARMS = (('hyperx', 'none'), ('hyper', 'none'),
         ('ray', 'ray'), ('ramp', 'plateau'))

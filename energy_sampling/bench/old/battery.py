@@ -37,9 +37,9 @@ from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 
-from bench.oracle import Surface, find_oracle
-from bench.robustness import BASE, BUDGET, SCENARIOS  # noqa
-from bench.scenarios import SEED_LR, sc_blowup, steps_to_target
+from bench.old.oracle import Surface, find_oracle
+from bench.old.robustness import BASE, BUDGET, SCENARIOS  # noqa
+from bench.old.scenarios import SEED_LR, sc_blowup, steps_to_target
 
 MIN_DROP = 100.0        # the oracle must actually converge for the cell to count
 

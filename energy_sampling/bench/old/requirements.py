@@ -55,8 +55,8 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 import torch
 
-from bench.crucible import EQ, MLE, _mk, _oracle_task, _regime_shift
-from bench.scenarios import (ON_TARGET_BAND, SEED_LR, longest_off_target,
+from bench.old.crucible import EQ, MLE, _mk, _oracle_task, _regime_shift
+from bench.old.scenarios import (ON_TARGET_BAND, SEED_LR, longest_off_target,
                              time_off_target)
 
 #: How far above the cliff R5 starts. The existing `hot_90pct` scenario starts

@@ -30,8 +30,8 @@ import sys
 
 import numpy as np
 
-from bench.harness import BenchRun
-from bench.oracle import (Surface, distance_trace, final_distance, find_oracle,
+from bench.old.harness import BenchRun
+from bench.old.oracle import (Surface, distance_trace, final_distance, find_oracle,
                           median_trace)
 
 #: The three stage analogues. Each is run from cold start, which is exactly the

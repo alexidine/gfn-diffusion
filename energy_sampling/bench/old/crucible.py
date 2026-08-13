@@ -36,10 +36,10 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 
 from bench.fake_modeller import MK_DEV_ADAPTIVE
-from bench.harness import BenchRun
-from bench.oracle import (OracleResult, Surface, final_distance, find_oracle,
+from bench.old.harness import BenchRun
+from bench.old.oracle import (OracleResult, Surface, final_distance, find_oracle,
                           median_trace)
-from bench.scenarios import SEED_LR, steps_to_target
+from bench.old.scenarios import SEED_LR, steps_to_target
 
 BUDGET = 2.0
 MIN_DROP = 100.0

@@ -52,9 +52,9 @@ from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 
-from bench.crucible import (BUDGET, DEEP_FRAC, EQ, MLE, SCENARIOS, _mk,
+from bench.old.crucible import (BUDGET, DEEP_FRAC, EQ, MLE, SCENARIOS, _mk,
                             _oracle_task, _sc_drift, _sc_mixture, _sc_regime)
-from bench.scenarios import (SEED_LR, longest_off_target, steps_to_target,
+from bench.old.scenarios import (SEED_LR, longest_off_target, steps_to_target,
                              time_off_target)
 
 #: The published gain and four multiples of it. 0.08 is the estimate the cos

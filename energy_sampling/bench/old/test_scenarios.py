@@ -16,8 +16,8 @@ import numpy as np
 import pytest
 import torch
 
-from bench.oracle import Surface, find_oracle, median_trace
-from bench.scenarios import RECOVERY_TOL, detectability, recovered_at
+from bench.old.oracle import Surface, find_oracle, median_trace
+from bench.old.scenarios import RECOVERY_TOL, detectability, recovered_at
 
 FAST = Surface('fast', 'mle', dict(dim=8, cond=20.0, noise=0.02, init_scale=2.0),
                steps=400, lr_grid=(1e-5, 1e0, 9))
@@ -163,7 +163,7 @@ bench got this wrong once by omission, so it is pinned.
 
 
 def _blowup_run(steps_before=200, factor=1e4, **kw):
-    from bench.harness import BenchRun
+    from bench.old.harness import BenchRun
     run = BenchRun(game='mle', need_batch_sizer=False,
                    game_kwargs=dict(dim=8, cond=20.0, noise=0.01, lr=1e-2, seed=0),
                    args_overrides={'adaptive_lr.warmup_steps': 20,
@@ -253,7 +253,7 @@ def test_reload_budget_aborts_the_run():
 def test_rewind_restores_non_parameter_state():
     """The buffer mean is not an optimizer parameter, and a restore that leaves
     it at its diverged value is not a restore."""
-    from bench.harness import BenchRun
+    from bench.old.harness import BenchRun
     run = BenchRun(game='equilibration', need_batch_sizer=False,
                    game_kwargs=dict(dim=4, a=4.0, w_rep=0.7, w_bwd=0.3,
                                     kappa=0.05, noise=0.05, lr=0.05, seed=0),
@@ -279,7 +279,7 @@ comparison drawn from it would be wrong.
 
 
 def _bench(args_overrides=None, **kw):
-    from bench.harness import BenchRun
+    from bench.old.harness import BenchRun
     overrides = {'adaptive_lr.warmup_steps': 0, 'ray_calibration.enabled': False}
     overrides.update(args_overrides or {})
     return BenchRun(game='mle', need_batch_sizer=False,
@@ -288,7 +288,7 @@ def _bench(args_overrides=None, **kw):
 
 
 def test_legacy_sensor_names_map_onto_the_factorial():
-    from bench.harness import BenchRun
+    from bench.old.harness import BenchRun
     for name, (climber, braker) in BenchRun._SENSOR_PAIRS.items():
         run = _bench(sensor=name)
         assert (run.climber, run.braker) == (climber, braker), name

@@ -22,8 +22,8 @@ import os
 
 os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')
 
-from bench.harness import BenchRun          # noqa: E402
-from bench.scenarios import toolkit         # noqa: E402
+from bench.old.harness import BenchRun          # noqa: E402
+from bench.old.scenarios import toolkit         # noqa: E402
 
 #: the incumbent and the current best, carried in every pass as the reference
 REFERENCE = [('ray', 'ray'), ('ramp', 'plateau')]

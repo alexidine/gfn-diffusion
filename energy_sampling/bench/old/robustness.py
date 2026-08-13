@@ -27,8 +27,8 @@ import sys
 
 import numpy as np
 
-from bench.oracle import Surface, find_oracle
-from bench.scenarios import (SEED_LR, SURFACES, sc_blowup, steps_to_target,
+from bench.old.oracle import Surface, find_oracle
+from bench.old.scenarios import (SEED_LR, SURFACES, sc_blowup, steps_to_target,
                              steps_behind)
 
 #: The budget. Set from the operating requirement -- at worst a ~2x training

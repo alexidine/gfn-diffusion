@@ -27,7 +27,7 @@ import pytest
 
 from bench.fake_modeller import (FakeModeller, FakeStage, attach_real_batch_sizer,
                                  make_args)
-from bench.harness import BenchRun
+from bench.old.harness import BenchRun
 
 from energy_sampling.checkpointing import MODELLER_STATE_DEFAULTS
 

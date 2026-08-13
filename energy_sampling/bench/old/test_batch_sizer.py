@@ -46,8 +46,8 @@ bench/test_usage_floor.py covers the new priority-1 (occupancy) behaviour.
 
 import pytest
 
-from bench.clock import SyntheticGPU
-from bench.harness import BenchRun
+from bench.old.clock import SyntheticGPU
+from bench.old.harness import BenchRun
 
 #: F-013/F-017 -- the three RECORDED-FAILURE tests below are still skipped
 #: individually. They assert specific blind spots OF THE RETIRED CRITERION (pins

@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from bench.fake_modeller import FakeModeller, make_args
-from bench.harness import BenchRun
+from bench.old.harness import BenchRun
 from energy_sampling.controller import LRController
 
 

@@ -1,25 +1,167 @@
-# bench/
+# bench — LR controller sandbox
 
-CPU sandbox for the control layer. Runs the **real** `LRController`,
-`RayCalibration` and `Modeller.increment_batch_size` against synthetic loss
-surfaces and a synthetic GPU, on a laptop, in seconds.
+CPU, seconds per run. Drives the shipping `LRController` and `RayCalibration`
+against synthetic surfaces where the right answer is known.
 
-Documentation lives in [`../docs/module_bench.md`](../docs/module_bench.md) —
-this file is a pointer, not a second copy.
+**Rebuilt 2026-08-13.** The previous generation is in [`old/`](old/), intact and
+still runnable. It was retired after an adversarial review found it had
+accumulated defects faster than results — the summary of what went wrong is at
+the bottom of this file, because most of it is reusable as a list of things not
+to do again.
 
 ```bash
-python -m pytest bench/ -q            # regression suite
-python -m bench.experiments           # the answer-producing runs
-python -m bench.experiments probe_blindness
+python -m bench.board            # the leaderboard: MLE game, Adam, 8 seeds
+python -m bench.board 20 sgd     # 20 seeds, SGD control
+python -m pytest bench/ -q
 ```
 
-Findings produced so far: `F-011`–`F-017` in
-[`../docs/findings.md`](../docs/findings.md).
+## The four pieces
 
-`test_fidelity.py` builds the **real** `train.Modeller` on CPU and checks the
-fake against it — surface, config values, and end-to-end LR equivalence. If it
-fails, trust it over everything else here.
+| file | what it is |
+|---|---|
+| `surfaces.py` | the games. `MLEGame` is the simple case: `½θᵀHθ + cΣθ⁴ + gᵀθ`, log-spaced spectrum, exact optimum at the origin, exact `alpha_star_true`. |
+| `arms.py` | the controllers, plus the fixed-rate ladder and the no-sensor control. |
+| `runner.py` | one (game, arm, seed) → a trace. Nothing else. |
+| `metrics.py` | five numbers, all pure functions of a trace. |
+| `board.py` | the leaderboard. |
 
-**The one rule:** the bench fakes the *modeller*, never the controller. If you
-find yourself reimplementing a control law here, stop — that is how a bench rots
-into reporting green about code that no longer exists.
+## Design rules, each of which is a scar
+
+**No oracle.** Fixed rates are arms. The old stack selected a "best fixed rate"
+and divided by it; that selection went wrong three separate ways (a rate 187x off
+on one surface family, a grid-edge winner that bypassed its own guard, a
+denominator pinned at the metric's floor) and each time it silently rescaled
+results rather than failing. A leaderboard needs no reference: "at worst ~2x the
+best fixed rate" is read by comparing rows.
+
+**No threshold, no budget, no censoring.** The old topline was
+`steps_to_target(run)/steps_to_target(oracle)` against a `2x budget`. Measured on
+its last full run, 92% of all "over budget" events were non-arrivals and 3 of 900
+runs were finite-and-over — the metric reported its own censoring. `final_loss`
+is uncensored and continuous.
+
+**Metrics are pure functions of the trace.** A metric can be corrected without
+re-running anything. Four re-runs were spent on metric definitions in the old
+stack because they were entangled with execution.
+
+**Adam by default.** Hypergradient's rule is derived from the SGD update
+(`dθ/dlr = −g`); production runs Adam everywhere (`train.py:1647`); every cell of
+the old bench ran SGD. Under Adam the step direction is `m̂/(√v̂+ε)`, so the
+derivation does not carry over. SGD stays as a control.
+
+**Paired seeds.** One seed is one noise stream, shared across arms, so a row
+difference is the arm and not the draw.
+
+**Every arm must be distinguishable from `null`.** Enforced in `test_arms.py`. An
+arm that silently no-ops does not error here — it posts a plausible row. `ray+ray`
+did exactly that during the rebuild (armed after the optimizer step, so all 1900
+readings returned `None`) and was bit-identical to the do-nothing arm.
+
+## The metrics
+
+| metric | definition | why this shape |
+|---|---|---|
+| `final` | median loss over the last 100 steps, relative to the best arm | median not mean (heavy tails); window not last-value (one minibatch draw) |
+| `lead` | share of steps with the lowest smoothed loss, paired by seed | the only arm-vs-arm metric, and the reason no oracle is needed. Ties split evenly |
+| `lr sd`, `max jump` | sd and worst single-step move of **log** lr | controllers act multiplicatively, so log is the natural space; `max jump` is what "wild swings" means operationally, and is far more legible than a 4th moment |
+| `backslide` | share of the run where the loss is higher than `horizon` steps ago by more than its own noise explains | `mean(diff>0)` on a smoothed series returns ~0.5 for ANY noisy series — measured 0.501 on a flat loss — so it would have ranked arms by batch noise |
+| `div / abort / nonfin` | counts, summed over seeds | the goal is "never 50x", a tail statement. A mean hides an arm that is excellent on 5 seeds and detonates on the 6th |
+
+## What the arms are
+
+`hyper` is **not** Baydin et al.'s published rule, and the old docs called it
+that. Published is additive and unnormalised (`lr += β⟨g_t,g_{t-1}⟩`); this is
+multiplicative on the cosine. They share a fixed point and nothing else — β goes
+from units of `lr/gradient²` to dimensionless, which is exactly why one β serves
+every surface here, and the additive form's self-annealing near a stationary
+point is gone. On measured real gradients (‖g‖≈583, cos≈0.29) the published rule
+at the paper's β=1e-7 would multiply the LR by ~80 in one step. The cosine form
+is the defensible choice; the citation was not.
+
+`ray+ray` goes through the real `LRController.on_calibration`, so it carries the
+production `ratio**eta` damping, abstention policy and recorded ceiling. `hyper`
+has no production counterpart — there is no hypergradient in `controller.py` —
+so it writes `peak_scale` through the same actuator and bounds, but its update
+law is bench code. The old harness claimed all arms shared an update law; they
+do not, and pretending otherwise made the comparison look tighter than it was.
+
+## First result (2026-08-13, MLE game, Adam, 8 seeds)
+
+```
+arm                   final    lead   lr sd  max jump  backslide  div
+fixed@0.03             1.00  56.1%   0.000     0.000       0.0%     0
+hyper b=0.02           1.05   4.3%   4.029     0.043       0.0%     0
+fixed@0.01             1.82   2.7%   0.000     0.000       0.0%     0
+fixed@0.1              4.50  36.8%   0.000     0.000       1.7%     0
+ray+ray            712284.58   0.0%   2.319     0.543       0.0%     0
+ramp+plateau       712309.92   0.0%   2.319     0.543       0.0%     0
+null (no sensor)  5341861.49   0.0%   0.748     0.023       0.0%     0
+```
+
+Hyper lands within **5%** of the best fixed rate from a cold start 240x below it,
+which is the stated goal met on the simplest case. `ray+ray` and `ramp+plateau`
+are indistinguishable because the probe **saturated on 19 of 19 readings**
+(`above_range`), and the servo's saturation fallback is the blind ramp's own
+multiplier — so on this surface the probe *is* the ramp. That reproduces the
+anisotropy-blindness result from the old work in one line.
+
+### The SGD control, and why the optimizer was worth rebuilding for
+
+Same game, same arms, same seeds, `optimizer='sgd'`:
+
+```
+arm                   final    lead   lr sd  backslide   div  nonfin
+fixed@0.003            1.00  99.8%   0.000       0.0%     0       0
+hyper b=0.02           5.94   0.1%   2.396       1.4%     0       0
+ramp+plateau         396.58   0.0%   2.063       2.6%     8       0
+ray+ray              406.85   0.0%   2.063       2.6%     7       0
+fixed@0.01              inf   0.0%   0.000       3.0%  1586   15516
+fixed@0.03              inf   0.0%   0.000       1.0%  1592   15830
+fixed@0.1               inf   0.0%   0.000       0.7%  1592   15891
+```
+
+**The optimizer changes every answer.** The best fixed rate moves 10x (0.03 →
+0.003); the three rates that are *stable and near-optimal on Adam* are
+**catastrophic on SGD** (~1590 divergences each, 15k non-finite steps); and hyper
+goes from **1.05x** the best fixed rate to **5.94x**, i.e. from comfortably
+inside the "at worst ~2x" goal to well outside it.
+
+So the old bench's SGD-only measurement could not have transferred to an Adam
+trainer, and this is the direct demonstration rather than the argument from the
+derivation. It also means every number on this page is optimizer-specific and has
+to say so.
+
+Note the catastrophe columns doing their job: `fixed@0.01` on SGD has a *better*
+`backslide` than several healthy arms, because a run that is non-finite for most
+of its length has nothing to slide back from. Counts, not averages.
+
+### Known gaps
+
+- **No parameter rewind.** Production's `fire_loss_spike` restores a checkpoint
+  and then cuts the rate; this runner models only the cut. So a divergence here
+  is permanent where production would recover, which makes `div` a harsher
+  reading than production's. Deliberately not modelled yet: the old harness's
+  version rewound to a ≤50-step-old checkpoint *gated on a `diverged()` oracle*
+  production does not have, which flattered every arm whose only brake is the
+  tripwire.
+- Only one game (`MLEGame`), one cell, no perturbation scenarios, nothing
+  multi-player.
+
+## What killed the previous generation
+
+Kept because every item is a live hazard, not history:
+
+- A reference rate used as four different things at once (denominator, scenario
+  start, band centre, hot-start base). Changing it for one purpose broke the other three.
+- Guards that ran before the value they guarded was re-selected.
+- A scenario set where **44 of 65** cell×scenario columns had zero spread across
+  every arm including the control — the battery was ~10 binary trials wearing
+  1300 runs.
+- Nine of thirteen "independent" cells sharing one reference rate, denominator
+  and target.
+- A metric whose band (2.0x) was exactly the reciprocal of the controller's
+  divergence cut (0.5), so one cut landed bit-exactly on the boundary.
+- Constants transcribed between documents rather than computed from data. One
+  IQR was wrong by 1.69x and propagated into three conclusions.
+- Docstrings that described the opposite of the code (`_time_oracle`: "NOT WIRED
+  IN. Nothing calls this", while being called).
