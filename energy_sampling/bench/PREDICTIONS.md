@@ -156,3 +156,42 @@ metric as well as on time-to-target.
 divergences on the mle cells. That would mean the bench's absorbing boundary
 binds well before the noise argument does, and the gain is not the free lunch it
 looks like.
+
+### Outcome -- 2 of 5 wrong, and the wrong ones are the ones that mattered
+
+| beta | %over | off-target | too hot | too cold | longest | div/run |
+|---|---|---|---|---|---|---|
+| **0.02** | 9% | **38.4%** | 7.3% | **31.1%** | 35.0% | 0.30 |
+| 0.05 | 9% | 52.3% | 7.8% | 44.5% | 46.3% | 0.29 |
+| 0.08 | 9% | 56.7% | 8.0% | 48.7% | 48.2% | 0.31 |
+| 0.15 | 9% | 56.0% | 8.0% | 48.1% | 41.4% | 0.57 |
+| 0.30 | 6% | 62.4% | 11.5% | 50.9% | 37.2% | 0.67 |
+
+1. **Metrics disagree — YES, but the direction is backwards.** `%over` is flat at
+   9% for four of five gains and cannot see the difference at all; `off-target`
+   spans 38-62%. So the new metric earns its place. But I predicted it would be
+   minimised at a HIGHER beta and it is minimised at **0.02**, the published one.
+2. **"too cold falls with beta" — WRONG, it RISES**, 31.1% -> 50.9%. This is the
+   prediction I was most confident in and it is the one that kills the proposal.
+   Mechanism: once a run is in its noise ball `E[cos] < 0` (measured -0.15 in the
+   bench's late quartiles), so the drift per step is `beta * E[cos]` — raising
+   the gain scales the SYSTEMATIC COOLING BIAS by the same factor. The knob that
+   climbs faster also sinks faster, and near convergence sinking is what it
+   spends its time doing.
+3. **Divergences rise at 0.15-0.3 — YES**, 0.30 -> 0.57 -> 0.67.
+4. **"eq cells break at a lower beta" — WRONG.** They show FEWER divergences at
+   higher beta (0.14 -> 0.00), the opposite of my reasoning.
+5. Lower-bound framing stands, and is now the only thing keeping the idea alive.
+
+**What this does NOT settle.** The mechanism that kills it is `E[cos] < 0` near
+convergence. The real fused signal has **p25 = 0.24** — it does not go negative,
+so the cooling bias that punishes a high beta here may simply not exist there. I
+cannot test that on the bench, because no cell reproduces a persistently positive
+cos. Not special pleading: it is the measured difference from F-033, and it is
+now the single question that decides the gain.
+
+**The one place a high beta clearly wins** is recovery, from the requirements
+battery: after a real loss explosion, `hyper 0.02` spends 35.4% of the run stuck
+COLD with a 34.4% longest excursion and recovers on only half the seeds, while
+`hyper 0.08` spends 2.0%. So beta helps when far from the right rate and hurts
+when near it — an argument for a gain that is not constant, not for a bigger one.
