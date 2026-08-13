@@ -55,9 +55,23 @@ GRID = [
     for n in (0.01, 0.1, 0.5, 2.0, 5.0)
 ]
 
-#: The real fused measurement, for the comparison line. Median and IQR from
-#: `noise_calib_eq_descent.json` (399 samples, mid-descent, elj nehzor sg14 T10).
-REAL = dict(label='REAL fused (eq_descent)', med=0.2901, p25=0.24, p75=0.35,
+#: THE REAL FUSED MEASUREMENT, and its provenance stated exactly, because the
+#: first version of this constant cited a regime name rather than a file and the
+#: name later resolved to a different model.
+#:
+#: FOUR windows, elj nehzor sg14 T10, equilibration, `fused`, 400 steps each:
+#:      0.2871  phase1_exit, pre-fix        0.2889  r2 running.pt, pre-clip-fix
+#:      0.2901  r2 running.pt @11001        0.3037  phase1_exit, POST-fix
+#: Median of the four = 0.2895; full spread 0.0166, NOT the 0.003 claimed in
+#: F-033 before the fourth existed. The p25/p75 below are from the 0.2901
+#: window, which is the only one whose quartiles were recorded.
+#:
+#: `noise_calib_eq_descent.json` carries `stage: null` -- it predates stage
+#: recording, so it is a PRE-fix artifact of the era when `eq_descent` still
+#: pointed at a mutable `_running.pt`. The number is a real measurement of a
+#: real fused window; only the regime LABEL was unstable. A post-fix eq_descent
+#: window does not exist on disk yet.
+REAL = dict(label='REAL fused (4 windows)', med=0.2895, p25=0.24, p75=0.35,
             dim=6_163_969)
 
 

@@ -373,11 +373,12 @@ def _time_oracle(base, cell, seeds=(0, 1, 2)):
     Re-select the reference rate on the metric it is actually the denominator
     FOR: time to the deep target, not final distance.
 
-    NOT WIRED IN. Nothing calls this -- `_oracle_task` still takes its denominator
-    from `find_oracle` + `steps_to_target`, so the mis-normalisation described
-    below is still live in every number this file prints. Stated here because a
-    fix that exists as an uncalled function reads, from the outside, exactly like
-    a fix that shipped.
+    WIRED IN at `_oracle_task` (see the call below). This docstring said "NOT
+    WIRED IN. Nothing calls this" for as long as it WAS called, which is the
+    same defect it was written to warn about, pointing the other way: a fix
+    documented as absent is as misleading as an absence documented as a fix.
+    Consequence to keep in mind when reading old numbers -- every result printed
+    before it was wired in used the distance-selected denominator.
 
     `find_oracle` minimises the last-50 median distance. The crucible scores
     TIME. On flat-above-optimum surfaces those pick different rates, and badly:

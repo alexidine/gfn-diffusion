@@ -93,6 +93,24 @@ Two hold conditions carry real content:
 
 ## 4. Knobs and liveness
 
+> **⚠ THIS TABLE DOCUMENTS THE RETIRED `servo.*` BLOCK. Do not read values off
+> it.** v8 replaced the servo with periodic ray calibration and renamed the
+> block to `adaptive_lr.*`; the `servo.*` keys below no longer exist. Two rows
+> are actively misleading because the shipping value differs by an order of
+> magnitude:
+>
+> | row below | says | `configs/mk_dev.yaml` actually ships |
+> |---|---|---|
+> | `servo.bounds` | `[0.1, 200]` | **`adaptive_lr.bounds: [0.01, 2000.0]`** (line 48) |
+> | `servo.target` | `1.0` | **`alpha_target: 4.0`** (line 62) |
+>
+> The `2000` matters beyond bookkeeping: it is the `peak_scale` ceiling that
+> F-032 derives the cold-start reachability wall from, so a reader who takes
+> `200` from here computes a wall 10x too low. Read the config, or F-032.
+>
+> Kept rather than deleted because the WARRANT column — which knobs were
+> measured and which were arbitrary — is the part that did not become obsolete.
+
 | Key | mk_dev | Live when | Warrant |
 |---|---|---|---|
 | `warmup_steps` | 1000 | every stage entry | **arbitrary** — the cold-Adam rationale is standard practice, the value is not calibrated |

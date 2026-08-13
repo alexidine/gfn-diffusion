@@ -112,9 +112,18 @@ file the broken `mle_fresh` regime wrote this morning — same 399 samples, same
 steps 10001–10399, same ‖g‖ 50.96. That is not consistency with the diagnosis,
 it is proof of it: those two regimes were always one measurement.
 
-The three `fused` medians — 0.2871, 0.2889, 0.2901 — are three separate runs at
-three checkpoints and agree to within 0.003, which is the only replication in
-this table.
+The `fused` medians — 0.2871, 0.2889, 0.2901 — are three separate runs at three
+checkpoints and agree to within 0.003, which is the only replication in this
+table.
+
+**CORRECTED, same day, before this entry was relied on:** a fourth `fused`
+window exists — the post-fix `eq_phase1exit` re-run, over the *identical* step
+range 10642–11039 as the 0.2871 reading — and it reads **0.3037**. Four windows
+give a median of 0.2895 and a full spread of **0.0166, not 0.003**. The
+replication stands (four windows within 2% of each other, against a null of
+0.0003); its tightness was overstated ~5x. The two readings over the same steps
+differ because the checkpoint itself was rewritten between them by the
+clobbering bug, so they are not the same model.
 
 Null |cos| for independent vectors is `sqrt(2/πd)` = 0.00032 at the policy's
 6,163,969 params, against 0.141 at the bench's d=32.
