@@ -493,7 +493,8 @@ class EquilibrationGame(_Game):
 
     def __init__(self, dim=8, a=2.0, b=1.0, w_rep=0.7, w_bwd=0.3, kappa=0.02,
                  noise=0.1, lr=0.05, optimizer='sgd', init_scale=1.0,
-                 probe_scores='replay', seed=0, device='cpu'):
+                 probe_scores='replay', seed=0, device='cpu',
+                 cond_rep=1.0, cond_bwd=1.0):
         g = torch.Generator(device='cpu').manual_seed(seed)
         self.device = device
         self.dim = dim
@@ -504,6 +505,24 @@ class EquilibrationGame(_Game):
         self.probe_scores = probe_scores
         self._gen = g
 
+        # COMPETING BRANCHES NEED DIFFERENT GEOMETRY, or they do not compete.
+        #
+        # With scalar curvatures the theta-problem is w_rep*b^2 + w_bwd -- a
+        # single ISOTROPIC attractor at a weighted midpoint, condition number 1.
+        # Two isotropic pulls average; they never disagree about which direction
+        # wants a small step, so no learning-rate headroom is lost and the usable
+        # band is enormous. Measured on the scalar version: a 50x rate sweep moved
+        # the settled distance 13x and `null` was competitive with every arm.
+        #
+        # `cond_rep` and `cond_bwd` give each branch its own log-spaced spectrum,
+        # DELIBERATELY IN OPPOSITE ORDER, so the direction replay finds stiffest
+        # is the one bwd finds softest. That is what "multiple competing
+        # optimizations on a shared policy model" means mechanically, and it is
+        # the part the scalar game left out.
+        self.S_rep = torch.logspace(0, math.log10(max(cond_rep, 1.0)),
+                                    dim, dtype=torch.float64).float()
+        self.S_bwd = torch.logspace(math.log10(max(cond_bwd, 1.0)), 0,
+                                    dim, dtype=torch.float64).float()
         t0 = torch.randn(dim, generator=g) * init_scale
         self.theta = torch.nn.Parameter(t0.clone())
         self.zeta = torch.nn.Parameter(self.a * t0.clone())   # level starts consistent
@@ -525,10 +544,11 @@ class EquilibrationGame(_Game):
 
     def _replay_loss(self, n_theta):
         r = self.b * self.theta - self.zeta.detach()
-        return 0.5 * (r ** 2).sum() + (n_theta * self.theta).sum()
+        return 0.5 * (self.S_rep * r * r).sum() + (n_theta * self.theta).sum()
 
     def _bwd_loss(self):
-        return 0.5 * ((self.theta - self.mu) ** 2).sum()
+        d = self.theta - self.mu
+        return 0.5 * (self.S_bwd * d * d).sum()
 
     def _flow_loss(self, n_zeta):
         r = self.zeta + self.a * self.theta.detach()      # anti-phase; see class docstring
@@ -554,6 +574,37 @@ class EquilibrationGame(_Game):
         # buffer admits the sample that was just produced
         self.mu = (1.0 - self.kappa) * self.mu + self.kappa * theta_before
         return float(theta_loss.detach())
+
+    def expected_loss(self):
+        """
+        The three players' objectives, summed, with every noise term zeroed.
+
+        THERE IS NO JOINT POTENTIAL HERE -- that is the point of the game -- so
+        this is NOT something anybody descends. It is a distance-to-equilibrium:
+        each term is a squared residual, all three vanish exactly at the fixed
+        point (theta = zeta = mu = 0) and are positive elsewhere. That makes it a
+        legitimate SCORE even though it is not an objective, in the same way
+        "how far is the system from settled" is well posed without any player
+        optimising it.
+
+        Scoring the noisy `train_step` return instead would repeat the MLE trap:
+        near the fixed point the residuals vanish and what is left is the noise
+        draw, sign and all, so arms get ranked on a coin flip.
+        """
+        with torch.no_grad():
+            r = self.b * self.theta - self.zeta
+            d = self.theta - self.mu
+            rep = 0.5 * (self.S_rep * r * r).sum()
+            bwd = 0.5 * (self.S_bwd * d * d).sum()
+            flw = 0.5 * ((self.zeta + self.a * self.theta) ** 2).sum()
+            return float(self.w_rep * rep + self.w_bwd * bwd + flw)
+
+    def distance_to_opt(self):
+        """Whole-state distance from the fixed point, all three players."""
+        with torch.no_grad():
+            return float(torch.cat([self.theta.detach().reshape(-1),
+                                    self.zeta.detach().reshape(-1),
+                                    self.mu.reshape(-1)]).norm())
 
     def probe_loss(self, batch):
         """
@@ -586,16 +637,32 @@ class EquilibrationGame(_Game):
 
     # ---- ground truth
 
-    def iteration_matrix(self, lr, lr_level=None):
+    def iteration_matrix(self, lr, lr_level=None, coord=None):
         """
         The exact linear map on (theta, zeta, mu) for one SGD step at these rates.
-        Per-dimension identical, so a 3x3 suffices.
+
+        ONE 3x3 PER COORDINATE. The branches carry their own spectra `S_rep` and
+        `S_bwd` (opposed, so the direction replay finds stiffest is the one bwd
+        finds softest), so the dimensions are NO LONGER identical and a single
+        3x3 does not cover the system. `coord=None` returns the stiffest
+        coordinate's block, which is the one that sets stability.
+
+        This used to say "per-dimension identical, so a 3x3 suffices" -- true
+        only while both curvatures were scalar. With `cond_rep=100` the empirical
+        cliff moved from 2.15 to ~0.03 while this function kept returning 2.15,
+        i.e. the ground truth silently stopped describing the game.
         """
         e_t = float(lr)
         e_z = float(lr if lr_level is None else lr_level)
-        c = self.w_rep * self.b ** 2 + self.w_bwd          # theta self-curvature
+        if coord is None:
+            # the stiffest theta-curvature is what binds
+            c_all = self.w_rep * self.S_rep * self.b ** 2 + self.w_bwd * self.S_bwd
+            coord = int(np.argmax(c_all.numpy()))
+        s_rep = float(self.S_rep[coord])
+        s_bwd = float(self.S_bwd[coord])
+        c = self.w_rep * s_rep * self.b ** 2 + self.w_bwd * s_bwd
         return np.array([
-            [1.0 - e_t * c, e_t * self.w_rep * self.b, e_t * self.w_bwd],
+            [1.0 - e_t * c, e_t * self.w_rep * s_rep * self.b, e_t * self.w_bwd * s_bwd],
             [-e_z * self.a, 1.0 - e_z, 0.0],               # anti-phase: note the sign
             [self.kappa, 0.0, 1.0 - self.kappa],
         ])
@@ -607,7 +674,11 @@ class EquilibrationGame(_Game):
         self.mu = state['mu'].clone()
 
     def spectral_radius(self, lr, lr_level=None):
-        return float(np.max(np.abs(np.linalg.eigvals(self.iteration_matrix(lr, lr_level)))))
+        """Max over COORDINATES of the per-coordinate 3x3 spectral radius."""
+        return max(
+            float(np.max(np.abs(np.linalg.eigvals(
+                self.iteration_matrix(lr, lr_level, coord=i)))))
+            for i in range(self.dim))
 
     def stability_lr(self, lo=1e-6, hi=10.0, iters=200, lr_level=None):
         """

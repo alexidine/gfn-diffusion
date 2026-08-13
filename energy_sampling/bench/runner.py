@@ -124,7 +124,12 @@ class Run:
         # ranks them on a coin flip.
         self.trace.append({
             'step': m.step_ind,
-            'lr': m.lr_of('fwd'),
+            # THE OPTIMIZER THIS GAME ACTUALLY STEPS, not a hardcoded 'fwd'.
+            # MLEGame trains 'fwd' so the two coincided; EquilibrationGame trains
+            # 'fused', and recording 'fwd' there reports a SPECTATOR optimizer --
+            # a rate nothing is training with. train.py has the same five-key
+            # dict and the same trap, which is why `train_key` exists.
+            'lr': m.lr_of(game.train_key),
             'loss': loss,
             'eloss': (game.expected_loss() if hasattr(game, 'expected_loss')
                       else None),
