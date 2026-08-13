@@ -157,6 +157,127 @@ class Hyper(Arm):
         self._scale_peak(run, math.exp(beta * cos))
 
 
+class HyperStep(Hyper):
+    """
+    Hypergradient against THE DIRECTION ACTUALLY STEPPED IN, not the raw
+    gradient. A bug fix, not a new heuristic.
+
+    The identity is `dL/d(lr) = -<g_t, d_{t-1}>` where `d` is the update
+    direction, which follows from `theta_t = theta_{t-1} - lr*d_{t-1}`. Under SGD
+    `d = g`, so `cos(g_t, g_{t-1})` is correct and this arm reduces to `hyper`.
+    Under ADAM `d = mhat/(sqrt(vhat)+eps)`, and on an ill-conditioned surface the
+    preconditioner rescales coordinates by wildly different factors -- so `g` and
+    `d` point in materially different directions and the plain arm has been
+    correlating the wrong pair. Baydin et al. derive Adam-HD with exactly this
+    correction.
+
+    `d` is read as the REALISED parameter displacement rather than from optimizer
+    internals, so this is optimizer-agnostic and cannot drift out of sync with
+    what the optimizer actually did.
+    """
+
+    def __init__(self, lr, beta=0.02):
+        super().__init__(lr, beta=beta)
+        self.name = f'hyper step b={beta:g}'
+
+    def reset(self, run):
+        super().reset(run)
+        self._theta_before = None
+        self._last_step = None
+
+    def pre_step(self, run):
+        self._theta_before = torch.cat(
+            [p.detach().reshape(-1).clone() for p in run.game.policy_params])
+
+    def tick(self, run, loss, g_before, batch):
+        after = torch.cat([p.detach().reshape(-1)
+                           for p in run.game.policy_params])
+        step, self._last_step = self._last_step, after - self._theta_before
+        if g_before is None or step is None:
+            return
+        # d = -step/lr, and lr > 0, so cos(g_t, -step) has the sign we want
+        d = -step
+        na, nb = float(g_before.norm()), float(d.norm())
+        if not (na > 0 and nb > 0):
+            return
+        cos = float(torch.dot(g_before, d)) / (na * nb)
+        if not math.isfinite(cos):
+            return
+        beta = self.beta if cos > 0 else self.beta_down
+        self._scale_peak(run, math.exp(beta * cos))
+
+
+class HyperSNR(Arm):
+    """
+    Drive the rate off the GRADIENT SIGNAL-TO-NOISE RATIO, measured by splitting
+    the batch -- the variance side of the tradeoff, which no cross-step statistic
+    can see.
+
+    THE MEASUREMENT. Two independent half-batch gradients at the SAME point:
+        snr = cos(g_A, g_B)  ->  ||gbar||^2 / (||gbar||^2 + sigma^2)
+    Two half-batch backward passes cost about what one full-batch pass costs, so
+    this is nearly free, and -- unlike a loss probe -- it needs NO scalar
+    objective, just two estimates of the same gradient. That is what should let
+    it survive a multi-player game where "did the loss go down" is ill-posed.
+
+    THE SETPOINT IS DERIVED, NOT CHOSEN. At equilibrium in a noise ball the ball
+    radius is `r ~ lr*sigma` and the mean gradient is `||gbar|| ~ lambda*r`, so
+        snr = (lr*lambda)^2 / ((lr*lambda)^2 + 1)
+    i.e. `snr` is a monotone increasing function of `lr*lambda` -- exactly the
+    quantity that sets stability. `lr*lambda = 1` gives **snr = 0.5**, so that is
+    the setpoint, and `snr -> 1` means far too hot while `snr -> 0` means the
+    gradient is buried in noise.
+
+    WHY THIS IS NOT THE THRESHOLD-ON-A-NOISY-STATISTIC DEATH (four arms died of
+    that): the response is PROPORTIONAL to the error, not an asymmetric switch,
+    and the statistic is a PAIRED estimate -- both halves are drawn at the same
+    point, so the common signal cancels out of the comparison rather than having
+    to be averaged out.
+
+    Derived for the SGD quadratic. Under Adam the preconditioner changes the
+    effective lambda, so 0.5 is a hypothesis there, not a derivation.
+    """
+
+    needs_gradient = False
+
+    def __init__(self, lr, beta=0.02, target=0.5, period=1):
+        super().__init__(f'hyper snr t={target:g}')
+        self.lr = float(lr)
+        self.beta = float(beta)
+        self.target = float(target)
+        self.period = int(period)
+
+    def args_overrides(self):
+        return {'lr_policy': self.lr, 'lr_fused': self.lr,
+                'lr_servo_managed': ('lr_policy', 'lr_fused'),
+                'ray_calibration.enabled': False}
+
+    def reset(self, run):
+        self.snr_log = []
+
+    def tick(self, run, loss, g_before, batch):
+        if self.period > 1 and run.m.step_ind % self.period:
+            return
+        game = run.game
+        if not hasattr(game, 'grad_on'):
+            return
+        half = max(1, run.batch // 2)
+        try:
+            ga = game.grad_on(game.draw(half))
+            gb = game.grad_on(game.draw(half))
+        except Exception:
+            return
+        na, nb = float(ga.norm()), float(gb.norm())
+        if not (na > 0 and nb > 0):
+            return
+        snr = float(torch.dot(ga, gb)) / (na * nb)
+        if not math.isfinite(snr):
+            return
+        self.snr_log.append(snr)
+        # snr RISES with lr, so an excess means too hot -> cool.
+        self._scale_peak(run, math.exp(self.beta * (self.target - snr)))
+
+
 class RayRay(Arm):
     """
     The shipping probe in both roles. Verdicts go through the REAL

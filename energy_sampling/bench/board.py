@@ -35,7 +35,8 @@ from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 
-from bench.arms import Fixed, Hyper, Null, RampPlateau, RayRay
+from bench.arms import (Fixed, Hyper, HyperSNR, HyperStep, Null,
+                        RampPlateau, RayRay)
 from bench.metrics import lead_fraction, score_run
 from bench.runner import Run
 from bench.surfaces import MLEGame
@@ -81,7 +82,8 @@ def make_game(optimizer='adam', seed=0, **kw):
 
 
 def build_arms():
-    return [Hyper(SEED_LR), RayRay(SEED_LR), RampPlateau(SEED_LR),
+    return [Hyper(SEED_LR), HyperStep(SEED_LR), HyperSNR(SEED_LR),
+            RayRay(SEED_LR), RampPlateau(SEED_LR),
             Null(SEED_LR)] + [Fixed(x) for x in LADDER]
 
 

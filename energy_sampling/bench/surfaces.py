@@ -118,6 +118,18 @@ class _Game:
     def distance_to_opt(self):
         raise NotImplementedError
 
+    def grad_on(self, batch):
+        """
+        Flat gradient at the CURRENT parameters on `batch`, WITHOUT stepping and
+        without touching `.grad`.
+
+        Exists so a sensor can draw two independent estimates of the same
+        gradient at the same point -- which is the only way to measure the
+        VARIANCE side of the step-size tradeoff. Every cross-step statistic sees
+        alignment only.
+        """
+        raise NotImplementedError
+
     def expected_loss(self):
         """
         The loss with the minibatch noise term set to ZERO -- what the loss would
@@ -287,6 +299,10 @@ class MLEGame(_Game):
     def expected_loss(self):
         with torch.no_grad():
             return float(self._loss(torch.zeros_like(self.theta)))
+
+    def grad_on(self, batch):
+        g, = torch.autograd.grad(self._loss(batch), self.theta)
+        return g.detach().reshape(-1)
 
 
 # ---------------------------------------------------------------------------
