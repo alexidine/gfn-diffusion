@@ -66,9 +66,26 @@ def null_cos(d):
     return math.sqrt(2.0 / (math.pi * max(int(d), 2)))
 
 
-def measure(cell, lr=None, seed=0, seeds=(0, 1, 2)):
+#: The real measurement's window length. Every comparison against it has to use
+#: the same window, for the reason in `measure`'s docstring.
+REAL_WINDOW = 400
+
+
+def measure(cell, lr=None, seed=0, seeds=(0, 1, 2), win=REAL_WINDOW):
     """
-    Median cos at a fixed rate, by quartile of the run.
+    Median cos at a fixed rate, over the whole run AND in windows of `win`.
+
+    THE WINDOWED NUMBERS ARE THE ONES THAT COMPARE TO THE REAL SYSTEM, and the
+    whole-run ones do not. `calibrate_noise` reads 400 consecutive steps of a
+    long run -- a snapshot at one operating point. A bench run sweeps from
+    cos ~ 1.0 (far from the optimum) to cos ~ -0.16 (in the noise ball) in 2000
+    steps, so its whole-run IQR is dominated by that DRIFT, not by per-step
+    scatter.
+
+    Quantitatively: quoting the whole-run IQR made the bench look ~10x noisier
+    per reading than the real system, which is the number that made a higher
+    `hyper_beta` look safe on the real system. Windowing is the like-for-like
+    comparison, and it is the one the beta question rests on.
 
     `lr=None` uses the oracle rate -- the operating point a working controller is
     supposed to find, and the one the crucible scores against.
@@ -98,11 +115,19 @@ def measure(cell, lr=None, seed=0, seeds=(0, 1, 2)):
         return None
     d = int(sum(p.numel() for p in run.game.policy_params))
     q = len(rows) // 4
+    # per-window (median, IQR) -- the like-for-like statistic
+    wins = []
+    for i in range(0, len(rows) - win + 1, win):
+        w = rows[i:i + win]
+        wins.append(dict(at=i,
+                         med=float(np.median(w)),
+                         iqr=float(np.percentile(w, 75) - np.percentile(w, 25))))
     return dict(label=cell[0], lr=float(lr), dim=d, n=len(rows),
                 med=st.median(rows),
                 p25=float(np.percentile(rows, 25)),
                 p75=float(np.percentile(rows, 75)),
-                quartiles=[st.median(rows[i * q:(i + 1) * q]) for i in range(4)])
+                quartiles=[st.median(rows[i * q:(i + 1) * q]) for i in range(4)],
+                windows=wins)
 
 
 def _task(cell):

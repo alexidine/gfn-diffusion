@@ -123,3 +123,36 @@ is gone.
 checkpoint writes` in a single 400-step regime — 8 × `running`, plus
 `phase1_exit`, `prior`, `stage_start` and three buffer saves. I had reasoned the
 diagnostic was writing checkpoints; I had not guessed the rate.
+
+---
+
+## 2026-08-13 -- `python -m bench.beta_ladder 10`
+
+Can hypergradient run faster than beta 0.02? First run scored on the off-target
+metric as well as on time-to-target.
+
+1. **The two metrics should DISAGREE about beta, and that is the point.**
+   `%over` measures how fast you arrive; `off-target` measures whether you sat
+   at a bad rate. Low beta's failure is being stuck COLD, which `%over` only
+   sees when it costs a deadline. So I predict **`%over` is minimised at or near
+   0.02 while `off-target` is minimised higher, around 0.05-0.08.** If both are
+   minimised at the same beta, the new metric is not adding anything and I
+   should say so rather than keep it.
+2. **`too cold` falls monotonically with beta; `too hot` rises monotonically.**
+   These are the two mechanisms, and if either is non-monotone I have the model
+   wrong.
+3. **Divergences per run rise sharply somewhere in 0.15-0.3.** That is the
+   absorbing boundary, and it is why the ladder goes past the estimate rather
+   than stopping at it.
+4. **`eq base` and `eq n1` break at a lower beta than the `mle` cells** -- a
+   second player amplifies an over-fast climber. If the equilibration cells
+   tolerate MORE beta than the bowls, my reasoning about why this is risky is
+   wrong.
+5. The estimate under test is beta ~ 0.08 (4x, from the 4x tighter real
+   signal). Since the bench statistic is ~4x noisier than reality, **whatever
+   beta survives here is a lower bound** on what is safe in production.
+
+**What would make me drop the whole idea:** beta 0.05 already showing elevated
+divergences on the mle cells. That would mean the bench's absorbing boundary
+binds well before the noise argument does, and the gain is not the free lunch it
+looks like.

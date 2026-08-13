@@ -257,6 +257,64 @@ def steps_to_target(run, oracle, window=50, frac=0.25):
     return int(hit[0]) + window if len(hit) else None
 
 
+#: How far from the reference rate still counts as "on target". A factor of 2
+#: each way, because that is the tolerance the whole exercise is stated in: at
+#: worst ~2x the best fixed rate, never 50x.
+ON_TARGET_BAND = 2.0
+
+
+def time_off_target(run, ref_lr, band=ON_TARGET_BAND):
+    """
+    Fraction of STEPS spent outside [ref/band, ref*band] -- split into too-hot
+    and too-cold.
+
+    THE METRIC THE REQUIREMENT IS ACTUALLY WRITTEN IN. `steps_to_target` scores
+    how long a run took to arrive somewhere, which answers "is it fast" and only
+    infers "did it sit at a bad rate for a long time". MK's standing requirement
+    is the second one directly -- a controller you set once and stop thinking
+    about is one that spends almost no time far from the right rate -- and a run
+    can arrive on time having spent half the run badly mis-set.
+
+    Reads the LIVE rate (`base x peak_scale x envelope`), which is what the
+    optimizer actually stepped with, not the configured one.
+
+    Hot and cold are reported apart because their consequences are not
+    symmetric: too hot risks the absorbing boundary, too cold only wastes time.
+    """
+    lrs = [h['lr'] for h in run.history
+           if h.get('lr') is not None and math.isfinite(h['lr'])]
+    if not lrs or not (math.isfinite(ref_lr) and ref_lr > 0):
+        return None
+    lo, hi = ref_lr / band, ref_lr * band
+    hot = sum(1 for x in lrs if x > hi)
+    cold = sum(1 for x in lrs if x < lo)
+    return {'off': (hot + cold) / len(lrs),
+            'hot': hot / len(lrs),
+            'cold': cold / len(lrs),
+            'n': len(lrs)}
+
+
+def longest_off_target(run, ref_lr, band=ON_TARGET_BAND):
+    """
+    Longest UNBROKEN run of steps outside the band, as a fraction of the run.
+
+    "Not stuck for long periods" is about the longest excursion, not the total:
+    500 scattered bad steps and 500 consecutive ones are the same number under
+    `time_off_target` and very different failures. A controller that oscillates
+    across the band is annoying; one that parks outside it is broken.
+    """
+    lrs = [h['lr'] for h in run.history
+           if h.get('lr') is not None and math.isfinite(h['lr'])]
+    if not lrs or not (math.isfinite(ref_lr) and ref_lr > 0):
+        return None
+    lo, hi = ref_lr / band, ref_lr * band
+    worst = cur = 0
+    for x in lrs:
+        cur = cur + 1 if (x > hi or x < lo) else 0
+        worst = max(worst, cur)
+    return worst / len(lrs)
+
+
 def score(run, oracle, tol=RECOVERY_TOL):
     final = final_distance([run])
     return {
