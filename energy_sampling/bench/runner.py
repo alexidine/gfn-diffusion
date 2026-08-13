@@ -113,10 +113,18 @@ class Run:
 
         self.arm.tick(self, loss=loss, g_before=g_before, batch=batch)
 
+        # TWO LOSSES, DELIBERATELY. `loss` is the noisy training loss -- what the
+        # controller sees and acts on, as in production. `eloss` is the same loss
+        # with the minibatch noise term zeroed: the quality of the parameters,
+        # which is what the SCORING uses. Near the optimum the noise term is all
+        # that is left of `loss` and its sign is random, so ranking arms on it
+        # ranks them on a coin flip.
         self.trace.append({
             'step': m.step_ind,
             'lr': m.lr_of('fwd'),
             'loss': loss,
+            'eloss': (game.expected_loss() if hasattr(game, 'expected_loss')
+                      else None),
             'grad_norm': grad_norm,
             'dist': game.distance_to_opt() if hasattr(game, 'distance_to_opt')
                     else None,

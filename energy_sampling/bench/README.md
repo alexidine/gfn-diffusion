@@ -85,25 +85,62 @@ so it writes `peak_scale` through the same actuator and bounds, but its update
 law is bench code. The old harness claimed all arms shared an update law; they
 do not, and pretending otherwise made the comparison look tighter than it was.
 
-## First result (2026-08-13, MLE game, Adam, 8 seeds)
+## Result (2026-08-13, MLE game, Adam, 8 seeds, 12000 steps)
 
 ```
-arm                   final    lead   lr sd  max jump  backslide  div
-fixed@0.03             1.00  56.1%   0.000     0.000       0.0%     0
-hyper b=0.02           1.05   4.3%   4.029     0.043       0.0%     0
-fixed@0.01             1.82   2.7%   0.000     0.000       0.0%     0
-fixed@0.1              4.50  36.8%   0.000     0.000       1.7%     0
-ray+ray            712284.58   0.0%   2.319     0.543       0.0%     0
-ramp+plateau       712309.92   0.0%   2.319     0.543       0.0%     0
-null (no sensor)  5341861.49   0.0%   0.748     0.023       0.0%     0
+arm                 nats behind    lead  lr/best   backslide  div
+ray+ray                    0.00  74.7%     0.48      16.3%     0
+fixed@0.001                0.92   1.0%     1.00       0.0%     0
+fixed@0.003                1.95   1.7%     3.00       3.7%     0
+fixed@0.01                 3.20   5.2%    10.00      13.4%     0
+fixed@0.03                 4.21  10.0%    30.00      16.0%     0
+hyper b=0.02               4.87   1.2%    89.09      12.7%     0
+fixed@0.1                  5.35   6.1%   100.00      15.8%     0
+ramp+plateau               5.98   0.0%   250.00      11.9%     0
+null (no sensor)          17.33   0.0%     0.12       0.0%     0
 ```
 
-Hyper lands within **5%** of the best fixed rate from a cold start 240x below it,
-which is the stated goal met on the simplest case. `ray+ray` and `ramp+plateau`
-are indistinguishable because the probe **saturated on 19 of 19 readings**
-(`above_range`), and the servo's saturation fallback is the blind ramp's own
-multiplier — so on this surface the probe *is* the ramp. That reproduces the
-anisotropy-blindness result from the old work in one line.
+**`ray+ray` beats the entire fixed ladder** — first time any controller here has
+won rather than tied. It climbs to ~0.09 by step 2200, then decays to ~1e-3 by
+5000 and tracks the optimum from there: an approximate decay schedule, which is
+the right shape for this surface. `max jump 0.693` = ln 2, a deliberate 2x cut
+from a resolved reading, with **zero divergences** — the probe braking, not a
+tripwire.
+
+**`hyper` ends 89x too hot and loses to four fixed rates.** It finds a rate that
+is right early and never comes back down as the optimum decays. Bounded and
+proportional means it cannot make a large correction, and near the noise floor
+its cooling signal is weak.
+
+Only the `lr/best` column shows this — `nats behind` alone cannot, because the
+surface is flat above the optimum under Adam.
+
+### Why the horizon changed the answer
+
+At **2000** steps this board said the opposite: hyper 1.05x and a tie for first,
+`ray+ray` 712285x behind. That run was measuring a race, not control:
+
+- `warmup_steps = 1000` is half of it, and fixed arms get no warmup at all;
+- an Adam run converges to its noise floor here in ~600 steps, so everyone who
+  arrived tied and everyone who did not lost by a meaningless multiple;
+- the ceiling for a controller was a TIE with the best fixed rate.
+
+At **12000** steps the best fixed rate walks `0.03 → 0.01 → 0.003 → 0.001` — it
+**decays ~30x** — so no fixed rate is right throughout and tracking can win. The
+decay is the noise ball, NOT the quartic: identical at `quartic=0` and `0.01`,
+one notch hotter early at `0.1`. `surfaces.py`'s claim that the quartic makes
+`alpha*` RISE along the path is not what dominates.
+
+### Score on the noise-free loss
+
+`MLEGame`'s training loss is `½θᵀHθ + cΣθ⁴ + noise·θ`. As θ→0 the first terms
+vanish and the loss becomes **the noise draw alone, sign and all** — so scoring
+on it near the optimum ranks arms on a coin flip. `expected_loss()` zeroes the
+noise term; the controller still acts on the noisy loss, as in production.
+
+Checked: the ranking is unchanged under both (ray+ray first either way), so the
+win is not an artifact of the loss definition. What moved is `backslide` — 0.7%
+→ 16.3% for ray+ray — because the noisy loss was masking genuine uphill drift.
 
 ### The SGD control, and why the optimizer was worth rebuilding for
 

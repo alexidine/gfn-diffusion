@@ -118,6 +118,23 @@ class _Game:
     def distance_to_opt(self):
         raise NotImplementedError
 
+    def expected_loss(self):
+        """
+        The loss with the minibatch noise term set to ZERO -- what the loss would
+        be at an infinite batch, i.e. the quality of the parameters themselves.
+
+        SCORE ON THIS, NOT ON THE TRAINING LOSS. The training loss carries a
+        `noise_vec . theta` term whose sign is random, so as theta -> 0 it stops
+        measuring the parameters and becomes the noise draw: near the optimum the
+        series crosses zero constantly and a median over a window ranks arms by
+        where that random term happened to land. Measured, this made the best arm
+        on the board an arm whose loss trace was oscillating across zero.
+
+        The CONTROLLER still sees the noisy loss, as in production. Only the
+        scoring uses this.
+        """
+        raise NotImplementedError
+
     def diverged(self):
         d = self.distance_to_opt()
         return (not math.isfinite(d)) or d > 1e6
@@ -266,6 +283,10 @@ class MLEGame(_Game):
 
     def distance_to_opt(self):
         return float(self.theta.detach().norm())
+
+    def expected_loss(self):
+        with torch.no_grad():
+            return float(self._loss(torch.zeros_like(self.theta)))
 
 
 # ---------------------------------------------------------------------------

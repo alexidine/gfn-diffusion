@@ -34,7 +34,18 @@ FINAL_WINDOW = 100
 EMA_PERIOD = 25.0
 
 
+#: WHICH LOSS THE SCORING READS. `eloss` is the noise-free expected loss; `loss`
+#: is the noisy training loss the controller acts on. Scoring on `loss` ranks
+#: arms by a random sign near the optimum -- see `_Game.expected_loss`. Falls
+#: back to `loss` for games that do not expose the clean one.
+SCORE_KEY = 'eloss'
+
+
 def _series(run, key):
+    if key == 'loss':
+        vals = [h.get(SCORE_KEY) for h in run.trace]
+        if any(v is not None for v in vals):
+            return vals
     return [h.get(key) for h in run.trace]
 
 
@@ -183,11 +194,27 @@ def catastrophes(run):
                                    if x is None or not math.isfinite(x))}
 
 
+def final_lr(run, window=FINAL_WINDOW):
+    """
+    The rate the run ENDED at (median of the last `window` steps).
+
+    Separate from `final_loss` because they answer different questions and can
+    disagree loudly: measured, `hyper` ended ~8x above the best fixed rate and
+    still matched its final loss, because the surface is flat above the optimum
+    under Adam. "Got a good loss" is not "found the right rate", and only this
+    column shows the second.
+    """
+    tail = [h.get('lr') for h in run.trace[-int(window):]]
+    tail = [x for x in tail if x is not None and math.isfinite(x) and x > 0]
+    return float(np.median(tail)) if tail else math.nan
+
+
 def score_run(run):
     """Every per-run metric. `lead_fraction` is per-GROUP and added by the caller."""
     st = lr_stability(run)
     return {'arm': run.arm.name, 'seed': run.seed,
             'final_loss': final_loss(run),
+            'final_lr': final_lr(run),
             'lr_sd': st['sd'], 'lr_max_jump': st['max_jump'],
             'lr_span': st['span'],
             'backslide': backslide(run),
