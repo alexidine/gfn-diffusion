@@ -71,8 +71,39 @@ GRID = [
 #: pointed at a mutable `_running.pt`. The number is a real measurement of a
 #: real fused window; only the regime LABEL was unstable. A post-fix eq_descent
 #: window does not exist on disk yet.
-REAL = dict(label='REAL fused (4 windows)', med=0.2895, p25=0.24, p75=0.35,
-            dim=6_163_969)
+#: COMPUTED FROM THE FILE, NOT TRANSCRIBED. The hardcoded quartiles were
+#: p25=0.24 / p75=0.35 (width 0.11), inherited from an earlier session's
+#: write-up. They match no window and no quartile of any artifact on disk: the
+#: cited file gives p25=0.1998 / p75=0.3859, width **0.186 -- 1.69x wider**. The
+#: median (0.2901) was correct, which is what let the error survive.
+#:
+#: Everything that leaned on 0.11 shifts: "the real signal is 4x tighter than
+#: the bench" becomes ~2.4x, and the `bwd` comparison "13x wider" becomes 7.6x.
+#:
+#: AND THE IQR IS NOT THE CONTROLLER'S SNR. `med/null` is a LOCATION null --
+#: E|cos| for independent isotropic vectors. It says the median is not zero; it
+#: says nothing about one reading. The number a controller consuming one cos per
+#: step actually sees is median/sd = 0.2901/0.1466 = **1.98**, not 903.
+def _real_from_disk(path='noise_calib_eq_descent.json'):
+    import os
+    p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     path)
+    if not os.path.exists(p):
+        return None
+    import json
+    with open(p) as f:
+        c = [x['cos'] for x in json.load(f)]
+    if not c:
+        return None
+    a = np.asarray(c, dtype=float)
+    return dict(label='REAL fused (from disk)', med=float(np.median(a)),
+                p25=float(np.percentile(a, 25)), p75=float(np.percentile(a, 75)),
+                sd=float(a.std()), n=len(a), dim=6_163_969)
+
+
+REAL = _real_from_disk() or dict(
+    label='REAL fused (file missing)', med=0.2901, p25=0.1998, p75=0.3859,
+    sd=0.1466, n=399, dim=6_163_969)
 
 
 def null_cos(d):
@@ -179,9 +210,12 @@ def grid(workers=6):
     iqr = f'{REAL["p25"]:.3f}-{REAL["p75"]:.3f}'
     print(f'\n  {REAL["label"]:<16} {"--":>9} {REAL["dim"]:>8,} {REAL["med"]:>8.4f} '
           f'{iqr:>15} {nl:>8.4f} {REAL["med"] / nl:>7.1f}')
-    print('\n  READ THE PAIR, NOT THE MEDIAN. A cell matching 0.29 at d=32 is 2.1x\n'
-          '  the null; the real system is ~900x it. Same median, different\n'
-          '  measurement problem.')
+    sd = REAL.get('sd')
+    if sd:
+        print(f'\n  x null is a LOCATION null (E|cos| for independent vectors). It says '
+              f'the median\n  is not zero -- it says NOTHING about one reading. Per-decision '
+              f'SNR, which is\n  what a controller consuming one cos per step sees:  '
+              f'median/sd = {REAL["med"] / sd:.2f}')
     return rows
 
 
