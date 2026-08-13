@@ -11,12 +11,21 @@ the multi-player game:
   SHIFTS     how much, and in which direction, the optimal rate moves during the
              run.
 
-WHY A SHIFT UPWARD MATTERS. Every result so far is on a surface whose optimal
-rate DECAYS (~30x, the noise ball forming). A controller that simply cools
-monotonically looks perfect there and would be indistinguishable from a good one.
-The `regime` cell softens the curvature 8x mid-run, so the optimal rate jumps
-UP -- which a monotone cooler cannot follow, and which is the case MK's
-requirement (2) actually describes.
+THE `regime /8` CELL DOES NOT DO WHAT THIS DOCSTRING FIRST CLAIMED. It said
+softening the curvature 8x makes the optimal rate jump UP, so the cell would test
+a direction nothing else did. Measured, it does not: after the shift
+`fixed@0.003` still beats `fixed@0.01` (1.48 vs 2.48 nats), and in the traces
+`ray+ray` responds by ramping UP and its loss RISES while `hyper step` continues
+DOWN and wins. Softening moves you closer to converged, and the noise-ball term
+that sets the optimum keeps falling. This is the same mistake made about the
+quartic term earlier: reasoning about curvature and ignoring the noise ball,
+which dominates on this family.
+
+So the cell is still useful -- it is an abrupt mid-run change and it discriminates
+strongly (2.38 nats between the top two arms) -- but it is NOT a test of tracking
+an optimum that moves upward. That direction remains untested; it likely needs an
+optimum that MOVES rather than a curvature that changes, so the run never
+converges and the rate must stay up.
 
     python -m bench.suite            # all cells, adam
     python -m bench.suite 5 sgd
