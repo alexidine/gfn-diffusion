@@ -14,7 +14,8 @@ import math
 
 import pytest
 
-from bench.arms import Fixed, Hyper, Null, RampPlateau, RayRay
+from bench.arms import (Fixed, Hyper, HyperSNR, HyperStep, Null, RampPlateau,
+                        RayRay)
 from bench.board import SEED_LR, make_game
 from bench.runner import Run
 
@@ -108,6 +109,39 @@ def test_ray_is_distinguishable_from_null():
     ray = _run(RayRay, steps=1400)
     null = _run(Null, steps=1400)
     assert _lrs(ray)[-1] != pytest.approx(_lrs(null)[-1], rel=1e-6)
+
+
+# ------------------------------------------------- hyper step (the operand)
+
+def test_hyper_step_is_identical_to_hyper_under_sgd():
+    """
+    THE FALSIFIABLE CHECK ON THE OPERAND FIX. `hyper step` correlates the
+    gradient against the direction actually stepped in; `hyper` correlates it
+    against the previous gradient. Under plain SGD (no momentum, `_mk_opt`) the
+    step IS -lr*g, so the two are the same statistic and the arms must trace
+    IDENTICAL rates.
+
+    If they differ here, the fix is doing something other than changing the
+    operand, and its large Adam improvement (4.87 -> 1.04 nats) is not evidence
+    about Adam preconditioning.
+    """
+    a = _run(Hyper, steps=900, optimizer='sgd')
+    b = _run(HyperStep, steps=900, optimizer='sgd')
+    la, lb = _lrs(a), _lrs(b)
+    assert len(la) == len(lb)
+    worst = max(abs(math.log(x) - math.log(y)) for x, y in zip(la, lb))
+    assert worst < 1e-9, (
+        f'under SGD the two operands are the same vector, but the rates differ '
+        f'by up to {worst:.3g} in log space -- the fix is not (only) changing '
+        f'the operand')
+
+
+def test_hyper_step_differs_from_hyper_under_adam():
+    """...and under Adam they MUST differ, or the preconditioner is not being
+    picked up and the arm is a no-op rename."""
+    a = _run(Hyper, steps=1400, optimizer='adam')
+    b = _run(HyperStep, steps=1400, optimizer='adam')
+    assert _lrs(a)[-1] != pytest.approx(_lrs(b)[-1], rel=1e-6)
 
 
 # --------------------------------------------------------- ramp + plateau
