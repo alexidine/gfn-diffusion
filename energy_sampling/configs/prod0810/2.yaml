@@ -7,7 +7,7 @@ anomaly_detection: false
 continue_from_checkpoint: false
 mlip_path: null
 checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/
-checkpoint_name: prod0810_nehzor_elj_elj-nehzor_sg14_zp1_elj_prior_dataset-T2.5-255bf7_phase1_exit.pt
+checkpoint_name: null
 prior_model_name: null
 load_weights_only: false
 prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/nehzor_sg14_zp1_elj_prior_dataset.pt

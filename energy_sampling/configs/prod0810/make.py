@@ -131,10 +131,14 @@ def prior(mol, sg, zp, efunc):
 # on, so the resumed run pulls an eval to its first step and re-fires the train_prior
 # exit gate through the normal path. Weights-only would restart at step 0 in train_prior
 # and throw away the thing we are trying to skip.
+#
+# Only triclinic arms can warm-start off a v1 snapshot. A v1 phase1_exit.pt carries no
+# `dead_latent_rows`, so it matches the () that sg-1/sg-2 resolve to but NOT the (3, 5)
+# of a monoclinic cell -- dead rows fix expanded_dim, so checkpointing refuses the load
+# (decisions.md D33). nehzor_elj (sg 14) therefore re-runs train_prior from scratch.
 WARM_STARTS = {
     'mipcas_elj': 'prod0810_mipcas_elj_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-2df5a5_phase1_exit.pt',
     'mipcas_uma': 'prod0810_mipcas_uma_uma-mipcas_sg2_zp1_uma_prior_dataset-T2.5-a29ef0_phase1_exit.pt',
-    'nehzor_elj': 'prod0810_nehzor_elj_elj-nehzor_sg14_zp1_elj_prior_dataset-T2.5-255bf7_phase1_exit.pt',
 }
 
 
