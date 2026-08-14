@@ -494,7 +494,8 @@ class EquilibrationGame(_Game):
     def __init__(self, dim=8, a=2.0, b=1.0, w_rep=0.7, w_bwd=0.3, kappa=0.02,
                  noise=0.1, lr=0.05, optimizer='sgd', init_scale=1.0,
                  probe_scores='replay', seed=0, device='cpu',
-                 cond_rep=1.0, cond_bwd=1.0):
+                 cond_rep=1.0, cond_bwd=1.0, quartic=0.0, schedule=None,
+                 shock=None, drift=0.0, drift_pull=0.01, grad_clip=None):
         g = torch.Generator(device='cpu').manual_seed(seed)
         self.device = device
         self.dim = dim
@@ -504,6 +505,109 @@ class EquilibrationGame(_Game):
         self.noise = float(noise)
         self.probe_scores = probe_scores
         self._gen = g
+
+        # NOISE IS A PURE GAIN ON THIS GAME UNLESS `quartic` IS SET, and that is
+        # a property of the surface, not of any metric. Everything here is
+        # linear and the fixed point is the origin, so the state splits as
+        # `deterministic(t) + noise * stochastic(t)`; once the transient has
+        # decayed the whole trajectory is proportional to `noise`. Gradients
+        # scale with it too, so every SCALE-FREE controller (a cosine, a ratio
+        # test, a plateau comparison -- i.e. all of them) is EXACTLY blind to
+        # it. Measured: 10x noise moved the settled distance by 100.0x for
+        # every arm and left hyper's chosen rate bit-identical at 0.01984.
+        #
+        # So a `noise` sweep on the linear game cannot separate arms, and the
+        # fix is not a different metric. `quartic` adds `c*sum(theta^4)` to the
+        # replay branch, making curvature grow with |theta|: a larger noise ball
+        # then sits in a STIFFER region and the usable rate genuinely depends on
+        # the noise level. That is a real noise-robustness test; the linear one
+        # was a tautology.
+        self.quartic = float(quartic)
+
+        #: (step, {param: value}) changes applied by `advance`, for cells that
+        #: pose a TRACKING problem -- the cliff moving mid-run rather than a
+        #: single boundary to find once. Only `cond_rep` is honoured.
+        self.schedule = tuple(schedule or ())
+        #: ((step, magnitude), ...): kicks to theta. The blow-up cell, and the
+        #: only way to exercise the rewind. A SEQUENCE rather than one event
+        #: because, measured, a single shock is FREE once the rewind works --
+        #: the restore erases it and cold and hot rates end bit-identically. What
+        #: discriminates is the peak cut each divergence leaves behind and how
+        #: fast an arm climbs back, which needs repeated hits to show.
+        if shock and not isinstance(shock[0], (tuple, list)):
+            shock = (shock,)
+        self.shocks = tuple(tuple(s) for s in (shock or ()))
+        self._step = 0
+
+        # THE TARGET MOVES, and this repairs the defect that made the static
+        # version unable to rank anything.
+        #
+        # MEASURED, six configurations of the static game: a NARROW rate band
+        # and a SETTLED run are mutually exclusive. Once the run converges the
+        # outcome is the noise floor, which depends on the rate only as
+        # ~sqrt(lr), so the band of rates within 2x of best is 30x wide -- every
+        # controller lands inside it and ties. Tighten the budget or drop the
+        # noise and the band narrows to 3x, but then the run is still descending
+        # at the horizon and what gets ranked is convergence SPEED, which moves
+        # with the budget. Same wall every time, because a problem decaying to a
+        # STATIC point cannot have a sharp placement signal at equilibrium.
+        #
+        # A DRIFTING TARGET BREAKS THE TIE: too cold lags by ~drift/lr, too hot
+        # sits in a noise ball of ~lr*sigma, and NEITHER decays. That is a
+        # stationary tracking problem with a sharp interior optimum -- and it is
+        # the honest picture of equilibration, where the buffer refreshes and
+        # the level moves so the target never stops moving.
+        #
+        # THE BRANCHES STILL SHARE A FIXED POINT, which MK verified on the real
+        # system. Replay wants `b*theta - zeta = c`, flow wants `zeta = -a*theta`,
+        # bwd wants `theta = mu`; together `theta* = c/(a+b)`, `zeta* = -a*theta*`,
+        # `mu* = theta*`. They agree on WHERE -- the where just moves.
+        # THE GLOBAL GRADIENT-NORM CLIP, WHICH IN PRODUCTION BINDS ALMOST
+        # ALWAYS -- and changes what a learning rate even means.
+        #
+        # Measured on the real system: `gradient_norm_clip: auto` resolves to
+        # 37.88 at T=10/W=512 against a median pre-clip gradient norm of ~1.0e3.
+        # The clip sits ~26x BELOW the median, so it is active on essentially
+        # every step, and train.py:2868-2870 states the consequence outright --
+        # "Adam is effectively running on normalized gradients".
+        #
+        # WHY THIS MATTERS MORE THAN ANY CELL ON THE BOARD. Once the clip binds,
+        # the update magnitude is set by the LEARNING RATE ALONE and is decoupled
+        # from the curvature. Every arm here is built on `step ~ lr * gradient`:
+        # the hypergradient correlates a gradient with a realised displacement,
+        # and the ray probe reads curvature along its own step. A permanently
+        # binding clip removes the quantity both of them are measuring. A bench
+        # without it recommends controllers for a regime production never enters.
+        #
+        # None = off, which is what every cell shipped with.
+        self.grad_clip = None if grad_clip is None else float(grad_clip)
+        #: counted, because a clip that never binds is a silently absent
+        #: mechanism and a clip that always binds is a different problem --
+        #: neither is visible from the outcome alone
+        self.clip_hits = 0
+        self.clip_steps = 0
+
+        self.drift = float(drift)
+        #: OU mean-reversion rate; 1/drift_pull is the target's
+        #: correlation time in steps.
+        self.drift_pull = float(drift_pull)
+        self.c = torch.zeros(dim)
+        #: ITS OWN GENERATOR, AND DELIBERATELY NOT SEEDED BY `seed`.
+        #:
+        #: Two reasons, one of which cost a factor of 8 in seed noise. First, the
+        #: shock reuses the NOISE generator, which breaks paired seeds between a
+        #: shocked cell and an unshocked one; the drift must not repeat that.
+        #: Second and larger: a per-seed target path is a second, macroscopic
+        #: noise source. Measured with `manual_seed(seed + 90001)`, the seed
+        #: noise rose from 0.054 to 0.413 nats as the drift grew -- the target
+        #: trajectory itself was most of the variance, and it swamped the sharper
+        #: signal the drift was added to buy.
+        #:
+        #: A COMMON path is the same argument as common random numbers for the
+        #: gradient noise: every arm and every seed tracks the SAME moving
+        #: target, so a difference between arms is the arm. The path is still
+        #: unpredictable to a controller -- it just is not re-rolled per seed.
+        self._drift_gen = torch.Generator(device='cpu').manual_seed(90001)
 
         # COMPETING BRANCHES NEED DIFFERENT GEOMETRY, or they do not compete.
         #
@@ -536,8 +640,7 @@ class EquilibrationGame(_Game):
         # caricature would give bwd a strict subspace rather than an opposed
         # spectrum; the coordinates only the forward branch touches would then be
         # unconstrained by bwd and soft in the combined problem. Not modelled.)
-        self.S_rep = torch.logspace(0, math.log10(max(cond_rep, 1.0)),
-                                    dim, dtype=torch.float64).float()
+        self.set_conflict(cond_rep)
         self.S_bwd = torch.logspace(math.log10(max(cond_bwd, 1.0)), 0,
                                     dim, dtype=torch.float64).float()
         t0 = torch.randn(dim, generator=g) * init_scale
@@ -548,6 +651,48 @@ class EquilibrationGame(_Game):
         self.optimizers = _full_optimizer_set(
             optimizer, [self.theta], [self.zeta], {'policy': lr, 'flow': lr})
         self.policy_params = [self.theta]
+
+    def set_conflict(self, cond_rep):
+        """(Re)build the replay spectrum. Separate so `advance` can move it."""
+        self.cond_rep = float(cond_rep)
+        self.S_rep = torch.logspace(0, math.log10(max(self.cond_rep, 1.0)),
+                                    self.dim, dtype=torch.float64).float()
+
+    def advance(self):
+        """
+        Move the surface: scheduled regime changes, then the one-off shock.
+
+        The battery's other cells all pose the same shape of problem -- a single
+        boundary, fixed for the whole run, approached from below. A controller
+        whose natural trajectory is "ramp up and settle" fits that for free, so
+        the cells cannot distinguish tracking from a lucky shape. These two
+        knobs are what make the surface capable of saying otherwise.
+        """
+        self._step += 1
+        if self.drift:
+            # ORNSTEIN-UHLENBECK, not a random walk and not a ramp.
+            #   ramp: a single direction, which a controller could in principle
+            #         learn, so it would not measure rate placement;
+            #   walk: displacement grows as sqrt(t), so the tracking error rises
+            #         through the run -- measured, the last fifth came back 1.7x
+            #         worse than the fifth before it, and the final score then
+            #         depends on where one realisation of the walk happened to
+            #         end rather than on the arm;
+            #   OU:   wanders unpredictably but is mean-reverting, so the
+            #         tracking problem is STATIONARY and the score is a genuine
+            #         time-average. `drift_pull` sets the correlation time.
+            self.c = ((1.0 - self.drift_pull) * self.c
+                      + torch.randn(self.dim, generator=self._drift_gen)
+                      * self.drift)
+        for at, changes in self.schedule:
+            if self._step == int(at):
+                if 'cond_rep' in changes:
+                    self.set_conflict(changes['cond_rep'])
+        for at, mag in self.shocks:
+            if self._step == int(at):
+                with torch.no_grad():
+                    self.theta.add_(torch.randn(self.dim, generator=self._gen)
+                                    * float(mag))
 
     # ---- data
 
@@ -560,8 +705,11 @@ class EquilibrationGame(_Game):
     # ---- objectives, one per player
 
     def _replay_loss(self, n_theta):
-        r = self.b * self.theta - self.zeta.detach()
-        return 0.5 * (self.S_rep * r * r).sum() + (n_theta * self.theta).sum()
+        r = self.b * self.theta - self.zeta.detach() - self.c
+        out = 0.5 * (self.S_rep * r * r).sum() + (n_theta * self.theta).sum()
+        if self.quartic:
+            out = out + self.quartic * (self.theta ** 4).sum()
+        return out
 
     def _bwd_loss(self):
         d = self.theta - self.mu
@@ -586,6 +734,16 @@ class EquilibrationGame(_Game):
         (g_zeta,) = torch.autograd.grad(flow_loss, [self.zeta])
         self.theta.grad, self.zeta.grad = g_theta, g_zeta
 
+        if self.grad_clip is not None:
+            # train.py clips the POLICY gradient globally, before the optimizer
+            # step and after the backward -- the level head is its own group at
+            # its own rate and is not part of that norm.
+            self.clip_steps += 1
+            n = float(self.theta.grad.norm())
+            if n > self.grad_clip:
+                self.clip_hits += 1
+                self.theta.grad.mul_(self.grad_clip / n)
+
         theta_before = self.theta.detach().clone()
         opt.step()
         # buffer admits the sample that was just produced
@@ -609,9 +767,11 @@ class EquilibrationGame(_Game):
         draw, sign and all, so arms get ranked on a coin flip.
         """
         with torch.no_grad():
-            r = self.b * self.theta - self.zeta
+            r = self.b * self.theta - self.zeta - self.c
             d = self.theta - self.mu
             rep = 0.5 * (self.S_rep * r * r).sum()
+            if self.quartic:
+                rep = rep + self.quartic * (self.theta ** 4).sum()
             bwd = 0.5 * (self.S_bwd * d * d).sum()
             flw = 0.5 * ((self.zeta + self.a * self.theta) ** 2).sum()
             return float(self.w_rep * rep + self.w_bwd * bwd + flw)
@@ -671,13 +831,24 @@ class EquilibrationGame(_Game):
         """
         e_t = float(lr)
         e_z = float(lr if lr_level is None else lr_level)
+        # THE QUARTIC MAKES THE CLIFF STATE-DEPENDENT, and this evaluates it
+        # where the system actually IS. d2/dtheta2 of c*theta^4 is 12*c*theta^2,
+        # zero at the origin and growing with the noise ball -- so a linear-only
+        # boundary would be an upper bound that gets looser exactly as the noise
+        # rises, which is the effect the cell exists to measure. Zero for every
+        # linear cell, so those are unchanged bit-for-bit.
+        quart = (12.0 * self.quartic
+                 * (self.theta.detach() ** 2)) if self.quartic else None
+        c_all = self.w_rep * self.S_rep * self.b ** 2 + self.w_bwd * self.S_bwd
+        if quart is not None:
+            c_all = c_all + self.w_rep * quart
         if coord is None:
             # the stiffest theta-curvature is what binds
-            c_all = self.w_rep * self.S_rep * self.b ** 2 + self.w_bwd * self.S_bwd
-            coord = int(np.argmax(c_all.numpy()))
+            coord = int(np.argmax(c_all.detach().numpy() if quart is not None
+                                  else c_all.numpy()))
         s_rep = float(self.S_rep[coord])
         s_bwd = float(self.S_bwd[coord])
-        c = self.w_rep * s_rep * self.b ** 2 + self.w_bwd * s_bwd
+        c = float(c_all[coord])
         return np.array([
             [1.0 - e_t * c, e_t * self.w_rep * s_rep * self.b, e_t * self.w_bwd * s_bwd],
             [-e_z * self.a, 1.0 - e_z, 0.0],               # anti-phase: note the sign
@@ -722,15 +893,155 @@ class EquilibrationGame(_Game):
                 hi = mid
         return lo
 
-    def one_step_lr(self):
+    def one_step_lr(self, batch=None):
         """
         LR at which a frozen-target ray probe reads alpha* = 1 -- the rate the
         sensor would drive to if alpha_target were 1. Compare with stability_lr().
+
+        MEASURED ALONG THE GRADIENT, not from a scalar formula. A ray probe steps
+        along `d = -lr*g` and so feels the RAYLEIGH QUOTIENT `g'Cg / g'g`, not
+        `w_rep*b^2 + w_bwd`.
+
+        The old scalar form ignored `S_rep` and `S_bwd` entirely and returned
+        exactly 1.0 for every cell on the board, including cells whose true value
+        moves 10x. Two independent reviews measured the error at ~40x, in the
+        direction that MANUFACTURES this file's headline claim: the docstring
+        says a probe targeting alpha* = 1 "diverges by construction", when the
+        measured value is a median of 0.85x the cliff -- essentially AT the
+        boundary, not 31x over it. It is the same defect `iteration_matrix` was
+        repaired for, in the sibling function, left in place.
+
+        Any claim about `alpha_target` being 4 rather than 1 that was checked
+        against the old number is unsupported.
         """
-        return 1.0 / (self.w_rep * self.b ** 2 + self.w_bwd)
+        with torch.no_grad():
+            c = self.w_rep * self.S_rep * self.b ** 2 + self.w_bwd * self.S_bwd
+            if self.quartic:
+                c = c + self.w_rep * 12.0 * self.quartic * self.theta.detach() ** 2
+            g = self.theta.grad
+            if g is None or not float(g.norm()) > 0:
+                # no realised step yet: fall back to the stiffest direction,
+                # which is the bound the probe would feel in the worst case
+                return float(1.0 / c.max())
+            g = g.detach()
+            return float((g * g).sum() / (c * g * g).sum())
 
     def distance_to_opt(self):
         return float(self.theta.detach().norm())
 
 
 GAMES = {'mle': MLEGame, 'var_cond': VarCondGame, 'equilibration': EquilibrationGame}
+
+
+# ---------------------------------------------------------------------------
+# 4. tracking -- the minimal surface an LR controller can be tested on
+# ---------------------------------------------------------------------------
+
+class TrackingGame(_Game):
+    """
+    theta chases a target that keeps moving. Adam, gradient noise, nothing else.
+
+    THIS IS THE FOUNDATION, and it is deliberately the simplest thing that poses
+    a real learning-rate question:
+
+        too slow  ->  lag ~ v/lr        cannot keep up with the target
+        too fast  ->  jitter ~ lr*sigma noise amplified into the parameters
+
+    so there is a sharp interior optimum at lr ~ sqrt(v*sigma), and -- the
+    property that makes it a TEST rather than a bowl -- THE OPTIMUM MOVES WITH
+    THE TARGET SPEED. Measured: speed 1e-3 -> best rate 1e-3, speed 1e-2 -> best
+    rate 1e-2. A controller that genuinely tracks has to follow that 10x shift;
+    one that happens to land in a good place does not.
+
+    WHY THIS AND NOT THE EQUILIBRATION GAME. That game accumulated a mass term,
+    a flat direction, a ratcheting anchor, a support split and a gradient clip,
+    each traceable to a real review finding, and its rate response went FLAT --
+    0.04 nats across a 100x span. This gives 2.3 nats and a 10x band. Every
+    mechanism from the richer surface now has to earn its way back by changing a
+    controller's RANKING, not by being more faithful in the abstract.
+
+    THE TARGET PATH IS COMMON ACROSS SEEDS, exactly like the gradient noise: a
+    per-seed path is a second macroscopic noise source and was measured to raise
+    seed noise 8x on the surface it was first tried on.
+    """
+
+    name = 'tracking'
+    train_key = 'fwd'
+
+    #: A LONG TIME-AVERAGE, because this surface is STATIONARY. The default
+    #: 100-step window is sized for a converging surface where the level is still
+    #: moving; here the quantity being estimated is fixed, so averaging longer is
+    #: strictly better. Measured: seed noise 0.176 -> 0.040 nats going from a
+    #: 100- to a 1000-step window, which is the difference between adjacent
+    #: rungs 1.8 sigma apart and 10.2.
+    score_window = 2000
+
+    def __init__(self, dim=32, speed=1e-3, noise=0.1, lr=1e-3, optimizer='adam',
+                 seed=0, device='cpu', cond=1.0):
+        self.device, self.dim = device, int(dim)
+        self.speed, self.noise = float(speed), float(noise)
+        self._gen = torch.Generator(device='cpu').manual_seed(seed)
+        #: COMMON path, not seeded by `seed`
+        self._tgen = torch.Generator(device='cpu').manual_seed(12345)
+
+        #: optional ill-conditioning. 1.0 = isotropic, which is the default
+        #: because the base construction should be checked before anything is
+        #: layered on it.
+        self.S = torch.logspace(0, math.log10(max(float(cond), 1.0)),
+                                self.dim, dtype=torch.float64).float()
+
+        self.theta = torch.nn.Parameter(torch.zeros(self.dim))
+        self.target = torch.zeros(self.dim)
+        #: an untrained scalar so the FIVE-KEY optimizer dict exists. It guards
+        #: `_apply_lrs`'s positional pin on the last group of `fused`, which the
+        #: checkpointing history records breaking twice.
+        self._level = torch.nn.Parameter(torch.zeros(1))
+        self.optimizers = _full_optimizer_set(
+            optimizer, [self.theta], [self._level],
+            {'policy': lr, 'flow': lr})
+        self.policy_params = [self.theta]
+
+    def advance(self):
+        self.target = self.target + torch.randn(
+            self.dim, generator=self._tgen) * self.speed
+
+    def draw(self, batch_size):
+        b = max(1, int(batch_size))
+        return torch.randn(self.dim, generator=self._gen) * (self.noise / math.sqrt(b))
+
+    def _loss(self, n, theta=None):
+        d = (self.theta if theta is None else theta) - self.target
+        return 0.5 * (self.S * d * d).sum() + (n * self.theta).sum()
+
+    def train_step(self, batch):
+        opt = self.optimizers['fwd']
+        opt.zero_grad(set_to_none=True)
+        loss = self._loss(batch)
+        (g,) = torch.autograd.grad(loss, [self.theta])
+        self.theta.grad = g
+        opt.step()
+        return float(loss.detach())
+
+    def expected_loss(self):
+        with torch.no_grad():
+            d = self.theta - self.target
+            return float(0.5 * (self.S * d * d).sum())
+
+    def distance_to_opt(self):
+        with torch.no_grad():
+            return float((self.theta.detach() - self.target).norm())
+
+    def probe_loss(self, batch):
+        with torch.no_grad():
+            return float(self._loss(batch))
+
+    def grad_on(self, batch):
+        (g,) = torch.autograd.grad(self._loss(batch), [self.theta])
+        return g.detach().reshape(-1)
+
+    # `best_lr_scale()` -- `sqrt(speed*noise)`, from balancing lag against
+    # jitter -- WAS HERE AND IS DELETED. Measured against `bench.ladder` it is
+    # 32x off for Adam at the slowest target and 10x off for SGD at the fastest,
+    # because Adam normalises per coordinate so the balance is not the naive one.
+    # An unused predictor that does not predict is exactly the kind of quiet
+    # wrong number this bench was rebuilt to remove; the ladder is the reference.

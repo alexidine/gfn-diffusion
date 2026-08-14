@@ -124,13 +124,31 @@ def test_hyper_step_is_identical_to_hyper_under_sgd():
     If they differ here, the fix is doing something other than changing the
     operand, and its large Adam improvement (4.87 -> 1.04 nats) is not evidence
     about Adam preconditioning.
+
+    MUST RUN PAST WARMUP. This test used to run 900 steps against the config's
+    `warmup_steps` of 1000, so `_scale_peak` was held on all 899 calls and it
+    compared two identical warmup envelopes -- `peak_scale` was exactly 1.0 at
+    the end of both. It passed with the hypergradient sign REVERSED, with
+    `HyperStep.tick` a total no-op, and with the operand fix undone. It had no
+    power at all, while its own name claimed it was the falsifiable check.
+
+    The tolerance is float32 round-off, not exactness: the arm reconstructs the
+    step as `after - theta_before` while `Hyper` uses `g` directly, and
+    `-lr*g` accumulated into a parameter is not bitwise equal to `lr*g`. The
+    measured clean difference is ~6e-7 in log space; the mutations above show up
+    at 4.2 and 8.6, so a 1e-4 bar separates them by four orders of magnitude.
     """
-    a = _run(Hyper, steps=900, optimizer='sgd')
-    b = _run(HyperStep, steps=900, optimizer='sgd')
+    a = _run(Hyper, steps=2500, optimizer='sgd')
+    b = _run(HyperStep, steps=2500, optimizer='sgd')
     la, lb = _lrs(a), _lrs(b)
     assert len(la) == len(lb)
+    moved = max(abs(math.log(x) - math.log(la[0])) for x in la)
+    assert moved > 0.5, (
+        f'the rate barely moved over the run (max {moved:.3g} in log space), so '
+        f'this comparison is between two arms that never acted -- exactly the '
+        f'hold-through-warmup trap this test fell into before')
     worst = max(abs(math.log(x) - math.log(y)) for x, y in zip(la, lb))
-    assert worst < 1e-9, (
+    assert worst < 1e-4, (
         f'under SGD the two operands are the same vector, but the rates differ '
         f'by up to {worst:.3g} in log space -- the fix is not (only) changing '
         f'the operand')

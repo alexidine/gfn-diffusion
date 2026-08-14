@@ -80,6 +80,8 @@ class LRController:
         self._calibrations = 0
         self._last = {}               # last calibration's decision, for the log
         self._plateau_last = {}       # last plateau decision, same purpose
+        self._hyper_last = {}         # last hypergradient decision, same purpose
+        self._hypergrads = 0
         self._plateau_cuts = 0
         self._restarts = 0
         self._check_bars()
@@ -231,6 +233,76 @@ class LRController:
         st['envelope'] = self._envelope(st)
         self._apply_lrs(st)
         print(f"lr_ctrl: plateau cut -> peak_scale {st['peak_scale']:.4g}")
+
+    def on_hypergradient(self, cos: float, beta: float, beta_down: float = None):
+        """
+        Apply one hypergradient verdict: `peak_scale *= exp(beta * cos)`.
+
+        `cos` is the cosine between the CURRENT gradient and the direction the
+        PREVIOUS step actually moved the policy in. The identity is
+        `dL/d(lr) = -<g_t, d_{t-1}>`, so a positive cosine means the last step
+        was too short and a negative one means it overshot.
+
+        WHY THIS EXISTS ALONGSIDE `on_calibration`. The ray probe scores a LOSS,
+        which requires that loss to be one the stage actually trains -- the
+        precondition written at `protocol.py::_parse_lr_sensor` ("only coherent
+        in a fused stage that trains replay TB ... anywhere else it rates a loss
+        nobody is optimising"). Measured on run 7tjno8m6, whose `var_conditioning`
+        stage pins replay to 0.0 and trains VarGrad on fwd/bwd: 35% of
+        calibrations came back `inconsistent` and the t-statistic alternated sign
+        at the +-99 clamp between consecutive readings, while the same code on
+        `prod0810_mipcas_elj` -- an equilibration stage with replay live at
+        0.05-0.6 -- scored 100 bracketed of 102 with zero inconsistent.
+
+        This sensor reads the gradient and the realised displacement, both of
+        which exist whatever the branch mixture is and whatever loss family the
+        stage trains. It cannot be pointed at the wrong loss because it does not
+        score a loss.
+
+        BOUNDED BY CONSTRUCTION: `cos` is a cosine, so one step can move the peak
+        by at most `exp(+-beta)` however wrong the rate is. That is what makes it
+        safe to run every step, and also what makes it slow to make a large
+        correction -- the trade is intrinsic, not a tuning error.
+
+        NO SINGLE beta IS ROBUST ACROSS PROBLEM FAMILIES. Swept on the bench over
+        12 cells (two optimizers x tracking and MLE surfaces), the best worst-case
+        beta was 0.1 at 3.2x the best fixed rate, and the per-cell optimum spanned
+        20x. beta is a BANDWIDTH: a stage whose optimum keeps moving wants a high
+        one, a stage whose optimum is static wants a low one to reject noise. It
+        is therefore per-stage config with no default that claims universality.
+        """
+        st = self._state()
+        self._hyper_last = {'cos': float(cos), 'applied': 0.0, 'status': 'clean'}
+        # Held through warmup for exactly the reason `on_calibration` and
+        # `on_plateau` are: the envelope is deliberately ramping the rate, so a
+        # cosine measured through that suppression is not evidence about the
+        # operating point.
+        if self._elapsed(st) < int(self._cfg('warmup_steps', 1000)):
+            self._hyper_last['status'] = 'warmup'
+            return
+        if not (isinstance(cos, float) and math.isfinite(cos)):
+            self._hyper_last['status'] = 'nonfinite'
+            return
+        b = float(beta if cos > 0 or beta_down is None else beta_down)
+        lo, hi = self._peak_bounds()
+        ceiling = self._current_ceiling()
+        if ceiling is not None:
+            hi = min(hi, ceiling)
+        before = float(st['peak_scale'])
+        st['peak_scale'] = max(lo, min(hi, before * math.exp(b * float(cos))))
+        self._hyper_last['applied'] = st['peak_scale'] / before if before else 1.0
+        self._hypergrads = getattr(self, '_hypergrads', 0) + 1
+        # ANNOUNCE THE FIRST FIRE, once, the way the other two sensors announce
+        # their actions. A per-step sensor must not print per step, but a sensor
+        # that silently never runs is the failure this whole exercise was about:
+        # the ray probe spent a live run rating a branch pinned to zero weight,
+        # and nothing said so.
+        if self._hypergrads == 1:
+            print(f"lr_ctrl: hypergradient sensor live (beta {b:g}) -- first "
+                  f"reading cos {cos:+.3f}, peak_scale {before:.4g} -> "
+                  f"{st['peak_scale']:.4g}")
+        st['envelope'] = self._envelope(st)
+        self._apply_lrs(st)
 
     # -------------------------------------------------------------------- state
 
@@ -387,6 +459,7 @@ class LRController:
     # 'warmup' deliberately shares code 5 with _STATUS so the two sensors' status
     # channels read on one scale
     _PLATEAU_STATUS = {'clean': 0, 'cut': 1, 'warmup': 5}
+    _HYPER_STATUS = {'clean': 0, 'warmup': 1, 'nonfinite': 2}
 
     def in_warmup(self) -> bool:
         """Whether the LR envelope is still ramping. Public because a sensor may
@@ -419,6 +492,17 @@ class LRController:
             self._report['lr_ctrl/plateau_status'] = float(
                 self._PLATEAU_STATUS.get(self._plateau_last.get('status'), -1))
             self._report['lr_ctrl/plateau_cuts'] = float(self._plateau_cuts)
+        # Same contract as the block above: a sensor that is never FIRING and one
+        # that is never RUNNING must be distinguishable from the log alone. This
+        # sensor has no equivalent of `raycal/status` to fall back on, so without
+        # a counter a misconfigured stage would look identical to a quiet one.
+        hl = getattr(self, '_hyper_last', None)
+        if hl:
+            self._report['lr_ctrl/hyper_cos'] = float(hl.get('cos', 0.0))
+            self._report['lr_ctrl/hyper_applied'] = float(hl.get('applied', 0.0))
+            self._report['lr_ctrl/hyper_status'] = float(
+                self._HYPER_STATUS.get(hl.get('status'), -1))
+            self._report['lr_ctrl/hypergrads'] = float(getattr(self, '_hypergrads', 0))
         ceiling = self._current_ceiling()
         if ceiling is not None:
             self._report['lr_ctrl/peak_ceiling'] = ceiling

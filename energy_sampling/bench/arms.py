@@ -61,6 +61,20 @@ class Arm:
     def tick(self, run, loss, g_before, batch):
         pass
 
+    def on_rewind(self, run):
+        """
+        The parameters just jumped backwards. Drop any cross-step state.
+
+        Every arm here differences something against the PREVIOUS step -- a
+        gradient, a realised displacement, a best-loss watermark. After a rewind
+        that previous step belongs to a trajectory that no longer exists, so the
+        next difference spans the discontinuity and reports a huge spurious
+        move. For `hyper` that is a cosine against a jump of the size of the
+        whole detonation, applied at the exact moment the run is least able to
+        absorb a bad verdict.
+        """
+        pass
+
     # -- shared actuator ---------------------------------------------------
     @staticmethod
     def _scale_peak(run, factor):
@@ -141,6 +155,9 @@ class Hyper(Arm):
     def reset(self, run):
         self._prev = None
 
+    def on_rewind(self, run):
+        self._prev = None
+
     def tick(self, run, loss, g_before, batch):
         if g_before is None:
             return
@@ -176,12 +193,47 @@ class HyperStep(Hyper):
     what the optimizer actually did.
     """
 
-    def __init__(self, lr, beta=0.02):
-        super().__init__(lr, beta=beta)
-        self.name = f'hyper step b={beta:g}'
+    #: WHERE THIS ARM SETTLES, and the knob that moves it.
+    #:
+    #: The update is `exp(beta * (cos - target))`, so the fixed point is at
+    #: `cos = target`. With target 0 that is `cos = 0`: the new gradient is
+    #: orthogonal to the step just taken, which on a quadratic is EXACTLY the
+    #: line-search optimum -- i.e. this arm targets alpha* = 1 in the ray probe's
+    #: units, while the shipping servo targets alpha* = 4.
+    #:
+    #: Measured elsewhere, cos is close to `1 - lr/lr_opt`: +1 at zero rate, 0 at
+    #: the optimum, -1 at twice it. So a target of `1 - 1/A` parks the arm at
+    #: 1/A of the line-search optimum, and target=0.75 is the setpoint ray is
+    #: using. That makes "is ray just hyper with a conservative setpoint and a
+    #: slow clock?" a two-knob experiment rather than an argument.
+    def __init__(self, lr, beta=0.02, target=0.0, period=1, beta_down=None):
+        # ASYMMETRIC GAIN. `beta_down` is the gain when the statistic says TOO
+        # HOT. The base class has always had it; this subclass did not pass it
+        # through, so no arm on any board could ever use it.
+        #
+        # It is the lever for the second half of the stated goal. "At worst ~2x"
+        # and "never 50x" are different requirements: the first wants a good
+        # setpoint, the second wants the response to be FASTER DOWNWARD than
+        # upward, so an excursion is corrected before it compounds while the
+        # climb stays gentle enough not to chase noise.
+        super().__init__(lr, beta=beta, beta_down=beta_down)
+        self.target = float(target)
+        self.period = int(period)
+        base = (f'hyper b={beta:g}' if beta_down in (None, beta)
+                else f'hyper b={beta:g}/{beta_down:g}')
+        self.name = (f'{base} step' if not target and period == 1
+                     else f'{base} t={target:g} p={period}')
 
     def reset(self, run):
         super().reset(run)
+        self._theta_before = None
+        self._last_step = None
+
+    def on_rewind(self, run):
+        super().on_rewind(run)
+        # `_last_step` is the displacement of a step on the abandoned
+        # trajectory; differencing across the rewind would read the detonation
+        # itself as this step's update direction.
         self._theta_before = None
         self._last_step = None
 
@@ -190,6 +242,11 @@ class HyperStep(Hyper):
             [p.detach().reshape(-1).clone() for p in run.game.policy_params])
 
     def tick(self, run, loss, g_before, batch):
+        # `_theta_before` is None only when `on_rewind` cleared it EARLIER IN
+        # THIS STEP -- the divergence check runs between `pre_step` and `tick`.
+        # Without this guard the rewind path raises on the subtraction.
+        if self._theta_before is None:
+            return
         after = torch.cat([p.detach().reshape(-1)
                            for p in run.game.policy_params])
         step, self._last_step = self._last_step, after - self._theta_before
@@ -203,8 +260,15 @@ class HyperStep(Hyper):
         cos = float(torch.dot(g_before, d)) / (na * nb)
         if not math.isfinite(cos):
             return
-        beta = self.beta if cos > 0 else self.beta_down
-        self._scale_peak(run, math.exp(beta * cos))
+        # THE STATISTIC IS MEASURED EVERY STEP; ONLY THE ACTUATION IS GATED.
+        # That is the honest way to separate "ray is slower" from "ray measures
+        # something different" -- a period that also skipped the measurement
+        # would confound the two, which is the whole point of the comparison.
+        if self.period > 1 and run.m.step_ind % self.period:
+            return
+        err = cos - self.target
+        beta = self.beta if err > 0 else self.beta_down
+        self._scale_peak(run, math.exp(beta * err))
 
 
 class HyperSNR(Arm):
@@ -254,18 +318,27 @@ class HyperSNR(Arm):
 
     def reset(self, run):
         self.snr_log = []
+        #: COUNTED, because this arm's two failure modes are both SILENT.
+        #: `_Game.grad_on` is a base-class stub that RAISES, so `hasattr` is
+        #: True on every game and a bare `except` turned "this surface cannot
+        #: support the sensor" into "the sensor chose not to act" -- measured, 0
+        #: readings in 300 steps on EquilibrationGame with no error and no tell,
+        #: which is indistinguishable from the null arm.
+        self.unsupported = 0
 
     def tick(self, run, loss, g_before, batch):
         if self.period > 1 and run.m.step_ind % self.period:
             return
         game = run.game
-        if not hasattr(game, 'grad_on'):
-            return
         half = max(1, run.batch // 2)
         try:
             ga = game.grad_on(game.draw(half))
             gb = game.grad_on(game.draw(half))
+        except NotImplementedError:
+            self.unsupported += 1
+            return
         except Exception:
+            self.unsupported += 1
             return
         na, nb = float(ga.norm()), float(gb.norm())
         if not (na > 0 and nb > 0):
@@ -310,6 +383,12 @@ class RayRay(Arm):
         # AFTER the optimizer step, so every one of 1900 readings came back None
         # and the arm scored bit-identical to `null` -- which is what caught it.
         self.readings = {'armed': 0, 'none': 0}
+        self._armed = False
+
+    def on_rewind(self, run):
+        # The probe armed against parameters that have just been replaced;
+        # measuring now would difference across the restore and read the rewind
+        # as this step's curvature.
         self._armed = False
 
     def pre_step(self, run):
@@ -362,6 +441,15 @@ class RampPlateau(Arm):
         self._best = math.inf
         self._bad = 0
         self._cool = 0
+
+    def on_rewind(self, run):
+        # `_best` is a legitimate watermark and survives -- the run really did
+        # reach that loss, and the rewind restored the state that did it. The
+        # EMA does not: it is averaging the detonation, so the next comparison
+        # against `_best` would count patience against a loss that has been
+        # undone.
+        self._ema = None
+        self._bad = 0
 
     def tick(self, run, loss, g_before, batch):
         m = run.m

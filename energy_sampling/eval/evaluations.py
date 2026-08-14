@@ -1150,6 +1150,23 @@ def compute_1d_kld(p_data: np.ndarray,
         data_max=data_range[1],
     )
 
+    # The violin helper SHORT-CIRCUITS a (near-)constant input to a 3-point grid while a
+    # spread input returns n_kde_points + 2, so the two sides need not share a grid. This
+    # function then integrates y_ref (from p_data) against x_common (from q_data), which
+    # raises when exactly ONE side is constant:
+    #   ValueError: operands could not be broadcast together with shapes (201,) (2,)
+    # It is not reachable from dead latent rows -- both sides route through
+    # latent_params(), so both are constant, symmetric, and correctly give 0.0. It IS
+    # reachable when a COLLAPSED sampler dimension meets a broad buffer dimension, and it
+    # would take out buffer_kld and the whole eval metrics block with it. D33 makes the
+    # constant branch routine rather than exotic, so guard it rather than wait.
+    #
+    # A constant-vs-spread pair has genuinely infinite KL (the reference puts mass where
+    # the sample has none), so returning NaN is the honest answer -- not 0.0, which would
+    # read as "these distributions agree".
+    if len(x_samp) != len(x_ref):
+        return float('nan')
+
     # the violin helper returns float32 (it exists to make small figures);
     # integrate in float64 since this one is a metric, not a plot
     x_common = np.asarray(x_samp, dtype=np.float64)
@@ -1633,7 +1650,31 @@ def sliced_wasserstein(sampled_latents, prior_latents, n_proj=50, p=1, generator
     assert b.shape[1] == D, "latent dims must match"
 
     theta = torch.randn(D, n_proj, device=a.device, dtype=a.dtype, generator=generator)
-    theta = theta / theta.norm(dim=0, keepdim=True)
+
+    # Drop dimensions that are CONSTANT ACROSS BOTH CLOUDS COMBINED before normalising.
+    #
+    # D33 pins structurally-dead latent rows to a constant, and `latent_params()` has
+    # always clobbered them, so 2-4 of 12 dims carry no information at all. They
+    # contribute 0 to both projections either way -- but while they were still inside the
+    # unit-norm constraint, only ||theta_live|| ~ sqrt(live/D) of each direction did any
+    # work, so every reading scaled down by that factor: measured 0.933 with 2 dead of 12.
+    # `wass_debiased = raw - null` does NOT cancel it, because both terms scale.
+    #
+    # That matters because this is a GATE, not just a curve: `eval/wass_debiased below
+    # 0.015` is a stage-1 exit term in 376 configs. Uncorrected, a threshold tuned on
+    # triclinic sits ~7% loose for monoclinic and ~13% for orthorhombic -- i.e. the
+    # transition fires earlier the more dead rows a space group has, which is exactly the
+    # wrong dependence for a convergence gate.
+    #
+    # The test is on the COMBINED variance, deliberately. A dim that is constant in each
+    # cloud but at DIFFERENT values does carry signal (the clouds genuinely differ there)
+    # and must keep its weight; only a dim constant across the union is uninformative.
+    combined_var = torch.cat((a, b), dim=0).var(dim=0)
+    keep = combined_var > 1e-12
+    if not bool(keep.all()) and bool(keep.any()):
+        theta = theta * keep.unsqueeze(-1).to(theta.dtype)
+
+    theta = theta / theta.norm(dim=0, keepdim=True).clamp_min(1e-12)
 
     a_proj = a @ theta  # [N, n_proj]
     b_proj = b @ theta  # [M, n_proj]

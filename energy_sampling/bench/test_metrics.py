@@ -191,3 +191,42 @@ def test_a_clean_run_reports_zeros_not_none():
 def test_smoothed_loss_holds_through_a_nan_rather_than_resetting():
     s = smoothed_loss(_Run(losses=[1.0] * 50 + [float('nan')] * 5 + [1.0] * 50))
     assert all(x is not None for x in s[50:55])
+
+
+def test_the_scoring_reads_eloss_and_not_the_training_loss():
+    """
+    THE WHOLE SCORING PREMISE, WHICH HAD NO TEST.
+
+    `_series` substitutes `SCORE_KEY` ('eloss', the noise-free loss) for 'loss'
+    whenever a trace carries it. That substitution is the reason the battery's
+    rankings are not coin flips: near the fixed point the training loss is
+    dominated by a noise term whose SIGN IS RANDOM, so a median over a window
+    ranks arms by where that term happened to land.
+
+    Measured: deleting the substitution from `_series` left 47/47 tests passing,
+    and so did setting `SCORE_KEY = 'loss'`. Every test in this file built traces
+    with no `eloss` key at all, so they all exercised the FALLBACK branch and
+    none of them ever touched the branch the battery actually runs.
+    """
+    run = _Run(losses=[7.0] * 300)
+    for h in run.trace:
+        h['eloss'] = 0.5
+    assert final_loss(run) == pytest.approx(0.5), (
+        'final_loss read the noisy training loss, not the noise-free one -- the '
+        'battery is ranking arms on the sign of a random term')
+
+
+def test_one_stray_eloss_does_not_switch_the_whole_series():
+    """
+    `_series` switches on `any(v is not None ...)`, so a SINGLE non-None `eloss`
+    flips the entire series over to a key that is absent everywhere else --
+    measured, a trace with `eloss` on 1 step of 300 scored 0.5 off that one
+    sample while `loss` said 7.0. A partially-populated trace should not be
+    scored off the handful of steps that happen to carry the key.
+    """
+    run = _Run(losses=[7.0] * 300)
+    run.trace[137]['eloss'] = 0.5
+    got = final_loss(run)
+    assert got == pytest.approx(7.0), (
+        f'one stray eloss in 300 steps set the score to {got:.4g}; the run is '
+        f'being scored off a single sample')

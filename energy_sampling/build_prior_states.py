@@ -136,7 +136,10 @@ def main():
     torch.set_num_threads(args.threads)
     rng = np.random.default_rng(args.seed)
 
-    energy = ConformerTorsions(smiles=args.smiles, device="cpu", epsilon=args.epsilon)
+    # see build_conformer_buffer.py: `torsion` is explicit, not a default. The fitted
+    # InternalPrior draw and the period-2 wrapping below both assume torsion-only state.
+    energy = ConformerTorsions(smiles=args.smiles, device="cpu", epsilon=args.epsilon,
+                               level="torsion")
     print(energy.describe())
     prior = fit_or_load(args.prior_path, args.datasets, args.fatten)
     states, n_uniform = draw_states(energy, prior, args.n, rng)

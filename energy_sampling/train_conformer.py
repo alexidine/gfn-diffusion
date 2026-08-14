@@ -13,10 +13,14 @@ over molecules of different sizes.
 
 Two things are deliberately different from the crystal setup:
 
-*Every state dimension is periodic.* Torsions live on a torus, so ``TorsionGFN`` overrides
-the crystal-specific periodic mask rather than editing ``gfn.py`` -- the running crystal
-job is untouched. The sin/cos policy encoding and post-step wrapping already existed for
-aunit periodicity and are reused as-is.
+*The state layout comes from the energy.* ``ConformerTorsions.periodic_dims`` declares
+which dims wrap, and is handed to ``GFN(angular_mask=...)``. At `torsion` and `dihedral`
+that is every dim; from `flex` up the r and theta blocks are linear and bounded. This
+replaces the old ``TorsionGFN`` subclass, which overrode ``get_periodic_dimensions``
+wholesale. Note the subclass could not simply be DELETED: the base method's non-crystal
+branch writes ``[False] * dim``, which hands a torsion state zero wrapped dims silently,
+and a 2-periodic reward with no wrap has no finite log Z at all. The sin/cos policy
+encoding and post-step wrapping already existed for aunit periodicity and are reused.
 
 *The TB residual accumulates per-step differences.* ``(log_pf - log_pb).sum(-1)``, never
 ``log_pf.sum() - log_pb.sum()``. Each sum is O(d*T) and the residual is O(1), so the
@@ -46,6 +50,7 @@ from mxtaltools.common.training_utils import flatten_wandb_params
 from energies.conformer_torsions import ConformerTorsions
 from models.gfn import GFN
 from controller import LRController
+from grad_clip_guard import GradClipGuard
 from train import Modeller, safe_histogram
 from eval.evaluations import flow_parity_plot
 from utils import (dict2namespace, load_yaml, preflight_config, quick_tb_stats,
@@ -74,38 +79,19 @@ def load_config(default: Path = DEFAULT_CONFIG):
     return resolve_derived_config(preflight_config(dict2namespace(load_yaml(path))))
 
 
-class TorsionGFN(GFN):
-    """GFN whose entire state lives on a torus.
+def build_gfn(dim: int, mdl, device, angular_mask) -> GFN:
+    """Construct the policy against the layout the ENERGY declares.
 
-    ``get_periodic_dimensions`` in the base class hard-codes the crystal state layout
-    (6 box params, then centroids, then orientations) and raises on any other dimension.
-    Torsions are the simpler case -- every dimension wraps -- so the mask is overridden
-    rather than the base class being taught about a second layout.
+    ``angular_mask`` comes from ``ConformerTorsions.periodic_dims`` and is required, not
+    optional: the base class's fallback for a non-crystal state is ``[False] * dim``,
+    which is a silently unnormalizable target rather than a merely degraded layout.
+    Passing it explicitly is what retired the ``TorsionGFN`` subclass.
     """
-
-    def get_periodic_dimensions(self, device, do_periodic_angles: bool = True,
-                                periodic_centroid_axes=None,
-                                dead_latent_rows=None, dead_latent_values=None):
-        # Only the LAYOUT is overridden -- every torsion dimension wraps. The index-set
-        # bookkeeping (block widths, expanded_dim, the ang/lin/dead partition and its
-        # assertions, the pinned dead values) is delegated to the base class, so this
-        # override cannot drift out of step with it. It previously set those six
-        # attributes by hand, which is how the dead-row work broke conformer
-        # construction: the base class grew seven more and this copy did not.
-        #
-        # dead rows are passed through rather than dropped: torsions have no
-        # crystal-system projection so nothing is dead today (the conformer builder never
-        # sets them, giving ()), but hardcoding None here would silently ignore them if
-        # that ever changes.
-        self.periodic_centroid_axes = ()
-        self._finalize_dim_partition(device, [True] * self.dim,
-                                     dead_latent_rows=dead_latent_rows,
-                                     dead_latent_values=dead_latent_values)
-
-
-def build_gfn(dim: int, mdl, device) -> TorsionGFN:
-    gfn = TorsionGFN(
+    if len(angular_mask) != dim:
+        raise ValueError(f"angular_mask has {len(angular_mask)} entries for dim {dim}")
+    gfn = GFN(
         dim=dim,
+        angular_mask=angular_mask,
         s_emb_dim=mdl.s_emb_dim,
         conditions_dim=0,
         harmonics_dim=mdl.harmonics_dim,
@@ -123,7 +109,6 @@ def build_gfn(dim: int, mdl, device) -> TorsionGFN:
         clipping=mdl.clipping,
         gfn_clip=mdl.gfn_clip,
         device=device,
-        do_periodic_angles=True,
     )
     return gfn.to(device)
 
@@ -216,9 +201,20 @@ def torsion_latent_figure(samples, reference=None, n_kde: int = 200,
     return fig
 
 
-def wrap_state(x):
-    """Wrap to the state space (-1, 1]. Period 2, NOT 2*pi -- see build_conformer_buffer."""
-    return (x + 1.0) % 2.0 - 1.0
+def wrap_state(x, periodic_mask):
+    """Wrap the PERIODIC columns to (-1, 1]. Period 2, NOT 2*pi.
+
+    `periodic_mask` is required, not optional. From `flex` up the state carries linear
+    blocks (r, theta), and wrapping one of those is not merely imprecise: a bond-length
+    latent at 1.3 folds to -0.7 -- the opposite corner of the box -- with a perfectly
+    plausible energy and no error anywhere. The three data-prep scripts keep their own
+    unconditional copies of this, which is correct there only because they are pinned to
+    level='torsion' where every column is periodic.
+    """
+    m = torch.as_tensor(periodic_mask, dtype=torch.bool, device=x.device)
+    if m.numel() != x.shape[-1]:
+        raise ValueError(f"periodic_mask has {m.numel()} entries for a {x.shape[-1]}-wide state")
+    return torch.where(m, (x + 1.0) % 2.0 - 1.0, x)
 
 
 class TerminalBuffers:
@@ -243,12 +239,38 @@ class TerminalBuffers:
     get_traj_bwd as terminal states outside the sampler's domain.
     """
 
-    def __init__(self, reference=None, prior=None, prior_frac: float = 0.5):
-        self.reference = None if reference is None else wrap_state(reference)
-        self.prior = None if prior is None else wrap_state(prior)
+    def __init__(self, reference=None, prior=None, prior_frac: float = 0.5,
+                 periodic_mask=None):
+        self._pmask = periodic_mask
+        self.reference = None if reference is None else self._admit(reference, 'reference')
+        self.prior = None if prior is None else self._admit(prior, 'prior')
         self.prior_frac = 0.0 if self.prior is None else float(prior_frac)
         if self.reference is None:
             self.prior_frac = 1.0 if self.prior is not None else 0.0
+
+    def _admit(self, states, which: str):
+        """Wrap the periodic columns, and REFUSE a linear column that is out of the box.
+
+        A stored file written against a narrower level, or by a build script that wrapped
+        every column, arrives here looking exactly like a valid one. The periodic columns
+        are wrapped (a total map, so always safe); the linear ones cannot be repaired
+        without guessing, so they raise.
+        """
+        if self._pmask is None:
+            raise ValueError("TerminalBuffers needs the energy's periodic_dims")
+        states = wrap_state(states, self._pmask)
+        lin = ~torch.as_tensor(self._pmask, dtype=torch.bool, device=states.device)
+        if lin.any():
+            bad = (states[:, lin].abs() > 1.0 + 1e-9)
+            if bad.any():
+                worst = float(states[:, lin].abs().max())
+                raise ValueError(
+                    f"{which} buffer has {int(bad.any(dim=1).sum())} row(s) whose LINEAR "
+                    f"columns leave the box (max |x| = {worst:.4g}). Wrapping them would "
+                    f"fold a bond length or angle to the opposite corner silently, so this "
+                    f"refuses instead. The file was almost certainly written at a "
+                    f"different level, or by a script that wraps every column.")
+        return states
 
     def __bool__(self):
         return self.reference is not None or self.prior is not None
@@ -298,22 +320,52 @@ def build_terminal_buffers(energy, train_c, eval_c, dim) -> TerminalBuffers:
         ref = torch.as_tensor(blob[key], dtype=torch.float64)
         print(f"reference buffer: {len(ref)} local optima ('{key}') from {path}")
     elif ref is None and path is not None:
-        print(f"reference buffer: {path} not found")
+        # an explicitly-configured buffer that is not there is a config error, not a
+        # reason to fall through to uniform. Printing it is how a run ends up training
+        # against a buffer nobody chose.
+        raise SystemExit(f"training.buffer_path was set to {path}, which does not exist")
 
     prior = None
     p_path = getattr(train_c, "prior_states_path", None)
+    ip_path = getattr(train_c, "internal_prior_path", None)
     n_prior = int(getattr(train_c, "prior_size", 20000))
     if p_path and Path(p_path).exists():
         blob = torch.load(Path(p_path), weights_only=False)
         prior = torch.as_tensor(blob["states"] if isinstance(blob, dict) else blob,
                                 dtype=torch.float64)
+        if prior.shape[1] != dim:
+            raise SystemExit(
+                f"prior_states_path {p_path} holds {prior.shape[1]}-wide states but this "
+                f"problem is {dim}-wide (level {energy.level!r}). One file is one level.")
         print(f"prior buffer: {len(prior)} states from {p_path}")
+    elif ip_path:
+        # A FITTED prior over internal coordinates, drawn per-DoF in this energy's own
+        # spec numbering (see ConformerTorsions.sample_prior_states). This is the thing
+        # that makes `flex` and `full` trainable: uniform-on-box puts every bond length
+        # and angle anywhere in its box independently, which for propanol is ~300 kcal/mol
+        # of strain in every backward terminal.
+        if not Path(ip_path).exists():
+            raise SystemExit(f"training.internal_prior_path {ip_path} does not exist")
+        if energy.collective:
+            raise SystemExit(
+                f"internal_prior_path needs a selection level; {energy.level!r} has "
+                f"collective columns. Use prior_states_path with a file from "
+                f"build_prior_states.py for the torsion route.")
+        fitted = torch.load(Path(ip_path), weights_only=False)
+        print(f"prior: fitted InternalPrior from {ip_path} ({fitted.n_fitted} molecules; "
+              f"{len(fitted.bonds)} bond / {len(fitted.angles)} angle / "
+              f"{len(fitted.torsions)} torsion types)")
+        prior, _ = energy.sample_prior_states(
+            fitted, n_prior, np.random.default_rng(int(getattr(train_c, "prior_seed", 0))))
+        prior = prior.to(torch.float64)
     elif n_prior > 0:
         prior = torch.rand(n_prior, dim, dtype=torch.float64) * 2 - 1
-        print(f"prior buffer: {n_prior} UNIFORM-on-torus states "
-              f"(no prior_states_path given; this is the max-entropy dumb prior)")
+        print(f"prior buffer: {n_prior} UNIFORM-on-box states (no prior_states_path or "
+              f"internal_prior_path; this is the max-entropy dumb prior, and from `flex` "
+              f"up it is a very dumb one -- every bond length independently uniform)")
 
-    return TerminalBuffers(ref, prior, getattr(train_c, "prior_frac", 0.5))
+    return TerminalBuffers(ref, prior, getattr(train_c, "prior_frac", 0.5),
+                           periodic_mask=energy.periodic_dims)
 
 
 @torch.no_grad()
@@ -417,6 +469,12 @@ class ConformerModeller:
         self.last_grad_norm_pre_clip = float('nan')
         self.grad_nonfinite = 0
         self._throughput = {'samples': 0, 'seconds': 0.0}
+        # Same adaptive clip bar as the crystal route. v0.1 has one stage and no
+        # protocol, so there is no transition to refresh on -- the tracker's own
+        # rate limit is the only adaptation here.
+        self.grad_guard = GradClipGuard.from_config(
+            args.gradient_norm_clip, getattr(args, 'grad_clip_guard', None))
+        self.grad_guard.announce()
         self.init_schedulers_optimizers()
         self.lr_controller = LRController(self)
 
@@ -474,6 +532,8 @@ class ConformerModeller:
 
         m['train/batch_size'] = self.batch_size
         m['train/grad_norm_pre_clip'] = self.last_grad_norm_pre_clip
+        # per-branch clip bar + firing rate; empty dict when the guard is off
+        m.update(self.grad_guard.report())
         # count since the last call, not a rate -- drained here
         m['train/grad_nonfinite'] = self.grad_nonfinite
         self.grad_nonfinite = 0
@@ -524,15 +584,30 @@ def run(args):
     device = torch.device(getattr(args, "device", "cpu"))
     torch.set_num_threads(getattr(args, "num_threads", 2))
 
+    # `level` is read WITHOUT a fallback and ConformerTorsions takes no **kwargs, so a
+    # config that omits it fails here rather than silently running `torsion`
     energy = ConformerTorsions(smiles=prob.smiles, device=str(device),
+                               level=prob.level,
                                log_temperature=prob.log_temperature,
                                epsilon=prob.epsilon,
                                min_separation=prob.min_separation,
                                scale_14=prob.scale_14,
                                lj_k_factor=prob.lj_k_factor,
-                               include_trivial_rotations=prob.include_trivial_rotations)
+                               include_trivial_rotations=prob.include_trivial_rotations,
+                               **{k: getattr(prob, k) for k in
+                                  ('delta_r_max', 'delta_theta_max', 'bounding_coeff',
+                                   'r_floor', 'theta_floor') if hasattr(prob, k)})
     print(energy.describe())
     dim = energy.data_ndim
+    # the resolved level and width go to wandb.summary, not just stdout: a config that
+    # says one thing and a run that does another is the failure this guards
+    wandb.run.summary.update({'problem/level': energy.level,
+                              'problem/data_ndim': dim,
+                              'problem/n_atoms': energy.spec.n_atoms,
+                              'problem/n_free_r': int((energy._free_block == 0).sum()),
+                              'problem/n_free_theta': int((energy._free_block == 1).sum()),
+                              'problem/n_free_phi': int((energy._free_block == 2).sum()),
+                              'problem/linearity_verified': energy.linearity_verified})
 
     t0 = time.time()
     refs = exact_references(energy, eval_c.brute_force_grid)
@@ -546,7 +621,7 @@ def run(args):
         print(f"k={dim}: too many torsions for brute-force references; calibration this "
               f"run is relative only (see the validation ladder)")
 
-    gfn = build_gfn(dim, mdl, device)
+    gfn = build_gfn(dim, mdl, device, energy.periodic_dims)
     mod = ConformerModeller(args, gfn, device)   # owns optimizers, LR controller, batch size
     discretizer = lambda bsz: uniform_discretizer(bsz, args.integrator.T)
 
@@ -602,12 +677,15 @@ def run(args):
         # clip_grad_norm_ returns the norm BEFORE clipping -- the only free read of
         # how hard the clip is biting, and the thing to look at first when the LR
         # schedule and the loss disagree
-        gnorm = torch.nn.utils.clip_grad_norm_(gfn.parameters(), args.gradient_norm_clip)
+        chan = "bwd" if use_bwd else "fwd"
+        gnorm = torch.nn.utils.clip_grad_norm_(gfn.parameters(),
+                                               mod.grad_guard.threshold(chan))
+        mod.grad_guard.observe(chan, float(gnorm))
         mod.last_grad_norm_pre_clip = float(gnorm)
         mod.grad_nonfinite += int(not np.isfinite(mod.last_grad_norm_pre_clip))
         # turn-taking: the direction's own policy optimizer, plus the flow (Z) optimizer,
         # exactly as train.py's non-fused branch does
-        mod.optimizers["bwd" if use_bwd else "fwd"].step()
+        mod.optimizers[chan].step()
         mod.optimizers["flow"].step()
         step_dt = time.time() - step_t0
         mod._recent_step_times.append(step_dt)
@@ -685,4 +763,21 @@ def run(args):
 
 
 if __name__ == "__main__":
+    # GPU pre-flight, same as train.py's. train_conformer was listed in
+    # gpu_guard.TRAIN_ENTRYPOINTS -- so OTHER runs correctly saw it as a tenant -- while
+    # never checking itself, which is the asymmetry that lets a conformer run launch onto
+    # a card a trainer already holds. That is the collision the guard exists to prevent.
+    # Override with GFN_GPU_GUARD=0; see gpu_guard.py.
+    # `Path` (imported above), NOT os.path -- this module does not import os, so an
+    # os.path call here would raise NameError on the one line meant to prevent a
+    # collision. Same shape as the sys.exit slip in train.py's guard block: py_compile
+    # passes and the safety path is still dead. Compiling is not running.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from gpu_guard import require_free_gpu, GPUBusy
+
+    try:
+        require_free_gpu()
+    except GPUBusy as _e:
+        raise SystemExit(str(_e))
+
     main()

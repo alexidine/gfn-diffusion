@@ -44,7 +44,12 @@ SCORE_KEY = 'eloss'
 def _series(run, key):
     if key == 'loss':
         vals = [h.get(SCORE_KEY) for h in run.trace]
-        if any(v is not None for v in vals):
+        # ALL, NOT ANY. On `any`, a single populated step switched the WHOLE
+        # series to a key absent everywhere else -- measured, one stray `eloss`
+        # at step 137 of 300 drove `final_loss` to inf, because the trailing
+        # window it is computed over had none. A partially populated key means a
+        # malformed trace, and the safe reading is the one that is complete.
+        if vals and all(v is not None for v in vals):
             return vals
     return [h.get(key) for h in run.trace]
 
@@ -209,11 +214,42 @@ def final_lr(run, window=FINAL_WINDOW):
     return float(np.median(tail)) if tail else math.nan
 
 
+def _final_loss_or_death(run, window=FINAL_WINDOW):
+    """
+    `final_loss`, except an ABORTED run scores infinite.
+
+    AN ABORT MUST NOT BE SCORED AS A FINISH, and the trailing-window median makes
+    that trap sharp rather than obvious. The rewind restores a healthy state
+    after every divergence, so a run that detonates repeatedly and then exhausts
+    its reload budget has a tail full of restored, healthy losses -- its median
+    is excellent right up to the moment it dies. Measured on the `regime shift`
+    cell: `ramp+plateau` aborted on 5 seeds out of 5 and came FIRST in the cell,
+    and `fixed@0.01` aborted on 5 of 5 and came second. Both were being ranked on
+    a run that never reached the end.
+
+    Production treats the abort as terminal -- it raises `FrozenTrainingState` and
+    releases the GPU -- so the honest score is the one for not finishing. This
+    also makes `died in k/n` count aborts, which it otherwise never did: every
+    aborted run had a finite loss, so the column read '-' while 30 runs had died.
+    """
+    return math.inf if run.aborted else final_loss(run, window)
+
+
 def score_run(run):
     """Every per-run metric. `lead_fraction` is per-GROUP and added by the caller."""
     st = lr_stability(run)
+    # THE WINDOW IS A PROPERTY OF THE SURFACE, not a constant. On a CONVERGING
+    # surface a short window is right: the level is still moving, and a long
+    # average would blend it with earlier, worse parameters. On a STATIONARY one
+    # -- a tracking problem -- the quantity is fixed and a long average is simply
+    # a better estimator of it. Measured on `TrackingGame`: seed noise 0.176 nats
+    # at a 100-step window against 0.040 at 1000, taking adjacent rungs from 1.8
+    # sigma apart (unusable) to 10.2 (clean). Same runs, same data, only the
+    # estimator changed.
+    window = getattr(run.game, 'score_window', FINAL_WINDOW)
     return {'arm': run.arm.name, 'seed': run.seed,
-            'final_loss': final_loss(run),
+            'final_loss': _final_loss_or_death(run, window),
+            'final_loss_at_abort': final_loss(run, window),
             'final_lr': final_lr(run),
             'lr_sd': st['sd'], 'lr_max_jump': st['max_jump'],
             'lr_span': st['span'],

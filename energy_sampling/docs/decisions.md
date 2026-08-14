@@ -98,6 +98,63 @@ remainder are diagnostic/cosmetic (per-dim figure labels hardcoding 12 latent na
 `Total Var` dividing by `data_ndim`, `get_traj_replay` not pinning — inert, since dead
 values reach neither the policy input nor the log-probs).
 
+**Deep pass, 2026-08-12** (`test_dead_latent_rows_deep.py`, evidence in F-010):
+the reduction is **bitwise exact** against an independent live-only reimplementation;
+`Var(log w)` falls 6.30 → 5.33 → 4.77 as `n_dead` goes 0 → 2 → 3, which is the
+quantitative form of the argument that decided this entry against pinning; 65
+config × dead-set models all hold the invariants; `live_dim == 0` gives log-probs of
+exactly 0 rather than NaN; CPU/CUDA agree to ~1e-6 on an identical trajectory. That pass
+also found **F-009b** — a pre-existing latent bug where the non-crystal angular mask was
+hardcoded to width 12, which would have fed a `data_ndim`-18 toy only its first 12 dims.
+Caught by the width assert added for this work, which had no other purpose.
+
+**Free aunit axes now land too, at Z'=1** (`canonicalize_free_axes`, called from
+`latent_params()`): pinned to the aunit box centre, which is latent 0 — the same constant
+the angles take, so `_dead_values` stays all-zeros. Measured energy- and RDF-invariant on
+physical structures (energy-invariant to <=1.2e-06 relative on 40 structures per SG) and
+idempotent. The RDF is NOT a reliable witness to this -- see F-010b -- so assert gauge
+invariance on the energy. **Z'>1 is
+gated off**: the free translation there is one global shift, so fixing it needs a common
+offset, and the leftover units then leave the box where re-wrapping a single unit by
+`auv_d` is a symmetry only when `auv_d == 1`. The canonicaliser and the dead-row table
+had to land TOGETHER — canonicalising without holding the rows would pin every buffer row
+at the constant while the policy flowed the dim freely, i.e. this defect inverted.
+
+**Certified against a closed form, 2026-08-12** (`test_latent_gaussian.py`, evidence in
+F-023). Physical energies have never converged perfectly, so they cannot certify a
+log Z; the new `latent_gaussian` energy can. It is the combination that did not
+previously exist — `is_crystal` TRUE (crystal layout, dead rows, periodic angles) with
+`latent_energy` TRUE (analytic reward on the latent) — so it is the first target that
+exercises dead rows *and* has an exact answer. The old toys are `is_crystal` FALSE and
+cannot reach the mechanism at all.
+
+Two terms are **structurally zero** for any latent-scored problem, not config knobs:
+
+- **`reduction_energy`.** On P-1 the reduced region is a thin set with no
+  zero-reduction ball wide enough for a gaussian (best of 4000 draws: 0 at the centre,
+  0.105 at the edge of a ±0.15 ball), so leaving it on would contaminate the target by
+  ~1 nat at 1.5σ.
+- **`jacobian_energy`.** The jacobian is a change of measure from box-latent to
+  physical coordinates, so that a target defined by a *physical* energy is sampled
+  correctly in physical space. A latent-space analytic target is defined *in* the latent
+  space: there is no measure to correct, and applying one would make the target
+  `gaussian × |J|`, which has no closed form in box coordinates. It would also break the
+  dead-row test itself — rows 3/4/5 are cell angles, which enter `cell_volume`, so with
+  the jacobian on those rows are not flat even when the energy ignores them and the
+  rows-live arm's fictitious volume stops being analytic.
+
+Being structural rather than a knob means no config can switch either back on by
+accident. `reward_range` needs no such treatment: `set_reward_clip` has no callers, so
+`energy_clip` is always `None` and `log_rescale_positive` is unreachable.
+
+Battery: `configs/gauss_aug12/` — 10 arms, 5 space groups × rows held/live, each with a
+predicted log Z. It also closes two gaps `deadrow_aug12` states it cannot: orthorhombic
+(no physical prior on disk) and the free-axis path (a physical prior must be a real
+crystal, but nothing builds a cell here, so any space group can be synthesised).
+`periodic_centroids` is pinned FALSE on every arm — with centroid wrapping on, a free
+axis has period 2 and its fictitious volume would be `log 2` rather than
+`log(2 + √(π/k))`, invalidating the arms D/E predictions for a reason unrelated to D33.
+
 **The defect.** `latent_params()` round-trips the clobbered angles to 0.0, so every
 prior/buffer row carries `latent[3] = latent[5] = 0.0` exactly (std `0.0e+00`,
 n=535 and n=3582) while the energy is flat across the whole box there. `bwd` trains

@@ -142,7 +142,17 @@ def main():
     torch.set_num_threads(args.threads)     # stay off the GPU and out of the way
     torch.manual_seed(args.seed)
 
-    energy = ConformerTorsions(smiles=args.smiles, device="cpu", epsilon=args.epsilon)
+    # level is explicit and stays `torsion` here: this script's mode search, its period-2
+    # wrapping and its harmonic weights all assume every state dim is a torsion. Widening
+    # it is part of the ladder's step 4, not a default that can drift in.
+    #
+    # On the change of measure (ladder step 2): energy() now carries -T log J. At this
+    # level r and theta are frozen, so that term is CONSTANT in x -- the minima and the
+    # relative harmonic weights below are therefore unchanged, and only the absolute
+    # energies shift. That stops being true the moment this script is pointed at a wider
+    # level, where "mode" would come to mean a minimum of U - T log J rather than of U.
+    energy = ConformerTorsions(smiles=args.smiles, device="cpu", epsilon=args.epsilon,
+                               level="torsion")
     print(energy.describe())
     k = energy.data_ndim
     out = args.out or Path(f"conformer_buffer_{args.smiles.replace('/', '_')}.pt")

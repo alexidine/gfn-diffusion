@@ -30,7 +30,7 @@ adaptive_lr:
   - 0.01
   - 2000.0
   calibration:
-    alpha_target: 6.0
+    alpha_target: 4.0
     eta_up: 0.25
     eta_down: 0.5
   divergence_loss_abs: 1000000000.0
@@ -55,6 +55,14 @@ use_weight_decay: false
 compile_policy: auto
 traj_checkpoint: true
 gradient_norm_clip: auto
+grad_clip_guard:
+  enabled: true
+  p: 0.99
+  eta: 0.01
+  warmup_steps: 100
+  warmup_clip: static
+  max_ratio: 100.0
+  refresh_on_stage: true
 ema_decay: null
 max_reloads_per_1k_steps: 0.2
 model:
@@ -96,8 +104,11 @@ batch_growth_factor: 1.65
 batch_growth_interval: 50
 batch_growth_slow_interval: 300
 auto_batch_throughput_opt: true
-batch_growth_max_step_regression: 0.25
-max_step_seconds: 60
+batch_growth_min_throughput_gain: 0.05
+gpu_util_window_s: 900
+gpu_util_sample_period_s: 60
+gpu_util_policy_window_s: 7200
+max_step_seconds: 300
 batch_knee_recheck_steps: 2000
 oom_batch_shrink_factor: 0.5
 oom_cooldown_steps: 200

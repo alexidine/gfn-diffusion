@@ -99,7 +99,10 @@ batch_growth_factor: 1.65
 batch_growth_interval: 50
 batch_growth_slow_interval: 300
 auto_batch_throughput_opt: true
-batch_growth_max_step_regression: 0.25  # how much slower a step may get in exchange for a jump's throughput (replaces batch_growth_min_gain, which scored raw samples/sec and accepted jumps that made steps 43% slower)
+batch_growth_min_throughput_gain: 0.05  # samples/sec gain a jump must clear to be kept -- a SATURATION detector. opt-steps/sec = samples_per_sec / grad-accum target, so this maximises optimizer-step throughput; step time does not enter. MUST be < batch_growth_factor-1 (0.65 here): at or above it a factor-f jump can never deliver the demanded gain, so every jump is rejected and the batch FREEZES at batch_size
+gpu_util_window_s: 900  # trailing window for the gpu/util_recent metric. DIAGNOSTIC ONLY -- nothing in the trainer acts on occupancy: batch size does not move it on the MLIP route (measured, umaperf0812)
+gpu_util_sample_period_s: 60  # wall-clock seconds between occupancy samples. Time-based, not per-N-steps: a step-based cadence cannot fill a 900 s window at 200 s/step, which is how the metric came to be absent on exactly the slow MLIP arms it was there to watch
+gpu_util_policy_window_s: 7200  # the window the CLUSTER averages over when deciding to cancel. Logged as gpu/util_policy so the number the scheduler judges is visible in wandb
 batch_knee_recheck_steps: 2000
 oom_batch_shrink_factor: 0.5
 oom_cooldown_steps: 200

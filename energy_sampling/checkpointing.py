@@ -44,6 +44,17 @@ MODELLER_STATE_DEFAULTS = {
     # incoming stage has its own memory profile. Worth checkpointing so a
     # mid-stage resume doesn't have to rediscover the ceiling the hard way.
     'batch_size_oom_ceiling': None,
+    # the throughput pin: the stage whose knee has been found (None = still climbing)
+    # and the step it was pinned at, which is the recheck clock. These MUST travel
+    # with batch_size_oom_ceiling above. In a live process the pin is safe by
+    # accident -- every writer of the ceiling also writes the pin -- but a resume
+    # broke that pairing: it restored the ceiling from disk and left the pin
+    # undefined, and the growth walk reads it as a bare attribute, so the job died
+    # of AttributeError ~2 growth intervals in, outside the train loop's try/except.
+    # Checkpointing them also keeps a resumed run from re-climbing a knee it has
+    # already paid to find.
+    'batch_size_saturated_stage': None,
+    'batch_size_pinned_at': 0,
     'grow_buffer': False,
     'fwd_step_count': 0,
     'bwd_step_count': 0,
@@ -106,12 +117,24 @@ class Checkpointer:
 
     def get_state_dict(self):
         m = self.modeller
-        return {k: getattr(m, k) for k in MODELLER_STATE_DEFAULTS}
+        state = {k: getattr(m, k) for k in MODELLER_STATE_DEFAULTS}
+        # The adaptive clip tracker (grad_clip_guard.py) is state on an OBJECT
+        # rather than a Modeller attribute, so it cannot ride the comprehension
+        # above. Worth persisting because a rewind is exactly when the bar
+        # matters most: a divergence-triggered reload that dropped it would
+        # re-enter the warmup window with the run already unstable, i.e. the
+        # guard would be absent precisely during the excursion.
+        state['grad_guard'] = m.grad_guard.state_dict()
+        return state
 
     def set_state_dict(self, state):
         m = self.modeller
         for k, default in MODELLER_STATE_DEFAULTS.items():
             setattr(m, k, state[k] if k in state else deepcopy(default))
+        # Absent key, or a state version this build does not speak: the tracker
+        # warms from scratch. load_state_dict DISCARDS rather than reinterprets,
+        # for the same reason lr_ctrl's 'ver' does.
+        m.grad_guard.load_state_dict(state.get('grad_guard'))
         self.reconcile_batch_size()
 
     def reconcile_batch_size(self):

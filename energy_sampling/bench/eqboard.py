@@ -8,11 +8,16 @@ WHAT IS DIFFERENT FROM THE MLE BOARD, and it changes how to read the table:
 
   * THIS IS A CLIFF PROBLEM, NOT A TUNING PROBLEM. Measured, inside the stable
     band the settled distance moves only ~3.3x across a 10x rate sweep, while
-    crossing the boundary reaches 1e35 in ~200 steps. So the reward is not "find
-    the rate that minimises the loss", it is "get as close to the cliff as you
-    can without going over". `lr/cliff` is therefore the most informative
-    column: 1.0 means riding the edge, 0.1 means leaving most of the rate on the
-    table, >1 means you should be dead.
+    crossing the boundary reaches 1e35 in ~200 steps. `lr/cliff` is therefore
+    the most informative column -- but read it as a POSITION, not a score.
+
+    THE OPTIMUM IS NOT AT THE CLIFF. This file used to say the reward was "get
+    as close to the cliff as you can without going over", i.e. that lr/cliff 1.0
+    was the target. `bench.eqsuite` refutes that across cells: `fixed@0.03` sits
+    at 0.94-1.04x and finishes 0.34 / 0.52 / 3.91 nats back, then dies outright
+    in two of the nine. The good zone is 0.3-0.65x. The edge is a constraint to
+    respect, not a setpoint to seek -- the same shape-not-setpoint mistake
+    already recorded for alpha*.
   * THERE IS EXACT GROUND TRUTH. `stability_lr` is the closed-form
     spectral-radius-1 rate. Use the LEVEL-PINNED variant: the Z head sits at
     `lr_flow` and is exempt from the servo, so the level's rate does not scale

@@ -194,6 +194,104 @@ can manufacture a tail that is not there.
 Read `P99` before `Nonthermal Fraction`: the fraction is one bar on a
 distribution, and a tail growing *under* the bar is the same event seen earlier.
 
+### 3d. The per-condition fractions, 2026-08-13 — class 2
+
+`Reasonable Sample Fraction` and `Nonthermal Fraction` are both batch fractions
+of a per-sample 0/1 indicator, and a batch fraction cannot see failure
+**geometry**:
+
+| batch | pooled fraction | what it actually is |
+|---|---|---|
+| every condition 50% good | 0.50 | uniformly mediocre |
+| half the conditions 0% good | 0.50 | **half the library lost** |
+
+The second is a much worse model and is the one a conditional run risks.
+[`per_condition_fraction`](../utils.py:1766) groups the indicator by
+`condition_id`, takes each condition's own fraction `p_c`, and reduces *that*
+distribution. `Modeller.log_condition_fraction` publishes it at three sites —
+train-condition reasonable ([`train.py:4089`](../train.py:4089)) and non-thermal
+([`train.py:4271`](../train.py:4271)) at top level, held-out reasonable
+([`train.py:3864`](../train.py:3864)) under `eval_test/`:
+
+| Key | Meaning |
+|---|---|
+| `[eval_test/]Cond {Reasonable,Nonthermal} Failing Frac` | **headline** — share of *conditions* failing the bar. Within-stream only |
+| `Cond * Worst` | the `conditional_worst_quantile` bad tail across conditions — `tb_err_worst`'s convention and knob. Within-stream only |
+| `Cond * Spread` | binomial-debiased sd of `p_c` — **the only key here that may be compared across streams** |
+| `Cond * Frac` | histogram of the `p_c`; the distribution the scalars read off |
+| `Cond * N` | conditions scored — **read this first** |
+| `Cond * Bar` | the bar, emitted only when it moves (S3's rule). **Not** prefixed: it is a property of the family, so both streams score against one series |
+
+Direction is per family: `Reasonable` fails **below** `reasonable_cond_bar`
+(default 0.5), `Nonthermal` fails **above** `nonthermal_cond_bar` (default 0.1).
+Neither knob appears in any config — both are `getattr` defaults, and setting
+either to `null` turns that family off. "Failing" always means *this condition is
+broken*, so both headlines read larger-is-worse and `Worst` always names the same
+end as `Failing Frac`.
+
+**Both scalars are kept because they are censored at opposite ends** — the
+`alpha_median` lesson (`module_lr_controller.md`: a censored statistic still
+prints a number), applied at birth. Early in a run nearly every condition fails,
+so `Failing Frac` pins at 1.0 while `Worst` still moves; late, `Worst` pins at
+the good end while `Failing Frac` still resolves the last broken conditions.
+Either alone goes blind for half a run.
+
+**Resolution is the thing to check first.** `p_c` is a Bernoulli mean over that
+condition's `n_c = eval_num_samples / Cond * N` samples. At `n_c == 1` it is 0 or
+1, `Failing Frac` degenerates *exactly* to the pooled fraction (no lie, no added
+information), and the histogram's spikes at 0 and 1 are binomial artifacts rather
+than structure. Conditions are deliberately not count-weighted — each contributes
+its `p_c` once — which is the only reason any of this differs from the pooled
+value.
+
+**`Failing Frac` TRAVELS WITH `n_c`, so it is a within-stream reading only.**
+Binomial smearing pushes conditions across the bar, always toward that stream's
+own pooled fraction, so the *same* model reports different numbers at different
+sampling budgets. Measured on 400 synthetic conditions all at a true `p_c` of
+0.6 against a bar of 0.5 (true answer: 0):
+
+| `n_c` | `Failing Frac` | `Spread` (true 0) |
+|---|---|---|
+| 5 | **0.31** | 0.00 |
+| 50 | **0.04** | 0.00 |
+
+This matters because the two streams are not sampled alike. On `cond_aug11` the
+train side draws `eval_num_samples: 10000` over ~900 conditions and the held-out
+side `test_eval_num_samples: 2000` over ~100, so `n_c` is ~11 against ~20 — the
+held-out set is sampled *harder* per condition despite the smaller batch, and a
+naive `eval_fwd` vs `eval_test` comparison of `Failing Frac` reads a
+generalization gap that is pure sampling geometry.
+
+`Cond * Spread` is the fix, and the reason it is not just another summary:
+`Var(p̂) = Var(p) + E[p(1−p)/n]`, and the noise term is estimable
+(`p̂(1−p̂)/(n−1)` is unbiased for `p(1−p)/n`), so subtracting it leaves an
+estimate of the true between-condition spread that is **unbiased at any `n_c`** —
+0.0 when every condition is equally good, 0.5 when half the library is dead, at
+`n_c` 2 or 40 alike. The smaller stream's estimate is merely noisier, and noise
+is symmetric where the `Failing Frac` bias is not. The **level** half of a
+cross-stream comparison needs nothing new: the pooled `Reasonable Sample
+Fraction` is a batch mean and has no `n_c` dependence at all. Singletons carry no
+information about `Var(p)` and are dropped from both terms (`logw_std_within`'s
+mask); the key is omitted when fewer than two conditions have 2+ samples.
+
+**Held-out: the reasonable half only, and that asymmetry is structural.**
+`log_test_metrics` publishes `eval_test/Reasonable Sample Fraction` alongside the
+`eval_test/Cond Reasonable *` family, computed by the same
+`_reasonable_sample_mask` ([`train.py:4100`](../train.py:4100)) as the train-side
+reading, so the *indicator* is like-for-like — the rule `_eval_conditional_stats`
+already follows for the TB family. The *sampling* is not (see the `n_c` table
+above), which is what confines the cross-stream comparison to
+`Reasonable Sample Fraction` and `Cond Reasonable Spread`. The **non-thermal**
+family cannot follow at all:
+`u = (E - Emin(c))/T` needs a per-condition record, and held-out `condition_id`s
+are disjoint from train ones (`init_identifiers` mints one registry over distinct
+identifier strings) while `side_effects=False` forbids ever writing one. It would
+have nothing to reference and would read a constant 0, so it is not emitted
+there. Giving the held-out set its own `Emin(c)` table would not fix this: an
+`Emin` from a handful of eval batches is far shallower than one accumulated over
+training, so the two sides would stop being comparable, which is the only reason
+the `eval_fwd`/`eval_test` pair is worth logging.
+
 ## 4. Unconditional degeneracies
 
 With one condition, a large part of the family collapses:
@@ -204,6 +302,7 @@ With one condition, a large part of the family collapses:
 | `tb_err_worst` | == `tb_err` |
 | `z_grad_worst` | == `\|tb_resid_clipped\|` |
 | `logw_std_within` | **omitted entirely** |
+| `Cond * Failing Frac` / `Worst` / `Frac` / `N` / `Bar` | **omitted entirely** — with one group `Failing Frac` is a 0/1 step function and the histogram a single spike (§3d) |
 | `relative_under` | pooled (unchanged) |
 | `relative_under_wcen` | differs from `relative_under` only because the ramp weights are non-uniform |
 | `conditional_worst_quantile: 0.25` | **inert** |

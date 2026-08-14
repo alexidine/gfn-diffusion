@@ -563,15 +563,24 @@ def attach_states(condition: MolData, states, energies, identifier: Optional[str
 
 
 def bake_energies(energy, states, chunk: int = 4096) -> torch.Tensor:
-    """Raw energies for a state block, in the force field's own units.
+    """Raw POTENTIAL for a state block, in the force field's own units.
 
-    ``ConformerTorsions.energy`` returns E/T, so this passes ``log_temperature = 0``
-    explicitly rather than letting the energy's configured temperature leak into a stored
-    number that ``prebuilt_sample_to_reward`` will divide by again.
+    Two things this deliberately excludes, for the same reason: the stored number is
+    divided by the sampling temperature when ``prebuilt_sample_to_reward`` reads it back.
+
+    - The temperature. Hence ``log_temperature = 0`` rather than the energy's configured
+      one, so a T does not leak in and get divided out twice.
+    - **The change of measure.** ``energy()`` carries ``-T log J``; dividing that by T
+      gives ``-log J`` only at T = 1, so baking it would make the measure term scale as
+      1/T -- and a change of measure is by definition temperature-independent. It is
+      therefore added back on the read side, in log-reward units, after the division.
+
+    So this calls ``potential_energy`` explicitly rather than ``energy``. The distinction
+    did not exist before ladder step 2 and the two were the same function.
     """
-    zero = torch.tensor(0.0, dtype=energy.dtype, device=energy.device)
+    one = torch.tensor(1.0, dtype=energy.dtype, device=energy.device)  # T = 10**0
     states = torch.as_tensor(states, dtype=energy.dtype, device=energy.device)
-    return torch.cat([energy.energy(states[i:i + chunk], None, zero)
+    return torch.cat([energy.potential_energy(states[i:i + chunk], one)
                       for i in range(0, len(states), chunk)])
 
 

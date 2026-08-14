@@ -98,7 +98,10 @@ def main():
 
     conditions, energies = [], []
     for smiles, ident in zip(args.smiles, identifiers):
-        energy = ConformerTorsions(smiles=smiles, device="cpu", **ff)
+        # see build_conformer_buffer.py: `torsion` is explicit, not a default. The
+        # condition/prior file format stores per-graph `torsion_state` and n_torsions,
+        # both of which mean something else at a wider level.
+        energy = ConformerTorsions(smiles=smiles, device="cpu", level="torsion", **ff)
         print(energy.describe())
         mol = condition_from_energy(energy, identifier=ident)
         if not args.no_check:

@@ -353,6 +353,7 @@ failures live.
 | [`module_protocol.md`](module_protocol.md) | stages, exits, transition barrier, balance controller |
 | [`module_modulators.md`](module_modulators.md) | batch size, OOM, buffer servo |
 | [`module_lr_controller.md`](module_lr_controller.md) | LR warmup envelope, the alpha* servo, the divergence bar. **Rewritten 2026-08-08 for v7** -- the cut/latch/recovery middle layer and the decay leg are deleted, so anything citing them is pre-v7 |
+| [`module_bench.md`](module_bench.md) | `bench/` — CPU sandbox running the **real** controllers against synthetic surfaces with known ground truth. Where control-logic questions get answered without cluster time |
 | [`decisions.md`](decisions.md) | **the entry point.** Part 1 is the docket (items needing the user's own call); Part 2 the register by closing condition; Part 3 closed |
 | [`to_do_rebuild.md`](to_do_rebuild.md) | **forward-looking: the rebuild plan.** Part A LR controller, Part B batch construction, §0 the read-only gate battery, §C order of work — and the measured results from the 2026-08-07 local shakedown |
 | [`audit_since_ty4xdlzo.md`](audit_since_ty4xdlzo.md) | code + config diff of the current HEAD against the trusted `ty4xdlzo` reference |

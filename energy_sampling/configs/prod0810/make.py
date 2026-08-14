@@ -196,20 +196,32 @@ def build_config(base, name, mol, sg, zp, efunc, mlip_path):
 TRAJ_CHECKPOINT = {'elj': False, 'uma': True, 'mace': True}
 
 
-# --- per-energy wall-clock step ceiling -------------------------------------------
-# base.yaml's 10 s is right for elj and UNREACHABLE for an MLIP arm, which is not a
-# tuning nicety: chasing it is what got v2's uma arm killed. During the z_calibration
-# transient a step costs ~(1 + p) x 5.5 ms x batch with p ~ 10, so a 10 s step needs
-# batch <= ~165 -- small enough that the GPU is guaranteed to idle. The controller
-# duly cut 1000 -> 500 -> 250, utilization fell 75% -> 48%, and the scheduler
-# cancelled the job for low usage at 5.2 h.
+# --- per-energy RUNAWAY GUARD (not a tuning knob) ---------------------------------
+# max_step_seconds does not serve the objective -- it cuts the batch, and it measures
+# loop-iterations/hour rather than the samples/sec that opt-step throughput is
+# proportional to. It survives only to catch the v1 pathology (181-262 s steps at 15
+# samples/s), so it is set FAR above the operating point on purpose: elj runs 2-4 s
+# steps, uma ran 3.7-67 s, both with wide margin. It also stands itself down for a
+# stage if a cut fails to move step time, since a fixed per-step cost is not something
+# the batch can fix.
+MAX_STEP_SECONDS = {'elj': 60, 'uma': 300, 'mace': 300}
+
+# --- GPU occupancy: MEASURED, NOT CONTROLLED --------------------------------------
+# The cluster cancels a job whose GPU utilization averages under 60% for ~2 h, and
+# prod0810's uma arm (4r351oqm) died that way at 5.2 h. These arms used to carry
+# gpu_util_floor: 70, which grew the batch whenever the trailing mean fell under it.
+# That key is RETIRED (utils._RETIRED_KEYS) and setting it now hard-fails preflight.
 #
-# So on a usage-policed cluster the ceiling and GPU occupancy pull in OPPOSITE
-# directions, and for an expensive energy occupancy wins: a bigger batch with slower
-# steps is the configuration that survives. 60 s still catches a genuine runaway (v1
-# sat at 181-262 s) without cutting into the idle regime. elj keeps 10 s -- it holds
-# that comfortably at batch 1650-4491 and runs at 66% utilization.
-MAX_STEP_SECONDS = {'elj': 10, 'uma': 60, 'mace': 60}
+# It was removed because its premise is false here. umaperf0812/c_controller, whose
+# every growth was floor-driven: batch 100->741 took utilization 52->42% and
+# samples/sec 57.7->24.3. Occupancy does not rise with batch once the MLIP dominates
+# the step, so the floor overrode a throughput gate that would have refused all four
+# jumps, and cost 58% of throughput for nothing. It was inert on these very arms
+# besides -- a 900 s window cannot fill from a per-10-step sample at 200 s/step.
+#
+# Occupancy is still logged (gpu/util_recent, gpu/util_policy, now sampled on a
+# wall-clock cadence so slow arms report too). If an arm is cancelled for low usage
+# the levers are work per kernel launch and unpaired host stalls, NOT batch size.
 
 
 # --- SLURM time classes ------------------------------------------------------
@@ -220,20 +232,19 @@ TIME_CLASSES = [
     ('acridine',      '2-00:00:00', 8, lambda mol: mol == 'acridine'),
 ]
 
-# --- why cpus-per-task is 8 and not 1 --------------------------------------------
-# v2's uma arm (4r351oqm) was cancelled at 5.2 h for LOW GPU USAGE: median utilization
-# 45%, 31% of samples under 30%, power 190-215 W on a 400 W A100. Low utilization AND
-# low power together mean the GPU is idle waiting, not saturated -- and the whole
-# host side (fairchem AtomicData construction, the PBCv2 neighbour-list build that
-# warns "very large box ... slower than optimal", PyG collation, buffer draws) ran
-# single-threaded under --cpus-per-task=1.
+# --- cpus-per-task 8: kept, but it is NOT the fix ---------------------------------
+# Raised from 1 on the theory that the low-util/low-power signature was host-bound
+# and single-threaded. Host-bound is right; single-threaded-because-of-CPU-count is
+# NOT. The hot paths are serial Python `for` loops over graphs -- one AtomicData
+# object built per crystal in mlip_interfaces/uma_utils.py, then collated one at a
+# time, ~52k scalar extractions and ~29k CUDA syncs per 1000-crystal call, done TWICE
+# (crystal leg + gas-phase leg). A second core cannot enter a serial loop, so extra
+# CPUs buy nothing here.
 #
-# This is a HYPOTHESIS, not a measurement: this cluster logs no CPU columns to wandb,
-# so the host-bound story is inferred from the utilization/power signature, not
-# observed. energy/* metrics were added to train.py in the same change to settle it --
-# read energy/frac_of_step on the next run before spending more effort here.
-# CPUs are near-free next to an A100, so all classes get the bump; the elj arms run
-# the same collation/buffer path and sat at 66%, not 100%, so they may benefit too.
+# Left at 8 anyway: CPUs are near-free beside an A100 and it costs only queue time.
+# The real lever is vectorising that construction (measured 720 ms -> 3.1 ms at
+# B=1000, bit-identical output) and caching the gas-phase leg, which is recomputed
+# every call for a quantity that depends only on molecule identity.
 
 
 def _slurm_ranges(idxs):

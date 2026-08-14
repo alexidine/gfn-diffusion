@@ -72,6 +72,7 @@ class MolecularCrystal(BaseSet):
                  log_temperature_range: list = None,
                  analyze_kwargs: Optional[dict] = None,  # extra kwargs passed through to crystal_batch.analyze()
                  internal_oom_recovery: bool = True,  # if False, skip the adaptive sub-batching/OOM catch-and-shrink loop in batched_analyze_crystal_batch and analyze the whole batch in one call, letting any OOM propagate to the caller
+                 host_gas_phase_reference: bool = True,  # uma/mace only: compute the isolated-molecule leg ONCE per molecule and carry it, instead of recomputing it every energy call. See attach_gas_phase_reference
                  ):
 
         super(MolecularCrystal, self).__init__()
@@ -139,6 +140,12 @@ class MolecularCrystal(BaseSet):
         if isinstance(analyze_kwargs, Namespace):  # yaml configs nest dicts as Namespaces
             analyze_kwargs = vars(analyze_kwargs)
         self.analyze_kwargs = analyze_kwargs or {}
+        self.host_gas_phase_reference = bool(host_gas_phase_reference)
+        # mol_id -> isolated-molecule MLIP energy, filled lazily on first sight of
+        # each molecule. Deliberately NOT checkpointed: it is a pure function of the
+        # molecule set and the MLIP weights, so a resume refills it in one call
+        # rather than risking a stale value riding across a model or dataset change.
+        self._gas_pot_cache = {}
         if self.energy_function == 'uma':
             self.mlip_path = mlip_path
             self.predictor = init_uma_crystal_predictor(mlip_path, device=self.device)
@@ -152,6 +159,23 @@ class MolecularCrystal(BaseSet):
         self.energy_clip = None
         self.reward_clip = None
 
+        # TWO independent facts, previously conflated into one:
+        #
+        #   is_crystal     -- the state IS a crystal parameterization, so the crystal
+        #                     latent layout applies: periodic angle dims, the jacobian
+        #                     correction, and (D33) dead-row resolution.
+        #   latent_energy  -- the reward is a cheap analytic function OF THE LATENT, so
+        #                     there is no packing coefficient, no pressure term and no
+        #                     physical mol_energy to read.
+        #
+        # `latent_gaussian` is the combination that did not previously exist: a real
+        # crystal parameterization scored by an analytic gaussian. That is what lets a
+        # toy measure the dead-row machinery against a CLOSED-FORM log Z, which no
+        # physical energy can provide. latent_harmonic/latent_multiharmonic keep
+        # is_crystal False exactly as before, so every existing toy config is untouched.
+        self.latent_energy = self.energy_function in ['latent_harmonic',
+                                                      'latent_multiharmonic',
+                                                      'latent_gaussian']
         self.is_crystal = not self.energy_function in ['latent_harmonic', 'latent_multiharmonic']  # not a toy model
 
         self.batch = collate_data_list([MolCrystalData(max_z_prime=max_z_prime)], max_z_prime=max_z_prime)
@@ -238,9 +262,108 @@ class MolecularCrystal(BaseSet):
             crystal_batch.canonicalize_zp_aunits()
         return crystal_batch
 
+    def attach_gas_phase_reference(self, crystal_batch):
+        """
+        Host the MLIP gas-phase reference instead of recomputing it every call.
+
+        WHAT IT IS. A lattice energy is (crystal - isolated molecule); mxtaltools'
+        compute_lattice_uma/_mace evaluate BOTH legs per call. The second leg is an
+        isolated molecule in a P1 cell at pbc=False, so for the rigid molecules this
+        sampler uses its value depends only on MOLECULE IDENTITY -- not on the cell,
+        not on the centroid, and (UMA being rotation-invariant) not on the sample's
+        orientation either. Recomputing it per call buys nothing and costs a whole
+        extra MLIP forward plus its host-side batch construction: roughly half the
+        energy call.
+
+        HOW IT SKIPS. compute_lattice_uma is already written as
+        `if not hasattr(self, 'uma_gas_pot')`, so simply carrying the attribute on
+        the batch bypasses the leg -- no change is needed in mxtaltools.
+
+        HOW THE VALUE IS PRODUCED. By calling mxtaltools' own
+        compute_lattice_gas_phase_* on one representative crystal per molecule,
+        rather than reimplementing it. That leg has real structure worth not
+        duplicating: a P1 reset, box_analysis, force_rebuild, and for Z'>1 a
+        per-conformer split followed by a scatter-MEAN back onto the parent graph.
+
+        WHAT CHANGES NUMERICALLY. Every sample of a molecule now gets ONE reference
+        value instead of that molecule's value at its own orientation. The
+        difference is UMA's rotation-invariance error, multiplied by 96.485 into
+        kJ/mol -- i.e. this REMOVES a per-sample noise term from the reward rather
+        than adding one. `gas_reference_audit` measures that term; run it before
+        trusting the assumption on a new molecule set.
+
+        Keyed on mol_id, which train.py's init_identifiers mints per identifier
+        string. No mol_id (toys, unkeyed batches) -> silently do nothing and let the
+        original per-call path run.
+        """
+        if self.energy_function not in ('uma', 'mace'):
+            return
+        if not getattr(self, 'host_gas_phase_reference', True):
+            return
+        mol_id = getattr(crystal_batch, 'mol_id', None)
+        if mol_id is None:
+            return
+
+        key = f'{self.energy_function}_gas_pot'
+        cache = self._gas_pot_cache
+        ids = mol_id.tolist()
+        missing = [i for i in dict.fromkeys(ids) if i not in cache]
+        if missing:
+            # one representative crystal per unseen molecule -- FIRST occurrence, so
+            # the reference is a real sample of that molecule rather than a synthetic
+            # pose the rest of the pipeline never produces
+            first = {}
+            for row, mid in enumerate(ids):
+                if mid in missing and mid not in first:
+                    first[mid] = row
+            rows = torch.tensor([first[m] for m in missing], dtype=torch.long,
+                                device=crystal_batch.device)
+            sub = crystal_batch.subsample_new_batch(rows)
+            fn = (sub.compute_lattice_gas_phase_uma if self.energy_function == 'uma'
+                  else sub.compute_lattice_gas_phase_mace)
+            vals = fn(self.predictor).detach()
+            for slot, mid in enumerate(missing):
+                cache[mid] = float(vals[slot])
+            print(f"gas reference: cached {len(missing)} molecule(s) "
+                  f"({len(cache)} total) -- skipping the gas leg from here on")
+
+        ref = torch.tensor([cache[i] for i in ids], dtype=torch.float32,
+                           device=crystal_batch.device)
+        crystal_batch.add_graph_attr(ref, key)
+
+    @torch.no_grad()
+    def gas_reference_audit(self, crystal_batch, n: int = 8):
+        """
+        Measure what hosting the gas reference actually costs in accuracy: recompute
+        the leg for `n` live samples and compare against the cached value, in kJ/mol.
+
+        This is the number that decides whether hosting is a pure speedup or a
+        correctness fix. The gas energy is subtracted and then scaled by 96.485, so a
+        spread here is noise that was riding in every reward -- against a lattice
+        energy of order 100 kJ/mol, a few tenths is real. Returns {} when hosting is
+        off or unkeyed.
+        """
+        if self.energy_function not in ('uma', 'mace'):
+            return {}
+        key = f'{self.energy_function}_gas_pot'
+        cached = getattr(crystal_batch, key, None)
+        if cached is None:
+            return {}
+        rows = torch.arange(min(n, crystal_batch.num_graphs), device=crystal_batch.device)
+        sub = crystal_batch.subsample_new_batch(rows)
+        delattr(sub, key)  # force the real leg to run
+        fn = (sub.compute_lattice_gas_phase_uma if self.energy_function == 'uma'
+              else sub.compute_lattice_gas_phase_mace)
+        fresh = fn(self.predictor).detach()
+        drift = (fresh - cached[rows]) * 96.485
+        return {'gas_ref/drift_mean_kj': float(drift.mean()),
+                'gas_ref/drift_absmax_kj': float(drift.abs().max()),
+                'gas_ref/drift_std_kj': float(drift.std()) if drift.numel() > 1 else 0.0}
+
     def analyze_crystal_batch(self, x, mol_batch, temperature, return_batch=False,
                               keep_grads: bool = False):  # x is gfn_outputs
         crystal_batch = self.instantiate_crystals(x, mol_batch)
+        self.attach_gas_phase_reference(crystal_batch)
 
         analyze_kwargs = dict(cutoff=10,
                               supercell_size=10,
@@ -322,7 +445,11 @@ class MolecularCrystal(BaseSet):
         # matching the same compensation already applied to jacobian_energy below
         bounding_energy = bounding_energy * temperature
 
-        if self.is_crystal:
+        # `and not self.latent_energy`: a latent-scored crystal (latent_gaussian) has a
+        # real crystal parameterization but no packing coefficient, pressure term or
+        # physical mol_energy to read, so it must not enter this block. Without the
+        # second clause it would walk straight into density_penalty(packing_coeff).
+        if self.is_crystal and not self.latent_energy:
             density_energy = density_penalty(crystal_batch.packing_coeff)
             mol_energy = getattr(crystal_batch, self.energy_function)
             if self.energy_function not in ['uma', 'mace']:
@@ -347,7 +474,18 @@ class MolecularCrystal(BaseSet):
             ens_dict['bounding_energy'] = bounding_energy
             ens_dict['pressure_energy'] = pressure_energy
         else:
+            # reduction_energy is structurally zero for a latent-scored problem, which is
+            # what keeps the analytic log Z exact. It matters: on P-1 the reduced region
+            # is a thin, oddly-shaped set in box-latent space, and no zero-reduction ball
+            # wide enough for a gaussian was found in 4000 draws (best: 0 at the centre,
+            # 0.105 at the edge of a +-0.15 ball). Leaving the penalty on would contaminate
+            # the target by ~1 nat at 1.5 sigma. Being structural rather than a config
+            # knob means a config cannot switch it back on by accident.
             reduction_energy = torch.zeros_like(bounding_energy)
+            # still log the bounding term -- for a latent-scored problem it is the ONLY
+            # active penalty, so dropping it from ens_dict would leave the run with no
+            # visibility into the one thing constraining the box
+            ens_dict['bounding_energy'] = bounding_energy
 
         if self.energy_function == 'latent_harmonic':
             crystal_energy = getattr(crystal_batch, 'latent_harmonic')
@@ -355,13 +493,31 @@ class MolecularCrystal(BaseSet):
         elif self.energy_function == 'latent_multiharmonic':
             crystal_energy = getattr(crystal_batch, 'latent_multiharmonic')
 
+        elif self.energy_function == 'latent_gaussian':
+            # Same compute as latent_harmonic (crystal_analysis.py reuses the function),
+            # but on a batch whose is_crystal is True -- so dead rows, periodic angle dims
+            # and the jacobian correction are all live. Set `c` to the canonical value
+            # (0.0) on dead rows in analyze_kwargs and the energy becomes live-dims-only
+            # for free: their contribution is exactly ((0 - 0)/w)^2 = 0.
+            crystal_energy = getattr(crystal_batch, 'latent_gaussian')
+
         elif self.energy_function in ['lj', 'qlj', 'elj', 'silu', 'uma', 'mace']:
             crystal_energy = self.lj_coeff * mol_energy + self.density_coeff * density_energy + pressure_energy
 
         else:
             assert False, f'{self.energy_function} not implemented'
 
-        if not self.is_crystal:
+        # `or self.latent_energy`: the jacobian is a CHANGE OF MEASURE from the box-latent
+        # parameterization to the physical one (cartesian aunit position, Haar rotation), so
+        # that a target defined by a PHYSICAL energy is sampled correctly in physical space.
+        # A latent-space analytic target is defined IN the latent space, so there is no
+        # measure to correct and the correction is not merely unnecessary but wrong: the
+        # target would become gaussian * |J|, which has no closed form in box coordinates.
+        # It would also silently break the dead-row test itself -- rows 3/4/5 are cell
+        # angles, which enter cell_volume, so with the jacobian on those dims are no longer
+        # flat even when the energy ignores them, and the rows-live arm's fictitious volume
+        # stops being log 2 per dim.
+        if not self.is_crystal or self.latent_energy:
             jacobian_energy = torch.zeros_like(bounding_energy)
         else:
             jacobian_energy, jacobian_components = self.compute_jacobian(crystal_batch, temperature)

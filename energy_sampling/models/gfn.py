@@ -40,6 +40,7 @@ class GFN(nn.Module):  # todo add seeding
                  max_z_prime: int = 1,
                  full_flow: bool = False,
                  do_periodic_angles: bool = True,
+                 angular_mask: Optional[Sequence[bool]] = None,
                  periodic_centroids: bool = False,
                  periodic_centroid_axes: Optional[Sequence[int]] = None,
                  hold_dead_latent_rows: bool = True,
@@ -100,6 +101,7 @@ class GFN(nn.Module):  # todo add seeding
         self.hold_dead_latent_rows = hold_dead_latent_rows
         self.get_periodic_dimensions(
             device, do_periodic_angles=do_periodic_angles,
+            angular_mask=angular_mask,
             periodic_centroid_axes=periodic_centroid_axes if periodic_centroids else None,
             dead_latent_rows=dead_latent_rows if hold_dead_latent_rows else None,
             dead_latent_values=dead_latent_values if hold_dead_latent_rows else None)
@@ -248,6 +250,7 @@ class GFN(nn.Module):  # todo add seeding
                 self.flow_model = LearnableScalar()  # unified syntax with this instead of nn.Parameter
 
     def get_periodic_dimensions(self, device, do_periodic_angles: bool = True,
+                                angular_mask: Optional[Sequence[bool]] = None,
                                 periodic_centroid_axes: Optional[Sequence[int]] = None,
                                 dead_latent_rows: Optional[Sequence[int]] = None,
                                 dead_latent_values: Optional[Sequence[float]] = None):
@@ -272,7 +275,34 @@ class GFN(nn.Module):  # todo add seeding
         Note this also extends `dplr_mask_angular` (get_dplr_cov) to the wrapped centroid
         dims, which is the consistent reading: that mask exists to keep the shared
         low-rank noise direction off circular coordinates, and these are now circular.
+        `angular_mask` is the explicit route: a length-dim sequence of bools supplied by
+        the caller, which BYPASSES the crystal layout below entirely. It exists because
+        the crystal layout is not the only state layout -- a conformer's is
+        `[r | theta | phi]` restricted to whichever DoF the level frees -- and the base
+        class must not have to guess. `do_periodic_angles` cannot serve that role: it
+        conflates "not a crystal" with "not periodic" and its False branch hands ANY
+        non-crystal state ZERO wrapped dims, silently. For a torsion state that is not a
+        degraded layout but an unnormalizable target -- the reward is exactly 2-periodic
+        in every dim, so with no wrap the integral diverges and no log Z exists.
+
+        The energy owns the layout and declares it (see ConformerTorsions.periodic_dims);
+        the caller passes it here. Crystal energies pass nothing and take the branch below.
         """
+        if angular_mask is not None:
+            if periodic_centroid_axes:
+                raise ValueError(
+                    "periodic_centroid_axes is a crystal-layout argument and cannot be "
+                    "combined with an explicit angular_mask; the mask already says which "
+                    "dims wrap")
+            angs = [bool(a) for a in angular_mask]
+            if len(angs) != self.dim:
+                raise ValueError(
+                    f"angular_mask has {len(angs)} entries but dim is {self.dim}; the "
+                    f"energy's declared layout and the policy's width disagree")
+            self.periodic_centroid_axes = ()
+            self._finalize_dim_partition(device, angs, dead_latent_rows, dead_latent_values)
+            return
+
         if do_periodic_angles:
             # The crystal layout below is the ONLY thing that makes dim and max_z_prime
             # two views of one fact, so check them here rather than inside the
@@ -292,7 +322,14 @@ class GFN(nn.Module):  # todo add seeding
                 angs.extend([False, True, True])
                 # phi and r dimensions arein rotational basis
         else:
-            angs = [False] * 12
+            # self.dim, NOT a hardcoded 12. This was `[False] * 12` and is a latent bug
+            # surfaced by _finalize_dim_partition's width check: with do_periodic_angles
+            # off (the toy path) and dim != 12 the mask came out the wrong length, and
+            # since lin_idx is derived from it, `expand_state_for_policy` would have fed
+            # the policy only the first 12 dims of a wider state -- silently, e.g. for a
+            # toy with z_primes: [2] (data_ndim 18). Unreached today only because every
+            # toy config happens to sit at data_ndim 12.
+            angs = [False] * self.dim
 
         self.periodic_centroid_axes = tuple(sorted(set(periodic_centroid_axes or ())))
         if self.periodic_centroid_axes:
@@ -318,7 +355,7 @@ class GFN(nn.Module):  # todo add seeding
         widths, expanded_dim, and the pinned dead values.
 
         Factored out of get_periodic_dimensions so SUBCLASSES with their own state layout
-        (TorsionGFN, whose every dim wraps) share this bookkeeping instead of
+        (or an explicit angular_mask, e.g. a conformer's) share this bookkeeping instead of
         reimplementing it. That is not cosmetic: the previous arrangement had the subclass
         hand-maintain ang_mask/ang_dim/lin_dim/expanded_dim/ang_idx/lin_idx, so adding the
         dead-row attributes to the base method left the override silently short of seven

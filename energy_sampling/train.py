@@ -28,13 +28,14 @@ from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTra
     _per_condition_max, strip_lazy_sg_caches
 from energy_sampling.checkpointing import Checkpointer, MODELLER_STATE_DEFAULTS
 from energy_sampling.controller import LRController
-from energy_sampling.protocol import StageProtocol
+from energy_sampling.grad_clip_guard import GradClipGuard
+from energy_sampling.protocol import StageProtocol, TRAIN_MODES
 from energy_sampling.ray_calibration import RayCalibration
 from energy_sampling.eval.utils import sample_eval_fwd_trajs
 from energy_sampling.utils import is_cuda_oom, \
     dict2namespace, \
     get_discretizer, drain_elapsed_times, MetricTracker, quick_tb_stats, uniform_discretizer, logmeanexp, \
-    cal_subtb_coef_matrix
+    cal_subtb_coef_matrix, per_condition_fraction
 from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss, log_pf_estimate
 from models import GFN
 from energy_sampling.models.aunit_periodicity import sg_periodic_centroid_axes, describe
@@ -174,10 +175,20 @@ class Modeller:
         # 'budget' is the churn quota the prior-model draw was asked for, so the
         # admitted counts can be read as an admission RATE, not just a raw count
         self.prior_churn = {'from_prior_model': 0, 'from_anchors': 0, 'from_seed': 0,
-                            'evicted': 0, 'budget': 0}
+                            'evicted': 0, 'budget': 0, 'expired': 0, 'anchor_floor': 0}
         self.device = self.args.device
         self.checkpointer = Checkpointer(self)
         self.lr_controller = LRController(self)  # fixed-peak ramp/hold/decay; tripwires always on
+        # Adaptive clip bar. Built HERE and not in init_schedulers_optimizers
+        # (where ray_cal is) precisely because that runs again at every stage
+        # transition: the guard's tracker is state we want to survive a
+        # boundary, and what the boundary should do to it is the softer
+        # refresh() -- recalibrate while the old bar stays live. Absent config
+        # block => disabled => threshold() is args.gradient_norm_clip, so this is
+        # inert for every existing config.
+        self.grad_guard = GradClipGuard.from_config(
+            self.args.gradient_norm_clip, getattr(self.args, 'grad_clip_guard', None))
+        self.grad_guard.announce()
         self.protocol = StageProtocol(self)  # the declarative stage engine: coeffs, balance, exits, transitions
         self.init_train_constants()
 
@@ -205,7 +216,7 @@ class Modeller:
         # samples and seconds accumulated since the last report, so throughput
         # is a true window ratio rather than batch_size / one sampled step time
         # (batch_size moves by 3-4x over a run, so the two are not the same)
-        self._throughput = {'samples': 0, 'seconds': 0.0}
+        self._throughput = {'samples': 0, 'seconds': 0.0, 'energy_seconds': 0.0}
 
     # position in the protocol, derived -- checkpoints store the stage NAME; the
     # int only feeds wandb continuity and the LR controller's stage-change marker
@@ -235,6 +246,103 @@ class Modeller:
 
     def train_logic(self, it):
         return self.protocol.stage.train_mode
+
+    def _now(self):
+        """
+        Wall clock for the time-windowed sensors, as a method so bench/ can drive
+        them on a VIRTUAL clock. The bench runs thousands of steps in about a second,
+        so real timestamps would put every sample inside every window and the
+        averaging logic -- which is the part worth testing -- would never be
+        exercised. One seam here beats reimplementing the windowing in the fake.
+        """
+        return time()
+
+    def _sample_gpu_util(self):
+        """
+        One NVML utilization reading, appended with its timestamp. Cheap and
+        time-gated, so the caller may invoke it every step.
+
+        THIS IS THE JOB-SURVIVAL NUMBER, though nothing in this process acts on it:
+        the cluster cancels a job whose GPU utilization averages under a threshold
+        for a couple of hours -- prod0810's uma arm (4r351oqm) died that way at 5.2 h
+        with hourly means 75/62/54/49/48/48%. The batch controller used to read it
+        and grow on it; that rule is gone (see increment_batch_size) because batch
+        size does not move occupancy on this route. Reporting it accurately still
+        matters, because it is the criterion we are actually judged on.
+
+        SAMPLED ON A TIME CADENCE, NOT A STEP CADENCE. It used to be sampled once per
+        ten_step_reporting, which is fine at 2 s/step and useless at 200 s/step: two
+        readings 2000 s apart cannot populate a 900 s window, so `_gpu_util_mean`
+        returned None and the metric was simply absent -- on exactly the slow MLIP
+        arms whose utilization we most needed to watch. A wall-clock period decouples
+        the sensor from the step time it is trying to characterise.
+
+        TWO SOURCES, because the obvious one is not always there.
+        `torch.cuda.utilization()` needs the pynvml bindings, which are NOT installed
+        in this project's venv -- the first local run printed "gpu util sensor
+        unavailable (ModuleNotFoundError)" and logged no occupancy at all for the
+        whole run. So it falls back to nvidia-smi via gpu_guard, which is already a
+        train.py dependency and demonstrably works on this box. Only after BOTH fail
+        does it go inert, and then loudly: a missing sensor must never stop training,
+        but a run with no occupancy trace is a run we cannot defend to the scheduler.
+        """
+        if getattr(self, '_gpu_util_off', False):
+            return
+        now = self._now()
+        period = float(getattr(self.args, 'gpu_util_sample_period_s', 60) or 0)
+        last = getattr(self, '_gpu_util_last_sample', None)
+        if period > 0 and last is not None and now - last < period:
+            return
+        self._gpu_util_last_sample = now
+        reading = self._read_gpu_util()
+        if reading is None:
+            self._gpu_util_off = True
+            print("gpu util sensor unavailable (no pynvml AND no nvidia-smi) -- "
+                  "no gpu/util_* metrics for this run. Nothing depends on it to train, "
+                  "but on a usage-policed cluster this is the number the scheduler "
+                  "cancels on and we will have no record of it.")
+            return
+        if not hasattr(self, '_gpu_util'):
+            self._gpu_util = deque(maxlen=4096)
+        self._gpu_util.append((now, reading))
+
+    def _read_gpu_util(self):
+        """
+        One raw utilization percent, or None if no sensor answers. Split out from
+        the sampling cadence above purely as a SEAM: bench/ substitutes a synthetic
+        GPU here and then runs the real `_sample_gpu_util` on top of it, so the
+        cadence logic under test is the shipping one rather than a copy of it. The
+        harness used to reimplement the cadence, which is how it kept passing while
+        the real sampler could not populate its own window on slow steps.
+        """
+        try:
+            return float(torch.cuda.utilization())
+        except Exception:
+            pass
+        try:
+            import gpu_guard
+            mem = gpu_guard.gpu_memory()              # (used, free, total, util%)
+            if mem is not None:
+                return float(mem[3])
+        except Exception:
+            pass
+        return None
+
+    def _gpu_util_mean(self, window_s: float):
+        """Mean utilization over the trailing `window_s` seconds, or None if the
+        sensor is off or the window is not yet populated. None means 'no reading',
+        never 'fine'."""
+        samples = getattr(self, '_gpu_util', None)
+        if not samples:
+            return None
+        cutoff = self._now() - window_s
+        recent = [u for ts, u in samples if ts >= cutoff]
+        # a couple of readings inside a 15-minute window is not a mean, it is a coin
+        # flip. With time-cadence sampling this is reachable at any step time; on the
+        # old step-cadence it was what made the metric vanish on slow MLIP arms.
+        if len(recent) < 5:
+            return None
+        return sum(recent) / len(recent)
 
     def _batch_floor(self) -> int:
         """
@@ -307,14 +415,59 @@ class Modeller:
         times = getattr(self, '_recent_step_times', None)
         med = float(np.median(list(times)[-20:])) if times and len(times) >= 10 else None
 
-        # absolute step-time ceiling, checked before any throughput reasoning and
-        # in BOTH directions: an oversized batch inherited across a transition (or
-        # restored from a checkpoint) has to be able to come back down, and the
-        # knee walk alone only ever moves up from where it starts
+        # THERE IS DELIBERATELY NO OCCUPANCY RULE HERE, and re-adding one needs new
+        # evidence, not new reasoning. `gpu_util_floor` used to sit at the top of this
+        # ladder and grow the batch whenever utilization fell under the cluster's
+        # cancellation threshold. Deleted 2026-08-13: its premise is false on this
+        # route. Utilization is flat-to-DECLINING in batch once an MLIP dominates the
+        # step, because the energy call is already saturating the card and a bigger
+        # batch mostly buys more host-side work. Measured, umaperf0812 c_controller --
+        # every growth driven by the floor, the throughput gate never fired once:
+        #
+        #     batch      100    165    272    449    741
+        #     util %      52     44     49     42      -
+        #     samples/s  57.7   46.5   45.1   28.2   24.3
+        #
+        # A 7.4x batch increase bought NEGATIVE occupancy and cost 58% of throughput,
+        # and because the rule outranked everything it overrode a throughput gate that
+        # would have refused all four jumps. It was also structurally inert on the very
+        # arms it was written for: sampling once per ten_step_reporting could not fill
+        # a 900 s window at 181-262 s/step, so it never fired there at all.
+        #
+        # Batch size is simply not the control input for occupancy here -- work per
+        # kernel launch and unpaired host stalls are. The SENSOR survives as a metric
+        # (gpu/util_recent, gpu/util_policy): the cancellation criterion is real and
+        # worth watching, it is just not actuable from this function.
+
+        # RUNAWAY GUARD. An absolute wall-clock ceiling on one train step, checked
+        # before the growth walk because a step already over the ceiling must never be
+        # grown. Set it far above the operating point -- it exists for the 181-262 s
+        # pathology, not for tuning.
         max_step_s = float(getattr(self.args, 'max_step_seconds', 0) or 0)
         if max_step_s > 0 and med is not None and med > max_step_s:
             if self.step_ind < getattr(self, 'batch_size_cooldown_until', -1):
                 return
+            # ...unless cutting has already been shown not to help. The guard's whole
+            # model is "step time scales with batch"; when the overrun is FIXED cost
+            # (an MLIP hiccup, a z_cal transition at ~12x, a slow host) that model is
+            # wrong and the proportional cut below ratchets forever -- 1000 -> 538 ->
+            # 290 -> ... -> 1, training at batch 1 without ever raising an error, one
+            # torch.compile recompile per rung. So MEASURE the previous cut: if the
+            # batch fell materially and the median step time did not, stop cutting.
+            if getattr(self, '_runaway_unresponsive_stage', None) == stage_name:
+                return
+            last = getattr(self, '_runaway_last_cut', None)
+            if last is not None:
+                prev_b, prev_med = last
+                if self.batch_size <= prev_b / 1.4 and med >= 0.9 * prev_med:
+                    self._runaway_unresponsive_stage = stage_name
+                    print(f"batch: step time {med:.1f}s still over max_step_seconds "
+                          f"{max_step_s:.1f}s after cutting {prev_b} -> {self.batch_size} "
+                          f"({prev_med:.1f}s -> {med:.1f}s). The overrun is NOT batch-driven, "
+                          f"so cutting further only shrinks the gradient -- standing down for "
+                          f"stage '{stage_name}'. Look at fixed per-step cost (z_calibration "
+                          f"rollouts at a transition, MLIP call overhead, host stalls).")
+                    return
             f = float(getattr(self.args, 'batch_growth_factor', 2.0))
             # PROPORTIONAL, not one rung: step cost is close enough to linear in batch
             # that the overshoot ratio estimates the target directly, and a fixed /f
@@ -337,14 +490,26 @@ class Modeller:
             if accum > 0 and getattr(self.protocol.stage, 'train_mode', None) == 'fused':
                 shrunk = max(shrunk, min(accum, self.batch_size))
             if shrunk >= self.batch_size:
-                print(f"batch: step time {med:.1f}s over max_step_seconds {max_step_s:.1f}s "
-                      f"at batch {self.batch_size}, which is already the smallest size that "
-                      f"still makes one optimizer update ({accum} samples). Cutting further "
-                      f"cannot speed the update up -- lower fused_grad_accum_min_samples, "
-                      f"raise max_step_seconds, or accept the step cost.")
+                # ONCE PER STAGE. increment_batch_size runs every step, so an
+                # unconditional print here is ~10k copies of the same paragraph on a
+                # 7-day run -- and it holds whenever batch_size <= accum_target, which
+                # is mk_dev's shipped 1000/1000 pair at the base batch of any fused
+                # stage. Freezing the controller is right (growing a step that is
+                # already over the ceiling would make it worse); shouting is not.
+                if getattr(self, '_accum_floor_warned_stage', None) != stage_name:
+                    self._accum_floor_warned_stage = stage_name
+                    print(f"batch: step time {med:.1f}s over max_step_seconds {max_step_s:.1f}s "
+                          f"at batch {self.batch_size}, which is already the smallest size that "
+                          f"still makes one optimizer update ({accum} samples). Cutting further "
+                          f"cannot speed the update up -- lower fused_grad_accum_min_samples, "
+                          f"raise max_step_seconds, or accept the step cost. Growth is frozen "
+                          f"for stage '{stage_name}' while this holds (said once).")
             if shrunk < self.batch_size:
                 print(f"batch: step time {med:.1f}s over max_step_seconds {max_step_s:.1f}s "
                       f"-- cutting {self.batch_size} -> {shrunk}")
+                # remembered so the NEXT firing can ask whether that cut did anything;
+                # see the unresponsiveness check above
+                self._runaway_last_cut = (self.batch_size, med)
                 self.batch_size = shrunk
                 self.batch_size_saturated_stage = None
                 self._rung_throughput = None
@@ -415,22 +580,39 @@ class Modeller:
                 return
             prev_batch, prev_sps = base
             if prev_batch < self.batch_size:
-                # step time scales as batch/throughput, so the previous jump grew
-                # it by (b1/s1)/(b0/s0). Accept only if that regression is within
-                # tolerance -- a throughput gain bought with a slower step is a
-                # steps/hour loss, which is what actually matters for training.
-                tol = float(getattr(self.args, 'batch_growth_max_step_regression', 0.25) or 0)
-                regression = (self.batch_size / max(sps, 1e-9)) / (prev_batch / max(prev_sps, 1e-9))
-                if regression > 1.0 + tol:
+                # PRIORITY 2: OPTIMIZER-STEP THROUGHPUT AT THE GRAD-ACCUM TARGET.
+                # With the update size pinned at accum_target, updates/sec =
+                # samples_per_sec / accum_target -- so maximising opt-step
+                # throughput IS maximising samples/sec, and step time per se does
+                # not enter. This gate is therefore a SATURATION DETECTOR: keep
+                # climbing while throughput still improves, pin where it flattens.
+                #
+                # It deliberately replaces the step-time-regression test, which
+                # optimised loop-iterations/hour. That is a different objective and
+                # the wrong one here: it rejects a jump that buys +15% samples/sec
+                # for a 43% slower step, which under this priority is a 15% WIN.
+                min_gain = float(getattr(self.args, 'batch_growth_min_throughput_gain', 0.05) or 0)
+                if sps < prev_sps * (1.0 + min_gain):
                     # pin at the TRUE knee; gradient stability below
                     # fused_grad_accum_min_samples is provided by fused-step
                     # accumulation (see train_step), not batch inflation
                     accum = int(getattr(self.args, 'fused_grad_accum_min_samples', 0) or 0)
-                    print(f"batch growth: throughput knee -- {prev_batch}->{self.batch_size} bought "
-                          f"{prev_sps:.0f}->{sps:.0f} samples/s for x{regression:.2f} step time "
-                          f"(> +{tol * 100:.0f}%); pinning {prev_batch} for stage '{stage_name}'"
+                    gain = sps / max(prev_sps, 1e-9) - 1.0
+                    print(f"batch growth: throughput saturated -- {prev_batch}->{self.batch_size} "
+                          f"bought {prev_sps:.0f}->{sps:.0f} samples/s ({gain * 100:+.0f}%, under "
+                          f"+{min_gain * 100:.0f}%); pinning {prev_batch} for stage '{stage_name}'"
                           + (f" (fused steps will grad-accumulate to {accum})" if prev_batch < accum else ""))
-                    self.batch_size = max(self._batch_floor(), prev_batch)
+                    # A PIN IS A DECISION TO STOP CLIMBING, NEVER A JUMP. This was
+                    # `max(floor, prev_batch)`, which consults neither the OOM ceiling
+                    # nor the rungs just measured -- and since protocol.advance re-enters
+                    # every stage at exactly args.batch_size, the floor is routinely AT
+                    # OR ABOVE a ceiling discovered in that same stage. The pin then set
+                    # the batch to a size already recorded as OOMing and marked it
+                    # saturated, which rebuilt the permanent sawtooth the ceiling exists
+                    # to prevent. It also silently reverted max_step_seconds cuts.
+                    # Clamping to the current batch fixes both: we are standing on a size
+                    # that just ran, and prev_batch is below it by the guard above.
+                    self.batch_size = min(max(self._batch_floor(), prev_batch), self.batch_size)
                     self.batch_size_saturated_stage = stage_name
                     self.batch_size_pinned_at = self.step_ind
                     self._rung_throughput = None
@@ -478,6 +660,12 @@ class Modeller:
             metrics.update(self.replay_buffer.absorption_stats())
         if hasattr(self, 'last_grad_norm_pre_clip'):
             metrics['grad_norm_pre_clip'] = self.last_grad_norm_pre_clip
+        # Adaptive clip bar, per branch. gradclip/*_fire_rate is the one that
+        # says WHICH ALGORITHM is running: near 1-p is a guard, 0 is a guard that
+        # has gone absent, 1 is normalized gradient descent wearing a clip's name.
+        # grad_norm_pre_clip above cannot answer that -- it is a single scalar
+        # holding whichever branch stepped last.
+        metrics.update(self.grad_guard.report())
         # per-submodel grad norms (see _submodel_grad_norms) + how many steps
         # since the last report had a non-finite gradient and were skipped
         metrics.update(self._last_grad_norms)
@@ -502,11 +690,33 @@ class Modeller:
         # Empty dict on stages that never evaluate the energy (bwd/dataset MLE), so
         # nothing misleading gets logged there.
         energy_timing = self.energy_function.drain_energy_timing()
-        if energy_timing and self._throughput['seconds'] > 0:
-            energy_timing['energy/frac_of_step'] = (
-                    energy_timing['energy/seconds'] / self._throughput['seconds'])
+        if energy_timing:
+            # energy/seconds is EVERY call in the window -- training steps, eval
+            # sampling, anchor screening, prior churn. Only the in-step share can be
+            # divided by the step window; using the raw total gave 1.48 on the first
+            # real run. Both are logged: in_step for "is the MLIP the thing to
+            # optimise", total for "how much MLIP is this run doing at all".
+            in_step = self._throughput.get('energy_seconds', 0.0)
+            energy_timing['energy/seconds_in_step'] = in_step
+            if self._throughput['seconds'] > 0:
+                energy_timing['energy/frac_of_step'] = in_step / self._throughput['seconds']
+                energy_timing['energy/frac_outside_step'] = max(
+                    0.0, energy_timing['energy/seconds'] - in_step) / self._throughput['seconds']
         metrics.update(energy_timing)
-        self._throughput = {'samples': 0, 'seconds': 0.0}
+        # GPU occupancy. Purely diagnostic now -- no control law reads it (see
+        # increment_batch_size) -- but it is the number the scheduler cancels jobs on,
+        # so it is worth two windows: gpu/util_recent tracks what the run is doing
+        # now, gpu/util_policy is the long average the cluster actually judges.
+        # Sampling happens in the train loop on a wall-clock cadence; this only reads.
+        util_recent = self._gpu_util_mean(
+            float(getattr(self.args, 'gpu_util_window_s', 900) or 900))
+        if util_recent is not None:
+            metrics['gpu/util_recent'] = util_recent
+        policy_s = float(getattr(self.args, 'gpu_util_policy_window_s', 7200) or 7200)
+        policy = self._gpu_util_mean(policy_s)
+        if policy is not None:
+            metrics['gpu/util_policy'] = policy
+        self._throughput = {'samples': 0, 'seconds': 0.0, 'energy_seconds': 0.0}
         metrics['Fwd Frac'] = self.fwd_frac
         metrics['Bwd Frac'] = self.bwd_frac
         metrics['Replay Frac'] = self.replay_frac
@@ -1185,8 +1395,19 @@ class Modeller:
         the gate; this method also skips the probe, which is crystal machinery.
 
         Like periodic_centroids this makes the model space-group specific, so the space
-        groups present must agree on their dead rows. They always do within a crystal
-        system; a mixed-system list cannot be served by one index set and raises.
+        groups present must agree on their dead rows, and the check below compares the
+        RESOLVED SETS rather than the crystal systems.
+
+        That distinction is load-bearing, and an earlier version of this comment claimed
+        the opposite ("they always agree within a crystal system"), which is FALSE.
+        Monoclinic alone carries three different sets, because free aunit axes do not
+        follow the crystal system:
+            sg 3, 4, 5      -> (3, 5, 7)      2-fold along b: free translation along b
+            sg 6, 7, 8, 9   -> (3, 5, 6, 8)   mirror perp b: free translation in a-c
+            sg 10 - 15      -> (3, 5)         centrosymmetric: no free axis
+        So `space_groups: [4, 14]` is same-system and still ambiguous. Do NOT "simplify"
+        this into a crystal-system comparison -- that would silently serve one index set
+        to space groups that need different ones.
         """
         if not getattr(self.args.model, 'hold_dead_latent_rows', True):
             return None
@@ -1235,9 +1456,19 @@ class Modeller:
             n = min(n_probe, crystal_batch.num_graphs)
             probe_batch = crystal_batch.subsample_new_batch(
                 torch.arange(n, device=crystal_batch.device)).clone()
-            probe_batch.pose_aunit()
-            probe_batch.build_unit_cell()
+            # NO pose_aunit()/build_unit_cell() here. The probe only drives
+            # latent_to_cell_params -> latent_params, which needs cell parameters and
+            # nothing built from them. Those two calls were dead weight AND they broke
+            # the probe at Z'>1: aunit2ucell assumes a 3-wide centroid, but at Z'=2
+            # aunit_centroid is stored FLATTENED as (n, 6), so appending the affine 1
+            # gives a 7-vector against a 4x4 operator --
+            #   "einsum(): subscript j has size 7 ... previously seen size 4".
+            # That raised, was swallowed by the except below, and every Z'>1 run printed
+            # "the tabulated rows are UNVERIFIED this run" -- so the ONE runtime guard on
+            # the dead-row table was silently absent for exactly the layout with the
+            # least other coverage. Found by the sg 9 Z'=2 smoke run, 2026-08-12.
             found = verify_dead_rows(probe_batch, sg, max(self.args.z_primes))
+            self._dead_rows_verified = True
             print(f"dead-row probe: latent_to_cell_params confirms rows {found} "
                   f"are ignored for SG{sg} (n={n})")
             # The value the SDE pins these rows to must equal the value latent_params()
@@ -1260,6 +1491,11 @@ class Modeller:
         except Exception as e:
             # a probe that cannot run is not evidence the table is wrong; say so loudly
             # rather than either crashing the run or implying the check passed
+            # Record it as well as printing it. A startup WARNING is exactly what went
+            # unread when the probe was broken at Z'>1 for every run of that layout, so
+            # the unverified state is now a logged series and can be queried after the
+            # fact instead of relying on someone having scrolled the log.
+            self._dead_rows_verified = False
             print(f"WARNING: dead-row probe could not run ({type(e).__name__}: {e}); "
                   f"the tabulated rows for SG{sg} are UNVERIFIED this run")
 
@@ -1451,8 +1687,16 @@ class Modeller:
         # composite step the servo would not control. Absent config block =>
         # disabled, so this is inert for every existing config.
         sp_cfg = getattr(self.args, 'ray_calibration', None)
+        # ONE list, built once, shared by both sensors. `get_policy_params` is a
+        # local of this method, so the hypergradient sensor cannot call it later
+        # -- and it must snapshot exactly what the ray probe does (policy only,
+        # decision D26b) or the two sensors would disagree about what they are
+        # measuring.
+        self._hyper_param_cache = [
+            p for g in get_policy_params(self.gfn_model) for p in g['params']]
+        self._hyper_prev_step = None
         self.ray_cal = RayCalibration(
-            [p for g in get_policy_params(self.gfn_model) for p in g['params']],
+            self._hyper_param_cache,
             alphas=tuple(getattr(sp_cfg, 'alphas', (0.0, 1.0, 2.0, 4.0, 8.0))),
             n_sub=int(getattr(sp_cfg, 'n_sub', 8)),
             period=int(getattr(sp_cfg, 'period', 500)),
@@ -1493,15 +1737,23 @@ class Modeller:
         if True:  # not hasattr(prior, self.args.energy_function):
             print("Re-analyzing prior energies")
             prior = prior.to(self.device)
-            energy, prior = self.energy_function.batched_analyze_crystal_batch(
-                prior.latent_params(),
-                prior,
-                self.args.energy_config.temperature * torch.ones((prior.num_graphs), dtype=torch.float32,
-                                                                 device=self.device),
-                return_batch=True,
-                internal_oom_recovery=True,
-                # one-off pass over the whole prior dataset at init -- prefer the adaptive, self-healing chunked path over a hard crash, regardless of the training-time flag
-            )
+            # NO_GRAD, explicitly. keep_grads defaults False but that only DETACHES
+            # the output -- it does not stop the graph being built, and fairchem's
+            # _run_inference uses nullcontext (not no_grad) whenever direct_forces is
+            # False, which is what this predictor sets. So without this the whole
+            # ~176k-row scoring pass built an autograd graph nothing ever
+            # differentiates, holding activations for the entire scan. That is the
+            # pass whose MLIP chunk size collapsed to 144 on the uma arm.
+            with torch.no_grad():
+                energy, prior = self.energy_function.batched_analyze_crystal_batch(
+                    prior.latent_params(),
+                    prior,
+                    self.args.energy_config.temperature * torch.ones((prior.num_graphs), dtype=torch.float32,
+                                                                     device=self.device),
+                    return_batch=True,
+                    internal_oom_recovery=True,
+                    # one-off pass over the whole prior dataset at init -- prefer the adaptive, self-healing chunked path over a hard crash, regardless of the training-time flag
+                )
 
         # D33: confirm the tabulated dead latent rows still match what the crystal build
         # actually discards, now that a real batch with physical cell parameters exists.
@@ -1691,6 +1943,14 @@ class Modeller:
                 attempted_batch = self.batch_size
                 self.times['train_step_start'] = time()
                 self._z_cal_rollouts = 0
+                # energy seconds spent INSIDE this step, isolated by a before/after
+                # snapshot. The raw counter on the energy function accumulates EVERY
+                # call -- eval sampling, anchor screening, prior churn -- none of
+                # which is inside the step timing, so dividing the raw total by the
+                # step window gave energy/frac_of_step = 1.48 on the first real run.
+                # A "fraction" above 1 is the metric confessing it is measuring two
+                # different denominators.
+                energy_s_before = getattr(self.energy_function, 'energy_seconds', 0.0)
                 try:
                     current_loss = self.train_step(step_type)
                 except (RuntimeError, ValueError) as e:  # if we do hit OOM, slash the batch size
@@ -1716,6 +1976,14 @@ class Modeller:
                 self._recent_step_work.append(attempted_batch * (1 + self._z_cal_rollouts))
                 self._throughput['samples'] += attempted_batch
                 self._throughput['seconds'] += step_dt
+                self._throughput['energy_seconds'] += max(
+                    0.0, getattr(self.energy_function, 'energy_seconds', 0.0) - energy_s_before)
+                # occupancy sampled on a WALL-CLOCK cadence (the call is a cheap
+                # no-op between periods), so the trailing windows populate at 200 s
+                # a step as well as at 2 s. Doing this from ten_step_reporting tied
+                # the sample rate to the step rate and left the metric absent on
+                # exactly the slow MLIP arms it was added to watch.
+                self._sample_gpu_util()
                 # the controller scores the step it just timed, at the batch that
                 # actually ran it: growing before the append paired a new batch
                 # with the old rung's timings (and made 'Batch Size' log one rung
@@ -1765,6 +2033,23 @@ class Modeller:
                                    if not (isinstance(v, wandb.Histogram)
                                            or (isinstance(v, np.ndarray) and v.size > 1))}
                     wandb.log(metrics, step=self.step_ind, commit=True)
+
+                    # Only AFTER the first eval. record_peak used to fire from step 10,
+                    # so a run killed early wrote a partial high-water mark that later
+                    # launches then trusted as a measurement -- and the eval rollout is
+                    # the single largest allocation of the step, so a pre-eval peak is a
+                    # systematic UNDER-estimate. configs/gauss_aug12/make.py already
+                    # documents this exact trap ("taken at step 150, before stage-2 fused
+                    # training ... those arms would have died mid-run"); the lesson was
+                    # never applied here.
+                    # Record this config's VRAM high-water mark so the NEXT launch's
+                    # pre-flight can project from a measurement instead of falling back
+                    # to cuda_memory_fraction x total (a bound, not a prediction).
+                    # Written here rather than at exit on purpose: an OOM kill or a
+                    # BSOD never reaches an atexit hook, and those are exactly the runs
+                    # whose footprint most needs to be on record. See gpu_guard.py.
+                    if self.step_ind >= max(50, int(self.args.eval_period)):
+                        self.record_vram_peak()
 
                 if self.step_ind % 50 == 0:  # save running model
                     self.checkpointer.save('running')
@@ -2580,6 +2865,50 @@ Two things deliberately NOT done here, both recorded in
                                         step=self.step_ind)
         return loss.detach().item()
 
+    def _hyper_sensor_cfg(self, step_type):
+        """The stage's hypergradient config, or None if it is not this sensor.
+
+        Gated on the TRAINED step type: the sensor differences the policy's own
+        displacement, so it is only meaningful on a step that moved the policy."""
+        sensor = self.protocol.stage.lr_sensor
+        if sensor is None or sensor.get('kind') != 'hyper':
+            return None
+        if step_type not in ('fused', 'fwd', 'bwd', 'replay'):
+            return None
+        if self.step_ind % int(sensor.get('every', 1)):
+            return None
+        return sensor
+
+    def _hyper_params(self):
+        # THE SAME LIST THE RAY PROBE SNAPSHOTS -- policy only, built once where
+        # the probe is built. The flow head is LR-pinned separately and excluded
+        # there for the same reason (decision D26b); including it would mix a
+        # parameter on a different, unservoed rate into the displacement.
+        return getattr(self, '_hyper_param_cache', None) or []
+
+    @torch.no_grad()
+    def _hyper_flat(self):
+        return torch.cat([p.detach().reshape(-1) for p in self._hyper_params()])
+
+    @torch.no_grad()
+    def _hyper_apply(self, cfg):
+        """cos(current gradient, previous displacement) -> the controller."""
+        gs = [p.grad.reshape(-1) for p in self._hyper_params() if p.grad is not None]
+        if not gs:
+            return
+        g = torch.cat(gs)
+        d = -self._hyper_prev_step
+        if g.numel() != d.numel():
+            # parameter set changed under us (a stage rebuilt the optimizers);
+            # drop the stale operand rather than difference across it
+            self._hyper_prev_step = None
+            return
+        ng, nd = float(g.norm()), float(d.norm())
+        if not (ng > 0 and nd > 0):
+            return
+        cos = float(torch.dot(g, d) / (ng * nd))
+        self.lr_controller.on_hypergradient(cos, cfg['beta'], cfg.get('beta_down'))
+
     def step_loss(self, step_type, loss, do_step: bool = True):
         loss.backward()
         if not do_step:
@@ -2591,8 +2920,21 @@ Two things deliberately NOT done here, both recorded in
         if self.step_ind % 10 == 0:
             self._last_grad_norms = self._submodel_grad_norms()
 
+        # THE BAR IS PER-BRANCH when grad_clip_guard is enabled: fwd/bwd/replay/
+        # fused reach their own optimizer step here and an MLE gradient and a TB
+        # gradient are different distributions, so one shared number is set by
+        # whichever branch dominates the mixture (grad_clip_guard.py). Disabled =>
+        # threshold() returns args.gradient_norm_clip, i.e. exactly the constant
+        # this line used to read.
+        bar = self.grad_guard.threshold(step_type)
         pre_clip = torch.nn.utils.clip_grad_norm_(
-            self.gfn_model.parameters(), self.args.gradient_norm_clip).item()
+            self.gfn_model.parameters(), bar).item()
+        # BEFORE the finiteness gate below, so a non-finite reading is counted by
+        # the guard rather than vanishing down that early return. observe()
+        # deliberately does not fold it into the bar: it is not a quantile
+        # observation, and it is not a training event either since the step is
+        # about to be skipped.
+        self.grad_guard.observe(step_type, pre_clip)
         if not math.isfinite(pre_clip):
             print(f"Non-finite gradient at {self.step_ind}")
             self._grad_nonfinite += 1  # drained into gradnorm/nonfinite_steps
@@ -2606,11 +2948,32 @@ Two things deliberately NOT done here, both recorded in
             return  # skip non-finite
         self._grad_nonfinite_streak = 0  # a finite gradient landed: streak broken
         # raw (pre-clip) global grad norm, for reading how hard the clip binds:
-        # persistently >> gradient_norm_clip means every step is rescaled and
-        # Adam is effectively running on normalized gradients
+        # persistently >> the bar means every step is rescaled and Adam is
+        # effectively running on normalized gradients. With grad_clip_guard
+        # enabled, gradclip/*_fire_rate answers that directly and per branch;
+        # this scalar holds only the LAST branch to step, so it cannot.
         self.last_grad_norm_pre_clip = pre_clip
 
+        # ---- hypergradient sensor: read BEFORE the step, difference AFTER.
+        # `cos(g_t, d_{t-1})` -- the current gradient against the direction the
+        # PREVIOUS step actually moved the policy. Both operands exist whatever
+        # the stage trains, which is the whole reason this sensor is available
+        # where `ray` is not (protocol.py::_parse_lr_sensor).
+        _hyp = self._hyper_sensor_cfg(step_type)
+        if _hyp is not None and not self._hyper_params():
+            _hyp = None
+        _theta_before = self._hyper_flat() if _hyp else None
+        if _hyp is not None and getattr(self, '_hyper_prev_step', None) is not None:
+            self._hyper_apply(_hyp)
+
         self.optimizers[step_type].step()
+
+        if _hyp is not None:
+            # the REALISED displacement, not `-lr*g`: read this way it is
+            # optimizer-agnostic and cannot drift out of sync with what Adam
+            # actually did, which matters because Adam's step direction is
+            # mhat/(sqrt(vhat)+eps) and not the gradient.
+            self._hyper_prev_step = self._hyper_flat() - _theta_before
         # Non-fused steps: step the standalone flow optimizer here (fwd/bwd/replay run
         # separately, so whichever one had freeze_z=False unambiguously trained Z).
         # Fused steps: skip it -- flow is a param group of optimizers['fused'], so the
@@ -3278,6 +3641,30 @@ Two things deliberately NOT done here, both recorded in
         return bool(getattr(cfg, 'symmetric', False))
 
     def draw_replay_sample(self, repeats):
+        # Condition-blocked draw (C conditions x up to M distinct terminals
+        # each), same mechanism as draw_bwd_sample and active only while
+        # condition-grouped replay VarGrad is. Without it that branch is a SILENT
+        # NO-OP: vg_loss is identically zero on singleton groups, and a uniform
+        # draw groups rows only by birthday collision at a rate ~ batch_size /
+        # library -- per-condition occupancy and buffer size cancel, so a bigger
+        # buffer does NOT raise it. Zero loss, zero gradient, no error.
+        # The gate also tests vg_by_condition, unlike draw_bwd_sample's narrower
+        # vg_lb-only test: bwd's base block pins vg_by_condition at 1.0 while
+        # replay's defaults to 0, and the legacy repeats-grouped estimator does
+        # not read this grouping (replay repeats is 1 by design -- stored
+        # trajectories, so K copies would be identical -- which makes that path
+        # singleton-tiled and equally dead).
+        rlc = self.args.replay_loss_coeffs
+        block_m = getattr(self.args.buffers.replay_buffer, 'condition_block_m', 0) \
+            if (getattr(rlc, 'vg_by_condition', 0) > 0.5
+                and (getattr(rlc, 'vg_lb', 0) > 0 or getattr(rlc, 'vg_lme', 0) > 0)) else 0
+        if block_m >= 2 and not hasattr(self.replay_buffer.batch, 'condition_id'):
+            raise ValueError(
+                "replay condition_block_m needs condition_id on the stored batch. "
+                "manage_replay_buffer admits the post-condition_samples forward "
+                "batch, which carries it, so a buffer without it was built by "
+                "another route.")
+
         # Prioritised-IS draw (docs/to_do_rebuild.md B5): p ~ delta_plus^kappa
         # (or |delta|^kappa under prioritise.symmetric) with the row weights
         # that undo it. delta is reconstructed from the buffer's ema_logw
@@ -3287,6 +3674,22 @@ Two things deliberately NOT done here, both recorded in
         kappa = self.replay_priority_config()
         p = None
         self._replay_is_w = None
+        # Cleared rather than left to persist: log_metrics merges
+        # _replay_is_stats by getattr on every call, so a blocked draw inheriting
+        # the previous prioritised draw's ESS would keep reporting a healthy
+        # prioritised estimator that is no longer running.
+        self._replay_is_stats = {}
+        if kappa is not None and block_m >= 2:
+            # Not a silent precedence rule: _sample_indices returns from the
+            # blocked branch BEFORE p is consulted, so the draw would come from
+            # the blocked measure while the IS weights below still divided by p
+            # -- the same inverse-measure error as the beta=1.0 bug documented
+            # further down, and just as invisible in the loss.
+            raise ValueError(
+                "buffers.replay_buffer.condition_block_m >= 2 is mutually "
+                "exclusive with buffers.replay_buffer.prioritise: blocked draws "
+                "bypass `p` entirely in CrystalBuffer._sample_indices. Set "
+                "prioritise.enabled false or condition_block_m 0.")
         if kappa is not None:
             log_z = self.current_log_z()
             if log_z is not None:
@@ -3313,7 +3716,8 @@ Two things deliberately NOT done here, both recorded in
                 repeats=repeats, return_inds=True,
                 weighted=False,
                 temperature=0.1, beta=draw_beta,
-                return_traj=True, p=p))
+                return_traj=True, p=p,
+                condition_block_m=block_m))
 
         if p is not None:
             wb = np.asarray(w_row)[np.asarray(inds).ravel()]
@@ -3376,10 +3780,21 @@ Two things deliberately NOT done here, both recorded in
         # that walk climbs straight back into this same OOM -- prod0810 mipcas_elj
         # ran that sawtooth (6113->10086->OOM->5043->8321->OOM->4160->...) for the
         # rest of the run, burning a step plus a gc/empty_cache cycle each lap.
-        oomed_at = self.batch_size
-        prior_ceiling = getattr(self, 'batch_size_oom_ceiling', None)
-        self.batch_size_oom_ceiling = (oomed_at if prior_ceiling is None
-                                       else min(prior_ceiling, oomed_at))
+        #
+        # TRAIN STEPS ONLY. This function is the shared recovery path for eval too
+        # (eval_bwd, eval_fwd, anchor_refresh), and eval has a different memory
+        # profile entirely: eval_num_samples per pass, the EMA model, no gradients.
+        # Recording the TRAIN batch as a ceiling because an EVAL pass overflowed
+        # installs a stage-lifetime cap that only a stage transition clears, on
+        # evidence about a different allocation. Eval OOMs are self-limiting -- their
+        # loops cut and retry -- so the cut below still applies to them; only the
+        # ceiling is withheld. Gated on protocol.TRAIN_MODES rather than a list of
+        # eval names so a new eval call site cannot opt itself in by accident.
+        if step_type in TRAIN_MODES:
+            oomed_at = self.batch_size
+            prior_ceiling = getattr(self, 'batch_size_oom_ceiling', None)
+            self.batch_size_oom_ceiling = (oomed_at if prior_ceiling is None
+                                           else min(prior_ceiling, oomed_at))
         self.batch_size = max(1, int(self.batch_size * self.args.oom_batch_shrink_factor))
         self.batch_size_ever_oomed = True
         self.batch_size_cooldown_until = self.step_ind + self.args.oom_cooldown_steps
@@ -3490,10 +3905,10 @@ Two things deliberately NOT done here, both recorded in
         prior-buffer churn, and nothing here feeds a gate, controller or loss.
         """
         n = getattr(self.args, 'test_eval_num_samples', None) or self.args.eval_num_samples
-        test_stats, _ = self.fwd_eval_sampling(self.ema_model, eval_discretizer,
-                                               override_num_samples=int(n),
-                                               dataset=self.test_mol_dataset,
-                                               side_effects=False)
+        test_stats, test_batch = self.fwd_eval_sampling(self.ema_model, eval_discretizer,
+                                                        override_num_samples=int(n),
+                                                        dataset=self.test_mol_dataset,
+                                                        side_effects=False)
         train_m = self._eval_conditional_stats(fwd_stats)
         test_m = self._eval_conditional_stats(test_stats)
 
@@ -3504,7 +3919,49 @@ Two things deliberately NOT done here, both recorded in
         # no 'eval_gap/' block: it was exactly eval_fwd - eval_test on six keys
         # that are both already logged, so the generalization gap is a wandb
         # panel expression rather than six more channels.
+
+        # SAMPLE QUALITY on held-out conditions, pooled and per-condition, the
+        # same pair log_thermo_properties publishes at top level for the train
+        # conditions. Only the 'reasonable' window transfers: it is an absolute
+        # physical bar needing no per-condition reference, whereas the
+        # non-thermal family is scored against Emin(c), which side_effects=False
+        # never writes for a test condition (its condition_ids are disjoint --
+        # init_identifiers mints one registry over distinct identifier strings),
+        # so it would have nothing to reference and read a constant 0.
+        if test_batch is not None:
+            arr = lambda t: t.cpu().detach().numpy()
+            is_good = self._reasonable_sample_mask(test_batch)
+            metrics['eval_test/Reasonable Sample Fraction'] = is_good.float().mean().item()
+            self.log_condition_fraction(metrics, arr, 'Reasonable', is_good,
+                                        test_stats.get('condition_id'),
+                                        getattr(self.args, 'reasonable_cond_bar', 0.5),
+                                        higher_is_worse=False, prefix='eval_test/')
         return metrics
+
+    def record_vram_peak(self):
+        """
+        Publish this run's peak RESERVED VRAM to the pre-flight registry.
+
+        Reserved, not allocated: reserved is what the caching allocator holds from the
+        driver and (with expandable_segments unsupported on this platform) does not
+        give back, so it is what a co-tenant would actually find missing.
+
+        Best-effort by construction -- a diagnostic must never be able to kill a
+        training run, so every failure path here is swallowed.
+        """
+        try:
+            if not torch.cuda.is_available():
+                return
+            peak_mb = int(torch.cuda.max_memory_reserved() / (1024 ** 2))
+            live_mb = int(torch.cuda.max_memory_allocated() / (1024 ** 2))
+            if peak_mb <= 0:
+                return
+            from gpu_guard import record_peak
+            # both: their RATIO says whether co-tenancy needs a genuinely smaller job
+            # or merely a lower cuda_memory_fraction. See record_peak's docstring.
+            record_peak(self.args, peak_mb, live_mb)
+        except Exception:
+            pass
 
     def log_metrics(self, fwd_stats, bwd_stats, sample_batch):
 
@@ -3686,24 +4143,121 @@ Two things deliberately NOT done here, both recorded in
         # were bit-identical to eval_fwd/emp_z and eval_fwd/jensen_z, which
         # sit next to the rest of the forward parity block where they belong.
         metrics['log Z learned'] = val(log_Z_learned.mean())
+        # 1 = the dead-row table was confirmed against the real crystal build at startup,
+        # 0 = the probe could not run and the table is UNVERIFIED for this run,
+        # absent = not a crystal problem, or hold_dead_latent_rows is off. See D33.
+        _drv = getattr(self, '_dead_rows_verified', None)
+        if _drv is not None:
+            metrics['dead_rows/probe_verified'] = float(_drv)
 
-        # get fraction of samples which are 'reasonable' at this energy,
-        # prefer the rescaled mol_energy (matches the actual loss scale) over
-        # the bare energy_function attribute, which is only correct for toy
-        # (non lj-rescaled) energy functions that never set mol_energy
-        en_func = self.energy_function.energy_function
-        scaled_mol_energy = getattr(sample_batch, 'mol_energy', None)
-        if scaled_mol_energy is None:
-            scaled_mol_energy = sample_batch[en_func]
-        sample_is_good = (scaled_mol_energy < 0) * (sample_batch.packing_coeff > 0.55) * (
-                sample_batch.packing_coeff < 0.95)
+        sample_is_good = self._reasonable_sample_mask(sample_batch)
         metrics["Reasonable Sample Fraction"] = sample_is_good.float().mean().item()
+
+        # ...and the same indicator read PER CONDITION rather than pooled: a
+        # batch fraction of 0.5 is a different (much worse) model when half the
+        # library is at 0 than when every condition is at 0.5, and only the
+        # per-condition view can tell them apart. See per_condition_fraction.
+        self.log_condition_fraction(metrics, arr, 'Reasonable', sample_is_good,
+                                    fwd_stats.get('condition_id'),
+                                    getattr(self.args, 'reasonable_cond_bar', 0.5),
+                                    higher_is_worse=False)
 
         # 'Reasonable Sample Fraction' just above is an ABSOLUTE, hand-set
         # physical window. This is the distribution-relative counterpart: how
         # much of the batch is so far above its own condition's best known
         # energy that no realisable density of states could explain it.
         self.log_nonthermal_tail(arr, fwd_stats, log_T_tensor, log_r, metrics)
+
+    def _reasonable_sample_mask(self, sample_batch):
+        """
+        Per-sample 'is this a physically reasonable crystal', the ABSOLUTE
+        hand-set window behind 'Reasonable Sample Fraction': bound energy, and a
+        packing coefficient in 0.55-0.95.
+
+        Prefers the rescaled `mol_energy` (matches the actual loss scale) over
+        the bare energy_function attribute, which is only correct for toy (non
+        lj-rescaled) energy functions that never set mol_energy.
+
+        Shared by the train-condition and held-out readings so the two are
+        computed by the same code, not by two copies that can drift -- the same
+        like-for-like rule _eval_conditional_stats follows for the TB family.
+        """
+        en_func = self.energy_function.energy_function
+        scaled_mol_energy = getattr(sample_batch, 'mol_energy', None)
+        if scaled_mol_energy is None:
+            scaled_mol_energy = sample_batch[en_func]
+        return ((scaled_mol_energy < 0) * (sample_batch.packing_coeff > 0.55)
+                * (sample_batch.packing_coeff < 0.95))
+
+    def log_condition_fraction(self, metrics, arr, name, indicator, condition_id,
+                               bar, higher_is_worse, prefix=''):
+        """
+        Publish the per-condition breakdown of a per-sample 0/1 indicator under
+        '{prefix}Cond {name} *':
+
+          'Cond {name} Failing Frac'  share of CONDITIONS that fail `bar`
+          'Cond {name} Worst'         the conditional_worst_quantile bad tail
+                                      across conditions, same convention as
+                                      tb_err_worst
+          'Cond {name} Spread'        binomial-debiased sd of the per-condition
+                                      fraction -- the ONLY key here comparable
+                                      across streams (see below)
+          'Cond {name} Frac'          histogram of the per-condition fractions
+          'Cond {name} N'             conditions scored -- divide the batch by
+                                      it before trusting any of the above
+                                      (per_condition_fraction: at 1 sample per
+                                      condition the family degenerates to the
+                                      pooled fraction)
+          'Cond {name} Bar'           the bar itself, on change only
+
+        `prefix` namespaces the SERIES ('eval_test/' for the held-out stream).
+        The bar is deliberately NOT prefixed: it is a property of the metric
+        family, not of the stream reading against it, so every prefix scores
+        against one series and _log_setting's cache makes the second writer a
+        no-op rather than a duplicate channel.
+
+        CROSS-STREAM COMPARISONS GO ON 'Spread', not 'Failing Frac'. The two
+        streams do not draw the same samples per condition (cond_aug11: 10000
+        over ~900 train conditions vs 2000 over ~100 held-out ones, so n_c ~ 11
+        against ~20), and 'Failing Frac' is biased by n_c -- binomial smearing
+        pushes conditions across the bar, always toward that stream's own pooled
+        fraction, so two identically-good streams report different numbers.
+        'Spread' subtracts that noise and is unbiased at any n_c; the LEVEL
+        comparison is already carried by the pooled fractions, which are batch
+        means and so have no n_c dependence at all. 'Failing Frac' / 'Worst' /
+        'Frac' stay WITHIN-stream readings: n_c is fixed for a given stream, so
+        their trends over a run are clean.
+
+        The whole family is ABSENT -- never nan, never 0 -- on unconditional
+        runs, on a batch with fewer than 2 conditions, and when the bar is set
+        to null. `bar` is a threshold on the per-condition fraction, not on the
+        indicator; `higher_is_worse` says which side of it fails.
+        """
+        stats = per_condition_fraction(indicator, condition_id, bar,
+                                       worst_quantile=self.args.conditional_worst_quantile,
+                                       higher_is_worse=higher_is_worse)
+        if stats is None:
+            return
+        metrics[f'{prefix}Cond {name} Failing Frac'] = stats['failing_frac']
+        metrics[f'{prefix}Cond {name} Worst'] = stats['worst']
+        metrics[f'{prefix}Cond {name} Frac'] = arr(stats['per_condition'])
+        metrics[f'{prefix}Cond {name} N'] = stats['n_conditions']
+        if stats['spread'] is not None:  # absent, not 0, when every group is a singleton
+            metrics[f'{prefix}Cond {name} Spread'] = stats['spread']
+        self._log_setting(metrics, f'Cond {name} Bar', float(bar))
+
+    def _log_setting(self, metrics, key, value):
+        """
+        Emit a SETTING, not a series: logged on the first eval and thereafter
+        only when it changes. A reading scored against a bar is uninterpretable
+        later without the bar (module_metrics.md S3), but re-logging a constant
+        every eval is a flat line that looks like a measurement. wandb holds the
+        last value forward, so the panels still read correctly. Same rule
+        dump_numeric applies to the energy-function / loss-coefficient blocks.
+        """
+        if self._settings_log_cache.get(key) != value:
+            metrics[key] = value
+            self._settings_log_cache[key] = value
 
     def log_nonthermal_tail(self, arr, fwd_stats, log_T_tensor, log_r, metrics):
         """
@@ -3798,6 +4352,13 @@ Two things deliberately NOT done here, both recorded in
         u_star = s_per_dim * float(n_dof)
 
         metrics['Nonthermal Fraction'] = (u > u_star).float().mean().item()
+        # per-CONDITION view of the same bar, over the SAME scored rows: 'which
+        # conditions are broken', not 'how much of the batch is'. cid is
+        # subsetted by `seen` to match u, whose unreferenced rows were dropped.
+        cid_seen = torch.as_tensor(condition_id).detach().cpu().flatten()[seen]
+        self.log_condition_fraction(metrics, arr, 'Nonthermal', u > u_star, cid_seen,
+                                    getattr(self.args, 'nonthermal_cond_bar', 0.1),
+                                    higher_is_worse=True)
         q = torch.quantile(u, torch.tensor([0.5, 0.9, 0.99], dtype=u.dtype))
         metrics['Excess Energy Nats Mean'] = u.mean().item()
         metrics['Excess Energy Nats P50'] = q[0].item()
@@ -3809,9 +4370,7 @@ Two things deliberately NOT done here, both recorded in
         # the bar itself, emitted only when it moves: a reading in nats is
         # uninterpretable later without the threshold it was scored against
         # (module_metrics.md S3), but it is a setting, not a series
-        if self._settings_log_cache.get('Nonthermal Threshold') != u_star:
-            metrics['Nonthermal Threshold'] = u_star
-            self._settings_log_cache['Nonthermal Threshold'] = u_star
+        self._log_setting(metrics, 'Nonthermal Threshold', u_star)
 
     def update_mle_gate(self):
         """
@@ -4112,6 +4671,16 @@ Two things deliberately NOT done here, both recorded in
             metrics.update({
                 'prior_buffer_added': added,
                 'prior_buffer_evicted': churn['evicted'],
+                # subset of 'evicted': rows that stopped clearing their OWN
+                # condition's admission gate because Emin(c) ratcheted down under
+                # them, as opposed to loss-quantile evictions made to free
+                # headroom. Persistently 0 with expire_max_frac > 0 means Emin(c)
+                # has stopped moving, not that the channel is broken
+                'prior_buffer_expired': churn['expired'],
+                # rows the anchor top-up requested PURELY to satisfy
+                # anchor_floor_frac, i.e. beyond what the per-condition shortfall
+                # already asked for. 0 means the floor never bound this window
+                'prior_buffer_anchor_floor_rows': churn['anchor_floor'],
                 'prior_buffer_from_prior_model': churn['from_prior_model'],
                 'prior_buffer_from_anchors': churn['from_anchors'],
                 'prior_buffer_from_seed': churn['from_seed'],
@@ -4392,6 +4961,14 @@ Two things deliberately NOT done here, both recorded in
                           * churn_batch_ref))
         n_to_add = min(self.args.eval_num_samples,
                        n_churn)  # cap unrelated to GPU batch size -- eval_batch_size is retired, this is just a churn-rate limiter
+
+        # membership is admission -- drop rows that would no longer clear their
+        # own condition's gate. Runs BEFORE headroom is measured so its evictions
+        # become intake room for this same call's churn cycle, which demotes the
+        # loss-quantile branch below from the primary eviction channel to an
+        # overflow handler.
+        self._expire_stale_prior_rows()
+
         headroom = max(0, self.args.buffers.prior_buffer.max_size - len(self.prior_buffer))
 
         # Eligibility for eviction is RELATIVE (the bottom `quantile` of
@@ -4460,6 +5037,75 @@ Two things deliberately NOT done here, both recorded in
                     if reach < cfg.reach_threshold:
                         self.top_up_prior_from_anchors(cfg.reach_topup_size, purge_worst=True)
 
+    def _expire_stale_prior_rows(self):
+        """
+        Gate-staleness eviction: MEMBERSHIP IS ADMISSION.
+
+        A prior_buffer row belongs iff it would still be admitted today --
+        `energy < Emin(c) + ramp_floor`, the identical test _prior_churn_cycle
+        and top_up_prior_from_anchors gate on. Emin(c) ratchets down as the
+        tracker sees better structures, so rows admitted under an older, looser
+        gate stop clearing the current one.
+
+        That is the ONLY sense in which a prior row is stale. prior_model is a
+        frozen snapshot (snapshot_prior), so an old draw is still a perfectly
+        valid draw from it -- unlike a replay trajectory, which goes stale
+        because the policy that generated it moved. Nothing here needs a
+        rollout: the energy is already stored and Emin(c) is already tracked.
+
+        Energy-intrinsic and policy-independent, so this channel does not
+        interact with the loss-quantile eviction in manage_prior_buffer, which
+        it runs ahead of and thereby demotes to an overflow handler.
+
+        Capped at `expire_max_frac` of the buffer per call, worst-excess first:
+        one record-breaking anchor can drop Emin(c) far enough to stale a large
+        slice of a condition at once, and an uncapped purge driven by an
+        absolute bar is exactly the failure mode manage_prior_buffer's
+        loss_floor=+inf comment is about (and that purge_lowest's `loss_min`
+        still has). Truncation prints, never silent.
+
+        Returns the number of rows dropped. expire_max_frac <= 0 -- the default
+        for configs predating the key -- disables the channel outright.
+        """
+        cfg = self.args.buffers.prior_buffer
+        max_frac = float(getattr(cfg, 'expire_max_frac', 0.0))
+        n_rows = self._prior_buffer_len()
+        if max_frac <= 0 or n_rows == 0:
+            return 0
+
+        # host-side throughout: _condition_energy_floor returns on its input's
+        # device, and y/argsort/purge_by_index are all CPU bookkeeping (with
+        # buffer_device: cuda the raw batch attr is a CUDA tensor)
+        condition_id = self.prior_buffer.batch.condition_id.detach().cpu()
+        energy_floor = self._condition_energy_floor(condition_id)
+        if energy_floor is None:
+            return 0  # pre-bootstrap: no tracker and no anchors, so no gate to apply
+
+        energy_floor = energy_floor.cpu().flatten()
+        # a condition with no observations carries Emin(c) = +inf, so its excess
+        # is -inf and its rows are always kept -- the same convention that makes
+        # a condition's FIRST sample admissible regardless of margin
+        excess = self.prior_buffer.y.cpu().flatten() - energy_floor
+        stale = excess >= self._ramp_params()[0]
+        n_stale = int(stale.sum())
+        if n_stale == 0:
+            return 0
+
+        stale_idx = torch.nonzero(stale, as_tuple=False).flatten()
+        cap = max(1, int(max_frac * n_rows))
+        if n_stale > cap:
+            order = torch.argsort(excess[stale_idx], descending=True)
+            stale_idx = stale_idx[order[:cap]]
+            print(f"prior_buffer gate-staleness purge capped at {cap} of {n_stale} stale rows "
+                  f"({n_rows} resident): Emin(c) is moving faster than expire_max_frac "
+                  f"{max_frac} allows -- the remainder expires over subsequent calls")
+
+        self.prior_buffer.purge_by_index(stale_idx.numpy())
+        n_dropped = int(stale_idx.numel())
+        self.prior_churn['evicted'] += n_dropped
+        self.prior_churn['expired'] += n_dropped
+        return n_dropped
+
     def _prior_buffer_len(self):
         """len(prior_buffer) that tolerates the buffer not existing --
         rebuild_prior_by_churn deletes it and refills from nothing, so its loop
@@ -4494,7 +5140,23 @@ Two things deliberately NOT done here, both recorded in
         is skipped entirely and the caller's buffer is left to the anchor
         top-up paths.
         """
-        if budget <= 0 or not hasattr(self, 'prior_model'):
+        if budget <= 0:
+            return
+        if not hasattr(self, 'prior_model'):
+            # Silent here changes the buffer's SOURCE MIX to 100% anchor with no
+            # error and no log line -- the only tell is prior_buffer_prior_admit_rate
+            # going nan (0/0) instead of 0.0, because budget below is never
+            # incremented. Reached whenever a run resumes PAST train_prior's
+            # snapshot_prior on_exit action without prior_model_name set. Reports
+            # once per stage rather than raising: an anchor-only buffer is a legal
+            # composition, it just is not the one the config describes.
+            stage_name = self.protocol.stage.name
+            if getattr(self, '_no_prior_model_warned_stage', None) != stage_name:
+                self._no_prior_model_warned_stage = stage_name
+                print(f"WARNING [stage '{stage_name}']: prior churn requested but no "
+                      f"prior_model exists -- the draw is SKIPPED and the prior buffer "
+                      f"fills 100% from anchors. Set prior_model_name to a *_prior.pt, "
+                      f"or run through train_prior's snapshot_prior, to restore it.")
             return
 
         metrics, sample_batch = self.sample_from_prior(budget)
@@ -4513,12 +5175,45 @@ Two things deliberately NOT done here, both recorded in
         self.prior_churn['from_prior_model'] += int(good_inds.numel())
         self.prior_churn['budget'] += int(budget)
 
-        # this cycle's prior-model draw came up short of admissible samples --
-        # top up the gap from the permanent anchor archive instead of just
-        # accepting a smaller churn this round
-        shortfall = budget - int(good_inds.numel())
-        if shortfall > 0 and getattr(self, 'anchor_buffer', None) is not None and len(self.anchor_buffer) > 0:
-            self.top_up_prior_from_anchors(shortfall)
+        if getattr(self, 'anchor_buffer', None) is None or len(self.anchor_buffer) == 0:
+            return
+
+        floor_frac = float(getattr(self.args.buffers.prior_buffer, 'anchor_floor_frac', 0.0))
+        if floor_frac <= 0:
+            # this cycle's prior-model draw came up short of admissible samples --
+            # top up the gap from the permanent anchor archive instead of just
+            # accepting a smaller churn this round
+            shortfall = budget - int(good_inds.numel())
+            if shortfall > 0:
+                self.top_up_prior_from_anchors(shortfall)
+            return
+
+        # Per-condition intake. The pooled branch above computes ONE shortfall
+        # over the whole draw and hands it to an archive-wide priority draw, so a
+        # condition whose prior yield is zero carries no guarantee of any anchor
+        # coverage -- the backfill lands wherever archive-wide priority sends it.
+        # Here every condition the draw touched gets its own shortfall AND a
+        # guaranteed quota, so the prior/anchor mix is specified rather than
+        # emergent. Conditions absent from this draw are not shorted: the draw's
+        # own condition sampling covers them across cycles. N_c == 1 makes the
+        # two branches identical by construction.
+        drawn_cid = torch.as_tensor(metrics['condition_id']).detach().cpu().long().flatten()
+        if drawn_cid.numel() == 0:
+            return
+        admitted_cid = drawn_cid[good_inds.detach().cpu().flatten()]
+        n_cid = int(drawn_cid.max().item()) + 1
+        drawn_per_c = torch.bincount(drawn_cid, minlength=n_cid)
+        admitted_per_c = torch.bincount(admitted_cid, minlength=n_cid)
+        shortfall_per_c = (drawn_per_c - admitted_per_c).clamp(min=0)
+        quota_per_c = torch.ceil(floor_frac * drawn_per_c.float()).long()
+        want_per_c = torch.maximum(shortfall_per_c, quota_per_c)
+
+        n_want = int(want_per_c.sum().item())
+        if n_want > 0:
+            # what the floor asked for BEYOND the shortfall the pooled branch
+            # would have requested; 0 means the floor never bound this cycle
+            self.prior_churn['anchor_floor'] += max(0, n_want - int(shortfall_per_c.sum().item()))
+            self.top_up_prior_from_anchors(n_want, per_condition=want_per_c)
 
     @torch.no_grad()
     def rebuild_prior_by_churn(self, target_size: Optional[int] = None):
@@ -4605,7 +5300,65 @@ Two things deliberately NOT done here, both recorded in
               f"rows of headroom left for churn)")
 
     @torch.no_grad()
-    def top_up_prior_from_anchors(self, n, purge_worst: bool = False):
+    def _stratified_anchor_draw(self, per_condition):
+        """
+        Draw anchors with EXACT per-condition counts, so a guaranteed floor is
+        guaranteed rather than merely expected.
+
+        sample_graphs' `p` argument would fix the condition mix only in
+        expectation, which is not a floor -- so the index set is built per
+        condition here and handed to a single subsample. Within each condition
+        the draw keeps sample_graphs' own semantics: priority-weighted on
+        ema_loss (the AnchorBuffer replay priority) with cfg.replay_beta of the
+        slice drawn uniformly as a random floor, weighted portion WITH
+        replacement (_sample_indices does the same, and ignores replace= on that
+        path). select_counts is bumped exactly as sample_graphs would.
+
+        A condition holding no anchors leaves its quota unfilled and prints:
+        borrowing that shortfall from another condition would silently undo the
+        stratification this exists to provide.
+
+        Returns (graphs, inds), or (None, None) if nothing could be drawn.
+        """
+        cfg = self.args.buffers.anchor_buffer
+        anchor_cid = self.anchor_buffer.batch.condition_id.detach().cpu().long().flatten()
+        weights = np.asarray(self.anchor_buffer._loss_weights(temperature=1.0),
+                             dtype=np.float64).flatten()
+
+        chosen, starved = [], []
+        for cid in torch.nonzero(per_condition > 0, as_tuple=False).flatten().tolist():
+            k = int(per_condition[cid].item())
+            pool = torch.nonzero(anchor_cid == cid, as_tuple=False).flatten().numpy()
+            if pool.size == 0:
+                starved.append(cid)
+                continue
+
+            n_uniform = max(1, int(k * cfg.replay_beta))
+            n_weighted = max(0, k - n_uniform)
+            picks = [np.random.choice(pool, size=n_uniform, replace=n_uniform > pool.size)]
+            if n_weighted > 0:
+                p = weights[pool]
+                total = p.sum()
+                # a condition whose anchors are all NaN/zero-weight falls back to
+                # uniform rather than raising inside np.random.choice
+                p = (p / total) if (np.isfinite(total) and total > 0) else None
+                picks.append(np.random.choice(pool, size=n_weighted, replace=True, p=p))
+            chosen.append(np.concatenate(picks))
+
+        if starved:
+            print(f"anchor floor unfilled for {len(starved)} condition(s) holding no anchors "
+                  f"(e.g. {starved[:5]}) -- quota skipped, never reassigned")
+        if not chosen:
+            return None, None
+
+        inds = np.concatenate(chosen)
+        self.anchor_buffer._bump_counts(inds)
+        graphs = self.anchor_buffer.batch.subsample_new_batch(inds)
+        graphs = self.anchor_buffer._drop_keys(
+            graphs, ("symmetry_operators", "smiles", "identifier"))
+        return graphs, inds
+
+    def top_up_prior_from_anchors(self, n, purge_worst: bool = False, per_condition=None):
         """
         Top up prior_buffer from the anchor buffer: isotropically noise a
         batch of anchors in latent space and rescore them -- the same
@@ -4631,24 +5384,47 @@ Two things deliberately NOT done here, both recorded in
         thereby trigger thin()'s energy-window purges against other anchors)
         while being structurally exempt from admission themselves.
 
-        purge_worst: if True, first purge up to n of prior_buffer's lowest-
-        reward (highest-energy) entries, so the anchor-sourced batch actively
-        replaces stale/pinned material instead of just padding on top of it
-        (used by the reach trigger; the shortfall trigger leaves this False
-        since headroom for that case is already handled upstream).
+        purge_worst: if True, first purge up to n of prior_buffer's worst
+        entries by excess above their OWN condition's minimum, so the
+        anchor-sourced batch actively replaces stale/pinned material instead of
+        just padding on top of it (used by the reach trigger; the shortfall
+        trigger leaves this False since headroom for that case is already
+        handled upstream).
+
+        per_condition: optional per-condition-id count vector. None keeps the
+        archive-wide priority draw. Supplied, the draw is stratified to those
+        exact counts (_stratified_anchor_draw) so an anchor floor is guaranteed
+        per condition rather than merely expected -- `n` must equal its sum.
         """
         cfg = self.args.buffers.anchor_buffer
 
         if purge_worst and self._prior_buffer_len() > 0:
             n_purge = min(n, len(self.prior_buffer))
-            worst_first = torch.argsort(self.prior_buffer.y.cpu(), descending=True)  # highest energy = lowest reward
+            # Rank on EXCESS above each row's own condition minimum, not raw
+            # energy. Absolute elj scales with molecule size, so a pooled raw-y
+            # sort strips the small-molecule conditions wholesale on a
+            # multi-condition run however good their structures are for their
+            # own condition. The reach trigger that fires this already measures
+            # excess (manage_prior_buffer) -- this is the same statistic applied
+            # to the purge it drives. An unobserved condition's +inf floor sends
+            # its rows to -inf, i.e. last, so they are never purged: the same
+            # convention that makes a condition's first sample admissible.
+            y = self.prior_buffer.y.cpu().flatten()
+            energy_floor = self._condition_energy_floor(
+                self.prior_buffer.batch.condition_id.detach().cpu())
+            score = y if energy_floor is None else y - energy_floor.cpu().flatten()
+            worst_first = torch.argsort(score, descending=True)
             self.prior_buffer.purge_by_index(worst_first[:n_purge].numpy())
             self.prior_churn['evicted'] += int(n_purge)
 
-        n_draw = min(n, len(self.anchor_buffer))
-
-        anchor_batch, anchor_inds, _ = self.anchor_buffer.sample_graphs(
-            n_draw, replace=False, weighted=True, temperature=1.0, beta=cfg.replay_beta)
+        if per_condition is None:
+            n_draw = min(n, len(self.anchor_buffer))
+            anchor_batch, anchor_inds, _ = self.anchor_buffer.sample_graphs(
+                n_draw, replace=False, weighted=True, temperature=1.0, beta=cfg.replay_beta)
+        else:
+            anchor_batch, anchor_inds = self._stratified_anchor_draw(per_condition)
+            if anchor_batch is None:
+                return
         anchor_batch = anchor_batch.clone().to(self.device)
         anchor_batch.log_noise_latent_parameters(*cfg.noise_log_range)
 
@@ -4684,9 +5460,12 @@ Two things deliberately NOT done here, both recorded in
         # one cycle); log_buffer_stats zeroes it on read
         self.prior_churn['from_anchors'] += int(good_inds.numel())
 
-        # Record-breaker admission: each drawn anchor's noised child (exactly
-        # one per parent per topup, since draws are replace=False) stands for
-        # admission iff it STRICTLY lowered its condition's Emin(c). No
+        # Record-breaker admission: each drawn anchor's noised child stands for
+        # admission iff it STRICTLY lowered its condition's Emin(c). A parent can
+        # appear more than once -- _sample_indices ignores replace= entirely on
+        # the beta>0 path and draws the weighted portion WITH replacement, as
+        # does the stratified draw -- so AnchorBuffer.admit's same-condition
+        # dup_cutoff pass is what resolves repeats, not the draw. No
         # surprise measurement is spent here -- the child is a strictly deeper
         # version of an already-vetted anchor, so it inherits its parent's
         # frozen original_surprise, and AnchorBuffer.admit's same-condition
@@ -5668,5 +6447,20 @@ Two things deliberately NOT done here, both recorded in
 
 
 if __name__ == '__main__':
+    # GPU pre-flight, BEFORE Modeller() touches CUDA. Two training runs on one card
+    # took this machine down with a BSOD three times on 2026-08-11/12 -- the driver
+    # does not politely OOM, so there is nothing to catch afterwards and the check has
+    # to happen here, first. Judges occupancy on other train.py/train_conformer.py
+    # processes and on free VRAM, NOT on the ~30 desktop apps nvidia-smi reports as
+    # compute processes. Override with GFN_ALLOW_GPU_SHARING=1; see gpu_guard.py.
+    from gpu_guard import require_free_gpu, GPUBusy
+
+    try:
+        require_free_gpu()
+    except GPUBusy as _e:
+        # SystemExit, not sys.exit: `sys` is not imported in this module, and a
+        # NameError here would defeat the check it is guarding.
+        raise SystemExit(str(_e))
+
     modeller = Modeller()
     modeller.train()

@@ -65,7 +65,7 @@ adaptive_lr:
   # a one-step measurement that cannot see multi-step effects, while lowering is
   # the safe direction (undertraining is recovered, damage is not).
   calibration:
-    alpha_target: 6.0
+    alpha_target: 4.0
     eta_up: 0.25
     eta_down: 0.5
 
@@ -93,6 +93,14 @@ use_weight_decay: false
 compile_policy: auto           # torch.compile the dense policy trunk with inductor kernel fusion. 'auto' = Linux+CUDA only (no inductor on native Windows; dev boxes stay eager); true/false force it. Compile errors degrade to eager with a warning. Recompiles on every new batch size
 traj_checkpoint: false         # gradient-checkpoint each rollout step: trajectory activation memory ~O(1) in T instead of O(T), at ~1 extra policy forward per step. Values/gradients identical to false (verified bitwise incl. RNG stream)
 gradient_norm_clip: auto        # policy grad-norm clip. auto -> resolve_derived_config = 250 * grad_median(T)/6.6e3 * sqrt(W/512). Explicit number = override
+grad_clip_guard:               # adaptive clip bar, per step_type, tracking a quantile of that branch's pre-clip grad norms
+  enabled: true                # false -> the bar is gradient_norm_clip, unchanged
+  p: 0.99                      # target quantile; the bar binds on 1-p of steps
+  eta: 0.01                    # log-space step of the bar per observation
+  warmup_steps: 100            # observations per branch before the tracked bar takes over
+  warmup_clip: static          # bar until then: static = gradient_norm_clip, off = no clip
+  max_ratio: 100.0             # furthest the bar may travel from its last calibration, either direction
+  refresh_on_stage: true       # recalibrate at stage transitions, holding the outgoing bar live
 ema_decay: null #0.95  # set to null for no ema # NOTE this breaks some important statistics - leave as null for now
 max_reloads_per_1k_steps: 0.2  # divergence-rewind budget, as a RATE: a run is aborted once total rewinds exceed this x steps/1000 (floor 3). A rate rather than a count so a long run is not aborted for the same per-step behaviour as a short one
 
@@ -162,8 +170,11 @@ batch_growth_slow_interval: 300 # jump spacing after any OOM (congestion avoidan
 # LEVEL itself resets to batch_size at every stage transition (the walk only moves up, so
 # an inherited level is a floor). With this ON, max_batch_size is a safety ceiling.
 auto_batch_throughput_opt: true  # master switch; false = grow to max_batch_size/OOM as before
-batch_growth_max_step_regression: 0.25  # how much slower a step may get in exchange for a jump's throughput (replaces batch_growth_min_gain, which scored raw samples/sec and accepted jumps that made steps 43% slower)
-max_step_seconds: 10  # absolute wall-clock ceiling on a train step; over this the batch is cut a rung regardless of throughput. The v1 run had no such bound and sat at 181 s/step. 0 = off
+batch_growth_min_throughput_gain: 0.05  # samples/sec gain a jump must clear to be kept -- a SATURATION detector. opt-steps/sec = samples_per_sec / grad-accum target, so this maximises optimizer-step throughput; step time does not enter. MUST be < batch_growth_factor-1 (0.65 here): at or above it a factor-f jump can never deliver the demanded gain, so every jump is rejected and the batch FREEZES at batch_size
+gpu_util_window_s: 900  # trailing window for the gpu/util_recent metric. DIAGNOSTIC ONLY -- nothing in the trainer acts on occupancy: batch size does not move it on the MLIP route (measured, umaperf0812)
+gpu_util_sample_period_s: 60  # wall-clock seconds between occupancy samples. Time-based, not per-N-steps: a step-based cadence cannot fill a 900 s window at 200 s/step, which is how the metric came to be absent on exactly the slow MLIP arms it was there to watch
+gpu_util_policy_window_s: 7200  # the window the CLUSTER averages over when deciding to cancel. Logged as gpu/util_policy so the number the scheduler judges is visible in wandb
+max_step_seconds: 60  # RUNAWAY GUARD, not a tuning knob: cut the batch only once the median step exceeds this. Stands down for the stage if a cut does not actually move step time (a fixed per-step cost is not batch-driven, and cutting further only shrinks the gradient). 0 = off
 batch_knee_recheck_steps: 2000  # re-estimate a pinned knee every N steps: drop one rung and re-climb. 0 = pin holds until stage transition/OOM
 oom_batch_shrink_factor: 0.5
 oom_cooldown_steps: 200  # steps to hold batch_size flat after an OOM before resuming growth

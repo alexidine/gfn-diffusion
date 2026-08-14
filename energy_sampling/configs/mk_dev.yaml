@@ -87,6 +87,14 @@ use_weight_decay: false
 compile_policy: auto           # torch.compile the dense policy trunk with inductor kernel fusion. 'auto' = Linux+CUDA only (no inductor on native Windows; dev boxes stay eager); true/false force it. Compile errors degrade to eager with a warning. Recompiles on every new batch size
 traj_checkpoint: false         # gradient-checkpoint each rollout step: trajectory activation memory ~O(1) in T instead of O(T), at ~1 extra policy forward per step. Values/gradients identical to false (verified bitwise incl. RNG stream)
 gradient_norm_clip: auto        # policy grad-norm clip. auto -> resolve_derived_config = 250 * grad_median(T)/6.6e3 * sqrt(W/512). Explicit number = override
+grad_clip_guard:               # adaptive clip bar, per step_type, tracking a quantile of that branch's pre-clip grad norms
+  enabled: true                # false -> the bar is gradient_norm_clip, unchanged
+  p: 0.99                      # target quantile; the bar binds on 1-p of steps
+  eta: 0.01                    # log-space step of the bar per observation
+  warmup_steps: 100            # observations per branch before the tracked bar takes over
+  warmup_clip: static          # bar until then: static = gradient_norm_clip, off = no clip
+  max_ratio: 100.0             # furthest the bar may travel from its last calibration, either direction
+  refresh_on_stage: true       # recalibrate at stage transitions, holding the outgoing bar live
 ema_decay: null #0.95  # set to null for no ema # NOTE this breaks some important statistics - leave as null for now
 max_reloads_per_1k_steps: 0.2  # divergence-rewind budget, as a RATE: a run is aborted once total rewinds exceed this x steps/1000 (floor 3). A rate rather than a count so a long run is not aborted for the same per-step behaviour as a short one
 
@@ -156,8 +164,11 @@ batch_growth_slow_interval: 300 # jump spacing after any OOM (congestion avoidan
 # LEVEL itself resets to batch_size at every stage transition (the walk only moves up, so
 # an inherited level is a floor). With this ON, max_batch_size is a safety ceiling.
 auto_batch_throughput_opt: true  # master switch; false = grow to max_batch_size/OOM as before
-batch_growth_max_step_regression: 0.25  # how much slower a step may get in exchange for a jump's throughput. 0 = demand perfect linear scaling; 0.25 = accept up to 25% slower steps. Must be < batch_growth_factor-1 or every jump passes
-max_step_seconds: 10  # absolute wall-clock ceiling on a train step; over this the batch is cut a rung regardless of throughput. 0 = off
+batch_growth_min_throughput_gain: 0.05  # samples/sec gain a jump must clear to be kept -- a SATURATION detector. opt-steps/sec = samples_per_sec / grad-accum target, so this maximises optimizer-step throughput; step time does not enter. MUST be < batch_growth_factor-1 (0.65 here): at or above it a factor-f jump can never deliver the demanded gain, so every jump is rejected and the batch FREEZES at batch_size
+gpu_util_window_s: 900  # trailing window for the gpu/util_recent metric. DIAGNOSTIC ONLY -- nothing in the trainer acts on occupancy: batch size does not move it on the MLIP route (measured, umaperf0812)
+gpu_util_sample_period_s: 60  # wall-clock seconds between occupancy samples. Time-based, not per-N-steps: a step-based cadence cannot fill a 900 s window at 200 s/step, which is how the metric came to be absent on exactly the slow MLIP arms it was there to watch
+gpu_util_policy_window_s: 7200  # the window the CLUSTER averages over when deciding to cancel. Logged as gpu/util_policy so the number the scheduler judges is visible in wandb
+max_step_seconds: 60  # RUNAWAY GUARD, not a tuning knob: cut the batch only once the median step exceeds this. Stands down for the stage if a cut does not actually move step time (a fixed per-step cost is not batch-driven, and cutting further only shrinks the gradient). 0 = off
 batch_knee_recheck_steps: 2000  # re-estimate a pinned knee every N steps: drop one rung and re-climb. 0 = pin holds until stage transition/OOM
 oom_batch_shrink_factor: 0.5
 oom_cooldown_steps: 200  # steps to hold batch_size flat after an OOM before resuming growth
@@ -227,6 +238,7 @@ replay_loss_coeffs: # applied to trajectories pulled from the replay buffer
   freeze_z: 1.0       # 1 => train policy only, Z detached
   vg_lb: 0
   vg_lme: 0  # exclusive with vg_lb
+  vg_by_condition: 0.0  # group replay VarGrad by condition_id instead of by the K-repeats tile. Needs buffers.replay_buffer.condition_block_m >= 2 to form groups: replay repeats is 1, so the tile path is singleton-grouped and vg_loss is identically zero
   pf_boost: 0
   db: 0.0
   subtb: 0.0
@@ -404,6 +416,8 @@ buffers:
     min_size: 10000
     max_size: 250000
     init_fraction: 0.25  # rebuild_prior_by_churn refill target as a fraction of max_size, admitted through the online gate. Fires at equilibration's on_enter
+    expire_max_frac: 0.1  # per manage call, max fraction of the buffer purged for no longer clearing energy < Emin(c) + ramp_floor. 0 = channel off
+    anchor_floor_frac: 0.1  # per churn cycle, minimum share of each condition's intake drawn from anchor_buffer. 0 = pooled shortfall backfill only
     condition_block_m: 2  # >= 2: bwd 'prior' draws are condition-blocked (M distinct same-condition terminals per block). Auto-active only while bwd vg_lb > 0. 0 = off
     reward_min: 0 # bootstrap-only fallback admission floor (absolute), used until a tracker/anchor_buffer exists to admit relative to each condition's best energy
     # quick_tb_stats' weighted under_coverage ramp, in ENERGY units of per-condition depth
@@ -427,6 +441,7 @@ buffers:
     mean_residence_steps: 50  # memoryless hazard, so residence is exponential (CV ~ 1) -- a WIDE lag distribution, which is a strong lowpass on the policy -> buffer -> gradient path. A hard age cap would concentrate the phase lag at one frequency, and this codebase has a documented phase-2 limit cycle
     max_size: 12000  # 1.5x the 80 x 50 equilibrium (was 4000 = exactly it, zero headroom)
     admit_reward_min: -200  # hard exclusion, applied UPSTREAM of admission unconditionally: admission scores badness, so without a floor the energy distribution is unbounded above
+    condition_block_m: 0  # >= 2: replay draws are condition-blocked (M distinct same-condition terminals per block). Auto-active only while replay vg_by_condition > 0 and vg_lb/vg_lme > 0. 0 = off. Mutually exclusive with prioritise below (blocked draws bypass p); the draw raises if both are on
     # --- prioritised replay (to_do_rebuild.md B5/B7b) ---
     # Admission is unconditionally uniform (D5); purge is hazard+backstop only
     # (floor/stalled retired -- exactly redundant with hazard+backstop once

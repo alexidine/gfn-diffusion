@@ -118,7 +118,7 @@ SKIP_CONDITIONS = ('prior_loaded',)
 
 # Per-stage LR sensor kinds -- see Stage._parse_lr_sensor for why this is
 # declared rather than derived from the active loss coefficients.
-LR_SENSOR_KINDS = ('ray', 'plateau', 'none')
+LR_SENSOR_KINDS = ('ray', 'plateau', 'hyper', 'none')
 RULE_KEYS = {'metric', 'boost', 'above', 'below', 'relative', 'margin', 'drift', 'floor',
              'abs', 'if_missing', 'lookahead', 'anneal'}
 TERM_KEYS = {'metric', 'above', 'below', 'abs', 'patience'}
@@ -363,6 +363,14 @@ class Stage:
                           replay (needing stored trajectories) and scores with
                           replay_loss_coeffs, so anywhere else it rates a loss
                           nobody is optimising.
+          kind: hyper     hypergradient: peak_scale *= exp(beta * cos), where
+                          cos is between the current gradient and the direction
+                          the previous step actually moved the policy. Reads no
+                          loss, so unlike `ray` it is coherent whatever the stage
+                          trains -- which is why it is the sensor for stages that
+                          do not train replay TB. `beta` is a BANDWIDTH and has
+                          no universal value (bench: per-cell optimum spans 20x),
+                          so it is required rather than defaulted.
           kind: none      this stage deliberately has no LR sensor.
 
         `none` is spelled out rather than left to omission, so "no sensor" is a
@@ -377,6 +385,34 @@ class Stage:
         if kind not in LR_SENSOR_KINDS:
             raise ValueError(f"stage '{self.name}': lr_sensor.kind must be one of "
                              f"{LR_SENSOR_KINDS}, got {kind!r}")
+        if kind == 'hyper':
+            # beta is REQUIRED. It is a bandwidth, not a safe constant: swept on
+            # the bench across 12 cells the per-cell optimum spanned 20x and the
+            # best worst-case setting was still 3.2x the best fixed rate. A
+            # default here would be a universal claim the measurements do not
+            # support.
+            if 'beta' not in node:
+                raise ValueError(f"stage '{self.name}': lr_sensor kind 'hyper' "
+                                 f"requires an explicit 'beta' -- it is a "
+                                 f"bandwidth, and no value is right for every "
+                                 f"stage")
+            bad = set(node) - {'kind', 'beta', 'beta_down', 'every'}
+            if bad:
+                raise ValueError(f"stage '{self.name}': unknown lr_sensor keys "
+                                 f"for kind 'hyper': {sorted(bad)}")
+            for k in ('beta', 'beta_down'):
+                if k in node and not (isinstance(node[k], (int, float))
+                                      and float(node[k]) > 0):
+                    raise ValueError(f"stage '{self.name}': lr_sensor.{k} must "
+                                     f"be a positive number, got {node[k]!r}")
+            node['beta'] = float(node['beta'])
+            if node.get('beta_down') is not None:
+                node['beta_down'] = float(node['beta_down'])
+            node['every'] = int(node.get('every', 1))
+            if node['every'] < 1:
+                raise ValueError(f"stage '{self.name}': lr_sensor.every must be "
+                                 f">= 1, got {node['every']}")
+            return node
         if kind in ('ray', 'none'):
             bad = set(node) - {'kind'}
             if bad:
@@ -1163,7 +1199,15 @@ class StageProtocol:
         # first knee comparison (same rationale as the OOM path's reset)
         m._rung_throughput = None
         m.batch_size_saturated_stage = None
+        m.batch_size_pinned_at = 0
         m.batch_size_oom_ceiling = None  # the incoming stage has its own memory profile
+        # runaway-guard latches: both are conclusions about the OUTGOING stage's
+        # fixed per-step cost ("cutting the batch did not move step time", "the batch
+        # is already at the accumulation target"). The incoming stage has a different
+        # cost profile, so it gets to re-derive them -- and to say its piece once.
+        m._runaway_last_cut = None
+        m._runaway_unresponsive_stage = None
+        m._accum_floor_warned_stage = None
         times = getattr(m, '_recent_step_times', None)
         if times is not None:
             times.clear()
@@ -1187,6 +1231,17 @@ class StageProtocol:
         warmup_steps = m.lr_controller.rearm_warmup()
         if warmup_steps:
             print(f"protocol: optimizers rebuilt, LR re-warming over {warmup_steps} train steps")
+        # The adaptive clip bar is calibrated against a gradient distribution, and
+        # a stage boundary is where that distribution moves -- new coeffs, new
+        # branch fracs, fresh Adam moments, sometimes a different train_mode
+        # entirely. The tracker's own rate limit would walk across a shift like
+        # that eventually (ln(ratio)/eta steps), but a boundary is the one place
+        # the change is KNOWN rather than inferred, so it recalibrates on the
+        # signal instead of paying the walk. refresh() holds the outgoing bar live
+        # while it re-measures -- the run is never unguarded across the
+        # turbulence -- and prints the before/after ratio, so unlike a silent
+        # reset this one reports its own size.
+        m.grad_guard.refresh(reason=f"stage {old.name} -> {new.name}")
 
         for name, arg in new.on_enter:
             self._run_action(name, arg, eval_metrics)

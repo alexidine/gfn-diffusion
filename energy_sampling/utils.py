@@ -155,6 +155,27 @@ _GRAD_MEDIAN = {10: 1.0e3, 25: 6.6e3, 100: 1.7e4}  # empirical pre-clip grad med
 # (1.1-7.8 h each) because a retired-key guard lived inside manage_replay_buffer,
 # which first runs at the phase-1 -> 2 transition (module_buffers.md B4).
 _RETIRED_KEYS = {
+    'gpu_util_floor':
+        "deleted 2026-08-13 -- the occupancy rule it drove is gone from "
+        "increment_batch_size. It grew the batch whenever GPU utilization fell under "
+        "this threshold, on the premise that occupancy rises with batch. MEASURED "
+        "FALSE on the MLIP route (umaperf0812 c_controller): batch 100->741 took "
+        "utilization 52->42% and samples/sec 57.7->24.3, four growths, every one "
+        "driven by this floor, the throughput gate refusing all of them and being "
+        "overridden because the floor outranked it. It was also inert on the slow "
+        "arms it was written for -- a 900 s window cannot fill from a per-10-step "
+        "sample at 200 s/step. Occupancy is still LOGGED (gpu/util_recent, "
+        "gpu/util_policy); it just is not actuated from batch size, because the "
+        "levers that move it are work per kernel launch and unpaired host stalls.",
+    'batch_growth_max_step_regression':
+        "deleted -- replaced by `batch_growth_min_throughput_gain`. It bounded how much "
+        "SLOWER a step may get, i.e. it optimised loop-iterations/hour. That is not the "
+        "objective: with the update size pinned at fused_grad_accum_min_samples, "
+        "optimizer-steps/sec = samples_per_sec / accum_target, so opt-step throughput IS "
+        "samples/sec and step time does not enter. The regression gate rejected jumps "
+        "that bought +15% samples/sec for a 43% slower step -- a 15% win scored as a "
+        "loss. The gate is now throughput saturation alone; max_step_seconds survives "
+        "as a far runaway guard.",
     'batch_growth_min_gain':
         "deleted -- replaced by `batch_growth_max_step_regression`. It asked for a "
         "fixed samples/sec gain, which is not a knee criterion: at growth factor f a "
@@ -466,8 +487,19 @@ def _to_plain(obj):
 # would otherwise re-hash every slug and orphan the prod0810 phase1_exit
 # checkpoints. normalize_problem_def drops these from BOTH sides of a
 # compatibility check, so checkpoints saved before an entry was added still load.
+#
+# host_gas_phase_reference is the one entry here that DOES move numbers, so it is
+# worth being explicit about why it still is not identity. The isolated-molecule
+# leg of a lattice energy is mathematically constant for a rigid molecule; hosting
+# it replaces a per-sample recomputation with one reference value, so what changes
+# is the MLIP's rotation-invariance NOISE, not the energy landscape being sampled.
+# Treating that as a different problem would orphan every checkpoint over a
+# numerical-precision improvement. Measure the size of it with
+# MolecularCrystal.gas_reference_audit before assuming it is small on a new
+# molecule set.
 _NON_IDENTITY_ENERGY_CONFIG_KEYS = ('density_coeff', 'bounding_coeff', 'reduction_coeff', 'lj_coeff',
-                                    'reward_range', 'internal_oom_recovery')
+                                    'reward_range', 'internal_oom_recovery',
+                                    'host_gas_phase_reference')
 
 # Explicit version of the problem_def SCHEMA (the set of fields below that
 # constitute a problem's identity). It rides in the dict and therefore in the
@@ -1729,6 +1761,136 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=N
             mets['logw_std_within'] = centered_w.pow(2).mean().sqrt().item()
 
     return mets
+
+
+def per_condition_fraction(indicator, condition_id, bar, worst_quantile=0.5,
+                           higher_is_worse=False):
+    """
+    Per-CONDITION breakdown of a per-sample 0/1 indicator -- the conditional
+    counterpart of the pooled batch fractions ('Reasonable Sample Fraction',
+    'Nonthermal Fraction'), which are the same number for two very different
+    models:
+
+        every condition at 50% good     -> pooled 0.5
+        half the conditions at 0% good  -> pooled 0.5
+
+    The second has entirely lost half the library. That is a worse object than
+    a uniformly mediocre one, it is the failure a pooled fraction cannot see,
+    and it is the one that matters on a conditional run. So: group the
+    indicator by condition_id, take each condition's own fraction p_c, and
+    reduce THAT distribution.
+
+      'failing_frac'  frac(conditions that fail `bar`) -- the headline.
+                      Direction-aware: p_c < bar when higher is better
+                      (reasonable samples), p_c > bar when higher is worse
+                      (non-thermal samples). Fails the bar == "this condition
+                      is broken", so the metric always reads larger-is-worse.
+      'worst'         the `worst_quantile` BAD tail of p_c across conditions,
+                      same knob and convention as quick_tb_stats' tb_err_worst
+                      (worst_quantile = the fraction of conditions allowed to
+                      sit beyond the bar).
+      'per_condition' the p_c themselves, for the histogram -- the full
+                      distribution, of which the two scalars are readings.
+
+    BOTH SCALARS ARE REPORTED because they are inverse readings of one CDF and
+    saturate at OPPOSITE ends. Early in a run nearly every condition fails, so
+    failing_frac pins at 1.0 while 'worst' still moves; late, 'worst' pins at
+    the good end while failing_frac still resolves the last broken conditions.
+    Either one alone is censored across half of a run.
+
+    CHECK RESOLUTION FIRST. p_c is a Bernoulli mean over that condition's n_c
+    samples in this batch. At n_c == 1 it is 0 or 1, failing_frac degenerates
+    to the pooled fraction (no lie, but no added information), and the
+    histogram's spikes at 0 and 1 are binomial artifacts rather than structure.
+    'n_conditions' is returned so the caller can publish it: samples per
+    condition is batch / n_conditions. Conditions are deliberately NOT
+    count-weighted -- each contributes its p_c once, which is the only reason
+    this differs from the pooled fraction at all.
+
+    Returns None -- the family is OMITTED, never nan or 0 -- when there is no
+    condition axis (condition_id None), fewer than 2 conditions, no samples, or
+    no bar. With one group failing_frac would be a 0/1 step function and the
+    histogram a single spike, so an unconditional run's metric surface is left
+    exactly as it was (module_metrics.md 4, the logw_std_within rule).
+    """
+    if indicator is None or condition_id is None or bar is None:
+        return None
+    ind = torch.as_tensor(indicator).detach().flatten().float()
+    if ind.numel() == 0:
+        return None
+    cid = torch.as_tensor(condition_id).detach().flatten().long().to(ind.device)
+    if cid.numel() != ind.numel():
+        # structural: both come off the same pooled batch, so a mismatch is an
+        # upstream alignment bug. Raise -- a per-condition metric computed
+        # against the wrong conditions is worse than no metric.
+        raise ValueError(f"per_condition_fraction: {ind.numel()} indicator rows "
+                         f"vs {cid.numel()} condition ids")
+    uniq, inverse = torch.unique(cid, return_inverse=True)
+    k = uniq.numel()
+    if k < 2:
+        return None
+    counts = torch.zeros(k, device=ind.device, dtype=ind.dtype).scatter_add_(
+        0, inverse, torch.ones_like(ind))
+    hits = torch.zeros(k, device=ind.device, dtype=ind.dtype).scatter_add_(0, inverse, ind)
+    p_c = hits / counts.clamp(min=1)
+
+    bar = float(bar)
+    failing = (p_c > bar) if higher_is_worse else (p_c < bar)
+    # the bad tail: upper when higher_is_worse (as tb_err_worst reads it),
+    # lower otherwise -- 'worst' must always name the same end as 'failing'
+    q = 1.0 - float(worst_quantile) if higher_is_worse else float(worst_quantile)
+    q = min(max(q, 0.0), 1.0)
+    return {
+        'failing_frac': failing.float().mean().item(),
+        'worst': torch.quantile(p_c, q).item(),
+        'spread': _debiased_condition_spread(p_c, counts),
+        'per_condition': p_c,
+        'n_conditions': int(k),
+    }
+
+
+def _debiased_condition_spread(p_c, counts):
+    """
+    Between-condition standard deviation of the TRUE per-condition fraction,
+    with the binomial sampling noise subtracted off. The one reading in
+    per_condition_fraction that survives a change in samples per condition, and
+    therefore the only one that may be compared ACROSS streams (eval_fwd vs
+    eval_test, whose n_c differ by ~2x on cond_aug11).
+
+    p_hat_c is a Bernoulli mean, so its spread across conditions is inflated by
+    noise that shrinks as n_c grows:
+
+        Var(p_hat) = Var(p) + E[p(1-p)/n]
+
+    Both terms are estimable. The sample variance over conditions (the /(k-1)
+    convention, which is what makes the identity exact under heterogeneous n_c)
+    gives the left side; p_hat(1-p_hat)/(n-1) is unbiased for p(1-p)/n per
+    condition, since E[p_hat(1-p_hat)] = p(1-p)(n-1)/n. Subtract and take the
+    root:
+
+        every condition at 50%      -> 0.0   (all spread was noise)
+        half the library dead       -> 0.5   (at ANY n_c)
+
+    which is exactly the geometry a pooled fraction cannot see, stated in a way
+    that a 2000-sample stream and a 10000-sample one can be held against each
+    other. Unbiased in both, so their difference is signal; the smaller stream's
+    estimate is merely noisier, and noise is symmetric where the raw
+    failing-fraction bias is not.
+
+    Clamped at 0 before the root: a negative estimate means the observed spread
+    is within binomial noise, i.e. no detectable concentration, which reads as
+    0. Singletons carry no information about Var(p) (their correction term is
+    undefined) and are dropped from BOTH terms -- the same singleton mask
+    logw_std_within uses, and under uniform condition draws the sample count is
+    independent of sample quality. None -- key omitted -- when fewer than two
+    conditions have 2+ samples.
+    """
+    multi = counts >= 2
+    if int(multi.sum().item()) < 2:
+        return None
+    p_m, n_m = p_c[multi], counts[multi]
+    var_hat = p_m.var(unbiased=True) - (p_m * (1.0 - p_m) / (n_m - 1.0)).mean()
+    return var_hat.clamp_min(0.0).sqrt().item()
 
 
 def online_tb_coverage(log_pf, log_pb, log_Z, log_r, log_w_clamp=10.0):

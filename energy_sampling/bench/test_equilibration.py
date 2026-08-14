@@ -115,6 +115,118 @@ def test_this_cell_is_a_CLIFF_problem_not_a_tuning_problem():
         f'inside -- the cliff is not sharp, so there is no edge to control to')
 
 
+def test_noise_is_a_pure_gain_on_the_linear_game():
+    """
+    THE `noisy` CELL IS NOT A CELL, and the reason is STRUCTURAL rather than a
+    metric defect -- which is a stronger statement than the first version of
+    this test made, and it changes the fix.
+
+    `bench.eqsuite`'s `noisy` cell returned a nats column identical to `base` to
+    two decimals for eight arms. The game is linear and its fixed point is the
+    origin, so the state is `deterministic(t) + noise * stochastic(t)`; once the
+    transient decays the WHOLE trajectory is proportional to `noise`. Distance
+    is quadratic in it -- hence exactly 100x for 10x noise, measured, for arms
+    at different rates -- and the gradients scale too, so every scale-free
+    controller is exactly blind to it. It is not that nats hides a real
+    difference; there is no difference to hide.
+
+    Consequence: no rescoring rescues the linear cell. Only breaking the scale
+    invariance does, which is what `quartic` is for -- see the next test.
+    """
+    lo = [_run(lr, steps=3000)[0].expected_loss() for lr in (0.01, 0.003)]
+    hi = [_run(lr, steps=3000, noise=1.0)[0].expected_loss()
+          for lr in (0.01, 0.003)]
+    ratios = [h / l for h, l in zip(hi, lo)]
+
+    assert all(r > 10.0 for r in ratios), (
+        f'10x noise moved the settled distance by {ratios} -- the knob is INERT '
+        f'and the game, not the metric, is what needs fixing')
+    assert abs(ratios[0] / ratios[1] - 1.0) < 0.05, (
+        f'noise rescaled the two rates differently ({ratios}) -- then the game '
+        f'is NOT scale-invariant and the cell carries information after all')
+
+
+def test_the_quartic_is_live_and_STILL_cannot_break_the_noise_invariance():
+    """
+    THE ATTEMPTED REPAIR AND ITS FAILURE, recorded as a test so the idea is not
+    tried again from scratch.
+
+    The reasoning was sound: a quartic makes curvature grow with |theta|, a
+    bigger noise ball sits in a stiffer region, and noise should stop being a
+    common rescale. It does not work at any usable coefficient. theta starts at
+    O(1) and settles at O(1e-3), so the quartic term spans six orders of
+    magnitude between the two ends. Measured at the widest ball the game
+    tolerates (noise=1.0): the settled distance moves 2.7e-7 at quartic=0.05,
+    6.3e-5 at quartic=10, and NaN at quartic=50 -- it goes from unmeasurable to
+    fatal without passing through useful. The `noisy` cell is DROPPED from
+    `bench.eqsuite`.
+
+    TWO ASSERTIONS, and the pair is the point. The quartic must be LIVE -- it
+    changes the settled distance -- and must still FAIL to separate the rates.
+    Asserting only the failure would pass just as well if the term were never
+    added at all, which is the state this test would then be certifying.
+
+    (An earlier version asserted the repair WORKED and was failing the whole
+    time. It survived a mutation sweep because that sweep only checked each test
+    failed with its bug reinstated and never checked it passed clean -- so
+    "caught" meant nothing for a test that was red in both states.)
+    """
+    # the LARGEST coefficient that does not detonate, and the widest ball -- if
+    # the term cannot matter here it cannot matter anywhere on this surface
+    q = dict(quartic=10.0)
+    # ON `distance_to_opt`, NOT `expected_loss`. The score ADDS the quartic term
+    # itself, so it moves when the coefficient changes even if the term never
+    # reaches an update -- measured: deleting the quartic from `_replay_loss`
+    # left an expected_loss-based version of this assertion passing. The state
+    # norm carries no quartic, so only the DYNAMICS can move it.
+    plain = _run(0.01, steps=3000, noise=1.0)[0].distance_to_opt()
+    quart = _run(0.01, steps=3000, noise=1.0, **q)[0].distance_to_opt()
+    assert abs(quart / plain - 1.0) > 1e-6, (
+        f'the quartic changed nothing at all ({quart:.10g} vs {plain:.10g}) -- '
+        f'it is not reaching the dynamics, so the rest of this test would be '
+        f'certifying an absent term rather than an insufficient one')
+
+    lo = [_run(lr, steps=3000, **q)[0].expected_loss() for lr in (0.01, 0.003)]
+    hi = [_run(lr, steps=3000, noise=1.0, **q)[0].expected_loss()
+          for lr in (0.01, 0.003)]
+    ratios = [h / l for h, l in zip(hi, lo)]
+    assert abs(ratios[0] / ratios[1] - 1.0) < 0.05, (
+        f'the quartic now DOES separate the rates under noise ({ratios}) -- the '
+        f'`noisy` cell is repairable after all and eqsuite should carry it')
+
+
+def test_the_buffer_rate_is_inert_at_the_battery_horizon():
+    """
+    THE `slow buffer` CELL IS NOT A CELL EITHER, for an unrelated reason: at the
+    fixed point mu reaches theta whatever kappa is, so kappa shapes only the
+    transient -- and over 6000 steps that has washed out. Measured 0.3%, roughly
+    100x under the gaps between arms.
+
+    The fix is therefore a SHORTER HORIZON, not a bigger knob, and this test
+    pins both ends of that claim rather than only the null: kappa is worth ~13%
+    at 3000 steps (comparable to the ray-vs-hyper gap, so scoreable) and ~0.3%
+    at the battery's 6000 (not). A null on its own would be satisfied by a
+    kappa that never did anything, which is a different and worse story.
+    """
+    def dist(steps, **over):
+        return _run(0.01, steps=steps, **over)[0].expected_loss()
+
+    early = dist(3000, kappa=0.002) / dist(3000)
+    late = dist(6000, kappa=0.002) / dist(6000)
+
+    assert abs(early - 1.0) > 0.05, (
+        f'kappa moves nothing even at 3000 steps ({early:.4f}x) -- the buffer '
+        f'pole is not reaching the dynamics at all, which is a game bug and not '
+        f'a horizon problem')
+    assert abs(late - 1.0) < 0.05, (
+        f'kappa now moves the settled distance {late:.3f}x at the battery '
+        f'horizon -- `slow buffer` is a live cell again and eqsuite should '
+        f'score it')
+    assert abs(late - 1.0) < abs(early - 1.0), (
+        'the kappa effect is supposed to DECAY with horizon (transient-only); '
+        f'it grew instead ({early:.4f} -> {late:.4f})')
+
+
 def test_the_closed_form_tracks_the_conditioning():
     """
     `iteration_matrix` used to assume every coordinate identical and return one
