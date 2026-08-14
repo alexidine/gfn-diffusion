@@ -58,6 +58,17 @@ per-call `(step_type, current_loss, grad_norm)`.
   clamped to the live ceiling on every read, which is what makes that safe.
 - The envelope is a pure function of `step_ind - stage_start_step`, so the
   10-step call cadence cannot change what a config value means.
+- **Every sensor is opt-in per stage.** A stage runs the sensor its `lr_sensor`
+  block names and no other; omitting the block means *no* sensor, exactly like
+  `kind: none`. `ray_calibration.enabled` is no longer a second way to switch
+  the ray probe on — omission used to arm it, which put a replay-dependent
+  sensor (it draws from replay and scores `replay_loss_coeffs`) into stages that
+  never train replay, where it could only tally `raycal/skipped`. The block now
+  supplies parameters (`alphas`, `n_sub`, `period`) to whoever opts in.
+  `Modeller._check_ray_wiring` reports the two disagreements at startup: a stage
+  asking for `ray` while the block is disabled is a hard error (it would train at
+  a fixed LR while the config claims a servo); an enabled block nobody asks for
+  prints that it is inert.
 
 ## 3. Mechanism
 

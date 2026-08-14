@@ -436,23 +436,27 @@ class LRController:
         over-cut run keeps cutting toward the floor. A periodic reset bounds that
         without a servo that tries to hunt the peak, and cannot oscillate.
 
-        Two triggers, both cheap:
-          - the peak has hit its floor, so further cuts do nothing anyway;
-          - restart_after train steps have passed since the last restart.
-        adaptive_lr.restart_after: null disables the timed one.
+        ONE trigger: restart_after train steps since the last restart.
+        adaptive_lr.restart_after: null disables it, which is the default.
+
+        There is deliberately NO floor trigger. Restarting because peak_scale
+        reached its floor multiplies the LR by 1/floor in a single step -- 100x
+        at the old 0.01 bound -- and that detonated five of six qm9anchor_aug14
+        arms from a healthy state. It also fired regardless of which sensor moved
+        peak_scale, so a hypergradient run correctly tracking a descending
+        optimum was reset by plateau-rule machinery it never used. peak_scale
+        sitting at the floor means the FLOOR IS TOO HIGH; lower the bound.
         """
-        lo, _ = self._peak_bounds()
         every = self._cfg('restart_after', None)
+        if every is None:
+            return
         since = int(self.modeller.step_ind) - int(st.get('restart_step', 0))
-        floored = float(st['peak_scale']) <= lo * 1.000001
-        timed = every is not None and since >= int(every)
-        if not (floored or timed):
+        if since < int(every):
             return
         st['peak_scale'] = 1.0
         st['restart_step'] = int(self.modeller.step_ind)
         self._restarts += 1
-        print(f"lr_ctrl: warm restart ({'floor' if floored else f'{since} steps'}) "
-              f"-- peak_scale -> 1.0")
+        print(f"lr_ctrl: warm restart ({since} steps) -- peak_scale -> 1.0")
 
     _STATUS = {'unresolved': 0, 'bracketed': 1, 'above_range': 2,
                'below_range': 3, 'inconsistent': 4, 'warmup': 5}

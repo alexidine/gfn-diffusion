@@ -52,6 +52,28 @@ causes it used to gate) are retired outright, not merely switched off, so
 eviction is unconditionally hazard + backstop regardless of `prioritise`
 (B10).
 
+**Replay management is stage-gated, and the gate is derived, not configured.**
+`manage_replay_buffer` returns immediately — before the residual arithmetic and
+before the `flow_states` D2H, which is the part that costs — unless the current
+stage has a consumer for the buffer (`replay_in_play`, `train.py`). The three
+consumers are the fused replay branch, the ray probe (it draws from replay), and
+`z_calibration.mode: replay`. A VarGrad-only protocol has none of them, so it
+never builds a replay buffer at all.
+
+The branch test is the engine's own `mode_boostable('replay')` with one
+correction: `Stage.active_modes` counts a pinned mode by the *presence* of its
+key, so `pinned: {replay: 0.0}` reads as boostable. `replay_in_play` reads the
+pin by value. There is no config switch — a protocol that trains replay cannot
+be starved by a stale key, and one that never does pays nothing.
+
+Being wrong in the OFF direction is bounded and self-healing: intake is
+supply-paced, so a stage that does want replay fills it from its own first fwd
+steps rather than inheriting a warm buffer from the stage before, and rows
+surviving from an earlier managed stage are aged out by the backstop on the
+first managed call. This is *not* the tsched_july24 failure — there the buffer
+emptied **during** a stage that was drawing from it, because intake was paced
+demand-side. Nothing about the gate changes intake while a stage draws.
+
 Paper voice: *training draws from a large, slowly-churned prior buffer that
 supplies distributional diversity, and from a small, fast-turnover replay buffer
 that supplies the policy's own mis-weighted samples. A permanent archive of

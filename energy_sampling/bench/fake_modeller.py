@@ -111,10 +111,14 @@ def make_args(**overrides):
 class FakeStage:
     """protocol.stage, as increment_batch_size and the probe gate see it."""
 
-    def __init__(self, name='naive', train_mode='fused', lr_sensor=None):
+    def __init__(self, name='naive', train_mode='fused', lr_sensor=None, balance=None):
         self.name = name
         self.train_mode = train_mode
-        self.lr_sensor = lr_sensor      # None = legacy always-on ray probe
+        # None = NO LR sensor. The ray probe is opt-in per stage (train.py
+        # _ray_probe_armed): omitting the block used to arm it anyway under the
+        # global ray_calibration.enabled, and that default is retired.
+        self.lr_sensor = lr_sensor
+        self.balance = balance          # parsed balance dict, as protocol.Stage builds it
 
 
 class FakeModeller:

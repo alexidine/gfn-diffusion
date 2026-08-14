@@ -166,6 +166,9 @@ class Modeller:
                               'expired': 0, 'expired_undrawn': 0,
                               'expired_drawn': 0, 'expired_draws_sum': 0,
                               'expired_delta_sum': 0.0, 'expired_delta_n': 0}
+        # last answer from replay_in_play(), for the transition print only (None
+        # = never asked). Deliberately NOT checkpointed: it drives nothing.
+        self._replay_managed = None
         # prior_buffer churn decomposed by admission SOURCE, tallied across every
         # manage_prior_buffer/top_up_prior_from_anchors/grow_prior_buffer call and
         # drained once per eval in log_buffer_stats. The point is the source mix:
@@ -190,7 +193,69 @@ class Modeller:
             self.args.gradient_norm_clip, getattr(self.args, 'grad_clip_guard', None))
         self.grad_guard.announce()
         self.protocol = StageProtocol(self)  # the declarative stage engine: coeffs, balance, exits, transitions
+        self._check_ray_wiring()
         self.init_train_constants()
+
+    def _ray_probe_armed(self) -> bool:
+        """Arm the ray probe iff THIS stage asked for it (lr_sensor kind 'ray').
+
+        The probe is coherent only in a fused stage that trains replay TB -- it
+        draws from replay (needing STORED trajectories) and scores with
+        replay_loss_coeffs, so anywhere else it rates a loss nobody is
+        optimising.
+
+        A stage with NO lr_sensor block used to arm it anyway, governed by the
+        global ray_calibration.enabled. That default is retired: arming by
+        omission put a replay-dependent sensor into stages that never train
+        replay (where _draw_probe_batch can only return None and tally
+        raycal/skipped), and it was the last thing keeping the replay buffer
+        load-bearing in a VarGrad-only protocol. Omitting the block now means NO
+        LR sensor, which is what it reads like. _check_ray_wiring reports the two
+        ways a config can disagree with that, at startup rather than here.
+
+        arm() is called ONLY on the armed path: it clones every policy parameter,
+        which is not something to spend on a stage that will not measure.
+        """
+        sensor = self.protocol.stage.lr_sensor
+        if sensor is None or sensor['kind'] != 'ray':
+            return False
+        return self.ray_cal.arm(self.step_ind)
+
+    def _check_ray_wiring(self):
+        """The ray probe is OPT-IN per stage: it runs where and only where a
+        stage declares `lr_sensor: {kind: ray}` (see the gate in train_step).
+
+        It used to arm by OMISSION -- any stage with no lr_sensor block ran it
+        whenever `ray_calibration.enabled` was true. That is backwards for a
+        probe with a hard coherence requirement (it draws from replay and scores
+        replay_loss_coeffs, so outside a fused stage training replay TB it rates
+        a loss nobody is optimising), and it is what kept the replay buffer
+        nominally load-bearing in stages that never touch replay.
+
+        Two ways the pair can now disagree, both silent before this ran:
+          - a stage asks for `ray` while ray_calibration.enabled is false. arm()
+            would return False forever and the stage would train at its seed LR
+            with the config claiming a sensor. Hard error.
+          - ray_calibration.enabled is true and no stage asks. The block is
+            inert; say so rather than let it read as an active sensor.
+        """
+        rc = getattr(self.args, 'ray_calibration', None)
+        enabled = bool(getattr(rc, 'enabled', False))
+        askers = [s.name for s in self.protocol.stages
+                  if s.lr_sensor is not None and s.lr_sensor['kind'] == 'ray']
+        if askers and not enabled:
+            raise ValueError(
+                f"stages {askers} declare lr_sensor kind 'ray' but "
+                f"ray_calibration.enabled is false -- the probe would never arm and "
+                f"those stages would run at a fixed LR while the config says they are "
+                f"servoed. Set ray_calibration.enabled: true, or move those stages to "
+                f"another lr_sensor kind.")
+        if enabled and not askers:
+            print("WARNING: ray_calibration.enabled is true but no stage declares "
+                  "lr_sensor kind 'ray' -- the probe is opt-in per stage, so the block "
+                  "is inert (parameters only). This is the intended setting for a run "
+                  "with no replay-TB stage; the key is left in place because it still "
+                  "supplies alphas/n_sub/period to any stage that opts in.")
 
     def init_train_constants(self):
         for k, v in MODELLER_STATE_DEFAULTS.items():
@@ -556,6 +621,7 @@ class Modeller:
                       f"{self.batch_size}")
                 self.batch_size_oom_ceiling = None
                 self.batch_size_oom_ceiling_at = None
+                self.batch_ceiling_expiries = getattr(self, 'batch_ceiling_expiries', 0) + 1
                 if getattr(self, 'batch_size_saturated_stage', None) == stage_name:
                     # the pin may have been the ceiling's doing; release it and let the
                     # walk re-measure. A knee pin released here costs one re-climb
@@ -773,6 +839,29 @@ class Modeller:
         if policy is not None:
             metrics['gpu/util_policy'] = policy
         self._throughput = {'samples': 0, 'seconds': 0.0, 'energy_seconds': 0.0}
+        # VRAM, on the same cadence as occupancy. Read vram/cached_mb against
+        # 'Batch Size': a batch that falls while cached_mb stays high is the caching
+        # allocator holding ground the run cannot use, which is the difference between
+        # "this job needs a smaller batch" and "this job needs its memory back".
+        metrics.update(self.vram_metrics())
+        # BATCH CONTROLLER STATE AS SERIES. Everything this controller concludes it
+        # otherwise says only in prints, and prints do not survive the runs that most
+        # need a postmortem: wandb uploads no console log at all for a run left in
+        # state 'crashed' (a hard kill / node loss, where the exit handler never runs),
+        # so a scancelled job loses its whole account of itself. History streams
+        # continuously and survives that. Counters are CUMULATIVE rather than per-step
+        # flags so an event landing between two ten-step reports still shows up as a
+        # step change instead of being missed entirely.
+        #
+        # Read `batch/oom_events` against 'Batch Size' to place every cut, and
+        # `batch/oom_ceiling` against `vram/cached_mb` to tell a real memory limit from
+        # a stale one -- a ceiling standing while cached_mb stays high is the caching
+        # allocator holding ground the run cannot use, not a batch that genuinely does
+        # not fit. 0 = no ceiling currently standing (the state is None).
+        metrics['batch/oom_events'] = float(getattr(self, 'batch_oom_events', 0))
+        metrics['batch/ceiling_expiries'] = float(getattr(self, 'batch_ceiling_expiries', 0))
+        metrics['batch/oom_ceiling'] = float(getattr(self, 'batch_size_oom_ceiling', None) or 0)
+        metrics['batch/oom_min'] = float(getattr(self, 'batch_size_oom_min', None) or 0)
         metrics['Fwd Frac'] = self.fwd_frac
         metrics['Bwd Frac'] = self.bwd_frac
         metrics['Replay Frac'] = self.replay_frac
@@ -1959,18 +2048,27 @@ class Modeller:
                          tags=[self.args.tag])):
             self.times['initialization_start'] = time()
 
+            self.vram_ledger('baseline')
+
             # Reward init
             self.init_energy_function()
+            self.vram_ledger('energy fn (MLIP loaded)')
 
             # Model Init
             self.init_gfn()
+            self.vram_ledger('gfn model')
 
             # data init -- init_identifiers() needs mol_dataset/prior_dataset/test_mol_dataset
             # all loaded first (it builds one registry spanning all of them), and must itself
             # run before init_condition_log_z() (which preallocates the tracker table off
             # energy_function.condition_library_size, set by init_identifiers())
             self.init_mol_dataset()
+            self.vram_ledger('mol_dataset')
             self.init_prior_dataset()
+            # THE ONE TO WATCH: this is the whole-prior MLIP re-analysis. If `cached`
+            # jumps here and never comes back down, the startup energy evaluations are
+            # holding the card and every later OOM is downstream of this line.
+            self.vram_ledger('prior_dataset (MLIP scan)')
             self.init_identifiers()
             # grow_prior_buffer() must run after init_identifiers() so the freshly
             # sampled batch inherits mol_id (via mol_dataset's registry) and matches
@@ -1985,6 +2083,9 @@ class Modeller:
                 self.grow_prior_buffer()
             self.init_condition_log_z()
             self.init_anchor_buffer_seed()
+            # buffer_device: cuda puts prior/replay/anchor on the card. A big jump in
+            # LIVE (not cached) here is the buffers, not a leak -- a different fix.
+            self.vram_ledger('buffers seeded')
 
             # pin the starting stage on a fresh run and walk any skip_if chain
             # (e.g. a prior loaded by path skips the MLE warm-start stage);
@@ -1992,6 +2093,16 @@ class Modeller:
             self.protocol.begin()
 
             self.times['initialization_end'] = time()
+            # the number every training allocation has to fit under, printed BEFORE
+            # the first step so a launch that is already doomed says so at step 0
+            self.vram_ledger('READY TO TRAIN')
+            if torch.cuda.is_available():
+                _total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 2)
+                _cap = float(getattr(self.args, 'cuda_memory_fraction', 1.0) or 1.0) * _total
+                _res = torch.cuda.memory_reserved() / (1024 ** 2)
+                print(f"vram: cuda_memory_fraction {getattr(self.args, 'cuda_memory_fraction', None)} "
+                      f"x {_total:.0f} MiB = {_cap:.0f} MiB hard cap; "
+                      f"{_cap - _res:.0f} MiB of it left for training allocations")
 
             # no wandb.watch(log='gradients'): 110 per-tensor histograms answered
             # 'is gradient reaching every submodel / is one cooling off' badly and
@@ -2392,15 +2503,7 @@ class Modeller:
         # actually taken. Sensor only -- measure() restores every parameter it
         # touches bitwise, and a probe that finds no step (non-finite gradient,
         # or mid-accumulation) tallies 'nostep' and returns without reading.
-        # The ray probe runs only where the stage asks for it. It is coherent
-        # ONLY in a fused stage that trains replay TB -- it draws from replay
-        # (needing STORED trajectories) and scores with replay_loss_coeffs, so
-        # anywhere else it rates a loss nobody is optimising. A stage with no
-        # lr_sensor block keeps the legacy always-on behaviour governed by
-        # ray_calibration.enabled, so existing configs are unaffected.
-        _sensor = self.protocol.stage.lr_sensor
-        probe_armed = (self.ray_cal.arm(self.step_ind)
-                       if (_sensor is None or _sensor['kind'] == 'ray') else False)
+        probe_armed = self._ray_probe_armed()
 
         if accumulating:
             self.fused_accum_count += self.batch_size
@@ -3832,6 +3935,11 @@ Two things deliberately NOT done here, both recorded in
             raise e  # will simply raise error if other or if training on CPU
 
         print("OOMED!")
+        # counted BEFORE the step_ind == 0 bail below, and for eval OOMs as well as
+        # train ones: this is the record that an allocation failed, not the record of
+        # what the controller did about it. Which of the two it was is recoverable from
+        # whether batch/oom_ceiling moved on the same step.
+        self.batch_oom_events = getattr(self, 'batch_oom_events', 0) + 1
         if self.step_ind == 0:
             return
 
@@ -4020,6 +4128,55 @@ Two things deliberately NOT done here, both recorded in
                                         getattr(self.args, 'reasonable_cond_bar', 0.5),
                                         higher_is_worse=False, prefix='eval_test/')
         return metrics
+
+    def vram_ledger(self, tag: str):
+        """
+        One line of the init-time VRAM ledger: what is LIVE, what the allocator is
+        HOLDING, and the difference.
+
+        WHY THE DIFFERENCE IS THE WHOLE POINT. `allocated` is live tensors; `reserved`
+        is what the caching allocator took from the driver and -- expandable_segments
+        being unsupported here -- does not give back. `reserved - allocated` is free
+        cache. That is normally harmless, except that `cuda_memory_fraction` is applied
+        as a HARD per-process cap (set_per_process_memory_fraction, __init__), so cache
+        the run cannot reuse still counts against the ceiling a training allocation has
+        to fit under. Blocks shaped like MLIP supercell neighbour lists are exactly the
+        kind a T-step MLP rollout will never ask for.
+
+        Called at each init milestone so the question "do the startup mace evaluations
+        give their VRAM back" is ANSWERED BY THE LOG rather than inferred from a batch
+        size hours later. Read the ledger down the page: a large `cached` that appears
+        at the prior re-analysis and never falls is the leak signature; a large
+        `allocated` that appears when the buffers are built is buffer_device: cuda
+        doing what it was told, and needs a different fix entirely.
+        """
+        if not torch.cuda.is_available():
+            return
+        try:
+            alloc = torch.cuda.memory_allocated() / (1024 ** 2)
+            res = torch.cuda.memory_reserved() / (1024 ** 2)
+            peak = torch.cuda.max_memory_reserved() / (1024 ** 2)
+            print(f"vram [{tag:<28}] live {alloc:8.0f} MiB | reserved {res:8.0f} MiB "
+                  f"| cached {res - alloc:8.0f} MiB | peak reserved {peak:8.0f} MiB")
+            if not hasattr(self, '_vram_ledger'):
+                self._vram_ledger = {}
+            self._vram_ledger[tag] = (round(alloc), round(res))
+        except Exception:
+            pass        # a diagnostic must never be able to kill a run
+
+    def vram_metrics(self):
+        """The same three numbers as wandb series, so the ledger has a time axis past
+        init. `vram/cached_mb` is the actionable one -- see vram_ledger."""
+        if not torch.cuda.is_available():
+            return {}
+        try:
+            alloc = torch.cuda.memory_allocated() / (1024 ** 2)
+            res = torch.cuda.memory_reserved() / (1024 ** 2)
+            return {'vram/live_mb': alloc, 'vram/reserved_mb': res,
+                    'vram/cached_mb': res - alloc,
+                    'vram/peak_reserved_mb': torch.cuda.max_memory_reserved() / (1024 ** 2)}
+        except Exception:
+            return {}
 
     def record_vram_peak(self):
         """
@@ -5745,11 +5902,64 @@ Two things deliberately NOT done here, both recorded in
         self.prev_bwd_step_count = self.bwd_step_count
         return num_bwd_steps
 
+    def replay_in_play(self) -> bool:
+        """Has the CURRENT stage any use for the replay buffer? False means
+        manage_replay_buffer is skipped outright -- no admission, no eviction,
+        and (the part that actually costs) no per-step D2H of flow_states.
+
+        DERIVED FROM THE STAGE, not from a config switch, so a protocol that
+        never trains replay simply never builds the buffer, and one that does
+        cannot be starved by a stale key. The three consumers, each named:
+
+          - the fused replay branch. mode_boostable('replay') is the engine's
+            own answer to "can this stage's balance raise replay off the floor"
+            (fused_train_step gates the branch on exactly it), with one
+            correction: active_modes counts a PINNED mode by the presence of
+            its key, so `pinned: {replay: 0.0}` -- var_conditioning's way of
+            saying "replay off" -- reads as boostable. A pin at zero is a pin at
+            zero, so it is read by VALUE here.
+          - the ray probe, which draws from replay (see _draw_probe_batch).
+          - z_calibration mode 'replay', which draws from it too.
+
+        Cost of being wrong in the OFF direction is bounded and self-healing:
+        the buffer is supply-paced, so a stage that does want replay fills it
+        from its own first fwd steps (churn_rate rows per step, equilibrium
+        occupancy churn_rate x mean_residence_steps) instead of inheriting a
+        warm one from the stage before. Rows that survive from an earlier
+        managed stage are aged out by the backstop on the first managed call.
+        That is the opposite of the tsched_july24 failure this must not
+        recreate: there the buffer emptied DURING a stage that was drawing from
+        it, because intake was paced demand-side. Nothing here changes intake
+        while a stage draws.
+        """
+        stage = self.protocol.stage
+        sensor = stage.lr_sensor
+        if sensor is not None and sensor['kind'] == 'ray':
+            return True
+        zc = getattr(self.args, 'z_calibration', None)
+        if getattr(zc, 'enabled', False) and getattr(zc, 'mode', None) == 'replay':
+            return True
+        if stage.train_mode != 'fused':
+            return False  # TRAIN_MODES is ('bwd', 'fused'); only fused has branches
+        if not self.protocol.mode_boostable('replay'):
+            return False
+        bal = stage.balance
+        if bal is not None and bal['kind'] in ('proportional', 'constraint', 'ratio'):
+            pinned = bal.get('pinned') or {}
+            if 'replay' in pinned:
+                return float(pinned['replay']) > 0.0
+        return True
+
     def manage_replay_buffer(self, fwd_stats, sample_batch):
         """
         Store the full forward trajectory of on-policy samples with strongly
         over- or under-weighted terminals, so they can be replayed exactly
         (get_traj_replay) instead of re-sampled backward.
+
+        NO-OP in a stage with no use for the buffer (replay_in_play), which is
+        checked FIRST -- ahead of the residual arithmetic and the flow_states
+        transfer, so an unused buffer costs nothing rather than costing the
+        expensive part of a managed call.
 
         ADMISSION is unconditionally uniform over the sane pool (decisions.md
         D5, to_do_rebuild.md Phase 3 step 3). Selection lives entirely at the
@@ -5788,6 +5998,20 @@ Two things deliberately NOT done here, both recorded in
         BADNESS criterion, so without a reward floor the buffer's energy
         distribution is unbounded above.
         """
+        in_play = self.replay_in_play()
+        if in_play is not self._replay_managed:
+            # announced on every flip (both directions) so the transition print
+            # is followed by an explicit statement of what the buffer is doing,
+            # rather than leaving "is replay churning?" to be inferred from
+            # whether replay_buffer_* metrics moved
+            self._replay_managed = in_play
+            print(f"replay buffer: management {'ON' if in_play else 'OFF'} under stage "
+                  f"'{self.protocol.stage.name}'"
+                  + ('' if in_play else " -- nothing in it trains replay, draws from it, "
+                                        "or probes it (replay_in_play)"))
+        if not in_play:
+            return
+
         log_r = fwd_stats['log_r']
         log_pf = fwd_stats['log_pf']
         log_pb = fwd_stats['log_pb']

@@ -178,6 +178,7 @@ max_step_seconds: 60  # RUNAWAY GUARD, not a tuning knob: cut the batch only onc
 batch_knee_recheck_steps: 2000  # re-estimate a pinned knee every N steps: drop one rung and re-climb. 0 = pin holds until stage transition/OOM
 oom_batch_shrink_factor: 0.5
 oom_cooldown_steps: 200  # steps to hold batch_size flat after an OOM before resuming growth
+batch_oom_ceiling_retest_steps: 1000  # steps an OOM ceiling stands with no further OOM before it is cleared and the walk re-probes upward. Every OOM restarts this clock. A failed re-probe costs a shrink_factor cut, so this is not free. 0 = the ceiling never expires
 eval_num_samples: 10000       # minimum number of samples for evaluation
 test_eval_num_samples: 2000   # held-out conditional eval batch; inert while test_molecules_path is null
 fused_grad_accum_min_samples: 1000  # fused steps only: effective-gradient floor. Batches BELOW this accumulate micro-steps until this many samples contribute; batches AT/ABOVE it take a plain unscaled step. 0 disables
@@ -354,9 +355,9 @@ protocol:
       on_enter: [ 'rebuild_prior_by_churn', 'bootstrap_z:train_conditioner' ]
       fracs: { fwd: 0.05, bwd: 0.45, replay: 0.5 }
       # Per-mode frac floors; the integrator kinds fold these into `bounds` at
-      # parse. bwd's floor is the mode-collapse guard -- lost modes are not
-      # spontaneously re-found.
-      min_fracs: { fwd: 0.02, bwd: 0.25, replay: 0.05 }
+      # parse. A floor at or above deactivate_threshold keeps that branch
+      # always active; below it, the branch may switch off entirely.
+      min_fracs: { fwd: 0.02, bwd: 0.02, replay: 0.02 }
       deactivate_threshold: 0.01
       loss_coeffs:
         fwd: { tb: 1.0, freeze_policy: 1.0 }   # Z ONLY: policy + conditioner detached at the source
@@ -370,7 +371,7 @@ protocol:
         setpoint: 5.0                      # the exchange rate between the two halves of the residual field, and the only judgement in the loop
         gain: 0.05                         # theta moves gain*|err| per tick at 10 train steps/tick; time constant ~3.3k steps at the measured plant gain, i.e. slower than the ~1-2k-step absorption cycle it must not fight
         max_step: 0.05                     # per-tick theta clip -- binds only on a large error, so it bounds the slew rate without changing the fixed point
-        bounds: { replay: [ 0.05, 0.60 ] } # ABSOLUTE frac bounds. This is what makes a miscalibrated setpoint degrade to a fixed mix instead of a collapse, so the bound is the mix the run may actually end up running forever. 0.60 (not 0.45) because both long local_aug09 arms SATURATED at 0.45 with rho still above setpoint
+        bounds: { replay: [ 0.02, 0.93 ], bwd: [ 0.02, 0.93 ] } # ABSOLUTE frac bounds on each split mode; a ceiling on one is a floor on the other, so naming both intersects. Set to the pair mass (1 - pinned fwd) less the opposite mode's floor, so either mode can take almost the whole pair while the other stays above deactivate_threshold
         converge_floor: 1.0                # nats: gain fades to 0 as MAX(both metrics) drops to this. max, not min -- both metrics are RMS residuals with a null at 0, so the loop must keep steering while EITHER half is still large; min would retire it as soon as one side converged
       # Replay-buffer FRESHNESS servo -- a second loop, on a different quantity
       # to the balance one above. Loss weights cannot fix memorisation:

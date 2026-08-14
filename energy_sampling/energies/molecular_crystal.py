@@ -16,7 +16,7 @@ from mxtaltools.constants.space_group_info import SYM_OPS
 from mxtaltools.dataset_utils.data_class_methods.crystal_analysis import COMPUTES_REQUIRE_CLUSTER
 from mxtaltools.dataset_utils.data_classes import MolCrystalData
 from mxtaltools.dataset_utils.utils import collate_data_list
-from mxtaltools.mlip_interfaces.AL_mace_utils import load_mace_model
+from mxtaltools.mlip_interfaces.AL_mace_utils import load_mace_model, drain_mace_phase_timing
 from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
 
 
@@ -261,6 +261,25 @@ class MolecularCrystal(BaseSet):
             # The Z'>1 ordering penalty is unaffected -- it reads the raw latents.
             crystal_batch.canonicalize_zp_aunits()
         return crystal_batch
+
+    def drain_energy_timing(self) -> dict:
+        """BaseSet's counters, plus the mace call's INTERNAL split when this run is
+        on the mace route.
+
+        The split is what decides whether vectorising batch_to_mace_atomicdata is
+        worth doing: `energy/mace_host_frac` is the share a vectorised builder could
+        address, and one minus it is the Amdahl ceiling. Measured on the machine that
+        actually runs the job -- the same question could not be answered locally,
+        where MACE inference takes the box down (2026-08-14, twice).
+
+        Drained unconditionally so the phase counters cannot accumulate across a
+        window in which nothing else was logged; returns {} on stages with no energy
+        calls, exactly as BaseSet does."""
+        base = super().drain_energy_timing()
+        phases = drain_mace_phase_timing()
+        if base and phases:
+            base.update(phases)
+        return base
 
     def attach_gas_phase_reference(self, crystal_batch):
         """
@@ -779,9 +798,25 @@ class MolecularCrystal(BaseSet):
                     raise e
 
         del outs
-        # gc.collect()
-        # torch.cuda.empty_cache()
-        # torch.cuda.synchronize()
+        # RESTORED 2026-08-14. These were commented out; on the mace/uma route that
+        # left the largest allocation the process ever makes -- the init pass over the
+        # whole prior dataset, chunked at supercell_size 10 -- holding its blocks in
+        # the caching allocator for the rest of the run. They are free blocks, not a
+        # leak, but `cuda_memory_fraction` is a HARD cap (set_per_process_memory_fraction
+        # in train.py), so cache the run cannot reuse still counts against it, and the
+        # blocks are shaped like supercell neighbour lists that a T-step MLP rollout
+        # never asks for.
+        #
+        # THIS IS NOT THE PER-STEP HOT PATH, which is why it can afford to sync. The
+        # `not use_recovery` branch at the top of this function returns EARLY, and
+        # every physical config sets energy_config.internal_oom_recovery: false -- so
+        # training-time energy calls never reach this line. What does reach it is the
+        # init pass (internal_oom_recovery=True, explicitly) and the other one-off
+        # whole-dataset scans, i.e. exactly the calls whose footprint outlives them.
+        gc.collect()
+        if torch.cuda.is_available():        # synchronize() RAISES with no device
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
         if return_batch:
             return energies.to(x.device), samples_batch

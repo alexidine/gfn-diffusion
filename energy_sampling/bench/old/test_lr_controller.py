@@ -326,16 +326,36 @@ def test_stale_state_is_discarded_never_reinterpreted():
     assert 'disc_state' not in m.lr_ctrl
 
 
-def test_warm_restart_at_the_floor():
-    """The plateau rule is a pure ratchet; without a restart an over-cut run
-    walks to the floor and stays there."""
+def test_floor_does_not_trigger_a_warm_restart():
+    """
+    INVERTED 2026-08-14, and the inversion is the whole point of the test.
+
+    This asserted `floor must trigger a warm restart`, on the reasoning in its old
+    docstring: the plateau rule is a pure ratchet, so without a restart an over-cut
+    run walks to the floor and stays there.
+
+    That is right about the ratchet and wrong about the remedy. Restarting BECAUSE
+    peak_scale reached its floor multiplies the LR by 1/floor in a single step --
+    100x at the 0.01 bound this test uses -- and that detonated five of six
+    qm9anchor_aug14 arms from a healthy state. It also fired regardless of which
+    sensor moved peak_scale, so a hypergradient run correctly tracking a descending
+    optimum was reset by plateau-rule machinery it never used.
+
+    peak_scale sitting at the floor means THE FLOOR IS TOO HIGH; the fix is to lower
+    the bound, not to fire a 100x step change. The floor trigger is therefore gone
+    from LRController (see its docstring) and the timed one is the only restart --
+    test_timed_warm_restart covers that, and it still passes, so this inversion
+    removes a trigger rather than the feature.
+    """
     m = _modeller(**{'adaptive_lr.warmup_steps': 0, 'adaptive_lr.bounds': (0.01, 2000.0)})
     m.step_ind = 100
     for _ in range(40):
         m.lr_controller.on_plateau(True, 0.5)
     assert m.lr_ctrl['peak_scale'] == pytest.approx(0.01)
     m.lr_controller.step()
-    assert m.lr_ctrl['peak_scale'] == 1.0, 'floor must trigger a warm restart'
+    assert m.lr_ctrl['peak_scale'] == pytest.approx(0.01), (
+        'the floor must NOT trigger a warm restart -- at these bounds that is a '
+        '100x LR step in one go, which detonated five of six qm9anchor_aug14 arms')
 
 
 def test_timed_warm_restart():

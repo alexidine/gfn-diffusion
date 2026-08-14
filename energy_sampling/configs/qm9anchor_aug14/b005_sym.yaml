@@ -1,6 +1,6 @@
 adaptive_lr:
   bounds:
-  - 0.01
+  - 0.004
   - 2000.0
   calibration:
     alpha_target: 4.0
@@ -9,7 +9,7 @@ adaptive_lr:
   control_flow_lr: false
   divergence_cut: 0.5
   divergence_grad_abs: 1000000000.0
-  divergence_loss_abs: 1000000000.0
+  divergence_loss_abs: 1000000.0
   seed_lr: 0.000125
   warmup_steps: 1000
 anomaly_detection: false
@@ -90,7 +90,7 @@ bwd_loss_coeffs:
   vg_by_condition: 1.0
   vg_lb: 0
   vg_lme: 0
-checkpoint_name: null
+checkpoint_name: qm9a13_qm9anchor_aug14_b005_sym_elj-qm9c100k_prior-T6.9-bb6cfd_phase1_exit.pt
 checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/
 compile_policy: auto
 condition_log_z:
@@ -175,7 +175,7 @@ lr_replay: auto
 lr_warmup_ratio: 10
 max_batch_size: 1000
 max_reloads_per_1k_steps: 0.2
-min_lr: 1.0e-06
+min_lr: 5.0e-07
 mle_min_rate: 0.05
 mle_slope_t: 2.0
 mle_slope_window: 300

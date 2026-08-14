@@ -374,7 +374,12 @@ class Stage:
           kind: none      this stage deliberately has no LR sensor.
 
         `none` is spelled out rather than left to omission, so "no sensor" is a
-        decision in the config and not an oversight.
+        decision in the config and not an oversight. OMITTING the block means the
+        same thing -- no sensor -- but silently. It did NOT always: omission used
+        to arm the ray probe under the global ray_calibration.enabled, which put
+        a replay-dependent sensor into stages that never train replay. See
+        train.py::_ray_probe_armed and _check_ray_wiring, which reports at
+        startup when ray_calibration and the stages disagree about who is asking.
         """
         if node is None:
             return None
