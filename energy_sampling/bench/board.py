@@ -35,9 +35,8 @@ from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 
-from bench.arms import (Fixed, Hyper, HyperSNR, HyperStep, Null,
-                        RampPlateau, RayRay)
-from bench.metrics import lead_fraction, score_run
+from bench.arms import Fixed, Hyper, HyperStep, Null, RampPlateau, RayRay
+from bench.metrics import lead_from_series, score_run
 from bench.runner import Run
 from bench.surfaces import MLEGame
 
@@ -81,8 +80,21 @@ def make_game(optimizer='adam', seed=0, **kw):
                    seed=seed, **kw)
 
 
+#: `HyperSNR` IS NOT ON THIS BOARD, and the reason is a property of the cell.
+#: Its statistic is `cos(g_A, g_B)` on two half-batches, i.e. a gradient
+#: signal-to-noise ratio -- and this cell has no noise to speak of. Measured
+#: over 12000 steps here: the statistic is 1.0000 in every quartile (sd 6.7e-8),
+#: and still 0.9985 at 100x the surface's noise, because the noise enters as an
+#: additive term while the signal grows with ||theta||. A sensor pinned at its
+#: maximum is not a controller: the arm cooled monotonically into the peak floor
+#: and the shipping warm restart bounced it back, over and over, which is what
+#: the 99x `max jump` on this board's old table actually was.
+#:
+#: It stays on `trackboard`, where the same statistic has a real spread
+#: (median 0.39, IQR -0.07..0.65). Left as a comment rather than deleted so the
+#: next person does not re-add it and re-derive the same 12000 steps.
 def build_arms():
-    return [Hyper(SEED_LR), HyperStep(SEED_LR), HyperSNR(SEED_LR),
+    return [Hyper(SEED_LR), HyperStep(SEED_LR),
             RayRay(SEED_LR), RampPlateau(SEED_LR),
             Null(SEED_LR)] + [Fixed(x) for x in LADDER]
 
@@ -128,7 +140,7 @@ def main(seeds=8, optimizer='adam', workers=None):
     # lead is computed PER SEED across arms, then averaged over seeds
     lead_acc = {a.name: [] for a in arms}
     for seed, by_arm in smoothed.items():
-        got = _lead_from_smoothed(by_arm)
+        got = lead_from_series(by_arm)
         for k, v in got.items():
             lead_acc[k].append(v)
 
@@ -194,22 +206,12 @@ def _best_fixed_lr(rows, arms):
     return best
 
 
-def _lead_from_smoothed(by_arm):
-    n = min(len(s) for s in by_arm.values())
-    wins = {k: 0.0 for k in by_arm}
-    counted = 0
-    for i in range(n):
-        vals = {k: s[i] for k, s in by_arm.items() if s[i] is not None}
-        if not vals:
-            continue
-        counted += 1
-        best = min(vals.values())
-        leaders = [k for k, v in vals.items() if v <= best]
-        for k in leaders:
-            wins[k] += 1.0 / len(leaders)
-    if not counted:
-        return {k: float('nan') for k in by_arm}
-    return {k: v / counted for k, v in wins.items()}
+# `_lead_from_smoothed` WAS HERE AND IS DELETED. It was a second, untested copy
+# of `metrics.lead_from_series`, and it was the one the leaderboard actually
+# called -- verified with a kill-switch: booby-trapping `metrics.lead_fraction`
+# to raise, the board still printed a full lead column. So every test in
+# `test_metrics.py` covered a function no board ran, and the min-length
+# truncation bug lived on in the copy that did.
 
 
 if __name__ == '__main__':

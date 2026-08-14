@@ -51,9 +51,16 @@ RATES = (3e-4, 5.6e-4, 1e-3, 1.8e-3, 3.2e-3, 5.6e-3, 1e-2,
 STEPS = 6000
 SEEDS = 6
 
-#: what the battery ships today
-BASE = dict(dim=8, a=2.0, b=1.0, w_rep=0.7, w_bwd=0.3, kappa=0.02, noise=0.1,
-            init_scale=1.0, cond_rep=100.0)
+#: WHAT THE BATTERY SHIPS TODAY -- imported, never restated.
+#:
+#: The comment above this line used to say exactly that while the dict below it
+#: was a stale copy missing `cond_bwd` and `drift`. So the tool whose entire job
+#: is to say whether a surface can rank controllers was auditing a surface
+#: `eqsuite` had already repaired, and its headline verdict ("bwd is a rounding
+#: error at 0.9%") described the version nobody runs. On the real one bwd
+#: supplies 19.1%. A fitness checker that reads a different config from the
+#: battery it certifies is worse than no checker.
+from bench.eqsuite import BASE
 
 
 def _one(item):

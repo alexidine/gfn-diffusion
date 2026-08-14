@@ -1,40 +1,45 @@
 """
-WHAT DOES THE BENCH'S NOISE AXIS LOOK LIKE IN THE UNITS THE REAL SYSTEM REPORTS?
+DO THE BENCH'S GRADIENTS LOOK LIKE THE REAL SYSTEM'S?
 
-`calibrate_noise.py` measures `cos(g_t, g_{t-1})` on a real TB run. That number is
-only useful if the bench can be read in the same units, and until now it could
-not be: "0.9997 at noise 0.01, 0.29 at noise 2" appears in three files as PROSE
-with no code behind it, so it could not be re-derived, extended to a new cell, or
-checked. This file is that measurement.
+`bench/calibrate_noise.py` records, on a real TB run, how much consecutive
+gradients agree: `cos(g_t, g_{t-1})`. That number is only useful if the bench can
+be read in the same units. This file measures the same statistic on the bench
+surfaces and prints both next to each other.
 
-THE STATISTIC IS COMPUTED HERE, NOT READ OFF A CONTROLLER, and that is
-deliberate. `_hyper_tick` computes the same cosine but from inside a live servo,
-where the rate is moving; the axis wants cos at a FIXED operating point.
-Computing it the same way `calibrate_noise.py` does -- consecutive gradients of
-the same branch, before any rescale -- is what makes the two tables comparable.
+REWRITTEN 2026-08-14. The previous version imported `MLE` and `_mk` from
+`bench.crucible`, which the rebuild moved to `old/`, so the module had not
+imported -- and therefore this check had not been runnable -- since 2026-08-13.
+It also went through the old `Surface`/`find_oracle` machinery, which the rebuild
+deliberately deleted; nothing here needs an oracle, so nothing here has one.
 
-TWO NUMBERS, NOT ONE. Median cos alone does not locate the real system on this
-axis, because the same median means different things at different widths:
+TWO NUMBERS, NOT ONE, and this is the point of the file. A median alone does not
+locate the real system on this axis, because the same median means different
+things at different widths. Two UNRELATED vectors in d dimensions already agree
+by about
 
-    null |cos| for independent vectors = sqrt(2 / (pi * d))
+    chance = sqrt(2 / (pi * d))
 
-At the bench's usual d=32 that null is 0.141, so a median of 0.29 is 2.1x chance
-and a SINGLE reading is nearly worthless. At the real policy's d=6,163,969 the
-null is 0.00032, so the same 0.29 is ~900x chance and one reading is essentially
-noiseless. Matching only the median would put the real system in a cell where the
-statistic is far noisier than it really is -- which flatters every blind arm and
-penalises every measuring one. So the report prints median, IQR, null and
-cos/null together, and a cell "matches" only on the pair.
+At the bench's usual d=32 that is 0.141, so a median of 0.29 is twice chance and
+a single reading is mostly luck. At the real policy's d = 6,163,969 chance is
+0.00032, so the same 0.29 is ~900x chance and one reading is essentially exact.
+Matching only the median would put the real system in a cell where its own
+sensor is far noisier than it really is -- which flatters every arm that ignores
+the signal and penalises every arm that measures it. So a cell matches on the
+PAIR: median and width.
 
-COS DECAYS AS A RUN CONVERGES, so a full-run median pools regimes that a real
-400-step window does not. Reported per QUARTILE of the run for that reason: the
-first crucible-era attempt at this measurement read a converged model and got
-cos ~ 0, which is the correct reading at a stationary point and not a noise
-verdict.
+MEASURED AT A FIXED RATE, deliberately. The same cosine computed inside a live
+servo is contaminated by the rate moving underneath it; the axis wants the
+statistic at a settled operating point, computed the way `calibrate_noise.py`
+computes it -- consecutive gradients of the branch that trains, before any
+rescale.
 
-    python -m bench.cos_axis            # the noise x dim grid
-    python -m bench.cos_axis lr         # cos vs lr/oracle, one cell
+REPORTED PER QUARTILE, because the statistic decays as a run converges and a
+whole-run median pools regimes a real 400-step window does not.
+
+    python -m bench.cos_axis            # bench cells against the real run
+    python -m bench.cos_axis tune       # search dim x speed x noise for a match
 """
+import json
 import math
 import os
 import statistics as st
@@ -42,207 +47,166 @@ import sys
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
+import torch
 
-from bench.crucible import MLE, _mk
-from bench.oracle import find_oracle
+from bench.surfaces import EquilibrationGame, MLEGame, TrackingGame
+import bench.eqsuite as eqsuite
 
-#: (label, game, kwargs, steps, lr_grid, extra_args) -- `_mk`'s cell shape, so
-#: these are the crucible's own surfaces and not a second definition of them.
-GRID = [
-    (f'mle n{n:g} d{d}', 'mle', dict(MLE, noise=n, dim=d), 2000,
-     (1e-6, 1e-1, 12), {})
-    for d in (32, 2048)
-    for n in (0.01, 0.1, 0.5, 2.0, 5.0)
-]
+#: written by `bench/calibrate_noise.py`, at the repo root
+REAL_JSON = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), 'bench_noise_calibration.json')
 
-#: THE REAL FUSED MEASUREMENT, and its provenance stated exactly, because the
-#: first version of this constant cited a regime name rather than a file and the
-#: name later resolved to a different model.
-#:
-#: FOUR windows, elj nehzor sg14 T10, equilibration, `fused`, 400 steps each:
-#:      0.2871  phase1_exit, pre-fix        0.2889  r2 running.pt, pre-clip-fix
-#:      0.2901  r2 running.pt @11001        0.3037  phase1_exit, POST-fix
-#: Median of the four = 0.2895; full spread 0.0166, NOT the 0.003 claimed in
-#: F-033 before the fourth existed. The p25/p75 below are from the 0.2901
-#: window, which is the only one whose quartiles were recorded.
-#:
-#: `noise_calib_eq_descent.json` carries `stage: null` -- it predates stage
-#: recording, so it is a PRE-fix artifact of the era when `eq_descent` still
-#: pointed at a mutable `_running.pt`. The number is a real measurement of a
-#: real fused window; only the regime LABEL was unstable. A post-fix eq_descent
-#: window does not exist on disk yet.
-#: COMPUTED FROM THE FILE, NOT TRANSCRIBED. The hardcoded quartiles were
-#: p25=0.24 / p75=0.35 (width 0.11), inherited from an earlier session's
-#: write-up. They match no window and no quartile of any artifact on disk: the
-#: cited file gives p25=0.1998 / p75=0.3859, width **0.186 -- 1.69x wider**. The
-#: median (0.2901) was correct, which is what let the error survive.
-#:
-#: Everything that leaned on 0.11 shifts: "the real signal is 4x tighter than
-#: the bench" becomes ~2.4x, and the `bwd` comparison "13x wider" becomes 7.6x.
-#:
-#: AND THE IQR IS NOT THE CONTROLLER'S SNR. `med/null` is a LOCATION null --
-#: E|cos| for independent isotropic vectors. It says the median is not zero; it
-#: says nothing about one reading. The number a controller consuming one cos per
-#: step actually sees is median/sd = 0.2901/0.1466 = **1.98**, not 903.
-def _real_from_disk(path='noise_calib_eq_descent.json'):
-    import os
-    p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                     path)
-    if not os.path.exists(p):
+
+def chance(d):
+    """|cos| between two independent vectors in d dimensions."""
+    return math.sqrt(2.0 / (math.pi * d))
+
+
+def _fmt(label, xs, d, extra=''):
+    if len(xs) < 8:
+        print(f'  {label:<34} (only {len(xs)} readings)')
         return None
-    import json
-    with open(p) as f:
-        c = [x['cos'] for x in json.load(f)]
-    if not c:
-        return None
-    a = np.asarray(c, dtype=float)
-    return dict(label='REAL fused (from disk)', med=float(np.median(a)),
-                p25=float(np.percentile(a, 25)), p75=float(np.percentile(a, 75)),
-                sd=float(a.std()), n=len(a), dim=6_163_969)
+    a = np.asarray(xs, dtype=float)
+    c = chance(d)
+    med = float(np.median(a))
+    q1, q3 = float(np.percentile(a, 25)), float(np.percentile(a, 75))
+    print(f'  {label:<34} d={d:>9,} chance={c:.5f}  med={med:>7.4f}  '
+          f'[{q1:>7.4f},{q3:>7.4f}] w={q3 - q1:>6.3f}  x-chance={med / c:>7.1f}'
+          f'  quartiles ' + ' '.join(
+              f'{float(np.median(x)):>7.4f}' for x in np.array_split(a, 4)) + extra)
+    return med, q1, q3
 
 
-REAL = _real_from_disk() or dict(
-    label='REAL fused (file missing)', med=0.2901, p25=0.1998, p75=0.3859,
-    sd=0.1466, n=399, dim=6_163_969)
+def real_reference():
+    """Median/IQR per branch from the real run. Returns {} if never measured."""
+    if not os.path.exists(REAL_JSON):
+        print(f'  (no {os.path.basename(REAL_JSON)} -- run bench.calibrate_noise)')
+        return {}
+    recs = json.load(open(REAL_JSON))
+    by = {}
+    for r in recs:
+        by.setdefault(r['step_type'], []).append(r)
+    out = {}
+    for k, rs in sorted(by.items()):
+        gn = [r['gnorm'] for r in rs]
+        sd = st.pstdev(gn) if len(gn) > 1 else 0.0
+        # a gradient norm with no spread is a clip pinning every step, which
+        # changes what the whole axis means -- say so rather than let it pass
+        tag = (f'  |g| med={st.median(gn):.4g} sd={sd:.2e}'
+               + ('   <- CLIP BINDING EVERY STEP' if sd < 1e-4 * max(st.median(gn), 1e-12)
+                  else ''))
+        got = _fmt(f'real {k} (n={len(rs)})', [r['cos'] for r in rs],
+                   rs[0]['dim'], extra=tag)
+        if got:
+            out[k] = got
+    return out
 
 
-def null_cos(d):
-    """E|cos| between independent vectors in d dimensions."""
-    return math.sqrt(2.0 / (math.pi * max(int(d), 2)))
-
-
-#: The real measurement's window length. Every comparison against it has to use
-#: the same window, for the reason in `measure`'s docstring.
-REAL_WINDOW = 400
-
-
-def measure(cell, lr=None, seed=0, seeds=(0, 1, 2), win=REAL_WINDOW):
-    """
-    Median cos at a fixed rate, over the whole run AND in windows of `win`.
-
-    THE WINDOWED NUMBERS ARE THE ONES THAT COMPARE TO THE REAL SYSTEM, and the
-    whole-run ones do not. `calibrate_noise` reads 400 consecutive steps of a
-    long run -- a snapshot at one operating point. A bench run sweeps from
-    cos ~ 1.0 (far from the optimum) to cos ~ -0.16 (in the noise ball) in 2000
-    steps, so its whole-run IQR is dominated by that DRIFT, not by per-step
-    scatter.
-
-    Quantitatively: quoting the whole-run IQR made the bench look ~10x noisier
-    per reading than the real system, which is the number that made a higher
-    `hyper_beta` look safe on the real system. Windowing is the like-for-like
-    comparison, and it is the one the beta question rests on.
-
-    `lr=None` uses the oracle rate -- the operating point a working controller is
-    supposed to find, and the one the crucible scores against.
-    """
-    surface = _mk(cell)
-    if lr is None:
-        lr = find_oracle(surface, seeds=seeds, verbose=False).lr
-    import torch
-    run = surface.make(float(lr), seed=seed, servo=False)
-    prev, rows = None, []
-    for _ in range(surface.steps):
-        run.step()
-        gs = [p.grad.detach().reshape(-1) for p in run.game.policy_params
-              if p.grad is not None]
-        if not gs:
-            continue
-        g = torch.cat(gs).float()
+def series(game, lr, steps=3000, batch=64, burn=0.25):
+    """cos between consecutive policy gradients at a FIXED rate."""
+    out, prev = [], None
+    for _ in range(steps):
+        game.advance()
+        game.train_step(game.draw(batch))
+        g = torch.cat([p.grad.detach().reshape(-1)
+                       for p in game.policy_params if p.grad is not None]).float()
         n = float(g.norm())
         if prev is not None and n > 0:
             pn = float(prev.norm())
             if pn > 0:
-                c = float(torch.dot(g, prev)) / (n * pn)
-                if math.isfinite(c):
-                    rows.append(c)
-        prev = g.clone() if n > 0 else prev
-    if len(rows) < 8:
-        return None
-    d = int(sum(p.numel() for p in run.game.policy_params))
-    q = len(rows) // 4
-    # per-window (median, IQR) -- the like-for-like statistic
-    wins = []
-    for i in range(0, len(rows) - win + 1, win):
-        w = rows[i:i + win]
-        wins.append(dict(at=i,
-                         med=float(np.median(w)),
-                         iqr=float(np.percentile(w, 75) - np.percentile(w, 25))))
-    return dict(label=cell[0], lr=float(lr), dim=d, n=len(rows),
-                med=st.median(rows),
-                p25=float(np.percentile(rows, 25)),
-                p75=float(np.percentile(rows, 75)),
-                quartiles=[st.median(rows[i * q:(i + 1) * q]) for i in range(4)],
-                windows=wins)
+                out.append(float(torch.dot(g, prev)) / (n * pn))
+        prev = g.clone()
+    return out[int(burn * len(out)):]
 
 
-def _task(cell):
-    try:
-        return measure(cell)
-    except Exception as e:                       # one cell must not hide the rest
-        return dict(label=cell[0], error=f'{type(e).__name__}: {e}')
+#: (label, builder, rate). The rate is roughly what each cell wants, so the
+#: statistic is read at a sensible operating point rather than an arbitrary one.
+CELLS = [
+    ('board MLE adam', lambda: MLEGame(dim=32, cond=300.0, noise=0.5, quartic=0.0,
+                                       init_scale=3.0, lr=1e-3, optimizer='adam',
+                                       seed=0), 1e-3),
+    ('tracking adam sp=1e-3', lambda: TrackingGame(dim=32, speed=1e-3, noise=0.1,
+                                                   lr=1e-3, optimizer='adam',
+                                                   seed=0), 1e-3),
+    ('tracking adam sp=1e-2', lambda: TrackingGame(dim=32, speed=1e-2, noise=0.1,
+                                                   lr=3e-2, optimizer='adam',
+                                                   seed=0), 3e-2),
+    ('tracking adam d=256 sp=3e-3',
+     lambda: TrackingGame(dim=256, speed=3e-3, noise=0.1, lr=3e-3,
+                          optimizer='adam', seed=0), 3e-3),
+    ('tracking sgd sp=1e-3', lambda: TrackingGame(dim=32, speed=1e-3, noise=0.1,
+                                                  lr=1e-1, optimizer='sgd',
+                                                  seed=0), 1e-1),
+    ('equilibration sgd', lambda: EquilibrationGame(lr=1.8e-2, optimizer='sgd',
+                                                    seed=0, **eqsuite.BASE), 1.8e-2),
+]
 
 
-def _header():
-    print(f'  {"cell":<16} {"lr":>9} {"dim":>8} {"median":>8} {"IQR":>15} '
-          f'{"null":>8} {"x null":>7}   {"cos by quartile of run":<32}')
+def main():
+    print('=' * 132)
+    print('THE REAL RUN')
+    print('=' * 132)
+    real = real_reference()
+
+    print()
+    print('=' * 132)
+    print('BENCH CELLS, at a fixed rate')
+    print('=' * 132)
+    for label, mk, lr in CELLS:
+        g = mk()
+        _fmt(label, series(g, lr), sum(p.numel() for p in g.policy_params))
+
+    if real.get('fused'):
+        med, q1, q3 = real['fused']
+        print(f'\n  target to match: median {med:.3f}, width {q3 - q1:.3f}. '
+              f'`python -m bench.cos_axis tune` searches for it.')
 
 
-def _row(r):
-    if r is None or 'error' in (r or {}):
-        label = (r or {}).get('label', '?')
-        print(f'  {label:<16} {(r or {}).get("error", "no samples")}')
+#: dim lowers the chance floor (and so the width); the speed/noise RATIO sets
+#: the median. Both are needed -- see the module docstring.
+TUNE = [(d, s, n) for d in (32, 256, 1024, 4096)
+        for s in (3e-4, 1e-3, 3e-3, 1e-2) for n in (0.03, 0.1, 0.3, 1.0)]
+
+
+def _init():
+    import torch
+    torch.set_num_threads(1)
+
+
+def _tune_one(job):
+    dim, speed, noise = job
+    g = TrackingGame(dim=dim, speed=speed, noise=noise, lr=speed,
+                     optimizer='adam', seed=0)
+    a = np.asarray(series(g, speed, steps=2500))
+    return (dim, speed, noise, float(np.median(a)),
+            float(np.percentile(a, 25)), float(np.percentile(a, 75)))
+
+
+def tune(workers=None):
+    real = real_reference()
+    if not real.get('fused'):
+        print('no real `fused` reference to tune against.')
         return
-    nl = null_cos(r['dim'])
-    qs = ' '.join(f'{x:>6.3f}' for x in r['quartiles'])
-    iqr = f'{r["p25"]:.3f}-{r["p75"]:.3f}'
-    print(f'  {r["label"]:<16} {r["lr"]:>9.3g} {r["dim"]:>8,} {r["med"]:>8.4f} '
-          f'{iqr:>15} {nl:>8.4f} {r["med"] / nl:>7.1f}   {qs:<32}')
-
-
-def grid(workers=6):
-    print(f'{"=" * 118}\nCOS vs NOISE x DIM, at each cell\'s ORACLE rate\n{"=" * 118}')
-    _header()
-    with ProcessPoolExecutor(max_workers=workers) as pool:
-        rows = list(pool.map(_task, GRID))
-    for r in rows:
-        _row(r)
-    nl = null_cos(REAL['dim'])
-    iqr = f'{REAL["p25"]:.3f}-{REAL["p75"]:.3f}'
-    print(f'\n  {REAL["label"]:<16} {"--":>9} {REAL["dim"]:>8,} {REAL["med"]:>8.4f} '
-          f'{iqr:>15} {nl:>8.4f} {REAL["med"] / nl:>7.1f}')
-    sd = REAL.get('sd')
-    if sd:
-        print(f'\n  x null is a LOCATION null (E|cos| for independent vectors). It says '
-              f'the median\n  is not zero -- it says NOTHING about one reading. Per-decision '
-              f'SNR, which is\n  what a controller consuming one cos per step sees:  '
-              f'median/sd = {REAL["med"] / sd:.2f}')
-    return rows
-
-
-def lr_sweep(mult=(0.125, 0.25, 0.5, 1.0, 2.0, 4.0), noise=0.5, dim=32):
-    """
-    COS ALSO MOVES WITH THE RATE -- which is the entire hypergradient premise, and
-    the reason one real cos value cannot by itself pin the real system's noise.
-
-    Printed so the ambiguity is visible: a median of 0.29 is consistent with a
-    quiet surface run hot and with a noisy surface run correctly, and only the
-    IQR/null pair separates them.
-    """
-    cell = (f'mle n{noise:g} d{dim}', 'mle', dict(MLE, noise=noise, dim=dim),
-            2000, (1e-6, 1e-1, 12), {})
-    base = find_oracle(_mk(cell), seeds=(0, 1, 2), verbose=False).lr
-    print(f'{"=" * 118}\nCOS vs RATE -- {cell[0]}, oracle lr {base:.3g}\n{"=" * 118}')
-    _header()
-    for m in mult:
-        r = measure(cell, lr=base * m)
-        if r:
-            r['label'] = f'{m:g}x oracle'
-        _row(r)
+    tmed, tq1, tq3 = real['fused']
+    tw = tq3 - tq1
+    workers = int(workers or max(2, min(12, (os.cpu_count() or 4) - 4)))
+    with ProcessPoolExecutor(max_workers=workers, initializer=_init) as p:
+        out = list(p.map(_tune_one, TUNE))
+    print()
+    print('=' * 104)
+    print(f'CLOSEST TRACKING CELLS  (target median {tmed:.3f}, width {tw:.3f})')
+    print('=' * 104)
+    print(f'  {"dim":>6} {"chance":>8} {"speed":>7} {"noise":>6} '
+          f'{"median":>8} {"middle half":>19} {"width":>7} {"miss":>7}')
+    scored = sorted((abs(m - tmed) + 0.5 * abs((c - b) - tw), d, s, n, m, b, c)
+                    for d, s, n, m, b, c in out)
+    for miss, d, s, n, m, b, c in scored[:12]:
+        print(f'  {d:>6} {chance(d):>8.4f} {s:>7.2g} {n:>6.2g} {m:>8.3f} '
+              f'[{b:>7.3f},{c:>7.3f}] {c - b:>7.3f} {miss:>7.3f}')
 
 
 if __name__ == '__main__':
-    os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')
-    if 'lr' in sys.argv[1:]:
-        lr_sweep()
+    if 'tune' in sys.argv:
+        tune()
     else:
-        grid()
+        main()

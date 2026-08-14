@@ -61,6 +61,11 @@ MK_DEV_BATCH = dict(
     batch_growth_min_throughput_gain=0.05, max_step_seconds=60,
     batch_knee_recheck_steps=2000, oom_batch_shrink_factor=0.5,
     oom_cooldown_steps=200, fused_grad_accum_min_samples=1000,
+    # how long an OOM ceiling stands before the walk re-probes past it. NOT the same
+    # clock as batch_knee_recheck_steps: a knee retest is free, an OOM retest costs a
+    # wasted step plus a cooldown, and turning the knee recheck off must not also
+    # disable OOM recovery.
+    batch_oom_ceiling_retest_steps=2000,
     # occupancy: METRIC WINDOWS ONLY. The controller no longer reads utilization --
     # `gpu_util_floor` is retired (utils._RETIRED_KEYS) because growing the batch
     # does not raise occupancy on the MLIP route. Kept here so the fake's args
@@ -131,6 +136,8 @@ class FakeModeller:
         self.batch_size_ever_oomed = False
         self.batch_size_cooldown_until = -1
         self.batch_size_oom_ceiling = None
+        self.batch_size_oom_ceiling_at = None   # None = unstamped, NOT step 0
+        self.batch_size_oom_min = None
         self.batch_size_saturated_stage = None
         self.batch_size_pinned_at = 0
         self._rung_throughput = None

@@ -16,6 +16,30 @@ Two ways to take the head start away, run together:
                is NOT free -- ray pays ~n_sub extra loss evaluations per firing,
                so period 10 is roughly 10x the probe cost, which is the actual
                engineering trade rather than a defect in the comparison.
+
+!! READ THIS BEFORE RANKING ANYTHING IN THIS FILE !!
+
+THE RAY-VS-RAY AND RAY-VS-HYPER GAPS HERE ARE INSIDE THE SEED NOISE, at 5 seeds,
+and it is not close. A probing arm draws through `run.game.draw`, so it consumes
+extra randomness the non-probing arms never see and the paired-seed design does
+NOT hold across that boundary (runner.py says so; this file compares across it
+anyway, three times).
+
+Measured directly -- same cell, same control law, arms differing ONLY in how much
+RNG their probe consumes -- the spread from the draw alone is 1.28 nats cold and
+1.21 warm. Against that null:
+
+    largest ray-vs-ray gap    0.49 cold / 0.34 warm
+    ray-vs-hyper gaps         0.95-1.44 cold / 0.49-0.83 warm
+
+Every one of them fits inside. The null even reproduces a cadence ORDERING (p=20
+best cold, p=100 best warm) out of nothing but the draw, so "increasing ray's
+cadence does not close the head start" is not supported by this cell at 5 seeds
+-- neither the claim nor its ordering.
+
+This is specific to comparisons across the probing boundary. `board.py`'s gaps
+(4.87 / 1.04 / 0.92 nats against a 0.169 per-seed sd) are unaffected. Fixing it
+needs many more seeds, or arms matched on probe cost -- not a rerun.
 """
 import math
 import os
@@ -32,10 +56,31 @@ COLD, WARM = 1.25e-4, 3e-3
 STEPS, SEEDS = 8000, 5
 
 
-def arms(start):
-    return [HyperStep(start, beta=0.2), HyperStep(start, beta=0.02),
-            RayRay(start, period=100), RayRay(start, period=20),
-            RayRay(start, period=10), Fixed(3e-3)]
+def arms(start, warm=False):
+    """
+    THE WARM START HAS TO TURN THE WARMUP ENVELOPE OFF, and it did not.
+
+    Starting an arm AT 3e-3 does not start it at 3e-3: the servo's envelope
+    ramps from `1/lr_warmup_ratio` (10x down) over `warmup_steps`, so every
+    controller began at 3.0e-4 and spent the first 1000 steps climbing the same
+    deterministic curve. Measured: all five servo arms read lr@0 = 3.0000e-04,
+    lr@100 = 3.7768e-04, lr@500 = 9.4868e-04, lr@999 = 2.9317e-03 -- BIT-
+    IDENTICAL across five different controllers, because none of it is the
+    controller. `reach` was therefore 700 for all five by construction, which is
+    the envelope crossing the band and nothing else; with the envelope off it
+    goes to 0 for four of them.
+
+    So the file's premise ("both begin AT the best fixed rate. No ramp to win.
+    Whatever remains is TRACKING") only holds with `lr_warmup_ratio = 1`.
+    """
+    a = [HyperStep(start, beta=0.2), HyperStep(start, beta=0.02),
+         RayRay(start, period=100), RayRay(start, period=20),
+         RayRay(start, period=10), Fixed(3e-3)]
+    if warm:
+        for arm in a:
+            base = arm.args_overrides
+            arm.args_overrides = (lambda b=base: {**b(), 'lr_warmup_ratio': 1})
+    return a
 
 
 def label(a, i):
@@ -45,7 +90,7 @@ def label(a, i):
 def _one(item):
     which, ai, seed = item
     start = COLD if which == 'cold' else WARM
-    a = arms(start)[ai]
+    a = arms(start, warm=(which != 'cold'))[ai]
     game = MLEGame(dim=32, cond=300.0, noise=0.5, quartic=0.0, init_scale=3.0,
                    lr=start, optimizer='adam', seed=seed)
     run = Run(game, a, seed=seed, steps=STEPS, batch=64).run()

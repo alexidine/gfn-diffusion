@@ -144,45 +144,68 @@ win is not an artifact of the loss definition. What moved is `backslide` — 0.7
 
 ### The SGD control, and why the optimizer was worth rebuilding for
 
-Same game, same arms, same seeds, `optimizer='sgd'`:
+Same game, same arms, same seeds, `optimizer='sgd'`, 12000 steps:
 
 ```
-arm                   final    lead   lr sd  backslide   div  nonfin
-fixed@0.003            1.00  99.8%   0.000       0.0%     0       0
-hyper b=0.02           5.94   0.1%   2.396       1.4%     0       0
-ramp+plateau         396.58   0.0%   2.063       2.6%     8       0
-ray+ray              406.85   0.0%   2.063       2.6%     7       0
-fixed@0.01              inf   0.0%   0.000       3.0%  1586   15516
-fixed@0.03              inf   0.0%   0.000       1.0%  1592   15830
-fixed@0.1               inf   0.0%   0.000       0.7%  1592   15891
+arm                 nats behind    lead  lr/best   lr sd  max jump  backslide   div  nonfin
+hyper b=0.02               0.00  36.9%     0.16   1.165     0.043      13.4%     0       0
+hyper b=0.02 step          0.00  40.8%     0.16   1.165     0.043      13.4%     0       0
+fixed@0.001                1.88   0.0%     1.00   0.000     0.000       2.5%     0       0
+ray+ray p=100              2.04   0.0%     0.24   1.067     0.693       0.6%     7       0
+fixed@0.003                3.04  22.3%     3.00   0.000     0.000      11.1%     0       0
+ramp+plateau               3.26   0.0%     3.68   1.318     0.693       9.8%     8       0
+null (no sensor)          11.89   0.0%     0.12   0.374     0.023       0.0%     0       0
+fixed@0.0001              12.45   0.0%     0.10   0.000     0.000       0.0%     0       0
+fixed@1e-05               16.57   0.0%     0.01   0.000     0.000       0.0%     0       0
+fixed@0.01                never   0.0%    10.00   0.000     0.000      42.9%    32       0
+fixed@0.03                never   0.0%    30.00   0.000     0.000      68.8%    32       0
+fixed@0.1                 never   0.0%   100.00   0.000     0.000      68.8%    32       0
 ```
 
 **The optimizer changes every answer.** The best fixed rate moves 10x (0.03 →
-0.003); the three rates that are *stable and near-optimal on Adam* are
-**catastrophic on SGD** (~1590 divergences each, 15k non-finite steps); and hyper
-goes from **1.05x** the best fixed rate to **5.94x**, i.e. from comfortably
-inside the "at worst ~2x" goal to well outside it.
+0.001) and the three rates that are *stable and near-optimal on Adam* all die on
+SGD. But note what it does NOT do: **hyper is FIRST here**, tied at 0.00 across
+both operands, against third on Adam.
 
-So the old bench's SGD-only measurement could not have transferred to an Adam
-trainer, and this is the direct demonstration rather than the argument from the
-derivation. It also means every number on this page is optimizer-specific and has
-to say so.
+THE TABLE THAT USED TO SIT HERE WAS A DIFFERENT EXPERIMENT. It reported hyper at
+5.94x, `ramp+plateau` at 396.58 and ~1590 divergences per fixed arm, and
+concluded that hyper "goes from comfortably inside the 2x goal to well outside
+it". Reproduced exactly: those are the numbers for a **2000-step run with
+`rewind=False`** — i.e. the horizon this file's own next section declares invalid
+("that run was measuring a race, not control"), and a runner that no longer
+exists. At the current default the conclusion inverts. Every number on this page
+is specific to its optimizer AND its horizon AND its rewind setting, and this is
+what happens when only the first is stated.
 
 Note the catastrophe columns doing their job: `fixed@0.01` on SGD has a *better*
-`backslide` than several healthy arms, because a run that is non-finite for most
-of its length has nothing to slide back from. Counts, not averages.
+`backslide` than several healthy arms, because a run that spends most of its
+length dead has nothing to slide back from. Counts, not averages.
 
 ### Known gaps
 
-- **No parameter rewind.** Production's `fire_loss_spike` restores a checkpoint
-  and then cuts the rate; this runner models only the cut. So a divergence here
-  is permanent where production would recover, which makes `div` a harsher
-  reading than production's. Deliberately not modelled yet: the old harness's
-  version rewound to a ≤50-step-old checkpoint *gated on a `diverged()` oracle*
-  production does not have, which flattered every arm whose only brake is the
-  tripwire.
-- Only one game (`MLEGame`), one cell, no perturbation scenarios, nothing
-  multi-player.
+- ~~No parameter rewind.~~ **STALE — the rewind exists.** `Run` defaults to
+  `rewind=True` and `_fire_loss_spike` restores parameters, a deep-copied
+  optimizer state and the game's `extra_state`, on production's rate-based reload
+  budget. This entry is what made the SGD table above survive: it read as a known
+  limitation rather than as a table from a runner that had been replaced.
+- **The MLE cell is effectively noiseless, and that is load-bearing.** Measured,
+  consecutive gradients on it agree by 1.0000 in every quartile, and still 0.9985
+  at 100x the surface's noise — the noise enters as an additive term while the
+  signal grows with ‖θ‖. Real system for comparison: 0.29 on `fused`. So both
+  gradient sensors are exercised outside the regime they would run in, `HyperSNR`
+  is unusable here (removed from this board), and ray's probe resolves only 8.7%
+  of firings against 63–82% on `trackboard` and `eqboard`. Use `bench.cos_axis`
+  to place any new cell before trusting it.
+- **`ray+ray`'s win on this board is not a resolved measurement.** Restricted to
+  readings it actually resolved it is bit-identical to `null`: it starts cold,
+  every reading returns "the step is far too small", that is not a resolved
+  status, so it never acts and never reaches a rate where it could resolve. All
+  of its movement comes from the grid-edge verdicts, so `alpha_target` is
+  essentially not exercised here. A probe scoring random numbers does much worse,
+  so the sensor does carry information — just not through its brackets.
+- Only one game (`MLEGame`), one cell, no perturbation scenarios.
+  `trackboard`/`eqboard`/`eqsuite` cover the others; `TrackingGame` is the only
+  surface that passes its own fitness checks in every cell.
 
 ## What killed the previous generation
 

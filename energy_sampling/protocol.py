@@ -1201,6 +1201,8 @@ class StageProtocol:
         m.batch_size_saturated_stage = None
         m.batch_size_pinned_at = 0
         m.batch_size_oom_ceiling = None  # the incoming stage has its own memory profile
+        m.batch_size_oom_ceiling_at = None       # ...and its own expiry clock
+        m.batch_size_oom_min = None              # ...and its own OOM history
         # runaway-guard latches: both are conclusions about the OUTGOING stage's
         # fixed per-step cost ("cutting the batch did not move step time", "the batch
         # is already at the accumulation target"). The incoming stage has a different

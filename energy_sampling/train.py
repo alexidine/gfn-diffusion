@@ -519,6 +519,51 @@ class Modeller:
                 times.clear()
                 self._recent_step_work.clear()
             return
+        # THE OOM CEILING EXPIRES. It is a permanent conclusion about VRAM drawn from
+        # ONE failed allocation -- and the recovery for that failure (gc +
+        # empty_cache, in handle_train_epoch_error) is itself what can make the
+        # conclusion stale. An OOM caused by fragmentation left over from init, where
+        # the mace/uma prior re-analysis reserves supercell-shaped blocks that a T-step
+        # MLP rollout can never reuse, is CLEARED by the very cut that records it.
+        #
+        # Latched forever, that was catastrophic rather than merely conservative.
+        # prod0810's acridine/mace arms: one OOM at the BASE batch of 1000 set the
+        # ceiling to 1000, so the walk climbed 500 -> 825 and then refused the 1361
+        # rung for the rest of the stage. 825 also sits BELOW _batch_floor(), so the
+        # knee recheck below could not re-measure it either (its drop target clamps at
+        # the floor, which is already above the pin) -- the arm ran the whole of
+        # train_prior at 0.825x its configured batch, on a stage that makes no energy
+        # calls at all and is judged by the scheduler on GPU occupancy. All three died.
+        #
+        # So the ceiling decays like any other AIMD limit: after a quiet spell with no
+        # further OOM, drop it and let the walk re-probe. Re-probing costs one step and
+        # a cooldown when the ceiling was right; NOT re-probing costs the whole stage
+        # when it was wrong.
+        ceiling = getattr(self, 'batch_size_oom_ceiling', None)
+        retest = int(getattr(self.args, 'batch_oom_ceiling_retest_steps', 2000) or 0)
+        if ceiling is not None:
+            stamped = getattr(self, 'batch_size_oom_ceiling_at', None)
+            if stamped is None:
+                # A RESTORED CEILING STARTS ITS CLOCK HERE. A resume brings back the
+                # ceiling but not necessarily the stamp, and step_ind is already large
+                # -- measured against an absent (0) clock the ceiling would expire on
+                # the first post-resume step, which is precisely the OOM the resumed
+                # run was checkpointed to avoid re-discovering.
+                self.batch_size_oom_ceiling_at = stamped = self.step_ind
+            if retest > 0 and self.step_ind - int(stamped) >= retest:
+                print(f"batch: OOM ceiling {ceiling} has stood {retest}+ steps without "
+                      f"another OOM -- clearing it and re-probing upward from "
+                      f"{self.batch_size}")
+                self.batch_size_oom_ceiling = None
+                self.batch_size_oom_ceiling_at = None
+                if getattr(self, 'batch_size_saturated_stage', None) == stage_name:
+                    # the pin may have been the ceiling's doing; release it and let the
+                    # walk re-measure. A knee pin released here costs one re-climb
+                    # cycle, which is what batch_knee_recheck_steps does on purpose.
+                    self.batch_size_saturated_stage = None
+                    self._rung_throughput = None
+                    self.batch_size_last_grow = self.step_ind
+
         if (knee_on and stage_name is not None
                 and getattr(self, 'batch_size_saturated_stage', None) == stage_name):
             # periodic re-estimation: the knee moves WITHIN a stage as the fused
@@ -531,7 +576,18 @@ class Modeller:
                 f = float(getattr(self.args, 'batch_growth_factor', 2.0))
                 dropped = max(self._batch_floor(), int(round(self.batch_size / f)))
                 if dropped >= self.batch_size:
-                    return  # already at the floor -- nothing below to re-measure against
+                    # PINNED AT OR BELOW THE FLOOR -- an OOM cut, not a knee, put us
+                    # here. There is nothing below to re-measure against, so re-arm the
+                    # walk UPWARD instead of returning. Returning left batch_size_pinned_at
+                    # stale, so this branch was re-entered every step and the recheck
+                    # could never fire again: the batch was frozen for the stage's life.
+                    self.batch_size_saturated_stage = None
+                    self._rung_throughput = None
+                    self.batch_size_last_grow = self.step_ind
+                    self.batch_size_pinned_at = self.step_ind
+                    print(f"batch growth: pin {self.batch_size} is at/below the floor "
+                          f"{self._batch_floor()} -- re-arming the walk upward")
+                    return
                 self.batch_size = dropped
                 self.batch_size_saturated_stage = None
                 self._rung_throughput = None
@@ -1754,6 +1810,23 @@ class Modeller:
                     internal_oom_recovery=True,
                     # one-off pass over the whole prior dataset at init -- prefer the adaptive, self-healing chunked path over a hard crash, regardless of the training-time flag
                 )
+
+            # HAND THE CARD BACK BEFORE TRAINING STARTS. This pass is the largest
+            # allocation the process ever makes -- the whole prior scored through the
+            # MLIP at supercell_size 10 -- and its blocks are shaped like supercell
+            # neighbour lists, which a T-step MLP rollout can never reuse. They are
+            # not leaked (the allocator holds them as free), but cuda_memory_fraction
+            # is a HARD cap (set_per_process_memory_fraction, init above), so cached
+            # blocks the run cannot reuse still count against it and the first large
+            # training allocation can OOM behind them.
+            #
+            # ONE SHOT, HERE, deliberately: the same cleanup inside
+            # batched_analyze_crystal_batch is commented out because that function runs
+            # every training step on the uma/mace route, where empty_cache() costs a
+            # device sync per call. At init it costs milliseconds, once.
+            if torch.cuda.is_available():
+                gc.collect()
+                torch.cuda.empty_cache()
 
         # D33: confirm the tabulated dead latent rows still match what the crystal build
         # actually discards, now that a real batch with physical cell parameters exists.
@@ -3792,9 +3865,19 @@ Two things deliberately NOT done here, both recorded in
         # eval names so a new eval call site cannot opt itself in by accident.
         if step_type in TRAIN_MODES:
             oomed_at = self.batch_size
+            # the stage's all-time smallest OOM, which the expiry does NOT clear. The
+            # ceiling is re-derived from it so that a re-probe -- which climbs from
+            # below and therefore re-OOMs a little HIGHER than the original -- cannot
+            # ratchet the ceiling upward and forget the smallest size known not to fit.
+            prior_min = getattr(self, 'batch_size_oom_min', None)
+            self.batch_size_oom_min = (oomed_at if prior_min is None
+                                       else min(prior_min, oomed_at))
             prior_ceiling = getattr(self, 'batch_size_oom_ceiling', None)
-            self.batch_size_oom_ceiling = (oomed_at if prior_ceiling is None
+            self.batch_size_oom_ceiling = (self.batch_size_oom_min if prior_ceiling is None
                                            else min(prior_ceiling, oomed_at))
+            # restart the expiry clock on every OOM, whether or not the ceiling
+            # moved: a ceiling that keeps being re-confirmed must keep standing.
+            self.batch_size_oom_ceiling_at = self.step_ind
         self.batch_size = max(1, int(self.batch_size * self.args.oom_batch_shrink_factor))
         self.batch_size_ever_oomed = True
         self.batch_size_cooldown_until = self.step_ind + self.args.oom_cooldown_steps

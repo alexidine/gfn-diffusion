@@ -36,7 +36,24 @@ RESULTS, 2026-08-13 (5 seeds, 8000 steps):
     the reason to stop there rather than at 0.4.
   * `ray+ray` IS NOT THE SAFE OPTION. It trips on 4/5 seeds of `sgd cliff`,
     where hyper step at 0.2 trips on none.
-  * EVERY CONTROLLER RECOVERS FROM A 15x-TOO-HOT START (`sgd hot`, lr 0.1
+  * !! THE `sgd hot` CELL IS A PASS-THROUGH AND ITS BULLET BELOW IS WRONG. !!
+    Measured on seeds 0/1/2: all seven arms produce exactly 821 trace rows, 4
+    divergences, and abort with "unrecoverable: 4 rewinds at step 820". The lr
+    series is element-wise IDENTICAL to `null`'s for every servo arm, and so is
+    `eloss` for the four hyper arms and `ramp+plateau`. The shipped 5-seed table
+    prints one value across nine rows (div 20, nonfin 0, nats "never", final lr
+    0.00736).
+
+    THE MECHANISM: the cell dies at step 820, INSIDE the 1000-step warmup hold,
+    where `Arm._scale_peak` returns without acting. So no controller has been
+    allowed to move the rate yet and the cell scores the RELOAD BUDGET, not the
+    controllers. Removing either half separates them -- with `warmup_steps=0`,
+    `hyper b=0.02` runs all 8000 steps (3 div, final 2.6e-3, eloss 6.7e-5) and
+    its lr series stops matching the others; with the reload floor lifted, all
+    four survive and separate. Either would make it a real cell.
+
+    The bullet below describes an outcome nothing produces: no arm lands finite.
+  * ~~EVERY CONTROLLER RECOVERS FROM A 15x-TOO-HOT START~~ (`sgd hot`, lr 0.1
     against a 0.0067 cliff): ~20 divergence events each, then a finite landing at
     1.4e-3 to 6e-3. Every fixed rate at or above the cliff never recovers. Note
     `null` recovers too -- the tripwire's peak cut is doing the recovering, so

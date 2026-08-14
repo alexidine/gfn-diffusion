@@ -71,40 +71,78 @@ def smoothed_loss(run, period=EMA_PERIOD):
 
 def final_loss(run, window=FINAL_WINDOW):
     """
-    Median loss over the last `window` steps.
+    Median loss over the last `window` steps, MINUS the surface's floor.
 
     Median, not mean: a diverging run's tail is heavy and a mean would be set by
     its worst single step. Window, not the last value: the last value is one
     minibatch draw, and an arm can win it by luck.
+
+    THE FLOOR SUBTRACTION IS NOT COSMETIC. Boards report `log(final/best)`, and
+    on a surface whose loss cannot reach zero that ratio is pulled toward 1 by
+    the constant both sides carry. Measured on the MLE cell with `floor=1.0`:
+    the four rates around the optimum went from spanning 3.97 nats to spanning
+    0.02, while their distance-to-optimum was bit-identical -- the score moved,
+    the runs did not. The floor is the realistic setting (the real objective has
+    an irreducible floor), so scoring the raw loss meant the more faithful the
+    surface, the less the board could rank. `score_floor` is 0.0 for every
+    surface that genuinely reaches zero, so no existing cell moves.
     """
     tail = _finite(_series(run, 'loss')[-int(window):])
-    return float(np.median(tail)) if tail else math.inf
+    if not tail:
+        return math.inf
+    # `getattr` twice, because this module's rule is that a metric is a pure
+    # function of a TRACE -- the tests build bare objects carrying nothing but
+    # `.trace`, and a metric that requires a live game would quietly make every
+    # one of them untestable.
+    floor = float(getattr(getattr(run, 'game', None), 'score_floor', 0.0) or 0.0)
+    # clamp: a trailing median can land a hair under the floor by noise, and a
+    # negative or zero score would come back as nan/inf out of the log.
+    return max(float(np.median(tail)) - floor, _FLOOR_EPS)
 
 
-def lead_fraction(runs):
+#: Smallest reportable excess over the floor. Below this the run is at the floor
+#: and the remaining difference is estimator noise, not skill.
+_FLOOR_EPS = 1e-12
+
+
+def lead_from_series(by_arm):
     """
-    For each arm, the share of steps where its smoothed loss is the lowest.
+    Share of steps each arm's smoothed loss was the lowest. `by_arm` is
+    {arm name: list of smoothed values, None where unusable}.
 
-    THE ONLY METRIC HERE THAT COMPARES ARMS DIRECTLY, and the reason no oracle is
-    needed: `runs` are the same seed on the same game, so the noise stream is
-    shared and a difference is the arm. Ties are split evenly rather than given
-    to whichever arm happens to be first in the list -- with fixed-rate arms
-    early in a run, exact ties are common and awarding them by list order would
-    be a silent ranking bias.
+    THE HORIZON IS THE LONGEST SERIES, NOT THE SHORTEST, and that is the whole
+    correction. Truncating to `min(len)` means one arm dying early silences the
+    entire comparison: measured on the shipped SGD board, three arms died at
+    step 41 of 12000, so the whole lead column was computed over 0.34% of the
+    run and `fixed@0.003` printed 97.7% where the honest figure is 22.9%. A
+    dead arm simply stops contributing values; the arms still alive keep being
+    compared to each other, which is what the docstring always claimed and the
+    code did not do. (The Adam board has no deaths and is bit-identical either
+    way, so its published numbers stand.)
 
-    Returns {arm name: fraction}. Steps where no arm has a usable loss are
-    dropped from the denominator, so this cannot be inflated by another arm
-    dying early.
+    Steps where NO arm has a usable value are dropped from the denominator, so a
+    universal blackout cannot dilute anyone. Ties split evenly rather than going
+    to whoever is first in the list -- exact ties are common early among fixed
+    rates, and list order would be a silent ranking bias.
+
+    THERE IS ONE COPY OF THIS ON PURPOSE. `board.py` used to carry its own,
+    subtly different, entirely untested duplicate; every test in
+    `test_metrics.py` exercised the copy the leaderboard never called, so a fix
+    here would not have reached the board.
     """
-    if not runs:
+    if not by_arm:
         return {}
-    series = {r.arm.name: smoothed_loss(r) for r in runs}
-    n = min(len(s) for s in series.values())
-    wins = {k: 0.0 for k in series}
+    n = max(len(s) for s in by_arm.values())
+    wins = {k: 0.0 for k in by_arm}
     counted = 0
     for i in range(n):
-        vals = {k: s[i] for k, s in series.items()
-                if s[i] is not None and math.isfinite(s[i])}
+        vals = {}
+        for k, s in by_arm.items():
+            if i >= len(s):
+                continue                      # this arm has ended; others go on
+            v = s[i]
+            if v is not None and math.isfinite(v):
+                vals[k] = v
         if not vals:
             continue
         counted += 1
@@ -113,8 +151,19 @@ def lead_fraction(runs):
         for k in leaders:
             wins[k] += 1.0 / len(leaders)
     if not counted:
-        return {k: float('nan') for k in series}
+        return {k: float('nan') for k in by_arm}
     return {k: v / counted for k, v in wins.items()}
+
+
+def lead_fraction(runs):
+    """
+    THE ONLY METRIC HERE THAT COMPARES ARMS DIRECTLY, and the reason no oracle is
+    needed: `runs` are the same seed on the same game, so the noise stream is
+    shared and a difference is the arm.
+    """
+    if not runs:
+        return {}
+    return lead_from_series({r.arm.name: smoothed_loss(r) for r in runs})
 
 
 def lr_stability(run):

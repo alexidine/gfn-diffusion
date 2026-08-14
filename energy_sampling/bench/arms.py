@@ -24,12 +24,26 @@ doing nothing is not a controller.
 ON THE NAME "hyper". This is NOT Baydin et al.'s published rule, and the old docs
 called it that. Published is additive and unnormalised, `lr += beta * <g_t,
 g_{t-1}>`; this is multiplicative on the cosine. They share a fixed point and
-nothing else: beta changes from units of `lr/gradient^2` to dimensionless, which
-is exactly why one beta works across surfaces here, and the additive form's
-self-annealing (its step shrinks with ||g||^2 near a stationary point) is gone.
-On real measured gradients (||g|| ~ 583, cos ~ 0.29) the published rule at the
-paper's beta=1e-7 would multiply the LR by ~80 in a single step. The cosine form
-is the defensible choice; the citation was not.
+nothing else: beta changes from units of `lr/gradient^2` to dimensionless, and
+the additive form's self-annealing (its step shrinks with ||g||^2 near a
+stationary point) is gone. On real measured gradients (||g|| ~ 583, cos ~ 0.29)
+the published rule at the paper's beta=1e-7 would multiply the LR by ~80 in a
+single step. The cosine form is the defensible choice; the citation was not.
+
+HYPER DOES HAVE A PRODUCTION COUNTERPART, and this file used to say it did not.
+`LRController.on_hypergradient` (controller.py:237) ships; `train.py:2910` calls
+it on every stepping step; `protocol.py:121` lists 'hyper' beside 'ray' and
+'plateau' as a configurable `lr_sensor` kind with its own beta/beta_down/every
+schema. Its law is `peak_scale *= exp(beta * cos)` -- bit-identical to this
+file's actuator -- and its operand is the REALISED DISPLACEMENT, i.e.
+`HyperStep`'s, not `Hyper`'s.
+
+That matters for how the boards read. `Hyper` correlates the current gradient
+with the PREVIOUS GRADIENT, which is the right statistic only under SGD, and it
+exists in no production path. The README headline that hyper "ends 89x too hot
+and loses to four fixed rates" was measured on that arm; the operand production
+actually uses scores 1.81x on the same cell. `HyperStep` now routes through the
+shipping call so the production counters and status channel are exercised.
 """
 import math
 
@@ -201,11 +215,28 @@ class HyperStep(Hyper):
     #: line-search optimum -- i.e. this arm targets alpha* = 1 in the ray probe's
     #: units, while the shipping servo targets alpha* = 4.
     #:
-    #: Measured elsewhere, cos is close to `1 - lr/lr_opt`: +1 at zero rate, 0 at
-    #: the optimum, -1 at twice it. So a target of `1 - 1/A` parks the arm at
-    #: 1/A of the line-search optimum, and target=0.75 is the setpoint ray is
-    #: using. That makes "is ray just hyper with a conservative setpoint and a
-    #: slow clock?" a two-knob experiment rather than an argument.
+    #: THAT MAP IS FALSE UNDER ADAM, and the claim that used to sit here --
+    #: "cos is close to `1 - lr/lr_opt`: +1 at zero rate, 0 at the optimum, -1 at
+    #: twice it", so target `1 - 1/A` parks the arm at `1/A` of the line-search
+    #: optimum -- is retracted. Measured E[cos] against a fixed rate:
+    #:
+    #:   adam  1e-5 0.513 | 1e-4 0.521 | 1e-3 0.624 | 2e-3 0.645 | 3e-3 0.491
+    #:         5e-3 0.117 | 1e-2 -0.020 | 3e-2 -0.055 | 1e-1 -0.149
+    #:   sgd   1e-5 1.000 | 1e-4 0.999 | 1e-3 0.285 | 2e-3 -0.054 | 3e-3 -0.096
+    #:
+    #: Under SGD the map roughly holds. Under Adam it does not: the lr->0
+    #: asymptote is 0.51 rather than +1, the curve is NON-MONOTONE (it rises to
+    #: 0.645 before falling), so target->lr is not even invertible, and the far
+    #: end reaches -0.15 rather than -1. Any target >= 0.60 therefore sits ABOVE
+    #: the whole attainable range: the arm makes zero raises in ~11000
+    #: actuations, sinks to the peak floor, and warm-restarts out of it. The
+    #: `target=0.75` this comment used to recommend returns a dead arm.
+    #:
+    #: THIS IS ALSO THE MECHANISM BEHIND THE OPTIMIZER SPLIT. The update's fixed
+    #: point is `cos = target`, and at target=0 that is a different rate under
+    #: each optimizer: cos crosses zero at ~1.7e-3 under SGD against a best rate
+    #: of 3e-3 (close), and at ~1e-2 under Adam against a best rate of 3e-3
+    #: (3x hot). No shipped board sets `target`, so nothing published moves.
     def __init__(self, lr, beta=0.02, target=0.0, period=1, beta_down=None):
         # ASYMMETRIC GAIN. `beta_down` is the gain when the statistic says TOO
         # HOT. The base class has always had it; this subclass did not pass it
@@ -267,6 +298,20 @@ class HyperStep(Hyper):
         if self.period > 1 and run.m.step_ind % self.period:
             return
         err = cos - self.target
+        if not self.target:
+            # THROUGH THE SHIPPING SENSOR. `LRController.on_hypergradient` exists
+            # (controller.py:237), train.py calls it every stepping step
+            # (:2910) on exactly this operand -- the realised displacement --
+            # and protocol.py lists 'hyper' as a first-class lr_sensor kind.
+            # Verified bit-identical to the local actuator on all six tracking
+            # cells, so routing through it changes no number and buys the
+            # production counters, the status channel and the first-fire
+            # announce, none of which any bench cell used to exercise.
+            run.m.lr_controller.on_hypergradient(err, self.beta, self.beta_down)
+            return
+        # A NONZERO TARGET IS A BENCH EXTENSION. The shipping sensor has no
+        # setpoint, so it cannot carry this; using the local actuator keeps the
+        # reported `hyper_cos` the raw cosine rather than a shifted error.
         beta = self.beta if err > 0 else self.beta_down
         self._scale_peak(run, math.exp(beta * err))
 

@@ -13,7 +13,7 @@ accumulated defects faster than results. What is different, and why:
 
   * ADAM BY DEFAULT. Hypergradient's rule is derived from the SGD update
     (`d(theta)/d(lr) = -g`), production runs Adam on every optimizer
-    (`train.py:1647`), and every cell of the old bench ran SGD. The derivation
+    (`train.py:1664`), and every cell of the old bench ran SGD. The derivation
     does not carry over -- under Adam the step direction is `mhat/(sqrt(vhat)+eps)`
     -- so measuring on SGD and recommending for Adam was never valid. SGD stays
     available as a control.
@@ -32,15 +32,23 @@ accumulated defects faster than results. What is different, and why:
     boundary carry seed noise the design was supposed to remove, which is worth
     remembering whenever a ray-vs-hyper gap is small.
 
-  * THE REAL CONTROLLER, and an honest account of where that stops. `ray` and
-    `plateau` verdicts go through the shipping `LRController.on_calibration` /
-    `on_plateau`, including its `ratio**eta` damping, bounds, ceiling and warmup
-    hold. `hyper` has NO production counterpart -- there is no hypergradient in
-    `controller.py` -- so it writes `peak_scale` through the same actuator
-    (`_apply_lrs`) and the same bounds, but its update law is bench code. The old
-    harness header claimed all arms "drive the SAME actuator ... only the source
-    of the verdict changes"; that was false, and pretending the laws are
-    interchangeable is what made the comparison look tighter than it was.
+  * THE REAL CONTROLLER, ON ALL THREE SENSORS. `ray` and `plateau` verdicts go
+    through the shipping `LRController.on_calibration` / `on_plateau`, including
+    the `ratio**eta` damping, bounds, ceiling and warmup hold. So does `hyper`:
+    `LRController.on_hypergradient` ships (controller.py:237), `train.py:2910`
+    calls it on every stepping step, and `protocol.py:121` lists 'hyper' beside
+    'ray' and 'plateau' as a configurable `lr_sensor` kind.
+
+    THIS PARAGRAPH USED TO SAY THE OPPOSITE -- "there is no hypergradient in
+    `controller.py`" -- and it was false when written; the sensor and the bench
+    rebuild both landed on 2026-08-13. It was load-bearing, because it is what
+    made the hyper rows read as bench code rather than as statements about a
+    shipping, user-configurable sensor -- and hyper is FIRST on the SGD board.
+
+    Still bench-only, and each for its own reason: `Hyper`'s OPERAND (previous
+    gradient rather than realised displacement, which is the right statistic
+    under SGD only, and is in no production path), `HyperStep`'s `target`
+    setpoint, and `HyperSNR` entirely.
 """
 import copy
 import math
@@ -58,6 +66,13 @@ def _clone_opt_state(opt):
     return copy.deepcopy(opt.state_dict())
 
 from bench.fake_modeller import FakeModeller, FakeStage, make_args
+from bench.surfaces import SurfaceCannot, _Game
+
+#: The unbound stubs, captured once. `type(game).expected_loss is _Game.<stub>`
+#: is the only reliable "did this subclass override it" test -- `hasattr` sees
+#: the stub and says yes.
+_Game_expected_loss = _Game.expected_loss
+_Game_distance_to_opt = _Game.distance_to_opt
 from energy_sampling.controller import LRController
 from energy_sampling.ray_calibration import RayCalibration
 
@@ -65,7 +80,7 @@ from energy_sampling.ray_calibration import RayCalibration
 #: crosses it is a catastrophe and is COUNTED, never averaged into anything.
 DIVERGENCE_BAR = 1.0e9
 
-#: train.py:2130. The reload budget is a RATE, not a count, with a floor of 3 so
+#: train.py:2155. The reload budget is a RATE, not a count, with a floor of 3 so
 #: an early detonation still aborts. Exceeding it is the UNRECOVERABLE signal --
 #: rewinding restores healthy weights but not a survivable rate, and a run that
 #: keeps re-detonating must die rather than hold the GPU forever.
@@ -117,6 +132,29 @@ class Run:
         self.trace = []
         self.divergences = 0
         self.aborted = None
+
+        # CAPABILITY IS DECIDED ONCE, HERE, AND LOUDLY.
+        #
+        # This used to be `hasattr(game, 'expected_loss')` per step, which is
+        # True for every game alive -- `_Game` defines the stub. So a game
+        # without a real one did not fall back, it RAISED on step 1, and
+        # `VarCondGame` did exactly that for the whole life of the rebuild while
+        # its tests passed (they never construct a `Run`).
+        #
+        # Scoring must not silently fall back either. With `eloss` absent for
+        # every step, `metrics._series` reverts to the NOISY training loss --
+        # the ranking-on-a-coin-flip trap `expected_loss` exists to prevent --
+        # and nothing in the output says which loss produced the table. A
+        # surface that cannot be scored is a bug in the surface, not a run to
+        # score differently.
+        cls = type(game)
+        if cls.expected_loss is _Game_expected_loss:
+            raise SurfaceCannot(
+                f'{cls.__name__} does not implement expected_loss, so this run '
+                f'could only be scored on the noisy training loss. Implement it '
+                f'(the noise-free loss at the current parameters) rather than '
+                f'letting the scoring fall back.')
+        self._has_dist = cls.distance_to_opt is not _Game_distance_to_opt
         arm.reset(self)
 
     # ------------------------------------------------------------------ step
@@ -142,8 +180,8 @@ class Run:
         grad_norm = float(g_before.norm()) if g_before is not None else None
 
         # --- train.py's step body ORDER, which the old harness inverted:
-        #     1966 batch sizer | 1971 lr_controller.step() | 1973 check_spike
-        #     | 1982 on_plateau. The batch sizer is not exercised here.
+        #     1992 batch sizer | 1996 lr_controller.step() | 1998 monitor_losses
+        #     (check_spike at 2082) | 2007 on_plateau. The batch sizer is not exercised here.
         if m.step_ind % 10 == 0:
             m.lr_controller.step()
 
@@ -177,11 +215,9 @@ class Run:
             # dict and the same trap, which is why `train_key` exists.
             'lr': m.lr_of(game.train_key),
             'loss': loss,
-            'eloss': (game.expected_loss() if hasattr(game, 'expected_loss')
-                      else None),
+            'eloss': game.expected_loss(),
             'grad_norm': grad_norm,
-            'dist': game.distance_to_opt() if hasattr(game, 'distance_to_opt')
-                    else None,
+            'dist': game.distance_to_opt() if self._has_dist else None,
         })
         m.step_ind += 1
 
@@ -206,7 +242,7 @@ class Run:
     def _snapshot(self):
         self._snap = {
             'params': [p.detach().clone() for p in self._all_params()],
-            # load_model_only(..., load_optimizers=True) at train.py:2169 -- the
+            # load_model_only(..., load_optimizers=True) at train.py:2194 -- the
             # optimizer state RIDES ALONG. Leaving Adam's moments at their
             # detonated values while restoring the weights is its own documented
             # failure mode, so this follows production rather than guessing.
@@ -253,7 +289,7 @@ class Run:
             self.game.optimizers[k].load_state_dict(state)
         self.game.load_extra_state(self._snap['extra'])
         # step_ind is NOT rewound: train.py restores the checkpoint and then
-        # puts the live step back (2172-2175). Time does not run backwards, and
+        # puts the live step back (2197-2200). Time does not run backwards, and
         # a rewound clock would reset the reload budget it is measured against.
         m.lr_controller.on_divergence()
         self.arm.on_rewind(self)

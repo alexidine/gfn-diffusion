@@ -62,7 +62,7 @@ def _mk_opt(kind, groups, lr):
 def _full_optimizer_set(kind, policy, level, lrs):
     """
     Build the SAME five-key optimizer dict train.py always builds
-    (train.py:1619-1664), whatever the game actually trains with.
+    (train.py:1664-1681), whatever the game actually trains with.
 
     This matters for faithfulness in both directions. LRController._apply_lrs
     iterates every key and branches on 'flow' and on the trailing group of
@@ -84,10 +84,35 @@ def _full_optimizer_set(kind, policy, level, lrs):
     return opts
 
 
+class SurfaceCannot(NotImplementedError):
+    """This surface does not provide that capability.
+
+    A DISTINCT TYPE, because `hasattr` cannot tell the difference. `_Game`
+    DEFINES `expected_loss` and `grad_on` as stubs, so `hasattr(game, ...)` is
+    True on every game ever written and a caller guarding on it is guarding on
+    nothing. That is not hypothetical: `runner.py` guarded `expected_loss` that
+    way, and `VarCondGame` -- the entire two-player cell -- raised on step 1 of
+    every run while `test_games.py` passed, because those tests call the game's
+    own methods and never go through `Run`. The same shape had already been
+    found once, in `HyperSNR`'s `grad_on` handler, and documented there.
+
+    Callers must catch THIS, and count what they caught.
+    """
+
+
 class _Game:
     """Common surface protocol. The harness and the tests only use this."""
 
     name = 'base'
+
+    #: Subtracted before scoring. A surface whose loss cannot reach zero has an
+    #: irreducible floor, and `log(final/best)` on a raw loss with a floor is
+    #: COMPRESSED toward zero: measured on the MLE cell, a floor of 1.0 took the
+    #: four rates around the optimum from spanning 3.97 nats to spanning 0.02,
+    #: on runs whose distance-to-optimum was bit-identical. The floor changes the
+    #: score, not the run, and the four rates it stops separating are exactly the
+    #: ones controllers are compared on. 0.0 for a surface that reaches zero.
+    score_floor = 0.0
 
     #: which optimizer key this game's train_step actually drives. The full
     #: five-key dict is always present (train.py builds it unconditionally), so
@@ -138,7 +163,7 @@ class _Game:
         VARIANCE side of the step-size tradeoff. Every cross-step statistic sees
         alignment only.
         """
-        raise NotImplementedError
+        raise SurfaceCannot('grad_on')
 
     def expected_loss(self):
         """
@@ -155,7 +180,7 @@ class _Game:
         The CONTROLLER still sees the noisy loss, as in production. Only the
         scoring uses this.
         """
-        raise NotImplementedError
+        raise SurfaceCannot('expected_loss')
 
     def diverged(self):
         d = self.distance_to_opt()
@@ -225,6 +250,8 @@ class MLEGame(_Game):
         # sensors are floor-invariant is exactly the question worth asking, and
         # this isolates it.
         self.floor = float(floor)
+        #: read by `metrics.final_loss`; see `_Game.score_floor`
+        self.score_floor = float(floor)
         self._gen = g
 
         # log-spaced spectrum in [1, cond]
@@ -427,6 +454,27 @@ class VarCondGame(_Game):
         with torch.no_grad():
             return float(self._loss(batch))
 
+    def expected_loss(self):
+        """
+        The FULL-condition, noise-free loss.
+
+        Without this the game raised on step 1 of every `Run` -- see
+        `SurfaceCannot`. Scoring on the training loss instead is not an option
+        here for the usual reason (the noise term's sign is random near the
+        optimum) and for a second one specific to this surface: the training
+        loss is evaluated on the conditions the batch DREW, so it is also an
+        estimate over a random subset of `zeta`, and an arm can win a step by
+        drawing conditions that happen to be fresh.
+        """
+        with torch.no_grad():
+            resid = (self.A @ self.theta) + self.zeta - self.t
+            return float(0.5 * (resid ** 2).mean()
+                         + 0.5 * self.ridge * (self.zeta ** 2).mean())
+
+    def grad_on(self, batch):
+        (g,) = torch.autograd.grad(self._loss(batch), [self.theta])
+        return g.detach().reshape(-1)
+
     # ---- ground truth
 
     def staleness(self):
@@ -568,7 +616,7 @@ class EquilibrationGame(_Game):
         # Measured on the real system: `gradient_norm_clip: auto` resolves to
         # 37.88 at T=10/W=512 against a median pre-clip gradient norm of ~1.0e3.
         # The clip sits ~26x BELOW the median, so it is active on essentially
-        # every step, and train.py:2868-2870 states the consequence outright --
+        # every step, and train.py:2952 states the consequence outright --
         # "Adam is effectively running on normalized gradients".
         #
         # WHY THIS MATTERS MORE THAN ANY CELL ON THE BOARD. Once the clip binds,

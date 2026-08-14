@@ -44,6 +44,20 @@ MODELLER_STATE_DEFAULTS = {
     # incoming stage has its own memory profile. Worth checkpointing so a
     # mid-stage resume doesn't have to rediscover the ceiling the hard way.
     'batch_size_oom_ceiling': None,
+    # step the ceiling above was last recorded. It EXPIRES (see increment_batch_size),
+    # so the clock has to travel with it. None means UNSTAMPED, not step 0: a resume
+    # at step 20000 that restored the ceiling against a 0 clock would expire it on the
+    # first post-resume step -- the opposite failure from the one expiry exists to fix.
+    # increment_batch_size stamps an unstamped ceiling at the current step, so a
+    # restored ceiling serves its full quiet window from the resume.
+    'batch_size_oom_ceiling_at': None,
+    # smallest batch EVER seen to OOM in this stage. Unlike the ceiling above it does
+    # not expire, and it exists only to keep the ceiling MONOTONE: when an expired
+    # ceiling is re-probed and OOMs again, the walk approaches from below and so
+    # re-discovers a slightly HIGHER size than the original. Without this the ceiling
+    # would ratchet upward one probe at a time, forgetting the smallest size it has
+    # direct evidence does not fit.
+    'batch_size_oom_min': None,
     # the throughput pin: the stage whose knee has been found (None = still climbing)
     # and the step it was pinned at, which is the recheck clock. These MUST travel
     # with batch_size_oom_ceiling above. In a live process the pin is safe by

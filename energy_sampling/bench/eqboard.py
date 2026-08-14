@@ -19,13 +19,27 @@ WHAT IS DIFFERENT FROM THE MLE BOARD, and it changes how to read the table:
     respect, not a setpoint to seek -- the same shape-not-setpoint mistake
     already recorded for alpha*.
   * THERE IS EXACT GROUND TRUTH. `stability_lr` is the closed-form
-    spectral-radius-1 rate. Use the LEVEL-PINNED variant: the Z head sits at
-    `lr_flow` and is exempt from the servo, so the level's rate does not scale
-    with the policy's. Both-scale reads 2.15 where the applicable one reads
-    0.032 on the same game.
-  * A ONE-STEP PROBE IS 31x WRONG HERE. `one_step_lr` = 1/(w_rep*b^2 + w_bwd) =
-    1.0 against a true cliff of 0.032. The game exists to expose exactly that:
-    a sensor answering a one-step question about a multi-step system.
+    spectral-radius-1 rate: 0.0318 with the level pinned at `lr_flow`, which is
+    the applicable variant (the Z head is exempt from the servo, so its rate
+    does not scale with the policy's).
+
+    THE "2.15 vs 0.032" JUSTIFICATION FOR PREFERRING IT IS RETRACTED. Measured,
+    the both-scale variant now returns 0.0293 -- 0.92x the pinned one, agreeing
+    to within 8%. Both numbers here were the pre-fix scalar values that
+    `surfaces.py::one_step_lr` (:896-916) labels unsupported.
+  * A ONE-STEP PROBE IS *NOT* 31x WRONG HERE, and this file's stated reason for
+    existing was wrong by ~34x. Measured `one_step_lr` is 0.287, not 1.0.
+    Worse, the ratio depends entirely on WHEN it is read: `cliff()` reads it
+    after 30 steps, while the gradient is still transient, and gets 4.2-9.2x.
+    At any settled operating point it is 0.46-0.91x, median 0.90 -- i.e. the
+    one-step probe sits slightly BELOW the boundary, not over it. THE SIGN OF
+    THE CLAIM FLIPS. `surfaces.py`'s own docstring already says this ("a median
+    of 0.85x the cliff -- essentially AT the boundary, not 31x over it"); this
+    header had not been updated to match.
+
+    The runtime banner below still prints the 30-step reading, so a run of this
+    board prints "Nx too hot" from a transient. Read it as a transient, or read
+    the settled numbers above.
   * SGD, because that is where the closed form applies -- the game is linear.
 """
 import math
@@ -42,9 +56,30 @@ from bench.surfaces import EquilibrationGame
 
 SEED_LR = 1e-4
 STEPS = 6000
-KW = dict(dim=8, a=2.0, b=1.0, w_rep=0.7, w_bwd=0.3, kappa=0.02, noise=0.1,
-          init_scale=1.0, cond_rep=100.0)
-LADDER = (3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1)
+
+#: THE SURFACE COMES FROM `eqsuite`, IT IS NOT RESTATED HERE.
+#:
+#: This file used to carry its own copy, and the copy had gone stale by two
+#: FIELDS THAT WERE SIMPLY ABSENT -- `cond_bwd` and `drift` -- which default to
+#: off. `eqsuite`'s docstring records both as the repairs that made the surface
+#: able to rank anything at all. Measured, the same ladder on each:
+#:
+#:     stale copy      bwd branch = 0.7% of the policy gradient, 2x band 32x
+#:                     wide, seed sd 0.086 nats
+#:     eqsuite.BASE    bwd = 19.1%, band 3x wide, seed sd 0.021 nats
+#:
+#: On the stale one this board's top eight arms spanned 0.00-0.30 nats against
+#: a seed sd of 0.07-0.13 -- it resolved nothing. On the repaired one it does,
+#: and the answer CHANGES: ray goes from 0.11 to 0.63 nats behind and ends 3-5x
+#: too cold. Every equilibration verdict read off the old copy is about a
+#: surface that was fixed and not re-run.
+from bench.eqsuite import BASE as KW
+
+#: 0.018 IS ON THE LADDER because it is the cell's actual optimum. Without it
+#: the fixed-rate reference the controllers are scored against was itself ~0.28
+#: nats off, and a ladder that does not contain the answer reports its own
+#: spacing.
+LADDER = (3e-4, 1e-3, 3e-3, 1e-2, 1.8e-2, 3e-2, 1e-1)
 
 
 def make_game(lr, seed=0, **over):

@@ -314,9 +314,33 @@ def test_A4_pin_does_not_rebuild_the_oom_sawtooth():
     ).run(2500)
     ooms = _oom_steps(r)
     assert r.m.batch_size_oom_ceiling == 4000, r.m.batch_size_oom_ceiling
+
+    # RE-AIMED 2026-08-14, from "no late OOM" to "no SUSTAINED late OOMs".
+    #
+    # This assertion was `assert not late`, and it is the one place where the OOM
+    # ceiling's expiry (increment_batch_size) and this test's original reading are
+    # genuinely incompatible: any re-probe of the ceiling produces exactly one late
+    # OOM in a scenario like this one, where `oom_at` is a hard synthetic wall and the
+    # ceiling really is permanent truth.
+    #
+    # It was re-aimed rather than deleted because zero-tolerance was measuring the
+    # wrong thing. What this test caught was a PERMANENT sawtooth -- an OOM every
+    # growth lap (batch_growth_slow_interval, 60 steps here), forever. A single probe
+    # per batch_oom_ceiling_retest_steps is two orders of magnitude rarer, and it is
+    # what stops the OTHER production failure: prod0810's acridine/mace arms latched a
+    # ceiling at their BASE batch from init-time MLIP fragmentation and then ran the
+    # whole of train_prior under-sized, on a stage judged by GPU occupancy, until the
+    # scheduler cancelled all three. A latch that is never re-questioned trades a
+    # cheap, bounded cost for an unbounded one.
+    #
+    # So the bar is now the RATE: at most one late OOM per retest window. Reverting
+    # the expiry keeps this green; reintroducing the per-lap sawtooth does not.
     late = [s for s in ooms if s > 400]      # OOMs AFTER the ceiling was known
-    assert not late, (
-        f'walked back into a known OOM ceiling at steps {late} -- the sawtooth is back')
+    retest = int(getattr(r.m.args, 'batch_oom_ceiling_retest_steps', 0) or 0)
+    budget = (2500 // retest) if retest else 0
+    assert len(late) <= budget, (
+        f'{len(late)} OOMs after the ceiling was known (budget {budget}, one per '
+        f'{retest}-step retest window) at steps {late} -- the sawtooth is back')
     assert r.m.batch_size < 4000, f'sitting at the ceiling ({r.m.batch_size})'
 
 
