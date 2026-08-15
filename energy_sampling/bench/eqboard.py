@@ -108,10 +108,17 @@ def _init():
     torch.set_num_threads(1)
 
 
+#: READ THE PROBE AT A SETTLED STATE, NOT AT 30 STEPS.
+#: `one_step_lr` is evaluated along the CURRENT gradient, so at 30 steps it is
+#: reading a transient: the ratio to the cliff comes back ~1.3x there and
+#: 0.74-0.82x once settled, which is the difference between "the probe is over
+#: the boundary" and "the probe is under it". The banner printed the transient.
+SETTLE_STEPS = 3000
+
+
 def cliff():
     g = make_game(0.01)
-    r = Run(g, Fixed(0.01), seed=0, steps=30, batch=64)
-    r.run()
+    Run(g, Fixed(0.01), seed=0, steps=SETTLE_STEPS, batch=64).run()
     pin = g.optimizers['fused'].param_groups[-1]['lr']
     return g.stability_lr(lr_level=pin), g.one_step_lr(), pin
 
@@ -124,7 +131,8 @@ def main(seeds=5, workers=None):
     print(f'{"=" * 96}\nEQUILIBRATION BOARD -- {len(arms)} arms x {len(seeds)} '
           f'seeds, {STEPS} steps, SGD\n'
           f'closed-form cliff {c:.4f} (level pinned at {pin:g}) | a one-step '
-          f'probe would say {one:.3g} -- {one / c:.0f}x too hot\n{"=" * 96}\n')
+          f'probe reads {one:.3g} = {one / c:.2f}x the cliff, measured at a '
+          f'settled state\n{"=" * 96}\n')
 
     jobs = [(i, s) for i in range(len(arms)) for s in seeds]
     with ProcessPoolExecutor(max_workers=workers, initializer=_init) as pool:

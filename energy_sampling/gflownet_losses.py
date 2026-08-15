@@ -219,6 +219,10 @@ def get_gfn_forward_loss(loss_coeffs,
     losses = []
     """VarGrad losses + empirical-Z regression"""
     vg_by_condition = getattr(loss_coeffs, 'vg_by_condition', 0) > 0.5
+    # Form B when set: the huber'd VarGrad term treats its group centre as a
+    # constant, so beta bounds influence WITHOUT the tail-skew MLE leftover the
+    # un-detached form carries. See condition_grouped_empirical_z's docstring.
+    vg_detach_center = getattr(loss_coeffs, 'vg_detach_center', 0) > 0.5
     if vg_by_condition and condition_id is not None and (
             loss_coeffs.vg_lb > 0 or loss_coeffs.vg_lme > 0 or loss_coeffs.emp_z > 0):
         # condition-grouped estimation (see condition_grouped_empirical_z): every
@@ -233,18 +237,21 @@ def get_gfn_forward_loss(loss_coeffs,
         """VarGrad - lower bound loss (condition-grouped): center = group MEAN of log w"""
         if loss_coeffs.vg_lb > 0:
             log_Z_emp_rows, emp_mask, vg_loss = condition_grouped_empirical_z(
-                log_pb, log_pf, log_r, condition_id, lme=False, beta=beta)
+                log_pb, log_pf, log_r, condition_id, lme=False, beta=beta,
+                detach_center=vg_detach_center)
             losses.append(vg_loss * loss_coeffs.vg_lb)
 
             """VarGrad - log mean exp loss (condition-grouped): center = group LOGMEANEXP of log w"""
         elif loss_coeffs.vg_lme > 0:
             log_Z_emp_rows, emp_mask, vg_loss = condition_grouped_empirical_z(
-                log_pb, log_pf, log_r, condition_id, lme=True, beta=beta)
+                log_pb, log_pf, log_r, condition_id, lme=True, beta=beta,
+                detach_center=vg_detach_center)
             losses.append(vg_loss * loss_coeffs.vg_lme)
 
         else:  # emp_z standalone: Jensen-mean target (the vargrad-Z experiment -- drive Z exactly at the empirical lower bound)
             log_Z_emp_rows, emp_mask, _ = condition_grouped_empirical_z(
-                log_pb, log_pf, log_r, condition_id, lme=False, beta=beta)
+                log_pb, log_pf, log_r, condition_id, lme=False, beta=beta,
+                detach_center=vg_detach_center)
 
         if loss_coeffs.emp_z > 0:
             # regress Z(c) onto this batch's per-condition estimate; the target's
@@ -259,13 +266,13 @@ def get_gfn_forward_loss(loss_coeffs,
         """VarGrad - lower bound loss (repeats-grouped)"""
         if loss_coeffs.vg_lb > 0:
             log_Z, vg_loss = vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats,
-                                   beta=beta)
+                                   beta=beta, detach_center=vg_detach_center)
             losses.append(vg_loss * loss_coeffs.vg_lb)
 
             """VarGrad - log mean exp loss"""
         elif loss_coeffs.vg_lme > 0:
             log_Z, vg_loss = vg_lme(gfn, log_pb, log_pf, log_r, repeats,
-                                    beta=beta)
+                                    beta=beta, detach_center=vg_detach_center)
             losses.append(vg_loss * loss_coeffs.vg_lme)
 
         if loss_coeffs.emp_z > 0:  # train the flow model to match the empirical log Z distribution
@@ -436,6 +443,7 @@ def get_gfn_backward_loss(loss_coeffs,
     losses = []
     """VarGrad losses"""
     vg_by_condition = getattr(loss_coeffs, 'vg_by_condition', 0) > 0.5
+    vg_detach_center = getattr(loss_coeffs, 'vg_detach_center', 0) > 0.5
     if vg_by_condition and condition_id is not None and (
             loss_coeffs.vg_lb > 0 or loss_coeffs.vg_lme > 0):
         # condition-grouped BACKWARD VarGrad: cross-terminal, pooling every row
@@ -457,24 +465,26 @@ def get_gfn_backward_loss(loss_coeffs,
             "bwd emp_z with vg_by_condition is unsupported: the off-policy group center is a biased log Z target"
         if loss_coeffs.vg_lb > 0:
             _, _, vg_loss = condition_grouped_empirical_z(
-                log_pb, log_pf, log_r, condition_id, lme=False, beta=beta)
+                log_pb, log_pf, log_r, condition_id, lme=False, beta=beta,
+                detach_center=vg_detach_center)
             losses.append(vg_loss * loss_coeffs.vg_lb)
         else:
             _, _, vg_loss = condition_grouped_empirical_z(
-                log_pb, log_pf, log_r, condition_id, lme=True, beta=beta)
+                log_pb, log_pf, log_r, condition_id, lme=True, beta=beta,
+                detach_center=vg_detach_center)
             losses.append(vg_loss * loss_coeffs.vg_lme)
 
         """VarGrad - lower bound loss (legacy repeats-grouped)"""
     elif loss_coeffs.vg_lb > 0:
         log_Z_emp, vg_loss = vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats,
-                                   beta=beta)
+                                   beta=beta, detach_center=vg_detach_center)
 
         losses.append(vg_loss * loss_coeffs.vg_lb)
 
         """VarGrad - log mean exp loss"""
     elif loss_coeffs.vg_lme > 0:
         log_Z_emp, vg_loss = vg_lme(gfn, log_pb, log_pf, log_r, repeats,
-                                    beta=beta)
+                                    beta=beta, detach_center=vg_detach_center)
         losses.append(vg_loss * loss_coeffs.vg_lme)
 
     """Level-gap term: the z_match delta as a training signal, not only a gate"""
@@ -905,7 +915,8 @@ def condition_group_stats(condition_id, min_group_count: int = 2):
 
 def condition_grouped_empirical_z(log_pb, log_pf, log_r, condition_id,
                                   lme: bool = False, beta: float = 10.0,
-                                  min_group_count: int = 2):
+                                  min_group_count: int = 2,
+                                  detach_center: bool = False):
     """
     Condition-grouped VarGrad / empirical-Z estimation for the forward loss.
 
@@ -932,6 +943,35 @@ def condition_grouped_empirical_z(log_pb, log_pf, log_r, condition_id,
       avoid -- so those rows carry no emp_z gradient.
     - vg_loss: per-row huber deviation of log_ratio from its group estimate
       (the classic VarGrad policy loss; identically zero on singleton groups).
+
+    detach_center controls WHICH gradient the huber'd VarGrad term carries.
+
+    Un-detached (the default, and the only behaviour before 2026-08-14) the
+    group centre is itself a function of theta, so autograd differentiates
+    through it too. With a QUADRATIC loss that costs nothing -- the centred
+    residuals sum to zero identically, so the centre's term cancels exactly and
+    the gradient is the pure contrast sum_i d_i grad r_i. The huber breaks that
+    cancellation: the influence weights become psi_beta(d_i) = clip(d_i, +-beta),
+    and clip is nonlinear, so sum_i psi_beta(d_i) != 0 as soon as the group's
+    residual tails are asymmetric -- the normal state of an under-covered
+    buffer. What survives is a leftover term along the batch-mean score,
+    i.e. an MLE-on-buffer force whose weight is set by TAIL SKEW rather than by
+    any coefficient (same shape as the saturated-backward-TB -> MLE*beta
+    collapse in module_losses.md L8a).
+
+    Detached, the centre is a constant, the leftover vanishes, and beta changes
+    ONLY the influence function -- the fixed point stays exactly where plain
+    VarGrad's already was. Sign-correct absorption is then something you add
+    deliberately (level_gap), not a by-product of the robustness knee.
+
+    The two coincide identically at group size 2, where d_2 = -d_1 and clip is
+    odd, so sum psi_beta = 0 whatever beta is. They diverge only on groups of 3+,
+    which this estimator produces whenever a condition lands in a batch more
+    times than `repeats` -- so the flag is inert on some batches and live on
+    others in the same run.
+
+    The RETURNED log_Z_emp_rows is never detached: emp_z regresses the flow head
+    onto it and that path must keep its gradient.
     """
     log_ratio = log_r + log_pb - log_pf
     uniq, inverse = torch.unique(condition_id.to(log_ratio.device), return_inverse=True)
@@ -956,17 +996,21 @@ def condition_grouped_empirical_z(log_pb, log_pf, log_r, condition_id,
 
     log_Z_emp_rows = group_z[inverse]
     mask_rows = counts[inverse] >= min_group_count
-    vg_loss = beta * F.smooth_l1_loss(log_Z_emp_rows, log_ratio, reduction='none', beta=beta)
+    vg_center = log_Z_emp_rows.detach() if detach_center else log_Z_emp_rows
+    vg_loss = beta * F.smooth_l1_loss(vg_center, log_ratio, reduction='none', beta=beta)
     return log_Z_emp_rows, mask_rows, vg_loss
 
 
-def vg_lme(gfn, log_pb, log_pf, log_r, repeats, beta: float = 10):
+def vg_lme(gfn, log_pb, log_pf, log_r, repeats, beta: float = 10,
+           detach_center: bool = False):
+    """Repeats-grouped VarGrad, logmeanexp centre. detach_center as in vg_lb."""
     log_ratio = log_r + log_pb - log_pf
     if gfn.conditional:
         # [B*repeats] -> [B, repeats]; each row is one condition's K trajectories
         log_ratio_grouped = log_ratio.view(-1, repeats)
         log_Z = torch.logsumexp(log_ratio_grouped, dim=1, keepdim=True) - math.log(repeats)  # [B, 1]
-        vg_loss = beta * F.smooth_l1_loss(log_Z.expand_as(log_ratio_grouped), log_ratio_grouped, reduction='none',
+        center = log_Z.detach() if detach_center else log_Z
+        vg_loss = beta * F.smooth_l1_loss(center.expand_as(log_ratio_grouped), log_ratio_grouped, reduction='none',
                                           beta=beta).view(-1)
         log_Z = log_Z.view(-1)  # [B]
     else:
@@ -980,12 +1024,19 @@ def vg_lme(gfn, log_pb, log_pf, log_r, repeats, beta: float = 10):
         # uphill mechanism in z_level_loss's docstring). vg_lb's unconditional
         # branch takes a plain mean over the same group and was always correct.
         log_Z = torch.logsumexp(log_ratio, dim=0, keepdim=True) - math.log(log_ratio.shape[0])
+        center = log_Z.detach() if detach_center else log_Z
         # vg_loss = 0.5 * (log_Z - log_ratio) ** 2
-        vg_loss = beta * F.smooth_l1_loss(log_Z.repeat(len(log_ratio)), log_ratio, reduction='none', beta=beta)
+        vg_loss = beta * F.smooth_l1_loss(center.repeat(len(log_ratio)), log_ratio, reduction='none', beta=beta)
     return log_Z, vg_loss
 
 
-def vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats, beta: float = 10):
+def vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats, beta: float = 10,
+          detach_center: bool = False):
+    """Repeats-grouped VarGrad, Jensen (group-mean) centre.
+
+    detach_center has the same meaning as in condition_grouped_empirical_z: it
+    selects whether the huber'd term also differentiates through the centre. The
+    returned log_Z keeps its gradient either way -- emp_Z consumes it."""
     assert not (loss_coeffs.vg_lb > 0 and loss_coeffs.vg_lme > 0), \
         "Cannot use both vg_lb and vg_lme simultaneously"
     log_ratio = log_r + log_pb - log_pf
@@ -993,14 +1044,16 @@ def vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats, beta: float = 10):
         # [B*repeats] -> [B, repeats]; each row is one condition's K trajectories
         log_ratio_grouped = log_ratio.view(-1, repeats)
         log_Z = log_ratio_grouped.mean(dim=1, keepdim=True)  # [B, 1]
-        vg_loss = beta * F.smooth_l1_loss(log_Z.expand_as(log_ratio_grouped), log_ratio_grouped, reduction='none',
+        center = log_Z.detach() if detach_center else log_Z
+        vg_loss = beta * F.smooth_l1_loss(center.expand_as(log_ratio_grouped), log_ratio_grouped, reduction='none',
                                           beta=beta).view(-1)
         log_Z = log_Z.view(-1)  # [B]
 
     else:
         log_Z = log_ratio.mean(dim=0, keepdim=True)
+        center = log_Z.detach() if detach_center else log_Z
         # vg_loss = 0.5 * (log_Z - log_ratio) ** 2
-        vg_loss = beta * F.smooth_l1_loss(log_Z.repeat(len(log_ratio)), log_ratio, reduction='none', beta=beta)
+        vg_loss = beta * F.smooth_l1_loss(center.repeat(len(log_ratio)), log_ratio, reduction='none', beta=beta)
     return log_Z, vg_loss
 
 

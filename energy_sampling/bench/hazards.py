@@ -53,12 +53,10 @@ RESULTS, 2026-08-13 (5 seeds, 8000 steps):
     four survive and separate. Either would make it a real cell.
 
     The bullet below describes an outcome nothing produces: no arm lands finite.
-  * ~~EVERY CONTROLLER RECOVERS FROM A 15x-TOO-HOT START~~ (`sgd hot`, lr 0.1
-    against a 0.0067 cliff): ~20 divergence events each, then a finite landing at
-    1.4e-3 to 6e-3. Every fixed rate at or above the cliff never recovers. Note
-    `null` recovers too -- the tripwire's peak cut is doing the recovering, so
-    this scenario scores the SAFETY NET, and the controllers are separated only
-    by where they land afterwards (b=0.2 best at 0.55 nats, null worst at 2.40).
+    (The bullet that stood here -- "every controller recovers from a 15x-too-hot
+    start", with per-arm landing rates -- is DELETED rather than struck through.
+    Nothing lands finite on that cell; every arm aborts at step 820. Keeping a
+    known-wrong result visible is how it gets quoted.)
   * `ramp+plateau` FROM A HOT START ends at lr=200 under Adam (15.67 nats). It
     ramps away from an already-bad rate and the plateau brake never catches it.
 

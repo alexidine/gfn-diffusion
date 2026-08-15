@@ -70,7 +70,7 @@ buffers:
       kappa: 1.0
       symmetric: true
 bwd_loss_coeffs:
-  beta: 80.0
+  beta: 10.0
   db: 0.0
   emp_z: 0
   emp_z_persistent: 0
@@ -88,7 +88,7 @@ bwd_loss_coeffs:
   tbc: 0.0
   traj_grads: 1.0
   vg_by_condition: 1.0
-  vg_detach_center: 0.0
+  vg_detach_center: 1.0
   vg_lb: 0
   vg_lme: 0
 checkpoint_name: null
@@ -157,7 +157,7 @@ fwd_loss_coeffs:
   tb: 0.0
   traj_grads: 0.0
   vg_by_condition: 0.0
-  vg_detach_center: 0.0
+  vg_detach_center: 1.0
   vg_lb: 0.0
   vg_lme: 0
   z_level: 0.0
@@ -291,7 +291,7 @@ protocol:
         vg_by_condition: 1.0
         vg_lb: 1.0
     lr_sensor:
-      beta: 0.2
+      beta: 0.05
       kind: hyper
     name: var_conditioning
     on_enter:
@@ -369,7 +369,7 @@ replay_loss_coeffs:
   traj_grads: 0.0
   vg_lb: 0
   vg_lme: 0
-run_name: qm9anchor_aug14_b020_bwd80
+run_name: qm9anchor_aug14_b005_sym_formb
 seed: 12345
 sg_conditioning: false
 space_groups:

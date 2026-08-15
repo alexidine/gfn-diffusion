@@ -55,6 +55,46 @@ forward and backward legs; moving replay too would make the axis three-legged an
 would isolate anything.
 
 =============================================================================
+THE FORM-B ARM (one extra arm, not an axis)
+=============================================================================
+`vg_detach_center` treats the VarGrad group centre as a constant inside the
+huber'd term. Added to gflownet_losses.py 2026-08-14; default 0.0 reproduces
+every previous run bitwise.
+
+WHY IT IS NOT A NO-OP. With a quadratic loss the centre's contribution cancels
+exactly -- the centred residuals sum to zero -- so detaching changes nothing.
+The huber breaks that cancellation: the influence weights become
+psi_beta(d_i) = clip(d_i, +-beta), clip is nonlinear, and sum_i psi_beta(d_i) is
+only zero if the group's tails are symmetric. The leftover is
+
+    -(1/K) sum_i psi_beta(d_i)   applied along the batch-mean score,
+
+i.e. an MLE-on-buffer force whose weight is set by TAIL SKEW rather than by any
+coefficient -- the same shape as the saturated-backward-TB -> MLE*beta collapse
+in module_losses.md L8a. Confirmed in closed form to 1e-16 by
+test_vg_detach_center.py, which also proves the difference vanishes without a
+biting knee (so it is caused by the clip, not by the detach).
+
+WHEN IT IS LIVE HERE. Identically inert on groups of 2, where d_2 = -d_1 and
+clip is odd. condition_grouped_empirical_z pools EVERY same-condition row in the
+batch, not just the `repeats` tile, so groups exceed 2 whenever a condition lands
+more than twice -- which weighted_condition_sampling makes common. The arm is
+therefore live on some batches and inert on others in the same run, and the
+honest framing is "removes a skew-weighted absorption term that is present some
+of the time", not "changes every step".
+
+ONE ARM, NOT AN AXIS. Crossing it would double the battery. It is pinned to the
+CONTROL cell (b005 bandwidth, sym loss-betas) so it is a clean one-change delta
+against b005_sym, and set on BOTH fwd and bwd because var_conditioning runs
+vg_lb on both legs and the mechanism is identical there -- one mechanism applied
+consistently, not two axes.
+
+NOT TESTED HERE, and worth stating: `bwd_loss_coeffs.beta` is read by the
+var_conditioning VarGrad branch AND the naive TB branch, so the existing bwd80
+arm moves the knee in two stages at once. That confound predates this arm and
+this arm does not touch it.
+
+=============================================================================
 THE WIDTH AXIS (--width, off by default)
 =============================================================================
 Crossing bandwidth x width doubles the arm count, and the two are not independent: a wider
@@ -77,6 +117,7 @@ the prior is built from training molecules only, so neither leaks). Then --prefl
 """
 import argparse
 import copy
+import re
 from pathlib import Path
 
 import yaml
@@ -98,7 +139,8 @@ def stage(cfg, name):
     raise SystemExit(f"base.yaml has no stage named {name!r}")
 
 
-def build(base, tag, beta_name, beta, lb_name, fwd_b, bwd_b, width_name=None, width=None):
+def build(base, tag, beta_name, beta, lb_name, fwd_b, bwd_b, width_name=None, width=None,
+          vg_detach=0.0, extra_name=None):
     cfg = copy.deepcopy(base)
 
     sensor = stage(cfg, "var_conditioning").get("lr_sensor")
@@ -112,13 +154,43 @@ def build(base, tag, beta_name, beta, lb_name, fwd_b, bwd_b, width_name=None, wi
             raise SystemExit(f"base.yaml has no {block}.beta")
         cfg[block]["beta"] = val
 
+    # Form B. Written from here rather than into base.yaml for the same reason as
+    # the batch controls below -- the snapshot stays a faithful copy of the arm
+    # that actually ran. 0.0 is the pre-2026-08-14 behaviour, so writing it on
+    # every arm makes the control arms explicit rather than merely absent.
+    vc = stage(cfg, "var_conditioning").get("loss_coeffs", {})
+    if not (vc.get("fwd", {}).get("vg_lb", 0) > 0 and vc.get("bwd", {}).get("vg_lb", 0) > 0):
+        raise SystemExit("base.yaml's var_conditioning stage does not run vg_lb on both legs -- "
+                         "vg_detach_center would be inert, refusing to write the Form-B arm")
+    for block in ("fwd_loss_coeffs", "bwd_loss_coeffs"):
+        cfg[block]["vg_detach_center"] = float(vg_detach)
+
     if width is not None:
         for k in WIDTH_KEYS:
             if k not in cfg["model"]:
                 raise SystemExit(f"base.yaml model block has no {k!r}")
             cfg["model"][k] = width
 
-    name = "_".join(x for x in (beta_name, lb_name, width_name) if x)
+    # CLUSTER-IZE THE BATCH CONTROLS. base.yaml is snapshotted from qm9_anchor_aug13,
+    # which ran LOCALLY, so it inherits mk_dev's dev-box settings: grow_batch_size false
+    # and max_batch_size == batch_size. Both are hard stops, independently --
+    # train.py::train only calls increment_batch_size under the flag, and the growth walk
+    # returns immediately on `batch_size >= max_batch_size`. The first submission of this
+    # battery therefore ran all six arms pinned at 1000 on an A100 against an analytic ELJ
+    # energy, and every arm was cancelled by the scheduler for low utilization.
+    #
+    # Batch IS the occupancy lever on this route. The comment in increment_batch_size
+    # retiring `gpu_util_floor` ("batch size does not move utilization") is a measurement
+    # from the MLIP route, where the energy call already saturates the card; it does not
+    # transfer to an MLP policy over an analytic energy. Setting these here rather than in
+    # base.yaml keeps the snapshot a faithful copy of the arm that actually ran.
+    for k, want in (("grow_batch_size", True), ("max_batch_size", 20000)):
+        if k not in cfg:
+            raise SystemExit(f"base.yaml has no {k!r} -- the batch controls moved, "
+                             "refusing to write arms that may pin at the base batch")
+        cfg[k] = want
+
+    name = "_".join(x for x in (beta_name, lb_name, width_name, extra_name) if x)
     cfg["run_name"] = f"qm9anchor_aug14_{name}"
     cfg["molecules_path"] = f"{DATA_ROOT}/{tag}_conditions.pt"
     cfg["prior_path"] = f"{DATA_ROOT}/{tag}_prior.pt"
@@ -146,6 +218,13 @@ def main():
             else:
                 arms.append(build(base, args.tag, bn, b, lbn, fb, bb))
 
+    # the Form-B arm: one extra cell, pinned to the control (b005, sym) so it is
+    # a single-change delta against b005_sym. Not crossed -- see the docstring.
+    if not args.width:
+        arms.append(build(base, args.tag, BETAS[0][0], BETAS[0][1],
+                          LOSS_BETAS[0][0], LOSS_BETAS[0][1], LOSS_BETAS[0][2],
+                          vg_detach=1.0, extra_name="formb"))
+
     if args.preflight:
         missing = sorted({v for _, c in arms
                           for v in (c["molecules_path"], c["prior_path"],
@@ -162,21 +241,40 @@ def main():
             yaml.dump(cfg, f, default_flow_style=False, sort_keys=True)
         written.append((name, cfg))
 
-    # an arm that silently duplicates another is a wasted GPU-week
+    # an arm that silently duplicates another is a wasted GPU-week. vg_detach_center
+    # is in the key because the Form-B arm matches the b005_sym control on every
+    # other axis -- leave it out and this assert correctly rejects the battery.
     keys = [(stage(c, "var_conditioning")["lr_sensor"]["beta"],
              c["fwd_loss_coeffs"]["beta"], c["bwd_loss_coeffs"]["beta"],
-             c["model"]["policy_hidden_dim"]) for _, c in written]
+             c["model"]["policy_hidden_dim"],
+             c["bwd_loss_coeffs"]["vg_detach_center"]) for _, c in written]
     assert len(set(keys)) == len(written), "arms are not distinct"
 
     with (HERE / "INDEX.tsv").open("w", encoding="utf-8") as f:
-        f.write("name\thyper_beta\tfwd_beta\tbwd_beta\thidden_dim\trun_name\n")
+        f.write("name\thyper_beta\tfwd_beta\tbwd_beta\thidden_dim\tvg_detach_center\trun_name\n")
         for (name, cfg), k in zip(written, keys):
-            f.write(f"{name}\t{k[0]}\t{k[1]}\t{k[2]}\t{k[3]}\t{cfg['run_name']}\n")
+            f.write(f"{name}\t{k[0]}\t{k[1]}\t{k[2]}\t{k[3]}\t{k[4]}\t{cfg['run_name']}\n")
+
+    # KEEP THE ARRAY RANGE IN SYNC WITH INDEX.tsv. submit.sbatch selects an arm by
+    # INDEX row, so a range that is too SHORT drops the tail arms silently -- no
+    # error, no missing-config message, they simply never run. (Too long is safe:
+    # the script's empty-ARM branch exits 1.) The 2026-08-14 Form-B arm made the
+    # battery 7 against a hardcoded 0-5, which is exactly this failure, so the
+    # range is written from here rather than maintained by hand.
+    sb = HERE / "submit.sbatch"
+    text = sb.read_text(encoding="utf-8")
+    want = f"#SBATCH --array=0-{len(written) - 1}"
+    new, n = re.subn(r"#SBATCH --array=0-\d+", want, text)
+    if n != 1:
+        raise SystemExit(f"submit.sbatch: expected exactly one '#SBATCH --array=0-N' line, found {n}")
+    if new != text:
+        sb.write_text(new, encoding="utf-8")
+        print(f"submit.sbatch: array range -> 0-{len(written) - 1}")
 
     print(f"wrote {len(written)} arms + INDEX.tsv to {HERE}")
     for (name, _), k in zip(written, keys):
-        print(f"  {name:16s} hyper beta {k[0]:<5g} fwd/bwd {k[1]:g}/{k[2]:g}  "
-              f"hidden_dim {k[3]}")
+        print(f"  {name:20s} hyper beta {k[0]:<5g} fwd/bwd {k[1]:g}/{k[2]:g}  "
+              f"hidden_dim {k[3]}  vg_detach {k[4]:g}")
     print(f"\ndata tag: {args.tag} -- run --preflight on the cluster before submitting")
 
 

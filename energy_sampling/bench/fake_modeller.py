@@ -65,7 +65,7 @@ MK_DEV_BATCH = dict(
     # clock as batch_knee_recheck_steps: a knee retest is free, an OOM retest costs a
     # wasted step plus a cooldown, and turning the knee recheck off must not also
     # disable OOM recovery.
-    batch_oom_ceiling_retest_steps=2000,
+    batch_oom_ceiling_retest_steps=1000,
     # occupancy: METRIC WINDOWS ONLY. The controller no longer reads utilization --
     # `gpu_util_floor` is retired (utils._RETIRED_KEYS) because growing the batch
     # does not raise occupancy on the MLIP route. Kept here so the fake's args

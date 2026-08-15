@@ -605,7 +605,10 @@ class Modeller:
         # a cooldown when the ceiling was right; NOT re-probing costs the whole stage
         # when it was wrong.
         ceiling = getattr(self, 'batch_size_oom_ceiling', None)
-        retest = int(getattr(self.args, 'batch_oom_ceiling_retest_steps', 2000) or 0)
+        # default matches the shipping value in configs/mk_dev.yaml and prod0810;
+        # a code default that disagrees with every config is a trap for the one
+        # config that forgets the key
+        retest = int(getattr(self.args, 'batch_oom_ceiling_retest_steps', 1000) or 0)
         if ceiling is not None:
             stamped = getattr(self, 'batch_size_oom_ceiling_at', None)
             if stamped is None:

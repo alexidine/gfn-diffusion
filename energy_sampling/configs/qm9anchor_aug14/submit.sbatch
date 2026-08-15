@@ -6,13 +6,16 @@
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
 #SBATCH --mail-type=END,FAIL
-#SBATCH --array=0-5
+#SBATCH --array=0-6
 #SBATCH --account=torch_pr_226_chemistry
 #SBATCH --job-name=qm9anchor_aug14
 
-# qm9anchor_aug14 :: 3 hyper bandwidths x 2 loss-beta settings.
+# qm9anchor_aug14 :: 3 hyper bandwidths x 2 loss-beta settings, + the Form-B arm.
 # Arms are NAMED, not numbered, so the array index selects a row of INDEX.tsv rather than
 # a filename -- renaming arms to integers would lose which arm is which in wandb.
+#
+# DO NOT EDIT THE --array RANGE BY HAND: make.py rewrites it to match INDEX.tsv on every
+# run. A range shorter than the index drops the tail arms with no error at all.
 module purge
 
 # ---- paths ----

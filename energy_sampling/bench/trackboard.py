@@ -40,8 +40,21 @@ SEED_LR = 1e-4
 STEPS = 6000
 SPEEDS = (1e-4, 1e-3, 1e-2)
 OPTS = ('adam', 'sgd')
-#: spans both optimizers' optima, which sit ~100x apart on the same cell
-LADDER = (1e-4, 1e-3, 1e-2, 1e-1, 3e-1)
+
+#: !! THE sgd/1e-2 CELL IS CENSORED BY THE ACTUATOR, NOT BY THE CONTROLLERS. !!
+#: A servo arm can reach at most `SEED_LR * peak_bounds[1]` = 1e-4 * 2000 = 0.2,
+#: and that cell's best fixed rate is 0.3. So every hyper arm pins at the bound,
+#: their losses agree to 4 significant figures because they ARE the bound, and
+#: the beta axis is dead there. Released, they go past 0.5 and score better.
+#: Read that cell as a bound reading; the other five are controller readings.
+#: Spans both optimizers' optima, which sit ~100x apart on the same cell.
+#:
+#: 3e-2 IS ON THE LADDER BECAUSE IT IS AN ANSWER. Without it the adam/1e-2 cell's
+#: best rung was 1e-2, so the `true move` divisor below came out 100x when
+#: `bench.ladder` -- a finer ladder on the same surface -- measures 300x. Every
+#: `tracked` ratio was then read against a divisor 3x too small, which flips the
+#: reading of an arm near 200x from "overshot" to "undershot".
+LADDER = (1e-4, 1e-3, 1e-2, 3e-2, 1e-1, 3e-1)
 
 
 def build_arms():

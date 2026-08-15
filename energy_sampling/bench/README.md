@@ -45,7 +45,7 @@ re-running anything. Four re-runs were spent on metric definitions in the old
 stack because they were entangled with execution.
 
 **Adam by default.** Hypergradient's rule is derived from the SGD update
-(`dθ/dlr = −g`); production runs Adam everywhere (`train.py:1647`); every cell of
+(`dθ/dlr = −g`); production runs Adam everywhere (`train.py:1664`); every cell of
 the old bench ran SGD. Under Adam the step direction is `m̂/(√v̂+ε)`, so the
 derivation does not carry over. SGD stays as a control.
 
@@ -78,12 +78,14 @@ point is gone. On measured real gradients (‖g‖≈583, cos≈0.29) the publis
 at the paper's β=1e-7 would multiply the LR by ~80 in one step. The cosine form
 is the defensible choice; the citation was not.
 
-`ray+ray` goes through the real `LRController.on_calibration`, so it carries the
-production `ratio**eta` damping, abstention policy and recorded ceiling. `hyper`
-has no production counterpart — there is no hypergradient in `controller.py` —
-so it writes `peak_scale` through the same actuator and bounds, but its update
-law is bench code. The old harness claimed all arms shared an update law; they
-do not, and pretending otherwise made the comparison look tighter than it was.
+All three sensors have production counterparts and the bench drives them:
+`on_calibration` (ray), `on_plateau`, `on_hypergradient` (hyper). This section
+used to claim there was no hypergradient in `controller.py`; there is, and
+`protocol.py` accepts `lr_sensor: {kind: hyper}` alongside `ray` and `plateau`.
+
+Still bench-only: `Hyper`'s operand (previous gradient, correct under SGD only —
+production uses the realised displacement, i.e. `HyperStep`), `HyperStep`'s
+`target` setpoint, and `HyperSNR` entirely.
 
 ## Result (2026-08-13, MLE game, Adam, 8 seeds, 12000 steps)
 
@@ -107,13 +109,29 @@ the right shape for this surface. `max jump 0.693` = ln 2, a deliberate 2x cut
 from a resolved reading, with **zero divergences** — the probe braking, not a
 tripwire.
 
-**`hyper` ends 89x too hot and loses to four fixed rates.** It finds a rate that
-is right early and never comes back down as the optimum decays. Bounded and
-proportional means it cannot make a large correction, and near the noise floor
-its cooling signal is weak.
+**`hyper b=0.02` ends 89x too hot and loses to four fixed rates — but that is
+the arm production does NOT use.** `Hyper` correlates the current gradient with
+the PREVIOUS GRADIENT, which is the right statistic under SGD only. The shipping
+sensor (`LRController.on_hypergradient`, called from `train.py` when a stage
+selects it) correlates it with the REALISED DISPLACEMENT, i.e. `HyperStep` — and
+that arm scores **1.04 nats at 1.67x** on this same cell, third overall and the
+best controller after `ray+ray`. The table above omits it; it should not.
 
-Only the `lr/best` column shows this — `nats behind` alone cannot, because the
-surface is flat above the optimum under Adam.
+The gap is not a tuning difference, it is the operand. Measured, where each
+statistic crosses zero — i.e. where the rule settles — relative to the best rate:
+
+```
+                       sgd        adam
+cos vs prev gradient   0.71x      308x     <- `Hyper`, non-production
+cos vs realised step   0.71x      4.35x    <- `HyperStep`, what ships
+```
+
+Under Adam the gradient-vs-gradient curve is not even monotone, so it has no
+usable fixed point. Under SGD the two operands are identical, which is why this
+distinction stayed invisible for as long as the bench ran SGD only.
+
+Only the `lr/best` column shows any of this — `nats behind` alone cannot, because
+the surface is flat above the optimum under Adam.
 
 ### Why the horizon changed the answer
 

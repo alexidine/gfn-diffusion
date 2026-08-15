@@ -20,6 +20,21 @@ it is recommended.
 Every arm starts COLD at the same rate in every cell, so what is measured is
 adaptation, not placement.
 
+!! THE WORST-CELL COLUMN -- THIS FILE'S ENTIRE FIGURE OF MERIT -- IS NOT SCALE
+   FREE, so the beta it recommends is partly a statement about STEPS. !!
+
+The worst cell is set by the four MLE cells, and MLEGame's optimum is EXACTLY
+zero: as a run converges the denominator of `log(final/best)` collapses toward 0
+and the ratio grows without bound. So the gap those cells report keeps changing
+with the horizon rather than settling, and the recommended beta -- and the
+verdict on `beta_down` -- move with `STEPS=6000`. The tracking cells do not have
+this problem (stationary surface, nonzero floor).
+
+Two ways out, neither applied yet because either changes the published numbers:
+give the MLE cells a `floor=` so the ratio has a scale (see `_Game.score_floor`),
+or take the worst case over the tracking cells alone. Until then read the
+per-cell columns, not the worst-case summary.
+
     python -m bench.hypersweep 5
 """
 import math

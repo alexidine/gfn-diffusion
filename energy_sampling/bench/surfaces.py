@@ -1,6 +1,10 @@
 """
-The synthetic games -- three loss surfaces chosen for their CHARACTER, not their
-realism.
+The synthetic games -- four loss surfaces here, plus `fused_stage.py`, chosen for
+their CHARACTER rather than their realism.
+
+`GAMES` at the bottom of this file is NOT the roster: it holds three names and is
+defined above `TrackingGame`, so the one surface that passes its own fitness
+checks in every cell is outside it. Boards import the classes directly.
 
 A quadratic bowl would make this whole bench worthless. On a quadratic, alpha* is
 constant (so periodic recalibration measures nothing), batch size is decoupled
@@ -18,17 +22,15 @@ structure of one training stage:
                  CONDITION COVERAGE, not just gradient noise.
 
   equilibration  three players, NOT cooperative -- no joint potential. A policy
-                 chasing a level, a level chasing the policy (positive feedback,
-                 the documented Z-dispersion mechanism), and a lagged buffer
-                 supplying the only restoring force. Its stability boundary in LR
-                 is far below its one-step optimum, so a ray probe targeting
-                 alpha* = 1 diverges by construction.
+                 chasing a level, a level chasing the policy, and a lagged buffer
+                 supplying the only restoring force.
 
-That last property is the point of the whole file. `alpha_target` defaults to 4
-rather than 1 because a ray probe at frozen theta cannot see the tr(H*Sigma) term
--- an argument currently supported by one cluster measurement (tuphwfkm). Here
-the boundary is a spectral radius we can compute exactly, so the claim becomes
-checkable in a second on a laptop.
+RETRACTED: that a ray probe targeting alpha* = 1 "diverges by construction" here.
+Settled, `one_step_lr` reads 0.74-0.82x the cliff -- BELOW the boundary, not
+above it. Only a reading taken ~30 steps in, while the gradient is still a
+transient, supports the old claim. So this surface does NOT supply an argument
+for alpha_target = 4, and any claim checked against the old number is
+unsupported. See `one_step_lr`.
 
 GROUND TRUTH is the other reason these are synthetic. Every game knows its own
 optimum, and `equilibration` knows the exact LR at which it goes unstable. On a
@@ -214,13 +216,16 @@ class MLEGame(_Game):
     L(theta) = 1/2 theta^T H theta + c * sum(theta^4) + g^T theta
 
     H is diagonal with log-spaced eigenvalues spanning `cond`, so the surface is
-    ill-conditioned the way a real regression is. The quartic term is what makes
-    this more than a bowl: local curvature is H + 12c*diag(theta^2), which FALLS
-    as the run converges, so alpha* RISES along the path. A controller that
-    calibrates once and holds is wrong here by construction, which is the whole
-    argument for periodic recalibration.
+    ill-conditioned the way a real regression is.
 
-    Optimum is the origin, exactly.
+    RETRACTED: that the quartic "is what makes this more than a bowl". It is 0.0
+    in every shipped cell, and `quartic=0.01` is indistinguishable from 0.0 at
+    every rate; it takes 0.1 to move the best rate one notch. What moves the
+    optimum here is the noise ball -- see `board.py::STEPS`.
+
+    Optimum is the origin exactly, so `expected_loss` reaches 0: the
+    INTERPOLATION regime. `floor=` models the real objective's nonzero
+    irreducible loss, and no shipped cell sets it. See `_Game.score_floor`.
     """
 
     name = 'mle'
@@ -522,14 +527,14 @@ class EquilibrationGame(_Game):
     architecture's own claim, that the off-policy buffer branch is what prevents
     collapse, made mechanical.
 
-    WHY THIS IS THE IMPORTANT GAME. The iteration is linear in (theta, zeta, mu),
-    so `stability_lr()` returns the exact LR at which the spectral radius reaches
-    1. Meanwhile a ray probe at frozen zeta and mu sees only the theta-curvature
-    w_rep*b^2 + w_bwd and reports alpha* = 1 at lr = 1/(w_rep*b^2 + w_bwd) -- a
-    rate typically many times ABOVE the stability boundary. The probe is not
-    wrong; it is answering a one-step question about a multi-step system. Every
-    claim about alpha_target being 4 rather than 1 is testable against these two
-    numbers.
+    The iteration is linear in (theta, zeta, mu), so `stability_lr()` returns the
+    EXACT LR at which the spectral radius reaches 1. That ground truth is the
+    reason to keep this surface; no other one here has it.
+
+    RETRACTED: that a one-step probe reads "many times ABOVE the stability
+    boundary" here. That used the scalar `1/(w_rep*b^2 + w_bwd)`, which ignores
+    `S_rep`/`S_bwd`; the repaired reading sits BELOW the cliff. See
+    `one_step_lr` and the module header.
 
     kappa is the buffer churn rate. Small kappa is a slow pole: the restoring
     force arrives late, and the system limit-cycles at a period set by kappa
@@ -675,9 +680,14 @@ class EquilibrationGame(_Game):
         # THE BRANCHES STILL SHARE A FIXED POINT and must: MK, on the real
         # system, "var(w) optimizes to zero on both in the very terminal stage".
         # Verified here -- all three branch losses are exactly 0 at
-        # theta = zeta = mu = 0, while cos(replay grad, bwd grad) = +0.85 away
-        # from it. They agree on WHERE, disagree on HOW FAR. The spectra move
-        # curvature, never the location of a minimum.
+        # theta = zeta = mu = 0. They agree on WHERE, disagree on HOW FAR: the
+        # spectra move curvature, never the location of a minimum.
+        #
+        # RETRACTED: cos(replay grad, bwd grad) = +0.85. It is NEGATIVE -- the
+        # branches pull anti-parallel (-0.99 at 500 steps, -0.41 at 3000). The
+        # +0.85 came from evaluating at init, where mu == theta makes the bwd
+        # gradient exactly 0 and the cosine undefined. See
+        # `audit.py::branch_shares`, which measures it at a settled state.
         #
         # AND THE CONFLICT DOES NOT FADE AT CONVERGENCE, which is why these are
         # constant rather than decaying. MK: in terminal training the forward
@@ -974,8 +984,9 @@ class EquilibrationGame(_Game):
             g = g.detach()
             return float((g * g).sum() / (c * g * g).sum())
 
-    def distance_to_opt(self):
-        return float(self.theta.detach().norm())
+    # A SECOND `distance_to_opt` WAS HERE, returning ||theta|| only. Being later
+    # in the class body it silently won, so the documented three-player version
+    # above was dead code: 3.40 reported against 8.32 on the same state.
 
 
 GAMES = {'mle': MLEGame, 'var_cond': VarCondGame, 'equilibration': EquilibrationGame}
@@ -1001,12 +1012,15 @@ class TrackingGame(_Game):
     rate 1e-2. A controller that genuinely tracks has to follow that 10x shift;
     one that happens to land in a good place does not.
 
-    WHY THIS AND NOT THE EQUILIBRATION GAME. That game accumulated a mass term,
-    a flat direction, a ratcheting anchor, a support split and a gradient clip,
-    each traceable to a real review finding, and its rate response went FLAT --
-    0.04 nats across a 100x span. This gives 2.3 nats and a 10x band. Every
-    mechanism from the richer surface now has to earn its way back by changing a
-    controller's RANKING, not by being more faithful in the abstract.
+    WHY THIS AND NOT THE RICHER MULTI-PLAYER SURFACE. That one accumulated a
+    mass term, a flat direction, a ratcheting anchor, a support split and a
+    gradient clip, each traceable to a real review finding, and its rate response
+    went FLAT -- 0.04 nats across a 100x span. This gives 2.3 nats and a 10x
+    band. Every mechanism has to earn its way back by changing a controller's
+    RANKING, not by being more faithful in the abstract.
+
+    (Those five mechanisms live in `fused_stage.py::FusedStageGame`, not in
+    `EquilibrationGame`, which this paragraph used to name.)
 
     THE TARGET PATH IS COMMON ACROSS SEEDS, exactly like the gradient noise: a
     per-seed path is a second macroscopic noise source and was measured to raise

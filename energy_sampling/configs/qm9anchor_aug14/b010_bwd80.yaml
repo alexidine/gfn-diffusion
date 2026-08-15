@@ -88,9 +88,10 @@ bwd_loss_coeffs:
   tbc: 0.0
   traj_grads: 1.0
   vg_by_condition: 1.0
+  vg_detach_center: 0.0
   vg_lb: 0
   vg_lme: 0
-checkpoint_name: qm9a13_qm9anchor_aug14_b010_bwd80_elj-qm9c100k_prior-T6.9-bb6cfd_phase1_exit.pt
+checkpoint_name: null
 checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/
 compile_policy: auto
 condition_log_z:
@@ -156,6 +157,7 @@ fwd_loss_coeffs:
   tb: 0.0
   traj_grads: 0.0
   vg_by_condition: 0.0
+  vg_detach_center: 0.0
   vg_lb: 0.0
   vg_lme: 0
   z_level: 0.0
@@ -163,7 +165,7 @@ gpu_util_policy_window_s: 7200
 gpu_util_sample_period_s: 60
 gpu_util_window_s: 900
 gradient_norm_clip: auto
-grow_batch_size: false
+grow_batch_size: true
 integrator:
   T: 10
 load_weights_only: false
@@ -173,7 +175,7 @@ lr_fused: auto
 lr_policy: auto
 lr_replay: auto
 lr_warmup_ratio: 10
-max_batch_size: 1000
+max_batch_size: 20000
 max_reloads_per_1k_steps: 0.2
 min_lr: 5.0e-07
 mle_min_rate: 0.05

@@ -1,4 +1,38 @@
 """
+!! MEASURED UNFIT TO RANK CONTROLLERS, 2026-08-14. DO NOT WIRE INTO A BOARD. !!
+
+It runs cleanly on every arm -- that is not the problem. Audited with the same
+five checks `bench/audit.py` applies, against `TrackingGame` on an identical
+ladder: seed noise 1.683 nats against a 4.30-nat ladder (range/noise 2.6, the bar
+is 10) where tracking is 0.017 and 286. Its within-2x floor is 1000x wide against
+tracking's 10x. Under ADAM -- production's optimizer -- every rate from 3.2e-4 to
+0.32 lands within 0.13 nats, and an arm board ties `fixed@0.3`, `fixed@0.1` and
+`fixed@0.01` at 0.00 nats with a per-arm seed sd of 1.3-1.7.
+
+Three causes, each measured, and each an instructive trap:
+
+  * THE FLAT DIRECTION IS NOT FLAT (curvature 12-24 in a training Hessian whose
+    smallest eigenvalue is 3.39) and it supplies 90-98% of the score as a
+    PER-SEED CONSTANT that moves 3% over a 320x rate range. `score_floor` is left
+    at 0.0, so that constant is never subtracted and it swamps the signal.
+  * THE THIRD PLAYER CANNOT PULL. Both autograd cross-derivatives between the
+    flow player and the rest come back None -- it is structurally decoupled.
+  * `lr_flow = lr * 800`, the file's headline design choice, IS OVERWRITTEN every
+    10 steps by `controller.py`'s flow pinning, so |zeta| is bit-identical at
+    every policy rate.
+
+Its `grad_clip` default is also now wrong: production ships a per-branch p=0.99
+quantile guard (`grad_clip_guard.py`), and under SGD an always-binding clip keeps
+alive rates that die 4/4 without it -- it REMOVES the cliff. The quantile guard
+reproduces the no-clip result to four digits.
+
+WHAT IT IS STILL GOOD FOR: the fidelity analysis below. Its four corrections to
+`EquilibrationGame` all still hold against current code. Recommendation is to
+harvest that into a design note and delete the class; it is kept for now only so
+that analysis is not lost with it.
+
+--------------------------------------------------------------------------------
+
 THE FUSED EQUILIBRATION STAGE, rebuilt against the real one.
 
 `EquilibrationGame` is kept as the CONTROL. A fidelity critique of it against

@@ -24,6 +24,7 @@ import numpy as np
 
 from bench.arms import Fixed
 from bench.eqsuite import BASE, CELLS, STEPS, _spec
+from bench.metrics import FINAL_WINDOW, _final_loss_or_death
 from bench.runner import Run
 from bench.surfaces import EquilibrationGame
 
@@ -44,7 +45,13 @@ def _one(item):
     if flow is not None:
         run.m.args.lr_flow = flow
     run.run()
-    v = math.inf if run.aborted else g.expected_loss()
+    # THE BOARDS' ESTIMATOR, not a single endpoint. `g.expected_loss()` is one
+    # draw and carries ~2.3x the noise of the trailing-window median (measured,
+    # per-block, on a single trace), with a rate-dependent +0.13..+0.18 nat bias
+    # concentrated at exactly the rates near the optimum. `audit.py` warns
+    # against this substitution by name. Measured effect at 25 seeds: 11 of 13
+    # bands unchanged; `coupling a=6` genuinely widens 3x -> 10x.
+    v = _final_loss_or_death(run, getattr(g, 'score_window', FINAL_WINDOW))
     return ci, ri, (v if math.isfinite(v) and v > 0 else math.inf)
 
 
@@ -53,7 +60,12 @@ def _init():
     torch.set_num_threads(1)
 
 
-def main(seeds=3, workers=None):
+#: THREE SEEDS COULD NOT REPRODUCE THIS FILE'S OWN ANSWER. Measured against a
+#: 25-seed reference, the 3-seed band disagreed in 4 of 13 cells, and pooled
+#: band reproduction was 76%; `static target` reproduced 21% of the time. Since
+#: this file defines the reference band every other equilibration number is read
+#: against, that is the wrong place to save 10 seconds.
+def main(seeds=15, workers=None):
     seeds = tuple(range(int(seeds)))
     workers = int(workers or max(2, min(16, (os.cpu_count() or 4) - 4)))
     jobs = [(ci, ri, s) for ci in range(len(CELLS))

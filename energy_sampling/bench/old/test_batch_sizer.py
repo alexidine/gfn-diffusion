@@ -216,8 +216,22 @@ def test_never_walks_back_into_the_oom_ceiling():
     assert run.oom_steps >= 1
     assert run.m.batch_size_oom_ceiling is not None
     assert run.m.batch_size < run.m.batch_size_oom_ceiling
-    assert run.oom_steps <= 2, (
-        f'{run.oom_steps} OOMs means the walk re-entered the ceiling (sawtooth)')
+    # RE-AIMED 2026-08-14, from an absolute count to a RATE, for the same reason as
+    # test_A4_pin_does_not_rebuild_the_oom_sawtooth in test_batch_adversarial.py:
+    # the OOM ceiling now EXPIRES (increment_batch_size), so on a synthetic wall like
+    # `oom_at` -- where the ceiling really is permanent truth -- each retest window
+    # costs exactly one re-probe OOM. The defect this test was written for was an OOM
+    # every GROWTH LAP, which is one to two orders of magnitude denser.
+    #
+    # Budget derived from the configured window, not hardcoded: the shipping value
+    # already moved once (2000 -> 1000), and a hardcoded bound silently loosens or
+    # tightens against it. Plus one for the discovery OOM.
+    retest = int(getattr(run.m.args, 'batch_oom_ceiling_retest_steps', 0) or 0)
+    budget = 1 + (4000 // retest if retest else 1)
+    assert run.oom_steps <= budget, (
+        f'{run.oom_steps} OOMs over 4000 steps against a budget of {budget} '
+        f'(one discovery + one per {retest}-step retest window) -- the walk is '
+        f're-entering the ceiling faster than expiry explains: sawtooth is back')
 
 
 def test_growth_is_never_blind_after_an_oom():

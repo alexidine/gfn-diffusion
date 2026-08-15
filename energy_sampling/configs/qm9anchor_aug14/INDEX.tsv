@@ -1,7 +1,8 @@
-name	hyper_beta	fwd_beta	bwd_beta	hidden_dim	run_name
-b005_sym	0.05	10.0	10.0	512	qm9anchor_aug14_b005_sym
-b005_bwd80	0.05	10.0	80.0	512	qm9anchor_aug14_b005_bwd80
-b010_sym	0.1	10.0	10.0	512	qm9anchor_aug14_b010_sym
-b010_bwd80	0.1	10.0	80.0	512	qm9anchor_aug14_b010_bwd80
-b020_sym	0.2	10.0	10.0	512	qm9anchor_aug14_b020_sym
-b020_bwd80	0.2	10.0	80.0	512	qm9anchor_aug14_b020_bwd80
+name	hyper_beta	fwd_beta	bwd_beta	hidden_dim	vg_detach_center	run_name
+b005_sym	0.05	10.0	10.0	512	0.0	qm9anchor_aug14_b005_sym
+b005_bwd80	0.05	10.0	80.0	512	0.0	qm9anchor_aug14_b005_bwd80
+b010_sym	0.1	10.0	10.0	512	0.0	qm9anchor_aug14_b010_sym
+b010_bwd80	0.1	10.0	80.0	512	0.0	qm9anchor_aug14_b010_bwd80
+b020_sym	0.2	10.0	10.0	512	0.0	qm9anchor_aug14_b020_sym
+b020_bwd80	0.2	10.0	80.0	512	0.0	qm9anchor_aug14_b020_bwd80
+b005_sym_formb	0.05	10.0	10.0	512	1.0	qm9anchor_aug14_b005_sym_formb

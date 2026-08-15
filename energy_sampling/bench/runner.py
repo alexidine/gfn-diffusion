@@ -35,8 +35,8 @@ accumulated defects faster than results. What is different, and why:
   * THE REAL CONTROLLER, ON ALL THREE SENSORS. `ray` and `plateau` verdicts go
     through the shipping `LRController.on_calibration` / `on_plateau`, including
     the `ratio**eta` damping, bounds, ceiling and warmup hold. So does `hyper`:
-    `LRController.on_hypergradient` ships (controller.py:237), `train.py:2910`
-    calls it on every stepping step, and `protocol.py:121` lists 'hyper' beside
+    `LRController.on_hypergradient` ships (controller.py:237), `train.py:3089`
+    calls it when a stage selects it, and `protocol.py:121` lists 'hyper' beside
     'ray' and 'plateau' as a configurable `lr_sensor` kind.
 
     THIS PARAGRAPH USED TO SAY THE OPPOSITE -- "there is no hypergradient in

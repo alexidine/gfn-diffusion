@@ -17,8 +17,10 @@ knobs that set the problem, each cell scored against its OWN closed-form cliff.
                a permanently stale buffer, which is the documented concern.
   weights      w_rep/w_bwd -- the branch mixture, which in production is a live
                controlled quantity rather than a constant.
-  level rate   `lr_flow`. The Z head is pinned and exempt from the servo, and the
-               cliff depends on it strongly: 2.15 vs 0.03 on the same game.
+  level rate   `lr_flow`. The Z head is pinned and exempt from the servo, so its
+               rate is worth sweeping on its own. (RETRACTED: "the cliff depends
+               on it strongly, 2.15 vs 0.03". Re-measured, the both-scale and
+               level-pinned variants agree to within 8%. See `eqboard.py`.)
   hazards      hot start, a regime change mid-run, and repeated blow-ups. The
                MLE family has all three; equilibration had none, so every
                equilibration verdict so far was about a cold start on a
