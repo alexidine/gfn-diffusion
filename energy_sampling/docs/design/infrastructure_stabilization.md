@@ -69,9 +69,34 @@ which is why it is written as a test before the consolidation, not after.
 
 **Ownership constraint.** The canonical config is user-controlled; the standing
 rule is *schema may change freely, behavior may not*. Consolidation therefore has
-a hard acceptance criterion: **a run of `mk_dev.yaml` is bit-identical before and
-after.** Any change that alters what an experiment does is a separate, explicit
-ask.
+a hard acceptance criterion — stated at three tiers, because "bit-identical" is
+the wrong bar on a GPU/MLIP path and this document elsewhere says exactly that:
+
+| Tier | What | Bar |
+|---|---|---|
+| **A. Parsed config** | the loaded, preflighted, derived-resolved config object | **exact equality** |
+| **B. Deterministic pre-runtime state** | seeded model init, protocol stage parse, buffer seeding, resolved LR/clip values, batch plan | **exact equality** |
+| **C. Execution** | losses, energies, metrics over N steps | **within a measured floor** |
+
+A and B carry most of the risk and are cheap to test exactly: they are pure
+functions of the YAML and the seed, with no kernel nondeterminism in them. A
+consolidation that changes nothing must change nothing there, full stop.
+
+C's floor is **measured, not chosen**. The reference is the spread of the *same*
+config run twice — that is the null distribution, and the consolidated config has
+to be indistinguishable from it. Picking a tolerance by eye instead yields a test
+that passes because it is loose, which is a failure mode this project has already
+paid for. Two consequences:
+
+- On a **deterministic** target the same-config spread is zero, so tier C
+  collapses to an exact test and should be run that way. `latent_gaussian` is the
+  natural choice, being the analytic toy. Do this one first — it is the sharpest
+  instrument available, and it costs seconds.
+- On the **MLIP** route the spread is not zero: UMA is not bit-reproducible on
+  GPU and the reward noise floor is ~0.1 kJ/mol. `torch.equal` is the wrong bar
+  there; the comparison is against the measured repeat-run spread.
+
+Any change that alters what an experiment does is a separate, explicit ask.
 
 ---
 
@@ -187,9 +212,16 @@ is already in git.
 only, and *loaded*, not reference-only. Its previous job — recording which
 sections to rewrite per mode — is obsoleted by 1.2.
 
-**Acceptance.** A short `mk_dev.yaml` run is **bit-identical** before and after
-(same seed, same trace). Mode-safety tests pass, and each fails when its
-invariant is deliberately broken — a test that cannot fail is not evidence.
+**Acceptance.** The three-tier equivalence in §1: exact on parsed config and
+deterministic pre-runtime state, exact on a `latent_gaussian` run, and within the
+measured same-config repeat spread on the MLIP route. Mode-safety tests pass, and
+each fails when its invariant is deliberately broken — a test that cannot fail is
+not evidence.
+
+The tier-A/B comparator is worth building before 1.2 rather than after: a
+harness that dumps the resolved config and pre-runtime state for a given YAML
+turns every subsequent consolidation edit into a one-command diff, which is what
+makes it safe to do the rewrite in small steps instead of one leap.
 
 ---
 
@@ -291,13 +323,36 @@ conditional/unconditional, toy/MLIP — since their profiles differ materially.
 Local profiling for development; A100 for anything where production hardware
 behavior matters.
 
-One question is prerequisite to Phase 6 and should be answered here: **what
-statistic does the cluster actually enforce on**, and how does it relate to
-`gpu/util_policy`, `gpu/util_recent`, and nvidia-smi sampling? These are not
-assumed interchangeable.
+**The utilization question, and what counts as answering it.** Phase 6 needs to
+know what the scheduler judges. It does *not* need the scheduler's source code,
+and must not be blocked on getting it — the enforcement mechanism is someone
+else's implementation detail and may simply be unavailable.
+
+The deliverable is a **conservative observable proxy, demonstrated to track the
+real thing well enough**, not the real thing. Concretely, an acceptable answer is
+any of:
+
+1. the actual statistic and window, if documentation or an admin can supply it;
+2. a proxy whose agreement with cluster-visible evidence is *shown* — job
+   cancellations against the logged trace, `sacct`/`scontrol` fields, sampled
+   `nvidia-smi` during a job — over enough jobs to mean something;
+3. failing both, the most conservative available reading plus a stated margin,
+   with the margin's cost in throughput measured so the price of the ignorance is
+   known rather than hidden.
+
+`gpu/util_policy` (already logged, 7200 s window) is the standing candidate for
+(2) and (3). Whichever holds, **write down which case applies** — a proxy adopted
+under case 3 and later remembered as case 1 is how a margin quietly becomes a
+law. Phase 6 proceeds on the proxy either way.
+
+The subsidiary question is measurable regardless of how the first one resolves:
+how do `gpu/util_policy`, `gpu/util_recent`, and nvidia-smi sampling relate to
+each other? They are not assumed interchangeable, and their disagreement is
+itself the input to choosing the conservative proxy.
 
 **Acceptance.** A small named set of canonical workloads, rerunnable by name,
-with current baseline numbers recorded as graded findings.
+with current baseline numbers recorded as graded findings; plus a named
+utilization proxy with its case (1/2/3) stated.
 
 ---
 
