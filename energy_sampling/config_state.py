@@ -38,9 +38,6 @@ import copy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-# The state the canonical config (configs/mk_dev.yaml) is written against. A
-# production config records the state it was generated from, so a later migration
-# knows which transitions to apply.
 # What an unstamped config is assumed to be. Every config predating the
 # introduction of the key is state 0 by definition.
 UNSTAMPED_VERSION = 0
@@ -112,9 +109,9 @@ class Change:
 # The history. Append; never edit a shipped record.
 # ---------------------------------------------------------------------------
 
-STATE_HISTORY: tuple[StateTransition, ...] = (
-    StateTransition(
-        version=1,
+CHANGES: tuple[Change, ...] = (
+    Change(
+        state=1,
         summary=(
             "Baseline. Introduces `project_state_version` and this module. State 1 "
             "is the config schema as it stands at the start of the infrastructure "
@@ -125,6 +122,7 @@ STATE_HISTORY: tuple[StateTransition, ...] = (
             "the mechanical subset can now be repaired instead."
         ),
         components=('config_state.py', 'utils.py', 'configs/mk_dev.yaml'),
+        transition=Transition(
         added={VERSION_KEY: 1},
         # Pure renames ONLY: same meaning, same units, value carried across
         # untouched. Anything whose interpretation moved is in `manual` below,
@@ -213,6 +211,7 @@ STATE_HISTORY: tuple[StateTransition, ...] = (
                 "freezes."
             ),
         },
+        ),
         invariants=(
             "A config at CURRENT_STATE_VERSION passes migrate() unchanged.",
             "Migration never alters the problem identity (energy_function, paths, "
@@ -227,6 +226,21 @@ STATE_HISTORY: tuple[StateTransition, ...] = (
         ),
     ),
 )
+
+
+def state_changes() -> tuple[Change, ...]:
+    """The subset of CHANGES that moved project state, in state order.
+
+    This is what `migrate` walks. Every other change is history and is rendered
+    in the chronology, but has nothing to apply."""
+    return tuple(sorted((c for c in CHANGES if c.moves_state),
+                        key=lambda c: c.state))
+
+
+# DERIVED, never hand-maintained. The current state is whatever the last
+# state-moving change created. Writing it as a literal alongside the records is
+# how it comes to disagree with them.
+CURRENT_STATE_VERSION = max((c.state for c in CHANGES), default=UNSTAMPED_VERSION)
 
 
 # ---------------------------------------------------------------------------
@@ -330,37 +344,38 @@ def migrate(cfg: dict, from_version: Optional[int] = None,
             f"may carry keys this code has no schema for. Check out the matching "
             f"revision instead.")
 
-    for tr in STATE_HISTORY:
-        if not (from_version < tr.version <= to_version):
+    for ch in state_changes():
+        tr = ch.transition
+        if not (from_version < ch.state <= to_version):
             continue
 
         for dotted, value in tr.added.items():
             node, leaf, present = _get(cfg, dotted)
             if not present:
                 _set(cfg, dotted, value)
-                report.applied.append(f"v{tr.version} add    {dotted} = {value!r}")
+                report.applied.append(f"v{ch.state} add    {dotted} = {value!r}")
 
         for old, new in tr.renamed.items():
             node, leaf, present = _get(cfg, old)
             if present:
                 value = node.pop(leaf)
                 _set(cfg, new, value)
-                report.applied.append(f"v{tr.version} rename {old} -> {new} (value kept: {value!r})")
+                report.applied.append(f"v{ch.state} rename {old} -> {new} (value kept: {value!r})")
 
         for dotted, why in tr.removed.items():
             node, leaf, present = _get(cfg, dotted)
             if present:
                 dropped = node.pop(leaf)
-                report.applied.append(f"v{tr.version} drop   {dotted} (was {dropped!r}) -- {why}")
+                report.applied.append(f"v{ch.state} drop   {dotted} (was {dropped!r}) -- {why}")
 
         for dotted, why in tr.manual.items():
             _, _, present = _get(cfg, dotted)
             if present:
-                report.needs_judgment.append(f"v{tr.version} {dotted}: {why}")
+                report.needs_judgment.append(f"v{ch.state} {dotted}: {why}")
 
         if tr.migrate_fn is not None:
             tr.migrate_fn(cfg)
-            report.applied.append(f"v{tr.version} custom transform")
+            report.applied.append(f"v{ch.state} custom transform")
 
     cfg[VERSION_KEY] = to_version
     report.unchanged = not (report.applied or report.needs_judgment)
@@ -372,45 +387,51 @@ def render_history_markdown() -> str:
     edit the records and regenerate, so the description and the transform that
     implements it cannot disagree."""
     out = [
-        "# Project state history",
+        "# Project change history",
         "",
-        "Generated from `config_state.STATE_HISTORY` -- do not edit by hand.",
-        "One entry per project-state transition. The line-level diff is in git;",
-        "what is recorded here is the semantic delta needed to migrate state.",
+        "Generated from `config_state.CHANGES` -- do not edit by hand.",
+        "",
+        "One entry per material functional change. A change marked **STATE N** is",
+        "one that altered how persisted state is interpreted, and is the only kind",
+        "that moves `project_state_version` or carries a migration; the rest record",
+        "what changed and why. The line-level diff is in git.",
         "",
     ]
-    for tr in STATE_HISTORY:
-        out.append(f"## State {tr.version}")
+    for ch in CHANGES:
+        marker = f"STATE {ch.state}" if ch.moves_state else f"at state {ch.state}"
+        out.append(f"## {marker} — {ch.summary.split('.')[0]}.")
         out.append("")
-        out.append(tr.summary)
+        out.append(ch.summary)
         out.append("")
-        if tr.commit:
-            out.append(f"**Commit:** `{tr.commit}`")
+        if ch.commit:
+            out.append(f"**Commit:** `{ch.commit}`")
             out.append("")
-        if tr.components:
-            out.append(f"**Components:** {', '.join(f'`{c}`' for c in tr.components)}")
+        if ch.components:
+            out.append(f"**Components:** {', '.join(f'`{c}`' for c in ch.components)}")
             out.append("")
-        for title, items, fmt in (
-            ("Added", tr.added, lambda k, v: f"`{k}` = `{v!r}`"),
-            ("Renamed", tr.renamed, lambda k, v: f"`{k}` -> `{v}`"),
-            ("Removed", tr.removed, lambda k, v: f"`{k}` -- {v}"),
-            ("Requires judgment", tr.manual, lambda k, v: f"`{k}` -- {v}"),
-        ):
-            if items:
-                out.append(f"**{title}:**")
-                out.append("")
-                for k, v in items.items():
-                    out.append(f"- {fmt(k, v)}")
-                out.append("")
-        if tr.invariants:
+        tr = ch.transition
+        if tr is not None:
+            for title, items, fmt in (
+                ("Added", tr.added, lambda k, v: f"`{k}` = `{v!r}`"),
+                ("Renamed", tr.renamed, lambda k, v: f"`{k}` -> `{v}`"),
+                ("Removed", tr.removed, lambda k, v: f"`{k}` -- {v}"),
+                ("Requires judgment", tr.manual, lambda k, v: f"`{k}` -- {v}"),
+            ):
+                if items:
+                    out.append(f"**{title}:**")
+                    out.append("")
+                    for k, v in items.items():
+                        out.append(f"- {fmt(k, v)}")
+                    out.append("")
+        if ch.invariants:
             out.append("**Invariants:**")
             out.append("")
-            out.extend(f"- {i}" for i in tr.invariants)
+            out.extend(f"- {i}" for i in ch.invariants)
             out.append("")
-        if tr.validation:
+        if ch.validation:
             out.append("**Validation:**")
             out.append("")
-            out.extend(f"- {v}" for v in tr.validation)
+            out.extend(f"- {v}" for v in ch.validation)
             out.append("")
     return "\n".join(out)
 

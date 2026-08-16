@@ -18,22 +18,36 @@ made State unreadable without Log and made Evidence impossible to grade.
 `audit_since_ty4xdlzo.md` is frozen Evidence; the `.html`/`.tex` derivations are
 Argument. Neither gets edited.
 
-### Transition — the one exception to "Log lives in git"
+### Change — the one exception to "Log lives in git"
 
-A **state transition** record says how a config at project state N reaches state
-N+1. It reads like Log and is not: Log narrates what happened, a Transition
-answers a question a future reader must be able to answer mechanically, and
-unlike Log its correctness is checkable — the migration either produces a
-loadable config or it does not.
+A **Change** record says what a material functional edit meant. It reads like Log
+and is not: Log narrates what happened, a Change answers what a future reader
+must know to work on the thing afterwards, and the subset that carries a
+migration is *checkable* — the migration either produces a loadable config or it
+does not.
 
-It gets a home because git cannot serve that question. Reconstructing a migration
-from a diff means reading every commit between two states and inferring intent.
+It gets a home because git cannot serve that question. Reconstructing intent from
+a diff means reading every commit in between and guessing.
 
-**Transitions are data, not prose.** They live in `config_state.STATE_HISTORY`
-beside the migration that implements them, so a description and its transform
-cannot drift. `docs/state_history.md` is generated from those records and is
-never hand-edited; a test asserts the committed copy matches. Append one record
-per transition; never edit a shipped one.
+**Changes are data, not prose.** They live in `config_state.CHANGES` beside the
+migration that implements them, so a description and its transform cannot drift.
+`docs/change_history.md` is generated from those records and never hand-edited; a
+test asserts the committed copy matches. Append; never edit a shipped record.
+
+**Two tiers, and the distinction is load-bearing.** A Change optionally carries a
+`Transition` — the migration payload — and *only* a change with one moves
+`project_state_version`.
+
+| | Gets a Change record | Moves the state integer |
+|---|---|---|
+| renamed / removed / reinterpreted config key, or a default whose meaning moved | yes | **yes** |
+| bug fix, performance work, new metric, refactor | yes | no |
+
+The test is: *could a config or checkpoint written before this be read wrong
+afterwards?* If every functional edit bumped the integer it would reach state 483
+with 450 numbers that say nothing about migrating anything, and it would stop
+meaning what its name claims. It earns its keep by being rare. A test enforces
+the rule in both directions.
 
 ## Grades
 

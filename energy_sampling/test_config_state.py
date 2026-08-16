@@ -17,8 +17,9 @@ import pytest
 import yaml
 
 import config_state as cs
-from config_state import (CURRENT_STATE_VERSION, STATE_HISTORY, UNSTAMPED_VERSION,
-                          VERSION_KEY, StateTransition, config_version, migrate)
+from config_state import (CHANGES, CURRENT_STATE_VERSION, UNSTAMPED_VERSION,
+                          VERSION_KEY, Change, Transition, config_version, migrate,
+                          state_changes)
 
 HERE = Path(__file__).parent
 CANONICAL = HERE / 'configs' / 'mk_dev.yaml'
@@ -44,7 +45,7 @@ def _retired_keys():
 # Structural invariants, as predicates so they can be mutation-tested
 # ---------------------------------------------------------------------------
 
-def classes_are_disjoint(tr: StateTransition) -> bool:
+def classes_are_disjoint(tr: Transition) -> bool:
     """A key may appear in at most one of added/renamed/removed/manual. Two
     classes claiming one key makes the transform order-dependent, and the order
     is an implementation detail nobody should have to know."""
@@ -53,34 +54,57 @@ def classes_are_disjoint(tr: StateTransition) -> bool:
     return len(set().union(*groups)) == total
 
 
-def rename_targets_are_live(tr: StateTransition, retired: set) -> bool:
+def rename_targets_are_live(tr: Transition, retired: set) -> bool:
     """A rename must not point at a key that is itself retired -- that is a
     two-step transition written as one, and it produces a config that fails the
     load-time gate immediately after being 'migrated'."""
     return all(new not in retired for new in tr.renamed.values())
 
 
-def versions_are_monotone(history) -> bool:
-    return [t.version for t in history] == list(range(1, len(history) + 1))
+def states_advance_by_one_and_only_on_a_transition(changes) -> bool:
+    """The rule that keeps the state integer meaningful.
+
+    A change carrying a Transition advances the state by exactly one. A change
+    without one leaves it where it was. Violating this in the permissive
+    direction is how a project ends up at state 483 with 450 numbers that say
+    nothing about migrating a config."""
+    state = 0
+    for ch in changes:
+        expected = state + 1 if ch.moves_state else state
+        if ch.state != expected:
+            return False
+        state = ch.state
+    return True
 
 
 # ---------------------------------------------------------------------------
 # The shipped history satisfies them
 # ---------------------------------------------------------------------------
 
-def test_history_versions_are_monotone_from_one():
-    assert versions_are_monotone(STATE_HISTORY)
-    assert STATE_HISTORY[-1].version == CURRENT_STATE_VERSION
+def test_states_advance_only_on_a_transition():
+    assert states_advance_by_one_and_only_on_a_transition(CHANGES)
 
 
-@pytest.mark.parametrize('tr', STATE_HISTORY, ids=lambda t: f'v{t.version}')
-def test_key_classes_are_disjoint(tr):
-    assert classes_are_disjoint(tr)
+def test_current_version_is_derived_from_the_records():
+    """CURRENT_STATE_VERSION is computed, not written down. A literal beside the
+    records is how the two come to disagree."""
+    assert CURRENT_STATE_VERSION == max(c.state for c in CHANGES)
+    assert state_changes()[-1].state == CURRENT_STATE_VERSION
 
 
-@pytest.mark.parametrize('tr', STATE_HISTORY, ids=lambda t: f'v{t.version}')
-def test_rename_targets_are_not_themselves_retired(tr):
-    assert rename_targets_are_live(tr, _retired_keys())
+def test_every_state_moving_change_carries_a_transition():
+    for ch in state_changes():
+        assert ch.transition is not None
+
+
+@pytest.mark.parametrize('ch', state_changes(), ids=lambda c: f'v{c.state}')
+def test_key_classes_are_disjoint(ch):
+    assert classes_are_disjoint(ch.transition)
+
+
+@pytest.mark.parametrize('ch', state_changes(), ids=lambda c: f'v{c.state}')
+def test_rename_targets_are_not_themselves_retired(ch):
+    assert rename_targets_are_live(ch.transition, _retired_keys())
 
 
 def test_v1_covers_the_retired_keys_exactly():
@@ -89,8 +113,8 @@ def test_v1_covers_the_retired_keys_exactly():
     a key a transition handles but the gate does not know about is a migration
     for an event that never fires."""
     retired = _retired_keys()
-    v1 = STATE_HISTORY[0]
-    handled = set(v1.renamed) | set(v1.removed) | set(v1.manual)
+    tr = state_changes()[0].transition
+    handled = set(tr.renamed) | set(tr.removed) | set(tr.manual)
     assert handled - retired == set(), f'handled but not retired: {sorted(handled - retired)}'
     assert retired - handled == set(), f'retired but unhandled: {sorted(retired - handled)}'
 
@@ -100,33 +124,48 @@ def test_v1_covers_the_retired_keys_exactly():
 # ---------------------------------------------------------------------------
 
 def test_disjointness_check_rejects_an_overlapping_transition():
-    broken = StateTransition(
-        version=99, summary='mutation',
-        removed={'foo.bar': 'x'}, manual={'foo.bar': 'y'},
-    )
+    broken = Transition(removed={'foo.bar': 'x'}, manual={'foo.bar': 'y'})
     assert not classes_are_disjoint(broken)
 
 
 def test_rename_target_check_rejects_a_chained_rename():
-    broken = StateTransition(
-        version=99, summary='mutation',
-        renamed={'adaptive_lr.cut_ratio': 'adaptive_lr.trigger'},  # target is retired
-    )
+    broken = Transition(
+        renamed={'adaptive_lr.cut_ratio': 'adaptive_lr.trigger'})  # target is retired
     assert not rename_targets_are_live(broken, _retired_keys())
 
 
-def test_monotonicity_check_rejects_a_gap():
-    a = StateTransition(version=1, summary='a')
-    c = StateTransition(version=3, summary='c')
-    assert not versions_are_monotone((a, c))
+def test_state_rule_rejects_a_bump_without_a_transition():
+    """THE failure this design exists to prevent: a plain functional change that
+    increments the state integer anyway."""
+    changes = (Change(state=1, summary='real', transition=Transition()),
+               Change(state=2, summary='a bug fix that bumped the state'))
+    assert not states_advance_by_one_and_only_on_a_transition(changes)
+
+
+def test_state_rule_rejects_a_transition_that_does_not_bump():
+    """The other direction: a migration that leaves the state where it was would
+    never be applied to a config stamped at that state."""
+    changes = (Change(state=1, summary='real', transition=Transition()),
+               Change(state=1, summary='migration, no bump', transition=Transition()))
+    assert not states_advance_by_one_and_only_on_a_transition(changes)
+
+
+def test_state_rule_accepts_history_changes_between_transitions():
+    """The intended shape: several recorded changes sitting at one state, with
+    the integer moving only when persisted interpretation actually changes."""
+    changes = (Change(state=1, summary='transition', transition=Transition()),
+               Change(state=1, summary='a perf change'),
+               Change(state=1, summary='a bug fix'),
+               Change(state=2, summary='another transition', transition=Transition()))
+    assert states_advance_by_one_and_only_on_a_transition(changes)
 
 
 def test_coverage_check_would_notice_a_dropped_key():
     """Same comparison as test_v1_covers_the_retired_keys_exactly, run against a
     history missing one key -- it must come back unequal."""
     retired = _retired_keys()
-    v1 = STATE_HISTORY[0]
-    handled = set(v1.renamed) | set(v1.removed) | set(v1.manual)
+    tr = state_changes()[0].transition
+    handled = set(tr.renamed) | set(tr.removed) | set(tr.manual)
     handled.discard('gpu_util_floor')
     assert retired - handled == {'gpu_util_floor'}
 
@@ -269,22 +308,22 @@ def test_canonical_config_declares_its_state():
 
 def test_history_renders():
     md = cs.render_history_markdown()
-    assert '# Project state history' in md
-    assert '## State 1' in md
+    assert '# Project change history' in md
+    assert '## STATE 1' in md
     assert 'do not edit by hand' in md
 
 
 def test_committed_history_doc_matches_the_records():
-    """docs/state_history.md is generated, and the generator's output is the only
+    """docs/change_history.md is generated, and the generator's output is the only
     thing that makes it true. Committing it keeps the chronology readable without
     running Python; this check is what stops the committed copy drifting behind the
     records after a transition is added.
 
     Regenerate with:  python -c "import config_state as cs; \
-open('docs/state_history.md','w',encoding='utf-8',newline='\\n').write(cs.render_history_markdown())"
+open('docs/change_history.md','w',encoding='utf-8',newline='\\n').write(cs.render_history_markdown())"
     """
-    doc = HERE / 'docs' / 'state_history.md'
-    assert doc.exists(), 'docs/state_history.md is missing -- regenerate it'
+    doc = HERE / 'docs' / 'change_history.md'
+    assert doc.exists(), 'docs/change_history.md is missing -- regenerate it'
     assert doc.read_text(encoding='utf-8') == cs.render_history_markdown(), (
-        'docs/state_history.md is stale relative to config_state.STATE_HISTORY -- '
+        'docs/change_history.md is stale relative to config_state.CHANGES -- '
         'regenerate it (command in this test\'s docstring)')
