@@ -34,10 +34,10 @@ override_learning_rates: false  # on resume, overwrite the numeric LR restored f
 
 #Optimizers
 ################################################################
-# `auto` on an lr_* key = SERVO-MANAGED: seeded at 1e-5 (below every optimum
-# measured on this codebase) and then owned by the alpha* loop below, which
-# probes the usable peak per stage. An explicit float is a FIXED peak the servo
-# never touches, so a partial config (lr_fused: auto, lr_back: 3e-4) is legal.
+# `auto` on an lr_* key = SERVO-MANAGED: resolved at load to adaptive_lr.seed_lr
+# below, and then owned by the alpha* loop, which probes the usable peak per
+# stage. An explicit float is a FIXED peak the servo never touches, so a partial
+# config (lr_fused: auto, lr_back: 3e-4) is legal.
 # The old auto rule -- anchor x 25/T -- is deleted: it promoted one battery's
 # number to a law, and every run is a transfer (decisions.md D3 revisited).
 lr_policy: auto
@@ -46,7 +46,7 @@ lr_replay: auto
 lr_fused: auto
 lr_flow: 0.1                 # PINNED: exempt from envelope and servo alike, since alpha* is measured over policy params only. Unconditional flow_model is a LearnableScalar (convex 1-D, O(lr) jitter at this LR); conditional nets use 1.0e-4
 min_lr: 1.0e-6
-lr_warmup_ratio: 10          # initial warmup LR = peak / this. 10 rather than 100 because the servo seed already sits ~10x under any measured optimum, and 1e-5/100 is below min_lr (the ramp's first half would be clipped flat)
+lr_warmup_ratio: 10          # the ramp starts at peak / this and reaches peak over adaptive_lr.warmup_steps, floored at min_lr. A deeper ratio spends more of warmup far below the operating rate; every sensor holds through warmup anyway, so the ramp is dead time the run pays at each stage transition
 adaptive_lr:
   # ---- 1. WARMUP ENVELOPE ------------------------------------------------
   # Fixed schedule, no sensor: exponential 1/lr_warmup_ratio -> 1.0 over these
@@ -167,11 +167,13 @@ batch_growth_factor: 1.65
 batch_growth_interval: 50       # steps between jumps before the first OOM. WITH compile_policy active use ~250-500 (each new size is a ~30-60s recompile stall); 50 is fine locally where compile is off
 batch_growth_slow_interval: 300 # jump spacing after any OOM (congestion avoidance)
 # --- automatic batch-size throughput optimization (train.py increment_batch_size) ---
-# The growth walk scores every jump by how much it slowed the STEP down, not by raw
-# samples/sec: a jump that fails reverts one rung and PINS the batch for the current
-# protocol stage. The pin re-arms at stage transitions and after OOM cuts, and the batch
-# LEVEL itself resets to batch_size at every stage transition (the walk only moves up, so
-# an inherited level is a floor). With this ON, max_batch_size is a safety ceiling.
+# The growth walk scores every jump by the SAMPLES/SEC it buys, not by how much it slowed
+# the step down: a jump that fails to clear batch_growth_min_throughput_gain reverts one
+# rung and PINS the batch for the current protocol stage. The pin re-arms at stage
+# transitions and after OOM cuts, and the batch LEVEL itself resets to batch_size at every
+# stage transition (the walk only moves up, so an inherited level is a floor). With this
+# ON, max_batch_size is a safety ceiling. NB the whole walk is gated on grow_batch_size,
+# which is false above -- none of this runs as shipped.
 auto_batch_throughput_opt: true  # master switch; false = grow to max_batch_size/OOM as before
 batch_growth_min_throughput_gain: 0.05  # samples/sec gain a jump must clear to be kept -- a SATURATION detector. opt-steps/sec = samples_per_sec / grad-accum target, so this maximises optimizer-step throughput; step time does not enter. MUST be < batch_growth_factor-1 (0.65 here): at or above it a factor-f jump can never deliver the demanded gain, so every jump is rejected and the batch FREEZES at batch_size
 gpu_util_window_s: 900  # trailing window for the gpu/util_recent metric. DIAGNOSTIC ONLY -- nothing in the trainer acts on occupancy: batch size does not move it on the MLIP route (measured, umaperf0812)
@@ -272,7 +274,7 @@ condition_log_z:
   trim_frac: 0.01  # per-condition-group trimmed mean for ema_logw. log w is heavy-tailed here (logw_std 8-46), and a 1% two-sided trim removes the handful of extreme draws that would otherwise set the mean
   max_batch_weight: 200.0  # ceiling on the evidence one update() may contribute, in samples. At batch 1000 with ESS ~0.4 a call would otherwise carry ~400; capping at 200 with a 7-visit half-life puts the steady-state effective_count near 200/(1-0.5^(1/7)) ~ 2100
   discovery_half_life_steps: 200.0  # half-life (TRAINING STEPS) of the minima-discovery rate EMAs. Pure monitoring
-  fwd_tb_z_source: learned  # 'learned' or 'persistent' (the conditional persistent-Z regime; see mode_presets.yaml)
+  fwd_tb_z_source: learned  # 'learned' or 'persistent' (the conditional persistent-Z regime)
   bwd_tb_z_source: learned
   replay_tb_z_source: learned
   weighted_condition_sampling: true  # fit-error-weighted forward mol draws; applies only in stages declaring the flag
@@ -311,9 +313,9 @@ z_calibration:
   holdout_modulus: 8         # conditions with id % this == 0 are excluded from the fit and reported as z_cal/holdout_rms; a growing gap vs z_cal/train_rms means the head is fitting tracker noise. 0 = no holdout
 
 # ============================================================================
-# TRAINING PROTOCOL -- the declarative stage interface (protocol.py). Field
-# docs: see the conditional_toy_protocol snapshot in mode_presets.yaml and
-# protocol.py itself. Two stages: train_prior (MLE) -> equilibration.
+# TRAINING PROTOCOL -- the declarative stage interface. Field docs live in
+# protocol.py's module docstring, which is the authority on what a stage may
+# declare. Two stages: train_prior (MLE) -> equilibration.
 # ============================================================================
 protocol:
   stages:
@@ -323,6 +325,22 @@ protocol:
       train_mode: bwd
       bwd_sampling_mode: dataset
       skip_if: prior_loaded          # a prior loaded by path IS this stage's product
+      # `hyper` rather than `ray`: the ray probe draws from replay and scores
+      # replay_loss_coeffs, so it is incoherent in a bwd stage that trains
+      # neither. The hypergradient reads no loss -- peak_scale *= exp(beta*cos)
+      # over the angle between the current gradient and the direction the last
+      # step actually moved the policy -- so it is coherent whatever a stage
+      # trains, which is why it is the sensor for the non-replay-TB stages.
+      #
+      # beta is a BANDWIDTH with no universal value -- the per-cell optimum spans
+      # 20x, which is why the parser refuses to default it. 0.1 is the best
+      # WORST-CASE beta measured on the bench over 12 cells (two optimizers x
+      # tracking and MLE surfaces, at 3.2x the best fixed rate; controller.py
+      # _hypergradient docstring). That sweep covered MLE surfaces, which is what
+      # this stage trains, so it is the closest measured evidence rather than a
+      # transfer -- the production conditional configs run 0.05, but on a
+      # var_conditioning stage and from a battery with no committed verdict.
+      lr_sensor: { kind: hyper, beta: 0.1 }
       flags:
         update_log_z: true           # accumulate ema_logw / best_energy evidence
         scramble_conditions: true    # intent flag; applies only on conditional problems
@@ -353,6 +371,12 @@ protocol:
     - name: equilibration
       train_mode: fused
       bwd_sampling_mode: prior       # churned prior_buffer, never the atomic dataset
+      # The LR sensor is OPT-IN PER STAGE: omitting this block means no sensor,
+      # silently, and the `auto` lr_* keys then sit at adaptive_lr.seed_lr for the
+      # whole run while the config reads as adaptive. `ray` is coherent here and
+      # only here -- the probe draws from replay and scores replay_loss_coeffs, so
+      # it needs a fused stage that trains replay TB, which this is.
+      lr_sensor: { kind: ray }
       flags:
         update_log_z: true
         buffers_active: true
@@ -410,6 +434,21 @@ controller:
   lookahead_horizon: 5  # rules with lookahead: true -- controller ticks to extrapolate metrics ahead before thresholding
   lookahead_trend_alpha: 0.1  # EMA smoothing on the estimated per-tick trend
 
+# Cheap, periodic diagnostic on fused steps only (see _log_fused_gradient_geometry
+# in train.py) -- pairwise cosines between the active branches' raw (pre-weight)
+# gradients, split into shared-trunk vs branch-private parameter blocks, plus the
+# fused gradient's norm against the naive weighted sum of component norms.
+# Distinguishes ALIGNED (higher batch/LR may accelerate every branch) from
+# ORTHOGONAL (optimization capacity/preconditioning may be the limit) from
+# CONFLICTING (the current slow thermalization may be the unavoidable Pareto
+# path, or benefit from conflict-aware geometry like PCGrad) -- without it any
+# of those three stories is speculation. Off by omission; every <= 0 also
+# disables it. Cost is one extra autograd.grad() per active branch, only on
+# armed steps (fused_step_count % every == 0).
+grad_geometry:
+  enabled: true
+  every: 50
+
 conditional_worst_quantile: 0.25  # fraction of conditions allowed to sit beyond the bar for worst-case metrics; drives tb_err_worst / z_grad_worst / delta_worst (all upper-tail). Degrades to pooled on unconditional runs
 
 buffers:
@@ -460,13 +499,13 @@ buffers:
       enabled: true
       kappa: 1.0        # draw p ~ d+^kappa. The practical ceiling: kappa=2 blew is_ess_frac to 0.07 with one row at 58x the mean weight, and kappa=0 was the worst arm
       floor_frac: 0.25  # relative floor on surviving d+ as a fraction of the median, so the weight range is bounded by (median/floor)^kappa. Measured ESS knee: 0.01 -> ESS/n 0.11, 0.25 -> 0.63, 0.50 -> 0.80
-      symmetric: true  # draw on |delta|^kappa instead of delta_plus^kappa when true -- untested alternative, default off preserves current behavior
+      symmetric: true  # draw on |delta|^kappa instead of delta_plus^kappa. ON here (the code default is off): under the one-sided draw a row that falls to delta <= 0 gets p = 0, so its ema_logw is never refreshed and it ratchets out of the eligible set permanently -- is_elig_frac drifted 0.74 -> 0.33, monotonic. |delta| leaves every row eligible and holds is_elig_frac at 1.0. Whether it also closes the forward-tail fit gap is NOT yet measured: that needs an on/off arm
 
   # permanent archive of high-quality, mutually latent-distinct samples -- grows only
   # through admission, and tops up prior_buffer via noising + rescoring whenever a
   # prior-sampling churn cycle comes up short
   anchor_buffer:
-    seed_source: 'prior_dataset'   # domain rule (mode_presets.yaml): molecule problems seed from prior_dataset; toys seed from the CONDITIONS .pt
+    seed_source: 'prior_dataset'   # domain rule (configs/problems.yaml): molecule problems seed from prior_dataset; toys seed from the CONDITIONS .pt
     max_size: 200000
     dup_cutoff: 0.05          # latent L2 distance below which two CONFIRMED-SURPRISING candidates are literal duplicates. Latents live in a unit box, so this is 5% of an axis
     # Energy windows above that condition's Emin(c), in kJ/mol. At temperature

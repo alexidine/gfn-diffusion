@@ -3,14 +3,31 @@ import math
 
 class LRController:
     """
-    LR controller v8: a warmup envelope under a peak set by PERIODIC RAY
-    CALIBRATION, plus one coarse divergence bar. Nothing else.
+    LR controller v8: a warmup envelope under a peak set by a PER-STAGE SENSOR,
+    plus one coarse divergence bar.
 
         lr = base_lr x peak_scale x envelope(t)
 
     `envelope` is a fixed warmup ramp, restarted at every stage transition.
-    `peak_scale` is moved only by on_calibration(), at most once per
-    ray_calibration.period steps.
+    `peak_scale` is moved by whichever sensor the CURRENT STAGE declares
+    (protocol.py `lr_sensor`, parsed at Stage._parse_lr_sensor) and by nothing
+    else:
+
+        kind: ray      on_calibration(), at most once per
+                       ray_calibration.period steps. Coherent only in a fused
+                       stage that trains replay TB -- the probe draws from
+                       replay and scores replay_loss_coeffs
+        kind: hyper    on_hypergradient(), EVERY step, each move bounded by
+                       exp(+-beta). Scores no loss, so it is coherent whatever
+                       the stage trains
+        kind: plateau  on_plateau(), on a ReduceLROnPlateau verdict. Cuts only
+        kind: none     nothing moves it; the LRs sit at their resolved base
+
+    Omitting the block entirely means no sensor -- silently -- so `auto` keys
+    stay at adaptive_lr.seed_lr for the whole stage while the config reads as
+    adaptive. on_divergence() also cuts peak_scale, whatever the sensor. All
+    three sensors HOLD THROUGH WARMUP, for the reason written at
+    on_calibration.
 
     WHAT V8 DELETED, AND WHY. v7 estimated alpha* online: a 3-point parabola per
     probe, then a windowed median, a censoring taxonomy, quorum fractions, a
@@ -342,13 +359,15 @@ class LRController:
         curvature) and forget the ceiling, whose evidence describes a surface
         that no longer exists.
 
-        peak_scale is RESET to 1.0, so each stage re-discovers its own peak. It
-        used to be carried, on the grounds that it was an accumulated estimate
-        and re-deriving it would "spend thousands of steps re-climbing" -- but
-        that reasoning belongs to a sensor that CLIMBS. The plateau rule only
-        ever cuts, so there is nothing to re-climb, and carrying a cut forward
-        just imposes the previous stage's verdict on a surface with different
-        curvature. Measured peaks differ substantially between stages and runs.
+        peak_scale is RESET to 1.0, so each stage re-discovers its own peak.
+        Carrying it forward would impose the previous stage's verdict on a
+        surface with different curvature, and measured peaks differ
+        substantially between stages and runs.
+
+        The reset is NOT free, and deliberately so: `ray` and `hyper` both
+        climb, so a stage that inherited a high peak pays warmup plus a
+        re-climb to get back to it. That cost is accepted in exchange for never
+        carrying a stale verdict across a surface change.
 
         Returns the warmup length in TRAIN STEPS."""
         m = self.modeller
@@ -416,7 +435,7 @@ class LRController:
     def step(self):
         """One controller evaluation. Re-stamps the envelope and the LRs; it does
         NOT move peak_scale, except for a warm restart -- otherwise only
-        on_calibration, on_plateau and on_divergence do."""
+        on_calibration, on_hypergradient, on_plateau and on_divergence do."""
         st = self._state()
         self._maybe_restart(st)
         st['envelope'] = self._envelope(st)

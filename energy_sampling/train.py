@@ -801,6 +801,12 @@ class Modeller:
         metrics.update(self._last_grad_norms)
         metrics['gradnorm/nonfinite_steps'] = self._grad_nonfinite
         self._grad_nonfinite = 0
+        # fused-branch gradient-geometry diagnostic (grad_geometry.enabled) --
+        # consume-on-read: it's computed far less often than every 10 steps,
+        # so once logged it must not repeat as a stale value on later reports
+        if getattr(self, '_fused_grad_geom_report', None):
+            metrics.update(self._fused_grad_geom_report)
+            self._fused_grad_geom_report = None
         # interspersed z-calibration telemetry, drained each report
         # (z_cal/steps is a count SINCE the last report, not a rate)
         if getattr(self, '_z_cal_report', None):
@@ -2635,6 +2641,9 @@ class Modeller:
         fused_loss = sum((weights[k] / total_weight) * sub_losses[k][0]
                          for k in sub_losses if weights[k] > 0)
 
+        if self._fused_grad_diag_armed():
+            self._log_fused_gradient_geometry(sub_losses, weights, total_weight)
+
         if fwd_ran:
             # churn on the fly
             self.manage_replay_buffer(fwd_loss_dict,
@@ -2962,6 +2971,130 @@ class Modeller:
             return {}
         return {f'gradnorm/{n}': v for n, v in
                 zip(names, torch.stack(norms).cpu().tolist())}
+
+    def _fused_grad_diag_armed(self) -> bool:
+        """Opt-in cadence gate for _log_fused_gradient_geometry.
+
+        grad_geometry.enabled defaults absent -> off (config generation is not
+        loading -- an omitted block must not silently start paying for extra
+        backward passes). every <= 0 also disables it. Ticks on fused_step_count,
+        which only advances inside fused_train_step, so this is a no-op outside
+        a fused stage.
+        """
+        cfg = getattr(self.args, 'grad_geometry', None)
+        if cfg is None or not getattr(cfg, 'enabled', False):
+            return False
+        every = int(getattr(cfg, 'every', 0) or 0)
+        return every > 0 and self.fused_step_count % every == 0
+
+    def _log_fused_gradient_geometry(self, sub_losses, weights, total_weight):
+        """
+        Periodic, cheap diagnostic on a fused step's ACTIVE branches (weight >
+        0, i.e. carrying a graph -- a force-refresh-only branch is already
+        detached and has none): are their gradients COOPERATING (aligned --
+        higher batch/LR likely accelerates everyone), ORTHOGONAL (independent
+        -- optimization capacity/preconditioning may be the limiting factor),
+        or CONFLICTING (fighting -- the current slow thermalization may be the
+        unavoidable Pareto path, or benefit from conflict-aware geometry like
+        PCGrad)? Without this measurement any of those three stories is
+        speculation.
+
+        One torch.autograd.grad per active branch, retain_graph=True so the
+        real fused_loss.backward() downstream (in step_loss) is unaffected --
+        this only reads gradients, it never writes .grad or frees the graph.
+        The fused gradient itself is DERIVED from the branch grads (linearity
+        of d/dtheta) rather than measured with a second backward, so the cost
+        is exactly num_active_branches extra passes, on armed steps only
+        (_fused_grad_diag_armed).
+
+        WHICH PARAMETERS A PAIR ACTUALLY CONTENDS OVER IS THE FIRST QUESTION,
+        not a detail. Under mk_dev's equilibration stage `fwd` carries
+        freeze_policy and `bwd`/`replay` carry freeze_z, so fwd is Z-only and
+        the other two are policy-only: they are PARAMETER-DISJOINT (bench/
+        fused_stage.py:48 measures the Jacobian off-diagonals at exactly 0).
+        A whole-model cosine over such a pair is 0 no matter what either branch
+        is doing -- read as 'orthogonal regime' it would be a pure artifact of
+        the freeze flags. So every pair also reports `overlap_*`, the share of
+        the pair's gradient energy living in jointly-touched parameters:
+        overlap 0 means the cosine is structural and carries NO information
+        about cooperation, and `cos_*_shared` is omitted rather than emitted as
+        a NaN or a spurious 0. Under mk_dev the one pair that genuinely shares
+        the trunk is bwd-vs-replay.
+
+        Membership is by OBSERVED autograd touch (a non-None grad), not by
+        module name, so it follows freeze flags and arch changes for free.
+        There is deliberately NO branch-private COSINE: 'private' means at most
+        one of the pair touched the parameter, so at least one factor of every
+        term in that dot product is exactly zero and the cosine is identically
+        0 by construction -- a metric that cannot ever say anything. The
+        informative form of the same question is per-branch:
+        `{k}_uncontested_frac`, the share of branch k's own gradient energy in
+        parameters no other active branch touches at all (1.0 for fwd under
+        mk_dev, i.e. it contends with nobody).
+        """
+        active = [k for k in sub_losses if weights.get(k, 0.0) > 0]
+        if len(active) < 2:
+            return  # nothing to compare a single branch's gradient against
+
+        params = [p for p in self.gfn_model.parameters() if p.requires_grad]
+        if not params:
+            return
+
+        flat, touched = {}, {}
+        for k in active:
+            raw = torch.autograd.grad(sub_losses[k][0], params,
+                                      retain_graph=True, allow_unused=True)
+            touched[k] = torch.cat([
+                torch.full((p.numel(),), g is not None, dtype=torch.bool, device=p.device)
+                for g, p in zip(raw, params)])
+            flat[k] = torch.cat([(g if g is not None else torch.zeros_like(p)).reshape(-1)
+                                 for g, p in zip(raw, params)])
+
+        def cos(u, v):
+            nu, nv = float(u.norm()), float(v.norm())
+            return float(torch.dot(u, v) / (nu * nv)) if nu > 0 and nv > 0 else float('nan')
+
+        coef = {k: weights[k] / total_weight for k in active}
+        norms = {k: float(flat[k].norm()) for k in active}
+        report = {f'fused_grad/{k}_norm_raw': norms[k] for k in active}  # BEFORE weighting
+
+        for k in active:
+            others = torch.zeros_like(touched[k])
+            for j in active:
+                if j != k:
+                    others |= touched[j]
+            mine = float((flat[k] * ~others).norm())
+            report[f'fused_grad/{k}_uncontested_frac'] = (
+                (mine / norms[k]) ** 2 if norms[k] > 0 else float('nan'))
+
+        for i, a in enumerate(active):
+            for b in active[i + 1:]:
+                report[f'fused_grad/cos_{a}_{b}'] = cos(flat[a], flat[b])
+                both = touched[a] & touched[b]
+                pair_energy = norms[a] ** 2 + norms[b] ** 2
+                shared_energy = float((flat[a] * both).norm()) ** 2 + float((flat[b] * both).norm()) ** 2
+                report[f'fused_grad/overlap_{a}_{b}'] = (
+                    shared_energy / pair_energy if pair_energy > 0 else float('nan'))
+                # parameter-disjoint pair: the cosine above is 0 by construction
+                # and a 'shared block' cosine would be a cosine of two empty
+                # vectors. Emit neither rather than a number that reads as a
+                # measurement of orthogonality.
+                if bool(both.any()):
+                    report[f'fused_grad/cos_{a}_{b}_shared'] = cos(flat[a][both], flat[b][both])
+
+        g_fused = sum(coef[k] * flat[k] for k in active)
+        fused_norm = float(g_fused.norm())
+        weighted_norm_sum = sum(coef[k] * norms[k] for k in active)
+        report['fused_grad/fused_norm'] = fused_norm
+        report['fused_grad/weighted_component_norm_sum'] = weighted_norm_sum
+        # 1.0 = fully aligned (triangle inequality tight); falls toward 0 as the
+        # weighted components cancel each other out (conflicting), and lands
+        # around 1/sqrt(n_active) for mutually orthogonal components of equal
+        # weighted size -- the ORTHOGONAL regime lives between the two poles.
+        report['fused_grad/fused_norm_ratio'] = (
+            fused_norm / weighted_norm_sum if weighted_norm_sum > 0 else float('nan'))
+
+        self._fused_grad_geom_report = report
 
     def _draw_probe_batch(self):
         """

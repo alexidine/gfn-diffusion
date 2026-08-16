@@ -1,0 +1,1006 @@
+---
+# Canonical benchmark workloads. Argument and derivation: docs/design/benchmarks.md.
+#
+# This file is DATA and is LOADED (benchmarks/registry.py), not reference-only.
+# Field semantics are documented in docs/design/benchmarks.md §3; they are not
+# restated here, because a restated field doc is a field doc that drifts.
+#
+# `null` in a measured slot means NOT YET MEASURED. It is never a default and
+# never a guess; the validator refuses a comparison claim that rests on one.
+schema_version: 1
+
+defaults:
+  # Applied under every benchmark's own `overrides`, which win on conflict.
+  # Every entry here removes a source of work that is not the work being timed.
+  overrides:
+    checkpoint_read_only: true
+    archive_period: 0
+    archive_buffers: false
+    grow_batch_size: false
+    auto_batch_throughput_opt: false
+    max_step_seconds: 0
+    batch_knee_recheck_steps: 0
+    figs_period: 100000000
+    z_calibration:
+      enabled: false
+    ray_calibration:
+      enabled: false
+    anomaly_detection: false
+    device: cuda
+
+metrics:
+  # Every literal here is grep-verifiable in the trainer. Source is recorded so a
+  # rename lands in one place.
+  cost:
+    train_step_time: {source: 'utils.drain_elapsed_times', cadence: report}
+    samples_per_sec: {source: 'train.py:814', cadence: report}
+    step_time_max10: {source: 'train.py:2156', cadence: report}
+    Batch Size: {source: train.py, cadence: report}
+  energy:
+    energy/ms_per_sample: {source: 'energies/base_set.py:81', cadence: report}
+    energy/calls: {source: 'energies/base_set.py:78', cadence: report}
+    energy/seconds: {source: 'energies/base_set.py:77', cadence: report}
+    energy/seconds_in_step: {source: 'train.py:830', cadence: report}
+    energy/frac_of_step: {source: 'train.py:832', cadence: report}
+    energy/frac_outside_step: {source: 'train.py:833', cadence: report}
+  energy_phase_split:
+    # MACE ONLY. There is no UMA equivalent; see docs/design/benchmarks.md §10.
+    energy/mace_build_s: {source: 'AL_mace_utils.drain_mace_phase_timing'}
+    energy/mace_collate_s: {source: 'AL_mace_utils.drain_mace_phase_timing'}
+    energy/mace_xfer_s: {source: 'AL_mace_utils.drain_mace_phase_timing'}
+    energy/mace_forward_s: {source: 'AL_mace_utils.drain_mace_phase_timing'}
+    energy/mace_calls: {source: 'AL_mace_utils.drain_mace_phase_timing'}
+    energy/mace_host_frac: {source: 'AL_mace_utils.py:137'}
+    energy/mace_forward_frac: {source: 'AL_mace_utils.py:139'}
+  occupancy:
+    gpu/util_recent: {source: 'train.py:844', window_s: 900}
+    gpu/util_policy: {source: 'train.py:848', window_s: 7200}
+    vram/cached_mb: {source: train.py, cadence: report}
+    vram/peak_reserved_mb: {source: train.py, cadence: report}
+  eval_cost:
+    eval_step_time: {source: 'utils.drain_elapsed_times', cadence: eval}
+    eval_sampling_time: {source: 'utils.drain_elapsed_times', cadence: eval}
+    eval_figs_time: {source: 'utils.drain_elapsed_times', cadence: eval}
+    inter_eval_time: {source: 'utils.drain_elapsed_times', cadence: eval}
+    initialization_time: {source: 'utils.drain_elapsed_times', cadence: once}
+  catastrophe:
+    # Counts. Never averaged, never smoothed into a score.
+    batch/oom_events: {source: 'train.py:869'}
+    batch/ceiling_expiries: {source: 'train.py:870'}
+    batch/oom_ceiling: {source: 'train.py:871'}
+    gradnorm/nonfinite_steps: {source: 'train.py:802'}
+
+# Metric-name patterns forbidden in `primary`. A benchmark's headline number may
+# not be a ratio against another run.
+forbidden_primary_patterns:
+  - 'speedup'
+  - 'vs_baseline'
+  - 'relative_to'
+  - 'x_faster'
+  - 'frac_of_peak'
+  - 'normali[sz]ed'
+
+hardware:
+  local:
+    name: dev box
+    gpu: RTX 5080 Laptop
+    vram_mb: 16303
+    os: Windows 11
+    torch_compile_available: false
+    scheduler: none
+    notes_ref: 'docs/design/benchmarks.md#5'
+  a100:
+    name: cluster
+    gpu: A100
+    vram_mb: null
+    os: Linux
+    torch_compile_available: true
+    scheduler: cancels on low utilisation, policy window 7200 s
+    notes_ref: 'docs/design/benchmarks.md#5'
+
+benchmarks:
+
+  # ---------------------------------------------------------------- toys ----
+  - id: toy-latentgauss-fused-uncond
+    title: Analytic toy, fused, unconditional
+    status: specified
+    workload:
+      energy_function: latent_gaussian
+      conditioning: unconditional
+      domain: toy_on_crystal_parameterisation
+      space_groups: [2]
+      z_primes: [1]
+      T: 10
+      dataset: 'mxtaltools/mini_datasets/mini_new_csd.pt'
+      dataset_in_repo: true
+    training_mode:
+      stage: equilibration
+      train_mode: fused
+      bwd_sampling_mode: prior
+      branches: [fwd, bwd, replay]
+    hardware:
+      class: local
+      local_adequate: true
+      a100_required: false
+      reason: analytic energy, no MLIP weights, dataset ships in repo
+    work:
+      kind: fixed_steps
+      batch_size: 1000
+      pin_batch: true
+      resume_step: 0
+      warmup_steps: 100
+      measure_steps: 400
+      epochs_formula: 'resume_step + warmup_steps + measure_steps'
+      wallclock_cap_s: 3600
+    overrides:
+      energy_function: latent_gaussian
+      integrator: {T: 10}
+      eval_T: 10
+      batch_size: 1000
+      max_batch_size: 1000
+      eval_period: 100000000
+      controller: {refresh_every: 1000000}
+    metrics:
+      primary: [train_step_time, samples_per_sec]
+      secondary: [vram/peak_reserved_mb, gpu/util_recent, step_time_max10]
+      catastrophes: [batch/oom_events, gradnorm/nonfinite_steps]
+      unusable:
+        gpu/util_policy: 'run is shorter than the 7200 s window'
+        energy/frac_of_step: 'analytic energy is a negligible share; the ratio is noise'
+    liveness:
+      - 'fwd/* present and changing'
+      - 'bwd/* present and changing'
+      - 'replay/* present and changing'
+    noise_floor:
+      method: repeat_launch
+      repeats: 5
+      seed_policy: fixed
+      run_statistic: median
+      dispersion: relative_span
+      measured: null
+    correctness:
+      reference: closed_form
+      detail: 'log Z = (n_live/2) log(2 pi T) + n_live log w, plus n_dead * log(2 + sqrt(pi/k)) when dead rows are live'
+      gate: 'pytest test_latent_gaussian.py'
+      exactness: exact
+    comparison:
+      valid_against: [toy-latentgauss-fused-uncond]
+      rule: same_hardware_class_paired_seed
+    purpose:
+      - 'the sharpest instrument available: a deterministic target with a closed-form reference'
+      - 'tier-C config-equivalence check collapses to an exact test here'
+
+  - id: toy-multiharm-fused-cond
+    title: Conditional toy, fused, vector conditioning
+    status: specified
+    workload:
+      energy_function: latent_multiharmonic
+      conditioning: conditional_vector
+      domain: toy
+      space_groups: [1]
+      z_primes: [1]
+      T: 10
+      dataset: 'toy_big_unif_prior.pt + toy_big_unif_conditions.pt + toy_big_unif_test_conditions.pt'
+      dataset_in_repo: false
+    training_mode:
+      stage: equilibration
+      train_mode: fused
+      bwd_sampling_mode: prior
+      branches: [fwd, bwd, replay]
+    hardware:
+      class: local
+      local_adequate: true
+      a100_required: false
+      reason: analytic energy; the conditioner is a small MLP
+    work:
+      kind: fixed_steps
+      batch_size: 1000
+      pin_batch: true
+      resume_step: null
+      warmup_steps: 100
+      measure_steps: 400
+      epochs_formula: 'resume_step + warmup_steps + measure_steps'
+      wallclock_cap_s: 3600
+    overrides:
+      energy_function: latent_multiharmonic
+      vector_conditioning: true
+      vector_conditioning_dim: 3
+      model: {periodic_centroids: false}
+      space_groups: [1]
+      energy_config: {temperature: 1.0}
+      integrator: {T: 10}
+      eval_T: 10
+      batch_size: 1000
+      max_batch_size: 1000
+      eval_period: 100000000
+      controller: {refresh_every: 1000000}
+    metrics:
+      primary: [train_step_time, samples_per_sec]
+      secondary: [vram/peak_reserved_mb, gpu/util_recent]
+      catastrophes: [batch/oom_events, gradnorm/nonfinite_steps]
+      unusable:
+        gpu/util_policy: 'run is shorter than the 7200 s window'
+    liveness:
+      - 'fwd/* present and changing'
+      - 'bwd/* present and changing'
+      - 'replay/* present and changing'
+      - 'the conditioner receives gradient on at least one branch'
+    noise_floor:
+      method: repeat_launch
+      repeats: 5
+      seed_policy: fixed
+      run_statistic: median
+      dispersion: relative_span
+      measured: null
+    correctness:
+      reference: paired_unconditional_control
+      detail: 'toy-latentgauss-fused-uncond at the same T and batch is the cost control; the delta is the conditioning overhead'
+      gate: 'pytest test_condition_fractions.py'
+      exactness: floor
+    comparison:
+      valid_against: [toy-multiharm-fused-cond, toy-latentgauss-fused-uncond]
+      rule: same_hardware_class_paired_seed
+    purpose:
+      - 'isolates the cost of conditioning from the cost of an expensive energy'
+
+  # ------------------------------------------------------- branch ladder ----
+  - id: elj-bwd-dataset-uncond
+    title: ELJ, bwd from the atomic dataset (train_prior MLE)
+    status: specified
+    workload:
+      energy_function: elj
+      conditioning: unconditional
+      domain: molecule
+      space_groups: [2]
+      z_primes: [1]
+      T: 10
+      dataset: 'mipcas_sg2_zp1_elj_prior_dataset.pt'
+      dataset_in_repo: false
+    training_mode:
+      stage: train_prior
+      train_mode: bwd
+      bwd_sampling_mode: dataset
+      branches: [bwd]
+    hardware:
+      class: local
+      local_adequate: true
+      a100_required: false
+      reason: no energy call at all on this stage; nothing about it is hardware-policy sensitive
+    work:
+      kind: fixed_steps
+      batch_size: 1000
+      pin_batch: true
+      resume_step: 0
+      warmup_steps: 100
+      measure_steps: 400
+      epochs_formula: 'resume_step + warmup_steps + measure_steps'
+      wallclock_cap_s: 3600
+    overrides:
+      energy_function: elj
+      integrator: {T: 10}
+      eval_T: 10
+      batch_size: 1000
+      max_batch_size: 1000
+      eval_period: 100000000
+    metrics:
+      primary: [train_step_time, samples_per_sec]
+      secondary: [vram/peak_reserved_mb]
+      catastrophes: [batch/oom_events, gradnorm/nonfinite_steps]
+      unusable:
+        energy/ms_per_sample: 'this stage never calls the energy; the key is ABSENT, not zero'
+        energy/frac_of_step: 'same'
+        gpu/util_policy: 'run is shorter than the 7200 s window'
+    liveness:
+      - 'bwd/* present and changing'
+      - 'energy/* ABSENT for the whole run'
+    noise_floor:
+      method: repeat_launch
+      repeats: 5
+      seed_policy: fixed
+      run_statistic: median
+      dispersion: relative_span
+      measured: null
+    correctness:
+      reference: mle_descent
+      detail: 'bwd/mle descending over the window; gates/mle_flat not yet tripped'
+      gate: 'pytest -m fast'
+      exactness: floor
+    comparison:
+      valid_against: [elj-bwd-prior-uncond, elj-fwd-solo-uncond, elj-replay-solo-uncond, elj-fused-uncond]
+      rule: branch_ladder_paired_seed
+    purpose:
+      - 'the energy-free floor of the branch ladder: policy + backward rollout cost alone'
+
+  - id: elj-bwd-prior-uncond
+    title: ELJ, bwd from the churned prior buffer
+    status: specified
+    workload:
+      energy_function: elj
+      conditioning: unconditional
+      domain: molecule
+      space_groups: [2]
+      z_primes: [1]
+      T: 10
+      dataset: 'mipcas_sg2_zp1_elj_prior_dataset.pt'
+      dataset_in_repo: false
+    training_mode:
+      stage: equilibration
+      train_mode: bwd
+      bwd_sampling_mode: prior
+      branches: [bwd]
+    hardware:
+      class: local
+      local_adequate: true
+      a100_required: false
+      reason: analytic energy
+    work:
+      kind: fixed_steps
+      batch_size: 1000
+      pin_batch: true
+      resume_step: null
+      warmup_steps: 100
+      measure_steps: 400
+      epochs_formula: 'resume_step + warmup_steps + measure_steps'
+      wallclock_cap_s: 3600
+    overrides:
+      energy_function: elj
+      integrator: {T: 10}
+      eval_T: 10
+      batch_size: 1000
+      max_batch_size: 1000
+      eval_period: 100000000
+    metrics:
+      primary: [train_step_time, samples_per_sec]
+      secondary: [energy/calls, energy/ms_per_sample, vram/peak_reserved_mb]
+      catastrophes: [batch/oom_events, gradnorm/nonfinite_steps]
+      unusable:
+        gpu/util_policy: 'run is shorter than the 7200 s window'
+    liveness:
+      - 'bwd/* present and changing'
+      - 'prior_buffer occupancy non-zero for the whole window'
+    noise_floor:
+      method: repeat_launch
+      repeats: 5
+      seed_policy: fixed
+      run_statistic: median
+      dispersion: relative_span
+      measured: null
+    correctness:
+      reference: paired_control
+      detail: 'elj-bwd-dataset-uncond is the same branch off a different sampler; the delta is buffer draw plus churn'
+      gate: 'pytest -m fast'
+      exactness: floor
+    comparison:
+      valid_against: [elj-bwd-dataset-uncond, elj-fwd-solo-uncond, elj-replay-solo-uncond, elj-fused-uncond]
+      rule: branch_ladder_paired_seed
+    purpose:
+      - 'separates the buffer draw and churn cost from the backward rollout cost'
+      - 'settles by measurement whether the prior draw triggers energy calls: read energy/calls'
+
+  - id: elj-fwd-solo-uncond
+    title: ELJ, fused stage driven to fwd only
+    status: specified
+    workload:
+      energy_function: elj
+      conditioning: unconditional
+      domain: molecule
+      space_groups: [2]
+      z_primes: [1]
+      T: 10
+      dataset: 'mipcas_sg2_zp1_elj_prior_dataset.pt'
+      dataset_in_repo: false
+    training_mode:
+      stage: equilibration
+      train_mode: fused
+      bwd_sampling_mode: prior
+      branches: [fwd]
+      isolation: deactivate_threshold
+    hardware:
+      class: local
+      local_adequate: true
+      a100_required: false
+      reason: analytic energy
+    work:
+      kind: fixed_steps
+      batch_size: 1000
+      pin_batch: true
+      resume_step: null
+      warmup_steps: 100
+      measure_steps: 400
+      epochs_formula: 'resume_step + warmup_steps + measure_steps'
+      wallclock_cap_s: 3600
+    overrides:
+      energy_function: elj
+      integrator: {T: 10}
+      eval_T: 10
+      batch_size: 1000
+      max_batch_size: 1000
+      eval_period: 100000000
+      controller: {refresh_every: 1000000}
+    metrics:
+      primary: [train_step_time, samples_per_sec, energy/ms_per_sample]
+      secondary: [energy/frac_of_step, energy/calls, vram/peak_reserved_mb]
+      catastrophes: [batch/oom_events, gradnorm/nonfinite_steps]
+      unusable:
+        gpu/util_policy: 'run is shorter than the 7200 s window'
+    liveness:
+      - 'fwd/* present and changing'
+      - 'bwd/* and replay/* FROZEN for the whole window (proof the branches were skipped, not merely down-weighted)'
+      - 'energy/calls > 0'
+    noise_floor:
+      method: repeat_launch
+      repeats: 5
+      seed_policy: fixed
+      run_statistic: median
+      dispersion: relative_span
+      measured: null
+    correctness:
+      reference: paired_control
+      detail: 'the fwd branch of elj-fused-uncond at the same batch and T'
+      gate: 'pytest -m fast'
+      exactness: floor
+    comparison:
+      valid_against: [elj-bwd-dataset-uncond, elj-bwd-prior-uncond, elj-replay-solo-uncond, elj-fused-uncond]
+      rule: branch_ladder_paired_seed
+    purpose:
+      - 'the on-policy rollout plus one full-batch energy call, alone'
+
+  - id: elj-replay-solo-uncond
+    title: ELJ, fused stage driven to replay only
+    status: specified
+    workload:
+      energy_function: elj
+      conditioning: unconditional
+      domain: molecule
+      space_groups: [2]
+      z_primes: [1]
+      T: 10
+      dataset: 'mipcas_sg2_zp1_elj_prior_dataset.pt'
+      dataset_in_repo: false
+    training_mode:
+      stage: equilibration
+      train_mode: fused
+      bwd_sampling_mode: prior
+      branches: [replay]
+      isolation: deactivate_threshold
+    hardware:
+      class: local
+      local_adequate: true
+      a100_required: false
+      reason: analytic energy
+    work:
+      kind: fixed_steps
+      batch_size: 1000
+      pin_batch: true
+      resume_step: null
+      warmup_steps: 100
+      measure_steps: 400
+      epochs_formula: 'resume_step + warmup_steps + measure_steps'
+      wallclock_cap_s: 3600
+    overrides:
+      energy_function: elj
+      integrator: {T: 10}
+      eval_T: 10
+      batch_size: 1000
+      max_batch_size: 1000
+      eval_period: 100000000
+      controller: {refresh_every: 1000000}
+    metrics:
+      primary: [train_step_time, samples_per_sec]
+      secondary: [energy/calls, vram/peak_reserved_mb]
+      catastrophes: [batch/oom_events, gradnorm/nonfinite_steps]
+      unusable:
+        gpu/util_policy: 'run is shorter than the 7200 s window'
+    liveness:
+      - 'replay/* present and changing'
+      - 'Replay Frac has NOT been folded into Bwd Frac (train.py:2157 fires on an empty buffer and silently makes this a bwd benchmark)'
+      - 'replay_buffer occupancy non-zero at every report'
+    noise_floor:
+      method: repeat_launch
+      repeats: 5
+      seed_policy: fixed
+      run_statistic: median
+      dispersion: relative_span
+      measured: null
+    correctness:
+      reference: paired_control
+      detail: 'stored trajectories are replayed exactly; the loss form matches fwd, only the sampler differs'
+      gate: 'pytest test_replay_gating.py'
+      exactness: floor
+    comparison:
+      valid_against: [elj-bwd-dataset-uncond, elj-bwd-prior-uncond, elj-fwd-solo-uncond, elj-fused-uncond]
+      rule: branch_ladder_paired_seed
+    purpose:
+      - 'the cheapest branch: a buffer draw and a scored replay, with no new energy call'
+
+  # ------------------------------------------------------ production shape --
+  - id: elj-fused-uncond
+    title: ELJ, fused, unconditional — the production shape
+    status: specified
+    workload:
+      energy_function: elj
+      conditioning: unconditional
+      domain: molecule
+      space_groups: [2]
+      z_primes: [1]
+      T: 10
+      dataset: 'mipcas_sg2_zp1_elj_prior_dataset.pt'
+      dataset_in_repo: false
+    training_mode:
+      stage: equilibration
+      train_mode: fused
+      bwd_sampling_mode: prior
+      branches: [fwd, bwd, replay]
+    hardware:
+      class: both
+      local_adequate: true
+      a100_required: false
+      reason: >-
+        local for step-cost deltas; the A100 for absolute throughput at production
+        batch and for anything the scheduler judges
+    work:
+      kind: fixed_steps
+      batch_size: 1000
+      pin_batch: true
+      resume_step: null
+      warmup_steps: 100
+      measure_steps: 400
+      epochs_formula: 'resume_step + warmup_steps + measure_steps'
+      wallclock_cap_s: 7200
+    overrides:
+      energy_function: elj
+      integrator: {T: 10}
+      eval_T: 10
+      batch_size: 1000
+      max_batch_size: 1000
+      eval_period: 100000000
+    metrics:
+      primary: [train_step_time, samples_per_sec, energy/frac_of_step]
+      secondary: [energy/ms_per_sample, energy/calls, gpu/util_recent, vram/peak_reserved_mb, step_time_max10]
+      catastrophes: [batch/oom_events, batch/ceiling_expiries, gradnorm/nonfinite_steps]
+      unusable:
+        gpu/util_policy: 'requires a run at least 7200 s long; see a100-batch-scaling-elj'
+    liveness:
+      - 'fwd/*, bwd/* and replay/* all present and changing'
+      - 'Replay Frac not folded into Bwd Frac'
+      - 'energy/calls > 0'
+    noise_floor:
+      method: repeat_launch
+      repeats: 5
+      seed_policy: fixed
+      run_statistic: median
+      dispersion: relative_span
+      measured: null
+    correctness:
+      reference: tier_c_repeat_spread
+      detail: >-
+        loss and metric traces of the same config run twice are the null
+        distribution; a change is indistinguishable from it or it is not equivalent
+      gate: 'python -m config_snapshot <base> <candidate> for tiers A and B'
+      exactness: floor
+    comparison:
+      valid_against: [elj-fused-uncond]
+      rule: same_hardware_class_paired_seed
+    purpose:
+      - 'the shape production runs; the reference workload for config-equivalence tier C'
+
+  - id: elj-fused-cond
+    title: ELJ, fused, molecule-conditional
+    status: specified
+    workload:
+      energy_function: elj
+      conditioning: conditional_molecule
+      domain: molecule
+      space_groups: [2]
+      z_primes: [1]
+      T: 10
+      dataset: 'QM9-anchored conditional prior + held-out test conditions'
+      dataset_in_repo: false
+    training_mode:
+      stage: equilibration
+      train_mode: fused
+      bwd_sampling_mode: prior
+      branches: [fwd, bwd, replay]
+    hardware:
+      class: both
+      local_adequate: true
+      a100_required: false
+      reason: >-
+        the frozen conditioner runs locally; production condition-library sizes and
+        held-out eval cost need the A100
+    work:
+      kind: fixed_steps
+      batch_size: 1000
+      pin_batch: true
+      resume_step: null
+      warmup_steps: 100
+      measure_steps: 400
+      epochs_formula: 'resume_step + warmup_steps + measure_steps'
+      wallclock_cap_s: 7200
+    overrides:
+      energy_function: elj
+      molecule_conditioning: true
+      integrator: {T: 10}
+      eval_T: 10
+      batch_size: 1000
+      max_batch_size: 1000
+      eval_period: 100000000
+    metrics:
+      primary: [train_step_time, samples_per_sec, energy/frac_of_step]
+      secondary: [energy/ms_per_sample, gpu/util_recent, vram/peak_reserved_mb]
+      catastrophes: [batch/oom_events, gradnorm/nonfinite_steps]
+      unusable:
+        gpu/util_policy: 'run is shorter than the 7200 s window'
+    liveness:
+      - 'fwd/*, bwd/* and replay/* all present and changing'
+      - 'the conditioner is evaluated every step (a frozen conditioner that is cached would change the cost profile)'
+      - 'more than one distinct condition_id appears in the window'
+    noise_floor:
+      method: repeat_launch
+      repeats: 5
+      seed_policy: fixed
+      run_statistic: median
+      dispersion: relative_span
+      measured: null
+    correctness:
+      reference: paired_unconditional_control
+      detail: 'elj-fused-uncond at the same batch, T and space group; the delta is the conditioning overhead'
+      gate: 'pytest test_condition_fractions.py'
+      exactness: floor
+    comparison:
+      valid_against: [elj-fused-cond, elj-fused-uncond]
+      rule: same_hardware_class_paired_seed
+    purpose:
+      - 'conditioning changes the model, the batch composition and the eval path; none of it is derivable from the unconditional profile'
+
+  # --------------------------------------------------------------- MLIP -----
+  - id: uma-fused-uncond
+    title: UMA, fused, unconditional
+    status: specified
+    workload:
+      energy_function: uma
+      conditioning: unconditional
+      domain: molecule
+      space_groups: [2]
+      z_primes: [1]
+      T: 10
+      dataset: 'mipcas_sg2_zp1 prior + UMA weights (mlip_path)'
+      dataset_in_repo: false
+    training_mode:
+      stage: equilibration
+      train_mode: fused
+      bwd_sampling_mode: prior
+      branches: [fwd, bwd, replay]
+    hardware:
+      class: both
+      local_adequate: partial
+      a100_required: true
+      reason: >-
+        local runs give valid step-cost DELTAS at a pinned small batch; absolute
+        throughput, occupancy and anything the scheduler judges require the A100
+    work:
+      kind: fixed_steps
+      batch_size: 100
+      pin_batch: true
+      resume_step: null
+      warmup_steps: 25
+      measure_steps: 200
+      epochs_formula: 'resume_step + warmup_steps + measure_steps'
+      wallclock_cap_s: 10800
+    overrides:
+      energy_function: uma
+      integrator: {T: 10}
+      eval_T: 10
+      batch_size: 100
+      max_batch_size: 100
+      cuda_memory_fraction: 0.7
+      eval_period: 100000000
+    metrics:
+      primary: [energy/ms_per_sample, train_step_time, samples_per_sec, energy/frac_of_step]
+      secondary: [energy/frac_outside_step, energy/calls, gpu/util_recent, vram/peak_reserved_mb]
+      catastrophes: [batch/oom_events, batch/ceiling_expiries, gradnorm/nonfinite_steps]
+      unusable:
+        gpu/util_policy: 'only meaningful on a run at least 7200 s long'
+        energy/mace_host_frac: 'the phase split is instrumented on the MACE route only; UMA has no equivalent'
+    liveness:
+      - 'fwd/*, bwd/* and replay/* all present and changing'
+      - 'energy/calls > 0'
+      - 'the neighbour-list fast path is TAKEN (a silent torch_cluster fallback reads as a slow GPU)'
+    noise_floor:
+      method: repeat_launch
+      repeats: 5
+      seed_policy: fixed
+      run_statistic: median
+      dispersion: relative_span
+      measured: null
+    correctness:
+      reference: control_comparison
+      detail: >-
+        UMA is not bit-reproducible on GPU; measure same-path repeat spread on the
+        same batch inside the same test and require cross-path spread not to exceed
+        it by more than a small factor. torch.equal is refused.
+      gate: 'mxtaltools/tests/test_uma_atomicdata_vectorisation.py, test_uma_gpu_real_batches.py'
+      exactness: floor
+      known_energy_floor:
+        value_ev: 4.0e-3
+        value_kj_mol: 0.1
+        conditions: 'RTX 5080, esen_s.pt, 12 CSD crystals, tf32 on; 9.2e-5 eV with tf32 off'
+    comparison:
+      valid_against: [uma-fused-uncond, mace-fused-uncond]
+      rule: same_hardware_class_paired_seed
+    purpose:
+      - 'the MLIP cost profile; the route where the energy call dominates the step'
+
+  - id: mace-fused-uncond
+    title: MACE, fused, unconditional
+    status: specified
+    workload:
+      energy_function: mace
+      conditioning: unconditional
+      domain: molecule
+      space_groups: [14]
+      z_primes: [1]
+      T: 10
+      dataset: 'acridine prior + MACE weights (mlip_path)'
+      dataset_in_repo: false
+    training_mode:
+      stage: equilibration
+      train_mode: fused
+      bwd_sampling_mode: prior
+      branches: [fwd, bwd, replay]
+    hardware:
+      class: both
+      local_adequate: partial
+      a100_required: true
+      reason: >-
+        same split as UMA; additionally the neighbour-list fast path must be shown
+        to be taken on BOTH classes, because its absence is silent
+    work:
+      kind: fixed_steps
+      batch_size: 100
+      pin_batch: true
+      resume_step: null
+      warmup_steps: 25
+      measure_steps: 200
+      epochs_formula: 'resume_step + warmup_steps + measure_steps'
+      wallclock_cap_s: 10800
+    overrides:
+      energy_function: mace
+      space_groups: [14]
+      integrator: {T: 10}
+      eval_T: 10
+      batch_size: 100
+      max_batch_size: 100
+      cuda_memory_fraction: 0.7
+      eval_period: 100000000
+    metrics:
+      primary: [energy/ms_per_sample, train_step_time, samples_per_sec, energy/frac_of_step]
+      secondary:
+        - energy/frac_outside_step
+        - energy/calls
+        - gpu/util_recent
+        - vram/peak_reserved_mb
+        - energy/mace_host_frac
+        - energy/mace_forward_frac
+        - energy/mace_build_s
+        - energy/mace_collate_s
+        - energy/mace_xfer_s
+        - energy/mace_forward_s
+        - energy/mace_calls
+      catastrophes: [batch/oom_events, gradnorm/nonfinite_steps]
+      unusable:
+        gpu/util_policy: 'only meaningful on a run at least 7200 s long'
+    liveness:
+      - 'fwd/*, bwd/* and replay/* all present and changing'
+      - 'energy/calls > 0'
+      - 'batched_pbc_neighbour_list fast path TAKEN — _pairs_by_radius_search returned non-None'
+      - 'energy/mace_* phase split present (it is the Phase 5.0 breakdown, and it exists only on this route)'
+    noise_floor:
+      method: repeat_launch
+      repeats: 5
+      seed_policy: fixed
+      run_statistic: median
+      dispersion: relative_span
+      measured: null
+    correctness:
+      reference: control_comparison
+      detail: >-
+        same discipline as UMA. Edge sets additionally admit an EXACT comparison —
+        the shift-grid range fails silently, dropping long edges while the energy
+        merely moves.
+      gate: 'mxtaltools/tests/test_pbc_neighbours.py, verify_mace_atomicdata_equivalence'
+      exactness: floor
+      known_energy_floor: null
+    comparison:
+      valid_against: [mace-fused-uncond, uma-fused-uncond]
+      rule: same_hardware_class_paired_seed
+    purpose:
+      - 'the second MLIP route; energy/mace_host_frac exists to say whether MACE splits host/device the way UMA does'
+
+  # ------------------------------------------------- surrounding machinery --
+  - id: elj-eval-cost
+    title: Evaluation and figure cost, isolated
+    status: specified
+    workload:
+      energy_function: elj
+      conditioning: unconditional
+      domain: molecule
+      space_groups: [2]
+      z_primes: [1]
+      T: 10
+      dataset: 'mipcas_sg2_zp1_elj_prior_dataset.pt'
+      dataset_in_repo: false
+    training_mode:
+      stage: equilibration
+      train_mode: fused
+      bwd_sampling_mode: prior
+      branches: [fwd, bwd, replay]
+    hardware:
+      class: both
+      local_adequate: true
+      a100_required: false
+      reason: eval cost is a share of wall clock and must be read on the class it is being charged to
+    work:
+      kind: fixed_evals
+      batch_size: 1000
+      pin_batch: true
+      resume_step: null
+      warmup_steps: 100
+      measure_steps: 2000
+      measure_evals: 8
+      epochs_formula: 'resume_step + warmup_steps + measure_steps'
+      wallclock_cap_s: 7200
+    overrides:
+      energy_function: elj
+      integrator: {T: 10}
+      eval_T: 10
+      batch_size: 1000
+      max_batch_size: 1000
+      eval_period: 250
+      figs_period: 500
+      eval_num_samples: 10000
+    metrics:
+      primary: [eval_step_time, eval_sampling_time, eval_figs_time]
+      secondary: [inter_eval_time, initialization_time, train_step_time, energy/frac_outside_step]
+      catastrophes: [batch/oom_events]
+      unusable:
+        samples_per_sec: 'the denominator counts training samples only; eval sampling is not in it'
+        energy/ms_per_sample: 'pools training and eval energy calls, which is the confound this benchmark exists to separate'
+    liveness:
+      - 'at least measure_evals evaluations fired'
+      - 'figs_period is a multiple of eval_period, so figures actually logged'
+    noise_floor:
+      method: repeat_launch
+      repeats: 5
+      seed_policy: fixed
+      run_statistic: median
+      dispersion: relative_span
+      measured: null
+    correctness:
+      reference: none_required
+      detail: 'this benchmark times a path whose correctness is covered elsewhere; it makes no claim about what eval computes'
+      gate: null
+      exactness: floor
+    comparison:
+      valid_against: [elj-eval-cost]
+      rule: same_hardware_class_paired_seed
+    purpose:
+      - 'eval and figures are the only work excluded from the throughput benchmarks; their share must be measured, not assumed'
+      - 'the one measurement on record (1.8 % of wall clock) is a single run on a single route'
+
+  - id: a100-batch-scaling-elj
+    title: A100 batch and occupancy scaling, ELJ
+    status: specified
+    workload:
+      energy_function: elj
+      conditioning: unconditional
+      domain: molecule
+      space_groups: [2]
+      z_primes: [1]
+      T: 10
+      dataset: 'mipcas_sg2_zp1_elj_prior_dataset.pt'
+      dataset_in_repo: false
+    training_mode:
+      stage: equilibration
+      train_mode: fused
+      bwd_sampling_mode: prior
+      branches: [fwd, bwd, replay]
+    hardware:
+      class: a100
+      local_adequate: false
+      a100_required: true
+      reason: >-
+        the question is what the cluster scheduler judges. A 16 GB laptop with no
+        scheduler cannot answer it at any batch.
+    work:
+      kind: fixed_steps_per_rung
+      batch_size: null
+      batch_rungs: [1000, 1650, 2722, 4491, 7410]
+      pin_batch: true
+      resume_step: null
+      warmup_steps: 100
+      measure_steps: 400
+      epochs_formula: 'resume_step + warmup_steps + measure_steps, per rung, one launch each'
+      wallclock_cap_s: 28800
+      min_wallclock_s: 7200
+    overrides:
+      energy_function: elj
+      integrator: {T: 10}
+      eval_T: 10
+      eval_period: 100000000
+    metrics:
+      primary: [samples_per_sec, gpu/util_policy, train_step_time]
+      secondary: [gpu/util_recent, vram/peak_reserved_mb, vram/cached_mb, energy/frac_of_step]
+      catastrophes: [batch/oom_events, batch/ceiling_expiries, batch/oom_ceiling]
+      unusable: {}
+    liveness:
+      - 'each rung ran at its declared batch for the whole window (Batch Size flat)'
+      - 'the run lasted at least min_wallclock_s, so gpu/util_policy window is filled'
+      - 'compile_policy resolved the same way on every rung'
+    noise_floor:
+      method: repeat_launch
+      repeats: 3
+      seed_policy: fixed
+      run_statistic: median
+      dispersion: relative_span
+      measured: null
+    correctness:
+      reference: tier_c_repeat_spread
+      detail: 'rungs differ only in batch; the loss trace is not compared across rungs, only the cost metrics'
+      gate: null
+      exactness: floor
+    comparison:
+      valid_against: [a100-batch-scaling-elj]
+      rule: within_suite_rungs
+    purpose:
+      - 'Phase 6 needs the throughput-vs-occupancy curve on the hardware that cancels jobs'
+      - 'batch IS the occupancy lever on an analytic energy and is NOT on the MLIP route; the two must be measured separately'
+
+suites:
+  local-dev:
+    description: Everything that runs on the dev box. The development smoke set.
+    benchmarks:
+      - toy-latentgauss-fused-uncond
+      - toy-multiharm-fused-cond
+      - elj-bwd-dataset-uncond
+      - elj-bwd-prior-uncond
+      - elj-fwd-solo-uncond
+      - elj-replay-solo-uncond
+      - elj-fused-uncond
+      - elj-fused-cond
+      - elj-eval-cost
+  branch-ladder:
+    description: >-
+      The four branch profiles on one energy, one T and one batch. Only comparable
+      to each other, and only paired by seed.
+    benchmarks:
+      - elj-bwd-dataset-uncond
+      - elj-bwd-prior-uncond
+      - elj-fwd-solo-uncond
+      - elj-replay-solo-uncond
+      - elj-fused-uncond
+  a100-throughput:
+    description: The standard A100 throughput suite.
+    benchmarks:
+      - elj-fused-uncond
+      - elj-fused-cond
+      - uma-fused-uncond
+      - mace-fused-uncond
+      - a100-batch-scaling-elj
+  mlip-cost:
+    description: The two MLIP routes, energy-call cost and its share of the step.
+    benchmarks:
+      - uma-fused-uncond
+      - mace-fused-uncond
+  conditional:
+    description: Conditioning overhead, toy and molecule.
+    benchmarks:
+      - toy-multiharm-fused-cond
+      - elj-fused-cond
+  determinism:
+    description: >-
+      The config-equivalence instruments. The toy is exact; the ELJ shape is
+      compared against its own measured repeat spread.
+    benchmarks:
+      - toy-latentgauss-fused-uncond
+      - elj-fused-uncond

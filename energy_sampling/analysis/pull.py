@@ -202,21 +202,26 @@ def _cloud_run(spec: str, project: str):
 def scan_cloud_history(run, keys: list[str], samples: int = 100000) -> dict:
     """Fetch history for keys already resolved against `run.summary`.
 
-    H1: pass only RESOLVED keys. `scan_history` returns zero rows silently when
-    any one requested key is absent -- measured: seven keys of which two were
-    absent returned 0 rows in 0.4 s and looked like a run with no data."""
+    H1: `keys` FILTERS CLIENT-SIDE; it is deliberately not forwarded to
+    `scan_history`. Server-side key selection returns only rows containing EVERY
+    requested key, so it zeroes the pull two different ways -- one absent key
+    (seven keys of which two were absent: 0 rows in 0.4 s, indistinguishable
+    from a run that did no work), and, even with every key resolved, any mix of
+    logging cadences (532 resolved keys on a 128k-step run: 0 rows). Streaming
+    all columns and filtering here is immune to both, and costs ~10 s for a
+    128k-step run because rows are sparse."""
     if not keys:
         return {}
-    want = list(dict.fromkeys(list(keys) + ['_step']))
+    want = set(keys)
     series: dict[str, tuple[list, list]] = {}
     step = None
-    for row in run.scan_history(keys=want, page_size=10000):
+    for row in run.scan_history(page_size=10000):
         if '_step' in row and row['_step'] is not None:
             step = row['_step']
         if step is None:
             continue
         for k, v in row.items():
-            if k == '_step' or v is None or isinstance(v, bool):
+            if k == '_step' or k not in want or v is None or isinstance(v, bool):
                 continue
             if isinstance(v, (int, float)) and np.isfinite(v):
                 s, vals = series.setdefault(k, ([], []))

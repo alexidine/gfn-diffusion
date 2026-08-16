@@ -943,11 +943,13 @@ class CrystalBuffer:
         here: it stores |resid|, and the sign is exactly what the one-sided
         priority needs.
 
-        ONE-SIDED BY DEFAULT: delta_plus = max(delta, 0). A row the policy has
-        moved off has a fallen log_pf and therefore a strongly NEGATIVE delta,
-        so it takes priority ~0 automatically -- which is both the intended
-        replay/backward split (B2) and, incidentally, most of what the drift
-        term was introduced to do (B8).
+        ONE-SIDED BY DEFAULT -- but the canonical config overrides it, so read
+        `symmetric` below before assuming this is the operating mode.
+        delta_plus = max(delta, 0). A row the policy has moved off has a fallen
+        log_pf and therefore a strongly NEGATIVE delta, so it takes priority ~0
+        automatically -- which is both the intended replay/backward split (B2)
+        and, incidentally, most of what the drift term was introduced to do
+        (B8).
 
         ABSORBING STARVATION, one-sided mode only: p == 0 rows are never drawn,
         and ema_logw is written ONLY at draw time (update_logw_stats, called
@@ -957,13 +959,15 @@ class CrystalBuffer:
         row's own estimate being refreshed. That escape closes once log_z
         converges, which is the expected end state, not a corner case: the
         row's residual becomes a frozen, unfalsifiable snapshot for the rest of
-        the run. This is a plausible mechanism behind the monotonic
-        is_elig_frac drift F-003 measured (0.74 -> 0.33 over 1500 steps) --
-        a one-way exclusion ratchets, it does not equilibrate. `symmetric`
-        closes this trap as a side effect of what it is for: elig = |delta| > 0
-        is false only at exact float equality, so every row stays eligible,
-        gets floored, and keeps getting redrawn regardless of which side of
-        zero it is on -- there is no absorbing region left to fall into.
+        the run. A one-way exclusion ratchets rather than equilibrating, and the
+        measured is_elig_frac drift (0.74 -> 0.33, monotonic) is that ratchet.
+        `symmetric` closes the trap as a side effect of what it is for:
+        elig = |delta| > 0 is false only at exact float equality, so every row
+        stays eligible, gets floored, and keeps getting redrawn regardless of
+        which side of zero it is on -- there is no absorbing region left to fall
+        into, and is_elig_frac holds at 1.0. THE CANONICAL CONFIG SHIPS
+        `symmetric: true`, so that is the operating mode here; whether it also
+        closes the forward-tail fit gap is not yet measured.
 
         Unvisited rows (ema_logw NaN) get the nan_quantile of the observed
         delta_plus, matching _loss_weights' policy: moderately hard, visited

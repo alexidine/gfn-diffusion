@@ -1,0 +1,168 @@
+# Problem definitions.
+#
+# WHAT BELONGS HERE: settings intrinsic to WHICH PROBLEM is being solved -- the
+# energy function, the data paths, the conditioning flags, space groups,
+# temperature, and the handful of model/buffer settings that follow from the
+# domain rather than from tuning. Selecting a problem should be the whole of
+# switching modes.
+#
+# WHAT DOES NOT BELONG HERE: anything a run might tune. If a key is being set
+# differently per problem because it happened to be tuned that way, that is a
+# mode-safety defect in mk_dev.yaml, not a problem property -- fix it there so
+# both settings coexist and the inactive one is inert. The predecessor of this
+# file (mode_presets.yaml) carried a dozen such keys plus a whole alternate
+# protocol block, which is what made a mode switch an editing exercise.
+#
+# THE PROTOCOL IS THE ONE STRUCTURAL EXCEPTION. A conditional route genuinely
+# needs different stages (var_conditioning has no meaning with one condition:
+# condition-grouped VarGrad over a single group is identically zero), so a
+# problem may name a protocol. It is named, not inlined, so this file stays a
+# registry rather than becoming a second config.
+#
+# STATUS: this file is a REGISTRY, and consuming it from train.py is Phase 2 of
+# docs/design/infrastructure_stabilization.md (the generator reads it). Until
+# then it is authoritative as documentation and is validated by tests, which is
+# already more than its predecessor managed -- that one was explicitly "never
+# loaded by train.py" and drifted.
+
+schema: 1
+
+# --------------------------------------------------------------------------
+# Domain rules -- why the per-problem values below are what they are. These are
+# derivations, not preferences, so they are stated once here rather than
+# repeated in every entry.
+#
+# periodic_centroids: TRUE for crystals, FALSE for toys. It wraps the aunit
+#   centroid dims whose aunit spans the full cell width, so the SDE flows
+#   through the aunit face instead of piling against the bounding-energy wall.
+#   Toys have no cell.
+#
+# anchor seed_source: what a "good sample" is differs by domain.
+#   toy (conditional and unconditional): the prior dataset is a broad junk
+#     Gaussian while the CONDITIONS file holds genuine target-distribution
+#     samples, so anchors seed from the conditions file -- handing over the
+#     answer set deliberately, because these runs study convergence dynamics
+#     rather than mode discovery.
+#   unconditional molecule: the prior is already high quality (not the target),
+#     so anchors seed from it.
+#   conditional molecule: seed from reasonable samples; per-condition coverage
+#     will be partial and that is expected.
+#
+# temperature: room-temperature kT in kJ/mol for real crystals; 1.0 for toys,
+#   where the energy is already in natural units.
+# --------------------------------------------------------------------------
+
+problems:
+
+  # ---- unconditional molecule (the canonical route) --------------------
+  mipcas_elj:
+    description: >
+      Single-molecule ELJ crystals, space group 2, Z'=1. The route
+      configs/mk_dev.yaml is written against.
+    domain: molecule
+    conditioning: unconditional
+    energy_function: elj
+    space_groups: [ 2 ]
+    z_primes: [ 1 ]
+    vector_conditioning: false
+    molecule_conditioning: false
+    prior_path: 'D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt'
+    molecules_path: 'D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt'
+    test_molecules_path: null
+    temperature: 2.5
+    analyze_kwargs: { }
+    model:
+      periodic_centroids: true
+    buffers:
+      anchor_buffer:
+        seed_source: prior_dataset
+
+  # ---- conditional toy --------------------------------------------------
+  toy_big_unif:
+    description: >
+      Multiharmonic latent field with per-sample condition vectors. Studies
+      conditional convergence dynamics with the target set known.
+    domain: toy
+    conditioning: conditional
+    energy_function: latent_multiharmonic
+    space_groups: [ 1 ]
+    z_primes: [ 1 ]
+    vector_conditioning: true
+    vector_conditioning_dim: 3
+    molecule_conditioning: false
+    prior_path: 'D:\crystal_datasets\conditional\priors\toy_big_unif_prior.pt'
+    molecules_path: 'D:\crystal_datasets\conditional\priors\toy_big_unif_conditions.pt'
+    test_molecules_path: 'D:\crystal_datasets\conditional\priors\toy_big_unif_test_conditions.pt'
+    temperature: 1.0
+    # MUST match the generator run's latent_field block (toy_prior_config.yaml).
+    # A mismatch is not an error -- it scores against a different field.
+    analyze_kwargs:
+      cond_dim: 3
+      n_core: 16
+      n_ghost: 16
+      sigma_range: [ 0.04, 0.12 ]
+      aniso_scale: 0.4
+      depth_range: [ 0.0, 4.0 ]
+      mu_scale: 0.5
+      disp_max: 0.3
+      logsig_scale: 0.25
+      gate_steep: 4.0
+      edge_sigmas: 0.1
+      max_temperature: 1.0
+      max_width: 2.5
+      seed: 0
+    model:
+      periodic_centroids: false
+    buffers:
+      anchor_buffer:
+        seed_source: 'D:\crystal_datasets\conditional\priors\toy_big_unif_conditions.pt'
+    protocol: conditional_vargrad
+
+  # ---- unconditional toy ------------------------------------------------
+  toy_hard_uncond_multi:
+    description: >
+      16-core/16-ghost multiharmonic field, single identifier mode_a. The
+      unconditional toy control.
+    domain: toy
+    conditioning: unconditional
+    energy_function: latent_multiharmonic
+    space_groups: [ 1 ]
+    z_primes: [ 1 ]
+    vector_conditioning: false
+    molecule_conditioning: false
+    prior_path: 'D:\crystal_datasets\conditional\priors\toy_hard_uncond_multi_prior.pt'
+    molecules_path: 'D:\crystal_datasets\conditional\priors\toy_hard_uncond_multi_conditions.pt'
+    test_molecules_path: null
+    temperature: 1.0
+    # must match this prior's own generator block, as above
+    analyze_kwargs: { }
+    model:
+      periodic_centroids: false
+    buffers:
+      anchor_buffer:
+        seed_source: 'D:\crystal_datasets\conditional\priors\toy_hard_uncond_multi_conditions.pt'
+
+  # ---- latent_gaussian (the analytic toy) -------------------------------
+  latent_gaussian:
+    description: >
+      Closed-form log Z, so a run can be scored against truth rather than
+      against another run. Deterministic, which makes it the reference workload
+      for exact before/after comparison (docs/design/infrastructure_stabilization.md
+      §1, tier C).
+    domain: toy
+    conditioning: unconditional
+    energy_function: latent_gaussian
+    space_groups: [ 1 ]
+    z_primes: [ 1 ]
+    vector_conditioning: false
+    molecule_conditioning: false
+    prior_path: null
+    molecules_path: null
+    test_molecules_path: null
+    temperature: 1.0
+    analyze_kwargs: { }
+    model:
+      periodic_centroids: false
+    buffers:
+      anchor_buffer:
+        seed_source: prior_dataset

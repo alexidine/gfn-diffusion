@@ -41,8 +41,54 @@ The last three are the ones that still matter, because they describe faults a
 *new* config can reproduce. All three are now asserted in `config_invariants.py`,
 which is what stops them recurring.
 
-Next: Phase 1, gated on the commit. Phase 3b Tier 1 and Phase 5.0/5.1 are
-independent of it.
+**Phase 1 in progress** (tree committed at `7625d09`):
+
+- **1.0 comparator — DONE.** `config_snapshot.py` + 16 tests. Snapshots the
+  *resolved* config (so `auto` is the number it will train at), the parsed
+  protocol, and each stage's effective loss coefficients computed by the
+  trainer's own `StageProtocol.coeffs` rather than a copy of the overlay rule.
+  `compare()` splits CHANGED / ADDED / REMOVED, because consolidation adds keys
+  by design and a text diff drowns in that. Validated on the case that matters: a
+  single loss coefficient altered inside a full file reordering is caught, while
+  the reordering alone passes clean. The loop is two commands, baseline from git:
+
+      git show HEAD:energy_sampling/configs/mk_dev.yaml > /tmp/base.yaml
+      python -m config_snapshot /tmp/base.yaml configs/mk_dev.yaml
+
+- **1.1 mode safety — static half DONE.** `test_mode_safety.py`, 13 tests. Eleven
+  keys the canonical config documents as inert are now checked to have no
+  *derived* effect, so those comments are executable. Two mutations prove the
+  check can see a live key. The **runtime half is not built**: proving the
+  trainer never reads a key needs a run, which needs a smoke harness that does
+  not exist yet — and that same harness is what tier C of the acceptance
+  criterion needs. It is the next piece of work, not an afterthought.
+
+- **1.4 `problems.yaml` — DONE.** `mode_presets.yaml` is retired. It had declared
+  itself "Reference only — never loaded by train.py" and drifted exactly as an
+  unexecuted reference does: it prescribed **seven keys that are now retired and
+  hard-fail at load**, taught the deleted `anchor × 25/T` learning-rate rule, and
+  labelled its worked example the "current mk_dev state" at W256/T40 when the file
+  was W512/T10. Replaced by `configs/problems.yaml` — problem-intrinsic settings
+  only, with 18 tests including one that rejects any retired key and one that
+  rejects a tuning knob leaking in. Its durable half (the intensive/extensive
+  derivation) moved to `docs/design/width_and_length_scaling.md`.
+
+- **LR sensors — DONE.** Both canonical stages now declare one (`train_prior`
+  hyper β=0.1, `equilibration` ray); previously neither did, so all four `auto`
+  rates sat at the seed for entire runs. `auto` now *requires* an adaptive sensor
+  at load. The old gate tested `ray_calibration.enabled`, which passed mk_dev
+  while nothing asked and would have rejected a legitimate hyper-only config.
+
+**1.2 is PARTLY done and the remainder is the substantive half.** Retiring
+`mode_presets` removed the *list* of per-mode keys; it did not make those keys
+mode-safe. `dplr_rank`/`dplr_rho_max`, the three `condition_log_z.*_tb_z_source`
+keys, `half_life_visits`, `z_calibration.enabled` and `lr_flow` still carry only
+their unconditional values in the canonical config, and a conditional run still
+needs them changed. Making both coexist — with the inactive one provably inert —
+is what 1.2 has left, and it is gated on nothing.
+
+1.3 (comment discipline) is deliberately held until the §4 audit lands, so the
+rewrite is driven by its work list rather than duplicating it.
 
 ---
 

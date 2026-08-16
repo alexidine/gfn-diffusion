@@ -149,6 +149,115 @@ def test_pinned_frac_disagreeing_with_fracs(canonical):
     assert _fires(cfg, 'pinned_frac_matches_fracs')
 
 
+def test_auto_lr_with_no_sensor_anywhere_is_an_error(canonical):
+    """`auto` claims a servo owns the rate. With no adaptive sensor nothing moves
+    peak_scale off 1.0, so the run trains at the seed for its whole life while the
+    config reads as adaptive."""
+    cfg = copy.deepcopy(canonical)
+    for st in cfg['protocol']['stages']:
+        st.pop('lr_sensor', None)
+    assert _fires(cfg, 'auto_lr_requires_an_adaptive_sensor')
+
+
+def test_auto_lr_with_sensor_kind_none_is_also_an_error(canonical):
+    """`{kind: none}` and an omitted block mean the same thing. Only the second
+    is silent, but neither owns an `auto` rate."""
+    cfg = copy.deepcopy(canonical)
+    for st in cfg['protocol']['stages']:
+        st['lr_sensor'] = {'kind': 'none'}
+    assert _fires(cfg, 'auto_lr_requires_an_adaptive_sensor')
+
+
+def test_one_stage_missing_a_sensor_still_fires(canonical):
+    """Checked PER STAGE: a sensor on the terminal stage does nothing for a
+    phase-1 learning rate."""
+    cfg = copy.deepcopy(canonical)
+    cfg['protocol']['stages'][0].pop('lr_sensor', None)
+    v = [x for x in check(cfg) if x.rule == 'auto_lr_requires_an_adaptive_sensor']
+    assert len(v) == 1 and repr(cfg['protocol']['stages'][0]['name']) in v[0].detail
+
+
+def test_explicit_float_lrs_need_no_sensor(canonical):
+    """The other half of the rule: a float is a fixed peak that takes the warmup
+    envelope and divergence handling only, so it has nothing to yield to and must
+    not be flagged."""
+    cfg = copy.deepcopy(canonical)
+    for k in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'):
+        cfg[k] = 3.0e-4
+    for st in cfg['protocol']['stages']:
+        st.pop('lr_sensor', None)
+    assert not _fires(cfg, 'auto_lr_requires_an_adaptive_sensor')
+
+
+def test_auto_keys_survives_resolution_destroying_the_evidence(canonical):
+    """THE bug this parameter exists for.
+
+    `resolve_derived_config` overwrites the string `auto` with the seed float in
+    place. A caller running after it sees four ordinary numbers, so re-deriving
+    the auto set from the config finds none and the rule passes on exactly the
+    configs it exists to reject -- silently. Such a caller must pass the
+    managed-key list it already computed."""
+    resolved = copy.deepcopy(canonical)
+    for k in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'):
+        resolved[k] = 1.25e-4                       # as resolution leaves it
+    for st in resolved['protocol']['stages']:
+        st.pop('lr_sensor', None)
+
+    # derived from the config: the evidence is gone, so nothing fires
+    assert ci.auto_lr_requires_an_adaptive_sensor(resolved) == []
+    # told what was managed: fires correctly
+    told = ci.auto_lr_requires_an_adaptive_sensor(
+        resolved, auto_keys=['lr_policy', 'lr_back', 'lr_replay', 'lr_fused'])
+    assert told and all(v.severity == ERROR for v in told)
+
+
+def test_ray_on_a_non_fused_stage_is_an_error(canonical):
+    """The probe draws from replay and scores replay_loss_coeffs; a bwd stage
+    trains neither, so it would rate a loss nobody is optimising -- silently."""
+    cfg = copy.deepcopy(canonical)
+    cfg['protocol']['stages'][0]['lr_sensor'] = {'kind': 'ray'}   # train_prior is bwd
+    assert _fires(cfg, 'ray_sensor_needs_a_coherent_stage')
+
+
+def test_ray_on_a_fused_stage_without_replay_tb_is_an_error(canonical):
+    cfg = copy.deepcopy(canonical)
+    st = cfg['protocol']['stages'][1]
+    assert st['train_mode'] == 'fused', 'fixture assumption'
+    st.setdefault('loss_coeffs', {}).setdefault('replay', {})['tb'] = 0.0
+    assert _fires(cfg, 'ray_sensor_needs_a_coherent_stage')
+
+
+def test_hyper_is_accepted_on_a_non_fused_stage(canonical):
+    """`hyper` reads no loss, so unlike `ray` it is coherent whatever the stage
+    trains. Flagging it would push people back to omitting the block."""
+    cfg = copy.deepcopy(canonical)
+    cfg['protocol']['stages'][0]['lr_sensor'] = {'kind': 'hyper', 'beta': 0.05}
+    assert not _fires(cfg, 'ray_sensor_needs_a_coherent_stage')
+    assert not _fires(cfg, 'auto_lr_requires_an_adaptive_sensor')
+
+
+def test_periodic_centroids_with_two_space_groups_is_an_error(canonical):
+    """The feature bakes a per-SG axis set into the model's expanded_dim, so two
+    space groups would be intersected into a weaker or empty wrap, silently."""
+    assert _fires(broken(canonical, space_groups=[2, 14]),
+                  'periodic_centroids_needs_one_crystal_space_group')
+
+
+def test_periodic_centroids_on_a_toy_is_an_error(canonical):
+    """A toy has no cell to wrap."""
+    assert _fires(broken(canonical, energy_function='latent_multiharmonic'),
+                  'periodic_centroids_needs_one_crystal_space_group')
+
+
+def test_the_rule_abstains_when_periodic_centroids_is_off(canonical):
+    """Mutation: with the feature off, neither condition is a fault -- a toy with
+    several space groups is an ordinary config."""
+    cfg = broken(canonical, space_groups=[2, 14],
+                 energy_function='latent_multiharmonic')
+    cfg['model']['periodic_centroids'] = False
+    assert not _fires(cfg, 'periodic_centroids_needs_one_crystal_space_group')
+
+
 def test_effective_batch_below_baseline_is_a_baseline_not_an_error(canonical):
     cfg = broken(canonical, batch_size=100, max_batch_size=100,
                  fused_grad_accum_min_samples=0)

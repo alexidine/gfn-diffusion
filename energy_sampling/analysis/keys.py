@@ -427,3 +427,242 @@ def live_keys(resolutions: Iterable[Resolution]) -> list[str]:
 
 def is_ema(key: str) -> bool:
     return key.startswith(EMA_PREFIXES)
+
+
+# ---------------------------------------------------------------------------
+# Config key literals
+# ---------------------------------------------------------------------------
+# Config names are literals for the same reason metric names are: a rename
+# upstream must stay a one-file change. `%d` is a stage index, `%s` a mode or a
+# metric tag.
+
+CFG_STAGE = 'protocol_stages_%d_%s'          # stage-scoped key
+CFG_STAGE_NAME = 'protocol_stages_%d_name'
+CFG_STAGE_TRAIN_MODE = 'protocol_stages_%d_train_mode'
+CFG_STAGE_EXIT_METRIC = 'protocol_stages_%d_exit_%d_metric'
+CFG_STAGE_EXIT_ABOVE = 'protocol_stages_%d_exit_%d_above'
+CFG_STAGE_EXIT_BELOW = 'protocol_stages_%d_exit_%d_below'
+CFG_STAGE_BALANCE_METRIC = 'protocol_stages_%d_balance_metrics_%s'
+CFG_STAGE_LR_SENSOR_METRIC = 'protocol_stages_%d_lr_sensor_metrics_%d'
+CFG_STAGE_BUFFER_SERVO_NUM = 'protocol_stages_%d_buffer_servo_numerator'
+CFG_STAGE_BUFFER_SERVO_DEN = 'protocol_stages_%d_buffer_servo_denominator'
+CFG_STAGE_DEACTIVATE = 'deactivate_threshold'          # stage-scoped tail
+CFG_ANCHOR_GATE_CEILING_METRIC = 'buffers_anchor_buffer_health_gate_ceiling_metric'
+CFG_ANCHOR_GATE_FLOOR_METRIC = 'buffers_anchor_buffer_health_gate_floor_metric'
+
+# §4 confounds, all config-level.
+CFG_EVAL_T = 'eval_T'
+CFG_TRAIN_T = 'integrator_T'
+CFG_CHECKPOINT_NAME = 'checkpoint_name'
+CFG_CONTINUE_FROM_CHECKPOINT = 'continue_from_checkpoint'
+CFG_PRIOR_PATH = 'prior_path'
+CFG_ENERGY_FUNCTION = 'energy_function'
+CFG_SEED = 'seed'
+CFG_RUN_NAME = 'run_name'
+CFG_TAG = 'tag'
+CFG_EPOCHS = 'epochs'
+CFG_WANDB_BLOB = '_wandb'                    # carries the git commit and argv
+
+# Config keys that identify a run rather than configure it. A sweep table that
+# lists these as "knobs that differ" is listing noise: every arm differs in its
+# name, and comparing arms is the whole point.
+CFG_IDENTITY = (CFG_RUN_NAME, CFG_TAG, CFG_WANDB_BLOB, CFG_EPOCHS,
+                'Experiment', 'checkpoints_dir', 'device')
+
+# The steps counter, and the run-position metric.
+STEP_KEY = '_step'
+
+
+def git_commit(config: dict, metadata: Optional[dict] = None) -> Optional[str]:
+    """The commit the run actually executed, or None.
+
+    §4's first confound is code version drift between arms, and the stamp is not
+    where it looks like it should be: wandb buries it in the `_wandb` config
+    blob under a per-machine hash key, and `wandb-metadata.json` carries a second
+    copy. Both are read, blob first, because the blob survives the cloud API."""
+    for src in (config, ):
+        blob = _value(src, CFG_WANDB_BLOB)
+        if isinstance(blob, dict):
+            for entry in (blob.get('e') or {}).values():
+                if isinstance(entry, dict):
+                    commit = (entry.get('git') or {}).get('commit')
+                    if commit:
+                        return str(commit)
+    if isinstance(metadata, dict):
+        commit = (metadata.get('git') or {}).get('commit')
+        if commit:
+            return str(commit)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Mechanism registry -- R2
+# ---------------------------------------------------------------------------
+# R2 is the highest-value check in the package: for every mechanism a config
+# declares active, assert a nonzero activation trace. An inert mechanism does not
+# give a null result -- it VOIDS the arm while looking like an answer, and it has
+# repeatedly made whole batteries meaningless.
+#
+# EVERY ENTRY BELOW IS VERIFIED against the local run corpus (182 directories,
+# 85 with a config and summary). An unverified declaration-to-trace pair is worse
+# than a missing one: it manufactures findings on runs that are fine, and a
+# check that cries wolf is switched off. Pairs that could not be verified are
+# named in `docs/module_analysis.md` rather than guessed at here.
+#
+# Two traps this registry encodes, both of which produced a wrong reading during
+# its construction:
+#
+#  * `protocol/bs_boost` is exp(log_boost), so it reads 1.0 -- NONZERO -- while
+#    the servo is doing nothing. The actuator is `protocol/bs_log_boost`, which
+#    is 0 when idle. A trace that is nonzero at rest is not a trace.
+#  * `ray_calibration.enabled` and the stage's `lr_sensor.kind: ray` are
+#    DIFFERENT declarations, and the trainer's own startup check warns when they
+#    disagree. Both are registered; they answer different questions.
+
+
+class Declare(str, Enum):
+    """How a config key declares its mechanism active."""
+
+    POSITIVE = 'positive'      # numeric and > 0
+    TRUTHY = 'truthy'          # bool True, nonzero number, or non-empty string
+    NOT_NULL = 'not_null'      # present and not None
+    EQUALS = 'equals'          # string equality with `declares_value`
+
+
+class Rule(str, Enum):
+    """How a trace shows the mechanism fired."""
+
+    NONZERO = 'nonzero'        # active on ticks where |v| exceeds the floor
+    MOVES = 'moves'            # active on ticks where v differs from v[0]
+    COUNTER = 'counter'        # monotone event counter; events = last - first
+
+
+@dataclass(frozen=True)
+class Mechanism:
+    """One declared-active mechanism and the trace that proves it ran."""
+
+    name: str
+    scope: str                       # 'stage' or 'global'
+    declared_by: str                 # config key ('stage' scope omits prefix)
+    declares: Declare
+    trace: tuple[str, ...]           # ANY of these firing counts as fired
+    rule: Rule
+    declares_value: str = ''         # for Declare.EQUALS
+    threshold_key: str = ''          # config key supplying the activation floor
+    note: str = ''
+
+
+# 'stage'-scoped `declared_by` values are tails: the reader prefixes
+# `protocol_stages_<current stage>_`.
+MECHANISMS = (
+    # --- allocation. R1 reads the allocation before the metric, and R2's
+    # canonical case is "a frac below its deactivation threshold": the branch is
+    # configured on, the controller has driven it under the floor, and it
+    # contributes nothing while the config still claims it does.
+    Mechanism('frac.fwd', 'stage', 'fracs_fwd', Declare.POSITIVE,
+              ('Fwd Frac',), Rule.NONZERO, threshold_key=CFG_STAGE_DEACTIVATE,
+              note='forward branch share; floor is the stage deactivate_threshold'),
+    Mechanism('frac.bwd', 'stage', 'fracs_bwd', Declare.POSITIVE,
+              ('Bwd Frac',), Rule.NONZERO, threshold_key=CFG_STAGE_DEACTIVATE),
+    Mechanism('frac.replay', 'stage', 'fracs_replay', Declare.POSITIVE,
+              ('Replay Frac',), Rule.NONZERO, threshold_key=CFG_STAGE_DEACTIVATE),
+
+    # --- the balance controller. Which trace exists depends on the KIND, so the
+    # kinds are separate mechanisms rather than one with a union of traces: a
+    # union would report a ratio controller as fired because the proportional
+    # keys are absent, which is the wrong answer twice over.
+    Mechanism('balance.ratio', 'stage', 'balance_kind', Declare.EQUALS,
+              ('protocol/rt_theta', 'protocol/rt_err'), Rule.MOVES,
+              declares_value='ratio',
+              note='rt_theta is the logit it actually steers'),
+    Mechanism('balance.proportional', 'stage', 'balance_kind', Declare.EQUALS,
+              ('protocol/prop_target', 'protocol/prop_drive_fwd',
+               'protocol/prop_drive_bwd', 'protocol/prop_drive_replay'),
+              Rule.MOVES, declares_value='proportional'),
+
+    # --- the replay buffer residence servo.
+    Mechanism('buffer_servo', 'stage', 'buffer_servo_gain', Declare.POSITIVE,
+              ('protocol/bs_log_boost',), Rule.NONZERO,
+              note='bs_log_boost is 0 at rest; bs_boost is exp() of it and '
+                   'reads 1.0 while idle, so it cannot serve as the trace'),
+
+    # --- LR sensors. Two independent declarations, deliberately both here.
+    Mechanism('lr_sensor.ray', 'stage', 'lr_sensor_kind', Declare.EQUALS,
+              ('lr_ctrl/calibrations',), Rule.COUNTER, declares_value='ray',
+              note='per-stage opt-in; the trainer errors if a stage asks for '
+                   'ray while ray_calibration.enabled is false'),
+    Mechanism('lr_sensor.loss_slope', 'stage', 'lr_sensor_kind', Declare.EQUALS,
+              ('lr_ctrl/slope_cuts',), Rule.COUNTER, declares_value='loss_slope'),
+    Mechanism('ray_calibration', 'global', 'ray_calibration_enabled',
+              Declare.TRUTHY, ('lr_ctrl/calibrations',), Rule.COUNTER,
+              note='the global block. Enabled with no stage opting in leaves it '
+                   'inert (parameters only) -- measured on 14 of 21 runs that '
+                   'declare it'),
+    Mechanism('adaptive_lr', 'global', 'adaptive_lr_seed_lr', Declare.POSITIVE,
+              ('lr_ctrl/scale',), Rule.MOVES),
+
+    # --- Z calibration. Measured inert on 11 of 69 runs that enable it.
+    Mechanism('z_calibration', 'global', 'z_calibration_enabled', Declare.TRUTHY,
+              ('z_cal/steps', 'z_cal/p'), Rule.NONZERO),
+
+    # --- the MLE slope gate. `gates/mle_flat` is published to the protocol but
+    # never logged as a metric, so the streak counter is its ONLY trace.
+    Mechanism('mle_gate', 'stage', 'flags_mle_gate', Declare.TRUTHY,
+              ('protocol/exit_streak_gates_mle_flat',), Rule.NONZERO,
+              note='measured inert on 10 of 14 runs that enable it'),
+
+    # --- prioritised replay draw.
+    Mechanism('replay_prioritise', 'global',
+              'buffers_replay_buffer_prioritise_enabled', Declare.TRUTHY,
+              ('replay/is_elig_frac',), Rule.NONZERO),
+)
+
+# Generated mechanisms. These are families, not fixed entries: the set depends on
+# what the config declares, so they are templates the check expands.
+#
+# LOSS_COEFF_TRACE is the strongest liveness evidence in the run, because it is
+# the coefficient the trainer is ACTUALLY holding, after the stage's overrides.
+# It is a CHANGE-ONLY channel -- emitted at eval time and only when a value
+# moved -- so it must be read from the SUMMARY (which holds the last value) and
+# not from history, where it is a 1-2 point series that the local parser drops.
+LOSS_COEFF_TRACE = 'loss_coeffs/%s_/%s'
+LOSS_COEFF_IS_SUMMARY_ONLY = True
+
+# One per stage exit condition. `tag` is the metric name with '/' -> '_'.
+EXIT_STREAK_TRACE = 'protocol/exit_streak_%s'
+# The live annealed bar for the same condition, in the metric's own units. R13:
+# never ratchet a threshold below a floor you have not measured.
+EXIT_THRESHOLD_TRACE = 'protocol/thr_%s'
+
+
+def metric_tag(metric: str) -> str:
+    """`bwd/tbc` -> `bwd_tbc`, the form the protocol uses in its own key names."""
+    return metric.replace('/', '_')
+
+
+# ---------------------------------------------------------------------------
+# R11 -- replay overfitting
+# ---------------------------------------------------------------------------
+# Replay is drawn from higher-residual trajectories by construction, so its error
+# sits ABOVE the forward error. Below 1x means rows are being corrected faster
+# than they are replaced. The ratio is reported; the bands are the doc's, and the
+# check states which band the number is in, not what it means.
+R11_NUMERATOR = 'replay/scatter_err'
+R11_DENOMINATOR = 'fwd/scatter_err'
+R11_HEALTHY_RATIO = 2.0
+R11_OVERFIT_BELOW = 1.0
+# TB route only. On the VarGrad route the check reports NA_ROUTE and stops.
+R11_ROUTES = (Route.TB_UNCONDITIONAL, Route.MLE_PRIOR)
+
+
+# ---------------------------------------------------------------------------
+# R14 -- censoring bounds
+# ---------------------------------------------------------------------------
+# A censored estimator reported AT its censoring bound is not a reading. These
+# are the bounds this codebase imposes, with the series they clamp.
+CENSORED = {
+    # ray_calibration clamps its t-statistics to +/-99 before logging.
+    'raycal/t_': 99.0,
+}
+# Config keys that name a clip a series can pin against.
+CFG_CLIP_KEYS = ('gradient_norm_clip', 'model_gfn_clip')

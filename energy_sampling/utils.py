@@ -420,6 +420,35 @@ def _is_auto(v):
     return v is None or (isinstance(v, str) and v.strip().lower() == 'auto')
 
 
+def _require_adaptive_sensor(args, managed, seed_lr):
+    """Every stage must have something that can move a servo-managed LR.
+
+    Per stage, not globally: a sensor on the terminal stage does nothing for a
+    phase-1 rate, and a run whose phase 1 is pinned at the seed while the config
+    reads as adaptive is the same silent failure as one with no sensor at all.
+
+    The rule and its message are shared with
+    `config_invariants.auto_lr_requires_an_adaptive_sensor`, which reports the
+    same condition without raising; this is the load gate."""
+    import config_invariants
+
+    # `managed` is passed explicitly: this runs AFTER the `auto` strings have been
+    # overwritten with the seed, so re-deriving them from args would find none and
+    # the gate would pass on exactly the configs it exists to reject.
+    violations = config_invariants.auto_lr_requires_an_adaptive_sensor(
+        _namespace_to_dict(args), auto_keys=list(managed))
+    if not violations:
+        return
+    raise ValueError(
+        f"{', '.join(managed)} set to `auto` (servo-managed), seeded at "
+        f"{seed_lr:.3g}, but not every stage has an adaptive sensor to move it:\n"
+        + '\n'.join(f'  {v.detail}' for v in violations)
+        + "\n\nDeclare `lr_sensor` on each stage (kind: ray | plateau | hyper), or "
+          "write an explicit float for any rate that is meant to be fixed -- a "
+          "float still takes the warmup envelope and divergence handling, it just "
+          "does not pretend to adapt.")
+
+
 def _grad_median(T):
     """Empirical pre-clip grad-norm median at rollout length T, log-log
     interpolated over _GRAD_MEDIAN (and extrapolated past the table ends via the
@@ -465,20 +494,20 @@ def resolve_derived_config(args):
             managed.append(name)
     args.lr_servo_managed = tuple(managed)
     if managed:
-        # `auto` means SERVO-MANAGED now. Silently resolving it to the seed with
-        # no servo to move it would leave the run training at 1e-5 forever while
-        # the config still says `auto` -- a config that reads as "let the system
-        # choose" and behaves as "pinned an order of magnitude low". That is the
-        # exact class of silent change the retired-key preflight exists to stop,
-        # so it is an error rather than a default.
-        cal = getattr(args, 'ray_calibration', None)
-        if cal is None or not getattr(cal, 'enabled', False):
-            raise ValueError(
-                f"{', '.join(managed)} set to `auto` (controller-managed) but "
-                f"ray_calibration is absent or disabled. `auto` means the periodic ray "
-                f"calibration OWNS this LR; with no sensor it would sit at the seed "
-                f"{seed_lr:.3g} forever while the config claims it is adaptive. Either "
-                f"enable ray_calibration or write an explicit float for a fixed LR.")
+        # `auto` means SERVO-MANAGED. Resolving it to the seed with no servo to
+        # move it leaves the run training at the seed forever while the config
+        # still says `auto` -- reads as "let the system choose", behaves as
+        # "pinned". That is the class of silent change the retired-key preflight
+        # exists to stop, so it is an error rather than a default.
+        #
+        # THE TEST IS WHETHER A STAGE ASKS, not whether ray_calibration is on.
+        # This used to check `ray_calibration.enabled` alone, which is wrong in
+        # both directions now that the sensor is opt-in per stage and there are
+        # three adaptive kinds: it PASSED a config with the block enabled and no
+        # stage asking (the LRs then sat at the seed for the whole run, which is
+        # exactly what it was written to prevent), and it would REJECT a config
+        # driven entirely by `hyper`, which does not use ray_calibration at all.
+        _require_adaptive_sensor(args, managed, seed_lr)
 
     # grad clip: anchor x grad_median(T)/grad_median(T_REF) x sqrt(W/W_REF).
     # This one IS still derived -- it scales with the gradient's own measured

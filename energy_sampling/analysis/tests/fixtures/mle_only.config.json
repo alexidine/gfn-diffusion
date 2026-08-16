@@ -1,0 +1,1030 @@
+{
+"Experiment": {
+"value": "{args.energy}"
+},
+"_wandb": {
+"value": {
+"cli_version": "0.21.1",
+"e": {
+"1pvnhg6xwkuj0qr2rjfqrykp8823rgx0": {
+"args": [
+"--config",
+"configs/elj_nehzor_sg14_t10_r2.yaml"
+],
+"git": {
+"commit": "2e5f9bbeee7b9cd4a7a2051cdf02f4ddc13f4486",
+"remote": "https://github.com/alexidine/gfn-diffusion.git"
+}
+}
+}
+}
+},
+"adaptive_lr": {
+"value": "Namespace(warmup_steps=1000, seed_lr=0.000125, bounds=[0.01, 2000.0], calibration=Namespace(alpha_target=4.0, eta_up=0.25, eta_down=0.5), divergence_loss_abs=1000000000.0, divergence_grad_abs=1000000000.0, divergence_cut=0.5, control_flow_lr=False)"
+},
+"adaptive_lr_bounds_0": {
+"value": 0.01
+},
+"adaptive_lr_bounds_1": {
+"value": 2000
+},
+"adaptive_lr_calibration_alpha_target": {
+"value": 4
+},
+"adaptive_lr_calibration_eta_down": {
+"value": 0.5
+},
+"adaptive_lr_calibration_eta_up": {
+"value": 0.25
+},
+"adaptive_lr_control_flow_lr": {
+"value": false
+},
+"adaptive_lr_divergence_cut": {
+"value": 0.5
+},
+"adaptive_lr_divergence_grad_abs": {
+"value": "1e+09"
+},
+"adaptive_lr_divergence_loss_abs": {
+"value": "1e+09"
+},
+"adaptive_lr_seed_lr": {
+"value": 0.000125
+},
+"adaptive_lr_warmup_steps": {
+"value": 1000
+},
+"anomaly_detection": {
+"value": false
+},
+"archive_buffers": {
+"value": true
+},
+"archive_period": {
+"value": 5000
+},
+"auto_batch_throughput_opt": {
+"value": true
+},
+"batch_growth_factor": {
+"value": 1.65
+},
+"batch_growth_interval": {
+"value": 50
+},
+"batch_growth_min_throughput_gain": {
+"value": 0.05
+},
+"batch_growth_slow_interval": {
+"value": 300
+},
+"batch_knee_recheck_steps": {
+"value": 2000
+},
+"batch_size": {
+"value": 1000
+},
+"buffer_device": {
+"value": "cuda"
+},
+"buffers": {
+"value": "Namespace(prior_buffer=Namespace(seed_source='prior_dataset', mean_lifetime=100, weighted_bwd_beta=0.9, churn_batch_ref=1000, min_size=10000, max_size=250000, init_fraction=0.25, condition_block_m=2, reward_min=0, ramp_floor=100, ramp_width=50), replay_buffer=Namespace(churn_rate=80, mean_residence_steps=50, max_size=12000, admit_reward_min=-200, prioritise=Namespace(enabled=True, kappa=1.0, floor_frac=0.25, symmetric=True)), anchor_buffer=Namespace(seed_source='prior_dataset', max_size=200000, dup_cutoff=0.05, screen_energy_window=20, thin_energy_window=50, surprise_cutoff=-5, confirm_cutoff=-5, confirm_k=5, health_gate_floor_metric=None, health_gate_floor=None, health_gate_ceiling_metric='tb_resid_clipped', health_gate_ceiling=0.5, replay_beta=0.5, thin_every_n_evals=5, refresh_every_n_evals=3, noise_log_range=[-2.5, -1.5], topup_admit_record_breakers=True, reach_quantile=0.9, reach_threshold=0.75, reach_topup_size=1000))"
+},
+"buffers_anchor_buffer_confirm_cutoff": {
+"value": -5
+},
+"buffers_anchor_buffer_confirm_k": {
+"value": 5
+},
+"buffers_anchor_buffer_dup_cutoff": {
+"value": 0.05
+},
+"buffers_anchor_buffer_health_gate_ceiling": {
+"value": 0.5
+},
+"buffers_anchor_buffer_health_gate_ceiling_metric": {
+"value": "tb_resid_clipped"
+},
+"buffers_anchor_buffer_health_gate_floor": {
+"value": null
+},
+"buffers_anchor_buffer_health_gate_floor_metric": {
+"value": null
+},
+"buffers_anchor_buffer_max_size": {
+"value": 200000
+},
+"buffers_anchor_buffer_noise_log_range_0": {
+"value": -2.5
+},
+"buffers_anchor_buffer_noise_log_range_1": {
+"value": -1.5
+},
+"buffers_anchor_buffer_reach_quantile": {
+"value": 0.9
+},
+"buffers_anchor_buffer_reach_threshold": {
+"value": 0.75
+},
+"buffers_anchor_buffer_reach_topup_size": {
+"value": 1000
+},
+"buffers_anchor_buffer_refresh_every_n_evals": {
+"value": 3
+},
+"buffers_anchor_buffer_replay_beta": {
+"value": 0.5
+},
+"buffers_anchor_buffer_screen_energy_window": {
+"value": 20
+},
+"buffers_anchor_buffer_seed_source": {
+"value": "prior_dataset"
+},
+"buffers_anchor_buffer_surprise_cutoff": {
+"value": -5
+},
+"buffers_anchor_buffer_thin_energy_window": {
+"value": 50
+},
+"buffers_anchor_buffer_thin_every_n_evals": {
+"value": 5
+},
+"buffers_anchor_buffer_topup_admit_record_breakers": {
+"value": true
+},
+"buffers_prior_buffer_churn_batch_ref": {
+"value": 1000
+},
+"buffers_prior_buffer_condition_block_m": {
+"value": 2
+},
+"buffers_prior_buffer_init_fraction": {
+"value": 0.25
+},
+"buffers_prior_buffer_max_size": {
+"value": 250000
+},
+"buffers_prior_buffer_mean_lifetime": {
+"value": 100
+},
+"buffers_prior_buffer_min_size": {
+"value": 10000
+},
+"buffers_prior_buffer_ramp_floor": {
+"value": 100
+},
+"buffers_prior_buffer_ramp_width": {
+"value": 50
+},
+"buffers_prior_buffer_reward_min": {
+"value": 0
+},
+"buffers_prior_buffer_seed_source": {
+"value": "prior_dataset"
+},
+"buffers_prior_buffer_weighted_bwd_beta": {
+"value": 0.9
+},
+"buffers_replay_buffer_admit_reward_min": {
+"value": -200
+},
+"buffers_replay_buffer_churn_rate": {
+"value": 80
+},
+"buffers_replay_buffer_max_size": {
+"value": 12000
+},
+"buffers_replay_buffer_mean_residence_steps": {
+"value": 50
+},
+"buffers_replay_buffer_prioritise_enabled": {
+"value": true
+},
+"buffers_replay_buffer_prioritise_floor_frac": {
+"value": 0.25
+},
+"buffers_replay_buffer_prioritise_kappa": {
+"value": 1
+},
+"buffers_replay_buffer_prioritise_symmetric": {
+"value": true
+},
+"bwd_loss_coeffs": {
+"value": "Namespace(tb=0.0, freeze_policy=0.0, freeze_z=1.0, vg_lb=0, vg_lme=0, vg_by_condition=1.0, pf_boost=0, db=0.0, subtb=0.0, subtb_lambda=0.95, emp_z=0, emp_z_persistent=0, level_gap=0.0, level_gap_clamp=10.0, mle=0.0, tbc=0.0, repeats=1.0, traj_grads=1.0, loss_clip=1000000000.0, beta=10.0)"
+},
+"bwd_loss_coeffs_beta": {
+"value": 10
+},
+"bwd_loss_coeffs_db": {
+"value": 0
+},
+"bwd_loss_coeffs_emp_z": {
+"value": 0
+},
+"bwd_loss_coeffs_emp_z_persistent": {
+"value": 0
+},
+"bwd_loss_coeffs_freeze_policy": {
+"value": 0
+},
+"bwd_loss_coeffs_freeze_z": {
+"value": 1
+},
+"bwd_loss_coeffs_level_gap": {
+"value": 0
+},
+"bwd_loss_coeffs_level_gap_clamp": {
+"value": 10
+},
+"bwd_loss_coeffs_loss_clip": {
+"value": "1e+09"
+},
+"bwd_loss_coeffs_mle": {
+"value": 0
+},
+"bwd_loss_coeffs_pf_boost": {
+"value": 0
+},
+"bwd_loss_coeffs_repeats": {
+"value": 1
+},
+"bwd_loss_coeffs_subtb": {
+"value": 0
+},
+"bwd_loss_coeffs_subtb_lambda": {
+"value": 0.95
+},
+"bwd_loss_coeffs_tb": {
+"value": 0
+},
+"bwd_loss_coeffs_tbc": {
+"value": 0
+},
+"bwd_loss_coeffs_traj_grads": {
+"value": 1
+},
+"bwd_loss_coeffs_vg_by_condition": {
+"value": 1
+},
+"bwd_loss_coeffs_vg_lb": {
+"value": 0
+},
+"bwd_loss_coeffs_vg_lme": {
+"value": 0
+},
+"checkpoint_name": {
+"value": "d33elj_elj_nehzor_sg14_t10_elj-nehzor_sg14_zp1_elj_prior_dataset-T2.5-990198_final.pt"
+},
+"checkpoints_dir": {
+"value": "C:\\Users\\mikem\\Projects\\mxt_gfn\\gfn_diffusion\\energy_sampling\\checkpoints"
+},
+"compile_policy": {
+"value": "auto"
+},
+"condition_log_z": {
+"value": "Namespace(min_visits=20, half_life_visits=7.0, trim_frac=0.01, max_batch_weight=200.0, discovery_half_life_steps=200.0, fwd_tb_z_source='learned', bwd_tb_z_source='learned', replay_tb_z_source='learned', weighted_condition_sampling=True, weighted_condition_sampling_clip_quantile=0.99, weighted_condition_sampling_temperature=0.3, weighted_condition_sampling_uniform_beta=0.5)"
+},
+"condition_log_z_bwd_tb_z_source": {
+"value": "learned"
+},
+"condition_log_z_discovery_half_life_steps": {
+"value": 200
+},
+"condition_log_z_fwd_tb_z_source": {
+"value": "learned"
+},
+"condition_log_z_half_life_visits": {
+"value": 7
+},
+"condition_log_z_max_batch_weight": {
+"value": 200
+},
+"condition_log_z_min_visits": {
+"value": 20
+},
+"condition_log_z_replay_tb_z_source": {
+"value": "learned"
+},
+"condition_log_z_trim_frac": {
+"value": 0.01
+},
+"condition_log_z_weighted_condition_sampling": {
+"value": true
+},
+"condition_log_z_weighted_condition_sampling_clip_quantile": {
+"value": 0.99
+},
+"condition_log_z_weighted_condition_sampling_temperature": {
+"value": 0.3
+},
+"condition_log_z_weighted_condition_sampling_uniform_beta": {
+"value": 0.5
+},
+"conditional_worst_quantile": {
+"value": 0.25
+},
+"continue_from_checkpoint": {
+"value": false
+},
+"controller": {
+"value": "Namespace(min_mode_frac=0.001, beta=0.025, deactivate_threshold=0.01, refresh_every=10, decay_rate=0.95, anneal_patience=5, lookahead_horizon=5, lookahead_trend_alpha=0.1)"
+},
+"controller_anneal_patience": {
+"value": 5
+},
+"controller_beta": {
+"value": 0.025
+},
+"controller_deactivate_threshold": {
+"value": 0.01
+},
+"controller_decay_rate": {
+"value": 0.95
+},
+"controller_lookahead_horizon": {
+"value": 5
+},
+"controller_lookahead_trend_alpha": {
+"value": 0.1
+},
+"controller_min_mode_frac": {
+"value": 0.001
+},
+"controller_refresh_every": {
+"value": 10
+},
+"cuda_memory_fraction": {
+"value": 0.45
+},
+"device": {
+"value": "cuda"
+},
+"ema_decay": {
+"value": null
+},
+"energy_config": {
+"value": "Namespace(internal_oom_recovery=False, temperature=2.5, log_temperature_range=[0, 0.693147], density_coeff=10.0, bounding_coeff=10.0, reduction_coeff=10.0, lj_coeff=1.0, reward_range=250, analyze_kwargs=Namespace())"
+},
+"energy_config_bounding_coeff": {
+"value": 10
+},
+"energy_config_density_coeff": {
+"value": 10
+},
+"energy_config_internal_oom_recovery": {
+"value": false
+},
+"energy_config_lj_coeff": {
+"value": 1
+},
+"energy_config_log_temperature_range_0": {
+"value": 0
+},
+"energy_config_log_temperature_range_1": {
+"value": 0.693147
+},
+"energy_config_reduction_coeff": {
+"value": 10
+},
+"energy_config_reward_range": {
+"value": 250
+},
+"energy_config_temperature": {
+"value": 2.5
+},
+"energy_function": {
+"value": "elj"
+},
+"epochs": {
+"value": 60000
+},
+"eval_T": {
+"value": 10
+},
+"eval_num_samples": {
+"value": 10000
+},
+"eval_period": {
+"value": 250
+},
+"figs_period": {
+"value": 500
+},
+"fused_grad_accum_min_samples": {
+"value": 1000
+},
+"fwd_loss_coeffs": {
+"value": "Namespace(tb=0.0, z_level=0.0, freeze_policy=0.0, freeze_z=0.0, vg_lb=0.0, vg_lme=0, vg_by_condition=0.0, db=0.0, subtb=0.0, subtb_lambda=0.95, emp_z=0, emp_z_persistent=0, traj_grads=0.0, reward_grads=0.0, repeats=1.0, loss_clip=1000000000.0, beta=10.0)"
+},
+"fwd_loss_coeffs_beta": {
+"value": 10
+},
+"fwd_loss_coeffs_db": {
+"value": 0
+},
+"fwd_loss_coeffs_emp_z": {
+"value": 0
+},
+"fwd_loss_coeffs_emp_z_persistent": {
+"value": 0
+},
+"fwd_loss_coeffs_freeze_policy": {
+"value": 0
+},
+"fwd_loss_coeffs_freeze_z": {
+"value": 0
+},
+"fwd_loss_coeffs_loss_clip": {
+"value": "1e+09"
+},
+"fwd_loss_coeffs_repeats": {
+"value": 1
+},
+"fwd_loss_coeffs_reward_grads": {
+"value": 0
+},
+"fwd_loss_coeffs_subtb": {
+"value": 0
+},
+"fwd_loss_coeffs_subtb_lambda": {
+"value": 0.95
+},
+"fwd_loss_coeffs_tb": {
+"value": 0
+},
+"fwd_loss_coeffs_traj_grads": {
+"value": 0
+},
+"fwd_loss_coeffs_vg_by_condition": {
+"value": 0
+},
+"fwd_loss_coeffs_vg_lb": {
+"value": 0
+},
+"fwd_loss_coeffs_vg_lme": {
+"value": 0
+},
+"fwd_loss_coeffs_z_level": {
+"value": 0
+},
+"gpu_util_floor": {
+"value": 0
+},
+"gpu_util_policy_window_s": {
+"value": 7200
+},
+"gpu_util_window_s": {
+"value": 900
+},
+"gradient_norm_clip": {
+"value": 37.87878787878788
+},
+"grow_batch_size": {
+"value": false
+},
+"integrator": {
+"value": "Namespace(T=10)"
+},
+"integrator_T": {
+"value": 10
+},
+"load_weights_only": {
+"value": false
+},
+"lr_back": {
+"value": 0.000125
+},
+"lr_flow": {
+"value": 0.1
+},
+"lr_fused": {
+"value": 0.000125
+},
+"lr_policy": {
+"value": 0.000125
+},
+"lr_replay": {
+"value": 0.000125
+},
+"lr_servo_managed": {
+"value": [
+"lr_policy",
+"lr_replay",
+"lr_back",
+"lr_fused"
+]
+},
+"lr_warmup_ratio": {
+"value": 10
+},
+"max_batch_size": {
+"value": 1000
+},
+"max_reloads_per_1k_steps": {
+"value": 0.2
+},
+"max_step_seconds": {
+"value": 60
+},
+"min_lr": {
+"value": "1e-06"
+},
+"mle_min_rate": {
+"value": 0.05
+},
+"mle_slope_t": {
+"value": 2
+},
+"mle_slope_window": {
+"value": 300
+},
+"mlip_path": {
+"value": null
+},
+"model": {
+"value": "Namespace(full_flow=False, s_emb_dim=512, t_dim=64, harmonics_dim=64, condition_embedding_dim=16, t_hidden_dim=512, s_hidden_dim=512, s_layers=4, policy_hidden_dim=512, policy_layers=4, flow_hidden_dim=512, flow_layers=4, cond_hidden_dim=512, cond_layers=4, dropout=0, norm='layer', zero_init=False, t_scale=0.05, log_var_range=6, pb_drift_range=0.4, pb_var_range=6, learn_pb=True, learned_variance=True, clipping=True, gfn_clip=200.0, periodic_centroids=True, dplr_rank=6, dplr_rho_max=0.5, dplr_mask_angular=True, pb_exact_reversal=True, hold_dead_latent_rows=True)"
+},
+"model_clipping": {
+"value": true
+},
+"model_cond_hidden_dim": {
+"value": 512
+},
+"model_cond_layers": {
+"value": 4
+},
+"model_condition_embedding_dim": {
+"value": 16
+},
+"model_dplr_mask_angular": {
+"value": true
+},
+"model_dplr_rank": {
+"value": 6
+},
+"model_dplr_rho_max": {
+"value": 0.5
+},
+"model_dropout": {
+"value": 0
+},
+"model_flow_hidden_dim": {
+"value": 512
+},
+"model_flow_layers": {
+"value": 4
+},
+"model_full_flow": {
+"value": false
+},
+"model_gfn_clip": {
+"value": 200
+},
+"model_harmonics_dim": {
+"value": 64
+},
+"model_hold_dead_latent_rows": {
+"value": true
+},
+"model_learn_pb": {
+"value": true
+},
+"model_learned_variance": {
+"value": true
+},
+"model_log_var_range": {
+"value": 6
+},
+"model_norm": {
+"value": "layer"
+},
+"model_pb_drift_range": {
+"value": 0.4
+},
+"model_pb_exact_reversal": {
+"value": true
+},
+"model_pb_var_range": {
+"value": 6
+},
+"model_periodic_centroids": {
+"value": true
+},
+"model_policy_hidden_dim": {
+"value": 512
+},
+"model_policy_layers": {
+"value": 4
+},
+"model_s_emb_dim": {
+"value": 512
+},
+"model_s_hidden_dim": {
+"value": 512
+},
+"model_s_layers": {
+"value": 4
+},
+"model_t_dim": {
+"value": 64
+},
+"model_t_hidden_dim": {
+"value": 512
+},
+"model_t_scale": {
+"value": 0.05
+},
+"model_zero_init": {
+"value": false
+},
+"molecule_conditioning": {
+"value": false
+},
+"molecules_path": {
+"value": "D:\\crystal_datasets\\conditional\\priors\\nehzor_sg14_zp1_elj_prior_dataset.pt"
+},
+"oom_batch_shrink_factor": {
+"value": 0.5
+},
+"oom_cooldown_steps": {
+"value": 200
+},
+"override_learning_rates": {
+"value": false
+},
+"prior_model_name": {
+"value": null
+},
+"prior_path": {
+"value": "D:\\crystal_datasets\\conditional\\priors\\nehzor_sg14_zp1_elj_prior_dataset.pt"
+},
+"protocol": {
+"value": "Namespace(stages=[{'name': 'train_prior', 'train_mode': 'bwd', 'bwd_sampling_mode': 'dataset', 'skip_if': 'prior_loaded', 'flags': {'update_log_z': True, 'scramble_conditions': True, 'mle_gate': True}, 'loss_coeffs': {'bwd': {'mle': 1.0, 'tbc': 1.0, 'repeats': 2.0}}, 'exit': [{'metric': 'gates/mle_flat', 'above': 0.5, 'patience': 5}, {'metric': 'eval/wass_debiased', 'below': 0.015}, {'metric': 'bwd/tbc', 'below': 2.0}], 'on_exit': ['snapshot:phase1_exit', 'snapshot_prior']}, {'name': 'equilibration', 'train_mode': 'fused', 'bwd_sampling_mode': 'prior', 'flags': {'update_log_z': True, 'buffers_active': True}, 'on_enter': ['rebuild_prior_by_churn', 'bootstrap_z:train_conditioner'], 'fracs': {'fwd': 0.05, 'bwd': 0.45, 'replay': 0.5}, 'min_fracs': {'fwd': 0.02, 'bwd': 0.25, 'replay': 0.05}, 'deactivate_threshold': 0.01, 'loss_coeffs': {'fwd': {'tb': 1.0, 'freeze_policy': 1.0}, 'bwd': {'tb': 1.0, 'beta': 80}, 'replay': {'tb': 1.0, 'beta': 80}}, 'balance': {'kind': 'ratio', 'pinned': {'fwd': 0.05}, 'metrics': {'replay': 'fwd/over_coverage', 'bwd': 'bwd/relative_under_wcen'}, 'numerator': 'replay', 'setpoint': 5.0, 'gain': 0.05, 'max_step': 0.05, 'bounds': {'replay': [0.05, 0.6]}, 'converge_floor': 1.0}, 'buffer_servo': {'numerator': 'replay/ema_loss_mean', 'denominator': 'replay/birth_loss_mean', 'bar': 0.368, 'release': 0.6, 'scale': 0.15, 'gain': 0.05, 'relax': 0.5, 'max_step': 0.05, 'max_boost': 8.0}}])"
+},
+"protocol_stages_0_bwd_sampling_mode": {
+"value": "dataset"
+},
+"protocol_stages_0_exit_0_above": {
+"value": 0.5
+},
+"protocol_stages_0_exit_0_metric": {
+"value": "gates/mle_flat"
+},
+"protocol_stages_0_exit_0_patience": {
+"value": 5
+},
+"protocol_stages_0_exit_1_below": {
+"value": 0.015
+},
+"protocol_stages_0_exit_1_metric": {
+"value": "eval/wass_debiased"
+},
+"protocol_stages_0_exit_2_below": {
+"value": 2
+},
+"protocol_stages_0_exit_2_metric": {
+"value": "bwd/tbc"
+},
+"protocol_stages_0_flags_mle_gate": {
+"value": true
+},
+"protocol_stages_0_flags_scramble_conditions": {
+"value": true
+},
+"protocol_stages_0_flags_update_log_z": {
+"value": true
+},
+"protocol_stages_0_loss_coeffs_bwd_mle": {
+"value": 1
+},
+"protocol_stages_0_loss_coeffs_bwd_repeats": {
+"value": 2
+},
+"protocol_stages_0_loss_coeffs_bwd_tbc": {
+"value": 1
+},
+"protocol_stages_0_name": {
+"value": "train_prior"
+},
+"protocol_stages_0_on_exit_0": {
+"value": "snapshot:phase1_exit"
+},
+"protocol_stages_0_on_exit_1": {
+"value": "snapshot_prior"
+},
+"protocol_stages_0_skip_if": {
+"value": "prior_loaded"
+},
+"protocol_stages_0_train_mode": {
+"value": "bwd"
+},
+"protocol_stages_1_balance_bounds_replay_0": {
+"value": 0.05
+},
+"protocol_stages_1_balance_bounds_replay_1": {
+"value": 0.6
+},
+"protocol_stages_1_balance_converge_floor": {
+"value": 1
+},
+"protocol_stages_1_balance_gain": {
+"value": 0.05
+},
+"protocol_stages_1_balance_kind": {
+"value": "ratio"
+},
+"protocol_stages_1_balance_max_step": {
+"value": 0.05
+},
+"protocol_stages_1_balance_metrics_bwd": {
+"value": "bwd/relative_under_wcen"
+},
+"protocol_stages_1_balance_metrics_replay": {
+"value": "fwd/over_coverage"
+},
+"protocol_stages_1_balance_numerator": {
+"value": "replay"
+},
+"protocol_stages_1_balance_pinned_fwd": {
+"value": 0.05
+},
+"protocol_stages_1_balance_setpoint": {
+"value": 5
+},
+"protocol_stages_1_buffer_servo_bar": {
+"value": 0.368
+},
+"protocol_stages_1_buffer_servo_denominator": {
+"value": "replay/birth_loss_mean"
+},
+"protocol_stages_1_buffer_servo_gain": {
+"value": 0.05
+},
+"protocol_stages_1_buffer_servo_max_boost": {
+"value": 8
+},
+"protocol_stages_1_buffer_servo_max_step": {
+"value": 0.05
+},
+"protocol_stages_1_buffer_servo_numerator": {
+"value": "replay/ema_loss_mean"
+},
+"protocol_stages_1_buffer_servo_relax": {
+"value": 0.5
+},
+"protocol_stages_1_buffer_servo_release": {
+"value": 0.6
+},
+"protocol_stages_1_buffer_servo_scale": {
+"value": 0.15
+},
+"protocol_stages_1_bwd_sampling_mode": {
+"value": "prior"
+},
+"protocol_stages_1_deactivate_threshold": {
+"value": 0.01
+},
+"protocol_stages_1_flags_buffers_active": {
+"value": true
+},
+"protocol_stages_1_flags_update_log_z": {
+"value": true
+},
+"protocol_stages_1_fracs_bwd": {
+"value": 0.45
+},
+"protocol_stages_1_fracs_fwd": {
+"value": 0.05
+},
+"protocol_stages_1_fracs_replay": {
+"value": 0.5
+},
+"protocol_stages_1_loss_coeffs_bwd_beta": {
+"value": 80
+},
+"protocol_stages_1_loss_coeffs_bwd_tb": {
+"value": 1
+},
+"protocol_stages_1_loss_coeffs_fwd_freeze_policy": {
+"value": 1
+},
+"protocol_stages_1_loss_coeffs_fwd_tb": {
+"value": 1
+},
+"protocol_stages_1_loss_coeffs_replay_beta": {
+"value": 80
+},
+"protocol_stages_1_loss_coeffs_replay_tb": {
+"value": 1
+},
+"protocol_stages_1_min_fracs_bwd": {
+"value": 0.25
+},
+"protocol_stages_1_min_fracs_fwd": {
+"value": 0.02
+},
+"protocol_stages_1_min_fracs_replay": {
+"value": 0.05
+},
+"protocol_stages_1_name": {
+"value": "equilibration"
+},
+"protocol_stages_1_on_enter_0": {
+"value": "rebuild_prior_by_churn"
+},
+"protocol_stages_1_on_enter_1": {
+"value": "bootstrap_z:train_conditioner"
+},
+"protocol_stages_1_train_mode": {
+"value": "fused"
+},
+"ray_calibration": {
+"value": "Namespace(enabled=True, period=500, n_sub=8, alphas=[0, 1, 2, 4, 8, 16, 32, 64])"
+},
+"ray_calibration_alphas_0": {
+"value": 0
+},
+"ray_calibration_alphas_1": {
+"value": 1
+},
+"ray_calibration_alphas_2": {
+"value": 2
+},
+"ray_calibration_alphas_3": {
+"value": 4
+},
+"ray_calibration_alphas_4": {
+"value": 8
+},
+"ray_calibration_alphas_5": {
+"value": 16
+},
+"ray_calibration_alphas_6": {
+"value": 32
+},
+"ray_calibration_alphas_7": {
+"value": 64
+},
+"ray_calibration_enabled": {
+"value": true
+},
+"ray_calibration_n_sub": {
+"value": 8
+},
+"ray_calibration_period": {
+"value": 500
+},
+"replay_loss_coeffs": {
+"value": "Namespace(tb=1.0, freeze_policy=0.0, freeze_z=1.0, vg_lb=0, vg_lme=0, pf_boost=0, db=0.0, subtb=0.0, subtb_lambda=0.95, emp_z=0, emp_z_persistent=0, mle=0.0, repeats=1.0, traj_grads=0.0, loss_clip=1000000000.0, beta=10.0)"
+},
+"replay_loss_coeffs_beta": {
+"value": 10
+},
+"replay_loss_coeffs_db": {
+"value": 0
+},
+"replay_loss_coeffs_emp_z": {
+"value": 0
+},
+"replay_loss_coeffs_emp_z_persistent": {
+"value": 0
+},
+"replay_loss_coeffs_freeze_policy": {
+"value": 0
+},
+"replay_loss_coeffs_freeze_z": {
+"value": 1
+},
+"replay_loss_coeffs_loss_clip": {
+"value": "1e+09"
+},
+"replay_loss_coeffs_mle": {
+"value": 0
+},
+"replay_loss_coeffs_pf_boost": {
+"value": 0
+},
+"replay_loss_coeffs_repeats": {
+"value": 1
+},
+"replay_loss_coeffs_subtb": {
+"value": 0
+},
+"replay_loss_coeffs_subtb_lambda": {
+"value": 0.95
+},
+"replay_loss_coeffs_tb": {
+"value": 1
+},
+"replay_loss_coeffs_traj_grads": {
+"value": 0
+},
+"replay_loss_coeffs_vg_lb": {
+"value": 0
+},
+"replay_loss_coeffs_vg_lme": {
+"value": 0
+},
+"run_name": {
+"value": "elj_nehzor_sg14_t10_r2"
+},
+"save_checkpoints": {
+"value": false
+},
+"seed": {
+"value": 12345
+},
+"sg_conditioning": {
+"value": false
+},
+"space_groups": {
+"value": [
+14
+]
+},
+"space_groups_0": {
+"value": 14
+},
+"tag": {
+"value": "d33elj"
+},
+"temperature_conditioning": {
+"value": false
+},
+"test_eval_num_samples": {
+"value": 2000
+},
+"test_molecules_path": {
+"value": null
+},
+"traj_checkpoint": {
+"value": false
+},
+"use_wandb": {
+"value": false
+},
+"use_weight_decay": {
+"value": false
+},
+"vector_conditioning": {
+"value": false
+},
+"vector_conditioning_dim": {
+"value": 3
+},
+"weight_decay": {
+"value": 0.0001
+},
+"z_calibration": {
+"value": "Namespace(enabled=True, mode='rollout', sensor='pooled', sensor_quantile=0.5, threshold=0.5, grace=0.8, gain=1.0, max_steps_per_step=100.0, min_visits=None, freshness_half_life_steps=300.0, se2_floor=0.25, holdout_modulus=8)"
+},
+"z_calibration_enabled": {
+"value": true
+},
+"z_calibration_freshness_half_life_steps": {
+"value": 300
+},
+"z_calibration_gain": {
+"value": 1
+},
+"z_calibration_grace": {
+"value": 0.8
+},
+"z_calibration_holdout_modulus": {
+"value": 8
+},
+"z_calibration_max_steps_per_step": {
+"value": 100
+},
+"z_calibration_min_visits": {
+"value": null
+},
+"z_calibration_mode": {
+"value": "rollout"
+},
+"z_calibration_se2_floor": {
+"value": 0.25
+},
+"z_calibration_sensor": {
+"value": "pooled"
+},
+"z_calibration_sensor_quantile": {
+"value": 0.5
+},
+"z_calibration_threshold": {
+"value": 0.5
+},
+"z_primes": {
+"value": [
+1
+]
+},
+"z_primes_0": {
+"value": 1
+},
+"zp_conditioning": {
+"value": false
+}
+}

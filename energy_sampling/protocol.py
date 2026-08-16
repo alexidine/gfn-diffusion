@@ -12,8 +12,9 @@ declares:
   bwd_sampling_mode 'dataset' | 'prior' -- where backward draws terminals from
   flags             explicit behavior switches read by train.py (update_log_z,
                     scramble_conditions, weighted_condition_sampling,
-                    buffers_active, mle_gate) -- the replacements for the old
-                    `self.phase == N` integer checks
+                    buffers_active, mle_gate, weighted_bwd_sampling) -- the
+                    replacements for the old `self.phase == N` integer checks.
+                    STAGE_FLAGS below is the authoritative list
   loss_coeffs       per-mode dicts of NON-DEFAULT coefficient overrides; the
                     base config's fwd/bwd/replay_loss_coeffs blocks are the
                     defaults, and a stage's live coeffs are a pure function of
@@ -26,10 +27,12 @@ declares:
                     terms; when it fires, the run advances to the next stage.
                     A stage with no exit is terminal.
   on_exit/on_enter  transition actions (snapshot:<tag>, snapshot_prior,
-                    bootstrap_z, seed_prior_from_anchors) -- the
-                    route-specific physics; everything generic (optimizer
-                    rebuild, monitor cooldown, LR re-warm) happens
-                    automatically at EVERY transition
+                    bootstrap_z, seed_prior_from_anchors,
+                    reseed_prior_from_dataset, rebuild_prior_by_churn; ACTIONS
+                    below is the authoritative list) -- the route-specific
+                    physics; everything generic (optimizer rebuild, monitor
+                    cooldown, LR re-warm) happens automatically at EVERY
+                    transition
   skip_if           entry condition ('prior_loaded'): on a fresh run the stage
                     is skipped when the condition holds (e.g. the MLE warm-
                     start is redundant when a prior model was loaded by path
@@ -50,6 +53,11 @@ a pair of lagging-spread metrics (the old phase-2 balancer, generalized).
 kind: constraint treats the same two modes ASYMMETRICALLY -- one side's metric
 is a bar that must hold, the other's is a best-effort objective -- and drives
 the split with an INTEGRATOR rather than a static map (see _constraint_tick).
+kind: ratio holds the RATIO of the two split modes' metrics at `setpoint`,
+integrating in the logit of the numerator mode's share and pinning any third
+mode's frac. It declares an exchange rate between two disjoint halves of one
+residual field instead of a bar per side, so neither drive can clamp to zero
+and go one-sided (see _ratio_tick).
 
 A stage may also declare `buffer_servo`: a second, independent controller whose
 actuator is the replay buffer's freshness rather than the loss weights (see

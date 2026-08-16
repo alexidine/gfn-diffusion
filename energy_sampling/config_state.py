@@ -225,6 +225,87 @@ CHANGES: tuple[Change, ...] = (
             "the canonical config migrates clean.",
         ),
     ),
+
+    Change(
+        state=1,
+        summary=(
+            "configs/mk_dev.yaml: both stages now declare an LR sensor -- "
+            "train_prior `{kind: hyper, beta: 0.1}`, equilibration `{kind: ray}`. "
+            "Neither declared one before, and because the sensor is opt-in per "
+            "stage and omission means 'none' SILENTLY, all four `auto` lr_* keys "
+            "sat at adaptive_lr.seed_lr for the whole run while the config read "
+            "as adaptive. The kinds are not interchangeable: `ray` draws from "
+            "replay and scores replay_loss_coeffs, so it is coherent only in a "
+            "fused stage training replay TB (equilibration), while `hyper` reads "
+            "no loss and is therefore the sensor for stages that train neither "
+            "(train_prior, which is bwd/MLE). NO STATE TRANSITION: this adds keys "
+            "with new meanings rather than reinterpreting existing ones, so a "
+            "config written before it still means exactly what it meant."
+        ),
+        components=('configs/mk_dev.yaml',),
+        invariants=(
+            "`auto` on an lr_* key requires an adaptive sensor to own it; "
+            "otherwise the rate is fixed at the seed while the config claims "
+            "otherwise (config_invariants.auto_lr_requires_an_adaptive_sensor).",
+            "A stage declaring lr_sensor kind 'ray' requires ray_calibration."
+            "enabled -- train.py::_check_ray_wiring raises otherwise.",
+            "`ray` is only coherent in a fused stage that trains replay TB.",
+            "An explicit float lr_* takes the warmup envelope and divergence "
+            "handling but NOT peak_scale (controller.py::_apply_lrs).",
+        ),
+        validation=(
+            "config_snapshot reports exactly two changed values (stages[0] and "
+            "stages[1] lr_sensor), confirming nothing else moved.",
+            "test_mode_safety.py drives the full load path: auto without a sensor "
+            "raises, explicit floats load without one, and a hyper-only config "
+            "loads with ray_calibration disabled.",
+            "beta 0.1 is the best WORST-CASE value from the 12-cell bench sweep, "
+            "which covered MLE surfaces -- the closest measured evidence for this "
+            "stage. Production conditional configs run 0.05, but on a "
+            "var_conditioning stage and from a battery with no committed verdict.",
+        ),
+    ),
+    Change(
+            state=1,
+            summary=(
+                "configs/mode_presets.yaml is RETIRED and replaced by "
+                "configs/problems.yaml. The old file declared itself \"Reference only "
+                "-- never loaded by train.py\" and drifted accordingly: it prescribed "
+                "SEVEN keys that are now in utils._RETIRED_KEYS and hard-fail at load "
+                "(cut_grad_abs, reset_grad_abs, cut_loss_abs, reset_loss_abs, "
+                "hold_steps, decay_halflife_steps, fire_cooldown_steps), taught the "
+                "learning-rate rule `anchor x 25/T` that utils.py records as deleted, "
+                "and labelled its worked example the 'current mk_dev state' at W256/T40 "
+                "when the file had long been W512/T10. A checklist that recommends "
+                "keys the schema rejects is worse than no checklist. "
+                "problems.yaml carries PROBLEM-INTRINSIC settings only -- energy "
+                "function, paths, conditioning flags, space groups, temperature, and "
+                "the model/buffer values that follow from the domain -- and is covered "
+                "by tests, including one that rejects any retired key and one that "
+                "rejects a tuning knob leaking in. The durable half of the retired "
+                "file, the intensive/extensive derivation explaining why gradient-space "
+                "bars scale with (W, T) and loss-space bars do not, moved to "
+                "docs/design/width_and_length_scaling.md. NO STATE TRANSITION: no "
+                "config key changed meaning; a reference file was deleted and a new "
+                "registry added, neither of which alters how an existing config reads."
+            ),
+            components=('configs/problems.yaml', 'configs/mode_presets.yaml',
+                        'docs/design/width_and_length_scaling.md', 'configs/mk_dev.yaml'),
+            invariants=(
+                "problems.yaml carries no key that a run would TUNE -- a per-problem "
+                "difference in a tuning knob is a mode-safety defect in mk_dev.yaml, "
+                "not a property of the problem.",
+                "periodic_centroids follows the domain: true for crystals, false for "
+                "toys.",
+                "A conditional problem declares a held-out test set (R17: held-out is "
+                "read before train metrics).",
+            ),
+            validation=(
+                "test_problems.py: 18 tests, including agreement between mk_dev.yaml "
+                "and its mipcas_elj entry, and mutation tests proving the retired-key "
+                "check fires on a real key and ignores prose.",
+            ),
+        ),
 )
 
 

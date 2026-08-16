@@ -17,7 +17,8 @@ from mxtaltools.dataset_utils.data_class_methods.crystal_analysis import COMPUTE
 from mxtaltools.dataset_utils.data_classes import MolCrystalData
 from mxtaltools.dataset_utils.utils import collate_data_list
 from mxtaltools.mlip_interfaces.AL_mace_utils import load_mace_model, drain_mace_phase_timing
-from mxtaltools.mlip_interfaces.uma_utils import init_uma_crystal_predictor
+from mxtaltools.mlip_interfaces.uma_utils import (init_uma_crystal_predictor,
+                                                  drain_uma_phase_timing)
 
 
 def density_penalty(packing_coeff, turnover = 1):
@@ -263,22 +264,32 @@ class MolecularCrystal(BaseSet):
         return crystal_batch
 
     def drain_energy_timing(self) -> dict:
-        """BaseSet's counters, plus the mace call's INTERNAL split when this run is
-        on the mace route.
+        """BaseSet's counters, plus the MLIP call's INTERNAL split for whichever of
+        the mace/uma routes this run is on.
 
-        The split is what decides whether vectorising batch_to_mace_atomicdata is
-        worth doing: `energy/mace_host_frac` is the share a vectorised builder could
+        The split is what decides whether vectorising the AtomicData builder is worth
+        doing: `energy/{mace,uma}_host_frac` is the share a vectorised builder could
         address, and one minus it is the Amdahl ceiling. Measured on the machine that
         actually runs the job -- the same question could not be answered locally,
         where MACE inference takes the box down (2026-08-14, twice).
+
+        BOTH ROUTES ARE DRAINED UNCONDITIONALLY, and that is safe rather than sloppy:
+        each drain returns {} when its own route logged no calls, so the inactive one
+        contributes nothing instead of a block of zeros.
+
+        The uma split carries a subtlety the mace one does not. UMA builds its
+        neighbour list INSIDE the forward (otf_graph), so `uma_forward_frac` near 1 is
+        the expected reading and says nothing about whether that graph construction is
+        cheap. Only present when uma_utils.install_uma_graph_timer() has been called,
+        `energy/uma_graph_frac_of_forward` is the number that actually answers it.
 
         Drained unconditionally so the phase counters cannot accumulate across a
         window in which nothing else was logged; returns {} on stages with no energy
         calls, exactly as BaseSet does."""
         base = super().drain_energy_timing()
-        phases = drain_mace_phase_timing()
-        if base and phases:
-            base.update(phases)
+        for phases in (drain_mace_phase_timing(), drain_uma_phase_timing()):
+            if base and phases:
+                base.update(phases)
         return base
 
     def attach_gas_phase_reference(self, crystal_batch):

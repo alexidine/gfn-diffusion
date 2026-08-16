@@ -279,19 +279,35 @@ def test_signature_agrees_across_dict_and_namespace():
     # the run uses.
     from energy_sampling.utils import load_yaml, dict2namespace, preflight_config, \
         resolve_derived_config
-    cfgs = sorted(glob.glob(os.path.join(_here, 'configs', 'gauss_aug12', '*_sg*_o*.yaml')))
-    if not cfgs:
-        check("an arm config to compare against", False, 'none found')
-        return
+    # THE CANONICAL CONFIG LEADS, and historical arms are a bonus rather than the
+    # basis. This used to read only `configs/gauss_aug12/*`, which stopped loading
+    # once `auto` learning rates began requiring a stage to declare an adaptive
+    # sensor -- those arms predate the rule and sit at the seed. A signature test
+    # should fail when the SIGNATURE breaks, not when an old battery ages out, so
+    # a config that no longer loads is skipped with its reason rather than
+    # failing here.
+    cfgs = [os.path.join(_here, 'configs', 'mk_dev.yaml')]
+    cfgs += sorted(glob.glob(os.path.join(_here, 'configs', 'gauss_aug12', '*_sg*_o*.yaml')))[:3]
+
     checked = 0
-    for path in cfgs[:3]:
+    loaded_args = None
+    for path in cfgs:
         d = yaml.safe_load(open(path, encoding='utf-8'))
-        args = resolve_derived_config(preflight_config(dict2namespace(load_yaml(path))))
+        try:
+            args = resolve_derived_config(preflight_config(dict2namespace(load_yaml(path))))
+        except ValueError as e:
+            print(f"   skip {os.path.basename(path)}: no longer loads "
+                  f"({str(e).splitlines()[0][:70]})")
+            continue
+        loaded_args = args
         a, b = G.config_signature(args), G.config_signature(d)
         check(f"{os.path.basename(path)}: real args and YAML agree",
               a == b and a is not None, f"{a} vs {b}")
         checked += 1
-    args = resolve_derived_config(preflight_config(dict2namespace(load_yaml(cfgs[0]))))
+    check("at least one config was actually compared", checked > 0, f"{checked} compared")
+    if loaded_args is None:
+        return
+    args = loaded_args
     check("declared ceiling reads from the real args object",
           G.declared_ceiling_mb(args, 16303) == int(0.9 * 16303),
           str(G.declared_ceiling_mb(args, 16303)))

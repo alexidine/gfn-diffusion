@@ -14,7 +14,8 @@ import numpy as np
 import pytest
 
 from analysis import keys as K
-from analysis.pull import EmptyPull, Run, _run_dirs, scan_local_history
+from analysis.pull import (EmptyPull, Run, _run_dirs, scan_cloud_history,
+                           scan_local_history)
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +42,50 @@ def test_resolution_is_what_prevents_the_empty_pull():
     live = K.live_keys(K.resolve(available, wanted, K.Route.VARGRAD_CONDITIONAL))
     assert 'fwd/does_not_exist' not in live
     assert set(live) == available
+
+
+class _MixedCadenceRun:
+    """A cloud run whose keys are logged on DIFFERENT cadences, as every real
+    run's are: `phase` every row, `fwd/tb_err` every other, `raycal/alpha_star`
+    every fourth. Records whether the caller narrowed the request server-side."""
+
+    def __init__(self):
+        self.keys_arg = 'not-called'
+
+    def scan_history(self, keys=None, page_size=None):
+        self.keys_arg = keys
+        for i in range(40):
+            row = {'_step': i * 10, 'phase': 2.0}
+            if i % 2 == 0:
+                row['fwd/tb_err'] = 10.0 - i * 0.1
+            if i % 4 == 0:
+                row['raycal/alpha_star'] = 8.0
+            # wandb returns only rows carrying EVERY requested key
+            if keys is not None and not set(keys).issubset(row):
+                continue
+            yield row
+
+
+def test_mixed_cadence_keys_do_not_zero_the_pull():
+    """H1's second half, and the bug that shipped: even with every key RESOLVED,
+    forwarding them to `scan_history` returns only rows containing all of them.
+    Measured on prod0810_mipcas_elj (9inim617): 532 resolved keys, 0 rows, while
+    the same run streamed 11887 rows unfiltered. Filtering must be client-side."""
+    run = _MixedCadenceRun()
+    out = scan_cloud_history(run, ['phase', 'fwd/tb_err', 'raycal/alpha_star'])
+
+    assert run.keys_arg is None, 'keys must not be forwarded to scan_history'
+    assert set(out) == {'phase', 'fwd/tb_err', 'raycal/alpha_star'}
+    assert len(out['phase'][0]) == 40          # every row
+    assert len(out['fwd/tb_err'][0]) == 20     # every other
+    assert len(out['raycal/alpha_star'][0]) == 10
+
+
+def test_cloud_filter_still_drops_unrequested_keys():
+    """Client-side filtering must still narrow: streaming all columns is an
+    implementation detail, not a widening of what the caller asked for."""
+    out = scan_cloud_history(_MixedCadenceRun(), ['fwd/tb_err'])
+    assert set(out) == {'fwd/tb_err'}
 
 
 # ---------------------------------------------------------------------------

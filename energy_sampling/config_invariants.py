@@ -244,7 +244,145 @@ def effective_batch_meets_baseline(cfg: dict) -> list[Violation]:
     return []
 
 
+# Sensor kinds that actually move the learning rate. `none` (and an omitted
+# block, which means the same thing silently) does not.
+_ADAPTIVE_SENSOR_KINDS = frozenset({'ray', 'plateau', 'hyper'})
+_LR_KEYS = ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused')
+
+
+def _is_auto(v) -> bool:
+    return isinstance(v, str) and v.strip().lower() == 'auto'
+
+
+def auto_lr_requires_an_adaptive_sensor(cfg: dict,
+                                        auto_keys: Optional[list] = None) -> list[Violation]:
+    """`auto` must yield to an adaptive scheme. A float must not.
+
+    THE TWO SPELLINGS MEAN OPPOSITE THINGS and resolve to the same number, which
+    is what makes the failure silent:
+
+      auto   -> servo-managed. The rate is seeded at adaptive_lr.seed_lr and an
+                adaptive sensor owns it from there.
+      float  -> a fixed peak. It takes the warmup envelope and divergence
+                handling, and `peak_scale` never applies to it
+                (controller.py::_apply_lrs: `env * (peak if managed else 1.0)`).
+
+    So `auto` with no adaptive sensor anywhere is a contradiction: the key is
+    marked servo-managed, nothing ever moves peak_scale off 1.0, and the run
+    trains at the seed for its whole life while the config reads as adaptive.
+    Since the sensor is OPT-IN PER STAGE and an omitted block means `none`
+    SILENTLY, this is reachable by leaving something out rather than by writing
+    anything wrong.
+
+    Checked per stage, not globally: a sensor on the terminal stage does nothing
+    for a phase-1 LR.
+
+    `auto_keys` EXISTS BECAUSE THE EVIDENCE IS DESTROYED BY RESOLUTION.
+    `resolve_derived_config` overwrites the string `auto` with the seed float in
+    place, so a caller running after it sees four ordinary numbers and this rule
+    would find nothing to complain about -- silently, which is the failure mode it
+    was written to catch. Such a caller passes the managed-key list it already
+    computed. Callers working on raw YAML pass nothing and the keys are read from
+    the config."""
+    if auto_keys is None:
+        auto_keys = [k for k in _LR_KEYS if _is_auto(cfg.get(k))]
+    if not auto_keys:
+        return []                      # every rate explicitly pinned: nothing to own
+
+    stages = _get(cfg, 'protocol.stages', []) or []
+    if not stages:
+        return []                      # no protocol to reason about
+
+    out = []
+    for st in stages:
+        if not isinstance(st, dict):
+            continue
+        sensor = st.get('lr_sensor')
+        kind = sensor.get('kind') if isinstance(sensor, dict) else None
+        if kind in _ADAPTIVE_SENSOR_KINDS:
+            continue
+        how = 'declares no lr_sensor' if sensor is None else f"declares lr_sensor kind {kind!r}"
+        out.append(Violation(
+            ERROR, 'auto_lr_requires_an_adaptive_sensor',
+            f"stage {st.get('name')!r} {how}, but {', '.join(auto_keys)} "
+            f"{'are' if len(auto_keys) > 1 else 'is'} `auto`. `auto` hands the "
+            f"rate to a servo; with no adaptive sensor in this stage nothing "
+            f"moves it, so it trains at adaptive_lr.seed_lr throughout while the "
+            f"config reads as adaptive. Either declare a sensor (ray / plateau / "
+            f"hyper) or write an explicit float, which takes the warmup envelope "
+            f"and divergence handling without pretending to adapt."))
+    return out
+
+
+def ray_sensor_needs_a_coherent_stage(cfg: dict) -> list[Violation]:
+    """`ray` is only coherent in a fused stage that trains replay TB.
+
+    The probe draws from the replay buffer (so it needs stored trajectories) and
+    scores with replay_loss_coeffs, so anywhere else it rates a loss nobody is
+    optimising -- and does so silently, tallying skips rather than raising."""
+    out = []
+    base_replay_tb = _num(_get(cfg, 'replay_loss_coeffs.tb')) or 0.0
+    for st in (_get(cfg, 'protocol.stages', []) or []):
+        if not isinstance(st, dict):
+            continue
+        sensor = st.get('lr_sensor')
+        if not (isinstance(sensor, dict) and sensor.get('kind') == 'ray'):
+            continue
+        if st.get('train_mode') != 'fused':
+            out.append(Violation(
+                ERROR, 'ray_sensor_needs_a_coherent_stage',
+                f"stage {st.get('name')!r} declares lr_sensor kind 'ray' but "
+                f"train_mode is {st.get('train_mode')!r}. The ray probe draws "
+                f"from replay and scores replay_loss_coeffs; outside a fused "
+                f"stage training replay TB it rates a loss nobody is optimising."))
+            continue
+        override = ((st.get('loss_coeffs') or {}).get('replay') or {}).get('tb')
+        replay_tb = _num(override) if override is not None else base_replay_tb
+        if not replay_tb:
+            out.append(Violation(
+                ERROR, 'ray_sensor_needs_a_coherent_stage',
+                f"stage {st.get('name')!r} declares lr_sensor kind 'ray' but its "
+                f"effective replay tb coefficient is 0 -- the probe would score a "
+                f"loss this stage does not optimise."))
+    return out
+
+
+def periodic_centroids_needs_one_crystal_space_group(cfg: dict) -> list[Violation]:
+    """`periodic_centroids` makes the model SPACE-GROUP SPECIFIC.
+
+    Which centroid axes span the full cell width is a property of the space
+    group, so the feature resolves a per-SG axis set and bakes it into the
+    model's `expanded_dim`. Two space groups would have to be intersected, which
+    "works" while quietly handing back a weaker or empty wrap instead of saying
+    the config asked for something unsupported.
+
+    It is also a molecular-crystal feature: a toy has no cell to wrap.
+
+    Both are enforced at model construction, which is late -- on an MLIP route
+    that is after the predictor has loaded. Checking at config level costs
+    nothing and fails in the right place."""
+    if _get(cfg, 'model.periodic_centroids') is not True:
+        return []
+    out = []
+    sgs = list(_get(cfg, 'space_groups', []) or [])
+    if len(sgs) != 1:
+        out.append(Violation(
+            ERROR, 'periodic_centroids_needs_one_crystal_space_group',
+            f'model.periodic_centroids is on, which makes the model space-group '
+            f'specific, so space_groups needs exactly one entry; got {sgs}.'))
+    ef = _get(cfg, 'energy_function')
+    if ef is not None and ef not in _ANGULAR_ENERGY_FUNCTIONS:
+        out.append(Violation(
+            ERROR, 'periodic_centroids_needs_one_crystal_space_group',
+            f'model.periodic_centroids is a molecular-crystal feature but '
+            f'energy_function is {ef!r}, which has no cell to wrap.'))
+    return out
+
+
 RULES = (
+    auto_lr_requires_an_adaptive_sensor,
+    periodic_centroids_needs_one_crystal_space_group,
+    ray_sensor_needs_a_coherent_stage,
     growth_gain_below_growth_factor,
     figs_period_fires,
     batch_ceiling_above_floor,
