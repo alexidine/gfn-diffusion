@@ -1,0 +1,8 @@
+name	budget	asks
+a_sg2_on	7580	CONTROL. sg 2 triclinic, n_dead=0, knob ON. Resumes mk_dev phase-1 exit, so it also proves a COMPATIBLE pre-change resume still loads (stored None vs resolved ()).
+a_sg2_off	7580	CONTROL PARTNER. Identical but knob OFF. Must be indistinguishable from a_sg2_on to numerical noise -- a systematic gap means the knob acts where nothing is dead. Bitwise equality is the CPU unit test; on GPU expect nondeterminism-floor agreement.
+b_sg14_on	2500	PRIMARY. sg 14 monoclinic, 2 dead rows held. Tell: startup prints dead rows (3,5) and the probe confirms them; live_dim 10 of 12.
+b_sg14_off	2500	PRIMARY A/B. Same problem, old behaviour. THE measurement F-009 needs: does holding the rows change the fwd/bwd gap and the tb_err floor? Compare at matched step, not at convergence -- neither arm converges here.
+c_sg9_zp2_on	2500	INTERACTION. sg 9 monoclinic Z'=2: dead rows stay (3,5) while the state is 18 wide, and this is the only arm that reaches zp_order_penalty's absolute raw_latents[:, 6:6+3k] slice. Its 2 free centroid axes are NOT handled and stay live.
+d_toy_on	1500	GATE CONTROL. latent_multiharmonic with the sg 1 placeholder. Must resolve to NO dead rows via is_crystal. Tell: startup prints the non-crystal line, never a dead-row list.
+e_conformer	see launch.txt	REGRESSION. TorsionGFN construction, which this change broke outright and the unit suite missed. Run configs/conformer_dev.yaml unchanged -- if it reaches step 1 the subclass delegation works. NOT generated here: conformer_dev.yaml is user-owned.

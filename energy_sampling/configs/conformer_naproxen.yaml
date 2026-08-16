@@ -1,0 +1,108 @@
+run_name: 'conformer_naproxen_bigN'
+tag: 'bigN'
+seed: 0
+device: 'cuda'
+wandb_mode: 'online'   # online | offline | disabled
+num_threads: 2
+
+# Problem
+################################################################
+# naproxen: 31 atoms, 87 internal DoF, k = 3 sampled torsions (aryl-CH, CH-COOH,
+# aryl-OMe). 2 ring-closure bonds; all 3 rotatable bonds are bridges, so the fused
+# naphthalene is rigid under sampling (measured closure drift 8.9e-16 A).
+# Exact quadrature at grid 48^3: log Z 6.4938, E_p[log R] 4.6658, H[p] 1.8279 of max 2.0794.
+problem:
+  smiles: 'COc1ccc2cc(ccc2c1)C(C)C(=O)O'
+  epsilon: 0.1                 # LJ well depth, kcal/mol
+  log_temperature: 0.0         # energy() returns E / 10**log_temperature
+  min_separation: 3            # include nonbonded pairs >= 3 bonds apart (1-2, 1-3 excluded)
+  scale_14: 0.5                # epsilon multiplier for separation-3 pairs
+  lj_k_factor: 2.5             # soft-core exponential stiffness below sigma
+  include_trivial_rotations: false   # no effect on this molecule (k = 3 either way)
+
+# Integrator
+################################################################
+integrator:
+  T: 32
+
+# Model
+################################################################
+model:
+  policy_hidden_dim: 128
+  policy_layers: 3
+  s_emb_dim: 128
+  harmonics_dim: 128
+  t_dim: 128
+  flow_hidden_dim: 128
+  flow_layers: 2
+  t_scale: 0.05               # sigma_step must stay << the wrap period
+  zero_init: true
+  clipping: true
+  gfn_clip: 1.0e+4   # unsigned exponents (1.0e4) parse as strings in YAML 1.1
+
+# Optimizers
+################################################################
+# Top level: resolve_derived_config reads these off the root namespace and treats a
+# missing key as `auto`.
+# EXPLICIT since 2026-08-08. `auto` used to mean the T-scaling rule (anchor x
+# 25/T); it now means SERVO-MANAGED, and the conformer route has no step_probe
+# block, so `auto` here is a hard config error rather than a silent pin at the
+# servo seed. These four are the values the old rule gave at T=32, so this
+# migration changes no learning rate.
+lr_policy: 7.8125e-05
+lr_back: 7.8125e-05
+lr_replay: 7.8125e-05
+lr_fused: 3.90625e-05
+lr_flow: 1.0e-1
+min_lr: 1.0e-6
+lr_warmup_ratio: 100
+gradient_norm_clip: 1.0
+grad_clip_guard:               # adaptive clip bar, per step_type, tracking a quantile of that branch's pre-clip grad norms
+  enabled: true                # false -> the bar is gradient_norm_clip, unchanged
+  p: 0.99                      # target quantile; the bar binds on 1-p of steps
+  eta: 0.01                    # log-space step of the bar per observation
+  warmup_steps: 100            # observations per branch before the tracked bar takes over
+  warmup_clip: static          # bar until then: static = gradient_norm_clip, off = no clip
+  max_ratio: 100.0             # furthest the bar may travel from its last calibration, either direction
+  refresh_on_stage: true       # recalibrate at stage transitions, holding the outgoing bar live
+weight_decay: 1.0e-4
+use_weight_decay: false
+
+adaptive_lr:
+  # v8 (2026-08-11): peak_scale is moved only by periodic ray calibration
+  # (adaptive_lr.calibration / top-level ray_calibration), which the conformer
+  # route does not configure -- these four LRs are explicit floats, never
+  # `auto`, so no key here marks them servo-managed and peak_scale never
+  # applies to them. Only the warmup envelope and the divergence bar act.
+  warmup_steps: 200
+  divergence_loss_abs: 1.0e+9   # non-finite or past this -> reload + peak cut
+  divergence_grad_abs: 1.0e+9
+  divergence_cut: 0.5
+
+# Training
+################################################################
+training:
+  steps: 10000000
+  batch_size: 128
+  grow_batch_size: true
+  max_batch_size: 2048
+  batch_growth_factor: 1.65
+  batch_growth_interval: 50
+  batch_growth_slow_interval: 300
+  auto_batch_throughput_opt: true
+  batch_growth_min_throughput_gain: 0.05  # samples/sec gain a jump must clear to be kept -- a SATURATION detector. opt-steps/sec = samples_per_sec / grad-accum target, so this maximises optimizer-step throughput; step time does not enter. MUST be < batch_growth_factor-1 (0.65 here): at or above it a factor-f jump can never deliver the demanded gain, so every jump is rejected and the batch FREEZES at batch_size
+  gpu_util_window_s: 900  # trailing window for the gpu/util_recent metric. DIAGNOSTIC ONLY -- nothing in the trainer acts on occupancy: batch size does not move it on the MLIP route (measured, umaperf0812)
+  gpu_util_sample_period_s: 60  # wall-clock seconds between occupancy samples. Time-based, not per-N-steps: a step-based cadence cannot fill a 900 s window at 200 s/step, which is how the metric came to be absent on exactly the slow MLIP arms it was there to watch
+  gpu_util_policy_window_s: 7200  # the window the CLUSTER averages over when deciding to cancel. Logged as gpu/util_policy so the number the scheduler judges is visible in wandb
+  exploration_std: 0.0
+  buffer_path: null            # k <= 3, so build_terminal_buffers draws the EXACT
+                               # Boltzmann reference by grid inversion instead
+  bwd_frac: 0.5
+
+# Evaluation
+################################################################
+eval:
+  report_every: 250
+  figs_period: 1000           # figures are heavier than scalars; 0 to disable
+  brute_force_grid: 48        # 110592 points, 12 s; grid-converged against 32^3 to 1e-4
+  out: 'conformer_naproxen_run.json'

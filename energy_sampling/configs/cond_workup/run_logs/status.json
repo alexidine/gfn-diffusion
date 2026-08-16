@@ -1,0 +1,24 @@
+[
+  {
+    "index": 7,
+    "tag": "cw07",
+    "outcome": "terminal_budget",
+    "wandb_run": "run-20260722_233140-pmcz6ofr",
+    "final_step": 5380,
+    "phase": 5,
+    "rel_under": 4.131577010575102,
+    "terminal_entry": 2360,
+    "terminal_steps": 3020
+  },
+  {
+    "index": 8,
+    "tag": "cw08",
+    "outcome": "terminal_converged",
+    "wandb_run": "run-20260723_011910-5dndpgpe",
+    "final_step": 3110,
+    "phase": 5,
+    "rel_under": 0.7805580711465225,
+    "terminal_entry": 3110,
+    "terminal_steps": 0
+  }
+]

@@ -1,0 +1,28 @@
+C:\Users\mikem\venvs\csd_mxt_gfn\Lib\site-packages\pydantic\_internal\_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'repr' attribute with value False was provided to the `Field()` function, which has no effect in the context it was used. 'repr' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+C:\Users\mikem\venvs\csd_mxt_gfn\Lib\site-packages\pydantic\_internal\_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True was provided to the `Field()` function, which has no effect in the context it was used. 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+C:\Users\mikem\venvs\csd_mxt_gfn\Lib\site-packages\e3nn\o3\_wigner.py:10: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  _Jd, _W3j_flat, _W3j_indices = torch.load(os.path.join(os.path.dirname(__file__), 'constants.pt'))
+W0813 00:18:19.863000 51460 Lib\site-packages\torch\distributed\elastic\multiprocessing\redirects.py:29] NOTE: Redirects are currently not supported in Windows or MacOs.
+GPU: 1512 MiB used / 16303 MiB total, 14492 MiB free, 0% util
+job: configs/umaperf0812/_smoke.yaml  [None]
+projected need: UNKNOWN -- no config: cannot project
+room check: skipped: sole tenant and the projection is a declared CAP, not a measurement
+  note    compute process not readable by this user: 2524, [Insufficient Permissions]
+  note    compute process not readable by this user: 37124, [Insufficient Permissions]
+GPU preflight: CLEAR TO LAUNCH
+Traceback (most recent call last):
+  File "C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\train.py", line 5882, in <module>
+    modeller = Modeller()
+               ^^^^^^^^^^
+  File "C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\train.py", line 129, in __init__
+    self.args = get_train_args()
+                ^^^^^^^^^^^^^^^^
+  File "C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\utils.py", line 118, in get_train_args
+    return resolve_derived_config(preflight_config(dict2namespace(load_yaml(remaining[1]))))
+                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\utils.py", line 447, in dict2namespace
+    for k, v in data_dict.items():
+                ^^^^^^^^^^^^^^^
+AttributeError: 'NoneType' object has no attribute 'items'

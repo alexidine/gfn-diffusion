@@ -1,0 +1,662 @@
+run_name: 'stab_july21b'
+tag: 'stab_july21b'
+seed: 12345
+device: 'cuda'
+cuda_memory_fraction: 0.9
+anomaly_detection: false  # dramatic slowdown when True
+
+# Checkpoints
+################################################################
+continue_from_checkpoint: false
+mlip_path: null #'D:\crystal_datasets\esen_s.pt' # C:\Users\mikem\Downloads\acr_112025_mh1_stagetwo.model
+prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_prior_dataset.pt
+molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_prior_dataset.pt
+test_molecules_path: null
+checkpoints_dir: '/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/'
+checkpoint_name: null
+prior_model_name: null #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-88792d_prior.pt #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-88792d_prior.pt #dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-88792d_prior.pt #dev_mk_dev_latent_harmonic-toy_2cond_prior-T1-48d154_prior.pt #dev_mk_dev_latent_multiharmonic-toy_2cond_prior-T1-73224a_prior.pt
+# prior_model_name loads a SEPARATE frozen GFN used only for prior-buffer sampling. It is rebuilt from its
+# own stored gfn_config, so it may be any architecture/conditioning (only the problem TARGET must match --
+# mol_cond/temp_cond are exempt from the compatibility check) and it never touches the live policy's
+# weights. To ALSO warm-start the policy from it, point checkpoint_name at the same file with
+# load_weights_only: true (requires matching architecture).
+reuse_prior: true  # if true and prior_model_name is null, auto-reload this run's own saved prior checkpoint ({run_name}_{problem_slug}_prior.pt) as the frozen prior model, provided its stored problem_def matches this config exactly (stricter than prior_model_name: no conditioning exemption -- the file was written under this same identity). A fresh run then skips the warm-start stage via skip_if: prior_loaded, exactly as if the path were given; missing/mismatched checkpoint = train phase 1 normally (which re-saves it). Policy weights/optimizers/buffers untouched -- warm-starting stays explicit via checkpoint_name + load_weights_only
+load_weights_only: false  # if true, checkpoint_name loads just the model/EMA weights into an otherwise-fresh run - optimizers, buffers, metrics, and phase/step state all initialize from scratch
+# (no override_loss_coeffs any more: checkpoints carry only the stage name; live
+# coefficients always re-derive from this config's protocol block on resume)
+override_learning_rates: false  # if true, overwrite just the numeric LR restored from a resumed checkpoint's optimizers with this config's lr_* values - warmup/anneal status and Adam momentum buffers are left as-is
+
+#Optimizers
+################################################################
+lr_policy: 1.0e-4              # learning rate of the policy network -- the PEAK (v6 controller: scale ramps to 1.0 == this value and NEVER exceeds it). mipcas A/B: 7.5e-5 flat-stable, ~3e-4 the edge; toys more forgiving
+min_lr: 1.0e-6                # ihn
+lr_flow: 0.1                # learning rate of the flow network -- can be rather large for unconditional problems
+lr_back: 1.0e-4                # learning rate of the backward pass (operating LR, see lr_policy). MLE tolerates a HIGHER LR than TB -- structurally, not by luck: TB is on-policy (a bad step relocates the sample distribution, so the next gradient is computed from worse samples), carries an unbounded -log R in a SQUARED residual, and sums log_pf over T steps. MLE has none of the four; its data is fixed and it never evaluates the energy. So an MLE-measured LR is always an UPPER BOUND on TB's, and phase 1 (not fused -> rides this knob via bwd) can keep 1e-4 while phase 3 (fused -> lr_fused) must not
+lr_replay: 1.0e-4               # learning rate of the trajectory replay pass (operating LR, see lr_policy)
+lr_fused: 1.0e-4                # learning rate of the fused fwd/bwd/replay pass -- the PEAK for phases 2+3.
+lr_warmup_ratio: 100           # how much smaller the initial (warmup) LR should be than the peak
+# v6 LR controller (controller.py LRController). Radical simplification of v5:
+# the configured LRs are a FIXED PEAK (scale <= 1.0 always -- the v5 probe/
+# coherence climb measured update AGREEMENT, which stayed honestly positive
+# straight into detonations, aijrfwuy/s706frkh, and is gone entirely), a basic
+# per-stage ramp -> hold -> decay schedule, and two-tier ABSOLUTE tripwires
+# (no medians, no relative bars -- the floored-median bars fired on
+# clip-neutralized steps when the median rode the floor, and went blind when a
+# sustained incident raised the median, s706frkh). ALL durations below are in
+# TRAIN STEPS -- the schedule is a pure function of steps-since-stage-start,
+# so the controller's own evaluation cadence (every 10 steps) can never change
+# what a config value means. The schedule restarts at every stage transition
+# (rearm_warmup). enabled: false pins scale flat at 1.0; the tripwires run
+# regardless. lr_ctrl state ver=6 invalidates any v1-v5 checkpoint state.
+adaptive_lr:
+  enabled: true                # true = ramp/hold/decay schedule; false = flat at configured LRs. Tripwires are unconditional either way.
+  # --- schedule (per stage, in TRAIN STEPS) ---
+  warmup_steps: 1000           # blind exponential ramp 1/lr_warmup_ratio -> 1.0, at run start and after every stage transition (rebuilt optimizers must not land at the peak on cold Adam moments)
+  hold_steps: 10000            # train steps at scale 1.0 (the peak) before decay begins
+  decay_halflife_steps: 20000  # exponential decay half-life after the hold; 0/null = hold at 1.0 forever. Decay buys back the late-run precision the LR jitter floor otherwise caps (phase-1 study: wass/MLE floors at the operating LR were weight jitter, not capacity)
+  decay_floor_scale: 0.05      # decay stops at this scale (min_lr still floors the absolute LR per group)
+  # --- FIRE: two-tier absolute tripwires on branch loss + pre-clip grad norm ---
+  # cut tier = parameter thrash: LR cut in place, no rewind (training state is
+  # intact, just too hot). reset tier = true explosion (tb err at +1e4 scale,
+  # or non-finite): rewind to best + cut. Bars are informed by s706frkh:
+  # healthy losses ran 1.5-176 and healthy pre-clip grads 10-750 (clip 100),
+  # while genuine detonations hit 1e4-1e5 -- the gulf is ~100x, so absolute
+  # bars sit comfortably between the regimes with no baseline tracking.
+  cut_loss_abs: 1.0e+3         # branch loss above this = thrash -> cut
+  cut_grad_abs: 3.0e+3         # pre-clip grad norm above this (30x clip) = thrash -> cut
+  reset_loss_abs: 1.0e+4       # true explosion -> rewind + cut
+  reset_grad_abs: 3.0e+4       # true explosion -> rewind + cut
+  cut_ratio: 0.5               # multiplicative cut per fire; cuts compound across fires. Instance-held (rewind-proof), reset to 1.0 at stage transitions
+  fire_cooldown_steps: 500     # min train steps between finite fires on one channel -- gives a post-cut/post-rewind state time to re-synchronize instead of machine-gunning (s706frkh's 18-fire loop ran at exactly the old 100-step cooldown). Non-finite readings ignore it. NB a fire also LATCHES its channel's cut tier until the metric recrosses below the cut bar (g8d8se26: 4 tail fires on one excursion's grad drain compounded 0.25 -> 0.01); reset tier + non-finite ignore the latch
+  # --- RECOVERY: re-ramp after a cut instead of keeping it for the stage ---
+  # g8d8se26: cut correct at step ~2400, then 24k of 27k steps pinned at the
+  # 0.01 floor with grads 30-50x under the bar and metrics still slowly
+  # climbing at kill. A fire during recovery cuts from the current level and
+  # re-records the firing level, so repeat detonations ratchet the cruise
+  # target down (AIMD) rather than sawtoothing at the ceiling.
+  recovery_target_frac: 0.5    # cruise at this fraction of the cut factor that was running at the last fire (0 = no recovery, cuts are stage-permanent)
+  recovery_wait_steps: 3000    # COLD train steps (no fires AND every monitored reading below its cut bar) before the re-ramp starts -- a latched channel simmering between the bars blocks recovery indefinitely rather than being ramped back into (the drain after g8d8se26's caught excursion took ~600 steps; LR cuts do not accelerate it -- LR is the trigger, not the sustainer)
+  recovery_ramp_steps: 1000    # exponential re-ramp duration from the cut level to the cruise target
+  control_flow_lr: false       # false (default): flow/Z-head groups PINNED at lr_flow, exempt from scaling (the schedule has no sensor mandate over Z; scaling it ran the Z head ~20x under design, ylmtpqjy). true = uniform scaling, for A/B
+weight_decay: 1.0e-4
+use_weight_decay: false
+compile_policy: auto           # torch.compile the dense policy trunk (t/s encoders, fwd/bwd policies, flow) with inductor kernel fusion (default mode; CUDA graphs are incompatible with the T-times-per-rollout module re-invocation pattern) -- the fused loop is launch-overhead-bound (~30% GPU util at batch 2500 locally), this is the lever. 'auto' = Linux+CUDA only (inductor has no CUDA support on native Windows, so dev boxes stay eager); true/false force it. Compile errors degrade to eager with a warning rather than crashing. Recompiles on every new batch size, so prefer grow_batch_size: false alongside it
+gradient_norm_clip: 100.0        # gradient norm clip for updating gfn model weights
+ema_decay: null #0.95  # set to null for no ema # NOTE this breaks some important statistics - leave as null for now
+
+# model parameters
+################################################################
+model:
+  full_flow: false           # true for subtb or db losses
+  # shared dimensions
+  s_emb_dim: 512             # dimensionality of state embedding
+  t_dim: 64                   # dimensionality of time embedding
+  harmonics_dim: 64           # dimensionality of harmonic embedding
+  condition_embedding_dim: 16  # dimensionality of the conditioning embedding
+  # per-sub-model architecture
+  t_hidden_dim: 512          # time encoder hidden dim
+  s_hidden_dim: 512          # state encoder hidden dim
+  s_layers: 4                 # state encoder layers
+  policy_hidden_dim: 512     # forward/backward policy hidden dim
+  policy_layers: 4            # forward/backward policy layers
+  flow_hidden_dim: 512       # flow model hidden dim
+  flow_layers: 4              # flow model layers
+  cond_hidden_dim: 512       # conditioning embedding hidden dim
+  cond_layers: 4              # conditioning embedding layers
+  # regularization (shared)
+  dropout: 0                  # dropout probability
+  norm: layer                 # null, "layer" - DON'T PUT 'batch'
+  zero_init: false
+  # SDE params
+  t_scale: 0.05               # scales fixed forward policy variance
+  log_var_range: 6            # controls dynamic range of learned policy variance
+  pb_drift_range: 0.4         # range of learned backward drift corrections
+  pb_var_range: 6             # range of learned backward policy variance
+  learn_pb: true              # whether to learn a correction to the backward policy
+  learned_variance: true      # whether to learn policy variance
+  clipping: true              # clip the maximum step size induced by the policy model
+  gfn_clip: 200.0             # clip value for policy step size
+  # Wrap the aunit centroid dims whose aunit spans the full cell width (auv == 1), so the SDE
+  # flows through the aunit face instead of piling up against the bounding-energy wall -- which
+  # is where real probability mass tends to bunch, precisely because that face is an artificial
+  # cut rather than a physical one. The aunit is NOT periodic in general (crossing a face
+  # usually re-enters through a symmetry op, e.g. P21/c at y=1/4); at auv == 1 the wrap is a
+  # whole-cell lattice translation, so it is safe for every space group. Axes are resolved per
+  # space group and intersected over `space_groups` (models/aunit_periodicity.py), which makes
+  # the model space-group specific. e.g. P21/c -> x,z wrap; y does not.
+  # Verified 2026-07-16 over all 123 SGs with defined aunit bounds (energy+RDF vs an exact
+  # symmetry derivation, 369/369 agreement): auv==1 wrap-safe in 80/80 cases, no exceptions.
+  # The auv==0.5 half-cell wrap is often valid too but is deliberately excluded -- it
+  # identifies points within the fundamental domain, which we aren't exploring yet.
+  # Changes expanded_dim (wrapped dims get a sin/cos encoding), so it is NOT checkpoint
+  # compatible with a run trained without it.
+  periodic_centroids: true  # for physical problems on crystals, not toy problems
+  # diagonal-plus-low-rank (DPLR) forward covariance: C = diag(d) + V V^T, forward SDE only.
+  # fixed marginal-variance budget: rho redistributes the existing policy variance
+  # between private (d) and correlated (V) parts, it never inflates the marginal.
+  dplr_rank: 6                 # rank r of the low-rank factor V; 0 = disabled (exactly original diagonal SDE)
+  dplr_rho_max: 0.5            # cap on correlated variance fraction; also an exact cap on pairwise |corr_jk| <= rho_max. Keep < 1 strictly
+  dplr_mask_angular: false      # zero the correlated fraction on wrapped dims (angular, plus any periodic_centroids ones); correlations then only couple non-wrapped dims
+
+# training params
+################################################################
+buffer_device: cuda           # where the churned/static sample stores live (replay + prior + anchor buffers, mol/prior datasets). 'cuda' turns per-step buffer draws/admits/purges into async device gathers instead of serial CPU work + host round trips; footprint is ~1KB/graph (250k graphs ~ 250MB) so VRAM cost is negligible next to activations. 'cpu' = legacy
+batch_size: 1000              # number of samples per training batch -- single shared batch size for all rollout work (train fwd/bwd/replay/fused AND eval sampling), so there's one adaptive value reacting to OOMs instead of several independently-tuned ones
+grow_batch_size: true        # whether to dynamically grow the batch size to fill the RAM
+max_batch_size: 50000
+# jump-mode batch growth: multiply by batch_growth_factor once every batch_growth_interval steps
+# instead of a little every step, so the run visits only ~log_f(max/base) distinct batch sizes
+# (torch.compile treats each distinct size as a recompile + its own CUDA graph; continuous growth
+# blows dynamo's recompile limit and silently reverts to eager). OOM cuts divide by the same
+# factor -- exactly one rung down -- then cool down as before. f=2 over 25->2500 = 8 shapes.
+batch_growth_factor: 1.65
+batch_growth_interval: 50       # steps between jumps before the first OOM (25->2500 in ~350 steps, similar to the old 1.01/step walk); 0/absent = legacy continuous mode below. WITH compile_policy active, each new size is a ~30-60s recompile stall, so keep dwell >> compile: use ~250-500 here (or start batch_size near max/4 so there are only a few rungs); 50 is fine locally where compile is off
+batch_growth_slow_interval: 300 # jump spacing after any OOM (congestion avoidance; ~the old 1.002/step doubling time)
+# --- automatic batch-size throughput optimization (train.py increment_batch_size) ---
+# The growth walk measures marginal samples/sec at every jump (batch / median step time over the
+# trailing ~20 steps, robust to the one-off compile stall at rung entry). Past GPU saturation a
+# factor-f batch jump returns ~x1.0 throughput at xf step time -- pure steps/hour loss (rpvez6ep
+# on A100-80GB: batch 50k ran the same 13.3k samples/s as batch 1.6k, at 31x the step time, 958
+# vs 30k steps/hr). A jump that underperforms min_gain reverts one rung and PINS the batch for
+# the current protocol stage (per-stage: fused vs bwd steps have different cost profiles); the
+# pin re-arms at stage transitions and after OOM cuts, so the controller re-finds the knee per
+# stage, per GPU, per model width on its own. With this ON, max_batch_size is a safety ceiling
+# rather than a target. NB nvidia-smi-style utilization cannot drive this decision -- it
+# saturates at 100% below the knee; marginal throughput discriminates on both sides.
+auto_batch_throughput_opt: true  # master switch; false = grow to max_batch_size/OOM as before
+batch_growth_min_throughput_gain: 0.05  # samples/sec gain a jump must clear to be kept -- a SATURATION detector. opt-steps/sec = samples_per_sec / grad-accum target, so this maximises optimizer-step throughput; step time does not enter. MUST be < batch_growth_factor-1 (0.65 here): at or above it a factor-f jump can never deliver the demanded gain, so every jump is rejected and the batch FREEZES at batch_size
+gpu_util_window_s: 900  # trailing window for the gpu/util_recent metric. DIAGNOSTIC ONLY -- nothing in the trainer acts on occupancy: batch size does not move it on the MLIP route (measured, umaperf0812)
+gpu_util_sample_period_s: 60  # wall-clock seconds between occupancy samples. Time-based, not per-N-steps: a step-based cadence cannot fill a 900 s window at 200 s/step, which is how the metric came to be absent on exactly the slow MLIP arms it was there to watch
+gpu_util_policy_window_s: 7200  # the window the CLUSTER averages over when deciding to cancel. Logged as gpu/util_policy so the number the scheduler judges is visible in wandb
+batch_knee_recheck_steps: 2000  # re-estimate a pinned knee every N steps: drop one rung and re-climb (adapts BOTH directions -- the knee moves within a stage as the fused composition drifts, e.g. the fwd branch activating/deactivating). 0 = pin holds until stage transition/OOM
+oom_batch_shrink_factor: 0.5
+oom_cooldown_steps: 200  # steps to hold batch_size flat after an OOM before resuming growth, to let the reduced level prove stable first
+eval_num_samples: 10000       # minimum number of samples for evaluation
+fused_grad_accum_min_samples: 1000  # fused steps only: effective-gradient floor. Batches BELOW this accumulate micro-steps (loss weighted batch/target) until this many samples contribute, then clip and step; batches AT/ABOVE it take a plain unscaled step (no batch/target > 1 loss inflation). Pairs with the throughput knee: rollout batch stays at the knee, gradient stability comes from accumulation. 0 disables
+epochs: 100000             # number of training epochs
+eval_period: 250              # how often to do evaluation & reporting
+figs_period: 250             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+
+# SDE integration
+################################################################
+eval_T: 25                  # diffusion trajectory length for inference
+integrator:
+  T: 25                        # static training diffusion length
+  min_traj_length: 10
+  max_traj_length: 10
+  traj_length_strategy: static # 'static'  or 'sampled'  will do random between min and max traj lengths
+  discretizer_max_ratio: 15    # maximum ratio between randomly sampled step sizes - needs to be >25 for 15 steps, or 10 for 30 steps to get good coverage at extrema
+  discretizer: uniform         # 'random' 'low_discrepancy' 'equidistant' 'uniform'
+
+# BASE DEFAULTS for the per-mode loss coefficients. The live values on any
+# given step are these blocks overlaid with the CURRENT protocol stage's
+# loss_coeffs overrides (see the protocol: block below) -- a pure function of
+# (defaults, stage), rebuilt every set_loss_coeffs() call. No schedules, no
+# cross-step mutation; keep these blocks to structural values (beta,
+# loss_clip, vg_by_condition, subtb_lambda, ...) and put anything a stage
+# turns on in that stage's own override dict.
+fwd_loss_coeffs:
+  tb: 0.0
+  freeze_policy: 0.0  # 1 => train Z only (detach policy + conditioner from the loss, replaces old tb_z=2)
+  freeze_z: 0.0       # 1 => train policy only, log_Z_learned detached from the loss (replaces old tb_z=0). neither set => train both (old tb_z=1). fwd tb must be >0
+  vg_lb: 0.0
+  vg_lme: 0  # exclusive with vg_lb
+  vg_by_condition: 0.0  # group VarGrad/emp_z estimation by condition_id (scatter: pools K-repeat tiles AND independent same-condition draws per batch) instead of by the K-repeats tile. Small condition libraries then get large per-batch estimates with repeats staying 1; large libraries (each condition ~once per batch) still want repeats > 1 so every group has >= K samples
+  db: 0.0
+  subtb: 0.0
+  subtb_lambda: 0.95
+  emp_z: 0  # train Z(c) toward the batch's empirical per-condition estimate (Jensen mean of log w unless vg_lme > 0 selects logmeanexp). With vg_by_condition it works standalone; in the legacy repeats-grouped path it must combine with a VG loss. NB: > 0 also disables fwd tb activation at phase1to3 (emp_z owns Z training)
+  emp_z_persistent: 0  # separate sidecar: train log_Z_learned to regress onto condition_log_z's persistent per-condition estimate (masked to warmed-up conditions), independent of tb_z_source
+  traj_grads: 0.0
+  reward_grads: 0.0
+  repeats: 1.0  # per-mode K-tiling factor (scheduled like any coefficient); with vg_by_condition and a 2-condition library, condition grouping already pools ~B/2 rows per estimate, so no fwd tiling (and its per-rollout energy cost) is needed
+  loss_clip: 1.0E+9
+  beta: 10.0  # Huber beta
+bwd_loss_coeffs:
+  tb: 0.0 #1.0  # must be nonzero for log Z backwards-trained warm start
+  freeze_policy: 0.0  # 1 => train Z only (replaces old tb_z=2, the bwd warm-start default)
+  freeze_z: 1.0       # 1 => train policy only, Z detached (replaces old tb_z=0). neither => train both (old tb_z=1). bwd tb must be >0
+  vg_lb: 0
+  vg_lme: 0  # exclusive with vg_lb
+  vg_by_condition: 1.0  # group bwd VarGrad by condition_id (cross-terminal; pools buffer draws + K repeats). Off-policy SAFE as a policy loss: zero variance is a measure-independent fixed point, and a dropped mode is an extreme positive log w outlier, so this doubles as mode retention. The group center is a biased Z estimate off-policy, so bwd emp_z is asserted off with this. Per-tile (repeats) grouping would just be TBC in disguise -- cross-terminal pressure requires condition grouping
+  pf_boost: 0
+  db: 0.0
+  subtb: 0.0
+  subtb_lambda: 0.95
+  emp_z: 0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
+  emp_z_persistent: 0  # see fwd_loss_coeffs.emp_z_persistent
+  mle: 0.0  # weighted MLE if VG is running with repeats, otherwise trajectory-wise. Default 0 -- the train_prior stage turns it on in its own loss_coeffs override
+  tbc: 0.0  # trajectory balance consistency (arXiv:2209.02606 eq. 33): reward-free VarGrad over the K backward rollouts per terminal state -- trains flow consistency during MLE pre-training so intra-terminal Var(log w) is already tame when Z learning activates. REQUIRES repeats > 1. Default 0; the train_prior stage turns it on
+  repeats: 1.0  # per-mode K-tiling: K same-terminal backward rollouts (multiplies bwd batch rows) for exact-MLE and tbc; larger K = better-conditioned consistency/IWAE estimates at proportionally larger batches. Default 1; the train_prior stage raises it
+  traj_grads: 1.0
+  loss_clip: 1.0E+9
+  beta: 10.0  # Huber beta for TB-style losses
+replay_loss_coeffs: # applied to trajectories pulled from the replay buffer (see replay_buffer below)
+  tb: 1.0
+  freeze_policy: 0.0  # 1 => train Z only (old tb_z=2)
+  freeze_z: 1.0       # 1 => train policy only, Z detached (replaces old tb_z=0). neither => train both (old tb_z=1)
+  vg_lb: 0
+  vg_lme: 0  # exclusive with vg_lb
+  pf_boost: 0
+  db: 0.0
+  subtb: 0.0
+  subtb_lambda: 0.95
+  emp_z: 0  # separate from tb, train Z to match the empirical lme estimate. Must combine with a VG loss
+  emp_z_persistent: 0  # see fwd_loss_coeffs.emp_z_persistent
+  mle: 0.0  # will do weighted MLE if VG is running with repeats, otherwise trajectory-wise
+  repeats: 1.0  # per-mode K-tiling factor; replay replays stored trajectories (K copies would be identical), keep at 1
+  traj_grads: 0.0
+  loss_clip: 1.0E+9
+  beta: 10.0 # Huber beta for TB-style losses
+
+# persistent per-condition empirical log Z tracker (buffer.py: ConditionLogZTracker),
+# decoupled from prior/replay/anchor buffers entirely -- see emp_z_persistent above.
+# fwd/bwd/replay_tb_z_source live here rather than inside *_loss_coeffs because the
+# coeff namespaces are numeric-only (rebuilt from defaults + stage overrides every
+# set_loss_coeffs() call) -- a string field there would break that rebuild.
+condition_log_z:
+  min_visits: 20  # a condition needs this many visits before tb_z_source: persistent / emp_z_persistent will use its estimate
+  half_life_steps: 7.0  # tracker's evidence half-life, in TRAINING STEPS (not update() calls) since a condition's own last visit -- decoupled from how often any given condition happens to get sampled, so it doesn't need retuning as the condition library grows or visit cadence gets uneven
+  trim_frac: 0.1  # per-condition-group trimmed mean for ema_logw (top/bottom fraction dropped by rank before averaging) -- guards the arithmetic-mean Jensen estimate's VALUE against rare catastrophic-energy outliers; no-op on small batches with nothing to trim
+  max_batch_weight: 200.0  # caps how much effective evidence (min of a batch's ESS and this ceiling) any single update() call can contribute, regardless of raw batch size -- guards against one huge batch (e.g. eval, ~5000/condition here) nearly overwriting hundreds of steps of accumulated training-time evidence just by being large
+  discovery_half_life_steps: 200.0  # half-life (TRAINING STEPS) of the minima-discovery rate EMAs (condition_minima_rate_ema / condition_minima_depth_rate_ema): per-step rate of strict per-condition best_energy improvements -- ~0 when minima have gone static, rising with discovery churn. Depth metrics are intensive: energy units of reduction PER VISITED CONDITION, so they don't scale with condition-library size. Pure monitoring; nothing feeds back into training
+  fwd_tb_z_source: learned  # 'learned' (default, unchanged) or 'persistent': once a condition has enough visits, swap the persistent per-condition empirical log Z in for log_Z_learned in the TB residual instead
+  bwd_tb_z_source: learned
+  replay_tb_z_source: learned
+  mol_sampling_weighted_by_z_gap: true  # if true, fwd_train_step draws mol_dataset rows weighted toward higher tracked z_gap (ema_log_z_emp - ema_logw, at each molecule's base condition_id) instead of uniformly, so molecules whose log Z estimate hasn't converged (the under-covered extrema tail) get sampled more often -- concentrates forward attention on the tail instead of the already-converged bulk. Applies ONLY in stages declaring the zgap_mol_sampling flag (stages where forward trains the POLICY, so steering reduces the tail's Var(log w)); in a Z-only forward stage high z_gap = high Var(log w) = worst TB-Z gradient the policy can't fix, so leave the flag off there
+  mol_sampling_z_gap_clip_quantile: 0.99  # z_gap is clipped at this quantile and NORMALIZED by it -> scale-free priority in [0,1], so temperature never needs retuning as the gap range shrinks / changes per problem, and no single ema_log_z_emp blowup can dominate. Falls back to uniform when the tail has closed (scale ~0). null = legacy raw-gap (temperature then in nats)
+  mol_sampling_z_gap_temperature: 0.5   # softmax temperature over the [0,1] normalized priority; ~0.3 sharper (top ~1% ~27x the bulk), ~1.0 gentler (~2.7x). 0.5 -> tail ~5% of conditions gets ~4-5x its uniform share
+  mol_sampling_uniform_beta: 0.5  # fraction of each mol_dataset draw taken uniformly at random regardless of z_gap weight -- a freshness floor so every condition still gets visited (keeps tracker stats + retention alive on the converged bulk). 0.5 = half uniform / half tail-steered
+
+# ============================================================================
+# TRAINING PROTOCOL -- the declarative stage interface (protocol.py).
+# One ordered list of stages replaces the old phase-1/2/3 + forward-first
+# machinery. Each stage declares its train mode, backward sampling source,
+# behavior flags, loss-coefficient overrides (over the base *_loss_coeffs
+# defaults above), mode-frac balance rules, exit trigger, and transition
+# actions. Checkpoints store only the stage NAME plus the engine state
+# (stage_ctrl); behavior always re-derives from THIS config, so editing it
+# rewrites a resumed run's future -- no override flags needed.
+#
+# Per-stage keys:
+#   train_mode:        'bwd' (every step is a backward step) | 'fused'
+#                      (fwd/bwd/replay fire together, losses fused by frac)
+#   bwd_sampling_mode: 'dataset' (static prior_dataset) | 'prior' (churned
+#                      prior_buffer, requires a prior model -- see snapshot_prior)
+#   flags:             per-stage behavior switches:
+#                        update_log_z         condition_log_z tracker updates
+#                                             on bwd/replay losses
+#                        scramble_conditions  unconditional prior by
+#                                             construction: scramble the
+#                                             condition embedding INSIDE the
+#                                             model (conditioner runs on the
+#                                             true pairing; its detached output
+#                                             rows are K-tile-permuted at the
+#                                             conditioner->trunk seam, so the
+#                                             trunk is trained to IGNORE the
+#                                             embedding). Vector conditioning
+#                                             only (no-op otherwise -- see
+#                                             Modeller.scramble_applicable)
+#                        zgap_mol_sampling    z_gap-weighted forward mol draws
+#                        buffers_active       prior/replay buffer management +
+#                                             which buffer backward stats
+#                                             report on
+#                        mle_gate             run the MLE slope gate publisher
+#   fracs:             mode fractions applied once at stage ENTRY (omit to
+#                      carry the previous stage's fracs across)
+#   exit:              AND-list of {metric, above|below, abs?, patience?}.
+#                      Metrics resolve against the RUNNING metric_tracker EMAs
+#                      ('dir/name'), gate-published values ('gates/name'), or
+#                      -- explicit opt-in, evals are rare -- the eval metrics
+#                      dict ('eval/name'). Tick terms are checked every 10
+#                      steps; when all reach patience, the next eval is pulled
+#                      forward and the transition executes there with fresh
+#                      eval metrics. No exit = terminal stage.
+#   on_exit/on_enter:  route-specific actions -- snapshot:<tag> (pre-transition
+#                      reload point, stamps request_eval so a resume replays
+#                      the transition), snapshot_prior (freeze the EMA model as
+#                      THE prior + 'prior' checkpoint + drop 'best'),
+#                      bootstrap_z (Z warm start; ':train_conditioner' lets the
+#                      conditional fit shape an untrained conditioner).
+#                      Everything generic happens AUTOMATICALLY at every
+#                      transition: spike monitors reset + cooldown, combo
+#                      record cleared, optimizers rebuilt (fresh Adam moments),
+#                      LR re-warmed with a fresh probe baseline, eval + figs
+#                      pulled forward.
+#   skip_if:           'prior_loaded' -- on a fresh run, skip this stage when a
+#                      prior model was loaded, by path (prior_model_name) or
+#                      auto-refound (reuse_prior). The loaded prior is
+#                      sampling-only: skipping does NOT warm-start the policy
+#                      from it (see prior_model_name)
+#
+# Balance (fused stages): kind lexicographic walks rules in order, FIRST
+# violated rule's `boost` mode gets the EMA frac nudge; default_boost when all
+# clean, and anneal_patience clean ticks tighten every annealed rule by
+# controller.decay_rate toward its `min` (a number, or a metric name = dynamic
+# floor). Rules: absolute `above: X` (annealable), `below: X` (fixed floor,
+# never annealed -- e.g. an fwd/r2 calibration gate: bounded, saturating
+# metrics make deliberately LOOSE gates that don't steal priority from
+# coverage work during absorption), or `relative: best` with
+# `margin` (violated when value > own-running-best x margin; the best relaxes
+# upward by `drift`/tick -- degradation detectors, never absolute bars, since
+# achievable floors legitimately RISE with coverage). `abs: true` takes |value|;
+# `if_missing: violated` makes a cold metric vote instead of abstain;
+# `lookahead: true` projects the log-space trend before thresholding.
+# Per-stage `min_fracs: {mode: floor}` (fallback controller.min_mode_frac) and
+# `deactivate_threshold` state EXPLICITLY which modes may switch off: a floor
+# at/above the deactivate threshold = that branch is always computed; below it
+# = the mode can go truly dark (s706frkh: terminal bwd sat below the implicit
+# global deactivate for ~1700 steps -- zero backward gradients). A mode no
+# rule can boost is excluded from the fused loss; a mode whose metrics nothing
+# reads skips its force-refresh rollout.
+# kind: proportional instead splits two modes' mass proportionally to a pair
+# of lagging-spread metrics: {kind: proportional, metrics: {fwd: fwd/x, bwd:
+# bwd/x}, alpha: 0.05, floor: 0.01} -- the old phase-2 balancer, kept as a
+# capability.
+# `anneal_coeffs: {energy_config_key: {target: X, rate?: Y}}` (lexicographic
+# only) RAMPS UP a numeric energy_config coefficient (e.g. bounding_coeff,
+# reduction_coeff) toward `target` at the SAME clean-streak anneal event as
+# the rule thresholds above -- i.e. strictly lower priority than every rule,
+# since it only moves once the whole balance has been clean for
+# anneal_patience ticks in a row. The coefficient's base energy_config value
+# is the SOFT one: it's what the energy function is built with, so it's in
+# effect for every stage from run start (including stages that name nothing
+# here); a stage's anneal_coeffs only climbs its named coefficients off that
+# base once ITS balance is fully converged. Coefficients no stage names stay
+# pinned at their energy_config default forever (e.g. lj_coeff, which is
+# calibrated separately at init and must not be listed here).
+# ============================================================================
+
+# MLE slope gate (train.py update_mle_gate, runs on stages flagged mle_gate;
+# publishes gates/mle_flat for the exit trigger -- latching now lives in the
+# trigger's own `patience`). Regresses the RAW per-step bwd/mle batch loss
+# sampled every 10 steps: raw losses are ~independent across steps, so plain
+# OLS standard errors apply and the old 1000-step window (forced by regressing
+# a 100-step-EMA whose samples were ~90% correlated -- ~5 independent points)
+# shrinks to 300. If the raw series proves too noisy on a real system, raise
+# the window before touching mle_min_rate.
+mle_slope_t: 2.0  # confidence multiplier on the descent rate's standard error. 'flat' = rate + mle_slope_t * se(rate) < mle_min_rate, i.e. ~95% confident (at 2.0, one-sided) the true descent is below the negligible rate. HIGHER = more conservative = exits later. This is an EQUIVALENCE test, not a significance test: noise argues AGAINST exiting (an uncertain window cannot clear the bound) -- the safe direction
+mle_min_rate: 0.05  # the negligible descent rate, nats per 100 train steps: the warm-start exits once it is confident further MLE training buys less than this. Needs no normalization -- the MLE LEVEL carries the target's differential entropy and varies by system, but the RATE does not (nats are nats). Must sit above 2*se(rate) for the window or a true plateau can never clear the bound
+mle_slope_window: 300  # train steps of raw-loss gate samples (one per 10 steps) the slope is regressed over. Sets the resolution floor: long enough that 2*se(rate) < mle_min_rate. Code floors this at 4 samples (max(window // 10, 4))
+
+protocol:
+  stages:
+    # -- MLE warm-start: build a broad, self-consistent policy on the dataset
+    #    prior (unconditional by design), then freeze it as THE prior model
+    - name: train_prior
+      train_mode: bwd
+      bwd_sampling_mode: dataset
+      skip_if: prior_loaded          # a prior loaded by path IS this stage's product
+      flags:
+        update_log_z: true           # accumulate ema_logw / best_energy evidence
+        scramble_conditions: true    # unconditional prior by construction (see the flags key in the header comment); a later bootstrap_z:train_conditioner relies on this having kept the conditioner untrained
+        mle_gate: true
+      loss_coeffs:
+        bwd: { mle: 1.0, tbc: 1.0, repeats: 2.0 }
+      exit:
+        # gate flat for 5 consecutive checks (the old mle_plateau_patience),
+        # wass as a loose underfit-plateau ceiling (~4x the old convergence
+        # threshold -- it catches 'optimizer stalled but match still bad', not
+        # convergence), tbc converged so Z learning starts with tame
+        # intra-terminal Var(log w)
+        - { metric: gates/mle_flat, above: 0.5, patience: 5 }
+        - { metric: eval/wass_debiased, below: 0.015 }
+        - { metric: bwd/tbc, below: 2.0 }
+      on_exit: [ 'snapshot:phase1_exit', 'snapshot_prior' ]
+
+    # -- policy warm start for runs that loaded a shared prior and skipped
+    #    train_prior: same MLE+TBC loss on the dataset, but exits on the
+    #    matched-eval wass bar (fast) instead of the mle_flat slope gate
+    #    (slow), and never runs snapshot_prior -- the loaded prior model is
+    #    kept as-is. When no prior was found and train_prior ran, this stage
+    #    exits at its first eval (wass/tbc are already under these bars).
+    - name: warmstart
+      train_mode: bwd
+      bwd_sampling_mode: dataset
+      flags:
+        update_log_z: true
+        scramble_conditions: true
+      loss_coeffs:
+        bwd: { mle: 1.0, tbc: 1.0, repeats: 2.0 }
+      exit:
+        - { metric: eval/wass_debiased, below: 0.03 }
+        - { metric: bwd/tbc, below: 2.0 }
+      on_exit: [ 'snapshot:warmstart_exit' ]
+
+    # -- forward-first stage A: fwd TB trains policy AND Z on-policy, replay
+    #    retains, backward dormant at the floor (admitted only by the boundary
+    #    servo). Collapse expected -- calibration over coverage.
+    - name: buildout
+      train_mode: fused
+      bwd_sampling_mode: prior       # churned prior_buffer, never the atomic dataset
+      flags:
+        buffers_active: true
+      fracs: { fwd: 0.799, bwd: 0.001, replay: 0.2 }
+      # explicit floor/deactivation intent: bwd is TRULY dormant here (floor
+      # below the deactivate threshold -> its branch is never computed); fwd
+      # and replay may never switch off
+      min_fracs: { fwd: 0.02, bwd: 0.001, replay: 0.02 }
+      deactivate_threshold: 0.01
+      loss_coeffs:
+        fwd: { tb: 1.0 }               # policy + Z together; no Z bootstrap -- Z learns on-policy
+        bwd: { tb: 1.0 }               # armed but dormant (freeze_z stays 1 from base)
+      balance:
+        kind: lexicographic
+        default_boost: fwd           # fwd is the live, always-fresh calibration source
+        rules:
+          # Z is the ruler: calibrate it before chasing anything measured against it
+          - { metric: fwd/tb_resid_clipped, abs: true, above: 0.5, boost: fwd }
+          # on-policy calibration degrading -> hand throughput to fwd (not replay:
+          # boosting replay off a degrading fwd is the memorization-amplification loop)
+          - { metric: fwd/scatter_err, relative: best, margin: 1.3, drift: 0.003, boost: fwd }
+          # co-convergence with a one-sided floor: chase replay's scatter down toward
+          # fwd's LIVE level, never below it
+          - { metric: replay/scatter_err, above: 20.0, boost: replay, anneal: { min: fwd/scatter_err } }
+      exit:
+        # calibration gate: on-policy parity healthy for 2 consecutive ticks
+        - { metric: fwd/r2, above: 0.95, patience: 2 }
+      on_exit: [ 'snapshot:fwd_calibrated' ]
+
+    # -- forward-first stage B, TERMINAL: fwd policy frozen (Z-only), backward
+    #    pries open support as fast as calibration absorbs it.
+    #      Z > calibration-not-degrading > coverage-while-it-still-moves
+    #    Coverage is EARNED, never taken at the cost of the fit.
+    - name: terminal
+      train_mode: fused
+      bwd_sampling_mode: prior
+      flags:
+        buffers_active: true
+      # no fracs: carries buildout's split across the boundary
+      # explicit floor/deactivation intent: NO mode may switch off in terminal.
+      # bwd's floor sits ABOVE the deactivate threshold -- backward training
+      # never goes to zero here (s706frkh: bwd starved to the old implicit
+      # 0.001 floor and was skipped outright for ~1700 steps while
+      # relative_under sat 4x over its bar; if Pf gets bad enough to demand
+      # zero backward, the run is better restarted from a healthy snapshot)
+      min_fracs: { fwd: 0.0009, bwd: 0.01, replay: 0.0009}
+      deactivate_threshold: 0.001
+      loss_coeffs:
+        fwd: { tb: 1.0, freeze_policy: 1.0 }   # THE stage flip: forward becomes Z-only
+        bwd: { tb: 1.0 }
+      balance:
+        kind: lexicographic
+        default_boost: {replay: 0.9, fwd: 0.1}   # idle: keep the fit clean + hold Z at its fixed point
+        rules:
+          - { metric: fwd/tb_resid_clipped, abs: true, above: 0.5, boost: fwd }
+          # calibration: elevation over own running best (NEVER absolute, never
+          # annealed -- the floor legitimately rises with each adopted mode;
+          # an absolute bar would pin replay forever after mode 2, b9ze0p5c)
+          - { metric: fwd/r2, below: 0.9, boost: replay }
+          - { metric: bwd/relative_under, above: 8.0, boost: bwd, anneal: { min: 1.0 } }
+          # over_coverage: egregious-outliers-only tamp, LAST and UNANNEALED
+          # (c8utdn8q). What we care about is overall fwd calibration (the r2
+          # rule), not tightly clipped tails. The old anneal (min: 2.0)
+          # ratcheted this bar to its floor by ~6k steps -- right at the
+          # metric's natural 1.7-2.0 level -- so a marginal tail-clipping
+          # breach outranked a hard-violated under rule through the 20-22k
+          # absorption crisis (relative_under 6.5->13.4 while replay held
+          # ~0.77 and bwd starved at 0.21). The 8.0 bar itself was never
+          # crossed post-warm-start, so unannealed + demoted = dormant unless
+          # genuinely pathological. NB rule ctrl state is keyed by rule INDEX:
+          # resuming a pre-reorder checkpoint maps anneal/floor state to the
+          # wrong rules -- fresh runs only
+          - { metric: fwd/over_coverage, above: 8.0, boost: replay }
+        # lexicographically LAST: bounding/reduction_coeff above are set LOW
+        # (1.0) so they're soft for the WHOLE run, from train_prior onward --
+        # only once every rule above has run clean for anneal_patience ticks
+        # in a row (the same clean-streak event that tightens their
+        # thresholds) does the live value ramp up off that base toward
+        # `target`, never traded against an active violation. reduction_coeff
+        # co-anneals with bounding_coeff since both introduce similar
+        # boundary artifacts.
+        anneal_coeffs:
+          bounding_coeff: { target: 10.0 }
+          reduction_coeff: { target: 10.0 }
+
+    # -- standard equilibration route (unused while the forward-first stages
+    #    above are the protocol; swap it in for the buildout/terminal pair to
+    #    recover the old direct 1->3 behavior):
+    # - name: equilibrate
+    #   train_mode: fused
+    #   bwd_sampling_mode: prior
+    #   flags: {buffers_active: true}
+    #   fracs: {fwd: 0.0, bwd: 1.0, replay: 0.0}
+    #   loss_coeffs:
+    #     fwd: {tb: 1.0, freeze_policy: 1.0}   # on-policy Z ONLY
+    #     bwd: {tb: 1.0}
+    #   on_enter: [ 'bootstrap_z:train_conditioner' ]  # Z(c) fit onto ema_logw
+    #   balance:
+    #     kind: lexicographic
+    #     default_boost: replay
+    #     rules:   # old ModeBalanceController: Z > under-coverage > over-coverage
+    #       - {metric: fwd/tb_resid_clipped, abs: true, above: 0.5, boost: fwd, if_missing: violated, lookahead: true}
+    #       - {metric: bwd/relative_under, above: 8.0, boost: bwd, anneal: {min: 1.0}, lookahead: true}
+    #       - {metric: fwd/over_coverage, above: 8.0, boost: replay, anneal: {min: 1.0}, lookahead: true}
+
+# shared balance/fused mechanics (per-stage thresholds live in the rules above)
+controller:
+  min_mode_frac: 0.001  # FALLBACK frac floor for modes a stage's min_fracs doesn't name (stages state their floors explicitly; this catches omissions)
+  beta: 0.025  # probability mass the frac nudge moves per tick toward the boosted mode
+  deactivate_threshold: 0.01  # FALLBACK for stages without their own deactivate_threshold. Fused loss only: skip computing a branch entirely (not just down-weight it) if its frac falls below this. Keep < 1/3 so at least one branch always runs.
+  refresh_every: 10  # fused loss only: force-evaluate every non-dormant branch at least this often (even if deactivated) so its rolling metric_tracker stats don't go stale; deactivated branches still get zero weight in the fused loss
+  decay_rate: 0.95  # per-anneal-event tightening factor for annealed rule thresholds (per-rule anneal.rate overrides)
+  anneal_patience: 5  # consecutive all-clean balance ticks before one anneal event; guards against noise-triggered anneals
+  lookahead_horizon: 5  # rules with lookahead: true -- controller ticks (each ~10 train steps) to extrapolate metrics ahead before thresholding
+  lookahead_trend_alpha: 0.1  # EMA smoothing on the estimated per-tick trend
+
+# --- terminal policy-state detector (train.py::_terminal_policy_state) ---
+# ABSOLUTE sanity bounds on the fwd channels -> "this is no longer physics" -> rewind to best +
+# ratchet LR. Complements the spike monitors rather than duplicating them: those are RELATIVE (spike
+# vs their own rolling median) and go blind once the explosion IS the median, which is precisely
+# the state we need to catch. NOT an early warning -- the policy variance heads move only ~0.85
+# nats at the kill vs 1.2 nats on a benign excursion, so nothing leads; this is a terminal-state
+# detector whose actuator is a rewind. Both channels needed: djr13t0j detonated on logw_std
+# (8.6 -> 1.8e5 in <100 steps) while 1219ddv9 crept to death on box_violation (-> 19.8) with
+# logw_std never clearing 994. Healthy: logw_std 8-46, box_violation 0.001-0.004.
+# null disables a channel.
+terminal_logw_std: 1000.0      # >20x the worst healthy logw_std (46), >100x below djr13t0j's death (1.8e5)
+terminal_box_violation: 1.0    # ~300x above healthy (0.004); "samples a full unit outside a [-1,1] box"
+
+# conditional r2: quick_tb_stats' pooled 'r2' is inflated by between-condition Z(c)
+# spread at scale (r2-pooled-conditional-gate). '{fwd,bwd,replay}/r2_within' (sample-
+# weighted, group-mean-centered) and '.../r2_worst' (per-condition quantile, the
+# stricter "r2 > 0.9 for ALL conditions" reading) are always computed and logged
+# whenever condition_id is present; not yet wired into any gate/rule below -- swap
+# fwd/r2 for one of these in the buildout exit gate and terminal calibration rule
+# once a conditional run is actually configured.
+r2_worst_quantile: 0.0  # quantile across condition groups for r2_worst; 0.0 = strict min
+
+buffers:
+  # buffer
+  prior_buffer:
+    seed_source: 'prior_dataset' #'prior_dataset'  # 'generated' (default: buffer starts empty, fills at churn rate from prior-model sampling) or 'prior_dataset': seed at init with the full prebuilt prior dataset (random-subsampled to max_size if larger), with FRESH per-sample records (ema_loss NaN, counts 0) so churn/purge priorities re-form under the current policy -- instant full buffer at phase-2/3 entry instead of slow filling
+    mean_lifetime: 100 # batch size adjusted mean lifetime to buffer samples
+    min_size: 10000
+    max_size: 50000
+    condition_block_m: 2  # >= 2: bwd 'prior' draws are condition-blocked -- sample conditions, then up to M DISTINCT rows (different terminals) each, so condition-grouped bwd VarGrad gets cross-terminal signal in ~every row instead of only via birthday collisions (~25% of rows at batch 2500 over 10k conditions). Auto-active only while bwd vg_lb > 0 (phase 2); `repeats` same-terminal tiles (TBC) stack on top; singleton conditions are skipped with uniform fallback fill. 0 = off
+    reward_min: -600 # bootstrap-only fallback admission floor (absolute), used only until a condition_log_z tracker or anchor_buffer exists to admit/reach-check relative to each sample's own condition_id's best energy instead (see Modeller._condition_energy_floor)
+    # quick_tb_stats' weighted under_coverage ramp, in ENERGY units of per-condition depth
+    # d = E - E*_c above each sample's own condition's best known energy (tracks the achievable
+    # scale as it rises over training):  w_raw(d) = clamp((ramp_floor - d) / ramp_width, 0, 1)
+    #   ramp_floor: contribution cutoff -- weight 0 at d >= ramp_floor, i.e. only samples within
+    #               ramp_floor of their conditional minimum contribute to the metric at all
+    #   ramp_width: width of the linear 0->1 transition band anchored AT the floor -- weight
+    #               saturates to 1 at d = ramp_floor - ramp_width and stays 1 down to the minimum
+    # Requires 0 < ramp_width <= ramp_floor (validated at read; the old floor_range/knee_range
+    # pair silently inverted when knee > floor). No-op until an anchor buffer exists.
+    # ramp_floor also doubles as manage_prior_buffer's admission/reach-trigger margin above each
+    # condition's best known energy -- equivalence with the reward-space ramp holds only while
+    # energy_config.temperature==1.0; will need separating if temperature varies.
+    ramp_floor: 100
+    ramp_width: 50
+
+  # trajectory replay buffer - stores full forward trajectories of overweighted on-policy
+  # samples (residual > buffer_resid_cutoff) so they can later be exactly replayed
+  # (get_traj_replay) during the "replay" training step instead of re-sampled backward from
+  # the terminal state alone
+  replay_buffer:
+    random_churn_rate: 50  # number of random samples to add/purge per replay train step
+    max_size: 100000  # if this is too big, or takes too long to churn, it becomes a lagging indicator
+
+  # permanent archive of high-quality, mutually latent-distinct samples -- grows only
+  # through admission (never churned like prior_buffer/replay_buffer above), and tops
+  # up prior_buffer via isotropic noising + rescoring whenever a prior-sampling churn
+  # cycle comes up short of admissible samples on its own
+  anchor_buffer:
+    seed_source: 'prior_dataset' #D:\crystal_datasets\conditional\priors\toy_2harm_conditions.pt #'prior_dataset'   # 'generated' (default, unchanged: lazy-bootstrap from the first fwd-eval-sampled batch), 'prior_dataset' (seed from the real high-quality dataset already loaded for backward training), or a path to torch.load a curated set of good seeds from
+    max_size: 200000
+    dup_cutoff: 0.05          # latent L2 distance below which two CONFIRMED-SURPRISING candidates are treated as literal duplicates; restricted to same-condition_id pairs. Not a novelty gate (surprise is) -- only ever runs on the rare confirmed set, so kept tight (see AnchorBuffer.admit)
+    screen_energy_window: 20  # cheap one-rollout screen's energy pre-filter: candidate's energy must be within this many ENERGY units of that condition's Emin(c) (condition_log_z.best_energy) before spending a backward rollout on it
+    thin_energy_window: 50   # deliberately wider than screen_energy_window -- thin()'s energy-window trim drops anchors whose energy - Emin(c) exceeds this; monotonic and safe since Emin(c) only ever decreases
+    surprise_cutoff: -5       # screen gate on the CENTERED TB residual log_Z(c) + (log_pf - log_pb) - log_r (k=1 estimate): below this = the policy under-credits the state by >= this many nats relative to its Boltzmann weight -> "plausibly surprising". Comparable across conditions by construction
+    confirm_cutoff: -5        # confirm gate: same centered residual on the K-rollout logsumexp estimate log_p_hat; defaults equal to surprise_cutoff since logsumexp is dominated by the best rollout and is structurally a stricter/less-noisy bar than the K=1 screen at the same threshold. NB refresh_anchor_buffer_surprise now refreshes replay priority on this same centered axis
+    confirm_k: 5               # number of backward rollouts for the logsumexp confirmation pass (5-10 recommended); only ever spent on screen-survivors, so cheap in aggregate
+    # policy-health gate on the whole screen/confirm path: surprise is measured THROUGH the live
+    # policy's log_pf, so a damaged policy reads its own log_pf collapse as fake surprise on
+    # everything (c8utdn8q: 382 spurious admissions in the one eval inside its 20-22k LR
+    # excursion, r2 0.84-0.89 throughout). Admissions pause while fwd/r2 (EMA) sits below
+    # health_gate_r2 OR |fwd/tb_resid_clipped| (EMA, the zerr channel) exceeds health_gate_zerr;
+    # cold channels abstain (phase-1 seeding unaffected). Values mirror the terminal balance
+    # rules' calibration bar and zerr threshold on purpose -- same ruler, same trust criterion.
+    health_gate_r2: 0.9
+    health_gate_zerr: 0.5
+    replay_beta: 0.5           # random-floor fraction of anchor replay draws in top_up_prior_from_anchors, so every anchor gets replayed sometimes even at low priority
+    thin_every_n_evals: 5     # cadence (in eval cycles) for the full energy-window thin/hard-cap pass
+    refresh_every_n_evals: 5   # cadence (in eval cycles) for refresh_anchor_buffer_surprise's full sweep -- refreshes ema_loss (replay priority) for every anchor uniformly, bounding worst-case staleness at refresh_every_n_evals * eval_period steps
+    noise_log_range: [ -2.5, -1.5 ]  # log10-uniform isotropic latent noise magnitude applied when topping up prior_buffer
+    topup_admit_record_breakers: true  # noised children that STRICTLY lower their condition's Emin(c) stand for anchor admission (one child per drawn parent per topup by construction). No surprise rollouts spent: a record-breaker is a strictly deeper version of an already-vetted anchor, inherits its parent's frozen original_surprise, and admit()'s same-condition dup_cutoff pass resolves near-duplicates (usually replacing the parent in place). Strict-improvement-only = monotone descent toward the energy envelope, so no MCMC-like lateral drift. false/absent disables (children update Emin(c) but never stand for admission -- the old behavior)
+    reach_quantile: 0.9        # prior_buffer quantile (of energy - own condition_id's best known energy, pooled across conditions) checked against prior_buffer.ramp_floor
+    reach_threshold: 0.75      # trigger a purge-and-replace top-up if that quantile covers less than this fraction of ramp_floor (i.e. is still this far from its own condition's best)
+    reach_topup_size: 1000     # samples purged from prior_buffer's worst and replaced from anchors when the reach trigger fires
+
+# energy function settings
+################################################################
+energy_function: 'elj'
+temperature_conditioning: false  # if false, temperatures are set to temperature, and there is no annealing
+molecule_conditioning: false  # conditions the generative prediction on the molecule
+sg_conditioning: False  # whether to conditionally sample across space groups
+space_groups: [ 2 ]  # which space groups to sample over
+zp_conditioning: false # whether to condition over z prime values
+z_primes: [ 1 ]
+vector_conditioning: false  # per-sample condition vectors (molecules_path/prior_path entries' `c` attribute) embedded through a plain MLP (conditions_type stays 'vector') rather than molecule_conditioning's GNN -- for toy energy functions, where `c` isn't tied to any real molecular graph
+vector_conditioning_dim: 3  # dimensionality of the `c` vectors -- must match whatever data_processing/generate_toy_prior.py's config built molecules_path/prior_path with (data_ndim for latent_harmonic, cond_dim for latent_multiharmonic)
+energy_config:
+  internal_oom_recovery: true  # if false, skip the energy function's own adaptive sub-batching/OOM catch-and-shrink loop and analyze the whole batch in one call, so an OOM propagates up to train.py's global batch size reduction instead. Recommended false in fused mode, where the internal recovery destabilizes memory management.
+  temperature: 2.5 # 2.5 is room temperature kT in kJ/mol
+  log_temperature_range: [ 0, 0.693147 ]
+  # loss coefficients
+  density_coeff: 10.0  # how much to weight the density penalty term in the energy function
+  # SOFT from run start (see terminal stage's balance.anneal_coeffs below):
+  # this is the value the energy function is actually constructed with, so
+  # it's in effect through train_prior/buildout and terminal until terminal's
+  # balance runs clean -- only then does the live value ramp up toward
+  # anneal_coeffs' target: 10.0
+  bounding_coeff: 1.0
+  reduction_coeff: 1.0
+  lj_coeff: 1.0  # loss coefficient
+  reward_range: 500 # max ptp of reward values allowed, null to go unrestricted
+  analyze_kwargs: {}#{ width: 2.0, c: [ 0, 0] } #{width: 0.15}  # extra kwargs passed through to crystal_batch.analyze(), e.g. noise: 0.01, rdf_mode: 'envwise', cutoff: 6
+#                   c: [.5,.5,.5,.5,.5,.5,.5,.5,.5,.5,.5,.5]
+#  {width: 0.075,
+#                   c:[0,0,0,0,0,0,0,0],
+#                   modes: [.75,.75,.75,.75,.75,.75,.75,.75,.75,.75,.75,.75]

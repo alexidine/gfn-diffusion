@@ -1,0 +1,152 @@
+deadrow_aug12 -- launch sequence. Dead-latent-row change (decisions.md D33).
+=============================================================================
+
+Run from energy_sampling. Environment (reference_local_run_recipe):
+
+  $env:PYTHONPATH = "C:\Users\mikem\Projects\mxt_gfn\mxtaltools;C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion"
+  $PY = "C:\Users\mikem\venvs\csd_mxt_gfn\Scripts\python.exe"
+
+Arms are serial on one GPU. Total ~11.5k steps of crystal work plus the toy and
+the conformer check. Order below is cheapest-and-most-diagnostic first, so a
+break shows up in minutes rather than hours.
+
+
+STEP 0 -- unit suites (do not skip)
+-----------------------------------------------------------------------------
+& $PY test_dead_latent_rows.py      # ~20 s
+& $PY test_periodic_scoring.py      # ~20 s
+& $PY test_dead_latent_rows_deep.py # ~6 min (trains 3 small TB models)
+
+All three must end in ALL ... PASSED. They prove the CPU-bitwise claims the GPU
+battery cannot:
+
+  test_dead_latent_rows      no-dead-rows identity against recorded pre-change
+                             numbers, trajectory constancy, the density vs an
+                             independent MultivariateNormal, log-prob invariance to
+                             the held constant, the TorsionGFN subclass path.
+  test_dead_latent_rows_deep the STATISTICS. log Z equivalence to the reduced
+                             problem, bitwise exactness of the restricted log-prob,
+                             65 config x dead-set models, degenerate dead sets
+                             (live_dim 0/1), T in {1,2,60}, CPU/CUDA parity,
+                             Var(log w) losing the dead term, the free-axis
+                             canonicaliser's invariance and idempotency.
+
+If any fails, stop -- the battery would only tell you the same thing slower, and the
+deep suite localises a break far better than a training curve does.
+
+
+STEP 1 -- conformer regression: ALREADY COVERED BY STEP 0, do not gate on a run
+-----------------------------------------------------------------------------
+Adding the dead-row kwargs to GFN.get_periodic_dimensions broke this outright --
+TorsionGFN overrides that method, so construction raised TypeError before step 0
+for every conformer config. Fixed by delegating to _finalize_dim_partition.
+
+That regression is covered by
+    test_dead_latent_rows.py::test_subclass_layout_override_still_works
+which constructs TorsionGFN at three widths, checks the layout matches the old
+hand-written override exactly, rolls a trajectory, and asserts fwd/replay
+agreement. It runs in step 0 and needs no config, no dataset and no GPU.
+
+DO NOT gate this battery on `train_conformer.py --config ...`. The conformer
+pipeline is under active development, so that entrypoint may fail for reasons
+having nothing to do with dead rows -- and someone reading a failure there would
+reasonably but wrongly conclude this change broke conformers again. The unit test
+is the honest check because it isolates exactly the surface this change touched.
+
+If you do want the end-to-end run anyway (optional, ~2 min, conformer_dev.yaml is
+USER-OWNED and unmodified):
+    & $PY train_conformer.py --config configs\conformer_dev.yaml 2>&1 | tee configs\deadrow_aug12\e_conformer.log
+Reaching step 1 is the whole test; kill it once it is training. Interpret any
+failure against the conformer pipeline's own state FIRST, not against D33.
+
+
+STEP 2 -- priors (once, ~1-2 min)
+-----------------------------------------------------------------------------
+& $PY configs\deadrow_aug12\prep_priors.py
+
+Builds 10k ELJ-target subsets for the sg-14 and sg-9 arms and DROPS
+thermal_scaling_factor, so each arm's own lj_coeff governs rather than a
+MACE-derived scale. Idempotent: delete the deadrow10k_* files to rebuild.
+
+
+STEP 3 -- the two controls (must NOT move)
+-----------------------------------------------------------------------------
+& $PY train.py --config configs\deadrow_aug12\a_sg2_on.yaml  2>&1 | tee configs\deadrow_aug12\a_sg2_on.log
+& $PY train.py --config configs\deadrow_aug12\a_sg2_off.yaml 2>&1 | tee configs\deadrow_aug12\a_sg2_off.log
+
+sg 2 is triclinic, n_dead = 0, so the knob has nothing to do. These two differ
+ONLY in hold_dead_latent_rows and must agree. They resume mk_dev's pinned phase-1
+exit, which also makes them the end-to-end proof that a COMPATIBLE pre-change
+resume still loads.
+
+Read as agreement to GPU nondeterminism, NOT bitwise -- bitwise is step 0's job.
+The failure signal is a WIDENING gap, not a constant small offset.
+
+
+STEP 4 -- the primary pair (must DIFFER)
+-----------------------------------------------------------------------------
+& $PY train.py --config configs\deadrow_aug12\b_sg14_on.yaml  2>&1 | tee configs\deadrow_aug12\b_sg14_on.log
+& $PY train.py --config configs\deadrow_aug12\b_sg14_off.yaml 2>&1 | tee configs\deadrow_aug12\b_sg14_off.log
+
+sg 14 monoclinic, 2 of 12 rows dead. Cold start: expanded_dim is 14 vs 16, so the
+arms cannot share a checkpoint and no pre-change sg-14 checkpoint loads any more,
+by design.
+
+b_sg14_on's startup must print the resolved rows (3, 5) AND the probe line
+confirming latent_to_cell_params ignores them. This pair is the only measurement
+that speaks to F-009's tb_err-floor conjecture -- directionally, since neither arm
+converges at this budget.
+
+
+STEP 5 -- interaction and gate
+-----------------------------------------------------------------------------
+& $PY train.py --config configs\deadrow_aug12\c_sg9_zp2_on.yaml 2>&1 | tee configs\deadrow_aug12\c_sg9_zp2_on.log
+& $PY train.py --config configs\deadrow_aug12\d_toy_on.yaml     2>&1 | tee configs\deadrow_aug12\d_toy_on.log
+
+c_sg9_zp2_on is the only arm reaching zp_order_penalty's absolute
+raw_latents[:, 6:6+3k] slice -- the term the "states stay full width" design was
+chosen to protect. Dead rows stay (3, 5) while the state is 18 wide.
+
+d_toy_on must print the NON-CRYSTAL line and never a dead-row list. sg 1 there is
+a placeholder, and P1 has all three centroid axes free, so a bypassed is_crystal
+gate would eventually freeze three dims a toy genuinely uses.
+
+
+STEP 6 -- the negative test (manual, ~1 min, needs STEP 4 done)
+-----------------------------------------------------------------------------
+Copy b_sg14_on.yaml, point checkpoint_name at the checkpoint b_sg14_on wrote, and
+set model.hold_dead_latent_rows: false. Launching it MUST fail fast with
+
+    ValueError: dead_latent_rows mismatch: this run resolves () ... checkpoint
+    was built with (3, 5) ...
+
+That is _assert_dead_rows_match doing its job. Without it, the run would rebuild
+from the checkpoint's gfn_config with the rows LIVE while the startup probe
+printed reassurance, and log Z would revert to the old scale silently. This is
+the single most dangerous failure the change could have, so confirm the guard
+fires rather than trusting it.
+
+
+STEP 7 -- verification
+-----------------------------------------------------------------------------
+& $PY configs\deadrow_aug12\verify.py
+
+Reads the startup tells from the .log files above and locates the wandb runs.
+Then compare the pairs it names -- it deliberately reports numbers rather than
+passing judgement on anything this battery is too short to decide.
+
+
+WHAT A CLEAN RUN DOES NOT TELL YOU
+-----------------------------------------------------------------------------
+  * ORTHORHOMBIC (3 dead rows) has no prior on disk and is unit-tested only.
+    sg 19 is the most common Sohncke group; close this before chiral work.
+    Generate with data_processing/generate_sg_prior.py, then copy arm B.
+  * FREE AUNIT AXES are implemented at Z'=1 and NO ARM TESTS THEM -- every
+    polar/Sohncke Z'=1 group lacks a prior on disk, so that path is unit-tested
+    only. Arm C is Z'=2, where the mechanism is gated off by design, so its two
+    free axes stay live. Generate a Z'=1 polar prior (sg 4 or 9) and copy arm B
+    to close this; it is the largest remaining hole in this battery.
+  * dead_latent_values is not wired through _build_gfn_config, so hexagonal trips
+    the startup canonical-value assert by design. Unreachable here.
+  * CONVERGENCE. Nothing here runs long enough to judge whether a space group
+    trains well.

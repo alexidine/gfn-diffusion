@@ -1,0 +1,9 @@
+resolve_derived_config (W=512, T=10): lr_policy=0.00025, lr_replay=0.00025, lr_back=0.00025, lr_fused=0.000125, gradient_norm_clip=37.88, adaptive_lr.reset_grad_abs=3.8e+04, adaptive_lr.reset_loss_abs=2.5e+04
+lr_ctrl bars: cut_grad_abs=3800 reset_grad_abs=38000  |  in clip units: clip=37.8788, cut=100x, reset=1003x
+Loading model from checkpoint C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints/dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-573c92_phase1_exit.pt
+Restored buffers from sidecar C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints/dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-573c92_phase1_exit_buffers.pt (saved at step 6680)
+Re-analyzing prior energies
+protocol: stage 'train_prior' -> 'naive'
+protocol: optimizers rebuilt, LR re-warming over 1000 train steps
+protocol: stage 'naive' engaged (fwd 0.050 / bwd 0.9020 / replay 0.048, train_mode fused, bwd_sampling prior)
+Finished Training!

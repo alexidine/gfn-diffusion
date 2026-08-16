@@ -1,0 +1,92 @@
+[
+  {
+    "index": 0,
+    "tag": "cw00",
+    "outcome": "terminal_converged",
+    "wandb_run": "run-20260722_144517-0z8pulpt",
+    "final_step": 3960,
+    "phase": 5,
+    "rel_under": 1.8907729420506685,
+    "terminal_entry": 2980,
+    "terminal_steps": 980
+  },
+  {
+    "index": 1,
+    "tag": "cw01",
+    "outcome": "terminal_converged",
+    "wandb_run": "run-20260722_152626-tozpm72d",
+    "final_step": 3620,
+    "phase": 5,
+    "rel_under": 1.7904222427951912,
+    "terminal_entry": 2860,
+    "terminal_steps": 760
+  },
+  {
+    "index": 2,
+    "tag": "cw02",
+    "outcome": "terminal_converged",
+    "wandb_run": "run-20260722_170725-cgvk0qnh",
+    "final_step": 6740,
+    "phase": 5,
+    "rel_under": 1.9166873528331738,
+    "terminal_entry": 6110,
+    "terminal_steps": 630,
+    "note": "user-restarted from ckpt after metric fix"
+  },
+  {
+    "index": 3,
+    "tag": "cw03",
+    "outcome": "terminal_converged",
+    "wandb_run": "run-20260722_172547-i87pn5ei",
+    "final_step": 3790,
+    "phase": 5,
+    "rel_under": 1.8900850344479123,
+    "terminal_entry": 2990,
+    "terminal_steps": 800
+  },
+  {
+    "index": 4,
+    "tag": "cw04",
+    "outcome": "terminal_converged",
+    "wandb_run": "run-20260722_180755-vwikye6g",
+    "final_step": 4310,
+    "phase": 5,
+    "rel_under": 1.872040558772943,
+    "terminal_entry": 3030,
+    "terminal_steps": 1280
+  },
+  {
+    "index": 5,
+    "tag": "cw05",
+    "outcome": "terminal_converged",
+    "wandb_run": "run-20260722_185606-6tn1eqkn",
+    "final_step": 3810,
+    "phase": 5,
+    "rel_under": 1.9517689180335887,
+    "terminal_entry": 2920,
+    "terminal_steps": 890
+  },
+  {
+    "index": 6,
+    "tag": "cw06",
+    "outcome": "terminal_converged",
+    "wandb_run": "run-20260722_193646-qu343t8f",
+    "final_step": 4330,
+    "phase": 5,
+    "rel_under": 1.8851786639484407,
+    "terminal_entry": 3040,
+    "terminal_steps": 1290
+  },
+  {
+    "index": 7,
+    "tag": "cw07",
+    "outcome": "stopped_by_user",
+    "wandb_run": "run-20260722_202426-2ehyg79p",
+    "final_step": 5070,
+    "phase": 5,
+    "rel_under": 5.712461553763833,
+    "terminal_entry": 3360,
+    "terminal_steps": 1710,
+    "note": "killed mid terminal budget at user request; had not converged (rel_under >> 2)"
+  }
+]

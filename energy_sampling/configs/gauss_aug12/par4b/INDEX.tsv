@@ -1,0 +1,11 @@
+arm	sg	dead	n_live	hold	predicted_log_Z	prior
+a_sg2_on	2	-	12	True	-16.6038	gauss_latent_sg2_zp1_prior.pt
+a_sg2_off	2	-	12	False	-16.6038	gauss_latent_sg2_zp1_prior.pt
+b_sg14_on	14	3|5	10	True	-13.8365	gauss_latent_sg14_zp1_prior.pt
+b_sg14_off	14	3|5	12	False	-11.1810	gauss_latent_sg14_zp1_prior.pt
+c_sg19_on	19	3|4|5	9	True	-12.4528	gauss_latent_sg19_zp1_prior.pt
+c_sg19_off	19	3|4|5	12	False	-8.4696	gauss_latent_sg19_zp1_prior.pt
+d_sg4_on	4	3|5|7	9	True	-12.4528	gauss_latent_sg4_zp1_prior.pt
+d_sg4_off	4	3|5|7	12	False	-8.4696	gauss_latent_sg4_zp1_prior.pt
+e_sg1_on	1	6|7|8	9	True	-12.4528	gauss_latent_sg1_zp1_prior.pt
+e_sg1_off	1	6|7|8	12	False	-8.4696	gauss_latent_sg1_zp1_prior.pt

@@ -1,0 +1,72 @@
+- index: 0
+  run_name: elj_h512x4_T40_lr7.5e-5
+  width: 512
+  layers: 4
+  T: 40
+  eval_T: 40
+  seed: 12345
+  peak_lr: 7.5e-05
+  note: anchor at known-stable point
+- index: 1
+  run_name: elj_h512x4_T70_lr7.5e-5
+  width: 512
+  layers: 4
+  T: 70
+  eval_T: 70
+  seed: 12345
+  peak_lr: 7.5e-05
+  note: T transfer
+- index: 2
+  run_name: elj_h512x4_T100_lr7.5e-5
+  width: 512
+  layers: 4
+  T: 100
+  eval_T: 100
+  seed: 12345
+  peak_lr: 7.5e-05
+  note: T transfer
+- index: 3
+  run_name: elj_h1024x4_T40_lr2.0e-5
+  width: 1024
+  layers: 4
+  T: 40
+  eval_T: 40
+  seed: 12345
+  peak_lr: 2.0e-05
+  note: width transfer at toy-scaled peak
+- index: 4
+  run_name: elj_h1024x4_T100_lr2.0e-5
+  width: 1024
+  layers: 4
+  T: 100
+  eval_T: 100
+  seed: 12345
+  peak_lr: 2.0e-05
+  note: width x long-T corner
+- index: 5
+  run_name: elj_h512x4_T40_lr1.5e-4
+  width: 512
+  layers: 4
+  T: 40
+  eval_T: 40
+  seed: 12345
+  peak_lr: 0.00015
+  note: 512 ceiling probe (overshoot expected)
+- index: 6
+  run_name: elj_h1024x4_T40_lr6.0e-5
+  width: 1024
+  layers: 4
+  T: 40
+  eval_T: 40
+  seed: 12345
+  peak_lr: 6.0e-05
+  note: 1024 ceiling probe (overshoot expected)
+- index: 7
+  run_name: elj_h512x6_T40_lr4.0e-5
+  width: 512
+  layers: 6
+  T: 40
+  eval_T: 40
+  seed: 12345
+  peak_lr: 4.0e-05
+  note: depth transfer

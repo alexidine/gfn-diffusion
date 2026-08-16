@@ -1,0 +1,9 @@
+pair	name	budget	epochs	asks
+A	a_frz	3600	6250	D30 frozen cell at T=10. mk_dev as-shipped. The control.
+A	a_unf	3600	6250	D30 unfrozen cell at T=10. If fwd/tb_err falls here and rises in a_frz, the 2026-08-07 result replicates at 4.5x length and synthesis.md section 1s thesis -- policy trained entirely off-policy, fwd trains only Z -- is in trouble.
+B	b_frz_seedB	3600	6250	seed replicate of the pair-A cell of the same name. Gives the detection threshold for A, C and D at once, and the first local read of alpha_median seed spread -- A4s clip(median, 0.9, 1.1) is mis-sized if that is wide.
+B	b_unf_seedB	3600	6250	seed replicate of the pair-A cell of the same name. Gives the detection threshold for A, C and D at once, and the first local read of alpha_median seed spread -- A4s clip(median, 0.9, 1.1) is mis-sized if that is wide.
+C	c_frz_rep20	3600	6250	FROZEN, fixed mix {'fwd': 0.2, 'bwd': 0.6, 'replay': 0.2}. rep20 is the pinned-mix control (isolates "controller off" from "more replay"); rep40 doubles replay weight. Both read against a_unf, which got LESS replay (0.238) than a_frz (0.286) and still won.
+C	c_frz_rep40	3600	6250	FROZEN, fixed mix {'fwd': 0.2, 'bwd': 0.4, 'replay': 0.4}. rep20 is the pinned-mix control (isolates "controller off" from "more replay"); rep40 doubles replay weight. Both read against a_unf, which got LESS replay (0.238) than a_frz (0.286) and still won.
+D	d_frz_lrup	3600	6250	lr_fused 0.000215 = 1.72x the resolved base, the probes own estimate of a_frzs optimum. With pair A this is the D30 2x2 at T=10 -- the cell rb0808 could not run.
+D	d_unf_lrup	3600	6250	lr_fused 0.000215 = 1.72x the resolved base, the probes own estimate of a_frzs optimum. With pair A this is the D30 2x2 at T=10 -- the cell rb0808 could not run.

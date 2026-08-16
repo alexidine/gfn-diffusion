@@ -1,0 +1,18 @@
+C:\Users\mikem\venvs\csd_mxt_gfn\Lib\site-packages\e3nn\o3\_wigner.py:10: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  _Jd, _W3j_flat, _W3j_indices = torch.load(os.path.join(os.path.dirname(__file__), 'constants.pt'))
+W0722 15:26:14.548000 27292 Lib\site-packages\torch\distributed\elastic\multiprocessing\redirects.py:29] NOTE: Redirects are currently not supported in Windows or MacOs.
+C:\Users\mikem\venvs\csd_mxt_gfn\Lib\site-packages\pydantic\_internal\_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'repr' attribute with value False was provided to the `Field()` function, which has no effect in the context it was used. 'repr' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+C:\Users\mikem\venvs\csd_mxt_gfn\Lib\site-packages\pydantic\_internal\_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True was provided to the `Field()` function, which has no effect in the context it was used. 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+condition_manifold (interpolate): expanded 2 anchors -> 52 conditions, each with its own unique identifier ('manifold_ab_NNNN' + anchor names)
+Partition functions per condition (target_temperature=1.0):
+  [mode_a] log Z = -0.268956   Z = 0.764177
+  [mode_b] log Z = 0.268516   Z = 1.30802
+Saved condition set -> D:\crystal_datasets\conditional\priors\cw01_conditions.pt (520 graphs, 52 unique identifiers)
+prior: n_samples_total=20000 over 52 conditions -> 385 samples per condition (20020 realized total)
+prior (shared, vectorized): 52 conditions baked in one analyze() call
+prior: equalized_n_samples_total=100000 over 52 conditions -> 1924 samples per condition (100048 realized total)
+prior (shared, vectorized): 52 conditions baked in one analyze() call
+Saved prior -> D:\crystal_datasets\conditional\priors\cw01_prior.pt (20020 / 100048 graphs)
+coverage_check: 52 conditions, 96 IS samples each -- ESS fraction min 0.01042 / median 0.01042 / max 0.02065; 0 below min_ess_frac=0.01

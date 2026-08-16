@@ -35,6 +35,8 @@ CPU-only.
 import os
 import sys
 
+import pytest
+
 import torch
 
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -46,10 +48,69 @@ for p in (os.path.dirname(_here), os.path.join(os.path.dirname(_here), '..', 'mx
 PRIORS = r'D:\crystal_datasets\conditional\priors'
 _R = []
 
+def _under_pytest():
+    """Checked at CALL time, not import time: PYTEST_CURRENT_TEST is set while a
+    test executes, not while the module is collected, so an import-time constant
+    reads False under pytest and silently disables every pytest-only path here."""
+    return 'PYTEST_CURRENT_TEST' in os.environ
+
 
 def check(name, ok, detail=''):
+    """Record a check, and under pytest RAISE on failure.
+
+    Script mode keeps the original behavior: record, print, carry on, and let
+    `main()` report every case together -- which is what makes a partial failure
+    readable when you are working on the thing being tested.
+
+    Under pytest it must raise, and raise HERE. Recording silently would leave a
+    failed invariance check reporting PASS. Asserting in fixture teardown instead
+    was tried and is wrong: pytest classifies a teardown assertion as an ERROR and
+    still counts the test as passed, so a broken check reads as `6 passed, 5
+    errors` -- exactly the ambiguity this file exists to remove."""
     _R.append((name, bool(ok), detail))
     print(f"  {'PASS' if ok else 'FAIL'}  {name}   {detail}")
+    if not ok and _under_pytest():
+        raise AssertionError(f'{name}: {detail}')
+
+
+def _skip_missing(path, label):
+    """Absent data: a real skip under pytest, a printed note in script mode.
+
+    Never a silent return -- a test that reports success without touching data is
+    exactly the reassurance-shaped silence this file was written to rule out."""
+    msg = f"{label}: prior not on this machine ({path})"
+    if _under_pytest():
+        pytest.skip(msg)
+    print(f"  SKIP {msg}")
+
+
+@pytest.fixture(autouse=True)
+def _test_must_actually_check_something():
+    """Guard the remaining silent-pass route: a test body that records no checks
+    at all.
+
+    Failed checks are handled by `check` itself, which raises where it happens.
+    What is left is a test that runs to completion having asserted nothing --
+    absent data is already a skip, so reaching here with an empty record is a
+    structural defect in the test rather than a wrong answer from the code. It
+    surfaces as a teardown ERROR, which is the honest classification for that and
+    still fails the run.
+
+    Inert in script mode: `main()` does not invoke fixtures, so its
+    run-all-then-report behavior is untouched."""
+    start = len(_R)
+    yield
+    assert _R[start:], 'no checks ran -- the test body asserted nothing'
+
+
+_COMPOSITION_CASES = [
+    # Z'=1 is the CONTROL: only the max_z_prime > 1 branch was affected, so it
+    # must have been correct before the fix and must stay correct after it.
+    ('nehzor_sg14_zp1_elj_prior_dataset.pt', "sg14 Z'=1 (control)"),
+    ('deadrow10k_sg9_zp2_elj.pt', "sg9 Z'=2"),
+    ('deadrow10k_sg14_zp2_elj.pt', "sg14 Z'=2"),
+]
+_WORST_CASE_CASES = _COMPOSITION_CASES[1:]  # the control has no Z'>1 stack to break
 
 
 def _pool(path, n):
@@ -130,10 +191,11 @@ def _three_routes(pool):
     return alone, batched, unshuffled
 
 
+@pytest.mark.parametrize('fname,label', _COMPOSITION_CASES, ids=lambda v: v)
 def test_energy_is_invariant_to_batch_composition(fname, label, n=12):
     path = os.path.join(PRIORS, fname)
     if not os.path.exists(path):
-        print(f"  SKIP {label} (prior not on this machine)")
+        _skip_missing(path, label)
         return
     pool = _pool(path, n)
     print(f"\n  {label}  (Z'={int(pool.max_z_prime)}, n={pool.num_graphs})")
@@ -148,6 +210,7 @@ def test_energy_is_invariant_to_batch_composition(fname, label, n=12):
           f"max |d| {d_shuf.max():.4g} < tol {tol:.4g}")
 
 
+@pytest.mark.parametrize('fname,label', _WORST_CASE_CASES, ids=lambda v: v)
 def test_invariance_on_the_worst_case_pool(fname, label):
     """
     The same property on the pool built to break it: minimum-buffer crystal at position 0,
@@ -155,7 +218,7 @@ def test_invariance_on_the_worst_case_pool(fname, label):
     """
     path = os.path.join(PRIORS, fname)
     if not os.path.exists(path):
-        print(f"  SKIP {label} worst-case (prior not on this machine)")
+        _skip_missing(path, f"{label} worst-case")
         return
     pool, buf = _adversarial_pool(path)
     print(f"\n  {label} WORST CASE  (buffer at position 0: {float(buf[0]):.2f} A, "

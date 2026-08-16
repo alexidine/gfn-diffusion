@@ -1,0 +1,4 @@
+name	molecules_path	test_molecules_path
+qm9_v1	qm9_v1_conditions.pt	-
+qm9_v2	qm9_v2_conditions.pt	-
+qm9_v8	qm9_v8_conditions.pt	qm9_heldout_conditions.pt

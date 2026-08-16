@@ -1,0 +1,186 @@
+gauss_aug12 -- launch order and what to read
+============================================================================
+10 arms. Every arm has a CLOSED-FORM log Z, so each one either lands on its
+number or it does not. This is the first end-to-end correctness test of D33;
+deadrow_aug12 is the smoke battery on physical energies.
+
+PREREQUISITES (both already done, 2026-08-12 -- re-run only if spec.py changes)
+
+    python configs/gauss_aug12/prep_prior.py     # writes 5 priors, 21.9 MB each
+    python configs/gauss_aug12/make.py           # writes the 10 arm YAMLs
+    python configs/gauss_aug12/verify.py         # 10/10 load, GFN dead rows correct
+
+  verify.py is not optional decoration. It puts every arm through the REAL
+  loader, re-parses the protocol through protocol.Stage, and builds the real
+  energy function and GFN to read back dead_idx / live_dim / expanded_dim.
+  A retired schema key raises at LOAD, so ten clean-looking YAMLs can still
+  die at startup on all ten.
+
+WALL TIME, MEASURED 2026-08-12 on the RTX 5080 Laptop, batch 1000, T=10:
+~6.7 it/s before the first eval, settling to ~2.5 it/s OVERALL once eval_period
+150 at 10000 samples is being paid -- i.e. eval is roughly two thirds of the wall
+clock here, because the train step on an analytic energy is nearly free. So
+~26 min per 4000-step arm and ~4.5 h for all ten, sequentially. (tqdm's rate
+includes eval; the pure train step is the train_step_time metric.)
+
+Run them SEQUENTIALLY -- parallel arms contend for the GPU, and while that would
+not corrupt emp_z (an equal-STEPS comparison), it makes train_step_time
+unreadable. If wall clock matters more than that, cutting eval_num_samples is the
+cheaper lever than parallelism -- but note emp_z's noise floor scales as
+1/sqrt(N), and at 10000 it is already only ~0.003.
+
+CONVERGENCE IS FAST because the prior IS the target: c_sg19_on was already within
+0.004 nats of its analytic log Z by step 510. The 4000-step budget is therefore
+mostly a stability test, not a convergence one.
+
+READING TOLERANCE. emp_z has real sampling noise; do not read a 0.01 miss as a
+failure. Estimate the floor from the run's own numbers: emp_z - jensen_z ~ Var/2,
+so SE ~ sqrt(Var / eval_num_samples). At Var 0.106 and N 10000 that is 0.0033, so
+anything inside ~0.01 is noise for a rows-held arm. Rows-live arms carry ~3x the
+variance and a correspondingly wider floor.
+
+============================================================================
+THREE CONDITIONS EXIST. Know which one you are reading.
+============================================================================
+  configs/gauss_aug12/*.yaml     FULL SIZE, one arm at a time. cuda_memory_fraction
+                                 0.9, buffers on cuda, eval 10000. The reference.
+  configs/gauss_aug12/par4/      4-WAY CO-TENANT. LR servo still ON. This is the
+                                 condition F-024 and F-025 were measured in, and
+                                 F-025 says its convergence-rate comparisons are
+                                 CONFOUNDED: the servo trained the two arms of a
+                                 pair 8x apart in LR.
+  configs/gauss_aug12/par4b/     4-WAY CO-TENANT, LR PINNED at 1e-5 and stage 1
+                                 uncapped from gates/mle_flat. Use this for any
+                                 held-vs-live comparison.
+
+    python configs/gauss_aug12/make.py --cotenants 4 --pin-lr --cap-stage1 --suffix b
+
+Co-tenancy is measurement-driven, not a preference. `cotenant_fraction` reads
+.vram_registry.json and gives each arm its measured peak plus gpu_guard's margin,
+then REFUSES an N that does not fit -- which is how 6-way was rejected (2282 MiB
+each against a 2264 MiB measured peak: 18 MiB of headroom, on a HARD cap with
+internal_oom_recovery false). Launch co-tenants with GFN_COTENANTS=N set, or each
+arm's own pre-flight will refuse itself the moment a sibling appears.
+
+WHY par4b PINS THREE THINGS, not one. `lr = base_lr x peak_scale x envelope(t)`:
+ray_calibration moves peak_scale, the per-stage sensor issues the verdicts, and the
+warmup envelope RESTARTS at every stage transition -- so leaving the envelope on
+would put a ramp exactly where stage 2 begins. 1e-5 is where the held arms' own
+controller settled while holding err ~0.001 for 3000 steps: the only LR measured
+stable on this problem, not a guess.
+
+WHY STAGE 1 IS CAPPED. Exit terms are ANDed, and `gates/mle_flat` can never flatten
+on a rows-live arm -- MLE buys unbounded likelihood by collapsing a delta onto the
+zero-variance dead rows. c_sg19_off spent 3000 of 4000 steps in stage 1 while
+bwd/tbc sat at 0.04 against a 2.0 bar. Dropping that ONE exit term is the fix; the
+mle_gate FLAG stays on so gates/mle_flat is still published as a diagnostic.
+
+============================================================================
+LAUNCH (from energy_sampling/, with the venv and PYTHONPATH from
+        reference_local_run_recipe)
+============================================================================
+Order is by how interpretable a failure would be, largest signal first.
+
+  1. c_sg19_on / c_sg19_off     3 clobbered angles.   delta +3.9832
+  2. b_sg14_on / b_sg14_off     2 clobbered angles.   delta +2.6555
+  3. d_sg4_on  / d_sg4_off      2 angles + 1 FREE AXIS. delta +3.9832 -- must
+                                equal arm C by a DIFFERENT code path
+  4. e_sg1_on  / e_sg1_off      3 free axes, no angles. delta +3.9832
+  5. a_sg2_on  / a_sg2_off      CONTROL. delta 0. The knob must be inert.
+
+    python train.py --config configs\gauss_aug12\c_sg19_on.yaml
+
+If only one pair can be run, run pair 1. If two, add pair 3 -- that is the
+comparison nothing else in either battery makes.
+
+============================================================================
+WHAT TO READ, IN ORDER OF WEIGHT
+============================================================================
+1. eval_fwd/emp_z   THE PRIMARY READOUT.
+   logsumexp(log_r + log_pb - log_pf) - log N: the importance-sampling
+   estimator, consistent regardless of how good the policy is. It approaches
+   the true log Z FROM BELOW as the policy improves, so the test has a hard
+   ceiling: it may rise to the analytic value and stop. If it goes ABOVE,
+   something is wrong -- with the code, or with the prediction.
+
+       arm            analytic log Z
+       a_sg2_on          -16.6038
+       a_sg2_off         -16.6038
+       b_sg14_on         -13.8365
+       b_sg14_off        -11.1810
+       c_sg19_on         -12.4528
+       c_sg19_off         -8.4696
+       d_sg4_on          -12.4528
+       d_sg4_off          -8.4696
+       e_sg1_on          -12.4528
+       e_sg1_off          -8.4696
+
+2. log Z learned    Secondary, and only trustworthy once the policy has
+   converged. Do NOT certify correctness from this alone -- a trained
+   comparison already nearly produced a false bias report on this change
+   (feedback_use_is_estimator_for_logz_correctness).
+
+3. eval_fwd/jensen_z    Lower bound, mean log w. jensen_z <= emp_z <= log Z, so
+   the gap between the two is a variance readout, not a second estimate.
+
+4. Startup lines. Each arm prints the resolved dead rows and then the probe
+   result ("dead-row probe: latent_to_cell_params confirms rows (3, 5) are
+   ignored for SG14"). An ON arm that prints no dead-row list has silently
+   fallen through the is_crystal gate and is not testing anything.
+
+5. THE A/B THAT MOTIVATED D33. Held rows should show lower Var(log w) and
+   faster convergence at equal steps -- the additive-variance argument,
+   measured on CPU at 6.30 -> 5.33 -> 4.77 for n_dead 0 -> 2 -> 3 (F-010).
+   Read tb_err and logw spread, not just log Z: BOTH arms are expected to
+   reach their own correct log Z, and that is the point. The rows-live arm is
+   not WRONG, it is solving a needlessly larger problem, so the difference
+   shows up in efficiency and variance, not in the answer.
+
+============================================================================
+WHAT WOULD FALSIFY WHAT
+============================================================================
+  Arm A on/off disagree systematically   -> the knob acts where the dead set is
+                                            empty. Serious: the mechanism is
+                                            supposed to be a no-op there, and it
+                                            is bitwise so on CPU.
+  An ON arm lands on the OFF number      -> the rows are not actually held.
+                                            Check the startup probe line first.
+  An OFF arm lands on the ON number      -> the fictitious volume is not being
+                                            integrated; suspect bounding_coeff or
+                                            an unintended wrap.
+  C agrees, D disagrees                  -> the FREE-AXIS half of D33 is wrong
+                                            (canonicalize_free_axes), while the
+                                            angle half is right.
+  Both C and D miss by the same amount   -> suspect the PREDICTION, not the code.
+                                            Re-run test_latent_gaussian.py, which
+                                            checks the closed form against the
+                                            real energy object independently of
+                                            any training.
+  emp_z exceeds the analytic value       -> the estimator or the target is wrong.
+                                            emp_z cannot exceed log Z except by
+                                            sampling noise.
+
+============================================================================
+KNOWN NOT COVERED
+============================================================================
+  * Z' > 1. free_centroid_rows returns () above Z'=1 by design, so the free-axis
+    mechanism is gated off there and no arm here reaches it. deadrow_aug12's
+    arm C is the Z'=2 arm, on a physical energy.
+  * TRIGONAL AND HEXAGONAL. Both trip the startup canonical-value assert by design:
+    gamma = 2pi/3 reads back as latent 0.5556, not 0. MEASURED, not assumed -- sg 147
+    (trigonal) as well as 168/176 (hexagonal); monoclinic/orthorhombic controls read
+    back exactly 0.0. Earlier notes said "hexagonal" only, which was wrong.
+    Unreachable from any config here.
+  * CONDITIONAL. Every arm is unconditional and single-space-group. Note the multi-SG
+    guard compares RESOLVED DEAD-ROW SETS, not crystal systems, and it has to: monoclinic
+    alone has three sets (sg 3/4/5 -> (3,5,7); 6/7/8/9 -> (3,5,6,8); 10-15 -> (3,5)),
+    so [4, 14] is same-system and still ambiguous. Covered by
+    test_dead_latent_rows.py::test_multi_space_group_disagreement_raises.
+  * periodic_centroids. Pinned FALSE on every arm, and the closed form for the
+    rows-live arms depends on that: with centroid wrapping on, a free axis has
+    period 2 and its fictitious volume would be log 2 rather than
+    log(2 + sqrt(pi/k)). Turning it on invalidates the arms D/E OFF predictions
+    and nothing else here would notice.
+  * CONVERGENCE at physical energies. Unchanged by this battery; that is what a
+    short elj arm is for, and a physical energy can only ever smoke-test, never
+    certify, because none has converged perfectly.

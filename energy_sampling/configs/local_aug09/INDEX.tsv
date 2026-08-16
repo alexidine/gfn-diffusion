@@ -1,0 +1,10 @@
+name	budget	epochs	asks
+v0_suite	600	3250	wiring check for probe + ratio controller + B7b replay. Read verify.py tells.
+v1_suite_servo	600	3250	as v0 plus the lambda*tau servo. Tell: protocol/bs_* present and bs_log_boost moves off 0 only if the bar is crossed; a servo with no authority reads the same as one correctly holding, which is why the actuator is logged.
+v2_long	3600	6250	v0 at pair-A length. Does fwd/tb_err return to a_frz parity (~18.8 final) or settle worse? Everything downstream depends on which.
+v3_size4000	600	3250	isolates max_size. Everything else identical to v0. Tell: replay_buffer_mean_loss and whether fwd/over_coverage tracks it.
+v4_beta10	600	3250	isolates replay beta (de-huberisation). Everything else identical to v0.
+v5_kappa0	600	3250	kappa 0 at beta 1e6: uniform over eligible, IS weights identically 1. Separates quadratic-loss damage from IS-weight variance.
+v6_kappa2_beta10	600	3250	sharper draw on the best base. Does raising kappa recover the hard-tail force that uniform admission gave up? Watch is_ess_frac -- k=2 will drop it, and the variance cost is the thing that eventually bounds kappa.
+v7_best_long	3600	6250	v4 at pair-A length. THE practical question: does the new construction close on a_frz (18.76 final) given time, or is the admission gap permanent?
+v8_unclamped	3600	6250	v7 with bounds.replay raised to 0.65. Is the standing fwd gap partly a SATURATED controller rather than the admission change? Watch bwd/tb_err for what it costs.

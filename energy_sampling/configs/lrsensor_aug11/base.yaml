@@ -1,0 +1,394 @@
+# lrsensor_aug11 -- SHARED BASE. Do not run directly; make.py writes the scenarios.
+#
+# FUNCTIONAL TEST of the per-stage lr_sensor, not a battery: the two scenarios
+# are deliberately NOT matched, they are different tempos.
+#
+# Snapshot of cond_aug11/base.yaml. Deliberately left FRESH (checkpoint_name and
+# prior_model_name both null) so every run passes through train_prior before
+# var_conditioning -- that is what exercises BOTH sensors in one run: the MLE
+# channel in phase 1, the two VarGrad channels after it.
+#
+# ray_calibration.enabled stays TRUE on purpose. Both stages declare
+# kind: loss_slope, so the per-stage gate must suppress the ray probe and
+# lr_ctrl/calibrations must stay at 0 for the whole run. That is a live
+# assertion that the gate works, not leftover config.
+#
+# WHAT TO READ:
+#   lr_ctrl/slope_status   0 clean | 1 cut | 2 recover | 5 warmup
+#   lr_ctrl/slope_cuts     cumulative cuts
+#   lr_ctrl/peak_scale     the actuator
+#   lr_slope/<metric>/rise, /rise_lo   per-channel evidence (rise_lo > 0 fires)
+#   lr_ctrl/calibrations   MUST STAY 0 -- the ray probe is gated off here
+#
+# Inherited unchanged from cond_aug11: dplr 6/0.5, the naive stage stays
+# dropped, T=40, toy_big_unif.
+run_name: 'OVERWRITTEN_BY_MAKE'
+tag: 'ls11'
+seed: 12345
+device: 'cuda'
+cuda_memory_fraction: 0.9
+anomaly_detection: false  # dramatic slowdown when True
+
+# Checkpoints
+################################################################
+continue_from_checkpoint: false  # fresh run: nothing to resume
+mlip_path: null
+checkpoints_dir: 'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints'
+checkpoint_name: null            # fresh: train_prior builds phase 1 on current code
+prior_model_name: null           # no frozen prior model -- train_prior's snapshot_prior produces it
+load_weights_only: false
+prior_path: 'D:\crystal_datasets\conditional\priors\toy_big_unif_prior.pt'
+molecules_path: 'D:\crystal_datasets\conditional\priors\toy_big_unif_conditions.pt'
+test_molecules_path: 'D:\crystal_datasets\conditional\priors\toy_big_unif_test_conditions.pt'  # held-out conditions, eval only
+archive_period: 5000
+archive_buffers: true
+override_learning_rates: false
+
+#Optimizers
+################################################################
+lr_policy: auto
+lr_back: auto
+lr_replay: auto
+lr_fused: auto
+lr_flow: 1.0e-4              # CONDITIONAL: flow_model is a real scalarMLP over the condition embedding, not the unconditional LearnableScalar. 0.1 detonated Z(c) on this route (cazwlyy1)
+min_lr: 1.0e-6
+lr_warmup_ratio: 10
+adaptive_lr:
+  warmup_steps: 1000
+  seed_lr: 1.25e-4           # above the T=40 optimum on the old scaling, which is the wanted direction: the calibration descends onto alpha* rather than climbing to it
+  bounds: [ 0.01, 2000.0 ]
+  calibration:
+    # alpha_target 4.0 was measured on the UNCONDITIONAL elj route (tuphwfkm).
+    # alpha* is a shape, not a transferable setpoint -- re-read lr_ctrl/alpha_hat
+    # on this route before trusting it.
+    alpha_target: 4.0
+    eta_up: 0.25
+    eta_down: 0.5
+  divergence_loss_abs: 1.0e+9
+  divergence_grad_abs: 1.0e+9
+  divergence_cut: 0.5
+  control_flow_lr: false     # lr_flow stays exempt: alpha* is measured over policy params only
+
+ray_calibration:
+  enabled: true
+  period: 500
+  n_sub: 8
+  alphas: [ 0, 1, 2, 4, 8, 16, 32, 64 ]
+weight_decay: 1.0e-4
+use_weight_decay: false
+compile_policy: auto
+traj_checkpoint: false
+gradient_norm_clip: auto      # resolves off T=40: 250 * grad_median(40)/6.6e3 * sqrt(W/512)
+ema_decay: null
+max_reloads_per_1k_steps: 0.2
+
+# model parameters
+################################################################
+model:
+  full_flow: false
+  s_emb_dim: 512
+  t_dim: 64
+  harmonics_dim: 64
+  condition_embedding_dim: 16
+  t_hidden_dim: 512
+  s_hidden_dim: 512
+  s_layers: 4
+  policy_hidden_dim: 512
+  policy_layers: 4
+  flow_hidden_dim: 512
+  flow_layers: 4
+  cond_hidden_dim: 512
+  cond_layers: 4
+  dropout: 0
+  norm: layer
+  zero_init: false
+  t_scale: 0.05
+  log_var_range: 6
+  pb_drift_range: 0.4
+  pb_var_range: 6
+  learn_pb: true
+  learned_variance: true
+  clipping: true
+  gfn_clip: 200.0
+  periodic_centroids: false    # TOY: latent_multiharmonic is not a crystal, no aunit axes to wrap
+  dplr_rank: 6                 # matches toy_big_unif's own checkpoints (see header)
+  dplr_rho_max: 0.5
+  dplr_mask_angular: true      # inert on this problem: do_periodic_angles is false for the toys, so there are no wrapped dims to mask
+  pb_exact_reversal: true
+
+# training params
+################################################################
+buffer_device: cuda
+batch_size: 500        # known to fit at T=40 fused; growth off so batch never confounds the sensor
+grow_batch_size: false
+max_batch_size: 500
+batch_growth_factor: 1.65
+batch_growth_interval: 50
+batch_growth_slow_interval: 300
+auto_batch_throughput_opt: true
+batch_growth_min_throughput_gain: 0.05  # samples/sec gain a jump must clear to be kept -- a SATURATION detector. opt-steps/sec = samples_per_sec / grad-accum target, so this maximises optimizer-step throughput; step time does not enter. MUST be < batch_growth_factor-1 (0.65 here): at or above it a factor-f jump can never deliver the demanded gain, so every jump is rejected and the batch FREEZES at batch_size
+gpu_util_window_s: 900  # trailing window for the gpu/util_recent metric. DIAGNOSTIC ONLY -- nothing in the trainer acts on occupancy: batch size does not move it on the MLIP route (measured, umaperf0812)
+gpu_util_sample_period_s: 60  # wall-clock seconds between occupancy samples. Time-based, not per-N-steps: a step-based cadence cannot fill a 900 s window at 200 s/step, which is how the metric came to be absent on exactly the slow MLIP arms it was there to watch
+gpu_util_policy_window_s: 7200  # the window the CLUSTER averages over when deciding to cancel. Logged as gpu/util_policy so the number the scheduler judges is visible in wandb
+batch_knee_recheck_steps: 2000
+oom_batch_shrink_factor: 0.5
+oom_cooldown_steps: 200
+eval_num_samples: 10000
+test_eval_num_samples: 2000   # LIVE here: test_molecules_path is set
+fused_grad_accum_min_samples: 1000
+epochs: 100000
+eval_period: 250
+figs_period: 500
+
+# SDE integration
+################################################################
+# T=40 is what toy_big_unif trained at (train_T on its checkpoints), and T
+# dominates outcomes here, so a different T would not be a confirmation.
+eval_T: 40
+integrator:
+  T: 40
+
+fwd_loss_coeffs:
+  tb: 0.0
+  z_level: 0.0
+  freeze_policy: 0.0
+  freeze_z: 0.0
+  vg_lb: 0.0
+  vg_lme: 0
+  vg_by_condition: 0.0
+  db: 0.0
+  subtb: 0.0
+  subtb_lambda: 0.95
+  emp_z: 0
+  emp_z_persistent: 0
+  traj_grads: 0.0
+  reward_grads: 0.0
+  repeats: 1.0
+  loss_clip: 1.0E+9
+  beta: 10.0
+bwd_loss_coeffs:
+  tb: 0.0
+  freeze_policy: 0.0
+  freeze_z: 1.0
+  vg_lb: 0
+  vg_lme: 0
+  vg_by_condition: 1.0
+  pf_boost: 0
+  db: 0.0
+  subtb: 0.0
+  subtb_lambda: 0.95
+  emp_z: 0
+  emp_z_persistent: 0
+  level_gap: 0.0
+  level_gap_clamp: 10.0
+  mle: 0.0
+  tbc: 0.0
+  repeats: 1.0
+  traj_grads: 1.0
+  loss_clip: 1.0E+9
+  beta: 10.0
+replay_loss_coeffs:
+  tb: 1.0
+  freeze_policy: 0.0
+  freeze_z: 1.0
+  vg_lb: 0
+  vg_lme: 0
+  pf_boost: 0
+  db: 0.0
+  subtb: 0.0
+  subtb_lambda: 0.95
+  emp_z: 0
+  emp_z_persistent: 0
+  mle: 0.0
+  repeats: 1.0
+  traj_grads: 0.0
+  loss_clip: 1.0E+9
+  beta: 10.0
+
+# CONDITIONAL: this block is load-bearing here, unlike on the unconditional
+# route. All three tb_z_source keys are persistent, so Z(c) IS the tracker EMA
+# and the learned head is a cache that var_conditioning's fwd emp_z fits to it.
+# train_prior moves neither: every bwd branch is freeze_z, which is why startup
+# logs a 'no mode trains the flow head' warning for that stage.
+condition_log_z:
+  min_visits: 20
+  half_life_visits: 28.0   # persistent-Z regime (SE ~0.4-0.5 nats), not the unconditional 7
+  trim_frac: 0.01
+  max_batch_weight: 200.0
+  discovery_half_life_steps: 200.0
+  fwd_tb_z_source: persistent
+  bwd_tb_z_source: persistent
+  replay_tb_z_source: persistent
+  weighted_condition_sampling: true
+  weighted_condition_sampling_clip_quantile: 0.99
+  weighted_condition_sampling_temperature: 0.3
+  weighted_condition_sampling_uniform_beta: 0.5
+
+mle_slope_t: 2.0
+mle_min_rate: 0.05
+mle_slope_window: 300
+
+z_calibration:
+  enabled: false            # retired to hygiene duty after the 9x mean-pinned-Z falsification; off on the conditional route
+  mode: rollout
+  sensor: pooled
+  sensor_quantile: 0.5
+  threshold: 0.5
+  grace: 0.8
+  gain: 1.0
+  max_steps_per_step: 100.0
+  min_visits: null
+  freshness_half_life_steps: 300.0
+  se2_floor: 0.25
+  holdout_modulus: 8
+
+# ============================================================================
+# TRAINING PROTOCOL -- conditional_toy_protocol_2026_07_29 without its naive
+# stage (see header note 2).
+# ============================================================================
+protocol:
+  stages:
+    - name: train_prior
+      train_mode: bwd
+      bwd_sampling_mode: dataset
+      skip_if: prior_loaded
+      flags: { update_log_z: true, scramble_conditions: true, mle_gate: true }
+      loss_coeffs:
+        bwd: { mle: 1.0, tbc: 1.0, repeats: 2.0 }
+      exit:
+        - { metric: gates/mle_flat, above: 0.5, patience: 5 }
+        - { metric: eval/wass_debiased, below: 0.015 }
+        - { metric: bwd/tbc, below: 2.0 }
+      on_exit: [ 'snapshot:phase1_exit', 'snapshot_prior' ]
+
+    # condition-grouped VarGrad on fwd + bwd; Z(c) trains as fwd-only emp_z
+    # sidecar; prior_buffer.condition_block_m auto-activates while bwd vg_lb > 0
+    - name: var_conditioning
+      train_mode: fused
+      bwd_sampling_mode: prior
+      flags: { update_log_z: true, buffers_active: true, weighted_bwd_sampling: true,
+               weighted_condition_sampling: true }
+      on_enter: [ 'rebuild_prior_by_churn' ]
+      fracs: { fwd: 0.5, bwd: 0.5, replay: 0.0 }
+      deactivate_threshold: 0.01
+      loss_coeffs:
+        # beta stays at base 10: 30 was tried (louder tail pull) and came back noisier-and-worse
+        fwd: { vg_lb: 1.0, vg_by_condition: 1.0, emp_z: 1.0, repeats: 2.0 , beta: 10}
+        bwd: { vg_lb: 1.0, repeats: 2.0, level_gap: 1.0, beta: 80}
+      balance:
+        kind: proportional
+        pinned: { replay: 0.0 }
+        metrics: { fwd: fwd/logw_std_within, bwd: bwd/logw_std_within }
+        drive: relative
+        targets: { fwd: 1.0, bwd: 1.0 }
+        default_boost: { fwd: 0.5, bwd: 0.5 }
+        floor: 0.1     # bwd VG is the anti-degeneracy anchor
+        alpha: 0.01
+#      on_exit: [ 'snapshot:var_conditioned' ]
+#      exit:
+#        # thresholds sit just above observed structural floors (fwd ~5.5, bwd ~2.4 in m=6 units)
+#        # NB rolling channels only: a tracker/* exit term resolves None and its streak stays 0 forever (sbb9491u)
+#        - { metric: fwd/logw_std_within, below: 6.0, patience: 5 }
+#        - { metric: bwd/logw_std_within, below: 3.0, patience: 5 }
+
+controller:
+  min_mode_frac: 0.001
+  beta: 0.025
+  deactivate_threshold: 0.01
+  refresh_every: 10
+  decay_rate: 0.95
+  anneal_patience: 5
+  lookahead_horizon: 5
+  lookahead_trend_alpha: 0.1
+
+conditional_worst_quantile: 0.25  # LIVE here: r2_worst / delta_worst are real upper-tail statistics over conditions
+
+buffers:
+  prior_buffer:
+    seed_source: 'prior_dataset'
+    mean_lifetime: 100
+    weighted_bwd_beta: 0.9   # LIVE: both fused stages declare weighted_bwd_sampling
+    churn_batch_ref: 1000
+    min_size: 10000
+    max_size: 250000
+    init_fraction: 0.25
+    condition_block_m: 1     # auto-activates while bwd vg_lb > 0 (var_conditioning)
+    reward_min: 0
+    ramp_floor: 100
+    ramp_width: 50
+
+  replay_buffer:
+    churn_rate: 80
+    mean_residence_steps: 50
+    max_size: 12000
+    admit_reward_min: -200
+    prioritise:
+      enabled: true
+      kappa: 1.0
+      floor_frac: 0.25
+      symmetric: true
+
+  anchor_buffer:
+    # DOMAIN RULE (mode_presets.yaml): toys seed anchors from the CONDITIONS .pt,
+    # which generate_toy_prior.py filled with genuine per-condition target samples
+    # (condition_set.sample_latents), so the anchor set is handed the answer and
+    # mode discovery is obviated. Molecule problems seed from prior_dataset instead.
+    seed_source: 'D:\crystal_datasets\conditional\priors\toy_big_unif_conditions.pt'
+    max_size: 200000
+    dup_cutoff: 0.05
+    screen_energy_window: 20
+    thin_energy_window: 50
+    surprise_cutoff: -5
+    confirm_cutoff: -5
+    confirm_k: 5
+    health_gate_floor_metric: null
+    health_gate_floor: null
+    health_gate_ceiling_metric: tb_resid_clipped
+    health_gate_ceiling: 0.5
+    replay_beta: 0.5
+    thin_every_n_evals: 5
+    refresh_every_n_evals: 3
+    noise_log_range: [ -2.5, -1.5 ]
+    topup_admit_record_breakers: true
+    reach_quantile: 0.9
+    reach_threshold: 0.75
+    reach_topup_size: 1000
+
+# energy function settings
+################################################################
+energy_function: 'latent_multiharmonic'
+temperature_conditioning: false
+molecule_conditioning: false   # the toy `c` is not tied to a molecular graph -- see vector_conditioning
+sg_conditioning: False
+space_groups: [ 1 ]
+zp_conditioning: false
+z_primes: [ 1 ]
+vector_conditioning: true      # per-sample `c` through the scalarMLP conditioner (conditions_type stays 'vector')
+vector_conditioning_dim: 3
+energy_config:
+  internal_oom_recovery: true
+  temperature: 1.0
+  log_temperature_range: [ 0, 0.693147 ]
+  density_coeff: 10.0
+  bounding_coeff: 10.0
+  reduction_coeff: 10.0
+  lj_coeff: 1.0
+  reward_range: 250
+  # MUST match the generator run's latent_field block, and matches the
+  # analyze_kwargs stored in toy_big_unif's own problem_def.
+  analyze_kwargs: {
+    cond_dim: 3,
+    n_core: 16,
+    n_ghost: 16,
+    sigma_range: [ 0.04, 0.12 ],
+    aniso_scale: 0.4,
+    depth_range: [ 0.0, 4.0 ],
+    mu_scale: 0.5,
+    disp_max: 0.3,
+    logsig_scale: 0.25,
+    gate_steep: 4.0,
+    edge_sigmas: 0.1,
+    max_temperature: 1.0,
+    max_width: 2.5,
+    seed: 0
+  }

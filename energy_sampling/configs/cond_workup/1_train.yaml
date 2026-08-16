@@ -1,0 +1,444 @@
+run_name: cw01
+tag: cw01
+seed: 12345
+device: cuda
+cuda_memory_fraction: 0.9
+anomaly_detection: false
+continue_from_checkpoint: false
+mlip_path: null
+prior_path: D:\crystal_datasets\conditional\priors\cw01_prior.pt
+molecules_path: D:\crystal_datasets\conditional\priors\cw01_conditions.pt
+test_molecules_path: null
+checkpoints_dir: C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints
+checkpoint_name: null
+prior_model_name: null
+reuse_prior: true
+load_weights_only: false
+override_learning_rates: false
+lr_policy: auto
+min_lr: 1.0e-06
+lr_flow: 0.0001
+lr_back: auto
+lr_replay: auto
+lr_fused: auto
+lr_warmup_ratio: 100
+adaptive_lr:
+  enabled: true
+  warmup_steps: 1000
+  hold_steps: 4000
+  decay_halflife_steps: 8000
+  decay_floor_scale: 0.05
+  cut_loss_abs: 2500.0
+  cut_grad_abs: auto
+  reset_loss_abs: auto
+  reset_grad_abs: auto
+  cut_ratio: 0.5
+  fire_cooldown_steps: 500
+  recovery_target_frac: 0.5
+  recovery_wait_steps: 3000
+  recovery_ramp_steps: 1000
+  control_flow_lr: false
+weight_decay: 0.0001
+use_weight_decay: false
+compile_policy: auto
+gradient_norm_clip: auto
+ema_decay: null
+model:
+  full_flow: false
+  s_emb_dim: 256
+  t_dim: 64
+  harmonics_dim: 64
+  condition_embedding_dim: 16
+  t_hidden_dim: 256
+  s_hidden_dim: 256
+  s_layers: 4
+  policy_hidden_dim: 256
+  policy_layers: 4
+  flow_hidden_dim: 256
+  flow_layers: 4
+  cond_hidden_dim: 256
+  cond_layers: 4
+  dropout: 0
+  norm: layer
+  zero_init: false
+  t_scale: 0.05
+  log_var_range: 6
+  pb_drift_range: 0.4
+  pb_var_range: 6
+  learn_pb: true
+  learned_variance: true
+  clipping: true
+  gfn_clip: 200.0
+  periodic_centroids: false
+  dplr_rank: 6
+  dplr_rho_max: 0.5
+  dplr_mask_angular: false
+buffer_device: cuda
+batch_size: 1000
+grow_batch_size: true
+max_batch_size: 50000
+batch_growth_factor: 1.65
+batch_growth_interval: 50
+batch_growth_slow_interval: 300
+auto_batch_throughput_opt: true
+batch_growth_min_throughput_gain: 0.05  # samples/sec gain a jump must clear to be kept -- a SATURATION detector. opt-steps/sec = samples_per_sec / grad-accum target, so this maximises optimizer-step throughput; step time does not enter. MUST be < batch_growth_factor-1 (0.65 here): at or above it a factor-f jump can never deliver the demanded gain, so every jump is rejected and the batch FREEZES at batch_size
+gpu_util_window_s: 900  # trailing window for the gpu/util_recent metric. DIAGNOSTIC ONLY -- nothing in the trainer acts on occupancy: batch size does not move it on the MLIP route (measured, umaperf0812)
+gpu_util_sample_period_s: 60  # wall-clock seconds between occupancy samples. Time-based, not per-N-steps: a step-based cadence cannot fill a 900 s window at 200 s/step, which is how the metric came to be absent on exactly the slow MLIP arms it was there to watch
+gpu_util_policy_window_s: 7200  # the window the CLUSTER averages over when deciding to cancel. Logged as gpu/util_policy so the number the scheduler judges is visible in wandb
+batch_knee_recheck_steps: 2000
+oom_batch_shrink_factor: 0.5
+oom_cooldown_steps: 200
+eval_num_samples: 10000
+fused_grad_accum_min_samples: 1000
+epochs: 100000
+eval_period: 500
+figs_period: 1000
+eval_T: 40
+integrator:
+  T: 40
+  min_traj_length: 10
+  max_traj_length: 10
+  traj_length_strategy: static
+  discretizer_max_ratio: 15
+  discretizer: uniform
+fwd_loss_coeffs:
+  tb: 0.0
+  freeze_policy: 0.0
+  freeze_z: 0.0
+  vg_lb: 0.0
+  vg_lme: 0
+  vg_by_condition: 0.0
+  db: 0.0
+  subtb: 0.0
+  subtb_lambda: 0.95
+  emp_z: 0
+  emp_z_persistent: 0
+  traj_grads: 0.0
+  reward_grads: 0.0
+  repeats: 1.0
+  loss_clip: 1000000000.0
+  beta: 10.0
+bwd_loss_coeffs:
+  tb: 0.0
+  freeze_policy: 0.0
+  freeze_z: 1.0
+  vg_lb: 0
+  vg_lme: 0
+  vg_by_condition: 1.0
+  pf_boost: 0
+  db: 0.0
+  subtb: 0.0
+  subtb_lambda: 0.95
+  emp_z: 0
+  emp_z_persistent: 0
+  mle: 0.0
+  tbc: 0.0
+  repeats: 1.0
+  traj_grads: 1.0
+  loss_clip: 1000000000.0
+  beta: 10.0
+replay_loss_coeffs:
+  tb: 1.0
+  freeze_policy: 0.0
+  freeze_z: 1.0
+  vg_lb: 0
+  vg_lme: 0
+  pf_boost: 0
+  db: 0.0
+  subtb: 0.0
+  subtb_lambda: 0.95
+  emp_z: 0
+  emp_z_persistent: 0
+  mle: 0.0
+  repeats: 1.0
+  traj_grads: 0.0
+  loss_clip: 1000000000.0
+  beta: 10.0
+condition_log_z:
+  min_visits: 20
+  half_life_steps: 7.0
+  trim_frac: 0.1
+  max_batch_weight: 200.0
+  discovery_half_life_steps: 200.0
+  fwd_tb_z_source: learned
+  bwd_tb_z_source: learned
+  replay_tb_z_source: learned
+  mol_sampling_weighted_by_z_gap: true
+  mol_sampling_z_gap_clip_quantile: 0.99
+  mol_sampling_z_gap_temperature: 0.5
+  mol_sampling_uniform_beta: 0.5
+mle_slope_t: 2.0
+mle_min_rate: 0.05
+mle_slope_window: 300
+protocol:
+  stages:
+  - name: train_prior
+    train_mode: bwd
+    bwd_sampling_mode: dataset
+    skip_if: prior_loaded
+    flags:
+      update_log_z: true
+      scramble_conditions: true
+      mle_gate: true
+    loss_coeffs:
+      bwd:
+        mle: 1.0
+        tbc: 1.0
+        repeats: 2.0
+    exit:
+    - metric: gates/mle_flat
+      above: 0.5
+      patience: 5
+    - metric: eval/wass_debiased
+      below: 0.015
+    - metric: bwd/tbc
+      below: 2.0
+    on_exit:
+    - snapshot:phase1_exit
+    - snapshot_prior
+  - name: anchor_seed
+    train_mode: bwd
+    bwd_sampling_mode: prior
+    flags:
+      update_log_z: true
+      buffers_active: false
+      weighted_bwd_sampling: true
+    on_enter:
+    - seed_prior_from_anchors:100:flush
+    loss_coeffs:
+      bwd:
+        tb: 1.0
+        freeze_z: 0.0
+    exit:
+    - metric: bwd/r2_worst
+      above: 0.95
+      patience: 2
+    - metric: bwd/scatter_err
+      below: 50.0
+      patience: 2
+    on_exit:
+    - snapshot:anchor_seed_exit
+  - name: z_match
+    train_mode: fused
+    bwd_sampling_mode: prior
+    flags:
+      buffers_active: false
+    fracs:
+      fwd: 0.5
+      bwd: 0.499
+      replay: 0.001
+    min_fracs:
+      fwd: 0.05
+      bwd: 0.05
+      replay: 0.0001
+    deactivate_threshold: 0.01
+    loss_coeffs:
+      fwd:
+        tb: 1.0
+        freeze_policy: 1.0
+        beta: 2.0
+      bwd:
+        tb: 1.0
+    balance:
+      kind: lexicographic
+      default_boost:
+        fwd: 0.7
+        bwd: 0.3
+      rules:
+      - metric: bwd/scatter_err
+        above: 60.0
+        boost:
+          bwd: 0.9
+          fwd: 0.1
+    exit:
+    - metric: gates/delta_worst
+      below: 5.0
+      patience: 5
+    - metric: bwd/scatter_err
+      below: 50.0
+    on_exit:
+    - snapshot:z_matched
+  - name: buildout
+    train_mode: fused
+    bwd_sampling_mode: prior
+    flags:
+      buffers_active: true
+    on_enter:
+    - rebuild_prior_by_churn
+    fracs:
+      fwd: 0.799
+      bwd: 0.001
+      replay: 0.2
+    min_fracs:
+      fwd: 0.02
+      bwd: 0.001
+      replay: 0.009
+    deactivate_threshold: 0.01
+    loss_coeffs:
+      fwd:
+        tb: 1.0
+      bwd:
+        tb: 1.0
+    balance:
+      kind: lexicographic
+      default_boost:
+        fwd: 0.9
+        replay: 0.1
+      rules:
+      - metric: fwd/tb_resid_clipped
+        abs: true
+        above: 0.5
+        boost: fwd
+      - metric: fwd/scatter_err
+        above: 8.0
+        boost: fwd
+      - metric: fwd/scatter_err
+        relative: best
+        margin: 1.3
+        drift: 0.003
+        boost: fwd
+      - metric: replay/scatter_err
+        above: 150.0
+        boost:
+          fwd: 0.65
+          replay: 0.35
+        anneal:
+          min: fwd/scatter_err
+    exit:
+    - metric: fwd/r2_within
+      above: 0.95
+      patience: 2
+    on_exit:
+    - snapshot:fwd_calibrated
+  - name: terminal
+    train_mode: fused
+    bwd_sampling_mode: prior
+    flags:
+      buffers_active: true
+    min_fracs:
+      fwd: 0.0009
+      bwd: 0.01
+      replay: 0.0009
+    deactivate_threshold: 0.001
+    loss_coeffs:
+      fwd:
+        tb: 1.0
+        freeze_policy: 1.0
+      bwd:
+        tb: 1.0
+    balance:
+      kind: lexicographic
+      default_boost:
+        replay: 0.9
+        fwd: 0.1
+      rules:
+      - metric: fwd/tb_resid_clipped
+        abs: true
+        above: 0.5
+        boost: fwd
+      - metric: fwd/r2_worst
+        below: 0.9
+        boost: replay
+      - metric: bwd/relative_under
+        above: 8.0
+        boost: bwd
+        anneal:
+          min: 1.0
+      - metric: fwd/over_coverage
+        above: 8.0
+        boost: replay
+      anneal_coeffs:
+        bounding_coeff:
+          target: 10.0
+        reduction_coeff:
+          target: 10.0
+controller:
+  min_mode_frac: 0.001
+  beta: 0.025
+  deactivate_threshold: 0.01
+  refresh_every: 10
+  decay_rate: 0.95
+  anneal_patience: 5
+  lookahead_horizon: 5
+  lookahead_trend_alpha: 0.1
+terminal_logw_std: 1000.0
+terminal_box_violation: 1.0
+conditional_worst_quantile: 0.5
+buffers:
+  prior_buffer:
+    seed_source: prior_dataset
+    mean_lifetime: 100
+    weighted_bwd_beta: 0.9
+    churn_batch_ref: 1000
+    min_size: 10000
+    max_size: 250000
+    init_fraction: 0.25
+    condition_block_m: 2
+    reward_min: -600
+    ramp_floor: 50
+    ramp_width: 40
+  replay_buffer:
+    random_churn_rate: 50
+    max_size: 10000
+  anchor_buffer:
+    seed_source: D:\crystal_datasets\conditional\priors\cw01_conditions.pt
+    max_size: 200000
+    dup_cutoff: 0.05
+    screen_energy_window: 20
+    thin_energy_window: 50
+    surprise_cutoff: -5
+    confirm_cutoff: -5
+    confirm_k: 5
+    health_gate_r2: 0.9
+    health_gate_zerr: 0.5
+    replay_beta: 0.5
+    thin_every_n_evals: 5
+    refresh_every_n_evals: 3
+    noise_log_range:
+    - -2.5
+    - -1.5
+    topup_admit_record_breakers: true
+    reach_quantile: 0.9
+    reach_threshold: 0.75
+    reach_topup_size: 1000
+energy_function: latent_multiharmonic
+temperature_conditioning: false
+molecule_conditioning: false
+sg_conditioning: false
+space_groups:
+- 1
+zp_conditioning: false
+z_primes:
+- 1
+vector_conditioning: true
+vector_conditioning_dim: 2
+energy_config:
+  internal_oom_recovery: true
+  temperature: 1.0
+  log_temperature_range:
+  - 0
+  - 0.693147
+  density_coeff: 10.0
+  bounding_coeff: 1.0
+  reduction_coeff: 1.0
+  lj_coeff: 1.0
+  reward_range: 100
+  analyze_kwargs:
+    cond_dim: 2
+    n_core: 1
+    n_ghost: 0
+    sigma_range:
+    - 0.04
+    - 0.12
+    aniso_scale: 0.0
+    depth_range:
+    - 0.0
+    - 4.0
+    mu_scale: 0.5
+    disp_max: 0.3
+    logsig_scale: 0.25
+    gate_steep: 4.0
+    edge_sigmas: 0.1
+    max_temperature: 1.0
+    max_width: 2.5
+    seed: 0

@@ -11,6 +11,8 @@ Run from energy_sampling with the csd_mxt_gfn venv:
 import os
 import sys
 
+import pytest
+
 _here = os.path.dirname(os.path.abspath(__file__))
 for _root in (os.path.dirname(_here),                                   # gfn_diffusion
               os.path.join(os.path.dirname(os.path.dirname(_here)), 'mxtaltools')):
@@ -64,6 +66,7 @@ def test_guardrail():
 
 
 @torch.no_grad()
+@pytest.mark.parametrize('pb_exact_reversal', [True, False])
 def test_representative_invariance(pb_exact_reversal):
     """Shifting any endpoint by a full period must not change any score."""
     gfn = build_gfn(pb_exact_reversal=pb_exact_reversal)
@@ -98,6 +101,7 @@ def test_representative_invariance(pb_exact_reversal):
 
 
 @torch.no_grad()
+@pytest.mark.parametrize('pb_exact_reversal', [True, False])
 def test_fwd_replay_roundtrip(pb_exact_reversal, t_scale=1.0, exploration=1.0,
                               require_crossings=True):
     """A fwd rollout's own logpf/logpb must be exactly recomputable from its
@@ -124,6 +128,7 @@ def test_fwd_replay_roundtrip(pb_exact_reversal, t_scale=1.0, exploration=1.0,
 
 
 @torch.no_grad()
+@pytest.mark.parametrize('pb_exact_reversal', [True, False])
 def test_bwd_replay_roundtrip(pb_exact_reversal):
     """A bwd rollout scored by the forward-direction scorer must reproduce the
     rollout's own values -- the fwd/bwd kernel matchup, incl. crossings."""
@@ -208,6 +213,7 @@ def test_mixture_normalization():
     print(f"PASS mixture normalization (mass {mass:.5f})")
 
 
+@pytest.mark.parametrize('pb_exact_reversal', [True, False])
 def test_traj_checkpoint_and_grads(pb_exact_reversal):
     """Gradient-checkpointed steps must replay the new pre-drawn randomness
     (incl. the mixture's u_lift) bitwise, and the mixture logsumexp must pass

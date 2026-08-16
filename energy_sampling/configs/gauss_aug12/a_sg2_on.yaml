@@ -1,0 +1,377 @@
+run_name: a_sg2_on
+tag: gauss0812
+seed: 12345
+device: cuda
+cuda_memory_fraction: 0.9
+anomaly_detection: false
+continue_from_checkpoint: false
+mlip_path: null
+checkpoints_dir: C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints
+checkpoint_name: null
+prior_model_name: null
+load_weights_only: false
+prior_path: D:\crystal_datasets\conditional\priors\gauss_latent_sg2_zp1_prior.pt
+molecules_path: D:\crystal_datasets\conditional\priors\gauss_latent_sg2_zp1_prior.pt
+test_molecules_path: null
+archive_period: 5000
+archive_buffers: true
+override_learning_rates: false
+lr_policy: auto
+lr_back: auto
+lr_replay: auto
+lr_fused: auto
+lr_flow: 0.1
+min_lr: 1.0e-06
+lr_warmup_ratio: 10
+adaptive_lr:
+  warmup_steps: 1000
+  seed_lr: 0.000125
+  bounds:
+  - 0.01
+  - 2000.0
+  calibration:
+    alpha_target: 4.0
+    eta_up: 0.25
+    eta_down: 0.5
+  divergence_loss_abs: 1000000000.0
+  divergence_grad_abs: 1000000000.0
+  divergence_cut: 0.5
+  control_flow_lr: false
+ray_calibration:
+  enabled: true
+  period: 500
+  n_sub: 8
+  alphas:
+  - 0
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  - 32
+  - 64
+weight_decay: 0.0001
+use_weight_decay: false
+compile_policy: auto
+traj_checkpoint: false
+gradient_norm_clip: auto
+ema_decay: null
+max_reloads_per_1k_steps: 0.2
+model:
+  full_flow: false
+  s_emb_dim: 512
+  t_dim: 64
+  harmonics_dim: 64
+  condition_embedding_dim: 16
+  t_hidden_dim: 512
+  s_hidden_dim: 512
+  s_layers: 4
+  policy_hidden_dim: 512
+  policy_layers: 4
+  flow_hidden_dim: 512
+  flow_layers: 4
+  cond_hidden_dim: 512
+  cond_layers: 4
+  dropout: 0
+  norm: layer
+  zero_init: false
+  t_scale: 0.05
+  log_var_range: 6
+  pb_drift_range: 0.4
+  pb_var_range: 6
+  learn_pb: true
+  learned_variance: true
+  clipping: true
+  gfn_clip: 200.0
+  periodic_centroids: false
+  dplr_rank: 6
+  dplr_rho_max: 0.5
+  dplr_mask_angular: true
+  pb_exact_reversal: true
+  hold_dead_latent_rows: true
+buffer_device: cuda
+batch_size: 1000
+grow_batch_size: false
+max_batch_size: 1000
+batch_growth_factor: 1.65
+batch_growth_interval: 50
+batch_growth_slow_interval: 300
+auto_batch_throughput_opt: true
+batch_growth_min_throughput_gain: 0.05  # samples/sec gain a jump must clear to be kept -- a SATURATION detector. opt-steps/sec = samples_per_sec / grad-accum target, so this maximises optimizer-step throughput; step time does not enter. MUST be < batch_growth_factor-1 (0.65 here): at or above it a factor-f jump can never deliver the demanded gain, so every jump is rejected and the batch FREEZES at batch_size
+gpu_util_window_s: 900  # trailing window for the gpu/util_recent metric. DIAGNOSTIC ONLY -- nothing in the trainer acts on occupancy: batch size does not move it on the MLIP route (measured, umaperf0812)
+gpu_util_sample_period_s: 60  # wall-clock seconds between occupancy samples. Time-based, not per-N-steps: a step-based cadence cannot fill a 900 s window at 200 s/step, which is how the metric came to be absent on exactly the slow MLIP arms it was there to watch
+gpu_util_policy_window_s: 7200  # the window the CLUSTER averages over when deciding to cancel. Logged as gpu/util_policy so the number the scheduler judges is visible in wandb
+max_step_seconds: 10  # RUNAWAY GUARD, not a tuning knob: cut the batch only once the median step exceeds this. Stands down for the stage if a cut does not actually move step time (a fixed per-step cost is not batch-driven, and cutting further only shrinks the gradient). 0 = off
+batch_knee_recheck_steps: 2000
+oom_batch_shrink_factor: 0.5
+oom_cooldown_steps: 200
+eval_num_samples: 10000
+test_eval_num_samples: 2000
+fused_grad_accum_min_samples: 1000
+epochs: 4000
+eval_period: 150
+figs_period: 500
+eval_T: 10
+integrator:
+  T: 10
+fwd_loss_coeffs:
+  tb: 0.0
+  z_level: 0.0
+  freeze_policy: 0.0
+  freeze_z: 0.0
+  vg_lb: 0.0
+  vg_lme: 0
+  vg_by_condition: 0.0
+  db: 0.0
+  subtb: 0.0
+  subtb_lambda: 0.95
+  emp_z: 0
+  emp_z_persistent: 0
+  traj_grads: 0.0
+  reward_grads: 0.0
+  repeats: 1.0
+  loss_clip: 1000000000.0
+  beta: 10.0
+bwd_loss_coeffs:
+  tb: 0.0
+  freeze_policy: 0.0
+  freeze_z: 1.0
+  vg_lb: 0
+  vg_lme: 0
+  vg_by_condition: 1.0
+  pf_boost: 0
+  db: 0.0
+  subtb: 0.0
+  subtb_lambda: 0.95
+  emp_z: 0
+  emp_z_persistent: 0
+  level_gap: 0.0
+  level_gap_clamp: 10.0
+  mle: 0.0
+  tbc: 0.0
+  repeats: 1.0
+  traj_grads: 1.0
+  loss_clip: 1000000000.0
+  beta: 10.0
+replay_loss_coeffs:
+  tb: 1.0
+  freeze_policy: 0.0
+  freeze_z: 1.0
+  vg_lb: 0
+  vg_lme: 0
+  pf_boost: 0
+  db: 0.0
+  subtb: 0.0
+  subtb_lambda: 0.95
+  emp_z: 0
+  emp_z_persistent: 0
+  mle: 0.0
+  repeats: 1.0
+  traj_grads: 0.0
+  loss_clip: 1000000000.0
+  beta: 10.0
+condition_log_z:
+  min_visits: 20
+  half_life_visits: 7.0
+  trim_frac: 0.01
+  max_batch_weight: 200.0
+  discovery_half_life_steps: 200.0
+  fwd_tb_z_source: learned
+  bwd_tb_z_source: learned
+  replay_tb_z_source: learned
+  weighted_condition_sampling: true
+  weighted_condition_sampling_clip_quantile: 0.99
+  weighted_condition_sampling_temperature: 0.3
+  weighted_condition_sampling_uniform_beta: 0.5
+mle_slope_t: 2.0
+mle_min_rate: 0.05
+mle_slope_window: 300
+z_calibration:
+  enabled: true
+  mode: rollout
+  sensor: pooled
+  sensor_quantile: 0.5
+  threshold: 0.5
+  grace: 0.8
+  gain: 1.0
+  max_steps_per_step: 100.0
+  min_visits: null
+  freshness_half_life_steps: 300.0
+  se2_floor: 0.25
+  holdout_modulus: 8
+protocol:
+  stages:
+  - name: train_prior
+    train_mode: bwd
+    bwd_sampling_mode: dataset
+    skip_if: prior_loaded
+    flags:
+      update_log_z: true
+      scramble_conditions: true
+      mle_gate: true
+    loss_coeffs:
+      bwd:
+        mle: 1.0
+        tbc: 1.0
+        repeats: 2.0
+    exit:
+    - metric: gates/mle_flat
+      above: 0.5
+      patience: 5
+    - metric: eval/wass_debiased
+      below: 0.015
+    - metric: bwd/tbc
+      below: 2.0
+    on_exit:
+    - snapshot:phase1_exit
+    - snapshot_prior
+  - name: equilibration
+    train_mode: fused
+    bwd_sampling_mode: prior
+    flags:
+      update_log_z: true
+      buffers_active: true
+    on_enter:
+    - rebuild_prior_by_churn
+    - bootstrap_z:train_conditioner
+    fracs:
+      fwd: 0.05
+      bwd: 0.45
+      replay: 0.5
+    min_fracs:
+      fwd: 0.02
+      bwd: 0.25
+      replay: 0.05
+    deactivate_threshold: 0.01
+    loss_coeffs:
+      fwd:
+        tb: 1.0
+        freeze_policy: 1.0
+      bwd:
+        tb: 1.0
+        beta: 80
+      replay:
+        tb: 1.0
+        beta: 80
+    balance:
+      kind: ratio
+      pinned:
+        fwd: 0.05
+      metrics:
+        replay: fwd/over_coverage
+        bwd: bwd/relative_under_wcen
+      numerator: replay
+      setpoint: 5.0
+      gain: 0.05
+      max_step: 0.05
+      bounds:
+        replay:
+        - 0.05
+        - 0.6
+      converge_floor: 1.0
+    buffer_servo:
+      numerator: replay/ema_loss_mean
+      denominator: replay/birth_loss_mean
+      bar: 0.368
+      release: 0.6
+      scale: 0.15
+      gain: 0.05
+      relax: 0.5
+      max_step: 0.05
+      max_boost: 8.0
+controller:
+  min_mode_frac: 0.001
+  beta: 0.025
+  deactivate_threshold: 0.01
+  refresh_every: 10
+  decay_rate: 0.95
+  anneal_patience: 5
+  lookahead_horizon: 5
+  lookahead_trend_alpha: 0.1
+conditional_worst_quantile: 0.25
+buffers:
+  prior_buffer:
+    seed_source: prior_dataset
+    mean_lifetime: 100
+    weighted_bwd_beta: 0.9
+    churn_batch_ref: 1000
+    min_size: 10000
+    max_size: 250000
+    init_fraction: 0.25
+    condition_block_m: 1
+    reward_min: 0
+    ramp_floor: 100
+    ramp_width: 50
+  replay_buffer:
+    churn_rate: 80
+    mean_residence_steps: 50
+    max_size: 12000
+    admit_reward_min: -200
+    prioritise:
+      enabled: true
+      kappa: 1.0
+      floor_frac: 0.25
+      symmetric: true
+  anchor_buffer:
+    seed_source: prior_dataset
+    max_size: 200000
+    dup_cutoff: 0.05
+    screen_energy_window: 20
+    thin_energy_window: 50
+    surprise_cutoff: -5
+    confirm_cutoff: -5
+    confirm_k: 5
+    health_gate_floor_metric: null
+    health_gate_floor: null
+    health_gate_ceiling_metric: tb_resid_clipped
+    health_gate_ceiling: 0.5
+    replay_beta: 0.5
+    thin_every_n_evals: 5
+    refresh_every_n_evals: 3
+    noise_log_range:
+    - -2.5
+    - -1.5
+    topup_admit_record_breakers: true
+    reach_quantile: 0.9
+    reach_threshold: 0.75
+    reach_topup_size: 1000
+energy_function: latent_gaussian
+temperature_conditioning: false
+molecule_conditioning: false
+sg_conditioning: false
+space_groups:
+- 2
+zp_conditioning: false
+z_primes:
+- 1
+vector_conditioning: false
+vector_conditioning_dim: 3
+energy_config:
+  internal_oom_recovery: false
+  temperature: 1.0
+  log_temperature_range:
+  - 0.0
+  - 0.0
+  density_coeff: 0.0
+  bounding_coeff: 1.0
+  reduction_coeff: 1.0
+  lj_coeff: 1.0
+  reward_range: null
+  analyze_kwargs:
+    c:
+    - 0.5
+    - 0.5
+    - 0.5
+    - 0.5
+    - 0.5
+    - 0.5
+    - 0.5
+    - 0.5
+    - 0.5
+    - 0.5
+    - 0.5
+    - 0.5
+    width: 0.1
+  lj_rescale: null
+figure_period: 600
+wandb_mode: online

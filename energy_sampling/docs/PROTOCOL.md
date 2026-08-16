@@ -18,6 +18,23 @@ made State unreadable without Log and made Evidence impossible to grade.
 `audit_since_ty4xdlzo.md` is frozen Evidence; the `.html`/`.tex` derivations are
 Argument. Neither gets edited.
 
+### Transition — the one exception to "Log lives in git"
+
+A **state transition** record says how a config at project state N reaches state
+N+1. It reads like Log and is not: Log narrates what happened, a Transition
+answers a question a future reader must be able to answer mechanically, and
+unlike Log its correctness is checkable — the migration either produces a
+loadable config or it does not.
+
+It gets a home because git cannot serve that question. Reconstructing a migration
+from a diff means reading every commit between two states and inferring intent.
+
+**Transitions are data, not prose.** They live in `config_state.STATE_HISTORY`
+beside the migration that implements them, so a description and its transform
+cannot drift. `docs/state_history.md` is generated from those records and is
+never hand-edited; a test asserts the committed copy matches. Append one record
+per transition; never edit a shipped one.
+
 ## Grades
 
 Every finding carries one. Prose cannot be trusted to carry confidence, so it is

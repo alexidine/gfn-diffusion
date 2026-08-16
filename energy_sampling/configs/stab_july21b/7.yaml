@@ -1,0 +1,370 @@
+adaptive_lr:
+  control_flow_lr: false
+  cut_grad_abs: 3000.0
+  cut_loss_abs: 1000.0
+  cut_ratio: 0.5
+  decay_floor_scale: 0.05
+  decay_halflife_steps: 20000
+  enabled: true
+  fire_cooldown_steps: 500
+  hold_steps: 10000
+  recovery_ramp_steps: 1000
+  recovery_target_frac: 0.5
+  recovery_wait_steps: 3000
+  reset_grad_abs: 30000.0
+  reset_loss_abs: 10000.0
+  warmup_steps: 1000
+anomaly_detection: false
+auto_batch_throughput_opt: true
+batch_growth_factor: 1.65
+batch_growth_interval: 50
+batch_growth_min_throughput_gain: 0.05  # samples/sec gain a jump must clear to be kept -- a SATURATION detector. opt-steps/sec = samples_per_sec / grad-accum target, so this maximises optimizer-step throughput; step time does not enter. MUST be < batch_growth_factor-1 (0.65 here): at or above it a factor-f jump can never deliver the demanded gain, so every jump is rejected and the batch FREEZES at batch_size
+gpu_util_window_s: 900  # trailing window for the gpu/util_recent metric. DIAGNOSTIC ONLY -- nothing in the trainer acts on occupancy: batch size does not move it on the MLIP route (measured, umaperf0812)
+gpu_util_sample_period_s: 60  # wall-clock seconds between occupancy samples. Time-based, not per-N-steps: a step-based cadence cannot fill a 900 s window at 200 s/step, which is how the metric came to be absent on exactly the slow MLIP arms it was there to watch
+gpu_util_policy_window_s: 7200  # the window the CLUSTER averages over when deciding to cancel. Logged as gpu/util_policy so the number the scheduler judges is visible in wandb
+batch_growth_slow_interval: 300
+batch_knee_recheck_steps: 2000
+batch_size: 1000
+buffer_device: cuda
+buffers:
+  anchor_buffer:
+    confirm_cutoff: -5
+    confirm_k: 5
+    dup_cutoff: 0.05
+    health_gate_r2: 0.9
+    health_gate_zerr: 0.5
+    max_size: 200000
+    noise_log_range:
+    - -2.5
+    - -1.5
+    reach_quantile: 0.9
+    reach_threshold: 0.75
+    reach_topup_size: 1000
+    refresh_every_n_evals: 5
+    replay_beta: 0.5
+    screen_energy_window: 20
+    seed_source: prior_dataset
+    surprise_cutoff: -5
+    thin_energy_window: 50
+    thin_every_n_evals: 5
+    topup_admit_record_breakers: true
+  prior_buffer:
+    condition_block_m: 2
+    max_size: 50000
+    mean_lifetime: 100
+    min_size: 10000
+    ramp_floor: 100
+    ramp_width: 50
+    reward_min: -600
+    seed_source: prior_dataset
+  replay_buffer:
+    max_size: 100000
+    random_churn_rate: 50
+bwd_loss_coeffs:
+  beta: 10.0
+  db: 0.0
+  emp_z: 0
+  emp_z_persistent: 0
+  freeze_policy: 0.0
+  freeze_z: 1.0
+  loss_clip: 1000000000.0
+  mle: 0.0
+  pf_boost: 0
+  repeats: 1.0
+  subtb: 0.0
+  subtb_lambda: 0.95
+  tb: 0.0
+  tbc: 0.0
+  traj_grads: 1.0
+  vg_by_condition: 1.0
+  vg_lb: 0
+  vg_lme: 0
+checkpoint_name: null
+checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/
+compile_policy: auto
+condition_log_z:
+  bwd_tb_z_source: learned
+  discovery_half_life_steps: 200.0
+  fwd_tb_z_source: learned
+  half_life_steps: 7.0
+  max_batch_weight: 200.0
+  min_visits: 20
+  mol_sampling_uniform_beta: 0.5
+  mol_sampling_weighted_by_z_gap: true
+  mol_sampling_z_gap_clip_quantile: 0.99
+  mol_sampling_z_gap_temperature: 0.5
+  replay_tb_z_source: learned
+  trim_frac: 0.1
+continue_from_checkpoint: false
+controller:
+  anneal_patience: 5
+  beta: 0.025
+  deactivate_threshold: 0.01
+  decay_rate: 0.95
+  lookahead_horizon: 5
+  lookahead_trend_alpha: 0.1
+  min_mode_frac: 0.001
+  refresh_every: 10
+cuda_memory_fraction: 0.9
+device: cuda
+ema_decay: null
+energy_config:
+  analyze_kwargs: {}
+  bounding_coeff: 1.0
+  density_coeff: 10.0
+  internal_oom_recovery: true
+  lj_coeff: 1.0
+  log_temperature_range:
+  - 0
+  - 0.693147
+  reduction_coeff: 1.0
+  reward_range: 500
+  temperature: 2.5
+energy_function: elj
+epochs: 100000
+eval_T: 40
+eval_num_samples: 10000
+eval_period: 250
+figs_period: 250
+fused_grad_accum_min_samples: 1000
+fwd_loss_coeffs:
+  beta: 10.0
+  db: 0.0
+  emp_z: 0
+  emp_z_persistent: 0
+  freeze_policy: 0.0
+  freeze_z: 0.0
+  loss_clip: 1000000000.0
+  repeats: 1.0
+  reward_grads: 0.0
+  subtb: 0.0
+  subtb_lambda: 0.95
+  tb: 0.0
+  traj_grads: 0.0
+  vg_by_condition: 0.0
+  vg_lb: 0.0
+  vg_lme: 0
+gradient_norm_clip: 100.0
+grow_batch_size: true
+integrator:
+  T: 40
+  discretizer: uniform
+  discretizer_max_ratio: 15
+  max_traj_length: 40
+  min_traj_length: 40
+  traj_length_strategy: static
+load_weights_only: false
+lr_back: 4.0e-05
+lr_flow: 0.1
+lr_fused: 4.0e-05
+lr_policy: 4.0e-05
+lr_replay: 4.0e-05
+lr_warmup_ratio: 100
+max_batch_size: 50000
+min_lr: 1.0e-06
+mle_min_rate: 0.05
+mle_slope_t: 2.0
+mle_slope_window: 300
+mlip_path: null
+model:
+  clipping: true
+  cond_hidden_dim: 512
+  cond_layers: 6
+  condition_embedding_dim: 16
+  dplr_mask_angular: false
+  dplr_rank: 6
+  dplr_rho_max: 0.5
+  dropout: 0
+  flow_hidden_dim: 512
+  flow_layers: 6
+  full_flow: false
+  gfn_clip: 200.0
+  harmonics_dim: 64
+  learn_pb: true
+  learned_variance: true
+  log_var_range: 6
+  norm: layer
+  pb_drift_range: 0.4
+  pb_var_range: 6
+  periodic_centroids: true
+  policy_hidden_dim: 512
+  policy_layers: 6
+  s_emb_dim: 512
+  s_hidden_dim: 512
+  s_layers: 6
+  t_dim: 64
+  t_hidden_dim: 512
+  t_scale: 0.05
+  zero_init: false
+molecule_conditioning: false
+molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_prior_dataset.pt
+oom_batch_shrink_factor: 0.5
+oom_cooldown_steps: 200
+override_learning_rates: false
+prior_model_name: null
+prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_prior_dataset.pt
+protocol:
+  stages:
+  - bwd_sampling_mode: dataset
+    exit:
+    - above: 0.5
+      metric: gates/mle_flat
+      patience: 5
+    - below: 0.015
+      metric: eval/wass_debiased
+    - below: 2.0
+      metric: bwd/tbc
+    flags:
+      mle_gate: true
+      scramble_conditions: true
+      update_log_z: true
+    loss_coeffs:
+      bwd:
+        mle: 1.0
+        repeats: 2.0
+        tbc: 1.0
+    name: train_prior
+    on_exit:
+    - snapshot:phase1_exit
+    - snapshot_prior
+    skip_if: prior_loaded
+    train_mode: bwd
+  - bwd_sampling_mode: dataset
+    exit:
+    - below: 0.03
+      metric: eval/wass_debiased
+    - below: 2.0
+      metric: bwd/tbc
+    flags:
+      scramble_conditions: true
+      update_log_z: true
+    loss_coeffs:
+      bwd:
+        mle: 1.0
+        repeats: 2.0
+        tbc: 1.0
+    name: warmstart
+    on_exit:
+    - snapshot:warmstart_exit
+    train_mode: bwd
+  - balance:
+      default_boost: fwd
+      kind: lexicographic
+      rules:
+      - above: 0.5
+        abs: true
+        boost: fwd
+        metric: fwd/tb_resid_clipped
+      - boost: fwd
+        drift: 0.003
+        margin: 1.3
+        metric: fwd/scatter_err
+        relative: best
+      - above: 20.0
+        anneal:
+          min: fwd/scatter_err
+        boost: replay
+        metric: replay/scatter_err
+    bwd_sampling_mode: prior
+    deactivate_threshold: 0.01
+    exit:
+    - above: 0.95
+      metric: fwd/r2
+      patience: 2
+    flags:
+      buffers_active: true
+    fracs:
+      bwd: 0.001
+      fwd: 0.799
+      replay: 0.2
+    loss_coeffs:
+      bwd:
+        tb: 1.0
+      fwd:
+        tb: 1.0
+    min_fracs:
+      bwd: 0.001
+      fwd: 0.02
+      replay: 0.02
+    name: buildout
+    on_exit:
+    - snapshot:fwd_calibrated
+    train_mode: fused
+  - balance:
+      anneal_coeffs:
+        bounding_coeff:
+          target: 10.0
+        reduction_coeff:
+          target: 10.0
+      default_boost:
+        fwd: 0.1
+        replay: 0.9
+      kind: lexicographic
+      rules:
+      - above: 0.5
+        abs: true
+        boost: fwd
+        metric: fwd/tb_resid_clipped
+      - below: 0.9
+        boost: replay
+        metric: fwd/r2
+      - above: 8.0
+        anneal:
+          min: 1.0
+        boost: bwd
+        metric: bwd/relative_under
+      - above: 8.0
+        boost: replay
+        metric: fwd/over_coverage
+    bwd_sampling_mode: prior
+    deactivate_threshold: 0.001
+    flags:
+      buffers_active: true
+    loss_coeffs:
+      bwd:
+        tb: 1.0
+      fwd:
+        freeze_policy: 1.0
+        tb: 1.0
+    min_fracs:
+      bwd: 0.01
+      fwd: 0.0009
+      replay: 0.0009
+    name: terminal
+    train_mode: fused
+r2_worst_quantile: 0.0
+replay_loss_coeffs:
+  beta: 10.0
+  db: 0.0
+  emp_z: 0
+  emp_z_persistent: 0
+  freeze_policy: 0.0
+  freeze_z: 1.0
+  loss_clip: 1000000000.0
+  mle: 0.0
+  pf_boost: 0
+  repeats: 1.0
+  subtb: 0.0
+  subtb_lambda: 0.95
+  tb: 1.0
+  traj_grads: 0.0
+  vg_lb: 0
+  vg_lme: 0
+reuse_prior: true
+run_name: elj_h512x6_T40_lr4.0e-5
+seed: 12345
+sg_conditioning: false
+space_groups:
+- 2
+tag: stab_july21b
+temperature_conditioning: false
+terminal_box_violation: 1.0
+terminal_logw_std: 1000.0
+test_molecules_path: null
+use_weight_decay: false
+vector_conditioning: false
+vector_conditioning_dim: 3
+weight_decay: 0.0001
+z_primes:
+- 1
+zp_conditioning: false

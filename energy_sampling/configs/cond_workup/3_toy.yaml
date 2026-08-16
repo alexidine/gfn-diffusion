@@ -1,0 +1,71 @@
+seed: 0
+template_path: D:\crystal_datasets\conditional\priors\14_1_elj.pt
+output_dir: D:\crystal_datasets\conditional\priors
+tag: cw03
+energy_function: latent_multiharmonic
+latent_field:
+  cond_dim: 2
+  n_core: 1
+  n_ghost: 0
+  sigma_range:
+  - 0.04
+  - 0.12
+  aniso_scale: 0.0
+  depth_range:
+  - 0.0
+  - 4.0
+  mu_scale: 0.5
+  disp_max: 0.3
+  logsig_scale: 0.25
+  gate_steep: 4.0
+  edge_sigmas: 0.1
+  max_temperature: 1.0
+  max_width: 2.5
+  seed: 0
+conditions:
+- identifier: mode_a
+  c:
+  - 1.0
+  - 1.0
+  width: 1.0
+- identifier: mode_b
+  c:
+  - -1.0
+  - -1.0
+  width: 1.0
+condition_manifold:
+  enabled: true
+  mode: interpolate
+  identifier: manifold_ab
+  n_conditions: 1000
+  include_anchors: true
+  noise_std: 0.0
+  scale: 2.0
+  center: null
+  cond_dim: 2
+  draw_width: 1.0
+condition_set:
+  generate: true
+  n_replicas_per_condition: 10
+  sample_latents: true
+  output_name: null
+prior:
+  generate: true
+  mode: shared
+  shared_center: null
+  shared_width: 0.35
+  width_multiplier: 2
+  n_samples_per_condition: 10
+  equalized_n_samples_per_condition: 10
+  n_samples_total: 20000
+  equalized_n_samples_total: 100000
+  target_temperature: 1.0
+  output_name: null
+coverage_check:
+  run: true
+  n_check_conditions: 200
+  n_is_samples: 5000
+  min_ess_frac: 0.01
+  show_figures: true
+  save_figures: false
+show_figures: false

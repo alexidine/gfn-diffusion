@@ -1,0 +1,70 @@
+- index: 0
+  run_name: fx_static
+  tag: ctrl_aug03
+  controller: fixed
+  buffer_servo: false
+  resume_from: dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-573c92_phase1_exit.pt
+  resume_step: 6680
+  epochs: 9080
+  fwd_frac: 0.05
+  fwd_trains_policy: true
+  entry_fracs:
+    fwd: 0.05
+    bwd: 0.75
+    replay: 0.2
+  note: 'reference cell: fixed mix 0.05/0.75/0.20, no controller, no servo'
+  steps_past_resume: 2400
+  compare_at_steps: 2000
+- index: 1
+  run_name: fx_servo
+  tag: ctrl_aug03
+  controller: fixed
+  buffer_servo: true
+  resume_from: dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-573c92_phase1_exit.pt
+  resume_step: 6680
+  epochs: 8680
+  fwd_frac: 0.05
+  fwd_trains_policy: true
+  entry_fracs:
+    fwd: 0.05
+    bwd: 0.75
+    replay: 0.2
+  note: buffer freshness servo on a static mix; A/B against arm 0
+  steps_past_resume: 2000
+  compare_at_steps: 2000
+- index: 2
+  run_name: cs_servo
+  tag: ctrl_aug03
+  controller: constraint
+  buffer_servo: true
+  resume_from: dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-573c92_phase1_exit.pt
+  resume_step: 6680
+  epochs: 8680
+  fwd_frac: 0.05
+  fwd_trains_policy: true
+  entry_fracs:
+    fwd: 0.05
+    bwd: 0.75
+    replay: 0.2
+  note: constraint integrator, constrain bwd at 2.0, best-effort replay at 10.0, replay
+    bounded [0.10, 0.25]
+  steps_past_resume: 2000
+  compare_at_steps: 2000
+- index: 3
+  run_name: pp_servo
+  tag: ctrl_aug03
+  controller: proportional
+  buffer_servo: true
+  resume_from: dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-573c92_phase1_exit.pt
+  resume_step: 6680
+  epochs: 8680
+  fwd_frac: 0.05
+  fwd_trains_policy: true
+  entry_fracs:
+    fwd: 0.05
+    bwd: 0.75
+    replay: 0.2
+  note: incumbent proportional tilt at the same bars/ceiling as arm 2; controller-law
+    A/B
+  steps_past_resume: 2000
+  compare_at_steps: 2000

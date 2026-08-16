@@ -452,15 +452,20 @@ class Modeller:
         at 100% below the knee; marginal throughput is the discriminating signal
         on both sides.
 
-        THE TEST IS STEP-TIME REGRESSION, NOT RAW THROUGHPUT GAIN. The retired
-        batch_growth_min_gain asked for a fixed +15% samples/sec, which is not a
-        knee criterion at all: at growth factor f a rung that returns exactly
-        +15% has grown step time by f/1.15 = x1.43, a 30% steps/hour LOSS scored
-        as a win. Chained, that walks the batch up until OOM stops it (prod0810
-        mipcas_elj: 2722 -> 12226, then a permanent OOM sawtooth). The honest
-        question is how much slower a step may get in exchange for throughput,
-        so the gate is batch_growth_max_step_regression: accept iff
-        t_new/t_old <= 1 + tol, i.e. sps_new >= sps_old * f / (1 + tol).
+        THE TEST IS THROUGHPUT SATURATION. A jump is kept iff it buys at least
+        batch_growth_min_throughput_gain more samples/sec than the rung below;
+        otherwise the batch pins at the previous rung. Step time does not enter:
+        with the update size pinned at fused_grad_accum_min_samples,
+        optimizer-steps/sec = samples_per_sec / accum_target, so samples/sec IS
+        opt-step throughput and a slower-but-higher-throughput step is a win.
+
+        That is a deliberate reversal of the step-time-regression test this
+        method used to apply, which optimised loop-iterations/hour -- a different
+        objective, and the wrong one under this priority. Both retired keys
+        (batch_growth_min_gain, batch_growth_max_step_regression) are in
+        utils._RETIRED_KEYS with the argument; the gate itself is below, and its
+        constraint against batch_growth_factor is asserted in
+        config_invariants.growth_gain_below_growth_factor.
 
         Three further guards, each from an observed prod0810 failure:
           * NEVER GROW BLIND. The old code fell through to an unconditional

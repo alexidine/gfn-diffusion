@@ -1,3 +1,12 @@
+# The config-schema state this file is written against. Every generated
+# production config records the state it was spawned from, so an old config can
+# be migrated forward mechanically rather than reconstructed by hand:
+#     python -m config_state migrate <config.yaml>
+# The history and the migrations live together in config_state.py. This is a
+# migration identifier, NOT a release version, and it is a separate axis from the
+# checkpoint problem_def's schema_version (which versions the problem identity).
+project_state_version: 1
+
 run_name: 'mk_dev'
 tag: 'dev'
 seed: 12345

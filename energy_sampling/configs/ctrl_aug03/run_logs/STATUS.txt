@@ -1,0 +1,11 @@
+﻿battery ctrl_aug03 started 2026-08-03T02:09:04  deadline 2026-08-03T07:09:04
+START fx_static 2026-08-03T02:09:04
+END   fx_static 2026-08-03T02:57:45  exit=  minutes=48.7
+START cs_servo 2026-08-03T02:58:05
+END   cs_servo 2026-08-03T03:39:33  exit=  minutes=41.5
+START fx_servo 2026-08-03T03:39:53
+END   fx_servo 2026-08-03T04:21:56  exit=  minutes=42
+START pp_servo 2026-08-03T04:22:16
+END   pp_servo 2026-08-03T05:04:10  exit=  minutes=41.9
+battery ctrl_aug03 finished 2026-08-03T05:04:30
+FOLLOWUP START fx_servo_hi 2026-08-03T05:05:57

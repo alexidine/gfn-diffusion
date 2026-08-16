@@ -1,0 +1,68 @@
+- run_name: fx_static
+  tag: ctrl_aug03
+  sizing: lo
+  fwd_frac: 0.05
+  fracs:
+    fwd: 0.05
+    bwd: 0.75
+    replay: 0.2
+  churn_rate: 80
+  max_size: 4000
+  mean_residence_steps: 50
+  predicted_occupancy: 4000
+  predicted_draws_per_row_step: 0.708
+  epochs: 9080
+  buffer_servo: false
+  balance: null
+  note: ALREADY RUN as the ctrl_aug03 reference; the (lo, 0.05) cell
+- run_name: sz_hi_f05
+  tag: size_aug03
+  sizing: hi
+  fwd_frac: 0.05
+  fracs:
+    fwd: 0.05
+    bwd: 0.75
+    replay: 0.2
+  churn_rate: 700
+  max_size: 40000
+  mean_residence_steps: 50
+  predicted_occupancy: 35000
+  predicted_draws_per_row_step: 0.0809
+  epochs: 8680
+  buffer_servo: false
+  balance: null
+  note: sizing fixed, fwd 0.05 -- does correct sizing alone lift the ratio above 1
+- run_name: sz_lo_f20
+  tag: size_aug03
+  sizing: lo
+  fwd_frac: 0.2
+  fracs:
+    fwd: 0.2
+    bwd: 0.6
+    replay: 0.2
+  churn_rate: 80
+  max_size: 4000
+  mean_residence_steps: 50
+  predicted_occupancy: 4000
+  predicted_draws_per_row_step: 0.7077
+  epochs: 8680
+  buffer_servo: false
+  balance: null
+  note: current sizing, fwd 0.20 -- does fwd mass alone close the Z residual
+- run_name: sz_hi_f20
+  tag: size_aug03
+  sizing: hi
+  fwd_frac: 0.2
+  fracs:
+    fwd: 0.2
+    bwd: 0.6
+    replay: 0.2
+  churn_rate: 700
+  max_size: 40000
+  mean_residence_steps: 50
+  predicted_occupancy: 35000
+  predicted_draws_per_row_step: 0.0809
+  epochs: 8680
+  buffer_servo: false
+  balance: null
+  note: both -- the reference-like configuration

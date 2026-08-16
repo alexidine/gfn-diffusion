@@ -350,6 +350,7 @@ failures live.
 | [`module_buffers.md`](module_buffers.md) | `CrystalBuffer` + prior / replay / anchor policies |
 | [`module_training_modes.md`](module_training_modes.md) | fwd / bwd / replay / fused dispatch, fracs-as-weights |
 | [`module_metrics.md`](module_metrics.md) | `quick_tb_stats`, `MetricTracker`, load-bearing set |
+| [`reading_runs.md`](reading_runs.md) | **the interpretive layer.** Read order, metric tiers, the `R*` standing principles, the routine confound list. What a shape *means*, as against what a metric *is* (`module_metrics.md`) |
 | [`module_protocol.md`](module_protocol.md) | stages, exits, transition barrier, balance controller |
 | [`module_modulators.md`](module_modulators.md) | batch size, OOM, buffer servo |
 | [`module_lr_controller.md`](module_lr_controller.md) | LR warmup envelope, the alpha* servo, the divergence bar. **Rewritten 2026-08-08 for v7** -- the cut/latch/recovery middle layer and the decay leg are deleted, so anything citing them is pre-v7 |
@@ -369,6 +370,8 @@ The remaining finding IDs are **module-local**: `B0…B8` in `module_buffers.md`
 `L1…L11` in `module_losses.md`,
 `P1…P8` in `module_protocol.md`, `T0…T7` in `module_metrics.md`, `M1…M8` in
 `module_training_modes.md`, `D1…D8` in `module_modulators.md`, `S*` per document.
+`R1…R19` in `reading_runs.md` are **principles, not findings** — they carry no
+grade and no scope line, because they are method rather than evidence.
 Two of these collide with other series and the collisions are live: `to_do_rebuild.md`
 uses `§B1…§B9` for the *design argument* (always written with the `§`), and
 `decisions.md` uses `D2`, `D8`, `D26`… for *decisions* (a different `D` series from

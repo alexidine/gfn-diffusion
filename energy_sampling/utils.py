@@ -303,6 +303,79 @@ def _walk_key(args, dotted):
     return node, parts[-1], hasattr(node, parts[-1])
 
 
+def _check_state_version(args):
+    """Check the config's declared project state against this code's.
+
+    SELF-ARMING SEVERITY. While CURRENT_STATE_VERSION is 1 there is nothing for a
+    migration to do beyond writing the stamp, so an unstamped config gets a notice
+    and runs. The moment a real transition ships, the same unstamped config is
+    genuinely stale -- it predates a change whose migration exists -- and this
+    becomes fatal without anyone having to remember to tighten it.
+
+    A config AHEAD of the code is always fatal: it may carry keys this revision has
+    no schema for, and there is no downgrade path."""
+    from config_state import CURRENT_STATE_VERSION, UNSTAMPED_VERSION, VERSION_KEY
+
+    declared = getattr(args, VERSION_KEY, None)
+    version = UNSTAMPED_VERSION if declared is None else int(declared)
+
+    if version > CURRENT_STATE_VERSION:
+        raise ValueError(
+            f"config declares {VERSION_KEY}: {version}, ahead of this code's state "
+            f"{CURRENT_STATE_VERSION}. It may carry keys with no schema here. Check "
+            f"out the revision that matches, rather than running it against older code.")
+
+    if version < CURRENT_STATE_VERSION:
+        msg = (f"config is at {VERSION_KEY} {version}, current is "
+               f"{CURRENT_STATE_VERSION}. Migrate it:\n"
+               f"    python -m config_state migrate <config.yaml>")
+        if CURRENT_STATE_VERSION > 1:
+            raise ValueError(msg)
+        print(f"NOTE: {msg}\n  (not fatal at state 1 -- the migration only adds the "
+              f"stamp. It becomes fatal once a real transition ships.)")
+
+    setattr(args, VERSION_KEY, version)
+    return args
+
+
+def _namespace_to_dict(ns):
+    """Namespace tree -> plain dict, for the invariant checks (which are pure
+    functions of a raw config dict so they can also run over YAML on disk)."""
+    from argparse import Namespace
+    if isinstance(ns, Namespace):
+        return {k: _namespace_to_dict(v) for k, v in vars(ns).items()}
+    if isinstance(ns, (list, tuple)):
+        return [_namespace_to_dict(v) for v in ns]
+    return ns
+
+
+def _report_config_invariants(args):
+    """Print any violated config invariant. REPORTS, does not raise.
+
+    Deliberately not a gate, for now. Of the 2,244 configs in the tree, 47 set a
+    `figs_period` that is not a multiple of `eval_period` (so they logged no
+    figures at all) and 119 run DPLR unmasked with angular dims (so they die at
+    model construction anyway). Making this fatal would block reruns of batteries
+    that are otherwise valid, to report a fault the run either already survives
+    or already dies of.
+
+    The gate belongs at GENERATION, where a bad config can be fixed before it
+    costs anything: the production-config generator treats ERROR as fatal.
+    Printing here means an existing config still says so out loud, at load,
+    rather than at hour three."""
+    try:
+        import config_invariants
+        violations = config_invariants.check(_namespace_to_dict(args))
+    except Exception as e:      # never let a diagnostic stop a run
+        print(f'config invariant check skipped ({type(e).__name__}: {e})')
+        return
+    if not violations:
+        return
+    print('config invariants:')
+    for v in violations:
+        print(f'  {v}')
+
+
 def preflight_config(args):
     """Reject retired keys at load, before a single energy call is spent.
 
@@ -316,7 +389,15 @@ def preflight_config(args):
         if present:
             dead.append(f"  {dotted}: {why}")
     if dead:
-        raise ValueError("retired config keys found:\n" + "\n".join(dead))
+        raise ValueError(
+            "retired config keys found:\n" + "\n".join(dead)
+            + "\n\nThe mechanical subset of these can be repaired automatically:\n"
+              "    python -m config_state migrate <config.yaml>\n"
+              "which renames what is renameable, drops what is dead, and REPORTS "
+              "(without changing) the keys whose interpretation moved.")
+
+    _check_state_version(args)
+    _report_config_invariants(args)
 
     # Integration time must agree between training and eval. The stab_july21
     # elj battery ran eval_T = 2T and floored wass_debiased on what turned out

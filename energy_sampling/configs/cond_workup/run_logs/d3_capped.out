@@ -1,0 +1,3 @@
+resolve_derived_config (W=256, T=40): lr_policy=6.25e-05, lr_replay=6.25e-05, lr_back=6.25e-05, lr_fused=3.125e-05, gradient_norm_clip=243.6, adaptive_lr.cut_grad_abs=7309, adaptive_lr.reset_grad_abs=7.309e+04, adaptive_lr.reset_loss_abs=2.5e+04
+Re-analyzing prior energies
+Seeded prior_buffer with 100800 prior-dataset samples (fresh loss records)

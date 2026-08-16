@@ -1,0 +1,57 @@
+# ctrl_aug03 battery -- run sequentially from energy_sampling/.
+#
+# Arm order is by information value, so a short night still buys the important
+# comparisons: the reference first (also validates the pipeline cheaply), then
+# the proposed controller, then the two isolations.
+#
+# Two independent stops. PER_ARM_TIMEOUT keeps one pathological arm from eating
+# the night; DEADLINE stops the battery starting an arm it cannot finish.
+# Metrics live in wandb and are streamed continuously, so an arm killed by the
+# timeout still yields everything except its final checkpoint.
+
+$ErrorActionPreference = 'Continue'
+$PY   = 'C:\Users\mikem\venvs\csd_mxt_gfn\Scripts\python.exe'
+$ROOT = 'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling'
+$LOGS = Join-Path $ROOT 'configs\ctrl_aug03\run_logs'
+$env:PYTHONPATH = 'C:\Users\mikem\Projects\mxt_gfn\mxtaltools;C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion'
+
+$PER_ARM_TIMEOUT = 5400          # seconds
+$DEADLINE        = (Get-Date).AddHours(5.0)
+
+$ARMS = @('fx_static', 'cs_servo', 'fx_servo', 'pp_servo')
+
+if (-not (Test-Path $LOGS)) { New-Item -ItemType Directory -Force -Path $LOGS | Out-Null }
+Set-Location $ROOT
+$status = Join-Path $LOGS 'STATUS.txt'
+"battery ctrl_aug03 started $(Get-Date -Format s)  deadline $($DEADLINE.ToString('s'))" |
+    Out-File -FilePath $status -Encoding utf8
+
+foreach ($arm in $ARMS) {
+    if ((Get-Date) -ge $DEADLINE) {
+        "SKIP  $arm  (past deadline) $(Get-Date -Format s)" | Out-File -Append -FilePath $status -Encoding utf8
+        continue
+    }
+    $cfg = "configs\ctrl_aug03\$arm.yaml"
+    $out = Join-Path $LOGS "$arm.log"
+    $err = Join-Path $LOGS "$arm.err.log"
+    "START $arm $(Get-Date -Format s)" | Out-File -Append -FilePath $status -Encoding utf8
+    $t0 = Get-Date
+
+    $p = Start-Process -FilePath $PY -ArgumentList @('train.py', '--config', $cfg) `
+                       -WorkingDirectory $ROOT -PassThru -NoNewWindow `
+                       -RedirectStandardOutput $out -RedirectStandardError $err
+    $done = $p.WaitForExit($PER_ARM_TIMEOUT * 1000)
+    if (-not $done) {
+        "TIMEOUT $arm after $PER_ARM_TIMEOUT s -- killing" | Out-File -Append -FilePath $status -Encoding utf8
+        try { Stop-Process -Id $p.Id -Force -ErrorAction Stop } catch {}
+        Start-Sleep -Seconds 10
+    }
+    $mins = [math]::Round(((Get-Date) - $t0).TotalMinutes, 1)
+    $code = if ($done) { $p.ExitCode } else { 'killed' }
+    "END   $arm $(Get-Date -Format s)  exit=$code  minutes=$mins" |
+        Out-File -Append -FilePath $status -Encoding utf8
+    # let the allocator release before the next arm loads a 309MB buffer sidecar
+    Start-Sleep -Seconds 20
+}
+
+"battery ctrl_aug03 finished $(Get-Date -Format s)" | Out-File -Append -FilePath $status -Encoding utf8

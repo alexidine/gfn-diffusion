@@ -685,6 +685,12 @@ def boltzmann_fig(log_r):
     energy_cutoff = np.quantile(energies_np, quantile_cutoff)
     low_energy_mask = bin_centers <= energy_cutoff
     fit_mask = nonzero & low_energy_mask
+    if fit_mask.sum() < 2:
+        # One extreme outlier stretches the 50 bins wide enough that the whole
+        # bulk falls in a single bin whose CENTRE sits above the 0.99 quantile,
+        # so the trim empties the fit set and log_y.min() has nothing to reduce.
+        # Fall back to every populated bin -- a worse fit, but a live figure.
+        fit_mask = nonzero
 
     x_fit = bin_centers[fit_mask]
     log_y = np.log(hist_y[fit_mask])

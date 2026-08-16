@@ -1,0 +1,6 @@
+idx	arm	pair	steps	asks
+0	smoke	S	150	does mk_dev as shipped survive 150 steps? Checks the servo tick, the prioritised draw, the buffer servo and the new frac bounds together.
+1	a_fixed	A	5400	local_aug08 a_frz re-run under v7. bwd/tb_err final window MUST come back near 15.14 -- if it does not, the v7 rewrite changed training and not just the LR path, and every other arm here is void. Also gives the alpha* trace at a known-good fixed LR, which is what the servo arms are read against.
+2	a_climb	A	5400	servo from 12.5x BELOW the reference LR. Does it reach ~1.25e-4, and how long does the climb take? Parking at the reference is the strong result; sailing past it is F5 (the growth half is wrong, ship clip [lo, 1.0]); never arriving says clip 1.25 / period 200 is too slow to pay for itself in a run.
+3	b_climbB	B	5400	seed replicate of a_climb. The CONVERGED LR is the quantity that has to be stable -- per-probe alpha* spread is known to be wide and that is fine if the median is stable. Two different landing points would mean the loop is integrating noise.
+4	b_descend	B	5400	servo from 3.2x ABOVE the reference. The DOWN direction is the half pair D supports, so this is the control on the servo machinery itself: if the descent does not work either, the fault is the implementation and not the setpoint.

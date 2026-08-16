@@ -1,0 +1,36 @@
+[
+  {
+    "index": 0,
+    "tag": "cw00",
+    "outcome": "terminal_converged",
+    "wandb_run": "run-20260722_144517-0z8pulpt",
+    "final_step": 3960,
+    "phase": 5,
+    "rel_under": 1.8907729420506685,
+    "terminal_entry": 2980,
+    "terminal_steps": 980
+  },
+  {
+    "index": 1,
+    "tag": "cw01",
+    "outcome": "terminal_converged",
+    "wandb_run": "run-20260722_152626-tozpm72d",
+    "final_step": 3620,
+    "phase": 5,
+    "rel_under": 1.7904222427951912,
+    "terminal_entry": 2860,
+    "terminal_steps": 760
+  },
+  {
+    "index": 2,
+    "tag": "cw02",
+    "outcome": "terminal_converged",
+    "wandb_run": "run-20260722_170725-cgvk0qnh",
+    "final_step": 6740,
+    "phase": 5,
+    "rel_under": 1.9166873528331738,
+    "terminal_entry": 6110,
+    "terminal_steps": 630,
+    "note": "user-restarted from ckpt after metric fix"
+  }
+]

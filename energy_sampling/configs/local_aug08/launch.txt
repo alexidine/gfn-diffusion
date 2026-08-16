@@ -1,0 +1,17 @@
+# Launch ONE pair at a time. Read pair A before launching C or D.
+
+# --- pair A ---
+$env:PYTHONPATH="C:\Users\mikem\Projects\mxt_gfn\mxtaltools;C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion"; & "C:\Users\mikem\venvs\csd_mxt_gfn\Scripts\python.exe" train.py --config configs\local_aug08\a_frz.yaml
+$env:PYTHONPATH="C:\Users\mikem\Projects\mxt_gfn\mxtaltools;C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion"; & "C:\Users\mikem\venvs\csd_mxt_gfn\Scripts\python.exe" train.py --config configs\local_aug08\a_unf.yaml
+
+# --- pair B ---
+$env:PYTHONPATH="C:\Users\mikem\Projects\mxt_gfn\mxtaltools;C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion"; & "C:\Users\mikem\venvs\csd_mxt_gfn\Scripts\python.exe" train.py --config configs\local_aug08\b_frz_seedB.yaml
+$env:PYTHONPATH="C:\Users\mikem\Projects\mxt_gfn\mxtaltools;C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion"; & "C:\Users\mikem\venvs\csd_mxt_gfn\Scripts\python.exe" train.py --config configs\local_aug08\b_unf_seedB.yaml
+
+# --- pair C ---
+$env:PYTHONPATH="C:\Users\mikem\Projects\mxt_gfn\mxtaltools;C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion"; & "C:\Users\mikem\venvs\csd_mxt_gfn\Scripts\python.exe" train.py --config configs\local_aug08\c_frz_rep20.yaml
+$env:PYTHONPATH="C:\Users\mikem\Projects\mxt_gfn\mxtaltools;C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion"; & "C:\Users\mikem\venvs\csd_mxt_gfn\Scripts\python.exe" train.py --config configs\local_aug08\c_frz_rep40.yaml
+
+# --- pair D ---
+$env:PYTHONPATH="C:\Users\mikem\Projects\mxt_gfn\mxtaltools;C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion"; & "C:\Users\mikem\venvs\csd_mxt_gfn\Scripts\python.exe" train.py --config configs\local_aug08\d_frz_lrup.yaml
+$env:PYTHONPATH="C:\Users\mikem\Projects\mxt_gfn\mxtaltools;C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion"; & "C:\Users\mikem\venvs\csd_mxt_gfn\Scripts\python.exe" train.py --config configs\local_aug08\d_unf_lrup.yaml

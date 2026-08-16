@@ -1,0 +1,9 @@
+
+==============================================================
+ARM smoke   MXT_VECTORISED_ATOMICDATA=1   01:00:59
+==============================================================
+clear: 14848 MB free, util 0%
+smoke exit=0  (01:21:32)  log: configs/umaperf0812/logs/smoke.log
+  2%|1         | 1/61 [00:00<00:20,  2.92it/s]  3%|3         | 2/61 [00:00<00:14,  3.99it/s]  5%|4         | 3/61 [00:00<00:11,  5.07it/s]  7%|6         | 
+protocol: stage 'train_prior' -> 'equilibration'
+protocol: stage 'equilibration' engaged (fwd 0.050 / bwd 0.4500 / replay 0.500, train_mode fused, bwd_sampling prior)
