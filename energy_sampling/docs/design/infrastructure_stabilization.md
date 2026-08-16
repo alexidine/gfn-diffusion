@@ -79,13 +79,31 @@ which is what stops them recurring.
   at load. The old gate tested `ray_calibration.enabled`, which passed mk_dev
   while nothing asked and would have rejected a legitimate hyper-only config.
 
-**1.2 is PARTLY done and the remainder is the substantive half.** Retiring
-`mode_presets` removed the *list* of per-mode keys; it did not make those keys
-mode-safe. `dplr_rank`/`dplr_rho_max`, the three `condition_log_z.*_tb_z_source`
-keys, `half_life_visits`, `z_calibration.enabled` and `lr_flow` still carry only
-their unconditional values in the canonical config, and a conditional run still
-needs them changed. Making both coexist — with the inactive one provably inert —
-is what 1.2 has left, and it is gated on nothing.
+**1.2 — the five mode-varying key groups are now classified, and most need NO
+coexistence machinery.** Each was classified against the code and then
+adversarially checked; four of the five recommendations did not survive, two of
+them because they would have changed the canonical unconditional route.
+
+| Key group | Verdict | Action |
+|---|---|---|
+| `dplr_rank` / `dplr_rho_max` | **TUNED**, check held | **none** — already one value (6 / 0.5). The 10/0.9 pair has zero recorded support, entered in a bulk mode-switch commit, and exists nowhere in the tree today |
+| `lr_flow` | **not derivable** | derivation *refuted*: 22 live configs carry `1.0`, falsifying the 0.1/1e-4 two-branch story. Left explicit; a real bug fixed instead (below) |
+| `protocol.stages` | **STRUCTURAL** | name a protocol per problem — but see the hazard below before restructuring |
+| `z_calibration.*` | recommendation refuted | **none** — the conditional `enabled: false` has no code counterpart, and the proposed sensor change would flip the canonical route's trigger |
+| `tb_z_source` family | recommendation refuted | **none** — the proposed hard gate would abort the canonical run at its first stage |
+
+**The `protocol.stages` restructure hazard, recorded before anyone attempts it.**
+Four validators read the literal dotted path `protocol.stages` and treat absence
+as "nothing to check" — including `config_invariants.auto_lr_requires_an_adaptive_sensor`,
+which `utils` makes a *raising* load gate. Moving the stage list under a
+`protocols:` map would therefore silently DISARM that gate rather than trip it.
+Any such restructure must move the validators in the same change.
+
+**A live bug found and fixed on the way:** `lr_flow: auto` resolved to the
+literal string `'auto'`. It is deliberately absent from `_LR_KEYS` (alpha* is
+measured over policy parameters only, so the flow groups are exempt from both the
+envelope and `peak_scale`), so nothing filled it in and the string was assigned
+straight to `param_group['lr']`. Now refused at load with the reason.
 
 1.3 (comment discipline) is deliberately held until the §4 audit lands, so the
 rewrite is driven by its work list rather than duplicating it.
@@ -409,6 +427,17 @@ harnesses are the pattern — extended to whatever diversity of structures the
 change touches. Note the measured reward noise floor: UMA is not bit-reproducible
 on GPU, so `torch.equal` is the wrong bar and the tolerance must be stated
 against that floor.
+
+> **Before any local measurement is trusted: the policy rollout is DISPATCH-BOUND
+> and `compile_policy` is OFF on this dev box.** Measured 2026-08-16, eager, batch
+> 256, T=12, toy target: widths 64 / 256 / 512 (52x the parameters) cost
+> 61.1 / 62.7 / 58.7 ms/step — identical — and CUDA beats CPU by only 1.9x. Cause:
+> ~937 `nn.Module` calls per training step, so the cost is dispatch and launch
+> overhead, not arithmetic. `compile_policy: auto` resolves to Linux+CUDA only, so
+> **a local ms/step under-represents the A100 by an unknown factor, and width
+> looks free when it is not**. Re-measure with compile on before transferring any
+> number. Not yet measured: production width with compile actually on, batch
+> 1000+, or a crystal route with a live MLIP.
 
 **5.0 Re-profile the whole pathway first.** Not a formality and not gated on the
 existing 1.38x reading. Break the energy call into preprocessing, neighbour-list

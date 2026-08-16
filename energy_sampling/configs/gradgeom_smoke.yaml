@@ -107,8 +107,8 @@ oom_cooldown_steps: 200
 eval_num_samples: 48
 test_eval_num_samples: 48
 fused_grad_accum_min_samples: 0
-epochs: 31
-eval_period: 10000
+epochs: 41
+eval_period: 6
 figs_period: 100000
 eval_T: 3
 integrator:
@@ -200,6 +200,19 @@ z_calibration:
   holdout_modulus: 8
 protocol:
   stages:
+  - name: warm
+    train_mode: bwd
+    bwd_sampling_mode: prior
+    flags:
+      update_log_z: true
+      buffers_active: true
+    loss_coeffs:
+      bwd:
+        tb: 1.0
+        beta: 80
+    exit:
+    - metric: eval/wass_debiased
+      below: 1000000000.0
   - name: fused_smoke
     train_mode: fused
     bwd_sampling_mode: prior
@@ -328,4 +341,4 @@ max_step_seconds: 10
 checkpoint_read_only: true
 grad_geometry:
   enabled: true
-  every: 5
+  every: 3

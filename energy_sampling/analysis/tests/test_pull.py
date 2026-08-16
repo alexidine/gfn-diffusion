@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 from analysis import keys as K
-from analysis.pull import (EmptyPull, Run, _run_dirs, scan_cloud_history,
+from analysis.pull import (EmptyPull, Run, _run_dirs, pull, scan_cloud_history,
                            scan_local_history)
 
 
@@ -22,16 +22,26 @@ from analysis.pull import (EmptyPull, Run, _run_dirs, scan_cloud_history,
 # H1 -- an unresolved key zeroes the WHOLE pull
 # ---------------------------------------------------------------------------
 
-def test_empty_history_raises_rather_than_returning_nothing():
+def test_empty_history_raises_rather_than_returning_nothing(real_run_dir):
     """Spec acceptance #1. `scan_history` answers an unresolved key with zero
     rows and no error, which is indistinguishable from a run that did no work.
     Measured: seven keys of which two were absent returned 0 rows in 0.4 s. An
-    empty pull must raise."""
-    run = Run(run_id='x', name='x', source='local', history={})
+    empty pull must raise.
+
+    THROUGH `pull()`, on a REAL datastore. This test used to raise `EmptyPull`
+    itself inside its own `with` block and never call `pull` at all -- deleting
+    the guard from `pull.py` failed nothing, so the package's self-described
+    check number one was untested."""
     with pytest.raises(EmptyPull) as e:
-        if not run.history:
-            raise EmptyPull('no scalar rows')
-    assert 'no scalar rows' in str(e.value)
+        pull(real_run_dir, wanted=['definitely/not/a/logged/key'])
+    assert 'unresolved' in str(e.value)
+
+
+def test_the_same_pull_succeeds_when_the_key_resolves(real_run_dir):
+    """The companion. Without it the test above passes on a `pull` that raises
+    unconditionally."""
+    run = pull(real_run_dir, wanted=['fwd/tb_err_worst'])
+    assert run.history and 'fwd/tb_err_worst' in run.history
 
 
 def test_resolution_is_what_prevents_the_empty_pull():

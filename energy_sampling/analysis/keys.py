@@ -446,6 +446,13 @@ CFG_STAGE_BALANCE_METRIC = 'protocol_stages_%d_balance_metrics_%s'
 CFG_STAGE_LR_SENSOR_METRIC = 'protocol_stages_%d_lr_sensor_metrics_%d'
 CFG_STAGE_BUFFER_SERVO_NUM = 'protocol_stages_%d_buffer_servo_numerator'
 CFG_STAGE_BUFFER_SERVO_DEN = 'protocol_stages_%d_buffer_servo_denominator'
+# The servo's own bar and release, AS CONFIGURED BY THE RUN. `protocol.py`
+# defaults the servo's pair to sensor A with bar/release 1.0/1.5, and most local
+# runs declare no servo at all -- so the 0.368/0.60 pair below is the config
+# generators' choice, not every run's, and calling it "the servo's hold band"
+# without reading these is an assertion about a controller the run may not have.
+CFG_STAGE_BUFFER_SERVO_BAR = 'protocol_stages_%d_buffer_servo_bar'
+CFG_STAGE_BUFFER_SERVO_RELEASE = 'protocol_stages_%d_buffer_servo_release'
 CFG_STAGE_DEACTIVATE = 'deactivate_threshold'          # stage-scoped tail
 CFG_ANCHOR_GATE_CEILING_METRIC = 'buffers_anchor_buffer_health_gate_ceiling_metric'
 CFG_ANCHOR_GATE_FLOOR_METRIC = 'buffers_anchor_buffer_health_gate_floor_metric'
@@ -598,8 +605,18 @@ MECHANISMS = (
               note='the global block. Enabled with no stage opting in leaves it '
                    'inert (parameters only) -- measured on 14 of 21 runs that '
                    'declare it'),
+    # TWO ENTRIES, ONE MECHANISM, because the declaring key changed and the two
+    # eras are DISJOINT in the corpus: 53 runs carry `adaptive_lr_enabled`, 22
+    # carry `adaptive_lr_seed_lr`, none carry both. Registering only the newer
+    # key left R2 asserting nothing about the LR controller on the majority of
+    # runs -- and saying so in language ('the config asserts nothing') that reads
+    # as 'not configured'. An absent key makes no claim, so the era a run is not
+    # from simply reports OFF.
     Mechanism('adaptive_lr', 'global', 'adaptive_lr_seed_lr', Declare.POSITIVE,
               ('lr_ctrl/scale',), Rule.MOVES),
+    Mechanism('adaptive_lr.enabled', 'global', 'adaptive_lr_enabled',
+              Declare.TRUTHY, ('lr_ctrl/scale',), Rule.MOVES,
+              note='the earlier declaring key for the same controller'),
 
     # --- Z calibration. Measured inert on 11 of 69 runs that enable it.
     Mechanism('z_calibration', 'global', 'z_calibration_enabled', Declare.TRUTHY,
@@ -615,6 +632,19 @@ MECHANISMS = (
     Mechanism('replay_prioritise', 'global',
               'buffers_replay_buffer_prioritise_enabled', Declare.TRUTHY,
               ('replay/is_elig_frac',), Rule.NONZERO),
+
+    # --- the two-point LR probe. REGISTERED PRECISELY BECAUSE IT IS RETIRED:
+    # `step_probe.py` is gone from the tree, while the config generators still
+    # emit the block, so any run launched now declares a sensor that cannot
+    # log. That is R2's "a knob retired upstream" as a live instance rather
+    # than a hypothetical, and this entry is what turns it into a finding
+    # instead of a silence. The pair is verified on runs from when the module
+    # existed: 33 of 36 declaring runs carry the trace, 3 declare and log
+    # nothing.
+    Mechanism('step_probe', 'global', 'step_probe_enabled', Declare.TRUTHY,
+              ('lrprobe/alpha_n', 'lrprobe/alpha_star'), Rule.NONZERO,
+              note='step_probe.py is deleted from the tree; a run declaring '
+                   'this today cannot produce the trace'),
 )
 
 # Generated mechanisms. These are families, not fixed entries: the set depends on
@@ -643,16 +673,49 @@ def metric_tag(metric: str) -> str:
 # ---------------------------------------------------------------------------
 # R11 -- replay overfitting
 # ---------------------------------------------------------------------------
-# Replay is drawn from higher-residual trajectories by construction, so its error
-# sits ABOVE the forward error. Below 1x means rows are being corrected faster
-# than they are replaced. The ratio is reported; the bands are the doc's, and the
-# check states which band the number is in, not what it means.
+# TWO SENSORS, AND ONLY ONE OF THEM HAS A BAR WORTH FLAGGING ON.
+#
+# SENSOR A -- `replay/scatter_err / fwd/scatter_err`. The original, and what the
+# build spec named. Replay draws are a |resid|-prioritised resample of stored
+# forward rollouts, so a replay batch is by construction the hard tail of the
+# forward distribution and its spread should exceed fresh forward's.
+#
+# It is REPORTED AND NOT FLAGGED, for a reason `module_metrics.md` states
+# outright: a ratio below 1 is equally the signature of memorisation and of a
+# coverage gap, "the statistic does not distinguish them, and reading it as
+# either one alone is unwarranted". `module_modulators.md` adds that its
+# "stated justification is stale and its thresholds are uncalibrated".
+#
+# Measured over the local corpus, that is not a theoretical worry: 45 of 60
+# TB-route runs sit below 1, and 58 of 60 below the '~2 healthy' figure. A
+# finding state that fires on three quarters of a corpus is not a finding, and a
+# check that cries wolf gets switched off -- so the number is surfaced with its
+# ambiguity named, and the reader decides.
 R11_NUMERATOR = 'replay/scatter_err'
 R11_DENOMINATOR = 'fwd/scatter_err'
-R11_HEALTHY_RATIO = 2.0
-R11_OVERFIT_BELOW = 1.0
-# TB route only. On the VarGrad route the check reports NA_ROUTE and stops.
-R11_ROUTES = (Route.TB_UNCONDITIONAL, Route.MLE_PRIOR)
+# Kept as a stated REFERENCE printed beside the number, never as a bar.
+R11_SCATTER_REFERENCE = 2.0
+R11_SCATTER_BELOW = 1.0
+
+# SENSOR B -- `replay/ema_loss_mean / replay/birth_loss_mean`, each resident
+# row's current residual against the one it was admitted with. The preferred
+# memorisation sensor, and the one this check FLAGS on, because its bar is
+# DERIVED rather than calibrated: 0.368 is lambda*tau = 1, i.e. rows are being
+# corrected exactly as fast as they are replaced. Below it, the buffer is being
+# fitted faster than it turns over, which is memorisation and not a coverage gap.
+#
+# It behaves like a bar should: 0 of 44 runs below the derived bar, 4 below the
+# release threshold. That is the difference a derived bar makes.
+R11_MEMORISATION_NUMERATOR = 'replay/ema_loss_mean'
+R11_MEMORISATION_DENOMINATOR = 'replay/birth_loss_mean'
+R11_MEMORISATION_BAR = 0.368        # lambda*tau = 1, derived
+R11_MEMORISATION_RELEASE = 0.60     # lambda*tau ~ 0.5
+# TB ROUTE ONLY, per the spec. Everywhere else the check reports NA_ROUTE and
+# stops. `MLE_PRIOR` was in this tuple and contradicted both the spec line and
+# the comment above it -- the prior route trains no replay TB branch, so a ratio
+# computed there is a ratio between a quantity the optimiser is minimising and
+# one nothing is touching.
+R11_ROUTES = (Route.TB_UNCONDITIONAL,)
 
 
 # ---------------------------------------------------------------------------

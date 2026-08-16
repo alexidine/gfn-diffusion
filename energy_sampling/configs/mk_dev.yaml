@@ -17,47 +17,49 @@ anomaly_detection: false  # dramatic slowdown when True
 # Checkpoints
 ################################################################
 continue_from_checkpoint: false  # inert while checkpoint_name is set (train.py init_gfn takes that branch first); true resolves to this run identity's own _running.pt
-mlip_path: null #'D:\crystal_datasets\esen_s.pt'
-checkpoints_dir: 'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints'
-# T=10 train_prior exit, step 6680, post-periodic-fix. A copy of this run identity's own
+mlip_path: null #'D:\crystal_datasets\esen_s.pt'  # todo add short comment
+checkpoints_dir: 'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints'  # todo add short comment
+# T=10 train_prior exit, step 6680, post-periodic-fix. A copy of this run identity's own  # todo shorten / kill
 # _phase1_exit.pt under a prefix no run writes, so train_prior's on_exit snapshot can't
 # overwrite the warm-start source. Its _phase1_exit_buffers.pt sidecar is copied alongside
-checkpoint_name: 'dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-573c92_phase1_exit.pt'
-prior_model_name: null  # a SEPARATE frozen GFN for prior-buffer sampling only; rebuilt from its own stored gfn_config, so any architecture. To also warm-start the policy, point checkpoint_name at the same file with load_weights_only: true
-load_weights_only: false
-prior_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt
-molecules_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt
-test_molecules_path: null
-archive_period: 5000  # freeze a step-tagged copy of 'running' every N steps (0/null = off). Hardlinked off bytes already on disk: no write I/O, ~910MB of disk per archive
-archive_buffers: true
-override_learning_rates: false  # on resume, overwrite the numeric LR restored from the checkpoint's optimizers with this config's lr_* values. Warmup state and Adam moments are left as-is
+checkpoint_name: 'dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-573c92_phase1_exit.pt'  # todo add short comment
+prior_model_name: null  # a SEPARATE frozen GFN for prior-buffer sampling only; rebuilt from its own stored gfn_config, so any architecture. To also warm-start the policy, point checkpoint_name at the same file with load_weights_only: true # todo shorten
+load_weights_only: false   # todo add short comment
+prior_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt  # todo add short comment
+molecules_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt  # todo add short comment
+test_molecules_path: null  # todo add short comment
+archive_period: 5000  # freeze a step-tagged copy of 'running' every N steps (0/null = off). Hardlinked off bytes already on disk: no write I/O, ~910MB of disk per archive  # todo shorten
+archive_buffers: true   # todo add short comment
+override_learning_rates: false  # on resume, overwrite the numeric LR restored from the checkpoint's optimizers with this config's lr_* values. Warmup state and Adam moments are left as-is # todo shorten
 
-#Optimizers
+#Optimizers  # todo whis whole optimizer block should be its own nested section, I think.
 ################################################################
-# `auto` on an lr_* key = SERVO-MANAGED: resolved at load to adaptive_lr.seed_lr
+# `auto` on an lr_* key = SERVO-MANAGED: resolved at load to adaptive_lr.seed_lr  # todo make this concice and readable
 # below, and then owned by the alpha* loop, which probes the usable peak per
 # stage. An explicit float is a FIXED peak the servo never touches, so a partial
 # config (lr_fused: auto, lr_back: 3e-4) is legal.
 # The old auto rule -- anchor x 25/T -- is deleted: it promoted one battery's
 # number to a law, and every run is a transfer (decisions.md D3 revisited).
-lr_policy: auto
+lr_policy: auto  # todo update the optimizers section with the modern logic
 lr_back: auto
 lr_replay: auto
 lr_fused: auto
 lr_flow: 0.1                 # PINNED: exempt from envelope and servo alike, since alpha* is measured over policy params only. Unconditional flow_model is a LearnableScalar (convex 1-D, O(lr) jitter at this LR); conditional nets use 1.0e-4
-min_lr: 1.0e-6
+min_lr: 1.0e-6  # todo add short comment
 lr_warmup_ratio: 10          # the ramp starts at peak / this and reaches peak over adaptive_lr.warmup_steps, floored at min_lr. A deeper ratio spends more of warmup far below the operating rate; every sensor holds through warmup anyway, so the ramp is dead time the run pays at each stage transition
 adaptive_lr:
+  control_flow_lr: false     # true = the flow/Z groups also take envelope and peak_scale
+
   # ---- 1. WARMUP ENVELOPE ------------------------------------------------
-  # Fixed schedule, no sensor: exponential 1/lr_warmup_ratio -> 1.0 over these
+  # Fixed schedule, no sensor: exponential 1/lr_warmup_ratio -> 1.0 over these  # todo shorten comment
   # steps, then hold at 1.0. Restarted at every stage transition, because the
   # optimizers were just rebuilt onto a surface with different curvature.
   warmup_steps: 1000
   seed_lr: 1.25e-4           # what an `auto` lr_* key resolves to; the rate a run starts from
-  bounds: [ 0.01, 2000.0 ]   # absolute range of peak_scale
+  bounds: [ 0.01, 2000.0 ]   # absolute range of peak_scale  # todo explain better what this is - BRIEFLY
 
   # ---- 2. CALIBRATION -> LR ----------------------------------------------
-  # Applied once per ray_calibration.period from the bracket on alpha*:  # todo shorten comment
+  # Applied once per ray_calibration.period from the bracket on alpha*:  # todo shorten comment like by a lot. Actually I would say this is now semi-obviated, as we have multiple auto options. Give concice, mechanical explanations for each key
   #     peak_scale <- peak_scale * (alpha_hat / alpha_target) ^ eta
   # alpha* = 1 is the ONE-STEP optimum along a frozen ray, and it sits ABOVE the
   # rate a run survives -- a ray probe at fixed theta cannot see the
@@ -68,9 +70,9 @@ adaptive_lr:
   # a one-step measurement that cannot see multi-step effects, while lowering is
   # the safe direction (undertraining is recovered, damage is not).
   calibration:
-    alpha_target: 4.0
-    eta_up: 0.25
-    eta_down: 0.5
+    alpha_target: 4.0  # todo add short comment - i.e., higher is less (I think) aggressive. Less than 1 is probably unstable
+    eta_up: 0.25  # todo add short comment
+    eta_down: 0.5  # todo add short comment
 
   # ---- 3. DIVERGENCE (the only between-calibration guard) -----------------
   # Non-finite loss/grad, or either past these bars -> reload the checkpoint AND
@@ -81,22 +83,21 @@ adaptive_lr:
   divergence_loss_abs: 1.0e+9
   divergence_grad_abs: 1.0e+9
   divergence_cut: 0.5        # peak_scale multiplier per divergence; compounds
-  control_flow_lr: false     # true = the flow/Z groups also take envelope and peak_scale
 
-ray_calibration:             # the sensor -- see ray_calibration.py for the identity it rests on
-  enabled: true
+ray_calibration:             # the sensor -- see ray_calibration.py for the identity it rests on  # todo this is not well stated. Should be combined partially with the calibration: block above. Possibly moved up wholesale. Similarly our new 'hyper' controller params
+  enabled: true  # todo should only fire on a phase which calls it. Not always on or off
   period: 500                # train steps between calibrations
-  n_sub: 8                   # paired sub-batches: the replicates every CI is built from
+  n_sub: 8                   # paired sub-batches: the replicates every CI is built from  # todo a comment on why one might make it higher or lower
   # MUST be closed under doubling -- testing "alpha* > a" needs the loss at 2a.
   # Log-spaced, so the response is proportional to log-distance from target and
   # saturates at the grid edge rather than extrapolating a bound.
-  alphas: [ 0, 1, 2, 4, 8, 16, 32, 64 ]
+  alphas: [ 0, 1, 2, 4, 8, 16, 32, 64 ]  # todo a comment on the range
 weight_decay: 1.0e-4
 use_weight_decay: false
 compile_policy: auto           # torch.compile the dense policy trunk with inductor kernel fusion. 'auto' = Linux+CUDA only (no inductor on native Windows; dev boxes stay eager); true/false force it. Compile errors degrade to eager with a warning. Recompiles on every new batch size
 traj_checkpoint: false         # gradient-checkpoint each rollout step: trajectory activation memory ~O(1) in T instead of O(T), at ~1 extra policy forward per step. Values/gradients identical to false (verified bitwise incl. RNG stream)
-gradient_norm_clip: auto        # policy grad-norm clip. auto -> resolve_derived_config = 250 * grad_median(T)/6.6e3 * sqrt(W/512). Explicit number = override
-grad_clip_guard:               # adaptive clip bar, per step_type, tracking a quantile of that branch's pre-clip grad norms
+gradient_norm_clip: auto        # policy grad-norm clip. auto -> resolve_derived_config = 250 * grad_median(T)/6.6e3 * sqrt(W/512). Explicit number = override  # todo update - I believe we changed the whole function here
+grad_clip_guard:               # adaptive clip bar, per step_type, tracking a quantile of that branch's pre-clip grad norms  # todo update - ditto above comment. If not true, raise issue.
   enabled: true                # false -> the bar is gradient_norm_clip, unchanged
   p: 0.99                      # target quantile; the bar binds on 1-p of steps
   eta: 0.01                    # log-space step of the bar per observation
@@ -155,18 +156,24 @@ model:
   pb_exact_reversal: true      # P_B on angular dims: true = exact reversal of the wrapped reference bridge (mixture over arrival lifts); false = its single-image term. See docs/periodic_scoring_fix.html
 
 # training params
-################################################################
+################################################################  # todo revise this section on batch sizer rewrite
 buffer_device: cuda           # where the churned/static sample stores live (replay + prior + anchor buffers, mol/prior datasets). 'cuda' turns per-step buffer draws/admits/purges into async device gathers instead of serial CPU work + host round trips; footprint ~1KB/graph. 'cpu' = legacy
 batch_size: 1000              # number of samples per training batch -- single shared batch size for all rollout work (train fwd/bwd/replay/fused AND eval sampling)
 grow_batch_size: false        # whether to dynamically grow the batch size to fill the RAM
 max_batch_size: 1000
+eval_num_samples: 10000       # minimum number of samples for evaluation
+test_eval_num_samples: 2000   # held-out conditional eval batch; inert while test_molecules_path is null
+fused_grad_accum_min_samples: 1000  # fused steps only: effective-gradient floor. Batches BELOW this accumulate micro-steps until this many samples contribute; batches AT/ABOVE it take a plain unscaled step. 0 disables
+epochs: 100000             # number of training epochs
+eval_period: 250              # how often to do evaluation & reporting
+figs_period: 500             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 # jump-mode batch growth: multiply by batch_growth_factor once every batch_growth_interval steps
 # so the run visits only ~log_f(max/base) distinct batch sizes (torch.compile treats each
 # distinct size as a recompile). OOM cuts divide by the same factor, then cool down.
 batch_growth_factor: 1.65
 batch_growth_interval: 50       # steps between jumps before the first OOM. WITH compile_policy active use ~250-500 (each new size is a ~30-60s recompile stall); 50 is fine locally where compile is off
 batch_growth_slow_interval: 300 # jump spacing after any OOM (congestion avoidance)
-# --- automatic batch-size throughput optimization (train.py increment_batch_size) ---
+# --- automatic batch-size throughput optimization (train.py increment_batch_size) ---  # todo this is the section that will be redone entirely
 # The growth walk scores every jump by the SAMPLES/SEC it buys, not by how much it slowed
 # the step down: a jump that fails to clear batch_growth_min_throughput_gain reverts one
 # rung and PINS the batch for the current protocol stage. The pin re-arms at stage
@@ -184,12 +191,6 @@ batch_knee_recheck_steps: 2000  # re-estimate a pinned knee every N steps: drop 
 oom_batch_shrink_factor: 0.5
 oom_cooldown_steps: 200  # steps to hold batch_size flat after an OOM before resuming growth
 batch_oom_ceiling_retest_steps: 1000  # steps an OOM ceiling stands with no further OOM before it is cleared and the walk re-probes upward. Every OOM restarts this clock. A failed re-probe costs a shrink_factor cut, so this is not free. 0 = the ceiling never expires
-eval_num_samples: 10000       # minimum number of samples for evaluation
-test_eval_num_samples: 2000   # held-out conditional eval batch; inert while test_molecules_path is null
-fused_grad_accum_min_samples: 1000  # fused steps only: effective-gradient floor. Batches BELOW this accumulate micro-steps until this many samples contribute; batches AT/ABOVE it take a plain unscaled step. 0 disables
-epochs: 100000             # number of training epochs
-eval_period: 250              # how often to do evaluation & reporting
-figs_period: 500             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
 
 # SDE integration
 ################################################################
@@ -205,7 +206,7 @@ integrator:
 # loss_coeffs overrides -- a pure function of (defaults, stage), rebuilt every
 # set_loss_coeffs() call. Keep these blocks structural; put anything a stage
 # turns on in that stage's own override dict.
-fwd_loss_coeffs:
+fwd_loss_coeffs:  # todo in a rare exception, I will allow a big block comment here to define all the keys in a shared way. They should contain contextual information when fwd/bwd/replay implementations are different in important ways, e.g., fwd/repeats is more similar to bwd/condition_block_m than bwd/repeats
   tb: 0.0
   z_level: 0.0  # Z-ONLY condition-grouped regression of log_Z(c) onto the LIVE per-condition mean log w, log w DETACHED (Z gradient without on-policy policy gradient). 0 = off
   freeze_policy: 0.0  # 1 => train Z only (detach policy + conditioner from the loss)
@@ -277,14 +278,14 @@ condition_log_z:
   fwd_tb_z_source: learned  # 'learned' or 'persistent' (the conditional persistent-Z regime)
   bwd_tb_z_source: learned
   replay_tb_z_source: learned
-  weighted_condition_sampling: true  # fit-error-weighted forward mol draws; applies only in stages declaring the flag
+  weighted_condition_sampling: true  # fit-error-weighted forward mol draws; applies only in stages declaring the flag  # todo flag explicitly what the weight is computed against
   weighted_condition_sampling_clip_quantile: 0.99  # fit error clipped at this quantile and NORMALIZED by it -> scale-free priority in [0,1]
   weighted_condition_sampling_temperature: 0.3  # softmax temperature over the normalized priority
   weighted_condition_sampling_uniform_beta: 0.5  # fraction of each draw taken uniformly regardless of weight
 
 # MLE slope gate (train.py update_mle_gate, runs on stages flagged mle_gate;
 # publishes gates/mle_flat for the exit trigger). Regresses the RAW per-step
-# bwd/mle batch loss sampled every 10 steps.
+# bwd/mle batch loss sampled every 10 steps. # todo these probably belong in the phase 1 exit definition, no?
 mle_slope_t: 2.0  # confidence multiplier on the descent rate's standard error. HIGHER = more conservative = exits later. An EQUIVALENCE test: noise argues AGAINST exiting
 mle_min_rate: 0.05  # the negligible descent rate, nats per 100 train steps
 mle_slope_window: 300  # train steps of raw-loss gate samples the slope is regressed over
@@ -317,7 +318,7 @@ z_calibration:
 # protocol.py's module docstring, which is the authority on what a stage may
 # declare. Two stages: train_prior (MLE) -> equilibration.
 # ============================================================================
-protocol:
+protocol:  # todo I will leave edits here for after the synthesis
   stages:
     # -- MLE warm-start: build a broad, self-consistent policy on the dataset
     #    prior (unconditional by design), then freeze it as THE prior model
@@ -444,14 +445,15 @@ controller:
 # path, or benefit from conflict-aware geometry like PCGrad) -- without it any
 # of those three stories is speculation. Off by omission; every <= 0 also
 # disables it. Cost is one extra autograd.grad() per active branch, only on
-# armed steps (fused_step_count % every == 0).
+# armed steps (fused_step_count % every == 0).  # todo this is just a one-time diagnostic. It does not merit a paragraph. We can keep it for later, in which case the comment / definition should be terse
 grad_geometry:
   enabled: true
   every: 50
 
+# todo not really a problem but this is a very important key just kindof buried randomly here. Maybe closer to the phase info?
 conditional_worst_quantile: 0.25  # fraction of conditions allowed to sit beyond the bar for worst-case metrics; drives tb_err_worst / z_grad_worst / delta_worst (all upper-tail). Degrades to pooled on unconditional runs
 
-buffers:
+buffers:  # todo feel mostly good about the rest of it
   # SLOW store: a representation of a DISTRIBUTION, churned on a rate the
   # config sets rather than on any per-row property. Residence works out as
   # mean_lifetime * max_size / churn_batch_ref = 25,000 train steps here, i.e.

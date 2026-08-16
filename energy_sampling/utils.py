@@ -509,6 +509,26 @@ def resolve_derived_config(args):
         # driven entirely by `hyper`, which does not use ray_calibration at all.
         _require_adaptive_sensor(args, managed, seed_lr)
 
+    # `lr_flow` IS NOT SERVO-MANAGED and deliberately not in _LR_KEYS: alpha* is
+    # measured over policy parameters only, and _apply_lrs exempts the flow
+    # groups from both the envelope and peak_scale. So `auto` has no resolver
+    # here and no servo to hand it to -- it stays the STRING 'auto' and is
+    # assigned straight to param_group['lr'] (controller.py) and to the optimizer
+    # constructor (train.py), failing somewhere downstream that says nothing
+    # about the config. Reject it here, where the reason is visible.
+    flow = getattr(args, 'lr_flow', None)
+    if not isinstance(flow, (int, float)) or isinstance(flow, bool):
+        raise ValueError(
+            f"lr_flow must be an explicit number, got {flow!r}. It is NOT "
+            f"servo-managed -- alpha* is measured over policy parameters only, so "
+            f"the flow (Z head) groups are exempt from both the warmup envelope "
+            f"and peak_scale, and there is no rule that would resolve `auto` for "
+            f"it. Write the number: the value depends on WHAT THE FLOW HEAD IS, "
+            f"which is a LearnableScalar when `model.full_flow` is false and the "
+            f"run is unconditional, and a network otherwise -- and a rate suited "
+            f"to one is wrong for the other by orders of magnitude in both "
+            f"directions.")
+
     # grad clip: anchor x grad_median(T)/grad_median(T_REF) x sqrt(W/W_REF).
     # This one IS still derived -- it scales with the gradient's own measured
     # magnitude, which is a property of the rollout length rather than of a

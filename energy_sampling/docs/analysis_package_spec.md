@@ -6,14 +6,14 @@ executed; the resulting package documents itself and its State belongs in a
 
 ---
 
-> **STATUS: Tier 0 is BUILT** (`analysis/`, 59 tests, State in
-> `docs/module_analysis.md`). Tiers 1–3 remain, and this file stays until they
-> are done. Open questions 1–3 are answered: the VarGrad topline carries all four
+> **STATUS: Tiers 0, 1 and 2 are BUILT** (`analysis/`, 351 tests, State in
+> `docs/module_analysis.md`). Tier 3 remains, and this file stays until it
+> is done. Open questions 1–3 are answered: the VarGrad topline carries all four
 > candidate families; `GFN Energy` is the priority with `GFN Conformers` riding
 > along where easy; the cache lives in the system temp dir.
 >
 > **Three of this spec's assumptions were wrong**, each failing silently — they
-> are corrected in `module_analysis.md` and worth reading before Tier 1:
+> are corrected in `module_analysis.md`:
 >
 > 1. Route detection cannot read `protocol` from the config. wandb stores it as a
 >    repr **string**; the usable form is the flattened `protocol_stages_N_*` keys.
@@ -24,7 +24,25 @@ executed; the resulting package documents itself and its State belongs in a
 >    `train_prior` and classifies the MLE warm-start as the TB route.
 >
 > The instruction to verify by inspection rather than trust the prose is what
-> caught all three.
+> caught all three. **Four more were caught the same way in Tier 1**, and the
+> pattern held — each was a silent wrong answer, not an error:
+>
+> 4. `loss_coeffs/*` — the coefficients the trainer is actually holding, and the
+>    strongest liveness evidence in a run — is a **change-only** channel. Its
+>    history series is one or two points and the datastore reader drops anything
+>    shorter than three, so it must be read from the summary.
+> 5. `detect_route` defaults an unknown stage to the **last declared** one.
+>    Reading a run that way asserts a route it never reached, and since NA_ROUTE
+>    marking is driven entirely by the route, it switches NA_ROUTE **off**.
+> 6. `protocol/thr_*` is published by the lexicographic balance controller, not
+>    by the stage exit block. R13 derived from it alone is dark on nearly every
+>    run while still returning a full sensor table.
+> 7. `pull` raises only on empty **history**, so a run arrives fully parsed with
+>    `config == {}` — and every cross-arm comparison then reads `<missing>` on
+>    one side and flags confidently about an arm nothing is known about.
+>
+> Tier 1 was also adversarially verified against the ~110-run local corpus rather
+> than against its fixtures alone, which is what surfaced 4, 6 and 7.
 
 ## Why this exists
 
@@ -174,7 +192,7 @@ then the feature report grouped in `reading_runs.md` §1 read order.
 
 ---
 
-## Tier 1 — checks
+## Tier 1 — checks — **DONE**
 
 `checks.py`. Each returns structured findings; each **fails loudly**, never
 silently passes.
@@ -194,7 +212,7 @@ silently passes.
 - **`R11`.** `replay/scatter_err ÷ fwd/scatter_err` — healthy ≈ 2, flag < 1 as
   replay overfitting. TB route only; N/A on VarGrad.
 
-## Tier 2 — compare
+## Tier 2 — compare — **DONE**
 
 `compare.py`. Config diff across arms → the sweep table (which knobs actually
 differ, decoded to arm names). Aligned feature table. Flag arms that are not

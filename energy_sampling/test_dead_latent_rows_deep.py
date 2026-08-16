@@ -5,7 +5,9 @@ test_dead_latent_rows.py proves the mechanics: index sets, constancy, densities,
 gradients. This file attacks the STATISTICS and the combinatorial surface -- the
 things that would still be wrong if every mechanical invariant held.
 
-  1. LOG Z RECOVERY. Trains real TB on a target that depends only on the live dims.
+  1. LOG Z RECOVERY (`check_log_z_recovery`, NOT collected by pytest -- it trains
+     three models; run this file as a script). Trains real TB on a target that
+     depends only on the live dims.
      A (dim d, nothing dead) vs B (dim d+2, the extras dead) must learn the SAME
      log Z; C (dim d+2, nothing dead) must not. A == B is the change's promise. The
      closed-form constant is reported but only weakly asserted -- see the docstring
@@ -194,10 +196,25 @@ def test_log_z_unbiased(live=2, sigma=1.0, seeds=(1, 2, 3)):
           f"{worst_err:.4f} nats, A vs B agree to {mean_gap:.4f}, no training involved")
 
 
-def test_log_z_recovery(steps=2500, live=2, sigma=1.0):
+def check_log_z_recovery(steps=2500, live=2, sigma=1.0):
     """
-    THE statistical test: does holding dead rows make the sampler behave as the REDUCED
-    problem, with the reduced normalizing constant?
+    NOT A PYTEST TEST -- deliberately named `check_` so pytest cannot collect it.
+    Run it from this file's __main__, or call it directly.
+
+    It trains THREE TB models from scratch. At the default 2500 steps that is 7500
+    training steps and about FOURTEEN MINUTES, which was 73% of the entire repo
+    suite's wall clock while pytest was collecting it. Note the budget: __main__
+    has always invoked this at `steps=600`, so the 2500-step run was never a
+    considered choice -- pytest collected the function by name and supplied the
+    default, and nobody chose the cost.
+
+    Substrate is not the fix and was measured: CPU 112 ms/step vs CUDA 58 ms/step,
+    and 52x more parameters (52k -> 2.7M) costs the SAME time. The rollout is
+    dispatch-bound -- ~937 nn.Module calls per training step -- so there is no
+    device that makes this cheap, only fewer calls.
+
+    THE STATISTICAL CHECK: does holding dead rows make the sampler behave as the
+    REDUCED problem, with the reduced normalizing constant?
 
     Three models, one target that depends only on the first `live` coordinates:
         A  dim live      nothing dead        the genuine reduced problem
@@ -707,7 +724,7 @@ if __name__ == '__main__':
     test_log_z_unbiased()
     print()
     print("1b. LOG Z -- TRAINED (secondary, convergence-limited: see its docstring)")
-    test_log_z_recovery(steps=600)
+    check_log_z_recovery(steps=600)
     print()
     print("2. EXACTNESS OF THE REDUCTION")
     test_reduction_is_exact_not_merely_consistent()

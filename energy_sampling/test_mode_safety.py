@@ -163,6 +163,29 @@ def test_hyper_only_config_loads_with_ray_calibration_disabled(raw):
     assert _load(cfg) is not None
 
 
+def test_lr_flow_auto_is_refused(raw):
+    """`lr_flow` is NOT servo-managed -- alpha* is measured over policy params
+    only, so the flow groups are exempt from the envelope AND peak_scale, and no
+    resolver fills it in. Before this guard, `auto` stayed the STRING 'auto' and
+    was assigned straight to param_group['lr'], failing somewhere downstream that
+    said nothing about the config."""
+    cfg = copy.deepcopy(raw)
+    cfg['lr_flow'] = 'auto'
+    with pytest.raises(ValueError, match='lr_flow must be an explicit number'):
+        _load(cfg)
+
+
+def test_lr_flow_accepts_every_value_in_live_use(raw):
+    """0.1 (unconditional scalar), 1.0e-4 (network) and 1.0 all appear in live
+    configs -- 22 of them carry 1.0. The guard rejects non-numbers, not values it
+    has not seen: there is no derivation rule here, precisely because a third
+    value with 22 users falsifies the two-branch story."""
+    for v in (0.1, 1.0e-4, 1.0):
+        cfg = copy.deepcopy(raw)
+        cfg['lr_flow'] = v
+        assert _load(cfg).lr_flow == v
+
+
 # ---------------------------------------------------------------------------
 # The mutation: the method must be able to SEE a key that is not inert
 # ---------------------------------------------------------------------------

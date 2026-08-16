@@ -15,6 +15,8 @@ from __future__ import annotations
 import argparse
 import sys
 
+from . import checks as C
+from . import compare as P
 from . import features as F
 from . import keys as K
 from .pull import DEFAULT_PROJECT, CONFORMER_PROJECT, EmptyPull, list_local, pull
@@ -79,8 +81,10 @@ def _report(run, route, window):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog='analysis')
-    ap.add_argument('spec', nargs='?', default='newest',
-                    help="'newest', a local run dir, a run id, name, or tag")
+    ap.add_argument('spec', nargs='*', default=['newest'],
+                    help="'newest', a local run dir, a run id, name, or tag. "
+                         'Several make a battery, and the §4 comparability '
+                         'checks then apply across them.')
     ap.add_argument('--window', type=float, default=6000,
                     help='trailing window in steps')
     ap.add_argument('--project', default=DEFAULT_PROJECT)
@@ -88,6 +92,12 @@ def main(argv=None):
                     help=f'use {CONFORMER_PROJECT}')
     ap.add_argument('--list', action='store_true', help='list local runs and exit')
     ap.add_argument('--no-cache', action='store_true')
+    ap.add_argument('--no-checks', action='store_true',
+                    help='features only, no assertions')
+    ap.add_argument('--no-compare', action='store_true',
+                    help='skip the cross-arm sweep and feature tables')
+    ap.add_argument('-v', '--verbose', action='store_true',
+                    help='every subject a check examined, not only its findings')
     a = ap.parse_args(argv)
 
     if a.list:
@@ -96,27 +106,55 @@ def main(argv=None):
         return 0
 
     project = CONFORMER_PROJECT if a.conformers else a.project
-    try:
-        run = pull(a.spec, project=project, use_cache=not a.no_cache)
-    except EmptyPull as e:
-        print(f'EMPTY PULL: {e}', file=sys.stderr)
-        return 2
-    except LookupError as e:
-        print(f'{e}', file=sys.stderr)
-        return 2
+    specs = a.spec if isinstance(a.spec, list) else [a.spec]
+    specs = specs or ['newest']
+    runs = []
+    for spec in specs:
+        try:
+            runs.append(pull(spec, project=project, use_cache=not a.no_cache))
+        except EmptyPull as e:
+            print(f'EMPTY PULL: {e}', file=sys.stderr)
+            return 2
+        except LookupError as e:
+            print(f'{e}', file=sys.stderr)
+            return 2
 
+    # THE CHECKS COME FIRST, and §4 first among them. A comparison across arms
+    # that are not comparable is not a weaker result, it is not a result -- so
+    # the reader must meet that before any feature table, not after it.
+    if not a.no_checks:
+        print(C.format_report(C.run_all(runs, window=a.window),
+                              verbose=a.verbose))
+
+    # Tier 2. Only with something to compare -- a one-arm sweep table and a
+    # one-column feature table say nothing the per-run report below does not.
+    if len(runs) > 1 and not a.no_compare:
+        print(P.format_comparison(P.compare(runs, window=a.window),
+                                  verbose=a.verbose))
+
+    for run in runs:
+        _one(run, a)
+    return 0
+
+
+def _one(run, a):
     # Classify against the stage the run is ACTUALLY in, not the last declared
     # one: a run that died in train_prior is on the MLE route, and reading it
     # with the terminal stage's topline describes a stage it never reached.
-    stages = K.stage_names(run.config)
-    stage_idx = K.current_stage_index(run.summary, run.config)
-    route = K.detect_route(run.config, stage_idx)
-    stage = K.current_stage(run.summary, run.config)
+    # Routed through the same `context()` the checks use, so the feature report
+    # and the check blocks cannot state different routes for one run -- they did,
+    # and a reader had no way to tell which was right.
+    ctx = C.context(run)
+    route = ctx.route
 
-    print(f'{run.name}  [{run.source}]  id={run.run_id}')
+    print(f'\n{run.name}  [{run.source}]  id={run.run_id}')
     print(f'  last step {run.last_step:.0f}  |  window {a.window:.0f}  |  '
           f'{len(run.history)} scalar series')
-    print(f'  stages {stages}  current={stage or "unknown"}')
+    print(f'  stages {list(ctx.stages)}  current={ctx.stage_name or "UNKNOWN"}'
+          f'  route={route.value}')
+    if ctx.stage_index is None and ctx.stages:
+        print('  NB the stage is UNKNOWN, so the route is too. Every topline '
+              'below is the fallback set, and no NA_ROUTE rule has been applied.')
 
     _print_key_table(K.resolve(run.available_keys(), K.TOPLINE[route], route), route)
     _report(run, route, a.window)

@@ -506,7 +506,81 @@ class ConformerTorsions(BaseSet):
             out.append(('phi', prior.torsions.get(k), k, ring(ti[j])))
         return out
 
-    def sample_prior_states(self, prior, n: int, rng, report: bool = True):
+    def torsion_groups(self):
+        """phi DoF rows grouped by central bond, leader first.
+
+        A group is one bond's substituent set -- every dihedral that turns when that bond
+        turns. Their DIFFERENCES are what fix the local geometry: an H-C-H angle is a
+        difference of two of them, and it is one of the 40 graph angles the force field
+        scores but the tree does not expose as a coordinate. So they have to be drawn
+        JOINTLY. Drawn independently, even from perfect marginals, roughly a third of
+        sibling pairs land on the same rotamer mode and put two substituents in the same
+        place -- measured on Ala5 at a median sibling-difference error of 91 degrees.
+        """
+        from collections import defaultdict
+        ti = np.asarray(self.spec.torsion_index)
+        g = defaultdict(list)
+        for j in range(self.n_ph):
+            g[(int(ti[j, 1]), int(ti[j, 2]))].append(j)
+        return [sorted(rows) for rows in g.values()]
+
+    def sibling_jitter_sigma(self, groups, temperature: float):
+        """Per-group jitter width for the sibling offsets, in radians.
+
+        ``sigma = sqrt(kT / 2k)`` of the REDUNDANT angle the group's members determine --
+        i.e. the thermal width of the very quantity independent draws destroy. Taken from
+        the force field's own constant, so it is automatically tighter at a stiff centre
+        than a soft one and scales with temperature; nothing here is a tuned number.
+
+        The jitter has to be nonzero. Locking the offsets rigidly gives a prior with
+        measure-zero support in those dimensions, and support is the one property TB
+        actually needs from a prior -- it is the same reason InternalPrior fattens its
+        marginals toward uniform.
+        """
+        _, ff1 = self._batch(1)
+        ai = ff1.angle_index.detach().cpu().numpy()
+        ka = ff1.k_angle.detach().cpu().numpy()
+        ti = np.asarray(self.spec.torsion_index)
+        out = []
+        for rows in groups:
+            c = int(ti[rows[0], 2])
+            placed = {int(ti[j, 3]) for j in rows}
+            k = [ka[i] for i in range(len(ai))
+                 if int(ai[i, 1]) == c and int(ai[i, 0]) in placed and int(ai[i, 2]) in placed]
+            k_med = float(np.median(k)) if k else 50.0
+            out.append(float(np.sqrt(max(temperature, 1e-12) / (2.0 * k_med))))
+        return out
+
+    def thermal_rtheta_sigma(self, temperature: float):
+        """``sqrt(kT / 2k)`` per tree bond and tree angle, from the FF's own constants.
+
+        For a HARMONIC term the exact local Boltzmann marginal is a Gaussian of this
+        width about the term's minimum -- which the force field states outright, so there
+        is nothing to fit. InternalPrior's r/theta histograms are pooled across chemical
+        environments and are therefore much broader than any individual bond's thermal
+        spread: on Ala5 they cost ~180 kcal/mol of bond strain against a thermal ~26.
+
+        This does NOT replace the prior for phi. There the force field (ff_from_reference)
+        has no torsion term at all, so the rotamer distribution comes entirely from
+        sterics and the empirical histogram is the only thing that knows about it.
+        """
+        _, ff1 = self._batch(1)
+        bi_ff = ff1.bond_index.detach().cpu().numpy()
+        ai_ff = ff1.angle_index.detach().cpu().numpy()
+        kb, ka = ff1.k_bond.detach().cpu().numpy(), ff1.k_angle.detach().cpu().numpy()
+        bmap = {frozenset((int(a), int(b))): kb[i] for i, (a, b) in enumerate(bi_ff)}
+        amap = {(int(j), frozenset((int(i), int(k)))): ka[m]
+                for m, (i, j, k) in enumerate(ai_ff)}
+        bi, ai = np.asarray(self.spec.bond_index), np.asarray(self.spec.angle_index)
+        kt = max(float(temperature), 1e-12)
+        s_r = np.array([np.sqrt(kt / (2.0 * bmap.get(frozenset((int(r[0]), int(r[1]))), 300.0)))
+                        for r in bi])
+        s_th = np.array([np.sqrt(kt / (2.0 * amap.get((int(r[1]), frozenset((int(r[0]), int(r[2])))), 50.0)))
+                         for r in ai])
+        return s_r, s_th
+
+    def sample_prior_states(self, prior, n: int, rng, report: bool = True,
+                            joint_torsions: bool = True, thermal_rtheta: bool = True):
         """``[n, d]`` states drawn from a fitted InternalPrior. Returns ``(x, stats)``.
 
         Per-DoF marginals, which is the prior's acyclic case. Ring systems are the one
@@ -522,15 +596,54 @@ class ConformerTorsions(BaseSet):
         types = self.prior_dof_types(prior)
         dof = np.empty((n, len(types)))
         stats = {'n_uniform': {'r': 0, 'theta': 0, 'phi': 0},
-                 'n_ring_marginal': 0, 'n_dof': len(types)}
-        for row, (kind, hist, key, is_ring) in enumerate(types):
-            stats['n_ring_marginal'] += int(is_ring)
+                 'n_ring_marginal': 0, 'n_dof': len(types), 'joint_torsions': joint_torsions}
+        n_phi0 = self.n_r + self.n_th
+
+        def draw(row, kind, hist):
             if hist is None:
                 lo, hi = spans[kind]
-                dof[:, row] = rng.uniform(lo, hi, n)
                 stats['n_uniform'][kind] += 1
-            else:
-                dof[:, row] = hist.sample(n, prior.fatten, rng)
+                return rng.uniform(lo, hi, n)
+            return hist.sample(n, prior.fatten, rng)
+
+        if thermal_rtheta:
+            s_r, s_th = self.thermal_rtheta_sigma(float(self.temperature))
+            r0 = self.r0.detach().cpu().numpy(); th0 = self.th0.detach().cpu().numpy()
+            for j in range(self.n_r):
+                dof[:, j] = rng.normal(r0[j], s_r[j], n)
+            for j in range(self.n_th):
+                dof[:, self.n_r + j] = rng.normal(th0[j], s_th[j], n)
+            stats['rtheta_sigma_deg'] = (float(np.degrees(s_th.mean())), float(s_r.mean()))
+        for row, (kind, hist, key, is_ring) in enumerate(types):
+            stats['n_ring_marginal'] += int(is_ring)
+            # phi is handled below when drawing jointly; r/theta above when thermal
+            if (joint_torsions and row >= n_phi0) or (thermal_rtheta and row < n_phi0):
+                continue
+            dof[:, row] = draw(row, kind, hist)
+
+        if joint_torsions:
+            groups = self.torsion_groups()
+            sigmas = self.sibling_jitter_sigma(groups, float(self.temperature))
+            ph0 = self.ph0.detach().cpu().numpy()
+            stats['n_groups'] = len(groups)
+            stats['sigma_deg'] = (float(np.degrees(min(sigmas))),
+                                  float(np.degrees(max(sigmas)))) if sigmas else (0.0, 0.0)
+            for gi, rows in enumerate(groups):
+                lead = rows[0]
+                _, hist, _, _ = types[n_phi0 + lead]
+                lead_val = draw(n_phi0 + lead, 'phi', hist)
+                dof[:, n_phi0 + lead] = lead_val
+                # the group turns together: every member takes the LEADER'S displacement
+                # from its own reference, which is what preserves the reference offsets
+                disp = (lead_val - ph0[lead] + np.pi) % (2 * np.pi) - np.pi
+                for r in rows[1:]:
+                    dof[:, n_phi0 + r] = ph0[r] + disp + rng.normal(0.0, sigmas[gi], n)
+        else:
+            # independent marginals for phi too: the pre-fix behaviour, kept so the A/B
+            # is runnable and the gate below can require the difference
+            for row in range(n_phi0, len(types)):
+                kind, hist, _, _ = types[row]
+                dof[:, row] = draw(row, kind, hist)
 
         t = lambda a: torch.as_tensor(a, dtype=self.dtype, device=self.device)
         x = self.state_from_dof(t(dof[:, :self.n_r]),
@@ -552,6 +665,13 @@ class ConformerTorsions(BaseSet):
             print(f"InternalPrior draw: {n} states, {len(types)} DoF "
                   f"(uniform fallback r {u['r']}/{self.n_r}, theta {u['theta']}/{self.n_th}, "
                   f"phi {u['phi']}/{self.n_ph})")
+            if joint_torsions:
+                lo, hi = stats['sigma_deg']
+                print(f"  phi drawn JOINTLY: {stats['n_groups']} bond groups, one leader "
+                      f"each, siblings at the leader's displacement + N(0, sigma) with "
+                      f"sigma {lo:.1f}-{hi:.1f} deg from the FF's own k_angle")
+            else:
+                print(f"  phi drawn INDEPENDENTLY per DoF (pre-fix behaviour)")
             print(f"  clipped to box: r {stats['clip_frac']['r']:.1%}, "
                   f"theta {stats['clip_frac']['theta']:.1%}")
             if stats['n_ring_marginal']:
