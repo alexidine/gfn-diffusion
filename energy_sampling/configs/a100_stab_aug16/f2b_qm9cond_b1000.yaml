@@ -8,9 +8,9 @@ anomaly_detection: false
 continue_from_checkpoint: false
 mlip_path: null
 checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/
-checkpoint_name: null
+checkpoint_name: qm9a13_qm9a98b_elj-qm9split_prior-T6.9-b3483b_phase1_exit.pt
 prior_model_name: null
-load_weights_only: false
+load_weights_only: true
 prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/qm9split_prior.pt
 molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/qm9split_conditions.pt
 test_molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/qm9split_test_conditions.pt
@@ -181,19 +181,19 @@ replay_loss_coeffs:
   beta: 10.0
 condition_log_z:
   min_visits: 20
-  half_life_visits: 7.0
+  half_life_visits: 28.0
   trim_frac: 0.01
   max_batch_weight: 200.0
   discovery_half_life_steps: 200.0
-  fwd_tb_z_source: learned
-  bwd_tb_z_source: learned
-  replay_tb_z_source: learned
+  fwd_tb_z_source: persistent
+  bwd_tb_z_source: persistent
+  replay_tb_z_source: persistent
   weighted_condition_sampling: true
   weighted_condition_sampling_clip_quantile: 0.99
   weighted_condition_sampling_temperature: 0.3
   weighted_condition_sampling_uniform_beta: 0.5
 z_calibration:
-  enabled: true
+  enabled: false
   mode: rollout
   sensor: pooled
   sensor_quantile: 0.5

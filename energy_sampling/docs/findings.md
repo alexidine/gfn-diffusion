@@ -7,6 +7,91 @@ Newest first.
 
 ---
 
+## F-042 · The conditional route detonates on three inherited UNCONDITIONAL Z settings, not on MLE quality · `MECHANISM`
+
+*2026-08-17. `a100_stab_aug16` f2 (A100, batch 500) plus three local shakeout
+runs, against three conditional batteries that ran to completion.*
+
+**Scope:** the QM9 embedding-conditioned route, `conditional_vargrad`,
+`var_conditioning` stage. The comparison is config-level and three-for-three; the
+mechanism below is argued, not yet isolated by an ablation.
+
+**The symptom.** Every conditional run detonates ~30 steps into
+`var_conditioning` — grad norms 1–4e9 against a 1e9 bar, four rewinds, abort —
+at *the same steps* (170/190/210/220) across two GPUs and compile on/off.
+
+**"Not enough MLE" is FALSIFIED, and this is the load-bearing negative.** The
+`qm9_warm` shakeout warm-started weights-only from a **3.2k-step** MLE prior —
+23× the cold run's ~140 — and detonated at the same steps with the same grad
+norms. MLE quantity spans 140 → 3200 with no effect on the outcome.
+
+**What actually separates the survivors from the casualties.** Every conditional
+battery that RAN — `qm9_aug11`, `qm9_anchor_aug13`, `qm9anchor_aug14` — is
+identical on three keys, and every run that detonated carries the opposite value
+on all three:
+
+| key | ran (all 3) | detonated (all) |
+|---|---|---|
+| `z_calibration.enabled` | `false` | `true` |
+| `condition_log_z.{fwd,bwd,replay}_tb_z_source` | `persistent` | `learned` |
+| `condition_log_z.half_life_visits` | `28.0` | `7.0` |
+
+All three are documented in `configs/mk_dev.yaml` as **unconditional-route**
+settings — the `condition_log_z` block is annotated *"MONITORING ONLY … it
+becomes load-bearing on the conditional route"* and `z_calibration`'s parameters
+*"are set for the UNCONDITIONAL route"*. Neither statement was executable, so a
+conditional config spawned from the canonical one inherits all three silently.
+**The comments were right and unenforced, which is the whole failure.**
+
+**Mechanism, as far as the configs support it.** With `z_calibration` on, up to
+`max_steps_per_step: 100` Z-only optimizer steps per policy step are driven into
+a *conditional* flow head — a 4-layer `scalarMLP` (`models/gfn.py:242`), not the
+unconditional `LearnableScalar` — that no stage has trained (the run's own log:
+*"no mode trains the flow (Z) head … log_Z will not move for this stage"*),
+against a quadratic, deliberately unclipped `emp_z` target.
+
+**And a Z-side sidecar can abort the whole run, which it should not be able to
+do.** `check_spike` reads `last_grad_norm_pre_clip`, a **global** pre-clip norm
+whose own docstring notes it "holds only the LAST branch to step". So a blowup
+confined to a simple Z regression — a term that does not even enter the VarGrad
+policy loss, since the group centre replaces log Z — trips the 1e9 divergence
+wire, and the response cuts `peak_scale`, which by construction **does not touch
+the flow group** (`controller.py:466`, flow pinned flat at `lr_flow` while
+`control_flow_lr: false`). That is exactly the reported behaviour: *"rewinding
+restores weights but not a survivable LR."* **The guard cuts a rate that is not
+the one diverging.** Recorded as a defect in its own right; not fixed here.
+
+**A red herring worth recording so it is not re-derived.** `lr_flow: 0.1` (vs
+`1e-4` in the batteries that ran) is *also* an unconditional value on a
+conditional net — but on a VarGrad stage nothing in the policy loss reads log Z,
+so with `z_calibration` off the head barely trains and `lr_flow` is inert
+whatever its value. It is a compounding factor downstream of the real defect,
+not the defect. `benchmarks`-style reasoning applies: the surviving batteries
+differ from each other on `lr_flow` handling but agree on the three keys above.
+
+**Fixed** in `configs/a100_stab_aug16` (arms now carry the conditional trio) and
+enforced in `config_invariants.conditional_z_settings_are_conditional`, which
+reports the departure as BASELINE — it is a per-route default backed by three
+batteries, not a self-contradiction provable from one file. Verified to fire on
+every config that detonated and on none of the three that ran.
+
+**A second rule landed alongside it, from the same comparison:**
+`vargrad_needs_groups`. VarGrad needs ≥2 rows per group or `vg_loss` is
+identically zero (`condition_grouped_empirical_z`) — a **silent** under-training,
+not a crash. `fwd repeats >= 2` is required outright; the backward side needs
+**`bwd repeats >= 2` OR `prior_buffer.condition_block_m >= 2`**, and it must be
+written as that disjunction because aug14/aug11 satisfy it the first way and
+aug13 the second. A conjunction would reject two of the three, and a naive diff
+reads the two spellings as a disagreement. 0 ERRORs across 538 configs; four
+negative controls confirm it fires on each singleton case, accepts the aug13
+spelling, and abstains off the VarGrad route.
+
+**Still open:** which parameter group actually holds the 1e9 norm at steps
+160–220. `gradnorm/flow_model` vs `gradnorm/forward_policy` is already logged per
+submodel and settles it from the existing f2 run without a new job.
+
+---
+
 ## F-041 · The gradient-geometry diagnostic is fatal under `torch.compile`, and no local run can ever see it · `MECHANISM`
 
 *2026-08-16. First cluster job of `a100_stab_aug16` (arm `f3_mipcas_uma`), A100

@@ -639,6 +639,133 @@ def exit_bar_is_within_measured_range(cfg: dict) -> list[Violation]:
     return out
 
 
+def _coeff(cfg: dict, stage: dict, mode: str, key: str):
+    """A stage's effective coefficient: its own override, else the base block."""
+    override = ((stage.get('loss_coeffs') or {}).get(mode) or {})
+    if key in override:
+        return _num(override[key])
+    return _num(_get(cfg, f'{mode}_loss_coeffs.{key}'))
+
+
+def _runs_vargrad(cfg: dict, stage: dict, mode: str) -> bool:
+    return bool((_coeff(cfg, stage, mode, 'vg_lb') or 0.0) > 0
+                or (_coeff(cfg, stage, mode, 'vg_lme') or 0.0) > 0)
+
+
+def vargrad_needs_groups(cfg: dict) -> list[Violation]:
+    """VarGrad needs a GROUP of >= 2 rows to centre over, per branch that runs it.
+
+    The group centre replaces log Z, so it is estimated from the rows that share
+    a group. A SINGLETON GROUP CONTRIBUTES NO GRADIENT AT ALL -- vg_loss is
+    identically zero there (gflownet_losses.condition_grouped_empirical_z, and
+    condition_group_stats' `vg_live_frac` exists to measure exactly this). So a
+    misgrouped branch does not crash: it trains on a fraction of what it paid to
+    roll out, and the run looks busy while learning from part of the batch.
+    That is why this is a load-time rule and not something a reader spots.
+
+    THE TWO BRANCHES REACH >= 2 BY DIFFERENT MEANS, which is why the second
+    condition is a DISJUNCTION and cannot be written as `repeats >= 2`:
+
+      fwd   only `repeats` can do it. Forward tiles share a condition and roll
+            out to DISTINCT terminals, which is the cross-terminal group VarGrad
+            needs. Nothing else supplies one.
+      bwd   EITHER `repeats >= 2` (K backward rollouts from one terminal) OR
+            `prior_buffer.condition_block_m >= 2` (M distinct same-condition
+            terminals per block). Either yields a group; neither is required
+            when the other holds.
+
+    Measured across every conditional battery that RAN (2026-08-17): aug14 and
+    aug11 satisfy the bwd side via `repeats: 2.0` at `condition_block_m: 1`;
+    aug13 satisfies it via `condition_block_m: 2` at `repeats: 1.0`. A rule
+    written as a conjunction would reject two of the three, and a naive config
+    diff reads those two spellings as a disagreement when they are the same
+    constraint met two ways.
+
+    ABSTAINS on any branch not running vg_lb/vg_lme -- on a TB route `repeats`
+    means something else entirely and 1 is correct."""
+    out = []
+    cbm = _num(_get(cfg, 'buffers.prior_buffer.condition_block_m')) or 0.0
+    for st in active_stages(cfg):
+        if not isinstance(st, dict):
+            continue
+        name = st.get('name')
+        if _runs_vargrad(cfg, st, 'fwd'):
+            reps = _coeff(cfg, st, 'fwd', 'repeats')
+            if reps is not None and reps < 2:
+                out.append(Violation(
+                    ERROR, 'vargrad_needs_groups',
+                    f"stage {name!r} runs fwd VarGrad at fwd repeats={reps:g}. Forward "
+                    f"tiling is the ONLY source of a forward group -- at repeats 1 every "
+                    f"group is a singleton, vg_loss is identically zero, and the forward "
+                    f"branch trains on nothing while reporting a loss. Set fwd "
+                    f"repeats >= 2."))
+        if _runs_vargrad(cfg, st, 'bwd'):
+            reps = _coeff(cfg, st, 'bwd', 'repeats')
+            if reps is not None and reps < 2 and cbm < 2:
+                out.append(Violation(
+                    ERROR, 'vargrad_needs_groups',
+                    f"stage {name!r} runs bwd VarGrad at bwd repeats={reps:g} AND "
+                    f"buffers.prior_buffer.condition_block_m={cbm:g}. The backward group "
+                    f"needs ONE of the two >= 2 -- repeats gives K rollouts from one "
+                    f"terminal, condition_block_m gives M same-condition terminals per "
+                    f"block. With neither, every backward group is a singleton and the "
+                    f"branch contributes no VarGrad gradient."))
+    return out
+
+
+def conditional_z_settings_are_conditional(cfg: dict) -> list[Violation]:
+    """Three Z-side keys are documented as UNCONDITIONAL-route settings and must
+    be switched when the route is conditional.
+
+    `configs/mk_dev.yaml` says it in its own comments -- the condition_log_z
+    block is "MONITORING ONLY ... it becomes load-bearing on the conditional
+    route", and the z_calibration block's parameters "are set for the
+    UNCONDITIONAL route". Neither statement was executable, so a conditional
+    config spawned from the canonical one inherits all three silently.
+
+    THE EVIDENCE IS THE RUN RECORD, NOT A DERIVATION. Every conditional battery
+    that ran to completion -- qm9_aug11, qm9_anchor_aug13, qm9anchor_aug14 --
+    carries z_calibration off, all three tb_z_source keys `persistent`, and
+    half_life_visits 28. Every conditional run that detonated in
+    var_conditioning carried the unconditional trio. That includes one with a
+    3.2k-step MLE warm start, which is what rules out "not enough MLE" as the
+    explanation (findings F-042).
+
+    BASELINE, not ERROR, and deliberately: this is a per-route default backed by
+    three batteries, not a self-contradiction provable from the file. A run may
+    depart from it knowingly -- but not by accident, which is what happened."""
+    conditional = any(_get(cfg, k) is True for k in
+                      ('embedding_conditioning', 'molecule_conditioning', 'vector_conditioning'))
+    if not conditional:
+        return []
+    out = []
+    src = 'qm9_aug11 / qm9_anchor_aug13 / qm9anchor_aug14, every conditional battery that ran'
+    if _get(cfg, 'z_calibration.enabled') is True:
+        out.append(Violation(
+            BASELINE, 'conditional_z_settings_are_conditional',
+            f'z_calibration.enabled is true on a CONDITIONAL route; every battery that '
+            f'ran turned it off ({src}). Its parameters are documented as set for the '
+            f'unconditional route, and on the conditional one it drives up to '
+            f'max_steps_per_step Z-only steps into a per-condition flow NETWORK that '
+            f'no stage has trained.'))
+    for key in ('fwd_tb_z_source', 'bwd_tb_z_source', 'replay_tb_z_source'):
+        if _get(cfg, f'condition_log_z.{key}') == 'learned':
+            out.append(Violation(
+                BASELINE, 'conditional_z_settings_are_conditional',
+                f'condition_log_z.{key} is `learned` on a CONDITIONAL route; every '
+                f'battery that ran used `persistent` ({src}) -- the conditional '
+                f'persistent-Z regime the canonical config names in its own comment.'))
+    hl = _num(_get(cfg, 'condition_log_z.half_life_visits'))
+    if hl is not None and hl < 28.0:
+        out.append(Violation(
+            BASELINE, 'conditional_z_settings_are_conditional',
+            f'condition_log_z.half_life_visits={hl:g} on a CONDITIONAL route; every '
+            f'battery that ran used 28 ({src}). The canonical 7 is reasoned for a '
+            f'ONE-condition run, where 7 visits == 7 steps; across a large library a '
+            f'condition is revisited far more sparsely.'))
+    return out
+
+
 def protocol_selector_resolves(cfg: dict) -> list[Violation]:
     """`protocol` must name a protocol in `protocols` that has stages.
 
@@ -731,6 +858,8 @@ def every_protocol_parses(cfg: dict) -> list[Violation]:
 RULES = (
     protocol_selector_resolves,
     every_protocol_parses,
+    vargrad_needs_groups,
+    conditional_z_settings_are_conditional,
     auto_lr_requires_an_adaptive_sensor,
     periodic_centroids_needs_one_crystal_space_group,
     ray_sensor_needs_a_coherent_stage,

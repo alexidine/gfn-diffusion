@@ -181,6 +181,14 @@ SEED_LR = 1.25e-4       # adaptive_lr.seed_lr: what `auto` resolves to with no s
 # The unconditional route COMPLETED off this gate locally (mipcas_final).
 MLE_GATE = {'slope_t': 1.0, 'min_rate': 0.5, 'window': 100}
 
+# The conditional arms' WEIGHTS-ONLY MLE warm start. From qm9_anchor_aug13, the
+# later of the two runs on this exact problem; slug `elj-qm9split_prior-T6.9-
+# b3483b` matches what these arms resolve to, which is what makes it legal
+# (load_weights_only calls assert_problem_match). Override with --cond-mle-seed.
+# MUST BE COPIED TO THE CLUSTER checkpoints dir -- it currently exists locally
+# only; --preflight is what catches its absence before a queue slot is spent.
+DEFAULT_COND_MLE_SEED = 'qm9a13_qm9a98b_elj-qm9split_prior-T6.9-b3483b_phase1_exit.pt'
+
 FLOOR_REPEATS = 5       # matches registry noise_floor.repeats on the four step-cost benchmarks
 UTIL_REPEATS = 3        # matches a100-batch-scaling-elj / a100-util-production-shape
 
@@ -254,11 +262,39 @@ def cluster_layer(cfg, run_name, batch, epochs, archive_period):
     return cfg
 
 
-def pin_fresh(cfg):
-    cfg['checkpoint_name'] = None
+def pin_fresh(cfg, mle_seed=None):
+    """Wave-1 resume pinning. `mle_seed` is a WEIGHTS-ONLY MLE warm start.
+
+    WHY WEIGHTS-ONLY AND NOT A FULL RESUME. load_weights_only takes the model
+    weights and nothing else -- step count restarts at 0, optimizers and buffers
+    are fresh, and the run RE-ENTERS train_prior. So the arm still exercises the
+    MLE stage, the gate, the transition and the churn rebuild (which is most of
+    what these arms are for), but starts them from a policy that is already
+    trained rather than from noise. A full resume would skip the very paths
+    under test.
+
+    WHY AT ALL. The MLE budget these arms can afford is ~150-250 steps, and the
+    older qm9 conditional runs that started from a good MLE point began
+    var_conditioning at markedly lower losses. Re-deriving that in 200 steps is
+    not possible; loading it costs nothing.
+
+    NOT A FIX FOR THE DETONATION, and the evidence is direct: the 2026-08-16
+    `qm9_warm` shakeout did exactly this from a 3.2k-step MLE prior and
+    detonated at the same steps as the cold run, because it still carried the
+    unconditional Z trio. Warm start and conditionalise_z are independent
+    changes and this battery makes both.
+
+    IDENTITY IS CHECKED, NOT ASSUMED. checkpointing.load_weights_only calls
+    assert_problem_match, so the seed must share the live config's problem
+    identity -- same energy function, prior_path, T, space group. The qm9split
+    seeds carry the slug `elj-qm9split_prior-T6.9-b3483b`, which is the slug
+    these arms resolve to; that is why they are legal here and an aug14
+    (qm9c100k) checkpoint would not be.
+    """
+    cfg['checkpoint_name'] = mle_seed
     cfg['continue_from_checkpoint'] = False
     cfg['prior_model_name'] = None
-    cfg['load_weights_only'] = False
+    cfg['load_weights_only'] = mle_seed is not None
     cfg['checkpoint_read_only'] = False     # wave 1 MUST write: wave 2 resumes from it
     return cfg
 
@@ -304,6 +340,30 @@ def strip_lr_sensors(cfg):
     for k in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'):
         assert k in cfg, f'missing {k}'
         cfg[k] = SEED_LR
+    return cfg
+
+
+def conditionalise_z(cfg):
+    """Switch the three Z-side blocks from their UNCONDITIONAL defaults.
+
+    THE CANONICAL CONFIG SAYS TO DO THIS AND NOTHING ENFORCED IT. mk_dev's
+    condition_log_z block is annotated "MONITORING ONLY ... it becomes
+    load-bearing on the conditional route", and its z_calibration parameters
+    "are set for the UNCONDITIONAL route". A conditional config spawned from the
+    canonical one inherits all three unchanged, which is what these arms did.
+
+    The values are not a derivation -- they are what every conditional battery
+    that RAN carries (qm9_aug11, qm9_anchor_aug13, qm9anchor_aug14, all three
+    identical on all three keys), against a detonation in every conditional run
+    that carried the unconditional trio, including one with a 3.2k-step MLE warm
+    start. `config_invariants.conditional_z_settings_are_conditional` now
+    reports the departure at load; this function is what makes these arms not
+    depart. See findings F-042.
+    """
+    cfg['z_calibration']['enabled'] = False
+    for key in ('fwd_tb_z_source', 'bwd_tb_z_source', 'replay_tb_z_source'):
+        cfg['condition_log_z'][key] = 'persistent'
+    cfg['condition_log_z']['half_life_visits'] = 28.0
     return cfg
 
 
@@ -353,13 +413,13 @@ def archive_step(archive):
 # wave 1
 # ---------------------------------------------------------------------------
 
-def build_wave1(base_uncond, base_cond):
+def build_wave1(base_uncond, base_cond, cond_mle_seed=None):
     arms = []
 
     def f_arm(name, base, batch, epochs, archive_period, extra=None, cond=False):
         cfg = copy.deepcopy(base)
         cluster_layer(cfg, name, batch, epochs, archive_period)
-        pin_fresh(cfg)
+        pin_fresh(cfg, mle_seed=cond_mle_seed if cond else None)
         # production eval size on the cheap-energy arms; MLIP F arms keep 2000
         # so a 10k MLIP-scored eval does not dominate a functionality check
         cfg['eval_num_samples'] = 2000 if (extra or {}).get('_mlip') else 10000
@@ -367,6 +427,7 @@ def build_wave1(base_uncond, base_cond):
             stage(cfg, proto, 'train_prior')['mle_gate'] = dict(MLE_GATE)
         if cond:
             make_var_conditioning_terminal(cfg)
+            conditionalise_z(cfg)
             cfg['prior_path'] = CLUSTER_PRIOR_DIR + 'qm9split_prior.pt'
             cfg['molecules_path'] = CLUSTER_PRIOR_DIR + 'qm9split_conditions.pt'
             cfg['test_molecules_path'] = CLUSTER_PRIOR_DIR + 'qm9split_test_conditions.pt'
@@ -413,6 +474,7 @@ def build_wave2(base_uncond, base_cond, a):
         strip_grad_geometry(cfg)
         if cond:
             make_var_conditioning_terminal(cfg)
+            conditionalise_z(cfg)
             cfg['prior_path'] = CLUSTER_PRIOR_DIR + 'qm9split_prior.pt'
             cfg['molecules_path'] = CLUSTER_PRIOR_DIR + 'qm9split_conditions.pt'
             cfg['test_molecules_path'] = CLUSTER_PRIOR_DIR + 'qm9split_test_conditions.pt'
@@ -543,10 +605,27 @@ def validate(name, wave, kind, bid, cfg):
     for key in ('checkpoint_name', 'continue_from_checkpoint', 'prior_model_name',
                 'load_weights_only', 'checkpoint_read_only'):
         assert key in cfg, f'{name}: {key} missing entirely'
+    conditional = cfg.get('embedding_conditioning') is True
     if wave.startswith('wave1'):
-        assert cfg['checkpoint_name'] is None and cfg['prior_model_name'] is None, \
-            f'{name}: wave-1 arms are FRESH -- a leaked warm start silently skips ' \
-            f'the MLE stage and the transition this arm exists to exercise'
+        assert cfg['prior_model_name'] is None, \
+            f'{name}: wave-1 arms build their own prior in-run'
+        if cfg['checkpoint_name'] is None:
+            assert cfg['load_weights_only'] is False, f'{name}: no seed, so nothing to load'
+        else:
+            # a WEIGHTS-ONLY MLE seed. Full-state would restore the step count and
+            # stage position and skip the paths this arm exists to exercise.
+            assert cfg['load_weights_only'] is True, \
+                f'{name}: an MLE seed must be weights-only -- a full-state resume ' \
+                f'restores step/stage and skips the MLE stage, the gate, the ' \
+                f'transition and the churn rebuild, which is everything this arm tests'
+            assert conditional, f'{name}: only the conditional arms take an MLE seed'
+            # assert_problem_match fires at load; catch the mismatch HERE, where it
+            # costs nothing rather than a queue slot.
+            assert 'qm9split_prior' in cfg['checkpoint_name'], \
+                (f"{name}: MLE seed {cfg['checkpoint_name']!r} is not a qm9split_prior "
+                 f"checkpoint. The problem identity is keyed on prior_path among other "
+                 f"fields, so a seed from another condition library (e.g. qm9c100k) is "
+                 f"refused by assert_problem_match at load.")
         assert cfg['checkpoint_read_only'] is False, \
             f'{name}: wave 1 must WRITE checkpoints; wave 2 resumes from them'
     else:
@@ -554,10 +633,15 @@ def validate(name, wave, kind, bid, cfg):
             f'{name}: wave-2 arms are WARM -- a fresh start silently retrains phase 1 ' \
             f'({cfg["checkpoint_name"]!r}, {cfg["prior_model_name"]!r})'
         assert cfg['checkpoint_read_only'] is True, f'{name}: benchmark arms must not write'
+        # wave 2 is the opposite case from wave 1's MLE seed: a benchmark measures
+        # INSIDE a stage, so it needs the full state -- optimizers, buffers, step
+        # count. Weights-only would restart at step 0 in train_prior and measure
+        # the wrong stage entirely.
+        assert cfg['load_weights_only'] is False, \
+            f'{name}: a benchmark resume needs full state, not weights-only'
         assert cfg['epochs'] > archive_step(cfg['checkpoint_name']), \
             f'{name}: epochs {cfg["epochs"]} <= resume step -- runs ZERO steps and ' \
             f'reports a clean empty result (epochs is an ABSOLUTE index)'
-    assert cfg['load_weights_only'] is False, f'{name}: full-state resume only'
     assert cfg['continue_from_checkpoint'] is False, f'{name}: pinned false everywhere'
     assert cfg['batch_size'] == cfg['max_batch_size'], f'{name}: batch not pinned'
     assert cfg['grow_batch_size'] is False, f'{name}: growth must be off'
@@ -575,8 +659,17 @@ def validate(name, wave, kind, bid, cfg):
         assert cfg['max_step_seconds'] == 0, f'{name}: the runaway guard cuts the batch mid-window'
         assert cfg['grad_geometry']['enabled'] is False, \
             f'{name}: the grad-geometry probe adds a backward per branch inside the window'
-    else:
-        assert cfg['z_calibration']['enabled'] is True, f'{name}: F arms are production-shaped'
+    elif not conditional:
+        assert cfg['z_calibration']['enabled'] is True, \
+            f'{name}: unconditional F arms are production-shaped'
+
+    if conditional:
+        # the three keys documented as unconditional-route settings, which every
+        # conditional battery that RAN switched and every one that detonated did not
+        assert cfg['z_calibration']['enabled'] is False, f'{name}: z_cal off on conditional'
+        for k in ('fwd_tb_z_source', 'bwd_tb_z_source', 'replay_tb_z_source'):
+            assert cfg['condition_log_z'][k] == 'persistent', f'{name}: {k} must be persistent'
+        assert cfg['condition_log_z']['half_life_visits'] == 28.0, f'{name}: half_life 28'
 
     # requirement 4: config_invariants over every generated config
     violations = config_invariants.check(cfg)
@@ -744,12 +837,15 @@ def preflight(outdir):
             full = os.path.join(ckpt_dir, ckpt)
             if not os.path.isfile(full):
                 print(f'  MISSING  {path.name:<28} checkpoint -> {full}'); bad += 1
-            sidecar = full.replace('.pt', '_buffers.pt')
-            if not os.path.isfile(sidecar):
-                # HARD FAIL: a resume without its buffer sidecar rebuilds empty
-                # buffers silently -- rb0808's fallback was itself the warning
-                # nobody read.
-                print(f'  MISSING  {path.name:<28} buffer sidecar -> {sidecar}'); bad += 1
+            # A WEIGHTS-ONLY seed has no sidecar BY DESIGN: buffers re-seed from
+            # prior_path, which is what keeps the churn test real. Requiring one
+            # here would reject a correct config. A FULL-STATE resume without its
+            # sidecar rebuilds empty buffers silently, so that stays a hard fail --
+            # rb0808's fallback was itself the warning nobody read.
+            if not cfg.get('load_weights_only'):
+                sidecar = full.replace('.pt', '_buffers.pt')
+                if not os.path.isfile(sidecar):
+                    print(f'  MISSING  {path.name:<28} buffer sidecar -> {sidecar}'); bad += 1
         prior = cfg.get('prior_model_name')
         if prior and not os.path.isfile(os.path.join(ckpt_dir, prior)):
             print(f'  MISSING  {path.name:<28} prior model -> {prior}'); bad += 1
@@ -774,6 +870,10 @@ def main():
     ap.add_argument('--t-elj4491', type=float, help='override the 2.8x t1000 extrapolation')
     ap.add_argument('--eval-s', type=float, default=150.0,
                     help='measured wave-1 eval_step_time at cluster cadence, seconds')
+    ap.add_argument('--cond-mle-seed', default=DEFAULT_COND_MLE_SEED,
+                    help='WEIGHTS-ONLY MLE warm start for the conditional F arms. Must be a '
+                         'qm9split_prior checkpoint (problem identity is checked at load). '
+                         'Pass "" to run them cold.')
     a = ap.parse_args()
 
     outdir = Path(a.outdir) if a.outdir else HERE
@@ -790,7 +890,17 @@ def main():
         if not arms:
             raise SystemExit('wave 2: nothing to generate -- pass the wave-1 artifact args')
     else:
-        arms, dropped = build_wave1(base_uncond, base_cond), []
+        seed = a.cond_mle_seed or None
+        arms, dropped = build_wave1(base_uncond, base_cond, cond_mle_seed=seed), []
+        if seed:
+            print(f'conditional MLE seed (weights-only): {seed}\n'
+                  f'  -> must exist in the CLUSTER checkpoints dir; --preflight checks it.\n'
+                  f'  -> a weights-only seed needs NO _buffers.pt sidecar (buffers re-seed '
+                  f'from prior_path, which is what keeps the churn test real).')
+        else:
+            dropped.append('conditional MLE warm start: --cond-mle-seed "" -- f2/f2b run '
+                           'cold, so they enter var_conditioning from ~200 steps of MLE '
+                           'rather than a trained policy')
     emit(arms, dropped, outdir)
 
 

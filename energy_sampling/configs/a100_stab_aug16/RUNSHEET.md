@@ -24,6 +24,31 @@ extensions landed in `benchmarks/registry.yaml` the same day (13 benchmarks,
 > runnable locally, so **the next cluster run is the verification** — check that
 > arms pass step 320 with `fused_grad/*` present and no `fused_grad/disabled`.
 >
+> ### Conditional arms also aborted — three inherited settings, not MLE (2026-08-17)
+>
+> `f2` cleared MLE, the transition, the churn generate-up (4,880 → 62,500) and
+> the var_conditioning entry at batch 500 — then detonated ~30 steps in.
+> **`docs/findings.md` F-042.** Cause: three keys documented as
+> UNCONDITIONAL-route settings were inherited by a conditional config —
+> `z_calibration.enabled`, the three `tb_z_source` keys, and
+> `half_life_visits`. Every conditional battery that ran has the other value;
+> every one that detonated has these. **Not an MLE problem** — a 3.2k-step warm
+> start detonated identically.
+>
+> **Fixed** in `make.py::conditionalise_z` (asserted at generation) and enforced
+> repo-wide by `config_invariants.conditional_z_settings_are_conditional`. A
+> second rule, `vargrad_needs_groups`, landed from the same comparison. The
+> conditional arms additionally now take a **weights-only MLE seed**
+> (`--cond-mle-seed`, default the qm9a98b phase1_exit) so they enter
+> var_conditioning from a trained policy rather than ~200 steps of MLE — that
+> is a quality change, *not* the detonation fix; the two are independent.
+>
+> **ACTION BEFORE RESUBMIT:** the seed exists locally only. Copy
+> `qm9a13_qm9a98b_elj-qm9split_prior-T6.9-b3483b_phase1_exit.pt` into the
+> cluster checkpoints dir (no `_buffers.pt` needed — weights-only re-seeds
+> buffers from `prior_path`, which keeps the churn test real). `--preflight`
+> fails loudly if it is absent; `--cond-mle-seed ""` runs them cold instead.
+>
 > **Resubmit wave 1 after pulling the train.py fix.** No config change is needed
 > (the F arms keep the diagnostic on deliberately — proving it survives compile
 > is part of what they check); wave-2 benchmark arms now switch it off as

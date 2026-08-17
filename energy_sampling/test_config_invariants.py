@@ -480,6 +480,104 @@ def test_accumulation_lifts_a_small_batch_to_the_baseline(canonical):
 # Rule hygiene
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# The two rules from the 2026-08-17 conditional-detonation comparison (F-042).
+# Both are keyed to the CONDITIONAL route, which the canonical config is not, so
+# each fixture builds the conditional case rather than mutating mk_dev in place.
+# ---------------------------------------------------------------------------
+
+def _conditional(canonical, **dotted):
+    """mk_dev switched onto the conditional route, with the Z trio already set
+    correctly -- i.e. the state a correct conditional config is in, so a test
+    that mutates one key is testing exactly that key."""
+    cfg = broken(canonical, **dotted)
+    cfg['embedding_conditioning'] = True
+    cfg['protocol'] = 'conditional_vargrad'
+    cfg['z_calibration']['enabled'] = False
+    for k in ('fwd_tb_z_source', 'bwd_tb_z_source', 'replay_tb_z_source'):
+        cfg['condition_log_z'][k] = 'persistent'
+    cfg['condition_log_z']['half_life_visits'] = 28.0
+    return cfg
+
+
+def _fired(cfg, rule_name):
+    return [v for v in check(cfg) if v.rule == rule_name]
+
+
+def test_conditional_z_settings_pass_when_set_for_the_route(canonical):
+    assert _fired(_conditional(canonical), 'conditional_z_settings_are_conditional') == []
+
+
+@pytest.mark.parametrize('path, bad_value', [
+    ('z_calibration__enabled', True),
+    ('condition_log_z__fwd_tb_z_source', 'learned'),
+    ('condition_log_z__bwd_tb_z_source', 'learned'),
+    ('condition_log_z__replay_tb_z_source', 'learned'),
+    ('condition_log_z__half_life_visits', 7.0),
+])
+def test_each_inherited_unconditional_z_setting_fires(canonical, path, bad_value):
+    """Each of the three keys (four spellings) that separated every conditional
+    battery that RAN from every conditional run that detonated -- F-042."""
+    cfg = _conditional(canonical)
+    node, parts = cfg, path.replace('__', '.').split('.')
+    for p in parts[:-1]:
+        node = node[p]
+    node[parts[-1]] = bad_value
+    vs = _fired(cfg, 'conditional_z_settings_are_conditional')
+    assert len(vs) == 1 and vs[0].severity == BASELINE, [str(v) for v in vs]
+
+
+def test_unconditional_route_is_left_alone(canonical):
+    """The SAME values are correct on the unconditional route. A rule that fired
+    there would flag the canonical config and every unconditional battery."""
+    assert canonical['z_calibration']['enabled'] is True, 'precondition: mk_dev is unconditional'
+    assert _fired(canonical, 'conditional_z_settings_are_conditional') == []
+
+
+def _vg_stage(cfg):
+    return [s for s in cfg['protocols']['conditional_vargrad']['stages']
+            if s['name'] == 'var_conditioning'][0]
+
+
+def test_vargrad_grouping_passes_as_shipped(canonical):
+    assert _fired(_conditional(canonical), 'vargrad_needs_groups') == []
+
+
+def test_fwd_vargrad_singleton_group_fires(canonical):
+    """fwd repeats is the ONLY source of a forward group; at 1 every group is a
+    singleton and vg_loss is identically zero -- silent, not a crash."""
+    cfg = _conditional(canonical)
+    _vg_stage(cfg)['loss_coeffs']['fwd']['repeats'] = 1.0
+    vs = _fired(cfg, 'vargrad_needs_groups')
+    assert len(vs) == 1 and vs[0].severity == ERROR
+
+
+def test_bwd_vargrad_fires_only_when_BOTH_group_sources_are_absent(canonical):
+    """The backward condition is a DISJUNCTION, and it must stay one: aug14 and
+    aug11 satisfy it with repeats 2 at condition_block_m 1, aug13 with
+    condition_block_m 2 at repeats 1. A conjunction rejects two configs that ran."""
+    both_absent = _conditional(canonical, buffers__prior_buffer__condition_block_m=1)
+    _vg_stage(both_absent)['loss_coeffs']['bwd']['repeats'] = 1.0
+    vs = _fired(both_absent, 'vargrad_needs_groups')
+    assert len(vs) == 1 and vs[0].severity == ERROR
+
+    # aug13's spelling: repeats 1 but blocked draws -- must NOT fire
+    via_blocks = _conditional(canonical, buffers__prior_buffer__condition_block_m=2)
+    _vg_stage(via_blocks)['loss_coeffs']['bwd']['repeats'] = 1.0
+    assert _fired(via_blocks, 'vargrad_needs_groups') == []
+
+    # aug14's spelling: repeats 2, blocking off -- must NOT fire
+    via_repeats = _conditional(canonical, buffers__prior_buffer__condition_block_m=1)
+    _vg_stage(via_repeats)['loss_coeffs']['bwd']['repeats'] = 2.0
+    assert _fired(via_repeats, 'vargrad_needs_groups') == []
+
+
+def test_vargrad_rule_abstains_off_the_vargrad_route(canonical):
+    """On a TB route `repeats` means something else and 1 is correct. mk_dev's
+    unconditional protocol runs repeats 1 everywhere and must stay clean."""
+    assert _fired(canonical, 'vargrad_needs_groups') == []
+
+
 def test_every_rule_is_mutation_tested():
     """Each rule in RULES must have at least one test above that makes it fire.
     Without this, adding a rule and forgetting its mutation test leaves a check
