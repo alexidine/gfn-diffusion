@@ -1154,7 +1154,7 @@ def run_molecule(name, smiles, level, ff_choice, n, seed, n_external, led, prior
         # refusal stated in ConformerTorsions.__init__, not a pipeline fault, so it is a
         # loud skip. Any OTHER ValueError propagates and fails the run.
         if 'no rotatable bonds' in msg or 'no free degrees of freedom' in msg:
-            led.skip('MOLECULE', name, level, f'construction refused: {msg}')
+            led.skip('MOLECULE', name, level, f'construction refused: {msg}', K_MOL)
             return {'name': name, 'smiles': smiles, 'skipped': msg}
         raise
 
@@ -1863,11 +1863,16 @@ def _prior_key_external(en, name, level, led):
         ai = m.tree_angle_index.detach().cpu().numpy()
         ti = m.tree_torsion_index.detach().cpu().numpy()
     except Exception as ex:
-        led.skip('prior_key_external', name, level,
-                 f'the mxtaltools tree_* route could not be built for this molecule, so '
-                 f'there is no independent authority to compare against: '
-                 f'{type(ex).__name__}: {ex}')
+        for k in ('prior_key_external', 'n_key_rows'):
+            led.skip(k, name, level,
+                     f'the mxtaltools tree_* route could not be built for this molecule, so '
+                     f'there is no independent authority to compare against: '
+                     f'{type(ex).__name__}: {ex}', K_UNREACHABLE)
         return
+    # `bad` below is a count of disagreeing rows, so with no rows there is nothing to
+    # disagree and the check passes without comparing anything
+    led.check('n_key_rows', name, level, len(got), TOL['population_min'], '>=',
+              units='DoF rows whose prior key was compared against the tree_* derivation')
     want = {}
     for j in range(bi.shape[1]):
         want[j] = InternalPrior.bond_key(*keys[bi[:, j]])
@@ -1929,14 +1934,16 @@ def _prior_draw_leg(en, name, level, led, prior, n, seed, inject=()):
         for k in ('prior_rtheta_width', 'prior_improper_sigma'):
             led.skip(k, name, level,
                      'no fitted InternalPrior available (--no-prior, or the cache file is '
-                     'missing), and sample_prior_states cannot be driven without one')
+                     'missing), and sample_prior_states cannot be driven without one',
+                     K_CONFIG)
         return
     kw = {'thermal_rtheta': False} if 'prior-pooled-rtheta' in inject else {}
     try:
         r, th, ph = _capture_prior_dof(en, prior, n, np.random.default_rng(seed + 31), **kw)
     except Exception as ex:
         for k in ('prior_rtheta_width', 'prior_improper_sigma'):
-            led.skip(k, name, level, f'sample_prior_states raised: {type(ex).__name__}: {ex}')
+            led.skip(k, name, level, f'sample_prior_states raised: {type(ex).__name__}: {ex}',
+                     K_UNREACHABLE)
         return
 
     T = float(en.temperature)
@@ -1967,7 +1974,7 @@ def _prior_draw_leg(en, name, level, led, prior, n, seed, inject=()):
     if not q:
         led.skip('prior_rtheta_width', name, level,
                  'every r and theta row on this molecule is owned by a ring system and is '
-                 'therefore held at a fraction of thermal width by design')
+                 'therefore held at a fraction of thermal width by design', K_MOL)
     else:
         led.check('prior_rtheta_width', name, level, max(q), TOL['prior_rtheta_width'],
                   units='fold deviation from the FF thermal sigma')
@@ -1977,7 +1984,7 @@ def _prior_draw_leg(en, name, level, led, prior, n, seed, inject=()):
     if not imp:
         led.skip('prior_improper_sigma', name, level,
                  'no improper phi row outside a ring block on this molecule (an improper '
-                 'row inside one is held by the ring, not drawn)')
+                 'row inside one is held by the ring, not drawn)', K_MOL)
         return
     qi = []
     for j in imp:
@@ -2003,7 +2010,7 @@ def chiral_pair_check(led, level, results_cip):
     a, b = results_cip.get('butan-2-ol-R'), results_cip.get('butan-2-ol-S')
     if not a or not b:
         led.skip('chiral_pair_opposite', 'butan-2-ol', level,
-                 'one or both members of the chiral pair did not run at this level')
+                 'one or both members of the chiral pair did not run at this level', K_MOL)
         return
     led.check('chiral_pair_opposite', 'butan-2-ol', level, int(a == b), 0, '==',
               units='identical CIP assignments (want 0)')
@@ -2044,6 +2051,47 @@ def fmt(v):
     return f'{float(v):.4g}' if 1e-3 <= a < 1e5 else f'{float(v):.3e}'
 
 
+def skip_census(led, summaries):
+    """Which of the suite ran, which did not, and WHY -- as numbers rather than as prose.
+
+    "N passed, M skipped, 0 FAILED" is unreadable without this. M mixes three unrelated
+    things: a property this molecule does not have, a property this LEVEL froze out of
+    existence, and a code path that RAISED. Only the third is a hole, and it is the one a
+    headline count silently rounds into the second.
+
+    The fourth number is the one nothing else in the file could see: a check name that
+    emitted NO ROW AT ALL, which is what happens downstream of a raise unless the raise
+    handler skips the downstream names explicitly. It is neither a pass nor a skip, so it
+    is invisible to both counts. Diffing the emitted names against ``ASSERTIONS`` is what
+    makes it a printed integer, and the diff runs the other way too so the list cannot rot.
+    """
+    ran_mols = [s['name'] for s in summaries if 'skipped' not in s]
+    emitted = {(r.name, r.mol) for r in led.rows if r.status in ('pass', 'FAIL', 'skip')}
+    dark = [(nm, m) for m in ran_mols for nm in ASSERTIONS if (nm, m) not in emitted]
+    known = set(ASSERTIONS) | set(NON_ASSERTION_ROWS)
+    unregistered = {r.name for r in led.rows
+                    if r.status in ('pass', 'FAIL', 'skip') and r.name not in known}
+    by_kind = defaultdict(int)
+    for r in led.skips:
+        by_kind[r.kind] += 1
+    n_skip = len(led.skips)
+    n_ran = sum(r.status in ('pass', 'FAIL') for r in led.rows)
+    tier = [r for r in led.rows
+            if r.name in PRIOR_QUALITY_TIER and r.status in ('pass', 'FAIL', 'skip')]
+    return {
+        'n_slots': n_ran + n_skip + len(dark),
+        'n_ran': n_ran,
+        'n_skip': n_skip,
+        'by_kind': dict(by_kind),
+        'n_inapplicable': sum(by_kind.get(k, 0) for k in (K_MOL, K_LEVEL, K_CONFIG)),
+        'n_unreachable': by_kind.get(K_UNREACHABLE, 0),
+        'dark': dark,
+        'unregistered': sorted(unregistered),
+        'tier_ran': sum(r.status in ('pass', 'FAIL') for r in tier),
+        'tier_slots': len(tier) + sum(1 for nm, _m in dark if nm in PRIOR_QUALITY_TIER),
+    }
+
+
 def print_report(cfg, led, summaries, out=sys.stdout):
     p = lambda s='': print(s, file=out)
     p('=' * 96)
@@ -2069,21 +2117,23 @@ def print_report(cfg, led, summaries, out=sys.stdout):
     # ---- per molecule -------------------------------------------------------------
     p('MOLECULES')
     p(f"  {'name':<18}{'SMILES':<22}{'N':>4}{'d':>5}{'rot':>5}{'lin':>5}"
-      f"{'E/T median':>13}{'pass':>7}{'skip':>6}{'FAIL':>6}   hazard")
+      f"{'E/T median':>13}{'pass':>7}{'inapp':>7}{'UNRE':>6}{'FAIL':>6}   hazard")
     for s in summaries:
         by = defaultdict(int)
         for r_ in led.rows:
             if r_.mol == s['name']:
                 by[r_.status] += 1
+                if r_.status == 'skip':
+                    by['UNRE' if r_.kind == K_UNREACHABLE else 'inapp'] += 1
         if 'skipped' in s:
             p(f"  {s['name']:<18}{s['smiles']:<22}{'-':>4}{'-':>5}{'-':>5}{'-':>5}"
-              f"{'SKIPPED':>13}{by['pass']:>7}{by['skip']:>6}{by['FAIL']:>6}   "
-              f"{s['skipped']}")
+              f"{'SKIPPED':>13}{by['pass']:>7}{by['inapp']:>7}{by['UNRE']:>6}"
+              f"{by['FAIL']:>6}   {s['skipped']}")
             continue
         p(f"  {s['name']:<18}{s['smiles']:<22}{s['n_atoms']:>4}{s['d']:>5}"
           f"{s['n_rotatable']:>5}{s['n_linear_angle']:>5}"
-          f"{s['energy_median']:>13.2f}{by['pass']:>7}{by['skip']:>6}{by['FAIL']:>6}   "
-          f"{s['hazard'][:44]}")
+          f"{s['energy_median']:>13.2f}{by['pass']:>7}{by['inapp']:>7}{by['UNRE']:>6}"
+          f"{by['FAIL']:>6}   {s['hazard'][:40]}")
     p()
 
     # ---- per check ----------------------------------------------------------------
@@ -2113,15 +2163,53 @@ def print_report(cfg, led, summaries, out=sys.stdout):
             p(f"  {nm:<26}{npass:>5}{nskip:>5}{nfail:>5}   {'-':<20}{'-':>12}{'-':>14}")
     p()
 
-    # ---- skips, grouped by reason --------------------------------------------------
-    p('SKIPPED  (a check that did not run is not a check that passed)')
+    # ---- SKIP CENSUS ---------------------------------------------------------------
+    cen = skip_census(led, summaries)
+    p('SKIP CENSUS  (a check that did not run is not a check that passed)')
+    p(f"  {cen['n_ran']} of {cen['n_slots']} check x molecule slots RAN; "
+      f"{cen['n_skip']} did not "
+      f"({100.0 * cen['n_skip'] / max(cen['n_slots'], 1):.0f}% of the suite is dark at "
+      f"level {cfg['level']!r}).")
+    p(f"    {cen['n_inapplicable']:>4}  legitimately INAPPLICABLE -- the property does not "
+      f"exist to be checked")
+    for k in (K_MOL, K_LEVEL, K_CONFIG):
+        if cen['by_kind'].get(k):
+            p(f"    {cen['by_kind'][k]:>4}    {k}")
+    p(f"    {cen['by_kind'].get(K_UNREACHABLE, 0):>4}  UNREACHABLE -- a code path RAISED. "
+      f"This is the number that must NOT be read as 0 FAILED.")
+    p(f"    {cen['by_kind'].get(K_UNASSERTED, 0):>4}  ran, deliberately UNASSERTED "
+      f"(no defensible bar; see the reason text)")
+    if cen['dark']:
+        # a name that emitted NO row of any kind on a molecule that ran: invisible to both
+        # the pass count and the skip count. The whole census is worthless if this grows.
+        p(f"  !! {len(cen['dark'])} check x molecule slots emitted NO ROW AT ALL -- not a "
+          f"pass, not a skip, not a failure:")
+        byname = defaultdict(list)
+        for nm, m in cen['dark']:
+            byname[nm].append(m)
+        for nm, mols in sorted(byname.items()):
+            p(f"       {nm}  [{len(mols)}: {', '.join(mols)}]")
+    else:
+        p(f"     {0:>3}  emitted NO ROW at all (every listed assertion produced a pass, a "
+          f"skip or a failure)")
+    if cen['unregistered']:
+        p(f"  !! emitted but absent from ASSERTIONS, so the census cannot account for it: "
+          f"{', '.join(sorted(cen['unregistered']))}")
+    tier_ran, tier_slots = cen['tier_ran'], cen['tier_slots']
+    p(f"  PRIOR-QUALITY TIER ({', '.join(PRIOR_QUALITY_TIER)}):")
+    p(f"     {tier_ran} of {tier_slots} slots ran"
+      + ('   <-- ZERO. The tier this harness exists to supply contributes nothing to the '
+         'pass count at this level.' if tier_ran == 0 else ''))
+    p()
+
+    p('SKIPPED, BY REASON')
     groups = defaultdict(list)
     for r_ in led.skips:
-        groups[(r_.name, r_.reason)].append(r_.mol)
+        groups[(r_.kind, r_.name, r_.reason)].append(r_.mol)
     if not groups:
         p('  none')
-    for (nm, reason), mols in sorted(groups.items()):
-        p(f"  {nm}  [{len(mols)}: {', '.join(mols)}]")
+    for (kind, nm, reason), mols in sorted(groups.items()):
+        p(f"  [{kind}]  {nm}  [{len(mols)}: {', '.join(mols)}]")
         for line in _wrap(reason, 88):
             p(f"      {line}")
     p()
