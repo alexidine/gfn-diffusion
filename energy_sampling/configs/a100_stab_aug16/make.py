@@ -418,6 +418,30 @@ def conditional_base(base, data):
     return cfg
 
 
+def strip_z_calibration(cfg):
+    """Remove the z_calibration STAGE FLAG from every stage of every protocol.
+
+    THIS IS NOT OPTIONAL BOOKKEEPING -- it is the thing whose absence voided
+    a100_stab_aug16's first floor set. benchmarks.md section 2: z_calibration's
+    sidecar rollouts run INSIDE the step-timing window while
+    `_throughput['samples']` is charged only `attempted_batch`, so
+    `samples_per_sec` moves at constant batch as the sensor converges. A
+    throughput benchmark cannot have it on.
+
+    It USED to be neutralised by `defaults.overrides.z_calibration.enabled`
+    in the registry. State 6 made it a stage flag, the override went inert
+    without a word, and ten floor launches calibrated Z inside their measurement
+    windows while the config read as clean. The registry now REFUSES the old
+    spelling, and this function is the replacement -- the same shape as
+    strip_lr_sensors, and for the same reason: a stage declaration is
+    unreachable from an override, so neutralising it is the generator's job.
+    """
+    for proto in cfg.get('protocols', {}).values():
+        for st in proto.get('stages', []):
+            (st.get('flags') or {}).pop('z_calibration', None)
+    return cfg
+
+
 def make_var_conditioning_terminal(cfg):
     """Remove var_conditioning's exit + on_exit: the declared bar
     (fwd/logw_std_within < 6.0) sits under the metric's measured minimum 17.1,
@@ -523,6 +547,7 @@ def build_wave2(base, cond_data, a):
         apply_benchmark(cfg, bid)
         strip_lr_sensors(cfg)
         strip_grad_geometry(cfg)
+        strip_z_calibration(cfg)
         if cond:
             make_var_conditioning_terminal(cfg)
         else:
@@ -705,7 +730,19 @@ def validate(name, wave, kind, bid, cfg):
     if kind in ('floor', 'util', 'probe'):
         for k in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'):
             assert cfg[k] == SEED_LR, f'{name}: benchmark arms pin {k} to the seed'
-        assert cfg['z_calibration']['enabled'] is False, f'{name}: z_cal corrupts the denominator'
+        # z-cal off, checked WHERE STATE 6 PUT IT. Asserting the old
+        # `z_calibration.enabled` key passed happily while ten floor arms
+        # calibrated Z inside their windows -- the assertion was reading a
+        # setting nothing consumes.
+        for proto, entry in cfg.get('protocols', {}).items():
+            for st in entry.get('stages', []):
+                assert not (st.get('flags') or {}).get('z_calibration'), \
+                    (f'{name}: stage {proto}/{st["name"]} still declares the '
+                     f'z_calibration flag. Its rollouts run inside the step-timing '
+                     f'window while only attempted_batch is charged to the throughput '
+                     f'denominator, so samples_per_sec moves at constant batch.')
+        assert 'enabled' not in (cfg.get('z_calibration') or {}), \
+            f'{name}: z_calibration.enabled is the pre-state-6 spelling and is inert'
         assert cfg['max_step_seconds'] == 0, f'{name}: the runaway guard cuts the batch mid-window'
         assert cfg['grad_geometry']['enabled'] is False, \
             f'{name}: the grad-geometry probe adds a backward per branch inside the window'

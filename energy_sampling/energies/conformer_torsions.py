@@ -545,26 +545,34 @@ class ConformerTorsions(BaseSet):
         return out
 
     def torsion_groups(self):
-        """phi DoF rows grouped by PARENT ATOM, leader first.
+        """phi DoF rows grouped by CENTRAL BOND, improper rows excluded, leader first.
 
         A group is the set of atoms placed onto one parent -- every dihedral whose
         DIFFERENCES from the others fix a bond angle at that parent. An H-C-H angle is a
         difference of two of them, and it is one of the graph angles the force field
         scores but the tree does not expose as a coordinate. So they have to be drawn
-        JOINTLY. Drawn independently, even from perfect marginals, roughly a third of
-        sibling pairs land on the same rotamer mode and put two substituents in the same
-        place -- measured on Ala5 at a median sibling-difference error of 91 degrees.
+        JOINTLY. Drawn independently, even from perfect marginals, a substantial fraction
+        of sibling pairs land on the same rotamer mode and put two substituents in the
+        same place.
 
-        KEYED ON THE CENTRAL BOND `(b, c)`, and IMPROPER ROWS ARE EXCLUDED. The group's
-        whole mechanism is that every member takes the leader's angular displacement, and
-        that is only a rigid rotation of the set when the members share a reference axis
-        -- which is what the central bond is. Grouping by parent atom instead gathers the
-        right atoms but then applies a common displacement to dihedrals measured about
-        DIFFERENT axes, which is not a rotation of anything: measured on ethanol it left
-        O4-C0-H1 at a median 14.5 degrees against a theta0 of 108.6.
+        OF THE TWO FACTS IN THAT SUMMARY LINE, ONLY THE SECOND IS LOAD-BEARING.
 
-        Rows that are improper (see improper_phi_rows) are not rotations at all and are
-        handled separately, so they must not appear here.
+        The mechanism is that every member takes the leader's angular displacement, which
+        is a rigid rotation of the set only when the members share a reference axis. On a
+        SPANNING TREE that is automatic: every atom has exactly one parent, so for a proper
+        row the reference `b` is a function of `c`, and keying on the parent atom therefore
+        yields the IDENTICAL partition. The key is a free choice here, and a test written
+        to detect the "wrong" key cannot fire. Do not add one.
+
+        WHAT IS NOT A FREE CHOICE is excluding the improper rows (see improper_phi_rows).
+        They are the only rows that share a parent with different references -- that is
+        what an improper IS -- so with them in the group the two keyings genuinely differ
+        and the displacement lands about mismatched axes, destroying the angle at the
+        shared parent. An earlier version of this docstring credited the KEY for that
+        damage on the strength of a pinned measurement; the improper rows were the whole
+        cause, and the pinned number outlived the claim it supported. Quantities belong in
+        the harness output or in findings, not here -- see prior_smoke's
+        improper_rows_ungrouped and group_rigid_angle, which re-measure this on every run.
         """
         from collections import defaultdict
         ti = np.asarray(self.spec.torsion_index)

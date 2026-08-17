@@ -206,7 +206,6 @@ z_calibration:
   freshness_half_life_steps: 300.0
   se2_floor: 0.25
   holdout_modulus: 8
-  enabled: false
 conditional_worst_quantile: 0.25
 protocol: unconditional_tb
 protocols:
@@ -245,7 +244,6 @@ protocols:
       flags:
         update_log_z: true
         buffers_active: true
-        z_calibration: true
       on_enter:
       - rebuild_prior_by_churn
       - bootstrap_z:train_conditioner

@@ -288,14 +288,22 @@ def _validate_defaults(reg: dict) -> None:
     # meant this validator raised unless the registry set a key the trainer
     # refuses at load -- a schema the two halves could not both satisfy. See the
     # note at defaults.overrides in registry.yaml for what that costs a window.
-    for path, want in ((('z_calibration', 'enabled'), False),):
-        node: Any = ov
-        for k in path:
-            if not isinstance(node, dict) or k not in node:
-                raise RegistryError(f'defaults.overrides must set {".".join(path)}')
-            node = node[k]
-        if node is not want:
-            raise RegistryError(f'defaults.overrides.{".".join(path)} must be {want}')
+    # z_calibration USED TO BE REQUIRED HERE and no longer can be, for exactly
+    # the reason ray_calibration could not: state 6 moved the switch onto the
+    # stage (`flags: {z_calibration: true}`), and an override cannot reach a
+    # stage declaration. Requiring the old key made the registry demand a
+    # setting nothing reads -- which is worse than demanding nothing, because it
+    # reads as neutralised. It voided a100_stab_aug16's first floor set.
+    #
+    # The requirement INVERTS: the old spelling is now refused, so a registry
+    # that quietly reintroduces it fails here instead of at analysis time.
+    if 'enabled' in (ov.get('z_calibration') or {}):
+        raise RegistryError(
+            'defaults.overrides.z_calibration.enabled is a pre-state-6 spelling. '
+            'z_calibration is a STAGE FLAG now, unreachable by override, so this key '
+            'is inert and makes the benchmark read as z-cal-free while every arm '
+            'calibrates Z inside the measurement window. Neutralising it belongs to '
+            'the workload generator; remove this key.')
     for key, want in (('checkpoint_read_only', True),
                       ('grow_batch_size', False),
                       ('auto_batch_throughput_opt', False),

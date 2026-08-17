@@ -113,7 +113,7 @@ class LRController:
         self._calibrations = 0
         self._last = {}               # last calibration's decision, for the log
         self._plateau_last = {}       # last plateau decision, same purpose
-        self._hyper_last = {}         # last hypergradient decision, same purpose
+        self._hyper_win = None        # hypergradient readings since the last report() drain
         self._hypergrads = 0
         self._plateau_cuts = 0
         self._restarts = 0
@@ -313,6 +313,16 @@ class LRController:
         self._apply_lrs(st)
         print(f"lr_ctrl: plateau cut -> peak_scale {st['peak_scale']:.4g}")
 
+    def _hyper_window(self):
+        """The per-reporting-period accumulator `_emit` publishes and `report`
+        drains. Lazily created, so `None` means UNAMBIGUOUSLY 'this sensor has
+        not fired since the last report' -- which is the whole point; see _emit."""
+        w = self._hyper_win
+        if w is None:
+            w = self._hyper_win = {'n': 0, 'cos_sum': 0.0, 'log_applied': 0.0,
+                                   'nonfinite': 0, 'status': 'clean'}
+        return w
+
     def on_hypergradient(self, cos: float, beta: float, beta_down: float = None,
                          cos_target: float = 0.0):
         """
@@ -352,7 +362,7 @@ class LRController:
         is therefore per-stage config with no default that claims universality.
         """
         st = self._state()
-        self._hyper_last = {'cos': float(cos), 'applied': 0.0, 'status': 'clean'}
+        w = self._hyper_window()
         # Held through warmup for exactly the reason `on_calibration` and
         # `on_plateau` are: the envelope is deliberately ramping the rate, so a
         # cosine measured through that suppression is not evidence about the
@@ -366,7 +376,9 @@ class LRController:
         # ray and plateau still hold: both score a LOSS, which a deliberate ramp
         # really does distort. This one scores no loss.
         if not (isinstance(cos, float) and math.isfinite(cos)):
-            self._hyper_last['status'] = 'nonfinite'
+            w['n'] += 1
+            w['nonfinite'] += 1
+            w['status'] = 'nonfinite'
             return
         # STEER TO cos == cos_target, NOT to cos == 0. The fixed point of
         # peak_scale *= exp(beta*cos) is cos == 0, which is the one-step optimum --
@@ -386,7 +398,15 @@ class LRController:
             hi = min(hi, ceiling)
         before = float(st['peak_scale'])
         st['peak_scale'] = max(lo, min(hi, before * math.exp(b * err)))
-        self._hyper_last['applied'] = st['peak_scale'] / before if before else 1.0
+        w['n'] += 1
+        w['cos_sum'] += float(cos)
+        # ACCUMULATED IN LOG SPACE, because the actuator is multiplicative: the
+        # period's total move is the product of its per-firing multipliers, and
+        # summing the ratios instead would report a period that halved then
+        # doubled as having moved by 2.5x rather than 1.0.
+        if before > 0 and st['peak_scale'] > 0:
+            w['log_applied'] += math.log(st['peak_scale'] / before)
+        w['status'] = 'clean'
         self._hypergrads = getattr(self, '_hypergrads', 0) + 1
         # ANNOUNCE THE FIRST FIRE, once, the way the other two sensors announce
         # their actions. A per-step sensor must not print per step, but a sensor
@@ -680,16 +700,53 @@ class LRController:
         # that is never RUNNING must be distinguishable from the log alone. This
         # sensor has no equivalent of `raycal/status` to fall back on, so without
         # a counter a misconfigured stage would look identical to a quiet one.
-        hl = getattr(self, '_hyper_last', None)
-        if hl:
-            self._report['lr_ctrl/hyper_cos'] = float(hl.get('cos', 0.0))
-            self._report['lr_ctrl/hyper_applied'] = float(hl.get('applied', 0.0))
+        #
+        # ONE-SHOT, DRAINED BY report(). A reporting period in which the sensor
+        # did not fire publishes NO cos/applied/status AT ALL, rather than
+        # republishing the last live reading. Measured 2026-08-17 on the qm9
+        # conditional route: after the fused branch began returning non-finite
+        # gradients at step 902 -- which returns from train.py::step_loss BEFORE
+        # the sensor block, so nothing fires -- run `liveservo` emitted the same
+        # cos (-0.267178) for 327 consecutive rows with `hypergrads` frozen at
+        # 379 and `peak_scale` frozen at 2.0929. A dead sensor read exactly like a
+        # working one, and any statistic taken off the channel was then an average
+        # over a repeated constant. `hypergrads` is deliberately still published
+        # once the sensor has EVER fired, precisely so a flat counter beside an
+        # absent cos reads as 'stopped' rather than 'never configured'.
+        #
+        # AND THE READING IS THE PERIOD, NOT THE LAST FIRING. peak_scale is the
+        # integral of every firing in the period, but this channel used to carry
+        # only the last one. With fused_grad_accum_min_samples above the batch
+        # size the optimizer -- and so the sensor -- steps once per several
+        # step_ind, giving ~5 firings per reported row, so the published cos was
+        # one sample of five while the actuator moved on all five. hyper_cos is
+        # now the MEAN over the period and hyper_applied the TOTAL multiplier, so
+        # the sensor channel and the actuator channel describe the same steps.
+        w = self._hyper_win
+        if self._hypergrads or w is not None:
+            self._report['lr_ctrl/hypergrads'] = float(self._hypergrads)
+        if w is not None and w['n']:
+            live = w['n'] - w['nonfinite']
+            if live:
+                self._report['lr_ctrl/hyper_cos'] = w['cos_sum'] / live
+            self._report['lr_ctrl/hyper_applied'] = math.exp(w['log_applied'])
             self._report['lr_ctrl/hyper_status'] = float(
-                self._HYPER_STATUS.get(hl.get('status'), -1))
-            self._report['lr_ctrl/hypergrads'] = float(getattr(self, '_hypergrads', 0))
+                self._HYPER_STATUS.get(w['status'], -1))
+            # the denominator behind the two averages above, so a period built
+            # from one firing and one built from ten are not read alike
+            self._report['lr_ctrl/hyper_n'] = float(w['n'])
         ceiling = self._current_ceiling()
         if ceiling is not None:
             self._report['lr_ctrl/peak_ceiling'] = ceiling
 
     def report(self):
-        return dict(self._report)
+        """The metrics for one reporting period. TAKING THE REPORT ENDS THE
+        PERIOD: the hypergradient accumulator is drained here, so the next report
+        describes what that period did or says nothing. Same one-shot discipline
+        train.py uses for `_grad_nonfinite`. The caller must therefore be the
+        reporter -- train.py::ten_step_reporting, which runs immediately after
+        step_lr_schedule() so `_emit` has already published this period's
+        reading. A second caller would silently eat readings."""
+        out = dict(self._report)
+        self._hyper_win = None
+        return out

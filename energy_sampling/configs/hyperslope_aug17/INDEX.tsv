@@ -1,0 +1,9 @@
+arm	lr	half_life_visits	steps	seed	config
+lr5e6	5e-06	7	2000	12345	lr5e6.yaml
+lr12e6	1.25e-05	7	2000	12345	lr12e6.yaml
+lr3e5	3e-05	7	2000	12345	lr3e5.yaml
+lr8e5	8e-05	7	2000	12345	lr8e5.yaml
+lr2e4	0.0002	7	2000	12345	lr2e4.yaml
+lr5e4	0.0005	7	2000	12345	lr5e4.yaml
+hl28	8e-05	28	2000	12345	hl28.yaml
+hl28b	0.0002	28	2000	12345	hl28b.yaml

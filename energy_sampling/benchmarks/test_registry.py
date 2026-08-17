@@ -107,25 +107,81 @@ def test_the_standard_a100_suite_exists_and_is_named(reg):
     assert all(b['hardware']['class'] in ('a100', 'both') for b in s)
 
 
-def test_no_floor_is_measured_yet(reg):
+#: Benchmarks whose floor has been measured and recorded. The list is the
+#: deliverable's honest state: everything NOT here still cannot support a
+#: comparison. Add an id only when `noise_floor.measured` is filled from real
+#: repeat launches -- never to make the suite green.
+#
+# EMPTY AGAIN as of 2026-08-17. Both entries were briefly populated and then
+# RETRACTED the same day: those ten launches ran with z_calibration on, because
+# the registry disabled it through a key state 6 had turned into a stage flag.
+# See the retraction notes in registry.yaml. The arms must be re-run.
+MEASURED_FLOORS: set[str] = set()
+
+
+def test_floor_coverage_matches_the_recorded_state(reg):
     """
-    Guards the honest state of the deliverable. This test is EXPECTED TO FAIL and be
-    updated once floors are measured -- that failure is the reminder that the
-    numbers arrived. It must never be deleted to make the suite green.
+    Guards the honest state of the deliverable, in BOTH directions.
+
+    This replaces `test_no_floor_is_measured_yet`, which asserted that no floor
+    existed anywhere and was designed to fail the moment the first one landed
+    (benchmarks.md section 3 says so explicitly). That happened on 2026-08-17.
+    The tripwire is kept rather than deleted, but inverted: it now pins exactly
+    WHICH benchmarks have floors, so a floor appearing without being recorded
+    here fails, and a floor silently disappearing from the registry fails too.
     """
-    unmeasured = [b['id'] for b in reg['benchmarks'] if b['noise_floor']['measured'] is None]
-    assert len(unmeasured) == len(reg['benchmarks']), (
-        f'a floor has been measured for {set(b["id"] for b in reg["benchmarks"]) - set(unmeasured)}; '
-        f'record it and update this test')
+    measured = {b['id'] for b in reg['benchmarks'] if b['noise_floor']['measured']}
+    assert measured == MEASURED_FLOORS, (
+        f'floor coverage moved. newly measured: {sorted(measured - MEASURED_FLOORS)}; '
+        f'expected but missing: {sorted(MEASURED_FLOORS - measured)}. Update '
+        f'MEASURED_FLOORS deliberately -- it is the record of what can support a '
+        f'comparison.')
+
+
+def test_most_floors_are_still_unmeasured(reg):
+    """The complement, stated so the gap stays visible: 11 of 13 benchmarks
+    still cannot support a comparison, and `floor_for` refuses on every one."""
+    unmeasured = [b['id'] for b in reg['benchmarks'] if not b['noise_floor']['measured']]
+    assert len(unmeasured) == len(reg['benchmarks']) - len(MEASURED_FLOORS)
+    for bid in unmeasured:
+        with pytest.raises(R.RegistryError):
+            R.floor_for(bid, R.benchmark(bid, reg)['metrics']['primary'][0], reg)
+
+
+@pytest.mark.skipif(not MEASURED_FLOORS, reason='no floor is currently recorded')
+def test_a_measured_floor_covers_every_primary_metric(reg):
+    """`_validate_floor` enforces coverage at load; this asserts the recorded
+    numbers are actually retrievable and positive, which a null-filled
+    `per_metric` block would pass validation but fail here."""
+    for bid in sorted(MEASURED_FLOORS):
+        for metric in R.benchmark(bid, reg)['metrics']['primary']:
+            floor = R.floor_for(bid, metric, reg)
+            assert 0.0 < floor < 1.0, f'{bid}/{metric}: implausible floor {floor}'
+
+
+@pytest.mark.skipif(not MEASURED_FLOORS, reason='no floor is currently recorded')
+def test_floor_for_refuses_a_metric_the_floor_does_not_cover(reg):
+    """A recorded floor is not a blanket licence: asking for a metric outside
+    `per_metric` must refuse rather than fall back to another metric's number."""
+    bid = sorted(MEASURED_FLOORS)[0]
+    covered = set(R.benchmark(bid, reg)['noise_floor']['measured']['per_metric'])
+    uncovered = next(m for m in R.benchmark(bid, reg)['metrics']['secondary']
+                     if m not in covered)
+    with pytest.raises(R.RegistryError) as e:
+        R.floor_for(bid, uncovered, reg)
+    assert 'not for' in str(e.value)
 
 
 # ----------------------------------------------------------------- helpers --
 
 def test_resolved_overrides_are_deep_merged(reg):
     ov = R.resolved_overrides('toy-latentgauss-fused-uncond', reg)
-    assert ov['z_calibration']['enabled'] is False      # from defaults
+    assert ov['integrator']['T'] == 10                   # nested, from the benchmark
+    assert ov['figs_period'] == 100000000                # from defaults
     assert ov['controller']['refresh_every'] == 1000000  # from the benchmark
     assert ov['checkpoint_read_only'] is True
+    # the deep merge must not have resurrected the retired switch
+    assert 'enabled' not in (ov.get('z_calibration') or {})
 
 
 def test_epochs_is_absolute_not_a_count(reg):
@@ -149,8 +205,9 @@ def test_exceeds_floor_is_symmetric_and_has_no_denominator():
 
 
 def test_floor_for_refuses_an_unmeasured_floor(reg):
+    assert 'mace-fused-uncond' not in MEASURED_FLOORS, 'pick another unmeasured benchmark'
     with pytest.raises(R.RegistryError) as e:
-        R.floor_for('elj-fused-uncond', 'samples_per_sec', reg)
+        R.floor_for('mace-fused-uncond', 'samples_per_sec', reg)
     assert 'has NOT been measured' in str(e.value)
 
 
@@ -309,9 +366,17 @@ def test_rejects_zero_warmup(mut):
     _must_raise(mut, 'warmup_steps must be >= 1')
 
 
-def test_rejects_defaults_that_leave_z_calibration_on(mut):
-    mut['defaults']['overrides']['z_calibration']['enabled'] = True
-    _must_raise(mut, 'must be False')
+def test_rejects_the_pre_state6_z_calibration_spelling(mut):
+    """INVERTED 2026-08-17. This used to assert the registry REQUIRED
+    `defaults.overrides.z_calibration.enabled: false`. State 6 made
+    z_calibration a stage flag, so that key became inert -- and the requirement
+    became actively harmful, because a registry that sets it reads as
+    z-cal-free while every arm calibrates Z inside its measurement window. That
+    is what voided a100_stab_aug16's first floor set. The key is now REFUSED."""
+    mut['defaults']['overrides']['z_calibration'] = {'enabled': False}
+    _must_raise(mut, 'pre-state-6 spelling')
+    mut['defaults']['overrides']['z_calibration'] = {'enabled': True}
+    _must_raise(mut, 'pre-state-6 spelling')
 
 
 def test_rejects_defaults_that_leave_the_runaway_guard_armed(mut):

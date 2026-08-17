@@ -6,7 +6,7 @@
 #SBATCH --tasks-per-node=1
 #SBATCH --mail-user=mjakilgour@gmail.com
 #SBATCH --mail-type=END,FAIL
-#SBATCH --array=0-9
+#SBATCH --array=0-19
 #SBATCH --account=torch_pr_226_chemistry
 #SBATCH --job-name=a100stab_wave2_floors
 #SBATCH --output=/scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/configs/a100_stab_aug16/joblogs/%x_%A_%a.out

@@ -1,0 +1,17 @@
+hyperslope_aug17: 7 arms -> lr5e6 lr12e6 lr3e5 lr8e5 lr2e4 lr5e4 hl28
+start 15:06:28
+=== lr5e6  15:06:28  -> /c/Users/mikem/Projects/mxt_gfn/gfn_diffusion/energy_sampling/configs/hyperslope_aug17/logs/lr5e6.log
+    exit=0  0 non-finite steps  ok
+=== lr12e6  15:23:30  -> /c/Users/mikem/Projects/mxt_gfn/gfn_diffusion/energy_sampling/configs/hyperslope_aug17/logs/lr12e6.log
+    exit=0  0 non-finite steps  ok
+=== lr3e5  15:40:45  -> /c/Users/mikem/Projects/mxt_gfn/gfn_diffusion/energy_sampling/configs/hyperslope_aug17/logs/lr3e5.log
+    exit=0  0 non-finite steps  ok
+=== lr8e5  15:58:01  -> /c/Users/mikem/Projects/mxt_gfn/gfn_diffusion/energy_sampling/configs/hyperslope_aug17/logs/lr8e5.log
+    exit=0  0 non-finite steps  ok
+=== lr2e4  16:15:59  -> /c/Users/mikem/Projects/mxt_gfn/gfn_diffusion/energy_sampling/configs/hyperslope_aug17/logs/lr2e4.log
+    exit=1  50 non-finite steps  Traceback
+=== lr5e4  16:30:43  -> /c/Users/mikem/Projects/mxt_gfn/gfn_diffusion/energy_sampling/configs/hyperslope_aug17/logs/lr5e4.log
+    exit=1  50 non-finite steps  Traceback
+=== hl28  16:34:38  -> /c/Users/mikem/Projects/mxt_gfn/gfn_diffusion/energy_sampling/configs/hyperslope_aug17/logs/hl28.log
+    exit=0  0 non-finite steps  ok
+done 16:50:32

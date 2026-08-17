@@ -343,38 +343,65 @@ def test_the_rule_abstains_when_periodic_centroids_is_off(canonical):
 # (docs/design/next_battery.md 1.1a and 1.3)
 # ---------------------------------------------------------------------------
 
+#: the term these tests edit when the stage they target ships no exit block.
+#: `fwd/logw_std_within` is the one metric MEASURED_METRIC_RANGES covers, so it is
+#: the only one that can exercise the rule at all.
+_LOGW_TERM = {'metric': 'fwd/logw_std_within', 'below': 6.0}
+
+
 def _exit_term(canonical, protocol, stage_index, term_index, **keys):
     """The canonical config with one exit term of one protocol edited in place,
     and that protocol selected. Real stages, real metrics -- a synthetic exit
-    block would not prove the rule fires on a config anyone would write."""
+    block would not prove the rule fires on a config anyone would write.
+
+    A STAGE WITH NO EXIT BLOCK GETS ONE. `var_conditioning` used to ship
+    `fwd/logw_std_within < 6.0`, an unreachable bar these tests were written
+    against; it has since been deleted from the canonical config, because
+    next_battery.md 1.1 concluded the stage is terminal by design. Indexing into
+    an absent block just raises KeyError, which reads as a broken suite rather
+    than as the config improving. The term is installed instead, so these tests
+    keep testing the RULE -- which still has to fire on any config that declares
+    such a bar -- and stop depending on the canonical config carrying a fault."""
     cfg = copy.deepcopy(canonical)
     cfg['protocol'] = protocol
-    cfg['protocols'][protocol]['stages'][stage_index]['exit'][term_index].update(keys)
+    stage = cfg['protocols'][protocol]['stages'][stage_index]
+    if not stage.get('exit'):
+        assert term_index == 0, 'only term 0 can be installed into an empty exit block'
+        stage['exit'] = [copy.deepcopy(_LOGW_TERM)]
+    stage['exit'][term_index].update(keys)
     return cfg
 
 
-def test_the_canonical_conditional_route_ships_an_unreachable_exit_bar(canonical):
-    """THE MEASURED CASE, on the real config, via the ONE-WORD route switch the
-    protocol library exists to make cheap.
-
-    `conditional_vargrad`'s var_conditioning stage declares
+def test_the_unreachable_exit_bar_fires_wherever_it_is_declared(canonical):
+    """THE MEASURED CASE. `var_conditioning` used to declare
     `fwd/logw_std_within < 6.0`. Measured minimum over 4,348 ticks and 6 arms of
-    qm9anchor_aug14 is 17.1 -- no arm came within 2.9x of it. next_battery.md
-    1.1 concludes the block is VESTIGIAL (the stage is terminal by design)
-    rather than mis-set, which does not change what the rule must do: an exit
-    condition that cannot fire has to be visible at load, whether the fix is a
-    higher bar or a deleted block.
+    qm9anchor_aug14 is 17.1 -- no arm came within 2.9x of it. next_battery.md 1.1
+    concluded the block was VESTIGIAL (the stage is terminal by design) rather
+    than mis-set, and it has since been deleted from the canonical config.
+
+    THE RULE STILL HAS TO FIRE, which is why this test outlived the bar it was
+    written for: the fault it catches is a property of any config that declares
+    such a term, not of mk_dev. Deleting the test along with the bar would have
+    left the next config free to reintroduce it silently.
 
     REPORTED, NOT REFUSED. 17.1 was measured on runs with five railed controls,
     and the configs written to unrail them are exactly the ones that should be
-    allowed to aim below it. A rule built on evidence blocks the next
+    allowed to aim under it. A rule built on evidence blocks the next
     experiment; this one must never be the reason a run will not start."""
-    cfg = copy.deepcopy(canonical)
-    cfg['protocol'] = 'conditional_vargrad'
+    cfg = _exit_term(canonical, 'conditional_vargrad', 1, 0, below=6.0)
     assert _fires(cfg, 'exit_bar_is_within_measured_range', severity=BASELINE)
     assert errors(cfg) == [], (
         'a measured floor is evidence, not a config contradiction -- it must '
         'never block a run from starting')
+
+
+def test_the_canonical_config_no_longer_ships_that_bar(canonical):
+    """The other half, and the one that would have caught the drift: selecting
+    the conditional route must be CLEAN on this rule. If a future edit puts an
+    unreachable bar back into either protocol, this fails."""
+    cfg = copy.deepcopy(canonical)
+    cfg['protocol'] = 'conditional_vargrad'
+    assert not _fires(cfg, 'exit_bar_is_within_measured_range')
 
 
 def test_a_bar_above_the_measured_floor_but_inside_sigma_is_a_baseline(canonical):
@@ -632,7 +659,11 @@ def test_bwd_vargrad_fires_only_when_BOTH_group_sources_are_absent(canonical):
     """The backward condition is a DISJUNCTION, and it must stay one: aug14 and
     aug11 satisfy it with repeats 2 at condition_block_m 1, aug13 with
     condition_block_m 2 at repeats 1. A conjunction rejects two configs that ran."""
+    # SET IT ON THE STAGE, not just the base. Since state 6 condition_block_m is
+    # a loss coefficient, and `var_conditioning` overrides it to 2.0 -- so a base
+    # of 1 is shadowed and this arm was silently testing the passing case.
     both_absent = _conditional(canonical, bwd_loss_coeffs__condition_block_m=1)
+    _vg_stage(both_absent)['loss_coeffs']['bwd']['condition_block_m'] = 1.0
     _vg_stage(both_absent)['loss_coeffs']['bwd']['repeats'] = 1.0
     vs = _fired(both_absent, 'vargrad_needs_groups')
     assert len(vs) == 1 and vs[0].severity == ERROR

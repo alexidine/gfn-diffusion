@@ -21,8 +21,17 @@ defaults:
     max_step_seconds: 0
     batch_knee_recheck_steps: 0
     figs_period: 100000000
-    z_calibration:
-      enabled: false
+    # NO z_calibration ENTRY, and none is possible -- the same story as
+    # ray_calibration below, and it cost a retracted floor to learn twice.
+    # `z_calibration.enabled` was the switch until state 6 made it a STAGE FLAG
+    # (`flags: {z_calibration: true}`). An override cannot reach a stage
+    # declaration: stage lists merge WHOLESALE, so a patch would have to restate
+    # the whole protocol. Setting the old key here is worse than useless -- it
+    # reads as neutralised while every arm calibrates Z inside the measurement
+    # window, which is exactly what voided a100_stab_aug16's first floor set.
+    # Neutralising it is the WORKLOAD generator's job (see
+    # configs/a100_stab_aug16/make.py::strip_z_calibration), and every
+    # benchmark's liveness list requires the absence to be shown.
     # NO ray_calibration ENTRY, and none is possible. The ray probe is the other
     # piece of periodic work whose period is not the report period, but it now
     # arms iff some stage declares `lr_sensor: {kind: ray}` -- there is no flag
@@ -581,6 +590,28 @@ benchmarks:
       seed_policy: fixed
       run_statistic: median
       dispersion: relative_span
+      # RETRACTED 2026-08-17, same day it was recorded. The five launches
+      # (a100_stab_aug16_elj_r0..r4) ran with Z-CALIBRATION ON, so they did not
+      # execute this benchmark's declared work quantity.
+      #
+      # HOW: `defaults.overrides` below disabled z_calibration through
+      # `z_calibration.enabled`, and state 6 turned that switch into a STAGE FLAG
+      # (`flags: {z_calibration: true}`). The override kept setting a key nothing
+      # reads, the equilibration stage kept its flag, and the arms calibrated Z
+      # inside the measurement window. Section 2 of benchmarks.md is explicit
+      # about why that voids the numbers: the sidecar rollouts run INSIDE the
+      # step-timing window while `_throughput['samples']` is charged only
+      # `attempted_batch`, so `samples_per_sec` is wrong by a moving factor and
+      # `train_step_time` carries work this benchmark does not define.
+      #
+      # This is the SECOND time a neutralisation here died when its key moved --
+      # see the ray_calibration note at defaults.overrides. Same lesson: an
+      # override cannot reach a stage declaration, so neutralising a stage flag
+      # is the WORKLOAD generator's job, not this file's.
+      #
+      # The retracted values, for the record only -- do not compare against them:
+      #   train_step_time 0.7838 (span 3.0%) | samples_per_sec 1284 (10.7%)
+      #   energy/frac_of_step 0.3725 (5.8%)  | window steps 2100-2500, batch flat
       measured: null
     correctness:
       reference: tier_c_repeat_spread
@@ -740,6 +771,14 @@ benchmarks:
       seed_policy: fixed
       run_statistic: median
       dispersion: relative_span
+      # RETRACTED 2026-08-17 for the same reason as elj-fused-uncond: the five
+      # launches (a100_stab_aug16_uma_r0..r4) ran with z_calibration ON, because
+      # `defaults.overrides` disabled it through a key state 6 turned into a
+      # stage flag. See that entry for the mechanism.
+      #
+      # Retracted values, for the record only -- do not compare against them:
+      #   energy/ms_per_sample 2.294 (5.0%) | train_step_time 0.6075 (8.7%)
+      #   samples_per_sec 123 (12.0%)       | energy/frac_of_step 0.465 (8.9%)
       measured: null
     correctness:
       reference: control_comparison

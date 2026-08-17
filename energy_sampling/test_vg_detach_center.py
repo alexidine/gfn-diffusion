@@ -43,7 +43,10 @@ for p in (_here, os.path.dirname(_here),
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from gflownet_losses import condition_grouped_empirical_z  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from gflownet_losses import (condition_grouped_empirical_z, vg_lb,  # noqa: E402
+                             vg_lme)
 
 TIGHT = 1e-9
 torch.manual_seed(0)
@@ -191,6 +194,59 @@ def test_mutations():
     return ok
 
 
+# --------------------------------------------------------------------------
+# 6. THE Z-SIDECAR INVARIANT: emp_z may move Z and ONLY Z.
+#
+# The policy must never differentiate through an empirical Z outside the
+# TB-family terms. emp_z regresses log_Z_learned onto a group estimate built
+# from log w, so if that estimate stays live the huber has BOTH arguments in
+# the graph and the sidecar becomes a second policy loss. Asserted on all three
+# producers, and mutation-checked by re-introducing the live target.
+# --------------------------------------------------------------------------
+def _emp_z_grads(target, log_pf, log_Z_learned, beta=1.0):
+    """(|d emp_z / d log_pf|, |d emp_z / d log_Z_learned|)."""
+    loss = beta * F.smooth_l1_loss(target, log_Z_learned, reduction='none', beta=beta)
+    g_pf, g_z = torch.autograd.grad(loss.sum(), [log_pf, log_Z_learned],
+                                    retain_graph=True, allow_unused=True)
+    return (0.0 if g_pf is None else g_pf.abs().sum().item(),
+            0.0 if g_z is None else g_z.abs().sum().item())
+
+
+def test_emp_z_touches_z_only():
+    print("\n[6] emp_z invariant -- the Z sidecar may not reach the policy")
+    ok = True
+    cond = torch.tensor([0, 0, 1, 1])
+    vals = [0.4, -0.3, 12.0, -7.0]          # spread >> beta so the knee bites
+    zeros = torch.zeros(4, dtype=torch.double)
+    gfn = SimpleNamespace(conditional=True)
+    coeffs = SimpleNamespace(vg_lb=1.0, vg_lme=0.0)
+
+    producers = {
+        'condition_grouped': lambda pf: condition_grouped_empirical_z(
+            zeros, pf, zeros, cond, lme=False, beta=1.0, detach_center=False)[0],
+        'vg_lb': lambda pf: vg_lb(gfn, zeros, pf, zeros, coeffs, 2, beta=1.0)[0],
+        'vg_lme': lambda pf: vg_lme(gfn, zeros, pf, zeros, 2, beta=1.0)[0],
+    }
+    for name, produce in producers.items():
+        log_pf = _leaf(vals)
+        target = produce(log_pf)
+        log_Z_learned = _leaf([0.0] * target.numel())
+        g_pf, g_z = _emp_z_grads(target, log_pf, log_Z_learned)
+        ok &= _report(f"{name}: no policy gradient", g_pf == 0.0, f"|d/d log_pf| {g_pf:.3e}")
+        # the term must still TRAIN Z, or the fix has silently disabled emp_z
+        ok &= _report(f"{name}: still trains Z", g_z > 0.0, f"|d/d log_Z| {g_z:.3e}")
+
+    # mutation: put the live target back and require the guard to FIRE
+    log_pf = _leaf(vals)
+    log_ratio = zeros + zeros - log_pf
+    live_target = log_ratio.view(-1, 2).mean(dim=1, keepdim=True).expand(-1, 2).reshape(-1)
+    log_Z_learned = _leaf([0.0] * 4)
+    g_pf, _ = _emp_z_grads(live_target, log_pf, log_Z_learned)
+    ok &= _report("mutation (live target) is CAUGHT", g_pf > 0.0,
+                  f"|d/d log_pf| {g_pf:.3e} -- the test can see the defect")
+    return ok
+
+
 if __name__ == '__main__':
     results = [
         test_quadratic_control(),
@@ -198,6 +254,7 @@ if __name__ == '__main__':
         test_triples_differ(),
         test_difference_is_the_mle_leftover(),
         test_mutations(),
+        test_emp_z_touches_z_only(),
     ]
     print("\n" + ("ALL PASS" if all(results) else "FAILURES ABOVE"))
     sys.exit(0 if all(results) else 1)
