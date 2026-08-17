@@ -7,6 +7,80 @@ Newest first.
 
 ---
 
+## F-041 · The gradient-geometry diagnostic is fatal under `torch.compile`, and no local run can ever see it · `MECHANISM`
+
+*2026-08-16. First cluster job of `a100_stab_aug16` (arm `f3_mipcas_uma`), A100
+80 GB, UMA, batch 250, T=10, `unconditional_tb`, seed 12345.*
+
+**Scope:** any run with `compile_policy` resolving ON **and**
+`grad_geometry.enabled: true` — i.e. every cluster run spawned from `mk_dev` as
+it currently stands, on both routes, as soon as it reaches a fused stage.
+Confirmed on one job; the mechanism is not statistical.
+
+**What happened.** The run cleared MLE, transitioned at ~step 250, rebuilt the
+prior buffer by churn, engaged `equilibration` — and died at **step 320**, the
+first fused step on which the diagnostic armed (`every: 50`):
+
+```
+RuntimeError: This backward function was compiled with non-empty donated buffers
+which requires create_graph=False and retain_graph=False.
+```
+
+**Mechanism.** `_log_fused_gradient_geometry` takes one
+`torch.autograd.grad(..., retain_graph=True)` per active branch to read branch
+gradients without disturbing the real backward. AOTAutograd's *donated buffer*
+optimisation frees-and-reuses intermediates on the assumption that each compiled
+backward runs exactly once, and hard-raises on any re-entry. The exception
+propagates out of `fused_train_step` through `handle_train_epoch_error` (which
+re-raises anything that is not an OOM) and ends the job. A **diagnostic killed
+the run it was observing**, having produced no diagnosis.
+
+**Why every local shakeout passed.** `compile_policy: auto` resolves to
+Linux+CUDA only — inductor has no CUDA on native Windows — so the dev box runs
+eager, no AOTAutograd, no donated buffers, and this code path is *structurally
+unreachable* there. The same day's four local shakeout runs all crossed the same
+transition with the same diagnostic armed and none could have caught it. This is
+the concrete case for the standing rule that a local pass is not evidence about
+the cluster.
+
+**Fixed, in two places.**
+
+1. `maybe_compile_policy` sets `torch._functorch.config.donated_buffer = False`
+   whenever it enables compile. It must be there and not at the diagnostic: the
+   choice is baked in when AOTAutograd traces, so setting it after first forward
+   is too late. Cost is some activation-memory reuse.
+2. The probe now catches `RuntimeError`, **disables itself for the rest of the
+   run, says so loudly, and logs `fused_grad/disabled: 1.0`** — because a metric
+   that merely stops appearing reads as "the diagnostic looked and saw nothing
+   wrong". Training is untouched; the probe only reads gradients.
+
+Both halves are mutation-proven in `test_fused_grad_geometry.py`: removing
+either makes its test fail (verified 2026-08-16), and the guard test has a
+negative control asserting real geometry is still reported when nothing raises.
+
+**Unverified locally, by construction.** Neither fix can be exercised on this
+dev box, for exactly the reason the bug survived to the cluster: the tests pin
+the *source* (that `donated_buffer = False` is set at the compile site) and the
+*fallback* (that a raising probe disables instead of propagating). Whether
+donated-buffer-off is sufficient in this torch build is established by the next
+cluster run reaching step 320+ with `fused_grad/*` present and no
+`fused_grad/disabled`.
+
+**Two riders from the same log, both first-of-their-kind.**
+
+- **`compile_policy: auto` engages on the cluster** — "trunk (…) compiled
+  (default mode, lazy on first forward)". First direct confirmation; it had been
+  an open question.
+- **The loose MLE gate `{1.0, 0.5, 100}` fires on the A100**, at ~step 250 on
+  the unconditional UMA route, vindicating the same-day reversal away from a
+  stricter gate that had failed to fire in 3186 local steps.
+
+Also: the UMA init prior scan peaked at **26.7 GB** reserved at batch 250 — fine
+against 80 GB, fatal against the dev box's 16 GB, and worth carrying into any
+batch-ceiling estimate.
+
+---
+
 ## F-040 · F-039 fixed: the probe now decides before it draws, and the tier-C divergence goes to zero · `MECHANISM`
 
 *2026-08-16. Fixes F-039 (below), verified with the harness that found it.*

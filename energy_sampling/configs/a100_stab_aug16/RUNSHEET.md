@@ -9,6 +9,33 @@ extensions landed in `benchmarks/registry.yaml` the same day (13 benchmarks,
 **Nothing below is submitted yet. The total ask is ≈53 GPU-h central,
 ≈39–75 GPU-h bracketed (§5), split ≈6 (wave 1) + ≈8 (floors) + ≈39 (utilization).**
 
+> ### Wave-1 v1 aborted — resubmit required (2026-08-16)
+>
+> The first cluster job (`f3_mipcas_uma`) **died at step 320**, ~50 steps after
+> the transition, on the first armed `grad_geometry` step: the diagnostic's
+> `retain_graph=True` backward is illegal through an inductor-compiled trunk
+> (AOTAutograd donated buffers). **Full write-up: `docs/findings.md` F-041.**
+> It would have killed all five arms identically, and no local run could ever
+> have caught it — compile resolves OFF on Windows.
+>
+> **Fixed** in `train.py`: `maybe_compile_policy` now disables donated buffers,
+> and the probe self-disables loudly (logging `fused_grad/disabled`) instead of
+> propagating. Both mutation-proven in `test_fused_grad_geometry.py`; neither is
+> runnable locally, so **the next cluster run is the verification** — check that
+> arms pass step 320 with `fused_grad/*` present and no `fused_grad/disabled`.
+>
+> **Resubmit wave 1 after pulling the train.py fix.** No config change is needed
+> (the F arms keep the diagnostic on deliberately — proving it survives compile
+> is part of what they check); wave-2 benchmark arms now switch it off as
+> periodic work that does not belong inside a timing window.
+>
+> **What v1 already established, and does not need re-measuring:**
+> `compile_policy: auto` **engages** on the cluster (first confirmation); the
+> loose MLE gate fires at ~step 250 on the A100; the UMA init scan peaks at
+> **26.7 GB** at batch 250; and the mipcas UMA prior seeds **176,350** rows, so
+> that route's churn is a purge-down like `f1`, not a generate-up. Cost of the
+> aborted job: ~0.2 GPU-h.
+
 ---
 
 ## 1. The short-run / utilization-window tension — the decision
@@ -197,6 +224,8 @@ wandb; landing G1–G3 before the phase-6 submission remains the recommendation.
 | U2/U3 arms *also* cancelled | Threshold higher than the ~60 % working model, or the statistic isn't a mean | Highest-information outcome (row 2a): the proxy tracks the GPU but not the policy. Case 2 refused → case 3 with margin; escalate §0 email. |
 | `qm9split_*` not on the cluster mirror | — | `--preflight` catches it before submission. Mirror from `D:\crystal_datasets\conditional\priors\`, or swap the conditional groups to the qm9c100k anchor triple (changes problem identity — regenerate, don't hand-edit). |
 | f3/f4 hit the 6 h class limit before reaching transition + 400 steps | MLIP step time above the bracket top (~20 s/step fused) — itself the measurement | The truncated run still yields t and the transition; rerun that arm with the class limit raised in `TIME_CLASSES` (now informed by a measured t) so a deep-enough archive exists for wave 2. |
+| An arm logs `fused_grad/disabled: 1.0` | The donated-buffer fix was insufficient in this torch build; the probe's fallback caught it | **Not fatal — the run continues and stays usable.** Read the printed reason, then set `grad_geometry.enabled: false` on the F arms too and drop the diagnostic until it is reworked. Record against F-041. |
+| An arm dies again at the first armed fused step | The fix did not take (stale checkout on the cluster?) | Confirm the pulled `train.py` contains `donated_buffer = False` — `pytest test_fused_grad_geometry.py -k compile_site` asserts exactly that. |
 | f4 neighbour fast path NOT taken | `torch_cluster` missing in the container | MACE numbers are the *fallback* kernel's (~92× work) — label them so, fix the dependency, re-run f4 before B4. |
 
 ---

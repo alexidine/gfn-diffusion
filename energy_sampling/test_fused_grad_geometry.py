@@ -358,3 +358,71 @@ def test_absent_config_block_is_off_not_on():
     fake.fused_step_count = 0  # 0 % every == 0, the step most likely to fire
 
     assert fake._fused_grad_diag_armed() is False
+
+
+# ---------------------------------------------------------------------------
+# A DIAGNOSTIC MUST NOT KILL THE RUN. Measured on the cluster 2026-08-16
+# (a100_stab_aug16 f3): with the trunk torch.compiled, AOTAutograd's donated
+# buffers make the probe's retain_graph=True backward raise, and the exception
+# propagated out of fused_train_step and ended the job ~50 steps into the
+# stage. The compile-site fix (maybe_compile_policy sets donated_buffer=False)
+# is the real remedy; these two pin the fallback, because the next backend
+# optimisation that assumes one-backward-per-graph fails exactly here again.
+# ---------------------------------------------------------------------------
+
+def _raising_grad(*_a, **_k):
+    raise RuntimeError('This backward function was compiled with non-empty '
+                       'donated buffers which requires create_graph=False and '
+                       'retain_graph=False.')
+
+
+def test_probe_failure_disables_itself_instead_of_raising(model, monkeypatch):
+    a = _linear_loss([(model.shared, torch.tensor([1., 0., 0., 0.]))])
+    b = _linear_loss([(model.shared, torch.tensor([0., 1., 0., 0.]))])
+    fake = _FakeModeller(model)
+    fake.args = _Args(_Cfg(enabled=True, every=10))
+    fake.fused_step_count = 10
+    assert fake._fused_grad_diag_armed() is True, 'precondition: armed'
+
+    monkeypatch.setattr(torch.autograd, 'grad', _raising_grad)
+    sub_losses = {'a': (a, {}, True), 'b': (b, {}, True)}
+
+    # must NOT raise -- this is the whole point
+    fake._log_fused_gradient_geometry(sub_losses, {'a': 1.0, 'b': 1.0}, 2.0)
+
+    # ...and the failure must be VISIBLE, not an absent metric that reads as
+    # "the diagnostic looked and saw nothing wrong"
+    assert fake._fused_grad_geom_report == {'fused_grad/disabled': 1.0}
+    # ...and it must not retry every armed step for the rest of the run
+    assert fake._fused_grad_diag_armed() is False
+
+
+def test_the_guard_can_fail(model):
+    """Negative control: without a raising probe the same call reports real
+    geometry, so the test above is not passing because nothing ran."""
+    a = _linear_loss([(model.shared, torch.tensor([1., 0., 0., 0.]))])
+    b = _linear_loss([(model.shared, torch.tensor([0., 1., 0., 0.]))])
+    fake = _FakeModeller(model)
+    fake.args = _Args(_Cfg(enabled=True, every=10))
+    fake.fused_step_count = 10
+
+    fake._log_fused_gradient_geometry({'a': (a, {}, True), 'b': (b, {}, True)},
+                                      {'a': 1.0, 'b': 1.0}, 2.0)
+
+    assert 'fused_grad/disabled' not in fake._fused_grad_geom_report
+    assert fake._fused_grad_geom_report['fused_grad/cos_a_b'] == pytest.approx(0.0)
+    assert fake._fused_grad_diag_armed() is True
+
+
+def test_compile_site_turns_donated_buffers_off():
+    """The real fix, asserted at its source: a second backward through a
+    compiled graph is only legal with donated buffers off, and the decision is
+    baked in when AOTAutograd traces -- so it must be set BEFORE first forward,
+    in maybe_compile_policy, and cannot be moved to the diagnostic."""
+    import inspect
+    src = inspect.getsource(train.Modeller.maybe_compile_policy)
+    assert 'donated_buffer = False' in src, (
+        'maybe_compile_policy no longer disables donated buffers -- with the '
+        'trunk compiled, the first armed grad_geometry step raises and (absent '
+        'the guard above) kills the run. Cluster-only: compile_policy auto '
+        'resolves OFF on Windows, so no local run can catch this.')

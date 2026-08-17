@@ -271,6 +271,24 @@ def pin_warm(cfg, archive, prior):
     return cfg                               # from anchors (train.py warns)
 
 
+def strip_grad_geometry(cfg):
+    """Benchmark arms: turn the fused gradient-geometry diagnostic OFF.
+
+    It is periodic work whose period (50 fused steps) is not the report period,
+    and each firing costs one extra backward PER ACTIVE BRANCH -- three on a
+    fused stage. A 400-step window contains 8 firings, so it is a real, roughly
+    5-10% addition to the measured step cost that has nothing to do with the
+    training step being timed. Same argument as z_calibration and the ray probe
+    in registry.yaml's defaults.overrides; this key simply postdates that list.
+
+    Left ON for the wave-1 F arms: there it is production shape, and proving it
+    survives a compiled trunk is part of what those arms check (it did not --
+    2026-08-16, see maybe_compile_policy's donated-buffer note).
+    """
+    cfg.setdefault('grad_geometry', {})['enabled'] = False
+    return cfg
+
+
 def strip_lr_sensors(cfg):
     """Benchmark arms: drop every stage's lr_sensor and pin the four lr keys.
 
@@ -392,6 +410,7 @@ def build_wave2(base_uncond, base_cond, a):
         cfg = copy.deepcopy(base_cond if cond else base_uncond)
         apply_benchmark(cfg, bid)
         strip_lr_sensors(cfg)
+        strip_grad_geometry(cfg)
         if cond:
             make_var_conditioning_terminal(cfg)
             cfg['prior_path'] = CLUSTER_PRIOR_DIR + 'qm9split_prior.pt'
@@ -554,6 +573,8 @@ def validate(name, wave, kind, bid, cfg):
             assert cfg[k] == SEED_LR, f'{name}: benchmark arms pin {k} to the seed'
         assert cfg['z_calibration']['enabled'] is False, f'{name}: z_cal corrupts the denominator'
         assert cfg['max_step_seconds'] == 0, f'{name}: the runaway guard cuts the batch mid-window'
+        assert cfg['grad_geometry']['enabled'] is False, \
+            f'{name}: the grad-geometry probe adds a backward per branch inside the window'
     else:
         assert cfg['z_calibration']['enabled'] is True, f'{name}: F arms are production-shaped'
 

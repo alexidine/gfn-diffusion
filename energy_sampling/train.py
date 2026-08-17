@@ -1778,6 +1778,26 @@ class Modeller:
             # dynamo's default recompile limit of 8 -- give it headroom so the
             # top rungs don't silently fall back to eager
             _dynamo.config.cache_size_limit = 24
+            # DONATED BUFFERS MUST BE OFF WHILE ANYTHING TAKES A SECOND BACKWARD.
+            # AOTAutograd donates (frees-and-reuses) intermediate buffers on the
+            # assumption each compiled backward runs exactly once, and then
+            # HARD-RAISES on any backward with retain_graph=True/create_graph=True.
+            # _log_fused_gradient_geometry does exactly that -- one
+            # torch.autograd.grad(retain_graph=True) per active branch -- so with
+            # the trunk compiled, the first armed fused step kills the run:
+            #   "This backward function was compiled with non-empty donated
+            #    buffers which requires create_graph=False and retain_graph=False"
+            # Measured on the cluster 2026-08-16 (a100_stab_aug16 f3, step 320,
+            # ~50 steps after the phase-1->2 transition, i.e. the first armed
+            # fused step). It cannot reproduce on the dev box: compile_policy
+            # 'auto' resolves OFF on native Windows, so this whole failure mode
+            # is invisible locally and every local shakeout passed.
+            # Set here rather than at the diagnostic, because the choice is baked
+            # in when AOTAutograd traces -- flipping it after first forward is too
+            # late. Costs some activation-memory reuse; that is the price of
+            # keeping a diagnostic that reads gradients.
+            import torch._functorch.config as _functorch_config
+            _functorch_config.donated_buffer = False
             for model in (self.gfn_model, self.ema_model):
                 for name in trunk:
                     mod = getattr(model, name, None)
@@ -3009,6 +3029,8 @@ class Modeller:
         cfg = getattr(self.args, 'grad_geometry', None)
         if cfg is None or not getattr(cfg, 'enabled', False):
             return False
+        if getattr(self, '_fused_grad_geom_dead', False):
+            return False        # self-disabled after a failure; see the handler
         every = int(getattr(cfg, 'every', 0) or 0)
         return every > 0 and self.fused_step_count % every == 0
 
@@ -3067,8 +3089,32 @@ class Modeller:
 
         flat, touched = {}, {}
         for k in active:
-            raw = torch.autograd.grad(sub_losses[k][0], params,
-                                      retain_graph=True, allow_unused=True)
+            try:
+                raw = torch.autograd.grad(sub_losses[k][0], params,
+                                          retain_graph=True, allow_unused=True)
+            except RuntimeError as e:
+                # A DIAGNOSTIC MUST NEVER KILL A TRAINING RUN. This one reads a
+                # second backward through a possibly-compiled graph, which is a
+                # standing hazard: donated buffers are handled at the compile
+                # site above, but the next backend optimisation that assumes
+                # one-backward-per-graph would land here the same way -- 50
+                # steps into a stage, hours in, on the cluster only.
+                #
+                # DISABLED LOUDLY AND VISIBLY, not swallowed: the print says
+                # what died and why, and `fused_grad/disabled` is logged from
+                # here on, because a metric that merely STOPS APPEARING reads as
+                # "the diagnostic says nothing is wrong". Nothing else about the
+                # step changes -- the real fused backward downstream is
+                # untouched, and the run keeps its actual work.
+                self._fused_grad_geom_dead = True
+                self._fused_grad_geom_report = {'fused_grad/disabled': 1.0}
+                print(f"grad_geometry: DISABLED for the rest of this run -- the "
+                      f"branch-gradient probe raised on branch '{k}': {e}\n"
+                      f"  Training is unaffected (this reads gradients, it does not "
+                      f"write them). If the message mentions donated buffers, the "
+                      f"compiled trunk was built with donated_buffer on -- see "
+                      f"maybe_compile_policy.")
+                return
             touched[k] = torch.cat([
                 torch.full((p.numel(),), g is not None, dtype=torch.bool, device=p.device)
                 for g, p in zip(raw, params)])
