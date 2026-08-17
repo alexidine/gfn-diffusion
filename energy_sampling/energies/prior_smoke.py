@@ -889,7 +889,8 @@ def _t_eff(en, name, level, led, ff, pos, n, T, ff_choice):
     kb = ff.k_bond.clone()
     kb[torch.as_tensor(~sel, device=kb.device)] = 0.0
     masked = dataclasses.replace(ff, k_bond=kb)
-    _, comp = intramolecular_energy(None, pos, masked, components=True)
+    tree, _ = en._batch(n)
+    _, comp = intramolecular_energy(tree, pos, masked, components=True)
     n_sel = int(sel.sum()) // n
     val = 2.0 * float(comp['bond'].mean()) / (n_sel * T)
     led.note('T_eff_n_bonds', name, level, n_sel)
@@ -977,7 +978,7 @@ def _prior_leg(en, name, level, led, prior, prior_n, seed):
     led.note('coverage_excess_median_kt', name, level, cov['excess_median_kt'], units='kT')
 
 
-def chiral_pair_check(led, level, summaries, results_cip):
+def chiral_pair_check(led, level, results_cip):
     """The two enantiomers must build to OPPOSITE CIP codes from identical machinery.
 
     A single molecule's CIP check catches a reflection applied to everything. This catches
@@ -1186,7 +1187,7 @@ def run(level='torsion', force_field='mmff', n=2000, seed=0, n_external=4,
         cip = [r_ for r_ in led.rows if r_.mol == name and r_.name == 'cip_built']
         if cip:
             cips[name] = cip[-1].value
-    chiral_pair_check(led, level, summaries, cips)
+    chiral_pair_check(led, level, cips)
 
     cfg = {'level': level, 'force_field': force_field, 'n': n, 'seed': seed,
            'n_external': n_external, 'prior': prior_desc, 'prior_n': prior_n,

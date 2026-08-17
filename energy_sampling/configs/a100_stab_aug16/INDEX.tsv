@@ -1,6 +1,11 @@
 name	wave	kind	benchmark_id	batch	epochs	checkpoint_name
-f1_mipcas_elj	wave1_elj	func	-	1000	2500	-
-f2_qm9cond_b500	wave1_elj	func	-	500	1500	qm9a13_qm9anchor_aug14_b005_sym_elj-qm9c100k_prior-T6.9-bb6cfd_phase1_exit.pt
-f2b_qm9cond_b1000	wave1_elj	func	-	1000	1000	qm9a13_qm9anchor_aug14_b005_sym_elj-qm9c100k_prior-T6.9-bb6cfd_phase1_exit.pt
-f3_mipcas_uma	wave1_mlip	func	-	250	1200	-
-f4_acridine_mace	wave1_mlip	func	-	250	1200	-
+elj_r0	wave2_floors	floor	elj-fused-uncond	1000	2500	a100_stab_aug16_f1_mipcas_elj_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-3eb2e3_step2000.pt
+elj_r1	wave2_floors	floor	elj-fused-uncond	1000	2500	a100_stab_aug16_f1_mipcas_elj_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-3eb2e3_step2000.pt
+elj_r2	wave2_floors	floor	elj-fused-uncond	1000	2500	a100_stab_aug16_f1_mipcas_elj_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-3eb2e3_step2000.pt
+elj_r3	wave2_floors	floor	elj-fused-uncond	1000	2500	a100_stab_aug16_f1_mipcas_elj_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-3eb2e3_step2000.pt
+elj_r4	wave2_floors	floor	elj-fused-uncond	1000	2500	a100_stab_aug16_f1_mipcas_elj_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-3eb2e3_step2000.pt
+uma_r0	wave2_floors	floor	uma-fused-uncond	100	1225	a100_stab_aug16_f3_mipcas_uma_uma-mipcas_sg2_zp1_uma_prior_dataset-T2.5-5796d8_step1000.pt
+uma_r1	wave2_floors	floor	uma-fused-uncond	100	1225	a100_stab_aug16_f3_mipcas_uma_uma-mipcas_sg2_zp1_uma_prior_dataset-T2.5-5796d8_step1000.pt
+uma_r2	wave2_floors	floor	uma-fused-uncond	100	1225	a100_stab_aug16_f3_mipcas_uma_uma-mipcas_sg2_zp1_uma_prior_dataset-T2.5-5796d8_step1000.pt
+uma_r3	wave2_floors	floor	uma-fused-uncond	100	1225	a100_stab_aug16_f3_mipcas_uma_uma-mipcas_sg2_zp1_uma_prior_dataset-T2.5-5796d8_step1000.pt
+uma_r4	wave2_floors	floor	uma-fused-uncond	100	1225	a100_stab_aug16_f3_mipcas_uma_uma-mipcas_sg2_zp1_uma_prior_dataset-T2.5-5796d8_step1000.pt

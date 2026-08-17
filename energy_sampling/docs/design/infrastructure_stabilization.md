@@ -176,18 +176,31 @@ current baseline before quoting them as current.
   at load. The old gate tested `ray_calibration.enabled`, which passed mk_dev
   while nothing asked and would have rejected a legitimate hyper-only config.
 
-**1.2 — the five mode-varying key groups are now classified, and most need NO
-coexistence machinery.** Each was classified against the code and then
-adversarially checked; four of the five recommendations did not survive, two of
-them because they would have changed the canonical unconditional route.
+**1.2 — the five mode-varying key groups, classified, then resolved.** Each was
+classified against the code and then adversarially checked; four of the five
+recommendations did not survive, two of them because they would have changed the
+canonical unconditional route. What replaced them was not coexistence machinery
+but **stage scoping**: four of the five now travel with the protocol, and only
+`dplr_*` — which was never mode-varying in the first place — needed nothing.
 
 | Key group | Verdict | Action |
 |---|---|---|
 | `dplr_rank` / `dplr_rho_max` | **TUNED**, check held | **none** — already one value (6 / 0.5). The 10/0.9 pair has zero recorded support, entered in a bulk mode-switch commit, and exists nowhere in the tree today |
-| `lr_flow` | **not derivable** | derivation *refuted*: 22 live configs carry `1.0`, falsifying the 0.1/1e-4 two-branch story. Left explicit; a real bug fixed instead (below) |
-| `protocol.stages` | **STRUCTURAL** | name a protocol per problem — but see the hazard below before restructuring |
-| `z_calibration.*` | recommendation refuted | **none** — the conditional `enabled: false` has no code counterpart, and the proposed sensor change would flip the canonical route's trigger |
-| `tb_z_source` family | recommendation refuted | **none** — the proposed hard gate would abort the canonical run at its first stage |
+| `lr_flow` | **not derivable** | derivation *refuted*: 22 live configs carry `1.0`, falsifying the 0.1/1e-4 two-branch story. Left explicit, then **resolved structurally** — a stage sets its own rate via `on_enter: [set_lr_flow:<x>]` |
+| `protocol.stages` | **STRUCTURAL** | **DONE** (state 4) — `protocol:` names one, `protocols:` holds them all |
+| `z_calibration.*` | recommendation refuted | the *proposed* sensor change was refused for flipping the canonical trigger; **resolved structurally instead** — enablement is a stage flag, the block keeps only *how* |
+| `tb_z_source` family | recommendation refuted | the *proposed* hard gate would have aborted the canonical run at its first stage; **resolved structurally instead** — moved into `{mode}_loss_coeffs`, which a stage can override |
+
+**Why four "refuted" verdicts still ended in a move, and why that is not a
+reversal.** Each refuted recommendation was a *gate* — make the wrong combination
+fail at load — and each was refused for the same reason: the canonical
+unconditional route is a legitimate config, so any gate strict enough to catch the
+conditional mistake also rejected the route we actually run. Stage-scoping
+dissolves that. It does not ask which combination is wrong; it makes the route
+that needs a value the thing that declares it, so the wrong combination is not
+reachable rather than merely forbidden. The classification was right about the
+mechanism it evaluated and wrong only about that being the last mechanism
+available.
 
 ### 1.2's structural remainder
 
@@ -305,8 +318,16 @@ conditional/unconditional or molecule/toy changes only *problem-intrinsic*
 settings — energy function, data paths, the conditioning flags, space groups,
 temperature. Every other section of the canonical config is written so both
 alternatives coexist and only the selected one activates. `mode_presets.yaml`
-demotes accordingly: from a 322-line mode-overlay matrix that rewrites whole
-config sections, to a thin problem registry.
+demoted accordingly and is now retired: a 322-line mode-overlay matrix that
+rewrote whole config sections became `configs/problems.yaml`, a thin problem
+registry that is *loaded* rather than reference-only.
+
+**Where "only the selected one activates" ended up living.** Not in a coexistence
+rule applied to every section, which is what this paragraph originally implied,
+but in the stage: `protocol:` names a route, `protocols:` holds them all, and each
+stage declares the settings its route needs. Switching route is that one word plus
+the problem keys. The one key that still resists is
+`condition_log_z.half_life_visits`, which is global rather than stage-scoped.
 
 This makes the central §1 requirement and the central §5 invariant the same
 statement:
@@ -348,10 +369,15 @@ Any change that alters what an experiment does is a separate, explicit ask.
 
 ---
 
-## 2. What already exists
+## 2. What already existed
 
-Roughly a third of the requested machinery is built. Building it again is the
-main avoidable cost in this project.
+Roughly a third of the requested machinery was built before this plan started.
+Building it again is the main avoidable cost in this project, which is why the
+inventory is recorded rather than the gaps alone.
+
+**This table is the STARTING position and is not maintained** — it is the evidence
+for how the phases were sequenced, not a status board. Current status is the
+ledger at the top.
 
 | Workstream | Existing | Gap |
 |---|---|---|
@@ -460,6 +486,14 @@ inert-looking flags and mutating getters are a known failure mode here. The
 are present and activation derives from the problem block. Remove stale,
 duplicated, and conflicting defaults and pathways. Resolve the existing
 `# todo` comments.
+
+*Refined by what it took to execute:* activation derives from the **stage**, and
+the problem block's job is to select the protocol. A global key cannot be
+mode-safe by inspection, because "inactive" is a claim about a route that the key
+itself does not name — which is why the mode-safety audit (1.1) kept finding
+assertions it could not make executable. A key declared on the stage that consumes
+it needs no such claim: it is present exactly on the route that reads it. That is
+the generalisation of §1's requirement, not a departure from it.
 
 **1.3 Comment discipline (§4).** The canonical config currently narrates
 experimental history in-line — run ids (`tuphwfkm`, `cazwlyy1`, `gejezmjg`,
@@ -731,18 +765,40 @@ scheduled as Phase 3b.)*
 
 ## 6. Completion criterion
 
-- [ ] one clear canonical production-config state
-- [ ] production-config generation is a scripted workflow, not an agent search
-- [ ] generated configs carry reliable provenance
-- [ ] substantive code/config changes have semantic history
+Unchecked means unchecked. Where a box has real partial progress it is annotated,
+because a half-built thing recorded as done is how this list would stop working.
+
+- [ ] **one clear canonical production-config state** — `mk_dev.yaml` is
+      canonical and stamped at state 6. Blocked on the optimizer-block nesting and
+      on state 7: four migrated keys still load clean, so the stamp does not yet
+      mean what it says.
+- [ ] **production-config generation is a scripted workflow, not an agent search**
+      — Phase 2.1, not started.
+- [ ] **generated configs carry reliable provenance** — Phase 2.1. Note the bar:
+      `a100_stab_aug16` arms carry a state stamp that is *wrong about their own
+      contents*, which is provenance that misleads rather than provenance missing.
+- [ ] **substantive code/config changes have semantic history** — the machinery
+      exists and works (`config_state.CHANGES` → `docs/change_history.md`, drift
+      guarded by a test). It is the *discipline* that has a live counterexample:
+      the mode-key migration shipped without a record. Check this box when a
+      migration cannot ship without one.
 - ~~historical configs migrate systematically~~ — dropped: back-compat is not a
       requirement. A stale config fails loudly at load; that is sufficient.
-- [ ] comments and docstrings follow current-state discipline
+      **Conditional on the load gate actually firing** — see state 7.
+- [ ] **comments and docstrings follow current-state discipline** — audit landed
+      (`docs/design/comment_audit.md`), S1 applied, S2–S5 open.
 - [ ] the initial recurring workflows are scripted and documented
       (update-old-run · production-config generation · functional-change ·
-      performance-investigation · run analysis)
-- [ ] representative training modes have current end-to-end profiles
-- [ ] MLIP bottlenecks addressed, numerical equivalence demonstrated
-- [ ] A100 utilization behavior empirically understood
-- [ ] batch sizing satisfies the utilization constraint at near-best throughput
-- [ ] canonical performance and regression benchmarks exist
+      performance-investigation · run analysis) — **run analysis is done** (Phase
+      3b, Tiers 0–2); the other four are not.
+- [ ] representative training modes have current end-to-end profiles — gated on
+      `a100_stab_aug16` launching.
+- [ ] MLIP bottlenecks addressed, numerical equivalence demonstrated — local
+      optimisations done, A100 validation outstanding.
+- [ ] A100 utilization behavior empirically understood — measurement request
+      written (`docs/design/phase6_measurement_request.md`), not yet run.
+- [ ] batch sizing satisfies the utilization constraint at near-best throughput —
+      designed (`docs/design/phase6_batch_sizer.md`), not built.
+- [ ] **canonical performance and regression benchmarks exist** — the
+      *specification* exists (`docs/design/benchmarks.md` + `benchmarks/`); the
+      baseline numbers it is supposed to hold do not.

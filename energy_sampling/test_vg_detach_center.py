@@ -167,13 +167,14 @@ def test_mutations():
     print("\n[5] mutation checks (each must FAIL to prove the suite can see)")
     ok = True
 
-    # 5a. the returned estimate must KEEP its gradient (emp_z regresses onto it)
+    # 5a. the returned estimate must be DETACHED -- it is emp_z's regression
+    # TARGET, and a live target hands the policy a second gradient (test 6)
     log_pf = _leaf([0.2, 0.1, -0.1, -0.15, 9.0])
     rows, _, _ = condition_grouped_empirical_z(
         torch.zeros(5, dtype=torch.double), log_pf, torch.zeros(5, dtype=torch.double),
         torch.tensor([0, 0, 0, 0, 0]), lme=False, beta=1.0, detach_center=True)
-    ok &= _report("returned log_Z_emp_rows still carries grad", rows.requires_grad,
-                  "would silently kill emp_z if False")
+    ok &= _report("returned log_Z_emp_rows is detached", not rows.requires_grad,
+                  "a live target leaks policy gradient through emp_z")
 
     # 5b. re-introduce "detach does nothing": test 3 must then fail
     a = _vg_grad([0.2, 0.1, -0.1, -0.15, 9.0], [0, 0, 0, 0, 0], beta=1.0, detach_center=False)

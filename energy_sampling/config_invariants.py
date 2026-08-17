@@ -736,7 +736,19 @@ def conditional_z_settings_are_conditional(cfg: dict) -> list[Violation]:
 
     BASELINE, not ERROR, and deliberately: this is a per-route default backed by
     three batteries, not a self-contradiction provable from the file. A run may
-    depart from it knowingly -- but not by accident, which is what happened."""
+    depart from it knowingly -- but not by accident, which is what happened.
+
+    ABSENCE IS JUDGED, NOT ABSTAINED ON, and that distinction is the whole point
+    of the rule. Elsewhere this module abstains where it cannot know (see
+    exit_bar_is_within_measured_range, which only judges metrics it has a measured
+    range for). Here there is nothing to abstain about: both keys have a code
+    fallback, both fallbacks are the UNCONDITIONAL value, so an unset key is not an
+    unmade choice -- it is the wrong setting, silently. Judging only present values
+    is what let all five configs/a100_stab_aug16 arms report clean while the two
+    conditional ones resolved to the F-042 detonation regime, because their
+    generator wrote `persistent` into the pre-migration home where nothing reads
+    it. A rule that passes the exact config it was written to catch is not a
+    conservative rule, it is a broken one."""
     conditional = any(_get(cfg, k) is True for k in
                       ('embedding_conditioning', 'molecule_conditioning', 'vector_conditioning'))
     if not conditional:
@@ -781,15 +793,41 @@ def conditional_z_settings_are_conditional(cfg: dict) -> list[Violation]:
         for mode in live:
             over = overrides.get(mode) or {}
             eff = over.get('tb_z_source', _get(cfg, f'{mode}_loss_coeffs.tb_z_source'))
-            if eff == 'learned':
+            # ABSENCE IS NOT ABSTENTION HERE. train.py:1105 falls back to
+            # 'learned', so a config that sets the key nowhere trains in exactly
+            # the regime this rule exists to catch. Judging only present values
+            # made the rule blind to the most likely way to get it wrong -- a
+            # config that wrote `persistent` into the PRE-MIGRATION home, where it
+            # loads clean and is read by nothing.
+            if eff is None:
+                stale = _get(cfg, f'condition_log_z.{mode}_tb_z_source')
+                where = (f'; it is set to {stale!r} at the pre-migration '
+                         f'`condition_log_z.{mode}_tb_z_source`, which is read by nothing'
+                         if stale is not None else '')
+                out.append(Violation(
+                    BASELINE, 'conditional_z_settings_are_conditional',
+                    f"stage '{st.get('name')}' sets {mode}_loss_coeffs.tb_z_source "
+                    f'NOWHERE on a CONDITIONAL route, so it resolves to the code '
+                    f'fallback `learned` (train.py:1105){where}. Every battery that ran '
+                    f'used `persistent` ({src}). Set it in that stage\'s loss_coeffs.'))
+            elif eff == 'learned':
                 out.append(Violation(
                     BASELINE, 'conditional_z_settings_are_conditional',
                     f"stage '{st.get('name')}' resolves {mode}_loss_coeffs.tb_z_source "
                     f'to `learned` on a CONDITIONAL route; every battery that ran used '
                     f'`persistent` ({src}) -- the conditional persistent-Z regime. Set it '
                     f"in that stage's loss_coeffs so selecting the protocol adopts it."))
+    # Same shape of blindness, same reason: ConditionLogZTracker defaults
+    # half_life_visits to 7.0 (buffer.py:1185), the UNCONDITIONAL value, so an
+    # absent key is the wrong setting rather than an unmade choice.
     hl = _num(_get(cfg, 'condition_log_z.half_life_visits'))
-    if hl is not None and hl < 28.0:
+    if hl is None:
+        out.append(Violation(
+            BASELINE, 'conditional_z_settings_are_conditional',
+            f'condition_log_z.half_life_visits is unset on a CONDITIONAL route, so it '
+            f'resolves to the code default 7.0 (buffer.py:1185) -- the unconditional '
+            f'value. Every battery that ran used 28 ({src}).'))
+    elif hl < 28.0:
         out.append(Violation(
             BASELINE, 'conditional_z_settings_are_conditional',
             f'condition_log_z.half_life_visits={hl:g} on a CONDITIONAL route; every '

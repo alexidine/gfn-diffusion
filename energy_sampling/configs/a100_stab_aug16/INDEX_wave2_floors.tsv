@@ -1,0 +1,11 @@
+name	kind	benchmark_id	batch	epochs
+elj_r0	floor	elj-fused-uncond	1000	2500
+elj_r1	floor	elj-fused-uncond	1000	2500
+elj_r2	floor	elj-fused-uncond	1000	2500
+elj_r3	floor	elj-fused-uncond	1000	2500
+elj_r4	floor	elj-fused-uncond	1000	2500
+uma_r0	floor	uma-fused-uncond	100	1225
+uma_r1	floor	uma-fused-uncond	100	1225
+uma_r2	floor	uma-fused-uncond	100	1225
+uma_r3	floor	uma-fused-uncond	100	1225
+uma_r4	floor	uma-fused-uncond	100	1225

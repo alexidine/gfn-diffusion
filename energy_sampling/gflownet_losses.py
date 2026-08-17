@@ -832,6 +832,13 @@ def get_tb_loss(log_Z_learned, log_pb, log_pf, log_r,
 
 
 def emp_Z(gfn, log_Z, log_Z_learned, repeats, beta: float = 10):
+    """Regress the flow head onto an empirical per-group log Z.
+
+    log_Z arrives DETACHED from vg_lb/vg_lme/condition_grouped_empirical_z -- it
+    is the target, so only log_Z_learned may carry gradient here. That is what
+    keeps this a Z sidecar rather than a second policy loss; see the invariant
+    in condition_grouped_empirical_z's docstring.
+    """
     if gfn.conditional:
         # log_Z is one empirical estimate per condition group [B]; broadcast each
         # group's value back out over its `repeats` trajectories (x-repeated-K-times
@@ -946,9 +953,7 @@ def condition_grouped_empirical_z(log_pb, log_pf, log_r, condition_id,
     Returns (log_Z_emp_rows, mask_rows, vg_loss), all [N] and row-aligned:
     - log_Z_emp_rows: each row's condition-group empirical log Z -- Jensen
       flavor (group mean of log_ratio, a lower bound) when lme=False,
-      logmeanexp flavor when lme=True. Carries whatever grad state
-      log_pf/log_pb/log_r already have (the upstream freeze flags govern
-      detaching, same contract as the repeats-grouped path).
+      logmeanexp flavor when lme=True. DETACHED; see the contract note below.
     - mask_rows (bool): rows whose group had >= min_group_count samples. A
       singleton group's "estimate" is the row's own ratio -- regressing Z
       onto it degenerates to per-trajectory TB, exactly what emp_z exists to
@@ -982,8 +987,26 @@ def condition_grouped_empirical_z(log_pb, log_pf, log_r, condition_id,
     times than `repeats` -- so the flag is inert on some batches and live on
     others in the same run.
 
-    The RETURNED log_Z_emp_rows is never detached: emp_z regresses the flow head
-    onto it and that path must keep its gradient.
+    THE RETURNED log_Z_emp_rows IS DETACHED (2026-08-17; it was live before, and
+    that was a defect, not a design). It is a regression TARGET -- emp_z pulls
+    the flow head onto it -- and a target must not push back. Left live,
+    smooth_l1(log_Z_emp_rows, log_Z_learned) has BOTH arguments in the graph, so
+    under freeze_policy 0 the Z sidecar hands the policy a gradient of the same
+    magnitude as the one it hands Z: the policy is driven to move its own
+    group-mean log w onto the flow head. Since every residual in a condition
+    shares one sign and beta saturates the magnitude, that arrives as a
+    constant-size per-condition force on the policy -- near-zero expectation
+    on-policy (the score identity in L9) but variance comparable to VarGrad's
+    own, i.e. pure noise injection at whatever weight emp_z carries.
+
+    The invariant: the policy never differentiates through an empirical Z except
+    in the TB-family terms, where the Z residual IS the objective (get_tb_loss).
+    The VarGrad term is not an exception to it -- there the group centre is the
+    estimator rather than a target, and detach_center is the knob that governs
+    it.
+
+    Detaching here does NOT touch vg_loss: vg_center is taken above, before the
+    return, so the VarGrad term is bit-identical either way.
     """
     log_ratio = log_r + log_pb - log_pf
     uniq, inverse = torch.unique(condition_id.to(log_ratio.device), return_inverse=True)
@@ -1010,12 +1033,15 @@ def condition_grouped_empirical_z(log_pb, log_pf, log_r, condition_id,
     mask_rows = counts[inverse] >= min_group_count
     vg_center = log_Z_emp_rows.detach() if detach_center else log_Z_emp_rows
     vg_loss = beta * F.smooth_l1_loss(vg_center, log_ratio, reduction='none', beta=beta)
-    return log_Z_emp_rows, mask_rows, vg_loss
+    # detached AFTER vg_center is taken, so vg_loss is unchanged; see the
+    # regression-target contract in the docstring
+    return log_Z_emp_rows.detach(), mask_rows, vg_loss
 
 
 def vg_lme(gfn, log_pb, log_pf, log_r, repeats, beta: float = 10,
            detach_center: bool = False):
-    """Repeats-grouped VarGrad, logmeanexp centre. detach_center as in vg_lb."""
+    """Repeats-grouped VarGrad, logmeanexp centre. detach_center as in vg_lb, and
+    the returned log_Z is DETACHED for the same reason."""
     log_ratio = log_r + log_pb - log_pf
     if gfn.conditional:
         # [B*repeats] -> [B, repeats]; each row is one condition's K trajectories
@@ -1039,7 +1065,7 @@ def vg_lme(gfn, log_pb, log_pf, log_r, repeats, beta: float = 10,
         center = log_Z.detach() if detach_center else log_Z
         # vg_loss = 0.5 * (log_Z - log_ratio) ** 2
         vg_loss = beta * F.smooth_l1_loss(center.repeat(len(log_ratio)), log_ratio, reduction='none', beta=beta)
-    return log_Z, vg_loss
+    return log_Z.detach(), vg_loss
 
 
 def vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats, beta: float = 10,
@@ -1048,7 +1074,10 @@ def vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats, beta: float = 10,
 
     detach_center has the same meaning as in condition_grouped_empirical_z: it
     selects whether the huber'd term also differentiates through the centre. The
-    returned log_Z keeps its gradient either way -- emp_Z consumes it."""
+    returned log_Z is DETACHED either way -- emp_Z consumes it as a regression
+    TARGET, and a target must not push back on the policy (the invariant is
+    stated in condition_grouped_empirical_z). vg_loss is unaffected: its centre
+    is taken before the return."""
     assert not (loss_coeffs.vg_lb > 0 and loss_coeffs.vg_lme > 0), \
         "Cannot use both vg_lb and vg_lme simultaneously"
     log_ratio = log_r + log_pb - log_pf
@@ -1066,7 +1095,7 @@ def vg_lb(gfn, log_pb, log_pf, log_r, loss_coeffs, repeats, beta: float = 10,
         center = log_Z.detach() if detach_center else log_Z
         # vg_loss = 0.5 * (log_Z - log_ratio) ** 2
         vg_loss = beta * F.smooth_l1_loss(center.repeat(len(log_ratio)), log_ratio, reduction='none', beta=beta)
-    return log_Z, vg_loss
+    return log_Z.detach(), vg_loss
 
 
 def get_pf_retention_loss(log_Z_learned, log_pb, log_pf, log_r, beta: float = 10):

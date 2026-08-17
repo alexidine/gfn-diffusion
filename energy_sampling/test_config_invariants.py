@@ -489,13 +489,18 @@ def test_accumulation_lifts_a_small_batch_to_the_baseline(canonical):
 def _conditional(canonical, **dotted):
     """mk_dev switched onto the conditional route, with the Z trio already set
     correctly -- i.e. the state a correct conditional config is in, so a test
-    that mutates one key is testing exactly that key."""
+    that mutates one key is testing exactly that key.
+
+    TWO OF THE THREE ARE NOW CARRIED BY THE PROTOCOL and are deliberately NOT set
+    here. Since the mode-key migration, selecting `conditional_vargrad` brings
+    `tb_z_source: persistent` (each stage's `loss_coeffs`) and z_calibration-off
+    (the flag, omitted) with it. Setting them here again would test this helper
+    rather than the config: the rule would pass even if mk_dev's stages lost them,
+    which is the regression these tests exist to catch. `half_life_visits` is
+    global, so it stays -- it is the one key a mode switch still hand-edits."""
     cfg = broken(canonical, **dotted)
     cfg['embedding_conditioning'] = True
     cfg['protocol'] = 'conditional_vargrad'
-    cfg['z_calibration']['enabled'] = False
-    for k in ('fwd_tb_z_source', 'bwd_tb_z_source', 'replay_tb_z_source'):
-        cfg['condition_log_z'][k] = 'persistent'
     cfg['condition_log_z']['half_life_visits'] = 28.0
     return cfg
 
@@ -508,29 +513,100 @@ def test_conditional_z_settings_pass_when_set_for_the_route(canonical):
     assert _fired(_conditional(canonical), 'conditional_z_settings_are_conditional') == []
 
 
-@pytest.mark.parametrize('path, bad_value', [
-    ('z_calibration__enabled', True),
-    ('condition_log_z__fwd_tb_z_source', 'learned'),
-    ('condition_log_z__bwd_tb_z_source', 'learned'),
-    ('condition_log_z__replay_tb_z_source', 'learned'),
-    ('condition_log_z__half_life_visits', 7.0),
-])
-def test_each_inherited_unconditional_z_setting_fires(canonical, path, bad_value):
-    """Each of the three keys (four spellings) that separated every conditional
-    battery that RAN from every conditional run that detonated -- F-042."""
+def test_inherited_half_life_fires(canonical):
+    """The one key of the F-042 trio a mode switch still has to hand-edit."""
     cfg = _conditional(canonical)
-    node, parts = cfg, path.replace('__', '.').split('.')
-    for p in parts[:-1]:
-        node = node[p]
-    node[parts[-1]] = bad_value
+    cfg['condition_log_z']['half_life_visits'] = 7.0
+    vs = _fired(cfg, 'conditional_z_settings_are_conditional')
+    assert len(vs) == 1 and vs[0].severity == BASELINE, [str(v) for v in vs]
+
+
+# `var_conditioning` ships fracs.replay = 0.0, so the replay branch is not
+# trained there and the rule deliberately skips it -- see the `live` computation.
+# Only the two LIVE branches are expected to fire.
+@pytest.mark.parametrize('branch', ['fwd', 'bwd'])
+def test_inherited_tb_z_source_fires_at_its_state6_home(canonical, branch):
+    """A stage that resolves to `learned` on the conditional route -- F-042's
+    second key, checked where state 6 put it."""
+    cfg = _conditional(canonical)
+    _vg_stage(cfg)['loss_coeffs'][branch]['tb_z_source'] = 'learned'
+    vs = _fired(cfg, 'conditional_z_settings_are_conditional')
+    assert len(vs) == 1 and vs[0].severity == BASELINE, [str(v) for v in vs]
+
+
+def test_a_branch_the_stage_does_not_train_is_not_flagged(canonical):
+    """The narrowness is load-bearing, not incidental. `var_conditioning` zeroes
+    the replay frac, so its Z source is never read there; flagging it would add a
+    violation to every correct conditional config, and a BASELINE rule that cries
+    wolf is one people learn to skip. Guarded in both directions -- wrong value
+    AND absent -- because the absence branch is the newer one."""
+    cfg = _conditional(canonical)
+    assert _vg_stage(cfg)['fracs']['replay'] == 0.0, 'precondition: replay is not trained'
+    _vg_stage(cfg)['loss_coeffs']['replay']['tb_z_source'] = 'learned'
+    assert _fired(cfg, 'conditional_z_settings_are_conditional') == []
+
+    cfg = _conditional(canonical)
+    _vg_stage(cfg)['loss_coeffs']['replay'].pop('tb_z_source', None)
+    cfg['replay_loss_coeffs'].pop('tb_z_source', None)
+    assert _fired(cfg, 'conditional_z_settings_are_conditional') == []
+
+
+def test_z_calibration_flag_on_a_conditional_stage_fires(canonical):
+    """F-042's third key, as the state-5 stage flag rather than a global."""
+    cfg = _conditional(canonical)
+    _vg_stage(cfg).setdefault('flags', {})['z_calibration'] = True
+    vs = _fired(cfg, 'conditional_z_settings_are_conditional')
+    assert len(vs) == 1 and vs[0].severity == BASELINE, [str(v) for v in vs]
+
+
+# --- absence, which is the way this actually goes wrong -------------------
+# A generator that writes the PRE-MIGRATION spelling leaves the live home unset.
+# Both keys then fall back to a code default that is the UNCONDITIONAL value, so
+# the config trains in the detonation regime while reading as correct. Judging
+# only present values made the rule blind to exactly this.
+
+@pytest.mark.parametrize('branch', ['fwd', 'bwd'])
+def test_absent_tb_z_source_fires(canonical, branch):
+    """Unset everywhere -> train.py:1105 falls back to `learned`."""
+    cfg = _conditional(canonical)
+    _vg_stage(cfg)['loss_coeffs'][branch].pop('tb_z_source', None)
+    cfg[f'{branch}_loss_coeffs'].pop('tb_z_source', None)
+    vs = _fired(cfg, 'conditional_z_settings_are_conditional')
+    assert len(vs) == 1 and vs[0].severity == BASELINE, [str(v) for v in vs]
+
+
+def test_absent_tb_z_source_names_the_pre_migration_home_when_carried(canonical):
+    """The diagnosis, not just the fault: a config carrying `persistent` at the
+    dead `condition_log_z.*_tb_z_source` is the case this rule was blind to, and
+    the message has to say where the value actually is."""
+    cfg = _conditional(canonical)
+    _vg_stage(cfg)['loss_coeffs']['fwd'].pop('tb_z_source', None)
+    cfg['fwd_loss_coeffs'].pop('tb_z_source', None)
+    cfg['condition_log_z']['fwd_tb_z_source'] = 'persistent'
+    vs = _fired(cfg, 'conditional_z_settings_are_conditional')
+    assert len(vs) == 1, [str(v) for v in vs]
+    assert 'condition_log_z.fwd_tb_z_source' in str(vs[0]), str(vs[0])
+
+
+def test_absent_half_life_fires(canonical):
+    """Unset -> ConditionLogZTracker defaults to 7.0 (buffer.py:1185)."""
+    cfg = _conditional(canonical)
+    cfg['condition_log_z'].pop('half_life_visits', None)
     vs = _fired(cfg, 'conditional_z_settings_are_conditional')
     assert len(vs) == 1 and vs[0].severity == BASELINE, [str(v) for v in vs]
 
 
 def test_unconditional_route_is_left_alone(canonical):
     """The SAME values are correct on the unconditional route. A rule that fired
-    there would flag the canonical config and every unconditional battery."""
-    assert canonical['z_calibration']['enabled'] is True, 'precondition: mk_dev is unconditional'
+    there would flag the canonical config and every unconditional battery.
+
+    Note what the precondition now asserts: z_calibration is enabled by the STAGE
+    FLAG, not a global `enabled`, which is the state-5 spelling."""
+    eq = [s for s in canonical['protocols']['unconditional_tb']['stages']
+          if s['name'] == 'equilibration'][0]
+    assert eq['flags']['z_calibration'] is True, 'precondition: mk_dev is unconditional'
+    assert 'enabled' not in canonical['z_calibration'], \
+        'precondition: z_calibration.enabled is a pre-state-5 spelling'
     assert _fired(canonical, 'conditional_z_settings_are_conditional') == []
 
 
