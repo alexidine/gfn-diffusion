@@ -181,13 +181,36 @@ SEED_LR = 1.25e-4       # adaptive_lr.seed_lr: what `auto` resolves to with no s
 # The unconditional route COMPLETED off this gate locally (mipcas_final).
 MLE_GATE = {'slope_t': 1.0, 'min_rate': 0.5, 'window': 100}
 
-# The conditional arms' WEIGHTS-ONLY MLE warm start. From qm9_anchor_aug13, the
-# later of the two runs on this exact problem; slug `elj-qm9split_prior-T6.9-
-# b3483b` matches what these arms resolve to, which is what makes it legal
-# (load_weights_only calls assert_problem_match). Override with --cond-mle-seed.
-# MUST BE COPIED TO THE CLUSTER checkpoints dir -- it currently exists locally
-# only; --preflight is what catches its absence before a queue slot is spent.
-DEFAULT_COND_MLE_SEED = 'qm9a13_qm9a98b_elj-qm9split_prior-T6.9-b3483b_phase1_exit.pt'
+# THE CONDITION LIBRARY AND ITS MLE SEED MOVE TOGETHER, which is why they are one
+# preset and not two flags. `load_weights_only` calls `assert_problem_match`, and
+# the problem identity is keyed on `prior_path` among other fields -- so a seed
+# from one library under the other library's config is refused at load. Pairing
+# them here makes that mismatch unconstructible rather than merely detectable.
+#
+# qm9c100k is the DEFAULT because its seeds already sit in the cluster
+# checkpoints dir and it is the lineage of qm9anchor_aug14, the battery that ran
+# var_conditioning to completion -- same arch, same conditioning dims, same T and
+# temperature (verified 2026-08-17), so a weights-only load is clean.
+# qm9split's seed exists on the dev box only and must be copied first.
+CONDITIONAL_DATA = {
+    'qm9c100k': {
+        'prior': 'qm9c100k_prior.pt',
+        'conditions': 'qm9c100k_conditions.pt',
+        'test_conditions': 'qm9c100k_test_conditions.pt',
+        # b005_sym is the aug14 battery's stated CONTROL arm. Its train_prior is
+        # identical to every other `sym` arm's (the battery's axes are the
+        # var_conditioning hyper beta and the loss betas), so any of them would
+        # serve; naming the control makes the choice legible.
+        'seed': 'qm9a13_qm9anchor_aug14_b005_sym_elj-qm9c100k_prior-T6.9-bb6cfd_phase1_exit.pt',
+    },
+    'qm9split': {
+        'prior': 'qm9split_prior.pt',
+        'conditions': 'qm9split_conditions.pt',
+        'test_conditions': 'qm9split_test_conditions.pt',
+        'seed': 'qm9a13_qm9a98b_elj-qm9split_prior-T6.9-b3483b_phase1_exit.pt',
+    },
+}
+DEFAULT_COND_DATA = 'qm9c100k'
 
 FLOOR_REPEATS = 5       # matches registry noise_floor.repeats on the four step-cost benchmarks
 UTIL_REPEATS = 3        # matches a100-batch-scaling-elj / a100-util-production-shape
@@ -413,7 +436,7 @@ def archive_step(archive):
 # wave 1
 # ---------------------------------------------------------------------------
 
-def build_wave1(base_uncond, base_cond, cond_mle_seed=None):
+def build_wave1(base_uncond, base_cond, cond_data, cond_mle_seed=None):
     arms = []
 
     def f_arm(name, base, batch, epochs, archive_period, extra=None, cond=False):
@@ -428,9 +451,9 @@ def build_wave1(base_uncond, base_cond, cond_mle_seed=None):
         if cond:
             make_var_conditioning_terminal(cfg)
             conditionalise_z(cfg)
-            cfg['prior_path'] = CLUSTER_PRIOR_DIR + 'qm9split_prior.pt'
-            cfg['molecules_path'] = CLUSTER_PRIOR_DIR + 'qm9split_conditions.pt'
-            cfg['test_molecules_path'] = CLUSTER_PRIOR_DIR + 'qm9split_test_conditions.pt'
+            cfg['prior_path'] = CLUSTER_PRIOR_DIR + cond_data['prior']
+            cfg['molecules_path'] = CLUSTER_PRIOR_DIR + cond_data['conditions']
+            cfg['test_molecules_path'] = CLUSTER_PRIOR_DIR + cond_data['test_conditions']
         else:
             p = CLUSTER_PRIOR_DIR + 'mipcas_sg2_zp1_elj_prior_dataset.pt'
             cfg['prior_path'] = p
@@ -620,12 +643,15 @@ def validate(name, wave, kind, bid, cfg):
                 f'transition and the churn rebuild, which is everything this arm tests'
             assert conditional, f'{name}: only the conditional arms take an MLE seed'
             # assert_problem_match fires at load; catch the mismatch HERE, where it
-            # costs nothing rather than a queue slot.
-            assert 'qm9split_prior' in cfg['checkpoint_name'], \
-                (f"{name}: MLE seed {cfg['checkpoint_name']!r} is not a qm9split_prior "
-                 f"checkpoint. The problem identity is keyed on prior_path among other "
-                 f"fields, so a seed from another condition library (e.g. qm9c100k) is "
-                 f"refused by assert_problem_match at load.")
+            # costs nothing rather than a queue slot. The seed's own filename carries
+            # the prior it was trained against, so this compares like with like
+            # instead of hardcoding one library's name.
+            library = Path(cfg['prior_path']).stem       # e.g. qm9c100k_prior
+            assert library in cfg['checkpoint_name'], \
+                (f"{name}: MLE seed {cfg['checkpoint_name']!r} was not trained on "
+                 f"{library!r}. The problem identity is keyed on prior_path among other "
+                 f"fields, so a seed from another condition library is refused by "
+                 f"assert_problem_match at load -- after the queue slot is spent.")
         assert cfg['checkpoint_read_only'] is False, \
             f'{name}: wave 1 must WRITE checkpoints; wave 2 resumes from them'
     else:
@@ -870,10 +896,11 @@ def main():
     ap.add_argument('--t-elj4491', type=float, help='override the 2.8x t1000 extrapolation')
     ap.add_argument('--eval-s', type=float, default=150.0,
                     help='measured wave-1 eval_step_time at cluster cadence, seconds')
-    ap.add_argument('--cond-mle-seed', default=DEFAULT_COND_MLE_SEED,
-                    help='WEIGHTS-ONLY MLE warm start for the conditional F arms. Must be a '
-                         'qm9split_prior checkpoint (problem identity is checked at load). '
-                         'Pass "" to run them cold.')
+    ap.add_argument('--cond-data', default=DEFAULT_COND_DATA, choices=sorted(CONDITIONAL_DATA),
+                    help='condition library for the conditional F arms; also selects the '
+                         'matching MLE seed, since the two must share a problem identity')
+    ap.add_argument('--cond-mle-seed', default=None,
+                    help='override the library default seed. Pass "" to run cold.')
     a = ap.parse_args()
 
     outdir = Path(a.outdir) if a.outdir else HERE
@@ -890,17 +917,19 @@ def main():
         if not arms:
             raise SystemExit('wave 2: nothing to generate -- pass the wave-1 artifact args')
     else:
-        seed = a.cond_mle_seed or None
-        arms, dropped = build_wave1(base_uncond, base_cond, cond_mle_seed=seed), []
+        cond_data = CONDITIONAL_DATA[a.cond_data]
+        seed = cond_data['seed'] if a.cond_mle_seed is None else (a.cond_mle_seed or None)
+        arms, dropped = build_wave1(base_uncond, base_cond, cond_data, cond_mle_seed=seed), []
+        print(f'conditional library: {a.cond_data} ({cond_data["conditions"]})')
         if seed:
             print(f'conditional MLE seed (weights-only): {seed}\n'
                   f'  -> must exist in the CLUSTER checkpoints dir; --preflight checks it.\n'
                   f'  -> a weights-only seed needs NO _buffers.pt sidecar (buffers re-seed '
                   f'from prior_path, which is what keeps the churn test real).')
         else:
-            dropped.append('conditional MLE warm start: --cond-mle-seed "" -- f2/f2b run '
-                           'cold, so they enter var_conditioning from ~200 steps of MLE '
-                           'rather than a trained policy')
+            dropped.append('conditional MLE warm start: run cold -- f2/f2b enter '
+                           'var_conditioning from ~200 steps of MLE rather than a '
+                           'trained policy')
     emit(arms, dropped, outdir)
 
 

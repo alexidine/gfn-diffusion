@@ -8,12 +8,12 @@ anomaly_detection: false
 continue_from_checkpoint: false
 mlip_path: null
 checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/
-checkpoint_name: qm9a13_qm9a98b_elj-qm9split_prior-T6.9-b3483b_phase1_exit.pt
+checkpoint_name: qm9a13_qm9anchor_aug14_b005_sym_elj-qm9c100k_prior-T6.9-bb6cfd_phase1_exit.pt
 prior_model_name: null
 load_weights_only: true
-prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/qm9split_prior.pt
-molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/qm9split_conditions.pt
-test_molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/qm9split_test_conditions.pt
+prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/qm9c100k_prior.pt
+molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/qm9c100k_conditions.pt
+test_molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/qm9c100k_test_conditions.pt
 archive_period: 500
 archive_buffers: true
 override_learning_rates: false
