@@ -61,7 +61,6 @@ buffers:
     topup_admit_record_breakers: true
   prior_buffer:
     churn_batch_ref: 1000
-    condition_block_m: 1
     init_fraction: 0.25
     max_size: 250000
     mean_lifetime: 100
@@ -94,6 +93,7 @@ bwd_loss_coeffs:
   mle: 0.0
   pf_boost: 0
   repeats: 1.0
+  condition_block_m: 1
   subtb: 0.0
   subtb_lambda: 0.95
   tb: 0.0
@@ -243,7 +243,7 @@ oom_cooldown_steps: 200
 override_learning_rates: false
 prior_model_name: null
 prior_path: D:\crystal_datasets\conditional\priors\toy_big_unif_prior.pt
-project_state_version: 5
+project_state_version: 6
 protocol: migrated
 protocols:
   migrated:

@@ -556,20 +556,28 @@ def test_bwd_vargrad_fires_only_when_BOTH_group_sources_are_absent(canonical):
     """The backward condition is a DISJUNCTION, and it must stay one: aug14 and
     aug11 satisfy it with repeats 2 at condition_block_m 1, aug13 with
     condition_block_m 2 at repeats 1. A conjunction rejects two configs that ran."""
-    both_absent = _conditional(canonical, buffers__prior_buffer__condition_block_m=1)
+    both_absent = _conditional(canonical, bwd_loss_coeffs__condition_block_m=1)
     _vg_stage(both_absent)['loss_coeffs']['bwd']['repeats'] = 1.0
     vs = _fired(both_absent, 'vargrad_needs_groups')
     assert len(vs) == 1 and vs[0].severity == ERROR
 
     # aug13's spelling: repeats 1 but blocked draws -- must NOT fire
-    via_blocks = _conditional(canonical, buffers__prior_buffer__condition_block_m=2)
+    via_blocks = _conditional(canonical, bwd_loss_coeffs__condition_block_m=2)
     _vg_stage(via_blocks)['loss_coeffs']['bwd']['repeats'] = 1.0
     assert _fired(via_blocks, 'vargrad_needs_groups') == []
 
     # aug14's spelling: repeats 2, blocking off -- must NOT fire
-    via_repeats = _conditional(canonical, buffers__prior_buffer__condition_block_m=1)
+    via_repeats = _conditional(canonical, bwd_loss_coeffs__condition_block_m=1)
     _vg_stage(via_repeats)['loss_coeffs']['bwd']['repeats'] = 2.0
     assert _fired(via_repeats, 'vargrad_needs_groups') == []
+
+    # ...and the STAGE override is what the rule reads, not just the base block:
+    # a base of 2 with the stage turning blocking off must fire.
+    stage_off = _conditional(canonical, bwd_loss_coeffs__condition_block_m=2)
+    _vg_stage(stage_off)['loss_coeffs']['bwd']['repeats'] = 1.0
+    _vg_stage(stage_off)['loss_coeffs']['bwd']['condition_block_m'] = 0
+    vs = _fired(stage_off, 'vargrad_needs_groups')
+    assert len(vs) == 1 and vs[0].severity == ERROR
 
 
 def test_vargrad_rule_abstains_off_the_vargrad_route(canonical):

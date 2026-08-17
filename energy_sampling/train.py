@@ -1088,15 +1088,21 @@ class Modeller:
 
     def tb_z_source(self, group: str) -> str:
         """
-        Safe accessor for condition_log_z.{fwd,bwd,replay}_tb_z_source --
-        falls back to 'learned' (today's exact behavior) if the
-        condition_log_z config section, or this field within it, is absent
-        (e.g. an older/other config that predates this feature).
+        Per-branch Z source, read from {group}_loss_coeffs.tb_z_source.
+
+        It lives with the loss coefficients, not in condition_log_z, because it
+        is a property of what a branch's loss DOES -- get_tb_loss substitutes a
+        detached per-condition target under 'persistent' -- and because that is
+        the one place a protocol stage can override per branch. The conditional
+        route needs 'persistent' where the unconditional route needs 'learned',
+        and as a global it was a hand-edit every mode switch silently required.
+
+        Falls back to 'learned', which is the unconditional behaviour.
         """
-        cfg = getattr(self.args, 'condition_log_z', None)
-        if cfg is None:
+        c = getattr(self.args, f'{group}_loss_coeffs', None)
+        if c is None:
             return 'learned'
-        return getattr(cfg, f'{group}_tb_z_source', 'learned')
+        return getattr(c, 'tb_z_source', 'learned')
 
     def mode_repeats(self, mode: str) -> int:
         """
@@ -2196,6 +2202,12 @@ class Modeller:
                 energy_s_before = getattr(self.energy_function, 'energy_seconds', 0.0)
                 try:
                     current_loss = self.train_step(step_type)
+                except FrozenTrainingState:
+                    # FrozenTrainingState subclasses RuntimeError, so without this it
+                    # would be caught below and treated as an OOM -- the batch would be
+                    # slashed and the run would carry on in the very state the exception
+                    # exists to end. It means UNRECOVERABLE; let it out.
+                    raise
                 except (RuntimeError, ValueError) as e:  # if we do hit OOM, slash the batch size
                     self.handle_train_epoch_error(e, step_type)
                 # interspersed Z-only calibration steps (z_calibration_tick);
@@ -2318,6 +2330,21 @@ class Modeller:
             print("Finished Training!")
 
     def monitor_losses(self, current_loss, step_type):
+        # NON-FINITE GRADIENT -> the divergence response, not silence. step_loss
+        # returns early on a non-finite pre-clip norm, so current_loss is None and
+        # the check_spike branch below never runs -- which is how a run could sit
+        # in that state making zero progress. check_spike could not have caught it
+        # anyway: its non-finite trigger reads last_grad_norm_pre_clip, which that
+        # same early return leaves at its last FINITE value.
+        # Fired on streak 1, 11, 21... rather than every step: a rewind needs a few
+        # steps to show whether it took, and fire_loss_spike's own rewind budget is
+        # the escalation path -- it raises FrozenTrainingState once exhausted.
+        if getattr(self, '_nonfinite_pending', False):
+            self._nonfinite_pending = False
+            if (getattr(self, '_grad_nonfinite_streak', 0) % 10) == 1:
+                print(f"non-finite gradient at {self.step_ind} "
+                      f"(streak {self._grad_nonfinite_streak}) -> rewind + peak cut")
+                self.fire_loss_spike()
         if current_loss is not None:
             # check_spike (LRController) is the one remaining tripwire: an
             # absolute ~1e9 bar on branch loss / pre-clip grad norm, or a
@@ -3295,7 +3322,8 @@ Two things deliberately NOT done here, both recorded in
         if not (ng > 0 and nd > 0):
             return
         cos = float(torch.dot(g, d) / (ng * nd))
-        self.lr_controller.on_hypergradient(cos, cfg['beta'], cfg.get('beta_down'))
+        self.lr_controller.on_hypergradient(cos, cfg['beta'], cfg.get('beta_down'),
+                                            cfg.get('cos_target', 0.0))
 
     def step_loss(self, step_type, loss, do_step: bool = True):
         loss.backward()
@@ -3333,6 +3361,34 @@ Two things deliberately NOT done here, both recorded in
             # finite grad norm to every downstream check. The streak counter is
             # kept as telemetry (gradnorm/nonfinite_steps).
             self._grad_nonfinite_streak = getattr(self, '_grad_nonfinite_streak', 0) + 1
+            # A non-finite GRADIENT is the same class of event as a non-finite
+            # loss or a 1e9 excursion, so it gets the same response: rewind to the
+            # last good checkpoint and cut peak_scale. It cannot be raised from
+            # here -- fire_loss_spike reloads model/optimizer state, and this is
+            # mid-step, after backward() and before the optimizer step -- so flag
+            # it and let monitor_losses fire it at the point the divergence path
+            # already runs. Rate-limited there, because the rewind needs a few
+            # steps to show whether it took.
+            self._nonfinite_pending = True
+            # ...and the streak is no longer telemetry ONLY. Measured 2026-08-17 on
+            # the QM9 conditional route: 1,579 consecutive non-finite steps from 902
+            # to 4,058 -- ~3,150 steps of zero progress with tqdm advancing, the GPU
+            # busy and the loss curves smooth, and nothing would have stopped it
+            # inside its 13-hour wall clock. check_spike's non-finite trigger cannot
+            # catch this: it reads last_grad_norm_pre_clip, which the return below
+            # deliberately leaves at its last FINITE value, so the one guard meant to
+            # fire is the one this path blinds. Abort instead, same exception and the
+            # same "release the GPU" rationale as the rewind-budget path.
+            bar = int(getattr(self.args, 'nonfinite_abort_streak', 50))
+            if bar > 0 and self._grad_nonfinite_streak >= bar:
+                first = self.step_ind - self._grad_nonfinite_streak + 1
+                stale = getattr(self, 'last_grad_norm_pre_clip', float('nan'))
+                raise FrozenTrainingState(
+                    f"UNRECOVERABLE at step {self.step_ind}: {self._grad_nonfinite_streak} "
+                    f"consecutive non-finite gradients (since step {first}). The optimizer "
+                    f"has not stepped in that window, so the run is making no progress; "
+                    f"last_grad_norm_pre_clip is stale at {stale:.4g} and every guard "
+                    f"reading it is blind. Aborting so the GPU is released.")
             return  # skip non-finite
         self._grad_nonfinite_streak = 0  # a finite gradient landed: streak broken
         # raw (pre-clip) global grad norm, for reading how hard the clip binds:
@@ -3409,7 +3465,12 @@ Two things deliberately NOT done here, both recorded in
         mode only).
         """
         cfg = getattr(self.args, 'z_calibration', None)
-        if cfg is None or not getattr(cfg, 'enabled', False):
+        # WHICH stages run Z-calibration is a stage property, so it is a stage
+        # flag; the z_calibration block holds only HOW. As a global `enabled` it
+        # was one of the keys a conditional run had to remember to switch off by
+        # hand, and forgetting it drives Z-only steps into a per-condition flow
+        # network that no stage has trained.
+        if cfg is None or not self.protocol.flag('z_calibration'):
             return
         rep = self._z_cal_report = getattr(self, '_z_cal_report', {})
         rep['z_cal/p'] = 0.0
@@ -3953,8 +4014,9 @@ Two things deliberately NOT done here, both recorded in
             # its cross-terminal signal otherwise only arrives via birthday
             # collisions. Phase 3's per-sample TB prefers the broad-coverage
             # independent draws, which block_m = 0 restores automatically.
-            block_m = getattr(self.args.buffers.prior_buffer, 'condition_block_m', 0) \
-                if getattr(self.args.bwd_loss_coeffs, 'vg_lb', 0) > 0 else 0
+            blc = self.args.bwd_loss_coeffs
+            block_m = int(getattr(blc, 'condition_block_m', 0) or 0) \
+                if getattr(blc, 'vg_lb', 0) > 0 else 0
             # gentle loss-weighted draw when the stage sets weighted_bwd_sampling:
             # tilt a small slice of the batch toward high-residual conditions via
             # the buffer's own ema_loss (the _bwd_retention_priority signal), so a
@@ -4043,12 +4105,13 @@ Two things deliberately NOT done here, both recorded in
         # trajectories, so K copies would be identical -- which makes that path
         # singleton-tiled and equally dead).
         rlc = self.args.replay_loss_coeffs
-        block_m = getattr(self.args.buffers.replay_buffer, 'condition_block_m', 0) \
+        block_m = int(getattr(rlc, 'condition_block_m', 0) or 0) \
             if (getattr(rlc, 'vg_by_condition', 0) > 0.5
                 and (getattr(rlc, 'vg_lb', 0) > 0 or getattr(rlc, 'vg_lme', 0) > 0)) else 0
         if block_m >= 2 and not hasattr(self.replay_buffer.batch, 'condition_id'):
             raise ValueError(
-                "replay condition_block_m needs condition_id on the stored batch. "
+                "replay_loss_coeffs.condition_block_m needs condition_id on the "
+                "stored batch. "
                 "manage_replay_buffer admits the post-condition_samples forward "
                 "batch, which carries it, so a buffer without it was built by "
                 "another route.")
@@ -4074,7 +4137,7 @@ Two things deliberately NOT done here, both recorded in
             # -- the same inverse-measure error as the beta=1.0 bug documented
             # further down, and just as invisible in the loss.
             raise ValueError(
-                "buffers.replay_buffer.condition_block_m >= 2 is mutually "
+                "replay_loss_coeffs.condition_block_m >= 2 is mutually "
                 "exclusive with buffers.replay_buffer.prioritise: blocked draws "
                 "bypass `p` entirely in CrystalBuffer._sample_indices. Set "
                 "prioritise.enabled false or condition_block_m 0.")

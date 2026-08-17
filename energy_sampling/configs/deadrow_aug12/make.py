@@ -165,7 +165,7 @@ def common(cfg, name, budget):
     # and so flipping grow_batch_size later does not silently run without a ceiling.
     cfg['max_step_seconds'] = 10
     cfg.setdefault('energy_config', {})['internal_oom_recovery'] = False
-    cfg.setdefault('buffers', {}).setdefault('prior_buffer', {})['condition_block_m'] = 1
+    cfg.setdefault('bwd_loss_coeffs', {})['condition_block_m'] = 1
     return cfg
 
 

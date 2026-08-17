@@ -1,4 +1,4 @@
-project_state_version: 5
+project_state_version: 6
 run_name: ablate_mid
 tag: lrv8
 seed: 12345
@@ -158,6 +158,7 @@ bwd_loss_coeffs:
   mle: 0.0
   tbc: 0.0
   repeats: 1.0
+  condition_block_m: 2
   traj_grads: 1.0
   loss_clip: 1000000000.0
   beta: 10.0
@@ -176,6 +177,7 @@ replay_loss_coeffs:
   emp_z_persistent: 0
   mle: 0.0
   repeats: 1.0
+  condition_block_m: 0
   traj_grads: 0.0
   loss_clip: 1000000000.0
   beta: 10.0
@@ -407,7 +409,6 @@ buffers:
     init_fraction: 0.25
     expire_max_frac: 0.1
     anchor_floor_frac: 0.1
-    condition_block_m: 2
     reward_min: 0
     ramp_floor: 100
     ramp_width: 50
@@ -416,7 +417,6 @@ buffers:
     mean_residence_steps: 50
     max_size: 12000
     admit_reward_min: -200
-    condition_block_m: 0
     prioritise:
       enabled: true
       kappa: 1.0

@@ -670,9 +670,9 @@ def vargrad_needs_groups(cfg: dict) -> list[Violation]:
             out to DISTINCT terminals, which is the cross-terminal group VarGrad
             needs. Nothing else supplies one.
       bwd   EITHER `repeats >= 2` (K backward rollouts from one terminal) OR
-            `prior_buffer.condition_block_m >= 2` (M distinct same-condition
-            terminals per block). Either yields a group; neither is required
-            when the other holds.
+            `condition_block_m >= 2` (M distinct same-condition terminals per
+            block). Either yields a group; neither is required when the other
+            holds.
 
     Measured across every conditional battery that RAN (2026-08-17): aug14 and
     aug11 satisfy the bwd side via `repeats: 2.0` at `condition_block_m: 1`;
@@ -681,10 +681,12 @@ def vargrad_needs_groups(cfg: dict) -> list[Violation]:
     diff reads those two spellings as a disagreement when they are the same
     constraint met two ways.
 
+    Both terms resolve through `_coeff`, so a stage that overrides either one
+    is judged on what IT runs rather than on the base block.
+
     ABSTAINS on any branch not running vg_lb/vg_lme -- on a TB route `repeats`
     means something else entirely and 1 is correct."""
     out = []
-    cbm = _num(_get(cfg, 'buffers.prior_buffer.condition_block_m')) or 0.0
     for st in active_stages(cfg):
         if not isinstance(st, dict):
             continue
@@ -701,11 +703,12 @@ def vargrad_needs_groups(cfg: dict) -> list[Violation]:
                     f"repeats >= 2."))
         if _runs_vargrad(cfg, st, 'bwd'):
             reps = _coeff(cfg, st, 'bwd', 'repeats')
+            cbm = _coeff(cfg, st, 'bwd', 'condition_block_m') or 0.0
             if reps is not None and reps < 2 and cbm < 2:
                 out.append(Violation(
                     ERROR, 'vargrad_needs_groups',
                     f"stage {name!r} runs bwd VarGrad at bwd repeats={reps:g} AND "
-                    f"buffers.prior_buffer.condition_block_m={cbm:g}. The backward group "
+                    f"bwd condition_block_m={cbm:g}. The backward group "
                     f"needs ONE of the two >= 2 -- repeats gives K rollouts from one "
                     f"terminal, condition_block_m gives M same-condition terminals per "
                     f"block. With neither, every backward group is a singleton and the "
@@ -740,21 +743,51 @@ def conditional_z_settings_are_conditional(cfg: dict) -> list[Violation]:
         return []
     out = []
     src = 'qm9_aug11 / qm9_anchor_aug13 / qm9anchor_aug14, every conditional battery that ran'
-    if _get(cfg, 'z_calibration.enabled') is True:
-        out.append(Violation(
-            BASELINE, 'conditional_z_settings_are_conditional',
-            f'z_calibration.enabled is true on a CONDITIONAL route; every battery that '
-            f'ran turned it off ({src}). Its parameters are documented as set for the '
-            f'unconditional route, and on the conditional one it drives up to '
-            f'max_steps_per_step Z-only steps into a per-condition flow NETWORK that '
-            f'no stage has trained.'))
-    for key in ('fwd_tb_z_source', 'bwd_tb_z_source', 'replay_tb_z_source'):
-        if _get(cfg, f'condition_log_z.{key}') == 'learned':
+    sel = _get(cfg, 'protocol')
+    stages = (_get(cfg, f'protocols.{sel}.stages') or []) if sel else []
+    for st in stages:
+        if isinstance(st, dict) and (st.get('flags') or {}).get('z_calibration') is True:
             out.append(Violation(
                 BASELINE, 'conditional_z_settings_are_conditional',
-                f'condition_log_z.{key} is `learned` on a CONDITIONAL route; every '
-                f'battery that ran used `persistent` ({src}) -- the conditional '
-                f'persistent-Z regime the canonical config names in its own comment.'))
+                f"stage '{st.get('name')}' declares the z_calibration flag on a "
+                f'CONDITIONAL route; every battery that ran left it off ({src}). Its '
+                f'parameters are set for the unconditional route, and here it drives up '
+                f'to max_steps_per_step Z-only steps into a per-condition flow NETWORK '
+                f'that no stage has trained.'))
+    # tb_z_source moved out of condition_log_z into {mode}_loss_coeffs, so the
+    # question is no longer "what does the global say" but "what does the SELECTED
+    # protocol's stage resolve to" -- base value overlaid with the stage override.
+    # Checking the base alone would now fail every conditional config, since the
+    # base is deliberately `learned` and the conditional stages override it.
+    sel = _get(cfg, 'protocol')
+    stages = (_get(cfg, f'protocols.{sel}.stages') or []) if sel else []
+    for st in stages:
+        if not isinstance(st, dict):
+            continue
+        overrides = st.get('loss_coeffs') or {}
+        # Only the branches this stage actually trains: a train_mode: bwd stage
+        # never reads fwd's Z source, and a fused stage skips any branch its fracs
+        # zero out. Flagging those would be noise, and noise is what gets a
+        # BASELINE rule ignored.
+        tm = st.get('train_mode')
+        fracs = st.get('fracs') or {}
+        if tm == 'fused':
+            live = [m for m in ('fwd', 'bwd', 'replay')
+                    if not fracs or (_num(fracs.get(m)) or 0) > 0]
+        elif tm in ('fwd', 'bwd', 'replay'):
+            live = [tm]
+        else:
+            live = ['fwd', 'bwd', 'replay']
+        for mode in live:
+            over = overrides.get(mode) or {}
+            eff = over.get('tb_z_source', _get(cfg, f'{mode}_loss_coeffs.tb_z_source'))
+            if eff == 'learned':
+                out.append(Violation(
+                    BASELINE, 'conditional_z_settings_are_conditional',
+                    f"stage '{st.get('name')}' resolves {mode}_loss_coeffs.tb_z_source "
+                    f'to `learned` on a CONDITIONAL route; every battery that ran used '
+                    f'`persistent` ({src}) -- the conditional persistent-Z regime. Set it '
+                    f"in that stage's loss_coeffs so selecting the protocol adopts it."))
     hl = _num(_get(cfg, 'condition_log_z.half_life_visits'))
     if hl is not None and hl < 28.0:
         out.append(Violation(

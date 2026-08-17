@@ -377,7 +377,7 @@ def arm(sg, hold):
     cfg['eval_T'] = TRAJ_T
     cfg.setdefault('integrator', {})['T'] = TRAJ_T
     cfg['max_step_seconds'] = 10
-    cfg.setdefault('buffers', {}).setdefault('prior_buffer', {})['condition_block_m'] = 1
+    cfg.setdefault('bwd_loss_coeffs', {})['condition_block_m'] = 1
     return name, cfg
 
 

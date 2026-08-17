@@ -109,7 +109,7 @@ def _stage(cfg, name=STAGE):
 
 def build_config(base, name, block_m, bwd_repeats, fwd_repeats):
     cfg = overwrite_nested_dict(yaml.safe_load(yaml.safe_dump(base)), {'run_name': name})
-    cfg['buffers']['prior_buffer']['condition_block_m'] = block_m
+    cfg['bwd_loss_coeffs']['condition_block_m'] = block_m
     _stage(cfg)['loss_coeffs']['bwd']['repeats'] = bwd_repeats
     _stage(cfg)['loss_coeffs']['fwd']['repeats'] = fwd_repeats
     return cfg
@@ -152,7 +152,7 @@ def assert_distinct(configs):
     """No arm may be a duplicate written by omission."""
     keys = {}
     for name, cfg in configs:
-        k = (cfg['buffers']['prior_buffer']['condition_block_m'],
+        k = (cfg['bwd_loss_coeffs']['condition_block_m'],
              _stage(cfg)['loss_coeffs']['bwd']['repeats'],
              _stage(cfg)['loss_coeffs']['fwd']['repeats'])
         assert k not in keys, f'{name} duplicates {keys[k]}: both are m/Kbwd/Kfwd = {k}'
@@ -199,7 +199,7 @@ def main():
     for name, cfg in configs:
         out = HERE / f'{name}.yaml'
         out.write_text(yaml.safe_dump(cfg, sort_keys=False, default_flow_style=False))
-        m = cfg['buffers']['prior_buffer']['condition_block_m']
+        m = cfg['bwd_loss_coeffs']['condition_block_m']
         kb = _stage(cfg)['loss_coeffs']['bwd']['repeats']
         kf = _stage(cfg)['loss_coeffs']['fwd']['repeats']
         b = cfg['batch_size']

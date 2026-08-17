@@ -245,3 +245,25 @@ Stage-exit `patience` counts METRIC WRITES instead of trigger checks, and two co
 - The positive path is asserted separately: the real three-term phase-1 block driven at real cadences must still transition, so a fix that tightened the stage into never advancing cannot pass.
 - exit_bar_is_within_measured_range reports on configs/mk_dev.yaml the moment `protocol:` is switched to conditional_vargrad, which still declares `fwd/logw_std_within < 6.0` -- and `errors()` stays EMPTY there, so the route still loads and runs.
 - Full suite minus bench: 848 passed, 2 pre-existing failures in test_replay_gating.py (its fake modeller lacks `lr_controller`, unrelated to this change).
+
+## STATE 6 — `condition_block_m` moves from the two buffer blocks to the two loss-coefficient blocks: buffers.
+
+`condition_block_m` moves from the two buffer blocks to the two loss-coefficient blocks: buffers.prior_buffer -> bwd_loss_coeffs, buffers.replay_buffer -> replay_loss_coeffs. It never configured a store -- the buffer holds the same rows either way -- it shapes the DRAW for one loss, and both read sites were already gated on that loss's own coefficients (bwd on vg_lb; replay on vg_by_condition plus vg_lb/vg_lme). So the value only ever meant anything in conjunction with coefficients living in a different block, and a reader of either block alone could not tell whether it was active. THE MOVE ALSO CHANGES ITS SCOPE, which is the point rather than a side effect: loss coefficients are per-stage overridable (protocol.coeffs merges stage `loss_coeffs` over the base block), so a protocol can now run blocked draws in the VarGrad stage and independent ones elsewhere by declaring it. The vg_lb gate was emulating exactly that with the one stage-scoped signal it had. Value and semantics are unchanged: >= 2 blocks the draw, 0/1 does not, and the activation gates are untouched.
+
+**Components:** `train.py`, `utils.py`, `config_invariants.py`, `configs/mk_dev.yaml`
+
+**Renamed:**
+
+- `buffers.prior_buffer.condition_block_m` -> `bwd_loss_coeffs.condition_block_m`
+- `buffers.replay_buffer.condition_block_m` -> `replay_loss_coeffs.condition_block_m`
+
+**Invariants:**
+
+- A knob that is inert unless a loss coefficient is nonzero lives with that coefficient, so presence and activation are readable in one place.
+- The value is read as an INT at the draw site: _sample_condition_blocked_indices passes it to np.random.choice's `size`, which rejects a float. Loss-coefficient blocks are written in floats throughout, so `2.0` is now a spelling a config can reach and the cast is load-bearing rather than defensive.
+- vargrad_needs_groups reads it through config_invariants._coeff, the same resolver as `repeats`, so the rule sees a stage override instead of only the base block.
+
+**Validation:**
+
+- test_config_state.py: the retired-key gate and the transitions describe the same set (both old paths retired, both renamed), and the canonical config migrates clean at the new version.
+- test_config_invariants.py: the bwd disjunction mutation test now drives the coefficient, and its aug13/aug14 spellings still resolve the same way.

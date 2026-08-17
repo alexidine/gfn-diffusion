@@ -7,7 +7,25 @@ revised when the reasoning changes rather than appended to.
 Completion is defined at the bottom. Until every box there is checked this is the
 active plan; after that, foundational change requires a demonstrated need.
 
-**Current position.** Phase 0 is done and the first slice of Phase 3 with it:
+**Current position**, by phase. The detail is below; this is the ledger.
+
+| Phase | State | What is left |
+|---|---|---|
+| **0** baseline + version primitive | **DONE** | — |
+| **1** canonical config | **~85%** | optimizer-block nesting; the **state-7 load gate** the mode-key migration never got; 1.1's runtime half; 1.3 tiers S2–S5 |
+| **2** config generation | **NOT STARTED** | 2.1 `configs/generate.py` + 2.2 corpus. 2.3 is a deliberate stub. Gates three completion boxes and is the highest-value unstarted item |
+| **3** executable invariants | **DONE**, folded into Phase 0 | extend as new rules earn it |
+| **3b** analysis package | Tiers 0/1/2 **SHIPPED** | Tier 3 (figures), specified and not built |
+| **4** profiling + benchmark spec | spec + `benchmarks/` **SHIPPED** | the profiling runs — cluster, user-run. Gated on `a100_stab_aug16` launching |
+| **5** MLIP | local optimisations **DONE** | A100 validation |
+| **6** batch sizer | **DESIGNED**, not built | gated on Phase 4 measurement |
+
+The config schema has moved through **six states** since this document was
+written; `docs/change_history.md` is the record and `config_state.CHANGES` is its
+source. States 2–6 are all Phase 1 work: they are what "consolidate" turned out to
+mean once each key was moved next to the thing that consumes it.
+
+**Phase 0 is done and the first slice of Phase 3 with it:**
 
 - `.gitignore` extended — untracked tree 1.1 GB → 67 MB. *The commit is the
   user's to make, and Phase 1 is gated on it.*
@@ -49,7 +67,9 @@ The last three are the ones that still matter, because they describe faults a
 *new* config can reproduce. All three are now asserted in `config_invariants.py`,
 which is what stops them recurring.
 
-**Phase 1 in progress** (tree committed at `7625d09`):
+**Phase 1 in progress.** The tier-C results below were measured against
+`7625d09`; the schema has since moved to state 6, so re-run them against the
+current baseline before quoting them as current.
 
 - **1.0 comparator — DONE.** `config_snapshot.py` + 16 tests. Snapshots the
   *resolved* config (so `auto` is the number it will train at), the parsed
@@ -180,13 +200,18 @@ now landed; one remains.**
 |---|---|
 | `ray_calibration` merge/move | **DONE** — moved under `adaptive_lr`, `enabled` deleted (state 2) |
 | `conditional_worst_quantile` | **DONE** — re-homed beside the stages that consume it |
-| optimizer-block nesting | **NOT DONE** — sized below |
-| `mle_slope_*` → phase-1 exit | **NOT DONE** — needs a protocol schema change |
-| `protocol:` | **PARKED** by the user, pending the experiment synthesis |
+| `protocol:` | **DONE** — `protocol:` names one; `protocols:` holds them all (state 4) |
+| `mle_slope_*` → phase-1 exit | **DONE** — now `mle_gate: {slope_t, min_rate, window}` on the declaring stage (state 5) |
+| optimizer-block nesting | **NOT DONE** — sized below, and now the only one |
 
 They are one change in kind, not five: every one is *move a key nearer the thing
 that consumes it*. And 1.2's own verdict stands for the hard one — **name a
 protocol per problem**, which is what `configs/problems.yaml` exists to hold.
+
+`protocol:` was parked here pending the experiment synthesis, and unparking it
+first was what made `mle_slope_*` cheap: the prediction below was that the MLE
+gate should move *with* `protocol:` rather than before it, and that is what
+happened one state later.
 
 **THE CONSTRAINT, and why `CHANGED: 0` does not certify this class of change.**
 Four validators read literal dotted paths, and
@@ -210,11 +235,38 @@ not see. Worse, the silent-failure sites are real: `getattr(args, 'lr_flow',
 None)` and friends return `None` rather than raising. It is a single deliberate
 change with its own negative controls, not a rider on a comment pass.
 
-**Why `mle_slope_*` is not landed.** "Belongs in the phase-1 exit definition" is
-a schema change, not a move: `protocol.Stage.__init__` validates its spec against
-a closed key set, so the stage would have to accept the new keys and the exit
-machinery would have to read them from there. That is a protocol change with its
-own transition, and it should be made with `protocol:` rather than before it.
+**The mode-key migration, which this table understates.** Landing `protocol:`
+turned the stage list into the place a route declares itself, and three keys that
+had been hand-edited at every mode switch followed it there. They are listed
+together because they are one argument, not three:
+
+| was | is | mechanism |
+|---|---|---|
+| `condition_log_z.{fwd,bwd,replay}_tb_z_source` | `{fwd,bwd,replay}_loss_coeffs.tb_z_source` | a property of what a branch's loss does, and `loss_coeffs` is the one block a stage can override per branch |
+| `z_calibration.enabled` (global) | a stage flag, `flags: {z_calibration: true}` | off by omission, which is what the conditional protocol wants; the block below keeps only *how* |
+| `lr_flow` (hand-edited 0.1 → 1e-4) | stage `on_enter: [set_lr_flow:<x>]` | two new stage actions, `set_lr_flow` and `set_lr_policy` |
+
+This is the payoff the whole phase was aimed at. **Selecting a protocol now
+carries the route's Z regime with it**, so the F-042 trio — the three settings
+whose inheritance detonates `var_conditioning` within ~30 steps — is no longer
+something a mode switch has to remember. Exactly one key still needs a hand-edit,
+`condition_log_z.half_life_visits` (7.0 unconditional / 28.0 conditional), because
+it is global rather than stage-scoped; the mode-switch table in
+`configs/mk_dev.yaml` is where that is recorded.
+
+**It is not finished, and the unfinished half is the load gate.** Measured
+2026-08-17 on the real load path, with a known-retired key as a positive control:
+all four old spellings **load clean and are silently ignored**. None was added to
+`utils._RETIRED_KEYS`, the migration carries no `config_state.CHANGES` record, and
+`project_state_version` did not move — so by PROTOCOL's own rule (a renamed or
+reinterpreted key gets a record *and* the integer) this migration is unrecorded.
+
+The cost is not hypothetical. Every arm of `configs/a100_stab_aug16` writes
+`tb_z_source` into the dead home, where it resolves to `None` and falls back to
+`'learned'` at `train.py:1105` — the F-042 detonation value — while the file reads
+`persistent` in three places and stamps state 6. A version stamp that says
+*migrated* over contents that are not is worse than no stamp. Closing this is
+**state 7**, and it is the first thing Phase 1 owes.
 
 **A live bug found and fixed on the way:** `lr_flow: auto` resolved to the
 literal string `'auto'`. It is deliberately absent from `_LR_KEYS` (alpha* is
@@ -222,8 +274,23 @@ measured over policy parameters only, so the flow groups are exempt from both th
 envelope and `peak_scale`), so nothing filled it in and the string was assigned
 straight to `param_group['lr']`. Now refused at load with the reason.
 
-1.3 (comment discipline) is deliberately held until the §4 audit lands, so the
-rewrite is driven by its work list rather than duplicating it.
+**1.3 (comment discipline) — the audit landed and S1 with it.** It was held so the
+rewrite would be driven by the §4 work list rather than duplicating it;
+`docs/design/comment_audit.md` is that list, and it is the authority on what
+remains. S1 — the ten comments *contradicted by the code they sit on* — was
+applied ahead of 1.2 rather than after, on the reasoning that a comment wrong
+about behaviour does its damage during consolidation, which is the operation most
+likely to trust it. S2–S5 are open. S4 was deferred behind 1.2 and 1.2's config
+prose has now been rewritten, so S4 is unblocked.
+
+The audit's own ranking has been vindicated twice over, and both times in the
+canonical config. `mk_dev.yaml`'s mode-switch table is now S1 in the audit's exact
+sense: it lists five keys as needing a hand-edit at every mode switch, and three
+of them stopped needing one when the mode-key migration moved them. Two of those
+three name keys that **no longer exist**, and a reader who follows the table edits
+a key that loads clean and does nothing. That is the same defect class as the
+`increment_batch_size` docstring, in the one file §1 says a reader inspects to
+learn current state.
 
 ---
 

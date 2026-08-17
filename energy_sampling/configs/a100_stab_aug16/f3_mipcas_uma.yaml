@@ -1,4 +1,4 @@
-project_state_version: 5
+project_state_version: 6
 run_name: f3_mipcas_uma
 tag: a100_stab_aug16
 seed: 12345
@@ -135,6 +135,7 @@ fwd_loss_coeffs:
   subtb_lambda: 0.95
   emp_z: 0
   emp_z_persistent: 0
+  tb_z_source: learned
   traj_grads: 0.0
   reward_grads: 0.0
   repeats: 1.0
@@ -153,11 +154,13 @@ bwd_loss_coeffs:
   subtb_lambda: 0.95
   emp_z: 0
   emp_z_persistent: 0
+  tb_z_source: learned
   level_gap: 0.0
   level_gap_clamp: 10.0
   mle: 0.0
   tbc: 0.0
   repeats: 1.0
+  condition_block_m: 2
   traj_grads: 1.0
   loss_clip: 1000000000.0
   beta: 10.0
@@ -174,8 +177,10 @@ replay_loss_coeffs:
   subtb_lambda: 0.95
   emp_z: 0
   emp_z_persistent: 0
+  tb_z_source: learned
   mle: 0.0
   repeats: 1.0
+  condition_block_m: 0
   traj_grads: 0.0
   loss_clip: 1000000000.0
   beta: 10.0
@@ -185,15 +190,11 @@ condition_log_z:
   trim_frac: 0.01
   max_batch_weight: 200.0
   discovery_half_life_steps: 200.0
-  fwd_tb_z_source: learned
-  bwd_tb_z_source: learned
-  replay_tb_z_source: learned
   weighted_condition_sampling: true
   weighted_condition_sampling_clip_quantile: 0.99
   weighted_condition_sampling_temperature: 0.3
   weighted_condition_sampling_uniform_beta: 0.5
 z_calibration:
-  enabled: true
   mode: rollout
   sensor: pooled
   sensor_quantile: 0.5
@@ -232,11 +233,11 @@ protocols:
       exit:
       - metric: gates/mle_flat
         above: 0.5
-        patience: 1
+        patience: 5
       - metric: eval/wass_debiased
-        below: 100.0
+        below: 0.015
       - metric: bwd/tbc
-        below: 1000.0
+        below: 2.0
       on_exit:
       - snapshot:phase1_exit
       - snapshot_prior
@@ -248,6 +249,7 @@ protocols:
       flags:
         update_log_z: true
         buffers_active: true
+        z_calibration: true
       on_enter:
       - rebuild_prior_by_churn
       - bootstrap_z:train_conditioner
@@ -320,14 +322,15 @@ protocols:
           mle: 1.0
           tbc: 1.0
           repeats: 2.0
+          tb_z_source: persistent
       exit:
       - metric: gates/mle_flat
         above: 0.5
-        patience: 1
+        patience: 5
       - metric: eval/wass_debiased
-        below: 100.0
+        below: 0.015
       - metric: bwd/tbc
-        below: 1000.0
+        below: 2.0
       on_exit:
       - snapshot:phase1_exit
       - snapshot_prior
@@ -337,6 +340,7 @@ protocols:
       lr_sensor:
         kind: hyper
         beta: 0.05
+        cos_target: 0.03
       flags:
         update_log_z: true
         buffers_active: true
@@ -344,6 +348,7 @@ protocols:
         weighted_condition_sampling: true
       on_enter:
       - rebuild_prior_by_churn
+      - set_lr_flow:1.0e-4
       fracs:
         fwd: 0.5
         bwd: 0.5
@@ -355,10 +360,15 @@ protocols:
           vg_by_condition: 1.0
           emp_z: 1.0
           repeats: 2.0
+          tb_z_source: persistent
         bwd:
           vg_lb: 1.0
-          repeats: 2.0
-          level_gap: 1.0
+          condition_block_m: 2.0
+          repeats: 1.0
+          level_gap: 0
+          tb_z_source: persistent
+        replay:
+          tb_z_source: persistent
       balance:
         kind: proportional
         pinned:
@@ -375,15 +385,6 @@ protocols:
           bwd: 0.5
         floor: 0.1
         alpha: 0.01
-      exit:
-      - metric: fwd/logw_std_within
-        below: 6.0
-        patience: 5
-      - metric: bwd/logw_std_within
-        below: 3.0
-        patience: 5
-      on_exit:
-      - snapshot:var_conditioned
 controller:
   min_mode_frac: 0.001
   beta: 0.025
@@ -407,7 +408,6 @@ buffers:
     init_fraction: 0.25
     expire_max_frac: 0.1
     anchor_floor_frac: 0.1
-    condition_block_m: 2
     reward_min: 0
     ramp_floor: 100
     ramp_width: 50
@@ -416,7 +416,6 @@ buffers:
     mean_residence_steps: 50
     max_size: 12000
     admit_reward_min: -200
-    condition_block_m: 0
     prioritise:
       enabled: true
       kappa: 1.0
@@ -456,6 +455,8 @@ z_primes:
 - 1
 vector_conditioning: false
 vector_conditioning_dim: 3
+embedding_conditioning: false
+embedding_conditioning_dim: 192
 energy_config:
   internal_oom_recovery: false
   temperature: 2.5

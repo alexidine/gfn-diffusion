@@ -87,6 +87,22 @@ class LRController:
     _POLICY_BASE = {'fwd': 'lr_policy', 'bwd': 'lr_back', 'replay': 'lr_replay',
                     'fused': 'lr_fused'}
 
+    # How far peak_scale must fall below its own high-water mark before the warmup
+    # ramp freezes (see _maybe_freeze_envelope). PER SENSOR, because their firing
+    # rates differ by ~500x and the same number cannot mean the same thing to both:
+    #   ray      reads at most once per ray_calibration.period, so ANY downward move
+    #            is already a considered verdict from a bracketed measurement, not a
+    #            noisy sample. 0.0 = freeze on the first cut.
+    #   plateau  only ever cuts, so its first cut carries the same weight.
+    #   hyper    fires EVERY step against a cosine that swings either side of zero,
+    #            so a single reading is noise. peak_scale is the integral of those
+    #            readings, which is where persistence accumulates -- 5% off the
+    #            high-water mark means it has been pulling down, not jittering.
+    # A stage with no sensor never moves peak_scale, so it never freezes and the
+    # ramp runs to hold with only on_divergence able to cut -- the no-controller
+    # mode, which needs no special case here.
+    _FREEZE_DROP_DEFAULT = {'ray': 0.0, 'plateau': 0.0, 'hyper': 0.05}
+
     _STATE_VER = 8
 
     def __init__(self, modeller):
@@ -297,7 +313,8 @@ class LRController:
         self._apply_lrs(st)
         print(f"lr_ctrl: plateau cut -> peak_scale {st['peak_scale']:.4g}")
 
-    def on_hypergradient(self, cos: float, beta: float, beta_down: float = None):
+    def on_hypergradient(self, cos: float, beta: float, beta_down: float = None,
+                         cos_target: float = 0.0):
         """
         Apply one hypergradient verdict: `peak_scale *= exp(beta * cos)`.
 
@@ -340,19 +357,35 @@ class LRController:
         # `on_plateau` are: the envelope is deliberately ramping the rate, so a
         # cosine measured through that suppression is not evidence about the
         # operating point.
-        if self._elapsed(st) < int(self._cfg('warmup_steps', 1000)):
-            self._hyper_last['status'] = 'warmup'
-            return
+        # HYPER DOES NOT HOLD THROUGH WARMUP -- and it is the reason the ramp can
+        # self-terminate. `_maybe_freeze_envelope` freezes the envelope once this
+        # sensor has pulled peak_scale materially off its high-water mark, which
+        # requires the sensor to be moving peak_scale DURING the ramp. Reinstating
+        # the hold here would silently disable that freeze, since peak_scale would
+        # sit at 1.0 for the whole warmup and could never fall.
+        # ray and plateau still hold: both score a LOSS, which a deliberate ramp
+        # really does distort. This one scores no loss.
         if not (isinstance(cos, float) and math.isfinite(cos)):
             self._hyper_last['status'] = 'nonfinite'
             return
-        b = float(beta if cos > 0 or beta_down is None else beta_down)
+        # STEER TO cos == cos_target, NOT to cos == 0. The fixed point of
+        # peak_scale *= exp(beta*cos) is cos == 0, which is the one-step optimum --
+        # the rate adaptive_lr.calibration's own comment says a run does not
+        # survive, because a local probe cannot see the gradient-noise term. `ray`
+        # carries that margin as alpha_target: 4.0 (it runs at a QUARTER of the
+        # greedy optimum); this is hyper's equivalent, and 0.0 reproduces the old
+        # behaviour exactly.
+        err = float(cos) - float(cos_target)
+        # up/down is decided by the ERROR, not by the raw cosine: with a positive
+        # target, a small positive cos now means "hotter than intended" and must
+        # take the down branch.
+        b = float(beta if err > 0 or beta_down is None else beta_down)
         lo, hi = self._peak_bounds()
         ceiling = self._current_ceiling()
         if ceiling is not None:
             hi = min(hi, ceiling)
         before = float(st['peak_scale'])
-        st['peak_scale'] = max(lo, min(hi, before * math.exp(b * float(cos))))
+        st['peak_scale'] = max(lo, min(hi, before * math.exp(b * err)))
         self._hyper_last['applied'] = st['peak_scale'] / before if before else 1.0
         self._hypergrads = getattr(self, '_hypergrads', 0) + 1
         # ANNOUNCE THE FIRST FIRE, once, the way the other two sensors announce
@@ -375,6 +408,9 @@ class LRController:
             'phase_seen': phase,
             'stage_start_step': int(self.modeller.step_ind),
             'peak_scale': 1.0,
+            # per-stage, so each stage ramps and freezes on its own evidence
+            'peak_high_water': 1.0,
+            'envelope_frozen_at': None,
             'envelope': 1.0 / self.modeller.args.lr_warmup_ratio,
         }
 
@@ -436,6 +472,10 @@ class LRController:
         """Ramp -> hold, in [1/lr_warmup_ratio, 1.0]. No decay leg: the
         calibration rates the PRODUCT peak x envelope, so a deterministic
         multiplier on it is absorbed and only inflates peak against its bounds."""
+        # A FROZEN envelope short-circuits the ramp -- see _maybe_freeze_envelope.
+        frozen = st.get('envelope_frozen_at')
+        if frozen is not None:
+            return float(frozen)
         warmup_steps = max(1, int(self._cfg('warmup_steps', 1000)))
         elapsed = self._elapsed(st)
         if elapsed >= warmup_steps:
@@ -484,6 +524,7 @@ class LRController:
         on_calibration, on_hypergradient, on_plateau and on_divergence do."""
         st = self._state()
         self._maybe_restart(st)
+        self._maybe_freeze_envelope(st)
         st['envelope'] = self._envelope(st)
         ceiling = self._current_ceiling()
         if ceiling is not None:
@@ -491,6 +532,80 @@ class LRController:
         self._apply_lrs(st)
         self._emit(st)
         return self.modeller.optimizers['fwd'].param_groups[0]['lr']
+
+    def _freeze_drop(self):
+        """The fall from high-water that freezes the ramp, or None to disable it.
+
+        `adaptive_lr.envelope_freeze_drop` selects between the three modes:
+          absent / 'auto'  per-SENSOR default (_FREEZE_DROP_DEFAULT) -- ray and
+                           plateau freeze on their first cut, hyper waits for a
+                           persistent 5% pull-down
+          a float          that threshold whatever the sensor declares
+          null / false     freeze OFF: ramp to hold, only on_divergence cuts
+        """
+        cfg = self._cfg('envelope_freeze_drop', 'auto')
+        if cfg is None or cfg is False:
+            return None
+        if not isinstance(cfg, str):
+            return float(cfg)
+        if cfg != 'auto':
+            raise ValueError(
+                f"adaptive_lr.envelope_freeze_drop: expected 'auto', a float, or "
+                f"null -- got {cfg!r}")
+        stage = getattr(getattr(self.modeller, 'protocol', None), 'stage', None)
+        kind = (getattr(stage, 'lr_sensor', None) or {}).get('kind')
+        # kind None / 'none' -> no entry -> None -> freeze off, which is right:
+        # nothing moves peak_scale on such a stage, so there is nothing to freeze on
+        return self._FREEZE_DROP_DEFAULT.get(kind)
+
+    def _maybe_freeze_envelope(self, st):
+        """Stop the warmup ramp the moment the sensor is materially pulling AGAINST
+        it, and hold the envelope there for the rest of the stage.
+
+        WHY THE RAMP NEEDS AN OFF SWITCH AT ALL. `warmup_steps` is a step count, so
+        the ramp ends on a constant rather than on evidence, and it re-arms at every
+        stage transition -- which is exactly where the optimizers are fresh and the
+        loss surface just changed. Whatever the rate is doing, the envelope keeps
+        climbing to 1.0 on schedule. It also fights `on_divergence`: that cuts
+        peak_scale, while the envelope goes on re-inflating the product underneath
+        it.
+
+        WHY THE TRIGGER IS THE ACTUATOR, NOT THE SENSOR. The obvious rule is "freeze
+        when cos goes negative", but cos is noisy about zero -- measured swinging
+        -0.2 to +0.4 through a live warmup -- so a single negative reading fires
+        within a few steps and the ramp never happens at all. peak_scale is the
+        integral of those readings, so noise averages out of it while a sustained
+        too-hot verdict accumulates. Freezing on a fall from its own HIGH-WATER mark
+        also means the test cannot be tripped by the climb itself.
+
+        Recoverable by construction: after the freeze the sensor still owns
+        peak_scale in both directions, with `bounds` (default 2000x) far above
+        anything the ramp would have reached. Freezing early costs some warmup, not
+        the operating point.
+
+        Per stage: `_fresh_state` clears both fields, so each stage ramps and
+        freezes on its own evidence.
+        """
+        if st.get('envelope_frozen_at') is not None:
+            return
+        if self._elapsed(st) >= int(self._cfg('warmup_steps', 1000)):
+            return                       # ramp already finished; nothing to freeze
+        peak = float(st['peak_scale'])
+        hw = float(st.get('peak_high_water', peak))
+        if peak >= hw:
+            st['peak_high_water'] = peak
+            return
+        st['peak_high_water'] = hw
+        drop = self._freeze_drop()
+        if drop is None:                 # freeze disabled: ramp to hold regardless
+            return
+        # peak < hw is already established above, so drop 0.0 means "any fall"
+        if peak >= hw * (1.0 - drop):
+            return
+        st['envelope_frozen_at'] = self._envelope(st)
+        print(f"lr_ctrl: warmup ramp FROZEN at envelope {st['envelope_frozen_at']:.4g} "
+              f"-- peak_scale {peak:.4g} is {100.0 * (1.0 - peak / hw):.1f}% off its "
+              f"high-water {hw:.4g}, i.e. the sensor is pulling against the ramp")
 
     def _maybe_restart(self, st):
         """Warm restart (SGDR-style): put peak_scale back to 1.0 and let the

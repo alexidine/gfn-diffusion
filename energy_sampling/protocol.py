@@ -28,11 +28,14 @@ declares:
                     A stage with no exit is terminal.
   on_exit/on_enter  transition actions (snapshot:<tag>, snapshot_prior,
                     bootstrap_z, seed_prior_from_anchors,
-                    reseed_prior_from_dataset, rebuild_prior_by_churn; ACTIONS
-                    below is the authoritative list) -- the route-specific
-                    physics; everything generic (optimizer rebuild, monitor
-                    cooldown, LR re-warm) happens automatically at EVERY
-                    transition
+                    reseed_prior_from_dataset, rebuild_prior_by_churn,
+                    set_lr_flow:<float>; ACTIONS below is the authoritative
+                    list) -- the route-specific physics; everything generic
+                    (optimizer rebuild, monitor cooldown, LR re-warm) happens
+                    automatically at EVERY transition.
+                    NB the first stage is never ENTERED via a transition, so its
+                    on_enter does not fire -- put entry actions on the stage
+                    being transitioned INTO
   skip_if           entry condition ('prior_loaded'): on a fresh run the stage
                     is skipped when the condition holds (e.g. the MLE warm-
                     start is redundant when a prior model was loaded by path
@@ -128,7 +131,7 @@ MODES = ('fwd', 'bwd', 'replay')
 TRAIN_MODES = ('bwd', 'fused')
 BWD_SAMPLING_MODES = ('dataset', 'prior')
 STAGE_FLAGS = ('update_log_z', 'scramble_conditions', 'weighted_condition_sampling',
-               'buffers_active', 'weighted_bwd_sampling')
+               'buffers_active', 'weighted_bwd_sampling', 'z_calibration')
 
 # `mle_gate` is a BLOCK, not a flag. It was a flag on the stage while its three
 # parameters sat at top level, which put the switch and the settings in different
@@ -140,7 +143,8 @@ MLE_GATE_DEFAULTS = {
     'window': 300,       # train steps of gate samples the slope is regressed over
 }
 ACTIONS = ('snapshot', 'snapshot_prior', 'bootstrap_z', 'seed_prior_from_anchors',
-           'reseed_prior_from_dataset', 'rebuild_prior_by_churn')
+           'reseed_prior_from_dataset', 'rebuild_prior_by_churn', 'set_lr_flow',
+           'set_lr_policy')
 SKIP_CONDITIONS = ('prior_loaded',)
 
 # Per-stage LR sensor kinds -- see Stage._parse_lr_sensor for why this is
@@ -473,10 +477,24 @@ class Stage:
                                  f"requires an explicit 'beta' -- it is a "
                                  f"bandwidth, and no value is right for every "
                                  f"stage")
-            bad = set(node) - {'kind', 'beta', 'beta_down', 'every'}
+            bad = set(node) - {'kind', 'beta', 'beta_down', 'every', 'cos_target'}
             if bad:
                 raise ValueError(f"stage '{self.name}': unknown lr_sensor keys "
                                  f"for kind 'hyper': {sorted(bad)}")
+            # cos_target is hyper's analogue of calibration.alpha_target, and it
+            # exists for the same reason. The update's fixed point is cos == this,
+            # so 0.0 (the default) parks the rate at the ONE-STEP optimum -- which
+            # adaptive_lr.calibration's own comment says "the rate a run survives
+            # sits well BELOW", because a local probe cannot see the gradient-noise
+            # term. `ray` carries that margin explicitly as alpha_target: 4.0;
+            # hyper had none. A POSITIVE value holds the rate under the greedy
+            # optimum by steering to "still mildly under-stepped".
+            ct = node.get('cos_target', 0.0)
+            if not isinstance(ct, (int, float)) or not (-1.0 < float(ct) < 1.0):
+                raise ValueError(f"stage '{self.name}': lr_sensor.cos_target must "
+                                 f"be a number in (-1, 1) -- it is compared against "
+                                 f"a cosine -- got {ct!r}")
+            node['cos_target'] = float(ct)
             for k in ('beta', 'beta_down'):
                 if k in node and not (isinstance(node[k], (int, float))
                                       and float(node[k]) > 0):
@@ -921,6 +939,13 @@ class Stage:
             if name == 'rebuild_prior_by_churn' and arg and not arg.isdigit():
                 raise ValueError(f"stage '{self.name}' {where}: '{a}' -- expected "
                                  f"rebuild_prior_by_churn or rebuild_prior_by_churn:<int>")
+            if name in ('set_lr_flow', 'set_lr_policy'):
+                try:
+                    if float(arg) <= 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    raise ValueError(f"stage '{self.name}' {where}: '{a}' -- expected "
+                                     f"{name}:<positive float>, e.g. {name}:1.0e-4")
             actions.append((name, arg))
         return actions
 
@@ -1082,9 +1107,15 @@ class StageProtocol:
         once, pristine) overlaid with the current stage's overrides. Unknown
         override keys are a config error, not a silent no-op."""
         if self._coeff_defaults is None:
+            # str is admitted alongside the numbers because not every entry in a
+            # loss_coeffs block is a weight -- tb_z_source is 'learned'/'persistent'
+            # and lives here so a stage can set it per branch. Filtering to numerics
+            # dropped it from `base`, which then made the stage override read as an
+            # unknown key. Callers that do arithmetic select the coefficients they
+            # want by name; none iterate the block and multiply.
             self._coeff_defaults = {
                 m: {k: v for k, v in vars(getattr(self.m.args, f'{m}_loss_coeffs')).items()
-                    if isinstance(v, (int, float))}
+                    if isinstance(v, (int, float, str))}
                 for m in MODES}
         base = self._coeff_defaults[mode]
         overrides = self.stage.loss_coeffs.get(mode, {})
@@ -1428,6 +1459,43 @@ class StageProtocol:
             self.m.reseed_prior_from_dataset(flush=(arg == 'flush'))
         elif name == 'rebuild_prior_by_churn':
             self.m.rebuild_prior_by_churn(int(arg) if arg else None)
+        elif name == 'set_lr_flow':
+            # The flow/Z group is exempt from the warmup envelope and the servo
+            # (adaptive_lr.control_flow_lr: false), so nothing else will move it
+            # and nothing else will move it BACK -- this is the only lever on it.
+            # It is a stage action because the right rate is a property of what
+            # the flow head IS on this route: a LearnableScalar unconditionally
+            # (1-D convex, 0.1 is jitter) versus a per-condition NETWORK on the
+            # conditional one, where the same 0.1 diverges once emp_z trains it.
+            # Set on args AND on both live groups, since a rebuild reads args
+            # while an already-built optimizer does not.
+            v = float(arg)
+            m = self.m
+            m.args.lr_flow = v
+            if 'flow' in m.optimizers:
+                for g in m.optimizers['flow'].param_groups:
+                    g['lr'] = v
+            if 'fused' in m.optimizers:      # the fused optimizer's TRAILING group is the flow one
+                m.optimizers['fused'].param_groups[-1]['lr'] = v
+            print(f"protocol: lr_flow -> {v:g} on entering '{self.stage.name}'")
+        elif name == 'set_lr_policy':
+            # PER-STAGE BASE RATE for the servo-managed policy groups. adaptive_lr.
+            # seed_lr is ONE number for every stage, but a bwd MLE stage and a fused
+            # VarGrad stage on a per-condition target do not want the same rate --
+            # so the servo had to discover the difference from scratch, through a
+            # ramp, at every transition. Measured on the QM9 conditional route: the
+            # controller settled 3-7x BELOW seed_lr in three independent runs.
+            # This sets the BASE only. The group stays servo-managed, because
+            # _managed_keys reads args.lr_servo_managed -- recorded by
+            # resolve_derived_config at load -- and not the live value. So the
+            # sensor keeps full authority; it just starts from a sane place.
+            # _apply_lrs recomputes base * peak_scale * envelope on the next tick.
+            v = float(arg)
+            m = self.m
+            for key in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'):
+                setattr(m.args, key, v)
+            print(f"protocol: lr_policy/back/replay/fused -> {v:g} on entering "
+                  f"'{self.stage.name}' (base only; servo still owns peak_scale)")
 
     def _snapshot(self, tag: str):
         """Pre-transition snapshot: the untouched end-state of the outgoing

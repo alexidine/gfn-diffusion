@@ -24,6 +24,30 @@ extensions landed in `benchmarks/registry.yaml` the same day (13 benchmarks,
 > runnable locally, so **the next cluster run is the verification** — check that
 > arms pass step 320 with `fused_grad/*` present and no `fused_grad/disabled`.
 >
+> ### Regenerated from the state-6 canonical config (2026-08-17)
+>
+> **The battery now has ONE base**, `base_uncond.yaml`, a straight copy of
+> `configs/mk_dev.yaml`. The conditional arms derive from it through
+> `make.py::CONDITIONAL_PROBLEM` (protocol selector, `embedding_conditioning`,
+> temperature 6.9, `half_life_visits` 28, and the library's three paths). The
+> second snapshot is gone — a second copy of the canonical config is precisely
+> what drifted into F-042.
+>
+> State 6 also **fixed the shape of that bug rather than its values**:
+> `tb_z_source` and `condition_block_m` became per-branch loss coefficients that
+> `conditional_vargrad`'s stages declare, and `z_calibration` became a stage flag
+> the conditional stages omit. So selecting the protocol now carries two of the
+> three settings, `conditionalise_z()` is deleted, and the generation-time
+> assertions check that the **protocol still declares them** rather than
+> re-applying them — if a future canonical edit drops them, generation fails
+> instead of the battery quietly regressing.
+>
+> Re-snapshot whenever mk_dev moves; `make.py` refuses to run against a base
+> whose `project_state_version` differs from the code's:
+>
+>     cp configs/mk_dev.yaml configs/a100_stab_aug16/base_uncond.yaml
+>     python configs/a100_stab_aug16/make.py
+>
 > ### Conditional arms also aborted — three inherited settings, not MLE (2026-08-17)
 >
 > `f2` cleared MLE, the transition, the churn generate-up (4,880 → 62,500) and

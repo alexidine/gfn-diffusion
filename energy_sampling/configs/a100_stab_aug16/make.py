@@ -154,6 +154,7 @@ ROOT = HERE.parents[1]                      # energy_sampling/
 sys.path.insert(0, str(ROOT))
 
 import config_invariants                    # noqa: E402
+import config_state                         # noqa: E402
 from benchmarks import registry             # noqa: E402
 
 TAG = 'a100_stab_aug16'
@@ -366,27 +367,54 @@ def strip_lr_sensors(cfg):
     return cfg
 
 
-def conditionalise_z(cfg):
-    """Switch the three Z-side blocks from their UNCONDITIONAL defaults.
+# The conditional route as a PROBLEM LAYER on the canonical config, which is all
+# it is once state 6 landed. Previously this battery kept a second base snapshot
+# for the conditional arms, and that snapshot is exactly how the route came to
+# carry three unconditional Z settings (F-042): a second copy of the canonical
+# config drifts from it, silently, in the direction nobody is reading.
+#
+# WHAT IS *NOT* HERE, DELIBERATELY. tb_z_source and condition_block_m are set by
+# `conditional_vargrad`'s own stages in mk_dev (var_conditioning declares
+# persistent on all three branches plus bwd condition_block_m 2), and
+# z_calibration is a STAGE FLAG that the conditional stages simply omit. So the
+# route now adopts all three by selecting the protocol -- which is the point of
+# the state-6 change, and the reason this dict is five keys instead of eight.
+CONDITIONAL_PROBLEM = {
+    'protocol': 'conditional_vargrad',
+    'embedding_conditioning': True,      # pre-baked frozen Mo3ENet latents, not the live-GNN route
+    'energy_config': {'temperature': 6.9},   # RAW elj units for the QM9 split
+    # half_life_visits is the ONE conditional setting the protocol cannot carry:
+    # condition_log_z is global, not stage-scoped. mk_dev's 7 is reasoned for a
+    # ONE-condition run ("7 visits == 7 steps"); every conditional battery that
+    # ran used 28, because a condition in a large library is revisited far more
+    # sparsely. Kept here until it too becomes stage-scoped.
+    'condition_log_z': {'half_life_visits': 28.0},
+}
 
-    THE CANONICAL CONFIG SAYS TO DO THIS AND NOTHING ENFORCED IT. mk_dev's
-    condition_log_z block is annotated "MONITORING ONLY ... it becomes
-    load-bearing on the conditional route", and its z_calibration parameters
-    "are set for the UNCONDITIONAL route". A conditional config spawned from the
-    canonical one inherits all three unchanged, which is what these arms did.
 
-    The values are not a derivation -- they are what every conditional battery
-    that RAN carries (qm9_aug11, qm9_anchor_aug13, qm9anchor_aug14, all three
-    identical on all three keys), against a detonation in every conditional run
-    that carried the unconditional trio, including one with a 3.2k-step MLE warm
-    start. `config_invariants.conditional_z_settings_are_conditional` now
-    reports the departure at load; this function is what makes these arms not
-    depart. See findings F-042.
+def conditional_base(base, data):
+    """mk_dev + CONDITIONAL_PROBLEM + this library's paths. The battery's only
+    conditional base, DERIVED rather than snapshotted.
+
+    OBSOLETES the previous `conditionalise_z()`, and the reason is worth keeping.
+    That function existed to re-set three Z keys the conditional route needs
+    (z_calibration off, tb_z_source persistent, half_life 28) because a second
+    base snapshot had inherited the unconditional values and detonated
+    var_conditioning in ~30 steps (F-042). State 6 fixed the SHAPE of that
+    problem rather than the values: tb_z_source and condition_block_m became
+    per-branch loss coefficients that `conditional_vargrad`'s own stages declare,
+    and z_calibration became a stage flag the conditional stages omit. So
+    selecting the protocol now carries two of the three, and only
+    half_life_visits (global, not stage-scoped) is left in CONDITIONAL_PROBLEM.
+
+    A post-hoc correction became a structural property, which is the right end
+    state and is why this function applies a layer instead of patching one.
     """
-    cfg['z_calibration']['enabled'] = False
-    for key in ('fwd_tb_z_source', 'bwd_tb_z_source', 'replay_tb_z_source'):
-        cfg['condition_log_z'][key] = 'persistent'
-    cfg['condition_log_z']['half_life_visits'] = 28.0
+    cfg = copy.deepcopy(base)
+    merge(cfg, copy.deepcopy(CONDITIONAL_PROBLEM))
+    cfg['prior_path'] = CLUSTER_PRIOR_DIR + data['prior']
+    cfg['molecules_path'] = CLUSTER_PRIOR_DIR + data['conditions']
+    cfg['test_molecules_path'] = CLUSTER_PRIOR_DIR + data['test_conditions']
     return cfg
 
 
@@ -436,8 +464,10 @@ def archive_step(archive):
 # wave 1
 # ---------------------------------------------------------------------------
 
-def build_wave1(base_uncond, base_cond, cond_data, cond_mle_seed=None):
+def build_wave1(base, cond_data, cond_mle_seed=None):
     arms = []
+    base_cond = conditional_base(base, cond_data)
+    base_uncond = base
 
     def f_arm(name, base, batch, epochs, archive_period, extra=None, cond=False):
         cfg = copy.deepcopy(base)
@@ -450,10 +480,6 @@ def build_wave1(base_uncond, base_cond, cond_data, cond_mle_seed=None):
             stage(cfg, proto, 'train_prior')['mle_gate'] = dict(MLE_GATE)
         if cond:
             make_var_conditioning_terminal(cfg)
-            conditionalise_z(cfg)
-            cfg['prior_path'] = CLUSTER_PRIOR_DIR + cond_data['prior']
-            cfg['molecules_path'] = CLUSTER_PRIOR_DIR + cond_data['conditions']
-            cfg['test_molecules_path'] = CLUSTER_PRIOR_DIR + cond_data['test_conditions']
         else:
             p = CLUSTER_PRIOR_DIR + 'mipcas_sg2_zp1_elj_prior_dataset.pt'
             cfg['prior_path'] = p
@@ -487,8 +513,10 @@ def build_wave1(base_uncond, base_cond, cond_data, cond_mle_seed=None):
 # wave 2
 # ---------------------------------------------------------------------------
 
-def build_wave2(base_uncond, base_cond, a):
+def build_wave2(base, cond_data, a):
     arms, dropped = [], []
+    base_cond = conditional_base(base, cond_data)
+    base_uncond = base
 
     def bench_base(bid, cond=False):
         cfg = copy.deepcopy(base_cond if cond else base_uncond)
@@ -497,10 +525,6 @@ def build_wave2(base_uncond, base_cond, a):
         strip_grad_geometry(cfg)
         if cond:
             make_var_conditioning_terminal(cfg)
-            conditionalise_z(cfg)
-            cfg['prior_path'] = CLUSTER_PRIOR_DIR + 'qm9split_prior.pt'
-            cfg['molecules_path'] = CLUSTER_PRIOR_DIR + 'qm9split_conditions.pt'
-            cfg['test_molecules_path'] = CLUSTER_PRIOR_DIR + 'qm9split_test_conditions.pt'
         else:
             p = CLUSTER_PRIOR_DIR + 'mipcas_sg2_zp1_elj_prior_dataset.pt'
             cfg['prior_path'] = p          # uma/mace groups override via their extra
@@ -686,16 +710,38 @@ def validate(name, wave, kind, bid, cfg):
         assert cfg['grad_geometry']['enabled'] is False, \
             f'{name}: the grad-geometry probe adds a backward per branch inside the window'
     elif not conditional:
-        assert cfg['z_calibration']['enabled'] is True, \
-            f'{name}: unconditional F arms are production-shaped'
+        # production-shaped: z_calibration ON, which since state 6 is a STAGE
+        # FLAG rather than a global `enabled`
+        assert any((st.get('flags') or {}).get('z_calibration')
+                   for st in cfg['protocols']['unconditional_tb']['stages']), \
+            (f'{name}: no unconditional stage declares the z_calibration flag. The F '
+             f'arms are production-shaped, and since state 6 that switch is a stage '
+             f'flag -- a global z_calibration.enabled would be silently inert.')
 
     if conditional:
-        # the three keys documented as unconditional-route settings, which every
-        # conditional battery that RAN switched and every one that detonated did not
-        assert cfg['z_calibration']['enabled'] is False, f'{name}: z_cal off on conditional'
-        for k in ('fwd_tb_z_source', 'bwd_tb_z_source', 'replay_tb_z_source'):
-            assert cfg['condition_log_z'][k] == 'persistent', f'{name}: {k} must be persistent'
-        assert cfg['condition_log_z']['half_life_visits'] == 28.0, f'{name}: half_life 28'
+        # The F-042 trio, checked WHERE STATE 6 PUT IT. Two of the three are now
+        # carried by conditional_vargrad's own stages, so this asserts the
+        # protocol actually declares them rather than re-setting them here -- if
+        # a future mk_dev edit drops them from the stage, these fail instead of
+        # the battery silently regressing to the unconditional behaviour.
+        vc = stage(cfg, 'conditional_vargrad', 'var_conditioning')
+        for branch in ('fwd', 'bwd', 'replay'):
+            got = ((vc.get('loss_coeffs') or {}).get(branch) or {}).get('tb_z_source')
+            assert got == 'persistent', \
+                (f'{name}: var_conditioning {branch} tb_z_source is {got!r}, not '
+                 f'"persistent" -- the conditional persistent-Z regime is carried by '
+                 f'the protocol since state 6; a config that lost it detonates '
+                 f'(findings F-042)')
+        for st in cfg['protocols']['conditional_vargrad']['stages']:
+            assert not (st.get('flags') or {}).get('z_calibration'), \
+                (f'{name}: stage {st["name"]!r} declares the z_calibration flag on a '
+                 f'CONDITIONAL route; every battery that ran had it off (off by '
+                 f'omission is the state-6 spelling)')
+        assert cfg['condition_log_z']['half_life_visits'] == 28.0, \
+            f'{name}: conditional half_life_visits must be 28 (mk_dev 7 is one-condition)'
+        assert 'enabled' not in (cfg.get('z_calibration') or {}), \
+            (f'{name}: z_calibration.enabled is a pre-state-6 spelling; it is a STAGE '
+             f'FLAG now, and a leftover global key here is silently inert')
 
     # requirement 4: config_invariants over every generated config
     violations = config_invariants.check(cfg)
@@ -843,6 +889,41 @@ srun singularity exec --nv \\
 # preflight (run ON THE CLUSTER)
 # ---------------------------------------------------------------------------
 
+def write_set(outdir, label, names, time_limit):
+    """One index + one sbatch over an ARBITRARY list of already-generated arms.
+
+    The per-wave files group by TIME CLASS, which is right when a wave is
+    submitted whole. A resubmission is not a wave: it is whatever failed plus
+    whatever is newly unblocked, drawn from several classes at once, and
+    `sbatch --array=` surgery across two files is how the wrong arm gets
+    launched. One set = one array = one thing to check.
+
+    THE TIME LIMIT IS THE MAX OVER THE MEMBERS, which is the honest cost of
+    putting them in one file: SLURM has no per-task limit, so a 1 h arm sharing
+    a set with a 6 h arm is queued as 6 h. Mixing a fast arm into an MLIP set
+    trades queue priority for one command; keep sets to one class when the
+    arms are ready at the same time, and use this when they are not.
+    """
+    missing = [n for n in names if not (outdir / f'{n}.yaml').exists()]
+    if missing:
+        raise SystemExit(f'set {label!r}: no generated config for {missing} -- '
+                         f'generate the wave first, or check the arm names')
+    rows = []
+    for n in names:
+        cfg = load_yaml(outdir / f'{n}.yaml')
+        rows.append(f'{n}\tset\t-\t{cfg["batch_size"]}\t{cfg["epochs"]}')
+    (outdir / f'INDEX_{label}.tsv').write_text(
+        'name\tkind\tbenchmark_id\tbatch\tepochs\n' + '\n'.join(rows) + '\n', encoding='utf-8')
+    (outdir / f'submit_{label}.sbatch').write_text(
+        SBATCH_TEMPLATE.format(label=label, time=time_limit,
+                               array=f'0-{len(names) - 1}'), encoding='utf-8')
+    print(f'wrote submit_{label}.sbatch  --array=0-{len(names) - 1}  ({len(names)} arms, '
+          f'--time={time_limit})')
+    for i, n in enumerate(names):
+        print(f'  {i}  {n}')
+    return len(names)
+
+
 def preflight(outdir):
     paths = sorted(p for p in outdir.glob('*.yaml')
                    if p.name not in ('base_uncond.yaml', 'base_cond.yaml'))
@@ -901,25 +982,50 @@ def main():
                          'matching MLE seed, since the two must share a problem identity')
     ap.add_argument('--cond-mle-seed', default=None,
                     help='override the library default seed. Pass "" to run cold.')
+    ap.add_argument('--set', dest='set_spec', metavar='LABEL=arm1,arm2,...',
+                    help='write ONE index+sbatch over an arbitrary list of already-'
+                         'generated arms (a resubmission draws from several time '
+                         'classes at once). --time is the max over the members.')
     a = ap.parse_args()
 
     outdir = Path(a.outdir) if a.outdir else HERE
     if a.preflight:
         raise SystemExit(preflight(outdir))
 
-    base_uncond = load_yaml(HERE / 'base_uncond.yaml')
-    base_cond = load_yaml(HERE / 'base_cond.yaml')
-    for b, name in ((base_uncond, 'base_uncond'), (base_cond, 'base_cond')):
-        assert b.get('project_state_version') == 5, f'{name}: re-snapshot against current state'
+    if a.set_spec:
+        # Works on the ALREADY-GENERATED yamls, so it neither regenerates nor
+        # revalidates -- run it after the wave it draws from.
+        label, _, csv = a.set_spec.partition('=')
+        names = [n.strip() for n in csv.split(',') if n.strip()]
+        if not label or not names:
+            raise SystemExit('--set wants LABEL=arm1,arm2,...')
+        # MLIP arms set the ceiling when present -- explicit rather than clever
+        mlip = any(('uma' in n or 'mace' in n) for n in names)
+        limit = TIME_CLASSES['wave1_mlip'] if mlip else TIME_CLASSES['wave1_elj']
+        raise SystemExit(0 if write_set(outdir, label, names, limit) else 1)
 
+    # ONE base, and it is a straight copy of the canonical config. The
+    # conditional arms derive from it via CONDITIONAL_PROBLEM rather than from a
+    # second snapshot -- a second copy of mk_dev is what drifted into F-042.
+    base = load_yaml(HERE / 'base_uncond.yaml')
+    assert base.get('project_state_version') == config_state.CURRENT_STATE_VERSION, (
+        f'base_uncond is state {base.get("project_state_version")} against code state '
+        f'{config_state.CURRENT_STATE_VERSION}. Re-snapshot it:\n'
+        f'    cp configs/mk_dev.yaml configs/a100_stab_aug16/base_uncond.yaml\n'
+        f'A stale base generates arms whose keys land in locations the schema has '
+        f'moved, where they are silently inert rather than refused.')
+    assert base.get('protocol') == 'unconditional_tb', \
+        'base_uncond must be the canonical config as-is (unconditional); the ' \
+        'conditional route is applied by conditional_base()'
+
+    cond_data = CONDITIONAL_DATA[a.cond_data]
     if a.wave2:
-        arms, dropped = build_wave2(base_uncond, base_cond, a)
+        arms, dropped = build_wave2(base, cond_data, a)
         if not arms:
             raise SystemExit('wave 2: nothing to generate -- pass the wave-1 artifact args')
     else:
-        cond_data = CONDITIONAL_DATA[a.cond_data]
         seed = cond_data['seed'] if a.cond_mle_seed is None else (a.cond_mle_seed or None)
-        arms, dropped = build_wave1(base_uncond, base_cond, cond_data, cond_mle_seed=seed), []
+        arms, dropped = build_wave1(base, cond_data, cond_mle_seed=seed), []
         print(f'conditional library: {a.cond_data} ({cond_data["conditions"]})')
         if seed:
             print(f'conditional MLE seed (weights-only): {seed}\n'

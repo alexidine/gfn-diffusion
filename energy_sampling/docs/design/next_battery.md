@@ -102,6 +102,17 @@ research question. Ordered by how much they distort a battery.
 it is at the clamp on *every* arm equally, so it explains the *level* of the stall,
 not its *shape*.
 
+The code names the structure precisely, which makes the defect sharper than
+"pinned at a clamp": `gflownet_losses.py:512-516` describes it as **"a PROPORTIONAL
+CONTROLLER on J_B with gain `level_gap` and lag = the level stream's
+`half_life_visits`"**, whose designed failure mode is **limit-cycling at high gain**.
+The battery runs gain 1.0, clamp 10.0, lag 28.0. So the measured state is a
+proportional controller whose error signal is clipped on 54–93 % of ticks against a
+true gap of ~710 nats — **which is not a proportional controller at all, it is
+bang-bang.** That gives the fix two candidate directions rather than one (lower the
+gain, or restore proportionality by raising the clamp and dropping the gain to
+match), and §2.3 spends arms on both.
+
 **Not on this list: the `var_conditioning` exit bar.** `fwd/logw_std_within < 6.0`
 was never met once in 4,348 ticks across 6 arms (measured min 17.1, metric σ 9.9),
 and the `naive` stage was never entered by any run. **That is intended —
@@ -271,8 +282,10 @@ delivered quantity are different things**: setting `repeats` does not set group
 size, because batch size and condition concentration also move it. So set `repeats`
 and `condition_block_m` as you like, but **declare the target group size and verify
 it against `fwd/vg_group_size_mean`**, or the arm label will not describe the arm.
-Note `prior_buffer.condition_block_m: 1` in every current arm (mk_dev ships 2), so
-the backward condition-blocked draw is off and bwd groups form by chance collision.
+Note `condition_block_m: 1` in every current arm (mk_dev ships 2), so the backward
+condition-blocked draw is off and bwd groups form by chance collision. Those arms
+spell it `buffers.prior_buffer.condition_block_m`, which state 6 moved to
+`bwd_loss_coeffs.condition_block_m`; migrate before rerunning one.
 
 Tested and **not** supported: the group-size ramp as the cause of the wobble. Gen
 A/B (group pinned ~2.4) and gen C/D (group ramping) overlap completely in held-out
@@ -349,8 +362,13 @@ arms:
 **Step 2 — the battery.** Three axes, all genuinely open, all about gradient
 quality and variance:
 
-- **Z level (4 arms)** — control / `level_gap 0` / `emp_z 0 + emp_z_persistent 1` /
-  both off. Separates "the tether hurts" from "the tether's *target* is noisy".
+- **Z tether gain (5 arms)** — `bwd_loss_coeffs.level_gap` ∈ **{0, 0.25, 0.5, 1.0}**
+  (1.0 = control), plus one **restored-proportional** arm. See below; this replaces
+  the on/off framing an earlier draft had, which was wrong — `level_gap` is a
+  coefficient, and the interesting question is its size.
+- **Z target (1–2 arms, after the gain sweep)** — `emp_z 0 + emp_z_persistent 1` at
+  the winning gain. Separates "the tether is the wrong strength" from "the tether's
+  *target* is noisy"; running it after the sweep keeps the axes uncrossed.
 - **Group size (3 arms)** — target ∈ {2, ~6, ~12} at *fixed* batch, reached by
   `repeats` and `condition_block_m` together, **verified against
   `fwd/vg_group_size_mean`**. This is the VarGrad estimator-variance axis.
@@ -361,6 +379,43 @@ quality and variance:
 
 **Do not cross them.** Run one, then the next on the winner. Target the 6k–13k
 window, where arms actually differ.
+
+#### The `level_gap` gain sweep, designed against the code
+
+`gflownet_losses.py:520-527` computes `gap.clamp(±level_gap_clamp) * (log_r + log_pb
+− log_pf) * level_gap`, and its own comment names the structure: **"a PROPORTIONAL
+CONTROLLER on J_B with gain `level_gap` and lag = the level stream's
+`half_life_visits`, so the failure mode is limit-cycling at high gain, not
+divergence."** The battery runs gain **1.0**, clamp **10.0**, lag
+`half_life_visits` **28.0**. So this is a controller-gain sweep, and the code tells
+you what to look for.
+
+**Read the sweep for a limit cycle, not only for quality.** The analysis package
+already computes ACF oscillation period and amplitude, so run it on
+`zmatch/delta_worst` and `level_gap_coeff_rms` across the four gains. A period that
+appears at 1.0 and vanishes by 0.25 is the documented failure mode caught in the
+act; monotone improvement with falling gain is a different story (the force is
+simply too strong).
+
+**Do not also sweep `level_gap_clamp`.** While the gap is saturated — and
+`level_gap_coeff_rms` sits exactly at the clamp on 54–93 % of ticks — halving the
+gain and halving the clamp are *linearly equivalent*, both scaling the per-row force
+by the same factor. They differ only for the minority of rows below the clamp. The
+gain is the cleaner knob because it does not change *which* rows saturate.
+
+**The restored-proportional arm is the one that tests §1.1(a)'s actual claim.** The
+defect is not that the force is the wrong size, it is that a clamp of 10 against a
+true gap of ~710 nats makes it **sign-only** — a proportional controller whose error
+signal is always clipped is not proportional, it is bang-bang. An arm at **clamp
+1,000 × gain 0.01** delivers a comparable typical force (≈7 nats vs 10) while
+letting it *scale with the gap* again. If that arm behaves like gain 0 or gain 1, the
+information content of the force was never the issue; if it beats both, the tether
+is fine and only its saturation was broken.
+
+**Pin the lag and say so.** A proportional controller's stability is set by gain ×
+lag, so every result here is conditional on `half_life_visits: 28.0`. It must not
+move as a free variable — 7.0 is the unconditional default and it detonates
+`var_conditioning` within ~30 steps.
 
 **How the noise floor changes the design, without vetoing anything.** §0.1 is a
 constraint on *how* to run these, not a reason to skip them. Three consequences:
@@ -660,7 +715,7 @@ that single fact decides most of the budget below — see stage 1.
 | **6a** | 2 | **C1–C2 DPLR** (`dplr_rank` 6 vs 0) | uncond elj | — | live | 24 | **48** | no |
 | **6b** | 3 | **C3–C5 T** (40 / 60 / 100) at fixed wall clock | uncond elj | — | live | 24 | **72** | no |
 | **6c** | 3 | **C6–C8 `t_scale`** — branches off one warm start | uncond elj | — | live | 24 | **72** | no |
-| **6d** | 20 | **conditional battery** — 10 arms × 2 seeds, Z level (4) → group size (3) → huber beta (3), run in sequence | conditional, warm from `phase1_exit` | 8,000 | 20k | 13.3 | **267** | no |
+| **6d** | 26 | **conditional battery** — 13 arms × 2 seeds, run in sequence: Z tether gain (5: `level_gap` 0 / 0.25 / 0.5 / 1.0 + restored-proportional) → Z target (2) → group size (3) → huber beta (3) | conditional, warm from `phase1_exit` | 8,000 | 20k | 13.3 | **346** | no |
 
 ### 4.3 Totals, and the number that matters
 
@@ -670,7 +725,8 @@ that single fact decides most of the budget below — see stage 1.
 | production (stage 5) | 840 | ~35 |
 | gates + production | 956 | **~40** |
 | Tier B (stage 4) | 240 | ~10 |
-| everything (stages 0–6) | 1,655 | **~69** |
+| Tier C + conditional battery (stage 6) | 538 | ~22 |
+| everything (stages 0–6) | 1,734 | **~72** |
 
 **The headline: the gating work costs ~5 GPU-days on top of a ~35-day production
 plan — about 13 %** — and it is aimed at a handoff that cost `nehzor_uma` on the
@@ -680,7 +736,7 @@ is the easiest trade in this document.
 **Stage 1 is the highest-leverage 4 GPU-hours here.** Gen A/B at batch 1,000 were
 cancelled by the scheduler for low utilization; gen C/D at 20,000 survived 34.5 h;
 **nothing in between has been measured.** If batch 4,000 clears the 60 % bar, stages
-2 and 6d get ~4.5x cheaper — 23 → 5 GPU-h and 267 → 62 GPU-h, a saving of ~9
+2 and 6d get ~4.5x cheaper — 23 → 5 GPU-h and 346 → 81 GPU-h, a saving of ~12
 GPU-days for two 2-hour runs. The 2-hour duration is not padding: `gpu_util_policy`
 averages over a 7,200 s window, so a shorter run cannot fill the number the cluster
 actually judges.

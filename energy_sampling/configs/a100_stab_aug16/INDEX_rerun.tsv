@@ -1,0 +1,4 @@
+name	kind	benchmark_id	batch	epochs
+f2_qm9cond_b500	set	-	500	1500
+f2b_qm9cond_b1000	set	-	1000	1000
+f4_acridine_mace	set	-	250	1200

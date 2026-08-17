@@ -331,6 +331,18 @@ _RETIRED_KEYS = {
     'buffers.replay_buffer.toxic_delta_threshold':
         "deleted (see toxic_min_draws) -- the other half of the same "
         "stalled-row purge.",
+    'buffers.prior_buffer.condition_block_m':
+        "moved -> bwd_loss_coeffs.condition_block_m. It shapes the bwd DRAW for "
+        "one loss and is already gated on that loss (it applies only while bwd "
+        "vg_lb > 0), so it is a property of the loss and not of the store: the "
+        "buffer holds the same rows either way. In loss_coeffs it is also "
+        "stage-overridable like every other coefficient, which is what the gate "
+        "was emulating by hand. Move the value; the meaning is unchanged.",
+    'buffers.replay_buffer.condition_block_m':
+        "moved -> replay_loss_coeffs.condition_block_m (see "
+        "buffers.prior_buffer.condition_block_m) -- gated on replay "
+        "vg_by_condition plus vg_lb/vg_lme, so likewise a coefficient of the "
+        "replay loss rather than a setting of the replay store.",
 }
 
 

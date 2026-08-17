@@ -79,7 +79,7 @@ every config that detonated and on none of the three that ran.
 `vargrad_needs_groups`. VarGrad needs ≥2 rows per group or `vg_loss` is
 identically zero (`condition_grouped_empirical_z`) — a **silent** under-training,
 not a crash. `fwd repeats >= 2` is required outright; the backward side needs
-**`bwd repeats >= 2` OR `prior_buffer.condition_block_m >= 2`**, and it must be
+**`bwd repeats >= 2` OR `bwd condition_block_m >= 2`**, and it must be
 written as that disjunction because aug14/aug11 satisfy it the first way and
 aug13 the second. A conjunction would reject two of the three, and a naive diff
 reads the two spellings as a disagreement. 0 ERRORs across 538 configs; four

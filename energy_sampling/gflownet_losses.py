@@ -497,6 +497,18 @@ def get_gfn_backward_loss(loss_coeffs,
     # loss, so the on-policy level is a target, never a follower. No log_Z term
     # appears, so this cannot move Z.
     #
+    # Reaches BOTH policies, by different routes. P_F explicitly: the rows come
+    # from the buffer x P_B, neither of which depends on the forward params, so
+    # -gap * d log_pf is a straight gradient (this is the half that raises P_F
+    # on stored terminals). P_B only through the REPARAMETERISED path -- the
+    # backward trajectory is sampled from P_B, so the explicit d log_pb term is
+    # a score and averages to zero. bwd_loss_coeffs.traj_grads is therefore
+    # load-bearing here, not just a stability knob: at 0, bwd_propagate detaches
+    # back_mean/back_var (gfn.bwd_propagate) and the P_B channel silently
+    # degrades to variance with no drift. Via P_B the term lowers J_B by
+    # shrinking KL(P_B||P_F) per terminal -- a different mechanism from the P_F
+    # half, and one that distorts nothing.
+    #
     # Self-limiting: gap is re-read each step, so the coefficient -- and the
     # term -- vanish once the levels match. Structurally this is a PROPORTIONAL
     # CONTROLLER on J_B with gain level_gap and lag = the level stream's
@@ -894,7 +906,7 @@ def condition_group_stats(condition_id, min_group_count: int = 2):
     actually distribute over conditions. Measures the DRAW rather than a
     downstream mask, so it reports identically whichever estimator branch ran,
     and both knobs that move group occupancy land in it -- `repeats` tiling and
-    prior_buffer.condition_block_m.
+    the branch's `condition_block_m`.
 
     Row-weighted deliberately. 'The average ROW sits in a group of size g' is
     what the estimator's variance depends on; an unweighted mean over groups is
