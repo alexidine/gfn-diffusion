@@ -379,7 +379,7 @@ def test_servo_cuts_from_a_hot_start():
     run = BenchRun(
         game='mle', need_batch_sizer=False,
         game_kwargs=dict(dim=16, cond=8.0, noise=0.02, lr=2.0e-1, init_scale=1.0, seed=3),
-        args_overrides={'adaptive_lr.warmup_steps': 50, 'ray_calibration.period': 50,
+        args_overrides={'adaptive_lr.warmup_steps': 50, 'adaptive_lr.ray_calibration.period': 50,
                         'lr_policy': 2.0e-1, 'min_lr': 1e-9},
         probe_batch=2048,
     ).run(600)
@@ -437,7 +437,7 @@ def test_only_the_divergence_bar_stops_a_saturated_ramp():
     run = BenchRun(
         game='mle', need_batch_sizer=False,
         game_kwargs=dict(dim=32, cond=300.0, noise=0.01, lr=5e-5, init_scale=3.0, seed=3),
-        args_overrides={'adaptive_lr.warmup_steps': 50, 'ray_calibration.period': 50,
+        args_overrides={'adaptive_lr.warmup_steps': 50, 'adaptive_lr.ray_calibration.period': 50,
                         'lr_policy': 5e-5, 'min_lr': 1e-10},
         probe_batch=2048,
     ).run(700, stop_on_divergence=False)

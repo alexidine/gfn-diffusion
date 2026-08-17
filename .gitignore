@@ -14,6 +14,13 @@ energy_sampling/checkpoints/*.npz
 # Buffers and prior states written beside the trainer
 energy_sampling/*.pt
 
+# Generated artifacts live beside the producer that writes them. Deliberately
+# NOT a blanket `energy_sampling/*.json`: a stray JSON at the top level should
+# still surface as untracked, because that is the signal that an output path
+# has regressed to the CWD again.
+energy_sampling/bench/results/
+energy_sampling/energies/results/
+
 energy_sampling/eval/paper1_results/
 energy_sampling/*.png
 energy_sampling/SCRATCH/

@@ -72,14 +72,24 @@ VERSION_KEY = 'project_state_version'
 class Transition:
     """The mechanical part of a state change.
 
-    Applied in the order added -> renamed -> removed. `manual` is the judgment
-    part: never applied, only reported, so a migration cannot quietly make a
-    decision that needed a human."""
+    Applied in the order added -> renamed -> removed, then migrate_fn. `manual`
+    is the judgment part: never applied, only reported, so a migration cannot
+    quietly make a decision that needed a human.
+
+    `moved` is DECLARATION ONLY -- migrate_fn does the work. It exists because a
+    key whose destination depends on other config (which stage declared a flag,
+    say) cannot be written as a rename, and putting it in `removed` would be
+    worse than silent: `removed` pops the key BEFORE migrate_fn runs, so the
+    transform would find nothing and substitute defaults, losing a non-default
+    value while reporting success. Declaring it here keeps the audit -- every
+    retired key traceable to the transition that handles it -- without handing
+    the engine a key it would destroy."""
 
     added: dict[str, Any] = field(default_factory=dict)      # dotted -> value reproducing prior behavior
     renamed: dict[str, str] = field(default_factory=dict)    # old dotted -> new dotted, value carried unchanged
     removed: dict[str, str] = field(default_factory=dict)    # dotted -> why
     manual: dict[str, str] = field(default_factory=dict)     # dotted/topic -> what a human must decide
+    moved: dict[str, str] = field(default_factory=dict)      # dotted -> where migrate_fn puts it (declaration only)
     migrate_fn: Optional[Callable[[dict], None]] = None      # escape hatch, mutates in place
 
 
@@ -306,7 +316,382 @@ CHANGES: tuple[Change, ...] = (
                 "check fires on a real key and ignores prose.",
             ),
         ),
+    Change(
+        state=2,
+        summary=(
+            "The `ray` LR sensor loses its `enabled` flag and its block moves "
+            "under `adaptive_lr`. A stage declaring `lr_sensor: {kind: ray}` IS "
+            "the switch; a separate flag was a second mechanism for the same "
+            "decision and the two could disagree -- a stage asking for ray while "
+            "the flag said false trained at its seed LR with the config claiming "
+            "a sensor. `enabled` is now DERIVED in train.py from which stages "
+            "ask, so that disagreement is unrepresentable and the check that "
+            "caught it is gone with it. The asymmetry that gave the flag away: "
+            "`hyper` has no block at all and declares itself inline at the stage. "
+            "The block itself survives -- seven shared parameters are worth "
+            "storing once -- but under `adaptive_lr`, since it parameterises one "
+            "of the LR sensors rather than standing alone."
+        ),
+        components=('configs/mk_dev.yaml', 'train.py', 'utils.py'),
+        transition=Transition(
+            # Order is added -> renamed -> removed, so the block moves FIRST and
+            # the flag is then dropped at its new path. Spelling `removed` at the
+            # old path as well keeps the retired-key gate and this record
+            # describing the same set.
+            renamed={'ray_calibration': 'adaptive_lr.ray_calibration'},
+            removed={
+                'adaptive_lr.ray_calibration.enabled': 'derived from the stages that declare lr_sensor kind ray',
+                'ray_calibration.enabled': 'derived from the stages that declare lr_sensor kind ray',
+            },
+        ),
+        invariants=(
+            "The ray probe arms iff some stage declares lr_sensor kind 'ray'.",
+            "A config carrying the old top-level `ray_calibration` block fails at "
+            "load rather than silently falling through to the code defaults -- "
+            "which would have disabled the probe, since the old constructor "
+            "defaulted enabled to False.",
+        ),
+        validation=(
+            "Negative controls for all four dotted-path validators were shown to "
+            "fail before the move and to still fail after it.",
+            "config_snapshot vs the committed baseline: CHANGED empty.",
+        ),
+    ),
+
+    Change(
+        state=3,
+        summary=(
+            "Three replay-buffer keys move from a first-use guard to the "
+            "load-time retired-key gate: max_residence_steps, toxic_min_draws "
+            "and toxic_delta_threshold. All three were already dead -- "
+            "manage_replay_buffer raised on them -- but that function first runs "
+            "at a stage transition, so the rejection arrived hours into a run "
+            "instead of at load. This is the failure mode _RETIRED_KEYS was "
+            "created to prevent, and the reason is written directly above that "
+            "dict: the aug02 battery lost all 16 arms' entire phase 1 (1.1-7.8 h "
+            "each) to a retired-key guard that lived inside this very function. "
+            "THE GATE IS ALSO STRICTER THAN THE GUARD IT REPLACES. The guard "
+            "tested truthiness (toxic_min_draws) or non-None "
+            "(max_residence_steps), so a config carrying `toxic_min_draws: 0` or "
+            "`max_residence_steps: null` passed it and ran with the key silently "
+            "ignored. The gate fires on PRESENCE, because a key in a config is a "
+            "value its author believes is doing something. Those configs now fail "
+            "at load, which is the intended widening rather than a side effect. "
+            "The runtime guards are deleted rather than kept as defence in depth: "
+            "every load path runs preflight_config, and duplicating the reason "
+            "text in two places is how the two come to disagree."
+        ),
+        components=('utils.py', 'config_state.py', 'train.py',
+                    'configs/mk_dev.yaml'),
+        transition=Transition(
+            # Dropping these two reproduces current behavior EXACTLY: the purge
+            # they drove is gone, and neither has a reader other than its own
+            # rejection guard. Reasons live in utils._RETIRED_KEYS, not here
+            # (PROTOCOL: one fact, one home).
+            removed={
+                k: 'see utils._RETIRED_KEYS'
+                for k in (
+                    'buffers.replay_buffer.toxic_min_draws',
+                    'buffers.replay_buffer.toxic_delta_threshold',
+                )
+            },
+            # NOT `removed`, though it is equally retired -- this one was
+            # REPLACED, and its successor's absence is not inert. Every one of
+            # the 106 tracked configs carrying max_residence_steps carries NO
+            # mean_residence_steps (measured: the overlap is zero), so dropping
+            # it mechanically would leave the buffer with no residence setting
+            # at all. train.py then reads `tau = getattr(rb_cfg,
+            # 'mean_residence_steps', 0) or 0` -> 0.0, and the `if tau > 0`
+            # block that arms BOTH the memoryless hazard and the age backstop
+            # never runs. That config loads clean, trains, and reports a healthy
+            # replay_buffer_age_cv ~1 -- because the displacement purge left
+            # standing is itself memoryless -- while the staleness ceiling is
+            # silently gone.
+            #
+            # `manual` is also the only category that BLOCKS `migrate --write`,
+            # which is exactly the affordance this needs: a human has to pick
+            # the new value, because a hard cap and the mean of an exponential
+            # are not the same number.
+            manual={
+                'buffers.replay_buffer.max_residence_steps': (
+                    "replaced by mean_residence_steps, and the value does NOT "
+                    "carry across: the old key was a hard age cap (every row "
+                    "evicted at exactly N, a ~uniform age profile, CV ~0.58), "
+                    "the new one is the MEAN of a memoryless hazard "
+                    "(exponential residence, CV ~1). Sizing is Little's law, "
+                    "occupancy = churn_rate * mean_residence_steps, so the new "
+                    "value follows from the occupancy you want and not from the "
+                    "old cap. Canonical: mean_residence_steps: 50. Leaving it "
+                    "unset is NOT 'off' -- it reads as tau = 0, which disarms "
+                    "the hazard and the backstop together."
+                ),
+            },
+        ),
+        invariants=(
+            "A retired key is rejected at LOAD, never at first use -- the cost of "
+            "a first-use guard is the whole run up to that point.",
+            "Replay eviction is residual-INDEPENDENT (hazard + age backstop). "
+            "That is what makes birth_loss an unbiased intake baseline for "
+            "Buffer.absorption_stats; a residual-dependent purge cause silently "
+            "invalidates that sensor.",
+            "Every reason for a retirement has one home, utils._RETIRED_KEYS.",
+        ),
+        validation=(
+            "Counted over git-TRACKED yaml only (the working tree also holds "
+            "git-ignored wandb artifacts, which inflate a naive grep): 106 "
+            "configs carry max_residence_steps, 103 carry toxic_min_draws, none "
+            "carry toxic_delta_threshold. None had a mechanical route forward "
+            "before this record, since the keys were rejected by code no "
+            "migration knew about.",
+            "The max_residence_steps / mean_residence_steps overlap is ZERO -- "
+            "no config carrying the old key also carries its replacement. That "
+            "measurement is why it is `manual` rather than `removed`: dropping "
+            "it would leave tau unset, and tau = 0 disarms both eviction causes "
+            "(train.py, `if tau > 0`).",
+            "configs/mk_dev.yaml carries none of the three, so the canonical "
+            "config is unaffected beyond its version stamp.",
+        ),
+    ),
+    Change(
+        state=4,
+        summary=(
+            "The protocol becomes SELECTABLE. `protocol:` now names a protocol; "
+            "`protocols:` holds every one of them, keyed by name. Switching route "
+            "is that one word plus the problem keys, instead of rewriting the "
+            "stage list -- and both routes sit in the same file where they can be "
+            "compared rather than reconstructed from git. Protocols live ONLY "
+            "here: configs/problems.yaml selects a problem and says nothing about "
+            "stages, so the two files cannot disagree about which stages a route "
+            "runs."
+        ),
+        components=('configs/mk_dev.yaml', 'configs/problems.yaml', 'protocol.py',
+                    'config_invariants.py', 'config_snapshot.py'),
+        transition=Transition(
+            # `protocol` changes SHAPE (block -> string), so this is not a rename.
+            # migrate_fn lifts the old stage list into the library under a neutral
+            # name and points the selector at it. Neutral because the migration
+            # cannot know which route an old config was: guessing `unconditional_tb`
+            # for a conditional config would mislabel it in the one file that is
+            # supposed to say.
+            migrate_fn=lambda cfg: _lift_protocol(cfg),
+        ),
+        invariants=(
+            "`protocol` names a key of `protocols`, and that protocol has stages "
+            "-- enforced by config_invariants.protocol_selector_resolves, which "
+            "must be checked FIRST because every stage-scoped rule reads the "
+            "ACTIVE stage list and a bad selector silently empties it.",
+            "The trainer and the validators resolve stages through ONE function "
+            "(config_invariants.active_stages), so a check can never pass on a "
+            "stage list the run does not execute.",
+        ),
+        validation=(
+            "The four pre-existing negative controls were shown to fail before "
+            "the move and to still fail after it.",
+            "A FIFTH failure mode was found by the gate and closed: a selector "
+            "naming a missing protocol resolved to zero stages, and the auto-LR "
+            "gate went quiet on a config it had just rejected. That is now its "
+            "own rule with its own mutation tests.",
+            "config_snapshot vs the migrated baseline: CHANGED empty.",
+        ),
+    ),
+    Change(
+        state=5,
+        summary=(
+            "The MLE descent gate becomes a stage BLOCK. `flags: {mle_gate: true}` "
+            "plus top-level `mle_slope_t` / `mle_min_rate` / `mle_slope_window` "
+            "becomes `mle_gate: {slope_t, min_rate, window}` on the stage that "
+            "declares it. The switch and its settings were in different places, "
+            "and the settings read as global config though only the one MLE stage "
+            "ever consulted them -- so a reader had no way to tell they were "
+            "stage-scoped, and a second MLE stage could not have differed. "
+            "Presence of the block is now the switch; `{}` means gate on with "
+            "defaults, which still declares intent where a missing block does not."
+        ),
+        components=('protocol.py', 'train.py', 'configs/mk_dev.yaml', 'utils.py'),
+        transition=Transition(
+            # Not a rename: the destination is inside a stage, and WHICH stage
+            # depends on which one declared the flag. A migration cannot place
+            # them without reading the protocol, so it moves what it can and says
+            # what it cannot.
+            moved={
+                'mle_slope_t': "the declaring stage's mle_gate.slope_t",
+                'mle_min_rate': "the declaring stage's mle_gate.min_rate",
+                'mle_slope_window': "the declaring stage's mle_gate.window",
+            },
+            migrate_fn=lambda cfg: _fold_mle_gate(cfg),
+        ),
+        invariants=(
+            "A stage publishing gates/mle_flat carries the parameters that shape "
+            "it, so a stage's exit condition and the metric it reads are declared "
+            "together.",
+            "mle_gate.window >= 40: the gate samples every 10 steps and the slope "
+            "regression needs at least 4 points, below which it fits noise.",
+        ),
+        validation=(
+            "protocol.Stage rejected the block before the change and accepts it "
+            "after; the old flag spelling is now rejected, so a config cannot "
+            "half-migrate.",
+            "config_snapshot vs the migrated baseline: CHANGED empty.",
+        ),
+    ),
+    Change(
+        state=5,
+        summary=(
+            "The eval metric streams stop disagreeing about what "
+            "`conditional_worst_quantile` means. NO CONFIG KEY CHANGES -- the knob "
+            "already existed and its value is untouched; what changes is that the "
+            "eval path now READS it. Every train-step site already passed it, but "
+            "the two eval calls in log_metrics omitted it and took quick_tb_stats' "
+            "0.5 default, while log_test_metrics recomputed the train-condition "
+            "stats at the config value and overwrote four 'eval_fwd/' keys on its "
+            "way out. Dict-update order in evaluation() decided which definition "
+            "reached wandb. Because that overwrite only ran when a held-out set "
+            "was configured, `eval_fwd/tb_err_worst` meant the MEDIAN condition on "
+            "a run without `test_molecules_path` and the upper-tail one on a run "
+            "with it -- the meaning of a published series set by an unrelated key. "
+            "All three eval streams now go through one call site. "
+            "READING OLD RUNS: `eval_fwd/{tb_err_worst, z_grad_worst}` on a "
+            "conditional run with no held-out set, and `eval_bwd/*` on every "
+            "conditional run, were logged at 0.5 and are NOT comparable with "
+            "post-change runs; the same keys on a run with a held-out set already "
+            "carried the config value and are unaffected. Unconditional runs are "
+            "unaffected throughout -- with one condition group the quantile is "
+            "inert. No gate, controller or tracker reads these keys (the sole "
+            "eval-stream consumer is protocol.py's bootstrap_z handoff, which "
+            "reads `eval_fwd/jensen_z`; that is a mean and carries no quantile), "
+            "so no training behavior changes -- only what is logged."
+        ),
+        components=('train.py', 'test_condition_fractions.py',
+                    'docs/module_metrics.md'),
+        invariants=(
+            "Exactly one eval-time quick_tb_stats call site "
+            "(Modeller._eval_conditional_stats), so an argument that changes what "
+            "a shared metric NAME means cannot be set on one stream and not "
+            "another.",
+            "log_test_metrics writes only under 'eval_test/'. The lone shared key "
+            "is the unprefixed `Cond * Bar`, which reaches the merge at most once "
+            "because _log_setting's cache makes the second writer a no-op.",
+            "Metric dicts are merged with Modeller._merge_metrics, which refuses "
+            "to overwrite an existing key rather than letting call order pick a "
+            "winner.",
+        ),
+        validation=(
+            "Read the numbers rather than the code: on a skewed synthetic "
+            "condition set, tb_err_worst and z_grad_worst move between the two "
+            "quantiles while cond_tb_err and logw_std_within do not -- confirming "
+            "the blast radius was the *_worst family only.",
+            "MUT-4 (test_condition_fractions.test_merge_metrics_refuses_a_silent_"
+            "overwrite) re-introduces the exact overwrite that shipped and "
+            "requires an AssertionError, so the guard cannot go blind.",
+            "The held-out test asserts no 'eval_fwd/' key leaks and that the "
+            "train-condition stats are computed once per eval, not twice.",
+            "Fast tier: 680 passed.",
+        ),
+    ),
+    Change(
+        state=5,
+        summary=(
+            "Stage-exit `patience` counts METRIC WRITES instead of trigger checks, "
+            "and two config-load rules reject exit conditions that cannot fire. NO "
+            "CONFIG KEY CHANGES. Every value an exit term can read persists its "
+            "last value -- metric_tracker is an EMA dict and `gates/*` a plain one "
+            "-- while `_exit_tick` ran every 10 steps and advanced the streak on "
+            "whatever `_resolve` returned. A term therefore counted ONE sample as "
+            "N: measured on the prod0810 phase-1 block, a single `bwd/tbc` write "
+            "at step 100 carried the streak to 20 over 20 quiet ticks, and one "
+            "`gates/mle_flat` publish cleared its `patience: 5` three ticks later. "
+            "`patience` on an `eval/*` term had the mirror defect -- accepted by "
+            "_parse_exit, then silently discarded, so it fired on the first clean "
+            "eval. THIS CORRECTS docs/design/next_battery.md 1.3, which recorded "
+            "the opposite mechanism (a streak resetting on quiet ticks and never "
+            "accumulating). The pinned "
+            "`protocol/exit_streak_eval_wass_debiased` = 0 that prompted that "
+            "reading was a LOGGING ARTEFACT: eval terms were skipped by the tick "
+            "loop, so the series meant 'never judged here', not 'never passes'. "
+            "READING OLD RUNS: any pre-change `protocol/exit_streak_*` on a metric "
+            "slower than 10 steps over-counts, and eval-term streaks are "
+            "structurally 0; neither is comparable with post-change runs. Stage "
+            "transitions that already fired are unaffected in ORDER but a stage "
+            "whose patience was cleared by stale reads may now dwell longer, which "
+            "is the intended correction."
+        ),
+        components=('protocol.py', 'utils.py', 'config_invariants.py',
+                    'test_protocol_exit_streaks.py', 'test_config_invariants.py',
+                    'docs/design/next_battery.md'),
+        invariants=(
+            "A streak advances only on a FRESH write: fresh pass advances, fresh "
+            "fail resets, no fresh write HOLDS. Holding is load-bearing -- "
+            "resetting on a quiet tick would make patience > 1 unreachable for "
+            "every metric slower than the 10-step tick, which is the bug 1.3 "
+            "described rather than the one that existed.",
+            "MetricTracker.written_at is within-process and NOT checkpointed, so a "
+            "restored stamp can never claim freshness nobody observed.",
+            "`patience` means the same thing on every term kind; eval/* terms keep "
+            "a real streak advanced once per eval.",
+            "config_invariants abstains rather than guesses: "
+            "exit_bar_is_within_measured_range only judges metrics in "
+            "MEASURED_METRIC_RANGES, and a missing entry is not a pass.",
+            "That rule is BASELINE-ONLY and pinned so by its own test. It reasons "
+            "from a MEASUREMENT, which is not a property of the config being "
+            "checked -- the 17.1 floor was read off a battery with five railed "
+            "controls, so the configs written to unrail them are the ones that "
+            "should be free to aim under it. Only "
+            "exit_patience_is_reachable can ERROR, and only on the arithmetic "
+            "case (patience x cadence > epochs), which is provable from the file "
+            "alone.",
+        ),
+        validation=(
+            "Mechanism established by RUNNING the real prod0810 exit block through "
+            "the engine, not by reading it -- which is what showed the reported "
+            "cause was inverted.",
+            "Three mutations, each required to FAIL the suite: M1 removes freshness "
+            "gating (6 failures), M2 restores the discarded eval-term patience (3), "
+            "M3 implements the wrong fix -- reset on a quiet tick -- and is "
+            "rejected by 4.",
+            "The positive path is asserted separately: the real three-term phase-1 "
+            "block driven at real cadences must still transition, so a fix that "
+            "tightened the stage into never advancing cannot pass.",
+            "exit_bar_is_within_measured_range reports on configs/mk_dev.yaml the "
+            "moment `protocol:` is switched to conditional_vargrad, which still "
+            "declares `fwd/logw_std_within < 6.0` -- and `errors()` stays EMPTY "
+            "there, so the route still loads and runs.",
+            "Full suite minus bench: 848 passed, 2 pre-existing failures in "
+            "test_replay_gating.py (its fake modeller lacks `lr_controller`, "
+            "unrelated to this change).",
+        ),
+    ),
 )
+
+
+def _fold_mle_gate(cfg: dict) -> None:
+    """state 4 -> 5: top-level gate parameters move onto whichever stage declared
+    `flags.mle_gate`, and the flag becomes the block.
+
+    Mechanical BECAUSE the flag says where they belong. A config that carried the
+    parameters but declared the flag nowhere had settings for a gate that never
+    ran; they are dropped, which is what they already did."""
+    params = {new: cfg.pop(old) for old, new in
+              (('mle_slope_t', 'slope_t'), ('mle_min_rate', 'min_rate'),
+               ('mle_slope_window', 'window')) if old in cfg}
+    library = cfg.get('protocols')
+    if not isinstance(library, dict):
+        return
+    for entry in library.values():
+        for st in (entry or {}).get('stages', []) or []:
+            flags = st.get('flags') or {}
+            if flags.pop('mle_gate', None):
+                st['mle_gate'] = dict(params)      # {} = on with defaults
+
+
+def _lift_protocol(cfg: dict) -> None:
+    """state 3 -> 4: `protocol: {stages: [...]}` becomes
+    `protocol: <name>` + `protocols: {<name>: {stages: [...]}}`."""
+    node = cfg.get('protocol')
+    if not isinstance(node, dict) or 'stages' not in node:
+        return                                  # already lifted, or nothing to lift
+    name = 'migrated'
+    cfg.setdefault('protocols', {})[name] = node
+    cfg['protocol'] = name
 
 
 def state_changes() -> tuple[Change, ...]:
@@ -455,8 +840,14 @@ def migrate(cfg: dict, from_version: Optional[int] = None,
                 report.needs_judgment.append(f"v{ch.state} {dotted}: {why}")
 
         if tr.migrate_fn is not None:
+            # Report it only if it actually did something. A transform that runs
+            # on every migration and announces itself regardless puts a line in
+            # every report describing work that did not happen -- and a report
+            # full of no-ops is one nobody reads, which is the whole value gone.
+            before = copy.deepcopy(cfg)
             tr.migrate_fn(cfg)
-            report.applied.append(f"v{ch.state} custom transform")
+            if cfg != before:
+                report.applied.append(f"v{ch.state} custom transform")
 
     cfg[VERSION_KEY] = to_version
     report.unchanged = not (report.applied or report.needs_judgment)
@@ -496,6 +887,7 @@ def render_history_markdown() -> str:
                 ("Added", tr.added, lambda k, v: f"`{k}` = `{v!r}`"),
                 ("Renamed", tr.renamed, lambda k, v: f"`{k}` -> `{v}`"),
                 ("Removed", tr.removed, lambda k, v: f"`{k}` -- {v}"),
+                ("Moved", tr.moved, lambda k, v: f"`{k}` -> {v}"),
                 ("Requires judgment", tr.manual, lambda k, v: f"`{k}` -- {v}"),
             ):
                 if items:

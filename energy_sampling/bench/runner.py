@@ -122,11 +122,23 @@ class Run:
         # fixed-rate arm at the bottom of the ladder and silently make it a
         # different rate than its own name.
         args = make_args(**{'min_lr': 1e-12, **arm.args_overrides()})
-        self.m = FakeModeller(args, game.optimizers, stage=FakeStage())
-        rc = args.ray_calibration
+        # THE ARM DECLARES ITS SENSOR ON THE STAGE, exactly as a config stage
+        # does, because that declaration is what arms the probe.
+        self.m = FakeModeller(args, game.optimizers,
+                              stage=FakeStage(lr_sensor=arm.lr_sensor()))
+        rc = args.adaptive_lr.ray_calibration
+        # ENABLED IS DERIVED, not configured -- train.py:1871 passes exactly
+        # `bool(self._ray_askers())`. There is no `ray_calibration.enabled` to
+        # set any more (utils._RETIRED_KEYS deletes both spellings), so the arm's
+        # declaration and the probe's state cannot disagree. They could before,
+        # and the failure was silent in the dangerous direction: an unarmed probe
+        # returns no readings, the arm scores bit-identical to `null`, and the
+        # board prints a plausible row. bench/test_arms.py counts armings and
+        # resolutions for that reason.
         self.m.ray_cal = RayCalibration(
             game.policy_params, alphas=tuple(float(a) for a in rc.alphas),
-            n_sub=rc.n_sub, period=rc.period, enabled=rc.enabled)
+            n_sub=rc.n_sub, period=rc.period,
+            enabled=bool(self.m._ray_askers()))
         self.m.lr_controller = LRController(self.m)
 
         self.trace = []

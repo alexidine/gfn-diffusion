@@ -19,7 +19,8 @@ import pytest
 import torch
 
 from bench.fake_modeller import (MK_DEV_ADAPTIVE, MK_DEV_BATCH, MK_DEV_CALIBRATION,
-                                 MK_DEV_LR, MK_DEV_RAYCAL, FakeModeller, make_args)
+                                 MK_DEV_LR, MK_DEV_RAYCAL, FakeModeller, FakeStage,
+                                 make_args)
 from bench.real_modeller import build_real_modeller
 from energy_sampling.controller import LRController
 
@@ -27,6 +28,20 @@ from energy_sampling.controller import LRController
 @pytest.fixture(scope='module')
 def real():
     return build_real_modeller()
+
+
+#: distinguishes "the key is absent" from "the key is None", which a config
+#: legitimately is (adaptive_lr.restart_after).
+_MISSING = object()
+
+
+def _dig(node, dotted):
+    """Walk a dotted path, `_MISSING` if any hop is absent."""
+    for part in dotted.split('.'):
+        node = getattr(node, part, _MISSING)
+        if node is _MISSING:
+            return _MISSING
+    return node
 
 
 # ------------------------------------------------------- the coupling surface
@@ -52,10 +67,15 @@ DEFERRED_SURFACE = ['optimizers', 'fused_accum_count']
 #: Config values that are collections without meaningful order.
 UNORDERED_KEYS = {'lr_servo_managed'}
 
-#: args keys the controllers read.
+#: args keys the controllers read. DOTTED WHERE THE REAL CONFIG NESTS THEM: the
+#: ray block moved under `adaptive_lr` (utils._RETIRED_KEYS, "moved ->
+#: adaptive_lr.ray_calibration"), and a top-level-only check cannot see that move
+#: -- `adaptive_lr` is present either way, so the block could go missing in
+#: silence.
 ARGS_SURFACE = [
     'lr_policy', 'lr_back', 'lr_replay', 'lr_fused', 'lr_flow', 'min_lr',
-    'lr_warmup_ratio', 'lr_servo_managed', 'adaptive_lr', 'ray_calibration',
+    'lr_warmup_ratio', 'lr_servo_managed', 'adaptive_lr',
+    'adaptive_lr.ray_calibration',
     'batch_size', 'max_batch_size', 'grow_batch_size', 'batch_growth_factor',
     'batch_growth_interval', 'batch_growth_slow_interval',
     'auto_batch_throughput_opt', 'batch_growth_min_throughput_gain',
@@ -88,11 +108,11 @@ def test_fake_carries_the_whole_coupling_surface(real):
 
 
 def test_fake_args_carry_every_key_the_controllers_read(real):
-    missing = [k for k in ARGS_SURFACE if not hasattr(real.args, k)]
+    missing = [k for k in ARGS_SURFACE if _dig(real.args, k) is _MISSING]
     assert not missing, f'{missing} missing from the REAL resolved config'
 
     fake_args = make_args()
-    missing = [k for k in ARGS_SURFACE if not hasattr(fake_args, k)]
+    missing = [k for k in ARGS_SURFACE if _dig(fake_args, k) is _MISSING]
     assert not missing, (
         f'{missing} present in the real config but not in make_args(). '
         f'Add it to the MK_DEV_* dicts in bench/fake_modeller.py.')
@@ -124,7 +144,7 @@ def test_fake_supplies_the_deferred_surface(real):
     ('batch', MK_DEV_BATCH, None),
     ('adaptive_lr', MK_DEV_ADAPTIVE, 'adaptive_lr'),
     ('calibration', MK_DEV_CALIBRATION, 'adaptive_lr.calibration'),
-    ('ray_calibration', MK_DEV_RAYCAL, 'ray_calibration'),
+    ('ray_calibration', MK_DEV_RAYCAL, 'adaptive_lr.ray_calibration'),
 ])
 def test_transcribed_defaults_match_the_shipping_config(real, block, source, path):
     """
@@ -162,6 +182,63 @@ def test_transcribed_defaults_match_the_shipping_config(real, block, source, pat
     assert not drift, (
         f'{block}: bench default vs configs/mk_dev.yaml -- '
         + '; '.join(f'{k}: bench {m!r} vs config {t!r}' for k, (m, t) in drift.items()))
+
+
+def test_the_retired_ray_keys_are_gone_from_the_bench_too(real):
+    """
+    THE BLIND SPOT OF THE TEST ABOVE. Value fidelity skips any bench key the real
+    config lacks (`not hasattr(node, key)`), so a RETIRED key living on in a
+    MK_DEV_* dict is invisible to it -- which is how `ray_calibration.enabled`
+    stayed in this bench after the trainer deleted it (utils._RETIRED_KEYS
+    retires both the top-level block and `enabled` in either spelling).
+
+    Both directions, because both were wrong: the block MOVED under adaptive_lr,
+    and its flag was DELETED in favour of deriving the switch from the stages
+    that declare `lr_sensor: {kind: ray}`.
+    """
+    assert _dig(real.args, 'ray_calibration') is _MISSING, (
+        'a top-level ray_calibration block survived the load -- it is retired '
+        '(moved under adaptive_lr), so the preflight should have refused it')
+    assert _dig(real.args, 'adaptive_lr.ray_calibration.enabled') is _MISSING, (
+        '`enabled` is deleted: the switch is which stages declare '
+        'lr_sensor: {kind: ray}, and a second flag could disagree with them')
+    assert 'enabled' not in MK_DEV_RAYCAL, (
+        'the bench is still transcribing a key the trainer refuses at load')
+
+    # ...and the retired spellings must FAIL here rather than being carried as
+    # private bench keys, which is what the unchecked nested branch allowed.
+    for retired in ('ray_calibration.enabled', 'ray_calibration.period',
+                    'adaptive_lr.ray_calibration.enabled'):
+        with pytest.raises(KeyError):
+            make_args(**{retired: False})
+
+
+def test_the_fake_derives_the_probe_switch_as_the_trainer_does():
+    """
+    `enabled` is DERIVED, so the derivation is now load-bearing code -- and the
+    fake owns a copy of it (`FakeModeller._ray_askers`) to stay off train.py's
+    11 s import. Run the REAL function against the fake's protocol and require
+    the same answer, so the copy cannot drift.
+
+    Getting this wrong is silent in the dangerous direction: a ray arm whose
+    switch reads False runs a probe that never arms, scores bit-identical to
+    `null`, and still posts a row. That has fired twice here.
+    """
+    import train  # noqa: E402 -- deferred, ~11 s; this module pays it anyway
+
+    cases = [(None, False),
+             ({'kind': 'ray'}, True),
+             ({'kind': 'hyper', 'beta': 0.1}, False),
+             ({'kind': 'plateau'}, False),
+             ({'kind': 'none'}, False)]
+    for sensor, asks in cases:
+        fake = FakeModeller(make_args(), {},
+                            stage=FakeStage(name='s', lr_sensor=sensor))
+        mine, theirs = fake._ray_askers(), train.Modeller._ray_askers(fake)
+        assert mine == theirs, (
+            f'lr_sensor={sensor!r}: the bench derives {mine} where the trainer '
+            f'derives {theirs} -- FakeModeller._ray_askers has drifted')
+        assert bool(mine) is asks, sensor
 
 
 def test_controller_produces_the_same_lr_on_both(real):

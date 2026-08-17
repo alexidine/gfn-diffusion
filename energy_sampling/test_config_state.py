@@ -46,10 +46,16 @@ def _retired_keys():
 # ---------------------------------------------------------------------------
 
 def classes_are_disjoint(tr: Transition) -> bool:
-    """A key may appear in at most one of added/renamed/removed/manual. Two
+    """A key may appear in at most one of added/renamed/removed/manual/moved. Two
     classes claiming one key makes the transform order-dependent, and the order
-    is an implementation detail nobody should have to know."""
-    groups = [set(tr.added), set(tr.renamed), set(tr.removed), set(tr.manual)]
+    is an implementation detail nobody should have to know.
+
+    `moved` matters most here: it is the one class the engine does NOT apply, so
+    a key listed in both `moved` and `removed` would be popped by the engine and
+    then looked for by the transform -- the exact failure `moved` exists to
+    avoid, reintroduced by a duplicate entry."""
+    groups = [set(tr.added), set(tr.renamed), set(tr.removed), set(tr.manual),
+              set(tr.moved)]
     total = sum(len(g) for g in groups)
     return len(set().union(*groups)) == total
 
@@ -107,14 +113,20 @@ def test_rename_targets_are_not_themselves_retired(ch):
     assert rename_targets_are_live(ch.transition, _retired_keys())
 
 
-def test_v1_covers_the_retired_keys_exactly():
-    """The load-time gate and the migration must describe the same set. A key the
+def test_transitions_cover_the_retired_keys_exactly():
+    """The load-time gate and the migrations must describe the same set. A key the
     gate rejects but no transition handles is a config with no route forward;
     a key a transition handles but the gate does not know about is a migration
-    for an event that never fires."""
+    for an event that never fires.
+
+    Unioned across EVERY transition, not just the first: retirements accrue at
+    whatever state they happen in, and pinning this to v1 would fail the moment a
+    second transition retired anything."""
     retired = _retired_keys()
-    tr = state_changes()[0].transition
-    handled = set(tr.renamed) | set(tr.removed) | set(tr.manual)
+    handled = set()
+    for ch in state_changes():
+        tr = ch.transition
+        handled |= set(tr.renamed) | set(tr.removed) | set(tr.manual) | set(tr.moved)
     assert handled - retired == set(), f'handled but not retired: {sorted(handled - retired)}'
     assert retired - handled == set(), f'retired but unhandled: {sorted(retired - handled)}'
 
@@ -126,6 +138,24 @@ def test_v1_covers_the_retired_keys_exactly():
 def test_disjointness_check_rejects_an_overlapping_transition():
     broken = Transition(removed={'foo.bar': 'x'}, manual={'foo.bar': 'y'})
     assert not classes_are_disjoint(broken)
+
+
+def test_disjointness_check_rejects_a_moved_key_the_engine_would_also_pop():
+    """The specific collision `moved` exists to prevent: the engine pops on
+    `removed` before migrate_fn runs, so the transform would find the key gone
+    and silently fall back to defaults."""
+    broken = Transition(moved={'foo.bar': 'somewhere'}, removed={'foo.bar': 'x'})
+    assert not classes_are_disjoint(broken)
+
+
+def test_a_moved_key_is_not_popped_by_the_engine():
+    """`moved` must stay declaration-only. If the engine ever applied it, the
+    value would be gone before the transform that places it could read it."""
+    cfg = {'mle_slope_window': 555,
+           'protocols': {'p': {'stages': [{'name': 's', 'flags': {'mle_gate': True}}]}}}
+    out, _ = migrate({**cfg, VERSION_KEY: 4})
+    assert out['protocols']['p']['stages'][0]['mle_gate']['window'] == 555, (
+        'the non-default value did not survive the move')
 
 
 def test_rename_target_check_rejects_a_chained_rename():
@@ -161,11 +191,13 @@ def test_state_rule_accepts_history_changes_between_transitions():
 
 
 def test_coverage_check_would_notice_a_dropped_key():
-    """Same comparison as test_v1_covers_the_retired_keys_exactly, run against a
-    history missing one key -- it must come back unequal."""
+    """Same comparison as the test above, run against a history missing one key
+    -- it must come back unequal."""
     retired = _retired_keys()
-    tr = state_changes()[0].transition
-    handled = set(tr.renamed) | set(tr.removed) | set(tr.manual)
+    handled = set()
+    for ch in state_changes():
+        tr = ch.transition
+        handled |= set(tr.renamed) | set(tr.removed) | set(tr.manual) | set(tr.moved)
     handled.discard('gpu_util_floor')
     assert retired - handled == {'gpu_util_floor'}
 

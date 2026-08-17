@@ -13,8 +13,9 @@ import numpy as np
 import pytest
 
 from analysis import keys as K
-from analysis.checks import (State, check_r11, context, context_header,
-                             format_report, run_all, run_label)
+from analysis.checks import (State, battery_labels, check_r11, context,
+                             context_header, format_report, run_all,
+                             run_label)
 from analysis.tests import fixtures
 
 
@@ -180,3 +181,57 @@ def test_na_route_is_visible_without_verbose(vg_normal, tb_ramp):
     assert na != live
     assert 'NA_ROUTE' in na and 'NA_ROUTE' not in live
     assert 'nothing to report' not in na
+
+
+# ---------------------------------------------------------------------------
+# Runs are named by something that MEANS something
+# ---------------------------------------------------------------------------
+
+def test_colliding_names_are_split_by_the_knob_that_differs(ring_probe, ring_cal):
+    """`reading_runs.md` §7: refer to runs by NAME, TAG, or A DISTINGUISHING
+    CONFIG FEATURE -- never by wandb id. An id is a hash; it carries nothing and
+    makes the reader look every arm up.
+
+    Two arms of a real cluster battery are both `prod0810_mipcas_elj`, so a
+    collision is the normal case, not the edge case."""
+    a, b = fixtures.mutate(ring_probe), fixtures.mutate(ring_cal)
+    a.name = b.name = 'prod_elj'
+    a.config[K.CFG_EVAL_T] = {'value': 10}
+    b.config[K.CFG_EVAL_T] = {'value': 40}
+
+    labels = battery_labels([a, b])
+    assert set(labels.values()) == {'prod_elj[eval_T=10]', 'prod_elj[eval_T=40]'}
+    for lab in labels.values():
+        assert a.run_id not in lab and b.run_id not in lab
+
+
+def test_a_unique_name_is_left_alone(ring_probe, vg_normal):
+    labels = battery_labels([ring_probe, vg_normal])
+    assert set(labels.values()) == {ring_probe.name, vg_normal.name}
+
+
+def test_a_label_never_carries_a_config_repr_blob(ring_probe, ring_cal):
+    """wandb stores each config section a SECOND time as a repr string
+    (`adaptive_lr` -> "Namespace(warmup_steps=1000, ...)"). Those keys are the
+    shortest and their values the longest, so ranking candidates on key length
+    put a 200-character Namespace dump into every subject line."""
+    a, b = fixtures.mutate(ring_probe), fixtures.mutate(ring_cal)
+    a.name = b.name = 'prod_elj'
+    a.config['blob'] = {'value': 'Namespace(' + 'x' * 200 + ')'}
+    b.config['blob'] = {'value': 'Namespace(' + 'y' * 200 + ')'}
+    a.config[K.CFG_EVAL_T] = {'value': 10}
+    b.config[K.CFG_EVAL_T] = {'value': 40}
+    for lab in battery_labels([a, b]).values():
+        assert 'Namespace' not in lab
+        assert len(lab) < 40, lab
+
+
+def test_arms_that_differ_in_no_knob_fall_back_to_something_visible(ring_probe):
+    """Two arms with the same name and the same config still need separating,
+    and saying so with the id is the honest answer there: they differ in no
+    knob."""
+    a, b = fixtures.mutate(ring_probe), fixtures.mutate(ring_probe)
+    a.name = b.name = 'twin'
+    b.run_id = 'other'
+    labels = set(battery_labels([a, b]).values())
+    assert len(labels) == 2

@@ -1,0 +1,1000 @@
+C:\Users\mikem\venvs\csd_mxt_gfn\Lib\site-packages\pydantic\_internal\_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'repr' attribute with value False was provided to the `Field()` function, which has no effect in the context it was used. 'repr' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+C:\Users\mikem\venvs\csd_mxt_gfn\Lib\site-packages\pydantic\_internal\_generate_schema.py:2249: UnsupportedFieldAttributeWarning: The 'frozen' attribute with value True was provided to the `Field()` function, which has no effect in the context it was used. 'frozen' is field-specific metadata, and can only be attached to a model field using `Annotated` metadata or by assignment. This may have happened because an `Annotated` type alias using the `type` statement was used, or if the `Field()` function was attached to a single member of a union type.
+  warnings.warn(
+C:\Users\mikem\venvs\csd_mxt_gfn\Lib\site-packages\e3nn\o3\_wigner.py:10: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  _Jd, _W3j_flat, _W3j_indices = torch.load(os.path.join(os.path.dirname(__file__), 'constants.pt'))
+W0816 21:11:59.051000 12968 Lib\site-packages\torch\distributed\elastic\multiprocessing\redirects.py:29] NOTE: Redirects are currently not supported in Windows or MacOs.
+wandb: Currently logged in as: mkilgour to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: creating run
+wandb: Tracking run with wandb version 0.21.1
+wandb: Run data is saved locally in C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\wandb\run-20260816_211203-ef7gmm0r
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run shake_shake_qm9cond
+wandb:  View project at https://wandb.ai/mkilgour/GFN%20Energy
+wandb:  View run at https://wandb.ai/mkilgour/GFN%20Energy/runs/ef7gmm0r
+C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\models\gfn.py:381: UserWarning: expandable_segments not supported on this platform (Triggered internally at C:\actions-runner\_work\pytorch\pytorch\pytorch\c10/cuda/CUDAAllocatorConfig.h:35.)
+  ang_bool = torch.as_tensor(angs, device=device, dtype=torch.bool)
+  0%|          | 0/3001 [00:00<?, ?it/s]  0%|          | 1/3001 [00:00<45:47,  1.09it/s]  0%|          | 2/3001 [00:01<24:10,  2.07it/s]  0%|          | 3/3001 [00:01<18:59,  2.63it/s]  0%|          | 4/3001 [00:01<18:29,  2.70it/s]  0%|          | 5/3001 [00:02<18:39,  2.68it/s]  0%|          | 6/3001 [00:02<19:07,  2.61it/s]  0%|          | 7/3001 [00:02<18:22,  2.72it/s]  0%|          | 8/3001 [00:03<16:32,  3.02it/s]  0%|          | 9/3001 [00:03<14:35,  3.42it/s]  0%|          | 10/3001 [00:03<13:04,  3.81it/s]  0%|          | 11/3001 [00:04<28:08,  1.77it/s]  0%|          | 12/3001 [00:05<29:50,  1.67it/s]  0%|          | 13/3001 [00:06<37:25,  1.33it/s]  0%|          | 14/3001 [00:08<50:33,  1.02s/it]  0%|          | 15/3001 [00:08<47:01,  1.06it/s]  1%|          | 16/3001 [00:09<38:06,  1.31it/s]  1%|          | 17/3001 [00:09<30:37,  1.62it/s]  1%|          | 18/3001 [00:10<28:33,  1.74it/s]  1%|          | 19/3001 [00:10<24:54,  1.99it/s]  1%|          | 20/3001 [00:10<22:01,  2.26it/s]  1%|          | 21/3001 [00:10<19:27,  2.55it/s]  1%|          | 22/3001 [00:11<21:10,  2.34it/s]  1%|          | 23/3001 [00:11<17:07,  2.90it/s]  1%|          | 24/3001 [00:11<14:41,  3.38it/s]  1%|          | 25/3001 [00:11<12:58,  3.82it/s]  1%|          | 26/3001 [00:12<11:05,  4.47it/s]  1%|          | 27/3001 [00:12<10:04,  4.92it/s]  1%|          | 28/3001 [00:12<09:06,  5.44it/s]  1%|          | 29/3001 [00:12<08:30,  5.82it/s]  1%|          | 30/3001 [00:12<08:17,  5.97it/s]  1%|          | 31/3001 [00:12<08:10,  6.06it/s]  1%|          | 32/3001 [00:13<08:07,  6.09it/s]  1%|          | 33/3001 [00:13<08:08,  6.07it/s]  1%|          | 34/3001 [00:13<08:47,  5.62it/s]  1%|          | 35/3001 [00:13<08:23,  5.89it/s]  1%|          | 36/3001 [00:13<08:16,  5.97it/s]  1%|          | 37/3001 [00:13<09:22,  5.27it/s]  1%|▏         | 38/3001 [00:14<08:55,  5.53it/s]  1%|▏         | 39/3001 [00:14<09:11,  5.37it/s]  1%|▏         | 40/3001 [00:14<08:24,  5.86it/s]  1%|▏         | 41/3001 [00:14<07:55,  6.23it/s]  1%|▏         | 42/3001 [00:14<07:34,  6.51it/s]  1%|▏         | 43/3001 [00:14<07:15,  6.79it/s]  1%|▏         | 44/3001 [00:14<07:19,  6.73it/s]  1%|▏         | 45/3001 [00:15<07:07,  6.92it/s]  2%|▏         | 46/3001 [00:15<07:13,  6.81it/s]  2%|▏         | 47/3001 [00:15<07:26,  6.62it/s]  2%|▏         | 48/3001 [00:15<07:06,  6.92it/s]  2%|▏         | 49/3001 [00:15<06:56,  7.08it/s]  2%|▏         | 50/3001 [00:15<06:51,  7.16it/s]  2%|▏         | 51/3001 [00:24<2:16:40,  2.78s/it]  2%|▏         | 52/3001 [00:24<1:39:00,  2.01s/it]  2%|▏         | 53/3001 [00:25<1:11:56,  1.46s/it]  2%|▏         | 54/3001 [00:25<52:52,  1.08s/it]    2%|▏         | 55/3001 [00:25<41:19,  1.19it/s]  2%|▏         | 56/3001 [00:25<32:06,  1.53it/s]  2%|▏         | 57/3001 [00:26<26:58,  1.82it/s]  2%|▏         | 58/3001 [00:26<21:52,  2.24it/s]  2%|▏         | 59/3001 [00:26<18:31,  2.65it/s]  2%|▏         | 60/3001 [00:26<18:56,  2.59it/s]  2%|▏         | 61/3001 [00:27<16:43,  2.93it/s]  2%|▏         | 62/3001 [00:27<13:45,  3.56it/s]  2%|▏         | 63/3001 [00:27<12:27,  3.93it/s]  2%|▏         | 64/3001 [00:27<10:49,  4.52it/s]  2%|▏         | 65/3001 [00:27<10:13,  4.79it/s]  2%|▏         | 66/3001 [00:28<09:03,  5.40it/s]  2%|▏         | 67/3001 [00:28<08:25,  5.81it/s]  2%|▏         | 68/3001 [00:28<07:47,  6.27it/s]  2%|▏         | 69/3001 [00:28<08:02,  6.07it/s]  2%|▏         | 70/3001 [00:28<07:34,  6.46it/s]  2%|▏         | 71/3001 [00:28<08:02,  6.07it/s]  2%|▏         | 72/3001 [00:29<09:29,  5.14it/s]  2%|▏         | 73/3001 [00:29<08:44,  5.59it/s]  2%|▏         | 74/3001 [00:29<08:06,  6.02it/s]  2%|▏         | 75/3001 [00:29<07:36,  6.41it/s]  3%|▎         | 76/3001 [00:29<07:28,  6.52it/s]  3%|▎         | 77/3001 [00:29<08:23,  5.80it/s]  3%|▎         | 78/3001 [00:29<08:01,  6.08it/s]  3%|▎         | 79/3001 [00:30<07:48,  6.24it/s]  3%|▎         | 80/3001 [00:30<07:37,  6.38it/s]  3%|▎         | 81/3001 [00:30<07:48,  6.24it/s]  3%|▎         | 82/3001 [00:30<08:20,  5.83it/s]  3%|▎         | 83/3001 [00:30<07:53,  6.16it/s]  3%|▎         | 84/3001 [00:30<07:47,  6.24it/s]  3%|▎         | 85/3001 [00:31<07:19,  6.64it/s]  3%|▎         | 86/3001 [00:31<07:07,  6.82it/s]  3%|▎         | 87/3001 [00:31<07:12,  6.74it/s]  3%|▎         | 88/3001 [00:31<07:24,  6.55it/s]  3%|▎         | 89/3001 [00:31<07:42,  6.29it/s]  3%|▎         | 90/3001 [00:31<08:27,  5.74it/s]  3%|▎         | 91/3001 [00:32<08:33,  5.67it/s]  3%|▎         | 92/3001 [00:32<08:54,  5.44it/s]  3%|▎         | 93/3001 [00:32<08:06,  5.98it/s]  3%|▎         | 94/3001 [00:32<08:08,  5.95it/s]  3%|▎         | 95/3001 [00:32<08:22,  5.79it/s]  3%|▎         | 96/3001 [00:33<09:33,  5.06it/s]  3%|▎         | 97/3001 [00:33<09:58,  4.85it/s]  3%|▎         | 98/3001 [00:33<09:51,  4.91it/s]  3%|▎         | 99/3001 [00:34<18:05,  2.67it/s]  3%|▎         | 100/3001 [00:34<23:50,  2.03it/s]  3%|▎         | 101/3001 [00:35<28:27,  1.70it/s]  3%|▎         | 102/3001 [00:36<26:59,  1.79it/s]  3%|▎         | 103/3001 [00:36<23:43,  2.04it/s]  3%|▎         | 104/3001 [00:37<26:12,  1.84it/s]  3%|▎         | 105/3001 [00:39<56:43,  1.18s/it]  4%|▎         | 106/3001 [00:40<45:24,  1.06it/s]  4%|▎         | 107/3001 [00:40<36:22,  1.33it/s]  4%|▎         | 108/3001 [00:40<29:12,  1.65it/s]  4%|▎         | 109/3001 [00:41<23:59,  2.01it/s]  4%|▎         | 110/3001 [00:41<19:22,  2.49it/s]  4%|▎         | 111/3001 [00:41<15:43,  3.06it/s]  4%|▎         | 112/3001 [00:41<13:08,  3.67it/s]  4%|▍         | 113/3001 [00:41<11:32,  4.17it/s]  4%|▍         | 114/3001 [00:41<10:06,  4.76it/s]  4%|▍         | 115/3001 [00:42<09:06,  5.28it/s]  4%|▍         | 116/3001 [00:42<08:13,  5.84it/s]  4%|▍         | 117/3001 [00:42<07:44,  6.21it/s]  4%|▍         | 118/3001 [00:42<07:36,  6.32it/s]  4%|▍         | 119/3001 [00:42<07:23,  6.50it/s]  4%|▍         | 120/3001 [00:42<07:03,  6.80it/s]  4%|▍         | 121/3001 [00:42<07:05,  6.77it/s]  4%|▍         | 122/3001 [00:43<06:55,  6.92it/s]  4%|▍         | 123/3001 [00:43<07:15,  6.61it/s]  4%|▍         | 124/3001 [00:43<08:14,  5.81it/s]  4%|▍         | 125/3001 [00:43<08:39,  5.53it/s]  4%|▍         | 126/3001 [00:43<08:05,  5.92it/s]  4%|▍         | 127/3001 [00:43<08:02,  5.95it/s]  4%|▍         | 128/3001 [00:44<08:02,  5.95it/s]  4%|▍         | 129/3001 [00:44<07:59,  5.99it/s]  4%|▍         | 130/3001 [00:44<07:49,  6.11it/s]  4%|▍         | 131/3001 [00:44<07:47,  6.14it/s]  4%|▍         | 132/3001 [00:44<08:10,  5.85it/s]  4%|▍         | 133/3001 [00:45<08:46,  5.45it/s]  4%|▍         | 134/3001 [00:45<10:32,  4.53it/s]  4%|▍         | 135/3001 [00:45<11:28,  4.16it/s]  5%|▍         | 136/3001 [00:45<11:06,  4.30it/s]  5%|▍         | 137/3001 [00:46<11:09,  4.28it/s]  5%|▍         | 138/3001 [00:46<11:18,  4.22it/s]  5%|▍         | 139/3001 [00:46<12:08,  3.93it/s]  5%|▍         | 140/3001 [00:46<10:36,  4.50it/s]  5%|▍         | 141/3001 [02:46<28:44:30, 36.18s/it]  5%|▍         | 142/3001 [02:47<20:15:38, 25.51s/it]  5%|▍         | 143/3001 [02:47<14:15:59, 17.97s/it]  5%|▍         | 144/3001 [02:48<10:04:12, 12.69s/it]  5%|▍         | 145/3001 [02:48<7:08:11,  9.00s/it]   5%|▍         | 146/3001 [02:48<5:04:49,  6.41s/it]  5%|▍         | 147/3001 [02:49<3:38:52,  4.60s/it]  5%|▍         | 148/3001 [02:50<2:50:22,  3.58s/it]  5%|▍         | 149/3001 [02:52<2:32:45,  3.21s/it]  5%|▍         | 150/3001 [02:54<2:10:41,  2.75s/it]  5%|▌         | 151/3001 [02:57<2:10:44,  2.75s/it]  5%|▌         | 152/3001 [02:58<1:45:37,  2.22s/it]  5%|▌         | 153/3001 [02:58<1:21:51,  1.72s/it]  5%|▌         | 154/3001 [02:59<1:02:36,  1.32s/it]  5%|▌         | 155/3001 [02:59<48:55,  1.03s/it]    5%|▌         | 156/3001 [02:59<39:39,  1.20it/s]  5%|▌         | 157/3001 [03:00<34:57,  1.36it/s]  5%|▌         | 158/3001 [03:00<29:39,  1.60it/s]  5%|▌         | 159/3001 [03:01<25:51,  1.83it/s]  5%|▌         | 160/3001 [03:01<23:05,  2.05it/s]  5%|▌         | 161/3001 [03:02<23:46,  1.99it/s]  5%|▌         | 162/3001 [03:02<22:06,  2.14it/s]  5%|▌         | 163/3001 [03:02<20:58,  2.26it/s]  5%|▌         | 164/3001 [03:03<19:55,  2.37it/s]  5%|▌         | 165/3001 [03:03<21:01,  2.25it/s]  6%|▌         | 166/3001 [03:04<19:46,  2.39it/s]  6%|▌         | 167/3001 [03:04<19:00,  2.49it/s]  6%|▌         | 168/3001 [03:05<27:10,  1.74it/s]  6%|▌         | 169/3001 [03:07<44:47,  1.05it/s]  6%|▌         | 170/3001 [03:09<57:16,  1.21s/it]  6%|▌         | 171/3001 [03:11<1:10:01,  1.48s/it]  6%|▌         | 172/3001 [03:11<1:00:28,  1.28s/it]  6%|▌         | 173/3001 [03:13<58:05,  1.23s/it]    6%|▌         | 174/3001 [03:13<46:47,  1.01it/s]  6%|▌         | 175/3001 [03:13<37:58,  1.24it/s]  6%|▌         | 176/3001 [03:14<31:39,  1.49it/s]  6%|▌         | 177/3001 [03:14<29:37,  1.59it/s]  6%|▌         | 178/3001 [03:15<25:42,  1.83it/s]  6%|▌         | 179/3001 [03:15<23:03,  2.04it/s]  6%|▌         | 180/3001 [03:15<21:30,  2.19it/s]  6%|▌         | 181/3001 [03:16<22:11,  2.12it/s]  6%|▌         | 182/3001 [03:16<20:28,  2.29it/s]  6%|▌         | 183/3001 [03:17<20:12,  2.32it/s]  6%|▌         | 184/3001 [03:17<19:06,  2.46it/s]  6%|▌         | 185/3001 [03:18<20:14,  2.32it/s]  6%|▌         | 186/3001 [03:18<19:13,  2.44it/s]  6%|▌         | 187/3001 [03:18<18:32,  2.53it/s]  6%|▋         | 188/3001 [03:19<17:55,  2.61it/s]  6%|▋         | 189/3001 [03:19<20:58,  2.23it/s]  6%|▋         | 190/3001 [03:21<45:17,  1.03it/s]  6%|▋         | 191/3001 [03:27<1:47:58,  2.31s/it]  6%|▋         | 192/3001 [03:27<1:25:03,  1.82s/it]  6%|▋         | 193/3001 [03:28<1:11:46,  1.53s/it]  6%|▋         | 194/3001 [03:29<55:17,  1.18s/it]    6%|▋         | 195/3001 [03:29<43:33,  1.07it/s]  7%|▋         | 196/3001 [03:29<35:55,  1.30it/s]  7%|▋         | 197/3001 [03:30<32:17,  1.45it/s]  7%|▋         | 198/3001 [03:30<27:29,  1.70it/s]  7%|▋         | 199/3001 [03:31<24:18,  1.92it/s]  7%|▋         | 200/3001 [03:31<22:31,  2.07it/s]  7%|▋         | 201/3001 [03:32<24:43,  1.89it/s]  7%|▋         | 202/3001 [03:32<22:46,  2.05it/s]  7%|▋         | 203/3001 [03:32<20:46,  2.24it/s]  7%|▋         | 204/3001 [03:33<19:15,  2.42it/s]  7%|▋         | 205/3001 [03:33<20:43,  2.25it/s]  7%|▋         | 206/3001 [03:34<19:22,  2.40it/s]  7%|▋         | 207/3001 [03:34<18:33,  2.51it/s]  7%|▋         | 208/3001 [03:35<27:33,  1.69it/s]  7%|▋         | 209/3001 [03:37<42:19,  1.10it/s]  7%|▋         | 210/3001 [03:38<54:20,  1.17s/it]  7%|▋         | 211/3001 [03:40<1:04:21,  1.38s/it]  7%|▋         | 212/3001 [03:41<56:18,  1.21s/it]    7%|▋         | 213/3001 [03:42<49:12,  1.06s/it]  7%|▋         | 214/3001 [03:42<39:16,  1.18it/s]  7%|▋         | 215/3001 [03:43<32:16,  1.44it/s]  7%|▋         | 216/3001 [03:43<27:27,  1.69it/s]  7%|▋         | 217/3001 [03:43<26:08,  1.77it/s]  7%|▋         | 218/3001 [03:44<23:19,  1.99it/s]  7%|▋         | 219/3001 [03:44<21:05,  2.20it/s]  7%|▋         | 220/3001 [03:44<19:38,  2.36it/s]  7%|▋         | 220/3001 [03:45<47:29,  1.02s/it]
+Traceback (most recent call last):
+  File "C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\train.py", line 2221, in train
+    self.monitor_losses(current_loss, step_type)
+  File "C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\train.py", line 2308, in monitor_losses
+    self.fire_loss_spike()
+  File "C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\train.py", line 2398, in fire_loss_spike
+    raise FrozenTrainingState(msg)
+FrozenTrainingState: UNRECOVERABLE at step 220: 4 rewinds (budget 3.0 at 0.2/1k steps) and the run keeps re-detonating -- rewinding restores weights but not a survivable LR. Aborting so the GPU is released.
+wandb: uploading console lines 23-45
+wandb:                                                                                
+wandb: 
+wandb: Run history:
+wandb:                                         Batch Size ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                            Boltzmann Temp Estimate ▁
+wandb:                                           Bwd Frac ███████████████▁▁▁▁▁▁▁
+wandb:                                Cond Nonthermal Bar ▁
+wandb:                       Cond Nonthermal Failing Frac ▁▁
+wandb:                                  Cond Nonthermal N ▁▁
+wandb:                             Cond Nonthermal Spread ▁█
+wandb:                              Cond Nonthermal Worst ▁▁
+wandb:                                Cond Reasonable Bar ▁
+wandb:                       Cond Reasonable Failing Frac ▁▁
+wandb:                                  Cond Reasonable N ▁▁
+wandb:                             Cond Reasonable Spread █▁
+wandb:                              Cond Reasonable Worst ▁▁
+wandb:                       Crystal Mean Log Temperature ▁▁
+wandb:                                Effective Dimension █▁
+wandb:                             Excess Energy Nats Max █▁
+wandb:                            Excess Energy Nats Mean █▁
+wandb:                             Excess Energy Nats P50 █▁
+wandb:                             Excess Energy Nats P90 █▁
+wandb:                             Excess Energy Nats P99 █▁
+wandb:                  Excess Energy Referenced Fraction ▁▁
+wandb:                                           Fwd Frac ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁███████
+wandb:                          Max rot_r_jacobian_energy ▁█
+wandb:                      Max rot_theta_jacobian_energy ▁▁
+wandb:                                 Mean Packing Coeff █▁
+wandb:                                 Mean Sample Energy █▁
+wandb:                                 Mean Sample Reward ▁█
+wandb:                               Mean bounding_energy █▁
+wandb:                                Mean density_energy █▁
+wandb:                          Mean frac_jacobian_energy ▁█
+wandb:                               Mean jacobian_energy ▁█
+wandb:                                    Mean mol_energy █▁
+wandb:                               Mean pressure_energy █▁
+wandb:                              Mean reduction_energy █▁
+wandb:                         Mean rot_r_jacobian_energy ▁█
+wandb:                     Mean rot_theta_jacobian_energy ▁█
+wandb:                                Nonthermal Fraction ▁█
+wandb:                               Nonthermal Threshold ▁
+wandb:                         Reasonable Sample Fraction ▁█
+wandb:                             Reduced Valid Fraction ▁█
+wandb:                                        Replay Frac ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                                         Total Mean █▁
+wandb:                                          Total Var █▁
+wandb:                             anchor_admitted_last_n ▁▁
+wandb:                               anchor_buffer_length ▁▁
+wandb:                           anchor_buffer_max_energy ▁▁
+wandb:            anchor_buffer_max_energy_above_cond_min ▁▁
+wandb:                          anchor_buffer_mean_energy █▁
+wandb:           anchor_buffer_mean_energy_above_cond_min ▁█
+wandb:  anchor_buffer_mean_energy_improvement_last_window ▁
+wandb: anchor_buffer_mean_energy_improvement_n_conditions ▁
+wandb:                        anchor_buffer_median_energy ▁▁
+wandb:         anchor_buffer_median_energy_above_cond_min ▁█
+wandb:                           anchor_buffer_min_energy ▁▁
+wandb:                       anchor_topup_admitted_last_n ▁
+wandb:                                anchor_topup_last_n ▁█
+wandb:                             batch/ceiling_expiries ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                                  batch/oom_ceiling ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                                   batch/oom_events ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                                      batch/oom_min ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                                   bwd Mean B Drift ▁█
+wandb:                                     bwd Mean B Var █▁
+wandb:                                bwd Mean F Diag Var █▁
+wandb:                                   bwd Mean F Drift █▁
+wandb:                                     bwd Mean F Rho ▁█
+wandb:                                     bwd Mean F Var █▁
+wandb:                               bwd/box_contact_frac ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                                  bwd/box_violation ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                                    bwd/cond_tb_err ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▂▆▃█▃█
+wandb:                   bwd/condition_log_z_visited_frac ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                                          bwd/emp_z ▅▄▄▄▄▄▃▃▂▂▂▁▁▁▂▄▆▅▇▇█
+wandb:                                      bwd/emp_z_err ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▂▅▂█▂█
+wandb:                                       bwd/ess_frac ▅▅▄▃▅▆▄▅▅▅█▇▇▇▇▆▄▃▂▂▁
+wandb:                                  bwd/intercept_err ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▄▃▅▃█
+wandb:                                       bwd/jensen_z ▇▆▆▅▅▄▄▃▃▂▂▂▁▁▂▃▆▅▆▇█
+wandb:                                   bwd/jensen_z_err ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▂▆▃█▃█
+wandb:                                      bwd/level_gap ▁▁█▁▇▁▇
+wandb:                            bwd/level_gap_coeff_rms ▁▁█▁█▁█
+wandb:                                  bwd/log_Z_learned ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▂▅▂█▂█
+wandb:                                       bwd/logw_std █▇█▇█▇▇▇▆█▇▇▇▆▅▄▄▃▃▁▁
+wandb:                                bwd/logw_std_within █▇███▇▇▇▇██▇█▇▆▅▄▃▂▂▁
+wandb:                                           bwd/loss ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁█▁▇▁▇
+wandb:                                            bwd/mle █▇▇▆▅▅▄▃▃▂▂▂▁▁
+wandb:                                  bwd/over_coverage ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▂▆▃█▃█
+wandb:                                             bwd/r2 ▁▁▁▁▁▁▁▂▁▁▁▂▂▂▂▄▅▆▆▇█
+wandb:                                  bwd/ramp_ess_frac ▅▅▅▅▄▃▃▂▂▁▁▂▁▂▃▄▅▆▇▇█
+wandb:                                 bwd/relative_under ▇▇█▇▇▇▇▇▇██▇▇▇▆▅▄▃▂▂▁
+wandb:                            bwd/relative_under_wcen ████▇▇▆▆▆▆▆▆▆▆▅▄▄▂▂▁▁
+wandb:                                      bwd/resid_p05 ████████████████▁▃▃▄▆
+wandb:                                      bwd/resid_p95 ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▂▆▃█▃█
+wandb:                                     bwd/resid_skew ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▂▄▅▆▇█
+wandb:                                    bwd/scatter_err ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▂▇▃█▃█
+wandb:                                      bwd/slope_err ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▂▆▃█▄█
+wandb:                                       bwd/step_var ▁▂▂▃▄▄▅▅▆▆▇▇▇▇███████
+wandb:                                         bwd/tb_err ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▂▆▃█▃█
+wandb:                                   bwd/tb_err_worst ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▂▆▃█▃█
+wandb:                                       bwd/tb_resid ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▂▅▂█▂█
+wandb:                               bwd/tb_resid_clipped ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▃▄▅▇▆█
+wandb:                                            bwd/tbc ██▇▆▅▅▄▄▃▃▂▂▁▁
+wandb:                                   bwd/terminal_var ▇▇█▇▆▇▆▆▆▆▆▇▇▇▆▄▃▃▁▂▁
+wandb:                                 bwd/under_coverage ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▂▂█▅▆▅▆
+wandb:                         bwd/under_coverage_uniform ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▂▂█▅▆▅▆
+wandb:                             bwd/vg_group_size_mean ███▇▇▇▇▇▇▆▆▆▆▆▅▄▄▃▂▁▁
+wandb:                                          bwd/vg_lb ▁▃▇▂▄▇█
+wandb:                                   bwd/vg_live_frac ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                                    bwd/vg_n_groups ▁▂▂▂▂▃▃▃▃▃▃▃▄▃▄▅▆▆▇▇█
+wandb:                                          bwd/z_gap ▁▁▂▃▃▃▃▃▂▃▂▂▂▂▃▄▇▆▇▇█
+wandb:                                   bwd/z_grad_worst ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                                bwd_outside_fwd_auc ▁█
+wandb:                              bwd_outside_fwd_final ▁█
+wandb:                       condition_best_energy_median █▁
+wandb:                 condition_log_z_mean_ema_log_z_emp █▁
+wandb:                      condition_log_z_mean_ema_logw █▁
+wandb:                           condition_log_z_mean_gap █▁
+wandb:               condition_log_z_median_ema_log_z_emp █▁
+wandb:                    condition_log_z_median_ema_logw █▁
+wandb:                         condition_log_z_median_gap █▁
+wandb:                        condition_log_z_num_visited ▁▁
+wandb:                 condition_minima_depth_last_window ▁█
+wandb:                    condition_minima_depth_rate_ema ▁█
+wandb:                       condition_minima_depth_total ▁█
+wandb:          condition_minima_first_visits_last_window █▁
+wandb:              condition_minima_improved_last_window ▁█
+wandb:                    condition_minima_improved_total ▁█
+wandb:                          condition_minima_rate_ema ▁█
+wandb:                           dead_rows/probe_verified ▁▁
+wandb:                                      delta_overlap ▁█
+wandb:                                       energy/calls ▁█▁▁▁▁▁▁
+wandb:                                energy/frac_of_step ▁▅█▇█▇▇▆
+wandb:                           energy/frac_outside_step ▂█▁▁▁▁▁▁
+wandb:                               energy/ms_per_sample █▃▂▃▂▄▁▃
+wandb:                                     energy/seconds ▁█▁▁▁▁▁▁
+wandb:                             energy/seconds_in_step ▁▆▅▇▅█▄▆
+wandb:                            energy_func//batch_size ▁
+wandb:                        energy_func//bounding_coeff ▁
+wandb:                energy_func//condition_library_size ▁
+wandb:                             energy_func//data_ndim ▁
+wandb:                         energy_func//density_coeff ▁
+wandb:            energy_func//embedding_conditioning_dim ▁
+wandb:                          energy_func//energy_calls ▁
+wandb:                        energy_func//energy_samples ▁
+wandb:                        energy_func//energy_seconds ▁█
+wandb:                              energy_func//lj_coeff ▁
+wandb:                       energy_func//max_temperature ▁
+wandb:                           energy_func//max_z_prime ▁
+wandb:                       energy_func//min_temperature ▁
+wandb:                           energy_func//n_molecules ▁
+wandb:                                  energy_func//n_sg ▁
+wandb:                                  energy_func//n_zp ▁
+wandb:                            energy_func//num_sample ▁
+wandb:                              energy_func//pressure ▁
+wandb:                       energy_func//reduction_coeff ▁
+wandb:                          energy_func//reward_range ▁
+wandb:                           energy_func//temperature ▁
+wandb:               energy_func//vector_conditioning_dim ▁
+wandb:                               eval_bwd/cond_tb_err █▁
+wandb:                                     eval_bwd/emp_z █▁
+wandb:                                 eval_bwd/emp_z_err █▁
+wandb:                                  eval_bwd/ess_frac █▁
+wandb:                             eval_bwd/intercept_err ▁█
+wandb:                                  eval_bwd/jensen_z █▁
+wandb:                              eval_bwd/jensen_z_err █▁
+wandb:                                  eval_bwd/logw_std ▁█
+wandb:                           eval_bwd/logw_std_within ▁█
+wandb:                             eval_bwd/over_coverage █▁
+wandb:                                        eval_bwd/r2 █▁
+wandb:                             eval_bwd/ramp_ess_frac █▁
+wandb:                            eval_bwd/relative_under ▁█
+wandb:                       eval_bwd/relative_under_wcen █▁
+wandb:                                 eval_bwd/resid_p05 ▁█
+wandb:                                 eval_bwd/resid_p95 ▁█
+wandb:                                eval_bwd/resid_skew █▁
+wandb:                               eval_bwd/scatter_err ▁█
+wandb:                                 eval_bwd/slope_err ▁█
+wandb:                                    eval_bwd/tb_err █▁
+wandb:                              eval_bwd/tb_err_worst █▁
+wandb:                                  eval_bwd/tb_resid ▁█
+wandb:                          eval_bwd/tb_resid_clipped ▁█
+wandb:                            eval_bwd/under_coverage █▁
+wandb:                    eval_bwd/under_coverage_uniform █▁
+wandb:                                     eval_bwd/z_gap █▁
+wandb:                              eval_bwd/z_grad_worst ▁▁
+wandb:                                     eval_figs_time ▁█
+wandb:                               eval_fwd/cond_tb_err █▁
+wandb:                                     eval_fwd/emp_z █▁
+wandb:                                 eval_fwd/emp_z_err █▁
+wandb:                                  eval_fwd/ess_frac █▁
+wandb:                             eval_fwd/intercept_err ▁█
+wandb:                                  eval_fwd/jensen_z ▁█
+wandb:                              eval_fwd/jensen_z_err █▁
+wandb:                                  eval_fwd/logw_std █▁
+wandb:                           eval_fwd/logw_std_within █▁
+wandb:                             eval_fwd/over_coverage █▁
+wandb:                                        eval_fwd/r2 ▁█
+wandb:                             eval_fwd/ramp_ess_frac ▁█
+wandb:                            eval_fwd/relative_under █▁
+wandb:                       eval_fwd/relative_under_wcen █▁
+wandb:                                 eval_fwd/resid_p05 ▁█
+wandb:                                 eval_fwd/resid_p95 █▁
+wandb:                                eval_fwd/resid_skew ▁█
+wandb:                               eval_fwd/scatter_err █▁
+wandb:                                 eval_fwd/slope_err █▁
+wandb:                                    eval_fwd/tb_err █▁
+wandb:                              eval_fwd/tb_err_worst █▁
+wandb:                                  eval_fwd/tb_resid █▁
+wandb:                          eval_fwd/tb_resid_clipped █▁
+wandb:                            eval_fwd/under_coverage █▁
+wandb:                    eval_fwd/under_coverage_uniform █▁
+wandb:                                     eval_fwd/z_gap █▁
+wandb:                              eval_fwd/z_grad_worst ▁█
+wandb:                                 eval_sampling_time ▁█▁
+wandb:                                     eval_step_time ▁█
+wandb:             eval_test/Cond Reasonable Failing Frac ▁▁
+wandb:                        eval_test/Cond Reasonable N ▁▁
+wandb:                   eval_test/Cond Reasonable Spread ▁▁
+wandb:                    eval_test/Cond Reasonable Worst ▁▁
+wandb:               eval_test/Reasonable Sample Fraction ▁█
+wandb:                              eval_test/cond_tb_err █▁
+wandb:                                    eval_test/emp_z ▁█
+wandb:                                eval_test/emp_z_err ▁█
+wandb:                                 eval_test/ess_frac ▁█
+wandb:                            eval_test/intercept_err ▁█
+wandb:                                 eval_test/jensen_z ▁█
+wandb:                             eval_test/jensen_z_err █▁
+wandb:                                 eval_test/logw_std █▁
+wandb:                          eval_test/logw_std_within █▁
+wandb:                            eval_test/over_coverage █▁
+wandb:                                       eval_test/r2 ▁█
+wandb:                            eval_test/ramp_ess_frac ▁█
+wandb:                           eval_test/relative_under █▁
+wandb:                      eval_test/relative_under_wcen ▁█
+wandb:                                eval_test/resid_p05 █▁
+wandb:                                eval_test/resid_p95 █▁
+wandb:                               eval_test/resid_skew █▁
+wandb:                              eval_test/scatter_err █▁
+wandb:                                eval_test/slope_err █▁
+wandb:                                   eval_test/tb_err █▁
+wandb:                             eval_test/tb_err_worst █▁
+wandb:                                 eval_test/tb_resid █▁
+wandb:                         eval_test/tb_resid_clipped █▁
+wandb:                           eval_test/under_coverage ▁█
+wandb:                   eval_test/under_coverage_uniform ▁█
+wandb:                                    eval_test/z_gap █▁
+wandb:                             eval_test/z_grad_worst ▁█
+wandb:                                   eval_wrapup_time ▁▁
+wandb:                            fused_grad/bwd_norm_raw ▁
+wandb:                    fused_grad/bwd_uncontested_frac ▁
+wandb:                             fused_grad/cos_fwd_bwd ▁
+wandb:                      fused_grad/cos_fwd_bwd_shared ▁
+wandb:                              fused_grad/fused_norm ▁
+wandb:                        fused_grad/fused_norm_ratio ▁
+wandb:                            fused_grad/fwd_norm_raw ▁
+wandb:                    fused_grad/fwd_uncontested_frac ▁
+wandb:                         fused_grad/overlap_fwd_bwd ▁
+wandb:             fused_grad/weighted_component_norm_sum ▁
+wandb:                                   fwd Mean B Drift █▁
+wandb:                                     fwd Mean B Var █▁
+wandb:                                fwd Mean F Diag Var █▁
+wandb:                                   fwd Mean F Drift █▁
+wandb:                                     fwd Mean F Rho ▁█
+wandb:                                     fwd Mean F Var █▁
+wandb:                               fwd/box_contact_frac ▃▃█▁▂▁▂
+wandb:                                  fwd/box_violation ▇▃█▁▁▄▁
+wandb:                                    fwd/cond_tb_err ▁▂▆▂█▂█
+wandb:                   fwd/condition_log_z_visited_frac ▁▁▁▁▁▁▁
+wandb:                                          fwd/emp_z ▁▂▇▂▇▂█
+wandb:                                      fwd/emp_z_err ▁▂▇▁▇▁█
+wandb:                                       fwd/ess_frac ▁▁▁▅█▂▂
+wandb:                                  fwd/intercept_err ▁▂▇▁▇▁█
+wandb:                                       fwd/jensen_z ▂▅█▅▇▁▄
+wandb:                                   fwd/jensen_z_err ▁▂▇▂▇▂█
+wandb:                                  fwd/log_Z_learned ▁▂▆▂▇▂█
+wandb:                                       fwd/logw_std ▂▁▁▅▅█▇
+wandb:                                fwd/logw_std_within ▂▁▁▅▅█▇
+wandb:                                           fwd/loss ▁▂█▂█▂█
+wandb:                                  fwd/over_coverage ▁▂▆▂▇▂█
+wandb:                                             fwd/r2 ▁▂▄▅▆▇█
+wandb:                                  fwd/ramp_ess_frac ▁▃▄▇█▆▇
+wandb:                                 fwd/relative_under ▃▂▁▆▅█▆
+wandb:                            fwd/relative_under_wcen ▁▄█▃▇▇█
+wandb:                                      fwd/resid_p05 ▇█▁▁▃▃▆
+wandb:                                      fwd/resid_p95 ▁▂▅▂▇▃█
+wandb:                                     fwd/resid_skew ▁▂▄▄▅▇█
+wandb:                                    fwd/scatter_err ▁▂▆▃▇▃█
+wandb:                                      fwd/slope_err ▁▂▆▁▂▁█
+wandb:                                       fwd/step_var ▇▇█▂▂▁▁
+wandb:                                         fwd/tb_err ▁▂▆▂▇▂█
+wandb:                                   fwd/tb_err_worst ▁▂▇▂█▂█
+wandb:                                       fwd/tb_resid ▁▂▆▂▇▂█
+wandb:                               fwd/tb_resid_clipped ▁▃▅▄▆▆█
+wandb:                                   fwd/terminal_var █▂▃▁▂▅▂
+wandb:                                 fwd/under_coverage ▂▁██▇▄▄
+wandb:                         fwd/under_coverage_uniform ▂▁███▄▄
+wandb:                             fwd/vg_group_size_mean ▅██▆█▁▄
+wandb:                                          fwd/vg_lb ▃▂▁▅▄█▆
+wandb:                                   fwd/vg_live_frac ▁▁▁▁▁▁▁
+wandb:                                    fwd/vg_n_groups ▆▅▃▁▁██
+wandb:                                          fwd/z_gap █▆▃▄▁█▅
+wandb:                                   fwd/z_grad_worst ▁▁▁▁▁▁▁
+wandb:                                fwd_outside_bwd_auc █▁
+wandb:                              fwd_outside_bwd_final █▁
+wandb:                                 grad_norm_pre_clip ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▃▇▂█▂▇
+wandb:                             gradclip/bwd_fire_rate ██▂▁▁▂▂▄▅▅▅▁▁▁▁▁▁▁▁▁▁▁
+wandb:                                     gradclip/bwd_n ▂██████████████▁▁▁▁▁▁▁
+wandb:                             gradclip/bwd_saturated ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                                   gradclip/bwd_tau █▆▄▃▁▁▁▁▁▁▁▁
+wandb:                           gradclip/fused_fire_rate ▁▁▁▁▁▁▁
+wandb:                                   gradclip/fused_n ▁█▁█▁█▁
+wandb:                           gradclip/fused_saturated ▁▁▁▁▁▁▁
+wandb:                                 gradclip/nonfinite ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                               gradclip/nonpositive ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                                 gradclip/refreshes ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁███████
+wandb:                           gradnorm/backward_policy ▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁██▂▂▂▂
+wandb:                gradnorm/conditions_embedding_model ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁██▆▆▄▄
+wandb:                                gradnorm/flow_model ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁██▃▃▃▃
+wandb:                            gradnorm/forward_policy ▅▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁██▆▆▇▇
+wandb:                           gradnorm/nonfinite_steps ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                                   gradnorm/s_model ▆▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁██▃▃▄▄
+wandb:                                   gradnorm/t_model ▇▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁██▃▃▄▄
+wandb:                                initialization_time ▁
+wandb:                                    inter_eval_time ▁
+wandb:                                      log Z learned ▁█
+wandb:                              loss_coeffs/bwd_/beta ▁
+wandb:                                loss_coeffs/bwd_/db ▁
+wandb:                             loss_coeffs/bwd_/emp_z ▁
+wandb:                  loss_coeffs/bwd_/emp_z_persistent ▁
+wandb:                     loss_coeffs/bwd_/freeze_policy ▁
+wandb:                          loss_coeffs/bwd_/freeze_z ▁
+wandb:                         loss_coeffs/bwd_/level_gap ▁
+wandb:                   loss_coeffs/bwd_/level_gap_clamp ▁
+wandb:                         loss_coeffs/bwd_/loss_clip ▁
+wandb:                               loss_coeffs/bwd_/mle ▁
+wandb:                          loss_coeffs/bwd_/pf_boost ▁
+wandb:                           loss_coeffs/bwd_/repeats ▁
+wandb:                             loss_coeffs/bwd_/subtb ▁
+wandb:                      loss_coeffs/bwd_/subtb_lambda ▁
+wandb:                                loss_coeffs/bwd_/tb ▁
+wandb:                               loss_coeffs/bwd_/tbc ▁
+wandb:                        loss_coeffs/bwd_/traj_grads ▁
+wandb:                   loss_coeffs/bwd_/vg_by_condition ▁
+wandb:                             loss_coeffs/bwd_/vg_lb ▁
+wandb:                            loss_coeffs/bwd_/vg_lme ▁
+wandb:                              loss_coeffs/fwd_/beta ▁
+wandb:                                loss_coeffs/fwd_/db ▁
+wandb:                             loss_coeffs/fwd_/emp_z ▁
+wandb:                  loss_coeffs/fwd_/emp_z_persistent ▁
+wandb:                     loss_coeffs/fwd_/freeze_policy ▁
+wandb:                          loss_coeffs/fwd_/freeze_z ▁
+wandb:                         loss_coeffs/fwd_/loss_clip ▁
+wandb:                           loss_coeffs/fwd_/repeats ▁
+wandb:                      loss_coeffs/fwd_/reward_grads ▁
+wandb:                             loss_coeffs/fwd_/subtb ▁
+wandb:                      loss_coeffs/fwd_/subtb_lambda ▁
+wandb:                                loss_coeffs/fwd_/tb ▁
+wandb:                        loss_coeffs/fwd_/traj_grads ▁
+wandb:                   loss_coeffs/fwd_/vg_by_condition ▁
+wandb:                             loss_coeffs/fwd_/vg_lb ▁
+wandb:                            loss_coeffs/fwd_/vg_lme ▁
+wandb:                           loss_coeffs/fwd_/z_level ▁
+wandb:                           loss_coeffs/replay_/beta ▁
+wandb:                             loss_coeffs/replay_/db ▁
+wandb:                          loss_coeffs/replay_/emp_z ▁
+wandb:               loss_coeffs/replay_/emp_z_persistent ▁
+wandb:                  loss_coeffs/replay_/freeze_policy ▁
+wandb:                       loss_coeffs/replay_/freeze_z ▁
+wandb:                      loss_coeffs/replay_/loss_clip ▁
+wandb:                            loss_coeffs/replay_/mle ▁
+wandb:                       loss_coeffs/replay_/pf_boost ▁
+wandb:                        loss_coeffs/replay_/repeats ▁
+wandb:                          loss_coeffs/replay_/subtb ▁
+wandb:                   loss_coeffs/replay_/subtb_lambda ▁
+wandb:                             loss_coeffs/replay_/tb ▁
+wandb:                     loss_coeffs/replay_/traj_grads ▁
+wandb:                loss_coeffs/replay_/vg_by_condition ▁
+wandb:                          loss_coeffs/replay_/vg_lb ▁
+wandb:                         loss_coeffs/replay_/vg_lme ▁
+wandb:                                             lr_bwd ▅▅▅▅▆▆▆▆▇▇▇▇▇██▅▅▅▁▁▁▁
+wandb:                               lr_ctrl/calibrations ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                                lr_ctrl/divergences ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▅▅██
+wandb:                                   lr_ctrl/envelope ▁▁▂▂▃▃▄▄▅▅▆▆▇▇█▁▂▂▃▃▄▄
+wandb:                              lr_ctrl/hyper_applied ▁▁▁▁▁▁▁
+wandb:                                  lr_ctrl/hyper_cos ▃▅▆▁▇▁█
+wandb:                               lr_ctrl/hyper_status ▁▁▁▁▁▁▁
+wandb:                                 lr_ctrl/hypergrads ▁▁▁▁▁▁▁
+wandb:                               lr_ctrl/peak_ceiling ▁▁▁▁
+wandb:                                 lr_ctrl/peak_scale ██████████████████▁▁▁▁
+wandb:                                      lr_ctrl/scale ▅▅▅▅▆▆▆▆▇▇▇▇▇██▅▅▅▁▁▁▁
+wandb:                                     lr_ctrl/warmup ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                                            lr_flow ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                                           lr_fused ▅▅▅▅▆▆▆▆▇▇▇▇▇██▅▅▅▁▁▁▁
+wandb:                                      lr_fused_flow ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                                             lr_fwd ▅▅▅▅▆▆▆▆▇▇▇▇▇██▅▅▅▁▁▁▁
+wandb:                                          lr_replay ▅▅▅▅▆▆▆▆▇▇▇▇▇██▅▅▅▁▁▁▁
+wandb:                                      mle_gate_flat ▁▁▁▁█
+wandb:                                      mle_gate_rate █▄▂▂▁
+wandb:                                   mle_gate_rate_hi █▄▂▁▁
+wandb:                                   mle_gate_rate_se █▃▂▁▁
+wandb:                                          mmd_final ▁█
+wandb:                                            mmd_max ▁█
+wandb:                                           mmd_mean ▁█
+wandb:                                       nn_sep_final █▁
+wandb:                                         nn_sep_max █▁
+wandb:                                        nn_sep_mean █▁
+wandb:                                              phase ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁███████
+wandb:                                  policy_ratio_mean ▁█
+wandb:                                   policy_ratio_std █▁
+wandb:                                 prior_buffer_added ▁█
+wandb:                     prior_buffer_anchor_floor_rows ▁▁
+wandb:                       prior_buffer_anchor_fraction  ▁
+wandb:                               prior_buffer_evicted ▁█
+wandb:                               prior_buffer_expired ▁█
+wandb:                          prior_buffer_from_anchors ▁█
+wandb:                      prior_buffer_from_prior_model ▁▁
+wandb:                             prior_buffer_from_seed ▁▁
+wandb:                                prior_buffer_length ▁█
+wandb:                            prior_buffer_max_energy █▁
+wandb:                           prior_buffer_mean_energy █▁
+wandb:                             prior_buffer_mean_loss ▁ 
+wandb:                            prior_buffer_mean_steps █▁
+wandb:                         prior_buffer_median_energy █▁
+wandb:                           prior_buffer_median_loss ▁ 
+wandb:                          prior_buffer_median_steps █▁
+wandb:                            prior_buffer_min_energy ▁█
+wandb:                      prior_buffer_prior_admit_rate  ▁
+wandb:                              prior_buffer_turnover ▁█
+wandb:                           probe/device_alloc_delta ▁▁▁▁▁▁▁▁▁▁▁▁▁▁█▁▁▁▁▁▁
+wandb:                            probe/device_free_delta ▁▁▁▁▁▁▁▁▁▁▁▁▁▁█▁▁▁▁▁▁
+wandb:                              probe/step_time_max10 ▂▃▃▁▁▁▁▁▁▁▂▄▁▁▁▅▂▃▂█▂▃
+wandb:                                     protocol/boost ▁▁▁▁▁▁
+wandb:           protocol/exit_streak_bwd_logw_std_within ▁▁▁▁▁▁▁
+wandb:                       protocol/exit_streak_bwd_tbc ▁▁▂▂▃▃▄▄▅▅▆▆▇▇█
+wandb:            protocol/exit_streak_eval_wass_debiased ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:           protocol/exit_streak_fwd_logw_std_within ▁▁▁▁▁▁▁
+wandb:                protocol/exit_streak_gates_mle_flat ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                              protocol/prop_bar_bwd ▁▁▁▁▁▁▁
+wandb:                              protocol/prop_bar_fwd ▁▁▁▁▁▁▁
+wandb:                            protocol/prop_drive_bwd █▇▆▃▃▂▁
+wandb:                            protocol/prop_drive_fwd ▂▁▁▅▅█▇
+wandb:                               protocol/prop_target ▁▁▁▁▁▁
+wandb:                                    samples_per_sec ▂▃▂▆▇█▅▇▇▇▃▂█▇▅▁▂▁▂▁▂▁
+wandb:                                    stepkl_argmax_t ▁▁
+wandb:                                       stepkl_drift ▁█
+wandb:                                         stepkl_max █▁
+wandb:                                         stepkl_sum █▁
+wandb:                                             tb_gap █▁
+wandb:                                       tb_resid_std █▁
+wandb:                               tracker/logw_std_rms ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁█▄▃▄▄▄▃
+wandb:                                 tracker/tb_err_rms ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▃█▂█▂█
+wandb:                               tracker/tb_err_worst ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▃█▂▇▁▇
+wandb:                                 tracker/z_bias_rms ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▃█▂█▂█
+wandb:                                 tracker/z_bias_var ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁█▁▄▁▅
+wandb:                               tracker/z_bias_worst ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▃█▂▇▁▇
+wandb:                                 tracker/z_grad_rms ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▆█▆█▆▇
+wandb:                               tracker/z_grad_worst ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▆▆█▆▇▆▇
+wandb:                                    train_step_time ▂▃▁▁▁▁▁▁▁▁▂▁▁▁▁▅▂▃▂█▂▃
+wandb:                                     vram/cached_mb ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁█▇█▆█▇█
+wandb:                                       vram/live_mb ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▄▇▄█▄█▄
+wandb:                              vram/peak_reserved_mb ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁███████
+wandb:                                   vram/reserved_mb ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁███████
+wandb:                                               wass ▁█
+wandb:                                        wass_anchor ▁█
+wandb:                               wass_anchor_debiased ▁█
+wandb:                                   wass_anchor_null █▁
+wandb:                                      wass_debiased ▁█
+wandb:                                          wass_null █▁
+wandb:                                            z_cal/p ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁█▁▇▁▆▁
+wandb:                                       z_cal/sensor ▁██▇▇▆▆
+wandb:                                   zmatch/bwd_level                 ▂█▁▄▁▄
+wandb:                             zmatch/delta_n_trusted ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▆█▅█▆█
+wandb:                                   zmatch/fwd_level                 ▃█▂▇▁▇
+wandb: 
+wandb: Run summary:
+wandb:                                         Batch Size 250
+wandb:                            Boltzmann Temp Estimate 2408.75852
+wandb:                                           Bwd Frac 0.48812
+wandb:                                Cond Nonthermal Bar 0.1
+wandb:                       Cond Nonthermal Failing Frac 1
+wandb:                                  Cond Nonthermal N 98
+wandb:                             Cond Nonthermal Spread 0.01457
+wandb:                              Cond Nonthermal Worst 1
+wandb:                                Cond Reasonable Bar 0.5
+wandb:                       Cond Reasonable Failing Frac 1
+wandb:                                  Cond Reasonable N 98
+wandb:                             Cond Reasonable Spread 0.00089
+wandb:                              Cond Reasonable Worst 0
+wandb:                       Crystal Mean Log Temperature 0.83885
+wandb:                                Effective Dimension 7.1768
+wandb:                             Excess Energy Nats Max 122931.60938
+wandb:                            Excess Energy Nats Mean 855.36505
+wandb:                             Excess Energy Nats P50 251.27414
+wandb:                             Excess Energy Nats P90 1015.90271
+wandb:                             Excess Energy Nats P99 15610.91309
+wandb:                  Excess Energy Referenced Fraction 1
+wandb:                                           Fwd Frac 0.51188
+wandb:                          Max rot_r_jacobian_energy 71.71929
+wandb:                      Max rot_theta_jacobian_energy 127.10271
+wandb:                                 Mean Packing Coeff 0.90658
+wandb:                                 Mean Sample Energy 5382.69287
+wandb:                                 Mean Sample Reward -780.1004
+wandb:                               Mean bounding_energy 0.18953
+wandb:                                Mean density_energy 0.26623
+wandb:                          Mean frac_jacobian_energy -34.71146
+wandb:                               Mean jacobian_energy -29.11141
+wandb:                                    Mean mol_energy 1221.35608
+wandb:                               Mean pressure_energy 0.01146
+wandb:                              Mean reduction_energy 418.58792
+wandb:                         Mean rot_r_jacobian_energy 2.69232
+wandb:                     Mean rot_theta_jacobian_energy 2.90773
+wandb:                                Nonthermal Fraction 0.9855
+wandb:                               Nonthermal Threshold 48
+wandb:                         Reasonable Sample Fraction 0.0255
+wandb:                             Reduced Valid Fraction 0.5165
+wandb:                                        Replay Frac 0
+wandb:                                         Total Mean 0.09726
+wandb:                                          Total Var 0.15173
+wandb:                             anchor_admitted_last_n 0
+wandb:                               anchor_buffer_length 4880
+wandb:                           anchor_buffer_max_energy 738.20789
+wandb:            anchor_buffer_max_energy_above_cond_min 1367.88342
+wandb:                          anchor_buffer_mean_energy -446.83176
+wandb:           anchor_buffer_mean_energy_above_cond_min 74.61698
+wandb:  anchor_buffer_mean_energy_improvement_last_window 0.0039
+wandb: anchor_buffer_mean_energy_improvement_n_conditions 98
+wandb:                        anchor_buffer_median_energy -456.48685
+wandb:         anchor_buffer_median_energy_above_cond_min 53.22849
+wandb:                           anchor_buffer_min_energy -664.32507
+wandb:                       anchor_topup_admitted_last_n 43
+wandb:                                anchor_topup_last_n 64842
+wandb:                             batch/ceiling_expiries 0
+wandb:                                  batch/oom_ceiling 0
+wandb:                                   batch/oom_events 0
+wandb:                                      batch/oom_min 0
+wandb:                                   bwd Mean B Drift 0.01771
+wandb:                                     bwd Mean B Var -3.17426
+wandb:                                bwd Mean F Diag Var -2.50044
+wandb:                                   bwd Mean F Drift 0.01085
+wandb:                                     bwd Mean F Rho 0.00591
+wandb:                                     bwd Mean F Var -2.4945
+wandb:                               bwd/box_contact_frac 0
+wandb:                                  bwd/box_violation 0
+wandb:                                    bwd/cond_tb_err 8493297.78531
+wandb:                   bwd/condition_log_z_visited_frac 1
+wandb:                                          bwd/emp_z 98.10486
+wandb:                                      bwd/emp_z_err 7490549.06267
+wandb:                                       bwd/ess_frac 0.00458
+wandb:                                  bwd/intercept_err 23518646.6253
+wandb:                                       bwd/jensen_z 75.22796
+wandb:                                   bwd/jensen_z_err 8371014.54988
+wandb:                                      bwd/level_gap 80.84595
+wandb:                            bwd/level_gap_coeff_rms 0.95163
+wandb:                                  bwd/log_Z_learned 7302455.99053
+wandb:                                       bwd/logw_std 11.26482
+wandb:                                bwd/logw_std_within 6.29423
+wandb:                                           bwd/loss 43.52921
+wandb:                                            bwd/mle 4.01906
+wandb:                                  bwd/over_coverage 9635186.26999
+wandb:                                             bwd/r2 -40.91252
+wandb:                                  bwd/ramp_ess_frac 0.99844
+wandb:                                 bwd/relative_under 3.92716
+wandb:                            bwd/relative_under_wcen 3.5082
+wandb:                                      bwd/resid_p05 -879801.63748
+wandb:                                      bwd/resid_p95 16748599.16828
+wandb:                                     bwd/resid_skew 0.03091
+wandb:                                    bwd/scatter_err 5964351.40658
+wandb:                                      bwd/slope_err 96069.24775
+wandb:                                       bwd/step_var 0.01905
+wandb:                                         bwd/tb_err 9874785.13512
+wandb:                                   bwd/tb_err_worst 12482627.27443
+wandb:                                       bwd/tb_resid 7302381.27154
+wandb:                               bwd/tb_resid_clipped -3.84906
+wandb:                                            bwd/tbc 0.52772
+wandb:                                   bwd/terminal_var 0.16885
+wandb:                                 bwd/under_coverage 1093975.03005
+wandb:                         bwd/under_coverage_uniform 1093974.9406
+wandb:                             bwd/vg_group_size_mean 6.3082
+wandb:                                          bwd/vg_lb 6.82474
+wandb:                                   bwd/vg_live_frac 1
+wandb:                                    bwd/vg_n_groups 93.90815
+wandb:                                          bwd/z_gap 22.8769
+wandb:                                   bwd/z_grad_worst 10
+wandb:                                bwd_outside_fwd_auc 0.04964
+wandb:                              bwd_outside_fwd_final 0.044
+wandb:                       condition_best_energy_median -520.81244
+wandb:                 condition_log_z_mean_ema_log_z_emp 89.94236
+wandb:                      condition_log_z_mean_ema_logw 67.35194
+wandb:                           condition_log_z_mean_gap 22.59043
+wandb:               condition_log_z_median_ema_log_z_emp 89.62622
+wandb:                    condition_log_z_median_ema_logw 66.79573
+wandb:                         condition_log_z_median_gap 21.47538
+wandb:                        condition_log_z_num_visited 98
+wandb:                 condition_minima_depth_last_window 0.17755
+wandb:                    condition_minima_depth_rate_ema 0.00053
+wandb:                       condition_minima_depth_total 0.17755
+wandb:          condition_minima_first_visits_last_window 0
+wandb:              condition_minima_improved_last_window 43
+wandb:                    condition_minima_improved_total 43
+wandb:                          condition_minima_rate_ema 0.12802
+wandb:                           dead_rows/probe_verified 1
+wandb:                                      delta_overlap 0.47025
+wandb:                                       energy/calls 12
+wandb:                                energy/frac_of_step 0.21191
+wandb:                           energy/frac_outside_step 0
+wandb:                               energy/ms_per_sample 0.29222
+wandb:                                     energy/seconds 1.7533
+wandb:                             energy/seconds_in_step 1.7533
+wandb:                            energy_func//batch_size 10000
+wandb:                        energy_func//bounding_coeff 10
+wandb:                energy_func//condition_library_size 198
+wandb:                             energy_func//data_ndim 12
+wandb:                         energy_func//density_coeff 10
+wandb:            energy_func//embedding_conditioning_dim 192
+wandb:                          energy_func//energy_calls 8
+wandb:                        energy_func//energy_samples 2000
+wandb:                        energy_func//energy_seconds 0.48648
+wandb:                              energy_func//lj_coeff 1
+wandb:                       energy_func//max_temperature 10
+wandb:                           energy_func//max_z_prime 1
+wandb:                       energy_func//min_temperature 0.01
+wandb:                           energy_func//n_molecules 198
+wandb:                                  energy_func//n_sg 1
+wandb:                                  energy_func//n_zp 1
+wandb:                            energy_func//num_sample -2333
+wandb:                              energy_func//pressure 1
+wandb:                       energy_func//reduction_coeff 10
+wandb:                          energy_func//reward_range 250
+wandb:                           energy_func//temperature 6.9
+wandb:               energy_func//vector_conditioning_dim 3
+wandb:                               eval_bwd/cond_tb_err 67.91116
+wandb:                                     eval_bwd/emp_z 87.64865
+wandb:                                 eval_bwd/emp_z_err 87.5512
+wandb:                                  eval_bwd/ess_frac 0.00123
+wandb:                             eval_bwd/intercept_err 60.85735
+wandb:                                  eval_bwd/jensen_z 67.36253
+wandb:                              eval_bwd/jensen_z_err 67.37386
+wandb:                                  eval_bwd/logw_std 11.80764
+wandb:                           eval_bwd/logw_std_within 9.47387
+wandb:                             eval_bwd/over_coverage 1.04871
+wandb:                                        eval_bwd/r2 -76.37026
+wandb:                             eval_bwd/ramp_ess_frac 0.99637
+wandb:                            eval_bwd/relative_under 4.47618
+wandb:                       eval_bwd/relative_under_wcen 4.01441
+wandb:                                 eval_bwd/resid_p05 -83.50365
+wandb:                                 eval_bwd/resid_p95 -49.89367
+wandb:                                eval_bwd/resid_skew -1.03288
+wandb:                               eval_bwd/scatter_err 11.85219
+wandb:                                 eval_bwd/slope_err 0.69258
+wandb:                                    eval_bwd/tb_err 68.30128
+wandb:                              eval_bwd/tb_err_worst 72.2504
+wandb:                                  eval_bwd/tb_resid -67.26508
+wandb:                          eval_bwd/tb_resid_clipped -9.91077
+wandb:                            eval_bwd/under_coverage 68.4771
+wandb:                    eval_bwd/under_coverage_uniform 68.29324
+wandb:                                     eval_bwd/z_gap 20.28613
+wandb:                              eval_bwd/z_grad_worst 10
+wandb:                                     eval_figs_time 2.09659
+wandb:                               eval_fwd/cond_tb_err 2173.72534
+wandb:                                     eval_fwd/emp_z 33.79621
+wandb:                                 eval_fwd/emp_z_err 33.69109
+wandb:                                  eval_fwd/ess_frac 0.00056
+wandb:                             eval_fwd/intercept_err 118.01488
+wandb:                                  eval_fwd/jensen_z -778.11737
+wandb:                              eval_fwd/jensen_z_err 781.48199
+wandb:                                  eval_fwd/logw_std 3802.62622
+wandb:                           eval_fwd/logw_std_within 3691.84351
+wandb:                             eval_fwd/over_coverage 3881.43457
+wandb:                                        eval_fwd/r2 -251484.76562
+wandb:                             eval_fwd/ramp_ess_frac 0.13065
+wandb:                            eval_fwd/relative_under 1175.14453
+wandb:                       eval_fwd/relative_under_wcen 6.96559
+wandb:                                 eval_fwd/resid_p05 -13.58811
+wandb:                                 eval_fwd/resid_p95 2600.10547
+wandb:                                eval_fwd/resid_skew 18.77697
+wandb:                               eval_fwd/scatter_err 3802.62256
+wandb:                                 eval_fwd/slope_err 0.99986
+wandb:                                    eval_fwd/tb_err 3881.43872
+wandb:                              eval_fwd/tb_err_worst 2412.45752
+wandb:                                  eval_fwd/tb_resid 778.22241
+wandb:                          eval_fwd/tb_resid_clipped 7.90923
+wandb:                            eval_fwd/under_coverage 17.6881
+wandb:                    eval_fwd/under_coverage_uniform 5.84476
+wandb:                                     eval_fwd/z_gap 811.91357
+wandb:                              eval_fwd/z_grad_worst 9.48879
+wandb:                                 eval_sampling_time 1.00954
+wandb:                                     eval_step_time 12.44949
+wandb:             eval_test/Cond Reasonable Failing Frac 1
+wandb:                        eval_test/Cond Reasonable N 100
+wandb:                   eval_test/Cond Reasonable Spread 0
+wandb:                    eval_test/Cond Reasonable Worst 0
+wandb:               eval_test/Reasonable Sample Fraction 0.0245
+wandb:                              eval_test/cond_tb_err 1712.5387
+wandb:                                    eval_test/emp_z 39.37686
+wandb:                                eval_test/emp_z_err 39.32733
+wandb:                                 eval_test/ess_frac 0.00099
+wandb:                            eval_test/intercept_err 117.67728
+wandb:                                 eval_test/jensen_z -702.38776
+wandb:                             eval_test/jensen_z_err 706.11761
+wandb:                                 eval_test/logw_std 2609.77905
+wandb:                          eval_test/logw_std_within 2533.95508
+wandb:                            eval_test/over_coverage 2702.64917
+wandb:                                       eval_test/r2 -123344.94531
+wandb:                            eval_test/ramp_ess_frac 0.08877
+wandb:                           eval_test/relative_under 1139.2478
+wandb:                      eval_test/relative_under_wcen 4.14724
+wandb:                                eval_test/resid_p05 -16.41187
+wandb:                                eval_test/resid_p95 2482.47705
+wandb:                               eval_test/resid_skew 10.49546
+wandb:                              eval_test/scatter_err 2609.77686
+wandb:                                eval_test/slope_err 0.99989
+wandb:                                   eval_test/tb_err 2702.65674
+wandb:                             eval_test/tb_err_worst 2111.60376
+wandb:                                 eval_test/tb_resid 702.43732
+wandb:                         eval_test/tb_resid_clipped 7.78455
+wandb:                           eval_test/under_coverage 23.44695
+wandb:                   eval_test/under_coverage_uniform 6.37295
+wandb:                                    eval_test/z_gap 741.76465
+wandb:                             eval_test/z_grad_worst 9.26805
+wandb:                                   eval_wrapup_time 0
+wandb:                            fused_grad/bwd_norm_raw 7315.85596
+wandb:                    fused_grad/bwd_uncontested_frac 0
+wandb:                             fused_grad/cos_fwd_bwd 0.00634
+wandb:                      fused_grad/cos_fwd_bwd_shared 0.00635
+wandb:                              fused_grad/fused_norm 2453416704.0
+wandb:                        fused_grad/fused_norm_ratio 1.0
+wandb:                            fused_grad/fwd_norm_raw 4792949248.0
+wandb:                    fused_grad/fwd_uncontested_frac 0.00015
+wandb:                         fused_grad/overlap_fwd_bwd 0.99985
+wandb:             fused_grad/weighted_component_norm_sum 2453420349.25862
+wandb:                                   fwd Mean B Drift 0.01637
+wandb:                                     fwd Mean B Var -3.17533
+wandb:                                fwd Mean F Diag Var -2.50007
+wandb:                                   fwd Mean F Drift 0.01058
+wandb:                                     fwd Mean F Rho 0.00591
+wandb:                                     fwd Mean F Var -2.49412
+wandb:                               fwd/box_contact_frac 0.25671
+wandb:                                  fwd/box_violation 0.0356
+wandb:                                    fwd/cond_tb_err 9541366.33729
+wandb:                   fwd/condition_log_z_visited_frac 1
+wandb:                                          fwd/emp_z 112650008.45259
+wandb:                                      fwd/emp_z_err 10089316.7456
+wandb:                                       fwd/ess_frac 0.00215
+wandb:                                  fwd/intercept_err 9857609.31058
+wandb:                                       fwd/jensen_z -101.04356
+wandb:                                   fwd/jensen_z_err 11265005.54486
+wandb:                                  fwd/log_Z_learned 8089693.40325
+wandb:                                       fwd/logw_std 245.4031
+wandb:                                fwd/logw_std_within 221.4027
+wandb:                                           fwd/loss 47340537.0569
+wandb:                                  fwd/over_coverage 12148735.6283
+wandb:                                             fwd/r2 -19.57856
+wandb:                                  fwd/ramp_ess_frac 0.36199
+wandb:                                 fwd/relative_under 122.33692
+wandb:                            fwd/relative_under_wcen 4.75657
+wandb:                                      fwd/resid_p05 -2584516.37966
+wandb:                                      fwd/resid_p95 22217236.35426
+wandb:                                     fwd/resid_skew -0.00975
+wandb:                                    fwd/scatter_err 7938822.73392
+wandb:                                      fwd/slope_err 3991.13713
+wandb:                                       fwd/step_var 0.02308
+wandb:                                         fwd/tb_err 13384325.83142
+wandb:                                   fwd/tb_err_worst 13551650.91129
+wandb:                                       fwd/tb_resid 8089796.17634
+wandb:                               fwd/tb_resid_clipped -4.2119
+wandb:                                   fwd/terminal_var 0.16476
+wandb:                                 fwd/under_coverage 2098188.69265
+wandb:                         fwd/under_coverage_uniform 2131167.44547
+wandb:                             fwd/vg_group_size_mean 9.72935
+wandb:                                          fwd/vg_lb 946.38793
+wandb:                                   fwd/vg_live_frac 1
+wandb:                                    fwd/vg_n_groups 89.54635
+wandb:                                          fwd/z_gap 131.31746
+wandb:                                   fwd/z_grad_worst 10
+wandb:                                fwd_outside_bwd_auc 0.06755
+wandb:                              fwd_outside_bwd_final 0.114
+wandb:                                 grad_norm_pre_clip 2485184768.0
+wandb:                             gradclip/bwd_fire_rate 0
+wandb:                                     gradclip/bwd_n 0
+wandb:                             gradclip/bwd_saturated 0
+wandb:                                   gradclip/bwd_tau 111.80272
+wandb:                           gradclip/fused_fire_rate 1
+wandb:                                   gradclip/fused_n 2
+wandb:                           gradclip/fused_saturated 0
+wandb:                                 gradclip/nonfinite 0
+wandb:                               gradclip/nonpositive 0
+wandb:                                 gradclip/refreshes 1
+wandb:                           gradnorm/backward_policy 120.39209
+wandb:                gradnorm/conditions_embedding_model 384409344.0
+wandb:                                gradnorm/flow_model 7931628.0
+wandb:                            gradnorm/forward_policy 459.82449
+wandb:                           gradnorm/nonfinite_steps 0
+wandb:                                   gradnorm/s_model 116.47424
+wandb:                                   gradnorm/t_model 9.09477
+wandb:                                initialization_time 2.65513
+wandb:                                    inter_eval_time 22.25747
+wandb:                                      log Z learned 0.10512
+wandb:                              loss_coeffs/bwd_/beta 10
+wandb:                                loss_coeffs/bwd_/db 0
+wandb:                             loss_coeffs/bwd_/emp_z 0
+wandb:                  loss_coeffs/bwd_/emp_z_persistent 0
+wandb:                     loss_coeffs/bwd_/freeze_policy 0
+wandb:                          loss_coeffs/bwd_/freeze_z 1
+wandb:                         loss_coeffs/bwd_/level_gap 0
+wandb:                   loss_coeffs/bwd_/level_gap_clamp 10
+wandb:                         loss_coeffs/bwd_/loss_clip 1000000000.0
+wandb:                               loss_coeffs/bwd_/mle 1
+wandb:                          loss_coeffs/bwd_/pf_boost 0
+wandb:                           loss_coeffs/bwd_/repeats 2
+wandb:                             loss_coeffs/bwd_/subtb 0
+wandb:                      loss_coeffs/bwd_/subtb_lambda 0.95
+wandb:                                loss_coeffs/bwd_/tb 0
+wandb:                               loss_coeffs/bwd_/tbc 1
+wandb:                        loss_coeffs/bwd_/traj_grads 1
+wandb:                   loss_coeffs/bwd_/vg_by_condition 1
+wandb:                             loss_coeffs/bwd_/vg_lb 0
+wandb:                            loss_coeffs/bwd_/vg_lme 0
+wandb:                              loss_coeffs/fwd_/beta 10
+wandb:                                loss_coeffs/fwd_/db 0
+wandb:                             loss_coeffs/fwd_/emp_z 0
+wandb:                  loss_coeffs/fwd_/emp_z_persistent 0
+wandb:                     loss_coeffs/fwd_/freeze_policy 0
+wandb:                          loss_coeffs/fwd_/freeze_z 0
+wandb:                         loss_coeffs/fwd_/loss_clip 1000000000.0
+wandb:                           loss_coeffs/fwd_/repeats 1
+wandb:                      loss_coeffs/fwd_/reward_grads 0
+wandb:                             loss_coeffs/fwd_/subtb 0
+wandb:                      loss_coeffs/fwd_/subtb_lambda 0.95
+wandb:                                loss_coeffs/fwd_/tb 0
+wandb:                        loss_coeffs/fwd_/traj_grads 0
+wandb:                   loss_coeffs/fwd_/vg_by_condition 0
+wandb:                             loss_coeffs/fwd_/vg_lb 0
+wandb:                            loss_coeffs/fwd_/vg_lme 0
+wandb:                           loss_coeffs/fwd_/z_level 0
+wandb:                           loss_coeffs/replay_/beta 10
+wandb:                             loss_coeffs/replay_/db 0
+wandb:                          loss_coeffs/replay_/emp_z 0
+wandb:               loss_coeffs/replay_/emp_z_persistent 0
+wandb:                  loss_coeffs/replay_/freeze_policy 0
+wandb:                       loss_coeffs/replay_/freeze_z 1
+wandb:                      loss_coeffs/replay_/loss_clip 1000000000.0
+wandb:                            loss_coeffs/replay_/mle 0
+wandb:                       loss_coeffs/replay_/pf_boost 0
+wandb:                        loss_coeffs/replay_/repeats 1
+wandb:                          loss_coeffs/replay_/subtb 0
+wandb:                   loss_coeffs/replay_/subtb_lambda 0.95
+wandb:                             loss_coeffs/replay_/tb 1
+wandb:                     loss_coeffs/replay_/traj_grads 0
+wandb:                loss_coeffs/replay_/vg_by_condition 0
+wandb:                          loss_coeffs/replay_/vg_lb 0
+wandb:                         loss_coeffs/replay_/vg_lme 0
+wandb:                                             lr_bwd 1e-05
+wandb:                               lr_ctrl/calibrations 0
+wandb:                                lr_ctrl/divergences 2
+wandb:                                   lr_ctrl/envelope 0.11749
+wandb:                              lr_ctrl/hyper_applied 0
+wandb:                                  lr_ctrl/hyper_cos 0.33581
+wandb:                               lr_ctrl/hyper_status 1
+wandb:                                 lr_ctrl/hypergrads 0
+wandb:                               lr_ctrl/peak_ceiling 0.5
+wandb:                                 lr_ctrl/peak_scale 0.5
+wandb:                                      lr_ctrl/scale 0.05874
+wandb:                                     lr_ctrl/warmup 1
+wandb:                                            lr_flow 0.1
+wandb:                                           lr_fused 1e-05
+wandb:                                      lr_fused_flow 0.1
+wandb:                                             lr_fwd 1e-05
+wandb:                                          lr_replay 1e-05
+wandb:                                      mle_gate_flat 1
+wandb:                                      mle_gate_rate 0.18757
+wandb:                                   mle_gate_rate_hi 0.34597
+wandb:                                   mle_gate_rate_se 0.1584
+wandb:                                          mmd_final 0.00279
+wandb:                                            mmd_max 0.00279
+wandb:                                           mmd_mean 0.00113
+wandb:                                       nn_sep_final 0.16947
+wandb:                                         nn_sep_max 0.16947
+wandb:                                        nn_sep_mean 0.04122
+wandb:                                              phase 2
+wandb:                                  policy_ratio_mean -1.98305
+wandb:                                   policy_ratio_std 2.2205
+wandb:                                 prior_buffer_added 64842
+wandb:                     prior_buffer_anchor_floor_rows 0
+wandb:                       prior_buffer_anchor_fraction 1
+wandb:                               prior_buffer_evicted 7250
+wandb:                               prior_buffer_expired 6250
+wandb:                          prior_buffer_from_anchors 64842
+wandb:                      prior_buffer_from_prior_model 0
+wandb:                             prior_buffer_from_seed 0
+wandb:                                prior_buffer_length 57592
+wandb:                            prior_buffer_max_energy -289.78281
+wandb:                           prior_buffer_mean_energy -438.41736
+wandb:                             prior_buffer_mean_loss nan
+wandb:                            prior_buffer_mean_steps 0
+wandb:                         prior_buffer_median_energy -436.21478
+wandb:                           prior_buffer_median_loss nan
+wandb:                          prior_buffer_median_steps 0
+wandb:                            prior_buffer_min_energy -631.52014
+wandb:                      prior_buffer_prior_admit_rate 0
+wandb:                              prior_buffer_turnover 1.12589
+wandb:                           probe/device_alloc_delta 0
+wandb:                            probe/device_free_delta 0
+wandb:                              probe/step_time_max10 1.7638
+wandb:                                     protocol/boost 0
+wandb:           protocol/exit_streak_bwd_logw_std_within 0
+wandb:                       protocol/exit_streak_bwd_tbc 13
+wandb:            protocol/exit_streak_eval_wass_debiased 0
+wandb:           protocol/exit_streak_fwd_logw_std_within 0
+wandb:                protocol/exit_streak_gates_mle_flat 0
+wandb:                              protocol/prop_bar_bwd 1
+wandb:                              protocol/prop_bar_fwd 1
+wandb:                            protocol/prop_drive_bwd 5.29423
+wandb:                            protocol/prop_drive_fwd 220.4027
+wandb:                               protocol/prop_target 0.9
+wandb:                                    samples_per_sec 302.15565
+wandb:                                    stepkl_argmax_t 0
+wandb:                                       stepkl_drift -39.20645
+wandb:                                         stepkl_max 39.21329
+wandb:                                         stepkl_sum 41.52366
+wandb:                                             tb_gap 778.06081
+wandb:                                       tb_resid_std 3802.62627
+wandb:                               tracker/logw_std_rms 213.61569
+wandb:                                 tracker/tb_err_rms 41297100.0
+wandb:                               tracker/tb_err_worst 45073820.0
+wandb:                                 tracker/z_bias_rms 41297100.0
+wandb:                                 tracker/z_bias_var 533442555019264.0
+wandb:                               tracker/z_bias_worst 45073820.0
+wandb:                                 tracker/z_grad_rms 5.88896
+wandb:                               tracker/z_grad_worst 7.17984
+wandb:                                    train_step_time 1.54719
+wandb:                                unrecoverable_abort UNRECOVERABLE at ste...
+wandb:                                     vram/cached_mb 2825.03369
+wandb:                                       vram/live_mb 388.96631
+wandb:                              vram/peak_reserved_mb 14602
+wandb:                                   vram/reserved_mb 3214
+wandb:                                               wass 0.0351
+wandb:                                        wass_anchor 0.03383
+wandb:                               wass_anchor_debiased 0.01996
+wandb:                                   wass_anchor_null 0.01388
+wandb:                                      wass_debiased 0.02288
+wandb:                                          wass_null 0.01222
+wandb:                                            z_cal/p 0
+wandb:                                       z_cal/sensor 5.6561
+wandb:                                   zmatch/bwd_level 82.042
+wandb:                                  zmatch/delta_mean inf
+wandb:                             zmatch/delta_n_trusted 98
+wandb:                                 zmatch/delta_worst inf
+wandb:                                   zmatch/fwd_level -109.78646
+wandb: 
+wandb:  View run shake_shake_qm9cond at: https://wandb.ai/mkilgour/GFN%20Energy/runs/ef7gmm0r
+wandb:  View project at: https://wandb.ai/mkilgour/GFN%20Energy
+wandb: Synced 5 W&B file(s), 0 media file(s), 0 artifact file(s) and 0 other file(s)
+wandb: Find logs at: .\wandb\run-20260816_211203-ef7gmm0r\logs
+Traceback (most recent call last):
+  File "C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\train.py", line 7000, in <module>
+    modeller.train()
+  File "C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\train.py", line 2221, in train
+    self.monitor_losses(current_loss, step_type)
+  File "C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\train.py", line 2308, in monitor_losses
+    self.fire_loss_spike()
+  File "C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\train.py", line 2398, in fire_loss_spike
+    raise FrozenTrainingState(msg)
+FrozenTrainingState: UNRECOVERABLE at step 220: 4 rewinds (budget 3.0 at 0.2/1k steps) and the run keeps re-detonating -- rewinding restores weights but not a survivable LR. Aborting so the GPU is released.
+Traceback (most recent call last):
+  File "C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\train.py", line 7000, in <module>
+    modeller.train()
+  File "C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\train.py", line 2221, in train
+    self.monitor_losses(current_loss, step_type)
+  File "C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\train.py", line 2308, in monitor_losses
+    self.fire_loss_spike()
+  File "C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\train.py", line 2398, in fire_loss_spike
+    raise FrozenTrainingState(msg)
+FrozenTrainingState: UNRECOVERABLE at step 220: 4 rewinds (budget 3.0 at 0.2/1k steps) and the run keeps re-detonating -- rewinding restores weights but not a survivable LR. Aborting so the GPU is released.

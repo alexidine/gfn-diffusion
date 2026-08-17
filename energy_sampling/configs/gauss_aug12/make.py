@@ -108,6 +108,12 @@ sys.path.insert(0, str(HERE))
 
 import spec  # noqa: E402
 
+# The SHIPPING stage resolver, not a local copy. `protocol` became a SELECTOR
+# naming an entry in `protocols` (config_state state 4), so the old
+# `cfg['protocol']['stages']` reads a string here and dies; keeping a private
+# copy of the new lookup would just queue up the same break at state 6.
+from energy_sampling.config_invariants import active_stages  # noqa: E402
+
 # Budgets. Every arm starts COLD: expanded_dim differs between held and live
 # (e.g. sg 19: 21 vs 24 with 3 angular rows), so no two arms can share a
 # checkpoint, and no pre-D33 checkpoint is loadable by design.
@@ -255,8 +261,21 @@ def apply_pinned_lr(cfg):
         cfg[key] = PINNED_LR
     cfg['lr_warmup_ratio'] = 1
     cfg.setdefault('adaptive_lr', {})['warmup_steps'] = 0
-    cfg.setdefault('ray_calibration', {})['enabled'] = False
-    for stage in cfg.get('protocol', {}).get('stages', []):
+    # No `ray_calibration.enabled: False` here. That key is retired
+    # (utils._RETIRED_KEYS) and, worse, `setdefault` would CREATE the retired
+    # top-level block on a config that does not have one -- the gate fires on
+    # PRESENCE, so the arm would be refused at load. The loop below is now the
+    # whole switch: with every stage on `kind: none` no stage asks for ray, and
+    # train.py arms the probe on `bool(self._ray_askers())`.
+    stages = active_stages(cfg)
+    # active_stages returns [] on an unresolvable selector rather than raising.
+    # Silence there is the dangerous answer now that the loop below IS the ray
+    # switch: no stages touched means no stage set to `none`, which means the
+    # probe stays armed at whatever mk_dev declares, on an arm whose whole point
+    # is that nothing actuates the LR.
+    assert stages, (f"protocol {cfg.get('protocol')!r} resolves to no stages, so "
+                    f"the pinned-LR arm would keep mk_dev's lr_sensor declarations")
+    for stage in stages:
         # a MAPPING, not the bare string: Stage._parse_lr_sensor raises TypeError on a
         # str, so `lr_sensor: none` kills every arm at startup. Caught by loading the
         # generated configs, not by generating them.
@@ -265,7 +284,7 @@ def apply_pinned_lr(cfg):
 
 
 def apply_stage1_cap(cfg):
-    for stage in cfg.get('protocol', {}).get('stages', []):
+    for stage in active_stages(cfg):
         if not stage.get('exit'):
             continue
         kept = [t for t in stage['exit'] if t.get('metric') not in DROP_EXIT_METRICS]

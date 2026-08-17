@@ -7,6 +7,7 @@ rather than against a mock of it -- the `item.key`-is-empty trap (H4) only exist
 in the real encoding and a hand-built fixture would hide it.
 """
 
+import glob
 import os
 import time
 
@@ -164,6 +165,88 @@ def test_missing_datastore_file_is_skipped(tmp_path):
 # H4 -- real datastore parsing
 # ---------------------------------------------------------------------------
 
+# Rows the fixture logs. The readiness wait below counts them, so the two cannot
+# drift apart.
+_N_ROWS = 60
+
+
+def _history_records(run_dir: str) -> int:
+    """History records readable in the run's datastore right now, -1 if it is not
+    readable at all yet.
+
+    Deliberately NOT `scan_local_history`: this decides when the fixture is
+    ready, and a fixture that asks the module under test whether it is ready
+    turns a regression in that module into a fixture timeout rather than a test
+    failure. wandb's own reader is the independent measure."""
+    from wandb.proto import wandb_internal_pb2
+    from wandb.sdk.internal import datastore
+
+    files = glob.glob(os.path.join(run_dir, 'run-*.wandb'))
+    if not files or os.path.getsize(files[0]) == 0:
+        return -1
+    # The `finally` covers the open as well as the scan: `open_for_scan` opens the
+    # file and THEN reads the header, so a half-written header raises with the
+    # handle already open -- which is the common case here, since this is polled
+    # precisely while the file is being written. Closed explicitly rather than
+    # left to refcounting because this runs in a loop against a file another
+    # process is still writing.
+    ds = datastore.DataStore()
+    try:
+        ds.open_for_scan(files[0])     # raises if the header is not on disk yet
+        n = 0
+        while True:
+            data = ds.scan_data()
+            if data is None:
+                break
+            rec = wandb_internal_pb2.Record()
+            rec.ParseFromString(data)
+            if rec.WhichOneof('record_type') == 'history':
+                n += 1
+        return n
+    except Exception:
+        return -1                      # torn mid-write, so not ready
+    finally:
+        ds.close()
+
+
+def _await_datastore(run_dir: str, timeout: float = 30.0) -> None:
+    """Block until wandb has actually written the logged rows to disk.
+
+    `run.finish()` RETURNS BEFORE THE OFFLINE DATASTORE IS ON DISK. On an idle
+    box the write lands before the first test reads the run and everything
+    passes; under CPU load it does not, and the run then parses as a run that
+    logged nothing.
+
+    It fails all-or-nothing rather than short because wandb's service flushes the
+    datastore one leveldb block at a time. This run is smaller than one block, so
+    NOTHING is on disk until finish forces the final flush -- the file is zero
+    bytes when finish returns and then appears whole. (A run long enough to fill
+    blocks does stream to disk as it goes, which is what makes `scan_local_history`
+    useful on a run that is still going.)
+
+    That is what made this file flaky, and it presented deceptively: the only
+    test that failed was `test_the_same_pull_succeeds_when_the_key_resolves`,
+    because the tests either side of it survive an empty read.
+    `test_empty_history_raises_rather_than_returning_nothing` EXPECTS an empty
+    pull, so during the race it passed for the wrong reason -- it was not
+    testing resolution at all -- and the `scan_local_history` tests run late
+    enough that the file has landed by the time they read it.
+
+    A condition check rather than a sleep: it waits for the rows themselves, so
+    it costs nothing once the write has landed, and it cannot be silently too
+    short on a box slower than whatever a fixed sleep had assumed."""
+    deadline = time.monotonic() + timeout
+    while True:
+        seen = _history_records(run_dir)
+        if seen >= _N_ROWS:
+            return
+        if time.monotonic() > deadline:
+            raise AssertionError(
+                f'wandb did not write the datastore within {timeout:g} s: '
+                f'{seen} of {_N_ROWS} history records readable in {run_dir}')
+        time.sleep(0.01)
+
+
 @pytest.fixture(scope='module')
 def real_run_dir(tmp_path_factory):
     """A genuine `.wandb` datastore, written by wandb offline.
@@ -180,14 +263,16 @@ def real_run_dir(tmp_path_factory):
     # stay online, since an offline run has no URL to read.
     run = wandb.init(project='analysis-test', dir=str(d), mode='offline',
                      settings=wandb.Settings(silent=True))
-    for i in range(60):
+    for i in range(_N_ROWS):
         row = {'fwd/tb_err_worst': 10.0 - i * 0.01, 'nested': {'a': float(i)}}
         if i % 3:                      # most rows carry a metric, some do not
             row['sparse/metric'] = float(i)
         run.log(row)
     path = run.dir
     run.finish()
-    return os.path.dirname(path)       # .../wandb/offline-run-.../
+    run_dir = os.path.dirname(path)    # .../wandb/offline-run-.../
+    _await_datastore(run_dir)          # finish() does not mean written -- see above
+    return run_dir
 
 
 def test_parses_a_real_datastore(real_run_dir):

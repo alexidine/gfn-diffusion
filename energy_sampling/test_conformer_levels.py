@@ -485,10 +485,153 @@ def test_internal_prior_beats_uniform():
     print("PASS         fitted InternalPrior beats uniform-on-box at every selection level")
 
 
+RING_MOLS = [('cyclohexane', 'C1CCCCC1'), ('toluene', 'Cc1ccccc1'),
+             ('naphthalene', 'c1ccc2ccccc2c1'), ('proline', 'OC(=O)C1CCCN1'),
+             ('ibuprofen', 'CC(C)Cc1ccc(cc1)C(C)C(=O)O')]
+
+
+def test_ring_closure():
+    """Ring systems must come out CLOSED. Asserted on the closure bond, not the energy.
+
+    Ring closure is the second place a product of marginals cannot work, and unlike the
+    sibling case there is no purely structural fix -- the ring block has to come from
+    InternalPrior's joint RingBank, or be held near the reference. Both paths are checked,
+    and the no-ring-handling path is required to FAIL, so this cannot pass blind.
+    """
+    from pathlib import Path
+    from mxtaltools.conformers.builder import closure_length
+    if not Path('conformer_prior.pt').exists():
+        raise AssertionError("conformer_prior.pt missing -- this gate cannot run, and a "
+                             "silent skip is how it would disappear on another machine")
+    prior = torch.load('conformer_prior.pt', weights_only=False)
+    n = 256
+    for name, smi in RING_MOLS:
+        e = _energy(smi, level='full')
+        tree, ff = e._batch(n)
+        assert ff.closure_index.numel() > 0, f'{name} has no ring closure bond'
+
+        def cerr(**kw):
+            x, st = e.sample_prior_states(prior, n, np.random.default_rng(0),
+                                          report=False, **kw)
+            cl = closure_length(tree, e.build_positions(x))
+            return float((cl - ff.closure_r0).abs().reshape(n, -1).max(1).values.median()), st
+
+        off, _ = cerr(joint_rings=False)
+        on, st = cerr()
+        assert on < 0.25, f'{name}: closure error {on:.3f} A with rings wired'
+        assert off > 4 * on, \
+            (f'{name}: turning ring handling OFF barely changed closure ({off:.3f} vs '
+             f'{on:.3f} A) -- this gate cannot detect the bug it exists for')
+        # every ring system is accounted for by exactly one path
+        assert st['n_rings'] == st['n_ring_banked'] + st['n_ring_thermal'], (name, st)
+        print(f"     {name:12s} closure {off:.2f} A -> {on:.3f} A   "
+              f"({st['n_ring_banked']} banked, {st['n_ring_thermal']} held, "
+              f"{st['n_ring_extra_held']} extra DoF held)")
+
+    print('PASS         ring closure holds on 5 ring types')
+
+
+def _ring_key(energy, prior):
+    """The (signature, n_dof) key for a molecule's single ring system."""
+    from energies.conformer_data import condition_from_energy
+    m = condition_from_energy(energy, partial_charges=False)
+    m.build_conformer_tree()
+    _, blocks, sigs, _ = prior._layout(m)
+    s = list(blocks)[0]
+    cols = blocks[s]
+    nd = len(cols['r']) + len(cols['theta']) + len(cols['phi'])
+    return (sigs[s], nd), nd
+
+
+def _ring_torsions(e, x, n):
+    """The six ring torsions of a 6-ring, in degrees, [n, 6]."""
+    from mxtaltools.conformers.geometry import dihedral
+    z = np.asarray(e.spec.z)
+    ring = [i for i in range(len(z)) if e.atom_in_ring[i] and z[i] > 1]
+    adj = {i: [] for i in ring}
+    for a, b in np.asarray(e.spec.graph_bond_index):
+        a, b = int(a), int(b)
+        if a in adj and b in adj:
+            adj[a].append(b); adj[b].append(a)
+    cyc, prev = [ring[0]], None
+    while len(cyc) < 6:
+        nxt = [y for y in adj[cyc[-1]] if y != prev][0]
+        prev = cyc[-1]; cyc.append(nxt)
+    pos = e.build_positions(x).reshape(n, -1, 3)
+    return np.stack([np.degrees(dihedral(pos[:, cyc[i]], pos[:, cyc[(i + 1) % 6]],
+                                         pos[:, cyc[(i + 2) % 6]], pos[:, cyc[(i + 3) % 6]]).numpy())
+                     for i in range(6)], 1)
+
+
+def test_ring_bank_rules():
+    """Two rules decide whether a ring is banked; each is checked against its own
+    counterfactual so neither can pass for the other's reason.
+
+    AROMATIC rings are never banked -- rigid, so a bank buys nothing, and under signature
+    version 1 it actively hurt: benzene shared cyclohexane's bank and drew chairs at a
+    median |ring torsion| of 47 deg. SATURATED rings are banked only above a row count,
+    since a single row is one observation on replay. The threshold is 2, not higher:
+    with a v2 signature and a purpose-built bank, pyrrolidine's two envelope basins
+    are COMPLETE rather than thin.
+    """
+    from pathlib import Path
+    from dataclasses import replace
+    from mxtaltools.conformers.prior import RingBank
+    prior = torch.load(Path('conformer_prior.pt'), weights_only=False)
+
+    # aromatic: refused, and NOT because of the row count
+    for name, smi in (('benzene', 'c1ccccc1'), ('naphthalene', 'c1ccc2ccccc2c1')):
+        e = _energy(smi, level='full', ring_min_bank_rows=1)
+        assert all(b is None for _, b, _ in e.ring_blocks(prior)), \
+            f'{name} was banked despite being aromatic, even at ring_min_bank_rows=1'
+    e = _energy('c1ccccc1', level='full')
+    n = 256
+    x, _ = e.sample_prior_states(prior, n, np.random.default_rng(0), report=False)
+    med = float(np.median(np.abs(_ring_torsions(e, x, n))))
+    assert med < 5.0, f'benzene ring is not planar: median |ring torsion| {med:.1f} deg'
+
+    # saturated: the row count decides. Tested against a SYNTHETIC bank so it depends on
+    # neither what the shipped fit contains nor on the signature version.
+    e = _energy('C1CCCCC1', level='full')
+    key, nd = _ring_key(e, prior)
+    row = np.concatenate([e.r0.numpy(), e.th0.numpy(), e.ph0.numpy()])[:nd]
+    for n_rows, expect in ((1, False), (4, True)):
+        fake = replace(prior, rings={key: RingBank(rows=np.tile(row, (n_rows, 1)))})
+        got = any(b is not None for _, b, _ in e.ring_blocks(fake))
+        assert got is expect, \
+            (f'saturated ring with {n_rows} bank rows: banked={got}, expected {expect} '
+             f'(ring_min_bank_rows={e.ring_min_bank_rows})')
+    print(f'PASS         aromatic rings never banked and planar (benzene median '
+          f'|ring torsion| {med:.1f} deg); saturated rings gated on bank row count')
+
+
+def test_stale_ring_signature_detected():
+    """A prior pickled before ``ring_sig_version`` existed must read as STALE.
+
+    InternalPrior is a dataclass, so a defaulted field is also a CLASS attribute and
+    getattr on an old pickle returns the current default -- reporting itself up to date
+    while none of its ring keys can resolve. Every ring then silently falls through to the
+    hold, which is indistinguishable from a molecule whose ring was never fitted.
+    """
+    from pathlib import Path
+    from mxtaltools.conformers.prior import InternalPrior
+    old = torch.load(Path('conformer_prior.pt'), weights_only=False)
+    assert getattr(old, 'ring_sig_version', 1) == 2, \
+        'the class default is no longer 2, so this test no longer exercises the trap'
+    assert vars(old).get('ring_sig_version', 1) == 1, 'the shipped prior should read stale'
+    assert vars(InternalPrior()).get('ring_sig_version', 1) == 2, 'a fresh fit should read 2'
+    e = _energy('C1CCCCC1', level='full')
+    e.ring_blocks(old)
+    assert e.ring_sig_stale is True, 'a pre-fix prior was not flagged stale'
+    print('PASS         stale ring signature detected via vars(), not getattr')
+
+
 TESTS = [test_torsion_bitwise, test_rotatable_axes_ordered, test_layout_reaches_gfn,
          test_domain_guarantee, test_level_cannot_be_swallowed, test_linearity_is_measured,
          test_propanol_widths, test_measure_term, test_baked_energy_excludes_measure,
-         test_state_dof_roundtrip, test_internal_prior_beats_uniform]
+         test_state_dof_roundtrip, test_internal_prior_beats_uniform,
+         test_ring_closure, test_ring_bank_rules,
+         test_stale_ring_signature_detected]
 
 if __name__ == "__main__":
     torch.set_default_dtype(DTYPE)

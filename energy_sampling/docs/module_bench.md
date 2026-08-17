@@ -38,18 +38,57 @@ scope line.
 
 ## Layout
 
+**Two halves, one fake modeller.** The LR half drives `LRController`/`RayCalibration`
+against loss surfaces; the batch half drives `increment_batch_size` against a synthetic
+device. They share `fake_modeller.py` and nothing else — an LR arm and a batch arm need
+different clocks, which is why `runner.py` states outright that the batch sizer is not
+exercised there.
+
+**Shared**
+
 | File | Role |
 |---|---|
-| `clock.py` | `SyntheticGPU` — step time with a **planted** knee and OOM ceiling, plus the answer the controller should find |
-| `surfaces.py` | the three games (below) |
 | `fake_modeller.py` | duck-typed `Modeller` stand-in; `make_args` carries mk_dev's defaults |
 | `real_modeller.py` | builds the **actual** `train.Modeller` on CPU, for checking the fake against |
-| `harness.py` | `BenchRun` — the driver loop, transcribed from `train.py:1668-1710` |
-| `oracle.py` | brute-forces the best **fixed** LR a surface admits, and checks it |
-| `scenarios.py` | the battery: regret, recovery, detectability; `python -m bench.scenarios` |
-| `experiments.py` | the answer-producing runs; `python -m bench.experiments [name]` |
 | `test_fidelity.py` | asserts the fake still stands in for the real one |
-| `test_*.py` | the regression suite |
+
+**LR half**
+
+| File | Role |
+|---|---|
+| `surfaces.py` | the games. `TrackingGame` is the only one that passes its own fitness checks in every cell |
+| `arms.py` · `runner.py` · `metrics.py` | controllers, one (game, arm, seed) → trace, five pure trace functions |
+| `board.py` · `trackboard.py` · `eqboard.py` · `eqsuite.py` | leaderboards |
+| `audit.py` | **is this surface fit to rank controllers?** Six checks, run before any arm |
+| `band.py` · `hazards.py` · `cos_axis.py` · `ladder.py` | the good band, the safety cells, sensor placement |
+
+**Batch half**
+
+| File | Role |
+|---|---|
+| `gpu.py` | `SyntheticDevice` — `t(B)`, `U(B)` in three shapes, OOM, recompiles, eval blocks. `MeasuredDevice` interpolates an observed table rather than fitting one |
+| `batch_runner.py` | `BatchRun` — one (device, arm, seed) → trace, in `train.py`'s step-body order |
+| `batch_metrics.py` | pure trace functions: realised objective, occupancy, `descent`, `selection_edge`, `cell_can_rank`, `dominates` |
+| `batch_arms.py` | fixed batches as **arms**, `Null`, the shipping controller, and the two injected defects |
+| `test_batch_traps.py` | the two traps, detected **when injected** |
+| `test_oom_ceiling_expiry.py` | the OOM ceiling must expire; a pin below the floor must not deadlock |
+
+**`old/`** — the previous generation, retired 2026-08-13 but **not dead**. It still holds
+the only coverage of several shipping behaviours, so it is collected: see
+`bench/old/conftest.py`, which ignores the three files that genuinely are retired and
+records the mutation evidence for why the rest are not.
+
+### The occupancy model is the reason `gpu.py` replaced `old/clock.py`
+
+`old/clock.py`'s utilization is `busy(B)/t(B)` with `busy = t_fixed·(1−host_frac) +
+B/sps_max` — **monotone rising and saturating for every parameter setting**. It can
+express the belief that batch is the occupancy lever; it cannot express the measurement
+that refuted it (util 52→44→49→42 while samples/s fell 58%). An occupancy rule tested
+there is right by construction, so that device could never have detected the trap.
+
+`gpu.py` makes occupancy a **separate parameter** of the device rather than a function of
+the timing model, which is the whole correction: on the MLIP route occupancy and
+throughput moved in **opposite** directions.
 
 ## The discipline that keeps it honest
 

@@ -309,19 +309,88 @@ def context(run) -> Context:
 
 
 def run_label(run) -> str:
-    """How a run is named in a report.
+    """How ONE run is named when there is no battery to disambiguate against.
 
-    A DISPLAY NAME IS NOT UNIQUE. Nine names are shared by two or more runs in
-    the local corpus (`mk_dev` alone covers eleven), so labelling by name gave
-    two arms of one battery identical subject strings -- and a duplicate row
-    reading `duplicate/r3_kappa00~r3_kappa00`, which names one arm twice and
-    tells the reader nothing. The id disambiguates and is always present.
+    Prefer `battery_labels` wherever the whole set is in hand.
     """
-    name = str(getattr(run, 'name', '') or '')
-    run_id = str(getattr(run, 'run_id', '') or '')
-    if name and run_id and name != run_id:
-        return f'{name}#{run_id}'
-    return name or run_id or '?'
+    return str(getattr(run, 'name', '') or getattr(run, 'run_id', '') or '?')
+
+
+def battery_labels(runs) -> dict:
+    """`{id(run): label}` -- names that MEAN something to a reader.
+
+    `reading_runs.md` §7: refer to runs by NAME, TAG, OR A DISTINGUISHING CONFIG
+    FEATURE -- never by wandb id. An id is a hash; it carries nothing, and a
+    report full of them makes the reader go and look every one of them up.
+
+    A display name is not unique, though: nine names are shared by two or more
+    runs in the local corpus (`mk_dev` covers eleven), and two arms of one real
+    cluster battery are both `prod0810_mipcas_elj`. So when a name collides, the
+    tie is broken by the CONFIG KNOB THAT ACTUALLY DIFFERS between the colliding
+    arms -- which is the thing the reader wanted to know anyway, and is why §7
+    lists it as an alternative to the name rather than as a fallback.
+
+    The id is used only when nothing else separates them, where it is the honest
+    answer: these two arms differ in no knob and no stopping point.
+    """
+    runs = list(runs)
+    labels = {}
+    by_name = {}
+    for r in runs:
+        by_name.setdefault(run_label(r), []).append(r)
+
+    for name, group in by_name.items():
+        if len(group) == 1:
+            labels[id(group[0])] = name
+            continue
+        keys = set()
+        for r in group:
+            keys |= {k for k in (r.config or {}) if k not in K.CFG_IDENTITY}
+        # Knobs that separate these arms. Ranked by how READABLE the resulting
+        # label is, not by key length: wandb stores each config section a second
+        # time as a repr STRING (`adaptive_lr` -> "Namespace(warmup_steps=1000,
+        # ...)"), and those keys are the SHORTEST while their values are the
+        # longest -- ranking on the key put a 200-character Namespace dump in
+        # every subject line. Rank on the value, and drop candidates no label
+        # could carry.
+        differing = [k for k in keys
+                     if len({_label_value(r, k) for r in group}) == len(group)
+                     and max(len(_label_value(r, k)) for r in group)
+                     <= _LABEL_VALUE_MAX]
+        differing.sort(key=lambda k: (max(len(_label_value(r, k)) for r in group),
+                                      len(k), k))
+        if differing:
+            k = differing[0]
+            for r in group:
+                labels[id(r)] = f'{name}[{_label_knob(k)}={_label_value(r, k)}]'
+            continue
+        steps = {float(getattr(r, 'last_step', 0.0) or 0.0) for r in group}
+        if len(steps) == len(group):
+            for r in group:
+                labels[id(r)] = f'{name}@{float(r.last_step):.0f}steps'
+            continue
+        for r in group:
+            labels[id(r)] = f'{name}#{getattr(r, "run_id", "?")}'
+    return labels
+
+
+# A label has to fit on a subject line beside everything else on it.
+_LABEL_VALUE_MAX = 24
+# Knob-name tail kept in a label. `protocol_stages_1_lr_sensor_beta` -> the last
+# two words, which is what distinguishes it; the full path would swamp the name
+# the label exists to carry.
+_LABEL_KNOB_WORDS = 2
+
+
+def _label_knob(key: str) -> str:
+    return '_'.join(key.split('_')[-_LABEL_KNOB_WORDS:])
+
+
+def _label_value(run, key: str) -> str:
+    cfg = run.config or {}
+    if key not in cfg:
+        return '<missing>'
+    return str(K._value(cfg, key))
 
 
 def context_header(run, ctx: Context, window: Optional[float] = None) -> str:
@@ -1482,8 +1551,13 @@ def _conf_equal(a, b) -> bool:
         return False
 
 
+# Set by `check_confounds` for the battery in hand, so every subject uses the
+# battery-aware label rather than a bare name that may collide.
+_CONF_LABELS: dict = {}
+
+
 def _conf_label(run) -> str:
-    return run_label(run)
+    return _CONF_LABELS.get(id(run)) or run_label(run)
 
 
 def _conf_normalise(runs) -> list:
@@ -1581,7 +1655,10 @@ def _conf_per_run(res: CheckResult, run, ctx: Optional[Context],
 
     # --- code version. Absent is a FLAG in its own right: without the stamp,
     # drift against a sibling cannot be ruled out, and §4 opens with drift.
-    commit = K.git_commit(cfg)
+    # `run.metadata` as well as the config: the cloud API strips the `_wandb`
+    # blob the commit lives in, so a cluster arm -- exactly the kind a battery is
+    # made of -- reported "no commit stamp" and §4's first confound went dark.
+    commit = K.git_commit(cfg, getattr(run, 'metadata', None))
     subj = f'{label}/code_version'
     if commit:
         res.add(Finding(_CONF_CHECK, subj, State.OK, commit))
@@ -1690,13 +1767,53 @@ def _conf_group(runs, fn) -> dict:
     return out
 
 
-def _conf_battery(res: CheckResult, runs: list) -> None:
+def _conf_battery(res: CheckResult, runs: list, window=None) -> None:
+    _conf_battery_age(res, runs, window)
     _conf_battery_position(res, runs)
     _conf_battery_commit(res, runs)
     _conf_battery_checkpoint(res, runs)
     _conf_battery_start(res, runs)
     _conf_battery_duplicates(res, runs)
     _conf_battery_sweep(res, runs)
+
+
+def _conf_battery_age(res: CheckResult, runs: list, window=None) -> None:
+    """How far each arm actually got.
+
+    A trailing window is measured from EACH ARM'S OWN LAST STEP, so arms that
+    stopped at different points are read at different TRAINING AGES -- and every
+    metric here improves with age. Measured on two real cluster arms sharing a
+    name: at their own trailing windows (132k vs 42k steps) one arm led on every
+    topline metric; read over the span they BOTH covered, the other led on every
+    one. The comparison reversed, and nothing in the report said why.
+
+    The bar is the window itself, because that is what makes the statement
+    exact: when the last steps differ by more than the window, the two trailing
+    spans do not overlap at all and the arms share no common ground. With no
+    window the whole history is read, so the spread is reported and not flagged
+    -- how much of it to discount is the reader's.
+    """
+    ages = {}
+    for run in runs:
+        ages.setdefault(float(getattr(run, 'last_step', 0.0) or 0.0),
+                        []).append(_conf_label(run))
+    lo, hi = min(ages), max(ages)
+    spread = hi - lo
+    nums = {'min_last_step': lo, 'max_last_step': hi, 'spread': spread,
+            'n_arms': len(runs)}
+    detail = ' | '.join(f'{step:.0f}: {", ".join(a)}'
+                        for step, a in sorted(ages.items()))
+    if window is not None:
+        nums['window'] = float(window)
+    if window is not None and spread > float(window):
+        res.add(Finding(_CONF_CHECK, 'battery/training_age', State.FLAG,
+                        f'arms stopped {spread:.0f} steps apart, more than the '
+                        f'{float(window):.0f}-step window -- their trailing '
+                        f'windows do not overlap, so every metric below is read '
+                        f'at a different training age: {detail}', nums))
+    else:
+        res.add(Finding(_CONF_CHECK, 'battery/training_age', State.OK,
+                        detail, nums))
 
 
 def _conf_battery_position(res: CheckResult, runs: list) -> None:
@@ -1724,7 +1841,8 @@ def _conf_battery_position(res: CheckResult, runs: list) -> None:
 
 
 def _conf_battery_commit(res: CheckResult, runs: list) -> None:
-    groups = _conf_group(runs, lambda r: K.git_commit(r.config or {}))
+    groups = _conf_group(
+        runs, lambda r: K.git_commit(r.config or {}, getattr(r, 'metadata', None)))
     detail = ' | '.join(f'{c or "no stamp"}: {", ".join(a)}'
                         for c, a in groups.items())
     nums = {'n_commits': len(groups), 'n_arms': len(runs)}
@@ -1883,12 +2001,14 @@ def check_confounds(runs, *, ctx: Optional[Context] = None,
     answers, which are properties of the run and not of the battery.
     """
     runs = _conf_normalise(runs)
+    _CONF_LABELS.clear()
+    _CONF_LABELS.update(battery_labels(runs))
     if not runs:
         return CheckResult.not_run(
             _CONF_CHECK, 'no runs given -- nothing to read or to compare')
     res = CheckResult(check=_CONF_CHECK)
     if len(runs) > 1:
-        _conf_battery(res, runs)
+        _conf_battery(res, runs, window)
     else:
         res.add(Finding(_CONF_CHECK, 'battery', State.OK,
                         'cross-arm subjects skipped -- one arm, and a confound '
@@ -2255,7 +2375,8 @@ def run_all(runs, *, window: Optional[float] = None) -> list:
     # left unforwarded, that subject could never fire on the default path, and
     # its rows could not be read against the windowed rows printed beside them.
     battery = check_confounds(runs, window=window)
-    battery.run = ', '.join(run_label(r) for r in runs)
+    labels = battery_labels(runs)
+    battery.run = ', '.join(labels[id(r)] for r in runs)
     battery.header = f'{len(runs)} arm(s)'
     out = [battery]
 
@@ -2267,7 +2388,7 @@ def run_all(runs, *, window: Optional[float] = None) -> list:
             # Stamped HERE and not inside each check: a block that cannot be
             # attributed to an arm is unreadable in a battery, and leaving it to
             # four separate call sites is four chances to forget.
-            res.run, res.header = run_label(run), header
+            res.run, res.header = labels[id(run)], header
             out.append(res)
     return out
 

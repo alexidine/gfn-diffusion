@@ -57,6 +57,13 @@ class Run:
     summary: dict = field(default_factory=dict)
     history: dict = field(default_factory=dict)
     path: Optional[str] = None
+    # Host and provenance, and the ONLY place a cluster run's git commit is
+    # reachable: the local `config.yaml` carries it inside the `_wandb` blob, but
+    # the cloud API STRIPS that key from `run.config`. Measured on the cluster --
+    # so §4's first confound, code version drift between arms, went dark on
+    # exactly the runs a battery is made of. It lives on the Run because it
+    # belongs to neither config nor summary.
+    metadata: dict = field(default_factory=dict)
 
     @property
     def last_step(self) -> float:
@@ -99,6 +106,18 @@ def _local_config(run_dir: str) -> dict:
     try:
         with open(p, encoding='utf-8') as f:
             return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+
+def _local_metadata(run_dir: str) -> dict:
+    """`files/wandb-metadata.json` -- host, argv, and the git commit."""
+    p = os.path.join(run_dir, 'files', 'wandb-metadata.json')
+    if not os.path.exists(p):
+        return {}
+    try:
+        with open(p, encoding='utf-8') as f:
+            return json.load(f) or {}
     except Exception:
         return {}
 
@@ -236,7 +255,10 @@ def scan_cloud_history(run, keys: list[str], samples: int = 100000) -> dict:
 # ---------------------------------------------------------------------------
 
 def _cache_path(run_id: str, last_step: float) -> str:
-    return os.path.join(CACHE_DIR, f'{run_id}_{int(last_step)}.pkl')
+    # `_v2`: the cache holds pickled `Run` objects, and one written before
+    # `metadata` existed unpickles without that field. A version in the key is a
+    # miss rather than an AttributeError at read time.
+    return os.path.join(CACHE_DIR, f'{run_id}_{int(last_step)}_v2.pkl')
 
 
 def _cache_load(run_id: str, last_step: float) -> Optional[Run]:
@@ -323,7 +345,8 @@ def _pull_local(spec: str, wanted, base: str) -> Optional[Run]:
     if isinstance(display, dict):
         display = display.get('value')
     return Run(run_id=run_id, name=display or name, source='local',
-               config=config, summary=summary, history=history, path=run_dir)
+               config=config, summary=summary, history=history, path=run_dir,
+               metadata=_local_metadata(run_dir))
 
 
 def _pull_cloud(spec: str, project: str, wanted, use_cache: bool) -> Run:
@@ -342,8 +365,20 @@ def _pull_cloud(spec: str, project: str, wanted, use_cache: bool) -> Run:
     resolved = K.resolve(set(summary), want, K.detect_route(config))
     history = scan_cloud_history(cr, K.live_keys(resolved))
 
+    # The cloud API strips `_wandb` from `run.config`, so the commit is reachable
+    # only here. Guarded: `metadata` is a lazy network fetch and a run whose files
+    # were swept has none -- a missing stamp is a §4 finding, not a crash.
+    metadata = {}
+    try:
+        metadata = dict(cr.metadata or {})
+    except Exception:
+        pass
+    if 'git' not in metadata and getattr(cr, 'commit', None):
+        metadata['git'] = {'commit': cr.commit}
+
     run = Run(run_id=cr.id, name=cr.name, source='cloud',
-              config=config, summary=summary, history=history)
+              config=config, summary=summary, history=history,
+              metadata=metadata)
     if use_cache:
         _cache_store(run)
     return run

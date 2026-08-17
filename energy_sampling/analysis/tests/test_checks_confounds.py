@@ -1044,3 +1044,70 @@ def test_two_arms_sharing_a_display_name_stay_distinguishable(ring_probe, ring_c
     assert len(subjects) == len(set(subjects)), 'subject strings collided'
     dup = [s for s in subjects if 'duplicate/' in s]
     assert dup and a.run_id in dup[0] and b.run_id in dup[0]
+
+
+def test_the_commit_is_found_on_a_cloud_run_with_no_wandb_blob(ring_probe):
+    """§4's FIRST confound went dark on exactly the runs a battery is made of.
+
+    The local `config.yaml` carries the commit inside the `_wandb` blob; the
+    cloud API STRIPS that key from `run.config` and exposes it on the run object
+    instead. Measured on three cluster runs: every one reported 'no commit stamp
+    in the config' while all three had one, and they were on three DIFFERENT
+    commits."""
+    cloud = fixtures.mutate(ring_probe)
+    cloud.config.pop(K.CFG_WANDB_BLOB, None)          # as the cloud API returns it
+    assert K.git_commit(cloud.config) is None, 'blob still present'
+    cloud.metadata = {'git': {'commit': 'deadbeef' * 5}}
+
+    assert _state(check_confounds(cloud), f'{cloud.name}/code_version') is State.OK
+    assert K.git_commit(cloud.config, cloud.metadata) == 'deadbeef' * 5
+
+
+def test_a_run_with_neither_source_still_flags(ring_probe):
+    """The companion. A missing stamp must remain a finding, or the fix above
+    would have been to stop asking."""
+    blind = fixtures.mutate(ring_probe)
+    blind.config.pop(K.CFG_WANDB_BLOB, None)
+    blind.metadata = {}
+    assert _state(check_confounds(blind), f'{blind.name}/code_version') is State.FLAG
+
+
+def test_arms_on_different_commits_flag_from_metadata(ring_probe, ring_cal):
+    """Cross-arm drift, sourced from metadata rather than the config -- the real
+    cluster case, where no arm has the blob at all."""
+    a, b = fixtures.mutate(ring_probe), fixtures.mutate(ring_cal)
+    for r, c in ((a, 'a' * 40), (b, 'b' * 40)):
+        r.config.pop(K.CFG_WANDB_BLOB, None)
+        r.metadata = {'git': {'commit': c}}
+    assert _state(check_confounds([a, b]), 'battery/code_version') is State.FLAG
+    same = fixtures.mutate(b)
+    same.metadata = {'git': {'commit': 'a' * 40}}
+    assert _state(check_confounds([a, same]), 'battery/code_version') is State.OK
+
+
+def test_arms_that_stopped_far_apart_are_read_at_different_ages(tb_ramp, buildout):
+    """A trailing window is measured from EACH ARM'S OWN last step, so arms that
+    stopped at different points are read at different TRAINING AGES -- and every
+    topline metric here improves with age.
+
+    Measured on two real cluster arms sharing a name: at their own trailing
+    windows one led on every metric; over the span they BOTH covered, the other
+    led on every one. The comparison reversed and nothing said why."""
+    spread = abs(tb_ramp.last_step - buildout.last_step)
+    assert spread > 0, 'fixtures now end at the same step'
+
+    tight = check_confounds([tb_ramp, buildout], window=spread / 2)
+    assert _state(tight, 'battery/training_age') is State.FLAG
+    assert _row(tight, 'battery/training_age').numbers['spread'] == spread
+
+    # the companion: a window wide enough that the spans DO overlap is not a
+    # finding, or the subject would fire on every battery ever compared
+    wide = check_confounds([tb_ramp, buildout], window=spread * 2)
+    assert _state(wide, 'battery/training_age') is State.OK
+
+
+def test_arms_that_stopped_together_never_fire_on_age(ring_probe, ring_cal):
+    """These two really did stop at the same step."""
+    assert ring_probe.last_step == ring_cal.last_step
+    res = check_confounds([ring_probe, ring_cal], window=100.0)
+    assert _state(res, 'battery/training_age') is State.OK

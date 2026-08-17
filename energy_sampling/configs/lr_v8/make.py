@@ -32,6 +32,24 @@ START = 5300
 HEALTHY = 1.59e-4
 
 
+def _ray_off(cfg):
+    """Withdraw every `lr_sensor: {kind: ray}` declaration -- the only way there
+    now is to turn the probe off.
+
+    `ray_calibration.enabled: False` used to do this and is retired
+    (utils._RETIRED_KEYS): a flag and a stage declaration are two mechanisms for
+    one decision and could disagree. train.py arms the probe on
+    `bool(self._ray_askers())`, so absence of the declaration IS the off switch.
+    A MAPPING, not the bare string -- Stage._parse_lr_sensor raises TypeError on
+    a str."""
+    off = []
+    for st in cfg['protocols'][cfg['protocol']]['stages']:
+        if (st.get('lr_sensor') or {}).get('kind') == 'ray':
+            st['lr_sensor'] = {'kind': 'none'}
+            off.append(st['name'])
+    return off
+
+
 def _base(run_name, steps, read_only):
     with open(BASE) as f:
         cfg = yaml.safe_load(f)
@@ -54,7 +72,7 @@ def build():
     cfg = _base('smoke', 400, read_only=True)
     cfg['adaptive_lr']['seed_lr'] = HEALTHY
     cfg['adaptive_lr']['warmup_steps'] = 1     # no envelope: we want the sensor, not the ramp
-    cfg['ray_calibration']['period'] = 100
+    cfg['adaptive_lr']['ray_calibration']['period'] = 100
     out.append(('smoke', cfg))
 
     # ---- explode -----------------------------------------------------------
@@ -77,7 +95,7 @@ def build():
     # likely die before its first calibration -- which would measure the exposure
     # window, not the recovery. Shortened deliberately so the question under test
     # is "can it pull back", and the exposure question is recorded separately.
-    cfg['ray_calibration']['period'] = 200
+    cfg['adaptive_lr']['ray_calibration']['period'] = 200
     out.append(('explode', cfg))
 
     # ---- ramp --------------------------------------------------------------
@@ -96,9 +114,11 @@ def build():
     # fixed LR 1.25e-4, same eval/figs cadence -- and differs from it ONLY in
     # carrying the current working tree.
     #
-    # The LRs are explicit floats, not `auto`, so nothing actuates: with
-    # ray_calibration off, `auto` would be refused at load (and rightly -- it
-    # would pin the LR at the seed while claiming to be adaptive).
+    # The LRs are explicit floats, not `auto`, so nothing actuates: with the ray
+    # declaration withdrawn below, `auto` would be refused at load (and rightly
+    # -- the sensor check is per stage, so equilibration would be left with
+    # nothing to move its rate and would pin the LR at the seed while claiming
+    # to be adaptive).
     #
     # READ: jitter of replay/tb_err = median|dx|/median|x|. jybhxgxl 0.0018,
     # the v8 ramp 0.0087. If this arm lands near 0.0018 the cause is NOT in the
@@ -108,7 +128,7 @@ def build():
                               '-T2.5-573c92_phase1_exit.pt')
     for k in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'):
         cfg[k] = 1.25e-4
-    cfg['ray_calibration']['enabled'] = False
+    _ray_off(cfg)
     cfg['eval_period'] = 250      # match the reference runs, NOT the 500 house rule
     cfg['figs_period'] = 500
     # phase1_exit sits at step ~430 (both reference runs start there), so epochs
@@ -138,12 +158,17 @@ def build():
         path = os.path.join(HERE, f'{name}.yaml')
         with open(path, 'w') as f:
             yaml.safe_dump(c, f, sort_keys=False, default_flow_style=False)
-        al, rc = c['adaptive_lr'], c['ray_calibration']
+        al, rc = c['adaptive_lr'], c['adaptive_lr']['ray_calibration']
+        # The probe's armed/inert state is DERIVED from the stages now, so it is
+        # printed: there is no longer a flag in the file to read it off.
+        askers = [st['name'] for st in c['protocols'][c['protocol']]['stages']
+                  if (st.get('lr_sensor') or {}).get('kind') == 'ray']
         print(f"wrote {path}")
         print(f"   seed {al['seed_lr']:.3g} ({al['seed_lr'] / HEALTHY:.2g}x healthy) "
               f"| {c['epochs'] - START} steps | period {rc['period']} | "
               f"target alpha* {al['calibration']['alpha_target']} | "
-              f"read_only {c['checkpoint_read_only']}")
+              f"read_only {c['checkpoint_read_only']} | "
+              f"ray {','.join(askers) if askers else 'INERT (no stage asks)'}")
     return [n for n, _ in out]
 
 

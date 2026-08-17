@@ -1,0 +1,3 @@
+name	kind	benchmark_id	batch	epochs
+f3_mipcas_uma	func	-	250	1200
+f4_acridine_mace	func	-	250	1200

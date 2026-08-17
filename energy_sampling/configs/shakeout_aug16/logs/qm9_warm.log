@@ -1,0 +1,45 @@
+GPU: 1004 MiB used / 16303 MiB total, 15000 MiB free, 0% util
+job: configs\shakeout_aug16\qm9_cond.yaml  [elj|250|10|512|6|1|0|2000|cuda]
+projected need: 8355 MiB -- measured peak 7266 MiB for this exact config
+room check: skipped: sole tenant and the projection is a declared CAP, not a measurement
+  note    compute process not readable by this user: 2464, [Insufficient Permissions]
+GPU preflight: CLEAR TO LAUNCH
+config invariants:
+  ERROR    exit_bar_is_within_measured_range: stage 'var_conditioning' exit term 0 (fwd/logw_std_within) requires < 6, but the measured minimum is 17.1 (qm9anchor_aug14, 6 arms, 4,348 ticks in var_conditioning, read 2026-08-16). The bar sits below every value the metric has been observed to take, so this condition cannot fire and any stage behind it is never entered. Either raise the bar to a value the metric reaches, or -- if the stage is terminal by design -- delete the exit block rather than leaving a gate that reads as live.
+resolve_derived_config (W=512, T=10): lr_policy=0.000125, lr_replay=0.000125, lr_back=0.000125, lr_fused=0.000125, gradient_norm_clip=37.88
+grad_clip_guard: ON (guard mode) | p 0.99 (target fire rate 0.01) | eta 0.01 | warmup 100/branch (static) | cap 100x baseline | refresh_on_stage True | fallback bar 37.88
+NOTE: no stage declares lr_sensor kind 'ray', so the ray_calibration block is inert (parameters only). It still supplies alphas/n_sub/period to any stage that opts in.
+vram [baseline                    ] live        0 MiB | reserved        0 MiB | cached        0 MiB | peak reserved        0 MiB
+vram [energy fn (MLIP loaded)     ] live        0 MiB | reserved        0 MiB | cached        0 MiB | peak reserved        0 MiB
+Loading model weights only from checkpoint C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints/WARM_qm9_mle3k.pt - optimizers, buffers, and training state start fresh
+lr_ctrl v8: calibration off | target alpha* 4.0 | eta up/down 0.25/0.5 | managed lr_back,lr_fused,lr_policy,lr_replay
+vram [gfn model                   ] live       74 MiB | reserved      176 MiB | cached      102 MiB | peak reserved      176 MiB
+vram [mol_dataset                 ] live       82 MiB | reserved      202 MiB | cached      120 MiB | peak reserved      202 MiB
+Re-analyzing prior energies
+dead-row probe: latent_to_cell_params confirms rows () are ignored for SG2 (n=8)
+vram [prior_dataset (MLIP scan)   ] live       91 MiB | reserved     1382 MiB | cached     1291 MiB | peak reserved     7320 MiB
+Seeded prior_buffer with 4880 prior-dataset samples (fresh loss records)
+vram [buffers seeded              ] live      116 MiB | reserved     2648 MiB | cached     2532 MiB | peak reserved     7320 MiB
+vram [READY TO TRAIN              ] live      116 MiB | reserved     2648 MiB | cached     2532 MiB | peak reserved     7320 MiB
+vram: cuda_memory_fraction 0.9 x 16303 MiB = 14672 MiB hard cap; 12024 MiB of it left for training allocations
+WARNING [stage 'train_prior']: no mode trains the flow (Z) head -- every branch is freeze_z, or its TB reads a detached persistent target with no emp_z/emp_z_persistent/z_level sidecar. log_Z will not move for this stage.
+grad_clip_guard: calibrated -- bar 29.69 (lognormal p0.99 seed, geo-mean 22.17)
+protocol: stage 'train_prior' -> 'var_conditioning'
+lr_ctrl v8: calibration off | target alpha* 4.0 | eta up/down 0.25/0.5 | managed lr_back,lr_fused,lr_policy,lr_replay
+protocol: optimizers rebuilt, LR re-warming over 1000 train steps
+grad_clip_guard: refresh (stage train_prior -> var_conditioning) -- recalibrating over 100 steps/branch, holding [bwd=30.77]
+rebuild_prior_by_churn: prior_buffer 4880 -> 62500 rows (target 62500, 15 churn cycles, 187500 rows of headroom left for churn)
+protocol: stage 'var_conditioning' engaged (fwd 0.500 / bwd 0.5000 / replay 0.000, train_mode fused, bwd_sampling prior)
+prior_buffer gate-staleness purge capped at 6250 of 13698 stale rows (62500 resident): Emin(c) is moving faster than expire_max_frac 0.1 allows -- the remainder expires over subsequent calls
+replay buffer: management OFF under stage 'var_conditioning' -- nothing in it trains replay, draws from it, or probes it (replay_in_play)
+lr_ctrl DIVERGENCE: grad_norm = 2.395e+09 (bar 1e+09) at step 170 -- reload + peak cut
+Divergence response: rewind #1 + peak cut
+lr_ctrl: peak_scale -> 0.5 (ceiling recorded)
+lr_ctrl DIVERGENCE: grad_norm = 3.28e+09 (bar 1e+09) at step 190 -- reload + peak cut
+Divergence response: rewind #2 + peak cut
+lr_ctrl: peak_scale -> 0.5 (ceiling recorded)
+lr_ctrl DIVERGENCE: grad_norm = 3.294e+09 (bar 1e+09) at step 210 -- reload + peak cut
+Divergence response: rewind #3 + peak cut
+lr_ctrl: peak_scale -> 0.25 (ceiling recorded)
+lr_ctrl DIVERGENCE: grad_norm = 3.445e+09 (bar 1e+09) at step 220 -- reload + peak cut
+UNRECOVERABLE at step 220: 4 rewinds (budget 3.0 at 0.2/1k steps) and the run keeps re-detonating -- rewinding restores weights but not a survivable LR. Aborting so the GPU is released.

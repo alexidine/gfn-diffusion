@@ -8,10 +8,18 @@
 # var_conditioning -- that is what exercises BOTH sensors in one run: the MLE
 # channel in phase 1, the two VarGrad channels after it.
 #
-# ray_calibration.enabled stays TRUE on purpose. Both stages declare
-# kind: loss_slope, so the per-stage gate must suppress the ray probe and
-# lr_ctrl/calibrations must stay at 0 for the whole run. That is a live
-# assertion that the gate works, not leftover config.
+# THIS FILE IS A FROZEN aug11 SNAPSHOT and is still written against the schema
+# of that day: `protocol` as a stage block rather than a selector, and the MLE
+# gate parameters at top level. make.py migrates it forward with
+# config_state.migrate before writing an arm, so the repair is mechanical and
+# the snapshot keeps its commentary. The one thing hand-migrated here is the
+# ray block, below.
+#
+# lr_ctrl/calibrations must stay at 0 for the whole run -- both stages declare
+# a plateau sensor, so no stage asks for ray and the probe never arms. This used
+# to be phrased as `ray_calibration.enabled: true` plus a per-stage gate that had
+# to suppress it; that flag is retired, because a flag and a stage declaration
+# are two mechanisms for one decision and could disagree.
 #
 # WHAT TO READ:
 #   lr_ctrl/slope_status   0 clean | 1 cut | 2 recover | 5 warmup
@@ -69,11 +77,14 @@ adaptive_lr:
   divergence_cut: 0.5
   control_flow_lr: false     # lr_flow stays exempt: alpha* is measured over policy params only
 
-ray_calibration:
-  enabled: true
-  period: 500
-  n_sub: 8
-  alphas: [ 0, 1, 2, 4, 8, 16, 32, 64 ]
+  # PARAMETERS ONLY -- there is no `enabled` here, and the block being present
+  # does not arm anything. The probe runs where a stage declares
+  # `lr_sensor: {kind: ray}` and nowhere else; make.py puts `kind: plateau` on
+  # both stages, so nothing asks and the calibrator stays inert.
+  ray_calibration:
+    period: 500
+    n_sub: 8
+    alphas: [ 0, 1, 2, 4, 8, 16, 32, 64 ]
 weight_decay: 1.0e-4
 use_weight_decay: false
 compile_policy: auto

@@ -112,6 +112,12 @@ CKPT = ('checkpoints/d33elj_elj_nehzor_sg14_t10_r2_elj-nehzor_sg14_zp1_'
 STEPS = 400
 MEM_FRACTION = 0.45
 OUT = 'bench_noise_calibration.json'
+#: WHERE BARE OUTPUT NAMES LAND. `OUT` and the per-regime names below are
+#: filenames, not paths, and an unqualified `open(name, 'w')` wrote them to the
+#: CWD -- in practice always `energy_sampling/`, which is how a dozen
+#: calibration JSONs came to sit beside the trainer. Resolution happens in
+#: `_resolve` at the write site, so an explicit `out=` path still wins.
+RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results')
 #: The window is only informative if the model is ACTUALLY DESCENDING in it.
 #: Checked and reported, not assumed -- a flat ||g|| means the measurement is
 #: about convergence rather than about noise, whatever cos says.
@@ -410,6 +416,14 @@ def run(steps=STEPS, config=CONFIG, out=OUT, ckpt=CKPT):
     return rec
 
 
+def _resolve(out):
+    """Bare filename -> `bench/results/`; an explicit path is left alone."""
+    if os.path.isabs(out) or os.path.dirname(out):
+        return out
+    os.makedirs(RESULTS, exist_ok=True)
+    return os.path.join(RESULTS, out)
+
+
 def report(rec, out=OUT):
     d = rec[0]['dim']
     null = math.sqrt(2.0 / (math.pi * max(d, 2)))
@@ -472,9 +486,10 @@ def report(rec, out=OUT):
         print('  >> REAL IS NOISIER THAN THE BENCH\'S WORST CELL. Every '
               'noise-driven\n     ranking in docs/lr_control_summary.md is '
               'optimistic.')
-    with open(out, 'w') as f:
+    dest = _resolve(out)
+    with open(dest, 'w') as f:
         json.dump(rec, f)
-    print(f'\n  raw samples -> {out}')
+    print(f'\n  raw samples -> {dest}')
 
 
 if __name__ == '__main__':

@@ -48,7 +48,7 @@ ARMS = (
     ('hyper 2:1', 'hyperx', 'none', {'hyper_beta_down': 0.04}, {}),
     ('hyper 4:1', 'hyperx', 'none', {'hyper_beta_down': 0.08}, {}),
     ('ray+ray', 'ray', 'ray', None, {}),
-    ('ray n_sub16', 'ray', 'ray', None, {'ray_calibration.n_sub': 16}),
+    ('ray n_sub16', 'ray', 'ray', None, {'adaptive_lr.ray_calibration.n_sub': 16}),
     ('ray eta_dn1', 'ray', 'ray', None,
      {'adaptive_lr.calibration.eta_down': 1.0}),
     ('ramp+plateau', 'ramp', 'plateau', None, {}),

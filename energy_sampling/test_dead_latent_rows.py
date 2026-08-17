@@ -33,6 +33,7 @@ for _root in (os.path.dirname(_here),                                   # gfn_di
     if _root not in sys.path:
         sys.path.insert(0, _root)
 
+import pytest
 import torch
 from torch.distributions import MultivariateNormal
 
@@ -61,6 +62,30 @@ CFG = {
     'sg14_zp2': dict(dim=18, max_z_prime=2, periodic_centroid_axes=(0, 2), dplr_rank=6),
     'nodplr':   dict(dim=12, max_z_prime=1, periodic_centroid_axes=(1, 2), dplr_rank=0),
 }
+
+# The PRECHANGE table is float32, and so is every `torch.equal` in this file. Seeding
+# is already explicit (build_gfn and roll both call manual_seed), so the RNG is not the
+# exposure -- the DEFAULT DTYPE is. Build these models in double and all four pinned
+# pairs move by tens of nats, and the mxtaltools batches in the end-to-end test stop
+# accepting index writes at all.
+#
+# That is reachable from outside this file: pytest imports every collected module
+# before running any test, so one module-scope `torch.set_default_dtype` anywhere in
+# the session rebuilds these models in float64. mxtaltools' conformer suite had exactly
+# that, which made this file's bitwise guarantee a function of collection order --
+# passing alone, failing beside a module it never references. Pin it per test rather
+# than inheriting whatever the process was left in.
+DTYPE = torch.float32
+
+
+@pytest.fixture(autouse=True)
+def _pinned_default_dtype():
+    prev = torch.get_default_dtype()
+    torch.set_default_dtype(DTYPE)
+    try:
+        yield
+    finally:
+        torch.set_default_dtype(prev)
 
 
 def build_gfn(dim=12, max_z_prime=1, periodic_centroid_axes=(1, 2), dplr_rank=6,
@@ -762,6 +787,8 @@ def test_rotation_magnitude_clamp_covers_every_aunit():
 
 
 if __name__ == '__main__':
+    # the autouse fixture above is pytest-only, so the direct runner sets it itself
+    torch.set_default_dtype(DTYPE)
     test_table_matches_known_space_groups()
     test_toy_gate()
     test_prechange_bitwise_identity()

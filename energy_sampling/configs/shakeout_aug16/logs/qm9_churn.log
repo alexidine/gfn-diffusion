@@ -1,0 +1,29 @@
+GPU: 590 MiB used / 16303 MiB total, 15414 MiB free, 0% util
+job: configs\shakeout_aug16\qm9_cond.yaml  [elj|250|10|512|6|1|0|2000|cuda]
+projected need: 14672 MiB -- cuda_memory_fraction 0.9 x 16303 MiB -- the config's DECLARED CEILING, no measurement on record
+room check: skipped: sole tenant and the projection is a declared CAP, not a measurement
+  note    compute process not readable by this user: 2464, [Insufficient Permissions]
+GPU preflight: CLEAR TO LAUNCH
+resolve_derived_config (W=512, T=10): lr_policy=0.000125, lr_replay=0.000125, lr_back=0.000125, lr_fused=0.000125, gradient_norm_clip=37.88
+grad_clip_guard: ON (guard mode) | p 0.99 (target fire rate 0.01) | eta 0.01 | warmup 100/branch (static) | cap 100x baseline | refresh_on_stage True | fallback bar 37.88
+NOTE: no stage declares lr_sensor kind 'ray', so the ray_calibration block is inert (parameters only). It still supplies alphas/n_sub/period to any stage that opts in.
+vram [baseline                    ] live        0 MiB | reserved        0 MiB | cached        0 MiB | peak reserved        0 MiB
+vram [energy fn (MLIP loaded)     ] live        0 MiB | reserved        0 MiB | cached        0 MiB | peak reserved        0 MiB
+SG2 aunit=[0.5, 1, 1]: wrapping centroid axes yz
+SG2 (triclinic), Z'<=1: no dead latent rows; SDE flows the full 12 dims
+lr_ctrl v8: calibration off | target alpha* 4.0 | eta up/down 0.25/0.5 | managed lr_back,lr_fused,lr_policy,lr_replay
+vram [gfn model                   ] live       73 MiB | reserved       84 MiB | cached       11 MiB | peak reserved       84 MiB
+vram [mol_dataset                 ] live       81 MiB | reserved      112 MiB | cached       31 MiB | peak reserved      112 MiB
+Re-analyzing prior energies
+dead-row probe: latent_to_cell_params confirms rows () are ignored for SG2 (n=8)
+vram [prior_dataset (MLIP scan)   ] live       90 MiB | reserved     1386 MiB | cached     1296 MiB | peak reserved     7266 MiB
+Seeded prior_buffer with 4880 prior-dataset samples (fresh loss records)
+vram [buffers seeded              ] live      114 MiB | reserved     1390 MiB | cached     1276 MiB | peak reserved     7266 MiB
+vram [READY TO TRAIN              ] live      114 MiB | reserved     1390 MiB | cached     1276 MiB | peak reserved     7266 MiB
+vram: cuda_memory_fraction 0.9 x 16303 MiB = 14672 MiB hard cap; 13282 MiB of it left for training allocations
+WARNING [stage 'train_prior']: no mode trains the flow (Z) head -- every branch is freeze_z, or its TB reads a detached persistent target with no emp_z/emp_z_persistent/z_level sidecar. log_Z will not move for this stage.
+grad_clip_guard: calibrated -- bar 112.3 (lognormal p0.99 seed, geo-mean 37.22)
+protocol: stage 'train_prior' -> 'var_conditioning'
+lr_ctrl v8: calibration off | target alpha* 4.0 | eta up/down 0.25/0.5 | managed lr_back,lr_fused,lr_policy,lr_replay
+protocol: optimizers rebuilt, LR re-warming over 1000 train steps
+grad_clip_guard: refresh (stage train_prior -> var_conditioning) -- recalibrating over 100 steps/branch, holding [bwd=111.8]

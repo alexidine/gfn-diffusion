@@ -33,7 +33,8 @@ class BaseSet(abc.ABC, Dataset):
         del batch_size
         raise NotImplementedError
 
-    def log_reward(self, x, mol_batch, log_temperature, return_exp: bool = False, keep_grads: bool = False):
+    def log_reward(self, x, mol_batch, log_temperature, return_exp: bool = False, keep_grads: bool = False,
+                   internal_oom_recovery=None):
         """
         The single funnel every training energy evaluation goes through, so the
         timing lives here rather than in any one energy subclass.
@@ -50,15 +51,20 @@ class BaseSet(abc.ABC, Dataset):
         and an un-synchronised GPU section that returns immediately is exactly the
         idle this is meant to expose. Counters are drained by ten_step_reporting.
         """
+        # Forwarded ONLY when explicitly set: this base log_reward is inherited by
+        # every energy, and the toy subclasses' energy() take no such argument. A
+        # None default therefore leaves all existing call sites byte-identical.
+        recovery_kw = {} if internal_oom_recovery is None else {
+            'internal_oom_recovery': internal_oom_recovery}
         t0 = time.time()
         try:
             if return_exp:
                 energy, sample = self.energy(x, mol_batch, log_temperature, return_exp,
-                                             keep_grads=keep_grads)
+                                             keep_grads=keep_grads, **recovery_kw)
                 return -energy, sample
             else:
                 return -self.energy(x, mol_batch, log_temperature, return_exp,
-                                    keep_grads=keep_grads)
+                                    keep_grads=keep_grads, **recovery_kw)
         finally:
             self.energy_seconds = getattr(self, 'energy_seconds', 0.0) + (time.time() - t0)
             self.energy_calls = getattr(self, 'energy_calls', 0) + 1

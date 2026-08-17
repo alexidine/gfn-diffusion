@@ -74,8 +74,22 @@ def build():
         for k in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'):
             cfg[k] = LR                                # explicit -> unmanaged
         cfg['adaptive_lr']['warmup_steps'] = 10
-        cfg['ray_calibration']['period'] = 200
-        cfg['ray_calibration']['n_sub'] = PROBE_SAMPLES // batch
+        cfg['adaptive_lr']['ray_calibration']['period'] = 200
+        cfg['adaptive_lr']['ray_calibration']['n_sub'] = PROBE_SAMPLES // batch
+
+        # THE PROBE IS THIS BATTERY'S INSTRUMENT, and it now arms only because a
+        # stage asks for it (train.py::_ray_askers) -- the `ray_calibration.
+        # enabled: True` that used to say so in the file is retired. Nothing in
+        # this generator sets that declaration, so it is inherited from mk_dev
+        # and can be dropped there by an edit that has nothing to do with bsz.
+        # An inert probe logs no raycal/alpha_star at all and the battery would
+        # simply have no reading, so it is asserted rather than assumed.
+        askers = [st['name'] for st in cfg['protocols'][cfg['protocol']]['stages']
+                  if (st.get('lr_sensor') or {}).get('kind') == 'ray']
+        assert askers, (
+            f"b{batch}: no stage in protocol {cfg['protocol']!r} declares "
+            f"lr_sensor kind 'ray', so the calibrator is inert and alpha* -- the "
+            f"only quantity this battery measures -- is never logged.")
 
         arms.append((f'b{batch}', cfg))
 
@@ -83,7 +97,7 @@ def build():
         p = os.path.join(HERE, f'{name}.yaml')
         with open(p, 'w') as f:
             yaml.safe_dump(c, f, sort_keys=False, default_flow_style=False)
-        rc = c['ray_calibration']
+        rc = c['adaptive_lr']['ray_calibration']
         print(f"wrote {p}")
         print(f"   batch {c['batch_size']:>5}  n_sub {rc['n_sub']:>3}  "
               f"probe samples {c['batch_size'] * rc['n_sub']}  "

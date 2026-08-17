@@ -23,8 +23,15 @@ defaults:
     figs_period: 100000000
     z_calibration:
       enabled: false
-    ray_calibration:
-      enabled: false
+    # NO ray_calibration ENTRY, and none is possible. The ray probe is the other
+    # piece of periodic work whose period is not the report period, but it now
+    # arms iff some stage declares `lr_sensor: {kind: ray}` -- there is no flag
+    # left to clear, and `ray_calibration.enabled` is a retired key that would
+    # hard-fail the run at load. Overrides cannot reach it either: the
+    # declaration lives on a stage, and stage lists merge WHOLESALE, so a patch
+    # would have to restate the whole protocol. Neutralising it is therefore the
+    # WORKLOAD's job -- a benchmark whose config declares a ray stage carries the
+    # probe's cost in its timing, and its window must be read as such.
     anomaly_detection: false
     device: cuda
 
@@ -62,12 +69,16 @@ metrics:
     eval_sampling_time: {source: 'utils.drain_elapsed_times', cadence: eval}
     eval_figs_time: {source: 'utils.drain_elapsed_times', cadence: eval}
     inter_eval_time: {source: 'utils.drain_elapsed_times', cadence: eval}
+    # needed for the eval-blindness arithmetic: the unsampled share of wall clock
+    # is eval time over (inter_eval + eval), and wrapup is part of eval time.
+    eval_wrapup_time: {source: 'train.py:5039 times pair, via drain_elapsed_times', cadence: eval}
     initialization_time: {source: 'utils.drain_elapsed_times', cadence: once}
   catastrophe:
     # Counts. Never averaged, never smoothed into a score.
     batch/oom_events: {source: 'train.py:869'}
     batch/ceiling_expiries: {source: 'train.py:870'}
     batch/oom_ceiling: {source: 'train.py:871'}
+    batch/oom_min: {source: 'train.py:889'}
     gradnorm/nonfinite_steps: {source: 'train.py:802'}
 
 # Metric-name patterns forbidden in `primary`. A benchmark's headline number may
@@ -584,30 +595,40 @@ benchmarks:
     purpose:
       - 'the shape production runs; the reference workload for config-equivalence tier C'
 
+  # AMENDED 2026-08-16, before any floor was measured, so no recorded number
+  # depends on the old spec. The entry previously declared molecule_conditioning:
+  # true (the live-GNN conditioner) on an equilibration stage. The production
+  # conditional route conditions on PRE-BAKED frozen Mo3ENet latents
+  # (embedding_conditioning, 192-d) and its post-MLE production stage is
+  # var_conditioning (fused fwd/bwd VarGrad, replay frac 0), not equilibration --
+  # evidence: qm9anchor_aug14 battery, configs/shakeout_aug16/qm9_cond.yaml.
+  # A cost benchmark of a route production does not run measures nothing anyone
+  # will compare against.
   - id: elj-fused-cond
-    title: ELJ, fused, molecule-conditional
+    title: ELJ, fused, embedding-conditional (QM9) -- the conditional production shape
     status: specified
     workload:
       energy_function: elj
-      conditioning: conditional_molecule
+      conditioning: conditional_molecule_embedding
       domain: molecule
       space_groups: [2]
       z_primes: [1]
       T: 10
-      dataset: 'QM9-anchored conditional prior + held-out test conditions'
+      dataset: 'qm9split conditional triple (prior + conditions + held-out test conditions)'
       dataset_in_repo: false
     training_mode:
-      stage: equilibration
+      stage: var_conditioning
       train_mode: fused
       bwd_sampling_mode: prior
-      branches: [fwd, bwd, replay]
+      branches: [fwd, bwd]
     hardware:
       class: both
       local_adequate: true
       a100_required: false
       reason: >-
-        the frozen conditioner runs locally; production condition-library sizes and
-        held-out eval cost need the A100
+        the embedding lookup runs locally; production condition-library sizes,
+        production batch at the var_conditioning memory peak (fwd 0.5 / bwd 0.5
+        with repeats 2.0 on both branches), and held-out eval cost need the A100
     work:
       kind: fixed_steps
       batch_size: 1000
@@ -619,7 +640,8 @@ benchmarks:
       wallclock_cap_s: 7200
     overrides:
       energy_function: elj
-      molecule_conditioning: true
+      embedding_conditioning: true
+      embedding_conditioning_dim: 192
       integrator: {T: 10}
       eval_T: 10
       batch_size: 1000
@@ -628,13 +650,13 @@ benchmarks:
     metrics:
       primary: [train_step_time, samples_per_sec, energy/frac_of_step]
       secondary: [energy/ms_per_sample, gpu/util_recent, vram/peak_reserved_mb]
-      catastrophes: [batch/oom_events, gradnorm/nonfinite_steps]
+      catastrophes: [batch/oom_events, batch/oom_min, gradnorm/nonfinite_steps]
       unusable:
         gpu/util_policy: 'run is shorter than the 7200 s window'
     liveness:
-      - 'fwd/*, bwd/* and replay/* all present and changing'
-      - 'the conditioner is evaluated every step (a frozen conditioner that is cached would change the cost profile)'
-      - 'more than one distinct condition_id appears in the window'
+      - 'fwd/* and bwd/* present and changing; replay/* FROZEN (var_conditioning runs replay frac 0)'
+      - 'more than one distinct condition_id appears in the window (the embedding is consumed, not cached to one row)'
+      - 'vg_live_frac > 0 -- the VarGrad grouping actually formed groups'
     noise_floor:
       method: repeat_launch
       repeats: 5
@@ -644,7 +666,12 @@ benchmarks:
       measured: null
     correctness:
       reference: paired_unconditional_control
-      detail: 'elj-fused-uncond at the same batch, T and space group; the delta is the conditioning overhead'
+      detail: >-
+        elj-fused-uncond at the same batch and T is the cost control. NOT a clean
+        conditioning isolate: the pair differs in conditioning, loss form
+        (VarGrad vs TB) and branch mix together, because each is its route's
+        production shape. The clean conditioning isolate is
+        toy-multiharm-fused-cond against toy-latentgauss-fused-uncond.
       gate: 'pytest test_condition_fractions.py'
       exactness: floor
     comparison:
@@ -652,6 +679,7 @@ benchmarks:
       rule: same_hardware_class_paired_seed
     purpose:
       - 'conditioning changes the model, the batch composition and the eval path; none of it is derivable from the unconditional profile'
+      - 'the var_conditioning memory peak is the one that OOMed the 2026-08-16 local shakeout at half the unconditional batch'
 
   # --------------------------------------------------------------- MLIP -----
   - id: uma-fused-uncond
@@ -920,7 +948,20 @@ benchmarks:
       resume_step: null
       warmup_steps: 100
       measure_steps: 400
-      epochs_formula: 'resume_step + warmup_steps + measure_steps, per rung, one launch each'
+      # AMENDED 2026-08-16 (phase6_measurement_request.md section 2 box): the old
+      # formula 'resume_step + warmup_steps + measure_steps' = 500 steps reaches
+      # min_wallclock_s only at >= 14.4 s/step, which an A100 ELJ step at batch
+      # 1000 is not plausibly near -- so as previously declared the job ended
+      # early and _gpu_util_mean(7200) printed a partial window LABELLED as the
+      # policy average. The step budget must be sized from a MEASURED step time.
+      # NB registry.epochs_for() hard-codes the old sum and does NOT evaluate this
+      # formula (phase6_measurement_delta.md D10.1): a battery generator must
+      # compute the budget itself and treat warmup+measure as the timing window
+      # only, not the run length.
+      epochs_formula: >-
+        resume_step + max(warmup_steps + measure_steps,
+        ceil(min_wallclock_s / measured_step_time)) rounded up to a multiple of
+        10, per rung, one launch each
       wallclock_cap_s: 28800
       min_wallclock_s: 7200
     overrides:
@@ -955,6 +996,111 @@ benchmarks:
     purpose:
       - 'Phase 6 needs the throughput-vs-occupancy curve on the hardware that cancels jobs'
       - 'batch IS the occupancy lever on an analytic energy and is NOT on the MLIP route; the two must be measured separately'
+
+  # From docs/design/phase6_measurement_request.md section 9.1 (landed 2026-08-16
+  # with two amendments recorded inline). The request's other proposed entries do
+  # NOT land yet, deliberately: a100-batch-scaling-uma carries batch_rungs: null
+  # until the pre-flight measures a ladder (the validator refuses it, which is the
+  # desired failure mode), and a100-util-sensor-crosscal collapsed to a single
+  # confirmation launch after F-038 showed wandb's system stream already answers
+  # the cadence question retroactively (phase6_measurement_delta.md D11) -- a
+  # single probe launch is not a benchmark.
+  - id: a100-util-production-shape
+    title: Utilization on a production-shaped run, with eval ON
+    status: specified
+    workload:
+      energy_function: elj
+      conditioning: unconditional
+      domain: molecule
+      space_groups: [2]
+      z_primes: [1]
+      T: 10
+      dataset: 'mipcas_sg2_zp1_elj_prior_dataset.pt'
+      dataset_in_repo: false
+    training_mode:
+      stage: equilibration
+      train_mode: fused
+      bwd_sampling_mode: prior
+      branches: [fwd, bwd, replay]
+    hardware:
+      class: a100
+      local_adequate: false
+      a100_required: true
+      reason: >-
+        the proxy has to be calibrated on the run shape that actually gets
+        cancelled. Every throughput benchmark disables eval by design, and the
+        in-process occupancy sampler takes NO samples during an eval block, so a
+        proxy validated on an eval-free arm does not transfer to a production run.
+    work:
+      # AMENDED from the request's draft in two places, both with cluster
+      # evidence. (1) batch 4491, not 1000: every pinned batch-1000 T=10 ELJ arm
+      # ever submitted was cancelled for low utilization (qm9anchor_aug14 v1, all
+      # six arms), and this benchmark needs to SURVIVE ~4 h; 4491 sits in the
+      # observed surviving range of grown cluster runs (1650-7410, prod0810). The
+      # quantity measured -- the share of wall clock the in-process sensor never
+      # samples -- is a property of the eval cadence, and batch enters only
+      # through survival odds. (2) eval 500 / figs 1000, the actual production
+      # cluster cadence, not the request's 250/500.
+      kind: fixed_steps
+      batch_size: 4491
+      pin_batch: true
+      resume_step: null
+      warmup_steps: 100
+      measure_steps: 400
+      epochs_formula: >-
+        resume_step + max(warmup_steps + measure_steps,
+        ceil(min_wallclock_s / measured_effective_step_time)) rounded up to a
+        multiple of 10, where effective step time includes the eval share
+      wallclock_cap_s: 21600
+      min_wallclock_s: 14400
+    overrides:
+      energy_function: elj
+      integrator: {T: 10}
+      eval_T: 10
+      batch_size: 4491
+      max_batch_size: 4491
+      eval_period: 500
+      figs_period: 1000
+      eval_num_samples: 10000
+    metrics:
+      primary: [gpu/util_policy, eval_step_time, inter_eval_time]
+      secondary: [gpu/util_recent, eval_sampling_time, eval_figs_time,
+                  eval_wrapup_time, train_step_time, energy/frac_outside_step,
+                  vram/peak_reserved_mb]
+      catastrophes: [batch/oom_events, batch/oom_min, gradnorm/nonfinite_steps]
+      unusable:
+        samples_per_sec: 'counts training samples only; eval sampling is not in the denominator'
+        energy/ms_per_sample: 'pools training and eval energy calls'
+    liveness:
+      - 'at least 8 evaluations fired inside the gpu/util_policy window'
+      - 'figs_period is a multiple of eval_period, so figures actually logged'
+      - 'the external nvidia-smi CSV covers the whole job, eval blocks included'
+      - >-
+        the run lasted at least min_wallclock_s, VERIFIED from the external
+        sidecar CSV duration -- the in-process sample count (G2) is not
+        instrumented yet, so window fill cannot be checked from wandb alone
+      - 'fwd/*, bwd/* and replay/* all present and changing'
+    noise_floor:
+      method: repeat_launch
+      repeats: 3
+      seed_policy: fixed
+      run_statistic: median
+      dispersion: relative_span
+      measured: null
+    correctness:
+      reference: paired_control
+      detail: >-
+        the a100-batch-scaling-elj rung at the same batch with eval disabled is
+        the control; the delta is what eval does to the OCCUPANCY READING, which
+        is a different question from what eval costs (elj-eval-cost owns that)
+      gate: null
+      exactness: floor
+    comparison:
+      valid_against: [a100-util-production-shape, a100-batch-scaling-elj]
+      rule: same_hardware_class_paired_seed
+    purpose:
+      - 'measures the share of wall clock the in-process occupancy sensor never samples'
+      - 'the single number that decides whether gpu/util_policy OVERSTATES what the scheduler sees'
 
 suites:
   local-dev:
@@ -1004,3 +1150,13 @@ suites:
     benchmarks:
       - toy-latentgauss-fused-uncond
       - elj-fused-uncond
+  phase4-utilisation:
+    description: >-
+      The utilisation proxy and the occupancy-versus-batch question, on the
+      hardware that cancels jobs. Everything Phase 6 is gated on. Grows to the
+      full five-benchmark set of phase6_measurement_request.md section 9 as the
+      UMA ladder's pre-flight lands; absolute numbers here do not transfer to
+      the dev box, which has no scheduler.
+    benchmarks:
+      - a100-batch-scaling-elj
+      - a100-util-production-shape

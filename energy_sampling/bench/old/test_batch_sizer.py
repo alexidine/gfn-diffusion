@@ -69,8 +69,13 @@ TEST_GAIN = 0.30
 
 
 def batch_run(steps=2000, gpu=None, seed=0, **args_overrides):
-    """A cheap run with the sensor off -- these tests are about the batch controller."""
-    overrides = {'grow_batch_size': True, 'ray_calibration.enabled': False,
+    """A cheap run with the sensor off -- these tests are about the batch controller.
+
+    `probe_enabled=False` is where `ray_calibration.enabled: False` went: the
+    config flag is retired (the switch is a stage declaring lr_sensor kind
+    'ray'), and this harness selects its arm by climber/braker rather than by
+    stage, so its off-switch is now an argument. Same default, same effect."""
+    overrides = {'grow_batch_size': True,
                  'max_batch_size': 200000, 'max_step_seconds': 0,
                  'batch_growth_min_throughput_gain': TEST_GAIN}
     overrides.update(args_overrides)
@@ -83,6 +88,7 @@ def batch_run(steps=2000, gpu=None, seed=0, **args_overrides):
     return BenchRun(
         game='mle', game_kwargs=dict(dim=4, cond=2.0, noise=0.0, lr=1e-3),
         gpu_kwargs=gpu_kwargs, args_overrides=overrides, seed=seed,
+        probe_enabled=False,
     ).run(steps, stop_on_divergence=False)
 
 
@@ -267,8 +273,9 @@ def test_oom_leaves_exactly_one_poisoned_timing_entry():
     gpu = SyntheticGPU(t_fixed=2.0, sps_max=5000.0, oom_at=1000)
     run = BenchRun(game='mle', game_kwargs=dict(dim=4, cond=2.0, noise=0.0, lr=1e-3),
                    gpu_kwargs=dict(t_fixed=2.0, sps_max=5000.0, oom_at=1000),
-                   args_overrides={'grow_batch_size': True, 'ray_calibration.enabled': False,
-                                   'max_step_seconds': 0})
+                   args_overrides={'grow_batch_size': True,
+                                   'max_step_seconds': 0},
+                   probe_enabled=False)
     # handle_train_epoch_error returns early at step_ind == 0 (an OOM on the very
     # first step is a config error, not a growth overshoot), so start past it
     run.m.step_ind = 5
@@ -327,9 +334,10 @@ def test_max_step_seconds_is_checked_in_both_directions():
     run = BenchRun(
         game='mle', game_kwargs=dict(dim=4, cond=2.0, noise=0.0, lr=1e-3),
         gpu_kwargs=dict(t_fixed=1.0, sps_max=100.0),
-        args_overrides={'grow_batch_size': True, 'ray_calibration.enabled': False,
+        args_overrides={'grow_batch_size': True,
                         'max_step_seconds': 10, 'fused_grad_accum_min_samples': 0,
                         'max_batch_size': 200000},
+        probe_enabled=False,
     )
     run.m.batch_size = 50000            # inherited, absurdly slow
     run.run(200, stop_on_divergence=False)
@@ -433,9 +441,10 @@ def test_the_gate_is_path_dependent_on_a_non_monotone_curve():
         run = BenchRun(
             game='mle', game_kwargs=dict(dim=4, cond=2.0, noise=0.0, lr=1e-3),
             gpu_kwargs=dict(kw, seed=0),
-            args_overrides={'grow_batch_size': True, 'ray_calibration.enabled': False,
+            args_overrides={'grow_batch_size': True,
                             'max_batch_size': 200000, 'max_step_seconds': 0,
                             'batch_size': start},
+            probe_enabled=False,
         ).run(6000, stop_on_divergence=False)
         pins[start] = run.m.batch_size
 
@@ -451,9 +460,10 @@ def test_the_gate_is_path_dependent_on_a_non_monotone_curve():
         run = BenchRun(
             game='mle', game_kwargs=dict(dim=4, cond=2.0, noise=0.0, lr=1e-3),
             gpu_kwargs=dict(smooth, seed=0),
-            args_overrides={'grow_batch_size': True, 'ray_calibration.enabled': False,
+            args_overrides={'grow_batch_size': True,
                             'max_batch_size': 200000, 'max_step_seconds': 0,
                             'batch_size': start},
+            probe_enabled=False,
         ).run(6000, stop_on_divergence=False)
         smooth_pins.add(run.m.batch_size)
     assert smooth_pins == {7410}, smooth_pins

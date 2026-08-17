@@ -23,8 +23,16 @@ active plan; after that, foundational change requires a demonstrated need.
   nothing. `test_batch_invariance.py` was doubly blind — its `check()` recorded
   failures without raising, so a failed invariance check would have reported as a
   pass. Both now fail on a mutation and keep their `__main__` drivers.
-- **Phase 3b Tier 0 shipped** — `analysis/`, 59 tests, State in
+- **Phase 3b Tiers 0, 1 and 2 shipped** — `analysis/` now carries `checks.py`
+  (R2 liveness, R14 dead sensors, §4 confounds, R11) and `compare.py`, tested
+  against fixtures captured from eight real runs. State in
   `docs/module_analysis.md`.
+- **Phase 4's benchmark specification shipped** — `docs/design/benchmarks.md`
+  plus the `benchmarks/` registry.
+- **Test suite tiered** — one test was 73% of a 19m37s run and was never meant to
+  run at that budget (the file's own driver used a quarter of it; pytest supplied
+  the default by collecting on name). Now `check_`-prefixed and uncollected; the
+  suite is 5m11s, with `pytest -m fast` as the dev loop.
 
 Measured over the 2,244-config corpus. With back-compat dropped, the first two
 rows are context rather than a work queue — nothing needs those configs to load:
@@ -58,10 +66,79 @@ which is what stops them recurring.
 - **1.1 mode safety — static half DONE.** `test_mode_safety.py`, 13 tests. Eleven
   keys the canonical config documents as inert are now checked to have no
   *derived* effect, so those comments are executable. Two mutations prove the
-  check can see a live key. The **runtime half is not built**: proving the
-  trainer never reads a key needs a run, which needs a smoke harness that does
-  not exist yet — and that same harness is what tier C of the acceptance
-  criterion needs. It is the next piece of work, not an afterthought.
+  check can see a live key. The **runtime half** needs a run, and the harness it
+  needs now exists (below); the per-key runtime proofs are not written yet.
+
+- **1.5 tier-C smoke harness — DONE.** `tierc_smoke.py` + 55 tests. Runs
+  `train.py` for a fixed number of steps on `latent_gaussian`, captures a
+  per-step trace of losses, learning rates, fused sub-losses and every logged
+  metric, and diffs two traces exactly. It reuses `benchmarks/registry.yaml`'s
+  `defaults.overrides` and the `epochs`-is-an-absolute-index arithmetic rather
+  than restating either, and then **verifies the executed step count** against
+  the budget, because a computed budget is a belief until something counts.
+
+      python -m tierc_smoke --null configs/mk_dev.yaml
+      python -m tierc_smoke --negative-control configs/mk_dev.yaml
+      python -m tierc_smoke /tmp/base.yaml configs/mk_dev.yaml
+
+  **The same-config spread on this target is exactly zero**, so §1's tier C is
+  an exact test here as predicted — 0 of 243 values at 30 steps across two
+  seeds, 0 of 14,313 at 600 steps. Two conditions are needed and both are
+  measured rather than chosen: `torch.use_deterministic_algorithms` (without it
+  7 of 243 differ, all grouped reductions at float32 rounding, and strict mode
+  raises nothing — torch simply does not select those kernels by default), and
+  excluding wall-clock keys, 21 of 522. The negative control resolves a **1e-6**
+  relative change to one loss coefficient.
+
+  Three things it found on the way, each of which would have made a passing
+  result meaningless:
+
+  - **The registry's `defaults.overrides` no longer loads.** It sets
+    `ray_calibration.enabled: false`, and both that key and its parent are now
+    retired and hard-fail at preflight. Applied verbatim the harness dies;
+    applied quietly the block is gone and nothing says so. The harness drops
+    them and reports each drop. **`benchmarks/registry.yaml` needs updating for
+    its own purposes** — `registry.py::_validate_defaults` still *requires* the
+    retired spelling, so this is a two-file change and is not done here.
+  - **`configs/problems.yaml` cannot run `latent_gaussian` as it stands.**
+    `prior_path` is null and `init_prior_dataset` `torch.load`s it
+    unconditionally; `analyze_kwargs` is empty, so the analytic target has no
+    centre or width. The harness fills both from `configs/gauss_aug12/spec.py`
+    and reports the gap rather than closing it silently.
+  - **The pre-consolidation config does not load under current code**, for two
+    reasons of different kind — five retired keys, which `config_state.migrate`
+    repairs mechanically, and `auto` LR rates with no stage sensor, which
+    migration correctly refuses because choosing a sensor is judgment. See the
+    tier-C result below for how that is resolved.
+
+- **Tier C, run.** `configs/mk_dev.yaml` at `7625d09` against the current file,
+  both under current code, 600 steps. **Steps 0–500 are bit-identical**,
+  including the phase-1→2 stage transition, which fires at step 381 in both.
+  From step 501 every loss differs.
+
+  The baseline was made loadable by pinning its four `auto` rates to
+  `adaptive_lr.seed_lr` — a translation, not a guess: with no sensor, `auto`
+  trains at the seed with `peak_scale` fixed at 1.0, which is exactly what an
+  explicit float does. That is stated on every run rather than applied quietly.
+
+  **The divergence is one feature, and it is the documented one** — the
+  `equilibration` stage's `lr_sensor: {kind: ray}`. Tier A/B over the same pair
+  reports 8 changed values and all 8 are that feature or follow from it; no loss
+  coefficient, batch, clip, schedule or buffer setting moved. So the
+  consolidation did not violate *schema may change freely, behavior may not*.
+
+  What the run adds is worth its own entry, and has one — **`findings.md`
+  F-039, fixed in F-040**. The sensor changes **no learning rate at all** (every LR bit-identical
+  across 600 steps, `cal_status: warmup`, `cal_applied: 0.0`), yet the run
+  diverges completely, because the probe *samples* eight replay draws before the
+  controller refuses the reading, and that shifts the RNG stream. `in_warmup()`
+  exists for exactly this and the plateau sensor uses it; the ray path does not.
+
+  **What tier C has NOT covered:** any sensor actually actuating.
+  `warmup_steps` is 1000 and `rearm_warmup` restarts it at every stage
+  transition, so the transition at 381 pushes the first permitted action to step
+  1381 — no sensor acts anywhere inside a 1200-step window. Covering actuation
+  needs a run past that, and is not the same measurement as the one above.
 
 - **1.4 `problems.yaml` — DONE.** `mode_presets.yaml` is retired. It had declared
   itself "Reference only — never loaded by train.py" and drifted exactly as an
@@ -92,12 +169,52 @@ them because they would have changed the canonical unconditional route.
 | `z_calibration.*` | recommendation refuted | **none** — the conditional `enabled: false` has no code counterpart, and the proposed sensor change would flip the canonical route's trigger |
 | `tb_z_source` family | recommendation refuted | **none** — the proposed hard gate would abort the canonical run at its first stage |
 
-**The `protocol.stages` restructure hazard, recorded before anyone attempts it.**
-Four validators read the literal dotted path `protocol.stages` and treat absence
-as "nothing to check" — including `config_invariants.auto_lr_requires_an_adaptive_sensor`,
-which `utils` makes a *raising* load gate. Moving the stage list under a
-`protocols:` map would therefore silently DISARM that gate rather than trip it.
-Any such restructure must move the validators in the same change.
+### 1.2's structural remainder
+
+Five keys sat parked as `# todo` in the canonical config. They are not a separate
+refactor — they are the unfinished half of §1's "activation derives from the
+problem block", and Phase 1 cannot be called done while they stand. **Four are
+now landed; one remains.**
+
+| Key | Status |
+|---|---|
+| `ray_calibration` merge/move | **DONE** — moved under `adaptive_lr`, `enabled` deleted (state 2) |
+| `conditional_worst_quantile` | **DONE** — re-homed beside the stages that consume it |
+| optimizer-block nesting | **NOT DONE** — sized below |
+| `mle_slope_*` → phase-1 exit | **NOT DONE** — needs a protocol schema change |
+| `protocol:` | **PARKED** by the user, pending the experiment synthesis |
+
+They are one change in kind, not five: every one is *move a key nearer the thing
+that consumes it*. And 1.2's own verdict stands for the hard one — **name a
+protocol per problem**, which is what `configs/problems.yaml` exists to hold.
+
+**THE CONSTRAINT, and why `CHANGED: 0` does not certify this class of change.**
+Four validators read literal dotted paths, and
+`config_invariants.auto_lr_requires_an_adaptive_sensor` returns `[]` on absence
+while `utils` makes it a *raising* load gate. A validator that goes quiet
+produces an **identical resolved config** — so the comparator, which compares
+what *this* config resolves to rather than what a future bad config would be
+allowed to do, cannot see the characteristic failure. Validators move in the same
+commit or the restructure does not happen.
+
+The procedure that does certify it, used for the two landed moves: write a
+negative control per validator, demonstrate it FAILS before the move,
+move keys and validator together, demonstrate the same control still fails. A
+control that passes at step two is not a control, it is a bug.
+
+**Why the optimizer-block nesting is not landed.** Sized at **64 attribute-read
+sites across 16 files** — `train.py`, `controller.py`, `utils.py`,
+`checkpointing.py`, `train_conformer.py`, nine `bench/` files — and several read
+through an object alias (`a = m.args; a.min_lr`), which a name-based sweep does
+not see. Worse, the silent-failure sites are real: `getattr(args, 'lr_flow',
+None)` and friends return `None` rather than raising. It is a single deliberate
+change with its own negative controls, not a rider on a comment pass.
+
+**Why `mle_slope_*` is not landed.** "Belongs in the phase-1 exit definition" is
+a schema change, not a move: `protocol.Stage.__init__` validates its spec against
+a closed key set, so the stage would have to accept the new keys and the exit
+machinery would have to read them from there. That is a protocol change with its
+own transition, and it should be made with `protocol:` rather than before it.
 
 **A live bug found and fixed on the way:** `lr_flow: auto` resolved to the
 literal string `'auto'`. It is deliberately absent from `_LR_KEYS` (alpha* is
@@ -183,20 +300,33 @@ main avoidable cost in this project.
 
 ## 3. Two corrections to the requested sequence
 
-**§8 gets re-measured before it gets resequenced.** A preprocessing pass has
-already run and measured **1.38x** end-to-end, on the reading that the UMA
-forward is >99% of the call. That is a prior, not a licence to skip A or D: it is
-one measurement, on one route, and the code has moved since.
+**§8 gets re-measured before it gets resequenced — and the standing prior just
+got weaker, which strengthens the case rather than weakening it.**
 
-So the only change to §8's order is that **measurement comes first** — Phase 5.0
+This section used to reason from a preprocessing pass measuring **1.38x**
+end-to-end against a forward that was ">99% of the call". The MLIP tab has since
+corrected both numbers: the end-to-end gain is **~1.08x**, and the UMA graph
+build, once broken out of the forward rather than lumped into it, is
+**2.6–6.1%** — small, but not the invisible remainder the old figure implied.
+
+Follow the argument through, because the conclusion inverts. At 1.38x the prior
+was "preprocessing has already been harvested, so look at the forward" — an
+argument for *skipping* A and D. At ~1.08x that reading collapses: a 1.08x
+end-to-end gain is close to the noise of the thing it was measured on, so it no
+longer licenses a claim about where the time is at all. **A weaker prior is not
+permission to guess in the other direction; it is a smaller budget of belief to
+spend before measuring.** Whatever headroom exists, we now know less about where
+it sits than the original number suggested we did.
+
+So §8's order changes only in that **measurement comes first** — Phase 5.0
 re-profiles the whole pathway, neighbour-list construction included and broken
-out explicitly, and the sequence after that follows what the split actually
-shows. The 1.38x figure is a hypothesis to re-test, not a conclusion to plan
-around. Where it does still bear is on expectations: if the forward really is
->99%, then `crystal_inference_settings` (activation checkpointing, precision),
-the `always_use_pbc` path and §8B's built-in execution modes are where the
-headroom lives, and `energy/mace_host_frac` exists precisely to say whether MACE
-splits the same way.
+out explicitly, and the sequence follows what the split actually shows. What
+survives as expectation is thin and should be held that way: if the forward does
+dominate, `crystal_inference_settings` (activation checkpointing, precision), the
+`always_use_pbc` path and §8B's built-in execution modes are where to look, and
+`energy/mace_host_frac` exists to say whether MACE splits the same way. The
+2.6–6.1% graph build is now a named, separable term rather than a rounding error,
+which is exactly the kind of thing a re-profile should size properly.
 
 **§2 conflicts with `docs/PROTOCOL.md` as written.** PROTOCOL declares four doc
 types and puts *Log* — "what happened when" — in git history only, never in a
@@ -398,21 +528,50 @@ any of:
 
 1. the actual statistic and window, if documentation or an admin can supply it;
 2. a proxy whose agreement with cluster-visible evidence is *shown* — job
-   cancellations against the logged trace, `sacct`/`scontrol` fields, sampled
-   `nvidia-smi` during a job — over enough jobs to mean something;
+   cancellations against the logged trace, and `sacct`/`scontrol` fields — over
+   enough jobs to mean something;
 3. failing both, the most conservative available reading plus a stated margin,
    with the margin's cost in throughput measured so the price of the ignorance is
    known rather than hidden.
+
+**`nvidia-smi` carries none of case (2)'s weight, and it was wrong to list it
+there.** It is an independent *sampler* but not an independent *instrument*:
+`torch.cuda.utilization()` wraps `nvmlDeviceGetUtilizationRates().gpu` and
+`nvidia-smi --query-gpu=utilization.gpu` reports **the same NVML counter**. So it
+can control for cadence, phase and eval blindness — genuinely useful — but it
+cannot corroborate anything about that counter's own semantics, because it *is*
+that counter. Only cluster-visible outcomes are outside the instrument. See
+`docs/design/phase6_measurement_request.md`.
+
+**The error has a DIRECTION, and that is what makes "conservative" definable.**
+The in-process sampler sits in the training portion of the loop body, so eval,
+figure logging and archiving — later in the same iteration — contribute no
+samples. A 300 s eval contributes zero. The run's *least occupied* minutes are
+therefore omitted from the series while the scheduler counts them, so
+**`gpu/util_policy` overstates what the scheduler sees.**
+
+That asymmetry is not decoration; it decides which way to err. A proxy that
+reads low costs throughput. A proxy that reads high gets the job **killed while
+the dashboard looks clean** — the failure with no warning attached. Conservative
+here means *biased toward the cheap failure*, and case (3)'s margin is sized
+against this direction, not around it.
 
 `gpu/util_policy` (already logged, 7200 s window) is the standing candidate for
 (2) and (3). Whichever holds, **write down which case applies** — a proxy adopted
 under case 3 and later remembered as case 1 is how a margin quietly becomes a
 law. Phase 6 proceeds on the proxy either way.
 
-The subsidiary question is measurable regardless of how the first one resolves:
-how do `gpu/util_policy`, `gpu/util_recent`, and nvidia-smi sampling relate to
-each other? They are not assumed interchangeable, and their disagreement is
-itself the input to choosing the conservative proxy.
+The subsidiary question is measurable regardless of how the first resolves, but
+it answers something narrower than it looks: `gpu/util_policy`, `gpu/util_recent`
+and external `nvidia-smi` all read one counter, so a disagreement between them
+isolates a **sampling or windowing artifact** — cadence, window length, phase,
+eval blindness — and never a discrepancy between two measurements of the world.
+That is still worth having: those artifacts are exactly the terms the direction
+argument above turns on.
+
+**The benchmark specification is `docs/design/benchmarks.md`**, with the machine
+-readable workload registry under `benchmarks/`. That document is the authority
+on what a named benchmark means; this section is only its place in the sequence.
 
 **Acceptance.** A small named set of canonical workloads, rerunnable by name,
 with current baseline numbers recorded as graded findings; plus a named
@@ -439,8 +598,10 @@ against that floor.
 > number. Not yet measured: production width with compile actually on, batch
 > 1000+, or a crystal route with a live MLIP.
 
-**5.0 Re-profile the whole pathway first.** Not a formality and not gated on the
-existing 1.38x reading. Break the energy call into preprocessing, neighbour-list
+**5.0 Re-profile the whole pathway first.** Not a formality, and now with less
+prior to lean on than when this was written — the end-to-end figure fell from
+1.38x to ~1.08x and the graph build turned out to be a separable 2.6–6.1% rather
+than part of the forward. Break the energy call into preprocessing, neighbour-list
 construction, forward, and host↔device transfer, separately for MACE
 (representative acridine structures) and UMA (broader crystals). Until that split
 is current, every later step in this phase is guesswork.

@@ -116,8 +116,19 @@ rather than through the state.
 Every block names its run and states `route`, `stage`, `window` and `last_step`.
 Without those a battery renders one indistinguishable block per arm, and a reader
 cannot audit a withheld metric without knowing which route's rules were applied.
-Runs are labelled `name#run_id`: nine display names are shared by two or more
-runs in the local corpus, `mk_dev` alone by eleven.
+**Runs are named by something that means something.** `reading_runs.md` §7:
+refer to a run by NAME, TAG, or A DISTINGUISHING CONFIG FEATURE — never by
+wandb id, which is a hash that carries nothing and makes the reader look every
+arm up. Display names collide, though — nine are shared by two or more runs in
+the local corpus, `mk_dev` alone by eleven, and two arms of a real cluster
+battery are both `prod0810_mipcas_elj` — so `battery_labels` breaks a tie with
+**the config knob that actually differs**: `prod0810_mipcas_elj[alpha_target=6]`
+against `[alpha_target=4]`. That is the thing the reader wanted anyway, which is
+why §7 lists it as an alternative to the name rather than as a fallback.
+Candidates are ranked on how readable the VALUE is, not the key: wandb stores
+each config section a second time as a repr string, and those keys are the
+shortest while their values are the longest. The id appears only when nothing
+else separates two arms, where it is the honest answer.
 
 ### R2 — confirm the thing ever fired
 
@@ -260,6 +271,16 @@ reads a missing config as `<missing>` and therefore agrees with itself. Two
 unparseable configs produced a clean bill, a "no knob differs" sweep, and a full
 aligned table putting their numbers in the same rows.
 
+**`span='matched'`** reads every arm over the steps they all cover, ending at the
+earliest last step. A trailing window is measured from each arm's *own* last
+step, so arms that stopped at different points are read at different training
+ages — and every topline metric improves with age. `check_confounds` flags that
+(`battery/training_age`); this is the half that makes the comparison answerable.
+On two real cluster arms it reversed the result: at their own trailing windows
+one led on every topline metric, over the shared span the other led on every one.
+The confounds deliberately run on the UNTRIMMED runs, since an arm's stopping
+point is a fact about the run and trimming first would hide it.
+
 **Arms on different routes do not share a topline**, so the feature table splits
 into per-route blocks rather than forcing a union. ABSENT and NA_ROUTE render
 distinctly and never as blank or zero.
@@ -284,7 +305,7 @@ an error.
 | `bwd/under_coverage_wcen` is not logged; the run has `bwd/under_coverage` | a topline entry silently missing |
 | `log_Z_learned` is namespaced three ways | resolving it at all would be a guess between different quantities |
 | `loss_coeffs/*` is emitted **only when a stage transition moves it** | the most direct evidence of which loss terms are live is a sub-3-point series the parser drops |
-| the git commit lives in the `_wandb` config blob under a per-machine hash key | §4's first confound cannot be checked |
+| the git commit lives in the `_wandb` config blob under a per-machine hash key, and **the cloud API strips that key from `run.config`** — cluster runs carry it on the run object instead (`run.commit` / `run.metadata`), which is why `Run` has a `metadata` field | §4's first confound goes dark on exactly the runs a battery is made of: three real cluster arms all reported "no commit stamp" while all three had one, and were on three DIFFERENT commits |
 | `gates/mle_flat` is published to the protocol and never logged as a metric | its exit streak is its only observable trace |
 | `pull` raises only on empty **history**, so a run can arrive fully parsed with `config == {}` | every cross-arm comparison reads `<missing>` on one side and flags confidently |
 
@@ -339,7 +360,7 @@ latency; a corrupt entry is a miss, never an error.
 
 ## Tests
 
-`analysis/tests/`, network-free and `wandb/`-free.
+`analysis/tests/`, network-free and `wandb/`-free. 354 tests.
 
 The fixtures are eight **real captured runs** (`tests/fixtures/`, built by
 `_capture.py`, which records why each one is there), not mocks. They span all

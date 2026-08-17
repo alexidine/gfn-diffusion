@@ -66,8 +66,25 @@ class Arm:
 
     def args_overrides(self):
         """Config the run should be built with. Sensors off unless asked for."""
-        return {'lr_servo_managed': ('lr_policy', 'lr_fused'),
-                'ray_calibration.enabled': False}
+        return {'lr_servo_managed': ('lr_policy', 'lr_fused')}
+
+    def lr_sensor(self):
+        """
+        What this arm's STAGE declares, i.e. `lr_sensor` in the config.
+
+        THIS IS THE RAY PROBE'S SWITCH, and the only one. `ray_calibration.
+        enabled` is retired in both spellings (utils._RETIRED_KEYS): production
+        derives the flag from the stages that ask (train.py:1871), so an arm that
+        wants the probe has to ask here -- `runner.Run` reads it and there is no
+        second flag that can disagree.
+
+        None for every other arm, and that is not a shortcut. `hyper`, `plateau`
+        and the bench-only laws are actuated BY THE ARM, per step, rather than by
+        train.py's per-stage dispatch; declaring a kind here would claim a
+        production wiring these cells do not exercise. Only `ray` is gated on the
+        declaration, so only `ray` makes it.
+        """
+        return None
 
     def reset(self, run):
         pass
@@ -131,8 +148,7 @@ class Fixed(Arm):
     def args_overrides(self):
         return {'lr_policy': self.lr, 'lr_fused': self.lr,
                 'lr_servo_managed': (),      # nothing manages it
-                'lr_warmup_ratio': 1,        # and no warmup envelope
-                'ray_calibration.enabled': False}
+                'lr_warmup_ratio': 1}        # and no warmup envelope
 
 
 class Null(Arm):
@@ -144,8 +160,7 @@ class Null(Arm):
 
     def args_overrides(self):
         return {'lr_policy': self.lr, 'lr_fused': self.lr,
-                'lr_servo_managed': ('lr_policy', 'lr_fused'),
-                'ray_calibration.enabled': False}
+                'lr_servo_managed': ('lr_policy', 'lr_fused')}
 
 
 class Hyper(Arm):
@@ -169,8 +184,7 @@ class Hyper(Arm):
 
     def args_overrides(self):
         return {'lr_policy': self.lr, 'lr_fused': self.lr,
-                'lr_servo_managed': ('lr_policy', 'lr_fused'),
-                'ray_calibration.enabled': False}
+                'lr_servo_managed': ('lr_policy', 'lr_fused')}
 
     def reset(self, run):
         self._prev = None
@@ -351,8 +365,7 @@ class HyperSNR(Arm):
 
     def args_overrides(self):
         return {'lr_policy': self.lr, 'lr_fused': self.lr,
-                'lr_servo_managed': ('lr_policy', 'lr_fused'),
-                'ray_calibration.enabled': False}
+                'lr_servo_managed': ('lr_policy', 'lr_fused')}
 
     def reset(self, run):
         self.snr_log = []
@@ -412,8 +425,13 @@ class RayRay(Arm):
     def args_overrides(self):
         return {'lr_policy': self.lr, 'lr_fused': self.lr,
                 'lr_servo_managed': ('lr_policy', 'lr_fused'),
-                'ray_calibration.enabled': True,
-                'ray_calibration.period': self.period}
+                'adaptive_lr.ray_calibration.period': self.period}
+
+    def lr_sensor(self):
+        """THE ARM'S SWITCH. `ray_calibration.enabled: True` used to sit in
+        args_overrides above; the flag is retired and the declaration replaces
+        it, so this arm turns the probe on exactly the way a stage does."""
+        return {'kind': 'ray'}
 
     def reset(self, run):
         # Counted so a probe that never resolves cannot masquerade as a
@@ -471,8 +489,7 @@ class RampPlateau(Arm):
 
     def args_overrides(self):
         return {'lr_policy': self.lr, 'lr_fused': self.lr,
-                'lr_servo_managed': ('lr_policy', 'lr_fused'),
-                'ray_calibration.enabled': False}
+                'lr_servo_managed': ('lr_policy', 'lr_fused')}
 
     def reset(self, run):
         self._ema = None

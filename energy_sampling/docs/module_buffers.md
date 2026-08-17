@@ -275,15 +275,20 @@ Headroom is zero at full admission efficiency. It probably does not bind, becaus
 than the hazard starts shaping eviction at the margin. Raise to ~2× equilibrium
 or state that the guard is meant to be tight.
 
-### B4 — retired-key guards fire hours into a run
+### B4 — retired-key guards fired hours into a run — **RESOLVED**
 
-The `ValueError` on `max_residence_steps` ([train.py:4483](../train.py:4483)) is
-correct but lives in the manage path, which first runs at the phase-1 → 2
-transition. **There is no load-time config preflight.** The aug02 battery lost
-all 16 arms' entire phase 1 (1.1–7.8 h each) to exactly this. B10's
-`toxic_min_draws`/`toxic_delta_threshold` retirement guard
-([train.py:4490](../train.py:4490)) is a second instance of the same pattern —
-same call site, same failure mode, nothing new to fix.
+Both retirement guards used to live in the manage path, which first runs at a
+stage transition, so a stale config was rejected hours in. The aug02 battery
+lost all 16 arms' entire phase 1 (1.1–7.8 h each) to exactly this.
+
+`max_residence_steps`, `toxic_min_draws` and `toxic_delta_threshold` are now in
+`utils._RETIRED_KEYS`, so `preflight_config` rejects them at LOAD, and the
+runtime guards are deleted rather than kept alongside. The gate is also stricter
+than the guards were: it fires on key PRESENCE, where the old code tested
+truthiness, so `toxic_min_draws: 0` no longer slips through.
+
+Recorded as project state 3 (`config_state.CHANGES`), which also gives the
+affected configs a repair path they never had — see B10.
 
 ### B5 — `min_size` does two unrelated jobs
 
@@ -325,14 +330,26 @@ fed) are all gone. Eviction is unconditionally hazard + backstop (§3);
 `replay_buffer_backstop_frac`, `replay_buffer_hazard_frac`, and the
 `expired_*` hazard-cohort metrics still exist and are unaffected.
 
-Setting `buffers.replay_buffer.toxic_min_draws` or `toxic_delta_threshold` in
-a config now raises `ValueError` at the same guard site as the pre-existing
-`max_residence_steps` retirement ([train.py:4490](../train.py:4490)) — the
-same B4 precedent applies: over a hundred old configs still set
-`max_residence_steps` and were never patched, because they are closed-out
-historical battery runs and this protocol treats git as their log, not the
-configs. Old configs that set `toxic_min_draws`/`toxic_delta_threshold` will
-fail to load the same way, for the same reason. Not a bug to fix.
+Setting `buffers.replay_buffer.toxic_min_draws` or `toxic_delta_threshold` in a
+config is refused at LOAD by `utils._RETIRED_KEYS`, alongside the
+`max_residence_steps` retirement (B4). 103 tracked configs still set
+`toxic_min_draws` and 106 set `max_residence_steps`; they were never patched,
+because they are closed-out historical battery runs and this protocol treats git
+as their log, not the configs.
+
+They are no longer a dead end, though. Project state 3 carries a migration:
+`toxic_min_draws`/`toxic_delta_threshold` are dropped mechanically, since the
+purge they fed is gone and dropping them changes nothing.
+
+`max_residence_steps` is deliberately **not** dropped — it is `manual`, so
+`migrate` reports it and refuses `--write` until a human resolves it. It was
+REPLACED by `mean_residence_steps`, and the overlap between the two across
+tracked configs is **zero**: dropping it would leave the buffer with no residence
+setting, `tau` reads 0, and the `if tau > 0` branch that arms both the hazard and
+the backstop never runs — a config that loads clean, trains, and still reports a
+healthy `replay_buffer_age_cv` ≈ 1, because the surviving displacement purge is
+itself memoryless. A hard cap and the mean of an exponential are not the same
+number, so the value cannot carry across mechanically.
 
 Two reasons `floor`/`stalled` had to go, both recorded at the call site
 (`manage_replay_buffer`'s docstring) and already covered in §3: under a

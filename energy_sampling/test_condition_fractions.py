@@ -233,6 +233,7 @@ class _StubModeller:
     log_condition_fraction = Modeller.log_condition_fraction
     _reasonable_sample_mask = Modeller._reasonable_sample_mask
     _log_setting = Modeller._log_setting
+    _merge_metrics = Modeller._merge_metrics
 
     def __init__(self, floor=None, data_ndim=2):
         self._floor = floor
@@ -377,7 +378,14 @@ def test_log_test_metrics_publishes_the_heldout_family():
         return {'condition_id': cid}, batch
 
     m.fwd_eval_sampling = _fake_sampling
-    m._eval_conditional_stats = lambda stats: {'tb_err_worst': 1.0, 'cond_tb_err': 0.5}
+    m.args.fwd_loss_coeffs = SimpleNamespace(beta=None)
+    seen_streams = []
+
+    def _fake_stats(stats, coeffs):
+        seen_streams.append(stats)
+        return {'tb_err_worst': 1.0, 'cond_tb_err': 0.5}
+
+    m._eval_conditional_stats = _fake_stats
 
     metrics = m.log_test_metrics(None, {'condition_id': torch.zeros(6, dtype=torch.long)})
 
@@ -385,9 +393,25 @@ def test_log_test_metrics_publishes_the_heldout_family():
     assert seen_kwargs['side_effects'] is False, "held-out pass gained side effects"
     assert seen_kwargs['dataset'] is m.test_mol_dataset and seen_kwargs['n'] == 6
 
-    # DID IT RUN -- and the pre-existing eval_test/eval_fwd block survived
+    # NAMESPACE SEPARATION. This method scores the HELD-OUT stream and publishes
+    # only 'eval_test/'. It used to also recompute the train-condition stats at a
+    # different worst_quantile and republish four 'eval_fwd/' keys, which
+    # log_metrics had already written -- the collision _merge_metrics now
+    # forbids. Two assertions, because they fail for different reasons: the
+    # duplicate PASS over the train batch is gone, and no key leaks.
+    assert not [k for k in metrics if k.startswith('eval_fwd/')], \
+        [k for k in metrics if k.startswith('eval_fwd/')]
+    # the ONE unprefixed key is the shared bar, and it is shared on purpose:
+    # _log_setting's cache makes the second stream to reach it a no-op, so it
+    # is one series rather than a duplicate channel (log_condition_fraction).
+    leaked = [k for k in metrics
+              if not k.startswith('eval_test/') and not k.endswith(' Bar')]
+    assert not leaked, f"log_test_metrics wrote outside 'eval_test/': {leaked}"
+    assert len(seen_streams) == 1, \
+        f"train-condition stats recomputed here ({len(seen_streams)} passes, want 1)"
+
+    # DID IT RUN
     assert metrics['eval_test/tb_err_worst'] == 1.0
-    assert metrics['eval_fwd/tb_err_worst'] == 1.0
     for k in ('eval_test/Reasonable Sample Fraction', 'eval_test/Cond Reasonable Failing Frac',
               'eval_test/Cond Reasonable Worst', 'eval_test/Cond Reasonable Spread',
               'eval_test/Cond Reasonable Frac', 'eval_test/Cond Reasonable N'):
@@ -403,6 +427,43 @@ def test_log_test_metrics_publishes_the_heldout_family():
     assert metrics['eval_test/Cond Reasonable N'] == 3
     print("PASS held-out family published from log_test_metrics "
           f"(pooled 0.5, conditions failing {metrics['eval_test/Cond Reasonable Failing Frac']:.3f})")
+
+
+def test_merge_metrics_refuses_a_silent_overwrite():
+    """MUT-4: re-introduce the bug this guard exists for and require a FAILURE.
+
+    The defect was two writers publishing eval_fwd/tb_err_worst at different
+    worst_quantile values, resolved by dict-update order. Nothing about it was
+    detectable from the logs -- both numbers were plausible. So the test is not
+    'the helper merges dicts', it is 'the helper REFUSES the merge that shipped'.
+    """
+    m = _StubModeller()
+    metrics = {}
+
+    # the ordinary case still merges, and returns the accumulator
+    out = m._merge_metrics(metrics, {'eval_fwd/tb_err_worst': 3.0}, 'log_metrics')
+    assert out is metrics and metrics['eval_fwd/tb_err_worst'] == 3.0
+
+    # disjoint namespaces are exactly what the fix produces, and must pass
+    m._merge_metrics(metrics, {'eval_test/tb_err_worst': 2.5}, 'log_test_metrics')
+    assert metrics['eval_test/tb_err_worst'] == 2.5
+
+    # THE MUTATION: log_test_metrics republishing the train-condition key at its
+    # own quantile, exactly as it did before the fix.
+    try:
+        m._merge_metrics(metrics, {'eval_fwd/tb_err_worst': 2.9}, 'log_test_metrics')
+    except AssertionError as e:
+        msg = str(e)
+    else:
+        raise AssertionError("MUT-4 FAILED TO FIRE: the silent overwrite was accepted")
+
+    # the message has to name the key AND both values -- 'which one won' is the
+    # question a reader hitting this will be asking
+    for want in ('eval_fwd/tb_err_worst', 'log_test_metrics', '3.0', '2.9'):
+        assert want in msg, f"collision message omits {want!r}: {msg}"
+    # and it must not have half-applied the update before refusing
+    assert metrics['eval_fwd/tb_err_worst'] == 3.0, "collision mutated the dict anyway"
+    print("PASS MUT-4 duplicate-key merge refused, dict left intact")
 
 
 def test_reasonable_wiring_through_log_thermo_properties():
@@ -524,6 +585,7 @@ if __name__ == '__main__':
     test_prefix_namespaces_series_but_not_the_bar()
     test_reasonable_mask_is_the_documented_window()
     test_log_test_metrics_publishes_the_heldout_family()
+    test_merge_metrics_refuses_a_silent_overwrite()
     test_reasonable_wiring_through_log_thermo_properties()
     test_nonthermal_wiring_subsets_by_referenced_rows()
     test_nonthermal_family_absent_without_records()

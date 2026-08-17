@@ -72,16 +72,18 @@ class Surface:
             'min_lr': 1e-12,                 # the floor must not truncate the sweep
             **self.extra_args,
         }
+        # `ray_calibration.enabled` used to be set in both branches; the flag is
+        # retired (production derives it from the stages declaring lr_sensor kind
+        # 'ray'), so the probe now follows `servo` through BenchRun's
+        # probe_enabled argument in make() below -- the same decision, made once.
         if servo:
             args.update({'adaptive_lr.warmup_steps': 50,
-                         'ray_calibration.period': 50,
-                         'ray_calibration.enabled': True})
+                         'adaptive_lr.ray_calibration.period': 50})
         else:
             # the shipping control arm: reads and logs, actuates nothing, and the
             # envelope is identically 1.0 so the rate really is fixed
             args.update({'lr_servo_managed': (),
-                         'lr_warmup_ratio': 1,
-                         'ray_calibration.enabled': False})
+                         'lr_warmup_ratio': 1})
         return args
 
     def make(self, lr, seed=0, servo=False, sensor=None,
@@ -94,7 +96,7 @@ class Surface:
             game_kwargs=dict(self.game_kwargs, lr=lr, seed=seed),
             probe_batch=self.probe_batch,
             args_overrides=self._args(lr, train_key, servo, seed),
-            standard=standard,
+            standard=standard, probe_enabled=bool(servo),
             **({'sensor': 'none'} if not servo else
                {'sensor': sensor} if sensor else
                {'climber': climber, 'braker': braker}))

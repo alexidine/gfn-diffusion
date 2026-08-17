@@ -181,6 +181,55 @@ class LRController:
 
     # ------------------------------------------------------------- calibration
 
+    def calibration_refusal(self) -> str | None:
+        """Why a ray calibration's reading would be thrown away, decided WITHOUT
+        measuring anything -- or None if it would be acted on.
+
+        THE POINT OF A SEPARATE PREDICATE. The probe cannot be allowed to draw
+        first and find out afterwards. `RayCalibration.measure` draws `n_sub`
+        sub-batches from the replay buffer, and those draws consume RNG that
+        nothing restores -- so a calibration whose reading is discarded still
+        shifts every subsequent training step (findings.md F-039). Anything
+        knowable in advance has to be knowable HERE, before a draw happens.
+
+        `on_calibration` consults this too, so the two cannot drift: the gate
+        that skips the probe and the gate that refuses the reading are the same
+        function, not two copies of one rule.
+
+        DECIDABLE IN ADVANCE (returned by this function):
+
+          warmup   the envelope is deliberately below 1, so the step just taken
+                   is a scheduled fraction of the operating step and alpha* rates
+                   THAT. peak_scale is the multiplier on the un-suppressed rate,
+                   so acting would inflate it by exactly the warmup factor and
+                   hand that back the moment the envelope releases -- a jump of
+                   lr_warmup_ratio, all at once.
+
+        DECIDABLE IN ADVANCE, AND DELIBERATELY NOT REFUSED:
+
+          an empty `lr_servo_managed` means peak_scale reaches no learning rate,
+          but `_managed_keys` calls that "its own control arm" -- the controller
+          reads and logs while actuating nothing, and there the reading IS the
+          deliverable. "No LR moved" is not the same as "the reading was thrown
+          away", and conflating them would delete a documented operating mode.
+
+        NOT DECIDABLE IN ADVANCE, and named here so the gap is explicit rather
+        than papered over. Each of these IS the measurement, so no predicate can
+        anticipate it and the draws are genuinely spent to find out:
+
+          unresolved       no paired test cleared its CI
+          inconsistent     the tests contradict (lo >= hi)
+          bad alpha_star   non-finite or non-positive
+          no_batch /       the draw itself failed or returned too few
+          too_few_subbatches
+          clamped          peak_scale already at a `bounds`/ceiling edge, so the
+                           multiplier is a no-op -- depends on alpha_star
+        """
+        st = self._state()
+        if self._elapsed(st) < int(self._cfg('warmup_steps', 1000)):
+            return 'warmup'
+        return None
+
     def on_calibration(self, reading):
         """
         Apply one periodic ray calibration. `reading` is ray_calibration's dict.
@@ -195,15 +244,12 @@ class LRController:
         alpha = reading.get('alpha_star', float('nan'))
         self._calibrations += 1
         self._last = {'status': status, 'alpha_star': alpha, 'applied': 0.0}
-        # HOLD THROUGH WARMUP. The envelope is deliberately below 1 here, so the
-        # step just measured is a scheduled fraction of the operating step and
-        # alpha* rates THAT. peak_scale is defined as the multiplier on the
-        # un-suppressed rate, so acting on this reading would inflate it by
-        # exactly the warmup factor and hand that back as a real LR the moment
-        # the envelope releases -- a jump of lr_warmup_ratio, all at once. The
-        # sensor cannot anticipate a suppression it is measuring through.
-        if self._elapsed(st) < int(self._cfg('warmup_steps', 1000)):
-            self._last['status'] = 'warmup'
+        # Kept as the authoritative refusal even though the probe path now checks
+        # it BEFORE drawing: this is the rule, and `calibration_refusal` is the
+        # same function, so a caller that reaches here anyway still gets it.
+        refusal = self.calibration_refusal()
+        if refusal is not None:
+            self._last['status'] = refusal
             return
         if status not in ('bracketed', 'above_range', 'below_range'):
             return

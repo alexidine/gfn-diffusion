@@ -126,7 +126,7 @@ def test_dropping_an_lr_sensor_block_is_caught(tmp_path, raw, base_snap):
     """The silent case: omitting the block means 'no sensor', with no error. A
     consolidation that lost one must not pass clean."""
     new = copy.deepcopy(raw)
-    new['protocol']['stages'][1]['lr_sensor'] = {'kind': 'hyper', 'beta': 0.05}
+    new['protocols']['unconditional_tb']['stages'][1]['lr_sensor'] = {'kind': 'hyper', 'beta': 0.05}
     withsensor = snap_of(tmp_path, 'sensor.yaml', new)
 
     gained = cs.compare(base_snap, withsensor)
@@ -143,7 +143,7 @@ def test_changing_the_sensor_kind_is_caught(tmp_path, raw, base_snap):
     """ray vs hyper vs plateau are different controllers, not variants of one."""
     def with_kind(node, name):
         new = copy.deepcopy(raw)
-        new['protocol']['stages'][1]['lr_sensor'] = node
+        new['protocols']['unconditional_tb']['stages'][1]['lr_sensor'] = node
         return snap_of(tmp_path, name, new)
 
     ray = with_kind({'kind': 'ray'}, 'ray.yaml')
@@ -230,7 +230,7 @@ def test_an_unloadable_reference_is_reported_not_raised(tmp_path, raw, base_snap
     die in exactly the case it exists for. Here: strip the lr_sensors, which makes
     `auto` learning rates unowned and the config unloadable."""
     stale = copy.deepcopy(raw)
-    for st in stale['protocol']['stages']:
+    for st in stale['protocols']['unconditional_tb']['stages']:
         st.pop('lr_sensor', None)
     old = snap_of(tmp_path, 'stale_ref.yaml', stale)
 
@@ -245,7 +245,7 @@ def test_an_unloadable_reference_is_reported_not_raised(tmp_path, raw, base_snap
 
 def test_an_unloadable_candidate_is_reported_separately(tmp_path, raw, base_snap):
     stale = copy.deepcopy(raw)
-    for st in stale['protocol']['stages']:
+    for st in stale['protocols']['unconditional_tb']['stages']:
         st.pop('lr_sensor', None)
     c = cs.compare(base_snap, snap_of(tmp_path, 'stale_cand.yaml', stale))
     assert c.candidate_error and not c.reference_error
@@ -313,11 +313,11 @@ def test_a_changed_stage_override_is_caught_twice(tmp_path, raw, base_snap):
     matter: the raw hit localises the edit, the effective hit proves it reaches
     the trainer."""
     new = copy.deepcopy(raw)
-    new['protocol']['stages'][1]['loss_coeffs']['bwd']['beta'] = 40
+    new['protocols']['unconditional_tb']['stages'][1]['loss_coeffs']['bwd']['beta'] = 40
     c = cs.compare(base_snap, snap_of(tmp_path, 'override.yaml', new))
     assert not c.behaviour_preserved
     paths = [p for p, _, _ in c.changed]
-    assert any('protocol.stages[1].loss_coeffs.bwd.beta' in p for p in paths)
+    assert any('stages[1].loss_coeffs.bwd.beta' in p for p in paths)
     assert any('effective_loss_coeffs.bwd.beta' in p for p in paths)
 
 

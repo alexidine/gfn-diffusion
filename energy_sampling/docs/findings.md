@@ -7,6 +7,431 @@ Newest first.
 
 ---
 
+## F-040 · F-039 fixed: the probe now decides before it draws, and the tier-C divergence goes to zero · `MECHANISM`
+
+*2026-08-16. Fixes F-039 (below), verified with the harness that found it.*
+
+> **THIS CHANGES THE NUMBERS FOR EVERY RAY-ARMED CONFIG, AND THAT IS THE POINT.**
+> Any run whose protocol declares `lr_sensor: {kind: ray}` on a stage now takes
+> a different trajectory from the same seed than it did before this commit,
+> because the probe no longer consumes RNG inside warmup. Consequences, plainly:
+>
+> - **Any comparison that spans this fix is confounded.** An arm launched before
+>   it and an arm launched after it differ by more than whatever was under test.
+>   Re-run the baseline arm rather than reusing a stored one.
+> - **Any run in flight right now is on the OLD behaviour.** Do not read a
+>   resumed run as continuous across a restart that crosses this change.
+> - **Checkpoints are unaffected** — no state layout changed — but a resume
+>   after the fix will not reproduce the pre-fix continuation.
+>
+> No `project_state_version` bump: no config key changed meaning. A config
+> written before this reads exactly as it did.
+
+**Scope:** as F-039 — `latent_gaussian` sg 1 Z'=1, T=10, batch 1000,
+`unconditional_tb`, 600 steps, seed 12345, RTX 5080, `--deterministic strict`.
+
+**The fix is a predicate, not an early return.** `LRController
+.calibration_refusal()` answers "would this reading be thrown away regardless of
+what it measures", from state alone. `_ray_probe_armed` consults it BEFORE
+arming; `on_calibration` consults the same function, so the gate that skips the
+probe and the gate that refuses the reading cannot drift apart.
+`RayCalibration.refuse` then consumes the period exactly as a completed
+calibration does — without that, the latch would stay pending through warmup and
+the first probe would fire on the first step after it instead of the next period
+boundary, which would have moved the applied path.
+
+**Every refusal path, classified.** This is the part that matters, because
+"warmup" is only the one this run happened to hit:
+
+| path | decidable before drawing? | gated |
+|---|---|---|
+| warmup envelope still ramping | yes | **yes** |
+| `lr_servo_managed` empty | yes | **no, deliberately** |
+| `unresolved` (no test cleared its CI) | no — it IS the measurement | — |
+| `inconsistent` (lo ≥ hi) | no — same | — |
+| `alpha_star` non-finite or ≤ 0 | no — same | — |
+| `no_batch` / `too_few_subbatches` | no — the draw is what fails | — |
+| clamped at a `bounds`/ceiling edge | no — depends on `alpha_star` | — |
+
+The second row is the one worth arguing. An empty `lr_servo_managed` means
+`peak_scale` reaches no learning rate, which looks like a guaranteed discard —
+but `_managed_keys` calls that state *"its own control arm"*: the controller
+reads and logs while actuating nothing, and there the reading IS the
+deliverable. **"No LR moved" is not "the reading was thrown away."** Gating it
+would delete a documented operating mode.
+
+**Verified on the comparison that exposed it** — `configs/mk_dev.yaml` at
+`7625d09` vs current, 600 steps, same seed:
+
+| | before the fix | after |
+|---|---:|---:|
+| step records differing (600 × loss, LR, fused sub-losses) | 2562 | **0** |
+| first divergent step | **501** | none |
+| shared logged metrics differing | 1111 | **3** |
+| reference-only keys | 0 | 0 |
+
+**And re-introducing the bug fails it again.** With the gate deleted from
+`train.py` and everything else held fixed, the same comparison returns to 2562
+differing step records with the first divergence at **step 501** — the original
+number, to the step. A test that cannot fail is not evidence, and this one can.
+
+**The 3 residual differences are NOT reclassified away.** All three are
+`probe/device_alloc_delta` — the delta of `torch.cuda.memory_stats()
+['num_device_alloc']`, i.e. a count of `cudaMalloc` calls — at steps 390, 400
+and 430. Step 430 coincides exactly with a `fused_grad/*` report, a
+`grad_geometry` diagnostic the pre-consolidation config does not declare at all;
+390 and 400 sit just past the stage transition, where the candidate's allocator
+holds tensors the baseline never allocates (the hypergradient's cached
+displacement). They are resource counters, not numerics, and every number the
+model trains on is bit-identical. They are left in the comparison rather than
+added to the wall-clock exclusion list, because that list is calibrated by the
+NULL test and the null never flagged them — excluding a key at the moment it is
+the last thing between a result and "identical" is how a comparison stops
+meaning anything.
+
+**Audit of the same shape elsewhere — reported, not chased.**
+
+*Residual instances, inherently post-hoc:* `measure`'s partial draws (a `None`
+draw after ≥1 success discards what was already drawn — cannot be pre-decided);
+`arm`'s clone followed by `deferred_no_step` (cost only, no RNG, and the module
+documents the trade).
+
+*Checked and clean, so nobody re-checks them:* **`hyper`** reads `p.grad` and a
+stored displacement and computes one dot product — no draws, no RNG, and its
+warmup discard is free. **`plateau`** calls `in_warmup()` first and reads only
+`metric_tracker` EMAs. `grad_geometry` is cadence-gated before any work and
+reuses the fused step's graph. `z_calibration_tick` is decide-then-act, returning
+on `excess <= 0` before touching RNG. `_per_step_probe` and
+`_verify_dead_latent_rows` are opt-in and deterministic. The fused force-refresh
+does sample a branch whose gradient is discarded, but its rolling stats are the
+deliverable — adjacent, not an instance.
+
+*A broader shape, worth its own work:* three diagnostics consume the GLOBAL RNG,
+so their mere presence shifts training — `log_dist_stats` (`train.py:4504,4506`,
+two `randperm` for the anchor split, in a function that seeds its
+`sliced_wasserstein` projections explicitly and these not),
+`eval/evaluations.py:299` (a funnel-figure subsample), and the held-out
+`eval_test` rollout (`train.py:4268`, `side_effects=False`, feeding no gate,
+controller or loss). **Consequence: two runs differing only in `eval_period`,
+`figs_period`, or whether held-out eval is configured are not step-for-step
+comparable.** That is why `tierc_smoke` pins all three.
+
+---
+
+## F-039 · The ray probe SAMPLES during warmup, so arming a sensor that applies nothing still changes every step of the run · `MECHANISM`
+
+*2026-08-16. Found by the tier-C smoke harness (`tierc_smoke.py`) on its first
+real use — the Phase-1 consolidation comparison. Verified against the shipping
+code, not inferred from the traces alone.*
+
+**Scope:** `latent_gaussian`, sg 1, Z'=1, T=10, batch 1000, protocol
+`unconditional_tb` (train_prior MLE → equilibration fused), 600 steps, seed
+12345, RTX 5080, torch 2.8.0+cu128, `--deterministic strict`.
+`adaptive_lr.warmup_steps: 1000`, `ray_calibration.period: 500`.
+
+`configs/mk_dev.yaml` at `7625d09` (pre-consolidation, migrated, `auto` rates
+pinned to `seed_lr`) against the current file, both run under current code.
+
+**Steps 0–500 are bit-identical.** 14,313 deterministic values, including the
+phase-1→2 stage transition, which fires at **step 381 in both**. From **step
+501** every subsequent loss differs.
+
+The cause is at step 500 and it is one thing: the current config declares
+`lr_sensor: {kind: ray}` on `equilibration` and the baseline declares no sensor,
+so only the current config fires a ray calibration. What that calibration did:
+
+| | ref (no sensor) | cand (ray) |
+|---|---|---|
+| `lr_ctrl/calibrations` @500 | 0 | **1** |
+| `lr_ctrl/cal_status` | — | **5 = `warmup`** |
+| `lr_ctrl/cal_applied` | — | **0.0** |
+| `lr_ctrl/peak_scale` | 1.0 | 1.0 |
+| `lr.fused` @599 | 2.0272626216986626e-05 | **identical** |
+| loss @599 | 0.078703 | 0.048191 |
+
+**The learning rate never moved.** Every LR is bit-identical across all 600
+steps in both arms, and `peak_scale` is exactly 1.0 throughout — the controller
+read the calibration and threw it away, by design, because the envelope is still
+ramping (`cal_status: warmup`).
+
+**The run diverged anyway, because the probe SAMPLED before being refused.**
+`RayCalibration.measure` draws `n_sub: 8` fresh sub-batches through
+`_draw_probe_batch` (replay buffer) and scores each at 8 alphas — 64 loss
+evaluations. It restores every parameter it touches bitwise and writes no state,
+which is what its contract promises. It does not, and cannot, restore the RNG
+those eight draws consumed. So the training rollouts from step 501 onward read a
+shifted random stream.
+
+**The mechanism to prevent this exists, is documented, and this sensor does not
+use it.** `LRController.in_warmup()` carries the docstring *"Public because a
+sensor may need to decline to SAMPLE during warmup, not merely to act."* The
+**plateau** sensor calls it and returns `{}` (`train.py:4861`). The **ray** path
+does not: `_ray_probe_armed` checks the stage's sensor kind and then
+`RayCalibration.arm`, which checks only `due(step_ind)`. There is no warmup
+check anywhere on that path.
+
+**Consequences, in order of how much they cost:**
+
+1. **A sensor-on/sensor-off A/B is confounded from the first probe**, 500 steps
+   before the sensor is permitted to act. The arms differ by an RNG shift, not
+   only by the thing under test. This is a different defect from F-025 (where a
+   saturated reading trained the D33 arms 8× apart in LR) — here the LR is
+   provably identical and the run still diverges.
+2. **The probe pays full price for a discarded reading**: 64 loss evaluations
+   plus a full parameter clone per probe, for every probe inside the first 1000
+   steps of each stage.
+3. **`warmup_steps` is restarted at every stage transition**
+   (`controller.py:11`, `rearm_warmup` on the `Protocol.advance` hook), so the
+   dead zone is not once per run. In this run the transition at 381 pushed the
+   sensor's first permitted action to step 1381 — no sensor of any kind actuates
+   anywhere in a 1200-step window, which is why the divergence above is purely
+   the sampling side effect.
+
+**Not a consolidation defect.** Tier A/B over the same pair reports 8 changed
+values, and all 8 are this feature: the two `lr_sensor` blocks, the four
+`lr_servo_managed` flags that follow from them, and a protocol *name*. No loss
+coefficient, batch size, clip, schedule or buffer setting moved. The LR-sensor
+addition is a deliberate change and `change_history.md` records it as one. What
+this finding adds is that its runtime footprint starts far earlier, and by a
+different route, than "the sensor moves the LR" describes.
+
+**The instrument.** Same-config spread on this target is **exactly zero** — 0 of
+243 values at 30 steps (seeds 12345 and 777) and 0 of 14,313 at 600 steps — so
+the comparison is exact and needs no tolerance. Two conditions are required for
+that and both are measured, not chosen: `torch.use_deterministic_algorithms`
+(without it 7 of 243 values differ, all grouped reductions at float32 rounding),
+and excluding wall-clock keys (21 of 522). The harness detects a **1e-6**
+relative change to a single loss coefficient.
+
+---
+
+## F-038 · wandb's system monitor is a free retroactive cross-calibration, and it does NOT corroborate "occupancy declines with batch" · `OBSERVED`
+
+*2026-08-16. `system.gpu.0.gpu` from wandb's own system stream, which samples in a
+SEPARATE THREAD (~14 s cadence) and therefore keeps sampling during eval, unlike
+`_sample_gpu_util`.*
+
+**Scope:** 18 runs carrying both readings; the within-run table is ONE run,
+`umaperf0812_c_controller`, on host **BB2 — the dev box, not the cluster** — 0.94 h,
+batch 100→741 in one stage. n is small throughout. Not replicated.
+
+**1. Compared like with like, the two sensors mostly agree.** Both as a MEAN over the
+same trailing window (`min(7200 s, runtime)`): median difference **+1.1 points**, 12 of
+18 within 10 points. An earlier comparison of our trailing mean against wandb's
+whole-run median showed ±49 and was an artifact of comparing different statistics over
+different windows — the confound, not the sensors.
+
+**2. Two of the six outliers are not evidence.** `prod0810_mipcas_elj` (−34.4) and
+`prod0810_nehzor_uma` (+32.6) rest on **n = 10** system samples in a 7200 s window,
+because wandb decimates history on 48-hour runs. Long cluster runs lose system-metric
+resolution, which is the one thing the external CSV still has to supply.
+
+**3. The surviving disagreements are the `umaperf0812` family — the runs whose table
+deleted `gpu_util_floor`.** On `c_controller`, ours 50.6 vs wandb 82.0 over the same
+window. Within the run, against batch:
+
+| batch | ours (`util_recent`) | wandb sys gpu | samples/s |
+|---:|---:|---:|---:|
+| 100 | 55.2 | 100.0 *(n=2)* | 61.1 |
+| 165 | 50.5 | 69.7 *(n=11)* | 64.6 |
+| 272 | 46.9 | 71.3 *(n=18)* | 43.4 |
+| 449 | 47.1 | 89.4 *(n=37)* | 36.1 |
+| 741 | 54.2 | 86.6 *(n=20)* | 26.1 |
+
+**Throughput falling in batch is corroborated. Occupancy declining in batch is NOT.**
+The independent sampler's minimum is at batch 165, and it *rises* at the top rung. Our
+sensor's decline rests on 2–5 ten-step rows per rung with a 900 s window smearing across
+rungs ~11 min apart, so those readings are not independent of each other.
+
+**What this does and does not change.** The deletion of `gpu_util_floor` **stands**: the
+rule grew batch 7.4× while samples/sec fell 58 %, and the pre-registered joint clause —
+no occupancy rule unless `U(B)` and `S(B)` move in the *same* direction — refuses it on
+the throughput half alone. What is weakened is the *stated mechanism* ("utilization is
+flat-to-declining in batch on this route"), which was carried as a fact and is now
+one thin, dev-box, in-process-sensor reading contradicted by a concurrent independent one.
+
+**4. The practical consequence: arm C is largely answerable for free, retroactively.**
+wandb's system monitor is an out-of-process, concurrent, ~14 s-cadence sampler joined on
+the same clock, present on **every run ever logged**. That is precisely the role the
+external `nvidia-smi` sidecar was specified for. It is an independent **sampler**, not an
+independent **instrument** — same NVML counter — so it controls for cadence, phase and
+eval blindness and for nothing about the counter's semantics. What it does *not* supply,
+and what still needs the sidecar: throttle reasons, per-process attribution for
+co-tenancy, MIG detection, and resolution on long runs (see 2).
+
+Feeds [`design/phase6_measurement_delta.md`](design/phase6_measurement_delta.md) Δ7 and
+the arm C budget.
+
+---
+
+## F-037 · Trap (b) does not descend to 1, the floor does not stop the churn, and the shipping controller loses to every fixed batch once recompiles are charged · `MECHANISM`
+
+*2026-08-16. Driven against the REAL `train.Modeller.increment_batch_size` in
+`bench/`. Deterministic — no seeds — so every number reproduces exactly.*
+
+**Scope, and it is a hard limit:** a *synthetic* device. `t(B) = t_fixed + B/sps_max`,
+`sps_max = 5000`, mk_dev config (`batch_growth_factor 1.65`,
+`batch_growth_min_throughput_gain 0.05`, `batch_knee_recheck_steps 2000`), one
+`equilibration` stage, `train_mode fused`, no OOM. These are properties of the **control
+law given a cost model**, not of any hardware. Nothing here may be quoted as a batch size.
+
+**1. The descent terminates at the closed-form knee, not at 1.** With `_batch_floor`
+removed, the walk runs down to the knee the cost model implies and stops:
+
+| `t_fixed` | terminal batch | descent? |
+|---:|---:|---|
+| 0.0 | **1** | to the domain floor |
+| 0.001 | 50 | yes (knee_bound 36) |
+| 0.01 | 366 | yes (knee_bound 364) |
+| 0.1 | 4491 | **none** |
+
+Reaching batch 1 requires `t_fixed` **exactly** zero — a measure-zero, physically
+impossible point, and the only point at which "descends forever" is reachable. The real
+defect is *"descends to a level the configuration never chose"*, which is what actually
+cost prod0810 (a whole stage at 0.825× its configured batch). `bench/old`'s only floor
+test sits exactly at that impossible point.
+
+**2. The floor stops the descent, not the churn.** With the floor intact under flat
+throughput the batch oscillates `1000 ↔ 1650` **permanently** — 57 transitions in 60k
+steps, `n_distinct = 2`. A horizon-invariance check on `n_distinct` alone calls that
+converged, so `n_transitions` must be reported beside it.
+
+**3. At zero switching cost the OBJECTIVE IS BLIND to the descent.** Measured regret of
+the floorless arm against the floored one: **±0.0000** at both 20k and 60k steps. This
+refutes the natural assumption that a throughput objective convicts trap (b);
+`train.py:417-419` already says why ("flat throughput genuinely does argue for the
+smallest batch… gradient quality is not something it can see"). Detection therefore needs
+a **structural invariance** — on a stationary device a converged controller's
+`n_distinct` must not depend on the horizon: measured **2/2/2** with the floor, **13 → 19**
+without it, at 20k/40k/60k.
+
+**4. Once recompiles are charged the SHIPPING controller loses to the worst fixed batch.**
+At `recompile_s = 30`, flat curve, 20k steps: shipping **4927.3** samples/s against a
+*worst* fixed arm of **4962.8**. The churn in (2) buys nothing and pays a recompile per
+distinct shape. Pinned as an assertion in the true direction in
+`bench/test_batch_traps.py` so it is not rediscovered.
+
+**5. Trap (a) needs dominance PLUS a retained growth; dominance alone convicts the
+shipping controller.** On the umaperf0812 table driven as a device, 6000 steps:
+
+| arm | sps | occ % | final `B` | distinct |
+|---|---:|---:|---:|---:|
+| `null` | 57.70 | 52.0 | 100 | 1 |
+| `ship` | 57.14 | 51.6 | 100 | 2 |
+| `ship+occfloor` | 24.41 | 42.0 | 741 | 5 |
+
+The shipping controller is dominated by null — worse on both axes — because one
+exploratory probe up a declining curve costs **0.97%**. That is the correct cost of
+learning the curve declines, not a defect. The structural separator, which needs no
+magnitude threshold: the injected arm **retained** its growth (`net_rungs 641`), the
+shipping controller ended where it started (`net_rungs 0`). Negative controls on RISING
+and FLAT occupancy report UNRESOLVED, not PASS.
+
+This was found by the false-positive check, not by the detection check — a detector that
+reddens for current and injected code alike distinguishes nothing.
+
+**6. The two candidate objectives have opposite argmaxes.** `samples_per_sec` is maximised
+at the largest rung, `updates_per_sec` at the smallest, on the same saturating curve.
+Accumulation engages **strictly below** `fused_grad_accum_min_samples` (`train.py:2467`),
+and mk_dev ships `batch_size == fused_grad_accum_min_samples == 1000`, so **every
+reachable batch sits where the identity justifying `samples_per_sec` does not hold.** That
+identity is asserted at four sites as if unconditional.
+
+Feeds [`design/phase6_batch_sizer.md`](design/phase6_batch_sizer.md) and
+[`design/phase6_measurement_delta.md`](design/phase6_measurement_delta.md) Δ6, Δ8.
+
+---
+
+## F-036 · The utilization proxy's window is 48–288× slower than the batch actuator on ELJ, and inverts on MLIP · `MECHANISM`
+
+*2026-08-16. Derived from the shipped sensor code and the shipped growth cadence;
+no run required. Input to Phase 6's control law.*
+
+**Scope:** `gpu_util_policy_window_s: 7200`, `gpu_util_sample_period_s: 60`,
+`batch_growth_interval: 50` (`configs/mk_dev.yaml`, transcribed in
+`bench/fake_modeller.MK_DEV_BATCH`); sampler cadence quantised to step boundaries
+per `train.py::_sample_gpu_util`'s once-per-step gate; 5-sample floor per
+`_gpu_util_mean`. Step times: 1.4 s measured on the dev box, 181–262 s measured on
+prod0810's MLIP arms; the two A100 ELJ rows are estimates and are labelled as such.
+
+How many growth decisions fire inside **one** `gpu/util_policy` window:
+
+| route / step time | growth interval | `util_recent` | `util_policy` | policy ÷ interval |
+|---|---:|---:|---:|---:|
+| ELJ dev box, 1.4 s *(measured)* | 70 s | 14 smp | 119 smp | **103×** |
+| ELJ A100 batch 1000, ~0.5 s *(est)* | 25 s | 15 smp | 120 smp | **288×** |
+| ELJ A100 batch 7410, ~3.0 s *(est)* | 150 s | 15 smp | 120 smp | **48×** |
+| MLIP prod0810, 181 s *(measured)* | 9050 s | **4 smp — ABSENT** | 39 smp | **0.8×** |
+| MLIP prod0810, 262 s *(measured)* | 13100 s | **3 smp — ABSENT** | 27 smp | **0.5×** |
+
+**The ratio spans ~600× across routes, and it crosses 1.** On ELJ the controller
+takes 48–288 actions before its priority-1 sensor reflects the first one, so
+`gpu/util_policy` **cannot be a closed-loop input there at any gain** — the dead
+time exceeds the actuation period by two orders of magnitude. On MLIP the ratio
+inverts, but `gpu/util_recent` is simultaneously **absent** (3–4 samples against
+the 5-sample floor), so the only surviving reading is the slow one and the growth
+interval is 2.5–3.6 **hours**.
+
+**Consequence for Phase 6:** priority 1 cannot be a servo on the live reading.
+It has to be **feed-forward** — a predicate over a calibrated `U(B)` — with the
+live proxy demoted to a slow monitor that can *invalidate* the calibration but
+never steer step-by-step. This is independent of what the cluster's statistic
+turns out to be: it follows from the window length alone, so it does not wait on
+the Phase 4 data.
+
+**Also:** no single control cadence is correct for both routes, so a cadence is a
+per-route **parameter**, not a constant. `docs/design/phase6_measurement_request.md`
+§2 records the sensor mechanics that produce these numbers but does not draw the
+control-timescale consequence.
+
+---
+
+## F-035 · `bench/old`'s pytest exclusion parked 58 live tests; the load-bearing half was the LR half, not the batch half · `MECHANISM`
+
+*2026-08-16. Settled by mutation, not by reading. Changed `pytest.ini`.*
+
+**Scope:** `bench/old/`, project venv, dev box. Whole directory:
+**111 passed / 3 skipped in 65 s** — nothing in it is broken or stale.
+
+Two mutations, each a one-line monkeypatch applied via a pytest plugin:
+
+| mutation | `bench/old` | collected suite |
+|---|---:|---:|
+| `train.Modeller._batch_floor → 1` (re-introduces trap (b)) | **3 RED** | **3 RED** |
+| `LRController.on_calibration → no-op` | **12 RED** | **1 RED** |
+
+**The batch half was the less interesting answer.** Under the floor mutation
+`bench/old` reddens `test_flat_throughput_walks_down_only_to_the_floor`,
+`test_gain_at_or_above_factor_minus_one_rejects_every_jump` and
+`test_A4_pin_does_not_rebuild_the_oom_sawtooth` — but the **already-collected**
+`bench/test_oom_ceiling_expiry.py` reddens too, and 2 of its 3 are genuine
+detections (`batch stuck at 303`; the descent `1000 → 606`). The third is only a
+scaffolding precondition (`assert m._batch_floor() == 1000`) noticing its own
+setup moved. So the floor was **not** unprotected, and
+`docs/design/phase6_measurement_request.md` §8's "the controller's entire
+regression protection is parked" overstates it for the batch half.
+
+**The LR half is where the coverage actually was.** `bench/old/test_lr_controller.py`
+drives the **shipping v8** `LRController`. Neutering `on_calibration` reddens 12
+named behaviours there — warmup hold, asymmetric update, peak bounds, the
+permanent divergence ceiling, the servo cut from a hot start, saturated-sensor
+open loop, unresolved/inconsistent producing no move, the unmanaged-key control
+arm — against **one** red in the entire collected `bench/`, and that one is
+`test_arms.py::test_ray_is_distinguishable_from_null`, which reports that *an arm
+went inert*, not which behaviour broke.
+
+**Fix:** `bench/old` dropped from `norecursedirs`; new `bench/old/conftest.py`
+carries `collect_ignore` for the three files that genuinely are retired
+(`test_scenarios.py`, `test_off_target.py`, `test_crucible_feasibility.py` — each
+self-tests the apparatus the 2026-08-13 review condemned). Whole-suite collection
+**873 → 931**; `pytest -m fast` stays green (719 passed / 3 skipped / 209
+deselected, 103 s).
+
+**A test failing under a mutation is not automatically detection.** Read the
+failing line: a broken precondition and a caught bug look identical in the summary.
+
+---
+
 ## F-034 · The ranking holds on a second surface family, and the blind ramp is worse than no sensor there · `REPLICATED`
 
 *2026-08-13. Second battery for §0's table; same arms, same scoring, an unrelated

@@ -96,6 +96,10 @@ def main(argv=None):
                     help='features only, no assertions')
     ap.add_argument('--no-compare', action='store_true',
                     help='skip the cross-arm sweep and feature tables')
+    ap.add_argument('--matched', action='store_true',
+                    help='read every arm over the step span they ALL cover, so '
+                         'they are compared at the same training age rather '
+                         'than each at its own trailing window')
     ap.add_argument('-v', '--verbose', action='store_true',
                     help='every subject a check examined, not only its findings')
     a = ap.parse_args(argv)
@@ -129,8 +133,10 @@ def main(argv=None):
     # Tier 2. Only with something to compare -- a one-arm sweep table and a
     # one-column feature table say nothing the per-run report below does not.
     if len(runs) > 1 and not a.no_compare:
-        print(P.format_comparison(P.compare(runs, window=a.window),
-                                  verbose=a.verbose))
+        print(P.format_comparison(
+            P.compare(runs, window=a.window,
+                      span='matched' if a.matched else None),
+            verbose=a.verbose))
 
     for run in runs:
         _one(run, a)

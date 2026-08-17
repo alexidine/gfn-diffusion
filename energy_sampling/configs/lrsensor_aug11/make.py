@@ -21,9 +21,17 @@ var_conditioning (the two VarGrad channels), exercising both in one run.
 patience is in CHECKS, one per 10 train steps. 600 steps is where healthy (arm A)
 and stalled (lrs_normal) separate; at 300 they do not separate at all.
 
-Both leave ray_calibration.enabled TRUE while declaring kind: plateau, so
-lr_ctrl/calibrations staying 0 is a live assertion that the per-stage gate
-suppresses the ray probe.
+Neither arm arms the ray probe: both stages declare kind: plateau, and a stage
+declaration is the probe's only switch, so lr_ctrl/calibrations stays 0. This was
+once phrased the other way round -- `ray_calibration.enabled: true` plus a
+per-stage gate that had to suppress it -- and the assertion here checked that the
+gate won that argument. The flag is retired and the disagreement it allowed is
+unrepresentable, so what is asserted now is simply that no stage asks.
+
+base.yaml is a FROZEN aug11 snapshot written against that day's schema, so it is
+run through config_state.migrate on load: `protocol` becomes a selector (state 4)
+and the MLE gate parameters move onto their stage (state 5). Repairing it forward
+rather than rewriting it keeps the snapshot, and its comments, intact.
 
 NB warmup re-arms per stage, so each stage's sensor is blocked for `warmup` steps
 after that stage is ENTERED. In lrs_normal phase 1 exits around step 570, before
@@ -40,6 +48,8 @@ import yaml
 HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE.parent.parent))
 
+import config_state  # noqa: E402
+from config_invariants import active_stages  # noqa: E402
 from configs.generate_configs import overwrite_nested_dict  # noqa: E402
 
 # (name, seed_lr, warmup_steps, patience_checks, epochs)
@@ -58,10 +68,12 @@ STAGE_METRICS = {
 
 
 def _stage(cfg, name):
-    for st in cfg['protocol']['stages']:
+    stages = active_stages(cfg)
+    for st in stages:
         if st['name'] == name:
             return st
-    raise KeyError(f'stage {name!r} not in protocol')
+    raise KeyError(f'stage {name!r} not in protocol {cfg.get("protocol")!r} '
+                   f'(has {[s.get("name") for s in stages]})')
 
 
 def build(base, name, seed_lr, warmup, patience, epochs):
@@ -85,8 +97,16 @@ def assert_test_shape(cfg, name):
     assert cfg['checkpoint_name'] is None and cfg['prior_model_name'] is None, \
         f'{name}: must be FRESH or train_prior is skipped and the MLE sensor never runs'
     assert cfg['continue_from_checkpoint'] is False, f'{name}: must not resume'
-    assert cfg['ray_calibration']['enabled'] is True, \
-        f'{name}: leave ray enabled -- calibrations staying 0 is the gate assertion'
+    # The ray probe must stay INERT, and a stage declaration is now the only
+    # thing that could arm it (train.py::_ray_askers). Asserted rather than
+    # assumed because it is an assertion about an ABSENCE: the plateau sensors
+    # set below happen to displace mk_dev's ray stage today, and an edit that
+    # added a third stage would re-arm the probe silently.
+    askers = [st.get('name') for st in active_stages(cfg)
+              if (st.get('lr_sensor') or {}).get('kind') == 'ray']
+    assert not askers, \
+        f'{name}: stage(s) {askers} declare lr_sensor kind ray -- this test needs ' \
+        f'lr_ctrl/calibrations to stay 0, and the ray probe arms on that declaration'
     for stage_name, metrics in STAGE_METRICS.items():
         ls = _stage(cfg, stage_name).get('lr_sensor')
         assert ls and ls['kind'] == 'plateau', f'{name}/{stage_name}: needs a plateau sensor'
@@ -104,6 +124,14 @@ def assert_test_shape(cfg, name):
 def main():
     argparse.ArgumentParser().parse_args()
     base = yaml.safe_load((HERE / 'base.yaml').read_text())
+    # base.yaml is the frozen aug11 snapshot; repair it forward to the current
+    # state before anything is built on it. Applied to the BASE, not to a merged
+    # result -- migration renames and drops whole blocks, so running it after a
+    # patch layer had merged into one could overwrite real values with a stub.
+    base, report = config_state.migrate(base)
+    if report.needs_judgment:
+        raise SystemExit(report.render())
+    print(report.render())
     rows = ['name\tseed_lr\twarmup\tpatience_checks\tepochs']
     for name, seed_lr, warmup, patience, epochs in SCENARIOS:
         cfg = build(base, name, seed_lr, warmup, patience, epochs)

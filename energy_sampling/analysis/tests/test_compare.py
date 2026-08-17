@@ -848,3 +848,59 @@ def test_a_sweep_row_never_renders_two_different_values_the_same(ring_probe, rin
     b = fixtures.mutate(ring_cal, config={K.CFG_PRIOR_PATH: shared + 'BBBB' + shared})
     text = P.format_sweep(P.compare([a, b]).sweep)
     assert 'AAAA' in text and 'BBBB' in text
+
+
+# ---------------------------------------------------------------------------
+# Matched span -- the other half of battery/training_age
+# ---------------------------------------------------------------------------
+
+def test_matched_span_is_the_overlap_ending_at_the_shortest_arm(tb_ramp, buildout):
+    """Ending at the EARLIEST last step is what makes it symmetric: the longer
+    arm is read at the age the shorter one reached, not the other way round."""
+    lo, hi = P.matched_span([tb_ramp, buildout])
+    assert hi == min(tb_ramp.last_step, buildout.last_step)
+    assert lo >= 0
+
+
+def test_a_matched_span_read_uses_the_same_ticks_for_every_arm(tb_ramp, buildout):
+    """`check_confounds` FLAGS the age difference; this is the half that makes
+    the comparison answerable. Measured on two real cluster arms: at their own
+    trailing windows one led on every topline metric, over the shared span the
+    other led on every one -- the comparison reversed."""
+    span = P.matched_span([tb_ramp, buildout])
+    cmp_ = P.compare([tb_ramp, buildout], span='matched')
+    assert cmp_.span == span
+    for rec in cmp_.records():
+        if rec.get('state') == 'live' and rec.get('last_step') is not None:
+            assert span[0] <= rec['last_step'] <= span[1]
+
+
+def test_a_matched_span_read_says_so_above_the_table(tb_ramp, buildout):
+    """A matched-span table and a trailing-window table look identical and
+    answer different questions."""
+    text = P.format_comparison(P.compare([tb_ramp, buildout], span='matched'))
+    assert 'MATCHED SPAN' in text
+    assert text.index('MATCHED SPAN') < text.index('FEATURES')
+    plain = P.format_comparison(P.compare([tb_ramp, buildout], window=2000))
+    assert 'MATCHED SPAN' not in plain
+
+
+def test_arms_that_share_no_span_refuse_rather_than_invent_one(tb_ramp):
+    """No overlap means there is no age at which they can be compared, and
+    reading them at their own windows would report the age gap as a result."""
+    early = fixtures.mutate(tb_ramp)
+    early.history = {k: (s[:5], v[:5]) for k, (s, v) in early.history.items()}
+    late = fixtures.mutate(tb_ramp)
+    late.history = {k: (s[-5:] + 1e9, v[-5:]) for k, (s, v) in late.history.items()}
+    assert P.matched_span([early, late]) is None
+    with pytest.raises(ValueError, match='share no step span'):
+        P.compare([early, late], span='matched')
+
+
+def test_the_confounds_still_see_the_untrimmed_runs(tb_ramp, buildout):
+    """Trimming before the confound check would hide the very training-age
+    difference that motivates the span."""
+    cmp_ = P.compare([tb_ramp, buildout], span='matched', window=1000.0)
+    row = [r for r in cmp_.confounds.rows if r.subject == 'battery/training_age']
+    assert row and row[0].numbers['max_last_step'] == max(
+        tb_ramp.last_step, buildout.last_step)

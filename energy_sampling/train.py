@@ -215,46 +215,57 @@ class Modeller:
 
         arm() is called ONLY on the armed path: it clones every policy parameter,
         which is not something to spend on a stage that will not measure.
+
+        THE SECOND GATE IS NOT AN OPTIMISATION. `measure` draws n_sub sub-batches
+        from the replay buffer, and those draws consume RNG that nothing
+        restores -- so a calibration whose reading the controller then discards
+        still changes every subsequent training step. Measured: a 600-step
+        tier-C pair was bit-identical to step 500 and diverged from step 501,
+        the first probe, while every learning rate stayed bit-identical and
+        `cal_applied` was 0.0 (findings.md F-039). The probe must therefore ask
+        whether its result will be USED before it draws, not after.
         """
         sensor = self.protocol.stage.lr_sensor
         if sensor is None or sensor['kind'] != 'ray':
             return False
+        refusal = self.lr_controller.calibration_refusal()
+        if refusal is not None:
+            # Consumes the period exactly as a completed calibration would, so
+            # the first APPLIED calibration still lands on the step it always
+            # did; see RayCalibration.refuse.
+            self.ray_cal.refuse(refusal, self.step_ind)
+            return False
         return self.ray_cal.arm(self.step_ind)
+
+    def _ray_askers(self):
+        """Stages declaring `lr_sensor: {kind: ray}`. This IS the probe's switch."""
+        return [s.name for s in self.protocol.stages
+                if s.lr_sensor is not None and s.lr_sensor['kind'] == 'ray']
 
     def _check_ray_wiring(self):
         """The ray probe is OPT-IN per stage: it runs where and only where a
         stage declares `lr_sensor: {kind: ray}` (see the gate in train_step).
 
         It used to arm by OMISSION -- any stage with no lr_sensor block ran it
-        whenever `ray_calibration.enabled` was true. That is backwards for a
-        probe with a hard coherence requirement (it draws from replay and scores
-        replay_loss_coeffs, so outside a fused stage training replay TB it rates
-        a loss nobody is optimising), and it is what kept the replay buffer
-        nominally load-bearing in stages that never touch replay.
+        whenever a separate `ray_calibration.enabled` flag was true. That is
+        backwards for a probe with a hard coherence requirement (it draws from
+        replay and scores replay_loss_coeffs, so outside a fused stage training
+        replay TB it rates a loss nobody is optimising).
 
-        Two ways the pair can now disagree, both silent before this ran:
-          - a stage asks for `ray` while ray_calibration.enabled is false. arm()
-            would return False forever and the stage would train at its seed LR
-            with the config claiming a sensor. Hard error.
-          - ray_calibration.enabled is true and no stage asks. The block is
-            inert; say so rather than let it read as an active sensor.
-        """
-        rc = getattr(self.args, 'ray_calibration', None)
-        enabled = bool(getattr(rc, 'enabled', False))
-        askers = [s.name for s in self.protocol.stages
-                  if s.lr_sensor is not None and s.lr_sensor['kind'] == 'ray']
-        if askers and not enabled:
-            raise ValueError(
-                f"stages {askers} declare lr_sensor kind 'ray' but "
-                f"ray_calibration.enabled is false -- the probe would never arm and "
-                f"those stages would run at a fixed LR while the config says they are "
-                f"servoed. Set ray_calibration.enabled: true, or move those stages to "
-                f"another lr_sensor kind.")
-        if enabled and not askers:
-            print("WARNING: ray_calibration.enabled is true but no stage declares "
-                  "lr_sensor kind 'ray' -- the probe is opt-in per stage, so the block "
-                  "is inert (parameters only). This is the intended setting for a run "
-                  "with no replay-TB stage; the key is left in place because it still "
+        That flag is now GONE and `enabled` is derived from these askers, which
+        removes the disagreement it made possible -- a stage asking for `ray`
+        while the flag said false used to train at its seed LR with the config
+        claiming a sensor. That case is unrepresentable now, so the check that
+        caught it is gone with it.
+
+        What remains is the other direction, which derivation cannot rule out:
+        the block's parameters are present and nothing asks. Not an error -- the
+        parameters are shared storage, and a run with no replay-TB stage is a
+        legitimate configuration -- but worth saying, so the block does not read
+        as an active sensor."""
+        if self.protocol.stages and not self._ray_askers():
+            print("NOTE: no stage declares lr_sensor kind 'ray', so the "
+                  "ray_calibration block is inert (parameters only). It still "
                   "supplies alphas/n_sub/period to any stage that opts in.")
 
     def init_train_constants(self):
@@ -1845,7 +1856,13 @@ class Modeller:
         # head is LR-pinned separately, so folding it in would make alpha* rate a
         # composite step the servo would not control. Absent config block =>
         # disabled, so this is inert for every existing config.
-        sp_cfg = getattr(self.args, 'ray_calibration', None)
+        # The block lives under `adaptive_lr` -- it parameterises one of the LR
+        # sensors, so it belongs with the rest of the LR machinery rather than at
+        # top level. The old top-level spelling is retired (utils._RETIRED_KEYS),
+        # so a config still carrying it fails at load rather than silently
+        # falling through to the defaults below.
+        sp_cfg = getattr(getattr(self.args, 'adaptive_lr', None),
+                         'ray_calibration', None)
         # ONE list, built once, shared by both sensors. `get_policy_params` is a
         # local of this method, so the hypergradient sensor cannot call it later
         # -- and it must snapshot exactly what the ray probe does (policy only,
@@ -1854,12 +1871,20 @@ class Modeller:
         self._hyper_param_cache = [
             p for g in get_policy_params(self.gfn_model) for p in g['params']]
         self._hyper_prev_step = None
+        # ENABLED IS DERIVED, not configured. A stage declaring
+        # `lr_sensor: {kind: ray}` IS the switch; a separate `ray_calibration.
+        # enabled` was a second mechanism for the same decision, and the two could
+        # disagree. Note the asymmetry that gave it away: `hyper` has no block at
+        # all and declares itself inline at the stage.
+        #
+        # Defaulting this to False on a missing key would silently kill the probe,
+        # so it is computed from the protocol rather than read.
         self.ray_cal = RayCalibration(
             self._hyper_param_cache,
             alphas=tuple(getattr(sp_cfg, 'alphas', (0.0, 1.0, 2.0, 4.0, 8.0))),
             n_sub=int(getattr(sp_cfg, 'n_sub', 8)),
             period=int(getattr(sp_cfg, 'period', 500)),
-            enabled=bool(getattr(sp_cfg, 'enabled', False)),
+            enabled=bool(self._ray_askers()),
         )
         # Announced HERE and not in LRController.__init__: the controller is built
         # before the calibrator exists, so it cannot describe its own sensor there.
@@ -2197,7 +2222,7 @@ class Modeller:
                     # gate publishers feed the exit triggers (gates/*); the
                     # protocol tick then runs the stage's balance nudge and
                     # arms the exit trigger (which pulls the next eval forward)
-                    if self.protocol.flag('mle_gate'):
+                    if self.protocol.stage.mle_gate is not None:
                         metrics.update(self.update_mle_gate())
                     # the stage's declared LR sensor. Returns {} (and touches
                     # nothing) unless the stage declares lr_sensor kind:
@@ -4207,18 +4232,42 @@ Two things deliberately NOT done here, both recorded in
 
         return pooled
 
-    def _eval_conditional_stats(self, stats):
-        """quick_tb_stats over a pooled EVAL batch's accumulated tensors, with the
-        condition axis wired through (and the protocol's worst_quantile), so the
-        held-out comparison in log_test_metrics runs off the same code path as the
-        train-condition one and stays like-for-like."""
+    def _eval_conditional_stats(self, stats, coeffs):
+        """
+        THE ONLY eval-time quick_tb_stats call. All three eval streams --
+        'eval_fwd/' (train conditions), 'eval_bwd/', 'eval_test/' (held-out) --
+        go through here, differing only in the accumulated tensors and in
+        `coeffs` (the direction's *_loss_coeffs, for the Huber clip_beta behind
+        tb_resid_clipped / z_grad_worst).
+
+        ONE CALL SITE IS THE POINT, not a tidiness preference. The metric names
+        are shared across streams and the dashboard reads them as a set, so any
+        argument that changes what a name MEANS -- worst_quantile above all --
+        has to be impossible to set on one stream and not another. It was not:
+        the two calls this replaced omitted worst_quantile entirely and took
+        quick_tb_stats' 0.5 default, while log_test_metrics recomputed the
+        train-condition stats at the protocol quantile and overwrote four
+        'eval_fwd/' keys on the way out. Which definition reached wandb was
+        settled by dict-update order in evaluation(), and (because the overwrite
+        only ran when a held-out set was configured) 'eval_fwd/tb_err_worst'
+        silently meant the MEDIAN condition on a run with no
+        `test_molecules_path` and the upper-tail one on a run with it. A new
+        keyword added to one of two parallel calls would have inherited exactly
+        the same defect, which is why there is now only one.
+
+        worst_quantile is `conditional_worst_quantile` -- the same value every
+        train-step site already passes (_update_rolling, the per-step probe) and
+        the same one log_condition_fraction and condition_tracker_figs read, so
+        'the worst-case condition' is one convention across the whole run
+        rather than a per-call-site accident. Never a bare default here.
+        """
         log_pf = stats['log_pfs'].sum(-1)
         log_pb = stats['log_pbs'].sum(-1)
         log_z = stats['log_Z_learned']
         log_r = stats['log_r']
         cid = stats.get('condition_id')
         return quick_tb_stats(log_pf, log_pb, log_z, log_r,
-                              clip_beta=getattr(self.args.fwd_loss_coeffs, 'beta', None),
+                              clip_beta=getattr(coeffs, 'beta', None),
                               condition_id=cid,
                               worst_quantile=self.args.conditional_worst_quantile,
                               **self._reward_ramp_kwargs(cid))
@@ -4241,16 +4290,25 @@ Two things deliberately NOT done here, both recorded in
                                                         override_num_samples=int(n),
                                                         dataset=self.test_mol_dataset,
                                                         side_effects=False)
-        train_m = self._eval_conditional_stats(fwd_stats)
-        test_m = self._eval_conditional_stats(test_stats)
+        test_m = self._eval_conditional_stats(test_stats, self.args.fwd_loss_coeffs)
 
         metrics = {f'eval_test/{k}': v for k, v in test_m.items()}
-        for k in ('logw_std_within', 'cond_tb_err', 'tb_err_worst', 'z_grad_worst'):
-            if k in train_m:
-                metrics[f'eval_fwd/{k}'] = train_m[k]
-        # no 'eval_gap/' block: it was exactly eval_fwd - eval_test on six keys
-        # that are both already logged, so the generalization gap is a wandb
-        # panel expression rather than six more channels.
+        # THIS METHOD WRITES NOTHING UNDER 'eval_fwd/'. It used to re-run the
+        # train-condition stats and republish four of them, because log_metrics
+        # computed those keys at quick_tb_stats' default quantile rather than
+        # the protocol's and they were not like-for-like with 'eval_test/'.
+        # log_metrics now takes the quantile from the config (see
+        # _eval_conditional_stats), so the train-condition series is already
+        # correct at its own site, the duplicate pass over the full train eval
+        # batch is gone, and the two streams cannot collide on one key.
+        #
+        # no 'eval_gap/' block either: it was exactly eval_fwd - eval_test on six
+        # keys that are both already logged, so the generalization gap is a wandb
+        # panel expression rather than six more channels. Read it on the QUANTILE
+        # family, not the RMS one -- see module_metrics.md: the two streams pool
+        # very different sample counts over very different condition counts, so
+        # scatter_err / over_coverage / logw_std_within reach the tail at
+        # different rates and their difference is sampling geometry.
 
         # SAMPLE QUALITY on held-out conditions, pooled and per-condition, the
         # same pair log_thermo_properties publishes at top level for the train
@@ -4352,29 +4410,20 @@ Two things deliberately NOT done here, both recorded in
 
         """Forward TB Stats"""
         log_r = fwd_stats['log_r']
-        log_pf = fwd_stats['log_pfs'].sum(-1)
-        log_pb = fwd_stats['log_pbs'].sum(-1)
         log_Z_learned = fwd_stats['log_Z_learned']
         log_T_tensor = fwd_stats['log_T_tensor']
         metrics.update({f'eval_fwd/{k}': v for k, v in
-                        quick_tb_stats(log_pf, log_pb, log_Z_learned, log_r,
-                                       clip_beta=getattr(self.args.fwd_loss_coeffs, 'beta', None),
-                                       condition_id=fwd_stats.get('condition_id'),
-                                       **self._reward_ramp_kwargs(fwd_stats.get('condition_id'))).items()})
+                        self._eval_conditional_stats(fwd_stats, self.args.fwd_loss_coeffs).items()})
 
         self.log_thermo_properties(arr, fwd_stats, log_T_tensor, log_Z_learned, log_r, metrics, sample_batch, val)
 
         """Backward TB Stats"""
-        log_pf = bwd_stats['log_pfs'].sum(-1)
-        log_pb = bwd_stats['log_pbs'].sum(-1)
-        log_z = bwd_stats['log_Z_learned']
-        log_r = bwd_stats['log_r']
-        # parity / Z diagnostics (shared with fwd)
+        # parity / Z diagnostics (shared with fwd) -- same single call site, so
+        # 'eval_bwd/tb_err_worst' and 'eval_fwd/tb_err_worst' name the same
+        # quantile and the fwd/bwd parity read is a like-for-like one
         metrics.update({f'eval_bwd/{k}': v for k, v in
-                        quick_tb_stats(log_pf, log_pb, log_z, log_r,
-                                       clip_beta=getattr(self.args.bwd_loss_coeffs, 'beta', None),
-                                       condition_id=bwd_stats.get('condition_id'),
-                                       **self._reward_ramp_kwargs(bwd_stats.get('condition_id'))).items()})
+                        self._eval_conditional_stats(bwd_stats, self.args.bwd_loss_coeffs).items()})
+        bwd_log_pf = bwd_stats['log_pfs'].sum(-1)   # log_dist_stats reads the BWD stream
 
         def dump_numeric(metrics, prefix, obj):
             """Log the numeric settings behind this eval, but ONLY the ones that
@@ -4403,7 +4452,7 @@ Two things deliberately NOT done here, both recorded in
         dump_numeric(metrics, 'loss_coeffs/bwd_', self.args.bwd_loss_coeffs)
         dump_numeric(metrics, 'loss_coeffs/replay_', self.args.replay_loss_coeffs)
 
-        self.log_dist_stats(log_pf, metrics, sample_batch)
+        self.log_dist_stats(bwd_log_pf, metrics, sample_batch)
 
         "Trajectory Stats"
         for prefix in ['fwd', 'bwd']:
@@ -4761,7 +4810,7 @@ Two things deliberately NOT done here, both recorded in
 
         Samples the RAW per-step bwd MLE batch loss (self._last_stats, the
         pre-EMA value _update_rolling just computed) every 10 steps into a
-        window of mle_slope_window train steps, then least-squares fits the
+        window of mle_gate.window train steps, then least-squares fits the
         slope. Raw batch losses are ~independent across steps -- unlike the
         old 100-step-time-constant EMA input, whose ~0.9 autocorrelation
         needed an AR(1) effective-sample-size correction and forced the
@@ -4770,9 +4819,9 @@ Two things deliberately NOT done here, both recorded in
         in a ~3x shorter window.
 
         'Flat' = an EQUIVALENCE test on the descent rate: the upper
-        mle_slope_t-sigma bound on the rate (nats per 100 train steps -- the
+        mle_gate.slope_t-sigma bound on the rate (nats per 100 train steps -- the
         RATE needs no per-system normalization; nats are nats) lies below
-        mle_min_rate. Deliberately NOT a significance test: 'descent not
+        mle_gate.min_rate. Deliberately NOT a significance test: 'descent not
         significantly nonzero' also holds when the data is uninformative, so
         a significance gate fires hardest where it knows least (lcmft1z4:
         rate +0.96 nats/100 across a reload transient read as 'flat').
@@ -4795,7 +4844,10 @@ Two things deliberately NOT done here, both recorded in
         if raw is None or not math.isfinite(raw):
             return metrics
         gs = self.protocol.gate_state('mle')
-        checks = max(int(getattr(self.args, 'mle_slope_window', 300)) // 10, 4)
+        # Parameters come from the STAGE that declares the gate, not from args:
+        # they shape this stage's exit and nothing else consults them.
+        gate = self.protocol.stage.mle_gate
+        checks = max(int(gate['window']) // 10, 4)
         window = gs.setdefault('window', [])
         window.append(float(raw))
         del window[:-checks]
@@ -4812,8 +4864,8 @@ Two things deliberately NOT done here, both recorded in
         se = np.sqrt(s2 / sxx) if sxx > 0 and s2 > 0 else 0.0
         rate = -slope * 10.0  # nats per 100 train steps; > 0 = descending = improving
         se_rate = se * 10.0
-        rate_hi = rate + float(getattr(self.args, 'mle_slope_t', 2.0)) * se_rate
-        flat = rate_hi < float(getattr(self.args, 'mle_min_rate', 0.05))
+        rate_hi = rate + float(gate['slope_t']) * se_rate
+        flat = rate_hi < float(gate['min_rate'])
         self.protocol.publish_gate('mle_flat', float(flat))
         metrics['mle_gate_rate'] = rate  # nats/100 train steps; > 0 = improving
         metrics['mle_gate_rate_se'] = se_rate
@@ -4894,6 +4946,42 @@ Two things deliberately NOT done here, both recorded in
         return {'lr_plateau/stale': float(gs['stale']),
                 'lr_plateau/fired': float(fired)}
 
+    def _merge_metrics(self, metrics, new, source):
+        """
+        dict.update() that REFUSES to overwrite. Two writers reaching the same
+        metric key is not a merge, it is a disagreement about what that channel
+        means, and plain update() resolves it by call order -- silently, and in
+        favour of whichever function happens to run last.
+
+        This is not hypothetical. log_metrics and log_test_metrics both wrote
+        eval_fwd/{logw_std_within, cond_tb_err, tb_err_worst, z_grad_worst} with
+        different worst_quantile values; the held-out call ran second and won,
+        so a knob nobody had set on the eval path decided the meaning of four
+        published series (see _eval_conditional_stats). The values were close
+        enough to look like the same series and it went unnoticed until a
+        cross-stream audit. This assertion would have fired on the first eval.
+
+        HARD FAILURE, not a warning. Evals run every eval_period from the start,
+        so a genuine collision kills the run in minutes rather than corrupting
+        a week of logging, and a warning on a channel nobody is reading yet is
+        the same class of defect as the bug it is meant to catch. The message
+        carries both values because 'which one won' is the actual question.
+
+        Not a licence to share a key deliberately: settings emitted from more
+        than one stream go through _log_setting, whose cache makes the second
+        writer a no-op, so they never reach here as duplicates.
+        """
+        dup = sorted(set(new) & set(metrics))
+        assert not dup, (
+            f"metric key collision merging {source}: {len(dup)} key(s) already "
+            f"written by an earlier writer this eval. Give one of the two "
+            f"streams its own namespace -- do NOT let update() order decide. "
+            + "; ".join(f"{k!r} kept={metrics[k]!r} incoming={new[k]!r}"
+                        for k in dup[:8])
+            + (f" (+{len(dup) - 8} more)" if len(dup) > 8 else ""))
+        metrics.update(new)
+        return metrics
+
     def evaluation(self, override_do_figs: bool = False):
         metrics = {}
         # NB any pending pulled-forward request (stage_ctrl['request_eval'] --
@@ -4913,9 +5001,11 @@ Two things deliberately NOT done here, both recorded in
         '''sampling and metrics analysis'''
         fwd_stats, sample_batch = self.fwd_eval_sampling(self.ema_model, eval_discretizer)
         bwd_stats = self.bwd_eval_sampling(eval_discretizer)
-        metrics.update(self.log_metrics(fwd_stats, bwd_stats, sample_batch))
+        self._merge_metrics(metrics, self.log_metrics(fwd_stats, bwd_stats, sample_batch),
+                            'log_metrics')
         if getattr(self, 'test_mol_dataset', None) is not None:
-            metrics.update(self.log_test_metrics(eval_discretizer, fwd_stats))
+            self._merge_metrics(metrics, self.log_test_metrics(eval_discretizer, fwd_stats),
+                                'log_test_metrics')
 
         self.times['eval_figs_start'] = time()
         fig_dict = {}
@@ -5098,8 +5188,10 @@ Two things deliberately NOT done here, both recorded in
                 # the quantity that governs how much the policy->buffer->
                 # gradient path lowpasses itself, and mean/max say nothing
                 # about it. A hard age cap gives a ~uniform age profile, CV
-                # ~0.58; memoryless eviction gives exponential residence,
-                # CV ~1. Watch this rise when max_residence_steps is retired.
+                # ~0.58; the memoryless eviction this buffer now uses gives
+                # exponential residence, CV ~1. So ~1 is the healthy reading
+                # here, and a drift toward ~0.58 means something has started
+                # capping age after all.
                 'replay_buffer_age_cv': (
                     (replay_age.std(unbiased=False) / replay_age.mean().clamp(min=1e-6)).item()
                     if replay_age.numel() > 1 else 0.0),
@@ -5814,8 +5906,14 @@ Two things deliberately NOT done here, both recorded in
         anchor_batch.orient_molecule(mode='std')
 
         terminal_latents = anchor_batch.latent_params()
+        # Bulk anchor scan, not the per-step hot path, and it runs inside a stage
+        # transition's on_enter hook -- OUTSIDE the try/except around train_step that
+        # slashes the batch on OOM. So an OOM here is fatal with nothing to catch it.
+        # Force the chunked self-healing path, same as the two init-time whole-dataset
+        # scans do. Per-call only: it does not touch self.internal_oom_recovery.
         reward, anchor_batch = self.energy_function.log_reward(
-            terminal_latents, anchor_batch, log_T_tensor, return_exp=True)
+            terminal_latents, anchor_batch, log_T_tensor, return_exp=True,
+            internal_oom_recovery=True)
 
         temperature = 10 ** log_T_tensor
         energy = -reward.detach() * temperature
@@ -6113,11 +6211,13 @@ Two things deliberately NOT done here, both recorded in
         PURGE is hazard (memoryless) + backstop (age) only -- both are
         residual-independent, so p_survive drops out of the IS weight cleanly.
         The old residual-dependent causes (floor: ema_loss corrected below a
-        threshold; stalled: drawn >= toxic_min_draws and not improving) are
+        threshold; stalled: a draw count paired with a delta threshold) are
         retired: once the draw itself is prioritised, a corrected row already
         draws at p ~ 0, so they were buying memory, not gradient budget, and
         hazard reclaims that memory without reintroducing a residual-dependent
-        survival probability (see the toxic_min_draws ValueError below).
+        survival probability. Their config keys are rejected at LOAD
+        (utils._RETIRED_KEYS), not here -- a guard in this function first runs
+        at a stage transition, which is hours into a run.
 
         Not just a variance-reduction gap -- it fabricated evidence. A row
         driven to delta ~ 0 by repeated replay IS the memorisation sensor's
@@ -6206,22 +6306,6 @@ Two things deliberately NOT done here, both recorded in
         ema = self.replay_buffer.ema_loss
         n = len(self.replay_buffer)
 
-        if getattr(rb_cfg, 'max_residence_steps', None) is not None:
-            raise ValueError(
-                "buffers.replay_buffer.max_residence_steps is retired -- the hard age "
-                "cap was doing 100% of eviction and culling the improving tail. Replace "
-                "it with mean_residence_steps (memoryless hazard); backstop_mult "
-                "defaults to 5. Sizing is now Little's law: occupancy = churn_rate * "
-                "mean_residence_steps.")
-        if getattr(rb_cfg, 'toxic_min_draws', None) or getattr(rb_cfg, 'toxic_delta_threshold', None):
-            raise ValueError(
-                "buffers.replay_buffer.toxic_min_draws/toxic_delta_threshold are retired "
-                "-- the stalled-row purge they fed was residual-dependent, exactly "
-                "redundant with hazard+backstop once the draw itself is prioritised "
-                "(weighted sampling already drives a corrected row's draw probability "
-                "to ~0; hazard reclaims its memory without reintroducing survival bias). "
-                "Remove both keys; eviction is hazard+backstop only now.")
-
         # EVICTION, two causes -- neither shapes the bulk of the age
         # distribution, which is the point:
         #   hazard    memoryless: evict n/tau rows per call, uniformly at
@@ -6233,8 +6317,10 @@ Two things deliberately NOT done here, both recorded in
         #             without reshaping the bulk.
         # Both are residual-independent, so p_survive drops out of the IS
         # weight cleanly -- no residual-scored purge cause survives now that
-        # the draw itself carries the prioritisation (see the retirement
-        # ValueError above for what used to live here and why it's gone).
+        # the draw itself carries the prioritisation. The keys that drove the
+        # old floor/stalled causes are rejected at LOAD (utils._RETIRED_KEYS);
+        # tau = 0 here means neither of these two arms, which is why
+        # mean_residence_steps is load-bearing rather than optional.
         # Occupancy is emergent (Little's law: n = admit_rate * tau); max_size
         # is a memory guard, not a target. Eviction is proportional to n, so
         # occupancy decays toward the intake equilibrium rather than falling off
@@ -6294,8 +6380,8 @@ Two things deliberately NOT done here, both recorded in
         # admissions. Any TTL mass-expiry during a replay-dormant stage
         # (z_match, replay frac 0.001) zeroed the buffer PERMANENTLY, and
         # buildout then rode the variance blowup into terminal-rewind
-        # sawtooths (tsched_july24: 10/14 arms died this way; survival =
-        # z_match duration < max_residence_steps, a race). Supply-side intake
+        # sawtooths (survival was a race between the z_match stage's duration
+        # and the since-retired hard age cap). Supply-side intake
         # runs whether or not replay is training, so the buffer is warm
         # whenever a stage wants to draw from it ---
         n_admit = min(elig.numel(), int(rb_cfg.churn_rate))

@@ -35,6 +35,7 @@ import numpy as np
 import torch
 
 from energies.base_set import BaseSet
+from energies.conformer_data import RingModes
 
 
 class ConformerTorsions(BaseSet):
@@ -71,6 +72,11 @@ class ConformerTorsions(BaseSet):
                  bounding_coeff: float = 10.0,
                  r_floor: float = 0.50,
                  theta_floor: float = 1.0e-3,
+                 ring_jitter_scale: float = 0.1,
+                 ring_min_bank_rows: int = 2,
+                 force_field: str = 'reference',
+                 ring_mode_fill: float = 0.0,
+                 ring_pop_temper: float = 1.0,
                  ):
         """
         `level` is keyword-only and has NO default, and there is deliberately no
@@ -134,9 +140,10 @@ class ConformerTorsions(BaseSet):
         r0, th0, ph0 = measure(tree1, pos1)
         self.r0, self.th0, self.ph0 = r0, th0, ph0
         self.ref_pos = pos1
-        self.ff_single = ff_from_reference(
-            tree1, pos1, epsilon=epsilon, min_separation=min_separation,
-            scale_14=scale_14, lj_k_factor=lj_k_factor)
+        # NOTE force_field is read here, before it is stored below -- keep the local name
+        self._ff_choice = force_field
+        self.ff_single = self._make_ff(tree1, pos1, epsilon, min_separation, scale_14,
+                                       lj_k_factor)
 
         # ---- linearity flags, MEASURED rather than defaulted -------------------------
         # spec_from_graph is called with use_geometry=False above -- required, since a
@@ -168,6 +175,9 @@ class ConformerTorsions(BaseSet):
         in_ring_orig = np.array([a.IsInRing() for a in mol.GetAtoms()], dtype=bool)
         self.atom_in_ring = np.zeros(len(z), dtype=bool)
         self.atom_in_ring[slot] = in_ring_orig
+        arom_orig = np.array([a.GetIsAromatic() for a in mol.GetAtoms()], dtype=bool)
+        self.atom_is_aromatic = np.zeros(len(z), dtype=bool)
+        self.atom_is_aromatic[slot] = arom_orig
 
         # ---- the free-DoF mask over the concatenated [r | theta | phi] vector ---------
         self.rotatable, self.mask = self._find_rotatable(bonds, z, include_trivial_rotations)
@@ -251,6 +261,13 @@ class ConformerTorsions(BaseSet):
         self.delta_r_max, self.delta_theta_max = float(delta_r_max), float(delta_theta_max)
         self.bounding_coeff = float(bounding_coeff)
         self.r_floor, self.theta_floor = float(r_floor), float(theta_floor)
+        self.ring_jitter_scale = float(ring_jitter_scale)
+        self.ring_min_bank_rows = int(ring_min_bank_rows)
+        if force_field not in ('reference', 'mmff'):
+            raise ValueError(f"force_field must be 'reference' or 'mmff', got {force_field!r}")
+        self.force_field = force_field
+        self.ring_mode_fill = float(ring_mode_fill)
+        self.ring_pop_temper = float(ring_pop_temper)
 
         # The wall's box must sit strictly inside the physical domain, or the clamp binds
         # permanently and the sampler is exploring a geometry the reward cannot see.
@@ -371,16 +388,37 @@ class ConformerTorsions(BaseSet):
 
     # -------------------------------------------------------------------- energy
 
+    def _make_ff(self, tree, ref_pos, epsilon, min_separation, scale_14, lj_k_factor):
+        """The force field, by the `force_field` switch.
+
+        'reference' -- ff_from_reference: r0/theta0 MEASURED off the embedded conformer, so
+        the bonded terms are exactly zero there. It carries NO TORSION TERM AT ALL, which
+        makes every rotamer distribution nearly uniform (propanol's target entropy is 7.601
+        of a maximum 7.625) and leaves amide omega degenerate between cis and trans. Its
+        parameters also depend on the embedding seed, which is fatal conditionally.
+
+        'mmff' -- ff_from_mmff: RDKit's MMFF94 typing, graph-determined, with a real
+        3-term torsion. Full organic coverage, so peptides and aromatics work; ff_from_graph
+        raises on both. Note the reference conformer STOPS being the energy minimum, since
+        r0/theta0 are now typed rather than measured.
+        """
+        from mxtaltools.conformers.energy import ff_from_reference, ff_from_mmff
+        if self._ff_choice == 'mmff':
+            return ff_from_mmff(tree, self.mol, self.spec.perm, dtype=self.dtype,
+                                min_separation=min_separation, lj_k_factor=lj_k_factor)
+        return ff_from_reference(tree, ref_pos, epsilon=epsilon,
+                                 min_separation=min_separation,
+                                 scale_14=scale_14, lj_k_factor=lj_k_factor)
+
     def _batch(self, batch_size: int):
         """Cached collated tree and force field for a given batch size."""
         if batch_size not in self._tree_cache:
             from mxtaltools.conformers.builder import collate
-            from mxtaltools.conformers.energy import ff_from_reference
 
             tree = collate([self.spec] * batch_size, device=self.device)
             ref = self.ref_pos.repeat(batch_size, 1)
             self._tree_cache[batch_size] = tree
-            self._ff_cache[batch_size] = ff_from_reference(tree, ref, **self._ff_kwargs)
+            self._ff_cache[batch_size] = self._make_ff(tree, ref, **self._ff_kwargs)
         return self._tree_cache[batch_size], self._ff_cache[batch_size]
 
     def dof_from_state(self, x: torch.Tensor):
@@ -507,22 +545,74 @@ class ConformerTorsions(BaseSet):
         return out
 
     def torsion_groups(self):
-        """phi DoF rows grouped by central bond, leader first.
+        """phi DoF rows grouped by PARENT ATOM, leader first.
 
-        A group is one bond's substituent set -- every dihedral that turns when that bond
-        turns. Their DIFFERENCES are what fix the local geometry: an H-C-H angle is a
-        difference of two of them, and it is one of the 40 graph angles the force field
+        A group is the set of atoms placed onto one parent -- every dihedral whose
+        DIFFERENCES from the others fix a bond angle at that parent. An H-C-H angle is a
+        difference of two of them, and it is one of the graph angles the force field
         scores but the tree does not expose as a coordinate. So they have to be drawn
         JOINTLY. Drawn independently, even from perfect marginals, roughly a third of
         sibling pairs land on the same rotamer mode and put two substituents in the same
         place -- measured on Ala5 at a median sibling-difference error of 91 degrees.
+
+        KEYED ON THE CENTRAL BOND `(b, c)`, and IMPROPER ROWS ARE EXCLUDED. The group's
+        whole mechanism is that every member takes the leader's angular displacement, and
+        that is only a rigid rotation of the set when the members share a reference axis
+        -- which is what the central bond is. Grouping by parent atom instead gathers the
+        right atoms but then applies a common displacement to dihedrals measured about
+        DIFFERENT axes, which is not a rotation of anything: measured on ethanol it left
+        O4-C0-H1 at a median 14.5 degrees against a theta0 of 108.6.
+
+        Rows that are improper (see improper_phi_rows) are not rotations at all and are
+        handled separately, so they must not appear here.
         """
         from collections import defaultdict
         ti = np.asarray(self.spec.torsion_index)
+        imp = set(self.improper_phi_rows())
         g = defaultdict(list)
         for j in range(self.n_ph):
+            if j in imp:
+                continue
             g[(int(ti[j, 1]), int(ti[j, 2]))].append(j)
         return [sorted(rows) for rows in g.values()]
+
+    def improper_phi_rows(self):
+        """phi rows that are LOCAL GEOMETRY, not rotatable torsions.
+
+        A tree dihedral for atom `n` placed on parent `c` with references `b`, `a` is a
+        genuine torsion about the c-b bond only when `a` lies one bond FURTHER OUT, i.e.
+        bonded to `b`. When `a` is instead bonded to `c`, the dihedral is measured between
+        two substituents of the same parent and IS the angle between them -- an improper.
+        Drawing it from a pooled rotamer histogram destroys that angle outright.
+
+        Ethanol is the clean example: row 1 places O4 on C0 referenced to (C3, H1) with
+        H1 a neighbour of C0, so phi(row 1) is precisely the O4-C0-H1 angle. Sampled from
+        a histogram it lands at a median 14.5 degrees against theta0 = 108.6, and that one
+        angle carried 251 of the 252 kcal/mol of angle strain in the whole molecule.
+
+        Always a small set -- the first one or two rows, where the tree is still building
+        its initial frame -- which is exactly why this survived: every genuinely rotatable
+        bond in the molecule behaves correctly.
+        """
+        from collections import defaultdict
+        ti = np.asarray(self.spec.torsion_index)
+        nb = defaultdict(set)
+        for u, v in np.asarray(self.spec.bond_index):
+            nb[int(u)].add(int(v))
+            nb[int(v)].add(int(u))
+        return [j for j in range(self.n_ph) if int(ti[j, 0]) in nb[int(ti[j, 2])]]
+
+    def improper_phi_sigma(self, temperature: float):
+        """Thermal width for the improper phi rows, in radians.
+
+        An improper dihedral IS an angle at the parent, so its Boltzmann width is that
+        angle's own sqrt(kT/2k). The controlled angle is a redundant graph angle rather
+        than a tree angle, so this uses the median tree-angle width as the stand-in --
+        near-tetrahedral centres put the dihedral-to-angle Jacobian at order one, and the
+        measurement that matters (the angle energy of a draw) is checked directly.
+        """
+        _, s_th = self.thermal_rtheta_sigma(temperature)
+        return float(np.median(s_th)) if len(s_th) else 0.1
 
     def sibling_jitter_sigma(self, groups, temperature: float):
         """Per-group jitter width for the sibling offsets, in radians.
@@ -550,6 +640,190 @@ class ConformerTorsions(BaseSet):
             k_med = float(np.median(k)) if k else 50.0
             out.append(float(np.sqrt(max(temperature, 1e-12) / (2.0 * k_med))))
         return out
+
+    def ring_blocks(self, prior):
+        """Ring-system DoF blocks in SPEC numbering, paired with their fitted bank.
+
+        Returns ``[(order, bank)]`` where ``order`` is ``[(kind, row), ...]`` in exactly
+        the sequence InternalPrior fitted the block in (all r, then all theta, then all
+        phi), and ``bank`` is the RingBank or None.
+
+        Ring systems are the second place a product of marginals cannot work: closure is a
+        hard constraint, so independently-drawn ring DoF violate it by construction --
+        prior.py says so outright. Unlike the sibling case there is no structural fix, so
+        this defers to InternalPrior's own joint bank.
+
+        The ASSERTION is the load-bearing part. The bank was fitted in mxtaltools'
+        ``tree_*`` encoding and is consumed here in ``spec`` numbering. Those are different
+        encodings of the same tree (conformer_data's module docstring) and they agree
+        today -- verified on cyclohexane, toluene, naphthalene, proline and ibuprofen --
+        but a silent divergence would permute the block rather than fail, and the symptom
+        would look like "rings just sample badly".
+        """
+        from energies.conformer_data import condition_from_energy
+        m = condition_from_energy(self, partial_charges=False)
+        m.build_conformer_tree()
+        for lbl, a, b in (('bond', np.asarray(self.spec.bond_index), m.tree_bond_index),
+                          ('angle', np.asarray(self.spec.angle_index), m.tree_angle_index),
+                          ('torsion', np.asarray(self.spec.torsion_index), m.tree_torsion_index)):
+            b = b.detach().cpu().numpy().T
+            if a.shape != b.shape or not (a == b).all():
+                raise RuntimeError(
+                    f"the spec tree and mxtaltools' tree_* encoding disagree on the {lbl} "
+                    f"index for {self.smiles}. RingBank blocks are fitted in the latter and "
+                    f"consumed in the former, so they cannot be mapped -- refusing rather "
+                    f"than permuting the block silently.")
+        # A prior fitted before the ring signature was fixed has keys that simply do not
+        # resolve, and every ring then falls through to the hold -- indistinguishable from
+        # "this ring was never fitted". Say which it is.
+        # vars(), NOT getattr. InternalPrior is a dataclass, so a field with a default is
+        # also a CLASS attribute -- getattr on a prior pickled before the field existed
+        # returns the current default and reports itself up to date. Only the instance
+        # __dict__ distinguishes "fitted under v2" from "predates the field".
+        self.ring_sig_stale = vars(prior).get('ring_sig_version', 1) < 2
+        sysid, _ = prior.ring_systems(m)
+        _, blocks, sigs, _ = prior._layout(m)
+        bi, ai, ti = (np.asarray(self.spec.bond_index), np.asarray(self.spec.angle_index),
+                      np.asarray(self.spec.torsion_index))
+        out = []
+        for s, cols in blocks.items():
+            order = ([('r', int(j)) for j in cols['r']]
+                     + [('theta', int(j)) for j in cols['theta']]
+                     + [('phi', int(j)) for j in cols['phi']])
+            in_sys_pre = {int(a) for a in range(len(sysid)) if int(sysid[a]) == int(s)}
+            aromatic = bool(self.atom_is_aromatic[list(in_sys_pre)].all())
+            # a fitted MODE SUBSPACE wins over the discrete bank: the rows were isolated
+            # islands with near-zero mass between basins, and the saddles live between them
+            bank = getattr(prior, 'ring_modes', {}).get((sigs[s], len(order)))
+            if bank is None:
+                bank = prior.rings.get((sigs[s], len(order)))
+            if aromatic:
+                # An aromatic ring is RIGID: there is no pucker to sample, so a bank buys
+                # nothing and can only do harm. It did: under signature version 1 the key
+                # carried element but not degree, so benzene and cyclohexane shared a bank
+                # and benzene drew chairs -- median |ring torsion| 47 deg, 75% of draws
+                # past 20 deg, with ff_from_reference unable to object (no torsion term,
+                # and bond angles stay near 120 deg through a pucker). Holding it planar
+                # near the reference is correct by construction and needs no fit.
+                bank = None
+            elif isinstance(bank, RingModes):
+                pass                                    # subspaces carry their own width
+            elif bank is not None and (bank.rows.shape[1] != len(order)
+                                       or bank.rows.shape[0] < self.ring_min_bank_rows):
+                # a 1-row bank is a single observation on replay -- measured on
+                # naphthalene under signature v1, where it was 30x WORSE than holding the
+                # ring. The default is 2, not higher: with a v2 signature and a
+                # purpose-built bank (build_ring_banks.py) a small bank is COMPLETE rather
+                # than thin -- pyrrolidine genuinely has two envelope basins. The real
+                # protection against a contaminated bank is the signature, not this count.
+                bank = None
+            # DoF that PLACE a ring atom, which is a superset of the block: _layout's
+            # owner() requires every atom of a DoF to be in the ring, so a ring-positioning
+            # dihedral whose reference atom sits outside is excluded -- and then moves
+            # freely and breaks closure. Proline's closure error was 1.5 A at ANY jitter
+            # scale for exactly this reason. These extras are held, never banked, since
+            # the bank was fitted against the narrower set.
+            in_sys = {int(a) for a in range(len(sysid)) if int(sysid[a]) == int(s)}
+            placing = ([('r', j) for j in range(self.n_r) if int(bi[j, 1]) in in_sys]
+                       + [('theta', j) for j in range(self.n_th) if int(ai[j, 2]) in in_sys]
+                       + [('phi', j) for j in range(self.n_ph) if int(ti[j, 3]) in in_sys])
+            extra = [kj for kj in placing if kj not in set(order)]
+            out.append((order, bank, extra))
+        return out
+
+    def prior_log_prob(self, prior, dof: np.ndarray, joint_torsions: bool = True,
+                       thermal_rtheta: bool = True) -> np.ndarray:
+        """``log q(dof)`` for exactly what ``sample_prior_states`` draws. ``[n]``.
+
+        WHY THIS HAS TO EXIST SEPARATELY. InternalPrior ships a matched sample/log_prob
+        pair, but ``sample_prior_states`` is NOT InternalPrior's sampler -- it adds joint
+        sibling draws, thermal r/theta and ring subspaces on top, in SPEC numbering rather
+        than mxtaltools' ``tree_*`` numbering. Without a density that mirrors those extras
+        there is no importance weight, and so no ESS: the number people quote for the
+        upgraded prior would silently be the density of a DIFFERENT distribution.
+
+        ACYCLIC ONLY. Ring blocks draw from a bank or a pucker subspace whose density is a
+        mixture over fitted rows, and the subspace is lower-dimensional than the block it
+        fills, so the block's density is singular in the held directions. That is a real
+        derivation, not an oversight -- it raises rather than returning a number that
+        would look usable.
+
+        The BOX CLAMP in sample_prior_states is not represented here either: it puts
+        finite mass exactly on the wall, which no continuous density can express. Callers
+        must check ``stats['clip_frac']`` is ~0 before treating these weights as valid.
+        """
+        from mxtaltools.conformers.prior import R_RANGE, THETA_RANGE, PHI_RANGE
+        spans = {'r': R_RANGE, 'theta': THETA_RANGE, 'phi': PHI_RANGE}
+
+        if any(True for _ in self.ring_blocks(prior)):
+            raise NotImplementedError(
+                'prior_log_prob covers acyclic molecules only: a ring block is drawn from '
+                'a bank or pucker subspace whose density is a mixture, and is singular in '
+                'the directions the subspace does not span. Restrict the ESS measurement '
+                'to acyclic molecules, or derive the ring block density first.')
+
+        dof = np.atleast_2d(np.asarray(dof, dtype=np.float64))
+        n = dof.shape[0]
+        total = np.zeros(n)
+        types = self.prior_dof_types(prior)
+        n_phi0 = self.n_r + self.n_th
+
+        ph0 = self.ph0.detach().cpu().numpy()
+        r0 = self.r0.detach().cpu().numpy()
+        th0 = self.th0.detach().cpu().numpy()
+        s_r, s_th = self.thermal_rtheta_sigma(float(self.temperature))
+        groups = self.torsion_groups()
+        g_sigma = self.sibling_jitter_sigma(groups, float(self.temperature))
+
+        def gauss(x, mu, s):
+            return -0.5 * ((x - mu) / s) ** 2 - np.log(s) - 0.5 * np.log(2 * np.pi)
+
+        def wrapped_gauss(x, mu, s):
+            """phi lives on a circle; for sigma near pi the images matter."""
+            acc = np.zeros_like(x)
+            for k in (-1, 0, 1):
+                acc = acc + np.exp(gauss(x + 2 * np.pi * k, mu, s))
+            return np.log(np.clip(acc, 1e-300, None))
+
+        def marginal(row, kind, hist):
+            if hist is None:
+                lo, hi = spans[kind]
+                return np.full(n, -np.log(hi - lo))
+            return np.asarray(hist.log_prob(dof[:, row], prior.fatten))
+
+        # ---- r / theta ----
+        if thermal_rtheta:
+            for j in range(self.n_r):
+                total += gauss(dof[:, j], r0[j], s_r[j])
+            for j in range(self.n_th):
+                total += gauss(dof[:, self.n_r + j], th0[j], s_th[j])
+
+        # ---- rows the sampler leaves on their own marginal ----
+        for row, (kind, hist, key, is_ring) in enumerate(types):
+            if (joint_torsions and row >= n_phi0) or (thermal_rtheta and row < n_phi0):
+                continue
+            total += marginal(row, kind, hist)
+
+        # ---- phi, mirroring the leader/follower structure exactly ----
+        if joint_torsions:
+            s_imp = self.improper_phi_sigma(float(self.temperature))
+            for j in self.improper_phi_rows():
+                total += wrapped_gauss(dof[:, n_phi0 + j], ph0[j], s_imp)
+            for gi, rows_j in enumerate(groups):
+                grows = [n_phi0 + j for j in rows_j]
+                lead_i = 0
+                _, hist, _, _ = types[grows[lead_i]]
+                total += marginal(grows[lead_i], 'phi', hist)
+                disp = ((dof[:, grows[lead_i]] - ph0[rows_j[lead_i]] + np.pi)
+                        % (2 * np.pi) - np.pi)
+                for i, gr in enumerate(grows):
+                    if i == lead_i:
+                        continue
+                    total += wrapped_gauss(dof[:, gr], ph0[rows_j[i]] + disp, g_sigma[gi])
+        return total
+
+    def _global_row(self, kind: str, j: int) -> int:
+        return {'r': j, 'theta': self.n_r + j, 'phi': self.n_r + self.n_th + j}[kind]
 
     def thermal_rtheta_sigma(self, temperature: float):
         """``sqrt(kT / 2k)`` per tree bond and tree angle, from the FF's own constants.
@@ -580,7 +854,8 @@ class ConformerTorsions(BaseSet):
         return s_r, s_th
 
     def sample_prior_states(self, prior, n: int, rng, report: bool = True,
-                            joint_torsions: bool = True, thermal_rtheta: bool = True):
+                            joint_torsions: bool = True, thermal_rtheta: bool = True,
+                            joint_rings: bool = True):
         """``[n, d]`` states drawn from a fitted InternalPrior. Returns ``(x, stats)``.
 
         Per-DoF marginals, which is the prior's acyclic case. Ring systems are the one
@@ -606,42 +881,138 @@ class ConformerTorsions(BaseSet):
                 return rng.uniform(lo, hi, n)
             return hist.sample(n, prior.fatten, rng)
 
+        ph0 = self.ph0.detach().cpu().numpy()
+        r0 = self.r0.detach().cpu().numpy()
+        th0 = self.th0.detach().cpu().numpy()
+        s_r, s_th = self.thermal_rtheta_sigma(float(self.temperature))
+        groups = self.torsion_groups()
+        g_sigma = self.sibling_jitter_sigma(groups, float(self.temperature))
+        phi_sig = float(np.median(g_sigma)) if g_sigma else 0.1
+
+        # ---- ring systems FIRST: closure is a hard constraint, so their DoF are joint,
+        # and substituents hanging off a ring atom then lock to what the ring chose ----
+        ring_rows = set()
+        stats.update(n_rings=0, n_ring_banked=0, n_ring_thermal=0, n_ring_extra_held=0)
+        if joint_rings:
+            ref = {'r': r0, 'theta': th0, 'phi': ph0}
+            sig = {'r': s_r, 'theta': s_th}
+            sc = self.ring_jitter_scale
+
+            def hold(kj):
+                """Rattle one ring DoF about its reference at a FRACTION of thermal width.
+
+                Full thermal width does not work: closure is nonlinear, so independent
+                per-DoF perturbations accumulate around the loop with a lever arm. Measured
+                on cyclohexane and naphthalene, closure error is linear in this scale, and
+                0.1 puts it at 0.025-0.043 A -- at or under a bond's own thermal width of
+                0.041 A. Larger and the ring is visibly open; this is the price of having
+                no bank, and it means pucker is rattled rather than sampled.
+                """
+                kind, j = kj
+                gr = self._global_row(kind, j)
+                s = (sig[kind][j] if kind in sig else phi_sig) * sc
+                dof[:, gr] = ref[kind][j] + rng.normal(0.0, s, n)
+                return gr
+
+            for order, bank, extra in self.ring_blocks(prior):
+                rows = [self._global_row(k, j) for k, j in order]
+                stats['n_rings'] += 1
+                if isinstance(bank, RingModes):
+                    # subspace draw: theta/phi from the pucker manifold, r from the
+                    # thermal path, everything else in the block held
+                    stats['ring_fill'] = self.ring_mode_fill
+                    dev = np.asarray(bank.sample(n, rng, fill=self.ring_mode_fill,
+                                                 temperature=float(self.temperature),
+                                                 temper=self.ring_pop_temper))
+                    for col, (kind, j) in enumerate(bank.order):
+                        gr = self._global_row(kind, j)
+                        v = bank.ref[col] + dev[:, col]
+                        dof[:, gr] = ((v + np.pi) % (2 * np.pi) - np.pi) if kind == 'phi' else v
+                        ring_rows.add(gr)
+                    for kj in order:
+                        gr = self._global_row(*kj)
+                        if gr not in ring_rows:
+                            ring_rows.add(hold(kj))
+                    stats['n_ring_banked'] += 1
+                elif bank is not None:
+                    drawn = np.asarray(bank.sample(n, rng))
+                    for col, ((kind, j), gr) in enumerate(zip(order, rows)):
+                        if kind == 'r':
+                            # bank the PUCKER, not the bond lengths. A bank row carries
+                            # whatever molecule was fitted, so taking its r would import
+                            # another molecule's bonds and override the thermal path --
+                            # which is the exact local Boltzmann marginal for a harmonic
+                            # term, and specific to THIS molecule. Pucker lives in the
+                            # torsions and angles.
+                            hold((kind, j))
+                        else:
+                            dof[:, gr] = drawn[:, col]
+                        ring_rows.add(gr)
+                    stats['n_ring_banked'] += 1
+                else:
+                    for kj in order:
+                        ring_rows.add(hold(kj))
+                    stats['n_ring_thermal'] += 1
+                # ring-POSITIONING DoF outside the block are held either way: banked or
+                # not, letting them float re-opens the ring (see ring_blocks)
+                for kj in extra:
+                    ring_rows.add(hold(kj))
+                stats['n_ring_extra_held'] += len(extra)
+
+        # ---- r / theta ----
         if thermal_rtheta:
-            s_r, s_th = self.thermal_rtheta_sigma(float(self.temperature))
-            r0 = self.r0.detach().cpu().numpy(); th0 = self.th0.detach().cpu().numpy()
             for j in range(self.n_r):
-                dof[:, j] = rng.normal(r0[j], s_r[j], n)
+                if j not in ring_rows:
+                    dof[:, j] = rng.normal(r0[j], s_r[j], n)
             for j in range(self.n_th):
-                dof[:, self.n_r + j] = rng.normal(th0[j], s_th[j], n)
+                if self.n_r + j not in ring_rows:
+                    dof[:, self.n_r + j] = rng.normal(th0[j], s_th[j], n)
             stats['rtheta_sigma_deg'] = (float(np.degrees(s_th.mean())), float(s_r.mean()))
         for row, (kind, hist, key, is_ring) in enumerate(types):
-            stats['n_ring_marginal'] += int(is_ring)
-            # phi is handled below when drawing jointly; r/theta above when thermal
+            stats['n_ring_marginal'] += int(is_ring and row not in ring_rows)
+            if row in ring_rows:
+                continue
             if (joint_torsions and row >= n_phi0) or (thermal_rtheta and row < n_phi0):
                 continue
             dof[:, row] = draw(row, kind, hist)
 
+        # ---- phi ----
         if joint_torsions:
-            groups = self.torsion_groups()
-            sigmas = self.sibling_jitter_sigma(groups, float(self.temperature))
-            ph0 = self.ph0.detach().cpu().numpy()
+            # improper rows FIRST: they are angles at the parent, not rotations, so they
+            # rattle thermally about the reference instead of taking a rotamer histogram
+            imp = [j for j in self.improper_phi_rows() if n_phi0 + j not in ring_rows]
+            s_imp = self.improper_phi_sigma(float(self.temperature))
+            stats['n_improper'] = len(imp)
+            for j in imp:
+                dof[:, n_phi0 + j] = ph0[j] + rng.normal(0.0, s_imp, n)
             stats['n_groups'] = len(groups)
-            stats['sigma_deg'] = (float(np.degrees(min(sigmas))),
-                                  float(np.degrees(max(sigmas)))) if sigmas else (0.0, 0.0)
-            for gi, rows in enumerate(groups):
-                lead = rows[0]
-                _, hist, _, _ = types[n_phi0 + lead]
-                lead_val = draw(n_phi0 + lead, 'phi', hist)
-                dof[:, n_phi0 + lead] = lead_val
-                # the group turns together: every member takes the LEADER'S displacement
-                # from its own reference, which is what preserves the reference offsets
-                disp = (lead_val - ph0[lead] + np.pi) % (2 * np.pi) - np.pi
-                for r in rows[1:]:
-                    dof[:, n_phi0 + r] = ph0[r] + disp + rng.normal(0.0, sigmas[gi], n)
+            stats['sigma_deg'] = ((float(np.degrees(min(g_sigma))),
+                                   float(np.degrees(max(g_sigma)))) if g_sigma else (0.0, 0.0))
+            for gi, rows_j in enumerate(groups):
+                grows = [n_phi0 + j for j in rows_j]
+                in_ring = [i for i, gr in enumerate(grows) if gr in ring_rows]
+                if in_ring and len(in_ring) == len(grows):
+                    continue                       # wholly intra-ring: the bank owns it
+                if in_ring:
+                    # a mixed group is a ring bond carrying substituents. The ring member
+                    # is already placed, so it leads and the substituents follow it -- an
+                    # H on a ring carbon sits at a fixed offset from the ring's own dihedral
+                    lead_i = in_ring[0]
+                else:
+                    lead_i = 0
+                    _, hist, _, _ = types[grows[lead_i]]
+                    dof[:, grows[lead_i]] = draw(grows[lead_i], 'phi', hist)
+                disp = (dof[:, grows[lead_i]] - ph0[rows_j[lead_i]] + np.pi) % (2 * np.pi) - np.pi
+                for i, gr in enumerate(grows):
+                    if i == lead_i or gr in ring_rows:
+                        continue
+                    dof[:, gr] = ph0[rows_j[i]] + disp + rng.normal(0.0, g_sigma[gi], n)
         else:
             # independent marginals for phi too: the pre-fix behaviour, kept so the A/B
             # is runnable and the gate below can require the difference
             for row in range(n_phi0, len(types)):
+                if row in ring_rows:
+                    continue
                 kind, hist, _, _ = types[row]
                 dof[:, row] = draw(row, kind, hist)
 
@@ -660,6 +1031,22 @@ class ConformerTorsions(BaseSet):
         }
         x = x.clamp(-1.0, 1.0)
 
+        # CLOSURE MONITOR. Ring closure is the one constraint the state cannot express --
+        # the closure bond is not a tree DoF, it is whatever the ring's internals imply --
+        # so it has to be measured on the draw rather than assumed. Reported against a
+        # bond's own thermal width, since that is the scale at which it stops mattering.
+        stats['closure_err'] = 0.0
+        stats['closure_sigma'] = 0.0
+        if stats['n_rings']:
+            from mxtaltools.conformers.builder import closure_length
+            tree, ff = self._batch(n)
+            if ff.closure_index.numel():
+                cl = closure_length(tree, self.build_positions(x))
+                err = (cl - ff.closure_r0).abs().reshape(n, -1).max(1).values
+                stats['closure_err'] = float(err.median())
+                s_r, _ = self.thermal_rtheta_sigma(float(self.temperature))
+                stats['closure_sigma'] = stats['closure_err'] / max(float(np.mean(s_r)), 1e-12)
+
         if report:
             u = stats['n_uniform']
             print(f"InternalPrior draw: {n} states, {len(types)} DoF "
@@ -674,11 +1061,29 @@ class ConformerTorsions(BaseSet):
                 print(f"  phi drawn INDEPENDENTLY per DoF (pre-fix behaviour)")
             print(f"  clipped to box: r {stats['clip_frac']['r']:.1%}, "
                   f"theta {stats['clip_frac']['theta']:.1%}")
+            if stats['n_rings']:
+                print(f"  rings: {stats['n_rings']} system(s) -- {stats['n_ring_banked']} "
+                      f"from a fitted RingBank (joint, samples pucker), "
+                      f"{stats['n_ring_thermal']} held at thermal jitter about the "
+                      f"reference (closure preserved, pucker NOT sampled; aromatic rings "
+                      f"take this path by design, being rigid)")
+                print(f"  closure error {stats['closure_err']:.3f} A = "
+                      f"{stats['closure_sigma']:.1f} bond-sigma"
+                      + ("  <-- ABOVE 3 sigma, the ring is visibly open"
+                         if stats['closure_sigma'] > 3 else ""))
+                if getattr(self, 'ring_sig_stale', False):
+                    print(f"  WARNING this prior predates the ring-signature fix "
+                          f"(ring_sig_version < 2), so NO ring key can resolve and every "
+                          f"ring above is held rather than banked. Refit to recover pucker "
+                          f"sampling on saturated rings.")
             if stats['n_ring_marginal']:
-                print(f"  WARNING {stats['n_ring_marginal']}/{len(types)} DoF are in ring "
-                      f"systems and got MARGINALS, not InternalPrior's joint ring block. "
-                      f"A product of marginals violates ring closure by construction, so "
-                      f"these draws are valid support but poor proposals.")
+                print(f"  WARNING {stats['n_ring_marginal']} ring DoF got independent "
+                      f"MARGINALS. A product of marginals violates ring closure by "
+                      f"construction -- valid support, poor proposal.")
+        # the RAW dof, before state_from_dof and before the box clamp. prior_log_prob must
+        # score what was actually drawn: scoring the clamped state would evaluate the
+        # density at a point the sampler never proposed.
+        stats['dof'] = dof
         return x, stats
 
     def potential_energy(self, x: torch.Tensor, temperature, keep_grads: bool = False,

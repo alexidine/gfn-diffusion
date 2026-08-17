@@ -137,7 +137,7 @@ class BenchRun:
                  args_overrides=None, stage=None, probe_batch=256,
                  need_batch_sizer=True, seed=0, reading_filter=None,
                  checkpoint_every=50, max_reloads_per_1k=0.2, sensor=None,
-                 climber=None, braker=None, standard=None):
+                 climber=None, braker=None, standard=None, probe_enabled=True):
         torch.manual_seed(seed)
         # per-instance copy so a sweep can vary the averaging windows without
         # mutating the class default under every other arm in the same process
@@ -176,10 +176,22 @@ class BenchRun:
         self.m = FakeModeller(self.args, self.game.optimizers,
                               stage=stage or FakeStage())
 
-        rc = self.args.ray_calibration
+        # THE BLOCK MOVED UNDER adaptive_lr and its `enabled` flag is DELETED
+        # (utils._RETIRED_KEYS, both spellings): production derives the switch
+        # from the stages that declare `lr_sensor: {kind: ray}`, so a second flag
+        # cannot disagree with them.
+        #
+        # This harness has no stages -- its arm IS the climber/braker pair, which
+        # is what the probe gate in step() reads ("train.py:2304" there) -- so
+        # there is nothing here to derive from, and the off-switch the batch
+        # cells need becomes a HARNESS argument rather than a config key. It is
+        # `enabled` under a name that cannot be mistaken for config, at the same
+        # default (True) and the same call sites. bench/runner.py, which does
+        # carry a stage, derives it the production way.
+        rc = self.args.adaptive_lr.ray_calibration
         self.m.ray_cal = RayCalibration(
             self.game.policy_params, alphas=tuple(float(a) for a in rc.alphas),
-            n_sub=rc.n_sub, period=rc.period, enabled=rc.enabled)
+            n_sub=rc.n_sub, period=rc.period, enabled=bool(probe_enabled))
         self.m.lr_controller = LRController(self.m)
 
         self.history = []
@@ -403,11 +415,11 @@ class BenchRun:
         -- is exactly what the shipping servo applies whenever the probe fails
         to resolve, which is most of the time.
         """
-        period = self.args.ray_calibration.period
+        period = self.args.adaptive_lr.ray_calibration.period
         if self.m.step_ind == 0 or self.m.step_ind % period:
             return
-        top = max(a for a in self.args.ray_calibration.alphas
-                  if 2 * a in set(self.args.ray_calibration.alphas))
+        top = max(a for a in self.args.adaptive_lr.ray_calibration.alphas
+                  if 2 * a in set(self.args.adaptive_lr.ray_calibration.alphas))
         self.m.lr_controller.on_calibration(
             {'status': 'above_range', 'alpha_star': float(top), 'lo': float(top), 'hi': None})
 
@@ -685,7 +697,7 @@ class BenchRun:
         keep = max(int(cfg['bb_window']), 1)
         if len(self._bb_window) > keep:
             self._bb_window = self._bb_window[-keep:]
-        period = self.args.ray_calibration.period
+        period = self.args.adaptive_lr.ray_calibration.period
         if self.m.step_ind == 0 or self.m.step_ind % period:
             return
         if len(self._bb_window) < min(4, keep):

@@ -596,15 +596,24 @@ MECHANISMS = (
     # --- LR sensors. Two independent declarations, deliberately both here.
     Mechanism('lr_sensor.ray', 'stage', 'lr_sensor_kind', Declare.EQUALS,
               ('lr_ctrl/calibrations',), Rule.COUNTER, declares_value='ray',
-              note='per-stage opt-in; the trainer errors if a stage asks for '
-                   'ray while ray_calibration.enabled is false'),
+              note='per-stage opt-in, and as of project state 2 the ONLY switch: '
+                   'the block-level `ray_calibration.enabled` flag is deleted and '
+                   'the probe now arms iff some stage declares this kind'),
     Mechanism('lr_sensor.loss_slope', 'stage', 'lr_sensor_kind', Declare.EQUALS,
               ('lr_ctrl/slope_cuts',), Rule.COUNTER, declares_value='loss_slope'),
+    # KEPT, though the key is retired in the trainer as of project state 2 --
+    # same two-era reasoning as `adaptive_lr_enabled` below. `ray_calibration.
+    # enabled` was a second declaration of what the stage already declares, and
+    # deleting it from the config was right; deleting it from THIS registry would
+    # be wrong, because every run recorded before state 2 carries it and reading
+    # those runs is the entire job. A config key's retirement does not retire the
+    # runs that used it.
     Mechanism('ray_calibration', 'global', 'ray_calibration_enabled',
               Declare.TRUTHY, ('lr_ctrl/calibrations',), Rule.COUNTER,
-              note='the global block. Enabled with no stage opting in leaves it '
-                   'inert (parameters only) -- measured on 14 of 21 runs that '
-                   'declare it'),
+              note='PRE-STATE-2 declaring key, retired in the trainer: the stage '
+                   'entry above is the switch now. On runs that carry it, enabled '
+                   'with no stage opting in leaves the block inert (parameters '
+                   'only) -- measured on 14 of 21 runs that declare it'),
     # TWO ENTRIES, ONE MECHANISM, because the declaring key changed and the two
     # eras are DISJOINT in the corpus: 53 runs carry `adaptive_lr_enabled`, 22
     # carry `adaptive_lr_seed_lr`, none carry both. Registering only the newer

@@ -101,6 +101,15 @@ pre-transition snapshot ('phase1_exit' etc., saved with request_eval stamped
 True) replay its transition through the normal path on its first post-resume
 eval.
 
+`patience` COUNTS MEASUREMENTS, NOT CHECKS -- a term's streak only moves on a
+tick where its metric was freshly written (see _advance_term). Every source
+above persists its last value, so counting checks counted one sample many
+times: `patience: 5` on a metric written every 500 steps was cleared by a
+single clean write. A term is therefore denominated in its OWN metric's
+cadence, and a patience of N on an eval/* metric costs N * eval_period train
+steps where the same N on a tick metric costs N * 10. config_invariants'
+`exit_patience_is_reachable` states that relation at load time.
+
 All mutable engine state (rule bests / streaks, live annealed
 thresholds, gate latches, request_eval) lives in modeller.stage_ctrl, which
 is checkpointed and reset at every stage transition. Live thresholds riding
@@ -119,7 +128,17 @@ MODES = ('fwd', 'bwd', 'replay')
 TRAIN_MODES = ('bwd', 'fused')
 BWD_SAMPLING_MODES = ('dataset', 'prior')
 STAGE_FLAGS = ('update_log_z', 'scramble_conditions', 'weighted_condition_sampling',
-               'buffers_active', 'mle_gate', 'weighted_bwd_sampling')
+               'buffers_active', 'weighted_bwd_sampling')
+
+# `mle_gate` is a BLOCK, not a flag. It was a flag on the stage while its three
+# parameters sat at top level, which put the switch and the settings in different
+# places -- and the parameters read as global while only one stage ever used
+# them. Presence of the block is the switch; its contents are the parameters.
+MLE_GATE_DEFAULTS = {
+    'slope_t': 2.0,      # confidence multiplier on the descent rate's standard error
+    'min_rate': 0.05,    # negligible descent rate, nats per 100 train steps
+    'window': 300,       # train steps of gate samples the slope is regressed over
+}
 ACTIONS = ('snapshot', 'snapshot_prior', 'bootstrap_z', 'seed_prior_from_anchors',
            'reseed_prior_from_dataset', 'rebuild_prior_by_churn')
 SKIP_CONDITIONS = ('prior_loaded',)
@@ -141,6 +160,14 @@ def fresh_stage_ctrl():
         'rules': {},        # rule index -> {'best', 'thr', 'look'}
         'coeffs': {},       # anneal_coeffs name -> {'val': live value}
         'exit': {},         # exit term index -> consecutive-pass streak
+        # exit term index -> the write-stamp of the last value that streak
+        # ACTUALLY JUDGED. Without it a streak cannot tell a new measurement
+        # from the same one read again (see _advance_term).
+        'exit_seen': {},
+        # gate name -> step of its last publish, the gates/* half of the same
+        # question. ctrl['gates'] alone is a stale read, exactly like the
+        # metric tracker's.
+        'gate_written': {},
         'anneal_streak': 0,
         'boost': None,      # last chosen boost mode (logging)
         'exit_armed': False,
@@ -171,7 +198,8 @@ class Stage:
         unknown = set(spec) - {'name', 'train_mode', 'bwd_sampling_mode', 'flags',
                                'loss_coeffs', 'fracs', 'min_fracs',
                                'deactivate_threshold', 'balance', 'buffer_servo',
-                               'lr_sensor', 'exit', 'on_exit', 'on_enter', 'skip_if'}
+                               'lr_sensor', 'exit', 'on_exit', 'on_enter', 'skip_if',
+                               'mle_gate'}
         if unknown:
             raise ValueError(f"protocol.stages[{index}] has unknown keys {sorted(unknown)}")
         self.index = index
@@ -231,6 +259,7 @@ class Stage:
         self.balance = self._parse_balance(spec.get('balance'))
         self.buffer_servo = self._parse_buffer_servo(spec.get('buffer_servo'))
         self.lr_sensor = self._parse_lr_sensor(spec.get('lr_sensor'))
+        self.mle_gate = self._parse_mle_gate(spec.get('mle_gate'))
         self.exit = self._parse_exit(spec.get('exit'))
         self.on_exit = self._parse_actions(spec.get('on_exit'), 'on_exit')
         self.on_enter = self._parse_actions(spec.get('on_enter'), 'on_enter')
@@ -356,6 +385,41 @@ class Stage:
                     f"branch would go dark while the controller still steers it")
             bounds[mode] = [lo, hi]
         return bounds
+
+    def _parse_mle_gate(self, node):
+        """The MLE descent gate's parameters, or None if this stage has no gate.
+
+        PRESENCE IS THE SWITCH. This used to be `flags: {mle_gate: true}` with
+        slope_t / min_rate / window living at config top level -- so the switch
+        and the settings sat in different places, and the settings read as global
+        while only the one MLE stage ever consulted them. A stage that publishes
+        the gate now carries the numbers that shape it.
+
+        `{}` is legal and means "gate on, defaults" -- an empty block still
+        declares intent, which a missing one does not."""
+        if node is None:
+            return None
+        if not isinstance(node, dict):
+            raise TypeError(f"stage '{self.name}': mle_gate must be a mapping, "
+                            f"got {type(node)}")
+        bad = set(node) - set(MLE_GATE_DEFAULTS)
+        if bad:
+            raise ValueError(f"stage '{self.name}': unknown mle_gate keys "
+                             f"{sorted(bad)} (known: {sorted(MLE_GATE_DEFAULTS)})")
+        out = dict(MLE_GATE_DEFAULTS)
+        out.update(node)
+        for k in ('slope_t', 'min_rate'):
+            if not (isinstance(out[k], (int, float)) and float(out[k]) > 0):
+                raise ValueError(f"stage '{self.name}': mle_gate.{k} must be a "
+                                 f"positive number, got {out[k]!r}")
+        # The gate samples every 10 steps and the regression needs at least a few
+        # points, so a window under 40 steps yields fewer than 4 and the slope is
+        # noise fitted to noise.
+        if not (isinstance(out['window'], int) and out['window'] >= 40):
+            raise ValueError(f"stage '{self.name}': mle_gate.window must be an "
+                             f"int >= 40 (it is sampled every 10 steps and the "
+                             f"regression needs >= 4 points), got {out['window']!r}")
+        return out
 
     def _parse_lr_sensor(self, node):
         """
@@ -951,10 +1015,22 @@ class StageProtocol:
     @property
     def stages(self):
         if self._stages is None:
-            node = getattr(self.m.args, 'protocol', None)
-            specs = getattr(node, 'stages', None) if node is not None else None
+            # ONE resolution point, shared with the config validators. The config
+            # holds every protocol under `protocols:` and names the live one in
+            # `protocol:`; the validators must agree with the trainer about which
+            # stages are live, or a check passes on a list the run never executes.
+            from config_invariants import (active_protocol_name, active_stages,
+                                           PROTOCOL_LIBRARY)
+            args = self.m.args
+            specs = active_stages(args)
             if not specs:
-                raise ValueError("config needs a protocol.stages list (see configs/mk_dev.yaml)")
+                name = active_protocol_name(args)
+                have = getattr(args, PROTOCOL_LIBRARY, None)
+                known = sorted(vars(have)) if have is not None else []
+                raise ValueError(
+                    f"no live protocol: `protocol` names {name!r} and `protocols` "
+                    f"defines {known or 'nothing'}. Set `protocol:` to one of them "
+                    f"(see configs/mk_dev.yaml).")
             self._stages = [Stage(s, i) for i, s in enumerate(specs)]
             names = [s.name for s in self._stages]
             if len(set(names)) != len(names):
@@ -1072,8 +1148,31 @@ class StageProtocol:
 
     def publish_gate(self, name: str, value: float):
         """Gate publishers (e.g. the MLE slope gate) drop their verdicts here;
-        triggers and rules read them as 'gates/<name>'."""
+        triggers and rules read them as 'gates/<name>'. The publish is stamped
+        so a reader can tell a fresh verdict from the last one left lying
+        around -- a gate that stops publishing leaves its value behind."""
         self.ctrl['gates'][name] = float(value)
+        self.ctrl.setdefault('gate_written', {})[name] = int(getattr(self.m, 'step_ind', 0))
+
+    def _write_step(self, name: str, eval_metrics: dict = None):
+        """The step at which `name` last received a FRESH value, or None if it
+        has not been written (in this process, for tracker/gate metrics).
+
+        The companion to `_resolve`, and the thing the exit engine was missing:
+        every source here PERSISTS its last value, so `_resolve` alone cannot
+        distinguish "the metric is passing" from "the metric passed once, a
+        long time ago, and nothing has written it since"."""
+        if name.startswith('gates/'):
+            return self.ctrl.get('gate_written', {}).get(name[len('gates/'):])
+        if name.startswith('eval/'):
+            # eval metrics are handed in for the duration of one maybe_advance
+            # call and do not persist, so presence in the dict IS freshness;
+            # the eval's own step is the stamp.
+            if eval_metrics is None or name[len('eval/'):] not in eval_metrics:
+                return None
+            return int(getattr(self.m, 'step_ind', 0))
+        direction, _, metric = name.partition('/')
+        return self.m.metric_tracker.written_step(direction, metric)
 
     def gate_state(self, name: str) -> dict:
         """Scratch dict for a gate's internals (windows, latches), checkpointed
@@ -1101,12 +1200,48 @@ class StageProtocol:
             v = abs(v)
         return (v > term['above']) if 'above' in term else (v < term['below'])
 
+    def _advance_term(self, i: int, term: dict, eval_metrics: dict = None):
+        """Advance ONE exit term's pass-streak, gated on the metric having been
+        FRESHLY WRITTEN since this streak last judged it. Three outcomes, and
+        keeping them distinct is the whole point:
+
+            fresh value, passes  -> advance
+            fresh value, fails   -> reset to 0
+            NO fresh value       -> HOLD, neither advance nor reset
+
+        PATIENCE COUNTS MEASUREMENTS, NOT TICKS. It used to count ticks, and
+        every value source here (metric_tracker EMAs, gates/* publishes, eval
+        metrics) persists its last value, so a term read faster than its metric
+        is written counted ONE sample as N. Measured on the prod0810 phase-1
+        block: a single `bwd/tbc` write at step 100 carried the streak to 20
+        over 20 subsequent ticks with no further write, and `gates/mle_flat`
+        published once cleared its `patience: 5` three ticks later. A patience
+        of 5 on a metric written every 500 steps meant 50 steps of the same
+        number, not five independent readings.
+
+        Holding rather than resetting is deliberate, and it is the other half
+        of the same bug. Resetting on a quiet tick would make patience > 1
+        UNREACHABLE for any metric slower than the 10-step tick -- which is
+        what `next_battery.md` 1.3 believed was already happening. Neither
+        counting nor discounting a non-measurement is right; not judging it
+        is."""
+        streaks, seen = self.ctrl['exit'], self.ctrl.setdefault('exit_seen', {})
+        stamp = self._write_step(term['metric'], eval_metrics)
+        if stamp is None or stamp == seen.get(i):
+            return                      # nothing new to judge
+        seen[i] = stamp
+        streaks[i] = streaks.get(i, 0) + 1 if self._term_passes(term, eval_metrics) else 0
+
     def _exit_tick(self):
         """Advance each tick-resolvable term's pass-streak; on the rising edge
         of 'all tick terms at patience', pull the next eval forward. eval/*
-        terms can't be watched at tick cadence -- they are checked with fresh
+        terms can't be watched at tick cadence -- they are advanced with fresh
         values inside maybe_advance, exactly like the old phase-1 gate latched
-        on the MLE slope and left wass to the pulled-forward eval."""
+        on the MLE slope and left wass to the pulled-forward eval.
+
+        Arming stays a TICK-TERM question. An eval/* term cannot contribute to
+        it without deadlocking the pull-forward against the very eval that
+        would satisfy it."""
         stage = self.stage
         if stage.exit is None:
             return
@@ -1115,31 +1250,37 @@ class StageProtocol:
         for i, term in enumerate(stage.exit):
             if term['metric'].startswith('eval/'):
                 continue
-            streaks[i] = streaks.get(i, 0) + 1 if self._term_passes(term) else 0
-            if streaks[i] < term.get('patience', 1):
+            self._advance_term(i, term)
+            if streaks.get(i, 0) < term.get('patience', 1):
                 armed = False
         if armed and not self.ctrl['exit_armed']:
             self.ctrl['request_eval'] = True  # pull the eval that will run maybe_advance
         self.ctrl['exit_armed'] = armed
 
     def _exit_satisfied(self, eval_metrics: dict) -> bool:
+        """Every term at its patience. UNIFORM over eval/* and tick terms now
+        that both keep a real streak -- eval/* used to be tested once against
+        the fresh metrics with `patience` silently DISCARDED, so a patience of
+        5 on an eval metric fired on the first clean eval. The key was accepted
+        by _parse_exit and then ignored, which is the config reading as one
+        thing and meaning another."""
         stage = self.stage
         if stage.exit is None:
             return False  # terminal stage
-        for i, term in enumerate(stage.exit):
-            if term['metric'].startswith('eval/'):
-                if not self._term_passes(term, eval_metrics):
-                    return False
-            elif self.ctrl['exit'].get(i, 0) < term.get('patience', 1):
-                return False
-        return True
+        return all(self.ctrl['exit'].get(i, 0) >= term.get('patience', 1)
+                   for i, term in enumerate(stage.exit))
 
     def maybe_advance(self, eval_metrics: dict) -> bool:
         """Called from evaluation() after metrics are computed -- the one place
-        transitions execute. Clears any pending pulled-forward eval request
-        (this eval satisfies it, whoever set it: the trigger arming tick, or a
-        reloaded pre-transition snapshot's stamped request_eval)."""
+        transitions execute. Advances the eval/* terms first (this is the only
+        cadence at which those metrics exist, so one eval is one measurement),
+        then tests the whole trigger. Clears any pending pulled-forward eval
+        request (this eval satisfies it, whoever set it: the trigger arming
+        tick, or a reloaded pre-transition snapshot's stamped request_eval)."""
         self.ctrl['request_eval'] = False
+        for i, term in enumerate(self.stage.exit or []):
+            if term['metric'].startswith('eval/'):
+                self._advance_term(i, term, eval_metrics)
         if not self._exit_satisfied(eval_metrics):
             return False
         self.advance(eval_metrics)
@@ -2108,4 +2249,15 @@ class StageProtocol:
             for i, term in enumerate(stage.exit):
                 tag = term['metric'].replace('/', '_')
                 out[f'protocol/exit_streak_{tag}'] = self.ctrl['exit'].get(i, 0)
+                # AGE, next to the streak, because the streak alone is
+                # ambiguous in exactly the way that cost a battery. A flat zero
+                # reads as "this condition never passes"; on the eval/* terms it
+                # used to mean "this condition is never JUDGED here", and
+                # `next_battery.md` 1.3 read the first from the second. Age
+                # separates them: a streak stuck at 0 with age climbing is a
+                # metric nobody is writing, a streak stuck at 0 with age at the
+                # metric's own cadence is a bar that genuinely is not met.
+                last = self.ctrl.get('exit_seen', {}).get(i)
+                out[f'protocol/exit_age_{tag}'] = (
+                    -1.0 if last is None else float(int(self.m.step_ind) - int(last)))
         return out

@@ -285,9 +285,52 @@ _RETIRED_KEYS = {
         "would re-enter the force spectrum uncorrected on top of it.",
     'buffers.replay_buffer.admit_cap_min': "deleted (see admit_cap_max).",
     'buffers.replay_buffer.admit_cap_health_h0': "deleted (see admit_cap_max).",
+    'mle_slope_t':
+        "moved -> the declaring stage's `mle_gate.slope_t`. The three gate "
+        "parameters sat at top level while the switch was a stage flag, so the "
+        "switch and the settings lived in different places and the settings read "
+        "as global though only the MLE stage consulted them. The block's PRESENCE "
+        "is now the switch.",
+    'mle_min_rate': "moved -> the declaring stage's `mle_gate.min_rate` (see mle_slope_t).",
+    'mle_slope_window': "moved -> the declaring stage's `mle_gate.window` (see mle_slope_t).",
+    'ray_calibration':
+        "moved -> adaptive_lr.ray_calibration. It parameterises one of the LR "
+        "sensors, so it belongs with the rest of the LR machinery rather than at "
+        "top level. Move the block; the parameters themselves are unchanged.",
+    'ray_calibration.enabled':
+        "deleted -- a stage declaring `lr_sensor: {kind: ray}` IS the switch, and "
+        "a second flag could disagree with it (a stage asking for ray while the "
+        "flag said false trained at its seed LR with the config claiming a "
+        "sensor). `enabled` is now DERIVED from which stages ask. Note the "
+        "asymmetry that gave it away: `hyper` has no block at all and declares "
+        "itself inline at the stage.",
+    'adaptive_lr.ray_calibration.enabled':
+        "deleted (see ray_calibration.enabled) -- derived from the stages that "
+        "declare lr_sensor kind 'ray'.",
     'buffers.replay_buffer.admit_temperature':
         "deleted (see admit_cap_max) -- admission and the displacement purge "
         "both draw uniformly now, so there is no softmax temperature left to set.",
+    'buffers.replay_buffer.max_residence_steps':
+        "deleted -- the hard age cap was doing 100% of eviction and culling the "
+        "improving tail. Replaced by mean_residence_steps, a memoryless hazard: "
+        "residence becomes exponential (CV ~1, a WIDE lag distribution) instead "
+        "of a spike at the cap, which is what keeps the buffer a lowpass on the "
+        "policy->buffer->gradient path rather than a phase lag concentrated at "
+        "one frequency. Sizing is Little's law: occupancy = churn_rate * "
+        "mean_residence_steps.",
+    'buffers.replay_buffer.toxic_min_draws':
+        "deleted -- the stalled-row purge it fed was residual-dependent, and is "
+        "exactly redundant with hazard+backstop once the DRAW itself is "
+        "prioritised: a corrected row already draws at p ~ 0, so the purge was "
+        "buying memory rather than gradient budget. Worse, it fabricated "
+        "evidence -- a row driven to delta ~ 0 by repeated replay IS the "
+        "memorisation sensor's positive case, so purging it early deleted the "
+        "evidence absorption_stats reads, and a residual-dependent survival "
+        "probability breaks that sensor's no-survivorship-bias property. "
+        "Eviction is hazard + age backstop only.",
+    'buffers.replay_buffer.toxic_delta_threshold':
+        "deleted (see toxic_min_draws) -- the other half of the same "
+        "stalled-row purge.",
 }
 
 
@@ -1515,6 +1558,21 @@ class MetricTracker:
         self.best = {}  # (direction, name) -> [min, max]
         self.last_it = {}  # direction -> step
         self.changed_keys = set()
+        # (direction, name) -> the step of that key's most recent FRESH write.
+        #
+        # `get` is a stale read by construction: once a key has been written the
+        # value persists forever, so a reader ticking faster than the writer sees
+        # the same sample over and over with no way to tell. That is fine for a
+        # controller nudging on an EMA and WRONG for anything counting
+        # consecutive passes -- protocol's exit streaks counted one stale sample
+        # as N independent ones. This stamp is what lets a reader ask "is this a
+        # new measurement?" instead of only "what is the value?".
+        #
+        # NOT in state_dict: it is a within-process fact about writes this
+        # process has seen, and a restored stamp from a previous run would
+        # claim freshness nobody observed. A reader therefore sees "no fresh
+        # write yet" for the first tick after a resume, which is the truth.
+        self.written_at = {}
 
     def update(self, direction, scalars: dict, step: int):
         dt = max(step - self.last_it.get(direction, step), 1)
@@ -1530,6 +1588,7 @@ class MetricTracker:
 
             self.values[key] = nv
             self.changed_keys.add(key)  # mark as changed
+            self.written_at[key] = int(step)
 
             b = self.best.get(key)
             if b is None:
@@ -1542,6 +1601,12 @@ class MetricTracker:
 
     def get(self, direction, name, default=None):
         return self.values.get((direction, name), default)
+
+    def written_step(self, direction, name):
+        """The step of the last FRESH write to this key, or None if it has not
+        been written in this process. Pairs with `get`, which cannot distinguish
+        a value written this step from one written ten thousand steps ago."""
+        return self.written_at.get((direction, name))
 
     def get_best(self, direction, name, mode='max', default=None):
         b = self.best.get((direction, name))

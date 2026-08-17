@@ -38,6 +38,7 @@ yourself typing `'fwd/'` here, stop.
 
 from __future__ import annotations
 
+import copy
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -263,6 +264,10 @@ class Comparison:
     sweep: SweepTable
     features: FeatureTable
     window: Optional[float]
+    # The step span every arm was read over, when one was requested. Carried so
+    # the render states it: a table that does not say which ticks it used cannot
+    # be told from one read at each arm's own trailing window.
+    span: Optional[tuple] = None
 
     @property
     def blockers(self) -> tuple:
@@ -339,18 +344,21 @@ def _labels(runs) -> tuple:
     """`(label, short)` per run, positionally.
 
     EVERY TABLE IS KEYED BY `label`, so it has to be unique or two arms share a
-    column. `checks.run_label` gives `name#run_id` and that is unique for real
-    runs, but the same run object passed twice is not, and a silent collision
-    loses a whole arm -- so a repeat gets a visible `~N` rather than
-    disappearing.
+    column. `checks.battery_labels` disambiguates a shared display name by the
+    CONFIG KNOB THAT DIFFERS rather than by a wandb id -- an id is a hash and
+    carries nothing, and `reading_runs.md` §7 asks for a name, a tag, or a
+    distinguishing config feature. The same run object passed twice is still not
+    unique, and a silent collision loses a whole arm, so a repeat gets a visible
+    `~N` rather than disappearing.
 
     `short` is the column heading: the bare display name, and only when it is
     unique in THIS battery. Nine names in the local corpus are shared by two or
     more runs and `mk_dev` alone by eleven.
     """
+    keyed = C.battery_labels(runs)
     labels, seen = [], set()
     for run in runs:
-        lab = C.run_label(run)
+        lab = keyed.get(id(run)) or C.run_label(run)
         base, i = lab, 1
         while lab in seen:
             i += 1
@@ -636,6 +644,55 @@ def feature_table(runs, *, metrics: Optional[Iterable[str]] = None,
 _CONFIG_SUBJECT_SUFFIX = '/config'
 
 
+def matched_span(runs) -> tuple:
+    """`(lo, hi)` -- the step span EVERY arm covers, or None if they do not overlap.
+
+    A trailing window is measured from each arm's own last step, so arms that
+    stopped at different points are read at different TRAINING AGES, and every
+    topline metric here improves with age. Measured on two real cluster arms
+    sharing a name: at their own trailing windows one led on every topline
+    metric; over the span they both covered, the other led on every one. The
+    comparison reversed.
+
+    `check_confounds` FLAGS that (battery/training_age). This is the other half:
+    the span that makes the comparison answerable. Ending at the earliest last
+    step is what makes it symmetric -- the longer arm is read at the age the
+    shorter one reached, not the other way round.
+    """
+    firsts, lasts = [], []
+    for run in runs:
+        steps = [s for s, _ in (run.history or {}).values() if len(s)]
+        if not steps:
+            return None
+        firsts.append(min(float(s[0]) for s in steps))
+        lasts.append(max(float(s[-1]) for s in steps))
+    lo, hi = max(firsts), min(lasts)
+    return (lo, hi) if hi > lo else None
+
+
+def _span_slice(run, span):
+    """A COPY of `run` holding only the history inside `span`.
+
+    A copy rather than a flag threaded through every extractor: the whole point
+    is that every downstream number is computed on the same ticks, and a flag
+    that one code path forgets to honour produces a table mixing two spans
+    silently.
+    """
+    if span is None:
+        return run
+    lo, hi = span
+    trimmed = {}
+    for k, (s, v) in (run.history or {}).items():
+        s = np.asarray(s, float)
+        v = np.asarray(v, float)
+        m = (s >= lo) & (s <= hi)
+        if m.any():
+            trimmed[k] = (s[m], v[m])
+    clone = copy.copy(run)
+    clone.history = trimmed
+    return clone
+
+
 def _blockers(res: C.CheckResult) -> tuple:
     """The §4 findings that say these arms may not be read against each other.
 
@@ -660,7 +717,7 @@ def _blockers(res: C.CheckResult) -> tuple:
 
 
 def compare(runs, *, metrics: Optional[Iterable[str]] = None,
-            window: Optional[float] = None) -> Comparison:
+            window: Optional[float] = None, span=None) -> Comparison:
     """Compare arms: §4 first, then the sweep, then the aligned features.
 
     `runs` is an iterable of `pull.Run`. One run is allowed and answers
@@ -678,16 +735,33 @@ def compare(runs, *, metrics: Optional[Iterable[str]] = None,
             '"compared them, nothing differs", which is the opposite of what '
             'is true.')
 
+    # `span='matched'` reads every arm over the steps they ALL cover, which is
+    # what makes arms that stopped at different points comparable at all. The
+    # confounds run on the UNTRIMMED runs -- an arm's stopping point, stage
+    # residence and code version are facts about the run, not about the window
+    # chosen to read it through, and trimming first would hide the very
+    # training-age difference that motivates the span.
+    if span == 'matched':
+        span = matched_span(runs)
+        if span is None:
+            raise ValueError(
+                'these arms share no step span, so there is no age at which '
+                'they can be compared. Reading them at their own trailing '
+                'windows would compare different training ages and report the '
+                'difference as a result.')
+    read = [_span_slice(r, span) for r in runs] if span else runs
+
     confounds = C.check_confounds(runs, window=window)
-    confounds.run = ', '.join(C.run_label(r) for r in runs)
+    confounds.run = ', '.join(C.battery_labels(runs)[id(r)] for r in runs)
     confounds.header = f'{len(runs)} arm(s)'
 
     arm_list = arms(runs)
     sweep = sweep_table(runs, arm_list)
-    feats = feature_table(runs, metrics=metrics, window=window,
+    feats = feature_table(read, metrics=metrics,
+                          window=None if span else window,
                           blockers=_blockers(confounds))
     return Comparison(arms=arm_list, confounds=confounds, sweep=sweep,
-                      features=feats, window=window)
+                      features=feats, window=window, span=span)
 
 
 # ---------------------------------------------------------------------------
@@ -915,8 +989,18 @@ def _format_gate(table: FeatureTable) -> str:
 def format_comparison(cmp: Comparison, *, verbose: bool = False,
                       stats: Iterable[str] = DEFAULT_STATS) -> str:
     """§4, then the sweep, then the features. The order is the point."""
-    return '\n\n'.join([
-        C.format_result(cmp.confounds, verbose=verbose),
-        format_sweep(cmp.sweep),
-        format_feature_table(cmp.features, stats=stats),
-    ])
+    parts = [C.format_result(cmp.confounds, verbose=verbose),
+             format_sweep(cmp.sweep)]
+    if cmp.span:
+        # Stated ABOVE the table, not in a footnote: a matched-span table and a
+        # trailing-window table look identical and answer different questions,
+        # and that difference has already reversed a real comparison.
+        lo, hi = cmp.span
+        parts.append(
+            f'READ AT A MATCHED SPAN  steps {lo:.0f}-{hi:.0f}, which every arm '
+            f'covers.\n  Every arm is read at the SAME TRAINING AGE. Read at '
+            f'their own trailing windows instead, arms that stopped at '
+            f'different points are compared at different ages -- and every '
+            f'metric here improves with age.')
+    parts.append(format_feature_table(cmp.features, stats=stats))
+    return '\n\n'.join(parts)

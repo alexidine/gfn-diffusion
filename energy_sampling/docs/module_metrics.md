@@ -206,12 +206,12 @@ of a per-sample 0/1 indicator, and a batch fraction cannot see failure
 | half the conditions 0% good | 0.50 | **half the library lost** |
 
 The second is a much worse model and is the one a conditional run risks.
-[`per_condition_fraction`](../utils.py:1766) groups the indicator by
+[`per_condition_fraction`](../utils.py:1961) groups the indicator by
 `condition_id`, takes each condition's own fraction `p_c`, and reduces *that*
 distribution. `Modeller.log_condition_fraction` publishes it at three sites —
-train-condition reasonable ([`train.py:4089`](../train.py:4089)) and non-thermal
-([`train.py:4271`](../train.py:4271)) at top level, held-out reasonable
-([`train.py:3864`](../train.py:3864)) under `eval_test/`:
+train-condition reasonable ([`train.py:4590`](../train.py:4590)) and non-thermal
+([`train.py:4789`](../train.py:4789)) at top level, held-out reasonable
+([`train.py:4325`](../train.py:4325)) under `eval_test/`:
 
 | Key | Meaning |
 |---|---|
@@ -277,9 +277,9 @@ mask); the key is omitted when fewer than two conditions have 2+ samples.
 **Held-out: the reasonable half only, and that asymmetry is structural.**
 `log_test_metrics` publishes `eval_test/Reasonable Sample Fraction` alongside the
 `eval_test/Cond Reasonable *` family, computed by the same
-`_reasonable_sample_mask` ([`train.py:4100`](../train.py:4100)) as the train-side
+`_reasonable_sample_mask` ([`train.py:4601`](../train.py:4601)) as the train-side
 reading, so the *indicator* is like-for-like — the rule `_eval_conditional_stats`
-already follows for the TB family. The *sampling* is not (see the `n_c` table
+already follows for the TB family (§3e). The *sampling* is not (see the `n_c` table
 above), which is what confines the cross-stream comparison to
 `Reasonable Sample Fraction` and `Cond Reasonable Spread`. The **non-thermal**
 family cannot follow at all:
@@ -291,6 +291,66 @@ there. Giving the held-out set its own `Emin(c)` table would not fix this: an
 `Emin` from a handful of eval batches is far shallower than one accumulated over
 training, so the two sides would stop being comparable, which is the only reason
 the `eval_fwd`/`eval_test` pair is worth logging.
+
+### 3e. The three eval streams — one call site, one quantile, disjoint namespaces
+
+An eval publishes the same metric family three times, under three prefixes:
+
+| Prefix | Stream | Batch |
+|---|---|---|
+| `eval_fwd/` | on-policy, **train** conditions | `eval_num_samples` |
+| `eval_bwd/` | backward from the prior/replay draw | `eval_num_samples` |
+| `eval_test/` | on-policy, **held-out** conditions (`test_molecules_path`) | `test_eval_num_samples`, `side_effects=False` |
+
+All three come from **one** call site,
+[`_eval_conditional_stats`](../train.py:4235), which differs per stream only in
+the accumulated tensors and the direction's `*_loss_coeffs` (for the Huber
+`clip_beta` behind `tb_resid_clipped` / `z_grad_worst`). `worst_quantile` is
+always `conditional_worst_quantile` — the same value `_update_rolling`,
+`log_condition_fraction` and `condition_tracker_figs` read, so *the worst-case
+condition* is one convention run-wide.
+
+**Why one call site rather than three careful ones.** The names are shared and
+the dashboard reads them as a set, so any argument that changes what a name
+*means* must be impossible to set on one stream and not another. It was not: the
+`eval_fwd`/`eval_bwd` calls omitted `worst_quantile` and silently took
+`quick_tb_stats`' `0.5` default, while `log_test_metrics` recomputed the
+train-condition stats at the protocol quantile and overwrote four `eval_fwd/`
+keys on its way out. Update order in `evaluation` decided which definition
+reached wandb, and because the overwrite only ran when a held-out set was
+configured, `eval_fwd/tb_err_worst` meant the **median** condition on a run
+without `test_molecules_path` and the **upper-tail** one on a run with it. Only
+the `*_worst` family was affected (`cond_tb_err` and `logw_std_within` do not
+read the quantile), so nothing looked wrong — both numbers were plausible.
+
+Two structural rules now hold it in place, and both are asserted
+(`test_condition_fractions.py`):
+
+- **`log_test_metrics` writes nothing outside `eval_test/`.** The one shared key
+  is the unprefixed `Cond * Bar`, and it is shared deliberately — `_log_setting`'s
+  cache makes the second writer a no-op, so it stays one series (§3d).
+- **[`_merge_metrics`](../train.py:4949) refuses to overwrite.** Two writers on
+  one key is a disagreement about what the channel means, not a merge; it fails
+  the run at the first eval rather than resolving by call order.
+
+**Cross-stream reading: the quantile family travels, the RMS family does not.**
+`eval_fwd` vs `eval_test` is the generalization gap and there is no `eval_gap/`
+block — it is a panel expression over two logged series. But the two streams pool
+very different sample counts over very different condition counts (`qm9anchor_aug14`:
+10,000 over ~4,470 train conditions against 2,000 over ~570 held-out ones), and
+that governs which keys are comparable:
+
+| Family | Keys | Across `eval_fwd` / `eval_test`? |
+|---|---|---|
+| per-condition quantile | `tb_err_worst`, `z_grad_worst`, `cond_tb_err` | **yes** — a quantile over conditions is not a tail-hitting statistic |
+| pooled RMS | `scatter_err`, `over_coverage`, `under_coverage`, `logw_std_within`, `tb_err` | **no** — an RMS over a 5× larger pool reaches the tail ~8× more often |
+
+The failure this prevents looks exactly like a generalization signal:
+`eval_fwd/scatter_err` running an order of magnitude above `eval_test/scatter_err`
+at the same tick while every quantile key shows no gap at all. That is sampling
+geometry, not the conditioner. Same shape as §3d's `Failing Frac` / `Spread`
+split, one level up: **the level comparison needs a statistic whose expectation
+does not move with the sample count.**
 
 ## 4. Unconditional degeneracies
 

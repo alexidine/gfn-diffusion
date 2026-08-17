@@ -50,6 +50,56 @@ class Violation:
         return f'{self.severity:8s} {self.rule}: {self.detail}'
 
 
+# ---------------------------------------------------------------------------
+# THE PROTOCOL SELECTOR -- one resolution point, imported by everything that
+# needs the stage list.
+#
+# The canonical config carries EVERY protocol under `protocols:` and names the
+# live one in `protocol:`. Switching route is then a one-word edit rather than a
+# stage-list rewrite, and both alternatives sit in the same file where they can
+# be compared.
+#
+# This function exists because the stage list used to be read from the literal
+# path `protocol.stages` in six places. Four of those are validators, and
+# `auto_lr_requires_an_adaptive_sensor` returns [] on absence while utils makes
+# it a RAISING load gate -- so a restructure that moved the list would have
+# silently disarmed the gate rather than tripping it. One resolver means the next
+# move has one place to change.
+# ---------------------------------------------------------------------------
+
+PROTOCOL_SELECTOR = 'protocol'      # names the live protocol
+PROTOCOL_LIBRARY = 'protocols'      # holds every protocol, keyed by name
+
+
+def _member(node, name, default=None):
+    """Read `name` off a dict OR an argparse.Namespace, so one resolver serves
+    the raw-YAML callers and the trainer alike."""
+    if node is None:
+        return default
+    if isinstance(node, dict):
+        return node.get(name, default)
+    return getattr(node, name, default)
+
+
+def active_protocol_name(cfg) -> Optional[str]:
+    sel = _member(cfg, PROTOCOL_SELECTOR)
+    return sel if isinstance(sel, str) else None
+
+
+def active_stages(cfg) -> list:
+    """The stage specs the run will actually execute, or [] if unresolvable.
+
+    Returns [] rather than raising: a validator's job is to report a broken
+    config, not to die alongside it. The callers that MUST have stages
+    (protocol.StageProtocol) raise on the empty result themselves, with a message
+    about what is missing."""
+    name = active_protocol_name(cfg)
+    if name is None:
+        return []
+    entry = _member(_member(cfg, PROTOCOL_LIBRARY), name)
+    return list(_member(entry, 'stages', []) or [])
+
+
 def _get(cfg: dict, dotted: str, default=None):
     node: Any = cfg
     for p in dotted.split('.'):
@@ -184,7 +234,7 @@ def deactivate_threshold_is_sane(cfg: dict) -> list[Violation]:
             out.append(Violation(ERROR, 'deactivate_threshold_is_sane',
                                  f'{path}={v} >= 1/3; a three-way frac split can be '
                                  f'fully deactivated, leaving no active branch.'))
-    for st in _get(cfg, 'protocol.stages', []) or []:
+    for st in active_stages(cfg):
         if not isinstance(st, dict):
             continue
         v = _num(st.get('deactivate_threshold'))
@@ -204,7 +254,7 @@ def pinned_frac_matches_fracs(cfg: dict) -> list[Violation]:
     describe different splits and which one a step sees depends on evaluation
     order."""
     out = []
-    for st in _get(cfg, 'protocol.stages', []) or []:
+    for st in active_stages(cfg):
         if not isinstance(st, dict):
             continue
         bal = st.get('balance') or {}
@@ -289,7 +339,7 @@ def auto_lr_requires_an_adaptive_sensor(cfg: dict,
     if not auto_keys:
         return []                      # every rate explicitly pinned: nothing to own
 
-    stages = _get(cfg, 'protocol.stages', []) or []
+    stages = active_stages(cfg)
     if not stages:
         return []                      # no protocol to reason about
 
@@ -322,7 +372,7 @@ def ray_sensor_needs_a_coherent_stage(cfg: dict) -> list[Violation]:
     optimising -- and does so silently, tallying skips rather than raising."""
     out = []
     base_replay_tb = _num(_get(cfg, 'replay_loss_coeffs.tb')) or 0.0
-    for st in (_get(cfg, 'protocol.stages', []) or []):
+    for st in active_stages(cfg):
         if not isinstance(st, dict):
             continue
         sensor = st.get('lr_sensor')
@@ -379,10 +429,313 @@ def periodic_centroids_needs_one_crystal_space_group(cfg: dict) -> list[Violatio
     return out
 
 
+# ---------------------------------------------------------------------------
+# EXIT TRIGGERS. Two ways a declared exit condition ships dead, both found in
+# the 2026-08-16 audit of prod0810 / qm9anchor_aug14 (docs/design/next_battery.md
+# 1.1a and 1.3), and both provable from the YAML.
+# ---------------------------------------------------------------------------
+
+# The exit trigger's check cadence in train steps: train.py runs
+# `protocol.tick()` inside `if self.step_ind % 10 == 0`. Hardcoded there, so it
+# is a constant here too -- if that block moves, this must move with it.
+EXIT_TICK_STEPS = 10
+
+
+def _exit_metric_cadence(cfg: dict, metric: str) -> Optional[float]:
+    """Train steps between successive WRITES of `metric`, or None if the config
+    does not determine it.
+
+    `eval/*` is written once per evaluation. `gates/*` is published from the
+    same 10-step block that runs the tick, and `dir/*` rides the metric tracker,
+    written by whichever branch produced the sample -- both are tick-rate or
+    faster, so the tick is the binding cadence for them."""
+    if not isinstance(metric, str):
+        return None
+    if metric.startswith('eval/'):
+        return _num(_get(cfg, 'eval_period'))
+    return float(EXIT_TICK_STEPS)
+
+
+def exit_patience_is_reachable(cfg: dict) -> list[Violation]:
+    """An exit term's `patience` counts WRITES of its metric, not checks of it.
+
+    protocol._advance_term only moves a streak on a tick where the metric was
+    freshly written, because every value source it reads persists its last
+    value: counting checks counted one sample many times, so a `patience: 5` on
+    a metric written every 500 steps was cleared by a SINGLE clean write 50
+    steps later. Patience is therefore denominated in the term's own metric
+    cadence, and the same integer means different things on different terms of
+    one `exit:` block.
+
+    Two consequences, both readable off the YAML:
+
+      ERROR     `patience * cadence` exceeds `epochs`. The term cannot reach
+                its patience before the run ends, so the stage's exit is
+                governed by its OTHER terms while the config reads as if this
+                one participates. That is the shape 1.3 describes: a trigger
+                whose declared conditions and effective conditions differ.
+      BASELINE  a coarse-cadence term (eval/*) carrying patience > 1 sits in a
+                block alongside tick terms whose identical integer costs
+                cadence/10 times fewer steps. Legal, and worth stating, because
+                nothing at the point of writing it says the units differ.
+
+    NOT an error merely for being coarse. The engine handles a slow metric
+    correctly now; it just costs `patience * eval_period` steps to satisfy."""
+    epochs = _num(_get(cfg, 'epochs'))
+    out = []
+    for st in active_stages(cfg):
+        if not isinstance(st, dict):
+            continue
+        for i, term in enumerate(st.get('exit') or []):
+            if not isinstance(term, dict):
+                continue
+            metric = term.get('metric')
+            patience = _num(term.get('patience'))
+            if patience is None or patience <= 1:
+                continue                # patience 1 is one measurement, always reachable
+            cadence = _exit_metric_cadence(cfg, metric)
+            if cadence is None or cadence <= 0:
+                continue                # eval_period absent: nothing to reason about
+            cost = patience * cadence
+            where = f"stage {st.get('name')!r} exit term {i} ({metric}, patience {patience:g})"
+            if epochs is not None and cost > epochs:
+                out.append(Violation(
+                    ERROR, 'exit_patience_is_reachable',
+                    f'{where} needs {patience:g} writes of {metric} at one every '
+                    f'{cadence:g} steps = {cost:g} train steps, but the run is '
+                    f'{epochs:g} steps. The term can never reach its patience, so '
+                    f'the stage exits on its remaining terms while the config reads '
+                    f'as if this one gates.'))
+            elif cadence > EXIT_TICK_STEPS:
+                out.append(Violation(
+                    BASELINE, 'exit_patience_is_reachable',
+                    f'{where} is denominated in that metric\'s own cadence: '
+                    f'{patience:g} writes at one every {cadence:g} steps = {cost:g} '
+                    f'train steps. The same patience on a tick-cadence term in the '
+                    f'same block costs {patience * EXIT_TICK_STEPS:g} steps.'))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# MEASURED METRIC RANGES -- the read-time R14 "bar inside its own scatter"
+# check (analysis/checks.py, _R14_TAG_BAR), moved to config load.
+#
+# THIS TABLE IS DATA, AND DATA ROTS. Each entry is a measurement with a stated
+# provenance, not a law: it says what a metric was observed to do on a named
+# battery, and a bar underneath that floor is a bar no run in that battery would
+# have cleared. Retire or re-measure an entry when the route it was measured on
+# changes -- and prefer re-measuring to deleting, because an absent entry is a
+# silent pass.
+#
+# WHICH IS WHY EVERY FINDING HERE IS BASELINE. A floor measured on a battery
+# whose controls were railed describes the railed regime, not the metric; the
+# configs most likely to trip this rule are the ones written to escape that
+# regime. The table's job is to make a reader look, not to decide for them.
+#
+# Deliberately SMALL. A metric belongs here only when its floor has been
+# measured across enough arms and ticks to be a property of the metric rather
+# than of one run.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class MeasuredRange:
+    """What a metric was observed to do, and where that was measured."""
+    minimum: Optional[float]        # smallest value observed
+    sigma: Optional[float]          # detrended scatter, R14's noise floor
+    source: str                     # battery, arms, ticks, date
+    maximum: Optional[float] = None  # largest value observed, where relevant
+
+
+MEASURED_METRIC_RANGES: dict[str, MeasuredRange] = {
+    # next_battery.md 1.1. `var_conditioning` declares `fwd/logw_std_within <
+    # 6.0`; the measured minimum is 17.1, so no arm came within 2.9x of it in
+    # 4,348 ticks. That block turned out to be VESTIGIAL rather than mis-set --
+    # var_conditioning is terminal by design -- which is the case this rule is
+    # most useful for and the reason its message names deletion as a remedy.
+    'fwd/logw_std_within': MeasuredRange(
+        minimum=17.1, sigma=9.9,
+        source='qm9anchor_aug14, 6 arms, 4,348 ticks in var_conditioning, read 2026-08-16'),
+}
+
+
+def exit_bar_is_within_measured_range(cfg: dict) -> list[Violation]:
+    """An exit bar must sit somewhere its metric has actually been observed.
+
+    A `below: X` bar under the metric's measured MINIMUM asks for a value the
+    metric has never taken, so the condition cannot fire. TWO DIFFERENT FAULTS
+    PRODUCE THAT, and the rule cannot tell them apart -- which is why it reports
+    the fact and names both remedies rather than assuming one:
+
+      the bar is wrong        raise it to something the metric reaches
+      the BLOCK is vestigial  the stage is terminal by design and the `exit:`
+                              should be deleted, along with whatever stage sits
+                              behind it
+
+    The second is what `var_conditioning` turned out to be (next_battery.md
+    1.1), and it is the case that most needs saying out loud: an exit block
+    nobody intends to fire still reads as a live gate to every reader that walks
+    the config, which is how the same stage got diagnosed as railed, as dead,
+    and as terminal-by-design across three drafts.
+
+    The read-time version of this is R14 (`analysis/checks.py`), which flags a
+    bar inside the metric's own detrended sigma. R14 needs a run; by the time it
+    speaks the arms are spent. Both conditions are reported, at two strengths:
+
+      below the measured minimum   no run has come near the bar
+      inside sigma of the minimum  whether it fires is decided by scatter
+
+    ALWAYS BASELINE, NEVER ERROR, and the distinction is the whole reason the
+    two severities exist. An ERROR is a config contradicting ITSELF -- provable
+    from the file, true under any circumstances. A measured floor is EVIDENCE
+    FROM ONE BATTERY, and evidence about a metric is not a property of the
+    config in front of you: the same bar may be trivially reachable on another
+    molecule set, temperature, or (W, T). `MIN_EFFECTIVE_BATCH` is the
+    precedent -- a number to revise on evidence, not a law.
+
+    The measurement here makes the point sharply. 17.1 was measured on runs
+    where next_battery.md 1.1 finds FIVE controls railed or inert, and fixing
+    those is the point of that section: the floor was read off a regime that is
+    deliberately about to stop existing. A rule that blocked a run on it would
+    forbid exactly the configs written to move it.
+
+    ABSTAINS on any metric not in MEASURED_METRIC_RANGES, which is nearly all of
+    them. A missing entry is not evidence the bar is fine."""
+    out = []
+    for st in active_stages(cfg):
+        if not isinstance(st, dict):
+            continue
+        for i, term in enumerate(st.get('exit') or []):
+            if not isinstance(term, dict):
+                continue
+            rng = MEASURED_METRIC_RANGES.get(term.get('metric'))
+            if rng is None:
+                continue
+            where = f"stage {st.get('name')!r} exit term {i} ({term.get('metric')})"
+            below = _num(term.get('below'))
+            if below is not None and rng.minimum is not None:
+                if below < rng.minimum:
+                    out.append(Violation(
+                        BASELINE, 'exit_bar_is_within_measured_range',
+                        f'{where} requires < {below:g}, below the measured minimum '
+                        f'{rng.minimum:g} ({rng.source}). No run in that battery came '
+                        f'near it, so on that evidence the condition does not fire and '
+                        f'any stage behind it is never entered. Three things this can '
+                        f'mean: the bar wants raising, the exit block is vestigial and '
+                        f'wants deleting (a stage terminal by design should not carry '
+                        f'a gate that reads as live), or the run intends to reach a '
+                        f'regime the measurement never saw.'))
+                elif rng.sigma is not None and below < rng.minimum + rng.sigma:
+                    out.append(Violation(
+                        BASELINE, 'exit_bar_is_within_measured_range',
+                        f'{where} requires < {below:g}, within one sigma '
+                        f'({rng.sigma:g}) of the measured minimum {rng.minimum:g} '
+                        f'({rng.source}); whether it fires is decided by scatter.'))
+            above = _num(term.get('above'))
+            if above is not None and rng.maximum is not None and above > rng.maximum:
+                out.append(Violation(
+                    BASELINE, 'exit_bar_is_within_measured_range',
+                    f'{where} requires > {above:g}, above the measured maximum '
+                    f'{rng.maximum:g} ({rng.source}).'))
+    return out
+
+
+def protocol_selector_resolves(cfg: dict) -> list[Violation]:
+    """`protocol` must name a protocol in `protocols` that has stages.
+
+    THIS RULE EXISTS BECAUSE THE SELECTOR CREATED A NEW WAY TO GO QUIET. Every
+    stage-scoped check reads the ACTIVE stage list, so a selector naming a
+    protocol that is not defined resolves to zero stages -- and a rule with
+    nothing to iterate reports nothing wrong. Measured while making the change:
+    with the selector pointed at a missing name, the auto-LR gate stopped firing
+    on a config it had rejected a moment earlier.
+
+    One mistyped word therefore used to disarm every stage check at once. This
+    rule is what makes that word fail loudly instead, so it must be checked
+    FIRST and must never itself depend on the stage list."""
+    library = _get(cfg, PROTOCOL_LIBRARY)
+    selector = _get(cfg, PROTOCOL_SELECTOR)
+    if library is None and selector is None:
+        return []                       # a fragment with no protocol at all
+    known = sorted(library) if isinstance(library, dict) else []
+    if not isinstance(selector, str):
+        return [Violation(
+            ERROR, 'protocol_selector_resolves',
+            f'`{PROTOCOL_SELECTOR}` must name one of the protocols in '
+            f'`{PROTOCOL_LIBRARY}` ({known or "none defined"}); got '
+            f'{selector!r}. Without it no stage is live and EVERY stage-scoped '
+            f'check silently has nothing to inspect.')]
+    if selector not in known:
+        return [Violation(
+            ERROR, 'protocol_selector_resolves',
+            f'`{PROTOCOL_SELECTOR}: {selector}` names no protocol. Defined: '
+            f'{known or "none"}. Every stage-scoped check would inspect an empty '
+            f'list and report nothing wrong.')]
+    if not active_stages(cfg):
+        return [Violation(
+            ERROR, 'protocol_selector_resolves',
+            f'protocol {selector!r} defines no stages.')]
+    return []
+
+
+def every_protocol_parses(cfg: dict) -> list[Violation]:
+    """Every protocol in the library must parse, not just the selected one.
+
+    THE PROBLEM THIS SOLVES. Every other stage-scoped rule reads the ACTIVE stage
+    list, so an inactive protocol is unexamined until it is selected -- and then
+    it fails at load, on the switch, which is the worst moment to discover it.
+    Switching route is meant to be one word.
+
+    DELIBERATELY SHALLOW. This parses each stage through `protocol.Stage`, which
+    is the validation the trainer already does: unknown keys, train_mode, flags,
+    lr_sensor shape (hyper needs an explicit beta, ray takes no other keys), the
+    balance kind. That catches the trivially-broken protocol. It does NOT check
+    whether a stage's exit metrics are ever published, whether a handover's
+    on_enter actions are coherent, or anything else that needs a run -- those are
+    not cheap and are not attempted here.
+
+    Cheap enough for load and for config generation: Stage parsing is plain
+    Python, no torch, no model."""
+    library = _get(cfg, PROTOCOL_LIBRARY)
+    if not isinstance(library, dict):
+        return []
+    from protocol import Stage           # local: protocol imports this module back
+
+    out = []
+    for name, entry in sorted(library.items()):
+        specs = _member(entry, 'stages') or []
+        if not specs:
+            out.append(Violation(ERROR, 'every_protocol_parses',
+                                 f'protocol {name!r} defines no stages.'))
+            continue
+        seen = []
+        for i, spec in enumerate(specs):
+            try:
+                st = Stage(spec, i)
+            except Exception as e:
+                out.append(Violation(
+                    ERROR, 'every_protocol_parses',
+                    f'protocol {name!r} stage {i} does not parse: '
+                    f'{type(e).__name__}: {e}'))
+                continue
+            seen.append(st.name)
+        dupes = {n for n in seen if seen.count(n) > 1}
+        if dupes:
+            out.append(Violation(
+                ERROR, 'every_protocol_parses',
+                f'protocol {name!r} repeats stage name(s) {sorted(dupes)}; the '
+                f'trainer identifies the live stage BY NAME, so a duplicate makes '
+                f'the run\'s position ambiguous.'))
+    return out
+
+
 RULES = (
+    protocol_selector_resolves,
+    every_protocol_parses,
     auto_lr_requires_an_adaptive_sensor,
     periodic_centroids_needs_one_crystal_space_group,
     ray_sensor_needs_a_coherent_stage,
+    exit_patience_is_reachable,
+    exit_bar_is_within_measured_range,
     growth_gain_below_growth_factor,
     figs_period_fires,
     batch_ceiling_above_floor,

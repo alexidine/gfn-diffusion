@@ -54,7 +54,7 @@ def probe_blindness():
                    game_kwargs=dict(dim=32, cond=300.0, noise=0.01, lr=5e-5,
                                     init_scale=3.0, seed=3),
                    args_overrides={'adaptive_lr.warmup_steps': 50,
-                                   'ray_calibration.period': 50,
+                                   'adaptive_lr.ray_calibration.period': 50,
                                    'lr_policy': 5e-5, 'min_lr': 1e-10},
                    probe_batch=2048)
     g = run.game
@@ -142,10 +142,10 @@ def saturation_policy():
           f'{"diverge":>8} {"final dist":>11}')
     rows = []
     for name, (filt, alphas) in arms.items():
-        overrides = {'adaptive_lr.warmup_steps': 50, 'ray_calibration.period': 50,
+        overrides = {'adaptive_lr.warmup_steps': 50, 'adaptive_lr.ray_calibration.period': 50,
                      'lr_policy': 5e-5, 'min_lr': 1e-10}
         if alphas is not None:
-            overrides['ray_calibration.alphas'] = alphas
+            overrides['adaptive_lr.ray_calibration.alphas'] = alphas
         run = BenchRun(game='mle', need_batch_sizer=False, reading_filter=filt,
                        game_kwargs=dict(dim=32, cond=300.0, noise=0.01, lr=5e-5,
                                         init_scale=3.0, seed=3),
@@ -215,7 +215,7 @@ def alpha_target_sweep():
         run = BenchRun(game='equilibration', need_batch_sizer=False,
                        game_kwargs=dict(**game_kw, lr=0.05, seed=0),
                        args_overrides={'adaptive_lr.warmup_steps': 50,
-                                       'ray_calibration.period': 50,
+                                       'adaptive_lr.ray_calibration.period': 50,
                                        'adaptive_lr.calibration.alpha_target': target,
                                        'lr_fused': 0.05, 'lr_flow': LR_FLOW,
                                        'min_lr': 1e-9},
@@ -282,7 +282,7 @@ def sensor_mismatch():
         run = BenchRun(game='equilibration', need_batch_sizer=False,
                        game_kwargs=dict(**kw, lr=0.05, seed=0),
                        args_overrides={'adaptive_lr.warmup_steps': 50,
-                                       'ray_calibration.period': 50,
+                                       'adaptive_lr.ray_calibration.period': 50,
                                        'lr_fused': 0.05, 'lr_flow': LR_FLOW,
                                        'min_lr': 1e-9},
                        probe_batch=2048).run(4000, stop_on_divergence=False)
@@ -372,9 +372,10 @@ def knee_realism():
         run = BenchRun(
             game='mle', game_kwargs=dict(dim=4, cond=2.0, noise=0.0, lr=1e-3),
             gpu_kwargs=dict(kw, seed=0),
-            args_overrides={'grow_batch_size': True, 'ray_calibration.enabled': False,
+            args_overrides={'grow_batch_size': True,
                             'max_batch_size': 200000, 'max_step_seconds': 0,
                             'batch_size': start},
+            probe_enabled=False,
         ).run(6000, stop_on_divergence=False)
         p = run.m.batch_size
         print(f'{start:>10} {p:>10} {gpu.throughput(p):>10.0f} '

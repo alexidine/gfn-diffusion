@@ -136,7 +136,7 @@ def test_auto_lr_without_a_sensor_is_refused_at_load(raw):
     This is the gate, not just the report -- the whole cost of the failure is that
     it is invisible for the length of a run."""
     cfg = copy.deepcopy(raw)
-    for st in cfg['protocol']['stages']:
+    for st in cfg['protocols']['unconditional_tb']['stages']:
         st.pop('lr_sensor', None)
     with pytest.raises(ValueError, match='adaptive sensor'):
         _load(cfg)
@@ -146,21 +146,45 @@ def test_explicit_float_lrs_need_no_sensor_at_load(raw):
     """A float is a fixed peak by intent: it takes the warmup envelope and
     divergence handling but never peak_scale, so it has nothing to yield to."""
     cfg = copy.deepcopy(raw)
-    for st in cfg['protocol']['stages']:
+    for st in cfg['protocols']['unconditional_tb']['stages']:
         st.pop('lr_sensor', None)
     for k in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'):
         cfg[k] = 3.0e-4
     assert _load(cfg) is not None
 
 
-def test_hyper_only_config_loads_with_ray_calibration_disabled(raw):
-    """`hyper` does not use ray_calibration at all. The previous gate tested
-    `ray_calibration.enabled` and would have rejected this legitimate config."""
+def test_hyper_only_config_loads_with_the_ray_block_present(raw):
+    """`hyper` does not use the ray block at all, and no stage asks for ray -- so
+    the block is inert. That must LOAD, not fail: the parameters are shared
+    storage, and a run with no replay-TB stage is a legitimate configuration.
+
+    There is no longer an `enabled` flag to turn off; a stage's
+    `lr_sensor: {kind: ray}` declaration is the only switch."""
     cfg = copy.deepcopy(raw)
-    for st in cfg['protocol']['stages']:
+    for st in cfg['protocols']['unconditional_tb']['stages']:
         st['lr_sensor'] = {'kind': 'hyper', 'beta': 0.05}
-    cfg['ray_calibration']['enabled'] = False
     assert _load(cfg) is not None
+
+
+def test_the_retired_ray_enabled_flag_is_refused(raw):
+    """The flag was a second mechanism for a decision the stage already makes,
+    and the two could disagree. A config still carrying it must fail loudly --
+    silently ignoring it would leave the author believing they had switched
+    something off."""
+    cfg = copy.deepcopy(raw)
+    cfg['adaptive_lr']['ray_calibration']['enabled'] = False
+    with pytest.raises(ValueError, match='retired config keys'):
+        _load(cfg)
+
+
+def test_the_old_top_level_ray_block_is_refused(raw):
+    """Moving the block is only safe because the old spelling is retired. Left
+    unclaimed, train.py's getattr would fall through to the code defaults --
+    which default `enabled` to False and would silently kill the probe."""
+    cfg = copy.deepcopy(raw)
+    cfg['ray_calibration'] = cfg['adaptive_lr'].pop('ray_calibration')
+    with pytest.raises(ValueError, match='retired config keys'):
+        _load(cfg)
 
 
 def test_lr_flow_auto_is_refused(raw):

@@ -110,6 +110,7 @@ Per-graph ``n_torsions`` is stored anyway so the variable-dimension path, when i
 has the information rather than a padded tensor to reverse-engineer.
 """
 
+from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
 import numpy as np
@@ -130,6 +131,93 @@ CTREE_GRAPH_FIELDS = ('n_torsions',)
 CONFORMER_FIELDS = CTREE_ATOM_FIELDS + CTREE_GRAPH_FIELDS
 # additionally required of a prior / replay row, but not of a condition
 STATE_FIELDS = ('torsion_state', 'conformer_energy')
+
+
+@dataclass
+class RingModes:
+    """A ring signature's pucker manifold as a low-dimensional subspace.
+
+    Replaces RingBank's discrete rows. The rows were eight isolated islands with a tiny
+    jitter, so the proposal had near-zero mass BETWEEN basins -- and the boat saddles of
+    cyclohexane sit exactly there, on the pseudorotation path between twists. A subspace
+    plus a broadened density covers the path.
+
+    Three further things fall out. Fused rings work, because PCA does not need an analytic
+    puckering form. The weighting accident goes away: uniform-over-rows gave cyclohexane
+    25% chair / 75% twist purely because those are the symmetry multiplicities (2 chairs,
+    6 twist-boats), which is an arbitrary bias rather than a chosen one. And the components
+    are meaningful -- whitened by the force field's own thermal widths, the covariance is
+    kT * H^-1 at harmonic level, so the leading directions are the SOFT ones rather than
+    merely the high-variance ones. That is the harmonic-limit version of a slow-mode
+    analysis; Cremer-Pople is itself the Fourier/PCA decomposition of ring puckering, so
+    for a monocycle this recovers CP empirically.
+
+    Deliberately NOT a fitted density. Populations from a multi-start minimisation are not
+    Boltzmann weights and are not claimed to be; the job is complete SUPPORT. `coords` is
+    the projected sample cloud and sampling mixes a jittered draw from it with a uniform
+    draw over its bounding box, in the same spirit as InternalPrior's `fatten`.
+    """
+
+    order: list              # [(kind, j)] block ordering this was fitted against
+    ref: np.ndarray          # [d] reference the deviations are measured from
+    periodic: np.ndarray     # [d] bool, which entries wrap
+    scale: np.ndarray        # [d] whitening widths, from the FF's own constants
+    components: np.ndarray   # [k, d] PCA directions in whitened deviation space
+    coords: np.ndarray       # [n, k] the sample cloud, projected
+    energies: np.ndarray = None   # [n] relative basin energy, kcal/mol. None = uniform
+    bandwidth: float = 1.0   # jitter in THERMAL units: whitening makes 1 unit = 1 sigma
+    comp_std: np.ndarray = None   # [k] sampled spread along each component; caps the jitter
+    var_explained: float = 0.0
+    n_samples: int = 0
+    max_fold_deg: float = 0.0     # worst |deviation| after the branch cut; >150 is a warning
+
+    def weights(self, temperature: float, temper: float = 1.0):
+        """Boltzmann weights over the sample cloud, or uniform if no energies were stored.
+
+        The populations are NOT cosmetic. Measured at kT=1: cyclohexane's chair holds
+        99.7% and everything else 0.3%, while pyrrolidine -- proline's ring -- is 71/29
+        with both basins genuinely occupied. Drawing uniformly over basins therefore
+        over-samples cyclohexane's twist by ~200x while getting pyrrolidine roughly right,
+        which is an arbitrary bias that varies per ring.
+
+        `temper` > 1 flattens toward uniform, in the same spirit as InternalPrior's
+        `fatten`: a proposal wants the target's support, and a rare-but-real basin is
+        worth over-weighting slightly rather than losing.
+        """
+        if self.energies is None:
+            return np.full(len(self.coords), 1.0 / max(len(self.coords), 1))
+        w = np.exp(-(self.energies - self.energies.min())
+                   / max(temperature * max(temper, 1e-6), 1e-6))
+        t = w.sum()
+        return w / t if t > 0 else np.full(len(w), 1.0 / len(w))
+
+    def sample(self, n: int, rng, fill: float = 0.0, temperature: float = 1.0,
+               temper: float = 1.0):
+        """``[n, d]`` deviations in the ORIGINAL DoF units, ready to add to `ref`."""
+        lo, hi = self.coords.min(0), self.coords.max(0)
+        pick = self.coords[rng.choice(len(self.coords), size=n,
+                                      p=self.weights(temperature, temper))]
+        # PER-COMPONENT jitter, capped by the spread the samples actually show along that
+        # direction. Thermal motion is 1 sigma along a direction TANGENT to the closed-ring
+        # manifold, but zero across it -- closure is a constraint, not a soft coordinate --
+        # and the sampled spread is what distinguishes the two. Jittering uniformly at 1
+        # sigma is why adding components past the manifold's own dimension made closure
+        # sharply worse (cyclohexane 2.7 -> 6.5 bond-sigma from k=5 to k=7): the extra
+        # directions carry no manifold structure, so all that motion goes off-surface.
+        sd = (np.minimum(self.bandwidth, self.comp_std) if self.comp_std is not None
+              else np.full(pick.shape[1], self.bandwidth))
+        c = pick + rng.normal(0.0, 1.0, size=pick.shape) * sd
+        if fill > 0:
+            # Uniform over the cloud's bounding box. DEFAULT OFF, and measured: the
+            # bandwidth jitter along the soft subspace directions already covers 12/12
+            # sectors of the pseudorotation circle on its own, so fill buys no coverage
+            # and only costs population fidelity (cyclohexane 89% chair -> 69% at
+            # fill=0.25) and closure (4.6 -> 5.5 bond-sigma). Kept as a knob for a ring
+            # whose sampled basins turn out too sparse to bridge.
+            m = rng.random(n) < fill
+            if m.any():
+                c[m] = rng.uniform(lo, hi, size=(int(m.sum()), self.coords.shape[1]))
+        return (c @ self.components) * self.scale
 
 
 def wrap_state(x):

@@ -10,6 +10,18 @@ adaptive_lr:
   divergence_cut: 0.5
   divergence_grad_abs: 1000000000.0
   divergence_loss_abs: 1000000000.0
+  ray_calibration:
+    alphas:
+    - 0
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    n_sub: 8
+    period: 500
   seed_lr: 0.000125
   warmup_steps: 1000
 anomaly_detection: false
@@ -18,10 +30,7 @@ archive_period: 5000
 auto_batch_throughput_opt: true
 batch_growth_factor: 1.65
 batch_growth_interval: 50
-batch_growth_min_throughput_gain: 0.05  # samples/sec gain a jump must clear to be kept -- a SATURATION detector. opt-steps/sec = samples_per_sec / grad-accum target, so this maximises optimizer-step throughput; step time does not enter. MUST be < batch_growth_factor-1 (0.65 here): at or above it a factor-f jump can never deliver the demanded gain, so every jump is rejected and the batch FREEZES at batch_size
-gpu_util_window_s: 900  # trailing window for the gpu/util_recent metric. DIAGNOSTIC ONLY -- nothing in the trainer acts on occupancy: batch size does not move it on the MLIP route (measured, umaperf0812)
-gpu_util_sample_period_s: 60  # wall-clock seconds between occupancy samples. Time-based, not per-N-steps: a step-based cadence cannot fill a 900 s window at 200 s/step, which is how the metric came to be absent on exactly the slow MLIP arms it was there to watch
-gpu_util_policy_window_s: 7200  # the window the CLUSTER averages over when deciding to cancel. Logged as gpu/util_policy so the number the scheduler judges is visible in wandb
+batch_growth_min_throughput_gain: 0.05
 batch_growth_slow_interval: 300
 batch_knee_recheck_steps: 2000
 batch_size: 500
@@ -178,6 +187,9 @@ fwd_loss_coeffs:
   vg_lb: 0.0
   vg_lme: 0
   z_level: 0.0
+gpu_util_policy_window_s: 7200
+gpu_util_sample_period_s: 60
+gpu_util_window_s: 900
 gradient_norm_clip: auto
 grow_batch_size: false
 integrator:
@@ -192,9 +204,6 @@ lr_warmup_ratio: 10
 max_batch_size: 500
 max_reloads_per_1k_steps: 0.2
 min_lr: 1.0e-06
-mle_min_rate: 0.05
-mle_slope_t: 2.0
-mle_slope_window: 300
 mlip_path: null
 model:
   clipping: true
@@ -234,103 +243,96 @@ oom_cooldown_steps: 200
 override_learning_rates: false
 prior_model_name: null
 prior_path: D:\crystal_datasets\conditional\priors\toy_big_unif_prior.pt
-protocol:
-  stages:
-  - bwd_sampling_mode: dataset
-    exit:
-    - above: 0.5
-      metric: gates/mle_flat
-      patience: 5
-    - below: 0.015
-      metric: eval/wass_debiased
-    - below: 2.0
-      metric: bwd/tbc
-    flags:
-      mle_gate: true
-      scramble_conditions: true
-      update_log_z: true
-    loss_coeffs:
-      bwd:
-        mle: 1.0
-        repeats: 2.0
-        tbc: 1.0
-    name: train_prior
-    on_exit:
-    - snapshot:phase1_exit
-    - snapshot_prior
-    skip_if: prior_loaded
-    train_mode: bwd
-    lr_sensor:
-      kind: plateau
-      metrics:
-      - bwd/mle
-      factor: 0.5
-      patience: 60
-      cooldown: 10
-  - balance:
-      alpha: 0.01
-      default_boost:
+project_state_version: 5
+protocol: migrated
+protocols:
+  migrated:
+    stages:
+    - bwd_sampling_mode: dataset
+      exit:
+      - above: 0.5
+        metric: gates/mle_flat
+        patience: 5
+      - below: 0.015
+        metric: eval/wass_debiased
+      - below: 2.0
+        metric: bwd/tbc
+      flags:
+        scramble_conditions: true
+        update_log_z: true
+      loss_coeffs:
+        bwd:
+          mle: 1.0
+          repeats: 2.0
+          tbc: 1.0
+      mle_gate:
+        min_rate: 0.05
+        slope_t: 2.0
+        window: 300
+      name: train_prior
+      on_exit:
+      - snapshot:phase1_exit
+      - snapshot_prior
+      skip_if: prior_loaded
+      train_mode: bwd
+      lr_sensor:
+        kind: plateau
+        metrics:
+        - bwd/mle
+        factor: 0.5
+        patience: 60
+        cooldown: 10
+    - balance:
+        alpha: 0.01
+        default_boost:
+          bwd: 0.5
+          fwd: 0.5
+        drive: relative
+        floor: 0.1
+        kind: proportional
+        metrics:
+          bwd: bwd/logw_std_within
+          fwd: fwd/logw_std_within
+        pinned:
+          replay: 0.0
+        targets:
+          bwd: 1.0
+          fwd: 1.0
+      bwd_sampling_mode: prior
+      deactivate_threshold: 0.01
+      flags:
+        buffers_active: true
+        update_log_z: true
+        weighted_bwd_sampling: true
+        weighted_condition_sampling: true
+      fracs:
         bwd: 0.5
         fwd: 0.5
-      drive: relative
-      floor: 0.1
-      kind: proportional
-      metrics:
-        bwd: bwd/logw_std_within
-        fwd: fwd/logw_std_within
-      pinned:
         replay: 0.0
-      targets:
-        bwd: 1.0
-        fwd: 1.0
-    bwd_sampling_mode: prior
-    deactivate_threshold: 0.01
-    flags:
-      buffers_active: true
-      update_log_z: true
-      weighted_bwd_sampling: true
-      weighted_condition_sampling: true
-    fracs:
-      bwd: 0.5
-      fwd: 0.5
-      replay: 0.0
-    loss_coeffs:
-      bwd:
-        beta: 80
-        level_gap: 1.0
-        repeats: 2.0
-        vg_lb: 1.0
-      fwd:
-        beta: 10
-        emp_z: 1.0
-        repeats: 2.0
-        vg_by_condition: 1.0
-        vg_lb: 1.0
-    name: var_conditioning
-    on_enter:
-    - rebuild_prior_by_churn
-    train_mode: fused
-    lr_sensor:
-      kind: plateau
-      metrics:
-      - fwd/vg_lb
-      - bwd/vg_lb
-      factor: 0.5
-      patience: 60
-      cooldown: 10
-ray_calibration:
-  alphas:
-  - 0
-  - 1
-  - 2
-  - 4
-  - 8
-  - 16
-  - 32
-  - 64
-  enabled: true
-  n_sub: 8
-  period: 500
+      loss_coeffs:
+        bwd:
+          beta: 80
+          level_gap: 1.0
+          repeats: 2.0
+          vg_lb: 1.0
+        fwd:
+          beta: 10
+          emp_z: 1.0
+          repeats: 2.0
+          vg_by_condition: 1.0
+          vg_lb: 1.0
+      name: var_conditioning
+      on_enter:
+      - rebuild_prior_by_churn
+      train_mode: fused
+      lr_sensor:
+        kind: plateau
+        metrics:
+        - fwd/vg_lb
+        - bwd/vg_lb
+        factor: 0.5
+        patience: 60
+        cooldown: 10
 replay_loss_coeffs:
   beta: 10.0
   db: 0.0

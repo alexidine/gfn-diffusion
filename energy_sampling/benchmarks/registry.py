@@ -276,13 +276,19 @@ def validate(reg: dict) -> None:
 
 def _validate_defaults(reg: dict) -> None:
     ov = reg['defaults'].get('overrides') or {}
-    # Both of these are PERIODIC extra work whose period is not the report period,
-    # so a fixed-length window contains a variable amount of them. z_calibration is
-    # worse than aliasing: its rollouts are inside the step timing while only the
-    # training batch is charged to the throughput denominator (train.py:2168-2170),
-    # so `samples_per_sec` moves at constant batch as the sensor converges.
-    for path, want in ((('z_calibration', 'enabled'), False),
-                       (('ray_calibration', 'enabled'), False)):
+    # PERIODIC extra work whose period is not the report period, so a fixed-length
+    # window contains a variable amount of it. z_calibration is worse than
+    # aliasing: its rollouts are inside the step timing while only the training
+    # batch is charged to the throughput denominator (train.py:2168-2170), so
+    # `samples_per_sec` moves at constant batch as the sensor converges.
+    #
+    # ray_calibration USED TO BE REQUIRED HERE TOO and no longer can be: its
+    # `enabled` flag is retired (utils._RETIRED_KEYS) and the probe now arms from
+    # the stage declarations, which an override cannot reach. Requiring the flag
+    # meant this validator raised unless the registry set a key the trainer
+    # refuses at load -- a schema the two halves could not both satisfy. See the
+    # note at defaults.overrides in registry.yaml for what that costs a window.
+    for path, want in ((('z_calibration', 'enabled'), False),):
         node: Any = ov
         for k in path:
             if not isinstance(node, dict) or k not in node:

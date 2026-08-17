@@ -135,18 +135,98 @@ def test_deactivate_threshold_at_a_third(canonical):
 
 def test_deactivate_threshold_checked_per_stage(canonical):
     cfg = copy.deepcopy(canonical)
-    stage = next(s for s in cfg['protocol']['stages'] if 'deactivate_threshold' in s)
+    stage = next(s for s in cfg['protocols']['unconditional_tb']['stages'] if 'deactivate_threshold' in s)
     stage['deactivate_threshold'] = 0.5
     assert _fires(cfg, 'deactivate_threshold_is_sane')
 
 
 def test_pinned_frac_disagreeing_with_fracs(canonical):
     cfg = copy.deepcopy(canonical)
-    stage = next(s for s in cfg['protocol']['stages']
+    stage = next(s for s in cfg['protocols']['unconditional_tb']['stages']
                  if (s.get('balance') or {}).get('pinned'))
     mode = next(iter(stage['balance']['pinned']))
     stage['balance']['pinned'][mode] = stage['fracs'][mode] + 0.1
     assert _fires(cfg, 'pinned_frac_matches_fracs')
+
+
+def test_a_selector_naming_a_missing_protocol_is_an_error(canonical):
+    """THE hazard this restructure created, and the reason the gate exists.
+
+    Every stage-scoped check reads the ACTIVE stage list, so a selector pointing
+    at a protocol that is not defined resolves to zero stages -- and a rule with
+    nothing to iterate reports nothing wrong. Measured while making the change:
+    with the selector mistyped, the auto-LR gate stopped firing on a config it
+    had rejected moments before. One word used to disarm every stage check."""
+    assert _fires(broken(canonical, protocol='does_not_exist'),
+                  'protocol_selector_resolves')
+
+
+def test_an_absent_or_non_string_selector_is_an_error(canonical):
+    cfg = copy.deepcopy(canonical); cfg.pop('protocol')
+    assert _fires(cfg, 'protocol_selector_resolves')
+    assert _fires(broken(canonical, protocol={'stages': []}),
+                  'protocol_selector_resolves')
+
+
+def test_a_selected_protocol_with_no_stages_is_an_error(canonical):
+    cfg = copy.deepcopy(canonical)
+    cfg['protocols']['unconditional_tb'] = {'stages': []}
+    assert _fires(cfg, 'protocol_selector_resolves')
+
+
+def test_the_selector_rule_abstains_on_a_fragment(canonical):
+    """A config with no protocol at all is an overlay, not a broken run config.
+    Firing there would flag every fragment in the tree."""
+    assert not _fires({'batch_size': 100}, 'protocol_selector_resolves')
+
+
+def test_a_disarmed_stage_check_is_caught_by_the_selector_rule(canonical):
+    """The two halves together: with a bad selector the stage-scoped rule goes
+    quiet, and the selector rule is what keeps the config from passing."""
+    cfg = broken(canonical, protocol='does_not_exist')
+    assert not _fires(cfg, 'auto_lr_requires_an_adaptive_sensor'),         'fixture assumption: the stage rule DOES go quiet'
+    assert errors(cfg), 'but the config must still be rejected'
+
+
+def test_an_inactive_protocol_that_cannot_parse_is_caught(canonical):
+    """The point of checking the whole library: an inactive protocol is otherwise
+    unexamined until it is SELECTED, and then it fails at load -- on the switch,
+    which is the worst moment. Switching route is meant to be one word."""
+    cfg = copy.deepcopy(canonical)
+    cfg['protocols']['conditional_vargrad'] = {
+        'stages': [{'name': 'train_prior', 'train_mode': 'bwd',
+                    'lr_sensor': {'kind': 'hyper'}}]}   # hyper REQUIRES beta
+    assert _fires(cfg, 'every_protocol_parses')
+
+
+def test_an_inactive_protocol_with_an_unknown_key_is_caught(canonical):
+    cfg = copy.deepcopy(canonical)
+    cfg['protocols']['conditional_vargrad'] = {
+        'stages': [{'name': 'x', 'train_mode': 'fused', 'not_a_stage_key': 1}]}
+    assert _fires(cfg, 'every_protocol_parses')
+
+
+def test_duplicate_stage_names_in_any_protocol_are_caught(canonical):
+    """The trainer identifies the live stage BY NAME, so a duplicate makes the
+    run's position ambiguous."""
+    cfg = copy.deepcopy(canonical)
+    cfg['protocols']['conditional_vargrad'] = {
+        'stages': [{'name': 'same', 'train_mode': 'bwd'},
+                   {'name': 'same', 'train_mode': 'fused'}]}
+    assert _fires(cfg, 'every_protocol_parses')
+
+
+def test_a_well_formed_inactive_protocol_passes(canonical):
+    """Mutation for the three above: a valid second protocol must NOT fire, or
+    the rule would block the very thing it exists to make safe."""
+    cfg = copy.deepcopy(canonical)
+    cfg['protocols']['conditional_vargrad'] = {
+        'stages': [{'name': 'train_prior', 'train_mode': 'bwd',
+                    'lr_sensor': {'kind': 'hyper', 'beta': 0.1}},
+                   {'name': 'var_conditioning', 'train_mode': 'fused',
+                    'lr_sensor': {'kind': 'hyper', 'beta': 0.05}}]}
+    assert not _fires(cfg, 'every_protocol_parses')
+    assert errors(cfg) == [], [str(e) for e in errors(cfg)]
 
 
 def test_auto_lr_with_no_sensor_anywhere_is_an_error(canonical):
@@ -154,7 +234,7 @@ def test_auto_lr_with_no_sensor_anywhere_is_an_error(canonical):
     peak_scale off 1.0, so the run trains at the seed for its whole life while the
     config reads as adaptive."""
     cfg = copy.deepcopy(canonical)
-    for st in cfg['protocol']['stages']:
+    for st in cfg['protocols']['unconditional_tb']['stages']:
         st.pop('lr_sensor', None)
     assert _fires(cfg, 'auto_lr_requires_an_adaptive_sensor')
 
@@ -163,7 +243,7 @@ def test_auto_lr_with_sensor_kind_none_is_also_an_error(canonical):
     """`{kind: none}` and an omitted block mean the same thing. Only the second
     is silent, but neither owns an `auto` rate."""
     cfg = copy.deepcopy(canonical)
-    for st in cfg['protocol']['stages']:
+    for st in cfg['protocols']['unconditional_tb']['stages']:
         st['lr_sensor'] = {'kind': 'none'}
     assert _fires(cfg, 'auto_lr_requires_an_adaptive_sensor')
 
@@ -172,9 +252,9 @@ def test_one_stage_missing_a_sensor_still_fires(canonical):
     """Checked PER STAGE: a sensor on the terminal stage does nothing for a
     phase-1 learning rate."""
     cfg = copy.deepcopy(canonical)
-    cfg['protocol']['stages'][0].pop('lr_sensor', None)
+    cfg['protocols']['unconditional_tb']['stages'][0].pop('lr_sensor', None)
     v = [x for x in check(cfg) if x.rule == 'auto_lr_requires_an_adaptive_sensor']
-    assert len(v) == 1 and repr(cfg['protocol']['stages'][0]['name']) in v[0].detail
+    assert len(v) == 1 and repr(cfg['protocols']['unconditional_tb']['stages'][0]['name']) in v[0].detail
 
 
 def test_explicit_float_lrs_need_no_sensor(canonical):
@@ -184,7 +264,7 @@ def test_explicit_float_lrs_need_no_sensor(canonical):
     cfg = copy.deepcopy(canonical)
     for k in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'):
         cfg[k] = 3.0e-4
-    for st in cfg['protocol']['stages']:
+    for st in cfg['protocols']['unconditional_tb']['stages']:
         st.pop('lr_sensor', None)
     assert not _fires(cfg, 'auto_lr_requires_an_adaptive_sensor')
 
@@ -200,7 +280,7 @@ def test_auto_keys_survives_resolution_destroying_the_evidence(canonical):
     resolved = copy.deepcopy(canonical)
     for k in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'):
         resolved[k] = 1.25e-4                       # as resolution leaves it
-    for st in resolved['protocol']['stages']:
+    for st in resolved['protocols']['unconditional_tb']['stages']:
         st.pop('lr_sensor', None)
 
     # derived from the config: the evidence is gone, so nothing fires
@@ -215,13 +295,13 @@ def test_ray_on_a_non_fused_stage_is_an_error(canonical):
     """The probe draws from replay and scores replay_loss_coeffs; a bwd stage
     trains neither, so it would rate a loss nobody is optimising -- silently."""
     cfg = copy.deepcopy(canonical)
-    cfg['protocol']['stages'][0]['lr_sensor'] = {'kind': 'ray'}   # train_prior is bwd
+    cfg['protocols']['unconditional_tb']['stages'][0]['lr_sensor'] = {'kind': 'ray'}   # train_prior is bwd
     assert _fires(cfg, 'ray_sensor_needs_a_coherent_stage')
 
 
 def test_ray_on_a_fused_stage_without_replay_tb_is_an_error(canonical):
     cfg = copy.deepcopy(canonical)
-    st = cfg['protocol']['stages'][1]
+    st = cfg['protocols']['unconditional_tb']['stages'][1]
     assert st['train_mode'] == 'fused', 'fixture assumption'
     st.setdefault('loss_coeffs', {}).setdefault('replay', {})['tb'] = 0.0
     assert _fires(cfg, 'ray_sensor_needs_a_coherent_stage')
@@ -231,7 +311,7 @@ def test_hyper_is_accepted_on_a_non_fused_stage(canonical):
     """`hyper` reads no loss, so unlike `ray` it is coherent whatever the stage
     trains. Flagging it would push people back to omitting the block."""
     cfg = copy.deepcopy(canonical)
-    cfg['protocol']['stages'][0]['lr_sensor'] = {'kind': 'hyper', 'beta': 0.05}
+    cfg['protocols']['unconditional_tb']['stages'][0]['lr_sensor'] = {'kind': 'hyper', 'beta': 0.05}
     assert not _fires(cfg, 'ray_sensor_needs_a_coherent_stage')
     assert not _fires(cfg, 'auto_lr_requires_an_adaptive_sensor')
 
@@ -256,6 +336,129 @@ def test_the_rule_abstains_when_periodic_centroids_is_off(canonical):
                  energy_function='latent_multiharmonic')
     cfg['model']['periodic_centroids'] = False
     assert not _fires(cfg, 'periodic_centroids_needs_one_crystal_space_group')
+
+
+# ---------------------------------------------------------------------------
+# Exit triggers -- the two dead-gate shapes from the 2026-08-16 audit
+# (docs/design/next_battery.md 1.1a and 1.3)
+# ---------------------------------------------------------------------------
+
+def _exit_term(canonical, protocol, stage_index, term_index, **keys):
+    """The canonical config with one exit term of one protocol edited in place,
+    and that protocol selected. Real stages, real metrics -- a synthetic exit
+    block would not prove the rule fires on a config anyone would write."""
+    cfg = copy.deepcopy(canonical)
+    cfg['protocol'] = protocol
+    cfg['protocols'][protocol]['stages'][stage_index]['exit'][term_index].update(keys)
+    return cfg
+
+
+def test_the_canonical_conditional_route_ships_an_unreachable_exit_bar(canonical):
+    """THE MEASURED CASE, on the real config, via the ONE-WORD route switch the
+    protocol library exists to make cheap.
+
+    `conditional_vargrad`'s var_conditioning stage declares
+    `fwd/logw_std_within < 6.0`. Measured minimum over 4,348 ticks and 6 arms of
+    qm9anchor_aug14 is 17.1 -- no arm came within 2.9x of it. next_battery.md
+    1.1 concludes the block is VESTIGIAL (the stage is terminal by design)
+    rather than mis-set, which does not change what the rule must do: an exit
+    condition that cannot fire has to be visible at load, whether the fix is a
+    higher bar or a deleted block.
+
+    REPORTED, NOT REFUSED. 17.1 was measured on runs with five railed controls,
+    and the configs written to unrail them are exactly the ones that should be
+    allowed to aim below it. A rule built on evidence blocks the next
+    experiment; this one must never be the reason a run will not start."""
+    cfg = copy.deepcopy(canonical)
+    cfg['protocol'] = 'conditional_vargrad'
+    assert _fires(cfg, 'exit_bar_is_within_measured_range', severity=BASELINE)
+    assert errors(cfg) == [], (
+        'a measured floor is evidence, not a config contradiction -- it must '
+        'never block a run from starting')
+
+
+def test_a_bar_above_the_measured_floor_but_inside_sigma_is_a_baseline(canonical):
+    """Measured min 17.1, sigma 9.9. A bar at 20 is reachable but sits inside
+    the metric's own scatter -- R14's read-time condition, at load time. Worth
+    stating, never worth failing on: a run may set a bar it expects to be tight."""
+    cfg = _exit_term(canonical, 'conditional_vargrad', 1, 0, below=20.0)
+    assert _fires(cfg, 'exit_bar_is_within_measured_range', severity=BASELINE)
+    assert errors(cfg) == [], 'a tight bar is a departure, not a contradiction'
+
+
+def test_a_bar_clear_of_the_measured_floor_passes(canonical):
+    """MUTATION IN THE PASSING DIRECTION. Without this the rule could be firing
+    on every bar on this metric and the tests above would not notice."""
+    cfg = _exit_term(canonical, 'conditional_vargrad', 1, 0, below=40.0)
+    assert not _fires(cfg, 'exit_bar_is_within_measured_range', severity=ERROR)
+    assert not _fires(cfg, 'exit_bar_is_within_measured_range', severity=BASELINE)
+
+
+def test_a_measured_range_can_never_produce_an_error(canonical):
+    """THE SEVERITY IS THE RULE'S CONTRACT, so it is pinned rather than left to
+    whoever edits the table next.
+
+    This rule reasons from a measurement, and a measurement is not a property of
+    the config being checked -- the floor was read off a battery with five
+    railed controls, and the configs written to unrail them are precisely the
+    ones that should be allowed to aim under it. Promoting any branch to ERROR
+    turns the evidence into a law and blocks the next experiment. Asserted over
+    an absurd bar so it holds for whatever the table grows to contain."""
+    cfg = _exit_term(canonical, 'conditional_vargrad', 1, 0, below=-1e9)
+    assert _fires(cfg, 'exit_bar_is_within_measured_range', severity=BASELINE)
+    assert [v for v in check(cfg) if v.rule == 'exit_bar_is_within_measured_range'
+            and v.severity == ERROR] == []
+
+
+def test_an_unmeasured_metric_abstains(canonical):
+    """The table covers one metric. Everything else must abstain -- a missing
+    entry is not evidence that a bar is fine, and a rule that guessed would make
+    every other rule here less trustworthy."""
+    cfg = _exit_term(canonical, 'conditional_vargrad', 1, 0,
+                     metric='fwd/nothing_ever_measured', below=1e-9)
+    assert not _fires(cfg, 'exit_bar_is_within_measured_range')
+
+
+def test_patience_on_a_coarse_metric_that_outruns_the_run_is_an_error(canonical):
+    """`patience` counts WRITES of its metric. eval/wass_debiased is written
+    once per eval_period (250 here), so patience 5 needs 1,250 train steps; a
+    1,000-step run can never reach it and the stage exits on its other terms
+    while the config reads as if this one gates."""
+    cfg = _exit_term(canonical, 'unconditional_tb', 0, 1, patience=5)
+    cfg['epochs'] = 1000
+    assert _fires(cfg, 'exit_patience_is_reachable', severity=ERROR)
+
+
+def test_patience_on_a_coarse_metric_that_fits_is_a_baseline(canonical):
+    """Same term in a run long enough to satisfy it. Reachable, so not an
+    error -- but the same integer on a tick-cadence term in the same block
+    costs 50 steps rather than 1,250, and nothing at the point of writing it
+    says so."""
+    cfg = _exit_term(canonical, 'unconditional_tb', 0, 1, patience=5)
+    assert _fires(cfg, 'exit_patience_is_reachable', severity=BASELINE)
+    assert errors(cfg) == []
+
+
+def test_patience_on_a_tick_cadence_metric_is_not_flagged(canonical):
+    """MUTATION IN THE PASSING DIRECTION. gates/mle_flat is published from the
+    same 10-step block that runs the tick, so patience 5 is 50 steps and the
+    rule must stay quiet -- the canonical config already carries exactly this
+    term, and a rule that flagged it would fire on every protocol in the repo."""
+    cfg = _exit_term(canonical, 'unconditional_tb', 0, 0, patience=20)
+    assert not _fires(cfg, 'exit_patience_is_reachable')
+
+
+def test_patience_one_is_always_reachable(canonical):
+    """One measurement is one measurement at any cadence. This is the shape
+    prod0810 actually shipped (`eval/wass_debiased` with no patience key), and
+    it is NOT a fault -- see the streak tests for what was wrong with it."""
+    cfg = _exit_term(canonical, 'unconditional_tb', 0, 1, patience=1)
+    # 100 steps is shorter than ONE eval_period (250) and still fine: the term
+    # needs a single write, and evaluation() forces one at step 50. Long enough,
+    # though, for the sibling tick terms -- patience 5 at 10 steps is 50 -- so
+    # this isolates the coarse term rather than tripping over its neighbours.
+    cfg['epochs'] = 100
+    assert not _fires(cfg, 'exit_patience_is_reachable')
 
 
 def test_effective_batch_below_baseline_is_a_baseline_not_an_error(canonical):

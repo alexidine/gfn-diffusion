@@ -18,6 +18,8 @@ WHAT THE CONTROLLERS ACTUALLY READ (the whole coupling surface):
 
   LRController          args, optimizers, step_ind, phase, lr_ctrl, ray_cal
   RayCalibration        nothing -- it takes params + two callables
+  the ray probe SWITCH   protocol.stages[*].lr_sensor -- `enabled` is derived,
+                        not configured (train.py:1871, _ray_askers)
   increment_batch_size  args, protocol.stage.{name,train_mode}, step_ind,
                         batch_size, _recent_step_times, _recent_step_work,
                         _rung_throughput, batch_size_* state
@@ -51,8 +53,15 @@ MK_DEV_ADAPTIVE = dict(
 
 MK_DEV_CALIBRATION = dict(alpha_target=4.0, eta_up=0.25, eta_down=0.5)
 
-MK_DEV_RAYCAL = dict(enabled=True, period=500, n_sub=8,
-                     alphas=(0, 1, 2, 4, 8, 16, 32, 64))
+# The block lives UNDER adaptive_lr (utils._RETIRED_KEYS: "moved ->
+# adaptive_lr.ray_calibration"), because it parameterises one of the LR sensors.
+#
+# `enabled` IS NOT HERE, and its absence is the mechanism rather than an
+# omission: the flag is deleted in both spellings, and a stage declaring
+# `lr_sensor: {kind: ray}` IS the switch (train.py:1871 passes
+# `enabled=bool(self._ray_askers())`). The bench derives it the same way, from
+# FakeStage.lr_sensor via FakeModeller._ray_askers.
+MK_DEV_RAYCAL = dict(period=500, n_sub=8, alphas=(0, 1, 2, 4, 8, 16, 32, 64))
 
 MK_DEV_BATCH = dict(
     batch_size=1000, max_batch_size=1000, grow_batch_size=False,
@@ -81,31 +90,44 @@ def make_args(**overrides):
 
     Nested blocks are addressed with dots: make_args(**{'adaptive_lr.warmup_steps': 0}).
     The controller reads them via getattr chains, so SimpleNamespace is faithful.
+
+    THE DOTTED PATH IS THE SHIPPING SPELLING, and unknown keys raise in EVERY
+    block, not just the flat one. The nested branches used to write through
+    unchecked, which is how `ray_calibration.enabled` -- a key the trainer now
+    refuses at load -- went on being set here for free: the override landed in a
+    dict nobody compared against the real config, so the bench kept steering a
+    flag production had deleted.
     """
     adaptive = dict(MK_DEV_ADAPTIVE)
     calibration = dict(MK_DEV_CALIBRATION)
     raycal = dict(MK_DEV_RAYCAL)
     flat = {**MK_DEV_LR, **MK_DEV_BATCH}
 
+    #: prefix -> the block it addresses. LONGEST FIRST: 'adaptive_lr.' is a
+    #: prefix of the other two, so an unordered scan would file
+    #: 'adaptive_lr.ray_calibration.period' into the adaptive block under a key
+    #: literally named 'ray_calibration.period'. The empty prefix is top level.
+    blocks = (('adaptive_lr.calibration.', calibration),
+              ('adaptive_lr.ray_calibration.', raycal),
+              ('adaptive_lr.', adaptive),
+              ('', flat))
+
     for key, value in overrides.items():
-        if key.startswith('adaptive_lr.calibration.'):
-            calibration[key.split('.', 2)[2]] = value
-        elif key.startswith('adaptive_lr.'):
-            adaptive[key.split('.', 1)[1]] = value
-        elif key.startswith('ray_calibration.'):
-            raycal[key.split('.', 1)[1]] = value
-        else:
-            if key not in flat:
-                raise KeyError(
-                    f'{key!r} is not a known arg. Add it to the MK_DEV_* dicts if the '
-                    f'real config has it -- silently accepting unknown keys is how a '
-                    f'bench ends up testing a config the trainer would reject.')
-            flat[key] = value
+        prefix, block = next((p, b) for p, b in blocks if key.startswith(p))
+        name = key[len(prefix):]
+        if name not in block:
+            raise KeyError(
+                f'{key!r} is not a known arg. Add it to the MK_DEV_* dicts if the '
+                f'real config has it -- silently accepting unknown keys is how a '
+                f'bench ends up testing a config the trainer would reject. Two '
+                f'live cases: the ray block MOVED to adaptive_lr.ray_calibration, '
+                f'and its `enabled` was DELETED (utils._RETIRED_KEYS) -- the '
+                f'switch is now a stage declaring lr_sensor: {{kind: ray}}.')
+        block[name] = value
 
     adaptive['calibration'] = SimpleNamespace(**calibration)
-    return SimpleNamespace(adaptive_lr=SimpleNamespace(**adaptive),
-                           ray_calibration=SimpleNamespace(**raycal),
-                           **flat)
+    adaptive['ray_calibration'] = SimpleNamespace(**raycal)
+    return SimpleNamespace(adaptive_lr=SimpleNamespace(**adaptive), **flat)
 
 
 class FakeStage:
@@ -117,6 +139,13 @@ class FakeStage:
         # None = NO LR sensor. The ray probe is opt-in per stage (train.py
         # _ray_probe_armed): omitting the block used to arm it anyway under the
         # global ray_calibration.enabled, and that default is retired.
+        #
+        # So this field is now LOAD-BEARING rather than decorative: it is the
+        # only thing that turns the probe on, here as in production
+        # (FakeModeller._ray_askers / train.py::_ray_askers). A ray arm on a
+        # stage that does not declare it runs a probe that never arms and posts
+        # a row bit-identical to `null` -- the exact silent no-op bench/README
+        # records, and what test_arms.py's reading counters exist to catch.
         self.lr_sensor = lr_sensor
         self.balance = balance          # parsed balance dict, as protocol.Stage builds it
 
@@ -130,7 +159,12 @@ class FakeModeller:
     def __init__(self, args, optimizers, stage=None, batch_size=None):
         self.args = args
         self.optimizers = optimizers
-        self.protocol = SimpleNamespace(stage=stage or FakeStage())
+        # `stages` as well as `stage`, because the probe's switch is derived by
+        # scanning the WHOLE protocol for askers (train.py::_ray_askers), not by
+        # asking the current stage. One stage, so the bench's list holds exactly
+        # the stage it is running.
+        stage = stage or FakeStage()
+        self.protocol = SimpleNamespace(stage=stage, stages=[stage])
         self.device = 'cpu'
         self.step_ind = 0
 
@@ -175,6 +209,19 @@ class FakeModeller:
 
         # bench bookkeeping (never read by the real code)
         self.history = []
+
+    def _ray_askers(self):
+        """Stages declaring `lr_sensor: {kind: ray}`. This IS the probe's switch.
+
+        A THREE-LINE COPY of train.Modeller._ray_askers, and copies are the thing
+        this file exists to avoid. Binding the real one would drag in the 11 s
+        train.py import that every LR-controller and ray test currently avoids,
+        so the copy is pinned against the original instead, in
+        test_fidelity.py::test_the_fake_derives_the_probe_switch_as_the_trainer_does
+        -- which pays that import anyway.
+        """
+        return [s.name for s in self.protocol.stages
+                if s.lr_sensor is not None and s.lr_sensor['kind'] == 'ray']
 
     def _now(self):
         """Overrides Modeller._now so the windowed sensors run on simulated time."""

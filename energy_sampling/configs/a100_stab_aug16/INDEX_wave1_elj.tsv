@@ -1,0 +1,4 @@
+name	kind	benchmark_id	batch	epochs
+f1_mipcas_elj	func	-	1000	2500
+f2_qm9cond_b500	func	-	500	1500
+f2b_qm9cond_b1000	func	-	1000	1000

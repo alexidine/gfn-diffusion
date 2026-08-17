@@ -1,0 +1,22 @@
+GPU: 529 MiB used / 16303 MiB total, 15475 MiB free, 0% util
+job: configs\shakeout_aug16\mipcas_elj.yaml  [elj|500|10|512|6|1|0|10000|cuda]
+projected need: 14672 MiB -- cuda_memory_fraction 0.9 x 16303 MiB -- the config's DECLARED CEILING, no measurement on record
+room check: skipped: sole tenant and the projection is a declared CAP, not a measurement
+  note    compute process not readable by this user: 2464, [Insufficient Permissions]
+GPU preflight: CLEAR TO LAUNCH
+resolve_derived_config (W=512, T=10): lr_policy=0.000125, lr_replay=0.000125, lr_back=0.000125, lr_fused=0.000125, gradient_norm_clip=37.88
+grad_clip_guard: ON (guard mode) | p 0.99 (target fire rate 0.01) | eta 0.01 | warmup 100/branch (static) | cap 100x baseline | refresh_on_stage True | fallback bar 37.88
+vram [baseline                    ] live        0 MiB | reserved        0 MiB | cached        0 MiB | peak reserved        0 MiB
+vram [energy fn (MLIP loaded)     ] live        0 MiB | reserved        0 MiB | cached        0 MiB | peak reserved        0 MiB
+SG2 aunit=[0.5, 1, 1]: wrapping centroid axes yz
+SG2 (triclinic), Z'<=1: no dead latent rows; SDE flows the full 12 dims
+lr_ctrl v8: calibration ON (period 500, n_sub 8, alphas [0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]) | target alpha* 4.0 | eta up/down 0.25/0.5 | managed lr_back,lr_fused,lr_policy,lr_replay
+vram [gfn model                   ] live       47 MiB | reserved       60 MiB | cached       13 MiB | peak reserved       60 MiB
+vram [mol_dataset                 ] live       65 MiB | reserved     3586 MiB | cached     3521 MiB | peak reserved     3586 MiB
+Re-analyzing prior energies
+dead-row probe: latent_to_cell_params confirms rows () are ignored for SG2 (n=8)
+vram [prior_dataset (MLIP scan)   ] live      191 MiB | reserved     3612 MiB | cached     3421 MiB | peak reserved    14148 MiB
+Seeded prior_buffer with 158998 prior-dataset samples (fresh loss records)
+vram [buffers seeded              ] live      459 MiB | reserved     3638 MiB | cached     3179 MiB | peak reserved    14148 MiB
+vram [READY TO TRAIN              ] live      459 MiB | reserved     3638 MiB | cached     3179 MiB | peak reserved    14148 MiB
+vram: cuda_memory_fraction 0.9 x 16303 MiB = 14672 MiB hard cap; 11034 MiB of it left for training allocations

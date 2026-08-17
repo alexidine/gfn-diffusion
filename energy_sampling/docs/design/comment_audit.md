@@ -30,7 +30,7 @@ only costs them scrolling. The tiers are:
 | Tier | Class | Count | Status |
 |---|---|---:|---|
 | **S1** | Contradicted by the code it sits on — acting on it produces the wrong change | 10 | **APPLIED** |
-| **S2** | Names something retired or deleted as if live — the reader cannot resolve it | 7 | open |
+| **S2** | Names something retired or deleted as if live — the reader cannot resolve it | 7 | 1 fixed, 6 open |
 | **S3** | Pinned numbers presented as current fact | 6 | open (1 needs a decision) |
 | **S4** | Experimental history / run-id narrative | 11 | open — deferred behind 1.2 |
 | **S5** | Housekeeping — dead files, `# todo` markers, dormant blocks | 3 | open |
@@ -94,7 +94,44 @@ config key that hard-fails preflight.
 | `protocol.py:1357` | `_lookahead` is a "verbatim port from `ModeBalanceController._log_ema_lookahead`" | Same. "Verbatim port from X" is unfalsifiable once X is gone. | as above |
 | `utils.py:1657`, `utils.py:1685` | "**the phase-3 controller** keys backward allocation on this" (`relative_under` / `relative_under_wcen`) | `phase` is now just `protocol.stage.index + 1`. The canonical config declares two stages, so phase 3 does not exist on it. The actual consumer is the `kind: ratio` balance loop on `equilibration`, which does read `bwd/relative_under_wcen`. | `train.py:286-290`; stages `configs/mk_dev.yaml:322`, `:369`; consumer `configs/mk_dev.yaml:395` |
 | `train.py` — phase 1/2/3 vocabulary, ~20 sites | Comments throughout speak of "phase 1", "phase 2", "phase 3" as a fixed framework | Same root cause as above: `phase` is a 1-based index into whatever stage list a config declares, so these names denote different stages in different configs and denote nothing at all past the end of the list. Worth one sweep rather than 20 separate edits. | `train.py:1088, 1153, 1409, 1426, 1819, 2567, 2981, 2992, 3102, 3644, 3647, 3747, 3750, 4071, 6209, 6221, 6392, 6483, 6591, 6724-6725`; also `protocol.py:49, 859, 985` |
-| `train.py:6076-6091` | Three keys are retired *in prose only*: `max_residence_steps`, `toxic_min_draws`, `toxic_delta_threshold` | They are absent from `utils._RETIRED_KEYS`, so they raise at **first use inside `manage_replay_buffer`** rather than at load — precisely the failure `utils.py:153-156` records as having cost the aug02 battery all 16 arms' phase 1 (1.1–7.8 h each). The comment at `utils.py:154` reads as though that lesson is uniformly applied; for these three keys it is not. *Remedy is a code change (move them into `_RETIRED_KEYS`), not a comment edit — flagged here because the comment is what misleads.* | `train.py:6076`, `:6083`; `_RETIRED_KEYS` `utils.py:157-291`; the rationale `utils.py:153-156` |
+| ~~`train.py:6076-6091`~~ | Three keys were retired *in prose only*: `max_residence_steps`, `toxic_min_draws`, `toxic_delta_threshold` | They were absent from `utils._RETIRED_KEYS`, so they raised at **first use inside `manage_replay_buffer`** rather than at load — precisely the failure `utils.py` records above that dict as having cost the aug02 battery all 16 arms' phase 1. **FIXED** — see below. | `_RETIRED_KEYS` `utils.py`; `config_state.CHANGES` state 3 |
+
+---
+
+### S2 #17, resolved — the three replay keys now fail at load
+
+Applied as **project state 3** (`config_state.CHANGES`), not as a comment edit,
+because the honest fix was mechanical:
+
+- `utils._RETIRED_KEYS` gains all three keys, each with its reason. Rejection now
+  happens in `preflight_config`, before a single energy call.
+- A `Transition` gives them a repair path. This is the part that was actually
+  missing: **106 tracked configs carry `max_residence_steps` and 103 carry
+  `toxic_min_draws`** (counted over git-tracked yaml — a naive grep also picks up
+  git-ignored wandb artifacts and overcounts), and until now none had a
+  mechanical route forward, because the keys were rejected by code no migration
+  knew about.
+- **Only two of the three are dropped mechanically.** `max_residence_steps` is
+  `manual`: it was REPLACED by `mean_residence_steps`, and the overlap between
+  the two across tracked configs is **zero**. Dropping it would leave no residence
+  setting at all, `tau` reads 0, and the `if tau > 0` branch that arms both the
+  hazard and the age backstop never runs — a config that loads clean, trains, and
+  still reports a healthy `replay_buffer_age_cv` ≈ 1 because the surviving
+  displacement purge is itself memoryless. `manual` is also the only category
+  that blocks `migrate --write`, which is the affordance this needs.
+- The two runtime guards in `manage_replay_buffer` are **deleted** rather than
+  kept as defence in depth. Every load path runs `preflight_config`, and holding
+  the same reason text in two places is how the two come to disagree.
+- Three comments that named these keys as live were reworded
+  (`train.py` age-CV metric, the TTL race note, and `manage_replay_buffer`'s own
+  docstring, which pointed at "the toxic_min_draws ValueError below").
+
+**The gate is stricter than the guard it replaced**, which is intended rather than
+incidental. The old guard tested truthiness (`toxic_min_draws`) or non-None
+(`max_residence_steps`), so `toxic_min_draws: 0` passed it and ran with the key
+silently ignored. The gate fires on PRESENCE. Verified end-to-end on a real
+`configs/aug02` config: load-time rejection, the present-but-falsy widening, and
+`migrate` dropping all three.
 
 ---
 
@@ -189,8 +226,9 @@ Recorded so the next pass does not re-verify them.
 5. **S2 #11** (`controller.py:132`) — one retired key name, one word.
 6. **S2 #12-#15** — the dangling-class and phase-vocabulary sweep. Mechanical but
    broad; do it as one commit.
-7. **S2 #16** — move the three replay keys into `_RETIRED_KEYS`. Code, not
-   comment; worth doing while the reasoning is loaded.
+7. ~~**S2 #17** — move the three replay keys into `_RETIRED_KEYS`.~~ **DONE** —
+   shipped as project state 3; see the resolution note in the S2 section. (Filed
+   as #16 here originally; it is the seventh S2 row, #17.)
 8. **S3** — the arithmetic error at `mk_dev:474` first, then the pinned tables.
 9. **S5** — delete `eval/offline_evaluation.py`, resolve the `# todo`s.
 10. **S4** — the §1.3 narrative trim, last.

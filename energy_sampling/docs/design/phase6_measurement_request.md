@@ -73,20 +73,40 @@ trend estimator and nothing else.**
 Three consequences follow immediately, and all three are traps in their own right:
 
 - On any run **shorter than 900 s the two are numerically identical** — every sample
-  falls in both windows. On a run under 7200 s they differ only by whatever samples
-  predate the 900 s mark. So "policy agrees with recent" on a short run is
-  *guaranteed by construction* and carries **zero** information. An analyst who reads
-  it as corroboration has been reassured by an identity. This is the
-  swallowed-diagnostic shape this project has paid for before.
-- **`nvidia-smi` sampled from outside the process is the only genuinely independent
-  reading available.** It is therefore not optional on the first submission.
+  falls in both windows, because neither window requires its own length to have
+  elapsed; the only gate is the 5-sample floor. **This is already visible in the
+  repo**: `analysis/tests/fixtures/mle_only.summary.json` carries
+  `gpu/util_policy: 40.975` and `gpu/util_recent: 40.975` — the same number to five
+  digits. So "policy agrees with recent" on a short run is *guaranteed by
+  construction* and carries **zero** information. An analyst reading it as
+  corroboration has been reassured by an identity — the swallowed-diagnostic shape
+  this project has paid for before.
+- **`nvidia-smi` sampled from outside the process is the only independent *sampler*
+  available — but it is not an independent *instrument*.** `torch.cuda.utilization()`
+  wraps `nvmlDeviceGetUtilizationRates().gpu` and
+  `nvidia-smi --query-gpu=utilization.gpu` reports **the same NVML counter**. The
+  external sampler therefore controls for cadence, phase and eval blindness — which
+  is what §2's mechanisms (i)–(iii) are — and controls for **nothing** about the
+  counter's own semantics. Separating those needs a genuinely different instrument;
+  see the `SM_ACTIVE` note below.
 - Because the quantity is a time-average over a trailing window, it **cannot be
   reconstructed after the fact**. Any external check must be *concurrent* or it is
   not a check.
 
-### The four mechanisms that can make the in-process series wrong
+> **Correction to the obvious reading.** "Two windows over one deque" does *not*
+> imply "same instrument". `_read_gpu_util` re-selects its source **per sample**, so
+> a transient NVML failure silently routes individual samples through nvidia-smi into
+> the same deque, and a 900 s window and a 7200 s window then contain **different
+> mixture ratios**. Worse, the two sources can read *different physical cards*:
+> `torch.cuda.utilization()` resolves through the process's CUDA device, while
+> `gpu_guard` picks its row by `int(CUDA_VISIBLE_DEVICES.split(',')[0])`
+> ([gpu_guard.py:113-133](../../gpu_guard.py#L113)) and falls back to index 0 on a
+> UUID-form value. Under `CUDA_VISIBLE_DEVICES="2,3"` with the process on local
+> device 1, they read different GPUs. **G1 is what makes this detectable at all.**
 
-Each is invisible without the external sampler, and each has a *direction*.
+### The six mechanisms that can make the in-process series wrong
+
+Each is invisible from inside the run, and each has a *direction*.
 
 **(i) Phase bias.** `_sample_gpu_util()` is called at exactly one point in the step
 body — [train.py:2184](../../train.py#L2184), after the step is timed, before
@@ -129,24 +149,76 @@ raises transiently the series silently *mixes two instruments under one metric n
 The known precedent: the sensor was already found completely inert once, on a missing
 optional dependency, with one line in a log nobody read.
 
+**(v) What the counter actually measures.** NVML `utilization.gpu` is *the percent of
+time over the driver's sample period (1/6 s–1 s) during which one or more kernels was
+executing*. It is an **"any kernel resident" indicator and is blind to how much of the
+GPU is used** — a single-block kernel occupying one SM for the whole period reads
+100 %. That is a mechanism for trap (a)'s premise failing: growing the batch makes
+kernels *bigger*, not more *continuous*, and this counter cannot see the difference.
+**If `dcgmi` is available on the cluster, capture `SM_ACTIVE` alongside** — it is a
+genuinely different instrument and it is the only way to tell "the GPU is idle" from
+"the GPU is busy with almost nothing". Verify `dcgmi dmon`'s mean against
+`dcgmi stats -j` before trusting either as an interval integral.
+
+**(vi) The readings are device-wide, not per-process.** Neither source excludes a
+co-tenant's kernels. Any job sharing the card contaminates both the in-process series
+and the external sampler, in the same direction. Capture
+`nvidia-smi --query-compute-apps=pid,used_memory` alongside so contaminated intervals
+can be excluded rather than silently averaged in.
+
 ### And the mean itself
 
 `_gpu_util_mean` is an **unweighted arithmetic mean of point samples**, with a hard
 floor of 5 samples ([train.py:396-410](../../train.py#L396)) below which it returns
-`None`. It is not time-weighted, so a stretch of long steps contributes fewer samples
-than its share of wall clock. And **the sample count backing any row is never
-logged** — a `gpu/util_policy` row is a number whether it rests on 5 samples or 120.
+`None`. Timestamps *select*, they never *weight* — so a sample separated from its
+neighbour by 900 s counts exactly as much as one separated by 60 s. And **the sample
+count backing any row is never logged**: a `gpu/util_policy` row is a number whether
+it rests on 5 samples or 121.
+
+Three numbers a plan needs, and they are sharper than the nominal 60 s suggests:
+
+- **The realized cadence quantizes to step boundaries.** The gate is checked once per
+  step, so spacing is `S = ceil(60/dt)·dt` for `dt < 60`, and `S = dt` above it. At
+  `dt = 59 s` the realized cadence is **118 s**, not 60 — so the 900 s window holds 8
+  samples, not 15.
+- **Ceilings:** at `S = 60 s`, the 900 s window holds at most **16** samples and the
+  7200 s window at most **121**.
+- **`gpu/util_recent` goes ABSENT above ~225 s/step** (5 samples needs `S ≤ 225`);
+  `gpu/util_policy` above ~1800 s/step. The arms this metric exists for ran
+  **181–262 s/step** ([train.py:505](../../train.py#L505)) — straddling that
+  threshold, which is why absence must be read as data (§7 row 8).
+
+> **A dead sensor reads as a live number for up to two hours.** On a double failure
+> `_gpu_util_off` is set ([train.py:363-369](../../train.py#L363)) and **never
+> cleared anywhere**. The already-collected samples keep being averaged until they
+> age out — so `gpu/util_recent` reports a stale mean for up to 900 s and
+> `gpu/util_policy` for up to 7200 s *after the sensor has stopped reading*, then
+> both vanish without comment. On a venv without pynvml (the documented local case)
+> a single `nvidia-smi` timeout is enough; the smi path also **forks a subprocess per
+> sample and can block the train loop for up to 30 s**
+> ([gpu_guard.py:102-110](../../gpu_guard.py#L102)).
+>
+> **And on a MIG-partitioned A100 the sensor is off from the first sample**:
+> `utilization.gpu` returns `[N/A]`, which raises inside `gpu_guard.gpu_memory`, so
+> `_read_gpu_util` returns `None` permanently. `nvidia-smi -L` and
+> `--query-gpu=mig.mode.current` belong in the pre-flight, and "not MIG" is a stated
+> precondition of this whole submission.
 
 > **A defect this exposes in the existing registry.**
 > `a100-batch-scaling-elj` declares `gpu/util_policy` as primary and
 > `min_wallclock_s: 7200`, which `_validate_work` checks. But its budget is
-> `epochs_formula: resume_step + warmup_steps + measure_steps` = 500 steps. At an
-> ELJ fused step of ~1 s that job ends in **~8 minutes**, and
-> `_gpu_util_mean(7200)` will happily return the mean of its ~8 samples **labelled
-> as the 7200 s policy average**. The validator's guard is a *declaration*, not a
-> measurement: nothing checks that the step budget delivers the wall clock. This is
-> the same shape as both named traps — a rule that is declared and not enforced.
-> §4 and §9 fix it, and the fix requires the sample-count instrumentation below.
+> `epochs_formula: resume_step + warmup_steps + measure_steps` = **500 steps**, and
+> 500 steps reach 7200 s only if the step costs **≥ 14.4 s**. An A100 ELJ fused step
+> at batch 1000 is not measured — that is part of what this request is for — but it
+> is not plausibly 14 s on an analytic energy. So the job ends well short, and
+> `_gpu_util_mean(7200)` will return the mean of however few samples it has,
+> **labelled as the 7200 s policy average**. The same arithmetic applies to any
+> MLIP rung entry sized the same way: 225 steps needs ≥32 s/step.
+>
+> The validator's guard is a *declaration*, not a measurement — nothing checks that
+> the step budget delivers the wall clock. This is the same shape as both named
+> traps: a rule that is declared and not enforced. §4 and §9 fix it, and the fix
+> requires the sample-count instrumentation below.
 
 ---
 
@@ -163,7 +235,9 @@ GPU-hours produce an ambiguity instead of an answer.
 | **G1** | `gpu/util_source` — which sensor answered, per report (`0` nvml / `1` smi / `2` mixed-in-window) | one line | Every row of the disagreement table. Without it, "in-process ≠ external" cannot be told from "in-process *is* nvidia-smi and something else is wrong". |
 | **G2** | `gpu/util_n_recent`, `gpu/util_n_policy` — sample count backing each window | two lines | Whether a disagreement is real or a 5-sample coin flip. Also the honest enforcement of `min_wallclock_s` (§2 box). |
 | **G3** | `gpu/util_sampled_wallclock_frac` — share of the window's wall clock lying within ±`period/2` of a sample | ~5 lines | The **direct** measure of eval blindness (ii). This one number decides whether `gpu/util_policy` overstates, and it is the difference between case 2 and case 3. |
-| **G4** | `batch/oom_min` is logged at [train.py:878](../../train.py#L878) and is **absent from the registry metric catalogue** | registry only, no code | A benchmark cannot legally name it today. Registry gap, not an instrument gap. |
+| **G3b** | `gpu/device_uuid`, logged once at init **from inside the trainer** | one line | Whether the in-process sensor and the side-sampler read the same card at all (§2's correction box). The whole cross-calibration rests on this and nothing currently records it. |
+| **G4** | `batch/oom_min` is logged at [train.py:878](../../train.py#L878) and is **absent from the registry metric catalogue**; `eval_wrapup_time` is emitted by `drain_elapsed_times` and likewise absent | registry only, no code | A benchmark cannot legally name either today. `eval_wrapup_time` is needed for G3's unsampled-share arithmetic. Registry gap, not an instrument gap. |
+| **G4b** | An integer **stage-index series**. `phase` is not the stage, and nothing marks a stage transition in the metric stream | one line | §7 row 5's prescribed action is "split the trace at stage boundaries" — impossible without it. The 7200 s window is never cleared at a transition, so it straddles regimes silently. |
 | **G5** | Controller decision series — rung throughput, the ratio tested, the rung rejected — currently exist only as prints | moderate | Needed **only** for the shadow-mode arm (§8). wandb uploads no console log for a run left in state `crashed`, so a scancelled job loses its entire account of itself — which is exactly the job you most need to read. |
 | **G6** | UMA has no phase split (`AL_mace_utils.drain_mace_phase_timing` has no UMA counterpart) | `mxtaltools/`, not owned here | Already recorded in `benchmarks.md` §10. **Not blocking for Phase 6** — it blocks Phase 5.0. Listed so it is not rediscovered. |
 
@@ -208,7 +282,27 @@ SMI_PID=$!
   separate "the GPU is idle" from "the GPU is throttled" — two states that produce
   the same utilization number and call for opposite responses.
 - **It must span the whole job**, including startup, eval, and the final checkpoint
-  write, so the denominator matches the scheduler's.
+  write, so the denominator matches the scheduler's. That same property is why §7's
+  first precondition exists: the sampler's early window contains initialization the
+  in-process sensor never sees.
+
+Three companions, all cheap and all load-bearing:
+
+- `nvidia-smi --query-compute-apps=pid,used_memory` on the same cadence — both
+  readings are device-wide, so co-tenanted intervals must be **excludable** rather
+  than silently averaged in (§2 (vi)).
+- `nvidia-smi -L` and `--query-gpu=mig.mode.current,uuid` once at job start. MIG
+  turns the in-process sensor off permanently and silently; the UUID is what pairs
+  with G3b to prove both readings are of the same card.
+- `dcgmi dmon -e 1002` (`SM_ACTIVE`) if available, cross-checked against
+  `dcgmi stats -j` on the same interval before either is trusted. It is the only
+  genuinely different instrument in this plan, and the only one that can distinguish
+  an idle GPU from a busy one running almost nothing.
+
+**Compute both statistics from the CSV, not one.** A trailing **mean** and a
+**windowed minimum** over the same series cost nothing extra, and §0's question 2
+means one of them is the right one and it is not yet known which. A plan that
+computes only the mean has to be re-run if the answer is "minimum".
 
 Also captured per job, into a small sidecar the run can be joined on:
 
@@ -341,16 +435,32 @@ in-process) · `S` = external nvidia-smi, time-weighted over the matching window
 Every row names the **second explanation**, because a table whose conclusions are
 unique-by-assertion is how a proxy becomes a law.
 
+> **Two preconditions gate the whole table, and without them rows 3 and 4 fire
+> spuriously.**
+>
+> 1. **Compare only windows fully inside `[job_start + 7200 s, end]`.** The side
+>    sampler starts before `srun` and its trailing window includes container start,
+>    dataset load, compile and initialization — near-idle seconds the in-process
+>    sensor never sees. So `P > S` and `R > S` are **guaranteed** until the job is
+>    older than 7200 s, for a reason that has nothing to do with the sensor.
+> 2. **Compare only intervals with no co-tenant.** Both readings are device-wide
+>    (§2 (vi)). A co-tenant's kernels raise `S` and the in-process series alike, and
+>    a contaminated interval can otherwise be read as row 3's "good case" and its
+>    excess adopted as a margin. Exclude, do not adopt.
+
 | # | Pattern | Conclude | Second explanation to rule out | Do |
 |---|---|---|---|---|
 | 1 | `P ≈ R ≈ S`, job **survives**, ≥7200 s elapsed | The proxy tracks the GPU **in this regime**. Adopt `gpu/util_policy` under **case 2**. | The run never entered the regime where the mechanisms bite — no eval, uniform step time. Check G3 ≈ 1. | Record the case **and its regime**: route, batch, T, step time, eval cadence. It does *not* license the proxy at 200 s/step if measured at 2 s/step. |
-| 2 | `P ≈ R ≈ S`, job **cancelled anyway** | The proxy tracks the GPU but **not the policy**. The scheduler's statistic is not mean `utilization.gpu`. | The cancellation was unrelated — preemption, walltime, node failure, OOM-kill. | `sacct` `Reason`/`State` first. If genuinely a utilization cancellation, **case 2 is refused**; go to case 3 and state the margin. This is the highest-information outcome in the table. |
+| 2a | `P ≈ R ≈ S` and **high**, job **cancelled** | The proxy tracks the GPU but **not the policy**. The scheduler's statistic is not a mean of `utilization.gpu` — it may be `SM_ACTIVE`, a **minimum-over-blocks** rather than a mean, or a per-node aggregate. | The cancellation was unrelated — preemption, walltime, QoS, allocation exhaustion, maintenance drain, node fault, or a `scancel` by another user on a shared account. | `sacct` `Reason`/`State`/`Comment` **first**; the falsification is only valid if the reason names utilization. Then compare the windowed **minimum** against the mean (§4 records both). **Case 2 is refused**; go to case 3. Highest-information row in the table. |
+| 2b | `P ≈ R ≈ S` and **low**, job **cancelled** | **Consistent with the proxy, not against it.** The readings agreed and correctly showed a job that deserved cancelling. | The threshold is higher than assumed, so the margin is wrong even though the proxy is right. | Not a falsification. Record the level at which cancellation occurred — across enough jobs this *is* the threshold, obtained empirically. |
 | 3 | `S > P` and `S > R` (in-process reads **low**) | The in-process sampler misses busy time — phase bias sampling at a host-heavy instant. | NVML vs nvidia-smi instrument difference — **this is what G1 exists to exclude**. | The proxy is **conservative**: safe to adopt, but it costs throughput. Quantify the margin in samples/sec so the price of the ignorance is known. |
 | 4 | `P > S` and `R > S` (in-process reads **high**) | **The predicted eval-blindness direction.** The in-process series omits low-occupancy stretches the scheduler counts. | Long non-eval stalls also outside the sample points — checkpoint writes, buffer churn, allocator growth. Distinguish via G3 against `eval_step_time / (inter_eval_time + eval_step_time)`: if they match, it is eval. | **`gpu/util_policy` is not admissible as the proxy unmodified.** Either the external sampler becomes the proxy, or the in-process reading is discounted by the measured unsampled share. Case 3 with a stated, measured margin. |
 | 5 | `P > R` (long window above short) | **Utilization is falling.** Not a sensor disagreement at all — one series, two windows. | A stage transition or a batch change inside the window. Read against `Batch Size` and the stage marker. | This is prod0810's uma-arm shape (hourly means 75/62/54/49/48/48). A run that starts busy and settles idle **passes an early check and fails a later one** — the controller must eventually watch the trend, not the level. Record it; do not act on it yet. |
 | 6 | `R > P` (short window above long) | **Utilization is rising** — warm-up, a transition, or a batch change. Nothing about the sensor. | The 7200 s window is not yet full and still carries the launch. | Discard the **first 7200 s** of every job for proxy purposes. `P` is not meaningful until its window has filled once. |
 | 7 | `P` absent, `R` present | The job is too young: fewer than 5 samples in 7200 s while ≥5 in 900 s is impossible, so this means the run is short. | — (mechanically unambiguous) | **Not a fault.** No policy claim is available from this job. This is the registry's `min_wallclock_s` rule doing its job. |
-| 8 | `R` absent, `P` present | Fewer than 5 samples in the trailing 900 s ⇒ steps longer than ~180 s, **or the loop stalled** — a long eval, an OOM recovery, a checkpoint write. | Genuinely slow steps on an MLIP route, which is expected, not pathological. Separate via `train_step_time`. | **Absence is the signal.** Every `R`-absent interval is an interval the sensor could not see — and those are precisely the intervals that bias `P`. Read `S` over exactly that interval. |
+| 8 | `R` absent, `P` present | Fewer than 5 samples in the trailing 900 s ⇒ **step time above ~225 s**, or the loop stalled — a long eval, an OOM recovery, a checkpoint write. | Genuinely slow steps on an MLIP route, which is expected, not pathological. Separate via `train_step_time`: the prod0810 arms ran 181–262 s/step, straddling the threshold. | **Absence is the signal.** Every `R`-absent interval is an interval the sensor could not see — and those are precisely the intervals that bias `P`. Read `S` over exactly that interval. |
+| 8b | `P` and `R` both **frozen at a constant**, then vanish | The sensor died and its stale samples were re-averaged until they aged out (§2 box). | A genuinely stationary workload. Distinguish by G2: a frozen mean with a *falling* sample count is a dead sensor; a frozen mean with a full count is a stationary job. | Discard the trailing 900 s (`R`) / 7200 s (`P`) before the vanish — those rows are stale by construction. `gpu/util_read_failures` (G1) makes this immediate rather than inferential. |
+| 8c | `P` and `R` present but `S` shows a **different mixture**, and `gpu/util_source` is not constant | The in-process series mixed NVML and nvidia-smi samples mid-run, and the two windows hold different ratios (§2 correction box). | The two sources read **different physical cards** under a multi-GPU `CUDA_VISIBLE_DEVICES`. Separate with `gpu/device_uuid` (G3b) against the sampler's own device id. | The run's occupancy series is not a single measurement and cannot carry a proxy claim. Exclude and fix the sensor before re-running. |
 | 9 | `P` and `R` both absent, `S` present | The in-process sensor is **off** — both NVML and nvidia-smi failed inside the process, printed once, then silence. | The job never reached 5 samples at all (very short, or crashed early). | The external sampler is the **only** evidence for this job. This row alone justifies making it mandatory. Fix the sensor before re-running. |
 | 10 | `S` absent, `P`/`R` present | The side-sampler died or was never launched — container, `srun` wrapper, or a `trap` that did not fire. | The CSV was written somewhere the epilogue did not collect. | The job still contributes to Q1/Q2 (`t(B)`, `S(B)`) but **not** to Q3. **State the exclusion**; do not quietly average it in. |
 | 11 | All three disagree pairwise, no pattern | Sampling noise dominates. | A genuinely non-stationary workload — the mean is not the right summary. Check the smi time series for structure. | **G2 decides it.** If `S` (~720 samples) is stable while `P`/`R` scatter, the in-process cadence is too coarse — lower `gpu_util_sample_period_s`. Arm C answers this directly. |
@@ -377,16 +487,48 @@ with the controller off, before any rule is written.** Three requirements:
    on MLIP, and that "both statements are true and neither generalises". Today
    nothing would catch it. `a100-batch-scaling-uma` (§9) is the single most important
    entry in this request.
-2. **Flat must be distinguishable from noisy.** A rung's occupancy mean needs a
-   measured floor like any other primary metric — `gpu/util_policy` is declared
-   primary on both ladders, so `_validate_floor` requires the floor to cover it. With
-   ~120 in-process samples and ~720 external samples per 2 h rung, and the previously
-   observed sd of ~6.5 points, per-rung means are tight enough to resolve the ~10
-   point effect that was actually observed. **If the measured span turns out to
-   exceed the rung-to-rung differences, the correct finding is "occupancy is not
-   resolvable in batch on this route", which is itself a complete answer to trap (a).**
+2. **Flat must be distinguishable from noisy — and the naive sample count overstates
+   how well.** A rung's occupancy mean needs a measured floor like any other primary
+   metric; `gpu/util_policy` is declared primary on both ladders, so
+   `_validate_floor` requires the floor to cover it.
+
+   **Do not size the band from nominal sample counts.** ~121 in-process and ~720
+   external samples per 2 h rung look ample against the previously observed sd of
+   ~6.5 points, but NVML readings seconds apart on a job with ~1 s steps are strongly
+   autocorrelated, and across a window they are dominated by *regime* — stage, eval
+   block, compile — rather than by independent noise. Effective *n* is one to two
+   orders of magnitude smaller, so a band computed as `2·SE` from nominal *n* is
+   several times too tight, and it would be the threshold in every row of §7.
+
+   **Derive the band empirically instead:** split each job's `gpu.csv` into disjoint
+   7200 s windows *within one stationary stage* and use the observed between-window
+   spread, or block-bootstrap with a block length at least the eval period. That is
+   the same "measure the null distribution, do not pick a tolerance by eye"
+   discipline the registry already applies to every other floor.
+
+   **If the measured span exceeds the rung-to-rung differences, the correct finding
+   is "occupancy is not resolvable in batch on this route" — which is itself a
+   complete answer to trap (a)**, and a far better one than a knee-shaped story
+   fitted to noise.
 3. **The finding must be recorded as evidence with its scope line**, not as a
    controller rule. `findings.md`, graded, with T, route, stage, batch range.
+
+> **Pre-register the decision rule now, before the data exists.** What actually
+> killed `gpu_util_floor` was not that occupancy failed to rise — it was that
+> **occupancy and throughput moved in opposite directions** and the rule outranked
+> the one that could see it. So the rule to write down in advance is a *joint* one:
+>
+> **No occupancy rule may be written unless `U(B)` and `S(B)` are shown to move in
+> the same direction over the measured ladder, on the route in question, with
+> non-overlapping repeat spans at the endpoints. A rung where they disagree in sign
+> is recorded as a losing row and never as a law.**
+>
+> Pre-registering it matters because it is the clause that would have refused all
+> four of the growths that fired: util 52 → 44 → 49 → 42 while samples/sec fell
+> 58 %. Written afterwards, the same clause is a rationalisation of a known result;
+> written now, it is a commitment. State the **minimum detectable `ΔU`** between the
+> extreme rungs in the same artefact, so "flat" is a measured claim and not the
+> absence of one.
 
 ### Trap (b): a knee walk with no floor that descends forever under flat throughput
 
@@ -437,6 +579,15 @@ controller that was never live-tested on the cluster.
 **Not part of the first submission.** It needs G5, it is not a cost benchmark (the
 batch moves by design, so it violates the fixed work quantity), and it must not be
 mixed into the ladder jobs. Recorded here so it is not rediscovered as a new idea.
+
+> **The sandbox that would score it is currently dormant.** `bench/` was rebuilt and
+> the batch-sizer half moved to `bench/old/` — which `pytest.ini` lists under
+> `norecursedirs`. So `bench/old/test_batch_sizer.py` (21 tests) and
+> `bench/old/test_batch_adversarial.py` (12 regressions, each mutation-proven to
+> catch its defect) **exist and are no longer collected**. The controller's entire
+> regression protection is parked. That is a Phase 6 prerequisite in its own right,
+> it is free to fix, and it is not this submission's business — but it must not be
+> discovered at the moment someone starts writing the replacement.
 
 ---
 
@@ -847,6 +998,16 @@ adopted. The entry lives in this document until it has real rungs.
 > "not yet measured" rather than "fine". One field, no schema version bump, and it
 > makes the provenance of a ladder as visible as the provenance of a floor.
 
+> **A second caveat, which bites later.** When the first floor is recorded,
+> `_validate_floor` demands `measured.per_metric` cover **every** primary metric
+> ([registry.py:426-430](../../benchmarks/registry.py#L426)). `gpu/util_policy` is
+> primary on all four new entries, so a floor cannot be recorded at all from any
+> repeat set in which the window failed to fill on even one launch — the metric is
+> simply absent there, and `score_repeats` will return `n < 2`. That is the
+> validator being right again, but it means **the liveness assertion on the sample
+> count is not optional bookkeeping: it is what makes a floor recordable.** Plan for
+> the possibility that a repeat has to be re-run for this reason alone.
+
 **Other validator notes.** All four declare `class: a100` with `local_adequate:
 false` and a non-empty `reason`; none joins `local-dev`. All are `train_mode: fused`
 with `measure_steps` a multiple of 10. All name `gpu/util_policy` primary and declare
@@ -854,6 +1015,12 @@ with `measure_steps` a multiple of 10. All name `gpu/util_policy` primary and de
 for the closed-form toy. The one `control_comparison` names its gate. The rung
 benchmark sets no `batch_size`/`max_batch_size` override; the three pinned benchmarks
 set both to the same value, since they are independent hard stops.
+
+The catalogue additions in §9.0 and the G1–G4b metric names must land **before** the
+entries do — `_validate_metrics` checks every `primary`/`secondary`/`catastrophes`
+name against `known_metrics()`, so an entry naming an uninstrumented metric is
+refused. That ordering is deliberate: it is what stops a benchmark declaring a
+measurement that no instrument makes.
 
 ---
 
@@ -888,9 +1055,15 @@ discipline.
 
 This request is discharged when:
 
+- [ ] G1–G3 have landed and the pre-flight has run, so the entries in §9 name only
+      metrics that exist and durations that were measured
+- [ ] The **joint occupancy rule and the minimum detectable `ΔU` are pre-registered**
+      (§8) before the ladder data is read
 - [ ] The proxy's **case (1/2/3) is written down**, with the regime it was measured
       in — route, batch, `T`, step time, eval cadence — and, if case 3, the margin
       **and the margin's measured cost in samples/sec**
+- [ ] Both the trailing **mean** and the windowed **minimum** are recorded per job, so
+      the artefact survives the answer to §0's question 2
 - [ ] `noise_floor.measured` is recorded for every benchmark in `phase4-utilisation`,
       from at least the declared repeat launches, covering every primary metric
 - [ ] `U(B)` is recorded on **both** an analytic-energy and an MLIP route, each

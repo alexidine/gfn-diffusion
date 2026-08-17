@@ -13,11 +13,9 @@
 # file (mode_presets.yaml) carried a dozen such keys plus a whole alternate
 # protocol block, which is what made a mode switch an editing exercise.
 #
-# THE PROTOCOL IS THE ONE STRUCTURAL EXCEPTION. A conditional route genuinely
-# needs different stages (var_conditioning has no meaning with one condition:
-# condition-grouped VarGrad over a single group is identically zero), so a
-# problem may name a protocol. It is named, not inlined, so this file stays a
-# registry rather than becoming a second config.
+# PROTOCOLS ARE NOT HERE. They live in the canonical config, under `protocols:`,
+# named by its `protocol:` key -- one home, so the two files cannot disagree about
+# which stages a route runs.
 #
 # STATUS: this file is a REGISTRY, and consuming it from train.py is Phase 2 of
 # docs/design/infrastructure_stabilization.md (the generator reads it). Until
@@ -116,7 +114,6 @@ problems:
     buffers:
       anchor_buffer:
         seed_source: 'D:\crystal_datasets\conditional\priors\toy_big_unif_conditions.pt'
-    protocol: conditional_vargrad
 
   # ---- unconditional toy ------------------------------------------------
   toy_hard_uncond_multi:

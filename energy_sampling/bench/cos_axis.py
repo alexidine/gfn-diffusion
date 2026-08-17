@@ -52,9 +52,12 @@ import torch
 from bench.surfaces import EquilibrationGame, MLEGame, TrackingGame
 import bench.eqsuite as eqsuite
 
-#: written by `bench/calibrate_noise.py`, at the repo root
-REAL_JSON = os.path.join(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__))), 'bench_noise_calibration.json')
+#: written by `bench/calibrate_noise.py`. This used to resolve to
+#: `energy_sampling/` -- described in the comment as "the repo root", which it
+#: never was -- because that tool wrote bare filenames into the CWD. Both ends
+#: now agree on `bench/results/`.
+REAL_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         'results', 'bench_noise_calibration.json')
 
 
 def chance(d):

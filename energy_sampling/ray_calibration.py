@@ -86,6 +86,12 @@ class RayCalibration:
         # predecessor logged three separate times.
         self.n_skipped = 0        # genuine failures: nothing to draw
         self.n_deferred = 0       # due but no optimizer step yet -- retried next step
+        # Due, but the controller had already decided the reading would be
+        # discarded, so nothing was drawn. Counted and reported for the same
+        # reason as the two above: a probe that is deliberately silent and one
+        # that is broken must not look alike from the logs.
+        self.n_refused = 0
+        self.refuse_reason = ''
         self.skip_reason = ''
         self._last_done = None    # period index of the last COMPLETED calibration
         self._armed_at = None
@@ -135,6 +141,40 @@ class RayCalibration:
             return False
         self._before = [p.detach().clone() for p in self._params]
         self._armed_at = int(step_ind)
+        return True
+
+    def refuse(self, reason: str, step_ind: int) -> bool:
+        """Consume a due calibration WITHOUT measuring it.
+
+        Called instead of `arm` when the controller has already decided the
+        reading would be discarded (`LRController.calibration_refusal`). Skips
+        the parameter clone and, far more importantly, the `n_sub` replay draws:
+        those consume RNG that nothing restores, so a calibration that changes
+        no learning rate still moves every subsequent training step. That was
+        F-039.
+
+        THE PERIOD IS CONSUMED, exactly as a completed calibration consumes it.
+        This is what keeps the applied path unchanged. `due` latches from the
+        moment a calibration falls due until one completes, so a refusal that
+        left `_last_done` alone would leave the latch pending through warmup and
+        then fire on the FIRST step after it -- earlier than the boundary the
+        old code fired on. Advancing it here means the same boundaries are
+        consumed either way, so the first calibration that is actually applied
+        lands on the same step as before this change.
+
+        One edge remains, and it is stated rather than hidden: pre-change, a
+        `deferred_no_step` (mid-accumulation, or a non-finite gradient) at a
+        boundary left the latch pending and let a later step consume a LATER
+        period index. A refusal cannot detect that case, because detecting it is
+        what the clone is for. The two can therefore disagree by one period
+        index only if a deferral straddles the end of warmup.
+        """
+        if not self.due(step_ind):
+            return False
+        self.n_refused += 1
+        self.refuse_reason = str(reason)
+        self._last_done = int(step_ind) // self.period
+        self._before = None
         return True
 
     # ----------------------------------------------------------------- measure
@@ -276,18 +316,37 @@ class RayCalibration:
     _STATUS = {'unresolved': 0, 'bracketed': 1, 'above_range': 2,
                'below_range': 3, 'inconsistent': 4, 'warmup': 5}
 
+    #: Reasons a calibration was refused before drawing. Explicit codes for the
+    #: same reason `_STATUS` has them: a positional encoding re-maps every
+    #: historical run's logs the moment the list is reordered.
+    _REFUSAL = {'': 0, 'warmup': 1}
+
     def report(self) -> dict:
-        """Loggable view. Empty until the first calibration."""
+        """Loggable view. Empty until the first calibration.
+
+        `raycal/refused` is load-bearing, not decoration. With the pre-draw gate
+        in place a probe inside warmup produces NO measurement at all, so every
+        `raycal/*` measurement key is absent -- which is indistinguishable from
+        a sensor that was never wired up unless something counts the refusals.
+        That confusion is the exact failure this module's predecessor logged
+        three separate times."""
         if not self.enabled:
             return {}
         if not self.last:
             return ({'raycal/skipped': float(self.n_skipped),
-                     'raycal/deferred': float(self.n_deferred)}
-                    if (self.n_skipped or self.n_deferred) else {})
+                     'raycal/deferred': float(self.n_deferred),
+                     'raycal/refused': float(self.n_refused),
+                     'raycal/refused_reason': float(
+                         self._REFUSAL.get(self.refuse_reason, -1))}
+                    if (self.n_skipped or self.n_deferred or self.n_refused)
+                    else {})
         r = self.last
         out = {
             'raycal/skipped': float(self.n_skipped),
             'raycal/deferred': float(self.n_deferred),
+            'raycal/refused': float(self.n_refused),
+            'raycal/refused_reason': float(
+                self._REFUSAL.get(self.refuse_reason, -1)),
             'raycal/alpha_star': r['alpha_star'],
             'raycal/status': float(self._STATUS.get(r['status'], -1)),
             'raycal/n_sub': float(r['n_sub']),

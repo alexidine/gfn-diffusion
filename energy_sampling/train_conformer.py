@@ -58,6 +58,20 @@ from utils import (dict2namespace, load_yaml, preflight_config, quick_tb_stats,
 
 WANDB_PROJECT = "GFN Conformers"
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "configs" / "conformer_dev.yaml"
+#: WHERE A BARE ``eval.out`` LANDS. conformer_dev.yaml names an output *file*,
+#: not a path, and ``Path(name).write_text`` resolved it against the CWD --
+#: always ``energy_sampling/``. Resolving here leaves the config owning the NAME
+#: and this module owning the DIRECTORY, so the user-owned yaml needs no edit.
+RESULTS_DIR = Path(__file__).resolve().parent / "energies" / "results"
+
+
+def resolve_out(out) -> Path:
+    """Bare filename -> ``energies/results/``; an explicit path is left alone."""
+    p = Path(out)
+    if p.is_absolute() or p.parent != Path("."):
+        return p
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    return RESULTS_DIR / p.name
 
 
 def load_config(default: Path = DEFAULT_CONFIG):
@@ -756,10 +770,11 @@ def run(args):
                    gt_entropy=refs[2] if refs else None,
                    max_entropy=refs[3] if refs else None,
                    wall_seconds=time.time() - t_start, history=history)
-    Path(eval_c.out).write_text(json.dumps(summary, indent=2))
+    out_path = resolve_out(eval_c.out)
+    out_path.write_text(json.dumps(summary, indent=2))
     for k in ("gt_log_z", "gt_e_log_reward", "gt_entropy", "max_entropy", "wall_seconds"):
         wandb.run.summary[k] = summary[k]
-    print(f"\nwrote {eval_c.out}")
+    print(f"\nwrote {out_path}")
 
 
 if __name__ == "__main__":

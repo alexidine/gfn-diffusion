@@ -1,0 +1,6 @@
+name	wave	kind	benchmark_id	batch	epochs	checkpoint_name
+f1_mipcas_elj	wave1_elj	func	-	1000	2500	-
+f2_qm9cond_b500	wave1_elj	func	-	500	1500	-
+f2b_qm9cond_b1000	wave1_elj	func	-	1000	1000	-
+f3_mipcas_uma	wave1_mlip	func	-	250	1200	-
+f4_acridine_mace	wave1_mlip	func	-	250	1200	-

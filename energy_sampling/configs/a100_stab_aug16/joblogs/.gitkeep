@@ -1,0 +1,2 @@
+# keeps joblogs/ present in git: submit_*.sbatch writes #SBATCH --output here,
+# and SLURM cannot create the log file into a directory that does not exist.
