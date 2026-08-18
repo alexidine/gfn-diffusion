@@ -830,6 +830,35 @@ class Modeller:
         if self._throughput['seconds'] > 0:
             metrics['samples_per_sec'] = (
                     self._throughput['samples'] / self._throughput['seconds'])
+            # OPTIMIZER-STEP throughput, which is a DIFFERENT objective from
+            # samples/sec and has a different argmax. Below
+            # fused_grad_accum_min_samples a fused step is a micro-step, so N
+            # batches accumulate into one update and updates/sec =
+            # samples_per_sec / accum_target; at or above it every step is one
+            # update. The identity "maximising samples/sec maximises opt-steps/sec"
+            # is asserted in several places and holds only in the second regime --
+            # so on any arm running below the crossover (every MLIP arm at batch
+            # 50-500) samples/sec is NOT the quantity to maximise, and without
+            # this line nothing logs the one that is.
+            _accum = int(getattr(self.args, 'fused_grad_accum_min_samples', 0) or 0)
+            _target = max(_accum, int(self.batch_size)) if _accum else int(self.batch_size)
+            if _target > 0:
+                metrics['updates_per_sec'] = metrics['samples_per_sec'] / _target
+                metrics['batch/accum_target'] = _target
+        # THE STATISTIC THE BATCH CONTROLLER ACTUALLY ACTS ON, which until now was
+        # computed and thrown away (increment_batch_size medians the last 20 step
+        # times and decides on that). Every other cost metric here is a mean over
+        # the 10-step report window, so a ladder built from them describes a curve
+        # no in-process controller can be shown to reproduce -- and nothing
+        # anywhere measures whether 20 samples is enough or what that median's own
+        # dispersion is. Logging it makes every measured operating point a
+        # measurement of the controller's own estimator.
+        _times = getattr(self, '_recent_step_times', None)
+        if _times and len(_times) >= 10:
+            _med = float(np.median(list(_times)[-20:]))
+            metrics['batch/med_step_s'] = _med
+            if _med > 0:
+                metrics['batch/sps_rung'] = float(self.batch_size) / _med
         # WHERE THE STEP'S SECONDS GO. energy/frac_of_step is the load-bearing one:
         # paired with GPU utilization it separates 'the MLIP call is expensive' from
         # 'the MLIP call is idle waiting on the host'. Denominator is the same window
@@ -4507,9 +4536,40 @@ Two things deliberately NOT done here, both recorded in
             res = torch.cuda.memory_reserved() / (1024 ** 2)
             return {'vram/live_mb': alloc, 'vram/reserved_mb': res,
                     'vram/cached_mb': res - alloc,
-                    'vram/peak_reserved_mb': torch.cuda.max_memory_reserved() / (1024 ** 2)}
+                    'vram/peak_reserved_mb': torch.cuda.max_memory_reserved() / (1024 ** 2),
+                    # SEGMENTED peak: reset at the top of every evaluation, so this
+                    # is the peak of the TRAIN phase since the last eval rather than
+                    # a run-lifetime maximum. A batch sizer's memory constraint is a
+                    # train-phase quantity, and eval shares `batch_size` -- so on a
+                    # run with eval on, the lifetime peak is frequently the EVAL peak
+                    # and using it to bound the training batch bounds the wrong
+                    # thing. peak_reserved_mb is kept as-is; nothing that reads it
+                    # today changes meaning.
+                    'vram/peak_train_mb': self._phase_peak_mb()}
         except Exception:
             return {}
+
+    def _phase_peak_mb(self):
+        """Peak reserved MB since the last `reset_peak_memory_stats`, in MB.
+
+        Separate from `vram/peak_reserved_mb` deliberately: that one is a
+        run-lifetime high-water mark and several call sites already depend on it
+        meaning exactly that (the pre-flight registry, the OOM ceiling report).
+        """
+        try:
+            return torch.cuda.max_memory_reserved() / (1024 ** 2)
+        except Exception:
+            return 0.0
+
+    def _reset_phase_peak(self):
+        """Start a new VRAM phase window. Called at the top of `evaluation`, so a
+        train-phase peak is never contaminated by the previous eval's allocation
+        burst -- eval draws `eval_num_samples` through the same batch machinery
+        and is often the larger of the two."""
+        try:
+            torch.cuda.reset_peak_memory_stats()
+        except Exception:
+            pass
 
     def record_vram_peak(self):
         """
@@ -5118,6 +5178,11 @@ Two things deliberately NOT done here, both recorded in
 
     def evaluation(self, override_do_figs: bool = False):
         metrics = {}
+        # close the TRAIN-phase VRAM window before eval allocates anything, so
+        # vram/peak_train_mb reported on the next 10-step report describes
+        # training and not this eval's sampling burst
+        metrics['vram/peak_train_phase_mb'] = self._phase_peak_mb()
+        self._reset_phase_peak()
         # NB any pending pulled-forward request (stage_ctrl['request_eval'] --
         # set by an exit trigger arming, or stamped into a reloaded
         # pre-transition snapshot) is cleared by protocol.maybe_advance below,

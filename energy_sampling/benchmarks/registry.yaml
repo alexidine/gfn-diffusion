@@ -60,7 +60,8 @@ metrics:
     energy/frac_of_step: {source: 'train.py:832', cadence: report}
     energy/frac_outside_step: {source: 'train.py:833', cadence: report}
   energy_phase_split:
-    # MACE ONLY. There is no UMA equivalent; see docs/design/benchmarks.md §10.
+    # MACE. The UMA equivalent is energy_phase_split_uma below -- benchmarks.md §10's
+    # claim that UMA has none is STALE (corrected 2026-08-18).
     energy/mace_build_s: {source: 'AL_mace_utils.drain_mace_phase_timing'}
     energy/mace_collate_s: {source: 'AL_mace_utils.drain_mace_phase_timing'}
     energy/mace_xfer_s: {source: 'AL_mace_utils.drain_mace_phase_timing'}
@@ -68,6 +69,40 @@ metrics:
     energy/mace_calls: {source: 'AL_mace_utils.drain_mace_phase_timing'}
     energy/mace_host_frac: {source: 'AL_mace_utils.py:137'}
     energy/mace_forward_frac: {source: 'AL_mace_utils.py:139'}
+    energy/mace_neighbours_s: {source: 'AL_mace_utils.drain_mace_phase_timing'}
+    energy/mace_nl_frac_of_build: {source: 'AL_mace_utils.drain_mace_phase_timing'}
+    # WHICH PATH RAN. Two arms otherwise log identical key sets with nothing to say
+    # which was which, and an absent flag reads as "feature off" with no error.
+    energy/mace_flag_batched_nl: {source: 'AL_mace_utils, MXT_BATCHED_MACE_NEIGHBOURS'}
+    energy/mace_flag_gpu_batch: {source: 'AL_mace_utils, MXT_GPU_MACE_BATCH'}
+    energy/mace_flag_hoisted: {source: 'AL_mace_utils, MXT_HOISTED_MACE_ATOMICDATA'}
+  controller:
+    # What the batch controller ACTS ON, as opposed to what the reporter averages.
+    # increment_batch_size medians the last 20 step times and decides on that; every
+    # other cost metric here is a 10-step report mean, so a ladder built from those
+    # describes a curve no in-process controller can be shown to reproduce.
+    batch/med_step_s: {source: 'train.py ten_step_reporting', cadence: report}
+    batch/sps_rung: {source: 'train.py ten_step_reporting', cadence: report}
+    # OPT-STEP throughput. Differs from samples_per_sec below the grad-accum
+    # crossover, where the two candidate objectives have opposite argmaxes.
+    updates_per_sec: {source: 'train.py ten_step_reporting', cadence: report}
+    batch/accum_target: {source: 'train.py ten_step_reporting', cadence: report}
+  energy_phase_split_uma:
+    # UMA DOES have a phase split -- benchmarks.md section 10 said otherwise and was
+    # stale. `graph` is NESTED INSIDE `forward` (fairchem runs otf_graph, so the
+    # neighbour list is built inside the forward), and the graph keys appear ONLY
+    # under MXT_UMA_GRAPH_TIMER=1, which costs a CUDA synchronise per graph build.
+    energy/uma_guard_s: {source: 'uma_utils.drain_uma_phase_timing'}
+    energy/uma_build_s: {source: 'uma_utils.drain_uma_phase_timing'}
+    energy/uma_forward_s: {source: 'uma_utils.drain_uma_phase_timing'}
+    energy/uma_calls: {source: 'uma_utils.drain_uma_phase_timing'}
+    energy/uma_host_frac: {source: 'uma_utils.drain_uma_phase_timing'}
+    energy/uma_forward_frac: {source: 'uma_utils.drain_uma_phase_timing'}
+    energy/uma_flag_vectorised: {source: 'uma_utils.drain_uma_phase_timing'}
+    energy/uma_graph_s: {source: 'uma_utils, MXT_UMA_GRAPH_TIMER=1 only'}
+    energy/uma_graph_calls: {source: 'uma_utils, MXT_UMA_GRAPH_TIMER=1 only'}
+    energy/uma_forward_ex_graph_s: {source: 'uma_utils, MXT_UMA_GRAPH_TIMER=1 only'}
+    energy/uma_graph_frac_of_forward: {source: 'uma_utils, MXT_UMA_GRAPH_TIMER=1 only'}
   occupancy:
     gpu/util_recent: {source: 'train.py:844', window_s: 900}
     gpu/util_policy: {source: 'train.py:848', window_s: 7200}

@@ -227,6 +227,11 @@ TIME_CLASSES = {
     'wave2_floors': '02:00:00',   # 500/225-step budgets: ~8-70 min + resume init
     'wave2_util': '05:00:00',     # U1/U2 sized ~3.1 h at measured t; cap >> window
     'wave2_prodshape': '08:00:00',  # U3 sized ~6 h incl. eval share
+    # wave 3. The boundary cells must be able to reach the ~2 h policy
+    # horizon, since being cancelled there IS the measurement; everything
+    # else measures per-step or per-call quantities and wants minutes.
+    'wave3_short': '01:00:00',      # rollout shape + MLIP flag A/Bs
+    'wave3_boundary': '03:00:00',   # survive-or-cancelled at 2 h
 }
 
 POLICY_WINDOW_S = registry.POLICY_WINDOW_S          # 7200
@@ -674,6 +679,191 @@ def build_wave2(base, cond_data, a):
 # validation + emission
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# WAVE 3 -- the (T, B, route) map, and the MLIP construction-path A/Bs.
+#
+# WHY THIS SUPERSEDES THE U TIER. The U tier asked "does batch move occupancy"
+# at T=10 with the production work stripped, and so answered a question nobody
+# has: 38 -> 48 % across a 7.4x batch rise, while prod0810 at T=60 and a SMALLER
+# batch sits at 70 % and survives for days. Occupancy is set by GPU work per
+# TRAINING STEP; the host cost (buffer draws, admission, churn, the loop body) is
+# paid once per step regardless. T multiplies the rollout only; batch multiplies
+# both halves, so it merely dilutes the fixed term. The map therefore has to be
+# over (T, B, route), not B alone.
+#
+# THE SAMPLE-QUALITY TRAP, and why tier 1 is energy-free. `eval_T` must equal
+# `integrator.T` -- refused at load -- because a policy learns drift and variance
+# per step at ONE dt, so a warm start run at another T integrates a different SDE
+# and its samples are wrong in a structured way. On an MLIP route that feeds
+# straight into COST, since geometry sets neighbour counts and the MACE
+# neighbour list is 93 % of its build. So the T axis is measured on the
+# `bwd`/`dataset` branch, which calls the energy ZERO times (the registry asserts
+# energy/* ABSENT there) and draws terminals from the dataset rather than the
+# policy: no energy, no policy samples, nothing for T to contaminate.
+#
+# AND IT IS MEASURED ONCE, NOT PER ROUTE. The rollout is the same policy trunk
+# whatever the energy function is, so tier 1 is six cells total rather than
+# eighteen.
+# ---------------------------------------------------------------------------
+
+#: T axis for tier 1. The 100/7410 cell may not fit -- trajectory activation
+#: memory scales with T unless traj_checkpoint is on, and turning that on is a
+#: DIFFERENT operating point rather than the same one measured more cheaply. A
+#: dropped cell here is a measurement of the ceiling, not a gap.
+T_LADDER = (10, 60, 100)
+T1_BATCHES = (1000, 7410)
+
+#: Tier 2, per route: the reachable ranges differ by ~100x, so a shared list
+#: would be mostly empty cells. ELJ 500 is the ONLY sub-crossover rung anywhere
+#: in this battery on that route (fused_grad_accum_min_samples is 1000), and it
+#: is the one region where samples/sec and updates/sec have different argmaxes.
+T2_BATCHES = {'elj': (500, 1000, 2722, 7410, 20000),
+              'uma': (100, 250, 500, 1000),
+              'mace': (50, 100, 250)}
+
+#: Model width -- the third occupancy lever, and unmeasured: every arm run so far
+#: is 512. Moves the whole width family together, because moving one member
+#: tests plumbing rather than capacity.
+WIDTH_KEYS = ('s_emb_dim', 't_hidden_dim', 's_hidden_dim', 'policy_hidden_dim',
+              'flow_hidden_dim', 'cond_hidden_dim')
+WIDTHS = (256, 1024)
+
+#: MLIP construction paths. ENV switches, not config keys, so each arm carries a
+#: sidecar .env and the drain functions log the resolved flag alongside.
+#:
+#: THE GRAPH TIMER CHANGES THE THING IT MEASURES: it adds a CUDA synchronise per
+#: graph build, so its arm's WALL CLOCK is not comparable to the un-timed cells.
+#: Phase FRACTIONS are the readable quantity there. Flagged on the arm so its
+#: step times are never folded into a floor.
+FLAG_ARMS = (
+    ('uma_graphtimer', 'uma', {'MXT_UMA_GRAPH_TIMER': '1'},
+     'splits fairchem otf_graph out of the opaque 98% UMA forward'),
+    ('mace_batchednl', 'mace', {'MXT_BATCHED_MACE_NEIGHBOURS': '1'},
+     'the A/B on 93% of the MACE build; the speedup has a batch-size crossover '
+     'and an earlier 10.8x reading did not reproduce'),
+    ('mace_gpubatch', 'mace', {'MXT_GPU_MACE_BATCH': '1'},
+     'on-device MACE batch build'),
+)
+
+
+def set_T(cfg, T):
+    """integrator.T and eval_T move together -- utils refuses them unequal, and
+    the reason is physical: the policy's drift is learned at one dt."""
+    cfg['integrator']['T'] = int(T)
+    cfg['eval_T'] = int(T)
+    return cfg
+
+
+def set_width(cfg, w):
+    for k in WIDTH_KEYS:
+        cfg['model'][k] = int(w)
+    return cfg
+
+
+ROUTE_SPECS = {
+    'elj': dict(energy_function='elj', mlip=None, sg=[2],
+                prior='mipcas_sg2_zp1_elj_prior_dataset.pt',
+                f_prefix='f1_mipcas_elj'),
+    'uma': dict(energy_function='uma', mlip=None, sg=[2],
+                prior='mipcas_sg2_zp1_uma_prior_dataset.pt',
+                f_prefix='f3_mipcas_uma'),
+    'mace': dict(energy_function='mace', mlip=None, sg=[14],
+                 prior='acridine_sg14_zp1_mace_prior_dataset.pt',
+                 f_prefix='f4_acridine_mace'),
+}
+
+
+def build_wave3(base, a):
+    arms, dropped = [], []
+    art = {'elj': (a.elj_archive, a.elj_prior, a.elj_transition_step),
+           'uma': (a.uma_archive, a.uma_prior, a.uma_transition_step),
+           'mace': (a.mace_archive, a.mace_prior, a.mace_transition_step)}
+    mlip = {'elj': None, 'uma': CLUSTER_UMA_MLIP, 'mace': CLUSTER_MACE_MLIP}
+
+    def cell(name, route, batch, T, kind, steps, width=None, env=None,
+             energy_free=False):
+        archive, prior_ckpt, trans = art[route]
+        if not (archive and prior_ckpt and trans):
+            dropped.append(f'{name}: no wave-1 artifacts for route {route!r} '
+                           f'(pass --{route}-archive/--{route}-prior/'
+                           f'--{route}-transition-step)')
+            return
+        r = ROUTE_SPECS[route]
+        check_warm_names(name, archive, prior_ckpt, f'{TAG}_{r["f_prefix"]}_')
+        resume = archive_step(archive)
+        cfg = copy.deepcopy(base)
+        strip_lr_sensors(cfg)
+        strip_grad_geometry(cfg)
+        strip_z_calibration(cfg)
+        set_T(cfg, T)
+        if width:
+            set_width(cfg, width)
+        p = CLUSTER_PRIOR_DIR + r['prior']
+        merge(cfg, {'energy_function': r['energy_function'],
+                    'mlip_path': mlip[route], 'space_groups': r['sg'],
+                    'prior_path': p, 'molecules_path': p,
+                    'traj_checkpoint': route != 'elj',
+                    'cuda_memory_fraction': 0.9 if route == 'elj' else 0.7,
+                    # benchmark hygiene, applied by hand because wave 3 does not
+                    # route through registry defaults (it has no benchmark id):
+                    # the runaway guard would cut the batch mid-window, and the
+                    # knee recheck would move it for a different reason.
+                    'max_step_seconds': 0, 'batch_knee_recheck_steps': 0,
+                    'anomaly_detection': False})
+        if energy_free:
+            # THE POINT OF TIER 1, and it does not happen by itself. Resuming a
+            # step-2000 archive lands INSIDE equilibration, which is fused and
+            # calls the energy every step -- so the T axis would be contaminated
+            # by exactly the sample-quality term it exists to avoid.
+            #
+            # Instead: keep ONLY train_prior, strip its exit block so it is
+            # terminal, and take weights alone. train_prior is bwd from the
+            # DATASET -- the registry asserts `energy/*` ABSENT for the whole run
+            # -- so there is no energy call and no policy sample for T to spoil.
+            # Terminals come from the dataset and are identical at every T.
+            stages = [st for st in cfg['protocols']['unconditional_tb']['stages']
+                      if st.get('name') == 'train_prior']
+            assert len(stages) == 1, 'train_prior stage not found'
+            st = copy.deepcopy(stages[0])
+            st.pop('exit', None)        # terminal: never transitions to fused
+            st.pop('on_exit', None)     # and never writes a prior/exit snapshot
+            st.pop('skip_if', None)     # `prior_loaded` would skip the only stage
+            cfg['protocols'] = {'unconditional_tb': {'stages': [st]}}
+            cfg['protocol'] = 'unconditional_tb'
+            # weights only: step restarts at 0, so `epochs` is a plain count here
+            resume = 0
+
+        cluster_layer(cfg, name, batch, resume + int(steps), archive_period=0)
+        cfg['eval_period'] = 100000000
+        cfg['figs_period'] = 100000000
+        pin_warm(cfg, archive, prior_ckpt)
+        if energy_free:
+            cfg['load_weights_only'] = True
+            cfg['prior_model_name'] = None   # nothing samples a prior here
+        cfg['checkpoint_read_only'] = True
+        arms.append((name, 'wave3', kind, '-', cfg, dict(env or {})))
+
+    # -- tier 1: rollout shape, ENERGY-FREE, one route only
+    for T in T_LADDER:
+        for b in T1_BATCHES:
+            cell(f'w3_roll_T{T}_b{b}', 'elj', b, T, 'rollout', steps=400,
+                 energy_free=True)
+    # -- tier 2: per-route batch ladder at production T, long enough to be
+    #    cancelled if it is going to be. The survive/cancel outcome IS the datum.
+    for route, batches in T2_BATCHES.items():
+        for b in batches:
+            cell(f'w3_{route}_b{b}', route, b, 60, 'boundary', steps=1000000)
+    # -- width pair, ELJ at a mid batch
+    for w in WIDTHS:
+        cell(f'w3_elj_w{w}', 'elj', 2722, 60, 'width', steps=1000000, width=w)
+    # -- MLIP construction-path A/Bs at each route's mid batch. Short: they
+    #    measure per-CALL phase splits, which need calls, not wall clock.
+    mid = {'uma': 250, 'mace': 100}
+    for nm, route, env, _why in FLAG_ARMS:
+        cell(f'w3_{nm}', route, mid[route], 60, 'flag', steps=400, env=env)
+    return arms, dropped
+
+
 def validate(name, wave, kind, bid, cfg):
     # resume pinning is DELIBERATE on every arm (requirement 3)
     for key in ('checkpoint_name', 'continue_from_checkpoint', 'prior_model_name',
@@ -706,17 +896,40 @@ def validate(name, wave, kind, bid, cfg):
         assert cfg['checkpoint_read_only'] is False, \
             f'{name}: wave 1 must WRITE checkpoints; wave 2 resumes from them'
     else:
-        assert cfg['checkpoint_name'] and cfg['prior_model_name'], \
-            f'{name}: wave-2 arms are WARM -- a fresh start silently retrains phase 1 ' \
-            f'({cfg["checkpoint_name"]!r}, {cfg["prior_model_name"]!r})'
+        # A rollout arm needs no prior model: bwd/dataset draws terminals from
+        # the atomic dataset, so nothing samples the frozen prior. Requiring one
+        # there would demand a checkpoint the arm has no use for.
+        assert cfg['checkpoint_name'], (
+            f'{name}: warm arms need a checkpoint -- a fresh start silently '
+            f'retrains phase 1')
+        assert kind == 'rollout' or cfg['prior_model_name'], (
+            f'{name}: a churn-stage resume needs prior_model_name, or churn '
+            f'refills 100% from anchors')
         assert cfg['checkpoint_read_only'] is True, f'{name}: benchmark arms must not write'
         # wave 2 is the opposite case from wave 1's MLE seed: a benchmark measures
         # INSIDE a stage, so it needs the full state -- optimizers, buffers, step
         # count. Weights-only would restart at step 0 in train_prior and measure
         # the wrong stage entirely.
-        assert cfg['load_weights_only'] is False, \
-            f'{name}: a benchmark resume needs full state, not weights-only'
-        assert cfg['epochs'] > archive_step(cfg['checkpoint_name']), \
+        if kind == 'rollout':
+            # the energy-free T-axis arms deliberately take weights alone: they
+            # run a single terminal train_prior stage rather than resuming into
+            # the fused stage the archive was written from
+            assert cfg['load_weights_only'] is True, \
+                f'{name}: a rollout arm must be weights-only'
+            protos = cfg['protocols']
+            assert list(protos) == ['unconditional_tb'] and \
+                len(protos['unconditional_tb']['stages']) == 1, \
+                f'{name}: rollout arms run ONE terminal stage'
+            only = protos['unconditional_tb']['stages'][0]
+            assert only['name'] == 'train_prior' and only['train_mode'] == 'bwd' \
+                and only['bwd_sampling_mode'] == 'dataset', \
+                (f'{name}: the T axis is only clean on bwd/dataset, which calls '
+                 f'the energy zero times')
+            assert 'exit' not in only, f'{name}: rollout stage must be terminal'
+        else:
+            assert cfg['load_weights_only'] is False, \
+                f'{name}: a benchmark resume needs full state, not weights-only'
+        assert kind == 'rollout' or cfg['epochs'] > archive_step(cfg['checkpoint_name']), \
             f'{name}: epochs {cfg["epochs"]} <= resume step -- runs ZERO steps and ' \
             f'reports a clean empty result (epochs is an ABSOLUTE index)'
     assert cfg['continue_from_checkpoint'] is False, f'{name}: pinned false everywhere'
@@ -729,7 +942,7 @@ def validate(name, wave, kind, bid, cfg):
         assert str(cfg[key]).startswith('/'), f'{name}: local {key}: {cfg[key]}'
     assert cfg['tag'] == TAG and cfg['run_name'] == name
 
-    if kind in ('floor', 'util', 'probe'):
+    if kind in ('floor', 'util', 'probe', 'rollout', 'boundary', 'width', 'flag'):
         for k in ('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'):
             assert cfg[k] == SEED_LR, f'{name}: benchmark arms pin {k} to the seed'
         # z-cal off, checked WHERE STATE 6 PUT IT. Asserting the old
@@ -801,15 +1014,29 @@ def emit(arms, dropped, outdir):
     names = [n for n, *_ in arms]
     assert len(set(names)) == len(names), 'duplicate arm names'
 
+    # waves 1-2 emit 5-tuples; wave 3 adds a per-arm ENV dict, because the MLIP
+    # construction paths are environment switches that no config key can express.
+    arms = [a if len(a) == 6 else (*a, {}) for a in arms]
+
     print('validating:')
-    for name, wave, kind, bid, cfg in arms:
+    for name, wave, kind, bid, cfg, _env in arms:
         validate(name, wave, kind, bid, cfg)
-    for name, wave, kind, bid, cfg in arms:
+    for name, wave, kind, bid, cfg, env in arms:
         with (outdir / f'{name}.yaml').open('w', encoding='utf-8') as f:
             yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
+        envp = outdir / f'{name}.env'
+        if env:
+            # sourced by the sbatch. Written even though the drain functions also
+            # log the resolved flags: the log says what the process saw, this says
+            # what we ASKED for, and a silent divergence between them is the thing
+            # worth catching.
+            envp.write_text(''.join(f'{k}={v}\n' for k, v in sorted(env.items())),
+                            encoding='utf-8')
+        elif envp.exists():
+            envp.unlink()   # a stale sidecar would silently re-flag a control arm
 
     by_wave = {}
-    for name, wave, kind, bid, cfg in arms:
+    for name, wave, kind, bid, cfg, _env in arms:
         by_wave.setdefault(wave, []).append((name, kind, bid, cfg))
 
     master = ['name\twave\tkind\tbenchmark_id\tbatch\tepochs\tcheckpoint_name']
@@ -820,8 +1047,13 @@ def emit(arms, dropped, outdir):
             master.append(f'{name}\t{wave}\t{kind}\t{bid}\t{cfg["batch_size"]}'
                           f'\t{cfg["epochs"]}\t{cfg.get("checkpoint_name") or "-"}')
         (outdir / f'INDEX_{wave}.tsv').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        # wave 3 spans two time classes -- the boundary cells must reach the 2 h
+        # policy horizon, the rest want minutes -- so its per-wave file takes the
+        # MAX and the useful submission is a `--set` per class.
+        limit = TIME_CLASSES.get(wave) or max(
+            (TIME_CLASSES[class_of(n)] for n, *_ in rows), key=_hms)
         (outdir / f'submit_{wave}.sbatch').write_text(
-            SBATCH_TEMPLATE.format(label=wave, time=TIME_CLASSES[wave],
+            SBATCH_TEMPLATE.format(label=wave, time=limit,
                                    array=f'0-{len(rows) - 1}'), encoding='utf-8')
     (outdir / 'INDEX.tsv').write_text('\n'.join(master) + '\n', encoding='utf-8')
 
@@ -924,6 +1156,17 @@ srun singularity exec --nv \\
     /bin/bash -c "
         source /ext3/env.sh
         export PYTHONPATH=${{PROJECT_ROOT}}/MXtalTools:${{PROJECT_ROOT}}/gfn-diffusion:\\$PYTHONPATH
+        # PER-ARM ENV, one KEY=VAL per line in <arm>.env. The MLIP construction
+        # paths are ENV switches rather than config keys, so an A/B on them cannot
+        # be expressed in the YAML at all -- and a flag arm differing from its
+        # control only by an unrecorded environment variable is unreadable after
+        # the fact. drain_{{mace,uma}}_phase_timing log the RESOLVED flags for
+        # exactly this reason; the .env file is the other half, on disk beside
+        # the config.
+        if [ -f ${{ARMS}}/${{ARM}}.env ]; then
+            set -a; . ${{ARMS}}/${{ARM}}.env; set +a
+            echo "arm env:"; cat ${{ARMS}}/${{ARM}}.env
+        fi
         python -u train.py --config ${{CONFIG}}
     "
 """
@@ -954,6 +1197,11 @@ def class_of(arm):
     been truncated by SLURM at the exact moment its policy window was filling.
     A name-substring heuristic cannot classify names it was not written for.
     """
+    if arm.startswith('w3_roll_') or arm.startswith('w3_uma_graphtimer') \
+            or arm.startswith('w3_mace_batchednl') or arm.startswith('w3_mace_gpubatch'):
+        return 'wave3_short'
+    if arm.startswith('w3_'):
+        return 'wave3_boundary'
     if arm.startswith('u_prodshape'):
         return 'wave2_prodshape'
     if arm.startswith('u_'):
@@ -1039,6 +1287,8 @@ def preflight(outdir):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[1])
     ap.add_argument('--wave2', action='store_true')
+    ap.add_argument('--wave3', action='store_true',
+                    help='the (T, B, route) map + MLIP construction-path A/Bs')
     ap.add_argument('--preflight', action='store_true')
     ap.add_argument('--outdir', default=None, help=argparse.SUPPRESS)  # self-test hook
     for grp in ('elj', 'cond', 'uma', 'mace'):
@@ -1093,7 +1343,12 @@ def main():
         'conditional route is applied by conditional_base()'
 
     cond_data = CONDITIONAL_DATA[a.cond_data]
-    if a.wave2:
+    if a.wave3:
+        arms, dropped = build_wave3(base, a)
+        if not arms:
+            raise SystemExit('wave 3: nothing to generate -- pass the wave-1 '
+                             'artifact args for at least one route')
+    elif a.wave2:
         arms, dropped = build_wave2(base, cond_data, a)
         if not arms:
             raise SystemExit('wave 2: nothing to generate -- pass the wave-1 artifact args')

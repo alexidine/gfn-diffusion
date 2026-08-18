@@ -1,0 +1,10 @@
+name	kind	benchmark_id	batch	epochs
+w3_roll_T10_b1000	set	-	1000	400
+w3_roll_T10_b7410	set	-	7410	400
+w3_roll_T60_b1000	set	-	1000	400
+w3_roll_T60_b7410	set	-	7410	400
+w3_roll_T100_b1000	set	-	1000	400
+w3_roll_T100_b7410	set	-	7410	400
+w3_uma_graphtimer	set	-	250	1400
+w3_mace_batchednl	set	-	100	1400
+w3_mace_gpubatch	set	-	100	1400

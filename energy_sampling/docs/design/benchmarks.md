@@ -433,14 +433,29 @@ whole neighbour-list approach rests on and Phase 5.1 requires it re-measured.
 numbers do not transfer: `energy/mace_host_frac` exists precisely to establish
 whether MACE splits host/device the way UMA does, and that is an open question.
 
-**UMA's phase split does not exist as an instrument.** Phase 5.0 wants the energy
-call broken into preprocessing, neighbour-list construction, forward, and host↔device
-transfer *for both routes*. `AL_mace_utils.drain_mace_phase_timing` does it for MACE;
-there is no counterpart in `uma_utils`. So the UMA benchmark can report the total
-energy cost and its share of the step, and cannot say where inside the call the time
-goes. Closing that is instrumentation work that has to precede the measurement, and
-it is the one place this specification implies a code change — in
-`mxtaltools/`, which this session does not own.
+**UMA's phase split — CORRECTED 2026-08-18: it EXISTS.** This section previously
+said there was no UMA counterpart to `drain_mace_phase_timing`, and that was
+wrong. `uma_utils.drain_uma_phase_timing` reports guard / build / forward,
+`uma_host_frac` and `uma_forward_frac`, and it is live on every UMA run —
+measured `host_frac` **1.7 %** against MACE's **68 %**, i.e. the UMA host side is
+already substantially solved by the AtomicData vectorisation
+(`uma_flag_vectorised: 1`).
+
+It is also more careful than the MACE one where it matters. `graph` is **nested
+inside `forward`**: mxtaltools hands fairchem an empty `edge_index` and
+`crystal_inference_settings` sets `external_graph_gen=False`, so the model runs
+`otf_graph` and builds the neighbour list ITSELF inside the forward. A plain
+build/forward split therefore charges graph construction to the forward and
+concludes the forward dominates — true, uninformative, and exactly the reading
+that would retire the neighbour-list question for the wrong reason.
+
+**What is real is that the graph keys are OFF BY DEFAULT.** They appear only
+under `MXT_UMA_GRAPH_TIMER=1`, because the timer adds a CUDA synchronise per
+graph build and a measurement cost has no business on every production step. So
+UMA's forward reads 98.3–98.6 % of the call and **nothing decomposes it** until
+that flag is set — which is a flag on a profiling arm, not missing
+instrumentation. The same pattern governs the MACE construction paths
+(`MXT_BATCHED_MACE_NEIGHBOURS`, `MXT_GPU_MACE_BATCH`), both off by default.
 
 **The utilisation proxy, and its case.** Phase 4 wants `gpu/util_policy` adopted
 under case 1 (documented statistic), 2 (proxy shown to agree with cluster-visible

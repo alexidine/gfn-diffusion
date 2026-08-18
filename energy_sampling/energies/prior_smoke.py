@@ -17,7 +17,7 @@ TWO RULES IT IS BUILT AROUND
 ----------------------------
 **1. It must be able to FAIL.** A harness that prints numbers and exits 0 manufactures
 reassurance. Every check asserts a threshold and names the molecule it fired on, and
-``--inject`` re-introduces eleven real bug classes so the checks can be SHOWN to fire rather
+``--inject`` re-introduces real bug classes so the checks can be SHOWN to fire rather
 than assumed to. Run ``--inject all`` after touching this file -- it makes ONE PASS PER BUG,
 so the question "did THIS bug's named detector fire" stays answerable. A harness whose
 injections stop firing has gone blind, and is worse than no harness.
@@ -34,7 +34,7 @@ fitted prior, no tolerance. Freezing a row does not blind a count of it.
 **4. A CEILING CANNOT SEE A VANISHING QUANTITY, and most of this file is ceilings.** This
 one was learned by an audit of the file's own thresholds and it is the more general form of
 rule 3. Nearly every check here bounds an ERROR from above, and an error is smallest when
-NOTHING HAPPENED: a builder that ignores its dihedral argument satisfies every roundtrip,
+NOTHING HAPPENED: a builder that ignores its dihedral argument satisfies every
 external, rigid, group-rigid and MMFF residual EXACTLY, and passes every kT-per-term
 ceiling, because zero is simultaneously the correct answer and the signature of a dead
 pipeline. No tighter bar on the residual separates those two. Three things do, and they are
@@ -45,22 +45,30 @@ the only floors in the file that can exist:
   actually moved the molecule, measured on the nonbonded distances, which are precisely the
   coordinates the invariance claims do not cover;
 * a floor on the POPULATION, never on the residual -- ``n_external_geom``,
-  ``n_external_mmff``, ``n_key_rows``, ``n_groups``, ``n_improper_rows``, ``n_clash_pairs``,
+  ``n_external_mmff``, ``n_key_rows``, ``n_groups``, ``n_clash_pairs``,
   ``n_chirality_conformers``. An empty population makes every ceiling pass at exactly 0 and
   every violation count pass at exactly 0;
-* an IDENTITY rather than a threshold -- ``term_energy_live`` and ``ele_pairs_charged``
-  compare a boolean or a count against a second source, so there is nothing to calibrate
-  and nothing to go blind.
+* an IDENTITY rather than a threshold -- ``term_energy_live`` compares a boolean against a
+  second source, so there is nothing to calibrate and nothing to go blind.
 
-Only two checks in the file carry a genuine magnitude floor, and both are stated as bands:
-``T_eff`` and ``T_eff_angle``, where equipartition fixes the value at 1, and
-``kt_per_electrostatic``, whose floor is CONDITIONAL on the charge parameters being
-non-degenerate because on most of this molecule set the nonbonded electrostatic energy is
-exactly zero for correct code. Floors were deliberately NOT put on ``kt_per_bond``,
-``kt_per_angle``, ``kt_per_stretch_bend``, ``kt_per_oop``, ``kt_per_torsion``,
-``kt_per_lj``, ``closure_sigma`` or ``clash_excess_p10``: each of those legitimately
-reaches zero, cancels in sign, or is a constant in x at the level that ships, so a floor
-there would fire on correct code. A false-firing floor is worse than a missing one.
+Two checks carry a genuine magnitude floor, both stated as bands: ``T_eff`` and
+``T_eff_angle``, where equipartition fixes the value at 1. Floors were deliberately NOT put
+on the ``kt_per_*`` family or on ``closure_sigma``: each of those legitimately reaches zero,
+cancels in sign, or is a constant in x at the level that ships, so a floor there would fire
+on correct code. A false-firing floor is worse than a missing one.
+
+**6. IF BOTH OPERANDS COME FROM THE CODE UNDER TEST, IT IS NOT A CHECK.** It reports zero
+when the code is correct and zero when the code is dead, and no threshold separates those.
+An audit of this file found the shape in eight places and they were REMOVED rather than
+tightened: the ``roundtrip_*`` legs (reference and measured side both descend from one
+``dof_from_state`` call), ``rigid_bond`` and ``group_rigid_bond`` (``build`` places every
+atom at exactly the requested r, so a phi-only perturbation cannot move a tree bond),
+``group_frame_bond`` (scored against the key ``torsion_groups`` partitions on),
+``ele_pairs_charged`` (both counts from one ``GetMMFFPartialCharge`` call),
+``clash_excess_p10`` (draw and reference overlap over the same ``ff.sigma``),
+``prior_ess_le_one`` and ``coverage_report``'s mode floor (algebraic identities that no
+pipeline state can violate). ``improper_rows_ungrouped`` was RE-REFERENCED instead, against
+RDKit's bond table, because the claim is worth keeping and an independent operand was cheap.
 
 **5. "N PASSED, M SKIPPED, 0 FAILED" IS NOT A RESULT until M is broken down.** Every skip
 carries a KIND, and the report prints the census on the verdict line where the summary gets
@@ -73,33 +81,29 @@ its own line because at the only level that ships it is entirely absent.
 **2. It must not be SELF-REFERENTIAL.** Scoring our own draws with our own energy cannot
 detect a wrong energy. Three legs here are independent of the force field entirely:
 
-* ``roundtrip_*`` -- draw DoF, build Cartesians, RE-MEASURE the internal coordinates from
-  those Cartesians, compare to what was drawn. Pure geometry. Catches NeRF bugs, index
-  scrambles, permutation errors.
-* ``rigid_*`` -- shifting every dihedral about one bridge bond by a common delta must leave
-  EVERY graph bond length and EVERY graph angle invariant, because it is a rigid motion of
-  a fragment. This is the claim the torsion parameterisation rests on, and it is what
-  separates a joint-draw group keyed on the CENTRAL BOND from one keyed on the parent atom.
+* ``rigid_angle`` -- shifting every dihedral about one bridge bond by a common delta must
+  leave EVERY graph angle invariant, because it is a rigid motion of a fragment. The second
+  operand is the theory constant 0, not a second call into the builder.
 * ``chirality`` -- RDKit re-perceives the stereocentre from the built Cartesians and must
   recover the SMILES' own CIP code. Every energy term is a function of interatomic
   distances or of even functions of the dihedral, so a mirrored molecule scores identically
   -- this is the only check in the file that can see a reflection.
-
-* ``group_rigid_*`` -- the same rigid-motion claim, but with the rows taken from
-  ``torsion_groups()`` rather than from ``_find_rotatable``'s mask. The two row sources are
-  computed independently, which is why ``rigid_angle`` sits at 2e-15 on a grouping defect
-  that this one catches at 1.0 rad.
-* ``prior_key_external`` -- ``prior_dof_types``' per-row keys against the mxtaltools
-  ``tree_*`` derivation, which is the route ``InternalPrior.fit`` actually used to build the
-  tables. Two implementations of the same claim, not one implementation checked against
-  itself.
+* ``group_rigid_angle`` -- the same rigid-motion claim, but with the rows taken from
+  ``torsion_groups()`` rather than from ``_find_rotatable``'s mask.
 
 and two are independent of OUR force field though not of RDKit:
 
 * ``external_*`` -- ``rdkit.Chem.rdMolTransforms`` re-measures r/theta/phi off the built
-  conformer through the ORIGINAL atom numbering. Our own ``measure`` shares an index
-  convention with ``build``, so it cannot see an error that is consistent between them.
+  conformer. What is independent is RDKit's ABSOLUTE convention -- radians, and the standard
+  internal-coordinate definitions -- so a units or NeRF-convention error that ``build`` and
+  ``measure`` share is visible here. The atom-index arrays are NOT independent: the read
+  addresses the same ``spec.perm`` the write used, so the permutation cancels and a
+  consistently wrong numbering is invisible to these three. ``mmff_lj`` sees that.
 * ``mmff_*`` -- RDKit's own MMFF94, term by term, on the geometries WE built.
+
+``prior_key_external`` is deliberately NOT on either list. The ``tree_*`` route re-runs
+``spec_from_graph``, the same function ``spec`` came from, so the index arrays are shared;
+what it tests independently is the slot <-> atom permutation and the column convention.
 
 KNOWN BUG CLASSES THIS EXISTS TO CATCH
 --------------------------------------
@@ -200,25 +204,23 @@ MOLECULES = [
 # ---------------------------------------------------------------------------------------
 TOL = {
     # --- energy-free geometry ---------------------------------------------------------
-    # build and measure are exact inverses in exact arithmetic, so the only floor is
-    # float64 round-off. r and theta land under 1e-15. phi's worst case is the near-linear
-    # nitrile frame, where the dihedral is ill-conditioned by construction, at ~2e-13. A
-    # bar of 1e-7 is six orders above that: nothing but an index convention, a permutation
-    # or a units error reaches it, and each of those lands at 1e-2 or worse.
-    'roundtrip_r': 1e-9,
-    'roundtrip_theta': 1e-9,
-    'roundtrip_phi': 1e-7,
-    # identical numbers for the external re-measure: rdMolTransforms does the same
-    # arithmetic, just addressed through the ORIGINAL atom numbering instead of slots.
+    # roundtrip_r / roundtrip_theta / roundtrip_phi DELETED: measure() and build() share the
+    # tree index arrays and the NeRF convention, and both operands descend from one
+    # dof_from_state call, so the residual is machine zero under a dead map, a rolled index
+    # and a flipped phi sign alike. external_* is the same claim with RDKit on the far side.
+    # rdMolTransforms does the same arithmetic in an ABSOLUTE convention. r and theta land
+    # under 1e-15; phi's worst case is the near-linear nitrile frame, ill-conditioned by
+    # construction, at ~1e-13. A units or NeRF-convention error lands at 1e-2 or worse.
     'external_r': 1e-9,
     'external_theta': 1e-9,
     'external_phi': 1e-7,
     # A common delta on every dihedral about one bridge bond is a rigid motion of the
-    # moving fragment, so bond lengths and graph angles are invariant EXACTLY; round-off
-    # only, measured under 1e-14. If a torsion column drove only the first of its bond's
-    # dihedrals the fragment would shear, and graph angles at the axis would move by tens
-    # of degrees -- 1e-1 rad, seven orders above this bar (--inject shear-torsion).
-    'rigid_bond': 1e-8,
+    # moving fragment, so graph angles are invariant EXACTLY; round-off only. If a torsion
+    # column drove only the first of its bond's dihedrals the fragment would shear, and
+    # graph angles at the axis would move by tens of degrees (--inject shear-torsion).
+    # rigid_bond DELETED: build places every atom at exactly the requested r from its
+    # parent, so a phi-only perturbation cannot move a TREE bond at all, and _rigid never
+    # rotates a ring bond, so it cannot move a closure bond either. Identically zero.
     'rigid_angle': 1e-8,
 
     # --- external energy cross-check ---------------------------------------------------
@@ -271,7 +273,8 @@ TOL = {
     'kt_per_oop': 1.0,
     'kt_per_lj': 2.0,
     'kt_per_torsion': 2.0,
-    'kt_per_electrostatic': 5.0,
+    # kt_per_electrostatic DELETED: a one-sided ceiling whose only named defect drives the
+    # quantity to zero, which every ceiling passes. term_energy_live detects it instead.
     # T_eff/T from the bond term over FREE, NON-RING bonds: 2 <E_bond> / (n kT). For a
     # harmonic term drawn at sqrt(kT/2k) this is exactly 1 by equipartition -- the one
     # place in the file where theory predicts a number rather than bounding it. Two things
@@ -281,30 +284,14 @@ TOL = {
     # those with room and still catches a factor-2 error in the width or a lost factor of T.
     'T_eff_lo': 0.70,
     'T_eff_hi': 1.40,
-    # Worst nonbonded overlap as a FRACTION of the pair's own sigma, in EXCESS of the
-    # reference conformer's own value, at the 10th percentile of draws.
-    #   Three choices, each load-bearing. (a) As a fraction of sigma, so it is comparable
-    # across molecules. (b) In EXCESS of the reference: 1-4 pairs are intrinsically inside
-    # sigma and the MMFF-optimised reference conformer already sits at 0.13-0.25, so an
-    # absolute bar measures the molecule rather than the draw. The baseline is a relaxed
-    # GEOMETRY, not our energy, so this stays outside the self-referential trap. (c) The
-    # 10th percentile, not the median: a legitimate torsional excursion raises the TAIL --
-    # a floppy chain folded onto itself is a real conformer -- while destroyed local
-    # geometry raises the FLOOR, because siblings overlap whatever the global torsion does.
-    #   Measured across the set: clean 0.00-0.11 (worst is hexanol), improper-scramble
-    # reaches 0.28 and sibling-scramble 0.36. 0.20 sits at 1.8x the worst clean value.
-    'clash_excess_p10': 0.20,
+    # clash_excess_p10 DELETED: draw and reference overlap were both _worst_overlap over the
+    # same ff.pair_index and the same ff.sigma, so halving every vdW radius sends both to
+    # exactly 0 and doubling them drives the difference AWAY from the bar. The pair-count
+    # floor does not cover it. The overlap is still reported, unasserted.
     # One batch of n against two of n/2. _batch is a getter that MUTATES (it fills the
     # tree/ff caches as a side effect) and a stale tree is a silent wrong answer, not a
     # crash. Relative, because energies here span 1e0 to 1e5.
     'batch_invariance_rel': 1e-9,
-
-    # --- prior_diagnostics ---------------------------------------------------------------
-    # An ESS FRACTION is bounded above by 1 by construction: it is sum(w)^2 / (n sum(w^2)),
-    # which is Cauchy-Schwarz. Above 1 means the object being averaged is not a set of
-    # importance weights. This is the only HARD bound the prior leg supplies -- see the
-    # note in _prior_leg for why eta and n_missed are reported rather than asserted.
-    'prior_ess_max': 1.0,
 
     # --- LEG 0: structural invariants of the tree and the grouping -----------------------
     # These carry NO tolerance and need no draw, no energy and no fitted prior. That is the
@@ -315,32 +302,31 @@ TOL = {
     # definitional identity, not a rate; a tolerated count here would be a number with no
     # argument behind it.
     'improper_rows_ungrouped': 0,
-    'group_frame_bond': 0,
     'tree_parent_unique': 0,
     'prior_key_external': 0,
+    # group_frame_bond DELETED: it scored spec.torsion_index's central-bond column pair
+    # against the key torsion_groups partitions on, read off the identical array. Pinned at
+    # 0 under every column permutation of that array, including ones that collapse the
+    # partition. group_rigid_angle is the behavioural form of the same claim.
     # A common displacement over the members of ONE group is a rigid motion of the placed
-    # fragment, so every graph bond and graph angle is invariant in exact arithmetic --
-    # identical argument to rigid_bond/rigid_angle, hence identical bars, except that the
-    # rows come from torsion_groups() rather than from _find_rotatable's mask. The two row
-    # sources are computed independently, which is why rigid_angle sits at 2e-15 on a
-    # grouping defect that this one catches.
-    'group_rigid_bond': 1e-8,
+    # fragment, so every graph angle is invariant in exact arithmetic -- identical argument
+    # to rigid_angle, hence an identical bar, except that the rows come from
+    # torsion_groups() rather than from _find_rotatable's mask.
+    # group_rigid_bond DELETED for the same reason as rigid_bond: build places every atom at
+    # exactly the requested r, and ring groups are skipped, so no tree or closure bond moves.
     'group_rigid_angle': 1e-8,
-    # Realised sample width of sample_prior_states' OWN draw, as a fold deviation from the
-    # force field's thermal sigma, worst over free non-ring rows. For a harmonic term drawn
-    # at its own thermal width the ratio is exactly 1 BY CONSTRUCTION -- the same
-    # equipartition statement kt_per_bond rests on, measured on the DRAW instead of on the
-    # energy, which is why it survives at `torsion` where the bond term is constant in x.
-    # Two-sided (max of q and 1/q), so a lost width or a lost factor of T fires too.
-    # Measured clean 1.04 across the set at both levels; the pooled-histogram regression
-    # gives 3.1-14.2. 1.5 sits 1.45x above clean and 2.1x below the failure.
+    # Realised sample width of sample_prior_states' OWN draw against the force field's
+    # thermal sigma, worst over free non-ring rows. LIMIT, and it bounds what a pass means:
+    # sample_prior_states DREW from thermal_rtheta_sigma and this scores against the same
+    # call, so the ratio is algebraically independent of that sigma -- shadow it and both
+    # sides move together. What survives is a ROUTING claim: the draw still came down the
+    # thermal path and not from a pooled histogram (--inject prior-pooled-rtheta, 11x).
+    # The width itself is instrumented by T_eff / T_eff_angle, which read ff.k_* directly.
     'prior_rtheta_width': 1.5,
-    # Same quantity for the IMPROPER phi rows, against improper_phi_sigma. Looser (2.0)
-    # for a stated reason: that sigma is a STAND-IN -- the median tree-angle width, with the
-    # dihedral-to-angle Jacobian taken as order one -- so the prediction is order-one rather
-    # than exact, where thermal_rtheta_sigma IS the exact marginal. Measured clean 1.02;
-    # a rotamer-histogram draw on an improper spreads over the circle at circstd ~1.8 rad
-    # against s_imp ~0.1, i.e. ~18x.
+    # Same quantity and the same limit for the IMPROPER phi rows, against improper_phi_sigma
+    # (which itself calls thermal_rtheta_sigma). Looser (2.0) because that sigma is a
+    # STAND-IN -- the median tree-angle width with the dihedral-to-angle Jacobian taken as
+    # order one -- so even the routing claim is order-one rather than exact.
     'prior_improper_sigma': 2.0,
 
     # --- FLOORS AND POSITIVE CONTROLS -----------------------------------------------------
@@ -350,8 +336,8 @@ TOL = {
     # can separate those two. The separator is a positive control on the PERTURBATION and a
     # floor on the POPULATION -- never on the residual itself. That is what this block is.
     #
-    # (a) The perturbation actually moved the molecule. rigid_* and group_rigid_* assert
-    # that a common dihedral displacement leaves every graph bond and graph angle invariant.
+    # (a) The perturbation actually moved the molecule. rigid_angle and group_rigid_angle
+    # assert that a common dihedral displacement leaves every graph angle invariant.
     # A builder that ignores its dihedral argument satisfies that claim perfectly. The set
     # the invariance claim does NOT cover is the NONBONDED pair distances, so that is what
     # this measures: the largest change in any nonbonded pair distance under the same
@@ -384,18 +370,13 @@ TOL = {
     # adds in the same direction.
     'T_eff_angle_lo': 0.70,
     'T_eff_angle_hi': 1.50,
-    # (e) The electrostatic FLOOR, and it is the weakest bar in the file for a stated
-    # reason. On most of this molecule set MMFF puts charge only on the heteroatom, its
-    # hydrogen and the attached carbon, every charged pair is then 1-2 or 1-3, and the
-    # nonbonded electrostatic energy is EXACTLY zero by construction -- RDKit's own Ele
-    # term agrees at exactly zero. A floor there would false-fire on correct code, so the
-    # check is CONDITIONED on the charge parameters being non-degenerate and skips
-    # otherwise. On the molecules that do carry charged nonbonded pairs the bar is a
-    # magnitude bound calibrated to THIS committed molecule set, which is legitimate only
-    # because the set is fixed and committed. It is not the check that closes the
-    # electrostatics hole -- ele_pairs_charged and term_energy_live are, because they are
-    # count and liveness identities rather than thresholds, and they are meaningful on
-    # every molecule including the ones where every energy-based instrument is zero.
+    # (e) Electrostatics carries NO magnitude bar at all. On most of this molecule set MMFF
+    # puts charge only on the heteroatom, its hydrogen and the attached carbon, every
+    # charged pair is then 1-2 or 1-3, and the nonbonded electrostatic energy is EXACTLY
+    # zero by construction -- RDKit's own Ele term agrees at exactly zero. A floor
+    # false-fires there and a ceiling cannot see a term going missing. term_energy_live
+    # closes it instead, as a liveness identity, meaningful on every molecule at every level
+    # including under force_field='reference' where the RDKit cross-check is unavailable.
 }
 
 # Skip classification. The count that must not be rounded to "0 failed" is UNREACHABLE.
@@ -413,47 +394,44 @@ SKIP_KINDS = (K_MOL, K_LEVEL, K_CONFIG, K_UNREACHABLE, K_UNASSERTED)
 # a name emitted that is not listed here is also reported, so the list cannot rot quietly.
 ASSERTIONS = (
     # leg 0: structural counts and populations, no draw, no energy, no fitted prior
-    'improper_rows_ungrouped', 'group_frame_bond', 'tree_parent_unique',
-    'n_groups',
-    'group_rigid_bond', 'group_rigid_angle', 'group_perturbation_moved',
+    'improper_rows_ungrouped', 'tree_parent_unique', 'n_groups',
+    'group_rigid_angle', 'group_perturbation_moved',
     'prior_key_external', 'n_key_rows',
     # the draw and its response
     'finite_positions', 'finite_energy', 'finite_e_ref', 'draw_response',
-    # leg 1: energy-free round trip and rigidity
-    'roundtrip_r', 'roundtrip_theta', 'roundtrip_phi',
-    'rigid_bond', 'rigid_angle', 'rigid_perturbation_moved',
+    # leg 1: rigidity
+    'rigid_angle', 'rigid_perturbation_moved',
     # leg 2: external cross-checks
     'external_r', 'external_theta', 'external_phi', 'n_external_geom',
     'chirality', 'n_chirality_conformers',
     'mmff_bond', 'mmff_angle', 'mmff_stretch_bend', 'mmff_oop', 'mmff_torsion',
     'mmff_lj', 'mmff_electrostatic', 'mmff_total', 'n_external_mmff',
-    'ele_pairs_charged',
     # leg 3: physical scale
     'kt_per_bond', 'kt_per_angle', 'kt_per_stretch_bend', 'kt_per_oop', 'kt_per_lj',
-    'kt_per_torsion', 'kt_per_electrostatic', 'term_energy_live',
+    'kt_per_torsion', 'term_energy_live',
     'closure_sigma', 'clip_frac', 'T_eff', 'T_eff_angle',
-    'clash_excess_p10', 'n_clash_pairs', 'batch_invariance',
+    'n_clash_pairs', 'batch_invariance',
     # leg 4: sample_prior_states' own draw, then prior_diagnostics
-    'prior_rtheta_width', 'prior_improper_sigma',
-    'prior_ess_le_one', 'prior_clip_frac',
-    'coverage_report', 'coverage_missed',
+    'prior_rtheta_width', 'prior_improper_sigma', 'prior_clip_frac', 'coverage_report',
 )
 
 # Rows that are deliberately not per-molecule assertions and are excluded from the darkness
 # diff: a construction refusal, a cross-molecule check, and a stated blind spot.
-NON_ASSERTION_ROWS = ('MOLECULE', 'chiral_pair_opposite', 'T_eff_detects_per_bond_k')
+# kt_per_electrostatic is here because it is REPORTED, not asserted: see the note in
+# run_molecule. It still emits a skip row where the term has no members.
+NON_ASSERTION_ROWS = ('MOLECULE', 'chiral_pair_opposite', 'T_eff_detects_per_bond_k',
+                      'kt_per_electrostatic')
 
 # The tier this harness exists to supply and the one the user's memory flags as the
 # replacement for ESS. Printed as its own line because it is the tier that is entirely dark
 # at the shipped level, and a headline pass count hides that completely.
-PRIOR_QUALITY_TIER = ('T_eff', 'T_eff_angle', 'prior_ess_le_one', 'prior_clip_frac',
-                      'coverage_report', 'coverage_missed')
+PRIOR_QUALITY_TIER = ('T_eff', 'T_eff_angle', 'prior_clip_frac', 'coverage_report')
 
 # The entry point and everything downstream of it. When the entry point raises, EVERY name
 # here is skipped by name -- otherwise the downstream ones emit no row at all and the hole
 # is invisible to any census.
-PRIOR_REPORT_CHECKS = ('prior_ess_le_one', 'prior_clip_frac')
-COVERAGE_CHECKS = ('coverage_report', 'coverage_missed')
+PRIOR_REPORT_CHECKS = ('prior_clip_frac',)
+COVERAGE_CHECKS = ('coverage_report',)
 
 # Known bug classes, re-introduced on demand. They act on the DoF VECTOR (or on the built
 # Cartesians), never on the state draw, for two reasons: a DoF-space injection reproduces
@@ -478,15 +456,15 @@ INJECTIONS = {
         'let ring-locked DoF float at their FULL thermal width. Closure is nonlinear, so '
         'independent per-DoF perturbations accumulate around the loop with a lever arm'),
     'shear-torsion': (
-        'rigid_bond / rigid_angle',
+        'rigid_angle',
         'rotate only the FIRST dihedral of a bond instead of all of them. This is the bug '
         'the collective state -> DoF map was written to fix: it shears the moving fragment '
         'rather than rotating it'),
-    'perm-scramble': (
-        'external_r / external_theta / external_phi',
-        'address the built Cartesians through the IDENTITY instead of spec.perm when '
-        'handing them to RDKit -- the spec-numbering vs mxtaltools tree_* numbering bug '
-        'class, which permutes rather than raising'),
+    # perm-scramble REMOVED: it replaced spec.perm with the identity on the WRITE side of
+    # to_rdkit_mol while the READ side still used the true perm, so it manufactured a
+    # mismatch inside the harness's own RDKit bridge. A consistently wrong spec.perm -- the
+    # actual bug class -- is bit-identical in external_r/theta/phi, because the write and the
+    # read address through the same array and it cancels. mmff_lj and mmff_total see it.
     'mirror': (
         'chirality',
         'negate EVERY dihedral in the DoF vector, which builds the exact mirror image. '
@@ -501,19 +479,17 @@ INJECTIONS = {
     # injection can express them. That is exactly why the sample-based checks were blind to
     # this family and the leg-0 counts are not.
     'improper-in-group': (
-        'improper_rows_ungrouped / prior_improper_sigma',
+        'improper_rows_ungrouped / group_rigid_angle / prior_improper_sigma',
         "drop the improper-row exclusion from torsion_groups, so an improper dihedral is "
         "bucketed with the real rotations about its central bond and then takes the "
         "leader's rotamer displacement. This is the ethanol O4-C0-H1 bug reintroduced at "
         "its actual source. At `torsion` every improper row is FROZEN, so nothing that "
         "measures a draw can see it -- the structural count can"),
-    'group-coarse-key': (
-        'group_frame_bond',
-        'key torsion_groups on the REFERENCE atom b alone instead of the central bond '
-        '(b, c), merging dihedrals about DIFFERENT axes into one group. Caught by the '
-        'structural count only, and that is the finding: a MERGE is behaviourally benign '
-        'here, because the sibling sets it unions are each still displaced together and '
-        'no graph angle spans two of them. Splitting is what shears -- see group-split-key'),
+    # group-coarse-key REMOVED with group_frame_bond, its only detector. Measured, the
+    # merged groups that genuinely span two or three central bonds still move rigidly --
+    # every graph angle holds to 4e-16 rad -- so the coarse key has no consequence here for
+    # a behavioural check to see, and the count that "caught" it was a restatement of the
+    # key. Splitting is what shears; see group-split-key.
     'group-split-key': (
         'group_rigid_angle',
         'key torsion_groups on the PLACED atom, i.e. one row per group. Every sibling then '
@@ -545,7 +521,7 @@ INJECTIONS = {
         'shadow dof_from_state so it IGNORES x and returns the reference conformer DoF for '
         'every row -- the pipeline stops responding to its input entirely. Every residual '
         'ceiling in the file is then satisfied EXACTLY, because a residual is smallest when '
-        'nothing happened: roundtrip, external, rigid, group_rigid, all eight mmff terms, '
+        'nothing happened: external, rigid, group_rigid, all eight mmff terms, '
         'batch_invariance and every kt_per_* pass'),
     'null-perturbation': (
         'rigid_perturbation_moved / group_perturbation_moved',
@@ -556,40 +532,40 @@ INJECTIONS = {
     'empty-groups': (
         'n_groups',
         'torsion_groups returns an empty list -- the shape a keying or filtering regression '
-        'takes when its exclusion becomes total. improper_rows_ungrouped and '
-        'group_frame_bond then both count zero violations over zero groups and pass'),
+        'takes when its exclusion becomes total. improper_rows_ungrouped then counts zero '
+        'violations over zero groups and passes'),
     'no-improper-rows': (
-        'tree_parent_unique / group_rigid_angle',
+        'improper_rows_ungrouped / tree_parent_unique / group_rigid_angle',
         'improper_phi_rows returns an empty list. This is the ethanol bug at its detection '
-        'end rather than its damage end: improper_rows_ungrouped -- the leg-0 count the '
-        'whole file leans on -- passes vacuously, torsion_groups stops excluding anything, '
-        'and prior_improper_sigma skips for want of a row. Detected STRUCTURALLY rather '
-        'than by a population count: with impropers back in the groups the root frame '
-        'contributes two references for one parent, so tree_parent_unique fires (7/11), '
-        'and the group displacement then lands about mismatched axes, so group_rigid_angle '
-        'fires (10/11). The previous detector was an `n_improper_rows >= 1` bar, which '
-        'false-fired on ordinary molecules with no improper rows at all'),
+        'end rather than its damage end: torsion_groups stops excluding anything and '
+        'prior_improper_sigma skips for want of a row. improper_rows_ungrouped catches it '
+        'only because its improper set is now taken from RDKit rather than from the '
+        'function being damaged; the previous version compared the damaged set against its '
+        'own complement and reported 0. tree_parent_unique and group_rigid_angle are the '
+        'structural and behavioural back-stops'),
     'empty-prior-keys': (
         'n_key_rows',
         'prior_dof_types returns an empty mapping, so prior_key_external compares zero rows '
         'against the mxtaltools tree_* authority'),
     'no-pairs': (
         'n_clash_pairs',
-        'empty the force field NONBONDED pair list. clash_excess_p10 is then measured over '
-        'no pairs at all, and it passes -- it goes NEGATIVE, because the reference '
-        "conformer's own overlap is measured over the same empty list"),
+        'empty the force field NONBONDED pair list. Every overlap statistic is then '
+        'measured over no pairs at all, and a population floor is the only thing that can '
+        'see it -- the deleted clash_excess_p10 went NEGATIVE here, because the reference '
+        "conformer's own overlap was measured over the same empty list"),
     'drop-electrostatics': (
-        'kt_per_electrostatic',
+        'term_energy_live',
         'zero the electrostatic ENERGY PATHWAY (ele_scale) while leaving the partial '
         'charges in place. This is the "a whole force-field term went missing" class named '
         'in the module docstring, and against a CEILING it is invisible by construction: a '
-        'vanishing term makes abs(E)/count/T go to exactly 0, which every ceiling passes'),
+        'vanishing term makes abs(E)/count/T go to exactly 0, which every ceiling passes. '
+        'Live parameters against a dead energy is what sees it'),
     'drop-charges': (
-        'ele_pairs_charged',
+        'mmff_electrostatic',
         'zero the partial-charge PARAMETERS (ele_qq) instead of the energy pathway. The '
-        'complement of drop-electrostatics and deliberately a separate injection: the '
-        'kt_per_electrostatic floor cannot fire here, because its guard correctly turns '
-        'into a skip when the charges are degenerate. Only a COUNT against RDKit sees it'),
+        'complement of drop-electrostatics: term_energy_live cannot fire here, because '
+        'parameters and energy both go dead and agree with each other. RDKit scoring the '
+        'same geometry with its OWN charges is what sees it'),
     'cold-theta': (
         'T_eff_angle',
         'halve-and-halve-again the thermal ANGLE width: thermal_rtheta_sigma returns a '
@@ -612,7 +588,7 @@ INJECTION_REQUIRES_LEVEL = {
 # run_molecule immediately after construction, by shadowing the bound method on the
 # instance, so every downstream consumer -- draw_states here AND sample_prior_states inside
 # conformer_torsions -- sees the damaged version, which is what the real regression does.
-STRUCTURAL_INJECTIONS = ('improper-in-group', 'group-coarse-key', 'group-split-key',
+STRUCTURAL_INJECTIONS = ('improper-in-group', 'group-split-key',
                          'prior-key-scramble', 'prior-pooled-rtheta',
                          'dead-map', 'empty-groups', 'no-improper-rows',
                          'empty-prior-keys', 'no-pairs', 'drop-electrostatics',
@@ -623,13 +599,12 @@ STRUCTURAL_INJECTIONS = ('improper-in-group', 'group-coarse-key', 'group-split-k
 # _worst_overlap -- sees it.
 FF_INJECTIONS = ('drop-electrostatics', 'drop-charges', 'no-pairs')
 
-# Three of them rewrite the SAME method (torsion_groups) with three incompatible keying
-# rules, so combining them is not "both bugs at once" -- it is whichever one was applied
-# last, silently. Refusing is the point: a combined run that quietly drops two injections is
-# how a battery goes dead while still printing PASS. `--inject all` runs every injection in
-# its OWN pass for the same reason.
-EXCLUSIVE_FAMILY = ('improper-in-group', 'group-coarse-key', 'group-split-key',
-                    'empty-groups')
+# These rewrite the SAME method (torsion_groups) with incompatible keying rules, so
+# combining them is not "both bugs at once" -- it is whichever one was applied last,
+# silently. Refusing is the point: a combined run that quietly drops an injection is how a
+# battery goes dead while still printing PASS. `--inject all` runs every injection in its
+# OWN pass for the same reason.
+EXCLUSIVE_FAMILY = ('improper-in-group', 'group-split-key', 'empty-groups')
 
 
 # =======================================================================================
@@ -868,17 +843,17 @@ def inject_dof(en, r, th, ph, rng, inject):
     return r, th, ph
 
 
-def to_rdkit_mol(en, pos_slot, inject=()):
+def to_rdkit_mol(en, pos_slot):
     """A copy of the molecule whose conformer holds ``pos_slot``, in ORIGINAL numbering.
 
     ``pos_slot[i]`` is placement slot i and ``spec.perm[i]`` is that slot's RDKit atom
-    index. Getting this backwards is the "spec numbering vs mxtaltools tree_* numbering"
-    bug class, so every external check is addressed through it deliberately.
+    index. NOTE what this does NOT buy: ``_external_geometry`` reads back through the same
+    ``perm``, so the permutation cancels there and a consistently wrong ``spec.perm`` is
+    invisible to external_r/theta/phi. The MMFF leg is where it shows, because RDKit builds
+    its own pair list from the bond graph while ours comes from the tree.
     """
     from rdkit import Chem
     perm = np.asarray(en.spec.perm)
-    if 'perm-scramble' in inject:
-        perm = np.arange(len(perm))                # the identity: slot i <- atom i
     mol = Chem.Mol(en.mol)
     conf = mol.GetConformer()
     pos = np.asarray(pos_slot, dtype=np.float64)
@@ -893,14 +868,6 @@ def _worst_overlap(pos, ff, n):
     frac = torch.relu(ff.sigma - d) / ff.sigma
     return torch.zeros(n, dtype=pos.dtype, device=pos.device).scatter_reduce(
         0, ff.pair_batch, frac, reduce='amax', include_self=True)
-
-
-def _batch1_dof(en):
-    """``(tree, r, theta, phi)`` for the REFERENCE conformer, as ``build`` wants them."""
-    tree, _ = en._batch(1)
-    r, th, ph = en.dof_from_state(torch.zeros(1, en.data_ndim, dtype=en.dtype,
-                                              device=en.device))
-    return tree, r.reshape(-1), th.reshape(-1), ph.reshape(-1)
 
 
 def graph_geometry(pos, ff):
@@ -941,18 +908,6 @@ def apply_structural_injections(en, inject):
                 g[(int(ti[j, 1]), int(ti[j, 2]))].append(j)
             return [sorted(rows) for rows in g.values()]
         en.torsion_groups = groups_with_impropers
-
-    if 'group-coarse-key' in inject:
-        def groups_by_reference_atom(_en=en):
-            ti = np.asarray(_en.spec.torsion_index)
-            imp = set(_en.improper_phi_rows())
-            g = defaultdict(list)
-            for j in range(_en.n_ph):
-                if j in imp:
-                    continue
-                g[int(ti[j, 1])].append(j)                # the REFERENCE atom, not the bond
-            return [sorted(rows) for rows in g.values()]
-        en.torsion_groups = groups_by_reference_atom
 
     if 'group-split-key' in inject:
         def groups_by_placed_atom(_en=en):
@@ -1050,16 +1005,23 @@ def _structure_leg(en, name, level, led):
     # states this as a contract: an improper dihedral IS an angle at the parent, so giving
     # it the group leader's rotamer displacement destroys that angle outright -- ethanol's
     # O4-C0-H1 at 14.5 deg against theta0 = 108.6, carrying 251 of 252 kcal/mol.
-    led.check('improper_rows_ungrouped', name, level, len(imp & grouped),
+    #   THE IMPROPER SET IS TAKEN FROM RDKIT, not from improper_phi_rows. torsion_groups
+    # DEFINES its membership as the complement of that function's return, so scoring one
+    # against the other is the identity |S & (rows \ S)| = 0 -- it reported 0 for every
+    # implementation, including the empty one. A row is improper exactly when its outer atom
+    # a is bonded to the parent c instead of to the reference b, which RDKit's bond table
+    # settles independently. LIMIT: the row -> atom triple still comes from
+    # spec.torsion_index, so a defect inside spec_from_graph's reference selection moves
+    # both sides.
+    perm = np.asarray(en.spec.perm)
+    imp_rd = {j for j in range(en.n_ph)
+              if en.mol.GetBondBetweenAtoms(int(perm[int(ti[j, 0])]),
+                                            int(perm[int(ti[j, 2])])) is not None}
+    led.check('improper_rows_ungrouped', name, level, len(imp_rd & grouped),
               TOL['improper_rows_ungrouped'], '==', units='improper rows inside a group')
-
-    # (2) every member of a group must share ONE central bond (b, c). The group's mechanism
-    # is that each member takes the leader's angular displacement, and that is a rotation
-    # only when they share the reference axis. A coarser key gathers dihedrals measured
-    # about DIFFERENT axes and shears the fragment instead.
-    bad = sum(1 for g in groups if len({(int(ti[j, 1]), int(ti[j, 2])) for j in g}) != 1)
-    led.check('group_frame_bond', name, level, bad, TOL['group_frame_bond'], '==',
-              units='groups spanning more than one central bond')
+    # group_frame_bond DELETED here: it compared the set of (ti[j,1], ti[j,2]) pairs inside
+    # each group against 1, and that pair IS the key torsion_groups buckets on, read off the
+    # identical array. group_rigid_angle is the behavioural form and can actually fail.
 
     # (3) THE PRECONDITION TRIPWIRE, and it is worth being explicit about what it is for.
     # On this tree spec, keying the groups on the PARENT ATOM c gives the IDENTICAL
@@ -1083,11 +1045,9 @@ def _structure_leg(en, name, level, led):
     led.check('tree_parent_unique', name, level, len(multi), TOL['tree_parent_unique'], '==',
               units='parent atoms carrying more than one reference')
 
-    # (4) THE POPULATIONS the three counts above are computed over. Every one of those is a
-    # violation count with a bar of 0, and an empty population has zero violations: with no
-    # groups, (1) and (2) both pass at 0 over nothing; with no improper rows, (1) passes at
-    # 0 while the exact defect it was written to catch is present and unrecorded. The floor
-    # goes here, on the population, and never on the count -- a tolerated violation count
+    # (4) THE POPULATION the counts above are computed over. Both are violation counts with a
+    # bar of 0, and an empty population has zero violations: with no groups they pass at 0
+    # over nothing. The floor goes here and never on the count -- a tolerated violation count
     # would be a number with no argument behind it, whereas "at least one row to count" is
     # not a tolerance at all.
     led.check('n_groups', name, level, len(groups), TOL['population_min'], '>=',
@@ -1095,11 +1055,10 @@ def _structure_leg(en, name, level, led):
     # n_improper_rows had a `>= 1` bar here. REMOVED: it false-fires on ordinary correct
     # molecules -- diethyl ether, dimethyl ether and propyne have zero improper rows -- and
     # the committed set's minimum was exactly 1, i.e. the bar was calibrated to the molecule
-    # list rather than to anything structural. It is reported, not asserted; the
-    # no-improper-rows injection now has no detector and needs an independent reference
-    # (an expected count derived from the tree), not a population floor.
+    # list. Reported only; the RDKit-referenced count in (1) is what detects an emptied
+    # improper_phi_rows now.
     led.note('n_improper_rows', name, level, len(imp),
-             units='improper phi rows; REPORTED ONLY, see comment')
+             units='improper phi rows, from improper_phi_rows; REPORTED ONLY')
 
 
 def _nonbonded_d(pos, ff):
@@ -1126,11 +1085,12 @@ def _group_rigid(en, name, level, led, seed, inject=()):
     """A common delta on ALL members of one torsion group must be a RIGID motion.
 
     This is the behavioural half of the grouping contract, and it is a genuinely different
-    check from ``rigid_bond``/``rigid_angle`` above even though the bars are identical: that
-    one takes its rows from ``_find_rotatable``'s mask and only ever exercises bonds the
-    LEVEL frees, this one takes them from ``torsion_groups()`` -- the object the joint draw
-    actually consults -- and exercises every group, including the ones no state column
-    drives. A grouping keyed too coarsely leaves rigid_angle at 2e-15 and fires here.
+    check from ``rigid_angle`` above even though the bar is identical: that one takes its
+    rows from ``_find_rotatable``'s mask and only ever exercises bonds the LEVEL frees, this
+    one takes them from ``torsion_groups()`` -- the object the joint draw actually consults
+    -- and exercises every group, including the ones no state column drives. It is also the
+    only check that can see a grouping defect at all, now that the structural counts that
+    scored the key against itself are gone.
 
     Ring groups are excluded: rotating a dihedral whose central bond is in a ring breaks the
     closure bond, and closure bonds and ring angles ARE in the force field's graph lists, so
@@ -1140,44 +1100,56 @@ def _group_rigid(en, name, level, led, seed, inject=()):
     groups = en.torsion_groups()
     ti = np.asarray(en.spec.torsion_index)
     inr = en.atom_in_ring
+    # Rows whose PLACED atom sits on the rotation axis: the angle (b, c, d) is linear, so
+    # turning the dihedral moves nothing however correct the builder is. Butyronitrile's
+    # C-C#N is one. The flag is ConformerTorsions' own measured linearity, not a property of
+    # the perturbation, so excluding these does not weaken the positive control below.
+    ang = np.asarray(en.spec.angle_index)
+    lin_ang = {tuple(sorted((int(a), int(b), int(c)))) for (a, b, c), f
+               in zip(ang, np.asarray(en.angle_is_linear)) if f}
+    on_axis = [tuple(sorted((int(ti[j, 1]), int(ti[j, 2]), int(ti[j, 3])))) in lin_ang
+               for j in range(en.n_ph)]
     nb = 8
     rng = np.random.default_rng(seed + 23)
     x0, _ = draw_states(en, nb, rng)
     tree, ff = en._batch(nb)
     r0, th0, ph0 = en.dof_from_state(x0)
     p0 = build(tree, r0.reshape(-1), th0.reshape(-1), ph0.reshape(-1))
-    b0, a0 = graph_geometry(p0, ff)
+    _, a0 = graph_geometry(p0, ff)
     d0 = _nonbonded_d(p0, ff)
 
-    worst_b = worst_a = 0.0
-    moved = 0.0
+    worst_a = 0.0
+    moved = None
     tested = 0
     for g in groups:
         if any(inr[int(ti[j, 1])] and inr[int(ti[j, 2])] for j in g):
             continue                      # a ring bond: rotating it opens the closure
+        if all(on_axis[j] for j in g):
+            continue                      # every placed atom is ON the axis: nothing to move
         ph1 = ph0.clone()
         delta = 0.0 if 'null-perturbation' in inject else float(rng.uniform(0.4, 2.0))
         for j in g:
             ph1[:, j] += delta            # ONE shared displacement over the whole group
         p1 = build(tree, r0.reshape(-1), th0.reshape(-1), ph1.reshape(-1))
-        b1, a1 = graph_geometry(p1, ff)
-        worst_b = max(worst_b, (b1 - b0).abs().max().item())
+        _, a1 = graph_geometry(p1, ff)
         worst_a = max(worst_a, (a1 - a0).abs().max().item())
-        moved = max(moved, _moved(d0, _nonbonded_d(p1, ff)))
+        m = _moved(d0, _nonbonded_d(p1, ff))
+        moved = m if moved is None else min(moved, m)
         tested += 1
     if not tested:
-        for k in ('group_rigid_bond', 'group_rigid_angle', 'group_perturbation_moved'):
+        for k in ('group_rigid_angle', 'group_perturbation_moved'):
             led.skip(k, name, level,
                      'every torsion group on this molecule is keyed on a RING bond, where a '
-                     'rotation legitimately opens the closure and rigidity does not hold',
-                     K_MOL)
+                     'rotation legitimately opens the closure and rigidity does not hold, '
+                     'or on a near-linear frame, where the rotation moves nothing', K_MOL)
         return
     led.note('group_rigid_tested', name, level, tested)
-    led.check('group_rigid_bond', name, level, worst_b, TOL['group_rigid_bond'], units='A')
     led.check('group_rigid_angle', name, level, worst_a, TOL['group_rigid_angle'], units='rad')
-    # the positive control on the SAME displacement the two lines above call invariant
+    # The positive control on the SAME displacements the line above calls invariant, as a MIN
+    # over groups and not a max: worst_a is a max, so one group that moved would otherwise
+    # license the invariance claim for every group that did not.
     led.check('group_perturbation_moved', name, level, moved, TOL['perturbation_moved'],
-              '>=', units='A, largest nonbonded pair-distance change under the group shift')
+              '>=', units='A, smallest nonbonded pair-distance change over the groups tested')
 
 
 # =======================================================================================
@@ -1192,7 +1164,7 @@ ALL_RDKIT = ('Bond', 'Angle', 'StretchBend', 'Oop', 'Torsion', 'VdW', 'Ele')
 def run_molecule(name, smiles, level, ff_choice, n, seed, n_external, led, prior,
                  prior_n, inject=()):
     """Every check for one molecule at one level. Returns a per-molecule summary dict."""
-    from mxtaltools.conformers.builder import measure, closure_length
+    from mxtaltools.conformers.builder import closure_length
     from mxtaltools.conformers.energy import intramolecular_energy
     from energies.conformer_torsions import ConformerTorsions
 
@@ -1231,7 +1203,7 @@ def run_molecule(name, smiles, level, ff_choice, n, seed, n_external, led, prior
     e_state = en.energy(x)                       # the pure state path: no injection reaches it
 
     # THE POSITIVE CONTROL ON THE DRAW, and it is the one check here that generalises over
-    # the whole residual-ceiling class. Every roundtrip_*, external_*, rigid_*, mmff_* and
+    # the whole residual-ceiling class. Every external_*, rigid_*, mmff_* and
     # batch_invariance bar is a ceiling on an ERROR, and an error is smallest when nothing
     # happened -- a dof_from_state that ignores x satisfies all of them EXACTLY. Nothing
     # downstream can distinguish "the pipeline is correct" from "the pipeline is dead",
@@ -1247,33 +1219,25 @@ def run_molecule(name, smiles, level, ff_choice, n, seed, n_external, led, prior
     led.check('finite_energy', name, level, int((~torch.isfinite(e_state)).sum()), 0, '==')
     led.check('finite_e_ref', name, level, 0 if math.isfinite(en.e_ref) else 1, 0, '==')
 
-    # ------------------------------------------ LEG 1: energy-free structural round trip
-    rm, thm, phm = measure(tree, pos)
-    dphi = (phm - ph.reshape(-1) + np.pi) % (2 * np.pi) - np.pi
-    led.check('roundtrip_r', name, level, (rm - r.reshape(-1)).abs().max().item(),
-              TOL['roundtrip_r'], units='A')
-    led.check('roundtrip_theta', name, level, (thm - th.reshape(-1)).abs().max().item(),
-              TOL['roundtrip_theta'], units='rad')
-    led.check('roundtrip_phi', name, level, dphi.abs().max().item(),
-              TOL['roundtrip_phi'], units='rad')
-
+    # ------------------------------------------------------------- LEG 1: rigidity
+    # roundtrip_r/theta/phi were here. DELETED: measure() and build() read the same tree
+    # index arrays and share the NeRF convention, and the reference side came off the same
+    # dof_from_state call as the measured side, so the residual was machine zero under a
+    # dead map, a rolled index array and a flipped phi sign alike. external_r/theta/phi is
+    # the same claim with rdMolTransforms as the second operand.
     _rigid(en, name, level, led, seed, inject)
 
     # ------------------------------------------------- LEG 2: external cross-checks
-    _external_geometry(en, name, level, led, r, th, ph, pos, n_external, inject)
-    _chirality(en, name, level, led, pos, n_external, inject)
+    _external_geometry(en, name, level, led, r, th, ph, pos, n_external)
+    _chirality(en, name, level, led, pos, n_external)
     if ff_choice == 'mmff':
-        _external_mmff(en, name, level, led, pos, n_external, inject)
-        _ele_pairs_external(en, name, level, led, n, inject)
+        _external_mmff(en, name, level, led, pos, n_external)
     else:
         _skip_mmff(led, name, level,
                    f"force_field={ff_choice!r} is not MMFF94, so RDKit's MMFF is not a "
                    f"reference for it and the whole external ENERGY leg is unavailable. The "
                    f"external GEOMETRY checks above still ran, and they are the ones that "
                    f"do not depend on the force field at all", K_CONFIG)
-        led.skip('ele_pairs_charged', name, level,
-                 f"force_field={ff_choice!r} carries no partial charges at all, so there is "
-                 f"no charge assignment to compare against RDKit's", K_CONFIG)
 
     # --------------------------------------------------------- LEG 3: physical scale
     total, comp = intramolecular_energy(tree, pos, ff, components=True)
@@ -1296,31 +1260,11 @@ def run_molecule(name, smiles, level, ff_choice, n, seed, n_external, led, prior
         val = float(comp[k].median()) / counts[k] / T
         per_term[k] = val
         if k == 'electrostatic':
-            # THE ONE PLACE A CEILING BECOMES A BAND. A vanishing term is invisible to a
-            # ceiling: drop the electrostatic pathway and abs(val) goes to exactly 0, which
-            # abs(val) <= bar passes. The floor is CONDITIONAL because on most of this set
-            # MMFF charges only the heteroatom, its hydrogen and the attached carbon, every
-            # charged pair is then 1-2 or 1-3 and excluded from the nonbonded list, and the
-            # nonbonded electrostatic energy is exactly zero FOR CORRECT CODE -- RDKit's own
-            # Ele term returns exactly zero on the same geometries. An unconditional floor
-            # would false-fire there, which is worse than no floor.
-            if float(ff.ele_qq.abs().max()) <= 0.0:
-                led.skip('kt_per_electrostatic', name, level,
-                         'MMFF assigns partial charge only to atoms whose every charged '
-                         'nonbonded partner is 1-2 or 1-3 on this molecule, so every '
-                         'charged pair is excluded from the nonbonded list and the '
-                         "electrostatic energy is exactly zero by construction. RDKit's "
-                         'own Ele term agrees at exactly zero. There is nothing here for a '
-                         'floor to bound, and a floor calibrated to pass this molecule '
-                         'would not be a floor. ele_pairs_charged and term_energy_live '
-                         'still cover the charge assignment on this molecule', K_MOL)
-                continue
-            # floor removed: it fired only on molecules where mmff_electrostatic fired
-            # too, and was skipped on all 11 under force_field='reference' -- the one
-            # config where the RDKit cross-check is unavailable and a floor would have
-            # had to stand alone.
-            led.check('kt_per_electrostatic', name, level, abs(val),
-                      TOL['kt_per_electrostatic'], units='kT/term')
+            # kt_per_electrostatic DELETED. It was a one-sided ceiling and its only named
+            # defect -- the electrostatic pathway going missing -- drives the quantity to
+            # exactly 0, which the ceiling passes. Its own injection audit reported it BLIND.
+            # The magnitude is reported; term_energy_live is what detects the defect.
+            led.note('kt_per_electrostatic', name, level, abs(val), units='kT/term')
             continue
         led.check(f'kt_per_{k}', name, level, abs(val), TOL[f'kt_per_{k}'], units='kT/term')
 
@@ -1352,21 +1296,16 @@ def run_molecule(name, smiles, level, ff_choice, n, seed, n_external, led, prior
     _t_eff(en, name, level, led, ff, pos, n, T, ff_choice)
     _t_eff_angle(en, name, level, led, ff, pos, n, T)
 
-    # worst nonbonded overlap, in EXCESS of the reference conformer's own
+    # Worst nonbonded overlap, REPORTED. clash_excess_p10 asserted this against the
+    # reference conformer's own overlap through the same _worst_overlap over the same
+    # ff.pair_index and the same ff.sigma, so both operands moved together under any defect
+    # in either -- halving every sigma sent both to exactly 0. The population floor stays,
+    # because an empty pair list is a real vacuity and nothing else sees it.
     worst = _worst_overlap(pos, ff, n)
-    _, ff1 = en._batch(1)
-    ref_pos = build(*(_batch1_dof(en)))
-    ref_worst = float(_worst_overlap(ref_pos, ff1, 1)[0])
-    # over an empty pair list clash_excess_p10 is 0 - 0, and a molecule with no nonbonded
-    # pairs at all is not a molecule this pipeline can be trusted on
     led.check('n_clash_pairs', name, level, len(ff.pair_index) // n, TOL['population_min'],
               '>=', units='nonbonded pairs the overlap statistic is computed over')
-    led.check('clash_excess_p10', name, level,
-              float(torch.quantile(worst, 0.10)) - ref_worst, TOL['clash_excess_p10'],
-              units='fraction of sigma above the reference conformer')
     led.note('clash_p10', name, level, float(torch.quantile(worst, 0.10)))
     led.note('clash_median', name, level, float(worst.median()))
-    led.note('clash_reference', name, level, ref_worst)
 
     half = n // 2
     e_split = torch.cat([en.energy(x[:half]), en.energy(x[half:])])
@@ -1391,15 +1330,18 @@ def run_molecule(name, smiles, level, ff_choice, n, seed, n_external, led, prior
 
 
 def _rigid(en, name, level, led, seed, inject):
-    """Rotating one bridge bond must leave every graph bond and graph angle invariant.
+    """Rotating one bridge bond must leave every graph ANGLE invariant.
 
-    Energy-free, and it is the check that distinguishes a torsion group keyed on the
-    CENTRAL BOND from one keyed on the parent atom: a common displacement applied to
-    dihedrals measured about DIFFERENT axes is not a rotation of anything.
+    Energy-free: the second operand is the theory constant 0, and the angles come from
+    ``ff.angle_index``, which is not one of the arrays the DoF vector flows through.
+    ``rigid_bond`` used to sit beside it and is gone -- ``build`` places every atom at
+    exactly the requested r from its parent, and ``_rigid`` only ever drives phi columns and
+    never rotates a ring bond, so no tree bond and no closure bond can move. It was zero by
+    construction rather than by correctness.
     """
     from mxtaltools.conformers.builder import build
     if not en.rotatable:
-        for k in ('rigid_bond', 'rigid_angle', 'rigid_perturbation_moved'):
+        for k in ('rigid_angle', 'rigid_perturbation_moved'):
             led.skip(k, name, level,
                      'no rotatable (bridge, heavy-fragment) bond on this molecule, so '
                      'there is no rigid rotation to test', K_MOL)
@@ -1413,10 +1355,10 @@ def _rigid(en, name, level, led, seed, inject):
     scale = _np(en._free_scale)
     tree, ff = en._batch(nb)
     p0 = en.build_positions(x0)
-    b0, a0 = graph_geometry(p0, ff)
+    _, a0 = graph_geometry(p0, ff)
     d0 = _nonbonded_d(p0, ff)
 
-    worst_b = worst_a = 0.0
+    worst_a = 0.0
     moved = 0.0
     tested = 0
     for jb in range(len(en.rotatable)):
@@ -1439,28 +1381,34 @@ def _rigid(en, name, level, led, seed, inject):
                 v = _np(x1[:, c]) + delta / scale[c]
                 x1[:, c] = torch.as_tensor((v + 1.0) % 2.0 - 1.0, dtype=x1.dtype)
             p1 = en.build_positions(x1)
-        b1, a1 = graph_geometry(p1, ff)
-        worst_b = max(worst_b, (b1 - b0).abs().max().item())
+        _, a1 = graph_geometry(p1, ff)
         worst_a = max(worst_a, (a1 - a0).abs().max().item())
         moved = max(moved, _moved(d0, _nonbonded_d(p1, ff)))
         tested += 1
     if not tested:
-        for k in ('rigid_bond', 'rigid_angle', 'rigid_perturbation_moved'):
+        for k in ('rigid_angle', 'rigid_perturbation_moved'):
             led.skip(k, name, level,
                      'no rotatable bond had ALL of its dihedrals driven by state columns '
                      'at this level, so no shift here is a whole rotation', K_LEVEL)
         return
     led.note('rigid_bonds_tested', name, level, tested)
-    led.check('rigid_bond', name, level, worst_b, TOL['rigid_bond'], units='A')
     led.check('rigid_angle', name, level, worst_a, TOL['rigid_angle'], units='rad')
-    # the positive control on the SAME rotation the two lines above call invariant. Without
-    # it a builder that ignores its dihedral argument satisfies both of them exactly.
+    # the positive control on the SAME rotation the line above calls invariant. Without it a
+    # builder that ignores its dihedral argument satisfies the invariance exactly.
     led.check('rigid_perturbation_moved', name, level, moved, TOL['perturbation_moved'],
               '>=', units='A, largest nonbonded pair-distance change under the bond rotation')
 
 
-def _external_geometry(en, name, level, led, r, th, ph, pos, n_sub, inject):
-    """rdMolTransforms re-measures r/theta/phi through the ORIGINAL atom numbering."""
+def _external_geometry(en, name, level, led, r, th, ph, pos, n_sub):
+    """rdMolTransforms re-measures r/theta/phi off the built conformer.
+
+    What is independent here is RDKit's ABSOLUTE convention -- radians, and the standard
+    internal-coordinate definitions -- so a units error or a NeRF convention that ``build``
+    and ``measure`` share is visible. The ATOM ADDRESSING is not independent: the write in
+    ``to_rdkit_mol`` and the read below both go through ``spec.perm``, and the row -> atom
+    triples both come from ``spec.*_index``, so a consistently wrong numbering cancels and
+    is invisible to all three residuals.
+    """
     from rdkit.Chem import rdMolTransforms as rdmt
     perm = np.asarray(en.spec.perm)
     bi = np.asarray(en.spec.bond_index)
@@ -1473,7 +1421,7 @@ def _external_geometry(en, name, level, led, r, th, ph, pos, n_sub, inject):
     compared = 0
     for s in range(min(n_sub, pos_np.shape[0])):
         compared += 1
-        conf = to_rdkit_mol(en, pos_np[s], inject).GetConformer()
+        conf = to_rdkit_mol(en, pos_np[s]).GetConformer()
         got_r = np.array([rdmt.GetBondLength(conf, int(perm[a]), int(perm[b]))
                           for a, b in bi])
         got_t = np.array([rdmt.GetAngleRad(conf, int(perm[a]), int(perm[b]), int(perm[c]))
@@ -1494,7 +1442,7 @@ def _external_geometry(en, name, level, led, r, th, ph, pos, n_sub, inject):
     led.check('external_phi', name, level, wp, TOL['external_phi'], units='rad')
 
 
-def _chirality(en, name, level, led, pos, n_sub, inject):
+def _chirality(en, name, level, led, pos, n_sub):
     """RDKit re-perceives the stereocentres from the BUILT Cartesians.
 
     Every energy term is a function of interatomic distances, or of the dihedral through
@@ -1516,7 +1464,7 @@ def _chirality(en, name, level, led, pos, n_sub, inject):
     pos_np = _np(pos).reshape(-1, N, 3)
     bad, got_any, checked = 0, None, 0
     for s in range(min(n_sub, pos_np.shape[0])):
-        m = to_rdkit_mol(en, pos_np[s], inject)
+        m = to_rdkit_mol(en, pos_np[s])
         Chem.AssignStereochemistryFrom3D(m)
         got = {a.GetIdx(): a.GetProp('_CIPCode') for a in m.GetAtoms()
                if a.HasProp('_CIPCode')}
@@ -1532,7 +1480,7 @@ def _chirality(en, name, level, led, pos, n_sub, inject):
              ','.join(f'{k}:{v}' for k, v in sorted((got_any or {}).items())))
 
 
-def _external_mmff(en, name, level, led, pos, n_sub, inject):
+def _external_mmff(en, name, level, led, pos, n_sub):
     """RDKit's own MMFF94, TERM BY TERM, on the geometries we built.
 
     Per term rather than on the total, because a total hides two errors this code has
@@ -1551,7 +1499,7 @@ def _external_mmff(en, name, level, led, pos, n_sub, inject):
     for s in range(n_sub):
         p1 = torch.as_tensor(pos_np[s], dtype=en.dtype, device=en.device)
         tot, comp = intramolecular_energy(tree1, p1, ff1, components=True)
-        mol = to_rdkit_mol(en, pos_np[s], inject)
+        mol = to_rdkit_mol(en, pos_np[s])
         props = AllChem.MMFFGetMoleculeProperties(mol)
         if props is None:
             _skip_mmff(led, name, level, 'RDKit could not MMFF-type this molecule',
@@ -1715,18 +1663,17 @@ TERM_PARAMS = {'bond': ('k_bond',), 'angle': ('k_angle',),
 def _term_liveness(en, name, level, led, ff, comp, counts):
     """Every force-field term with live PARAMETERS must produce a live ENERGY, and vice versa.
 
-    This is the general form of the electrostatics finding, and it is the check that
-    actually closes it. ``kt_per_electrostatic`` is a magnitude bound, so it needs a
-    calibrated floor, it needs a guard against the molecules where zero is correct, and the
-    guard turns it into a skip on exactly the defect that damages the parameters. This
-    needs none of that: it compares two booleans, so there is no bar to calibrate, it is
-    meaningful on every molecule at every level, and it holds under
-    ``force_field='reference'`` where the whole external MMFF leg is unavailable and nothing
-    else covers the question at all.
+    This is the general form of the electrostatics finding and the check that closes it. A
+    magnitude bound cannot: a vanishing term passes every ceiling, and a floor needs a guard
+    against the molecules where zero is correct, which turns into a skip on exactly the
+    defect that damages the parameters. This compares two booleans, so there is no bar to
+    calibrate, it is meaningful on every molecule at every level, and it holds under
+    ``force_field='reference'`` where the whole external MMFF leg is unavailable.
 
-    It catches the "a whole force-field term went missing" class named in the module
-    docstring from either end -- a dropped energy pathway with the parameters intact, or
-    dropped parameters -- and it does so without a draw-dependent threshold.
+    ONE-SIDED, and worth stating: it sees a dropped energy PATHWAY with the parameters
+    intact (--inject drop-electrostatics). It does NOT see dropped PARAMETERS, because then
+    both halves go dead and agree; RDKit scoring the same geometry with its own charges is
+    what sees that (--inject drop-charges, caught by mmff_electrostatic).
     """
     bad = []
     for term, fields in TERM_PARAMS.items():
@@ -1743,48 +1690,11 @@ def _term_liveness(en, name, level, led, ff, comp, counts):
                     + (': ' + ' '.join(bad) if bad else ''))
 
 
-def _ele_pairs_external(en, name, level, led, n, inject):
-    """Charged nonbonded pairs, OURS against RDKit's own MMFF partial charges.
-
-    A COUNT, not a magnitude, and that is the whole point. On most of this molecule set the
-    nonbonded electrostatic ENERGY is exactly zero for correct code, so every energy-based
-    instrument -- ours and RDKit's alike -- is identically zero and can bound nothing. The
-    charge assignment is still there to be checked, and it is checked here: the same
-    nonbonded pair list, scored for charge from RDKit's ``GetMMFFPartialCharge`` instead of
-    from our typing. No draw, no calibration, no threshold.
-
-    Complementary to the ``kt_per_electrostatic`` floor rather than redundant with it: that
-    one catches a dropped energy PATHWAY with the parameters intact, this one catches
-    dropped PARAMETERS, where the floor's own guard correctly turns it into a skip.
-    """
-    from rdkit import Chem
-    from rdkit.Chem import AllChem
-    _, ff = en._batch(n)
-    if ff.ele_qq is None or ff.pair_index is None or not ff.pair_index.numel():
-        led.skip('ele_pairs_charged', name, level,
-                 'the force field carries no nonbonded pair list on this molecule, so '
-                 'there are no charged pairs to count', K_MOL)
-        return
-    n_at = en.spec.n_atoms
-    npair = ff.pair_index.shape[0] // n
-    pi = _np(ff.pair_index[:npair]) % n_at
-    qq = ff.ele_qq[:npair]
-    ours = int((qq.abs() > 0).sum())
-
-    mol = Chem.Mol(en.mol)
-    props = AllChem.MMFFGetMoleculeProperties(mol)
-    if props is None:
-        led.skip('ele_pairs_charged', name, level,
-                 'RDKit could not MMFF-type this molecule, so there is no independent '
-                 'charge assignment to compare against', K_UNREACHABLE)
-        return
-    perm = np.asarray(en.spec.perm)
-    q = np.array([props.GetMMFFPartialCharge(int(perm[s])) for s in range(n_at)])
-    theirs = int(sum(1 for a, b in pi if abs(q[int(a)] * q[int(b)]) > 0))
-    led.note('ele_pairs_ours', name, level, ours)
-    led.note('ele_pairs_rdkit', name, level, theirs)
-    led.check('ele_pairs_charged', name, level, abs(ours - theirs), 0, '==',
-              units='disagreement on how many nonbonded pairs carry charge')
+# _ele_pairs_external / ele_pairs_charged DELETED: 'ours' counted nonzero ff.ele_qq, which
+# energy.py builds from GetMMFFPartialCharge, and 'theirs' counted nonzero products of
+# GetMMFFPartialCharge -- one RDKit call feeding both operands over one pair list. Zero the
+# charges at that source and both counts went 32 -> 0 with the residual still exactly 0.
+# mmff_electrostatic catches drop-charges on the same molecules.
 
 
 def _prior_leg(en, name, level, led, prior, prior_n, seed):
@@ -1797,26 +1707,27 @@ def _prior_leg(en, name, level, led, prior, prior_n, seed):
     reported SKIPPED with the exception text VERBATIM. That the only level which ships is
     the one these functions cannot measure is the finding, not a nuisance to route around.
 
-    WHY THIS LEG MOSTLY REPORTS RATHER THAN ASSERTS. Two of its headline numbers cannot
-    carry a threshold that a correct pipeline would pass, and inventing one would be worse
-    than having none:
+    WHY THIS LEG MOSTLY REPORTS RATHER THAN ASSERTS. Its headline numbers cannot carry a
+    threshold that a correct pipeline would pass, and inventing one would be worse than
+    having none:
 
     * ``eta = ESS_fitted / ESS_oracle`` is NOT bounded by 1. The oracle is built by scanning
       each group leader's 1-D slice of the true energy with the other coordinates held at
       the reference, and prior_diagnostics' own docstring calls it "A LOWER BOUND ON THE
       PRODUCT-FORM CEILING, not the ceiling". A fitted histogram can and does beat a
-      one-dimensional slice -- measured eta = 2.41 on propanol at `full`, with D_avoidable
-      going negative. So eta above 1 is legal and there is no bar.
+      one-dimensional slice, so eta above 1 is legal and there is no bar.
     * ``n_missed`` counts accessible basins with zero draws, where "accessible" is defined
       at 10 kT. A basin 10 kT up carries Boltzmann weight e^-10 ~ 5e-5, so a CORRECT prior
       is expected to miss some of them, and on top of that there is a Monte-Carlo empty-bin
       floor of order n_accessible * exp(-n / n_accessible). Asserting 0 fails on correct
-      code (measured: 2 missed of 729 modes on hexanol); asserting some tolerated count
-      would be a number with no argument behind it.
+      code; asserting some tolerated count would be a number with no argument behind it.
+    * the ESS FRACTION being <= 1 is Cauchy-Schwarz applied to the definition, so NO
+      pipeline state can violate it. ``prior_ess_le_one`` asserted exactly that and is
+      DELETED -- the third check in this block removed for the same reason, after
+      ``prior_report``'s `prior_n >= 1` and ``prior_ess_positive``. The fraction is reported.
 
-    What IS assertable: the ESS FRACTION lies in (0, 1] -- that is Cauchy-Schwarz, not a
-    modelling choice -- and the box-clip rate, which is a property of the pipeline rather
-    than of the fit.
+    What IS assertable: the box-clip rate, which is a property of the pipeline rather than
+    of the fit, and the size of the population the coverage statistics run over.
     """
     import energies.prior_diagnostics as pdg
     if prior is None:
@@ -1838,19 +1749,8 @@ def _prior_leg(en, name, level, led, prior, prior_n, seed):
         for k in PRIOR_REPORT_CHECKS:
             led.skip(k, name, level, f'{type(ex).__name__}: {ex}', K_UNREACHABLE)
     else:
-        # THE MIRROR OF THE CEILING BELOW, and definitional for the same reason. An ESS
-        # FRACTION is sum(w)^2 / (n sum(w^2)); Cauchy-Schwarz bounds it above by 1 and the
-        # same inequality applied the other way bounds it below by 1/n for any non-negative
-        # weights. So this is not a calibrated quality bar -- it cannot false-fire on a
-        # correct draw however bad the fit is. What it catches is the object not being a
-        # set of importance weights at all. The old 1e-12 caught only exact zero and NaN.
-        # prior_report asserted `int(prior_n) >= 1` -- an argparse value, never the report.
-        # prior_ess_positive asserted ESS >= 1/n, which Cauchy-Schwarz makes identically
-        # true for any non-negative weights. Neither could fail for any pipeline reason.
-        # Both REMOVED and reported instead.
         led.note('prior_n', name, level, int(prior_n),
                  units='draws the fitted-prior report was computed over')
-        led.check('prior_ess_le_one', name, level, rep['ess_fitted'], TOL['prior_ess_max'])
         led.check('prior_clip_frac', name, level, rep['clip_frac'], TOL['clip_frac'])
         led.note('prior_ess_pct', name, level, 100 * rep['ess_fitted'], units='%')
         led.note('prior_eta', name, level, rep['eta'], units='NOT bounded by 1, see docstring')
@@ -1865,17 +1765,15 @@ def _prior_leg(en, name, level, led, prior, prior_n, seed):
         for k in COVERAGE_CHECKS:
             led.skip(k, name, level, cov['skipped'], K_MOL)
         return
-    led.skip('coverage_missed', name, level,
-             'coverage_report RAN and its numbers are in the REPORTED block, but n_missed '
-             'carries NO threshold: "accessible" is defined at 10 kT, whose Boltzmann '
-             'weight is e^-10 ~ 5e-5, so a CORRECT prior is expected to miss some of those '
-             'basins; and there is an empty-bin floor of order n_accessible * '
-             'exp(-n / n_accessible) on top. Asserting 0 fails on correct code and any '
-             'tolerated count would be a number with no argument behind it', K_UNASSERTED)
-    # coverage over zero enumerated modes is vacuous: worst_frac and excess_median would be
-    # computed over an empty basin set and every number below would still print
-    led.check('coverage_report', name, level, cov['n_modes'], TOL['population_min'], '>=',
-              units='rotamer basins the coverage statistics are computed over')
+    # The population floor is on n_ACCESSIBLE, not on n_modes. n_modes >= 1 is an identity:
+    # rotamer_modes falls back to one centre per group and itertools.product over an empty
+    # group list still yields one empty tuple, so it holds for every reachable state --
+    # measured 1 even with torsion_groups returning []. n_accessible can genuinely reach 0.
+    # coverage_missed was here as an unconditional UNASSERTED skip -- a name with no operand
+    # and no bar, inflating the prior-quality tier denominator. DELETED; the numbers it
+    # stood for are the coverage_n_missed and coverage_empty_bin_floor notes below.
+    led.check('coverage_report', name, level, cov['n_accessible'], TOL['population_min'],
+              '>=', units='accessible rotamer basins the coverage statistics run over')
     led.note('coverage_n_modes', name, level, cov['n_modes'])
     led.note('coverage_n_accessible', name, level, cov['n_accessible'])
     led.note('coverage_n_missed', name, level, cov['n_missed'])
@@ -1889,23 +1787,27 @@ def _prior_leg(en, name, level, led, prior, prior_n, seed):
 def _prior_key_external(en, name, level, led):
     """``prior_dof_types``' per-row keys against the mxtaltools ``tree_*`` derivation.
 
-    NOT a re-derivation of the same expression. ``InternalPrior.fit`` built the fitted
-    tables by walking ``mol.tree_bond_index / tree_angle_index / tree_torsion_index`` after
-    ``build_conformer_tree()`` (prior.py fit / _layout), so that route is the AUTHORITY for
-    what a key means; ``prior_dof_types`` deliberately reaches the same keys through this
-    class's ``spec`` instead, and its own docstring names mixing the two numberings as the
-    hazard. Comparing the two closes that loop with an independent second implementation.
+    ``InternalPrior.fit`` built the fitted tables by walking ``mol.tree_bond_index /
+    tree_angle_index / tree_torsion_index`` after ``build_conformer_tree()`` (prior.py fit /
+    _layout), so that route is what a key MEANS to the fitted object; ``prior_dof_types``
+    reaches the same keys through this class's ``spec`` instead, and its own docstring names
+    mixing the two numberings as the hazard.
+
+    WHAT IS AND IS NOT INDEPENDENT HERE, because the old docstring claimed more than it had.
+    ``build_conformer_tree`` re-runs ``spec_from_graph`` -- the same function ``spec`` came
+    from -- and the ``tree_*`` index arrays map back through ``tree_perm_index`` to
+    ``spec.*_index`` BITWISE. So the row -> atoms mapping is SHARED, and a key defect common
+    to both routes passes at 0. What is genuinely tested is the slot <-> atom permutation
+    round trip and the [k, n] vs [n, k] column convention, which is the bug class
+    --inject prior-key-scramble reproduces and which nothing else in the file sees.
 
     Runs off a BARE, unfitted InternalPrior: the key functions are static and the histogram
     lookups are irrelevant here, so this check does not need conformer_prior_v2.pt and is
     therefore available on every invocation, including --no-prior.
 
-    LIMITATION, stated because it bounds what a pass means: keys are (element, degree)
-    types, not atom indices, so a scramble that lands on a DIFFERENT atom pair of the SAME
-    type is invisible to it. Measured under --inject prior-key-scramble: 1 of 9 phi rows on
-    propanol, 15 of 19 on ala-dipeptide, but 11 of 11 MOLECULES fire, which is what decides
-    the exit code. A per-index comparison would be strictly stronger, and prior_dof_types
-    does not return indices.
+    SECOND LIMITATION: keys are (element, degree) types, not atom indices, so a scramble
+    that lands on a DIFFERENT atom pair of the SAME type is invisible to it. A per-index
+    comparison would be strictly stronger, and prior_dof_types does not return indices.
     """
     from mxtaltools.conformers.prior import InternalPrior
     from energies.conformer_data import condition_from_energy

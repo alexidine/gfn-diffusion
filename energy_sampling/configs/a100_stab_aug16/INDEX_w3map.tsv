@@ -1,0 +1,15 @@
+name	kind	benchmark_id	batch	epochs
+w3_elj_b500	set	-	500	1002000
+w3_elj_b1000	set	-	1000	1002000
+w3_elj_b2722	set	-	2722	1002000
+w3_elj_b7410	set	-	7410	1002000
+w3_elj_b20000	set	-	20000	1002000
+w3_uma_b100	set	-	100	1001000
+w3_uma_b250	set	-	250	1001000
+w3_uma_b500	set	-	500	1001000
+w3_uma_b1000	set	-	1000	1001000
+w3_mace_b50	set	-	50	1001000
+w3_mace_b100	set	-	100	1001000
+w3_mace_b250	set	-	250	1001000
+w3_elj_w256	set	-	2722	1002000
+w3_elj_w1024	set	-	2722	1002000

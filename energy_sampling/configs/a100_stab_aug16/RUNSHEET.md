@@ -337,3 +337,77 @@ not wall-clock, are the budget that binds.
   Phase 4 acceptance list.
 - Gate-calibration numbers (exit steps vs detonation) → the MLE-gate ladder in
   the conditional-adaptation notes.
+
+---
+
+# WAVE 3 — the (T, B, route) map (2026-08-18)
+
+**Supersedes the U tier**, which asked "does batch move occupancy" at T=10 with
+production work stripped and so answered a question nobody has: 38 → 48 % across
+a 7.4× batch rise, while `prod0810` at **T=60 and a smaller batch** sits at 70 %
+and has run 152 h uncancelled. Occupancy is GPU work per *training step*; the
+host cost is paid once per step regardless. **T multiplies the rollout only;
+batch multiplies both halves**, so batch merely dilutes the fixed term.
+
+## Tier 1 — rollout shape, ENERGY-FREE (9 arms with the flag arms, 1 h class)
+
+`w3_roll_T{10,60,100}_b{1000,7410}` — six cells, **one route only**: the rollout
+trunk is the same model whatever the energy function is.
+
+They run a **single terminal `train_prior` stage, bwd from the dataset, weights-
+only**, because of a trap: `eval_T` must equal `integrator.T` (refused at load) —
+a policy learns drift per step at ONE dt, so a warm start run at another T
+integrates a different SDE and its samples are wrong in a structured way, which
+on an MLIP route feeds straight into cost via neighbour counts. `bwd/dataset`
+calls the energy **zero times** and draws terminals from the dataset, so there is
+nothing for T to contaminate.
+
+## Tier 2 — the production boundary (14 arms, 3 h class)
+
+Per-route batch ladders at T=60, production shape. Ranges differ ~100×, so they
+are per route: ELJ {500, 1000, 2722, 7410, 20000}, UMA {100, 250, 500, 1000},
+MACE {50, 100, 250}, plus the width pair `w3_elj_w{256,1024}` at batch 2722 —
+the third occupancy lever, and unmeasured until now.
+
+**ELJ 500 is the only sub-crossover rung** (`fused_grad_accum_min_samples` is
+1000) — the one region where `samples_per_sec` and `updates_per_sec` have
+different argmaxes.
+
+**Survive-or-cancelled at 02:00:2x IS the measurement.** The 3 h SLURM class is
+deliberately above the 2 h policy horizon so the two are distinguishable by
+`Elapsed`: a kill at 02:00:2x is the occupancy policy, at 03:00:00 it is SLURM.
+
+## The MLIP construction-path A/Bs (in the 1 h set)
+
+Env switches, not config keys, so each arm carries a `<arm>.env` sidecar that the
+sbatch sources and echoes; the drain functions log the *resolved* flags, so the
+two halves can be cross-checked.
+
+- `w3_uma_graphtimer` — `MXT_UMA_GRAPH_TIMER=1`. UMA's forward is **98.3–98.6 %**
+  of the call and opaque; this is the only thing that splits fairchem's
+  `otf_graph` out of it.
+- `w3_mace_batchednl` — `MXT_BATCHED_MACE_NEIGHBOURS=1`. The A/B on **93 % of the
+  MACE build**. The speedup has a batch-size crossover and an earlier 10.8×
+  reading did not reproduce, so this is Phase 5.1's re-measurement.
+- `w3_mace_gpubatch` — `MXT_GPU_MACE_BATCH=1`.
+
+**The graph timer changes what it measures** — a CUDA synchronise per graph build
+— so that arm's *wall clock* is not comparable to the un-timed cells. Phase
+FRACTIONS are the readable quantity; its step times must never enter a floor.
+
+## New instruments (landed in `train.py`, verified on a local run)
+
+| metric | why |
+|---|---|
+| `batch/med_step_s`, `batch/sps_rung` | the 20-step median the batch controller **actually acts on** — computed since forever and never logged, so a ladder built from 10-step report means describes a curve no in-process controller can reproduce |
+| `updates_per_sec`, `batch/accum_target` | opt-step throughput. Differs from samples/sec below the crossover, where **every MLIP arm here runs** |
+| `vram/peak_train_mb` | peak reset at each eval, so the sizer's memory constraint is a train-phase quantity. Eval shares `batch_size` and is often the larger peak |
+
+Verified locally: `updates_per_sec` 0.71094 = 710.94 / 1000, `sps_rung` 691.6 =
+100 / 0.14459. `peak_reserved_mb` keeps its old lifetime-max meaning.
+
+## Cost
+
+9 × 1 h + 14 × 3 h ≈ **51 GPU-h worst case**, and materially less in practice:
+the tier-1 and flag arms are 400-step runs that will exit in minutes, and every
+below-threshold boundary cell dies at 2 h. Two queue batches on 16 A100s.

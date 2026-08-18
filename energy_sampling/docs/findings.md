@@ -7,6 +7,133 @@ Newest first.
 
 ---
 
+## F-045 · `gpu/util_policy` overstates occupancy by up to 42 points, and batch does NOT buy occupancy on ELJ either · `MECHANISM`
+
+*2026-08-18, `a100_stab_aug16` U tier. Nine arms, three batches x three repeats,
+A100, ELJ/mipcas T=10, `equilibration`, warm-resumed at step 2000. All nine were
+CANCELLED at Elapsed 02:00:2x, on six different nodes.*
+
+**CONFIRMED BY THE USER (2026-08-18) AS THE UTILIZATION CANCELLATION.** `sacct`
+itself is unhelpful -- `State CANCELLED+`, `ExitCode 0:0`, `Reason: None` -- so
+the machine-readable record never names utilization. What it corroborates is the
+timing: `Elapsed` 02:00:23-02:00:26 on every arm across six nodes (ga013, ga021,
+ga024, ga027, ga030, ga036), i.e. 7200 s + ~25 s, matching the documented
+occupancy-policy window exactly. Recorded here because the cancellation reason
+is NOT recoverable from cluster tooling and a later reader will look for it.
+
+**Arms self-reporting 87-89 % occupancy were cancelled for low occupancy**, which
+is what falsifies the in-process proxy.
+
+Compared like with like -- wandb's out-of-process `system.gpu.0.gpu`, MEAN over
+the SAME trailing 7200 s window as `gpu/util_policy`, 195-254 samples per arm:
+
+| batch | `gpu/util_policy` | external, same window | P - S | samples/sec |
+|---:|---|---|---:|---|
+| 1000 | 31.2-32.1 | **37.3-38.9** | **-5 to -8** | 1807-1870 |
+| 4491 | 68.1-70.6 | **44.1-48.6** | **+22 to +24** | 3764-3914 |
+| 7410 | 87.3-88.6 | **47.1-49.0** | **+38 to +42** | 4218-4273 |
+
+*(The statistic is matched deliberately. Comparing our trailing mean against
+wandb's whole-run median manufactures differences of +/-49 points -- F-038. The
+numbers above are mean-to-mean over one window, and `S_all` vs `S_tail7200`
+differ by under 1 point, so the choice of window is not doing the work.)*
+
+**TWO INDEPENDENT FINDINGS, and the second is the expensive one.**
+
+**(1) The proxy is inadmissible unmodified, and its error GROWS with batch.** It
+reads ~6 points LOW at batch 1000 and ~40 points HIGH at 7410 -- so it is not a
+fixed offset that a margin could absorb; the sign flips. Disagreement-table row 4
+(in-process reads high) at the top two rungs, row 3 (reads low) at the bottom.
+Mechanically this is what eval/phase blindness predicts: the in-process sampler
+fires at one point in the training portion of the loop body, and the longer and
+more internally varied the step, the less representative that instant is.
+**Phase 4 case 2 is REFUSED for `gpu/util_policy`. The out-of-process sampler
+becomes the proxy** -- it agrees with the only cluster-visible outcome there is.
+
+**(2) THE LADDER STOPPED TOO LOW -- RETRACTED AND RESTATED 2026-08-18.** The
+first version of this entry said "batch does not buy occupancy on the ELJ
+route". That was drawn from a ladder that never reached the regime that
+survives, and it is wrong.
+
+Externally, occupancy over the measured rungs goes **38 % -> 46 % -> 48 %**
+across a 7.4x batch rise: real, resolvable (within-group spread 1.6-1.9 points),
+and far too slow to reach threshold by 7410. But `qm9anchor_aug14` ran at
+**batch 20000** on 2026-08-15/16 and sat at **57-68 %** external utilization for
+**34-48 hours without cancellation**. So the curve keeps climbing past the top
+of this ladder, and the survivable regime is somewhere near 20k, not 7410.
+
+**The ladder is the defect, and it was flagged in advance.** `batch_rungs:
+[1000, 1650, 2722, 4491, 7410]` was copied from prod0810's *observed* batch
+sizes, and `benchmarks.md` section 10 says in as many words that it is "a
+starting grid, not a measured range". Meanwhile `configs/qm9anchor_aug14/make.py`
+already carried `max_batch_size: 20000` with `grow_batch_size: true`, and its
+comment states outright that batch IS the occupancy lever on this route. The
+knowledge was in the tree; the ladder did not use it.
+
+**CAVEAT ON THE 20k POINT, which is why this is not simply inverted:** those runs
+are the QM9 *conditional* VarGrad route with a live conditioner at 8.3 s/step,
+not mipcas ELJ unconditional at 1.7 s/step. Different model, loss and data. It
+establishes that ~60 % is reachable at ~20k *somewhere*; it does not establish
+the ELJ unconditional value there. **The missing rung is ELJ at 15-25k** and it
+is the one that decides whether Phase 6 can use batch at all.
+
+**NO SLOWDOWN WAS INTRODUCED.** Compared at MATCHED batch 1000, the aug14 arm
+read 32.1 % at 1.02 s/step and this battery's arms read 37.5-40.0 % at
+0.54 s/step -- today is *faster and slightly busier*. The "we had very high
+utilization a month ago" runs were high because they ran at **batch 20000**,
+not because the code was quicker. The suspicion of a regression is not supported
+by the data.
+
+**The fixed-cost analysis below still stands and still matters** -- it is why the
+climb is so slow, and why reaching threshold needs 20k rather than 3k.
+
+**What batch IS still good for: throughput.** samples/sec rises 1857 -> 3830 ->
+4242, a genuine 2.3x. So batch remains the throughput lever and is simply not an
+occupancy actuator. A controller may grow batch for priority 2; it must not
+grow batch expecting to satisfy priority 1.
+
+**AN EARLIER READING OF THIS SAME DATA WAS WRONG AND IS RETRACTED.** Reading
+`gpu/util_policy` alone gave 32 -> 69 -> 88 %, which appears to satisfy the
+pre-registered joint rule (U and S rising together) and would have licensed
+exactly the occupancy rule that `gpu_util_floor` was deleted for. The joint rule
+did its job -- but only because the reading was checked against an out-of-process
+sampler first. **A pre-registered rule evaluated on an unvalidated instrument is
+not a safeguard.**
+
+**(3) WHY OCCUPANCY IS FLAT: a large FIXED per-step cost, not a batch problem.**
+`samples_per_sec` gives step time directly at the two eval-free rungs -- 0.542 s
+at batch 1000, 1.747 s at 7410. A 7.41x batch buys only a 3.25x longer step, so
+fitting `t = a + b*B` over those two points gives **a ~= 0.35 s of per-step cost
+that does not scale with batch** and b ~= 0.19 ms/sample. At batch 1000 that
+fixed term is 65 % of the step; at 7410 it is 20 %.
+
+If that fixed term were the only idle, utilization at 7410 would be
+1.394/1.747 = **80 %**. It measures **48 %**. So roughly another 30 points of
+idle sit INSIDE the batch-scaled portion -- consistent with a step made of many
+small kernels separated by launch gaps rather than one saturating workload.
+That matches the standing dispatch-bound result (~937 `nn.Module` calls per
+training step; 52x the parameters cost the same time locally) and it is
+corroborated by memory: **`vram/*` shows 5-30 % of an 80 GB card even at 7410**,
+so the card is nowhere near loaded on any axis.
+
+**The consequence for Phase 6 is a redirection, not a tuning problem.** Occupancy
+here is set by host-side gaps per step, and growing the batch dilutes the fixed
+term without closing the gaps. The levers are work-per-launch and round-trips
+per step -- kernel fusion, CUDA graphs, fewer module calls -- not batch size. Two
+points cannot distinguish a+bB from other sub-linear forms, so the split is an
+ESTIMATE; a mid-rung eval-free arm would pin it.
+
+**Caveats.** wandb's system stream is an independent SAMPLER, not an independent
+INSTRUMENT -- same NVML counter. It earns its promotion here not by measuring
+something different but by sampling out-of-process (during eval, between steps)
+and by AGREEING with the cancellations. The dedicated 10 s `nvidia-smi` sidecar
+and `sacct` are on disk in `configs/a100_stab_aug16/joblogs/` and should be read
+before this is graded above MECHANISM. The threshold itself is still not known:
+all nine arms were cancelled between 38 % and 49 %, which brackets it from below
+but never from above.
+
+---
+
 ## F-044 · A benchmark neutralisation died silently when its key became a stage flag, voiding ten floor launches · `PROCESS`
 
 *2026-08-17, `a100_stab_aug16` B1/B3.*
