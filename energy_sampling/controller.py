@@ -163,7 +163,9 @@ class LRController:
 
         Non-finite readings, or a finite reading past an absolute ~1e9 bar. No
         cooldown, no latch: at this bar a second reading is a second explosion,
-        and train.py's max_reloads cap is what stops a rewind loop."""
+        and train.py's `max_reloads_per_1k_steps` budget is what stops a rewind loop.
+        Note it is a RATE, not a count -- a long run is not aborted for the same
+        per-step behaviour as a short one."""
         checks = []
         if current_loss is not None and step_type in self.CHANNELS:
             checks.append((f'{step_type}_loss', float(current_loss),

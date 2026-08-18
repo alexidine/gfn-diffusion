@@ -54,6 +54,11 @@ CANONICAL_DRIFT = {
     # carries it; it is ADDED rather than CHANGED, but list it so a rename is
     # not silently absorbed.
     'config.adaptive_lr.warmup_freeze_cos_window',
+    # min_lr dropped 1e-6 -> 1e-8 on 2026-08-17. It is a NUMERICAL BACKSTOP, not a
+    # policy: at 1e-6 it sat barely below the conditional VarGrad quality optimum,
+    # so a controller asking to go lower was refused silently. Historical arms
+    # predate that and carry the old floor.
+    'config.min_lr',
     # var_conditioning's `fwd/logw_std_within < 6.0` exit was DELETED from
     # canonical on 2026-08-17: the bar sat below a measured minimum of 17.1 and
     # next_battery.md 1.1 concluded the stage is terminal by design. Historical

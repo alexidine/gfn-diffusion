@@ -1,5 +1,10 @@
 # Module: `bench/` — the controller sandbox
 
+> **Status: MODULE SNAPSHOT.** Use this document for explanation and navigation,
+> not as proof of current behavior. Verify material claims against the current
+> implementation and focused tests. See
+> [`EPISTEMIC_PROTOCOL.md`](EPISTEMIC_PROTOCOL.md).
+
 A CPU-only harness that runs the **real** control code against synthetic loss
 surfaces and a synthetic GPU, on a laptop, in seconds. It exists so that
 questions about batch sizing, LR scheduling and stage transitions stop costing

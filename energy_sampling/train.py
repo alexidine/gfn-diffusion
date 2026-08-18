@@ -451,8 +451,8 @@ class Modeller:
         THROUGHPUT KNEE (auto_batch_throughput_opt: true): before each jump,
         check whether the PREVIOUS jump actually paid. Past GPU saturation a
         factor-f batch jump returns ~x1.0 throughput while step time grows xf
-        -- pure steps/hour loss (rpvez6ep: batch 50k ran the same 13.3k
-        samples/s as batch 1.6k at 31x the step time). A jump that fails the
+        -- pure steps/hour loss, measured across a 30x batch span where
+        samples/s was flat and step time tracked the batch. A jump that fails the
         test reverts one rung and PINS the batch for the current protocol stage
         (stages have different step-cost profiles, so protocol.advance clears
         the pin, the rung baseline, the OOM ceiling and the step-time window at
@@ -502,18 +502,16 @@ class Modeller:
         # cancellation threshold. Deleted 2026-08-13: its premise is false on this
         # route. Utilization is flat-to-DECLINING in batch once an MLIP dominates the
         # step, because the energy call is already saturating the card and a bigger
-        # batch mostly buys more host-side work. Measured, umaperf0812 c_controller --
-        # every growth driven by the floor, the throughput gate never fired once:
+        # batch mostly buys more host-side work. A 7.4x batch increase bought
+        # NEGATIVE occupancy and cost most of the throughput, and because the rule
+        # outranked everything it overrode a throughput gate that would have
+        # refused every jump. It was also structurally inert on the very arms it
+        # was written for: the sampling cadence could not fill the window at
+        # MLIP step times, so it never fired there at all.
         #
-        #     batch      100    165    272    449    741
-        #     util %      52     44     49     42      -
-        #     samples/s  57.7   46.5   45.1   28.2   24.3
-        #
-        # A 7.4x batch increase bought NEGATIVE occupancy and cost 58% of throughput,
-        # and because the rule outranked everything it overrode a throughput gate that
-        # would have refused all four jumps. It was also structurally inert on the very
-        # arms it was written for: sampling once per ten_step_reporting could not fill
-        # a 900 s window at 181-262 s/step, so it never fired there at all.
+        # THE NUMBERS LIVE ONCE, in `utils._RETIRED_KEYS['gpu_util_floor']` --
+        # a retirement record's job is to hold the reason it was deleted, and a
+        # second copy here is a second thing to keep true.
         #
         # Batch size is simply not the control input for occupancy here -- work per
         # kernel launch and unpaired host stalls are. The SENSOR survives as a metric
@@ -1137,7 +1135,7 @@ class Modeller:
         """
         Per-mode K-tiling factor, read from {mode}_loss_coeffs.repeats so it
         can be phase-scheduled like any other coefficient (e.g. bwd repeats
-        > 1 only during phase-1 MLE/TBC pre-training, where K same-terminal
+        > 1 only during the MLE/TBC warm-start stage, where K same-terminal
         rollouts define the exact-MLE and consistency objectives, and 1
         everywhere else so no mode pays the K-times batch tiling for losses
         that don't need it). Falls back to the legacy global top-level
@@ -1205,7 +1203,7 @@ class Modeller:
         in seconds. Trains flow_model through a FRESH local Adam, not
         self.optimizers['flow'], so it starts from clean moments.
 
-        Runs once at the phase 1 -> 2 transition, to put the flow head somewhere
+        Runs once at the warm-start stage's exit, to put the flow head somewhere
         reasonable before rollout-driven training resumes.
 
         trust_c = eff_c / (eff_c + min_visits), from the tracker's time-decayed,
@@ -1461,7 +1459,7 @@ class Modeller:
         np.random.set_state(numpy_rng_state)
 
         # keep the best-by-coverage attempt regardless of whether any run passed --
-        # a marginal fit is still better to hand phase 2 than a fresh random head
+        # a marginal fit is still better to hand the next stage than a fresh random head
         if best_overall_state is not None:
             _restore(best_overall_state)
         # keep ema_model's flow head in sync (a no-op when ema_decay is null and
@@ -1478,7 +1476,7 @@ class Modeller:
               f"P{coverage_quantile * 100:.0f} abs err {best_cov:.3g} nats "
               f"(accept <= {coverage_tol:.3g}){holdout_msg}")
         if not passed:
-            print("  WARNING: Z(c) bootstrap did not reach the coverage bar; phase-2 "
+            print("  WARNING: Z(c) bootstrap did not reach the coverage bar; the next stage "
                   "training may be unreliable. Consider more attempts or a lower lr.")
 
     def weighted_condition_sampling(self, temperature: float = 1.0,
@@ -1826,7 +1824,7 @@ class Modeller:
             #   "This backward function was compiled with non-empty donated
             #    buffers which requires create_graph=False and retain_graph=False"
             # Measured on the cluster 2026-08-16 (a100_stab_aug16 f3, step 320,
-            # ~50 steps after the phase-1->2 transition, i.e. the first armed
+            # ~50 steps after the first stage transition, i.e. the first armed
             # fused step). It cannot reproduce on the dev box: compile_policy
             # 'auto' resolves OFF on native Windows, so this whole failure mode
             # is invisible locally and every local shakeout passed.
@@ -1891,7 +1889,7 @@ class Modeller:
         for mode in ('fwd', 'bwd', 'replay'):
             self.optimizers[mode] = torch.optim.Adam(get_policy_params(self.gfn_model), init_policy_lrs[mode],
                                                      weight_decay=weight_decay)
-        # fused fires fwd/bwd/replay in one backward() (phase 3), so -- unlike the
+        # a fused stage fires fwd/bwd/replay in one backward(), so -- unlike the
         # turn-taking fwd/bwd/replay optimizers, which piggyback on optimizers['flow']
         # via step_loss's non-fused branch -- the flow (Z head) params must ride the
         # fused optimizer directly or they'd never get stepped on a fused step. They go
@@ -2674,7 +2672,7 @@ class Modeller:
         the fused loss -- it's run only to refresh its stats, not for gradient.
         """
         # replay joins the fused loss only in stages whose balance can boost it
-        # (mode_boostable, derived from the rule list -- the old 'phase 3 only'
+        # (mode_boostable, derived from the rule list -- the old 'fused stages only'
         # check): a stage that never boosts replay pins its frac at zero, and
         # the gate additionally keeps force_refresh from burning a replay pass
         # (and polluting its rolling stats) on a branch that isn't part of the stage
@@ -3241,7 +3239,7 @@ class Modeller:
         the right distribution to probe on because it carries the highest loss
         variance in the system, and a step-size sensor should be read at its
         worst case for stability rather than its most forgiving one. Falls back
-        to the backward draw only when replay is unavailable (phase 1, or an
+        to the backward draw only when replay is unavailable (a bwd-only stage, or an
         empty buffer).
 
         HELD OUT: a fresh draw is disjoint from this step's training batch in
@@ -3252,7 +3250,7 @@ class Modeller:
         # repeats MUST come from the branch whose coeffs we score with: a coeff
         # bank is only valid at its own branch's K. bwd_loss_coeffs carries tbc,
         # whose residual is defined over K same-terminal rollouts and which
-        # asserts K > 1 -- so scoring a bwd draw at replay's K crashes in phase 1,
+        # asserts K > 1 -- so scoring a bwd draw at replay's K crashes on a bwd-only stage,
         # where replay does not exist yet and the fallback is the only path.
         # REPLAY ONLY, and the fallback to bwd is deliberately GONE. The whole
         # calibration rests on evaluating one fixed batch at several alpha, and
@@ -3372,7 +3370,7 @@ Two things deliberately NOT done here, both recorded in
             return  # mid-accumulation: keep piling up gradients, don't clip/step yet
 
         # sampled on the same 1-in-10 clock as the rest of ten_step_reporting.
-        # When a step runs more than one branch (unfused phase 1), this holds
+        # When a step runs more than one branch (an unfused stage), this holds
         # the LAST branch to reach an optimizer step, not their sum.
         if self.step_ind % 10 == 0:
             self._last_grad_norms = self._submodel_grad_norms()
@@ -3960,10 +3958,11 @@ Two things deliberately NOT done here, both recorded in
         Per-sample priority for prior/dataset buffer retention (purge_lowest
         keeps the HIGH-priority samples), centered on the tracker's
         per-condition mean (ema_logw) -- the buffer's OWN normalizer -- in
-        every phase, not just phase 2. Rationale (same as the re-centered
+        every stage, not just the terminal one. Rationale (same as the re-centered
         bwd under_coverage metric, see _bwd_under_center): whenever the
         learned Z lags the buffer-implied level -- the standing condition of
-        phase 3, not just phase 2's untrained-Z init -- |log_Z - log_w| is
+        any fused stage, not just the untrained-Z init the terminal stage starts
+        from -- |log_Z - log_w| is
         dominated by that collective offset, so ranking by it degenerates to
         ranking by log_w alone (one-sided) and skews retention to
         off-policy/blowup tails instead of the samples that define each
@@ -4063,7 +4062,7 @@ Two things deliberately NOT done here, both recorded in
 
         elif self.bwd_sampling_mode == 'prior':
             # condition-blocked draws (C conditions x up to M distinct terminals
-            # each) only while condition-grouped bwd VarGrad is active (phase 2:
+            # each) only while condition-grouped bwd VarGrad is active (var_conditioning:
             # vg_lb = phase2_bwd_vg_lb; _activate_phase3_losses turns it off) --
             # its cross-terminal signal otherwise only arrives via birthday
             # collisions. Phase 3's per-sample TB prefers the broad-coverage
@@ -4389,7 +4388,7 @@ Two things deliberately NOT done here, both recorded in
         # backward sampling (ema_model, fixed eval temperature) is a different
         # measurement protocol from the train-step bwd stream that feeds the
         # tracker, and mixing protocols inflates the tracker's second moment by
-        # the between-stream mean shift, spiking the phase-2 logw_std gate (and
+        # the between-stream mean shift, spiking the terminal stage's logw_std gate (and
         # the ema_logw sawblade) at every eval. The train-time bwd/replay
         # update() calls (phase-gated, in get_gfn_backward_loss) are untouched.
 
@@ -6624,7 +6623,7 @@ Two things deliberately NOT done here, both recorded in
         """
         Optionally pre-populate self.prior_buffer at init time from the
         prebuilt prior dataset, instead of letting it start empty and fill at
-        churn rate (manage_prior_buffer) once phase 2/3 starts drawing from
+        churn rate (manage_prior_buffer) once a buffers_active stage starts drawing from
         it. buffers.prior_buffer.seed_source:
           'generated'      -- default, unchanged: lazy creation from the first
                               fwd-eval batch, then churn-rate filling
@@ -6636,7 +6635,7 @@ Two things deliberately NOT done here, both recorded in
         Seeding constructs a fresh CrystalBuffer, so every per-sample record
         (ema_loss, select_counts, ema_logw) starts clean: churn/purge
         priorities re-form under the current policy instead of inheriting the
-        dataset's own phase-1 bookkeeping. Must run after init_identifiers()
+        dataset's own warm-start bookkeeping. Must run after init_identifiers()
         and is skipped when a checkpoint-restored prior_buffer already exists.
         """
         if hasattr(self, 'prior_buffer'):
@@ -6807,7 +6806,7 @@ Two things deliberately NOT done here, both recorded in
         # seeding the former does NOT inform the latter, and BOTH the admission
         # plausibility gate (screen_and_admit_anchors) and thin()'s purge gate
         # calibrate against best_energy(c), not against the anchor buffer's own
-        # energies. Without this, best_energy(c) stays inf until phase-2 prior
+        # energies. Without this, best_energy(c) stays inf until the terminal stage's prior
         # churn warms it from broad, high-energy prior-model samples -- which
         # then admits (and can't purge) those bad samples as each condition's
         # "per-condition best", exactly the behaviour these good seeds are meant
@@ -6898,7 +6897,7 @@ Two things deliberately NOT done here, both recorded in
         # below the bar, CEILING when |its metric| rises above. Bars are named
         # for their ROLE (health_gate_floor / _ceiling), not for a metric, so a
         # swap cannot leave a bar named after the metric it no longer uses.
-        # A cold channel abstains rather than blocks, so phase-1 seeding is
+        # A cold channel abstains rather than blocks, so warm-start seeding is
         # unaffected. floor_metric: null disables that channel.
         #
         # ⚠ A BAR DOES NOT SURVIVE A RULER SWAP. tb_resid_clipped is signed and
@@ -7006,7 +7005,7 @@ Two things deliberately NOT done here, both recorded in
     def sample_from_prior(self, num_samples):
         "sample from prior"
         # a reused prior carries its own training T (checkpoint 'train_T'); a
-        # prior trained live in this run's phase 1 does not, so fall back to the
+        # prior trained live in this run's warm-start stage does not, so fall back to the
         # run's own rollout length. Either way, sample at the T the prior was
         # TRAINED at -- not eval_T, which need not match it (a T=10 shared prior
         # sampled at T=100 integrates 10x finer than it was fit to).
@@ -7139,8 +7138,8 @@ Two things deliberately NOT done here, both recorded in
         # axes at once -- ema_model weights, a fresh log-uniform temperature
         # sweep, uniform mol draws, ~eval_num_samples pooled rows -- while the
         # ConditionLogZTracker is a rolling estimate over the *train-step*
-        # stream, and every training-facing consumer of it (phase-2 logw_std
-        # gate, phase-3 bootstrap_log_z target, z_grad/controller, persistent
+        # stream, and every training-facing consumer of it (the terminal logw_std
+        # gate, the bootstrap_log_z handoff target, z_grad/controller, persistent
         # tb_z_source) needs a single, homogeneous protocol. Mixing the eval
         # stream in spiked those statistics at every eval: the z-residual and
         # (worse) the second moment, since folding in a stream with a shifted

@@ -6,7 +6,7 @@ cuda_memory_fraction: 0.9
 anomaly_detection: false
 continue_from_checkpoint: false
 mlip_path: null
-checkpoints_dir: C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints
+checkpoints_dir: D:\crystal_datasets\gfn_checkpoints
 checkpoint_name: null
 prior_model_name: null
 load_weights_only: false

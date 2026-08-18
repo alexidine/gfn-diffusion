@@ -12,7 +12,7 @@ active plan; after that, foundational change requires a demonstrated need.
 | Phase | State | What is left |
 |---|---|---|
 | **0** baseline + version primitive | **DONE** | — |
-| **1** canonical config | **~95%** | the comment rewrite (1.3, tiers S2-S5) and the runtime half of the mode-safety audit (1.1). Optimizer-block nesting DROPPED |
+| **1** canonical config | **DONE** | the runtime half of the mode-safety audit (1.1) is the only remainder, and is optional now that keys travel with the protocol |
 | **2** config generation | **DONE** | 2.1 `configs/generate.py` + 2.2 corpus shipped. 2.3 stays a deliberate stub |
 | **3** executable invariants | **DONE**, folded into Phase 0 | extend as new rules earn it |
 | **3b** analysis package | Tiers 0/1/2 **SHIPPED** | Tier 3 (figures), specified and not built |
@@ -834,8 +834,12 @@ because a half-built thing recorded as done is how this list would stop working.
 - ~~historical configs migrate systematically~~ — dropped: back-compat is not a
       requirement. A stale config fails loudly at load; that is sufficient, and
       the gate it depends on now fires (state 7).
-- [ ] **comments and docstrings follow current-state discipline** — audit landed
-      (`docs/design/comment_audit.md`), S1 applied, S2–S5 open.
+- [x] **comments and docstrings follow current-state discipline** — the audit
+      (`docs/design/comment_audit.md`) is fully applied. What it could not decide
+      mechanically is recorded there: two pinned-number findings were kept
+      because the measurement is what makes the claim checkable, and one vague
+      correctness marker was sharpened into two checkable statements rather than
+      deleted.
 - [ ] the initial recurring workflows are scripted and documented
       (update-old-run · production-config generation · functional-change ·
       performance-investigation · run analysis) — **two of five done**: run

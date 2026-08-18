@@ -1,7 +1,13 @@
 # LR control: what the bench has established
 
-*State doc for one open question, per [`PROTOCOL.md`](PROTOCOL.md): rewritten in
-place, no supersession chain, git holds the history. Measurements live in
+> **Status: SNAPSHOT.** This is a scoped explanation and evidence summary, not
+> automatically current State. Verify behavioral claims against the current
+> controller, canonical config, and focused tests; use cited findings only in
+> their stated scope. The active maintenance rules are in
+> [`EPISTEMIC_PROTOCOL.md`](EPISTEMIC_PROTOCOL.md).
+
+*Originally a State doc for one open question under the now-superseded
+[`PROTOCOL.md`](PROTOCOL.md). Measurements live in
 `findings.md` and are cited by ID, never restated. All results are from `bench/`,
 on synthetic surfaces driving the REAL `LRController` and `RayCalibration`,
 except the real-gradient numbers in §3.*

@@ -1,5 +1,12 @@
 # Decisions and open items
 
+> **Status: LEGACY MIXED LEDGER.** This file predates the active
+> [`EPISTEMIC_PROTOCOL.md`](EPISTEMIC_PROTOCOL.md) and mixes decisions, open
+> questions, work items, experiments, closed rulings, and documentation history.
+> Do not append new decisions or treat the file as current policy. Read a
+> specific ruling only as scoped evidence of owner intent, then verify current
+> executable state and later explicit rulings.
+
 **Replaces `questions.md` and `register.md`** — consolidated 2026-08-06, and both
 **deleted** the same day after a coverage check (all 30 questions and every
 register ID map into this file). They had held one content set under two indexes

@@ -18,7 +18,7 @@ anomaly_detection: false  # dramatic slowdown when True
 ################################################################
 continue_from_checkpoint: false  # inert while checkpoint_name is set (train.py init_gfn takes that branch first); true resolves to this run identity's own _running.pt
 mlip_path: null              # MLIP weights, for energy_function uma/mace only. Unused on elj and the toys. e.g. 'D:\crystal_datasets\esen_s.pt'
-checkpoints_dir: 'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints'  # where this run writes and reloads every checkpoint
+checkpoints_dir: 'D:\crystal_datasets\gfn_checkpoints'  # where this run writes and reloads every checkpoint
 # Kept under a prefix no run writes to, so train_prior's own on_exit snapshot
 # cannot overwrite the warm start it is being started FROM.
 checkpoint_name: 'dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-573c92_phase1_exit.pt'  # warm start: weights + optimizers + buffers, with its _buffers.pt sidecar. null = fresh run
@@ -669,7 +669,7 @@ buffers:
     seed_source: 'prior_dataset'  # 'generated' or 'prior_dataset': seed at init with the full prebuilt prior dataset, FRESH per-sample records
     mean_lifetime: 100  # NOT a lifetime -- a rate divisor. Rows admitted per bwd step = churn_batch_ref / mean_lifetime = 10, so turnover time = mean_lifetime * max_size / churn_batch_ref steps. The VALUE is arbitrary; the 25k-step residence it implies is the number to argue about
     weighted_bwd_beta: 0.9  # uniform fraction for stages with weighted_bwd_sampling; 0.9 => 10% of the bwd batch drawn ~ema_loss. No stage here declares that flag
-    churn_batch_ref: 1000  # fixed reference batch size for churn pacing -- decoupled from the live batch_size so a growth event doesn't multiply buffer turnover (gejezmjg)
+    churn_batch_ref: 1000  # fixed reference batch size for churn pacing -- decoupled from the live batch_size so a growth event doesn't multiply buffer turnover
     min_size: 10000
     max_size: 250000
     init_fraction: 0.25  # rebuild_prior_by_churn refill target as a fraction of max_size, admitted through the online gate. Fires at equilibration's on_enter
@@ -695,7 +695,7 @@ buffers:
   replay_buffer:
     churn_rate: 80  # admission attempts budgeted per manage call; SUPPLY-side
     mean_residence_steps: 50  # memoryless hazard, so residence is exponential (CV ~ 1) -- a WIDE lag distribution, which is a strong lowpass on the policy -> buffer -> gradient path. A hard age cap would concentrate the phase lag at one frequency, and this codebase has a documented phase-2 limit cycle
-    max_size: 12000  # 1.5x the 80 x 50 equilibrium (was 4000 = exactly it, zero headroom)
+    max_size: 12000  # 3x the churn_rate x mean_residence_steps equilibrium of 4000, so the cap is HEADROOM and the hazard sets occupancy. At exactly 4000 the cap binds instead, and eviction becomes displacement -- which is residual-dependent and breaks birth_loss as an unbiased intake baseline
     admit_reward_min: -200  # hard exclusion, applied UPSTREAM of admission unconditionally: admission scores badness, so without a floor the energy distribution is unbounded above
     # --- prioritised replay (to_do_rebuild.md B5/B7b) ---
     # Admission is unconditionally uniform (D5); purge is hazard+backstop only

@@ -20,7 +20,7 @@ mlip_path: null
 prior_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt
 molecules_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt
 test_molecules_path: null
-checkpoints_dir: C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints
+checkpoints_dir: D:\crystal_datasets\gfn_checkpoints
 checkpoint_name: null
 prior_model_name: null
 reuse_prior: false

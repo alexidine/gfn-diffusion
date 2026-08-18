@@ -30,10 +30,32 @@ only costs them scrolling. The tiers are:
 | Tier | Class | Count | Status |
 |---|---|---:|---|
 | **S1** | Contradicted by the code it sits on — acting on it produces the wrong change | 10 | **APPLIED** |
-| **S2** | Names something retired or deleted as if live — the reader cannot resolve it | 7 | 1 fixed, 6 open |
-| **S3** | Pinned numbers presented as current fact | 6 | open (1 needs a decision) |
-| **S4** | Experimental history / run-id narrative | 11 | open — deferred behind 1.2 |
-| **S5** | Housekeeping — dead files, `# todo` markers, dormant blocks | 3 | open |
+| **S2** | Names something retired or deleted as if live — the reader cannot resolve it | 7 | **APPLIED** |
+| **S3** | Pinned numbers presented as current fact | 6 | **APPLIED** |
+| **S4** | Experimental history / run-id narrative | 11 | **APPLIED**, except `controller.py` |
+| **S5** | Housekeeping — dead files, `# todo` markers, dormant blocks | 3 | **APPLIED** |
+
+**S2–S5 applied 2026-08-17.** Three judgment calls worth recording, because each
+is a case where the tier's rule said "trim" and the right answer was not to:
+
+- **`utils.py`'s `_SERVO_SEED_LR` citations KEPT.** The claim is that the seed
+  sits below *every measured optimum*, and that is only checkable if the
+  measurements are named. Trimming the run names would leave a bare assertion —
+  the same test the audit applies to `controller.py`'s alpha_target calibration,
+  which it also marks keep.
+- **`_GRAD_MEDIAN` given a scope and a re-measure trigger rather than a trim.**
+  Three constants set the gradient clip for every `auto` config, and they were
+  measured on one molecule with no route caveat. The fix a pinned-number finding
+  usually wants — delete the provenance — would have made it worse.
+- **`controller.py` left alone**, as the user was editing it. Its S4 entries (the
+  "WHAT V8 DELETED" autopsy and the tuphwfkm calibration) are theirs to keep or
+  move to `docs/lr_control_summary.md`.
+
+One correctness question was SHARPENED, not resolved: `calibrate_prior_noise`
+carried `# todo confirm right latents / dists`, which named no checkable thing.
+It now states the two: the magnitude sweep is a deterministic ramp under a name
+that says otherwise, and the unit-box clip truncates the large end so realised
+displacement falls below nominal exactly where the sweep is widest.
 
 **S1 was applied on 2026-08-16**, ahead of 1.2 rather than after it: a comment
 that is wrong about behaviour does its damage during consolidation, which is the

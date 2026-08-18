@@ -148,7 +148,23 @@ _SCALING_T_REF = 25
 _SERVO_SEED_LR = 1.0e-5
 _LR_KEYS = ('lr_policy', 'lr_replay', 'lr_back', 'lr_fused')
 _CLIP_ANCHOR = 250.0
-_GRAD_MEDIAN = {10: 1.0e3, 25: 6.6e3, 100: 1.7e4}  # empirical pre-clip grad medians (mipcas)
+# Pre-clip policy gradient medians by T, and the only measurement in this file
+# that silently sets a number every `auto` config trains under -- the clip is
+# _CLIP_ANCHOR * grad_median(T)/grad_median(25) * sqrt(W/512).
+#
+# THE SCOPE IS NARROWER THAN THE USE. These were read off ELJ crystal runs on one
+# molecule (mipcas). Nothing restricts them to that route, so a toy or an MLIP
+# route takes a clip fitted to a distribution nobody checked it against. That is
+# tolerable only because grad_clip_guard is normally ON and tracks the live
+# quantile itself, which makes this the FALLBACK bar rather than the operating
+# one -- see grad_clip_guard.py and the `gradient_norm_clip` note in mk_dev.
+#
+# RE-MEASURE WHEN: a new energy route becomes production, or T moves outside
+# 10-100 (the interpolation is over three points and does not extrapolate).
+# The check is cheap -- log the pre-clip norm median for a few hundred steps and
+# compare. A wrong entry here does not crash; it clips a healthy gradient or
+# fails to clip an unhealthy one, and both look like a training result.
+_GRAD_MEDIAN = {10: 1.0e3, 25: 6.6e3, 100: 1.7e4}
 
 # Keys deleted from the schema, with the reason the config author needs. Checked
 # at LOAD, not at first use: the aug02 battery lost all 16 arms' entire phase 1
@@ -1213,7 +1229,21 @@ def calibrate_prior_noise(buffer, energy_function,
     rand_magnitude = torch.logspace(log_min, log_max, len(samples))
 
     noised_samples = (samples + rand_dir * rand_magnitude[:, None]).clip(min=-1, max=1)
-    new_samples = noised_samples  # todo confirm right latents / dists
+
+    # TWO THINGS TO CONFIRM BEFORE TRUSTING A CALIBRATION FROM THIS, stated
+    # precisely because the previous marker here ("confirm right latents /
+    # dists") was not actionable:
+    #
+    #  1. `rand_magnitude` is a logspace RAMP, not a draw -- sample i gets a
+    #     magnitude monotone in its buffer index, and the buffer is walked in
+    #     order. That is right for a designed sweep and wrong for a random
+    #     perturbation; the name says the latter. Which is intended decides
+    #     whether the per-row reward change is a curve or a scatter.
+    #  2. The clip to the unit box TRUNCATES the large end: a row already near a
+    #     wall moves less than its requested magnitude, so realised displacement
+    #     falls below nominal exactly where the sweep is widest. Any fit over
+    #     magnitude should use the realised norm, not `rand_magnitude`.
+    new_samples = noised_samples
 
     # have to update the rewards if we are using any loss functions that require them
     crystal_batch, log_T_tensor, condition, condition_id = energy_function.condition_samples(
@@ -1781,8 +1811,8 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=N
     makes the Z-anchored under_coverage read "everything is under-covered"
     whenever Z lags, starving the controller's other modes. Re-centered,
     'under-covered' means under-covered relative to the rest of the batch:
-    the spread component that IS the policy's to fix. The phase-3 controller
-    keys backward allocation on this; the Z-anchored under_coverage stays
+    the spread component that IS the policy's to fix. The balance controller on
+    the terminal stage (`kind: ratio`) keys backward allocation on this; the Z-anchored under_coverage stays
     reported as the absolute-merge gauge (its gap to relative_under, like
     jensen_z vs log_Z_learned, is the has-forward-caught-up signal).
 
@@ -1791,10 +1821,10 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=N
     same scatter-mean pattern as logw_std_within / cond_tb_err)
     instead of the single batch-wide pooled z_jensen. A pooled z_jensen mixes
     conditions with different true log Z into one mean, which is not any
-    condition's own normalizer -- cazwlyy1: bwd's per-condition log_Z_learned
-    had converged to the per-condition level while the pooled 'jensen_z'
-    metric sat far off from either, and relative_under (built on the pooled
-    value) read as a large spurious violation. condition_id=None reproduces
+    condition's own normalizer. MEASURED, and the reason this is per-condition:
+    bwd's per-condition log_Z_learned had converged to the per-condition level
+    while the pooled 'jensen_z' sat far off from either, so relative_under --
+    built on the pooled value -- read as a large spurious violation. condition_id=None reproduces
     the old pooled behavior exactly (unconditional callers unaffected). The
     reported 'jensen_z'/'z_gap' metrics stay pooled either way -- only
     relative_under's own centering changes.
@@ -1809,7 +1839,7 @@ def quick_tb_stats(log_pf, log_pb, log_Z, log_r, reward_floor=None, ramp_width=N
     picks up that offset before the one-sided clamp (~f*Delta of apparent
     under-coverage with a perfectly fit scored population). f is a buffer knob
     -- anchor top-up rate, churn, weighted_bwd_beta, purge -- so the metric is
-    not comparable across a run whose mix drifts, and the phase-3 controller
+    not comparable across a run whose mix drifts, and the balance controller
     that keys backward allocation on it also moves the mix that sets it.
     Weighting the centre removes f from both sides. Keep BOTH: their gap is the
     composition reading (large gap == the batch is mostly material the ramp

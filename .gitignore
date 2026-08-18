@@ -3,14 +3,6 @@ __pycache__/
 wandb/
 .claude/worktrees/
 
-# Checkpoints. The suffixed forms (*.pt.detonated_*, *.pt.stale_*, *.pt.hotstart_*)
-# are quarantined checkpoints, hundreds of MB each -- `*.pt` does not match them
-# because the suffix moves the extension.
-energy_sampling/checkpoints/*.pt
-energy_sampling/checkpoints/*.pt.*
-energy_sampling/checkpoints/*.npy
-energy_sampling/checkpoints/*.npz
-
 # Buffers and prior states written beside the trainer
 energy_sampling/*.pt
 

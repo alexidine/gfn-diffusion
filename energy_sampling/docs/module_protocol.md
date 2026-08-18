@@ -1,5 +1,10 @@
 # Module: protocol (`protocol.py`)
 
+> **Status: MODULE SNAPSHOT.** The verification dates below are historical.
+> Use this document for explanation and navigation; verify material claims
+> against current code, canonical config, and focused tests. See
+> [`EPISTEMIC_PROTOCOL.md`](EPISTEMIC_PROTOCOL.md).
+
 Pass 1 (audit + rationalize). Verified against the working tree, 2026-08-03;
 balance-controller sections revised 2026-08-06 for `kind: ratio` (P7);
 **line refs and P4/P8 revised 2026-08-08**.

@@ -10,7 +10,7 @@ mlip_path: /scratch/mk8347/models/uma/esen_s.pt
 checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/
 checkpoint_name: a100_stab_aug16_f3_mipcas_uma_uma-mipcas_sg2_zp1_uma_prior_dataset-T2.5-5796d8_step1000.pt
 prior_model_name: a100_stab_aug16_f3_mipcas_uma_uma-mipcas_sg2_zp1_uma_prior_dataset-T2.5-5796d8_prior.pt
-load_weights_only: false
+load_weights_only: true
 prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_uma_prior_dataset.pt
 molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_uma_prior_dataset.pt
 test_molecules_path: null
@@ -105,7 +105,7 @@ max_batch_size: 100
 eval_num_samples: 10000
 test_eval_num_samples: 2000
 fused_grad_accum_min_samples: 1000
-epochs: 1001000
+epochs: 1000000
 eval_period: 100000000
 figs_period: 100000000
 batch_growth_factor: 1.65
@@ -213,33 +213,6 @@ protocol: unconditional_tb
 protocols:
   unconditional_tb:
     stages:
-    - name: train_prior
-      train_mode: bwd
-      bwd_sampling_mode: dataset
-      skip_if: prior_loaded
-      flags:
-        update_log_z: true
-        scramble_conditions: true
-      mle_gate:
-        slope_t: 2.0
-        min_rate: 0.05
-        window: 300
-      loss_coeffs:
-        bwd:
-          mle: 1.0
-          tbc: 1.0
-          repeats: 2.0
-      exit:
-      - metric: gates/mle_flat
-        above: 0.5
-        patience: 5
-      - metric: eval/wass_debiased
-        below: 0.015
-      - metric: bwd/tbc
-        below: 2.0
-      on_exit:
-      - snapshot:phase1_exit
-      - snapshot_prior
     - name: equilibration
       train_mode: fused
       bwd_sampling_mode: prior
@@ -297,83 +270,6 @@ protocols:
         relax: 0.5
         max_step: 0.05
         max_boost: 8.0
-  conditional_vargrad:
-    stages:
-    - name: train_prior
-      train_mode: bwd
-      bwd_sampling_mode: dataset
-      skip_if: prior_loaded
-      flags:
-        update_log_z: true
-        scramble_conditions: true
-      mle_gate:
-        slope_t: 2.0
-        min_rate: 0.05
-        window: 300
-      loss_coeffs:
-        bwd:
-          mle: 1.0
-          tbc: 1.0
-          repeats: 2.0
-          tb_z_source: persistent
-      exit:
-      - metric: gates/mle_flat
-        above: 0.5
-        patience: 5
-      - metric: eval/wass_debiased
-        below: 0.015
-      - metric: bwd/tbc
-        below: 2.0
-      on_exit:
-      - snapshot:phase1_exit
-      - snapshot_prior
-    - name: var_conditioning
-      train_mode: fused
-      bwd_sampling_mode: prior
-      flags:
-        update_log_z: true
-        buffers_active: true
-        weighted_bwd_sampling: true
-        weighted_condition_sampling: true
-      on_enter:
-      - rebuild_prior_by_churn
-      - set_lr_flow:1.0e-4
-      fracs:
-        fwd: 0.5
-        bwd: 0.5
-        replay: 0.0
-      deactivate_threshold: 0.01
-      loss_coeffs:
-        fwd:
-          vg_lb: 1.0
-          vg_by_condition: 1.0
-          emp_z: 1.0
-          repeats: 2.0
-          tb_z_source: persistent
-        bwd:
-          vg_lb: 1.0
-          condition_block_m: 2.0
-          repeats: 1.0
-          level_gap: 0
-          tb_z_source: persistent
-        replay:
-          tb_z_source: persistent
-      balance:
-        kind: proportional
-        pinned:
-          replay: 0.0
-        metrics:
-          fwd: fwd/logw_std_within
-          bwd: bwd/logw_std_within
-        drive: relative
-        targets:
-          fwd: 1.0
-          bwd: 1.0
-        default_boost:
-          fwd: 0.5
-          bwd: 0.5
-        floor: 0.1
-        alpha: 0.01
 controller:
   min_mode_frac: 0.001
   beta: 0.025

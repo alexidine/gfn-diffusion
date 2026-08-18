@@ -463,26 +463,66 @@ built without it, but no training curve can be read without it.
 
 ### F1 · The reference table
 
-**Goal.** One committed command emits, for the smoke harness's molecule set at `'torsion'`:
-uniform, the fitted prior, and a relaxation reference — scored on T_eff/T, coverage and ESS,
-each with an error bar.
+**Goal.** One committed command emits a four-axis comparison over the smoke harness's
+molecule set:
 
-**Why an error bar and not a number.** The weekend produced six such tables and none is
-reproducible by any committed command; worse, single-seed figures were compared against one
-another as though the differences were real. A baseline without a noise floor cannot tell you
-whether a model beat it.
+| axis | values |
+|---|---|
+| **sampler** | uniform · fitted prior |
+| **post-optimization** | raw · optimized |
+| **score** | energy · diversity |
+| **tier** | `torsion` · `dihedral` · `flex` · `full` |
 
-**Files.** New — `energies/prior_baselines.py`, beside the producer.
+Every cell carries an **error bar**, not a point estimate.
 
-**Done when.** The command runs at `'torsion'`, writes to `energies/results/`, and re-running
-it reproduces every published prior-quality figure in
+**Almost every ingredient exists; the assembly does not.** The prior ships
+(`sample_prior_states`). Post-optimization ships two ways —
+`gradient_descent_optimization` in internal coordinates and `cartesian_optimization`
+(`mxtaltools/conformers/optimize.py`). The energy scores ship
+(`excess_median_kt`, `excess_p90_kt`, `frac_within_equipartition` in `prior_diagnostics`).
+Levels ship and the harness already runs more than one per pass. **Uniform does not exist**
+— the baseline every other number is read against is the one arm nobody has written.
+
+**Which energy score, and why not only T_eff.** Report the raw excess above the reference
+minimum — median, p90, and the thermal-or-better fraction. Those have no operand in common
+with the sampler. T_eff may be reported *beside* them but must not stand alone: the prior
+draws r and theta at `sqrt(kT/2k)` from the force field's own constants and T_eff then scores
+that draw with **the same constants**, so k cancels and it reads 1.0 by construction —
+verified by scaling `k_bond` x4 for a bit-identical result. The degeneracy is specific: it
+does **not** apply to uniform, to optimized draws, to the phi dimensions, or at `torsion`
+where r and theta are frozen and the check skips. So T_eff is informative across most of this
+table and **systematically flatters the prior** in exactly one block. Label that cell.
+
+**Diversity, and an honest proxy.** `coverage_report` is the wanted measure but has two
+defects — it raises at `torsion`, and it false-passes on molecules with coupled coordinates
+(B1). Until B1 lands, report the **occupancy distribution over rotamer basins** — already
+computed, and it needs no mode-enumeration guarantee to be meaningful. State which of the two
+produced each cell; do not silently substitute.
+
+**Files.** New — `energies/prior_baselines.py`, beside the producer, writing to
+`energies/results/`.
+
+**Done when.** The command reproduces every published prior-quality figure in
 [`conformer_conditional_stack.md`](conformer_conditional_stack.md) — or that document is
-corrected to state the level each of its figures actually describes.
+corrected to state the tier each of its figures actually describes — and every cell states
+its seed count and spread.
 
-**Traps.** Uniform is not a trivial baseline here: at `'torsion'` under `ff_from_reference` it
-**beats the fitted prior**, and reporting only the prior would hide that. Relaxation is not a
-baseline for the *prior* — it is a different proposal at a different cost — so report its
-compute budget beside its score or the comparison is meaningless.
+**Traps.**
+
+- **Tiers are not a resolution ladder.** Freezing a degree of freedom yields a conditional
+  slice differing from the full distribution by a state-dependent Fixman factor, so a figure
+  at `torsion` does not approximate the same figure at `full`. Uniform-vs-prior-vs-optimized
+  is well posed **within** a tier. Reading a row **across** tiers compares different target
+  distributions. Either emit one table per tier, or keep the tier axis and print the warning
+  in the header — a table that puts tiers in columns invites precisely the wrong reading.
+- **Uniform is not a straw man.** At `'torsion'` under `ff_from_reference` it **beats the
+  fitted prior** as an importance proposal. Reporting only the prior hides that.
+- **Optimization is not a sampler.** It is a different proposal at a different cost, and its
+  score is meaningless without its compute budget printed beside it. It also over-cools:
+  fixed-step relaxation drove ethanol to T_eff/T = 0.02. Report the budget, and do not treat
+  an optimized arm as a better version of its raw arm.
+- **A shared random draw across arms is not a control**, it is a correlation. Seed the arms
+  independently and report the spread, or the error bars understate.
 
 ### F2 · log Z by importance sampling, untrained, several seeds
 

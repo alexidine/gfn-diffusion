@@ -1,5 +1,10 @@
 # Module: losses (`gflownet_losses.py`)
 
+> **Status: MODULE SNAPSHOT.** The verification dates below are historical.
+> Use this document for explanation and navigation; verify material claims
+> against current code, canonical config, and focused tests. See
+> [`EPISTEMIC_PROTOCOL.md`](EPISTEMIC_PROTOCOL.md).
+
 Pass 1 (audit + rationalize). Verified against the working tree, 2026-08-03;
 **revised 2026-08-08** for the importance-weighted backward reduction (L10) and
 the truncated forward path gradient (L11), both added 2026-08-07.

@@ -811,6 +811,32 @@ def build_wave3(base, a):
                     # knee recheck would move it for a different reason.
                     'max_step_seconds': 0, 'batch_knee_recheck_steps': 0,
                     'anomaly_detection': False})
+        # T CANNOT CROSS A FULL-STATE RESUME. The replay buffer stores whole
+        # trajectories and get_traj_replay asserts trajectory.shape[1] ==
+        # trajectory_length + 1. Every archive in this battery was written at
+        # T=10, so resuming one at T=60 dies with "trajectory has 11 states,
+        # expected 61" the first time the replay branch draws -- which killed
+        # twelve arms of wave 3 v1. eval_T == integrator.T is only HALF the
+        # constraint: that one is about integrating the same SDE, this one is
+        # about restored state whose SHAPE was fixed at write time.
+        #
+        # So an arm that changes T takes WEIGHTS ONLY and rebuilds its buffers,
+        # running one terminal equilibration stage from step 0 -- the same fused
+        # shape the boundary cells exist to measure, with a replay buffer that
+        # fills at the run's own T.
+        archive_T = 10
+        needs_fresh_buffers = int(T) != archive_T
+        if needs_fresh_buffers and not energy_free:
+            _st = [x for x in cfg['protocols']['unconditional_tb']['stages']
+                   if x.get('name') == 'equilibration']
+            assert len(_st) == 1, 'equilibration stage not found'
+            _st = copy.deepcopy(_st[0])
+            _st.pop('exit', None)
+            _st.pop('on_exit', None)
+            cfg['protocols'] = {'unconditional_tb': {'stages': [_st]}}
+            cfg['protocol'] = 'unconditional_tb'
+            resume = 0
+
         if energy_free:
             # THE POINT OF TIER 1, and it does not happen by itself. Resuming a
             # step-2000 archive lands INSIDE equilibration, which is fused and
@@ -841,6 +867,9 @@ def build_wave3(base, a):
         if energy_free:
             cfg['load_weights_only'] = True
             cfg['prior_model_name'] = None   # nothing samples a prior here
+        elif needs_fresh_buffers:
+            # keeps prior_model_name: rebuild_prior_by_churn samples it on entry
+            cfg['load_weights_only'] = True
         cfg['checkpoint_read_only'] = True
         arms.append((name, 'wave3', kind, '-', cfg, dict(env or {})))
 
@@ -859,9 +888,15 @@ def build_wave3(base, a):
         cell(f'w3_elj_w{w}', 'elj', 2722, 60, 'width', steps=1000000, width=w)
     # -- MLIP construction-path A/Bs at each route's mid batch. Short: they
     #    measure per-CALL phase splits, which need calls, not wall clock.
+    # AT T=10, DELIBERATELY. What these measure -- one energy call split into
+    # graph/forward or neighbours/build -- is a per-CALL property; T changes how
+    # many rollout steps surround the call, not what happens inside it. Holding T
+    # at the archive's value keeps the full-state resume legal (see the buffer
+    # note in cell()), so these start in a warmed equilibration stage rather than
+    # spending their 400 steps refilling buffers.
     mid = {'uma': 250, 'mace': 100}
     for nm, route, env, _why in FLAG_ARMS:
-        cell(f'w3_{nm}', route, mid[route], 60, 'flag', steps=400, env=env)
+        cell(f'w3_{nm}', route, mid[route], 10, 'flag', steps=400, env=env)
     return arms, dropped
 
 
@@ -911,7 +946,14 @@ def validate(name, wave, kind, bid, cfg):
         # INSIDE a stage, so it needs the full state -- optimizers, buffers, step
         # count. Weights-only would restart at step 0 in train_prior and measure
         # the wrong stage entirely.
-        if kind == 'rollout':
+        if kind in ('boundary', 'width'):
+            assert cfg['load_weights_only'] is True, (
+                f'{name}: an arm that changes T must be weights-only -- the '
+                f'replay buffer stores T+1-length trajectories')
+            _only = cfg['protocols']['unconditional_tb']['stages']
+            assert len(_only) == 1 and _only[0]['name'] == 'equilibration', (
+                f'{name}: T-changing boundary arms run ONE terminal equilibration stage')
+        elif kind == 'rollout':
             # the energy-free T-axis arms deliberately take weights alone: they
             # run a single terminal train_prior stage rather than resuming into
             # the fused stage the archive was written from
@@ -930,9 +972,12 @@ def validate(name, wave, kind, bid, cfg):
         else:
             assert cfg['load_weights_only'] is False, \
                 f'{name}: a benchmark resume needs full state, not weights-only'
-        assert kind == 'rollout' or cfg['epochs'] > archive_step(cfg['checkpoint_name']), \
-            f'{name}: epochs {cfg["epochs"]} <= resume step -- runs ZERO steps and ' \
-            f'reports a clean empty result (epochs is an ABSOLUTE index)'
+        # rollout/boundary/width arms restart at step 0 (weights-only), so their
+        # epochs is a plain count and has no archive step to exceed
+        assert kind in ('rollout', 'boundary', 'width') or (
+                cfg['epochs'] > archive_step(cfg['checkpoint_name'])), (
+            f'{name}: epochs {cfg["epochs"]} <= resume step -- runs ZERO steps and '
+            f'reports a clean empty result (epochs is an ABSOLUTE index)')
     assert cfg['continue_from_checkpoint'] is False, f'{name}: pinned false everywhere'
     assert cfg['batch_size'] == cfg['max_batch_size'], f'{name}: batch not pinned'
     assert cfg['grow_batch_size'] is False, f'{name}: growth must be off'

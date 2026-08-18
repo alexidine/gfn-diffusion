@@ -1,8 +1,14 @@
 # Synthesis: design philosophy, working parts, key interactions
 
-Top-level view over the module documents. Unconditional route, working tree
+> **Status: SNAPSHOT, NOT CURRENT STATE.** This document explains the system as
+> understood at the dated working states below. Verify every material behavioral
+> claim against current code, `configs/mk_dev.yaml`, and focused tests. Current
+> authority and routing are defined by root `AGENTS.md`, `docs/README.md`, and
+> [`EPISTEMIC_PROTOCOL.md`](EPISTEMIC_PROTOCOL.md).
+
+Top-level snapshot over the module documents. Unconditional route, working tree
 @ 2026-08-03; **§1 annotated 2026-08-08 — the thesis is under active challenge.**
-Read this first; the module docs are the detail.
+The module docs are the detail for the same historical snapshot.
 
 ---
 

@@ -1004,8 +1004,8 @@ class CrystalBuffer:
         median among eligible rows. It bounds the weight range, and it is the
         knob that decides whether this estimator is usable at all.
 
-        MEASURED 2026-08-07 against r2_wiring's live buffer (kappa=1, 1000-row  # todo shorten comment
-        draws) -- the shipped 0.01 was far too permissive:
+        The knee is a calibration, not a preference. Against a live buffer
+        (kappa=1, 1000-row draws):
 
             floor_frac   ESS/n_drawn   max(w)/mean(w)
                   0.01         0.11              73
@@ -1013,11 +1013,11 @@ class CrystalBuffer:
                   0.25         0.63             3.3
                   0.50         0.80             1.9
 
-        At 0.01 the live run reported is_ess_frac 0.02-0.06: a 1000-row batch
-        was doing the work of ~20-60 rows, because a row just barely above zero
-        residual draws with p ~ 0 and therefore carries w ~ 1/p. 0.25 is the
-        knee -- it restores the ESS the synthetic test predicted (0.65) while
-        keeping most of the prioritisation. Watch replay/is_ess_frac; if it
+        Below ~0.1 the estimator stops working: a 1000-row batch does the work
+        of a few dozen rows, because a row barely above zero residual draws at
+        p ~ 0 and therefore carries w ~ 1/p. 0.25 is the knee -- most of the
+        prioritisation, at an ESS that makes the draw worth taking. THE
+        INVARIANT, which is what to act on: watch replay/is_ess_frac, and if it
         falls below ~0.3 this is the first knob to move.
 
         floor_frac keeps a small uniform component among ELIGIBLE rows, so a
@@ -1046,7 +1046,7 @@ class CrystalBuffer:
         score = delta.abs() if symmetric else torch.clamp(delta, min=0.0)
         score[~valid] = torch.quantile(score[valid], nan_quantile)
 
-        # ELIGIBILITY: score == 0 rows are excluded from the draw outright  # todo comment vastly too long
+        # ELIGIBILITY: score == 0 rows are excluded from the draw outright
         # (p = 0), not floored into it. They contribute zero force by
         # construction -- score IS the priority -- so the estimator's target
         # is the uniform mean over the eligible set (the positive half in the

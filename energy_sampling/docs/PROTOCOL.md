@@ -1,4 +1,11 @@
-# Documentation protocol
+# Documentation protocol (superseded)
+
+> **Status: LEGACY.** Superseded on 2026-08-18 by
+> [`EPISTEMIC_PROTOCOL.md`](EPISTEMIC_PROTOCOL.md), which subsumes the evidence
+> grades, scope rules, write gate, and one-fact-one-home discipline while
+> replacing the Git-dependent and high-bureaucracy rules below. This file is
+> retained as explicit institutional history. Do not follow it as current
+> instruction.
 
 How these docs are written. Adopted 2026-08-10. This file is State: if a rule
 changes, overwrite it.

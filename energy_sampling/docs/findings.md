@@ -1,9 +1,62 @@
 # Findings
 
+> **Status: EVIDENCE LEDGER, NOT POLICY.** Read cited entries in their stated
+> scope; do not load this file wholesale to infer current design. Active
+> authority and grading rules are defined by
+> [`EPISTEMIC_PROTOCOL.md`](EPISTEMIC_PROTOCOL.md).
+
 Append-only evidence ledger. Entries are **never edited** — a later entry
-supersedes an earlier one by naming it. Format and grades: [`PROTOCOL.md`](PROTOCOL.md).
+supersedes an earlier one by naming it. Format and grades:
+[`EPISTEMIC_PROTOCOL.md`](EPISTEMIC_PROTOCOL.md).
 
 Newest first.
+
+---
+
+## F-046 · T cannot cross a full-state resume: the replay buffer stores T+1-length trajectories · `MECHANISM`
+
+*2026-08-18, `a100_stab_aug16` wave 3 v1. Twelve of twenty-three arms died on one
+assertion; the six that survived did so by accident of an unrelated design
+choice.*
+
+```
+models/gfn.py:1181  get_traj_replay
+AssertionError: trajectory has 11 states, expected 61
+```
+
+**The rule.** The replay buffer stores whole trajectories, and
+`get_traj_replay` asserts `trajectory.shape[1] == trajectory_length + 1`. Every
+archive in this battery was written at T=10, so a full-state resume that sets
+T=60 restores a buffer of 11-state trajectories and dies the first time the
+replay branch draws. Nothing checks this at load: the run starts, seeds, enters
+the stage, and fails several steps in.
+
+**This is a SECOND, independent T constraint.** `utils` already refuses
+`eval_T != integrator.T`, and that one is about *integrating the same SDE* -- the
+policy learns drift per step at one dt. This one is about **restored state whose
+shape was fixed at write time**, and it binds even when eval_T and integrator.T
+agree perfectly with each other. Knowing the first does not warn you about the
+second.
+
+**Why six arms survived.** The tier-1 rollout arms are weights-only *and* run a
+single terminal `bwd`/`dataset` stage -- no inherited buffer, no replay branch.
+Both were chosen to keep the T axis free of sample-quality contamination, and
+they happened to also be the only configuration immune to this. An accident, not
+a design.
+
+**Fixed** in `configs/a100_stab_aug16/make.py`: any arm whose T differs from the
+archive's takes weights only and runs one terminal `equilibration` stage from
+step 0, so its replay buffer fills at the run's own T. Asserted at generation.
+The MLIP flag arms were moved to **T=10** instead -- what they measure (one
+energy call split into graph/forward or neighbours/build) is a per-call property,
+so holding T at the archive's value keeps their full-state resume legal and
+spends their 400 steps on measurement rather than on refilling buffers.
+
+**The general shape, which is the transferable part:** a warm start restores more
+than weights, and some of that state is only valid for the geometry it was
+written under. `assert_problem_match` guards the problem identity; nothing guards
+the *trajectory* shape. T is the one such knob currently in play, but any future
+config key that changes a stored tensor's shape has the same hazard and no gate.
 
 ---
 

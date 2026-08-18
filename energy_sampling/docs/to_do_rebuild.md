@@ -1,5 +1,10 @@
 # To-do: rebuild
 
+> **Status: LEGACY DESIGN AND PLAN.** This file preserves prior reasoning and
+> sequencing; it is not the current work queue or project policy. Follow root
+> `AGENTS.md` for priorities and [`EPISTEMIC_PROTOCOL.md`](EPISTEMIC_PROTOCOL.md)
+> for the authority of claims cited here.
+
 Unconditional route. Started 2026-08-05; batch-design part merged in 2026-08-06.
 **Decisions ratified 2026-08-06** — see [`decisions.md`](decisions.md) Part 3 for
 the ruling set and Part 1 for what is still open.

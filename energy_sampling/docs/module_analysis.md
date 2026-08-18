@@ -1,5 +1,10 @@
 # module: analysis
 
+> **Status: MODULE SNAPSHOT.** Use this document for explanation and navigation,
+> not as proof of current behavior. Verify material claims against the current
+> implementation and focused tests. See
+> [`EPISTEMIC_PROTOCOL.md`](EPISTEMIC_PROTOCOL.md).
+
 The run-reading toolkit. `docs/reading_runs.md` is its requirements document;
 this file records what exists.
 

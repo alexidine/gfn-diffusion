@@ -10,7 +10,7 @@ anomaly_detection: false  # dramatic slowdown when True
 ################################################################
 continue_from_checkpoint: false  # inert while checkpoint_name is set (train.py init_gfn takes that branch first); true resolves to this run identity's own _running.pt
 mlip_path: null #'D:\crystal_datasets\esen_s.pt'
-checkpoints_dir: 'C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints'
+checkpoints_dir: 'D:\crystal_datasets\gfn_checkpoints'
 # T=10 train_prior exit, step 6680, post-periodic-fix. A copy of this run identity's own
 # _phase1_exit.pt under a prefix no run writes, so train_prior's on_exit snapshot can't
 # overwrite the warm-start source. Its _phase1_exit_buffers.pt sidecar is copied alongside

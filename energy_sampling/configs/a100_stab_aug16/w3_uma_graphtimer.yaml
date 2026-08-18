@@ -121,9 +121,9 @@ batch_knee_recheck_steps: 0
 oom_batch_shrink_factor: 0.5
 oom_cooldown_steps: 200
 batch_oom_ceiling_retest_steps: 1000
-eval_T: 60
+eval_T: 10
 integrator:
-  T: 60
+  T: 10
 fwd_loss_coeffs:
   tb: 0.0
   z_level: 0.0

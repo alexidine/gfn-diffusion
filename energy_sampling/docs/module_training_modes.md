@@ -1,5 +1,10 @@
 # Module: training modes (`train.py` step dispatch)
 
+> **Status: MODULE SNAPSHOT.** The verification dates below are historical.
+> Use this document for explanation and navigation; verify material claims
+> against current code, canonical config, and focused tests. See
+> [`EPISTEMIC_PROTOCOL.md`](EPISTEMIC_PROTOCOL.md).
+
 Pass 1 (audit + rationalize). Verified against the working tree, 2026-08-03.
 User pass 2026-08-06 — rulings recorded inline. **Revised 2026-08-08**: the replay
 draw is now regime-dependent (§4), plus M7 (the mis-wired prioritised draw) and M8

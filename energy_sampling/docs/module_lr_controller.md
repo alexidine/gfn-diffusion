@@ -1,5 +1,10 @@
 # Module: LR controller (`controller.py`)
 
+> **Status: MODULE SNAPSHOT.** The verification dates below are historical.
+> Use this document for explanation and navigation; verify material claims
+> against current code, canonical config, and focused tests. See
+> [`EPISTEMIC_PROTOCOL.md`](EPISTEMIC_PROTOCOL.md).
+
 Pass 1 (audit + rationalize) 2026-08-03. **Rewritten 2026-08-08 for v7** — the
 middle layer and the decay leg were deleted and the α\* servo was built, so most
 of what pass 1 documented no longer exists. Unconditional route only. Empirical

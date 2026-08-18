@@ -1,8 +1,9 @@
 """
 The unified stage interface: one declarative, config-level description of the
-training protocol, replacing the tangled phase (1/2/3) + forward-first (A/B)
-frameworks (phases.PhaseController, controller.ModeBalanceController,
-controller.ForwardFirstController) with a single engine.
+training protocol. It replaced three separate controllers -- a phase machine
+(1/2/3), a forward-first A/B switcher, and a mode-balance nudger -- whose
+interactions were the thing nobody could predict. All three are deleted; this
+engine is the only thing that moves a run between regimes.
 
 A protocol is an ordered list of STAGES (config: protocol.stages). Each stage
 declares:
@@ -43,14 +44,15 @@ declares:
 
 Balance rules (kind: lexicographic) walk in order; the FIRST violated rule's
 `boost` (a mode name, or a {mode: weight} mix -- same form as default_boost)
-gets the frac nudge this tick (the same EMA-toward-target nudge
-ModeBalanceController and ForwardFirstController both used); `default_boost`
+gets the frac nudge this tick -- an EMA step of `controller.beta` toward the
+boosted mix, so a rule that stays violated compounds while a rule that flickers
+averages out; `default_boost`
 takes it when all rules are clean, and a clean streak of
 controller.anneal_patience ticks tightens every annealed rule's threshold.
 A rule is either absolute (`above: X`, annealable) or relative to its own
 running best (`relative: best, margin: M` -- "is this metric DEGRADING",
 never "is it below an absolute bar"; the calibration floor legitimately
-rises as coverage grows, so absolute bars deadlock -- see b9ze0p5c).
+rises as coverage grows, so absolute bars deadlock).
 kind: proportional instead splits two modes' combined mass proportionally to
 a pair of lagging-spread metrics (the old phase-2 balancer, generalized).
 kind: constraint treats the same two modes ASYMMETRICALLY -- one side's metric
@@ -84,10 +86,11 @@ active violation.
 Frac floors are EXPLICIT per stage: min_fracs {mode: floor} (fallback
 controller.min_mode_frac) and an optional per-stage deactivate_threshold. A
 floor at or above the deactivate threshold means that branch is always
-computed; below it, the mode can switch off entirely (s706frkh: bwd sat
-below the global deactivate threshold for ~1700 steps of terminal --
-zero backward gradients -- because the floor/deactivate relationship was
-implicit; each stage now states which modes may go dark). Mode dormancy for
+computed; below it, the mode can switch off entirely. THE RULE EXISTS
+BECAUSE THAT WENT UNNOTICED ONCE: a run sat with bwd below the global
+deactivate threshold for ~1700 steps of its terminal stage -- zero backward
+gradients, nothing saying so -- because the floor/deactivate relationship was
+implicit. Each stage now states which modes may go dark. Mode dormancy for
 force-refresh purposes stays DERIVED: a mode no rule (and no default_boost)
 ever boosts is dormant -- the fused step skips even its force-refresh
 rollout (the old bwd_dormant, generalized).
@@ -381,7 +384,8 @@ class Stage:
                     f"0 < lo <= hi <= {pair_mass:.4f} (the split pair's total mass)")
             # a floor UNDER the deactivate threshold means the branch can
             # switch off entirely while the controller still believes it is
-            # steering that mode -- the s706frkh silent-dark-branch failure
+            # steering that mode -- the silent-dark-branch failure this
+            # rule exists to make unrepresentable
             if self.deactivate_threshold is not None and lo < self.deactivate_threshold:
                 raise ValueError(
                     f"stage '{self.name}': bounds.{mode} lower bound {lo} is below the "
@@ -1570,8 +1574,7 @@ class StageProtocol:
         return v
 
     def _lookahead(self, state, value):
-        """Log-space trend projection (verbatim port from
-        ModeBalanceController._log_ema_lookahead): the metrics are nonnegative
+        """Log-space trend projection: the metrics are nonnegative
         nats on a log scale, so the trend is multiplicative and can never
         project below zero; capped at e^±3 because beyond ~20x the
         extrapolation is guessing."""
@@ -1907,8 +1910,8 @@ class StageProtocol:
         this loop can enter.
 
         WHY LOGS. The two metrics are positive and their observed oscillation
-        has constant RELATIVE amplitude (~2x peak-to-trough on ty4xdlzo while
-        the level falls 10x), i.e. the noise is multiplicative. In logs that
+        has constant RELATIVE amplitude -- measured at ~2x peak-to-trough while the
+        level itself fell 10x -- i.e. the noise is multiplicative. In logs that
         cycle is a symmetric additive perturbation the integrator averages to
         zero; in linear units the same cycle biases the mean.
 

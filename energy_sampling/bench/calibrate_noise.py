@@ -92,6 +92,12 @@ import statistics as st
 import sys
 
 CONFIG = 'configs/elj_nehzor_sg14_t10_r2.yaml'
+#: WHERE THE NAMED CHECKPOINTS LIVE. These regime constants used to start
+#: 'checkpoints/...', a CWD-relative prefix that only ever resolved because this
+#: is always launched from `energy_sampling/`. The directory now sits outside
+#: the repo -- see `checkpoints_dir` in CONFIG, which is the authority; this
+#: constant has to agree with it.
+CKPT_DIR = 'D:/crystal_datasets/gfn_checkpoints'
 # THE FALLBACK DEFAULT for a bare `run()`. `__main__` never uses it -- it drives
 # the four REGIMES below, because one checkpoint answers only about its own
 # operating point.
@@ -107,7 +113,7 @@ CONFIG = 'configs/elj_nehzor_sg14_t10_r2.yaml'
 # dead flat at 37.9 for the whole window", and 37.9 is the POST-CLIP PIN (37.88,
 # see the clip spy in `run`), which reads flat at every checkpoint whether or not
 # the model is converged. Only the cos half of that argument survives.
-CKPT = ('checkpoints/d33elj_elj_nehzor_sg14_t10_r2_elj-nehzor_sg14_zp1_'
+CKPT = (f'{CKPT_DIR}/d33elj_elj_nehzor_sg14_t10_r2_elj-nehzor_sg14_zp1_'
         'elj_prior_dataset-T2.5-990198_running.pt')
 STEPS = 400
 MEM_FRACTION = 0.45
@@ -135,9 +141,9 @@ FRESH_MAX_STEP = 100
 #: `checkpoint_name`, which is the same file `mle_converged` names explicitly,
 #: so the two regimes measured one checkpoint. `_assert_regime` now fails the
 #: run rather than reporting that a second time.
-CK = ('checkpoints/d33elj_elj_nehzor_sg14_t10_r2_elj-nehzor_sg14_zp1_'
+CK = (f'{CKPT_DIR}/d33elj_elj_nehzor_sg14_t10_r2_elj-nehzor_sg14_zp1_'
       'elj_prior_dataset-T2.5-990198_')
-CK_OLD = ('checkpoints/d33elj_elj_nehzor_sg14_t10_elj-nehzor_sg14_zp1_'
+CK_OLD = (f'{CKPT_DIR}/d33elj_elj_nehzor_sg14_t10_elj-nehzor_sg14_zp1_'
           'elj_prior_dataset-T2.5-990198_')
 #: A REGIME MUST NAME AN IMMUTABLE CHECKPOINT. `eq_descent` used to point at
 #: `_running.pt`, which every run of this config overwrites -- so the regime

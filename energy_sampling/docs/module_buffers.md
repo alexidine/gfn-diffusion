@@ -1,5 +1,10 @@
 # Module: buffers (`buffer.py` + management in `train.py`)
 
+> **Status: MODULE SNAPSHOT.** The verification dates below are historical.
+> Use this document for explanation and navigation; verify material claims
+> against current code, canonical config, and focused tests. See
+> [`EPISTEMIC_PROTOCOL.md`](EPISTEMIC_PROTOCOL.md).
+
 Pass 1 (audit + rationalize). Verified against the working tree, 2026-08-03;
 revised 2026-08-08 for the prioritised-replay package (`to_do_rebuild.md`
 §B5/§B7b/§B7c) and the memorisation sensor (§B7d), which shipped 2026-08-07;

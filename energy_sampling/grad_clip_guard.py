@@ -35,9 +35,9 @@ exists:
     what this picture predicts and what "clipping prevents blow-ups" does not.
 
 WHY NOT AN EMA OF THE NORM -- the failure is already in this repo's record.
-s706frkh: the floored median fired on a clip-neutralised grad of 745, then the
-incident's own 1e4 norms lifted the median and it went blind exactly when the
-real excursion began (`docs/to_do_rebuild.md:753-755`). ANY estimator whose
+A floored median once fired on a clip-neutralised grad of 745, and then the
+incident's own 1e4 norms lifted that median so it went blind exactly when the
+real excursion began. ANY estimator whose
 update is driven by the observed MAGNITUDE is contaminated by the excursion it
 exists to catch. A mean is doubly wrong: gradient-norm distributions are
 right-skewed, so an EMA mean is dominated by the tail it is meant to exclude.

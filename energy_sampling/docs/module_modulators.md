@@ -1,5 +1,10 @@
 # Module: modulators — batch size + buffer servo
 
+> **Status: MODULE SNAPSHOT.** The verification dates below are historical.
+> Use this document for explanation and navigation; verify material claims
+> against current code, canonical config, and focused tests. See
+> [`EPISTEMIC_PROTOCOL.md`](EPISTEMIC_PROTOCOL.md).
+
 Pass 1 (audit + rationalize). Verified against the working tree, 2026-08-03;
 **buffer-servo sections revised 2026-08-08** — the servo acquired a second,
 *derived* sensor on 2026-08-07 (`to_do_rebuild.md` §B7d) and was configured for
