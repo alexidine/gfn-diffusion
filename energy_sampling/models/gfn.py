@@ -782,6 +782,15 @@ class GFN(nn.Module):  # todo add seeding
         `zfreeze`, which cut the same path via freeze_z). Do not read this as
         the fix for var_conditioning instability.
         """
+        # UNCONDITIONAL ROUTE: there is no embedding, and flow_model is a
+        # LearnableScalar whose forward ignores its arguments. The pre-0fb2117
+        # spelling passed `None` straight in and that was harmless; routing it
+        # through .detach() made it an AttributeError on every forward rollout
+        # of every unconditional run. The detach invariant above is about
+        # containing a Z-side gradient to flow_model's own parameters, and a
+        # constant scalar already satisfies it -- there is nothing to detach.
+        if condition_embedding is None:
+            return self.flow_model().flatten()
         return self.flow_model(condition_embedding.detach()).flatten()
 
     def _fwd_step(self, current_state, dts, ts, condition_embedding, eps, eps_r,
