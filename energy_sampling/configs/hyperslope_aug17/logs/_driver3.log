@@ -1,0 +1,5 @@
+hyperslope_aug17: 1 arms -> zfreeze
+start 17:09:41
+=== zfreeze  17:09:41  -> /c/Users/mikem/Projects/mxt_gfn/gfn_diffusion/energy_sampling/configs/hyperslope_aug17/logs/zfreeze.log
+    exit=1  50 non-finite steps  Traceback
+done 17:16:38

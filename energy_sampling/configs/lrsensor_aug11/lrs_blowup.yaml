@@ -24,6 +24,7 @@ adaptive_lr:
     period: 500
   seed_lr: 0.001
   warmup_steps: 200
+  envelope_freeze: true
 anomaly_detection: false
 archive_buffers: true
 archive_period: 5000
@@ -102,17 +103,15 @@ bwd_loss_coeffs:
   vg_by_condition: 1.0
   vg_lb: 0
   vg_lme: 0
+  tb_z_source: persistent
 checkpoint_name: null
 checkpoints_dir: C:\Users\mikem\Projects\mxt_gfn\gfn_diffusion\energy_sampling\checkpoints
 compile_policy: auto
 condition_log_z:
-  bwd_tb_z_source: persistent
   discovery_half_life_steps: 200.0
-  fwd_tb_z_source: persistent
   half_life_visits: 28.0
   max_batch_weight: 200.0
   min_visits: 20
-  replay_tb_z_source: persistent
   trim_frac: 0.01
   weighted_condition_sampling: true
   weighted_condition_sampling_clip_quantile: 0.99
@@ -187,6 +186,7 @@ fwd_loss_coeffs:
   vg_lb: 0.0
   vg_lme: 0
   z_level: 0.0
+  tb_z_source: persistent
 gpu_util_policy_window_s: 7200
 gpu_util_sample_period_s: 60
 gpu_util_window_s: 900
@@ -243,7 +243,7 @@ oom_cooldown_steps: 200
 override_learning_rates: false
 prior_model_name: null
 prior_path: D:\crystal_datasets\conditional\priors\toy_big_unif_prior.pt
-project_state_version: 6
+project_state_version: 7
 protocol: migrated
 protocols:
   migrated:
@@ -350,6 +350,7 @@ replay_loss_coeffs:
   traj_grads: 0.0
   vg_lb: 0
   vg_lme: 0
+  tb_z_source: persistent
 run_name: lrs_blowup
 seed: 12345
 sg_conditioning: false
@@ -365,7 +366,6 @@ vector_conditioning: true
 vector_conditioning_dim: 3
 weight_decay: 0.0001
 z_calibration:
-  enabled: false
   freshness_half_life_steps: 300.0
   gain: 1.0
   grace: 0.8

@@ -10,6 +10,33 @@ from torch_geometric.loader import DataLoader
 from mxtaltools.dataset_utils.utils import collate_data_list
 from utils import compute_sample_overlap, iter_forever, stdz
 
+#: The ConditionLogZTracker forgetting rate, in OWN VISITS -- ONE definition,
+#: read by the constructor, by the checkpoint fallback in from_state_dict, and by
+#: train.py::init_condition_log_z. It used to be three separate `7.0` literals,
+#: which is a way for a fresh run and a RESUMED run to silently disagree about
+#: the decay of a quantity neither of them logs.
+#:
+#: WHY 200 AND NOT 7. 7 is the value this project shipped, and it is reasoned for
+#: a ONE-CONDITION run, where a visit is a step. Across a large library a
+#: condition is revisited sparsely, and -- measured 2026-08-17, battery
+#: hyperslope_aug17, QM9 conditional at a pinned 2e-4 -- 7 detonates
+#: var_conditioning at step 1560 while 28 runs 2000 steps clean, a single-key
+#: difference. This has, in the user's words, "blown up in our face many times".
+#:
+#: A VISIT IS ONE update() CALL, NOT ONE STEP. update() is reached from the fwd,
+#: bwd and replay sites, and a FUSED stage runs its branches together, so a
+#: two-branch stage burns two visits per train step. Divide by the number of live
+#: branches to get the half-life in steps: 200 visits is ~100 steps in
+#: var_conditioning, which is short against a stage of many thousands.
+#:
+#: 200 rather than the measured-sufficient 28 because the two failure directions
+#: are not symmetric: too short detonates the run, too long merely lags a moving
+#: log Z, which is visible and recoverable. The limit is well defined -- at
+#: half_life -> inf the decay is exactly 1.0 and the tracker becomes a plain
+#: evidence-weighted cumulative mean, with no division by zero and no code path
+#: that assumes finiteness -- so there is headroom above this, not a cliff.
+DEFAULT_HALF_LIFE_VISITS = 200.0
+
 # Space-group lookup tables (indexed 0..230) that data_classes builds lazily the
 # first time a batch runs a latent transform. They are deterministic globals, not
 # per-graph data, but they get attached to whichever batch happens to trigger the
@@ -1182,7 +1209,8 @@ class ConditionLogZTracker:
     docstring.
     """
 
-    def __init__(self, library_size: int, min_visits: int = 20, half_life_visits: float = 7.0,
+    def __init__(self, library_size: int, min_visits: int = 20,
+                 half_life_visits: float = DEFAULT_HALF_LIFE_VISITS,
                  trim_frac: float = 0.1, max_batch_weight: float = 200.0,
                  discovery_half_life_steps: float = 200.0, clip_beta: float = 10.0):
         self.library_size = library_size
@@ -2230,7 +2258,7 @@ class ConditionLogZTracker:
         # a step-elapsed clock rather than an own-visit one) -- no exact
         # conversion between the two decay bases, so just fall back to the
         # default rather than reverse-engineer a number from the old semantics.
-        obj.half_life_visits = state.get("half_life_visits", 7.0)
+        obj.half_life_visits = state.get("half_life_visits", DEFAULT_HALF_LIFE_VISITS)
         obj.trim_frac = state.get("trim_frac", 0.1)
         obj.max_batch_weight = state.get("max_batch_weight", 200.0)
         # restored from the checkpoint rather than re-read from the live config

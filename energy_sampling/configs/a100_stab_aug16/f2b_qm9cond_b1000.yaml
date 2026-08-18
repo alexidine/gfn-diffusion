@@ -1,4 +1,4 @@
-project_state_version: 6
+project_state_version: 7
 run_name: f2b_qm9cond_b1000
 tag: a100_stab_aug16
 seed: 12345
@@ -22,11 +22,13 @@ lr_back: auto
 lr_replay: auto
 lr_fused: auto
 lr_flow: 0.1
-min_lr: 1.0e-06
+min_lr: 1.0e-08
 lr_warmup_ratio: 10
 adaptive_lr:
   control_flow_lr: false
   warmup_steps: 1000
+  warmup_freeze_cos_window: 25
+  envelope_freeze: true
   seed_lr: 0.000125
   bounds:
   - 0.01
@@ -186,7 +188,7 @@ replay_loss_coeffs:
   beta: 10.0
 condition_log_z:
   min_visits: 20
-  half_life_visits: 28.0
+  half_life_visits: 200.0
   trim_frac: 0.01
   max_batch_weight: 200.0
   discovery_half_life_steps: 200.0
@@ -340,7 +342,7 @@ protocols:
       lr_sensor:
         kind: hyper
         beta: 0.05
-        cos_target: 0.03
+        cos_target: 0.0
       flags:
         update_log_z: true
         buffers_active: true

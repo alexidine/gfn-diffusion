@@ -25,7 +25,7 @@ from tqdm import trange
 
 from energies.molecular_crystal import MolecularCrystal
 from energy_sampling.buffer import CrystalBuffer, AnchorBuffer, ConditionLogZTracker, _per_condition_min, \
-    _per_condition_max, strip_lazy_sg_caches
+    _per_condition_max, strip_lazy_sg_caches, DEFAULT_HALF_LIFE_VISITS
 from energy_sampling.checkpointing import Checkpointer, MODELLER_STATE_DEFAULTS
 from energy_sampling.controller import LRController
 from energy_sampling.grad_clip_guard import GradClipGuard
@@ -1139,7 +1139,10 @@ class Modeller:
 
         cfg = getattr(self.args, 'condition_log_z', None)
         min_visits = getattr(cfg, 'min_visits', 20) if cfg is not None else 20
-        half_life_visits = getattr(cfg, 'half_life_visits', 7.0) if cfg is not None else 7.0
+        # ONE definition of the default, in buffer.py -- a second literal here is
+        # how a fresh run and a resumed run come to disagree about the decay.
+        half_life_visits = (getattr(cfg, 'half_life_visits', DEFAULT_HALF_LIFE_VISITS)
+                            if cfg is not None else DEFAULT_HALF_LIFE_VISITS)
         trim_frac = getattr(cfg, 'trim_frac', 0.1) if cfg is not None else 0.1
         max_batch_weight = getattr(cfg, 'max_batch_weight', 200.0) if cfg is not None else 200.0
         discovery_half_life_steps = getattr(cfg, 'discovery_half_life_steps', 200.0) if cfg is not None else 200.0
@@ -3306,8 +3309,16 @@ Two things deliberately NOT done here, both recorded in
         return torch.cat([p.detach().reshape(-1) for p in self._hyper_params()])
 
     @torch.no_grad()
-    def _hyper_apply(self, cfg):
-        """cos(current gradient, previous displacement) -> the controller."""
+    def _hyper_apply(self, cfg, clip_ratio=None):
+        """cos(current gradient, previous displacement) -> the controller.
+
+        `clip_ratio` is pre-clip grad norm / the guard's bar for this branch,
+        passed in rather than read off grad_clip_guard because that object's
+        counters are DRAINED at every report and reading them here would race
+        the reporter. The controller uses it as a validity gate on cos: once the
+        clip binds on essentially every step the update magnitude is set by the
+        LR alone and cos stops being a curvature statistic -- see
+        LRController._clip_saturated."""
         gs = [p.grad.reshape(-1) for p in self._hyper_params() if p.grad is not None]
         if not gs:
             return
@@ -3323,7 +3334,8 @@ Two things deliberately NOT done here, both recorded in
             return
         cos = float(torch.dot(g, d) / (ng * nd))
         self.lr_controller.on_hypergradient(cos, cfg['beta'], cfg.get('beta_down'),
-                                            cfg.get('cos_target', 0.0))
+                                            cfg.get('cos_target', 0.0),
+                                            clip_ratio=clip_ratio)
 
     def step_loss(self, step_type, loss, do_step: bool = True):
         loss.backward()
@@ -3408,7 +3420,20 @@ Two things deliberately NOT done here, both recorded in
             _hyp = None
         _theta_before = self._hyper_flat() if _hyp else None
         if _hyp is not None and getattr(self, '_hyper_prev_step', None) is not None:
-            self._hyper_apply(_hyp)
+            # pre-clip norm against the bar that was actually applied above: >= 1
+            # means the clip fired on this step. The controller cares about the
+            # sustained rate, not this one reading.
+            #
+            # WITHHELD WHILE THE GUARD IS WARMING. During a branch's first
+            # `grad_clip_guard.warmup_steps` observations the bar is the STATIC
+            # fallback, fitted to nothing in particular, so a high fire rate is
+            # about the bar rather than the rate -- and with refresh_on_stage the
+            # guard re-warms at every stage transition. None makes the
+            # controller's gate inert rather than feeding it evidence that means
+            # something else (see GradClipGuard.is_calibrated).
+            _ratio = (float(pre_clip) / float(bar)
+                      if bar and self.grad_guard.is_calibrated(step_type) else None)
+            self._hyper_apply(_hyp, clip_ratio=_ratio)
 
         self.optimizers[step_type].step()
 

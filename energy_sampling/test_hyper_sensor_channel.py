@@ -62,7 +62,7 @@ def _controller(warmup_steps=0):
     adaptive = _Bag(warmup_steps=warmup_steps, seed_lr=1.25e-4,
                     bounds=(0.01, 2000.0), divergence_loss_abs=1.0e9,
                     divergence_grad_abs=1.0e9, divergence_cut=0.5,
-                    envelope_freeze_drop=None, restart_after=None,
+                    envelope_freeze=True, restart_after=None,
                     control_flow_lr=False)
     args = _Bag(adaptive_lr=adaptive, lr_warmup_ratio=10, min_lr=1.0e-6,
                 lr_policy=1.25e-4, lr_back=1.25e-4, lr_replay=1.25e-4,
@@ -163,14 +163,24 @@ def test_cos_is_the_period_mean_not_the_last_firing():
 
 def test_applied_is_the_total_multiplier_over_the_period():
     """Accumulated in LOG space, because the actuator is multiplicative: a period
-    that halved then doubled has moved by 1.0, not by 2.5."""
+    that halved then doubled has moved by 1.0, not by 2.5.
+
+    THE EXPECTED VALUE CARRIES THE ASYMMETRIC GAIN, and must: since 2026-08-17 a
+    negative error moves the peak with `beta_down`, which defaults to
+    hyper_down_gain (2.0) times beta. Writing this as exp(BETA * sum(cosines))
+    would be asserting the old symmetric rule, and it is exactly the assertion
+    that failed when the asymmetry landed.
+    """
     modeller, ctrl = _controller()
     cosines = (0.2, -0.1, 0.3, 0.0, 0.15)
     _fire(modeller, ctrl, *cosines)
     report = _period(modeller, ctrl)
 
-    assert report['lr_ctrl/hyper_applied'] == pytest.approx(
-        math.exp(BETA * sum(cosines)))
+    down_gain = 2.0    # controller default for hyper_down_gain
+    expected_log = sum((BETA if c > 0 else BETA * down_gain) * c for c in cosines)
+    assert report['lr_ctrl/hyper_applied'] == pytest.approx(math.exp(expected_log))
+    assert expected_log != pytest.approx(BETA * sum(cosines)), \
+        'fixture is degenerate: it cannot tell the asymmetric rule from the old one'
 
 
 def test_applied_tracks_peak_scale_over_the_period():

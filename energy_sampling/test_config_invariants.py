@@ -615,10 +615,35 @@ def test_absent_tb_z_source_names_the_pre_migration_home_when_carried(canonical)
     assert 'condition_log_z.fwd_tb_z_source' in str(vs[0]), str(vs[0])
 
 
-def test_absent_half_life_fires(canonical):
-    """Unset -> ConditionLogZTracker defaults to 7.0 (buffer.py:1185)."""
+def test_absent_half_life_is_now_safe(canonical):
+    """INVERTED 2026-08-17, and the inversion is the point.
+
+    This used to assert the rule FIRES on an absent key, because the code default
+    was 7.0 -- the unconditional value -- so omitting the key silently selected
+    the setting that detonates var_conditioning. `buffer.DEFAULT_HALF_LIFE_VISITS`
+    is now 200.0, so an absent key resolves to a safe value and a rule that still
+    complained would be reporting a hazard that no longer exists.
+
+    THE SECOND ASSERTION IS WHY THIS TEST STILL HAS TEETH. Checking only that the
+    rule is quiet would pass just as happily if someone put the default back to
+    7.0 -- quiet rule, quiet test, live hazard. So the test reads the ACTUAL
+    default and requires it to be safe by the rule's own threshold.
+    """
+    from buffer import DEFAULT_HALF_LIFE_VISITS
+
     cfg = _conditional(canonical)
     cfg['condition_log_z'].pop('half_life_visits', None)
+    assert _fired(cfg, 'conditional_z_settings_are_conditional') == []
+    assert DEFAULT_HALF_LIFE_VISITS >= 28.0, (
+        f'the code default is {DEFAULT_HALF_LIFE_VISITS}, below the 28 this rule '
+        f'requires of an explicit value -- so an omitted key now selects a setting '
+        f'the rule would reject if it were written down')
+
+
+def test_explicit_short_half_life_still_fires(canonical):
+    """The hazard that remains reachable: an explicitly written short value."""
+    cfg = _conditional(canonical)
+    cfg['condition_log_z']['half_life_visits'] = 7.0
     vs = _fired(cfg, 'conditional_z_settings_are_conditional')
     assert len(vs) == 1 and vs[0].severity == BASELINE, [str(v) for v in vs]
 

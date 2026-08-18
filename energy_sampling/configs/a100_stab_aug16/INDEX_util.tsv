@@ -1,0 +1,8 @@
+name	kind	benchmark_id	batch	epochs
+u_scale1000_r0	set	-	1000	22140
+u_scale1000_r1	set	-	1000	22140
+u_scale1000_r2	set	-	1000	22140
+u_scale1000_probe10s	set	-	1000	22140
+u_scale7410_r0	set	-	7410	8700
+u_scale7410_r1	set	-	7410	8700
+u_scale7410_r2	set	-	7410	8700

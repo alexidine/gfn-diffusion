@@ -1,0 +1,6 @@
+name	kind	benchmark_id	batch	epochs
+cond_r0	set	-	1000	1500
+cond_r1	set	-	1000	1500
+cond_r2	set	-	1000	1500
+cond_r3	set	-	1000	1500
+cond_r4	set	-	1000	1500

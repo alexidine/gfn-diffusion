@@ -7,6 +7,96 @@ Newest first.
 
 ---
 
+## F-044 · A benchmark neutralisation died silently when its key became a stage flag, voiding ten floor launches · `PROCESS`
+
+*2026-08-17, `a100_stab_aug16` B1/B3.*
+
+Ten repeat launches were run to measure the first two noise floors in the
+registry. All ten ran with **z-calibration on** and their floors were recorded,
+then retracted the same day.
+
+**Mechanism.** `benchmarks/registry.yaml`'s `defaults.overrides` disabled
+z-calibration through `z_calibration.enabled: false`. State 6 turned that switch
+into a **stage flag** (`flags: {z_calibration: true}`). The override kept setting
+a key nothing reads; the `equilibration` stage kept its flag. Measured in the
+window: **median 7–11 z-cal steps per policy step**, sensor 0.86–1.0 against its
+0.5 threshold, so it never early-outed. Section 2 of `benchmarks.md` is why that
+voids the result — the sidecar rollouts run inside the step-timing window while
+`_throughput['samples']` is charged only `attempted_batch`.
+
+**This is the second occurrence of the identical failure.** `registry.yaml`
+already carried a note that `ray_calibration.enabled` had been retired the same
+way, stating the general rule: *an override cannot reach a stage declaration,
+because stage lists merge wholesale.* The note was read and z-cal was not
+checked against it.
+
+**Two properties made it invisible.** The old key is **not retired**, so it is
+accepted and ignored rather than refused — a hard failure would have caught this
+at the first launch. And the generation-time assertion asserted the same dead
+key, so the check and the bug shared a blind spot.
+
+**Fixed:** the registry now **refuses** `z_calibration.enabled` instead of
+requiring it; `make.py::strip_z_calibration` neutralises the stage flag (the
+`strip_lr_sensors` pattern); the generator asserts the *flag's absence*.
+
+**The general rule, worth more than the incident:** when a switch moves from a
+global key to a stage declaration, every neutralisation of it moves from the
+override layer to the workload generator — and the old key must be made to FAIL,
+not merely stop working. A silently-accepted dead key turns a validated config
+into a false reassurance.
+
+---
+
+## F-043 · On MACE the neighbour list is the energy call, not the forward · `OBSERVED`
+
+*2026-08-17, `a100_stab_aug16_f4_acridine_mace`, A100, acridine sg14/zp1, T=10,
+batch 125 (cut from 250 by one OOM), 1200 steps, `equilibration`. ONE run, no
+floor yet — `mace-fused-uncond`'s repeats have not been scored.*
+
+The first MACE cost measurement on record anywhere; `benchmarks.md` §10 lists
+"MACE, entirely" as unmeasured. Per-report phase split:
+
+| key | value |
+|---|---|
+| `energy/mace_neighbours_s` | **12.35** |
+| `energy/mace_build_s` | 13.21 |
+| `energy/mace_nl_frac_of_build` | **0.935** |
+| `energy/mace_forward_s` | 6.83 |
+| `energy/mace_collate_s` | 1.49 |
+| `energy/mace_xfer_s` | 0.23 |
+| `energy/mace_host_frac` | **0.676** |
+| `energy/mace_forward_frac` | 0.314 |
+| `energy/mace_flag_batched_nl` | **0** |
+
+**Neighbour-list construction is 93.5% of the build and ~57% of the whole energy
+call. The forward is 31%.** Phase 5.0's standing expectation — "if the forward
+does dominate, look at `crystal_inference_settings`" — does not hold here, and
+5.1's warning that the neighbour list is "the item most likely to be dismissed
+on stale evidence" is vindicated.
+
+**This is an opportunity, not a wall, and the flag is why.**
+`mace_flag_batched_nl: 0` means the measured 12.35 s is the **fallback** path,
+not the optimised one, and `host_frac 0.676` puts it on the CPU side — where
+this project's wins have actually come from (the UMA AtomicData vectorisation
+took host time 614 → 92 ms at batch 512).
+
+**Three things this does NOT establish, and none should be assumed:**
+
+- **The size of the win.** `pbc_neighbours`' own docstring claims ~92x less work
+  for the radius-search path; that number is unverified and Phase 5.1 requires
+  it re-measured. It is the number the whole approach rests on.
+- **The end-to-end gain.** NL is ~57% of the *energy call*; the step-level payoff
+  is that times `energy/frac_of_step`, which was not captured on this run.
+  Amdahl bounds it and the bound is unknown.
+- **That UMA splits the same way.** UMA has no phase-split instrument at all
+  (§10, G6). `energy/mace_host_frac` exists precisely to stop this transferring.
+
+**Scope caution:** batch 125 after an OOM, and `traj_checkpoint: true`. The
+host/device balance may move with batch, and a single run supports no comparison
+— `mace-fused-uncond`'s five repeats are queued.
+
+---
+
 ## F-042 · The conditional route detonates on three inherited UNCONDITIONAL Z settings, not on MLE quality · `MECHANISM`
 
 *2026-08-17. `a100_stab_aug16` f2 (A100, batch 500) plus three local shakeout

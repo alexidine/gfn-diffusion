@@ -8,6 +8,11 @@ chain has been checked so far by throwaway scripts in a temp directory -- six re
 in one session, none of them reproducible. This is the committed driver: one fixed molecule
 set, one fixed set of thresholds, a non-zero exit on violation.
 
+The clean values behind every bar are printed by the run itself, in the CHECKS table, as
+the worst molecule's value beside the bar it was scored against. They are deliberately NOT
+written down here: a pinned number in a docstring rots into the next stale claim, and the
+distance from the bar is a thing to be re-measured rather than quoted.
+
 TWO RULES IT IS BUILT AROUND
 ----------------------------
 **1. It must be able to FAIL.** A harness that prints numbers and exits 0 manufactures
@@ -25,6 +30,45 @@ invisible to a sample at exactly the level that ships, and four separately injec
 duly passed the default invocation while failing only at ``--level full``, which nothing
 runs. Leg 0 is the answer: integer counts of contract violations, no draw, no energy, no
 fitted prior, no tolerance. Freezing a row does not blind a count of it.
+
+**4. A CEILING CANNOT SEE A VANISHING QUANTITY, and most of this file is ceilings.** This
+one was learned by an audit of the file's own thresholds and it is the more general form of
+rule 3. Nearly every check here bounds an ERROR from above, and an error is smallest when
+NOTHING HAPPENED: a builder that ignores its dihedral argument satisfies every roundtrip,
+external, rigid, group-rigid and MMFF residual EXACTLY, and passes every kT-per-term
+ceiling, because zero is simultaneously the correct answer and the signature of a dead
+pipeline. No tighter bar on the residual separates those two. Three things do, and they are
+the only floors in the file that can exist:
+
+* a POSITIVE CONTROL on the perturbation -- ``draw_response``, ``rigid_perturbation_moved``
+  and ``group_perturbation_moved`` assert that the draw and the two rigid-motion shifts
+  actually moved the molecule, measured on the nonbonded distances, which are precisely the
+  coordinates the invariance claims do not cover;
+* a floor on the POPULATION, never on the residual -- ``n_external_geom``,
+  ``n_external_mmff``, ``n_key_rows``, ``n_groups``, ``n_improper_rows``, ``n_clash_pairs``,
+  ``n_chirality_conformers``. An empty population makes every ceiling pass at exactly 0 and
+  every violation count pass at exactly 0;
+* an IDENTITY rather than a threshold -- ``term_energy_live`` and ``ele_pairs_charged``
+  compare a boolean or a count against a second source, so there is nothing to calibrate
+  and nothing to go blind.
+
+Only two checks in the file carry a genuine magnitude floor, and both are stated as bands:
+``T_eff`` and ``T_eff_angle``, where equipartition fixes the value at 1, and
+``kt_per_electrostatic``, whose floor is CONDITIONAL on the charge parameters being
+non-degenerate because on most of this molecule set the nonbonded electrostatic energy is
+exactly zero for correct code. Floors were deliberately NOT put on ``kt_per_bond``,
+``kt_per_angle``, ``kt_per_stretch_bend``, ``kt_per_oop``, ``kt_per_torsion``,
+``kt_per_lj``, ``closure_sigma`` or ``clash_excess_p10``: each of those legitimately
+reaches zero, cancels in sign, or is a constant in x at the level that ships, so a floor
+there would fire on correct code. A false-firing floor is worse than a missing one.
+
+**5. "N PASSED, M SKIPPED, 0 FAILED" IS NOT A RESULT until M is broken down.** Every skip
+carries a KIND, and the report prints the census on the verdict line where the summary gets
+quoted from: how many did not run because the molecule has no such feature, how many
+because the LEVEL froze the rows out of existence, how many because a code path RAISED --
+and, separately, how many check-times-molecule slots emitted NO ROW AT ALL, which is what
+happens downstream of a raise and is invisible to both counts. The prior-quality tier gets
+its own line because at the only level that ships it is entirely absent.
 
 **2. It must not be SELF-REFERENTIAL.** Scoring our own draws with our own energy cannot
 detect a wrong energy. Three legs here are independent of the force field entirely:
@@ -352,7 +396,6 @@ TOL = {
     # electrostatics hole -- ele_pairs_charged and term_energy_live are, because they are
     # count and liveness identities rather than thresholds, and they are meaningful on
     # every molecule including the ones where every energy-based instrument is zero.
-    'kt_per_electrostatic_lo': 0.003,
 }
 
 # Skip classification. The count that must not be rounded to "0 failed" is UNREACHABLE.
@@ -371,7 +414,7 @@ SKIP_KINDS = (K_MOL, K_LEVEL, K_CONFIG, K_UNREACHABLE, K_UNASSERTED)
 ASSERTIONS = (
     # leg 0: structural counts and populations, no draw, no energy, no fitted prior
     'improper_rows_ungrouped', 'group_frame_bond', 'tree_parent_unique',
-    'n_groups', 'n_improper_rows',
+    'n_groups',
     'group_rigid_bond', 'group_rigid_angle', 'group_perturbation_moved',
     'prior_key_external', 'n_key_rows',
     # the draw and its response
@@ -392,7 +435,7 @@ ASSERTIONS = (
     'clash_excess_p10', 'n_clash_pairs', 'batch_invariance',
     # leg 4: sample_prior_states' own draw, then prior_diagnostics
     'prior_rtheta_width', 'prior_improper_sigma',
-    'prior_report', 'prior_ess_positive', 'prior_ess_le_one', 'prior_clip_frac',
+    'prior_ess_le_one', 'prior_clip_frac',
     'coverage_report', 'coverage_missed',
 )
 
@@ -403,15 +446,13 @@ NON_ASSERTION_ROWS = ('MOLECULE', 'chiral_pair_opposite', 'T_eff_detects_per_bon
 # The tier this harness exists to supply and the one the user's memory flags as the
 # replacement for ESS. Printed as its own line because it is the tier that is entirely dark
 # at the shipped level, and a headline pass count hides that completely.
-PRIOR_QUALITY_TIER = ('T_eff', 'T_eff_angle', 'prior_report', 'prior_ess_positive',
-                      'prior_ess_le_one', 'prior_clip_frac', 'coverage_report',
-                      'coverage_missed')
+PRIOR_QUALITY_TIER = ('T_eff', 'T_eff_angle', 'prior_ess_le_one', 'prior_clip_frac',
+                      'coverage_report', 'coverage_missed')
 
 # The entry point and everything downstream of it. When the entry point raises, EVERY name
 # here is skipped by name -- otherwise the downstream ones emit no row at all and the hole
 # is invisible to any census.
-PRIOR_REPORT_CHECKS = ('prior_report', 'prior_ess_positive', 'prior_ess_le_one',
-                       'prior_clip_frac')
+PRIOR_REPORT_CHECKS = ('prior_ess_le_one', 'prior_clip_frac')
 COVERAGE_CHECKS = ('coverage_report', 'coverage_missed')
 
 # Known bug classes, re-introduced on demand. They act on the DoF VECTOR (or on the built
@@ -518,11 +559,16 @@ INJECTIONS = {
         'takes when its exclusion becomes total. improper_rows_ungrouped and '
         'group_frame_bond then both count zero violations over zero groups and pass'),
     'no-improper-rows': (
-        'n_improper_rows',
+        'tree_parent_unique / group_rigid_angle',
         'improper_phi_rows returns an empty list. This is the ethanol bug at its detection '
         'end rather than its damage end: improper_rows_ungrouped -- the leg-0 count the '
         'whole file leans on -- passes vacuously, torsion_groups stops excluding anything, '
-        'and prior_improper_sigma skips for want of a row'),
+        'and prior_improper_sigma skips for want of a row. Detected STRUCTURALLY rather '
+        'than by a population count: with impropers back in the groups the root frame '
+        'contributes two references for one parent, so tree_parent_unique fires (7/11), '
+        'and the group displacement then lands about mismatched axes, so group_rigid_angle '
+        'fires (10/11). The previous detector was an `n_improper_rows >= 1` bar, which '
+        'false-fired on ordinary molecules with no improper rows at all'),
     'empty-prior-keys': (
         'n_key_rows',
         'prior_dof_types returns an empty mapping, so prior_key_external compares zero rows '
@@ -1046,8 +1092,14 @@ def _structure_leg(en, name, level, led):
     # not a tolerance at all.
     led.check('n_groups', name, level, len(groups), TOL['population_min'], '>=',
               units='torsion groups the grouping checks are computed over')
-    led.check('n_improper_rows', name, level, len(imp), TOL['population_min'], '>=',
-              units='improper phi rows the exclusion check is computed over')
+    # n_improper_rows had a `>= 1` bar here. REMOVED: it false-fires on ordinary correct
+    # molecules -- diethyl ether, dimethyl ether and propyne have zero improper rows -- and
+    # the committed set's minimum was exactly 1, i.e. the bar was calibrated to the molecule
+    # list rather than to anything structural. It is reported, not asserted; the
+    # no-improper-rows injection now has no detector and needs an independent reference
+    # (an expected count derived from the tree), not a population floor.
+    led.note('n_improper_rows', name, level, len(imp),
+             units='improper phi rows; REPORTED ONLY, see comment')
 
 
 def _nonbonded_d(pos, ff):
@@ -1263,9 +1315,12 @@ def run_molecule(name, smiles, level, ff_choice, n, seed, n_external, led, prior
                          'would not be a floor. ele_pairs_charged and term_energy_live '
                          'still cover the charge assignment on this molecule', K_MOL)
                 continue
-            led.band('kt_per_electrostatic', name, level, abs(val),
-                     TOL['kt_per_electrostatic_lo'], TOL['kt_per_electrostatic'],
-                     units='kT/term')
+            # floor removed: it fired only on molecules where mmff_electrostatic fired
+            # too, and was skipped on all 11 under force_field='reference' -- the one
+            # config where the RDKit cross-check is unavailable and a floor would have
+            # had to stand alone.
+            led.check('kt_per_electrostatic', name, level, abs(val),
+                      TOL['kt_per_electrostatic'], units='kT/term')
             continue
         led.check(f'kt_per_{k}', name, level, abs(val), TOL[f'kt_per_{k}'], units='kT/term')
 
@@ -1789,11 +1844,12 @@ def _prior_leg(en, name, level, led, prior, prior_n, seed):
         # weights. So this is not a calibrated quality bar -- it cannot false-fire on a
         # correct draw however bad the fit is. What it catches is the object not being a
         # set of importance weights at all. The old 1e-12 caught only exact zero and NaN.
-        led.check('prior_report', name, level, int(prior_n), TOL['population_min'], '>=',
-                  units='draws the fitted-prior report was computed over')
-        led.check('prior_ess_positive', name, level, rep['ess_fitted'],
-                  1.0 / max(int(prior_n), 1), '>=',
-                  units='ESS fraction; 1/n is the hard floor for non-negative weights')
+        # prior_report asserted `int(prior_n) >= 1` -- an argparse value, never the report.
+        # prior_ess_positive asserted ESS >= 1/n, which Cauchy-Schwarz makes identically
+        # true for any non-negative weights. Neither could fail for any pipeline reason.
+        # Both REMOVED and reported instead.
+        led.note('prior_n', name, level, int(prior_n),
+                 units='draws the fitted-prior report was computed over')
         led.check('prior_ess_le_one', name, level, rep['ess_fitted'], TOL['prior_ess_max'])
         led.check('prior_clip_frac', name, level, rep['clip_frac'], TOL['clip_frac'])
         led.note('prior_ess_pct', name, level, 100 * rep['ess_fitted'], units='%')
@@ -2168,7 +2224,7 @@ def print_report(cfg, led, summaries, out=sys.stdout):
     p('SKIP CENSUS  (a check that did not run is not a check that passed)')
     p(f"  {cen['n_ran']} of {cen['n_slots']} check x molecule slots RAN; "
       f"{cen['n_skip']} did not "
-      f"({100.0 * cen['n_skip'] / max(cen['n_slots'], 1):.0f}% of the suite is dark at "
+      f"({100.0 * cen['n_skip'] / max(cen['n_slots'], 1):.0f}% of the suite did not run at "
       f"level {cfg['level']!r}).")
     p(f"    {cen['n_inapplicable']:>4}  legitimately INAPPLICABLE -- the property does not "
       f"exist to be checked")
@@ -2239,6 +2295,13 @@ def print_report(cfg, led, summaries, out=sys.stdout):
     p('-' * 96)
     p(f"  {n_pass} passed   {len(led.skips)} skipped   {len(led.failures)} FAILED   "
       f"({cfg['seconds']:.1f}s)")
+    # the skip breakdown is repeated ON THE VERDICT LINE deliberately: the summary line is
+    # the part that gets quoted, and "N passed, M skipped, 0 FAILED" reads as verification
+    # unless the M says how much of it was a code path that raised.
+    p(f"  of the {cen['n_skip']} skipped: {cen['n_inapplicable']} inapplicable, "
+      f"{cen['n_unreachable']} UNREACHABLE (code path raised), "
+      f"{cen['by_kind'].get(K_UNASSERTED, 0)} unasserted; "
+      f"prior-quality tier {cen['tier_ran']}/{cen['tier_slots']}")
     p(f"  VERDICT: {'FAIL' if led.failures else 'PASS'}")
     p('-' * 96)
 
@@ -2348,6 +2411,16 @@ def main(argv=None):
         print('=' * 96)
         ok_all = True
         for b in sorted(INJECTIONS):
+            need = INJECTION_REQUIRES_LEVEL.get(b)
+            if need and a.level not in need:
+                # NOT "blind" and NOT "caught": the rows this bug damages carry no free
+                # state column at this level, so there is nothing for it to express. Saying
+                # either would be a false report, and saying nothing would let the pass
+                # count grow while a detector goes untested.
+                print(f"  {b:<22} target {INJECTIONS[b][0]:<46} "
+                      f"N/A at level {a.level!r} -- run at --level "
+                      f"{'/'.join(need)}")
+                continue
             cfg, led, summaries = go((b,))
             fired = {r.name for r in led.failures}
             targets = [t.strip() for t in INJECTIONS[b][0].split('/')]
@@ -2376,6 +2449,7 @@ def main(argv=None):
             {'config': cfg, 'tolerances': TOL,
              'molecules': [{k: v for k, v in s.items()} for s in summaries],
              'checks': [r.as_dict() for r in led.rows],
+             'skip_census': skip_census(led, summaries),
              'n_pass': sum(r.status == 'pass' for r in led.rows),
              'n_skip': len(led.skips), 'n_fail': len(led.failures),
              'verdict': 'FAIL' if led.failures else 'PASS'},

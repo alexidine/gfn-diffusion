@@ -612,7 +612,31 @@ benchmarks:
       # The retracted values, for the record only -- do not compare against them:
       #   train_step_time 0.7838 (span 3.0%) | samples_per_sec 1284 (10.7%)
       #   energy/frac_of_step 0.3725 (5.8%)  | window steps 2100-2500, batch flat
-      measured: null
+      # RE-RUN clean 2026-08-17 with the stage flag stripped; z_cal/* absent on
+      # all five. The contaminated step time was 43% HIGH (0.784 -> 0.548).
+      measured:
+        date: '2026-08-17'
+        host: a100
+        repeats: 5
+        run_ids: [a100_stab_aug16_elj_r0, a100_stab_aug16_elj_r1, a100_stab_aug16_elj_r2,
+                  a100_stab_aug16_elj_r3, a100_stab_aug16_elj_r4]
+        window_steps: [2100, 2500]
+        per_metric:
+          train_step_time: 0.108
+          samples_per_sec: 0.118
+          energy/frac_of_step: 0.042
+        medians:
+          train_step_time: 0.5484
+          samples_per_sec: 1820.0
+          energy/frac_of_step: 0.2731
+        notes: >-
+          CROSS-NODE AND LIKELY BIMODAL. Four launches sit at 0.548-0.555 s and
+          one at 0.496; the span is set by that single fast launch rather than by
+          scatter around a centre. That is the shape a node difference makes, and
+          SLURM_NODELIST was captured per job but not yet joined. Treat 10.8% as
+          an UPPER bound that mixes machine spread with run-to-run noise -- the
+          within-node floor is probably far tighter, and benchmarks.md section 10's
+          node-confound question (request arm E) is what separates them.
     correctness:
       reference: tier_c_repeat_spread
       detail: >-
@@ -779,7 +803,31 @@ benchmarks:
       # Retracted values, for the record only -- do not compare against them:
       #   energy/ms_per_sample 2.294 (5.0%) | train_step_time 0.6075 (8.7%)
       #   samples_per_sec 123 (12.0%)       | energy/frac_of_step 0.465 (8.9%)
-      measured: null
+      # RE-RUN clean 2026-08-17, z_cal/* absent on all five.
+      measured:
+        date: '2026-08-17'
+        host: a100
+        repeats: 5
+        run_ids: [a100_stab_aug16_uma_r0, a100_stab_aug16_uma_r1, a100_stab_aug16_uma_r2,
+                  a100_stab_aug16_uma_r3, a100_stab_aug16_uma_r4]
+        window_steps: [1025, 1225]
+        per_metric:
+          energy/ms_per_sample: 0.131
+          train_step_time: 0.089
+          samples_per_sec: 0.060
+          energy/frac_of_step: 0.063
+        medians:
+          energy/ms_per_sample: 2.273
+          train_step_time: 0.5976
+          samples_per_sec: 169.0
+          energy/frac_of_step: 0.3731
+        notes: >-
+          Batch 100 with traj_checkpoint on and grad accumulation engaged (batch <
+          fused_grad_accum_min_samples 1000) -- the production shape BELOW the
+          crossover, not a batch-1000 operating point. Node-unresolved, as for
+          elj-fused-uncond. NB energy/ms_per_sample is the LOOSEST metric here
+          (13.1%) while samples_per_sec is the tightest (6.0%) -- the reverse of
+          the ELJ route, so pick the comparator per route rather than by habit.
     correctness:
       reference: control_comparison
       detail: >-
@@ -868,7 +916,34 @@ benchmarks:
       seed_policy: fixed
       run_statistic: median
       dispersion: relative_span
-      measured: null
+      measured:
+        date: '2026-08-17'
+        host: a100
+        repeats: 5
+        run_ids: [a100_stab_aug16_mace_r0, a100_stab_aug16_mace_r1, a100_stab_aug16_mace_r2,
+                  a100_stab_aug16_mace_r3, a100_stab_aug16_mace_r4]
+        window_steps: [1025, 1225]
+        per_metric:
+          energy/ms_per_sample: 0.069
+          train_step_time: 0.200
+          samples_per_sec: 0.160
+          energy/frac_of_step: 0.110
+        medians:
+          energy/ms_per_sample: 4.34
+          train_step_time: 0.8222
+          samples_per_sec: 121.9
+          energy/frac_of_step: 0.529
+        notes: >-
+          FIRST MACE COST NUMBERS ON RECORD (benchmarks.md section 10 listed the
+          route as entirely unmeasured). Loosest floors of the three routes, and
+          the step-time set is CLEANLY BIMODAL -- r1/r2/r3 at 0.817-0.822 s,
+          r0/r4 at 0.959-0.981 -- so the 20% span is two populations, not
+          scatter. Same signature as elj-fused-uncond, same suspect: node
+          assignment. energy/ms_per_sample is 3x tighter (6.9%), which is what
+          you expect when the energy call is stable and the surrounding step is
+          not. NB the neighbour-list fast path was NOT taken on any launch
+          (energy/mace_flag_batched_nl 0), so these are FALLBACK-path costs --
+          findings F-043.
     correctness:
       reference: control_comparison
       detail: >-

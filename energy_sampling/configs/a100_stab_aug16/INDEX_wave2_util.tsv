@@ -1,8 +1,8 @@
 name	kind	benchmark_id	batch	epochs
-u_scale1000_r0	util	a100-batch-scaling-elj	1000	16090
-u_scale1000_r1	util	a100-batch-scaling-elj	1000	16090
-u_scale1000_r2	util	a100-batch-scaling-elj	1000	16090
-u_scale1000_probe10s	probe	a100-batch-scaling-elj	1000	16090
-u_scale7410_r0	util	a100-batch-scaling-elj	7410	8900
-u_scale7410_r1	util	a100-batch-scaling-elj	7410	8900
-u_scale7410_r2	util	a100-batch-scaling-elj	7410	8900
+u_scale1000_r0	util	a100-batch-scaling-elj	1000	22140
+u_scale1000_r1	util	a100-batch-scaling-elj	1000	22140
+u_scale1000_r2	util	a100-batch-scaling-elj	1000	22140
+u_scale1000_probe10s	probe	a100-batch-scaling-elj	1000	22140
+u_scale7410_r0	util	a100-batch-scaling-elj	7410	8700
+u_scale7410_r1	util	a100-batch-scaling-elj	7410	8700
+u_scale7410_r2	util	a100-batch-scaling-elj	7410	8700

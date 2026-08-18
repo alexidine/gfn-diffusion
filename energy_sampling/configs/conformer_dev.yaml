@@ -50,7 +50,7 @@ lr_back: 7.8125e-05
 lr_replay: 7.8125e-05
 lr_fused: 3.90625e-05
 lr_flow: 1.0e-1
-min_lr: 1.0e-6
+min_lr: 1.0e-8               # PERMISSIVE ON PURPOSE: a floor is a numerical backstop, not a policy, and it must never be the thing choosing the rate. At 1.0e-6 it sat barely below the conditional VarGrad quality optimum (~2e-6 to 2e-5), so a controller asking to go lower was refused silently, and it would clamp the BOTTOM OF THE RAMP for any stage whose base is set low (5e-6 at lr_warmup_ratio 10 starts at 5e-7). lr_ctrl/lr_floored_groups reports when it binds
 lr_warmup_ratio: 100
 gradient_norm_clip: 1.0
 grad_clip_guard:               # adaptive clip bar, per step_type, tracking a quantile of that branch's pre-clip grad norms

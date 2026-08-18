@@ -1,11 +1,11 @@
-﻿# The config-schema state this file is written against. Every generated
+# The config-schema state this file is written against. Every generated
 # production config records the state it was spawned from, so an old config can
 # be migrated forward mechanically rather than reconstructed by hand:
 #     python -m config_state migrate <config.yaml>
 # The history and the migrations live together in config_state.py. This is a
 # migration identifier, NOT a release version, and it is a separate axis from the
 # checkpoint problem_def's schema_version (which versions the problem identity).
-project_state_version: 6
+project_state_version: 7
 
 run_name: 'qm9cond_costgt'
 tag: 'real'
@@ -57,6 +57,8 @@ adaptive_lr:
   # Restarted at every stage transition -- the optimizers were just rebuilt onto
   # a surface with different curvature.
   warmup_steps: 1000
+  # Boolean since state 7; replaced a per-sensor fall threshold.
+  envelope_freeze: true
   seed_lr: 1.25e-4           # what an `auto` lr_* key resolves to; the rate a run starts from
   bounds: [ 0.01, 2000.0 ]   # how far the sensors may move the rate from its seed, as a multiplier. Wide on purpose: it is a sanity rail, not a tuning range
 
@@ -342,7 +344,7 @@ replay_loss_coeffs:       # applied to trajectories pulled from the replay buffe
 # or a controller here -- it becomes load-bearing on the conditional route.
 condition_log_z:
   min_visits: 20  # a condition needs this many visits before tb_z_source: persistent / emp_z_persistent will use its estimate
-  half_life_visits: 7.0  # evidence half-life in OWN-VISITS, not steps -- so it means "a memory window of ~7 visits" regardless of library size or how sparsely a condition is revisited. On an unconditional run there is one condition, so 7 visits == 7 steps and ema_logw is essentially the last few batches
+  half_life_visits: 200.0  # evidence half-life in OWN-VISITS, not steps. A "visit" is one update() call, and a FUSED stage runs its branches together, so var_conditioning's two live branches burn two visits per train step -- 200 visits is ~100 steps here. The 7.0 this carried is the UNCONDITIONAL value (one condition, so 7 visits == 7 steps); on this route it detonated var_conditioning at step 1560 at a pinned 2e-4 while 28 ran 2000 steps clean, a single-key difference (hyperslope_aug17, 2026-08-17)
   trim_frac: 0.01  # per-condition-group trimmed mean for ema_logw. log w is heavy-tailed here (logw_std 8-46), and a 1% two-sided trim removes the handful of extreme draws that would otherwise set the mean
   max_batch_weight: 200.0  # ceiling on the evidence one update() may contribute, in samples. At batch 1000 with ESS ~0.4 a call would otherwise carry ~400; capping at 200 with a 7-visit half-life puts the steady-state effective_count near 200/(1-0.5^(1/7)) ~ 2100
   discovery_half_life_steps: 200.0  # half-life (TRAINING STEPS) of the minima-discovery rate EMAs. Pure monitoring
@@ -565,7 +567,7 @@ protocols:
       - name: var_conditioning
         train_mode: fused
         bwd_sampling_mode: prior
-        lr_sensor: { kind: hyper, beta: 0.05, cos_target: 0.1 }   # `ray` is incoherent here: no replay TB
+        lr_sensor: { kind: hyper, beta: 0.05, cos_target: 0.0 }   # `ray` is incoherent here: no replay TB. cos_target 0.0 while the setpoint is still being explored: 0.1 sat above the ENTIRE attainable cos range on this route (largest per-arm mean measured anywhere on the hyperslope_aug17 ladder was +0.018), so the error was unconditionally negative and peak_scale walked to the floor and then to min_lr regardless of the rate
         flags:
           update_log_z: true
           buffers_active: true

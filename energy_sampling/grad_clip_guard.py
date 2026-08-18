@@ -258,6 +258,31 @@ class GradClipGuard:
                 f'grad_clip_guard: unknown step_type {step_type!r}; expected one of {CHANNELS}')
         return st
 
+    def is_calibrated(self, step_type: str) -> bool:
+        """Is this branch clipping against its OWN fitted bar yet?
+
+        False while the branch is warming, where `warmup_clip: static` means the
+        bar is `gradient_norm_clip` -- a number fitted to nothing in particular.
+        A high fire rate there says the static bar is wrong for this branch, NOT
+        that the learning rate is wrong, and the two are easy to confuse: the
+        guard re-warms at every stage transition when refresh_on_stage is set, so
+        every transition briefly looks like saturation.
+
+        MEASURED, run newlogic_qm9cond_newlogic 2026-08-17: var_conditioning
+        opens at step 150 with fused grad norms 155.7 / 111 / 67 / 53 / 44
+        against the static bar 37.88, so fused_fire_rate sat at 1.000 for the
+        whole warmup and then collapsed to 0.000 the moment the fitted bar took
+        over. LRController's clip gate read that as a hot rate and cut
+        peak_scale, which also tripped the high-water envelope freeze -- pinning
+        the rate 15.5x below where the ramp was headed, on evidence that was
+        about the BAR and not about the rate.
+
+        Callers gating a decision on the fire rate must consult this first.
+        """
+        if not self.enabled:
+            return False
+        return not self._branch(step_type).warming
+
     def threshold(self, step_type: str) -> float:
         """The norm to clip this branch's gradient at, right now."""
         if not self.enabled:

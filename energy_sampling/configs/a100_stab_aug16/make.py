@@ -383,12 +383,14 @@ CONDITIONAL_PROBLEM = {
     'protocol': 'conditional_vargrad',
     'embedding_conditioning': True,      # pre-baked frozen Mo3ENet latents, not the live-GNN route
     'energy_config': {'temperature': 6.9},   # RAW elj units for the QM9 split
-    # half_life_visits is the ONE conditional setting the protocol cannot carry:
-    # condition_log_z is global, not stage-scoped. mk_dev's 7 is reasoned for a
-    # ONE-condition run ("7 visits == 7 steps"); every conditional battery that
-    # ran used 28, because a condition in a large library is revisited far more
-    # sparsely. Kept here until it too becomes stage-scoped.
-    'condition_log_z': {'half_life_visits': 28.0},
+    # half_life_visits USED TO BE PINNED HERE at 28.0, and its REMOVAL is the
+    # point. On 2026-08-17 mk_dev raised the canonical value to 200.0 and took
+    # the key OUT of the route-dependent table: 7.0 was wrong on both routes,
+    # not merely the conditional one, and 200 matches
+    # buffer.DEFAULT_HALF_LIFE_VISITS. Re-forcing 28 here would now DOWNGRADE
+    # the canonical default while reading as a conditional fix -- the F-042
+    # shape, inverted. config_invariants still refuses an explicit value under
+    # 28 on a conditional route, which covers what a hand edit can reach.
 }
 
 
@@ -405,7 +407,7 @@ def conditional_base(base, data):
     per-branch loss coefficients that `conditional_vargrad`'s own stages declare,
     and z_calibration became a stage flag the conditional stages omit. So
     selecting the protocol now carries two of the three, and only
-    half_life_visits (global, not stage-scoped) is left in CONDITIONAL_PROBLEM.
+    nothing Z-side is left in CONDITIONAL_PROBLEM at all.
 
     A post-hoc correction became a structural property, which is the right end
     state and is why this function applies a layer instead of patching one.
@@ -774,8 +776,13 @@ def validate(name, wave, kind, bid, cfg):
                 (f'{name}: stage {st["name"]!r} declares the z_calibration flag on a '
                  f'CONDITIONAL route; every battery that ran had it off (off by '
                  f'omission is the state-6 spelling)')
-        assert cfg['condition_log_z']['half_life_visits'] == 28.0, \
-            f'{name}: conditional half_life_visits must be 28 (mk_dev 7 is one-condition)'
+        # A FLOOR, not a pin: mk_dev owns the value (200.0 since 2026-08-17);
+        # this only mirrors the bar config_invariants enforces.
+        hl = cfg['condition_log_z']['half_life_visits']
+        assert hl >= 28.0, (
+            f'{name}: conditional half_life_visits {hl} < 28. 7.0 detonated '
+             f'var_conditioning at step 1560 at a pinned 2e-4 where 28 ran clean '
+             f'(hyperslope_aug17, 2026-08-17).')
         assert 'enabled' not in (cfg.get('z_calibration') or {}), \
             (f'{name}: z_calibration.enabled is a pre-state-6 spelling; it is a STAGE '
              f'FLAG now, and a leftover global key here is silently inert')
@@ -926,6 +933,38 @@ srun singularity exec --nv \\
 # preflight (run ON THE CLUSTER)
 # ---------------------------------------------------------------------------
 
+def _hms(s):
+    """'06:00:00' -> seconds, so time limits can be MAXed rather than compared
+    as strings (which happens to work for HH:MM:SS but not for D-HH:MM:SS)."""
+    parts = [int(x) for x in str(s).replace('-', ':').split(':')]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    d, h, m, sec = ([0] + parts)[-4:]
+    return ((d * 24 + h) * 60 + m) * 60 + sec
+
+
+def class_of(arm):
+    """Arm name -> TIME_CLASSES key.
+
+    ORDER MATTERS and the specific prefixes come first. An earlier version of
+    this picked the class by asking whether 'uma' or 'mace' appeared anywhere in
+    the name, which is right for the floor arms and WRONG for everything else:
+    the U-tier arms contain neither substring, so a set of them resolved to the
+    3 h ELJ class against a 3.07-5.83 h need, and every occupancy arm would have
+    been truncated by SLURM at the exact moment its policy window was filling.
+    A name-substring heuristic cannot classify names it was not written for.
+    """
+    if arm.startswith('u_prodshape'):
+        return 'wave2_prodshape'
+    if arm.startswith('u_'):
+        return 'wave2_util'
+    if any(arm.startswith(p) for p in ('elj_r', 'uma_r', 'cond_r', 'mace_r')):
+        return 'wave2_floors'
+    if any(x in arm for x in ('uma', 'mace')):
+        return 'wave1_mlip'
+    return 'wave1_elj'
+
+
 def write_set(outdir, label, names, time_limit):
     """One index + one sbatch over an ARBITRARY list of already-generated arms.
 
@@ -1036,9 +1075,7 @@ def main():
         names = [n.strip() for n in csv.split(',') if n.strip()]
         if not label or not names:
             raise SystemExit('--set wants LABEL=arm1,arm2,...')
-        # MLIP arms set the ceiling when present -- explicit rather than clever
-        mlip = any(('uma' in n or 'mace' in n) for n in names)
-        limit = TIME_CLASSES['wave1_mlip'] if mlip else TIME_CLASSES['wave1_elj']
+        limit = max((TIME_CLASSES[class_of(n)] for n in names), key=_hms)
         raise SystemExit(0 if write_set(outdir, label, names, limit) else 1)
 
     # ONE base, and it is a straight copy of the canonical config. The

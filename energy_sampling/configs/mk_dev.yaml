@@ -5,7 +5,7 @@
 # The history and the migrations live together in config_state.py. This is a
 # migration identifier, NOT a release version, and it is a separate axis from the
 # checkpoint problem_def's schema_version (which versions the problem identity).
-project_state_version: 6
+project_state_version: 7
 
 run_name: 'mk_dev'
 tag: 'dev'
@@ -47,7 +47,7 @@ lr_back: auto
 lr_replay: auto
 lr_fused: auto
 lr_flow: 0.1                 # PINNED: exempt from envelope and servo alike, since alpha* is measured over policy params only. Unconditional flow_model is a LearnableScalar (convex 1-D, O(lr) jitter at this LR); conditional nets use 1.0e-4
-min_lr: 1.0e-6               # hard floor on every group's live rate, applied last -- after the envelope and after peak_scale
+min_lr: 1.0e-8               # PERMISSIVE ON PURPOSE: a floor is a numerical backstop, not a policy, and it must never be the thing choosing the rate. At 1.0e-6 it sat barely below the conditional VarGrad quality optimum (~2e-6 to 2e-5), so a controller asking to go lower was refused silently, and it would clamp the BOTTOM OF THE RAMP for any stage whose base is set low (5e-6 at lr_warmup_ratio 10 starts at 5e-7). lr_ctrl/lr_floored_groups reports when it binds
 lr_warmup_ratio: 10          # the ramp starts at peak / this and reaches peak over adaptive_lr.warmup_steps, floored at min_lr. A deeper ratio spends more of warmup far below the operating rate; every sensor holds through warmup anyway, so the ramp is dead time the run pays at each stage transition
 adaptive_lr:
   control_flow_lr: false     # true = the flow/Z groups also take envelope and peak_scale
@@ -57,6 +57,24 @@ adaptive_lr:
   # Restarted at every stage transition -- the optimizers were just rebuilt onto
   # a surface with different curvature.
   warmup_steps: 1000
+  # The ramp is DETERMINISTIC and the sensors decide only when it ENDS -- during
+  # warmup neither `hyper` nor `ray` moves peak_scale, because the envelope is
+  # holding the rate down on purpose and a reading taken through that suppression
+  # says "too cold" whatever the operating point is. Each stops the ramp on the
+  # cadence it can support: `hyper` speaks every step, so it averages this many
+  # of them and freezes when the mean error reaches its setpoint; `ray` gets two
+  # readings in a 1000-step ramp, so it cannot average and freezes on the first
+  # alpha* below alpha_target. Freezing early costs some warmup, not the
+  # operating point -- which is what licenses the one-reading rule.
+  # Too short and single noisy readings end the ramp (cos swings -0.2 to +0.4
+  # through a live warmup); too long and it cannot turn in time to be an interlock.
+  warmup_freeze_cos_window: 25
+  # Whether the ramp may be frozen early at all. A BOOLEAN since state 7:
+  # what used to be a per-sensor threshold on how far peak_scale had fallen
+  # measured noise the freeze no longer sees, because no sensor moves
+  # peak_scale during a ramp -- only on_divergence, which needs no bar to be
+  # believed. false = ramp to hold regardless.
+  envelope_freeze: true
   seed_lr: 1.25e-4           # what an `auto` lr_* key resolves to; the rate a run starts from
   bounds: [ 0.01, 2000.0 ]   # how far the sensors may move the rate from its seed, as a multiplier. Wide on purpose: it is a sanity rail, not a tuning range
 
@@ -342,7 +360,7 @@ replay_loss_coeffs:       # applied to trajectories pulled from the replay buffe
 # or a controller here -- it becomes load-bearing on the conditional route.
 condition_log_z:
   min_visits: 20  # a condition needs this many visits before tb_z_source: persistent / emp_z_persistent will use its estimate
-  half_life_visits: 7.0  # evidence half-life in OWN-VISITS, not steps -- so it means "a memory window of ~7 visits" regardless of library size or how sparsely a condition is revisited. On an unconditional run there is one condition, so 7 visits == 7 steps and ema_logw is essentially the last few batches
+  half_life_visits: 200.0  # evidence half-life in OWN-VISITS, not steps. A "visit" is one update() call and a FUSED stage runs its branches together, so a two-branch stage burns two per train step -- 200 visits is ~100 steps there, ~200 on a single-branch unconditional run. Was 7.0, which made ema_logw essentially the last few batches; that is too short to be right anywhere, and on the conditional route it detonated var_conditioning at step 1560 at a pinned 2e-4 where 28 ran clean (hyperslope_aug17, 2026-08-17). Matches buffer.DEFAULT_HALF_LIFE_VISITS
   trim_frac: 0.01  # per-condition-group trimmed mean for ema_logw. log w is heavy-tailed here (logw_std 8-46), and a 1% two-sided trim removes the handful of extreme draws that would otherwise set the mean
   max_batch_weight: 200.0  # ceiling on the evidence one update() may contribute, in samples. At batch 1000 with ESS ~0.4 a call would otherwise carry ~400; capping at 200 with a 7-visit half-life puts the steady-state effective_count near 200/(1-0.5^(1/7)) ~ 2100
   discovery_half_life_steps: 200.0  # half-life (TRAINING STEPS) of the minima-discovery rate EMAs. Pure monitoring
@@ -402,12 +420,20 @@ conditional_worst_quantile: 0.25  # fraction of conditions allowed to sit beyond
 #
 #   key                                    unconditional   CONDITIONAL
 #   condition_log_z.{fwd,bwd,replay}_tb_z_source   learned    persistent
-#   condition_log_z.half_life_visits               7.0        28.0
 #   z_calibration.enabled                          true       false
 #   lr_flow                                        0.1        1.0e-4
 #   embedding_conditioning (+_dim)                 false      true (molecule route)
 #
-# The first three are enforced at load by
+# half_life_visits LEFT THIS TABLE 2026-08-17: it is no longer route-dependent.
+# The old split was 7.0 unconditional / 28.0 conditional, but 7 is not right on
+# either route -- it makes ema_logw the last few batches everywhere, and it is
+# only on the conditional route that the consequence is a detonation rather than
+# a noisy target. Both columns are now 200.0, matching
+# buffer.DEFAULT_HALF_LIFE_VISITS, so there is nothing here for a mode switch to
+# get wrong. config_invariants still refuses an explicit value below 28 on a
+# conditional route, which is the case that remains reachable by hand.
+#
+# The first two are enforced at load by
 # config_invariants.conditional_z_settings_are_conditional. The last two are NOT
 # enforced -- lr_flow is a rate the invariants cannot infer intent for, and an
 # absent embedding_conditioning reads as false rather than as an error.
@@ -566,14 +592,18 @@ protocols:
         train_mode: fused
         bwd_sampling_mode: prior
         # cos_target is hyper's analogue of calibration.alpha_target: the update's
-        # fixed point is cos == this, so 0 parks the rate at the ONE-STEP optimum --
+        # fixed point is cos == this, so 0 parks the rate at the ONE-STEP optimum,
         # which alpha_target's own comment calls a rate a run does not survive. ray
-        # carries that margin as 4.0; hyper had none. PROVISIONAL: 0.1 was tried and
-        # railed peak_scale to its floor, because the achievable cos DRIFTS DOWN as
-        # the model trains (measured +0.20 at warm start, under 0.1 by ~2k steps) --
-        # so any absolute setpoint eventually becomes unreachable. A margin relative
-        # to the observed cos scale is the durable form; this is a smaller constant.
-        lr_sensor: { kind: hyper, beta: 0.05, cos_target: 0.03 }   # `ray` is incoherent here: no replay TB
+        # carries that margin as 4.0; hyper has none, and that residual is accepted
+        # rather than solved -- an absolute setpoint is not the way to buy it back.
+        # Swept over six cells, 0 is the best worst case (0.41 nats against 1.56 at
+        # 0.1 and 2.34 at 0.2): raising it repairs Adam and destroys SGD, because
+        # the cos->rate map is optimizer-dependent. It also cannot hold still, since
+        # the achievable cos DRIFTS DOWN as the model trains, so any fixed value
+        # eventually sits above the whole attainable range and rails the peak to its
+        # floor. A margin relative to the observed cos scale would be the durable
+        # form; until one exists, no setpoint.
+        lr_sensor: { kind: hyper, beta: 0.05, cos_target: 0.0 }   # `ray` is incoherent here: no replay TB
         flags:
           update_log_z: true
           buffers_active: true

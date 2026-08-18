@@ -728,11 +728,18 @@ def conditional_z_settings_are_conditional(cfg: dict) -> list[Violation]:
 
     THE EVIDENCE IS THE RUN RECORD, NOT A DERIVATION. Every conditional battery
     that ran to completion -- qm9_aug11, qm9_anchor_aug13, qm9anchor_aug14 --
-    carries z_calibration off, all three tb_z_source keys `persistent`, and
-    half_life_visits 28. Every conditional run that detonated in
-    var_conditioning carried the unconditional trio. That includes one with a
-    3.2k-step MLE warm start, which is what rules out "not enough MLE" as the
-    explanation (findings F-042).
+    carries z_calibration off and all three tb_z_source keys `persistent`. Every
+    conditional run that detonated in var_conditioning carried the unconditional
+    values. That includes one with a 3.2k-step MLE warm start, which is what
+    rules out "not enough MLE" as the explanation (findings F-042).
+
+    HALF_LIFE_VISITS WAS THE THIRD KEY AND IS NO LONGER ROUTE-DEPENDENT. Those
+    batteries ran it at 28 against a canonical 7, so it read as a per-route
+    setting; hyperslope_aug17 showed 7 is wrong on BOTH routes -- it makes
+    ema_logw the last few batches everywhere, and only on the conditional route
+    is the consequence a detonation rather than a noisy target. The default is
+    now 200 on both, so what survives here is a floor on an explicit short value,
+    not a route difference.
 
     BASELINE, not ERROR, and deliberately: this is a per-route default backed by
     three batteries, not a self-contradiction provable from the file. A run may
@@ -817,23 +824,26 @@ def conditional_z_settings_are_conditional(cfg: dict) -> list[Violation]:
                     f'to `learned` on a CONDITIONAL route; every battery that ran used '
                     f'`persistent` ({src}) -- the conditional persistent-Z regime. Set it '
                     f"in that stage's loss_coeffs so selecting the protocol adopts it."))
-    # Same shape of blindness, same reason: ConditionLogZTracker defaults
-    # half_life_visits to 7.0 (buffer.py:1185), the UNCONDITIONAL value, so an
-    # absent key is the wrong setting rather than an unmade choice.
+    # THE ABSENCE BRANCH IS GONE, DELIBERATELY. It fired because the code default
+    # was 7.0 -- the unconditional value -- so an unset key silently resolved to
+    # the wrong setting. `buffer.DEFAULT_HALF_LIFE_VISITS` is now 200.0, safe on
+    # this route by construction, so an absent key is no longer a defect and a
+    # rule that still complained about it would be reporting a hazard that no
+    # longer exists. What remains reachable, and still wrong, is an EXPLICIT
+    # short value: measured 2026-08-17 (hyperslope_aug17, QM9 conditional, rate
+    # pinned at 2e-4) an explicit 7 detonates var_conditioning at step 1560 while
+    # 28 runs 2000 steps clean, a single-key difference. So the rule keeps its
+    # teeth exactly where the hazard is.
     hl = _num(_get(cfg, 'condition_log_z.half_life_visits'))
-    if hl is None:
+    if hl is not None and hl < 28.0:
         out.append(Violation(
             BASELINE, 'conditional_z_settings_are_conditional',
-            f'condition_log_z.half_life_visits is unset on a CONDITIONAL route, so it '
-            f'resolves to the code default 7.0 (buffer.py:1185) -- the unconditional '
-            f'value. Every battery that ran used 28 ({src}).'))
-    elif hl < 28.0:
-        out.append(Violation(
-            BASELINE, 'conditional_z_settings_are_conditional',
-            f'condition_log_z.half_life_visits={hl:g} on a CONDITIONAL route; every '
-            f'battery that ran used 28 ({src}). The canonical 7 is reasoned for a '
-            f'ONE-condition run, where 7 visits == 7 steps; across a large library a '
-            f'condition is revisited far more sparsely.'))
+            f'condition_log_z.half_life_visits={hl:g} on a CONDITIONAL route. Measured '
+            f'2026-08-17 (hyperslope_aug17, QM9 conditional, rate pinned at 2e-4): an '
+            f'explicit 7 detonates var_conditioning at step 1560 while 28 runs 2000 '
+            f'steps clean, a single-key difference. The default is now 200 '
+            f'(buffer.DEFAULT_HALF_LIFE_VISITS) and this bar sits at the lowest value '
+            f'shown to survive, not at the default.'))
     return out
 
 

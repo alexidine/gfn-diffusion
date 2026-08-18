@@ -285,6 +285,36 @@ _RETIRED_KEYS = {
         "would re-enter the force spectrum uncorrected on top of it.",
     'buffers.replay_buffer.admit_cap_min': "deleted (see admit_cap_max).",
     'buffers.replay_buffer.admit_cap_health_h0': "deleted (see admit_cap_max).",
+    'condition_log_z.fwd_tb_z_source':
+        "moved -> fwd_loss_coeffs.tb_z_source. It is a property of what a "
+        "branch's LOSS does -- get_tb_loss substitutes a detached per-condition "
+        "target under 'persistent' -- and loss_coeffs is the one block a "
+        "protocol stage can override per branch, so the conditional route now "
+        "adopts it by selecting a protocol instead of by three hand-edits. "
+        "Carried the same value; only the home moved.",
+    'condition_log_z.bwd_tb_z_source':
+        "moved -> bwd_loss_coeffs.tb_z_source (see fwd_tb_z_source).",
+    'condition_log_z.replay_tb_z_source':
+        "moved -> replay_loss_coeffs.tb_z_source (see fwd_tb_z_source).",
+    'z_calibration.enabled':
+        "moved -> a per-stage flag, `flags: {z_calibration: true}`. WHICH stages "
+        "run the Z sidecar is a protocol decision; the z_calibration block now "
+        "holds only HOW. Off by omission, which is what the conditional route "
+        "wants. THE VALUE DOES NOT CARRY MECHANICALLY: measured over git-tracked "
+        "yaml, 8 of the 10 state-6 configs holding this key set it TRUE while no "
+        "stage declares the flag -- so they already ran with the sidecar OFF and "
+        "the key was decorative. Dropping it preserves what those runs did; "
+        "adding the flag would change them. Decide which you want.",
+    'adaptive_lr.envelope_freeze_drop':
+        "replaced by adaptive_lr.envelope_freeze (a boolean). It was a threshold "
+        "on how far peak_scale had fallen from its high-water mark, and it "
+        "existed to separate a sustained pull-down from noise in that signal. "
+        "Once the warmup ramp-exit detector stopped BEING the actuator, no "
+        "sensor moves peak_scale during a ramp at all -- only on_divergence, "
+        "whose cut is unambiguous -- so there is no noise left to threshold. "
+        "Measured: every threshold from 0.0 to 0.4 gives the identical verdict "
+        "on a divergence, because divergence_cut 0.5 is a 50% fall and the "
+        "largest per-sensor default was 5%. Only the on/off sense survives.",
     'mle_slope_t':
         "moved -> the declaring stage's `mle_gate.slope_t`. The three gate "
         "parameters sat at top level while the switch was a stage flag, so the "

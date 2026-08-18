@@ -5,7 +5,7 @@
 # The history and the migrations live together in config_state.py. This is a
 # migration identifier, NOT a release version, and it is a separate axis from the
 # checkpoint problem_def's schema_version (which versions the problem identity).
-project_state_version: 6
+project_state_version: 7
 
 run_name: 'shake_mipcas'
 tag: 'shake'
@@ -57,6 +57,8 @@ adaptive_lr:
   # Restarted at every stage transition -- the optimizers were just rebuilt onto
   # a surface with different curvature.
   warmup_steps: 1000
+  # Boolean since state 7: the per-sensor fall threshold it replaced measured noise the freeze no longer sees.
+  envelope_freeze: true
   seed_lr: 1.25e-4           # what an `auto` lr_* key resolves to; the rate a run starts from
   bounds: [ 0.01, 2000.0 ]   # how far the sensors may move the rate from its seed, as a multiplier. Wide on purpose: it is a sanity rail, not a tuning range
 
@@ -266,6 +268,7 @@ integrator:
 #   beta              Huber beta for the TB-style losses.
 #   loss_clip         absolute ceiling on the per-row loss.
 fwd_loss_coeffs:
+  tb_z_source: learned    # moved here from condition_log_z at state 7
   tb: 0.0
   z_level: 0.0
   freeze_policy: 0.0
@@ -284,6 +287,7 @@ fwd_loss_coeffs:
   loss_clip: 1.0E+9
   beta: 10.0
 bwd_loss_coeffs:
+  tb_z_source: learned    # moved here from condition_log_z at state 7
   tb: 0.0                 # must be nonzero for the log-Z backwards-trained warm start
   freeze_policy: 0.0
   freeze_z: 1.0
@@ -306,6 +310,7 @@ bwd_loss_coeffs:
   loss_clip: 1.0E+9
   beta: 10.0
 replay_loss_coeffs:       # applied to trajectories pulled from the replay buffer
+  tb_z_source: learned    # moved here from condition_log_z at state 7
   tb: 1.0
   freeze_policy: 0.0
   freeze_z: 1.0
@@ -336,9 +341,6 @@ condition_log_z:
   trim_frac: 0.01  # per-condition-group trimmed mean for ema_logw. log w is heavy-tailed here (logw_std 8-46), and a 1% two-sided trim removes the handful of extreme draws that would otherwise set the mean
   max_batch_weight: 200.0  # ceiling on the evidence one update() may contribute, in samples. At batch 1000 with ESS ~0.4 a call would otherwise carry ~400; capping at 200 with a 7-visit half-life puts the steady-state effective_count near 200/(1-0.5^(1/7)) ~ 2100
   discovery_half_life_steps: 200.0  # half-life (TRAINING STEPS) of the minima-discovery rate EMAs. Pure monitoring
-  fwd_tb_z_source: learned  # 'learned' or 'persistent' (the conditional persistent-Z regime)
-  bwd_tb_z_source: learned
-  replay_tb_z_source: learned
   weighted_condition_sampling: true  # draw forward CONDITIONS in proportion to condition_log_z's tracked per-condition FIT ERROR, so badly-fit conditions come up more often. Applies only in stages declaring the flag. NB this is the forward half of a pair whose two sides read different signals: forward draws pick conditions and weight on a per-condition statistic; backward draws pick stored terminal states and weight on each row's own ema_loss
   weighted_condition_sampling_clip_quantile: 0.99  # fit error clipped at this quantile and NORMALIZED by it -> scale-free priority in [0,1]
   weighted_condition_sampling_temperature: 0.3  # softmax temperature over the normalized priority
@@ -348,7 +350,6 @@ condition_log_z:
 # Silent when disabled, inside the deadband, cold, mid-accumulation, or in a
 # scramble_conditions stage.
 z_calibration:
-  enabled: true             # retired to hygiene duty after the 9x mean-pinned-Z falsification; parameters below are set for the UNCONDITIONAL route
   # 'rollout': fresh fwd rollout under freeze_policy, scored by the fwd TB loss,
   #   so sidecar and fused step share one fixed point. Also feeds replay intake.
   # 'replay': same gradient over stored trajectories -- no energy call, but Z is

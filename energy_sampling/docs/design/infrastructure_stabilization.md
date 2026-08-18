@@ -281,6 +281,37 @@ The cost is not hypothetical. Every arm of `configs/a100_stab_aug16` writes
 *migrated* over contents that are not is worse than no stamp. Closing this is
 **state 7**, and it is the first thing Phase 1 owes.
 
+### State 7's scope, held open deliberately
+
+It is held rather than landed because it makes `configs/a100_stab_aug16/make.py`'s
+`CURRENT_STATE_VERSION` assertion fail until `base_uncond.yaml` is re-snapshotted,
+and that battery is mid-regeneration. Two changes ride together, so the
+re-snapshot is paid once:
+
+| key | disposition |
+|---|---|
+| `condition_log_z.{fwd,bwd,replay}_tb_z_source` | retire — moved to `{mode}_loss_coeffs.tb_z_source` |
+| `z_calibration.enabled` | retire — moved to the stage flag `flags.z_calibration` |
+| `adaptive_lr.envelope_freeze_drop` | retire — replaced by a boolean freeze switch |
+
+**Why `envelope_freeze_drop` goes with them, since "unused knob" is the wrong
+reason.** It was a threshold on how far `peak_scale` had fallen from its
+high-water mark, and it existed to separate *"the sensor is pulling against the
+ramp"* from noise in that signal. Once the ramp-exit detector stopped being the
+actuator, there was no noise left in the signal to threshold: nothing moves
+`peak_scale` during a ramp except `on_divergence`, whose cut is unambiguous by
+construction. **The knob did not rot — the fix made it unnecessary**, which is a
+better reason to delete something than disuse.
+
+Measured before proposing it: no sensor moves `peak_scale` during warmup (all
+three read exactly 1.0 when driven), and across `hyper`/`ray`/`plateau` every
+threshold from 0.0 to 0.4 gives the identical verdict on a divergence, because
+`divergence_cut: 0.5` is a 50% fall and the largest per-sensor default is 5%. The
+`_FREEZE_DROP_DEFAULT` lookup cannot change an outcome. No git-tracked config sets
+the key, so its migration is a pure drop needing no judgment — the cheapest entry
+in the record. What survives is the one bit that was always load-bearing: freeze
+on, or off.
+
 **A live bug found and fixed on the way:** `lr_flow: auto` resolved to the
 literal string `'auto'`. It is deliberately absent from `_LR_KEYS` (alpha* is
 measured over policy parameters only, so the flow groups are exempt from both the

@@ -116,7 +116,15 @@ def test_the_standard_a100_suite_exists_and_is_named(reg):
 # RETRACTED the same day: those ten launches ran with z_calibration on, because
 # the registry disabled it through a key state 6 had turned into a stage flag.
 # See the retraction notes in registry.yaml. The arms must be re-run.
-MEASURED_FLOORS: set[str] = set()
+#
+# Populated 2026-08-17 from a100_stab_aug16's SECOND floor set (the first was
+# retracted -- see F-044). `elj-fused-cond` is deliberately absent: all five of
+# its launches diverged, so its floor remains unmeasurable (F-045).
+MEASURED_FLOORS = {
+    'elj-fused-uncond',
+    'uma-fused-uncond',
+    'mace-fused-uncond',
+}
 
 
 def test_floor_coverage_matches_the_recorded_state(reg):
@@ -205,9 +213,13 @@ def test_exceeds_floor_is_symmetric_and_has_no_denominator():
 
 
 def test_floor_for_refuses_an_unmeasured_floor(reg):
-    assert 'mace-fused-uncond' not in MEASURED_FLOORS, 'pick another unmeasured benchmark'
+    # elj-fused-COND, not -uncond: the three unconditional floors landed
+    # 2026-08-17, so this must point at one that is still genuinely unmeasured
+    # or it stops testing the refusal at all. The conditional floor is
+    # unmeasurable for a real reason (F-045), not merely unrun.
+    assert 'elj-fused-cond' not in MEASURED_FLOORS, 'pick another unmeasured benchmark'
     with pytest.raises(R.RegistryError) as e:
-        R.floor_for('mace-fused-uncond', 'samples_per_sec', reg)
+        R.floor_for('elj-fused-cond', 'samples_per_sec', reg)
     assert 'has NOT been measured' in str(e.value)
 
 

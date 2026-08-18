@@ -29,10 +29,20 @@ CANONICAL = HERE / 'configs' / 'mk_dev.yaml'
 ALLOWED = {
     'description', 'domain', 'conditioning', 'energy_function', 'space_groups',
     'z_primes', 'vector_conditioning', 'vector_conditioning_dim',
-    'molecule_conditioning', 'prior_path', 'molecules_path',
+    'molecule_conditioning', 'embedding_conditioning',
+    'embedding_conditioning_dim', 'prior_path', 'molecules_path',
     'test_molecules_path', 'temperature', 'analyze_kwargs', 'model', 'buffers',
     'protocol',
 }
+
+# The three conditioning mechanisms, and they are NOT interchangeable.
+# `embedding_conditioning` was missing from this set until 2026-08-17, which is
+# why the registry had no conditional MOLECULE problem: the live QM9 route
+# conditions on a frozen Mo3ENet embedding and could not be described here at
+# all, so the project's main experimental line was reachable only by hand-editing
+# a config -- exactly what this file exists to end.
+CONDITIONING_FLAGS = ('vector_conditioning', 'molecule_conditioning',
+                      'embedding_conditioning')
 # The only model/buffer sub-keys that follow from the DOMAIN rather than tuning.
 ALLOWED_MODEL = {'periodic_centroids'}
 ALLOWED_BUFFERS = {'anchor_buffer'}
@@ -104,8 +114,24 @@ def test_conditioning_flag_matches_the_declared_conditioning(problems):
     registry says one thing and the run does another."""
     for name, p in problems.items():
         declared = p['conditioning'] == 'conditional'
-        flagged = bool(p.get('vector_conditioning') or p.get('molecule_conditioning'))
+        flagged = any(p.get(f) for f in CONDITIONING_FLAGS)
         assert declared == flagged, f'{name}: declared {p["conditioning"]}, flags {flagged}'
+
+
+def test_embedding_conditioning_dim_present_whenever_embedding_conditioning_is_on(problems):
+    """The dim is not optional: the conditioner is built to it, and an absent
+    value reads as 0 rather than as an error."""
+    for name, p in problems.items():
+        if p.get('embedding_conditioning'):
+            assert p.get('embedding_conditioning_dim'), name
+
+
+def test_exactly_one_conditioning_mechanism_per_problem(problems):
+    """Two flags at once is not a richer problem, it is an ambiguous one -- the
+    three mechanisms build different conditioners off different inputs."""
+    for name, p in problems.items():
+        on = [f for f in CONDITIONING_FLAGS if p.get(f)]
+        assert len(on) <= 1, f'{name}: {on}'
 
 
 def test_vector_conditioning_dim_present_whenever_vector_conditioning_is_on(problems):

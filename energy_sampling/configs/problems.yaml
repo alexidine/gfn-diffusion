@@ -75,6 +75,43 @@ problems:
       anchor_buffer:
         seed_source: prior_dataset
 
+  # ---- conditional molecule ---------------------------------------------
+  qm9_conditional:
+    description: >
+      QM9-conditioned ELJ crystals, space group 2, Z'=1 -- the conditional
+      route. The policy is conditioned on a FROZEN Mo3ENet embedding of the
+      molecule (192-d, 3 x its 64-d bottleneck), so the conditioning flag is
+      `embedding_conditioning`, not `molecule_conditioning`: the latter names a
+      different mechanism and setting it here would silently select nothing.
+    domain: molecule
+    conditioning: conditional
+    energy_function: elj
+    space_groups: [ 2 ]
+    z_primes: [ 1 ]
+    vector_conditioning: false
+    molecule_conditioning: false
+    embedding_conditioning: true
+    embedding_conditioning_dim: 192
+    prior_path: 'D:\crystal_datasets\conditional\priors\qm9split_prior.pt'
+    molecules_path: 'D:\crystal_datasets\conditional\priors\qm9split_conditions.pt'
+    # A HELD-OUT SET IS PART OF THE PROBLEM, not a run option: every eval_test
+    # metric is absent without it, and on a conditional route generalization is
+    # the question being asked. The unconditional entries carry null because one
+    # molecule cannot be held out from itself.
+    test_molecules_path: 'D:\crystal_datasets\conditional\priors\qm9split_test_conditions.pt'
+    temperature: 6.9
+    analyze_kwargs: { }
+    # THE PROTOCOL IS SELECTED, NOT DEFINED. The stage list lives in the
+    # canonical config; naming it here is what makes the route's Z regime --
+    # tb_z_source persistent, z_calibration off -- travel with the problem
+    # instead of being three hand-edits a mode switch had to remember (F-042).
+    protocol: conditional_vargrad
+    model:
+      periodic_centroids: true
+    buffers:
+      anchor_buffer:
+        seed_source: prior_dataset
+
   # ---- conditional toy --------------------------------------------------
   toy_big_unif:
     description: >

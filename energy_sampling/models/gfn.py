@@ -729,16 +729,60 @@ class GFN(nn.Module):  # todo add seeding
         functions write log_flow[:, 0] once from the condition embedding,
         outside the step loop.
 
-        Z-only training (freeze_policy) is handled upstream by detaching
-        condition_embedding at its source (see get_traj_fwd/bwd/replay), so the
-        flow head trains its own parameters while the conditioner stays frozen.
-        NB: that source detach isolates flow_model only while full_flow is off;
-        under full_flow the flow head reads [s_emb, t_emb], so it would still
-        train s_model -- revisit here if full_flow + freeze_policy is ever used.
+        THE INPUTS ARE DETACHED, ALWAYS -- see _condition_flow for the rule and
+        the measurement behind it. This is the full_flow half of it: the head
+        reads [s_emb, t_emb], which come from s_model and t_model, both SHARED
+        with the policy. Without the detach a Z gradient trains the trunk, and
+        the source detach on condition_embedding does nothing about it because
+        this path never touches the conditioner. The note that used to sit here
+        said "revisit here if full_flow + freeze_policy is ever used"; the
+        revisit is this line, and it is unconditional rather than tied to
+        freeze_policy, because the invariant is about WHERE Z gradient may go,
+        not about which branch happens to be training.
         """
         if not self.full_flow:
             return None
-        return self.flow_model(torch.cat([s_emb, t_emb], dim=1)).flatten()
+        return self.flow_model(
+            torch.cat([s_emb.detach(), t_emb.detach()], dim=1)).flatten()
+
+    def _condition_flow(self, condition_embedding):
+        """
+        log Z(c) from the constant-flow head, with the conditioner DETACHED.
+
+        THE INVARIANT: a Z-side gradient reaches flow_model's own parameters and
+        nothing else. Structural, not a flag someone has to remember -- which is
+        the whole point, because the previous containment was exactly that flag.
+
+        WHAT WAS WRONG. `self.flow_model(condition_embedding)` was called on the
+        live tensor, and condition_embedding was detached only under
+        freeze_policy. So in ordinary training the Z loss backpropagated into
+        conditions_embedding_model -- and the SAME tensor feeds
+        s_model(state, condition_embedding), which is upstream of both policies.
+        Worse, conditions_embedding_model sits in the POLICY param groups
+        (utils.py:93), so the leaked Z gradient was applied at the servo-managed
+        policy rate: raising the policy LR amplified a Z-side gradient.
+
+        MEASURED, 2026-08-17, hyperslope_aug17 on the QM9 conditional route at a
+        pinned 5e-4: conditions_embedding_model and flow_model sit at exactly 0
+        until the var_conditioning transition switches them on at step 510, then
+        grow 187x and 70x within 40 steps while forward_policy grows 1.1x and
+        backward_policy 1.4x. The Z side detonates on its own and the NaN
+        propagates into the policy.
+
+        NOT A NO-OP AND NOT FREE: log Z(c) is still a function of the condition,
+        and flow_model still trains -- it just can no longer SHAPE the
+        conditioner to make itself easier to fit. On this route that costs
+        nothing that is used, because tb_z_source is `persistent` (TB reads the
+        condition_log_z tracker) and log_flow[:, 0] is consumed by `emp_z`
+        alone. On a route where TB reads the LEARNED head, the conditioner will
+        no longer be tuned by the Z objective -- that is the intended trade.
+
+        Cutting this path is a CONTRIBUTOR, not a cure: at 5e-4 it moved the
+        detonation from step 560 to 976 rather than preventing it (arm
+        `zfreeze`, which cut the same path via freeze_z). Do not read this as
+        the fix for var_conditioning instability.
+        """
+        return self.flow_model(condition_embedding.detach()).flatten()
 
     def _fwd_step(self, current_state, dts, ts, condition_embedding, eps, eps_r,
                   exploration_std, i: int, detach_traj: bool):
@@ -937,7 +981,7 @@ class GFN(nn.Module):  # todo add seeding
 
         use_ckpt = self._use_traj_checkpoint()
         if not self.full_flow:
-            log_flow[:, 0] = self.flow_model(condition_embedding).flatten()
+            log_flow[:, 0] = self._condition_flow(condition_embedding)
 
         for i in range(trajectory_length):
             dts = ts[:, i + 1] - ts[:, i]
@@ -1073,7 +1117,7 @@ class GFN(nn.Module):  # todo add seeding
         # matches the old (i - 1) == 0 gating: a T=1 backward traj never wrote
         # the constant flow and left log_flow[:, 0] at zero
         if not self.full_flow and trajectory_length > 1:
-            log_flow[:, 0] = self.flow_model(condition_embedding).flatten()
+            log_flow[:, 0] = self._condition_flow(condition_embedding)
 
         for i in range(trajectory_length):
             dts = ts[:, trajectory_length - i] - ts[:, trajectory_length - i - 1]
@@ -1148,7 +1192,7 @@ class GFN(nn.Module):  # todo add seeding
 
         use_ckpt = self._use_traj_checkpoint()
         if not self.full_flow:
-            log_flow[:, 0] = self.flow_model(condition_embedding).flatten()
+            log_flow[:, 0] = self._condition_flow(condition_embedding)
 
         for i in range(trajectory_length):
             dts = ts[:, i + 1] - ts[:, i]

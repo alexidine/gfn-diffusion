@@ -87,22 +87,6 @@ class LRController:
     _POLICY_BASE = {'fwd': 'lr_policy', 'bwd': 'lr_back', 'replay': 'lr_replay',
                     'fused': 'lr_fused'}
 
-    # How far peak_scale must fall below its own high-water mark before the warmup
-    # ramp freezes (see _maybe_freeze_envelope). PER SENSOR, because their firing
-    # rates differ by ~500x and the same number cannot mean the same thing to both:
-    #   ray      reads at most once per ray_calibration.period, so ANY downward move
-    #            is already a considered verdict from a bracketed measurement, not a
-    #            noisy sample. 0.0 = freeze on the first cut.
-    #   plateau  only ever cuts, so its first cut carries the same weight.
-    #   hyper    fires EVERY step against a cosine that swings either side of zero,
-    #            so a single reading is noise. peak_scale is the integral of those
-    #            readings, which is where persistence accumulates -- 5% off the
-    #            high-water mark means it has been pulling down, not jittering.
-    # A stage with no sensor never moves peak_scale, so it never freezes and the
-    # ramp runs to hold with only on_divergence able to cut -- the no-controller
-    # mode, which needs no special case here.
-    _FREEZE_DROP_DEFAULT = {'ray': 0.0, 'plateau': 0.0, 'hyper': 0.05}
-
     _STATE_VER = 8
 
     def __init__(self, modeller):
@@ -117,6 +101,8 @@ class LRController:
         self._hypergrads = 0
         self._plateau_cuts = 0
         self._restarts = 0
+        self._lr_capped_groups = 0    # param groups max_lr bound on the last _apply_lrs
+        self._lr_floored_groups = 0   # ...and min_lr; a floor that binds is a clamp, not a default
         self._check_bars()
 
     # ------------------------------------------------------------------ config
@@ -145,6 +131,21 @@ class LRController:
                     f'adaptive_lr.{name} = {bar:g} is below 1e5. This bar exists only to '
                     f'catch numerical explosion; anything that fires on ordinary training '
                     f'is a graduated cut tier, which v8 deleted on evidence.')
+        # max_lr vs min_lr CANNOT be resolved by clamp order -- whichever is
+        # applied second wins, so one of the two bounds is silently defeated and
+        # the run trains at a rate neither bound describes. Refuse it here, where
+        # the constructor already refuses an incoherent divergence bar.
+        cap = getattr(self.modeller.args, 'max_lr', None)
+        if cap is not None:
+            cap = float(cap)
+            floor = float(getattr(self.modeller.args, 'min_lr', 0.0) or 0.0)
+            if cap <= 0.0:
+                raise ValueError(f'max_lr = {cap:g} must be positive, or null for no cap.')
+            if cap < floor:
+                raise ValueError(
+                    f'max_lr = {cap:g} is below min_lr = {floor:g}. Clamping to both is '
+                    f'not possible: whichever is applied second wins and the other bound '
+                    f'is silently defeated. Raise max_lr or lower min_lr.')
 
     def announce(self):
         cal = getattr(self.modeller, 'ray_cal', None)
@@ -212,16 +213,22 @@ class LRController:
         that skips the probe and the gate that refuses the reading are the same
         function, not two copies of one rule.
 
-        DECIDABLE IN ADVANCE (returned by this function):
+        DECIDABLE IN ADVANCE (returned by this function): nothing, currently.
+        This function is kept because it is the one place the rule lives and the
+        probe path still asks before drawing; the warmup case moved below.
+
+        DECIDABLE IN ADVANCE, AND DELIBERATELY NOT REFUSED:
 
           warmup   the envelope is deliberately below 1, so the step just taken
                    is a scheduled fraction of the operating step and alpha* rates
                    THAT. peak_scale is the multiplier on the un-suppressed rate,
-                   so acting would inflate it by exactly the warmup factor and
+                   so ACTING would inflate it by exactly the warmup factor and
                    hand that back the moment the envelope releases -- a jump of
-                   lr_warmup_ratio, all at once.
-
-        DECIDABLE IN ADVANCE, AND DELIBERATELY NOT REFUSED:
+                   lr_warmup_ratio, all at once. That argument is unchanged and
+                   `on_calibration` still declines to actuate here. It is an
+                   argument against acting, not against LOOKING: the reading is
+                   what tells the ramp to stop, and a ramp nothing watches was
+                   the worse failure. Freeze-only during warmup.
 
           an empty `lr_servo_managed` means peak_scale reaches no learning rate,
           but `_managed_keys` calls that "its own control arm" -- the controller
@@ -242,8 +249,19 @@ class LRController:
                            multiplier is a no-op -- depends on alpha_star
         """
         st = self._state()
-        if self._elapsed(st) < int(self._cfg('warmup_steps', 1000)):
-            return 'warmup'
+        # WARMUP IS NO LONGER A REFUSAL, and that is a deliberate reversal. It
+        # used to be, because acting on a reading taken under a suppressed
+        # envelope would inflate the peak by exactly the warmup factor. That
+        # reason is intact and is why `on_calibration` still refuses to ACTUATE
+        # during the ramp -- but it is an argument against acting, not against
+        # LOOKING, and the ramp needs something watching it. At period 500
+        # against a 1000-step warmup this sensor gets two readings, so it cannot
+        # average and instead freezes the ramp on the first downward one.
+        #
+        # THE PROBE IS NOT FREE. `measure` draws n_sub sub-batches whose RNG
+        # nothing restores, so arming here shifts every subsequent step
+        # (findings F-039) and runs are not comparable with pre-change ones.
+        # That cost is accepted: an unwatched ramp was the worse trade.
         return None
 
     def on_calibration(self, reading):
@@ -272,6 +290,24 @@ class LRController:
         if not (isinstance(alpha, float) and math.isfinite(alpha) and alpha > 0):
             return
         target = float(self._cal_cfg('alpha_target', 4.0))
+        # DURING THE RAMP THIS READING STOPS IT AND DOES NOTHING ELSE. Actuating
+        # is still refused for the original reason -- the envelope is
+        # deliberately below 1, so the multiplier would be applied to a rate that
+        # is about to be raised by the ramp anyway -- but a resolved reading
+        # BELOW target says the rate is already hotter than we steer to, and that
+        # is exactly the "stop climbing" verdict the ramp needs.
+        #
+        # FIRST READING, NO AVERAGING, unlike hyper. With period 500 against a
+        # 1000-step warmup there are two readings in the whole ramp, so there is
+        # nothing to average over -- and the asymmetry licenses it: freezing
+        # early costs some warmup, not the operating point.
+        if self._elapsed(st) < int(self._cfg('warmup_steps', 1000)):
+            self._last['status'] = 'warmup_ramp'
+            if alpha < target:
+                self._freeze_envelope(
+                    st, f'ray alpha* {alpha:.3g} below target {target:g} on its '
+                        f'first resolved reading of the ramp')
+            return
         ratio = alpha / max(target, 1e-9)
         eta = float(self._cal_cfg('eta_up' if ratio > 1.0 else 'eta_down',
                                   0.25 if ratio > 1.0 else 0.5))
@@ -323,8 +359,99 @@ class LRController:
                                    'nonfinite': 0, 'status': 'clean'}
         return w
 
+    def _clip_saturated(self, st, clip_ratio):
+        """Is the gradient clip firing so hard that `cos` has stopped being a
+        learning-rate statistic? Updates the persistence EMA as a side effect.
+
+        `clip_ratio` is pre-clip grad norm / the guard's bar for that branch,
+        handed in by the caller because the guard's own counters are DRAINED at
+        every report and reading them here would race the reporter.
+
+        WHY THIS IS NOT A REFUSAL. `ray` answers an unusable reading with "no
+        move" (on_calibration: "a calibration that cannot see the answer must not
+        guess it"). That is right for `ray` and wrong here, because the state
+        that makes cos unusable is itself unambiguous evidence about the rate:
+        once the clip binds on essentially every step the update magnitude is set
+        by the LR alone, decoupled from curvature, and a rate that does that is
+        too high. So the correct response is to CUT, not to abstain.
+
+        MEASURED, 2026-08-17, hyperslope_aug17: `gradclip/fused_fire_rate` is
+        0.000 through every healthy window (lr8e5, hl28) and 1.000 through every
+        window in which cos misreads (lr2e4, lr5e4) -- with lr2e4's pre-clip norm
+        at 3.7e4 against a healthy 37. The separation is total, so the threshold
+        does not need to be delicate.
+
+        PERSISTENCE, NOT ONE READING. The guard targets a 1-p fire rate (0.01 at
+        the shipped p=0.99), so single firings are the design and only a
+        SUSTAINED rate means anything. The default bar is 0.5 -- fifty times the
+        design rate -- and a full window must elapse before it may fire at all.
+        """
+        bar = self._cfg('hyper_clip_fire_rate_max', 0.5)
+        if bar is None or clip_ratio is None:
+            return False
+        try:
+            ratio = float(clip_ratio)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(ratio):
+            ratio = float('inf')        # non-finite grad IS saturation, not a skip
+        span = max(1, int(self._cfg('hyper_clip_window', 50)))
+        alpha = 2.0 / (span + 1.0)
+        fired = 1.0 if ratio >= 1.0 else 0.0
+        prev = st.get('hyper_clip_ema')
+        st['hyper_clip_ema'] = fired if prev is None else alpha * fired + (1.0 - alpha) * prev
+        st['hyper_clip_n'] = int(st.get('hyper_clip_n', 0)) + 1
+        # THE EMA IS NEVER RESET, and that is load-bearing. An earlier version
+        # cleared it on each cut to rate-limit the braking, which also cleared
+        # the SUPPRESSION -- so between cuts cos resumed integrating and simply
+        # out-ran the brake. Measured on the first version of
+        # test_sustained_clip_saturation_cuts_the_rate: cos +0.5 lifts peak_scale
+        # by exp(beta*0.5) per firing, x3.49 over a 50-firing window, against a
+        # single x0.5 cut -- a NET RISE of 1.75x per window while the clip was
+        # pinned. Suppression has to be continuous; only the cut is rate-limited,
+        # which _clip_saturation_cut does with its own counter.
+        return st['hyper_clip_n'] >= span and st['hyper_clip_ema'] > float(bar)
+
+    def _clip_saturation_cut(self, st, w):
+        """Cut the peak because the clip is saturated, and re-arm the detector.
+
+        TWO EFFECTS, ON DIFFERENT CLOCKS. Reaching here at all means cos is not
+        integrated this firing -- that suppression is CONTINUOUS, for as long as
+        the clip stays saturated, because a statistic measuring clip geometry
+        should never move the rate. The CUT is rate-limited to one per window:
+        halving on every firing would compound to 0.5**n and floor the rate
+        inside a single window. So the response is "stop listening to cos, and
+        halve once per window of sustained evidence" -- hard, but recoverable,
+        and it cannot be out-run by cos the way a reset-on-cut version was."""
+        cut = float(self._cfg('hyper_clip_cut', 0.5))
+        span = max(1, int(self._cfg('hyper_clip_window', 50)))
+        w['n'] += 1
+        w['status'] = 'clip_saturated'
+        since = int(st.get('hyper_clip_n', 0)) - int(st.get('hyper_clip_cut_at', -span))
+        if since < span:
+            return                      # suppressed, but not yet due another cut
+        lo, hi = self._peak_bounds()
+        ceiling = self._current_ceiling()
+        if ceiling is not None:
+            hi = min(hi, ceiling)
+        before = float(st['peak_scale'])
+        st['peak_scale'] = max(lo, min(hi, before * cut))
+        st['hyper_clip_cut_at'] = int(st.get('hyper_clip_n', 0))
+        w['clip_cuts'] = int(w.get('clip_cuts', 0)) + 1
+        if before > 0 and st['peak_scale'] > 0:
+            w['log_applied'] += math.log(st['peak_scale'] / before)
+        self._clip_cuts = getattr(self, '_clip_cuts', 0) + 1
+        if self._clip_cuts == 1:
+            print(f"lr_ctrl: CLIP SATURATED -- the grad clip is firing on "
+                  f"essentially every step, so cos is measuring clip geometry "
+                  f"rather than curvature and the rate is too high on that "
+                  f"evidence alone. peak_scale {before:.4g} -> "
+                  f"{st['peak_scale']:.4g}. Further cuts are silent.")
+        st['envelope'] = self._envelope(st)
+        self._apply_lrs(st)
+
     def on_hypergradient(self, cos: float, beta: float, beta_down: float = None,
-                         cos_target: float = 0.0):
+                         cos_target: float = 0.0, clip_ratio: float = None):
         """
         Apply one hypergradient verdict: `peak_scale *= exp(beta * cos)`.
 
@@ -363,6 +490,13 @@ class LRController:
         """
         st = self._state()
         w = self._hyper_window()
+        # THE REGIME GATE RUNS FIRST, before anything reads cos -- including
+        # during warmup, where the envelope is deliberately holding the rate
+        # BELOW the operating point, so a saturated clip there is worse news
+        # still. See _clip_saturated for why this CUTS rather than abstains.
+        if self._clip_saturated(st, clip_ratio):
+            self._clip_saturation_cut(st, w)
+            return
         # Held through warmup for exactly the reason `on_calibration` and
         # `on_plateau` are: the envelope is deliberately ramping the rate, so a
         # cosine measured through that suppression is not evidence about the
@@ -391,13 +525,86 @@ class LRController:
         # up/down is decided by the ERROR, not by the raw cosine: with a positive
         # target, a small positive cos now means "hotter than intended" and must
         # take the down branch.
-        b = float(beta if err > 0 or beta_down is None else beta_down)
+        #
+        # ASYMMETRIC BY DEFAULT, for the reason `ray` ships eta_up 0.25 against
+        # eta_down 0.5: a raise is licensed only by a local reading that cannot
+        # see multi-step damage, while a cut is the recoverable direction --
+        # undertraining is recovered, a detonation is not. `beta_down` has been
+        # plumbed through protocol.py since this sensor shipped and was set by
+        # nothing, so in practice the gain was symmetric everywhere. Setting
+        # hyper_down_gain to 1.0 restores that exactly.
+        if beta_down is None:
+            beta_down = float(beta) * float(self._cfg('hyper_down_gain', 2.0))
+        b = float(beta if err > 0 else beta_down)
+        # THE RAMP IS DETERMINISTIC; THIS SENSOR ONLY DECIDES WHEN IT ENDS.
+        #
+        # During warmup the envelope is deliberately holding the rate
+        # lr_warmup_ratio below the operating point, so `err` is structurally
+        # POSITIVE -- that is the suppression reflected back, not evidence that
+        # the rate is too low. Actuating on it made peak_scale climb AGAINST the
+        # ramp: measured on the bench, to the 2000x bound in ~76 steps at
+        # beta 0.1, which destroys the one property the ramp exists to provide.
+        #
+        # So the reading feeds a SMOOTHED error instead of the actuator, and the
+        # ramp ends when that average reaches the setpoint -- "ramp until cos
+        # reaches the target, then stop". Smoothed because one reading is noise
+        # (measured swinging -0.2 to +0.4 through a live warmup); the window is
+        # the only knob. This is NOT a rare safety catch: cos at the operating
+        # point sits near zero, so on a healthy run the ramp is EXPECTED to end
+        # this way rather than by running out of steps.
+        if self._ramping(st):
+            span = max(1, int(self._cfg('warmup_freeze_cos_window', 25)))
+            n = int(st.get('hyper_cos_n', 0)) + 1
+            prev = st.get('hyper_cos_ema')
+            a = 2.0 / (span + 1.0)
+            st['hyper_cos_ema'] = err if prev is None else a * err + (1.0 - a) * prev
+            st['hyper_cos_n'] = n
+            # The statistic is still MEASURED and published; only the actuation
+            # is withheld, so the sensor channel cannot go dark through a ramp.
+            w['n'] += 1
+            w['cos_sum'] += float(cos)
+            w['status'] = 'warmup_ramp'
+            # A FULL WINDOW BEFORE IT MAY FIRE, so one early reading cannot end
+            # the ramp -- the failure the high-water rule below was built against.
+            if n >= span and st['hyper_cos_ema'] <= 0.0:
+                self._freeze_envelope(
+                    st, f'smoothed err {st["hyper_cos_ema"]:+.3f} <= 0 over a '
+                        f'{span}-step mean (cos target {float(cos_target):+.3g})')
+            return
         lo, hi = self._peak_bounds()
         ceiling = self._current_ceiling()
         if ceiling is not None:
             hi = min(hi, ceiling)
         before = float(st['peak_scale'])
-        st['peak_scale'] = max(lo, min(hi, before * math.exp(b * err)))
+        # THE LEAK. Without it this is a pure integrator in log space -- pole
+        # exactly on the unit circle, infinite DC gain -- so ANY constant bias in
+        # the error produces unbounded exponential drift in the rate, and
+        # zero-mean noise produces an unbounded random walk. The `bounds` clip is
+        # saturation, not a restoring force, which is why the failure looks like
+        # "railed at 0.01" rather than "drifted somewhere unhelpful".
+        #
+        #     log peak <- (1 - lam) * log peak + b * err
+        #
+        # moves the pole to 1 - lam. A sustained bias then buys a FINITE offset
+        # b*err_bar/lam instead of a ramp, and the stationary spread under noise
+        # is sigma*sqrt(b*tau_c/(2*lam)) instead of growing without limit. The
+        # controller's total authority becomes exactly b*err_bar/lam, so lam is
+        # chosen by inverting that: pick how far the rate may travel from seed
+        # against the worst sustained bias, and solve. Measured on this route the
+        # per-firing |err| runs 0.01-0.05, so lam 2e-3 at beta 0.05 bounds the
+        # excursion near 3x.
+        #
+        # DEFAULT 0.0 = OFF = today's behaviour, bit for bit. It is off rather
+        # than on because lam encodes a timescale, and the only route it has been
+        # measured on is the QM9 conditional one; a default here would be a
+        # universal claim the measurements do not support -- the same reason
+        # `beta` has no default.
+        lam = float(self._cfg('peak_leak', 0.0) or 0.0)
+        if lam > 0.0 and before > 0.0:
+            logp = (1.0 - lam) * math.log(before) + b * err
+            st['peak_scale'] = max(lo, min(hi, math.exp(logp)))
+        else:
+            st['peak_scale'] = max(lo, min(hi, before * math.exp(b * err)))
         w['n'] += 1
         w['cos_sum'] += float(cos)
         # ACCUMULATED IN LOG SPACE, because the actuator is multiplicative: the
@@ -431,6 +638,11 @@ class LRController:
             # per-stage, so each stage ramps and freezes on its own evidence
             'peak_high_water': 1.0,
             'envelope_frozen_at': None,
+            # hyper's warmup ramp-exit detector: an EMA of the cos ERROR and the
+            # count behind it. Read with .get() everywhere, so a state restored
+            # from before these existed simply starts the average fresh.
+            'hyper_cos_ema': None,
+            'hyper_cos_n': 0,
             'envelope': 1.0 / self.modeller.args.lr_warmup_ratio,
         }
 
@@ -488,6 +700,27 @@ class LRController:
     def _elapsed(self, st):
         return max(0, int(self.modeller.step_ind) - int(st.get('stage_start_step', 0)))
 
+    def _ramping(self, st) -> bool:
+        """Is the warmup envelope still MOVING? Not the same as "inside the
+        warmup step budget", and the difference is 800 steps of dead time.
+
+        hyper is held to freeze-only while the ramp runs, because a cosine
+        measured through a deliberately-suppressed rate says "too cold" whatever
+        the operating point is. That argument expires the moment the ramp is
+        FROZEN: the envelope is then a constant, the rate is no longer being
+        walked, and a reading is ordinary evidence again.
+
+        Keying the hold on `warmup_steps` alone kept the sensor mute for the rest
+        of the budget after an early freeze. Measured, run
+        newlogic_qm9cond_newlogic 2026-08-17: var_conditioning opened at step
+        150, the ramp froze at 350 on a negative smoothed cos, and hyper then sat
+        in freeze-only mode until 1150 -- 800 steps, 16% of the run, at a
+        constant 1.98e-5 with cos reading -0.02 to -0.04 throughout and
+        hypergrads stuck at 0.
+        """
+        return (st.get('envelope_frozen_at') is None
+                and self._elapsed(st) < int(self._cfg('warmup_steps', 1000)))
+
     def _envelope(self, st):
         """Ramp -> hold, in [1/lr_warmup_ratio, 1.0]. No decay leg: the
         calibration rates the PRODUCT peak x envelope, so a deterministic
@@ -508,23 +741,68 @@ class LRController:
         b = self._cfg('bounds', (0.01, 2000.0))
         return float(b[0]), float(b[1])
 
+    def _max_lr(self):
+        """The absolute ceiling on any rate this controller writes, or None.
+
+        A RAIL, NOT A RANGE. `adaptive_lr.bounds` stays wide on purpose -- the
+        controller is meant to find its own operating range, and narrowing bounds
+        to express a safety limit would also delete the exploration. This is the
+        separate thing: a hard number, in absolute learning-rate units, that no
+        group may exceed however the servo got there.
+
+        Measured 2026-08-17 (hyperslope_aug17, QM9 conditional, rate pinned per
+        arm): 5e-6 through 8e-5 run 2000 steps clean, 2e-4 goes non-finite at
+        step 1560, 5e-4 at step 560. The survivable range is about 16x wide,
+        against `bounds` defaults spanning 200,000x -- four orders of magnitude
+        more room than the run tolerates. Absent (the default) is no cap, which
+        reproduces the behaviour of every config that predates the key."""
+        cap = getattr(self.modeller.args, 'max_lr', None)
+        return None if cap is None else float(cap)
+
     def _apply_lrs(self, st):
-        """lr = base x peak_scale x envelope, floored at min_lr -- EXCEPT the flow
-        (Z head) groups, pinned flat at lr_flow, and except groups whose base LR
-        was configured as an explicit float, which the controller does not own
-        (peak_scale does not apply to them; the envelope still does)."""
+        """lr = base x peak_scale x envelope, capped at max_lr and floored at
+        min_lr -- EXCEPT the flow (Z head) groups, pinned flat at lr_flow, and
+        except groups whose base LR was configured as an explicit float, which
+        the controller does not own (peak_scale does not apply to them; the
+        envelope still does).
+
+        THE CAP APPLIES TO EVERY GROUP THIS METHOD WRITES, including the two the
+        servo does not own:
+
+          the FLOW group, because it is the one rate with no other guard at all.
+          peak_scale never reaches it (control_flow_lr is false), the envelope
+          never reaches it, and a divergence cut cannot move it -- so before this
+          cap there was no mechanism by which any controller could lower it. The
+          conditional route's flow head is a real network, and this base config
+          warns it diverges at the canonical lr_flow 0.1.
+
+          EXPLICIT-FLOAT groups, because the rail is about what the optimizer
+          actually receives, not about who chose it. For those the cap binds iff
+          the written float itself exceeds it, since the envelope only reduces.
+
+        The cap is the LAST transform before the floor, so it binds on the
+        product rather than on any one factor, and `_check_bars` has already
+        refused a cap below min_lr -- otherwise the two clamps would fight and
+        whichever ran second would silently win."""
         m = self.modeller
         a = m.args
         control_flow = self._cfg('control_flow_lr', False)
         managed = self._managed_keys()
         env = st['envelope']
         peak = float(st['peak_scale'])
+        cap = self._max_lr()
+        capped = 0
+        floored = 0
         for key, opt in m.optimizers.items():
             n_groups = len(opt.param_groups)
             for gi, g in enumerate(opt.param_groups):
                 is_flow_group = key == 'flow' or (key == 'fused' and gi == n_groups - 1)
                 if is_flow_group and not control_flow:
-                    g['lr'] = a.lr_flow
+                    # pinned, so no min_lr floor here either -- unchanged
+                    want = a.lr_flow
+                    if cap is not None and want > cap:
+                        want, capped = cap, capped + 1
+                    g['lr'] = want
                     continue
                 if key == 'fused':
                     base_key = 'lr_fused'
@@ -534,7 +812,25 @@ class LRController:
                     base_key = self._POLICY_BASE[key]
                 base = getattr(a, base_key)
                 scale = env * (peak if base_key in managed else 1.0)
-                g['lr'] = max(a.min_lr, base * scale)
+                want = base * scale
+                if cap is not None and want > cap:
+                    want, capped = cap, capped + 1
+                # A BINDING FLOOR IS AS INVISIBLE AS A BINDING CEILING, and on
+                # this route it is the more likely of the two: measured quality
+                # optimum on the conditional VarGrad route is ~2e-6 to 2e-5,
+                # against a shipped min_lr of 1e-6 -- so the floor sits barely
+                # below the good range and a controller asking to go lower is
+                # silently refused. It also truncates the BOTTOM OF THE RAMP once
+                # seed_lr is set sensibly: seed 5e-6 at lr_warmup_ratio 10 starts
+                # at 5e-7, under the floor, so warmup would begin clamped.
+                if want < a.min_lr:
+                    floored += 1
+                g['lr'] = max(a.min_lr, want)
+        # A BINDING RAIL MUST BE VISIBLE. A clamped controller and a satisfied
+        # one are otherwise indistinguishable from the rate alone, which is the
+        # failure this module has now logged four separate times.
+        self._lr_capped_groups = capped
+        self._lr_floored_groups = floored
 
     # --------------------------------------------------------------------- tick
 
@@ -553,30 +849,21 @@ class LRController:
         self._emit(st)
         return self.modeller.optimizers['fwd'].param_groups[0]['lr']
 
-    def _freeze_drop(self):
-        """The fall from high-water that freezes the ramp, or None to disable it.
+    def _freeze_enabled(self) -> bool:
+        """Whether the warmup ramp may be frozen at all. `adaptive_lr.envelope_freeze`,
+        default TRUE.
 
-        `adaptive_lr.envelope_freeze_drop` selects between the three modes:
-          absent / 'auto'  per-SENSOR default (_FREEZE_DROP_DEFAULT) -- ray and
-                           plateau freeze on their first cut, hyper waits for a
-                           persistent 5% pull-down
-          a float          that threshold whatever the sensor declares
-          null / false     freeze OFF: ramp to hold, only on_divergence cuts
-        """
-        cfg = self._cfg('envelope_freeze_drop', 'auto')
-        if cfg is None or cfg is False:
-            return None
-        if not isinstance(cfg, str):
-            return float(cfg)
-        if cfg != 'auto':
-            raise ValueError(
-                f"adaptive_lr.envelope_freeze_drop: expected 'auto', a float, or "
-                f"null -- got {cfg!r}")
-        stage = getattr(getattr(self.modeller, 'protocol', None), 'stage', None)
-        kind = (getattr(stage, 'lr_sensor', None) or {}).get('kind')
-        # kind None / 'none' -> no entry -> None -> freeze off, which is right:
-        # nothing moves peak_scale on such a stage, so there is nothing to freeze on
-        return self._FREEZE_DROP_DEFAULT.get(kind)
+        A BOOLEAN, WHERE IT USED TO BE A THRESHOLD. `envelope_freeze_drop` named
+        how far peak_scale had to fall from its high-water mark, per sensor,
+        because the freeze read the actuator and the actuator carried the
+        sensor's noise. It does not any more: no sensor moves peak_scale during a
+        ramp, so the only thing that can is on_divergence, whose cut is
+        unambiguous by construction. Measured before removing it -- every
+        threshold from 0.0 to 0.4 returned the identical verdict, since
+        divergence_cut 0.5 is a 50% fall against a largest default of 5%. Nothing
+        noisy reaches this decision, so there is nothing left to threshold.
+        Retired at state 7."""
+        return bool(self._cfg('envelope_freeze', True))
 
     def _maybe_freeze_envelope(self, st):
         """Stop the warmup ramp the moment the sensor is materially pulling AGAINST
@@ -616,16 +903,45 @@ class LRController:
             st['peak_high_water'] = peak
             return
         st['peak_high_water'] = hw
-        drop = self._freeze_drop()
-        if drop is None:                 # freeze disabled: ramp to hold regardless
+        if not self._freeze_enabled():   # ramp to hold regardless
             return
-        # peak < hw is already established above, so drop 0.0 means "any fall"
-        if peak >= hw * (1.0 - drop):
+        # peak < hw is established above, and the only thing that can have moved
+        # it during a ramp is on_divergence -- so ANY fall here is a divergence,
+        # which needs no threshold to be believed.
+        self._freeze_envelope(
+            st, f'peak_scale {peak:.4g} is {100.0 * (1.0 - peak / hw):.1f}% off its '
+                f'high-water {hw:.4g}, i.e. the sensor is pulling against the ramp')
+
+    def _freeze_envelope(self, st, reason: str):
+        """Latch the warmup ramp at its current envelope, once, with a reason.
+
+        THREE PATHS REACH THIS and they are deliberately different shapes, each
+        matched to how often its sensor speaks:
+
+          hyper   every step, so it can afford to average -- fires on a smoothed
+                  error reaching the setpoint (on_hypergradient)
+          ray     once per `period` (500) against a 1000-step ramp, so averaging
+                  is not available: it fires on the FIRST downward reading
+                  (on_calibration)
+          divergence / plateau  moved peak_scale off its high-water mark
+                  (_maybe_freeze_envelope, above)
+
+        Idempotent, so a second trigger in the same stage is a no-op rather than
+        re-latching at a lower envelope. `_fresh_state` clears the field, so each
+        stage ramps and freezes on its own evidence.
+
+        `envelope_freeze: false` still means FREEZE OFF, and it is honoured
+        here rather than at each caller so the off switch cannot be bypassed by
+        adding a path. Only its ON/OFF sense applies to the two new callers: its
+        numeric value is a fall-from-high-water threshold, which is meaningless
+        for a rule that reads a smoothed cos or a single alpha*."""
+        if st.get('envelope_frozen_at') is not None:
+            return
+        if not self._freeze_enabled():
             return
         st['envelope_frozen_at'] = self._envelope(st)
-        print(f"lr_ctrl: warmup ramp FROZEN at envelope {st['envelope_frozen_at']:.4g} "
-              f"-- peak_scale {peak:.4g} is {100.0 * (1.0 - peak / hw):.1f}% off its "
-              f"high-water {hw:.4g}, i.e. the sensor is pulling against the ramp")
+        print(f"lr_ctrl: warmup ramp FROZEN at envelope "
+              f"{st['envelope_frozen_at']:.4g} -- {reason}")
 
     def _maybe_restart(self, st):
         """Warm restart (SGDR-style): put peak_scale back to 1.0 and let the
@@ -663,13 +979,16 @@ class LRController:
     # 'warmup' deliberately shares code 5 with _STATUS so the two sensors' status
     # channels read on one scale
     _PLATEAU_STATUS = {'clean': 0, 'cut': 1, 'warmup': 5}
-    _HYPER_STATUS = {'clean': 0, 'warmup': 1, 'nonfinite': 2}
+    # 'warmup_ramp' is the freeze-only warmup mode; 'clip_saturated' is the
+    # regime gate having cut on clip evidence rather than on cos.
+    _HYPER_STATUS = {'clean': 0, 'warmup': 1, 'nonfinite': 2,
+                     'warmup_ramp': 1, 'clip_saturated': 3}
 
     def in_warmup(self) -> bool:
         """Whether the LR envelope is still ramping. Public because a sensor may
         need to decline to SAMPLE during warmup, not merely to act."""
         st = self._state()
-        return self._elapsed(st) < int(self._cfg('warmup_steps', 1000))
+        return self._ramping(st)
 
     def _emit(self, st):
         self._report = {
@@ -680,6 +999,17 @@ class LRController:
             'lr_ctrl/divergences': float(self._divergences),
             'lr_ctrl/calibrations': float(self._calibrations),
         }
+        # Published only when a cap is configured, so its ABSENCE means "no rail"
+        # rather than "rail never bound" -- two states a constant 0.0 could not
+        # tell apart. A non-zero value means the servo is asking for a rate the
+        # rail is refusing, i.e. peak_scale no longer describes the live rate.
+        if self._max_lr() is not None:
+            self._report['lr_ctrl/lr_capped_groups'] = float(self._lr_capped_groups)
+        # Always published: min_lr has no "off", so unlike the cap there is no
+        # absent-means-no-rail state to preserve. Non-zero means the servo is
+        # asking for a rate the floor is refusing, i.e. peak_scale has stopped
+        # describing the live rate at the bottom as well as the top.
+        self._report['lr_ctrl/lr_floored_groups'] = float(self._lr_floored_groups)
         if self._last:
             # The ACTUATOR beside the sensor, always: a controller that is
             # holding and one that is satisfied are otherwise indistinguishable
@@ -735,6 +1065,15 @@ class LRController:
             # the denominator behind the two averages above, so a period built
             # from one firing and one built from ten are not read alike
             self._report['lr_ctrl/hyper_n'] = float(w['n'])
+            # The brake, beside the sensor. A period in which the gate fired is
+            # one where peak_scale moved on CLIP evidence and not on cos, so a
+            # reader comparing hyper_cos against hyper_applied would otherwise
+            # find them inconsistent with no way to see why.
+            if w.get('clip_cuts'):
+                self._report['lr_ctrl/hyper_clip_cuts'] = float(w['clip_cuts'])
+            ema = self._state().get('hyper_clip_ema')
+            if ema is not None:
+                self._report['lr_ctrl/clip_fire_ema'] = float(ema)
         ceiling = self._current_ceiling()
         if ceiling is not None:
             self._report['lr_ctrl/peak_ceiling'] = ceiling

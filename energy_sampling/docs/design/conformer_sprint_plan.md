@@ -37,8 +37,33 @@ Found by the verification pass; not previously in this plan, and it precedes eve
 - `linearity_verified` is logged as a bare `True` (`train_conformer.py:624`): it records that
   the measurement ran, not what it found.
 
+> **PARTIALLY CLOSED.** `energies/prior_smoke.py` is that driver: committed, fixed molecule
+> set, ~60 asserted checks over 11 molecules, non-zero exit on violation, and a `--inject`
+> self-test carrying 20 reproducible bug classes. It does **not** close the half this item is
+> named for — `prior_report` and `coverage_report` still raise at `'torsion'`, so the
+> prior-quality tier contributes **0 of 88** check slots at the only level that ships. The
+> driver exists; the measurement it was built to drive does not run.
+>
+> **Three defects in the harness itself are open**, and until they close its verdict is not
+> evidence:
+> 1. A population bar calibrated to the current molecule list with **zero margin** — it
+>    demands every molecule have at least one improper row, and ordinary correct molecules
+>    (diethyl ether, dimethyl ether, propyne) have none. Adding one fails a healthy pipeline.
+> 2. Several checks that cannot fail by construction — an ESS floor that is Cauchy–Schwarz,
+>    and three magnitude floors the file's own adversarial pass found decorative.
+> 3. **The geometry legs cannot distinguish a working pipeline from a dead one.** Both sides
+>    of the round-trip are computed through `dof_from_state` (`build_positions` opens by
+>    calling it), so shadowing that function to ignore its input leaves every residual
+>    satisfied *exactly* and the file reports 0 FAILED. The same shape recurs in at least
+>    three other checks: the permutation cancels in `external_*` because it is applied to
+>    both the write and the read; `prior_rtheta_width` scores a draw against the same
+>    function that produced it; `clash_excess_p10` measures both sides over one empty list.
+>    A check whose two sides share a dependency is not a weak check — it is not a check. The
+>    separator is a positive control on the perturbation, never a tighter bar.
+
 **Done when.** A committed driver reproduces every published diagnostic number, and it either
-runs at `'torsion'` or the docs state plainly which level each figure describes.
+runs at `'torsion'` or the docs state plainly which level each figure describes. The three
+defects above are closed, and each is demonstrated closed by an injection that fires.
 
 ---
 
@@ -65,6 +90,8 @@ flowchart LR
     A1["A1 · log Z(c) offset"] -.->|"reporting only"| D
     A2["A2 · chart determinism"] -.-> C["C · rings"]
     B -.-> E["E · prior quality"]
+    B --> F["F · baselines"]
+    F -->|"makes model numbers readable"| D
 ```
 
 **File-conflict map** — do not run these concurrently on the same worktree:
@@ -76,6 +103,7 @@ flowchart LR
 | **A2, A3** | `energies/conformer_data.py` (condition serialisation) |
 | **A2** | `mxtaltools/conformers/topology.py` |
 | D1–D3 | new files |
+| F1, F2 | new file (`energies/prior_baselines.py`) |
 
 **Corrected:** the original map had four omissions — C1 also touches `prior_diagnostics.py`,
 A2 and A3 both land in `conformer_data.py`, and A2 reaches `topology.py`. A∥B is still safe.
@@ -359,8 +387,17 @@ justification. Fix the budget before looking.
 
 ## Track E — prior quality
 
-Depends on B for measurement. Lower priority: the prior is already 1.3–3.5× thermal
-against uniform's 42–85×.
+Depends on B for measurement.
+
+> **The priority here rests on which metric you read, and the two disagree.** By T_eff the
+> prior is 1.3–3.5× thermal against uniform's 42–85× — a large win, and the original basis
+> for calling this track lower priority. By ESS as an importance proposal at `'torsion'` on
+> propanol (d=1, so the target is exact by quadrature) the fitted torsion histogram scores
+> **−32% against uniform** under `ff_from_reference` and **+3%** under `ff_from_graph`. Both
+> figures are correct. T_eff asks whether draws are thermally distributed; ESS asks whether
+> they are usable as a proposal for *this* target. This project reports T_eff and coverage
+> because ESS is blind to missed modes — so T_eff governs the priority of E1/E2, and the ESS
+> figure governs E3, which is a different fix. Do not use one to defer the other.
 
 ### E1 · Energy-conditional relaxation
 
@@ -383,6 +420,108 @@ r→0, and the tail excess is enormous on the dipeptide against a median of +75.
 
 **Done when.** A training config sets it (0.3 or less, well inside the wall), and a test
 asserts MMFF is reproduced exactly above the switch.
+
+### E3 · Upgrade the force field — `ff_from_graph`'s parameter tables
+
+**Goal.** Give the target real torsion physics, which it currently lacks.
+
+**Why this and not a finer key.** Measured on propanol at `'torsion'`: under
+`ff_from_reference` the target entropy is 7.601 of a maximum 7.625 — nearly uniform, because
+that force field has **no torsion term at all** and preference comes only from weak sterics.
+Uniform scores 95.8% there; the fitted prior 65.6%. The ceiling for *any* pooled or
+3-fold-symmetric prior is 96.7%, so pooling was never the problem and neither was key
+coarseness. The histogram is fitted to the **wrong energy**. Nothing else in this track
+matters first: under `ff_from_reference` uniform already scores 95.8%.
+
+**The gate is the parameter tables.** `ff_from_graph` covers 4 bond / 6 angle / 2
+torsion-centre types — alkanes and alcohols only — and `_lookup` **raises** on anything else,
+so every molecule in the committed set except propanol and butanol fails at construction.
+These are published GAFF values: transcription, not research.
+
+**Files.** `mxtaltools/conformers/energy.py`.
+
+**Done when.** Every molecule in the smoke harness's committed set constructs under
+`ff_from_graph` at `'torsion'`, and `_lookup` still raises loudly rather than defaulting on an
+unknown type.
+
+**Traps.** `ff_from_graph` does **not** remove the embedding-seed dependence at `'torsion'` —
+r0/θ0 still come from `measure()` on the ETKDG conformer regardless of force field — and it
+loses zero-at-reference, adding a seed-dependent floor. Swap the frozen centres to typed
+values at the same time or A2 regresses.
+
+---
+
+## Track F — baselines
+
+**Nothing in this plan previously covered this, and it is what makes every future model
+number readable.** A model's ESS, T_eff or log Z means nothing without the same quantities for
+the alternatives it must beat — measured the same way, at the same level, on the same
+molecules, from a command anyone can re-run.
+
+Depends on B. Gates Track D's *interpretation*, not its construction: the encoder can be
+built without it, but no training curve can be read without it.
+
+### F1 · The reference table
+
+**Goal.** One committed command emits, for the smoke harness's molecule set at `'torsion'`:
+uniform, the fitted prior, and a relaxation reference — scored on T_eff/T, coverage and ESS,
+each with an error bar.
+
+**Why an error bar and not a number.** The weekend produced six such tables and none is
+reproducible by any committed command; worse, single-seed figures were compared against one
+another as though the differences were real. A baseline without a noise floor cannot tell you
+whether a model beat it.
+
+**Files.** New — `energies/prior_baselines.py`, beside the producer.
+
+**Done when.** The command runs at `'torsion'`, writes to `energies/results/`, and re-running
+it reproduces every published prior-quality figure in
+[`conformer_conditional_stack.md`](conformer_conditional_stack.md) — or that document is
+corrected to state the level each of its figures actually describes.
+
+**Traps.** Uniform is not a trivial baseline here: at `'torsion'` under `ff_from_reference` it
+**beats the fitted prior**, and reporting only the prior would hide that. Relaxation is not a
+baseline for the *prior* — it is a different proposal at a different cost — so report its
+compute budget beside its score or the comparison is meaningless.
+
+### F2 · log Z by importance sampling, untrained, several seeds
+
+**Goal.** An independent reference value for log Z(c) that no learned quantity can drift.
+
+**Why.** Every log Z the training loop reports is a fitted quantity checking itself. The IS
+estimator on an untrained model over several seeds is correct by construction, and it is what
+a trained log Z head must reproduce.
+
+**Done when.** Reported for at least the size ladder at `'torsion'` with a seed spread, and
+`brute_force_log_z` agrees wherever d is small enough to integrate.
+
+**Traps.** Run it untrained and over several seeds — a single-seed estimate from a partly
+trained model is neither a baseline nor a check. Carry A1's per-molecule offset wherever these
+are compared **across** molecules: it is affine in atom count with zero chemical content, so
+omitting it manufactures a size trend out of nothing.
+
+---
+
+## Green light for Track D
+
+Track D can be **built** against A3 alone. It cannot be **read** until the rest is true.
+Before the first training curve is interpreted:
+
+| | Condition | State |
+|---|---|---|
+| 1 | A3 parity feature in the condition schema, both gate tests passing | not started — **hard dependency, blocks D1** |
+| 2 | The harness can distinguish a working pipeline from a dead one | open — item zero, defect 3 |
+| 3 | The harness has no check that fires on correct code | open — item zero, defect 1 |
+| 4 | `prior_report` / `coverage_report` run at `'torsion'` | open — item zero |
+| 5 | F1 reference table committed and reproducible | not started |
+| 6 | F2 untrained log Z with a seed spread | not started |
+| 7 | A1 offset recorded as a reporting attribute | not started |
+| 8 | Jacobian in the energy, pre-multiplied by T, tested at **two** temperatures | wired; two-temperature test unconfirmed |
+| 9 | `periodic_dims` wired into the policy layout | **done** — `TorsionGFN` replaced, `build_gfn` consumes it |
+
+Conditions 2–4 are an afternoon of subtraction. 5–7 are the real work, and 1 is on the
+critical path regardless. **8 is the cheapest item on this list and the most expensive to get
+wrong**: a single-temperature test passes on the broken code.
 
 ---
 

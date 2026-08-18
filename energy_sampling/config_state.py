@@ -715,6 +715,80 @@ CHANGES: tuple[Change, ...] = (
             "resolve the same way.",
         ),
     ),
+
+    Change(
+        state=7,
+        summary=(
+            "The MODE-KEY MIGRATION gets its load gate, three states late. States "
+            "4-6 moved the keys a mode switch used to hand-edit so that selecting "
+            "a protocol carries them: {fwd,bwd,replay}_tb_z_source into the "
+            "per-branch loss_coeffs a stage can override, z_calibration into a "
+            "stage flag, and lr_flow into an on_enter action. The moves shipped; "
+            "THE RETIREMENTS DID NOT. So the old spellings kept loading clean and "
+            "being read by nothing -- measured on the real load path with a "
+            "known-retired key as a positive control -- which is the precise "
+            "failure _RETIRED_KEYS exists to prevent, and it had already cost "
+            "something: every arm of configs/a100_stab_aug16 wrote tb_z_source "
+            "into the dead home, where it resolved to the code fallback `learned` "
+            "on a CONDITIONAL route -- the F-042 detonation value -- while the "
+            "file read `persistent` in three places and stamped state 6. A "
+            "version stamp asserting `migrated` over unmigrated contents is worse "
+            "than no stamp, because it answers the question a reader would "
+            "otherwise ask. adaptive_lr.envelope_freeze_drop rides along: it "
+            "became unnecessary rather than wrong, when the ramp-exit detector "
+            "stopped being the actuator and left no noise in peak_scale to "
+            "threshold. One re-snapshot pays for all three."),
+        components=('utils.py', 'config_state.py', 'controller.py',
+                    'configs/mk_dev.yaml'),
+        transition=Transition(
+            renamed={
+                'condition_log_z.fwd_tb_z_source': 'fwd_loss_coeffs.tb_z_source',
+                'condition_log_z.bwd_tb_z_source': 'bwd_loss_coeffs.tb_z_source',
+                'condition_log_z.replay_tb_z_source': 'replay_loss_coeffs.tb_z_source',
+            },
+            removed={
+                'adaptive_lr.envelope_freeze_drop':
+                    'replaced by adaptive_lr.envelope_freeze; only its on/off '
+                    'sense was ever reachable, and no tracked config set it.',
+            },
+            added={'adaptive_lr.envelope_freeze': True},
+            manual={
+                'z_calibration.enabled':
+                    'became a per-stage flag, and the value does NOT carry. '
+                    'Measured over git-tracked yaml: 205 configs hold the key, '
+                    'and of the 10 that are state 4 or later, 8 set it TRUE '
+                    'while no stage declares the flag -- so they already ran '
+                    'with the sidecar OFF. Dropping the key preserves what those '
+                    'runs did; adding `flags: {z_calibration: true}` to a stage '
+                    'changes them. Which is right depends on what the config was '
+                    'for, so migrate reports it and refuses to guess.',
+            },
+        ),
+        invariants=(
+            'A retired key is rejected at LOAD, never read-and-ignored. The '
+            'mode-key migration violated this for three states; the gate is what '
+            'makes "the schema moved" and "your config moved" the same event.',
+            'project_state_version means the contents match the state named. A '
+            'config may only stamp 7 once the old spellings are gone, because '
+            'they now hard-fail.',
+            'envelope_freeze is a BOOLEAN. The freeze either arms or it does '
+            'not; there is no threshold, because nothing noisy reaches it.',
+        ),
+        validation=(
+            'The gap was MEASURED before it was fixed: on the real load path '
+            '(dict2namespace -> preflight_config) all four old spellings loaded '
+            'clean, with mle_slope_t as a positive control that rejected -- so '
+            'the harness could see a retired key and these were genuinely '
+            'invisible.',
+            'Counted over git-tracked yaml, not a naive grep: 440 configs carry '
+            'each *_tb_z_source key, 205 carry z_calibration.enabled (166 true, '
+            '39 false), and ZERO carry envelope_freeze_drop -- which is what '
+            'makes that one a pure drop rather than a judgment call.',
+            'Only 10 configs are state 4 or later, i.e. mechanically migratable '
+            'at all; the rest predate the protocol library and need a stage-list '
+            'rewrite regardless. Those 10 were migrated and re-verified.',
+        ),
+    ),
 )
 
 

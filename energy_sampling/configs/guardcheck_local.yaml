@@ -259,7 +259,7 @@ replay_loss_coeffs: # applied to trajectories pulled from the replay buffer
 # or a controller here -- it becomes load-bearing on the conditional route.
 condition_log_z:
   min_visits: 20  # a condition needs this many visits before tb_z_source: persistent / emp_z_persistent will use its estimate
-  half_life_visits: 7.0  # evidence half-life in OWN-VISITS, not steps -- so it means "a memory window of ~7 visits" regardless of library size or how sparsely a condition is revisited. On an unconditional run there is one condition, so 7 visits == 7 steps and ema_logw is essentially the last few batches
+  half_life_visits: 200.0  # evidence half-life in OWN-VISITS, not steps (one update() call; a fused stage burns one per live branch). Was 7.0, which makes ema_logw the last few batches -- too short on any route; on the conditional route it detonates var_conditioning (hyperslope_aug17, 2026-08-17). Matches buffer.DEFAULT_HALF_LIFE_VISITS
   trim_frac: 0.01  # per-condition-group trimmed mean for ema_logw. log w is heavy-tailed here (logw_std 8-46), and a 1% two-sided trim removes the handful of extreme draws that would otherwise set the mean
   max_batch_weight: 200.0  # ceiling on the evidence one update() may contribute, in samples. At batch 1000 with ESS ~0.4 a call would otherwise carry ~400; capping at 200 with a 7-visit half-life puts the steady-state effective_count near 200/(1-0.5^(1/7)) ~ 2100
   discovery_half_life_steps: 200.0  # half-life (TRAINING STEPS) of the minima-discovery rate EMAs. Pure monitoring
