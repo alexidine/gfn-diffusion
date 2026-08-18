@@ -86,7 +86,14 @@ srun singularity exec --nv \
         # the config.
         if [ -f ${ARMS}/${ARM}.env ]; then
             set -a; . ${ARMS}/${ARM}.env; set +a
-            echo "arm env:"; cat ${ARMS}/${ARM}.env
+            # SINGLE quotes, and NO double quote anywhere in this block --
+            # comments included. The whole block is interpolated inside the srun
+            # bash -c string, which the OUTER shell parses before the inner one
+            # ever sees a '#', so a double quote in a comment truncates the
+            # command exactly as one in code would. Symptom: train.py never
+            # starts and no wandb run appears at all, while bash -n on the file
+            # still passes because the quotes balance.
+            echo 'arm env:'; cat ${ARMS}/${ARM}.env
         fi
         python -u train.py --config ${CONFIG}
     "

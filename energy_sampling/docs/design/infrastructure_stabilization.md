@@ -12,18 +12,20 @@ active plan; after that, foundational change requires a demonstrated need.
 | Phase | State | What is left |
 |---|---|---|
 | **0** baseline + version primitive | **DONE** | — |
-| **1** canonical config | **~85%** | optimizer-block nesting; the **state-7 load gate** the mode-key migration never got; 1.1's runtime half; 1.3 tiers S2–S5 |
-| **2** config generation | **NOT STARTED** | 2.1 `configs/generate.py` + 2.2 corpus. 2.3 is a deliberate stub. Gates three completion boxes and is the highest-value unstarted item |
+| **1** canonical config | **~95%** | the comment rewrite (1.3, tiers S2-S5) and the runtime half of the mode-safety audit (1.1). Optimizer-block nesting DROPPED |
+| **2** config generation | **DONE** | 2.1 `configs/generate.py` + 2.2 corpus shipped. 2.3 stays a deliberate stub |
 | **3** executable invariants | **DONE**, folded into Phase 0 | extend as new rules earn it |
 | **3b** analysis package | Tiers 0/1/2 **SHIPPED** | Tier 3 (figures), specified and not built |
 | **4** profiling + benchmark spec | spec + `benchmarks/` **SHIPPED** | the profiling runs — cluster, user-run. Gated on `a100_stab_aug16` launching |
 | **5** MLIP | local optimisations **DONE** | A100 validation |
 | **6** batch sizer | **DESIGNED**, not built | gated on Phase 4 measurement |
 
-The config schema has moved through **six states** since this document was
+The config schema has moved through **seven states** since this document was
 written; `docs/change_history.md` is the record and `config_state.CHANGES` is its
-source. States 2–6 are all Phase 1 work: they are what "consolidate" turned out to
-mean once each key was moved next to the thing that consumes it.
+source. States 2–7 are all Phase 1 work: they are what "consolidate" turned out to
+mean once each key was moved next to the thing that consumes it -- and state 7 is
+the reminder that moving a key is only half of it, the other half being that the
+old spelling has to start failing.
 
 **Phase 0 is done and the first slice of Phase 3 with it:**
 
@@ -215,7 +217,7 @@ now landed; one remains.**
 | `conditional_worst_quantile` | **DONE** — re-homed beside the stages that consume it |
 | `protocol:` | **DONE** — `protocol:` names one; `protocols:` holds them all (state 4) |
 | `mle_slope_*` → phase-1 exit | **DONE** — now `mle_gate: {slope_t, min_rate, window}` on the declaring stage (state 5) |
-| optimizer-block nesting | **NOT DONE** — sized below, and now the only one |
+| optimizer-block nesting | **DROPPED** 2026-08-17 by the user — see below |
 
 They are one change in kind, not five: every one is *move a key nearer the thing
 that consumes it*. And 1.2's own verdict stands for the hard one — **name a
@@ -240,7 +242,17 @@ negative control per validator, demonstrate it FAILS before the move,
 move keys and validator together, demonstrate the same control still fails. A
 control that passes at step two is not a control, it is a bug.
 
-**Why the optimizer-block nesting is not landed.** Sized at **64 attribute-read
+**The optimizer-block nesting is DROPPED, not deferred.** The user scratched it
+on 2026-08-17. The case for it was consistency -- the four learning rates sit at
+top level while everything else that steers them lives under `adaptive_lr` -- and
+consistency is the weakest reason on offer for a change with this shape: 64 read
+sites, several reached through an object alias a name-based sweep cannot see, and
+`getattr(args, 'lr_flow', None)` returning None rather than raising at every one
+of them. It buys no new capability and closes no failure that has cost anything.
+The cost sat entirely on the side of the risk. Recorded here rather than deleted
+so the next reader does not re-propose it; the sizing below is why.
+
+**The original sizing, kept as the reason.** Sized at **64 attribute-read
 sites across 16 files** — `train.py`, `controller.py`, `utils.py`,
 `checkpointing.py`, `train_conformer.py`, nine `bench/` files — and several read
 through an object alias (`a = m.args; a.min_lr`), which a name-based sweep does
@@ -799,29 +811,36 @@ scheduled as Phase 3b.)*
 Unchecked means unchecked. Where a box has real partial progress it is annotated,
 because a half-built thing recorded as done is how this list would stop working.
 
-- [ ] **one clear canonical production-config state** — `mk_dev.yaml` is
-      canonical and stamped at state 6. Blocked on the optimizer-block nesting and
-      on state 7: four migrated keys still load clean, so the stamp does not yet
-      mean what it says.
-- [ ] **production-config generation is a scripted workflow, not an agent search**
-      — Phase 2.1, not started.
-- [ ] **generated configs carry reliable provenance** — Phase 2.1. Note the bar:
-      `a100_stab_aug16` arms carry a state stamp that is *wrong about their own
-      contents*, which is provenance that misleads rather than provenance missing.
-- [ ] **substantive code/config changes have semantic history** — the machinery
-      exists and works (`config_state.CHANGES` → `docs/change_history.md`, drift
-      guarded by a test). It is the *discipline* that has a live counterexample:
-      the mode-key migration shipped without a record. Check this box when a
-      migration cannot ship without one.
+- [x] **one clear canonical production-config state** — `mk_dev.yaml` is
+      canonical and stamped at state 7, and the stamp means what it says: the
+      migrated keys hard-fail at load, verified by injection. The last open item,
+      the optimizer-block nesting, was dropped as consistency-only churn.
+- [x] **production-config generation is a scripted workflow, not an agent search**
+      — `configs/generate.py`: canonical + problem + overrides → validate → stamp
+      → emit, with a deviation-from-canonical summary. 20 tests, and a regression
+      corpus (2.2) reproducing three historical arms from explicit inputs.
+- [x] **generated configs carry reliable provenance** — every arm records the
+      canonical file's SHA and the state it was built against, so "was this built
+      from the config I am looking at" is a string comparison. The bar was set by
+      the failure it answers: `a100_stab_aug16` arms once carried a state stamp
+      that was *wrong about their own contents*, which misleads rather than
+      merely missing.
+- [x] **substantive code/config changes have semantic history** — the machinery
+      works (`config_state.CHANGES` → `docs/change_history.md`, drift guarded by a
+      test) and the counterexample is closed: the mode-key migration's missing
+      retirements shipped as state 7, with the measurements that justified each
+      disposition in the record. The discipline now has teeth, because an
+      unretired rename is a key that loads clean and that is what state 7 was.
 - ~~historical configs migrate systematically~~ — dropped: back-compat is not a
-      requirement. A stale config fails loudly at load; that is sufficient.
-      **Conditional on the load gate actually firing** — see state 7.
+      requirement. A stale config fails loudly at load; that is sufficient, and
+      the gate it depends on now fires (state 7).
 - [ ] **comments and docstrings follow current-state discipline** — audit landed
       (`docs/design/comment_audit.md`), S1 applied, S2–S5 open.
 - [ ] the initial recurring workflows are scripted and documented
       (update-old-run · production-config generation · functional-change ·
-      performance-investigation · run analysis) — **run analysis is done** (Phase
-      3b, Tiers 0–2); the other four are not.
+      performance-investigation · run analysis) — **two of five done**: run
+      analysis (Phase 3b, Tiers 0–2) and production-config generation (Phase 2.1).
+      The other three are not.
 - [ ] representative training modes have current end-to-end profiles — gated on
       `a100_stab_aug16` launching.
 - [ ] MLIP bottlenecks addressed, numerical equivalence demonstrated — local

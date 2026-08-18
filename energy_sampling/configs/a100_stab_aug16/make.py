@@ -142,6 +142,7 @@ WHAT THE GENERATOR ASSERTS (requirement: pin resume, validate every config)
 import argparse
 import copy
 import math
+import subprocess
 import os
 import re
 import sys
@@ -1052,9 +1053,10 @@ def emit(arms, dropped, outdir):
         # MAX and the useful submission is a `--set` per class.
         limit = TIME_CLASSES.get(wave) or max(
             (TIME_CLASSES[class_of(n)] for n, *_ in rows), key=_hms)
-        (outdir / f'submit_{wave}.sbatch').write_text(
-            SBATCH_TEMPLATE.format(label=wave, time=limit,
-                                   array=f'0-{len(rows) - 1}'), encoding='utf-8')
+        _txt = SBATCH_TEMPLATE.format(label=wave, time=limit,
+                                      array=f'0-{len(rows) - 1}')
+        _check_sbatch(_txt, f'submit_{wave}.sbatch')
+        (outdir / f'submit_{wave}.sbatch').write_text(_txt, encoding='utf-8')
     (outdir / 'INDEX.tsv').write_text('\n'.join(master) + '\n', encoding='utf-8')
 
     print(f'\nwrote {len(arms)} configs in {outdir}')
@@ -1165,7 +1167,14 @@ srun singularity exec --nv \\
         # the config.
         if [ -f ${{ARMS}}/${{ARM}}.env ]; then
             set -a; . ${{ARMS}}/${{ARM}}.env; set +a
-            echo "arm env:"; cat ${{ARMS}}/${{ARM}}.env
+            # SINGLE quotes, and NO double quote anywhere in this block --
+            # comments included. The whole block is interpolated inside the srun
+            # bash -c string, which the OUTER shell parses before the inner one
+            # ever sees a '#', so a double quote in a comment truncates the
+            # command exactly as one in code would. Symptom: train.py never
+            # starts and no wandb run appears at all, while bash -n on the file
+            # still passes because the quotes balance.
+            echo 'arm env:'; cat ${{ARMS}}/${{ARM}}.env
         fi
         python -u train.py --config ${{CONFIG}}
     "
@@ -1213,6 +1222,38 @@ def class_of(arm):
     return 'wave1_elj'
 
 
+def _check_sbatch(text, label):
+    """Refuse to emit a job script whose inner `bash -c` payload is truncated.
+
+    THE FAILURE THIS CATCHES, which cost a whole submitted wave. Everything after
+    `/bin/bash -c "` is one double-quoted string parsed by the OUTER shell, so a
+    single unescaped double quote anywhere inside it -- INCLUDING IN A COMMENT,
+    because the outer shell never sees the '#' -- closes the string early and the
+    container receives a truncated command. The symptom is maximally unhelpful:
+    train.py never starts, so there is no wandb run, no traceback and no log to
+    read; `bash -n` on the FILE passes, because the quotes still balance.
+
+    So the check is on the PAYLOAD, not the file: extract it and require both that
+    it contains no bare double quote and that it parses on its own.
+    """
+    pat = '/bin/bash -c "(.*?)' + chr(10) + '    "' + r'\s*$'
+    m = re.search(pat, text, re.S)
+    if not m:
+        raise SystemExit(f'{label}: no `bash -c` payload found -- template changed?')
+    payload = m.group(1)
+    if chr(34) in payload:
+        bad = [l for l in payload.split(chr(10)) if chr(34) in l]
+        raise SystemExit(
+            f'{label}: {len(bad)} line(s) carry a bare double quote inside the '
+            f'`bash -c` payload, which truncates the container command silently:'
+            + chr(10) + chr(10).join('  ' + l.strip()[:100] for l in bad)
+            + chr(10) + '  -> use single quotes, in code AND in comments.')
+    r = subprocess.run(['bash', '-n'], input=payload.replace(chr(92) + '$', '$'),
+                       text=True, capture_output=True)
+    if r.returncode != 0:
+        raise SystemExit(f'{label}: `bash -c` payload does not parse: {r.stderr}')
+
+
 def write_set(outdir, label, names, time_limit):
     """One index + one sbatch over an ARBITRARY list of already-generated arms.
 
@@ -1238,9 +1279,10 @@ def write_set(outdir, label, names, time_limit):
         rows.append(f'{n}\tset\t-\t{cfg["batch_size"]}\t{cfg["epochs"]}')
     (outdir / f'INDEX_{label}.tsv').write_text(
         'name\tkind\tbenchmark_id\tbatch\tepochs\n' + '\n'.join(rows) + '\n', encoding='utf-8')
-    (outdir / f'submit_{label}.sbatch').write_text(
-        SBATCH_TEMPLATE.format(label=label, time=time_limit,
-                               array=f'0-{len(names) - 1}'), encoding='utf-8')
+    _txt = SBATCH_TEMPLATE.format(label=label, time=time_limit,
+                                  array=f'0-{len(names) - 1}')
+    _check_sbatch(_txt, f'submit_{label}.sbatch')
+    (outdir / f'submit_{label}.sbatch').write_text(_txt, encoding='utf-8')
     print(f'wrote submit_{label}.sbatch  --array=0-{len(names) - 1}  ({len(names)} arms, '
           f'--time={time_limit})')
     for i, n in enumerate(names):

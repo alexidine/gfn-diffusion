@@ -59,16 +59,12 @@ on correct code. A false-firing floor is worse than a missing one.
 
 **6. IF BOTH OPERANDS COME FROM THE CODE UNDER TEST, IT IS NOT A CHECK.** It reports zero
 when the code is correct and zero when the code is dead, and no threshold separates those.
-An audit of this file found the shape in eight places and they were REMOVED rather than
-tightened: the ``roundtrip_*`` legs (reference and measured side both descend from one
-``dof_from_state`` call), ``rigid_bond`` and ``group_rigid_bond`` (``build`` places every
-atom at exactly the requested r, so a phi-only perturbation cannot move a tree bond),
-``group_frame_bond`` (scored against the key ``torsion_groups`` partitions on),
-``ele_pairs_charged`` (both counts from one ``GetMMFFPartialCharge`` call),
-``clash_excess_p10`` (draw and reference overlap over the same ``ff.sigma``),
-``prior_ess_le_one`` and ``coverage_report``'s mode floor (algebraic identities that no
-pipeline state can violate). ``improper_rows_ungrouped`` was RE-REFERENCED instead, against
-RDKit's bond table, because the claim is worth keeping and an independent operand was cheap.
+An audit found the shape in nine checks; all nine were REMOVED rather than tightened, and
+each site carries a one-line comment saying which two operands moved together.
+``improper_rows_ungrouped`` was RE-REFERENCED instead, against RDKit's bond table, because
+the claim was worth keeping and an independent operand was cheap. Positive controls are not
+the remedy: two already existed and they are why the file is not silent under --inject
+dead-map, but they cannot make a shared-operand residual falsifiable.
 
 **5. "N PASSED, M SKIPPED, 0 FAILED" IS NOT A RESULT until M is broken down.** Every skip
 carries a KIND, and the report prints the census on the verdict line where the summary gets
@@ -204,13 +200,11 @@ MOLECULES = [
 # ---------------------------------------------------------------------------------------
 TOL = {
     # --- energy-free geometry ---------------------------------------------------------
-    # roundtrip_r / roundtrip_theta / roundtrip_phi DELETED: measure() and build() share the
-    # tree index arrays and the NeRF convention, and both operands descend from one
-    # dof_from_state call, so the residual is machine zero under a dead map, a rolled index
-    # and a flipped phi sign alike. external_* is the same claim with RDKit on the far side.
-    # rdMolTransforms does the same arithmetic in an ABSOLUTE convention. r and theta land
-    # under 1e-15; phi's worst case is the near-linear nitrile frame, ill-conditioned by
-    # construction, at ~1e-13. A units or NeRF-convention error lands at 1e-2 or worse.
+    # roundtrip_r/theta/phi DELETED: see run_molecule. rdMolTransforms does the same
+    # arithmetic in an ABSOLUTE convention, which is what makes these three a check. r and
+    # theta land at round-off; phi's worst case is the near-linear nitrile frame, which is
+    # ill-conditioned by construction, hence the looser bar. A units or NeRF-convention
+    # error lands orders above either.
     'external_r': 1e-9,
     'external_theta': 1e-9,
     'external_phi': 1e-7,
@@ -229,12 +223,10 @@ TOL = {
     # with |theta - theta0|. test_mmff_matches_rdkit uses 3e-4 at a mildly perturbed
     # minimum; these geometries are drawn further out, so 5e-3 kcal/mol. The other four
     # terms carry no such rounding and land at ~1e-12, hence 1e-6 for them.
-    #   CONSEQUENCE, and it is a limitation rather than a defect: because the residual
-    # grows with the deviation, these three bars are only meaningful on geometries in the
-    # thermal range. On a draw whose local geometry has been destroyed they fire for the
-    # RIGHT reason -- RDKit's rounded theta0 against ours, amplified -- not because the
-    # conversion is wrong. Observed: 2.4e-4 clean at `full`, 1.0e-2 under
-    # --inject sibling-independent.
+    #   CONSEQUENCE, a limitation rather than a defect: because the residual grows with the
+    # deviation, these three bars are only meaningful on geometries in the thermal range. On
+    # a draw whose local geometry has been destroyed they fire for the RIGHT reason --
+    # RDKit's rounded theta0 against ours, amplified -- not because the conversion is wrong.
     'mmff_angle': 5e-3,
     'mmff_stretch_bend': 5e-3,
     'mmff_oop': 5e-3,
@@ -261,12 +253,15 @@ TOL = {
     # Per-term energy NORMALISED PER TERM, in kT. For a harmonic term driven at its exact
     # thermal width, equipartition fixes the mean at 0.5 kT per DoF. The force field scores
     # the REDUNDANT graph set, which is larger than the DoF set, so per graph term it sits
-    # near or below that -- measured 0.63 kT/angle at `full`, 0.07 at `torsion`. 2.0 kT is
-    # 4x equipartition: the smallest bar that cannot fire on a correct thermal draw. For
-    # scale, the ethanol improper bug put 251 kcal/mol into 19 angles = 13 kT/angle, 6x
-    # over the bar. The non-harmonic terms have NO equipartition prediction, so their bars
-    # are magnitude bounds from the measured spread with margin, and are correspondingly
-    # weaker evidence; electrostatics genuinely reaches -0.76 kT/pair on the amide.
+    # near or below that. 2.0 kT is 4x equipartition: the smallest bar that cannot fire on a
+    # correct thermal draw, and the ethanol improper bug sat several times over it. The
+    # non-harmonic terms have NO equipartition prediction, so their bars are magnitude
+    # bounds from the measured spread with margin, and are correspondingly weaker evidence.
+    #   ALSO WEAK AT THE SHIPPED LEVEL, and not fixed here: at `torsion` the bond, angle,
+    # stretch-bend and oop terms are constants in x to machine precision, so these four are
+    # reporting the reference conformer's own strain rather than anything about the draw --
+    # the same objection T_eff states when it SKIPS there. They still fire on the DoF-vector
+    # injections, which is why they are kept rather than skipped.
     'kt_per_bond': 2.0,
     'kt_per_angle': 2.0,
     'kt_per_stretch_bend': 1.0,
@@ -289,8 +284,9 @@ TOL = {
     # exactly 0 and doubling them drives the difference AWAY from the bar. The pair-count
     # floor does not cover it. The overlap is still reported, unasserted.
     # One batch of n against two of n/2. _batch is a getter that MUTATES (it fills the
-    # tree/ff caches as a side effect) and a stale tree is a silent wrong answer, not a
-    # crash. Relative, because energies here span 1e0 to 1e5.
+    # tree/ff caches as a side effect). A cached tree of the wrong SIZE raises; a cached
+    # PARAMETER that went stale does not, and that is what this catches. Relative, because
+    # energies here span 1e0 to 1e5.
     'batch_invariance_rel': 1e-9,
 
     # --- LEG 0: structural invariants of the tree and the grouping -----------------------
