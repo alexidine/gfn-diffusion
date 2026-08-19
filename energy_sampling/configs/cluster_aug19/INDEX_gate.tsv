@@ -1,0 +1,4 @@
+name	problem	batch	epochs
+cluster_aug19_g1_mace_gate	mace	100	200
+cluster_aug19_g2_uma_gate	uma	250	200
+cluster_aug19_g3_elj_compile	elj	1000	400

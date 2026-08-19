@@ -8,8 +8,18 @@
 The run-reading toolkit. `docs/reading_runs.md` is its requirements document;
 this file records what exists.
 
-Tiers 0, 1 and 2. Tier 3 (figures) is specified in
-`docs/analysis_package_spec.md` and not built.
+All four tiers. Tier 3 is `figures.py` -- an INDEX over the media wandb already
+rendered, not a plotting layer. It exists for a reader who cannot click the
+wandb UI; on a real run it collapses 30 media files to 15 named figures, each
+with the steps available (`python -m analysis <run> --figures`).
+
+Two things it will not do, both deliberate. An unrecognised filename is DROPPED
+rather than guessed at, because a figure indexed under an invented name is one
+no caller can ask for. And a cloud figure that has not been fetched RAISES
+instead of returning its would-be path: a path that does not resolve sends the
+reader after a file that was never there. Cloud download is listed but not
+wired -- the manifest is cheap, the bytes are not, and nothing has needed them
+yet.
 
 ## What it is for
 

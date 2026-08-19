@@ -1,0 +1,4 @@
+name	problem	batch	epochs
+cluster_aug19_c1_fused_on	elj	1000	3000
+cluster_aug19_c1_fused_off	elj	1000	3000
+cluster_aug19_c2_syncs	elj	1000	1200

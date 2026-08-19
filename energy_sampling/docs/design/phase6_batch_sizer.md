@@ -3,14 +3,25 @@
 Argument, in the `docs/PROTOCOL.md` sense: it records *why* the replacement is shaped
 this way, and is revised when the reasoning changes.
 
+**STATUS: BUILT, 2026-08-19, state 8.** The control law is
+`train.Modeller.select_batch_size` (+ `_conclude_batch_calibration`); the walk's four
+config keys are retired (`utils._RETIRED_KEYS`); `batch_util_target` (unset = hold
+the base, S3) and `batch_growth_cap` (rung step: geometric until the increment
+reaches the cap, linear after -- bounds the selection's absolute overshoot past
+the occupancy crossing to one accum quantum; 0 = uncapped) are the new keys, and the detection cases live in
+`bench/test_batch_traps.py` / `bench/test_oom_ceiling_expiry.py`. The state-8 record
+in `config_state.py` is the transition. Sections below are the argument that produced
+it; §0.15 has been REVISED against `phase6_handoff.md`, which post-dates the original
+decision and overturns its sensor choice.
+
 Phase 6 says **replace, do not patch further**, with two objectives in strict priority:
 satisfy the cluster utilization requirement, then maximize throughput subject to it.
 
-**This document does not pick a single threshold, rung, setpoint or knee location.**
-Those are gated on Phase 4's utilization proxy, which does not exist. Every such
-quantity below is a named parameter with a unit, a meaning, a stated instantiation
-route, and a stated behaviour when unset. Where a number appears it is either measured
-(and cited) or it is a domain boundary, and it says which.
+**This document does not pick a single knee location or setpoint — and no longer needs
+to.** The objective decision (§0.0) makes the throughput answer a constant, and the
+handoff's measurements instantiate the occupancy side: an empirical threshold bracket
+(§0.15) and a measured `t(B)` cost model (handoff §4.1). Every parameter below still
+has a unit, a meaning, an instantiation route, and a stated behaviour when unset.
 
 ---
 
@@ -104,55 +115,45 @@ Three consequences the design is built around:
    gradient quality, and it was the user's to make. It stays a logged parameter in the
    code so a board can still sweep it, but it now has a decided default and a reason.
 
-### 0.15 The proxy, DECIDED — and it is CASE 3, not case 2
+### 0.15 The proxy — REVISED 2026-08-19 against the handoff, which overturns the sensor
 
-**Decision (user, 2026-08-16): adopt `gpu/util_policy` — the 2 h rolling average — as the
-proxy, with an observed cancellation floor of ~60 %.**
+**Original decision (user, 2026-08-16): adopt `gpu/util_policy` — the 2 h rolling
+average — as the proxy, with an observed cancellation floor of ~60 %.** The ~60 %
+number was derived from the **wandb system stream** (out-of-process), not from the
+sensor itself; that matters below, because the number survives the sensor's death.
 
-**Recorded as case 3** (`infrastructure_stabilization.md` §Phase 4: "the most conservative
-available reading plus a stated margin"), *not* case 2 ("agreement with cluster-visible
-evidence is *shown*"). The protocol requires writing down which, because "a proxy adopted
-under case 3 and later remembered as case 1 is how a margin quietly becomes a law."
+**The sensor half is FALSIFIED** (`phase6_handoff.md` §2, measured on
+`a100_stab_aug16`): against the out-of-process stream over the same trailing window,
+`gpu/util_policy` errs by −6 to **+40 points with a sign that flips with batch**, so
+no fixed margin corrects it. Arms self-reporting 87–89 % were cancelled. Cause: the
+in-process sampler sits inside the training portion of the loop, so eval, figure
+logging and archiving contribute no samples. The metric survives as a logged series;
+nothing may be *decided* on it.
 
-**Why case 2 is not available.** Slurm records only "cancelled" with no reason, and the
-wandb `state` field cannot substitute for it — checked across 45 runs carrying
-`gpu/util_policy`:
+**The replacement proxy is the out-of-process reading** — the wandb system stream
+(~14 s cadence) and the `nvidia-smi` sidecar CSV (10 s, `joblogs/*_smi.csv`), which
+read the same NVML counter. This upgrades the adoption from case 3 toward case 2: the
+out-of-process numbers **agree with the only cluster-visible outcome available** —
+arms at 38–40 % were cancelled at `02:00:2x`, a run at 49.4 % survived to its cap
+(handoff §4.3). Still not full case 2 — cluster support, asked directly (2026-08-19),
+supplied a sidecar recipe (confirming the 10 s `nvidia-smi` loop as the sanctioned
+instrument) but **not the scheduler's statistic, window or threshold**, so the rule
+itself remains inferred. Their sample output also shows 4-GPU nodes at wildly
+different utilizations: any sidecar or system-stream reading **must filter to our GPU
+index**, or it imports a neighbour's workload.
 
-| state | n | min | median | max |
-|---|---:|---:|---:|---:|
-| crashed | 30 | 30.5 | 40.1 | **100.0** |
-| failed | 7 | 39.5 | 51.1 | **100.0** |
-| finished | 5 | 26.0 | 52.6 | 72.2 |
+**The number that travels: threshold ≤ 49.4 % (a run survived there), cancellations
+observed at ≤ 40 %, target 60 % as margin over the whole bracket** — margin still
+required, both because the rule is inferred and because the in-run calibration
+samples share the eval-blindness direction of error.
 
-Four runs sat at **exactly 100.0 %** and still failed; `prod0810_mipcas_elj` crashed at
-94.1 % and `nehzor_elj` at 93.7 %. A 60 % floor explains none of those, so `crashed`
-conflates cancellation with every other abnormal exit. The three runs that *finished*
-below 60 % are all on host `BB2` — the dev box, no scheduler — so they are not cluster
-evidence at all.
-
-**The observed tell is a wall-clock signature, and it corroborates the mechanism rather
-than the threshold.** A cancelled job ran 2–3 h, or was cancelled 2–3 h *after a phase
-transition*. The second form is **predicted by the sensor's construction**:
-`_gpu_util_mean` is a trailing window that is never cleared at a stage transition, so a
-transition into a low-occupancy stage takes a full window to poison the average, and the
-job dies one window later. Not statistically checkable in the current data — every run in
-the 1.75–3.5 h band predates the sensor (13 runs, all `gpu/util_policy` absent) — which
-is the concrete reason **G4b (a stage-index series) is a prerequisite**: without it the
-transition time is not in the metric stream and this tell cannot be tested.
-
-**Two consequences of case 3 that must travel with the number.**
-
-1. **The margin has the wrong sign at 60 %.** Eval blindness means `gpu/util_policy`
-   *overstates* what the scheduler sees, so applying a 60 % threshold to a 60 % reading
-   leaves **negative** margin. The threshold must be `60 % + the measured unsampled
-   share`, which is what arm D exists to measure.
-2. **On the UMA route the feasible set is EMPTY.** The measured occupancy is
-   52 / 44 / 49 / 42 across a 7.4x batch range — entirely below 60 %. No batch satisfies
-   the constraint, so the correct output is `INFEASIBLE_ROUTE`, said loudly: batch is not
-   the lever, and work-per-kernel-launch and unpaired host stalls are. A controller that
-   hunts for a rung that does not exist is the trap-(a) shape again.
-   (`prod0810_mipcas_uma` reads 63.5 %, so this is config-dependent, not a flat property
-   of UMA.)
+**The UMA-infeasibility consequence is RETRACTED.** The 52/44/49/42 ladder that made
+the UMA feasible set look empty was read off the falsified sensor on the dev box, and
+the handoff (§4.4) shows the real mechanism was batch pinning — the energy call's
+memory ceiling capping the rollout batch — with `prod0810_nehzor_uma` sustaining
+77.3 % for 47.9 h at rollout batch 1853. `INFEASIBLE` remains a required *output* of
+the controller (built: the argmax-occupancy hold plus a diagnosis naming the binding
+bound), but it is a per-run verdict, not a property of the route.
 
 ### 0.2 The utilization proxy cannot be a closed-loop input at controller timescales
 
@@ -174,10 +175,21 @@ the reading is `(n₂·U(B₂) + n₁·U(B₁))/(n₁+n₂)`: **reading `U(B₂)
 1.8 h *per rung* — a 5-rung survey is ≥9 h of dwell before priority 1 is evaluable, per
 stage. That is not a calibration; that is the run.
 
-**Therefore priority 1 is FEED-FORWARD.** A predicate over a `U(B)` relation fitted
-offline, evaluated at candidate `B`. The in-run reading is demoted to a slow,
+**Therefore priority 1 is FEED-FORWARD.** A predicate over a `U(B)` relation,
+evaluated at candidate `B`. The in-run windowed reading is demoted to a slow,
 stage-granularity **audit** that can *invalidate* the relation but never steers a
 decision. This follows from window arithmetic alone, so it does not wait on Phase 4.
+
+**Clarified 2026-08-19 — feed-forward does not mean no probing.** The 1.8 h-per-rung
+dwell above is a property of the never-cleared trailing MEAN, not of measurement
+itself: RAW samples taken during a rung's own dwell (60 s cadence in-process, 10 s on
+the sidecar) make a per-rung occupancy reading a **minutes-scale** measurement. So
+the built calibration walks the ladder once per stage over real train steps, reads
+raw samples per rung, computes the selection once, and holds it; during the run the
+only occupancy consumers are the S2 audit (one full policy window at the selected
+rung, compared against the base rung's calibration) and drift watching via the
+logged series. Probe at entry, hold, audit — never a closed loop on the windowed
+mean.
 
 ### 0.3 The previous sandbox could not have detected trap (a)
 
@@ -191,9 +203,23 @@ That is why the sandbox is replaced too, and why its only measured cell is a
 
 ---
 
-## 1. The two structural rules
+## 1. The structural rules
 
-Everything else is bookkeeping.
+Everything else is bookkeeping. In plain words first, because each rule is just a
+shipped failure mode inverted:
+
+- **S1** — an occupancy reading may only *veto* batch sizes ("these rungs don't clear
+  the constraint"), never *choose* one; the choice itself is a fixed rule (smallest
+  surviving rung). Exists because the old occupancy rule actively drove batch upward,
+  outranking a throughput gate that had refused every growth.
+- **S2** — if candidates were excluded because "bigger batch → higher occupancy" and
+  occupancy then didn't rise, the exclusion is withdrawn. The constraint keeps
+  earning its removals.
+- **S3** — no reading means no constraint: not "fine", not "assume the worst". With
+  nothing measured the controller holds B = A, which is the shipping default.
+
+Since §0.0 made priority 2 a constant, these three rules plus "hold at A, grow only
+for occupancy" essentially *are* the whole controller.
 
 **S1 — AUTHORITY DIRECTION (kills trap (a)).** Priority 1 is **set-valued and
 subtractive**: it may remove rungs from a candidate set and may do nothing else.
@@ -453,10 +479,9 @@ Shape, not values — the values are the measurement's job. Written as a delta i
 
 ## 7. The design's weakest points, stated
 
-1. **The objective is unresolved and the two candidates disagree in argmax.** Everything
-   downstream — the shape, the knee, the selection — is conditional on a choice no
-   measurement in flight will settle. The design makes it a logged parameter rather than
-   hiding it, which is honest but not a fix.
+1. ~~**The objective is unresolved and the two candidates disagree in argmax.**~~
+   **SETTLED** — §0.0 decided it (steps/sec at threshold effective batch) before the
+   build, and the built controller has no throughput search at all.
 2. **`DWELL_STEPS` unset means every rung is provisional**, and a provisional rung may
    not reject. With no measurement the controller therefore surveys and holds, and never
    rejects a rung — safe, and slower than it needs to be.

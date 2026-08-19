@@ -8,13 +8,13 @@ a batch arm need different clocks. This is the batch half, built to the same fou
 functions of the trace, and the MODELLER is faked while the CONTROLLER is real.
 
 THE STEP-BODY ORDER IS LOAD-BEARING AND IS COPIED, NOT INVENTED. `train.py` appends
-the timing and the work to the deques and THEN calls `increment_batch_size`, so the
+the timing and the work to the deques and THEN calls `select_batch_size`, so the
 controller always scores the step it just timed, at the batch that actually ran it.
 `bench/old/harness.py` inverted parts of this and that is how a rung baseline could be
 compared against a step the next rung had already paid for. The order here is:
 
     attempt captured  ->  step timed (or OOM)  ->  deques appended  ->  clock advanced
-    (incl. eval)  ->  _sample_gpu_util()  ->  handle_train_epoch_error | increment_batch_size
+    (incl. eval)  ->  _sample_gpu_util()  ->  handle_train_epoch_error | select_batch_size
 
 TWO LOSSES, TWO CLOCKS, DELIBERATELY -- the same split `bench/runner.py:203-208` makes
 between `loss` and `eloss`:
@@ -42,7 +42,7 @@ class BatchRun:
 
     `arm` supplies the config overrides and (optionally) a `patch(cls)` hook that
     installs an injected defect. Nothing else -- the control law under test is the
-    REAL `train.Modeller.increment_batch_size`, bound on by `attach_real_batch_sizer`.
+    REAL `train.Modeller.select_batch_size`, bound on by `attach_real_batch_sizer`.
     """
 
     def __init__(self, device, arm, seed=0, steps=20000, stage='equilibration',
@@ -111,7 +111,7 @@ class BatchRun:
                 RuntimeError('CUDA out of memory. Tried to allocate 2.00 GiB '
                              '(synthetic bench OOM)'), self.stage)
         else:
-            m.increment_batch_size()               # the REAL control law
+            m.select_batch_size()                  # the REAL control law
 
         outside = getattr(dev, 'outside_range', lambda b: False)
         self.trace.append({

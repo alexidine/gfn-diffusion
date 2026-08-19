@@ -55,6 +55,30 @@ def _wrapped_lp(x, mu, s):
     return np.log(np.clip(acc, 1e-300, None))
 
 
+def dof_to_state(en, d):
+    """``(r, theta, phi)`` -> state ``x``, at ANY level. THE ONLY THING THAT WAS MISSING.
+
+    ``state_from_dof`` refuses at a collective level and its message names
+    ``build_prior_states.draw_states`` as the torsion route. This IS that route, and it is
+    a translation rather than a derivation: there is no row-wise inverse because one column
+    drives several dihedrals, but the column is simply the LEADER'S DISPLACEMENT over the
+    free scale -- exactly what ``draw_states`` writes as
+    ``x[:, j] = wrap((phi - phi_ref) / pi)``, with the leader taken from ``mask[:, j]`` and
+    ``phi_ref = ph0[leader]``. No new machinery; one branch.
+    """
+    n_r, n0_ = en.n_r, en.n_r + en.n_th
+    t = lambda a: torch.as_tensor(a, dtype=en.dtype, device=en.device)
+    if not en.collective:
+        return en.state_from_dof(t(d[:, :n_r]), t(d[:, n_r:n0_]), t(d[:, n0_:])).clamp(-1, 1)
+    mask = en.mask.detach().cpu().numpy()
+    ph0 = en.ph0.detach().cpu().numpy()
+    x = np.empty((d.shape[0], mask.shape[1]))
+    for j in range(mask.shape[1]):
+        lead = int(np.flatnonzero(mask[:, j] != 0)[0])
+        x[:, j] = ((d[:, n0_ + lead] - ph0[lead]) / np.pi + 1.0) % 2.0 - 1.0
+    return t(x).clamp(-1, 1)
+
+
 def oracle_logw(en, n: int = 6000, seed: int = 0, report_modes: bool = False):
     """Log importance weights for the best product-form proposal we can construct.
 
@@ -83,8 +107,7 @@ def oracle_logw(en, n: int = 6000, seed: int = 0, report_modes: bool = False):
     t = lambda a: torch.as_tensor(a, dtype=en.dtype, device=en.device)
 
     def energy_of(d):
-        x = en.state_from_dof(t(d[:, :n_r]), t(d[:, n_r:n0]), t(d[:, n0:])).clamp(-1, 1)
-        return en.energy(x).detach().cpu().numpy()
+        return en.energy(dof_to_state(en, d)).detach().cpu().numpy()
 
     grid = np.linspace(-np.pi, np.pi, NGRID, endpoint=False)
     tables, modes = {}, {}
@@ -107,15 +130,22 @@ def oracle_logw(en, n: int = 6000, seed: int = 0, report_modes: bool = False):
     rng = np.random.default_rng(seed)
     dof = np.repeat(ref[None], n, 0)
     logq = np.zeros(n)
-    for j in range(n_r):
-        dof[:, j] = rng.normal(r0[j], s_r[j], n)
-        logq += _gauss_lp(dof[:, j], r0[j], s_r[j])
-    for j in range(n_th):
-        dof[:, n_r + j] = rng.normal(th0[j], s_th[j], n)
-        logq += _gauss_lp(dof[:, n_r + j], th0[j], s_th[j])
-    for j in imp:
-        dof[:, n0 + j] = ph0[j] + rng.normal(0.0, s_imp, n)
-        logq += _wrapped_lp(dof[:, n0 + j], ph0[j], s_imp)
+    # AT A COLLECTIVE LEVEL THIS MACHINERY DROPS OUT, it is not translated. r, theta and
+    # every improper row are FROZEN there, and dof_to_state reads only the leader columns --
+    # so perturbing them would add logq terms with no counterpart in the state and the
+    # weights would be nonsense (measured: eta of 171440%, i.e. an "oracle" 1700x WORSE
+    # than the fitted prior). What remains at torsion is one 1-D energy scan per rotatable
+    # bond, which is the whole of the oracle there.
+    if not en.collective:
+        for j in range(n_r):
+            dof[:, j] = rng.normal(r0[j], s_r[j], n)
+            logq += _gauss_lp(dof[:, j], r0[j], s_r[j])
+        for j in range(n_th):
+            dof[:, n_r + j] = rng.normal(th0[j], s_th[j], n)
+            logq += _gauss_lp(dof[:, n_r + j], th0[j], s_th[j])
+        for j in imp:
+            dof[:, n0 + j] = ph0[j] + rng.normal(0.0, s_imp, n)
+            logq += _wrapped_lp(dof[:, n0 + j], ph0[j], s_imp)
     step = grid[1] - grid[0]
     for gi, rows_j in enumerate(groups):
         g_, p, cdf = tables[gi]
@@ -127,6 +157,11 @@ def oracle_logw(en, n: int = 6000, seed: int = 0, report_modes: bool = False):
         logq += np.log(np.clip(dens, 1e-300, None))
         disp = (val - ph0[lead] + np.pi) % (2 * np.pi) - np.pi
         for i in rows_j[1:]:
+            if en.collective:
+                # the column drives every follower rigidly: no jitter, and a deterministic
+                # follower contributes no density term
+                dof[:, n0 + i] = ph0[i] + disp
+                continue
             dof[:, n0 + i] = ph0[i] + disp + rng.normal(0.0, g_sigma[gi], n)
             logq += _wrapped_lp(dof[:, n0 + i], ph0[i] + disp, g_sigma[gi])
 
@@ -138,11 +173,49 @@ def prior_report(en, prior, n: int = 6000, seed: int = 0, n_boot: int = 200,
                  blocks: bool = True, oracle: bool = True) -> dict:
     """Fitted-vs-oracle quality for one molecule. Every field is defined in the module docstring."""
     rng = np.random.default_rng(seed)
-    x, stats = en.sample_prior_states(prior, n, rng, report=False, joint_rings=False)
-    logw_fit = (-en.energy(x).detach().cpu().numpy()
-                - en.prior_log_prob(prior, stats['dof']))
-
-    clip = max([v for v in stats.get('clip_frac', {}).values()] or [0.0])
+    if en.collective:
+        # THE TORSION ROUTE, named by state_from_dof's own refusal. draw_states samples the
+        # leader per rotatable bond and writes the state column directly, so it never needs
+        # the inverse that does not exist. The followers are then DETERMINISTIC given the
+        # leader, which makes their prior_log_prob terms constant across draws -- and a
+        # constant cancels in a self-normalised ESS, which is why the same density scores
+        # both routes.
+        import contextlib
+        import io
+        from build_prior_states import draw_states
+        with contextlib.redirect_stdout(io.StringIO()):
+            xt, _ = draw_states(en, prior, n, rng)
+        x = xt.to(en.dtype)
+        dof = np.concatenate([a.detach().cpu().numpy()
+                              for a in en.dof_from_state(x)], axis=1)
+        # draw_states writes wrapped columns, so nothing can land outside the box
+        clip = 0.0
+    else:
+        # joint_rings left at its DEFAULT. This function scores draws with prior_log_prob,
+        # which refuses on any ring block, so a ring molecule is skipped below either way --
+        # but passing joint_rings=False here said "measure the disabled path", and that is
+        # what the reference table inherited.
+        x, stats = en.sample_prior_states(prior, n, rng, report=False)
+        dof = stats['dof']
+        clip = max([v for v in stats.get('clip_frac', {}).values()] or [0.0])
+    # TWO LOUD EXCLUSIONS, stated rather than routed around.
+    # (1) prior_log_prob raises on ANY ring block at EVERY level: a bank/pucker density is a
+    #     mixture that is singular in the held directions, so there is no weight to quote.
+    #     That is Track C1. A labelled skip, never an approximation.
+    try:
+        logq_fit = en.prior_log_prob(prior, dof)
+    except NotImplementedError as exc:
+        return {'d': int(en.ndim), 'n': n, 'clip_frac': clip,
+                'skipped': 'prior_log_prob: {}'.format(str(exc).split('.')[0].strip())}
+    # (2) the box clamp is NOT represented in the density -- it puts finite mass exactly on
+    #     the wall, where no continuous density can put any. Weights are valid only when
+    #     essentially nothing was clipped.
+    if clip > 1e-3:
+        return {'d': int(en.ndim), 'n': n, 'clip_frac': clip,
+                'skipped': 'clip_frac={:.4f}: mass sits ON the box wall, which the density '
+                           'does not represent, so these weights would be quietly wrong'
+                           .format(clip)}
+    logw_fit = -en.energy(x).detach().cpu().numpy() - logq_fit
     out = {'d': int(en.ndim), 'n': n, 'clip_frac': clip,
            'ess_fitted': ess_fraction(logw_fit),
            'sd_logw_fitted': float(logw_fit.std())}
@@ -166,13 +239,11 @@ def prior_report(en, prior, n: int = 6000, seed: int = 0, n_boot: int = 200,
                               en.th0.detach().cpu().numpy(),
                               en.ph0.detach().cpu().numpy()])
         t = lambda a: torch.as_tensor(a, dtype=en.dtype, device=en.device)
-        dof = stats['dof']
         for tag, sl in (('r', slice(0, n_r)), ('theta', slice(n_r, n0)),
                         ('phi', slice(n0, en.ndim))):
             d = np.repeat(ref[None], n, 0)
             d[:, sl] = dof[:, sl]
-            xx = en.state_from_dof(t(d[:, :n_r]), t(d[:, n_r:n0]),
-                                   t(d[:, n0:])).clamp(-1, 1)
+            xx = dof_to_state(en, d)
             lw = -en.energy(xx).detach().cpu().numpy() - en.prior_log_prob(prior, d)
             out[f'ess_{tag}'] = ess_fraction(lw)
     return out
@@ -200,7 +271,7 @@ def rotamer_modes(en, min_rel: float = 0.05):
         disp = (grid - ph0[lead] + np.pi) % (2 * np.pi) - np.pi
         for i in rows_j[1:]:
             d[:, n0 + i] = ph0[i] + disp
-        x = en.state_from_dof(t(d[:, :n_r]), t(d[:, n_r:n0]), t(d[:, n0:])).clamp(-1, 1)
+        x = dof_to_state(en, d)
         p = np.exp(-en.energy(x).detach().cpu().numpy() + 0.0)
         p = p / p.max()
         pk = [k for k in range(NGRID)
@@ -252,14 +323,16 @@ def coverage_report(en, prior, n: int = 6000, seed: int = 0, max_modes: int = 51
             disp = (val - ph0[lead] + np.pi) % (2 * np.pi) - np.pi
             for i in rows_j[1:]:
                 d[m, n0 + i] = ph0[i] + disp
-    x = en.state_from_dof(t(d[:, :n_r]), t(d[:, n_r:n0]), t(d[:, n0:])).clamp(-1, 1)
+    x = dof_to_state(en, d)
     e_mode = en.potential_energy(x, T).detach().cpu().numpy()
     e_best = float(e_mode.min())
     accessible = (e_mode - e_best) / T <= accessible_kt
 
     # ---- where do prior draws land? ----
     rng = np.random.default_rng(seed)
-    xs, stats = en.sample_prior_states(prior, n, rng, report=False, joint_rings=False)
+    # coverage needs no density, so unlike prior_report it CAN run on a ring molecule --
+    # and must therefore draw from the real ring path, not the disabled one.
+    xs, stats = en.sample_prior_states(prior, n, rng, report=False)
     dof = stats['dof']
     lab = np.zeros(n, dtype=np.int64)
     stride = 1

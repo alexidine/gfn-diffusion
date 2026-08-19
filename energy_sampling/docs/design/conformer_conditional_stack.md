@@ -541,9 +541,16 @@ Ordered by how much they would change a conclusion.
   coverage is trustworthy only for weakly-coupled rotamers.
 - **`prior_diagnostics.py` has no tests.** Nothing would have caught the above except
   looking.
-- **Rings are excluded from the diagnostics.** `prior_log_prob` raises on them by design
-  (a ring block's density is a mixture, and singular in the directions its subspace does
-  not span) and mode enumeration is rotamer-only. Most drug-like molecules are rings.
+- **Rings are excluded from the DENSITY-DEPENDENT diagnostics only** — corrected; the
+  earlier "excluded from the diagnostics" was too broad. `prior_log_prob` still raises on a
+  ring block by design (its density is a mixture, and singular in the directions its
+  subspace does not span), so ring ESS, `D_avoidable` and IS log Z remain **unavailable by
+  derivation, not approximated**, and mode enumeration is still rotamer-only. What does now
+  run per ring: energy excess and `T_eff/T`, closure error (absolute and in bond-sigma),
+  the four ring classes, pucker-basin occupancy on supported saturated rings, and aromatic
+  planarity — see `energies/ring_metrics.py` and the ring block of
+  `energies/prior_baselines.py`, with a named `prior-rings-off` negative control that makes
+  those columns falsifiable. Most drug-like molecules are rings.
 - **Mode enumeration is 3^n**, capping around five or six rotatable groups.
 - **`prior_log_prob` is thinly validated** — it gates every ESS number, and no test would
   fail if it were subtly wrong. Note that T_eff and coverage do not depend on it.

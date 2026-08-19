@@ -1,27 +1,31 @@
 """
-The OOM ceiling must EXPIRE, and a pin below the batch floor must not deadlock.
+The OOM ceiling must EXPIRE, and a cut batch must find its way back to the base.
 
 WHAT KILLED THREE RUNS. prod0810's acridine/mace arms (indices 4-6) were cancelled
 by the scheduler for low GPU utilization while still in `train_prior` -- a stage that
 makes no MLIP calls at all (the reward is a stored attribute on the prior rows), so
-occupancy is a pure function of batch size. The batch never grew. One OOM at the BASE
-batch of 1000 was enough:
+occupancy is a pure function of batch size. One OOM at the BASE batch of 1000 was
+enough: the ceiling latched at 1000, the batch parked below the configured base, and
+the arm ran the rest of the stage under-sized on a stage judged by occupancy.
 
-    OOM at 1000  ->  ceiling = 1000, batch = 500      (handle_train_epoch_error)
-    walk         ->  500 -> 825                        (825 < 1000, allowed)
-    walk         ->  825 -> 1361 REFUSED               (1361 >= ceiling) -> PIN
-    knee recheck ->  drop target = max(floor 1000, 500) = 1000 >= 825 -> return
+Under the state-8 replacement (train.select_batch_size) there is no growth walk, so
+the same failure has a NEW way to happen by omission: an OOM cuts the batch to 500,
+and with nothing regrowing, expiry of the ceiling would change nothing unless the
+controller explicitly RESTORES the base. These tests drive the real
+select_batch_size / handle_train_epoch_error through the prod0810 numbers and
+require the batch to come back to the configured base -- reverting either the expiry
+or the restore rule must turn them red.
 
-...and that last line returned WITHOUT re-arming batch_size_pinned_at, so the recheck
-branch was re-entered every step and could never fire again. The ceiling was a
-permanent conclusion, the pin sat below _batch_floor() where the recheck could not
-reach it, and the arm ran the rest of the stage at 0.825x its configured batch.
+Two deliberate behaviour changes from the old controller are pinned here rather than
+papered over:
 
-Both halves are tested here, and both are tested by REPRODUCING THE FAILURE, not by
-asserting that the fixed code does what it does: each test drives the real
-increment_batch_size / handle_train_epoch_error through the exact prod0810 numbers and
-requires the batch to come back UP. Reverting either fix must turn these red -- see
-the module docstring in bench/README.md on what a blind batch test looks like.
+  * recovery goes to the BASE, never past it. The old walk climbed toward a
+    samples/sec knee; the objective decision (phase6_batch_sizer.md section 0.0)
+    makes the throughput optimum the constant base batch, so "recovered" now means
+    "back at batch_size", not "climbing".
+  * while a ceiling stands AT OR BELOW the base, the controller holds the cut size
+    -- the base itself is the size that OOM'd, and re-approaching it before the
+    ceiling expires would be growing blind.
 """
 import os
 import sys
@@ -33,13 +37,17 @@ from bench.fake_modeller import (FakeModeller, FakeStage, attach_real_batch_size
 
 attach_real_batch_sizer()
 
-# prod0810/4.yaml (acridine_sg14_zp1_mace), the batch controller's view of it
+# prod0810/4.yaml (acridine_sg14_zp1_mace), the batch controller's view of it.
+# The retired walk keys (auto_batch_throughput_opt & co.) are gone from make_args,
+# which is itself part of the point: the config surface no longer carries them.
 PROD0810 = dict(batch_size=1000, max_batch_size=50000, grow_batch_size=True,
                 batch_growth_factor=1.65, batch_growth_interval=50,
-                batch_growth_slow_interval=300, auto_batch_throughput_opt=True,
-                batch_growth_min_throughput_gain=0.05, max_step_seconds=300,
-                batch_knee_recheck_steps=2000, oom_batch_shrink_factor=0.5,
-                oom_cooldown_steps=200, batch_oom_ceiling_retest_steps=1000)
+                max_step_seconds=300, oom_batch_shrink_factor=0.5,
+                oom_cooldown_steps=200, batch_oom_ceiling_retest_steps=1000,
+                # prod0810 predates the occupancy ladder: no target existed.
+                # Pinned explicitly since the canonical default became 60
+                # (2026-08-19) -- this file's premise is the no-target regime.
+                batch_util_target=0)
 
 #: DERIVED, never hardcoded below. This mirrors a shipping config, and the shipping
 #: value has already moved once (2000 -> 1000). A test that hardcodes the window
@@ -47,21 +55,10 @@ PROD0810 = dict(batch_size=1000, max_batch_size=50000, grow_batch_size=True,
 #: retuned -- it keeps passing while measuring nothing.
 RETEST = PROD0810['batch_oom_ceiling_retest_steps']
 
-
-# Two step-cost models, because "did the batch recover" has a different right answer
-# under each and a test that only knows one of them proves very little.
-#
-#   FLAT      step time strictly proportional to batch => samples/sec constant. The
-#             knee has no reason of its own to climb, so the configured batch_size is
-#             the correct resting place and anything the batch does here is the
-#             ceiling logic doing it, not a throughput gradient rescuing the run.
-#             This is close to what train_prior actually is on this route: no energy
-#             call, step dominated by host-side batch collation.
-#   HEADROOM  a fixed per-step overhead plus linear cost => samples/sec rises with
-#             batch and saturates. This is the case the acridine arms NEEDED to
-#             reach, and the only one that can show a climb back through the ceiling.
+# step cost strictly proportional to batch. The cost model no longer changes what
+# recovery means -- the controller reads no throughput gradient -- but the deques
+# still need plausible timings for the runaway guard's median.
 FLAT = lambda b: b / 1000.0
-HEADROOM = lambda b: 0.05 + b / 20000.0          # knee near batch ~7400
 
 
 def _drive(m, steps, cost=FLAT):
@@ -70,7 +67,7 @@ def _drive(m, steps, cost=FLAT):
         m.step_ind += 1
         m._recent_step_times.append(cost(m.batch_size))
         m._recent_step_work.append(m.batch_size)
-        m.increment_batch_size()
+        m.select_batch_size()
     return m.batch_size
 
 
@@ -83,53 +80,54 @@ def _fresh():
 
 
 def test_single_oom_does_not_cost_the_stage():
-    """The prod0810 chain end to end on the FLAT surface: one OOM at the base batch
-    must not leave the stage running below its configured batch_size. Before the fix
-    this parked at 825 forever."""
+    """The prod0810 chain end to end: one OOM at the base batch must not leave the
+    stage running below its configured batch_size forever. The old controller parked
+    at 825 for the stage's life; the new one must hold the cut size only while the
+    ceiling stands, then restore the base when it expires."""
     m = _fresh()
-    _drive(m, 60)                       # measure a rung at the base batch
+    _drive(m, 60)
 
     m.handle_train_epoch_error(RuntimeError('CUDA out of memory.'), 'bwd')
     assert m.batch_size == 500, m.batch_size
     assert m.batch_size_oom_ceiling == 1000, m.batch_size_oom_ceiling
 
-    # THE CEILING MUST BIND FIRST, or "recovery" proves nothing. Sampled across the
-    # window rather than asserted at one fixed step count, so retuning
-    # batch_oom_ceiling_retest_steps cannot turn this into a test that passes without
-    # ever observing the state it names.
-    pinned_at_some_point = False
+    # THE CEILING MUST BIND FIRST, or "recovery" proves nothing. The base (1000) IS
+    # the size that OOM'd, so while the ceiling stands the controller must hold the
+    # cut size rather than re-approach it. Sampled across the window rather than
+    # asserted at one fixed step count.
+    held_below = False
     for _ in range(max(1, RETEST // 50)):
         _drive(m, 50)
-        if m.batch_size_oom_ceiling is not None and m.batch_size <= 825:
-            pinned_at_some_point = True
-    assert pinned_at_some_point, (
+        if m.batch_size_oom_ceiling is not None and m.batch_size < 1000:
+            held_below = True
+    assert held_below, (
         'the ceiling never bound, so the recovery below demonstrates nothing')
 
-    # ...but the ceiling EXPIRES, and the walk re-probes past it
-    recovered = _drive(m, 8000)
+    # ...but the ceiling EXPIRES, and the restore rule brings the base back
+    recovered = _drive(m, 3000)
     assert m.batch_size_oom_ceiling is None, 'ceiling never expired'
-    assert recovered >= 1000, (
-        f'batch stuck at {recovered} after the ceiling expired -- below the '
-        f'configured batch_size of 1000. This is the prod0810 acridine/mace '
-        f'failure: a stage judged by GPU occupancy running under-sized for its life')
+    assert recovered == 1000, (
+        f'batch at {recovered} after the ceiling expired -- the configured base is '
+        f'1000. Below it is the prod0810 acridine/mace failure (a stage judged by '
+        f'GPU occupancy running under-sized for its life); above it is growth no '
+        f'objective asked for.')
 
 
-def test_recovery_climbs_back_through_the_ceiling_when_there_is_headroom():
-    """The case the acridine arms needed. With real throughput headroom above the
-    OOM'd size, an expired ceiling must let the walk climb well past it -- recovering
-    to exactly batch_size would still leave the card mostly idle."""
+def test_recovery_stops_at_the_base_not_a_knee():
+    """THE DELIBERATE INVERSION of the old headroom test, which required the walk to
+    climb well past the expired ceiling toward a samples/sec knee. Under the decided
+    objective (steps/sec at effective batch = the accum target) the throughput
+    optimum is the CONSTANT base, so recovery must stop exactly there -- climbing
+    past it is the retired objective reasserting itself."""
     m = _fresh()
-    _drive(m, 60, cost=HEADROOM)
+    _drive(m, 60)
     m.handle_train_epoch_error(RuntimeError('CUDA out of memory.'), 'bwd')
     assert m.batch_size_oom_ceiling == 1000
 
-    pinned = _drive(m, max(600, RETEST - 200), cost=HEADROOM)
-    assert pinned <= 825, f'ceiling should bind first, got {pinned}'
-
-    recovered = _drive(m, 20000, cost=HEADROOM)
-    assert recovered > 2000, (
-        f'batch only reached {recovered} against a knee near 7400 -- the expired '
-        f'ceiling is still throttling the walk')
+    recovered = _drive(m, RETEST + 3000)
+    assert recovered == 1000, (
+        f'recovered to {recovered}, not the configured base 1000 -- with no '
+        f'batch_util_target set, nothing may move the batch off the base')
 
 
 def test_ceiling_stands_while_ooms_keep_happening():
@@ -142,62 +140,70 @@ def test_ceiling_stands_while_ooms_keep_happening():
         _drive(m, RETEST - 200)         # always short of the retest window
         assert m.batch_size_oom_ceiling is not None, (
             'ceiling expired while OOMs were still being observed')
-    assert m.batch_size <= 1000
+    assert m.batch_size < 1000
 
 
-def test_pin_below_the_floor_rearms_instead_of_spinning():
-    """The second half: a pin BELOW _batch_floor() must re-arm the walk upward. The
-    old code returned early, leaving batch_size_pinned_at stale, so the recheck
-    branch was re-entered every step and never fired again."""
+def test_sub_base_batch_with_no_ceiling_is_restored():
+    """A batch parked below the base with NO ceiling standing (the shape a resume or
+    a stale cut can leave behind) must be restored to the base promptly -- there is
+    no evidence against the base, so running under it serves nothing."""
     m = _fresh()
     m.batch_size = 825                  # where the prod0810 walk parked
-    m.batch_size_saturated_stage = 'train_prior'
-    m.batch_size_pinned_at = 0
-    m.batch_size_oom_ceiling = None     # isolate the deadlock from the expiry
+    m.batch_sizer = None
+    m.batch_size_oom_ceiling = None
     m.step_ind = 0
-    assert m._batch_floor() == 1000, 'test assumes the pin sits below the floor'
+    assert m._batch_floor() == 1000, 'test assumes the batch sits below the base'
 
-    _drive(m, 2100)                     # past batch_knee_recheck_steps
-    assert m.batch_size_saturated_stage is None, (
-        'still pinned after the recheck window -- the walk never re-armed')
-    assert m.batch_size_pinned_at > 0, (
-        'batch_size_pinned_at was left stale, so the recheck can never fire again')
-    assert _drive(m, 2000) > 825, 'batch never recovered from a sub-floor pin'
+    _drive(m, 5)
+    assert m.batch_size == 1000, (
+        f'batch still {m.batch_size} with no ceiling standing -- the restore rule '
+        f'never fired')
+
+
+def test_ceiling_above_the_base_does_not_block_the_restore():
+    """The restore must distinguish 'the base OOMd' from 'something above the base
+    OOMd'. A ceiling at 1200 is no evidence against running at 1000."""
+    m = _fresh()
+    m.batch_size = 600
+    m.batch_sizer = None
+    m.batch_size_oom_ceiling = 1200
+    m.batch_size_oom_ceiling_at = None
+    m.step_ind = 0
+    _drive(m, 5)
+    assert m.batch_size == 1000, (
+        f'batch held at {m.batch_size} under a ceiling of 1200 -- the base 1000 is '
+        f'inside the domain and should be restored')
 
 
 def test_restored_ceiling_serves_its_window_from_the_resume():
     """A resume brings back the ceiling; the CLOCK may not come with it. Measured
     against an absent clock read as step 0, a run resuming at step 20000 expires its
     ceiling on the first post-resume step and walks straight back into the OOM it was
-    checkpointed to remember. `None` must mean unstamped, never step 0.
-
-    This is bench/old/test_A1's scenario, kept here because the expiry is what makes
-    it reachable again."""
+    checkpointed to remember. `None` must mean unstamped, never step 0."""
     m = _fresh()
     m.step_ind = 20000                  # a long-running run, resumed
     m.batch_size = 500
     m.batch_size_oom_ceiling = 1000
     m.batch_size_oom_ceiling_at = None  # what a restore leaves behind
-    m.batch_size_ever_oomed = True
 
-    _drive(m, RETEST - 400, cost=HEADROOM)   # well inside the retest window
+    _drive(m, RETEST - 400)             # well inside the retest window
     assert m.batch_size_oom_ceiling == 1000, (
         'restored ceiling expired immediately -- the clock was read as step 0')
-    assert m.batch_size <= 1000, 'resumed run climbed into the restored OOM ceiling'
+    assert m.batch_size < 1000, 'resumed run climbed into the restored OOM ceiling'
 
-    _drive(m, 3000, cost=HEADROOM)      # ...and past it, it expires normally
+    _drive(m, 3000)                     # ...and past it, it expires normally
     assert m.batch_size_oom_ceiling is None
+    assert m.batch_size == 1000
 
 
-def test_growth_is_unchanged_when_nothing_ooms():
-    """Negative control: on a clean run the new code must be inert. A test that only
-    proves the escape hatch opens says nothing about whether it opens too often."""
+def test_holds_the_base_when_nothing_ooms():
+    """Negative control: on a clean run with no batch_util_target the controller is
+    a HOLD -- the batch never leaves the configured base, in either direction."""
     m = _fresh()
     _drive(m, 4000)
     assert m.batch_size_oom_ceiling is None
-    assert not m.batch_size_ever_oomed
-    # flat throughput => the knee pins, and the floor holds it at the configured batch
-    assert m.batch_size >= 1000, m.batch_size
+    assert m.batch_size == 1000, m.batch_size
+    assert m.batch_sizer is not None and m.batch_sizer['reason'] == 'no_target'
 
 
 def test_ooms_and_expiries_are_counted_for_the_history_stream():

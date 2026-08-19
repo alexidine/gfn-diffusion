@@ -166,7 +166,10 @@ def test_warmup_holds_every_sensor():
     m.step_ind = 500
     m.lr_controller.on_calibration(_reading(64.0))
     assert m.lr_ctrl['peak_scale'] == 1.0
-    assert m.lr_controller._last['status'] == 'warmup'
+    # 'warmup_ramp' since the freeze-only reversal: the reading is LOOKED at
+    # (it can freeze the ramp) but still actuates nothing, which is what the
+    # peak_scale assertion above pins
+    assert m.lr_controller._last['status'] == 'warmup_ramp'
 
     m.lr_controller.on_plateau(True, 0.5)
     assert m.lr_ctrl['peak_scale'] == 1.0
@@ -259,6 +262,85 @@ def test_check_spike_catches_explosion(loss, grad):
 def test_check_spike_ignores_ordinary_training():
     m = _modeller()
     assert m.lr_controller.check_spike('fused', 5000.0, 900.0) is None
+
+
+def test_relative_bar_is_ARMED_by_default_and_matches_the_shipping_value():
+    """The bench transcribes the shipping config, so the rule is live here too
+    (test_fidelity pins that they agree). A steady loss must not trip it, and a
+    hundredfold excursion must -- while staying far below the absolute bar."""
+    m = _modeller()
+    assert float(m.args.adaptive_lr.divergence_loss_rel) == 100.0
+    for _ in range(60):
+        assert m.lr_controller.check_spike('fused', 1.0, 1.0) is None
+    assert m.lr_controller.check_spike('fused', 50.0, 1.0) is None
+    assert m.lr_controller.check_spike('fused', 500.0, 1.0) == 'diverged'
+
+
+def test_relative_bar_can_be_switched_off():
+    """null/0 = absolute bars only, for a route that legitimately swings."""
+    m = _modeller(**{'adaptive_lr.divergence_loss_rel': None})
+    for _ in range(60):
+        assert m.lr_controller.check_spike('fused', 1.0, 1.0) is None
+    assert m.lr_controller.check_spike('fused', 1.0e6, 1.0) is None
+
+
+def test_relative_bar_convicts_a_hundredfold_excursion():
+    """THE POINT OF THE RULE: a route whose loss lives at O(1) can go up 100x --
+    destroying the run -- while staying six orders of magnitude below the
+    absolute 1e9 bar."""
+    m = _modeller(**{'adaptive_lr.divergence_loss_rel': 100.0})
+    for _ in range(60):                       # settle a minimum, past _REL_MIN_OBS
+        assert m.lr_controller.check_spike('bwd', 2.0, 1.0) is None
+    assert m.lr_controller.check_spike('bwd', 150.0, 1.0) is None, 'under 100x'
+    assert m.lr_controller.check_spike('bwd', 250.0, 1.0) == 'diverged'
+
+
+def test_relative_bar_is_inert_until_it_has_seen_enough():
+    """A bar armed on its first reading would let the SECOND observation convict
+    the run -- the reference has to be a minimum, not a sample."""
+    m = _modeller(**{'adaptive_lr.divergence_loss_rel': 100.0})
+    assert m.lr_controller.check_spike('bwd', 1.0, 1.0) is None
+    assert m.lr_controller.check_spike('bwd', 1.0e5, 1.0) is None, 'not yet armed'
+
+
+def test_relative_bar_does_not_convict_a_new_LOW():
+    """A genuinely better loss must never trip the rule it is about to become
+    the reference for."""
+    m = _modeller(**{'adaptive_lr.divergence_loss_rel': 100.0})
+    for _ in range(60):
+        m.lr_controller.check_spike('bwd', 5.0, 1.0)
+    assert m.lr_controller.check_spike('bwd', 0.01, 1.0) is None
+
+
+def test_relative_bar_is_floored_so_a_near_zero_loss_cannot_arm_a_hair_trigger():
+    """Without the floor, a loss touching ~0 makes the bar ~0 and ordinary noise
+    reads as divergence."""
+    m = _modeller(**{'adaptive_lr.divergence_loss_rel': 100.0})
+    for _ in range(60):
+        m.lr_controller.check_spike('bwd', 1.0e-12, 1.0)
+    # floor 1e-3 * 100 = 0.1, so ordinary small values stay clean
+    assert m.lr_controller.check_spike('bwd', 0.05, 1.0) is None
+
+
+def test_relative_bar_is_per_channel():
+    """fwd and bwd differ in scale; a shared minimum would be the smaller of the
+    two and would convict the other."""
+    m = _modeller(**{'adaptive_lr.divergence_loss_rel': 100.0})
+    for _ in range(60):
+        m.lr_controller.check_spike('bwd', 0.01, 1.0)
+        m.lr_controller.check_spike('fwd', 100.0, 1.0)
+    assert m.lr_controller.check_spike('fwd', 150.0, 1.0) is None
+
+
+def test_relative_bar_reference_is_cleared_at_a_stage_transition():
+    """Loss SCALE differs by orders of magnitude between stages, so a minimum
+    carried across would convict the next stage on its first ordinary reading."""
+    m = _modeller(**{'adaptive_lr.divergence_loss_rel': 100.0})
+    for _ in range(60):
+        m.lr_controller.check_spike('bwd', 0.01, 1.0)
+    m.lr_controller.rearm_warmup()
+    for _ in range(60):
+        assert m.lr_controller.check_spike('bwd', 50.0, 1.0) is None
 
 
 def test_divergence_cuts_and_records_a_permanent_ceiling():

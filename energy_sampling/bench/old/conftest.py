@@ -59,10 +59,26 @@ generation"):
 None of the three imports a shipping symbol; they are self-tests of retired code,
 and re-collecting them would re-assert the constants the rebuild exists to be rid
 of.
+
+ADDED 2026-08-19 (state 8): the two BATCH files joined the ignore list when the
+throughput knee walk they test was deleted from `train.Modeller` (phase 6:
+"replace, do not patch further" -- see docs/design/phase6_batch_sizer.md and the
+state-8 record in config_state.py). Everything the mutation audit above credited
+them with protecting was a property OF THE WALK -- the floor stopping its
+descent, the gain gate freezing it, the pin/sawtooth interaction -- and the
+replacement contains no walk: those behaviours are now protected, in their new
+form, by the collected `bench/test_batch_traps.py` (injection-detected) and
+`bench/test_oom_ceiling_expiry.py` (rewritten for the restore rule):
+
+    test_batch_sizer.py          drives auto_batch_throughput_opt / the knee gate,
+                                 both retired keys that now hard-fail at load
+    test_batch_adversarial.py    adversarial cases against the same walk
 """
 
 collect_ignore = [
     'test_scenarios.py',
     'test_off_target.py',
     'test_crucible_feasibility.py',
+    'test_batch_sizer.py',
+    'test_batch_adversarial.py',
 ]

@@ -306,7 +306,6 @@ def _validate_defaults(reg: dict) -> None:
             'the workload generator; remove this key.')
     for key, want in (('checkpoint_read_only', True),
                       ('grow_batch_size', False),
-                      ('auto_batch_throughput_opt', False),
                       ('max_step_seconds', 0)):
         if ov.get(key) != want:
             raise RegistryError(f'defaults.overrides.{key} must be {want!r}')

@@ -1382,13 +1382,11 @@ class StageProtocol:
         # turbulence does not reach, so there is nothing for a transition to
         # protect it from.
         m.combo_loss_record = []
-        # batch controller: the throughput-knee state describes the OUTGOING
-        # stage's step-cost profile -- a rung baseline or step-time window
-        # measured there would cross-phase-contaminate the incoming stage's
-        # first knee comparison (same rationale as the OOM path's reset)
-        m._rung_throughput = None
-        m.batch_size_saturated_stage = None
-        m.batch_size_pinned_at = 0
+        # batch sizer: its conclusion and rung table describe the OUTGOING stage's
+        # step-cost and occupancy profile -- carried over, they would answer the
+        # incoming stage's question with the outgoing stage's measurements (same
+        # rationale as the OOM path's reset). The incoming stage re-runs the ladder.
+        m.batch_sizer = None
         m.batch_size_oom_ceiling = None  # the incoming stage has its own memory profile
         m.batch_size_oom_ceiling_at = None       # ...and its own expiry clock
         m.batch_size_oom_min = None              # ...and its own OOM history
@@ -1404,17 +1402,17 @@ class StageProtocol:
             times.clear()
             m._recent_step_work.clear()
         # THE LEVEL IS STAGE STATE TOO, not just the bookkeeping around it. It
-        # used to carry over, so equilibration inherited train_prior's knee --
-        # and since the walk only ever moves UP from where it starts, an
-        # MLE-sized batch became a FLOOR for a stage whose steps cost ~100x more
+        # used to carry over, so equilibration inherited train_prior's level --
+        # and since selection only ever moves UP from the base, an MLE-sized
+        # batch became a FLOOR for a stage whose steps cost ~100x more
         # (prod0810: 2722 cheap bwd/dataset steps -> 2722 fused steps at 181 s,
         # then grown further). Re-enter every stage at the configured base and
-        # let the knee re-derive the level from in-stage timings.
+        # let the sizer re-derive any growth from in-stage measurements.
         if bool(getattr(m.args, 'grow_batch_size', True)):
             base_batch = min(int(m.args.batch_size), int(m.args.max_batch_size))
             if m.batch_size != base_batch:
                 print(f"batch: stage change -- resetting {m.batch_size} -> {base_batch} "
-                      f"(re-deriving the knee under '{new.name}' step costs)")
+                      f"(re-selecting under '{new.name}' step costs)")
                 m.batch_size = base_batch
         m.batch_size_last_grow = m.step_ind  # full dwell of in-stage steps before the first grow
         m.init_schedulers_optimizers()

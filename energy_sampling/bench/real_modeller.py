@@ -32,9 +32,9 @@ def build_real_modeller(config=DEFAULT_CONFIG):
     """
     Construct `train.Modeller` from a real YAML config.
 
-    `get_train_args` parses `sys.argv` and reads `remaining[1]`, so argv has to
-    be shaped like a real invocation; it is restored afterwards because pytest's
-    own argv is still live.
+    `get_train_args` parses the explicit ``--config`` launch contract, so argv
+    has to be shaped like a real invocation; it is restored afterwards because
+    pytest's own argv is still live.
     """
     import train  # noqa: E402 -- deferred, ~11 s
 

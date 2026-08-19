@@ -132,6 +132,15 @@ DEFAULT_SEED = 12345
 # Recorded, never compared. Two identical runs disagree on every one of them.
 WALLCLOCK_EXACT = frozenset({
     'samples_per_sec', 'initialization_time',
+    # THROUGHPUT IS A TIMING, however it is spelled. `batch/sps_rung` is
+    # batch_size / median step time (train.py), so it cannot repeat between two
+    # identical launches -- and it slipped every rule below: no `_time`, no
+    # `seconds`, and `_s` is a SUFFIX rule that "rung" does not match. Measured:
+    # it was the sole reason the null control failed, on this file's own
+    # canonical config, at two of three logged points. A broken null makes the
+    # whole harness refuse to run, so one unfiltered timing key disabled the
+    # instrument rather than degrading it.
+    'batch/sps_rung',
 })
 #: Wins over every rule below, including the registry's own grouping. `Batch
 #: Size` sits in the registry's `cost` group because it is the DENOMINATOR of a
@@ -383,12 +392,12 @@ def registry_overrides() -> tuple[dict, list[str]]:
     resolver -- MINUS any key current code has retired.
 
     This is the block that neutralises checkpoint writes, archiving, batch
-    growth, the throughput optimiser, the runaway-step guard, the knee recheck
-    and figures. Three of those are the ones that make an exact comparison
-    possible at all, because they are actuated by WALL CLOCK: `grow_batch_size`
-    and `auto_batch_throughput_opt` read measured throughput, and
-    `max_step_seconds` is a stopwatch. Left on, two identical runs take
-    different actions and the null test can never be zero.
+    growth, the runaway-step guard and figures. Two of those are the ones that
+    make an exact comparison possible at all, because they are actuated by WALL
+    CLOCK: `grow_batch_size` gates a controller that reads measured step times
+    (and, with batch_util_target set, occupancy), and `max_step_seconds` is a
+    stopwatch. Left on, two identical runs take different actions and the null
+    test can never be zero.
 
     THE DROP IS A STANDING GUARD, not a workaround for a known break. The
     registry used to set `ray_calibration.enabled: false`, and under current code

@@ -200,10 +200,17 @@ class RingModes:
         # PER-COMPONENT jitter, capped by the spread the samples actually show along that
         # direction. Thermal motion is 1 sigma along a direction TANGENT to the closed-ring
         # manifold, but zero across it -- closure is a constraint, not a soft coordinate --
-        # and the sampled spread is what distinguishes the two. Jittering uniformly at 1
-        # sigma is why adding components past the manifold's own dimension made closure
-        # sharply worse (cyclohexane 2.7 -> 6.5 bond-sigma from k=5 to k=7): the extra
-        # directions carry no manifold structure, so all that motion goes off-surface.
+        # and the sampled spread is what distinguishes the two. Without this cap, jittering
+        # uniformly at 1 sigma sent motion along directions carrying no manifold structure,
+        # straight off the surface.
+        #
+        # THAT WAS AN ARGUMENT FOR THE CAP, NOT AGAINST COMPONENTS, and an earlier version
+        # of this comment pinned it as "adding components past the manifold's own dimension
+        # made closure sharply worse (cyclohexane 2.7 -> 6.5 bond-sigma from k=5 to k=7)".
+        # With the cap in place that no longer reproduces -- raising k IMPROVES closure,
+        # because truncation error at the basin centres dominates the jitter. The number
+        # outlived the code it described; see build_ring_banks.py for how k is chosen now
+        # and prior_baselines.py for the measurement.
         sd = (np.minimum(self.bandwidth, self.comp_std) if self.comp_std is not None
               else np.full(pick.shape[1], self.bandwidth))
         c = pick + rng.normal(0.0, 1.0, size=pick.shape) * sd

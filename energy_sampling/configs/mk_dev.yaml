@@ -1,11 +1,10 @@
-# The config-schema state this file is written against. Every generated
-# production config records the state it was spawned from, so an old config can
-# be migrated forward mechanically rather than reconstructed by hand:
-#     python -m config_state migrate <config.yaml>
-# The history and the migrations live together in config_state.py. This is a
-# migration identifier, NOT a release version, and it is a separate axis from the
-# checkpoint problem_def's schema_version (which versions the problem identity).
-project_state_version: 7
+# The live config-schema state this operational surface is written against.
+# Generated runs record the state they were spawned from so a mismatch fails
+# visibly. This is not a promise to migrate historical configs: add a transition
+# only when an explicitly active config or checkpoint still needs one.
+# This is a migration identifier, NOT a release version, and it is separate from
+# the checkpoint problem_def's schema_version (which versions problem identity).
+project_state_version: 9
 
 run_name: 'mk_dev'
 tag: 'dev'
@@ -93,6 +92,17 @@ adaptive_lr:
   # on this problem it fires too late to steer an LR.
   divergence_loss_abs: 1.0e+9
   divergence_grad_abs: 1.0e+9
+  # RELATIVE bar, as a multiple of the QUIETEST loss the CURRENT STAGE has
+  # produced on that branch. The absolute bars above are a backstop against
+  # numerical death, not a statement about training: a route whose loss lives at
+  # O(1) can go up a hundredfold -- which destroys the run -- and never approach
+  # 1e9. On a stage that is well behaved in general, that excursion IS the event
+  # worth rewinding from. Per stage and per branch, because loss SCALE differs by
+  # orders of magnitude between the two (cleared in LRController.rearm_warmup);
+  # inert for the first 50 observations on a branch so the opening reading cannot
+  # become the reference; and floored, so a loss that legitimately approaches zero
+  # cannot drag the bar down with it. null/0 = off, absolute bars only.
+  divergence_loss_rel: 100.0
   divergence_cut: 0.5        # peak_scale multiplier per divergence; compounds
 
   # Shared parameters for the `ray` sensor. There is no `enabled` flag: a stage
@@ -109,6 +119,31 @@ adaptive_lr:
     alphas: [ 0, 1, 2, 4, 8, 16, 32, 64 ]  # the probe grid, spanning 64x around the target so a badly mis-set rate is still bracketed rather than pinned at an edge. 0 is the no-step reference
 weight_decay: 1.0e-4
 use_weight_decay: false
+# GPU region timing (profiling.py). OFF, and off is the normal state: with no
+# block, or enabled false, `region()` returns one shared no-op and an energy call
+# allocates nothing extra. Enable it to answer "how much GPU time does the energy
+# consume", which wall clock cannot see through an async launch -- it reports
+# energy/seconds_gpu beside the existing wall-clock energy/seconds, and their
+# RATIO (energy/gpu_over_wall) is the reading: ~1 means the call occupies the
+# device, >1 means work outlives the return, <1 means host-bound.
+profiling:
+  enabled: false
+  regions: null              # null = every region asked for; a list restricts it
+  # Layer 2: a BOUNDED torch.profiler window -- op-level CPU and CUDA detail,
+  # written as files (a chrome trace + a text table) beside the run, never to
+  # wandb. Left on, torch.profiler dominates what it measures and the trace grows
+  # too large to open; bounded to a few steps its cost does not scale with run
+  # length, and once written the window latches shut for the rest of the run.
+  # start_step is deliberately late: the opening steps are CUDA context creation,
+  # autotuning and cold caches, so profiling them measures startup, not training.
+  trace:  # todo these need comments
+    enabled: false
+    start_step: 1500
+    active_steps: 8
+    outdir: profiling_results
+    write_trace: false       # also write the chrome timeline JSON. OFF: measured 748 MB for 8 steps (~93 MB/step) on ELJ with shapes and stacks both off, which is unopenable and is what pins active_steps to single digits. The *_table.txt beside it is 9 KB and carries the op breakdown; turn this on only when a TIMELINE is the question
+    record_shapes: false     # per-op input shapes; larger trace, needed to spot a shape that recompiles
+    with_stack: false        # python stacks; expensive, and only useful when the op table cannot say WHICH call site
 compile_policy: auto           # torch.compile the dense policy trunk with inductor kernel fusion. 'auto' = Linux+CUDA only (no inductor on native Windows; dev boxes stay eager); true/false force it. Compile errors degrade to eager with a warning. Recompiles on every new batch size
 traj_checkpoint: false         # gradient-checkpoint each rollout step: trajectory activation memory ~O(1) in T instead of O(T), at ~1 extra policy forward per step. Values/gradients identical to false (verified bitwise incl. RNG stream)
 # Fallback clip. With grad_clip_guard on it does NOT clip the policy -- the guard
@@ -176,41 +211,37 @@ model:
   pb_exact_reversal: true      # P_B on angular dims: true = exact reversal of the wrapped reference bridge (mixture over arrival lifts); false = its single-image term. See docs/periodic_scoring_fix.html
 
 # training params
-################################################################  # todo revise this section on batch sizer rewrite
+################################################################
 buffer_device: cuda           # where the churned/static sample stores live (replay + prior + anchor buffers, mol/prior datasets). 'cuda' turns per-step buffer draws/admits/purges into async device gathers instead of serial CPU work + host round trips; footprint ~1KB/graph. 'cpu' = legacy
 batch_size: 1000              # number of samples per training batch -- single shared batch size for all rollout work (train fwd/bwd/replay/fused AND eval sampling)
-grow_batch_size: false        # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 1000
+grow_batch_size: true         # whether to dynamically grow the batch size to fill the RAM
+max_batch_size: 20000
 eval_num_samples: 10000       # minimum number of samples for evaluation
 test_eval_num_samples: 2000   # held-out conditional eval batch; inert while test_molecules_path is null
 fused_grad_accum_min_samples: 1000  # fused steps only: effective-gradient floor. Batches BELOW this accumulate micro-steps until this many samples contribute; batches AT/ABOVE it take a plain unscaled step. 0 disables
 epochs: 100000             # number of training epochs
 eval_period: 250              # how often to do evaluation & reporting
 figs_period: 500             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
-# jump-mode batch growth: multiply by batch_growth_factor once every batch_growth_interval steps
-# so the run visits only ~log_f(max/base) distinct batch sizes (torch.compile treats each
-# distinct size as a recompile). OOM cuts divide by the same factor, then cool down.
-batch_growth_factor: 1.65
-batch_growth_interval: 50       # steps between jumps before the first OOM. WITH compile_policy active use ~250-500 (each new size is a ~30-60s recompile stall); 50 is fine locally where compile is off
-batch_growth_slow_interval: 300 # jump spacing after any OOM (congestion avoidance)
-# --- automatic batch-size throughput optimization (train.py increment_batch_size) ---  # todo this is the section that will be redone entirely
-# The growth walk scores every jump by the SAMPLES/SEC it buys, not by how much it slowed
-# the step down: a jump that fails to clear batch_growth_min_throughput_gain reverts one
-# rung and PINS the batch for the current protocol stage. The pin re-arms at stage
-# transitions and after OOM cuts, and the batch LEVEL itself resets to batch_size at every
-# stage transition (the walk only moves up, so an inherited level is a floor). With this
-# ON, max_batch_size is a safety ceiling. NB the whole walk is gated on grow_batch_size,
-# which is false above -- none of this runs as shipped.
-auto_batch_throughput_opt: true  # master switch; false = grow to max_batch_size/OOM as before
-batch_growth_min_throughput_gain: 0.05  # samples/sec gain a jump must clear to be kept -- a SATURATION detector. opt-steps/sec = samples_per_sec / grad-accum target, so this maximises optimizer-step throughput; step time does not enter. MUST be < batch_growth_factor-1 (0.65 here): at or above it a factor-f jump can never deliver the demanded gain, so every jump is rejected and the batch FREEZES at batch_size
-gpu_util_window_s: 900  # trailing window for the gpu/util_recent metric. DIAGNOSTIC ONLY -- nothing in the trainer acts on occupancy: batch size does not move it on the MLIP route (measured, umaperf0812)
+# --- batch sizer (train.py select_batch_size; state 8, docs/design/phase6_batch_sizer.md) ---
+# Two objectives in strict priority: occupancy constraint first, then optimizer-step
+# throughput -- whose answer is the CONSTANT batch_size = fused_grad_accum_min_samples,
+# so there is no throughput walk. With batch_util_target set (and grow_batch_size true,
+# max_batch_size > batch_size), the sizer calibrates once per stage: it climbs rungs of
+# batch_growth_factor, dwelling batch_growth_interval steps at each to measure step time
+# and raw occupancy, holds the smallest rung clearing the target, says INFEASIBLE loudly
+# when none does, and stands a kept growth back down if a full policy window fails to
+# confirm it. Everything else here is a safety BOUND, never a selector.
+batch_growth_factor: 1.6       # ladder rung spacing below the cap (torch.compile treats each distinct size as a recompile, so rungs are few)
+batch_growth_cap: 1000          # rung step ceiling in samples: grow geometrically until batch*(factor-1) reaches this, then climb linearly at it. Bounds the held rung's overshoot past the true occupancy crossing to one accum quantum -- at large batch a factor-f overshoot costs up to ~40% of update rate, a 1000-sample one <=10%. The price is more compile shapes on a high climb. 0 = uncapped geometric
+batch_growth_interval: 50       # minimum per-rung calibration dwell, in steps. WITH compile_policy active use ~250-500 (each new size is a ~30-60s recompile stall); 50 is fine locally where compile is off
+batch_util_target: 0.6          # occupancy target the calibration must clear before holding a grown batch, as a FRACTION of the card (0.6 = 60% busy), NOT a percentage -- the sensor reports percent and the one conversion happens in train.select_batch_size. 0 = off: hold batch_size, no probe. Empirical bracket (out-of-process sampler): cancelled <=0.40, survived >=0.494; 0.6 is a margined target
+gpu_util_window_s: 900  # trailing window for the gpu/util_recent metric  # todo is this steps or seconds?
 gpu_util_sample_period_s: 60  # wall-clock seconds between occupancy samples. Time-based, not per-N-steps: a step-based cadence cannot fill a 900 s window at 200 s/step, which is how the metric came to be absent on exactly the slow MLIP arms it was there to watch
-gpu_util_policy_window_s: 7200  # the window the CLUSTER averages over when deciding to cancel. Logged as gpu/util_policy so the number the scheduler judges is visible in wandb
+gpu_util_policy_window_s: 7200  # the window the CLUSTER averages over when deciding to cancel. Logged as gpu/util_policy -- but NB the in-process reading disagrees with the out-of-process samplers by a batch-dependent, sign-flipping error (phase6_handoff.md section 2); the scheduler judges the out-of-process number  # todo simplify this comment and align with our rules
 max_step_seconds: 60  # RUNAWAY GUARD, not a tuning knob: cut the batch only once the median step exceeds this. Stands down for the stage if a cut does not actually move step time (a fixed per-step cost is not batch-driven, and cutting further only shrinks the gradient). 0 = off
-batch_knee_recheck_steps: 2000  # re-estimate a pinned knee every N steps: drop one rung and re-climb. 0 = pin holds until stage transition/OOM
-oom_batch_shrink_factor: 0.5
-oom_cooldown_steps: 200  # steps to hold batch_size flat after an OOM before resuming growth
-batch_oom_ceiling_retest_steps: 1000  # steps an OOM ceiling stands with no further OOM before it is cleared and the walk re-probes upward. Every OOM restarts this clock. A failed re-probe costs a shrink_factor cut, so this is not free. 0 = the ceiling never expires
+oom_batch_shrink_factor: 0.625
+oom_cooldown_steps: 200  # steps to hold batch_size flat after an OOM before the sizer recalibrates
+batch_oom_ceiling_retest_steps: 1000  # steps an OOM ceiling stands with no further OOM before it is cleared and an INFEASIBLE conclusion re-probes. Every OOM restarts this clock. A failed re-probe costs a shrink_factor cut, so this is not free. 0 = the ceiling never expires
 
 # SDE integration
 ################################################################
@@ -622,7 +653,19 @@ protocols:
           # selecting this protocol adopts it -- it used to be three global keys
           # a mode switch had to remember to change.
           fwd: { vg_lb: 1.0, vg_by_condition: 1.0, emp_z: 1.0, repeats: 2.0, tb_z_source: persistent }
-          bwd: { vg_lb: 1.0, condition_block_m: 2.0, repeats: 1.0, level_gap: 0, tb_z_source: persistent }
+          # level_gap 1: the Z-LEVEL TETHER, and it is a stability term here, not a
+          # fit term. `gap * (log_r + log_pb - log_pf)` with gap the per-condition
+          # discrepancy against the empirical level stream, clamped by
+          # level_gap_clamp -- the only restoring force on the per-condition Z
+          # level. At 0 a local 20-min arm blew up: fwd/vg_lb ran 49 of 108
+          # reports above 10x its median from step ~600 of the stage (peak 43868
+          # vs 479) while log_Z drifted up. Same config with this at 1: zero
+          # excursion, and the fwd medians improved too. NB it enters SATURATED
+          # -- level_gap_coeff_rms sits at the clamp for the whole window, so it
+          # acts as a constant force on the way in rather than the proportional
+          # controller it becomes once the levels close. Cost: bwd VarGrad losses
+          # run higher, and the LR settles lower.
+          bwd: { vg_lb: 1.0, condition_block_m: 2.0, repeats: 1.0, level_gap: 1, tb_z_source: persistent }
           replay: { tb_z_source: persistent }
         balance:
           kind: proportional

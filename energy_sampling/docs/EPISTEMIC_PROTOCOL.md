@@ -13,7 +13,7 @@ This is the one operating procedure for deciding what repository claims mean, wh
 3. Put one material claim in one authoritative home; other documents point to it.
 4. Separate current state, decisions, working assumptions, observations, arguments, and history.
 5. Surface conflicts. Do not resolve them by recency, repetition, or apparent Git history.
-6. Update directly affected context when behavior changes; audit high-exposure context periodically.
+6. Update directly affected context when behavior changes; audit high-exposure context at owner-declared milestones or when explicitly requested.
 7. Keep institutional work bounded. Do not turn a local change into a repository-wide documentation sweep.
 
 ## 2. Knowledge types, homes, and proof
@@ -115,9 +115,9 @@ A review date routes attention but does not prove correctness. `ACTIVE` claims s
 
 When a directly relevant change invalidates prose, update it, mark it `SNAPSHOT`/`LEGACY`, or remove it from active routing in the same change. Do not sweep unrelated docs.
 
-## 8. Periodic context audit
+## 8. Milestone context audit
 
-At a project milestone or dedicated maintenance pass, inspect only high-exposure context:
+At an owner-declared project milestone or explicitly requested dedicated maintenance pass, inspect only high-exposure context:
 
 1. root `AGENTS.md` and `docs/README.md`;
 2. this protocol;

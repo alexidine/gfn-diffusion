@@ -100,6 +100,9 @@ def main(argv=None):
                     help='read every arm over the step span they ALL cover, so '
                          'they are compared at the same training age rather '
                          'than each at its own trailing window')
+    ap.add_argument('--figures', action='store_true',
+                    help='index the figures this run logged, by name and step '
+                         '(Tier 3; for a reader who cannot click the wandb UI)')
     ap.add_argument('-v', '--verbose', action='store_true',
                     help='every subject a check examined, not only its findings')
     a = ap.parse_args(argv)
@@ -162,6 +165,9 @@ def _one(run, a):
         print('  NB the stage is UNKNOWN, so the route is too. Every topline '
               'below is the fallback set, and no NA_ROUTE rule has been applied.')
 
+    if a.figures:
+        from . import figures as F
+        print('\n' + F.render(run))
     _print_key_table(K.resolve(run.available_keys(), K.TOPLINE[route], route), route)
     _report(run, route, a.window)
     print('\n  legend: * significant trend  ~ EMA (significance suppressed)  '

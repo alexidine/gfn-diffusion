@@ -180,9 +180,9 @@ def test_state_rule_rejects_a_transition_that_does_not_bump():
     assert not states_advance_by_one_and_only_on_a_transition(changes)
 
 
-def test_state_rule_accepts_history_changes_between_transitions():
-    """The intended shape: several recorded changes sitting at one state, with
-    the integer moving only when persisted interpretation actually changes."""
+def test_state_rule_accepts_selected_nontransition_records():
+    """A deliberately retained schema record may sit at one state; the integer
+    still moves only when persisted interpretation actually changes."""
     changes = (Change(state=1, summary='transition', transition=Transition()),
                Change(state=1, summary='a perf change'),
                Change(state=1, summary='a bug fix'),

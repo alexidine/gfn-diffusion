@@ -20,6 +20,8 @@ from time import time
 
 import numpy as np
 import torch
+
+import profiling
 import wandb
 from tqdm import trange
 
@@ -51,6 +53,24 @@ from utils import get_train_args, get_gfn_init_state, set_seed, \
 # can ride in on loaded datasets or analyzed batches; never read off any buffer
 # draw, so stripped from EVERY buffer's storage just in case they are present
 BULKY_ATTR_EXCLUDE_KEYS = ('fingerprint', 'rdf')
+
+# --- batch sizer (select_batch_size) -----------------------------------------
+#: Fewer raw occupancy samples than this is a coin flip, not a rung reading. The
+#: same domain boundary _gpu_util_mean draws at 5 for its windowed mean; smaller
+#: here because a calibration rung reads a dedicated dwell rather than a trailing
+#: window that may straddle rungs.
+_BS_MIN_UTIL_SAMPLES = 3
+#: Dwell multiplier after which a rung still short of _BS_MIN_UTIL_SAMPLES is
+#: declared starved and the walk concludes -- a sensor that answers nothing
+#: removes nothing and grows nothing (S3), and waiting forever on it would leave
+#: the batch parked mid-ladder with no conclusion recorded.
+_BS_RUNG_TIMEOUT_INTERVALS = 20
+#: Series encodings for the sizer's state, so wandb carries the account of what
+#: it concluded (prints do not survive a hard-killed run).
+_BS_PHASE_CODES = {None: 0, 'calibrating': 1, 'hold': 2}
+_BS_REASON_CODES = {None: 0, 'no_target': 1, 'target_met': 2, 'infeasible': 3,
+                    'sensor_off': 4, 'no_headroom': 5, 'stood_down': 6,
+                    'wallclock_cut': 7}
 
 
 # stripped from churned-buffer STORAGE at admission (draws already drop them):
@@ -125,9 +145,14 @@ def _uniform_draw(n: int, k: int) -> torch.Tensor:
 
 
 class Modeller:
-    def __init__(self):
+    def __init__(self, args=None):
         self.step_ind = None
-        self.args = get_train_args()
+        # Guaranteed to exist before any path can reach the training loop, so
+        # the per-step call needs no None check and no getattr. Replaced by the
+        # configured window in init_energy_function; a disabled one here means a
+        # trainer built without that step still runs rather than raising.
+        self._trace_window = profiling.TraceWindow(enabled=False)
+        self.args = get_train_args() if args is None else args
         if torch.cuda.is_available():
             torch.cuda.set_per_process_memory_fraction(self.args.cuda_memory_fraction, device=0)
             torch.cuda.init()  # create context with the cap already in place
@@ -338,13 +363,16 @@ class Modeller:
         One NVML utilization reading, appended with its timestamp. Cheap and
         time-gated, so the caller may invoke it every step.
 
-        THIS IS THE JOB-SURVIVAL NUMBER, though nothing in this process acts on it:
-        the cluster cancels a job whose GPU utilization averages under a threshold
-        for a couple of hours -- prod0810's uma arm (4r351oqm) died that way at 5.2 h
-        with hourly means 75/62/54/49/48/48%. The batch controller used to read it
-        and grow on it; that rule is gone (see increment_batch_size) because batch
-        size does not move occupancy on this route. Reporting it accurately still
-        matters, because it is the criterion we are actually judged on.
+        THIS IS THE JOB-SURVIVAL NUMBER: the cluster cancels a job whose GPU
+        utilization averages under a threshold for a couple of hours -- prod0810's
+        uma arm (4r351oqm) died that way at 5.2 h with hourly means
+        75/62/54/49/48/48%. In-process it feeds select_batch_size's per-rung
+        calibration readings and its S2 audit; the deleted gpu_util_floor rule --
+        which grew on the windowed mean directly -- stays deleted
+        (utils._RETIRED_KEYS holds the record). NB the trailing-window means built
+        on these samples disagree with the out-of-process samplers by a
+        batch-dependent, sign-flipping error (handoff §2), so the number the
+        scheduler judges is the out-of-process one.
 
         SAMPLED ON A TIME CADENCE, NOT A STEP CADENCE. It used to be sampled once per
         ten_step_reporting, which is fine at 2 s/step and useless at 200 s/step: two
@@ -422,101 +450,86 @@ class Modeller:
 
     def _batch_floor(self) -> int:
         """
-        Lower bound on the knee walk: the configured `batch_size`, which is the base
-        the run was designed around (and what protocol.advance re-enters each stage at).
+        The domain's lower bound: the configured `batch_size`, which is the base the
+        run was designed around (and what protocol.advance re-enters each stage at).
 
-        This floor is load-bearing, not defensive. The knee test asks whether a jump's
-        throughput gain was worth its step-time cost, so in a REGIME WITH NO KNEE --
-        throughput flat in batch, i.e. perfectly linear scaling -- every jump fails and
-        the periodic recheck walks the batch down a rung at a time forever (1000 -> 606
-        -> 367 -> ...), because each recheck re-tests one rung lower than the last pin
-        and never re-tests the level above it. Flat throughput genuinely does argue for
-        the smallest batch (same samples/sec, faster steps), so the walk is not wrong --
-        it just has no reason of its own to stop, and gradient quality is not something
-        it can see. max_step_seconds may still cut BELOW this: a hard wall-clock ceiling
+        Under select_batch_size nothing ever walks downward -- the base rung IS the
+        selection unless occupancy evidence lifts it -- so this floor is no longer
+        what stops a descent; it bounds the domain. It is kept (rather than folded
+        into the selection) because two cut paths can still land BELOW it, on
+        purpose: an OOM cut, and max_step_seconds -- a hard wall-clock ceiling
         outranks a batch-size preference.
         """
         return max(1, min(int(self.args.batch_size), int(self.args.max_batch_size)))
 
-    def increment_batch_size(self):
+    def select_batch_size(self):
         """
-        Batch growth, still AIMD-shaped (grow until OOM, cut + cooldown, regrow
-        slower): multiply by batch_growth_factor once every
-        batch_growth_interval steps (batch_growth_slow_interval after the first
-        OOM), capped at max_batch_size. The run then visits only
-        ~log_f(max/base) distinct batch sizes -- torch.compile treats every
-        distinct size as a recompile + its own CUDA graph, so rare large jumps
-        are what make compile viable alongside growth.
+        Batch selection under the phase-6 replacement
+        (docs/design/phase6_batch_sizer.md). Two objectives in strict priority:
+        satisfy the cluster occupancy requirement, then maximize optimizer-step
+        throughput subject to it.
 
-        THROUGHPUT KNEE (auto_batch_throughput_opt: true): before each jump,
-        check whether the PREVIOUS jump actually paid. Past GPU saturation a
-        factor-f batch jump returns ~x1.0 throughput while step time grows xf
-        -- pure steps/hour loss, measured across a 30x batch span where
-        samples/s was flat and step time tracked the batch. A jump that fails the
-        test reverts one rung and PINS the batch for the current protocol stage
-        (stages have different step-cost profiles, so protocol.advance clears
-        the pin, the rung baseline, the OOM ceiling and the step-time window at
-        every stage transition -- a baseline measured under the outgoing stage's
-        step cost would poison the incoming stage's first knee comparison).
-        With the flag on, max_batch_size is a safety ceiling rather than a
-        target. NB nvidia-smi-style utilization can't drive this: it saturates
-        at 100% below the knee; marginal throughput is the discriminating signal
-        on both sides.
+        THE THROUGHPUT HALF IS A CONSTANT, NOT A SEARCH. With the effective
+        update size held at A = fused_grad_accum_min_samples, updates/sec =
+        samples_per_sec / A for any B <= A and samples/sec rises in B, so
+        priority 2's answer is B = A exactly -- the configured batch_size, which
+        the canonical config already sets equal to A. There is no throughput
+        walk. Growth above the base exists ONLY to buy occupancy, must be
+        minimal, and stops the moment the constraint is met.
 
-        THE TEST IS THROUGHPUT SATURATION. A jump is kept iff it buys at least
-        batch_growth_min_throughput_gain more samples/sec than the rung below;
-        otherwise the batch pins at the previous rung. Step time does not enter:
-        with the update size pinned at fused_grad_accum_min_samples,
-        optimizer-steps/sec = samples_per_sec / accum_target, so samples/sec IS
-        opt-step throughput and a slower-but-higher-throughput step is a win.
+        THREE STRUCTURAL RULES:
+          S1  occupancy evidence may only VETO candidate sizes; the selection
+              rule itself is fixed (the smallest measured rung that clears the
+              target). No occupancy reading ever orders the batch on its own --
+              the deleted gpu_util_floor was an actuator, and it drove four
+              growths a throughput gate had refused (utils._RETIRED_KEYS holds
+              the record).
+          S2  a growth justified by "occupancy rises with batch" must produce
+              that rise: after a full policy window at the selected rung, the
+              lived occupancy is compared against the base rung's calibration
+              reading, and if the growth did not deliver, the batch STANDS DOWN
+              to the base rung. The max_step_seconds guard below carries the
+              same rule for cuts (its unresponsiveness stand-down).
+          S3  UNKNOWN never removes and never grows: no target configured, no
+              sensor, or no reading -> hold the base. That is the shipping
+              default (batch_util_target unset), under which this method holds
+              B = batch_size and only the safety bounds ever move it.
 
-        That is a deliberate reversal of the step-time-regression test this
-        method used to apply, which optimised loop-iterations/hour -- a different
-        objective, and the wrong one under this priority. Both retired keys
-        (batch_growth_min_gain, batch_growth_max_step_regression) are in
-        utils._RETIRED_KEYS with the argument; the gate itself is below, and its
-        constraint against batch_growth_factor is asserted in
-        config_invariants.growth_gain_below_growth_factor.
+        CALIBRATION IS FEED-FORWARD, OVER REAL TRAIN STEPS, ONCE PER STAGE.
+        With a target set, the walk climbs the ladder from the base rung,
+        dwelling at each rung until it has a step-time median and a few RAW
+        occupancy samples taken at that rung -- never the trailing windowed
+        mean, whose window straddles rungs and is what makes closed-loop
+        control on this sensor unworkable. It then holds the smallest rung
+        whose measured occupancy clears the target. If no rung clears, it holds
+        the argmax-occupancy rung and says INFEASIBLE loudly, naming the
+        binding bound: batch is not the lever then -- work per kernel launch,
+        host stalls, or an energy-pinned memory ceiling are
+        (docs/design/phase6_handoff.md §4.4).
 
-        Three further guards, each from an observed prod0810 failure:
-          * NEVER GROW BLIND. The old code fell through to an unconditional
-            multiply whenever _rung_throughput was None -- which handle_oom sets
-            on every OOM -- so after the first OOM every jump was taken with no
-            measurement, straight back into the same OOM. A rung with no
-            baseline is now MEASURED first and grown on the next interval.
-          * REMEMBER WHAT OOM'd. The size that OOM'd is the most informative
-            reading the controller ever gets; it used to be discarded. It is now
-            a hard ceiling for the stage.
-          * max_step_seconds is an absolute wall-clock ceiling on a train step.
-            Throughput arguments are blind to it -- a 180 s step can be perfectly
-            'efficient' in samples/sec and still be useless to train against.
+        EVERY SAFETY MECHANISM IS A BOUND ON THE DOMAIN, NEVER A SELECTOR: the
+        OOM ceiling (which expires), max_batch_size, the max_step_seconds
+        runaway guard, and the post-cut cooldown all shrink what may be
+        selected; none of them picks a size. protocol.advance clears the
+        conclusion, the ceiling and the timing window at every stage
+        transition, because stages have different step-cost profiles.
         """
-        knee_on = bool(getattr(self.args, 'auto_batch_throughput_opt', False))
         stage_name = getattr(getattr(self.protocol, 'stage', None), 'name', None)
         times = getattr(self, '_recent_step_times', None)
         med = float(np.median(list(times)[-20:])) if times and len(times) >= 10 else None
 
-        # THERE IS DELIBERATELY NO OCCUPANCY RULE HERE, and re-adding one needs new
-        # evidence, not new reasoning. `gpu_util_floor` used to sit at the top of this
-        # ladder and grow the batch whenever utilization fell under the cluster's
-        # cancellation threshold. Deleted 2026-08-13: its premise is false on this
-        # route. Utilization is flat-to-DECLINING in batch once an MLIP dominates the
-        # step, because the energy call is already saturating the card and a bigger
-        # batch mostly buys more host-side work. A 7.4x batch increase bought
-        # NEGATIVE occupancy and cost most of the throughput, and because the rule
-        # outranked everything it overrode a throughput gate that would have
-        # refused every jump. It was also structurally inert on the very arms it
-        # was written for: the sampling cadence could not fill the window at
-        # MLIP step times, so it never fired there at all.
-        #
-        # THE NUMBERS LIVE ONCE, in `utils._RETIRED_KEYS['gpu_util_floor']` --
-        # a retirement record's job is to hold the reason it was deleted, and a
-        # second copy here is a second thing to keep true.
-        #
-        # Batch size is simply not the control input for occupancy here -- work per
-        # kernel launch and unpaired host stalls are. The SENSOR survives as a metric
-        # (gpu/util_recent, gpu/util_policy): the cancellation criterion is real and
-        # worth watching, it is just not actuable from this function.
+        # OCCUPANCY IS READ HERE AGAIN, but not the way gpu_util_floor read it. That
+        # rule was an ACTUATOR -- "utilization low, grow" -- and on the route it was
+        # written for the premise was measured false; the retirement record
+        # (`utils._RETIRED_KEYS['gpu_util_floor']`) holds the numbers once. The
+        # calibration below differs in every load-bearing respect: it MEASURES
+        # occupancy per rung from raw samples taken at that rung (not a trailing
+        # window straddling rungs), it can only conclude "this rung clears / does not
+        # clear the target" (S1: veto plus a fixed selection rule, never an ordering),
+        # it terminates on a finite ladder, and a growth it keeps must later survive
+        # the S2 audit or stand down. Where occupancy genuinely does not rise with
+        # batch, the walk finds nothing, says INFEASIBLE, and returns to the best
+        # measured rung -- which is the behaviour the old rule lacked.
 
         # RUNAWAY GUARD. An absolute wall-clock ceiling on one train step, checked
         # before the growth walk because a step already over the ceiling must never be
@@ -569,7 +582,7 @@ class Modeller:
             if accum > 0 and getattr(self.protocol.stage, 'train_mode', None) == 'fused':
                 shrunk = max(shrunk, min(accum, self.batch_size))
             if shrunk >= self.batch_size:
-                # ONCE PER STAGE. increment_batch_size runs every step, so an
+                # ONCE PER STAGE. select_batch_size runs every step, so an
                 # unconditional print here is ~10k copies of the same paragraph on a
                 # 7-day run -- and it holds whenever batch_size <= accum_target, which
                 # is mk_dev's shipped 1000/1000 pair at the base batch of any fused
@@ -590,8 +603,11 @@ class Modeller:
                 # see the unresponsiveness check above
                 self._runaway_last_cut = (self.batch_size, med)
                 self.batch_size = shrunk
-                self.batch_size_saturated_stage = None
-                self._rung_throughput = None
+                # the wallclock bound outranks the occupancy ladder: whatever the walk
+                # had measured or concluded is void at this size, and regrowing for
+                # occupancy would re-trip the guard -- hold here.
+                self.batch_sizer = dict(phase='hold', reason='wallclock_cut',
+                                        selected=int(shrunk), table=[])
                 self.batch_size_last_grow = self.step_ind
                 self.batch_size_cooldown_until = self.step_ind + int(
                     getattr(self.args, 'oom_cooldown_steps', 200) or 0)
@@ -606,18 +622,15 @@ class Modeller:
         # MLP rollout can never reuse, is CLEARED by the very cut that records it.
         #
         # Latched forever, that was catastrophic rather than merely conservative.
-        # prod0810's acridine/mace arms: one OOM at the BASE batch of 1000 set the
-        # ceiling to 1000, so the walk climbed 500 -> 825 and then refused the 1361
-        # rung for the rest of the stage. 825 also sits BELOW _batch_floor(), so the
-        # knee recheck below could not re-measure it either (its drop target clamps at
-        # the floor, which is already above the pin) -- the arm ran the whole of
+        # prod0810's acridine/mace arms: one OOM at the BASE batch of 1000 latched a
+        # ceiling of 1000, under which the previous controller ran the whole of
         # train_prior at 0.825x its configured batch, on a stage that makes no energy
         # calls at all and is judged by the scheduler on GPU occupancy. All three died.
         #
         # So the ceiling decays like any other AIMD limit: after a quiet spell with no
-        # further OOM, drop it and let the walk re-probe. Re-probing costs one step and
-        # a cooldown when the ceiling was right; NOT re-probing costs the whole stage
-        # when it was wrong.
+        # further OOM, drop it and let the ladder re-probe. Re-probing costs one step
+        # and a cooldown when the ceiling was right; NOT re-probing costs the whole
+        # stage when it was wrong.
         ceiling = getattr(self, 'batch_size_oom_ceiling', None)
         # default matches the shipping value in configs/mk_dev.yaml and prod0810;
         # a code default that disagrees with every config is a trap for the one
@@ -639,128 +652,223 @@ class Modeller:
                 self.batch_size_oom_ceiling = None
                 self.batch_size_oom_ceiling_at = None
                 self.batch_ceiling_expiries = getattr(self, 'batch_ceiling_expiries', 0) + 1
-                if getattr(self, 'batch_size_saturated_stage', None) == stage_name:
-                    # the pin may have been the ceiling's doing; release it and let the
-                    # walk re-measure. A knee pin released here costs one re-climb
-                    # cycle, which is what batch_knee_recheck_steps does on purpose.
-                    self.batch_size_saturated_stage = None
-                    self._rung_throughput = None
-                    self.batch_size_last_grow = self.step_ind
+                sizer = getattr(self, 'batch_sizer', None)
+                if sizer is not None and sizer.get('reason') not in ('wallclock_cut',
+                                                                     'stood_down'):
+                    # the ceiling may have been what bounded the conclusion -- an
+                    # INFEASIBLE verdict, or a base batch held below the configured
+                    # one -- so with it gone, re-derive: restore the base and re-run
+                    # any ladder. The two exceptions are conclusions the ceiling did
+                    # not produce: a wallclock cut (max_step_seconds outranks this)
+                    # and an S2 stand-down (growth already failed its audit once;
+                    # re-climbing on a timer would oscillate).
+                    self.batch_sizer = None
 
-        if (knee_on and stage_name is not None
-                and getattr(self, 'batch_size_saturated_stage', None) == stage_name):
-            # periodic re-estimation: the knee moves WITHIN a stage as the fused
-            # composition drifts (branch fracs shift, fwd activates/deactivates,
-            # buffers grow), so a pin decays -- drop one rung and re-climb,
-            # which adapts in BOTH directions: a healthy re-climb re-pins at or
-            # above the old knee, a failed one pins lower
-            recheck = int(getattr(self.args, 'batch_knee_recheck_steps', 0) or 0)
-            if recheck > 0 and self.step_ind - getattr(self, 'batch_size_pinned_at', 0) >= recheck:
-                f = float(getattr(self.args, 'batch_growth_factor', 2.0))
-                dropped = max(self._batch_floor(), int(round(self.batch_size / f)))
-                if dropped >= self.batch_size:
-                    # PINNED AT OR BELOW THE FLOOR -- an OOM cut, not a knee, put us
-                    # here. There is nothing below to re-measure against, so re-arm the
-                    # walk UPWARD instead of returning. Returning left batch_size_pinned_at
-                    # stale, so this branch was re-entered every step and the recheck
-                    # could never fire again: the batch was frozen for the stage's life.
-                    self.batch_size_saturated_stage = None
-                    self._rung_throughput = None
-                    self.batch_size_last_grow = self.step_ind
-                    self.batch_size_pinned_at = self.step_ind
-                    print(f"batch growth: pin {self.batch_size} is at/below the floor "
-                          f"{self._batch_floor()} -- re-arming the walk upward")
-                    return
-                self.batch_size = dropped
-                self.batch_size_saturated_stage = None
-                self._rung_throughput = None
-                self.batch_size_last_grow = self.step_ind
-                print(f"batch growth: knee recheck -- dropping to {self.batch_size} and re-measuring")
-            return  # throughput knee already found for this stage's step profile
-        if self.batch_size >= self.args.max_batch_size:
-            return
-        if self.step_ind < self.batch_size_cooldown_until:
-            return  # recently cut -- hold flat until the new level proves stable
-
-        interval = int(getattr(self.args, 'batch_growth_interval', 0) or 0)
-        slow = int(getattr(self.args, 'batch_growth_slow_interval', 0) or 0) or interval
-        wait = slow if self.batch_size_ever_oomed else interval
-        if self.step_ind - getattr(self, 'batch_size_last_grow', 0) < wait:
-            return
-
-        f = float(getattr(self.args, 'batch_growth_factor', 2.0))
-        target = min(self.args.max_batch_size,
-                     max(self.batch_size + 1, int(round(self.batch_size * f))))
-
-        # a size that OOM'd in this stage is a measurement, not noise: never walk
-        # back into it. Without this the post-OOM baseline reset below made every
-        # subsequent jump a blind re-entry into the same failure.
+        # ----------------------------------------------------------- the ladder law
+        # THE CONFIG UNIT IS A FRACTION, THE SENSOR'S IS PERCENT, and this is the
+        # one place they meet. `batch_util_target: 0.6` means 60% of the card;
+        # every comparison and message below is in the sensor's percent, so the
+        # conversion happens once, here, rather than at each use. Written as a
+        # fraction in the config because that is how a target on a [0,1] quantity
+        # reads, and because a bare 0.6 meant as "60%" would otherwise be a legal
+        # 0.6% target that any rung clears -- an inert constraint reporting
+        # itself as served.
+        target = 100.0 * float(getattr(self.args, 'batch_util_target', 0) or 0)
+        hi = int(self.args.max_batch_size)
         ceiling = getattr(self, 'batch_size_oom_ceiling', None)
-        if ceiling is not None and target >= ceiling:
-            if self.batch_size_saturated_stage != stage_name:
-                print(f"batch growth: {target} would re-enter the OOM ceiling {ceiling} "
-                      f"-- pinning {self.batch_size} for stage '{stage_name}'")
-                self.batch_size_saturated_stage = stage_name
-                self.batch_size_pinned_at = self.step_ind
+        ceiling_binds = ceiling is not None and int(ceiling) <= hi
+        if ceiling is not None:
+            # a size that OOM'd in this stage is a measurement, not noise: the domain
+            # stops strictly below it. A BOUND, never a pin -- it shrinks what may be
+            # selected and selects nothing itself.
+            hi = min(hi, int(ceiling) - 1)
+
+        s = getattr(self, 'batch_sizer', None)
+        if s is None:
+            # RESTORE THE BASE before concluding anything. An OOM or wallclock cut
+            # can leave the batch BELOW the configured base, and with no growth walk
+            # nothing else would ever bring it back -- the prod0810 failure (a stage
+            # judged on occupancy running under-sized for its life) rebuilt by
+            # omission. Restore only when the base is not itself the size that
+            # OOM'd (base < ceiling, or no ceiling stands) and the cooldown is over;
+            # otherwise hold the cut size and let the ceiling's expiry re-open this.
+            base = self._batch_floor()
+            if self.batch_size < base and (ceiling is None or base < int(ceiling)):
+                if self.step_ind < self.batch_size_cooldown_until:
+                    return               # the cut is settling; restore on a later call
+                print(f"batch: restoring {self.batch_size} -> {base} (the configured "
+                      f"base"
+                      + ("" if ceiling is None
+                         else f"; the OOM ceiling {ceiling} sits above it") + ")")
+                self.batch_size = int(base)
+                self._recent_step_times.clear()
+                self._recent_step_work.clear()
+            # first call since a stage transition / OOM / ceiling expiry cleared the
+            # conclusion: decide whether there is anything to measure at all
+            if target <= 0:
+                # S3, and the shipping default: no constraint configured, so the
+                # answer is the base batch, held. No walk, no probe, no print.
+                self.batch_sizer = dict(phase='hold', reason='no_target',
+                                        selected=int(self.batch_size), table=[])
+            elif getattr(self, '_gpu_util_off', False):
+                self.batch_sizer = dict(phase='hold', reason='sensor_off',
+                                        selected=int(self.batch_size), table=[])
+                print("batch: batch_util_target is set but the occupancy sensor is "
+                      "off -- holding the base batch. UNKNOWN never grows (S3).")
+            elif hi <= self.batch_size:
+                self.batch_sizer = dict(phase='hold', reason='no_headroom',
+                                        selected=int(self.batch_size), table=[])
+            else:
+                self.batch_sizer = dict(
+                    phase='calibrating', reason=None, selected=int(self.batch_size),
+                    table=[], rung_start_step=int(self.step_ind),
+                    rung_start_time=float(self._now()), audit_at=None)
             return
 
-        if knee_on:
-            if med is None:
-                return  # not enough in-stage timings yet -- measure, never guess
-            work = float(np.sum(list(self._recent_step_work)[-20:]))
-            secs = float(np.sum(list(self._recent_step_times)[-20:]))
-            sps = work / max(secs, 1e-9)
-            base = getattr(self, '_rung_throughput', None)
-            if base is None:
-                # NO BASELINE = NO JUMP. Record this rung and grow on the next
-                # interval, so every jump is scored against a measured rung.
-                self._rung_throughput = (self.batch_size, sps)
-                self.batch_size_last_grow = self.step_ind
-                return
-            prev_batch, prev_sps = base
-            if prev_batch < self.batch_size:
-                # PRIORITY 2: OPTIMIZER-STEP THROUGHPUT AT THE GRAD-ACCUM TARGET.
-                # With the update size pinned at accum_target, updates/sec =
-                # samples_per_sec / accum_target -- so maximising opt-step
-                # throughput IS maximising samples/sec, and step time per se does
-                # not enter. This gate is therefore a SATURATION DETECTOR: keep
-                # climbing while throughput still improves, pin where it flattens.
-                #
-                # It deliberately replaces the step-time-regression test, which
-                # optimised loop-iterations/hour. That is a different objective and
-                # the wrong one here: it rejects a jump that buys +15% samples/sec
-                # for a 43% slower step, which under this priority is a 15% WIN.
-                min_gain = float(getattr(self.args, 'batch_growth_min_throughput_gain', 0.05) or 0)
-                if sps < prev_sps * (1.0 + min_gain):
-                    # pin at the TRUE knee; gradient stability below
-                    # fused_grad_accum_min_samples is provided by fused-step
-                    # accumulation (see train_step), not batch inflation
-                    accum = int(getattr(self.args, 'fused_grad_accum_min_samples', 0) or 0)
-                    gain = sps / max(prev_sps, 1e-9) - 1.0
-                    print(f"batch growth: throughput saturated -- {prev_batch}->{self.batch_size} "
-                          f"bought {prev_sps:.0f}->{sps:.0f} samples/s ({gain * 100:+.0f}%, under "
-                          f"+{min_gain * 100:.0f}%); pinning {prev_batch} for stage '{stage_name}'"
-                          + (f" (fused steps will grad-accumulate to {accum})" if prev_batch < accum else ""))
-                    # A PIN IS A DECISION TO STOP CLIMBING, NEVER A JUMP. This was
-                    # `max(floor, prev_batch)`, which consults neither the OOM ceiling
-                    # nor the rungs just measured -- and since protocol.advance re-enters
-                    # every stage at exactly args.batch_size, the floor is routinely AT
-                    # OR ABOVE a ceiling discovered in that same stage. The pin then set
-                    # the batch to a size already recorded as OOMing and marked it
-                    # saturated, which rebuilt the permanent sawtooth the ceiling exists
-                    # to prevent. It also silently reverted max_step_seconds cuts.
-                    # Clamping to the current batch fixes both: we are standing on a size
-                    # that just ran, and prev_batch is below it by the guard above.
-                    self.batch_size = min(max(self._batch_floor(), prev_batch), self.batch_size)
-                    self.batch_size_saturated_stage = stage_name
-                    self.batch_size_pinned_at = self.step_ind
-                    self._rung_throughput = None
-                    self.batch_size_last_grow = self.step_ind
-                    return
-            self._rung_throughput = (self.batch_size, sps)
+        if s.get('phase') == 'hold':
+            # S2 AUDIT, one shot per selection, armed only when the hold is a growth
+            # above the base rung. The calibration predicted this rung's occupancy
+            # from a short dwell; a full policy window of lived occupancy is the
+            # falsification test. If growing did not deliver more occupancy than the
+            # base rung measured, the constraint's own model is wrong here and the
+            # removal of the small rungs is withdrawn.
+            audit_at = s.get('audit_at')
+            if audit_at is not None and self._now() >= float(audit_at):
+                s['audit_at'] = None
+                table = s.get('table') or []
+                base = table[0] if table else None
+                lived = self._gpu_util_mean(float(getattr(
+                    self.args, 'gpu_util_policy_window_s', 7200) or 7200))
+                if (base is not None and base.get('util') is not None
+                        and lived is not None and lived <= float(base['util'])):
+                    print(f"batch: occupancy audit FAILED -- a full policy window at "
+                          f"{self.batch_size} reads {lived:.1f}%, not above the base "
+                          f"rung {base['batch']}'s calibration {base['util']:.1f}%. "
+                          f"The growth did not deliver the effect that justified it, "
+                          f"so it stands down (S2): {self.batch_size} -> {base['batch']}.")
+                    self.batch_size = int(base['batch'])
+                    s.update(phase='hold', reason='stood_down',
+                             selected=int(base['batch']))
+                    self._recent_step_times.clear()
+                    self._recent_step_work.clear()
+            return
 
-        self.batch_size = target
-        self.batch_size_last_grow = self.step_ind
+        # phase == 'calibrating': dwell at the current rung until it is MEASURED --
+        # a step-time median from this rung's own timings plus a few raw occupancy
+        # samples taken while it ran -- then act on the reading. The walk visits
+        # each rung once, ascending (geometric below the cap, linear at it), so it
+        # terminates by construction.
+        if self.step_ind < self.batch_size_cooldown_until:
+            return                       # an OOM cut is settling; measure after it
+        if int(self.batch_size) != int(s.get('selected', -1)):
+            # something outside the walk moved the batch (an OOM cut): the rungs it
+            # was climbing are now bounded away, so conclude from what is measured
+            self._conclude_batch_calibration(
+                target, hi, ceiling_binds, stage_name,
+                note='the walk was interrupted by a cut')
+            return
+        interval = max(1, int(getattr(self.args, 'batch_growth_interval', 0) or 50))
+        rung_steps = self.step_ind - int(s.get('rung_start_step', 0))
+        samples = [u for ts, u in getattr(self, '_gpu_util', ())
+                   if ts >= float(s.get('rung_start_time', 0.0))]
+        if med is None or rung_steps < interval or len(samples) < _BS_MIN_UTIL_SAMPLES:
+            if rung_steps >= _BS_RUNG_TIMEOUT_INTERVALS * interval and \
+                    len(samples) < _BS_MIN_UTIL_SAMPLES:
+                # the sensor is not producing on this cadence. S3: a sensor that
+                # answers nothing removes nothing, and it grows nothing either.
+                self._conclude_batch_calibration(
+                    target, hi, ceiling_binds, stage_name,
+                    note='the occupancy sensor starved a rung')
+            return
+        util = float(sum(samples) / len(samples))
+        s['table'].append(dict(batch=int(self.batch_size), med_s=float(med),
+                               util=util, n_util=len(samples)))
+        if util >= target:
+            # the smallest measured rung clearing the target, because the walk
+            # ascends: growth was minimal and stops the moment the constraint is met
+            grew = len(s['table']) > 1
+            policy_s = float(getattr(self.args, 'gpu_util_policy_window_s', 7200) or 7200)
+            s.update(phase='hold', reason='target_met', selected=int(self.batch_size),
+                     audit_at=(self._now() + policy_s) if grew else None)
+            print(f"batch: occupancy calibration -- {util:.1f}% at {self.batch_size} "
+                  f"clears the {target:.0f}% target"
+                  + (f" (base rung {s['table'][0]['batch']} read "
+                     f"{s['table'][0]['util']:.1f}%); holding, audit in one policy "
+                     f"window" if grew else "; holding the base batch"))
+            return
+        # CAPPED-GEOMETRIC RUNG STEP: multiply by batch_growth_factor while the
+        # increment stays under batch_growth_cap, then climb linearly at the cap.
+        # The cap bounds the selection's ABSOLUTE overshoot -- the held rung can
+        # exceed the true crossing by at most one cap's worth of samples, and the
+        # relative update-rate cost of that shrinks as B grows, exactly where the
+        # pure-geometric worst case (a factor-f overshoot) hurts most. The price
+        # is more rungs on a high climb, and the currency there is COMPILE
+        # SHAPES, not dwell time: every distinct size is a recompile, and dynamo
+        # falls back to eager past its cache limit. 0 = uncapped geometric, the
+        # escape hatch if the shape budget ever becomes the binding problem.
+        f = float(getattr(self.args, 'batch_growth_factor', 2.0))
+        cap = int(getattr(self.args, 'batch_growth_cap', 1000) or 0)
+        step = int(round(self.batch_size * (f - 1.0)))
+        if cap > 0:
+            step = min(step, cap)
+        nxt = min(hi, max(self.batch_size + 1, self.batch_size + step))
+        if nxt <= self.batch_size:
+            self._conclude_batch_calibration(target, hi, ceiling_binds, stage_name)
+            return
+        self.batch_size = int(nxt)
+        s['selected'] = int(nxt)
+        s['rung_start_step'] = int(self.step_ind)
+        s['rung_start_time'] = float(self._now())
+        # timings from the previous rung would contaminate this rung's median
+        self._recent_step_times.clear()
+        self._recent_step_work.clear()
+
+    def _conclude_batch_calibration(self, target, hi, ceiling_binds, stage_name,
+                                    note=None):
+        """
+        End the ladder walk with no rung having cleared the occupancy target.
+
+        The selection rule stays fixed (S1): hold the argmax-occupancy rung among
+        those measured and still inside the domain, and say INFEASIBLE loudly --
+        naming the binding bound, because "which bound bit" is the diagnosis. An
+        OOM ceiling binding here usually means the ENERGY call's memory is pinned
+        to the rollout batch (docs/design/phase6_handoff.md §4.4): the fix is
+        decoupling the energy batch, not any batch this controller can pick.
+        """
+        s = self.batch_sizer
+        eligible = [r for r in (s.get('table') or [])
+                    if r.get('util') is not None and r['batch'] <= hi]
+        if not eligible:
+            # nothing measured inside the domain -> hold whatever is running; it is
+            # the only size with evidence it runs at all (S3)
+            s.update(phase='hold', reason='sensor_off' if note else 'infeasible',
+                     selected=int(self.batch_size))
+            print(f"batch: occupancy calibration ended with no usable rung"
+                  + (f" ({note})" if note else "")
+                  + f" -- holding {self.batch_size}")
+            return
+        best = max(eligible, key=lambda r: (r['util'], -r['batch']))
+        base = eligible[0]
+        if ceiling_binds:
+            bound = ("an OOM ceiling -- on an MLIP route that is usually the ENERGY "
+                     "call's memory, pinned to the rollout batch "
+                     "(docs/design/phase6_handoff.md §4.4); the lever is decoupling "
+                     "the energy batch, not growing this one")
+        else:
+            bound = "max_batch_size"
+        print(f"batch: occupancy INFEASIBLE for stage '{stage_name}' -- no batch in "
+              f"[{base['batch']}..{eligible[-1]['batch']}] reached the {target:.0f}% "
+              f"target (best {best['util']:.1f}% at {best['batch']}). Batch is not "
+              f"the lever here; the binding bound is {bound}. Holding {best['batch']}"
+              + (f" ({note})" if note else "") + ".")
+        grew = int(best['batch']) != int(base['batch'])
+        policy_s = float(getattr(self.args, 'gpu_util_policy_window_s', 7200) or 7200)
+        if int(best['batch']) != int(self.batch_size):
+            self.batch_size = int(best['batch'])
+            self._recent_step_times.clear()
+            self._recent_step_work.clear()
+        s.update(phase='hold', reason='infeasible', selected=int(self.batch_size),
+                 audit_at=(self._now() + policy_s) if grew else None)
 
 
     def step_lr_schedule(self):
@@ -844,7 +952,7 @@ class Modeller:
                 metrics['updates_per_sec'] = metrics['samples_per_sec'] / _target
                 metrics['batch/accum_target'] = _target
         # THE STATISTIC THE BATCH CONTROLLER ACTUALLY ACTS ON, which until now was
-        # computed and thrown away (increment_batch_size medians the last 20 step
+        # computed and thrown away (select_batch_size medians the last 20 step
         # times and decides on that). Every other cost metric here is a mean over
         # the 10-step report window, so a ladder built from them describes a curve
         # no in-process controller can be shown to reproduce -- and nothing
@@ -877,10 +985,13 @@ class Modeller:
                 energy_timing['energy/frac_outside_step'] = max(
                     0.0, energy_timing['energy/seconds'] - in_step) / self._throughput['seconds']
         metrics.update(energy_timing)
-        # GPU occupancy. Purely diagnostic now -- no control law reads it (see
-        # increment_batch_size) -- but it is the number the scheduler cancels jobs on,
-        # so it is worth two windows: gpu/util_recent tracks what the run is doing
-        # now, gpu/util_policy is the long average the cluster actually judges.
+        # GPU occupancy. Two consumers now: these metrics, and select_batch_size --
+        # which reads RAW per-rung samples during calibration and the policy-window
+        # mean once for its S2 audit, never these windows as a control input. NB the
+        # in-process gpu/util_policy is known to disagree with the out-of-process
+        # samplers by a batch-dependent, sign-flipping error (handoff §2): the number
+        # the scheduler judges is the OUT-OF-PROCESS one (wandb system stream /
+        # nvidia-smi sidecar); this series survives as the in-process view of it.
         # Sampling happens in the train loop on a wall-clock cadence; this only reads.
         util_recent = self._gpu_util_mean(
             float(getattr(self.args, 'gpu_util_window_s', 900) or 900))
@@ -914,6 +1025,18 @@ class Modeller:
         metrics['batch/ceiling_expiries'] = float(getattr(self, 'batch_ceiling_expiries', 0))
         metrics['batch/oom_ceiling'] = float(getattr(self, 'batch_size_oom_ceiling', None) or 0)
         metrics['batch/oom_min'] = float(getattr(self, 'batch_size_oom_min', None) or 0)
+        # the sizer's conclusion as series, encoded by _BS_PHASE_CODES /
+        # _BS_REASON_CODES (train.py module constants). reason 3 = INFEASIBLE is the
+        # one to alarm on: it means no batch reaches the occupancy target and the
+        # binding bound is named in the console print.
+        _sizer = getattr(self, 'batch_sizer', None) or {}
+        metrics['batch/sizer_phase'] = float(_BS_PHASE_CODES.get(_sizer.get('phase'), 0))
+        metrics['batch/sizer_reason'] = float(_BS_REASON_CODES.get(_sizer.get('reason'), 0))
+        # rungs measured this stage: the compile-shape budget's own account. A long
+        # climb under the capped-linear tail is what would threaten dynamo's
+        # recompile cache, and it should announce itself here rather than as a
+        # silent fallback to eager.
+        metrics['batch/sizer_rungs'] = float(len(_sizer.get('table') or ()))
         metrics['Fwd Frac'] = self.fwd_frac
         metrics['Bwd Frac'] = self.bwd_frac
         metrics['Replay Frac'] = self.replay_frac
@@ -1112,6 +1235,24 @@ class Modeller:
         }
         energy_config.update(self.args.energy_config.__dict__)
         self.energy_function = MolecularCrystal(**energy_config)
+        # ONE ATTACHMENT POINT, and nothing else in the trainer changes. The
+        # region timer lives on the energy function because log_reward is the
+        # single funnel every energy evaluation goes through, so instrumenting
+        # it needs no edit to train_step -- the hottest code here, and the one
+        # place a profiling feature has no business touching. Disabled by
+        # default: `from_config` reads args.profiling, and an absent block is
+        # off, so an unprofiled run allocates nothing per call.
+        import profiling
+        prof = profiling.from_config(self.args, cuda=str(self.device).startswith('cuda'))
+        if prof.enabled:
+            self.energy_function._region_profiler = prof
+            print(f'profiling: region timer ON (cuda={prof.cuda}) -- '
+                  f'energy/seconds_gpu will accompany energy/seconds')
+        # Built unconditionally so the hot-loop call never needs a None check;
+        # disabled is the default and its `step()` returns on the first line.
+        self._trace_window = profiling.trace_from_config(
+            self.args, cuda=str(self.device).startswith('cuda'),
+            tag=str(getattr(self.args, 'run_name', 'run')))
 
     def tb_z_source(self, group: str) -> str:
         """
@@ -1885,10 +2026,31 @@ class Modeller:
 
         self.optimizers = {}
         weight_decay = self.args.weight_decay if self.args.use_weight_decay else 0
+        # FUSED ADAM ON CUDA. The default (foreach) path computes its bias
+        # corrections in Python -- `1 - beta1 ** _get_value(step)` per parameter
+        # tensor, and `_get_value` is `.item()` -- so it performs TWO
+        # device->host synchronisations per parameter tensor per optimizer step
+        # (~154 here), each one blocking the host until the device drains.
+        # Measured 2026-08-19 by patching Tensor.item around a real run:
+        # adam.py:755/758 was 70% of the Python-visible syncs. Keep the scale
+        # honest, though -- that is ~1.3% of the ~11.6k aten::item calls the
+        # torch.profiler window counted per step, so this removes a real
+        # mechanism, not most of the cost.
+        # NOT bit-identical to the foreach path, and adopted on that
+        # understanding (user, 2026-08-19). CUDA only: `fused=True` raises on
+        # CPU params, so a CPU run silently keeps the default path.
+        # MXT_FUSED_ADAM=0 forces the old foreach path. Present so the change
+        # is A/B-able end to end: an isolated timing of optimizer.step() cannot
+        # show what removing a host sync buys, because it synchronises anyway --
+        # the cost of a sync is the NEXT step's work not being queued yet.
+        fused_ok = (str(getattr(self, 'device', 'cpu')).startswith('cuda')
+                    and os.environ.get('MXT_FUSED_ADAM', '1') != '0')
+        adam_kw = {'fused': True} if fused_ok else {}
+        print(f'optimizers: Adam fused={fused_ok}')
         # the turn-taking policy optimizers are identical up to their LR
         for mode in ('fwd', 'bwd', 'replay'):
             self.optimizers[mode] = torch.optim.Adam(get_policy_params(self.gfn_model), init_policy_lrs[mode],
-                                                     weight_decay=weight_decay)
+                                                     weight_decay=weight_decay, **adam_kw)
         # a fused stage fires fwd/bwd/replay in one backward(), so -- unlike the
         # turn-taking fwd/bwd/replay optimizers, which piggyback on optimizers['flow']
         # via step_loss's non-fused branch -- the flow (Z head) params must ride the
@@ -1902,9 +2064,10 @@ class Modeller:
         self.optimizers['fused'] = torch.optim.Adam(
             get_policy_params(self.gfn_model) + [{'params': self.gfn_model.flow_model.parameters(),
                                                   'lr': init_flow_lr}],
-            init_policy_lrs['fused'], weight_decay=weight_decay)
+            init_policy_lrs['fused'], weight_decay=weight_decay, **adam_kw)
         flow_params = self.gfn_model.flow_model.parameters()
-        self.optimizers['flow'] = torch.optim.Adam(flow_params, init_flow_lr, weight_decay=weight_decay)
+        self.optimizers['flow'] = torch.optim.Adam(flow_params, init_flow_lr,
+                                                  weight_decay=weight_decay, **adam_kw)
 
         # Two-point step probe (docs/to_do_rebuild.md A3/A4b) -- SENSOR ONLY, no
         # actuation. Built over the same param list the fused optimizer's policy
@@ -2209,6 +2372,11 @@ class Modeller:
             self.set_detect_anomaly(do_anomaly_detection=self.args.anomaly_detection)
             init_step = self.step_ind * 1
             for self.step_ind in trange(init_step, self.args.epochs + 1):
+                # THE ONLY PROFILING CALL IN THE HOT LOOP, and it is one boolean
+                # compare unless a trace window is configured AND still open.
+                # Once the window has written, `done` latches and this never
+                # touches the profiler again for the rest of the run.
+                self._trace_window.step(self.step_ind)
                 current_loss = None
                 metrics = {}
                 if self.step_ind % 10 == 0:
@@ -2250,7 +2418,7 @@ class Modeller:
                 if not hasattr(self, '_recent_step_times'):
                     self._recent_step_times = deque(maxlen=64)
                     self._recent_step_work = deque(maxlen=64)
-                self._recent_step_times.append(step_dt)  # feeds the throughput-knee check
+                self._recent_step_times.append(step_dt)  # feeds the sizer's rung median
                 # WORK, not just the training batch: z_calibration_tick runs
                 # self._z_cal_rollouts extra full-batch rollouts inside the timing
                 # window above, and its rate is frequency-modulated by a sensor that
@@ -2270,11 +2438,11 @@ class Modeller:
                 # exactly the slow MLIP arms it was added to watch.
                 self._sample_gpu_util()
                 # the controller scores the step it just timed, at the batch that
-                # actually ran it: growing before the append paired a new batch
-                # with the old rung's timings (and made 'Batch Size' log one rung
-                # ahead of train_step_time)
+                # actually ran it: moving the batch before the append paired a new
+                # batch with the old rung's timings (and made 'Batch Size' log one
+                # rung ahead of train_step_time)
                 if self.args.grow_batch_size:
-                    self.increment_batch_size()
+                    self.select_batch_size()
 
                 # train monitoring
                 if self.step_ind % 10 == 0:
@@ -2554,7 +2722,7 @@ class Modeller:
 
         accum_target = self.args.fused_grad_accum_min_samples if step_type == 'fused' else 0
         # batch >= target degenerates to a plain unscaled step: accumulation
-        # only engages BELOW the target (e.g. a knee-pinned batch under the
+        # only engages BELOW the target (e.g. an OOM-cut batch under the
         # gradient-stability floor), so a large batch is never loss-scaled by
         # batch/target > 1
         accumulating = accum_target > self.batch_size
@@ -3590,7 +3758,7 @@ Two things deliberately NOT done here, both recorded in
             # per-STEP tally (the rep counter above is cumulative-since-report).
             # Each rollout/replay step processes a full self.batch_size, so the
             # batch controller needs this to charge the rung for the calibration
-            # work it caused -- see increment_batch_size.
+            # work it caused -- see select_batch_size.
             self._z_cal_rollouts += 1
             if fresh is not None:
                 rep['z_cal/fresh'] = fresh
@@ -4256,7 +4424,7 @@ Two things deliberately NOT done here, both recorded in
         fused steps AND eval sampling all call this) -- there's one batch_size and one
         recovery policy, rather than several independently-tuned loops that can OOM at
         different, decorrelated moments. On OOM: zero all grads, free what we can, cut
-        batch_size multiplicatively, and start a cooldown (see increment_batch_size).
+        batch_size multiplicatively, and start a cooldown (see select_batch_size).
         """
         print(f"Caught error during '{step_type}' step: {str(e)}")
         if not is_cuda_oom(e):
@@ -4315,11 +4483,11 @@ Two things deliberately NOT done here, both recorded in
             # moved: a ceiling that keeps being re-confirmed must keep standing.
             self.batch_size_oom_ceiling_at = self.step_ind
         self.batch_size = max(1, int(self.batch_size * self.args.oom_batch_shrink_factor))
-        self.batch_size_ever_oomed = True
         self.batch_size_cooldown_until = self.step_ind + self.args.oom_cooldown_steps
-        # stale throughput baseline/latch would compare across the cut -- re-measure
-        self._rung_throughput = None
-        self.batch_size_saturated_stage = None
+        # whatever the sizer measured or concluded was at sizes the new ceiling now
+        # bounds -- re-run the ladder under it after the cooldown. Never grow blind:
+        # every rung is re-measured before it is held.
+        self.batch_sizer = None
         # timings from the pre-cut rung would be scored against the post-cut batch
         if getattr(self, '_recent_step_times', None) is not None:
             self._recent_step_times.clear()
@@ -7179,6 +7347,11 @@ Two things deliberately NOT done here, both recorded in
 
 
 if __name__ == '__main__':
+    # Parse and fully preflight the config before asking for a GPU.  A malformed
+    # launch command or invalid canonical config is a CPU-side contract failure,
+    # not a reason to inspect or reserve accelerator state.
+    _args = get_train_args()
+
     # GPU pre-flight, BEFORE Modeller() touches CUDA. Two training runs on one card
     # took this machine down with a BSOD three times on 2026-08-11/12 -- the driver
     # does not politely OOM, so there is nothing to catch afterwards and the check has
@@ -7194,5 +7367,5 @@ if __name__ == '__main__':
         # NameError here would defeat the check it is guarding.
         raise SystemExit(str(_e))
 
-    modeller = Modeller()
+    modeller = Modeller(args=_args)
     modeller.train()

@@ -126,24 +126,46 @@ def _num(v) -> Optional[float]:
 # never fire is visible rather than reassuring.
 # ---------------------------------------------------------------------------
 
-def growth_gain_below_growth_factor(cfg: dict) -> list[Violation]:
-    """`batch_growth_min_throughput_gain` must be < `batch_growth_factor - 1`.
+def util_target_actuable(cfg: dict) -> list[Violation]:
+    """A set `batch_util_target` must be able to act.
 
-    At growth factor f, a jump multiplies work by f. Demanding a throughput gain
-    at or above f-1 demands more than the jump can deliver, so EVERY jump is
-    rejected and the batch freezes at batch_size -- with auto_batch_throughput_opt
-    still reporting itself as on."""
-    gain = _num(_get(cfg, 'batch_growth_min_throughput_gain'))
-    factor = _num(_get(cfg, 'batch_growth_factor'))
-    if gain is None or factor is None:
-        return []
-    if gain >= factor - 1.0:
-        return [Violation(ERROR, 'growth_gain_below_growth_factor',
-                          f'batch_growth_min_throughput_gain={gain} >= '
-                          f'batch_growth_factor-1={factor - 1:.4g}. No jump can ever '
-                          f'clear this bar; the batch freezes at batch_size while the '
-                          f'throughput optimizer reports itself active.')]
-    return []
+    The occupancy ladder (train.select_batch_size) only runs when growth is on
+    and there is headroom above the base batch. A target written into a config
+    where `grow_batch_size` is false, or where `max_batch_size <= batch_size`,
+    is an inert flag: it loads clean, logs nothing, and reads as 'the occupancy
+    constraint is being served' while nothing serves it.
+
+    THE UNIT IS A FRACTION, and the range clause is what enforces it. This key
+    was percent-valued until state 9 and the two spellings are not
+    distinguishable by inspection: 0.6 is a legal 0.6% target under the old
+    reading -- one that EVERY rung clears, so the ladder stops at the first rung
+    and the constraint reports itself as served while serving nothing. That is
+    the exact defect the rest of this rule exists to catch, and a range of
+    (0, 100] could not see it. (0, 1] can: a leftover `60` now fails loudly
+    instead of asking for 6000% occupancy and calling every batch INFEASIBLE."""
+    target = _num(_get(cfg, 'batch_util_target'))
+    if target is None or target <= 0:
+        return []                       # unset / off is the shipping default
+    out = []
+    if not (0 < target <= 1):
+        out.append(Violation(ERROR, 'util_target_actuable',
+                             f'batch_util_target={target} is not a fraction in '
+                             f'(0, 1] -- it is a fraction of the card, not a '
+                             f'percentage (0.6 = 60% busy). A value above 1 is '
+                             f'the pre-state-9 percent spelling.'))
+    if not bool(_get(cfg, 'grow_batch_size')):
+        out.append(Violation(ERROR, 'util_target_actuable',
+                             f'batch_util_target={target} is set but grow_batch_size '
+                             f'is false: the occupancy ladder never runs, so the '
+                             f'target is an inert flag.'))
+    batch = _num(_get(cfg, 'batch_size'))
+    max_batch = _num(_get(cfg, 'max_batch_size'))
+    if batch is not None and max_batch is not None and max_batch <= batch:
+        out.append(Violation(ERROR, 'util_target_actuable',
+                             f'batch_util_target={target} is set but max_batch_size='
+                             f'{max_batch:g} <= batch_size={batch:g}: the ladder has '
+                             f'one rung, so no occupancy-driven growth can happen.'))
+    return out
 
 
 def figs_period_fires(cfg: dict) -> list[Violation]:
@@ -946,7 +968,7 @@ RULES = (
     ray_sensor_needs_a_coherent_stage,
     exit_patience_is_reachable,
     exit_bar_is_within_measured_range,
-    growth_gain_below_growth_factor,
+    util_target_actuable,
     figs_period_fires,
     batch_ceiling_above_floor,
     dplr_is_well_formed,

@@ -1104,9 +1104,13 @@ class BenchRun:
         if self.need_batch_sizer:      # else _sample_gpu_util was never bound (LR-only
             m._sample_gpu_util()       # runs skip the 11 s train.py import)
 
-        # train.py:1966-1967 -- the controller scores the step it just timed
-        if m.args.grow_batch_size:
-            m.increment_batch_size()
+        # the controller scores the step it just timed (train.py gates
+        # select_batch_size on grow_batch_size; the walk-era name
+        # increment_batch_size is retired with the state-8 sizer). The
+        # need_batch_sizer guard matters since grow defaults TRUE now: an
+        # LR-only run never bound the method.
+        if self.need_batch_sizer and m.args.grow_batch_size:
+            m.select_batch_size()
 
         # train.py:1970-1971 -- LR schedule on the 10-step clock
         if m.step_ind % 10 == 0:
@@ -1170,7 +1174,9 @@ class BenchRun:
                            if c['status'] in ('bracketed', 'above_range', 'below_range')),
             n_divergences=self.divergences,
             oom_steps=self.oom_steps,
-            pinned_stage=self.m.batch_size_saturated_stage,
+            # the knee pin retired at state 8; the sizer's conclusion dict is
+            # the successor state (None until the controller first runs)
+            sizer=getattr(self.m, 'batch_sizer', None),
             oom_ceiling=self.m.batch_size_oom_ceiling,
         )
 

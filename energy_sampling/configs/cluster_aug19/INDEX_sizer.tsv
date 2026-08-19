@@ -1,0 +1,6 @@
+name	problem	batch	epochs
+cluster_aug19_b1_ladder_r1	elj	1000	40000
+cluster_aug19_b2_ladder_r2	elj	1000	40000
+cluster_aug19_b5_fixed7410	elj	7410	20000
+cluster_aug19_b5_fixed12000	elj	12000	20000
+cluster_aug19_b5_fixed20000	elj	20000	20000

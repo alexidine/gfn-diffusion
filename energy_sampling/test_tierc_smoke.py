@@ -250,13 +250,15 @@ def test_split_keeps_both_halves():
 # ------------------------------------------------------------- overrides ----
 
 def test_registry_neutralisers_survive_into_the_overrides():
-    """The five settings that silently unfix a run's work quantity. Three of
-    them are actuated by wall clock, which is why an exact comparison needs them
-    off and not merely constant."""
+    """The settings that silently unfix a run's work quantity. Two of them are
+    actuated by wall clock, which is why an exact comparison needs them off and
+    not merely constant. (`auto_batch_throughput_opt` used to be the third; the
+    throughput walk was retired at state 8, so the key is now retired too and
+    must NOT reappear in the overrides.)"""
     ov, _ = T.registry_overrides()
     assert ov['checkpoint_read_only'] is True
     assert ov['grow_batch_size'] is False
-    assert ov['auto_batch_throughput_opt'] is False
+    assert 'auto_batch_throughput_opt' not in ov
     assert ov['max_step_seconds'] == 0
     assert ov['archive_period'] == 0
 

@@ -144,29 +144,35 @@ fig.show()
 
 state = {}
 batch = batch.to(device)
-batch, state = adaptive_batched_analysis(
-    batch,
-    analyses=[energy_function, 'reduction_en'],
-    state=state,
-    initial_batch_size=10000,
-    predictor=predictor,
-    return_state=True,
-    device=device,
-    show_tqdm=False,
-)
+# NO_GRAD: these two calls sit at MODULE SCOPE, outside the @torch.no_grad()
+# helpers above, so the decorators do not cover them -- coverage that looks
+# present and is not. fairchem leaves grad enabled (direct_forces=False), which
+# retains 100-250 MB per crystal on a scan that differentiates nothing.
+with torch.no_grad():
+    batch, state = adaptive_batched_analysis(
+        batch,
+        analyses=[energy_function, 'reduction_en'],
+        state=state,
+        initial_batch_size=10000,
+        predictor=predictor,
+        return_state=True,
+        device=device,
+        show_tqdm=False,
+    )
 batch = batch.to('cpu')
 
 full_batch = full_batch.to(device)
-full_batch, state = adaptive_batched_analysis(
-    full_batch,
-    analyses=[energy_function, 'reduction_en'],
-    state=state,
-    initial_batch_size=10000,
-    predictor=predictor,
-    return_state=True,
-    device=device,
-    show_tqdm=False,
-)
+with torch.no_grad():
+    full_batch, state = adaptive_batched_analysis(
+        full_batch,
+        analyses=[energy_function, 'reduction_en'],
+        state=state,
+        initial_batch_size=10000,
+        predictor=predictor,
+        return_state=True,
+        device=device,
+        show_tqdm=False,
+    )
 full_batch = full_batch.to('cpu')
 
 dataset_dict = {

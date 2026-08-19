@@ -1,5 +1,10 @@
 # Diffusion models for amortized inference
 
+> **Status: LEGACY UPSTREAM README.** The commands below describe the original
+> paper code and are not the current GFN crystal workflow. Current repository
+> priorities and the proved crystal launch/validation commands live in root
+> [`AGENTS.md`](AGENTS.md).
+
 Official repository for the paper:
 
 [Improved off-policy training of diffusion samplers](https://arxiv.org/abs/2402.05098)

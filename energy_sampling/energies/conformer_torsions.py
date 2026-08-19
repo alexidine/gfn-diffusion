@@ -61,7 +61,17 @@ class ConformerTorsions(BaseSet):
                  include_trivial_rotations: bool = False,
                  mmff_reference: bool = True,
                  seed: int = 0,
-                 dtype=torch.float64,
+                 # float32 BY DEFAULT. Measured against float64 on the same DoF draw,
+                 # the relative error on the potential is ~5e-7, on log J ~6e-7, and on the
+                 # closure bond ~1e-6 A -- pure roundoff at float32 epsilon, with nothing
+                 # compounding through the NeRF chain (build walks ~8 topological ROUNDS,
+                 # not one round per atom). The closure errors this code reports are
+                 # 0.02-0.09 A, so the noise sits four orders below the signal. On CPU
+                 # float64 costs only ~1.1x, but `build` folds the batch into the atom
+                 # dimension for exactly the huge-batch GPU case, and consumer GPUs run
+                 # fp64 at a small fraction of fp32 -- which is where the default matters.
+                 # Pass dtype=torch.float64 explicitly for the exactness gates.
+                 dtype=torch.float32,
                  temperature_conditioning: bool = False,
                  log_temperature_range=(-1.0, 1.0),
                  lj_coeff: float = 1.0,
@@ -164,8 +174,48 @@ class ConformerTorsions(BaseSet):
             ang = np.arctan2(np.linalg.norm(np.cross(u, v), axis=-1), (u * v).sum(-1))
             return ang > np.deg2rad(self.LINEAR_TOL_DEG)
 
-        self.angle_is_linear = _linear(self.spec.angle_index)
-        self.torsion_frame_is_linear = _linear(np.asarray(self.spec.torsion_index)[:, :3])
+        def _typed_linear(triples):
+            """Linearity from MMFF's TYPED equilibrium angle -- a function of the GRAPH.
+
+            The measured route reads the reference conformer, so in principle the same
+            molecule can get a different chart from a different embedding seed, and `d`
+            with it. MMFF types its angles from the graph, so theta0 >= 179.99 is a
+            property of the molecule alone and the hazard cannot arise.
+
+            The hazard is LATENT, not observed: measured across nitriles, alkynes, an
+            azide, an allene and diphenylacetylene, every linear centre sits at 179.4-180
+            deg and every other angle below 121, so the nearest approach to the 175 deg
+            threshold is 4.4 deg and no chart varied over six seeds. The two routes agree
+            exactly on all ten molecules tested -- which is what makes this swap free.
+            test_conformer_levels.py pins that agreement, so a future divergence surfaces
+            there rather than as a silently different `d`.
+
+            Indexed by ATOM IDENTITY, never by row: ff.angle_index is the GRAPH angle list
+            and is longer than the tree's, so a positional lookup reads the wrong constant.
+            """
+            triples = np.asarray(triples).reshape(-1, 3)
+            if len(triples) == 0:
+                return np.zeros(0, dtype=bool)
+            ai_ff = self.ff_single.angle_index.detach().cpu().numpy()
+            th0_ff = self.ff_single.theta0.detach().cpu().numpy()
+            amap = {(int(j), frozenset((int(i), int(k)))): th0_ff[m]
+                    for m, (i, j, k) in enumerate(ai_ff)}
+            return np.array([np.degrees(amap.get(
+                (int(r[1]), frozenset((int(r[0]), int(r[2])))), 0.0)) >= 179.99
+                for r in triples])
+
+        # 'mmff' types from the graph, so the chart can be graph-determined. The
+        # 'reference' force field measures theta0 off the embedded conformer itself, so
+        # there is no graph-determined constant to appeal to and the measured route stands.
+        self.linearity_source = 'mmff_typed' if self._ff_choice == 'mmff' else 'measured'
+        if self.linearity_source == 'mmff_typed':
+            self.angle_is_linear = _typed_linear(self.spec.angle_index)
+            self.torsion_frame_is_linear = _typed_linear(
+                np.asarray(self.spec.torsion_index)[:, :3])
+        else:
+            self.angle_is_linear = _linear(self.spec.angle_index)
+            self.torsion_frame_is_linear = _linear(
+                np.asarray(self.spec.torsion_index)[:, :3])
         self.linearity_verified = True
 
         # ring membership in PLACEMENT-SLOT numbering, for the prior draw. InternalPrior
@@ -693,6 +743,13 @@ class ConformerTorsions(BaseSet):
         _, blocks, sigs, _ = prior._layout(m)
         bi, ai, ti = (np.asarray(self.spec.bond_index), np.asarray(self.spec.angle_index),
                       np.asarray(self.spec.torsion_index))
+        # WHY THIS IS RECORDED RATHER THAN RE-DERIVED. Four different things end in
+        # `bank = None` below -- aromatic by design, no key resolved, a bank too thin, and
+        # a stale prior whose keys cannot resolve at all -- and the tuple return cannot
+        # tell them apart. A reader that re-derives aromaticity and the lookup to label
+        # them is a second copy of this branch, free to drift from it; energies/
+        # ring_metrics.py reads this instead. See that module for what each class means.
+        self.ring_block_info = []
         out = []
         for s, cols in blocks.items():
             order = ([('r', int(j)) for j in cols['r']]
@@ -736,7 +793,58 @@ class ConformerTorsions(BaseSet):
                        + [('theta', j) for j in range(self.n_th) if int(ai[j, 2]) in in_sys]
                        + [('phi', j) for j in range(self.n_ph) if int(ti[j, 3]) in in_sys])
             extra = [kj for kj in placing if kj not in set(order)]
+            self.ring_block_info.append({
+                'system': int(s), 'aromatic': aromatic, 'key': (sigs[s], len(order)),
+                'ring_class': ('held_aromatic' if aromatic else
+                               'banked_modes' if isinstance(bank, RingModes) else
+                               'banked_rows' if bank is not None else 'held_unsupported'),
+                'n_block_dof': len(order), 'n_extra_dof': len(extra),
+                'stale_prior': bool(self.ring_sig_stale),
+            })
             out.append((order, bank, extra))
+        return out
+
+    def ring_frame_groups(self, ring_rows):
+        """Torsion groups about a RING BOND that hold no ring-placed member of their own.
+
+        THE GAP THE MIXED-GROUP RULE LEAVES. Groups are keyed on the central bond, and a
+        group containing a ring-placed row lets that row lead: the substituents take its
+        displacement, which is right because they share its axis. But the LAST ring atom in
+        placement order has both of its ring neighbours already placed, so the group about
+        its incoming ring bond contains only substituents -- no ring member, the rule does
+        not fire, and the group falls through to "draw the leader from a rotamer histogram".
+        That histogram is keyed on the central bond type, and the central bond here is a
+        RING bond, which does not rotate. Measured on cyclohexane, the leader landed 81 deg
+        from the reference while every correctly-mixed group sat within 5 deg, and the two
+        redundant angles at that carbon carried most of the molecule's angle strain.
+
+        The fix is not a new fitted object and not a correction after building: the ring
+        block has already placed every ring atom, so the frame's own dihedral to the OTHER
+        ring neighbour is determined, and the substituents hang off it at the fixed offset
+        they have in the reference conformer. Same move as the mixed-group rule, with the
+        leader taken from the ring geometry instead of from a member of the group.
+
+        Returns ``[(rows, a, b, c, p, gi)]`` -- the group's phi rows in SPEC numbering, its
+        torsion frame ``(a, b, c)``, the ring neighbour ``p`` of ``c`` that is not ``b``,
+        and the group index into ``torsion_groups()``.
+        """
+        ti = np.asarray(self.spec.torsion_index)
+        inr = self.atom_in_ring
+        nbr = {}
+        for u, v in np.asarray(self.spec.graph_bond_index):
+            nbr.setdefault(int(u), set()).add(int(v))
+            nbr.setdefault(int(v), set()).add(int(u))
+        out = []
+        for gi, rows in enumerate(self.torsion_groups()):
+            if any(self.n_r + self.n_th + j in ring_rows for j in rows):
+                continue
+            a, b, c = (int(ti[rows[0], 0]), int(ti[rows[0], 1]), int(ti[rows[0], 2]))
+            if not (inr[b] and inr[c]):
+                continue                       # not a ring bond: the default rule is right
+            p = [q for q in nbr.get(c, ()) if inr[q] and q != b]
+            if not p:
+                continue
+            out.append((list(rows), a, b, c, int(p[0]), gi))
         return out
 
     def prior_log_prob(self, prior, dof: np.ndarray, joint_torsions: bool = True,
@@ -866,12 +974,22 @@ class ConformerTorsions(BaseSet):
                             joint_rings: bool = True):
         """``[n, d]`` states drawn from a fitted InternalPrior. Returns ``(x, stats)``.
 
-        Per-DoF marginals, which is the prior's acyclic case. Ring systems are the one
-        place this is NOT what InternalPrior would do -- it draws a whole observed DoF
-        block per ring system, because closure is a hard constraint that a product of
-        marginals is guaranteed to violate. Ring DoF here therefore get marginals and the
-        count is REPORTED rather than silently absorbed: the draws are still valid support
-        (all TB needs), just much worse proposals.
+        Per-DoF marginals for the acyclic part, joint draws where a product of marginals
+        cannot work: sibling torsions about a shared bond, and RING SYSTEMS.
+
+        ``joint_rings`` DEFAULTS TO TRUE and is the real ring path -- each ring block is
+        drawn from its fitted pucker subspace or discrete bank, aromatic rings are held
+        planar by design, an unsupported ring is held at a fraction of thermal width, and
+        the ring-positioning DoF outside the block are held either way. See ``ring_blocks``
+        for the four classes and energies/ring_metrics.py for how they are reported.
+
+        ``joint_rings=False`` IS A NEGATIVE CONTROL, NOT A SAMPLING MODE. Every ring DoF
+        then gets an independent marginal, which violates closure by construction: measured
+        on cyclohexane at 'full', closure error goes from 0.086 A (2.2 bond-sigma) to
+        2.93 A (75 bond-sigma) and the median potential rises by two orders of magnitude.
+        The draws remain valid support, which is all TB strictly needs, but as a proposal
+        they are broken -- so a benchmark quoting this path is measuring the disabled path,
+        not the prior. ``stats['closure_err']`` is measured on BOTH, deliberately.
         """
         from mxtaltools.conformers.prior import R_RANGE, THETA_RANGE, PHI_RANGE
         spans = {'r': R_RANGE, 'theta': THETA_RANGE, 'phi': PHI_RANGE}
@@ -900,7 +1018,8 @@ class ConformerTorsions(BaseSet):
         # ---- ring systems FIRST: closure is a hard constraint, so their DoF are joint,
         # and substituents hanging off a ring atom then lock to what the ring chose ----
         ring_rows = set()
-        stats.update(n_rings=0, n_ring_banked=0, n_ring_thermal=0, n_ring_extra_held=0)
+        stats.update(n_rings=0, n_ring_banked=0, n_ring_thermal=0, n_ring_extra_held=0,
+                     n_ring_remapped=0)
         if joint_rings:
             ref = {'r': r0, 'theta': th0, 'phi': ph0}
             sig = {'r': s_r, 'theta': s_th}
@@ -929,10 +1048,39 @@ class ConformerTorsions(BaseSet):
                     # subspace draw: theta/phi from the pucker manifold, r from the
                     # thermal path, everything else in the block held
                     stats['ring_fill'] = self.ring_mode_fill
+                    # THE BANK'S ROW INDICES BELONG TO THE MOLECULE IT WAS FITTED ON.
+                    # ``bank.order`` is [(kind, row)] in the SPEC numbering of the bare
+                    # ring that build_ring_banks scanned. The lookup key is
+                    # (signature, n_dof), which identifies the ring TYPE and says nothing
+                    # about row numbering -- and the tree numbers a ring's DoF differently
+                    # depending on what else is attached. Writing the bank's columns into
+                    # its own stored rows therefore PERMUTES the block whenever the two
+                    # molecules disagree, which is exactly the silent-permutation failure
+                    # ring_blocks' tree assertion is written to prevent within a molecule.
+                    #
+                    # Measured on phenyl-tetrahydropyran: its block is theta 1,5,8,13 /
+                    # phi 4,7,12 while the bank carries theta 2,5,8,11 / phi 4,7,10, so two
+                    # bank columns landed on DoF placing atoms outside the ring. The ring
+                    # read chair-like on 48% of draws instead of 99.6% -- half the draws
+                    # were twist-boats with the phenyl clashing, worth ~40,000 kT of LJ, and
+                    # it looked like "rings just sample badly" rather than a mapping error.
+                    #
+                    # The correspondence is POSITIONAL: both sequences are _layout's block
+                    # order with the r rows removed, so column i means the i-th non-r DoF of
+                    # THIS block. The kinds must line up or the two blocks are not the same
+                    # object and there is nothing to map -- refuse rather than permute.
+                    own = [kj for kj in order if kj[0] != 'r']
+                    if [k for k, _ in own] != [k for k, _ in bank.order]:
+                        raise RuntimeError(
+                            f"ring bank for {self.smiles} has kind sequence "
+                            f"{[k for k, _ in bank.order]} but this molecule's block is "
+                            f"{[k for k, _ in own]}; the key matched but the blocks are "
+                            f"not the same object -- refusing rather than permuting it")
+                    stats['n_ring_remapped'] += int(list(own) != list(bank.order))
                     dev = np.asarray(bank.sample(n, rng, fill=self.ring_mode_fill,
                                                  temperature=float(self.temperature),
                                                  temper=self.ring_pop_temper))
-                    for col, (kind, j) in enumerate(bank.order):
+                    for col, (kind, j) in enumerate(own):
                         gr = self._global_row(kind, j)
                         v = bank.ref[col] + dev[:, col]
                         dof[:, gr] = ((v + np.pi) % (2 * np.pi) - np.pi) if kind == 'phi' else v
@@ -1015,6 +1163,32 @@ class ConformerTorsions(BaseSet):
                     if i == lead_i or gr in ring_rows:
                         continue
                     dof[:, gr] = ph0[rows_j[i]] + disp + rng.normal(0.0, g_sigma[gi], n)
+
+            # ---- substituents on a ring atom whose group has no ring member ----
+            # See ring_frame_groups. TWO-PASS, and the second pass is exact rather than
+            # iterative: the frame (a, b, c) and the reference neighbour p are all RING
+            # atoms, placed by the ring block, which sits upstream of every row corrected
+            # here in the tree order. So the provisional build below fixes their positions
+            # no matter what these rows currently hold, and one measurement is enough.
+            frame_groups = self.ring_frame_groups(ring_rows) if joint_rings else []
+            stats['n_ring_frame_groups'] = len(frame_groups)
+            if frame_groups:
+                tt = lambda a: torch.as_tensor(a, dtype=self.dtype, device=self.device)
+                prov = self.build_positions(
+                    self.state_from_dof(tt(dof[:, :self.n_r]),
+                                        tt(dof[:, self.n_r:n_phi0]),
+                                        tt(dof[:, n_phi0:])).clamp(-1.0, 1.0)
+                ).reshape(n, -1, 3)
+                ref = self.ref_pos.reshape(1, -1, 3)
+                from mxtaltools.conformers.geometry import dihedral
+                for rows_j, a, b, c, p, gi in frame_groups:
+                    ind = dihedral(prov[:, a], prov[:, b], prov[:, c],
+                                   prov[:, p]).detach().cpu().numpy()
+                    ind0 = float(dihedral(ref[:, a], ref[:, b], ref[:, c],
+                                          ref[:, p]).detach().cpu().numpy()[0])
+                    for j in rows_j:
+                        off = (ph0[j] - ind0 + np.pi) % (2 * np.pi) - np.pi
+                        dof[:, n_phi0 + j] = ind + off + rng.normal(0.0, g_sigma[gi], n)
         else:
             # independent marginals for phi too: the pre-fix behaviour, kept so the A/B
             # is runnable and the gate below can require the difference
@@ -1043,17 +1217,28 @@ class ConformerTorsions(BaseSet):
         # the closure bond is not a tree DoF, it is whatever the ring's internals imply --
         # so it has to be measured on the draw rather than assumed. Reported against a
         # bond's own thermal width, since that is the scale at which it stops mattering.
-        stats['closure_err'] = 0.0
-        stats['closure_sigma'] = 0.0
-        if stats['n_rings']:
-            from mxtaltools.conformers.builder import closure_length
-            tree, ff = self._batch(n)
-            if ff.closure_index.numel():
-                cl = closure_length(tree, self.build_positions(x))
-                err = (cl - ff.closure_r0).abs().reshape(n, -1).max(1).values
-                stats['closure_err'] = float(err.median())
-                s_r, _ = self.thermal_rtheta_sigma(float(self.temperature))
-                stats['closure_sigma'] = stats['closure_err'] / max(float(np.mean(s_r)), 1e-12)
+        # GATED ON THE MOLECULE, NOT ON joint_rings. It used to be gated on
+        # ``stats['n_rings']``, which is zero whenever joint ring sampling is OFF -- so the
+        # one configuration whose closure is catastrophic reported closure_err 0.000 and
+        # read as perfect. Measured on cyclohexane at 'full': 0.086 A with rings on, 2.93 A
+        # (75 bond-sigma) with them off, both previously indistinguishable at 0.000. A
+        # diagnostic that goes quiet exactly where the thing it monitors fails is worse
+        # than none, and it is what let the reference table benchmark the disabled path.
+        # nan, not 0.0, when there is no closure bond: an acyclic molecule has no closure
+        # error to report and 0.0 is a passing measurement of nothing.
+        stats['closure_err'] = float('nan')
+        stats['closure_sigma'] = float('nan')
+        stats['n_closure_bonds'] = 0
+        from mxtaltools.conformers.builder import closure_length
+        tree, ff = self._batch(n)
+        if ff.closure_index.numel():
+            cl = closure_length(tree, self.build_positions(x))
+            err = (cl - ff.closure_r0).abs().reshape(n, -1).max(1).values
+            stats['closure_err'] = float(err.median())
+            s_rc, _ = self.thermal_rtheta_sigma(float(self.temperature))
+            stats['closure_sigma'] = stats['closure_err'] / max(float(np.mean(s_rc)), 1e-12)
+            stats['n_closure_bonds'] = int(ff.closure_index.numel() // 2)
+        stats['joint_rings'] = bool(joint_rings)
 
         if report:
             u = stats['n_uniform']
@@ -1075,10 +1260,16 @@ class ConformerTorsions(BaseSet):
                       f"{stats['n_ring_thermal']} held at thermal jitter about the "
                       f"reference (closure preserved, pucker NOT sampled; aromatic rings "
                       f"take this path by design, being rigid)")
+            elif stats['n_closure_bonds'] and not joint_rings:
+                print(f"  rings: joint ring sampling is OFF -- {stats['n_closure_bonds']} "
+                      f"closure bond(s) are being violated by construction. This is the "
+                      f"NEGATIVE CONTROL, not a sampling mode.")
+            if stats['n_closure_bonds']:
                 print(f"  closure error {stats['closure_err']:.3f} A = "
                       f"{stats['closure_sigma']:.1f} bond-sigma"
                       + ("  <-- ABOVE 3 sigma, the ring is visibly open"
                          if stats['closure_sigma'] > 3 else ""))
+            if stats['n_rings']:
                 if getattr(self, 'ring_sig_stale', False):
                     print(f"  WARNING this prior predates the ring-signature fix "
                           f"(ring_sig_version < 2), so NO ring key can resolve and every "

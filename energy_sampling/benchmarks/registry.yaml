@@ -17,9 +17,7 @@ defaults:
     archive_period: 0
     archive_buffers: false
     grow_batch_size: false
-    auto_batch_throughput_opt: false
     max_step_seconds: 0
-    batch_knee_recheck_steps: 0
     figs_period: 100000000
     # NO z_calibration ENTRY, and none is possible -- the same story as
     # ray_calibration below, and it cost a retracted floor to learn twice.

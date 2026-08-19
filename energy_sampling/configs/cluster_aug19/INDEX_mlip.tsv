@@ -1,0 +1,5 @@
+name	problem	batch	epochs
+cluster_aug19_m1_mace_nl_only	mace	100	600
+cluster_aug19_m1_mace_nl_gpubatch	mace	100	600
+cluster_aug19_m2_uma_extgraph_on	uma	250	600
+cluster_aug19_m2_uma_extgraph_off	uma	250	600

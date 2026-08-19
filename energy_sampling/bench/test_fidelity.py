@@ -48,11 +48,11 @@ def _dig(node, dotted):
 
 #: Every attribute the controllers read off the modeller, that exists after a
 #: bare __init__. Transcribed from controller.py, ray_calibration.py and
-#: train.py's increment_batch_size / handle_train_epoch_error. If a controller
+#: train.py's select_batch_size / handle_train_epoch_error. If a controller
 #: starts reading something new, add it here -- that is the maintenance contract.
 COUPLING_SURFACE = [
     'args', 'step_ind', 'phase', 'lr_ctrl',
-    'batch_size', 'batch_size_last_grow', 'batch_size_ever_oomed',
+    'batch_size', 'batch_size_last_grow', 'batch_sizer',
     'batch_size_cooldown_until', 'batch_size_oom_ceiling', 'protocol',
 ]
 
@@ -77,12 +77,12 @@ ARGS_SURFACE = [
     'lr_warmup_ratio', 'lr_servo_managed', 'adaptive_lr',
     'adaptive_lr.ray_calibration',
     'batch_size', 'max_batch_size', 'grow_batch_size', 'batch_growth_factor',
-    'batch_growth_interval', 'batch_growth_slow_interval',
-    'auto_batch_throughput_opt', 'batch_growth_min_throughput_gain',
-    'max_step_seconds', 'batch_knee_recheck_steps', 'oom_batch_shrink_factor',
+    'batch_growth_cap', 'batch_growth_interval', 'batch_util_target',
+    'max_step_seconds', 'oom_batch_shrink_factor',
     'oom_cooldown_steps', 'fused_grad_accum_min_samples',
-    # occupancy metric windows. NOT a control input -- gpu_util_floor is retired;
-    # the controller reads no utilization at all.
+    # occupancy windows. The sizer reads RAW samples per calibration rung and the
+    # policy-window mean once for its S2 audit (S1: veto only, fixed selection);
+    # the gpu_util_floor actuator stays retired.
     'gpu_util_window_s', 'gpu_util_policy_window_s', 'gpu_util_sample_period_s',
 ]
 

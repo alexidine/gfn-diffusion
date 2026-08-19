@@ -13,7 +13,7 @@ replay-eviction causes were retired outright (`module_buffers.md` B10),
 which retires `toxic_min_draws` as a config key everywhere and makes the
 servo's `toxic_min_draws` boost path permanently inert as a side effect (D3
 below). Unconditional route. Covers
-[`increment_batch_size`](train.py:244), the OOM recovery path, and
+[`select_batch_size`](train.py:466), the OOM recovery path, and
 [`_buffer_servo_tick`](protocol.py:1676). The LR controller — the third
 modulator — has its own document.
 
@@ -32,59 +32,43 @@ cross-reference, not a summary.)*
 
 | | Sensor | Actuator | Bound |
 |---|---|---|---|
-| **Batch size** | marginal throughput (samples/s per rung) | `batch_size` ×/÷ `batch_growth_factor` | `max_batch_size`, OOM |
+| **Batch size** | per-rung occupancy calibration (raw NVML samples), off by default | hold `batch_size`; grow only to the smallest rung clearing `batch_util_target` | `max_batch_size`, OOM ceiling, `max_step_seconds` |
 | **Buffer servo** | a **configurable** `numerator ÷ denominator` — either the scatter ratio or, since 2026-08-07, `replay/ema_loss_mean ÷ replay/birth_loss_mean` | one multiplicative boost B on replay freshness | `max_boost`, deadband |
 | **LR** | `alpha*` (two-point step probe), plus one coarse divergence bar | multiplicative `peak_scale` on servo-managed groups | `servo.bounds`, a relaxing ceiling, `min_lr` |
 
 ## 2. Batch size
 
-**Stated goal** *(user, 2026-08-05)*: **maximum backprop-per-second throughput,
-above a set minimum batch size, while saturating the GPU** — compute saturation,
-explicitly not VRAM occupancy. `samples/sec` is the proxy.
+**REPLACED at state 8 (2026-08-19)** — the throughput-knee walk this section used
+to describe is gone; `train.select_batch_size` is the controller and
+`docs/design/phase6_batch_sizer.md` is the argument. In brief:
 
-**It is the right instrument, not a fallback.** The proxy is sometimes described
-as a workaround for not having nvidia-smi in Python. That undersells it twice
-over: `torch.cuda.utilization()` does exist (NVML wrapper, needs
-`pynvml`/`nvidia-ml-py`, ships with recent CUDA wheels) — *and it would be the
-wrong signal anyway*. Utilisation answers "is a kernel running," which pegs at
-100% well below the knee and stays there, so it cannot separate a batch that is
-paying from one that is not. `increment_batch_size`'s own docstring says exactly
-this. Marginal throughput discriminates on **both** sides of the knee;
-utilisation on neither. VRAM (`torch.cuda.memory_allocated()`) is available and
-equally uninformative about compute saturation.
+**Objective, decided (user, 2026-08-16):** optimizer steps/sec at a threshold
+effective batch `A = fused_grad_accum_min_samples`. For any `B <= A`, updates/sec
+rises with `B`, so the throughput optimum is the **constant** `B = A` — the
+configured `batch_size`. There is no knee to find and no walk; the old goal
+statement (max samples/sec) let the effective batch float, which is the other
+objective, with the opposite argmax on a saturating cost curve.
 
-Note the division of labour this implies, which the code already respects:
-gradient *quality* is owned by `fused_grad_accum_min_samples` (accumulate when
-the batch is under target), and batch size is left free to chase *throughput*.
-Two jobs that a single knob would otherwise conflate.
+**Growth exists only to buy occupancy** — the number the scheduler cancels on
+(cancelled at ≤40%, survived at ≥49.4%, out-of-process; `phase6_handoff.md` §2,
+§4.3). With `batch_util_target` set (off by default), the sizer calibrates once
+per stage: it climbs `batch_growth_factor` rungs, dwelling `batch_growth_interval`
+steps at each to read a step-time median and a few **raw** occupancy samples, and
+holds the smallest rung clearing the target. Three structural rules: occupancy
+evidence may only *veto* rungs under that fixed selection rule (S1); a kept growth
+must survive a full policy window of lived occupancy or it stands down (S2); and
+UNKNOWN — no target, no sensor, no reading — never removes and never grows (S3).
+When no rung clears, the verdict is **INFEASIBLE**, said loudly with the binding
+bound named: batch is not the lever then; host stalls, work per kernel launch, or
+the energy-pinned memory ceiling are (`phase6_handoff.md` §4.4).
 
-**AIMD with a throughput knee.** Multiply by `batch_growth_factor` every
-`batch_growth_interval` steps (slower after the first OOM), capped at
-`max_batch_size`. Before each jump, if `auto_batch_throughput_opt` is on, check
-whether the *previous* jump actually paid: median step time over the trailing 20
-steps × batch = samples/s. A jump that gains less than `batch_growth_min_gain`
-reverts one rung and **pins** the batch for the current stage.
-
-The core observation is sharp and worth quoting: past GPU saturation a factor-*f*
-batch jump returns ~1.0× throughput while step time grows *f*× — pure steps/hour
-loss. Run rpvez6ep measured batch 50k running the *same* 13.3k samples/s as batch
-1.6k at 31× the step time. With the knee on, `max_batch_size` becomes a **safety
-ceiling rather than a target**, which is the right relationship.
-
-Two details that are easy to get wrong and were gotten right:
-
-- **nvidia-smi utilisation cannot drive this.** It saturates at 100% *below* the
-  knee, so it cannot discriminate. Marginal throughput can, on both sides.
-- **The pin decays.** The knee moves *within* a stage as the fused composition
-  drifts (fracs shift, buffers grow), so after `batch_knee_recheck_steps` the
-  controller drops one rung and re-climbs. That adapts in both directions: a
-  healthy re-climb re-pins at or above the old knee, a failed one pins lower.
-
-Growth is also deliberately coarse — the run visits only ~log_f(max/base)
-distinct sizes — because `torch.compile` treats every distinct size as a
-recompile plus its own CUDA graph. Rare large jumps are what make compile viable
-alongside growth. That is a genuine cross-module constraint and belongs in the
-writeup.
+The division of labour stands: gradient *quality* is owned by
+`fused_grad_accum_min_samples` (accumulate when the batch is under target);
+memory by the OOM ceiling (a domain bound that expires, with a restore-to-base
+rule when it clears); runaway steps by `max_step_seconds`. None of them selects a
+size. Rungs are few and geometric because `torch.compile` treats every distinct
+size as a recompile plus its own CUDA graph — that cross-module constraint
+survives from the old design.
 
 ## 3. Buffer servo
 

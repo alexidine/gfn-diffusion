@@ -111,11 +111,28 @@ def get_exploration_std(iter, exploratory, max_steps: int = 5000, exploration_fa
     return expl
 
 
-def get_train_args():
-    parser = argparse.ArgumentParser(description='GFN Linear Regression')
-    args, remaining = parser.parse_known_args()
+def get_train_args(argv=None):
+    """Load the crystal trainer config from its explicit CLI contract.
 
-    return resolve_derived_config(preflight_config(dict2namespace(load_yaml(remaining[1]))))
+    The former implementation accepted any unknown option and then assumed its
+    second token was the config path.  A misspelling such as ``--confg`` therefore
+    looked valid until an unrelated positional lookup failed.  The live launch
+    surface is deliberately one named argument instead:
+
+        python -u train.py --config configs/mk_dev.yaml
+
+    ``argv`` exists so the contract can be tested without mutating pytest's own
+    process arguments.  Normal training leaves it as ``None`` and argparse reads
+    ``sys.argv``.
+    """
+    parser = argparse.ArgumentParser(description='GFN crystal training')
+    parser.add_argument(
+        '--config', required=True, metavar='PATH',
+        help='YAML run configuration; the canonical spawn point is configs/mk_dev.yaml')
+    cli = parser.parse_args(argv)
+
+    return resolve_derived_config(
+        preflight_config(dict2namespace(load_yaml(cli.config))))
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +190,7 @@ _GRAD_MEDIAN = {10: 1.0e3, 25: 6.6e3, 100: 1.7e4}
 _RETIRED_KEYS = {
     'gpu_util_floor':
         "deleted 2026-08-13 -- the occupancy rule it drove is gone from "
-        "increment_batch_size. It grew the batch whenever GPU utilization fell under "
+        "the batch controller (now select_batch_size). It grew the batch whenever GPU utilization fell under "
         "this threshold, on the premise that occupancy rises with batch. MEASURED "
         "FALSE on the MLIP route (umaperf0812 c_controller): batch 100->741 took "
         "utilization 52->42% and samples/sec 57.7->24.3, four growths, every one "
@@ -181,8 +198,36 @@ _RETIRED_KEYS = {
         "overridden because the floor outranked it. It was also inert on the slow "
         "arms it was written for -- a 900 s window cannot fill from a per-10-step "
         "sample at 200 s/step. Occupancy is still LOGGED (gpu/util_recent, "
-        "gpu/util_policy); it just is not actuated from batch size, because the "
-        "levers that move it are work per kernel launch and unpaired host stalls.",
+        "gpu/util_policy), and as of state 8 it is read again by select_batch_size -- "
+        "but as a per-rung CALIBRATION measurement that can only veto candidate "
+        "sizes under a fixed selection rule, with a falsification audit "
+        "(phase6_batch_sizer.md S1/S2), never as this actuator. Set "
+        "batch_util_target for that; this key stays dead.",
+    'auto_batch_throughput_opt':
+        "deleted 2026-08-19 (state 8) -- the throughput-saturation walk it switched "
+        "is gone from the batch sizer. The objective was DECIDED (2026-08-16): "
+        "optimizer steps/sec at a threshold effective batch A = "
+        "fused_grad_accum_min_samples, and for any B <= A updates/sec = "
+        "samples_per_sec/A rises with B, so the throughput optimum is the constant "
+        "B = A -- the configured batch_size -- and there is no knee to find. The "
+        "walk this flag enabled climbed toward samples/sec saturation, which "
+        "maximises the OTHER objective (it lets the effective batch float). Growth "
+        "above the base is now occupancy's business alone: set batch_util_target.",
+    'batch_growth_min_throughput_gain':
+        "deleted 2026-08-19 (state 8) with the throughput walk -- see "
+        "auto_batch_throughput_opt. It was the walk's saturation bar; with no walk "
+        "there is nothing to bar.",
+    'batch_knee_recheck_steps':
+        "deleted 2026-08-19 (state 8) with the throughput walk -- see "
+        "auto_batch_throughput_opt. It paced the pin's drop-and-reclimb recheck; "
+        "the sizer's conclusion is instead re-opened by exactly three events, none "
+        "of them a timer: a stage transition, an OOM, and the OOM ceiling's expiry "
+        "(batch_oom_ceiling_retest_steps, which survives).",
+    'batch_growth_slow_interval':
+        "deleted 2026-08-19 (state 8) -- the AIMD congestion-avoidance regrow "
+        "spacing. Nothing regrows on an interval any more: after an OOM cut the "
+        "sizer re-runs its calibration ladder under the recorded ceiling, and "
+        "batch_growth_interval survives as the per-rung calibration dwell.",
     'batch_growth_max_step_regression':
         "deleted -- replaced by `batch_growth_min_throughput_gain`. It bounded how much "
         "SLOWER a step may get, i.e. it optimised loop-iterations/hour. That is not the "

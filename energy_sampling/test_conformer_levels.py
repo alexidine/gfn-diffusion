@@ -34,6 +34,14 @@ PROPANOL = "CCCO"
 
 
 def _energy(smiles=GATE_SMILES, level="torsion", **kw):
+    """dtype PINNED to float64 here, while the shipped default is float32.
+
+    These gates assert exactness -- bitwise geometry, and the measure term to 1e-12 -- and
+    those tolerances are statements about the FORMULA, not about the working precision. Run
+    at float32 they would have to be loosened to ~1e-6, which is a weaker test of the thing
+    they exist to pin. test_float32_default_is_sound covers the shipped precision instead.
+    """
+    kw.setdefault("dtype", DTYPE)
     return ConformerTorsions(smiles=smiles, device="cpu", level=level, **kw)
 
 
@@ -495,40 +503,66 @@ def test_ring_closure():
 
     Ring closure is the second place a product of marginals cannot work, and unlike the
     sibling case there is no purely structural fix -- the ring block has to come from
-    InternalPrior's joint RingBank, or be held near the reference. Both paths are checked,
-    and the no-ring-handling path is required to FAIL, so this cannot pass blind.
+    InternalPrior's joint bank/subspace, or be held near the reference. The
+    no-ring-handling path is required to FAIL, so this cannot pass blind.
+
+    BOTH PRIORS, AND THE BANKED PATH IS REQUIRED TO OCCUR. Run on conformer_prior.pt alone
+    this gate exercised the HELD path only -- that prior predates the ring-signature fix,
+    so no key resolves and all five molecules report 0 banked. The docstring said both
+    paths were checked; the measurement said otherwise. conformer_prior_v2.pt is where a
+    saturated ring actually reaches its fitted pucker subspace, and the assertion below
+    requires at least one to, so the banked path cannot go untested again in silence.
     """
     from pathlib import Path
     from mxtaltools.conformers.builder import closure_length
     if not Path('conformer_prior.pt').exists():
         raise AssertionError("conformer_prior.pt missing -- this gate cannot run, and a "
                              "silent skip is how it would disappear on another machine")
-    prior = torch.load('conformer_prior.pt', weights_only=False)
     n = 256
-    for name, smi in RING_MOLS:
-        e = _energy(smi, level='full')
-        tree, ff = e._batch(n)
-        assert ff.closure_index.numel() > 0, f'{name} has no ring closure bond'
+    for tag, path in (('v1/held', 'conformer_prior.pt'), ('v2/banked', 'conformer_prior_v2.pt')):
+        if not Path(path).exists():
+            raise AssertionError(f'{path} missing -- this gate needs both priors: v1 '
+                                 f'exercises the held path, v2 the banked one')
+        prior = torch.load(path, weights_only=False)
+        banked_total = 0
+        for name, smi in RING_MOLS:
+            e = _energy(smi, level='full')
+            tree, ff = e._batch(n)
+            assert ff.closure_index.numel() > 0, f'{name} has no ring closure bond'
 
-        def cerr(**kw):
-            x, st = e.sample_prior_states(prior, n, np.random.default_rng(0),
-                                          report=False, **kw)
-            cl = closure_length(tree, e.build_positions(x))
-            return float((cl - ff.closure_r0).abs().reshape(n, -1).max(1).values.median()), st
+            def cerr(**kw):
+                x, st = e.sample_prior_states(prior, n, np.random.default_rng(0),
+                                              report=False, **kw)
+                cl = closure_length(tree, e.build_positions(x))
+                return float((cl - ff.closure_r0).abs().reshape(n, -1).max(1).values.median()), st
 
-        off, _ = cerr(joint_rings=False)
-        on, st = cerr()
-        assert on < 0.25, f'{name}: closure error {on:.3f} A with rings wired'
-        assert off > 4 * on, \
-            (f'{name}: turning ring handling OFF barely changed closure ({off:.3f} vs '
-             f'{on:.3f} A) -- this gate cannot detect the bug it exists for')
-        # every ring system is accounted for by exactly one path
-        assert st['n_rings'] == st['n_ring_banked'] + st['n_ring_thermal'], (name, st)
-        print(f"     {name:12s} closure {off:.2f} A -> {on:.3f} A   "
-              f"({st['n_ring_banked']} banked, {st['n_ring_thermal']} held, "
-              f"{st['n_ring_extra_held']} extra DoF held)")
+            off, off_st = cerr(joint_rings=False)
+            on, st = cerr()
+            assert on < 0.25, f'{tag} {name}: closure error {on:.3f} A with rings wired'
+            assert off > 4 * on, \
+                (f'{tag} {name}: turning ring handling OFF barely changed closure '
+                 f'({off:.3f} vs {on:.3f} A) -- this gate cannot detect the bug it '
+                 f'exists for')
+            # the OFF arm's own stats must SEE that breakage. The monitor used to be gated
+            # on the ring-system count, which is 0 there, so it reported a perfect 0.000.
+            assert abs(off_st['closure_err'] - off) < 1e-9, \
+                (f'{tag} {name}: the sampler reported closure_err '
+                 f'{off_st["closure_err"]:.3f} A with joint rings OFF while the true error '
+                 f'is {off:.3f} A -- the monitor is gated on the ring path again')
+            # every ring system is accounted for by exactly one path
+            assert st['n_rings'] == st['n_ring_banked'] + st['n_ring_thermal'], (name, st)
+            banked_total += st['n_ring_banked']
+            print(f"     {tag:10s} {name:12s} closure {off:.2f} A -> {on:.3f} A   "
+                  f"({st['n_ring_banked']} banked, {st['n_ring_thermal']} held, "
+                  f"{st['n_ring_extra_held']} extra DoF held)")
+        if tag.startswith('v2'):
+            assert banked_total > 0, \
+                ('no ring reached a bank or pucker subspace under the v2 prior, so this '
+                 'gate is still testing the HELD path only and would pass with ring '
+                 'banking entirely removed')
 
-    print('PASS         ring closure holds on 5 ring types')
+    print('PASS         ring closure holds on 5 ring types, under BOTH the held (v1) and '
+          'banked (v2) paths')
 
 
 def _ring_key(energy, prior):
@@ -626,12 +660,57 @@ def test_stale_ring_signature_detected():
     print('PASS         stale ring signature detected via vars(), not getattr')
 
 
+def test_float32_default_is_sound():
+    """The SHIPPED precision must agree with float64 on everything this code reports.
+
+    The exactness gates above pin the formula at float64 on purpose; this pins the working
+    precision. Asserted on the reported quantities -- potential, closure, log J -- against
+    the same DoF draw, because that is what a wrong dtype would corrupt. The bar is 1e-5
+    relative: float32 epsilon is ~1.2e-7 and `build` walks ~8 topological rounds, so
+    anything compounding through the NeRF chain would blow past this.
+    """
+    from mxtaltools.conformers.builder import closure_length, log_jacobian
+    assert ConformerTorsions(smiles=PROPANOL, device="cpu", level="full").dtype         is torch.float32, "the shipped default is no longer float32"
+
+    for smi in (PROPANOL, "CCC1CCCCC1"):
+        e64 = ConformerTorsions(smiles=smi, device="cpu", level="full",
+                                force_field="mmff", dtype=torch.float64)
+        e32 = ConformerTorsions(smiles=smi, device="cpu", level="full",
+                                force_field="mmff", dtype=torch.float32)
+        torch.manual_seed(4)
+        x64 = (torch.rand(256, e64.data_ndim, dtype=torch.float64) * 1.6 - 0.8)
+        x32 = x64.to(torch.float32)
+        t = float(e64.temperature)
+
+        u64 = e64.potential_energy(x64, t).numpy()
+        u32 = e32.potential_energy(x32, t).numpy().astype("float64")
+        rel = float(np.median(np.abs(u32 - u64) / np.maximum(np.abs(u64), 1e-9)))
+        assert rel < 1e-5, f"{smi}: float32 potential differs by {rel:.2e} relative"
+
+        r64, th64, _ = e64.dof_from_state(x64)
+        r32, th32, _ = e32.dof_from_state(x32)
+        tr64, ff64 = e64._batch(256)
+        tr32, ff32 = e32._batch(256)
+        j64 = log_jacobian(tr64, r64.reshape(-1), th64.reshape(-1)).numpy()
+        j32 = log_jacobian(tr32, r32.reshape(-1), th32.reshape(-1)).numpy().astype("float64")
+        assert np.abs(j32 - j64).max() < 1e-4, "float32 log J drifted"
+
+        if ff64.closure_index.numel():
+            c64 = closure_length(tr64, e64.build_positions(x64))
+            c32 = closure_length(tr32, e32.build_positions(x32)).double()
+            dc = float((c32 - c64).abs().max())
+            # the closure errors this code REPORTS are 0.02-0.09 A; noise must sit far below
+            assert dc < 1e-4, f"{smi}: float32 closure differs by {dc:.2e} A"
+        assert torch.isfinite(e32.energy(x32, None, torch.tensor(0.0))).all(), smi
+    print("PASS         float32 default agrees with float64 on U, log J and closure")
+
+
 TESTS = [test_torsion_bitwise, test_rotatable_axes_ordered, test_layout_reaches_gfn,
          test_domain_guarantee, test_level_cannot_be_swallowed, test_linearity_is_measured,
          test_propanol_widths, test_measure_term, test_baked_energy_excludes_measure,
          test_state_dof_roundtrip, test_internal_prior_beats_uniform,
          test_ring_closure, test_ring_bank_rules,
-         test_stale_ring_signature_detected]
+         test_stale_ring_signature_detected, test_float32_default_is_sound]
 
 if __name__ == "__main__":
     torch.set_default_dtype(DTYPE)

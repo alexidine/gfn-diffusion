@@ -59,6 +59,10 @@ CANONICAL_DRIFT = {
     # so a controller asking to go lower was refused silently. Historical arms
     # predate that and carry the old floor.
     'config.min_lr',
+    # Owner edits of 2026-08-19, with the occupancy ladder arming: rung spacing
+    # 1.65 -> 1.6 and the OOM cut 0.5 -> 0.625. Historical arms carry the old
+    # values.
+    'config.batch_growth_factor', 'config.oom_batch_shrink_factor',
     # var_conditioning's `fwd/logw_std_within < 6.0` exit was DELETED from
     # canonical on 2026-08-17: the bar sat below a measured minimum of 17.1 and
     # next_battery.md 1.1 concluded the stage is terminal by design. Historical
@@ -75,6 +79,10 @@ CANONICAL_DRIFT = {
 #: the documented control arm (`lr_servo_managed` empty: the sensor reads and logs
 #: while actuating nothing).
 _BSZ_COMMON = {
+    # the battery predates the occupancy ladder and pinned its batch, which the
+    # armed canonical (batch_util_target 60, grow true) can no longer express
+    # without saying so
+    'grow_batch_size': False, 'batch_util_target': 0,
     'adaptive_lr.warmup_steps': 10,
     'adaptive_lr.ray_calibration.period': 200,
     'condition_log_z.half_life_visits': 7.0,
@@ -122,6 +130,7 @@ def _spec_qm9_conditional():
     return 'configs/shakeout_aug16/qm9_cond.yaml', dict(
         problem='qm9_conditional',
         batch_size=500, max_batch_size=500, eval_num_samples=2000,
+        grow_batch_size=False, batch_util_target=0,
         checkpoint_name='WARM_qm9_mle3k.pt', load_weights_only=True,
         # The battery tuned the MLE exit gate for a 3k-step warm start.
         **{'protocols.conditional_vargrad.stages[0].mle_gate.slope_t': 1.0,

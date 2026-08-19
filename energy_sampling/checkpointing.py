@@ -36,19 +36,17 @@ MODELLER_STATE_DEFAULTS = {
     # jump-mode growth (batch_growth_interval > 0): step of the last size jump
     # (or OOM cut), so the growth clock survives resume
     'batch_size_last_grow': 0,
-    'batch_size_ever_oomed': False,
-    # flips permanently once we've OOM'd at least once - switches growth from fast slow-start to slow congestion-avoidance
     'batch_size_cooldown_until': -1,  # step_ind until which batch size growth is frozen after a cut
     # smallest batch known to OOM in the CURRENT stage (None = none seen). The
-    # growth walk refuses to re-enter it; protocol.advance clears it because the
-    # incoming stage has its own memory profile. Worth checkpointing so a
+    # sizer's domain stops strictly below it; protocol.advance clears it because
+    # the incoming stage has its own memory profile. Worth checkpointing so a
     # mid-stage resume doesn't have to rediscover the ceiling the hard way.
     'batch_size_oom_ceiling': None,
-    # step the ceiling above was last recorded. It EXPIRES (see increment_batch_size),
+    # step the ceiling above was last recorded. It EXPIRES (see select_batch_size),
     # so the clock has to travel with it. None means UNSTAMPED, not step 0: a resume
     # at step 20000 that restored the ceiling against a 0 clock would expire it on the
     # first post-resume step -- the opposite failure from the one expiry exists to fix.
-    # increment_batch_size stamps an unstamped ceiling at the current step, so a
+    # select_batch_size stamps an unstamped ceiling at the current step, so a
     # restored ceiling serves its full quiet window from the resume.
     'batch_size_oom_ceiling_at': None,
     # smallest batch EVER seen to OOM in this stage. Unlike the ceiling above it does
@@ -58,17 +56,15 @@ MODELLER_STATE_DEFAULTS = {
     # would ratchet upward one probe at a time, forgetting the smallest size it has
     # direct evidence does not fit.
     'batch_size_oom_min': None,
-    # the throughput pin: the stage whose knee has been found (None = still climbing)
-    # and the step it was pinned at, which is the recheck clock. These MUST travel
-    # with batch_size_oom_ceiling above. In a live process the pin is safe by
-    # accident -- every writer of the ceiling also writes the pin -- but a resume
-    # broke that pairing: it restored the ceiling from disk and left the pin
-    # undefined, and the growth walk reads it as a bare attribute, so the job died
-    # of AttributeError ~2 growth intervals in, outside the train loop's try/except.
-    # Checkpointing them also keeps a resumed run from re-climbing a knee it has
-    # already paid to find.
-    'batch_size_saturated_stage': None,
-    'batch_size_pinned_at': 0,
+    # the batch sizer's conclusion for the current stage (None = not yet decided;
+    # see train.select_batch_size): phase, reason, selection, and the measured rung
+    # table. It MUST travel with batch_size_oom_ceiling above -- a resume that
+    # restored the ceiling but not the conclusion would re-run a calibration the
+    # run already paid for. Its predecessor state (the knee pin) taught the same
+    # lesson the hard way: a resume restored the ceiling and left the pin
+    # undefined, and the job died of AttributeError outside the train loop's
+    # try/except.
+    'batch_sizer': None,
     'grow_buffer': False,
     'fwd_step_count': 0,
     'bwd_step_count': 0,
@@ -155,20 +151,20 @@ class Checkpointer:
         """
         Give the current config's batch settings authority over the restored ones.
 
-        batch_size and its growth bookkeeping are run state, so a resume used to
+        batch_size and its sizer bookkeeping are run state, so a resume used to
         inherit whatever size the checkpoint had grown to and ignore both
-        `batch_size:` and `max_batch_size:` outright: increment_batch_size only
-        ever moves the size UP, and it returns early once the restored size is
-        already at or above the ceiling, so nothing ever pulled an oversized
-        batch back down. Run p307hzip resumed with `batch_size: 1000` +
-        `max_batch_size: 1000` and trained at 2831, silently.
+        `batch_size:` and `max_batch_size:` outright: the previous controller
+        only ever moved the size UP and returned early once the restored size
+        was already at or above the ceiling, so nothing ever pulled an
+        oversized batch back down. Run p307hzip resumed with `batch_size: 1000`
+        + `max_batch_size: 1000` and trained at 2831, silently.
 
         With growth ON the checkpoint's size is legitimate run state, so it is
         kept - just clamped to this config's ceiling. With growth OFF the
         config's batch_size is an explicit pin, so it is restored verbatim and
-        the growth clock / OOM history go with it: they exist only to pace
-        growth that can no longer happen, and carrying an old cooldown or
-        ever_oomed flag into a pinned run just leaves stale state lying around.
+        the sizer's conclusion goes with it: it describes a selection this
+        config no longer allows to happen, and carrying a stale cooldown or
+        conclusion into a pinned run just leaves stale state lying around.
         The OOM path is untouched either way - handle_oom still cuts and re-arms
         them if the configured size turns out not to fit.
         """
@@ -179,7 +175,7 @@ class Checkpointer:
         if not grow:
             m.batch_size = int(args.batch_size)
             m.batch_size_last_grow = 0
-            m.batch_size_ever_oomed = False
+            m.batch_sizer = None
             m.batch_size_cooldown_until = -1
         m.batch_size = min(m.batch_size, int(args.max_batch_size))
         if m.batch_size != restored:

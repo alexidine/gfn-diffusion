@@ -1,4 +1,4 @@
-project_state_version: 7
+project_state_version: 9
 run_name: b1000
 tag: bsz
 seed: 12345
@@ -109,14 +109,10 @@ eval_period: 500
 figs_period: 1000
 batch_growth_factor: 1.65
 batch_growth_interval: 50
-batch_growth_slow_interval: 300
-auto_batch_throughput_opt: true
-batch_growth_min_throughput_gain: 0.05
 gpu_util_window_s: 900
 gpu_util_sample_period_s: 60
 gpu_util_policy_window_s: 7200
 max_step_seconds: 60
-batch_knee_recheck_steps: 2000
 oom_batch_shrink_factor: 0.5
 oom_cooldown_steps: 200
 batch_oom_ceiling_retest_steps: 1000

@@ -1,0 +1,7 @@
+name	problem	batch	epochs	state	canonical_sha
+synth_aug19_a1_elj_base	mipcas_elj	1000	730	9	af4a9fa3a93f
+synth_aug19_a2_mace_fast_eq2	mipcas_elj	1	120	9	af4a9fa3a93f
+synth_aug19_a3_uma_ext_eq2	mipcas_elj	2	120	9	af4a9fa3a93f
+synth_aug19_a4_sizer_ladder	mipcas_elj	1000	1330	9	af4a9fa3a93f
+synth_aug19_a5_transition_s9	latent_gaussian	300	900	9	af4a9fa3a93f
+synth_aug19_a6_cond_elj_s9	qm9_conditional	500	300	9	af4a9fa3a93f

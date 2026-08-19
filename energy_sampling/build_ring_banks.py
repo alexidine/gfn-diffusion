@@ -81,14 +81,22 @@ def ring_cycle(z, bonds):
 
 
 def basin_key(pos, cyc):
-    """Sign pattern of the ring torsions -- a coarse, stable label for a pucker basin."""
-    from mxtaltools.conformers.geometry import dihedral
+    """Sign pattern of the ring torsions -- a coarse, stable label for a pucker basin.
+
+    The quantisation lives in energies/ring_metrics.py because the benchmark counts basin
+    OCCUPANCY with it while this script deduplicates minimised conformers with it. Two
+    copies of the rule would let "how many basins exist" and "how many were reached"
+    silently answer different questions.
+    """
+    from energies.ring_metrics import basin_label
     n = len(cyc)
-    t = [float(dihedral(*(torch.tensor(pos[cyc[(i + k) % n]])[None] for k in range(4))))
-         for i in range(n)]
-    # quantise: flat (|t| < 10 deg) is its own state, so a planar ring does not read as a
-    # random sign pattern
-    return tuple(0 if abs(np.degrees(x)) < 10 else int(np.sign(x)) for x in t)
+    t = [float(dihedral_of(pos, cyc, i, n)) for i in range(n)]
+    return basin_label(t)
+
+
+def dihedral_of(pos, cyc, i, n):
+    from mxtaltools.conformers.geometry import dihedral
+    return dihedral(*(torch.tensor(pos[cyc[(i + k) % n]])[None] for k in range(4)))
 
 
 def as_moldata(z, bonds, pos, dtype=torch.float64):
@@ -121,7 +129,7 @@ def collect(smiles, n_starts, verbose=True):
     return mols, set(seen)
 
 
-def fit_ring_modes(smiles, mols, prior, var_target=0.995, max_k=8, verbose=True):
+def fit_ring_modes(smiles, mols, prior, var_target=1.0, max_k=8, verbose=True):
     """RingModes per (signature, n_dof) key, from a set of conformers of one molecule.
 
     Whitening comes from the FORCE FIELD's own thermal widths, never from the sample
@@ -133,6 +141,19 @@ def fit_ring_modes(smiles, mols, prior, var_target=0.995, max_k=8, verbose=True)
     Only theta and phi are fitted. Bond lengths are left to the thermal path, which is
     exact for a harmonic term and specific to the molecule at hand rather than imported
     from whichever ring was scanned.
+
+    var_target IS 1.0: KEEP EVERY DIRECTION THE SAMPLE SPANS. It was 0.995, which reads
+    like a mild denoising choice and is not -- variance in whitened DoF space is the wrong
+    loss for a manifold defined by a hard constraint. On cyclohexane 0.995 selected k=3 of
+    an available 7 while reporting var_explained 0.9996, and the discarded 0.04% happened
+    to fall almost entirely on the CHAIR, which carries 99% of the Boltzmann mass: the
+    chair reconstructed 4.6x further from closure than the rare twist-boats. Swept with
+    the jitter cap in place, k>=6 beats k=3 on closure (2.46 -> 1.51 bond-sigma), on median
+    energy and on basin evenness, and saturates at k = d_sub where the fit is lossless.
+
+    At that point the PCA performs no dimensionality reduction -- it supplies a whitened
+    basis in which `comp_std` can cap the jitter per direction, which is the part that was
+    ever load-bearing. max_k still binds on 7- and 8-rings, where d_sub exceeds 8.
     """
     from energies.conformer_torsions import ConformerTorsions
     from energies.conformer_data import RingModes

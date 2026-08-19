@@ -32,6 +32,7 @@ KNOWN_EXPENSIVE = (
     'test_conformer_levels.py',
     'test_periodic_scoring.py',
     'test_batch_invariance.py',        # loads real priors off the data drive
+    'test_mxtaltools_crystal_boundary.py',  # CPU synthetic boundary; constructs crystal graphs
     'test_latent_gaussian.py',
     'bench/test_surface_fitness.py',   # defers `import torch` into the body
     'bench/test_tracking.py',          # ditto
@@ -39,6 +40,7 @@ KNOWN_EXPENSIVE = (
 
 # Files that must stay in the fast lane, or the dev loop stops being a loop.
 KNOWN_CHEAP = (
+    'test_crystal_operational_contract.py',
     'test_config_state.py',
     'test_config_invariants.py',
     'test_problems.py',

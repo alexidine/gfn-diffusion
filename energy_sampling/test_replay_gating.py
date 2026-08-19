@@ -113,6 +113,10 @@ def modeller(stg, z_calibration=None, ray_enabled=True, step_ind=0):
         protocol=proto,
         step_ind=step_ind,
         _replay_managed=None,
+        # _ray_probe_armed consults the pre-draw refusal predicate (F-039);
+        # the shipping predicate currently refuses nothing (freeze-only warmup
+        # reversal), so None is the faithful stub
+        lr_controller=SimpleNamespace(calibration_refusal=lambda: None),
         args=SimpleNamespace(
             z_calibration=z_calibration,
             ray_calibration=SimpleNamespace(enabled=ray_enabled, period=500,
@@ -123,7 +127,7 @@ def modeller(stg, z_calibration=None, ray_enabled=True, step_ind=0):
                                enabled=ray_enabled),
     )
     for name in ('replay_in_play', 'manage_replay_buffer',
-                 '_ray_probe_armed', '_check_ray_wiring'):
+                 '_ray_probe_armed', '_check_ray_wiring', '_ray_askers'):
         setattr(m, name, MethodType(getattr(Modeller, name), m))
     return m
 

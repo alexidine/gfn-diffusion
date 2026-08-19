@@ -19,3 +19,8 @@ energy_sampling/SCRATCH/
 energy_sampling/*.log
 energy_sampling/logs_*.txt
 energy_sampling/.vram_registry.json
+
+# torch.profiler output (profiling.trace): an 8-step chrome trace measures
+# ~750 MB and is effectively unopenable; the companion *_table.txt is the
+# usable artifact. Neither belongs in the repo.
+energy_sampling/profiling_results/

@@ -1,0 +1,21 @@
+{
+  "uma_energy_state": 2,
+  "groups": {
+    "nehzor_4_uma": {
+      "rows": 40082,
+      "median_delta_eV": 0.00019073486328125,
+      "mean_abs_delta_eV": 3.345099687576294,
+      "max_abs_delta_eV": 967.6610107421875,
+      "frac_below_1meV": 0.02422533743083477,
+      "frac_above_100meV": 0.2573224902153015
+    },
+    "mipcas_uma": {
+      "rows": 82303,
+      "median_delta_eV": -0.0045318603515625,
+      "mean_abs_delta_eV": 1.755426049232483,
+      "max_abs_delta_eV": 440.5508728027344,
+      "frac_below_1meV": 0.02040022797882557,
+      "frac_above_100meV": 0.23216651380062103
+    }
+  }
+}

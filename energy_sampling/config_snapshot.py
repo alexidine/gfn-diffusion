@@ -38,16 +38,15 @@ certify a config against a rule the trainer no longer follows.
     python -m config_snapshot cfg.yaml --save ref.json  # bank a reference
     python -m config_snapshot cfg.yaml --against ref.json
 
-THE CONSOLIDATION LOOP. The reference does not need banking -- git already holds
-it, so the baseline is always the committed config rather than a snapshot file
-someone has to remember to refresh:
+THE CURRENT CONTRACT. Validate the canonical operational surface without a GPU,
+data drive, checkpoint, W&B, or model construction:
 
-    git show HEAD:energy_sampling/configs/mk_dev.yaml > /tmp/base.yaml
-    python -m config_snapshot /tmp/base.yaml configs/mk_dev.yaml
+    python -m config_snapshot configs/mk_dev.yaml --check
 
-Exit status is 0 when no key a run reads changed value, 1 otherwise, so this
-drops straight into a loop and every edit is one command away from a verdict.
-That is what makes it safe to consolidate in small steps instead of one leap.
+For a deliberate before/after comparison, bank the reference explicitly with
+``--save`` and use ``--against``.  Do not infer an authoritative baseline from
+Git chronology; the reference is evidence only when the person making the
+comparison chose it for that purpose.
 """
 
 from __future__ import annotations
@@ -195,9 +194,8 @@ def snapshot(yaml_path: str) -> dict:
     tighten a rule is that the committed config violates it. A comparator that
     dies on "before" is useless in exactly the case it was built for -- so an
     unloadable config is a REPORTED state, not a crash."""
-    import utils
-
     try:
+        import utils
         args = utils.resolve_derived_config(
             utils.preflight_config(utils.dict2namespace(utils.load_yaml(yaml_path))))
     except Exception as e:
@@ -248,6 +246,40 @@ def snapshot(yaml_path: str) -> dict:
     resolved['_active_protocol'] = active_protocol_name(resolved)
 
     return {'source': str(yaml_path), 'config': resolved, 'stages': stages}
+
+
+def contract(yaml_path: str) -> tuple[dict, list[str]]:
+    """Validate one config as a complete CPU-only operational contract.
+
+    This composes the existing sources of proof rather than restating their
+    rules: ``snapshot`` exercises the trainer's load/preflight/derived-config and
+    active ``StageProtocol`` paths, while ``config_invariants`` parses every
+    declared protocol and checks the cross-field claims.  Baseline departures
+    are failures here because this command is the canonical-control-surface
+    check; experiment generation has its own path that reports them instead.
+    """
+    snap = snapshot(yaml_path)
+    issues = []
+    if snap.get('load_error'):
+        issues.append(f"load: {snap['load_error']}")
+        return snap, issues
+
+    try:
+        import config_invariants
+        import utils
+        raw = utils.load_yaml(yaml_path)
+        issues.extend(str(v) for v in config_invariants.check(raw))
+    except Exception as e:
+        issues.append(f'invariants: {type(e).__name__}: {e}')
+
+    stages = snap.get('stages') or []
+    if not stages:
+        issues.append('active protocol resolves to no stages')
+    for stage in stages:
+        coeffs = stage.get('effective_loss_coeffs')
+        if isinstance(coeffs, str) and coeffs.startswith('ERROR:'):
+            issues.append(f"stage {stage.get('name')!r} loss coefficients: {coeffs}")
+    return snap, issues
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +413,31 @@ def _main():
     ap.add_argument('other', nargs='?', help='second config to compare against')
     ap.add_argument('--save', metavar='PATH', help='write this config\'s snapshot as JSON')
     ap.add_argument('--against', metavar='PATH', help='compare against a saved snapshot')
+    ap.add_argument('--check', action='store_true',
+                    help='validate a canonical config and print a concise operational summary')
     a = ap.parse_args()
+
+    if a.check and (a.other or a.save or a.against):
+        ap.error('--check cannot be combined with comparison or snapshot-output options')
+
+    if a.check:
+        checked, issues = contract(a.config)
+        if issues:
+            print(f'{a.config}: contract FAILED')
+            for issue in issues:
+                print(f'  - {issue}')
+            return 1
+        cfg = checked['config']
+        active = cfg.get('_active_protocol')
+        declared = ', '.join(sorted((cfg.get('protocols') or {}).keys()))
+        stages = ' -> '.join(str(s.get('name')) for s in checked['stages'])
+        print(f'{a.config}: contract ok')
+        print(f'  project_state_version: {cfg.get("project_state_version")}')
+        print(f'  active protocol: {active}')
+        print(f'  declared protocols: {declared}')
+        print(f'  active stages: {stages}')
+        print('  runtime services touched: none (GPU/data/checkpoint/W&B/model not constructed)')
+        return 0
 
     first = snapshot(a.config)
 

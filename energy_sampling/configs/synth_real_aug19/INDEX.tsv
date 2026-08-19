@@ -1,0 +1,4 @@
+name	problem	batch	epochs	state	canonical_sha
+synth_real_aug19_uncond	mipcas_elj	1000	1330	9	f1176a1db582
+synth_real_aug19_cond_20min	qm9_conditional	1000	23950	9	f1176a1db582
+synth_real_aug19_cond_levelgap	qm9_conditional	1000	19546	9	f1176a1db582

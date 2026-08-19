@@ -62,8 +62,8 @@ A throughput number needs a denominator that does not move. Every item below mov
 it, all of them are live in `configs/mk_dev.yaml`, and none of them announces
 itself. They are neutralised in `defaults.overrides` and the reasons are here.
 
-**The batch is a moving denominator.** `grow_batch_size`,
-`auto_batch_throughput_opt` and the OOM shrink path all change `batch_size` mid-run;
+**The batch is a moving denominator.** `grow_batch_size` (with the state-8 sizer's
+occupancy ladder behind it) and the OOM shrink path change `batch_size` mid-run;
 observed range 982–3000 on the dev box and 1650–7410 on the cluster. A benchmark
 pins it. `grow_batch_size: false` and `max_batch_size == batch_size` are
 **independent hard stops** and setting one alone pins nothing — the validator

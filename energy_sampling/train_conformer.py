@@ -454,13 +454,15 @@ class ConformerModeller:
     """Minimal Modeller surface so train.py's LR and batch machinery runs unmodified.
 
     ``LRController`` reaches into its owner for exactly ``step_ind``, ``args``,
-    ``phase``, ``optimizers`` and ``lr_ctrl``, and ``increment_batch_size`` for the
-    batch-growth state plus a step-time window. Providing that interface lets both be
+    ``phase``, ``optimizers`` and ``lr_ctrl``, and ``select_batch_size`` for the
+    batch-sizer state plus a step-time window. Providing that interface lets both be
     used as-is rather than reimplemented, so their semantics stay identical to the
     crystal runs and any fix there lands here too.
 
     ``phase`` is constant and ``protocol`` is None: v0.1 has a single stage, so the
-    per-stage warmup rearm and the knee's stage pinning are inert rather than absent.
+    per-stage clearing of the sizer's conclusion is inert rather than absent. No
+    conformer config sets ``batch_util_target``, so the sizer holds the base batch
+    (S3) and only the OOM/runaway bounds ever move it.
     """
 
     def __init__(self, args, gfn, device):
@@ -473,13 +475,11 @@ class ConformerModeller:
         self.lr_ctrl = None             # LRController builds and owns this dict
         self.batch_size = int(args.training.batch_size)
         self.args.max_batch_size = int(args.training.max_batch_size)
-        self.batch_size_ever_oomed = False
         self.batch_size_cooldown_until = 0
         self.batch_size_last_grow = 0
-        self.batch_size_saturated_stage = None
-        self.batch_size_pinned_at = 0
-        self._rung_throughput = None
+        self.batch_sizer = None
         self._recent_step_times = deque(maxlen=50)
+        self._recent_step_work = deque(maxlen=50)
         self.last_grad_norm_pre_clip = float('nan')
         self.grad_nonfinite = 0
         self._throughput = {'samples': 0, 'seconds': 0.0}
@@ -527,7 +527,10 @@ class ConformerModeller:
     def step_lr_schedule(self):
         return self.lr_controller.step()
 
-    increment_batch_size = Modeller.increment_batch_size
+    select_batch_size = Modeller.select_batch_size
+    _conclude_batch_calibration = Modeller._conclude_batch_calibration
+    _gpu_util_mean = Modeller._gpu_util_mean
+    _now = Modeller._now
 
     def fast_metrics(self):
         """train.py's ``ten_step_reporting``, restricted to what v0.1 has.
@@ -661,7 +664,7 @@ def run(args):
         if step % 10 == 0:                       # same cadence train.py uses
             mod.step_lr_schedule()
         if getattr(train_c, "grow_batch_size", False):
-            mod.increment_batch_size()
+            mod.select_batch_size()
         batch_size = mod.batch_size
         for opt in mod.optimizers.values():
             opt.zero_grad(set_to_none=True)

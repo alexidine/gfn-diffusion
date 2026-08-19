@@ -63,15 +63,26 @@ def _fires(cfg, rule_name, severity=ERROR):
     return len(vs) > 0
 
 
-def test_growth_gain_at_the_factor_freezes_the_batch(canonical):
-    # factor 1.65 -> anything >= 0.65 makes every jump unachievable
-    assert _fires(broken(canonical, batch_growth_min_throughput_gain=0.65),
-                  'growth_gain_below_growth_factor')
-    assert _fires(broken(canonical, batch_growth_min_throughput_gain=0.9),
-                  'growth_gain_below_growth_factor')
-    # just below is fine
-    assert not _fires(broken(canonical, batch_growth_min_throughput_gain=0.6),
-                      'growth_gain_below_growth_factor')
+def test_util_target_must_be_actuable(canonical):
+    # each control disarms the ladder EXPLICITLY, so the assertions hold whatever
+    # grow/max values the canonical config ships (it now ships armed: 60/true/20000)
+    assert _fires(broken(canonical, batch_util_target=0.6, grow_batch_size=False),
+                  'util_target_actuable')
+    # growth on but no headroom above the base: the ladder has one rung
+    assert _fires(broken(canonical, batch_util_target=0.6, grow_batch_size=True,
+                         max_batch_size=1000), 'util_target_actuable')
+    # THE UNIT GATE (state 9). A leftover percent value must fail rather than
+    # ask for 6000% occupancy and call every batch INFEASIBLE. This is the
+    # clause the old (0, 100] range could not express: under it, 60 passed.
+    assert _fires(broken(canonical, batch_util_target=60, grow_batch_size=True,
+                         max_batch_size=20000), 'util_target_actuable')
+    assert _fires(broken(canonical, batch_util_target=140, grow_batch_size=True,
+                         max_batch_size=20000), 'util_target_actuable')
+    # actuable: growth on, headroom above the base, a real fraction
+    assert not _fires(broken(canonical, batch_util_target=0.6, grow_batch_size=True,
+                             max_batch_size=20000), 'util_target_actuable')
+    # off is the shipping default and clean
+    assert not _fires(broken(canonical, batch_util_target=0), 'util_target_actuable')
 
 
 def test_figs_period_not_a_multiple_never_fires(canonical):
@@ -490,7 +501,7 @@ def test_patience_one_is_always_reachable(canonical):
 
 def test_effective_batch_below_baseline_is_a_baseline_not_an_error(canonical):
     cfg = broken(canonical, batch_size=100, max_batch_size=100,
-                 fused_grad_accum_min_samples=0)
+                 fused_grad_accum_min_samples=0, batch_util_target=0)
     assert _fires(cfg, 'effective_batch_meets_baseline', severity=BASELINE)
     assert errors(cfg) == [], 'a baseline departure must not be an ERROR'
 
@@ -738,7 +749,7 @@ def test_rules_abstain_on_an_empty_config():
 def test_rules_abstain_on_auto_values():
     """`auto` is resolved later from (W, T). A rule that treats the string as a
     number, or as zero, would judge a value that does not exist yet."""
-    cfg = {'batch_growth_min_throughput_gain': 'auto', 'batch_growth_factor': 'auto',
+    cfg = {'batch_util_target': 'auto', 'batch_growth_factor': 'auto',
            'gradient_norm_clip': 'auto', 'batch_size': 'auto'}
     assert check(cfg) == []
 

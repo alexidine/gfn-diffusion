@@ -3,7 +3,7 @@ A duck-typed stand-in for Modeller, carrying only what the controllers read.
 
 THE DISCIPLINE, and the reason this file exists rather than a reimplementation:
 the bench fakes the MODELLER, never the controller. LRController, RayCalibration
-and increment_batch_size are imported and run unmodified. If any of them changes
+and select_batch_size are imported and run unmodified. If any of them changes
 shape, this file raises AttributeError loudly instead of quietly testing a copy
 that has drifted.
 
@@ -20,9 +20,9 @@ WHAT THE CONTROLLERS ACTUALLY READ (the whole coupling surface):
   RayCalibration        nothing -- it takes params + two callables
   the ray probe SWITCH   protocol.stages[*].lr_sensor -- `enabled` is derived,
                         not configured (train.py:1871, _ray_askers)
-  increment_batch_size  args, protocol.stage.{name,train_mode}, step_ind,
+  select_batch_size     args, protocol.stage.{name,train_mode}, step_ind,
                         batch_size, _recent_step_times, _recent_step_work,
-                        _rung_throughput, batch_size_* state
+                        batch_sizer, batch_size_* state, _gpu_util, _now
   handle_train_...      args, optimizers, step_ind, batch_size, fused_accum_count
 
 No energy function anywhere. That is the fact the whole bench rests on.
@@ -39,7 +39,7 @@ from types import SimpleNamespace
 # resolution, and the point here is to control every input explicitly.
 MK_DEV_LR = dict(
     lr_policy=1.25e-4, lr_back=1.25e-4, lr_replay=1.25e-4, lr_fused=1.25e-4,
-    lr_flow=0.1, min_lr=1.0e-6, lr_warmup_ratio=10,
+    lr_flow=0.1, min_lr=1.0e-8, lr_warmup_ratio=10,
     # what resolve_derived_config records for every lr_* key written `auto`;
     # an empty set is the controller's own control arm (reads and logs, actuates nothing)
     lr_servo_managed=('lr_policy', 'lr_back', 'lr_replay', 'lr_fused'),
@@ -48,6 +48,13 @@ MK_DEV_LR = dict(
 MK_DEV_ADAPTIVE = dict(
     warmup_steps=1000, seed_lr=1.25e-4, bounds=(0.01, 2000.0),
     divergence_loss_abs=1.0e9, divergence_grad_abs=1.0e9, divergence_cut=0.5,
+    # relative bar, as a multiple of the QUIETEST loss the current stage has
+    # produced on that branch -- the absolute bars above are a numerical-death
+    # backstop and cannot see a 100x excursion on an O(1) loss. Transcribed from
+    # the shipping value rather than disabled here: a bench that starts from a
+    # different configuration than production is the drift test_fidelity exists
+    # to catch.
+    divergence_loss_rel=100.0,
     control_flow_lr=False, restart_after=None,
 )
 
@@ -64,21 +71,25 @@ MK_DEV_CALIBRATION = dict(alpha_target=4.0, eta_up=0.25, eta_down=0.5)
 MK_DEV_RAYCAL = dict(period=500, n_sub=8, alphas=(0, 1, 2, 4, 8, 16, 32, 64))
 
 MK_DEV_BATCH = dict(
-    batch_size=1000, max_batch_size=1000, grow_batch_size=False,
-    batch_growth_factor=1.65, batch_growth_interval=50,
-    batch_growth_slow_interval=300, auto_batch_throughput_opt=True,
-    batch_growth_min_throughput_gain=0.05, max_step_seconds=60,
-    batch_knee_recheck_steps=2000, oom_batch_shrink_factor=0.5,
+    batch_size=1000, max_batch_size=20000, grow_batch_size=True,
+    batch_growth_factor=1.6, batch_growth_interval=50,
+    # rung-step cap: geometric growth until the increment reaches this, linear
+    # after -- bounds the selection's absolute overshoot at one accum quantum.
+    # 0 = uncapped geometric.
+    batch_growth_cap=1000,
+    max_step_seconds=60, oom_batch_shrink_factor=0.625,
     oom_cooldown_steps=200, fused_grad_accum_min_samples=1000,
-    # how long an OOM ceiling stands before the walk re-probes past it. NOT the same
-    # clock as batch_knee_recheck_steps: a knee retest is free, an OOM retest costs a
-    # wasted step plus a cooldown, and turning the knee recheck off must not also
-    # disable OOM recovery.
+    # the occupancy target, a FRACTION of the card since state 9 (out-of-process
+    # bracket: cancelled <=0.40, survived >=0.494). The canonical config ships
+    # the ladder ARMED at 0.6 as of 2026-08-19; 0 still means off -- hold the
+    # base batch (S3). train.select_batch_size does the one percent conversion.
+    batch_util_target=0.6,
+    # how long an OOM ceiling stands before the ladder re-probes past it. An OOM
+    # retest is not free -- a failed re-probe costs a wasted step plus a cooldown.
     batch_oom_ceiling_retest_steps=1000,
-    # occupancy: METRIC WINDOWS ONLY. The controller no longer reads utilization --
-    # `gpu_util_floor` is retired (utils._RETIRED_KEYS) because growing the batch
-    # does not raise occupancy on the MLIP route. Kept here so the fake's args
-    # surface still matches the real one.
+    # occupancy windows. The sizer reads RAW samples per calibration rung and the
+    # policy-window mean once for its S2 audit; the `gpu_util_floor` actuator
+    # (grow on a low windowed mean) stays retired (utils._RETIRED_KEYS).
     gpu_util_window_s=900, gpu_util_policy_window_s=7200,
     gpu_util_sample_period_s=60,
 )
@@ -131,7 +142,7 @@ def make_args(**overrides):
 
 
 class FakeStage:
-    """protocol.stage, as increment_batch_size and the probe gate see it."""
+    """protocol.stage, as select_batch_size and the probe gate see it."""
 
     def __init__(self, name='naive', train_mode='fused', lr_sensor=None, balance=None):
         self.name = name
@@ -171,14 +182,11 @@ class FakeModeller:
         # MODELLER_STATE_DEFAULTS subset the batch sizer owns
         self.batch_size = int(batch_size if batch_size is not None else args.batch_size)
         self.batch_size_last_grow = 0
-        self.batch_size_ever_oomed = False
         self.batch_size_cooldown_until = -1
         self.batch_size_oom_ceiling = None
         self.batch_size_oom_ceiling_at = None   # None = unstamped, NOT step 0
         self.batch_size_oom_min = None
-        self.batch_size_saturated_stage = None
-        self.batch_size_pinned_at = 0
-        self._rung_throughput = None
+        self.batch_sizer = None                 # the sizer's per-stage conclusion
         self._recent_step_times = deque(maxlen=64)
         self._recent_step_work = deque(maxlen=64)
         self.fused_accum_count = 0
@@ -245,7 +253,7 @@ class FakeModeller:
 
 def attach_real_batch_sizer(cls=FakeModeller):
     """
-    Bind train.Modeller's REAL increment_batch_size / handle_train_epoch_error /
+    Bind train.Modeller's REAL select_batch_size / handle_train_epoch_error /
     _batch_floor onto the fake class. Python methods are plain functions, so a
     fake `self` works as long as it carries the attributes they read.
 
@@ -255,7 +263,8 @@ def attach_real_batch_sizer(cls=FakeModeller):
     """
     import train  # noqa: E402  -- deliberately deferred, see docstring
 
-    cls.increment_batch_size = train.Modeller.increment_batch_size
+    cls.select_batch_size = train.Modeller.select_batch_size
+    cls._conclude_batch_calibration = train.Modeller._conclude_batch_calibration
     cls.handle_train_epoch_error = train.Modeller.handle_train_epoch_error
     cls._batch_floor = train.Modeller._batch_floor
     # the occupancy sensor, both halves: the sampling cadence AND the windowed read.

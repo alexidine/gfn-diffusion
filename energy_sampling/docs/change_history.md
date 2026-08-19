@@ -2,10 +2,10 @@
 
 Generated from `config_state.CHANGES` -- do not edit by hand.
 
-One entry per material functional change. A change marked **STATE N** is
-one that altered how persisted state is interpreted, and is the only kind
-that moves `project_state_version` or carries a migration; the rest record
-what changed and why. The line-level diff is in git.
+Selected config-schema transitions and their closely coupled rationale.
+This is not a general development log. A change marked **STATE N** altered
+how persisted state is interpreted and is the only kind that moves
+`project_state_version` or carries a migration.
 
 ## STATE 1 — Baseline.
 
@@ -303,3 +303,45 @@ The MODE-KEY MIGRATION gets its load gate, three states late. States 4-6 moved t
 - The gap was MEASURED before it was fixed: on the real load path (dict2namespace -> preflight_config) all four old spellings loaded clean, with mle_slope_t as a positive control that rejected -- so the harness could see a retired key and these were genuinely invisible.
 - Counted over git-tracked yaml, not a naive grep: 440 configs carry each *_tb_z_source key, 205 carry z_calibration.enabled (166 true, 39 false), and ZERO carry envelope_freeze_drop -- which is what makes that one a pure drop rather than a judgment call.
 - Only 10 configs are state 4 or later, i.e. mechanically migratable at all; the rest predate the protocol library and need a stage-list rewrite regardless. Those 10 were migrated and re-verified.
+
+## STATE 8 — THE BATCH SIZER IS REPLACED (phase 6: replace, do not patch further).
+
+THE BATCH SIZER IS REPLACED (phase 6: replace, do not patch further). The throughput-saturation walk -- grow until samples/sec flattens, pin, periodically recheck downward -- is deleted from train.py, because its objective was decided against it (user, 2026-08-16): optimizer steps/sec at a threshold effective batch A = fused_grad_accum_min_samples, under which the throughput optimum is the constant B = A and there is no knee to find. Growth above the base batch is now occupancy's business alone: the new select_batch_size walks a finite ladder once per stage, measures step time and raw occupancy per rung over real train steps, holds the smallest rung clearing the new `batch_util_target` (absent/0 = off, the shipping default, under which the batch simply holds the base), declares INFEASIBLE loudly when no rung clears, and audits a kept growth against a full policy window, standing down if the growth did not deliver (docs/design/phase6_batch_sizer.md S1/S2/S3). Four keys of the walk retire with it; checkpoints swap the knee-pin fields (batch_size_saturated_stage/batch_size_pinned_at/batch_size_ever_oomed) for the sizer's conclusion dict, with no checkpoint back-compat by standing policy.
+
+**Components:** `train.py`, `protocol.py`, `checkpointing.py`, `utils.py`, `config_invariants.py`, `bench/`, `benchmarks/registry.yaml`, `configs/mk_dev.yaml`
+
+**Removed:**
+
+- `auto_batch_throughput_opt` -- the walk it switched no longer exists; priority 2 is the constant B = fused_grad_accum_min_samples.
+- `batch_growth_min_throughput_gain` -- the walk's saturation bar; with no walk there is nothing to bar. Its config_invariants rule (growth_gain_below_growth_factor) is deleted with it.
+- `batch_knee_recheck_steps` -- paced the pin's drop-and-reclimb recheck. The sizer's conclusion is re-opened only by a stage transition, an OOM, or the OOM ceiling's expiry (batch_oom_ceiling_retest_steps, which survives).
+- `batch_growth_slow_interval` -- the AIMD post-OOM regrow spacing; nothing regrows on an interval. batch_growth_interval survives as the per-rung calibration dwell.
+
+**Invariants:**
+
+- With batch_util_target unset -- every existing config -- the sizer holds the configured batch_size and only the safety bounds (OOM ceiling, max_step_seconds, cooldown) ever move it. On the canonical 1000/1000 pair this is bit-identical to what the old walk could reach, since its domain had one rung.
+- Occupancy evidence may only veto candidate sizes under a fixed selection rule (S1); no occupancy reading orders the batch on its own. gpu_util_floor stays retired.
+- A set batch_util_target must be actuable: config_invariants.util_target_actuable hard-errors a target paired with grow_batch_size: false or max_batch_size <= batch_size, so the flag cannot load as inert reassurance.
+- Every safety mechanism is a domain bound, never a selector: an OOM ceiling shrinks the ladder, it cannot pin a selection.
+
+**Validation:**
+
+- bench/test_batch_traps.py: trap (a) still convicted when injected and not convicted on the replacement; the structural horizon-invariance (B1) now holds at n_distinct=1 under FLAT with no util target; an injected floorless descent walk still breaks it.
+- test_config_state.py: the retired-key gate and this transition describe the same four keys, and the canonical config migrates clean at state 8.
+
+## STATE 9 — `batch_util_target` IS REINTERPRETED FROM PERCENT TO A FRACTION of the card (0.
+
+`batch_util_target` IS REINTERPRETED FROM PERCENT TO A FRACTION of the card (0.6 = 60% busy), and the canonical config ships the occupancy ladder ARMED for the first time: batch_util_target 0.6, grow_batch_size true, max_batch_size 20000 -- the last of which puts F-045's missing ELJ 15-25k rung inside the ladder's domain. The unit change is not cosmetic: the two spellings are NOT distinguishable by inspection at the value that matters. Under the percent reading 0.6 is a legal 0.6% target, which every rung clears, so the ladder holds the first rung it measures and the constraint reports itself as served while serving nothing -- precisely the inert-flag failure util_target_actuable exists to catch, and one its old (0, 100] range could not see. The sensor still reports percent; the single conversion lives at the one read site in train.select_batch_size.
+
+**Components:** `train.py`, `config_invariants.py`, `configs/mk_dev.yaml`, `bench/fake_modeller.py`
+
+**Invariants:**
+
+- batch_util_target is a fraction in (0, 1]; a value above 1 is the pre-state-9 percent spelling and hard-errors at load (config_invariants.util_target_actuable).
+- The actuability clauses are unchanged: a set target still requires grow_batch_size true and max_batch_size > batch_size, so the armed canonical config satisfies its own rule.
+- Nothing about the control law changes -- S1/S2/S3 and the capped-geometric ladder are as shipped at state 8. Only the unit in which the target is written, and where it is converted.
+
+**Validation:**
+
+- Local shakeout 2026-08-19 (configs/synth_aug19/): the ladder walks and advances 1000 -> 1600 on the shipped capped-geometric step, with the per-rung reading taken from raw occupancy samples rather than the trailing windowed mean.
+- MEASURED consequence of arming the ladder, and the reason max_batch_size is a budgeting decision rather than a free bound: at max_batch_size 20000 the ladder is 21 rungs, and a rung needs both a batch_growth_interval dwell and 3 occupancy samples at gpu_util_sample_period_s -- >= 63 min of calibration per stage on a fast route, and ~2.5 h per rung at prod0810-scale MLIP step times, where the walk cannot finish inside a job at all.

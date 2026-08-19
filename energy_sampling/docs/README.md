@@ -10,6 +10,8 @@ Do not load this directory wholesale. Most files are evidence, snapshots, propos
 ## Active epistemic system
 
 - [`EPISTEMIC_PROTOCOL.md`](EPISTEMIC_PROTOCOL.md) — the current operating procedure for authority, proof, evidence, decisions, assumptions, and freshness.
+- [`current_decisions.md`](current_decisions.md) — accepted owner choices that cannot live more clearly in executable sources; read only when the task implicates one.
+- [`design/infrastructure_stabilization.md`](design/infrastructure_stabilization.md) — the active infrastructure plan adopted by decision D-002; use for sequencing and remaining-work status, not as proof of executable behavior.
 - Root `AGENTS.md` — the repository constitution and higher authority.
 - `configs/mk_dev.yaml` — the integrated operational control surface for current crystal runs; outside this docs directory.
 
@@ -18,12 +20,14 @@ Do not load this directory wholesale. Most files are evidence, snapshots, propos
 | Family | Status | Use |
 |---|---|---|
 | `EPISTEMIC_PROTOCOL.md` | **ACTIVE** | Follow for institutional/epistemic work |
+| `current_decisions.md` | **ACTIVE DECISION RECORD** | Accepted non-executable choices; not a work queue or general log |
+| `design/infrastructure_stabilization.md` | **ACTIVE PLAN** | Remaining infrastructure sequence and completion criteria; subordinate to executable proof |
 | `PROTOCOL.md` | **LEGACY** | Historical predecessor; do not follow |
 | `findings.md` | **EVIDENCE LEDGER** | Read cited entries only; scoped observations/mechanisms, not policy |
 | `decisions.md` | **LEGACY MIXED LEDGER** | Investigate specific historical rulings; do not append or treat the file as current policy |
 | `change_history.md` | **GENERATED MIGRATION VIEW** | Config/checkpoint transition evidence only; not a development log |
 | `synthesis.md`, `module_*.md`, `lr_control_summary.md` | **SNAPSHOTS** until individually reverified | Explanatory navigation; verify every material claim against current proof |
-| `design/*.md`, `to_do_rebuild.md`, `analysis_package_spec.md` | **ARGUMENT / PROPOSAL / PLAN** | Rationale and candidate work; not accepted policy unless an active decision adopts it |
+| other `design/*.md`, `to_do_rebuild.md`, `analysis_package_spec.md` | **ARGUMENT / PROPOSAL / PLAN by default** | Rationale and candidate work; not accepted policy unless individually promoted here by an active decision |
 | `reading_runs.md`, `audit_*.md`, completed handoffs/audits | **EVIDENCE / HISTORY** | Read only for the named investigation |
 
 The method in `design/comment_audit.md` is reusable for proof-based freshness audits. Its particular findings describe a completed audit and are not a permanent current-state document.

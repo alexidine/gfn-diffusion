@@ -124,7 +124,7 @@ def test_a_BASELINE_departure_is_reported_not_refused(tmp_path, capsys):
     # does not depart from the baseline -- the effective optimization batch is
     # what counts (test_config_invariants pins that separately).
     cfg = generate.arm('b', problem='mipcas_elj', batch_size=8, max_batch_size=8,
-                       fused_grad_accum_min_samples=8)
+                       fused_grad_accum_min_samples=8, batch_util_target=0)
     written = generate.emit({'b': cfg}, outdir=tmp_path, index=False)
     assert written, 'a baseline departure must still generate'
     assert 'baseline note' in capsys.readouterr().out

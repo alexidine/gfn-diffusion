@@ -1,11 +1,18 @@
 # Infrastructure stabilization
 
+- **Status:** ACTIVE PLAN
+- **Adopted by:** `docs/current_decisions.md` D-002
+- **Scope:** remaining infrastructure sequence and completion criteria
+- **Authority:** owns work sequencing and remaining-work status; implementation, canonical config, validation, and focused tests own current behavior
+
+Completed-phase narration below is historical rationale unless reverified. An unchecked item remains live until completed with appropriate proof or explicitly retired/obviated. Reformatting and evidence-backed status corrections are maintenance; changing a live outcome requires owner acceptance.
+
 The plan for reaching a feature-stable production foundation. Argument, in the
-`docs/PROTOCOL.md` sense: it records *why* the work is sequenced this way, and is
+`docs/EPISTEMIC_PROTOCOL.md` sense: it records *why* the work is sequenced this way, and is
 revised when the reasoning changes rather than appended to.
 
-Completion is defined at the bottom. Until every box there is checked this is the
-active plan; after that, foundational change requires a demonstrated need.
+Completion is defined at the bottom. Until every live box there is resolved this
+is the active plan; after that, foundational change requires a demonstrated need.
 
 **Current position**, by phase. The detail is below; this is the ledger.
 
@@ -15,10 +22,10 @@ active plan; after that, foundational change requires a demonstrated need.
 | **1** canonical config | **DONE** | the runtime half of the mode-safety audit (1.1) is the only remainder, and is optional now that keys travel with the protocol |
 | **2** config generation | **DONE** | 2.1 `configs/generate.py` + 2.2 corpus shipped. 2.3 stays a deliberate stub |
 | **3** executable invariants | **DONE**, folded into Phase 0 | extend as new rules earn it |
-| **3b** analysis package | Tiers 0/1/2 **SHIPPED** | Tier 3 (figures), specified and not built |
-| **4** profiling + benchmark spec | spec + `benchmarks/` **SHIPPED** | the profiling runs — cluster, user-run. Gated on `a100_stab_aug16` launching |
-| **5** MLIP | local optimisations **DONE** | A100 validation |
-| **6** batch sizer | **DESIGNED**, not built | gated on Phase 4 measurement |
+| **3b** analysis package | **DONE** | all four tiers; Tier 3 is a figure INDEX over wandb's own media, not a plotting layer |
+| **4** profiling + benchmark spec | measurement **RUN** — `a100_stab_aug16`, 2026-08-16→18; results accepted as `docs/design/phase6_handoff.md` | baseline numbers into `benchmarks/registry.yaml` (3 floors exist, wave-3 cells are n=1); the scheduler's own statistic (admin question, not a battery). The sidecar cross-check ran 2026-08-19 and confirmed the wandb stream (handoff §2) |
+| **5** MLIP | handoff §3 asks **SHIPPED 2026-08-19**: batched MACE NL + device-built dict are the in-code defaults (energy AND grad gates green locally, `test_mace_gpu_real_batches.py`); UMA external `edge_index` default on (`test_uma_external_graph.py`; F-047 — it also FIXES a silent 0.4–0.6% edge loss in fairchem's internal graph, energies move ~0.24 eV); flag metrics now report the EXECUTED path. **Local shakeout 2026-08-19 (`configs/synth_aug19/`): both gates re-run with their models named — 64/64, 11/11, 9/9, reproducing F-047's edge counts and its 0.2437 eV wrap-invariance discriminator — and the executed-path flags read 1.0 with `nl_allpairs_calls` 0 on real runs.** NB both gate suites SKIP their energy/gradient tests silently unless `UMA_CHECKPOINT`/`MACE_CHECKPOINT` is set | A100 validation: read `energy/mace_flag_*`/`uma_flag_external_graph` = 1.0, `nl_fastpath_frac` = 1.0 (torch_cluster!), and `uma_ext_graph_s` vs `uma_forward_s` (local speed is parity; the 26.8% claim is unproven there); §3.4's OOM-recovery/sync pair still open. In-step MACE cost is not locally measurable at all — the fused stage OOMs at batch 1 on a 16 GB card |
+| **6** batch sizer | **BUILT 2026-08-19 (state 8)** — `train.select_batch_size`: hold B = accum target by default; occupancy ladder under `batch_util_target` (S1 veto-only, S2 stand-down audit, S3 unknown-never-grows); walk + 4 keys retired; INFEASIBLE names the binding bound (rollout-vs-energy pinning, handoff §4.4). **The canonical config now ships the ladder ARMED (owner, 2026-08-19), and `batch_util_target` is a FRACTION as of state 9: `0.6`, `grow_batch_size: true`, `max_batch_size: 20000` — the last of these puts F-045's missing ELJ 15–25k rung inside the domain for the first time.** Local: the walk runs, advances on the shipped capped-geometric rungs and reaches a `target_met` conclusion; occupancy input verified (`pynvml` absent, so the sensor runs on `gpu_guard`'s nvidia-smi fallback and does report) | cluster validation with the ladder armed; §3.4 energy-batch decoupling still the real lever on MLIP routes. **Three things local surfaced that the cluster arms must budget for or check: the ladder is 21 rungs at `max_batch_size: 20000` (≥63 min of calibration per stage, and unfinishable on MLIP step times); two local runs of the same route disagreed about the same rung and selected different batches (confounded by concurrent load, but the selection rests on only 3 samples); and S2 has never been exercised, since no local run outlives one policy window. See `configs/synth_aug19/{FINDINGS,RUNSHEET}.md`. Note also `grow_batch_size: false` disables the sizer entirely — including the OOM-ceiling expiry and the restore-to-base rule, so an OOM cut is permanent for such a run; production always runs it true (owner, 2026-08-19)** |
 
 The config schema has moved through **seven states** since this document was
 written; `docs/change_history.md` is the record and `config_state.CHANGES` is its
@@ -283,8 +290,14 @@ it is global rather than stage-scoped; the mode-switch table in
 2026-08-17 on the real load path, with a known-retired key as a positive control:
 all four old spellings **load clean and are silently ignored**. None was added to
 `utils._RETIRED_KEYS`, the migration carries no `config_state.CHANGES` record, and
-`project_state_version` did not move — so by PROTOCOL's own rule (a renamed or
-reinterpreted key gets a record *and* the integer) this migration is unrecorded.
+`project_state_version` did not move — so under the transition rule active at the
+time (a renamed or reinterpreted key gets a record *and* the integer) this
+migration was unrecorded. The current `EPISTEMIC_PROTOCOL.md` §6 is narrower:
+only an active config or checkpoint that could be read incorrectly requires a
+semantic transition. The ignored `tb_z_source` and `z_calibration.enabled`
+spellings met that bar; `envelope_freeze_drop`, present in zero configs, would
+now be a plain deletion. Its inclusion in shipped state 7 remains historical
+fact, not the current rule.
 
 The cost is not hypothetical. Every arm of `configs/a100_stab_aug16` writes
 `tb_z_source` into the dead home, where it resolves to `None` and falls back to
@@ -571,9 +584,10 @@ makes it safe to do the rewrite in small steps instead of one leap.
 > retired-key gate keeps doing the one job that still matters: refusing a stale
 > config loudly instead of ignoring a key the author believes is live.
 >
-> The *semantic history* half of §2 is unaffected and still worth its keep. It
-> exists so a future reader can tell what a change meant, which is a different
-> need from rescuing an old file and does not go away when back-compat does.
+> The persisted-state transition history remains worth its keep. It exists so a
+> future reader can tell how an active config or checkpoint crosses a schema
+> boundary without being silently misread. It is not a general semantic history
+> for ordinary functional changes.
 
 **2.1 Production config generation (§6B).** `configs/generate.py`:
 `problem + mode + run-specific overrides → config`. Starts from canonical, never
@@ -797,9 +811,13 @@ descends forever under flat throughput.
 
 Stubs only, until repeated concrete use justifies design:
 
-- documentation generation/refresh;
-- standard experiment launch;
-- regression/failure triage.
+- ~~documentation generation/refresh~~ — replaced by event-driven correction of
+  directly invalidated active guidance plus owner-declared milestone audits; no
+  bulk synchronization or calendar automation is wanted;
+- ~~standard experiment launch~~ — graduated for crystal training as the proved
+  `python -u train.py --config configs/mk_dev.yaml` workflow plus CPU-only config
+  preflight and operational contract;
+- regression/failure triage — still deferred pending repeated concrete use.
 
 *(Canonical W&B retrieval and analysis has left this list — it is specified and
 scheduled as Phase 3b.)*
@@ -825,12 +843,13 @@ because a half-built thing recorded as done is how this list would stop working.
       the failure it answers: `a100_stab_aug16` arms once carried a state stamp
       that was *wrong about their own contents*, which misleads rather than
       merely missing.
-- [x] **substantive code/config changes have semantic history** — the machinery
-      works (`config_state.CHANGES` → `docs/change_history.md`, drift guarded by a
-      test) and the counterexample is closed: the mode-key migration's missing
-      retirements shipped as state 7, with the measurements that justified each
-      disposition in the record. The discipline now has teeth, because an
-      unretired rename is a key that loads clean and that is what state 7 was.
+- [x] **persisted-state changes that can make an active config or checkpoint read
+      incorrectly have semantic transitions** — the machinery works
+      (`config_state.CHANGES` → `docs/change_history.md`, drift guarded by a test)
+      and the counterexample is closed: the mode-key migration's missing
+      retirements shipped as state 7. Bug fixes, performance work, metrics,
+      refactors, and pure deletions with no affected active artifact do not enter
+      this history merely because they are material.
 - ~~historical configs migrate systematically~~ — dropped: back-compat is not a
       requirement. A stale config fails loudly at load; that is sufficient, and
       the gate it depends on now fires (state 7).
@@ -840,19 +859,47 @@ because a half-built thing recorded as done is how this list would stop working.
       because the measurement is what makes the claim checkable, and one vague
       correctness marker was sharpened into two checkable statements rather than
       deleted.
-- [ ] the initial recurring workflows are scripted and documented
-      (update-old-run · production-config generation · functional-change ·
-      performance-investigation · run analysis) — **two of five done**: run
-      analysis (Phase 3b, Tiers 0–2) and production-config generation (Phase 2.1).
-      The other three are not.
-- [ ] representative training modes have current end-to-end profiles — gated on
-      `a100_stab_aug16` launching.
-- [ ] MLIP bottlenecks addressed, numerical equivalence demonstrated — local
-      optimisations done, A100 validation outstanding.
-- [ ] A100 utilization behavior empirically understood — measurement request
-      written (`docs/design/phase6_measurement_request.md`), not yet run.
+- [ ] **the performance-investigation workflow is scripted and documented** —
+      the one survivor of the five this plan originally enumerated, and the one
+      that consumes the Phase 4 measurement. Shipped: production-config
+      generation, run analysis. Retired (`current_decisions.md` D-003):
+      `update-old-run`, obviated by dropping backward compatibility;
+      `functional-change`, covered by root change discipline and bounded test
+      routing rather than a script; documentation-refresh and standard launch,
+      already deferred in §5 and never live outcomes.
+- [x] representative training modes have current end-to-end profiles —
+      `a100_stab_aug16` ran 2026-08-16→18; the accepted record is
+      `docs/design/phase6_handoff.md` (rollout cost model to ±3%, MACE/UMA energy
+      splits, occupancy per cell). Most cells are n=1 (`OBSERVED`); floors exist
+      for three workloads only.
+- [ ] MLIP bottlenecks addressed, numerical equivalence demonstrated — the
+      fixes handoff §3 licensed shipped 2026-08-19 as in-code defaults, each
+      behind energy AND gradient gates that ran green locally: batched MACE NL
+      + device-built dict (`test_mace_gpu_real_batches.py`), UMA external graph
+      (`test_uma_external_graph.py`) — the latter also a correctness fix
+      (F-047: fairchem's internal graph drops 0.4–0.6% of edges on unwrapped
+      cells, energies move ~0.24 eV). Flag metrics report the EXECUTED path.
+      Outstanding: A100 confirmation (`*_flag_* = 1.0`, `nl_fastpath_frac =
+      1.0`) and the UMA speed question (`uma_ext_graph_s` vs `uma_forward_s`;
+      local is parity).
+- [ ] A100 utilization behavior empirically understood — substantially answered:
+      the proxy is the **out-of-process** sampler, adopted under Phase 4 case (2)
+      (agrees with the one cluster-visible outcome, cancellations); `gpu/util_policy`
+      is refused (sign-flipping error up to +40 points); kill threshold bracketed
+      at ≤40% cancelled / ≥49.4% survives. The `nvidia-smi` sidecar cross-check
+      ran 2026-08-19: 65 CSV↔run pairs, median |Δ| 1.3 points — the wandb stream
+      is confirmed (handoff §2). Open before checking: the scheduler's own
+      statistic/window (admin question).
 - [ ] batch sizing satisfies the utilization constraint at near-best throughput —
-      designed (`docs/design/phase6_batch_sizer.md`), not built.
+      **built** (state 8: `train.select_batch_size`; the throughput walk and its
+      four keys retired; S1/S2/S3 + once-per-stage calibration + an INFEASIBLE
+      verdict that names the binding bound, since rollout and energy batch are two
+      quantities and pinning them costs 15–70× of batch on MLIP, handoff §4.4).
+      Sandbox-verified: `bench/test_batch_traps.py` (17, incl. injected trap
+      detection, minimal-selection, S2 stand-down) and
+      `bench/test_oom_ceiling_expiry.py` (rewritten for the base-restore rule).
+      The box stays open until a cluster run with `batch_util_target` set
+      demonstrates the outcome the sentence claims.
 - [ ] **canonical performance and regression benchmarks exist** — the
       *specification* exists (`docs/design/benchmarks.md` + `benchmarks/`); the
       baseline numbers it is supposed to hold do not.

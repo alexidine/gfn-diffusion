@@ -13,6 +13,80 @@ Newest first.
 
 ---
 
+## F-048 · The two out-of-process occupancy instruments agree to ~1 point across 65 jobs; the wandb stream is validated · `REPLICATED`
+
+*2026-08-19, local analysis. Inputs: `nvidia-smi` sidecar CSVs pulled from cluster
+scratch (`configs/a100_stab_aug16/joblogs/*_smi.csv`, 10 s cadence, cluster-local
+UTC−4) against each matching run's `system.gpu.0.gpu` from the wandb cloud API.
+Runs matched by time-span overlap, not name — arms were requeued under identical
+display names. Raw table and the rerunnable script live beside the data:
+`D:\crystal_datasets\joblogs\a100_stab_aug16\{smi_vs_wandb.json, compare_smi_wandb.py}`.*
+
+**Result.** 65 CSV↔run pairs: median |Δ| on mean GPU utilization **1.3 points**;
+every pair with ≥2 h of overlap agrees within **4.4 points** (most within 2),
+including on the trailing-7200 s window. Deltas above 5 occur only on overlaps
+under ~15 min, where window-edge alignment dominates a mean. Spot values
+reproduce the phase-6 handoff's numbers on both instruments: cancelled
+`u_scale1000` arms 37–39%, `w3_elj_b1000` 49.3–49.7%, `w3_mace_batchednl`
+81.4–81.6%.
+
+**What this settles.** F-038 adopted the wandb system stream as the occupancy
+source and F-045 refused `gpu/util_policy`; both rested on one out-of-process
+instrument. This closes the handoff §2's "NOT CROSS-CHECKED" caveat: a second
+sampler of the NVML counter, independently timestamped and transported, gives the
+same numbers, so the in-process metric is the lone outlier. Still open, unchanged:
+the scheduler's own statistic/window/threshold (admin question, not a battery).
+Note the shared-counter limit stands — both instruments read NVML utilization;
+the `*_dcgm.txt` sidecars (SM_ACTIVE) are the truly independent instrument and
+remain unread.
+
+**Coverage.** Wave-1/2 `elj_r*`/`cond_r*` CSVs found no overlapping run among
+the 250 most recent wandb runs fetched (older pages or pre-init deaths), and ~30
+CSVs were launch-failure stubs too short to compare. No compared arm disagrees.
+
+---
+
+## F-047 · fairchem's internal UMA graph silently drops 0.4–0.6% of edges on our unwrapped unit cells; the external graph fixes it and ships as default · `MECHANISM`
+
+*2026-08-19. Local (RTX 5080), esen_s.pt, mini_new_csd fixture batches; mechanism
+read directly from fairchem-core source in this venv.*
+
+**Mechanism.** `radius_graph_pbc_v2` documents itself as assuming every atom lies
+inside the unit cell — its periodic-image range is computed from cell geometry with
+no term for atom spread. `unit_cell_pos` is NOT wrapped (measured fractional spread
+up to 2.4 cell widths on real CSD crystals, per the pbc_neighbours module). So the
+shipping UMA route has been scoring crystals on a graph missing its longest edges.
+Separately, the internal path truncates at `max_neighbors=300`, which physical cells
+(~141 max) never hit but early-training degenerate cells (~2710) do.
+
+**Measured.** Edge sets: on wrapped positions ours == fairchem's exactly (the
+convention gate); on real unwrapped batches fairchem misses 102/26688 (n=4) and
+318/51592 (n=9) edges. Energy: max |Δ| **0.243 eV** on a 1718 eV scale across an
+8-crystal batch — 46× the 5.3e-3 eV tf32 nondeterminism control. The discriminator
+is wrap-invariance: wrapping atoms by lattice vectors is a symmetry of the crystal,
+the external path moves 6.6e-3 (inside the control), the internal path moves 0.243.
+
+**What shipped.** `USE_UMA_EXTERNAL_GRAPH` default ON: `attach_external_graph`
+builds edges with `batched_pbc_neighbour_list` and hands them in via
+`external_graph_gen=True`; the call site keys off the predictor's own setting; the
+executed fraction is logged as `energy/uma_flag_external_graph` and the build cost
+as `energy/uma_ext_graph_s`. Gates in `tests/test_uma_external_graph.py` (9 tests:
+convention, containment, energy, grads, gas leg, wrap-invariance).
+
+**Speed is NOT claimed.** Locally the two builders are parity (0.6–1.3×, noisy) and
+end-to-end is 0.95–0.99×. The A100's measured 26.8%-of-forward graph share
+(phase6_handoff §3.2) may or may not convert; that is what `uma_ext_graph_s` vs
+`uma_forward_s` on the next cluster arm answers. This entry's claim is correctness,
+with the graph now visible and controllable.
+
+**Consequence for history:** every UMA energy and reward to date carries an
+edge-dropping error of order 0.1–0.3 eV/batch-max on physical cells (larger on
+spread-out cells), and UMA energies change by that much across this default flip —
+runs before/after are not bit-comparable on the MLIP route (they already were not,
+per the tf32 floor, but this shift is systematic, not noise).
+
+---
+
 ## F-046 · T cannot cross a full-state resume: the replay buffer stores T+1-length trajectories · `MECHANISM`
 
 *2026-08-18, `a100_stab_aug16` wave 3 v1. Twelve of twenty-three arms died on one

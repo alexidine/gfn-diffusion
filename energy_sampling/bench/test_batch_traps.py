@@ -29,7 +29,8 @@ import math
 
 import pytest
 
-from bench.batch_arms import Fixed, NoFloor, Null, OccupancyFloor, Ship
+from bench.batch_arms import (DescentWalk, Fixed, Null, OccupancyFloor, Ship,
+                              Sizer)
 from bench.batch_metrics import (SAMPLES_PER_SEC, UPDATES_PER_SEC, cell_can_rank,
                                  convicted_as_occupancy_rule, descent, dominates,
                                  excluded_fraction, exploration_cost, realised,
@@ -137,33 +138,46 @@ def test_trap_a_detector_does_not_convict_the_shipping_controller():
     """
     THE FALSE-POSITIVE DIRECTION, on the cell where the trap actually fired.
 
-    The shipping controller has no occupancy rule -- it was deleted -- so on
-    umaperf0812 it must NOT be convicted by the same verdict that convicts the
-    injection. A detector that reddens for the current code as well as the injected
-    code distinguishes nothing, and the case would be protecting a number rather than
-    a behaviour.
+    Two shipping shapes to clear, because the replacement has two modes:
+
+      * with no batch_util_target, the controller HOLDS -- its batch trace is
+        bit-identical to Null's BY DESIGN (S3), so it cannot be convicted and it
+        pays no exploration cost at all. The old controller paid ~1% here for one
+        probe up the declining curve; that cost is gone and this pins it.
+      * with a target set, the controller CALIBRATES: it walks the ladder, finds
+        that no rung clears 60% (the measured cell tops out at 52%), returns to
+        the argmax-occupancy rung -- the base -- and says INFEASIBLE. It moves,
+        so it pays an exploration cost, but it must end where it started
+        (net_rungs == 0) and must NOT be convicted: exploring and returning is
+        the lawful behaviour the verdict's second clause exists to separate from
+        growing and keeping it.
     """
     dev, ladder = _uma_cell()
     null = _run(dev, Null(batch=ladder[0]), steps=6000)
-    ship = _run(dev, Ship(batch=ladder[0], max_batch=ladder[-1]), steps=6000)
-    assert not convicted_as_occupancy_rule(ship, null), (
-        f'the trap (a) detector convicts the SHIPPING controller '
-        f'(exploration cost {exploration_cost(ship, null):.4f}, '
-        f'net_rungs {descent(ship)["net_rungs"]}): '
-        f'sps {realised(ship):.2f} vs {realised(null):.2f}, '
-        f'occ {time_weighted_occupancy(ship):.1f}% vs '
-        f'{time_weighted_occupancy(null):.1f}%')
 
-    # ...but it IS dominated, by ~1%, and that is the cost of one probe up a declining
-    # curve. Pinned as a number so the separation between "explored and returned" and
-    # "grew and kept it" stays visible rather than becoming folklore.
-    assert dominates(ship, null), \
-        'the shipping controller no longer pays an exploration cost on this cell'
-    assert descent(ship)['net_rungs'] == 0, \
-        'the shipping controller retained a growth on a declining curve'
-    # The magnitude is REPORTED, never bounded -- bounding it would be the selected bar
-    # this whole file exists to avoid. Measured 2026-08-16: 0.0097.
-    assert exploration_cost(ship, null) > 0
+    ship = _run(dev, Ship(batch=ladder[0], max_batch=ladder[-1]), steps=6000)
+    assert [r['batch'] for r in ship] == [r['batch'] for r in null], \
+        'with no util target the replacement must HOLD -- something moved the batch'
+    assert not convicted_as_occupancy_rule(ship, null)
+
+    sizer = _run(dev, Sizer(util_target=0.60, batch=ladder[0],
+                            max_batch=ladder[-1]), steps=6000)
+    assert [r['batch'] for r in sizer] != [r['batch'] for r in null], \
+        'UNRESOLVED: the sizer never calibrated -- this cell shows nothing'
+    assert not convicted_as_occupancy_rule(sizer, null), (
+        f'the trap (a) detector convicts the REPLACEMENT '
+        f'(exploration cost {exploration_cost(sizer, null):.4f}, '
+        f'net_rungs {descent(sizer)["net_rungs"]}): '
+        f'sps {realised(sizer):.2f} vs {realised(null):.2f}, '
+        f'occ {time_weighted_occupancy(sizer):.1f}% vs '
+        f'{time_weighted_occupancy(null):.1f}%')
+    assert descent(sizer)['net_rungs'] == 0, \
+        'the sizer retained a growth on a cell where no rung clears the target'
+    assert descent(sizer)['final'] == ladder[0], \
+        'INFEASIBLE must resolve to the argmax-occupancy rung, the base here'
+    # The magnitude is REPORTED, never bounded -- bounding it would be the selected
+    # bar this whole file exists to avoid.
+    assert exploration_cost(sizer, null) > 0
 
 
 @pytest.mark.parametrize('shape', [RISING, FLAT])
@@ -191,7 +205,7 @@ FLAT_DEVICE = dict(t_fixed=0.0, sps_max=5000.0, util_shape=FLAT)
 
 
 @pytest.mark.parametrize('horizon', [20000, 40000, 60000])
-def test_trap_b_structural_invariance_holds_with_the_floor(horizon):
+def test_trap_b_structural_invariance_holds(horizon):
     """
     B1, THE STRUCTURAL ASSERTION -- and it contains no constant at all.
 
@@ -200,27 +214,36 @@ def test_trap_b_structural_invariance_holds_with_the_floor(horizon):
     answer. `n_distinct` is therefore horizon-invariant for a converged controller and
     grows without bound for a descending one.
 
-    This is the assertion that works at ZERO switching cost, where the objective is
-    blind -- see the next test for why that case is not hypothetical.
+    Under the replacement the answer is n_distinct == 1 with ZERO transitions: there
+    is no walk at all. The old controller measured 2 distinct sizes and 57 transitions
+    here (the 1000 <-> 1650 churn the floor could not stop); both numbers going to
+    their minimum is the improvement, pinned so a regression is visible.
     """
     tr = _run(SyntheticDevice(**FLAT_DEVICE), Ship(batch=1000, max_batch=50000),
               steps=horizon)
-    assert descent(tr)['n_distinct'] == 2, (
-        f'horizon {horizon}: n_distinct={descent(tr)["n_distinct"]} -- a converged '
-        f'controller on a stationary device must not depend on the horizon')
+    d = descent(tr)
+    assert d['n_distinct'] == 1, (
+        f'horizon {horizon}: n_distinct={d["n_distinct"]} -- a hold controller on a '
+        f'stationary device must not visit a second size')
+    assert d['n_transitions'] == 0, (
+        f'horizon {horizon}: {d["n_transitions"]} transitions -- the churn the old '
+        f'controller paid (57 per 60k steps) has come back')
 
 
 @pytest.mark.parametrize('horizon', [20000, 60000])
-def test_trap_b_is_detected_when_the_floor_is_removed(patched, horizon):
+def test_trap_b_is_detected_when_a_floorless_walk_is_reintroduced(patched, horizon):
     """
     The injection must break the invariance the previous test establishes.
 
-    Measured: with the floor intact `n_distinct` is 2 at every horizon; with it removed
-    it is 13 at 20k and 19 at 60k -- a function of the horizon, which is exactly what
+    The shipping controller no longer CONTAINS a walk -- trap (b) is prevented by
+    construction -- so the detection case injects one: the retired knee recheck's
+    downward step, minus the floor that saved it. The design keeps this case
+    because the walk could be reintroduced, and this is the assertion that would
+    catch it: n_distinct becomes a function of the horizon, which is exactly what
     "has not converged" means.
     """
     tr = _run(SyntheticDevice(**FLAT_DEVICE),
-              patched(NoFloor(batch=1000, max_batch=50000)), steps=horizon)
+              patched(DescentWalk(batch=1000, max_batch=50000)), steps=horizon)
     d = descent(tr)
     assert d['n_distinct'] > 2, \
         f'trap (b) NOT detected at horizon {horizon}: n_distinct={d["n_distinct"]}'
@@ -273,34 +296,27 @@ def test_trap_b_objective_DOES_convict_once_switching_is_charged(patched):
                          observed=True) for b in ladder}
     worst_fixed = min(fixed.values())
 
-    floored = realised(_run(SyntheticDevice(**dev_kw),
+    holding = realised(_run(SyntheticDevice(**dev_kw),
                             Ship(batch=1000, max_batch=50000), steps=20000),
                        observed=True)
     descending = realised(_run(SyntheticDevice(**dev_kw),
-                               patched(NoFloor(batch=1000, max_batch=50000)),
+                               patched(DescentWalk(batch=1000, max_batch=50000)),
                                steps=20000), observed=True)
 
     # THE INJECTION IS CONVICTED. This is the assertion the case exists for.
-    assert descending < floored, (
-        f'removing the floor did not cost anything measurable even with switching '
-        f'charged: descending={descending:.1f} floored={floored:.1f}')
+    assert descending < holding, (
+        f'the injected walk did not cost anything measurable even with switching '
+        f'charged: descending={descending:.1f} holding={holding:.1f}')
 
-    # ...AND SO IS THE SHIPPING CONTROLLER, which is a finding rather than a failure.
-    #
-    # Measured: floored=4927.3 against a WORST fixed arm of 4962.8. On a flat curve the
-    # floor stops the DESCENT but not the CHURN -- the walk still climbs 1000 -> 1650,
-    # is refused, drops back, and repeats (57 transitions in 60k steps). Every distinct
-    # size it visits is charged a recompile, and it buys nothing, so it loses to the
-    # WORST constant batch on the ladder.
-    #
-    # Asserted in the direction that is TRUE, so the fact is pinned rather than
-    # discovered again later. If a replacement controller ever makes this pass in the
-    # other direction, that is a real improvement and this assertion should be
-    # inverted deliberately -- not deleted.
-    assert floored < worst_fixed, (
-        f'the shipping controller now BEATS the worst fixed batch on a flat curve '
-        f'({floored:.1f} >= {worst_fixed:.1f}). That is an improvement over the '
-        f'behaviour measured 2026-08-16; invert this assertion deliberately.')
+    # THE DELIBERATE INVERSION. The old controller LOST to the worst constant batch
+    # here (measured 2026-08-16: 4927.3 vs 4962.8) because the floor stopped its
+    # descent but not its churn -- 57 transitions in 60k steps, each distinct size
+    # charged a recompile, buying nothing. The old assertion pinned that loss and
+    # said to invert it deliberately if a replacement ever fixed it; the replacement
+    # holds one size, pays one recompile, and so must no longer lose.
+    assert holding >= worst_fixed, (
+        f'the replacement loses to the worst fixed batch on a flat curve '
+        f'({holding:.1f} < {worst_fixed:.1f}) -- churn is back')
 
 
 # =============================================================================
@@ -312,10 +328,15 @@ def test_every_arm_is_distinguishable_from_null(patched):
     The guard that has now fired twice in this repo. An arm that silently no-ops posts
     a plausible row rather than erroring, and the tell is two traces agreeing to many
     significant figures.
+
+    `Ship` is deliberately NOT in this list any more: with no util target the
+    replacement holds, so its batch trace equals Null's BY DESIGN (asserted as such
+    in the false-positive case above). The arms that must prove they act are the
+    calibrating sizer and the injected occupancy rule.
     """
     dev, ladder = _uma_cell()
     null = [r['batch'] for r in _run(dev, Null(batch=ladder[0]), steps=3000)]
-    for arm in (Ship(batch=ladder[0], max_batch=ladder[-1]),
+    for arm in (Sizer(util_target=0.60, batch=ladder[0], max_batch=ladder[-1]),
                 patched(OccupancyFloor(util_floor=60.0, batch=ladder[0],
                                        max_batch=ladder[-1]))):
         traj = [r['batch'] for r in _run(dev, arm, steps=3000)]
@@ -346,3 +367,171 @@ def test_the_two_objectives_disagree_and_the_disagreement_is_visible():
     assert max(ups, key=ups.get) == min(ladder), 'updates/sec should favour the smallest rung'
     assert max(sps, key=sps.get) != max(ups, key=ups.get), \
         'the two objectives agree here, so this cell cannot show the conflict'
+
+
+# =============================================================================
+# The replacement's positive behaviour: selection, minimality, and the S2 audit
+# =============================================================================
+
+def test_sizer_holds_the_smallest_rung_clearing_the_target():
+    """
+    Where occupancy genuinely rises with batch, the sizer must select the SMALLEST
+    rung whose measured occupancy clears the target, and hold it: growth is bought
+    for the constraint only, so any rung above the first clearing one is update
+    rate spent on nothing.
+
+    Structural assertions, not planted constants: the walk ascends monotonically,
+    the resting rung clears the target while the rung below it does not, the rest
+    is interior (a bound is not a selection), and the answer is horizon-invariant
+    (B1 for the replacement: converged means the horizon changes nothing).
+    """
+    # percent, because that is the unit `true_utilization` reports and the unit
+    # the assertions below read. The CONFIG key is a fraction (state 9), so the
+    # arm takes target/100 -- the same conversion train.select_batch_size makes.
+    target = 55.0
+    finals = {}
+    for horizon in (6000, 12000):
+        run = BatchRun(SyntheticDevice(t_fixed=2.0, sps_max=5000.0,
+                                       util_shape=RISING),
+                       Sizer(util_target=target / 100.0, batch=1000,
+                             max_batch=50000),
+                       steps=horizon)
+        tr = run.run().trace
+        rungs = [b for i, b in enumerate(r['batch'] for r in tr)
+                 if i == 0 or tr[i]['batch'] != tr[i - 1]['batch']]
+        assert rungs == sorted(rungs), f'the walk moved downward: {rungs}'
+        dev = run.device
+        final = tr[-1]['batch']
+        assert dev.true_utilization(final) >= target, (
+            f'held rung {final} reads {dev.true_utilization(final):.1f}%, under the '
+            f'{target:.0f}% target')
+        below = max(b for b in rungs if b < final)
+        assert dev.true_utilization(below) < target, (
+            f'rung {below} below the selection already clears the target -- the '
+            f'selection is not minimal')
+        assert selection_edge(tr) is None, \
+            'the selection rests on a bound, so it is not a selection'
+        assert run.m.batch_sizer['reason'] == 'target_met'
+        finals[horizon] = final
+    assert len(set(finals.values())) == 1, (
+        f'the selection depends on the horizon ({finals}) -- the controller has '
+        f'not converged')
+
+
+def test_growth_cap_bounds_the_overshoot_past_the_crossing():
+    """
+    The capped rung step exists to bound the selection's ABSOLUTE overshoot: the
+    held rung may exceed the true occupancy crossing by at most batch_growth_cap
+    samples. On this device the crossing is exactly computable
+    (U(B) = 20 + 70*(x/(2+x)), x = B/5000, so U >= 55 iff B >= 10000), which is
+    high enough on the ladder that pure-geometric rungs overshoot it by more than
+    the cap -- so the uncapped run is the test's own power check: if IT lands
+    within the cap too, the cell cannot show the cap doing anything.
+    """
+    target, crossing = 55.0, 10000
+    dev_kw = dict(t_fixed=2.0, sps_max=5000.0, util_shape=RISING)
+    dev = SyntheticDevice(**dev_kw)
+    assert dev.true_utilization(crossing) >= target > dev.true_utilization(crossing - 1)
+
+    # factor pinned at 1.65: the power check below (uncapped geometric rungs
+    # overshoot the 10000 crossing by more than one cap) is a property of THIS
+    # cell's rung geometry, and the shipping factor moved to 1.6 (2026-08-19),
+    # where the uncapped ladder happens to land inside one cap of the crossing
+    # target is a percent here (see the sibling test); the config key is a fraction
+    capped = BatchRun(SyntheticDevice(**dev_kw),
+                      Sizer(util_target=target / 100.0, batch=1000, max_batch=50000,
+                            batch_growth_factor=1.65),
+                      steps=6000).run()
+    uncapped = BatchRun(SyntheticDevice(**dev_kw),
+                        Sizer(util_target=target / 100.0, batch=1000, max_batch=50000,
+                              batch_growth_factor=1.65, batch_growth_cap=0),
+                        steps=6000).run()
+    cap = int(capped.m.args.batch_growth_cap)
+    sel_c, sel_u = capped.trace[-1]['batch'], uncapped.trace[-1]['batch']
+
+    assert sel_u - crossing > cap, (
+        f'UNRESOLVED: the uncapped ladder lands at {sel_u}, within one cap of the '
+        f'crossing {crossing} -- this cell has no power to show the cap acting')
+    assert crossing <= sel_c, f'{sel_c} does not clear the crossing {crossing}'
+    assert sel_c - crossing <= cap, (
+        f'capped selection {sel_c} overshoots the crossing {crossing} by more '
+        f'than the cap {cap}')
+    assert capped.m.batch_sizer['reason'] == 'target_met'
+
+
+def test_sizer_says_infeasible_and_the_conclusion_is_readable():
+    """
+    On the measured MLIP cell no rung reaches 60%, and 'no batch works' must be a
+    CONCLUSION the run carries (reason: infeasible), not a batch that happens to sit
+    somewhere. The resting place is the argmax-occupancy rung -- the base, here.
+    """
+    dev, ladder = _uma_cell()
+    # factor 1.65: the umaperf0812 table's rungs were measured on that spacing,
+    # and the assertion below requires the walk to land on them exactly
+    run = BatchRun(dev, Sizer(util_target=0.60, batch=ladder[0],
+                              max_batch=ladder[-1],
+                              batch_growth_factor=1.65), steps=6000)
+    tr = run.run().trace
+    s = run.m.batch_sizer
+    assert s['reason'] == 'infeasible', s
+    assert tr[-1]['batch'] == ladder[0]
+    # every rung it climbed is in the table with a measured occupancy -- the account
+    # a postmortem needs, kept as state rather than as stdout
+    assert [r['batch'] for r in s['table']] == ladder
+    assert all(r['util'] is not None for r in s['table'])
+
+
+class _TransientlyBusyDevice(SyntheticDevice):
+    """
+    A device whose occupancy READS high at grown batches for a while, then stops --
+    the shape that makes a calibration conclusion wrong AFTER it is reached. Real
+    sources of the same shape: a transient co-tenant on a shared node, an init-time
+    burst, a stage whose composition drifts. The S2 audit exists for exactly this.
+    """
+
+    def __init__(self, lie_reads=10, base_batch=1000, **kw):
+        super().__init__(**kw)
+        self.lie_reads = int(lie_reads)
+        self.base_batch = int(base_batch)
+        self.reads = 0
+
+    def utilization(self, work):
+        self.reads += 1
+        if float(work) <= self.base_batch:
+            return 30.0
+        # a grown batch reads busy while the transient lasts, then reads WORSE than
+        # the base -- so a lived policy window cannot help but disagree with the
+        # calibration dwell, even if a lie sample or two lands inside the window
+        return 90.0 if self.reads <= self.lie_reads else 25.0
+
+    def true_utilization(self, work):
+        return 30.0 if float(work) <= self.base_batch else 25.0
+
+
+def test_s2_audit_stands_a_failed_growth_back_down():
+    """
+    S2: a growth kept on the strength of a calibration reading must survive a full
+    policy window of lived occupancy, or stand down to the base rung. Without the
+    audit this run would hold the grown batch forever on the strength of ten
+    transient samples.
+    """
+    dev = _TransientlyBusyDevice(lie_reads=10, base_batch=1000,
+                                 t_fixed=2.0, sps_max=5000.0, util_shape=FLAT)
+    run = BatchRun(dev, Sizer(util_target=0.60, batch=1000, max_batch=50000),
+                   steps=12000)
+    m = run.m
+    grew = False
+    for _ in range(12000):
+        run.step()
+        s = m.batch_sizer or {}
+        if s.get('phase') == 'hold' and s.get('selected', 0) > 1000:
+            grew = True
+        if grew and s.get('reason') == 'stood_down':
+            break
+    assert grew, ('UNRESOLVED: the transient reading never bought a growth, so '
+                  'there is nothing for the audit to catch')
+    s = m.batch_sizer
+    assert s['reason'] == 'stood_down', (
+        f'the audit never fired: still holding {m.batch_size} '
+        f'(reason {s.get("reason")}) on the strength of a transient reading')
+    assert m.batch_size == 1000, 'stand-down must return to the base rung'

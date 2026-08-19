@@ -15,7 +15,7 @@ cluster time.
 Every controller in this codebase is problem-blind. `LRController` reads
 `args`, `optimizers`, `step_ind`, `phase`, `lr_ctrl`, `ray_cal` — and nothing
 else. `RayCalibration` takes a parameter list and two callables.
-`increment_batch_size` is a control law over a timing series. None of them can
+`select_batch_size` is a control law over a timing-and-occupancy series. None of them can
 see the energy function.
 
 They are nevertheless only exercisable today by launching a crystal run, which
@@ -44,7 +44,7 @@ scope line.
 ## Layout
 
 **Two halves, one fake modeller.** The LR half drives `LRController`/`RayCalibration`
-against loss surfaces; the batch half drives `increment_batch_size` against a synthetic
+against loss surfaces; the batch half drives `select_batch_size` against a synthetic
 device. They share `fake_modeller.py` and nothing else — an LR arm and a batch arm need
 different clocks, which is why `runner.py` states outright that the batch sizer is not
 exercised there.
@@ -98,7 +98,7 @@ throughput moved in **opposite** directions.
 ## The discipline that keeps it honest
 
 **The bench fakes the modeller, never the controller.** `LRController`,
-`RayCalibration`, `Modeller.increment_batch_size` and
+`RayCalibration`, `Modeller.select_batch_size` and
 `Modeller.handle_train_epoch_error` are imported and run unmodified — the last
 two are bound onto the fake class as plain functions, so the batch-sizer tests
 execute the shipping code with a fake `self`.

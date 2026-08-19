@@ -468,12 +468,24 @@ molecule set:
 
 | axis | values |
 |---|---|
-| **sampler** | uniform · fitted prior |
+| **sampler** | uniform · `prior-rings-on` · `prior-rings-off` |
 | **post-optimization** | raw · optimized |
-| **score** | energy · diversity |
+| **score** | energy · diversity · rings |
 | **tier** | `torsion` · `dihedral` · `flex` · `full` |
 
 Every cell carries an **error bar**, not a point estimate.
+
+> **CORRECTED — the sampler axis had two values and needed three.** As first written, the
+> prior arm called `sample_prior_states(..., joint_rings=False)`, which draws every ring
+> DoF from an independent marginal; the sampler's closure monitor was meanwhile gated on
+> the ring-system count, which is zero on exactly that path, so it reported `closure_err`
+> **0.000 Å** while the true error was ~3 Å (75 bond-sigma). The table's poor ring results
+> therefore described the disabled path. The arm is now **split** rather than renamed —
+> `prior-rings-on` is the real path, `prior-rings-off` is a named **negative control**
+> whose job is to make the ring columns falsifiable. Both are measured by the same monitor,
+> which is now gated on the molecule. See `energies/ring_metrics.py` for the four ring
+> classes (banked / held-by-design / unsupported / stale prior) and
+> `test_prior_baselines_rings.py` for the gates.
 
 **Almost every ingredient exists; the assembly does not.** The prior ships
 (`sample_prior_states`). Post-optimization ships two ways —
@@ -553,7 +565,7 @@ Before the first training curve is interpreted:
 | 2 | The harness can distinguish a working pipeline from a dead one | open — item zero, defect 3 |
 | 3 | The harness has no check that fires on correct code | open — item zero, defect 1 |
 | 4 | `prior_report` / `coverage_report` run at `'torsion'` | open — item zero |
-| 5 | F1 reference table committed and reproducible | not started |
+| 5 | F1 reference table committed and reproducible | **shipped** — `python -m energies.prior_baselines`; ring arms + negative control added, ring density still UNAVAILABLE by derivation |
 | 6 | F2 untrained log Z with a seed spread | not started |
 | 7 | A1 offset recorded as a reporting attribute | not started |
 | 8 | Jacobian in the energy, pre-multiplied by T, tested at **two** temperatures | wired; two-temperature test unconfirmed |

@@ -158,18 +158,77 @@ class LRController:
 
     # -------------------------------------------------------------- divergence
 
+    #: Observations on a channel before its relative bar arms. Without it the
+    #: first loss of a stage becomes the reference and the second can convict.
+    _REL_MIN_OBS = 50
+    #: Floor under the reference, so a loss that legitimately approaches zero
+    #: cannot drag the bar to zero with it and convict ordinary noise.
+    _REL_FLOOR = 1.0e-3
+
+    def _rel_loss_bar(self, step_type, current_loss):
+        """Update this channel's stage-scoped running minimum and return the
+        relative divergence bar, or None while the rule is unset or unarmed.
+
+        Reads the CURRENT loss into the minimum BEFORE returning a bar, so a
+        genuinely new low can never convict itself."""
+        mult = self._cfg('divergence_loss_rel', None)
+        if mult is None or float(mult) <= 0:
+            return None
+        st = self._state()
+        book = st.setdefault('rel_loss', {})
+        seen = book.get(step_type)
+        value = float(current_loss)
+        if math.isfinite(value):
+            if seen is None:
+                book[step_type] = [value, 1]
+            else:
+                seen[0] = min(seen[0], value)
+                seen[1] += 1
+            seen = book[step_type]
+        if seen is None or seen[1] < self._REL_MIN_OBS:
+            return None
+        return max(seen[0], self._REL_FLOOR) * float(mult)
+
     def check_spike(self, step_type, current_loss, grad_norm):
         """The one always-on tripwire. Returns 'diverged' or None.
 
-        Non-finite readings, or a finite reading past an absolute ~1e9 bar. No
-        cooldown, no latch: at this bar a second reading is a second explosion,
-        and train.py's `max_reloads_per_1k_steps` budget is what stops a rewind loop.
-        Note it is a RATE, not a count -- a long run is not aborted for the same
-        per-step behaviour as a short one."""
+        Non-finite readings, a finite reading past an absolute ~1e9 bar, or --
+        where `divergence_loss_rel` is set -- a reading more than that multiple
+        above the QUIETEST loss this stage has produced. No cooldown, no latch:
+        at these bars a second reading is a second explosion, and train.py's
+        `max_reloads_per_1k_steps` budget is what stops a rewind loop. Note it is
+        a RATE, not a count -- a long run is not aborted for the same per-step
+        behaviour as a short one.
+
+        WHY A RELATIVE BAR EXISTS AT ALL. The absolute 1e9 is a backstop against
+        numerical death, not a statement about training: a route whose loss lives
+        at O(1) can go up a hundredfold -- destroying the run -- and never come
+        near it. On a well-behaved stage that excursion IS the event worth
+        rewinding from, and it is invisible to a bar six orders of magnitude
+        above the operating point.
+
+        THE REFERENCE IS THE STAGE'S OWN MINIMUM, and it is per stage for the
+        same reason peak_scale is: stages differ in loss SCALE by orders of
+        magnitude (an MLE stage and a VarGrad stage are not comparable), so a
+        minimum carried across a transition would either never fire or fire
+        immediately. `rearm_warmup` clears it.
+
+        THREE GUARDS, because a ratio is easy to make trigger-happy:
+          * ARMING. The bar is inert until `_REL_MIN_OBS` observations on the
+            channel, so the first reading cannot become the reference and
+            convict the second.
+          * A FLOOR. The reference is `max(min_seen, _REL_FLOOR)`, so a loss that
+            legitimately touches ~0 cannot make the bar ~0 with it.
+          * PER CHANNEL. fwd, bwd and replay have different scales; a shared
+            minimum would be the smallest of them and would convict the others.
+        """
         checks = []
         if current_loss is not None and step_type in self.CHANNELS:
             checks.append((f'{step_type}_loss', float(current_loss),
                            self._cfg('divergence_loss_abs', 1.0e9)))
+            rel = self._rel_loss_bar(step_type, current_loss)
+            if rel is not None:
+                checks.append((f'{step_type}_loss_rel', float(current_loss), rel))
         if grad_norm is not None:
             checks.append(('grad_norm', float(grad_norm),
                            self._cfg('divergence_grad_abs', 1.0e9)))
@@ -693,6 +752,10 @@ class LRController:
         st['peak_scale'] = 1.0
         st['restart_step'] = int(m.step_ind)
         st['stage_start_step'] = int(m.step_ind)
+        # the relative divergence bar's reference is per stage -- see
+        # check_spike. Loss SCALE differs by orders of magnitude between stages,
+        # so a minimum carried across would either never fire or fire at once.
+        st['rel_loss'] = {}
         st['envelope'] = self._envelope(st)
         self._apply_lrs(st)
         return int(self._cfg('warmup_steps', 1000))

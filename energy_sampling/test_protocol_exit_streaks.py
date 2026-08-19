@@ -66,8 +66,8 @@ def engine(exit_block, second_stage=True):
     m = SimpleNamespace(
         args=args, stage='s0', stage_ctrl=fresh_stage_ctrl(),
         metric_tracker=MetricTracker(period=25.0), step_ind=0,
-        combo_loss_record=[], _rung_throughput=None, batch_size_saturated_stage=None,
-        batch_size_pinned_at=0, batch_size_oom_ceiling=None, batch_size_oom_ceiling_at=None,
+        combo_loss_record=[], batch_sizer=None,
+        batch_size_oom_ceiling=None, batch_size_oom_ceiling_at=None,
         batch_size_oom_min=None, _runaway_last_cut=None, _runaway_unresponsive_stage=None,
         _accum_floor_warned_stage=None, batch_size_last_grow=0,
         fwd_frac=0.0, bwd_frac=1.0, replay_frac=0.0,

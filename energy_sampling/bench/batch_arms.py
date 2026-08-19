@@ -49,7 +49,7 @@ class Null(Arm):
 
     def args_overrides(self):
         return dict(batch_size=self.batch, max_batch_size=self.batch,
-                    grow_batch_size=False)
+                    grow_batch_size=False, batch_util_target=0)
 
 
 class Fixed(Arm):
@@ -61,16 +61,19 @@ class Fixed(Arm):
 
     def args_overrides(self):
         return dict(batch_size=self.batch, max_batch_size=self.batch,
-                    grow_batch_size=True)
+                    grow_batch_size=True, batch_util_target=0)
 
 
 class Ship(Arm):
     """
     The shipping controller at mk_dev settings, with the ladder bounds opened.
 
-    `max_batch_size` must be raised above `batch_size` or the walk cannot move at all:
-    mk_dev ships `1000/1000`, so on the canonical config the domain has ONE rung and
-    the entire growth mechanism is inert. That is worth knowing and is not a cell.
+    Under the state-8 replacement (train.select_batch_size) and WITHOUT a
+    `batch_util_target`, this HOLDS the base batch (S3: no constraint, no walk) --
+    so its batch trace is identical to `Null`'s BY DESIGN, and a
+    distinguishability check must use `Sizer` below, not this arm. `max_batch_size`
+    is still opened so the safety bounds and any injected defect have room to act;
+    mk_dev ships `1000/1000`, where the domain has ONE rung regardless.
     """
 
     name = 'ship'
@@ -81,50 +84,85 @@ class Ship(Arm):
         self.overrides = overrides
 
     def args_overrides(self):
+        # target 0 EXPLICITLY: this arm's definition is the no-target regime
+        # (see the docstring), and the canonical default it would otherwise
+        # inherit became 60 on 2026-08-19. Sizer re-overrides it.
         return dict(batch_size=self.batch, max_batch_size=self.max_batch,
-                    grow_batch_size=True, auto_batch_throughput_opt=True,
-                    **self.overrides)
+                    grow_batch_size=True, batch_util_target=0, **self.overrides)
 
 
-class NoFloor(Ship):
+class Sizer(Ship):
     """
-    TRAP (b) INJECTED: `_batch_floor` returns 1.
-
-    `train.py`'s own docstring calls the floor load-bearing: with throughput flat in
-    batch every jump fails the gate and the periodic recheck walks the batch down a
-    rung at a time, because each recheck re-tests one rung LOWER than the last pin and
-    never re-tests the level above it.
-
-    MEASURED CORRECTION TO THE HEADLINE, and it matters for how the case is written:
-    the descent does NOT run to 1 in general. It runs to the closed-form knee and
-    stops -- `t_fixed=0.001 -> 50`, `0.01 -> 366`, `0.1 -> no descent at all`. Reaching
-    batch 1 requires `t_fixed` EXACTLY zero, a measure-zero and physically impossible
-    point. So "descends forever" is true only at a point no hardware occupies; the real
-    defect is "descends to a level the configuration never chose", which is what
-    actually cost prod0810 (it ran a whole stage at 0.825x its configured batch).
+    The occupancy ladder ARMED: `batch_util_target` set, so the controller
+    calibrates rung by rung over real steps and holds the smallest rung whose
+    measured occupancy clears the target -- or the argmax-occupancy rung, said
+    INFEASIBLE, when none does. This is the arm that must be distinguishable
+    from `Null`: it moves during calibration even when it concludes by
+    returning to the base.
     """
 
-    name = 'ship+nofloor'
+    def __init__(self, util_target=0.6, **kw):
+        super().__init__(**kw)
+        self.util_target = float(util_target)
+        self.name = f'sizer@{self.util_target:g}'
+
+    def args_overrides(self):
+        return dict(super().args_overrides(), batch_util_target=self.util_target)
+
+
+class DescentWalk(Ship):
+    """
+    TRAP (b) INJECTED: a periodic, floorless downward walk -- the retired knee
+    recheck's shape, reintroduced.
+
+    The shipping controller no longer contains ANY walk, so trap (b) is prevented
+    by construction and `_batch_floor` is no longer what stops a descent. That is
+    precisely why this injection exists: the design says the detection cases stay
+    because the walk could be reintroduced, and a detector needs a reintroduction
+    to redden on. The injected rule drops one rung every `period` steps with no
+    floor, which is the old recheck minus the part that saved it.
+
+    The defect's real name, measured on the old controller: not "descends
+    forever" (that needed t_fixed exactly 0) but "descends to a level the
+    configuration never chose" -- prod0810 ran a whole stage at 0.825x its
+    configured batch that way.
+    """
+
+    name = 'ship+descentwalk'
+
+    def __init__(self, period=2000, **kw):
+        super().__init__(**kw)
+        self.period = int(period)
 
     def patch(self, cls):
-        orig = cls._batch_floor
-        cls._batch_floor = lambda self: 1
-        return {'_batch_floor': orig}
+        orig = cls.select_batch_size
+        period = self.period
+
+        def injected(m):
+            orig(m)
+            if m.step_ind - getattr(m, '_dw_last_drop', 0) >= period:
+                m._dw_last_drop = m.step_ind
+                f = float(getattr(m.args, 'batch_growth_factor', 1.65))
+                m.batch_size = max(1, int(round(m.batch_size / f)))
+
+        cls.select_batch_size = injected
+        return {'select_batch_size': orig}
 
 
 class OccupancyFloor(Ship):
     """
-    TRAP (a) INJECTED: an occupancy rule restored above the throughput gate.
+    TRAP (a) INJECTED: an occupancy ACTUATOR restored above the controller.
 
-    Reproduces the deleted `gpu_util_floor` in the position it occupied -- at the TOP
-    of the ladder, with its own early return, so it outranks everything below it
-    including the throughput gate. That textual position IS the trap: the rule was
-    priority 1, so it overrode a gate that would have refused all four of the growths
-    it drove.
+    Reproduces the deleted `gpu_util_floor` in the position it occupied -- at the
+    TOP, with its own early return, so it outranks everything below it. That
+    textual position IS the trap: the rule was priority 1, so nothing could
+    refuse the growths it drove. It is also the S1 violation in its purest form:
+    an occupancy reading SELECTING a batch (grow!) rather than vetoing candidates
+    under a fixed rule.
 
-    `gpu_util_floor` is a retired key whose mere PRESENCE is a load-time hard error, so
-    this arm carries the threshold itself rather than putting it in `args` -- which is
-    also a check that the retirement machinery still bites.
+    `gpu_util_floor` is a retired key whose mere PRESENCE is a load-time hard
+    error, so this arm carries the threshold itself rather than putting it in
+    `args` -- which is also a check that the retirement machinery still bites.
     """
 
     name = 'ship+occfloor'
@@ -134,7 +172,7 @@ class OccupancyFloor(Ship):
         self.util_floor = float(util_floor)
 
     def patch(self, cls):
-        orig = cls.increment_batch_size
+        orig = cls.select_batch_size
         floor, factor_key = self.util_floor, 'batch_growth_factor'
 
         def injected(m):
@@ -147,10 +185,9 @@ class OccupancyFloor(Ship):
                 m.batch_size = min(int(m.args.max_batch_size),
                                    max(m.batch_size + 1, int(round(m.batch_size * f))))
                 m.batch_size_last_grow = m.step_ind
-                m._rung_throughput = None
-                m.batch_size_saturated_stage = None
-                return                      # <-- the early return IS the priority
+                m.batch_sizer = None    # the rule outranks whatever was concluded
+                return                  # <-- the early return IS the priority
             return orig(m)
 
-        cls.increment_batch_size = injected
-        return {'increment_batch_size': orig}
+        cls.select_batch_size = injected
+        return {'select_batch_size': orig}
