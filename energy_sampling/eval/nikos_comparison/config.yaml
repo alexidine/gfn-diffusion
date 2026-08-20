@@ -1,0 +1,33 @@
+# Comparison of Nikos' acridine structures against our brute-force landscapes.
+# See README.md.
+
+# --- Nikos' structures -------------------------------------------------------
+nikos_root: D:\crystal_datasets\acridine\from_nikos\Acridine_Structures
+# Which CIFs to take. Relative glob, matched against nikos_root.
+# The 'Unique' folders under stage3 are his final de-duplicated hits.
+nikos_glob: "Z_prime_*/cif_exports/stage3/*/Unique/*.cif"
+
+# --- our side ----------------------------------------------------------------
+# The brute-force search outputs, thinned to diverse basins by collate_prior.py.
+# Keyed by name; each is a dict with a 'prior_batch'.
+priors:
+  sg14_zp1: D:\crystal_datasets\acridine\may_acridine_sg14_zp1_prior_dataset.pt
+  sg14_zp2: D:\crystal_datasets\acridine\may_acridine_sg14_zp2_prior_dataset.pt
+  sg9_zp2:  D:\crystal_datasets\acridine\may_acridine_sg9_zp2_prior_dataset.pt
+# NOTE sg19_zp3 exists only as raw chunks in prior_chunks/ and is deliberately
+# excluded; his 8 Z'=3 structures therefore have no Z'-matched landscape.
+
+# Known polymorphs, as a third reference layer.
+polymorphs: D:\crystal_datasets\acridine\std_acridine_polymorphs.pt
+# Our reference rigid conformer -- the molecule the priors were searched with.
+conformer: D:\crystal_datasets\acridine\opt_acridine_conformer.pt
+
+# --- energy ------------------------------------------------------------------
+# MACE is the function the acridine landscapes were built with, and is the only
+# Z'-comparable one available (per-molecule kJ/mol; elj/lj are per-cell).
+energy_function: mace
+mace_model: D:\crystal_datasets\acr_112025_mh1_stagetwo.model
+device: cuda
+
+# --- outputs -----------------------------------------------------------------
+out_dir: D:\crystal_datasets\acridine\nikos_comparison

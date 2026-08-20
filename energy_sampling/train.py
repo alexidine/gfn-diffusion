@@ -6,15 +6,37 @@ from collections import defaultdict, deque
 from copy import deepcopy
 from typing import Optional
 
+# ---------------------------------------------------------------------------
+# CUDA ALLOCATOR CONFIG. Two things about these lines are load-bearing.
+#
+# ORDER: this must precede every import that pulls in torch, and the eval
+# imports below do (eval/evaluations.py imports torch). It used to sit AFTER
+# them, leaving the setting's effect dependent on when torch happens to
+# initialise its allocator -- a silent, version-dependent coin flip on the one
+# knob that governs fragmentation.
+#
+# setdefault, NOT assignment: it was `os.environ[...] = ...`, which CLOBBERS
+# whatever the operator exported before launch, so a sbatch setting a different
+# allocator policy was silently overridden by the process it was configuring.
+# As a default, the environment wins and the code supplies a floor.
+#
+# WHY THE FLOOR IS expandable_segments: reserved memory otherwise runs far ahead
+# of live -- measured on a MACE arm, 890 MiB live against 57.7 GB reserved, 98.5%
+# of it cached-but-held -- and cuda_memory_fraction is a HARD cap that counts
+# those unusable blocks, so an allocation can fail with the card nearly empty.
+# `garbage_collection_threshold` and `max_split_size_mb` target the same problem
+# and are deliberately NOT defaulted: they change allocation for every route and
+# have not been measured. Set them per run through the environment, which works
+# now that this is a setdefault.
+# ---------------------------------------------------------------------------
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+# os.environ["TORCH_USE_CUDA_DSA"] = "1"
+
 from energy_sampling.eval.evaluations import to_loggable, sliced_wasserstein, adjust_fig_filesize, eval_figs, \
     log_ess_frac, condition_tracker_figs, fig_guard
 from energy_sampling.eval.traj_reporting import traj_overlap_report, to_scalars
 
-# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-# os.environ["TORCH_USE_CUDA_DSA"] = "1"
-# os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF",
-#     "max_split_size_mb:128,garbage_collection_threshold:0.8,expandable_segments:True")
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 from time import time
 
@@ -324,6 +346,102 @@ class Modeller:
     @property
     def phase(self):
         return self.protocol.stage.index + 1
+
+    #: THE BUFFER CLASS EVERY CHURNED STORE IS BUILT FROM. A class attribute rather than
+    #: a hardcoded name so a non-crystal Modeller can supply its own without this file
+    #: growing an energy-function branch at six construction sites. Crystal behaviour is
+    #: unchanged: same class, same kwargs.
+    buffer_cls = CrystalBuffer
+
+    #: the anchor store. A SEPARATE hook because AnchorBuffer is not buffer_cls: it carries
+    #: its own reward/energy/surprise state and is constructed with a different signature,
+    #: so it cannot be swapped by the same name. Same rationale otherwise.
+    anchor_buffer_cls = AnchorBuffer
+
+    def _buffer_kwargs(self):
+        """Construction kwargs specific to the buffer's DATA MODEL, not to its policy.
+
+        Split out for the same reason as buffer_cls: ``max_z_prime`` is meaningless on a
+        conformer graph and does not merely go unused there -- MXtalBase defers unknown
+        attributes to the PyG store, which raises. Sizes, devices and exclude-key sets stay
+        at the call sites because they are the caller's business.
+        """
+        return dict(max_z_prime=max(self.args.z_primes))
+
+    def _eval_extra_stats(self, mol_batch):
+        """Per-sample columns the eval accumulator should carry beyond the TB family.
+
+        Crystal adds the packing coefficient. A conformer has no cell and therefore no
+        packing coefficient at all -- this is a genuinely absent quantity, not one that
+        defaults to zero, so the conformer override returns nothing rather than inventing
+        a column of NaNs that would then be averaged into a metric.
+        """
+        return {'packing_coeff': mol_batch.packing_coeff}
+
+    def log_physical_properties(self, metrics, sample_batch, val, arr):
+        """The domain's own physical-plausibility metrics.
+
+        Split out for the same reason as _eval_extra_stats: packing coefficient and
+        reduction energy are properties of a periodic cell. Overriding this is how a
+        non-crystal route publishes its OWN physical metrics rather than suppressing the
+        block -- an empty override would be a silent loss of the eval's physical reading.
+        """
+        metrics['Mean Packing Coeff'] = val(sample_batch.packing_coeff.mean())
+        metrics['Packing Coeff'] = arr(sample_batch.packing_coeff.clip(max=2))
+        metrics['Reduction Energy'] = arr((1e-3 + sample_batch.reduction_en).log10())
+        metrics['Reduced Valid Fraction'] = np.mean(arr(sample_batch.reduction_en) < 1e-1)
+
+    def _has_prior_sampler(self):
+        """Is there anything to draw prior samples FROM?
+
+        On the crystal route the prior is a frozen GFN (``prior_model``), produced by
+        train_prior's snapshot_prior action or loaded by name. A route whose prior is not a
+        GFN at all -- a fitted analytic prior, say -- answers this differently, and
+        without the hook its phase-2 churn silently degrades to an anchor-only buffer:
+        _prior_churn_cycle's guard is a report, not a raise, because an anchor-only
+        composition is legal.
+        """
+        return hasattr(self, 'prior_model')
+
+    def _noise_and_condition(self, batch, noise_log_range):
+        """Jitter a stored batch's state, then condition it. IN PLACE on `batch`.
+
+        The two anchor paths (refresh_anchor_buffer_surprise, top_up_prior_from_anchors)
+        ran the identical three-line crystal preamble -- log_noise_latent_parameters,
+        condition_samples with sg_ind/z_prime, orient_molecule -- so it is one seam, hooked
+        once. Noising happens BEFORE conditioning so the noised state is what gets
+        conditioned and scored.
+        """
+        batch.log_noise_latent_parameters(*noise_log_range)
+        batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
+            batch, sg_inds=batch.sg_ind, z_primes=batch.z_prime)
+        batch.orient_molecule(mode='std')
+        return batch, log_T_tensor, condition, condition_id
+
+    _domain_figs = None      #: None = eval_figs uses its own crystal block, unchanged
+
+    def _batch_latents(self, batch):
+        """The GFN state carried by a STORED graph batch.
+
+        The crystal state is the cell/pose latent, read off the graph by
+        ``latent_params()``; the conformer state is the stored ``torsion_state``. Same
+        rationale as buffer_cls -- ``MXtalBase.__getattr__`` defers to the PyG store, so
+        ``latent_params`` does not go unused on a conformer graph, it raises. Crystal
+        behaviour is unchanged: the same call, at the same sites.
+        """
+        return batch.latent_params()
+
+    def _buffer_y_fn(self):
+        """The batch KEY a churned buffer reads its scalar `y` from.
+
+        ``energy_function`` doubles as that key on the crystal route -- the analysis
+        attaches the term under its own name, so 'elj' is both the backend and the
+        attribute. That coincidence does not survive a different energy: the conformer
+        bakes its scalar as ``conformer_energy`` while its energy_function is
+        ``conformer_torsions``, and passing the latter raises KeyError at buffer
+        construction. Naming the key separately is what lets the two differ.
+        """
+        return self.args.energy_function
 
     @property
     def buffer_device(self):
@@ -2183,9 +2301,9 @@ class Modeller:
 
         self.prior_dataset = CrystalBuffer(prior,
                                            device=self.buffer_device,
-                                           max_z_prime=max(self.args.z_primes),
+                                           **self._buffer_kwargs(),
                                            x_fn=None,  # 'latent_params',
-                                           y_fn=self.args.energy_function,
+                                           y_fn=self._buffer_y_fn(),
                                            exclude_keys=BULKY_ATTR_EXCLUDE_KEYS,
                                            )
 
@@ -2245,13 +2363,13 @@ class Modeller:
     def init_mol_dataset(self):
         self.mol_dataset = CrystalBuffer(self._load_condition_file(self.args.molecules_path),
                                          device=self.buffer_device,
-                                         max_z_prime=max(self.args.z_primes),
+                                         **self._buffer_kwargs(),
                                          exclude_keys=BULKY_ATTR_EXCLUDE_KEYS)
 
         if self.args.test_molecules_path is not None:
             self.test_mol_dataset = CrystalBuffer(self._load_condition_file(self.args.test_molecules_path),
                                                   device=self.buffer_device,
-                                                  max_z_prime=max(self.args.z_primes),
+                                                  **self._buffer_kwargs(),
                                                   exclude_keys=BULKY_ATTR_EXCLUDE_KEYS)
         else:
             self.test_mol_dataset = None
@@ -2337,7 +2455,7 @@ class Modeller:
             # mol_id on prior_dataset.batch; no sampling/energy involved). Runs
             # first so grow_prior_buffer's top-up sees the seeded fill level.
             self.init_prior_buffer_seed()
-            if hasattr(self, 'prior_model'):
+            if self._has_prior_sampler():
                 self.grow_prior_buffer()
             self.init_condition_log_z()
             self.init_anchor_buffer_seed()
@@ -4225,7 +4343,7 @@ Two things deliberately NOT done here, both recorded in
                     weighted=False,
                     temperature=0.1, beta=1.0))
 
-            latents = mol_batch.latent_params()
+            latents = self._batch_latents(mol_batch)
             latents = latents.to(self.device)
 
         elif self.bwd_sampling_mode == 'prior':
@@ -4255,7 +4373,7 @@ Two things deliberately NOT done here, both recorded in
                     temperature=0.5, beta=bwd_beta,
                     condition_block_m=block_m))
 
-            latents = mol_batch.latent_params()
+            latents = self._batch_latents(mol_batch)
             latents = latents.to(self.device)
         else:
             assert False, f"sampling method {self.args.sampling} not implemented"
@@ -4406,7 +4524,7 @@ Two things deliberately NOT done here, both recorded in
                 'replay/is_elig_frac': float((np.asarray(p) > 0).mean()),
             }
 
-        latents = mol_batch.latent_params()
+        latents = self._batch_latents(mol_batch)
         latents = latents.to(self.device)
         traj = traj.to(self.device)
 
@@ -4512,7 +4630,7 @@ Two things deliberately NOT done here, both recorded in
                     assert False
 
                 mol_batch = mol_batch.to(self.ema_model.device)
-                terminal_state = mol_batch.latent_params()
+                terminal_state = self._batch_latents(mol_batch)
 
                 mol_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
                     mol_batch,
@@ -4544,7 +4662,8 @@ Two things deliberately NOT done here, both recorded in
                 acc[k].append(cpu(v))
             acc['log_r'].append(cpu(log_r))
             acc['log_Z_learned'].append(cpu(log_z))
-            acc['packing_coeff'].append(cpu(mol_batch.packing_coeff))
+            for _k, _v in self._eval_extra_stats(mol_batch).items():
+                acc[_k].append(cpu(_v))
             acc['condition_id'].append(cpu(condition_id))
 
         pooled = {k: torch.cat(v, dim=0) for k, v in acc.items()}
@@ -4835,7 +4954,7 @@ Two things deliberately NOT done here, both recorded in
         return metrics
 
     def log_dist_stats(self, log_pf, metrics, sample_batch):
-        std_params = sample_batch.latent_params()
+        std_params = self._batch_latents(sample_batch)
         metrics['Total Var'] = std_params.var(dim=0).mean().cpu().detach().numpy()
         metrics['Total Mean'] = std_params.mean(dim=0).mean().cpu().detach().numpy()
         U, S, Vh = torch.linalg.svd(std_params - std_params.mean(0), full_matrices=False)
@@ -4917,10 +5036,7 @@ Two things deliberately NOT done here, both recorded in
                 metrics['Max ' + key] = val(sample_batch[key].max())
 
         # physical properties
-        metrics['Mean Packing Coeff'] = val(sample_batch.packing_coeff.mean())
-        metrics['Packing Coeff'] = arr(sample_batch.packing_coeff.clip(max=2))
-        metrics['Reduction Energy'] = arr((1e-3 + sample_batch.reduction_en).log10())
-        metrics['Reduced Valid Fraction'] = np.mean(arr(sample_batch.reduction_en) < 1e-1)
+        self.log_physical_properties(metrics, sample_batch, val, arr)
         # conditions
         metrics['Crystal Mean Log Temperature'] = val(log_T_tensor.mean())
         metrics['Crystal Log Temperature'] = arr(log_T_tensor)
@@ -5391,7 +5507,8 @@ Two things deliberately NOT done here, both recorded in
                                               self.args.energy_function,
                                               metrics,
                                               temperature_conditioning=self.args.temperature_conditioning,
-                                              anchor_latents=anchor_latents)
+                                              anchor_latents=anchor_latents,
+                                              domain_figs=self._domain_figs)
             if hasattr(self, 'condition_log_z'):
                 # cross-sections of the per-condition tracker state -- built
                 # purely from its running stats, no sampling / energy calls
@@ -5782,12 +5899,12 @@ Two things deliberately NOT done here, both recorded in
 
     def manage_prior_buffer(self, sample_batch):
         if not hasattr(self, 'prior_buffer'):
-            self.prior_buffer = CrystalBuffer(
+            self.prior_buffer = self.buffer_cls(
                 sample_batch,
                 device=self.buffer_device,
-                max_z_prime=max(self.args.z_primes),
+                **self._buffer_kwargs(),
                 x_fn=None,  # 'latent_params',
-                y_fn=self.args.energy_function,
+                y_fn=self._buffer_y_fn(),
                 exclude_keys=CHURNED_BUFFER_EXCLUDE_KEYS,
             )
 
@@ -5981,7 +6098,7 @@ Two things deliberately NOT done here, both recorded in
         """
         if budget <= 0:
             return
-        if not hasattr(self, 'prior_model'):
+        if not self._has_prior_sampler():
             # Silent here changes the buffer's SOURCE MIX to 100% anchor with no
             # error and no log line -- the only tell is prior_buffer_prior_admit_rate
             # going nan (0/0) instead of 0.0, because budget below is never
@@ -6265,13 +6382,10 @@ Two things deliberately NOT done here, both recorded in
             if anchor_batch is None:
                 return
         anchor_batch = anchor_batch.clone().to(self.device)
-        anchor_batch.log_noise_latent_parameters(*cfg.noise_log_range)
+        anchor_batch, log_T_tensor, condition, condition_id = self._noise_and_condition(
+            anchor_batch, cfg.noise_log_range)
 
-        anchor_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
-            anchor_batch, sg_inds=anchor_batch.sg_ind, z_primes=anchor_batch.z_prime)
-        anchor_batch.orient_molecule(mode='std')
-
-        terminal_latents = anchor_batch.latent_params()
+        terminal_latents = self._batch_latents(anchor_batch)
         # Bulk anchor scan, not the per-step hot path, and it runs inside a stage
         # transition's on_enter hook -- OUTSIDE the try/except around train_step that
         # slashes the batch on OOM. So an OOM here is fatal with nothing to catch it.
@@ -6388,13 +6502,10 @@ Two things deliberately NOT done here, both recorded in
 
         # noised BEFORE conditioning, so the noised state is what gets
         # conditioned, oriented and scored
-        seed_batch.log_noise_latent_parameters(*cfg.noise_log_range)
+        seed_batch, log_T_tensor, condition, condition_id = self._noise_and_condition(
+            seed_batch, cfg.noise_log_range)
 
-        seed_batch, log_T_tensor, condition, condition_id = self.energy_function.condition_samples(
-            seed_batch, sg_inds=seed_batch.sg_ind, z_primes=seed_batch.z_prime)
-        seed_batch.orient_molecule(mode='std')
-
-        terminal_latents = seed_batch.latent_params()
+        terminal_latents = self._batch_latents(seed_batch)
         reward, seed_batch = self.energy_function.log_reward(
             terminal_latents, seed_batch, log_T_tensor, return_exp=True)
 
@@ -6651,12 +6762,12 @@ Two things deliberately NOT done here, both recorded in
             if elig.numel() == 0:
                 return
             add_inds = elig[_uniform_draw(elig.numel(), rb_cfg.max_size)]
-            self.replay_buffer = CrystalBuffer(
+            self.replay_buffer = self.buffer_cls(
                 sample_batch.subsample_new_batch(add_inds),
                 device=self.buffer_device,
-                max_z_prime=max(self.args.z_primes),
+                **self._buffer_kwargs(),
                 x_fn=None,
-                y_fn=self.args.energy_function,
+                y_fn=self._buffer_y_fn(),
                 traj=flow_states[add_inds.to(flow_states.device)],
                 init_loss=resid[add_inds].abs(),
                 exclude_keys=CHURNED_BUFFER_EXCLUDE_KEYS,
@@ -6844,12 +6955,12 @@ Two things deliberately NOT done here, both recorded in
         """Construct a new CrystalBuffer around seed_batch with clean
         per-sample records -- the single construction recipe shared by init
         seeding and seed_prior_from_condition_minima's flush path."""
-        return CrystalBuffer(
+        return self.buffer_cls(
             seed_batch,
             device=self.buffer_device,
-            max_z_prime=max(self.args.z_primes),
+            **self._buffer_kwargs(),
             x_fn=None,
-            y_fn=self.args.energy_function,
+            y_fn=self._buffer_y_fn(),
             exclude_keys=CHURNED_BUFFER_EXCLUDE_KEYS,
         )
 
@@ -6931,7 +7042,7 @@ Two things deliberately NOT done here, both recorded in
             # side-loaded batch. See buffer.strip_lazy_sg_caches for why.
             strip_lazy_sg_caches(seed_batch)
             _, seed_batch = self.energy_function.batched_analyze_crystal_batch(
-                seed_batch.latent_params(), seed_batch,
+                self._batch_latents(seed_batch), seed_batch,
                 self.args.energy_config.temperature * torch.ones(
                     seed_batch.num_graphs, dtype=torch.float32, device=self.device),
                 return_batch=True, internal_oom_recovery=True)
@@ -6991,12 +7102,12 @@ Two things deliberately NOT done here, both recorded in
         # per graph, so candidates always carry it and parity needs it kept.
         seed_batch = AnchorBuffer._drop_keys(seed_batch, ("smiles", "identifier"))
 
-        self.anchor_buffer = AnchorBuffer(
+        self.anchor_buffer = self.anchor_buffer_cls(
             seed_batch,  # function-owned transient; the buffer moves it to buffer_device itself
             device=self.buffer_device,
             reward=reward.cpu(),
             energy=energy.cpu(),
-            max_z_prime=max(self.args.z_primes),
+            **self._buffer_kwargs(),
             exclude_keys=BULKY_ATTR_EXCLUDE_KEYS,
         )
 
@@ -7114,7 +7225,7 @@ Two things deliberately NOT done here, both recorded in
             return
 
         eval_discretizer = lambda bsz: uniform_discretizer(bsz, self.args.eval_T)
-        latents = sample_batch.latent_params()
+        latents = self._batch_latents(sample_batch)
 
         K = cfg.confirm_k
         n_cand = screen_idx.numel()
@@ -7147,11 +7258,11 @@ Two things deliberately NOT done here, both recorded in
         admit_energy = energy[confirmed_idx].cpu()
 
         if not hasattr(self, 'anchor_buffer'):
-            self.anchor_buffer = AnchorBuffer(
+            self.anchor_buffer = self.anchor_buffer_cls(
                 admit_batch, device=self.buffer_device,
                 reward=admit_reward, energy=admit_energy,
                 original_surprise=original_surprise,
-                max_z_prime=max(self.args.z_primes),
+                **self._buffer_kwargs(),
                 exclude_keys=BULKY_ATTR_EXCLUDE_KEYS,
             )
             self.last_anchor_admitted += len(self.anchor_buffer)
@@ -7196,12 +7307,12 @@ Two things deliberately NOT done here, both recorded in
             metrics, sample_batch = self.sample_from_prior(num_samples)
 
             if not hasattr(self, 'prior_buffer'):
-                self.prior_buffer = CrystalBuffer(
+                self.prior_buffer = self.buffer_cls(
                     sample_batch,
                     device=self.buffer_device,
-                    max_z_prime=max(self.args.z_primes),
+                    **self._buffer_kwargs(),
                     x_fn=None,  # 'latent_params',
-                    y_fn=self.args.energy_function,
+                    y_fn=self._buffer_y_fn(),
                     exclude_keys=CHURNED_BUFFER_EXCLUDE_KEYS,
                 )
             else:

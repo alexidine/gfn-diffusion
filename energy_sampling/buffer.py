@@ -229,18 +229,25 @@ class CrystalBuffer:
         if batch.num_graphs > 0:
             batch.orient_molecule(mode="std")
 
+    def _batch_x(self, batch):
+        """The GFN state of a batch, honouring x_fn. THE one place it is read.
+
+        Split out because AnchorBuffer.admit needs exactly this and had its own copy, so a
+        subclass that overrode _compute_xy (a conformer store, whose state is not a cell
+        latent) fixed the resident batch but not the admission path -- and the two only
+        disagree once something is actually admitted.
+        """
+        if self.x_fn is None:
+            return batch.latent_params()
+        if callable(self.x_fn):
+            return self.x_fn(batch)
+        return batch[self.x_fn]
+
     def _compute_xy(self, batch):
         """
         Compute cached x/y tensors directly from a resident batch.
         """
-        if self.x_fn is None:
-            x = batch.latent_params()
-        elif callable(self.x_fn):
-            x = self.x_fn(batch)
-        else:
-            x = batch[self.x_fn]
-
-        x = x.detach().to(self.device).contiguous()
+        x = self._batch_x(batch).detach().to(self.device).contiguous()
 
         if self.y_fn is None:
             y = None
@@ -1090,8 +1097,9 @@ class CrystalBuffer:
         return p, w
 
 
-class ConformerBuffer(CrystalBuffer):
-    """CrystalBuffer over conformer graphs (``MolData`` + internal-coordinate tree).
+class ConformerGraphHooks:
+    """The three hooks that make a CrystalBuffer-family store work on conformer graphs
+    (``MolData`` + internal-coordinate tree).
 
     Everything the buffer actually does -- row-wise draws, EMA loss/logw bookkeeping,
     admission, purge, TTL, persistence -- is graph-agnostic. Only three hooks reach into
@@ -1105,8 +1113,10 @@ class ConformerBuffer(CrystalBuffer):
                            paid once. Pointless here: the state is internal coordinates,
                            and geometry is rebuilt in the tree's own canonical frame, so
                            the stored orientation is never read.
-      ``_compute_xy``      derives the GFN state via ``latent_params()`` (cell params).
-                           The conformer state is the stored ``torsion_state``.
+      ``_batch_x``         derives the GFN state via ``latent_params()`` (cell params).
+                           The conformer state is the stored ``torsion_state``. Overridden
+                           here rather than at ``_compute_xy`` so ``AnchorBuffer.admit``,
+                           which reads the same thing, is covered by the same override.
 
     Subclassing rather than generalising CrystalBuffer keeps every crystal run bit-identical
     -- the same call made for ``ConformerModeller(Modeller)``. Rolling the split back into
@@ -1129,6 +1139,20 @@ class ConformerBuffer(CrystalBuffer):
         """No-op: the stored orientation of a conformer graph is never read."""
         return batch
 
+    def _batch_x(self, batch):
+        """x = the stored ``torsion_state``, not a cell latent.
+
+        Overriding HERE rather than in _compute_xy is what makes AnchorBuffer.admit work
+        too: both read the state through this one method.
+        """
+        from energies.conformer_data import batch_states, state_dim
+
+        if callable(self.x_fn):
+            return self.x_fn(batch)
+        if 'torsion_state' in batch._store:
+            return batch_states(batch)
+        return torch.zeros((batch.num_graphs, state_dim(batch)))
+
     def _compute_xy(self, batch):
         """x = the torsion state; y as configured.
 
@@ -1141,23 +1165,12 @@ class ConformerBuffer(CrystalBuffer):
         """
         from energies.conformer_data import batch_states, state_dim
 
-        if callable(self.x_fn):
-            x = self.x_fn(batch)
-        elif 'torsion_state' in batch._store:
-            x = batch_states(batch)
-        else:
-            x = torch.zeros((batch.num_graphs, state_dim(batch)))
+        return super()._compute_xy(batch)
 
-        x = x.detach().to(self.device).contiguous()
 
-        if self.y_fn is None:
-            y = None
-        elif callable(self.y_fn):
-            y = self.y_fn(batch).detach().to(self.device).contiguous()
-        else:
-            y = batch[self.y_fn].detach().to(self.device).contiguous()
 
-        return x, y
+class ConformerBuffer(ConformerGraphHooks, CrystalBuffer):
+    """The churned stores -- prior, replay, mol/prior datasets -- over conformer graphs."""
 
 
 def _upper_tail(quantile: float) -> float:
@@ -2725,13 +2738,7 @@ class AnchorBuffer(CrystalBuffer):
         if original_surprise is not None:
             original_surprise = original_surprise[keep]
 
-        if self.x_fn is None:
-            cand_x = candidate_batch.latent_params()
-        elif callable(self.x_fn):
-            cand_x = self.x_fn(candidate_batch)
-        else:
-            cand_x = candidate_batch[self.x_fn]
-        cand_x = cand_x.detach().to(self.device).contiguous()
+        cand_x = self._batch_x(candidate_batch).detach().to(self.device).contiguous()
 
         order = torch.argsort(energy)  # ascending -- lowest energy (best) first
 
@@ -2883,3 +2890,14 @@ class AnchorBuffer(CrystalBuffer):
 import plotly.graph_objects as go
 go.Figure(go.Histogram(x=np.log(p), nbinsx=100)).show()
 '''
+
+
+class ConformerAnchorBuffer(ConformerGraphHooks, AnchorBuffer):
+    """``AnchorBuffer`` over conformer graphs.
+
+    AnchorBuffer subclasses CrystalBuffer, so without this it inherits the crystal
+    ``_as_batch`` and dies on ``max_z_prime`` -- the same three hooks, the same reason.
+    Everything anchor-specific (surprise ranking, per-condition Emin gating, thin()) is
+    graph-agnostic and inherited untouched. The mixin comes FIRST in the MRO so its hooks
+    win over CrystalBuffer's.
+    """

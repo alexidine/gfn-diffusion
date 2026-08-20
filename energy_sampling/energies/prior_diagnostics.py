@@ -281,6 +281,94 @@ def rotamer_modes(en, min_rel: float = 0.05):
     return out
 
 
+def basin_reference(en, max_modes: int = 512, accessible_kt: float = 10.0) -> dict:
+    """Enumerate the target's rotamer basins and score them. SAMPLER-INDEPENDENT.
+
+    Split out of coverage_report so the SAME basin definition can be applied to draws that
+    did not come from an InternalPrior -- a trained policy's samples, most importantly.
+    Coverage is only meaningful measured in this direction (enumerate the target's basins
+    first, then ask what a sampler assigns them), so a second, differently-defined basin
+    set would silently make two coverage numbers incomparable.
+
+    Depends only on the molecule and the force field, so a caller evaluating repeatedly
+    should compute it ONCE and keep it.
+    """
+    import itertools
+
+    T = float(en.temperature)
+    n0 = en.n_r + en.n_th
+    ph0 = en.ph0.detach().cpu().numpy()
+    ref = np.concatenate([en.r0.detach().cpu().numpy(),
+                          en.th0.detach().cpu().numpy(), ph0])
+    groups = rotamer_modes(en)
+    n_comb = int(np.prod([len(c) for _, c in groups])) if groups else 1
+    if n_comb > max_modes:
+        return {'skipped': f'{n_comb} modes exceeds max_modes={max_modes}'}
+
+    combos = list(itertools.product(*[range(len(c)) for _, c in groups]))
+    d = np.repeat(ref[None], len(combos), 0)
+    for m, combo in enumerate(combos):
+        for gi, (rows_j, centres) in enumerate(groups):
+            lead = rows_j[0]
+            val = centres[combo[gi]]
+            d[m, n0 + lead] = val
+            disp = (val - ph0[lead] + np.pi) % (2 * np.pi) - np.pi
+            for i in rows_j[1:]:
+                d[m, n0 + i] = ph0[i] + disp
+    e_mode = en.potential_energy(dof_to_state(en, d), T).detach().cpu().numpy()
+    e_best = float(e_mode.min())
+    return {
+        'groups': groups, 'combos': combos, 'n0': n0,
+        'mode_energies_raw': e_mode, 'e_best': e_best,
+        'mode_energies': (e_mode - e_best) / T,
+        'accessible': (e_mode - e_best) / T <= accessible_kt,
+    }
+
+
+def rotamer_basin_labels(groups, dof, n0: int) -> np.ndarray:
+    """Per-draw ROTAMER basin index, ``[n]``, by nearest centre in each group's leader.
+
+    NOT ``basin_labels`` -- that name is taken, by ``ring_metrics.basin_labels``, for RING
+    PUCKER identity. The two are different partitions of different coordinates, and giving
+    them one name is how a coverage number and a pucker number end up silently compared.
+
+    Takes ``dof`` directly rather than a sampler, so prior draws and policy samples are
+    labelled by identical code -- see basin_reference for why that matters.
+    """
+    L = rotamer_group_labels(groups, dof, n0)
+    lab = np.zeros(len(dof), dtype=np.int64)
+    stride = 1
+    # group g-1 is the LEAST significant digit, which is what makes this agree with
+    # basin_reference's itertools.product ordering (product varies the last factor
+    # fastest). basin_coverage indexes `combos` by this label, so the two must not drift.
+    for gi in range(len(groups) - 1, -1, -1):
+        lab += stride * L[:, gi]
+        stride *= len(groups[gi][1])
+    return lab
+
+
+def rotamer_group_labels(groups, dof, n0: int) -> np.ndarray:
+    """PER-GROUP rotamer labels, ``[n, n_groups]`` -- the un-collapsed labelling.
+
+    ``rotamer_basin_labels`` reduces this to one mixed-radix integer, which is what
+    coverage needs and which DISCARDS the per-group structure. Anything asking whether the
+    groups move INDEPENDENTLY (basin_coupling) needs the array before that collapse, so it
+    is factored here rather than recomputed -- one definition of "which rotamer is this
+    group in", used by both.
+    """
+    out = np.zeros((len(dof), len(groups)), dtype=np.int64)
+    for gi, (rows_j, centres) in enumerate(groups):
+        v = dof[:, n0 + rows_j[0]]
+        dist = np.abs((v[:, None] - centres[None, :] + np.pi) % (2 * np.pi) - np.pi)
+        out[:, gi] = np.argmin(dist, axis=1)
+    return out
+
+
+def basin_counts(groups, dof, n0: int, n_combos: int) -> np.ndarray:
+    """Occupancy per rotamer basin, ``[n_combos]``. One definition, via the labeller."""
+    return np.bincount(rotamer_basin_labels(groups, dof, n0), minlength=n_combos)
+
+
 def coverage_report(en, prior, n: int = 6000, seed: int = 0, max_modes: int = 512,
                     accessible_kt: float = 10.0) -> dict:
     """Does the prior REACH every energetically accessible rotamer basin?
@@ -300,49 +388,20 @@ def coverage_report(en, prior, n: int = 6000, seed: int = 0, max_modes: int = 51
     counted three times here. That inflates the mode count but does not bias the failure
     the metric is for -- a symmetric triple is either all reached or all missed.
     """
-    import itertools
+    ref = basin_reference(en, max_modes=max_modes, accessible_kt=accessible_kt)
+    if 'skipped' in ref:
+        return ref
+    groups, combos, n0, e_mode, e_best, accessible = (
+        ref['groups'], ref['combos'], ref['n0'], ref['mode_energies_raw'],
+        ref['e_best'], ref['accessible'])
     T = float(en.temperature)
-    n_r, n_th = en.n_r, en.n_th
-    n0 = n_r + n_th
-    ph0 = en.ph0.detach().cpu().numpy()
-    ref = np.concatenate([en.r0.detach().cpu().numpy(),
-                          en.th0.detach().cpu().numpy(), ph0])
-    t = lambda a: torch.as_tensor(a, dtype=en.dtype, device=en.device)
-    groups = rotamer_modes(en)
-    n_comb = int(np.prod([len(c) for _, c in groups])) if groups else 1
-    if n_comb > max_modes:
-        return {'skipped': f'{n_comb} modes exceeds max_modes={max_modes}'}
-
-    combos = list(itertools.product(*[range(len(c)) for _, c in groups]))
-    d = np.repeat(ref[None], len(combos), 0)
-    for m, combo in enumerate(combos):
-        for gi, (rows_j, centres) in enumerate(groups):
-            lead = rows_j[0]
-            val = centres[combo[gi]]
-            d[m, n0 + lead] = val
-            disp = (val - ph0[lead] + np.pi) % (2 * np.pi) - np.pi
-            for i in rows_j[1:]:
-                d[m, n0 + i] = ph0[i] + disp
-    x = dof_to_state(en, d)
-    e_mode = en.potential_energy(x, T).detach().cpu().numpy()
-    e_best = float(e_mode.min())
-    accessible = (e_mode - e_best) / T <= accessible_kt
 
     # ---- where do prior draws land? ----
     rng = np.random.default_rng(seed)
     # coverage needs no density, so unlike prior_report it CAN run on a ring molecule --
     # and must therefore draw from the real ring path, not the disabled one.
     xs, stats = en.sample_prior_states(prior, n, rng, report=False)
-    dof = stats['dof']
-    lab = np.zeros(n, dtype=np.int64)
-    stride = 1
-    for gi in range(len(groups) - 1, -1, -1):
-        rows_j, centres = groups[gi]
-        v = dof[:, n0 + rows_j[0]]
-        dist = np.abs((v[:, None] - centres[None, :] + np.pi) % (2 * np.pi) - np.pi)
-        lab += stride * np.argmin(dist, axis=1)
-        stride *= len(centres)
-    counts = np.bincount(lab, minlength=len(combos))
+    counts = basin_counts(groups, stats['dof'], n0, len(combos))
     frac = counts / n
 
     acc_idx = np.where(accessible)[0]
@@ -393,3 +452,62 @@ def format_report(name: str, rep: dict) -> str:
     if rep['clip_frac'] > 1e-3:
         s += f'  !! clip {rep["clip_frac"]:.3f}'
     return s
+
+
+def is_log_z(en, prior, n: int = 20000, seed: int = 0, chunk: int = 4096) -> dict:
+    """Importance-sampled ``log Z`` using the fitted prior as the proposal.
+
+    THE POINT. A trained flow head reports a log Z, but nothing in the TB objective forces
+    that number to be RIGHT -- a policy and a flow head can agree with each other at the
+    wrong constant. This is an independent estimate that never touches the model, so
+    ``log Z_learned - log Z_IS`` is a real error bar rather than a self-consistency check.
+    ``brute_force_log_z`` is the exact answer but only at tiny d (64**30 at propanol/full),
+    which is why this exists.
+
+    THE MEASURE HAS TO MATCH OR THE ANSWER IS OFF BY A CONSTANT. ``log_reward`` is a density
+    on the LATENT BOX x (it carries ``log|dq/dx|``), while ``prior_log_prob`` is a density on
+    the internal coordinates q. Changing variables, ``log q_x(x) = log q_dof(q) +
+    log|dq/dx|``, so the chart term is added to the proposal before subtracting. Getting
+    this wrong shifts every estimate by exactly ``log_chart_jacobian`` -- a constant, which
+    is precisely the kind of error that looks like a plausible number.
+
+    ACYCLIC ONLY, by inheritance from ``prior_log_prob``: a ring block's density is a
+    mixture that is singular in the held directions. It RAISES there rather than returning
+    a number, and the caller is expected to publish an unavailable cell.
+
+    Returns the estimate plus the diagnostics that say whether to believe it: ``ess_frac``
+    and ``w_max_frac`` (one sample carrying most of the weight means the estimate is a
+    lower bound in practice), and ``clip_frac``, which must be ~0 -- the box clamp in
+    ``sample_prior_states`` puts finite mass exactly on the wall and no continuous density
+    can express that.
+    """
+    rng = np.random.default_rng(seed)
+    xs, stats = en.sample_prior_states(prior, n, rng, report=False)
+    dof = stats['dof']
+    log_q = np.asarray(en.prior_log_prob(prior, dof), dtype=np.float64)
+
+    x = torch.as_tensor(xs, dtype=en.dtype, device=en.device)
+    one = torch.tensor(1.0, dtype=en.dtype, device=en.device)
+    log_r = []
+    for i in range(0, len(x), chunk):
+        xb = x[i:i + chunk]
+        e = en.potential_energy(xb, one) + en.jacobian_energy(xb, one)
+        log_r.append((-(e - en.log_chart_jacobian)).detach().cpu().numpy())
+    log_r = np.concatenate(log_r).astype(np.float64)
+
+    # log q on the BOX, not on the internal coordinates -- see docstring
+    log_w = log_r - (log_q + float(en.log_chart_jacobian))
+    m = log_w.max()
+    log_z = m + np.log(np.exp(log_w - m).mean())
+
+    w = np.exp(log_w - m)
+    ess = float(w.sum() ** 2 / max(float((w ** 2).sum()), 1e-300))
+    # clip_frac is a dict keyed by DoF class ({'r': .., 'theta': ..}); the WORST class is
+    # what invalidates the weights, so reduce by max rather than averaging it away
+    _clip = stats.get('clip_frac', 0.0) or 0.0
+    clip = float(max(_clip.values())) if isinstance(_clip, dict) else float(_clip)
+    return {
+        'log_z': float(log_z), 'n': int(n), 'ess': ess, 'ess_frac': ess / n,
+        'w_max_frac': float(w.max() / max(w.sum(), 1e-300)),
+        'clip_frac': clip, 'log_w_std': float(log_w.std()),
+    }

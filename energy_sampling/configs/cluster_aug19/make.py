@@ -31,10 +31,13 @@ WAVES, and why they are separate submissions
 reported success without reaching the code, so nothing long should burn hours
 before the gate reads clean. Everything after it may be submitted at once.
 
-  gate   G1-G3   3 arms   00:30:00   torch_cluster + executed-path flags + compile
+  gate   G1-G3   3 arms   01:00:00   torch_cluster + executed-path flags + compile
+                            (was 00:30:00 -- too short: the MLIP arms spend ~22 min
+                             re-analysing the full prior before step 1, and g1 died
+                             at step 190/200 with its OOM count frozen since step 10)
   prod   P1-P5   3 arms   12:00:00   production shakeout, the whole stack, hours
   sizer  B1-B5   5 arms   04:00:00   the occupancy ladder, incl. a REPEAT for B2
-  mlip   M1-M2   4 arms   02:00:00   the two A/Bs the handoff left unrun
+  mlip   M1-M2   4 arms   03:00:00   the two A/Bs the handoff left unrun
   cost   C1-C2   3 arms   02:00:00   what this week's changes actually cost
 """
 
@@ -236,6 +239,42 @@ def arms():
            'profiling.trace.with_stack': True,
            'profiling.trace.write_trace': False})
 
+    # ================================================================= mem ===
+    # WHY THIS WAVE EXISTS. g1_mace_gate OOM'd three times in its first ten
+    # steps and cut batch 100 -> 23, then ran 180 steps stably. The memory trace
+    # says it was never short of memory: LIVE allocation was flat at 890 MiB
+    # (1.1% of the card) while RESERVED sat at 57.7 GB, of which 98.5% was
+    # cached-but-held. cuda_memory_fraction is a HARD cap that counts those
+    # unusable blocks, so the allocation failed with the card effectively empty.
+    #
+    # Historically this route ran an ENERGY batch of 79 against a POLICY batch of
+    # 3000, with the energy call chunking internally. That is disabled by design
+    # (grad accumulation is the simpler equivalent), so the only lever the OOM
+    # path has is the policy batch -- which is why 100 became 23.
+    #
+    # THE QUESTION: is the ceiling fragmentation, trajectory activations, or the
+    # cap itself? Each arm isolates one, all at batch 100, all otherwise
+    # identical to g1. mem0 is the control and must reproduce the crash, or the
+    # wave has no power and every other arm is uninterpretable.
+    #
+    # NB none of this was runnable before today: train.py ASSIGNED
+    # PYTORCH_CUDA_ALLOC_CONF rather than defaulting it, so anything exported
+    # here was clobbered by the process it was meant to configure.
+    for name, extra in (
+            ('mem0_mace_control', {}),
+            ('mem1_mace_gc', {}),
+            ('mem2_mace_split', {}),
+            ('mem3_mace_trajckpt', dict(traj_checkpoint=True)),
+            ('mem4_mace_cap97', dict(cuda_memory_fraction=0.97))):
+        out[f'{TAG}_{name}'] = generate.arm(
+            f'{TAG}_{name}', problem='mipcas_elj', tag=TAG,
+            energy_function='mace', mlip_path=CLUSTER_MACE_MLIP,
+            space_groups=[14], z_primes=[1],
+            prior_path=MACE_PRIOR, molecules_path=MACE_PRIOR,
+            batch_size=100, max_batch_size=100, fused_grad_accum_min_samples=100,
+            epochs=200, eval_period=100, figs_period=200, archive_period=0,
+            **{**BASE, **LADDER_OFF, EQ: EQUIL, **extra})
+
     return out
 
 
@@ -253,16 +292,34 @@ ENV = {
     f'{TAG}_c1_fused_on': {'MXT_FUSED_ADAM': '1'},
     f'{TAG}_c1_fused_off': {'MXT_FUSED_ADAM': '0'},
     f'{TAG}_g2_uma_gate': {'MXT_UMA_GRAPH_TIMER': '1'},
+    # ---- the allocator arms. mem0 sets NOTHING, so it takes train.py's
+    # setdefault floor (expandable_segments) and is the control for the two
+    # below it. mem3/mem4 vary a config key instead and inherit the same floor,
+    # which is what keeps each arm a single-variable change.
+    f'{TAG}_mem1_mace_gc': {
+        'PYTORCH_CUDA_ALLOC_CONF':
+            'expandable_segments:True,garbage_collection_threshold:0.8'},
+    f'{TAG}_mem2_mace_split': {
+        'PYTORCH_CUDA_ALLOC_CONF':
+            'expandable_segments:True,garbage_collection_threshold:0.8,'
+            'max_split_size_mb:128'},
 }
 
 WAVES = {
-    'gate':  ('00:30:00', ['g1_mace_gate', 'g2_uma_gate', 'g3_elj_compile']),
+    'gate':  ('01:00:00', ['g1_mace_gate', 'g2_uma_gate', 'g3_elj_compile']),
     'prod':  ('12:00:00', ['p1_uma_prod', 'p2_mace_prod', 'p3_qm9_cond_prod']),
     'sizer': ('04:00:00', ['b1_ladder_r1', 'b2_ladder_r2',
                            'b5_fixed7410', 'b5_fixed12000', 'b5_fixed20000']),
-    'mlip':  ('02:00:00', ['m1_mace_nl_only', 'm1_mace_nl_gpubatch',
+    'mlip':  ('03:00:00', ['m1_mace_nl_only', 'm1_mace_nl_gpubatch',
                            'm2_uma_extgraph_on', 'm2_uma_extgraph_off']),
     'cost':  ('02:00:00', ['c1_fused_on', 'c1_fused_off', 'c2_syncs']),
+    # 01:30:00, not 00:30:00: g1 spent ~22 of its 24 minutes on the init prior
+    # re-analysis (205k rows through MACE) and ~1.6 min actually training, then
+    # died at step 190 of 200 -- almost certainly the walltime, since
+    # batch/oom_events had been frozen at 3 since step 10.
+    'mem':   ('01:30:00', ['mem0_mace_control', 'mem1_mace_gc',
+                           'mem2_mace_split', 'mem3_mace_trajckpt',
+                           'mem4_mace_cap97']),
 }
 
 SBATCH_TEMPLATE = """#!/bin/bash

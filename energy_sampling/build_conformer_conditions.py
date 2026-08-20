@@ -128,7 +128,10 @@ def main():
         e = bake_energies(energy, states)
         print(f"  {ident}: E median {e.median():+8.3f}  p10 {torch.quantile(e, 0.1):+8.3f}"
               f"  p90 {torch.quantile(e, 0.9):+8.3f}")
-        parts.append(attach_states(mol, states, e, identifier=ident))
+        # the mask is NOT optional: at `flex` and above the state carries linear r/theta
+        # columns, and wrapping one folds a bond length to the opposite corner of the box
+        parts.append(attach_states(mol, states, e, identifier=ident,
+                                   periodic=energy.periodic_dims))
 
     prior = parts[0]
     for part in parts[1:]:

@@ -183,6 +183,56 @@ def torsion_latent_figure(samples, reference=None, n_kde: int = 200,
     Torsions are plotted in degrees on a fixed [-180, 180] range so panels stay
     comparable across steps, and so a distribution piling up at the wrap point is
     visible as mass at both edges rather than being silently re-centred.
+
+    THIS DOES NOT SCALE PAST `torsion`, IN THREE SEPARATE WAYS. Needs an abstraction; all
+    three are live at `flex` and `full` today.
+
+    1. WIDTH IS UNBOUNDED. One row of `k` panels at `width=300 * k` -- 9000 px at
+       propanol/full (d=30), and worse on anything real. A grid helps but only to about
+       15-18 panels; past that no per-dimension layout is readable.
+    2. EVERY PANEL IS LABELLED "torsion j", WHICH IS FALSE ABOVE `dihedral`. At `full` the
+       first n_r columns are BOND LENGTHS and the next n_th are ANGLES. The energy already
+       knows -- `_free_block` is 0/1/2 per state column -- so the label is available and
+       simply is not read.
+    3. EVERY COLUMN IS SCALED BY 180 AND RANGED [-185, 185] AS DEGREES. That is meaningful
+       only for the phi block. The r and theta columns are linear box coordinates, so the
+       axis is wrong for them and a bond-length distribution is being drawn as though it
+       were an angle. `periodic_dims` is the discriminator and is already passed to the
+       policy.
+
+    THE AGREED FRAMING (2026-08-20) IS SCALARS FIRST, FIGURE AS DRILL-DOWN. What you want
+    to see depends on what the reference IS, and the code already knows -- TerminalBuffers
+    carries `reference` and `prior` separately, and prior_frac == 1.0 means "no true target
+    exists here". Three questions, three different scalars, and the directionality differs:
+
+      * REFERENCE IS THE PRIOR -> coverage, and it is ONE-SIDED. What matters is prior mass
+        the sampler has abandoned, not sampler mass the prior lacks -- concentrating is the
+        point of training, so a symmetric divergence would penalise success.
+      * REFERENCE IS THE TARGET -> agreement, symmetric. Per-column Wasserstein or KS.
+      * WATCHING FOR PATHOLOGIES -> each named one is itself a scalar: variance explosion
+        (per-column sd ratio, max over columns), mode collapse (entropy drop), wall-piling
+        (mass within eps of +-1), wrap discontinuity (mass at both edges of a periodic
+        column).
+
+    So the distribution plot is not the primary diagnostic; it is what you open when a
+    scalar trips, over only the columns that tripped -- which is a handful by construction
+    and therefore dissolves the layout problem above.
+
+    DIMENSION REDUCTION WAS CONSIDERED AND REJECTED. A projection over the latent box mixes
+    incommensurable units -- r in angstrom, theta in radians, phi in radians ON A CIRCLE --
+    so a PCA over it is a weighted sum of things sharing no metric, and the periodic columns
+    do not embed in Euclidean space without picking a branch cut. The thermal widths could
+    whiten it, but the projection would still cross the periodic/linear boundary.
+
+    Options for the per-column layout if one is still wanted, none chosen:
+      * GROUP BY DoF CLASS -- three panels (r, theta, phi) with every column of a class
+        overlaid. Scales to any d; loses per-column identity.
+      * WORST-K BY DIVERGENCE -- rank columns by 1-D Wasserstein against the reference and
+        show the K worst plus a summary of the rest. Scales, and surfaces the failure
+        rather than averaging it away.
+      * DENSITY-DIFFERENCE HEATMAP -- columns on one axis, latent value on the other,
+        colour = sampler density minus reference density. One panel at any d, and zero
+        means agreement, so disagreement is what draws the eye.
     """
     from plotly.subplots import make_subplots
 
@@ -323,7 +373,7 @@ def build_terminal_buffers(energy, train_c, eval_c, dim) -> TerminalBuffers:
         draw = boltzmann_reference(energy, eval_c.brute_force_grid,
                                    n=int(getattr(train_c, "reference_size", 8192)))
         if draw is not None:
-            ref = torch.as_tensor(draw, dtype=torch.float64)
+            ref = torch.as_tensor(draw, dtype=torch.get_default_dtype())
             print(f"reference buffer: {len(ref)} EXACT Boltzmann states by grid inversion")
         elif source == "exact":
             raise SystemExit("reference_source='exact' needs brute_force_grid > 0 and k <= 3")
@@ -331,7 +381,7 @@ def build_terminal_buffers(energy, train_c, eval_c, dim) -> TerminalBuffers:
     if ref is None and path is not None and path.exists():
         blob = torch.load(path, weights_only=False)
         key = "modes" if source in ("auto", "modes") and "modes" in blob else "states"
-        ref = torch.as_tensor(blob[key], dtype=torch.float64)
+        ref = torch.as_tensor(blob[key], dtype=torch.get_default_dtype())
         print(f"reference buffer: {len(ref)} local optima ('{key}') from {path}")
     elif ref is None and path is not None:
         # an explicitly-configured buffer that is not there is a config error, not a
@@ -346,7 +396,7 @@ def build_terminal_buffers(energy, train_c, eval_c, dim) -> TerminalBuffers:
     if p_path and Path(p_path).exists():
         blob = torch.load(Path(p_path), weights_only=False)
         prior = torch.as_tensor(blob["states"] if isinstance(blob, dict) else blob,
-                                dtype=torch.float64)
+                                dtype=torch.get_default_dtype())
         if prior.shape[1] != dim:
             raise SystemExit(
                 f"prior_states_path {p_path} holds {prior.shape[1]}-wide states but this "
@@ -371,9 +421,9 @@ def build_terminal_buffers(energy, train_c, eval_c, dim) -> TerminalBuffers:
               f"{len(fitted.torsions)} torsion types)")
         prior, _ = energy.sample_prior_states(
             fitted, n_prior, np.random.default_rng(int(getattr(train_c, "prior_seed", 0))))
-        prior = prior.to(torch.float64)
+        prior = prior.to(torch.get_default_dtype())
     elif n_prior > 0:
-        prior = torch.rand(n_prior, dim, dtype=torch.float64) * 2 - 1
+        prior = torch.rand(n_prior, dim, dtype=torch.get_default_dtype()) * 2 - 1
         print(f"prior buffer: {n_prior} UNIFORM-on-box states (no prior_states_path or "
               f"internal_prior_path; this is the max-entropy dumb prior, and from `flex` "
               f"up it is a very dumb one -- every bond length independently uniform)")
@@ -474,6 +524,13 @@ class ConformerModeller:
         self.protocol = None
         self.lr_ctrl = None             # LRController builds and owns this dict
         self.batch_size = int(args.training.batch_size)
+        # BOTH bounds are mirrored onto `args`, because train.py's batch machinery reads
+        # them from there rather than from the modeller. `batch_size` is the CONFIGURED
+        # base and must not be confused with `self.batch_size`, which select_batch_size
+        # mutates -- the floor is what the run was designed around, not where it currently
+        # sits, and sourcing it from the mutable field would let the domain drift upward
+        # with every rung the sizer climbs.
+        self.args.batch_size = int(args.training.batch_size)
         self.args.max_batch_size = int(args.training.max_batch_size)
         self.batch_size_cooldown_until = 0
         self.batch_size_last_grow = 0
@@ -523,6 +580,21 @@ class ConformerModeller:
             init_policy_lrs['fused'], weight_decay=wd)
         self.optimizers['flow'] = torch.optim.Adam(
             self.gfn_model.flow_model.parameters(), init_flow_lr, weight_decay=wd)
+
+    def _batch_floor(self) -> int:
+        """The configured batch size, as the batch sizer's lower domain bound.
+
+        MIRRORS train.py's Modeller._batch_floor deliberately rather than importing it:
+        ConformerModeller is a duck-typed adapter, not a subclass, so every member
+        train.py's machinery reaches for has to exist here by hand. That is exactly how
+        this broke -- select_batch_size grew a _batch_floor() call and the adapter did not
+        follow, so the conformer entry point raised AttributeError before step 0.
+
+        If the two definitions ever need to differ, that is a signal the adapter should
+        become a subclass instead.
+        """
+        return max(1, min(int(self.args.batch_size), int(self.args.max_batch_size)))
+
 
     def step_lr_schedule(self):
         return self.lr_controller.step()
@@ -597,7 +669,20 @@ def run(args):
     train_c, eval_c = args.training, args.eval
 
     torch.manual_seed(args.seed)
-    torch.set_default_dtype(torch.float64)
+    # float32 EVERYWHERE for the conformer track. Measured against float64 on identical
+    # draws, the relative error is ~5e-7 on the potential, ~6e-7 on log J and ~1e-6 A on
+    # the closure bond -- four orders below the quantities being reported, with nothing
+    # compounding through the NeRF chain. The two places precision genuinely matters are
+    # exempt: the TB residual accumulator, which stays float64 by its own explicit cast
+    # (tb_loss does log_pf.double() - log_pb.double(), one scalar per trajectory and the
+    # one place cancellation actually bites).
+    #
+    # THE BUFFERS ARE NOT EXEMPT, and an earlier version of this comment said they were.
+    # They hold terminal STATES on [-1, 1] that are fed straight to the policy, so pinning
+    # them to float64 does not preserve precision -- it raises
+    # `expected mat1 and mat2 to have the same dtype` at the first backward step. Storage
+    # precision is only free where the tensor never meets a parameter.
+    torch.set_default_dtype(torch.float32)
     device = torch.device(getattr(args, "device", "cpu"))
     torch.set_num_threads(getattr(args, "num_threads", 2))
 

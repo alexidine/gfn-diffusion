@@ -5,7 +5,8 @@ import os
 import torch
 from tqdm import tqdm
 
-from energy_sampling.data_processing.utils import (calibrate_energy_function_vs_uma,
+from energy_sampling.data_processing.utils import (UMA_ENERGY_STATE,
+                                                   calibrate_energy_function_vs_uma,
                                                    load_search_chunks)
 from energy_sampling.utils import new_calibrate_prior_noise
 from mxtaltools.analysis.crystal_rdf import compute_rdf_distance
@@ -207,6 +208,12 @@ if __name__ == '__main__':
     ap.add_argument('--mace-model', default=r"D:\crystal_datasets\acr_112025_mh1_stagetwo.model")
     ap.add_argument('--device', default='cuda')
     ap.add_argument('--noised-samples', type=int, default=50000)
+    ap.add_argument('--dataset-suffix', default='',
+                    help="appended to the output name, e.g. '_f047' -> "
+                         "<run>_f047_prior_dataset.pt. A REBUILD MUST USE ONE: the "
+                         "resume branch below reuses any existing file of the target "
+                         "name outright, so re-running after an energy-function change "
+                         "silently returns the old prior and reports success.")
     cli = ap.parse_args()
 
     cfg = TARGETS[cli.target]
@@ -253,7 +260,7 @@ if __name__ == '__main__':
     zp = tbatch.z_prime
     sg = tbatch.sg_ind
 
-    dataset_filename = run_name + '_prior_dataset.pt'
+    dataset_filename = run_name + cli.dataset_suffix + '_prior_dataset.pt'
 
     if os.path.exists(dataset_filename):
         dd = torch.load(dataset_filename, weights_only=False)
@@ -272,6 +279,10 @@ if __name__ == '__main__':
             'thermal_scaling_factor': en_scaling_factor,
             'log_noise_range': log_noise_range,
             'prior_batch': thinned_batch.cpu(),
+            # which energy state selected these structures. The THINNING is what the
+            # stamp is about: it cuts at e_min + 6kT, so energies that were wrong
+            # change which structures are here, not merely what they are labelled.
+            'uma_energy_state': UMA_ENERGY_STATE if energy_function == 'uma' else None,
         }
         torch.save(dataset_dict, dataset_filename)
 
@@ -318,6 +329,7 @@ if __name__ == '__main__':
             'thermal_scaling_factor': en_scaling_factor,
             'log_noise_range': log_noise_range,
             'prior_batch': thinned_batch.cpu(),
+            'uma_energy_state': UMA_ENERGY_STATE if energy_function == 'uma' else None,
             'noised_batch': collate_data_list(noised_samples),
         }
         torch.save(dataset_dict, dataset_filename)

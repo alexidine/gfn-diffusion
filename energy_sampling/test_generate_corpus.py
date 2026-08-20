@@ -59,6 +59,15 @@ CANONICAL_DRIFT = {
     # so a controller asking to go lower was refused silently. Historical arms
     # predate that and carry the old floor.
     'config.min_lr',
+    # level_gap moved 0 -> 1 on the CONDITIONAL route's var_conditioning stage
+    # (2026-08-19). It is the per-condition Z-level tether, and it was adopted as
+    # a stability term after a local single-key A/B: at 0 the forward VarGrad ran
+    # 49 of 108 reports above 10x its median with log Z drifting up; at 1 there
+    # was no excursion at all. Historical conditional arms predate that.
+    # Reported on BOTH paths, since config_snapshot emits the resolved config and
+    # the parsed stage summary separately.
+    'config.protocols.conditional_vargrad.stages[1].loss_coeffs.bwd.level_gap',
+    'stages[1].effective_loss_coeffs.bwd.level_gap',
     # Owner edits of 2026-08-19, with the occupancy ladder arming: rung spacing
     # 1.65 -> 1.6 and the OOM cut 0.5 -> 0.625. Historical arms carry the old
     # values.

@@ -201,7 +201,10 @@ def descend(en, x0, steps, lr=None, optimizer='rprop'):
     x = x0.clone().detach().requires_grad_(True)
     opt = (torch.optim.Rprop([x], lr=lr) if optimizer == 'rprop'
            else torch.optim.Adam([x], lr=lr))
-    best_u = torch.full((len(x0),), float('inf'), dtype=en.dtype)
+    # device=x0.device, not the default: without it best_u is CPU while the energy runs
+    # on the caller's device, and `ud < best_u` raises. Never surfaced because the
+    # benchmark runs on CPU; the trainer calls this on the card.
+    best_u = torch.full((len(x0),), float('inf'), dtype=en.dtype, device=x0.device)
     best_x = x0.clone().detach()
     for _ in range(steps):
         opt.zero_grad()

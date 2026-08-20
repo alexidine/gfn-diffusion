@@ -238,6 +238,7 @@ def eval_figs(fwd_stats,
               metrics,
               temperature_conditioning: bool = False,
               anchor_latents=None,
+              domain_figs=None,
               ):
     fig_dict = {}  # todo add tb GP fig & binned residuals
 
@@ -277,6 +278,20 @@ def eval_figs(fwd_stats,
             bwd_stats['means_f'], bwd_stats['logvars_f'], fig_dict,
             bwd_stats['flow_states'], bwd_stats['means_b'],
             bwd_stats['logvars_b'], prefix='Bwd')
+
+    # THE DOMAIN'S OWN FIGURES. Everything above this line is TB diagnostics and is
+    # domain-agnostic; everything below it reads a crystal cell. `domain_figs` is how a
+    # non-crystal route substitutes its own -- the block below is the crystal
+    # implementation, kept here and passed in by Modeller so crystal runs are unchanged.
+    # It is NOT optional-with-a-silent-skip: a route that supplies nothing still gets the
+    # crystal block and its fig_guard failure, because silently emitting no domain figure
+    # is how a run looks healthy while showing nothing about its own samples.
+    if domain_figs is not None:
+        domain_figs(fig_dict, sample_batch, prior_latent_params, anchor_latents)
+        if temperature_conditioning:
+            with fig_guard('Z vs T'):
+                fig_dict['Z vs T'] = Z_vs_T(fwd_stats)
+        return fig_dict, metrics
 
     # prefer the rescaled mol_energy (matches the actual loss scale) over the
     # bare energy_function attribute, which is only correct for toy (non

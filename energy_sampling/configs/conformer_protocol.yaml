@@ -1,0 +1,83 @@
+# The conformer unconditional protocol -- the mk_dev `unconditional_tb` shape, with the
+# two owner decisions of 2026-08-20 encoded. Included by a conformer run config; not
+# runnable alone.
+#
+# WHY BOLT THIS OVER RATHER THAN KEEP train_conformer's stripped loop. That loop was built
+# deliberately without a protocol, buffers or stage machinery -- its docstring says none of
+# them "earn their keep before the sampler is shown to work at all". The sampler is now
+# shown to work (propanol/torsion, log Z 5.935 against an exact 5.9365), so that rationale
+# has expired, and the crystal route's workflow is well studied and known to work.
+
+protocol: conformer_unconditional
+
+protocols:
+  conformer_unconditional:
+    stages:
+      # -- PHASE 1: MLE warm start. Broadens the policy on prior draws.
+      - name: train_prior
+        train_mode: bwd
+        bwd_sampling_mode: dataset
+        skip_if: prior_loaded
+        # `hyper`, not `ray` -- and here that is forced rather than preferred. The ray
+        # probe draws from replay and scores replay_loss_coeffs, so it is incoherent in a
+        # bwd stage that trains neither. The hypergradient reads no loss at all
+        # (peak_scale *= exp(beta*cos) over the angle between the current gradient and the
+        # direction the last step actually moved the policy), so it stays coherent
+        # whatever a stage trains.
+        #
+        # beta is a BANDWIDTH with no universal value -- the per-cell optimum spans 20x,
+        # which is why the parser refuses to default it. 0.1 is the best WORST-CASE beta
+        # measured on the bench over 12 cells, and that sweep covered MLE surfaces, which
+        # is what this stage trains.
+        lr_sensor: { kind: hyper, beta: 0.1 }
+        flags:
+          update_log_z: true
+        mle_gate:
+          slope_t: 2.0
+          min_rate: 0.05
+          window: 300
+        loss_coeffs:
+          bwd: { mle: 1.0, tbc: 1.0, repeats: 2.0 }
+        exit:
+          - { metric: gates/mle_flat, above: 0.5, patience: 5 }
+          - { metric: bwd/tbc, below: 2.0 }
+        # OWNER DECISION 2026-08-20 -- `snapshot_prior` is DELIBERATELY ABSENT.
+        #
+        # The crystal route ends this stage with [ 'snapshot:phase1_exit',
+        # 'snapshot_prior' ], the second of which freezes the MLE-trained policy as THE
+        # prior model. That is right when the prior has to be learned. It is wrong here:
+        # the conformer track already has a fitted InternalPrior that draws r/theta at the
+        # force field's own thermal widths and torsions jointly per group, benchmarked
+        # against uniform-on-box at 32x-87000x on median energy excess. Phase 1 is being
+        # run ONLY to broaden the policy space, not to produce a prior -- so the trained
+        # model must not displace one that is already good.
+        #
+        # Consequence to keep in view: phase 2 therefore draws backward terminals from the
+        # SAME fitted prior phase 1 trained against, rather than from a policy that has
+        # moved. Whether that costs anything is measurable and unmeasured.
+        on_exit: [ 'snapshot:phase1_exit' ]
+
+      # -- PHASE 2: the always-on terminal stage. No exit block; runs to `epochs`.
+      - name: equilibration
+        train_mode: fused
+        bwd_sampling_mode: prior
+        # OWNER DECISION 2026-08-20: hyper is the DEFAULT sensor, not ray. On the crystal
+        # route this stage runs `ray` because it is the one place ray is coherent -- the
+        # probe needs a fused stage that trains replay TB, which this is. Overriding it to
+        # hyper is a deliberate default change, so the ray option stays available and the
+        # switch is one key.
+        lr_sensor: { kind: hyper, beta: 0.1 }
+        flags:
+          update_log_z: true
+          buffers_active: true
+          z_calibration: true
+        # `rebuild_prior_by_churn` carried over from the crystal route: it swaps the
+        # dataset-seeded buffer for one built through the online admission gate.
+        on_enter: [ 'rebuild_prior_by_churn', 'bootstrap_z' ]
+        fracs: { fwd: 0.05, bwd: 0.45, replay: 0.5 }
+        min_fracs: { fwd: 0.02, bwd: 0.02, replay: 0.02 }
+        deactivate_threshold: 0.01
+        loss_coeffs:
+          fwd: { tb: 1.0, freeze_policy: 1.0 }
+          bwd: { tb: 1.0, beta: 80 }
+          replay: { tb: 1.0, beta: 80 }

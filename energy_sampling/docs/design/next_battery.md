@@ -339,6 +339,87 @@ the backward branch training on a frozen anchor set replicated ~6.5x; or the
 VarGrad objective genuinely having a fit ceiling that sample quality does not share
 — which would be a real result rather than a defect.
 
+### 2.2b The tether experiment: what it actually revealed
+
+`OBSERVED` — one back-to-back pair, seed 12345, T=10, synthetic-condition
+conditional route (`synth_real_aug19`), 98 conditions, phase 2 entered at step
+18,460, ~1,080 phase-2 steps. `3yifcbrb` (`level_gap: 1`, finished) against
+`696ns1fz` (`level_gap: 0`, **crashed**). Same config otherwise.
+
+**The tether is both load-bearing and still a defect** — a bad leg on a broken
+stool. Removing it does not create the instability, it *reveals* one. So neither
+"keep it" nor "delete it" is the answer; the battery has to find and fix what it is
+propping up, and only then ask whether it is still needed.
+
+**What blew up, and what did not.**
+
+| series | tether ON, start → end | tether OFF, start → end |
+|---|---|---|
+| `fwd/step_var` | 0.00642 → **0.00448** | 0.00611 → **0.3967 (65x)** |
+| `fwd/terminal_var` | 0.144 → **0.124** | 0.138 → **0.334 (2.4x)** |
+| `fwd/logw_std_within` | 72.9 → **34.7** | 63.3 → **2.84e4** |
+| `fwd/vg_lb` | 446 → **195** | 271 → **1.99e4** |
+| `bwd/log_Z_learned` | -23.9 → -28.6 | -9.3 → **-45.0** |
+| `bwd/logw_std_within` | 8.0 → 4.29 | 7.7 → **2.37** |
+| `grad_norm_pre_clip` | 367 → 198, **max 1010** | 54 → 382, **max 904** |
+| `Fwd / Bwd Frac` | 0.52/0.48 -> 0.755/0.245 | 0.52/0.48 -> **0.757/0.243** |
+
+**Three corrections to an earlier draft of this section, all of which change the
+conclusion** (user, 2026-08-19):
+
+1. **`var(log w)` is not a flat direction — it IS the loss.** Condition-grouped
+   VarGrad minimises the within-group variance of log w, so `fwd/logw_std_within`
+   going to 2.84e4 means **the objective rose ~5 orders of magnitude**. This is
+   divergence on the objective, not drift along an unconstrained direction. (The
+   recorded `step_var`-is-the-flat-direction result is a **TB** result; on TB the
+   per-step increment budget is genuinely unconstrained. It does not transfer to
+   this route, and `fwd/step_var` rising 65x here is part of the divergence, not a
+   free direction.)
+2. **`log_Z_learned` cannot affect the policy models**, by design — VarGrad is
+   reward-free, the group centre replaces log Z, and `log_Z_learned` never enters
+   the loss. Its collapse to −45 is a **readout, not a driver**, and it must not
+   head a causal ordering. The policy-side early indicators are `fwd/terminal_var`
+   and `fwd/step_var`.
+3. **`level_gap` is a backward-loss term whose designed job is pulling J_B down.**
+   The forward counterpart is explicitly *not* added to the forward loss. It does
+   reach P_F parameters, through the documented `-gap * d log_pf` term on buffer
+   rows ("the half that raises P_F on stored terminals"), and that is its only
+   forward-facing route — but calling it "an anchor on the forward policy" overstated
+   one half of a backward term. Whether that half is what stabilises is **untested**.
+
+**What survives, and it now has a mechanism.** The blow-up is still not a gradient
+explosion — and the reason is the huber. `vg_loss = beta * smooth_l1(centre,
+log_ratio, beta)` with `fwd_loss_coeffs.beta: 10` gives a per-row gradient of `x`
+below the knee and **exactly `beta·sign(x)` above it**. So above |x| ≈ 10 the
+restoring force is **constant at 10 regardless of how large the error grows**. With
+residuals reaching ~1e4 the loss is 1,000x the force pulling it back. That is why
+`grad_norm_pre_clip` peaked at 904 while the loss hit 2.84e4, why the healthy run's
+peak norm (1,010) is *higher*, and why no grad-norm bar or clip could fire.
+
+**Leading hypothesis, `CONJECTURE`: the huber knee defines a basin, and the run fell
+out of it.** Inside |resid| < beta the restoring force is proportional and the system
+is stable; outside, it is constant and the system can wander at fixed force. This
+predicts exactly the timing anomaly observed — **the run survived `lr_fused` 2.07e-5
+at step 18,670 and then broke at ~1.6e-5 at 18,940.** A fixed LR threshold cannot
+produce that; a basin boundary can, because what matters is whether a perturbation
+pushes the batch past the knee, not the LR at that instant. It is also the same
+bang-bang pathology as `level_gap`'s clamp, one level up in the loss — which is
+consistent with the tether and the huber failing together rather than one fixing the
+other.
+
+**Normal operation is well inside the knee**: `fwd/tb_resid_clipped` runs 1.4–2.3
+against `beta: 10` on the QM9 battery, so the huber does no work at all until
+something pushes the batch out.
+
+**Also refuted, and recorded so it is not re-proposed:**
+
+- **Starved backward branch** — Fwd/Bwd Frac identical to three digits in both runs,
+  and `bwd/logw_std_within` was *lower* in the crashed run (2.37 vs 4.29).
+- **Condition-sampling concentration** — `fwd/vg_n_groups` constant at 98 throughout;
+  group size rose only because the batch grew.
+- **log Z gradients contaminating the conditioner** — the previous leading
+  hypothesis, fixed without removing the instability.
+
 ### 2.3 Proposed arms
 
 Pinned across all arms: `grow_batch_size: false`, `max_batch_size = batch_size`, one
@@ -362,20 +443,58 @@ arms:
 **Step 2 — the battery.** Three axes, all genuinely open, all about gradient
 quality and variance:
 
-- **Z tether gain (5 arms)** — `bwd_loss_coeffs.level_gap` ∈ **{0, 0.25, 0.5, 1.0}**
-  (1.0 = control), plus one **restored-proportional** arm. See below; this replaces
-  the on/off framing an earlier draft had, which was wrong — `level_gap` is a
-  coefficient, and the interesting question is its size.
+- **Huber basin (4 arms) — the new primary axis, and it runs with the tether OFF.**
+  §2.2b says the restoring force saturates at `fwd_loss_coeffs.beta` and the run fell
+  out of the proportional basin. Arms: **beta 10 (control) / 30 / 100 / effectively
+  off (1e9)**. **The predicted direction is counterintuitive and worth stating so the
+  arm can be wrong: RAISING beta should improve recoverability**, because it keeps the
+  restoring force proportional out to larger error — the opposite of the usual reason
+  one reaches for a huber. The risk it trades against is real: the huber also bounds
+  outlier influence, so removing it lets a few rows dominate. The discriminator is
+  whether the large residuals are a few outliers or the whole batch — at
+  `logw_std_within` 2.84e4 it is the whole batch, so there the huber is bounding
+  nothing useful.
+  **Tether-off is the assay, not a mistake.** With `level_gap 1` everything is masked
+  and a candidate fix cannot be told from the tether doing the work. And the readout
+  is a **threshold** — does the loss run away, and at what step — so §0.1's noise
+  floor does not apply and the arms need only ~1,500 steps. These are the cheapest
+  informative runs in the conditional battery.
+- **Gradient noise / group size (3 arms), restored to a live candidate.** An earlier
+  draft dismissed this because `grad_norm_pre_clip` was falling before onset. **That
+  reasoning was wrong**: a falling gradient *norm* says nothing about the noise-to-
+  signal ratio, and as a loss descends the signal falls while the noise persists, so
+  noise-to-signal *rises* — which is exactly when a fixed LR goes unstable. Sweep
+  target group size ∈ {2, ~6, ~12}, verified against `fwd/vg_group_size_mean`. Caveat
+  for this particular config: group size was already 31–125 in the pair above, so it
+  may not be the binding constraint *there* — which is an argument for running the
+  axis on the QM9 route where groups are 2.4–17, not for dropping it.
+- **`step_var` clamps (1 arm, demoted).** `model.log_var_range` 6 → 4, or
+  `t_scale_preserve_budget: true`. These bound the symptom rather than restoring a
+  restoring force, which puts them in **the same category as the tether** — another
+  leg propping the stool. Worth one arm to know the size of the effect; not worth
+  making it the plan.
+- **Z tether gain (5 arms), now a second-order question** — `bwd_loss_coeffs.level_gap`
+  ∈ **{0, 0.25, 0.5, 1.0}** plus one **restored-proportional** arm (clamp 1,000 ×
+  gain 0.01). Run this *after* the huber-basin axis, on whichever constraint
+  wins, so it asks the question it was written for — how well does the tether do the
+  Z-level job — rather than how well it substitutes for a variance regulariser.
 - **Z target (1–2 arms, after the gain sweep)** — `emp_z 0 + emp_z_persistent 1` at
   the winning gain. Separates "the tether is the wrong strength" from "the tether's
-  *target* is noisy"; running it after the sweep keeps the axes uncrossed.
-- **Group size (3 arms)** — target ∈ {2, ~6, ~12} at *fixed* batch, reached by
-  `repeats` and `condition_block_m` together, **verified against
-  `fwd/vg_group_size_mean`**. This is the VarGrad estimator-variance axis.
+  *target* is noisy"; running it after keeps the axes uncrossed.
 - **Huber beta (3 arms)** — the current `sym`/`bwd80` pair reads a ×8 gain change
   under full saturation, so add a third arm with beta small enough to put the knee
   inside the residual distribution. That brackets the question on both sides
   instead of one.
+
+
+**The three candidate stabilisers, re-ranked against §2.2b — with predicted
+directions, so each arm can be wrong.**
+
+| candidate | predicted direction | why |
+|---|---|---|
+| **fwd huber `beta`** | **primary, and RAISE it** | the restoring force saturates at `beta` while the error grows unbounded; raising it keeps the force proportional further out. Lowering it — the intuitive move — shrinks the basin and should make things worse |
+| **higher repeats / group size** | **live, direction unknown** | restored after an incorrect dismissal (see the axis above). Gradient *noise*, not gradient *norm*, sets the stable LR, and noise-to-signal rises as the loss descends |
+| **importance weighting (`vg_lme`)** | **harmful** | `vg_lme` centres on log-mean-exp instead of the group mean. At `logw_std` 20–80 nats log-mean-exp is numerically the max, so effective group size collapses toward 1 and VarGrad degenerates. The useful direction is the opposite — trim or winsorise the group log w tail, as `condition_log_z.trim_frac` already does for the tracker |
 
 **Do not cross them.** Run one, then the next on the winner. Target the 6k–13k
 window, where arms actually differ.
@@ -715,7 +834,7 @@ that single fact decides most of the budget below — see stage 1.
 | **6a** | 2 | **C1–C2 DPLR** (`dplr_rank` 6 vs 0) | uncond elj | — | live | 24 | **48** | no |
 | **6b** | 3 | **C3–C5 T** (40 / 60 / 100) at fixed wall clock | uncond elj | — | live | 24 | **72** | no |
 | **6c** | 3 | **C6–C8 `t_scale`** — branches off one warm start | uncond elj | — | live | 24 | **72** | no |
-| **6d** | 26 | **conditional battery** — 13 arms × 2 seeds, run in sequence: Z tether gain (5: `level_gap` 0 / 0.25 / 0.5 / 1.0 + restored-proportional) → Z target (2) → group size (3) → huber beta (3) | conditional, warm from `phase1_exit` | 8,000 | 20k | 13.3 | **346** | no |
+| **6d** | 32 | **conditional battery** — 16 arms x 2 seeds, in sequence: huber basin (4, tether OFF, ~1,500 steps) -> gradient noise / group size (3) -> step_var clamp (1) -> Z tether gain (5) -> Z target (2) -> huber beta on the QM9 route (1) | conditional, warm from `phase1_exit` | 1.5k–8k | 20k | 0.5–13.3 | **310** | no |
 
 ### 4.3 Totals, and the number that matters
 
@@ -725,8 +844,8 @@ that single fact decides most of the budget below — see stage 1.
 | production (stage 5) | 840 | ~35 |
 | gates + production | 956 | **~40** |
 | Tier B (stage 4) | 240 | ~10 |
-| Tier C + conditional battery (stage 6) | 538 | ~22 |
-| everything (stages 0–6) | 1,734 | **~72** |
+| Tier C + conditional battery (stage 6) | 502 | ~21 |
+| everything (stages 0–6) | 1,698 | **~71** |
 
 **The headline: the gating work costs ~5 GPU-days on top of a ~35-day production
 plan — about 13 %** — and it is aimed at a handoff that cost `nehzor_uma` on the
@@ -736,7 +855,7 @@ is the easiest trade in this document.
 **Stage 1 is the highest-leverage 4 GPU-hours here.** Gen A/B at batch 1,000 were
 cancelled by the scheduler for low utilization; gen C/D at 20,000 survived 34.5 h;
 **nothing in between has been measured.** If batch 4,000 clears the 60 % bar, stages
-2 and 6d get ~4.5x cheaper — 23 → 5 GPU-h and 346 → 81 GPU-h, a saving of ~12
+2 and 6d get ~4.5x cheaper — 23 → 5 GPU-h and 310 → 74 GPU-h, a saving of ~12
 GPU-days for two 2-hour runs. The 2-hour duration is not padding: `gpu_util_policy`
 averages over a 7,200 s window, so a shorter run cannot fill the number the cluster
 actually judges.

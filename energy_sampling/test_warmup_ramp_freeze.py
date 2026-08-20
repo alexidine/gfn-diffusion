@@ -277,3 +277,125 @@ def test_ray_actuates_normally_after_warmup():
     _past_warmup(modeller, ctrl)
     _calibrate(modeller, ctrl, alpha=1.0)
     assert _peak(ctrl) < 1.0, 'alpha* below target must cut the peak after warmup'
+
+
+# ------------------------------------------------- the ramp across a transition
+
+def _lr(modeller, key='fused', group=0):
+    return modeller.optimizers[key].param_groups[group]['lr']
+
+
+def _settled_low(modeller, ctrl, cos=-0.4, after=40):
+    """Drive a stage to a frozen envelope AND a peak well below 1.0 -- the state
+    every real stage ends in, and the one the transition has to hand over.
+
+    The min_lr floor is dropped first: the harness ships 1e-6, and the whole
+    point here is a rate two orders below seed, which the floor would clamp and
+    so hide the very discontinuity these tests measure."""
+    modeller.args.min_lr = 1.0e-12
+    _fire(modeller, ctrl, [cos] * SPAN)          # freeze the ramp
+    assert _frozen(ctrl) is not None
+    _fire(modeller, ctrl, [cos] * after)         # then let hyper cut the peak
+    assert _peak(ctrl) < 0.5, 'setup failed: the stage did not settle low'
+
+
+def test_a_stage_transition_clears_the_freeze_and_re_arms_the_ramp():
+    """THE REGRESSION, and the reason it went unseen for so long: nothing in this
+    file used to call `rearm_warmup` at all.
+
+    `rearm_warmup` resets peak_scale to 1.0 on the argument that the ramp absorbs
+    it. It did not clear `envelope_frozen_at`, so `_envelope` short-circuited on
+    the OUTGOING stage's latch and there was no ramp to absorb anything -- the
+    reset landed as a bare step. Measured on mmnxotsr (2026-08-20): train_prior
+    froze at envelope 0.1194 and phase 1 -> 2 multiplied every policy LR by 81x
+    in one optimizer step, on the same step Adam's moments were rebuilt."""
+    modeller, ctrl = _controller()
+    _settled_low(modeller, ctrl)
+
+    modeller.step_ind += 1
+    ctrl.rearm_warmup()
+
+    assert _frozen(ctrl) is None, "the outgoing stage's freeze latch survived"
+    assert ctrl.in_warmup(), 'the ramp must be running again after a transition'
+
+
+def test_the_transition_itself_changes_no_learning_rate():
+    """THE ANTI-SPIKE CLAIM, and the sharpest form of it: peak_scale goes to 1.0
+    and the rate does not move, because the envelope takes up exactly the slack.
+
+    This is what makes the reset safe. Re-introduce the bug -- drop the
+    `envelope_frozen_at` clear from `rearm_warmup` -- and this fails by the full
+    1/peak_out, which is the 81x seen live."""
+    modeller, ctrl = _controller()
+    _settled_low(modeller, ctrl)
+    before = _lr(modeller)
+    peak_out = _peak(ctrl)
+
+    modeller.step_ind += 1
+    ctrl.rearm_warmup()
+
+    assert _peak(ctrl) == 1.0, 'the reset itself must still happen'
+    assert _lr(modeller) == pytest.approx(before, rel=1e-9), (
+        f'LR jumped {_lr(modeller) / before:.1f}x across the transition '
+        f'(peak_scale {peak_out:.4g} -> 1.0 with nothing absorbing it)')
+
+
+def test_the_re_armed_ramp_climbs_from_the_outgoing_rate_back_to_seed():
+    """The ramp's two ends. It starts where the last stage was actually running
+    -- NOT at seed/lr_warmup_ratio, which on a settled stage is far hotter -- and
+    it ends at seed, never above it."""
+    modeller, ctrl = _controller()
+    _settled_low(modeller, ctrl)
+    outgoing_scale = _peak(ctrl) * ctrl._state()['envelope']
+    cold_start = 1.0 / modeller.args.lr_warmup_ratio
+    assert outgoing_scale < cold_start, (
+        'setup failed: this test is only meaningful when the outgoing stage '
+        'settled BELOW the cold-start ramp floor, which is the live case')
+
+    modeller.step_ind += 1
+    ctrl.rearm_warmup()
+    assert ctrl._state()['envelope'] == pytest.approx(outgoing_scale, rel=1e-9)
+
+    modeller.step_ind += WARMUP + 1
+    ctrl.step()
+    assert ctrl._state()['envelope'] == pytest.approx(1.0)
+    assert _lr(modeller) == pytest.approx(modeller.args.lr_fused), (
+        'the ramp must arrive at seed exactly -- the ceiling is seed, so a '
+        'stage gets one climb back to it and no further'
+    )
+    assert not ctrl.in_warmup()
+
+
+def test_a_stage_that_ran_HOTTER_than_seed_gets_no_ramp():
+    """THE NO-DECAY-LEG RULE, at the one boundary that can violate it. A stage
+    whose sensor climbed past seed hands over a scale above 1.0, and ramping
+    'from' it would be a DECAY toward seed -- a deterministic multiplier the
+    calibration would simply absorb into peak. The cut to seed lands at once."""
+    modeller, ctrl = _controller()
+    modeller.args.min_lr = 1.0e-12
+    _past_warmup(modeller, ctrl)
+    _fire(modeller, ctrl, [0.6] * 40)            # climb the peak above 1.0
+    assert _peak(ctrl) > 1.0, 'setup failed: the stage did not run hot'
+
+    modeller.step_ind += 1
+    ctrl.rearm_warmup()
+
+    assert ctrl._state()['envelope'] == 1.0
+    assert _lr(modeller) == pytest.approx(modeller.args.lr_fused)
+    assert not ctrl.in_warmup(), 'there is nothing to ramp toward'
+
+
+def test_the_transition_clears_the_freeze_rules_own_evidence():
+    """The high-water mark and the cos average describe the OUTGOING surface. A
+    carried-over high-water above the fresh peak of 1.0 reads as 'the sensor is
+    already pulling against the ramp' and re-freezes the new ramp immediately."""
+    modeller, ctrl = _controller()
+    modeller.args.min_lr = 1.0e-12
+    _past_warmup(modeller, ctrl)
+    _fire(modeller, ctrl, [0.6] * 40)            # peak_high_water climbs past 1
+    modeller.step_ind += 1
+    ctrl.rearm_warmup()
+
+    st = ctrl._state()
+    assert st['peak_high_water'] == 1.0
+    assert st.get('hyper_cos_ema') is None and st.get('hyper_cos_n') == 0

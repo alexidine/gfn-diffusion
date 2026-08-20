@@ -228,6 +228,12 @@ def test_length_mismatch_raises():
 class _StubModeller:
     """Only the attributes the real methods below actually touch."""
     log_thermo_properties = Modeller.log_thermo_properties
+    # log_thermo_properties delegates the physical block to this, which was
+    # extracted from it (2026-08-20). Bound as the REAL method, like every other
+    # name here: the point of this stub is that the wiring under test is the
+    # shipping wiring, so a stubbed stand-in would test a copy of the thing it is
+    # meant to protect.
+    log_physical_properties = Modeller.log_physical_properties
     log_nonthermal_tail = Modeller.log_nonthermal_tail
     log_test_metrics = Modeller.log_test_metrics
     log_condition_fraction = Modeller.log_condition_fraction

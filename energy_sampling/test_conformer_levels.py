@@ -95,11 +95,14 @@ def test_torsion_bitwise():
 
     # energy() is NOT bitwise any more, by design: step 2 added the change of measure.
     # At torsion it is a constant, so the difference must be EXACTLY that constant.
+    # TWO constants now, not one -- the BAT element and the chart volume element
+    # log|dq/dx|, added when log Z(c) had to become physical across molecules. Both are
+    # constant in x at this level, so this is where their presence is pinned.
     assert e.log_jacobian_const is not None
     got = e.energy(x, None, lt)
-    assert torch.allclose(got, ref_pot / t1 - e.log_jacobian_const,
+    assert torch.allclose(got, ref_pot / t1 - e.log_jacobian_const - e.log_chart_jacobian,
                           atol=1e-12, rtol=1e-12), \
-        "torsion energy() does not differ from the legacy value by exactly log J"
+        "torsion energy() does not differ from the legacy value by exactly log J + log|dq/dx|"
     print(f"PASS gate 1  torsion bitwise over 4096 states (d={e.data_ndim}); geometry and "
           f"potential exact, energy offset by exactly log J = {e.log_jacobian_const:.6f}")
 
@@ -335,7 +338,8 @@ def test_measure_term():
         for log_t in (-0.4, 0.0, 0.7):
             lt = torch.tensor(log_t, dtype=DTYPE)
             t = 10 ** lt.to(DTYPE)
-            contrib[log_t] = -e.energy(x, None, lt) + e.potential_energy(x, t) / t
+            contrib[log_t] = (-e.energy(x, None, lt) + e.potential_energy(x, t) / t
+                              - e.log_chart_jacobian)
         ref = _bat_log_jacobian(e, x)
         for log_t, c in contrib.items():
             assert torch.allclose(c, ref, atol=1e-10, rtol=1e-10), (level, log_t)
@@ -352,7 +356,8 @@ def test_measure_term():
             for log_t in (-0.4, 0.7):
                 lt = torch.tensor(log_t, dtype=DTYPE)
                 t = 10 ** lt.to(DTYPE)
-                broken[log_t] = -e.energy(x, None, lt) + e.potential_energy(x, t) / t
+                broken[log_t] = (-e.energy(x, None, lt)
+                                 + e.potential_energy(x, t) / t - e.log_chart_jacobian)
             bad_spread = float((broken[-0.4] - broken[0.7]).abs().max())
             assert bad_spread > 1e-6, \
                 "dropping the temperature pre-multiplication was NOT detected; this gate " \
@@ -363,10 +368,12 @@ def test_measure_term():
         # (c) sign and assembly: energy == potential/T - log J. Flipping the sign must fail.
         lt = torch.tensor(0.0, dtype=DTYPE)
         t = 10 ** lt.to(DTYPE)
-        assert torch.allclose(e.energy(x, None, lt), e.potential_energy(x, t) / t - ref,
+        assert torch.allclose(e.energy(x, None, lt),
+                              e.potential_energy(x, t) / t - ref - e.log_chart_jacobian,
                               atol=1e-10, rtol=1e-10), level
         assert not torch.allclose(e.energy(x, None, lt),
-                                  e.potential_energy(x, t) / t + ref,
+                                  e.potential_energy(x, t) / t + ref
+                                  - e.log_chart_jacobian,
                                   atol=1e-10, rtol=1e-10), \
             f"{level}: the measure term is symmetric under a sign flip, so this cannot " \
             f"catch a sign error -- log J is probably identically zero here"
@@ -416,20 +423,26 @@ def test_baked_energy_excludes_measure():
         assert torch.allclose(got, want, atol=1e-10, rtol=1e-10), (log_t,
                                                                    float((got - want).abs().max()))
 
-    # and at a level where the measure is state-dependent it must REFUSE, not return a
-    # measure-free reward
+    # A STATE-DEPENDENT MEASURE MUST NOT BE SILENTLY DROPPED -- but the answer is now to
+    # RECONSTRUCT it, not to refuse. prebuilt_sample_to_reward reads torsion_state off the
+    # graph above `dihedral`, which is what makes backward training, the prior buffer and
+    # the anchor seed reachable at `flex`/`full` at all; the equality is pinned by
+    # test_prebuilt_reward_matches_energy_at_every_level. What remains refusable, and is
+    # pinned HERE, is a batch carrying the baked scalar but NO state: that is unscoreable
+    # at this level and must say so rather than return a measure-free number.
     ef = _energy(PROPANOL, level="full")
     m = _Mols()
     m.conformer_energy = bake_energies(ef, torch.zeros(4, ef.data_ndim, dtype=DTYPE))
+    assert ef.log_jacobian_const is None, "full should have a state-dependent measure"
     try:
         ef.prebuilt_sample_to_reward(m, torch.tensor(1.0, dtype=DTYPE))
-    except NotImplementedError:
-        pass
+    except Exception:
+        pass          # any refusal is fine; a stateless batch cannot be scored here
     else:
-        raise AssertionError("prebuilt_sample_to_reward silently dropped a state-dependent "
-                             "measure term at level 'full'")
-    print("PASS         baked energy is measure-free; read side reconstructs log R at any T "
-          "and refuses when the measure is state-dependent")
+        raise AssertionError("prebuilt_sample_to_reward returned a reward for a batch with "
+                             "no torsion_state, so the state-dependent measure was dropped")
+    print("PASS         baked energy is measure-free; read side reconstructs log R at any T, "
+          "and refuses a batch that carries no state")
 
 
 # ------------------------------------------------------------------- the prior
@@ -670,7 +683,17 @@ def test_float32_default_is_sound():
     anything compounding through the NeRF chain would blow past this.
     """
     from mxtaltools.conformers.builder import closure_length, log_jacobian
-    assert ConformerTorsions(smiles=PROPANOL, device="cpu", level="full").dtype         is torch.float32, "the shipped default is no longer float32"
+    # the contract is FOLLOW THE DEFAULT, not "always float32". A pinned float32 does not
+    # fail against train_conformer.run()'s deliberate float64 -- it silently downcasts and
+    # hands float32 rewards to a float64 policy, which nothing reports.
+    saved = torch.get_default_dtype()
+    try:
+        for want in (torch.float32, torch.float64):
+            torch.set_default_dtype(want)
+            got = ConformerTorsions(smiles=PROPANOL, device="cpu", level="full").dtype
+            assert got is want,                 f"default dtype {want} but energy built {got}: it is pinned, not following"
+    finally:
+        torch.set_default_dtype(saved)
 
     for smi in (PROPANOL, "CCC1CCCCC1"):
         e64 = ConformerTorsions(smiles=smi, device="cpu", level="full",
@@ -705,12 +728,248 @@ def test_float32_default_is_sound():
     print("PASS         float32 default agrees with float64 on U, log J and closure")
 
 
+LINEAR_SET = [('acetonitrile', 'CC#N'), ('butyronitrile', 'CCCC#N'),
+              ('propargyl alcohol', 'C#CCO'), ('propanol', 'CCCO'),
+              ('azide', 'CCN=[N+]=[N-]'), ('allene', 'CC=C=CC'),
+              ('diphenylacetylene', 'c1ccccc1C#Cc1ccccc1'),
+              ('ala-dipeptide', 'CC(=O)NC(C)C(=O)NC')]
+
+
+def test_chart_is_a_function_of_the_graph():
+    """Under MMFF the chart must not depend on the embedding seed, and `d` with it.
+
+    Linearity decides which DoF are HELD, so it decides `d` -- acetonitrile is 11, not
+    3N-6 = 12. Measured off a reference conformer that is a hazard: the same molecule could
+    get a different chart from a different seed, which would silently reinterpret every
+    stored state. MMFF types its angles from the graph, so theta0 >= 179.99 removes the
+    hazard by construction.
+
+    THREE ASSERTIONS, because the swap is only free if the routes agree. The hazard was
+    latent rather than observed, so this gate is what keeps it that way.
+    """
+    for name, smi in LINEAR_SET:
+        charts = set()
+        for seed in range(4):
+            e = ConformerTorsions(smiles=smi, device="cpu", level="full",
+                                  force_field="mmff", seed=seed)
+            charts.add((e.data_ndim, int(e.angle_is_linear.sum()),
+                        int(e.torsion_frame_is_linear.sum())))
+        assert e.linearity_source == 'mmff_typed', e.linearity_source
+        assert len(charts) == 1,             '{}: the chart varies with the embedding seed: {}'.format(name, charts)
+
+        # the graph-determined route must agree with what measuring the conformer says --
+        # if these ever diverge the chart is ambiguous and one of them is wrong
+        pos = np.asarray(e.ref_pos.detach().cpu().numpy())
+        ai = np.asarray(e.spec.angle_index)
+        u = pos[ai[:, 0]] - pos[ai[:, 1]]
+        v = pos[ai[:, 2]] - pos[ai[:, 1]]
+        ang = np.degrees(np.arctan2(np.linalg.norm(np.cross(u, v), axis=-1),
+                                    (u * v).sum(-1)))
+        measured = ang > ConformerTorsions.LINEAR_TOL_DEG
+        assert np.array_equal(measured, e.angle_is_linear), (
+            '{}: MMFF-typed linearity disagrees with the measured geometry on rows {} -- '
+            'the chart is ambiguous'.format(name, np.flatnonzero(measured != e.angle_is_linear)))
+
+        # and no angle may sit near the threshold, or the agreement above is luck
+        margin = float(np.abs(ang - ConformerTorsions.LINEAR_TOL_DEG).min())
+        assert margin > 2.0, (
+            '{}: an angle sits {:.2f} deg from the linearity threshold, so the measured '
+            'route is one embedding away from a different chart'.format(name, margin))
+    print("PASS         chart is graph-determined under MMFF; typed and measured agree "
+          "on 8 molecules, nearest approach to the threshold > 2 deg")
+
+
+def test_chart_volume_element():
+    """log|dq/dx| must be in the reward, constant in x, and T-invariant in log_reward.
+
+    The sampler proposes x on the latent box; the Boltzmann density lives on the internal
+    coordinates. dof_from_state writes q_free = ref + scale * x, so the two measures differ
+    by prod_j scale_j. Carrying only the BAT term gives a density on q, and the sampler
+    does not propose q.
+
+    WHY NOTHING CAUGHT THIS. It is CONSTANT in x, so it cancels out of every TB residual
+    and shifts only log Z -- no unconditional result depends on it. The gate therefore has
+    to assert the thing that makes it matter: that the constant DIFFERS across molecules,
+    which is what makes log Z(c) non-physical without it.
+    """
+    e = _energy(PROPANOL, level="full", force_field="mmff")
+    assert abs(e.log_chart_jacobian - float(torch.log(e._free_scale).sum())) < 1e-12
+
+    torch.manual_seed(7)
+    x = torch.rand(32, e.data_ndim, dtype=DTYPE, device=DEVICE) * 1.6 - 0.8
+    r, th, _ = e.dof_from_state(x)
+    bat = 2.0 * torch.log(r).sum(-1) + torch.log(torch.sin(th)).sum(-1)
+
+    # the chart term's contribution to log_reward is the constant, at ANY temperature
+    contrib = {}
+    for log_t in (-0.4, 0.0, 0.7):
+        lt = torch.tensor(log_t, dtype=DTYPE)
+        t = 10 ** lt.to(DTYPE)
+        c = -e.energy(x, None, lt) + e.potential_energy(x, t) / t - bat
+        assert float(c.max() - c.min()) < 1e-9,             "the chart term is not constant in x at logT={}".format(log_t)
+        contrib[log_t] = float(c.mean())
+    for log_t, c in contrib.items():
+        assert abs(c - e.log_chart_jacobian) < 1e-8, (log_t, c, e.log_chart_jacobian)
+    spread = max(contrib.values()) - min(contrib.values())
+    assert spread < 1e-8,         "the chart term scales with temperature: {:.2e}. It is a change of measure and "         "must contribute the same to log_reward at every T".format(spread)
+
+    # ...and it is NOT a global constant -- this is why it cannot be ignored conditionally
+    vals = {}
+    for smi in (PROPANOL, "CCCCCCO", "CCC1CCCCC1"):
+        vals[smi] = _energy(smi, level="full", force_field="mmff").log_chart_jacobian
+    rng = max(vals.values()) - min(vals.values())
+    assert rng > 1.0, (
+        "log|dq/dx| is nearly the same on every molecule ({:.3f} nats apart), so this gate "
+        "cannot show why it matters conditionally".format(rng))
+    print("PASS         chart volume element in the reward, constant in x, T-invariant; "
+          "spans {:.1f} nats across three molecules".format(rng))
+
+
+def test_prebuilt_reward_matches_energy_at_every_level():
+    """A baked reward must equal the live one -- including where log J varies per row.
+
+    prebuilt_sample_to_reward used to RAISE above `dihedral`: log J is state-dependent
+    there, and a baked scalar alone is not a reward. That made backward training, the
+    prior buffer and the anchor seed unreachable at `flex`/`full`, which is most of the
+    machinery. It is reconstructible because the graph carries the state that produced the
+    scalar, so this asserts the reconstruction rather than the refusal.
+
+    Compared against energy() itself, not a restatement of the formula, so a change to
+    either side fails here instead of the two drifting apart.
+    """
+    from energies.conformer_data import attach_states, bake_energies, condition_from_energy
+
+    for level in ("torsion", "dihedral", "flex", "full"):
+        e = _energy(PROPANOL, level=level, force_field="mmff")
+        torch.manual_seed(0)
+        x = torch.rand(64, e.data_ndim, dtype=DTYPE, device=DEVICE) * 1.6 - 0.8
+        baked = bake_energies(e, x)
+        cond = condition_from_energy(e, identifier=PROPANOL)
+        batch = attach_states(cond, x, baked, identifier=PROPANOL)
+
+        got = e.prebuilt_sample_to_reward(batch, torch.tensor(float(e.temperature),
+                                                              dtype=DTYPE))
+        want = -e.energy(x)
+        d = float((got - want).abs().max())
+        assert d < 1e-6, "{}: prebuilt reward differs from energy() by {:.2e}".format(level, d)
+
+        # and the per-row branch is genuinely exercised above dihedral, or this gate is
+        # only testing the constant case it always passed
+        if level in ("flex", "full"):
+            assert e.log_jacobian_const is None,                 "{}: log J is constant, so the state-dependent path never ran".format(level)
+    print("PASS         prebuilt reward == energy() at all four levels, including the "
+          "per-row log J branch")
+
+
+def test_return_exp_gives_a_scored_batch():
+    """``energy(return_exp=True)`` must hand back a GRAPH BATCH in the buffers' currency.
+
+    Two separate failures this pins, both of which corrupt buffers rather than raise:
+
+      1. Returning ``pos`` (a Tensor) instead of a batch. Every consumer of return_exp --
+         fwd_eval_sampling, get_loss_reward, replay admission, the anchor screen -- indexes
+         it row-wise and appends it, exactly as the crystal route does. A tensor dies at
+         the first ``num_graphs``, but only once eval runs.
+      2. Baking the WRONG energy. ``conformer_energy`` is raw potential at T = 1; ``e`` is
+         E/T with both measure terms folded in. Storing ``e`` would make rows admitted from
+         a rollout a different currency from rows in the prior dataset, and the buffers
+         would silently mix them. So the read-back through prebuilt_sample_to_reward has to
+         return exactly -energy(), which is what fails if the wrong scalar is stored.
+    """
+    from energies.conformer_data import batch_states, collate_conditions, condition_from_energy
+
+    for level in ConformerTorsions.LEVELS:
+        ef = _energy(PROPANOL, level=level)
+        cond = condition_from_energy(ef, identifier=PROPANOL)
+        n = 8
+        batch = collate_conditions([cond.__copy__() for _ in range(n)])
+        x = (torch.rand(n, ef.data_ndim, dtype=DTYPE) * 2 - 1) * 0.2
+        e, sb = ef.energy(x, mol_batch=batch, log_temperature=torch.zeros(n, dtype=DTYPE),
+                          return_exp=True)
+
+        assert hasattr(sb, 'num_graphs'),             f"{level}: return_exp gave {type(sb).__name__}, not a graph batch"
+        assert sb.num_graphs == n, f"{level}: {sb.num_graphs} graphs for {n} rows"
+        assert torch.allclose(batch_states(sb), x, atol=1e-5),             f"{level}: the batch does not carry the state that was scored"
+
+        back = ef.prebuilt_sample_to_reward(sb, torch.ones(n, dtype=DTYPE))
+        d = (back - (-e)).abs().max().item()
+        assert d < 2e-3, (f"{level}: a row read back off the scored batch gives log R "
+                          f"differing from -energy() by {d:.3e} -- the stored "
+                          f"conformer_energy is not in bake_energies' currency")
+
+    # and with no batch to write onto it must SAY so rather than invent one
+    ef = _energy(PROPANOL, level="full")
+    try:
+        ef.energy(torch.zeros(4, ef.data_ndim, dtype=DTYPE), mol_batch=None,
+                  log_temperature=torch.zeros(4, dtype=DTYPE), return_exp=True)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("energy(return_exp=True, mol_batch=None) returned something "
+                             "instead of refusing")
+    print("PASS         return_exp yields a scored graph batch whose rows read back as "
+          "-energy() at every level")
+
+
+def test_wrap_never_folds_a_linear_column():
+    """A LINEAR state column outside the box must survive intact; a PERIODIC one must wrap.
+
+    THE BUG THIS PINS. wrap_state used to take no mask and wrap every column, and it sat on
+    both the prior-dataset build and the rollout write path. At `flex` and above the state
+    carries r/theta, so a bond-length latent at 1.3 folded to -0.7 -- the opposite corner
+    of the box -- with a plausible energy and nothing raised. It also made the in-box eval
+    metrics TAUTOLOGICAL: they read the stored state, which wrapping had already forced
+    inside the box, so 'all bonds in range' could never report a violation.
+
+    The earlier round-trip gate missed this because it drew states in [-0.2, 0.2] -- inside
+    the box, where wrapping is the identity. So this one deliberately goes OUT of the box.
+    """
+    from energies.conformer_data import (batch_states, collate_conditions,
+                                         condition_from_energy, set_batch_states, wrap_state)
+
+    ef = _energy(PROPANOL, level="full")
+    per = torch.as_tensor(ef.periodic_dims, dtype=torch.bool)
+    lin = ef._lin_free_idx
+    assert lin.numel() and bool(per.any()), "propanol at 'full' should have both kinds"
+
+    x = torch.zeros(4, ef.data_ndim, dtype=DTYPE)
+    x[:, lin[0]] = 1.3                       # a bond length OUTSIDE the box
+    x[:, int(torch.nonzero(per).flatten()[0])] = 1.4     # a torsion outside (-1, 1]
+
+    w = wrap_state(x, ef.periodic_dims)
+    assert torch.allclose(w[:, lin[0]], torch.full((4,), 1.3, dtype=DTYPE)),         f"wrap_state folded a LINEAR column: 1.3 -> {w[0, lin[0]].item()}"
+    j = int(torch.nonzero(per).flatten()[0])
+    assert torch.allclose(w[:, j], torch.full((4,), -0.6, dtype=DTYPE), atol=1e-5),         f"wrap_state failed to wrap a PERIODIC column: 1.4 -> {w[0, j].item()}"
+
+    # and the same must hold through the batch write path, or the buffers store a state
+    # that was never scored
+    cond = condition_from_energy(ef, identifier=PROPANOL)
+    batch = collate_conditions([cond.__copy__() for _ in range(4)])
+    set_batch_states(batch, x, periodic=ef.periodic_dims)
+    back = batch_states(batch)
+    assert torch.allclose(back[:, lin[0]], torch.full((4,), 1.3, dtype=DTYPE)),         "set_batch_states folded an out-of-box bond length"
+
+    # a mask of the wrong width must RAISE rather than broadcast into nonsense
+    try:
+        wrap_state(x, torch.ones(3, dtype=torch.bool))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("wrap_state accepted a mask of the wrong width")
+    print("PASS         wrap_state leaves linear columns alone and wraps periodic ones")
+
+
 TESTS = [test_torsion_bitwise, test_rotatable_axes_ordered, test_layout_reaches_gfn,
          test_domain_guarantee, test_level_cannot_be_swallowed, test_linearity_is_measured,
          test_propanol_widths, test_measure_term, test_baked_energy_excludes_measure,
          test_state_dof_roundtrip, test_internal_prior_beats_uniform,
          test_ring_closure, test_ring_bank_rules,
-         test_stale_ring_signature_detected, test_float32_default_is_sound]
+         test_stale_ring_signature_detected, test_float32_default_is_sound,
+         test_chart_is_a_function_of_the_graph,
+         test_chart_volume_element,
+         test_prebuilt_reward_matches_energy_at_every_level,
+         test_return_exp_gives_a_scored_batch,
+         test_wrap_never_folds_a_linear_column]
 
 if __name__ == "__main__":
     torch.set_default_dtype(DTYPE)

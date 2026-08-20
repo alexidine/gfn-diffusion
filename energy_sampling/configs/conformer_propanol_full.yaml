@@ -1,0 +1,94 @@
+# Propanol at `full`, d=30 -- an exploratory run, not a validated result.
+#
+# NO EXACT REFERENCE EXISTS HERE. Quadrature dies past k=3, so brute_force_grid returns
+# None and there is no ground-truth log Z to check against, and no exact Boltzmann
+# reference buffer either -- TerminalBuffers falls to prior_frac 1.0 and every backward
+# terminal comes from the prior. Read this run for BEHAVIOUR (does the loss fall, does
+# log Z settle, do the figures look sane), not for correctness.
+#
+# THE FITTED PRIOR IS THE POINT. Uniform-on-box at `full` puts every bond length and angle
+# independently anywhere in its box -- ~300 kcal/mol of strain in every backward terminal.
+# internal_prior_path routes through sample_prior_states, which draws r/theta at the force
+# field's own thermal widths and torsions jointly per group.
+run_name: conformer_propanol_full_aug19
+tag: ladder1
+seed: 0
+device: cuda
+wandb_mode: online
+num_threads: 2
+problem:
+  smiles: CCCO
+  level: 'full'
+  epsilon: 0.1
+  log_temperature: 0.0
+  min_separation: 3
+  scale_14: 0.5
+  lj_k_factor: 2.5
+  include_trivial_rotations: false
+  delta_r_max: 0.3
+  delta_theta_max: 0.5
+  bounding_coeff: 10.0
+  r_floor: 0.5
+  theta_floor: 0.001
+integrator:
+  T: 32
+model:
+  policy_hidden_dim: 128
+  policy_layers: 3
+  s_emb_dim: 128
+  harmonics_dim: 128
+  t_dim: 128
+  flow_hidden_dim: 128
+  flow_layers: 2
+  t_scale: 0.05
+  zero_init: true
+  clipping: true
+  gfn_clip: 10000.0
+lr_policy: 1.953125e-05
+lr_back: 1.953125e-05
+lr_replay: 1.953125e-05
+lr_fused: 9.765625e-06
+lr_flow: 0.025
+min_lr: 1.0e-06
+lr_warmup_ratio: 100
+gradient_norm_clip: 1.0
+grad_clip_guard:
+  enabled: true
+  p: 0.99
+  eta: 0.01
+  warmup_steps: 100
+  warmup_clip: static
+  max_ratio: 100.0
+  refresh_on_stage: true
+weight_decay: 0.0001
+use_weight_decay: false
+adaptive_lr:
+  warmup_steps: 200
+  divergence_loss_abs: 1000000000.0
+  divergence_grad_abs: 1000000000.0
+  divergence_cut: 0.5
+  envelope_freeze: true
+training:
+  steps: 6000
+  batch_size: 256
+  grow_batch_size: true
+  max_batch_size: 4096
+  batch_growth_factor: 1.65
+  batch_growth_interval: 50
+  batch_growth_slow_interval: 300
+  auto_batch_throughput_opt: true
+  batch_growth_min_throughput_gain: 0.05
+  gpu_util_window_s: 900
+  gpu_util_sample_period_s: 60
+  gpu_util_policy_window_s: 7200
+  exploration_std: 0.0
+  buffer_path: null
+  bwd_frac: 0.5
+  internal_prior_path: conformer_prior_v2.pt
+  prior_seed: 0
+eval:
+  report_every: 500
+  figs_period: 1000
+  brute_force_grid: 512
+  out: 'conformer_propanol_full.json'
+project_state_version: 9

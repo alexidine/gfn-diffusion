@@ -227,9 +227,29 @@ class RingModes:
         return (c @ self.components) * self.scale
 
 
-def wrap_state(x):
-    """Wrap to the state space (-1, 1]. Period 2, NOT 2*pi -- see conformer_torsions."""
-    return (x + 1.0) % 2.0 - 1.0
+def wrap_state(x, periodic):
+    """Wrap the PERIODIC columns to (-1, 1]. Period 2, NOT 2*pi -- see conformer_torsions.
+
+    ``periodic`` IS REQUIRED, and this used to wrap everything. From `flex` up the state
+    carries linear blocks (r, theta) and wrapping one of those is not merely imprecise: a
+    bond-length latent at 1.3 folds to -0.7, the OPPOSITE corner of the box, with a
+    perfectly plausible energy and no error raised anywhere. The identical hazard is
+    already documented on train_conformer.wrap_state, which has always required the mask;
+    this copy did not, and was reachable from both the prior-dataset build and the rollout
+    write path.
+
+    Pass ``True`` to wrap every column only if the caller genuinely has an all-periodic
+    state (e.g. `torsion`/`dihedral`), and pass it explicitly so the choice is visible.
+    """
+    x = torch.as_tensor(x)
+    wrapped = (x + 1.0) % 2.0 - 1.0
+    if periodic is True:
+        return wrapped
+    m = torch.as_tensor(periodic, dtype=torch.bool, device=x.device).reshape(-1)
+    if m.numel() != x.shape[-1]:
+        raise ValueError(f"periodic mask has {m.numel()} entries for a state of width "
+                         f"{x.shape[-1]}")
+    return torch.where(m, wrapped, x)
 
 
 # ---------------------------------------------------------------- construction
@@ -475,6 +495,46 @@ def batch_states(batch) -> torch.Tensor:
     return batch.torsion_state.reshape(batch.num_graphs, state_dim(batch))
 
 
+def set_batch_states(batch, states, energies=None, gfn_energy=None,
+                     periodic=None):
+    """Attach ``torsion_state`` (and optionally ``conformer_energy``) to an EXISTING batch.
+
+    The write-side counterpart of ``batch_states``. ``attach_states`` builds a batch by
+    replicating one condition graph per row, which is right when preparing a prior file
+    from scratch; this is for the case where the batch already exists with one graph per
+    row -- a forward-eval rollout, a replay admission -- and only the per-row state and its
+    energy are missing. Replicating there would rebuild graphs that are already correct.
+
+    ``energies`` must be RAW POTENTIAL at T = 1, the ``bake_energies`` convention, because
+    ``prebuilt_sample_to_reward`` divides the stored scalar by the sampling temperature and
+    adds the measure back afterwards. Storing anything else (an E/T, or a value with the
+    measure folded in) makes rows from this path a different currency from prior rows, and
+    nothing downstream would report the mismatch -- the buffers would simply mix them.
+
+    ``gfn_energy`` is a DIFFERENT quantity and deliberately a separate argument: it is the
+    energy the GFN actually sees, BEFORE the division by temperature, which is the crystal
+    convention (``molecular_crystal.energy`` attaches it and then returns
+    ``energy / temperature``). It is what the eval publishes as 'Mean Sample Energy'.
+    """
+    states = torch.as_tensor(states)
+    # periodic=None means DO NOT WRAP, rather than wrap everything. A caller that
+    # does not know which columns wrap must not be guessing on the linear ones.
+    states = states.reshape(batch.num_graphs, -1)
+    if periodic is not None:
+        states = wrap_state(states, periodic)
+    k = state_dim(batch)
+    if states.shape[1] != k:
+        raise ValueError(f"states are {states.shape[1]}-dimensional but the batch has "
+                         f"k = {k}")
+    batch.add_graph_attr(states.to(batch.pos.dtype).to(batch.pos.device), 'torsion_state')
+    for values, name in ((energies, 'conformer_energy'), (gfn_energy, 'gfn_energy')):
+        if values is None:
+            continue
+        values = torch.as_tensor(values).reshape(batch.num_graphs)
+        batch.add_graph_attr(values.to(batch.pos.dtype).to(batch.pos.device), name)
+    return batch
+
+
 def dof_rank(batch) -> torch.Tensor:
     """Per-atom DoF ownership rank, ``min(slot, 3)`` -- see ``ctree_round``."""
     return batch.ctree_round.clamp(max=3)
@@ -616,7 +676,8 @@ def states_to_positions(batch, state: torch.Tensor) -> torch.Tensor:
 # ------------------------------------------------- state-bearing (prior) rows
 
 
-def attach_states(condition: MolData, states, energies, identifier: Optional[str] = None):
+def attach_states(condition: MolData, states, energies,
+                  identifier: Optional[str] = None, periodic=None):
     """Replicate one condition graph per state, into the batch a prior file holds.
 
     One graph per row is what the buffer *is*: it holds a resident batch and indexes it
@@ -633,7 +694,9 @@ def attach_states(condition: MolData, states, energies, identifier: Optional[str
     """
     dtype = condition.pos.dtype
     states = torch.as_tensor(states, dtype=dtype)
-    states = wrap_state(states.reshape(states.shape[0], -1))
+    states = states.reshape(states.shape[0], -1)
+    if periodic is not None:
+        states = wrap_state(states, periodic)
     energies = torch.as_tensor(energies, dtype=dtype).flatten()
     k = int(condition.n_torsions)
 

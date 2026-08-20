@@ -704,6 +704,11 @@ class LRController:
             # from before these existed simply starts the average fresh.
             'hyper_cos_ema': None,
             'hyper_cos_n': 0,
+            # WHERE THE RAMP STARTS. At a cold start there is no previous rate to
+            # continue from, so it is the configured 1/lr_warmup_ratio below seed;
+            # at a stage transition `rearm_warmup` overwrites it with the rate the
+            # OUTGOING stage was actually running.
+            'ramp_from': 1.0 / self.modeller.args.lr_warmup_ratio,
             'envelope': 1.0 / self.modeller.args.lr_warmup_ratio,
         }
 
@@ -744,12 +749,39 @@ class LRController:
         re-climb to get back to it. That cost is accepted in exchange for never
         carrying a stale verdict across a surface change.
 
+        BUT THE RESET IS ONLY SAFE BECAUSE THE RAMP ABSORBS IT, so this method
+        owns re-arming the ramp as much as it owns the reset, and the two are
+        one transaction:
+
+          `ramp_from` <- the scale the OUTGOING stage was actually running
+                         (peak x envelope), so peak_scale -> 1.0 changes no
+                         learning rate on the transition step itself. The ramp
+                         then walks that back up to seed, and a stage that ran
+                         hotter than seed gets no ramp (see `_ramp_from`).
+          `envelope_frozen_at` <- None, or the outgoing stage's freeze latch
+                         short-circuits `_envelope` and there is NO RAMP AT ALL
+                         to absorb the reset. Measured, mmnxotsr 2026-08-20:
+                         train_prior froze its ramp at envelope 0.1194 and the
+                         latch survived every later transition, so phase 1 -> 2
+                         landed as a bare 81x step in ONE optimizer step, on the
+                         same step Adam's moments were rebuilt. This method used
+                         to print "LR re-warming" and then not re-warm.
+          `peak_high_water` / `hyper_cos_*` <- the freeze rules' own evidence,
+                         which describes the outgoing surface.
+
         Returns the warmup length in TRAIN STEPS."""
         m = self.modeller
         st = self._state()
         st['phase_seen'] = m.phase
         self._ceiling = None
+        # READ BEFORE RESETTING: this is the rate the outgoing stage settled on.
+        outgoing = float(st.get('peak_scale', 1.0)) * float(st.get('envelope', 1.0))
+        st['ramp_from'] = outgoing
         st['peak_scale'] = 1.0
+        st['peak_high_water'] = 1.0
+        st['envelope_frozen_at'] = None
+        st['hyper_cos_ema'] = None
+        st['hyper_cos_n'] = 0
         st['restart_step'] = int(m.step_ind)
         st['stage_start_step'] = int(m.step_ind)
         # the relative divergence bar's reference is per stage -- see
@@ -758,7 +790,17 @@ class LRController:
         st['rel_loss'] = {}
         st['envelope'] = self._envelope(st)
         self._apply_lrs(st)
-        return int(self._cfg('warmup_steps', 1000))
+        warmup_steps = int(self._cfg('warmup_steps', 1000))
+        start = self._ramp_from(st)
+        if start >= 1.0:
+            print(f"lr_ctrl: no warmup ramp -- the outgoing stage was running at "
+                  f"scale {outgoing:.4g}, at or above seed, so peak_scale 1.0 "
+                  f"applies immediately")
+        else:
+            print(f"lr_ctrl: warmup ramp re-armed -- envelope {start:.4g} -> 1.0 "
+                  f"over {warmup_steps} train steps ({1.0 / start:.1f}x), "
+                  f"continuing the outgoing stage's rate")
+        return warmup_steps
 
     # ----------------------------------------------------------------- envelope
 
@@ -775,6 +817,11 @@ class LRController:
         FROZEN: the envelope is then a constant, the rate is no longer being
         walked, and a reading is ordinary evidence again.
 
+        It expires the same way when there is NOTHING TO RAMP -- `ramp_from` at
+        1.0, which is what a stage that ran at or above seed hands over. The
+        envelope is a constant there too, so holding the sensor for the warmup
+        budget would be the same dead time with no suppression to justify it.
+
         Keying the hold on `warmup_steps` alone kept the sensor mute for the rest
         of the budget after an early freeze. Measured, run
         newlogic_qm9cond_newlogic 2026-08-17: var_conditioning opened at step
@@ -784,12 +831,39 @@ class LRController:
         hypergrads stuck at 0.
         """
         return (st.get('envelope_frozen_at') is None
+                and self._ramp_from(st) < 1.0
                 and self._elapsed(st) < int(self._cfg('warmup_steps', 1000)))
 
+    def _ramp_from(self, st):
+        """The envelope value the current ramp starts at, in (0, 1].
+
+        Clamped to 1.0 at the top because THE RAMP HAS NO DECAY LEG: a stage
+        whose outgoing rate was at or above seed gets no ramp at all (the
+        exponent below collapses to 1.0 everywhere), which is the cut to seed
+        that `rearm_warmup` intends, applied at once rather than annealed."""
+        v = st.get('ramp_from')
+        if v is None:                     # state restored from before this key
+            v = 1.0 / float(self.modeller.args.lr_warmup_ratio)
+        return min(1.0, max(1e-12, float(v)))
+
     def _envelope(self, st):
-        """Ramp -> hold, in [1/lr_warmup_ratio, 1.0]. No decay leg: the
-        calibration rates the PRODUCT peak x envelope, so a deterministic
-        multiplier on it is absorbed and only inflates peak against its bounds."""
+        """Ramp -> hold, in [ramp_from, 1.0]. No decay leg: the calibration rates
+        the PRODUCT peak x envelope, so a deterministic multiplier on it is
+        absorbed and only inflates peak against its bounds.
+
+        THE RAMP STARTS AT THE OUTGOING RATE, NOT AT A FIXED FRACTION OF SEED.
+        A fixed 1/lr_warmup_ratio floor is anchored to `seed_lr`, and a stage
+        that ran for thousands of steps has usually moved a long way from it --
+        so "reset to a low rate and re-ramp" would reset to a rate far ABOVE the
+        one the run had settled on. Measured, mmnxotsr 2026-08-20: train_prior
+        exited at peak_scale 0.0113 x envelope 0.1194 = 1.7e-7, while
+        seed_lr/lr_warmup_ratio is 1.25e-5 -- the "low" starting point was 74x
+        HOTTER than the rate it was meant to be lower than. Starting at the
+        outgoing scale makes the boundary continuous in LR by construction.
+
+        The ceiling stays 1.0 (= seed): every stage gets one ramp back up to the
+        seed rate and no further, with `bounds` remaining the sensor's own
+        post-ramp exploration range."""
         # A FROZEN envelope short-circuits the ramp -- see _maybe_freeze_envelope.
         frozen = st.get('envelope_frozen_at')
         if frozen is not None:
@@ -798,7 +872,7 @@ class LRController:
         elapsed = self._elapsed(st)
         if elapsed >= warmup_steps:
             return 1.0
-        return (1.0 / self.modeller.args.lr_warmup_ratio) ** (1.0 - elapsed / warmup_steps)
+        return self._ramp_from(st) ** (1.0 - elapsed / warmup_steps)
 
     # ----------------------------------------------------------------- actuator
 
@@ -955,8 +1029,9 @@ class LRController:
         anything the ramp would have reached. Freezing early costs some warmup, not
         the operating point.
 
-        Per stage: `_fresh_state` clears both fields, so each stage ramps and
-        freezes on its own evidence.
+        Per stage: `_fresh_state` at a cold start and `rearm_warmup` at every
+        transition clear both fields, so each stage ramps and freezes on its own
+        evidence.
         """
         if st.get('envelope_frozen_at') is not None:
             return
@@ -992,8 +1067,9 @@ class LRController:
                   (_maybe_freeze_envelope, above)
 
         Idempotent, so a second trigger in the same stage is a no-op rather than
-        re-latching at a lower envelope. `_fresh_state` clears the field, so each
-        stage ramps and freezes on its own evidence.
+        re-latching at a lower envelope. `_fresh_state` (cold start) and
+        `rearm_warmup` (every transition) clear the field, so each stage ramps
+        and freezes on its own evidence.
 
         `envelope_freeze: false` still means FREEZE OFF, and it is honoured
         here rather than at each caller so the off switch cannot be bypassed by
@@ -1060,7 +1136,13 @@ class LRController:
             'lr_ctrl/envelope': st['envelope'],
             'lr_ctrl/peak_scale': st['peak_scale'],
             'lr_ctrl/scale': st['envelope'] * st['peak_scale'],
-            'lr_ctrl/warmup': float(self._elapsed(st) < int(self._cfg('warmup_steps', 1000))),
+            # THE RAMP, NOT THE STEP BUDGET. This used to read
+            # elapsed < warmup_steps, which reports 1 for the full budget after
+            # an early freeze -- so the metric claimed a ramp was running while
+            # the envelope was a constant, and disagreed with in_warmup(), the
+            # predicate the sensors actually gate on.
+            'lr_ctrl/warmup': float(self._ramping(st)),
+            'lr_ctrl/ramp_from': self._ramp_from(st),
             'lr_ctrl/divergences': float(self._divergences),
             'lr_ctrl/calibrations': float(self._calibrations),
         }

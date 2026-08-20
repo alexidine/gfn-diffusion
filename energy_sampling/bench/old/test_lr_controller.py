@@ -386,6 +386,7 @@ def test_rearm_warmup_resets_peak_and_forgets_the_ceiling():
     m.lr_controller.on_calibration(_reading(1024.0))
     m.lr_controller.on_divergence()
     assert m.lr_controller._current_ceiling() is not None
+    before = m.lr_of('fwd')
 
     m.step_ind = 4000
     warmup = m.lr_controller.rearm_warmup()
@@ -393,7 +394,24 @@ def test_rearm_warmup_resets_peak_and_forgets_the_ceiling():
     assert m.lr_ctrl['peak_scale'] == 1.0
     assert m.lr_controller._current_ceiling() is None
     assert m.lr_controller.in_warmup() is True
-    assert m.lr_of('fwd') == pytest.approx(m.args.lr_policy / m.args.lr_warmup_ratio, rel=1e-6)
+
+    # THE RAMP STARTS AT THE OUTGOING RATE (2026-08-20), not at a fixed fraction
+    # of seed. This assertion used to read
+    #     lr == lr_policy / lr_warmup_ratio
+    # which anchors the restart to `seed_lr` -- and a stage that has run for
+    # thousands of steps has usually moved a long way from seed, so that rule
+    # could RAISE the rate at a transition rather than lower it. Measured on
+    # mmnxotsr: train_prior exited at peak 0.0113 x envelope 0.1194 = 1.7e-7 and
+    # phase 1 -> 2 landed as a bare 81x step in one optimizer step.
+    #
+    # So assert the CONTRACT rearm_warmup documents rather than a value:
+    # peak_scale going to 1.0 changes no learning rate on the transition step,
+    # because the ramp absorbs the reset (here peak 0.5 x env 0.1 becomes
+    # peak 1.0 x env 0.05). A hardcoded number would simply re-rot the next time
+    # the ramp rule moves.
+    assert m.lr_of('fwd') == pytest.approx(before, rel=1e-9), \
+        'the reset was not absorbed by the ramp -- the transition moved the LR'
+    assert m.lr_ctrl['envelope'] == pytest.approx(0.05, rel=1e-9)
 
 
 def test_stale_state_is_discarded_never_reinterpreted():

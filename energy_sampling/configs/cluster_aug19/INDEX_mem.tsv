@@ -1,0 +1,6 @@
+name	problem	batch	epochs
+cluster_aug19_mem0_mace_control	mace	100	200
+cluster_aug19_mem1_mace_gc	mace	100	200
+cluster_aug19_mem2_mace_split	mace	100	200
+cluster_aug19_mem3_mace_trajckpt	mace	100	200
+cluster_aug19_mem4_mace_cap97	mace	100	200

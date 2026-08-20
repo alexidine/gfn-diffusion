@@ -44,13 +44,19 @@ class _Bag:
         self.__dict__.update(kw)
 
 
-def _controller(**adaptive_overrides):
+def _controller(lr_warmup_ratio=1, **adaptive_overrides):
+    """`lr_warmup_ratio` DEFAULTS TO 1, i.e. NO RAMP: the envelope is pinned at
+    1.0 from step 0, so every test that is about the actuator alone sees the
+    operating rate directly. Tests about the RAMP must pass a real ratio -- with
+    1, the envelope never moves and `LRController._ramping` correctly reports
+    that there is nothing to hold the sensor for."""
     adaptive = dict(warmup_steps=0, seed_lr=SEED_LR, bounds=(0.01, 2000.0),
                     divergence_loss_abs=1.0e9, divergence_grad_abs=1.0e9,
                     divergence_cut=0.5, envelope_freeze_drop=None,
                     restart_after=None, control_flow_lr=False)
     adaptive.update(adaptive_overrides)
-    args = _Bag(adaptive_lr=_Bag(**adaptive), lr_warmup_ratio=1, min_lr=1.0e-9,
+    args = _Bag(adaptive_lr=_Bag(**adaptive), lr_warmup_ratio=lr_warmup_ratio,
+                min_lr=1.0e-9,
                 max_lr=None, lr_policy=SEED_LR, lr_back=SEED_LR,
                 lr_replay=SEED_LR, lr_fused=SEED_LR, lr_flow=0.1,
                 lr_servo_managed=['lr_fused'])
@@ -243,7 +249,8 @@ def test_hyper_actuates_once_the_envelope_is_frozen():
     a negative smoothed cos, and hyper stayed mute until 1150 with hypergrads at
     0 and cos at -0.02..-0.04 the whole way.
     """
-    m, c = _controller(warmup_steps=100000, warmup_freeze_cos_window=5)
+    m, c = _controller(lr_warmup_ratio=10, warmup_steps=100000,
+                       warmup_freeze_cos_window=5)
     st = c._state()
 
     _fire(m, c, cos=-0.2, n=40)                 # drives the smoothed error < 0
@@ -258,7 +265,8 @@ def test_hyper_actuates_once_the_envelope_is_frozen():
 
 def test_hyper_stays_muted_while_the_ramp_is_actually_moving():
     """The other half: before any freeze, actuation must still be withheld."""
-    m, c = _controller(warmup_steps=100000, warmup_freeze_cos_window=100000)
+    m, c = _controller(lr_warmup_ratio=10, warmup_steps=100000,
+                       warmup_freeze_cos_window=100000)
     _fire(m, c, cos=+0.5, n=60)
     assert _peak(c) == pytest.approx(1.0), \
         'hyper actuated during a live ramp, which is what freeze-only prevents'

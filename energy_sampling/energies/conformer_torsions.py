@@ -61,17 +61,22 @@ class ConformerTorsions(BaseSet):
                  include_trivial_rotations: bool = False,
                  mmff_reference: bool = True,
                  seed: int = 0,
-                 # float32 BY DEFAULT. Measured against float64 on the same DoF draw,
-                 # the relative error on the potential is ~5e-7, on log J ~6e-7, and on the
-                 # closure bond ~1e-6 A -- pure roundoff at float32 epsilon, with nothing
-                 # compounding through the NeRF chain (build walks ~8 topological ROUNDS,
-                 # not one round per atom). The closure errors this code reports are
-                 # 0.02-0.09 A, so the noise sits four orders below the signal. On CPU
-                 # float64 costs only ~1.1x, but `build` folds the batch into the atom
-                 # dimension for exactly the huge-batch GPU case, and consumer GPUs run
-                 # fp64 at a small fraction of fp32 -- which is where the default matters.
-                 # Pass dtype=torch.float64 explicitly for the exactness gates.
-                 dtype=torch.float32,
+                 # dtype FOLLOWS torch's default when not given, rather than being
+                 # pinned. Measured against float64 on the same DoF draw, float32's
+                 # relative error is ~5e-7 on the potential, ~6e-7 on log J and ~1e-6 A on
+                 # the closure bond -- pure roundoff, with nothing compounding through the
+                 # NeRF chain, and four orders below the closure errors this code reports.
+                 # So float32 is the right default for throughput, and `build` folds the
+                 # batch into the atom dimension for exactly the huge-batch GPU case where
+                 # consumer fp64 runs at a fraction of fp32.
+                 #
+                 # FOLLOWING THE DEFAULT RATHER THAN PINNING float32 IS THE POINT.
+                 # train_conformer.run() sets the global default to float64 deliberately;
+                 # a hard-coded float32 here does not fail against that, it SILENTLY
+                 # DOWNCASTS -- returning float32 rewards to a float64 policy, which is a
+                 # precision change nothing would report. Honouring the default lets each
+                 # caller state its own intent, and the exactness gates pass dtype outright.
+                 dtype=None,
                  temperature_conditioning: bool = False,
                  log_temperature_range=(-1.0, 1.0),
                  lj_coeff: float = 1.0,
@@ -118,7 +123,7 @@ class ConformerTorsions(BaseSet):
         from mxtaltools.conformers.topology import spec_from_graph
 
         self.device = torch.device(device)
-        self.dtype = dtype
+        self.dtype = torch.get_default_dtype() if dtype is None else dtype
         self.smiles = smiles
         self.log_temperature = log_temperature
 
@@ -354,6 +359,20 @@ class ConformerTorsions(BaseSet):
         self.log_jacobian_const = (
             float(_log_jac(_tree, _pr.reshape(-1), _pth.reshape(-1)).item())
             if self._lin_free_idx.numel() == 0 else None)
+
+        # THE CHART VOLUME ELEMENT, log|dq/dx|. The sampler proposes x on [-1, 1]^d, but
+        # the Boltzmann density lives on the internal coordinates q -- and dof_from_state
+        # writes q_free = ref + scale * x, so the two measures differ by prod_j scale_j.
+        #
+        # CONSTANT IN x, WHICH IS WHY IT WAS INVISIBLE. A constant shifts log Z and cancels
+        # out of every TB residual, so no unconditional result depends on it and no gate
+        # would have fired. It stops being harmless the moment log Z is compared ACROSS
+        # molecules: the free-column counts differ, so the constant does too -- measured at
+        # 'full' it spans 9.0 nats over eight molecules (propanol -9.87 to ethylcyclohexane
+        # -18.90), and 3.4 nats at 'torsion'. Without it log Z(c) is not a physical
+        # quantity and cross-condition comparison is meaningless.
+        self.log_chart_jacobian = float(
+            torch.log(self._free_scale).sum().item())
 
         self.e_ref = self.energy(torch.zeros(1, self.data_ndim, dtype=dtype,
                                              device=self.device),
@@ -1335,17 +1354,31 @@ class ConformerTorsions(BaseSet):
         return -temperature * log_jacobian(tree, r.reshape(-1), th.reshape(-1))
 
     def energy(self, x, mol_batch=None, log_temperature=None,
-               return_exp: bool = False, keep_grads: bool = False):
+               return_exp: bool = False, keep_grads: bool = False,
+               internal_oom_recovery=None):
         """E/T per sample, ``[B]``. ``log_reward = -energy``.
 
-        Carries the change of measure, so ``exp(-energy)`` is proportional to the
-        Cartesian Boltzmann density read through the internal-coordinate chart:
+        Carries BOTH changes of measure, so ``exp(-energy)`` is proportional to the
+        Cartesian Boltzmann density read through the chart the SAMPLER actually proposes
+        in -- the latent box, not the internal coordinates:
 
-            log_reward = -U/T + log J
+            log_reward = -U/T + log J_BAT + log|dq/dx|
+
+        ``log J_BAT`` relates internal coordinates to Cartesian; ``log|dq/dx|`` relates the
+        latent box to the internal coordinates and is a constant. Both are needed: the
+        first alone gives a density on q, and the sampler does not propose q.
 
         Note this SHIFTS log Z relative to the pre-step-2 code by ``log J``, which is a
         constant at `torsion` and `dihedral` and state-dependent above them. Stored
         reference values from before the shift are not comparable.
+
+        ``internal_oom_recovery`` is ACCEPTED AND IGNORED, deliberately. It selects the
+        crystal energy's adaptive sub-batching path, which exists because an MLIP scan over
+        a whole prior dataset can exhaust the card mid-call. This force field is a handful
+        of fused kernels over a fixed-size state block with no such path to select, so
+        there is nothing to switch on. It is in the signature because ``BaseSet.log_reward``
+        forwards it unconditionally and the anchor scans pass it explicitly; raising here
+        would make those callers crystal-only for no reason.
         """
         if log_temperature is None:
             log_temperature = torch.tensor(self.log_temperature)
@@ -1357,8 +1390,44 @@ class ConformerTorsions(BaseSet):
             e, pos = self.potential_energy(x, temperature, keep_grads=keep_grads,
                                            return_positions=True)
             e = e + self.jacobian_energy(x, temperature)
+            # PRE-MULTIPLIED BY T for the same reason the BAT term is: a change of measure
+            # must contribute the same amount to log_reward at every temperature, and
+            # energy() divides the total by T below.
+            e = e - temperature * self.log_chart_jacobian
+        # BEFORE the division: this is what the crystal route stores as `gfn_energy`
+        # (molecular_crystal.energy attaches it, then returns energy / temperature), and
+        # what the eval publishes as 'Mean Sample Energy'. Keeping the same convention is
+        # what makes that metric mean the same thing on both routes.
+        gfn_e = e
         e = e / temperature
-        return (e, pos) if return_exp else e
+        if not return_exp:
+            return e
+
+        # THE SECOND RETURN IS A GRAPH BATCH, NOT POSITIONS. Every consumer of
+        # return_exp=True -- fwd_eval_sampling, get_loss_reward, replay admission, the
+        # anchor screen -- treats it as the crystal route does: a batch it can append,
+        # index row-wise, read a state off and hand to a buffer. It used to return `pos`,
+        # which no conformer caller ever consumed because the stripped training loop had
+        # none of those paths.
+        if mol_batch is None:
+            raise ValueError(
+                'energy(return_exp=True) returns the scored BATCH, so it needs a mol_batch '
+                'to write onto; pass one or use return_exp=False')
+
+        # `conformer_energy` is baked at T = 1 in bake_energies' convention, NOT from the
+        # `e` computed above. Two reasons, and both would corrupt buffers silently rather
+        # than fail: `e` is E/T with both measure terms folded in, and the read side
+        # divides by T and re-adds the measure itself. A row admitted from here has to be
+        # the same currency as a row from the prior dataset, or the buffers just mix them.
+        with torch.no_grad():
+            one = torch.tensor(1.0, dtype=self.dtype, device=self.device)
+            baked = self.potential_energy(x.detach(), one)
+
+        from energies.conformer_data import set_batch_states
+
+        return e, set_batch_states(mol_batch, x.detach(), baked,
+                                   gfn_energy=gfn_e.detach(),
+                                   periodic=self.periodic_dims)
 
     # ------------------------------------------------- Modeller energy protocol
     #
@@ -1464,16 +1533,27 @@ class ConformerTorsions(BaseSet):
         # value is divided by the sampling T here and a change of measure divided by T is
         # not a change of measure. So the measure has to be added back, in log-reward
         # units, AFTER the division.
-        if self.log_jacobian_const is None:
-            raise NotImplementedError(
-                f"the change of measure is state-dependent at level {self.level!r}, so a "
-                f"reward cannot be reconstructed from a baked scalar. Recomputing log J "
-                f"needs each row's own state, which this signature does not receive -- "
-                f"see docs/design/internal_dof_ladder.md section 6, where "
-                f"prebuilt_sample_to_reward is rewritten to read `torsion_state` off the "
-                f"graph. Until then this path is torsion/dihedral only.")
         t = torch.as_tensor(temperature, dtype=e.dtype, device=e.device).flatten()
-        return -(e.flatten() / t) + self.log_jacobian_const
+        if self.log_jacobian_const is None:
+            # STATE-DEPENDENT MEASURE: log J varies per row above `dihedral`, so a baked
+            # scalar alone is not a reward. It is still reconstructible, because the graph
+            # carries the state that produced it -- which is what unblocks `flex` and
+            # `full` for every path that reads a prebuilt reward (backward training draws,
+            # the prior buffer, the anchor seed). Recomputed rather than baked for the same
+            # reason the potential is baked: a measure divided by the sampling temperature
+            # is not a measure, so it cannot be folded into the stored scalar.
+            from energies.conformer_data import batch_states
+            from mxtaltools.conformers.builder import log_jacobian
+            state = torch.as_tensor(batch_states(mols), dtype=self.dtype,
+                                    device=self.device)
+            r, th, _ = self.dof_from_state(state)
+            tree, _ = self._batch(state.shape[0])
+            log_j = log_jacobian(tree, r.reshape(-1), th.reshape(-1)).to(e.device)
+            return -(e.flatten() / t) + log_j.flatten() + self.log_chart_jacobian
+        # BOTH measure terms, or this path disagrees with energy() by a constant that is
+        # different for every molecule. The chart term is as temperature-independent as the
+        # BAT term and is added after the division for the same reason.
+        return -(e.flatten() / t) + self.log_jacobian_const + self.log_chart_jacobian
 
     def batched_analyze_crystal_batch(self, *args, **kwargs):
         raise NotImplementedError(
