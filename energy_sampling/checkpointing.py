@@ -355,13 +355,20 @@ class Checkpointer:
             print(f"Buffer sidecar {source} was saved under a different problem "
                   f"- ignoring it, buffers start fresh")
             return
-        # all resident stores restore onto the configured buffer_device
+        # all resident stores restore onto the configured buffer_device, and through the
+        # modeller's OWN buffer classes. Hardcoding CrystalBuffer/AnchorBuffer here restored
+        # a crystal store on a non-crystal route: the rows are fine, but the class carries
+        # the graph hooks, so the next `add` went through CrystalBuffer._as_batch and died
+        # on max_z_prime. Fresh runs never saw it because the seeded buffer is already full
+        # and grow_prior_buffer returns early -- it only fires on RESUME.
+        buf_cls = getattr(m, 'buffer_cls', CrystalBuffer)
+        anchor_cls = getattr(m, 'anchor_buffer_cls', AnchorBuffer)
         if state.get('prior_buffer') is not None:
-            m.prior_buffer = CrystalBuffer.from_state_dict(state['prior_buffer'], device=m.buffer_device)
+            m.prior_buffer = buf_cls.from_state_dict(state['prior_buffer'], device=m.buffer_device)
         if state.get('replay_buffer') is not None:
-            m.replay_buffer = CrystalBuffer.from_state_dict(state['replay_buffer'], device=m.buffer_device)
+            m.replay_buffer = buf_cls.from_state_dict(state['replay_buffer'], device=m.buffer_device)
         if state.get('anchor_buffer') is not None:
-            m.anchor_buffer = AnchorBuffer.from_state_dict(state['anchor_buffer'], device=m.buffer_device)
+            m.anchor_buffer = anchor_cls.from_state_dict(state['anchor_buffer'], device=m.buffer_device)
 
     def load_buffers_for(self, checkpoint_path: str) -> bool:
         """

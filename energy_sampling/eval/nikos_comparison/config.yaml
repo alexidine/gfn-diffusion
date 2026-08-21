@@ -2,10 +2,17 @@
 # See README.md.
 
 # --- Nikos' structures -------------------------------------------------------
-nikos_root: D:\crystal_datasets\acridine\from_nikos\Acridine_Structures
+# His FINAL accepted pool (15 structures), delivered 2026-08-21. The layout is
+# zprime_<N>/<SG>/struct_*.cif -- flatter than the earlier staged export, and it
+# carries no rank or score. `ingest.parse_provenance` handles both layouts by
+# identifying the Z' and space-group components rather than assuming depth.
+nikos_root: D:\crystal_datasets\acridine\from_nikos\accepted_structures
 # Which CIFs to take. Relative glob, matched against nikos_root.
 # The 'Unique' folders under stage3 are his final de-duplicated hits.
-nikos_glob: "Z_prime_*/cif_exports/stage3/*/Unique/*.cif"
+nikos_glob: "zprime_*/*/*.cif"
+# The earlier staged export, kept for reference:
+#   nikos_root: D:\crystal_datasets\acridine\from_nikos\Acridine_Structures
+#   nikos_glob: "Z_prime_*/cif_exports/stage3/*/Unique/*.cif"
 
 # --- our side ----------------------------------------------------------------
 # The brute-force search outputs, thinned to diverse basins by collate_prior.py.
@@ -17,8 +24,28 @@ priors:
 # NOTE sg19_zp3 exists only as raw chunks in prior_chunks/ and is deliberately
 # excluded; his 8 Z'=3 structures therefore have no Z'-matched landscape.
 
+# The (space group, Z') combinations our brute-force searches actually cover, and
+# which prior covers each. Kept as data rather than a constant in the code so it
+# cannot drift from the prior list above -- adding a prior means adding its row.
+searched:
+  - {sg: 14, z_prime: 1, prior: sg14_zp1}
+  - {sg: 14, z_prime: 2, prior: sg14_zp2}
+  - {sg: 9,  z_prime: 2, prior: sg9_zp2}
+
+# Analyse only structures that fall in one of `searched`. Outside those, we never
+# looked, so a non-match would be absence of evidence rather than a result.
+restrict_to_searched: true
+
 # Known polymorphs, as a third reference layer.
-polymorphs: D:\crystal_datasets\acridine\std_acridine_polymorphs.pt
+# MUST be the std_opt_ file. Both files hold the SAME experimental cells and
+# poses -- cell_lengths, cell_angles, aunit_centroid and aunit_orientation differ
+# by exactly 0.0 -- and differ ONLY in which conformer was substituted in.
+# std_acridine_polymorphs.pt carries the old `acridine_conformer.pt`
+# (aromatic C-C 1.3668 A); every prior AND our L1 reprojection carry
+# `opt_acridine_conformer.pt` (C-C 1.4027 A). Using the former compares a
+# different molecule against our landscapes, and costs ~70 kJ/mol of apparent
+# lattice energy. "opt" here means OPTIMIZED CONFORMER, not a relaxed crystal.
+polymorphs: D:\crystal_datasets\acridine\std_opt_acridine_polymorphs.pt
 # Our reference rigid conformer -- the molecule the priors were searched with.
 conformer: D:\crystal_datasets\acridine\opt_acridine_conformer.pt
 

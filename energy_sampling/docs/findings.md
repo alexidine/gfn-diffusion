@@ -13,6 +13,112 @@ Newest first.
 
 ---
 
+## F-051 · Warm-starting from a phase-1 exit archive does NOT skip phase 1 · `MECHANISM`
+
+*2026-08-19, local. QM9-conditional resumed full-state from its own
+`_phase1_exit.pt` at step 18450, intending to land in `var_conditioning`.*
+
+**Result.** The arm spent its entire budget re-running the MLE stage the archive
+was the exit of. Two mechanisms combine, and neither is visible on its own:
+
+1. **`skip_if: prior_loaded` only fires on a FRESH run.** `protocol.py:1335`
+   returns immediately when `step_ind != 0`, because a resumed run is
+   deliberately left wherever its checkpoint says. So the mechanism that exists
+   for exactly this case is unreachable on the resume that needs it.
+2. **A stage's `exit:` is an AND-list.** On `conditional_vargrad`'s
+   `train_prior` that is `gates/mle_flat` AND `eval/wass_debiased < 0.015` AND
+   `bwd/tbc < 2.0`. Loosening the MLE gate alone therefore cannot release the
+   stage, and two of the three terms are quality bars unrelated to whether the
+   MLE is finished (`wass` is not interpretive on crystal targets at all).
+
+**The tell, and it is cheap.** `phase` stays 1 in an otherwise clean run and no
+`protocol: stage 'a' -> 'b'` line appears. Nothing errors; the run trains, logs,
+and reports healthily for the whole budget in the wrong stage.
+
+**Scope.** Any arm resuming from one of these archives, on either route. The
+local fix was to replace the stage's whole `exit` block with one satisfiable
+term rather than loosen the gate; starting fresh with a `prior_model_name` is
+the other route, since the skip is then reachable.
+
+---
+
+## F-050 · The batch sizer's rung selection is not reproducible · `REPLICATED`
+
+*2026-08-19/20. Local `synth_prof_aug19` (RTX 5080) and cluster `cluster_aug19`
+sizer wave (A100 80 GB), ELJ mipcas sg2/zp1, `batch_util_target` armed.*
+
+**Result.** Two runs of byte-identical configs select different batches.
+Cluster: `b1_ladder_r1` held **10 560**, `b2_ladder_r2` held **11 560**. Local:
+two runs of one route disagreed by **more than 11 occupancy points at the same
+rung** and held different batches -- there with a named contaminant (a
+concurrent test suite on the same box), which is itself the point.
+
+**Mechanism.** The selection is made from `_BS_MIN_UTIL_SAMPLES = 3` raw
+samples of a counter that is not exclusively ours, and is then held for the
+whole stage. Three samples is a thin basis for a stage-lifetime decision, and
+the cluster analogue of the local contaminant is a co-tenant on a multi-GPU
+node -- which `phase6_batch_sizer.md` §0.15 already warns must be filtered out
+by GPU index.
+
+**Consequence.** The indicated fix is more samples per rung or a longer dwell,
+NOT a different target: the target is not what is unstable. Note also that
+**S2, the stand-down audit that exists to catch a selection made on a bad
+reading, has never executed anywhere** -- no run has yet outlived one
+`gpu_util_policy_window_s` past its selection.
+
+---
+
+## F-049 · MACE's coupled-batch memory cost is the ENERGY-CALL TRANSIENT; allocator tuning and trajectory checkpointing do not touch it · `MECHANISM`
+
+*2026-08-20, `cluster_aug19` mem wave, A100 80 GB. Five arms, MACE acridine
+sg14/zp1, batch 100, T=10, fresh, single terminal `equilibration` stage. One
+key varied per arm, control included.*
+
+**Result.**
+
+| arm | batch reached | OOM events | `vram/peak_train_mb` |
+|---|---:|---:|---:|
+| control (no change) | 23 | 3 | 72 382 |
+| `garbage_collection_threshold:0.8` | 23 | 3 | 72 422 |
+| + `max_split_size_mb:128` | 23 | 3 | 73 044 |
+| `traj_checkpoint: true` | 23 | 3 | 72 364 |
+| `cuda_memory_fraction: 0.97` | **38** | **2** | **77 818** |
+
+The control reproduced the cascade exactly (100 -> 62 -> 38 -> 23, three
+applications of `oom_batch_shrink_factor` 0.625), so the wave had power. Both
+allocator knobs and trajectory checkpointing changed **nothing**. Only raising
+the hard cap moved the outcome, and 5.7 GB of extra cap bought exactly one rung.
+
+**What this locates.** With the energy batch coupled to the policy batch, the
+binding cost at batch 100 is a genuine transient **inside the MACE call**. It is
+not allocator fragmentation (two knobs aimed at precisely that were null) and it
+is not trajectory activations held across the T-step rollout (`traj_checkpoint`
+was null).
+
+**This is NOT a claim that the route cannot run at scale.** The historical
+configuration ran an **energy batch of 73 against a policy batch of 3000 at
+T=100 on this hardware**, with the energy call chunking internally. The finding
+is about the COUPLED configuration: with `internal_oom_recovery: false` the
+energy call receives the whole policy batch, so its ceiling becomes the policy
+ceiling and the only lever the OOM path has is to shrink both. That is the
+handoff §4.4 pinning, now with the mechanism located rather than inferred, and
+it is an argument FOR the §3.4 decoupling engineering.
+
+**A correction this forced, recorded because the wrong reading was persuasive.**
+`vram/live_mb` sat flat at ~890 MiB (1.1% of the card) against 57.7 GB reserved,
+and that was read as "the run is not short of memory, only of correctly shaped
+blocks." It is not: `live_mb` is sampled BETWEEN steps and is not the demand.
+`peak_train_mb` is, and it reads 72.4 GB against a 73.0 GB cap. The two
+allocator arms are what refuted the fragmentation reading.
+
+**Also observed:** `energy/mace_flag_batched_nl` and `energy/mace_flag_gpu_batch`
+read **1.25** on a window containing OOM retries. An executed-FRACTION above 1.0
+is structurally impossible -- the exec counters increment on a retried call
+without `_PHASE_CALLS` -- so the flag stops being a fraction exactly when a run
+is in trouble.
+
+---
+
 ## F-048 · The two out-of-process occupancy instruments agree to ~1 point across 65 jobs; the wandb stream is validated · `REPLICATED`
 
 *2026-08-19, local analysis. Inputs: `nvidia-smi` sidecar CSVs pulled from cluster

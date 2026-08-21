@@ -58,6 +58,37 @@ OPT_CONFIG = dict(
 )
 
 
+def searched_combos(cfg):
+    """(sg_ind, z_prime) -> prior name, from config. See config.yaml `searched`."""
+    return {(int(r['sg']), int(r['z_prime'])): r['prior'] for r in cfg['searched']}
+
+
+def restrict(crystals, cfg):
+    """
+    Keep only structures in an SG/Z' combination our searches actually cover.
+
+    Outside those we never looked, so nothing there can be evidence either way --
+    and relaxing them at L2 would spend the expensive step on structures whose
+    result could not be interpreted. What is dropped is named, not silently
+    filtered.
+    """
+    combos = searched_combos(cfg)
+    kept = [c for c in crystals if (int(c.sg_ind), int(c.z_prime)) in combos]
+    dropped = [c for c in crystals if (int(c.sg_ind), int(c.z_prime)) not in combos]
+    from collections import Counter
+    print(f"restricted to searched SG/Z': keeping {len(kept)} of {len(crystals)}")
+    for combo, n in sorted(Counter((int(c.sg_ind), int(c.z_prime))
+                                   for c in kept).items()):
+        print(f"   kept    sg={combo[0]:3d} Z'={combo[1]}  {n:3d}  "
+              f"-> {combos[combo]}")
+    for combo, n in sorted(Counter((int(c.sg_ind), int(c.z_prime))
+                                   for c in dropped).items()):
+        print(f"   dropped sg={combo[0]:3d} Z'={combo[1]}  {n:3d}  (never searched)")
+    if not kept:
+        raise ValueError("no structures fall in a searched SG/Z' combination")
+    return kept
+
+
 def rdf_bins(like, device=None):
     return torch.linspace(0, 10, like.rdf.shape[-1], device=device or like.rdf.device)
 
@@ -167,6 +198,9 @@ def main():
                     help='stop after L1; L2 is the expensive stage')
     ap.add_argument('--limit', type=int, default=None,
                     help='use only the first N structures (smoke run)')
+    ap.add_argument('--all-space-groups', action='store_true',
+                    help="override config restrict_to_searched and keep every "
+                         "structure, including SG/Z' we never searched")
     ap.add_argument('--chunk', type=int, default=None,
                     help='structures per analysis chunk (default 4 on cpu)')
     cli = ap.parse_args()
@@ -186,6 +220,8 @@ def main():
     blob = torch.load(os.path.join(cfg['out_dir'], 'nikos_structures.pt'),
                       weights_only=False)
     crystals, manifest = blob['crystals'], blob['manifest']
+    if cfg.get('restrict_to_searched') and not cli.all_space_groups:
+        crystals = restrict(crystals, cfg)
     if cli.limit:
         crystals = crystals[:cli.limit]
         print(f"LIMIT: {len(crystals)} structures only -- this is a smoke run, "
@@ -237,6 +273,8 @@ def main():
     torch.save({'l0': l0, 'l1': l1, 'l2': l2, 'std_ok': std_ok,
                 'l0_l1_rdf_gap': gap, 'l1_l2_rdf_gap': moved,
                 'manifest': manifest, 'energy_function': ef,
+                'restricted_to_searched': bool(cfg.get('restrict_to_searched')
+                                               and not cli.all_space_groups),
                 'rdf_kwargs': RDF_KWARGS, 'opt_config': OPT_CONFIG}, out)
     print(f"\nwrote {out}")
 

@@ -275,6 +275,70 @@ def arms():
             epochs=200, eval_period=100, figs_period=200, archive_period=0,
             **{**BASE, **LADDER_OFF, EQ: EQUIL, **extra})
 
+    # =============================================================== nlcap ===
+    # THE DIRECT TEST OF THE SHIFT CAP, and the reason it is its own wave: the
+    # mem wave established that MACE at batch 100 cascades 100 -> 23 with three
+    # OOMs, and local profiling found why. `lattice_shift_range` clamps only
+    # from BELOW, so a flattening cell's interplanar spacing -> 0 makes the
+    # requested shift range unbounded -- and `batched_pbc_neighbour_list` takes
+    # `.max(dim=0)` across the batch, ghost-expanding EVERY graph on the worst
+    # cell's grid. Measured locally at 128 acridine graphs / 2944 atoms:
+    #
+    #     physical   grid [3,3,2]   K=245      peak  254 MiB
+    #     x0.01      grid [3,3,52]  K=5,145    peak 1725 MiB
+    #     x0.001     grid [3,3,510] K=50,029   OOM on a 16 GB card
+    #
+    # while the EDGE COUNT rose only 2.5x -- so it is ghost expansion the sane
+    # cells never needed. A fresh policy emits exactly those cells, which is why
+    # the failure is an early transient.
+    #
+    # Both arms are batch 100 -- the size that cascaded -- and short, because
+    # all three OOMs landed inside the first ten steps. `off` restores the old
+    # unbounded behaviour via the env override, so this is a single-key toggle
+    # rather than a comparison between two builds.
+    #
+    # PREDICTIONS. off: reproduces the mem wave -- 3 OOM events, batch collapses
+    # to 23. on: `energy/nl_shift_capped_frac` > 0 in the first reports (the
+    # degenerate cells are there and the cap is catching them), `batch/oom_events`
+    # 0, and the batch HOLDS at 100. If `capped_frac` stays 0 the cluster's
+    # degeneracy never reached the cap and this is not the cluster's mechanism --
+    # a real negative, and the arm is built to show it.
+    for name in ('nl0_shiftcap_off', 'nl1_shiftcap_on'):
+        out[f'{TAG}_{name}'] = generate.arm(
+            f'{TAG}_{name}', problem='mipcas_elj', tag=TAG,
+            energy_function='mace', mlip_path=CLUSTER_MACE_MLIP,
+            space_groups=[14], z_primes=[1],
+            prior_path=MACE_PRIOR, molecules_path=MACE_PRIOR,
+            batch_size=100, max_batch_size=100, fused_grad_accum_min_samples=100,
+            epochs=150, eval_period=75, figs_period=150, archive_period=0,
+            **{**BASE, **LADDER_OFF, EQ: EQUIL})
+
+    # THE CEILING-FINDER, and the arm that answers the objection to F-049. The
+    # mem wave is easy to misread as "MACE cannot hold a coupled batch", but this
+    # hardware has previously run energy batch 73 against policy batch 3000 at
+    # T=100, so the ceiling is an ENGINEERING NUMBER, not a wall -- and nothing
+    # in the battery measures it. This arm does: cap on, ladder ARMED from a
+    # deliberately small rung, and the settling batch is the answer.
+    #
+    # Starts at 25, not 100. If the cap works the ladder climbs in ~10 steps, and
+    # starting BELOW the size that cascaded means a failure to climb is
+    # informative rather than a repeat of the crash. traj_checkpoint on, since
+    # the ceiling worth knowing is the one under the memory settings prod uses.
+    #
+    # PREDICTION: settles above 100 -- somewhere in 100-400. Below 100 means the
+    # cap is not the binding constraint and the activation transient is, which
+    # sends the next round at the energy-call peak rather than the neighbour list.
+    out[f'{TAG}_nl2_shiftcap_ladder'] = generate.arm(
+        f'{TAG}_nl2_shiftcap_ladder', problem='mipcas_elj', tag=TAG,
+        energy_function='mace', mlip_path=CLUSTER_MACE_MLIP,
+        space_groups=[14], z_primes=[1],
+        prior_path=MACE_PRIOR, molecules_path=MACE_PRIOR,
+        batch_size=25, fused_grad_accum_min_samples=25,
+        max_batch_size=2000, grow_batch_size=True, batch_util_target=0.6,
+        batch_growth_interval=10, traj_checkpoint=True,
+        epochs=400, eval_period=200, figs_period=400, archive_period=0,
+        **{**BASE, EQ: EQUIL})
+
     return out
 
 
@@ -291,6 +355,11 @@ ENV = {
     f'{TAG}_m2_uma_extgraph_off': {'MXT_UMA_EXTERNAL_GRAPH': '0'},
     f'{TAG}_c1_fused_on': {'MXT_FUSED_ADAM': '1'},
     f'{TAG}_c1_fused_off': {'MXT_FUSED_ADAM': '0'},
+    # the shift cap, as a toggle. 100000 is "no cap" -- large enough that the
+    # clamp can never bind, restoring the pre-2026-08-20 behaviour exactly.
+    f'{TAG}_nl0_shiftcap_off': {'MXT_MAX_SHIFT_RANGE': '100000'},
+    f'{TAG}_nl1_shiftcap_on': {'MXT_MAX_SHIFT_RANGE': '8'},
+    f'{TAG}_nl2_shiftcap_ladder': {'MXT_MAX_SHIFT_RANGE': '8'},
     f'{TAG}_g2_uma_gate': {'MXT_UMA_GRAPH_TIMER': '1'},
     # ---- the allocator arms. mem0 sets NOTHING, so it takes train.py's
     # setdefault floor (expandable_segments) and is the control for the two
@@ -317,6 +386,10 @@ WAVES = {
     # re-analysis (205k rows through MACE) and ~1.6 min actually training, then
     # died at step 190 of 200 -- almost certainly the walltime, since
     # batch/oom_events had been frozen at 3 since step 10.
+    # 01:00:00: 150 steps, and the whole question is decided in the first ten.
+    # The MACE init prior re-analysis is the bulk of the wall clock either way.
+    'nlcap': ('01:30:00', ['nl0_shiftcap_off', 'nl1_shiftcap_on',
+                           'nl2_shiftcap_ladder']),
     'mem':   ('01:30:00', ['mem0_mace_control', 'mem1_mace_gc',
                            'mem2_mace_split', 'mem3_mace_trajckpt',
                            'mem4_mace_cap97']),

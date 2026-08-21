@@ -491,8 +491,24 @@ def state_dim(batch) -> int:
 
 
 def batch_states(batch) -> torch.Tensor:
-    """``torsion_state`` as ``[n_graphs, k]``."""
-    return batch.torsion_state.reshape(batch.num_graphs, state_dim(batch))
+    """``torsion_state`` as ``[n_graphs, k]``.
+
+    The size check is explicit because the bare reshape's message ("shape '[256, 72]' is
+    invalid for input of size 72") names neither the attribute nor the batch, and the
+    interesting case -- a per-graph attribute that arrived with ONE row where the batch has
+    many -- is exactly the one it fails to describe.
+    """
+    ts = batch.torsion_state
+    k = state_dim(batch)
+    want = batch.num_graphs * k
+    if ts.numel() != want:
+        raise ValueError(
+            f"torsion_state has {ts.numel()} elements (shape {tuple(ts.shape)}) but this "
+            f"batch has {batch.num_graphs} graphs x k={k} = {want}. A per-graph attribute "
+            f"carrying {ts.numel() // max(k, 1)} row(s) for {batch.num_graphs} graphs means "
+            f"it was written to the batch without being replicated -- see set_batch_states "
+            f"/ attach_states.")
+    return ts.reshape(batch.num_graphs, k)
 
 
 def set_batch_states(batch, states, energies=None, gfn_energy=None,

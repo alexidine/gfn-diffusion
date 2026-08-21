@@ -49,7 +49,33 @@ from train import BULKY_ATTR_EXCLUDE_KEYS, Modeller
 #: to ConformerTorsions, which takes no **kwargs and would raise on any of them.
 _NON_ENERGY_KEYS = ('internal_prior_path', 'prior_sample_size', 'reward_range',
                     'density_coeff', 'reduction_coeff', 'analyze_kwargs',
-                    'internal_oom_recovery')
+                    'internal_oom_recovery', 'prior_relax_steps')
+
+
+def _column_w1(samples, reference, periodic, n_offsets: int = 24):
+    """Per-column 1-D Wasserstein distance, CIRCULAR on the periodic columns.
+
+    Quantile form (mean |sorted difference|) rather than scipy, so it costs nothing and
+    tolerates unequal sample counts.
+
+    A periodic column lives on a circle of period 2, so a distribution straddling the wrap
+    would read as maximally far from an identical one centred at zero. The circular
+    distance is therefore the minimum over a rigid rotation of the sampler, scanned on a
+    coarse grid -- exact when the two differ by a shift, and an upper bound otherwise,
+    which is the safe direction for a "worst columns" ranking.
+    """
+    q = np.linspace(0.0, 1.0, 512)
+    out = np.zeros(samples.shape[1])
+    for j in range(samples.shape[1]):
+        b = np.quantile(reference[:, j], q)
+        v = samples[:, j]
+        d = float(np.abs(np.quantile(v, q) - b).mean())
+        if periodic[j]:
+            for off in np.linspace(-1.0, 1.0, n_offsets, endpoint=False):
+                w = ((v + off + 1.0) % 2.0) - 1.0
+                d = min(d, float(np.abs(np.quantile(w, q) - b).mean()))
+        out[j] = d
+    return out
 
 
 class ConformerModeller(Modeller):
@@ -104,66 +130,79 @@ class ConformerModeller(Modeller):
                     (2, 'phi (torsion, deg)', 180.0))
 
     def _domain_figs(self, fig_dict, sample_batch, prior_latent_params, anchor_latents):
-        """Sampler vs prior over the latent box, GROUPED BY DoF CLASS.
+        """The 12 worst state columns, drawn with the CRYSTAL latent-parameter panel code.
 
-        One panel per class rather than one per column. train_conformer's
-        torsion_latent_figure put one panel per state dimension at width 300*k, which is
-        9000 px at propanol/`full` (d = 30) and worse on anything real -- the first of the
-        three scaling problems its own docstring records. Grouping by class is the option
-        that docstring names as scaling to any d, and it also fixes the third problem
-        (the axis is now per class, so bond lengths are no longer drawn as degrees).
+        Same figure the crystal route logs -- overlaid one-sided violins, three to a row,
+        transparent background, horizontal legend on top -- via MolCrystalOps' own
+        ``_add_violin`` and ``_get_color_set``. Neither touches ``self``, and _add_violin
+        already lays out on a THREE-column grid (``// 3``, ``% 3``), so a 4x3 panel of the
+        worst 12 reuses it verbatim rather than reimplementing the idiom. What this route
+        supplies is only what is genuinely different: which columns, their labels and their
+        ranges.
 
-        What it does NOT do is preserve per-column identity, so a single bad column is
-        averaged into its class. That is deliberate for now: per the agreed framing
-        (2026-08-20) the distribution plot is the DRILL-DOWN, and the primary diagnostic is
-        the scalar that trips -- see log_physical_properties. The worst-K-by-divergence
-        variant is the next step and is not built.
+        WHY WORST-12 RATHER THAN ALL. A crystal has 12-ish cell parameters and can show them
+        all; a conformer at `full` has 72 columns and on phenyl-THP exactly three of them
+        carry the entire ring-flip problem. Ranking by 1-D Wasserstein against the prior puts
+        the columns that are actually wrong on the page and drops the ~60 that already match,
+        which is what keeps one fixed panel readable at any molecule size.
         """
+        from mxtaltools.dataset_utils.data_classes import MolCrystalData
         from plotly.subplots import make_subplots
 
         from energies.conformer_data import batch_states
-        from mxtaltools.reporting.utils import lightweight_one_sided_violin
 
         def host(t):
-            """-> numpy on the host. prior_latent_params arrives as a CUDA tensor when
-            buffer_device is 'cuda', and np.asarray on one raises rather than copying."""
             if t is None:
                 return None
             return t.detach().cpu().numpy() if torch.is_tensor(t) else np.asarray(t)
 
         samples = host(batch_states(sample_batch))
         reference = host(prior_latent_params)
-        block = host(self.energy_function._free_block)
-        present = [(b, title, scale) for b, title, scale in self._DOF_CLASSES
-                   if (block == b).any()]
-        if not present:
+        if reference is None or reference.shape[1] != samples.shape[1]:
             return
+        anchors = host(anchor_latents)
+        periodic = np.asarray(host(self.energy_function.periodic_dims)).astype(bool)
+        block = host(self.energy_function._free_block)
+        cls_name = {0: 'r', 1: 'theta', 2: 'phi'}
 
-        fig = make_subplots(rows=1, cols=len(present),
-                            subplot_titles=[f'{t}  (n={int((block == b).sum())})'
-                                            for b, t, _ in present])
-        for col, (b, _title, scale) in enumerate(present):
-            cols = np.flatnonzero(block == b)
-            dists = [('sampler', samples[:, cols], 'rgba(60,120,216,0.55)')]
-            if reference is not None and reference.shape[1] == block.shape[0]:
-                dists.append(('prior', reference[:, cols], 'rgba(235,104,52,0.45)'))
-            lo, hi = -scale, scale
-            for name, data, color in dists:
-                x_v, y_v = lightweight_one_sided_violin(
-                    torch.as_tensor(scale * data.reshape(-1)), 200,
-                    bandwidth_factor=0.05, data_min=lo, data_max=hi)
-                fig.add_scatter(x=x_v, y=y_v, mode='lines', fill='toself',
-                                fillcolor=color, line=dict(color=color, width=1.2),
-                                name=name, legendgroup=name, showlegend=(col == 0),
-                                row=1, col=col + 1)
-            # a hair past the box so mass piled ON the wall is visible as mass at the edge
-            # rather than being clipped flush against the frame
-            fig.update_xaxes(range=[lo * 1.03, hi * 1.03], row=1, col=col + 1)
-            fig.update_yaxes(showticklabels=False, row=1, col=col + 1)
+        w1 = _column_w1(samples, reference, periodic)
+        order = np.argsort(-w1)[:12]
+        self._last_w1 = w1
+
+        # the distributions to overlay, in the crystal panel's own (name, data) form
+        dists = [('sampler', samples), ('prior', reference)]
+        if anchors is not None and anchors.ndim == 2 and anchors.shape[1] == samples.shape[1]:
+            dists.append(('anchors', anchors))
+        colors = MolCrystalData._get_color_set(None, len(dists))
+
+        titles = [f'col {int(j)} · {cls_name.get(int(block[j]), "?")}'
+                  f'{" (wraps)" if periodic[j] else ""}  |  W1 {w1[j]:.4f}' for j in order]
+        fig = make_subplots(rows=4, cols=3, subplot_titles=titles)
+        for i, j in enumerate(order):
+            lo = min(float(d[:, j].min()) for _, d in dists)
+            hi = max(float(d[:, j].max()) for _, d in dists)
+            pad = 0.05 * max(hi - lo, 1e-6)
+            rng = (lo - pad, hi + pad)
+            for k, (name, data) in enumerate(dists):
+                MolCrystalData._add_violin(None, fig, data[:, j], name, colors[k], i, rng,
+                                           200, 0.05)
+            fig.update_xaxes(range=list(rng), row=i // 3 + 1, col=i % 3 + 1)
+
+        # styling copied from plot_batch_cell_params so the two panels read as one family
         fig.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
-                          height=300, width=340 * len(present),
-                          margin=dict(l=30, r=20, t=44, b=30))
-        fig_dict['Latent Distribution by DoF Class'] = fig
+                          violinmode='overlay',
+                          legend=dict(orientation='h', yanchor='bottom', y=1.05,
+                                      xanchor='center', x=0.5, bgcolor='rgba(0,0,0,0)'),
+                          margin=dict(l=40, r=20, t=50, b=50),
+                          font=dict(family='Helvetica', size=12, color='black'))
+        fig.update_xaxes(showgrid=False, zeroline=False, ticks='outside',
+                         tickwidth=1, mirror=True)
+        fig.update_yaxes(showgrid=False, zeroline=False, showticklabels=False, ticks='',
+                         mirror=True)
+        if len(dists) > 1:
+            fig.update_traces(opacity=0.5)
+        fig_dict['Latent Params (worst 12)'] = fig
+
 
     # ------------------------------------------------------------ eval metrics
 
@@ -379,6 +418,15 @@ class ConformerModeller(Modeller):
                   f'ConformerTorsions (crystal-route keys)')
         self.energy_function = ConformerTorsions(**cfg)
         print(self.energy_function.describe())
+        # THE BASE METHOD ALSO BUILDS THE TRACE WINDOW, and this override does not call
+        # super(). Dropping it left profiling.trace silently INERT on the whole conformer
+        # route -- the config key read as enabled and nothing was ever written, which is
+        # the quiet kind of failure. Rebuilt here rather than by calling super(), because
+        # super() would construct a MolecularCrystal first.
+        import profiling
+        self._trace_window = profiling.trace_from_config(
+            self.args, cuda=str(self.device).startswith('cuda'),
+            tag=str(getattr(self.args, 'run_name', 'run')))
         # the fitted prior, loaded once and reused by init_prior_dataset and by any later
         # prior top-up. Held on the modeller rather than the energy: it is a sampling
         # device for the trainer, not part of the reward.
@@ -472,6 +520,61 @@ class ConformerModeller(Modeller):
         """
         return self.internal_prior is not None
 
+    def _draw_prior_states(self, n, rng, report=False, chunk: int = 4096):
+        """Draw from the fitted prior, then REPAIR steric clashes if configured.
+
+        A product-of-marginals prior draws each torsion independently, so a long chain
+        walks through itself. Measured on the glycine series at level `full`/mmff, the LJ
+        term is 36% of the median energy at Gly3, 59% at Gly4 and 91% at Gly6 (2397 of
+        2526 kcal/mol on Ala4), while EVERY bonded term scales linearly and sanely --
+        angle 20.7 -> 52.9, bond 12.0 -> 24.0, electrostatic 10.2 -> 22.5 across the whole
+        series. So the draw is not wrong, it is UNACCEPTED: the best decile is fine and the
+        bulk self-intersects. Oversampling barely helps (keeping the best 1/100 of 20,000
+        only reaches T_eff/T 3.0 on Gly6); a few descent steps fix it outright.
+
+        CALIBRATED, NOT GUESSED. ``T_eff/T`` reads **2.0** for a correctly thermal sample,
+        because equipartition puts the median excess at d/2 -- which is exactly what
+        ``frac_within_equipartition`` tests against, and it independently agrees here
+        (0.44 / 0.51 against its ideal 0.5). Measured over 4096 draws:
+
+            molecule     d   0 steps     8     10     12     15     20
+            phenyl-THP  72      2.05  1.15   1.09   1.06   1.04   1.02
+            Gly4        87      7.03  2.20   2.00   1.89   1.79   1.70
+            Gly6       129     29.19  2.47   2.21   2.06   1.92   1.80
+            Ala4       123     41.84  2.43   2.15   1.99   1.86   1.74
+
+        10-12 steps lands the peptides ON 2.0. phenyl-THP needs NONE -- its raw draw is
+        already thermal and relaxing it only over-cools, which is why the default is 0:
+        a molecule whose prior is already right must not be "repaired", and every existing
+        config keeps the behaviour it was tuned with.
+
+        Rprop in STATE space via ``descend``, which returns the best point SEEN, so a step
+        that overshoots cannot land worse than the draw. Chunked because ``descend`` holds
+        an autograd graph over the whole batch, and the seed draw is 50,000 rows.
+        """
+        states, stats = self.energy_function.sample_prior_states(
+            self.internal_prior, n, rng, report=report)
+        steps = int(getattr(self.args.energy_config, 'prior_relax_steps', 0) or 0)
+        if steps <= 0:
+            return states, stats
+
+        from energies.prior_baselines import descend
+
+        en = self.energy_function
+        x = torch.as_tensor(states, dtype=en.dtype, device=en.device)
+        before = en.potential_energy(x, float(en.temperature)).detach()
+        out = []
+        for i in range(0, x.shape[0], chunk):
+            best_x, _ = descend(en, x[i:i + chunk], steps)
+            out.append(best_x.detach())
+        x = torch.cat(out, 0)
+        if report:
+            after = en.potential_energy(x, float(en.temperature)).detach()
+            print(f'  prior relax: {steps} Rprop steps in state space, median energy '
+                  f'{before.median().item():.1f} -> {after.median().item():.1f} kcal/mol '
+                  f'over {x.shape[0]} rows')
+        return x, stats
+
     def sample_from_prior(self, num_samples):
         """Draw from the fitted InternalPrior instead of rolling out a frozen GFN.
 
@@ -487,8 +590,7 @@ class ConformerModeller(Modeller):
                                              condition_from_energy)
 
         n = max(int(num_samples), 2)      # attach_states refuses a single row
-        states, _ = self.energy_function.sample_prior_states(
-            self.internal_prior, n, self._prior_rng, report=False)
+        states, _ = self._draw_prior_states(n, self._prior_rng, report=False)
         energies = bake_energies(self.energy_function, states)
         cond = condition_from_energy(self.energy_function,
                                      identifier=self.energy_function.smiles)
@@ -575,8 +677,7 @@ class ConformerModeller(Modeller):
 
         n = int(getattr(self.args.energy_config, 'prior_sample_size', 50000))
         rng = self._prior_rng
-        states, stats = self.energy_function.sample_prior_states(
-            self.internal_prior, n, rng, report=True)
+        states, stats = self._draw_prior_states(n, rng, report=True)
         energies = bake_energies(self.energy_function, states)
 
         cond = condition_from_energy(self.energy_function,

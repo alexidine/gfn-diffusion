@@ -20,7 +20,7 @@ locally, the local number is given as the thing to be surprised by.
 | The fast paths execute and report it (`*_flag_*` = 1.0, `nl_allpairs_calls` = 0) | *whether* they work — only whether they work THERE |
 | The wall-clock energy split is honest (`energy/gpu_over_wall` = 1.002, n=50) | validating `energy/frac_of_step` again |
 | The sizer walks, selects the smallest clearing rung, and reaches a conclusion | the control law's basic operation |
-| Fused Adam removes ~94% of its host syncs and is worth ~10% of step time and ~10 points of occupancy end-to-end (order-reversed replicate pending) | micro-benchmarking Adam in an isolated loop — that instrument synchronises anyway and reports the effect as noise |
+| Fused Adam removes ~94% of Adam's host syncs. **The local ~10% step-time / ~10-point occupancy gain is RETRACTED** — it was order-confounded and did not replicate on the cluster (C1: 0.538 vs 0.533 s, occupancy 36.2 vs 40.9, fused marginally worse) | micro-benchmarking Adam in an isolated loop — that instrument synchronises anyway and reports the effect as noise |
 
 ---
 
@@ -170,3 +170,118 @@ the log, and that `phase` in the summary is the stage you meant to measure.
 - Anything settled locally (§0).
 - Anything about conditional-route *quality*. Nothing under ~5 units is resolvable at one seed, so a conditional quality question needs its own battery with its own seeds — not a rider here.
 - The energy-batch decoupling (`internal_oom_recovery`). The handoff prices it at 15–70x of batch on MLIP routes and says the first step is **reproducing** the failure that got it disabled. That is a debugging task, not an arm.
+
+---
+
+# Round 2 — the shift cap, and the arms it unblocks
+
+Added after the `mem` wave came back. Everything above stands; this is what
+`mem` changed.
+
+## 8. What `mem` established, and the mechanism behind it
+
+`mem` refuted the fragmentation diagnosis outright. MACE at batch 100 cascades
+100 → 23 with three OOM events inside the first ten steps, and **every allocator
+knob was null** — `garbage_collection_threshold`, `max_split_size_mb`, and
+`traj_checkpoint` all moved it nowhere. Only raising `cuda_memory_fraction`
+0.9 → 0.97 moved the settling batch at all (23 → 38), which says the cost is a
+transient inside the energy call rather than anything the allocator can pack
+around.
+
+Local profiling then found a mechanism. `lattice_shift_range` clamps only from
+*below*, so as a cell flattens its interplanar spacing → 0 and the requested
+shift range is unbounded; and `batched_pbc_neighbour_list` takes `.max(dim=0)`
+across the batch, ghost-expanding **every** graph on the worst cell's grid.
+Measured at 128 acridine graphs / 2944 atoms / 6 Å:
+
+| squash | grid | K | peak MiB | with cap |
+|---|---|---|---|---|
+| physical | [3,3,2] | 245 | 254 | 254 |
+| ×0.01 | [3,3,52] | 5 145 | 1 725 | 361 |
+| ×0.003 | [3,3,171] | 16 807 | 3 825 | 361 |
+| ×0.001 | [3,3,510] | 50 029 | **OOM** | 361 |
+
+The edge count rose only 2.5× while memory rose 15× — so it is ghost expansion
+that 127 sane cells never needed. A fresh policy emits exactly those cells, which
+is why the failure is an early transient and why it clears if the run survives.
+
+**F-049 stands but is narrower than it reads.** It says the cost is the
+energy-call transient, and that remains what was measured. It is *not* a claim
+that the MACE route cannot scale — this hardware has run energy batch 73 against
+policy batch 3000 at T=100, so the ceiling is an engineering number. §10 is the
+arm that measures it.
+
+## 9. The cap, and why this shape
+
+`MAX_SHIFT_RANGE = 8`, applied inside `lattice_shift_range`, counted every time
+it binds. Physical acridine needs `n_i` ≤ 3 at a 6 Å cutoff, so 8 leaves 2.7×
+headroom and bounds K at 17³ = 4913.
+
+**Shifts, not `max_num_neighbors`.** Truncating the neighbour list of a
+*geometrically sound* cell is the silent-wrong-energy failure this module exists
+to prevent — the one F-047 removed from the UMA path. Capping shifts drops
+distant images of a cell that is already meaningless.
+
+**Overridable by `MXT_MAX_SHIFT_RANGE`**, so the comparison is a single-key
+toggle rather than a comparison between two builds. A cross-version A/B cannot
+isolate the cap from anything else that moved.
+
+**Where the cap binds, it changes the energy.** That is only harmless because a
+cell that degenerate is rejected by the bounding term anyway — an argument that
+is not self-verifying. `capped_frac` must be read alongside sample acceptance: if
+capping is common *and* those samples are being accepted, the cap is silently
+corrupting energies, and per-graph grids stop being an improvement and become
+the fix.
+
+## 10. The `nlcap` wave
+
+| arm | toggle | question | prediction |
+|---|---|---|---|
+| `nl0_shiftcap_off` | `MXT_MAX_SHIFT_RANGE=100000` | does the uncapped path reproduce `mem`? | 3 OOM events, batch collapses 100 → 23 |
+| `nl1_shiftcap_on` | `MXT_MAX_SHIFT_RANGE=8` | does the cap stop it? | `capped_frac` > 0 early, `oom_events` 0, batch **holds at 100** |
+| `nl2_shiftcap_ladder` | cap on, ladder armed from 25 | *how far* does MACE go now? | settles 100–400 |
+
+`nl0`/`nl1` are byte-identical configs — verified by diff, not assumed. The
+`.env` is the only axis. `nl2` starts at 25, *below* the size that cascaded, so a
+failure to climb is informative rather than a repeat of the crash.
+
+**Read `energy/nl_shift_capped_frac` first, and treat 0 as a real negative.** If
+the cap never binds on the cluster then cluster degeneracy never reached it, and
+this is not the cluster's mechanism. The local evidence is an inference from
+scaling — N·K, with the MACE supercell batch ~10–30× our local atom count, which
+brackets the observed 72 GB — not a measurement of the cluster failure.
+
+## 11. Sequencing
+
+`nlcap` is a **gate**. Submit it alone, because every held MACE arm's batch
+depends on its answer.
+
+```bash
+sbatch configs/cluster_aug19/submit_nlcap.sbatch
+```
+
+Then, only if `nl1` holds its batch, the arms held on the OOM. They need no edit
+— the cap is the in-code default, so they pick it up as they stand:
+
+```bash
+sbatch configs/cluster_aug19/submit_mlip.sbatch
+```
+
+`p2_mace_prod` goes last, with `batch_size` refit to whatever `nl2` settles at
+rather than the 100 it currently carries:
+
+```bash
+sbatch configs/cluster_aug19/submit_prod.sbatch
+```
+
+## 12. Still open, and NOT in this wave
+
+- **Per-graph shift grids** — the real fix, so a degenerate cell costs only
+  itself. A ragged-K change to the ghost expansion; a bigger job than the cap,
+  and the cap does not remove the waste, only bounds the damage.
+- **The four crashed `sizer` arms** — cause unknown, `sacct` never retrieved.
+  `b5_fixed7410` and `b5_fixed12000` reported occupancy from partial runs, so
+  those numbers are provisional and should not be quoted as settled.
+- **`c2_syncs`** — its stack-attributed op table is on cluster disk and wants
+  *reading*, not re-running. It is what would attribute the ~11 600 device→host
+  syncs per step, of which only ~220 are visible from Python.

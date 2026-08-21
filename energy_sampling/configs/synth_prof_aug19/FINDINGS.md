@@ -118,6 +118,20 @@ it is for. That is the obvious next probe and it was not run.
 
 ## 3a. Fused Adam, adopted and MEASURED — and the isolated benchmark misled
 
+> **RETRACTED 2026-08-20 by the cluster A/B.** The end-to-end numbers below
+> (-10.4% step time, +10.2% occupancy) did NOT replicate. `cluster_aug19`'s C1
+> pair, same config, 3000 steps each, measured `batch/med_step_s` 0.538 with
+> fused against 0.533 without, occupancy 36.2 against 40.9 and samples/sec 1609
+> against 1618 -- fused marginally WORSE on all three. The order confound named
+> below as the reason not to bank it (fused ran first, foreach second,
+> back-to-back) is the likely whole effect, and the order-reversed replicate was
+> never run.
+>
+> **What survives:** the sync count (2314 -> 136, -94%) and the instrument
+> lesson -- an isolated `optimizer.step()` loop cannot measure a sync-removal
+> change, because it synchronises anyway. Do not quote the throughput numbers.
+
+
 `fused=True` on all four optimizers (`train.py`, CUDA-guarded, `MXT_FUSED_ADAM=0`
 forces the old path so the change stays A/B-able). Adopted with bit-identity
 knowingly given up (user, 2026-08-19).

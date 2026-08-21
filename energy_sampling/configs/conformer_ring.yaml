@@ -215,7 +215,7 @@ model:
 buffer_device: cuda  # where the churned/static sample stores live (replay + prior + anchor buffers, mol/prior datasets). 'cuda' turns per-step buffer draws/admits/purges into async device gathers instead of serial CPU work + host round trips; footprint ~1KB/graph. 'cpu' = legacy
 batch_size: 256  # number of samples per training batch -- single shared batch size for all rollout work (train fwd/bwd/replay/fused AND eval sampling)
 grow_batch_size: true         # whether to dynamically grow the batch size to fill the RAM
-max_batch_size: 1024  # trajectory memory scales with T; at T=30 the old 3000-row batch OOM-thrashed
+max_batch_size: 20000  # matched to mk_dev; the sizer stops where OCCUPANCY says, and a low cap silently becomes the binding bound (it reported exactly that at 1024)
 eval_num_samples: 2048  # minimum number of samples for evaluation
 test_eval_num_samples: 2000   # held-out conditional eval batch; inert while test_molecules_path is null
 fused_grad_accum_min_samples: 1000  # fused steps only: effective-gradient floor. Batches BELOW this accumulate micro-steps until this many samples contribute; batches AT/ABOVE it take a plain unscaled step. 0 disables

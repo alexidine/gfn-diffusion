@@ -1,0 +1,4 @@
+name	problem	batch	epochs
+cluster_aug19_nl0_shiftcap_off	mace	100	150
+cluster_aug19_nl1_shiftcap_on	mace	100	150
+cluster_aug19_nl2_shiftcap_ladder	mace	25	400

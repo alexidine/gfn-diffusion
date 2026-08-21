@@ -6,16 +6,21 @@ own. Both need a reference measured the same way on structures whose answer we
 already know -- the seven known acridine polymorphs. Without these two controls
 the results mislead in both directions, and did:
 
-  ENERGY. His structures score POSITIVE MACE lattice energy as given (+23 to +91
-  kJ/mol), against prior minima at -62.8. That reads as "his structures are
-  unbound" until you score the known EXPERIMENTAL polymorphs the same way and
-  find they are positive too (+11 to +53). The difference is relaxation, not
-  quality: `std_acridine_polymorphs.pt` is the experimental cell with our rigid
-  conformer and is NOT relaxed, while `std_opt_acridine_polymorphs.pt` is the
-  same structures after rigid-body relaxation and scores -55 to -60. So an
-  unrelaxed structure scoring positive is the NORMAL result on this surface, and
-  his structures may only be compared against the unrelaxed column until L2
-  exists.
+  ENERGY. The two polymorph files differ by CONFORMER, not by relaxation. Their
+  cells and poses are bit-identical -- cell_lengths, cell_angles, aunit_centroid
+  and aunit_orientation all differ by exactly 0.0 -- and only the atoms move.
+  `std_acridine_polymorphs.pt` carries the old `acridine_conformer.pt`
+  (aromatic C-C 1.3668 A) and scores +11 to +53 kJ/mol; `std_opt_...` carries
+  `opt_acridine_conformer.pt` (C-C 1.4027 A) and scores -55 to -60. Every prior
+  and our own L1 reprojection carry the opt conformer, so `std_opt_` is the ONLY
+  like-for-like reference and the ~70 kJ/mol between the files is a conformer
+  effect with no relaxation involved.
+
+  That makes the comparison for his structures: L1 (opt conformer, his cell, no
+  relaxation) against std_opt_ (opt conformer, experimental cell, no relaxation).
+  His median -7.57 sits 20-50 kJ/mol ABOVE the experimental forms at -55 to -60.
+  There is no relaxed polymorph reference in either file; producing one means
+  relaxing them ourselves alongside L2.
 
   DISTANCE. `collate_prior.py` calibrated `log_noise_range` thermally and used
   10**log_noise_range[1] (0.056-0.076) to thin the priors. That is a thinning
@@ -45,11 +50,11 @@ TARGETS = {
     'sg9_zp2': ['ACRDIN05', 'ACRIDIN_VIII'],    # forms VI and VIII
 }
 
-#: the same polymorphs before and after rigid-body relaxation. The pair is the
-#: point: it brackets where an unrelaxed and a relaxed structure sit.
+#: the same experimental cells with two DIFFERENT conformers substituted in.
+#: Neither is relaxed. Only the second is comparable to our priors and our L1.
 STAGES = {
-    'unrelaxed (= our L1)': 'std_acridine_polymorphs.pt',
-    'rigid-body relaxed (= our L2)': 'std_opt_acridine_polymorphs.pt',
+    'OLD conformer -- NOT comparable': 'std_acridine_polymorphs.pt',
+    'opt conformer (= our priors, our L1)': 'std_opt_acridine_polymorphs.pt',
 }
 
 

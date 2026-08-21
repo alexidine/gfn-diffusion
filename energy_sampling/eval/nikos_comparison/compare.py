@@ -57,16 +57,7 @@ from mxtaltools.analysis.crystal_rdf import compute_rdf_distance
 from mxtaltools.common.adaptive_batching import adaptive_batched_analysis
 from mxtaltools.dataset_utils.utils import collate_data_list
 
-from energy_sampling.eval.nikos_comparison.levels import RDF_KWARGS
-
-#: (space group, Z') combinations our brute-force searches actually cover, and
-#: the prior that covers each. A row of the output table is only a real test of
-#: our landscape if his structure lands in one of these.
-SEARCHED = {
-    (14, 1): 'sg14_zp1',
-    (14, 2): 'sg14_zp2',
-    (9, 2): 'sg9_zp2',
-}
+from energy_sampling.eval.nikos_comparison.levels import RDF_KWARGS, searched_combos
 
 #: How constant the energy offset must be across sampled prior structures before
 #: it may be applied as a single number, in kJ/mol. Measured std is ~0.003.
@@ -226,6 +217,21 @@ def main():
                          f"comparable")
     available = {k: levels[k] for k in ('l0', 'l1', 'l2') if levels.get(k) is not None}
     print(f"levels present: {sorted(available)}")
+    searched = searched_combos(cfg)
+    if levels.get('restricted_to_searched'):
+        l0 = available['l0']
+        stray = [(l0.identifier[i], int(l0.sg_ind[i]), int(l0.z_prime[i]))
+                 for i in range(l0.num_graphs)
+                 if (int(l0.sg_ind[i]), int(l0.z_prime[i])) not in searched]
+        if stray:
+            raise AssertionError(
+                f"levels claims it was restricted to searched SG/Z', but "
+                f"{len(stray)} structures are outside it, e.g. {stray[:3]}")
+        print(f"scope: {l0.num_graphs} structures, all in searched SG/Z' "
+              f"{sorted(searched)}")
+    else:
+        print("scope: NOT restricted -- rows outside a searched SG/Z' are not "
+              "a test of our landscape (see the matched_landscape column)")
 
     offset, _ = calibrate_energy_offset(cfg['priors'], ef, predictor, device)
 
@@ -297,11 +303,11 @@ def main():
     print(f"\nwrote {out}")
 
     write_table(cfg, levels, available, priors, results, compack, level,
-                poly, offset, match_cuts)
+                poly, offset, match_cuts, searched)
 
 
 def write_table(cfg, levels, available, priors, results, compack, level,
-                poly, offset, match_cuts):
+                poly, offset, match_cuts, searched):
     """One row per structure of his: where it sits, and what it matched."""
     ef = levels['energy_function']
     manifest = levels['manifest']
@@ -320,7 +326,7 @@ def write_table(cfg, levels, available, priors, results, compack, level,
             'sg_ind': sg,
             'z_prime': zp,
             'nikos_rank': rec['rank'],
-            'matched_landscape': SEARCHED.get((sg, zp), ''),
+            'matched_landscape': searched.get((sg, zp), ''),
             'mirror_flip': rec['mirror_flip'],
             'nonstandard_setting': rec['nonstandard_symmetry'],
             'l0_l1_rdf_gap': round(float(levels['l0_l1_rdf_gap'][i]), 5),
@@ -370,8 +376,7 @@ def write_table(cfg, levels, available, priors, results, compack, level,
         real = [r for r in hits if r['matched_landscape'] == pname]
         print(f"  {pname}: {len(hits)} of his structures within the basin cutoff "
               f"({len(real)} of them in the matching SG/Z')")
-    print("
-DO NOT READ THE CUTOFF COLUMN ON ITS OWN. It is collate_prior's "
+    print("\nDO NOT READ THE CUTOFF COLUMN ON ITS OWN. It is collate_prior's "
           "thermal THINNING radius, not an identity criterion for structures "
           "ingested from outside: 5 of our own 6 targeted known polymorphs also "
           "fall outside it. Run controls.py for the range that 'present in our "

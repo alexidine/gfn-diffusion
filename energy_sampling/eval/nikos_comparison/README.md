@@ -11,6 +11,8 @@ python -m energy_sampling.eval.nikos_comparison.ingest
 python -m energy_sampling.eval.nikos_comparison.levels --write-cifs
 python -m energy_sampling.eval.nikos_comparison.compare
 python -m energy_sampling.eval.nikos_comparison.controls
+python -m energy_sampling.eval.nikos_comparison.modes
+python -m energy_sampling.eval.nikos_comparison.identify
 ```
 
 `controls.py` is **not optional**. Neither an energy nor an RDF distance from
@@ -54,22 +56,74 @@ confirms the top neighbours with COMPACK (ccdc `PackingSimilarity`, 20-molecule
 shell). RDF distance is cheap and ranks candidates; COMPACK is what makes "the
 same structure" a defensible claim.
 
+**`modes.py`** — cuts each landscape into distinct structural modes and places his
+structures on them. **`identify.py`** — COMPACKs his structures directly against
+the known polymorphs, which settles "the experimental form, or another low-energy
+state?" without routing the question through our landscape.
+
+## Structural modes, and why not paper1's clustering
+
+`paper1_results/utils.py::clustering` drives `mean_shift_density` from a KDE over
+the distance matrix — a basin *is* a density maximum there. That is right for GFN
+samples, drawn in proportion to exp(−E/kT). Our brute-force priors are not that:
+`collate_prior.py` ran `greedy_bottom_up_anchors2`, which deletes any sample
+within a thermal radius of one already kept. **Local density in a thinned set
+measures the thinning radius, not the free energy** — running the paper1 path here
+would recover our own preprocessing and present it as landscape structure.
+
+So modes are cut on shape alone: average-linkage agglomerative on the RDF distance
+matrix at a distance threshold. Two consequences:
+
+- **Mode size is not a population.** `n_members` is retained diversity. Modes are
+  ranked by energy; do not turn size into a weight.
+- **The threshold is swept, not assumed**, and validated two ways: the known
+  polymorphs a prior was built to find must land in different modes, and any
+  structure of his that COMPACK-confirmed at a full 20/20 shell must land in the
+  same mode as its confirmed partner (`modes._validate` raises if not).
+
+**The resolution limit is measured.** Distinct known polymorphs are 0.156–0.526
+apart in RDF-EMD (closest pair ACRDIN08/ACRDIN05 at 0.156; the two sg14-Z′2 forms
+0.178). That bounds how coarse any mode cut can be and still separate real forms.
+
+**A landscape only supports this if it contains its own known forms.** It is the
+precondition, and the two priors differ sharply:
+
+Verdicts below are COMPACK over the top-50 RDF neighbours of each form, against
+`std_opt_` so the conformer matches. RDF distance ranks; COMPACK decides.
+
+| prior | its target forms | RDF nn | COMPACK | verdict |
+|---|---|---|---|---|
+| sg14_zp1 | ACRDIN04 / ACRDIN12 | 0.069 / 0.106 | **20/20**, 0.170 / 0.283 Å | both found |
+| sg9_zp2 | ACRDIN05 / ACRIDIN_VIII | 0.060 / 0.087 | **20/20**, 0.200 / 0.192 Å | both found |
+| sg14_zp2 | ACRDIN07 / ACRDIN06 | 0.147 / 0.139 | 10/20, 11/20 | **neither found** |
+
+So sg9_zp2 cuts into 145 interpretable modes, while sg14_zp2 degenerates to 5255
+(the coarsest cut that still separates its targets), and his sg14 structures
+cannot be meaningfully placed. That is a limitation of **sg14_zp2 specifically** —
+not of sg14 in general, since sg14_zp1 contains both its forms at 20/20 — and not
+of his structures.
+
 ## Read nothing without the controls
 
 `controls.py` measures both scales on the seven known polymorphs, whose answer we
 already know. Both scales mislead without it, and did:
 
-**Energy — compare only against the matching relaxation stage.** His structures
-score *positive* MACE lattice energy as given (+23 to +91 kJ/mol) against prior
-minima of −62.8, which reads as "his structures are unbound". But the known
-*experimental* polymorphs score positive too at the same stage (+11 to +53):
-`std_acridine_polymorphs.pt` is the experimental cell with our rigid conformer and
-is **not** relaxed, while `std_opt_acridine_polymorphs.pt` is those same
-structures after rigid-body relaxation and scores −55 to −60. An unrelaxed
-structure scoring positive is the normal result on this surface. Measured at the
-matched (unrelaxed) stage his structures sit at −35.75 to +46.07, median −7.57 —
-*better* than every experimental polymorph. This is why L2 is load-bearing rather
-than a refinement.
+**Energy — the two polymorph files differ by CONFORMER, not relaxation.** Their
+cells and poses are bit-identical (`cell_lengths`, `cell_angles`,
+`aunit_centroid`, `aunit_orientation` all differ by exactly 0.0); only the atoms
+move. `std_acridine_polymorphs.pt` carries the old `acridine_conformer.pt`
+(aromatic C–C **1.3668 Å**) and scores **+11 to +53** kJ/mol.
+`std_opt_acridine_polymorphs.pt` carries `opt_acridine_conformer.pt` (C–C
+**1.4027 Å**) and scores **−55 to −60**. Every prior, and our own L1
+reprojection, carry the opt conformer — so **`std_opt_` is the only like-for-like
+reference**, and that ~70 kJ/mol is a conformer effect with no relaxation in it.
+"opt" in the filename means *optimized conformer*, not relaxed crystal.
+
+Read like-for-like — L1 (opt conformer, his cell, unrelaxed) against `std_opt_`
+(opt conformer, experimental cell, unrelaxed) — his structures sit at median
+**−7.57**, i.e. **20–50 kJ/mol above** the experimental forms. Neither file
+contains a relaxed polymorph, so producing that reference means relaxing them
+ourselves alongside L2.
 
 **Distance — the thinning cutoff is not an identity criterion.**
 `10**log_noise_range[1]` (0.056–0.076) is the thermal radius `collate_prior.py`
@@ -82,14 +136,20 @@ that 0.059–0.143 range, and COMPACK is the arbiter above it.
 
 ## Things that will bite
 
-**Coverage is the first thing to read.** Our searches cover sg14-Z′1, sg14-Z′2
-and sg9-Z′2. His set spans 17 space groups at Z′=2 and Z′=3. For every group we
-never searched, *no match means we never looked there* — not that we looked and
-missed. The `matched_landscape` column marks the rows where the comparison is a
-real test of our landscape; it is empty for the rest.
+**Scope: only the SG/Z′ combinations we actually searched.** `config.yaml` sets
+`restrict_to_searched: true`, and `searched` lists the covered combinations and
+which prior covers each. Of his 80 stage-3 `Unique` structures, **25** qualify —
+21 at sg14-Z′2 (P2₁/c and P2₁/n) and 4 at sg9-Z′2 (Cc). The other 55 span ten
+combinations we never searched, where a non-match would be absence of evidence
+rather than a result; `levels.py` names what it drops. Pass `--all-space-groups`
+to keep them anyway.
 
-sg19-Z′3 exists only as raw chunks in `prior_chunks/` and was deliberately left
-out, so his 8 Z′=3 structures have no Z′-matched landscape at all.
+The mapping lives in config rather than in code so it cannot drift from the
+prior list: adding a prior means adding its `searched` row. `compare.py` asserts
+that a run claiming to be restricted really is.
+
+sg19-Z′3 exists only as raw chunks in `prior_chunks/` and was never collated, so
+his Z′=3 structures have no matched landscape and are outside scope.
 
 **Cross-Z′ comparison is legitimate here.** RDF is divided by `z_prime` and MACE
 energy by `(sym_mult * z_prime)`, so both are per-molecule and compare across Z′.

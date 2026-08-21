@@ -77,20 +77,45 @@ _RANKED = re.compile(
     r'_cell(?P<cell>\d+)_var(?P<var>\d+)')
 _UNRANKED = re.compile(
     r'^acridine_(?P<sg>[^_]+)_cell(?P<cell>\d+)_var(?P<var>\d+)_(?P<serial>\d+)')
+#: the accepted_structures pool, which carries no rank or score at all:
+#: struct_000053_cell38_gp0.3926_0.4295_0.0996
+_STRUCT = re.compile(r'^struct_(?P<serial>\d+)_cell(?P<cell>\d+)')
+
+#: 'Z_prime_2' (the staged export) and 'zprime_2' (the accepted pool)
+_ZP_DIR = re.compile(r'^z_?prime_?(?P<zp>\d+)$', re.IGNORECASE)
 
 
 def parse_provenance(root: str, path: str) -> dict:
-    """Pull Z', stage, space group and his own ranking out of the path."""
+    """
+    Pull Z', stage, space group and any ranking out of the path.
+
+    Handles both layouts he has sent:
+        Z_prime_2/cif_exports/stage3/P21c/Unique/acridine_..._rank0002_score...
+        zprime_2/Cc/struct_000009_cell31_gp...
+    so the directory depth is not assumed -- the Z' and space-group components
+    are identified by what they are, not by position.
+    """
     rel = os.path.relpath(path, root).replace('\\', '/')
     parts = rel.split('/')
     name = os.path.basename(path)[:-len('.cif')]
 
+    zps = [m.group('zp') for m in (_ZP_DIR.match(p) for p in parts) if m]
+    if not zps:
+        raise KeyError(f"no Z' directory (z_prime_N / zprimeN) in {rel!r}")
+    stages = [p for p in parts if p.lower().startswith('stage')]
+
+    #: the space group is the directory holding the file, unless that is the
+    #: 'Unique' subfolder, in which case it is one level up.
+    sg_part = parts[-2] if len(parts) >= 2 else None
+    if sg_part == 'Unique' and len(parts) >= 3:
+        sg_part = parts[-3]
+
     rec = {
         'rel_path': rel,
         'file_name': name,
-        'zp_dir': int(parts[0].rsplit('_', 1)[-1]),      # Z_prime_2 -> 2
-        'stage': int(parts[2].replace('stage', '')),     # stage3 -> 3
-        'sg_label': parts[3],
+        'zp_dir': int(zps[0]),
+        'stage': int(stages[0].lower().replace('stage', '')) if stages else None,
+        'sg_label': sg_part,
         'unique': 'Unique' in parts,
         'rank': None, 'nikos_score': None, 'cell_id': None, 'var': None,
     }
@@ -103,11 +128,12 @@ def parse_provenance(root: str, path: str) -> dict:
     #: His 'score' is not one quantity -- the Cc and Cc_ folders carry values
     #: three orders of magnitude apart (~1e5 vs ~5-8) -- so it is kept purely as
     #: provenance. Everything comparable is recomputed on our energy function.
-    m = _RANKED.match(name) or _UNRANKED.match(name)
+    m = _RANKED.match(name) or _UNRANKED.match(name) or _STRUCT.match(name)
     if m is not None:
         g = m.groupdict()
         rec['cell_id'] = int(g['cell'])
-        rec['var'] = int(g['var'])
+        if 'var' in g:
+            rec['var'] = int(g['var'])
         if 'rank' in g:
             rec['rank'] = int(g['rank'])
             rec['nikos_score'] = float(g['score'])

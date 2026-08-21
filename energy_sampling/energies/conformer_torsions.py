@@ -479,15 +479,44 @@ class ConformerTorsions(BaseSet):
                                  min_separation=min_separation,
                                  scale_14=scale_14, lj_k_factor=lj_k_factor)
 
-    def _batch(self, batch_size: int):
-        """Cached collated tree and force field for a given batch size."""
-        if batch_size not in self._tree_cache:
-            from mxtaltools.conformers.builder import collate
+    _batch_cache_slack = 1.5
 
-            tree = collate([self.spec] * batch_size, device=self.device)
-            ref = self.ref_pos.repeat(batch_size, 1)
-            self._tree_cache[batch_size] = tree
-            self._ff_cache[batch_size] = self._make_ff(tree, ref, **self._ff_kwargs)
+    def _batch(self, batch_size: int):
+        """Cached collated tree and force field for a given batch size.
+
+        BOUNDED, because the cache lives on the device and is keyed on batch size while
+        the batch sizer WALKS batch sizes. One entry costs ~28 MB per 1000 samples for a
+        26-atom molecule, so an unbounded cache parks a gigabyte of dead tree on the card
+        after a single ladder walk to 20000 -- which competes with the live batch, trips
+        the OOM cycle, moves the batch size, and caches another entry.
+
+        The budget is in SAMPLES, not entries. Capping the entry count instead retains
+        the most recent few, and on a monotonically growing ladder those are the LARGEST
+        few -- measured worse than no cap at all (+1557 MB against +1046 MB over a
+        seven-rung walk to 20000). Here the entry just requested is always kept, since it
+        is about to be used, and least-recently-used entries are dropped until the total
+        is within ``_batch_cache_slack`` of it. So the overhead is a fixed fraction of the
+        one entry that is genuinely needed, whatever size the sizer settles on.
+
+        A miss is cheap enough to be worth eating: collate is tiled, so a rebuild is
+        ~0.4 s at 20000 rather than the ~11 s it was before that path existed.
+        """
+        if batch_size in self._tree_cache:
+            self._tree_cache[batch_size] = self._tree_cache.pop(batch_size)   # touch: MRU
+            self._ff_cache[batch_size] = self._ff_cache.pop(batch_size)
+            return self._tree_cache[batch_size], self._ff_cache[batch_size]
+
+        from mxtaltools.conformers.builder import collate
+
+        tree = collate([self.spec] * batch_size, device=self.device)
+        ref = self.ref_pos.repeat(batch_size, 1)
+        self._tree_cache[batch_size] = tree
+        self._ff_cache[batch_size] = self._make_ff(tree, ref, **self._ff_kwargs)
+        budget = self._batch_cache_slack * batch_size
+        while len(self._tree_cache) > 1 and sum(self._tree_cache) > budget:
+            stale = next(iter(self._tree_cache))          # dicts iterate in insertion order
+            self._tree_cache.pop(stale, None)
+            self._ff_cache.pop(stale, None)
         return self._tree_cache[batch_size], self._ff_cache[batch_size]
 
     def dof_from_state(self, x: torch.Tensor):
