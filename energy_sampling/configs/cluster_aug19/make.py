@@ -476,16 +476,20 @@ def arms():
 
     # p3 RESUMES rather than restarts: it reached step 54660 with
     # archive_period 5000, so step50000 is ~4.5 h of training to hand back.
-    # The archive name is {run_name}_{problem_slug}_{tag}.pt with the slug
-    # computed from THIS config, so it is only correct while the config that
-    # produced the run is unchanged -- verify the file exists before submitting;
-    # a warm start pointed at a missing file dies at load.
+    #
+    # THE NAME IS COPIED FROM THE RUN'S OWN OUTPUT, NOT COMPUTED. It is
+    # {run_name}_{problem_slug}_{tag}.pt, and deriving the slug offline got it
+    # wrong twice over: run_name carries the TAG PREFIX as well (hence
+    # cluster_aug19_cluster_aug19_...), and the slug hash came out 44136f
+    # against the real 0060db even though `git diff` showed the config
+    # unchanged since it ran. Verified present on cluster disk 2026-08-21,
+    # alongside its _buffers sidecar.
     #
     # FULL-STATE resume (load_weights_only False): weights alone would drop the
     # optimizers and buffers, and the replay buffer is part of the dynamics.
     # epochs is ABSOLUTE, so 200000 still leaves the whole remaining budget.
-    P3_ARCHIVE = ('cluster_aug19_p3_qm9_cond_prod'
-                  '_elj-qm9split_prior-T6.9-44136f_step50000.pt')
+    P3_ARCHIVE = ('cluster_aug19_cluster_aug19_p3_qm9_cond_prod'
+                  '_elj-qm9split_prior-T6.9-0060db_step50000.pt')
     out[f'{TAG}_p3_qm9_cond_prod_r2'] = generate.arm(
         f'{TAG}_p3_qm9_cond_prod_r2', problem='qm9_conditional', tag=TAG,
         prior_path=QM9_PRIOR, molecules_path=QM9_CONDS,
