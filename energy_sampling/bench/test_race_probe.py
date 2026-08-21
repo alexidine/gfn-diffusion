@@ -222,6 +222,43 @@ def test_a_transition_resets_the_clock_to_stage_relative():
     assert p.tick() is None, 'clock fired on absolute rather than stage-relative steps'
 
 
+def test_the_entry_race_defers_when_the_larder_is_still_filling():
+    """MEASURED FAILURE, run race_L1_phase1 (elj, 2026-08-21): the ramp froze at
+    step 50 with 51 of 68 batches harvested, the entry race fired, found the
+    larder short, and was CONSUMED -- so the run's cold-start escape was thrown
+    away silently and no race ran until the clock. A stage entry is precisely
+    when the harvest is thinnest, so this was not an edge case."""
+    p = _probe()
+    ran = {'n': 0}
+
+    def _guard(entry, why):
+        ran['n'] += 1
+        return None if ran['n'] == 1 else {'entry': entry, 'why': why}
+
+    p._guarded = _guard
+    p.tick()                                        # stage change arms it
+    p.m.step_ind = 1
+    assert p.tick() is None                         # larder short -> deferred
+    assert p._armed_entry, 'a short larder consumed the entry race'
+    p.m.step_ind = 2
+    assert p.tick() == {'entry': True, 'why': 'stage_entry'}
+    assert not p._armed_entry, 'the entry race fired but stayed armed'
+
+
+def test_a_transition_drops_the_previous_stage_harvest():
+    """Batches drawn under the outgoing stage carry its branches and its loss
+    mixture. Racing on them would score candidate rates against an objective the
+    run has already left -- the one comparison the design forbids."""
+    p = _probe()
+    p.tick()                                        # first sight registers the stage
+    _fill(p.larder, 'bwd', 30)                      # then the stage harvests
+    assert p.larder.count('bwd') == 30
+    p.m.protocol.stage = _FakeStage('equilibration', 'fused')
+    p.m.step_ind = 100
+    p.tick()                                        # transition
+    assert p.larder.count('bwd') == 0, 'stale harvest survived the transition'
+
+
 def test_the_probe_never_takes_the_run_down_with_it():
     """A measurement device that can kill training is worse than no device."""
     p = RaceProbe(_FakeModeller(), verbose=False)

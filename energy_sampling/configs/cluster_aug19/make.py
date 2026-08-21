@@ -503,6 +503,45 @@ def arms():
         # the replay buffer, and the buffer is part of the dynamics.
         **{**BASE, 'checkpoint_name': P3_ARCHIVE})
 
+
+    # =============================================================== prod4 ===
+    # MACE PRODUCTION WITH A GENUINE MLE STAGE. Every MACE arm so far carries
+    # `EQ: EQUIL`, which replaces the protocol with a single terminal
+    # `equilibration` stage -- fine for profiling the MACE code, which is what
+    # those arms are for, but it means the policy enters equilibration untrained
+    # and the TB statistics there are not realistic. Phase 2 is the part that
+    # matters and its numbers are only worth reading off a real MLE.
+    #
+    # So this arm runs the FULL unconditional_tb protocol: train_prior, then
+    # equilibration, with the canonical exit between them
+    # (gates/mle_flat AND eval/wass_debiased < 0.015 AND bwd/tbc < 2.0).
+    #
+    # MAX BATCH IS 400, NOT 800, AND THAT IS THE POINT OF THIS ARM'S DESIGN.
+    # train_prior makes NO energy call -- the MLIP arms that sat in it logged
+    # energy/frac_of_step = 0 -- so MLE is cheap and the occupancy ladder will
+    # grow the batch on MLE economics. Phase 2 then starts calling MACE at
+    # whatever the ladder reached, and a transition OOM is fatal rather than
+    # recoverable. p2_mace_prod settled at 261 at T=60 with the cap on, so 400
+    # bounds the ladder near the measured MACE ceiling instead of near the MLE
+    # one.
+    #
+    # archive_period 5000 so this arm LEAVES SOMETHING BEHIND. No MACE run has
+    # ever written a phase1_exit or a prior snapshot -- every one of them is
+    # terminal-stage and none reached step 5000 -- which is why there is no MACE
+    # checkpoint to warm-start from and why `skip_if: prior_loaded` can never
+    # fire on this route. on_exit writes both.
+    out[f'{TAG}_p4_mace_mle'] = generate.arm(
+        f'{TAG}_p4_mace_mle', problem='mipcas_elj', tag=TAG,
+        energy_function='mace', mlip_path=CLUSTER_MACE_MLIP,
+        space_groups=[14], z_primes=[1],
+        prior_path=MACE_PRIOR, molecules_path=MACE_PRIOR,
+        batch_size=25, fused_grad_accum_min_samples=25,
+        max_batch_size=400, grow_batch_size=True, batch_util_target=0.6,
+        batch_growth_interval=10, traj_checkpoint=True,
+        epochs=200000, eval_period=500, figs_period=1000, archive_period=5000,
+        # NOTE: no EQ override -- the full protocol, deliberately.
+        **{'integrator.T': 60, 'eval_T': 60, **BASE})
+
     return out
 
 
@@ -537,6 +576,7 @@ ENV = {
     # the acridine checkpoint's r_max of 6.0.
     f'{TAG}_p2_mace_prod':    {'MXT_EDGE_CAP_FACTOR': '1.25'},
     f'{TAG}_p2_mace_prod_hi': {'MXT_EDGE_CAP_FACTOR': '2.5'},
+    f'{TAG}_p4_mace_mle':      {'MXT_EDGE_CAP_FACTOR': '1.25'},
     # the two held MLIP arms, unblocked by the cap
     f'{TAG}_m1_mace_nl_only':    {'MXT_EDGE_CAP_FACTOR': '1.25',
                                   'MXT_BATCHED_MACE_NEIGHBOURS': '1',
@@ -586,6 +626,9 @@ WAVES = {
     'mlip2': ('03:00:00', ['m1_mace_nl_only', 'm1_mace_nl_gpubatch']),
     # the cancelled pair, resubmitted. p3 warm-starts from its step50000 archive.
     'prod3': ('12:00:00', ['p1_uma_prod_r2', 'p3_qm9_cond_prod_r2']),
+    # the MACE arm that runs a real MLE first, so phase 2's TB numbers mean
+    # something and the route finally leaves a phase1_exit + prior behind.
+    'prod4': ('12:00:00', ['p4_mace_mle']),
     'mem':   ('01:30:00', ['mem0_mace_control', 'mem1_mace_gc',
                            'mem2_mace_split', 'mem3_mace_trajckpt',
                            'mem4_mace_cap97']),

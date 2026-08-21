@@ -520,7 +520,7 @@ class ConformerModeller(Modeller):
         """
         return self.internal_prior is not None
 
-    def _draw_prior_states(self, n, rng, report=False, chunk: int = 4096):
+    def _draw_prior_states(self, n, rng, report=False, chunk: int = 4096, steps=None):
         """Draw from the fitted prior, then REPAIR steric clashes if configured.
 
         A product-of-marginals prior draws each torsion independently, so a long chain
@@ -554,7 +554,9 @@ class ConformerModeller(Modeller):
         """
         states, stats = self.energy_function.sample_prior_states(
             self.internal_prior, n, rng, report=report)
-        steps = int(getattr(self.args.energy_config, 'prior_relax_steps', 0) or 0)
+        if steps is None:
+            steps = getattr(self.args.energy_config, 'prior_relax_steps', 0)
+        steps = int(steps or 0)
         if steps <= 0:
             return states, stats
 
@@ -656,6 +658,69 @@ class ConformerModeller(Modeller):
         if getattr(self, '_prior_rng_state', None) is None:
             self._prior_rng_state = np.random.default_rng(int(self.args.seed))
         return self._prior_rng_state
+
+    def init_anchor_buffer_seed(self):
+        """Seed the anchor buffer from HARDER-RELAXED prior draws, not the prior dataset.
+
+        The base method's `seed_source: prior_dataset` calls that dataset "the real
+        high-quality dataset". On the crystal route it is -- a curated set of real
+        crystals. HERE THERE IS NO DATASET: init_prior_dataset SAMPLES the fitted prior,
+        and `prior_relax_steps` is tuned to land it at T_eff/T = 2.0, i.e. deliberately
+        THERMAL. Seeding anchors from it gives 50,000 average states: measured on
+        tetraglycine, mean 96.8, median 84.4, and a MINIMUM of 45.9 against a tier minimum
+        of 28.3 -- not one good conformer in the set, and `anchor_admitted_last_n` stayed
+        0 for the whole run, so it never improved on that.
+
+        `seed_relax_steps` fixes the seed at its source. Measured over 800 draws, median
+        energy by descent depth: 0 -> 253.1, 10 -> 69.3, 30 -> 51.9, 60 -> 47.1,
+        120 -> 44.5, 250 -> 43.4. SIXTY IS THE KNEE, and its median (47.1) already beats
+        the thermal seed's minimum (45.9); past it the gain is 3 kcal for 4x the cost.
+
+        The prior dataset itself is left at `prior_relax_steps`. The two want different
+        things: backward terminals should be thermal, anchors should mark where the good
+        states are.
+
+        RE-DRAWN AND RE-BAKED, never relaxed in place. `prebuilt_sample_to_reward` reads
+        the baked `conformer_energy` off the batch and REFUSES to recompute, and those
+        energies then warm condition_log_z's best_energy -- so moving the states without
+        rescoring would seed the buffer, and the admission gate, with new geometry
+        carrying old energies.
+        """
+        import types
+
+        from energies.conformer_data import (attach_states, bake_energies,
+                                             condition_from_energy)
+
+        if hasattr(self, 'anchor_buffer'):
+            return
+        cfg = self.args.buffers.anchor_buffer
+        steps = int(getattr(cfg, 'seed_relax_steps', 0) or 0)
+        if getattr(cfg, 'seed_source', 'generated') != 'prior_dataset' or steps <= 0:
+            return super().init_anchor_buffer_seed()
+
+        n = int(getattr(self.args.energy_config, 'prior_sample_size', 50000))
+        states, _ = self._draw_prior_states(n, self._prior_rng, report=False, steps=steps)
+        energies = bake_energies(self.energy_function, states)
+        cond = condition_from_energy(self.energy_function,
+                                     identifier=self.energy_function.smiles)
+        batch = attach_states(cond, torch.as_tensor(states).cpu(), energies.cpu(),
+                              identifier=self.energy_function.smiles,
+                              periodic=self.energy_function.periodic_dims)
+        e = energies.detach().cpu().numpy()
+        print(f'anchor seed: {n} prior draws relaxed {steps} steps -- median '
+              f'{np.median(e):.1f}, p10 {np.percentile(e, 10):.1f}, min {e.min():.1f} '
+              f'kcal/mol (the prior dataset itself stays thermal)')
+
+        # hand the RELAXED set to the base method by standing in for prior_dataset: every
+        # step after the seed batch is chosen -- condition_samples, the reward read,
+        # update_best_energy, key parity, buffer construction -- is identical and worth
+        # reusing rather than duplicating.
+        saved = getattr(self, 'prior_dataset', None)
+        self.prior_dataset = types.SimpleNamespace(batch=batch)
+        try:
+            super().init_anchor_buffer_seed()
+        finally:
+            self.prior_dataset = saved
 
     def init_prior_dataset(self):
         """Phase 1's dataset: draws from the fitted prior, scored at init.

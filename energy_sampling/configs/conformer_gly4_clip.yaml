@@ -654,6 +654,14 @@ buffers:
   # prior-sampling churn cycle comes up short
   anchor_buffer:
     seed_source: 'prior_dataset'   # domain rule (configs/problems.yaml): molecule problems seed from prior_dataset; toys seed from the CONDITIONS .pt
+    seed_relax_steps: 60      # CONFORMER ONLY. The base method calls prior_dataset "the
+    # real high-quality dataset" -- true on the crystal route, false here where it is a
+    # THERMAL sample from the fitted prior (T_eff/T 2.0 by construction). Seeded raw it
+    # gave 50,000 average states, min 45.9 against a tier minimum of 28.3, and
+    # anchor_admitted_last_n stayed 0 all run. 60 descent steps is the measured knee:
+    # median 253.1 -> 69.3 (10) -> 51.9 (30) -> 47.1 (60) -> 44.5 (120) -> 43.4 (250).
+    # The prior dataset itself stays at prior_relax_steps: backward terminals want to
+    # be thermal, anchors want to mark where the good states are.
     max_size: 200000
     dup_cutoff: 0.05          # latent L2 distance below which two CONFIRMED-SURPRISING candidates are literal duplicates. Latents live in a unit box, so this is 5% of an axis
     # Energy windows above that condition's Emin(c), in kJ/mol. At temperature

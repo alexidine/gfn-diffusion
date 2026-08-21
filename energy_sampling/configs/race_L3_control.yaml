@@ -55,7 +55,7 @@ adaptive_lr:
   # Fixed exponential ramp, no sensor: 1/lr_warmup_ratio -> 1.0, then held.
   # Restarted at every stage transition -- the optimizers were just rebuilt onto
   # a surface with different curvature.
-  warmup_steps: 1000
+  warmup_steps: 150   
   # The ramp is DETERMINISTIC and the sensors decide only when it ENDS -- during
   # warmup neither `hyper` nor `ray` moves peak_scale, because the envelope is
   # holding the rate down on purpose and a reading taken through that suppression
@@ -219,7 +219,7 @@ max_batch_size: 20000
 eval_num_samples: 10000       # minimum number of samples for evaluation
 test_eval_num_samples: 2000   # held-out conditional eval batch; inert while test_molecules_path is null
 fused_grad_accum_min_samples: 1000  # fused steps only: effective-gradient floor. Batches BELOW this accumulate micro-steps until this many samples contribute; batches AT/ABOVE it take a plain unscaled step. 0 disables
-epochs: 800
+epochs: 700   
 eval_period: 250              # how often to do evaluation & reporting
 figs_period: 100000
 # --- batch sizer (train.py select_batch_size; state 8, docs/design/phase6_batch_sizer.md) ---
