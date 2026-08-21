@@ -425,6 +425,13 @@ z_calibration:
   grace: 0.8                 # early-out bar as a fraction of threshold: the loop stops once a rollout's OWN fresh reading clears threshold * grace, rather than running out the sampled step count against a stale EMA
   gain: 1.0
   max_steps_per_step: 100.0
+  # --- level fill: a direct re-level for gaps the servo cannot close ---
+  # Fires only where the forward branch is Z-only (freeze_policy) on the
+  # unconditional scalar head -- the equilibration stage below. Reads that
+  # step's own logw, so it costs no rollout and no energy call.
+  fill_threshold: 20.0       # nats. HOW FAR OFF IS FAR ENOUGH: |log_Z - the batch's TB fixed point| must exceed this. 0 or null disables the fill. At 2x fwd_loss_coeffs.beta the clipped dL/dZ the servo reads is fully saturated, so past here the servo cannot tell 20 nats from 8000 and the fill is the only instrument that can
+  fill_se: 5.0               # ...AND the gap must exceed this many standard errors of that fixed point, so a fill never fires on a gap its own batch cannot resolve. The se is +inf when no row is unclipped, which BLOCKS the fill rather than licensing it
+  fill_cooldown_steps: 200   # train steps before another fill may fire. fwd/tb_resid_clipped (the `pooled` sensor) is an EMA that keeps reporting the pre-fill level for its own time constant, so without this the same corrected gap re-arms the fill on a stale reading
   # --- mode: regression only (inert on this route, which runs rollout) ---
   min_visits: null  # per-condition visit floor for a condition to enter the regression target set; null = the tracker's own condition_log_z.min_visits
   freshness_half_life_steps: 300.0  # regression weights decay by condition staleness (TRAIN STEPS since that condition's last tracker update), so a stale ema_logw target counts less than a current one

@@ -60,7 +60,8 @@ from energy_sampling.utils import is_cuda_oom, \
     dict2namespace, \
     get_discretizer, drain_elapsed_times, MetricTracker, quick_tb_stats, uniform_discretizer, logmeanexp, \
     cal_subtb_coef_matrix, per_condition_fraction
-from gflownet_losses import get_gfn_forward_loss, get_gfn_backward_loss, log_pf_estimate
+from gflownet_losses import (get_gfn_forward_loss, get_gfn_backward_loss, log_pf_estimate,
+                             winsorized_z_root)
 from models import GFN
 from energy_sampling.models.aunit_periodicity import sg_periodic_centroid_axes, describe
 from energy_sampling.models.dead_latent_rows import (
@@ -241,6 +242,7 @@ class Modeller:
         self.grad_guard.announce()
         self.protocol = StageProtocol(self)  # the declarative stage engine: coeffs, balance, exits, transitions
         self._check_ray_wiring()
+        self.race_probe = self._build_race_probe()
         self.init_train_constants()
 
     def _ray_probe_armed(self) -> bool:
@@ -288,6 +290,51 @@ class Modeller:
         """Stages declaring `lr_sensor: {kind: ray}`. This IS the probe's switch."""
         return [s.name for s in self.protocol.stages
                 if s.lr_sensor is not None and s.lr_sensor['kind'] == 'ray']
+
+    def _build_race_probe(self):
+        """Replay Racing (docs/design/lr_probe_protocol.md). ABSENT BLOCK = OFF.
+
+        Off by omission, deliberately: an omitted block must not silently start
+        paying for an always-on harvest, and `enabled` alone must not silently
+        start MOVING the rate -- `actuate` is a second, separate key, and it
+        stays false until the design's section-6 gates have been run on the
+        route in question.
+        """
+        cfg = getattr(self.args, 'lr_probe', None)
+        if cfg is None or not getattr(cfg, 'enabled', False):
+            return None
+        from lr_race import RaceConfig
+        from lr_race_probe import RaceProbe
+        rc = RaceConfig(replicates=int(getattr(cfg, 'replicates', 10)),
+                        screen_replicates=int(getattr(cfg, 'screen_replicates', 2)))
+        probe = RaceProbe(self, cfg=rc,
+                          window=int(getattr(cfg, 'window', 10)),
+                          n_hold=int(getattr(cfg, 'holdout', 10)),
+                          actuate=bool(getattr(cfg, 'actuate', False)),
+                          verbose=bool(getattr(cfg, 'verbose', True)))
+        print(f"race: armed, window {probe.window} replicates {rc.replicates} "
+              f"holdout {probe.n_hold} larder/branch {probe.larder.depth} "
+              f"actuate {probe.actuate}")
+        return probe
+
+    def _race_harvest(self, branch, loss_dict, condition, condition_id,
+                      mol_batch, traj, repeats):
+        """Tee one live batch into the larder, if the probe is armed.
+
+        `traj` is the draw's stored path where there is one (replay), and
+        otherwise the path the step ACTUALLY sampled, which only ever surfaces
+        as `loss_dict['flow_states']`. Either way the record is replay-scoreable,
+        which is the whole property the race needs.
+        """
+        probe = getattr(self, 'race_probe', None)
+        if probe is None or not loss_dict:
+            return
+        t = traj if traj is not None else loss_dict.get('flow_states')
+        log_r = loss_dict.get('log_r')
+        if t is None or log_r is None:
+            return
+        probe.harvest(branch, condition, condition_id, log_r, mol_batch,
+                      t, repeats)
 
     def _check_ray_wiring(self):
         """The ray probe is OPT-IN per stage: it runs where and only where a
@@ -1017,6 +1064,8 @@ class Modeller:
         # wandering median, or a rising downward/flat rate, voids the sensor
         # independently of what the alpha* values say.
         metrics.update(self.ray_cal.report())
+        if getattr(self, 'race_probe', None) is not None:
+            metrics.update(self.race_probe.report())
         metrics.update(getattr(self, '_replay_is_stats', {}) or {})
         # Memorisation sensor. replay/resid_vs_intake is the servo's input:
         # 1.0 = delay line, 1/e = 0.368 = the lambda*tau = 1 boundary, below
@@ -2529,6 +2578,11 @@ class Modeller:
                 # interspersed Z-only calibration steps (z_calibration_tick);
                 # inside the timing window so their cost shows in step_dt
                 if current_loss is not None:
+                    # BEFORE the tick: a fill closes the whole gap from data the
+                    # step already paid for, so it must pre-empt the servo's
+                    # rollouts rather than run after they have spent an energy
+                    # call each crawling at lr_flow
+                    self.z_level_fill()
                     self.z_calibration_tick(step_type)
                 self.times['train_step_end'] = time()
                 step_dt = self.times['train_step_end'] - self.times['train_step_start']
@@ -2561,6 +2615,14 @@ class Modeller:
                 # rung ahead of train_step_time)
                 if self.args.grow_batch_size:
                     self.select_batch_size()
+
+                # Replay Racing. Placed AFTER step_dt, the sizer deques and
+                # select_batch_size on purpose: the z_calibration_tick seat sits
+                # INSIDE the timing window, so a race there would post its own
+                # wall time as this iteration's step_dt and feed it to the rung
+                # median, the runaway guard and the throughput meters.
+                if getattr(self, 'race_probe', None) is not None:
+                    self.race_probe.tick()
 
                 # train monitoring
                 if self.step_ind % 10 == 0:
@@ -2990,6 +3052,8 @@ class Modeller:
                 fwd_loss = fwd_loss.detach()
             sub_losses['fwd'] = (fwd_loss, fwd_loss_dict, fwd_active)
             weights['fwd'] = self.fwd_frac if fwd_active else 0.0
+            # this branch's own logw, for the free Z re-level -- see z_level_fill
+            self._stash_z_fill_logw(fwd_loss_dict)
 
         # a DORMANT mode (protocol.mode_dormant: nothing in this stage's rules
         # or exit trigger reads its rolling stats) skips its force-refresh
@@ -4145,7 +4209,142 @@ Two things deliberately NOT done here, both recorded in
                                    step=self.step_ind,
                                    )
         self._stash_z_cal_cache(condition_id)
+        if getattr(self, 'race_probe', None) is not None and report_losses:
+            self._race_harvest('fwd', out[-1], condition, condition_id,
+                               mol_batch, None, repeats)
         return out
+
+    def _stash_z_fill_logw(self, loss_dict):
+        """
+        Keep this fused step's forward per-trajectory `logw` for z_level_fill.
+
+        get_tb_loss's residual is `log_pf + log_Z - log_pb - log_r`, i.e.
+        `log_Z - logw` for `logw = log_pb + log_r - log_pf`. Stashing that vector
+        costs one subtract on tensors the step already produced, and it is what
+        makes the fill free: no rollout and no energy call, unlike the
+        rollout-mode sidecar.
+
+        Stashed ONLY when the forward branch is Z-ONLY (freeze_policy) on an
+        unconditional scalar head -- the equilibration stage's configuration.
+        Under a training policy the level and the policy move together, so a
+        fill would be snapping to a target that is still moving; under a
+        conditional or full_flow head there is no single scalar to fill and the
+        level is a field, not a number.
+        """
+        self._z_fill_logw = None
+        if loss_dict is None:
+            return
+        if self.gfn_model.conditional or self.gfn_model.full_flow:
+            return
+        if not float(getattr(self.args.fwd_loss_coeffs, 'freeze_policy', 0.0) or 0.0):
+            return
+        if not all(k in loss_dict for k in ('log_pb', 'log_r', 'log_pf')):
+            return
+        with torch.no_grad():
+            self._z_fill_logw = (loss_dict['log_pb'] + loss_dict['log_r']
+                                 - loss_dict['log_pf']).detach().reshape(-1)
+
+    def z_level_fill(self):
+        """
+        Set log_Z directly to this batch's TB fixed point, for gaps the
+        frequency-modulated servo cannot close.
+
+        WHY A FILL RATHER THAN MORE STEPS. The sidecar's step size is
+        magnitude-blind twice over: the Huber clips dL/dZ at beta, so a batch
+        800 nats out reads exactly like one 10 nats out, and Adam then
+        normalises whatever survives, so the head moves ~lr_flow nats per step
+        regardless. Error decays LINEARLY, not exponentially, and a large debt
+        is not recoverable inside a stage's budget. The fixed point itself is
+        available in closed form from data the step already paid for
+        (winsorized_z_root), so there is nothing to converge TO -- only a
+        question of whether the batch resolves it.
+
+        THE TWO GATES ANSWER THAT QUESTION SEPARATELY.
+          fill_threshold  how far off is far enough to stop trusting the servo.
+                          Defaulted at 2x beta: within one beta the clipped
+                          gradient still carries magnitude and the servo is the
+                          better instrument; past it every row is saturated.
+          fill_se         whether THIS batch resolves the gap it claims. The
+                          root's standard error is +inf when no row is
+                          unclipped, so a batch carrying only a sign can never
+                          license a fill.
+        Both must pass. The threshold alone would fire on noise from a
+        degenerate batch; the se gate alone would fire constantly on a
+        well-resolved batch sitting a nat from its optimum, which is the
+        servo's job.
+
+        WHAT A FILL INVALIDATES. log_Z is the numeraire, so moving it re-signs
+        every residual at once. The tracker's two level EMAs are shifted here
+        (exactly for the unclipped one, to first order for the winsorized one).
+        The metric_tracker's fwd/tb_resid_clipped -- what mk_dev's `pooled`
+        sensor reads -- CANNOT be shifted from here and keeps reporting the
+        pre-fill level for its own time constant. fill_cooldown_steps is what
+        makes that safe: without it the same corrected gap re-arms the fill on
+        a stale reading. The cooldown is the guarantee; the EMA shifts are a
+        courtesy so the servo does not chase a ghost in the meantime.
+
+        Adam's moments for the flow parameter are dropped, since they describe a
+        pre-fill gradient that no longer points anywhere useful -- the same
+        reason bootstrap_log_z fits through a fresh local Adam.
+        """
+        logw = getattr(self, '_z_fill_logw', None)
+        self._z_fill_logw = None  # single-use: never fill twice off one batch
+        cfg = getattr(self.args, 'z_calibration', None)
+        if logw is None or cfg is None:
+            return
+        threshold = float(getattr(cfg, 'fill_threshold', 0.0) or 0.0)
+        if threshold <= 0:
+            return  # the fill is off by configuration, not by accident
+        cooldown = int(getattr(cfg, 'fill_cooldown_steps', 0) or 0)
+        last = getattr(self, '_z_fill_last_step', None)
+        if last is not None and (self.step_ind - last) < cooldown:
+            return
+
+        # created here, not in z_calibration_tick: the fill runs BEFORE the tick,
+        # so on the first fused step of a run the dict does not exist yet
+        rep = self._z_cal_report = getattr(self, '_z_cal_report', None) or {}
+        beta = float(self.args.fwd_loss_coeffs.beta)
+        try:
+            root, se, frac = winsorized_z_root(logw, beta)
+        except ValueError:
+            rep['z_fill/bad_batch'] = rep.get('z_fill/bad_batch', 0) + 1
+            return
+
+        current = float(self.gfn_model.flow_model.scalar.detach())
+        gap = root - current
+        rep['z_fill/gap'] = gap
+        rep['z_fill/se'] = se
+        rep['z_fill/frac_unclipped'] = frac
+        if abs(gap) <= threshold:
+            return
+        if abs(gap) <= float(getattr(cfg, 'fill_se', 5.0)) * se:
+            # includes the se = +inf case: an all-saturated batch never fills
+            rep['z_fill/blocked_by_se'] = rep.get('z_fill/blocked_by_se', 0) + 1
+            return
+
+        with torch.no_grad():
+            self.gfn_model.flow_model.scalar.data.fill_(root)
+            self.ema_model.flow_model.scalar.data.fill_(root)
+        for name in ('fused', 'flow'):
+            opt = self.optimizers.get(name)
+            if opt is None:
+                continue
+            for p in self.gfn_model.flow_model.parameters():
+                opt.state.pop(p, None)
+        tracker = getattr(self, 'condition_log_z', None)
+        if tracker is not None:
+            with torch.no_grad():
+                # stored residual is logw - log_Z_learned, so raising log_Z by
+                # `gap` lowers every stored level reading by the same amount
+                tracker.z_bias_ema -= gap
+                tracker.z_grad_ema = (tracker.z_grad_ema - gap).clamp(
+                    -tracker.clip_beta, tracker.clip_beta)
+        self._z_fill_last_step = self.step_ind
+        rep['z_fill/fired'] = rep.get('z_fill/fired', 0) + 1
+        rep['z_fill/root'] = root
+        print(f"z_level_fill: log_Z {current:.3f} -> {root:.3f} "
+              f"(gap {gap:+.3f} nats, se {se:.3f}, {frac:.1%} of rows unclipped) "
+              f"at step {self.step_ind}")
 
     def _stash_z_cal_cache(self, condition_id):
         """
@@ -4237,6 +4436,8 @@ Two things deliberately NOT done here, both recorded in
         elif self.bwd_sampling_mode == 'prior':
             self.prior_buffer.update_losses(priority, inds)
 
+        self._race_harvest('bwd', loss_dict, condition, condition_id,
+                           mol_batch, traj, repeats)
         return loss, loss_dict
 
     def _bwd_retention_priority(self, loss_dict):
@@ -4330,6 +4531,8 @@ Two things deliberately NOT done here, both recorded in
                  'lambda_tau': st['replay/lambda_tau']},
                 self.step_ind)
 
+        self._race_harvest('replay', loss_dict, condition, condition_id,
+                           mol_batch, traj, repeats)
         return loss, loss_dict
 
     @torch.no_grad()

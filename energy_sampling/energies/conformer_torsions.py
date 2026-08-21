@@ -92,6 +92,7 @@ class ConformerTorsions(BaseSet):
                  force_field: str = 'reference',
                  ring_mode_fill: float = 0.0,
                  ring_pop_temper: float = 1.0,
+                 energy_clip: float = None,
                  ):
         """
         `level` is keyword-only and has NO default, and there is deliberately no
@@ -105,6 +106,17 @@ class ConformerTorsions(BaseSet):
         if level not in self.LEVELS:
             raise ValueError(f"level must be one of {self.LEVELS}, got {level!r}")
         self.level = level
+        # SOFT REWARD CLIP. Absolute kcal/mol; None = off, which is the default so no
+        # existing run changes. NOT the crystal's `reward_range`: that derives its cutoff
+        # from max(dataset_rewards), and on this route the prior dataset is SAMPLED AND
+        # SCORED before the tier minimum is known, so an energy-distribution-relative
+        # cutoff would be set after 50,000 rows are already baked. An absolute number is
+        # order-independent and cannot acquire that bug.
+        if energy_clip is not None:
+            energy_clip = float(energy_clip)
+            if not np.isfinite(energy_clip):
+                raise ValueError(f'energy_clip must be finite, got {energy_clip!r}')
+        self.energy_clip = energy_clip
         # Modeller energy-protocol fields -- see the protocol section below. n_sg/n_zp are
         # 1 (not 0) so the mixed-radix condition_id arithmetic stays valid and collapses
         # to mol_id; condition_library_size is re-set by init_identifiers().
@@ -1352,6 +1364,21 @@ class ConformerTorsions(BaseSet):
             tree, ff = self._batch(x.shape[0])
             pos = self.build_positions(x)
             e = intramolecular_energy(tree, pos, ff)
+            if self.energy_clip is not None:
+                # Above the cutoff, U -> cutoff + log1p(U - cutoff): monotone, smooth,
+                # IDENTITY BELOW IT, so nothing a physical conformer reaches is deformed.
+                # A clash at 10,000 kcal/mol becomes ~109 at cutoff 100, which is the whole
+                # point -- log Z's TB fixed point is a MEAN of log w, so an unbounded left
+                # tail on log_reward drags it without limit.
+                #
+                # THE FORCE FIELD ONLY, and BEFORE the wall. The box wall is the domain
+                # guarantee, not part of the potential being tempered; compressing it would
+                # make a far off-domain excursion CHEAPER than the clamp intends, and the
+                # sampler would be free to leave the domain. The measure terms (BAT volume
+                # element, log_chart_jacobian) are added later in energy(), so they are
+                # untouched here for the same reason.
+                from mxtaltools.common.utils import log_rescale_positive
+                e = log_rescale_positive(e, self.energy_clip)
             if self._lin_free_idx.numel():
                 # skipped, not added-as-zero, so the geometry path stays bitwise
                 e = e + self.bounding_energy(x, temperature)

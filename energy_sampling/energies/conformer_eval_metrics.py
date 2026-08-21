@@ -70,12 +70,20 @@ def _quantiles(v, prefix, out, hist=True):
 
 
 def energy_components(en, x, chunk: int = 8192) -> dict:
-    """Per-term MMFF energies, ``{term: [B]}``, at T = 1 in kcal/mol.
+    """Per-term MMFF energies, ``{term: [B]}``, at T = 1 in kcal/mol. RAW -- UNCLIPPED.
 
-    Reuses ``intramolecular_energy(components=True)`` rather than re-summing the terms, so
-    the components add up to the potential the trainer actually optimises. The box wall is
-    NOT a component -- it is not part of the force field, it is the chart's boundary
-    condition -- so it is returned separately as 'wall'.
+    Reuses ``intramolecular_energy(components=True)`` rather than re-summing the terms. The
+    box wall is NOT a component -- it is not part of the force field, it is the chart's
+    boundary condition -- so it is returned separately as 'wall'.
+
+    ⚠ WITH ``energy_clip`` SET THESE DO NOT SUM TO WHAT THE TRAINER OPTIMISES, and they
+    cannot: the clip acts on the SUM (potential_energy), and a clipped total has no
+    per-term decomposition to hand back. Measured on tetraglycine at clip 250, the
+    component sum runs to 1.4e7 while potential_energy tops out at 266, disagreeing on 217
+    of 400 rows. That is deliberate and useful -- the raw LJ is how you SEE the clash level
+    the clip is hiding -- but read these as diagnostics of the geometry, never as the
+    objective. ``energy_component_stats`` publishes 'E/clipped_total_*' and
+    'E/clip_active_frac' alongside so the difference is visible rather than implied.
     """
     from mxtaltools.conformers.energy import intramolecular_energy
 
@@ -96,7 +104,13 @@ def energy_components(en, x, chunk: int = 8192) -> dict:
 
 
 def energy_component_stats(en, x, prefix: str = 'E/') -> dict:
-    """Histogram + quantiles for the total and every component."""
+    """Histogram + quantiles for the total and every component.
+
+    When ``energy_clip`` is active the components are RAW and do not sum to the optimised
+    potential (see energy_components), so the clipped total is published beside them along
+    with the fraction of samples the clip actually bit on. Without that, a rising raw
+    'E/lj_mean' reads as the objective degrading when the objective is bounded.
+    """
     comp = energy_components(en, x)
     out = {}
     total = np.zeros(len(next(iter(comp.values()))))
@@ -112,6 +126,18 @@ def energy_component_stats(en, x, prefix: str = 'E/') -> dict:
     denom = sum(mags.values()) or 1.0
     for name, m in mags.items():
         out[f'{prefix}{name}_share'] = m / denom
+    # THE OPTIMISED POTENTIAL, beside the raw sum above. Identical when energy_clip is off;
+    # when it is on, `total` is the uncompressed sum (which can reach 1e7) while this is
+    # what the loss actually sees (bounded near the cutoff). Publishing only the first
+    # makes a bounded objective look like a diverging one.
+    if getattr(en, 'energy_clip', None) is not None:
+        one = torch.tensor(1.0, dtype=en.dtype, device=en.device)
+        with torch.no_grad():
+            clipped = _host(en.potential_energy(
+                torch.as_tensor(x, dtype=en.dtype, device=en.device), one), np.float64)
+        _quantiles(clipped, f'{prefix}clipped_total', out)
+        out[f'{prefix}clip_active_frac'] = float((total > en.energy_clip).mean())
+        out[f'{prefix}energy_clip'] = float(en.energy_clip)
     return out
 
 

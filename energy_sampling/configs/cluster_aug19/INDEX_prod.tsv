@@ -1,4 +1,4 @@
 name	problem	batch	epochs
 cluster_aug19_p1_uma_prod	uma	250	200000
-cluster_aug19_p2_mace_prod	mace	100	200000
+cluster_aug19_p2_mace_prod	mace	25	200000
 cluster_aug19_p3_qm9_cond_prod	elj	1000	200000

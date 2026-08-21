@@ -194,22 +194,36 @@ its wall time into the batch sizer and throughput meters.
   replay config this degenerates to the batch — fine).
 - Score per contrast: paired per-unit loss difference vs the incumbent arm
   on the common held-out slice, per replicate, at matched step counts.
-- The test is an **exact binomial sign test over held-out batch-level
-  contrasts**: count the independent held-out units favoring the challenger
-  and compare against the exact binomial null at the corrected, one-sided
-  level. Genuinely distribution-free for the median — a sign-flip
-  permutation test is exact only under a symmetry assumption on the unit
-  differences that nothing here validates (and a symmetric-noise simulator
-  cannot detect its violation). Arithmetic at the defaults: S=10 units,
-  m=4 challengers (alpha 0.0125 one-sided) -> **>= 9 of 10 units** must
-  favor the challenger; S=20 -> >= 15 of 20. Conservative, and appropriate
-  for coarse rung-sized moves; raise S (scoring-only cost) if power is
-  short, never weaken the test. The original harvested batch is the
-  statistical cluster — correlated trajectories and repeated conditions
-  never count as independent evidence.
-- Half-window sign check: the winner's advantage must have the same sign in
-  both halves of each window, else inconclusive (free; catches
-  fast-transient-then-diverging shapes).
+- **The independent unit is the REPLICATE, not the held-out batch.**
+  Corrected in the build (2026-08-21) after the simulator measured a **4.2%
+  false-move rate against a 1.07% nominal** when the test ran at batch
+  level. Every arm in replicate `j` trains on the same sub-larder in the
+  same order, so that path's luck is a single offset shared by all of that
+  replicate's held-out scores: the batches carry ONE piece of evidence about
+  the rate, not S. Batches still earn their keep — averaging over them makes
+  each replicate's score precise — but the COUNT that enters the test is the
+  number of replicates. This is `ray`'s sub-batch-overlap disease one level
+  up.
+- The test is an **exact binomial sign test over replicate advantages**:
+  count the replicates favoring the challenger against the exact binomial
+  null at the corrected, one-sided level. Distribution-free for the median;
+  a sign-flip permutation test is exact only under a symmetry assumption
+  nothing here validates (and a symmetric-noise simulator cannot detect its
+  violation). At the defaults (r=10, m=2 challengers, alpha/2 = 0.025):
+  **>= 9 of 10 replicates**, realised false-move rate 1.07% per challenger.
+  Computed, never transcribed — `bench/test_lr_race.py` derives every
+  critical value from `math.comb`.
+- `replicates` is therefore **the sample size, not a cost knob**: at r=3
+  even a clean sweep is p = 1/8 and no verdict can reach any level, so the
+  rule would be structurally unable to decide anything. Screens use r=2
+  (selection only, no critical value) — measured, r=1 misses an 8x-hot
+  incumbent 4.0% of the time versus 0.5% at r=2.
+- Half-window check: the advantage must be positive in both halves of the
+  window, **pooled across replicates**. Per-replicate is a conjunction of 2r
+  noisy conditions and was measured rejecting 2 of every 3 genuine wins
+  (33.5% pass on a signal the sign test resolved 87% of the time) — a guard
+  that rejects the mission instead of the failure mode.
+- Any nonfinite/exploding window disqualifies that arm for this probe.
 - Any nonfinite/exploding window disqualifies that arm for this probe,
   logged as `died k/n`. Vetoes gate **actuation, never data**: every probe's
   full per-arm, per-unit, per-replicate record is logged regardless of
@@ -325,9 +339,22 @@ exactly as the shipped code computes it. Assertions:
   should show the violation that got it rejected); a deliberately corrupted
   optimizer-moment restore must trip the duplicate null.
 
+**6.2a THE NUMBER THE SWEEP MUST DELIVER (from the built simulator).** All
+of the rule's power reduces to one quantity the simulator cannot know:
+
+    SNR = mean(replicate advantage) / sd(replicate advantage)   for one rung
+
+Measured power at r=10, 9-of-10: SNR 0.0 -> 1.1% (the false-move rate),
+0.5 -> 14%, 0.8 -> 34%, 1.2 -> 68%, 2.0 -> 98%. **A contrast the probe must
+resolve needs SNR >= ~1.2.** Signal grows with the window length while the
+replicate-level noise does not, so W is the lever. Print the table with
+`python -m bench.race_sim`; the W-sweep's job is to find the smallest W that
+clears it on the real surface, and to report the measured SNR per route.
+
 **6.2 W-sweep.** Run the full probe at W in **{5, 10, 30, 100}** (the
 default W must be in the sweep), >= 3 preregistered replicate sets, at a
-**clean pinned-rate reference**. The current
+**clean pinned-rate reference**, and **report the measured one-rung SNR at
+each W** alongside the selected rate. The current
 `conformer_ring_mle_fixedlr.yaml` is NOT that reference: it resumes a
 step-25k checkpoint with `override_learning_rates: false`, so the
 checkpoint's optimizer LRs — not the configured 1e-4 — are what actually
@@ -361,6 +388,34 @@ is the unmeasured term the gate exists to catch.
 **6.6 Battery discipline.** Null arm always; sort by worst cell; report
 died-in-k/n; no means over survivors; conformer results name the
 internal-coordinate tier.
+
+## 6.7 Build status (2026-08-21)
+
+**Workstream 3 (decision layer + simulator) is BUILT and its gate PASSES.**
+`lr_race.py` (pure logic, no torch) + `bench/race_sim.py` (measurement-level
+simulator) + `bench/test_lr_race.py` (46 tests, fast tier, ~14 s). Report:
+`python -m bench.race_sim`.
+
+Gate 6.1 results, 3000 simulated probes per cell: drift CI inside +-0.005
+dex/probe on every cell including pure-noise, plateau, skewed, LR-dependent
+skew, scale drift, hazard and sprinter; stationary offset |E| <= 0.05 dex and
+sd <= 0.25 on every curved cell; centering holds at C+/C- = 10 (offset -0.020),
+which is the evidence the rejected margin is not needed. Escapes: 8x cold and
+8x hot corrected by one entry event, 800x cold to +0.107 in one event. The
+rejected v1 rule, in the same harness, parks at **+0.55 dex** and fails the
+offset bar — and note it PASSES the drift bar, which is why 6.1 needs both.
+
+Three defects the simulator caught in the design as specified, all fixed:
+batch-level testing ran 4.2% false moves against 1.07% nominal (the unit is
+the replicate); the per-replicate half-window conjunction rejected 2 of 3
+genuine wins; an r=1 screen misses 4% of hot entries.
+
+Honest resolution, measured: at the simulator's SNR the rule resolves ~2-3
+rung errors decisively and one-rung errors barely (3% per probe), so it
+settles with a **~1 rung residual** and rarely moves once settled. That is
+consistent with the design's premise — within a stage the optimum is
+stationary and a mostly-holding rule is correct — but it means the entry/wide
+race, not the fine race, is what actually sets the rate.
 
 ## 7. Implementation plan — five workstreams
 

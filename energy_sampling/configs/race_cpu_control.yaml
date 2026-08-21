@@ -1,20 +1,20 @@
 project_state_version: 9
-run_name: cluster_aug19_b2_ladder_r2
-tag: cluster_aug19
+run_name: race_cpu_control
+tag: synth_aug19
 seed: 12345
-device: cuda
+device: cpu
 cuda_memory_fraction: 0.9
 anomaly_detection: false
 continue_from_checkpoint: false
 mlip_path: null
-checkpoints_dir: /scratch/mk8347/projects/gfn_cond/gfn-diffusion/energy_sampling/checkpoints/
+checkpoints_dir: D:\crystal_datasets\gfn_checkpoints
 checkpoint_name: null
 prior_model_name: null
 load_weights_only: false
-prior_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_prior_dataset.pt
-molecules_path: /scratch/mk8347/data/crystal_datasets/conditional/priors/mipcas_sg2_zp1_elj_prior_dataset.pt
+prior_path: D:\crystal_datasets\conditional\priors\gauss_latent_sg1_zp1_prior.pt
+molecules_path: D:\crystal_datasets\conditional\priors\gauss_latent_sg1_zp1_prior.pt
 test_molecules_path: null
-archive_period: 5000
+archive_period: 100000
 archive_buffers: true
 override_learning_rates: false
 lr_policy: auto
@@ -39,7 +39,6 @@ adaptive_lr:
     eta_down: 0.5
   divergence_loss_abs: 1000000000.0
   divergence_grad_abs: 1000000000.0
-  divergence_loss_rel: 100.0
   divergence_cut: 0.5
   ray_calibration:
     period: 500
@@ -63,14 +62,13 @@ profiling:
     start_step: 1500
     active_steps: 8
     outdir: profiling_results
-    write_trace: false
     record_shapes: false
     with_stack: false
 compile_policy: auto
 traj_checkpoint: false
 gradient_norm_clip: auto
 grad_clip_guard:
-  enabled: true
+  enabled: false
   p: 0.99
   eta: 0.01
   warmup_steps: 100
@@ -105,25 +103,26 @@ model:
   learned_variance: true
   clipping: true
   gfn_clip: 200.0
-  periodic_centroids: true
+  periodic_centroids: false
   dplr_rank: 6
   dplr_rho_max: 0.5
   dplr_mask_angular: true
   pb_exact_reversal: true
-buffer_device: cuda
-batch_size: 1000
-grow_batch_size: true
-max_batch_size: 20000
-eval_num_samples: 10000
+  hold_dead_latent_rows: true
+buffer_device: cpu   # CPU-only run: `device: cpu` alone leaves the buffers on the card (~10GB reserved) -- this is the key that actually keeps them off it
+batch_size: 64
+grow_batch_size: false
+max_batch_size: 300
+eval_num_samples: 1000
 test_eval_num_samples: 2000
-fused_grad_accum_min_samples: 1000
-epochs: 40000
-eval_period: 500
-figs_period: 1000
+fused_grad_accum_min_samples: 0   # no accumulation: a trial step steps every step, so live and trial semantics must match
+epochs: 260
+eval_period: 100000
+figs_period: 100000
 batch_growth_factor: 1.6
 batch_growth_cap: 1000
 batch_growth_interval: 50
-batch_util_target: 0.6
+batch_util_target: 0
 gpu_util_window_s: 900
 gpu_util_sample_period_s: 60
 gpu_util_policy_window_s: 7200
@@ -214,9 +213,6 @@ z_calibration:
   grace: 0.8
   gain: 1.0
   max_steps_per_step: 100.0
-  fill_threshold: 20.0
-  fill_se: 5.0
-  fill_cooldown_steps: 200
   min_visits: null
   freshness_half_life_steps: 300.0
   se2_floor: 0.25
@@ -226,6 +222,36 @@ protocol: unconditional_tb
 protocols:
   unconditional_tb:
     stages:
+    - name: train_prior
+      train_mode: bwd
+      bwd_sampling_mode: dataset
+      skip_if: prior_loaded
+      lr_sensor:
+        kind: hyper
+        beta: 0.1
+      flags:
+        update_log_z: true
+        scramble_conditions: true
+      mle_gate:
+        slope_t: 2.0
+        min_rate: 0.05
+        window: 300
+      loss_coeffs:
+        bwd:
+          mle: 1.0
+          tbc: 1.0
+          repeats: 2.0
+      exit:
+      - metric: gates/mle_flat
+        above: 0.5
+        patience: 5
+      - metric: eval/wass_debiased
+        below: 0.015
+      - metric: bwd/tbc
+        below: 2.0
+      on_exit:
+      - snapshot:phase1_exit
+      - snapshot_prior
     - name: equilibration
       train_mode: fused
       bwd_sampling_mode: prior
@@ -235,6 +261,9 @@ protocols:
         update_log_z: true
         buffers_active: true
         z_calibration: true
+      on_enter:
+      - rebuild_prior_by_churn
+      - bootstrap_z:train_conditioner
       fracs:
         fwd: 0.05
         bwd: 0.45
@@ -347,7 +376,7 @@ protocols:
           vg_lb: 1.0
           condition_block_m: 2.0
           repeats: 1.0
-          level_gap: 1
+          level_gap: 0
           tb_z_source: persistent
         replay:
           tb_z_source: persistent
@@ -377,7 +406,7 @@ controller:
   lookahead_horizon: 5
   lookahead_trend_alpha: 0.1
 grad_geometry:
-  enabled: true
+  enabled: false
   every: 50
 buffers:
   prior_buffer:
@@ -426,12 +455,12 @@ buffers:
     reach_quantile: 0.9
     reach_threshold: 0.75
     reach_topup_size: 1000
-energy_function: elj
+energy_function: latent_gaussian
 temperature_conditioning: false
 molecule_conditioning: false
 sg_conditioning: false
 space_groups:
-- 2
+- 1
 zp_conditioning: false
 z_primes:
 - 1
@@ -441,20 +470,50 @@ embedding_conditioning: false
 embedding_conditioning_dim: 192
 energy_config:
   internal_oom_recovery: false
-  temperature: 2.5
+  temperature: 1.0
   log_temperature_range:
-  - 0
-  - 0.693147
-  density_coeff: 10.0
-  bounding_coeff: 10.0
-  reduction_coeff: 10.0
+  - 0.0
+  - 0.0
+  density_coeff: 0.0
+  bounding_coeff: 1.0
+  reduction_coeff: 1.0
   lj_coeff: 1.0
-  reward_range: 250
-  analyze_kwargs: {}
+  reward_range: null
+  analyze_kwargs:
+    c:
+    - 0.5
+    - 0.5
+    - 0.5
+    - 0.5
+    - 0.5
+    - 0.5
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.5
+    - 0.5
+    - 0.5
+    width: 0.1
+  lj_rescale: null
 checkpoint_read_only: false
 provenance:
   canonical: mk_dev.yaml
-  canonical_sha: 80adc8113834
+  canonical_sha: af4a9fa3a93f
   project_state_version: 9
-  problem: mipcas_elj
-  generated_utc: '2026-08-21T18:29:52Z'
+  problem: latent_gaussian
+  generated_utc: '2026-08-19T19:00:38Z'
+
+# ---------------------------------------------------------------- lr_probe
+# Replay Racing (docs/design/lr_probe_protocol.md rev d). CPU smoke settings:
+# tiny window and few replicates so a race is seconds, not minutes. These are
+# NOT shippable numbers -- the sign test at 4 replicates needs 4-of-4 to move,
+# which is the smoke's point (mechanics), not the design's (power).
+# actuate stays false: this run measures, logs, and changes nothing.
+lr_probe:
+  enabled: false
+  actuate: false
+  window: 3
+  replicates: 4
+  screen_replicates: 2
+  holdout: 4
+  verbose: true

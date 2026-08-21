@@ -775,7 +775,14 @@ def _to_plain(obj):
 # molecule set.
 _NON_IDENTITY_ENERGY_CONFIG_KEYS = ('density_coeff', 'bounding_coeff', 'reduction_coeff', 'lj_coeff',
                                     'reward_range', 'internal_oom_recovery',
-                                    'host_gas_phase_reference')
+                                    'host_gas_phase_reference',
+                                    # the conformer analogue of reward_range, and exempt
+                                    # for the same reason: a soft clip reshapes the reward
+                                    # TAIL without changing which landscape is being
+                                    # sampled, so a checkpoint stays usable across it.
+                                    # The cost is the same one reward_range already
+                                    # carries -- log Z is NOT comparable across settings.
+                                    'energy_clip')
 
 # Explicit version of the problem_def SCHEMA (the set of fields below that
 # constitute a problem's identity). It rides in the dict and therefore in the

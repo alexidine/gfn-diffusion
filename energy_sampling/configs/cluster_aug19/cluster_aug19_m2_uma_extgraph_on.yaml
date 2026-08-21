@@ -214,6 +214,9 @@ z_calibration:
   grace: 0.8
   gain: 1.0
   max_steps_per_step: 100.0
+  fill_threshold: 20.0
+  fill_se: 5.0
+  fill_cooldown_steps: 200
   min_visits: null
   freshness_half_life_steps: 300.0
   se2_floor: 0.25
@@ -451,7 +454,7 @@ energy_config:
 checkpoint_read_only: false
 provenance:
   canonical: mk_dev.yaml
-  canonical_sha: f1176a1db582
+  canonical_sha: 80adc8113834
   project_state_version: 9
   problem: mipcas_elj
-  generated_utc: '2026-08-21T16:40:48Z'
+  generated_utc: '2026-08-21T18:29:53Z'

@@ -716,6 +716,23 @@ energy_config:
   # energy excess (energies/results/prior_baselines_table.txt), which is why the phase-1
   # exit deliberately does NOT overwrite it with the trained policy.
   internal_prior_path: 'conformer_prior_v2.pt'
+  energy_clip: null   # SOFT REWARD CLIP, absolute kcal/mol. null = off (bitwise
+  # identical to no clip). Above it, U -> cutoff + log1p(U - cutoff): monotone, smooth,
+  # identity below. NOT the crystal's `reward_range`, which derives its cutoff from
+  # max(dataset_rewards); this route samples and scores its prior BEFORE the tier minimum
+  # is known, so a distribution-relative cutoff would be set after 50,000 rows are baked.
+  #
+  # 250 on tetraglycine: tier minimum 28.3, equipartition puts a thermal sample at 71.8
+  # (measured relaxed-prior median 69.2) and its tail reaches ~100, so 250 is a 2.5x
+  # margin above anything physical. Measured over 1500 draws it leaves the median at 69.3
+  # UNCHANGED and touches 4.8% of relaxed draws, while the maximum falls 12,293,036 ->
+  # 266. That bound is the point: log Z's TB fixed point is a MEAN of log w, so an
+  # unbounded left tail on log_reward drags it without limit.
+  #
+  # WARNING -- it is part of the PROBLEM DEFINITION, not a tuning knob. Buffers store
+  # BAKED energies, so changing it mid-lineage mixes clipped and unclipped rows in the
+  # same buffer, and log Z is not comparable across settings. Set it for a whole run
+  # lineage from the fresh start, or not at all.
   prior_sample_size: 50000   # rows drawn from the prior model when no prior dataset exists
   prior_relax_steps: 10      # REQUIRED on a chain this long -- see ConformerModeller
   # ._draw_prior_states. The prior draws torsions independently so the chain walks

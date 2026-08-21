@@ -406,6 +406,99 @@ def arms():
         epochs=400, eval_period=200, figs_period=400, archive_period=0,
         **{**BASE, EQ: EQUIL})
 
+
+    # =============================================================== prod2 ===
+    # MACE PRODUCTION, WITH THE EDGE CAP. The edgecap wave settled the mechanism:
+    # uncapped, batch collapses 100 -> 23 with 3 OOMs; at K=256 it HOLDS 100 with
+    # zero OOMs and discards 0.7% of edges by step 150. K=128 also survives but
+    # throws away 11.6%, because real acridine runs 92-104 edges/node and 128 is
+    # only 1.23x headroom.
+    #
+    # THE KNOB IS A FACTOR, NOT A COUNT. Per-node degree is (4/3) pi r^3 rho, so
+    # it transfers across chemistry through DENSITY (0.1056 vs 0.0992 between
+    # acridine polymorphs and priors -- a 6% spread) but scales as the CUBE of
+    # the cutoff. A fixed 256 is 2.46x headroom at r_cut 6 and 0.56x at 10, where
+    # it would discard 45% of a PHYSICAL structure's edges. factor 1.25 -> K=270
+    # at r_cut 6; the arm that held batch 100 ran K=256, i.e. factor 1.185.
+    #
+    # p2 STARTS AT 25, NOT 100. An OOM parks the sizer permanently: crashing down
+    # from 100 lands at 23, climbing up from 25 reached 64. Starting below the
+    # size that cascaded also makes a failure to climb informative rather than a
+    # repeat of the crash.
+    #
+    # WHAT IS ACTUALLY NEW HERE: every cap measurement to date is T=10. p2 runs
+    # T=60 with traj_checkpoint, six times the rollout, so this is the first test
+    # of the cap at production trajectory length. p2_hi is the headroom control --
+    # if 2.5 settles HIGHER than 1.25, then 1.25 is over-tight at T=60 and the
+    # cap is costing batch rather than buying it.
+    for name, factor_note in (('p2_mace_prod', 1.25), ('p2_mace_prod_hi', 2.5)):
+        out[f'{TAG}_{name}'] = generate.arm(
+            f'{TAG}_{name}', problem='mipcas_elj', tag=TAG,
+            energy_function='mace', mlip_path=CLUSTER_MACE_MLIP,
+            space_groups=[14], z_primes=[1],
+            prior_path=MACE_PRIOR, molecules_path=MACE_PRIOR,
+            batch_size=25, fused_grad_accum_min_samples=25,
+            max_batch_size=800, grow_batch_size=True, batch_util_target=0.6,
+            batch_growth_interval=10, traj_checkpoint=True,
+            epochs=200000, eval_period=500, figs_period=1000,
+            archive_period=5000,
+            # eval_T MUST track integrator.T -- the policy learns drift and
+            # variance per step at one dt, so evaluating at another integrates a
+            # different SDE and the numbers become a dt artifact.
+            **{'integrator.T': 60, 'eval_T': 60, **BASE, EQ: EQUIL})
+
+
+    # =============================================================== prod3 ===
+    # THE TWO ARMS THAT WERE CANCELLED, NOT CRASHED. sacct on job 16085658:
+    # both CANCELLED by signal 15 at 02:04 and 04:30 against a 12:00 limit, with
+    # MaxRSS 7.5 GB and 8.8 GB against 48 GB requested -- so neither hit
+    # walltime, neither exhausted host memory, and neither has a code fault on
+    # record (ExitCode 0:0; the batch step's FAILED 15:0 is just the shell
+    # reporting SIGTERM). wandb calls them "crashed" only because a killed
+    # process never calls finish(). There is nothing to fix, so they resubmit
+    # as they stood.
+    #
+    # NEITHER CARRIES THE EDGE CAP. p1 is UMA: fairchem already truncates at 300
+    # neighbours per atom and our external graph exists to avoid exactly that
+    # (F-047), and UMA physical cells reach ~141, so capping there would
+    # reintroduce by hand the truncation that path removed. p3 is conditional
+    # ELJ and makes no MLIP call at all, so the knob is inert either way.
+    out[f'{TAG}_p1_uma_prod_r2'] = generate.arm(
+        f'{TAG}_p1_uma_prod_r2', problem='mipcas_elj', tag=TAG,
+        energy_function='uma', mlip_path=CLUSTER_UMA_MLIP,
+        space_groups=[2], z_primes=[1],
+        prior_path=UMA_PRIOR, molecules_path=UMA_PRIOR,
+        batch_size=250, fused_grad_accum_min_samples=250,
+        max_batch_size=2000, grow_batch_size=True, batch_util_target=0.6,
+        batch_growth_interval=10,
+        epochs=200000, eval_period=500, figs_period=1000, archive_period=5000,
+        **{**BASE, EQ: EQUIL})
+
+    # p3 RESUMES rather than restarts: it reached step 54660 with
+    # archive_period 5000, so step50000 is ~4.5 h of training to hand back.
+    # The archive name is {run_name}_{problem_slug}_{tag}.pt with the slug
+    # computed from THIS config, so it is only correct while the config that
+    # produced the run is unchanged -- verify the file exists before submitting;
+    # a warm start pointed at a missing file dies at load.
+    #
+    # FULL-STATE resume (load_weights_only False): weights alone would drop the
+    # optimizers and buffers, and the replay buffer is part of the dynamics.
+    # epochs is ABSOLUTE, so 200000 still leaves the whole remaining budget.
+    P3_ARCHIVE = ('cluster_aug19_p3_qm9_cond_prod'
+                  '_elj-qm9split_prior-T6.9-44136f_step50000.pt')
+    out[f'{TAG}_p3_qm9_cond_prod_r2'] = generate.arm(
+        f'{TAG}_p3_qm9_cond_prod_r2', problem='qm9_conditional', tag=TAG,
+        prior_path=QM9_PRIOR, molecules_path=QM9_CONDS,
+        test_molecules_path=QM9_TEST,
+        batch_size=1000, fused_grad_accum_min_samples=1000,
+        max_batch_size=20000, grow_batch_size=True, batch_util_target=0.6,
+        epochs=200000, eval_period=500, figs_period=1000, archive_period=5000,
+        # BASE already fixes the checkpoint keys, so the warm start OVERRIDES
+        # them rather than passing them twice. load_weights_only stays False
+        # (BASE's value) on purpose: weights alone would drop the optimizers and
+        # the replay buffer, and the buffer is part of the dynamics.
+        **{**BASE, 'checkpoint_name': P3_ARCHIVE})
+
     return out
 
 
@@ -429,10 +522,24 @@ ENV = {
     f'{TAG}_nl2_shiftcap_ladder': {'MXT_MAX_SHIFT_RANGE': '8'},
     # 0 = OFF, the shipping default: ec0 MEASURES (nl_max_degree reports either
     # way) without changing a single energy.
+    # the edgecap wave predates the factor knob and is left on the retired
+    # absolute-K var so its configs still describe the runs that produced the
+    # result; nothing re-runs from them.
     f'{TAG}_ec0_cap_off':    {'MXT_MAX_EDGES_PER_NODE': '0'},
     f'{TAG}_ec1_cap_256':    {'MXT_MAX_EDGES_PER_NODE': '256'},
     f'{TAG}_ec2_cap_128':    {'MXT_MAX_EDGES_PER_NODE': '128'},
     f'{TAG}_ec3_cap_ladder': {'MXT_MAX_EDGES_PER_NODE': '256'},
+    # prod2: the FACTOR knob. K = factor * r_cut^3, so these read 270 and 540 at
+    # the acridine checkpoint's r_max of 6.0.
+    f'{TAG}_p2_mace_prod':    {'MXT_EDGE_CAP_FACTOR': '1.25'},
+    f'{TAG}_p2_mace_prod_hi': {'MXT_EDGE_CAP_FACTOR': '2.5'},
+    # the two held MLIP arms, unblocked by the cap
+    f'{TAG}_m1_mace_nl_only':    {'MXT_EDGE_CAP_FACTOR': '1.25',
+                                  'MXT_BATCHED_MACE_NEIGHBOURS': '1',
+                                  'MXT_GPU_MACE_BATCH': '0'},
+    f'{TAG}_m1_mace_nl_gpubatch': {'MXT_EDGE_CAP_FACTOR': '1.25',
+                                   'MXT_BATCHED_MACE_NEIGHBOURS': '1',
+                                   'MXT_GPU_MACE_BATCH': '1'},
     f'{TAG}_g2_uma_gate': {'MXT_UMA_GRAPH_TIMER': '1'},
     # ---- the allocator arms. mem0 sets NOTHING, so it takes train.py's
     # setdefault floor (expandable_segments) and is the control for the two
@@ -465,6 +572,16 @@ WAVES = {
                            'nl2_shiftcap_ladder']),
     'edgecap': ('01:30:00', ['ec0_cap_off', 'ec1_cap_256', 'ec2_cap_128',
                              'ec3_cap_ladder']),
+    # MACE production with the cap, plus the two arms it unblocks. p1/p3 are NOT
+    # here: p1_uma_prod was CANCELLED (SIGTERM) undiagnosed and p3_qm9_cond_prod
+    # crashed at step 54660, so both want their logs read before 12 GPU-hours
+    # are spent reproducing the same death. UMA is cap-EXEMPT regardless --
+    # fairchem already truncates at 300/atom and the external graph exists to
+    # avoid exactly that (F-047).
+    'prod2': ('12:00:00', ['p2_mace_prod', 'p2_mace_prod_hi']),
+    'mlip2': ('03:00:00', ['m1_mace_nl_only', 'm1_mace_nl_gpubatch']),
+    # the cancelled pair, resubmitted. p3 warm-starts from its step50000 archive.
+    'prod3': ('12:00:00', ['p1_uma_prod_r2', 'p3_qm9_cond_prod_r2']),
     'mem':   ('01:30:00', ['mem0_mace_control', 'mem1_mace_gc',
                            'mem2_mace_split', 'mem3_mace_trajckpt',
                            'mem4_mace_cap97']),
@@ -564,7 +681,19 @@ srun singularity exec --nv \\
 def check(cfgs):
     for name, cfg in cfgs.items():
         assert cfg['continue_from_checkpoint'] is False, name
-        assert cfg.get('checkpoint_name') is None, f'{name}: no warm starts here'
+        # ONE deliberate exception. Every other arm in this battery starts
+        # fresh, and the guard stays so a warm start cannot slip in by accident
+        # -- an arm that resumes without meaning to measures the wrong stage and
+        # says so nowhere. p3_r2 resumes because its predecessor was CANCELLED
+        # (SIGTERM, not a fault) at step 54660 and step50000 is ~4.5 h of
+        # training to hand back.
+        if name.endswith('p3_qm9_cond_prod_r2'):
+            assert cfg['checkpoint_name'].endswith('_step50000.pt'), name
+            assert cfg['load_weights_only'] is False, (
+                f'{name}: weights-only would drop the optimizers and the replay '
+                f'buffer, and the buffer is part of the dynamics')
+        else:
+            assert cfg.get('checkpoint_name') is None, f'{name}: no warm starts here'
         assert (cfg.get('mlip_path') is None) == \
                (cfg['energy_function'] not in ('uma', 'mace')), name
         assert cfg['figs_period'] % cfg['eval_period'] == 0, name
