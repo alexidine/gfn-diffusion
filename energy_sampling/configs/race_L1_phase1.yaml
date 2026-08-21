@@ -6,7 +6,7 @@
 # the checkpoint problem_def's schema_version (which versions problem identity).
 project_state_version: 9
 
-run_name: 'race_L1c_wandb'
+run_name: 'race_L1d_cosbar'
 tag: 'dev'
 seed: 12345
 device: 'cuda'

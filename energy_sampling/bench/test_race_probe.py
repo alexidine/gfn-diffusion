@@ -146,9 +146,14 @@ class _FakeModeller:
         self.lr_controller = None       # -> _ramping() False
 
 
-def _probe(**kw):
+def _probe(settled=True, **kw):
     p = RaceProbe(_FakeModeller(), verbose=False, **kw)
     p._guarded = lambda entry, why: {'entry': entry, 'why': why}   # do not race
+    if settled:
+        # These tests are about WHICH trigger fires, not about when the stage
+        # has settled; the settling gate has its own tests below.
+        p.MIN_STAGE_STEPS = 0
+        p._transient_settled = lambda rel: True
     return p
 
 
@@ -273,3 +278,58 @@ def test_the_probe_never_takes_the_run_down_with_it():
 
 if __name__ == '__main__':
     sys.exit(pytest.main([__file__, '-q']))
+
+
+# ---------------------------------------------------------------- settling
+
+def test_no_race_runs_inside_the_opening_transient():
+    """MEASURED, run race_L2 (elj, equilibration entry): step times were still
+    swinging 1.8-2.7 s a hundred and sixty steps in, and the entry race fired at
+    ~150. Its verdict therefore described the transition -- a large log-Z level
+    shift -- rather than the stage it was setting a rate for, and a transient
+    reading does not extrapolate to the stage."""
+    p = _probe(settled=False)
+    p.tick()
+    p.m.step_ind = p.MIN_STAGE_STEPS - 1
+    assert p.tick() is None, 'raced inside the transient floor'
+    assert p._armed_entry, 'the transient consumed the entry race'
+
+
+def test_the_z_calibration_actuator_gates_the_entry_race():
+    """`z_cal/p` opens wide at a transition and closes as the level shift
+    resolves, so it is the settling signal for the equilibration entry."""
+    p = _probe(settled=False)
+    p.tick()
+    p.m.step_ind = p.MIN_STAGE_STEPS + 10
+    p.m._z_cal_report = {'z_cal/p': 11.0}           # wide open
+    for _ in range(RaceProbe.Z_CAL_SETTLED_OBS + 2):
+        assert p.tick() is None
+    p.m._z_cal_report = {'z_cal/p': 0.01}           # closed
+    for _ in range(RaceProbe.Z_CAL_SETTLED_OBS - 1):
+        p.tick()
+    assert p.tick() == {'entry': True, 'why': 'stage_entry'}
+
+
+def test_one_spurious_zero_cannot_pass_the_settling_gate():
+    """`z_calibration_tick` pre-sets `z_cal/p` to 0.0 and then returns early on
+    several paths, so a lone 0 means "did not run", not "settled". Requiring a
+    RUN of observations is what makes those zeros harmless."""
+    p = _probe(settled=False)
+    p.tick()
+    p.m.step_ind = p.MIN_STAGE_STEPS + 10
+    p.m._z_cal_report = {'z_cal/p': 9.0}
+    for _ in range(RaceProbe.Z_CAL_SETTLED_OBS):
+        p.tick()
+    p.m._z_cal_report = {'z_cal/p': 0.0}            # one spurious zero
+    assert p.tick() is None, 'a single zero passed the settling gate'
+
+
+def test_a_stage_without_a_z_sidecar_waits_out_the_floor_only():
+    """No signal must not mean no wait: a stage that publishes no `z_cal/p`
+    still gets the step floor rather than racing immediately."""
+    p = _probe(settled=False)
+    p.tick()
+    p.m.step_ind = p.MIN_STAGE_STEPS - 1
+    assert p.tick() is None
+    p.m.step_ind = p.MIN_STAGE_STEPS + 1
+    assert p.tick() == {'entry': True, 'why': 'stage_entry'}

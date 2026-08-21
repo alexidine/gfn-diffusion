@@ -607,12 +607,12 @@ class LRController:
         # beta 0.1, which destroys the one property the ramp exists to provide.
         #
         # So the reading feeds a SMOOTHED error instead of the actuator, and the
-        # ramp ends when that average reaches the setpoint -- "ramp until cos
-        # reaches the target, then stop". Smoothed because one reading is noise
-        # (measured swinging -0.2 to +0.4 through a live warmup); the window is
-        # the only knob. This is NOT a rare safety catch: cos at the operating
-        # point sits near zero, so on a healthy run the ramp is EXPECTED to end
-        # this way rather than by running out of steps.
+        # ramp ends when that average shows the rate approaching the STABILITY
+        # EDGE -- "ramp until it starts to bite, then stop". Smoothed because
+        # one reading is noise (measured swinging -0.2 to +0.4 through a live
+        # warmup). This IS a safety catch and should be rare: on a healthy run
+        # the ramp is expected to run its budget and arrive at the configured
+        # rate, with rate SELECTION left to the probe that follows.
         if self._ramping(st):
             span = max(1, int(self._cfg('warmup_freeze_cos_window', 25)))
             n = int(st.get('hyper_cos_n', 0)) + 1
@@ -627,10 +627,37 @@ class LRController:
             w['status'] = 'warmup_ramp'
             # A FULL WINDOW BEFORE IT MAY FIRE, so one early reading cannot end
             # the ramp -- the failure the high-water rule below was built against.
-            if n >= span and st['hyper_cos_ema'] <= 0.0:
+            # THE BAR IS NEGATIVE, NOT ZERO, AND THE NUMBER MEANS SOMETHING.
+            # At stationarity cos ~ -eta*lambda/2 (docs/hypergradient_review.md
+            # section 2.1), so |cos| estimates the distance to the stability
+            # edge: eta_edge/eta ~ 1/|cos|. A bar at -0.25 therefore reads
+            # "stop ramping at a QUARTER of the edge" -- the same margin
+            # alpha_target 4 already encodes for `ray`.
+            #
+            # At 0.0 this fired on noise, because the equilibrium value of the
+            # statistic is ALREADY slightly negative: the ramp then froze at
+            # its starting value and the stage trained there for good.
+            # Measured 2026-08-21 -- toy froze at envelope 0.1102 on a smoothed
+            # err of -0.000, elj phase 1 (race_L1c_wandb) at 0.2154 on -0.006,
+            # both a fraction of a s.d. from zero against sd(cos) 0.06-0.17.
+            # Both are ~40x below this bar.
+            #
+            # The failure mode also flips to the safe side: the worst case is
+            # now "ramp completes to the CONFIGURED seed" rather than "ramp
+            # never leaves the floor", and a probe follows shortly after to set
+            # the operating rate anyway.
+            #
+            # NOT YET MEASURED: the |cos| ~ eta*lambda/2 relation is derived at
+            # stationarity and a ramp is transient, so 0.25 is an argument, not
+            # a calibration. configs/hyperslope_aug17 is the ladder that would
+            # earn it -- regress cos on pinned log lr and read off where the
+            # magnitude sits relative to the edge.
+            bar = float(self._cfg('warmup_freeze_cos_bar', -0.25))
+            if n >= span and st['hyper_cos_ema'] <= bar:
                 self._freeze_envelope(
-                    st, f'smoothed err {st["hyper_cos_ema"]:+.3f} <= 0 over a '
-                        f'{span}-step mean (cos target {float(cos_target):+.3g})')
+                    st, f'smoothed err {st["hyper_cos_ema"]:+.3f} <= {bar:+.2f} '
+                        f'over a {span}-step mean -- ~1/{1.0 / max(abs(bar), 1e-9):.0f} '
+                        f'of the stability edge (cos target {float(cos_target):+.3g})')
             return
         lo, hi = self._peak_bounds()
         ceiling = self._current_ceiling()

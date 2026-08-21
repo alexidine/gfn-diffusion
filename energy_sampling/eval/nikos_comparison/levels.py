@@ -203,6 +203,10 @@ def main():
                          "structure, including SG/Z' we never searched")
     ap.add_argument('--chunk', type=int, default=None,
                     help='structures per analysis chunk (default 4 on cpu)')
+    ap.add_argument('--out', default=None,
+                    help='output filename (default nikos_levels.pt). Use a '
+                         'distinct name for an --all-space-groups run so it does '
+                         'not overwrite the restricted analysis artifact')
     cli = ap.parse_args()
 
     cfg = load_yaml(cli.config)
@@ -268,8 +272,9 @@ def main():
         print(f"  L1->L2 RDF distance: median {moved.median():.4f}, "
               f"max {moved.max():.4f}")
 
-    out = os.path.join(cfg['out_dir'], 'nikos_levels.pt'
-                       if not cli.limit else f'nikos_levels_limit{cli.limit}.pt')
+    out = os.path.join(cfg['out_dir'],
+                       cli.out or ('nikos_levels.pt' if not cli.limit
+                                   else f'nikos_levels_limit{cli.limit}.pt'))
     torch.save({'l0': l0, 'l1': l1, 'l2': l2, 'std_ok': std_ok,
                 'l0_l1_rdf_gap': gap, 'l1_l2_rdf_gap': moved,
                 'manifest': manifest, 'energy_function': ef,
