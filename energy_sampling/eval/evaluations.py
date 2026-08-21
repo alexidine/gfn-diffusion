@@ -685,102 +685,63 @@ def boltzmann_fig(log_r):
     # === Input energies ===
     energies_np = energies.detach().cpu().numpy() if isinstance(energies, torch.Tensor) else energies
 
-    # === Histogram ===
-    hist_y, hist_x = np.histogram(energies_np, bins=50, density=True)
+    # === Trim to the bulk before binning ===
+    quantile_cutoff = 0.99
+    energy_cutoff = np.quantile(energies_np, quantile_cutoff)
+    bulk = energies_np[energies_np <= energy_cutoff]
+    n_excluded = energies_np.size - bulk.size
+    if bulk.size < 2 or bulk.min() == bulk.max():
+        # Degenerate bulk (tiny batch or near-constant energies) -- bin everything.
+        bulk = energies_np
+        n_excluded = 0
+
+    # === Histogram over the bulk only, so outliers cannot stretch the bins ===
+    hist_y, hist_x = np.histogram(bulk, bins=50, density=True)
     bin_centers = 0.5 * (hist_x[1:] + hist_x[:-1])
     nonzero = hist_y > 0
 
-    # === KDE ===
-    kde = gaussian_kde(energies_np, bw_method=0.3)
-    x_kde = np.linspace(energies_np.min(), energies_np.max(), 500)
-    y_kde = kde(x_kde)
-
-    # === Trim fit to low-energy region ===
-    quantile_cutoff = 0.99
-    energy_cutoff = np.quantile(energies_np, quantile_cutoff)
-    low_energy_mask = bin_centers <= energy_cutoff
-    fit_mask = nonzero & low_energy_mask
-    if fit_mask.sum() < 2:
-        # One extreme outlier stretches the 50 bins wide enough that the whole
-        # bulk falls in a single bin whose CENTRE sits above the 0.99 quantile,
-        # so the trim empties the fit set and log_y.min() has nothing to reduce.
-        # Fall back to every populated bin -- a worse fit, but a live figure.
-        fit_mask = nonzero
-
-    x_fit = bin_centers[fit_mask]
-    log_y = np.log(hist_y[fit_mask])
+    x_fit = bin_centers[nonzero]
+    log_y = np.log(hist_y[nonzero])
 
     # === Linear fit to log P(E) ≈ -βE + const
     try:
         slope, intercept, _, _, _ = linregress(x_fit, log_y)
-        beta_est = -slope
     except:
         slope, intercept = 1, 1
+    beta_est = -slope
 
-    # === Boltzmann fit in linear space
-    boltzmann_y = np.exp(-beta_est * x_kde)
-    boltzmann_y /= (np.trapz(boltzmann_y, x_kde) + 1e-6)
     log_fit = slope * bin_centers + intercept
 
-    # === Create subplots
-    fig = make_subplots(rows=1, cols=2, subplot_titles=('Probability Density', 'Log-Probability vs Energy'))
-
-    # --- Left plot: Linear space
-    fig.add_trace(go.Bar(
-        x=bin_centers, y=hist_y,
-        name='Histogram', opacity=0.5, showlegend=True
-    ), row=1, col=1)
+    # === Single log-space panel
+    fig = go.Figure()
 
     fig.add_trace(go.Scatter(
-        x=x_kde, y=y_kde,
-        mode='lines', name='KDE', line=dict(width=2)
-    ), row=1, col=1)
-
-    fig.add_trace(go.Scatter(
-        x=x_kde, y=boltzmann_y,
-        mode='lines', name=f'Boltzmann Fit (β ≈ {beta_est:.2f})',
-        line=dict(dash='dot')
-    ), row=1, col=1)
-
-    fig.add_trace(go.Scatter(
-        x=[energy_cutoff, energy_cutoff],
-        y=[0, max(y_kde.max(), hist_y.max())],
-        mode='lines', name='Fit Cutoff',
-        line=dict(color='gray', dash='dash')
-    ), row=1, col=1)
-
-    # --- Right plot: Log-space
-    fig.add_trace(go.Scatter(
-        x=bin_centers[nonzero], y=np.log(hist_y[nonzero]),
+        x=x_fit, y=log_y,
         mode='markers+lines', name='log Histogram',
         marker=dict(size=5), line=dict(width=2)
-    ), row=1, col=2)
+    ))
 
     fig.add_trace(go.Scatter(
         x=bin_centers, y=log_fit,
         mode='lines', name=f'Linear Fit (β ≈ {beta_est:.2f})',
         line=dict(dash='dot', width=2)
-    ), row=1, col=2)
+    ))
 
-    fig.add_trace(go.Scatter(
-        x=[energy_cutoff, energy_cutoff],
-        y=[min(log_y.min(), log_fit.min()), log_y.max()],
-        mode='lines', name='Fit Cutoff',
-        line=dict(color='gray', dash='dash')
-    ), row=1, col=2)
+    if n_excluded > 0:
+        fig.add_annotation(
+            xref='paper', yref='paper', x=0.99, y=0.99,
+            xanchor='right', yanchor='top', showarrow=False,
+            text=(f'{n_excluded} sample(s) above q{quantile_cutoff:.2f} '
+                  f'cutoff {energy_cutoff:.3g} not shown '
+                  f'(max E = {energies_np.max():.3g})'),
+            font=dict(size=11, color='gray')
+        )
 
-    # === Layout
     fig.update_layout(
-        # height=500,
-        # width=1000,
-        template='plotly_white'
+        template='plotly_white',
+        xaxis_title='Energy',
+        yaxis_title='log P(E)',
     )
-
-    fig.update_xaxes(title_text='Energy', row=1, col=1)
-    fig.update_yaxes(title_text='P(E)', row=1, col=1)
-
-    fig.update_xaxes(title_text='Energy', row=1, col=2)
-    fig.update_yaxes(title_text='log P(E)', row=1, col=2)
 
     return fig, 1 / beta_est
 

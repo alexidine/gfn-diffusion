@@ -339,6 +339,73 @@ def arms():
         epochs=400, eval_period=200, figs_period=400, archive_period=0,
         **{**BASE, EQ: EQUIL})
 
+
+    # =============================================================== edgecap ===
+    # THE EDGE-COUNT WAVE. `nlcap` refuted the neighbour-list hypothesis as stated
+    # -- the shift cap bound hard (80% of calls at step 10) and the batch still
+    # collapsed 100 -> 23, identically to uncapped. Measuring edges rather than
+    # VRAM explains why: the shift cap converted UNBOUNDED into 30x, and 30x still
+    # OOMs. Measured locally, acridine 92-atom cell at 6 A, one cell squashed:
+    #
+    #     physical      ~89 edges/node   (max 114)
+    #     x0.1          ~10x
+    #     x0.03         ~26x
+    #     x0.003        ~30x   <- saturates because the SHIFT cap binds
+    #     uncapped                332x
+    #
+    # MACE's per-edge tensors are what fills the card, so bounding edges per NODE
+    # bounds the forward exactly: n_nodes = n_atoms * sym_mult does NOT vary with
+    # degeneracy, so max edges = n_nodes * K is known before the forward runs.
+    #
+    # THIS WAVE SPENDS ITS CONTROL ARM ON INSTRUMENTATION. `energy/nl_max_degree`
+    # and `nl_edges_per_call` are new and report with the cap OFF, so ec0 measures
+    # the real edge distribution from real policy samples -- which is what should
+    # set K, rather than the synthetic squashes it was picked from.
+    #
+    # PREDICTIONS, written before launch:
+    #   ec0 (off)  -- reproduces nlcap: 3 OOMs, batch 100 -> 23. nl_max_degree
+    #                 >> 114 in the first reports and decaying as the policy
+    #                 stops emitting degenerate cells. If max_degree never
+    #                 exceeds ~150, edges are NOT the mechanism and this whole
+    #                 line is dead -- a real negative, and ec0 is built to say so.
+    #   ec1 (K=256) -- nl_edge_cap_frac > 0 early, nl_edge_kept_frac well below 1,
+    #                 fewer OOMs than ec0 and a settling batch ABOVE 23.
+    #   ec2 (K=128) -- binds harder than ec1. The risk arm: 128 is only ~12% above
+    #                 the measured physical max of 114, so if physical cells are
+    #                 denser on the cluster than locally this one clips REAL
+    #                 structures. Read nl_edge_cap_frac against sample acceptance.
+    #   ec3        -- ceiling-finder with the cap: starts at 25 like nl2 (which
+    #                 reached 64) and should exceed it if edges were the binding
+    #                 constraint.
+    #
+    # THE INVARIANT THAT OUTRANKS ALL OF THEM: a capped structure must never be
+    # ACCEPTED. Capping is defensible only because those structures are rejected
+    # whatever number we return. nl_edge_cap_frac > 0 on accepted samples means
+    # the approximation reached something that matters -- stop and reassess.
+    #
+    # MAX_SHIFT_RANGE stays 8 in every arm. The 8 -> 4 tightening is a separate
+    # axis and would confound the one this wave varies.
+    for name in ('ec0_cap_off', 'ec1_cap_256', 'ec2_cap_128'):
+        out[f'{TAG}_{name}'] = generate.arm(
+            f'{TAG}_{name}', problem='mipcas_elj', tag=TAG,
+            energy_function='mace', mlip_path=CLUSTER_MACE_MLIP,
+            space_groups=[14], z_primes=[1],
+            prior_path=MACE_PRIOR, molecules_path=MACE_PRIOR,
+            batch_size=100, max_batch_size=100, fused_grad_accum_min_samples=100,
+            epochs=150, eval_period=75, figs_period=150, archive_period=0,
+            **{**BASE, **LADDER_OFF, EQ: EQUIL})
+
+    out[f'{TAG}_ec3_cap_ladder'] = generate.arm(
+        f'{TAG}_ec3_cap_ladder', problem='mipcas_elj', tag=TAG,
+        energy_function='mace', mlip_path=CLUSTER_MACE_MLIP,
+        space_groups=[14], z_primes=[1],
+        prior_path=MACE_PRIOR, molecules_path=MACE_PRIOR,
+        batch_size=25, fused_grad_accum_min_samples=25,
+        max_batch_size=2000, grow_batch_size=True, batch_util_target=0.6,
+        batch_growth_interval=10, traj_checkpoint=True,
+        epochs=400, eval_period=200, figs_period=400, archive_period=0,
+        **{**BASE, EQ: EQUIL})
+
     return out
 
 
@@ -360,6 +427,12 @@ ENV = {
     f'{TAG}_nl0_shiftcap_off': {'MXT_MAX_SHIFT_RANGE': '100000'},
     f'{TAG}_nl1_shiftcap_on': {'MXT_MAX_SHIFT_RANGE': '8'},
     f'{TAG}_nl2_shiftcap_ladder': {'MXT_MAX_SHIFT_RANGE': '8'},
+    # 0 = OFF, the shipping default: ec0 MEASURES (nl_max_degree reports either
+    # way) without changing a single energy.
+    f'{TAG}_ec0_cap_off':    {'MXT_MAX_EDGES_PER_NODE': '0'},
+    f'{TAG}_ec1_cap_256':    {'MXT_MAX_EDGES_PER_NODE': '256'},
+    f'{TAG}_ec2_cap_128':    {'MXT_MAX_EDGES_PER_NODE': '128'},
+    f'{TAG}_ec3_cap_ladder': {'MXT_MAX_EDGES_PER_NODE': '256'},
     f'{TAG}_g2_uma_gate': {'MXT_UMA_GRAPH_TIMER': '1'},
     # ---- the allocator arms. mem0 sets NOTHING, so it takes train.py's
     # setdefault floor (expandable_segments) and is the control for the two
@@ -390,6 +463,8 @@ WAVES = {
     # The MACE init prior re-analysis is the bulk of the wall clock either way.
     'nlcap': ('01:30:00', ['nl0_shiftcap_off', 'nl1_shiftcap_on',
                            'nl2_shiftcap_ladder']),
+    'edgecap': ('01:30:00', ['ec0_cap_off', 'ec1_cap_256', 'ec2_cap_128',
+                             'ec3_cap_ladder']),
     'mem':   ('01:30:00', ['mem0_mace_control', 'mem1_mace_gc',
                            'mem2_mace_split', 'mem3_mace_trajckpt',
                            'mem4_mace_cap97']),

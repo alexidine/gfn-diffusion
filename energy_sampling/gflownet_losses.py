@@ -831,6 +831,79 @@ def get_tb_loss(log_Z_learned, log_pb, log_pf, log_r,
     return tb_loss
 
 
+def winsorized_z_root(logw, beta: float = 10.0, iters: int = 60):
+    """
+    The log_Z at which THIS batch's Huber TB loss has zero Z-gradient, plus the
+    standard error of that estimate. Pure function of a stored `logw` vector: no
+    rollout, no energy call, no optimizer.
+
+    get_tb_loss's residual is `log_pf + log_Z - log_pb - log_r`, i.e. `z - logw`
+    for `logw = log_pb + log_r - log_pf`. The outer `beta` factor cancels
+    smooth_l1's inner `1/beta`, so the Z-gradient is exactly
+
+        dL/dz = mean_i clip(z - logw_i, +-beta)
+
+    -- the residual itself inside the knee, saturating at +-beta outside it.
+    That is nondecreasing in z and runs from -beta to +beta, so it is bracketed
+    by [min(logw) - beta, max(logw) + beta]: every row clips negative at the low
+    end and positive at the high end. Bisection over a FIXED iteration count
+    (no data-dependent stopping, so a rerun on the same batch gives the same
+    bits) lands on the root.
+
+    THE ROOT IS A LOCATION ESTIMATOR, AND WHICH ONE DEPENDS ON beta. It is
+    Huber's, winsorized at beta: rows further off than beta contribute a bounded
+    +-beta rather than their true distance. Sending beta to infinity recovers the
+    plain mean of logw. That is the whole reason beta is not a free knob -- on a
+    left-skewed logw (a clash gives catastrophic log_r, hence a large POSITIVE
+    residual) the clipped rows pull the root down, and raising beta lets them
+    pull harder. Callers wanting the TB fixed point must pass the SAME beta the
+    loss uses.
+
+    The standard error is the M-estimator sandwich, and both halves are
+    quantities named elsewhere in the codebase:
+
+        se = rms(clip(resid, +-beta)) / (sqrt(B) * frac_unclipped)
+
+    The numerator is the ruler ConditionLogZTracker.rms_z_grad reads. The
+    denominator's `frac_unclipped` IS d2L/dz2, the loss's curvature in z, which
+    is bounded above by exactly 1 -- so plain gradient descent on this scalar is
+    stable for any step size below 2, and a step of 1 is a damped Newton step.
+
+    se is +inf when frac_unclipped is 0. A batch whose every row is saturated
+    carries no scale information about z, only a sign, so the root is not
+    identified; a caller gating on se must decline to act rather than treat the
+    returned root as measured.
+
+    Returns (root, se, frac_unclipped) as plain floats.
+    """
+    w = torch.as_tensor(logw).detach().reshape(-1).to(torch.float64)
+    if w.numel() == 0:
+        raise ValueError('winsorized_z_root: empty logw')
+    if not torch.isfinite(w).all():
+        # One inf drags the bracket to +-inf and every bisection midpoint to nan,
+        # which returns a nan root rather than raising -- and a nan filled into
+        # log_Z is unrecoverable. Refuse at the door.
+        raise ValueError('winsorized_z_root: logw holds non-finite entries')
+    if not beta > 0:
+        raise ValueError(f'winsorized_z_root: beta must be positive, got {beta}')
+
+    lo = w.min() - beta
+    hi = w.max() + beta
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        below = (mid - w).clamp(-beta, beta).mean() < 0
+        lo = torch.where(below, mid, lo)
+        hi = torch.where(below, hi, mid)
+    root = 0.5 * (lo + hi)
+
+    signed = root - w
+    resid = signed.clamp(-beta, beta)
+    frac = (signed.abs() < beta).to(torch.float64).mean()
+    rms = resid.pow(2).mean().sqrt()
+    se = (rms / (math.sqrt(w.numel()) * frac)) if float(frac) > 0 else torch.tensor(float('inf'))
+    return float(root), float(se), float(frac)
+
+
 def emp_Z(gfn, log_Z, log_Z_learned, repeats, beta: float = 10):
     """Regress the flow head onto an empirical per-group log Z.
 

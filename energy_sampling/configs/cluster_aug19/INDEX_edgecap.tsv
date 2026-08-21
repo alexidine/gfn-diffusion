@@ -1,0 +1,5 @@
+name	problem	batch	epochs
+cluster_aug19_ec0_cap_off	mace	100	150
+cluster_aug19_ec1_cap_256	mace	100	150
+cluster_aug19_ec2_cap_128	mace	100	150
+cluster_aug19_ec3_cap_ladder	mace	25	400

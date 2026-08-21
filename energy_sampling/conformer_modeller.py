@@ -564,9 +564,14 @@ class ConformerModeller(Modeller):
         x = torch.as_tensor(states, dtype=en.dtype, device=en.device)
         before = en.potential_energy(x, float(en.temperature)).detach()
         out = []
-        for i in range(0, x.shape[0], chunk):
-            best_x, _ = descend(en, x[i:i + chunk], steps)
-            out.append(best_x.detach())
+        # enable_grad EXPLICITLY: the churn path reaches here through
+        # rebuild_prior_by_churn, which is decorated @torch.no_grad(), and `descend` needs
+        # a graph to step. The seed path is not under no_grad, so this fails ONLY on churn
+        # -- late, and long after any short smoke test has passed.
+        with torch.enable_grad():
+            for i in range(0, x.shape[0], chunk):
+                best_x, _ = descend(en, x[i:i + chunk], steps)
+                out.append(best_x.detach())
         x = torch.cat(out, 0)
         if report:
             after = en.potential_energy(x, float(en.temperature)).detach()

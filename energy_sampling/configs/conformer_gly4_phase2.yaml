@@ -6,7 +6,7 @@
 # the checkpoint problem_def's schema_version (which versions problem identity).
 project_state_version: 9
 
-run_name: 'conformer_gly4_aug21a'  # first long-floppy rung: tetraglycine, acyclic, d=87
+run_name: 'gly4_phase2_aug21d'  # phase 2 off the MLE warm start
 tag: 'conformer'
 seed: 12345
 device: 'cuda'
@@ -20,7 +20,10 @@ mlip_path: null  # MLIP weights, for energy_function uma/mace only. Unused on el
 checkpoints_dir: 'D:\crystal_datasets\gfn_checkpoints'  # where this run writes and reloads every checkpoint
 # Kept under a prefix no run writes to, so train_prior's own on_exit snapshot
 # cannot overwrite the warm start it is being started FROM.
-checkpoint_name: null  # warm start: weights + optimizers + buffers, with its _buffers.pt sidecar. null = fresh run  |  fresh run
+checkpoint_name: 'conformer_conformer_gly4_aug21a_conformer_torsions-noprior-T1-f31f7c_running.pt'
+# _running, NOT _best. That run never left phase 1, so it wrote no _phase1_exit
+# snapshot, and a _best.pt from such a prefix is a mid-phase-1 frame that kills the
+# resume at step 0 with a non-finite gradient before any weight update.
 prior_model_name: null  # a SEPARATE frozen GFN, used only to sample the prior buffer; rebuilt from its own stored config, so any architecture. To warm-start the POLICY from it instead, use checkpoint_name + load_weights_only  |  the prior is an InternalPrior (energy_config.internal_prior_path), not a GFN
 load_weights_only: false     # true = take only model weights from checkpoint_name; optimizers, buffers and step count start fresh
 prior_path: null  # seeds the prior buffer, and the anchor buffer on molecule routes  |  no prior dataset file; init_prior_dataset samples the fitted prior instead
@@ -225,7 +228,10 @@ max_batch_size: 20000  # matched to mk_dev; the sizer stops where OCCUPANCY says
 eval_num_samples: 2048  # minimum number of samples for evaluation
 test_eval_num_samples: 2000   # held-out conditional eval batch; inert while test_molecules_path is null
 fused_grad_accum_min_samples: 1000  # fused steps only: effective-gradient floor. Batches BELOW this accumulate micro-steps until this many samples contribute; batches AT/ABOVE it take a plain unscaled step. 0 disables
-epochs: 10000  # ABSOLUTE, not additional
+epochs: 18000  # ABSOLUTE, not additional -- the resume lands at 10,000, so 8,000 of
+# phase 2. Sized to finish rather than be killed mid-stage: the first attempt opened at
+# 5 s/it, which over 18,000 steps projected to a day. Snapshots are periodic, so this
+# can be extended by resuming rather than by guessing high now.
 eval_period: 500  # how often to do evaluation & reporting  |  project cadence
 figs_period: 1000  # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire  |  project cadence; must be a multiple of eval_period
 # --- batch sizer (train.py select_batch_size; state 8, docs/design/phase6_batch_sizer.md) ---
@@ -499,33 +505,22 @@ protocols:
           update_log_z: true
         mle_gate:
           slope_t: 2.0
-          min_rate: 0.80   # 0.30 -> 0.80. The gate tests rate + 2*se < min_rate, so the
-                           # noise floor is 2*se and min_rate must clear it. At d=87 the
-                           # gate's own mle_gate_rate_se plateaued at 0.49 by step 600 and
-                           # does NOT shrink with training, putting the floor at 0.98
-                           # against min_rate 0.30 -- so the gate could only fire on a
-                           # REGRESSION and phase 1 never exited. Same failure the 0.30
-                           # was introduced to fix at 72 DoF, recurring because the floor
-                           # scales with the system and the threshold did not.
-                           # min_rate is the knob that works; widening the window helps
-                           # only ~1.8x (measured previously, NOT the n^-1.5 an OLS slope
-                           # would suggest -- curvature inflates the residual), which at
-                           # window 1000 leaves the floor near 0.54. 0.80 clears that and
-                           # still only fires once descent falls under ~0.26 nats/100
-                           # steps, against the 0.45-0.70 seen while genuinely descending.
-                           # VERIFY on the next fresh run: read mle_gate_rate_se and check
-                           # 2*se sits comfortably under min_rate.
-          window: 1000     # helps, but is not the load-bearing change; see min_rate
+          min_rate: 0.30   # was 0.05, which sits BELOW the measured noise floor
+                           # (2*se ~ 0.21 at 72 DoF) and so could only fire on a
+                           # REGRESSION -- 12,050 steps on phenyl-THP for a warm
+                           # start that had plateaued by ~1,500
+          window: 300
         loss_coeffs:
           bwd: { mle: 1.0, tbc: 1.0, repeats: 2.0 }
         exit:
-          # `bwd/tbc below 2.0` DELIBERATELY REMOVED. It is a phenyl-THP number and does
-          # not transfer: on tetraglycine tbc passed under 2.0 only briefly around step
-          # 600 and then rose steadily to 5-6 while the MLE was still descending cleanly,
-          # so as an AND-term it blocked the exit outright. No principled replacement is
-          # available from one run, and an invented threshold is worse than none -- a
-          # converged MLE is the criterion that actually says the warm start is done.
-          - { metric: gates/mle_flat, above: 0.5, patience: 5 }
+          # ADVANCE AT THE FIRST EVAL. A resume re-enters train_prior (Protocol.begin
+          # returns early when step_ind != 0) with streaks reset, and this molecule cannot
+          # satisfy the inherited gates: se plateaued at ~0.49 so gates/mle_flat needs a
+          # regression against min_rate 0.30, and bwd/tbc rose away from 2.0 after step
+          # 600. There is no step-based exit term, so a trivially-true metric is how you
+          # say 'advance now'. Plain float: PyYAML reads '1.0e9' as a STRING and the
+          # comparison then raises.
+          - { metric: bwd/tbc, below: 1000000.0 }
         # OWNER DECISION 2026-08-20 -- `snapshot_prior` is DELIBERATELY ABSENT.
         #
         # The crystal route ends this stage with [ 'snapshot:phase1_exit',

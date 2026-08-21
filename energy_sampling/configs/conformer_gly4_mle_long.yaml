@@ -6,7 +6,7 @@
 # the checkpoint problem_def's schema_version (which versions problem identity).
 project_state_version: 9
 
-run_name: 'conformer_gly4_aug21a'  # first long-floppy rung: tetraglycine, acyclic, d=87
+run_name: 'gly4_mle_long_aug21a'  # MLE ONLY: does phase 1 converge, and do the stiff torsions move
 tag: 'conformer'
 seed: 12345
 device: 'cuda'
@@ -20,7 +20,9 @@ mlip_path: null  # MLIP weights, for energy_function uma/mace only. Unused on el
 checkpoints_dir: 'D:\crystal_datasets\gfn_checkpoints'  # where this run writes and reloads every checkpoint
 # Kept under a prefix no run writes to, so train_prior's own on_exit snapshot
 # cannot overwrite the warm start it is being started FROM.
-checkpoint_name: null  # warm start: weights + optimizers + buffers, with its _buffers.pt sidecar. null = fresh run  |  fresh run
+checkpoint_name: 'conformer_conformer_gly4_aug21a_conformer_torsions-noprior-T1-f31f7c_running.pt'
+# resumes at step 10,000, inside train_prior (Protocol.begin returns early when
+# step_ind != 0), which is exactly what this run wants.
 prior_model_name: null  # a SEPARATE frozen GFN, used only to sample the prior buffer; rebuilt from its own stored config, so any architecture. To warm-start the POLICY from it instead, use checkpoint_name + load_weights_only  |  the prior is an InternalPrior (energy_config.internal_prior_path), not a GFN
 load_weights_only: false     # true = take only model weights from checkpoint_name; optimizers, buffers and step count start fresh
 prior_path: null  # seeds the prior buffer, and the anchor buffer on molecule routes  |  no prior dataset file; init_prior_dataset samples the fitted prior instead
@@ -225,7 +227,7 @@ max_batch_size: 20000  # matched to mk_dev; the sizer stops where OCCUPANCY says
 eval_num_samples: 2048  # minimum number of samples for evaluation
 test_eval_num_samples: 2000   # held-out conditional eval batch; inert while test_molecules_path is null
 fused_grad_accum_min_samples: 1000  # fused steps only: effective-gradient floor. Batches BELOW this accumulate micro-steps until this many samples contribute; batches AT/ABOVE it take a plain unscaled step. 0 disables
-epochs: 10000  # ABSOLUTE, not additional
+epochs: 40000  # ABSOLUTE, not additional -- resume lands at 10,000, so 30,000 more MLE
 eval_period: 500  # how often to do evaluation & reporting  |  project cadence
 figs_period: 1000  # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire  |  project cadence; must be a multiple of eval_period
 # --- batch sizer (train.py select_batch_size; state 8, docs/design/phase6_batch_sizer.md) ---
@@ -518,14 +520,13 @@ protocols:
           window: 1000     # helps, but is not the load-bearing change; see min_rate
         loss_coeffs:
           bwd: { mle: 1.0, tbc: 1.0, repeats: 2.0 }
-        exit:
-          # `bwd/tbc below 2.0` DELIBERATELY REMOVED. It is a phenyl-THP number and does
-          # not transfer: on tetraglycine tbc passed under 2.0 only briefly around step
-          # 600 and then rose steadily to 5-6 while the MLE was still descending cleanly,
-          # so as an AND-term it blocked the exit outright. No principled replacement is
-          # available from one run, and an invented threshold is worse than none -- a
-          # converged MLE is the criterion that actually says the warm start is done.
-          - { metric: gates/mle_flat, above: 0.5, patience: 5 }
+        # NO `exit` BLOCK, DELIBERATELY. This run is MLE-only: it must never advance to
+        # equilibration, because the question it answers is whether phase 1 converges at
+        # all and whether the stiff torsions (carboxyl O-H, amide omega) move with more
+        # MLE. An absent exit runs the stage to `epochs`, as equilibration itself does.
+        # The mle_gate block below is KEPT so gates/mle_flat and mle_gate_rate_hi are
+        # still published -- the recalibrated min_rate can be watched WITHOUT acting on
+        # it, which is the observation this run is for.
         # OWNER DECISION 2026-08-20 -- `snapshot_prior` is DELIBERATELY ABSENT.
         #
         # The crystal route ends this stage with [ 'snapshot:phase1_exit',

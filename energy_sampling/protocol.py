@@ -1544,10 +1544,51 @@ class StageProtocol:
         bootstrap_log_z's docstring."""
         m = self.m
         if (not m.gfn_model.full_flow) and (not m.gfn_model.conditional):
-            if eval_metrics is None or 'eval_fwd/jensen_z' not in eval_metrics:
-                raise RuntimeError("bootstrap_z needs eval metrics (eval_fwd/jensen_z) -- "
-                                   "it can only run from an eval-time transition")
-            empirical_z = eval_metrics['eval_fwd/jensen_z']
+            # PREFER THE TRACKER'S ema_logw over the eval's raw forward Jensen, which is
+            # what the conditional branch below has always done (bootstrap_log_z regresses
+            # onto ema_logw, "NEVER ema_log_z_emp"). The scalar branch was the odd one out.
+            #
+            # All three candidates estimate different things:
+            #   ema_log_z_emp  logmeanexp -- (nearly) UNBIASED for log Z, and unusable as
+            #                  an anchor: logsumexp has no 1/n dilution, so one bad
+            #                  off-policy sample sends it to billions of nats. Feeding it
+            #                  back measurably broke a live run. See ConditionLogZTracker
+            #                  .lookup.
+            #   ema_logw       E[log w], the Jensen bound -- structurally BELOW log Z, but
+            #                  it is what TB's squared residual actually converges to, and
+            #                  the tracker's copy is rank-trimmed, 1/n-diluted and EMA'd
+            #                  over an evidence half-life.
+            #   eval_fwd/jensen_z  the SAME estimand as ema_logw, raw: one eval, no trim,
+            #                  no EMA, and taken on FORWARD samples, which MLE's
+            #                  mode-covering objective deliberately spreads into
+            #                  clash regions. Measured on tetraglycine it swung -5,210 to
+            #                  -15,233 between adjacent evals while ema_logw sat at -239,
+            #                  so the anchor depended on which eval the transition hit --
+            #                  and it left log_Z ~8,000 nats from its fixed point, a debt
+            #                  phase 2 then spent its whole budget servicing.
+            empirical_z, src = None, None
+            tracker = getattr(m, 'condition_log_z', None)
+            if tracker is not None:
+                # plain lists, not tensor ops: this module is deliberately torch-free.
+                # `v == v` is the NaN test (an unvisited slot is NaN, not missing).
+                seen = [v for c, v in zip(tracker.count.tolist(), tracker.ema_logw.tolist())
+                        if c >= tracker.min_visits and v == v]
+                if seen:
+                    empirical_z = sum(seen) / len(seen)
+                    src = f'condition_log_z.ema_logw ({len(seen)} visited)'
+            if empirical_z is None:
+                # cold tracker (too few visits): fall back to the old source rather than
+                # refuse to bootstrap at all
+                if eval_metrics is None or 'eval_fwd/jensen_z' not in eval_metrics:
+                    raise RuntimeError(
+                        "bootstrap_z needs either a visited condition_log_z tracker or "
+                        "eval metrics (eval_fwd/jensen_z) -- it can only run from an "
+                        "eval-time transition")
+                empirical_z = eval_metrics['eval_fwd/jensen_z']
+                src = 'eval_fwd/jensen_z (tracker cold)'
+            raw = (eval_metrics or {}).get('eval_fwd/jensen_z')
+            print(f"bootstrap_z: log_Z <- {empirical_z:.3f} from {src}"
+                  + (f" (eval_fwd/jensen_z was {raw:.3f})" if raw is not None else ""))
             m.gfn_model.flow_model.scalar.data.fill_(empirical_z)
             m.ema_model.flow_model.scalar.data.fill_(empirical_z)
         else:

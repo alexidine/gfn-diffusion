@@ -93,3 +93,31 @@ def test_thermal_molecule_is_left_alone_by_default():
 def test_knob_is_consumed_not_forwarded_to_the_energy_function():
     """ConformerTorsions takes no **kwargs, so a stray key raises at construction."""
     assert 'prior_relax_steps' in _NON_ENERGY_KEYS
+
+def test_relax_works_under_no_grad():
+    """The CHURN path reaches _draw_prior_states through rebuild_prior_by_churn, which is
+    decorated @torch.no_grad(). The seed path is not, so a missing enable_grad fails only
+    at the first churn -- late, and after any short smoke test has passed. It did exactly
+    that: phase 2 died on launch with 'element 0 of tensors does not require grad'.
+    """
+    m = _stub(GLY4, 10)
+    en = m.energy_function
+    with torch.no_grad():
+        got, _ = ConformerModeller._draw_prior_states(m, 256, np.random.default_rng(3))
+    got = torch.as_tensor(got, dtype=en.dtype, device=en.device)
+    raw, _ = en.sample_prior_states(m.internal_prior, 256, np.random.default_rng(3),
+                                    report=False)
+    raw = torch.as_tensor(raw, dtype=en.dtype, device=en.device)
+    assert not torch.equal(raw, got), 'no-grad path returned the draw untouched'
+    one = torch.tensor(1.0, device=en.device)
+    assert en.potential_energy(got, one).median() < en.potential_energy(raw, one).median()
+
+
+def test_relax_spans_more_than_one_chunk():
+    """Chunking is real code with an off-by-one to get wrong; exercise >1 chunk."""
+    m = _stub(GLY4, 5)
+    en = m.energy_function
+    got, _ = ConformerModeller._draw_prior_states(m, 300, np.random.default_rng(4), chunk=128)
+    got = torch.as_tensor(got, dtype=en.dtype, device=en.device)
+    assert got.shape == (300, en.data_ndim)
+    assert torch.isfinite(got).all()
