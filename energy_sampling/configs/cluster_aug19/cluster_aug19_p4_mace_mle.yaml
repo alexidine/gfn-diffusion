@@ -3,7 +3,7 @@ run_name: cluster_aug19_p4_mace_mle
 tag: cluster_aug19
 seed: 12345
 device: cuda
-cuda_memory_fraction: 0.9
+cuda_memory_fraction: 0.97
 anomaly_detection: false
 continue_from_checkpoint: false
 mlip_path: /scratch/mk8347/data/acr_112025_mh1_stagetwo.model
@@ -67,7 +67,7 @@ profiling:
     record_shapes: false
     with_stack: false
 compile_policy: auto
-traj_checkpoint: true
+traj_checkpoint: false
 gradient_norm_clip: auto
 grad_clip_guard:
   enabled: true
@@ -268,6 +268,7 @@ protocols:
         z_calibration: true
       on_enter:
       - set_max_batch_size:250
+      - set_traj_checkpoint:1
       fracs:
         fwd: 0.05
         bwd: 0.45
@@ -490,4 +491,4 @@ provenance:
   canonical_sha: 816ffa6a687f
   project_state_version: 9
   problem: mipcas_elj
-  generated_utc: '2026-08-22T02:00:02Z'
+  generated_utc: '2026-08-22T20:59:59Z'

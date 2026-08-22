@@ -537,7 +537,19 @@ def arms():
         prior_path=MACE_PRIOR, molecules_path=MACE_PRIOR,
         batch_size=1000, fused_grad_accum_min_samples=1000,
         max_batch_size=20000, grow_batch_size=True, batch_util_target=0.6,
-        batch_growth_interval=10, traj_checkpoint=True,
+        batch_growth_interval=10,
+        # OFF FOR MLE, ON FOR THE MLIP STAGE. Checkpointing recomputes every SDE
+        # sub-step in the backward pass -- a large VRAM saving for roughly double
+        # the rollout dispatches, and at T=60 the rollout is dispatch-bound, so
+        # that lands on step time. train_prior makes no energy call
+        # (energy/frac_of_step measured 0.000), so it is paying for a spike it
+        # never sees; equilibration scores every step through MACE and needs it.
+        traj_checkpoint=False,
+        # 0.97, not 0.9. The first revision of this arm sat welded at 71.0 GB --
+        # exactly the 0.9 budget -- from step 60 onward, memory-saturated while
+        # the GPU was only ~54% utilised, so the batch stalled at 2560 against a
+        # 20000 ceiling. On the MACE mem wave this was the only allocator knob
+        # that ever moved anything.
         epochs=200000, eval_period=500, figs_period=1000, archive_period=5000,
         # NOTE: no EQ override -- the full protocol, deliberately.
         #
@@ -552,10 +564,12 @@ def arms():
         # T=60 with the cap on, and p4's first revision OOM'd repeatedly at 400.
         # The action clamps the LIVE batch as well as the ceiling, which is what
         # makes it a transition-OOM guard rather than a note for the ladder.
+        # BASE fixes cuda_memory_fraction, so this OVERRIDES it rather than
+        # passing it twice -- it must come after the **BASE spread.
         **{'integrator.T': 60, 'eval_T': 60,
            'protocols.unconditional_tb.stages[1].on_enter':
-               ['set_max_batch_size:250'],
-           **BASE})
+               ['set_max_batch_size:250', 'set_traj_checkpoint:1'],
+           **BASE, 'cuda_memory_fraction': 0.97})
 
     return out
 

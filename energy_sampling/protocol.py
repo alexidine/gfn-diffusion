@@ -30,7 +30,8 @@ declares:
   on_exit/on_enter  transition actions (snapshot:<tag>, snapshot_prior,
                     bootstrap_z, seed_prior_from_anchors,
                     reseed_prior_from_dataset, rebuild_prior_by_churn,
-                    set_lr_flow:<float>; set_max_batch_size:<int>; ACTIONS below is the authoritative
+                    set_lr_flow:<float>; set_max_batch_size:<int>;
+                    set_traj_checkpoint:<0|1>; ACTIONS below is the authoritative
                     list) -- the route-specific physics; everything generic
                     (optimizer rebuild, monitor cooldown, LR re-warm) happens
                     automatically at EVERY transition.
@@ -147,7 +148,7 @@ MLE_GATE_DEFAULTS = {
 }
 ACTIONS = ('snapshot', 'snapshot_prior', 'bootstrap_z', 'seed_prior_from_anchors',
            'reseed_prior_from_dataset', 'rebuild_prior_by_churn', 'set_lr_flow',
-           'set_lr_policy', 'set_max_batch_size')
+           'set_lr_policy', 'set_max_batch_size', 'set_traj_checkpoint')
 SKIP_CONDITIONS = ('prior_loaded',)
 
 # Per-stage LR sensor kinds -- see Stage._parse_lr_sensor for why this is
@@ -1518,6 +1519,33 @@ class StageProtocol:
             if 'fused' in m.optimizers:      # the fused optimizer's TRAILING group is the flow one
                 m.optimizers['fused'].param_groups[-1]['lr'] = v
             print(f"protocol: lr_flow -> {v:g} on entering '{self.stage.name}'")
+        elif name == 'set_traj_checkpoint':
+            # PER-STAGE, because the trade it makes is only worth paying where
+            # memory is actually scarce. Gradient checkpointing over the rollout
+            # recomputes every SDE sub-step in the backward pass: it buys a large
+            # VRAM saving (~33x at T=100) at roughly a doubling of the rollout's
+            # dispatch count, and at T=60 the rollout is dispatch-bound, so that
+            # cost lands squarely on step time.
+            #
+            # train_prior makes no energy call (energy/frac_of_step = 0), so the
+            # MLIP spike the checkpointing exists to survive is not present
+            # there; equilibration scores every step through the MLIP and needs
+            # it. One global flag has to satisfy the stage that needs it.
+            #
+            # NOTE the batch this frees or costs is NOT re-derived here -- the
+            # sizer re-measures on its own, and it must, because the per-sample
+            # memory changes by an order of magnitude across this switch. Clearing
+            # the ladder is the point: rungs measured under the old regime say
+            # nothing about the new one.
+            v = str(arg).strip().lower() not in ('0', 'false', 'off', '')
+            m = self.m
+            m.args.traj_checkpoint = v
+            for mdl in (getattr(m, 'gfn_model', None), getattr(m, 'ema_model', None)):
+                if mdl is not None:
+                    mdl.traj_checkpoint = v
+            m.batch_sizer = None
+            print(f"protocol: traj_checkpoint -> {v} on entering "
+                  f"'{self.stage.name}'; ladder re-armed")
         elif name == 'set_max_batch_size':
             # PER-STAGE BATCH CEILING, because what a step COSTS is a property of
             # the stage, not of the run. On the MLIP routes train_prior makes no
