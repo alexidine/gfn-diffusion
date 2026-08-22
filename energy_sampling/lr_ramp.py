@@ -325,10 +325,20 @@ class RampLadder:
         # margin licenses. Safe by direction: down is the safe way to be wrong,
         # the bound is evidence the run already paid for, and a rung is still the
         # minimum so a marginal rejection behaves exactly as before.
-        step = 1.0 / self.factor
+        #
+        # NOT named `step`. It was, for one revision, and it shadowed this
+        # method's `step` PARAMETER -- so `_enter(nxt, step)` stamped the rung's
+        # entry with the multiplier (0.25) instead of the step index. Every
+        # subsequent rung then read `resident = step_ind - 0`, the residence gate
+        # never bound, and the ramp finished on a spurious `no_evidence` timeout.
+        # Invisible to the unit tests, which use short residences and
+        # persistence 1 so the BOUNDARY short-circuit fires first; caught on
+        # elj/mipcas, which is what section 7's "validate on a real run before
+        # giving it authority" is for.
+        shrink = 1.0 / self.factor
         if self._margin is not None:
-            step = min(step, 10.0 ** self._margin[0])
-        nxt = self.scale * step
+            shrink = min(shrink, 10.0 ** self._margin[0])
+        nxt = self.scale * shrink
         if nxt < self.min_scale:
             self.outcome = 'floor_reached'
             return self._finish(nxt, 'min_scale_reached_without_a_clean_rung', step)
