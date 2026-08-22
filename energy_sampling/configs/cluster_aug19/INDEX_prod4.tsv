@@ -1,2 +1,2 @@
 name	problem	batch	epochs
-cluster_aug19_p4_mace_mle	mace	25	200000
+cluster_aug19_p4_mace_mle	mace	1000	200000

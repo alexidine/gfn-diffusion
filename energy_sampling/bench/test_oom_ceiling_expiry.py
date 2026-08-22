@@ -240,6 +240,38 @@ def test_ooms_and_expiries_are_counted_for_the_history_stream():
     assert getattr(m, 'batch_oom_events', 0) == 2, 'an eval OOM went unrecorded'
 
 
+def test_an_eval_oom_does_not_cut_the_training_batch():
+    """AN EVAL OVERFLOW IS EVIDENCE ABOUT A DIFFERENT ALLOCATION.
+
+    On the MLIP routes `train_prior` makes no energy call at all, so MLE can hold
+    a large batch, while eval scores eval_num_samples through the MLIP every
+    eval_period steps. Cutting the TRAIN batch when an EVAL pass overflows made
+    the two compete: measured on p4_mace_mle (2026-08-21) the ladder climbed
+    25 -> 400, an eval overflowed, the train batch was cut to 156, and the cycle
+    repeated for 11 OOM events in two hours.
+
+    The ceiling was already withheld for eval; this pins the CUT as well. Both
+    directions are asserted, because a handler that never cut anything would pass
+    the eval half on its own."""
+    m = _fresh()
+    _drive(m, 60)
+    base = m.batch_size
+
+    # eval: counted, but the training batch and the sizer's work are untouched
+    m.handle_train_epoch_error(RuntimeError('CUDA out of memory.'), 'eval_fwd')
+    assert getattr(m, 'batch_oom_events', 0) == 1, 'the eval OOM went unrecorded'
+    assert m.batch_size == base, (
+        f'an eval OOM cut the train batch {base} -> {m.batch_size}')
+    assert m.batch_size_oom_ceiling is None, 'an eval OOM installed a ceiling'
+
+    # train: the cut still applies, or this test would pass on a handler that
+    # simply stopped cutting
+    m.handle_train_epoch_error(RuntimeError('CUDA out of memory.'), 'bwd')
+    assert m.batch_size < base, (
+        f'a TRAIN OOM failed to cut the batch (still {m.batch_size})')
+    assert m.batch_size_oom_ceiling == base, m.batch_size_oom_ceiling
+
+
 if __name__ == '__main__':
     # keeps going after a failure ON PURPOSE: these are mutation-tested, and
     # "which tests does reverting fix X turn red" is unanswerable if the runner
@@ -255,3 +287,52 @@ if __name__ == '__main__':
                 print(f'FAIL {name}: {e}')
     print(f'\n{len(failures)} failed' if failures else '\nall passed')
     sys.exit(1 if failures else 0)
+
+
+def test_set_max_batch_size_clamps_the_live_batch():
+    """THE ACTION IS A TRANSITION GUARD, so it must move the batch, not just the
+    ceiling.
+
+    Per-stage batch caps exist because what a step costs is a property of the
+    stage: on the MLIP routes train_prior makes no energy call and can hold
+    thousands, while the stage after it scores every step through the MLIP and
+    cannot. A cap that lowered the ceiling but left the live batch above it would
+    guard nothing -- the first step of the new stage would run at the old size,
+    which is precisely the allocation the cap was lowered to prevent.
+
+    Both directions, because a clamp that always assigned `v` would pass the
+    lowering half on its own while silently shrinking batches on the way UP."""
+    from protocol import StageProtocol
+
+    m = _fresh()
+    _drive(m, 60)
+
+    # `stage` is a read-only property that resolves through the modeller, and
+    # this action reads it only to name itself in a log line -- so stub the
+    # property rather than build a whole protocol, which would drag in the
+    # config tree for no added coverage.
+    class _Named:
+        name = 'equilibration'
+
+    class _Proto(StageProtocol):
+        stage = _Named()
+
+    proto = object.__new__(_Proto)
+    proto.m = m
+
+    # LOWERING clamps the live batch and re-arms the ladder
+    m.batch_size = 8000
+    m.batch_sizer = {'reason': 'target_met'}
+    _Proto._run_action(proto, 'set_max_batch_size', '250', {})
+    assert m.args.max_batch_size == 250, m.args.max_batch_size
+    assert m.batch_size == 250, (
+        f'the ceiling moved but the live batch stayed at {m.batch_size} -- the '
+        f'next step would run at the size the cap exists to prevent')
+    assert m.batch_sizer is None, 'ladder conclusions from the old cap survived'
+
+    # RAISING leaves the batch alone; the ladder climbs on its own terms
+    m.batch_size = 120
+    _Proto._run_action(proto, 'set_max_batch_size', '20000', {})
+    assert m.args.max_batch_size == 20000, m.args.max_batch_size
+    assert m.batch_size == 120, (
+        f'raising the cap moved the batch to {m.batch_size}')

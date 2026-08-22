@@ -4803,19 +4803,39 @@ Two things deliberately NOT done here, both recorded in
             # restart the expiry clock on every OOM, whether or not the ceiling
             # moved: a ceiling that keeps being re-confirmed must keep standing.
             self.batch_size_oom_ceiling_at = self.step_ind
-        self.batch_size = max(1, int(self.batch_size * self.args.oom_batch_shrink_factor))
-        self.batch_size_cooldown_until = self.step_ind + self.args.oom_cooldown_steps
-        # whatever the sizer measured or concluded was at sizes the new ceiling now
-        # bounds -- re-run the ladder under it after the cooldown. Never grow blind:
-        # every rung is re-measured before it is held.
-        self.batch_sizer = None
-        # timings from the pre-cut rung would be scored against the post-cut batch
-        if getattr(self, '_recent_step_times', None) is not None:
-            self._recent_step_times.clear()
-            self._recent_step_work.clear()
-        if self.batch_size <= 1:
-            raise RuntimeError("Cascading OOM Failure")
-        print(f"Reducing batch size to {self.batch_size}")
+            self.batch_size = max(
+                1, int(self.batch_size * self.args.oom_batch_shrink_factor))
+            self.batch_size_cooldown_until = (self.step_ind
+                                              + self.args.oom_cooldown_steps)
+            # whatever the sizer measured or concluded was at sizes the new ceiling
+            # now bounds -- re-run the ladder under it after the cooldown. Never
+            # grow blind: every rung is re-measured before it is held.
+            self.batch_sizer = None
+            # timings from the pre-cut rung would be scored against the post-cut batch
+            if getattr(self, '_recent_step_times', None) is not None:
+                self._recent_step_times.clear()
+                self._recent_step_work.clear()
+            if self.batch_size <= 1:
+                raise RuntimeError("Cascading OOM Failure")
+            print(f"Reducing batch size to {self.batch_size}")
+        else:
+            # THE CUT IS TRAIN-ONLY TOO, not just the ceiling. Withholding the
+            # ceiling but still cutting left the training batch hostage to an
+            # allocation it has no relationship with: on the MLIP routes
+            # train_prior makes NO energy call, so MLE can hold thousands of
+            # samples, while eval scores eval_num_samples through the MLIP every
+            # eval_period steps. Measured on p4_mace_mle (2026-08-21): the ladder
+            # climbed 25 -> 400, an eval overflowed, the TRAIN batch was cut to
+            # 156, and the cycle repeated for 11 OOM events in 2 h -- the batch
+            # oscillating against a peak that training never produces.
+            #
+            # The existing justification for cutting was that eval OOMs are
+            # self-limiting because their own loops cut and retry. That is the
+            # reason the cut is unnecessary, not the reason it is safe: the retry
+            # already bounds the eval allocation, so the training batch buys
+            # nothing by shrinking and pays the whole MLE throughput for it.
+            print(f"OOM during '{step_type}' (not a train step) -- eval retries "
+                  f"at a smaller size; train batch stays {self.batch_size}")
 
     @torch.no_grad()
     def bwd_eval_sampling(

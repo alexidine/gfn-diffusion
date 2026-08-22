@@ -30,7 +30,7 @@ declares:
   on_exit/on_enter  transition actions (snapshot:<tag>, snapshot_prior,
                     bootstrap_z, seed_prior_from_anchors,
                     reseed_prior_from_dataset, rebuild_prior_by_churn,
-                    set_lr_flow:<float>; ACTIONS below is the authoritative
+                    set_lr_flow:<float>; set_max_batch_size:<int>; ACTIONS below is the authoritative
                     list) -- the route-specific physics; everything generic
                     (optimizer rebuild, monitor cooldown, LR re-warm) happens
                     automatically at EVERY transition.
@@ -147,7 +147,7 @@ MLE_GATE_DEFAULTS = {
 }
 ACTIONS = ('snapshot', 'snapshot_prior', 'bootstrap_z', 'seed_prior_from_anchors',
            'reseed_prior_from_dataset', 'rebuild_prior_by_churn', 'set_lr_flow',
-           'set_lr_policy')
+           'set_lr_policy', 'set_max_batch_size')
 SKIP_CONDITIONS = ('prior_loaded',)
 
 # Per-stage LR sensor kinds -- see Stage._parse_lr_sensor for why this is
@@ -1480,6 +1480,37 @@ class StageProtocol:
             if 'fused' in m.optimizers:      # the fused optimizer's TRAILING group is the flow one
                 m.optimizers['fused'].param_groups[-1]['lr'] = v
             print(f"protocol: lr_flow -> {v:g} on entering '{self.stage.name}'")
+        elif name == 'set_max_batch_size':
+            # PER-STAGE BATCH CEILING, because what a step COSTS is a property of
+            # the stage, not of the run. On the MLIP routes train_prior makes no
+            # energy call at all, so MLE can hold a batch orders of magnitude
+            # larger than the stage that follows it -- and one global
+            # max_batch_size has to be small enough for the expensive stage,
+            # which starves the cheap one for the whole of phase 1.
+            #
+            # Sizing the global cap for the EXPENSIVE stage is what
+            # p4_mace_mle did (max_batch_size 400 against an MLE that could hold
+            # thousands), and it spent its entire phase 1 there.
+            #
+            # CLAMPS THE LIVE BATCH TOO, not just the ceiling. Lowering the cap
+            # on entry is exactly the transition-OOM guard this exists for, and a
+            # cap that let the current batch stay above it would guard nothing --
+            # the first step of the new stage would run at the old size, which is
+            # the allocation the cap was lowered to prevent. Raising it leaves the
+            # batch where it is and lets the ladder climb normally.
+            v = int(float(arg))
+            m = self.m
+            m.args.max_batch_size = v
+            if m.batch_size > v:
+                print(f"protocol: max_batch_size -> {v} on entering "
+                      f"'{self.stage.name}'; clamping batch {m.batch_size} -> {v}")
+                m.batch_size = v
+            else:
+                print(f"protocol: max_batch_size -> {v} on entering "
+                      f"'{self.stage.name}' (batch {m.batch_size} already under it)")
+            # the ladder's conclusions were reached under the OLD cap, at rungs
+            # this one may not permit -- re-measure rather than carry them over
+            m.batch_sizer = None
         elif name == 'set_lr_policy':
             # PER-STAGE BASE RATE for the servo-managed policy groups. adaptive_lr.
             # seed_lr is ONE number for every stage, but a bwd MLE stage and a fused

@@ -535,12 +535,27 @@ def arms():
         energy_function='mace', mlip_path=CLUSTER_MACE_MLIP,
         space_groups=[14], z_primes=[1],
         prior_path=MACE_PRIOR, molecules_path=MACE_PRIOR,
-        batch_size=25, fused_grad_accum_min_samples=25,
-        max_batch_size=400, grow_batch_size=True, batch_util_target=0.6,
+        batch_size=1000, fused_grad_accum_min_samples=1000,
+        max_batch_size=20000, grow_batch_size=True, batch_util_target=0.6,
         batch_growth_interval=10, traj_checkpoint=True,
         epochs=200000, eval_period=500, figs_period=1000, archive_period=5000,
         # NOTE: no EQ override -- the full protocol, deliberately.
-        **{'integrator.T': 60, 'eval_T': 60, **BASE})
+        #
+        # THE CAP IS PER STAGE, and that is the whole point. train_prior makes no
+        # energy call, so MLE can hold thousands; equilibration scores every step
+        # through MACE and cannot. One global ceiling has to satisfy the
+        # expensive stage, which starves the cheap one -- the previous revision
+        # of this arm ran its entire phase 1 at max_batch_size 400 for exactly
+        # that reason. So MLE gets canonical's 20000 and the transition drops it.
+        #
+        # 250 from measurement, not guesswork: p2_mace_prod settled at 261 at
+        # T=60 with the cap on, and p4's first revision OOM'd repeatedly at 400.
+        # The action clamps the LIVE batch as well as the ceiling, which is what
+        # makes it a transition-OOM guard rather than a note for the ladder.
+        **{'integrator.T': 60, 'eval_T': 60,
+           'protocols.unconditional_tb.stages[1].on_enter':
+               ['set_max_batch_size:250'],
+           **BASE})
 
     return out
 

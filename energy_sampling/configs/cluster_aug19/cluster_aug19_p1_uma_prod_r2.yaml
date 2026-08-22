@@ -454,7 +454,7 @@ energy_config:
 checkpoint_read_only: false
 provenance:
   canonical: mk_dev.yaml
-  canonical_sha: 80adc8113834
+  canonical_sha: 816ffa6a687f
   project_state_version: 9
   problem: mipcas_elj
-  generated_utc: '2026-08-21T21:10:34Z'
+  generated_utc: '2026-08-22T02:00:02Z'

@@ -6,7 +6,7 @@
 # the checkpoint problem_def's schema_version (which versions problem identity).
 project_state_version: 9
 
-run_name: 'mk_dev'
+run_name: 'race_L1_hot4x_W30b'
 tag: 'dev'
 seed: 12345
 device: 'cuda'
@@ -20,7 +20,7 @@ mlip_path: null              # MLIP weights, for energy_function uma/mace only. 
 checkpoints_dir: 'D:\crystal_datasets\gfn_checkpoints'  # where this run writes and reloads every checkpoint
 # Kept under a prefix no run writes to, so train_prior's own on_exit snapshot
 # cannot overwrite the warm start it is being started FROM.
-checkpoint_name: 'dev_mk_dev_elj-mipcas_sg2_zp1_elj_prior_dataset-T2.5-573c92_phase1_exit.pt'  # warm start: weights + optimizers + buffers, with its _buffers.pt sidecar. null = fresh run
+checkpoint_name: null   # fresh: the dev checkpoint is not on this box
 prior_model_name: null       # a SEPARATE frozen GFN, used only to sample the prior buffer; rebuilt from its own stored config, so any architecture. To warm-start the POLICY from it instead, use checkpoint_name + load_weights_only
 load_weights_only: false     # true = take only model weights from checkpoint_name; optimizers, buffers and step count start fresh
 prior_path: D:\crystal_datasets\conditional\priors\mipcas_sg2_zp1_elj_prior_dataset.pt  # seeds the prior buffer, and the anchor buffer on molecule routes
@@ -55,7 +55,7 @@ adaptive_lr:
   # Fixed exponential ramp, no sensor: 1/lr_warmup_ratio -> 1.0, then held.
   # Restarted at every stage transition -- the optimizers were just rebuilt onto
   # a surface with different curvature.
-  warmup_steps: 1000
+  warmup_steps: 150
   # The ramp is DETERMINISTIC and the sensors decide only when it ENDS -- during
   # warmup neither `hyper` nor `ray` moves peak_scale, because the envelope is
   # holding the rate down on purpose and a reading taken through that suppression
@@ -74,7 +74,7 @@ adaptive_lr:
   # peak_scale during a ramp -- only on_divergence, which needs no bar to be
   # believed. false = ramp to hold regardless.
   envelope_freeze: true
-  seed_lr: 1.25e-4           # what an `auto` lr_* key resolves to; the rate a run starts from
+  seed_lr: 5.0e-4  # what an `auto` lr_* key resolves to; the rate a run starts from
   bounds: [ 0.01, 2000.0 ]   # how far the sensors may move the rate from its seed, as a multiplier. Wide on purpose: it is a sanity rail, not a tuning range
 
   # ---- 2. CALIBRATION -> LR ----------------------------------------------
@@ -128,22 +128,15 @@ use_weight_decay: false
 # device, >1 means work outlives the return, <1 means host-bound.
 profiling:
   enabled: false
-  regions: null              # null = every region asked for; a list restricts it
-  # Layer 2: a BOUNDED torch.profiler window -- op-level CPU and CUDA detail,
-  # written as files (a chrome trace + a text table) beside the run, never to
-  # wandb. Left on, torch.profiler dominates what it measures and the trace grows
-  # too large to open; bounded to a few steps its cost does not scale with run
-  # length, and once written the window latches shut for the rest of the run.
-  # start_step is deliberately late: the opening steps are CUDA context creation,
-  # autotuning and cold caches, so profiling them measures startup, not training.
-  trace:  # todo these need comments
-    enabled: false
-    start_step: 1500
-    active_steps: 8
+  regions: null
+  trace:
+    enabled: true
+    start_step: 150          # past CUDA context creation and cold caches
+    active_steps: 8          # SAME window as the conformer profile, for comparability
     outdir: profiling_results
-    write_trace: false       # also write the chrome timeline JSON. OFF: measured 748 MB for 8 steps (~93 MB/step) on ELJ with shapes and stacks both off, which is unopenable and is what pins active_steps to single digits. The *_table.txt beside it is 9 KB and carries the op breakdown; turn this on only when a TIMELINE is the question
-    record_shapes: false     # per-op input shapes; larger trace, needed to spot a shape that recompiles
-    with_stack: false        # python stacks; expensive, and only useful when the op table cannot say WHICH call site
+    write_trace: false
+    record_shapes: true
+    with_stack: false
 compile_policy: auto           # torch.compile the dense policy trunk with inductor kernel fusion. 'auto' = Linux+CUDA only (no inductor on native Windows; dev boxes stay eager); true/false force it. Compile errors degrade to eager with a warning. Recompiles on every new batch size
 traj_checkpoint: false         # gradient-checkpoint each rollout step: trajectory activation memory ~O(1) in T instead of O(T), at ~1 extra policy forward per step. Values/gradients identical to false (verified bitwise incl. RNG stream)
 # Fallback clip. With grad_clip_guard on it does NOT clip the policy -- the guard
@@ -214,14 +207,14 @@ model:
 ################################################################
 buffer_device: cuda           # where the churned/static sample stores live (replay + prior + anchor buffers, mol/prior datasets). 'cuda' turns per-step buffer draws/admits/purges into async device gathers instead of serial CPU work + host round trips; footprint ~1KB/graph. 'cpu' = legacy
 batch_size: 1000              # number of samples per training batch -- single shared batch size for all rollout work (train fwd/bwd/replay/fused AND eval sampling)
-grow_batch_size: true         # whether to dynamically grow the batch size to fill the RAM
+grow_batch_size: false
 max_batch_size: 20000
 eval_num_samples: 10000       # minimum number of samples for evaluation
 test_eval_num_samples: 2000   # held-out conditional eval batch; inert while test_molecules_path is null
 fused_grad_accum_min_samples: 1000  # fused steps only: effective-gradient floor. Batches BELOW this accumulate micro-steps until this many samples contribute; batches AT/ABOVE it take a plain unscaled step. 0 disables
-epochs: 100000             # number of training epochs
-eval_period: 250              # how often to do evaluation & reporting
-figs_period: 500             # how often to log custom figures EXPENSIVE # must be multiple of eval_period or it won't fire
+epochs: 448  
+eval_period: 100000   # no eval inside the window
+figs_period: 100000
 # --- batch sizer (train.py select_batch_size; state 8, docs/design/phase6_batch_sizer.md) ---
 # Two objectives in strict priority: occupancy constraint first, then optimizer-step
 # throughput -- whose answer is the CONSTANT batch_size = fused_grad_accum_min_samples,
@@ -234,7 +227,7 @@ figs_period: 500             # how often to log custom figures EXPENSIVE # must 
 batch_growth_factor: 1.6       # ladder rung spacing below the cap (torch.compile treats each distinct size as a recompile, so rungs are few)
 batch_growth_cap: 1000          # rung step ceiling in samples: grow geometrically until batch*(factor-1) reaches this, then climb linearly at it. Bounds the held rung's overshoot past the true occupancy crossing to one accum quantum -- at large batch a factor-f overshoot costs up to ~40% of update rate, a 1000-sample one <=10%. The price is more compile shapes on a high climb. 0 = uncapped geometric
 batch_growth_interval: 50       # minimum per-rung calibration dwell, in steps. WITH compile_policy active use ~250-500 (each new size is a ~30-60s recompile stall); 50 is fine locally where compile is off
-batch_util_target: 0.6          # occupancy target the calibration must clear before holding a grown batch, as a FRACTION of the card (0.6 = 60% busy), NOT a percentage -- the sensor reports percent and the one conversion happens in train.select_batch_size. 0 = off: hold batch_size, no probe. Empirical bracket (out-of-process sampler): cancelled <=0.40, survived >=0.494; 0.6 is a margined target
+batch_util_target: null  # occupancy target the calibration must clear before holding a grown batch, as a FRACTION of the card (0.6 = 60% busy), NOT a percentage -- the sensor reports percent and the one conversion happens in train.select_batch_size. 0 = off: hold batch_size, no probe. Empirical bracket (out-of-process sampler): cancelled <=0.40, survived >=0.494; 0.6 is a margined target
 gpu_util_window_s: 900  # trailing window for the gpu/util_recent metric  # todo is this steps or seconds?
 gpu_util_sample_period_s: 60  # wall-clock seconds between occupancy samples. Time-based, not per-N-steps: a step-based cadence cannot fill a 900 s window at 200 s/step, which is how the metric came to be absent on exactly the slow MLIP arms it was there to watch
 gpu_util_policy_window_s: 7200  # the window the CLUSTER averages over when deciding to cancel. Logged as gpu/util_policy -- but NB the in-process reading disagrees with the out-of-process samplers by a batch-dependent, sign-flipping error (phase6_handoff.md section 2); the scheduler judges the out-of-process number  # todo simplify this comment and align with our rules
@@ -425,13 +418,6 @@ z_calibration:
   grace: 0.8                 # early-out bar as a fraction of threshold: the loop stops once a rollout's OWN fresh reading clears threshold * grace, rather than running out the sampled step count against a stale EMA
   gain: 1.0
   max_steps_per_step: 100.0
-  # --- level fill: a direct re-level for gaps the servo cannot close ---
-  # Fires only where the forward branch is Z-only (freeze_policy) on the
-  # unconditional scalar head -- the equilibration stage below. Reads that
-  # step's own logw, so it costs no rollout and no energy call.
-  fill_threshold: 20.0       # nats. HOW FAR OFF IS FAR ENOUGH: |log_Z - the batch's TB fixed point| must exceed this. 0 or null disables the fill. At 2x fwd_loss_coeffs.beta the clipped dL/dZ the servo reads is fully saturated, so past here the servo cannot tell 20 nats from 8000 and the fill is the only instrument that can
-  fill_se: 5.0               # ...AND the gap must exceed this many standard errors of that fixed point, so a fill never fires on a gap its own batch cannot resolve. The se is +inf when no row is unclipped, which BLOCKS the fill rather than licensing it
-  fill_cooldown_steps: 200   # train steps before another fill may fire. fwd/tb_resid_clipped (the `pooled` sensor) is an EMA that keeps reporting the pre-fill level for its own time constant, so without this the same corrected gap re-arms the fill on a stale reading
   # --- mode: regression only (inert on this route, which runs rollout) ---
   min_visits: null  # per-condition visit floor for a condition to enter the regression target set; null = the tracker's own condition_log_z.min_visits
   freshness_half_life_steps: 300.0  # regression weights decay by condition staleness (TRAIN STEPS since that condition's last tracker update), so a stale ema_logw target counts less than a current one
@@ -502,7 +488,7 @@ protocols:
         # this stage trains, so it is the closest measured evidence rather than a
         # transfer -- the production conditional configs run 0.05, but on a
         # var_conditioning stage and from a battery with no committed verdict.
-        lr_sensor: { kind: hyper, beta: 0.1, cos_target: -0.05 }   # cos_target NEGATIVE here: the attainable cos on this stage sits slightly below zero, so a 0 setpoint reads that as "too fast" every step and walks peak_scale to its floor
+        lr_sensor: { kind: hyper, beta: 0.1 }
         flags:
           update_log_z: true           # accumulate ema_logw / best_energy evidence
           scramble_conditions: true    # intent flag; applies only on conditional problems
@@ -828,3 +814,18 @@ energy_config:
   lj_coeff: 1.0  # loss coefficient
   reward_range: 250 # max ptp of reward values allowed before soft clipping, null to go unrestricted
   analyze_kwargs: { }  # elj: none
+# ---------------------------------------------------------------- lr_probe
+# Replay Racing (docs/design/lr_probe_protocol.md rev d).
+# MEASUREMENT ONLY: actuate false, so this run races, logs a full record, and
+# changes nothing. The numbers being bought here are (a) the GPU nondeterminism
+# floor `race/duplicate_spread` -- 0 exactly on CPU, unknown on a card whose
+# reductions are scatter-atomic, and the one number that can silently turn the
+# probe into a no-op -- and (b) the real cost fraction against a probe-off twin.
+lr_probe:
+  enabled: true
+  actuate: false
+  window: 30  
+  replicates: 6
+  screen_replicates: 2
+  holdout: 8
+  verbose: true
