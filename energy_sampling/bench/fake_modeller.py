@@ -267,6 +267,12 @@ def attach_real_batch_sizer(cls=FakeModeller):
     cls._conclude_batch_calibration = train.Modeller._conclude_batch_calibration
     cls.handle_train_epoch_error = train.Modeller.handle_train_epoch_error
     cls._batch_floor = train.Modeller._batch_floor
+    # handle_train_epoch_error's eval branch sizes the EVAL draw, which shrinks
+    # independently of the train batch. Bound REAL rather than stubbed: a stub
+    # here would let the handler's eval path diverge from the loops it feeds,
+    # which is precisely the failure these tests exist to catch.
+    cls.eval_draw_size = train.Modeller.eval_draw_size
+    cls.reset_eval_draw_size = train.Modeller.reset_eval_draw_size
     # the occupancy sensor, both halves: the sampling cadence AND the windowed read.
     # Only _read_gpu_util (the NVML leaf) stays faked -- see FakeModeller.
     cls._sample_gpu_util = train.Modeller._sample_gpu_util

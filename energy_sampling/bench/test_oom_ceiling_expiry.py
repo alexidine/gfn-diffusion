@@ -240,6 +240,43 @@ def test_ooms_and_expiries_are_counted_for_the_history_stream():
     assert getattr(m, 'batch_oom_events', 0) == 2, 'an eval OOM went unrecorded'
 
 
+def test_repeated_eval_ooms_shrink_the_eval_draw_and_terminate():
+    """THE TEST THE FIRST ATTEMPT AT THIS NEEDED AND DID NOT HAVE.
+
+    Every eval retry loop draws at eval_draw_size() and retries on OOM, so the
+    ONLY thing that makes a retry smaller is the handler. A first version of this
+    change stopped cutting on eval OOMs without giving eval its own size; the
+    loops then spun forever at an unchanged draw -- 100% GPU, no further logging,
+    eight hours burned on p4_mace_mle before it was noticed.
+
+    So the property under test is TERMINATION, not just "the train batch is
+    untouched": the draw must strictly decrease, and once it can no longer
+    decrease the handler must RAISE rather than let the caller loop again."""
+    m = _fresh()
+    _drive(m, 60)
+    train_batch = m.batch_size
+
+    draws, guard = [m.eval_draw_size()], 0
+    while guard < 200:
+        guard += 1
+        try:
+            m.handle_train_epoch_error(RuntimeError('CUDA out of memory.'), 'eval_bwd')
+        except RuntimeError as e:
+            assert 'spin here forever' in str(e), f'unexpected raise: {e}'
+            break
+        d = m.eval_draw_size()
+        assert d < draws[-1], (
+            f'eval draw did not shrink: {draws[-1]} -> {d}; the retry loop would '
+            f'reissue the same allocation forever')
+        draws.append(d)
+    else:
+        raise AssertionError('handler never raised; the eval loop cannot terminate')
+
+    assert draws[-1] == 1, draws
+    assert m.batch_size == train_batch, (
+        f'the train batch moved {train_batch} -> {m.batch_size} on eval OOMs')
+
+
 def test_an_eval_oom_does_not_cut_the_training_batch():
     """AN EVAL OVERFLOW IS EVIDENCE ABOUT A DIFFERENT ALLOCATION.
 

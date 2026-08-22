@@ -4834,8 +4834,52 @@ Two things deliberately NOT done here, both recorded in
             # reason the cut is unnecessary, not the reason it is safe: the retry
             # already bounds the eval allocation, so the training batch buys
             # nothing by shrinking and pays the whole MLE throughput for it.
-            print(f"OOM during '{step_type}' (not a train step) -- eval retries "
-                  f"at a smaller size; train batch stays {self.batch_size}")
+            # EVAL SHRINKS ITS OWN DRAW, NOT THE TRAIN BATCH.
+            #
+            # The train batch must not be hostage to an allocation training never
+            # makes: on the MLIP routes train_prior calls no energy function at
+            # all, so MLE can hold thousands while eval scores eval_num_samples
+            # through the MLIP. Cutting the train batch on an eval overflow made
+            # the two compete -- p4_mace_mle (2026-08-21) sawtoothed 25 -> 400 ->
+            # 156 for 11 OOM events in two hours.
+            #
+            # BUT THE CUT CANNOT SIMPLY BE DROPPED. Every eval retry loop
+            # (bwd_eval_sampling, fwd_eval_sampling, anchor_refresh) draws at
+            # `eval_draw_size()` and retries on OOM; the ONLY thing that makes the
+            # retry smaller is this branch. Removing the cut without giving eval
+            # its own size spun those loops forever at an unchanged size -- a
+            # 100%-GPU hang with no further logging, which is what the first
+            # attempt at this shipped and cost eight GPU-hours.
+            cur = self.eval_draw_size()
+            self.eval_batch_cap = max(1, int(cur * self.args.oom_batch_shrink_factor))
+            if cur <= 1:
+                raise RuntimeError(
+                    f"OOM in '{step_type}' at an eval draw of 1 -- the eval loop "
+                    f"cannot shrink further and would spin here forever")
+            print(f"OOM during '{step_type}': eval draw {cur} -> "
+                  f"{self.eval_batch_cap}; train batch stays {self.batch_size}")
+
+    def eval_draw_size(self) -> int:
+        """Batch size for EVAL draws, which shrinks independently of training.
+
+        Eval and training have different memory profiles -- eval runs the EMA
+        model over eval_num_samples with no gradients, training runs the live
+        model with them -- and on the MLIP routes they do not even call the same
+        code (train_prior makes no energy call). One number for both means the
+        cheaper one is capped by the more expensive one.
+
+        Starts at the train batch and only ever falls, so an eval that has found
+        a size that fits keeps it rather than rediscovering the ceiling on every
+        pass. It is not restored on its own; a stage transition rebuilds it via
+        reset_eval_draw_size().
+        """
+        cap = getattr(self, 'eval_batch_cap', None)
+        return self.batch_size if cap is None else min(self.batch_size, cap)
+
+    def reset_eval_draw_size(self):
+        """Forget a learned eval cap -- for stage transitions, where the model,
+        the batch and the memory profile all change at once."""
+        self.eval_batch_cap = None
 
     @torch.no_grad()
     def bwd_eval_sampling(
@@ -4846,9 +4890,9 @@ Two things deliberately NOT done here, both recorded in
         while samples < self.args.eval_num_samples:
             try:
                 if self.bwd_sampling_mode == 'dataset':  # todo consider mixing, or adding anchor states
-                    mol_batch = next(self.prior_dataset.loader(batch_size=self.batch_size, mode='graphs'))
+                    mol_batch = next(self.prior_dataset.loader(batch_size=self.eval_draw_size(), mode='graphs'))
                 elif self.bwd_sampling_mode == 'prior':
-                    mol_batch = next(self.prior_buffer.loader(batch_size=self.batch_size, mode='graphs'))
+                    mol_batch = next(self.prior_buffer.loader(batch_size=self.eval_draw_size(), mode='graphs'))
                 else:
                     assert False
 
@@ -6816,7 +6860,7 @@ Two things deliberately NOT done here, both recorded in
         surprise = torch.empty(n, dtype=torch.float32)
         start = 0
         while start < n:
-            end = min(start + self.batch_size, n)
+            end = min(start + self.eval_draw_size(), n)
             idx = torch.arange(start, end, device=self.device)
             try:
                 chunk_batch = self.anchor_buffer.batch.subsample_new_batch(idx).to(self.device)
