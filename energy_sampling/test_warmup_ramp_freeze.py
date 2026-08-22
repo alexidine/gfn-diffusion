@@ -272,11 +272,38 @@ def test_ray_does_not_freeze_on_a_reading_that_did_not_resolve(status):
 
 def test_ray_actuates_normally_after_warmup():
     """REGRESSION GUARD. The freeze-only rule is warmup-scoped; past it the
-    calibration must move peak_scale as it always did."""
+    calibration must still move peak_scale.
+
+    WHAT CHANGED (handoff 6B): the actuator is a POOLED estimator, so "past
+    warmup" is no longer sufficient on its own -- the stage must also be past
+    its opening transient, and the window must hold `pool_min_readings`. The
+    guard is unchanged in what it protects (the applied path is alive after the
+    ramp) and stricter in what it takes to satisfy.
+    """
     modeller, ctrl = _controller(kind='ray')
     _past_warmup(modeller, ctrl)
-    _calibrate(modeller, ctrl, alpha=1.0)
+    modeller.step_ind = WARMUP + ctrl.MIN_STAGE_STEPS + 1
+    ctrl.tick()
+    for i in range(ctrl.pool.min_readings):
+        modeller.step_ind += 500
+        _calibrate(modeller, ctrl, alpha=1.0)      # target 4.0
     assert _peak(ctrl) < 1.0, 'alpha* below target must cut the peak after warmup'
+    assert _peak(ctrl) == pytest.approx(0.25, rel=1e-6), (
+        'the estimator moves to the pooled optimum, not a fraction of the way')
+
+
+def test_a_single_reading_no_longer_moves_the_rate():
+    """The sawtooth, at the controller level. One reading is not evidence about
+    a stationary optimum, and acting on it is what made the loop chase noise --
+    see lr_pool.py and test_lr_pool.py for the measured version."""
+    modeller, ctrl = _controller(kind='ray')
+    _past_warmup(modeller, ctrl)
+    modeller.step_ind = WARMUP + ctrl.MIN_STAGE_STEPS + 1
+    ctrl.tick()
+    _calibrate(modeller, ctrl, alpha=1.0)
+    assert _peak(ctrl) == 1.0
+    assert ctrl._pool_last['action'] == 'hold'
+    assert 'pool_short' in ctrl._pool_last['reason']
 
 
 # ------------------------------------------------- the ramp across a transition

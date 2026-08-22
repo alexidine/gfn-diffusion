@@ -44,11 +44,25 @@ SCOPE. d is taken over POLICY parameters only (decision D26 option b). The flow
 (Z) head is LR-pinned separately and is held at its post-step value throughout, so
 it contributes an identical constant to every evaluation and drops out of every
 difference.
+
+WHAT IS SCORED, AND WHY IT IS THE COMPOSITE. `loss_fn` may return one number or
+a mapping of named components. The optimizer takes ONE step along the FUSED
+gradient, so the loss alpha* has to be measured against is the frac-weighted sum
+the step descends: a per-branch alpha* is the optimum for a direction nobody
+took. `composite` is therefore the component the controller reads. The per-branch
+components are bracketed too and reported as DIAGNOSTICS -- each branch is
+already evaluated at each alpha to form the sum, so they are free, and branch
+disagreement (fwd wanting 4x while replay wants 0.25x) is worth surfacing.
 """
 
 import math
+from collections.abc import Mapping
 
 import torch
+
+#: The component `alpha_star`/`status` describe and the controller acts on.
+#: Everything else `loss_fn` returns is a free diagnostic.
+COMPOSITE = 'composite'
 
 
 class RayCalibration:
@@ -57,8 +71,14 @@ class RayCalibration:
     immediately after. Every parameter touched is restored bitwise.
 
     `alphas` MUST be closed under doubling over the tested range: to test (*) at
-    alpha it needs the loss at 2*alpha. The default {0,1,2,4,8} tests alpha* against
-    {0.5, 1, 2, 4}.
+    alpha it needs the loss at 2*alpha. A grid point is TESTED when its double is
+    also on the grid, so the default {0,1,2,4,8} tests alpha* against {1, 2, 4}
+    and the top point buys only the contrast for 4. (The comment here used to
+    say {0.5, 1, 2, 4}; 0.5 is not a grid point, so no paired difference for it
+    is ever formed -- verified against `_bracket`, which iterates the grid
+    itself.) The grid's LOWEST tested alpha is therefore its second entry: a rate
+    hotter than that reads as `below_range`, a bound, and is never
+    extrapolated.
     """
 
     def __init__(self,
@@ -179,11 +199,32 @@ class RayCalibration:
 
     # ----------------------------------------------------------------- measure
 
+    def defer(self, reason: str, step_ind: int) -> bool:
+        """Let a due calibration stand WITHOUT consuming its period.
+
+        The third outcome, distinct from `arm` and `refuse`: the reading is
+        wanted and nothing is wrong, the INPUTS are not there yet -- a larder
+        still filling after a stage transition, typically. `due` stays latched
+        so the calibration fires as soon as they are, and no parameter clone is
+        spent in the meantime.
+
+        Counted as a deferral rather than a skip for the reason every other
+        counter in this class exists: a sensor that is quietly waiting and one
+        that is broken must not look alike from its outputs.
+        """
+        if not self.due(step_ind):
+            return False
+        self.n_deferred += 1
+        self.skip_reason = str(reason)
+        return True
+
     @torch.no_grad()
     def measure(self, draw_fn, loss_fn) -> dict | None:
         """
         draw_fn() -> one fresh sub-batch. Called n_sub times.
-        loss_fn(batch) -> float, the policy loss on `batch` at the CURRENT params.
+        loss_fn(batch) -> the policy loss on `batch` at the CURRENT params,
+        either as a float or as a mapping of named components (see the module
+        docstring). A float is read as the composite alone.
         Neither may mutate training state: no tracker updates, no buffer writes,
         no log Z updates.
 
@@ -216,7 +257,7 @@ class RayCalibration:
 
             # Sub-batch OUTER, alpha INNER: holds one sub-batch at a time and
             # keeps every contrast within a single batch.
-            losses = []                            # [k][i] over sub-batches, alphas
+            losses = []            # [k][i] -> {component: loss}, sub-batches x alphas
             for _k in range(self.n_sub):
                 batch = draw_fn()
                 if batch is None:
@@ -225,7 +266,7 @@ class RayCalibration:
                 row = []
                 for a in self.alphas:
                     _set(a)
-                    row.append(float(loss_fn(batch)))
+                    row.append(_as_components(loss_fn(batch)))
                 losses.append(row)
                 del batch
             if len(losses) < 2:
@@ -250,9 +291,8 @@ class RayCalibration:
 
     # --------------------------------------------------------------- statistics
 
-    def _summarise(self, losses, step_norm):
-        """
-        Turn the [sub-batch][alpha] loss table into a bracket on alpha*.
+    def _bracket(self, table, K):
+        """One component's [sub-batch][alpha] numbers -> (status, alpha*, tests).
 
         For each tested alpha with 2*alpha on the grid, the paired differences
         D_k = L_k(2*alpha) - L_k(0) are one sample per sub-batch. By (*),
@@ -261,13 +301,12 @@ class RayCalibration:
         """
         idx = {a: i for i, a in enumerate(self.alphas)}
         i0 = idx[0.0]
-        K = len(losses)
         tests = []
         for a in self.alphas:
             if a <= 0.0 or (2.0 * a) not in idx:
                 continue
             j = idx[2.0 * a]
-            D = [row[j] - row[i0] for row in losses]
+            D = [row[j] - row[i0] for row in table]
             if not all(math.isfinite(v) for v in D):
                 continue
             m = sum(D) / K
@@ -295,15 +334,43 @@ class RayCalibration:
             status, alpha_star = 'below_range', hi
         else:
             status, alpha_star = 'unresolved', float('nan')
+        return {'status': status, 'alpha_star': alpha_star, 'lo': lo, 'hi': hi,
+                'tests': tests}
 
-        agg = [sum(row[i] for row in losses) / K for i in range(len(self.alphas))]
+    def _summarise(self, losses, step_norm):
+        """
+        Turn the [sub-batch][alpha] table of COMPONENT dicts into a reading.
+
+        `composite` carries the decision; every other component is bracketed the
+        same way and reported as a diagnostic. A component missing from some
+        sub-batch is dropped rather than imputed -- an absent branch is not a
+        branch at loss zero.
+        """
+        K = len(losses)
+        names = [k for k in losses[0][0]
+                 if all(k in cell for row in losses for cell in row)]
+        if COMPOSITE not in names:
+            return None
+        per = {}
+        for name in names:
+            table = [[cell[name] for cell in row] for row in losses]
+            got = self._bracket(table, K)
+            if got is not None:
+                per[name] = got
+        primary = per.get(COMPOSITE)
+        if primary is None:
+            return None
+
+        agg = [sum(row[i][COMPOSITE] for row in losses) / K
+               for i in range(len(self.alphas))]
         self.last = {
-            'alpha_star': alpha_star,
-            'status': status,
-            'lo': lo, 'hi': hi,
+            'alpha_star': primary['alpha_star'],
+            'status': primary['status'],
+            'lo': primary['lo'], 'hi': primary['hi'],
             'n_sub': K,
             'step_norm': step_norm,
-            'tests': tests,
+            'tests': primary['tests'],
+            'components': per,
             'aggregate': dict(zip(self.alphas, agg)),
             'losses': losses,
         }
@@ -319,7 +386,14 @@ class RayCalibration:
     #: Reasons a calibration was refused before drawing. Explicit codes for the
     #: same reason `_STATUS` has them: a positional encoding re-maps every
     #: historical run's logs the moment the list is reordered.
-    _REFUSAL = {'': 0, 'warmup': 1}
+    #:
+    #: `branch_refused` is the structural one: an ACTIVE branch of this stage
+    #: cannot be replay-scored (LarderScorer.refusal), so the composite the
+    #: optimizer step descends cannot be formed. It refuses the period rather
+    #: than deferring because nothing about it changes with time -- see
+    #: `defer` for the case that does.
+    _REFUSAL = {'': 0, 'warmup': 1, 'no_larder': 2, 'branch_refused': 3,
+                'no_active_branch': 4}
 
     def report(self) -> dict:
         """Loggable view. Empty until the first calibration.
@@ -361,4 +435,24 @@ class RayCalibration:
             out[f'raycal/t_{tag}'] = max(-99.0, min(99.0, x['t']))
         for a, v in r['aggregate'].items():
             out[f"raycal/L_{f'{a:g}'.replace('.', 'p')}"] = v
+        # Per-branch brackets, FREE: each branch is already evaluated at each
+        # alpha to form the composite. Diagnostic only -- nothing actuates on
+        # them -- but branch disagreement is the reading that says the fused
+        # step is a compromise rather than a consensus.
+        for name, c in r.get('components', {}).items():
+            if name == COMPOSITE:
+                continue
+            out[f'raycal/alpha_star_{name}'] = c['alpha_star']
+            out[f'raycal/status_{name}'] = float(self._STATUS.get(c['status'], -1))
         return out
+
+
+def _as_components(value):
+    """A loss_fn result as a {component: float} dict.
+
+    A bare float is the composite alone, which is what every caller predating
+    the composite scoring returns.
+    """
+    if isinstance(value, Mapping):
+        return {str(k): float(v) for k, v in value.items()}
+    return {COMPOSITE: float(value)}

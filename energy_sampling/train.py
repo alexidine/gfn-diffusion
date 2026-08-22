@@ -55,6 +55,7 @@ from energy_sampling.controller import LRController
 from energy_sampling.grad_clip_guard import GradClipGuard
 from energy_sampling.protocol import StageProtocol, TRAIN_MODES
 from energy_sampling.ray_calibration import RayCalibration
+from energy_sampling.lr_larder import Harvested, Larder, LarderScorer, to_host
 from energy_sampling.eval.utils import sample_eval_fwd_trajs
 from energy_sampling.utils import is_cuda_oom, \
     dict2namespace, \
@@ -248,43 +249,78 @@ class Modeller:
     def _ray_probe_armed(self) -> bool:
         """Arm the ray probe iff THIS stage asked for it (lr_sensor kind 'ray').
 
-        The probe is coherent only in a fused stage that trains replay TB -- it
-        draws from replay (needing STORED trajectories) and scores with
-        replay_loss_coeffs, so anywhere else it rates a loss nobody is
-        optimising.
-
         A stage with NO lr_sensor block used to arm it anyway, governed by the
-        global ray_calibration.enabled. That default is retired: arming by
-        omission put a replay-dependent sensor into stages that never train
-        replay (where _draw_probe_batch can only return None and tally
-        raycal/skipped), and it was the last thing keeping the replay buffer
-        load-bearing in a VarGrad-only protocol. Omitting the block now means NO
-        LR sensor, which is what it reads like. _check_ray_wiring reports the two
-        ways a config can disagree with that, at startup rather than here.
+        global ray_calibration.enabled. That default is retired: omitting the
+        block now means NO LR sensor, which is what it reads like.
+        _check_ray_wiring reports the one way a config can still disagree with
+        that, at startup rather than here.
 
         arm() is called ONLY on the armed path: it clones every policy parameter,
-        which is not something to spend on a stage that will not measure.
+        which is not something to spend on a stage that will not measure. So the
+        three ways a calibration can fail are separated BEFORE the clone, and
+        they are not the same failure:
 
-        THE SECOND GATE IS NOT AN OPTIMISATION. `measure` draws n_sub sub-batches
-        from the replay buffer, and those draws consume RNG that nothing
-        restores -- so a calibration whose reading the controller then discards
-        still changes every subsequent training step. Measured: a 600-step
-        tier-C pair was bit-identical to step 500 and diverged from step 501,
-        the first probe, while every learning rate stayed bit-identical and
-        `cal_applied` was 0.0 (findings.md F-039). The probe must therefore ask
-        whether its result will be USED before it draws, not after.
+          refuse  the controller would discard the reading (warmup, historically)
+                  -- CONSUMES the period, so the first applied calibration lands
+                  on the step it always did (RayCalibration.refuse).
+          refuse  an ACTIVE branch of this stage cannot be replay-scored, so the
+                  composite the optimizer step descends cannot be formed. Also
+                  consumes the period: nothing about it changes with time.
+          defer   the larder has not yet accumulated n_sub batches of every
+                  active branch that this step did not train on. KEEPS the
+                  period latched -- it will be ready shortly, and a stage entry
+                  is exactly when the harvest is thinnest.
+
+        THE PRE-DRAW GATE IS NO LONGER ABOUT RNG. It used to be: `measure` drew
+        n_sub sub-batches from the replay buffer, and those draws consume RNG
+        that nothing restores, so a calibration whose reading the controller
+        then discarded still changed every subsequent training step (F-039). The
+        larder draw is deterministic and consumes none, so that cost is gone --
+        the gate now buys the parameter clone and the forward passes, which is a
+        smaller but still real saving. `test_lr_larder.py` pins the RNG-neutrality
+        so it cannot be lost silently.
         """
         sensor = self.protocol.stage.lr_sensor
         if sensor is None or sensor['kind'] != 'ray':
             return False
-        refusal = self.lr_controller.calibration_refusal()
+        if not self.ray_cal.due(self.step_ind):
+            return False
+        refusal = self.lr_controller.calibration_refusal() or self._probe_refusal()
         if refusal is not None:
-            # Consumes the period exactly as a completed calibration would, so
-            # the first APPLIED calibration still lands on the step it always
-            # did; see RayCalibration.refuse.
             self.ray_cal.refuse(refusal, self.step_ind)
             return False
+        if not self.larder.have(tuple(self._probe_weights),
+                                self.ray_cal.n_sub, self._probe_exclude_from):
+            self.ray_cal.defer('larder_filling', self.step_ind)
+            return False
         return self.ray_cal.arm(self.step_ind)
+
+    def _probe_refusal(self):
+        """Why this stage's composite cannot be formed at all, or None.
+
+        Structural, so it consumes the period rather than deferring. Two cases,
+        and the second is the one section 6A of the 2026-08-21 handoff says to
+        assert rather than assume: a branch whose bank carries a term the
+        backward (replay) evaluator has no counterpart for cannot be scored, and
+        a composite missing an active branch is the optimum for a direction
+        nobody took. `var_conditioning` is a live example -- its fwd bank runs
+        `emp_z: 1.0` through the condition-grouped path -- so this refuses
+        rather than silently dropping the branch.
+        """
+        if self.larder is None:
+            return 'no_larder'
+        if not self._probe_weights:
+            return 'no_active_branch'
+        for branch in self._probe_weights:
+            reason = self.larder_scorer.refusal(branch)
+            if reason is not None:
+                if reason not in self._probe_refusals_seen:
+                    self._probe_refusals_seen.add(reason)
+                    print(f"raycal: refusing -- branch '{branch}' cannot be "
+                          f"replay-scored ({reason}); the fused composite this "
+                          f"stage descends cannot be formed")
+                return 'branch_refused'
+        return None
 
     def _ray_askers(self):
         """Stages declaring `lr_sensor: {kind: ray}`. This IS the probe's switch."""
@@ -299,10 +335,27 @@ class Modeller:
         start MOVING the rate -- `actuate` is a second, separate key, and it
         stays false until the design's section-6 gates have been run on the
         route in question.
+
+        RETIRED, AND NOW UNRUNNABLE. The frozen-training race optimises fit to
+        recorded targets rather than live progress
+        (`docs/design/lr_handoff_2026-08-21.md` section 4), and section 6D
+        deletes it once `lr_race{,_probe}.py` are in version control so the
+        salvage has history. Its harvest was the piece worth keeping and has
+        moved to `lr_larder.py`, so the tees no longer feed `RaceProbe.larder`
+        and a race would defer forever on an empty one. That is a SILENT no-op,
+        which is the failure this codebase keeps paying for, so an `lr_probe`
+        block raises instead of quietly doing nothing. Absent block: unchanged.
         """
         cfg = getattr(self.args, 'lr_probe', None)
         if cfg is None or not getattr(cfg, 'enabled', False):
             return None
+        raise ValueError(
+            "lr_probe is retired: the frozen-larder race trains on recorded "
+            "trajectories with fixed rewards, which is a different objective "
+            "from live on-policy progress and has its optimum elsewhere "
+            "(docs/design/lr_handoff_2026-08-21.md section 4). Its harvest now "
+            "feeds the generalised `ray` sensor instead -- declare "
+            "`lr_sensor: {kind: ray}` on the stage. Remove the block.")
         from lr_race import RaceConfig
         from lr_race_probe import RaceProbe
         rc = RaceConfig(replicates=int(getattr(cfg, 'replicates', 10)),
@@ -317,24 +370,37 @@ class Modeller:
               f"actuate {probe.actuate}")
         return probe
 
-    def _race_harvest(self, branch, loss_dict, condition, condition_id,
-                      mol_batch, traj, repeats):
-        """Tee one live batch into the larder, if the probe is armed.
+    def _larder_harvest(self, branch, loss_dict, condition, condition_id,
+                        mol_batch, traj, repeats, scramble_tiles=0,
+                        sample_weights=None):
+        """Tee one live batch into the larder, if one is being kept.
 
         `traj` is the draw's stored path where there is one (replay), and
         otherwise the path the step ACTUALLY sampled, which only ever surfaces
-        as `loss_dict['flow_states']`. Either way the record is replay-scoreable,
-        which is the whole property the race needs.
+        as `loss_dict['flow_states']` -- which is why this is a tee inside the
+        branch step functions rather than a wrapper around them: the loss dict
+        alone carries neither `condition` nor `mol_batch`.
+
+        Everything is parked on the HOST. See lr_larder.to_host for why the
+        shallow copy in front of `.cpu()` is not optional.
         """
-        probe = getattr(self, 'race_probe', None)
-        if probe is None or not loss_dict:
+        if self.larder is None or not loss_dict:
             return
         t = traj if traj is not None else loss_dict.get('flow_states')
         log_r = loss_dict.get('log_r')
         if t is None or log_r is None:
             return
-        probe.harvest(branch, condition, condition_id, log_r, mol_batch,
-                      t, repeats)
+        self.larder.record(Harvested(
+            branch=branch,
+            step=int(self.step_ind),
+            condition=to_host(condition),
+            condition_id=to_host(condition_id),
+            log_r=to_host(log_r),
+            mol_batch=to_host(mol_batch),
+            traj=to_host(t),
+            repeats=int(repeats),
+            scramble_tiles=int(scramble_tiles or 0),
+            sample_weights=to_host(sample_weights)))
 
     def _check_ray_wiring(self):
         """The ray probe is OPT-IN per stage: it runs where and only where a
@@ -342,9 +408,7 @@ class Modeller:
 
         It used to arm by OMISSION -- any stage with no lr_sensor block ran it
         whenever a separate `ray_calibration.enabled` flag was true. That is
-        backwards for a probe with a hard coherence requirement (it draws from
-        replay and scores replay_loss_coeffs, so outside a fused stage training
-        replay TB it rates a loss nobody is optimising).
+        backwards for a probe that has to be coherent with what a stage trains.
 
         That flag is now GONE and `enabled` is derived from these askers, which
         removes the disagreement it made possible -- a stage asking for `ray`
@@ -1064,6 +1128,15 @@ class Modeller:
         # wandering median, or a rising downward/flat rate, voids the sensor
         # independently of what the alpha* values say.
         metrics.update(self.ray_cal.report())
+        # What the ray had to score with. `larder/eligible_min` is the binding
+        # number: a calibration needs n_sub records of EVERY active branch that
+        # this step did not train on, so a reading that never fires and a larder
+        # that never fills look identical without it.
+        if self.larder is not None and self._probe_weights:
+            metrics['larder/harvested'] = float(self.larder.n_seen)
+            metrics['larder/eligible_min'] = float(min(
+                len(self.larder.eligible(b, self._probe_exclude_from))
+                for b in self._probe_weights))
         if getattr(self, 'race_probe', None) is not None:
             metrics.update(self.race_probe.report())
         metrics.update(getattr(self, '_replay_is_stats', {}) or {})
@@ -2272,6 +2345,38 @@ class Modeller:
             period=int(getattr(sp_cfg, 'period', 500)),
             enabled=bool(self._ray_askers()),
         )
+        # THE LARDER -- what ray scores, replacing the replay draw. Rebuilt here
+        # rather than once at init because this method is also what a stage
+        # transition calls: the outgoing stage's batches were drawn under a
+        # different branch set and loss mixture, so scoring a ray on them would
+        # rate an objective the run has already left. Rebuilding drops them.
+        #
+        # Kept iff some stage asks for `ray`, so a hyper-only or sensorless run
+        # pays neither the tee nor the host memory. Depth is derived from n_sub
+        # rather than configured: the calibration needs n_sub records per active
+        # branch that this step did not train on, and headroom above that only
+        # buys older data.
+        if self._ray_askers():
+            n_sub = int(getattr(sp_cfg, 'n_sub', 8))
+            depth = int(getattr(sp_cfg, 'larder_depth', 0) or 0) or max(4 * n_sub, 16)
+            self.larder = Larder(depth=depth)
+            self.larder_scorer = LarderScorer(self)
+        else:
+            self.larder = None
+            self.larder_scorer = None
+        # Weights of the composite the last optimizer step actually descended,
+        # stashed by the step that formed them (fused_train_step, or the
+        # single-branch dispatch in train_step). READ, never recomputed: the
+        # fused loss folds an unavailable replay branch's share into bwd and
+        # zeroes a force-refresh-only branch, and a reconstruction that missed
+        # either would rate a direction nobody took.
+        self._probe_weights = {}
+        # Lowest step_ind whose batches fed the pending optimizer step -- the
+        # current gradient-accumulation window, which is one step when nothing
+        # is accumulating. Records at or after it are the step's OWN training
+        # data and are held out of the ray.
+        self._probe_exclude_from = int(getattr(self, 'step_ind', 0))
+        self._probe_refusals_seen = set()
         # Announced HERE and not in LRController.__init__: the controller is built
         # before the calibrator exists, so it cannot describe its own sensor there.
         self.lr_controller.announce()
@@ -2616,13 +2721,19 @@ class Modeller:
                 if self.args.grow_batch_size:
                     self.select_batch_size()
 
-                # Replay Racing. Placed AFTER step_dt, the sizer deques and
-                # select_batch_size on purpose: the z_calibration_tick seat sits
-                # INSIDE the timing window, so a race there would post its own
-                # wall time as this iteration's step_dt and feed it to the rung
-                # median, the runaway guard and the throughput meters.
-                if getattr(self, 'race_probe', None) is not None:
-                    self.race_probe.tick()
+                # The LR pool's regime clock and settling gate. Placed AFTER
+                # step_dt, the sizer deques and select_batch_size on purpose:
+                # the z_calibration_tick seat sits INSIDE the timing window, so
+                # anything here would post its own wall time as this iteration's
+                # step_dt and feed it to the rung median, the runaway guard and
+                # the throughput meters.
+                #
+                # PER ITERATION, not on the 10-step reporting clock: the settling
+                # signal (`z_cal/p`) lives in a report dict that is CLEARED each
+                # time it is published, so a 10-step sampler would miss most of
+                # them and the gate would take ten times as long to open as it
+                # appears to.
+                self.lr_controller.tick()
 
                 # train monitoring
                 if self.step_ind % 10 == 0:
@@ -2912,6 +3023,12 @@ class Modeller:
         starting_new_cycle = (not accumulating) or (self.fused_accum_count == 0)
 
         if starting_new_cycle:
+            # The ray's held-out rule, in the one place that knows where the
+            # pending step's data starts. Under accumulation a step descends
+            # SEVERAL host iterations' batches, so excluding only the last one
+            # would score the ray on data its own gradient came from -- biased
+            # high, and biased in the direction that licenses too-large steps.
+            self._probe_exclude_from = int(self.step_ind)
             # flow (Z head) params live in optimizers['flow'] for non-fused steps and
             # as a dedicated param group of optimizers['fused'] for fused steps, so the
             # right owner zeroes them either way: skip the standalone flow optimizer on
@@ -2919,6 +3036,12 @@ class Modeller:
             if 'flow' in self.optimizers and step_type != 'fused':
                 self.optimizers['flow'].zero_grad(set_to_none=True)
             self.optimizers[step_type].zero_grad(set_to_none=True)
+
+        # The composite this step descends, for the ray to score. A single-branch
+        # step is that branch at weight 1; `fused_train_step` overwrites this with
+        # the weights it actually formed.
+        if step_type != 'fused':
+            self._probe_weights = {step_type: 1.0}
 
         if step_type == 'fwd':
             loss, crystal_batch, loss_dict = self.fwd_train_step(
@@ -2979,14 +3102,15 @@ class Modeller:
             self.step_loss(step_type, loss)
 
         if probe_armed:
-            # Sub-batches are drawn lazily, one at a time, inside measure(): the
-            # loop is sub-batch outer / alpha inner, so peak memory is one draw
-            # regardless of n_sub while every contrast stays within one batch.
+            # Sub-batches are dealt lazily, one at a time, inside measure(): the
+            # loop is sub-batch outer / alpha inner, so peak memory is one
+            # sub-batch regardless of n_sub while every contrast stays within one
+            # batch. Each sub-batch is one harvested record PER ACTIVE BRANCH, so
+            # the composite is paired branch-by-branch as well as alpha-by-alpha.
             def _loss(drawn):
-                batch, coeffs, source, repeats = drawn
-                return self._probe_loss(batch, coeffs, source, discretizer, repeats)
+                return self._probe_loss(drawn, discretizer)
 
-            reading = self.ray_cal.measure(self._draw_probe_batch, _loss)
+            reading = self.ray_cal.measure(self._probe_dealer(), _loss)
             if reading is not None:
                 self.lr_controller.on_calibration(reading)
 
@@ -3092,6 +3216,12 @@ class Modeller:
         total_weight = sum(weights.values())
         fused_loss = sum((weights[k] / total_weight) * sub_losses[k][0]
                          for k in sub_losses if weights[k] > 0)
+        # THE COMPOSITE THE STEP DESCENDS, handed to the ray sensor exactly as
+        # formed rather than reconstructed from the fracs. Reconstruction would
+        # miss both corrections above: an unavailable replay branch folds its
+        # share into bwd, and a force-refresh-only branch contributes zero.
+        self._probe_weights = {k: weights[k] / total_weight
+                               for k in sub_losses if weights[k] > 0}
 
         if self._fused_grad_diag_armed():
             self._log_fused_gradient_geometry(sub_losses, weights, total_weight)
@@ -3574,58 +3704,59 @@ class Modeller:
 
         self._fused_grad_geom_report = report
 
-    def _draw_probe_batch(self):
-        """
-        Draw the batch the step probe scores at all three alpha. FRESH EVERY
-        PROBE -- the invariant that matters is 'identical data across the three
-        alpha WITHIN one probe', not 'identical across probes'. Only the former
-        keeps the second difference free of trajectory/condition noise; the
-        latter just goes stale, and re-drawing per probe averages the particular
-        draw out for free (a buffer draw costs no energy calls).
+    def _probe_dealer(self):
+        """A `draw_fn` for RayCalibration over the larder.
 
-        SOURCE: replay, i.e. ON-POLICY ROLLOUTS. Replay rows are fed by the fwd
-        branch (to_do_rebuild B2 -- 'it inherits Q's blindness, by intake'), so a
-        replay draw IS the on-policy distribution, with stored energies. That is
-        the right distribution to probe on because it carries the highest loss
-        variance in the system, and a step-size sensor should be read at its
-        worst case for stability rather than its most forgiving one. Falls back
-        to the backward draw only when replay is unavailable (a bwd-only stage, or an
-        empty buffer).
+        DETERMINISTIC. The old dealer drew n_sub sub-batches from the replay
+        buffer, and those draws consume NumPy RNG that nothing restores -- so a
+        calibration whose reading the controller then discarded still moved
+        every subsequent training step (findings.md F-039), and probed and
+        unprobed runs of the same config were not comparable. `Larder.take`
+        selects the most recent eligible records instead: nothing is sampled,
+        the sub-batches are disjoint rather than overlapping draws from one
+        buffer, and the whole calibration is RNG-neutral.
 
-        HELD OUT: a fresh draw is disjoint from this step's training batch in
-        expectation, which is the property that matters -- same-batch probing is
-        biased high, because a step reduces loss on its own batch more than on
-        the population and would systematically license too-large steps.
+        SOURCE, generalised. It used to be replay only, because replay was the
+        only draw carrying STORED trajectories -- a bwd/dataset draw sets
+        traj = None, so the evaluator would re-sample a fresh backward path at
+        every alpha and the differences would be trajectory noise reported with
+        high confidence. The larder records the path each live step ACTUALLY
+        took, for every branch, so that constraint is lifted and with it the
+        rule that `ray` is coherent only in a fused stage training replay TB.
+
+        HELD OUT: `_probe_exclude_from` drops the batches the pending step's own
+        gradient came from. Same-batch scoring is biased high -- a step reduces
+        loss on its own batch more than on the population -- and would
+        systematically license too-large steps.
         """
-        # repeats MUST come from the branch whose coeffs we score with: a coeff
-        # bank is only valid at its own branch's K. bwd_loss_coeffs carries tbc,
-        # whose residual is defined over K same-terminal rollouts and which
-        # asserts K > 1 -- so scoring a bwd draw at replay's K crashes on a bwd-only stage,
-        # where replay does not exist yet and the fallback is the only path.
-        # REPLAY ONLY, and the fallback to bwd is deliberately GONE. The whole
-        # calibration rests on evaluating one fixed batch at several alpha, and
-        # that requires the batch to carry its STORED trajectories: a replay draw
-        # does (return_traj=True), a bwd/dataset draw sets traj = None, so
-        # get_gfn_backward_loss would re-sample a fresh backward trajectory at
-        # every alpha. The differences would then be dominated by trajectory
-        # noise rather than by the step -- pairing silently broken, and the CI
-        # would report high confidence in nothing. Returning None instead makes
-        # the calibration visibly skip (raycal/skipped) rather than lie.
-        if getattr(self, 'replay_buffer', None) is None or len(self.replay_buffer) == 0:
-            return None
-        k = self.mode_repeats('replay')
-        return self.draw_replay_sample(k), self.args.replay_loss_coeffs, 'replay', k
+        deal = self.larder.take(tuple(self._probe_weights), self.ray_cal.n_sub,
+                                self._probe_exclude_from)
+        it = iter(deal or ())
+
+        def draw():
+            return next(it, None)
+
+        return draw
 
     @torch.no_grad()
-    def _probe_loss(self, batch, coeffs, source, discretizer, repeats):
+    def _probe_loss(self, drawn, discretizer):
         """
-        Re-score the probe batch under the CURRENT parameters. Stored
-        trajectories and stored energies, so no resampling and no energy calls.
+        Re-score one sub-batch under the CURRENT parameters, per branch and as
+        the frac-weighted composite. Stored trajectories and stored energies, so
+        no resampling and no energy calls.
+
+        THE COMPOSITE IS WHAT THE CONTROLLER READS. The optimizer takes one step
+        along the fused gradient, so alpha* has to be measured against the
+        objective that step descends; a per-branch alpha* is the optimum for a
+        direction nobody took. The per-branch numbers come back anyway -- each
+        branch is evaluated at each alpha to form the sum -- so they are
+        returned as free diagnostics and bracketed alongside.
 
         FORWARD ONLY -- the whole probe runs under no_grad and builds no graph,
-        so it costs three forward passes and zero backward passes.
+        so it costs len(alphas) forward passes per active branch and zero
+        backward passes.
 
-Two things deliberately NOT done here, both recorded in
+        Two things deliberately NOT done here, both recorded in
         docs/to_do_rebuild.md A4c so they are not re-proposed:
 
         - Running one evaluation WITH grad to harvest a 'free' gradient. A
@@ -3636,29 +3767,21 @@ Two things deliberately NOT done here, both recorded in
           search, a live stage-2 option, but stage 1 restores so the probe
           cannot influence the trajectory it is measuring.
 
-        Must not mutate training state: update_log_z=False is the single gate on
-        the condition-log-Z tracker (gflownet_losses.py:432), report_losses=False
-        keeps it cheap, and unlike replay_train_step this deliberately does NOT
-        call buffer.update_losses -- a probe draw is not a training visit and
-        must not count as one for churn, priority, or residence.
+        Must not mutate training state: `LarderScorer.score` passes
+        update_log_z=False (the single gate on the condition-log-Z tracker,
+        gflownet_losses.py:432) and mode_level_stream=None, and unlike
+        replay_train_step nothing here calls buffer.update_losses -- a probe
+        score is not a training visit and must not count as one for churn,
+        priority, or residence.
         """
-        condition, condition_id, _inds, latents, log_reward, mol_batch, traj = batch
-        loss, _ = get_gfn_backward_loss(coeffs,
-                                        latents.to(self.device),
-                                        self.gfn_model,
-                                        log_reward.to(self.device),
-                                        discretizer,
-                                        mol_batch,
-                                        condition=condition,
-                                        repeats=repeats,
-                                        report_losses=False,
-                                        trajectories=traj,
-                                        condition_log_z=self.condition_log_z,
-                                        condition_id=condition_id,
-                                        tb_z_source=self.tb_z_source(source),
-                                        update_log_z=False,
-                                        step=self.step_ind)
-        return loss.detach().item()
+        out = {}
+        total = 0.0
+        for branch, w in self._probe_weights.items():
+            value = self.larder_scorer.score(drawn[branch], discretizer)
+            out[branch] = value
+            total += w * value
+        out['composite'] = total
+        return out
 
     def _hyper_sensor_cfg(self, step_type):
         """The stage's hypergradient config, or None if it is not this sensor.
@@ -4209,9 +4332,9 @@ Two things deliberately NOT done here, both recorded in
                                    step=self.step_ind,
                                    )
         self._stash_z_cal_cache(condition_id)
-        if getattr(self, 'race_probe', None) is not None and report_losses:
-            self._race_harvest('fwd', out[-1], condition, condition_id,
-                               mol_batch, None, repeats)
+        if report_losses:
+            self._larder_harvest('fwd', out[-1], condition, condition_id,
+                                 mol_batch, None, repeats)
         return out
 
     def _stash_z_fill_logw(self, loss_dict):
@@ -4436,8 +4559,9 @@ Two things deliberately NOT done here, both recorded in
         elif self.bwd_sampling_mode == 'prior':
             self.prior_buffer.update_losses(priority, inds)
 
-        self._race_harvest('bwd', loss_dict, condition, condition_id,
-                           mol_batch, traj, repeats)
+        self._larder_harvest('bwd', loss_dict, condition, condition_id,
+                             mol_batch, traj, repeats,
+                             scramble_tiles=scramble_tiles)
         return loss, loss_dict
 
     def _bwd_retention_priority(self, loss_dict):
@@ -4531,8 +4655,9 @@ Two things deliberately NOT done here, both recorded in
                  'lambda_tau': st['replay/lambda_tau']},
                 self.step_ind)
 
-        self._race_harvest('replay', loss_dict, condition, condition_id,
-                           mol_batch, traj, repeats)
+        self._larder_harvest('replay', loss_dict, condition, condition_id,
+                             mol_batch, traj, repeats,
+                             sample_weights=self._replay_is_w)
         return loss, loss_dict
 
     @torch.no_grad()
@@ -5793,7 +5918,14 @@ Two things deliberately NOT done here, both recorded in
             metrics.update(fig_dict)
 
         metrics.update({
-            'Batch Size': self.batch_size})  # single shared batch size -- train and eval sampling now use the same value
+            'Batch Size': self.batch_size,
+            # NO LONGER THE SAME NUMBER. Eval draws shrink independently of the
+            # train batch (see eval_draw_size), because they have different
+            # memory profiles and on the MLIP routes train_prior makes no energy
+            # call at all while eval scores every sample through the MLIP.
+            # Logged because a train batch of 1000 beside an eval draw of 8 is
+            # the whole diagnosis, and reading only the first hides it.
+            'batch/eval_draw': float(self.eval_draw_size())})
         self.times['eval_wrapup_end'] = time()
         self.times['eval_step_end'] = time()
         # drained AFTER the two end stamps above, so every pair this eval opened
@@ -6901,8 +7033,13 @@ Two things deliberately NOT done here, both recorded in
             its key, so `pinned: {replay: 0.0}` -- var_conditioning's way of
             saying "replay off" -- reads as boostable. A pin at zero is a pin at
             zero, so it is read by VALUE here.
-          - the ray probe, which draws from replay (see _draw_probe_batch).
-          - z_calibration mode 'replay', which draws from it too.
+          - z_calibration mode 'replay', which draws from it.
+
+        THE RAY PROBE USED TO BE A THIRD CONSUMER and no longer is: it draws
+        from the larder (`_probe_dealer`), which is fed by whatever branches the
+        stage runs, so a stage declaring `lr_sensor: {kind: ray}` no longer
+        forces a replay buffer it may not train. A fused stage that does train
+        replay still reaches the clauses below on their own merits.
 
         Cost of being wrong in the OFF direction is bounded and self-healing:
         the buffer is supply-paced, so a stage that does want replay fills it
@@ -6916,9 +7053,6 @@ Two things deliberately NOT done here, both recorded in
         while a stage draws.
         """
         stage = self.protocol.stage
-        sensor = stage.lr_sensor
-        if sensor is not None and sensor['kind'] == 'ray':
-            return True
         zc = getattr(self.args, 'z_calibration', None)
         if getattr(zc, 'enabled', False) and getattr(zc, 'mode', None) == 'replay':
             return True
@@ -7618,7 +7752,11 @@ Two things deliberately NOT done here, both recorded in
             num_samples = self.args.eval_num_samples
 
         while n_collected < num_samples:
-            bsz = min(num_samples - n_collected, self.batch_size)
+            # eval_draw_size(), NOT batch_size: this loop retries on OOM and the
+            # ONLY thing that shrinks the retry is the eval cap. Reading the train
+            # batch here made every retry reissue the same allocation -- p4_mace_mle
+            # asked for 45 GiB at eval draws of 8, 5, 3 and 1 alike.
+            bsz = min(num_samples - n_collected, self.eval_draw_size())
             try:
                 mol_batch = next(dataset.loader(bsz, mode='graphs'))
                 mol_batch = mol_batch.to(self.device)

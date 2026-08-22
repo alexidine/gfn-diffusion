@@ -265,9 +265,11 @@ def sensor_mismatch():
     """
     WHAT THE PROBE'S OBJECTIVE MISMATCH COSTS.
 
-    The real probe draws from replay and scores with replay_loss_coeffs, while
-    the step it is rating trained the full fused mixture. Arm A reproduces that;
-    arm B scores the same objective that trained.
+    HISTORICAL as of handoff 2026-08-21 section 6A: the probe USED TO draw from
+    replay and score `replay_loss_coeffs` while the step it rated trained the
+    full fused mixture. Arm A reproduces that; arm B scores the same objective
+    that trained -- which is what the trainer now does. This experiment measures
+    what the change bought, and is kept for that reading.
     """
     _hr('sensor_mismatch: probe scores replay only vs the objective that trained')
     LR_FLOW = 0.3

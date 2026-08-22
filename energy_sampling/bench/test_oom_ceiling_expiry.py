@@ -373,3 +373,61 @@ def test_set_max_batch_size_clamps_the_live_batch():
     assert m.args.max_batch_size == 20000, m.args.max_batch_size
     assert m.batch_size == 120, (
         f'raising the cap moved the batch to {m.batch_size}')
+
+
+def test_every_eval_retry_loop_sizes_itself_from_the_eval_draw():
+    """SOURCE-LEVEL, because the runtime tests cannot see this one.
+
+    An eval loop that catches OOM and `continue`s has exactly one way to make
+    progress: draw smaller next time. It draws smaller only if it sizes itself
+    from eval_draw_size(). A loop that sizes from self.batch_size instead
+    reissues an identical allocation forever -- and the train batch is now held
+    deliberately steady, so it will never shrink underneath it.
+
+    That is not hypothetical. p4_mace_mle asked for 45 GiB at eval draws of 8, 5,
+    3 and 1 alike, because fwd_eval_sampling read self.batch_size while the
+    handler shrank a number nothing consulted. The two runtime tests in this file
+    both passed throughout: they check the HANDLER, and the defect was in the
+    CALLER.
+
+    Checked by inspection rather than execution because driving a real eval needs
+    a model, a prior and a GPU -- and the property is a one-line syntactic fact.
+    """
+    import inspect
+    import train
+
+    def _safe_src(fn):
+        try:
+            return inspect.getsource(fn)
+        except (OSError, TypeError):
+            return ''
+
+    # DERIVED FROM THE CALL SITES, not hardcoded: any function that recovers an
+    # OOM under a NON-TRAIN step_type is subject to this, so a hand-written list
+    # would miss the next one added. The step_type literal is what separates an
+    # eval retry from a train one -- the handler itself gates on TRAIN_MODES.
+    import re
+    from protocol import TRAIN_MODES
+    call = re.compile(r"handle_train_epoch_error\(\s*\w+\s*,\s*'([^']+)'")
+    names = sorted({
+        m for m in dir(train.Modeller)
+        if not m.startswith('__') and callable(getattr(train.Modeller, m, None))
+        and any(st not in TRAIN_MODES
+                for st in call.findall(_safe_src(getattr(train.Modeller, m))))})
+    assert len(names) >= 3, f'expected at least 3 eval retry loops, found {names}'
+    for name in names:
+        fn = getattr(train.Modeller, name)
+        src = inspect.getsource(fn)
+        assert 'handle_train_epoch_error' in src, (
+            f'{name} no longer retries on OOM -- if the recovery moved, this '
+            f'test is pinning the wrong function')
+        assert 'eval_draw_size()' in src, (
+            f'{name} retries on OOM but never calls eval_draw_size(); its retry '
+            f'cannot get smaller and the loop will spin')
+        # the draw itself must not come from the train batch
+        for line in src.splitlines():
+            if 'self.batch_size' not in line or line.strip().startswith('#'):
+                continue
+            raise AssertionError(
+                f'{name} sizes from self.batch_size: {line.strip()!r} -- the '
+                f'train batch is held steady, so this retry never shrinks')

@@ -843,12 +843,19 @@ class EquilibrationGame(_Game):
 
     def probe_loss(self, batch):
         """
-        DEFAULT: score the replay objective ONLY, while the step trained
-        replay + bwd. That is not a simplification -- it is the real probe's
-        documented behaviour (it draws from replay and scores with
-        replay_loss_coeffs), and it means the sensor rates a loss nobody is
-        wholly optimising. Set probe_scores='total' to switch the mismatch off
-        and measure what it was worth.
+        Score the replay objective ONLY, while the step trained replay + bwd --
+        so the sensor rates a loss nobody is wholly optimising.
+
+        THAT MISMATCH IS NOW HISTORICAL. It modelled the shipped probe, which
+        drew from replay and scored `replay_loss_coeffs`; since section 6A of
+        `docs/design/lr_handoff_2026-08-21.md` the trainer scores the
+        FRAC-WEIGHTED COMPOSITE over every active branch, which is what
+        probe_scores='total' models here.
+
+        The DEFAULT is deliberately left at 'replay' so results measured before
+        the change stay interpretable and the mismatch's cost stays measurable
+        by switching. It is no longer a model of current behaviour: a bench cell
+        meant to mirror the trainer must set probe_scores='total'.
         """
         n_theta, _ = batch
         with torch.no_grad():

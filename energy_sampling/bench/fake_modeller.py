@@ -19,7 +19,13 @@ WHAT THE CONTROLLERS ACTUALLY READ (the whole coupling surface):
   LRController          args, optimizers, step_ind, phase, lr_ctrl, ray_cal
   RayCalibration        nothing -- it takes params + two callables
   the ray probe SWITCH   protocol.stages[*].lr_sensor -- `enabled` is derived,
-                        not configured (train.py:1871, _ray_askers)
+                        not configured (train.py, _ray_askers)
+  the ray probe GATE    larder, larder_scorer, _probe_weights,
+                        _probe_exclude_from, _probe_refusals_seen. The sensor
+                        scores the fused composite on harvested batches now, so
+                        the gate asks whether every ACTIVE branch can be
+                        replay-scored and whether the larder holds n_sub records
+                        of each that this step did not train on
   select_batch_size     args, protocol.stage.{name,train_mode}, step_ind,
                         batch_size, _recent_step_times, _recent_step_work,
                         batch_sizer, batch_size_* state, _gpu_util, _now
@@ -33,6 +39,11 @@ shipping configuration rather than an invented one.
 
 from collections import deque
 from types import SimpleNamespace
+
+import torch
+
+from energy_sampling.lr_larder import Larder, LarderScorer
+from energy_sampling.utils import MetricTracker
 
 # Defaults transcribed from configs/mk_dev.yaml. Deliberately a flat literal:
 # importing the real YAML would drag in the config loader and its derived-key
@@ -69,6 +80,19 @@ MK_DEV_CALIBRATION = dict(alpha_target=4.0, eta_up=0.25, eta_down=0.5)
 # `enabled=bool(self._ray_askers())`). The bench derives it the same way, from
 # FakeStage.lr_sensor via FakeModeller._ray_askers.
 MK_DEV_RAYCAL = dict(period=500, n_sub=8, alphas=(0, 1, 2, 4, 8, 16, 32, 64))
+
+# The three coefficient banks, transcribed from configs/mk_dev.yaml. Only the
+# keys the probe gate reads are here: LarderScorer.refusal asks whether the FWD
+# bank carries a term the backward (replay) evaluator has no counterpart for,
+# and all four are 0 on the canonical route. `var_conditioning` runs emp_z 1.0,
+# which is the case the refusal exists for -- flip it in a test, do not ship it
+# as a default here.
+MK_DEV_BANKS = dict(
+    fwd_loss_coeffs=dict(tb=1.0, z_level=0.0, emp_z=0.0, traj_grads=0.0,
+                         reward_grads=0.0),
+    bwd_loss_coeffs=dict(tb=1.0, traj_grads=1.0),
+    replay_loss_coeffs=dict(tb=1.0, traj_grads=0.0),
+)
 
 MK_DEV_BATCH = dict(
     batch_size=1000, max_batch_size=20000, grow_batch_size=True,
@@ -112,6 +136,7 @@ def make_args(**overrides):
     adaptive = dict(MK_DEV_ADAPTIVE)
     calibration = dict(MK_DEV_CALIBRATION)
     raycal = dict(MK_DEV_RAYCAL)
+    banks = {k: dict(v) for k, v in MK_DEV_BANKS.items()}
     flat = {**MK_DEV_LR, **MK_DEV_BATCH}
 
     #: prefix -> the block it addresses. LONGEST FIRST: 'adaptive_lr.' is a
@@ -121,6 +146,9 @@ def make_args(**overrides):
     blocks = (('adaptive_lr.calibration.', calibration),
               ('adaptive_lr.ray_calibration.', raycal),
               ('adaptive_lr.', adaptive),
+              ('fwd_loss_coeffs.', banks['fwd_loss_coeffs']),
+              ('bwd_loss_coeffs.', banks['bwd_loss_coeffs']),
+              ('replay_loss_coeffs.', banks['replay_loss_coeffs']),
               ('', flat))
 
     for key, value in overrides.items():
@@ -138,6 +166,7 @@ def make_args(**overrides):
 
     adaptive['calibration'] = SimpleNamespace(**calibration)
     adaptive['ray_calibration'] = SimpleNamespace(**raycal)
+    flat.update({k: SimpleNamespace(**v) for k, v in banks.items()})
     return SimpleNamespace(adaptive_lr=SimpleNamespace(**adaptive), **flat)
 
 
@@ -215,6 +244,39 @@ class FakeModeller:
         self.ray_cal = None
         self.lr_controller = None
 
+        # Ray-probe gate state. REAL objects, not stubs: Larder is pure Python
+        # and LarderScorer's refusal path reads only the coefficient banks, so
+        # both run unmodified here and a change to either shape fails loudly.
+        # `_probe_weights` is the composite the last step descended -- one
+        # branch at weight 1 unless a test says otherwise.
+        self.larder = Larder(depth=32)
+        self.larder_scorer = LarderScorer(self, verbose=False)
+        # NB 'fused' is a TRAIN MODE, never a branch: a fused step's composite
+        # is the three real branches at the weights it formed (mk_dev's
+        # equilibration fracs here), and a bwd stage is that one branch at 1.
+        self._probe_weights = ({'fwd': 0.05, 'bwd': 0.45, 'replay': 0.5}
+                               if stage.train_mode == 'fused'
+                               else {stage.train_mode: 1.0})
+        self._probe_exclude_from = 0
+        self._probe_refusals_seen = set()
+
+        # Ramp-driver surface (lr_ramp_probe.RampDriver): a real model to
+        # snapshot and a real MetricTracker to read coherence from. Tiny, but
+        # REAL -- the driver's contract is that a rollback is bitwise, and a
+        # stub with no parameters could not test that at all.
+        #
+        # BUILT INSIDE fork_rng. `nn.Linear` initialises its weights from the
+        # GLOBAL torch stream, so constructing a fake would shift the RNG for
+        # everything built after it -- and this class is instantiated by test
+        # modules that have nothing to do with the ramp. A harness that perturbs
+        # the runs it measures is the exact defect this bench exists to catch,
+        # one level up (findings F-039).
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(0)
+            self.gfn_model = torch.nn.Linear(4, 3)
+        self.metric_tracker = MetricTracker(period=100)
+        self._hyper_prev_step = None
+
         # bench bookkeeping (never read by the real code)
         self.history = []
 
@@ -277,4 +339,19 @@ def attach_real_batch_sizer(cls=FakeModeller):
     # Only _read_gpu_util (the NVML leaf) stays faked -- see FakeModeller.
     cls._sample_gpu_util = train.Modeller._sample_gpu_util
     cls._gpu_util_mean = train.Modeller._gpu_util_mean
+    return cls
+
+
+def attach_real_probe_gate(cls=FakeModeller):
+    """Bind train.Modeller's REAL ray-probe gate onto the fake class.
+
+    Same discipline and the same ~11 s import cost as attach_real_batch_sizer:
+    the gate decides refuse-vs-defer-vs-arm, and a bench copy of that decision
+    would be the one thing capable of drifting from the trainer while reporting
+    green.
+    """
+    import train  # noqa: E402  -- deliberately deferred, see docstring
+
+    cls._ray_probe_armed = train.Modeller._ray_probe_armed
+    cls._probe_refusal = train.Modeller._probe_refusal
     return cls

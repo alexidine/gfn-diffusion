@@ -132,6 +132,14 @@ gap.**
 Four changes. A and B are the substance; C and D are cleanup. This is what the
 calibration ramp of section 7 hands over to.
 
+> **BUILD STATUS, 2026-08-22.** A and B are **built and verified on real runs**;
+> C needs nothing; D is **blocked** on `lr_race{,_probe}.py` reaching version
+> control (section 10). New modules: `lr_larder.py` (harvest + scorer),
+> `lr_pool.py` (the estimator, no torch). New tests: `test_lr_larder.py`,
+> `test_lr_pool.py`, plus additions to `test_ray_probe_gate.py` and
+> `test_warmup_ramp_freeze.py`. See section 11 for what was measured and what
+> the build found that this plan did not anticipate.
+
 ### A. Generalise what `ray` scores to the loss the stage actually trains
 
 Today `_draw_probe_batch` (`train.py`) is hardwired to a replay draw and returns
@@ -413,12 +421,84 @@ suits a margin measurement — just note that any code assuming a doubling grid
 ## 10. Status
 
 - `lr_race.py` and `lr_race_probe.py` are **untracked**, while their call sites in
-  `train.py` and `controller.py` were captured by checkpoint commits. Nothing is
-  broken (the import is lazy inside `_build_race_probe`, and only a config
-  carrying an `lr_probe` block reaches it), but they need adding to version
-  control before the delete in 6D, so the salvage has history.
-- Probe configs written this session are `configs/race_*.yaml`; not user-owned,
+  `train.py` and `controller.py` were captured by checkpoint commits. **This now
+  blocks 6D**: the harvest they carried has moved to `lr_larder.py`, so the tees
+  no longer feed `RaceProbe.larder` and a race would defer forever on an empty
+  one. Rather than leave that silent, `_build_race_probe` RAISES on an
+  `lr_probe` block. Commit the two files and the delete can proceed.
+- Probe configs written 2026-08-21 are `configs/race_*.yaml`; not user-owned,
   and they can go with the delete.
 - The canonical config carries no `lr_probe` block and loads clean; the probe is
   off by omission and has never actuated.
-- `bench/` is 250 tests green as of the end of the session.
+- `bench/` is 250 tests green as of the end of the 2026-08-21 session.
+
+---
+
+## 11. What the 6A/6B build measured, 2026-08-22
+
+### Verified
+
+- **`ray` measures phase 1.** `raycal_phase1_smoke` (latent_gaussian, CPU,
+  `train_prior` declaring `lr_sensor: {kind: ray}`): **11 calibrations, 0
+  skipped / 0 deferred / 0 refused**, on a bwd/MLE stage the sensor had never
+  produced a single reading on across 19 prior runs.
+- **The composite and its per-branch diagnostics work on a fused stage.**
+  `raycal_fused_smoke`, 9 calibrations, larder 2201 records over three branches.
+  One reading: composite alpha* 8 (below_range), **bwd 8, fwd 4, replay 2.83
+  (bracketed)** -- the branch disagreement 6A predicted would be worth
+  surfacing, and it is free.
+- **The probe now perturbs nothing.** Two runs identical but for the phase-1
+  `lr_sensor`, with `lr_servo_managed` empty so no rate moved: **334 of 349
+  summary metrics bit-identical**. The 15 that differ are wall-clock timings
+  plus `lr_ctrl/peak_scale`, which the control arm does not apply. This is
+  F-039's own test, and it could not have passed under the replay draw -- that
+  draw consumed NumPy RNG nothing restored. `Larder.take` is deterministic.
+
+### Found during the build, not anticipated by this plan
+
+- **The alpha grid tests one entry FEWER than `ray_calibration.py` claimed.** A
+  grid point is tested only when its double is also on the grid, so
+  `{0,1,2,4,8}` tests alpha* against `{1,2,4}` -- not `{0.5,1,2,4}` as the
+  module docstring said. Corrected there. It matters for 8(f): the lowest
+  TESTED alpha is the grid's second entry, so a rate hotter than that reads as
+  a censored bound and never as a point.
+- **`var_conditioning` cannot be ray-measured as 6A assumed.** Its fwd bank runs
+  `emp_z: 1.0` through the condition-grouped path, and `get_gfn_backward_loss`
+  ASSERTS against `emp_z` under `vg_by_condition` (and reaches an undefined
+  `log_Z_emp` without it). 6A says "assert rather than assume, and refuse the
+  branch if not", so the calibration refuses with `branch_refused` -- but 6A
+  also expects that stage to yield "fwd and bwd VarGrad". **Open decision:**
+  score fwd there with `emp_z` zeroed and log the omission, or leave the stage
+  on `hyper`. Scoring it zeroed is not obviously wrong -- `emp_z` trains the
+  flow head, which the ray holds fixed anyway -- but its value still varies
+  along the ray through `log_Z_emp`, so it is not a free omission either.
+- **6B attributes the parking offset to the eta asymmetry with the sign read one
+  way; the arithmetic reads it the other.** `eta_down 0.5 > eta_up 0.25` makes
+  an up-down pair a net CUT (0.917x on the measured 2.83/5.66 alternation), so
+  peak_scale walks DOWN and alpha* equilibrates ABOVE target. Solving
+  `0.25(mu+s) + 0.5(mu-s) = 0` at `s = log10(5.66/4)` gives **mu = +0.050 dex of
+  alpha***, inside `raydrift`'s predicted +0.043..+0.059 band and consistent
+  with every run holding alpha* 4.57-5.47 against target 4. So the offset is
+  real and the mechanism is right; "hot" in 6B means hot IN ALPHA*, which is a
+  ~12% COLDER learning rate than `alpha_target` names. Pinned in
+  `test_lr_pool.py`.
+- **Censored readings needed handling 6B does not specify.** v8 used a bound as
+  a point estimate; for `below_range` that overstates alpha* and licenses a
+  hotter rate than the evidence supports. The pool takes bounds as one-sided
+  hinges instead -- a bound pulls only when the estimate violates it. With only
+  bounds in the window the minimiser is an interval and the estimate is the
+  point of it nearest the incumbent, i.e. the smallest move the evidence
+  requires.
+
+### Behaviour changes a reader should know about
+
+- `adaptive_lr.calibration.mode` defaults to **`pooled`**. `servo` restores the
+  retired per-reading rule for comparison. Absent key = pooled.
+- `replay_in_play` no longer returns True merely because a stage declares
+  `ray`: the sensor no longer draws from replay, so it no longer forces a
+  buffer the stage may not train.
+- `configs/mk_dev.yaml` still carries comments saying `ray` "draws from replay
+  and scores replay_loss_coeffs, so it is incoherent in a bwd stage". That is
+  no longer true and the file is owner-controlled, so it is flagged rather than
+  edited. The same sentence is copied through ~20 generated configs under
+  `configs/`, which are non-authoritative and were left alone.

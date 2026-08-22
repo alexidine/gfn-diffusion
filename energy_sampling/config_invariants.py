@@ -386,14 +386,34 @@ def auto_lr_requires_an_adaptive_sensor(cfg: dict,
     return out
 
 
-def ray_sensor_needs_a_coherent_stage(cfg: dict) -> list[Violation]:
-    """`ray` is only coherent in a fused stage that trains replay TB.
+#: Coefficients the FORWARD loss trains that `get_gfn_backward_loss` -- the only
+#: evaluator that takes stored trajectories -- has no counterpart for. See
+#: lr_larder.LarderScorer.FWD_ONLY_TERMS, which enforces the same thing at
+#: runtime; this is the load-time half so a config says so before it spends a
+#: stage discovering it.
+_FWD_ONLY_TERMS = ('z_level', 'emp_z', 'reward_grads', 'traj_grads')
 
-    The probe draws from the replay buffer (so it needs stored trajectories) and
-    scores with replay_loss_coeffs, so anywhere else it rates a loss nobody is
-    optimising -- and does so silently, tallying skips rather than raising."""
+
+def ray_sensor_needs_a_coherent_stage(cfg: dict) -> list[Violation]:
+    """`ray` must be able to score every branch its stage's step descends.
+
+    REWRITTEN 2026-08-22 (handoff section 6A). The old rule was "fused stage
+    training replay TB", because the probe drew from the replay buffer and
+    scored `replay_loss_coeffs` -- which is why phase 1 was never measured. It
+    now deals from a per-branch larder of harvested live batches and scores the
+    frac-weighted composite, so the coherence requirement moved with it: a stage
+    is coherent when every branch it trains can be replayed through
+    `get_gfn_backward_loss`.
+
+    The one case that cannot is a FORWARD bank carrying a term that evaluator has
+    no counterpart for. `var_conditioning` is the live example: its fwd bank runs
+    `emp_z: 1.0` through the condition-grouped path, which the backward evaluator
+    asserts against. The runtime refuses that branch and skips the calibration;
+    this says so at load, where it is cheap to fix.
+    """
     out = []
-    base_replay_tb = _num(_get(cfg, 'replay_loss_coeffs.tb')) or 0.0
+    base_fwd = {k: _num(_get(cfg, f'fwd_loss_coeffs.{k}')) or 0.0
+                for k in _FWD_ONLY_TERMS}
     for st in active_stages(cfg):
         if not isinstance(st, dict):
             continue
@@ -401,21 +421,19 @@ def ray_sensor_needs_a_coherent_stage(cfg: dict) -> list[Violation]:
         if not (isinstance(sensor, dict) and sensor.get('kind') == 'ray'):
             continue
         if st.get('train_mode') != 'fused':
+            continue          # a single-branch stage trains only that branch
+        override = (st.get('loss_coeffs') or {}).get('fwd') or {}
+        live = [k for k in _FWD_ONLY_TERMS
+                if abs(_num(override[k]) if k in override else base_fwd[k]) > 0]
+        if live:
             out.append(Violation(
                 ERROR, 'ray_sensor_needs_a_coherent_stage',
-                f"stage {st.get('name')!r} declares lr_sensor kind 'ray' but "
-                f"train_mode is {st.get('train_mode')!r}. The ray probe draws "
-                f"from replay and scores replay_loss_coeffs; outside a fused "
-                f"stage training replay TB it rates a loss nobody is optimising."))
-            continue
-        override = ((st.get('loss_coeffs') or {}).get('replay') or {}).get('tb')
-        replay_tb = _num(override) if override is not None else base_replay_tb
-        if not replay_tb:
-            out.append(Violation(
-                ERROR, 'ray_sensor_needs_a_coherent_stage',
-                f"stage {st.get('name')!r} declares lr_sensor kind 'ray' but its "
-                f"effective replay tb coefficient is 0 -- the probe would score a "
-                f"loss this stage does not optimise."))
+                f"stage {st.get('name')!r} declares lr_sensor kind 'ray', but its "
+                f"forward bank trains {live}, which the replay evaluator "
+                f"`get_gfn_backward_loss` has no counterpart for -- so the fused "
+                f"composite the step descends cannot be scored and every "
+                f"calibration would refuse. Use lr_sensor kind 'hyper' here, or "
+                f"zero those terms."))
     return out
 
 

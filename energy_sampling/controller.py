@@ -1,4 +1,7 @@
 import math
+from collections import deque
+
+from energy_sampling.lr_pool import NOISE_FLOOR_DEX, OptimumPool
 
 
 class LRController:
@@ -14,9 +17,13 @@ class LRController:
     else:
 
         kind: ray      on_calibration(), at most once per
-                       ray_calibration.period steps. Coherent only in a fused
-                       stage that trains replay TB -- the probe draws from
-                       replay and scores replay_loss_coeffs
+                       ray_calibration.period steps. Scores the FUSED COMPOSITE
+                       the stage's own step descends, on batches harvested from
+                       its own live steps (lr_larder.py), so it is coherent
+                       wherever every active branch can be replay-scored. It
+                       used to draw from replay and score replay_loss_coeffs,
+                       which confined it to a fused stage training replay TB and
+                       is why phase 1 was never measured
         kind: hyper    on_hypergradient(), EVERY step, each move bounded by
                        exp(+-beta). Scores no loss, so it is coherent whatever
                        the stage trains
@@ -103,6 +110,36 @@ class LRController:
         self._restarts = 0
         self._lr_capped_groups = 0    # param groups max_lr bound on the last _apply_lrs
         self._lr_floored_groups = 0   # ...and min_lr; a floor that binds is a clamp, not a default
+        # ------------------------------------------- the pooled ray estimator
+        # Section 6B of docs/design/lr_handoff_2026-08-21.md. `mode: servo`
+        # restores the retired per-reading rule; it is kept reachable so the
+        # replacement can be compared against it rather than argued about.
+        self.pool = OptimumPool(
+            half_life=float(self._cal_cfg('pool_half_life', 8.0)),
+            min_readings=int(self._cal_cfg('pool_min_readings', 3)),
+            move_t=float(self._cal_cfg('move_t', 2.0)),
+            noise_floor_dex=float(self._cal_cfg('noise_floor_dex', NOISE_FLOOR_DEX)))
+        self._pool_stage = None       # stage the pool's regime belongs to
+        self._pool_epoch = 0          # bumped when the loss composition moves
+        self._pool_composition = None  # the composition the current epoch started at
+        self._pool_entry = 0          # step_ind the current stage was entered at
+        self._zp = deque(maxlen=self.Z_CAL_SETTLED_OBS)
+        self._pool_last = {}
+        # ---------------------------------------- the checkpointed ramp (7)
+        # ABSENT BLOCK = OFF, so every existing config is unchanged. The ramp
+        # takes ownership of peak_scale for its duration and hands it to the
+        # pooled estimator at `cruise_scale`; nothing else moves it meanwhile.
+        self._ramp_cfg = getattr(getattr(self.modeller.args, 'adaptive_lr', None),
+                                 'ramp', None)
+        self.ramp = None              # the live RampDriver, or None
+        self._ramp_armed = False      # a stage/composition change wants a ramp
+        self._ramp_reason = None
+        self._ramp_coherence_at = None
+        # Seeded so a controller whose `tick` has not run yet still ADMITS
+        # readings. An unset pool key never matches `_regime_key`, so without
+        # this every reading would be refused as regime_changed -- silently, and
+        # only on the paths that call on_calibration without the host loop.
+        self.pool.reset(self._regime_key())
         self._check_bars()
 
     # ------------------------------------------------------------------ config
@@ -150,10 +187,15 @@ class LRController:
     def announce(self):
         cal = getattr(self.modeller, 'ray_cal', None)
         on = cal is not None and getattr(cal, 'enabled', False)
+        mode = self._cal_mode()
         print(f"lr_ctrl v8: calibration {'ON' if on else 'off'}"
               + (f" (period {cal.period}, n_sub {cal.n_sub}, alphas {list(cal.alphas)})" if on else '')
               + f" | target alpha* {self._cal_cfg('alpha_target', 4.0)}"
-              + f" | eta up/down {self._cal_cfg('eta_up', 0.25)}/{self._cal_cfg('eta_down', 0.5)}"
+              + (f" | POOLED estimator (half-life {self.pool.half_life:g} readings,"
+                 f" min {self.pool.min_readings}, move at {self.pool.move_t:g} se)"
+                 if mode == 'pooled' else
+                 f" | RETIRED per-reading servo, eta up/down "
+                 f"{self._cal_cfg('eta_up', 0.25)}/{self._cal_cfg('eta_down', 0.5)}")
               + f" | managed {','.join(sorted(self._managed_keys())) or 'NOTHING (control arm)'}")
 
     # -------------------------------------------------------------- divergence
@@ -249,6 +291,14 @@ class LRController:
         st = self._state()
         st['envelope'] = self._envelope(st)
         lo, hi = self._peak_bounds()
+        # A divergence IS the ramp's hard-failure condition: nonfinite values or
+        # runaway state, with no persistence rule and no dwell. It rolls the
+        # rejected rung back and finishes, so the cut below applies to a restored
+        # peak rather than compounding on a damaged one.
+        if self.ramp is not None and self.ramp.ladder.state == 'running':
+            self.ramp.ladder.observe_hard_failure('divergence')
+            self.ramp.apply(self.ramp.ladder.tick(
+                int(getattr(self.modeller, 'step_ind', 0))))
         st['peak_scale'] = max(lo, min(hi, float(st['peak_scale']) * cut))
         self._ceiling = st['peak_scale']
         print(f"lr_ctrl: peak_scale -> {st['peak_scale']:.4g} (ceiling recorded)")
@@ -263,12 +313,16 @@ class LRController:
         """Why a ray calibration's reading would be thrown away, decided WITHOUT
         measuring anything -- or None if it would be acted on.
 
-        THE POINT OF A SEPARATE PREDICATE. The probe cannot be allowed to draw
-        first and find out afterwards. `RayCalibration.measure` draws `n_sub`
-        sub-batches from the replay buffer, and those draws consume RNG that
-        nothing restores -- so a calibration whose reading is discarded still
-        shifts every subsequent training step (findings.md F-039). Anything
-        knowable in advance has to be knowable HERE, before a draw happens.
+        THE POINT OF A SEPARATE PREDICATE. `RayCalibration.measure` used to draw
+        `n_sub` sub-batches from the replay buffer, and those draws consume RNG
+        that nothing restores -- so a calibration whose reading was discarded
+        still shifted every subsequent training step (findings.md F-039), and a
+        probed run was not comparable with an unprobed one. THAT COST IS GONE:
+        the larder dealer is deterministic and consumes no RNG. What the
+        predicate still buys is the parameter clone and `n_sub * len(alphas)`
+        forward passes, which is smaller but real -- and it remains the one
+        place the rule lives, so the gate that skips the probe and the gate that
+        refuses the reading cannot drift apart.
 
         `on_calibration` consults this too, so the two cannot drift: the gate
         that skips the probe and the gate that refuses the reading are the same
@@ -277,6 +331,13 @@ class LRController:
         DECIDABLE IN ADVANCE (returned by this function): nothing, currently.
         This function is kept because it is the one place the rule lives and the
         probe path still asks before drawing; the warmup case moved below.
+
+        DECIDABLE IN ADVANCE, AND DECIDED ELSEWHERE. `Modeller._probe_refusal`
+        adds two structural refusals this function cannot see, because they are
+        facts about the STAGE's loss composition rather than about the
+        controller: an active branch whose bank the replay evaluator has no
+        counterpart for, and a step with no active branch at all. They use the
+        same `RayCalibration.refuse` path and consume the period identically.
 
         DECIDABLE IN ADVANCE, AND DELIBERATELY NOT REFUSED:
 
@@ -304,7 +365,7 @@ class LRController:
           unresolved       no paired test cleared its CI
           inconsistent     the tests contradict (lo >= hi)
           bad alpha_star   non-finite or non-positive
-          no_batch /       the draw itself failed or returned too few
+          no_batch /       the deal ran short mid-calibration
           too_few_subbatches
           clamped          peak_scale already at a `bounds`/ceiling edge, so the
                            multiplier is a no-op -- depends on alpha_star
@@ -319,11 +380,170 @@ class LRController:
         # against a 1000-step warmup this sensor gets two readings, so it cannot
         # average and instead freezes the ramp on the first downward one.
         #
-        # THE PROBE IS NOT FREE. `measure` draws n_sub sub-batches whose RNG
-        # nothing restores, so arming here shifts every subsequent step
-        # (findings F-039) and runs are not comparable with pre-change ones.
-        # That cost is accepted: an unwatched ramp was the worse trade.
+        # THE PROBE IS NOT FREE, though it is cheaper than when this reversal
+        # was made: arming here used to shift every subsequent step, because
+        # `measure` drew n_sub sub-batches whose RNG nothing restored (findings
+        # F-039). The larder dealer consumes no RNG, so what remains is compute.
         return None
+
+    # ------------------------------------------------- the regime and its gate
+
+    #: L1 distance on the NORMALISED branch-weight vector that counts as a new
+    #: loss regime. Branch dormancy flips and coefficient ramps are special
+    #: cases of the same move, so one number covers all three.
+    COMPOSITION_L1 = 0.2
+
+    #: `z_cal/p` below this counts as "the log-Z level shift is done".
+    Z_CAL_SETTLED = 0.1
+
+    #: Consecutive OBSERVATIONS required, not one. `z_calibration_tick` pre-sets
+    #: `z_cal/p` to 0.0 and then returns early on several paths (mid-grad-accum,
+    #: scrambled conditions), so a single 0 can mean "did not run" rather than
+    #: "settled". Requiring a run of them makes those spurious zeros harmless.
+    Z_CAL_SETTLED_OBS = 5
+
+    #: Floor for stages that publish no `z_cal/p` at all, so "no signal" cannot
+    #: mean "no wait". Stage entry is transient for hundreds to a couple of
+    #: thousand steps whether or not a sidecar happens to measure it.
+    MIN_STAGE_STEPS = 300
+
+    def _composition(self):
+        """The stage's live loss mixture, normalised. Its L1 movement is the
+        regime trigger, and it is read from the FRACS rather than from what any
+        probe happens to hold -- the question is whether the objective the run
+        trains has changed, which is true whether or not a newly-woken branch
+        has been harvested yet."""
+        m = self.modeller
+        fr = {k: float(getattr(m, f'{k}_frac', 0.0) or 0.0)
+              for k in ('fwd', 'bwd', 'replay')}
+        tot = sum(fr.values())
+        if tot > 0:
+            fr = {k: v / tot for k, v in fr.items()}
+        return fr
+
+    def _regime_key(self):
+        return (self._pool_stage, self._pool_epoch)
+
+    def tick(self):
+        """Once per host-loop iteration: keep the pool's regime and its settling
+        gate current.
+
+        SEPARATE FROM `step()`, which runs on the 10-step reporting clock. The
+        settling signal is a report dict that is CLEARED each time it is
+        published, so a 10-step sampler would miss most of them and the gate
+        would take ten times as long to open as it looks like it does.
+        """
+        stage = getattr(getattr(self.modeller, 'protocol', None), 'stage', None)
+        name = getattr(stage, 'name', None)
+        if name != self._pool_stage:
+            # A stage change is a new objective. Readings from the outgoing one
+            # estimate a different number, so the window starts empty.
+            self._pool_stage, self._pool_epoch = name, 0
+            self._pool_entry = int(getattr(self.modeller, 'step_ind', 0))
+            self._pool_composition = self._composition()
+            self._zp.clear()
+            self.pool.reset(self._regime_key())
+            self._arm_ramp('stage_change')
+            return
+        now = self._composition()
+        was = self._pool_composition or now
+        if sum(abs(now.get(k, 0.0) - was.get(k, 0.0)) for k in set(now) | set(was)) \
+                >= self.COMPOSITION_L1:
+            self._pool_epoch += 1
+            self._pool_composition = now
+            self.pool.reset(self._regime_key())
+            self._arm_ramp('composition_change')
+        rep = getattr(self.modeller, '_z_cal_report', None) or {}
+        if 'z_cal/p' in rep:
+            self._zp.append(float(rep['z_cal/p']))
+        self._drive_ramp()
+
+    def _ramp_enabled(self):
+        return bool(getattr(self._ramp_cfg, 'enabled', False))
+
+    def _arm_ramp(self, why):
+        """A stage or composition change REQUESTS a ramp (section 7, 'after
+        calibration'). It does not start one: `_drive_ramp` waits for the
+        settling gate, per DECISION 8c."""
+        if not self._ramp_enabled():
+            return
+        # A ramp in flight is DISCARDED rather than rolled back. Its rung
+        # evidence describes an objective the run has just left, so it is stale
+        # either way -- but the STEPS it took were real training on a valid
+        # objective at the time, and throwing the weights away would discard
+        # those too. The new ramp starts from wherever the rate now sits and
+        # classifies it like any other rung.
+        self.ramp = None
+        self._ramp_armed = True
+        self._ramp_reason = why
+
+    def _drive_ramp(self):
+        """Start, feed and step the ramp. One call per host-loop iteration."""
+        if not self._ramp_enabled():
+            return
+        step = int(getattr(self.modeller, 'step_ind', 0))
+        st = self._state()
+        if self.ramp is None:
+            # DECISION 8c: not through the stage-entry transient. A rung
+            # classified against a moving log-Z level describes the transition.
+            if not (self._ramp_armed and self._settled()):
+                return
+            if self._ramping(st):
+                return          # nor through the warmup envelope: see below
+            from energy_sampling.lr_ramp import RampLadder
+            from energy_sampling.lr_ramp_probe import RampDriver
+            cfg = self._ramp_cfg
+            ladder = RampLadder(
+                alpha_target=float(self._cal_cfg('alpha_target', 4.0)),
+                factor=float(getattr(cfg, 'factor', 1.5)),
+                min_residence_steps=int(getattr(cfg, 'min_residence_steps', 500)),
+                adam_beta2=getattr(cfg, 'adam_beta2', 0.999),
+                min_readings=int(self._cal_cfg('pool_min_readings', 3)),
+                move_t=float(self._cal_cfg('move_t', 2.0)),
+                persistence=int(getattr(cfg, 'persistence', 2)),
+                min_adverse_families=int(getattr(cfg, 'min_adverse_families', 2)),
+                max_scale=float(getattr(cfg, 'max_scale', self._peak_bounds()[1])),
+                min_scale=float(getattr(cfg, 'min_scale', self._peak_bounds()[0])),
+                cruise_backoff_rungs=int(getattr(cfg, 'cruise_backoff_rungs', 0)))
+            self.ramp = RampDriver(self.modeller, ladder,
+                                   verbose=bool(getattr(cfg, 'verbose', True)))
+            self._ramp_armed = False
+            self._ramp_coherence_at = step
+            cost = ladder.projected_cost(st['peak_scale'], ladder.max_scale)
+            print(f"ramp: armed by {self._ramp_reason} at peak_scale "
+                  f"{st['peak_scale']:.4g}; residence {ladder.residence} steps "
+                  f"({ladder.residence_bound_by}); budget to the ceiling "
+                  f"~{cost['rungs']} rungs / {cost['steps']} steps, of which "
+                  f"{cost['discarded']} are discarded on the rejected rung")
+            self.ramp.apply(ladder.start(float(st['peak_scale']), step))
+            return
+        if self.ramp.ladder.state != 'running':
+            return
+        # COHERENCE ON ITS OWN CADENCE, slower than the tracker's EMA writes.
+        # Sampling every step would count one stale EMA reading as `persistence`
+        # independent ones -- the exact trap `MetricTracker.written_at` exists
+        # for, one level up.
+        every = int(getattr(self._ramp_cfg, 'coherence_every', 100))
+        if step - (self._ramp_coherence_at or step) >= every:
+            self._ramp_coherence_at = step
+            self.ramp.ladder.observe_coherence(
+                self.ramp.coherence(float(getattr(self._ramp_cfg, 'ratio', 3.0))))
+        self.ramp.apply(self.ramp.ladder.tick(step))
+
+    def _settled(self):
+        """Is the stage past its opening transient?
+
+        A rate measured while log Z is still making a large level shift describes
+        the transition, not the stage, and does not extrapolate to it. Readings
+        taken before this opens are LOOKED AT and logged but never pooled.
+        """
+        rel = int(getattr(self.modeller, 'step_ind', 0)) - self._pool_entry
+        if rel < self.MIN_STAGE_STEPS:
+            return False
+        if not self._zp:                # no z sidecar here -> the floor is the gate
+            return True
+        return (len(self._zp) >= self.Z_CAL_SETTLED_OBS
+                and all(v < self.Z_CAL_SETTLED for v in self._zp))
 
     def on_calibration(self, reading):
         """
@@ -369,10 +589,20 @@ class LRController:
                     st, f'ray alpha* {alpha:.3g} below target {target:g} on its '
                         f'first resolved reading of the ramp')
             return
-        ratio = alpha / max(target, 1e-9)
-        eta = float(self._cal_cfg('eta_up' if ratio > 1.0 else 'eta_down',
-                                  0.25 if ratio > 1.0 else 0.5))
-        mult = ratio ** eta
+        # WHILE A RAMP IS RUNNING IT OWNS peak_scale. The reading goes to the
+        # rung's own pool and nothing else moves the rate -- two controllers
+        # steering one actuator is how a units mismatch turns into what looks
+        # like instability (handoff section 8a).
+        if self.ramp is not None and self.ramp.ladder.state == 'running':
+            self.ramp.ladder.observe_ray(reading, float(st['peak_scale']),
+                                         int(getattr(self.modeller, 'step_ind', 0)))
+            self._last['status'] = 'ramp'
+            return
+        mult = (self._pooled_multiplier(st, reading, target)
+                if self._cal_mode() == 'pooled'
+                else self._servo_multiplier(alpha, target))
+        if mult is None or mult == 1.0:
+            return
         lo, hi = self._peak_bounds()
         ceiling = self._current_ceiling()
         if ceiling is not None:
@@ -382,6 +612,50 @@ class LRController:
         self._last['applied'] = st['peak_scale'] / before if before else 1.0
         st['envelope'] = self._envelope(st)
         self._apply_lrs(st)
+
+    def _cal_mode(self):
+        mode = str(self._cal_cfg('mode', 'pooled'))
+        if mode not in ('pooled', 'servo'):
+            raise ValueError(
+                f"adaptive_lr.calibration.mode = {mode!r}; expected 'pooled' "
+                f"(the estimator, default) or 'servo' (the retired v8 rule).")
+        return mode
+
+    def _servo_multiplier(self, alpha, target):
+        """The RETIRED per-reading rule, kept reachable under `mode: servo`.
+
+        Both of its measured defects are properties of this expression rather
+        than of its constants: it moves on every reading, and the within-stage
+        optimum is stationary, so it tracks white noise; and eta_up != eta_down
+        rectifies that symmetric noise into one-directional drift, which put the
+        measured equilibrium +0.043..+0.059 dex off target. See lr_pool.py.
+        """
+        ratio = alpha / max(target, 1e-9)
+        eta = float(self._cal_cfg('eta_up' if ratio > 1.0 else 'eta_down',
+                                  0.25 if ratio > 1.0 else 0.5))
+        return ratio ** eta
+
+    def _pooled_multiplier(self, st, reading, target):
+        """Fold the reading into the regime's pool and ask what it implies.
+
+        Returns None while the reading is not poolable or the pool has nothing
+        to say -- both of which are HOLDS, and both of which reach the log with
+        their evidence attached, because "no move" and "no power to move" have
+        to be distinguishable there.
+        """
+        peak = float(st['peak_scale'])
+        if not self._settled():
+            self._last['status'] = 'unsettled'
+            self._pool_last = {'action': 'hold', 'reason': 'stage_transient',
+                               'multiplier': 1.0}
+            return None
+        self.pool.observe(reading, peak, int(getattr(self.modeller, 'step_ind', 0)),
+                          self._regime_key())
+        v = self.pool.verdict(peak, target)
+        self._pool_last = v
+        if v['action'] != 'move':
+            return None
+        return float(v['multiplier'])
 
     def on_plateau(self, fired: bool, factor: float):
         """
@@ -1143,7 +1417,14 @@ class LRController:
         print(f"lr_ctrl: warm restart ({since} steps) -- peak_scale -> 1.0")
 
     _STATUS = {'unresolved': 0, 'bracketed': 1, 'above_range': 2,
-               'below_range': 3, 'inconsistent': 4, 'warmup': 5}
+               'below_range': 3, 'inconsistent': 4, 'warmup': 5,
+               # the reading was taken, and deliberately not pooled: the stage's
+               # opening transient describes the transition rather than the
+               # stage. Distinct from 'unresolved', which is the SENSOR failing.
+               'unsettled': 6,
+               # ...and this one went to a RUNNING RAMP's rung pool instead,
+               # which owns peak_scale for its duration.
+               'ramp': 7}
     # 'warmup' deliberately shares code 5 with _STATUS so the two sensors' status
     # channels read on one scale
     _PLATEAU_STATUS = {'clean': 0, 'cut': 1, 'warmup': 5}
@@ -1192,6 +1473,20 @@ class LRController:
             self._report['lr_ctrl/cal_applied'] = float(self._last.get('applied', 0.0))
             s = self._last.get('status')
             self._report['lr_ctrl/cal_status'] = float(self._STATUS.get(s, -1))
+        # THE POOL'S EVIDENCE, not just its verdict. Published whenever the
+        # estimator is the live rule, and published even when the window is too
+        # short to speak -- an estimator that is holding and one that has no
+        # power to do anything else are otherwise identical from `cal_applied`
+        # alone, which is exactly the confusion this file has logged three times.
+        if self.ramp is not None:
+            self._report.update(self.ramp.report())
+        if self._cal_mode() == 'pooled':
+            self._report.update(self.pool.report(
+                peak_scale=float(st['peak_scale']),
+                alpha_target=float(self._cal_cfg('alpha_target', 4.0))))
+            if self._pool_last.get('reason'):
+                self._report['lrpool/holding_on_transient'] = float(
+                    self._pool_last['reason'] == 'stage_transient')
         # Same discipline for the plateau sensor: publish the ACTUATOR beside the
         # sensor, so a sensor that is never firing and one that is never running
         # can be told apart from the log alone.
