@@ -431,3 +431,43 @@ def test_every_eval_retry_loop_sizes_itself_from_the_eval_draw():
             raise AssertionError(
                 f'{name} sizes from self.batch_size: {line.strip()!r} -- the '
                 f'train batch is held steady, so this retry never shrinks')
+
+
+def test_set_traj_checkpoint_re_arms_the_ladder():
+    """Toggling checkpointing changes per-sample memory by an ORDER OF MAGNITUDE
+    (~33x at T=100), so every rung the ladder measured under the old setting is
+    meaningless under the new one. Carrying them over would have the sizer hold a
+    batch it sized when each sample cost a twentieth as much.
+
+    Also pins that the flag reaches the MODELS, not just args: the rollout reads
+    `model.traj_checkpoint`, and args alone would leave the switch inert while
+    the config claimed it had flipped."""
+    from protocol import StageProtocol
+
+    class _Named:
+        name = 'equilibration'
+
+    class _Proto(StageProtocol):
+        stage = _Named()
+
+    class _Model:
+        traj_checkpoint = None
+
+    m = _fresh()
+    _drive(m, 60)
+    m.gfn_model, m.ema_model = _Model(), _Model()
+    proto = object.__new__(_Proto)
+    proto.m = m
+
+    m.batch_sizer = {'reason': 'target_met'}
+    _Proto._run_action(proto, 'set_traj_checkpoint', '1', {})
+    assert m.args.traj_checkpoint is True
+    assert m.gfn_model.traj_checkpoint is True, 'flag never reached the train model'
+    assert m.ema_model.traj_checkpoint is True, 'flag never reached the EMA model'
+    assert m.batch_sizer is None, (
+        'ladder rungs measured at the old per-sample memory survived the switch')
+
+    # and OFF, since a setter that only ever set True would pass the above
+    _Proto._run_action(proto, 'set_traj_checkpoint', '0', {})
+    assert m.args.traj_checkpoint is False
+    assert m.gfn_model.traj_checkpoint is False
