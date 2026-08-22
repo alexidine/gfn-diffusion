@@ -2338,11 +2338,26 @@ class Modeller:
         #
         # Defaulting this to False on a missing key would silently kill the probe,
         # so it is computed from the protocol rather than read.
+        # PERIOD AND n_sub MAY BE OVERRIDDEN PER STAGE, and the reason is a
+        # measurement rather than a preference. The probe's ABSOLUTE cost is set
+        # by n_sub x len(alphas) forward passes over one batch; its OVERHEAD is
+        # that divided by the stage's step cost, and stages differ by more than
+        # an order of magnitude. Measured on elj/mipcas: a calibration costs ~28
+        # training steps on `train_prior`, whose bwd/dataset step runs no rollout
+        # and no energy call (median 0.158 s) -- 5.6% at period 500, against the
+        # 1.2% recorded for the same probe on the fused stage, whose steps are
+        # ~20x more expensive. One global period cannot serve both.
+        #
+        # This method runs again at every stage transition, so `protocol.stage`
+        # is the incoming stage and the override lands on the right one.
+        stage_sensor = self.protocol.stage.lr_sensor or {}
+        if stage_sensor.get('kind') != 'ray':
+            stage_sensor = {}
         self.ray_cal = RayCalibration(
             self._hyper_param_cache,
             alphas=tuple(getattr(sp_cfg, 'alphas', (0.0, 1.0, 2.0, 4.0, 8.0))),
-            n_sub=int(getattr(sp_cfg, 'n_sub', 8)),
-            period=int(getattr(sp_cfg, 'period', 500)),
+            n_sub=int(stage_sensor.get('n_sub', getattr(sp_cfg, 'n_sub', 8))),
+            period=int(stage_sensor.get('period', getattr(sp_cfg, 'period', 500))),
             enabled=bool(self._ray_askers()),
         )
         # THE LARDER -- what ray scores, replacing the replay draw. Rebuilt here

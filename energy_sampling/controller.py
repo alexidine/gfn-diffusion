@@ -135,6 +135,15 @@ class LRController:
         self._ramp_armed = False      # a stage/composition change wants a ramp
         self._ramp_reason = None
         self._ramp_coherence_at = None
+        # RUN-LEVEL counters, kept HERE and not on the driver. A stage change
+        # arms a NEW ramp with a new driver, so the driver's own counters restart
+        # -- which made the run summary report `ramp/rollbacks 0` for a run whose
+        # first ramp had descended six rungs and rolled back. Those are facts
+        # about the run, so they accumulate across ramps.
+        self._ramps_started = 0
+        self._ramp_rollbacks = 0
+        self._ramp_snapshots = 0
+        self._ramp_rungs_clean = 0
         # Seeded so a controller whose `tick` has not run yet still ADMITS
         # readings. An unset pool key never matches `_regime_key`, so without
         # this every reading would be refused as regime_changed -- silently, and
@@ -422,7 +431,22 @@ class LRController:
         return fr
 
     def _regime_key(self):
-        return (self._pool_stage, self._pool_epoch)
+        """The pool's regime: (stage, composition epoch).
+
+        THE STAGE NAME IS READ LIVE, not from `_pool_stage`, and the difference
+        matters on exactly one step. `tick` is what notices a transition and
+        resets the pool, and `on_calibration` runs EARLIER in the same iteration
+        -- so on the first step of a new stage a key built from `_pool_stage`
+        would still name the outgoing one, and a reading taken under the new
+        objective would be pooled with estimates of a different number. Reading
+        it live makes that case a counted `regime_changed` refusal instead.
+
+        (In practice the transition also empties the larder, so the calibration
+        would defer for n_sub steps anyway. Relying on that is not the same as
+        being correct.)
+        """
+        stage = getattr(getattr(self.modeller, 'protocol', None), 'stage', None)
+        return (getattr(stage, 'name', None), self._pool_epoch)
 
     def tick(self):
         """Once per host-loop iteration: keep the pool's regime and its settling
@@ -473,9 +497,31 @@ class LRController:
         # objective at the time, and throwing the weights away would discard
         # those too. The new ramp starts from wherever the rate now sits and
         # classifies it like any other rung.
-        self.ramp = None
+        self._retire_ramp()
         self._ramp_armed = True
         self._ramp_reason = why
+
+    def _retire_ramp(self):
+        """Bank the outgoing ramp's totals before dropping it."""
+        if self.ramp is not None:
+            self._ramp_rollbacks += self.ramp.n_rollbacks
+            self._ramp_snapshots += self.ramp.n_snapshots
+            self._ramp_rungs_clean += len(
+                [h for h in self.ramp.ladder.history if h['verdict'] == 'clean'])
+        self.ramp = None
+
+    def _ramp_totals(self) -> dict:
+        live = self.ramp
+        clean = 0 if live is None else len(
+            [h for h in live.ladder.history if h['verdict'] == 'clean'])
+        return {
+            'ramp/ramps': float(self._ramps_started),
+            'ramp/rollbacks_total': float(
+                self._ramp_rollbacks + (0 if live is None else live.n_rollbacks)),
+            'ramp/snapshots_total': float(
+                self._ramp_snapshots + (0 if live is None else live.n_snapshots)),
+            'ramp/rungs_clean_total': float(self._ramp_rungs_clean + clean),
+        }
 
     def _drive_ramp(self):
         """Start, feed and step the ramp. One call per host-loop iteration."""
@@ -508,6 +554,7 @@ class LRController:
             self.ramp = RampDriver(self.modeller, ladder,
                                    verbose=bool(getattr(cfg, 'verbose', True)))
             self._ramp_armed = False
+            self._ramps_started += 1
             self._ramp_coherence_at = step
             cost = ladder.projected_cost(st['peak_scale'], ladder.max_scale)
             print(f"ramp: armed by {self._ramp_reason} at peak_scale "
@@ -1478,8 +1525,18 @@ class LRController:
         # short to speak -- an estimator that is holding and one that has no
         # power to do anything else are otherwise identical from `cal_applied`
         # alone, which is exactly the confusion this file has logged three times.
+        if self._ramp_enabled():
+            self._report.update(self._ramp_totals())
         if self.ramp is not None:
             self._report.update(self.ramp.report())
+        elif self._ramp_enabled():
+            # ARMED BUT NOT STARTED is its own state and has to look like one.
+            # Without this the block is configured, the ramp is waiting on the
+            # settling gate, and NO `ramp/*` key exists at all -- which reads
+            # exactly like a ramp that was never wired up. That confusion is the
+            # one this file has logged three separate times.
+            self._report['ramp/armed'] = float(self._ramp_armed)
+            self._report['ramp/settled'] = float(self._settled())
         if self._cal_mode() == 'pooled':
             self._report.update(self.pool.report(
                 peak_scale=float(st['peak_scale']),

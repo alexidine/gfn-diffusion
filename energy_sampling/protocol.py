@@ -438,11 +438,17 @@ class Stage:
                           `patience` checks. One criterion covers rising,
                           stalled and blown-up alike -- all three are just "no
                           improvement over best".
-          kind: ray       the alpha* ray calibration. Only coherent in a fused
-                          stage that trains replay TB: the probe draws from
-                          replay (needing stored trajectories) and scores with
-                          replay_loss_coeffs, so anywhere else it rates a loss
-                          nobody is optimising.
+          kind: ray       the alpha* ray calibration. Scores the FUSED COMPOSITE
+                          this stage's own step descends, on batches harvested
+                          from its own live steps (lr_larder.py), so it is
+                          coherent wherever every active branch can be replayed
+                          through get_gfn_backward_loss. It used to draw from
+                          replay and score replay_loss_coeffs, which confined it
+                          to a fused replay-TB stage and is why phase 1 was never
+                          measured. Optional `period` / `n_sub` override the
+                          global ray_calibration values FOR THIS STAGE, because
+                          the probe's overhead is its fixed cost divided by the
+                          stage's step cost and stages differ by >10x.
           kind: hyper     hypergradient: peak_scale *= exp(beta * cos), where
                           cos is between the current gradient and the direction
                           the previous step actually moved the policy. Reads no
@@ -512,12 +518,44 @@ class Stage:
                 raise ValueError(f"stage '{self.name}': lr_sensor.every must be "
                                  f">= 1, got {node['every']}")
             return node
-        if kind in ('ray', 'none'):
+        if kind == 'none':
             bad = set(node) - {'kind'}
             if bad:
-                raise ValueError(f"stage '{self.name}': lr_sensor kind '{kind}' takes no "
+                raise ValueError(f"stage '{self.name}': lr_sensor kind 'none' takes no "
                                  f"other keys, got {sorted(bad)}")
-            return {'kind': kind}
+            return {'kind': 'none'}
+        if kind == 'ray':
+            # `period` and `n_sub` MAY be overridden here, and the reason is a
+            # measurement. The probe's absolute cost is n_sub x len(alphas)
+            # forward passes over one batch; its OVERHEAD is that divided by the
+            # stage's step cost, and stages differ by more than an order of
+            # magnitude. Measured on elj/mipcas: ~28 training steps per
+            # calibration on `train_prior` (a bwd/dataset step runs no rollout
+            # and no energy call, median 0.158 s) = 5.6% at period 500, against
+            # the 1.2% recorded for the same probe on the fused stage. One
+            # global period cannot serve both. Absent = the global value.
+            bad = set(node) - {'kind', 'period', 'n_sub'}
+            if bad:
+                raise ValueError(f"stage '{self.name}': lr_sensor kind 'ray' takes only "
+                                 f"'period' and 'n_sub', got {sorted(bad)}")
+            out = {'kind': 'ray'}
+            if 'period' in node:
+                period = int(node['period'])
+                if period < 1 or period % 10:
+                    # Same rule RayCalibration enforces: metrics drain on a
+                    # 10-step clock, so a period that is not a multiple of it
+                    # aliases and some calibrations never reach the log.
+                    raise ValueError(f"stage '{self.name}': lr_sensor.period must be a "
+                                     f"positive multiple of 10, got {node['period']!r}")
+                out['period'] = period
+            if 'n_sub' in node:
+                n_sub = int(node['n_sub'])
+                if n_sub < 2:
+                    raise ValueError(f"stage '{self.name}': lr_sensor.n_sub must be >= 2 "
+                                     f"-- they are the replicates every confidence "
+                                     f"interval is built from -- got {node['n_sub']!r}")
+                out['n_sub'] = n_sub
+            return out
 
         bad = set(node) - {'kind', 'metrics', 'factor', 'patience', 'threshold', 'cooldown'}
         if bad:

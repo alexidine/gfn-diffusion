@@ -133,12 +133,16 @@ Four changes. A and B are the substance; C and D are cleanup. This is what the
 calibration ramp of section 7 hands over to.
 
 > **BUILD STATUS, 2026-08-22.** A and B are **built and verified on real runs**;
-> C needs nothing; D is **blocked** on `lr_race{,_probe}.py` reaching version
-> control (section 10). New modules: `lr_larder.py` (harvest + scorer),
-> `lr_pool.py` (the estimator, no torch). New tests: `test_lr_larder.py`,
-> `test_lr_pool.py`, plus additions to `test_ray_probe_gate.py` and
-> `test_warmup_ramp_freeze.py`. See section 11 for what was measured and what
-> the build found that this plan did not anticipate.
+> C needs nothing here but section 11 raises a measurement about it; D is
+> **blocked** on `lr_race{,_probe}.py` reaching version control (section 10).
+> Section 7's ladder is **built and unit-tested**, wired behind an opt-in
+> `adaptive_lr.ramp` block, with its own validation runs reported in section 11.
+> New modules: `lr_larder.py` (harvest + scorer), `lr_pool.py` (the estimator,
+> no torch), `lr_ramp.py` (the ladder, no torch), `lr_ramp_probe.py` (its
+> trainer side). New tests: `test_lr_larder.py`, `test_lr_pool.py`,
+> `test_lr_ramp.py`, `test_lr_ramp_driver.py`, plus additions to
+> `test_ray_probe_gate.py`, `test_warmup_ramp_freeze.py` and
+> `test_config_invariants.py`. See section 11.
 
 ### A. Generalise what `ray` scores to the loss the stage actually trains
 
@@ -447,6 +451,28 @@ suits a margin measurement — just note that any code assuming a doubling grid
   One reading: composite alpha* 8 (below_range), **bwd 8, fwd 4, replay 2.83
   (bracketed)** -- the branch disagreement 6A predicted would be worth
   surfacing, and it is free.
+- **The pooled estimator holds where the servo sawtooths, and the two disagree
+  by 7.6x.** One key apart (`adaptive_lr.calibration.mode`), same seed, same
+  data, 620 steps of `train_prior`, 31 calibrations each:
+
+  | | pooled | servo (retired v8) |
+  |---|---|---|
+  | moves applied | **2** | **25** |
+  | readings pooled | 17 | n/a -- acts on each |
+  | final `peak_scale` | 0.154 | 0.0203 |
+
+  The servo's trace is the recorded pathology, live: it moves on nearly every
+  reading and oscillates in a +-20% band about a slowly falling centre
+  (0.0221 -> 0.0263 -> 0.0313 -> 0.0221 -> ... -> 0.0287 -> 0.0203 -> 0.0241 ->
+  0.0203). The pooled arm sees the SAME alternation -- alpha* 8, 2, 2, 4, 4, 2,
+  4, 2 -- and holds every one of them, then moves twice when the pooled estimate
+  clears its own standard error.
+- **The settling gate holds out the transient, and the transient is biased.**
+  The pooled arm pooled NOTHING from its first 14 calibrations (steps 20-300),
+  which read alpha* 4, 1, 2, 1.4, 1, 1, 1, 1.4, 2, 1, 2, 2, 1, 1 -- systematically
+  low, i.e. "too hot". The servo acted on all of them and had cut 45x before the
+  stage had settled. That is section 8c's concern, demonstrated rather than
+  argued.
 - **The probe now perturbs nothing.** Two runs identical but for the phase-1
   `lr_sensor`, with `lr_servo_managed` empty so no rate moved: **334 of 349
   summary metrics bit-identical**. The 15 that differ are wall-clock timings
@@ -489,6 +515,226 @@ suits a margin measurement — just note that any code assuming a doubling grid
   bounds in the window the minimiser is an interval and the estimate is the
   point of it nearest the incumbent, i.e. the smallest move the evidence
   requires.
+
+### The ramp, end to end on a cold start (`ramp_cold`)
+
+Every stage of section 7 fired in order, on real on-policy training:
+
+| step | what happened |
+|---|---|
+| 20-280 | 14 calibrations inside the stage transient. Ramp not started, nothing pooled. |
+| 300 | Settling gate opens. `ramp: armed by stage_change at peak_scale 1; residence 100 steps (config); budget to the ceiling ~20 rungs / 2000 steps, of which 100 are discarded on the rejected rung` |
+| 300-380 | Rung 0 dwells its residence. Coherence families resolve: `bwd_ess, bwd_loss, bwd_tb_residual, bwd_tb_upper_tail` -- all four live, so the gate is not inert on this route. |
+| 400 | Rung 0 `clean` -> host-RAM snapshot -> climb to peak 1.5. |
+| 520 | Rung 1 `boundary` (`ray_margin_-0.301dex_x2`) -> ROLLBACK, model restored, `cruise_scale 1.0`. |
+| 540+ | Cruise takes over from an EMPTY pool -- correct, the ramp's readings belonged to its rungs -- and refills. |
+| 780 | The pooled estimator's first cruise move, peak 1.0 -> 1.431 on 14 readings. |
+
+The budget line and the residence attribution (`config`, because the smoke sets
+`adam_beta2: null`) are section 8e and 8d reporting themselves.
+
+**⚠ FINDING: the ramp's rung classification is noisier than the controller it
+hands to, and by construction.** Cruise raised the rate to 1.43 -- ABOVE the 1.5
+rung the ramp had just rejected, and within one geometric rung of it. Look at
+what rejected that rung: readings 8, 8, 4, 4 followed by two `below_range` bounds
+at alpha* < 2. With per-reading noise measured at 0.233 dex on this route, TWO
+readings is a much thinner sample than the ~14 cruise pools, so `persistence: 2`
+lets noise reject a rung that the same sensor, averaged, would have accepted.
+
+The rejection is not a bug -- the pool did exactly what it should, and the two
+recent upper bounds are genuine evidence -- but the SETTING is wrong.
+**`persistence` (or the per-rung `min_readings`) has to be chosen from the
+route's measured per-reading noise, not left at its default**, or the ramp will
+stop early and cruise will spend its first window undoing that. Both are
+configurable and logged, which section 7 requires; neither has been calibrated.
+
+A second thing that showed up in the same rung, which the plan does not cover:
+**contradictory censored bounds**. `above_range` at alpha* > 8 and, four
+readings later, `below_range` at alpha* < 2 cannot both hold. The convex
+objective has no zero-violation point and settles where the squared violations
+balance, which under exponential forgetting is nearer the recent bound. That is
+the behaviour to want from a tracker, and it is now pinned in `test_lr_pool.py`
+rather than left emergent.
+
+### The real crystal route: elj/mipcas phase 1 on the GPU (`elj_raycal_phase1`)
+
+The toy validated the mechanism; this is the route `mk_dev` runs.
+
+- **16 calibrations on `train_prior`, 0 skipped / 0 deferred / 0 refused.** `ray`
+  measuring phase 1 on elj, which is what 19 prior runs never did.
+- **The pooled estimator converged and then held.** Held through the transient
+  (calibrations 1-2), then cut `peak_scale` 1.0 -> 0.25 -> 0.0625 -> 0.031 ->
+  0.021 -> 0.031 over calibrations 3-12, then **held for the last 5** while
+  alpha* read 8, 4, 4, 2, 2. Final gap -0.111 dex inside a 0.124 dex bar.
+- **⚑ The per-reading noise replicates across routes.** `lrpool/sd` **0.22 dex**
+  on elj, 0.22-0.23 on the latent_gaussian toy, against `raydrift`'s published
+  0.20-0.25 measured on 19 elj runs by a different method. Three independent
+  estimates agreeing is the strongest evidence yet that the noise floor is a
+  property of the sensor rather than of a route.
+
+**⚠ AND THE COST IS 4-5x WHAT THE FUSED-STAGE FIGURE SUGGESTS.** Measured here:
+a calibration costs **~28 training steps** on `train_prior` (median step 0.158 s;
+calibration step 4.5 s), which is **5.6% at period 500** against the **1.2%**
+recorded for the same probe on the fused stage.
+
+The absolute cost is similar -- `n_sub x len(alphas)` = 64 forward passes over
+one batch. What changed is the DENOMINATOR: a bwd/dataset step runs no rollout
+and no energy call, so it is ~20x cheaper than a fused one, and the same probe is
+a much larger fraction of it. (The bwd bank's `repeats: 2` also doubles the rows
+scored relative to replay's `repeats: 1`.)
+
+**Fixed, because one global period cannot serve both stages:**
+`lr_sensor: {kind: ray, period: N, n_sub: M}` now overrides
+`adaptive_lr.ray_calibration` FOR THAT STAGE. Absent keys keep the global value,
+so nothing changes for existing configs. To run `ray` on elj phase 1 under 2%,
+`period: 1500` there (or `n_sub: 4` at period 750).
+
+### The ramp on elj, with the REAL residence floor (`elj_ramp_phase1`)
+
+Same route, `adam_beta2: 0.999` this time, so section 8d's floor binds and says
+so: `residence 1000 steps (adam_moments)`, budget `~20 rungs / 20000 steps, of
+which 1000 are discarded on the rejected rung`. All four coherence families
+resolve here too.
+
+**⚠ AND IT FOUND A REAL INEFFICIENCY IN SECTION 7'S DESCENT RULE.** Rungs 0 and 1
+both returned a margin of **exactly -0.602 dex** -- that is `log10(4)`, the
+signature of a `below_range` reading at the BOTTOM of the alpha grid. The censored
+statement is "alpha* < 1", i.e. "the optimum is at most a quarter of this rate".
+
+Section 7 says "descend geometrically", and taken literally the ramp moved 1.5x
+per rung -- 1000 steps of real training each -- against evidence that already said
+at least 4x. Getting from `peak_scale` 1.0 to the ~0.031 the pooled estimator
+independently found would have taken ~9 rungs and **~9,000 steps** for a cut the
+estimator made in one move.
+
+**Changed: the descent now takes the LARGER of one geometric rung and what the
+margin licenses.** One rung remains the floor, so a marginal rejection behaves
+exactly as before; a censored bound is evidence the run has already paid for, and
+down is the safe direction to be wrong in. Measured immediately after the change,
+same config, same seed:
+
+| | as specified | evidence-driven |
+|---|---|---|
+| rung 0 (1.0) rejected -0.602 dex | -> 0.667 | **-> 0.25** |
+| rung 1 rejected -0.602 dex | -> 0.444 | (already past it) |
+| steps to cover a 4x cut | ~3,000 | **1,000** |
+
+Pinned in `test_lr_ramp.py`, both the jump and the one-rung floor.
+
+### Hot start (`ramp_hot`): the recovery path, and an independent cross-check
+
+Same config, seeded ~10x hot. There is no clean checkpoint to roll back to, so
+section 7's descent path runs instead -- and the ray margin closes monotonically
+all the way down:
+
+| rung | peak_scale | verdict |
+|---|---|---|
+| 0 | 1.0 | `boundary`, margin **-0.602 dex** -> descend |
+| 1 | 0.667 | `boundary`, **-0.490** -> descend |
+| 2 | 0.444 | `boundary`, **-0.398** -> descend |
+| 3 | 0.296 | `boundary`, **-0.249** -> descend |
+| 4 | 0.198 | dwelt 200 steps, not 100 -- `pending` extended the dwell |
+| 5 | 0.132 | `boundary`, **-0.147** -> descend |
+| 6 | 0.132 | **`clean`** -> climb to 0.198 |
+
+Two things worth keeping:
+
+- **The margin closes at ~0.11 dex per 0.176 dex rung, i.e. a slope near 0.63
+  rather than 1.** A fixed optimum would give exactly 1. The shortfall is the
+  optimum MOVING as the model trains, which is what a ramp on a fresh model
+  should expect and what section 8c's residence rule is really up against.
+- **⚑ TWO INDEPENDENT CONTROLLERS CONVERGED ON THE SAME RATE.** The pooled
+  cruise estimator, run separately at the same `seed_lr` with no ramp at all,
+  settled at `peak_scale` **0.154**. The ramp -- a different mechanism, on a
+  different run, from the opposite direction -- established its first clean rung
+  at **0.132** and climbed to **0.198**, bracketing it within one geometric
+  rung. Nothing in the two paths shares state, so this is a real cross-check on
+  the sensor rather than on either controller.
+
+### ⚑ THE RESULT THAT COMPLICATES ALL OF THIS: the settling gate has a cost
+
+**On this toy the servo trained better than either pooled arm**, and the reason
+is not the one it first looks like.
+
+| arm | `alpha_target` | final `peak_scale` | when it first moved | `eval/wass_debiased` |
+|---|---|---|---|---|
+| servo (retired v8) | 4 | 0.0203 | **step 40** | **0.0025** |
+| pooled | 4 | 0.154 | step 340 | 0.0378 |
+| pooled | 32 | 0.0147 | step 340 | 0.0267 |
+
+The obvious reading is "alpha_target 4 is too small here", and the third arm was
+run to test exactly that -- a single-key change with a predicted direction. The
+direction held: `alpha_target: 32` landed 10.5x colder, close to the 8x the
+setpoint change implies. **But the quality did not follow.** Pooled@32 ends
+COLDER than the servo (0.0147 vs 0.0203) and still trains 10x worse. A 1.4x rate
+difference cannot produce a 10x difference in wass, so the rate is not what
+separates them.
+
+**It is the first 300 steps.** Both pooled arms held `peak_scale` at 1.0 for the
+whole stage transient, because that is exactly what the settling gate is for --
+`lrpool/n` is 0 until step 300 in both. The servo acted from step 40 and was at
+0.088 by step 120. On this route peak 1.0 is ~50-70x hot, so the pooled arms
+spent 300 steps being cooked before their first move, and never recovered inside
+620 steps.
+
+**What this does and does not say:**
+
+- It does NOT vindicate the per-reading servo. The transient reading is
+  systematically biased toward "too hot" (alpha* 4, 1, 2, 1.4, 1, 1, 1, ... on
+  these arms), so acting on it CUTS -- which is right whenever the seed is hot
+  and wrong whenever it is cold. The servo was not correct here; it was biased in
+  the direction that happened to help.
+- It DOES say section 8c is a live tension rather than a settled call, and that
+  the resolution taken in `lr_ramp.py` (start the ramp AFTER the transient) does
+  not cover a badly-set seed. The ramp is the instrument for traversing a bad
+  seed, and it is currently gated behind the very transient that makes a bad seed
+  expensive.
+- The gate's cost is BOUNDED and VISIBLE: `MIN_STAGE_STEPS` (300) plus the
+  `z_cal/p` run, and `lrpool/holding_on_transient` publishes it.
+
+**Owner decision, and it changes behaviour if left alone.** Three options:
+
+1. **Let the ramp start during the transient**, with rung classification that
+   expects a moving optimum. Most work; addresses the actual problem.
+2. **Allow ONE conservative cut during the transient** -- act only on a resolved
+   reading below target, only downward, at most once per stage. Cheap, keeps the
+   "no servo" property, covers the hot-seed case (which is the damaging one) and
+   not the cold-seed case (which is merely slow).
+3. **Accept it** and require a sane seed. Defensible on a route whose seed is
+   already hand-tuned; indefensible on a new one.
+
+Recommended: (2), with (1) as the durable answer. Nothing here is implemented --
+the pooled estimator holds through the transient as built.
+
+Note also that this whole comparison is ONE SEED on a toy at batch 64, evaluated
+at a single point. The section 6B claims that ARE established are about the rule:
+2 moves against 25, the sawtooth held, the transient excluded, and a 7.6x
+difference in where the two rules park.
+
+### Section 8, item by item, as of this build
+
+| | resolution |
+|---|---|
+| **a** units mismatch | RESOLVED. The ramp's accept criterion is now `alpha* >= alpha_target`, the same quantity cruise steers to. `lr_ramp.py` DECISION 8a. |
+| **a(ii)** cruise backoff | DECIDED. Cruise starts AT the latest clean rung; the old "one rung below" double-counted the margin. `cruise_backoff_rungs: 1` restores it. |
+| **b** checkpoint namespace | RESOLVED by its own second option: the clean rung lives in HOST RAM. Nothing is written to `best`/`stage_start`, so the emergency rewind's target is untouched. |
+| **c** transient | DECIDED. The ramp starts AFTER the transient, on the settling gate the pool already uses. Verified: `ramp_cold` armed at step 300, not before. |
+| **d** Adam moments | IMPLEMENTED. `residence = max(configured, 1/(1-beta2))`, and `residence_bound_by` records which bound bound. |
+| **e** budget | IMPLEMENTED. `projected_cost` is printed at arm time -- rungs, steps, and the steps discarded on the rejected rung. |
+| **f** alpha grid | NO CODE CHANGE NEEDED, and the reason is the docstring correction above. `_bracket` iterates the grid and tests a point only when its double is on it, and `sqrt(lo*hi)` is defined for any pair -- so nothing assumes DOUBLING, and the proposed `0, 0.5, 1, 1.5, 2, 4` simply tests alpha* against {0.5, 1, 2}. It is usable as written. |
+
+### Still owed
+
+- **`hyper` as a magnitude-only edge guard (6D "keep").** NOT built. It is
+  currently a sign-driven integrator (`peak_scale *= exp(beta*cos)`), and
+  section 5's argument is that the sign is uninformative once equilibrated while
+  `|cos| ~ eta*lambda/2` is a real distance-to-edge reading. Converting it needs
+  an actuation rule section 6 does not give: what a large `|cos|` should DO, and
+  by how much. Owner call.
+- **`persistence` and per-rung `min_readings` for the ramp** have to be set from
+  the route's measured per-reading noise. See the `ramp_cold` finding above.
+- **`alpha_target` per route.** See below.
+- **6D's delete**, once `lr_race{,_probe}.py` are committed.
 
 ### Behaviour changes a reader should know about
 

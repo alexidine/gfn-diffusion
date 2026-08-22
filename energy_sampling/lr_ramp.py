@@ -308,9 +308,27 @@ class RampLadder:
             cruise = self.clean_scale / (self.factor ** self.cruise_backoff_rungs)
             return self._finish(cruise, why, step, action=ROLLBACK)
         # The FIRST rung was already rejected: there is no clean checkpoint to
-        # restore, so descend geometrically until one is established rather than
-        # finishing on a rate nothing has passed (section 7).
-        nxt = self.scale / self.factor
+        # restore, so descend until one is established rather than finishing on a
+        # rate nothing has passed (section 7).
+        #
+        # ONE RUNG IS THE FLOOR, NOT THE STEP. Section 7 says "descend
+        # geometrically", and taken literally that wastes a full residence per
+        # rung re-learning something the reading already said. Measured on
+        # elj/mipcas phase 1: rungs 0 and 1 both returned `below_range` at the
+        # BOTTOM of the alpha grid -- margin exactly -0.602 dex, i.e. log10(4),
+        # the censored statement "alpha* < 1, so the optimum is at most a quarter
+        # of this rate". Descending 1.5x against evidence of at least 4x needed
+        # ~9 rungs and 9,000 steps to cover a cut the pooled estimator made in
+        # one move.
+        #
+        # So the descent takes the LARGER of one geometric rung and what the
+        # margin licenses. Safe by direction: down is the safe way to be wrong,
+        # the bound is evidence the run already paid for, and a rung is still the
+        # minimum so a marginal rejection behaves exactly as before.
+        step = 1.0 / self.factor
+        if self._margin is not None:
+            step = min(step, 10.0 ** self._margin[0])
+        nxt = self.scale * step
         if nxt < self.min_scale:
             self.outcome = 'floor_reached'
             return self._finish(nxt, 'min_scale_reached_without_a_clean_rung', step)
