@@ -17,10 +17,10 @@ test_molecules_path: null
 archive_period: 5000
 archive_buffers: true
 override_learning_rates: false
-lr_policy: 5.0e-05
-lr_back: 5.0e-05
-lr_replay: 5.0e-05
-lr_fused: 5.0e-05
+lr_policy: 0.0001
+lr_back: 0.0001
+lr_replay: 0.0001
+lr_fused: 0.0001
 lr_flow: 0.1
 min_lr: 1.0e-08
 lr_warmup_ratio: 10
@@ -490,4 +490,4 @@ provenance:
   canonical_sha: 0602bf407f17
   project_state_version: 9
   problem: mipcas_elj
-  generated_utc: '2026-08-23T13:10:44Z'
+  generated_utc: '2026-08-23T13:23:01Z'

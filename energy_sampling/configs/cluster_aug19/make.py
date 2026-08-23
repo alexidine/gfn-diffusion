@@ -576,14 +576,27 @@ def arms():
         # T=60 with the cap on, and p4's first revision OOM'd repeatedly at 400.
         # The action clamps the LIVE batch as well as the ceiling, which is what
         # makes it a transition-OOM guard rather than a note for the ladder.
-        # ADAPTIVE LR OFF -- a flat 5e-5 on every group. Four explicit floats
+        # ADAPTIVE LR OFF -- warmup ramp, then a flat 1e-4 on every group. The
+        # envelope (adaptive_lr.warmup_steps 1000) is independent of the sensor,
+        # so the ramp survives; only the servo is gone.
+        #
+        # WHY, and it is not a preference. The previous revision let the
+        # hypergradient walk peak_scale to ~0.02 and lr_bwd to 5.97e-7 -- a 24x
+        # cut held for 8000 steps -- while bwd/mle was STILL DESCENDING
+        # monotonically, 2.77 -> -0.48, and never plateaued. gates/mle_flat
+        # regresses that slope against an ABSOLUTE min_rate, so a throttled
+        # descent reads as a finished one: phase 1 exited on a policy that was
+        # still learning, phase 2 inherited it with fwd/over_coverage at 5.6e7,
+        # the balance controller correctly railed replay to its 0.93 bound, bwd
+        # starved to 0.02 and log Z ran away. Every stage after the LR cut
+        # behaved correctly on honest inputs. Four explicit floats
         # rather than `auto` is what takes the groups out of servo management
         # (lr_servo_managed is DERIVED from which rates are written `auto`), and
         # `kind: none` on both stages stops the sensor reading and logging a
         # verdict nothing acts on. Simplicity while the phase 1->2 transition is
         # under investigation: one fewer moving part between MLE and the stage
         # whose numbers we are trying to trust.
-        lr_policy=5.0e-5, lr_back=5.0e-5, lr_replay=5.0e-5, lr_fused=5.0e-5,
+        lr_policy=1.0e-4, lr_back=1.0e-4, lr_replay=1.0e-4, lr_fused=1.0e-4,
         # BASE fixes cuda_memory_fraction, so this OVERRIDES it rather than
         # passing it twice -- it must come after the **BASE spread.
         **{'integrator.T': 60, 'eval_T': 60,
