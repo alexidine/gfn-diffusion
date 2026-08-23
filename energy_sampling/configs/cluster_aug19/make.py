@@ -576,9 +576,19 @@ def arms():
         # T=60 with the cap on, and p4's first revision OOM'd repeatedly at 400.
         # The action clamps the LIVE batch as well as the ceiling, which is what
         # makes it a transition-OOM guard rather than a note for the ladder.
+        # ADAPTIVE LR OFF -- a flat 5e-5 on every group. Four explicit floats
+        # rather than `auto` is what takes the groups out of servo management
+        # (lr_servo_managed is DERIVED from which rates are written `auto`), and
+        # `kind: none` on both stages stops the sensor reading and logging a
+        # verdict nothing acts on. Simplicity while the phase 1->2 transition is
+        # under investigation: one fewer moving part between MLE and the stage
+        # whose numbers we are trying to trust.
+        lr_policy=5.0e-5, lr_back=5.0e-5, lr_replay=5.0e-5, lr_fused=5.0e-5,
         # BASE fixes cuda_memory_fraction, so this OVERRIDES it rather than
         # passing it twice -- it must come after the **BASE spread.
         **{'integrator.T': 60, 'eval_T': 60,
+           'protocols.unconditional_tb.stages[0].lr_sensor': {'kind': 'none'},
+           'protocols.unconditional_tb.stages[1].lr_sensor': {'kind': 'none'},
            'protocols.unconditional_tb.stages[1].on_enter':
                ['set_max_batch_size:250', 'set_traj_checkpoint:1'],
            **BASE, 'cuda_memory_fraction': 0.97})

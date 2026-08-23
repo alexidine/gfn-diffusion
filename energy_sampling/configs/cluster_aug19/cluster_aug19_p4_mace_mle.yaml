@@ -17,10 +17,10 @@ test_molecules_path: null
 archive_period: 5000
 archive_buffers: true
 override_learning_rates: false
-lr_policy: auto
-lr_back: auto
-lr_replay: auto
-lr_fused: auto
+lr_policy: 5.0e-05
+lr_back: 5.0e-05
+lr_replay: 5.0e-05
+lr_fused: 5.0e-05
 lr_flow: 0.1
 min_lr: 1.0e-08
 lr_warmup_ratio: 10
@@ -232,9 +232,7 @@ protocols:
       bwd_sampling_mode: dataset
       skip_if: prior_loaded
       lr_sensor:
-        kind: hyper
-        beta: 0.1
-        cos_target: -0.05
+        kind: none
       flags:
         update_log_z: true
         scramble_conditions: true
@@ -262,7 +260,7 @@ protocols:
       train_mode: fused
       bwd_sampling_mode: prior
       lr_sensor:
-        kind: ray
+        kind: none
       flags:
         update_log_z: true
         buffers_active: true
@@ -489,7 +487,7 @@ energy_config:
 checkpoint_read_only: false
 provenance:
   canonical: mk_dev.yaml
-  canonical_sha: 1da55f8b769e
+  canonical_sha: 0602bf407f17
   project_state_version: 9
   problem: mipcas_elj
-  generated_utc: '2026-08-23T01:41:17Z'
+  generated_utc: '2026-08-23T13:10:44Z'
