@@ -131,6 +131,7 @@ max_step_seconds: 60
 oom_batch_shrink_factor: 0.625
 oom_cooldown_steps: 200
 batch_oom_ceiling_retest_steps: 1000
+batch_sizer_retest_steps: 1000
 eval_T: 10
 integrator:
   T: 10
@@ -454,7 +455,7 @@ energy_config:
 checkpoint_read_only: false
 provenance:
   canonical: mk_dev.yaml
-  canonical_sha: 816ffa6a687f
+  canonical_sha: 1da55f8b769e
   project_state_version: 9
   problem: mipcas_elj
-  generated_utc: '2026-08-22T20:59:59Z'
+  generated_utc: '2026-08-23T01:41:17Z'

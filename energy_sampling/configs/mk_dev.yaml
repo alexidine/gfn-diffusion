@@ -242,6 +242,7 @@ max_step_seconds: 60  # RUNAWAY GUARD, not a tuning knob: cut the batch only onc
 oom_batch_shrink_factor: 0.625
 oom_cooldown_steps: 200  # steps to hold batch_size flat after an OOM before the sizer recalibrates
 batch_oom_ceiling_retest_steps: 1000  # steps an OOM ceiling stands with no further OOM before it is cleared and an INFEASIBLE conclusion re-probes. Every OOM restarts this clock. A failed re-probe costs a shrink_factor cut, so this is not free. 0 = the ceiling never expires
+batch_sizer_retest_steps: 1000    # steps a TARGET_MET ladder stands before it re-measures. Occupancy moves under a verdict -- the model grows, buffers fill, compile settles -- and until this existed the only re-arm was an OOM ceiling expiring, so a run that never took a train OOM never looked again. Only target_met is re-probed; infeasible has the ceiling clock, stood_down failed an audit, wallclock_cut is outranked. 0 = a satisfied ladder is final
 
 # SDE integration
 ################################################################
@@ -487,12 +488,29 @@ protocols:
         train_mode: bwd
         bwd_sampling_mode: dataset
         skip_if: prior_loaded          # a prior loaded by path IS this stage's product
-        # `hyper` rather than `ray`: the ray probe draws from replay and scores
-        # replay_loss_coeffs, so it is incoherent in a bwd stage that trains
-        # neither. The hypergradient reads no loss -- peak_scale *= exp(beta*cos)
-        # over the angle between the current gradient and the direction the last
-        # step actually moved the policy -- so it is coherent whatever a stage
-        # trains, which is why it is the sensor for the non-replay-TB stages.
+        # `hyper` here, and that is now a CHOICE rather than a constraint.
+        # `ray` used to draw from replay and score replay_loss_coeffs, which made
+        # it incoherent in a bwd stage that trains neither -- and is why phase 1
+        # was never measured across 19 runs. Since 2026-08-22 it deals from a
+        # per-branch larder of batches harvested off this stage's own live steps
+        # and scores the composite this stage's own step descends, so it CAN run
+        # here: measured on elj/mipcas, 16 calibrations, none skipped.
+        #
+        # To switch, the whole edit is:
+        #     lr_sensor: { kind: ray, period: 1500 }
+        # The explicit period is not optional. The probe's cost is fixed
+        # (n_sub x len(alphas) forward passes over one batch) while its OVERHEAD
+        # is that over the stage's step cost -- and a bwd/dataset step runs no
+        # rollout and no energy call, so it is ~20x cheaper than a fused one.
+        # Measured: ~28 training steps per calibration here, i.e. 5.6% at the
+        # global period 500 against the 1.2% the same probe costs on the fused
+        # stage. 1500 puts it under 2%.
+        #
+        # The hypergradient reads no loss -- peak_scale *= exp(beta*cos) over the
+        # angle between the current gradient and the direction the last step
+        # actually moved the policy -- so it is coherent whatever a stage trains.
+        # It remains the default here until the generalised ray has run a
+        # production stage end to end.
         #
         # beta is a BANDWIDTH with no universal value -- the per-cell optimum spans
         # 20x, which is why the parser refuses to default it. 0.1 is the best
@@ -541,9 +559,13 @@ protocols:
         bwd_sampling_mode: prior       # churned prior_buffer, never the atomic dataset
         # The LR sensor is OPT-IN PER STAGE: omitting this block means no sensor,
         # silently, and the `auto` lr_* keys then sit at adaptive_lr.seed_lr for the
-        # whole run while the config reads as adaptive. `ray` is coherent here and
-        # only here -- the probe draws from replay and scores replay_loss_coeffs, so
-        # it needs a fused stage that trains replay TB, which this is.
+        # whole run while the config reads as adaptive. `ray` scores the
+        # FRAC-WEIGHTED COMPOSITE this stage's step descends -- all three branches,
+        # on batches harvested from its own live steps -- and reports each branch's
+        # own alpha* beside it as a free diagnostic (`raycal/alpha_star_<branch>`),
+        # which is worth reading: measured here, replay wanted 2.8x while bwd would
+        # take 8x. It is no longer restricted to a replay-TB stage; `period`/`n_sub`
+        # may be overridden per stage if this one's step cost warrants it.
         lr_sensor: { kind: ray }
         flags:
           update_log_z: true

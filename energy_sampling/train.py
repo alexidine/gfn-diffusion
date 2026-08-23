@@ -243,7 +243,6 @@ class Modeller:
         self.grad_guard.announce()
         self.protocol = StageProtocol(self)  # the declarative stage engine: coeffs, balance, exits, transitions
         self._check_ray_wiring()
-        self.race_probe = self._build_race_probe()
         self.init_train_constants()
 
     def _ray_probe_armed(self) -> bool:
@@ -326,49 +325,6 @@ class Modeller:
         """Stages declaring `lr_sensor: {kind: ray}`. This IS the probe's switch."""
         return [s.name for s in self.protocol.stages
                 if s.lr_sensor is not None and s.lr_sensor['kind'] == 'ray']
-
-    def _build_race_probe(self):
-        """Replay Racing (docs/design/lr_probe_protocol.md). ABSENT BLOCK = OFF.
-
-        Off by omission, deliberately: an omitted block must not silently start
-        paying for an always-on harvest, and `enabled` alone must not silently
-        start MOVING the rate -- `actuate` is a second, separate key, and it
-        stays false until the design's section-6 gates have been run on the
-        route in question.
-
-        RETIRED, AND NOW UNRUNNABLE. The frozen-training race optimises fit to
-        recorded targets rather than live progress
-        (`docs/design/lr_handoff_2026-08-21.md` section 4), and section 6D
-        deletes it once `lr_race{,_probe}.py` are in version control so the
-        salvage has history. Its harvest was the piece worth keeping and has
-        moved to `lr_larder.py`, so the tees no longer feed `RaceProbe.larder`
-        and a race would defer forever on an empty one. That is a SILENT no-op,
-        which is the failure this codebase keeps paying for, so an `lr_probe`
-        block raises instead of quietly doing nothing. Absent block: unchanged.
-        """
-        cfg = getattr(self.args, 'lr_probe', None)
-        if cfg is None or not getattr(cfg, 'enabled', False):
-            return None
-        raise ValueError(
-            "lr_probe is retired: the frozen-larder race trains on recorded "
-            "trajectories with fixed rewards, which is a different objective "
-            "from live on-policy progress and has its optimum elsewhere "
-            "(docs/design/lr_handoff_2026-08-21.md section 4). Its harvest now "
-            "feeds the generalised `ray` sensor instead -- declare "
-            "`lr_sensor: {kind: ray}` on the stage. Remove the block.")
-        from lr_race import RaceConfig
-        from lr_race_probe import RaceProbe
-        rc = RaceConfig(replicates=int(getattr(cfg, 'replicates', 10)),
-                        screen_replicates=int(getattr(cfg, 'screen_replicates', 2)))
-        probe = RaceProbe(self, cfg=rc,
-                          window=int(getattr(cfg, 'window', 10)),
-                          n_hold=int(getattr(cfg, 'holdout', 10)),
-                          actuate=bool(getattr(cfg, 'actuate', False)),
-                          verbose=bool(getattr(cfg, 'verbose', True)))
-        print(f"race: armed, window {probe.window} replicates {rc.replicates} "
-              f"holdout {probe.n_hold} larder/branch {probe.larder.depth} "
-              f"actuate {probe.actuate}")
-        return probe
 
     def _larder_harvest(self, branch, loss_dict, condition, condition_id,
                         mol_batch, traj, repeats, scramble_tiles=0,
@@ -893,6 +849,43 @@ class Modeller:
                     # re-climbing on a timer would oscillate).
                     self.batch_sizer = None
 
+        # ------------------------------------------- target_met is not forever
+        # A SATISFIED LADDER MUST RE-MEASURE ON A TIMER, because `target_met` is a
+        # verdict about the occupancy at one moment and the occupancy moves: the
+        # model grows, the buffers fill, compile settles, and the stage's work per
+        # step changes underneath a conclusion reached hundreds of steps ago.
+        #
+        # Until this existed the ONLY thing that re-armed the ladder was an OOM
+        # ceiling expiring -- so a run that never took a TRAIN OOM never re-probed
+        # at all. p4_mace_mle concluded target_met at step 190 from two rungs and
+        # held batch 1600 unexamined to step 2620, while the card sat at 41%
+        # against a sensor reading 68%.
+        #
+        # It used to re-probe by accident: an eval OOM cut the batch and cleared
+        # batch_sizer as a side effect. Decoupling eval OOMs from the train batch
+        # was right and removed that, which is what made this gap visible.
+        #
+        # ONLY `target_met` is re-probed. `infeasible` is the ceiling's business
+        # and has its own expiry; `stood_down` failed an audit already and
+        # re-climbing it on a timer is the oscillation the audit exists to stop;
+        # `wallclock_cut` is outranked by max_step_seconds.
+        sizer = getattr(self, 'batch_sizer', None)
+        resize = int(getattr(self.args, 'batch_sizer_retest_steps', 0) or 0)
+        if resize > 0 and sizer is not None and sizer.get('reason') == 'target_met':
+            stamp = getattr(self, 'batch_sizer_at', None)
+            if stamp is None:
+                self.batch_sizer_at = stamp = self.step_ind
+            if self.step_ind - int(stamp) >= resize:
+                print(f"batch: ladder has stood at {self.batch_size} for {resize}+ "
+                      f"steps on a target_met verdict -- re-measuring")
+                self.batch_sizer = None
+                self.batch_sizer_at = self.step_ind
+                self.batch_sizer_retests = getattr(self, 'batch_sizer_retests', 0) + 1
+        elif sizer is None:
+            # a fresh ladder starts its clock when it CONCLUDES, not here; clearing
+            # the stamp keeps a stale one from expiring the next verdict instantly
+            self.batch_sizer_at = None
+
         # ----------------------------------------------------------- the ladder law
         # THE CONFIG UNIT IS A FRACTION, THE SENSOR'S IS PERCENT, and this is the
         # one place they meet. `batch_util_target: 0.6` means 60% of the card;
@@ -1137,8 +1130,6 @@ class Modeller:
             metrics['larder/eligible_min'] = float(min(
                 len(self.larder.eligible(b, self._probe_exclude_from))
                 for b in self._probe_weights))
-        if getattr(self, 'race_probe', None) is not None:
-            metrics.update(self.race_probe.report())
         metrics.update(getattr(self, '_replay_is_stats', {}) or {})
         # Memorisation sensor. replay/resid_vs_intake is the servo's input:
         # 1.0 = delay line, 1/e = 0.368 = the lambda*tau = 1 boundary, below
@@ -1263,6 +1254,10 @@ class Modeller:
         # not fit. 0 = no ceiling currently standing (the state is None).
         metrics['batch/oom_events'] = float(getattr(self, 'batch_oom_events', 0))
         metrics['batch/ceiling_expiries'] = float(getattr(self, 'batch_ceiling_expiries', 0))
+        # how many times a satisfied ladder was made to look again. 0 across a
+        # long run with batch_sizer_retest_steps set means the verdict was never
+        # target_met -- a different conclusion is holding the batch.
+        metrics['batch/sizer_retests'] = float(getattr(self, 'batch_sizer_retests', 0))
         metrics['batch/oom_ceiling'] = float(getattr(self, 'batch_size_oom_ceiling', None) or 0)
         metrics['batch/oom_min'] = float(getattr(self, 'batch_size_oom_min', None) or 0)
         # the sizer's conclusion as series, encoded by _BS_PHASE_CODES /
@@ -2360,6 +2355,10 @@ class Modeller:
             period=int(stage_sensor.get('period', getattr(sp_cfg, 'period', 500))),
             enabled=bool(self._ray_askers()),
         )
+        # The pool's raise cap follows the sensor's grid, not a constant: see
+        # LRController.adopt_alpha_grid. Done here because the grid is only
+        # known once RayCalibration exists, which is after the controller.
+        self.lr_controller.adopt_alpha_grid(self.ray_cal.alphas)
         # THE LARDER -- what ray scores, replacing the replay draw. Rebuilt here
         # rather than once at init because this method is also what a stage
         # transition calls: the outgoing stage's batches were drawn under a

@@ -123,7 +123,7 @@ figs_period: 1000
 batch_growth_factor: 1.6
 batch_growth_cap: 1000
 batch_growth_interval: 10
-batch_util_target: 0.6
+batch_util_target: 0.8
 gpu_util_window_s: 900
 gpu_util_sample_period_s: 60
 gpu_util_policy_window_s: 7200
@@ -131,6 +131,7 @@ max_step_seconds: 60
 oom_batch_shrink_factor: 0.625
 oom_cooldown_steps: 200
 batch_oom_ceiling_retest_steps: 1000
+batch_sizer_retest_steps: 1000
 eval_T: 60
 integrator:
   T: 60
@@ -488,7 +489,7 @@ energy_config:
 checkpoint_read_only: false
 provenance:
   canonical: mk_dev.yaml
-  canonical_sha: 816ffa6a687f
+  canonical_sha: 1da55f8b769e
   project_state_version: 9
   problem: mipcas_elj
-  generated_utc: '2026-08-22T20:59:59Z'
+  generated_utc: '2026-08-23T01:41:17Z'

@@ -536,7 +536,19 @@ def arms():
         space_groups=[14], z_primes=[1],
         prior_path=MACE_PRIOR, molecules_path=MACE_PRIOR,
         batch_size=1000, fused_grad_accum_min_samples=1000,
-        max_batch_size=20000, grow_batch_size=True, batch_util_target=0.6,
+        # 0.8, NOT 0.6. The in-process occupancy sensor reads high -- this arm's
+        # predecessor reported 68% while nvidia-smi showed 41% over the same
+        # window -- so a 0.6 target is cleared by a card that is 40% busy. The
+        # ladder concluded target_met at step 190 from TWO rungs and held batch
+        # 1600 unexamined to step 2620.
+        #
+        # An unattainable target is the BENIGN failure here: the walk runs the
+        # whole domain, holds the argmax-occupancy rung and reports INFEASIBLE
+        # naming the bound that bit (_conclude_batch_calibration). So the cost of
+        # aiming too high is a longer walk and a loud log line, while the cost of
+        # aiming too low is the ladder stopping at rung 2. The S2 stand-down
+        # audit still falsifies growth that does not deliver occupancy.
+        max_batch_size=20000, grow_batch_size=True, batch_util_target=0.8,
         batch_growth_interval=10,
         # OFF FOR MLE, ON FOR THE MLIP STAGE. Checkpointing recomputes every SDE
         # sub-step in the backward pass -- a large VRAM saving for roughly double

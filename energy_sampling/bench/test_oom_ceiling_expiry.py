@@ -471,3 +471,57 @@ def test_set_traj_checkpoint_re_arms_the_ladder():
     _Proto._run_action(proto, 'set_traj_checkpoint', '0', {})
     assert m.args.traj_checkpoint is False
     assert m.gfn_model.traj_checkpoint is False
+
+
+def test_a_target_met_ladder_re_measures_on_a_timer():
+    """`target_met` IS A VERDICT ABOUT ONE MOMENT, and occupancy moves under it.
+
+    Until this existed the only thing that re-armed the ladder was an OOM ceiling
+    expiring -- so a run that never took a TRAIN OOM never re-probed at all.
+    p4_mace_mle concluded target_met at step 190 from two rungs and held batch
+    1600 unexamined through step 2620, while nvidia-smi showed the card at 41%
+    against an in-process sensor reading 68%.
+
+    It used to re-probe by ACCIDENT: an eval OOM cut the batch and cleared
+    batch_sizer as a side effect. Decoupling eval OOMs from the train batch
+    removed that, which is what made the gap visible."""
+    m = _fresh()
+    m.args.batch_sizer_retest_steps = 200
+    _drive(m, 60)
+
+    # RE-ASSERT THE VERDICT EACH LAP. _fresh() runs with batch_util_target 0 and
+    # no occupancy sensor, so the ladder overwrites any planted target_met with
+    # its own no_target/sensor_off verdict on the very next call -- and the
+    # re-probe (correctly) only fires on target_met. Holding the verdict is what
+    # makes this a test of the TIMER rather than of the fixture's sensor.
+    def _hold_target_met(steps):
+        for _ in range(steps // 10):
+            m.batch_sizer = {'reason': 'target_met'}
+            _drive(m, 10)
+
+    m.batch_sizer_at = m.step_ind
+    _hold_target_met(100)
+    assert getattr(m, 'batch_sizer_retests', 0) == 0, (
+        'ladder re-armed before its cooldown elapsed')
+
+    _hold_target_met(150)
+    assert getattr(m, 'batch_sizer_retests', 0) >= 1, (
+        'a satisfied ladder never re-measured; target_met is permanent')
+
+
+def test_re_probe_leaves_the_other_verdicts_alone():
+    """Only target_met is on the timer. `stood_down` failed a growth audit and
+    re-climbing it on a clock is the oscillation that audit exists to prevent;
+    `wallclock_cut` is outranked by max_step_seconds. Asserted because a re-probe
+    that fired on every verdict would pass the test above while quietly undoing
+    both of those."""
+    for verdict in ('stood_down', 'wallclock_cut'):
+        m = _fresh()
+        m.args.batch_sizer_retest_steps = 200
+        _drive(m, 60)
+        m.batch_sizer_at = m.step_ind
+        for _ in range(40):
+            m.batch_sizer = {'reason': verdict}
+            _drive(m, 10)
+        assert getattr(m, 'batch_sizer_retests', 0) == 0, (
+            f"a '{verdict}' verdict was re-probed on the timer")
