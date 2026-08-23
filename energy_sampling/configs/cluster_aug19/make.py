@@ -576,7 +576,7 @@ def arms():
         # T=60 with the cap on, and p4's first revision OOM'd repeatedly at 400.
         # The action clamps the LIVE batch as well as the ceiling, which is what
         # makes it a transition-OOM guard rather than a note for the ladder.
-        # ADAPTIVE LR OFF -- warmup ramp, then a flat 1e-4 on every group. The
+        # ADAPTIVE LR OFF -- warmup ramp, then a flat 5e-5 on every group. The
         # envelope (adaptive_lr.warmup_steps 1000) is independent of the sensor,
         # so the ramp survives; only the servo is gone.
         #
@@ -596,7 +596,7 @@ def arms():
         # verdict nothing acts on. Simplicity while the phase 1->2 transition is
         # under investigation: one fewer moving part between MLE and the stage
         # whose numbers we are trying to trust.
-        lr_policy=1.0e-4, lr_back=1.0e-4, lr_replay=1.0e-4, lr_fused=1.0e-4,
+        lr_policy=5.0e-5, lr_back=5.0e-5, lr_replay=5.0e-5, lr_fused=5.0e-5,
         # BASE fixes cuda_memory_fraction, so this OVERRIDES it rather than
         # passing it twice -- it must come after the **BASE spread.
         **{'integrator.T': 60, 'eval_T': 60,

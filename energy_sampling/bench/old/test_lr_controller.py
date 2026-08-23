@@ -280,11 +280,16 @@ def test_the_pooled_default_is_symmetric_and_needs_evidence():
     _calibrate(up, 16.0)                                  # 4x target
     assert up.lr_ctrl['peak_scale'] == pytest.approx(4.0)
 
+
+    # 2.0 rather than 1.0: a reading 0.30 dex below target is inside the
+    # emergency cut's materiality bar (move_t * noise_floor = 0.44 dex), so this
+    # measures the POOLED rule and not the unpooled one. See
+    # test_a_reading_far_below_target_cuts_even_on_a_silent_pool.
     down = _modeller(**{'adaptive_lr.warmup_steps': 0})
     _settle(down)
-    _calibrate(down, 1.0)                                 # 1/4 target
-    assert down.lr_ctrl['peak_scale'] == pytest.approx(0.25)
-    assert up.lr_ctrl['peak_scale'] * down.lr_ctrl['peak_scale'] == pytest.approx(1.0)
+    _calibrate(down, 2.0)                                 # 1/2 target
+    assert down.lr_ctrl['peak_scale'] == pytest.approx(0.5)
+    assert up.lr_ctrl['peak_scale'] * down.lr_ctrl['peak_scale'] == pytest.approx(2.0)
 
     once = _modeller(**{'adaptive_lr.warmup_steps': 0})
     _settle(once)
@@ -631,3 +636,46 @@ def test_only_the_divergence_bar_stops_a_saturated_ramp():
     assert peak_lr * lam_max > 2.0, (
         'the reference setup is meant to cross the SGD stability limit; '
         f'reached lr*lambda_max = {peak_lr * lam_max:.2f}')
+
+
+def test_relative_bar_DECLINES_on_a_channel_that_reaches_zero():
+    """A RATIO NEEDS A POSITIVE REFERENCE.
+
+    MLE/NLL channels pass through zero and go negative. Clamping the reference to
+    a floor does not rescue the ratio -- it manufactures a FIXED ABSOLUTE bar of
+    floor*mult and convicts every ordinary value above it. p4_mace_mle's bwd MLE
+    ran 2.77 -> -0.48, the bar collapsed to 1e-3*100 = 0.1, and a mid-descent
+    loss of 0.19 was called a divergence; four rewinds later the run aborted at
+    step 1010.
+
+    So the rule must DECLINE on such a channel rather than invent a scale. The
+    absolute bars are what still guard it."""
+    m = _modeller(**{'adaptive_lr.divergence_loss_rel': 100.0})
+    c = m.lr_controller
+
+    # a channel that descends through zero, as an MLE loss does
+    for v in [2.0 - 0.05 * i for i in range(60)]:
+        assert c.check_spike('bwd', v, 1.0) is None, f'convicted at {v}'
+    assert min(v for v in [2.0 - 0.05 * i for i in range(60)]) < 0
+
+    # ordinary post-descent values must NOT convict, at any magnitude the old
+    # floor*mult bar of 0.1 would have caught
+    for v in (0.19, 0.62, 0.69, 1.5):
+        assert c.check_spike('bwd', v, 1.0) is None, (
+            f'{v} convicted -- the relative rule invented an absolute bar')
+
+    # and the ABSOLUTE guard still works on the same channel, so declining the
+    # ratio is not the same as leaving it unguarded
+    assert c.check_spike('bwd', 1.0e12, 1.0) == 'diverged'
+
+
+def test_relative_bar_still_convicts_on_a_positive_channel():
+    """The decline above must be SCOPED to channels with no positive scale. A
+    strictly positive channel -- every VarGrad loss -- keeps the 100x rule, which
+    is the whole reason it exists."""
+    m = _modeller(**{'adaptive_lr.divergence_loss_rel': 100.0})
+    c = m.lr_controller
+    for _ in range(60):
+        assert c.check_spike('fused', 1.0, 1.0) is None
+    assert c.check_spike('fused', 50.0, 1.0) is None
+    assert c.check_spike('fused', 500.0, 1.0) == 'diverged'

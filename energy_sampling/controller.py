@@ -122,9 +122,12 @@ class LRController:
             noise_floor_dex=float(self._cal_cfg('noise_floor_dex', NOISE_FLOOR_DEX)))
         self._pool_stage = None       # stage the pool's regime belongs to
         self._pool_epoch = 0          # bumped when the loss composition moves
-        self._pool_composition = None  # the composition the current epoch started at
+        self._pool_composition = None
+        self._pool_branches = None  # the composition the current epoch started at
         self._pool_entry = 0          # step_ind the current stage was entered at
         self._zp = deque(maxlen=self.Z_CAL_SETTLED_OBS)
+        self._transient_timeout = False
+        self._hot_cuts = 0            # cuts made while the pool had no verdict
         self._pool_last = {}
         # ---------------------------------------- the checkpointed ramp (7)
         # ABSENT BLOCK = OFF, so every existing config is unchanged. The ramp
@@ -253,7 +256,29 @@ class LRController:
             seen = book[step_type]
         if seen is None or seen[1] < self._REL_MIN_OBS:
             return None
-        return max(seen[0], self._REL_FLOOR) * float(mult)
+        # A RATIO NEEDS A POSITIVE REFERENCE. If the channel's running minimum is
+        # at or below the floor the loss is not a positive-scale quantity -- an
+        # MLE/NLL channel passes through zero and goes NEGATIVE -- and clamping
+        # to the floor does not rescue the ratio, it manufactures a FIXED
+        # ABSOLUTE bar of floor*mult and convicts every ordinary value above it.
+        #
+        # Measured: p4_mace_mle's bwd MLE ran 2.77 -> -0.48, so the minimum went
+        # negative, the bar collapsed to 1e-3*100 = 0.1, and a mid-descent loss
+        # of 0.19 was called a divergence. Four rewinds later the run aborted.
+        #
+        # So the rule DECLINES on such a channel rather than guessing a scale.
+        # It is not left unguarded: divergence_loss_abs and divergence_grad_abs
+        # still apply, and this says so ONCE per channel rather than going quiet.
+        if seen[0] <= self._REL_FLOOR:
+            if step_type not in st.setdefault('rel_declined', set()):
+                st['rel_declined'].add(step_type)
+                print(f"lr_ctrl: relative divergence rule DECLINED on "
+                      f"'{step_type}' -- its running minimum {seen[0]:.4g} is at "
+                      f"or below the floor {self._REL_FLOOR:g}, so the channel "
+                      f"has no positive scale to take a ratio against. Absolute "
+                      f"bars still apply.")
+            return None
+        return seen[0] * float(mult)
 
     def check_spike(self, step_type, current_loss, grad_norm):
         """The one always-on tripwire. Returns 'diverged' or None.
@@ -417,6 +442,20 @@ class LRController:
     #: cases of the same move, so one number covers all three.
     COMPOSITION_L1 = 0.2
 
+    #: Frac below which a branch is treated as OFF for regime purposes. The pool
+    #: resets when the SET of active branches changes -- a discontinuity in what
+    #: the composite IS -- and not on continuous reweighting within a fixed set,
+    #: which the pool's own exponential forgetting already handles.
+    #:
+    #: WHY THIS REPLACED A PURE L1 TRIGGER. An L1 bar fires on cumulative DRIFT,
+    #: and a balance controller drifting steadily crosses it over and over.
+    #: Measured on elj_p2_cruise: the fracs ran 0.42/0.53 -> 0.02/0.93 across the
+    #: stage, tripping SIX pool resets, and `lrpool/n` never got above 1 in 2000
+    #: steps -- the LR controller was muted for the whole run by a loop doing
+    #: exactly what it was configured to do. A slow reweighting is not a new
+    #: objective; a branch switching on or off is.
+    BRANCH_ACTIVE_FRAC = 0.05
+
     #: `z_cal/p` below this counts as "the log-Z level shift is done".
     Z_CAL_SETTLED = 0.1
 
@@ -430,6 +469,16 @@ class LRController:
     #: mean "no wait". Stage entry is transient for hundreds to a couple of
     #: thousand steps whether or not a sidecar happens to measure it.
     MIN_STAGE_STEPS = 300
+
+    #: ...and a CEILING on the same wait, because the z_cal condition can go
+    #: unmet FOREVER. Measured on `elj_long_cruise` at the phase 1 -> 2
+    #: transition: `z_cal/p` fell 15.5 -> 0.135 and then went back UP to 0.85,
+    #: never producing five consecutive readings under the bar, while `bwd/loss`
+    #: ran 183 -> 2344. The gate waits for the log-Z level to stop moving; the
+    #: level will not stop moving while the rate is too hot; and the controller
+    #: could not cut the rate until the gate opened. A circular wait is not a
+    #: wait. Past this the stage is treated as settled, and it says so.
+    MAX_TRANSIENT_STEPS = 2000
 
     def _composition(self):
         """The stage's live loss mixture, normalised. Its L1 movement is the
@@ -480,7 +529,14 @@ class LRController:
             self._pool_stage, self._pool_epoch = name, 0
             self._pool_entry = int(getattr(self.modeller, 'step_ind', 0))
             self._pool_composition = self._composition()
+            # Adopt the NEW stage's branch set without comparing it against the
+            # outgoing one -- a stage change already reset the pool, and a
+            # spurious second reset would re-arm the ramp on the next tick.
+            self._pool_branches = frozenset(
+                b for b, v in self._pool_composition.items()
+                if v >= self.BRANCH_ACTIVE_FRAC)
             self._zp.clear()
+            self._transient_timeout = False
             self.pool.reset(self._regime_key())
             self._arm_ramp('stage_change')
             return
@@ -488,10 +544,18 @@ class LRController:
         was = self._pool_composition or now
         if sum(abs(now.get(k, 0.0) - was.get(k, 0.0)) for k in set(now) | set(was)) \
                 >= self.COMPOSITION_L1:
-            self._pool_epoch += 1
             self._pool_composition = now
+        # THE REGIME IS THE ACTIVE BRANCH SET, not the exact weights. See
+        # BRANCH_ACTIVE_FRAC.
+        active = frozenset(b for b, v in now.items() if v >= self.BRANCH_ACTIVE_FRAC)
+        if self._pool_branches is not None and active != self._pool_branches:
+            self._pool_epoch += 1
             self.pool.reset(self._regime_key())
             self._arm_ramp('composition_change')
+            print(f"lr_ctrl: active branches "
+                  f"{sorted(self._pool_branches)} -> {sorted(active)}; the "
+                  f"composite changed shape, so the pool restarts")
+        self._pool_branches = active
         rep = getattr(self.modeller, '_z_cal_report', None) or {}
         if 'z_cal/p' in rep:
             self._zp.append(float(rep['z_cal/p']))
@@ -630,8 +694,20 @@ class LRController:
             return False
         if not self._zp:                # no z sidecar here -> the floor is the gate
             return True
-        return (len(self._zp) >= self.Z_CAL_SETTLED_OBS
-                and all(v < self.Z_CAL_SETTLED for v in self._zp))
+        if (len(self._zp) >= self.Z_CAL_SETTLED_OBS
+                and all(v < self.Z_CAL_SETTLED for v in self._zp)):
+            return True
+        # THE WAIT IS BOUNDED -- see MAX_TRANSIENT_STEPS. The z_cal condition can
+        # go unmet indefinitely on a run whose level is being moved BY the rate
+        # the gate is stopping the controller from fixing.
+        if rel >= self.MAX_TRANSIENT_STEPS:
+            if not self._transient_timeout:
+                self._transient_timeout = True
+                print(f"lr_ctrl: stage transient never settled -- {rel} steps "
+                      f"with z_cal/p still above {self.Z_CAL_SETTLED}; treating "
+                      f"the stage as settled so the estimator can act")
+            return True
+        return False
 
     def on_calibration(self, reading):
         """
@@ -732,18 +808,94 @@ class LRController:
         to be distinguishable there.
         """
         peak = float(st['peak_scale'])
-        if not self._settled():
+        settled = self._settled()
+        if settled:
+            self.pool.observe(reading, peak,
+                              int(getattr(self.modeller, 'step_ind', 0)),
+                              self._regime_key())
+        else:
             self._last['status'] = 'unsettled'
             self._pool_last = {'action': 'hold', 'reason': 'stage_transient',
                                'multiplier': 1.0}
+        # CAN THE POOL SPEAK AT ALL? Only a window that is both settled and long
+        # enough has a verdict of its own; anything else is SILENCE, and silence
+        # must not be read as "hold".
+        if settled and len(self.pool.rows) >= self.pool.min_readings:
+            v = self.pool.verdict(peak, target)
+            self._pool_last = v
+            return float(v['multiplier']) if v['action'] == 'move' else None
+        # SILENT, and the log has to say WHY. `_too_hot_cut` overwrites this when
+        # it fires; when it does not, this is what distinguishes "the window is
+        # short" from "the estimator looked and held".
+        self._pool_last = {
+            'action': 'hold', 'multiplier': 1.0, 'n': len(self.pool.rows),
+            'reason': ('stage_transient' if not settled else
+                       f'pool_short_{len(self.pool.rows)}_of_{self.pool.min_readings}')}
+        return self._too_hot_cut(reading, target)
+
+    def _too_hot_cut(self, reading, target):
+        """The one move allowed while the pool cannot speak. DOWNWARD ONLY.
+
+        WHY THIS EXISTS. Measured on `elj_long_cruise` at the phase 1 -> 2
+        transition. `rearm_warmup` resets peak_scale to 1.0 per stage and the
+        envelope re-ramps, so the rate climbed 32x back to seed over 300 steps.
+        The regime change had just reset the pool, so a verdict needed the
+        settling gate PLUS `min_readings` calibrations -- and the settling gate
+        never opened, because `z_cal/p` stays high while the level is being moved
+        by the very rate nothing could cut. The sensor read alpha* = 1 against a
+        target of 4 -- "at least four times too hot", with its own t-test behind
+        it -- and the controller sat on it while `bwd/loss` ran 183 -> 2344.
+
+        A pooled estimate is the right instrument for WHERE TO SIT. It is the
+        wrong instrument for "this is on fire", and making the second wait on the
+        first is what produced a circular wait.
+
+        So a RESOLVED reading strictly below target cuts, bounded, whenever the
+        pool has no verdict of its own. It never RAISES -- a raise is speculative
+        and is exactly what wants pooled evidence. It never fires once the pool
+        CAN speak, so it cannot reintroduce the per-reading servo by the back
+        door.
+        """
+        status = reading.get('status')
+        alpha = reading.get('alpha_star', float('nan'))
+        if status not in ('bracketed', 'below_range'):
             return None
-        self.pool.observe(reading, peak, int(getattr(self.modeller, 'step_ind', 0)),
-                          self._regime_key())
-        v = self.pool.verdict(peak, target)
-        self._pool_last = v
-        if v['action'] != 'move':
+        if not (isinstance(alpha, float) and math.isfinite(alpha) and alpha > 0):
             return None
-        return float(v['multiplier'])
+        if alpha >= target:
+            return None
+        # MATERIALITY BAR, and without it this path is the servo again. A single
+        # reading one bracket below target is the ORDINARY SAWTOOTH -- alpha*
+        # alternates 2.83 / 5.66 about a target of 4 at a perfectly good rate --
+        # and cutting on it is exactly the noise-chasing the pooled estimator
+        # exists to stop. Caught by `test_a_single_reading_no_longer_moves_the_rate`
+        # the moment this path was added.
+        #
+        # The bar is `move_t * noise_floor`, the same span the POOL requires
+        # before it will move -- so one reading has to be MORE convincing on its
+        # own than the pooled bar would be, which is the right asymmetry for
+        # acting on a sample of one. At the measured 0.22 dex that is 0.44 dex,
+        # a factor of ~2.75: the sawtooth's lower rung (0.15 dex) is well inside
+        # it and the live failure (alpha* 1 against target 4, 0.602 dex) is well
+        # outside.
+        gap_dex = math.log10(target / alpha)
+        bar = self.pool.move_t * self.pool.noise_floor
+        if gap_dex <= bar:
+            return None
+        # Bounded by the same span a raise is, so one noisy reading cannot cut by
+        # orders of magnitude. Two calibrations still reach 16x.
+        floor = 10.0 ** (-self.pool.max_raise_dex)
+        mult = max(alpha / target, floor)
+        self._hot_cuts += 1
+        self._last['status'] = 'too_hot_unpooled'
+        self._pool_last = {'action': 'move', 'reason': 'too_hot_pool_silent',
+                           'multiplier': mult, 'n': len(self.pool.rows)}
+        print(f"lr_ctrl: CUT x{mult:.3g} on alpha* {alpha:.3g} vs target "
+              f"{target:g} ({gap_dex:.2f} dex below, bar {bar:.2f}) -- the pool "
+              f"cannot speak yet ({len(self.pool.rows)} of "
+              f"{self.pool.min_readings} readings), and a gate that delays an "
+              f"ESTIMATE must not block a CUT")
+        return mult
 
     def on_plateau(self, fired: bool, factor: float):
         """
@@ -778,7 +930,8 @@ class LRController:
         not fired since the last report' -- which is the whole point; see _emit."""
         w = self._hyper_win
         if w is None:
-            w = self._hyper_win = {'n': 0, 'cos_sum': 0.0, 'log_applied': 0.0,
+            w = self._hyper_win = {'n': 0, 'cos_sum': 0.0, 'abscos_sum': 0.0,
+                                   'abscos_max': 0.0, 'log_applied': 0.0,
                                    'nonfinite': 0, 'status': 'clean'}
         return w
 
@@ -986,6 +1139,8 @@ class LRController:
             # is withheld, so the sensor channel cannot go dark through a ramp.
             w['n'] += 1
             w['cos_sum'] += float(cos)
+            w['abscos_sum'] += abs(float(cos))
+            w['abscos_max'] = max(w['abscos_max'], abs(float(cos)))
             w['status'] = 'warmup_ramp'
             # A FULL WINDOW BEFORE IT MAY FIRE, so one early reading cannot end
             # the ramp -- the failure the high-water rule below was built against.
@@ -1057,6 +1212,8 @@ class LRController:
             st['peak_scale'] = max(lo, min(hi, before * math.exp(b * err)))
         w['n'] += 1
         w['cos_sum'] += float(cos)
+        w['abscos_sum'] += abs(float(cos))
+        w['abscos_max'] = max(w['abscos_max'], abs(float(cos)))
         # ACCUMULATED IN LOG SPACE, because the actuator is multiplicative: the
         # period's total move is the product of its per-firing multipliers, and
         # summing the ratios instead would report a period that halved then
@@ -1166,6 +1323,10 @@ class LRController:
         # READ BEFORE RESETTING: this is the rate the outgoing stage settled on.
         outgoing = float(st.get('peak_scale', 1.0)) * float(st.get('envelope', 1.0))
         st['ramp_from'] = outgoing
+        # The new stage's ramp has not been RELEASED yet -- the clock starts when
+        # the transient settles, not at the boundary. See _ramp_elapsed.
+        st['ramp_released_at'] = None
+        st['ramp_z_gated'] = True
         st['peak_scale'] = 1.0
         st['peak_high_water'] = 1.0
         st['envelope_frozen_at'] = None
@@ -1258,10 +1419,64 @@ class LRController:
         if frozen is not None:
             return float(frozen)
         warmup_steps = max(1, int(self._cfg('warmup_steps', 1000)))
-        elapsed = self._elapsed(st)
+        elapsed = self._ramp_elapsed(st)
         if elapsed >= warmup_steps:
             return 1.0
         return self._ramp_from(st) ** (1.0 - elapsed / warmup_steps)
+
+    def _ramp_elapsed(self, st):
+        """Steps of ramp actually SERVED. The clock does not start until the
+        stage has settled.
+
+        WHY THE RAMP IS Z-GATED AND NOT STEP-GATED. The envelope used to climb on
+        a step clock while the SENSOR waited on a z_cal clock, and the two can
+        disagree without limit. Measured on `elj_long_cruise` at the phase 1 -> 2
+        transition: the envelope finished its 300-step climb -- taking the rate
+        32x back up to seed -- while `z_cal/p` was still 15.5 and falling, so the
+        pooled estimator was still muzzled. The run raised the rate to full seed
+        during precisely the window in which nothing could judge it.
+
+        Holding the rate at the OUTGOING scale until the level settles is also
+        the physically right thing, not merely the safe one. The TB residual is
+        `log_pf + log_Z - log_pb - log_r`; while log_Z is hundreds of nats out,
+        the residual is dominated by the Z error and a policy gradient taken
+        against it is chasing that error rather than any policy defect. And it
+        costs nothing to wait: `lr_flow` is pinned high and is untouched by
+        peak_scale or by the envelope, so Z converges on its own clock while the
+        policy is held. A low policy rate during the Z transient makes policy
+        runaway impossible by construction.
+
+        The wait is bounded by `_settled` itself (MAX_TRANSIENT_STEPS), so a
+        level that never settles cannot hold the ramp shut forever.
+        """
+        # ONLY A RE-ARMED RAMP IS GATED. At run start there is no outgoing stage
+        # to hold at and no transition to be discontinuous across, so the initial
+        # warmup keeps the plain step clock it has always had -- every existing
+        # config's opening behaviour is unchanged, and the change is confined to
+        # the boundary where the failure was observed.
+        if not st.get('ramp_z_gated'):
+            return self._elapsed(st)
+        # RELEASE IS ONE-WAY. Checking `_settled()` first made it reversible, and
+        # a reversible release is a 32x LR flip: `_settled` reads a ROLLING
+        # window of z_cal/p, so a level that dips under the bar and comes back
+        # sent the envelope from 1.0 straight back to `ramp_from`. Measured on
+        # elj_p2_cruise: env oscillated 0.03125 <-> 1.0 across the run and
+        # bwd/loss jumped 717 -> 4119 on the first flip. Once a stage has been
+        # judged settled, the ramp it earned is not taken away -- if the level
+        # moves again that is what the SENSOR and the emergency cut are for, not
+        # something to re-litigate with a schedule.
+        released = st.get('ramp_released_at')
+        if released is None:
+            if not self._settled():
+                return 0
+            released = st['ramp_released_at'] = int(
+                getattr(self.modeller, 'step_ind', 0))
+            held = self._elapsed(st)
+            if held > 0:
+                print(f"lr_ctrl: ramp released after {held} steps held at the "
+                      f"outgoing scale {self._ramp_from(st):.4g} -- the stage "
+                      f"transient has settled, so the envelope may climb")
+        return max(0, int(getattr(self.modeller, 'step_ind', 0)) - int(released))
 
     # ----------------------------------------------------------------- actuator
 
@@ -1510,6 +1725,9 @@ class LRController:
                # opening transient describes the transition rather than the
                # stage. Distinct from 'unresolved', which is the SENSOR failing.
                'unsettled': 6,
+               # ...and this one CUT while the pool was silent: a resolved
+               # reading below target, downward only, bounded. See _too_hot_cut.
+               'too_hot_unpooled': 8,
                # ...and this one went to a RUNNING RAMP's rung pool instead,
                # which owns peak_scale for its duration.
                'ramp': 7}
@@ -1566,6 +1784,10 @@ class LRController:
         # short to speak -- an estimator that is holding and one that has no
         # power to do anything else are otherwise identical from `cal_applied`
         # alone, which is exactly the confusion this file has logged three times.
+        # Published ALWAYS once non-zero: a run that needed the emergency cut and
+        # one that never did must be distinguishable from the log.
+        if self._hot_cuts:
+            self._report['lr_ctrl/hot_cuts'] = float(self._hot_cuts)
         if self._ramp_enabled():
             self._report.update(self._ramp_totals())
         if self.ramp is not None:
@@ -1626,6 +1848,18 @@ class LRController:
             live = w['n'] - w['nonfinite']
             if live:
                 self._report['lr_ctrl/hyper_cos'] = w['cos_sum'] / live
+                # THE MAGNITUDE CHANNEL, and it is a different statistic from
+                # the one above rather than a convenience. The standing proposal
+                # for `hyper` is to keep it as a magnitude-only EDGE GUARD:
+                # |cos| ~ eta*lambda/2 estimates distance to the stability edge,
+                # where the SIGN is uninformative once the iterate has
+                # equilibrated. `hyper_cos` is the mean of the SIGNED cosine, so
+                # a symmetric oscillation cancels in it and reads as a small
+                # number -- exactly the case the guard would care about most.
+                # Testing the proposal needs mean|cos| and the period's worst
+                # single reading, so both are published.
+                self._report['lr_ctrl/hyper_abscos'] = w['abscos_sum'] / live
+                self._report['lr_ctrl/hyper_abscos_max'] = w['abscos_max']
             self._report['lr_ctrl/hyper_applied'] = math.exp(w['log_applied'])
             self._report['lr_ctrl/hyper_status'] = float(
                 self._HYPER_STATUS.get(w['status'], -1))
