@@ -1,7 +1,8 @@
 import math
 from collections import deque
 
-from energy_sampling.lr_pool import NOISE_FLOOR_DEX, OptimumPool
+from energy_sampling.lr_pool import (NOISE_FLOOR_DEX, OptimumPool,
+                                     raise_cap_from_grid)
 
 
 class LRController:
@@ -141,6 +142,8 @@ class LRController:
         # first ramp had descended six rungs and rolled back. Those are facts
         # about the run, so they accumulate across ramps.
         self._ramps_started = 0
+        self._ramp_started_at = None   # step the live ramp began, for the re-arm gate
+        self._ramp_suppressed = 0      # composition re-arms refused as too soon
         self._ramp_rollbacks = 0
         self._ramp_snapshots = 0
         self._ramp_rungs_clean = 0
@@ -150,6 +153,18 @@ class LRController:
         # only on the paths that call on_calibration without the host loop.
         self.pool.reset(self._regime_key())
         self._check_bars()
+
+    def adopt_alpha_grid(self, alphas) -> None:
+        """Derive the pool's raise cap from the sensor's own alpha grid.
+
+        Called when `RayCalibration` is built -- which is AFTER this controller,
+        and again at every stage transition, so the cap follows a per-stage grid
+        if one is ever configured. See lr_pool.raise_cap_from_grid: the cap is
+        'never raise further than the next reading can still measure', which on
+        the shipping grid reproduces the log10(4) constant it replaces.
+        """
+        self.pool.max_raise_dex = raise_cap_from_grid(
+            alphas, float(self._cal_cfg('alpha_target', 4.0)))
 
     # ------------------------------------------------------------------ config
 
@@ -488,8 +503,29 @@ class LRController:
     def _arm_ramp(self, why):
         """A stage or composition change REQUESTS a ramp (section 7, 'after
         calibration'). It does not start one: `_drive_ramp` waits for the
-        settling gate, per DECISION 8c."""
+        settling gate, per DECISION 8c.
+
+        RATE-LIMITED, on evidence. Section 7 asks for a new ramp on "stage
+        changes, MATERIAL loss-composition changes, or PERSISTENT sampler drift"
+        -- and the composition trigger was inherited from the POOL, where a reset
+        costs nothing. For the ramp a restart discards a rung of real training,
+        and on a fused stage the balance controller nudges the fracs every tick.
+        Measured on elj/mipcas: entering `equilibration`, the ramp re-armed
+        TWICE IN 30 STEPS on `composition_change` and could never have completed
+        a rung.
+
+        So a stage change always re-arms -- that is unambiguous -- while a
+        composition change may not restart a ramp that began less than one
+        residence ago. Refusals are counted, because a ramp that is being
+        starved and one that is quietly working look identical otherwise.
+        """
         if not self._ramp_enabled():
+            return
+        step = int(getattr(self.modeller, 'step_ind', 0))
+        gap = int(getattr(self._ramp_cfg, 'min_residence_steps', 500))
+        if (why != 'stage_change' and self._ramp_started_at is not None
+                and step - self._ramp_started_at < gap):
+            self._ramp_suppressed += 1
             return
         # A ramp in flight is DISCARDED rather than rolled back. Its rung
         # evidence describes an objective the run has just left, so it is stale
@@ -521,6 +557,7 @@ class LRController:
             'ramp/snapshots_total': float(
                 self._ramp_snapshots + (0 if live is None else live.n_snapshots)),
             'ramp/rungs_clean_total': float(self._ramp_rungs_clean + clean),
+            'ramp/rearms_suppressed': float(self._ramp_suppressed),
         }
 
     def _drive_ramp(self):
@@ -544,7 +581,10 @@ class LRController:
                 factor=float(getattr(cfg, 'factor', 1.5)),
                 min_residence_steps=int(getattr(cfg, 'min_residence_steps', 500)),
                 adam_beta2=getattr(cfg, 'adam_beta2', 0.999),
-                min_readings=int(self._cal_cfg('pool_min_readings', 3)),
+                # DERIVED from the noise floor and the rung spacing unless the
+                # config names one -- the cruise controller's 3 is too coarse to
+                # resolve a rung. See RampLadder.__init__.
+                min_readings=getattr(cfg, 'min_readings', None),
                 move_t=float(self._cal_cfg('move_t', 2.0)),
                 persistence=int(getattr(cfg, 'persistence', 2)),
                 min_adverse_families=int(getattr(cfg, 'min_adverse_families', 2)),
@@ -555,6 +595,7 @@ class LRController:
                                    verbose=bool(getattr(cfg, 'verbose', True)))
             self._ramp_armed = False
             self._ramps_started += 1
+            self._ramp_started_at = step
             self._ramp_coherence_at = step
             cost = ladder.projected_cost(st['peak_scale'], ladder.max_scale)
             print(f"ramp: armed by {self._ramp_reason} at peak_scale "

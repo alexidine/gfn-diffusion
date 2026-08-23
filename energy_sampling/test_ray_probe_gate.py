@@ -300,11 +300,15 @@ def test_a_filling_larder_defers_without_consuming_the_period():
     assert train.Modeller._ray_probe_armed(m) is True
 
 
-def test_an_unscoreable_active_branch_refuses_the_period():
-    """Structural, so it consumes the period rather than deferring: a fwd bank
-    carrying a term the replay evaluator has no counterpart for does not become
-    scoreable by waiting. `var_conditioning` ships `emp_z: 1.0`, so this is the
-    live case."""
+def test_a_z_sidecar_bank_no_longer_refuses_the_period():
+    """REVERSED by owner decision (2026-08-22): the Z sidecar is excluded from
+    ALL LR control, so a bank carrying `emp_z` is scored with that term zeroed
+    rather than refused. `var_conditioning` ships `emp_z: 1.0` on its forward
+    bank and was the one stage this used to make unmeasurable.
+
+    The refuse PATH is unchanged and still consumes a period the same way -- see
+    `test_a_refusal_still_consumes_its_period`. What changed is that nothing
+    reaches it."""
     m, p = _modeller()
     m.ray_cal.due(PERIOD)                       # first sight records the baseline
     m.args.fwd_loss_coeffs.emp_z = 1.0
@@ -312,13 +316,9 @@ def test_an_unscoreable_active_branch_refuses_the_period():
     m._probe_exclude_from = m.step_ind
     _stock(m.larder, m._probe_weights, m.step_ind)
 
-    assert train.Modeller._ray_probe_armed(m) is False
-    assert m.ray_cal.n_refused == 1
-    assert m.ray_cal.refuse_reason == 'branch_refused'
-    assert m.ray_cal.report()['raycal/refused_reason'] == float(
-        RayCalibration._REFUSAL['branch_refused'])
-    # the period is consumed, exactly as a completed calibration consumes it
-    assert m.ray_cal.due(2 * PERIOD + 1) is False
+    assert train.Modeller._probe_refusal(m) is None
+    assert train.Modeller._ray_probe_armed(m) is True
+    assert m.ray_cal.n_refused == 0
 
 
 def test_the_composite_is_the_weighted_sum_the_step_descended():

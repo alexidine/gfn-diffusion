@@ -302,54 +302,34 @@ def test_auto_keys_survives_resolution_destroying_the_evidence(canonical):
     assert told and all(v.severity == ERROR for v in told)
 
 
-def test_ray_on_a_bwd_stage_is_now_accepted(canonical):
-    """REVERSED 2026-08-22 (handoff section 6A), and the reversal is the point.
+def test_no_config_can_make_ray_incoherent_any_more(canonical):
+    """`ray_sensor_needs_a_coherent_stage` IS DELETED, and its absence is the
+    claim.
 
-    The rule used to be "fused stage training replay TB", because the probe drew
-    from the replay buffer and scored `replay_loss_coeffs` -- which is exactly
-    why phase 1 was never measured across 19 runs. It now deals from a per-branch
-    larder of harvested live batches and scores the composite the stage's own
-    step descends, so a bwd/MLE stage is a stage it can rate.
+    It has been wrong twice. First it required a fused replay-TB stage, because
+    the probe drew from replay -- which is exactly what left phase 1 unmeasured
+    across 19 runs. Rewritten 2026-08-22 to fire on a forward bank carrying a
+    term the replay evaluator has no counterpart for, it then had one live case:
+    `var_conditioning`'s `emp_z: 1.0`. The owner decision to exclude the Z
+    sidecar from ALL LR control removed that case too, by zeroing those terms
+    before scoring (lr_larder.LarderScorer.Z_SIDECAR_TERMS).
+
+    Nothing is left for it to judge, and a rule that can never fire is worse
+    than none -- it reads as coverage. This test replaces it: the stages that
+    used to be refused must now load clean.
     """
-    cfg = copy.deepcopy(canonical)
-    cfg['protocols']['unconditional_tb']['stages'][0]['lr_sensor'] = {'kind': 'ray'}
-    assert cfg['protocols']['unconditional_tb']['stages'][0]['train_mode'] == 'bwd'
-    assert not _fires(cfg, 'ray_sensor_needs_a_coherent_stage')
+    for stage_ix, sensor in ((0, {'kind': 'ray'}), (1, {'kind': 'ray'})):
+        cfg = copy.deepcopy(canonical)
+        cfg['protocols']['unconditional_tb']['stages'][stage_ix]['lr_sensor'] = sensor
+        assert not any(v.rule.startswith('ray_sensor')
+                       for v in check(cfg)), f'stage {stage_ix} refused'
 
-
-def test_ray_on_a_fused_stage_without_replay_tb_is_now_accepted(canonical):
-    """Same reversal: the composite is whatever the stage's fracs weight, so a
-    replay branch at tb 0 is simply a branch contributing nothing -- not an
-    objective the sensor cannot see."""
+    # ...including the one case the rewritten rule existed for
     cfg = copy.deepcopy(canonical)
     st = cfg['protocols']['unconditional_tb']['stages'][1]
-    assert st['train_mode'] == 'fused', 'fixture assumption'
-    st.setdefault('loss_coeffs', {}).setdefault('replay', {})['tb'] = 0.0
-    assert not _fires(cfg, 'ray_sensor_needs_a_coherent_stage')
-
-
-@pytest.mark.parametrize('term', ['z_level', 'emp_z', 'reward_grads', 'traj_grads'])
-def test_ray_on_a_fused_stage_whose_fwd_bank_it_cannot_score_is_an_error(canonical, term):
-    """WHAT REPLACED THE OLD RULE. `get_gfn_backward_loss` is the only evaluator
-    that takes stored trajectories, and it has no counterpart for these four
-    forward terms -- so the fused composite cannot be formed and every
-    calibration would refuse. `var_conditioning` ships `emp_z: 1.0` on its fwd
-    bank, so this is a live case."""
-    cfg = copy.deepcopy(canonical)
-    st = cfg['protocols']['unconditional_tb']['stages'][1]
-    st.setdefault('loss_coeffs', {}).setdefault('fwd', {})[term] = 1.0
-    assert _fires(cfg, 'ray_sensor_needs_a_coherent_stage')
-
-
-def test_the_fwd_bank_rule_abstains_on_a_stage_with_no_ray_sensor(canonical):
-    """Mutation guard: the terms are only a fault WHERE RAY RUNS. A stage on
-    `hyper` may train any of them, and flagging it would be a rule that fires on
-    the presence of a coefficient rather than on a real incoherence."""
-    cfg = copy.deepcopy(canonical)
-    st = cfg['protocols']['unconditional_tb']['stages'][1]
-    st['lr_sensor'] = {'kind': 'hyper', 'beta': 0.05}
+    st['lr_sensor'] = {'kind': 'ray'}
     st.setdefault('loss_coeffs', {}).setdefault('fwd', {})['emp_z'] = 1.0
-    assert not _fires(cfg, 'ray_sensor_needs_a_coherent_stage')
+    assert not any(v.rule.startswith('ray_sensor') for v in check(cfg))
 
 
 def test_hyper_is_accepted_on_a_non_fused_stage(canonical):
@@ -795,3 +775,23 @@ def test_severity_ordering_puts_errors_first(canonical):
     severities = [v.severity for v in vs]
     assert ERROR in severities and BASELINE in severities
     assert severities == sorted(severities, key=lambda s: s != ERROR)
+
+
+def test_a_stray_lr_probe_block_is_an_error(canonical):
+    """Replay Racing is deleted. Nothing reads `lr_probe` any more, so a config
+    still carrying the block would configure NOTHING -- silently, which is the
+    failure mode the whole retired-key apparatus exists to prevent.
+
+    A load-time gate rather than a retired-key migration, following state 9's
+    precedent: a migration moves `project_state_version` and every config in the
+    tree then needs restamping, and there is nothing to migrate -- no tracked
+    config outside the deleted `configs/race_*.yaml` ever carried it."""
+    cfg = copy.deepcopy(canonical)
+    cfg['lr_probe'] = {'enabled': True, 'window': 10}
+    assert _fires(cfg, 'lr_probe_is_retired')
+
+
+def test_the_lr_probe_rule_abstains_on_a_config_without_the_block(canonical):
+    """Mutation guard: the canonical config has never carried it, so the rule
+    must be silent there -- a rule that fires on every config is not a rule."""
+    assert not _fires(copy.deepcopy(canonical), 'lr_probe_is_retired')

@@ -88,8 +88,8 @@ MK_DEV_RAYCAL = dict(period=500, n_sub=8, alphas=(0, 1, 2, 4, 8, 16, 32, 64))
 # which is the case the refusal exists for -- flip it in a test, do not ship it
 # as a default here.
 MK_DEV_BANKS = dict(
-    fwd_loss_coeffs=dict(tb=1.0, z_level=0.0, emp_z=0.0, traj_grads=0.0,
-                         reward_grads=0.0),
+    fwd_loss_coeffs=dict(tb=1.0, z_level=0.0, emp_z=0.0, emp_z_persistent=0.0,
+                         traj_grads=0.0, reward_grads=0.0),
     bwd_loss_coeffs=dict(tb=1.0, traj_grads=1.0),
     replay_loss_coeffs=dict(tb=1.0, traj_grads=0.0),
 )

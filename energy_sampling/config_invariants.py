@@ -386,55 +386,32 @@ def auto_lr_requires_an_adaptive_sensor(cfg: dict,
     return out
 
 
-#: Coefficients the FORWARD loss trains that `get_gfn_backward_loss` -- the only
-#: evaluator that takes stored trajectories -- has no counterpart for. See
-#: lr_larder.LarderScorer.FWD_ONLY_TERMS, which enforces the same thing at
-#: runtime; this is the load-time half so a config says so before it spends a
-#: stage discovering it.
-_FWD_ONLY_TERMS = ('z_level', 'emp_z', 'reward_grads', 'traj_grads')
+def lr_probe_is_retired(cfg: dict) -> list[Violation]:
+    """`lr_probe` -- Replay Racing -- is deleted, and an inert block must say so.
 
+    A LOAD-TIME GATE RATHER THAN A RETIRED-KEY MIGRATION, following state 9's
+    precedent for `batch_util_target`: a migration moves
+    `project_state_version`, which every config in the tree then has to be
+    restamped for, and there is nothing to migrate -- no tracked config outside
+    the deleted `configs/race_*.yaml` ever carried the block. What is needed is
+    only that a stray one cannot be SILENTLY IGNORED, which is what an unknown
+    key would otherwise be.
 
-def ray_sensor_needs_a_coherent_stage(cfg: dict) -> list[Violation]:
-    """`ray` must be able to score every branch its stage's step descends.
-
-    REWRITTEN 2026-08-22 (handoff section 6A). The old rule was "fused stage
-    training replay TB", because the probe drew from the replay buffer and
-    scored `replay_loss_coeffs` -- which is why phase 1 was never measured. It
-    now deals from a per-branch larder of harvested live batches and scores the
-    frac-weighted composite, so the coherence requirement moved with it: a stage
-    is coherent when every branch it trains can be replayed through
-    `get_gfn_backward_loss`.
-
-    The one case that cannot is a FORWARD bank carrying a term that evaluator has
-    no counterpart for. `var_conditioning` is the live example: its fwd bank runs
-    `emp_z: 1.0` through the condition-grouped path, which the backward evaluator
-    asserts against. The runtime refuses that branch and skips the calibration;
-    this says so at load, where it is cheap to fix.
+    The design it configured trained candidate rates on RECORDED trajectories
+    with fixed rewards: supervised regression toward frozen targets, a different
+    objective from live on-policy progress, whose optimum sits elsewhere and
+    which drifts toward the stability edge rather than the operating point
+    (docs/design/lr_handoff_2026-08-21.md section 4).
     """
-    out = []
-    base_fwd = {k: _num(_get(cfg, f'fwd_loss_coeffs.{k}')) or 0.0
-                for k in _FWD_ONLY_TERMS}
-    for st in active_stages(cfg):
-        if not isinstance(st, dict):
-            continue
-        sensor = st.get('lr_sensor')
-        if not (isinstance(sensor, dict) and sensor.get('kind') == 'ray'):
-            continue
-        if st.get('train_mode') != 'fused':
-            continue          # a single-branch stage trains only that branch
-        override = (st.get('loss_coeffs') or {}).get('fwd') or {}
-        live = [k for k in _FWD_ONLY_TERMS
-                if abs(_num(override[k]) if k in override else base_fwd[k]) > 0]
-        if live:
-            out.append(Violation(
-                ERROR, 'ray_sensor_needs_a_coherent_stage',
-                f"stage {st.get('name')!r} declares lr_sensor kind 'ray', but its "
-                f"forward bank trains {live}, which the replay evaluator "
-                f"`get_gfn_backward_loss` has no counterpart for -- so the fused "
-                f"composite the step descends cannot be scored and every "
-                f"calibration would refuse. Use lr_sensor kind 'hyper' here, or "
-                f"zero those terms."))
-    return out
+    if _get(cfg, 'lr_probe') is None:
+        return []
+    return [Violation(
+        ERROR, 'lr_probe_is_retired',
+        "`lr_probe` is deleted -- Replay Racing is retired (see "
+        "docs/design/lr_handoff_2026-08-21.md section 4). Its HARVEST is what "
+        "survived, as lr_larder.py, and it now feeds the generalised `ray` "
+        "sensor: declare `lr_sensor: {kind: ray}` on the stage instead. Remove "
+        "the block -- left in place it would configure nothing.")]
 
 
 def periodic_centroids_needs_one_crystal_space_group(cfg: dict) -> list[Violation]:
@@ -983,7 +960,7 @@ RULES = (
     conditional_z_settings_are_conditional,
     auto_lr_requires_an_adaptive_sensor,
     periodic_centroids_needs_one_crystal_space_group,
-    ray_sensor_needs_a_coherent_stage,
+    lr_probe_is_retired,
     exit_patience_is_reachable,
     exit_bar_is_within_measured_range,
     util_target_actuable,

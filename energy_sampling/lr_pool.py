@@ -60,6 +60,48 @@ from collections import deque
 #: Readings whose alpha* is a point estimate rather than a bound.
 RESOLVED = 'bracketed'
 
+#: Fallback raise cap, in dex, for a caller that cannot name its alpha grid.
+#: `raise_cap_from_grid` is the derived value and should be preferred.
+MAX_RAISE_DEX = math.log10(4.0)
+
+
+def tested_alphas(alphas):
+    """The grid points a paired difference is actually formed at.
+
+    A point is TESTED only when its DOUBLE is also on the grid, because testing
+    "is alpha* above a" needs the loss at 2a. So the shipping grid
+    [0,1,2,4,8,16,32,64] tests {1,2,4,8,16,32} -- its top entry buys only the
+    contrast for 32, and its LOWEST tested alpha is its second entry.
+    """
+    grid = {float(a) for a in alphas}
+    return sorted(a for a in grid if a > 0 and (2.0 * a) in grid)
+
+
+def raise_cap_from_grid(alphas, alpha_target: float) -> float:
+    """The largest raise, in dex, that leaves the NEXT reading resolvable.
+
+    DERIVED, NOT CHOSEN, and this is what the constant should be replaced by
+    wherever the grid is known. At the setpoint alpha* sits at `alpha_target`;
+    raising the rate by k drops it to alpha_target/k, because alpha* = lr*/lr.
+    For the next calibration to see where the loop LANDED rather than reporting
+    a censored bound at the bottom of the grid, that has to stay at or above the
+    lowest TESTED alpha:
+
+        alpha_target / k >= min(tested)   =>   k <= alpha_target / min(tested)
+
+    So the cap is exactly "never raise further than you can still measure". On
+    the shipping grid with alpha_target 4 that is 4/1 = 4x = 0.602 dex, which is
+    the constant it replaces -- now with a reason, and one that follows the grid
+    if the grid changes.
+
+    Floored at one doubling: a cap below that would make the loop unable to
+    cross a single bracket, which is finer than the sensor's own resolution.
+    """
+    tested = tested_alphas(alphas)
+    if not tested or not (alpha_target > 0):
+        return MAX_RAISE_DEX
+    return max(math.log10(2.0), math.log10(max(alpha_target / tested[0], 1.0)))
+
 #: Per-reading noise floor, in dex. Measured on this route at 0.20-0.25 dex
 #: (handoff section 8e). A FLOOR rather than an estimate: the bracket is
 #: discrete, so two consecutive readings landing on the same pair of doubling
@@ -79,13 +121,14 @@ class OptimumPool:
 
     def __init__(self, half_life: float = 8.0, min_readings: int = 3,
                  move_t: float = 2.0, noise_floor_dex: float = NOISE_FLOOR_DEX,
-                 capacity: int = 64):
+                 max_raise_dex: float = MAX_RAISE_DEX, capacity: int = 64):
         if half_life <= 0:
             raise ValueError(f'half_life must be positive, got {half_life}')
         self.half_life = float(half_life)
         self.min_readings = max(1, int(min_readings))
         self.move_t = float(move_t)
         self.noise_floor = float(noise_floor_dex)
+        self.max_raise_dex = float(max_raise_dex)
         self.key = None
         self.rows = deque(maxlen=max(4, int(capacity)))
         self.n_admitted = 0
@@ -129,16 +172,21 @@ class OptimumPool:
             if not (isinstance(alpha, float) and math.isfinite(alpha) and alpha > 0):
                 return self._reject('bad_alpha_star')
             row['y'] = base + math.log10(alpha)
-        elif status == 'above_range':
-            lo = reading.get('lo')
-            if not (lo and lo > 0):
+        elif status in ('above_range', 'below_range'):
+            # `alpha_star` IS the bound for a censored status -- RayCalibration
+            # sets it to `lo` or `hi` and never extrapolates past it -- so the
+            # two agree by construction and either will do. Falling back matters
+            # because the alternative is a SILENT rejection: a caller that fills
+            # only alpha_star would have every censored reading dropped, and the
+            # pool would look merely quiet. Found exactly that way.
+            side = 'lo' if status == 'above_range' else 'hi'
+            bound = reading.get(side)
+            if not (isinstance(bound, (int, float)) and bound > 0):
+                bound = reading.get('alpha_star')
+            if not (isinstance(bound, (int, float)) and math.isfinite(bound)
+                    and bound > 0):
                 return self._reject('bad_bound')
-            row['lo'] = base + math.log10(lo)
-        elif status == 'below_range':
-            hi = reading.get('hi')
-            if not (hi and hi > 0):
-                return self._reject('bad_bound')
-            row['hi'] = base + math.log10(hi)
+            row[side] = base + math.log10(bound)
         else:
             # unresolved / inconsistent. NOT an error and NOT admitted: a
             # calibration that could not see the answer must not guess it, and
@@ -292,6 +340,26 @@ class OptimumPool:
             return out
         out['action'] = 'move'
         out['reason'] = 'pooled_optimum_moved'
+        # A RAISE IS CAPPED PER MOVE; A CUT IS NOT. This is NOT the v8 asymmetry
+        # coming back: that one was an asymmetric GAIN, which biases the fixed
+        # point (a symmetric noise source rectifies into drift). A cap on the
+        # STEP SIZE leaves the fixed point exactly where it was -- it binds only
+        # while the estimate is far from the incumbent, and vanishes as the loop
+        # approaches. What it buys is the EXPOSURE WINDOW: a raise is licensed by
+        # a one-step measurement that cannot see noise accumulating over the
+        # `period` steps before the next reading, and a 12x-hot excursion was
+        # measured UNRECOVERABLE on this route -- fwd/tb_err 18.5 -> 2.2e6 in ~30
+        # steps (run mvwsu5d5), with the divergence bars never firing.
+        #
+        # It matters most on a SATURATED sensor. An `above_range` bound pinned at
+        # the top of the grid says "alpha* > 32", which against a target of 4
+        # licenses an 8x move -- every period, open loop, for as long as the truth
+        # stays off the grid. The retired servo climbed at 1.68x there and its
+        # slowness was, accidentally, a safety property.
+        if gap > self.max_raise_dex:
+            out['reason'] = 'pooled_optimum_moved_raise_capped'
+            out['capped'] = True
+            gap = self.max_raise_dex
         out['multiplier'] = 10.0 ** gap
         return out
 

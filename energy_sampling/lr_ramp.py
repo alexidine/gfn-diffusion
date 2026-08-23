@@ -54,7 +54,7 @@ from __future__ import annotations
 
 import math
 
-from energy_sampling.lr_pool import OptimumPool
+from energy_sampling.lr_pool import NOISE_FLOOR_DEX, OptimumPool
 
 #: Rung classifications, section 7.
 CLEAN = 'clean'
@@ -84,7 +84,7 @@ class RampLadder:
 
     def __init__(self, alpha_target: float = 4.0, factor: float = 1.5,
                  min_residence_steps: int = 500, adam_beta2: float | None = 0.999,
-                 min_readings: int = 3, move_t: float = 2.0,
+                 min_readings: int | None = None, move_t: float = 2.0,
                  persistence: int = 2, min_adverse_families: int = 2,
                  max_scale: float = 64.0, min_scale: float = 1.0 / 64.0,
                  cruise_backoff_rungs: int = 0, max_residence_multiple: float = 3.0,
@@ -98,9 +98,28 @@ class RampLadder:
         self.max_scale = float(max_scale)
         self.min_scale = float(min_scale)
         self.cruise_backoff_rungs = int(cruise_backoff_rungs)
-        self.min_readings = max(1, int(min_readings))
-        self.move_t = float(move_t)
         self._pool_kwargs = dict(pool_kwargs or {})
+        self.move_t = float(move_t)
+        # READINGS PER RUNG, DERIVED FROM THE NOISE AND THE RUNG SPACING.
+        #
+        # A rung verdict has to resolve at the granularity the ladder moves in:
+        # one geometric rung, log10(factor). The pooled bar is move_t * se and
+        # se is noise/sqrt(n), so
+        #
+        #     move_t * noise / sqrt(n) < log10(factor)
+        #     =>  n > (move_t * noise / log10(factor))^2
+        #
+        # At the measured 0.22 dex, move_t 2 and factor 1.5 that is n > 6.25, so
+        # SEVEN. The default was 3 -- inherited from the cruise controller, where
+        # the window keeps growing -- which gives a bar of 0.25 dex against a
+        # rung of 0.176: coarser than the thing it is deciding. That is the
+        # "ramp is noisier than the controller it hands to" finding, in one line.
+        noise = float(self._pool_kwargs.get('noise_floor_dex', NOISE_FLOOR_DEX))
+        derived = math.ceil((self.move_t * noise / math.log10(self.factor)) ** 2)
+        self.min_readings = (max(1, int(min_readings)) if min_readings is not None
+                             else max(3, int(derived)))
+        self.readings_bound_by = ('config' if min_readings is not None
+                                  else 'rung_resolution')
 
         # SECTION 8d. Adam's second moment is an EMA with horizon ~1/(1-beta2);
         # a rung shorter than that is read partly through the previous rung's
@@ -302,9 +321,17 @@ class RampLadder:
     # ------------------------------------------------------------- finishing
 
     def _reject(self, verdict, why, step):
+        """This rung is rejected. Whether the RAMP is over depends on whether a
+        clean rung exists to fall back to.
+
+        `outcome` is set only on the paths that FINISH. A ramp still descending
+        has rejected a rung and has no outcome yet; stamping one mid-descent made
+        a running ladder report `boundary` while it was still working, which is
+        the sort of thing a reader takes at face value.
+        """
         self._record(verdict, why, step)
-        self.outcome = verdict
         if self.clean_scale is not None:
+            self.outcome = verdict
             cruise = self.clean_scale / (self.factor ** self.cruise_backoff_rungs)
             return self._finish(cruise, why, step, action=ROLLBACK)
         # The FIRST rung was already rejected: there is no clean checkpoint to

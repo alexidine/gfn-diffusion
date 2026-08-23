@@ -424,14 +424,28 @@ suits a margin measurement — just note that any code assuming a doubling grid
 
 ## 10. Status
 
-- `lr_race.py` and `lr_race_probe.py` are **untracked**, while their call sites in
-  `train.py` and `controller.py` were captured by checkpoint commits. **This now
-  blocks 6D**: the harvest they carried has moved to `lr_larder.py`, so the tees
-  no longer feed `RaceProbe.larder` and a race would defer forever on an empty
-  one. Rather than leave that silent, `_build_race_probe` RAISES on an
-  `lr_probe` block. Commit the two files and the delete can proceed.
-- Probe configs written 2026-08-21 are `configs/race_*.yaml`; not user-owned,
-  and they can go with the delete.
+- **6D IS DONE.** `lr_race.py` and `lr_race_probe.py` reached version control in
+  commit `2833bd5`, so the salvage has history and the delete could proceed.
+  Removed: `lr_race.py`, `lr_race_probe.py`, `bench/race_sim.py`,
+  `bench/test_lr_race.py`, `bench/test_race_probe.py`, and 18
+  `configs/race_*.yaml` -- 23 files. `train.py` loses `_build_race_probe`, the
+  `race_probe` attribute and its report merge.
+- **A stray `lr_probe` block fails AT LOAD**, via a new config invariant
+  (`lr_probe_is_retired`) rather than `utils._RETIRED_KEYS`. Nothing reads the
+  key any more, so leaving it unguarded would make it a silent no-op -- the
+  failure mode this whole file keeps recording. It is an INVARIANT and not a
+  retirement because the retired-key gate requires a matching migration, which
+  moves `project_state_version` and forces every config in the tree to be
+  restamped -- for a key no tracked config outside the deleted
+  `configs/race_*.yaml` ever carried. State 9 made the same call for
+  `batch_util_target` and its record says why: a load-time gate is "the honest
+  shape" when there is nothing to transform.
+- **One thing 6D said to delete was KEPT, deliberately**: the snapshot/restore
+  machinery. 6D reasoned that `RayCalibration` has its own param clone/restore,
+  which is true for CRUISE -- but section 7's rollback needs the model AND the
+  stepping optimizers' moments AND the RNG, which that clone does not carry. It
+  is salvaged into `lr_ramp_probe.RampDriver`, which is also how section 8b's
+  "hold the clean rung in host RAM" is implemented.
 - The canonical config carries no `lr_probe` block and loads clean; the probe is
   off by omission and has never actuated.
 - `bench/` is 250 tests green as of the end of the 2026-08-21 session.
@@ -621,6 +635,43 @@ same config, same seed:
 
 Pinned in `test_lr_ramp.py`, both the jump and the one-rung floor.
 
+**⚑ AND THE SAME RUN CAUGHT A BUG THE UNIT TESTS COULD NOT SEE.** The descent
+factor was written as a local named `step`, which SHADOWED `_reject`'s `step`
+parameter -- so `_enter(nxt, step)` stamped the rung's entry at 0.25 instead of
+at step 1000. Every rung after the first then read `resident = step_ind - 0`,
+the residence gate never bound, and the ramp terminated on a spurious
+`no_evidence` timeout 400 steps into a 1000-step rung.
+
+The unit tests were blind to it by construction: they use short residences and
+`persistence: 1`, so the BOUNDARY short-circuit fires before residence is ever
+consulted. **This is exactly what section 7's "validate on at least one
+cold-start and one hot-start training run before giving the ramp automatic
+authority" is for**, and it earned its place on the first real-route run.
+
+Fixed, and pinned by two tests that were checked to FAIL with the bug
+re-introduced and pass without it. A second, smaller thing fell out of the same
+investigation: `outcome` was stamped on every rejection, so a ladder still
+descending reported `boundary` while it was mid-descent. It is now set only on
+the paths that finish.
+
+After the stage transition a SECOND ramp armed itself, `armed by
+composition_change` -- section 7's "stage changes, material loss-composition
+changes... request a new checkpointed ramp", firing on its own.
+
+**⚠ AND IT THEN ARMED AGAIN 30 STEPS LATER, and would have kept doing so.** On
+the fused stage the balance controller nudges the branch fracs every tick, so the
+L1 composition trigger fires repeatedly -- and each firing DISCARDS the ramp and
+restarts it. The ramp could never have completed a rung, and every rung it did
+start would have cost real training for nothing.
+
+The trigger was inherited from the POOL, where a reset costs nothing. For the
+ramp it does not. Section 7 asks for a new ramp on stage changes, MATERIAL
+composition changes, or PERSISTENT drift -- so the re-arm is now rate-limited: a
+stage change always re-arms (unambiguous), a composition change may not restart a
+ramp younger than one residence, and refusals are counted as
+`ramp/rearms_suppressed` so a starved ramp and a quietly working one are
+distinguishable. Pinned in `test_lr_ramp_driver.py`.
+
 ### Hot start (`ramp_hot`): the recovery path, and an independent cross-check
 
 Same config, seeded ~10x hot. There is no clean checkpoint to roll back to, so
@@ -723,6 +774,37 @@ difference in where the two rules park.
 | **e** budget | IMPLEMENTED. `projected_cost` is printed at arm time -- rungs, steps, and the steps discarded on the rejected rung. |
 | **f** alpha grid | NO CODE CHANGE NEEDED, and the reason is the docstring correction above. `_bracket` iterates the grid and tests a point only when its double is on it, and `sqrt(lo*hi)` is defined for any pair -- so nothing assumes DOUBLING, and the proposed `0, 0.5, 1, 1.5, 2, 4` simply tests alpha* against {0.5, 1, 2}. It is usable as written. |
 
+### Two things the 6D delete surfaced
+
+`bench/old/test_lr_controller.py` is SLOW-tier (it imports torch), so `pytest -m
+fast` never ran it -- and it pins twelve behaviours of the shipping controller
+that nothing else pins. Running the whole bench after the delete turned up two
+real questions, not just stale expectations:
+
+- **A saturated sensor now climbs 8x per period, where the servo climbed 1.68x.**
+  When the truth is above the grid every reading returns `above_range` pinned at
+  the largest testable alpha (32 on the shipping grid). That says "alpha* > 32"
+  and nothing more. The servo applied `(32/4)^0.25 = 1.68` and UNDER-used the
+  bound; the pooled estimator reads it for what it is and licenses 8x. More
+  faithful, and more dangerous -- the binding constraint on this route is the
+  EXPOSURE WINDOW between calibrations, and a 12x-hot excursion was measured
+  unrecoverable in ~30 steps (`mvwsu5d5`), with the divergence bars never firing.
+  The servo's slowness was, accidentally, a safety property.
+
+  **Added: `max_raise_dex`, default log10(4).** A single RAISE is capped; a CUT
+  is not. This is not the v8 asymmetry returning -- that was an asymmetric GAIN,
+  which biases the FIXED POINT because symmetric noise rectifies into drift. A
+  cap on the STEP SIZE leaves the fixed point exactly where it was; it binds only
+  while the estimate is far from the incumbent and vanishes as the loop
+  approaches. Both properties are pinned.
+
+- **A censored reading missing `lo`/`hi` was SILENTLY REJECTED.**
+  `RayCalibration` sets `alpha_star` TO the bound for `above_range`/`below_range`
+  and never extrapolates past it, so the two agree by construction -- but a
+  caller filling only `alpha_star` had every censored reading dropped, and the
+  pool looked merely quiet rather than starved. It now falls back to
+  `alpha_star`, and still refuses a reading with no usable bound at all.
+
 ### Still owed
 
 - **`hyper` as a magnitude-only edge guard (6D "keep").** NOT built. It is
@@ -734,7 +816,9 @@ difference in where the two rules park.
 - **`persistence` and per-rung `min_readings` for the ramp** have to be set from
   the route's measured per-reading noise. See the `ramp_cold` finding above.
 - **`alpha_target` per route.** See below.
-- **6D's delete**, once `lr_race{,_probe}.py` are committed.
+- **`max_raise_dex` has not been measured**, only reasoned. log10(4) is one
+  grid doubling either side of the target; the right value is a property of the
+  exposure window (`period` x step cost) and should be measured per route.
 
 ### Behaviour changes a reader should know about
 

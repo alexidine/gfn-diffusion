@@ -34,7 +34,40 @@ def _modeller(**overrides):
 
 
 def _reading(alpha, status='bracketed'):
+    # lo/hi left None deliberately: RayCalibration sets alpha_star TO the bound
+    # for a censored status, and the pool falls back to it -- pinned in
+    # test_lr_pool.py, because the alternative was a silent rejection.
     return {'status': status, 'alpha_star': float(alpha), 'lo': None, 'hi': None}
+
+
+def _settle(m, warmup=0):
+    """Put the controller past BOTH gates the pooled actuator waits on.
+
+    Since the pooled estimator replaced the per-reading servo (handoff section
+    6B) a calibration is evidence, not a command: readings taken inside the
+    stage's opening transient are looked at and deliberately not pooled, and a
+    window shorter than `pool_min_readings` has no verdict to give. Tests that
+    are about the ACTUATOR -- which LR a move reaches -- have to clear both, or
+    they end up testing the gates instead.
+    """
+    m.lr_controller._state()               # stamp the warmup clock at step 0
+    m.step_ind = 1
+    m.lr_controller.tick()                 # stage seen; the transient starts here
+    m.step_ind = int(warmup) + LRController.MIN_STAGE_STEPS + 10
+    m.lr_controller.tick()
+    assert m.lr_controller._settled(), 'setup: the transient gate is still shut'
+
+
+def _calibrate(m, alpha, n=None, status='bracketed'):
+    """Drive the pooled actuator with a consistent run of readings.
+
+    It moves to the POOLED optimum rather than a fraction of the way, so a run of
+    readings at alpha* = k*target lands peak_scale at k. There is no eta.
+    """
+    n = n or m.lr_controller.pool.min_readings
+    for _ in range(n):
+        m.step_ind += 500
+        m.lr_controller.on_calibration(_reading(alpha, status))
 
 
 # ------------------------------------------------------------------- envelope
@@ -73,8 +106,8 @@ def test_flow_group_is_pinned_not_scheduled():
     # ...while the leading fused group is scheduled
     assert m.optimizers['fused'].param_groups[0]['lr'] < m.args.lr_fused
 
-    m.step_ind = 2000
-    m.lr_controller.on_calibration(_reading(64.0))
+    _settle(m, warmup=1000)
+    _calibrate(m, 64.0)
     assert m.lr_ctrl['peak_scale'] > 1.0
     assert m.lr_of('flow') == pytest.approx(m.args.lr_flow), 'peak_scale leaked into the flow head'
     assert m.optimizers['fused'].param_groups[-1]['lr'] == pytest.approx(m.args.lr_flow)
@@ -100,8 +133,8 @@ def test_control_flow_lr_grants_the_envelope_but_not_peak_scale():
     assert m.lr_of('flow') == pytest.approx(m.args.lr_flow / m.args.lr_warmup_ratio), \
         'control_flow_lr must at least grant the envelope'
 
-    m.step_ind = 2000
-    m.lr_controller.on_calibration(_reading(64.0))
+    _settle(m, warmup=1000)
+    _calibrate(m, 64.0)
     assert m.lr_ctrl['peak_scale'] > 1.0
     assert m.lr_of('flow') == pytest.approx(m.args.lr_flow), \
         'peak_scale reached an unmanaged key'
@@ -109,10 +142,8 @@ def test_control_flow_lr_grants_the_envelope_but_not_peak_scale():
     # ...and it DOES reach it once lr_flow is declared managed
     m2 = _modeller(**{'adaptive_lr.warmup_steps': 0, 'adaptive_lr.control_flow_lr': True,
                       'lr_servo_managed': ('lr_policy', 'lr_flow')})
-    m2.step_ind = 100
-    m2.lr_controller.step()          # materialise state here...
-    m2.step_ind = 101                # ...and clear the one-step ramp (see below)
-    m2.lr_controller.on_calibration(_reading(64.0))
+    _settle(m2)
+    _calibrate(m2, 64.0)
     assert m2.lr_of('flow') > m2.args.lr_flow
 
 
@@ -144,10 +175,10 @@ def test_unmanaged_keys_are_a_control_arm():
     working.
     """
     m = _modeller(**{'adaptive_lr.warmup_steps': 0, 'lr_servo_managed': ()})
-    m.step_ind = 100
+    _settle(m)
     m.lr_controller.step()
     before = m.lr_of('fwd')
-    m.lr_controller.on_calibration(_reading(64.0))
+    _calibrate(m, 64.0)
     assert m.lr_ctrl['peak_scale'] > 1.0, 'peak_scale should still move (it is logged)'
     assert m.lr_of('fwd') == pytest.approx(before), 'unmanaged key must not be actuated'
 
@@ -213,18 +244,25 @@ def test_unresolved_and_inconsistent_produce_no_move(status):
     assert m.lr_controller._last['applied'] == 0.0
 
 
-def test_update_is_asymmetric():
+def test_the_retired_servo_update_is_asymmetric():
     """
-    peak_scale <- peak_scale * (alpha/target)^eta, with eta_up < eta_down on
-    principle: raising is licensed only by a one-step measurement that cannot
-    see multi-step effects, while lowering is the safe direction.
+    peak_scale <- peak_scale * (alpha/target)^eta, with eta_up < eta_down.
+
+    RETIRED AS THE DEFAULT (handoff section 6B): that asymmetry rectifies
+    symmetric sensor noise into one-directional drift, which is where the
+    measured parking offset came from. It stays reachable as
+    `calibration.mode: servo` so the replacement can be COMPARED against it
+    rather than argued about, and this test keeps that path honest -- note it
+    now has to ASK for the mode, which is the point.
     """
     up = _modeller(**{'adaptive_lr.warmup_steps': 0})
+    up.args.adaptive_lr.calibration.mode = 'servo'
     up.step_ind = 100
     up.lr_controller.on_calibration(_reading(16.0))       # 4x target
     assert up.lr_ctrl['peak_scale'] == pytest.approx(4.0 ** 0.25)
 
     down = _modeller(**{'adaptive_lr.warmup_steps': 0})
+    down.args.adaptive_lr.calibration.mode = 'servo'
     down.step_ind = 100
     down.lr_controller.on_calibration(_reading(1.0))      # 1/4 target
     assert down.lr_ctrl['peak_scale'] == pytest.approx(0.25 ** 0.5)
@@ -233,14 +271,33 @@ def test_update_is_asymmetric():
     assert (1.0 / down.lr_ctrl['peak_scale']) > up.lr_ctrl['peak_scale']
 
 
+def test_the_pooled_default_is_symmetric_and_needs_evidence():
+    """The replacement, on the same readings. No eta, so it moves to the pooled
+    optimum in both directions and mirror-image excursions are reciprocal --
+    and one reading is not evidence."""
+    up = _modeller(**{'adaptive_lr.warmup_steps': 0})
+    _settle(up)
+    _calibrate(up, 16.0)                                  # 4x target
+    assert up.lr_ctrl['peak_scale'] == pytest.approx(4.0)
+
+    down = _modeller(**{'adaptive_lr.warmup_steps': 0})
+    _settle(down)
+    _calibrate(down, 1.0)                                 # 1/4 target
+    assert down.lr_ctrl['peak_scale'] == pytest.approx(0.25)
+    assert up.lr_ctrl['peak_scale'] * down.lr_ctrl['peak_scale'] == pytest.approx(1.0)
+
+    once = _modeller(**{'adaptive_lr.warmup_steps': 0})
+    _settle(once)
+    _calibrate(once, 16.0, n=1)
+    assert once.lr_ctrl['peak_scale'] == 1.0
+
+
 def test_peak_scale_respects_bounds():
     m = _modeller(**{'adaptive_lr.warmup_steps': 0, 'adaptive_lr.bounds': (0.5, 1.5)})
-    m.step_ind = 100
-    for _ in range(50):
-        m.lr_controller.on_calibration(_reading(1e6))
+    _settle(m)
+    _calibrate(m, 1e6, n=50)
     assert m.lr_ctrl['peak_scale'] == pytest.approx(1.5)
-    for _ in range(50):
-        m.lr_controller.on_calibration(_reading(1e-6))
+    _calibrate(m, 1e-6, n=50)
     assert m.lr_ctrl['peak_scale'] == pytest.approx(0.5)
 
 
@@ -350,9 +407,8 @@ def test_divergence_cuts_and_records_a_permanent_ceiling():
     erase the evidence.
     """
     m = _modeller(**{'adaptive_lr.warmup_steps': 0})
-    m.step_ind = 100
-    for _ in range(6):
-        m.lr_controller.on_calibration(_reading(1024.0))
+    _settle(m)
+    _calibrate(m, 1024.0, n=6)
     hot = m.lr_ctrl['peak_scale']
     assert hot > 2.0
 
@@ -489,37 +545,60 @@ def test_servo_cuts_from_a_hot_start():
     assert not run.summary()['diverged']
 
 
-def test_saturated_sensor_raises_open_loop_at_a_fixed_rate():
+def test_a_saturated_sensor_still_climbs_open_loop_but_capped():
     """
-    THE RAMP. When the true alpha* is above the grid, every reading comes back
-    `above_range` pinned at the largest testable alpha (32 for the shipping grid
-    [0..64], since testing alpha needs the loss at 2*alpha). The controller then
-    applies a CONSTANT multiplier
+    THE RAMP. When the true alpha* is above the grid every reading comes back
+    `above_range`, pinned at the largest TESTABLE alpha -- 32 for the shipping
+    grid [0..64], since testing alpha needs the loss at 2*alpha. Such a reading
+    says "alpha* > 32" and nothing more, so it carries no information about how
+    far above the grid the truth is, and the loop is open until a reading lands
+    inside the grid or the divergence bar fires.
 
-        (32 / alpha_target) ^ eta_up = (32/4) ^ 0.25 = 1.682
+    WHAT CHANGED, and it cuts both ways. The retired servo applied a constant
+    `(32/4)^0.25 = 1.682` per period -- it UNDER-used the bound, and its
+    slowness was, accidentally, a safety property. The pooled estimator reads the
+    bound for what it is: against a target of 4 it licenses 8x. That is more
+    faithful and more dangerous, because the binding constraint on this route is
+    the EXPOSURE WINDOW between calibrations (a 12x-hot excursion was measured
+    unrecoverable in ~30 steps, run mvwsu5d5).
 
-    every calibration period, carrying no information about how far above the
-    grid the truth actually is. That is open loop: 1.68x per period, forever,
-    until either a reading lands inside the grid or the divergence bar fires.
-
-    This is pinned rather than fixed because it IS the current design -- a
-    reading outside the grid is treated as a bound and never extrapolated. The
-    cost of the policy is measured in bench/experiments.py (saturation_ramp).
+    So a single RAISE is capped at `max_raise_dex` (log10 4). The cap bounds how
+    fast the loop approaches its fixed point; it does not move the fixed point,
+    which is what distinguishes it from the asymmetric GAIN v8 was retired for.
     """
     m = _modeller(**{'adaptive_lr.warmup_steps': 0})
-    m.step_ind = 100
-    m.lr_controller.step()               # materialise state
-    m.step_ind = 101
-    expected = (32.0 / 4.0) ** 0.25
+    _settle(m)
+    _calibrate(m, 32.0, status='above_range')     # prime the window
+
     scales = []
-    for _ in range(8):
+    for _ in range(4):                            # ...then ONE reading at a time
         before = m.lr_ctrl['peak_scale']
-        m.lr_controller.on_calibration(_reading(32.0, status='above_range'))
+        _calibrate(m, 32.0, n=1, status='above_range')
         scales.append(m.lr_ctrl['peak_scale'] / before)
 
-    assert all(s == pytest.approx(expected) for s in scales), scales
-    assert m.lr_ctrl['peak_scale'] == pytest.approx(expected ** 8)
-    assert expected ** 8 > 60, 'eight saturated periods is already a >60x ramp'
+    assert all(x == pytest.approx(4.0, rel=1e-6) for x in scales), (
+        f'a saturated sensor must climb at the CAP, not at the bound: {scales}')
+    assert 4.0 < (32.0 / 4.0), 'the cap must actually bind on the shipping grid'
+    assert 4.0 > (32.0 / 4.0) ** 0.25, 'and it is still faster than the retired servo'
+
+    # `bounds` remains the backstop: an open loop cannot climb past it
+    _calibrate(m, 32.0, n=20, status='above_range')
+    assert m.lr_ctrl['peak_scale'] == pytest.approx(m.args.adaptive_lr.bounds[1])
+
+
+def test_the_raise_cap_does_not_move_the_fixed_point():
+    """The distinction the cap rests on. An asymmetric GAIN biases where the loop
+    parks -- that is the v8 defect. A cap on the STEP binds only while the
+    estimate is far from the incumbent and vanishes as it approaches, so the rate
+    the loop settles at is unchanged."""
+    m = _modeller(**{'adaptive_lr.warmup_steps': 0})
+    _settle(m)
+    for _ in range(12):                       # a resolved optimum 16x above
+        _calibrate(m, 64.0, n=3)
+    settled = m.lr_ctrl['peak_scale']
+    _calibrate(m, 4.0, n=8)                   # ...now reading exactly at target
+    assert m.lr_ctrl['peak_scale'] == pytest.approx(settled, rel=0.15), (
+        'the cap must not leave the loop parked away from where the evidence puts it')
 
 
 def test_only_the_divergence_bar_stops_a_saturated_ramp():

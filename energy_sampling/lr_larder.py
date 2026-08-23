@@ -186,19 +186,27 @@ class LarderScorer:
     REQUIRED_COEFFS = ('db', 'mle', 'pf_boost', 'subtb', 'tb', 'traj_grads',
                        'vg_lb', 'vg_lme')
 
-    #: The mirror case, and the one padding must NOT paper over: terms the FWD
-    #: loss trains for which the backward evaluator has no counterpart at all.
-    #: `z_level` and the condition-grouped `emp_z` branch change the loss VALUE,
-    #: so a replayed fwd score would be a different objective (worse: the
-    #: backward evaluator ASSERTS against emp_z under vg_by_condition, and
-    #: reaches an undefined `log_Z_emp` without it). `traj_grads` and
-    #: `reward_grads` change only which paths carry gradient, which a no_grad
-    #: ray never uses -- they are refused anyway, because a bank carrying them
-    #: is a bank whose forward branch is not the one this evaluator computes,
-    #: and the cost of finding that out later is a wrong rate.
-    #: All four are 0 in the canonical fwd bank; this asserts rather than
-    #: assumes (handoff 2026-08-21 section 6A).
-    FWD_ONLY_TERMS = ('z_level', 'emp_z', 'reward_grads', 'traj_grads')
+    #: Z-SIDECAR TERMS, ZEROED IN EVERY BANK BEFORE SCORING. Owner decision
+    #: 2026-08-22: the Z sidecar is excluded from ALL learning-rate control.
+    #:
+    #: It is the coherent choice rather than a convenience. `ray` rays POLICY
+    #: parameters only (decision D26b) -- the flow head is LR-pinned separately
+    #: and held at its post-step value throughout, so it contributes an
+    #: identical constant to every evaluation. These terms exist to TRAIN that
+    #: head, i.e. they are the loss of the one thing the sensor deliberately
+    #: does not measure. Scoring them would put a quantity the ray holds fixed
+    #: into the objective the ray is differencing.
+    #:
+    #: It also removes the only structural refusal there was. `var_conditioning`
+    #: ships `emp_z: 1.0` on its forward bank, and the backward evaluator
+    #: ASSERTS against emp_z under vg_by_condition (and reaches an undefined
+    #: `log_Z_emp` without it) -- so before this the whole stage was
+    #: unmeasurable. Zeroed, its VarGrad terms replay normally.
+    #:
+    #: `reward_grads` and `traj_grads` are NOT here and are not zeroed: they
+    #: only decide which paths carry gradient, and the ray runs under no_grad,
+    #: so they cannot change a scored value.
+    Z_SIDECAR_TERMS = ('emp_z', 'emp_z_persistent', 'z_level')
 
     def __init__(self, modeller, verbose: bool = True):
         self.m = modeller
@@ -214,44 +222,53 @@ class LarderScorer:
     def refusal(self, branch: str):
         """Why this branch cannot be replay-scored, or None.
 
-        Asked BEFORE a calibration arms, so a structurally unscoreable stage
-        refuses its period instead of cloning every policy parameter and then
-        discovering the same thing n_sub scores later.
+        NOTHING, CURRENTLY, and that is the point. It used to refuse a forward
+        bank carrying a Z-sidecar term; those are zeroed now (see
+        `Z_SIDECAR_TERMS`), so no stage is structurally unmeasurable. The hook
+        stays because it is the one place such a rule would live, and
+        `Modeller._probe_refusal` still asks before spending a parameter clone.
         """
-        if branch != 'fwd':
-            return None
-        bank = self._raw_bank(branch)
-        live = [k for k in self.FWD_ONLY_TERMS
-                if abs(float(getattr(bank, k, 0.0) or 0.0)) > 0]
-        if not live:
-            return None
-        return 'fwd_bank_' + '_'.join(live)
+        return None
 
     def bank(self, branch: str):
-        """The branch's coefficient bank, padded for the replay evaluator.
+        """The branch's coefficient bank, adjusted for the replay evaluator.
 
-        Found the hard way: the first fused-stage score died with
-        `'Namespace' object has no attribute 'pf_boost'`. Padding is announced
-        once per branch rather than applied silently -- a zero that nobody chose
-        is exactly the kind of default that later reads as a measurement.
+        TWO ADJUSTMENTS, both announced once per branch rather than applied
+        silently -- a zero that nobody chose is exactly the kind of default that
+        later reads as a measurement:
+
+          PADDED. `get_gfn_backward_loss` reads `mle`/`pf_boost`/... without a
+          getattr guard, and the fwd bank legitimately has neither. Found the
+          hard way: the first fused-stage score died with `'Namespace' object
+          has no attribute 'pf_boost'`.
+
+          Z SIDECAR ZEROED. Owner decision: the Z sidecar is excluded from all
+          LR control. See `Z_SIDECAR_TERMS`.
+
+        The LIVE bank is never mutated -- both are applied to a copy.
         """
-        refused = self.refusal(branch)
-        if refused is not None:
-            raise BranchRefused(refused)
         bank = self._raw_bank(branch)
         missing = [k for k in self.REQUIRED_COEFFS if not hasattr(bank, k)]
-        if not missing:
+        zeroed = [k for k in self.Z_SIDECAR_TERMS
+                  if abs(float(getattr(bank, k, 0.0) or 0.0)) > 0]
+        if not (missing or zeroed):
             return bank
         cached = self._padded.get(branch)
         if cached is None:
             cached = copy.copy(bank)
-            for k in missing:
+            for k in missing + zeroed:
                 setattr(cached, k, 0.0)
             self._padded[branch] = cached
             if self.verbose and branch not in self._announced:
                 self._announced.add(branch)
-                print(f"larder: {branch} bank padded with {missing} = 0 for the "
-                      f"replay evaluator (terms this branch does not train)")
+                bits = []
+                if missing:
+                    bits.append(f"padded with {missing} = 0 (terms this branch "
+                                f"does not train)")
+                if zeroed:
+                    bits.append(f"Z sidecar {zeroed} zeroed (excluded from LR "
+                                f"control: the ray holds the flow head fixed)")
+                print(f"larder: {branch} bank " + '; '.join(bits))
         return cached
 
     @torch.no_grad()
