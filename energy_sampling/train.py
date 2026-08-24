@@ -245,6 +245,52 @@ class Modeller:
         self._check_ray_wiring()
         self.init_train_constants()
 
+    #: Consecutive telemetry failures tolerated before the run is torn down. A
+    #: logging backend that is down for a few publishes is a nuisance; one that
+    #: is gone for hundreds of them means nothing about this run is being
+    #: recorded, and a training run nobody can read is not worth the GPU.
+    _MAX_LOG_FAILURES = 200
+
+    def _log_metrics(self, metrics):
+        """Publish to wandb, but NEVER let telemetry kill training.
+
+        MEASURED, three times in one morning: `wandb.log` raised
+        ConnectionResetError from inside the training loop -- the local socket to
+        wandb's own service process, not the network, which pings clean -- and
+        took a run down at step 1550, another at step 190, and a third before it
+        started. The service writes nothing to its log when it goes, so there is
+        nothing to diagnose from its side.
+
+        Metrics are DIAGNOSTICS. Losing a publish is bad; losing hours of
+        training because a sidecar process died is worse, and the asymmetry is
+        not close. So a failure is counted, announced once, and stepped over.
+
+        NOT SILENT, and not unbounded. The first failure prints, the count is
+        published as `run/log_failures` so a run with holes in its telemetry is
+        distinguishable from one without, and a backend that stays down for
+        `_MAX_LOG_FAILURES` consecutive publishes re-raises -- at that point the
+        run is unreadable and continuing would burn the card for nothing.
+        """
+        try:
+            wandb.log(metrics, step=self.step_ind, commit=True)
+        except Exception as e:                      # noqa: BLE001 - telemetry only
+            self._log_failures = getattr(self, '_log_failures', 0) + 1
+            self._log_failures_total = getattr(self, '_log_failures_total', 0) + 1
+            if self._log_failures == 1:
+                print(f"wandb.log failed at step {self.step_ind} "
+                      f"({type(e).__name__}: {e}). Training continues -- metrics "
+                      f"are diagnostics, and a dead logging sidecar must not end "
+                      f"a run. Further failures are counted in "
+                      f"run/log_failures, not printed.")
+            if self._log_failures >= self._MAX_LOG_FAILURES:
+                raise RuntimeError(
+                    f"wandb.log has failed {self._log_failures} times in a row "
+                    f"(last: {type(e).__name__}: {e}). Nothing about this run is "
+                    f"being recorded, so it is not worth continuing.") from e
+            return
+        # a publish that lands clears the CONSECUTIVE count, not the total
+        self._log_failures = 0
+
     def _ray_probe_armed(self) -> bool:
         """Arm the ray probe iff THIS stage asked for it (lr_sensor kind 'ray').
 
@@ -1116,20 +1162,32 @@ class Modeller:
         # live batch size at step-time resolution: paired with train_step_time
         # this makes every run a samples/sec-vs-batch knee scan for free
         metrics['Batch Size'] = self.batch_size
-        # ray-calibration readings (empty dict unless ray_calibration.enabled). Read
-        # probe/alpha_median against probe/alpha_iqr and probe/fit_*_rate: a
-        # wandering median, or a rising downward/flat rate, voids the sensor
-        # independently of what the alpha* values say.
+        # Ray-calibration readings. Empty dict unless a stage declares
+        # `lr_sensor: {kind: ray}` -- that declaration IS the switch; the old
+        # `ray_calibration.enabled` flag is retired precisely because a second
+        # flag could disagree with it.
+        #
+        # Read `raycal/alpha_star` against `raycal/status`, and `raycal/refused`
+        # + `raycal/refused_reason` before either: a refusal means nothing was
+        # measured, so a stale alpha_star must not be read as this period's
+        # answer. Per-branch disagreement is under `raycal/branch/`. The
+        # per-alpha bracket the reading is built from is NOT logged -- see
+        # RayCalibration.report for what that costs.
+        #
+        # (This comment used to direct the reader to `probe/alpha_median`,
+        # `probe/alpha_iqr` and `probe/fit_*_rate`. Those were `step_probe.py`'s
+        # parabola-fit outputs; that module and its keys are gone, and `probe/`
+        # is now the churn/allocator window below.)
         metrics.update(self.ray_cal.report())
-        # What the ray had to score with. `larder/eligible_min` is the binding
-        # number: a calibration needs n_sub records of EVERY active branch that
-        # this step did not train on, so a reading that never fires and a larder
-        # that never fills look identical without it.
-        if self.larder is not None and self._probe_weights:
-            metrics['larder/harvested'] = float(self.larder.n_seen)
-            metrics['larder/eligible_min'] = float(min(
-                len(self.larder.eligible(b, self._probe_exclude_from))
-                for b in self._probe_weights))
+        # Holes in the telemetry must be visible IN the telemetry -- a run that
+        # lost publishes and one that did not are otherwise identical from it.
+        if getattr(self, '_log_failures_total', 0):
+            metrics['run/log_failures'] = float(self._log_failures_total)
+        # The larder publishes nothing (owner decision, 2026-08-23). It is a
+        # buffer like any other; its occupancy was reported only because
+        # `eligible_min` separated "the ray never fired" from "the larder never
+        # filled", and `raycal/deferred` with reason 'larder_filling' answers
+        # that from the sensor's side, where a reader is already looking.
         metrics.update(getattr(self, '_replay_is_stats', {}) or {})
         # Memorisation sensor. replay/resid_vs_intake is the servo's input:
         # 1.0 = delay line, 1/e = 0.368 = the lambda*tau = 1 boundary, below
@@ -1158,6 +1216,20 @@ class Modeller:
         # interspersed z-calibration telemetry, drained each report
         # (z_cal/steps is a count SINCE the last report, not a rate)
         if getattr(self, '_z_cal_report', None):
+            # SAME DENOMINATOR AS energy/frac_of_step, so the two read against
+            # each other directly. z-calibration is permitted max_steps_per_step
+            # rollouts per TRAIN step and every one is a full T-step policy
+            # rollout, so it can outweigh the MLIP call several times over while
+            # energy/frac_of_step -- correctly -- reports the MLIP as a small
+            # share. On p4_mace_mle's phase 2 that read 0.045 against a 7.4 s
+            # step and there was nothing to compare it to.
+            zsec = float(self._z_cal_report.get('z_cal/seconds', 0.0) or 0.0)
+            if self._throughput['seconds'] > 0:
+                self._z_cal_report['z_cal/frac_of_step'] = (
+                        zsec / self._throughput['seconds'])
+            zn = float(self._z_cal_report.get('z_cal/steps', 0) or 0)
+            if zn > 0:
+                self._z_cal_report['z_cal/seconds_per_rollout'] = zsec / zn
             metrics.update(self._z_cal_report)
             self._z_cal_report = {}
         # true throughput over the window: total samples / total seconds. Step
@@ -1323,10 +1395,10 @@ class Modeller:
         metrics['zmatch/fwd_level'] = levels['fwd']
         metrics['zmatch/bwd_level'] = levels['bwd']
 
-        # always logged, including on arms with no servo-managed LR: a flat
-        # peak_scale is itself the reading, and lr_ctrl/servo_hold says WHY the
-        # loop is not moving. A silently absent block and a satisfied
-        # controller must not look the same.
+        # always logged, including on arms with no bracket-managed LR: a flat
+        # scale is itself the reading, and lr_bracket/phase plus
+        # lr_bracket/refused say WHY it is not moving. A silently absent block
+        # and a controller that is deliberately holding must not look the same.
         metrics.update(self.lr_controller.report())
 
         if hasattr(self, 'condition_log_z'):
@@ -1340,34 +1412,16 @@ class Modeller:
                 for cid, val in enumerate(self.condition_log_z.bwd_level_ema.tolist()):
                     metrics[f'condition_bwd_level/{cid}'] = val
 
-        # --- step-time tail probes: WINDOW-MAX over the 10 steps since the last
-        # report, so a rare slow step can't slip between the 1-in-10 samples the
-        # way plain train_step_time does. Convicts the spike source by
-        # correlation: a step-time spike + a churn-cohort spike = avalanche; a
-        # step-time spike + a device_alloc burst = CUDA allocator expansion; a
-        # step-time spike with neither = look elsewhere.
-        probe = getattr(self, 'probe_window', None)
-        if probe is not None:
-            metrics.update({f'probe/{k}': v for k, v in probe.items()})
-        self.probe_window = {}  # reset the window
-        if torch.cuda.is_available():
-            stats = torch.cuda.memory_stats()
-            prev = getattr(self, '_prev_alloc_stats', None)
-            cur = {k: stats.get(k, 0) for k in ('num_device_alloc', 'num_device_free')}
-            if prev is not None:
-                metrics['probe/device_alloc_delta'] = cur['num_device_alloc'] - prev['num_device_alloc']
-                metrics['probe/device_free_delta'] = cur['num_device_free'] - prev['num_device_free']
-            self._prev_alloc_stats = cur
+        # The `probe/` family -- a 10-step window-max of step time and the four
+        # buffer-churn costs, plus the CUDA allocator's alloc/free deltas -- was
+        # retired 2026-08-23 (owner decision). Seven keys whose only consumer was
+        # the dashboard: they existed to triage a step-time spike by correlation
+        # (spike + churn cohort = avalanche, spike + alloc burst = allocator
+        # expansion, spike with neither = look elsewhere). Nothing actuated on
+        # them, and `_recent_step_times` -- which the batch sizer DOES act on --
+        # is unaffected and still fed at the same site.
 
         return metrics
-
-    def _probe_max(self, key, value):
-        """Roll value into the 10-step probe window as a running max."""
-        w = getattr(self, 'probe_window', None)
-        if w is None:
-            w = self.probe_window = {}
-        if value > w.get(key, float('-inf')):
-            w[key] = value
 
     def set_loss_coeffs(self):
         """Live loss coefficients are a pure function of (base config defaults,
@@ -2227,19 +2281,26 @@ class Modeller:
         optimizes a different loss surface, so Adam moments must not carry
         across the boundary.
 
-        No LR scheduler objects here any more -- the AdaptiveLRController
-        (controller.py) sets every param group's LR directly, every tick
-        (step_lr_schedule -> lr_controller.step -> _apply_lrs), so there is
-        nothing left to build or step. init_policy_lrs/init_flow_lr below
-        still matter for exactly the first train_step of a (re)build: it runs
-        before step_lr_schedule's first call fires, so the optimizer needs a
-        safe (warmup-start) initial value to construct with.
+        No LR scheduler objects here any more -- LRController (controller.py)
+        sets every param group's LR directly, every tick (step_lr_schedule ->
+        lr_controller.step -> _apply_lrs), so there is nothing left to build or
+        step. init_policy_lrs/init_flow_lr below still matter for exactly the
+        first train_step of a (re)build: it runs before step_lr_schedule's first
+        call fires, so the optimizer needs a safe initial value to construct
+        with, and the burn-in scale is exactly that value.
         """
+        # THE BURN-IN SCALE, not a warmup ratio. These values matter for exactly
+        # the first train_step of a (re)build -- it runs before the controller's
+        # first `step()` fires -- so the optimizer must be constructed at a rate
+        # that is safe on a freshly rebuilt surface. The burn-in scale IS that
+        # rate: it is the one the run is about to spend `burn_in_steps` at.
+        _burn = float(getattr(getattr(self.args, 'lr_control', None),
+                              'burn_in_scale', 1.0) or 1.0)
         init_flow_lr = self.args.lr_flow
-        init_policy_lrs = {'fwd': self.args.lr_policy / self.args.lr_warmup_ratio,
-                           'bwd': self.args.lr_back / self.args.lr_warmup_ratio,
-                           'replay': self.args.lr_replay / self.args.lr_warmup_ratio,
-                           'fused': self.args.lr_fused / self.args.lr_warmup_ratio}
+        init_policy_lrs = {'fwd': self.args.lr_policy * _burn,
+                           'bwd': self.args.lr_back * _burn,
+                           'replay': self.args.lr_replay * _burn,
+                           'fused': self.args.lr_fused * _burn}
 
         """
         Initialize Optimizers
@@ -2304,18 +2365,16 @@ class Modeller:
         self.optimizers['flow'] = torch.optim.Adam(flow_params, init_flow_lr,
                                                   weight_decay=weight_decay, **adam_kw)
 
-        # Two-point step probe (docs/to_do_rebuild.md A3/A4b) -- SENSOR ONLY, no
-        # actuation. Built over the same param list the fused optimizer's policy
-        # groups cover and NOT the flow head, per decision D26 option (b): the Z
-        # head is LR-pinned separately, so folding it in would make alpha* rate a
-        # composite step the servo would not control. Absent config block =>
-        # disabled, so this is inert for every existing config.
-        # The block lives under `adaptive_lr` -- it parameterises one of the LR
-        # sensors, so it belongs with the rest of the LR machinery rather than at
-        # top level. The old top-level spelling is retired (utils._RETIRED_KEYS),
-        # so a config still carrying it fails at load rather than silently
-        # falling through to the defaults below.
-        sp_cfg = getattr(getattr(self.args, 'adaptive_lr', None),
+        # The ray probe -- DIAGNOSTIC ONLY, and off unless a stage declares
+        # `lr_sensor: {kind: ray}`. It has reached no learning rate since the
+        # bracket took over: alpha* was measured uncorrelated with the rate it
+        # steered (see controller.py). It is retained so a future claim about it
+        # can be measured, and it is not free -- about 4.8% of step time at
+        # period 500 on `train_prior` -- so declaring it is a purchase.
+        # Built over the same param list the fused optimizer's policy groups
+        # cover and NOT the flow head (decision D26b): the Z head is LR-pinned
+        # separately.
+        sp_cfg = getattr(getattr(self.args, 'lr_control', None),
                          'ray_calibration', None)
         # ONE list, built once, shared by both sensors. `get_policy_params` is a
         # local of this method, so the hypergradient sensor cannot call it later
@@ -2337,9 +2396,9 @@ class Modeller:
         # measurement rather than a preference. The probe's ABSOLUTE cost is set
         # by n_sub x len(alphas) forward passes over one batch; its OVERHEAD is
         # that divided by the stage's step cost, and stages differ by more than
-        # an order of magnitude. Measured on elj/mipcas: a calibration costs ~28
+        # an order of magnitude. Measured on elj/mipcas: a calibration costs ~24
         # training steps on `train_prior`, whose bwd/dataset step runs no rollout
-        # and no energy call (median 0.158 s) -- 5.6% at period 500, against the
+        # and no energy call (median 0.158 s) -- 4.8% at period 500, against the
         # 1.2% recorded for the same probe on the fused stage, whose steps are
         # ~20x more expensive. One global period cannot serve both.
         #
@@ -2354,11 +2413,9 @@ class Modeller:
             n_sub=int(stage_sensor.get('n_sub', getattr(sp_cfg, 'n_sub', 8))),
             period=int(stage_sensor.get('period', getattr(sp_cfg, 'period', 500))),
             enabled=bool(self._ray_askers()),
+            log_grid=bool(getattr(sp_cfg, 'log_grid', False)),
+            dual_score=bool(getattr(sp_cfg, 'dual_score', False)),
         )
-        # The pool's raise cap follows the sensor's grid, not a constant: see
-        # LRController.adopt_alpha_grid. Done here because the grid is only
-        # known once RayCalibration exists, which is after the controller.
-        self.lr_controller.adopt_alpha_grid(self.ray_cal.alphas)
         # THE LARDER -- what ray scores, replacing the replay draw. Rebuilt here
         # rather than once at init because this method is also what a stage
         # transition calls: the outgoing stage's batches were drawn under a
@@ -2366,13 +2423,21 @@ class Modeller:
         # rate an objective the run has already left. Rebuilding drops them.
         #
         # Kept iff some stage asks for `ray`, so a hyper-only or sensorless run
-        # pays neither the tee nor the host memory. Depth is derived from n_sub
-        # rather than configured: the calibration needs n_sub records per active
-        # branch that this step did not train on, and headroom above that only
-        # buys older data.
+        # pays neither the tee nor the host memory.
+        #
+        # DEPTH IS n_sub PLUS A SMALL MARGIN, not a multiple of it. It was
+        # `4 * n_sub`, on the reasoning that headroom above n_sub "only buys
+        # older data" -- which is true about the BENEFIT and says nothing about
+        # the PRICE. The price is per ACTIVE BRANCH: phase 1 has one, a fused
+        # crystal stage has three, each holding full trajectories and PyG graphs
+        # for a batch of 1000. The margin exists only to cover records excluded
+        # by the held-out rule (this step's own, and under gradient accumulation
+        # the whole accumulation window), so a handful is enough and a multiple
+        # is waste measured in gigabytes of host RAM.
         if self._ray_askers():
             n_sub = int(getattr(sp_cfg, 'n_sub', 8))
-            depth = int(getattr(sp_cfg, 'larder_depth', 0) or 0) or max(4 * n_sub, 16)
+            depth = (int(getattr(sp_cfg, 'larder_depth', 0) or 0)
+                     or n_sub + max(4, n_sub // 2))
             self.larder = Larder(depth=depth)
             self.larder_scorer = LarderScorer(self)
         else:
@@ -2657,7 +2722,16 @@ class Modeller:
             self.gfn_model.train()
             self.set_detect_anomaly(do_anomaly_detection=self.args.anomaly_detection)
             init_step = self.step_ind * 1
-            for self.step_ind in trange(init_step, self.args.epochs + 1):
+            # THE STEP CLOCK IS AN EXPLICIT ITERATOR, not a bare `for x in
+            # trange(...)`, so the LR bracket can SKIP it. A bracket promotes one
+            # candidate's end state, and that candidate really did train
+            # `trial_steps` steps -- so the run's logical clock has to jump by
+            # exactly that, and by nothing else. `iter()` matters: tqdm's
+            # `__iter__` is a generator function, so calling it twice would hand
+            # out two independent generators and the skip would advance a clock
+            # nothing was reading.
+            step_iter = iter(trange(init_step, self.args.epochs + 1))
+            for self.step_ind in step_iter:
                 # THE ONLY PROFILING CALL IN THE HOT LOOP, and it is one boolean
                 # compare unless a trace window is configured AND still open.
                 # Once the window has written, `done` latches and this never
@@ -2705,7 +2779,6 @@ class Modeller:
                     self.z_calibration_tick(step_type)
                 self.times['train_step_end'] = time()
                 step_dt = self.times['train_step_end'] - self.times['train_step_start']
-                self._probe_max('step_time_max10', step_dt)
                 if not hasattr(self, '_recent_step_times'):
                     self._recent_step_times = deque(maxlen=64)
                     self._recent_step_work = deque(maxlen=64)
@@ -2742,12 +2815,32 @@ class Modeller:
                 # step_dt and feed it to the rung median, the runaway guard and
                 # the throughput meters.
                 #
-                # PER ITERATION, not on the 10-step reporting clock: the settling
-                # signal (`z_cal/p`) lives in a report dict that is CLEARED each
-                # time it is published, so a 10-step sampler would miss most of
-                # them and the gate would take ten times as long to open as it
-                # appears to.
-                self.lr_controller.tick()
+                # THE HARD TRIPWIRE, EVERY STEP. It used to ride `monitor_losses`
+                # on the 10-step reporting clock, which is fine for a bar at 1e9
+                # and useless for one derived from the run's own loss scale: a
+                # candidate rate detonates in tens of steps, so a 1-in-10 sampler
+                # both reacts late and -- because the bracket's bars are fitted to
+                # the burn-in window -- feeds that window one observation in ten.
+                if current_loss is not None:
+                    if self.lr_controller.observe(
+                            step_type, current_loss,
+                            getattr(self, 'last_grad_norm_pre_clip', None)) == 'diverged':
+                        self.fire_loss_spike()
+
+                # The LR bracket's seat. PER ITERATION, and it is the only thing
+                # that moves a learning rate: burn in for a fixed number of steps,
+                # take a root, run the fixed-LR grid, promote, hold.
+                #
+                # The return value is the PROMOTED candidate's horizon -- the
+                # steps the winning trial really did train, which the run is
+                # keeping. Discarded trial compute is not in it, so a bracket that
+                # spent six rungs' worth of steps advances this clock by one
+                # rung's worth. Consuming the iterator is what makes tqdm, the
+                # eval grid and the checkpoint cadence all agree with step_ind.
+                skip = self.lr_controller.tick()
+                for _ in range(int(skip or 0)):
+                    if next(step_iter, None) is None:
+                        break
 
                 # train monitoring
                 if self.step_ind % 10 == 0:
@@ -2759,10 +2852,7 @@ class Modeller:
                     # arms the exit trigger (which pulls the next eval forward)
                     if self.protocol.stage.mle_gate is not None:
                         metrics.update(self.update_mle_gate())
-                    # the stage's declared LR sensor. Returns {} (and touches
-                    # nothing) unless the stage declares lr_sensor kind:
-                    # plateau, so this is inert for every config without one.
-                    metrics.update(self.update_lr_plateau())
+                    metrics.update(self.observe_hot_lr())
                     self.protocol.tick()
 
                 # evaluation work -- stage_ctrl 'request_eval' pulls the eval
@@ -2790,7 +2880,7 @@ class Modeller:
                         metrics = {k: v for k, v in metrics.items()
                                    if not (isinstance(v, wandb.Histogram)
                                            or (isinstance(v, np.ndarray) and v.size > 1))}
-                    wandb.log(metrics, step=self.step_ind, commit=True)
+                    self._log_metrics(metrics)
 
                     # Only AFTER the first eval. record_peak used to fire from step 10,
                     # so a run killed early wrote a partial high-water mark that later
@@ -2849,14 +2939,11 @@ class Modeller:
                       f"(streak {self._grad_nonfinite_streak}) -> rewind + peak cut")
                 self.fire_loss_spike()
         if current_loss is not None:
-            # check_spike (LRController) is the one remaining tripwire: an
-            # absolute ~1e9 bar on branch loss / pre-clip grad norm, or a
-            # non-finite reading. fire_loss_spike does the rewind + peak cut.
-            trig = self.lr_controller.check_spike(
-                step_type, current_loss, getattr(self, 'last_grad_norm_pre_clip', None))
-            if trig == 'diverged':
-                self.fire_loss_spike()
-
+            # THE TRIPWIRE MOVED OUT OF HERE, to `lr_controller.observe` in the
+            # host loop. This method runs on the 10-step reporting clock, which is
+            # adequate for a 1e9 numerical-death bar and not for a bar derived
+            # from the run's own loss scale: a too-hot rate detonates in tens of
+            # steps, and the same window feeds the bracket's bars.
             current_fwd = self.metric_tracker.get('fwd', 'r2')
             current_bwd = self.metric_tracker.get('bwd', 'r2')
             current_replay = self.metric_tracker.get('replay', 'r2')
@@ -2876,28 +2963,49 @@ class Modeller:
         hung 11k steps fitting a 174k broad buffer a z_match Z was never
         calibrated for).
 
-        Prefer the same-stage 'best' (freshest). Else this stage's 'stage_start'
-        turnover point, saved post-on_enter in protocol.advance and healthy by
-        construction (it cleared the previous stage's exit gate). Else fall back
-        to 'best' so behavior is never worse than before the fix.
+        Prefer the same-stage 'best' ONLY WHILE IT IS FRESH. 'best' is linked on
+        a quality-record condition, and on stages where that record freezes early
+        ('best of the r2-combo samples' is degenerate on the MLE warm start, so it
+        latched at the first finite tracker reading ~step 300) a rewind restored
+        a near-init model whose raw loss re-tripped the excursion bar on the very
+        next step -- a guaranteed loop straight through the reload budget
+        (toy_wk_aug24, 4 rewinds in 4 steps, abort). A 'best' more than
+        10 x eval_period behind the present is that frozen record, not a
+        recovery point, so fall through to the ROLLING checkpoint ('running',
+        <= 50 steps old, saved before the bar fired). Then this stage's
+        'stage_start' turnover point (post-on_enter, healthy by construction),
+        then bare 'best' so behavior is never worse than before the fix.
         """
         idx = {s.name: s.index for s in self.protocol.stages}
         current = idx.get(self.protocol.stage.name, -1)
 
-        def stage_index(tag):
+        def stage_and_step(tag):
             path = self.checkpointer.path_for(tag)
             if not os.path.exists(path):
-                return None, path
+                return None, None, path
             try:
                 ck = torch.load(path, map_location='cpu', weights_only=False)
-                return idx.get(ck.get('modeller_state', {}).get('stage')), path
+                ms = ck.get('modeller_state', {})
+                return idx.get(ms.get('stage')), ms.get('step_ind'), path
             except Exception:
-                return None, path
+                return None, None, path
 
-        best_idx, best_path = stage_index('best')
-        if best_idx is not None and best_idx >= current:
+        stale_after = 10 * int(getattr(self.args, 'eval_period', 250) or 250)
+        best_idx, best_step, best_path = stage_and_step('best')
+        best_fresh = (best_step is not None
+                      and self.step_ind - int(best_step) <= stale_after)
+        if best_idx is not None and best_idx >= current and best_fresh:
             return best_path
-        start_idx, start_path = stage_index('stage_start')
+        if best_idx is not None and best_idx >= current and not best_fresh:
+            run_idx, run_step, run_path = stage_and_step('running')
+            if run_idx is not None and run_idx >= current:
+                print(f"rewind: 'best' is {self.step_ind - int(best_step)} steps stale "
+                      f"(> {stale_after}) -- its quality record froze, so it is not a "
+                      f"recovery point; rewinding to the rolling checkpoint "
+                      f"(step {run_step}) instead")
+                return run_path
+            return best_path        # stale but same-stage, and nothing fresher exists
+        start_idx, start_step, start_path = stage_and_step('stage_start')
         if start_idx == current:
             print(f"rewind: 'best' stage {best_idx} precedes current stage {current}; "
                   f"reverting to this stage's start rather than reversing the phase")
@@ -2995,10 +3103,11 @@ class Modeller:
                         if val is not None:
                             setattr(self.condition_log_z, key, val)
 
-        # set_state_dict above restored lr_ctrl (warmup clock + peak_scale)
-        # from the healthy best checkpoint; the CEILING lives on the controller
-        # instance and survives the rewind, so the cut below is applied to a
-        # healthy peak and then clamped by evidence the rewind cannot erase.
+        # set_state_dict above restored lr_ctrl (the scale and the bracket's
+        # phase) from the healthy best checkpoint. `on_divergence` COUNTS and
+        # does not cut: the rate was chosen by a bracket, and lowering it here
+        # would hide that selection error behind a number nobody chose. The
+        # rewind budget (max_reloads_per_1k_steps) is what stops a loop.
         self.lr_controller.on_divergence()
 
     def update_ema_model(self):
@@ -3124,7 +3233,14 @@ class Modeller:
             def _loss(drawn):
                 return self._probe_loss(drawn, discretizer)
 
-            reading = self.ray_cal.measure(self._probe_dealer(), _loss)
+            # The diagnostic second scorer: same batch, path re-sampled from the
+            # current P_B rather than replayed. See RayCalibration.dual_score.
+            def _loss_fresh(drawn):
+                return self._probe_loss(drawn, discretizer, resample=True)
+
+            reading = self.ray_cal.measure(
+                self._probe_dealer(), _loss,
+                _loss_fresh if self.ray_cal.dual_score else None)
             if reading is not None:
                 self.lr_controller.on_calibration(reading)
 
@@ -3753,11 +3869,21 @@ class Modeller:
         return draw
 
     @torch.no_grad()
-    def _probe_loss(self, drawn, discretizer):
+    def _probe_loss(self, drawn, discretizer, resample: bool = False):
         """
         Re-score one sub-batch under the CURRENT parameters, per branch and as
         the frac-weighted composite. Stored trajectories and stored energies, so
         no resampling and no energy calls.
+
+        `resample=True` is the DIAGNOSTIC arm and is never on the actuating
+        path: it re-samples the backward path from the current P_B instead of
+        replaying the stored one, which is what a bwd/dataset branch actually
+        trains on. Still no energy calls -- `log_r` is stored -- so the cost is
+        one extra backward-sampling pass per alpha per sub-batch, and EVERY
+        branch is re-sampled, including `replay`. That is deliberate: replay
+        trains on stored paths, so its two readings SHOULD agree, and it is the
+        control arm that says whether a gap on the other branches is about the
+        sampling rule or about something else entirely.
 
         THE COMPOSITE IS WHAT THE CONTROLLER READS. The optimizer takes one step
         along the fused gradient, so alpha* has to be measured against the
@@ -3791,7 +3917,8 @@ class Modeller:
         out = {}
         total = 0.0
         for branch, w in self._probe_weights.items():
-            value = self.larder_scorer.score(drawn[branch], discretizer)
+            value = self.larder_scorer.score(drawn[branch], discretizer,
+                                             resample=resample)
             out[branch] = value
             total += w * value
         out['composite'] = total
@@ -3847,6 +3974,11 @@ class Modeller:
         if not (ng > 0 and nd > 0):
             return
         cos = float(torch.dot(g, d) / (ng * nd))
+        # DIAGNOSTIC ONLY since the bracket took over. `on_hypergradient` records
+        # the cosine and moves nothing: cos is a stationarity statistic --
+        # negative at every stable rate once the iterate has equilibrated -- so
+        # it has no fixed point to steer to. Kept reachable, off by default, so a
+        # future claim about it can be measured rather than argued about.
         self.lr_controller.on_hypergradient(cos, cfg['beta'], cfg.get('beta_down'),
                                             cfg.get('cos_target', 0.0),
                                             clip_ratio=clip_ratio)
@@ -3888,8 +4020,8 @@ class Modeller:
             # kept as telemetry (gradnorm/nonfinite_steps).
             self._grad_nonfinite_streak = getattr(self, '_grad_nonfinite_streak', 0) + 1
             # A non-finite GRADIENT is the same class of event as a non-finite
-            # loss or a 1e9 excursion, so it gets the same response: rewind to the
-            # last good checkpoint and cut peak_scale. It cannot be raised from
+            # loss or a hard-failure excursion, so it gets the same response:
+            # rewind to the last good checkpoint. It cannot be raised from
             # here -- fire_loss_spike reloads model/optimizer state, and this is
             # mid-step, after backward() and before the optimizer step -- so flag
             # it and let monitor_losses fire it at the point the divergence path
@@ -4013,6 +4145,10 @@ class Modeller:
             return
         rep = self._z_cal_report = getattr(self, '_z_cal_report', {})
         rep['z_cal/p'] = 0.0
+        # seconds accumulate across the report window exactly as z_cal/steps
+        # does, so the two divide into a per-rollout cost; frac_of_step below
+        # puts it beside energy/frac_of_step on the same denominator.
+        rep.setdefault('z_cal/seconds', 0.0)
         if getattr(self, 'fused_accum_count', 0):
             return  # mid-accumulation: a zero_grad here would clobber piled-up grads
         if self.protocol.flag('scramble_conditions'):
@@ -4065,12 +4201,20 @@ class Modeller:
         grace = float(getattr(cfg, 'grace', 0.8))
         bar = threshold * grace
         for _ in range(n):
+            # TIMED, because this loop is permitted max_steps_per_step rollouts
+            # per TRAIN step (100 canonically) and reported none of their cost.
+            # On p4_mace_mle's phase 2 it ran 2-7 rollouts a step against a 7.4 s
+            # step whose energy call was 0.77 s -- so the seconds it was spending
+            # had to be inferred from a rollout-cost estimate rather than read.
+            # A subsystem allowed to triple a train step reports what it takes.
+            _t0 = time()
             if mode == 'rollout':
                 ok, fresh = self._z_rollout_step(owner, cfg)
             elif mode == 'replay':
                 ok, fresh = self._z_replay_step(owner, cfg)
             else:
                 ok, fresh = self._z_calibration_step(owner, cfg), None
+            rep['z_cal/seconds'] = rep.get('z_cal/seconds', 0.0) + (time() - _t0)
             if not ok:
                 break
             rep['z_cal/steps'] = rep.get('z_cal/steps', 0) + 1
@@ -4496,7 +4640,25 @@ class Modeller:
         the same one-step staleness every other use of the batch tolerates.
         """
         cfg = getattr(self.args, 'z_calibration', None)
-        if cfg is None or not getattr(cfg, 'enabled', False):
+        if cfg is None:
+            return
+        # GATED ON THE SAME TWO FACTS z_calibration_tick GATES ON, because this
+        # cache is the only thing that tick's `regression` branch consumes.
+        #
+        # This used to read `cfg.enabled`, which is in utils._RETIRED_KEYS and
+        # hard-fails at load -- so no config could set it, the cache was never
+        # populated, and the `mode == 'regression'` gate in z_calibration_tick
+        # returned every time. `mode: regression` was unreachable for as long as
+        # that key has been retired, and unreachable SILENTLY: the run logs
+        # z_cal/p = 0.0 and no z_cal/train_rms, which is exactly what a
+        # calibration that ran and had nothing to do also looks like.
+        #
+        # The mode check is not just an optimisation. On the rollout route this
+        # stash is pure cost -- an embedding slice and a unique() per fwd step
+        # for a cache nothing reads.
+        if not self.protocol.flag('z_calibration'):
+            return
+        if getattr(cfg, 'mode', 'rollout') != 'regression':
             return
         emb = getattr(self.gfn_model, '_z_cal_embedding', None)
         if emb is None or condition_id is None:
@@ -5339,6 +5501,7 @@ class Modeller:
         dump_numeric(metrics, 'loss_coeffs/replay_', self.args.replay_loss_coeffs)
 
         self.log_dist_stats(bwd_log_pf, metrics, sample_batch)
+        self.progress_metrics(metrics, sample_batch)
 
         "Trajectory Stats"
         for prefix in ['fwd', 'bwd']:
@@ -5358,6 +5521,110 @@ class Modeller:
         metrics.update({**to_scalars(res)})
 
         return metrics
+
+    def progress_metrics(self, metrics, sample_batch):
+        """Marginal fit, energy-marginal overlap, and the rate-based exit verdict.
+
+        ROUTE-AGNOSTIC BY CONSTRUCTION, and that is why it lives here rather than on the
+        conformer subclass where it was first written. Everything it needs comes through
+        ``_batch_latents`` -- ``latent_params()`` on a crystal, the torsion state on a
+        conformer -- so the same code measures both, and the exit criterion can be validated
+        across problems whose convergence times differ by orders of magnitude instead of on
+        one molecule at one timescale.
+
+        TARGETS ARE MEASURED, NEVER WRITTEN, which is what makes that portability real: a
+        genuine draw of the reference is scored through the identical path, so
+        ``w1r/perfect_median`` and ``w1r/perfect_worst`` re-derive themselves on a
+        12-dimensional crystal latent (where 2-4 rows are structurally dead, D33) exactly as
+        on an 87-column conformer state. The extreme-value statistic in particular calibrates
+        very differently between the two, and nothing here needs to know that.
+
+        PUBLISHED, NOT CONSUMED, unless a stage names ``gates/progress_done`` in its exit.
+        WRAPPED, because a diagnostic must never take a run down with it.
+        """
+        import numpy as _np
+
+        from progress_metrics import _PROGRESS_GATE, _column_w1_ratio, progress_gate
+        try:
+            spec = getattr(self.args, 'progress_gate', None)
+            spec = dict(spec.__dict__) if hasattr(spec, '__dict__') else (spec or _PROGRESS_GATE)
+            pd = getattr(self, 'prior_dataset', None)
+            if pd is None or getattr(pd, 'batch', None) is None:
+                return
+
+            def host(t):
+                if t is None:
+                    return None
+                return t.detach().cpu().numpy() if torch.is_tensor(t) else _np.asarray(t)
+
+            smp = host(self._batch_latents(sample_batch))
+            ref = host(self._batch_latents(pd.batch))
+            per = host(getattr(self.energy_function, 'periodic_dims', None))
+            if smp is None or ref is None or smp.ndim != 2 or ref.shape[1] != smp.shape[1]:
+                return
+            per = (_np.zeros(smp.shape[1], dtype=bool) if per is None
+                   else _np.asarray(per).astype(bool))
+            if not hasattr(self, '_w1_floor_cache'):
+                self._w1_floor_cache = {}
+            metrics.update(_column_w1_ratio(smp, ref, per, cache=self._w1_floor_cache))
+
+            # energy marginal -- a JOINT function of every coordinate, so it sees the
+            # correlation failures no 1-D marginal can (a column-shuffled sampler with
+            # perfect marginals scores at the floor on w1r and fails here)
+            ry = host(getattr(pd, 'y', None))
+            sy = host(getattr(sample_batch, self._buffer_y_fn(), None))
+            if ry is not None and sy is not None:
+                from energies.conformer_eval_metrics import energy_marginal_overlap
+                metrics.update(energy_marginal_overlap(
+                    _np.asarray(sy).reshape(-1), _np.asarray(ry).reshape(-1),
+                    temperature=float(getattr(self.energy_function, 'temperature', 1.0) or 1.0),
+                    cache=self._w1_floor_cache))
+                # ROUTE-AGNOSTIC energy keys, so the default gate spec names no
+                # route-specific metric ('Mean Conformer Energy' does not exist on the
+                # crystal route, and a spec that silently matches nothing yields a gate
+                # that abstains forever while every seam reports healthy)
+                rf = _np.asarray(ry, dtype=float); rf = rf[_np.isfinite(rf)]
+                sf = _np.asarray(sy, dtype=float); sf = sf[_np.isfinite(sf)]
+                if rf.size:
+                    metrics['E/ref_median'] = float(_np.median(rf))
+                if sf.size:
+                    metrics['E/sample_median'] = float(_np.median(sf))
+
+            hist = getattr(self, '_progress_history', None)
+            if hist is None:
+                hist = self._progress_history = {}
+            watched = {m['key'] for m in spec.get('metrics', [])}
+            watched |= {m['target_key'] for m in spec.get('metrics', []) if m.get('target_key')}
+            for m in spec.get('veto_metrics', []):
+                watched.add(m['key'])
+                if m.get('target_key'):
+                    watched.add(m['target_key'])
+            for k in watched:
+                v = metrics.get(k)
+                if v is None:
+                    continue
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if _np.isfinite(fv):
+                    hist.setdefault(k, []).append((float(self.step_ind or 0), fv))
+                    del hist[k][:-400]
+            out = progress_gate(hist, spec, float(self.step_ind or 0))
+            metrics.update(out)
+            # Through publish_gate, NOT just the metrics dict: the exit trigger
+            # resolves 'gates/*' against protocol.ctrl['gates'] and advances its
+            # streak only on a fresh ctrl['gate_written'] stamp. Writing the
+            # verdict only to wandb left both empty, so a stage gating on
+            # gates/progress_done could never exit -- silently, the exact
+            # welded-shut failure the exit redesign replaced (observed live on
+            # toy_wk2_aug24/sl1ebn35: done=1 published for 1500+ steps, streak 0).
+            # Publishing the 0 verdicts matters too: a resumed descent must
+            # reset the trigger streak, same as mle_flat.
+            if 'gates/progress_done' in out:
+                self.protocol.publish_gate('progress_done', out['gates/progress_done'])
+        except Exception as ex:
+            print(f'progress_metrics skipped: {ex}')
 
     def log_dist_stats(self, log_pf, metrics, sample_batch):
         std_params = self._batch_latents(sample_batch)
@@ -5756,78 +6023,56 @@ class Modeller:
         metrics['mle_gate_flat'] = float(flat)
         return metrics
 
-    def update_lr_plateau(self):
+    def observe_hot_lr(self):
+        """Feed the stage's drawdown sensor. REPORT-ONLY: returns metrics and
+        moves nothing.
+
+        THIS SEAT IS THE CALIBRATION. The thresholds were fitted on the wandb
+        history, which is `metric_tracker.snapshot()` sampled on this exact
+        10-step clock -- so the sensor reads `metric_tracker.get`, the same
+        EMA-smoothed value `snapshot` emits, from the same tick. Two nearby
+        alternatives are both wrong:
+
+          * `self._last_stats[branch][name]` is the RAW pre-EMA statistic, which
+            `update_mle_gate` two methods down deliberately reads -- that gate
+            fits a slope and needs independent samples, while a level comparison
+            does not. At alpha = 1 - exp(-10/100) = 0.0952 the raw value is
+            ~10.5x more responsive, so on raw input every threshold is wrong in
+            the unsafe direction and the sensor's noise analysis is void.
+          * calling `snapshot(changed_only=True)` here would DRAIN `changed_keys`
+            and silently delete those channels from the wandb row -- it has
+            exactly one caller for that reason.
+
+        The reading is returned straight into the metrics dict and NOT put back
+        through `metric_tracker`, which would EMA a statistic that is already
+        computed over an EMA.
         """
-        ReduceLROnPlateau over the stage's declared loss channels.
-
-        Track each channel's best value; a check counts as progress if any
-        channel improved on its best by more than `threshold` (relative). If no
-        channel has improved for `patience` checks, cut the LR by `factor` and
-        wait `cooldown` checks before counting again.
-
-        One criterion covers every failure mode: a rising loss, a stalled one,
-        and one that has blown up and plateaued at a ruinous level are all
-        simply "no improvement over best". The earlier slope-fitting version
-        tested only whether the loss was RISING, and so sat clean for 3000 steps
-        through lrs_normal, which was merely stalled at 8x the healthy LR.
-
-        WHY DECLARED AND NOT DERIVED from the active coefficients: bwd level_gap
-        carries a coefficient while being sign-indefinite and not a convergence
-        signal, and vg_by_condition carries one while being a boolean switch
-        with no series behind it.
-        """
-        sensor = self.protocol.stage.lr_sensor
-        if sensor is None or sensor['kind'] != 'plateau':
+        spec = self.protocol.stage.hot_lr_sensor
+        if spec is None:
+            self._hot_lr = None
             return {}
-        # The LR is deliberately non-stationary while the envelope ramps, so a
-        # lack of progress there says nothing about the operating point.
-        if self.lr_controller.in_warmup():
-            return {}
-
-        gs = self.protocol.gate_state('lr_plateau')
-        best = gs.setdefault('best', {})
-        improved = False
-        for name in sensor['metrics']:
-            mode, _, channel = name.partition('/')
-            # The SMOOTHED value (metric_tracker EMA), not the raw per-step one.
-            # Tracking a best-ever over raw values ratchets the best down to the
-            # luckiest noise sample, after which nothing beats it and the sensor
-            # cuts while the run is still genuinely improving -- observed on
-            # lrs_blowup, where stale climbed to patience over steps 770-850
-            # while the logged (EMA) curve was setting new lows. A slope test
-            # wants raw input, because EMA autocorrelation wrecks its standard
-            # errors; a best-tracking test wants the opposite.
-            raw = self.metric_tracker.get(mode, channel)
-            if raw is None or not math.isfinite(float(raw)):
-                continue
-            val = float(raw)
-            prev = best.get(name)
-            # ABSOLUTE threshold. A relative one has nothing to be relative to
-            # here: bwd/mle is unbounded below, so abs(best) * frac grows without
-            # limit as the run improves, and the multiplicative form flips sign
-            # outright once best goes negative.
-            if prev is None or val < prev - sensor['threshold']:
-                improved = True
-            if prev is None or val < prev:
-                best[name] = val
-
-        if gs.get('cooldown', 0) > 0:
-            gs['cooldown'] -= 1
-            gs['stale'] = 0
-        elif improved:
-            gs['stale'] = 0
-        else:
-            gs['stale'] = int(gs.get('stale', 0)) + 1
-
-        fired = gs['stale'] >= sensor['patience']
-        if fired:
-            gs['stale'] = 0
-            gs['cooldown'] = sensor['cooldown']
-        # called unconditionally so a satisfied sensor and an absent one are
-        # distinguishable in lr_ctrl/plateau_status
-        self.lr_controller.on_plateau(fired, sensor['factor'])
-        return {'lr_plateau/stale': float(gs['stale']),
-                'lr_plateau/fired': float(fired)}
+        stage_name = self.protocol.stage.name
+        sensor = getattr(self, '_hot_lr', None)
+        if sensor is None or sensor.stage != stage_name:
+            # PER STAGE, AND REBUILT ON A CHANGE. A window carrying the previous
+            # stage's rows has a floor from another regime -- and on this
+            # protocol `fwd/scatter_err` is not even written during
+            # `train_prior`, which is bwd-only.
+            from energy_sampling.lr_hot_sensor import HotSensor
+            sensor = self._hot_lr = HotSensor(
+                spec, stage_name, tracker_period=self.metric_tracker.period)
+        direction, _, name = sensor.channel.partition('/')
+        verdict = sensor.observe(self.step_ind,
+                                 self.metric_tracker.get(direction, name),
+                                 self.metric_tracker.written_step(direction, name))
+        if verdict.get('fired'):
+            print(f"hot_lr [{stage_name}]: FIRED at step {self.step_ind} -- "
+                  f"{sensor.channel} at {verdict['value']:.6g} against a floor of "
+                  f"{verdict['floor']:.6g}, drawdown {verdict['drawdown']:.4g} over "
+                  f"a bar of {sensor.above:g}. REPORT ONLY: no learning rate has "
+                  f"moved, and this says the run is destabilising, not that the LR "
+                  f"caused it.")
+        return sensor.report()
 
     def _merge_metrics(self, metrics, new, source):
         """
@@ -7067,8 +7312,18 @@ class Modeller:
         while a stage draws.
         """
         stage = self.protocol.stage
+        # A `mode: replay` Z sidecar DRAWS from the replay buffer, so the buffer
+        # has to be managed even on a stage whose own losses never touch it.
+        #
+        # This read used to be `getattr(zc, 'enabled', False)`. That key is a
+        # relocated retirement (utils._RETIRED_KEYS: it became the per-stage
+        # flag below), so no config could set it and the whole clause was dead:
+        # a replay-mode sidecar on a non-fused stage drew from a buffer nothing
+        # was filling, and reported it as z_cal/replay_errors rather than as the
+        # configuration error it was.
         zc = getattr(self.args, 'z_calibration', None)
-        if getattr(zc, 'enabled', False) and getattr(zc, 'mode', None) == 'replay':
+        if (self.protocol.flag('z_calibration')
+                and getattr(zc, 'mode', None) == 'replay'):
             return True
         if stage.train_mode != 'fused':
             return False  # TRAIN_MODES is ('bwd', 'fused'); only fused has branches
@@ -7291,11 +7546,9 @@ class Modeller:
 
         purge_idx = torch.cat([toxic, extra_purge])
 
-        t_purge = time()
         if purge_idx.numel() > 0:
             self.replay_buffer.purge_by_index(purge_idx)
             self.replay_churn['evicted'] += int(purge_idx.numel())
-        t_add = time()
 
         if add_inds.numel() > 0:
             self.replay_buffer.add(
@@ -7306,12 +7559,6 @@ class Modeller:
             )
             self.replay_churn['admitted'] += int(add_inds.numel())
 
-        # tail probes (see ten_step_reporting): wall time is what the train step
-        # actually pays, syncs included -- deliberately no cuda.synchronize here
-        self._probe_max('churn_purge_ms_max', (t_add - t_purge) * 1e3)
-        self._probe_max('churn_add_ms_max', (time() - t_add) * 1e3)
-        self._probe_max('churn_purged_max', int(purge_idx.numel()))
-        self._probe_max('churn_added_max', int(add_inds.numel()))
 
     def init_prior_buffer_seed(self):
         """
