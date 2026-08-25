@@ -179,7 +179,10 @@ class HardFailureBars:
         self.root_window = int(root_window)
         self.min_observations = int(min_observations)
         self.loss_bar = {}          # channel -> absolute value that counts as failure
+        self.loss_hi = {}           # channel -> root window hi (bar - hi = k*span)
         self.grad_bar = None
+        self.grad_hi = None
+        self.last_fire = None       # structured facts of the most recent verdict
         self.scale_note = ''
 
     def derive(self, loss_history, grad_history):
@@ -189,7 +192,7 @@ class HardFailureBars:
         Returns None on success, or a string saying why a bracket taken from this
         root could not fail a candidate -- which is a refusal, not a warning.
         """
-        self.loss_bar, notes = {}, []
+        self.loss_bar, self.loss_hi, notes = {}, {}, []
         for channel, values in (loss_history or {}).items():
             tail = [v for v in list(values)[-self.root_window:] if math.isfinite(v)]
             if len(tail) < self.min_observations:
@@ -201,12 +204,14 @@ class HardFailureBars:
                 # Fall back to the magnitude, which is the only scale left.
                 span = abs(hi) if abs(hi) > 0 else 1.0
             self.loss_bar[channel] = hi + self.loss_excursion_k * span
+            self.loss_hi[channel] = hi
             notes.append(f'{channel}: [{lo:.4g}, {hi:.4g}] -> bar '
                          f'{self.loss_bar[channel]:.4g}')
         gtail = [g for g in list(grad_history or ())[-self.root_window:]
                  if math.isfinite(g) and g > 0]
         if len(gtail) >= self.min_observations:
             self.grad_bar = max(gtail) * self.grad_excursion_x
+            self.grad_hi = max(gtail)
             notes.append(f'grad: max {max(gtail):.4g} -> bar {self.grad_bar:.4g}')
         self.scale_note = '; '.join(notes)
         if not self.loss_bar:
@@ -217,24 +222,49 @@ class HardFailureBars:
                     f'not a bracket.')
         return None
 
+    #: An excursion this far past the bar, measured in bar-excesses over the
+    #: root hi (bar - hi = k*span), is DECISIVE: it skips the confirmation
+    #: re-run. 3x means the value overshot the root by triple what the bar
+    #: already demanded. Non-finite and absolute-backstop verdicts are decisive
+    #: by kind. (Evidence-scaled confirmation, owner 2026-08-25.)
+    DECISIVE_X = 3.0
+
     def judge(self, channel, loss, grad_norm):
         """'why this candidate failed', or None. Direct conditions only: no
-        fitted trend, no loss ratio, no cosine, no composite health score."""
+        fitted trend, no loss ratio, no cosine, no composite health score.
+
+        Every non-None verdict also stamps `self.last_fire` with the structured
+        facts (kind, value, bar, hi, decisive) so the DRIVER can classify the
+        failure without parsing its own strings. Read it immediately after a
+        hit; it is overwritten by the next one."""
+        def fire(kind, decisive, why, value=None, bar=None, hi=None):
+            self.last_fire = {'kind': kind, 'decisive': bool(decisive),
+                              'value': value, 'bar': bar, 'hi': hi}
+            return why
+
         if loss is not None:
             if not math.isfinite(loss):
-                return f'nonfinite_loss_{channel}'
+                return fire('nonfinite', True, f'nonfinite_loss_{channel}')
             if self.loss_abs is not None and abs(loss) >= self.loss_abs:
-                return f'loss_abs_{channel}_{loss:.4g}'
+                return fire('abs', True, f'loss_abs_{channel}_{loss:.4g}', loss)
             bar = self.loss_bar.get(channel)
             if bar is not None and loss >= bar:
-                return f'loss_excursion_{channel}_{loss:.4g}_over_{bar:.4g}'
+                hi = self.loss_hi.get(channel, bar)
+                decisive = loss >= hi + self.DECISIVE_X * (bar - hi)
+                return fire('loss_excursion', decisive,
+                            f'loss_excursion_{channel}_{loss:.4g}_over_{bar:.4g}',
+                            loss, bar, hi)
         if grad_norm is not None:
             if not math.isfinite(grad_norm):
-                return 'nonfinite_grad'
+                return fire('nonfinite', True, 'nonfinite_grad')
             if self.grad_abs is not None and grad_norm >= self.grad_abs:
-                return f'grad_abs_{grad_norm:.4g}'
+                return fire('abs', True, f'grad_abs_{grad_norm:.4g}', grad_norm)
             if self.grad_bar is not None and grad_norm >= self.grad_bar:
-                return f'grad_excursion_{grad_norm:.4g}_over_{self.grad_bar:.4g}'
+                hi = getattr(self, 'grad_hi', None) or (self.grad_bar / self.grad_excursion_x)
+                decisive = grad_norm >= hi + self.DECISIVE_X * (self.grad_bar - hi)
+                return fire('grad_excursion', decisive,
+                            f'grad_excursion_{grad_norm:.4g}_over_{self.grad_bar:.4g}',
+                            grad_norm, self.grad_bar, hi)
         return None
 
     def report(self) -> dict:
@@ -601,7 +631,7 @@ class BracketDriver:
         start_step = int(m.step_ind)
         done, reason, fail_at = 0, None, None
         settle = int(getattr(self.bracket, 'trial_settle_steps', 0) or 0)
-        peaks = {}
+        peaks, logz_decisive = {}, False
         for i in range(self.bracket.trial_steps):
             m.step_ind = start_step + i + 1
             reason = self._one_step()
@@ -624,7 +654,10 @@ class BracketDriver:
                 baseline = (self.root_log_z
                             + getattr(self, 'root_log_z_slope', 0.0) * done)
                 if lz is not None and lz < baseline - self.bracket.logz_detour_nats:
-                    reason = (f'logz_detour_{baseline - lz:.4g}_nats_below_'
+                    detour = baseline - lz
+                    logz_decisive = detour >= (HardFailureBars.DECISIVE_X
+                                               * self.bracket.logz_detour_nats)
+                    reason = (f'logz_detour_{detour:.4g}_nats_below_'
                               f'drift-adjusted_root'
                               f'_(bar_{self.bracket.logz_detour_nats:g})')
             if reason is not None and done <= settle and not (
@@ -642,6 +675,19 @@ class BracketDriver:
                 fail_at = done
                 break
         self.trial_branch_peaks[trial.label] = peaks
+        # EVIDENCE CLASS of the failure (owner, 2026-08-25): decisive failures
+        # skip their confirmation re-run. Non-finite and exceptions are decisive
+        # by kind; bar verdicts carry the classification the bars stamped at
+        # fire time; a log-Z detour is decisive at DECISIVE_X x its own bar.
+        decisive = False
+        if reason is not None:
+            if reason.startswith('nonfinite') or reason.startswith('exception'):
+                decisive = True
+            elif reason.startswith('logz_detour'):
+                decisive = logz_decisive
+            else:
+                lf = getattr(self.bars, 'last_fire', None) or {}
+                decisive = bool(lf.get('decisive'))
 
         ok = reason is None
         if ok:
@@ -651,11 +697,13 @@ class BracketDriver:
             # compute that produced it.
             self.trial_states[trial.label] = TrainerSnapshot(m, trial.label)
             self._held_bytes += self.trial_states[trial.label].held_bytes()
-        self.bracket.record(trial, ok, reason, done, fail_at)
+        self.bracket.record(trial, ok, reason, done, fail_at,
+                            decisive=decisive)
         if self.verbose:
             print(f'lr_bracket: {trial.label} '
                   + ('SURVIVED all ' + str(done) + ' steps'
-                     if ok else f'FAILED after {done} steps -- {reason}'))
+                     if ok else f'FAILED after {done} steps -- {reason}'
+                          + (' [DECISIVE]' if decisive else '')))
         return ok
 
     def _live_log_z(self):
@@ -724,7 +772,7 @@ class BracketDriver:
             rows = self.bracket.race_rows()
             if rows:
                 cols = ['label', 'kind', 'scale', 'seed', 'survived',
-                        'steps_to_failure', 'reason',
+                        'steps_to_failure', 'reason', 'decisive',
                         'peak_fwd', 'peak_bwd', 'peak_replay', 'peak_fused']
                 for r in rows:
                     peaks = self.trial_branch_peaks.get(r['label'], {})

@@ -117,16 +117,26 @@ class Trial:
 
 
 class Outcome:
-    """What one trial did. `steps_to_failure` is None on a survivor."""
+    """What one trial did. `steps_to_failure` is None on a survivor.
 
-    __slots__ = ('trial', 'ok', 'reason', 'steps_completed', 'steps_to_failure')
+    `decisive` (failures only): the failure was beyond reasonable doubt --
+    non-finite, an absolute backstop, or an excursion far past the bar -- as
+    classified by the driver at failure time. Decisive failures skip the
+    confirmation re-run: empirically every decisive failure ever confirmed
+    reproduced, while the only non-reproduction on record was a marginal
+    1.1x-bar graze (wk8 c5). Evidence-scaled confirmation, owner 2026-08-25."""
 
-    def __init__(self, trial, ok, reason, steps_completed, steps_to_failure):
+    __slots__ = ('trial', 'ok', 'reason', 'steps_completed', 'steps_to_failure',
+                 'decisive')
+
+    def __init__(self, trial, ok, reason, steps_completed, steps_to_failure,
+                 decisive=False):
         self.trial = trial
         self.ok = bool(ok)
         self.reason = reason
         self.steps_completed = int(steps_completed)
         self.steps_to_failure = steps_to_failure
+        self.decisive = bool(decisive)
 
     @property
     def scale(self):
@@ -449,6 +459,19 @@ class LRBracket:
             self._boundary_confirmed = True
             return None
         target = fails[0]
+        # EVIDENCE-SCALED CONFIRMATION (owner, 2026-08-25): a DECISIVE screen
+        # failure -- non-finite, absolute backstop, or an excursion far past the
+        # bar -- is its own confirmation. The re-run exists to catch the
+        # marginal coin flip near the bar (the stochastic switch splash, D9);
+        # spending 150 steps re-proving a 25x-bar detonation protects nothing.
+        # Every decisive failure ever confirmed reproduced; the single
+        # non-reproduction on record was a 1.1x-bar graze.
+        if any(getattr(o, 'decisive', False)
+               for o in self._screen_outcomes()
+               if o.scale == target and not o.ok):
+            self._boundary = target
+            self._boundary_confirmed = True
+            return None
         if self.boundary_confirm_repeats == 0:
             # No confirmation budget: the first failing rung IS the boundary.
             # Stated rather than defaulted, because it is the configuration in
@@ -496,9 +519,11 @@ class LRBracket:
         return Trial(mid, DENSIFY, label=f'densify_{self._scale_tag(mid)}')
 
     def record(self, trial: Trial, ok: bool, reason=None,
-               steps_completed: int = 0, steps_to_failure=None):
+               steps_completed: int = 0, steps_to_failure=None,
+               decisive: bool = False):
         """Fold in one finished trial."""
-        out = Outcome(trial, ok, reason, steps_completed, steps_to_failure)
+        out = Outcome(trial, ok, reason, steps_completed, steps_to_failure,
+                      decisive)
         self._results.append(out)
         self._discarded_steps += int(steps_completed)
         if trial.kind == DENSIFY and not ok:
@@ -719,7 +744,9 @@ class LRBracket:
             lines.append(
                 f'  {o.trial.label:<24} scale {o.scale:<10.6g} {o.trial.kind:<8}'
                 + (f' seed {o.trial.seed}' if o.trial.seed is not None else '')
-                + ('  SURVIVED' if o.ok else f'  FAILED ({o.reason}){when}'))
+                + ('  SURVIVED' if o.ok
+                   else f'  FAILED ({o.reason}){when}'
+                        + (' [DECISIVE]' if getattr(o, 'decisive', False) else '')))
         v = self._verdict
         if v:
             lines.append(
@@ -745,7 +772,8 @@ class LRBracket:
                  'survived': bool(o.ok),
                  'steps_to_failure': (None if o.steps_to_failure is None
                                       else int(o.steps_to_failure)),
-                 'reason': ('' if o.ok else str(o.reason or ''))}
+                 'reason': ('' if o.ok else str(o.reason or '')),
+                 'decisive': bool(getattr(o, 'decisive', False))}
                 for o in self._results]
 
     @property

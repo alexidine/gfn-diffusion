@@ -216,3 +216,82 @@ def test_root_slope_is_estimated_from_the_ema_gap_and_never_positive():
     m._last_stats = {'bwd': {'log_Z_learned': 12.5}}  # raw above EMA: upward walk
     assert d.take_root(m.step_ind) is None
     assert d.root_log_z_slope == 0.0
+
+
+# --------------------------------------- evidence-scaled confirmation -------
+
+def _decision_bracket(**kw):
+    from lr_bracket import LRBracket
+    cfg = dict(candidate_scales=(0.05, 0.2, 0.8), burn_in_steps=10,
+               burn_in_scale=0.05, trial_steps=50, boundary_confirm_repeats=1,
+               boundary_densify=False, trial_settle_steps=5)
+    cfg.update(kw)
+    return LRBracket(**cfg)
+
+
+def _drive(b, verdicts):
+    """verdicts: scale -> (ok, decisive). Returns the kinds of trials run."""
+    from lr_bracket import CONFIRM
+    b.begin_bracket(100, bias_correction=0.99)
+    kinds = []
+    for _ in range(50):
+        tr = b.next_trial()
+        if tr is None:
+            break
+        kinds.append(tr.kind)
+        ok, decisive = verdicts.get(tr.scale, (True, False))
+        if tr.kind == CONFIRM:
+            ok, decisive = verdicts.get(('confirm', tr.scale), (ok, decisive))
+        b.record(tr, ok=ok, reason=None if ok else 'loss_excursion_x',
+                 steps_completed=10, steps_to_failure=None if ok else 10,
+                 decisive=decisive)
+    return kinds, b.select()
+
+
+def test_a_decisive_failure_skips_its_confirmation():
+    """The re-run exists for the marginal coin flip; a beyond-doubt detonation
+    is its own confirmation and its 150 steps are saved."""
+    b = _decision_bracket()
+    kinds, verdict = _drive(b, {0.8: (False, True)})
+    assert 'confirm' not in kinds, kinds
+    assert verdict['status'] == 'bracketed'
+    assert verdict['boundary_scale'] == 0.8
+    assert verdict['boundary_confirmed'] == 1
+
+
+def test_a_marginal_failure_still_confirms():
+    b = _decision_bracket()
+    kinds, verdict = _drive(b, {0.8: (False, False),
+                                ('confirm', 0.8): (False, False)})
+    assert kinds.count('confirm') == 1, kinds
+    assert verdict['boundary_scale'] == 0.8
+
+
+def test_bars_classify_excursion_magnitude():
+    """Decisive threshold = hi + DECISIVE_X * (bar - hi): a graze over the bar
+    is marginal; far past it is decisive; non-finite is decisive by kind."""
+    from lr_bracket_probe import HardFailureBars
+    bars = HardFailureBars(loss_excursion_k=3.0, root_window=10,
+                           min_observations=5)
+    assert bars.derive({'bwd': [0.0, 1.0, 0.5, 0.8, 0.2]}, []) is None
+    bar, hi = bars.loss_bar['bwd'], bars.loss_hi['bwd']   # hi=1, span=1 -> bar=4
+    assert (bar, hi) == (4.0, 1.0)
+    threshold = hi + HardFailureBars.DECISIVE_X * (bar - hi)   # = 10
+
+    assert bars.judge('bwd', 5.0, None) is not None
+    assert bars.last_fire['decisive'] is False                 # graze
+    assert bars.judge('bwd', threshold + 1, None) is not None
+    assert bars.last_fire['decisive'] is True                  # far past
+    assert bars.judge('bwd', float('nan'), None) is not None
+    assert bars.last_fire['decisive'] is True                  # by kind
+
+
+def test_logz_detour_decisiveness_scales_with_its_bar():
+    m, d = _with_log_z(10.0 - 3.0, trial_settle_steps=0, logz_detour_nats=2.0)
+    d.run_trial(_trial(0.05, label='marginalz'))
+    o = d.bracket._results[-1]
+    assert not o.ok and not o.decisive                         # 3 nats < 3x2
+    m2, d2 = _with_log_z(10.0 - 7.0, trial_settle_steps=0, logz_detour_nats=2.0)
+    d2.run_trial(_trial(0.05, label='decisivez'))
+    o2 = d2.bracket._results[-1]
+    assert not o2.ok and o2.decisive                           # 7 nats >= 6
