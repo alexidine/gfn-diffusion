@@ -155,6 +155,10 @@ class FakeTrainer:
         self.batch_size = 1000           # in FIELDS: the abort-order test's witness
 
         self.args = Namespace(
+            # the post-promotion durability write goes through the supported
+            # suppression; without this every promoting test would attempt a
+            # real disk write from the fake's half-formed state
+            checkpoint_read_only=True,
             lr_policy=base_lr, lr_back=base_lr, lr_replay=base_lr,
             lr_fused=base_lr, lr_flow=0.1, min_lr=1e-12, max_lr=None,
             # ALL FOUR managed, as every canonical config has them: mk_dev
@@ -821,6 +825,73 @@ def test_a_repeat_race_waits_for_the_full_root_window():
         if c.bracket._brackets:
             break
     assert c.bracket._brackets == 1, 'the race never ran once the window filled'
+
+
+def test_a_promotion_writes_the_rolling_checkpoint_and_a_refusal_does_not():
+    """PROMOTION DURABILITY (owner concern 2026-08-25). The race concludes
+    mid-tick; a kill before the next scheduled save silently discarded the
+    promotion twice in one day, and with unified fires an unpersisted
+    promotion would make the first post-promotion fire restore PRE-race
+    weights under a POST-race rate. The success path writes 'running'
+    (model+optimizers, no sidecar) the moment it promotes; refusals measure
+    nothing and must write nothing."""
+    m = FakeTrainer(lr_control=_control())
+    m.burn_in(m.lr_controller.bracket.burn_in_steps)
+    wrote = []
+    m.checkpointer.save = lambda tag, with_buffers=False: wrote.append(
+        (tag, with_buffers))
+    assert m.lr_controller._open_bracket(m.step_ind) > 0
+    assert wrote == [('running', False)], (
+        f'a promotion must persist immediately as a sidecar-less running.pt; '
+        f'saw {wrote}')
+
+    m2 = FakeTrainer(lr_control=_control())   # no burn-in: underivable bars
+    wrote2 = []
+    m2.checkpointer.save = lambda tag, with_buffers=False: wrote2.append(tag)
+    m2.lr_controller._open_bracket(m2.step_ind)
+    assert m2.lr_controller.bracket.refusal
+    assert wrote2 == [], 'a refusal measured nothing and must persist nothing'
+
+
+def test_trial_drift_is_recorded_and_orders_with_rate():
+    """THE DRIFT READOUT (measurement, no veto). A rung can survive its
+    horizon while steadily parking the loss above the root -- qm9c aug25's
+    0.566 did exactly that, invisibly to every level-based check at 150
+    steps. The post-settle OLS drift is recorded per rung so the eventual
+    veto threshold can be chosen from a corpus of race tables rather than
+    one incident. The fake's mechanism reproduces the shape: Adam's floor
+    grows with the rate, so from a near-converged root a hotter surviving
+    rung drifts upward where a cold one sits flat."""
+    # NO BUFFER: the standard fake's churn term adds +0.001/step to EVERY
+    # rung's loss -- a shared secular trend that drowns the rate-dependent
+    # floor difference (measured: all four COLD rungs read +0.039 with it).
+    # That same measurement is why any future veto must judge drift
+    # DIFFERENTIALLY against the coldest rung, not absolutely.
+    m = FakeTrainer(lr_control=_control(trial_steps=40, trial_settle_steps=0),
+                    with_buffer=False)
+    m.burn_in(m.lr_controller.bracket.burn_in_steps)
+    c = m.lr_controller
+    assert c.bars.derive(c._loss_history, c._grad_history) is None
+    d = BracketDriver(m, c.bracket, c.bars, verbose=False)
+    assert d.take_root(m.step_ind) is None
+    c.bracket.begin_bracket(m.step_ind, d.root_bias_correction()[0])
+    # warm = COLD[2] (0.8): without the churn noise the derived bar tightens
+    # enough that 0.8 fails MARGINALLY at ~10 steps and 3.2 inside the settle
+    # window (measured). The readout must exist for the marginal failure too
+    # -- a failed rung's drift is exactly what the eventual confirm/veto
+    # calibration wants to see -- while 3.2's None is correct (nothing
+    # fittable before the failure).
+    d.run_trial(_trial(COLD[1], label='cold'))
+    d.run_trial(_trial(COLD[2], label='warm'))
+    dc, dw = d.trial_drift['cold'], d.trial_drift['warm']
+    assert dc is not None and dw is not None, 'drift missing'
+    assert dc['n'] == 40, 'the survivor must fit its full post-settle window'
+    assert dw['drift'] > dc['drift'], (
+        f"the hotter surviving rung must drift upward relative to the cold one "
+        f"(cold {dc['drift']:+.4g}, warm {dw['drift']:+.4g})")
+    # ...and the race table carries both, so the corpus accumulates
+    rows = d.bracket.race_rows()
+    assert rows and all('label' in r for r in rows)
 
 
 def test_a_promotion_clears_the_refusal_latch():

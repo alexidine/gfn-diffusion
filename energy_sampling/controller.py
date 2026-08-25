@@ -932,6 +932,21 @@ class LRController:
         try:
             skip = driver.run(step)
             self._bracket_report = driver.report()
+            # A PROMOTION IS DURABLE THE MOMENT IT EXISTS (owner concern,
+            # 2026-08-25). The race concludes mid-tick and the next scheduled
+            # save can be minutes out; a kill inside that window silently
+            # discarded the promotion twice in one day -- and since every fire
+            # now rewinds to the rolling checkpoint, an unpersisted promotion
+            # would also make the first post-promotion fire restore PRE-race
+            # weights under a POST-race rate. Model + optimizers only (~74 MB
+            # on every route -- MLIP cost lives in energy calls, not
+            # checkpoint bytes); the buffer sidecar keeps its eval-cadence
+            # contract, whose staleness a resume already tolerates.
+            try:
+                self.modeller.checkpointer.save('running')
+            except Exception as save_error:      # noqa: BLE001 -- best-effort
+                print(f'lr_ctrl: post-promotion checkpoint not written '
+                      f'({type(save_error).__name__}: {save_error})')
         except Exception as e:                       # noqa: BLE001 -- classified
             # AN ABORTED BRACKET MUST NOT ABORT THE RUN, and this seat is outside
             # the host loop's `try/except (RuntimeError, ValueError)` -- that one

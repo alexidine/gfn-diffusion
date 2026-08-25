@@ -529,6 +529,7 @@ class BracketDriver:
         self.root = None
         self.trial_states = {}       # label -> TrainerSnapshot for a surviving trial
         self.trial_branch_peaks = {}  # label -> {branch: peak loss over the trial}
+        self.trial_drift = {}        # label -> {'drift','t','n'} post-settle OLS, or None
         self.root_log_z = None       # the guiding-star baseline; None = guard off
         self.root_log_z_slope = 0.0  # root Z drift (<=0), extrapolated under trials
         self.last_summary = ''
@@ -696,10 +697,15 @@ class BracketDriver:
         done, reason, fail_at = 0, None, None
         settle = int(getattr(self.bracket, 'trial_settle_steps', 0) or 0)
         peaks, logz_decisive = {}, False
+        drift_ys = []   # post-settle stepping-channel losses, for the drift readout
         for i in range(self.bracket.trial_steps):
             m.step_ind = start_step + i + 1
-            reason = self._one_step()
+            reason, step_loss = self._one_step()
             done = i + 1
+            if done > settle and step_loss is not None:
+                v = float(step_loss)
+                if math.isfinite(v):
+                    drift_ys.append(v)
             # RACE-TABLE VISIBILITY: per-branch peak losses over the trial, so
             # a minority branch destabilizing under a dominant frac is at least
             # SEEN even though it holds no veto (owner decision 2026-08-24).
@@ -739,6 +745,15 @@ class BracketDriver:
                 fail_at = done
                 break
         self.trial_branch_peaks[trial.label] = peaks
+        # THE DRIFT READOUT (measurement only, deliberately NO veto power --
+        # same contract as the branch peaks). The 0.566 poisoning showed that
+        # a rung can SURVIVE its horizon while steadily parking the loss above
+        # the root: level-based checks cannot see it at 150 steps, but the
+        # post-settle SLOPE can (the 0.566 trial climbed ~+17 over a root span
+        # of 57 while cold rungs sat flat). Recorded per rung into the race
+        # table so the veto threshold can be chosen from a corpus of races
+        # (battery + local) rather than from one incident.
+        self.trial_drift[trial.label] = self._fit_drift(drift_ys)
         # EVIDENCE CLASS of the failure (owner, 2026-08-25): decisive failures
         # skip their confirmation re-run. Non-finite and exceptions are decisive
         # by kind; bar verdicts carry the classification the bars stamped at
@@ -764,11 +779,34 @@ class BracketDriver:
         self.bracket.record(trial, ok, reason, done, fail_at,
                             decisive=decisive)
         if self.verbose:
+            dr = self.trial_drift.get(trial.label)
+            note = (f' (drift {dr["drift"]:+.4g}, t={dr["t"]:.1f})'
+                    if dr is not None else '')
             print(f'lr_bracket: {trial.label} '
-                  + ('SURVIVED all ' + str(done) + ' steps'
+                  + ('SURVIVED all ' + str(done) + ' steps' + note
                      if ok else f'FAILED after {done} steps -- {reason}'
-                          + (' [DECISIVE]' if decisive else '')))
+                          + (' [DECISIVE]' if decisive else '') + note))
         return ok
+
+    @staticmethod
+    def _fit_drift(ys):
+        """OLS drift over one trial's post-settle losses: total fitted rise
+        (slope x span) and its t-statistic. None when the window is too short
+        to fit. Plain arithmetic, no scipy -- this runs on CPU harnesses."""
+        n = len(ys)
+        if n < 10:
+            return None
+        xm = (n - 1) / 2.0
+        ym = sum(ys) / n
+        sxx = sum((i - xm) ** 2 for i in range(n))
+        sxy = sum((i - xm) * (y - ym) for i, y in zip(range(n), ys))
+        slope = sxy / sxx
+        resid2 = sum((y - (ym + slope * (i - xm))) ** 2
+                     for i, y in zip(range(n), ys))
+        se = math.sqrt(resid2 / (n - 2) / sxx) if n > 2 and resid2 > 0 else 0.0
+        drift = slope * (n - 1)
+        t = slope / se if se > 0 else (0.0 if slope == 0 else float('inf'))
+        return {'drift': drift, 't': t, 'n': n}
 
     def _live_log_z(self):
         """The last training step's batch-mean log_Z_learned, read from the raw
@@ -783,8 +821,8 @@ class BracketDriver:
         return None
 
     def _one_step(self):
-        """One training step at the candidate's fixed rate. Returns a hard-failure
-        reason or None.
+        """One training step at the candidate's fixed rate. Returns
+        (hard-failure reason or None, this step's loss or None).
 
         The body mirrors the host loop's step -- train_logic, train_step, the
         interspersed Z work -- and deliberately omits everything that is
@@ -804,15 +842,15 @@ class BracketDriver:
                 # rate the run never tested. Let it out: run_trial repeats the
                 # rung once at the same batch; a second OOM aborts the race.
                 raise
-            return f'exception_{type(e).__name__}'
+            return f'exception_{type(e).__name__}', None
         if loss is not None:
             m.z_level_fill()
             m.z_calibration_tick(step_type)
         if getattr(m, '_nonfinite_pending', False):
             m._nonfinite_pending = False
-            return 'nonfinite_gradient'
+            return 'nonfinite_gradient', loss
         return self.bars.judge(step_type, loss,
-                               getattr(m, 'last_grad_norm_pre_clip', None))
+                               getattr(m, 'last_grad_norm_pre_clip', None)), loss
 
     # -------------------------------------------------------------- the cycle
 
@@ -837,11 +875,15 @@ class BracketDriver:
             if rows:
                 cols = ['label', 'kind', 'scale', 'seed', 'survived',
                         'steps_to_failure', 'reason', 'decisive',
+                        'drift', 'drift_t',
                         'peak_fwd', 'peak_bwd', 'peak_replay', 'peak_fused']
                 for r in rows:
                     peaks = self.trial_branch_peaks.get(r['label'], {})
                     for d in ('fwd', 'bwd', 'replay', 'fused'):
                         r[f'peak_{d}'] = peaks.get(d)
+                    dr = self.trial_drift.get(r['label'])
+                    r['drift'] = None if dr is None else dr['drift']
+                    r['drift_t'] = None if dr is None else dr['t']
                 wandb.log({f'lr_bracket/race_cycle_{cycle}':
                            wandb.Table(columns=cols,
                                        data=[[r[c] for c in cols] for r in rows])})
