@@ -850,11 +850,18 @@ class LRController:
                            .format(type(e).__name__, e))
         if refusal is not None:
             driver.release()
-            self.set_scale(b.refuse(refusal, scale=self._keep_rate(), step=step),
+            # THE PRINT REPORTS THE RATE ACTUALLY KEPT. `_keep_rate` falls back
+            # to the burn-in scale only on the first cycle; on a repeat it holds
+            # the previously promoted rate, and a message hardcoding "burn-in
+            # scale" reported a 16x rate drop that never happened (qm9c aug25).
+            kept = self._keep_rate()
+            self.set_scale(b.refuse(refusal, scale=kept, step=step),
                            why='bracket_refused')
+            label = ('the burn-in scale' if kept == b.burn_in_scale
+                     else 'the previously promoted scale')
             print(f'lr_ctrl: REFUSING TO BRACKET -- {refusal}\n'
-                  f'          Holding the burn-in scale {b.burn_in_scale:g} for the rest '
-                  f'of the stage. This is the safe answer, not a measured one.')
+                  f'          Holding {label} {kept:g} until the next re-race. '
+                  f'This is the safe answer, not a measured one.')
             # The refusal is race telemetry too -- keyed by STEP, not by cycle:
             # begin_bracket never ran, so a later successful repeat takes the
             # next cycle index and must not overwrite this record. Fire-and-
@@ -907,12 +914,15 @@ class LRController:
                     driver.root.restore()
             except Exception as restore_error:       # noqa: BLE001
                 reason += f' (and the root would not restore: {restore_error})'
+            kept = self._keep_rate()
             self.set_scale(b.refuse(f'bracket aborted -- {reason}',
-                                    scale=self._keep_rate(), step=step),
+                                    scale=kept, step=step),
                            why='bracket_aborted')
+            label = ('the burn-in scale' if kept == b.burn_in_scale
+                     else 'the previously promoted scale')
             print(f'lr_ctrl: BRACKET ABORTED -- {reason}\n'
-                  f'          Restored the root and holding the burn-in scale '
-                  f'{b.burn_in_scale:g}. No boundary was measured.')
+                  f'          Restored the root and holding {label} {kept:g}. '
+                  f'No boundary was measured.')
             skip = 0
         finally:
             self.driver = None

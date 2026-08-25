@@ -64,7 +64,7 @@ lr_control:
   - 1.6
   trial_steps: 150
   safety_rungs: 1
-  repeat_every: 1500   # WORKOUT: prompt drift-compensated re-race post-resume
+  repeat_every: 8000
   boundary_confirm_repeats: 1
   boundary_densify: true
   fixed_scale: 0.2

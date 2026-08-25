@@ -503,6 +503,7 @@ class BracketDriver:
         self.root_log_z_slope = 0.0  # root Z drift (<=0), extrapolated under trials
         self.last_summary = ''
         self._held_bytes = 0
+        self.race_ooms = 0           # CUDA OOMs this race; the budget is ONE retry
 
     # ------------------------------------------------------------------ root
 
@@ -606,7 +607,40 @@ class BracketDriver:
     # ----------------------------------------------------------------- trials
 
     def run_trial(self, trial):
-        """One candidate: restore the root, set the rate once, hold it for the
+        """One candidate, with a one-OOM retry budget for the whole race.
+
+        AN OOM IS NOT A MEASUREMENT (owner, 2026-08-25). It says nothing about
+        the rate -- trials run at whatever batch the preceding cruise grew to,
+        plus the race's own overhead (root restores fragment the pool; qm9c's
+        c5 OOMed after five clean 150-step rungs at the same batch). So the
+        first OOM in a race discards the attempt, clears the allocator cache
+        and REPEATS THE RUNG from the root -- at the SAME batch, because a
+        rung measured at a smaller batch is not comparable to the rungs
+        already on the board, and because the shared recovery's batch cut +
+        OOM ceiling describe cruise memory, not race memory. A SECOND OOM
+        anywhere in the race is a symptom (VRAM squeeze or leak, not rate
+        evidence): it propagates to the controller's abort seat, which hands
+        it to the shared recovery and holds the kept rate.
+        """
+        while True:
+            try:
+                return self._run_trial_once(trial)
+            except Exception as e:               # noqa: BLE001 -- OOM-classified
+                if not is_cuda_oom(e):
+                    raise
+                self.race_ooms += 1
+                if self.race_ooms > 1:
+                    raise
+                print(f'lr_bracket: {trial.label} OOMed mid-trial -- not a '
+                      f'measurement, and not a batch cut either (a rung at a '
+                      f'smaller batch is not comparable). Cache cleared, '
+                      f'repeating the rung once; a second OOM in this race '
+                      f'aborts it.')
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+    def _run_trial_once(self, trial):
+        """One attempt: restore the root, set the rate once, hold it for the
         whole horizon, record what happened.
 
         THE CANDIDATE MAY NOT RESCUE ITSELF. Divergence handling inside a trial
@@ -737,8 +771,8 @@ class BracketDriver:
             if is_cuda_oom(e):
                 # NOT a candidate failure. An OOM says nothing about the rate, and
                 # convicting the lowest rung on one would bound the bracket at a
-                # rate the run never tested. Let it out: the host loop's shared
-                # recovery path cuts the batch, and the bracket aborts.
+                # rate the run never tested. Let it out: run_trial repeats the
+                # rung once at the same batch; a second OOM aborts the race.
                 raise
             return f'exception_{type(e).__name__}'
         if loss is not None:
@@ -833,4 +867,6 @@ class BracketDriver:
         out = dict(self.bars.report())
         if self._held_bytes:
             out['lr_bracket/held_mb'] = self._held_bytes / 1e6
+        if self.race_ooms:
+            out['lr_bracket/race_ooms'] = self.race_ooms
         return out
