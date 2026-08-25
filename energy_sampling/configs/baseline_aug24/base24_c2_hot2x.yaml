@@ -36,12 +36,6 @@ progress_gate:
   - key: w1r/median
     target_key: w1r/perfect_median
     bar: 1.5
-  - key: E/sample_median
-    target_key: E/ref_median
-    bar: 2.0
-  - key: E/emarg_w1_kT
-    target: 0.0
-    bar: 0.5
   veto_metrics:
   - key: w1r/worst
     target_key: w1r/perfect_worst

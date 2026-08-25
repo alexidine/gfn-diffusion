@@ -151,6 +151,16 @@ def cond(cfg):
     cfg['lr_flow'] = 1.0e-4                  # conditional Z(c) is a NETWORK; 0.1 detonates it
     deep_set(cfg, 'energy_config.temperature', 6.9)   # the qm9 route's kT (registry)
     deep_set(cfg, 'model.periodic_centroids', True)
+    # NO ENERGY TERMS in the conditional phase-1 gate (owner, 2026-08-25): the
+    # prior trains UNCONDITIONALLY, samples converge to the pooled marginal
+    # {x}, whose energy under any particular c is structurally garbage vs the
+    # dataset's matched {x,c} pairs -- E/sample vs E/ref can never close
+    # (pooled or per-condition) and CONVERGED would be unreachable, hanging
+    # the arm to the 20k SATURATED window. w1r + the MLE slope are the valid
+    # phase-1 instruments on this route.
+    cfg['progress_gate']['metrics'] = [
+        {'key': 'w1r/median', 'target_key': 'w1r/perfect_median', 'bar': 1.5},
+    ]
     return cfg
 
 
