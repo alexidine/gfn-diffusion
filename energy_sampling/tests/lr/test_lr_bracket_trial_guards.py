@@ -122,10 +122,15 @@ def _cruising(**kw):
     return m, m.lr_controller
 
 
-def test_a_moderate_fire_cuts_in_place_without_a_rewind():
-    """A finite excursion over the bar = the state is intact, just too hot:
-    the rate halves, observe returns None (no fire_loss_spike), and the
-    cooldown makes one incident one cut."""
+def test_an_excursion_fire_rewinds_like_every_other_fire():
+    """UNIFIED FIRES (owner 2026-08-25, superseding the two-tier design). The
+    in-place cut assumed a finite excursion left the state 'intact, just too
+    hot'; qm9c aug25 falsified it -- the excursion weights carry poison that
+    cuts only slow (vg_lb 126 -> 2700 through two cuts), invisibly to
+    tb_err_worst. An excursion now returns 'diverged' so the host loop rewinds
+    to the rolling checkpoint; the seat itself does NOT cut (the reload would
+    overwrite it -- on_divergence cuts once, from the restored scale), and the
+    cooldown makes one incident one response."""
     m, c = _cruising(hard_failure=dict(cruise_rederive=False),
                      fire_cut_factor=0.5, fire_cooldown_steps=50)
     before = c.scale
@@ -137,15 +142,23 @@ def test_a_moderate_fire_cuts_in_place_without_a_rewind():
         if c._moderate_fires:
             break
     assert c._moderate_fires == 1, 'the cold bar never fired on this fixture'
-    assert fired is None, 'a moderate fire must not reach fire_loss_spike'
+    assert fired == 'diverged', (
+        'an excursion fire must reach the rewind path -- keeping the excursion '
+        'weights is how qm9c aug25 accumulated 20x damage through two cuts')
+    assert c.scale == pytest.approx(before), (
+        'the fire seat cut the rate itself; the reload overwrites that, so the '
+        'single cut belongs to on_divergence after the restore')
+    # the post-restore response: one count, one cut
+    c.on_divergence()
+    assert c._divergences == 1
     assert c.scale == pytest.approx(before * 0.5)
-    # inside the cooldown a second crossing is not a second cut
-    scale_after_first = c.scale
+    # inside the cooldown a second crossing is not a second response
     for _ in range(10):
         m.step_ind += 1
-        c.observe(m.train_key, m.train_step(m.train_key), m.last_grad_norm_pre_clip)
+        verdict = c.observe(m.train_key, m.train_step(m.train_key),
+                            m.last_grad_norm_pre_clip)
+        assert verdict is None
     assert c._moderate_fires == 1
-    assert c.scale == scale_after_first
 
 
 def test_a_disaster_returns_diverged_and_the_rewind_cut_follows():

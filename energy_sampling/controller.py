@@ -73,8 +73,8 @@ class LRController:
     def __init__(self, modeller):
         self.modeller = modeller
         self._report = {}
-        self._divergences = 0            # DISASTER tier: rewind + cut
-        self._moderate_fires = 0         # MODERATE tier: cut in place, no rewind
+        self._divergences = 0            # every rewind+cut response (the counting seat)
+        self._moderate_fires = 0         # the excursion-tier subset of the above
         self._fire_cooldown_until = 0
         self._calibrations = 0
         self._hypergrads = 0
@@ -329,7 +329,7 @@ class LRController:
     def set_scale(self, scale, why=None):
         """Move the one multiplier, and say so. Every caller is the bracket, a
         stage transition, or (owner decision 2026-08-24) a FIRE RESPONSE -- the
-        moderate cut and the disaster rewind-cut, both of which stand until the
+        unified rewind-and-cut (owner 2026-08-25), which stands until the
         scheduled re-race re-measures the rate."""
         st = self._state()
         st['scale'] = float(scale)
@@ -435,26 +435,32 @@ class LRController:
                               None if grad_norm is None else float(grad_norm))
         if why is None:
             return None
-        # TWO TIERS (owner decision 2026-08-24). A MODERATE fire -- a finite
-        # excursion over the derived bar -- cuts the rate in place and keeps
-        # training: the state is intact, just too hot, and a rewind would spend
-        # a reload re-entering the same neighborhood. A DISASTER -- non-finite,
-        # or an absolute backstop -- rewinds to the rolling checkpoint AND cuts.
-        # Either stands until the scheduled re-race (repeat_every) re-measures
-        # the rate from live state; neither is a permanent verdict.
+        # EVERY FIRE REWINDS AND CUTS (owner decision 2026-08-25, superseding
+        # the 2026-08-24 two-tier design). The two-tier split assumed a finite
+        # excursion left the state "intact, just too hot" -- qm9c aug25
+        # falsified that: cruising a hot promotion poisoned the fwd branch in
+        # ~500 steps (vg_lb 126 -> 2700) while two in-place cuts only slowed
+        # the accumulation, and the damage was invisible to tb_err_worst, so
+        # nothing downstream would ever have flagged it. With bars refit at the
+        # promoted rate the fire lands within tens of steps of excursion onset,
+        # so the rolling checkpoint (<= ~50 steps old) is still clean: the
+        # rewind costs almost nothing and caps the carried damage at zero.
+        # The excursion tier keeps its own counter and cooldown; the CUT
+        # happens in on_divergence, once, from the RESTORED checkpoint's scale
+        # -- a cut applied here would be overwritten by the reload.
         step = int(getattr(self.modeller, 'step_ind', 0))
         if '_excursion_' in why:
             if step < int(self._fire_cooldown_until):
-                return None            # one incident, one cut -- not a machine gun
-            factor = float(self._cfg('fire_cut_factor', 0.5))
+                return None       # one incident, one response -- not a machine gun
             cooldown = int(self._cfg('fire_cooldown_steps', 100))
             self._moderate_fires += 1
             self._fire_cooldown_until = step + cooldown
-            new = self.set_scale(self.scale * factor, why='moderate_fire')
-            print(f'lr_ctrl MODERATE FIRE: {why} at step {step} -- rate cut in '
-                  f'place to scale {new:.4g} (x{factor:g}, cooldown {cooldown}); '
-                  f'no rewind. The scheduled re-race re-measures the rate.')
-            return None
+            print(f'lr_ctrl FIRE: {why} at step {step} (scale {self.scale:.4g}) '
+                  f'-- rewinding to the rolling checkpoint; the post-restore cut '
+                  f'follows (cooldown {cooldown}). Poisoning accumulates faster '
+                  f'than cuts arrest it (qm9c aug25), so no fire keeps the '
+                  f'excursion weights.')
+            return 'diverged'
         # NOT counted here: every 'diverged' return leads into fire_loss_spike,
         # whose on_divergence() call is the single counting seat -- the
         # non-finite-gradient path reaches fire_loss_spike WITHOUT passing
@@ -504,7 +510,7 @@ class LRController:
         self._divergences += max(int(count), 1)
         factor = float(self._cfg('fire_cut_factor', 0.5))
         new = self.set_scale(self.scale * factor, why='disaster_rewind_cut')
-        print(f'lr_ctrl: disaster #{self._divergences} -- rewound, and the rate is '
+        print(f'lr_ctrl: fire #{self._divergences} -- rewound, and the rate is '
               f'CUT to scale {new:.4g} (x{factor:g}): re-entering restored weights '
               f'at the rate that just detonated them is a loop (toy_wk_aug24). '
               f'The scheduled re-race re-measures; if this repeats the reload '
